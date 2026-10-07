@@ -91,6 +91,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -2557,6 +2558,11 @@ func runServe(args []string, logSink io.Writer) int {
 		// verbs): the chain is the sole authority, so the store needs only
 		// the pool — no derived table.
 		cfg.CaptainStore = captain.NewStore(pool)
+		// The E81.1 / #3771 user-report cursor store the comms role's gather
+		// reads and its apply advances (#4012). Dropping this ONE line is the
+		// partial rollback: the comms scan is then unwired and no other
+		// surface changes.
+		cfg.UserReportCursors = userreport.NewStore(pool)
 		// The E77.3 / #3737 crew-message surface (the five /v0/crew-messages
 		// routes). Dropping this ONE line is the partial rollback ADR-081's
 		// Consequences name: every crew-message endpoint then answers 503

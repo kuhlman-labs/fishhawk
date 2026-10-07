@@ -60,6 +60,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -864,6 +865,15 @@ type Config struct {
 	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
 
+	// UserReportCursors is the E81.1 user-report cursor store (#3771): the
+	// per-repository, per-source watermark over the forge's user-report
+	// feed. The comms gather (#3775 phase 4) reads it through a deferring
+	// wrapper and the comms apply (phase 7) advances it. Wired from serve.go
+	// next to CaptainStore (userreport.NewStore(pool)); nil leaves the comms
+	// scan unwired and changes no other surface. An interface so handler
+	// tests can supply an in-memory store; production is *userreport.Store.
+	UserReportCursors userreport.CursorStore
+
 	// Concurrency is the local stage concurrency slot store (#3964 /
 	// ADR-087): the host-dispatch spawn marker asks it for a slot before it
 	// moves a grouped host-dispatched stage to dispatched, and the stage reads
@@ -1128,18 +1138,19 @@ type Server struct {
 	// wedged forge cannot block a graceful stop past the deadline.
 	bgGroomingApply sync.WaitGroup
 
-	// bgUpkeepApply tracks the DETACHED on-approval upkeep apply (#3924):
-	// applyApprovedUpkeep returns to the approve request once the capture
-	// window is settled and the filing inputs are resolved; the per-finding
-	// filing loop then runs on a goroutine in this group under its own
-	// finding-scaled budget. Shutdown drains it alongside bgGroomingApply,
-	// bounded by the shutdown context.
-	bgUpkeepApply sync.WaitGroup
+	// bgReportApply tracks every DETACHED on-approval proposal-report apply
+	// started through startDetachedReportApply (report_seam.go, #4012): the
+	// upkeep per-finding filing loop (#3924) today, the comms apply next.
+	// Each apply returns to the approve request once its capture window is
+	// settled and its inputs are resolved; the loop then runs on a goroutine
+	// in this group under its own budget. Shutdown drains it alongside
+	// bgGroomingApply, bounded by the shutdown context.
+	bgReportApply sync.WaitGroup
 
 	// bgUpkeepInflight tracks the DETACHED in-flight advisory pass (#3763):
 	// applyApprovedUpkeep starts it once the capture window settles
 	// `approved`, under its own call-site-clocked budget. Shutdown drains it
-	// alongside bgUpkeepApply, bounded by the shutdown context.
+	// alongside bgReportApply, bounded by the shutdown context.
 	bgUpkeepInflight sync.WaitGroup
 
 	// bgBranchSweeps tracks the DETACHED cancel-path run-branch sweep
@@ -1495,7 +1506,7 @@ func (s *Server) Start() error {
 // ShutdownTimeout from the parent context. After the HTTP server
 // drains, it also waits for any detached advisory review goroutines
 // (#584), any detached grooming apply (E54.77 / #3232) and any detached
-// upkeep apply (#3924) to finish,
+// proposal-report apply (bgReportApply: the upkeep apply, #3924) to finish,
 // bounded by the same shutdown context so a hung reviewer or a wedged
 // forge can't block shutdown past the deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -1510,7 +1521,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	go func() {
 		s.bgReviews.Wait()
 		s.bgGroomingApply.Wait()
-		s.bgUpkeepApply.Wait()
+		s.bgReportApply.Wait()
 		s.bgUpkeepInflight.Wait()
 		s.bgBranchSweeps.Wait()
 		close(done)
@@ -1535,11 +1546,19 @@ func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitGroomingApply() { s.bgGroomingApply.Wait() }
 
+// waitReportApply blocks until every detached proposal-report apply started
+// through startDetachedReportApply (#4012) has finished — the deterministic
+// sync point tests use to assert on the rows a detached apply writes.
+// Production code never calls it (Shutdown drains the same group, bounded by
+// its context).
+func (s *Server) waitReportApply() { s.bgReportApply.Wait() }
+
 // waitUpkeepApply blocks until every detached on-approval upkeep apply
 // (#3924) has finished — the deterministic sync point tests use to assert on
-// the audit rows and filings the detached loop produces. Production code never
-// calls it (Shutdown drains the same group, bounded by its context).
-func (s *Server) waitUpkeepApply() { s.bgUpkeepApply.Wait() }
+// the audit rows and filings the detached loop produces. The upkeep loop runs
+// on bgReportApply (#4012), so this is waitReportApply under its original
+// name. Production code never calls it.
+func (s *Server) waitUpkeepApply() { s.bgReportApply.Wait() }
 
 // waitUpkeepInflight blocks until every detached in-flight advisory pass
 // (#3763) has finished — the test sync point. Production code never calls it
