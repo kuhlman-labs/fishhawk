@@ -221,6 +221,12 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 	}{
 		{name: "(1) absent evidence file", path: func(dir string) string { return filepath.Join(dir, "nope.json") }, want: "absent: no two-arm measurement"},
 		{name: "(2) malformed JSON", raw: func([]byte) []byte { return []byte("{") }, want: "malformed JSON"},
+		{name: "(2) a second object after a valid record", raw: func(raw []byte) []byte {
+			return append(append([]byte{}, raw...), `{"schema":"planreview-catchrate-evidence-v1"}`...)
+		}, want: "trailing content"},
+		{name: "(2) trailing garbage after a valid record", raw: func(raw []byte) []byte {
+			return append(append([]byte{}, raw...), "garbage\n"...)
+		}, want: "trailing content"},
 		{name: "(2) unknown field (a stored verdict)", raw: func(raw []byte) []byte {
 			var m map[string]any
 			_ = json.Unmarshal(raw, &m)
@@ -523,6 +529,12 @@ func TestRecordCatchRateEvidence_RefusesBeforeAnyModelCall(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, opts: pin("x"), want: "malformed"},
+		{name: "existing record with trailing content", setup: func(t *testing.T) {
+			raw := mustRead(t, freshCatchEvidence(t))
+			if err := os.WriteFile(path, append(raw, "{}"...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, opts: pin("x"), want: "trailing content"},
 		{name: "existing record with a wrong schema", setup: func(t *testing.T) {
 			if err := os.WriteFile(path, []byte(`{"schema":"other"}`), 0o644); err != nil {
 				t.Fatal(err)

@@ -13,9 +13,13 @@
 //
 // A trial is CAUGHT when any emitted concern matches any case probe
 // (matchCatchProbe: case-folded substring over the concern's note AND
-// category). An UNDECODABLE verdict counts as a MISS in the rate and is
-// reported separately — excluding it from the denominator would let an arm
-// that stops emitting parseable verdicts look better, not worse.
+// category). A probe never occurs in the issue or plan the reviewer is shown
+// (loader mode m), so a concern that merely ECHOES that wording about an
+// unrelated aspect scores missed rather than inflating both arms toward a
+// ceiling that would hide a dilution. An UNDECODABLE verdict counts as a MISS
+// in the rate and is reported separately — excluding it from the denominator
+// would let an arm that stops emitting parseable verdicts look better, not
+// worse.
 //
 // The regression rule (CompareCatchRateArms): the with-conventions catch rate
 // may be at most DefaultCatchRateRegressionTolerance below the
@@ -38,11 +42,10 @@ package agenteval
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"os"
@@ -105,9 +108,10 @@ const (
 	// whenever ClassifyCatch or matchCatchProbe changes meaning: it is
 	// folded into the evidence fingerprint, so a bump makes a recorded
 	// measurement stale instead of silently re-scoring it under new rules.
-	catchRuleVersion = "planreview-catch-v1: a trial is caught when the response decodes (extract first '{'..last '}', " +
+	catchRuleVersion = "planreview-catch-v2: a trial is caught when the response decodes (extract first '{'..last '}', " +
 		"verdict one of approve|approve_with_concerns|reject) and some concern's note OR category contains some " +
-		"catch probe as a case-folded (strings.ToLower) substring; an undecodable response is a miss counted in trials"
+		"catch probe as a case-folded (strings.ToLower) substring; an undecodable response is a miss counted in trials; " +
+		"no probe occurs case-folded in the case's issue title, issue body or plan text (loader mode m)"
 )
 
 // representativeConventionName / representativeConventionPath /
@@ -189,6 +193,12 @@ type PlanReviewCatchCase struct {
 //	    matchCatchProbe, the runtime matcher itself
 //	(k) a catching_example matching no probe
 //	(l) empty catching_examples or non_catching_examples
+//	(m) a probe occurring (case-folded) in the issue title, the issue body or
+//	    any key or value of the plan — text the reviewer is SHOWN, so a
+//	    concern echoing it about an unrelated aspect would score as a catch
+//
+// Mode (d) includes trailing content after the JSON value: a second object
+// or garbage appended to a valid review_input.json is refused, not ignored.
 //
 // A miss.json failure (malformed, no misses, empty criterion id) surfaces
 // through LoadPlanReviewMissCorpus with its own case-naming error. Synthetic
@@ -228,9 +238,7 @@ func loadPlanReviewCatchCase(dir string, m NamedPlanReviewMissCase) (PlanReviewC
 		return fail("read review_input.json (every catch-rate case needs a hand-curated review input): %w", err) // (c)
 	}
 	var in PlanReviewCatchInput
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
+	if err := decodeStrictJSON(raw, &in); err != nil {
 		return fail("parse review_input.json: %w", err) // (d)
 	}
 	if strings.TrimSpace(in.IssueTitle) == "" {
@@ -279,7 +287,66 @@ func loadPlanReviewCatchCase(dir string, m NamedPlanReviewMissCase) (PlanReviewC
 			return fail("catching_examples[%d] (%q) matches no catch probe", i, ex.Note) // (k)
 		}
 	}
+	shown, err := catchShownText(in)
+	if err != nil {
+		return fail("review_input.json: plan: %w", err)
+	}
+	for _, probe := range in.CatchProbes {
+		if strings.Contains(shown, strings.ToLower(strings.TrimSpace(probe))) {
+			return fail("catch probe %q occurs in the issue or plan the reviewer is shown: a concern echoing that wording about an unrelated aspect would score as a catch — use a phrase only a concern flagging the planted defect would use", probe) // (m)
+		}
+	}
 	return PlanReviewCatchCase{Name: name, Miss: m.Case, Input: in, Plan: p, ReviewInputRaw: raw}, nil
+}
+
+// decodeStrictJSON decodes exactly ONE JSON value from raw into v: an unknown
+// field is refused, and so is any trailing non-whitespace content after the
+// value. json.Decoder stops after the first value, so without the EOF check a
+// second object or garbage appended to a valid document would be silently
+// ignored — a malformed input that decodes as if it were well-formed.
+func decodeStrictJSON(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing content after the JSON value (offset %d)", dec.InputOffset())
+	}
+	return nil
+}
+
+// catchShownText is the case-folded text a reviewer of this case is shown
+// verbatim: the issue title, the issue body, and every key and value of the
+// plan. Loader mode (m) refuses a probe occurring in it.
+func catchShownText(in PlanReviewCatchInput) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(in.Plan))
+	dec.UseNumber()
+	var planValue any
+	if err := dec.Decode(&planValue); err != nil {
+		return "", err
+	}
+	parts := []string{in.IssueTitle, in.IssueBody}
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, x := range t {
+				parts = append(parts, k)
+				walk(x)
+			}
+		case []any:
+			for _, x := range t {
+				walk(x)
+			}
+		case string:
+			parts = append(parts, t)
+		case json.Number:
+			parts = append(parts, t.String())
+		}
+	}
+	walk(planValue)
+	return strings.ToLower(strings.Join(parts, "\n")), nil
 }
 
 // matchCatchProbe is THE catch matcher, shared by ClassifyCatch and the
@@ -305,9 +372,11 @@ func matchCatchProbe(category, note string, probes []string) (string, bool) {
 }
 
 // LoadRepresentativeConventions reads the committed representative conventions
-// file and renders it exactly as the server's resolution path does: content
-// hashed, mapped through the REAL repodoc.ToPromptDocument at the pinned
-// reviewConventionFixtureCommit under the server's "Review convention <name>"
+// file and renders it exactly as the server's resolution path does: the bytes
+// are shaped by the REAL repodoc.Fetched.Document (content hash, the size cap,
+// and delimiter-line neutralization — the same call repodoc.Resolve makes) at
+// the pinned reviewConventionFixtureCommit, then mapped through the REAL
+// repodoc.ToPromptDocument under the server's "Review convention <name>"
 // framing. It FAILS CLOSED on an absent file, an empty (whitespace-only) file,
 // and a file over repodoc.DefaultMaxBytes (the real path would truncate it, so
 // the with arm would not be what production renders).
@@ -326,15 +395,8 @@ func LoadRepresentativeConventions(path string) (prompt.ReviewConvention, error)
 	if len(raw) > repodoc.DefaultMaxBytes {
 		return prompt.ReviewConvention{}, fmt.Errorf("agenteval: representative conventions fixture %q is %d bytes, over repodoc.DefaultMaxBytes (%d): the server would truncate it", path, len(raw), repodoc.DefaultMaxBytes)
 	}
-	sum := sha256.Sum256(raw)
-	doc := repodoc.Document{
-		Path:          representativeConventionPath,
-		Commit:        reviewConventionFixtureCommit,
-		ContentHash:   "sha256:" + hex.EncodeToString(sum[:]),
-		Content:       content,
-		OriginalBytes: len(raw),
-		RenderedBytes: len(raw),
-	}
+	fetched := &repodoc.Fetched{Path: representativeConventionPath, Commit: reviewConventionFixtureCommit, Content: raw}
+	doc := fetched.Document(repodoc.DefaultMaxBytes)
 	return prompt.ReviewConvention{
 		Name:        representativeConventionName,
 		SeverityCap: representativeConventionSeverityCap,
@@ -618,6 +680,20 @@ func CompareCatchRateArms(without, with CatchRateArmReport, tolerance float64, m
 		cmp.PerCase = append(cmp.PerCase, CaseCatchComparison{Case: name, Without: without.PerCase[name], With: with.PerCase[name]})
 	}
 	return cmp, nil
+}
+
+// CatchRateRule states, on one line, the rule the offline gate applies: the
+// within-run tolerance, the pinned-baseline rule, the per-arm trial floor and
+// the derivation of that floor. catchrategate prints it on EVERY outcome —
+// pass, regression, absent, stale or malformed evidence, and infrastructure
+// failure — so the bar a record must clear is never missing from the output.
+func CatchRateRule() string {
+	return fmt.Sprintf("rule: FAIL when the with-conventions catch rate is more than %.2f below the without-conventions rate, "+
+		"or either arm is more than %.2f below the same arm of the pinned baseline; each arm needs at least %d trials "+
+		"(power floor n >= 0.5*(%.3f/%.2f)^2, one-sided 95%% sampling noise; derivation: backend/internal/agenteval/README.md "+
+		"§ \"The rule, the tolerance and the power floor\")",
+		DefaultCatchRateRegressionTolerance, DefaultCatchRateRegressionTolerance, MinCatchRateTrialsPerArm,
+		catchRateOneSidedZ, DefaultCatchRateRegressionTolerance)
 }
 
 // Render states both rates, the delta, the per-case and undecodable counts,

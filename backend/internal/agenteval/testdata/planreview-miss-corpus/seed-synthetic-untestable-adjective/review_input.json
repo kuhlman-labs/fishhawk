@@ -85,13 +85,16 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-retry-robust",
-    "robust",
-    "edge case",
-    "vague",
     "untestable",
     "not testable",
-    "not concretely verifiable"
+    "unverifiable",
+    "not verifiable",
+    "not concretely verifiable",
+    "cannot be verified",
+    "no pass/fail",
+    "unmeasurable",
+    "not measurable",
+    "subjective"
   ],
   "catching_examples": [
     {
@@ -102,7 +105,7 @@
     {
       "severity": "medium",
       "category": "testability",
-      "note": "One criterion is a vague adjective an executor cannot decide; replace it with a named, observable outcome."
+      "note": "One criterion is a subjective adjective an executor cannot decide; replace it with a named, observable outcome."
     }
   ],
   "non_catching_examples": [
@@ -120,6 +123,21 @@
       "severity": "low",
       "category": "scope",
       "note": "The failed-state transition may need an index on delivery status for the dashboard query."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Test the edge case where cancellation interrupts backoff."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Make the retry path robust to a process restart between attempts by persisting the attempt count."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Add a test for the edge case of a 5xx on the 5th retry followed by a 200."
     }
   ]
 }

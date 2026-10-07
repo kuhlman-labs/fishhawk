@@ -76,6 +76,7 @@ func TestRun_PassesOnFreshRecord(t *testing.T) {
 			t.Errorf("stdout lacks %q:\n%s", want, stdout)
 		}
 	}
+	assertRuleLine(t, stdout)
 }
 
 func TestRun_FailsOnStaleRecord(t *testing.T) {
@@ -93,6 +94,7 @@ func TestRun_FailsOnStaleRecord(t *testing.T) {
 	if code != 1 || !strings.Contains(stderr, "STALE") {
 		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming STALE", code, stderr)
 	}
+	assertRuleLine(t, stderr)
 }
 
 func TestRun_FailsOnRegressedRecordWithReport(t *testing.T) {
@@ -123,6 +125,111 @@ func TestRun_FailsOnAbsentRecord(t *testing.T) {
 	code, _, stderr := runGate("--evidence", filepath.Join(t.TempDir(), "evidence.json"), "--corpus", testCorpus, "--conventions", testConventions)
 	if code != 1 || !strings.Contains(stderr, "absent") {
 		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+	assertRuleLine(t, stderr)
+}
+
+// assertRuleLine requires the gate's rule line — not merely a report that
+// happens to carry the numbers — with the 0.10 tolerance and the 136-trial
+// minimum in it.
+func assertRuleLine(t *testing.T, out string) {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "catchrategate: rule:") {
+			if !strings.Contains(line, "0.10") || !strings.Contains(line, "136") {
+				t.Errorf("rule line lacks the 0.10 tolerance or the 136-trial minimum: %q", line)
+			}
+			return
+		}
+	}
+	t.Errorf("output carries no 'catchrategate: rule:' line naming 0.10 and 136:\n%s", out)
+}
+
+// TestRun_PrintsTheRuleOnEveryOutcome: the rule line (0.10 tolerance, 136
+// trials per arm, the derivation reference) is printed whatever the outcome —
+// absent, stale, malformed and regressed evidence, infrastructure failures,
+// usage errors, --print-fingerprint and a pass — on stdout for a pass and on
+// stderr otherwise.
+func TestRun_PrintsTheRuleOnEveryOutcome(t *testing.T) {
+	dir := t.TempDir()
+	staleConv := filepath.Join(dir, "conventions.md")
+	conv, err := os.ReadFile(testConventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv[len(conv)-2] ^= 0x01
+	if err := os.WriteFile(staleConv, conv, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := freshRecord(t, staleConv)
+	fresh := freshRecord(t, testConventions)
+	trailing := filepath.Join(dir, "trailing.json")
+	raw, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trailing, append(raw, []byte("{}\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		args     []string
+		wantCode int
+		onStdout bool
+	}{
+		{"absent evidence", []string{"--evidence", filepath.Join(dir, "none.json"), "--corpus", testCorpus, "--conventions", testConventions}, 1, false},
+		{"stale evidence", []string{"--evidence", stale, "--corpus", testCorpus, "--conventions", testConventions}, 1, false},
+		{"evidence with trailing content", []string{"--evidence", trailing, "--corpus", testCorpus, "--conventions", testConventions}, 1, false},
+		{"infrastructure: corpus unavailable", []string{"--evidence", fresh, "--corpus", filepath.Join(dir, "no-corpus"), "--conventions", testConventions}, 1, false},
+		{"infrastructure: conventions unavailable", []string{"--evidence", fresh, "--corpus", testCorpus, "--conventions", filepath.Join(dir, "none.md")}, 1, false},
+		{"infrastructure: print-fingerprint corpus unavailable", []string{"--print-fingerprint", "--evidence", "x", "--corpus", filepath.Join(dir, "no-corpus"), "--conventions", testConventions}, 1, false},
+		{"usage error", []string{"--no-such-flag"}, 2, false},
+		{"print-fingerprint", []string{"--print-fingerprint", "--evidence", "x", "--corpus", testCorpus, "--conventions", testConventions}, 0, false},
+		{"pass", []string{"--evidence", fresh, "--corpus", testCorpus, "--conventions", testConventions}, 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			code, stdout, stderr := runGate(tc.args...)
+			if code != tc.wantCode {
+				t.Fatalf("exit %d, want %d; stderr:\n%s", code, tc.wantCode, stderr)
+			}
+			if tc.onStdout {
+				assertRuleLine(t, stdout)
+			} else {
+				assertRuleLine(t, stderr)
+			}
+		})
+	}
+	t.Run("infrastructure: outside the checkout", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		code, _, stderr := runGate()
+		if code != 1 {
+			t.Fatalf("exit %d, want 1; stderr:\n%s", code, stderr)
+		}
+		assertRuleLine(t, stderr)
+	})
+}
+
+// TestRun_EvidenceWithTrailingContentFails: an otherwise passing record with a
+// second object or garbage appended fails closed rather than passing on its
+// first value.
+func TestRun_EvidenceWithTrailingContentFails(t *testing.T) {
+	fresh := freshRecord(t, testConventions)
+	raw, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, suffix := range map[string]string{"second object": "{\"schema\":\"x\"}\n", "garbage": "garbage\n"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "evidence.json")
+			if err := os.WriteFile(path, append(append([]byte{}, raw...), suffix...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			code, _, stderr := runGate("--evidence", path, "--corpus", testCorpus, "--conventions", testConventions)
+			if code != 1 || !strings.Contains(stderr, "trailing content") {
+				t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the trailing content", code, stderr)
+			}
+		})
 	}
 }
 

@@ -67,13 +67,17 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-import-log-or-not",
     "vacuous",
     "tautolog",
-    "cannot fail",
     "always true",
+    "always pass",
+    "trivially true",
+    "trivially satisf",
+    "unfalsifiable",
+    "not falsifiable",
     "falsifiab",
-    "either logs"
+    "holds for every implementation",
+    "can never fail"
   ],
   "catching_examples": [
     {
@@ -84,7 +88,7 @@
     {
       "severity": "medium",
       "category": "falsifiability",
-      "note": "One criterion is a tautology that cannot fail; replace it with one that fails when no warning is logged."
+      "note": "One criterion is a tautology that can never fail; replace it with one that fails when no warning is logged."
     }
   ],
   "non_catching_examples": [
@@ -102,6 +106,16 @@
       "severity": "medium",
       "category": "risk",
       "note": "A very large file with many bad rows will produce one WARN per row; consider the log volume."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test asserts the importer logs a warning for a skipped row when the reason is empty."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Logging behaviour should be specified in the importer README, including event=skipped_row."
     }
   ]
 }

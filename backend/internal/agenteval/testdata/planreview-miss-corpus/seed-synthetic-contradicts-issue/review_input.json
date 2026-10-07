@@ -89,14 +89,15 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-delete-hard",
-    "soft delete",
-    "soft-delete",
-    "contradict",
-    "hard delete",
-    "hard-delete",
-    "keeps the row",
-    "keep the row"
+    "contradicts the issue",
+    "contradicts issue",
+    "contradicts the soft",
+    "contradicts what the issue",
+    "conflicts with the issue",
+    "conflicts with the soft",
+    "inconsistent with the issue",
+    "opposite of what the issue",
+    "violates the issue"
   ],
   "catching_examples": [
     {
@@ -107,7 +108,7 @@
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "One explicit criterion demands a hard delete while the approach implements the soft delete the issue asks for."
+      "note": "One explicit criterion demands a hard delete, which conflicts with the issue's soft-delete requirement."
     }
   ],
   "non_catching_examples": [
@@ -125,6 +126,26 @@
       "severity": "low",
       "category": "documentation",
       "note": "api/openapi.yaml should note that GET /widgets/{id} returns 404 after deletion."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers soft delete of another tenant's widget."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "Existing hard-deleted rows are gone already; say so in the release notes."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "Since the soft delete keeps the row, add an index on deleted_at for the list query."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Add a handler test that DELETE /widgets/{id} removes the widget from GET /widgets."
     }
   ]
 }

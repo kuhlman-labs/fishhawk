@@ -15,7 +15,10 @@
 //	(cd backend && go run ./internal/agenteval/catchrategate --print-fingerprint)
 //
 // Exit codes: 0 the evidence passes (report on stdout), 1 the gate fails
-// (reason on stderr), 2 usage error.
+// (reason on stderr), 2 usage error. Every outcome ends with the rule line
+// (agenteval.CatchRateRule: the 0.10 tolerance, the 136-trial floor and its
+// derivation) — on stdout for a pass, on stderr otherwise (so
+// --print-fingerprint's stdout stays the bare digest).
 package main
 
 import (
@@ -44,7 +47,21 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// run executes the gate and then prints the rule line, whatever the outcome:
+// an absent, stale or malformed record and an infrastructure failure name the
+// bar the record must clear just as a pass or a regression does.
 func run(args []string, stdout, stderr io.Writer) int {
+	code, passed := gate(args, stdout, stderr)
+	ruleOut := stderr
+	if passed {
+		ruleOut = stdout
+	}
+	_, _ = fmt.Fprintln(ruleOut, "catchrategate: "+agenteval.CatchRateRule())
+	return code
+}
+
+// gate is the gate proper. passed is true only for an evidence PASS.
+func gate(args []string, stdout, stderr io.Writer) (code int, passed bool) {
 	fs := flag.NewFlagSet("catchrategate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	evidence := fs.String("evidence", "", "evidence record (default: the committed "+defaultEvidenceRel+" under the backend module root)")
@@ -62,23 +79,23 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return 2, false
 	}
 	if fs.NArg() > 0 {
 		_, _ = fmt.Fprintf(stderr, "catchrategate: unexpected argument %q\n", fs.Arg(0))
 		fs.Usage()
-		return 2
+		return 2, false
 	}
 	if *evidence == "" || *corpus == "" || *conventions == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1
+			return 1, false
 		}
 		root, err := findBackendRoot(cwd)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1
+			return 1, false
 		}
 		defaultTo(evidence, filepath.Join(root, defaultEvidenceRel))
 		defaultTo(corpus, filepath.Join(root, defaultCorpusRel))
@@ -90,20 +107,20 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		cases, err := agenteval.LoadPlanReviewCatchCorpus(*corpus)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1
+			return 1, false
 		}
 		conv, err := agenteval.LoadRepresentativeConventions(*conventions)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1
+			return 1, false
 		}
 		fp, err := agenteval.CatchRatePromptFingerprint(cases, conv, model)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1
+			return 1, false
 		}
 		_, _ = fmt.Fprintln(stdout, fp)
-		return 0
+		return 0, false
 	}
 
 	report, err := agenteval.CheckCatchRateEvidence(*evidence, *corpus, *conventions, model)
@@ -112,11 +129,11 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 			_, _ = fmt.Fprintln(stderr, report)
 		}
 		_, _ = fmt.Fprintf(stderr, "catchrategate: FAIL: %v\n", err)
-		return 1
+		return 1, false
 	}
 	_, _ = fmt.Fprintln(stdout, report)
 	_, _ = fmt.Fprintln(stdout, "catchrategate: PASS")
-	return 0
+	return 0, true
 }
 
 func defaultTo(p *string, v string) {

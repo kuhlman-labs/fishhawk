@@ -79,11 +79,15 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-step-two-done",
-    "restat",
-    "approach step",
-    "observable outcome",
-    "not an outcome"
+    "restates the approach",
+    "restates approach",
+    "restates an approach",
+    "restates step",
+    "restating the approach",
+    "not an observable",
+    "not an outcome",
+    "instead of an observable",
+    "instead of the observable"
   ],
   "catching_examples": [
     {
@@ -94,7 +98,7 @@
     {
       "severity": "medium",
       "category": "independence",
-      "note": "One criterion only checks that the step-2 code was written; it should assert the observable outcome the issue asks for."
+      "note": "One criterion restates the approach (the step-2 struct field exists); it should assert the response the issue asks for."
     }
   ],
   "non_catching_examples": [
@@ -112,6 +116,21 @@
       "severity": "low",
       "category": "risk",
       "note": "Selecting the extra column in every query slightly widens the row scan; negligible."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Approach step 4 must also update docs/api.md."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Approach step 2 should make ArchivedAt a pointer so a null archived_at serializes."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Test that toWidgetResponse populates ArchivedAt for the list endpoint too."
     }
   ]
 }

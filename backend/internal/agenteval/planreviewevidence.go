@@ -24,7 +24,6 @@
 package agenteval
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -264,10 +263,8 @@ func readExistingCatchRateEvidence(path string) (*CatchRateEvidence, error) {
 
 func decodeCatchRateEvidence(raw []byte) (*CatchRateEvidence, error) {
 	var rec CatchRateEvidence
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&rec); err != nil {
-		return nil, fmt.Errorf("malformed JSON or unknown field: %w", err)
+	if err := decodeStrictJSON(raw, &rec); err != nil {
+		return nil, fmt.Errorf("malformed JSON, unknown field or trailing content: %w", err)
 	}
 	if rec.Schema != CatchRateEvidenceSchema {
 		return nil, fmt.Errorf("schema %q is not %q", rec.Schema, CatchRateEvidenceSchema)
@@ -308,7 +305,7 @@ func writeCatchRateEvidence(path string, rec CatchRateEvidence) error {
 // fails closed, each with a message naming the run-book, on:
 //
 //	(1) an absent evidence file
-//	(2) malformed JSON or an unknown field
+//	(2) malformed JSON, an unknown field, or trailing content after the record
 //	(3) a wrong schema
 //	(4) a stale prompt fingerprint, or a generator model other than generatorModel
 //	(5) a recorded tolerance / min_trials_per_arm differing from the current constants

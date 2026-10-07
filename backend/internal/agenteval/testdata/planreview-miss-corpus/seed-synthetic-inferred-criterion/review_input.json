@@ -89,11 +89,15 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-list-pagination",
-    "page size",
-    "pagination",
-    "paginate",
-    "100 items"
+    "not warranted",
+    "unwarranted",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not requested",
+    "never requested",
+    "not asked for",
+    "scope creep"
   ],
   "catching_examples": [
     {
@@ -104,7 +108,7 @@
     {
       "severity": "medium",
       "category": "warrant",
-      "note": "The plan invents pagination the issue does not request; the paginate-at-100 criterion should be dropped or sourced."
+      "note": "Pagination is scope creep the issue does not ask for; the paginate-at-100 criterion should be dropped or sourced."
     }
   ],
   "non_catching_examples": [
@@ -122,6 +126,21 @@
       "severity": "low",
       "category": "risk",
       "note": "The rollback plan does not mention clients that start depending on the new endpoint."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "The pagination cursor is not documented in openapi.yaml."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "No test asserts the next_cursor when a tenant has more than 100 items."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Add a test that GET /widgets paginates correctly at exactly 100 items."
     }
   ]
 }

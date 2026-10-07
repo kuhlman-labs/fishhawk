@@ -103,12 +103,17 @@
     "predicted_runtime_confidence": "medium"
   },
   "catch_probes": [
-    "ac-archive-rate-limit",
-    "rate limit",
-    "rate-limit",
-    "ratelimit",
-    "429",
-    "throttl"
+    "not warranted",
+    "unwarranted",
+    "never asks for",
+    "never asked for",
+    "does not ask for",
+    "doesn't ask for",
+    "never mentions",
+    "not requested",
+    "not asked for",
+    "rationale is generic",
+    "generic rationale"
   ],
   "catching_examples": [
     {
@@ -137,6 +142,21 @@
       "severity": "low",
       "category": "risk",
       "note": "The down migration drops the column; any archived state is lost on rollback."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers the rate limit resetting after the one-minute window."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the 429 response in api/openapi.yaml alongside 200/404/409."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "A rate limited tenant could retry in a tight loop; add a Retry-After header."
     }
   ]
 }

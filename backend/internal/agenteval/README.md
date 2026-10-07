@@ -573,7 +573,7 @@ hand-curated `review_input.json` beside its `miss.json`:
   "issue_title": "…",
   "issue_body": "…",
   "plan": { "plan_version": "standard_v1", "…": "a COMPLETE plan plan.Parse accepts" },
-  "catch_probes": ["criterion-id", "a phrase only a catching concern uses"],
+  "catch_probes": ["contradicts the issue", "another phrase only a catching concern uses"],
   "catching_examples": [{"category": "acceptance_criteria", "note": "…"}],
   "non_catching_examples": [{"category": "security", "note": "…"}]
 }
@@ -590,14 +590,31 @@ function: a probe matching any `non_catching_examples` entry, or a
 the matcher's meaning requires a `catchRuleVersion` bump, which changes the
 evidence fingerprint and forces a re-measurement.
 
+**A probe never occurs in what the reviewer is shown (mode m,
+`planreview-catch-v2`).** The loader refuses a probe that occurs, case-folded,
+in the issue title, the issue body, or any key or value of the plan —
+including the planted criterion's own id and statement. A reviewer quotes that
+text in ordinary concerns about UNRELATED aspects ("Test the edge case where
+cancellation interrupts backoff"; "Approach step 4 must also update
+docs/api.md"); a probe drawn from it scores such a concern as a catch,
+inflating both arms toward a ceiling that hides a dilution. Probes are
+therefore defect-naming phrases only a concern flagging the planted defect
+uses (`contradicts the issue`, `not warranted`, `untestable`, `vacuous`,
+`restates the approach`). Author `non_catching_examples` that ECHO the issue
+and plan wording so mode (j) pins that they score missed;
+`TestCommittedCatchProbes_EchoesScoreMissed` additionally scores a concern
+quoting each case's issue, criteria and approach verbatim as missed, and
+`TestCommittedCatchProbes_AbsentFromConventionsFixture` keeps every probe out
+of the conventions fixture, which only the with arm shows.
+
 `LoadPlanReviewCatchCorpus` fails closed (an error naming the case) on: (a) an
 absent corpus dir, (b) zero cases, (c) a missing `review_input.json`, (d)
-malformed JSON or an unknown field, (e) an empty `issue_title`/`issue_body`,
+malformed JSON, an unknown field, or trailing content after the JSON value, (e) an empty `issue_title`/`issue_body`,
 (f) a plan `plan.Parse` rejects, (g) a plan lacking the miss criterion id —
 the defect must be IN the reviewed plan, (h) a criterion statement differing
 from `miss.json`, (i) empty or blank probes, (j) a probe matching a
 non-catching example, (k) a catching example matching no probe, (l) empty
-example lists. `synthetic` is NOT required: the six `seed-synthetic-*` cases
+example lists, (m) a probe occurring in the issue or plan text. `synthetic` is NOT required: the six `seed-synthetic-*` cases
 carry `synthetic: true`, and a curated production case (`synthetic: false`
 with a `review_input.json`) is legal. A distilled plan-review-miss case
 committed WITHOUT a `review_input.json` fails mode (c) in verify.
@@ -607,7 +624,9 @@ committed WITHOUT a `review_input.json` fails mode (c) in verify.
 Each case renders through the REAL `prompt.Build("plan_review")` twice:
 `ArmWithoutConventions` (no conventions section) and `ArmWithConventions` (the
 committed `representative-conventions.md`, a page of non-adversarial review
-prose rendered through the real `repodoc.ToPromptDocument` path).
+prose shaped by the real `repodoc.Fetched.Document` — the content hash, the
+size cap and delimiter-line neutralization, the same call `repodoc.Resolve`
+makes — and rendered through `repodoc.ToPromptDocument`).
 `TestCatchRateArms_DifferOnlyInConventionsSection` pins that the arms differ
 ONLY by that section. A trial is caught / missed / undecodable
 (`ClassifyCatch`); an UNDECODABLE verdict counts as a MISS in the rate and is
@@ -753,7 +772,9 @@ so such a change still runs the gate.
 
 It RECOMPUTES the verdict from the counts (the record has no verdict field to
 trust) and refuses, naming the run-book, on: (1) an absent record, (2)
-malformed JSON or an unknown field, (3) a wrong schema, (4) a stale
+malformed JSON, an unknown field, or trailing content after the record (a
+second object or garbage appended to a passing record is refused, not
+ignored), (3) a wrong schema, (4) a stale
 fingerprint or another generator model, (5) a recorded tolerance /
 `min_trials_per_arm` differing from the constants, (6) inconsistent counts —
 negative, `caught + undecodable > trials`, per-case `trials != samples_per_case`,
@@ -768,7 +789,13 @@ conventions fixture. Each mode has its own row in
 
 `catchrategate` (package `main` under `backend/internal/agenteval/catchrategate`)
 wraps `CheckCatchRateEvidence`: exit 0 pass (report on stdout, including the
-rule in words), 1 gate failure (reason on stderr), 2 usage error.
+rule in words), 1 gate failure (reason on stderr), 2 usage error. EVERY
+outcome — pass, regression, absent, stale or malformed evidence, an
+unavailable corpus or fixture, a usage error, `--print-fingerprint` — ends
+with the rule line (`agenteval.CatchRateRule`: the 0.10 tolerance, the
+pinned-baseline rule, the 136-trial floor and its derivation), on stdout for
+a pass and on stderr otherwise, so `--print-fingerprint`'s stdout stays the
+bare digest.
 `--print-fingerprint` prints the current fingerprint so an operator can confirm
 staleness against the record's `prompt_fingerprint`. Defaults resolve to the
 committed testdata paths under the backend module root, found by walking up

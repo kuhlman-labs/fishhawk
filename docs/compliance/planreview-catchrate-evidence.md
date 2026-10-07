@@ -100,7 +100,10 @@ variance.
 git add backend/internal/agenteval/testdata/planreview-catchrate/evidence.json
 ```
 
-`catchrategate` exits 0 with the rendered report when the record passes. It
+`catchrategate` exits 0 with the rendered report when the record passes.
+Every outcome, pass or fail (absent, stale or malformed evidence and an
+unavailable corpus included), ends with the rule line naming the 0.10
+tolerance, the pinned-baseline rule and the 136-trials-per-arm floor. It
 recomputes the verdict from the counts and refuses an absent, malformed,
 stale, under-powered or regressed record (the twelve modes:
 `backend/internal/agenteval/README.md` §
