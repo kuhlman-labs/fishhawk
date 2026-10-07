@@ -88,12 +88,14 @@ type hostDispatchResponse struct {
 // dispatch_not_admissible: none is ever host-spawned, so marking it 'dispatched'
 // would misrepresent state and could wedge the stage.
 //
-// Post-deploy hold (E35.1 / #1598, ADR-053): a `pending` stage sequenced behind
-// a deploy stage that has not SUCCEEDED (in flight, failed or cancelled) returns
-// 409 dispatch_not_admissible with reason deploy_not_succeeded, leaving the
-// stage state unchanged — the same orchestrator.DeployAheadNotSucceeded
-// predicate Orchestrator.Advance enforces. A stage-list read error there
-// answers 500 dependency_check_failed.
+// Post-deploy hold (E35.1 / #1598, ADR-053; widened E35.3 / #1600): a stage in
+// either admissible arm — `pending` or `awaiting_host_dispatch` — sequenced
+// behind a deploy stage that has not SUCCEEDED (in flight, failed or cancelled)
+// returns 409 dispatch_not_admissible with reason deploy_not_succeeded, leaving
+// the stage state unchanged — the same orchestrator.DeployAheadNotSucceeded
+// predicate Orchestrator.Advance enforces. The idempotent `dispatched` arm is
+// deliberately NOT checked (a dead-runner re-spawn of an already-marked stage).
+// A stage-list read error there answers 500 dependency_check_failed.
 //
 // Dev mode (E72.13 / #3500): a daemon with a dev-only surface mounted
 // (Config.DevFixtures / Config.DevStubForge — what `scripts/dev preview`
@@ -327,13 +329,18 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// advance that fails the run, so a `failed` deploy under a still-`running`
 	// run is a reachable window the terminal-run guard above does not cover.
 	// Checked inside the held stage-admission lock and BEFORE the state
-	// switch/CAS, so a refusal commits NO state and the stage stays `pending`.
-	// Only the `pending` arm is checked: Orchestrator.Advance parks a stage at
-	// awaiting_host_dispatch only AFTER this same hold cleared, i.e. once every
-	// earlier deploy reached `succeeded`, which is terminal and cannot regress.
+	// switch/CAS, so a refusal commits NO state and the stage stays in its
+	// observed state. BOTH admissible arms are checked (E35.3 / #1600):
+	// Orchestrator.Advance parks a stage at awaiting_host_dispatch only after
+	// this same hold cleared, but post-deploy acceptance makes a re-open path
+	// reachable that can park a stage there without passing Advance's hold, so
+	// the marker re-checks rather than trusting that the park implies every
+	// earlier deploy succeeded. The idempotent `dispatched` arm is deliberately
+	// unchanged: a spawn attempt already exists and the caller is re-spawning a
+	// dead runner.
 	// Sequence 0 has nothing ahead of it, so it skips the read. Fail-CLOSED on a
 	// stage-list read error (retryable 500), the wave-order guard's posture.
-	if stage.State == run.StageStatePending && stage.Sequence > 0 {
+	if (stage.State == run.StageStatePending || stage.State == run.StageStateAwaitingHostDispatch) && stage.Sequence > 0 {
 		runStages, lerr := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 		if lerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",

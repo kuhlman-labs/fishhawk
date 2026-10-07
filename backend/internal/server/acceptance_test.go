@@ -298,6 +298,10 @@ func TestHostDispatchAnchorAppendFailure_ShipClampsUndecidable(t *testing.T) {
 				ID: stageID, RunID: runID, Sequence: 4, Type: run.StageTypeAcceptance,
 				ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingHostDispatch,
 			}
+			// The marker's post-deploy hold now also reads the run's stages for
+			// an awaiting_host_dispatch stage (E35.3 / #1600); no deploy stage
+			// is ahead of this one, so the hold admits it.
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.getStages[stageID]}}
 			// A head IS on the chain at-or-before the anchor the marker writes
 			// (the auditFake stamps appended entries at sequence 0), so a
 			// RESOLVABLE anchor binds the verdict to it. The clamp in the fail
@@ -2126,6 +2130,11 @@ func TestTriageAcceptance_Class5_ExternallyUnvalidatable_Paged(t *testing.T) {
 func TestAcceptanceDispositionUnvalidatable_Value(t *testing.T) {
 	if acceptanceDispositionUnvalidatable != "externally_unvalidatable_paged" {
 		t.Errorf("acceptanceDispositionUnvalidatable = %q, want externally_unvalidatable_paged", acceptanceDispositionUnvalidatable)
+	}
+	// E35.3 / #1600: the post-deploy rollback offer token, mirrored as a
+	// literal in issuecomment/ping.go and as a const in mcpserver/next_actions.go.
+	if acceptanceDispositionRollbackOffered != "rollback_offered" {
+		t.Errorf("acceptanceDispositionRollbackOffered = %q, want rollback_offered", acceptanceDispositionRollbackOffered)
 	}
 }
 

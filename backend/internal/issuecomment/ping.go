@@ -477,8 +477,13 @@ func crewSentEscalation(payload []byte) bool {
 // acceptance_triage_decided payload (E31.8 / #1536) and reports whether the
 // disposition is one that needs a human — the paged variants (paged,
 // rerun_budget_exhausted, the *_paged routing-refusal fallbacks, and the
-// class-5 externally_unvalidatable_paged terminal page, #1671). The
-// auto-routed fixup_dispatched / retry_dispatched dispositions return ok=false
+// class-5 externally_unvalidatable_paged terminal page, #1671, and the
+// post-deploy rollback_offered disposition, E35.3 / #1600, which pages a human
+// to decide on an operator-gated rollback the backend never auto-fires). The
+// rollback_offer payload object (its pipeline-supplied rollback_handle
+// especially) is deliberately NOT read or rendered here: the ping names only
+// the class and disposition, so no pipeline free text reaches the forge thread.
+// The auto-routed fixup_dispatched / retry_dispatched dispositions return ok=false
 // (they stay edit-only). ok=false on any decode failure or an unrecognized
 // disposition, so a malformed payload never fires a page-class ping. This
 // package uses string literals, not the server consts — the value is pinned
@@ -497,7 +502,7 @@ func acceptanceTriageNeedsHuman(payload []byte) (class, disposition string, ok b
 	switch p.Disposition {
 	case "paged", "rerun_budget_exhausted",
 		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged",
-		"externally_unvalidatable_paged":
+		"externally_unvalidatable_paged", "rollback_offered":
 		return p.Class, p.Disposition, true
 	default:
 		return "", "", false

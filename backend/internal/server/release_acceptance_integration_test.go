@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -64,6 +69,10 @@ func newReleaseAcceptanceSeam(t *testing.T) *releaseAcceptanceSeam {
 		ApprovalRepo: approval.NewPostgresRepository(pool),
 		AuditRepo:    auditRepo,
 		ArtifactRepo: artifactRepo,
+		// SigningRepo is wired as production wires it so the deployment-record
+		// handler (POST /v0/runs/{run_id}/deployment) is configured; the
+		// rollback-offer seam persists its handle-bearing record through it.
+		SigningRepo:  signing.NewPostgresRepository(pool),
 		Orchestrator: orch,
 		GitHub:       gh,
 	})
@@ -350,5 +359,151 @@ func TestReleaseAcceptance_DeployFailed_NeverDispatchesAcceptance_PgBacked(t *te
 	}
 	if hits := f.dispatchHits(); hits != 1 {
 		t.Fatalf("workflow_dispatch hits = %d, want 1 (the deploy trigger only)", hits)
+	}
+}
+
+// shipDeploymentAsOperator POSTs body through the PRODUCTION deployment-record
+// handler (POST /v0/runs/{run_id}/deployment) under an operator bearer carrying
+// write:runs + write:deploy, failing the test on anything but 201.
+func (f *releaseAcceptanceSeam) shipDeploymentAsOperator(t *testing.T, runID, deployID uuid.UUID, body deploymentBody) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal deployment body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v0/runs/%s/deployment?stage_id=%s", runID, deployID), bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("run_id", runID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "operator:release-seam", TokenID: "tok-release-seam", Scopes: []string{"write:runs", "write:deploy"},
+	}))
+	w := httptest.NewRecorder()
+	f.s.handleShipDeployment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ship deployment status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// chainPayloads reads every category row for runID back from Postgres,
+// decoded, oldest first.
+func (f *releaseAcceptanceSeam) chainPayloads(t *testing.T, runID uuid.UUID, category string) []map[string]any {
+	t.Helper()
+	entries, err := f.audits.ListForRunByCategory(context.Background(), runID, category)
+	if err != nil {
+		t.Fatalf("list %s rows: %v", category, err)
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode %s payload: %v\n%s", category, err, e.Payload)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestReleaseAcceptance_FailedVerdictOffersRollbackWithStoredHandle_PgBacked is
+// the cross-boundary seam for E35.3 / #1600 (C13). On real Postgres and the
+// committed release example it drives the deploy to succeeded through the real
+// approval + reconciler path, persists a handle-bearing deployment record
+// through the PRODUCTION POST /v0/runs/{run_id}/deployment handler (NEWER than
+// the reconciler's handle-less record), settles the acceptance stage, and runs
+// triageAcceptanceFailure on a failed failure_mode=error verdict. It asserts
+// FROM THE AUDIT CHAIN that triage recorded rollback_offered carrying the
+// stored handle and NEVER dispatched (the GitHub stub's count and the
+// deployment_rollback_initiated rows are unchanged), then fires the rollback
+// through the real POST /v0/runs/{run_id}/deployment/rollback handler and
+// asserts the stored handle reached the workflow_dispatch inputs and the
+// chained deployment_rollback_initiated row.
+//
+// It crosses persistence (artifact + audit), triage, the rollback HTTP handler
+// and the GitHub dispatch payload. Counterfactuals: deleting triage's
+// decidePostDeployRollback call site records fixup_unavailable_paged (no
+// offer); deleting the rollback dispatch's handle insertion leaves
+// fishhawk_rollback_handle out of the dispatch inputs.
+func TestReleaseAcceptance_FailedVerdictOffersRollbackWithStoredHandle_PgBacked(t *testing.T) {
+	ctx := context.Background()
+	f := newReleaseAcceptanceSeam(t)
+	runRow, deploy, acceptance := f.startRelease(t)
+	f.approveDeploy(t, deploy)
+	if err := f.s.ResolveDeploymentFromPollState(ctx, runRow.ID, deploy.ID, run.DeployOutcomeSucceeded, "main",
+		&githubclient.WorkflowRun{ID: 777004, HTMLURL: "https://github.com/kuhlman-labs/example/actions/runs/777004",
+			Status: "completed", Conclusion: "success", HeadSHA: releaseDeployedSHA}); err != nil {
+		t.Fatalf("resolve deployment succeeded: %v", err)
+	}
+	f.assertStage(t, deploy.ID, run.StageStateSucceeded, "deploy after a succeeded resolution")
+	f.assertStage(t, acceptance.ID, run.StageStateDispatched, "acceptance once the deploy succeeded")
+
+	// The pipeline's own callback carries the rollback_handle.
+	f.shipDeploymentAsOperator(t, runRow.ID, deploy.ID, deploymentBody{
+		Environment: "staging", Ref: "main", ExternalRunURL: "https://github.com/kuhlman-labs/example/actions/runs/777004",
+		Outcome: string(run.DeployOutcomeSucceeded), RollbackHandle: "rev-abc",
+	})
+	stored, err := f.s.storedRollbackHandleFor(ctx, deploy.ID)
+	if err != nil || stored.Handle != "rev-abc" {
+		t.Fatalf("storedRollbackHandleFor = (%+v, %v), want handle rev-abc from the shipped record", stored, err)
+	}
+
+	// Settle the acceptance stage the way a finished runner would.
+	for _, to := range []run.StageState{run.StageStateRunning, run.StageStateSucceeded} {
+		if _, err := f.runs.TransitionStage(ctx, acceptance.ID, to, nil); err != nil {
+			t.Fatalf("transition acceptance to %s: %v", to, err)
+		}
+	}
+	settled, err := f.runs.GetStage(ctx, acceptance.ID)
+	if err != nil {
+		t.Fatalf("reload acceptance: %v", err)
+	}
+
+	hitsBeforeTriage := f.dispatchHits()
+	disposition := f.s.triageAcceptanceFailure(ctx, runRow.ID, settled,
+		acceptanceBody{Verdict: "failed", FailureMode: acceptanceFailureError}, uuid.NewString())
+	if disposition != acceptanceDispositionRollbackOffered {
+		t.Fatalf("triage disposition = %q, want rollback_offered", disposition)
+	}
+
+	triage := f.chainPayloads(t, runRow.ID, CategoryAcceptanceTriageDecided)
+	if len(triage) != 1 {
+		t.Fatalf("acceptance_triage_decided rows = %d, want 1", len(triage))
+	}
+	if triage[0]["disposition"] != acceptanceDispositionRollbackOffered || triage[0]["class"] != acceptanceClass1 {
+		t.Errorf("triage row = %v, want class 1 / rollback_offered", triage[0])
+	}
+	offer, _ := triage[0]["rollback_offer"].(map[string]any)
+	if offer["rollback_handle"] != "rev-abc" || offer["deploy_stage_id"] != deploy.ID.String() ||
+		offer["deployment_artifact_id"] != stored.ArtifactID.String() {
+		t.Errorf("rollback_offer = %v, want {rollback_handle:rev-abc deploy_stage_id:%s deployment_artifact_id:%s}",
+			offer, deploy.ID, stored.ArtifactID)
+	}
+	if hits := f.dispatchHits(); hits != hitsBeforeTriage {
+		t.Fatalf("workflow_dispatch hits after triage = %d, want %d — the offer must never auto-fire", hits, hitsBeforeTriage)
+	}
+	if rows := f.chainPayloads(t, runRow.ID, CategoryDeploymentRollbackInitiated); len(rows) != 0 {
+		t.Fatalf("deployment_rollback_initiated rows after triage = %d, want 0", len(rows))
+	}
+	f.assertStage(t, deploy.ID, run.StageStateSucceeded, "deploy after the offer (no transition)")
+
+	// The operator fires the offered rollback through the real handler.
+	w := rollbackRequest(t, f.s, runRow.ID, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("rollback status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if hits := f.dispatchHits(); hits != hitsBeforeTriage+1 {
+		t.Errorf("workflow_dispatch hits after the rollback = %d, want %d", hits, hitsBeforeTriage+1)
+	}
+	f.gh.mu.Lock()
+	gotHandle := f.gh.dispatchInputs[rollbackHandleDispatchInput]
+	f.gh.mu.Unlock()
+	if gotHandle != "rev-abc" {
+		t.Errorf("rollback dispatch input %s = %q, want rev-abc", rollbackHandleDispatchInput, gotHandle)
+	}
+	initiated := f.chainPayloads(t, runRow.ID, CategoryDeploymentRollbackInitiated)
+	if len(initiated) != 1 {
+		t.Fatalf("deployment_rollback_initiated rows = %d, want 1", len(initiated))
+	}
+	if initiated[0]["rollback_handle"] != "rev-abc" || initiated[0]["deployment_artifact_id"] != stored.ArtifactID.String() {
+		t.Errorf("deployment_rollback_initiated = %v, want rollback_handle rev-abc + deployment_artifact_id %s",
+			initiated[0], stored.ArtifactID)
 	}
 }
