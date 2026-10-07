@@ -3,15 +3,17 @@
 #
 # Mirrors the loop CI uses for the Go lane: reads registered modules
 # from go.work, runs each module's tests in its own directory.
-# `test` and `verify` fail fast on the first module whose tests fail.
-# `coverage` does NOT: it runs EVERY module, aggregates the surviving coverage
-# profiles, and ends with a per-module summary naming every failed module and
-# whether it failed to BUILD or failed its TESTS (#3403) — a first-failure abort
-# there hid 7 of 8 modules on every CI build for as long as one module stayed
-# red.
+# Every test loop — `test`, `verify` (full, scoped, and the patch-coverage loop)
+# and `coverage` — runs EVERY module, then ends with a stderr summary naming each
+# failed module and exits non-zero (#3403, #4036). A first-failure abort hid 7 of
+# 8 modules on every CI build for as long as one module stayed red, and in the
+# runner's verify-fix loop it hid every later module's failures from the fix
+# agent, so each ~20-minute iteration could fix at most one module. `coverage`
+# additionally classifies each failure as BUILD or TESTS.
 #
 # Usage:
-#   scripts/test              run `go test -race ./...` in every module
+#   scripts/test              run `go test -race ./...` in every module (a failing
+#                             module does not stop the rest; see above)
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
 #   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
@@ -615,8 +617,27 @@ TEST_P="${FISHHAWK_TEST_P:-4}"
 # gate always runs with the 20m default. `single` stays a raw passthrough.
 TEST_TIMEOUT="${FISHHAWK_TEST_TIMEOUT:-20m}"
 
+# _report_failed_modules <ran> <module>...: the shared epilogue of every test
+# loop (#3403, #4036) — `scripts/test: N of M modules failed:` plus one
+# `  - <module>` line per failure, on stderr. Callers guard on a NON-EMPTY failed
+# array before calling: "${arr[@]}" of an empty array is an unbound-variable
+# error under `set -u` in macOS bash 3.2. The caller exits 1 itself, so the
+# verdict never depends on the caller's errexit state.
+_report_failed_modules() {
+  local ran="$1" f
+  shift
+  printf 'scripts/test: %s of %s modules failed:\n' "$#" "$ran" >&2
+  for f in "$@"; do
+    printf '  - %s\n' "$f" >&2
+  done
+}
+
+# cmd_test: every module runs even when an earlier one fails (#4036). Each
+# per-module `go test` is a TESTED command, so `set -e` cannot end the loop at
+# the first red module; the failures are collected and reported together.
 cmd_test() {
-  local mlist m
+  local mlist m ran=0
+  local failed=()
   if ! mlist="$(_module_list)"; then
     echo "$NO_MODULES_MSG" >&2
     exit 1
@@ -624,8 +645,15 @@ cmd_test() {
   _arm_container_lease
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" ./...)
+    ran=$((ran + 1))
+    if ! (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" ./...); then
+      failed+=("$m")
+    fi
   done <<< "$mlist"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    _report_failed_modules "$ran" "${failed[@]}"
+    exit 1
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -812,10 +840,14 @@ _verify_scope_buckets() {
 # cmd_test_scoped <buckets>: cmd_test's loop restricted to the bucketed packages.
 # A module with no listed package is SKIPPED (printed, so the saving is visible in
 # the log). It arms the container lease exactly as cmd_test does — a scoped loop
-# still touches the shared testcontainers Postgres — and fails closed on an
-# unavailable/empty module list with cmd_test's NO_MODULES_MSG contract.
+# still touches the shared testcontainers Postgres — fails closed on an
+# unavailable/empty module list with cmd_test's NO_MODULES_MSG contract, and
+# aggregates failures across the modules it runs exactly as cmd_test does
+# (#4036): the runner's fix iterations verify SCOPED, so this is the loop whose
+# output the fix agent most often reads.
 cmd_test_scoped() {
   local buckets="$1" mlist m mm pp pkgs ran=0
+  local failed=()
   if ! mlist="$(_module_list)"; then
     echo "$NO_MODULES_MSG" >&2
     exit 1
@@ -835,7 +867,9 @@ cmd_test_scoped() {
     # arguments this script built itself, and _verify_scope_buckets already
     # refused any entry carrying whitespace.
     # shellcheck disable=SC2086
-    (cd "$m" && go test -race -p "$TEST_P" $pkgs -timeout "$TEST_TIMEOUT")
+    if ! (cd "$m" && go test -race -p "$TEST_P" $pkgs -timeout "$TEST_TIMEOUT"); then
+      failed+=("$m")
+    fi
     ran=$((ran + 1))
   done <<< "$mlist"
   # Defence in depth against the module list changing between bucketing and this
@@ -843,6 +877,10 @@ cmd_test_scoped() {
   # reason _module_list fails closed — that is a green gate that ran nothing.
   if [ "$ran" -eq 0 ]; then
     echo "scripts/test: scoped verify matched no go.work module — refusing to report success without running any tests" >&2
+    exit 1
+  fi
+  if [ "${#failed[@]}" -gt 0 ]; then
+    _report_failed_modules "$ran" "${failed[@]}"
     exit 1
   fi
 }
@@ -855,8 +893,10 @@ cmd_test_scoped() {
 # is how a red `backend` hid modules 2-8 on every CI build for as long as the
 # deleted `minio/minio` image kept `backend/internal/tracestore` red (#3386), and
 # why #3401 looked like it broke the runner module when it had merely unmasked it.
-# `cmd_test` and the verify loop deliberately KEEP their first-failure abort: they
-# are the fast inner gate, whereas `coverage` is the reporting one.
+# `cmd_test` and the verify loops aggregate the same way since #4036 (the
+# runner's fix loop needs every module's failures in ONE iteration; a passing
+# run costs the same, a failing one also runs the remaining modules). Only this
+# loop CLASSIFIES each failure as BUILD vs TESTS.
 cmd_coverage() {
   local mlist m classify=0 idx=0 cov_rc=0
   # Fail CLOSED on an unavailable or empty module list, exactly as cmd_test does.
@@ -924,11 +964,7 @@ cmd_coverage() {
   fi
 
   if [ "${#failed[@]}" -gt 0 ]; then
-    printf 'scripts/test: %s of %s modules failed:\n' "${#failed[@]}" "$idx" >&2
-    local f
-    for f in "${failed[@]}"; do
-      printf '  - %s\n' "$f" >&2
-    done
+    _report_failed_modules "$idx" "${failed[@]}"
     exit 1
   fi
   return "$cov_rc"
@@ -1233,6 +1269,11 @@ _patch_cov_emit_snapshot() {
 # run the tests; _verify_patch_coverage verifies the digest and consumes the
 # snapshot AFTER. A snapshot rewritten by a test during the loop no longer
 # matches the pre-test digest and fails closed.
+#
+# Like cmd_test, every module runs even when an earlier one fails (#4036), and a
+# failed loop prints the module summary and EXITS 1 here — BEFORE
+# _verify_patch_coverage. The verdict is already red, a failed module's profile
+# is partial, and the summary stays the last thing a reader sees.
 cmd_test_with_patch_coverage() {
   local mods="$1" base="$2" mlist
   # Re-enumerate defensively: bucketing enumerated the modules earlier, but if
@@ -1274,9 +1315,11 @@ cmd_test_with_patch_coverage() {
   # only as a human-readable SUFFIX for provenance, where a collision is
   # harmless. `(( ++cov_idx ))` is pre-increment: post-increment returns the old
   # value, and `(( 0 ))` is false, which aborts under `set -e`.
-  local m mm pp pkgs slug cov_idx=0
+  local m mm pp pkgs slug cov_idx=0 ran=0
+  local failed=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
+    ran=$((ran + 1))
     pkgs=""
     while IFS=$'\t' read -r mm pp; do
       if [ "${mm#./}" = "${m#./}" ]; then pkgs="$pp"; fi
@@ -1284,12 +1327,20 @@ cmd_test_with_patch_coverage() {
     if [ -n "$pkgs" ]; then
       (( ++cov_idx ))
       slug="$(printf '%s' "${m#./}" | tr '/' '_')"
-      (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
-        -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...)
+      if ! (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
+        -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...); then
+        failed+=("$m")
+      fi
     else
-      (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT")
+      if ! (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT"); then
+        failed+=("$m")
+      fi
     fi
   done <<< "$mlist"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    _report_failed_modules "$ran" "${failed[@]}"
+    exit 1
+  fi
 }
 
 # _verify_patch_coverage: run the diff-scoped gate over the profiles the loop
@@ -2326,7 +2377,8 @@ usage() {
   cat <<'EOF'
 usage: scripts/test [SUBCOMMAND] [ARGS]
 
-  test                 (default) run `go test -race ./...` in every module
+  test                 (default) run `go test -race ./...` in every module; every
+                       module runs, then a summary names each failed module
   coverage             run tests + aggregate coverage gate
   lint                 run `golangci-lint run --allow-serial-runners ./...` in every module
   verify               lint + schema-sync + tests + patch-scoped coverage — the runner's verify gate
