@@ -30,7 +30,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -141,32 +140,24 @@ type upkeepReportBinding struct {
 // artifact, a wrong kind or a parse failure → a wrapped error (500), never a
 // silent fallback to an older report.
 func (s *Server) latestUpkeepReport(ctx context.Context, runID uuid.UUID) (*upkeepReportBinding, error) {
-	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.UpkeepReportRecordedCategory)
+	// The newest row of ANY artifact (recordedReportRow, report_seam.go; a
+	// tie, impossible on one chain, takes the later-listed row). Its list
+	// failure is re-worded with the run id here, rewrapping the store error
+	// rather than the seam's own wrap, so the text is not double-wrapped.
+	newest, err := s.recordedReportRow(ctx, runID, audit.UpkeepReportRecordedCategory, "")
 	if err != nil {
-		return nil, fmt.Errorf("list upkeep_report_recorded rows for run %s: %w", runID, err)
-	}
-	var newest *audit.Entry
-	for _, e := range rows {
-		if e == nil {
-			continue
+		var le *reportRowsListError
+		if errors.As(err, &le) {
+			return nil, fmt.Errorf("list upkeep_report_recorded rows for run %s: %w", runID, le.Err)
 		}
-		// >= so a tie (impossible on one chain) takes the later-listed row.
-		if newest == nil || e.Sequence >= newest.Sequence {
-			newest = e
-		}
+		return nil, err
 	}
 	if newest == nil {
 		return nil, errUpkeepReportAbsent
 	}
-	var p struct {
-		ArtifactID string `json:"artifact_id"`
-	}
-	if jerr := json.Unmarshal(newest.Payload, &p); jerr != nil {
-		return nil, fmt.Errorf("decode upkeep_report_recorded row %d: %w", newest.Sequence, jerr)
-	}
-	artID, perr := uuid.Parse(p.ArtifactID)
+	artID, perr := recordedRowArtifactID(newest, audit.UpkeepReportRecordedCategory)
 	if perr != nil {
-		return nil, fmt.Errorf("upkeep_report_recorded row %d names artifact %q: %w", newest.Sequence, p.ArtifactID, perr)
+		return nil, perr
 	}
 	art, gerr := s.cfg.ArtifactRepo.Get(ctx, artID)
 	if gerr != nil {
@@ -472,31 +463,13 @@ func (s *Server) handleRecordUpkeepDispositions(w http.ResponseWriter, r *http.R
 // key (authorise_delegation_tier) or an undeclared nested field was silently
 // dropped while the rest of the entry recorded — a 200 that discarded the
 // captain's intent. This is what makes the request schema's
-// additionalProperties:false true. Kept local: the shared decodeSingleJSONBody
-// that grooming uses stays lenient.
+// additionalProperties:false true. The strict decode is the shared seam's
+// decodeStrictSingleJSONBody (report_seam.go) with this request's two
+// messages; the shared decodeSingleJSONBody that grooming uses stays lenient.
 func (s *Server) decodeUpkeepDispositionsBody(w http.ResponseWriter, r *http.Request, dst *upkeepDispositionRequest) bool {
-	if r.Body == nil {
-		return true
-	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	decErr := dec.Decode(dst)
-	switch {
-	case decErr != nil && !errors.Is(decErr, io.EOF):
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"request body must be valid JSON {dispositions:[{finding_id, verdict, authorize_delegation_tier, parent_epic}]} with no other keys; an unknown or misspelled key is refused rather than dropped",
-			map[string]any{"error": decErr.Error()})
-		return false
-	case decErr == nil:
-		var trailing json.RawMessage
-		if tErr := dec.Decode(&trailing); !errors.Is(tErr, io.EOF) {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success",
-				map[string]any{"field": "body"})
-			return false
-		}
-	}
-	return true
+	return s.decodeStrictSingleJSONBody(w, r, dst,
+		"request body must be valid JSON {dispositions:[{finding_id, verdict, authorize_delegation_tier, parent_epic}]} with no other keys; an unknown or misspelled key is refused rather than dropped",
+		"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success")
 }
 
 // writeUpkeepWindowClosed is the U11 refusal, shared by both append paths.

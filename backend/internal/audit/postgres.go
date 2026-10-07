@@ -714,6 +714,54 @@ func (r *postgresRepo) AppendChainedUpkeepWindowClose(ctx context.Context, p Cha
 	return watermark, consumed, nil
 }
 
+// AppendChainedFamilyDispositionBatch implements FamilyWindowAppender: the
+// generic, family-keyed one-transaction capture (#4012). The family is
+// resolved BEFORE pgx.BeginFunc, so an unknown name is refused with
+// *UnknownWindowFamilyError without opening a transaction; otherwise a thin
+// wrapper delegating to AppendChainedFamilyDispositionBatchTx. TxOptions are
+// deliberately NOT set (READ COMMITTED; see the Tx core's header).
+func (r *postgresRepo) AppendChainedFamilyDispositionBatch(ctx context.Context, family, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	if _, err := resolveWindowFamily(family); err != nil {
+		return nil, err
+	}
+	var out []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entries, aerr := AppendChainedFamilyDispositionBatchTx(ctx, tx, family, artifactID, ps)
+		if aerr != nil {
+			return aerr
+		}
+		out = entries
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AppendChainedFamilyWindowClose implements FamilyWindowAppender: the generic,
+// family-keyed one-transaction settlement (#4012). Unknown family refused
+// before BeginFunc, as above; TxOptions deliberately NOT set.
+func (r *postgresRepo) AppendChainedFamilyWindowClose(ctx context.Context, family string, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	if _, err := resolveWindowFamily(family); err != nil {
+		return nil, nil, err
+	}
+	var watermark *Entry
+	var consumed []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		w, c, cerr := AppendChainedFamilyWindowCloseTx(ctx, tx, family, p, artifactID)
+		if cerr != nil {
+			return cerr
+		}
+		watermark, consumed = w, c
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return watermark, consumed, nil
+}
+
 func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
 	row, err := q.GetAuditEntry(ctx, id)
@@ -900,3 +948,9 @@ var _ GroomingWindowAppender = (*postgresRepo)(nil)
 // fall back to its non-atomic leg (no binding re-check, no in-tx watermark
 // scan); this turns that regression into a build failure.
 var _ UpkeepWindowAppender = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the GENERIC family-keyed
+// window capability (#4012). Losing it would move the comms capture and apply
+// onto the server's non-atomic fallback (no binding re-check, no in-tx
+// watermark scan); this turns that regression into a build failure.
+var _ FamilyWindowAppender = (*postgresRepo)(nil)

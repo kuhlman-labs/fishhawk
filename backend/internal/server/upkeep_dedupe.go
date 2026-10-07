@@ -22,12 +22,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/intakegroom"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/upkeep"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
-	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // The two degrade reasons only the adapter can produce. Every other reason is
@@ -105,28 +102,17 @@ func (s *Server) upkeepDuplicates(ctx context.Context, runRow *run.Run, proposal
 		return upkeepDedupeDegraded(reason)
 	}
 
-	// The run-scoped target, built the way handleFileWorkItem's run-scoped
-	// path builds it: coordinates from the run, provider connections from the
-	// conventions, the credential scope from the run's installation.
-	target := workmgmt.Target{
-		Repo:    workmgmt.Repo{Owner: owner, Name: name},
-		Project: conv.Project,
-		Jira:    conv.Jira,
-		GitLab:  conv.GitLab,
-	}
-	if runRow.InstallationID != nil {
-		target.Scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
-	}
-	if target.Scope.IsZero() && s.cfg.GitHub != nil && conv.Provider == workmgmtgithub.ProviderName {
-		scope, rerr := s.resolveRepoScope(dctx, owner, name)
-		if rerr != nil {
-			// A failed installation lookup is a failed forge read: the
-			// candidate window cannot be enumerated without the scope.
-			reason := upkeepDedupeDeadlineOr(dctx, string(intakegroom.DegradeReasonReaderError))
-			s.logUpkeepDedupeDegrade(ctx, runRow, reason, "resolve repo installation: "+rerr.Error())
-			return upkeepDedupeDegraded(reason)
-		}
-		target.Scope = scope
+	// The run-scoped target (runScopedWorkTarget, report_seam.go), built the
+	// way handleFileWorkItem's run-scoped path builds it: coordinates from the
+	// run, provider connections from the conventions, the credential scope
+	// from the run's installation, else resolved for the GitHub provider.
+	target, rerr := s.runScopedWorkTarget(dctx, runRow, owner, name, conv)
+	if rerr != nil {
+		// A failed installation lookup is a failed forge read: the
+		// candidate window cannot be enumerated without the scope.
+		reason := upkeepDedupeDeadlineOr(dctx, string(intakegroom.DegradeReasonReaderError))
+		s.logUpkeepDedupeDegrade(ctx, runRow, reason, "resolve repo installation: "+rerr.Error())
+		return upkeepDedupeDegraded(reason)
 	}
 
 	candidates, truncated, reason := s.intakeCandidates(dctx, conv, target)

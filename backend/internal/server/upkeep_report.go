@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -115,52 +114,26 @@ func (s *Server) guardUpkeepStageProposal(w http.ResponseWriter, r *http.Request
 }
 
 // upkeepGuardMaxKindBytes bounds the agent-supplied top-level kind that
-// upkeepGuardBodyDetail echoes back (#3922 approval condition 6): the text
-// reaches the 400, the stage's failure reason and the schema-retry feedback.
-const upkeepGuardMaxKindBytes = 64
+// upkeepGuardBodyDetail echoes back (#3922 approval condition 6): the shared
+// seam's proposalGuardMaxKindBytes (report_seam.go).
+const upkeepGuardMaxKindBytes = proposalGuardMaxKindBytes
 
 // upkeepGuardBodyDetail says why a body refused on an upkeep-declaring stage
-// was read as a plan: derr non-nil means it did not parse (the parse error is
-// kept verbatim); otherwise it carries no top-level "kind", carries a kind
-// plan.AllArtifactKinds recognizes that upkeepStageAllowedKinds does not admit
-// (an explicit "plan" — #3924 carried item 9), or carries one nothing
-// recognizes, which is echoed truncated to upkeepGuardMaxKindBytes. Pure; derr
-// is plan.DetectArtifactKind's error.
+// was read as a plan: proposalGuardBodyDetail (report_seam.go) over the
+// upkeep_report kind and upkeepStageAllowedKinds. derr non-nil means it did
+// not parse (the parse error is kept verbatim); otherwise it carries no
+// top-level "kind", carries a kind plan.AllArtifactKinds recognizes that
+// upkeepStageAllowedKinds does not admit (an explicit "plan" — #3924 carried
+// item 9), or carries one nothing recognizes, which is echoed truncated to
+// upkeepGuardMaxKindBytes. Pure; derr is plan.DetectArtifactKind's error.
 func upkeepGuardBodyDetail(body []byte, derr error) string {
-	if derr != nil {
-		return "the body is not a parseable upkeep_report (" + derr.Error() + ")"
-	}
-	var disc struct {
-		Kind string `json:"kind"`
-	}
-	// DetectArtifactKind already decoded this body into the same shape, so a
-	// decode error here is unreachable; it reads as kind-less either way.
-	_ = json.Unmarshal(body, &disc)
-	if disc.Kind == "" {
-		return `the body carries no top-level "kind", so it was read as a plan`
-	}
-	if upkeepGuardRecognizedKind(disc.Kind) && !upkeepStageAllowedKinds[plan.ArtifactKind(disc.Kind)] {
-		// A recognized kind is a constant, never agent-chosen text, so it is
-		// echoed whole.
-		return fmt.Sprintf("its top-level kind %q is a recognized artifact kind but is not allowed on a stage declaring produces: upkeep_report", disc.Kind)
-	}
-	k := disc.Kind
-	if len(k) > upkeepGuardMaxKindBytes {
-		k = strings.ToValidUTF8(k[:upkeepGuardMaxKindBytes], "") + "...[truncated]"
-	}
-	return fmt.Sprintf("its top-level kind %q is not a recognized artifact kind", k)
+	return proposalGuardBodyDetail(body, derr, string(plan.KindUpkeepReport), upkeepStageAllowedKinds)
 }
 
 // upkeepGuardRecognizedKind reports whether kind is one of
-// plan.AllArtifactKinds — the enumeration a new plan-stage sibling must join —
-// so the guard detail tracks the recognized set without a second list.
+// plan.AllArtifactKinds (recognizedArtifactKind, report_seam.go).
 func upkeepGuardRecognizedKind(kind string) bool {
-	for _, k := range plan.AllArtifactKinds() {
-		if string(k) == kind {
-			return true
-		}
-	}
-	return false
+	return recognizedArtifactKind(kind)
 }
 
 // handleUpkeepReport ingests an upkeep_report artifact — the THIRD additive

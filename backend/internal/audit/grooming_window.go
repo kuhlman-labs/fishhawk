@@ -36,9 +36,9 @@ package audit
 //
 // THE PROTOCOL IS FAMILY-PARAMETERIZED (#3923). The two Tx cores and the scan
 // helpers take a windowFamily — {disposition category, watermark category,
-// closed-error constructor, optional binding re-check} — so a second
-// disposition family reuses the SAME locking and permanence code instead of a
-// copy. Two families exist:
+// closed- and superseded-error constructors, optional binding re-check} — so
+// another disposition family reuses the SAME locking and permanence code
+// instead of a copy. Three families exist:
 //
 //   - grooming (#2991): grooming_disposition_recorded under the
 //     grooming_apply_window_closed watermark. Its exported entry points and
@@ -54,6 +54,23 @@ package audit
 //     Under the run-row lock the batch re-reads the newest recorded row and
 //     refuses with *UpkeepReportSupersededError (writing NOTHING) when it no
 //     longer names the capture's artifact.
+//   - comms (#4012, E3775.2): comms_disposition_recorded under the
+//     comms_apply_window_closed watermark, with the upkeep-style BINDING
+//     RE-CHECK over the newest comms_report_recorded row. It has NO typed entry
+//     points of its own: it is reached through the GENERIC FamilyWindowAppender
+//     (AppendChainedFamilyDispositionBatch / AppendChainedFamilyWindowClose,
+//     keyed by family name) and refuses with the generic *WindowClosedError /
+//     *ReportSupersededError, both carrying Family. Its writers are the later
+//     comms phases; nothing appends these rows yet.
+//
+// The generic entry resolves the family name through ONE registry
+// (windowFamilies; LookupWindowFamily exposes its categories to the server's
+// non-atomic fallback) BEFORE touching the transaction: an unknown name is
+// refused with *UnknownWindowFamilyError (errors.Is ErrUnknownWindowFamily)
+// and writes NOTHING — a zero-value family would carry empty categories and
+// append its params unchecked. Grooming and upkeep are known families there
+// too, and keep their OWN typed errors through it, so the typed and generic
+// entry points can never disagree about one family.
 //
 // Family isolation: every scan filters by the family's OWN categories, so a
 // grooming watermark never closes an upkeep window (or vice versa) even when
@@ -117,6 +134,87 @@ const UpkeepDispositionRecordedCategory = "upkeep_disposition_recorded"
 // same value). The upkeep batch's binding re-check reads it: the
 // HIGHEST-sequence row names the report a capture must still be bound to.
 const UpkeepReportRecordedCategory = "upkeep_report_recorded"
+
+// WindowFamilyGrooming, WindowFamilyUpkeep and WindowFamilyComms are the
+// registered window-family names the generic FamilyWindowAppender entry points
+// and LookupWindowFamily key on. An unregistered name is refused with
+// ErrUnknownWindowFamily.
+const (
+	WindowFamilyGrooming = "grooming"
+	WindowFamilyUpkeep   = "upkeep"
+	WindowFamilyComms    = "comms"
+)
+
+// CommsDispositionRecordedCategory is the audit category one captain
+// disposition against a comms-report entry lands under (#4012; writer: the
+// later comms capture phase). Defined beside the protocol that consumes it,
+// as GroomingDispositionRecordedCategory is. Registered in KnownCategories.
+const CommsDispositionRecordedCategory = "comms_disposition_recorded"
+
+// CommsApplyWindowClosedCategory is the comms family's WATERMARK (#4012): the
+// later comms apply appends one per comms-report artifact it settles, on
+// approve AND reject, through AppendChainedFamilyWindowClose. Registered in
+// KnownCategories.
+const CommsApplyWindowClosedCategory = "comms_apply_window_closed"
+
+// CommsReportRecordedCategory is the row appended once per ingested comms
+// report artifact (#4012; writer: the later comms ingest phase). The comms
+// batch's binding re-check reads it: the HIGHEST-sequence row names the report
+// a capture must still be bound to. Registered in KnownCategories.
+const CommsReportRecordedCategory = "comms_report_recorded"
+
+// ErrUnknownWindowFamily is the sentinel a *UnknownWindowFamilyError wraps:
+// the generic entry points were handed a family name the registry does not
+// know. Nothing is written and no transaction is opened.
+var ErrUnknownWindowFamily = errors.New("audit: unknown window family")
+
+// UnknownWindowFamilyError names the refused family. errors.Is matches
+// ErrUnknownWindowFamily.
+type UnknownWindowFamilyError struct {
+	Family string
+}
+
+func (e *UnknownWindowFamilyError) Error() string {
+	return fmt.Sprintf("audit: unknown window family %q (known: %s, %s, %s)",
+		e.Family, WindowFamilyGrooming, WindowFamilyUpkeep, WindowFamilyComms)
+}
+
+// Unwrap lets errors.Is(err, ErrUnknownWindowFamily) match.
+func (*UnknownWindowFamilyError) Unwrap() error { return ErrUnknownWindowFamily }
+
+// WindowClosedError is the GENERIC closed-window refusal (#4012), returned by
+// families without a typed error of their own (comms, and any later family)
+// when a capture arrives for an artifact whose window is already settled —
+// nothing is written. Same facts as GroomingWindowClosedError plus the Family.
+type WindowClosedError struct {
+	Family     string
+	ArtifactID string
+	Settlement string
+	Sequence   int64
+	ClosedAt   time.Time
+}
+
+func (e *WindowClosedError) Error() string {
+	return fmt.Sprintf("audit: %s capture window for artifact %s is closed (settlement=%s, watermark sequence %d)",
+		e.Family, e.ArtifactID, e.Settlement, e.Sequence)
+}
+
+// ReportSupersededError is the GENERIC binding re-check refusal (#4012): the
+// HIGHEST-sequence report row of the family no longer names ArtifactID.
+// Nothing is written. CurrentArtifactID is "" when that row is absent or
+// undecodable (still a refusal, the fail-closed direction) and CurrentSequence
+// 0 when absent.
+type ReportSupersededError struct {
+	Family            string
+	ArtifactID        string
+	CurrentArtifactID string
+	CurrentSequence   int64
+}
+
+func (e *ReportSupersededError) Error() string {
+	return fmt.Sprintf("audit: %s report %s is superseded by %q (report sequence %d); re-capture against the current report",
+		e.Family, e.ArtifactID, e.CurrentArtifactID, e.CurrentSequence)
+}
 
 // GroomingWindowClosedError is returned when a capture arrives for an artifact
 // whose window has already been settled — nothing is written. Settlement is the
@@ -205,6 +303,57 @@ type UpkeepWindowAppender interface {
 	AppendChainedUpkeepWindowClose(ctx context.Context, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error)
 }
 
+// FamilyWindowAppender is the GENERIC, family-keyed form of the capture/apply
+// capability (#4012). It drives the SAME Tx cores as the typed grooming and
+// upkeep appenders, selected by family name (WindowFamily*), so a new family
+// needs a registry entry rather than a new interface. Kept OFF
+// audit.Repository for the same reason as the typed capabilities; postgresRepo
+// carries it (compile-time assertion in postgres.go) and
+// decisionindex.IndexingRepository forwards it.
+//
+// An unknown family is refused with *UnknownWindowFamilyError BEFORE any
+// transaction opens, writing nothing. A known family returns ITS refusals:
+// grooming and upkeep their typed errors, comms the generic *WindowClosedError
+// / *ReportSupersededError.
+type FamilyWindowAppender interface {
+	// AppendChainedFamilyDispositionBatch appends a whole capture batch for the
+	// named family under the run-row lock in ONE transaction (binding re-check
+	// and watermark scan first, writing NOTHING on a refusal).
+	AppendChainedFamilyDispositionBatch(ctx context.Context, family, artifactID string, ps []ChainAppendParams) ([]*Entry, error)
+	// AppendChainedFamilyWindowClose settles artifactID's window for the named
+	// family in ONE transaction, returning the watermark and the consumed
+	// dispositions. An existing watermark is returned UNCHANGED (permanence).
+	AppendChainedFamilyWindowClose(ctx context.Context, family string, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error)
+}
+
+// WindowFamilyInfo is the read-only view of one registered family's
+// categories, for callers that must scan the same rows without the atomic
+// capability (the server's non-atomic fallback). ReportCategory is "" for a
+// family without a binding re-check (grooming).
+type WindowFamilyInfo struct {
+	Name                string
+	DispositionCategory string
+	WatermarkCategory   string
+	ReportCategory      string
+}
+
+// LookupWindowFamily returns the registered family's categories, ok=false for
+// an unknown name. It reads the SAME registry the generic entry points
+// resolve through, so the atomic path and the fallback can never scan
+// different categories for one family.
+func LookupWindowFamily(name string) (WindowFamilyInfo, bool) {
+	f, ok := windowFamilies[name]
+	if !ok {
+		return WindowFamilyInfo{}, false
+	}
+	return WindowFamilyInfo{
+		Name:                f.name,
+		DispositionCategory: f.dispositionCategory,
+		WatermarkCategory:   f.watermarkCategory,
+		ReportCategory:      f.reportCategory,
+	}, true
+}
+
 // windowFamily parameterizes the capture/apply protocol over one disposition
 // family. name only shapes wrapped error text ("grooming" keeps the
 // pre-generalization strings byte-identical).
@@ -217,10 +366,14 @@ type windowFamily struct {
 	// reportCategory, when non-empty, enables the batch's BINDING RE-CHECK: the
 	// highest-sequence row of this category must name the capture's artifact.
 	reportCategory string
+	// superseded builds the family's binding re-check refusal; required when
+	// reportCategory is set. currentArtifactID is "" and currentSeq 0 when the
+	// newest report row is absent.
+	superseded func(artifactID, currentArtifactID string, currentSeq int64) error
 }
 
 var groomingFamily = windowFamily{
-	name:                "grooming",
+	name:                WindowFamilyGrooming,
 	dispositionCategory: GroomingDispositionRecordedCategory,
 	watermarkCategory:   GroomingApplyWindowClosedCategory,
 	closed: func(artifactID, settlement string, seq int64, closedAt time.Time) error {
@@ -229,13 +382,48 @@ var groomingFamily = windowFamily{
 }
 
 var upkeepFamily = windowFamily{
-	name:                "upkeep",
+	name:                WindowFamilyUpkeep,
 	dispositionCategory: UpkeepDispositionRecordedCategory,
 	watermarkCategory:   UpkeepApplyWindowClosedCategory,
 	closed: func(artifactID, settlement string, seq int64, closedAt time.Time) error {
 		return &UpkeepWindowClosedError{ArtifactID: artifactID, Settlement: settlement, Sequence: seq, ClosedAt: closedAt}
 	},
 	reportCategory: UpkeepReportRecordedCategory,
+	superseded: func(artifactID, currentArtifactID string, currentSeq int64) error {
+		return &UpkeepReportSupersededError{ArtifactID: artifactID, CurrentArtifactID: currentArtifactID, CurrentSequence: currentSeq}
+	},
+}
+
+var commsFamily = windowFamily{
+	name:                WindowFamilyComms,
+	dispositionCategory: CommsDispositionRecordedCategory,
+	watermarkCategory:   CommsApplyWindowClosedCategory,
+	closed: func(artifactID, settlement string, seq int64, closedAt time.Time) error {
+		return &WindowClosedError{Family: WindowFamilyComms, ArtifactID: artifactID, Settlement: settlement, Sequence: seq, ClosedAt: closedAt}
+	},
+	reportCategory: CommsReportRecordedCategory,
+	superseded: func(artifactID, currentArtifactID string, currentSeq int64) error {
+		return &ReportSupersededError{Family: WindowFamilyComms, ArtifactID: artifactID, CurrentArtifactID: currentArtifactID, CurrentSequence: currentSeq}
+	},
+}
+
+// windowFamilies is the ONE family registry the generic entry points and
+// LookupWindowFamily resolve through.
+var windowFamilies = map[string]windowFamily{
+	WindowFamilyGrooming: groomingFamily,
+	WindowFamilyUpkeep:   upkeepFamily,
+	WindowFamilyComms:    commsFamily,
+}
+
+// resolveWindowFamily returns the registered family for name, or
+// *UnknownWindowFamilyError. The generic Tx cores and postgresRepo's wrappers
+// call it FIRST, before any transaction or write.
+func resolveWindowFamily(name string) (windowFamily, error) {
+	f, ok := windowFamilies[name]
+	if !ok {
+		return windowFamily{}, &UnknownWindowFamilyError{Family: name}
+	}
+	return f, nil
 }
 
 // AppendChainedGroomingDispositionBatchTx is the transaction-aware core of the
@@ -273,6 +461,29 @@ func AppendChainedUpkeepDispositionBatchTx(ctx context.Context, tx pgx.Tx, artif
 // settlement (#3923; caller: the #3924 apply).
 func AppendChainedUpkeepWindowCloseTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
 	return windowCloseTx(ctx, tx, upkeepFamily, p, artifactID)
+}
+
+// AppendChainedFamilyDispositionBatchTx is the transaction-aware core of the
+// GENERIC batch capture (#4012): the family is resolved FIRST and an unknown
+// name returns *UnknownWindowFamilyError without touching tx; otherwise
+// windowDispositionBatchTx over that family. Same READ COMMITTED rule.
+func AppendChainedFamilyDispositionBatchTx(ctx context.Context, tx pgx.Tx, family, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	f, err := resolveWindowFamily(family)
+	if err != nil {
+		return nil, err
+	}
+	return windowDispositionBatchTx(ctx, tx, f, artifactID, ps)
+}
+
+// AppendChainedFamilyWindowCloseTx is the transaction-aware core of the
+// GENERIC settlement (#4012): family resolved first, as above, then
+// windowCloseTx over that family.
+func AppendChainedFamilyWindowCloseTx(ctx context.Context, tx pgx.Tx, family string, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	f, err := resolveWindowFamily(family)
+	if err != nil {
+		return nil, nil, err
+	}
+	return windowCloseTx(ctx, tx, f, p, artifactID)
 }
 
 // windowDispositionBatchTx is the family-generic batch core:
@@ -366,8 +577,9 @@ func windowCloseTx(ctx context.Context, tx pgx.Tx, f windowFamily, p ChainAppend
 }
 
 // checkReportBinding is the BINDING RE-CHECK (#3923 approval condition 1): it
-// returns *UpkeepReportSupersededError unless the HIGHEST-sequence row of
-// f.reportCategory names artifactID. An absent row or an undecodable newest row
+// returns the family's superseded refusal (f.superseded:
+// *UpkeepReportSupersededError for upkeep, *ReportSupersededError for comms)
+// unless the HIGHEST-sequence row of f.reportCategory names artifactID. An absent row or an undecodable newest row
 // refuses too (CurrentArtifactID ""): the capture's binding cannot be
 // confirmed, and an append it cannot confirm is the defect the check exists to
 // prevent.
@@ -387,11 +599,11 @@ func checkReportBinding(ctx context.Context, tx pgx.Tx, f windowFamily, runID uu
 		}
 	}
 	if newest == nil {
-		return &UpkeepReportSupersededError{ArtifactID: artifactID}
+		return f.superseded(artifactID, "", 0)
 	}
 	current := watermarkArtifactID(newest.Payload)
 	if current != artifactID {
-		return &UpkeepReportSupersededError{ArtifactID: artifactID, CurrentArtifactID: current, CurrentSequence: newest.Sequence}
+		return f.superseded(artifactID, current, newest.Sequence)
 	}
 	return nil
 }
@@ -447,8 +659,8 @@ func consumedDispositions(ctx context.Context, tx pgx.Tx, f windowFamily, runID 
 }
 
 // watermarkArtifactID decodes the shared "artifact_id" payload field, written
-// by the server for the disposition rows, the watermark AND the
-// upkeep_report_recorded row. It returns "" for an absent key or malformed
+// by the server for the disposition rows, the watermark AND the family's
+// report row (upkeep_report_recorded / comms_report_recorded). It returns "" for an absent key or malformed
 // payload, which never matches a real artifact id — the fail-safe direction.
 func watermarkArtifactID(payload []byte) string {
 	var p struct {
