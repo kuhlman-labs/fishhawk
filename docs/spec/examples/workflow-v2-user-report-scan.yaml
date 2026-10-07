@@ -1,0 +1,93 @@
+# Workflow-v2 example — the USER-REPORT SCAN: a propose-only workflow that
+# reads user-authored reports (issues and comments) and proposes captain-
+# approved draft responses and issues (E81.5 / #3775, phase 1).
+#
+# Validates against ../workflow-v2.schema.json. THIS FILE IS THE SHIPPED
+# USER-REPORT-SCAN DECLARATION: the TestShippedUserReportScanExample_* family
+# in backend/internal/spec and TestRunValidate_UserReportScanExample_NoCharter_OK
+# in cli/cmd/fishhawk read THESE bytes from disk, so a schema-invalid or
+# drifted file fails those tests rather than only a manual check-jsonschema run.
+#
+# NOT RUNNABLE YET. This workflow declares a stage that produces a
+# comms_report. Phase 1 (#4011) ships only the binding; four pieces are still
+# missing:
+#
+#   #4014  gathering the user reports and serving the scan prompt.
+#   #4015  ingesting the comms_report (until then a comms_report upload is
+#          refused plan_invalid).
+#   #4016  recording the captain's per-draft dispositions on the report.
+#   #4017  the on-approval hook that files the approved drafts.
+#
+# DO NOT register this workflow in .fishhawk/workflows.yaml until they land.
+# Installing it there is OPERATOR work: .fishhawk/** is forbidden to the
+# implement stage. Declaring it here (an example under docs/spec/examples/)
+# starts nothing: the scheduler is opt-in (--enable-scheduler) and reads only
+# the registered spec.
+#
+# WHAT IT DOES. The `scan` stage is a `plan`-typed PROPOSE stage (ADR-067 §2:
+# the v0 stage-type names are retained but general). It emits a comms_report —
+# drafts answering or filing what users reported — instead of a plan, and a
+# captain approves it. No stage declares the pull_request artifact, so this
+# workflow produces NO diff.
+#
+# NO EGRESS. The scan reads untrusted user-authored text. ADR-029's rule of two
+# never grants untrusted input and network access together, so the `scan`
+# stage declares no `egress` and no `permissions`.
+#
+# NO APPLY STAGE. No agent stage files anything: filing the captain-approved
+# drafts is the on-approval hook (phase 7, #4017), and the report's sources are
+# never edited.
+#
+# NO CHARTER AT VALIDATE. The scan does need a comms charter, but it is
+# enforced when the scan prompt is served (phase 4, #4014), not by
+# WorkflowRequiresCharter (which keys on grooming_report only). `fishhawk
+# validate` and run admission therefore do not refuse a charterless repository.
+#
+# NO `actions`, NO `inputs`, NO `auto_advance`. `autonomy: low` delegates none
+# of the run-driving classes, so the gate stops for a human; a scan is not
+# issue-anchored, so it takes no inputs.
+#
+# THE TRIGGER FORM AND CADENCE. `applies_to: {trigger: [scheduled, on_demand]}`
+# is the non-diff routing declaration (ADR-067) and is REQUIRED by the schedule
+# below, which starts `scheduled` runs. The cadence is weekly, Monday 09:00 UTC.
+
+version: "2"
+
+workflows:
+  user_report_scan:
+    description: >-
+      Scan user-authored reports (issues and comments), propose draft
+      responses and issues as a comms report, and gate the report on a human
+      approval. Produces no code diff and edits no report source.
+
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    schedule:
+      cron: "0 9 * * 1"
+
+    autonomy: low
+
+    stages:
+      # PROPOSE. A `plan`-typed stage need not emit a plan artifact — it emits a
+      # proposal, and here the proposal is a comms report. The artifact binds to
+      # the stage TYPE, requires its schema for the same forward-compatibility
+      # reason a plan declares standard_v1, and may not share the stage with a
+      # plan, grooming_report or upkeep_report artifact. No egress: see NO
+      # EGRESS above.
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        produces:
+          - artifact: comms_report
+            schema: comms_report_v1
+        gates:
+          - type: approval
+            sla: 24_hours
+            # Forge-neutral approval predicate (E39.2 / #1707): the captain
+            # approves, never the author or the agent.
+            approvals:
+              count: 1
+              not: [author, agent]

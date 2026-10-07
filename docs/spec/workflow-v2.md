@@ -872,8 +872,8 @@ Referent errors reuse the existing `from_stage` graph-shape rules with their unc
 
 ```yaml
 produces:
-  - artifact: plan          # plan | pull_request | deployment | acceptance | grooming_report | upkeep_report
-    schema: standard_v1     # plan / grooming_report / upkeep_report; the artifact schema version
+  - artifact: plan          # plan | pull_request | deployment | acceptance | grooming_report | upkeep_report | comms_report
+    schema: standard_v1     # plan / grooming_report / upkeep_report / comms_report; the artifact schema version
     persistence:
       - target: originating_issue   # originating_issue | fishhawk_audit_log
         mode: rendered_comment      # rendered_comment | canonical
@@ -888,8 +888,9 @@ produces:
 | `acceptance` | `acceptance` only | The durable acceptance-evidence record (`{verdict, per-criterion results, content-hash references}`). |
 | `grooming_report` | `plan` only | **v2-only** (ADR-065 §3 / #2235). The backlog-grooming proposal a PROPOSE stage emits *instead of* a plan: a rubric-cited ordering plus duplicate candidates, hygiene defects, suggested `depends_on` edges, vision-drift flags and decomposition suggestions, as `grooming_report_v1`. `schema: grooming_report_v1` is **required** alongside it, and a stage may not declare **both** `plan` and `grooming_report` — a propose stage proposes one thing. See [`grooming-report-v1.md`](grooming-report-v1.md). |
 | `upkeep_report` | `plan` only | **v2-only** (E79.2 / #3726). The upkeep-scan proposal a PROPOSE stage emits *instead of* a plan: recorded-run flake, toolchain-pin drift and deprecation findings to file, as `upkeep_report_v1`. `schema: upkeep_report_v1` is **required** alongside it, and a stage may not declare `upkeep_report` together with `plan` or `grooming_report` — a propose stage proposes one thing. The `upkeep_report_v1` contract and its ingest handler land in #3921. See [`examples/workflow-v2-upkeep-scan.yaml`](examples/workflow-v2-upkeep-scan.yaml). |
+| `comms_report` | `plan` only | **v2-only** (E81.5 / #3775). The user-report-scan proposal a PROPOSE stage emits *instead of* a plan: draft responses and issues proposed from user-authored reports, as `comms_report_v1`. `schema: comms_report_v1` is **required** alongside it, and a stage may not declare `comms_report` together with `plan`, `grooming_report` or `upkeep_report` — a propose stage proposes one thing. The `comms_report_v1` contract and its ingest handler land in #4015. See [`examples/workflow-v2-user-report-scan.yaml`](examples/workflow-v2-user-report-scan.yaml). |
 
-The `grooming_report` and `upkeep_report` bindings key on the **stage type**, not on a workflow name: `plan` reads as PROPOSE (ADR-067 §2), so any propose stage in any workflow may emit one. Declaring either does **not** make a stage produce a diff — `pull_request` remains the only diff signal, so a grooming or upkeep workflow still cannot carry a post-hoc diff constraint. An `upkeep_report` workflow requires **no charter** (the [charter requirement](#validation-rules-beyond-the-schema) keys on `grooming_report` only). Rejections:
+The `grooming_report`, `upkeep_report` and `comms_report` bindings key on the **stage type**, not on a workflow name: `plan` reads as PROPOSE (ADR-067 §2), so any propose stage in any workflow may emit one. Declaring any of them does **not** make a stage produce a diff — `pull_request` remains the only diff signal, so a grooming, upkeep or user-report-scan workflow still cannot carry a post-hoc diff constraint. An `upkeep_report` workflow requires **no charter** (the [charter requirement](#validation-rules-beyond-the-schema) keys on `grooming_report` only). A `comms_report` workflow needs no charter at validate or run admission either; its comms charter is enforced when the scan prompt is served (phase 4, #4014). Rejections:
 
 ```
 grooming_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 —
@@ -904,9 +905,17 @@ upkeep_report-producing stage must declare schema: upkeep_report_v1, got ""
 
 stage "scan" declares both the upkeep_report and plan artifacts; a propose stage proposes one
 thing — drop whichever this stage does not emit (E79.2)
+
+comms_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 —
+not a "implement" stage (E81.5)
+
+comms_report-producing stage must declare schema: comms_report_v1, got ""
+
+stage "scan" declares both the comms_report and plan artifacts; a propose stage proposes one
+thing — drop whichever this stage does not emit (E81.5)
 ```
 
-The last message names whichever of `plan` or `grooming_report` the stage declares beside `upkeep_report`, in either declaration order.
+The upkeep message names whichever of `plan`, `grooming_report` or `comms_report` the stage declares beside `upkeep_report`, in either declaration order — except that an `upkeep_report` declared AFTER `comms_report` is refused by the comms message. The comms message names whichever of `plan`, `grooming_report` or `upkeep_report` the stage declares beside `comms_report`; when `upkeep_report` is declared first, the upkeep message (naming `comms_report`) fires instead.
 
 `persistence` says where a copy of the artifact lands. `target` is `fishhawk_audit_log` (the authoritative copy, `mode: canonical`) or `originating_issue` (the human-readable echo on the tracker, `mode: rendered_comment`). `fishhawk_audit_log` / `canonical` is unconditional: the artifact store + audit chain record it regardless of anything below.
 
@@ -1033,7 +1042,7 @@ stage "apply" declares no pull_request artifact (ADR-067).
 Declare produces: [{artifact: pull_request}] on this stage, or remove the constraint.
 ```
 
-`pull_request` is the diff signal because it is the only artifact in the closed set that **denotes a code change**: `deployment` is delegated to an external pipeline, `acceptance` is a verdict, and `plan`, `grooming_report` and `upkeep_report` are proposals.
+`pull_request` is the diff signal because it is the only artifact in the closed set that **denotes a code change**: `deployment` is delegated to an external pipeline, `acceptance` is a verdict, and `plan`, `grooming_report`, `upkeep_report` and `comms_report` are proposals.
 
 > **An absent or empty `produces` list reads as "produces no diff."** Omitting `produces` does not exempt a stage — that is what gives the rule teeth. The permissive alternative ("absent means unknown, so allow it") would let any stage keep a diff constraint simply by staying silent, which is exactly the case this rule exists to reject. The fix is one line: declare the artifact, or drop the constraint.
 
@@ -1453,8 +1462,8 @@ reviewer_personas:
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
 | Input `source` | `github_issue` \| `pull_request` | external trigger; `github_issue` is the issue-anchored member (`Run.IsIssueAnchored`) and is correct on every forge — no `gitlab_issue` member exists |
 | Input `artifact` | `plan` \| `pull_request` | what a later stage may consume |
-| Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` \| `grooming_report` \| `upkeep_report` | `deployment` deploy-only, `acceptance` acceptance-only, `grooming_report` and `upkeep_report` plan-only (v2-only) |
-| `produces[].schema` | `standard_v1` \| `grooming_report_v1` \| `upkeep_report_v1` | required alongside the `plan`, `grooming_report` and `upkeep_report` artifacts respectively |
+| Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` \| `grooming_report` \| `upkeep_report` \| `comms_report` | `deployment` deploy-only, `acceptance` acceptance-only, `grooming_report`, `upkeep_report` and `comms_report` plan-only (v2-only) |
+| `produces[].schema` | `standard_v1` \| `grooming_report_v1` \| `upkeep_report_v1` \| `comms_report_v1` | required alongside the `plan`, `grooming_report`, `upkeep_report` and `comms_report` artifacts respectively |
 | `persistence.target` | `originating_issue` \| `fishhawk_audit_log` | closed set |
 | `persistence.mode` | `rendered_comment` \| `canonical` | closed set |
 | `persistence.update_on_change` | `true` \| `false` | republish in place when the artifact is regenerated |
@@ -1510,7 +1519,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` — and its `decision_record.index`, when declared — is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 

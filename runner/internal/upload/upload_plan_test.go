@@ -269,6 +269,18 @@ func TestShipPlan_AgentOutputInvalid_400(t *testing.T) {
 			wantReason: "the stage type is a property of the run — re-shipping cannot help",
 		},
 		{
+			name:       "comms_report_invalid",
+			body:       envelope("comms_report_invalid", "comms_report does not validate against comms_report_v1"),
+			wantB:      true,
+			wantReason: "the comms_report ingest handler (#4015) must fail the stage category-B before writing the 400 — a forward declaration",
+		},
+		{
+			name:       "comms_report_stage_invalid",
+			body:       envelope("comms_report_stage_invalid", "comms_report may only be shipped from a plan stage"),
+			wantB:      true,
+			wantReason: "the stage type is a property of the run — re-shipping cannot help",
+		},
+		{
 			name:       "clarification_request_invalid",
 			body:       envelope("clarification_request_invalid", "clarification_request does not validate against clarification-request-v1"),
 			wantB:      true,

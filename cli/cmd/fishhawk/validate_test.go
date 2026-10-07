@@ -1068,3 +1068,71 @@ workflows:
 		}
 	})
 }
+
+// userReportScanExamplePath is the shipped user-report-scan declaration
+// (E81.5 / #3775), read from disk so the CLI mirror is exercised against the
+// SHIPPED bytes.
+const userReportScanExamplePath = "../../../docs/spec/examples/workflow-v2-user-report-scan.yaml"
+
+// TestRunValidate_UserReportScanExample_NoCharter_OK pins two things end to
+// end: the CLI's embedded workflow-v2 mirror admits the comms_report artifact,
+// and the CLI charter rule stays grooming-only. The conventions file beside
+// the spec is present-without-charter (validConventions), so a charter rule
+// that widened to comms_report would refuse here — the comms charter is
+// enforced when the scan prompt is served (phase 4, #4014), not at validate.
+//
+// Counterfactual: drop "comms_report" from the CLI schema mirror's produces
+// enum and this exits 1 on a schema error.
+func TestRunValidate_UserReportScanExample_NoCharter_OK(t *testing.T) {
+	raw, err := os.ReadFile(userReportScanExamplePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", userReportScanExamplePath, err)
+	}
+	path := writeSpecAndConventions(t, string(raw), validConventions) // validConventions declares no charter
+	var stdout, stderr strings.Builder
+
+	got := runValidate([]string{path}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("exit = %d, want exitOK:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want empty (no validation diagnostic, no charter refusal)", stderr.String())
+	}
+	if !strings.HasPrefix(stdout.String(), path+": OK\n") {
+		t.Errorf("stdout = %q, want it to open with %q", stdout.String(), path+": OK\n")
+	}
+
+	// A frozen major keeps rejecting the artifact: a version "1.6" spec
+	// declaring comms_report fails on its own produces enum. The POSITIVE
+	// CONTROL is the same document with only the produces entry swapped to
+	// plan/standard_v1: it exits OK, so the refusal is attributable to the
+	// produces enum rather than to anything else in the fixture.
+	frozen := func(artifact, schema string) string {
+		return `version: "1.6"
+workflows:
+  user_report_scan:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: ` + artifact + `
+            schema: ` + schema + `
+`
+	}
+	t.Run("frozen major 1.6 refuses", func(t *testing.T) {
+		p := writeSpecAndConventions(t, frozen("comms_report", "comms_report_v1"), validConventions)
+		var so, se strings.Builder
+		if got := runValidate([]string{p}, &so, &se); got != exitFailure {
+			t.Fatalf("exit = %d, want exitFailure (v1.x must not admit comms_report):\nstdout: %s\nstderr: %s", got, so.String(), se.String())
+		}
+	})
+	t.Run("frozen major 1.6 positive control", func(t *testing.T) {
+		p := writeSpecAndConventions(t, frozen("plan", "standard_v1"), validConventions)
+		var so, se strings.Builder
+		if got := runValidate([]string{p}, &so, &se); got != exitOK {
+			t.Fatalf("exit = %d, want exitOK (the plan/standard_v1 twin must validate, or the refusal above is not attributable to the produces enum):\nstdout: %s\nstderr: %s", got, so.String(), se.String())
+		}
+	})
+}

@@ -4736,6 +4736,77 @@ func TestMigrateDown_ArtifactUpkeepReportReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_ArtifactCommsReportReversal pins 0098 (#3775, E81.5) in
+// BOTH directions, mirroring the 0095 test above: after MigrateUp the
+// artifacts kind CHECK ADMITS a 'comms_report' row, and after rolling back
+// through 0098 it REFUSES one (SQLSTATE 23514 naming artifacts_kind_check)
+// while every prior kind — 0095's 'upkeep_report' included — still inserts.
+// The test removes its own comms_report row before rolling back, so the down
+// migration's restored CHECK is the only thing deciding the second insert. A
+// comment-only touch of the migration fails here: the assertion is on the
+// INSERT, not on the rendered constraint text.
+func TestMigrateDown_ArtifactCommsReportReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'user_report_scan', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'plan', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID,
+	); err != nil {
+		t.Fatalf("seed plan stage: %v", err)
+	}
+	insertArtifact := func(kind string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO artifacts (id, stage_id, kind, schema_version, content, content_hash)
+			 VALUES ($1, $2, $3, NULL, '{}'::jsonb, 'hash-'||$3)`,
+			uuid.New(), stageID, kind)
+		return err
+	}
+
+	// BEHAVIOR after MigrateUp: the row inserts.
+	if err := insertArtifact("comms_report"); err != nil {
+		t.Fatalf("insert kind='comms_report' after MigrateUp: %v — 0098 must make the row insertable", err)
+	}
+	// Remove it before rolling back: 0098's down restores a CHECK the row would
+	// violate (the documented revert-before-use contract).
+	if _, err := pool.Exec(ctx, `DELETE FROM artifacts WHERE kind = 'comms_report'`); err != nil {
+		t.Fatalf("clear comms_report artifacts before rollback: %v", err)
+	}
+
+	downThrough(t, url, "0098")
+
+	var checkErr *pgconn.PgError
+	if err := insertArtifact("comms_report"); !errors.As(err, &checkErr) || checkErr.Code != "23514" {
+		t.Fatalf("insert kind='comms_report' after rollback returned %v, want SQLSTATE 23514 from artifacts_kind_check", err)
+	}
+	if checkErr.ConstraintName != "artifacts_kind_check" {
+		t.Errorf("rejecting constraint = %q, want artifacts_kind_check", checkErr.ConstraintName)
+	}
+	// The eight prior kinds survive the rollback — asserted by inserting each.
+	for _, kind := range []string{"plan", "pull_request", "deployment", "acceptance", "release_notes", "grooming_report", "acceptance_transcript", "upkeep_report"} {
+		if err := insertArtifact(kind); err != nil {
+			t.Errorf("insert kind=%q after 0098 rollback: %v — the rollback must disturb no earlier widening", kind, err)
+		}
+	}
+}
+
 // TestMigrateDown_StageChecksGitLabPipelineIDReversal pins 0084 (E45.55 /
 // #3490) in BOTH directions and on the column's SHAPE: stage_checks.
 // gitlab_pipeline_id EXISTS after MigrateUp, is NULLABLE bigint with NO

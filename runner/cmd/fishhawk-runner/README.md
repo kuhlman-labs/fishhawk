@@ -138,7 +138,7 @@ Pinned by `acceptancetranscript_test.go`: the path format, every branch above (o
 ## Plan-stage sibling artifacts ([#2833](https://github.com/kuhlman-labs/fishhawk/issues/2833))
 
 A `plan`-typed stage may emit an additive **standard_v1 sibling** at the
-`--plan-out` path instead of a plan. The runner recognizes three kinds, held in
+`--plan-out` path instead of a plan. The runner recognizes four kinds, held in
 `planSiblingKinds` (`main.go`):
 
 | `kind` | Emitted by | Backend outcome |
@@ -146,10 +146,12 @@ A `plan`-typed stage may emit an additive **standard_v1 sibling** at the
 | `clarification_request` | the planner's step-zero plannability check ([#1057](https://github.com/kuhlman-labs/fishhawk/issues/1057)) | stage parks at `awaiting_input` |
 | `grooming_report` | a backlog-grooming **propose** stage ([#2235](https://github.com/kuhlman-labs/fishhawk/issues/2235)) | artifact row persisted, decided at the plan gate |
 | `upkeep_report` | an upkeep-scan **propose** stage ([#3726](https://github.com/kuhlman-labs/fishhawk/issues/3726), runner recognition [#3920](https://github.com/kuhlman-labs/fishhawk/issues/3920)) | artifact row persisted and an `upkeep_report_recorded` row appended, decided at the plan gate ([#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921)); refused `upkeep_report_stage_invalid` unless the stage declares `produces: upkeep_report`, or `upkeep_report_invalid` on a schema, semantic or cited-run failure (category-B) |
+| `comms_report` | a user-report-scan **propose** stage ([#3775](https://github.com/kuhlman-labs/fishhawk/issues/3775), runner recognition [#4011](https://github.com/kuhlman-labs/fishhawk/issues/4011)) | no backend ingest yet — until [#4015](https://github.com/kuhlman-labs/fishhawk/issues/4015) lands the backend refuses it `plan_invalid` (category-B); #4015 must refuse a bad one `comms_report_invalid` / `comms_report_stage_invalid` |
 
 That set is a deliberate duplicate of the backend's
 `plan.ArtifactKindClarificationRequest` / `plan.ArtifactKindGroomingReport`
-(plus `upkeep_report`, whose backend `plan.ArtifactKind` lands in #3921): the
+(plus `upkeep_report`, whose backend `plan.ArtifactKind` lands in #3921, and
+`comms_report`, whose backend kind lands in #4015): the
 runner module declares **no** dependency on the backend module, so the backend's
 discriminator is unreachable here. A further sibling is one entry in this set plus
 the backend's own routing — a documented residual, not a solved problem.
@@ -179,8 +181,9 @@ On a hit the runner does three things and no more:
 3. **Clarification-only post-processing stays kind-gated.**
    `StripUnknownClarificationProps` carries hand-derived, clarification-shaped
    allowlists (`questions[]` / `ticket_reference` / `generated_by`) with no
-   grooming or upkeep equivalent; running it on a `grooming_report` or
-   `upkeep_report` would strip every legitimate property of that artifact.
+   grooming, upkeep or comms equivalent; running it on a `grooming_report`,
+   `upkeep_report` or `comms_report` would strip every legitimate property of
+   that artifact.
 
 **Sibling validation is the BACKEND's job.** No sibling schema is embedded
 in the runner — `scripts/sync-schemas` routes them to
@@ -192,7 +195,7 @@ and
 
 ### 400 error code → failure category
 
-All four artifact kinds — a plan and the three siblings — ship to the same
+All five artifact kinds — a plan and the four siblings — ship to the same
 endpoint (`POST /v0/runs/{run_id}/plan`, routed by `kind`), so `upload.ShipPlan` classifies the
 400 by the backend's error **code**, held in `agentOutputInvalidCodes`
 (`runner/internal/upload/upload.go`):
@@ -205,6 +208,8 @@ endpoint (`POST /v0/runs/{run_id}/plan`, routed by `kind`), so `upload.ShipPlan`
 | `grooming_report_stage_invalid` | **B** | `backend/internal/server/grooming_report.go` |
 | `upkeep_report_invalid` | **B** | the upkeep_report ingest handler ([#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921)) — a forward declaration the handler must emit verbatim |
 | `upkeep_report_stage_invalid` | **B** | the same handler ([#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921)) — a forward declaration |
+| `comms_report_invalid` | **B** | the comms_report ingest handler ([#4015](https://github.com/kuhlman-labs/fishhawk/issues/4015)) — a forward declaration the handler must emit verbatim |
+| `comms_report_stage_invalid` | **B** | the same handler ([#4015](https://github.com/kuhlman-labs/fishhawk/issues/4015)) — a forward declaration |
 | anything else (e.g. `validation_failed`) | **C** — generic error | — |
 
 Each B code is one the backend handler has ALREADY transitioned the stage to

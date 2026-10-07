@@ -1,0 +1,14 @@
+id: scenario:issue-4011/frozen-majors-reject-comms-report
+statement: '`fishhawk validate` on a version "1.6" spec whose plan stage produces comms_report exits 1 with a schema diagnostic on stderr; the same spec with produces plan/standard_v1 exits 0.'
+verify_hint: 'CLI exit code + stderr: run fishhawk validate on the small v1.6 spec and on its plan/standard_v1 twin; observe exit 1 with a schema diagnostic, then exit 0.'
+steps: Built the CLI from the sanctioned checkout. Wrote a version '1.6' spec whose single plan stage (executor claude-code) produces comms_report with schema comms_report_v1, and a twin producing plan/standard_v1. Ran fishhawk validate on each, capturing stdout and stderr separately.
+assertions:
+    expected: Exit 1 with a schema diagnostic for the comms_report spec, and exit 0 for the twin.
+    observed_at_record: 'The comms_report spec exited 1, with the stderr diagnostic ''.../produces/0/artifact: value must be one of plan, pull_request, deployment, acceptance''. The twin exited 0.'
+    repro_handle: fishhawk validate /tmp/fh4011/v16/comms.yaml
+origin:
+    issue: 4011
+    pr: 4071
+    run_id: 3660bdf8-0f0d-4b4c-9e15-d7631efd9c56
+    head_sha: 2d2dfb598de747277dae671494f6b819ff214a23
+    recorded_at: 2026-10-07T13:49:22Z
