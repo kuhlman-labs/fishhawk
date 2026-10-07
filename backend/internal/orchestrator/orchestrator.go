@@ -257,6 +257,38 @@ func (o *Orchestrator) LockStageAdmission(stageID uuid.UUID) func() {
 	return mu.Unlock
 }
 
+// DeployAheadNotSucceeded returns the first deploy-typed stage sequenced BEFORE
+// target whose state is anything other than succeeded, or nil when every
+// earlier deploy stage succeeded (or there is none) — the post-deploy hold
+// (E35.1 / #1598, ADR-053). A stage behind a deploy is dispatchable ONLY once
+// that deploy SUCCEEDED: awaiting approval, in flight, failed, cancelled and
+// superseded all hold it, because the stage after a deploy (a post-deploy
+// acceptance stage) validates the deployed environment and a deploy that did
+// not succeed left nothing valid to validate. Keying on "non-terminal" alone is
+// NOT enough: ResolveDeploymentFromPollState commits the deploy's failure
+// before the run advance that fails the run, so a `failed` deploy under a
+// still-`running` run is a reachable window.
+//
+// Pure (no I/O) and exported because both admission surfaces enforce it:
+// Orchestrator.Advance before it parks or dispatches its next pending stage,
+// and the host-dispatch spawn marker (server.handleHostDispatchStage) before
+// its admitting CAS. stages need not be ordered; the result is the
+// lowest-sequenced match when they are (the repository orders by sequence).
+func DeployAheadNotSucceeded(stages []*run.Stage, target *run.Stage) *run.Stage {
+	if target == nil {
+		return nil
+	}
+	for _, s := range stages {
+		if s == nil || s.ID == target.ID {
+			continue
+		}
+		if s.Type == run.StageTypeDeploy && s.Sequence < target.Sequence && s.State != run.StageStateSucceeded {
+			return s
+		}
+	}
+	return nil
+}
+
 // Outcome describes what Advance did. Useful for telemetry and
 // for callers (the approval handler) that want to react to
 // "run completed" vs "next stage dispatched."
@@ -356,6 +388,29 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		// Every stage has terminated successfully. completeRun
 		// transitions the run to succeeded.
 		return o.completeRun(ctx, r, stages)
+	}
+
+	// E35.1 (#1598, ADR-053): post-deploy hold. The walk above records a
+	// non-terminal stage as `gated` but keeps walking to the first PENDING one,
+	// so a stage sequenced after a deploy would be dispatched while that deploy
+	// is still awaiting approval or in flight (finishApprovalAdvance re-enters
+	// Advance right after the deploy approval parks the deploy at
+	// awaiting_deployment). A stage behind an earlier deploy stage advances only
+	// once EVERY earlier deploy SUCCEEDED (DeployAheadNotSucceeded). A failed or
+	// cancelled deploy never reaches here — the walk routes it to completeRun —
+	// so on this path the hold fires on an in-flight deploy. Placed BEFORE the
+	// deploy pre-execution park, so a SECOND deploy stage behind an in-flight
+	// first deploy also stays `pending` rather than parking at
+	// awaiting_deploy_approval. Deliberately deploy-scoped: no other
+	// predecessor type holds a later stage here.
+	if held := DeployAheadNotSucceeded(stages, next); held != nil {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: stage held behind an unsucceeded deploy stage",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", next.ID.String()),
+			slog.String("deploy_stage_id", held.ID.String()),
+			slog.String("deploy_state", string(held.State)),
+		)
+		return OutcomeNoOp, nil
 	}
 
 	// ADR-038 (#1384): a deploy stage's effect IS the side effect, so its

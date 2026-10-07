@@ -1,6 +1,6 @@
 # backend/internal/orchestrator
 
-Stage orchestrator: next-stage dispatch after approve. Called from the approval handler on approve; dispatches the next pending stage (or transitions the Run to terminal when all stages are done). Agent stages fire `workflow_dispatch`; human stages walk to `awaiting_approval` directly.
+Stage orchestrator: next-stage dispatch after approve. Called from the approval handler on approve; dispatches the next pending stage (or transitions the Run to terminal when all stages are done) — unless that stage sits behind a `deploy` stage that has not succeeded (see "Post-deploy hold"). Agent stages fire `workflow_dispatch`; human stages walk to `awaiting_approval` directly.
 
 ## Credential-scope resolution in `triggerParams` (E45.22 / #2043)
 
@@ -13,6 +13,15 @@ Stage orchestrator: next-stage dispatch after approve. Called from the approval 
 **Why the ladder exists.** Before #2043 this read ONLY `InstallationID`, so a `gitlab_ci` run — which has no GitHub installation id — resolved the zero scope and every one of its stages warn-skipped without ever firing a pipeline (HIGH 1 of #2043). `TestTriggerParams_GitLabRefReachesCreatePipeline` drives the whole seam with NO scope substituted by the test: a run carrying `installation_ref` `gitlab:5` reaches `POST /api/v4/projects/5/pipeline`, and the same run stripped of both credentials issues no request at all. `TestTriggerParams_ResolvesCredentialScopeFromInstallationRef` covers one cell per branch, including the ref-wins-over-a-disagreeing-installation-id cell that makes the ORDERING an assertion rather than a coincidence.
 
 `Ref` is unchanged: the run's ADR-035 sole-writer branch from `runBranchRef`, which the `gitlab_ci` backend creates its pipeline against and the `github_actions` backend ignores.
+
+## Post-deploy hold (E35.1 / #1598 / ADR-053)
+
+`Advance`'s stage walk records a non-terminal stage as `gated` but keeps walking to the first PENDING stage, so before #1598 a stage sequenced after a `deploy` stage would be dispatched while the deploy was still awaiting approval or in flight — `finishApprovalAdvance` re-enters `Advance` right after the deploy approval parks the deploy at `awaiting_deployment`. `DeployAheadNotSucceeded(stages, target)` (exported, pure) returns the first earlier `deploy` stage whose state is anything but `succeeded`; `Advance` returns `OutcomeNoOp` when it is non-nil for the selected `next` stage, BEFORE the deploy pre-execution park, the acceptance short-circuit, decomposition and dispatch.
+
+- **Keys on `succeeded`, not on terminal.** A post-deploy acceptance stage validates the deployed environment, so a deploy that failed, was cancelled or is still in flight holds it. In `Advance` a failed/cancelled deploy is already routed to `completeRun` by the walk, so the hold fires on an in-flight deploy there; the host-dispatch marker (`server.handleHostDispatchStage`) applies the same predicate to a `pending` stage and refuses 409 `dispatch_not_admissible` (`reason: deploy_not_succeeded`) — that is where a `failed` deploy under a still-`running` run is reachable (`ResolveDeploymentFromPollState` commits the stage failure before the run advance).
+- **Multi-deploy consequence (behavior change).** Because the hold runs before the deploy pre-execution park, a SECOND `deploy` stage behind an in-flight first deploy now stays `pending` instead of parking at `awaiting_deploy_approval`; it parks at its own gate once the first deploy succeeded.
+- **Deliberately deploy-scoped.** No other predecessor type holds a later stage; fix-up re-open, acceptance reopen and decomposed-parent sequencing are unchanged.
+- Pinned by `deploy_hold_test.go` (each non-terminal deploy state, the succeeded twin, the failed-deploy run completion, the second-deploy row, the predicate table) and the pg-backed `server/release_acceptance_integration_test.go`, which drives `docs/spec/examples/workflow-v2-release-acceptance.yaml` through the real deploy approval.
 
 ## Auto-merge stages (#255 / ADR-017)
 

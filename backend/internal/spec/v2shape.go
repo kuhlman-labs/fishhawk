@@ -168,10 +168,12 @@ func stageTypesByID(stages []any) map[string]string {
 }
 
 // defaultInputArtifact returns the artifact a `needs` referent of the given
-// stage type contributes, and whether that type has one at all. The mapping
-// is read straight off $defs/input's artifact enum, whose only members are
-// `plan` and `pull_request`: a review stage produces no artifact, and the
-// deployment / acceptance artifacts are not declarable as inputs.
+// stage type contributes, and whether that type has one at all. Only `plan`
+// and `implement` referents have one: a review stage produces no artifact, the
+// acceptance artifact is not declarable as an input, and the `deployment`
+// member of $defs/input's v2 artifact enum (E35.1 / #1598) is CONSUMER-bound —
+// valid only on an acceptance stage (ADR-053) — so a deploy referent gets no
+// default and is declarable longhand only.
 func defaultInputArtifact(stageType string) (string, bool) {
 	switch StageType(stageType) {
 	case StageTypePlan:

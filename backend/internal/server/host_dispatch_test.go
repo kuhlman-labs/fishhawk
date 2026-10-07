@@ -1776,3 +1776,160 @@ func TestHostDispatch_RunTerminalDuringBareCASRefused(t *testing.T) {
 		})
 	}
 }
+
+// ---- Post-deploy hold (E35.1 / #1598, ADR-053) ----
+
+// deployHoldListErrRepo fails ListStagesForRun so the post-deploy hold's
+// fail-closed read-error arm is isolated. Every other method (including the
+// StageCASTransitioner capability) is the embedded fake's, so without the
+// refusal the handler would proceed to the CAS and answer 200.
+type deployHoldListErrRepo struct {
+	*orchestratorRepo
+	err error
+}
+
+func (r *deployHoldListErrRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return nil, r.err
+}
+
+// deployHoldHostDispatchFixture seeds a run LOCKED to the local runner (so the
+// runner_kind guard admits and cannot mask the hold) carrying a deploy stage at
+// sequence 0 in deployState and an agent acceptance stage at sequence 1 in
+// acceptanceState — a state the marker's switch ADMITS, so the hold is the only
+// thing between the request and the CAS.
+func deployHoldHostDispatchFixture(t *testing.T, deployState, acceptanceState run.StageState) (*orchestratorRepo, *auditFake, *run.Run, *run.Stage, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	lockRunRunnerKind(rr, runRow.ID, run.RunnerKindLocal)
+	deploy := rr.seedStage(runRow.ID, 0, deployState)
+	deploy.Type = run.StageTypeDeploy
+	acceptance := rr.seedStage(runRow.ID, 1, acceptanceState)
+	acceptance.Type = run.StageTypeAcceptance
+	return rr, au, runRow, deploy, acceptance
+}
+
+// TestHostDispatch_DeployHold_RefusesAndLeavesStageUnchanged pins the
+// host-dispatch half of the post-deploy hold: a stage behind a deploy stage
+// that has not SUCCEEDED is refused 409 dispatch_not_admissible naming the
+// deploy, and the stage reads back in its original state (committed-state
+// assertion, not error identity) with no acceptance spawn anchor written.
+//
+// The failed rows are the reachable window approval condition 1 names: the
+// deploy is `failed` while the run is still `running`
+// (ResolveDeploymentFromPollState commits the stage failure before the run
+// advance), so the terminal-run guard does not refuse and only the hold does.
+//
+// Counterfactuals: (C5) deleting the hold's call site turns every row into a
+// 200 transitioned with the stage read back `dispatched`; (C1) narrowing the
+// predicate to a terminal-only check (`!s.State.IsTerminal()`) turns the
+// failed and cancelled rows into 200s with the stage read back dispatched.
+func TestHostDispatch_DeployHold_RefusesAndLeavesStageUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		deploy, acceptance run.StageState
+	}{
+		{run.StageStateAwaitingDeployApproval, run.StageStatePending},
+		{run.StageStateDispatched, run.StageStatePending},
+		{run.StageStateRunning, run.StageStatePending},
+		{run.StageStateAwaitingDeployment, run.StageStatePending},
+		{run.StageStateFailed, run.StageStatePending},
+		{run.StageStateCancelled, run.StageStatePending},
+	} {
+		t.Run(string(tc.deploy)+"/"+string(tc.acceptance), func(t *testing.T) {
+			rr, au, runRow, deploy, acceptance := deployHoldHostDispatchFixture(t, tc.deploy, tc.acceptance)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+			w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			for _, want := range []string{
+				`"dispatch_not_admissible"`,
+				`"reason":"` + hostDispatchReasonDeployNotSucceeded + `"`,
+				`"deploy_stage_id":"` + deploy.ID.String() + `"`,
+				`"deploy_state":"` + string(tc.deploy) + `"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("body missing %s: %s", want, body)
+				}
+			}
+			cur, err := rr.GetStage(context.Background(), acceptance.ID)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if cur.State != tc.acceptance {
+				t.Errorf("acceptance stage state = %q, want %q (unchanged by the refusal)", cur.State, tc.acceptance)
+			}
+			if got := acceptanceDispatchEntries(au, acceptance.ID); len(got) != 0 {
+				t.Errorf("acceptance_dispatched entries = %d, want 0 (nothing spawned)", len(got))
+			}
+			if r, _ := rr.GetRun(context.Background(), runRow.ID); r.State != run.StateRunning {
+				t.Errorf("run state = %q, want running (the hold, not the terminal-run guard, refused)", r.State)
+			}
+		})
+	}
+}
+
+// TestHostDispatch_DeployHold_DeploySucceeded_Admits is the positive twin: once
+// the earlier deploy SUCCEEDED the same acceptance stage is admitted and
+// transitions to dispatched.
+func TestHostDispatch_DeployHold_DeploySucceeded_Admits(t *testing.T) {
+	for _, accState := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
+		t.Run(string(accState), func(t *testing.T) {
+			rr, au, runRow, _, acceptance := deployHoldHostDispatchFixture(t, run.StageStateSucceeded, accState)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+			w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+				t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+			}
+			cur, _ := rr.GetStage(context.Background(), acceptance.ID)
+			if cur.State != run.StageStateDispatched {
+				t.Errorf("acceptance stage state = %q, want dispatched", cur.State)
+			}
+		})
+	}
+}
+
+// TestHostDispatch_DeployHold_StageListError_500 pins the fail-closed read
+// error: when the run's stages cannot be listed the marker answers 500
+// dependency_check_failed and the stage stays untouched — never a silent admit.
+//
+// Counterfactual (C6): letting the error branch fall through to admit makes the
+// handler proceed to the CAS and answer 200 with the stage read back dispatched.
+func TestHostDispatch_DeployHold_StageListError_500(t *testing.T) {
+	rr, au, runRow, _, acceptance := deployHoldHostDispatchFixture(t, run.StageStateSucceeded, run.StageStatePending)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &deployHoldListErrRepo{orchestratorRepo: rr, err: errors.New("stage store down")}, AuditRepo: au})
+
+	w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"dependency_check_failed"`) {
+		t.Errorf("body missing dependency_check_failed: %s", w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), acceptance.ID)
+	if cur.State != run.StageStatePending {
+		t.Errorf("acceptance stage state = %q, want pending (no CAS on 500)", cur.State)
+	}
+}
+
+// TestHostDispatch_DeployHold_SequenceZero_SkipsRead pins the sequence-0 skip:
+// a first stage has nothing ahead of it, so the marker never lists the run's
+// stages — a failing ListStagesForRun does not refuse it.
+func TestHostDispatch_DeployHold_SequenceZero_SkipsRead(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStatePending)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &deployHoldListErrRepo{orchestratorRepo: rr, err: errors.New("must not be read")}})
+
+	w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (sequence 0 skips the stage list):\n%s", w.Code, w.Body.String())
+	}
+}
