@@ -202,7 +202,12 @@ func liveRuntime(t *testing.T, image string) (Runtime, []string) {
 	if !rt.Safe {
 		t.Skipf("no safe container runtime: %s", rt.Reason)
 	}
-	env, err := rt.BindEndpointEnv(os.Environ())
+	cfg, err := NewAnonymousDockerConfig(OperatorPluginDirs(os.Getenv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cfg.Remove() })
+	env, err := rt.BindEndpointEnv(os.Environ(), cfg.Dir)
 	if err != nil {
 		t.Fatal(err)
 	}

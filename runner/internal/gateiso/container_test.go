@@ -227,31 +227,55 @@ func TestBuildArgv_EndpointBindingPrecedesRun(t *testing.T) {
 }
 
 // TestBindEndpointEnv_DropsOverridesAndPins: every variable through which
-// the CLI's endpoint could be redirected is dropped from the base env and the
-// validated socket re-pinned; the process environment is never consulted.
+// the CLI's endpoint or config dir could be redirected is dropped from the
+// base env, the validated socket re-pinned and the CLI's config pinned to the
+// runner's dir (E51.26 / #4046: an inherited DOCKER_CONFIG never survives,
+// podman also gets REGISTRY_AUTH_FILE); the process environment is never
+// consulted.
 func TestBindEndpointEnv_DropsOverridesAndPins(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://process-env.invalid:2375")
+	t.Setenv("DOCKER_CONFIG", "/process-env/.docker")
+	const cfgDir = "/tmp/fishhawk-gate-docker-config-x"
 	base := []string{"PATH=/usr/bin", "DOCKER_HOST=tcp://10.0.0.5:2376", "DOCKER_CONTEXT=remote",
-		"CONTAINER_HOST=ssh://core@machine", "CONTAINER_CONNECTION=machine", "HOME=/home/r", "DOCKER_CONFIG=/home/r/.docker"}
+		"CONTAINER_HOST=ssh://core@machine", "CONTAINER_CONNECTION=machine", "HOME=/home/r", "DOCKER_CONFIG=/home/r/.docker",
+		"REGISTRY_AUTH_FILE=/home/r/auth.json"}
 	for _, tc := range []struct {
-		rt  Runtime
-		pin string
+		rt   Runtime
+		pins []string
 	}{
-		{Runtime{Kind: KindDocker, SocketPath: "/tmp/v/docker.sock"}, "DOCKER_HOST=unix:///tmp/v/docker.sock"},
-		{Runtime{Kind: KindPodman, SocketPath: "/tmp/v/podman.sock"}, "CONTAINER_HOST=unix:///tmp/v/podman.sock"},
+		{Runtime{Kind: KindDocker, SocketPath: "/tmp/v/docker.sock"},
+			[]string{"DOCKER_HOST=unix:///tmp/v/docker.sock", "DOCKER_CONFIG=" + cfgDir}},
+		{Runtime{Kind: KindPodman, SocketPath: "/tmp/v/podman.sock"},
+			[]string{"CONTAINER_HOST=unix:///tmp/v/podman.sock", "DOCKER_CONFIG=" + cfgDir, "REGISTRY_AUTH_FILE=" + cfgDir + "/config.json"}},
 	} {
-		got, err := tc.rt.BindEndpointEnv(base)
+		got, err := tc.rt.BindEndpointEnv(base, cfgDir)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []string{"PATH=/usr/bin", "HOME=/home/r", "DOCKER_CONFIG=/home/r/.docker", tc.pin}
+		want := append([]string{"PATH=/usr/bin", "HOME=/home/r"}, tc.pins...)
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: env = %q, want %q", tc.rt.Kind, got, want)
 		}
 	}
 	for _, rt := range []Runtime{{Kind: KindDocker}, {Kind: KindNone, SocketPath: "/tmp/v/s"}} {
-		if got, err := rt.BindEndpointEnv(base); !errors.Is(err, ErrContainerSpec) || got != nil {
+		if got, err := rt.BindEndpointEnv(base, cfgDir); !errors.Is(err, ErrContainerSpec) || got != nil {
 			t.Errorf("%+v: got %q, %v; want ErrContainerSpec", rt, got, err)
+		}
+	}
+}
+
+// TestBindEndpointEnv_RefusesMissingDockerConfig: with no (or a relative)
+// docker config dir the binder refuses rather than fall back to an inherited
+// DOCKER_CONFIG — which is exactly the interactive credential store the pin
+// exists to keep out.
+func TestBindEndpointEnv_RefusesMissingDockerConfig(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "DOCKER_CONFIG=/home/r/.docker"}
+	for _, rt := range []Runtime{{Kind: KindDocker, SocketPath: "/tmp/v/docker.sock"}, {Kind: KindPodman, SocketPath: "/tmp/v/podman.sock"}} {
+		for _, dir := range []string{"", "relative/cfg"} {
+			got, err := rt.BindEndpointEnv(base, dir)
+			if !errors.Is(err, ErrContainerSpec) || got != nil || !strings.Contains(err.Error(), "docker config dir") {
+				t.Errorf("%s dir %q: got %q, %v; want ErrContainerSpec naming the docker config dir", rt.Kind, dir, got, err)
+			}
 		}
 	}
 }

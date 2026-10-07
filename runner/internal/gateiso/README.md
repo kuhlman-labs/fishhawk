@@ -25,16 +25,20 @@ there is still no second exec path.
 | `FISHHAWK_GATE_IMAGE_ALLOWLIST` | comma/whitespace list of registry hosts, namespace prefixes, repositories, exact digests | empty (no allowlist) | the operator image allowlist a DECLARED `gate_container` image, and every base of a declared build, must pass (`ParseAllowlist`; grammar in § "Declared gate image"). An invalid entry is a startup config error naming it. Never applied to `FISHHAWK_GATE_IMAGE` (operator-chosen) |
 | `FISHHAWK_GATE_BUILD` | `allow` \| `deny` | empty = the profile default (`hosted` deny, `local`/`self-hosted` allow) | whether a declared `gate_container` `dockerfile`/`context` build may run (`ParseBuildPolicy`; any other value is a startup config error) |
 | `FISHHAWK_GATE_CACHE` | `process` \| `off` | `process` | the container path's `GOCACHE` / golangci-lint cache posture (`ParseCacheMode`; any other value is a startup config error naming it and both valid values): `process` keeps them in ONE named volume per runner process, `off` keeps the pre-#3967 per-exec cold caches (also the measurement's cold arm). § "Persistent cache volume" |
+| `FISHHAWK_GATE_DOCKER_CONFIG` | an absolute path to a docker config dir | empty (the runner-owned anonymous config) | an operator-prepared docker config dir the container path's runtime CLI calls use for registry credentials (`LoadOperatorDockerConfig`: absolute, a directory, a `config.json` whose top level is a JSON object, helper names matching `^[A-Za-z0-9._-]+$`; any defect is a startup config error naming the variable). Validated at startup, never removed. Unset, every runtime call runs credential-free. § "Runtime CLI credentials" |
 
 A config error (bad mode/profile, an unknown `FISHHAWK_GATE_SERVICES` member,
 an invalid `FISHHAWK_GATE_IMAGE_ALLOWLIST` entry, `FISHHAWK_GATE_BUILD` or
-`FISHHAWK_GATE_CACHE` value, or `hosted` with an explicit `clone` / `clone-sandbox` —
+`FISHHAWK_GATE_CACHE` value, a defective `FISHHAWK_GATE_DOCKER_CONFIG`, or
+`hosted` with an explicit `clone` / `clone-sandbox` —
 `ProfileForbidsFallback`) fails the runner at startup with
 `runner_failed reason=config` BEFORE any backend contact. A valid config logs
-`gate_isolation_configured` (mode, profile, image, services,
-postgres_image, allowlist_entries, build, cache — `cache` is the LAST field); the first gate exec logs `gate_isolation_selected`
+`gate_isolation_configured` (mode, profile, image, credentials
+(`anonymous` | `operator_config`), services, postgres_image,
+allowlist_entries, build, cache — `cache` is the LAST field); the first gate exec logs `gate_isolation_selected`
 carrying the whole `Selection` JSON (path, mode, profile, image, the classified
-runtime including its endpoint, the sandbox probe, and the reason). The same
+runtime including its endpoint, the sandbox probe, the reason, and — on the
+container path only, stamped by the runner, never by `Select` — `credentials`). The same
 selection is recorded on the gate evidence once a gate reaches the exec seam
 (#2135, see § "Evidence" below).
 
@@ -177,9 +181,14 @@ entry (mutable), any wildcard, anything unparsable.
 
 **Pulling a declared `image:`** (`resolvePulledImage`). Every runtime call goes
 through the endpoint-bound runtime CLI with the runner host's inherited
-environment, so it authenticates with that CLI's OWN credential store
-(`docker login` / `containers-auth.json`); Fishhawk passes no credential and
-the spec cannot carry one. A digest-pinned ref is inspected and pulled only
+environment, its docker config PINNED to the one the runner chose (§ "Runtime
+CLI credentials", #4046): by default a credential-free config, so only a
+public image pulls; with `FISHHAWK_GATE_DOCKER_CONFIG` the credentials that
+operator-prepared config holds. The operator's interactive `docker login`
+store is never used. Fishhawk passes no credential and the spec cannot carry
+one. Under the anonymous posture a pull failure appends the
+`FISHHAWK_GATE_DOCKER_CONFIG` remedy to `PullFailedReason`'s text (at the
+runner call site, `anonymousPullHint`). A digest-pinned ref is inspected and pulled only
 when absent; a tag-only ref is pulled on EVERY gate. Either way the gate runs
 by `name@<registry digest>` read back from the inspected `RepoDigests`, so a
 concurrent retag cannot change what runs, and a pinned ref must find its own
@@ -298,19 +307,23 @@ env image; they pin the wire's field set, not the env-image record.
   under `local` / `self-hosted`: the cache persists on the daemon across
   builds and projects, so a build can read a cache another build wrote. That
   is accepted for a single-tenant host; `hosted` refuses it.
-- **Build bases are pulled with the runner host's own registry
-  credentials.** Without `FISHHAWK_GATE_IMAGE_ALLOWLIST` (the default in
+- **Build bases are pulled with whatever credentials the pinned docker
+  config holds.** Without `FISHHAWK_GATE_IMAGE_ALLOWLIST` (the default in
   `local` / `self-hosted`), a declared build's `FROM` / `COPY --from=` /
   `RUN --mount from=` references are unconstrained, and the daemon pulls
-  them through the runtime CLI's inherited environment, i.e. the host's
-  `docker login` / `containers-auth.json` store. The agent-writable
+  them through the runtime CLI's bound environment. The agent-writable
   Dockerfile therefore gets (1) a daemon-mediated egress channel to any
-  registry host, with data encodable in the host or repository name, and
-  (2) read access to any private image the host is logged in to, whose
-  contents become the gate image's filesystem and can reach gate output.
-  The mitigation is the allowlist: configure `FISHHAWK_GATE_IMAGE_ALLOWLIST`
-  (or `FISHHAWK_GATE_BUILD=deny`) on any host whose runtime CLI holds
-  registry credentials; `hosted` requires an allowlist for builds.
+  registry host, with data encodable in the host or repository name — under
+  every posture, since an anonymous pull still reaches the registry — and
+  (2) under `FISHHAWK_GATE_DOCKER_CONFIG` ONLY, read access to any private
+  image that operator config holds credentials for, whose contents become
+  the gate image's filesystem and can reach gate output. Since #4046 the
+  default anonymous config carries no credential, so (2) no longer follows
+  from the host's interactive `docker login` store. The mitigation is the
+  allowlist: configure `FISHHAWK_GATE_IMAGE_ALLOWLIST` (or
+  `FISHHAWK_GATE_BUILD=deny`) on any host, and always alongside an opt-in
+  docker config that holds registry credentials; `hosted` requires an
+  allowlist for builds.
 - RUN steps run as root inside the build sandbox (the GATE runs non-root via
   `--user`; the build does not).
 - A base image's `ONBUILD` triggers are not visible to the static scan.
@@ -364,13 +377,16 @@ a refused connection are all `Local=false` with a named reason.
   endpoint is unsafe for the same reason — a bind-mount source is resolved on
   the daemon's host, not the runner's.
 
-**A SAFE verdict does not mean pulls work.** Detection probes (`docker context
-show` / `inspect`, `docker version`, `podman info` / `version`) never pull, so
-a runtime classified SAFE can still hang every image pull when its credential
-helper blocks (observed on Docker Desktop for macOS: a
-`docker-credential-desktop get` child). The classification is unchanged; the
-symptom, the per-step bounds and the remedy are in `runner/README.md` §
-"Gate isolation" (Docker Desktop: hung credential helper).
+**A SAFE verdict does not mean pulls work — and since #4046 the runner no
+longer inherits the store that made them hang.** Detection probes (`docker
+context show` / `inspect`, `docker version`, `podman info` / `version`) never
+pull and invoke no credential helper. The hang they could not see — every pull
+stalled on a `docker-credential-desktop get` child while the macOS screen is
+LOCKED — came from the operator's interactive `credsStore`, which the docker
+CLI consults even for an anonymous public pull. Every post-selection runtime
+call is now pinned to a runner-chosen config (§ "Runtime CLI credentials"),
+so the default never invokes a helper, and an opt-in config's helpers are
+probed under a bound and fail fast as `container_credentials_blocked`.
 
 ## The container path (`container.go`)
 
@@ -403,11 +419,15 @@ binds.
   endpoint flag (`docker --host unix://<socket>` / `podman --url
   unix://<socket>`, which overrides both the context store and the
   environment) between the binary and the subcommand of BOTH `BuildArgv` and
-  `KillArgv`; `Runtime.BindEndpointEnv(base)` drops the four override
-  variables from the CLI's env and re-pins `DOCKER_HOST` / `CONTAINER_HOST`
-  to the same socket; a `Runtime` with no `SocketPath` renders NOTHING
+  `KillArgv`; `Runtime.BindEndpointEnv(base, dockerConfigDir)` drops the
+  four endpoint override variables AND `DOCKER_CONFIG` / `REGISTRY_AUTH_FILE`
+  from the CLI's env, re-pins `DOCKER_HOST` / `CONTAINER_HOST` to the same
+  socket and pins `DOCKER_CONFIG=<dockerConfigDir>` (plus
+  `REGISTRY_AUTH_FILE=<dir>/config.json` for podman, #4046); a `Runtime` with
+  no `SocketPath`, or an empty / relative `dockerConfigDir`, renders NOTHING
   (`ErrContainerSpec`). Pinned by `TestBuildArgv_EndpointBindingPrecedesRun`,
-  `TestBindEndpointEnv_DropsOverridesAndPins`, the runner-seam
+  `TestBindEndpointEnv_DropsOverridesAndPins`,
+  `TestBindEndpointEnv_RefusesMissingDockerConfig`, the runner-seam
   `TestRunGateInContainer_EndpointBoundAfterSelection` (selection recorded,
   THEN `DOCKER_HOST`/`DOCKER_CONTEXT` redirected, run + rm still bound) and
   the live fixture (l) `TestGateContainer_EndpointBoundAcrossContextSwitch`.
@@ -485,10 +505,104 @@ there). A provisioned service's env (`PostgresService.GateEnv`, the
 so neither the sanitized env nor extras can redirect the DSN
 (`TestContainerEnv_ServiceEnvWinsOverExtras`).
 The RUNNER's own inherited environment goes to the runtime CLI (it needs
-`PATH` and its config dir) with the endpoint BOUND (`BindEndpointEnv`:
-`DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `CONTAINER_CONNECTION`
-dropped, the validated socket re-pinned); the sanitized env crosses into the
+`PATH`) with the endpoint and the config BOUND (`BindEndpointEnv`:
+`DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `CONTAINER_CONNECTION` /
+`DOCKER_CONFIG` / `REGISTRY_AUTH_FILE` dropped, the validated socket and the
+runner-chosen docker config re-pinned); the sanitized env crosses into the
 container via `-e` only (`TestGateContainer_EnvAllowList`).
+
+## Runtime CLI credentials (`dockerconfig.go`, E51.26 / [#4046](https://github.com/kuhlman-labs/fishhawk/issues/4046))
+
+**Cause.** The docker CLI resolves credentials for EVERY registry it talks
+to, an anonymous public pull included, through the config's `credsStore` /
+`credHelpers`. Docker Desktop's `desktop` helper reads the macOS keychain, and
+while the screen is locked `docker-credential-desktop get` blocks, so every
+pull the runner made under the operator's inherited `DOCKER_CONFIG` hung
+until its step bound. The runner therefore never runs a post-selection
+runtime call under the operator's interactive config.
+
+**The posture is fixed at startup** (`Credentials`, recorded on the
+`gate_isolation_configured` line and stamped on a container-path
+`Selection.Credentials`):
+
+- `anonymous` (default, `FISHHAWK_GATE_DOCKER_CONFIG` unset) — a RUNNER-OWNED
+  config (`NewAnonymousDockerConfig`): a temp dir (mode `0700`) whose
+  `config.json` (mode `0600`) holds ONLY `{"auths":{}}` plus
+  `cliPluginsExtraDirs`, with NO `credsStore` and NO `credHelpers`. Minted
+  lazily on the first container exec of a runner process
+  (`gateDockerConfig`), reused by every later exec, and removed at
+  `cleanup()` AFTER the cache volumes (whose `volume rm` still runs under it).
+  The plugin dirs are carried forward so `docker buildx` still resolves
+  (Docker Desktop installs it under `~/.docker/cli-plugins`, which a
+  repointed `DOCKER_CONFIG` would otherwise hide): `OperatorPluginDirs` reads
+  exactly ONE file — the inherited `DOCKER_CONFIG`'s `config.json`, else
+  `$HOME/.docker/config.json` — read-only, decoding ONLY its
+  `cliPluginsExtraDirs` key (absolute entries only), and always prepends that
+  dir's `cli-plugins`. An absent or malformed file still mints the anonymous
+  config, with just the `cli-plugins` dir. The operator's interactive config
+  is never used for credentials (it is read for that one key, never for
+  `auths` / `credsStore` / `credHelpers`).
+- `operator_config` (`FISHHAWK_GATE_DOCKER_CONFIG=<dir>`) — an
+  operator-prepared config, validated at startup
+  (`LoadOperatorDockerConfig`) and NEVER removed (`DockerConfig.Remove` is a
+  no-op for a dir the runner did not mint). This is how a private gate,
+  service or build-base image is pulled.
+
+**The every-call guarantee** covers every runtime call AFTER selection — the
+declared pull and inspect, the build, the passwd read, the cache volume
+steps, the gate service lifecycle, the gate `run`, its `rm -f` kill and the
+cleanup removals — because all of them run under the ONE bound env
+`runGateInContainer` builds (`BindEndpointEnv`), which refuses to bind
+without a config dir. Pinned by
+`TestRunGateInContainer_EveryRuntimeCallPinsRunnerDockerConfig` and
+`TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited`.
+
+**The credential probe (opt-in config only).** Before any runtime call that
+could pull, the runner probes every (helper, server) pair the operator config
+would invoke for an image THIS exec pulls — `DockerConfig.ProbesFor`
+mirrors the CLI's choice: `credHelpers[server]` when the key exists (an empty
+value is the plain file store), else `credsStore`; Docker Hub's key is
+`https://index.docker.io/v1/`, every other registry's its host. A pair no
+image matches is NEVER run (an ECR `credHelpers` entry while the gate image
+lives on Docker Hub). Probe site (a) is `runGateInContainer` before the
+resolution / passwd / cache / service steps: the gate image by reference plus
+the Postgres service image. Probe site (b) is `resolveBuiltImage` after the
+content-addressed inspect MISS and before the build: every Dockerfile base.
+`ProbeCredentialHelper` resolves `docker-credential-<name>` on the bound
+env's `PATH`, runs `get` with the server on stdin and stdout / stderr on the
+null device (an answer is a credential and is never read), in its OWN process
+group with a `Cancel` that SIGKILLs the whole group and a `WaitDelay`; a
+helper that has not answered within 20s (`gateCredentialProbeTimeout`) is
+`blocked` and fails the exec `gateUnavailable` (category C) with
+`container_credentials_blocked: credential helper docker-credential-<name> did
+not answer within <bound> for <server> (a locked keychain/screen, or a slow
+network-backed helper)`. A missing helper is logged and left to the pull's own
+error. Every probe logs one `gate_credentials_probe` line (site, helper,
+server, outcome — never output). Probes run on EVERY exec, uncached.
+
+**Residuals (named, not closed).**
+
+- *Podman.* `REGISTRY_AUTH_FILE` scopes podman's auth FILE, but podman can
+  still invoke a helper configured in `registries.conf`
+  `credential-helpers` — a SYSTEM setting outside `REGISTRY_AUTH_FILE` the
+  runner does not rewrite. The default is credential-free for docker and only
+  `REGISTRY_AUTH_FILE`-scoped for podman (covered by the unit row only; no
+  live podman walk).
+- *Runtime detection runs before the seam.* `DetectRuntime` (`docker context
+  show` / `inspect`, `version`; `podman info` / `version`) runs at selection
+  with the INHERITED env, before any config is pinned. It invokes no
+  credential helper — the live fixture (p) runs it under the blocking config
+  and asserts the helper was never called — but it is outside the every-call
+  guarantee, which covers post-selection runtime calls only.
+- *Opt-in probe cost.* One outbound credential call per MATCHED pair per
+  exec, plus one per build-base pair before a build, with no success caching;
+  for a network-backed helper (ecr-login, gcr, acr) that is a live token
+  exchange. A slow-but-live helper over the bound is classified blocked (the
+  message names both causes). Matching is by image REFERENCE, not local
+  presence, so a locally present image is still probed.
+- *A lock that begins after the probe.* A screen lock that starts mid-pull
+  under an opt-in config still hangs that pull until its step bound. The
+  anonymous default never invokes a helper, so it has no such window.
 
 ## The throwaway clone (`clone.go`)
 
@@ -1021,7 +1135,9 @@ The five dispositions, by classification:
 - **`unavailable`** — the container path failed BEFORE exec for a reason on
   the HOST, not in the tree: visible-cache root creation, the lint-cache dir,
   the resolved-path mount-guard refusal, the host `GOMODCACHE` probe or
-  `go mod download` (an offline host), endpoint binding, the gate-service
+  `go mod download` (an offline host), the runner-owned docker config mint,
+  endpoint binding, a credential helper that did not answer within its bound
+  (`container_credentials_blocked`, #4046), the gate-service
   argv, or ANY gate-service provisioning step (#2137: volume create, run,
   readiness, bootstrap). The gate never
   executed, so its verdict says nothing about the tree — the same argument
@@ -1130,6 +1246,7 @@ every host — no runtime skip, no refused-state theater.
 | (l) `TestGateContainer_EndpointBoundAcrossContextSwitch` | selection recorded against the real socket, THEN `DOCKER_HOST`/`CONTAINER_HOST` redirected to an unreachable tcp endpoint and `DOCKER_CONTEXT`/`CONTAINER_CONNECTION` to a nonexistent context → the gate still runs on the validated daemon; the argv opens with the binding; the CLI env pins the validated socket with the redirecting variables dropped |
 | (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=true, rolbypassrls=true` (#4050), `CREATE DATABASE` works, `CREATE ROLE` prints its `CREATE ROLE` command tag, `COPY … TO PROGRAM`, `GRANT pg_execute_server_program TO CURRENT_USER`, `CREATE ROLE … SUPERUSER` and `ALTER ROLE postgres` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
 | (o) `TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses` | `FISHHAWK_GATE_CACHE=process` (#3967): state A's exec 1 prints the runner uid, `GOCACHE=/gatecache/gocache` and WRITES a marker into it (the prepare helper's ownership, live); A's exec 2 finds the marker (warm within a process); state B — a second runner process, a different run/stage — mounts a different volume and finds nothing (fresh across processes); the positive control C (cache off) does NOT see its own exec-1 marker, so warm discriminates on the volume; A's gate argv mounts `/gatecache` BY NAME (a volume that `BelongsTo` A's run/stage, never an absolute path) beside `--network=none`; a host-side `volume inspect` shows the `org.fishhawk.gate-cache` label before `A.cleanup()` and fails after it |
+| (p) `TestGateContainer_PublicPullIgnoresBlockingCredsStore` | #4046, docker only: with the inherited `DOCKER_CONFIG` naming a `credsStore` whose helper never answers, the PRECONDITION is that a direct `docker pull` under it, in its own process group, has NOT completed within 15s and did invoke the helper (then the group is killed; a completed pull FAILS the fixture as non-discriminating); `DetectRuntime` under the same config stays SAFE with zero helper calls; a declared tag-only image (always pulled) then passes the gate, the pull ran under the runner-owned config, the helper was never invoked, and `cleanup()` removes the minted dir |
 | (n) `TestGateContainer_SelfHostPgtestSuite` | OPT-IN (`FISHHAWK_GATE_SELFHOST_IMAGE`, the built `fishhawk-gate` image; counts toward the sentinel only when opted in and run): the REAL `pgtest` suite of the committed HEAD runs in the gate image over the socket DSN — pgx + golang-migrate, template bootstrap, per-test databases — exit 0, the PASS line, no `--- SKIP` |
 | (measure) `TestGateMeasure_ThreeWayFullVerify` (`gatemeasure_test.go`) | OPT-IN (`FISHHAWK_GATE_MEASURE_IMAGE`), NEVER counted toward the sentinel: the three-way full-verify walk of § "Persistent cache volume"; its pure helpers run in-loop via `TestGateMeasureHelpers` |
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
