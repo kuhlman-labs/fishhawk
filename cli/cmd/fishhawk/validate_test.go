@@ -1136,3 +1136,36 @@ workflows:
 		}
 	})
 }
+
+// releaseAcceptanceExamplePath is the shipped post-deploy acceptance example
+// (E35.1 / #1598), read from disk so the CLI mirror is exercised against the
+// SHIPPED bytes.
+const releaseAcceptanceExamplePath = "../../../docs/spec/examples/workflow-v2-release-acceptance.yaml"
+
+// TestRunValidate_ReleaseAcceptanceExample_OK pins that the CLI's embedded
+// workflow-v2 mirror admits the `deployment` member of $defs/input's artifact
+// enum: `fishhawk validate` on the committed example exits OK. The backend-only
+// post-deploy binding rules are not ported to the CLI, so this proves the
+// schema half only.
+//
+// Counterfactual: drop "deployment" from the CLI schema mirror's $defs/input
+// artifact enum and this exits 1 on a schema error at the verify stage's input.
+func TestRunValidate_ReleaseAcceptanceExample_OK(t *testing.T) {
+	raw, err := os.ReadFile(releaseAcceptanceExamplePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", releaseAcceptanceExamplePath, err)
+	}
+	path := writeTempSpec(t, string(raw))
+	var stdout, stderr strings.Builder
+
+	got := runValidate([]string{path}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("exit = %d, want exitOK:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want empty (no validation diagnostic)", stderr.String())
+	}
+	if !strings.HasPrefix(stdout.String(), path+": OK\n") {
+		t.Errorf("stdout = %q, want it to open with %q", stdout.String(), path+": OK\n")
+	}
+}

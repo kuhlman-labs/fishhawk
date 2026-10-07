@@ -1,0 +1,83 @@
+# Workflow-v2 example — release with a post-deploy acceptance stage (E35.1 / #1598, ADR-053).
+#
+# Validates against ../workflow-v2.schema.json AND the backend's cross-member
+# rules. It is welded to the suite three ways, so a schema-invalid or drifted
+# example fails a test rather than only a manual check-jsonschema run:
+#
+#   (i)   backend/internal/spec/post_deploy_acceptance_test.go reads this file
+#         from disk through spec.ParseBytes, and cli/cmd/fishhawk/validate_test.go
+#         runs `fishhawk validate` on it (the CLI's embedded schema mirror);
+#   (ii)  it is the driving spec of the cross-boundary release seam test
+#         backend/internal/server/release_acceptance_integration_test.go;
+#   (iii) THIS IS THE VERBATIM STANZA FOR THE OPERATOR'S COMPANION EDIT.
+#         `.fishhawk/workflows.yaml` is in the implement stages'
+#         forbidden_paths, so an implement agent cannot edit the live spec. The
+#         operator hand-applies the `- id: verify` stanza below (and the
+#         staging-only allowed_environments it requires) to the live `release`
+#         workflow after merge.
+#
+# Production targets are deliberately ABSENT (ADR-053 Decision 3: post-deploy
+# acceptance is staging-only in E35). The backend validator REJECTS a
+# deployment-consuming acceptance stage whose deploy stage's
+# allowed_environments includes `production`, so the live release workflow's
+# `[staging, production]` must be narrowed to `[staging]` before this stanza is
+# applied there.
+
+version: "2"
+
+workflows:
+  release:
+    description: >-
+      Delegating deploy workflow with a post-deploy acceptance stage: triggers an
+      external release pipeline against staging, monitors it to a terminal
+      state, then runs an acceptance agent against the deployed staging host.
+    auto_advance: true
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: deploy
+        type: deploy
+        # A deploy stage must delegate; Fishhawk holds no deploy logic or
+        # credentials.
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        # Staging-only (ADR-053 Decision 3). Adding `production` here makes the
+        # `verify` stage below a validation error.
+        constraints:
+          allowed_environments: [staging]
+          change_freeze: false
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      # ── POST-DEPLOY ACCEPTANCE STANZA (operator companion edit target) ─────
+      # Runs only after the deploy stage SUCCEEDED; it is held pending while
+      # the deploy is still in flight. It consumes the deploy stage's
+      # deployment artifact LONGHAND — `needs: [deploy]` is rejected, because
+      # the deployment input is valid only on an acceptance stage.
+      - id: verify
+        type: acceptance
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: deployment
+            from_stage: deploy
+        # Required for a deployment-consuming acceptance stage: the deployed
+        # environment's host. Hosts, not URLs — no scheme, no path. The runner
+        # adds the model API endpoint and the Fishhawk backend itself.
+        egress:
+          target_hosts:
+            - staging.example.com
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 200000
+          max_runtime: 20m
+          enforcement: advisory
