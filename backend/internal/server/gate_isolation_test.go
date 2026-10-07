@@ -129,15 +129,20 @@ func TestTraceUpload_RecordsGateIsolation(t *testing.T) {
 // (container_build) and declared_unhonored (fallback_declared_unhonored) as
 // top-level wire keys with the runner's exact values. It reads the RAW payload
 // keys, not the decoded struct, so a field dropped by the embed or renamed on
-// the wire fails here.
+// the wire fails here. The E51.26 / #4046 credential posture rides the same
+// boundary: every container member's payload carries credentials, and a
+// non-container member's payload carries NO credentials key (absent).
 func TestTraceUpload_GateIsolationDeclaredPayload(t *testing.T) {
 	cases := []struct {
 		member string
 		keys   []string
+		absent []string
 	}{
-		{"container_declared", []string{"image_source", "image_digest", "image_id", "policy_warning"}},
-		{"container_build", []string{"image_source", "image_id", "build_dockerfile", "build_context", "build_context_digest", "distinct_images_count"}},
-		{"fallback_declared_unhonored", []string{"image_source", "declared_unhonored"}},
+		{"container", []string{"credentials"}, nil},
+		{"container_declared", []string{"image_source", "image_digest", "image_id", "policy_warning", "credentials"}, nil},
+		{"container_build", []string{"image_source", "image_id", "build_dockerfile", "build_context", "build_context_digest", "distinct_images_count", "credentials"}, nil},
+		{"fallback_declared_unhonored", []string{"image_source", "declared_unhonored"}, []string{"credentials"}},
+		{"refused", nil, []string{"credentials"}},
 	}
 	for _, c := range cases {
 		t.Run(c.member, func(t *testing.T) {
@@ -170,6 +175,11 @@ func TestTraceUpload_GateIsolationDeclaredPayload(t *testing.T) {
 			for k, v := range want {
 				if !bytes.Equal(got[k], v) {
 					t.Errorf("payload %s = %s, want the golden's %s", k, got[k], v)
+				}
+			}
+			for _, k := range c.absent {
+				if v, ok := got[k]; ok {
+					t.Errorf("payload carries %s = %s on a non-container member; want the key absent", k, v)
 				}
 			}
 		})

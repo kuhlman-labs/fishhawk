@@ -144,7 +144,10 @@ type gateEvidencePayload struct {
 // reach the container path — absent when that gate's resolution failed);
 // DistinctImagesCount is set only when the stage's gates ran in more than one
 // distinct image; DeclaredUnhonored marks a declared gate_container that ran
-// on a host fallback path instead.
+// on a host fallback path instead. Credentials (E51.26 / #4046) is the
+// credential posture the container path's runtime CLI calls ran under —
+// anonymous (the runner-owned config) or operator_config
+// (FISHHAWK_GATE_DOCKER_CONFIG) — and is absent on every non-container path.
 //
 // CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
 // GateIsolationEvidence, paired ModeExact in backend/internal/wirecontract
@@ -174,6 +177,7 @@ type gateIsolationEvidence struct {
 	DistinctImagesCount  int    `json:"distinct_images_count,omitempty"`
 	PolicyWarning        string `json:"policy_warning,omitempty"`
 	DeclaredUnhonored    string `json:"declared_unhonored,omitempty"`
+	Credentials          string `json:"credentials,omitempty"`
 }
 
 // gateIsolationEvidenceFor digests st's RECORDED selection — nil when no gate
@@ -214,6 +218,7 @@ func newGateIsolationEvidence(sel gateiso.Selection) *gateIsolationEvidence {
 		DistinctImagesCount:  sel.DistinctImagesCount,
 		PolicyWarning:        text(sel.PolicyWarning),
 		DeclaredUnhonored:    text(sel.DeclaredUnhonored),
+		Credentials:          string(sel.Credentials),
 	}
 	if img := sel.ResolvedImage; img != nil {
 		ev.ImageDigest = text(img.Digest)

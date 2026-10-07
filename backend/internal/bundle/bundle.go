@@ -406,7 +406,10 @@ type GateEvidence struct {
 // image, ImageID the runtime's opaque local id, the Build* fields for an
 // in-repo build), DistinctImagesCount when the stage's gates ran in more than
 // one image, PolicyWarning, and DeclaredUnhonored when a declared image was
-// not honoured because the gate ran on a host fallback path.
+// not honoured because the gate ran on a host fallback path. Credentials
+// (E51.26 / #4046) is the credential posture of the container path's runtime
+// CLI calls — anonymous (the runner-owned config) or operator_config
+// (FISHHAWK_GATE_DOCKER_CONFIG) — absent on every non-container path.
 //
 // CROSS-MODULE WIRE CONTRACT: mirrors the runner's gateIsolationEvidence
 // (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
@@ -437,6 +440,7 @@ type GateIsolationEvidence struct {
 	DistinctImagesCount  int    `json:"distinct_images_count,omitempty"`
 	PolicyWarning        string `json:"policy_warning,omitempty"`
 	DeclaredUnhonored    string `json:"declared_unhonored,omitempty"`
+	Credentials          string `json:"credentials,omitempty"`
 }
 
 // ApprovalConditionResponsesEvidence is the peeked commit-body responses
