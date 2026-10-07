@@ -15,8 +15,9 @@ package workmgmt
 // failed for one author) are not errors: they are NAMED on the page as
 // UserReportDegradation entries, never silent.
 //
-// NOTHING IN PRODUCTION CALLS THIS YET. backend/internal/userreport's Scan is
-// the one consumer, and E81.5 (#3775) wires Scan into the comms stage.
+// backend/internal/userreport's Scan is the one consumer; its one production
+// caller is the server's comms scan gather (E81.5 / #4014), which resolves the
+// reader through UserReportReaderFor when a comms stage's prompt is served.
 
 import (
 	"context"
