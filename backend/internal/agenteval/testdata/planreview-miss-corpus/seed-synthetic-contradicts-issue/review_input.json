@@ -1,0 +1,130 @@
+{
+  "issue_title": "Make widget deletion a soft delete",
+  "issue_body": "Deleting a widget currently removes the row, which loses the audit history support relies on.\n\nDeletion must be a soft delete: `DELETE /widgets/{id}` sets `deleted_at` and KEEPS the row. A deleted widget is excluded from `GET /widgets`, and `GET /widgets/{id}` for a deleted widget returns 404. Do not physically remove rows.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/106",
+      "id": "example-org/widgets-service#106"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Convert widget deletion to a soft delete via a deleted_at column.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/migrations/0013_widgets_deleted_at.sql",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0013 adding a nullable deleted_at TIMESTAMPTZ column to widgets, with a down migration."
+      },
+      {
+        "step": 2,
+        "description": "Change DeleteWidget in internal/store/widgets.go to UPDATE widgets SET deleted_at = now()."
+      },
+      {
+        "step": 3,
+        "description": "Filter deleted_at IS NULL in ListWidgetsByTenant and GetWidget."
+      },
+      {
+        "step": 4,
+        "description": "Keep the DELETE /widgets/{id} handler's 204 response."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Store tests: after DeleteWidget the row still exists with deleted_at set, and ListWidgetsByTenant/GetWidget no longer return it. Handler test: GET /widgets/{id} after DELETE returns 404.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-delete-returns-204",
+          "statement": "DELETE /widgets/{id} on an existing widget returns HTTP 204.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#106"
+        },
+        {
+          "id": "ac-delete-hard",
+          "statement": "DELETE /widgets/{id} removes the widget row from the database.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#106"
+        },
+        {
+          "id": "ac-deleted-get-404",
+          "statement": "GET /widgets/{id} for a deleted widget returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#106"
+        },
+        {
+          "id": "ac-deleted-excluded-from-list",
+          "statement": "After deleting widget W, GET /widgets no longer includes W.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#106"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Existing hard-deleted rows are gone already; the change applies to new deletions only."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "ac-delete-hard",
+    "soft delete",
+    "soft-delete",
+    "contradict",
+    "hard delete",
+    "hard-delete",
+    "keeps the row",
+    "keep the row"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-delete-hard contradicts the issue it cites: the issue requires a soft delete that keeps the row, not removing it."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "One explicit criterion demands a hard delete while the approach implements the soft delete the issue asks for."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers deleting a widget that belongs to another tenant."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "The partial index for the list query should be updated in the migration."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "api/openapi.yaml should note that GET /widgets/{id} returns 404 after deletion."
+    }
+  ]
+}

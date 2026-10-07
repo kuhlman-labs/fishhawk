@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000002249",
+  "artifact_id": "00000000-0000-0000-0001-000000002249",
+  "triage_sequence": 104,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion cannot be violated by any implementation (bad criterion)",
+  "decided_at": "2026-10-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-import-log-or-not",
+      "statement": "The importer either logs a warning for a skipped row or does not log one.",
+      "source": "inferred",
+      "rationale": "Logging behaviour should be specified.",
+      "observed": "the importer logged nothing for a skipped row; the criterion still passed",
+      "expected": "a criterion able to fail when no warning is logged",
+      "steps_taken": "imported a CSV with one malformed row and inspected the log output",
+      "expectation_basis": "criterion ac-import-log-or-not",
+      "repro_handle": "widgets-import --file bad-row.csv 2>&1 | grep -c skipped_row",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

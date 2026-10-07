@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000002248",
+  "artifact_id": "00000000-0000-0000-0001-000000002248",
+  "triage_sequence": 103,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion restates an approach step instead of an observable outcome (bad criterion)",
+  "decided_at": "2026-10-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-step-two-done",
+      "statement": "The code in approach step 2 was written: widgetResponse has an ArchivedAt field.",
+      "source": "inferred",
+      "rationale": "Step 2 is the load-bearing change, so the criterion checks it was done.",
+      "observed": "widgetResponse has an ArchivedAt field, but GET /widgets/{id} still omits archived_at because the handler never populates it",
+      "expected": "an observable outcome: the response carries archived_at",
+      "steps_taken": "read internal/api/widgets.go; archived a widget; GET /widgets/{id}",
+      "expectation_basis": "criterion ac-step-two-done",
+      "repro_handle": "curl -s $TARGET/widgets/w1 | jq .archived_at",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

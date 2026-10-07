@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000002247",
+  "artifact_id": "00000000-0000-0000-0001-000000002247",
+  "triage_sequence": 102,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is not concretely verifiable (bad/ambiguous criterion)",
+  "decided_at": "2026-10-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-retry-robust",
+      "statement": "Webhook retry handling is robust and handles edge cases gracefully.",
+      "source": "explicit",
+      "source_ref": "example-org/widgets-service#103",
+      "observed": "the executor could not decide pass/fail: no edge case or robustness bar is named",
+      "expected": "an observable pass/fail condition",
+      "steps_taken": "read the criterion; found no observable behavior to drive or assert",
+      "expectation_basis": "criterion ac-retry-robust",
+      "repro_handle": "n/a: the criterion names no observable behavior",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}
