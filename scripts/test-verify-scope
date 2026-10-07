@@ -75,6 +75,9 @@ assert_ne() { # <desc> <not-expected> <actual>
 # <dir>/bin/{go,golangci-lint,sleep,docker}  recording stubs; prepend to PATH
 # <dir>/go.work + modules.json  two modules: ./backend and ./cli
 # <dir>/logs/go.log           one `<reldir>\t<argv>` line per `go test`
+#                             (FIXTURE_GO_FAIL="backend cli" makes the listed
+#                             module basenames print a `--- FAIL` + `FAIL\t<pkg>`
+#                             pair and exit 1; unset, every `go test` passes)
 # <dir>/logs/lint.log         one line per golangci-lint run
 # <dir>/logs/gate.log         one line per sub-gate script that ran
 # <dir>/logs/cov.log          one line per check-coverage.py invocation
@@ -120,7 +123,11 @@ if [ "\$1" = "work" ]; then
   exit 0
 fi
 if [ "\$1" = "test" ]; then
-  printf '%s\t%s\n' "\$(basename "\$PWD")" "\$*" >> "\$FX/logs/go.log"
+  mod="\$(basename "\$PWD")"
+  printf '%s\t%s\n' "\$mod" "\$*" >> "\$FX/logs/go.log"
+  case " \${FIXTURE_GO_FAIL:-} " in
+    *" \$mod "*) printf -- '--- FAIL: TestX\nFAIL\texample.com/%s\t0.1s\n' "\$mod"; exit 1 ;;
+  esac
   exit 0
 fi
 exit 0
@@ -322,6 +329,8 @@ assert_eq "a2 unscoped verify exits 0" "0" "$rc"
 assert_eq "a2 unscoped verify runs a go test per module" "2" "$(go_log_lines "$FX")"
 assert_contains "a2 unscoped backend runs ./..." "$FX/logs/go.log" "backend	test -race"
 assert_contains "a2 unscoped cli runs ./..." "$FX/logs/go.log" "cli	test -race -p 4 ./..."
+assert_not_contains "a2 an all-green loop prints no module failure summary" \
+  "$FX/logs/stderr.log" "modules failed"
 
 # a3 — FISHHAWK_VERIFY_PACKAGES alone scopes the loop.
 RV_ENV=(FISHHAWK_VERIFY_PACKAGES=cli/internal/gamma)
@@ -439,6 +448,60 @@ assert_ne "a12 a scoped loop that matched no module exits non-zero" "0" "$rc"
 assert_contains "a12 it says it refused rather than reporting success" \
   "$FX/logs/stderr.log" "refusing to report success without running any tests"
 assert_eq "a12 it ran no tests" "0" "$(go_log_lines "$FX")"
+
+# a13 — AGGREGATION (#4036): the unscoped verify (here the patch-coverage loop,
+# since backend owns the fixture's one changed file) with the FIRST module
+# failing still runs the SECOND, ends with a summary naming the failed module,
+# exits non-zero, and never reaches the patch-coverage gate (the gate's
+# check-coverage.py call is the only one carrying --diff-threshold).
+RV_ENV=(FIXTURE_GO_FAIL=backend)
+run_verify "$FX"
+rc=$?
+assert_ne "a13 unscoped verify with a failing module exits non-zero" "0" "$rc"
+assert_eq "a13 every module still ran" "2" "$(go_log_lines "$FX")"
+assert_contains "a13 the module AFTER the failing one ran" "$FX/logs/go.log" "cli	test -race"
+assert_contains "a13 the summary counts the failure" \
+  "$FX/logs/stderr.log" "scripts/test: 1 of 2 modules failed:"
+assert_contains "a13 the summary names the failed module" "$FX/logs/stderr.log" "  - ./backend"
+assert_not_contains "a13 the summary does not name the passing module" \
+  "$FX/logs/stderr.log" "  - ./cli"
+assert_contains "a13 the failing module's own output is kept" "$FX/logs/stdout.log" "--- FAIL: TestX"
+assert_not_contains "a13 a failed loop never reaches the patch-coverage gate" \
+  "$FX/logs/cov.log" "--diff-threshold"
+
+# a13b — the same through the PLAIN cmd_test loop (the patch gate skipped).
+RV_ENV=(FISHHAWK_SKIP_PATCH_COVERAGE=1 FIXTURE_GO_FAIL=backend)
+run_verify "$FX"
+rc=$?
+assert_ne "a13b plain-loop verify with a failing module exits non-zero" "0" "$rc"
+assert_contains "a13b it took the plain loop" "$FX/logs/stderr.log" "FISHHAWK_SKIP_PATCH_COVERAGE set"
+assert_eq "a13b every module still ran" "2" "$(go_log_lines "$FX")"
+assert_contains "a13b the summary names the failed module" "$FX/logs/stderr.log" "  - ./backend"
+assert_contains "a13b the summary counts the failure" \
+  "$FX/logs/stderr.log" "scripts/test: 1 of 2 modules failed:"
+
+# a14 — the SCOPED loop aggregates too: packages in both modules, the first
+# module failing; the second module's scoped package still runs.
+RV_ENV=(FIXTURE_GO_FAIL=backend)
+run_verify "$FX" --packages backend/internal/alpha,cli/internal/gamma
+rc=$?
+assert_ne "a14 scoped verify with a failing module exits non-zero" "0" "$rc"
+assert_eq "a14 both scoped modules ran" "2" "$(go_log_lines "$FX")"
+assert_contains "a14 the later module's scoped package still ran" \
+  "$FX/logs/go.log" "cli	test -race -p 4 ./internal/gamma"
+assert_contains "a14 the summary names the failed module" "$FX/logs/stderr.log" "  - ./backend"
+assert_contains "a14 the summary counts the failure" \
+  "$FX/logs/stderr.log" "scripts/test: 1 of 2 modules failed:"
+
+# a15 — every module failing: each is named, counted against the modules run.
+RV_ENV=(FIXTURE_GO_FAIL="backend cli")
+run_verify "$FX"
+rc=$?
+assert_ne "a15 all-modules-failing verify exits non-zero" "0" "$rc"
+assert_contains "a15 the summary counts both failures" \
+  "$FX/logs/stderr.log" "scripts/test: 2 of 2 modules failed:"
+assert_contains "a15 the summary names backend" "$FX/logs/stderr.log" "  - ./backend"
+assert_contains "a15 the summary names cli" "$FX/logs/stderr.log" "  - ./cli"
 
 echo "=== B. verify lock ==="
 

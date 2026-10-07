@@ -535,10 +535,34 @@ every CI build for as long as the deleted `minio/minio` image kept
 `backend/internal/tracestore` red (#3386), and made #3401 look like it had
 broken the runner module when it had merely unmasked it.
 
-**`cmd_test` and the verify loop deliberately KEEP their first-failure
-abort.** They are the fast inner gate an agent or developer re-runs; the
-split is intentional, not an oversight. Only `coverage` — the reporting
-gate — aggregates.
+**Every test loop aggregates since [#4036](https://github.com/kuhlman-labs/fishhawk/issues/4036).**
+#3403 first kept `cmd_test` and the verify loops on their first-failure
+abort as the "fast inner gate". That split cost the runner's verify-fix
+loop dearly: the fix agent saw only the FIRST failing module per
+iteration, so a branch red in two modules needed two ~20-minute
+iterations to learn what one verify could have told it. Now `cmd_test`
+(`scripts/test`), the full verify's patch-coverage loop
+(`cmd_test_with_patch_coverage`), and the scoped verify loop
+(`cmd_test_scoped`) all run every module in a TESTED context and end with
+the same stderr summary as `cmd_coverage` (`scripts/test: N of M modules
+failed:` plus one `  - <module>` line per failure, printed by the shared
+`_report_failed_modules`), then `exit 1`. M counts the modules the loop
+RAN, so a scoped loop's skipped modules are not counted. A passing run
+costs exactly what it did; a failing one now also runs the remaining
+modules. Only `coverage` CLASSIFIES each failure as BUILD vs TEST. In the
+full verify a failed patch-coverage loop exits BEFORE
+`_verify_patch_coverage`: the verdict is already red, a failed module's
+profile is partial, and the summary stays the last thing printed. The
+fail-closed paths are unchanged (`NO_MODULES_MSG` on an unavailable or
+empty module list, the scoped loop's ran-nothing refusal, the #2124
+snapshot emit/digest ordering ahead of the loop), as is every
+`-timeout "$TEST_TIMEOUT"` / `-p "$TEST_P"` argument. Pinned by
+`scripts/test-patch-coverage` (m1)-(m5) (the real `cmd_test` and
+`cmd_test_with_patch_coverage` under a `set -euo pipefail` subshell, both
+loop branches, plus all-green controls) and `scripts/test-verify-scope`
+a13-a15 (the real copied `scripts/test verify` end to end through the
+patch-coverage, plain and scoped loops, via the fixture's
+`FIXTURE_GO_FAIL` stub knob).
 
 The contract, in loop order:
 
@@ -787,7 +811,9 @@ the full unscoped loop, for each of:
 `cmd_test_scoped` additionally fails **closed** (exit 1, `NO_MODULES_MSG`) on an
 unavailable/empty module list, and fails closed again if the bucketed modules
 match nothing in the loop's own enumeration — a scoped loop that ran zero
-packages must never report success.
+packages must never report success. A failing scoped module does not stop
+the next one: the loop ends with the per-module failure summary and exits 1
+(#4036, see "Per-module coverage aggregation").
 
 ### The verify lock
 
