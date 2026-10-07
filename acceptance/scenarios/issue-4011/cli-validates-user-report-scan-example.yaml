@@ -1,0 +1,14 @@
+id: scenario:issue-4011/cli-validates-user-report-scan-example
+statement: '`fishhawk validate docs/spec/examples/workflow-v2-user-report-scan.yaml` exits 0 and prints no schema or validation diagnostic on stderr.'
+verify_hint: 'CLI exit code + stderr: build the fishhawk CLI from cli/cmd/fishhawk in the preview checkout, run validate on the shipped example path, observe exit 0 and empty stderr.'
+steps: 'Built the CLI from the sanctioned checkout: cd <tree>/cli && go build -o /tmp/fh4011/bin/fishhawk ./cmd/fishhawk. Ran /tmp/fh4011/bin/fishhawk validate <tree>/docs/spec/examples/workflow-v2-user-report-scan.yaml, capturing stdout and stderr separately.'
+assertions:
+    expected: Exit 0 and no diagnostic on stderr.
+    observed_at_record: 'Exit 0, 0 bytes on stderr, and ''<path>: OK'' on stdout. The example declares one plan-typed scan stage producing comms_report/comms_report_v1, an approval gate (count 1, not [author, agent]), no egress, and no apply stage.'
+    repro_handle: fishhawk validate docs/spec/examples/workflow-v2-user-report-scan.yaml
+origin:
+    issue: 4011
+    pr: 4071
+    run_id: 3660bdf8-0f0d-4b4c-9e15-d7631efd9c56
+    head_sha: 2d2dfb598de747277dae671494f6b819ff214a23
+    recorded_at: 2026-10-07T13:49:22Z

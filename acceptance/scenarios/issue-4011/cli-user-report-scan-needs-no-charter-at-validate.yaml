@@ -1,0 +1,14 @@
+id: scenario:issue-4011/cli-user-report-scan-needs-no-charter-at-validate
+statement: A copy of the shipped user_report_scan example, placed beside a work-management.yaml that declares no charter, passes `fishhawk validate` (exit 0, no charter refusal), because the spec-layer charter rule stays grooming-only.
+verify_hint: 'CLI exit code + stderr: copy the example into a temp dir as workflows.yaml with a sibling work-management.yaml lacking a charter block, run fishhawk validate on it, and observe exit 0 with no ''no backlog charter is declared'' text on stderr.'
+steps: Built the CLI from the sanctioned checkout. Copied the shipped example to /tmp/fh4011/nocharter/workflows.yaml. Beside it wrote a schema-valid work-management.yaml (spec_version work-management-v0, provider github_projects, required_fields, types.chore) with no charter block. Ran fishhawk validate on the copy. As a control, ran fishhawk validate on workflow-v2-backlog-grooming.yaml placed beside the same file.
+assertions:
+    expected: Exit 0 and no charter refusal.
+    observed_at_record: The user_report_scan copy exited 0 with no charter text. The grooming control exited 1 with 'no backlog charter is declared'.
+    repro_handle: fishhawk validate /tmp/fh4011/nocharter/workflows.yaml
+origin:
+    issue: 4011
+    pr: 4071
+    run_id: 3660bdf8-0f0d-4b4c-9e15-d7631efd9c56
+    head_sha: 2d2dfb598de747277dae671494f6b819ff214a23
+    recorded_at: 2026-10-07T13:49:22Z
