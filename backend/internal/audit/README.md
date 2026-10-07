@@ -267,12 +267,12 @@ a non-capable repo (in-memory fakes only) is a non-atomic read-then-append —
 rollback, permanence and the two-artifact scoping are pinned in
 `grooming_window_test.go` against real Postgres.
 
-### Family-parameterized protocol and the upkeep family (`UpkeepWindowAppender`, #3923)
+### Family-parameterized protocol: grooming, upkeep (`UpkeepWindowAppender`, #3923) and comms (`FamilyWindowAppender`, #4012)
 
 The two Tx cores (`windowDispositionBatchTx`, `windowCloseTx`) and the scan
 helpers take a `windowFamily` — {disposition category, watermark category,
-closed-error constructor, optional report category} — so a second disposition
-family reuses the same lock-then-scan-then-append code. The grooming entry points
+closed- and superseded-error constructors, optional report category} — so
+another disposition family reuses the same lock-then-scan-then-append code. The grooming entry points
 and `GroomingWindowClosedError` are thin wrappers, byte-identical in behavior and
 error text. Every scan filters by the family's OWN categories, so a grooming
 watermark never closes an upkeep window even when both carry the same
@@ -289,8 +289,39 @@ the capture's artifact, else `*UpkeepReportSupersededError` (naming the current
 artifact) and NOTHING is written. An absent or undecodable newest row refuses too.
 This is what keeps a capture the server resolved against report A from landing
 after report B was recorded. The watermark's production writer is the #3924
-apply, which closes the window on approve AND reject. Until it lands, only tests
-write the watermark.
+apply (`server/upkeep_apply.go`), which closes the window on approve AND reject.
+
+The **comms** family (#4012) is `comms_disposition_recorded` under the
+`comms_apply_window_closed` watermark, with the upkeep-style binding re-check
+over the newest `comms_report_recorded` row. It has NO typed entry points: it is
+reached through the GENERIC, family-keyed `FamilyWindowAppender` capability
+(`AppendChainedFamilyDispositionBatch(ctx, family, artifactID, ps)`,
+`AppendChainedFamilyWindowClose(ctx, family, p, artifactID)`; Tx cores
+`AppendChainedFamilyDispositionBatchTx` / `AppendChainedFamilyWindowCloseTx`;
+compile-time assertion in `postgres.go`, forwarded by
+`decisionindex.IndexingRepository`). Comms refusals are the generic
+`*WindowClosedError` and `*ReportSupersededError`, each carrying `Family`. The
+comms writers are the later #3775 phases; nothing appends these rows yet.
+
+- **One registry.** The family names are exported (`WindowFamilyGrooming`,
+  `WindowFamilyUpkeep`, `WindowFamilyComms`) and resolve through ONE map.
+  `LookupWindowFamily(name)` returns a family's {disposition, watermark, report}
+  categories from that same map, so the server's non-atomic fallback cannot scan
+  different categories than the atomic path.
+- **Unknown family refused, writing nothing.** The generic entry resolves the
+  family FIRST: an unregistered name returns `*UnknownWindowFamilyError`
+  (`errors.Is(err, ErrUnknownWindowFamily)`). The Postgres wrappers check before
+  `pgx.BeginFunc`, so no transaction opens; the Tx cores check again before
+  touching `tx`. A zero-value family would carry empty categories and append its
+  params unchecked (`TestFamilyWindow_UnknownFamilyRefusedWritesNothing`).
+- **Typed families keep their typed errors.** Grooming and upkeep are known
+  families on the generic entry too, and return their OWN refusals
+  (`*GroomingWindowClosedError`, `*UpkeepWindowClosedError`,
+  `*UpkeepReportSupersededError`), never the generic ones, so the typed and
+  generic entry points cannot disagree about one family
+  (`TestFamilyWindow_GenericEntryKeepsTypedErrorsForUpkeep`).
+- **Isolation.** A comms and an upkeep watermark on the same `artifact_id` each
+  refuse only their own family (`TestCommsWindow_FamilyIsolation`).
 
 ## At-most-one merge_verdict_recorded per run (0062 / #1983)
 

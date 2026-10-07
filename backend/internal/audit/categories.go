@@ -291,6 +291,16 @@ import "sort"
 // stage behind its group's holders, and one admitted row on every grouped
 // admission. Best-effort, actor system, INTERNAL — deliberately NOT
 // issue-comment activity categories (read through GET /v0/runs/{id}/audit).
+// #4012 (E3775.2) added the seven comms categories as FORWARD registrations,
+// the #3921 upkeep precedent: comms_report_recorded, comms_disposition_recorded
+// and comms_apply_window_closed are the comms window family's report, capture
+// and watermark rows (audit/grooming_window.go, reached through the generic
+// FamilyWindowAppender), and comms_scan_gathered, comms_draft_filed,
+// comms_draft_skipped and comms_apply_completed are the gather and apply rows.
+// Nothing emits them yet — their writers are the later #3775 comms phases —
+// and registering them now lets fishhawk_await_audit arm on them before those
+// writers land. INTERNAL, NOT issue-comment activity categories
+// (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -347,6 +357,13 @@ var KnownCategories = map[string]struct{}{
 	"clarification_answered":                  {},
 	"clarification_answers_truncated":         {},
 	"clarification_requested":                 {},
+	"comms_apply_completed":                   {}, // #4012: the comms apply's one summary row (writer: comms apply phase)
+	"comms_apply_window_closed":               {}, // #4012: comms capture-window watermark (writer: comms apply phase, via audit.FamilyWindowAppender)
+	"comms_disposition_recorded":              {}, // #4012: the captain disposed a comms-report entry (writer: comms capture phase)
+	"comms_draft_filed":                       {}, // #4012: the comms apply filed a draft (writer: comms apply phase)
+	"comms_draft_skipped":                     {}, // #4012: the comms apply skipped a draft (writer: comms apply phase)
+	"comms_report_recorded":                   {}, // #4012: one per ingested comms report artifact (writer: comms ingest phase)
+	"comms_scan_gathered":                     {}, // #4012: the comms gather's one scan summary row (writer: comms gather phase)
 	"concern_addressed_by_condition":          {},
 	"concern_auto_closed":                     {},
 	"concern_defer_failed":                    {},
