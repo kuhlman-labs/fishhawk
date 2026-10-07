@@ -8628,7 +8628,8 @@ func implementReviewStartedAfter(entries []*audit.Entry, stageID uuid.UUID, seq 
 //     resolved it — the resolve is idempotent).
 //  2. Persist the deployment artifact (artifact.KindDeployment), deduped on
 //     (stage_id, content_hash) exactly like handleShipDeployment so a repeat
-//     tick before the transition lands does not double-write.
+//     tick before the transition lands does not double-write. Its sha is the
+//     polled run's head_sha when that is a full commit SHA (E35.2 / #1599).
 //  3. Append the deployment_outcome_recorded audit entry (same payload shape
 //     the webhook callback writes, for consistent issue-comment rendering)
 //     and the deploy_run trace event carrying the polled run's identity.
@@ -8673,6 +8674,15 @@ func (s *Server) ResolveDeploymentFromPollState(ctx context.Context, runID, stag
 		ExternalRunURL: externalURL,
 		Outcome:        string(outcome),
 	}
+	// The deployed commit (E35.2 / #1599). gitRef is the DISPATCH ref (e.g.
+	// "main"), a symbolic name a post-deploy acceptance identity probe can
+	// never match, so the resolved commit comes from the polled run's head_sha
+	// — the commit the delegate workflow ran at. A malformed or empty head_sha
+	// is omitted, never fatal: the artifact then carries no sha (byte-identical
+	// to the pre-#1599 body) and a consuming acceptance stage fails closed.
+	if wr != nil && isDeployCommitSHA(wr.HeadSHA) {
+		depBody.SHA = strings.ToLower(wr.HeadSHA)
+	}
 	content, _ := json.Marshal(depBody)
 	contentHash := sha256Hex(content)
 
@@ -8702,6 +8712,7 @@ func (s *Server) ResolveDeploymentFromPollState(ctx context.Context, runID, stag
 		"content_hash":     contentHash,
 		"environment":      environment,
 		"ref":              gitRef,
+		"sha":              depBody.SHA,
 		"external_run_url": externalURL,
 		"outcome":          string(outcome),
 		"auth_method":      "reconciler",
@@ -8814,7 +8825,10 @@ func (s *Server) ResolveDeploymentRollbackFromPollState(ctx context.Context, run
 
 	// Persist the rolled_back deployment artifact — the durable carrier of the
 	// rolled_back disposition. Deduped on (stage_id, content_hash) so a repeat
-	// tick before the audit lands does not double-write.
+	// tick before the audit lands does not double-write. It deliberately
+	// carries NO sha (E35.2 / #1599): the rollback workflow's head_sha is not
+	// the deployed build, and a post-deploy acceptance stage must not read a
+	// rolled-back record as a deployed identity.
 	depBody := deploymentBody{
 		Environment:    environment,
 		Ref:            gitRef,

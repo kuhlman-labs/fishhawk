@@ -5388,8 +5388,28 @@ components:
           example: production
         ref:
           type: string
-          description: The git ref or sha that was deployed (ADR-038's "ref/sha").
+          description: |
+            The git ref or sha that was deployed (ADR-038's "ref/sha"). The
+            deploy reconciler records the dispatch `git_ref` here (e.g.
+            `main`), a symbolic name; the resolved commit rides `sha`.
           example: "1111111111111111111111111111111111111111"
+        sha:
+          type: string
+          pattern: '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
+          description: |
+            The full commit SHA of the deployed build — ADR-038's "ref/sha"
+            made explicit (E35.2 / #1599). Optional; when present it MUST be
+            a full 40- or 64-hex commit SHA (case-insensitive) or the request
+            is rejected 400 `deployment_invalid`. An abbreviated SHA is
+            refused. The deploy reconciler fills it from the polled GitHub
+            workflow run's `head_sha` (lowercased; an empty or malformed
+            `head_sha` is omitted, never fatal); a reconciler-recorded
+            `rolled_back` record never carries one. A post-deploy acceptance
+            stage consuming this deploy stage's `deployment` input reads it
+            (else a full-hex `ref`) as its expected head. Omitted from the
+            stored artifact when absent, so a sha-less record's content and
+            content hash are unchanged.
+          example: "0123456789abcdef0123456789abcdef01234567"
         external_run_url:
           type: string
           format: uri
@@ -23348,11 +23368,14 @@ paths:
         logic or credentials, so the external pipeline runs the deploy and
         the body reports its settled outcome.
 
-        The body carries `{ environment, ref, external_run_url, outcome,
-        rollback_handle? }`. `outcome` is one of `succeeded` / `failed` /
-        `partial` / `rolled_back` (the ADR-038 deploy dispositions). The
+        The body carries `{ environment, ref, sha?, external_run_url,
+        outcome, rollback_handle? }`. `outcome` is one of `succeeded` /
+        `failed` / `partial` / `rolled_back` (the ADR-038 deploy
+        dispositions). The optional `sha` (E35.2 / #1599) is the full 40- or
+        64-hex commit SHA of the deployed build, validated when present. The
         handler stores the artifact (`artifact.kind = deployment`) and
-        writes a `deployment_outcome_recorded` chained audit entry. When the
+        writes a `deployment_outcome_recorded` chained audit entry whose
+        payload carries the same `sha` key (empty when absent). When the
         body additionally carries `rollback_action` (`initiated` /
         `completed`) it writes the matching
         `deployment_rollback_initiated` / `deployment_rollback_completed`
@@ -23417,7 +23440,8 @@ paths:
             Body missing required fields or malformed
             (`code: deployment_invalid`) — for example an absent
             `environment`/`ref`/`external_run_url`, a non-http
-            `external_run_url`, an `outcome` outside the closed set, or an
+            `external_run_url`, an `outcome` outside the closed set, a `sha`
+            that is present but not a full 40- or 64-hex commit SHA, or an
             unrecognized `rollback_action` — or path/query parameters were
             malformed.
           content:
