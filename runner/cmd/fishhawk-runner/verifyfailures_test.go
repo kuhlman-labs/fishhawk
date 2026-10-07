@@ -94,6 +94,38 @@ func TestParseVerifyFailures(t *testing.T) {
 			t.Errorf("tests = %q, want one entry capped at %d bytes", got.tests, verifyFailureParseMaxEntryBytes)
 		}
 	})
+	t.Run("a lossy package list is flagged", func(t *testing.T) {
+		pkgLines := func(n int) string {
+			var b strings.Builder
+			for i := 0; i < n; i++ {
+				fmt.Fprintf(&b, "FAIL\texample.com/m/p%02d\t0.1s\n", i)
+			}
+			return b.String()
+		}
+		testLines := func(n int) string {
+			var b strings.Builder
+			for i := 0; i < n; i++ {
+				fmt.Fprintf(&b, "--- FAIL: T%02d (0.00s)\n", i)
+			}
+			return b.String()
+		}
+		cases := []struct {
+			name string
+			out  string
+			want bool
+		}{
+			{"exactly the cap is complete", pkgLines(verifyFailureParseMaxEntries), false},
+			{"a repeat past the cap drops nothing", pkgLines(verifyFailureParseMaxEntries) + "FAIL\texample.com/m/p00\t0.1s\n", false},
+			{"a distinct package past the cap is dropped", pkgLines(verifyFailureParseMaxEntries + 1), true},
+			{"a path cut at the byte cap", "FAIL\texample.com/" + strings.Repeat("x", verifyFailureParseMaxEntryBytes) + "/pkg/a\t0.1s\n", true},
+			{"tests past the cap do not flag packages", testLines(verifyFailureParseMaxEntries+5) + "FAIL\texample.com/m/pkg/b\t0.1s\n", false},
+		}
+		for _, c := range cases {
+			if got := parseVerifyFailures(c.out).pkgsLossy; got != c.want {
+				t.Errorf("%s: pkgsLossy = %t, want %t", c.name, got, c.want)
+			}
+		}
+	})
 	t.Run("no failure lines", func(t *testing.T) {
 		got := parseVerifyFailures("ok  \texample.com/m/pkg\t0.1s\nlint: 1 issue\n")
 		if len(got.tests)+len(got.pkgs)+len(got.buildFailed) != 0 {
@@ -125,6 +157,10 @@ func TestVerifyFailureScopeRelation(t *testing.T) {
 		{"build failed outside is inside", verifyFailures{pkgs: []string{"example.com/m/pkg/b"}, buildFailed: []string{"example.com/m/pkg/b"}}, scope, verifyRelationInside},
 		{"setup failed outside is inside", verifyFailures{pkgs: []string{"example.com/m/pkg/c"}, buildFailed: []string{"example.com/m/pkg/c"}}, scope, verifyRelationInside},
 		{"build failed beats an empty scope", verifyFailures{pkgs: []string{"example.com/m/pkg/b"}, buildFailed: []string{"example.com/m/pkg/b"}}, nil, verifyRelationInside},
+		// A lossy package list (an entry dropped past the cap, or a path cut
+		// at the byte cap) can never answer outside.
+		{"lossy all-outside is unknown", verifyFailures{pkgs: []string{"example.com/m/pkg/b"}, pkgsLossy: true}, scope, verifyRelationUnknown},
+		{"lossy with a parsed inside package is inside", verifyFailures{pkgs: []string{"example.com/m/pkg/b", "example.com/m/pkg/a"}, pkgsLossy: true}, scope, verifyRelationInside},
 	}
 	for _, c := range cases {
 		if got := verifyFailureScopeRelation(c.f, c.scope); got != c.want {
@@ -135,6 +171,32 @@ func TestVerifyFailureScopeRelation(t *testing.T) {
 	// package must classify inside.
 	if got := verifyFailureScopeRelation(parseVerifyFailures("FAIL\texample.com/m/pkg/b [build failed]\n"), scope); got != verifyRelationInside {
 		t.Errorf("parsed [build failed] outside package = %q, want inside", got)
+	}
+	// End to end at the parse caps: classification stays conservative when a
+	// package entry is omitted or truncated.
+	outsideLines := func(n int) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, "FAIL\texample.com/m/out%02d\t0.1s\n", i)
+		}
+		return b.String()
+	}
+	longScope := []string{"pkg/" + strings.Repeat("d", verifyFailureParseMaxEntryBytes)}
+	ends := []struct {
+		name  string
+		out   string
+		scope []string
+		want  string
+	}{
+		{"exactly the cap, all outside", outsideLines(verifyFailureParseMaxEntries), scope, verifyRelationOutside},
+		{"the cap of outside, then an in-scope package", outsideLines(verifyFailureParseMaxEntries) + "FAIL\texample.com/m/pkg/a\t0.1s\n", scope, verifyRelationUnknown},
+		{"one past the cap, all outside", outsideLines(verifyFailureParseMaxEntries + 1), scope, verifyRelationUnknown},
+		{"a path whose scope suffix is cut at the byte cap", "FAIL\texample.com/m/" + longScope[0] + "\t0.1s\n", longScope, verifyRelationUnknown},
+	}
+	for _, e := range ends {
+		if got := verifyFailureScopeRelation(parseVerifyFailures(e.out), e.scope); got != e.want {
+			t.Errorf("%s: relation = %q, want %q", e.name, got, e.want)
+		}
 	}
 }
 
@@ -247,6 +309,7 @@ type noopVerifyStep struct {
 	scoped bool // the call must carry FISHHAWK_VERIFY_PACKAGES
 	out    string
 	rc     int
+	hang   bool // print out, then sleep past the verify timeout
 }
 
 const (
@@ -254,7 +317,21 @@ const (
 	noopOutsideOut = "=== RUN   TestFlaky\n--- FAIL: TestFlaky (0.01s)\n    flaky_test.go:9: timing\nFAIL\nFAIL\texample.com/m/pkg/b\t0.02s\n"
 	noopInsideOut  = "--- FAIL: TestInside (0.00s)\nFAIL\nFAIL\texample.com/m/pkg/a\t0.01s\n"
 	noopBuildOut   = "# example.com/m/pkg/b\npkg/b/b.go:3:9: undefined: a.Old\nFAIL\texample.com/m/pkg/b [build failed]\n"
+	// noopLintOut is a lint-leg failure: no `FAIL\t<pkg>` line, so the
+	// relation is unknown.
+	noopLintOut = "pkg/a/a.go:3:1: exported const X should have comment (revive)\n1 issues:\n* revive: 1\nscripts/test: lint failed in runner\n"
 )
+
+// noopOverflowOut is a multi-module aggregate failure whose in-scope package
+// is reported AFTER verifyFailureParseMaxEntries outside packages.
+var noopOverflowOut = func() string {
+	var b strings.Builder
+	for i := 0; i < verifyFailureParseMaxEntries; i++ {
+		fmt.Fprintf(&b, "--- FAIL: TestOut%02d (0.00s)\nFAIL\texample.com/m/out%02d\t0.01s\n", i, i)
+	}
+	b.WriteString("--- FAIL: TestInside (0.00s)\nFAIL\texample.com/m/pkg/a\t0.01s\n")
+	return b.String()
+}()
 
 func scopedPass() noopVerifyStep           { return noopVerifyStep{scoped: true, out: noopPassOut} }
 func scopedFail(out string) noopVerifyStep { return noopVerifyStep{scoped: true, out: out, rc: 1} }
@@ -287,6 +364,9 @@ func newNoopLoopFixture(t *testing.T, maxIter int, steps ...noopVerifyStep) *noo
 	for i, s := range steps {
 		mustWrite(t, filepath.Join(dir, fmt.Sprintf("out.%d", i+1)), s.out)
 		mustWrite(t, filepath.Join(dir, fmt.Sprintf("rc.%d", i+1)), fmt.Sprintf("%d\n", s.rc))
+		if s.hang {
+			mustWrite(t, filepath.Join(dir, fmt.Sprintf("hang.%d", i+1)), "")
+		}
 	}
 	script := filepath.Join(dir, "verify.sh")
 	mustWrite(t, script, fmt.Sprintf(`#!/bin/sh
@@ -295,7 +375,7 @@ n=$(cat "$d/count" 2>/dev/null || echo 0)
 n=$((n+1))
 echo "$n" > "$d/count"
 printf '%%s pkgs=[%%s]\n' "$n" "$%s" >> "$d/calls.log"
-if [ -f "$d/out.$n" ]; then cat "$d/out.$n"; exit "$(cat "$d/rc.$n")"; fi
+if [ -f "$d/out.$n" ]; then cat "$d/out.$n"; if [ -f "$d/hang.$n" ]; then sleep 300; fi; exit "$(cat "$d/rc.$n")"; fi
 echo "verify fixture: unscripted call $n"
 exit 97
 `, dir, verifyPackagesEnvVar))
@@ -645,5 +725,132 @@ func TestRunVerifyFixLoop_HostOverloadedBeatsOutsideChange(t *testing.T) {
 	}
 	if detail, _ := noopSummaryOf(t, res)["detail"].(string); strings.HasPrefix(detail, verifyFailureOutsideChangeLead) {
 		t.Errorf("verify_summary detail = %q, want no outside-change detail when host_overloaded decides", detail)
+	}
+}
+
+// A refund on an UNKNOWN relation: the admitted re-run fails in the lint leg
+// (no `FAIL\t<pkg>` line — lint runs before the tests, so this is a realistic
+// failure). Unknown is refunded exactly like inside: max_iterations=1 still
+// yields a second fix re-invoke, and it is never category C.
+func TestRunVerifyFixLoop_NoopFlakeRerunFailingUnknownIsRefunded(t *testing.T) {
+	f := newNoopLoopFixture(t, 1,
+		scopedPass(), fullFail(noopOutsideOut), // iter 0 → fix 1 (no-op)
+		scopedFail(noopLintOut),  // iter 1: admitted re-run fails in lint → refund, fix 2
+		scopedPass(), fullPass(), // iter 1 again → pass
+	)
+	inv := cappedInvoker(t, 3, nil)
+	res, tree, log := f.run(t, inv)
+
+	if inv.callIdx != 2 {
+		t.Fatalf("fix invokes = %d, want 2 (an unknown re-run failure refunds the no-op iteration)\n%s", inv.callIdx, log)
+	}
+	if !res.OK || tree == "" {
+		t.Errorf("OK=%t tree=%q, want the final pass", res.OK, tree)
+	}
+	if !strings.Contains(log, `"event":"verify_flake_rerun_refunded"`) {
+		t.Errorf("log lacks verify_flake_rerun_refunded:\n%s", log)
+	}
+	if n := len(eventPayloads(t, res, verifyFlakeRerunEvent)); n != 0 {
+		t.Errorf("verify_flake_rerun events = %d, want 0 (the re-run failed, undecidably)", n)
+	}
+	noops := eventPayloads(t, res, verifyFixNoopEvent)
+	if countAdmitted(noops) != 1 {
+		t.Errorf("admitted no-ops = %d, want 1: %v", countAdmitted(noops), noops)
+	}
+	if len(noops) != 2 || noops[1]["relation"] != verifyRelationUnknown {
+		t.Errorf("verify_fix_noop = %v, want a second, unadmitted no-op with relation=unknown", noops)
+	}
+}
+
+// The flakeRerun marker survives a verify-lock contention re-run at the
+// admitted iteration: the contended verify never judged the tree, its in-place
+// repeat is not a second no-op, and the repeat's pass settles the flake re-run.
+func TestRunVerifyFixLoop_FlakeRerunSurvivesVerifyLockContention(t *testing.T) {
+	f := newNoopLoopFixture(t, 1,
+		scopedPass(), fullFail(noopOutsideOut), // iter 0 → fix 1 (no-op)
+		scopedFail(lockRefusalFixtureOutput), // iter 1: admitted re-run is lock-contended → in-place repeat
+		scopedPass(), fullPass(),             // the repeat on the identical tree passes
+	)
+	inv := cappedInvoker(t, 3, nil)
+	res, tree, log := f.run(t, inv)
+
+	if !res.OK || tree == "" {
+		t.Fatalf("OK=%t tree=%q, want a pass\n%s", res.OK, tree, log)
+	}
+	if inv.callIdx != 1 {
+		t.Errorf("fix invokes = %d, want 1", inv.callIdx)
+	}
+	if n := countEvents(res.Events, "verify_lock_contended_retry"); n != 1 {
+		t.Errorf("verify_lock_contended_retry events = %d, want 1", n)
+	}
+	noops := eventPayloads(t, res, verifyFixNoopEvent)
+	if len(noops) != 1 || countAdmitted(noops) != 1 {
+		t.Errorf("verify_fix_noop = %v, want exactly ONE (admitted) — a lock re-run is not a no-op fix\n%s", noops, log)
+	}
+	if strings.Contains(log, "verify_flake_rerun_refunded") {
+		t.Errorf("no refund may fire:\n%s", log)
+	}
+	if reruns := eventPayloads(t, res, verifyFlakeRerunEvent); len(reruns) != 1 || reruns[0]["outcome"] != "passed" {
+		t.Errorf("verify_flake_rerun = %v, want one outcome=passed (the marker survives the lock re-run)", reruns)
+	}
+	if detail, _ := noopSummaryOf(t, res)["detail"].(string); !strings.HasPrefix(detail, verifyFlakeRerunLead) {
+		t.Errorf("verify_summary detail = %q, want the %s lead", detail, verifyFlakeRerunLead)
+	}
+}
+
+// A gateTimedOut verify at the admitted iteration breaks BEFORE the flake
+// block: the stage ends with the timed-out category C, never the outside-change
+// lead, and neither a flake-rerun verdict nor a refund is recorded.
+func TestRunVerifyFixLoop_FlakeRerunTimedOutIsTimedOutNotOutsideChange(t *testing.T) {
+	f := newNoopLoopFixture(t, 2,
+		scopedPass(), fullFail(noopOutsideOut), // iter 0 → fix 1 (no-op)
+		noopVerifyStep{scoped: true, out: noopOutsideOut, rc: 1, hang: true}, // iter 1: admitted re-run hangs
+	)
+	// Every call but the last must COMPLETE inside the deadline (#3587).
+	f.cfg.verifyTimeout = fastExitSafeVerifyTimeout()
+	inv := cappedInvoker(t, 3, nil)
+	res, tree, log := f.run(t, inv)
+
+	if res.OK || tree != "" || res.FailureCategory != "C" || !strings.HasPrefix(res.FailureReason, verifyGateTimedOutLead+": ") {
+		t.Fatalf("OK=%t tree=%q category=%q reason=%.160q, want C with the %q lead\n%s", res.OK, tree, res.FailureCategory, res.FailureReason, verifyGateTimedOutLead, log)
+	}
+	if inv.callIdx != 1 {
+		t.Errorf("fix invokes = %d, want 1 (a timed-out verify never reaches the fix agent)", inv.callIdx)
+	}
+	if noops := eventPayloads(t, res, verifyFixNoopEvent); len(noops) != 1 || countAdmitted(noops) != 1 {
+		t.Errorf("verify_fix_noop = %v, want one admitted", noops)
+	}
+	if n := len(eventPayloads(t, res, verifyFlakeRerunEvent)); n != 0 {
+		t.Errorf("verify_flake_rerun events = %d, want 0 (a timeout is no verdict)", n)
+	}
+	if strings.Contains(log, "verify_flake_rerun_refunded") {
+		t.Errorf("no refund may fire on a timeout:\n%s", log)
+	}
+	if detail, _ := noopSummaryOf(t, res)["detail"].(string); strings.HasPrefix(detail, verifyFailureOutsideChangeLead) || strings.HasPrefix(detail, verifyFlakeRerunLead) {
+		t.Errorf("verify_summary detail = %q, want neither flake-rerun lead", detail)
+	}
+}
+
+// The parse cap must not admit a flake: a multi-module aggregate whose
+// in-scope failure follows verifyFailureParseMaxEntries outside packages is
+// unknown, so the no-op is NOT admitted and a reproduced failure stays
+// category A, never verify_failure_outside_change.
+func TestRunVerifyFixLoop_NoopOverflowingFailureListIsNotAdmitted(t *testing.T) {
+	f := newNoopLoopFixture(t, 1, scopedPass(), fullFail(noopOverflowOut), scopedPass(), fullFail(noopOverflowOut))
+	inv := cappedInvoker(t, 3, nil)
+	res, _, log := f.run(t, inv)
+
+	noops := eventPayloads(t, res, verifyFixNoopEvent)
+	if len(noops) != 1 || noops[0]["admitted"] != false || noops[0]["relation"] != verifyRelationUnknown {
+		t.Fatalf("verify_fix_noop = %v, want one admitted=false relation=unknown\n%s", noops, log)
+	}
+	if n := len(eventPayloads(t, res, verifyFlakeRerunEvent)); n != 0 {
+		t.Errorf("verify_flake_rerun events = %d, want 0", n)
+	}
+	if res.OK || res.FailureCategory != "A" || strings.HasPrefix(res.FailureReason, verifyFailureOutsideChangeLead) {
+		t.Errorf("OK=%t category=%q reason=%.120q, want category A on exhaustion, never outside-change", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if inv.callIdx != 1 {
+		t.Errorf("fix invokes = %d, want 1", inv.callIdx)
 	}
 }

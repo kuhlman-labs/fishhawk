@@ -101,27 +101,41 @@ type verifyFailures struct {
 	// buildFailed are the pkgs whose FAIL line carried `[build failed]` or
 	// `[setup failed]` — a deterministic artifact defect, never a flake.
 	buildFailed []string
+	// pkgsLossy is set when pkgs is NOT the complete, exact set of failing
+	// packages: a distinct package was dropped past the entry cap, or an
+	// import path was cut at the byte cap (which can remove the suffix that
+	// names a scope dir). verifyFailureScopeRelation never answers outside
+	// from a lossy list.
+	pkgsLossy bool
 }
 
 // parseVerifyFailures extracts the failing test names and package import
 // paths from a go-test verify output. Each list is deduplicated in order of
 // appearance, capped at verifyFailureParseMaxEntries entries, and each entry
 // is capped at verifyFailureParseMaxEntryBytes. A package that failed to build
-// or set up is recorded in buildFailed as well as pkgs.
+// or set up is recorded in buildFailed as well as pkgs. Either cap firing on a
+// package sets pkgsLossy.
 func parseVerifyFailures(out string) verifyFailures {
 	var f verifyFailures
 	seenT := map[string]bool{}
 	seenP := map[string]bool{}
 	seenB := map[string]bool{}
-	add := func(list *[]string, seen map[string]bool, v string) {
+	// add reports whether v lost information: cut at the byte cap, or a new
+	// entry dropped because the list is full.
+	add := func(list *[]string, seen map[string]bool, v string) (lossy bool) {
 		if len(v) > verifyFailureParseMaxEntryBytes {
 			v = v[:verifyFailureParseMaxEntryBytes]
+			lossy = true
 		}
-		if seen[v] || len(*list) >= verifyFailureParseMaxEntries {
-			return
+		if seen[v] {
+			return lossy
+		}
+		if len(*list) >= verifyFailureParseMaxEntries {
+			return true
 		}
 		seen[v] = true
 		*list = append(*list, v)
+		return lossy
 	}
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSuffix(line, "\r")
@@ -130,7 +144,9 @@ func parseVerifyFailures(out string) verifyFailures {
 			continue
 		}
 		if m := parsePkgFailRe.FindStringSubmatch(line); m != nil {
-			add(&f.pkgs, seenP, m[1])
+			if add(&f.pkgs, seenP, m[1]) {
+				f.pkgsLossy = true
+			}
 			if strings.Contains(m[2], "[build failed]") || strings.Contains(m[2], "[setup failed]") {
 				add(&f.buildFailed, seenB, m[1])
 			}
@@ -151,6 +167,10 @@ func parseVerifyFailures(out string) verifyFailures {
 //   - inside when ANY failing import path equals a scope dir or ends with
 //     "/"+dir — a suffix collision errs toward inside, today's behaviour and
 //     the fail-safe direction;
+//   - unknown when no parsed package is inside but the list is lossy
+//     (pkgsLossy): a package dropped past the entry cap, or a path cut at the
+//     byte cap, may be the in-scope one, so "every package is outside" cannot
+//     be decided;
 //   - outside otherwise: EVERY failing package is outside the change.
 func verifyFailureScopeRelation(f verifyFailures, scopePkgs []string) string {
 	if len(f.buildFailed) > 0 {
@@ -170,6 +190,9 @@ func verifyFailureScopeRelation(f verifyFailures, scopePkgs []string) string {
 				return verifyRelationInside
 			}
 		}
+	}
+	if f.pkgsLossy {
+		return verifyRelationUnknown
 	}
 	return verifyRelationOutside
 }
