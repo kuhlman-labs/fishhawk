@@ -4377,3 +4377,61 @@ func TestDeclaredImage_PullFailureHintOnlyWhenAnonymous(t *testing.T) {
 		})
 	}
 }
+
+// TestRunGateInContainer_HostGoEnvNeverReachesContainer pins #4048 across the
+// whole boundary: host-specific Go variables in the RUNNER PROCESS env (a
+// toolchain-switching host exports a darwin GOROOT) go process env →
+// sanitizedGateEnv → runGateInContainer → ContainerEnv → BuildArgv, and none of
+// them may appear as a `-e` token on the gate `run` argv; the tuning knob
+// survives, GOFLAGS loses its absolute-path field, and GOTOOLCHAIN stays the
+// pin. The narrowing is container-only: the host-side module seed is handed the
+// sanitized env UNCHANGED, GOROOT included, because it runs the host toolchain.
+func TestRunGateInContainer_HostGoEnvNeverReachesContainer(t *testing.T) {
+	hostRoot := "/Users/x/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.6.darwin-arm64"
+	t.Setenv("GOROOT", hostRoot)
+	t.Setenv("GOOS", "darwin")
+	t.Setenv("GOWORK", "/Users/x/go.work")
+	t.Setenv("GOTOOLDIR", "/Users/x/tool")
+	t.Setenv("GODEBUG", "panicnil=1")
+	t.Setenv("GOFLAGS", "-mod=mod -modfile=/Users/x/alt.mod")
+
+	st := containerState("img:1", "/nonexistent/daemon.sock", &strings.Builder{})
+	g := scriptGateExec(t, nil)
+	// scriptGateExec stubs the seed itself, so the env-capturing seed goes in
+	// AFTER it (and its cleanup restores the previous stub).
+	var seedEnv []string
+	prevSeed := seedModCacheFn
+	seedModCacheFn = func(_ context.Context, _ gateiso.SeedExecFunc, _, _ string, _ *gateiso.VisibleCaches, baseEnv []string, _ time.Duration) (gateiso.SeedReport, error) {
+		seedEnv = append([]string(nil), baseEnv...)
+		return gateiso.SeedReport{}, nil
+	}
+	t.Cleanup(func() { seedModCacheFn = prevSeed })
+
+	if out, code, disp := execOn(t, st); code != 0 || disp != gateExecuted {
+		t.Fatalf("(out, code, disp) = (%q, %d, %s), want the gate's own verdict", out, code, disp)
+	}
+	gate := g.argv["gate_run"]
+	if len(gate) == 0 {
+		t.Fatalf("no gate run argv recorded: %v", g.order)
+	}
+	for _, key := range []string{"GOROOT", "GOOS", "GOWORK", "GOTOOLDIR"} {
+		if i := envIndex(gate, key); i >= 0 {
+			t.Errorf("host %s reached the container: -e %s", key, gate[i+1])
+		}
+	}
+	if v, ok := lastEnvValue(gate, "GODEBUG"); !ok || v != "panicnil=1" {
+		t.Errorf("GODEBUG = (%q, %v), want the tuning knob to survive verbatim", v, ok)
+	}
+	if v, ok := lastEnvValue(gate, "GOFLAGS"); !ok || v != "-mod=mod" {
+		t.Errorf("GOFLAGS = (%q, %v), want the absolute -modfile field stripped to -mod=mod", v, ok)
+	}
+	if v, ok := lastEnvValue(gate, "GOTOOLCHAIN"); !ok || v != "local" {
+		t.Errorf("GOTOOLCHAIN = (%q, %v), want the pin", v, ok)
+	}
+	if seedEnv == nil {
+		t.Fatal("the host-side seed was never handed an env; the GOROOT check below would be vacuous")
+	}
+	if v, ok := envOf(seedEnv, "GOROOT"); !ok || v != hostRoot {
+		t.Errorf("seed env GOROOT = (%q, %v), want the process GOROOT %q: the host seed needs the host toolchain", v, ok, hostRoot)
+	}
+}

@@ -491,8 +491,9 @@ Do not widen or remove the bound silently.
 
 **The container env rung.** `ContainerEnv(sanitized, extras)` projects the
 runner's already-sanitized gate env (`sanitizedGateEnv`, ADR-029) into the
-container: only `TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*` and `GO*` survive, then
-`HOME=/tmp`, `GOPATH=/tmp/gopath`, `GOCACHE=/gocache`, `GOMODCACHE=/gomodcache`,
+container: only `TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*` and an explicit Go
+tuning-name set (`containerEnvAllowGo`, NOT a bare `GO*` prefix, #4048) survive,
+then `HOME=/tmp`, `GOPATH=/tmp/gopath`, `GOCACHE=/gocache`, `GOMODCACHE=/gomodcache`,
 `GOLANGCI_LINT_CACHE=/lintcache`, `GOPROXY=off`, `GOTOOLCHAIN=local`,
 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` and `FISHHAWK_GATE_CONTAINER=1`
 (`GateContainerMarker`, on EVERY container exec) are appended drop-then-append,
@@ -510,6 +511,41 @@ The RUNNER's own inherited environment goes to the runtime CLI (it needs
 `DOCKER_CONFIG` / `REGISTRY_AUTH_FILE` dropped, the validated socket and the
 runner-chosen docker config re-pinned); the sanitized env crosses into the
 container via `-e` only (`TestGateContainer_EnvAllowList`).
+
+**Which Go variables cross (#4048).** The container's toolchain, `GOROOT` and
+`GOOS`/`GOARCH` are baked into the image, so a host Go variable naming the HOST
+toolchain or platform must not reach it: a toolchain-switching host exports a
+darwin `GOROOT` to the runner process, and the old bare `GO*` prefix forwarded
+it as `-e GOROOT=…darwin-arm64`, which broke every in-container `go`. The
+HOST-side gate path (`sanitizedGateEnv` / `gateEnvAllowGo`, and the host-side
+module seed, which needs the host toolchain) is untouched; only the projection
+into the container narrowed.
+
+| Variable | Container sees | Why |
+|---|---|---|
+| `GODEBUG`, `GOEXPERIMENT`, `GOFIPS140`, `GO111MODULE`, `GOGC`, `GOMAXPROCS`, `GOMEMLIMIT`, `GOTRACEBACK` | the inherited value, verbatim | platform-independent tuning |
+| `GOFLAGS` | the inherited value after `containerGoflags` | see the rules below |
+| `HOME`, `GOPATH`, `GOCACHE`, `GOMODCACHE`, `GOLANGCI_LINT_CACHE`, `GOPROXY`, `GOTOOLCHAIN` | the runner pin, whatever was inherited | cache and toolchain pins (drop-then-append) |
+| `GOROOT`, `GOTOOLDIR`, `GOBIN`, `GOENV`, `GOWORK`, `GOMOD`, `GOCACHEPROG`, `GOCOVERDIR`, `GOTMPDIR`, `GOAUTH` | absent | name host paths or host-only programs that do not exist in the container |
+| `GOOS`, `GOARCH`, `GOHOSTOS`, `GOHOSTARCH`, `GOEXE`, `GOGCCFLAGS`, `GOVERSION` | absent | describe the HOST platform/toolchain; `GOOS`/`GOARCH` would silently cross-compile |
+| `GOOGLE_*` | absent | not Go variables; the old prefix admitted them |
+| `CGO_*` | the inherited value, verbatim | **residual, not fixed (#4048):** the prefix still crosses, and `CGO_CFLAGS`/`CGO_LDFLAGS` can carry host paths (e.g. `-I/opt/homebrew/include`). Harmless for the race detector's own cgo use, but could affect a module with its own cgo code |
+
+`containerGoflags` (applied to the inherited `GOFLAGS` only; runner `extraEnv`
+is not filtered): (1) a value containing a quote character is dropped whole
+(fail closed), because Go splits `GOFLAGS` with a quote-aware splitter, so a
+quoted field could hide a host path from a whitespace split; (2) otherwise each
+whitespace-separated `-name=value` / `--name=value` field whose value starts
+with `/` is dropped (`-modfile`, `-overlay`, `-pgo`, `-pkgdir`, `-toolexec`, …:
+an absolute path names a host file; a container-absolute value is dropped too,
+which loses only tuning), while relative values and bare flags are kept; (3) if
+nothing survives the key is omitted rather than emitted as `GOFLAGS=`. Pinned
+by `TestContainerEnv_HostGoVarsNeverCross`, `TestContainerGoflags`,
+`TestContainerEnv_GoflagsSanitizedInProjection` and the cross-boundary
+`TestRunGateInContainer_HostGoEnvNeverReachesContainer` in
+`cmd/fishhawk-runner`. Because the host `GOROOT` no longer crosses, AGENTS.md's
+`go env -w GOTOOLCHAIN=go1.25.6` remedy is safe on a host that also runs the
+container path.
 
 ## Runtime CLI credentials (`dockerconfig.go`, E51.26 / [#4046](https://github.com/kuhlman-labs/fishhawk/issues/4046))
 
@@ -1112,7 +1148,7 @@ the pieces, not the full in-container verify. Before enabling:
    opens with `command -v docker || return`, so with no docker CLI they no-op
    rather than fail or skip the run; `scripts/test` never sets
    `FISHHAWK_SKIP_INTEGRATION`; and the container env allow-list (`TZ`/`LANG`/
-   `TERM`, `LC_*`, `CGO_*`, `GO*`) cannot carry a host
+   `TERM`, `LC_*`, `CGO_*`, an explicit `GO*` tuning set) cannot carry a host
    `FISHHAWK_SKIP_INTEGRATION` in. A suite that skipped anyway shows as
    `--- SKIP`, which the walk must treat as a failure.
 
