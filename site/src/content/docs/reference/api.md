@@ -64,6 +64,16 @@ run their gates in different images. The runner applies its image policy,
 pull and build to that declaration. The object is absent when nothing is
 declared.
 
+The host-dispatch spawn marker
+(`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`) also holds a stage
+that sits behind a deploy, which the table does not spell out. A `pending`
+stage sequenced after a `deploy` stage that has not succeeded (still awaiting
+approval, in flight, failed or cancelled) is refused with 409
+`dispatch_not_admissible`, `details.reason` `deploy_not_succeeded` and the
+deploy stage's id and state, and the stage stays `pending`. It is the same
+rule the server applies when it advances a run on its own: a post-deploy
+acceptance stage runs only once every earlier deploy stage succeeded.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->

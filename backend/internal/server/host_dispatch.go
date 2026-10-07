@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 )
@@ -21,6 +22,11 @@ import (
 // orchestrator.emitAcceptanceDispatched's backend-triggered entry (which carries
 // no `source` field).
 const hostDispatchAnchorSource = "host_dispatch"
+
+// hostDispatchReasonDeployNotSucceeded is the `reason` detail on the
+// post-deploy hold's 409 dispatch_not_admissible (E35.1 / #1598): the stage
+// sits behind an earlier deploy stage that has not succeeded.
+const hostDispatchReasonDeployNotSucceeded = "deploy_not_succeeded"
 
 // hostDispatchResponse is the 200 body of the host-dispatch marker endpoint
 // (#1912). Transitioned is true when this call drove the stage
@@ -81,6 +87,13 @@ type hostDispatchResponse struct {
 // stage, and an auto-merge check-gate review stage each return 409
 // dispatch_not_admissible: none is ever host-spawned, so marking it 'dispatched'
 // would misrepresent state and could wedge the stage.
+//
+// Post-deploy hold (E35.1 / #1598, ADR-053): a `pending` stage sequenced behind
+// a deploy stage that has not SUCCEEDED (in flight, failed or cancelled) returns
+// 409 dispatch_not_admissible with reason deploy_not_succeeded, leaving the
+// stage state unchanged — the same orchestrator.DeployAheadNotSucceeded
+// predicate Orchestrator.Advance enforces. A stage-list read error there
+// answers 500 dependency_check_failed.
 //
 // Dev mode (E72.13 / #3500): a daemon with a dev-only surface mounted
 // (Config.DevFixtures / Config.DevStubForge — what `scripts/dev preview`
@@ -303,6 +316,38 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, r, http.StatusConflict, "wave_not_integrated",
 			waveErr.message(), waveErr.details())
 		return
+	}
+
+	// Post-deploy hold (E35.1 / #1598, ADR-053): the SAME predicate
+	// Orchestrator.Advance enforces, so an operator dispatch cannot spawn a
+	// stage the orchestrator is holding. A stage behind an earlier deploy stage
+	// is admitted only once EVERY earlier deploy SUCCEEDED — in flight, failed
+	// and cancelled all refuse. Failed matters here and not only in Advance:
+	// ResolveDeploymentFromPollState commits the deploy's failure before the run
+	// advance that fails the run, so a `failed` deploy under a still-`running`
+	// run is a reachable window the terminal-run guard above does not cover.
+	// Checked inside the held stage-admission lock and BEFORE the state
+	// switch/CAS, so a refusal commits NO state and the stage stays `pending`.
+	// Only the `pending` arm is checked: Orchestrator.Advance parks a stage at
+	// awaiting_host_dispatch only AFTER this same hold cleared, i.e. once every
+	// earlier deploy reached `succeeded`, which is terminal and cannot regress.
+	// Sequence 0 has nothing ahead of it, so it skips the read. Fail-CLOSED on a
+	// stage-list read error (retryable 500), the wave-order guard's posture.
+	if stage.State == run.StageStatePending && stage.Sequence > 0 {
+		runStages, lerr := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
+		if lerr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+				"could not list the run's stages to check for an unsucceeded deploy stage ahead of this one",
+				map[string]any{"run_id": runID.String(), "stage_id": stageID.String(), "error": lerr.Error()})
+			return
+		}
+		if deploy := orchestrator.DeployAheadNotSucceeded(runStages, stage); deploy != nil {
+			s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+				"stage is held behind an earlier deploy stage that has not succeeded; it is dispatchable only once every earlier deploy stage succeeded",
+				map[string]any{"stage_id": stageID.String(), "reason": hostDispatchReasonDeployNotSucceeded,
+					"deploy_stage_id": deploy.ID.String(), "deploy_state": string(deploy.State)})
+			return
+		}
 	}
 
 	switch stage.State {
