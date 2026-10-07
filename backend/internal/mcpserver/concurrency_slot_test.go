@@ -3,9 +3,11 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -580,14 +582,26 @@ type e2eSlotFixture struct {
 
 func newE2ESlotFixture(t *testing.T) *e2eSlotFixture {
 	t.Helper()
+	return newE2ESlotFixtureWith(t, nil)
+}
+
+// newE2ESlotFixtureWith is newE2ESlotFixture with the server's Postgres
+// concurrency store passed through wrap (nil: unwrapped), the seam a test uses
+// to act INSIDE an in-flight admission.
+func newE2ESlotFixtureWith(t *testing.T, wrap func(concurrency.Store) concurrency.Store) *e2eSlotFixture {
+	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	runRepo := runpkg.NewPostgresRepository(pool)
+	var store concurrency.Store = concurrency.NewPostgresStore(pool)
+	if wrap != nil {
+		store = wrap(store)
+	}
 	const bearer = "fhk_slot_waiter_e2e"
 	s := server.New(server.Config{
 		RunRepo:     runRepo,
 		AuditRepo:   audit.NewPostgresRepository(pool),
-		Concurrency: concurrency.NewPostgresStore(pool),
+		Concurrency: store,
 		APITokenRepo: &stubMCPAPITokens{tok: &apitoken.Token{
 			ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "write:runs", "write:approvals"}, PlainText: bearer,
 		}},
@@ -933,6 +947,100 @@ func TestConcurrencySlot_E2E_TerminalRunStopsWaiter(t *testing.T) {
 			}
 			f.settle(t, a) // the slot frees: only the terminal-run refusal keeps B out
 			waitDone(t, done)
+			if n := f.spawnCount(b); n != 0 {
+				t.Fatalf("B spawned %d time(s) for a %s run, want none", n, terminal)
+			}
+			if got := f.stageState(t, b); got != "awaiting_host_dispatch" {
+				t.Fatalf("B state = %s, want awaiting_host_dispatch (never admitted)", got)
+			}
+			slotWaiters.mu.Lock()
+			_, still := slotWaiters.active[b.ID]
+			slotWaiters.mu.Unlock()
+			if still {
+				t.Fatal("B's waiter is still registered after it stopped")
+			}
+		})
+	}
+}
+
+// admissionSeamStore runs hook INSIDE one in-flight admission: armed with a
+// stage id, the FIRST Admit for exactly that stage (an atomic one-shot — no
+// other stage's Admit, and no second Admit of the same stage, can trip it)
+// runs hook before delegating to the real store. By then the handler has
+// already read the run, so hook acts between the terminal-run pre-read and
+// the admission CAS. Hook errors run on the HTTP handler goroutine, so they
+// are recorded for the test goroutine rather than failing there.
+type admissionSeamStore struct {
+	concurrency.Store
+	target atomic.Pointer[uuid.UUID]
+	hook   func(ctx context.Context) error
+	fired  atomic.Int32
+	mu     sync.Mutex
+	errs   []error
+}
+
+func (s *admissionSeamStore) Admit(ctx context.Context, req concurrency.Request) (concurrency.Admission, error) {
+	if t := s.target.Load(); t != nil && req.StageID == *t && s.target.CompareAndSwap(t, nil) {
+		s.fired.Add(1)
+		if err := s.hook(ctx); err != nil {
+			s.mu.Lock()
+			s.errs = append(s.errs, err)
+			s.mu.Unlock()
+		}
+	}
+	return s.Store.Admit(ctx, req)
+}
+
+// TestConcurrencySlot_E2E_RunTerminalBetweenGuardAndAdmission reproduces the
+// #4035 flake sequence deterministically: B is queued behind A with a live
+// waiter; INSIDE B's next in-flight admission — after the handler's
+// terminal-run pre-read saw B's run live — B's run goes terminal and A
+// settles, freeing the slot. Only the admission's in-transaction run-liveness
+// check can refuse B now: the waiter must stop on the 409 without spawning,
+// and B must stay awaiting_host_dispatch.
+func TestConcurrencySlot_E2E_RunTerminalBetweenGuardAndAdmission(t *testing.T) {
+	for _, terminal := range []runpkg.State{runpkg.StateCancelled, runpkg.StateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			var seam *admissionSeamStore
+			f := newE2ESlotFixtureWith(t, func(s concurrency.Store) concurrency.Store {
+				seam = &admissionSeamStore{Store: s}
+				return seam
+			})
+			a, b := f.park(t, nil), f.park(t, nil)
+			f.dispatch(t, a)
+			if out := f.dispatch(t, b); out.ConcurrencySlot == nil || out.ConcurrencySlot.Waiter != slotWaiterStarted {
+				t.Fatalf("B slot = %+v, want queued with a started waiter", out.ConcurrencySlot)
+			}
+			slotWaiters.mu.Lock()
+			done, ok := slotWaiters.active[b.ID]
+			slotWaiters.mu.Unlock()
+			if !ok {
+				t.Fatal("no live waiter registered for B")
+			}
+			seam.hook = func(context.Context) error {
+				if _, err := f.runRepo.TransitionRun(f.ctx, b.RunID, terminal); err != nil {
+					return fmt.Errorf("transition B's run to %s: %w", terminal, err)
+				}
+				for _, to := range []runpkg.StageState{runpkg.StageStateRunning, runpkg.StageStateSucceeded} {
+					if _, err := f.runRepo.TransitionStage(f.ctx, a.ID, to, nil); err != nil {
+						return fmt.Errorf("settle A -> %s: %w", to, err)
+					}
+				}
+				return nil
+			}
+			bID := b.ID
+			seam.target.Store(&bID) // armed: B's waiter's next poll trips it
+			waitDone(t, done)
+
+			seam.mu.Lock()
+			errs := seam.errs
+			seam.mu.Unlock()
+			for _, err := range errs {
+				t.Errorf("seam hook: %v", err)
+			}
+			if n := seam.fired.Load(); n != 1 {
+				t.Fatalf("seam fired %d time(s), want exactly 1 (the waiter must reach the admission)", n)
+			}
 			if n := f.spawnCount(b); n != 0 {
 				t.Fatalf("B spawned %d time(s) for a %s run, want none", n, terminal)
 			}

@@ -1680,3 +1680,55 @@ func TestHostDispatch_ProductionNoDevSurface_Unchanged(t *testing.T) {
 		t.Errorf("host_dispatch_refused entries = %d, want 0 on a production daemon", n)
 	}
 }
+
+// liveCASTerminalRepo is a postgres run.Repository exposing ONLY the
+// StageLiveRunCASTransitioner capability (not StageCASTransitioner): its
+// TransitionStageFromLiveRun moves the stage's run to a terminal state and
+// then delegates to the real live-run CAS, so the run goes terminal AFTER the
+// handler's run read and BEFORE the bare arm's CAS (#4035).
+type liveCASTerminalRepo struct {
+	run.Repository
+	to run.State
+}
+
+func (r liveCASTerminalRepo) TransitionStageFromLiveRun(ctx context.Context, id uuid.UUID, from, to run.StageState) (*run.Stage, error) {
+	st, err := r.GetStage(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.TransitionRun(ctx, st.RunID, r.to); err != nil {
+		return nil, err
+	}
+	inner, ok := r.Repository.(run.StageLiveRunCASTransitioner)
+	if !ok {
+		return nil, errors.New("wrapped repository lacks StageLiveRunCASTransitioner")
+	}
+	return inner.TransitionStageFromLiveRun(ctx, id, from, to)
+}
+
+// TestHostDispatch_RunTerminalDuringBareCASRefused: on an ungrouped stage (nil
+// concurrency store) a run that goes terminal between the marker's run read
+// and the bare CAS is refused with the pre-read's 409 dispatch_not_admissible
+// naming run_state, and the stage reads back untouched (#4035).
+func TestHostDispatch_RunTerminalDuringBareCASRefused(t *testing.T) {
+	for _, terminal := range []run.State{run.StateCancelled, run.StateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			f := newSCPG(t, nil)
+			f.srv = New(Config{Addr: "127.0.0.1:0", RunRepo: liveCASTerminalRepo{Repository: f.repo, to: terminal}, AuditRepo: f.audit})
+			a := f.impl()
+			w := f.mark(a, hostBody("h1"))
+			if w.Code != http.StatusConflict ||
+				!strings.Contains(w.Body.String(), `"dispatch_not_admissible"`) ||
+				!strings.Contains(w.Body.String(), `"run_state":"`+string(terminal)+`"`) {
+				t.Fatalf("marker = %d %s, want 409 dispatch_not_admissible with run_state %s", w.Code, w.Body.String(), terminal)
+			}
+			got, err := f.repo.GetStage(context.Background(), a.ID)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if got.State != run.StageStateAwaitingHostDispatch || got.DispatchedAt != nil {
+				t.Fatalf("stage = {state:%s dispatched_at:%v}, want awaiting_host_dispatch untouched", got.State, got.DispatchedAt)
+			}
+		})
+	}
+}

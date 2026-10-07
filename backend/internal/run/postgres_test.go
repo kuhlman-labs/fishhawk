@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -3894,4 +3895,112 @@ func TestTransitionStageFromTx(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNotFound", err)
 		}
 	})
+}
+
+// TestTransitionStageFromLiveRunTx pins the live-run CAS (#4035) through both
+// entry points — the transaction-scoped TransitionStageFromLiveRunTx (committed
+// by the caller) and the repo's StageLiveRunCASTransitioner method. A live run
+// admits; a terminal run (succeeded, failed, cancelled) refuses with
+// RunTerminalError and the stage READ BACK is still awaiting_host_dispatch with
+// dispatched_at unset — the CAS that ran first was rolled back. Drift on a
+// terminal run answers StageStateChangedError (the CAS runs first), and an
+// unknown stage is ErrNotFound.
+func TestTransitionStageFromLiveRunTx(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	liveCAS, ok := repo.(run.StageLiveRunCASTransitioner)
+	if !ok {
+		t.Fatalf("NewPostgresRepository returned a %T without StageLiveRunCASTransitioner", repo)
+	}
+
+	entries := map[string]func(id uuid.UUID, from, to run.StageState) (*run.Stage, error){
+		"tx": func(id uuid.UUID, from, to run.StageState) (*run.Stage, error) {
+			var out *run.Stage
+			err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+				var err error
+				out, err = run.TransitionStageFromLiveRunTx(ctx, tx, id, from, to)
+				return err
+			})
+			return out, err
+		},
+		"repo": func(id uuid.UUID, from, to run.StageState) (*run.Stage, error) {
+			return liveCAS.TransitionStageFromLiveRun(ctx, id, from, to)
+		},
+	}
+	// newParked seeds a stage at awaiting_host_dispatch on a run walked to
+	// runState BY CONSTRUCTION (repo.TransitionRun), never via the control.
+	newParked := func(t *testing.T, runState run.State) *run.Stage {
+		t.Helper()
+		r := makeRun(t, repo)
+		s := makeStage(t, repo, r.ID, 1)
+		s, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingHostDispatch, nil)
+		if err != nil {
+			t.Fatalf("park: %v", err)
+		}
+		path := map[run.State][]run.State{
+			run.StatePending:   nil,
+			run.StateSucceeded: {run.StateRunning, run.StateSucceeded},
+			run.StateFailed:    {run.StateFailed},
+			run.StateCancelled: {run.StateCancelled},
+		}[runState]
+		for _, to := range path {
+			if _, err := repo.TransitionRun(ctx, r.ID, to); err != nil {
+				t.Fatalf("run → %s: %v", to, err)
+			}
+		}
+		return s
+	}
+
+	for name, call := range entries {
+		t.Run(name, func(t *testing.T) {
+			t.Run("live run admits", func(t *testing.T) {
+				s := newParked(t, run.StatePending)
+				got, err := call(s.ID, run.StageStateAwaitingHostDispatch, run.StageStateDispatched)
+				if err != nil {
+					t.Fatalf("live-run CAS: %v", err)
+				}
+				if got.State != run.StageStateDispatched {
+					t.Fatalf("returned state = %s, want dispatched", got.State)
+				}
+				if after, _ := repo.GetStage(ctx, s.ID); after.State != run.StageStateDispatched || after.DispatchedAt == nil {
+					t.Fatalf("read-back = %+v, want dispatched with dispatched_at", after)
+				}
+			})
+			for _, terminal := range []run.State{run.StateSucceeded, run.StateFailed, run.StateCancelled} {
+				t.Run("run "+string(terminal)+" refuses", func(t *testing.T) {
+					s := newParked(t, terminal)
+					got, err := call(s.ID, run.StageStateAwaitingHostDispatch, run.StageStateDispatched)
+					var rte run.RunTerminalError
+					if !errors.As(err, &rte) || rte.RunID != s.RunID || rte.State != terminal {
+						t.Fatalf("err = %v (stage %+v), want RunTerminalError{%s %s}", err, got, s.RunID, terminal)
+					}
+					if got != nil {
+						t.Errorf("returned stage = %+v alongside the refusal, want nil", got)
+					}
+					after, err := repo.GetStage(ctx, s.ID)
+					if err != nil {
+						t.Fatalf("read back: %v", err)
+					}
+					if after.State != run.StageStateAwaitingHostDispatch || after.DispatchedAt != nil {
+						t.Fatalf("read-back = {state:%s dispatched_at:%v}, want awaiting_host_dispatch with dispatched_at unset (CAS rolled back)",
+							after.State, after.DispatchedAt)
+					}
+				})
+			}
+			t.Run("drift on a terminal run is StageStateChangedError", func(t *testing.T) {
+				s := newParked(t, run.StateCancelled)
+				_, err := call(s.ID, run.StageStatePending, run.StageStateDispatched)
+				var changed run.StageStateChangedError
+				if !errors.As(err, &changed) || changed.Actual != run.StageStateAwaitingHostDispatch {
+					t.Fatalf("err = %v, want StageStateChangedError(actual awaiting_host_dispatch) before liveness", err)
+				}
+			})
+			t.Run("missing stage is ErrNotFound", func(t *testing.T) {
+				if _, err := call(uuid.New(), run.StageStatePending, run.StageStateDispatched); !errors.Is(err, run.ErrNotFound) {
+					t.Fatalf("err = %v, want ErrNotFound", err)
+				}
+			})
+		})
+	}
 }

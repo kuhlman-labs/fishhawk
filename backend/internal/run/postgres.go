@@ -727,6 +727,58 @@ func TransitionStageFromTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, from, t
 	return transitionStageTx(ctx, tx, id, to, nil, &from, "")
 }
 
+// TransitionStageFromLiveRunTx is TransitionStageFromTx plus a run-liveness
+// check in the SAME transaction (#4035): after the row-locked CAS succeeds it
+// reads the stage's run state and returns RunTerminalError when the run is
+// terminal (succeeded, failed, cancelled), so the caller's transaction rolls
+// the CAS back and the stage is never admitted for a dead run. The CAS runs
+// first, so drift still answers StageStateChangedError before liveness.
+//
+// The run read is a plain SELECT (no FOR SHARE/UPDATE): it adds no lock edge,
+// so the documented order (admission mutex → group lock → stage row → run row)
+// is unchanged. Under READ COMMITTED each statement sees every commit made
+// before it began, so a run that went terminal before this read is never
+// admitted. A cancel committing after the read linearizes as a cancel of an
+// already-dispatched run (the existing cancel path); FOR SHARE would only
+// order that cancel after this transaction, not prevent the dispatch, so it is
+// deliberately not taken. concurrency.PostgresStore.Admit is the grouped
+// consumer; postgresRepo.TransitionStageFromLiveRun is the bare one.
+func TransitionStageFromLiveRunTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, from, to StageState) (*Stage, error) {
+	stage, err := TransitionStageFromTx(ctx, tx, id, from, to)
+	if err != nil {
+		return nil, err
+	}
+	var runState string
+	if err := tx.QueryRow(ctx, `SELECT state FROM runs WHERE id = $1`, stage.RunID).Scan(&runState); err != nil {
+		return nil, fmt.Errorf("read run state: %w", err)
+	}
+	if state := State(runState); state.IsTerminal() {
+		return nil, RunTerminalError{RunID: stage.RunID, State: state}
+	}
+	return stage, nil
+}
+
+// Compile-time assertion that the concrete postgres repo carries the
+// StageLiveRunCASTransitioner capability (#4035), so the host-dispatch
+// marker's bare arm cannot silently degrade to the liveness-blind CAS.
+var _ StageLiveRunCASTransitioner = (*postgresRepo)(nil)
+
+// TransitionStageFromLiveRun runs TransitionStageFromLiveRunTx in its own
+// transaction (StageLiveRunCASTransitioner): a RunTerminalError rolls the CAS
+// back, leaving the stage untouched.
+func (r *postgresRepo) TransitionStageFromLiveRun(ctx context.Context, id uuid.UUID, from, to StageState) (*Stage, error) {
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		var err error
+		result, err = TransitionStageFromLiveRunTx(ctx, tx, id, from, to)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // validateStageCompletion is the completion/FailureCategory pairing rule every
 // stage transition enforces before touching the database.
 func validateStageCompletion(to StageState, completion *StageCompletion) error {
