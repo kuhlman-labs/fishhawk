@@ -1,0 +1,14 @@
+id: scenario:issue-2245/threshold-rule-printed
+statement: The evidence gate command prints the regression rule it applies — the 0.10 catch-rate tolerance and the 136-trials-per-arm minimum — on its output, and the same rule and its derivation are documented in the agenteval README and the compliance run-book.
+verify_hint: 'CLI stdout/stderr: from backend/, run `go run ./internal/agenteval/catchrategate`; its output (pass or fail) names the tolerance 0.10 and the minimum of 136 trials per arm. Then read backend/internal/agenteval/README.md and docs/compliance/planreview-catchrate-evidence.md for the derivation.'
+steps: 'Posture B on the sanctioned checkout at d8064173: from backend/, ran catchrategate with no args (fail path) and with a passing record (pass path). Read backend/internal/agenteval/README.md and docs/compliance/planreview-catchrate-evidence.md.'
+assertions:
+    expected: The output names 0.10 and 136, and both docs document the rule.
+    observed_at_record: On both paths stderr carries the rule line naming the 0.10 tolerance, the 136-trial minimum per arm and the derivation n >= 0.5*(1.645/0.10)^2. The README derives it (135.3, rounded up to 136) and says the floor bounds model-sampling noise only. The run-book has a rule table with the same values.
+    repro_handle: cd backend && go run ./internal/agenteval/catchrategate
+origin:
+    issue: 2245
+    pr: 0
+    run_id: 26616fee-63f5-49dd-8b6a-ce78b74c2c36
+    head_sha: d8064173fc29be31f51e254555d67eb5bc7aa2ae
+    recorded_at: 2026-10-07T16:20:07Z
