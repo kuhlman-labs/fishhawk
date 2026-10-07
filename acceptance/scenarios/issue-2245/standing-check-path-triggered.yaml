@@ -1,0 +1,14 @@
+id: scenario:issue-2245/standing-check-path-triggered
+statement: scripts/check-review-prompt-eval exits 0 with a 'not required' message when no review-prompt path changed since the merge base, and runs the evidence gate (exiting non-zero while no evidence is recorded) when a review-prompt path changed.
+verify_hint: 'CLI exit code/stdout: on the run branch (which changes backend/internal/agenteval/testdata/planreview-catchrate/) run `scripts/check-review-prompt-eval` => non-zero naming the missing evidence record; on a clean checkout of origin/main run it => exit 0 printing that evidence is not required.'
+steps: 'Posture B: (1) scripts/check-review-prompt-eval in the sanctioned checkout with the default base origin/main. (2) The same with --base HEAD. (3) The checkout''s script run inside a scratch clone checked out at origin/main c76dde3a.'
+assertions:
+    expected: Non-zero naming the missing evidence on the run branch; exit 0 'not required' on clean main.
+    observed_at_record: '(1) It listed the changed trigger paths, including testdata/planreview-catchrate/, reported ''absent: no two-arm measurement has been recorded'' and exited 1. (2) and (3) exited 0 with ''recorded two-arm evidence not required''.'
+    repro_handle: scripts/check-review-prompt-eval
+origin:
+    issue: 2245
+    pr: 0
+    run_id: 26616fee-63f5-49dd-8b6a-ce78b74c2c36
+    head_sha: d8064173fc29be31f51e254555d67eb5bc7aa2ae
+    recorded_at: 2026-10-07T16:20:07Z

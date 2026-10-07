@@ -1,0 +1,121 @@
+{
+  "issue_title": "Log a structured warning when a widget import row is skipped",
+  "issue_body": "The CSV importer silently skips malformed rows, so operators cannot tell why an import produced fewer widgets than the file had rows.\n\nWhen a row is skipped, log a structured warning at WARN level with `event=skipped_row`, the 1-based `line` number, and a `reason`. At the end of the import, log the total skipped count.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/105",
+      "id": "example-org/widgets-service#105"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Log a structured WARN for each skipped import row and a final skipped-row total.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/importer/csv.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/importer/csv_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In the row loop of internal/importer/csv.go, on a parse failure log WARN event=skipped_row with line and reason."
+      },
+      {
+        "step": 2,
+        "description": "Count skipped rows and log an INFO summary with skipped=<n> when the import finishes."
+      }
+    ],
+    "verification": {
+      "test_strategy": "csv_test.go captures log output with a test handler: a file with two malformed rows yields two skipped_row warnings carrying lines 3 and 7, and a summary with skipped=2.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-import-warn-fields",
+          "statement": "Importing a CSV whose line 3 is malformed logs one WARN record with event=skipped_row, line=3 and a non-empty reason.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#105"
+        },
+        {
+          "id": "ac-import-summary",
+          "statement": "Importing a CSV with two malformed rows logs a final summary carrying skipped=2.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#105"
+        },
+        {
+          "id": "ac-import-log-or-not",
+          "statement": "The importer either logs a warning for a skipped row or does not log one.",
+          "source": "inferred",
+          "rationale": "Logging behaviour should be specified."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The logger already supports structured attributes."
+    ],
+    "predicted_runtime_minutes": 20,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "vacuous",
+    "tautolog",
+    "always true",
+    "always pass",
+    "trivially true",
+    "trivially satisf",
+    "unfalsifiable",
+    "not falsifiable",
+    "falsifiab",
+    "holds for every implementation",
+    "can never fail"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-import-log-or-not is vacuously true: 'either logs or does not log' holds for every implementation."
+    },
+    {
+      "severity": "medium",
+      "category": "falsifiability",
+      "note": "One criterion is a tautology that can never fail; replace it with one that fails when no warning is logged."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers a file whose header row itself is malformed."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The summary log line could also report the number of widgets created."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "A very large file with many bad rows will produce one WARN per row; consider the log volume."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test asserts the importer logs a warning for a skipped row when the reason is empty."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Logging behaviour should be specified in the importer README, including event=skipped_row."
+    }
+  ]
+}

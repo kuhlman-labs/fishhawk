@@ -1,0 +1,143 @@
+{
+  "issue_title": "Retry webhook deliveries that fail with a 5xx",
+  "issue_body": "Webhook deliveries that receive a 5xx response are currently dropped.\n\nRetry a delivery that receives a 5xx up to 5 times with exponential backoff starting at 1s (1s, 2s, 4s, 8s, 16s). A 4xx response is NOT retried. After the 5th failed retry, mark the delivery `failed` and stop. The retry path should be robust.\n\nEach attempt is recorded in the delivery_attempts table.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/103",
+      "id": "example-org/widgets-service#103"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Retry 5xx webhook deliveries with bounded exponential backoff and record every attempt.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/webhook/deliver.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/webhook/deliver_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/delivery_attempts.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a retry loop to Deliver in internal/webhook/deliver.go: on a 5xx, sleep base*2^attempt (base 1s) and retry, up to 5 retries."
+      },
+      {
+        "step": 2,
+        "description": "Return immediately on a 4xx without retrying."
+      },
+      {
+        "step": 3,
+        "description": "After the 5th failed retry, mark the delivery failed via the store."
+      },
+      {
+        "step": 4,
+        "description": "Record each attempt (status code, attempt number, timestamp) with RecordAttempt in internal/store/delivery_attempts.go."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Table-driven tests in deliver_test.go with an injected clock and an httptest server scripted per attempt: 5xx-then-200 succeeds on the second attempt; six 5xx responses mark failed after 5 retries; a 4xx is not retried; the recorded backoff sequence is 1s,2s,4s,8s,16s.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-retry-5xx",
+          "statement": "A delivery whose endpoint returns 503 once and then 200 succeeds on the second attempt and records two delivery_attempts rows.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#103"
+        },
+        {
+          "id": "ac-retry-no-4xx",
+          "statement": "A delivery whose endpoint returns 400 is attempted exactly once and is not retried.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#103"
+        },
+        {
+          "id": "ac-retry-gives-up",
+          "statement": "A delivery whose endpoint always returns 500 is marked failed after exactly 5 retries (6 attempts).",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#103"
+        },
+        {
+          "id": "ac-retry-robust",
+          "statement": "Webhook retry handling is robust and handles edge cases gracefully.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#103"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The injected clock lets the backoff assertions run without real sleeps."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "untestable",
+    "not testable",
+    "unverifiable",
+    "not verifiable",
+    "not concretely verifiable",
+    "cannot be verified",
+    "no pass/fail",
+    "unmeasurable",
+    "not measurable",
+    "subjective"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-retry-robust is not concretely verifiable: 'robust' and 'handles edge cases gracefully' name no pass/fail condition."
+    },
+    {
+      "severity": "medium",
+      "category": "testability",
+      "note": "One criterion is a subjective adjective an executor cannot decide; replace it with a named, observable outcome."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test asserts the delivery_attempts row carries the status code of each attempt."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Retries hold a worker for up to 31s; the plan does not say whether deliveries run concurrently."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The failed-state transition may need an index on delivery status for the dashboard query."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Test the edge case where cancellation interrupts backoff."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Make the retry path robust to a process restart between attempts by persisting the attempt count."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "Add a test for the edge case of a 5xx on the 5th retry followed by a 200."
+    }
+  ]
+}

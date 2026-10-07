@@ -2952,3 +2952,165 @@ fails o9, removing the marker check fails m1/m2/m4, moving it after the path
 checks fails m4, and restoring the deny signal fails e3. Both `scripts/is-run-agent` and the harness are in both implement
 stages' `forbidden_paths`, so a run cannot merge a weakened guard. A skill that finds the script missing (a
 checkout that predates it, exit 127) stops instead of proceeding.
+
+## Review-prompt eval check (E55.4 / [#2245](https://github.com/kuhlman-labs/fishhawk/issues/2245))
+
+`scripts/check-review-prompt-eval [--base <ref>] [--always]` is the
+STANDING, path-triggered check that a change to the plan-review prompt
+carries passing recorded two-arm catch-rate evidence: does the E55.3 /
+#2244 review-conventions section dilute the plan reviewer's catch rate on
+the plan-review-miss corpus? When a trigger path changed since the merge
+base with `--base` (default `origin/main`), it requires
+`(cd backend && go run ./internal/agenteval/catchrategate)` to exit 0.
+That command decides from the committed evidence record alone (no model
+call, no network) and fails closed on an absent, malformed, stale,
+under-powered or regressed record; its twelve modes, the pinned baseline
+and the evidence schema are in `backend/internal/agenteval/README.md` §
+"Plan-review catch-rate gate". Recording the evidence is an operator step:
+`docs/compliance/planreview-catchrate-evidence.md`.
+
+**Until an operator records and pins the first baseline, the check fails
+on EVERY change that touches a trigger path**, including the branch that
+introduced it. That is the design: conventions already shipped in #2244
+without evidence.
+
+### Trigger paths and the change set
+
+| Trigger | Matches |
+|---|---|
+| `backend/internal/prompt/` | every path under it (the plan-review prompt itself) |
+| `backend/internal/repodoc/` | every path under it (the conventions render path) |
+| `backend/internal/agenteval/planreviewcatch.go` | that file only (arms, `ClassifyCatch`, tolerance, floor) |
+| `backend/internal/agenteval/planreviewevidence.go` | that file only (record, fingerprint, check) |
+| `backend/internal/agenteval/catchrategate/` | every path under it (the gate command) |
+| `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the corpus) |
+| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`) |
+
+A trigger ending in `/` is a directory at a component boundary
+(`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);
+any other trigger is an exact path (`planreviewcatch_test.go` and
+`planreviewcatch.go.orig` do not match). The change set is
+`git diff --name-only --no-renames -z <merge-base>` (merge base to the WORK
+TREE: committed, staged, unstaged and deleted paths all count; renames are
+split so a move OUT of a trigger path still triggers) plus
+`git ls-files --others --exclude-standard -z` (untracked files).
+NUL-separated, so a path git would C-quote cannot slip past the match. The
+repository is the one containing the current directory
+(`git rev-parse --show-toplevel`), not the script's own.
+
+`--always` runs the gate without consulting the change set (it needs no
+base ref).
+
+### Exit codes: 2 is never a skip
+
+| Exit | Meaning |
+|---|---|
+| 0 | no trigger path changed (printed reason naming the merge base), or the gate passed |
+| 1 | a trigger path changed (or `--always`) and the gate failed: any non-zero exit of `go run`, which reports a program's own exit status as 1 |
+| 2 | the check could NOT decide: a usage error, not inside a git work tree, an unresolvable base ref, no merge base, a failed tracked or untracked enumeration, a failed temp file, no `backend/` module, or `go` absent from PATH when triggered |
+
+Every precondition fails CLOSED. That deliberately differs from the
+patch-coverage gate's fail-open preconditions (§ "Fail-open contract"): a
+check that cannot tell whether the prompt changed must not report that it
+did not. A shallow CI clone with no merge base therefore exits 2, which is
+why the job below sets `fetch-depth: 0`.
+
+### Why it runs OUTSIDE `scripts/test verify`
+
+The evidence can only be produced by the LIVE two-arm measurement, which
+needs a model credential and network. The runner's gate env denies the key
+(`gateEnvDeny` in `runner/cmd/fishhawk-runner/gateenv.go`) and the
+container gate path has no network, so an implement agent cannot refresh a
+stale record; wiring the check into verify would red-line every agent that
+touches a trigger path for a step only an operator can take. Only its
+hermetic harness, `scripts/test-review-prompt-eval`, runs in verify
+(`_verify_gate_harnesses`), proving the control still works.
+
+### Residuals, stated
+
+- **Standing only once the CI job is installed.** `.github/workflows/**` is
+  in the implement stages' `forbidden_paths`, so the job below ships as a
+  block for an operator to install. Until then the check is run by hand.
+- **The trigger list is not the whole prompt dependency graph.**
+  `prompt.Build` imports `backend/internal/plan` (and
+  `backend/internal/securityscan`); a change there that alters the rendered
+  plan-review prompt does not trigger the check. The record's fingerprint
+  covers the rendered arm prompts, so the next triggered run, or
+  `--always`, fails that record as stale.
+- **The matcher's Go source is not fingerprinted.** A `ClassifyCatch` change
+  without a `catchRuleVersion` bump leaves the record fresh;
+  `planreviewcatch.go` is a trigger path, so the gate still runs on it.
+
+### Operator-installed CI job
+
+Add this job under `jobs:` in `.github/workflows/ci.yml`. It runs on every
+pull request and is a fast no-op when no trigger path changed. List
+`review-prompt-eval` in `ci-pass.needs` to make it required, but only AFTER
+the first baseline is recorded: before that it fails every PR touching a
+trigger path by design, so install it un-required (advisory) first if you
+want it visible sooner. The base ref goes through `env:`, not an inline
+`${{ }}` in `run:`, so no expression is interpolated into the shell.
+
+```yaml
+  review-prompt-eval:
+    name: Review-prompt eval (catch-rate evidence)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The check diffs against the merge base with the PR base branch;
+          # a shallow clone has no merge base and the check exits 2.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: '**/go.sum'
+
+      - name: Require recorded two-arm evidence for a review-prompt change
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: scripts/check-review-prompt-eval --base "origin/$BASE_REF"
+```
+
+### Testing
+
+`scripts/test-review-prompt-eval` drives the REAL script against temp git
+fixture repos under a PATH made only of symlinks to the tools the script
+runs (`bash`, `git`, `mktemp`, `rm`) plus, where a case wants one, a stub
+`go` that records its cwd and argv and exits as told. No network, no
+Docker, no model, never the real `go`; `origin/main` is seeded with
+`git update-ref`, not a push into a bare repo, so no detached
+`git maintenance` child outlives a fixture (AGENTS.md Traps, #3503). 37
+assertions: c1 no trigger → 0, gate not run; c2 committed trigger change +
+passing gate → 0, gate run from `backend/` as
+`run ./internal/agenteval/catchrategate`; c3 failing gate → 1 naming the
+run-book; c4 untracked trigger file triggers; c5 unresolvable `--base` → 2;
+c6 trigger change with `go` absent → exactly 2; c7 `--always` with no
+trigger runs the gate; c8 not a git repo → 2; c9 a non-trigger agenteval
+sibling (`injection.go`) → 0; c10 each of the seven triggers, changed
+alone, triggers; c11 four near misses (directory boundary, test file,
+`.orig`, `catchrategate.go`) do not; c12 an unstaged edit, c13 a deletion
+and c14 a move out of a trigger path trigger; c15 a C-quotable path (an
+embedded tab) under a trigger dir triggers; c16 a base with no shared
+history → 2; c17/c18 a failing `git diff` / `git ls-files` → 2; c19 each of
+the two temp files failing → 2; c20 no `backend/` → 2; c21–c24 usage
+(unknown flag, `--base` with no ref, a flag-shaped base → 2; `--help` → 0);
+c25 the `--base=<ref>` form; c26 run from a subdirectory; c27 the verify
+WIRING (the real `_verify_gate_harnesses`, sourced lib-only against a
+fixture ROOT whose only harness is a failing stub of this one, runs it and
+fails).
+
+Counterfactuals (each run by mutating a branch BODY, never deleting a
+referenced declaration): every exit-2 guard replaced with a fall-through to
+"not triggered" or `true` turns its case RED (c5, c6, c8, c16, c17, c18,
+c19 ×2, c20, c21–c23); dropping the trailing-slash boundary reddens c11's
+directory near misses, a prefix file match reddens `.orig`, dropping
+`--no-renames` reddens c14, dropping the untracked listing reddens c4,
+newline enumeration reddens c15, ignoring `--always` reddens c7, swallowing
+the gate's exit reddens c3, and removing `test-review-prompt-eval` from the
+`_verify_gate_harnesses` list reddens c27. The mktemp and flag-shaped-base
+guards stay exit 2 under deletion (a downstream redirect or ref-resolution
+failure also exits 2), so c19 and c23 assert the guard's own message.

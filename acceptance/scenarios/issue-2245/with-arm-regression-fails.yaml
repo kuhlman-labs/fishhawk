@@ -1,0 +1,14 @@
+id: scenario:issue-2245/with-arm-regression-fails
+statement: Given an evidence record whose fingerprint matches the current render but whose with-conventions catch rate is more than the tolerance below the without-conventions rate, the gate command exits non-zero and names the regression; it does not warn and exit zero.
+verify_hint: 'CLI exit code: from backend/, take the fingerprint from `go run ./internal/agenteval/catchrategate --print-fingerprint`, write a record with that fingerprint, 150 trials per arm, without-arm caught 120 and with-arm caught 90, then run `go run ./internal/agenteval/catchrategate --evidence <file>`: exit code 1 and stderr naming a regression.'
+steps: 'Posture B: took the fingerprint from --print-fingerprint. Wrote a complete v1 record with 6 cases x 25 trials (150 per arm): without-arm caught 120, with-arm caught 90, plus a pinned baseline. Ran go run ./internal/agenteval/catchrategate --evidence /tmp/fhacc2245/regress.json.'
+assertions:
+    expected: Exit 1 naming the regression.
+    observed_at_record: 'Exit 1. ''Verdict: REGRESSED''; stderr: ''the with-conventions arm is +0.200 below the without-conventions arm, more than the 0.10 tolerance''. The control record with equal arms exited 0.'
+    repro_handle: cd backend && go run ./internal/agenteval/catchrategate --evidence /tmp/fhacc2245/regress.json
+origin:
+    issue: 2245
+    pr: 0
+    run_id: 26616fee-63f5-49dd-8b6a-ce78b74c2c36
+    head_sha: d8064173fc29be31f51e254555d67eb5bc7aa2ae
+    recorded_at: 2026-10-07T16:20:07Z

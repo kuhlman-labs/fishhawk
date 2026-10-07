@@ -1,0 +1,162 @@
+{
+  "issue_title": "Add POST /widgets/{id}/archive to archive a widget",
+  "issue_body": "Tenants want to hide widgets they no longer use without deleting them.\n\nAdd `POST /widgets/{id}/archive`. It sets `archived_at` on the widget and returns the updated widget. Archiving an already-archived widget returns 409. Archiving another tenant's widget returns 404. Archived widgets are excluded from `GET /widgets`.\n\nDocument the endpoint in api/openapi.yaml.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/102",
+      "id": "example-org/widgets-service#102"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Add POST /widgets/{id}/archive, exclude archived widgets from the list endpoint, and document both.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/migrations/0012_widgets_archived_at.sql",
+          "operation": "create"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0012 adding a nullable archived_at TIMESTAMPTZ column to widgets, with a matching down migration."
+      },
+      {
+        "step": 2,
+        "description": "Add ArchiveWidget(ctx, tenantID, id) to internal/store/widgets.go returning ErrAlreadyArchived or ErrNotFound."
+      },
+      {
+        "step": 3,
+        "description": "Add the POST /widgets/{id}/archive handler mapping ErrAlreadyArchived to 409 and ErrNotFound to 404."
+      },
+      {
+        "step": 4,
+        "description": "Filter archived_at IS NULL in ListWidgetsByTenant."
+      },
+      {
+        "step": 5,
+        "description": "Document the endpoint and its 200/404/409 responses in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests for 200, 404 (other tenant) and 409 (already archived); a store test proving the list query excludes archived rows; the migration is exercised by the store test suite's migrate-up.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-archive-sets-timestamp",
+          "statement": "POST /widgets/{id}/archive on an active widget returns 200 and the returned widget carries a non-null archived_at.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#102"
+        },
+        {
+          "id": "ac-archive-conflict",
+          "statement": "POST /widgets/{id}/archive on an already-archived widget returns HTTP 409.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#102"
+        },
+        {
+          "id": "ac-archive-other-tenant",
+          "statement": "POST /widgets/{id}/archive on a widget owned by another tenant returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#102"
+        },
+        {
+          "id": "ac-archive-hidden-from-list",
+          "statement": "After archiving widget W, GET /widgets no longer includes W.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#102"
+        },
+        {
+          "id": "ac-archive-rate-limit",
+          "statement": "POST /widgets/{id}/archive returns HTTP 429 after 10 requests per minute from one tenant.",
+          "source": "inferred",
+          "rationale": "Write endpoints should be rate limited to protect the database."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The migration is additive and nullable, so existing rows need no backfill."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "not warranted",
+    "unwarranted",
+    "never asks for",
+    "never asked for",
+    "does not ask for",
+    "doesn't ask for",
+    "never mentions",
+    "not requested",
+    "not asked for",
+    "rationale is generic",
+    "generic rationale"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-archive-rate-limit is inferred, but the issue never mentions throttling; its rationale is generic, not warranted by the issue."
+    },
+    {
+      "severity": "medium",
+      "category": "warrant",
+      "note": "The 429-after-10-requests criterion invents a rate limit no step implements and the issue never asked for."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers archiving a widget id that does not exist at all (as opposed to another tenant's)."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "The OpenAPI change should also mark archived_at on the widget schema."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "The down migration drops the column; any archived state is lost on rollback."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers the rate limit resetting after the one-minute window."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the 429 response in api/openapi.yaml alongside 200/404/409."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "A rate limited tenant could retry in a tight loop; add a Retry-After header."
+    }
+  ]
+}

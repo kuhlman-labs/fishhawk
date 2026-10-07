@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-review-prompt-eval (E55.4 / #2245). Drives the
+# REAL script against temp git fixture repos, asserting the exit status, the
+# printed reason and whether the gate command was invoked. No network, no
+# Docker, no model, and never the real `go`: every invocation runs under a
+# PATH made only of symlinks to the few tools the script needs plus, where a
+# case wants one, a stub `go` that records its cwd and argv and exits
+# $STUB_GO_EXIT. `origin/main` is seeded with `git update-ref`, not a push into
+# a bare repo, so no detached `git maintenance` child outlives a fixture
+# (AGENTS.md Traps, #3503). House style follows scripts/test-site-voice:
+# PASS/FAIL counters, non-zero exit on any FAIL. Run by `scripts/test verify`
+# via _verify_gate_harnesses, and standalone.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-review-prompt-eval"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+if [ ! -x "$CHECK" ]; then
+  echo "FAIL: $CHECK missing or not executable"
+  exit 1
+fi
+
+# A git env inherited from a hook or a parent git process would point every
+# fixture command at the WRONG repository.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
+
+tmproot="$(cd "$(mktemp -d)" && pwd -P)"
+trap 'rm -rf "$tmproot"' EXIT
+# Never let a fixture's git discovery walk above the temp root (c8 needs a
+# directory that is genuinely outside every repository).
+export GIT_CEILING_DIRECTORIES="$tmproot"
+
+REAL_GIT="$(command -v git)"
+G=(git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false -c init.defaultBranch=main)
+
+# bin-nogo: exactly the tools the script runs, and NO go.
+# bin-go:   the same plus the recording stub go.
+mk_bin() {
+  mkdir -p "$1"
+  local tool
+  for tool in bash mktemp rm; do
+    ln -s "$(command -v "$tool")" "$1/$tool"
+  done
+}
+NOGO="$tmproot/bin-nogo"
+mk_bin "$NOGO"
+ln -s "$REAL_GIT" "$NOGO/git"
+WITHGO="$tmproot/bin-go"
+mk_bin "$WITHGO"
+ln -s "$REAL_GIT" "$WITHGO/git"
+cat > "$WITHGO/go" <<'EOF'
+#!/usr/bin/env bash
+printf '%s|%s\n' "$PWD" "$*" >> "$STUB_GO_LOG"
+exit "${STUB_GO_EXIT:-0}"
+EOF
+chmod +x "$WITHGO/go"
+# bin-failgit-<sub>: the stub go plus a git that fails one subcommand (any argv
+# word equal to <sub>) and delegates every other call to the real git.
+mk_failgit() {
+  local d="$tmproot/bin-failgit-$1"
+  mk_bin "$d"
+  ln -s "$WITHGO/go" "$d/go"
+  cat > "$d/git" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  [ "\$a" = "$1" ] && { echo "stub git: $1 failed" >&2; exit 128; }
+done
+exec "$REAL_GIT" "\$@"
+EOF
+  chmod +x "$d/git"
+}
+mk_failgit diff
+mk_failgit ls-files
+# bin-failmktemp: the stub go plus a mktemp that fails on its
+# $MKTEMP_FAIL_AT-th call and delegates every other call to the real mktemp.
+# Failing ONE call at a time keeps each of the script's two mktemp guards a
+# separate control: a mktemp that always failed would let the second guard
+# mask a deleted first one.
+REAL_MKTEMP="$(command -v mktemp)"
+FAILMKTEMP="$tmproot/bin-failmktemp"
+mkdir -p "$FAILMKTEMP"
+for tool in bash rm; do ln -s "$(command -v "$tool")" "$FAILMKTEMP/$tool"; done
+ln -s "$REAL_GIT" "$FAILMKTEMP/git"
+ln -s "$WITHGO/go" "$FAILMKTEMP/go"
+cat > "$FAILMKTEMP/mktemp" <<EOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "\$MKTEMP_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "\$MKTEMP_COUNT_FILE"
+[ "\$n" = "\$MKTEMP_FAIL_AT" ] && exit 1
+exec "$REAL_MKTEMP" "\$@"
+EOF
+chmod +x "$FAILMKTEMP/mktemp"
+
+# mk_repo <dir>: a fixture repo with one base commit carrying a backend/ module
+# dir and one file under every trigger path family; origin/main = that commit;
+# HEAD on branch `work`.
+n=0
+mk_repo() {
+  local d="$1"
+  mkdir -p "$d"
+  "${G[@]}" -C "$d" init -q
+  mkdir -p "$d/backend/internal/prompt" "$d/backend/internal/repodoc" \
+    "$d/backend/internal/agenteval/catchrategate" \
+    "$d/backend/internal/agenteval/testdata/planreview-miss-corpus/seed" \
+    "$d/backend/internal/agenteval/testdata/planreview-catchrate"
+  echo base > "$d/README.md"
+  echo base > "$d/backend/go.mod"
+  echo base > "$d/backend/internal/prompt/prompt.go"
+  echo base > "$d/backend/internal/repodoc/repodoc.go"
+  echo base > "$d/backend/internal/agenteval/planreviewcatch.go"
+  echo base > "$d/backend/internal/agenteval/planreviewevidence.go"
+  echo base > "$d/backend/internal/agenteval/injection.go"
+  echo base > "$d/backend/internal/agenteval/catchrategate/main.go"
+  echo base > "$d/backend/internal/agenteval/testdata/planreview-miss-corpus/seed/miss.json"
+  echo base > "$d/backend/internal/agenteval/testdata/planreview-catchrate/representative-conventions.md"
+  "${G[@]}" -C "$d" add -A
+  "${G[@]}" -C "$d" commit -q -m base
+  "${G[@]}" -C "$d" update-ref refs/remotes/origin/main HEAD
+  "${G[@]}" -C "$d" checkout -q -b work
+}
+
+# commit_change <dir> <path>: create or modify <path> and commit it.
+commit_change() {
+  mkdir -p "$(dirname "$1/$2")"
+  echo "change $RANDOM" >> "$1/$2"
+  "${G[@]}" -C "$1" add -A
+  "${G[@]}" -C "$1" commit -q -m "change $2"
+}
+
+new_repo() {
+  n=$((n + 1))
+  repo="$tmproot/repo$n"
+  mk_repo "$repo"
+}
+
+out=""
+status=0
+gocalls=""
+# run_check <cwd> <bin-dir> <go-exit> [args...]
+run_check() {
+  local cwd="$1" bin="$2" goexit="$3"
+  shift 3
+  : > "$tmproot/go.log"
+  out="$(cd "$cwd" && PATH="$bin" STUB_GO_LOG="$tmproot/go.log" STUB_GO_EXIT="$goexit" "$CHECK" "$@" 2>&1)"
+  status=$?
+  gocalls="$(cat "$tmproot/go.log")"
+}
+
+# expect <name> <want-status> <want-out-substring> <want-go: invoked|not>
+expect() {
+  local ok=1
+  [ "$status" -eq "$2" ] || ok=0
+  [[ "$out" == *"$3"* ]] || ok=0
+  case "$4" in
+    invoked) [[ "$gocalls" == *"/backend|run ./internal/agenteval/catchrategate" ]] || ok=0 ;;
+    not) [ -z "$gocalls" ] || ok=0 ;;
+  esac
+  if [ "$ok" -eq 1 ]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status want=$2 go=[$gocalls] out=$out)"
+  fi
+}
+
+# c1 — only a non-trigger path changed: exit 0 with the reason, gate not run.
+new_repo; commit_change "$repo" README.md
+run_check "$repo" "$WITHGO" 0
+expect "c1 no trigger path changed" 0 "no review-prompt path changed since" not
+
+# c2 — a committed trigger change + a passing gate: exit 0, gate run from
+# backend/ with exactly `run ./internal/agenteval/catchrategate`.
+new_repo; commit_change "$repo" backend/internal/prompt/prompt.go
+run_check "$repo" "$WITHGO" 0
+expect "c2 committed trigger change, gate passes" 0 "backend/internal/prompt/prompt.go" invoked
+
+# c3 — the same change + a failing gate: exit 1, naming the run-book.
+run_check "$repo" "$WITHGO" 1
+expect "c3 trigger change, gate fails" 1 "docs/compliance/planreview-catchrate-evidence.md" invoked
+
+# c4 — an UNTRACKED file under a trigger directory triggers.
+new_repo; echo new > "$repo/backend/internal/agenteval/testdata/planreview-catchrate/evidence.json"
+run_check "$repo" "$WITHGO" 0
+expect "c4 untracked trigger file" 0 "planreview-catchrate/evidence.json" invoked
+
+# c5 — an unresolvable --base: exit 2, gate not run (never 'not triggered').
+new_repo; commit_change "$repo" backend/internal/prompt/prompt.go
+run_check "$repo" "$WITHGO" 0 --base no-such-ref
+expect "c5 unresolvable --base" 2 "cannot resolve base ref 'no-such-ref'" not
+
+# c6 — a trigger change with go ABSENT from PATH: exactly 2 naming the remedy.
+run_check "$repo" "$NOGO" 0
+expect "c6 trigger change, go absent" 2 "go is absent from PATH" not
+
+# c7 — --always with no trigger change still runs the gate.
+new_repo; commit_change "$repo" README.md
+run_check "$repo" "$WITHGO" 0 --always
+expect "c7 --always, no trigger" 0 "--always" invoked
+
+# c8 — not inside a git checkout: exit 2.
+mkdir -p "$tmproot/nogit"
+run_check "$tmproot/nogit" "$WITHGO" 0
+expect "c8 not a git repo" 2 "not inside a git work tree" not
+
+# c9 — a NON-trigger sibling inside agenteval: exit 0, gate not run.
+new_repo; commit_change "$repo" backend/internal/agenteval/injection.go
+run_check "$repo" "$WITHGO" 0
+expect "c9 non-trigger agenteval sibling" 0 "no review-prompt path changed since" not
+
+# c10 — every trigger path, changed alone, triggers (pins the list).
+for t in \
+  backend/internal/prompt/new.go \
+  backend/internal/repodoc/repodoc.go \
+  backend/internal/agenteval/planreviewcatch.go \
+  backend/internal/agenteval/planreviewevidence.go \
+  backend/internal/agenteval/catchrategate/main.go \
+  backend/internal/agenteval/testdata/planreview-miss-corpus/seed/miss.json \
+  backend/internal/agenteval/testdata/planreview-catchrate/representative-conventions.md; do
+  new_repo; commit_change "$repo" "$t"
+  run_check "$repo" "$WITHGO" 0
+  expect "c10 trigger $t" 0 "$t" invoked
+done
+
+# c11 — near misses on the matching rule: a directory trigger is a COMPONENT
+# boundary, a file trigger an exact path.
+for t in \
+  backend/internal/prompts/x.go \
+  backend/internal/agenteval/planreviewcatch_test.go \
+  backend/internal/agenteval/planreviewcatch.go.orig \
+  backend/internal/agenteval/catchrategate.go; do
+  new_repo; commit_change "$repo" "$t"
+  run_check "$repo" "$WITHGO" 0
+  expect "c11 near miss $t" 0 "no review-prompt path changed since" not
+done
+
+# c12 — an UNSTAGED edit to a tracked trigger file counts (merge base -> work tree).
+new_repo; echo edit >> "$repo/backend/internal/repodoc/repodoc.go"
+run_check "$repo" "$WITHGO" 0
+expect "c12 unstaged trigger edit" 0 "backend/internal/repodoc/repodoc.go" invoked
+
+# c13 — a DELETED trigger file counts.
+new_repo; "${G[@]}" -C "$repo" rm -q backend/internal/agenteval/planreviewevidence.go
+"${G[@]}" -C "$repo" commit -q -m delete
+run_check "$repo" "$WITHGO" 0
+expect "c13 deleted trigger file" 0 "backend/internal/agenteval/planreviewevidence.go" invoked
+
+# c14 — a MOVE out of a trigger path counts (renames are split).
+new_repo; "${G[@]}" -C "$repo" mv backend/internal/agenteval/planreviewcatch.go backend/internal/agenteval/moved.go
+"${G[@]}" -C "$repo" commit -q -m move
+run_check "$repo" "$WITHGO" 0
+expect "c14 move out of a trigger path" 0 "backend/internal/agenteval/planreviewcatch.go" invoked
+
+# c15 — a path git would C-quote (embedded tab) under a trigger dir still matches.
+new_repo; commit_change "$repo" "backend/internal/prompt/a	b.go"
+run_check "$repo" "$WITHGO" 0
+expect "c15 C-quotable trigger path" 0 "review-prompt path(s) changed" invoked
+
+# c16 — base ref resolves but shares NO history with HEAD: exit 2.
+new_repo; "${G[@]}" -C "$repo" checkout -q --orphan island
+"${G[@]}" -C "$repo" commit -q -m island
+run_check "$repo" "$WITHGO" 0 --base origin/main
+expect "c16 no merge base" 2 "no merge base between HEAD and 'origin/main'" not
+
+# c17 — the tracked-path enumeration fails: exit 2, never 'not triggered'.
+new_repo; commit_change "$repo" README.md
+run_check "$repo" "$tmproot/bin-failgit-diff" 0
+expect "c17 git diff enumeration fails" 2 "enumerating changed paths" not
+
+# c18 — the untracked-path enumeration fails: exit 2.
+run_check "$repo" "$tmproot/bin-failgit-ls-files" 0
+expect "c18 git ls-files enumeration fails" 2 "enumerating untracked paths" not
+
+# c19 — either change-set temp file cannot be created: exit 2. The stub mktemp
+# reads its counter with `cat`, so cat joins that PATH only (the stub's need,
+# not the script's).
+ln -s "$(command -v cat)" "$FAILMKTEMP/cat"
+for at in 1 2; do
+  rm -f "$tmproot/mktemp.count"
+  export MKTEMP_COUNT_FILE="$tmproot/mktemp.count" MKTEMP_FAIL_AT="$at"
+  run_check "$repo" "$FAILMKTEMP" 0
+  unset MKTEMP_COUNT_FILE MKTEMP_FAIL_AT
+  expect "c19 mktemp call $at fails" 2 "could not create a temp file" not
+done
+
+# c20 — a trigger change with no backend/ module dir: exit 2.
+new_repo; "${G[@]}" -C "$repo" rm -q -r backend
+"${G[@]}" -C "$repo" commit -q -m drop-backend
+run_check "$repo" "$WITHGO" 0
+expect "c20 no backend/ module" 2 "no backend/ module" not
+
+# c21-c24 — usage: unknown flag, --base without a value, a flag-shaped base -> 2;
+# --help -> 0.
+new_repo
+run_check "$repo" "$WITHGO" 0 --bogus
+expect "c21 unknown flag" 2 "unknown argument '--bogus'" not
+run_check "$repo" "$WITHGO" 0 --base
+expect "c22 --base without a ref" 2 "--base needs a ref" not
+run_check "$repo" "$WITHGO" 0 --base=-x
+expect "c23 flag-shaped --base" 2 "--base must name a ref" not
+run_check "$repo" "$WITHGO" 0 --help
+expect "c24 --help" 0 "Usage: scripts/check-review-prompt-eval" not
+
+# c25 — --base=<ref> form selects the base: with the base at HEAD itself the
+# trigger change is no longer in the change set.
+new_repo; commit_change "$repo" backend/internal/prompt/prompt.go
+run_check "$repo" "$WITHGO" 0 --base=HEAD
+expect "c25 --base=<ref> form" 0 "no review-prompt path changed since" not
+
+# c26 — run from a SUBDIRECTORY: the repository root is still found.
+new_repo; commit_change "$repo" backend/internal/prompt/prompt.go
+run_check "$repo/backend/internal" "$WITHGO" 0
+expect "c26 run from a subdirectory" 0 "backend/internal/prompt/prompt.go" invoked
+
+# c27 — the verify WIRING: the REAL _verify_gate_harnesses (scripts/test sourced
+# lib-only, ROOT repointed at a fixture whose only harness is a failing stub of
+# this one) runs it and fails. Every other harness is absent and takes the
+# documented skip, so the stub's exit is the sole cause of a non-zero status and
+# dropping this harness from the loop list turns this case RED. Subshell keeps
+# scripts/test's `set -e` and traps contained (the seam test-site-ia c11 uses).
+c27="$tmproot/c27"
+mkdir -p "$c27/scripts"
+printf '#!/bin/sh\n: > "%s"\nexit 1\n' "$c27/ran" > "$c27/scripts/test-review-prompt-eval"
+chmod +x "$c27/scripts/test-review-prompt-eval"
+c27out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  ( set -e; ROOT="$c27"; _verify_gate_harnesses ) >/dev/null 2>&1
+  printf 'STATUS=%s\n' "$?"
+)"
+if [[ "$c27out" != *"STATUS=0"* ]] && [ -e "$c27/ran" ]; then
+  pass "c27 _verify_gate_harnesses runs this harness and propagates its failure"
+else
+  ran=no; [ -e "$c27/ran" ] && ran=yes
+  fail "c27 verify wiring (ran=$ran out=$c27out)"
+fi
+
+echo
+echo "test-review-prompt-eval: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

@@ -1,0 +1,14 @@
+id: scenario:issue-2245/stale-evidence-fails
+statement: An evidence record whose prompt fingerprint does not match the current plan-review render, corpus and conventions fixture is rejected as stale by the gate command, with a message telling the operator to re-run the live arms.
+verify_hint: 'CLI exit code: from backend/, run `go run ./internal/agenteval/catchrategate --evidence <file>` with a record carrying any non-matching prompt_fingerprint => exit 1 and stderr containing ''stale''.'
+steps: 'Posture B: wrote a complete record with prompt_fingerprint sha256:000...0 and ran catchrategate --evidence /tmp/fhacc2245/stale.json.'
+assertions:
+    expected: Exit 1 with 'stale' and an instruction to re-run.
+    observed_at_record: 'Exit 1: ''STALE: recorded prompt fingerprint ... != current sha256:125ec381... re-measure''.'
+    repro_handle: cd backend && go run ./internal/agenteval/catchrategate --evidence /tmp/fhacc2245/stale.json
+origin:
+    issue: 2245
+    pr: 0
+    run_id: 26616fee-63f5-49dd-8b6a-ce78b74c2c36
+    head_sha: d8064173fc29be31f51e254555d67eb5bc7aa2ae
+    recorded_at: 2026-10-07T16:20:07Z

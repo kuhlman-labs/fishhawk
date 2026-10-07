@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000002246",
+  "artifact_id": "00000000-0000-0000-0001-000000002246",
+  "triage_sequence": 101,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is inferred-source with a rationale the issue does not support (bad criterion)",
+  "decided_at": "2026-10-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-archive-rate-limit",
+      "statement": "POST /widgets/{id}/archive returns HTTP 429 after 10 requests per minute from one tenant.",
+      "source": "inferred",
+      "rationale": "Write endpoints should be rate limited to protect the database.",
+      "observed": "30 archive requests in one minute from one tenant all returned 200",
+      "expected": "HTTP 429 from the 11th request onward",
+      "steps_taken": "issued 30 POST /widgets/{id}/archive calls within 60s as one tenant and recorded the status codes",
+      "expectation_basis": "criterion ac-archive-rate-limit",
+      "repro_handle": "for i in $(seq 30); do curl -s -o /dev/null -w '%{http_code}\\n' -X POST $TARGET/widgets/w1/archive; done",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

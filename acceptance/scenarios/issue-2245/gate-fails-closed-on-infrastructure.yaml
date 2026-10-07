@@ -1,0 +1,14 @@
+id: scenario:issue-2245/gate-fails-closed-on-infrastructure
+statement: 'The gate fails closed rather than passing when its inputs are unavailable: the gate command exits non-zero naming the cause for an absent evidence file and for an absent corpus directory, and scripts/check-review-prompt-eval exits 2 (not 0) when its base ref cannot be resolved.'
+verify_hint: 'CLI exit codes: `go run ./internal/agenteval/catchrategate --evidence /nonexistent.json` and `--corpus /nonexistent` from backend/ each exit 1 with the cause on stderr; `scripts/check-review-prompt-eval --base no-such-ref` exits 2.'
+steps: 'Posture B: catchrategate --evidence /nonexistent.json; --corpus /nonexistent; --corpus /nonexistent with a valid record; scripts/check-review-prompt-eval --base no-such-ref.'
+assertions:
+    expected: Exit 1 with the cause for a missing evidence file and a missing corpus; exit 2 for an unresolvable base ref.
+    observed_at_record: The missing evidence exited 1 ('absent'). The missing corpus exited 1 ('corpus unavailable'), even with a valid record. The bad base ref exited 2 ('cannot resolve base ref').
+    repro_handle: cd backend && go run ./internal/agenteval/catchrategate --corpus /nonexistent
+origin:
+    issue: 2245
+    pr: 0
+    run_id: 26616fee-63f5-49dd-8b6a-ce78b74c2c36
+    head_sha: d8064173fc29be31f51e254555d67eb5bc7aa2ae
+    recorded_at: 2026-10-07T16:20:07Z
