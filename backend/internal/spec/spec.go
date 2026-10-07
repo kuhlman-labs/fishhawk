@@ -1099,7 +1099,10 @@ type ArtifactKind string
 
 // Artifact kinds per the schema. plan/pull_request are the v0 set;
 // deployment is the v1 deploy-stage artifact (ADR-038 / #925) — valid
-// only on a deploy stage; acceptance is the v1.2 acceptance-stage
+// only on a deploy stage as a produced artifact, and at v2 also the one
+// non-default INPUT artifact (E35.1 / #1598, ADR-053): an acceptance stage
+// may consume it longhand from an earlier deploy stage (post-deploy
+// acceptance, bound by Validate's validateDeploymentInput); acceptance is the v1.2 acceptance-stage
 // artifact (ADR-049 / #1531) — valid only on an acceptance stage;
 // grooming_report is the v2 propose-stage artifact (ADR-065 §3 / #2235)
 // — valid only on a `plan`-typed stage, which ADR-067 §2 reads as

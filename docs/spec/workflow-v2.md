@@ -534,6 +534,7 @@ General reading: an `acceptance` stage emits a **verdict** with evidence. It add
 
 - **Executor branches:** `agent` or `human`. Not `delegate`.
 - **Produces:** the `acceptance` artifact, valid on this type only — the durable evidence record (`{verdict, per-criterion results, content-hash references to evidence blobs}`).
+- **Inputs:** may consume an earlier deploy stage's `deployment` artifact to validate a deployed environment — see [Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy).
 - **Constraints:** the pre-flight deploy kinds are not valid here.
 - **`egress`:** the egress allowance below. On an acceptance stage it is **enforced** today by the runner's default-deny proxy; the same block is declarable on any other agent stage as a declaration only (see [Permissions](#permissions-network--write--shell)).
 
@@ -558,6 +559,54 @@ The `egress` block (ADR-050; generalized E53.5 / #2228) declares the **target-in
 - On an **acceptance** stage these entries are the **single customer-controlled slot** of the acceptance agent's default-deny egress allow-list, and they are **enforced** today: the runner adds the model API endpoint and the Fishhawk backend itself (neither declarable here), the acceptance invocation is forced through the runner-embedded egress proxy, destinations outside the composed allow-list are refused `403`, hostname resolutions are DNS-pinned against rebinding, and a public hostname resolving into loopback or private space is refused outright.
 - On **any other** agent stage (v2 loosened the acceptance-only binding) an `egress` block — equivalently the `permissions.network` spelling below — is **declaration-only**: surfaced and audited but **not enforced until E51 (#2133)**. Below major 2 the block stays acceptance-stage-only.
 - The first acceptance-stage `target_hosts` entry is also rendered into the acceptance prompt's target-instance section in full URL form — a schemeless `host:port` gains an `http://` prefix. That prefix applies to the **prompt seam only**; the allow-list itself keeps the verbatim `host:port` grammar. A spec with no `egress` block renders an explicit not-declared line.
+
+#### Post-deploy acceptance (acceptance after deploy)
+
+An acceptance stage may validate a **deployed environment** rather than a preview instance (E35.1 / #1598, ADR-053 verify-option A): it declares the earlier deploy stage's `deployment` artifact as an input. Worked example, validated by the backend and CLI test suites: [`examples/workflow-v2-release-acceptance.yaml`](examples/workflow-v2-release-acceptance.yaml).
+
+```yaml
+stages:
+  - id: deploy
+    type: deploy
+    executor:
+      delegate: {target: github_actions, workflow_ref: deploy.yml, git_ref: main}
+    constraints:
+      allowed_environments: [staging]   # staging-only — see rule 3
+    produces:
+      - artifact: deployment
+  - id: verify
+    type: acceptance
+    executor:
+      agent: claude-code
+    inputs:
+      - artifact: deployment             # longhand only; needs: [deploy] is rejected
+        from_stage: deploy
+    egress:
+      target_hosts: [staging.example.com]
+    produces:
+      - artifact: acceptance
+```
+
+`deployment` is the one input artifact that is **consumer-bound**, so it is declarable longhand only — `needs: [<deploy stage>]` stays rejected with the no-default-artifact error. The backend validator applies four binding rules to each `deployment` input, in this order, after the input's `from_stage` has resolved to an earlier stage (an unknown or later referent reports the ordinary `from_stage` error first):
+
+| # | Rule | Reported path | Message |
+|---|---|---|---|
+| 1 | the consuming stage is an `acceptance` stage | `…/inputs/<j>/artifact` | `deployment input is valid only on an acceptance stage, not a "<type>" stage (ADR-053)` |
+| 2 | `from_stage` names a `deploy` stage | `…/inputs/<j>/from_stage` | `deployment input must come from a deploy stage; from_stage "<id>" is a "<type>" stage (ADR-053)` |
+| 3 | that deploy stage's `allowed_environments` does not include `production` (case-insensitive) | `…/inputs/<j>/from_stage` | `acceptance stage "<id>" consumes the deployment of deploy stage "<id>", whose allowed_environments includes "<env>": post-deploy acceptance is staging-only and a production target is rejected (ADR-053 Decision 3). …` |
+| 4 | the acceptance stage declares an egress allowance naming the deployed host | `…/stages/<i>/egress` | `an acceptance stage consuming a deployment artifact must declare egress.target_hosts naming the deployed environment host (ADR-053)` |
+
+- **Rule 3 is ADR-053 Decision 3's production-host rejection, and its limit is stated:** a host string is not classified — nothing can tell from `staging.example.com` or `10.0.4.2:8443` whether it is production — so the deploy stage's **environment declaration is the signal**. Only the literal environment name `production` is recognised (in any letter case); an alias such as `prod`, or a production host listed in `egress.target_hosts` behind a deploy stage that declares only `staging`, is not detected. A deploy stage that declares no `allowed_environments` at all passes rule 3.
+- **Rule 4** accepts either spelling — `egress.target_hosts` or `permissions.network` (normalized into the same field). Because a v2 egress declaration is valid only on an agent-executor stage, a post-deploy acceptance stage runs under an **agent** executor.
+- All four are **backend-only** binding rules (like the other stage-binding rules): `fishhawk validate` checks the schema half — that `deployment` is an input-enum member — and the binding rules surface via `fishhawk_validate` (MCP) and at run creation. Below major 2 none is reachable: the frozen v1 input enum has no `deployment` member, so a v1 document declaring one fails at the schema.
+
+**Sequencing contract.** A stage declared after a `deploy` stage is dispatchable **only once every earlier deploy stage in the run has `succeeded`**. While an earlier deploy is still in flight (`awaiting_deploy_approval`, `dispatched`, `running`, `awaiting_deployment`), or has `failed` or been `cancelled`, the later stage is **held `pending`**:
+
+- the orchestrator does not dispatch it when the run advances — including the advance that follows a deploy approval, which parks the deploy at `awaiting_deployment`;
+- the host-dispatch marker (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`) refuses it with `409 dispatch_not_admissible` and leaves its state unchanged; a stage-list read failure there refuses `500` (fail-closed);
+- a **failed** deploy fails the run, and the acceptance stage never dispatches.
+
+The hold keys on the stage **behind** a deploy, not on the acceptance type, so it also applies to a **second deploy stage**: behind a not-yet-succeeded first deploy, the second stays `pending` — it is not parked at `awaiting_deploy_approval` until the first has succeeded. Post-deploy acceptance is **staging-only** in E35 (ADR-053 Decision fork 3).
 
 ## Permissions (`network` / `write` / `shell`)
 
@@ -833,11 +882,11 @@ inputs:
     required: true         # optional boolean
 
   # an artifact from an earlier stage in the same run
-  - artifact: plan         # plan | pull_request
+  - artifact: plan         # plan | pull_request | deployment
     from_stage: propose
 ```
 
-`source` names the external trigger the run is opened against. `required` marks the trigger as mandatory for the stage. `artifact` + `from_stage` wire an earlier stage's output into this one; the input-artifact enum has exactly two members, `plan` and `pull_request`.
+`source` names the external trigger the run is opened against. `required` marks the trigger as mandatory for the stage. `artifact` + `from_stage` wire an earlier stage's output into this one; the input-artifact enum has three members, `plan`, `pull_request` and `deployment`. `deployment` (E35.1 / #1598) is consumable only by an acceptance stage from an earlier deploy stage — see [Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy).
 
 `github_issue` is the `source` enum's ISSUE-ANCHORED member — `Run.IsIssueAnchored` (`backend/internal/run/run.go`) keys on it (alongside `on_demand` and `scheduled`) — and it is the correct value on EVERY forge, not a GitHub-only literal. A GitLab issue trigger creates the run with `trigger_source: github_issue` (`matchGitLabIssue` in `backend/internal/webhook/dispatcher.go`). There is deliberately NO `gitlab_issue` member: adding one would need a `runs_trigger_source_check` migration and a widening of `IsIssueAnchored`, and it is not required because the existing member is already forge-neutral. Do not infer a `gitlab_issue` member from the widened `grooming-report-v1.schema.json` enum (`github_issue | gitlab_issue | jira_issue`) — that is a DIFFERENT schema for a different surface. See [`docs/deploy/gitlab.md`](../deploy/gitlab.md) § "What is GitHub-only today" for the GitLab issue-input degradation and the supported escape hatch.
 
@@ -855,7 +904,7 @@ Each entry names an **earlier** stage whose default artifact this stage consumes
 | `implement` | `pull_request` |
 | `review`, `deploy`, `acceptance` | **rejected** — no default input artifact; declare the wiring longhand with `inputs:` |
 
-That mapping is the whole of the input-artifact enum: a review stage produces no artifact, and the `deployment` / `acceptance` artifacts are not declarable as inputs.
+A review stage produces no artifact and the `acceptance` artifact is not declarable as an input. A `deploy` referent is rejected even though `deployment` is an input-enum member: that input is **consumer-bound** — valid only on an acceptance stage — so a default derived from the referent alone would be wrong on every other consumer, and it is declarable longhand only (see [Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy)).
 
 **`needs:` and longhand `inputs:` may be combined on the same stage.** Ordering and dedupe:
 
@@ -1461,7 +1510,7 @@ reviewer_personas:
 | `reviewers.human` | integer `>= 0` (default `0`) | absent block → no reviewers configured; `Reviewers` nil; agent count `0`; resolves `gateless` (no `{human: 1}` default) |
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
 | Input `source` | `github_issue` \| `pull_request` | external trigger; `github_issue` is the issue-anchored member (`Run.IsIssueAnchored`) and is correct on every forge — no `gitlab_issue` member exists |
-| Input `artifact` | `plan` \| `pull_request` | what a later stage may consume |
+| Input `artifact` | `plan` \| `pull_request` \| `deployment` | what a later stage may consume; `deployment` acceptance-only, from an earlier deploy stage (v2-only) |
 | Produced `artifact` | `plan` \| `pull_request` \| `deployment` \| `acceptance` \| `grooming_report` \| `upkeep_report` \| `comms_report` | `deployment` deploy-only, `acceptance` acceptance-only, `grooming_report`, `upkeep_report` and `comms_report` plan-only (v2-only) |
 | `produces[].schema` | `standard_v1` \| `grooming_report_v1` \| `upkeep_report_v1` \| `comms_report_v1` | required alongside the `plan`, `grooming_report`, `upkeep_report` and `comms_report` artifacts respectively |
 | `persistence.target` | `originating_issue` \| `fishhawk_audit_log` | closed set |
@@ -1511,6 +1560,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - A `deploy` stage uses `executor.delegate`; no other stage type may.
 - The `deployment` artifact and the three pre-flight constraint kinds are deploy-only; the `acceptance` artifact and the `egress` block are acceptance-only.
 - A post-hoc diff constraint requires the `pull_request` artifact; `diff_coverage` additionally requires stage type `implement`.
+- A `deployment` **input** is valid only on an `acceptance` stage, its `from_stage` must name a `deploy` stage whose `allowed_environments` does not include `production`, and the consuming stage must declare an egress allowance (see [Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy)).
 - `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`, `milestone`) may not be `auto`.
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
@@ -1519,7 +1569,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` — and its `decision_record.index`, when declared — is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), the post-deploy acceptance `deployment`-input bindings (E35.1 / #1598), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 

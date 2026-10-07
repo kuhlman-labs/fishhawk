@@ -69,6 +69,20 @@ import (
 //     an agent reviewer; and every declared entry is selected by some stage.
 //     Rule order and the selection contract: review_conventions.go. v2-only in
 //     practice — no v0/v1 schema declares either key.
+//   - post-deploy acceptance binding (E35.1 / #1598, ADR-053): an input
+//     consuming the `deployment` artifact is valid only on an acceptance
+//     stage; its from_stage must name a deploy stage; that deploy stage's
+//     allowed_environments must not include `production` (case-insensitive;
+//     ADR-053 Decision 3 — staging-only, and the environment declaration is
+//     the signal because a host string is not classified); and the consuming
+//     acceptance stage must declare an egress allowance (egress.target_hosts,
+//     or the normalized permissions.network spelling) naming the deployed
+//     host. The four rules run in that order, right after the input's
+//     from_stage resolves. Version-agnostic in code but unreachable below
+//     major 2: only the workflow-v2 schema admits `deployment` in
+//     $defs/input's artifact enum. Backend-only — the CLI's graph-shape port
+//     does not carry them, so they surface via fishhawk_validate (MCP) and
+//     run creation.
 //   - reviewer_personas (ADR-084 / E55.8 / #3753): each declared persona's
 //     remit.path is a canonical repo-relative path (the review_conventions
 //     rule) and its agent.agent_version a well-formed range; a stage's
@@ -411,6 +425,14 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					Message: fmt.Sprintf(MsgFmtFromStageNotEarlier, in.FromStage, refIdx, i),
 				}
 			}
+			// Post-deploy acceptance binding (E35.1 / #1598, ADR-053). Runs
+			// here, after the referent is known to exist and be earlier, so
+			// wf.Stages[refIdx] is the resolved producer.
+			if in.Artifact == string(ArtifactDeployment) {
+				if err := validateDeploymentInput(name, i, j, &stage, &wf.Stages[refIdx]); err != nil {
+					return err
+				}
+			}
 		}
 
 		// Plan-producing stages must declare schema: standard_v1.
@@ -672,6 +694,82 @@ const PathFmtFromStage = "/workflows/%s/stages/%d/inputs/%d/from_stage"
 
 // PathFmtStageID is the reported path for a duplicate-stage-id rejection (wf, stage index).
 const PathFmtStageID = "/workflows/%s/stages/%d/id"
+
+// The post-deploy acceptance binding rules (E35.1 / #1598, ADR-053). Exported
+// so the tests assert the shipped text rather than a paraphrase. Unlike the
+// stage-reference constants above these are BACKEND-ONLY: the CLI's
+// graph-shape port does not carry the rules, so there is no CLI copy to hold
+// in parity.
+
+// MsgFmtDeploymentInputNotAcceptance rejects a deployment input on a non-acceptance stage (arg: the consuming stage's type).
+const MsgFmtDeploymentInputNotAcceptance = "deployment input is valid only on an acceptance stage, not a %q stage (ADR-053)"
+
+// MsgFmtDeploymentInputNotFromDeploy rejects a deployment input whose from_stage is not a deploy stage (args: the referent id and its type).
+const MsgFmtDeploymentInputNotFromDeploy = "deployment input must come from a deploy stage; from_stage %q is a %q stage (ADR-053)"
+
+// MsgDeploymentInputRequiresEgress rejects a deployment-consuming acceptance stage that declares no egress allowance.
+const MsgDeploymentInputRequiresEgress = "an acceptance stage consuming a deployment artifact must declare egress.target_hosts naming the deployed environment host (ADR-053)"
+
+// MsgFmtDeploymentInputProductionTarget rejects a deployment-consuming acceptance
+// stage whose deploy stage may target production (args: the acceptance stage id,
+// the deploy stage id, and the matching allowed_environments entry as written).
+const MsgFmtDeploymentInputProductionTarget = "acceptance stage %q consumes the deployment of deploy stage %q, whose allowed_environments includes %q: post-deploy acceptance is staging-only and a production target is rejected (ADR-053 Decision 3). Remove production from that deploy stage's allowed_environments, or drop the deployment input. The environment declaration is the signal because a target host string is not classified."
+
+// productionEnvironment is the allowed_environments entry the post-deploy
+// acceptance staging-only rule refuses, compared case-insensitively.
+const productionEnvironment = "production"
+
+// validateDeploymentInput applies the post-deploy acceptance binding to ONE
+// input entry carrying the deployment artifact (E35.1 / #1598, ADR-053). The
+// caller has already resolved from_stage to an EARLIER stage, passed as
+// producer. ORDER IS A CONTRACT, pinned by post_deploy_acceptance_test.go:
+//
+//  1. the consumer must be an acceptance stage — the artifact is only
+//     meaningful to an acceptance agent probing the deployed environment;
+//  2. the producer must be a deploy stage — only a deploy stage emits the
+//     deployment artifact (the ADR-038 produces binding);
+//  3. the producer's allowed_environments must not include `production`
+//     (ADR-053 Decision 3, staging-only). The egress allow-list carries hosts,
+//     and a host string cannot be classified as production or not, so the
+//     deploy stage's environment declaration is the signal. Only the literal
+//     environment name is recognised (case-insensitively); an alias such as
+//     `prod` is not;
+//  4. the consumer must declare an egress allowance. permissions.network has
+//     already been folded into stage.Egress (normalizeStagePermissions), so
+//     either spelling satisfies it. At major >= 2 egress is also bound to the
+//     agent executor, so a post-deploy acceptance stage runs under an agent.
+func validateDeploymentInput(wf string, stageIdx, inputIdx int, stage, producer *Stage) error {
+	inputPath := fmt.Sprintf("/workflows/%s/stages/%d/inputs/%d", wf, stageIdx, inputIdx)
+	if stage.Type != StageTypeAcceptance {
+		return &ValidationError{
+			Path:    inputPath + "/artifact",
+			Message: fmt.Sprintf(MsgFmtDeploymentInputNotAcceptance, stage.Type),
+		}
+	}
+	if producer.Type != StageTypeDeploy {
+		return &ValidationError{
+			Path:    fmt.Sprintf(PathFmtFromStage, wf, stageIdx, inputIdx),
+			Message: fmt.Sprintf(MsgFmtDeploymentInputNotFromDeploy, producer.ID, producer.Type),
+		}
+	}
+	for _, c := range producer.Constraints {
+		for _, env := range c.AllowedEnvironments {
+			if strings.EqualFold(strings.TrimSpace(env), productionEnvironment) {
+				return &ValidationError{
+					Path:    fmt.Sprintf(PathFmtFromStage, wf, stageIdx, inputIdx),
+					Message: fmt.Sprintf(MsgFmtDeploymentInputProductionTarget, stage.ID, producer.ID, env),
+				}
+			}
+		}
+	}
+	if stage.Egress == nil {
+		return &ValidationError{
+			Path:    fmt.Sprintf("/workflows/%s/stages/%d/egress", wf, stageIdx),
+			Message: MsgDeploymentInputRequiresEgress,
+		}
+	}
+	return nil
+}
 
 // MsgAppliesToChangeKindUnsupported is the rejection for a `change_kind`
 // criterion inside a workflow's `applies_to` (E53.3 / #2226). It is
