@@ -558,6 +558,24 @@ func (e StageStateChangedError) Error() string {
 	return fmt.Sprintf("stage %s state changed: expected %s, got %s", e.StageID, e.Expected, e.Actual)
 }
 
+// RunTerminalError is returned by the live-run compare-and-swap
+// (TransitionStageFromLiveRunTx / StageLiveRunCASTransitioner, #4035) when the
+// stage's CAS succeeded but its RUN is terminal (succeeded, failed, cancelled)
+// when read inside the same transaction. The caller's transaction rolls the
+// CAS back, so the stage is left exactly as it was. Callers match it with
+// errors.As; the host-dispatch marker maps it to the same 409
+// dispatch_not_admissible its terminal-run pre-read answers.
+//
+//nolint:revive // "Run" names the RUN (not the stage) as the terminal party, beside StageStateChangedError; run.TerminalError would read as the stage's own state.
+type RunTerminalError struct {
+	RunID uuid.UUID
+	State State
+}
+
+func (e RunTerminalError) Error() string {
+	return fmt.Sprintf("run %s is %s; a terminal run's stage is never admitted", e.RunID, e.State)
+}
+
 // StageAttemptToken renders a stage's per-attempt identity from its
 // dispatched_at column (#3598). It is the ONE renderer of that identity: the
 // prompt envelope that hands the token to the runner, the reap handler's

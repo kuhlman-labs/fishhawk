@@ -231,12 +231,13 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// re-POSTing for, up to its 3h cap — would otherwise be admitted and
 	// spawn a runner for a dead run. Refused before every state arm and any
 	// slot admission, so the refusal commits nothing; the waiter stops on this
-	// non-queued 4xx. Residual: a cancel committing between this read and the
-	// admission CAS is not seen (the run row is not locked here).
+	// non-queued 4xx. This pre-read is the cheap early refusal (and the only
+	// one on the idempotent already-dispatched arm, which does no CAS): the
+	// admitting transaction re-checks liveness (#4035) — Admit's live-run CAS
+	// on the grouped arm, StageLiveRunCASTransitioner on the bare arm — so a
+	// run that goes terminal after this read is refused with the same 409.
 	if runRow.State.IsTerminal() {
-		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
-			"run is "+string(runRow.State)+"; a terminal run's stage is never host-spawned",
-			map[string]any{"run_id": runID.String(), "run_state": string(runRow.State)})
+		s.writeTerminalRunRefusal(w, r, runID, runRow.State)
 		return
 	}
 	if stage.ExecutorKind != run.ExecutorAgent || isAutoMergeReviewStage(stage) {
@@ -329,14 +330,18 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// CAS the observed state → dispatched under the row lock (production
 	// postgresRepo). A concurrent writer that flipped the stage between the load
 	// and this call refuses atomically with StageStateChangedError rather than
-	// being stomped; we re-classify below. In-memory fakes without the
-	// capability fall back to the plain table-validated TransitionStage.
+	// being stomped; we re-classify below. Production prefers the live-run
+	// variant (StageLiveRunCASTransitioner, #4035), which also refuses a run
+	// gone terminal since the pre-read with run.RunTerminalError. In-memory
+	// fakes without either capability fall back to the plain table-validated
+	// TransitionStage.
 	//
 	// Concurrency groups (#3964 / ADR-087): when a slot store is wired and the
 	// stage resolves to a group, the bare CAS is replaced by Store.Admit, which
-	// performs the SAME pinned CAS inside its admission transaction when a slot
-	// is free, or commits a FIFO queue row and leaves the stage untouched when
-	// it is not (409 concurrency_slot_queued). Its drift refusal is the same
+	// performs the SAME pinned CAS (with the same #4035 run-liveness read)
+	// inside its admission transaction when a slot is free, or commits a FIFO
+	// queue row and leaves the stage untouched when it is not (409
+	// concurrency_slot_queued). Its drift refusal is the same
 	// StageStateChangedError, reclassified below exactly as the bare CAS's.
 	from := stage.State
 	var updated *run.Stage
@@ -345,6 +350,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	if s.cfg.Concurrency != nil {
 		group, limit, grouped = s.resolveStageConcurrency(r.Context(), runRow, stage, host)
 	}
+	liveCAS, isLiveCAS := s.cfg.RunRepo.(run.StageLiveRunCASTransitioner)
 	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
 	case grouped:
 		var queued bool
@@ -352,12 +358,25 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		if queued {
 			return
 		}
+	case isLiveCAS:
+		// Production postgresRepo: the CAS plus an in-transaction run-liveness
+		// read (#4035), so a run that went terminal after the pre-read above
+		// refuses with run.RunTerminalError instead of being admitted.
+		updated, err = liveCAS.TransitionStageFromLiveRun(r.Context(), stageID, from, run.StageStateDispatched)
 	case isCAS:
 		updated, err = cas.TransitionStageFrom(r.Context(), stageID, from, run.StageStateDispatched, nil)
 	default:
 		updated, err = s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStateDispatched, nil)
 	}
 	if err != nil {
+		// The run went terminal between the pre-read and the admitting
+		// transaction (#4035): the CAS rolled back, so answer the pre-read's
+		// exact refusal and the slot waiter stops without spawning.
+		var rte run.RunTerminalError
+		if errors.As(err, &rte) {
+			s.writeTerminalRunRefusal(w, r, runID, rte.State)
+			return
+		}
 		// A concurrent writer changed the state under us. Re-load and honour the
 		// same idempotency contract: if the winner already marked the spawn
 		// (dispatched), return the benign no-op; otherwise the stage moved to a
@@ -500,6 +519,15 @@ func (s *Server) emitHostDispatchAcceptanceAnchor(ctx context.Context, runID uui
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// writeTerminalRunRefusal answers the terminal-run 409. The handler's pre-read
+// guard and the admitting transaction's run.RunTerminalError (#4035) both call
+// it, so the two refusals are byte-identical on the wire.
+func (s *Server) writeTerminalRunRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, state run.State) {
+	s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+		"run is "+string(state)+"; a terminal run's stage is never host-spawned",
+		map[string]any{"run_id": runID.String(), "run_state": string(state)})
 }
 
 // isAutoMergeReviewStage mirrors orchestrator.isAutoMergeStage (unexported in

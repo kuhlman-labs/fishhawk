@@ -15,7 +15,8 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
   `ErrInvalidRequest` for the first two, and `run.ErrNotFound` for a stage/run
   mismatch.
   - **Admitted**: the stage was CAS'd `From → dispatched`
-    (`run.TransitionStageFromTx`, which runs inside the admission transaction),
+    (`run.TransitionStageFromLiveRunTx`, which runs inside the admission
+    transaction),
     and its row is `held` with `held_dispatched_at` = the `dispatched_at` the
     CAS stamped and `admission_nonce` = the request's `AdmissionNonce` (NULL
     when empty). `QueuedBefore` and `WaitedSeconds` are set when the stage
@@ -27,6 +28,12 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
     was busy, so this call queued without deciding.
   - **Drift**: if the row-locked stage state is not `From`, the call returns
     `run.StageStateChangedError` and writes nothing.
+  - **Terminal run** (#4035): on the admit path, if the stage's run is
+    `succeeded`, `failed` or `cancelled` when read after the CAS, the call
+    returns `run.RunTerminalError` and rolls back like any other error (stage
+    untouched, no slot-row change). The host-dispatch marker maps it to the
+    same 409 `dispatch_not_admissible` as its terminal-run pre-read. Pinned by
+    `TestAdmit_RunTerminalAtCASNeverAdmits`.
   - **Failure contract**: ANY error rolls back the whole transaction. The
     stage keeps its state, and its row keeps exactly the queue standing it had
     before the call: no row if it never queued, and an unchanged
@@ -87,9 +94,15 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    Residual: the round start is read a few microseconds before the try-lock.
    A lock-HIT admitter that commits a queued row inside that gap is also
    excluded, so the winner may go ahead of it once. Someone is still admitted.
-8. Admit: `run.TransitionStageFromTx(... From → dispatched)` (the 0072 trigger
-   stamps `dispatched_at`), then mark the row `held`, recording the request's
-   admission nonce.
+8. Admit: `run.TransitionStageFromLiveRunTx(... From → dispatched)` (the 0072
+   trigger stamps `dispatched_at`), then mark the row `held`, recording the
+   request's admission nonce. The live-run CAS then reads the run's state in
+   the same transaction (#4035). That read sits AFTER the holders read on
+   purpose: B is admitted only once that read sees the previous holder
+   settled, so under READ COMMITTED a cancel or failure that committed before
+   the slot was seen free is visible to the later run read, and the admission
+   is refused with `run.RunTerminalError`. A cancel committing after the run
+   read is a cancel of an already-dispatched run (the existing cancel path).
 
 Every time comparison uses the database clock. No Go `time.Now()` value is
 passed into SQL.
@@ -167,7 +180,9 @@ A queued row counts as "ahead" only while all of these hold: it is fresh
   concurrent marker calls need at most N connections only while each one is
   inside `Admit`, and none of them waits on a connection held by another.
 - **Full lock order:** admission mutex (process-local) → group advisory lock →
-  stage row (`FOR UPDATE`) → run row. `Admit` itself never locks a run row.
+  stage row (`FOR UPDATE`) → run row. `Admit` itself never locks a run row: it
+  READS the run's state with a plain `SELECT` on the admit path (#4035), which
+  adds no lock edge.
   The existing stage-then-run paths (`transitionStage`,
   `ResumeAwaitingInputAndAppend`) start below the group lock, and no other
   path takes the group lock, so no cycle is introduced.

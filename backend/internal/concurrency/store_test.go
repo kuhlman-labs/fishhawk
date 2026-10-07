@@ -682,6 +682,47 @@ func TestAdmit_StageDriftRefused(t *testing.T) {
 	}
 }
 
+// TestAdmit_RunTerminalAtCASNeverAdmits pins the in-transaction run-liveness
+// check (#4035): the group is EMPTY, so the decision is admit, and the
+// afterDecision hook commits the run's terminal transition on another pooled
+// connection AFTER the decision and BEFORE the CAS. Admit holds only the
+// advisory lock and the stage row, so the run-row lock TransitionRun takes
+// never blocks. Admit must refuse with run.RunTerminalError and roll the whole
+// admission back: the stage stays parked and no slot row survives. A later
+// live-run admission in the same group is then admitted (nothing leaked).
+func TestAdmit_RunTerminalAtCASNeverAdmits(t *testing.T) {
+	for _, terminal := range []run.State{run.StateCancelled, run.StateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			f := newFixture(t)
+			a, c := f.stage(), f.stage()
+			var hookErr error
+			f.store.afterDecision = func(ctx context.Context, admit bool) {
+				if !admit {
+					hookErr = errors.New("afterDecision saw a queue decision on an empty group")
+					return
+				}
+				_, hookErr = f.repo.TransitionRun(ctx, a.RunID, terminal)
+			}
+			_, err := f.store.Admit(context.Background(), req(a, 1))
+			f.store.afterDecision = nil
+			if hookErr != nil {
+				t.Fatalf("afterDecision: %v", hookErr)
+			}
+			var rte run.RunTerminalError
+			if !errors.As(err, &rte) || rte.RunID != a.RunID || rte.State != terminal {
+				t.Fatalf("Admit err = %v, want run.RunTerminalError{%s %s}", err, a.RunID, terminal)
+			}
+			if got := f.stageState(a.ID); got != run.StageStateAwaitingHostDispatch {
+				t.Fatalf("stage = %s after the terminal-run refusal, want awaiting_host_dispatch", got)
+			}
+			if row, ok := f.slot(a.ID); ok {
+				t.Fatalf("slot row %+v survived the terminal-run refusal, want none (rolled back)", row)
+			}
+			f.mustAdmit(c)
+		})
+	}
+}
+
 func TestAdmit_InvalidRequestRefused(t *testing.T) {
 	f := newFixture(t)
 	a := f.stage()

@@ -804,6 +804,55 @@ func TestHostDispatch_DriftDuringAdmissionReclassified(t *testing.T) {
 	}
 }
 
+// terminalStore moves the stage's RUN to a terminal state under the marker
+// (after the handler's run read, before the admission's CAS) and then
+// delegates to the real store, so only the admission's in-transaction
+// liveness read can refuse (#4035).
+type terminalStore struct {
+	concurrency.Store
+	repo run.Repository
+	to   run.State
+}
+
+func (d terminalStore) Admit(ctx context.Context, req concurrency.Request) (concurrency.Admission, error) {
+	if _, err := d.repo.TransitionRun(ctx, req.RunID, d.to); err != nil {
+		return concurrency.Admission{}, err
+	}
+	return d.Store.Admit(ctx, req)
+}
+
+// TestHostDispatch_RunTerminalDuringAdmissionRefused: a run that goes terminal
+// between the marker's run read and the grouped admission is refused with the
+// pre-read's exact 409 dispatch_not_admissible (naming run_state), the stage
+// stays parked, no slot row survives and no admitted audit row is written.
+func TestHostDispatch_RunTerminalDuringAdmissionRefused(t *testing.T) {
+	for _, terminal := range []run.State{run.StateCancelled, run.StateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			f := newSCPG(t, func(pool *pgxpool.Pool) concurrency.Store {
+				return terminalStore{Store: concurrency.NewPostgresStore(pool), repo: run.NewPostgresRepository(pool), to: terminal}
+			})
+			a := f.impl()
+			w := f.mark(a, hostBody("h1"))
+			if w.Code != http.StatusConflict ||
+				!strings.Contains(w.Body.String(), `"dispatch_not_admissible"`) ||
+				!strings.Contains(w.Body.String(), `"run_state":"`+string(terminal)+`"`) {
+				t.Fatalf("marker = %d %s, want 409 dispatch_not_admissible with run_state %s", w.Code, w.Body.String(), terminal)
+			}
+			if got := f.state(a.ID); got != run.StageStateAwaitingHostDispatch {
+				t.Fatalf("stage reads %s after the terminal-run refusal, want awaiting_host_dispatch", got)
+			}
+			if row, ok := f.slot(a.ID); ok {
+				t.Fatalf("slot row %+v survived the terminal-run refusal, want none", row)
+			}
+			for _, r := range f.auditRows(a.RunID) {
+				if r.category == CategoryStageConcurrencyAdmitted {
+					t.Fatalf("admitted audit row %+v written for a refused admission", r.payload)
+				}
+			}
+		})
+	}
+}
+
 // errStore fails every call.
 type errStore struct{}
 

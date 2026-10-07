@@ -24,7 +24,8 @@ import (
 // (orchestrator.LockStageAdmission — a process-local sync.Mutex that holds NO
 // pooled connection or transaction) → the group advisory lock → the stage row
 // (FOR UPDATE) → the run row (only on paths that already take stage-then-run,
-// such as ResumeAwaitingInputAndAppend; Admit itself never locks a run row).
+// such as ResumeAwaitingInputAndAppend; Admit itself never locks a run row —
+// on the admit path it READS the run's state with a plain SELECT, #4035).
 //
 // Tenancy: Admit and StatusForStages run on the raw pool with NO tenant GUC
 // set, under the runtime role (a superuser today, which bypasses RLS). They
@@ -208,8 +209,12 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 		return queued, nil
 	}
 
-	// (7) Admit: CAS in THIS transaction, then the held mark.
-	stage, err := run.TransitionStageFromTx(ctx, tx, req.StageID, req.From, run.StageStateDispatched)
+	// (7) Admit: CAS in THIS transaction, then the held mark. The live-run CAS
+	// re-reads the run's state after the CAS (#4035): it sits AFTER the holders
+	// read, so a run that went terminal before the slot was seen free is
+	// visible here (READ COMMITTED) and refused with run.RunTerminalError,
+	// which rolls this whole admission back.
+	stage, err := run.TransitionStageFromLiveRunTx(ctx, tx, req.StageID, req.From, run.StageStateDispatched)
 	if err != nil {
 		return Admission{}, err
 	}

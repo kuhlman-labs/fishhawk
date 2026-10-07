@@ -2,6 +2,7 @@ package run
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -424,6 +425,25 @@ func TestStageAttemptChangedError_FormatsAndIsErrorsTarget(t *testing.T) {
 	}
 	want := `stage ` + id.String() + ` attempt changed: expected "tok-a", got "tok-b"`
 	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// TestRunTerminalError_FormatsAndIsErrorsTarget pins the live-run CAS refusal
+// (#4035): errors.As extracts it through a wrap, and Error() names the run id
+// and its terminal state.
+func TestRunTerminalError_FormatsAndIsErrorsTarget(t *testing.T) {
+	id := uuid.New()
+	err := fmt.Errorf("admit: %w", RunTerminalError{RunID: id, State: StateCancelled})
+	var target RunTerminalError
+	if !errors.As(err, &target) {
+		t.Fatal("expected errors.As to extract RunTerminalError")
+	}
+	if target.RunID != id || target.State != StateCancelled {
+		t.Errorf("target = {run:%s state:%q}, want {%s cancelled}", target.RunID, target.State, id)
+	}
+	want := "run " + id.String() + " is cancelled; a terminal run's stage is never admitted"
+	if got := target.Error(); got != want {
 		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }

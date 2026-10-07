@@ -380,6 +380,19 @@ type StageAttemptCASTransitioner interface {
 	TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion) (*Stage, error)
 }
 
+// StageLiveRunCASTransitioner is an OPTIONAL capability on the concrete
+// postgres repo (#4035): TransitionStageFrom (no completion) plus, in the SAME
+// transaction, a read of the stage's run that refuses with RunTerminalError —
+// rolling the CAS back — when the run is terminal. The host-dispatch marker's
+// bare (ungrouped) arm prefers it so a run cancelled or failed after the
+// handler's own run read is still never admitted.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner
+// is: in-memory fakes keep compiling and keep their current behaviour.
+type StageLiveRunCASTransitioner interface {
+	TransitionStageFromLiveRun(ctx context.Context, id uuid.UUID, from, to StageState) (*Stage, error)
+}
+
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / E44.5) that
 // returns just a run's account_id ("" for an untenanted NULL row, the account
 // UUID string otherwise) without materializing the whole run.
