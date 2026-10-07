@@ -31,6 +31,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/alerttrigger"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -2502,18 +2503,22 @@ func TestWebhookStoreNeeded(t *testing.T) {
 		name         string
 		githubSecret string
 		gitlabSecret string
+		alert        bool
 		want         bool
 	}{
-		{"neither", "", "", false},
-		{"github-only", "gh", "", true},
-		{"gitlab-only", "", "gl", true},
-		{"both", "gh", "gl", true},
+		{"neither", "", "", false, false},
+		{"github-only", "gh", "", false, true},
+		{"gitlab-only", "", "gl", false, true},
+		{"both", "gh", "gl", false, true},
+		// E35.4 / #1601 approval condition 1: alert sources alone need the
+		// store (the alert ingress's replay nonce lives there).
+		{"alert-sources-only", "", "", true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := webhookStoreNeeded(tc.githubSecret, tc.gitlabSecret); got != tc.want {
-				t.Errorf("webhookStoreNeeded(%q,%q) = %v, want %v",
-					tc.githubSecret, tc.gitlabSecret, got, tc.want)
+			if got := webhookStoreNeeded(tc.githubSecret, tc.gitlabSecret, tc.alert); got != tc.want {
+				t.Errorf("webhookStoreNeeded(%q,%q,%v) = %v, want %v",
+					tc.githubSecret, tc.gitlabSecret, tc.alert, got, tc.want)
 			}
 		})
 	}
@@ -2537,18 +2542,27 @@ func TestNewWebhookDeliveryStore(t *testing.T) {
 		pool         *pgxpool.Pool
 		githubSecret string
 		gitlabSecret string
+		alert        bool
 		wantStore    bool
 		wantEvictor  bool
 	}{
-		{"neither-secret-no-store", nil, "", "", false, false},
-		{"github-only-memory", nil, "gh", "", true, false},
-		{"gitlab-only-memory", nil, "", "gl", true, false},
-		{"gitlab-only-postgres", pool, "", "gl", true, true},
-		{"both-postgres", pool, "gh", "gl", true, true},
+		{"neither-secret-no-store", nil, "", "", false, false, false},
+		{"neither-secret-no-store-with-pool", pool, "", "", false, false, false},
+		{"github-only-memory", nil, "gh", "", false, true, false},
+		{"gitlab-only-memory", nil, "", "gl", false, true, false},
+		{"gitlab-only-postgres", pool, "", "gl", false, true, true},
+		{"both-postgres", pool, "gh", "gl", false, true, true},
+		// E35.4 / #1601 approval condition 1: a sources-file-only deployment
+		// (no GitHub/GitLab webhook secret) still gets the delivery store, on
+		// the same Postgres-vs-memory selection and evictor wiring, so a
+		// configured alert ingress never answers a permanent 503 for want of
+		// its replay nonce.
+		{"alert-sources-only-memory", nil, "", "", true, true, false},
+		{"alert-sources-only-postgres", pool, "", "", true, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store, evictor := newWebhookDeliveryStore(tc.pool, tc.githubSecret, tc.gitlabSecret, retention)
+			store, evictor := newWebhookDeliveryStore(tc.pool, tc.githubSecret, tc.gitlabSecret, tc.alert, retention)
 			if (store != nil) != tc.wantStore {
 				t.Errorf("store != nil = %v, want %v", store != nil, tc.wantStore)
 			}
@@ -2565,6 +2579,222 @@ func TestNewWebhookDeliveryStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Alert trigger ingress: serve wiring (E35.4 / #1601, ADR-053) -----------
+
+// alertSecret is a 32-byte (MinSecretBytes) HMAC secret for the fixtures.
+const alertSecret = "0123456789abcdef0123456789abcdef"
+
+func writeAlertSources(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "alert-sources.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func alertGetenv(vars map[string]string) func(string) string {
+	return func(k string) string { return vars[k] }
+}
+
+const twoAlertSources = `version: 1
+sources:
+  - id: grafana-prod
+    secret_env: GRAFANA_SECRET
+    repo: acme/shop
+    auto_start: true
+  - id: pagerduty
+    secret_env: PD_SECRET
+    repo: acme/shop
+  - id: sentry
+    secret_env: SENTRY_SECRET
+    repo: acme/api
+    auto_start: true
+`
+
+func twoAlertSourcesEnv() func(string) string {
+	return alertGetenv(map[string]string{
+		"GRAFANA_SECRET": alertSecret, "PD_SECRET": alertSecret, "SENTRY_SECRET": alertSecret,
+	})
+}
+
+// TestResolveAlertTriggerConfig pins the startup contract: an empty path is
+// the ingress OFF (zero sources) with the default 5m window; a valid file
+// loads every source; and every malformed input FAILS rather than booting a
+// half-configured ingress — one row per refusal.
+func TestResolveAlertTriggerConfig(t *testing.T) {
+	t.Run("empty path is ingress off with the default window", func(t *testing.T) {
+		ac, err := resolveAlertTriggerConfig("", alerttrigger.DefaultReplayWindow.String(), alertGetenv(nil))
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if ac.Sources.Len() != 0 {
+			t.Errorf("Sources.Len() = %d, want 0 (ingress off)", ac.Sources.Len())
+		}
+		if ac.Window != 5*time.Minute {
+			t.Errorf("Window = %s, want 5m", ac.Window)
+		}
+	})
+
+	t.Run("valid file loads every source", func(t *testing.T) {
+		ac, err := resolveAlertTriggerConfig(writeAlertSources(t, twoAlertSources), "15m", twoAlertSourcesEnv())
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got := strings.Join(ac.Sources.IDs(), ","); got != "grafana-prod,pagerduty,sentry" {
+			t.Errorf("IDs = %q", got)
+		}
+		if ac.Window != 15*time.Minute {
+			t.Errorf("Window = %s, want 15m (the inclusive upper bound)", ac.Window)
+		}
+	})
+
+	// Each refusal is isolated: the window rows use NO sources file, so only
+	// the window check can refuse them, and the file rows use a valid window.
+	for _, tc := range []struct {
+		name, file, window string
+		env                map[string]string
+		wantSubstr         string
+	}{
+		{"window zero", "", "0s", nil, "out of range"},
+		{"window negative", "", "-1m", nil, "out of range"},
+		{"window 16m", "", "16m", nil, "out of range"},
+		{"window unparseable", "", "five minutes", nil, "not a duration"},
+		{"missing file", "/nonexistent/alert-sources.yaml", "5m", nil, "FISHHAWKD_ALERT_SOURCES_FILE"},
+		{"malformed yaml", "version: 1\nsources: [", "5m", nil, "FISHHAWKD_ALERT_SOURCES_FILE"},
+		{"unknown key", "version: 1\nsources:\n  - id: a\n    secret_env: S\n    repo: o/n\n    bogus: 1\n", "5m",
+			map[string]string{"S": alertSecret}, "bogus"},
+		{"unset secret env", "version: 1\nsources:\n  - id: a\n    secret_env: S\n    repo: o/n\n", "5m", nil, "FISHHAWKD_ALERT_SOURCES_FILE"},
+		{"short secret", "version: 1\nsources:\n  - id: a\n    secret_env: S\n    repo: o/n\n", "5m",
+			map[string]string{"S": alertSecret[:31]}, "FISHHAWKD_ALERT_SOURCES_FILE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.file
+			if path != "" && !strings.HasPrefix(path, "/nonexistent") {
+				path = writeAlertSources(t, tc.file)
+			}
+			ac, err := resolveAlertTriggerConfig(path, tc.window, alertGetenv(tc.env))
+			if err == nil {
+				t.Fatalf("resolveAlertTriggerConfig = %+v, nil; want a startup failure", ac)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q does not contain %q", err, tc.wantSubstr)
+			}
+			if strings.Contains(err.Error(), alertSecret[:31]) {
+				t.Errorf("error %q echoes the secret", err)
+			}
+		})
+	}
+}
+
+// TestServe_MalformedAlertSourcesFileFailsBoot drives runServe ITSELF: a
+// malformed FISHHAWKD_ALERT_SOURCES_FILE fails startup naming the variable,
+// and an out-of-range window does too — before anything dials a database.
+//
+// Both invocations also carry bootstrapAbortFlag, so with the alert guard
+// deleted startup still aborts at the LATER --review-resolution check instead
+// of booting a real listener; the log assertion is then what goes RED (the
+// abort reason names review-resolution, not the alert configuration).
+func TestServe_MalformedAlertSourcesFileFailsBoot(t *testing.T) {
+	code, log := serveWithProfile(t, "-alert-sources-file", writeAlertSources(t, "version: 2\n"), bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "invalid alert trigger configuration") || !strings.Contains(log, "FISHHAWKD_ALERT_SOURCES_FILE") {
+		t.Errorf("log does not name the alert sources failure:\n%s", log)
+	}
+
+	code, log = serveWithProfile(t, "-alert-replay-window", "20m", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("window exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "invalid alert trigger configuration") || !strings.Contains(log, "FISHHAWKD_ALERT_REPLAY_WINDOW") {
+		t.Errorf("log does not name the replay window failure:\n%s", log)
+	}
+}
+
+// TestWireAlertTrigger pins the cfg assignments and the startup log lines:
+// the INFO names every configured source, the auto_start WARN names EXACTLY
+// the sources with auto_start true, and each missing dependency gets its own
+// WARN; with no sources nothing is wired or logged.
+//
+// Counterfactual: drop the `cfg.GitHub != nil` guard and the no-GitHub row's
+// AlertSpecSource becomes a non-nil interface wrapping a nil client — RED.
+func TestWireAlertTrigger(t *testing.T) {
+	pool := &pgxpool.Pool{}
+	gh := &githubclient.Client{}
+	loaded, err := resolveAlertTriggerConfig(writeAlertSources(t, twoAlertSources), "5m", twoAlertSourcesEnv())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("no sources wires and logs nothing", func(t *testing.T) {
+		var buf bytes.Buffer
+		cfg := server.Config{GitHub: gh}
+		wireAlertTrigger(&cfg, alertTriggerConfig{Window: 7 * time.Minute}, pool, slog.New(slog.NewTextHandler(&buf, nil)))
+		if cfg.AlertIncidents != nil || cfg.AlertSpecSource != nil || cfg.AlertSources.Len() != 0 {
+			t.Errorf("ingress-off wiring assigned alert fields: %+v %+v", cfg.AlertIncidents, cfg.AlertSpecSource)
+		}
+		if cfg.AlertReplayWindow != 7*time.Minute {
+			t.Errorf("AlertReplayWindow = %s, want 7m", cfg.AlertReplayWindow)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("ingress-off wiring logged:\n%s", buf.String())
+		}
+	})
+
+	t.Run("fully wired", func(t *testing.T) {
+		var buf bytes.Buffer
+		cfg := server.Config{GitHub: gh, WebhookDeliveries: webhook.NewMemoryStore(time.Hour)}
+		wireAlertTrigger(&cfg, loaded, pool, slog.New(slog.NewTextHandler(&buf, nil)))
+		if cfg.AlertSources.Len() != 3 || cfg.AlertIncidents == nil || cfg.AlertSpecSource == nil {
+			t.Fatalf("wired cfg = sources %d, incidents %v, spec source %v", cfg.AlertSources.Len(), cfg.AlertIncidents, cfg.AlertSpecSource)
+		}
+		log := buf.String()
+		if !strings.Contains(log, `sources=grafana-prod,pagerduty,sentry`) {
+			t.Errorf("INFO line does not name every source:\n%s", log)
+		}
+		if !strings.Contains(log, `auto_start_sources=grafana-prod,sentry`) {
+			t.Errorf("auto_start WARN does not name exactly grafana-prod,sentry:\n%s", log)
+		}
+		if strings.Contains(log, "alert_store_unconfigured") {
+			t.Errorf("fully wired ingress logged a missing dependency:\n%s", log)
+		}
+	})
+
+	t.Run("no auto_start source logs no auto_start WARN", func(t *testing.T) {
+		var buf bytes.Buffer
+		ac, err := resolveAlertTriggerConfig(writeAlertSources(t, "version: 1\nsources:\n  - id: a\n    secret_env: S\n    repo: o/n\n"), "5m",
+			alertGetenv(map[string]string{"S": alertSecret}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := server.Config{GitHub: gh, WebhookDeliveries: webhook.NewMemoryStore(time.Hour)}
+		wireAlertTrigger(&cfg, ac, pool, slog.New(slog.NewTextHandler(&buf, nil)))
+		if strings.Contains(buf.String(), "AUTO-START") {
+			t.Errorf("auto_start WARN logged for a source that omits auto_start:\n%s", buf.String())
+		}
+	})
+
+	t.Run("missing dependencies each WARN", func(t *testing.T) {
+		var buf bytes.Buffer
+		cfg := server.Config{}
+		wireAlertTrigger(&cfg, loaded, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+		if cfg.AlertIncidents != nil {
+			t.Errorf("AlertIncidents = %v with no pool, want nil", cfg.AlertIncidents)
+		}
+		if cfg.AlertSpecSource != nil {
+			t.Errorf("AlertSpecSource = %#v with no GitHub client, want a nil interface", cfg.AlertSpecSource)
+		}
+		log := buf.String()
+		for _, want := range []string{"no database", "GitHub App is unconfigured", "no webhook delivery store"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("log does not WARN %q:\n%s", want, log)
+			}
+		}
+	})
 }
 
 // --- Regional cells: serve wiring (ADR-062, E44.7 / #1831) ------------------
