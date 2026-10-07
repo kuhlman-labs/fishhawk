@@ -5196,6 +5196,14 @@ func verifyFailureExcerpt(out string) string {
 //     loop is outside the ADR-023 self-retry for{} loop, so it can never call
 //     RetryStage (DECISION c2, non-compounding).
 //
+//  6. a NO-OP fix iteration (#4036) — a fix agent returned and the scope-only
+//     tree is byte-identical to the last FAILED one — whose failure lies
+//     entirely outside the change's packages is the once-per-stage FLAKE
+//     RE-RUN: a pass is recorded as such (verify_flake_rerun + a
+//     verify_summary detail), a reproduced outside failure is category C
+//     (verify_failure_outside_change), and a failure inside the change refunds
+//     the iteration. Helpers and the relation rules live in verifyfailures.go.
+//
 // Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
 // with runVerifyGateCommitted (#816):
 //
@@ -5304,6 +5312,17 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
 		lockContended   bool   // the LAST verify was a verify-lock refusal and no re-run remains (#3948) → category C, no fix re-invoke
 		lockState       verifyLockContention
+
+		// No-op fix detection + once-per-stage flake re-run (#4036).
+		failedTree       string         // scope-only tree of the last FAILED verify the fix agent was re-invoked on
+		failedOutput     string         // the verify output that fix agent was given
+		fixedSinceVerify bool           // a SUCCESSFUL fix re-invoke ran since the last verify (absorb / lock re-runs never set it)
+		flakeRerunSpent  bool           // the once-per-stage flake re-run was already admitted
+		flakeRerun       bool           // the CURRENT iteration is the admitted flake re-run (kept across an absorb's in-place repeat)
+		flakePassed      bool           // the flake re-run passed: the earlier failure did not reproduce
+		flakeFailures    verifyFailures // the failure the no-op fix agent was given (the flaky test on a pass)
+		outsideChange    bool           // the flake re-run reproduced a failure entirely outside the change → category C
+		outsideFailures  verifyFailures // the reproduced failure, for the category-C reason
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -5341,6 +5360,28 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			lastIterErr = err
 			break
 		}
+
+		// NO-OP fix detection (#4036). When a successful fix re-invoke ran since
+		// the last verify and this iteration's scope-only tree is byte-identical
+		// to the tree that verify FAILED on, the fix agent changed nothing. If
+		// the failure it was given lies entirely in packages OUTSIDE the change
+		// (verifyFailureScopeRelation), the iteration becomes the once-per-stage
+		// FLAKE RE-RUN, settled after the verify below. Best-effort: an
+		// unresolvable tree leaves curTree empty, which disables detection —
+		// the pre-#4036 behaviour, never a failure.
+		curTree, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
+		if isNoopFixIteration(failedTree, curTree, fixedSinceVerify) {
+			given := parseVerifyFailures(failedOutput)
+			relation := verifyFailureScopeRelation(given, scopePkgs)
+			admitted := relation == verifyRelationOutside && !flakeRerunSpent
+			res.Events = append(res.Events, logVerifyFixNoop(logSink, *cfg, iter+1, curTree, relation, given, admitted))
+			if admitted {
+				flakeRerunSpent = true
+				flakeRerun = true
+				flakeFailures = given
+			}
+		}
+		fixedSinceVerify = false
 
 		// The iteration's CHANGE IDENTITY (#3665), computed ONCE here against
 		// the throwaway commit's own parent and stamped onto BOTH verify_run
@@ -5425,6 +5466,13 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 
 		if outcome != "failed" {
 			passed = true
+			if flakeRerun {
+				// The identical tree passed: the failure the no-op fix agent
+				// was given did not reproduce (#4036). Still a pass — the full
+				// form exited 0 on this tree — but recorded honestly.
+				flakePassed = true
+				res.Events = append(res.Events, logVerifyFlakeRerun(logSink, *cfg, iter+1, outcome, flakeFailures))
+			}
 			break
 		}
 
@@ -5613,6 +5661,29 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			}
 		}
 
+		// FAILED flake re-run (#4036). Placed after both absorbs (each keeps
+		// priority, and its in-place repeat keeps the flakeRerun marker) and
+		// before the exhaustion check. The relation is recomputed on the
+		// CURRENT output: a failure still entirely outside the change on an
+		// identical tree is not this change's — break into category C with no
+		// fix re-invoke. A failure inside the change (or undecidable) REFUNDS
+		// this no-op iteration (iter--: it consumes no fix iteration) and falls
+		// through to the ordinary re-invoke path.
+		if flakeRerun {
+			flakeRerun = false
+			current := parseVerifyFailures(out)
+			if verifyFailureScopeRelation(current, scopePkgs) == verifyRelationOutside {
+				outsideChange = true
+				outsideFailures = current
+				res.Events = append(res.Events, logVerifyFlakeRerun(logSink, *cfg, iter+1, outcome, current))
+				break
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_flake_rerun_refunded","run_id":%q,"stage_id":%q,"iteration":%d,"failing_tests":%q,"failing_packages":%q}`+"\n",
+				cfg.runID, cfg.stageID, iter+1, strings.Join(current.tests, ","), strings.Join(current.pkgs, ","))
+			iter--
+		}
+
 		if iter == cfg.verifyMaxIterations {
 			// Budget exhausted — terminal demotion, no re-invoke.
 			break
@@ -5652,6 +5723,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				cfg.runID, cfg.stageID, iter+1, strings.Join(outOfScope, ","))
 		}
 		fixInv.Prompt, elided = verifyFixPrompt(cfg.verifyCmd, out, cfg.scopeFiles, cfg.approvedAmendments, outOfScope)
+		// The tree + output this fix agent is handed, for the next
+		// iteration's no-op detection (#4036).
+		failedTree, failedOutput = curTree, out
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_fix_reinvoke","run_id":%q,"stage_id":%q,"iteration":%d,"prompt_bytes":%d,"output_bytes":%d,"output_elided_bytes":%d}`+"\n",
 			cfg.runID, cfg.stageID, iter+1, len(fixInv.Prompt), len(out), elided)
@@ -5705,6 +5779,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				attemptsMade, fixErr)
 			break
 		}
+		fixedSinceVerify = true
 		res.Events = append(res.Events, fixRes.Events...)
 		res.TokensUsed += fixRes.TokensUsed
 		res.InputTokens += fixRes.InputTokens
@@ -5776,10 +5851,20 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	case lockContended:
 		summary["outcome"] = "failed"
 		summary["detail"] = lockState.reason(cfg.verifyCmd, attempts, timeout)
+	case outsideChange && !hostProbe.overloaded():
+		summary["outcome"] = "failed"
+		summary["detail"] = verifyFailureOutsideChangeReason(cfg.verifyCmd, outsideFailures)
 	case !passed:
 		summary["outcome"] = "failed"
 	default:
 		summary["outcome"] = "passed"
+		if flakePassed {
+			// A passed flake re-run (#4036): still outcome=passed, but the
+			// detail (it rides verifySummaryEvidence.Detail into the implement
+			// review) says the earlier failure did not reproduce.
+			summary["detail"] = verifyFlakeRerunDetail(flakeFailures)
+			summary["flaky_tests"] = append([]string{}, flakeFailures.tests...)
+		}
 	}
 	res.Events = append(res.Events, agent.Event{
 		Kind:    "verify_summary",
@@ -5855,6 +5940,18 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		res.OK = false
 		res.FailureCategory = "C"
 		res.FailureReason = hostProbe.reason() + "\n" + lastOutput
+		return reinvoked, "", nil
+	}
+
+	// OUTSIDE-CHANGE failure (#4036): the fix agent made no change and the
+	// identical tree failed again entirely outside this change's packages —
+	// a pre-existing or flaky failure, not an artifact defect. Category C,
+	// retryable in place, with a lead naming the test(s). After every more
+	// specific cause above, before the category-A arm.
+	if outsideChange {
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = verifyFailureOutsideChangeReason(cfg.verifyCmd, outsideFailures) + "\n" + lastOutput
 		return reinvoked, "", nil
 	}
 
@@ -6160,13 +6257,20 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 // embedded in the fix prompt (#3408). Both adapters pass the whole prompt to
 // the agent as ONE argv string, and Linux caps a single execve argument at
 // MAX_ARG_STRLEN (32 pages, 128 KiB on 4 KiB pages) while macOS caps the total
-// argv+envp at kern.argmax (1 MiB). A 64 KiB excerpt keeps the fix prompt under
-// the Linux per-string limit with margin. The head keeps a lint-first abort
-// (verify runs lint first and stops on it); the tail keeps the `--- FAIL` /
-// `FAIL pkg` lines. The full output stays on the verify_run trace event.
+// argv+envp at kern.argmax (1 MiB). The head keeps a lint-first abort (verify
+// runs lint first and stops on it); the tail keeps the last `--- FAIL` /
+// `FAIL pkg` lines; verifyFixOutputSignalBytes keeps every failure-signal line
+// from the ELIDED middle (#4036 — a long multi-module output used to bury the
+// failing test name there). The excerpt is therefore bounded by
+// head(16)+signal(16)+tail(48) = 80 KiB plus fixed framing, which with the
+// ~5 KiB scope/recipe blocks verifyFixPrompt appends stays under the Linux
+// per-string limit. The full output stays on the verify_run trace event.
 const (
 	verifyFixOutputHeadBytes = 16 << 10
 	verifyFixOutputTailBytes = 48 << 10
+	// verifyFixOutputSignalBytes is the separate budget for failure-signal
+	// lines (plus context) retained from the elided middle (#4036).
+	verifyFixOutputSignalBytes = 16 << 10
 	// verifyFixOutputTailFloorBytes is the minimum tail the line-snap below may
 	// keep before falling back to the raw byte window (#3431). A degenerate
 	// window whose only newline is its final byte (e.g. one very long
@@ -6181,10 +6285,15 @@ const (
 // The tail is snapped to a line boundary inside its window when one exists
 // AND the snap keeps at least verifyFixOutputTailFloorBytes; otherwise the
 // raw tail byte window is kept instead. Either way the retained tail never
-// exceeds the original tail-byte window, so the excerpt never exceeds
-// head+tail bytes and the OS argument-size bound below still holds. A window
-// with no newline likewise keeps its raw byte slice so the bound holds
-// regardless of content.
+// exceeds the original tail-byte window. A window with no newline likewise
+// keeps its raw byte slice so the bound holds regardless of content.
+//
+// When the elided middle carries failure-signal lines (#4036,
+// retainFailureSignalLines), they are kept with a little context inside a
+// separate verifyFixOutputSignalBytes budget, framed between the marker and
+// the tail, and the marker states how many were retained (and omitted over
+// budget); elided then excludes the retained source bytes. A middle with no
+// signal line returns exactly the pre-#4036 excerpt, byte for byte.
 func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 	const head, tail = verifyFixOutputHeadBytes, verifyFixOutputTailBytes
 	if len(out) <= head+tail {
@@ -6203,10 +6312,30 @@ func boundVerifyFixOutput(out string) (excerpt string, elided int) {
 		tailStart = rawTailStart
 	}
 	elided = tailStart - headEnd
-	marker := fmt.Sprintf("[... %d bytes of verify output elided here so the fix prompt fits the OS argument-size limit; the first %d and last %d bytes are kept — re-run the command yourself for the full output ...]\n",
-		elided, headEnd, len(out)-tailStart)
-	return out[:headEnd] + marker + out[tailStart:], elided
+	block, retained, kept, omitted := retainFailureSignalLines(out[headEnd:tailStart], verifyFixOutputSignalBytes)
+	if block == "" {
+		marker := fmt.Sprintf("[... %d bytes of verify output elided here so the fix prompt fits the OS argument-size limit; the first %d and last %d bytes are kept — re-run the command yourself for the full output ...]\n",
+			elided, headEnd, len(out)-tailStart)
+		return out[:headEnd] + marker + out[tailStart:], elided
+	}
+	elided -= retained
+	over := ""
+	if omitted > 0 {
+		over = fmt.Sprintf(" (%d more omitted over the %d-byte budget)", omitted, verifyFixOutputSignalBytes)
+	}
+	marker := fmt.Sprintf("[... %d bytes of verify output elided here so the fix prompt fits the OS argument-size limit; the first %d and last %d bytes are kept, and %d failure-signal line(s) from the elided region are retained below with context%s — re-run the command yourself for the full output ...]\n",
+		elided, headEnd, len(out)-tailStart, kept, over)
+	return out[:headEnd] + marker +
+		verifyFixRetainedSignalOpen + "\n" + block + verifyFixRetainedSignalClose + "\n" +
+		out[tailStart:], elided
 }
+
+// The frame around the failure-signal block boundVerifyFixOutput retains from
+// the elided middle (#4036).
+const (
+	verifyFixRetainedSignalOpen  = "[retained failure-signal lines from the elided region:]"
+	verifyFixRetainedSignalClose = "[end of retained failure-signal lines]"
+)
 
 // verifyFixPrompt builds the fix-iteration prompt fed back to the agent when
 // the committed-tree verify command fails. It embeds the failing command and

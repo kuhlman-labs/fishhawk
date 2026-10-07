@@ -15797,6 +15797,108 @@ func TestBoundVerifyFixOutput(t *testing.T) {
 			t.Errorf("excerpt tail must fall back to the raw last %d bytes of input", tail)
 		}
 	})
+	// #4036: failure-signal lines in the ELIDED middle are retained with
+	// context inside their own budget. Every case above has no signal line in
+	// its middle, which pins the no-signal path byte for byte.
+	filler := func(n int, ch byte) string {
+		var b strings.Builder
+		for b.Len() < n {
+			b.WriteString(line(100, ch))
+		}
+		return b.String()
+	}
+	t.Run("buried failure signals are retained with context", func(t *testing.T) {
+		middle := "ctx-before-2\nctx-before-1\n--- FAIL: TestBuried (0.00s)\n    buried_test.go:10: boom\n" +
+			filler(20<<10, 'm') +
+			"FAIL\texample.com/m/pkg/buried\t0.10s\n" + filler(20<<10, 'n') +
+			"panic: buried panic\n" + filler(20<<10, 'o') +
+			"WARNING: DATA RACE\n"
+		in := filler(head+4096, 'h') + middle + filler(tail+4096, 't')
+		got, elided := boundVerifyFixOutput(in)
+		for _, want := range []string{
+			"ctx-before-2\n", "--- FAIL: TestBuried (0.00s)\n", "    buried_test.go:10: boom\n",
+			"FAIL\texample.com/m/pkg/buried\t0.10s\n", "panic: buried panic\n", "WARNING: DATA RACE\n",
+			"4 failure-signal line(s) from the elided region are retained below",
+			verifyFixRetainedSignalOpen, verifyFixRetainedSignalClose,
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("excerpt lacks %q", want)
+			}
+		}
+		if strings.Contains(got, "more omitted over the") {
+			t.Error("nothing was over budget, so no omitted count may be reported")
+		}
+		// Exact accounting: head + elided + retained source bytes + tail == len(in).
+		mi := strings.Index(got, "[... ")
+		openIdx := strings.Index(got, verifyFixRetainedSignalOpen+"\n")
+		closeIdx := strings.Index(got, verifyFixRetainedSignalClose+"\n")
+		if mi < 0 || openIdx < 0 || closeIdx < openIdx {
+			t.Fatalf("excerpt framing missing:\n%.300s", got[mi:])
+		}
+		block := got[openIdx+len(verifyFixRetainedSignalOpen)+1 : closeIdx]
+		retained := len(strings.ReplaceAll(block, verifyFixSignalSeparator, ""))
+		tailKept := len(got) - (closeIdx + len(verifyFixRetainedSignalClose) + 1)
+		if mi+elided+retained+tailKept != len(in) {
+			t.Errorf("head %d + elided %d + retained %d + tail %d = %d, want len(in) %d",
+				mi, elided, retained, tailKept, mi+elided+retained+tailKept, len(in))
+		}
+		if !strings.HasSuffix(got, in[len(in)-tailKept:]) || tailKept > tail {
+			t.Errorf("tail kept %d (max %d) must be the input's own tail", tailKept, tail)
+		}
+	})
+	t.Run("thousands of FAIL lines stay bounded with an omitted count", func(t *testing.T) {
+		var b strings.Builder
+		for i := 0; i < 5000; i++ {
+			fmt.Fprintf(&b, "FAIL\texample.com/m/pkg/p%04d\t0.01s\n", i)
+		}
+		in := filler(head+4096, 'h') + b.String() + filler(tail+4096, 't')
+		got, elided := boundVerifyFixOutput(in)
+		const framing = 1 << 10
+		if len(got) > head+verifyFixOutputSignalBytes+tail+framing {
+			t.Errorf("len(excerpt) = %d, want <= head+signal+tail+framing = %d", len(got), head+verifyFixOutputSignalBytes+tail+framing)
+		}
+		if !strings.Contains(got, "more omitted over the") {
+			t.Errorf("excerpt must report the omitted signal lines:\n%.400s", got[strings.Index(got, "[... "):])
+		}
+		if elided <= 0 {
+			t.Errorf("elided = %d, want > 0", elided)
+		}
+	})
+}
+
+// TestRunVerifyFixLoop_FixPromptKeepsBuriedFailure drives the REAL loop with a
+// verify output whose only failing-test line sits >16 KiB from the start and
+// >48 KiB from the end (#4036): neither the head nor the tail window can hold
+// it, so only the retained-signal block puts TestBuried in the fix prompt.
+func TestRunVerifyFixLoop_FixPromptKeepsBuriedFailure(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	// The output lives in a script FILE: the prompt embeds the verify command,
+	// so a command spelling out the test name would put it in the prompt on
+	// its own and mask the control under test.
+	script := filepath.Join(t.TempDir(), "verify.sh")
+	mustWrite(t, script, "#!/bin/sh\n"+
+		"head -c 300000 /dev/zero | tr '\\0' x; echo\n"+
+		"echo '--- FAIL: TestBuried (0.00s)'\n"+
+		"head -c 100000 /dev/zero | tr '\\0' y; echo\n"+
+		"echo FAIL\nexit 1\n")
+	cfg := verifiedTreeCfg(repo, "sh "+script)
+	cfg.verifyMaxIterations = 1
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatalf("no fix re-invoke captured\n%s", logSink.String())
+	}
+	prompt := invoker.gotInv.Prompt
+	if !strings.Contains(prompt, "--- FAIL: TestBuried") {
+		t.Errorf("fix prompt dropped the buried failing test name:\n%.600s", prompt)
+	}
+	if len(prompt) >= 128<<10 {
+		t.Errorf("fix prompt is %d bytes, want < 128 KiB (Linux MAX_ARG_STRLEN)", len(prompt))
+	}
 }
 
 // TestRunVerifyFixLoop_FixPromptBounded drives the REAL loop against a verify
