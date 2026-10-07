@@ -9,10 +9,9 @@
 # drifted file fails those tests rather than only a manual check-jsonschema run.
 #
 # NOT RUNNABLE YET. This workflow declares a stage that produces a
-# comms_report. Phase 1 (#4011) ships only the binding; four pieces are still
-# missing:
+# comms_report. Phase 1 (#4011) shipped the binding and phase 4 (#4014) gathers
+# the user reports and serves the scan prompt; three pieces are still missing:
 #
-#   #4014  gathering the user reports and serving the scan prompt.
 #   #4015  ingesting the comms_report (until then a comms_report upload is
 #          refused plan_invalid).
 #   #4016  recording the captain's per-draft dispositions on the report.
@@ -39,9 +38,10 @@
 # never edited.
 #
 # NO CHARTER AT VALIDATE. The scan does need a comms charter, but it is
-# enforced when the scan prompt is served (phase 4, #4014), not by
-# WorkflowRequiresCharter (which keys on grooming_report only). `fishhawk
-# validate` and run admission therefore do not refuse a charterless repository.
+# enforced when the scan prompt is served (phase 4, #4014: both prompt
+# endpoints refuse 422 comms_charter_refused), not by WorkflowRequiresCharter
+# (which keys on grooming_report only). `fishhawk validate` and run admission
+# therefore do not refuse a charterless repository.
 #
 # NO `actions`, NO `inputs`, NO `auto_advance`. `autonomy: low` delegates none
 # of the run-driving classes, so the gate stops for a human; a scan is not

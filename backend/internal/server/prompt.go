@@ -1831,11 +1831,32 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trigger.Upkeep = upkeepCtx
+	// Comms scan gather (E81.5 / #4014): a plan stage declaring `produces:
+	// comms_report` is served the server-gathered user reports. /prompt-render
+	// runs this same call through the same per-(run, stage) gather cache
+	// (commsScanCacheTTL), so the two agree within the TTL and refuse
+	// identically (422 comms_charter_refused).
+	gathered, ok := s.applyCommsScan(w, r, runRow, stage, &trigger)
+	if !ok {
+		return
+	}
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
 		return
+	}
+	// Record what this SIGNED serve showed (#4014) only once the prompt carrying
+	// it has built: one comms_scan_gathered row per distinct gather digest.
+	// Phases 5 and 7 bind to that row, so a prompt whose gather cannot be
+	// recorded is not served — the runner's 5xx loop retries it. /prompt-render
+	// never records: a preview is not a serve.
+	if gathered != nil {
+		if _, _, err := s.recordCommsScanGathered(r.Context(), runRow.ID, stage.ID, gathered.payloadFor(stage)); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"record the comms scan gather failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 	// Record the deferred crew delivery (E77.7 / #3741) only once the prompt
 	// carrying it has actually built — the signed serve IS the delivery.
@@ -2080,6 +2101,10 @@ func (s *Server) markStageRunningOnPromptFetch(ctx context.Context, stage *run.S
 //     internal_error. Extracting it here is also what makes it directly
 //     testable (TestPromptBuildError_Mapping) rather than a second unreachable
 //     copy — unreachable is not uncovered nor unimportant.
+//   - prompt.ErrCommsRubricEmpty -> 422 comms_charter_refused with reason
+//     charter_rubric_unconforming (#4014). The prompt layer's backstop: the
+//     comms gather refuses an unconforming rubric FIRST, so through either
+//     handler this is unreachable, and it maps onto the same refusal shape.
 //   - anything else -> 500 internal_error.
 func (s *Server) writePromptBuildError(w http.ResponseWriter, r *http.Request, stageType string, err error) {
 	if errors.Is(err, prompt.ErrUnsupportedStage) {
@@ -2094,8 +2119,60 @@ func (s *Server) writePromptBuildError(w http.ResponseWriter, r *http.Request, s
 			map[string]any{"reason": reasonCharterNotInjected, "error": err.Error()})
 		return
 	}
+	if errors.Is(err, prompt.ErrCommsRubricEmpty) {
+		s.writeCommsCharterRefusal(w, r, &commsCharterRefusal{Reason: commsRefusalCharterRubricUnconforms})
+		return
+	}
 	s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 		"build prompt failed", map[string]any{"error": err.Error()})
+}
+
+// applyCommsScan resolves the comms scan gather (E81.5 / #4014) for both
+// prompt handlers. For a plan stage declaring `produces: comms_report` it sets
+// trigger.Comms and CLEARS the triggering issue's title, body and comments
+// (IssueNumber stays): a comms scan renders no triggering-issue text, so the
+// column-0 "User report · " attribution line is emitted only by the user-report
+// envelope writer and no issue text can forge a shown report (option (a) of
+// the #4013 carry). It returns the gather (nil for every other stage) and
+// whether serving may continue; on false it has already written the response:
+// 422 comms_charter_refused for a *commsCharterRefusal, 500 internal_error for
+// a binding transport error.
+func (s *Server) applyCommsScan(w http.ResponseWriter, r *http.Request, runRow *run.Run, stage *run.Stage, trigger *prompt.Trigger) (*commsGather, bool) {
+	cc, g, err := s.resolveCommsScanContext(r.Context(), runRow, stage)
+	if err != nil {
+		var refusal *commsCharterRefusal
+		if errors.As(err, &refusal) {
+			s.writeCommsCharterRefusal(w, r, refusal)
+			return nil, false
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"resolve the stage's comms_report declaration failed", map[string]any{"error": err.Error()})
+		return nil, false
+	}
+	if cc == nil {
+		return nil, true
+	}
+	trigger.Comms = cc
+	trigger.IssueTitle = ""
+	trigger.IssueBody = ""
+	trigger.IssueComments = nil
+	return g, true
+}
+
+// writeCommsCharterRefusal writes the 422 comms_charter_refused BOTH prompt
+// endpoints return when the charter cannot anchor a comms scan. details.reason
+// is one of commsCharterRefusalReasons(); details.charter_path is set when the
+// declaration was read. The refusal's log-only Detail never reaches the body.
+// A 422 is not retried by the runner (upload.FetchPrompt returns on a non-5xx
+// client error), so the stage fails and an operator retries after fixing the
+// charter.
+func (s *Server) writeCommsCharterRefusal(w http.ResponseWriter, r *http.Request, refusal *commsCharterRefusal) {
+	details := map[string]any{"reason": refusal.Reason}
+	if refusal.CharterPath != "" {
+		details["charter_path"] = refusal.CharterPath
+	}
+	s.writeError(w, r, http.StatusUnprocessableEntity, "comms_charter_refused",
+		"the comms scan charter could not anchor the scan", details)
 }
 
 // handleGetStagePromptRender implements GET /v0/stages/{stage_id}/prompt-render.
@@ -2532,6 +2609,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	trigger.Upkeep = upkeepCtx
+	// Comms scan gather (#4014), resolved exactly as handleGetStagePrompt
+	// resolves it and through the same gather cache, so the preview's bytes
+	// and refusals match the signed serve's. The preview records nothing.
+	if _, ok := s.applyCommsScan(w, r, runRow, stage, &trigger); !ok {
+		return
+	}
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {

@@ -3,7 +3,9 @@
 // since a per-repository cursor as fishhawk_filed, bot, internal or external,
 // hands the result to a caller's Recorder, and advances the forge-anchored
 // cursor (user_report_cursors, migration 0096) only after the record
-// succeeds. Nothing in production calls Scan yet (E81.5 / #3775 wires it).
+// succeeds. The one production caller is the server's comms scan gather
+// (E81.5 / #4014), which runs Scan through a deferring cursor store so a
+// prompt serve never advances the cursor.
 // comms.go adds the comms draft-marker primitives (DraftMarker,
 // ParseDraftMarkers, ContentHash); the marker is attacker-writable body text,
 // trusted only on an item classified fishhawk_filed.

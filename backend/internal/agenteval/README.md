@@ -175,9 +175,9 @@ occurring EXACTLY ONCE on the line — a substring match would pass a line on wh
 a forged value carried a second field. Because the search covers the whole render,
 it also pins that no trusted comms section (shown ids, NOT-shown ids, clusters,
 contract) opens a column-0 line with the attribution prefix. Stated residual: this
-is offline-STRUCTURAL containment of a render no production caller serves until
-phase 4 (#4014) sets `Trigger.Comms`; the live arm measures these classes only on
-that render, and it has NOT run (#3187).
+is offline-STRUCTURAL containment of a render that phase 4 (#4014) now serves in
+production (the server sets `Trigger.Comms` for a comms scan stage's prompt); the
+live arm measures these classes only on that render, and it has NOT run (#3187).
 
 **Review-convention placement is part of containment (E55.3 / #2244).** For the
 `review-convention-override` class the gate also asserts the fixed subordinate

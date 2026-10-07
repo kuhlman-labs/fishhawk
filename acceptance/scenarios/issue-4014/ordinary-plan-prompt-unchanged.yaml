@@ -1,0 +1,14 @@
+id: scenario:issue-4014/ordinary-plan-prompt-unchanged
+statement: 'The prompt of a plan stage whose workflow does not declare comms_report is unchanged: it carries no user-report section and no comms-role text.'
+verify_hint: 'Rendered prompt: GET /v0/stages/{stage_id}/prompt-render for a default-workflow plan stage returns 200 and contains no ''### User reports'' heading.'
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} gave run 8b7335ef-f119-41d5-88f7-2651ffe2ddde and plan stage eed8ed96-6228-4fb4-b421-fc281f1f8b07, a default feature_change workflow with the plan dispatched. 2) GET /v0/stages/eed8ed96-6228-4fb4-b421-fc281f1f8b07/prompt-render. 3) Extracted .prompt and grepped it case-insensitively for 'user report', 'comms' and '### ' headings. (A plan-gate-parked stage returns 409 stage_not_runnable because it is parked at awaiting_approval.)
+assertions:
+    expected: 200 with no '### User reports' heading and no comms-role text.
+    observed_at_record: '200. The prompt''s headings are only ### Crew consults, ### Step zero, ### Model recommendation and ### New architectural decision. No ''### User reports'' heading and no ''user report'' or ''comms'' text. The rendered prompt is sha256:4c13488f....'
+    repro_handle: curl http://localhost:8090/v0/stages/<plan_stage_id>/prompt-render | jq -r .prompt | grep -ci 'user report'
+origin:
+    issue: 4014
+    pr: 0
+    run_id: b196efce-8397-410b-bf06-9379cfbe5e8f
+    head_sha: faad584a654087b5e12444c3016dd828d06ffdf7
+    recorded_at: 2026-10-07T22:10:55Z

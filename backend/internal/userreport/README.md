@@ -6,9 +6,14 @@ stored per-repository cursor through the `workmgmt.UserReportReader`
 capability, classifies each item's author, hands the result to a caller's
 `Recorder`, and advances the cursor only after that record succeeds.
 
-**Nothing in production calls `Scan` yet.** E81.5 (#3775) wires it into the
-comms stage. No HTTP route, MCP tool, CLI verb or audit category exists for it,
-and the forge is only read.
+**The one production caller is the comms scan gather** (E81.5 / #4014,
+`backend/internal/server/comms_scan.go`, contract in
+`backend/internal/server/README.md` § "Comms scan gather"): a plan stage
+declaring `produces: comms_report` runs `Scan` when its prompt is served,
+through a DEFERRING cursor store whose `Advance` writes nothing and a
+capturing `Recorder`, so a serve never moves `user_report_cursors`; the comms
+apply (phase 7, #4017) is the advancer. This package has no HTTP route, MCP
+tool, CLI verb or audit category of its own, and the forge is only read.
 
 | File | Holds |
 |---|---|
@@ -96,6 +101,12 @@ on an item `Classify` reports as `fishhawk_filed`; a `Result` with
 `MarkerFromExternal` set is never trusted. The consumers — the scan's
 suppression read (phase 4, #4014) and the on-approval filing that renders the
 marker (phase 7, #4017) — enforce that; this package only renders and parses.
+Phase 4 enforces it in `server.trustedCommsMarkers`: `ParseDraftMarkers` runs
+ONLY on an item classified `fishhawk_filed`, and a parsed entry is honoured
+ONLY when a server-written `comms_draft_filed` audit row for the same
+`(issue_number, comment_id)` names that exact `(id, content_hash)`. The
+intersection means a marker quoted into a filed draft (an attacker title in
+an intake Derives-from block) suppresses nothing.
 
 ## Cursor
 
