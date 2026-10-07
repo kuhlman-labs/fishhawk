@@ -1474,6 +1474,14 @@ _verify_patch_coverage() {
 # (argument order, the HOST lock, the pre-run image pin check, the docker argv)
 # with a fake docker on a symlinked docker-free PATH. Both are bash, hermetic,
 # no network and no real Docker.
+# test-review-prompt-eval (E55.4 / #2245) pins scripts/check-review-prompt-eval,
+# the standing path-triggered check that a plan-review prompt change carries
+# passing recorded two-arm catch-rate evidence. The CHECK runs OUTSIDE verify on
+# purpose (the evidence needs a live model measurement the gate env denies, so a
+# stale record must not red-line an implement agent that cannot refresh it);
+# this harness is the only part of that gate that runs here. Bash (no zsh
+# guard), temp git fixtures, a stub `go` under a symlink-only PATH: no network,
+# no Docker, no model and never the real `go`, ~10s.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
@@ -1492,7 +1500,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
