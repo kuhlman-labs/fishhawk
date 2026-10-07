@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# check-review-prompt-eval: the STANDING, path-triggered check that a change to
+# the plan-review prompt carries PASSING recorded two-arm catch-rate evidence
+# (E55.4 / #2245).
+#
+# When any review-prompt path (TRIGGERS below) changed since the merge base with
+# BASE, it requires the OFFLINE gate command
+#
+#   (cd backend && go run ./internal/agenteval/catchrategate)
+#
+# to exit 0. That command decides from the committed evidence record alone — no
+# model call, no network — and fails closed on an absent, malformed, stale,
+# under-powered or regressed record (backend/internal/agenteval/README.md §
+# "Plan-review catch-rate gate"). Recording the evidence is an operator step:
+# docs/compliance/planreview-catchrate-evidence.md. Until an operator records
+# and pins the first baseline, this check FAILS on every change that touches a
+# trigger path. That is the design, not a defect.
+#
+# It runs OUTSIDE `scripts/test verify` on purpose. The evidence can only be
+# produced by the live two-arm measurement, which needs a model credential and
+# network the runner's gate denies (the key is on gateEnvDeny); an implement
+# agent that cannot measure must not be red-lined by a stale record it cannot
+# refresh. Only its hermetic harness, scripts/test-review-prompt-eval, runs
+# inside verify. Standing enforcement is the operator-installed CI job in
+# scripts/README.md § "Review-prompt eval check"; until that job is installed
+# this check is run by hand.
+#
+# Usage: scripts/check-review-prompt-eval [--base <ref>] [--always]
+#   --base <ref>  the ref whose merge base with HEAD bounds the change set
+#                 (default origin/main).
+#   --always      run the gate whatever changed; skips the base/diff enumeration.
+# Run it from inside the checkout: the repository is the one containing the
+# CURRENT DIRECTORY (`git rev-parse --show-toplevel`), not the script's own.
+#
+# CHANGE SET: `git diff --name-only --no-renames -z <merge-base>` (merge base ->
+# WORK TREE, so committed, staged, unstaged and deleted paths all count; with
+# renames split so a move OUT of a trigger path still triggers) plus untracked
+# files (`git ls-files --others --exclude-standard -z`). NUL-separated, so a
+# path git would C-quote cannot slip past the prefix match.
+#
+# MATCHING: a trigger ending in `/` matches every path under that directory (a
+# component boundary: backend/internal/prompts/x.go does NOT match
+# backend/internal/prompt/); any other trigger matches that exact path only.
+#
+# RESIDUAL: the trigger list names the paths that own the plan-review prompt,
+# the conventions render, the catch harness and its fixtures. A change ELSEWHERE
+# that still alters the rendered prompt (prompt.Build imports
+# backend/internal/plan) does not trigger this check; the record's fingerprint
+# covers the rendered arm prompts, so the next triggered run, or `--always`,
+# fails that record as stale.
+#
+# EXIT CODES:
+#   0  no trigger path changed (printed reason), or the gate passed;
+#   1  a trigger path changed (or --always) and the gate failed — any non-zero
+#      exit of `go run`, which reports a program's own exit status as 1;
+#   2  the check could NOT decide: a usage error, not inside a git checkout, an
+#      unresolvable base ref, no merge base, a failed path enumeration, a failed
+#      temp file, no backend/ module, or `go` absent from PATH when triggered.
+# Exit 2 is NEVER a skip. Unlike the patch-coverage gate's fail-open
+# preconditions, a check that cannot tell whether the prompt changed must not
+# report that it did not.
+set -uo pipefail
+
+PROG="check-review-prompt-eval"
+
+TRIGGERS=(
+  backend/internal/prompt/
+  backend/internal/repodoc/
+  backend/internal/agenteval/planreviewcatch.go
+  backend/internal/agenteval/planreviewevidence.go
+  backend/internal/agenteval/catchrategate/
+  backend/internal/agenteval/testdata/planreview-miss-corpus/
+  backend/internal/agenteval/testdata/planreview-catchrate/
+)
+
+GATE_PKG="./internal/agenteval/catchrategate"
+RUNBOOK="docs/compliance/planreview-catchrate-evidence.md"
+
+# usage uses printf (a builtin), not cat: the script's external tools are
+# exactly git, mktemp, rm and go, which scripts/test-review-prompt-eval pins by
+# running it under a PATH holding only those.
+usage() {
+  printf '%s\n' \
+    'Usage: scripts/check-review-prompt-eval [--base <ref>] [--always]' \
+    '' \
+    'Requires passing recorded two-arm plan-review catch-rate evidence when a' \
+    'review-prompt path changed since the merge base with <ref> (default' \
+    'origin/main). Exit 0: not triggered, or the gate passed. Exit 1: the gate' \
+    'failed. Exit 2: the check could not decide (never a skip).' \
+    "Run-book: $RUNBOOK"
+}
+
+die2() {
+  echo "$PROG: $1" >&2
+  exit 2
+}
+
+BASE="origin/main"
+ALWAYS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)
+      [ $# -ge 2 ] || { usage >&2; die2 "--base needs a ref"; }
+      BASE="$2"
+      shift 2
+      ;;
+    --base=*)
+      BASE="${1#--base=}"
+      shift
+      ;;
+    --always)
+      ALWAYS=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die2 "unknown argument '$1'"
+      ;;
+  esac
+done
+case "$BASE" in
+  ''|-*) die2 "--base must name a ref, got '$BASE'" ;;
+esac
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+  die2 "not inside a git work tree ($(pwd)): run it from inside the repository"
+
+if [ "$ALWAYS" -eq 1 ]; then
+  echo "$PROG: --always: running the catch-rate gate without consulting the change set"
+else
+  base_sha="$(git -C "$ROOT" rev-parse --verify --quiet "$BASE^{commit}")" ||
+    die2 "cannot resolve base ref '$BASE' to a commit: fetch it (git fetch origin main, CI: fetch-depth: 0) or pass --base <ref>; refusing to report an unchanged prompt"
+  merge_base="$(git -C "$ROOT" merge-base HEAD "$base_sha")" ||
+    die2 "no merge base between HEAD and '$BASE' ($base_sha): refusing to report an unchanged prompt"
+
+  tracked="$(mktemp "${TMPDIR:-/tmp}/$PROG.XXXXXX")" ||
+    die2 "could not create a temp file for the change set"
+  untracked="$(mktemp "${TMPDIR:-/tmp}/$PROG.XXXXXX")" || {
+    rm -f "$tracked"
+    die2 "could not create a temp file for the change set"
+  }
+  trap 'rm -f "$tracked" "$untracked"' EXIT
+
+  # Each enumeration writes to a FILE whose exit status IS checked, never a
+  # process substitution whose status the reading loop cannot see.
+  git -C "$ROOT" diff --name-only --no-renames -z "$merge_base" > "$tracked" ||
+    die2 "enumerating changed paths since $merge_base FAILED: refusing to report an unchanged prompt"
+  git -C "$ROOT" ls-files --others --exclude-standard -z > "$untracked" ||
+    die2 "enumerating untracked paths FAILED: refusing to report an unchanged prompt"
+
+  hits=""
+  for listing in "$tracked" "$untracked"; do
+    while IFS= read -r -d '' p; do
+      for t in "${TRIGGERS[@]}"; do
+        case "$t" in
+          */) [[ "$p" == "$t"* ]] || continue ;;
+          *) [[ "$p" == "$t" ]] || continue ;;
+        esac
+        hits="$hits  $p"$'\n'
+        break
+      done
+    done < "$listing"
+  done
+
+  if [ -z "$hits" ]; then
+    echo "$PROG: no review-prompt path changed since $merge_base; recorded two-arm evidence not required"
+    exit 0
+  fi
+  echo "$PROG: review-prompt path(s) changed since $merge_base:"
+  printf '%s' "$hits"
+fi
+
+[ -d "$ROOT/backend" ] ||
+  die2 "no backend/ module under $ROOT: cannot run the catch-rate gate"
+command -v go >/dev/null 2>&1 ||
+  die2 "go is absent from PATH: install the toolchain pinned in go.work and re-run; a review-prompt change cannot be judged without the catch-rate gate"
+
+echo "$PROG: running (cd backend && go run $GATE_PKG)"
+if (cd "$ROOT/backend" && go run "$GATE_PKG"); then
+  echo "$PROG: PASS — the recorded two-arm catch-rate evidence passes"
+  exit 0
+fi
+echo "$PROG: FAIL — the recorded two-arm plan-review catch-rate evidence does not pass for this change; record it per $RUNBOOK" >&2
+exit 1
