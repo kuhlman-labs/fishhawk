@@ -190,6 +190,42 @@ unchanged — `charter_unresolved` was already a member.
 `ScoreFiling` therefore takes the whole `Charter` rather than only its
 `Rubric`: the gap has to name which of the three happened.
 
+## Charter parsing: rubric rows and non-goal bullets
+
+Both parsers read the same resolved document and share one line loop
+(`parseCharterLines`): charter order is kept, the FIRST definition of a
+duplicated id wins, and a document with no match returns the safe zero value
+(`Len() == 0`, `Has` false for every id). Neither guesses an id the charter
+does not declare.
+
+| Parser | Matches only | Quote |
+|---|---|---|
+| `ParseRubricIDs` → `Rubric` | a §4 table row `\| **<id>** \| <line> \|` | the line cell |
+| `ParseNonGoals` → `NonGoals` | a §3 bullet `- **N<k> — <statement>**` (em dash, en dash or hyphen, spaced; id `^N[0-9]+$`) | the bolded statement, without the prose after it |
+
+The non-goal shape is anchored on the list dash AND the opening bold span, so
+running prose that names `N3`, an inline bold span, a table row carrying an
+N-id, and an unbolded bullet all fail to parse. It matches anywhere in the
+document rather than under a §3 heading, so renumbering the section does not
+silently empty it. `TestParseNonGoals_ParsesTheShippedCharter` pins N1..N8 of
+this repository's `.fishhawk/charter.md` and fails (never skips) when the file
+is unreadable.
+
+`Charter.NonGoals` is set from the same content as `RubricIDs`, so the two can
+never come from different charter revisions. Intake scoring ignores it; the
+comms scan (#4014) renders it so an `n_drift` entry cites only a declared
+non-goal.
+
+The server reads the charter through ONE log-free core,
+`(*Server).resolveCharterDocument` (`backend/internal/server/intake_hook.go`),
+which returns `(Charter, DegradeReason, detail)` and never logs. The intake
+hook calls it through the `intakeCharter` wrapper, which WARN-logs each
+degradation as `intake groom degraded; work item filed without signals`
+exactly as before the split; the comms scan calls the core directly and logs
+under its own message, because a comms charter failure refuses the prompt
+rather than filing anything. `TestResolveCharterDocument_LogFree` pins both
+halves for every degrade branch.
+
 ## The recency approximation, and what it misses
 
 The duplicate window is the newest `DefaultMaxScanned` items by **creation**

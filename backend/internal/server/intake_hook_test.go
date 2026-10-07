@@ -1863,3 +1863,129 @@ func TestIntakeFilingFor_MapsSourceRefs(t *testing.T) {
 		t.Errorf("no refs must yield no source numbers, got %v", none.SourceNumbers)
 	}
 }
+
+// igCharterWithNonGoals carries both the rubric table and §3 non-goal
+// bullets, so one read can be checked for both.
+const igCharterWithNonGoals = igCharterDoc + `
+## 3. Non-goals
+
+- **N1 — Not a coding agent.** It orchestrates them.
+- **N2 — Not a tracker.** Prose that mentions N1 does not parse.
+`
+
+// igCharterTarget is the target the direct charter-read tests resolve against.
+func igCharterTarget() workmgmt.Target {
+	return workmgmt.Target{Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}}
+}
+
+// igCharterConv returns conventions declaring the fixture charter path.
+func igCharterConv() workmgmt.Conventions {
+	conv := workmgmt.Default()
+	conv.Charter = &workmgmt.Charter{Path: igCharterPath}
+	return conv
+}
+
+// TestIntakeCharter_CarriesNonGoals: a resolved charter carries its non-goal
+// ids parsed from the SAME document as its rubric, through both the core and
+// the logging wrapper.
+func TestIntakeCharter_CarriesNonGoals(t *testing.T) {
+	s := New(igCharterConfig(igCharterWithNonGoals, false))
+	ctx := context.Background()
+
+	core, reason, detail := s.resolveCharterDocument(ctx, igCharterConv(), igCharterTarget())
+	if reason != "" || detail != "" {
+		t.Fatalf("clean read reported reason=%q detail=%q", reason, detail)
+	}
+	wrapped, wreason := s.intakeCharter(ctx, igCharterConv(), igCharterTarget())
+	if wreason != "" {
+		t.Fatalf("intakeCharter reason = %q, want a clean read", wreason)
+	}
+	for name, c := range map[string]intakegroom.Charter{"core": core, "wrapper": wrapped} {
+		if !c.Resolved || c.Path != igCharterPath || c.ContentHash == "" {
+			t.Errorf("%s: charter = %+v, want a resolved read of %s with a content hash", name, c, igCharterPath)
+		}
+		if got := strings.Join(c.NonGoals.IDs(), ","); got != "N1,N2" {
+			t.Errorf("%s: NonGoals = %s, want N1,N2", name, got)
+		}
+		if got := c.NonGoals.Quote("N1"); got != "Not a coding agent." {
+			t.Errorf("%s: Quote(N1) = %q", name, got)
+		}
+		if got := strings.Join(c.RubricIDs.IDs(), ","); got != "V1,S2,S4,U4" {
+			t.Errorf("%s: RubricIDs = %s, want V1,S2,S4,U4", name, got)
+		}
+	}
+}
+
+// TestResolveCharterDocument_LogFree pins the split: for EVERY degradation the
+// core returns the reason and a non-empty detail and logs NOTHING, while the
+// intakeCharter wrapper logs exactly that reason and detail under the intake
+// message — the behaviour every TestIntakeHook_* degrade test already relies on.
+// A clean read logs nothing from either.
+func TestResolveCharterDocument_LogFree(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		conv workmgmt.Conventions
+		cfg  func() Config
+		want intakegroom.DegradeReason
+	}{
+		{"charter undeclared", chConventionsWithoutCharter(), func() Config { return igCharterConfig(igCharterDoc, false) }, intakegroom.DegradeReasonCharterUndeclared},
+		{"seam unwired", igCharterConv(), func() Config { return Config{} }, intakegroom.DegradeReasonSeamUnwired},
+		{"base ref fails", igCharterConv(), func() Config {
+			cfg := igCharterConfig(igCharterDoc, false)
+			cfg.DocumentBaseRef = func(context.Context, forge.RepoRef) (string, error) { return "", errors.New("forge unreachable") }
+			return cfg
+		}, intakegroom.DegradeReasonCharterUnresolved},
+		{"base ref empty", igCharterConv(), func() Config {
+			cfg := igCharterConfig(igCharterDoc, false)
+			cfg.DocumentBaseRef = func(context.Context, forge.RepoRef) (string, error) { return " ", nil }
+			return cfg
+		}, intakegroom.DegradeReasonCharterUnresolved},
+		{"scope fails", igCharterConv(), func() Config {
+			cfg := igCharterConfig(igCharterDoc, false)
+			cfg.DocumentScope = func(context.Context, forge.RepoRef) (forge.CredentialScope, error) {
+				return forge.CredentialScope{}, errors.New("no installation")
+			}
+			return cfg
+		}, intakegroom.DegradeReasonCharterUnresolved},
+		{"document missing", igCharterConv(), func() Config { return igCharterConfig("", true) }, intakegroom.DegradeReasonCharterUnresolved},
+		{"rubric unparsed", igCharterConv(), func() Config { return igCharterConfig(igCharterNoRubric, false) }, intakegroom.DegradeReasonCharterRubricUnparsed},
+		{"clean read", igCharterConv(), func() Config { return igCharterConfig(igCharterDoc, false) }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg()
+			sink := igCaptureDegrades(&cfg)
+			s := New(cfg)
+			ctx := context.Background()
+
+			_, reason, detail := s.resolveCharterDocument(ctx, tc.conv, igCharterTarget())
+			if reason != tc.want {
+				t.Fatalf("core reason = %q, want %q", reason, tc.want)
+			}
+			if (detail == "") != (tc.want == "") {
+				t.Fatalf("core detail = %q for reason %q: a degradation needs its cause, a clean read none", detail, reason)
+			}
+			if recs := sink.snapshot(); len(recs) != 0 {
+				t.Fatalf("resolveCharterDocument logged %d record(s), want none (it is the log-free core): %+v", len(recs), recs)
+			}
+
+			_, wreason := s.intakeCharter(ctx, tc.conv, igCharterTarget())
+			if wreason != tc.want {
+				t.Fatalf("wrapper reason = %q, want %q", wreason, tc.want)
+			}
+			recs := sink.snapshot()
+			if tc.want == "" {
+				if len(recs) != 0 {
+					t.Fatalf("a clean read logged %+v", recs)
+				}
+				return
+			}
+			if len(recs) != 1 {
+				t.Fatalf("wrapper logged %d record(s), want exactly 1: %+v", len(recs), recs)
+			}
+			igAssertDegradeLogged(t, sink, tc.want)
+			if recs[0].detail != detail {
+				t.Errorf("wrapper logged detail %q, want the core's %q", recs[0].detail, detail)
+			}
+		})
+	}
+}

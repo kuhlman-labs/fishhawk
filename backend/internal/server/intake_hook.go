@@ -307,11 +307,34 @@ func (s *Server) intakeCandidates(ctx context.Context, conv workmgmt.Conventions
 //
 // It returns the Charter it managed to build alongside the reason, so a caller
 // that degrades on an unparsable rubric still knows which document it read.
+//
+// It is the LOGGING wrapper over resolveCharterDocument: every degradation the
+// core reports is WARN-logged through logIntakeDegrade with the core's detail,
+// exactly as the read logged before the split, so intake behaviour is
+// unchanged. A caller that is not filing a work item (the comms scan, #4014)
+// calls the core directly and logs under its own message instead of "work item
+// filed without signals".
 func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, target workmgmt.Target) (intakegroom.Charter, intakegroom.DegradeReason) {
+	charter, reason, detail := s.resolveCharterDocument(ctx, conv, target)
+	if reason != "" {
+		s.logIntakeDegrade(ctx, target, reason, detail)
+	}
+	return charter, reason
+}
+
+// resolveCharterDocument is the LOG-FREE charter read shared by intake and the
+// comms scan: it resolves the repo's declared charter and parses its rubric ids
+// and non-goal ids from the same document content.
+//
+// It returns the Charter it managed to build, the degrade reason ("" on a
+// clean read) and a human-readable detail naming the cause, which is "" when
+// the reason is. It never logs; the caller owns the log line, because what a
+// degradation MEANS differs per caller (intake files the item anyway, the comms
+// scan refuses the prompt).
+func (s *Server) resolveCharterDocument(ctx context.Context, conv workmgmt.Conventions, target workmgmt.Target) (intakegroom.Charter, intakegroom.DegradeReason, string) {
 	if conv.Charter == nil || strings.TrimSpace(conv.Charter.Path) == "" {
-		s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonCharterUndeclared,
-			"the repo's work-management conventions declare no charter path")
-		return intakegroom.Charter{}, intakegroom.DegradeReasonCharterUndeclared
+		return intakegroom.Charter{}, intakegroom.DegradeReasonCharterUndeclared,
+			"the repo's work-management conventions declare no charter path"
 	}
 	path := strings.TrimSpace(conv.Charter.Path)
 
@@ -319,9 +342,8 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		// A deployment that never wired the forge-backed document seam. This is
 		// also the documented no-revert kill switch: unwire the seam and every
 		// filing takes this branch and files exactly as it did before #2239.
-		s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonSeamUnwired,
-			"no document resolver / base-ref resolver is configured on this deployment")
-		return intakegroom.Charter{Path: path}, intakegroom.DegradeReasonSeamUnwired
+		return intakegroom.Charter{Path: path}, intakegroom.DegradeReasonSeamUnwired,
+			"no document resolver / base-ref resolver is configured on this deployment"
 	}
 
 	repo := forge.RepoRef{Owner: target.Repo.Owner, Name: target.Repo.Name}
@@ -331,9 +353,7 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		if err != nil {
 			detail = err.Error()
 		}
-		reason := intakeCharterFailureReason(ctx, err)
-		s.logIntakeDegrade(ctx, target, reason, detail)
-		return intakegroom.Charter{Path: path}, reason
+		return intakegroom.Charter{Path: path}, intakeCharterFailureReason(ctx, err), detail
 	}
 
 	// The document read acts under the same credential scope the filing does,
@@ -342,9 +362,7 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 	if s.cfg.DocumentScope != nil {
 		resolved, serr := s.cfg.DocumentScope(ctx, repo)
 		if serr != nil {
-			reason := intakeCharterFailureReason(ctx, serr)
-			s.logIntakeDegrade(ctx, target, reason, serr.Error())
-			return intakegroom.Charter{Path: path}, reason
+			return intakegroom.Charter{Path: path}, intakeCharterFailureReason(ctx, serr), serr.Error()
 		}
 		scope = resolved
 	}
@@ -363,29 +381,29 @@ func (s *Server) intakeCharter(ctx context.Context, conv workmgmt.Conventions, t
 		if err != nil {
 			detail = err.Error()
 		}
-		reason := intakeCharterFailureReason(ctx, err)
-		s.logIntakeDegrade(ctx, target, reason, detail)
-		return intakegroom.Charter{Path: path}, reason
+		return intakegroom.Charter{Path: path}, intakeCharterFailureReason(ctx, err), detail
 	}
 
 	// Resolved is set HERE and nowhere else: this is the one path on which a
 	// charter document was actually fetched and its content parsed. Every early
 	// return above leaves it false, which is what lets the pure package tell a
-	// never-read charter from a read-but-rubric-less one.
+	// never-read charter from a read-but-rubric-less one. NonGoals is parsed
+	// from the same content, so a reader can never see a rubric and a
+	// non-goal list from two different charter revisions.
 	charter := intakegroom.Charter{
 		Path:        doc.Path,
 		ContentHash: doc.ContentHash,
 		RubricIDs:   intakegroom.ParseRubricIDs(doc.Content),
+		NonGoals:    intakegroom.ParseNonGoals(doc.Content),
 		Resolved:    true,
 	}
 	if charter.RubricIDs.Len() == 0 {
 		// The charter resolved but carries no parsable rubric ids. Scoring
 		// records the gap as a finding; it never invents an id to cite.
-		s.logIntakeDegrade(ctx, target, intakegroom.DegradeReasonCharterRubricUnparsed,
-			"no rubric line ids could be parsed from "+doc.Path)
-		return charter, intakegroom.DegradeReasonCharterRubricUnparsed
+		return charter, intakegroom.DegradeReasonCharterRubricUnparsed,
+			"no rubric line ids could be parsed from " + doc.Path
 	}
-	return charter, ""
+	return charter, "", ""
 }
 
 // intakeCharterFailureReason classifies ONE charter-seam failure into the

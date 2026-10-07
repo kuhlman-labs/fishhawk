@@ -277,3 +277,80 @@ func TestScoreFiling_UnscoredWhenNoRuleFires(t *testing.T) {
 		t.Fatalf("CharterGap = %q, want the no-rule-fired gap", got.CharterGap)
 	}
 }
+
+// TestParseNonGoals_ParsesTheShippedCharter pins the non-goal parser against
+// this repository's own §3 bullets. It FAILS rather than skips on an
+// unreadable charter: the comms scan renders exactly these ids, so a vacuous
+// pass here would hide a parser that silently empties the non-goal table.
+func TestParseNonGoals_ParsesTheShippedCharter(t *testing.T) {
+	raw, err := os.ReadFile(repoCharterPath)
+	if err != nil {
+		t.Fatalf("repository charter not readable from this checkout: %v", err)
+	}
+	n := ParseNonGoals(string(raw))
+
+	want := []string{"N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8"}
+	if got := n.IDs(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("IDs = %v, want the shipped §3 non-goals in charter order %v", got, want)
+	}
+	if got := n.Quote("N3"); got != "Fishhawk is not a CI/CD platform." {
+		t.Errorf("Quote(N3) = %q, want the bolded statement only", got)
+	}
+	// The shipped rubric table rows are not non-goals.
+	for _, id := range []string{"V1", "S4", "U4"} {
+		if n.Has(id) {
+			t.Errorf("rubric id %s parsed as a non-goal", id)
+		}
+	}
+}
+
+// TestParseNonGoals_ProseAndRubricRowsDoNotParse: only the bullet shape
+// parses. Running prose naming an N-id, an inline bold span opening with an
+// N-id, a rubric-table row carrying an N-id, an unbolded bullet, and ids not
+// of the N-then-digits shape are all refused.
+func TestParseNonGoals_ProseAndRubricRowsDoNotParse(t *testing.T) {
+	doc := strings.Join([]string{
+		"# Charter",
+		"This is about the customer's work; it is not N2 drift.",
+		"Prose citing **N9 — an inline bold span** is not a bullet.",
+		"| **N10** | a rubric row with an N id |",
+		"- N11 — an unbolded bullet",
+		"- **V1 — a rubric-shaped id in a bullet**",
+		"- **N1a — a suffixed id**",
+		"- **n12 — a lowercase id**",
+		"- **N13 a statement with no dash separator**",
+		"- **N14 — the one real bullet.** Trailing **bold** prose.",
+	}, "\n")
+	n := ParseNonGoals(doc)
+	if got := n.IDs(); len(got) != 1 || got[0] != "N14" {
+		t.Fatalf("IDs = %v, want only [N14]", got)
+	}
+	if n.Quote("N14") != "the one real bullet." {
+		t.Errorf("Quote(N14) = %q, want the bolded statement without the trailing prose", n.Quote("N14"))
+	}
+}
+
+func TestParseNonGoals_AcceptsEachDashSeparator(t *testing.T) {
+	n := ParseNonGoals("- **N1 — em dash.**\n- **N2 – en dash.**\n- **N3 - hyphen.**\n")
+	if got := n.IDs(); strings.Join(got, ",") != "N1,N2,N3" {
+		t.Fatalf("IDs = %v, want [N1 N2 N3]", got)
+	}
+}
+
+func TestParseNonGoals_KeepsCharterOrderAndFirstDefinition(t *testing.T) {
+	n := ParseNonGoals("- **N4 — first n4.**\n- **N2 — n2.**\n- **N4 — a later duplicate.**\n")
+	if got := n.IDs(); strings.Join(got, ",") != "N4,N2" {
+		t.Fatalf("IDs = %v, want charter order [N4 N2]", got)
+	}
+	if n.Quote("N4") != "first n4." {
+		t.Fatalf("Quote(N4) = %q, want the first definition", n.Quote("N4"))
+	}
+}
+
+func TestParseNonGoals_NoBulletYieldsTheSafeZeroValue(t *testing.T) {
+	for _, n := range []NonGoals{ParseNonGoals("# Charter\n\nProse only. N3 matters.\n"), {}} {
+		if n.Len() != 0 || n.Has("N3") || n.Quote("N3") != "" || len(n.IDs()) != 0 {
+			t.Fatalf("want an empty NonGoals, got %v", n.IDs())
+		}
+	}
+}

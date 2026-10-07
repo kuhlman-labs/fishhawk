@@ -48,23 +48,88 @@ func (r Rubric) Quote(id string) string { return r.lines[id] }
 // never recycle them"), so an id this code knows about but the charter does
 // not declare is an id that must not be cited.
 func ParseRubricIDs(charterMarkdown string) Rubric {
-	r := Rubric{lines: make(map[string]string)}
+	ids, lines := parseCharterLines(charterMarkdown, rubricRow)
+	if len(ids) == 0 {
+		return Rubric{}
+	}
+	return Rubric{ids: ids, lines: lines}
+}
+
+// nonGoalBullet matches a charter §3 non-goal bullet: a list dash, then a bold
+// span that OPENS with an N-id, a dash separator (em dash, en dash or hyphen,
+// spaced) and the statement. That is the shipped shape
+// ("- **N3 — Fishhawk is not a CI/CD platform.** It runs on ..."). The id
+// capture is anchored to N then digits, and the bullet + bold anchor is what
+// keeps running prose that mentions "N3", and a rubric table row, from being
+// read as a non-goal.
+var nonGoalBullet = regexp.MustCompile(`^\s*-\s+\*\*(N[0-9]+)\s+[—–-]\s+(.+?)\*\*`)
+
+// NonGoals is the set of non-goal ids parsed from the charter's §3 bullets,
+// each mapped to its bolded statement for quoting. The zero NonGoals is empty
+// and safe: Has reports false for every id.
+//
+// Intake scoring does not read it. It exists for the comms scan (#4014),
+// which renders the non-goals so an n_drift entry can cite the id it drifts
+// toward — and, like the rubric, may cite only an id the charter declares.
+type NonGoals struct {
+	ids   []string
+	lines map[string]string
+}
+
+// Len returns how many non-goals were parsed.
+func (n NonGoals) Len() int { return len(n.ids) }
+
+// IDs returns the parsed ids in charter order.
+func (n NonGoals) IDs() []string {
+	out := make([]string, len(n.ids))
+	copy(out, n.ids)
+	return out
+}
+
+// Has reports whether id is declared as a non-goal in the charter.
+func (n NonGoals) Has(id string) bool {
+	_, ok := n.lines[id]
+	return ok
+}
+
+// Quote returns the charter's bolded statement for id, or "" when it is not
+// declared.
+func (n NonGoals) Quote(id string) string { return n.lines[id] }
+
+// ParseNonGoals extracts the non-goal bullets from a charter document.
+//
+// It matches the bullet shape anywhere in the document (the section heading
+// is not part of the contract, so renumbering §3 does not silently empty
+// it), keeps charter order, and lets the FIRST definition of an id win. A
+// document with no matching bullet returns the zero NonGoals; it never
+// guesses an id the charter does not declare.
+func ParseNonGoals(charterMarkdown string) NonGoals {
+	ids, lines := parseCharterLines(charterMarkdown, nonGoalBullet)
+	if len(ids) == 0 {
+		return NonGoals{}
+	}
+	return NonGoals{ids: ids, lines: lines}
+}
+
+// parseCharterLines is the one line-matching loop both charter parsers share:
+// re's first group is the id and its second the quoted text. It keeps charter
+// order and the first definition of a duplicated id.
+func parseCharterLines(charterMarkdown string, re *regexp.Regexp) ([]string, map[string]string) {
+	var ids []string
+	lines := make(map[string]string)
 	for _, line := range strings.Split(charterMarkdown, "\n") {
-		m := rubricRow.FindStringSubmatch(line)
+		m := re.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
 		id, text := m[1], strings.TrimSpace(m[2])
-		if _, dup := r.lines[id]; dup {
+		if _, dup := lines[id]; dup {
 			continue
 		}
-		r.ids = append(r.ids, id)
-		r.lines[id] = text
+		ids = append(ids, id)
+		lines[id] = text
 	}
-	if len(r.ids) == 0 {
-		return Rubric{}
-	}
-	return r
+	return ids, lines
 }
 
 // The fixed per-rule weights. They are advisory-only (charter §5.1 says to
