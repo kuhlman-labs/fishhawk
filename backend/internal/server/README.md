@@ -6083,6 +6083,71 @@ corpus-rejected shape while the test stayed green; the `top-level-unknown-field`
 row is the one that detects exactly that drift (deleting the handler's top-level
 `DisallowUnknownFields` admits it `201`).
 
+### Deployed-target identity: the post-deploy release arm (E35.2 / #1599)
+
+A post-deploy acceptance stage (one whose spec stage declares a `deployment`
+input, ADR-053) validates the DEPLOYED build, not a PR candidate — and a release
+run writes no reported-head ledger entry at all, so without a separate source
+its expectation resolved `""` (refused pre-spawn) and every passed verdict
+clamped to `undecidable`/`head_unresolved`. `acceptance_deployed_identity.go::resolvePostDeployExpectedSHA`
+is that source. It returns `(sha, applies)`:
+
+- **`applies=false` only when the stage is POSITIVELY KNOWN not to consume a
+  deployment** — nil `RunRepo`, `GetRun` answering `run.ErrNotFound`, no
+  workflow-spec snapshot on the run, a workflow declaring no `deployment` input
+  on any stage (decided from the spec alone, so a stage-read blip cannot move a
+  feature_change run off its reported head), or a mapped spec stage declaring
+  none. These are facts, never absences of knowledge (the split
+  `resolveRunWorkflowDef` draws). Only then do callers take the reported-head
+  path, byte-identical to before.
+- **`applies=true` on every other leg**, with `sha==""` wherever no deployed SHA
+  can be produced — INCLUDING the legs where applicability itself cannot be
+  determined: any other `GetRun` error, a `ListStagesForRun` error, an
+  unparseable spec, a workflow absent from it, a stage absent from the run's
+  rows, a stage with no spec counterpart at its type ordinal (operator approval
+  condition 2 on #1599: an undeterminable identity never falls back to the
+  reported head). Every such leg WARNs with a stable `reason`.
+
+Derivation, once applicable: more than one `deployment` input → `""`
+(ambiguous target). The input's `from_stage` maps to its run row by
+`runStageForSpecStage`, the INVERSE type-ordinal of `specStageForRunStage` (the
+k-th spec stage of a type is the k-th row of that type, rows sorted by Sequence
+then ID — the rule that survives a plan-filtered child's renumbering). Then
+`deployedSHAFromArtifacts` over that row's deployment artifacts
+(`ListForStage`, `created_at` ascending): the NEWEST must decode as `succeeded`
+(a later `rolled_back`/`failed`/`partial` means the host no longer serves the
+older build); each succeeded record contributes `sha` if it is a full 40- or
+64-hex commit SHA (`isDeployCommitSHA`), else `ref` if it is one, lowercased; zero
+contributions → `""` (symbolic `main`, or an abbreviated SHA — the runner's probe
+prefix-matches the target's `git_sha` against the expectation, so it needs the
+full SHA); more than one DISTINCT SHA → `""`. The disagreement rule, not a
+timestamp bound, is what stops a different succeeded record posted after
+dispatch from re-binding a verdict (no cross-clock comparison, #3048).
+
+Three call sites, one answer:
+
+- `resolveAcceptanceExpectedHeadSHA` (both prompt handlers): arm first; when it
+  applies its value is returned verbatim, `""` included.
+- `resolveAcceptanceExpectedHeadSHAWalkingParents` (acceptance admission):
+  short-circuits on the arm BEFORE the `ParentRunID` walk — an ancestor's
+  reported head names a PR candidate, never the deployed build.
+- `acceptanceValidatedHeadSHA` (the verdict binding): the arm runs AFTER the
+  dispatch-anchor check and the episode-restart staleness guard (order is
+  load-bearing — an anchorless or stale-anchored ship still clamps), and a
+  resolved deployed SHA binds a passed verdict to it.
+
+Pinned by `acceptance_deployed_identity_test.go` (per-leg table, the caller
+tables with a decoy reported head seeded by construction, the walk
+short-circuit, the validated-head ordering, and
+`TestShipAcceptance_PostDeploy_PassBindsDeployedSHA` through the real ship
+handler), `TestGetStagePrompt_PostDeployAcceptance_ServesDeployedSHA` /
+`TestGetStagePrompt_Acceptance_FeatureChangeSpec_KeepsReportedHead`, and the
+Postgres seam in `release_acceptance_integration_test.go` (reconciler
+`head_sha` → stored artifact `sha` → served expectation → verdict binding, plus
+the symbolic-ref fail-closed leg). The wire field is unchanged: the runner
+decodes it on `FetchedPrompt.AcceptanceExpectedHeadSHA` under the existing
+`prompt_response` pair in `backend/internal/wirecontract`'s `SeedManifest`.
+
 ### Invariants
 
 - **`acceptance_criteria_ids` stays a SUPERSET.** The ids served on the

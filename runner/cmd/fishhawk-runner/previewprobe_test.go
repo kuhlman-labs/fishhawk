@@ -642,3 +642,71 @@ func TestPreviewGateConfigFromEnv(t *testing.T) {
 		t.Errorf("readyTimeout = %s, want default on unparsable value", gcfg.readyTimeout)
 	}
 }
+
+// --- release-shaped (post-deploy) identity gate (E35.2 / #1599) --------------
+//
+// A post-deploy acceptance stage's expectation is the DEPLOYED build's full
+// commit SHA (the backend's release arm), and its target is a FIXED deployed
+// host (no provision command). These pin the UNCHANGED gate's outcomes for that
+// shape; the runner adds no code for it.
+
+// releaseDeployedSHA is a full 40-hex deployed SHA — the backend's release arm
+// only ever emits a full SHA, because verification prefix-matches the target's
+// reported git_sha against it.
+const releaseDeployedSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+func releaseGate(t *testing.T, body string) (string, string, string) {
+	t.Helper()
+	ts, _ := healthzServer(t, 200, body)
+	var log strings.Builder
+	teardown, reason, detail := acceptanceTargetGate(context.Background(), fastGateConfig(), []string{hostOf(ts)}, releaseDeployedSHA, "run-release", &log)
+	if teardown != nil {
+		t.Error("a fixed deployed target declares no teardown; none must be returned")
+	}
+	return reason, detail, log.String()
+}
+
+// A deployed host serving a DIFFERENT build → acceptance_target_stale, with
+// expected-vs-got in the detail.
+func TestAcceptanceTargetGate_Release_DeployedTargetStale(t *testing.T) {
+	reason, detail, _ := releaseGate(t, `{"git_sha":"9999999999aa"}`)
+	if reason != acceptanceReasonTargetStale {
+		t.Fatalf("reason = %q (%s), want %q", reason, detail, acceptanceReasonTargetStale)
+	}
+	if !strings.Contains(detail, releaseDeployedSHA) || !strings.Contains(detail, "9999999999aa") {
+		t.Errorf("detail %q must carry the deployed sha vs the served git_sha", detail)
+	}
+}
+
+// A deployed host serving the deployed SHA's 12-char prefix → verified, proceed.
+func TestAcceptanceTargetGate_Release_DeployedTargetVerified(t *testing.T) {
+	reason, detail, log := releaseGate(t, `{"git_sha":"`+releaseDeployedSHA[:12]+`"}`)
+	if reason != "" {
+		t.Fatalf("reason = %q (%s), want proceed", reason, detail)
+	}
+	if !strings.Contains(log, `"event":"acceptance_target_verified"`) {
+		t.Errorf("missing acceptance_target_verified: %s", log)
+	}
+}
+
+// A non-fishhawkd deploy target whose /healthz carries no git_sha →
+// unverifiable: warn and proceed (the documented posture for identifier-less
+// deploy targets).
+func TestAcceptanceTargetGate_Release_IdentifierlessTargetUnverifiable(t *testing.T) {
+	reason, detail, log := releaseGate(t, `{"status":"ok"}`)
+	if reason != "" {
+		t.Fatalf("reason = %q (%s), want warn-and-proceed", reason, detail)
+	}
+	if !strings.Contains(log, `"event":"acceptance_target_unverified"`) {
+		t.Errorf("missing acceptance_target_unverified warn: %s", log)
+	}
+}
+
+// A deployed host serving a DIRTY build of the deployed SHA is not that build
+// → stale.
+func TestAcceptanceTargetGate_Release_DirtyDeployedTargetStale(t *testing.T) {
+	reason, detail, _ := releaseGate(t, `{"git_sha":"`+releaseDeployedSHA[:7]+`-dirty"}`)
+	if reason != acceptanceReasonTargetStale {
+		t.Fatalf("reason = %q (%s), want %q", reason, detail, acceptanceReasonTargetStale)
+	}
+}

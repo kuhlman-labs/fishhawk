@@ -1387,10 +1387,14 @@ Notes:
   @-mention render surface is genuinely uninvolved: these are fixed
   system-actor verb phrases that never `@`-mention an approver). The ship
   handler (`server/deployment.go::handleShipDeployment`,
-  `POST /v0/runs/{run_id}/deployment`) is the SOLE writer of
+  `POST /v0/runs/{run_id}/deployment`) writes
   `deployment_outcome_recorded` (payload `{run_id, stage_id, artifact_id,
-  content_hash, environment, ref, external_run_url, outcome, rollback_handle,
-  auth_method}`, written on every persisted `deployment` artifact) and — when
+  content_hash, environment, ref, sha, external_run_url, outcome,
+  rollback_handle, auth_method}`, written on every persisted `deployment`
+  artifact; `sha` is the deployed commit, `""` when the body carries none,
+  E35.2 / #1599; the deploy reconciler's `ResolveDeploymentFromPollState`
+  writes the same entry with `sha` from the polled run's `head_sha`,
+  `auth_method: reconciler` and no `rollback_handle`) and — when
   the body carries a `rollback_action` — the matching
   `deployment_rollback_initiated` / `deployment_rollback_completed` entry
   (payload `{run_id, stage_id, artifact_id, environment, rollback_handle,

@@ -9471,6 +9471,49 @@ func TestGetStagePrompt_Acceptance_ServesExpectedHeadSHA(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_PostDeployAcceptance_ServesDeployedSHA pins the release
+// arm on the wire (E35.2 / #1599): a planless release run whose acceptance
+// stage consumes the deploy stage's deployment artifact is served the DEPLOYED
+// commit SHA (the artifact's `sha`; its `ref` is the symbolic dispatch ref
+// "main") as acceptance_expected_head_sha — never the decoy reported head the
+// run's chain also carries (counterfactual C1).
+func TestGetStagePrompt_PostDeployAcceptance_ServesDeployedSHA(t *testing.T) {
+	f := newDeployedIdentityFixture(t)
+	sf := newSigningFake()
+	f.s.cfg.SigningRepo = sf
+	f.addDeployment(t, f.deploy.ID, deployment("succeeded", "main", deployedSHAX))
+	priv, _ := sf.issue(t, f.runRow.ID)
+
+	w := promptRequest(t, f.s, f.runRow.ID, f.acceptance.ID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if want := `"acceptance_expected_head_sha":"` + deployedSHAX + `"`; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("response missing %s (decoy reported head is %s):\n%s", want, decoyReportedSHA, w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_Acceptance_FeatureChangeSpec_KeepsReportedHead is the
+// feature_change regression pin for the release arm (counterfactual C11): an
+// acceptance stage whose workflow declares NO deployment input is still served
+// the newest reported head, byte-identically.
+func TestGetStagePrompt_Acceptance_FeatureChangeSpec_KeepsReportedHead(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	rr.getRuns[runID].WorkflowSpec = []byte(featureChangeAcceptanceSpec)
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded,
+		makeReportedHeadEntry(runID, acceptanceStageID, "pull_request_opened",
+			"bbbb111111111111111111111111111111111111", time.Now().Add(-time.Hour)))
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if want := `"acceptance_expected_head_sha":"bbbb111111111111111111111111111111111111"`; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("feature_change acceptance must keep the reported head; response missing %s:\n%s", want, w.Body.String())
+	}
+}
+
 // TestGetStagePrompt_Acceptance_EmptyLedger_ExpectedHeadSHAOmitted pins the
 // WARN-and-omit posture: an acceptance stage on a run with NO reported-head
 // ledger entries (and no consolidated fan-in record) omits
