@@ -1,0 +1,127 @@
+{
+  "issue_title": "Add a GET /widgets endpoint listing the caller's widgets",
+  "issue_body": "Operators need to list the widgets that belong to their tenant.\n\nAdd `GET /widgets` returning a JSON object `{\"items\": [...]}` where each item carries `id`, `name` and `created_at`. Only widgets owned by the authenticated tenant may be returned; a request without a valid bearer token returns 401.\n\nDone means: the endpoint exists, is tenant-scoped, and is documented in api/openapi.yaml.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/101",
+      "id": "example-org/widgets-service#101"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Add a tenant-scoped GET /widgets list endpoint and document it in the OpenAPI spec.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a ListWidgetsByTenant query to internal/store/widgets.go that filters on tenant_id."
+      },
+      {
+        "step": 2,
+        "description": "Add the GET /widgets handler in internal/api/widgets.go: resolve the tenant from the bearer token, call ListWidgetsByTenant, and render {\"items\": [...]}."
+      },
+      {
+        "step": 3,
+        "description": "Cap the response at 100 items per page with a next_cursor field, matching the sibling list endpoints."
+      },
+      {
+        "step": 4,
+        "description": "Document GET /widgets and its 401 response in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests in internal/api/widgets_test.go against the in-memory store: a tenant sees only its own widgets, an unauthenticated request returns 401, and the response shape carries id/name/created_at. A store test asserts the tenant filter.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-list-tenant-scoped",
+          "statement": "GET /widgets as tenant A returns only widgets owned by tenant A, never a widget owned by tenant B.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#101"
+        },
+        {
+          "id": "ac-list-requires-auth",
+          "statement": "GET /widgets without a valid bearer token returns HTTP 401.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#101"
+        },
+        {
+          "id": "ac-list-pagination",
+          "statement": "GET /widgets paginates at 100 items",
+          "source": "inferred",
+          "rationale": "Inferred from the sibling list endpoints; the issue text never states a page size."
+        },
+        {
+          "id": "ac-list-documented",
+          "statement": "api/openapi.yaml declares GET /widgets with its 200 and 401 responses.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#101"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The sibling list endpoints paginate at 100 items, so this one should too."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "ac-list-pagination",
+    "page size",
+    "pagination",
+    "paginate",
+    "100 items"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "Inferred criterion ac-list-pagination is not warranted: the issue never asks for a page size, so the 100-item cap is invented."
+    },
+    {
+      "severity": "medium",
+      "category": "warrant",
+      "note": "The plan invents pagination the issue does not request; the paginate-at-100 criterion should be dropped or sourced."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "The OpenAPI step should also describe the created_at timestamp format."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "No test asserts the empty-list response for a tenant with zero widgets."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "The rollback plan does not mention clients that start depending on the new endpoint."
+    }
+  ]
+}

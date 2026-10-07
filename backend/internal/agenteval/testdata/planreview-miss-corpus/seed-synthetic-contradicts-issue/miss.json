@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000002250",
+  "artifact_id": "00000000-0000-0000-0001-000000002250",
+  "triage_sequence": 105,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed explicit criterion contradicts the issue text it cites (bad criterion)",
+  "decided_at": "2026-10-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-delete-hard",
+      "statement": "DELETE /widgets/{id} removes the widget row from the database.",
+      "source": "explicit",
+      "source_ref": "example-org/widgets-service#106",
+      "observed": "DELETE /widgets/{id} set deleted_at and kept the row, as the issue requires; the criterion failed",
+      "expected": "the row absent from the widgets table",
+      "steps_taken": "DELETE /widgets/w1, then SELECT count(*) FROM widgets WHERE id = 'w1'",
+      "expectation_basis": "criterion ac-delete-hard",
+      "repro_handle": "psql -c \"SELECT count(*) FROM widgets WHERE id = 'w1'\"",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

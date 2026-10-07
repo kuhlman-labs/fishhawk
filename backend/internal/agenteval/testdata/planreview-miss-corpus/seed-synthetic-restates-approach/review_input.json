@@ -1,0 +1,117 @@
+{
+  "issue_title": "Expose archived_at in the widget API response",
+  "issue_body": "The archive endpoint sets `archived_at`, but `GET /widgets/{id}` does not return it, so clients cannot tell an archived widget from an active one.\n\nInclude `archived_at` (RFC 3339, or null when not archived) in every widget response.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/104",
+      "id": "example-org/widgets-service#104"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-01T09:00:00Z"
+    },
+    "summary": "Include archived_at in the widget API response.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Select archived_at in the widget store queries."
+      },
+      {
+        "step": 2,
+        "description": "Add the ArchivedAt field (*time.Time, json:\"archived_at\") to the widgetResponse struct in internal/api/widgets.go."
+      },
+      {
+        "step": 3,
+        "description": "Populate ArchivedAt in toWidgetResponse."
+      },
+      {
+        "step": 4,
+        "description": "Add archived_at (nullable date-time) to the Widget schema in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests: an archived widget's GET /widgets/{id} body carries a non-null RFC 3339 archived_at; an active widget's carries null.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-step-two-done",
+          "statement": "The code in approach step 2 was written: widgetResponse has an ArchivedAt field.",
+          "source": "inferred",
+          "rationale": "Step 2 is the load-bearing change, so the criterion checks it was done."
+        },
+        {
+          "id": "ac-active-null",
+          "statement": "GET /widgets/{id} for an active widget returns archived_at: null.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#104"
+        },
+        {
+          "id": "ac-openapi-archived-at",
+          "statement": "api/openapi.yaml's Widget schema declares archived_at as a nullable date-time.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#104"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "All widget responses go through toWidgetResponse, so one change covers every endpoint."
+    ],
+    "predicted_runtime_minutes": 25,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "ac-step-two-done",
+    "restat",
+    "approach step",
+    "observable outcome",
+    "not an outcome"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-step-two-done restates approach step 2 instead of an observable outcome; it would pass even if the handler never populates the field."
+    },
+    {
+      "severity": "medium",
+      "category": "independence",
+      "note": "One criterion only checks that the step-2 code was written; it should assert the observable outcome the issue asks for."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "The OpenAPI change should give an example value for the new timestamp field."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "No criterion verifies an ARCHIVED widget's response carries a non-null timestamp."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "Selecting the extra column in every query slightly widens the row scan; negligible."
+    }
+  ]
+}
