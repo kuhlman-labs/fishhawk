@@ -179,6 +179,18 @@ const (
 	// backend/cmd/fishhawk-mcp/next_actions.go (const) — the three copies are
 	// pinned byte-for-byte by a per-package assertion.
 	acceptanceDispositionUnvalidatable = "externally_unvalidatable_paged"
+	// acceptanceDispositionRollbackOffered is the paged, operator-gated
+	// disposition for a failed POST-DEPLOY verdict (E35.3 / #1600, ADR-053):
+	// a class-1 or class-4 failure on an acceptance stage sequenced behind a
+	// deploy stage, on a run with no implement stage to fix up, records a
+	// rollback OFFER naming the deploy and its stored rollback_handle. It takes
+	// no state transition and NEVER dispatches the rollback — the operator
+	// fires it via POST /v0/runs/{run_id}/deployment/rollback or arbitrates to
+	// keep the deploy. Re-declared verbatim in
+	// backend/internal/issuecomment/ping.go (string literal) and
+	// backend/internal/mcpserver/next_actions.go (const); each copy is pinned
+	// byte-for-byte by a per-package assertion.
+	acceptanceDispositionRollbackOffered = "rollback_offered"
 )
 
 // defaultMaxAcceptanceReruns bounds the number of auto-routed acceptance
@@ -2833,7 +2845,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 			slog.String("error", err.Error()))
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionPaged, criterionIDs, acc.FailureMode, prior,
-			"triage route count failed; paging without action", misses)
+			"triage route count failed; paging without action", misses, nil)
 		return acceptanceDispositionPaged
 	}
 
@@ -2843,8 +2855,23 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	if stage.State != run.StageStateSucceeded {
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionUnsettled, criterionIDs, acc.FailureMode, prior,
-			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State), misses)
+			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State), misses, nil)
 		return acceptanceDispositionUnsettled
+	}
+
+	// Post-deploy rollback offer (E35.3 / #1600): a class-1 / class-4 failure
+	// on an acceptance stage verifying an earlier deploy, on a run with no
+	// implement stage, records rollback_offered (or degrades to paged on a
+	// multi-deploy run, #2642). Placed AFTER the unsettled check (an unsettled
+	// stage still records unsettled_paged) and BEFORE the re-run budget: the
+	// offer is not an auto-route, so the budget must not suppress it. It never
+	// dispatches and never transitions; an unhandled shape (no earlier deploy,
+	// an implement stage present, a stage-list error) falls through to the
+	// existing routing unchanged.
+	if offer, disposition, offerReason, handled := s.decidePostDeployRollback(ctx, runID, stage, class); handled {
+		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
+			disposition, criterionIDs, acc.FailureMode, prior, offerReason, misses, offer)
+		return disposition
 	}
 
 	// Re-run bound: at the cap keep the classified class but degrade to a paged
@@ -2852,7 +2879,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	if prior >= defaultMaxAcceptanceReruns {
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionRerunBudget, criterionIDs, acc.FailureMode, prior,
-			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns), misses)
+			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns), misses, nil)
 		return acceptanceDispositionRerunBudget
 	}
 
@@ -2875,7 +2902,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	}
 
 	s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
-		disposition, criterionIDs, acc.FailureMode, prior, reason, misses)
+		disposition, criterionIDs, acc.FailureMode, prior, reason, misses, nil)
 	return disposition
 }
 
@@ -2890,7 +2917,8 @@ func acceptanceDispositionPages(disposition string) bool {
 	switch disposition {
 	case acceptanceDispositionPaged, acceptanceDispositionRerunBudget,
 		acceptanceDispositionFixupUnavailable, acceptanceDispositionRetryUnavailable,
-		acceptanceDispositionUnsettled, acceptanceDispositionUnvalidatable:
+		acceptanceDispositionUnsettled, acceptanceDispositionUnvalidatable,
+		acceptanceDispositionRollbackOffered:
 		return true
 	default:
 		return false
@@ -3192,8 +3220,11 @@ func acceptanceTriageDispositionOf(payload []byte) string {
 // record — additive: emitted as the plan_review_miss payload field only when
 // non-empty (class 3), omitted entirely otherwise, so existing consumers
 // (issuecomment decodeAcceptanceActivity, acceptanceTriageDispositionOf)
-// that decode named fields are untouched.
-func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string, misses []agenteval.PlanReviewMiss) {
+// that decode named fields are untouched. offer is the E35.3 / #1600
+// post-deploy rollback offer — additive the same way: emitted as the
+// rollback_offer payload object only when non-nil (a rollback_offered
+// disposition), so every other disposition's payload is byte-identical.
+func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string, misses []agenteval.PlanReviewMiss, offer *acceptanceRollbackOffer) {
 	if criterionIDs == nil {
 		criterionIDs = []string{}
 	}
@@ -3211,6 +3242,9 @@ func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID 
 	}
 	if len(misses) > 0 {
 		fields["plan_review_miss"] = misses
+	}
+	if offer != nil {
+		fields["rollback_offer"] = offer
 	}
 	payload, _ := json.Marshal(fields)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

@@ -489,6 +489,7 @@ func TestPageClassEvents_AcceptanceTriage(t *testing.T) {
 		"paged", "rerun_budget_exhausted",
 		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged",
 		"externally_unvalidatable_paged", // #1671 class-5 terminal page
+		"rollback_offered",               // E35.3 / #1600 post-deploy rollback offer
 	}
 	for _, disp := range pagedDispositions {
 		entries := []*audit.Entry{acceptanceTriageEntry(9, "3", disp)}
@@ -533,6 +534,45 @@ func TestAcceptanceTriageNeedsHuman_Class5(t *testing.T) {
 	}
 	if class != "5" || got != disposition {
 		t.Errorf("class/disposition = %q/%q, want 5/%q", class, got, disposition)
+	}
+}
+
+// TestAcceptanceTriageNeedsHuman_RollbackOffered pins the E35.3 / #1600
+// post-deploy rollback offer: a rollback_offered payload needs a human
+// (ok=true), the exact literal is asserted per-package so a value drift from
+// the server's acceptanceDispositionRollbackOffered const is test-caught here,
+// and the rendered ping names only the class and disposition — the
+// pipeline-supplied rollback_handle carried in the payload's rollback_offer
+// object never reaches the issue thread.
+func TestAcceptanceTriageNeedsHuman_RollbackOffered(t *testing.T) {
+	const disposition = "rollback_offered"
+	const handle = "rev-abc-<script>"
+	payload, _ := json.Marshal(map[string]any{
+		"class":       "1",
+		"disposition": disposition,
+		"rollback_offer": map[string]any{
+			"deploy_stage_id":        "11111111-1111-1111-1111-111111111111",
+			"deployment_artifact_id": "22222222-2222-2222-2222-222222222222",
+			"rollback_handle":        handle,
+		},
+	})
+	class, got, ok := acceptanceTriageNeedsHuman(payload)
+	if !ok {
+		t.Fatalf("acceptanceTriageNeedsHuman ok = false, want true for %q", disposition)
+	}
+	if class != "1" || got != disposition {
+		t.Errorf("class/disposition = %q/%q, want 1/%q", class, got, disposition)
+	}
+
+	events := pageClassEvents([]*audit.Entry{{Sequence: 11, Category: "acceptance_triage_decided", Payload: payload}}, nil)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1 page for %q", len(events), disposition)
+	}
+	if !strings.Contains(events[0].message, disposition) {
+		t.Errorf("ping %q does not name %q", events[0].message, disposition)
+	}
+	if strings.Contains(events[0].message, handle) || strings.Contains(events[0].message, "rev-abc") {
+		t.Errorf("ping %q renders the pipeline-supplied rollback_handle; it must name only class + disposition", events[0].message)
 	}
 }
 
