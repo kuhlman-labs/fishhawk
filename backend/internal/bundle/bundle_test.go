@@ -1992,10 +1992,10 @@ func gateEvidenceBundle(t *testing.T, payload string) []byte {
 // would lose bytes on the round trip).
 func TestExtractGateEvidence_GateIsolationSharedGolden(t *testing.T) {
 	golden := sharedGateIsolationGolden(t)
-	want := map[string]struct{ path, unavailable string }{
-		"fallback":  {"clone", "no gate image configured (FISHHAWK_GATE_IMAGE is empty)"},
-		"refused":   {"refused", "docker is not a safe runtime"},
-		"container": {"container", ""},
+	want := map[string]struct{ path, unavailable, credentials string }{
+		"fallback":  {"clone", "no gate image configured (FISHHAWK_GATE_IMAGE is empty)", ""},
+		"refused":   {"refused", "docker is not a safe runtime", ""},
+		"container": {"container", "", "anonymous"},
 	}
 	for class, w := range want {
 		t.Run(class, func(t *testing.T) {
@@ -2017,6 +2017,9 @@ func TestExtractGateEvidence_GateIsolationSharedGolden(t *testing.T) {
 			if w.unavailable == "" && gi.ContainerUnavailable != "" || !strings.Contains(gi.ContainerUnavailable, w.unavailable) {
 				t.Errorf("container_unavailable = %q, want %q", gi.ContainerUnavailable, w.unavailable)
 			}
+			if gi.Credentials != w.credentials {
+				t.Errorf("credentials = %q, want %q (E51.26 / #4046: only the container path carries a posture)", gi.Credentials, w.credentials)
+			}
 			re, err := json.Marshal(gi)
 			if err != nil {
 				t.Fatal(err)
@@ -2031,18 +2034,20 @@ func TestExtractGateEvidence_GateIsolationSharedGolden(t *testing.T) {
 // TestExtractGateEvidence_GateIsolationDeclaredSharedGolden extends the #2135
 // backend half to the E51.3 / #2136 gate_container members: each decodes with
 // the image source, the final deciding gate's image identity and the
-// unhonoured marker the runner wrote, and re-encodes to the SAME bytes — a new
-// field missing from GateIsolationEvidence loses bytes on the round trip.
+// unhonoured marker the runner wrote, plus the E51.26 / #4046 credential
+// posture, and re-encodes to the SAME bytes — a new field missing from
+// GateIsolationEvidence loses bytes on the round trip.
 func TestExtractGateEvidence_GateIsolationDeclaredSharedGolden(t *testing.T) {
 	golden := sharedGateIsolationGolden(t)
 	type want struct {
-		class, source, digest, imageID, ctxDigest, dockerfile, buildCtx, warning, unhonored string
-		distinct                                                                            int
+		class, source, digest, imageID, ctxDigest, dockerfile, buildCtx, warning, unhonored, credentials string
+		distinct                                                                                         int
 	}
 	cases := map[string]want{
-		"container_declared": {class: "container", source: "stage", digest: "sha256:9b2e6d1c", imageID: "sha256:3c1f8a6e", warning: "is not digest-pinned"},
+		"container_declared": {class: "container", source: "stage", digest: "sha256:9b2e6d1c", imageID: "sha256:3c1f8a6e", warning: "is not digest-pinned",
+			credentials: "operator_config"},
 		"container_build": {class: "container", source: "workflow", imageID: "sha256:3c1f8a6e", ctxDigest: "sha256:e7a4c1f9",
-			dockerfile: "build/gate/Dockerfile", buildCtx: "build/gate", distinct: 2},
+			dockerfile: "build/gate/Dockerfile", buildCtx: "build/gate", distinct: 2, credentials: "anonymous"},
 		"fallback_declared_unhonored": {class: "fallback", source: "stage", unhonored: "gate_container declared (stage) but not honoured"},
 	}
 	prefix := func(got, want string) bool { return (want == "") == (got == "") && strings.HasPrefix(got, want) }
@@ -2064,7 +2069,8 @@ func TestExtractGateEvidence_GateIsolationDeclaredSharedGolden(t *testing.T) {
 				!prefix(gi.ImageDigest, w.digest) || !prefix(gi.ImageID, w.imageID) || !prefix(gi.BuildContextDigest, w.ctxDigest) ||
 				gi.BuildDockerfile != w.dockerfile || gi.BuildContext != w.buildCtx ||
 				!strings.Contains(gi.PolicyWarning, w.warning) || (w.warning == "") != (gi.PolicyWarning == "") ||
-				!strings.Contains(gi.DeclaredUnhonored, w.unhonored) || (w.unhonored == "") != (gi.DeclaredUnhonored == "") {
+				!strings.Contains(gi.DeclaredUnhonored, w.unhonored) || (w.unhonored == "") != (gi.DeclaredUnhonored == "") ||
+				gi.Credentials != w.credentials {
 				t.Errorf("decoded = %+v, want %+v", *gi, w)
 			}
 			re, err := json.Marshal(gi)

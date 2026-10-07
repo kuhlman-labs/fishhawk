@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
@@ -887,7 +890,10 @@ const (
 // ran on the host fallback (E51.3 / #2136). Each is produced by the real
 // gateiso.Select (and, for the warning, the real EvaluateImagePolicy), so the
 // golden tracks their text; the runner fills ResolvedImage and
-// DistinctImagesCount after resolution, exactly as recordedSelection does.
+// DistinctImagesCount after resolution, exactly as recordedSelection does, and
+// stamps Credentials on every container-path selection (E51.26 / #4046) — the
+// three container members carry both postures, the three non-container ones
+// none.
 func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 	const image = "ghcr.io/kuhlman-labs/fishhawk-gate:main"
 	const podSock = "/run/user/1000/podman/podman.sock"
@@ -904,6 +910,7 @@ func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 		ImageSource:   gateiso.ImageSourceStage,
 		PolicyWarning: gateiso.EvaluateImagePolicy(gateiso.ProfileSelfHosted, taggedReq, nil, true).Warning})
 	declared.ResolvedImage = &gateiso.ResolvedImage{Ref: "ghcr.io/acme/gate@" + goldenImageDigest, Digest: goldenImageDigest, ImageID: goldenImageID}
+	declared.Credentials = gateiso.CredentialsOperatorConfig
 
 	built := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
 		Runtime: dockerSafe, Sandbox: gateiso.SandboxProbe{Reason: "unshare unavailable on darwin (ADR-063 gap)"},
@@ -911,6 +918,15 @@ func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 	built.ResolvedImage = &gateiso.ResolvedImage{Ref: gateiso.BuildTag(goldenContextDigest), ImageID: goldenImageID,
 		BuildDockerfile: "build/gate/Dockerfile", BuildContext: "build/gate", ContextDigest: goldenContextDigest}
 	built.DistinctImagesCount = 2
+	built.Credentials = gateiso.CredentialsAnonymous
+
+	container := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeContainer, Profile: gateiso.ProfileHosted, Image: image,
+		Runtime: gateiso.Runtime{Kind: gateiso.KindPodman, Safe: true, Rootless: true, Version: "5.2.1",
+			Reason:     "podman 5.2.1 over local unix socket " + podSock,
+			Endpoint:   gateiso.Endpoint{Raw: "unix://" + podSock, Scheme: "unix", Path: podSock, Local: true},
+			SocketPath: podSock},
+		Sandbox: gateiso.SandboxProbe{Available: true}})
+	container.Credentials = gateiso.CredentialsAnonymous
 
 	unhonored := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
 		Image:   "ghcr.io/acme/gate@" + goldenImageDigest,
@@ -928,12 +944,7 @@ func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 			Runtime: gateiso.Runtime{Kind: gateiso.KindDocker, Reason: "docker endpoint from DOCKER_HOST is not a local unix socket: scheme tcp",
 				Endpoint: gateiso.Endpoint{Raw: "tcp://10.0.0.5:2376", Scheme: "tcp"}},
 			Sandbox: gateiso.SandboxProbe{Available: true}}),
-		"container": gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeContainer, Profile: gateiso.ProfileHosted, Image: image,
-			Runtime: gateiso.Runtime{Kind: gateiso.KindPodman, Safe: true, Rootless: true, Version: "5.2.1",
-				Reason:     "podman 5.2.1 over local unix socket " + podSock,
-				Endpoint:   gateiso.Endpoint{Raw: "unix://" + podSock, Scheme: "unix", Path: podSock, Local: true},
-				SocketPath: podSock},
-			Sandbox: gateiso.SandboxProbe{Available: true}}),
+		"container": container,
 	}
 }
 
@@ -1004,6 +1015,62 @@ func TestGateIsolationEvidence_MatchesSharedWireGolden(t *testing.T) {
 	}
 	if bytes.Contains(golden["refused"], []byte("10.0.0.5")) {
 		t.Errorf("the runtime endpoint must not be carried: %s", golden["refused"])
+	}
+}
+
+// TestGateIsolationEvidence_CarriesCredentialPosture (E51.26 / #4046) drives
+// the real exec seam end to end: the posture the runner stamps on its recorded
+// container-path selection reaches the composed gate_evidence payload as
+// gate_isolation.credentials (anonymous by default, operator_config under
+// FISHHAWK_GATE_DOCKER_CONFIG), and a refused or fallback selection carries no
+// credentials key at all.
+func TestGateIsolationEvidence_CarriesCredentialPosture(t *testing.T) {
+	opCfg := operatorDockerConfig(t, `{"auths":{}}`)
+	rows := []struct {
+		name string
+		st   func(io.Writer) *gateIsolationState
+		want string
+	}{
+		{"container anonymous", func(w io.Writer) *gateIsolationState { return containerState("img:1", declSock, w) }, "anonymous"},
+		{"container operator config", func(w io.Writer) *gateIsolationState {
+			return containerStateEnv(t, "img:1", declSock, w, map[string]string{gateDockerConfigEnvVar: opCfg})
+		}, "operator_config"},
+		{"refused", refusedState, ""},
+		{"fallback", func(io.Writer) *gateIsolationState { return fallbackState() }, ""},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			st := r.st(io.Discard)
+			installGateState(t, st)
+			captureHostExec(t, false, 0)
+			scriptAuxExec(t, nil)
+			stubSeed(t, func(string) error { return nil })
+			_, _, _ = runBoundedGateCommandDisposed(context.Background(), "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+			iso := gateIsolationEvidenceFor(st)
+			if iso == nil {
+				t.Fatal("no gate_isolation evidence after a gate reached the seam")
+			}
+			if iso.Credentials != r.want {
+				t.Fatalf("evidence credentials = %q, want %q", iso.Credentials, r.want)
+			}
+			ev := composeGateEvidence(nil, 0, iso)
+			if ev == nil {
+				t.Fatal("composeGateEvidence returned nil for an isolation record")
+			}
+			var p struct {
+				GateIsolation map[string]json.RawMessage `json:"gate_isolation"`
+			}
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			got, present := p.GateIsolation["credentials"]
+			switch {
+			case r.want == "" && present:
+				t.Errorf("a %s selection carries credentials %s; want the key absent", r.name, got)
+			case r.want != "" && string(got) != `"`+r.want+`"`:
+				t.Errorf("payload gate_isolation.credentials = %s, want %q", got, r.want)
+			}
+		})
 	}
 }
 
