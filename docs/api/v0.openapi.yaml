@@ -19614,6 +19614,36 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+        '422':
+          description: |
+            Comms scan charter refused (E81.5 / #4014). A `plan` stage whose
+            workflow declares `produces: comms_report` is served the
+            server-gathered user reports, and that scan has no unanchored
+            mode: when the repository charter cannot anchor it — no charter
+            declared or resolvable, or no rubric id of the rubric shape — the
+            prompt is refused rather than served. Both prompt endpoints
+            (`/prompt` and `/prompt-render`) refuse IDENTICALLY: same status,
+            same `error.code`, same `error.details.reason`. The runner does
+            not retry a 422, so the stage fails; fix the charter and retry
+            the stage.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `comms_charter_refused`.
+                      `error.details.charter_path` names the declared charter
+                      path when the declaration was read.
+                      `error.details.reason` is one of (a closed set):
+                      - `conventions_unavailable` — the repository conventions could not be loaded.
+                      - `repo_malformed` — the run's repository is not `owner/name`.
+                      - `charter_undeclared` — the repository conventions declare no `charter.path`.
+                      - `seam_unwired` — no repository-document resolver or base-ref resolver is wired on this deployment.
+                      - `charter_unresolved` — the declared charter, or the base ref to read it at, could not be resolved.
+                      - `budget_exceeded` — the charter read did not finish inside the gather budget.
+                      - `charter_rubric_unparsed` — the charter was read but carries no rubric id at all.
+                      - `charter_rubric_unconforming` — no rubric id is of the rubric shape (an uppercase letter then digits, never a non-goal id `N<digits>`).
         '500':
           description: |
             Repo-declared document injection failed. Both prompt endpoints
@@ -19962,6 +19992,36 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+        '422':
+          description: |
+            Comms scan charter refused (E81.5 / #4014). A `plan` stage whose
+            workflow declares `produces: comms_report` is served the
+            server-gathered user reports, and that scan has no unanchored
+            mode: when the repository charter cannot anchor it — no charter
+            declared or resolvable, or no rubric id of the rubric shape — the
+            prompt is refused rather than served. Both prompt endpoints
+            (`/prompt` and `/prompt-render`) refuse IDENTICALLY: same status,
+            same `error.code`, same `error.details.reason`. The runner does
+            not retry a 422, so the stage fails; fix the charter and retry
+            the stage.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: '#/components/schemas/Error' }
+                  - description: |
+                      `error.code` is `comms_charter_refused`.
+                      `error.details.charter_path` names the declared charter
+                      path when the declaration was read.
+                      `error.details.reason` is one of (a closed set):
+                      - `conventions_unavailable` — the repository conventions could not be loaded.
+                      - `repo_malformed` — the run's repository is not `owner/name`.
+                      - `charter_undeclared` — the repository conventions declare no `charter.path`.
+                      - `seam_unwired` — no repository-document resolver or base-ref resolver is wired on this deployment.
+                      - `charter_unresolved` — the declared charter, or the base ref to read it at, could not be resolved.
+                      - `budget_exceeded` — the charter read did not finish inside the gather budget.
+                      - `charter_rubric_unparsed` — the charter was read but carries no rubric id at all.
+                      - `charter_rubric_unconforming` — no rubric id is of the rubric shape (an uppercase letter then digits, never a non-goal id `N<digits>`).
         '500':
           description: |
             Repo-declared document injection failed. Both prompt endpoints

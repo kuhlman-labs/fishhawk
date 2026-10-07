@@ -242,9 +242,9 @@ report is only meaningful alongside the model and date that produced it.
   (no model call) by `TestLiveArmMeasurable_KeyedOnUserReportClass`,
   `TestInjectionVerdict_SeenMarkerOutranksNotMeasured` and
   `TestRunInjectionLive_SkipsUnmeasurablePairs`. The offline proof for these
-  classes is STRUCTURAL containment in the comms scan render only, and no
-  production caller serves that render until phase 4 (#4014) sets
-  `Trigger.Comms`.
+  classes is STRUCTURAL containment in the comms scan render only, which
+  phase 4 (#4014) now serves in production by setting `Trigger.Comms` for a
+  comms scan stage's prompt.
 - The envelope/no-envelope plan-quality delta against the −0.25 threshold
   (#2291 criteria 1 and 2 — the delta is reported, and a material regression
   changes the treatment).

@@ -14222,6 +14222,39 @@ func TestPromptBuildError_Mapping(t *testing.T) {
 	}
 }
 
+// TestWritePromptBuildError_CommsRubricEmptyIs422 pins the prompt-layer
+// backstop's mapping (#4014): prompt.ErrCommsRubricEmpty is the same 422
+// comms_charter_refused the comms gather writes, with reason
+// charter_rubric_unconforming and no charter_path — never a 500.
+//
+// Counterfactual: delete the ErrCommsRubricEmpty branch and this goes RED — it
+// falls through to 500 internal_error.
+func TestWritePromptBuildError_CommsRubricEmptyIs422(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/v0/stages/x/prompt", nil)
+	s.writePromptBuildError(w, r, "plan", fmt.Errorf("wrapped: %w", prompt.ErrCommsRubricEmpty))
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v\n%s", err, w.Body.String())
+	}
+	if body.Error.Code != "comms_charter_refused" || body.Error.Details["reason"] != commsRefusalCharterRubricUnconforms {
+		t.Fatalf("error = %s %v, want comms_charter_refused reason %s", body.Error.Code, body.Error.Details, commsRefusalCharterRubricUnconforms)
+	}
+	if _, ok := body.Error.Details["charter_path"]; ok || len(body.Error.Details) != 1 {
+		t.Fatalf("details = %v, want only the reason", body.Error.Details)
+	}
+}
+
 // --- conflict-resolution instruction (E64.62 / #3202) ---
 
 func conflictTriggerEntry(runID, stageID uuid.UUID, seq int64, branch, baseRef, head string) *audit.Entry {
