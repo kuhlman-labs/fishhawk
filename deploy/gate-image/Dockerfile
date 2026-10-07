@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # fishhawk-gate: the pinned verify toolchain for this repository (E51.17 / #3966).
 # It is the image ADR-063's container gate path names via FISHHAWK_GATE_IMAGE,
@@ -63,7 +62,7 @@
 #
 # RUNTIME CONTRACT. No ENTRYPOINT (the runner passes --entrypoint '') and no
 # USER (callers pass --user uid:gid). Everything works as an arbitrary uid with
-# HOME=/tmp, matching runner/internal/gateiso's container env, EXCEPT name
+# HOME set to /tmp, matching runner/internal/gateiso's container env, EXCEPT name
 # lookup: an arbitrary uid has no /etc/passwd entry here, so `whoami` fails and
 # test-helm-render r9h cannot pass. Both callers therefore SUPPLY one, read-only:
 # `scripts/test --in-gate-image` mounts a passwd file mapping the caller's uid,

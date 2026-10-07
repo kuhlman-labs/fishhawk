@@ -18,7 +18,7 @@ there is still no second exec path.
 | Variable | Values | Default | Meaning |
 |---|---|---|---|
 | `FISHHAWK_GATE_ISOLATION` | `auto` \| `container` \| `clone-sandbox` \| `clone` | `auto` | the isolation mode (`ParseMode`; an unknown value is a startup config error naming the valid values) |
-| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in when the stage declares no `gate_container` (a declared one beats it, § "Declared gate image"); empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`, and only after the § "Gate services (#2137)" operator walk is green:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red |
+| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in when the stage declares no `gate_container` (a declared one beats it, § "Declared gate image"); empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red. This repository runs it as `fishhawk-gate:local` (§ "Gate services (#2137)", Activated) |
 | `FISHHAWK_GATE_SERVICES` | comma list; only member `postgres` | empty (none) | services the CONTAINER path provisions beside each gate exec (`ParseServices`; an unknown member is a startup config error naming the variable and the valid value; duplicates collapse). Ignored, with one `gate_services_ignored` log line, on every other path. Future spec mapping: #2136's workflow-v2 `gate_container.services` |
 | `FISHHAWK_GATE_POSTGRES_IMAGE` | an image reference | `postgres:16-alpine` (`DefaultPostgresImage`) | the Postgres service image; pin it by DIGEST (`postgres@sha256:…`) — the image runs as a service beside every container gate. **Floor: PostgreSQL 16 or newer.** The gate role holds `CREATEROLE`, which only 16 bounds, so the bootstrap's version guard fails an older image (category C, the gate never runs; § "Gate services (#2137)", Least privilege) |
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
@@ -1125,6 +1125,22 @@ throwaway `fh_dir_<hex>` databases and no testcontainers call, and with
 against a hand-started server as the runner's least-privilege role, not
 against the runner-provisioned service, so the operator walk below remains
 the first run on the real socket.
+
+**Activated (#4040, 2026-10-07).** The walk below went green on 2026-10-06:
+a full container-path `scripts/test verify` passed with 166 packages ok, zero
+SKIP, in 9m35s. This repository's runners now carry
+`FISHHAWK_GATE_IMAGE=fishhawk-gate:local` with `FISHHAWK_GATE_SERVICES=postgres`
+on the env path. Set both in the spawning process's environment: the fishhawk
+MCP server env, and `.env` for fishhawkd host-dispatch. A local tag works there
+because `docker run` pulls only a missing image. Rebuild it by hand after any
+change under `deploy/gate-image/` or a pin bump:
+`docker buildx build --load -t fishhawk-gate:local deploy/gate-image`. Operator
+fallback, with no spec change: `FISHHAWK_GATE_ISOLATION=clone`.
+
+The repository deliberately does NOT declare an in-repo `gate_container`
+build. The runner builds a declared Dockerfile with `--network=none`, and this
+Dockerfile's RUN steps need the network (apt-get, curl), so a declared build
+works only off a warm layer cache (#4060).
 
 **Operator walk — required before setting `FISHHAWK_GATE_IMAGE` for this
 repository (approval conditions 5 and 6).** In-loop the implement gate proves
