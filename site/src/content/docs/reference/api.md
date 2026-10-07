@@ -53,6 +53,16 @@ each scheduled workflow, its cron, the current due window, the next due time
 and the last outcome. When the scheduler is off it answers `enabled: false`
 rather than an error.
 
+A run's `trigger_source` can also be `alert`. Only the alert ingress
+(`POST /v0/triggers/alert`) creates such a run, and only for an alert source
+configured with `auto_start: true`; the setting defaults to `false`. The
+ingress authenticates each source by an HMAC signature over the timestamp and
+body, not by a bearer token. It files one incident issue per alert
+fingerprint and comments on that issue for each repeat. An `alert` run is
+always anchored on the issue the ingress filed, and `applies_to` routes it as
+the `diff` trigger form. `POST /v0/runs` refuses `alert` with 400
+`trigger_source_reserved`.
+
 The stage prompt responses (`GET /v0/stages/{stage_id}/prompt` and its
 `prompt-render` twin) carry a `gate_container` object when the run's
 workflow-v2 spec declares one, which the table does not spell out either. It
@@ -84,7 +94,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **159 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **160 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -156,6 +166,7 @@ The v0 REST API exposes **159 operations** across the paths below, generated fro
 | `POST` | `/v0/digest/mark-read` | Advance the caller's digest read watermark |
 | `GET` | `/v0/handover-brief` | Handover brief for one repository |
 | `GET` | `/v0/schedules` | Scheduled workflows and their due windows for one repository |
+| `POST` | `/v0/triggers/alert` | HMAC-authenticated alert ingress — file (or comment on) an incident issue |
 | `GET` | `/v0/captain` | The captain record for one repository |
 | `POST` | `/v0/captain/offer` | Offer the captain seat to a named successor |
 | `POST` | `/v0/captain/withdraw` | Withdraw a pending handover offer |

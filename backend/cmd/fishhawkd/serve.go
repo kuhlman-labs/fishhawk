@@ -28,6 +28,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/alerttrigger"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
@@ -963,24 +964,29 @@ func installationBaseURLResolver(r *account.EndpointResolver, provider string) f
 // receivers (delivery ids are namespaced, E45.6 / #1860), so it is
 // needed when EITHER forge's webhook secret is set — a GitLab-only
 // deployment needs the store just as a GitHub-only one does. Previously
-// the store was gated on the GitHub secret alone.
-func webhookStoreNeeded(githubSecret, gitlabSecret string) bool {
-	return githubSecret != "" || gitlabSecret != ""
+// the store was gated on the GitHub secret alone. The alert ingress
+// (E35.4 / #1601) marks its post-verification nonce
+// ("alert:<source>:<mac>") in the same store, so configured alert sources
+// need it too: without it a configured ingress would answer a permanent
+// 503 alert_store_unconfigured on a deployment with no forge webhook.
+func webhookStoreNeeded(githubSecret, gitlabSecret string, alertSourcesConfigured bool) bool {
+	return githubSecret != "" || gitlabSecret != "" || alertSourcesConfigured
 }
 
 // newWebhookDeliveryStore builds the shared webhook delivery store,
 // consulting webhookStoreNeeded so the gating lives in exactly one place:
 // the store is created when EITHER forge's secret is set (a GitLab-only
-// deployment needs it just as a GitHub-only one does), and nil is returned
-// when neither is — so runServe's call site cannot re-inline a GitHub-only
+// deployment needs it just as a GitHub-only one does) or alert sources are
+// configured (the alert ingress's nonce, E35.4 / #1601), and nil is returned
+// when none is — so runServe's call site cannot re-inline a GitHub-only
 // gate while leaving webhookStoreNeeded intact (E45.6 binding condition 2 /
 // fix-up). Prefers the Postgres-backed store when a pool is available
 // (dedup survives restarts, shared across instances) and falls back to an
 // in-memory store otherwise. The second return is the concrete
 // *webhook.PostgresStore for the evictor wiring — non-nil only on the
 // Postgres path, nil for the memory store and the no-store case.
-func newWebhookDeliveryStore(pool *pgxpool.Pool, githubSecret, gitlabSecret string, retention time.Duration) (webhook.DeliveryStore, *webhook.PostgresStore) {
-	if !webhookStoreNeeded(githubSecret, gitlabSecret) {
+func newWebhookDeliveryStore(pool *pgxpool.Pool, githubSecret, gitlabSecret string, alertSourcesConfigured bool, retention time.Duration) (webhook.DeliveryStore, *webhook.PostgresStore) {
+	if !webhookStoreNeeded(githubSecret, gitlabSecret, alertSourcesConfigured) {
 		return nil, nil
 	}
 	if pool != nil {
@@ -2025,6 +2031,12 @@ func runServe(args []string, logSink io.Writer) int {
 	schedulerRunnerKind := fs.String("scheduler-runner-kind",
 		envOr("FISHHAWKD_SCHEDULER_RUNNER_KIND", runpkg.RunnerKindGitHubActions),
 		"runner_kind every scheduled run is created with (a POST /v0/runs runner_kind; default github_actions). With local, a started run parks at awaiting_host_dispatch until a host dispatches it — the scheduler does not auto-dispatch. An unknown value fails startup.")
+	alertSourcesFile := fs.String("alert-sources-file",
+		envOr("FISHHAWKD_ALERT_SOURCES_FILE", ""),
+		"YAML file declaring the alert sources the HMAC-authenticated POST /v0/triggers/alert ingress accepts (E35.4 / #1601, ADR-053): per source an id, the env var holding its HMAC secret (>= 32 bytes; secrets never live in the file), the repo incidents are filed in, and auto_start (default false). Empty (the default) leaves the ingress off — the route answers 503. A malformed file, an unknown key, or a missing or short secret fails startup. Contract: backend/internal/alerttrigger/README.md.")
+	alertReplayWindow := fs.String("alert-replay-window",
+		envOr("FISHHAWKD_ALERT_REPLAY_WINDOW", alerttrigger.DefaultReplayWindow.String()),
+		"timestamp tolerance of the alert ingress: a request signed further than this from the server clock, in either direction, is refused 401 alert_replayed. A Go duration in (0, 15m]; default 5m. An unparseable or out-of-range value fails startup.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2278,6 +2290,17 @@ func runServe(args []string, logSink io.Writer) int {
 	schedRepos, err := parseSchedulerRepos(*schedulerRepos)
 	if err != nil {
 		logger.Error("invalid --scheduler-repos", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
+	// Alert ingress (E35.4 / #1601, ADR-053). Resolved FIRST, before anything
+	// dials a database, like the scheduler flags: a malformed sources file,
+	// an unknown key, an unset or short secret, or an out-of-range replay
+	// window must fail startup loudly rather than boot an ingress that
+	// answers 503 or verifies against the wrong secret.
+	alertCfg, err := resolveAlertTriggerConfig(*alertSourcesFile, *alertReplayWindow, os.Getenv)
+	if err != nil {
+		logger.Error("invalid alert trigger configuration", slog.String("error", err.Error()))
 		return exitFailure
 	}
 
@@ -2784,11 +2807,12 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.GitLabWebhookSecret = []byte(*gitlabWebhookSecret)
 		logger.Info("gitlab webhook receiver configured")
 	}
-	// The delivery store is shared by both receivers, so create it when
-	// EITHER secret is set (previously gated on the GitHub secret alone).
-	// newWebhookDeliveryStore owns the gating + store selection so this
-	// call site can't drift back to a GitHub-only gate.
-	if store, evictor := newWebhookDeliveryStore(pool, *webhookSecret, *gitlabWebhookSecret, webhookRetention); store != nil {
+	// The delivery store is shared by both receivers AND the alert ingress's
+	// post-verification nonce (E35.4 / #1601), so create it when EITHER
+	// secret is set or alert sources are configured (previously gated on the
+	// GitHub secret alone). newWebhookDeliveryStore owns the gating + store
+	// selection so this call site can't drift back to a GitHub-only gate.
+	if store, evictor := newWebhookDeliveryStore(pool, *webhookSecret, *gitlabWebhookSecret, alertCfg.Sources.Len() > 0, webhookRetention); store != nil {
 		cfg.WebhookDeliveries = store
 		webhookEvictor = evictor
 		if evictor != nil {
@@ -3478,6 +3502,12 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 	cfg.PushDispatcher = pushDispatcher
+
+	// Alert ingress (E35.4 / #1601, ADR-053 option A). The config was
+	// resolved and validated at the top of runServe; this wires the dedup
+	// ledger and the auto-start spec source onto cfg and logs what the
+	// ingress can and cannot do.
+	wireAlertTrigger(&cfg, alertCfg, pool, logger)
 
 	// Scheduler (E79.1 / #3725). Built HERE, before server.New, because
 	// cfg.Schedules (the GET /v0/schedules read seam) must be assigned before
@@ -4320,6 +4350,89 @@ func (g githubScheduleSpecSource) FetchSpec(ctx context.Context, repo string) ([
 		return nil, "", fmt.Errorf("fetch workflow spec for %s: no content returned", repo)
 	}
 	return fc.Content, fc.SHA, nil
+}
+
+// maxAlertReplayWindow bounds --alert-replay-window. A wider window lengthens
+// the span in which a captured request is replayable before the 24h nonce is
+// the only defence left, and no sane sender clock needs more skew than this.
+const maxAlertReplayWindow = 15 * time.Minute
+
+// alertTriggerConfig is the resolved alert-ingress configuration
+// (E35.4 / #1601). The zero value — no sources — is the ingress OFF.
+type alertTriggerConfig struct {
+	Sources alerttrigger.Sources
+	Window  time.Duration
+}
+
+// resolveAlertTriggerConfig validates --alert-replay-window and loads
+// --alert-sources-file, resolving each source's secret_env through getenv.
+// The window is validated whether or not a sources file is set, so a typo is
+// caught before an operator later enables the ingress. An empty path returns
+// the zero Sources (ingress off). Every failure is a startup failure: a
+// malformed file, an unknown key, an unset or short secret, an unparseable
+// window, or one outside (0, maxAlertReplayWindow].
+func resolveAlertTriggerConfig(path, window string, getenv func(string) string) (alertTriggerConfig, error) {
+	w, err := time.ParseDuration(window)
+	if err != nil {
+		return alertTriggerConfig{}, fmt.Errorf("--alert-replay-window / FISHHAWKD_ALERT_REPLAY_WINDOW %q is not a duration: %w", window, err)
+	}
+	if w <= 0 || w > maxAlertReplayWindow {
+		return alertTriggerConfig{}, fmt.Errorf("--alert-replay-window / FISHHAWKD_ALERT_REPLAY_WINDOW %s is out of range; want (0, %s]", w, maxAlertReplayWindow)
+	}
+	out := alertTriggerConfig{Window: w}
+	if path == "" {
+		return out, nil
+	}
+	srcs, err := alerttrigger.LoadSources(path, getenv)
+	if err != nil {
+		return alertTriggerConfig{}, fmt.Errorf("--alert-sources-file / FISHHAWKD_ALERT_SOURCES_FILE: %w", err)
+	}
+	out.Sources = srcs
+	return out, nil
+}
+
+// wireAlertTrigger assigns the resolved alert-ingress configuration onto cfg
+// and logs it. With no sources it does nothing and logs nothing (the ingress
+// is off and the route answers 503 alert_trigger_unconfigured). Otherwise:
+//
+//   - cfg.AlertIncidents is the Postgres dedup ledger when a pool exists;
+//   - cfg.AlertSpecSource is the scheduler's GitHub App spec adapter when the
+//     GitHub client is wired — assigned only then, so a nil client never
+//     becomes a non-nil interface wrapping a nil pointer;
+//   - one INFO line names the configured source ids;
+//   - one WARN line names EVERY source with auto_start true (an incident then
+//     starts a hotfix run with no human in the loop until the plan gate);
+//   - one WARN line per missing dependency (database, GitHub App, delivery
+//     store) names what the ingress cannot do without it.
+func wireAlertTrigger(cfg *server.Config, ac alertTriggerConfig, pool *pgxpool.Pool, logger *slog.Logger) {
+	cfg.AlertReplayWindow = ac.Window
+	if ac.Sources.Len() == 0 {
+		return
+	}
+	cfg.AlertSources = ac.Sources
+	if pool != nil {
+		cfg.AlertIncidents = alerttrigger.NewPostgresStore(pool)
+	}
+	if cfg.GitHub != nil {
+		cfg.AlertSpecSource = githubScheduleSpecSource{gh: cfg.GitHub}
+	}
+	logger.Info("alert trigger ingress configured",
+		slog.String("route", "POST /v0/triggers/alert"),
+		slog.String("sources", strings.Join(ac.Sources.IDs(), ",")),
+		slog.Duration("replay_window", ac.Window))
+	if ids := ac.Sources.AutoStartIDs(); len(ids) > 0 {
+		logger.Warn("alert trigger AUTO-START ENABLED: a verified alert from these sources starts a hotfix run on its filed incident issue without a human request (the run still stops at every gate)",
+			slog.String("auto_start_sources", strings.Join(ids, ",")))
+	}
+	if pool == nil {
+		logger.Warn("alert sources configured but no database (FISHHAWKD_DATABASE_URL); POST /v0/triggers/alert will respond 503 alert_store_unconfigured — the dedup ledger is Postgres-only")
+	}
+	if cfg.GitHub == nil {
+		logger.Warn("alert sources configured but the GitHub App is unconfigured; POST /v0/triggers/alert will respond 503 alert_store_unconfigured — incident issues are filed through the App")
+	}
+	if cfg.WebhookDeliveries == nil {
+		logger.Warn("alert sources configured but no webhook delivery store; POST /v0/triggers/alert will respond 503 alert_store_unconfigured — the replay nonce lives there")
+	}
 }
 
 // scheduledRunStarter adapts Server.StartScheduledRun to scheduler.RunStarter:

@@ -53,7 +53,24 @@ when unset the endpoint responds 503 and `serve.go` warns.
 GitLab sends this secret VERBATIM in `X-Gitlab-Token` (no HMAC); when unset the endpoint responds 503.
 Deliberately asymmetric with GitHub: an absent GitLab secret logs nothing (GitLab is optional — an absent-warn
 would nag every GitHub-only deployment). The shared webhook delivery store (`webhook_deliveries` on Postgres,
-else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too.
+else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too — and
+also when alert sources are configured (below), because the alert ingress keeps its replay nonce there.
+
+## Alert trigger ingress (E35.4 / #1601, ADR-053)
+
+`POST /v0/triggers/alert` turns an HMAC-signed alert into a conventions-complete incident issue, deduplicated
+by alert fingerprint, with an optional per-source hotfix auto-start that ships OFF. Bearer tokens do not apply:
+each source signs with its own secret. Contract (wire format, sources file, payload, response codes):
+`backend/internal/alerttrigger/README.md`.
+
+| Env var | Flag | Effect | Default |
+|---|---|---|---|
+| `FISHHAWKD_ALERT_SOURCES_FILE` | `--alert-sources-file` | YAML file declaring the accepted sources (`version: 1`; per source `id`, `secret_env`, `repo`, `work_item_type`, `parent_epic`, `labels`, `auto_start`, `workflow_id`, `runner_kind`). Secrets live in the env vars `secret_env` names (>= 32 bytes), never in the file. A malformed file, an unknown key, or an unset or short secret **fails startup**. Configured, one INFO names the source ids, a WARN (`alert trigger AUTO-START ENABLED`) names every source with `auto_start: true`, and a WARN names each missing dependency (database, GitHub App, delivery store) the route would otherwise answer `503 alert_store_unconfigured` for. Also creates the webhook delivery store when no forge webhook secret is set. | *(unset — ingress off; the route answers 503)* |
+| `FISHHAWKD_ALERT_REPLAY_WINDOW` | `--alert-replay-window` | Timestamp tolerance: a request signed further than this from the server clock, in either direction, is refused `401 alert_replayed`. A Go duration in `(0, 15m]`; an unparseable or out-of-range value **fails startup**, whether or not a sources file is set. | `5m` |
+
+`auto_start` defaults to `false` per source. An auto-started run carries the system-only
+`trigger_source: alert` (`POST /v0/runs` refuses it `400 trigger_source_reserved`), is routed as the `diff`
+trigger form for `applies_to`, and passes every admission gate a hand-started run does.
 
 ## Push notification sinks (#2292)
 
