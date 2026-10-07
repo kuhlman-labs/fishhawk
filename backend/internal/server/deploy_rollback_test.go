@@ -3,15 +3,19 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -513,5 +517,201 @@ func TestRollbackDeployment_Webhook_SecretNeverLeaks(t *testing.T) {
 			}
 			assertSecretAbsent(t, au, logBuf, webhookTestSecret, map[string]string{"response body": w.Body.String()})
 		})
+	}
+}
+
+// seedStoredDeployment wires an in-memory artifact repository holding one
+// forward deployment record (outcome succeeded, the given rollback_handle) on
+// stageID, returning the stored artifact (E35.3 / #1600).
+func seedStoredDeployment(t *testing.T, s *Server, stageID uuid.UUID, handle string) *artifact.Artifact {
+	t.Helper()
+	repo := newFakeArtifactRepo()
+	a := deploymentArtifact(t, stageID, time.Now().UTC(), 0, forwardDeployment(handle))
+	repo.all = []*artifact.Artifact{a}
+	s.cfg.ArtifactRepo = repo
+	return a
+}
+
+// decodeRollbackResponse decodes a 202 rollback body.
+func decodeRollbackResponse(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode rollback response: %v\n%s", err, w.Body.String())
+	}
+	return body
+}
+
+// (C1)+(C2) E35.3 / #1600: a stored rollback_handle rides the github_actions
+// re-dispatch as fishhawk_rollback_handle, while the correlation map
+// ResolveDispatchedRun matches stays the three markers — the stub's listed run
+// echoes NO handle input, so a handle leaked into the correlation map would
+// leave gha_run_id unresolved (0). The initiated payload and the 202 body echo
+// the handle and the artifact it was read from.
+func TestRollbackDeployment_GitHubActions_CarriesStoredHandle(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	stored := seedStoredDeployment(t, s, stage.ID, "rev-abc")
+	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":515151,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/515151","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
+		stage.RunID.String(), stage.ID.String())
+
+	w := rollbackRequest(t, s, stage.RunID, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if got := stub.dispatchInputs[rollbackHandleDispatchInput]; got != "rev-abc" {
+		t.Errorf("dispatch input %s = %q, want rev-abc (inputs %v)", rollbackHandleDispatchInput, got, stub.dispatchInputs)
+	}
+	if stub.dispatchInputs["fishhawk_run_id"] != stage.RunID.String() ||
+		stub.dispatchInputs["fishhawk_stage_id"] != stage.ID.String() ||
+		stub.dispatchInputs[rollbackDispatchInput] != "true" {
+		t.Errorf("dispatch inputs %v lost a correlation marker", stub.dispatchInputs)
+	}
+	p := auditPayload(t, au, CategoryDeploymentRollbackInitiated)
+	if p["gha_run_id"] != float64(515151) {
+		t.Errorf("payload gha_run_id = %v, want 515151 (the handle must not join the correlation map)", p["gha_run_id"])
+	}
+	if p["rollback_handle"] != "rev-abc" || p["deployment_artifact_id"] != stored.ID.String() {
+		t.Errorf("payload rollback_handle/deployment_artifact_id = %v / %v, want rev-abc / %s",
+			p["rollback_handle"], p["deployment_artifact_id"], stored.ID)
+	}
+	body := decodeRollbackResponse(t, w)
+	if body["rollback_handle"] != "rev-abc" || body["deployment_artifact_id"] != stored.ID.String() {
+		t.Errorf("202 body rollback_handle/deployment_artifact_id = %v / %v, want rev-abc / %s",
+			body["rollback_handle"], body["deployment_artifact_id"], stored.ID)
+	}
+	if body["gha_run_id"] != float64(515151) {
+		t.Errorf("202 body gha_run_id = %v, want 515151", body["gha_run_id"])
+	}
+}
+
+// (C3) a forward record with NO rollback_handle omits the dispatch input
+// entirely — GitHub 422s an undeclared workflow_dispatch input, so a pipeline
+// that never returns a handle must never see one. The artifact id is still
+// echoed; the empty handle is omitted from the 202 body.
+func TestRollbackDeployment_GitHubActions_NoHandleOmitsInput(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	stored := seedStoredDeployment(t, s, stage.ID, "")
+
+	w := rollbackRequest(t, s, stage.RunID, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if v, has := stub.dispatchInputs[rollbackHandleDispatchInput]; has {
+		t.Errorf("dispatch inputs carry %s=%q with no stored handle: %v", rollbackHandleDispatchInput, v, stub.dispatchInputs)
+	}
+	if len(stub.dispatchInputs) != 3 {
+		t.Errorf("dispatch inputs = %v, want exactly the three correlation markers", stub.dispatchInputs)
+	}
+	p := auditPayload(t, au, CategoryDeploymentRollbackInitiated)
+	if p["rollback_handle"] != "" || p["deployment_artifact_id"] != stored.ID.String() {
+		t.Errorf("payload rollback_handle/deployment_artifact_id = %v / %v, want \"\" / %s",
+			p["rollback_handle"], p["deployment_artifact_id"], stored.ID)
+	}
+	body := decodeRollbackResponse(t, w)
+	if _, has := body["rollback_handle"]; has {
+		t.Errorf("202 body carries rollback_handle with no stored handle: %v", body)
+	}
+	if body["deployment_artifact_id"] != stored.ID.String() {
+		t.Errorf("202 body deployment_artifact_id = %v, want %s", body["deployment_artifact_id"], stored.ID)
+	}
+}
+
+// webhookRollbackTopLevelKeys is the webhook rollback body's top-level key set
+// before E35.3 / #1600: the handle rides variables, never a new top-level key.
+var webhookRollbackTopLevelKeys = []string{
+	"fishhawk_rollback", "fishhawk_run_id", "fishhawk_stage_id", "repo", "variables", "workflow_id",
+}
+
+// (C4) webhook: a stored handle rides variables.FISHHAWK_ROLLBACK_HANDLE and
+// the body's top-level key set is unchanged.
+func TestRollbackDeployment_Webhook_CarriesStoredHandle(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, _ := seedSettledDeployRun(rr, fmt.Sprintf(deploySpecWebhookFmt, hook.srv.URL), run.StageStateSucceeded, instID(99))
+	stored := seedStoredDeployment(t, s, stage.ID, "rev-abc")
+
+	w := rollbackRequest(t, s, stage.RunID, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	hits, _, body := hook.snapshot()
+	if hits != 1 {
+		t.Fatalf("webhook hits = %d, want 1", hits)
+	}
+	vars, _ := body["variables"].(map[string]any)
+	if vars[rollbackHandleWebhookVariable] != "rev-abc" {
+		t.Errorf("webhook variables = %v, want %s=rev-abc", vars, rollbackHandleWebhookVariable)
+	}
+	var keys []string
+	for k := range body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if strings.Join(keys, ",") != strings.Join(webhookRollbackTopLevelKeys, ",") {
+		t.Errorf("webhook top-level keys = %v, want %v (the handle must not add a top-level key)", keys, webhookRollbackTopLevelKeys)
+	}
+	p := auditPayload(t, au, CategoryDeploymentRollbackInitiated)
+	if p["rollback_handle"] != "rev-abc" || p["deployment_artifact_id"] != stored.ID.String() {
+		t.Errorf("payload rollback_handle/deployment_artifact_id = %v / %v", p["rollback_handle"], p["deployment_artifact_id"])
+	}
+}
+
+// (C4') webhook with no stored handle: the variable is absent, not empty.
+func TestRollbackDeployment_Webhook_NoHandleOmitsVariable(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	hook := newCountingHook(t, http.StatusAccepted, nil, "")
+	stage, _ := seedSettledDeployRun(rr, fmt.Sprintf(deploySpecWebhookFmt, hook.srv.URL), run.StageStateSucceeded, instID(99))
+	seedStoredDeployment(t, s, stage.ID, "")
+
+	w := rollbackRequest(t, s, stage.RunID, nil)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	_, _, body := hook.snapshot()
+	vars, _ := body["variables"].(map[string]any)
+	if v, has := vars[rollbackHandleWebhookVariable]; has {
+		t.Errorf("webhook variables carry %s=%v with no stored handle: %v", rollbackHandleWebhookVariable, v, vars)
+	}
+	if vars["FISHHAWK_ROLLBACK"] != "true" {
+		t.Errorf("webhook variables = %v, want FISHHAWK_ROLLBACK=true", vars)
+	}
+}
+
+// (C5) a failed stored-artifact read refuses 500 and dispatches NOTHING: no
+// request reaches the GitHub stub and no deployment_rollback_initiated row is
+// committed (read back after the call — the control's effect is the absence
+// of committed state, not the error identity).
+func TestRollbackDeployment_ArtifactReadError_RefusesWithoutDispatch(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	repo := newFakeArtifactRepo()
+	repo.listErr = errors.New("artifact store down")
+	s.cfg.ArtifactRepo = repo
+
+	w := rollbackRequest(t, s, stage.RunID, nil)
+	// Committed state first: these are the control's effect.
+	if stub.dispatchHits != 0 || stub.hits() != 0 {
+		t.Errorf("dispatch hits = %d, stub requests = %d, want 0 — a failed handle read must not dispatch", stub.dispatchHits, stub.hits())
+	}
+	if n := countAppendedCategory(au, CategoryDeploymentRollbackInitiated); n != 0 {
+		t.Errorf("deployment_rollback_initiated entries = %d, want 0", n)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	var resp errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+	}
+	if resp.Error.Code != "internal_error" || !strings.Contains(resp.Error.Message, "rollback_handle") {
+		t.Errorf("error = %s / %q, want internal_error naming the rollback_handle read", resp.Error.Code, resp.Error.Message)
 	}
 }
