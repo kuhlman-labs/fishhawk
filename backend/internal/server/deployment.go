@@ -64,8 +64,17 @@ type deploymentBody struct {
 	// constraint. Required.
 	Environment string `json:"environment"`
 	// Ref is the git ref or sha that was deployed (ADR-038's "ref/sha").
-	// Required.
+	// Required. On the reconciler path it is the dispatch git_ref (e.g.
+	// "main"), a symbolic name — the resolved commit rides SHA.
 	Ref string `json:"ref"`
+	// SHA is the full commit SHA of the deployed build — ADR-038's "ref/sha"
+	// made explicit (E35.2 / #1599). Optional; when set it must be a full 40-
+	// or 64-hex commit SHA (isDeployCommitSHA). The deploy reconciler fills it
+	// from the polled workflow run's head_sha; a webhook-target pipeline may
+	// POST it. A post-deploy acceptance stage reads it as its expected head.
+	// omitempty keeps every sha-less body's stored content (and content hash)
+	// byte-identical to the pre-#1599 shape.
+	SHA string `json:"sha,omitempty"`
 	// ExternalRunURL points at the external pipeline run Fishhawk delegated
 	// to (delegating mode — Fishhawk holds no deploy logic). Required.
 	ExternalRunURL string `json:"external_run_url"`
@@ -102,10 +111,34 @@ func (d *deploymentBody) validate() error {
 	case !run.DeployOutcome(d.Outcome).Valid():
 		return fmt.Errorf("outcome must be one of succeeded/failed/partial/rolled_back, got %q", d.Outcome)
 	}
+	if d.SHA != "" && !isDeployCommitSHA(d.SHA) {
+		return fmt.Errorf("sha must be a full 40- or 64-hex commit SHA when set, got %q", d.SHA)
+	}
 	if d.RollbackAction != "" && d.RollbackAction != "initiated" && d.RollbackAction != "completed" {
 		return fmt.Errorf("rollback_action must be \"initiated\" or \"completed\" when set, got %q", d.RollbackAction)
 	}
 	return nil
+}
+
+// isDeployCommitSHA reports whether s is a full commit SHA a deployment record
+// may carry: exactly 40 (SHA-1) or 64 (SHA-256) hex characters,
+// case-insensitive. It is deliberately distinct from isFullCommitSHA (40-hex
+// only, the run-admission read shape): a deployed build may come from a
+// SHA-256 repository. An abbreviated SHA is rejected on purpose — the
+// post-deploy acceptance identity probe matches a target's reported git_sha as
+// a PREFIX of the expectation, which needs the full expected SHA.
+func isDeployCommitSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // handleShipDeployment implements POST /v0/runs/{run_id}/deployment.
@@ -226,6 +259,7 @@ func (s *Server) handleShipDeployment(w http.ResponseWriter, r *http.Request) {
 					"content_hash":     contentHash,
 					"environment":      dep.Environment,
 					"ref":              dep.Ref,
+					"sha":              dep.SHA,
 					"external_run_url": dep.ExternalRunURL,
 					"outcome":          dep.Outcome,
 					"rollback_handle":  dep.RollbackHandle,
@@ -282,6 +316,7 @@ func (s *Server) handleShipDeployment(w http.ResponseWriter, r *http.Request) {
 		"content_hash":     contentHash,
 		"environment":      dep.Environment,
 		"ref":              dep.Ref,
+		"sha":              dep.SHA,
 		"external_run_url": dep.ExternalRunURL,
 		"outcome":          dep.Outcome,
 		"rollback_handle":  dep.RollbackHandle,

@@ -1159,3 +1159,276 @@ func (f *fakeDeployPoller) GetWorkflowRun(_ context.Context, _ forge.CredentialS
 func (f *fakeDeployPoller) ResolveDispatchedRun(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string, _ map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
 	return nil, nil
 }
+
+// ---- E35.2 / #1599: the deployed commit SHA on the deployment record ----
+
+const (
+	deploySHA40 = "0123456789abcdef0123456789abcdef01234567"
+	deploySHA64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+// deploymentBodyWithSHA returns a body that is valid in every field EXCEPT
+// possibly sha, so the sha check is the only control a malformed value meets.
+func deploymentBodyWithSHA(t *testing.T, sha string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"environment":      "production",
+		"ref":              "main",
+		"sha":              sha,
+		"external_run_url": "https://github.com/kuhlman-labs/fishhawk/actions/runs/42",
+		"outcome":          "succeeded",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestShipDeployment_MalformedSHA_400 pins deploymentBody.validate's sha arm:
+// a sha that is present but not a full 40- or 64-hex commit SHA is a 400
+// deployment_invalid naming the sha rule, and NO artifact or governance entry
+// is persisted. Every other field is valid, so with the arm deleted each case
+// ships 201.
+func TestShipDeployment_MalformedSHA_400(t *testing.T) {
+	cases := map[string]string{
+		"not hex":            "not-a-sha",
+		"39 hex":             deploySHA40[:39],
+		"41 hex":             deploySHA40 + "0",
+		"abbreviated 7 hex":  deploySHA40[:7],
+		"63 hex":             deploySHA64[:63],
+		"40 chars, non-hex":  strings.Repeat("g", 40),
+		"64 chars, one bad":  deploySHA64[:63] + "z",
+		"40 hex plus suffix": deploySHA40[:34] + "-dirty",
+	}
+	for name, sha := range cases {
+		t.Run(name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, ar, au, _ := newDeploymentServer(t, runID, stageID)
+			priv, _ := sf.issue(t, runID)
+			w := shipDeploymentRequest(t, s, runID, stageID, priv, deploymentBodyWithSHA(t, sha), "")
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			for _, want := range []string{"deployment_invalid", "sha must be a full 40- or 64-hex commit SHA"} {
+				if !strings.Contains(w.Body.String(), want) {
+					t.Errorf("body missing %q:\n%s", want, w.Body.String())
+				}
+			}
+			if len(ar.all) != 0 {
+				t.Errorf("artifacts = %d, want 0", len(ar.all))
+			}
+			if n := countByCategory(au, CategoryDeploymentOutcomeRecorded); n != 0 {
+				t.Errorf("deployment_outcome_recorded entries = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestShipDeployment_ValidSHA_201 pins the accepted shapes (40- and 64-hex,
+// either case): the body is stored verbatim with its sha, and the
+// deployment_outcome_recorded payload carries the same "sha" key.
+func TestShipDeployment_ValidSHA_201(t *testing.T) {
+	for _, sha := range []string{deploySHA40, deploySHA64, strings.ToUpper(deploySHA40)} {
+		t.Run(fmt.Sprintf("len=%d", len(sha)), func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, ar, au, _ := newDeploymentServer(t, runID, stageID)
+			priv, _ := sf.issue(t, runID)
+			body := deploymentBodyWithSHA(t, sha)
+			w := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			if len(ar.all) != 1 {
+				t.Fatalf("artifacts = %d, want 1", len(ar.all))
+			}
+			var stored deploymentBody
+			if err := json.Unmarshal(ar.all[0].Content, &stored); err != nil {
+				t.Fatalf("decode stored artifact: %v", err)
+			}
+			if stored.SHA != sha {
+				t.Errorf("stored sha = %q, want %q", stored.SHA, sha)
+			}
+			payload := string(payloadForCategory(au, CategoryDeploymentOutcomeRecorded))
+			if want := fmt.Sprintf(`"sha":%q`, sha); !strings.Contains(payload, want) {
+				t.Errorf("deployment_outcome_recorded payload missing %s: %s", want, payload)
+			}
+		})
+	}
+}
+
+// TestShipDeployment_HealedOutcomeEntryCarriesSHA pins the "sha" key on the
+// idempotent self-heal path (#1396): the governance entry appended by an
+// identical retry after a failed first append carries the record's sha, the
+// same shape the create path writes.
+func TestShipDeployment_HealedOutcomeEntryCarriesSHA(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newDeploymentServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := deploymentBodyWithSHA(t, deploySHA40)
+
+	au.appendErr = errors.New("boom")
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("first ship status = %d, want 500", w.Code)
+	}
+	au.appendErr = nil
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := string(payloadForCategory(au, CategoryDeploymentOutcomeRecorded))
+	if want := fmt.Sprintf(`"sha":%q`, deploySHA40); !strings.Contains(payload, want) {
+		t.Errorf("healed deployment_outcome_recorded payload missing %s: %s", want, payload)
+	}
+}
+
+// legacyDeploymentBody is the pre-#1599 deploymentBody shape (no sha field),
+// used to pin that a sha-less record's stored bytes are unchanged.
+type legacyDeploymentBody struct {
+	Environment    string `json:"environment"`
+	Ref            string `json:"ref"`
+	ExternalRunURL string `json:"external_run_url"`
+	Outcome        string `json:"outcome"`
+	RollbackHandle string `json:"rollback_handle,omitempty"`
+	RollbackAction string `json:"rollback_action,omitempty"`
+}
+
+// assertLegacyDeploymentBytes fails unless content carries no "sha" key and
+// is byte-identical to the pre-#1599 marshal of the same field values (so
+// its content hash, the idempotency key, is unchanged too).
+func assertLegacyDeploymentBytes(t *testing.T, content []byte) {
+	t.Helper()
+	if strings.Contains(string(content), `"sha"`) {
+		t.Errorf("artifact content carries a sha key: %s", content)
+	}
+	var d deploymentBody
+	if err := json.Unmarshal(content, &d); err != nil {
+		t.Fatalf("decode artifact: %v", err)
+	}
+	legacy, err := json.Marshal(legacyDeploymentBody{
+		Environment:    d.Environment,
+		Ref:            d.Ref,
+		ExternalRunURL: d.ExternalRunURL,
+		Outcome:        d.Outcome,
+		RollbackHandle: d.RollbackHandle,
+		RollbackAction: d.RollbackAction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(content, legacy) {
+		t.Errorf("artifact content = %s, want byte-identical pre-#1599 shape %s", content, legacy)
+	}
+}
+
+// TestResolveDeploymentFromPollState_CapturesHeadSHA pins the reconciler's
+// deployed-commit capture: git_ref is the symbolic dispatch ref "main", so the
+// polled run's head_sha is the fixture's ONLY full-SHA source. A full head_sha
+// (either case) lands lowercased in the artifact's sha and in the
+// deployment_outcome_recorded payload.
+func TestResolveDeploymentFromPollState_CapturesHeadSHA(t *testing.T) {
+	for _, head := range []string{deploySHA40, strings.ToUpper(deploySHA40), deploySHA64} {
+		t.Run(fmt.Sprintf("len=%d", len(head)), func(t *testing.T) {
+			s, _, ar, au, runID, stageID := newResolverServer(t)
+			wr := &githubclient.WorkflowRun{ID: 555, HTMLURL: "https://gh/run/555", Status: "completed", Conclusion: "success", HeadSHA: head}
+			if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcomeSucceeded, "main", wr); err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if len(ar.all) != 1 {
+				t.Fatalf("artifacts = %d, want 1", len(ar.all))
+			}
+			var stored deploymentBody
+			if err := json.Unmarshal(ar.all[0].Content, &stored); err != nil {
+				t.Fatalf("decode artifact: %v", err)
+			}
+			want := strings.ToLower(head)
+			if stored.SHA != want {
+				t.Errorf("artifact sha = %q, want %q", stored.SHA, want)
+			}
+			if stored.Ref != "main" {
+				t.Errorf("artifact ref = %q, want the dispatch ref %q", stored.Ref, "main")
+			}
+			payload := string(payloadForCategory(au, CategoryDeploymentOutcomeRecorded))
+			if w := fmt.Sprintf(`"sha":%q`, want); !strings.Contains(payload, w) {
+				t.Errorf("deployment_outcome_recorded payload missing %s: %s", w, payload)
+			}
+		})
+	}
+}
+
+// TestResolveDeploymentFromPollState_NoUsableHeadSHA_LegacyBytes pins the
+// omit-never-fatal posture: an absent run, an empty head_sha, or a malformed
+// one (abbreviated, non-hex) resolves the deploy normally and stores a record
+// with NO sha, byte-identical to the pre-#1599 body.
+func TestResolveDeploymentFromPollState_NoUsableHeadSHA_LegacyBytes(t *testing.T) {
+	cases := map[string]*githubclient.WorkflowRun{
+		"nil run":         nil,
+		"empty head_sha":  {ID: 1, HTMLURL: "https://gh/run/1", Status: "completed", Conclusion: "success"},
+		"abbreviated":     {ID: 1, HTMLURL: "https://gh/run/1", Status: "completed", Conclusion: "success", HeadSHA: deploySHA40[:7]},
+		"non-hex 40-char": {ID: 1, HTMLURL: "https://gh/run/1", Status: "completed", Conclusion: "success", HeadSHA: strings.Repeat("z", 40)},
+	}
+	for name, wr := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, rr, ar, au, runID, stageID := newResolverServer(t)
+			if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcomeSucceeded, "main", wr); err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+				t.Errorf("stage state = %q, want succeeded (a missing sha is never fatal)", got)
+			}
+			if len(ar.all) != 1 {
+				t.Fatalf("artifacts = %d, want 1", len(ar.all))
+			}
+			assertLegacyDeploymentBytes(t, ar.all[0].Content)
+			payload := string(payloadForCategory(au, CategoryDeploymentOutcomeRecorded))
+			if !strings.Contains(payload, `"sha":""`) {
+				t.Errorf("deployment_outcome_recorded payload = %s, want an empty sha", payload)
+			}
+		})
+	}
+}
+
+// TestResolveDeploymentRollbackFromPollState_CarriesNoSHA pins the deliberate
+// asymmetry: the rollback workflow's head_sha is NOT the deployed build, so a
+// rolled_back record carries no sha even when the polled run reports one.
+func TestResolveDeploymentRollbackFromPollState_CarriesNoSHA(t *testing.T) {
+	s, rr, ar, _, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded
+	wr := &githubclient.WorkflowRun{ID: 9, HTMLURL: "https://gh/run/9", Status: "completed", Conclusion: "success", HeadSHA: deploySHA40}
+	if err := s.ResolveDeploymentRollbackFromPollState(context.Background(), runID, stageID, "release", wr); err != nil {
+		t.Fatalf("resolve rollback: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts = %d, want 1", len(ar.all))
+	}
+	assertLegacyDeploymentBytes(t, ar.all[0].Content)
+}
+
+// TestIsDeployCommitSHA pins the helper's shape rule directly, including its
+// deliberate divergence from isFullCommitSHA (40-hex only) on a 64-hex value.
+func TestIsDeployCommitSHA(t *testing.T) {
+	cases := map[string]bool{
+		deploySHA40:                         true,
+		strings.ToUpper(deploySHA40):        true,
+		deploySHA64:                         true,
+		"":                                  false,
+		deploySHA40[:7]:                     false,
+		deploySHA40[:39]:                    false,
+		deploySHA40 + "0":                   false,
+		deploySHA64[:63]:                    false,
+		deploySHA64 + "0":                   false,
+		strings.Repeat("g", 40):             false,
+		"main":                              false,
+		deploySHA40[:39] + "-":              false,
+		strings.Repeat("0", 50):             false,
+		strings.Repeat("F", 64):             true,
+		" " + deploySHA40[:39]:              false,
+		deploySHA40[:20] + deploySHA40[:20]: true,
+	}
+	for in, want := range cases {
+		if got := isDeployCommitSHA(in); got != want {
+			t.Errorf("isDeployCommitSHA(%q) = %v, want %v", in, got, want)
+		}
+	}
+	if isFullCommitSHA(deploySHA64) {
+		t.Error("isFullCommitSHA accepts a 64-hex SHA; the run-admission helper must stay 40-hex only")
+	}
+}
