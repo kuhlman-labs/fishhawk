@@ -1,0 +1,14 @@
+id: scenario:issue-4046/runner-rejects-bad-gate-docker-config
+statement: A fishhawk-runner started with FISHHAWK_GATE_DOCKER_CONFIG set to a relative path or a dir without config.json exits with code 2 before any backend contact. Its stderr runner_failed reason=config line names the variable.
+verify_hint: CLI exit code + stderr runner_failed JSON line.
+steps: Built fishhawk-runner from the sanctioned checkout (HEAD 41058711 = preview git_sha). Ran env -u FISHHAWK_FORGE_WRITES -u DOCKER_CONFIG FISHHAWK_GATE_DOCKER_CONFIG=<v> fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://localhost:8090 --workflow feature_change --stage plan with v='good' (relative path), v=/tmp/fh4046/empty (an existing dir without config.json) and v=/tmp/fh4046/nope (missing). Captured exit code and stderr.
+assertions:
+    expected: exit 2 before backend contact; stderr runner_failed reason=config names FISHHAWK_GATE_DOCKER_CONFIG
+    observed_at_record: 'All exit 2. stderr is runner_started, then e.g. {"event":"runner_failed","reason":"config","detail":"FISHHAWK_GATE_DOCKER_CONFIG: invalid gate docker config: \"good\" is not an absolute path"} and "...\"/tmp/fh4046/empty\" has no readable config.json...". There is no forge_writes_healthz_probe line, which is the runner''s first backend contact on a valid start, so it failed before any backend contact.'
+    repro_handle: FISHHAWK_GATE_DOCKER_CONFIG=good fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://localhost:8090 --workflow feature_change --stage plan; echo $?
+origin:
+    issue: 4046
+    pr: 0
+    run_id: 16d27070-c32c-4327-a5d5-3f82629829cf
+    head_sha: 4105871109809c541d06b0d428888f8e80cad968
+    recorded_at: 2026-10-07T09:25:10Z
