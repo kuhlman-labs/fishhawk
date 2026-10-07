@@ -285,6 +285,18 @@ fields before a case lands. The committed
 demonstration (`synthetic: true`), per the same synthetic-seed
 discipline as the Tier-A/Tier-B seeds.
 
+**A distilled case needs a hand-curated `review_input.json` before commit
+(E55.4 / #2245).** The same corpus feeds the plan-review catch-rate gate,
+whose loader (`agenteval.LoadPlanReviewCatchCorpus`) reads each case's
+`review_input.json` — the issue text, a complete `standard_v1` plan carrying
+the missed criterion, and discriminating catch probes — and FAILS CLOSED in
+`scripts/test verify` on a case without one. The distiller writes only
+`miss.json` + `case.md`, so the operator authors `review_input.json` (shape:
+`backend/internal/agenteval/README.md` § "Corpus authoring") before
+committing the case. Adding a case also changes the evidence fingerprint and
+the pinned baseline's case set, so it obliges a re-measurement and a re-pin
+(`docs/compliance/planreview-catchrate-evidence.md`).
+
 The queryable metric lives on the API: `GET /v0/acceptance-triage/stats`
 (`backend/internal/server/acceptance_stats.go`, registered next to
 `/v0/calibration`) aggregates `acceptance_triage_decided` entries by
