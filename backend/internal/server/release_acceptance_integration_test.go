@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -200,7 +201,7 @@ func TestReleaseAcceptance_DeployThenAcceptance_EndToEnd_PgBacked(t *testing.T) 
 
 	if err := f.s.ResolveDeploymentFromPollState(ctx, runRow.ID, deploy.ID, run.DeployOutcomeSucceeded, "main",
 		&githubclient.WorkflowRun{ID: 777001, HTMLURL: "https://github.com/kuhlman-labs/example/actions/runs/777001",
-			Status: "completed", Conclusion: "success"}); err != nil {
+			Status: "completed", Conclusion: "success", HeadSHA: releaseDeployedSHA}); err != nil {
 		t.Fatalf("resolve deployment succeeded: %v", err)
 	}
 
@@ -241,6 +242,75 @@ func TestReleaseAcceptance_DeployThenAcceptance_EndToEnd_PgBacked(t *testing.T) 
 	if finalRun.State != run.StateRunning {
 		t.Fatalf("run state = %s, want running (the acceptance stage is now in flight)", finalRun.State)
 	}
+
+	// DEPLOYED-TARGET IDENTITY (E35.2 / #1599). The reconciler's git_ref is the
+	// symbolic "main"; the polled workflow run's head_sha is the fixture's ONLY
+	// full-SHA source, so the expectation below can only come from the stored
+	// artifact's sha (counterfactual C10) through the release arm (C1, C6). A
+	// release run writes no reported-head entry at all, so without the arm both
+	// resolve empty.
+	f.assertDeployedIdentity(t, runRow.ID, deploy.ID, acceptance.ID, releaseDeployedSHA)
+}
+
+// releaseDeployedSHA is the head_sha of the polled delegate workflow run in the
+// release seam — the build the deploy put on the staging host.
+const releaseDeployedSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+// assertDeployedIdentity reads the deploy stage's deployment artifact back
+// from Postgres and asserts its stored sha, the acceptance expected head the
+// prompt handlers serve, and the head a shipped verdict binds to — all equal
+// to want ("" means the release arm must fail closed on every surface).
+func (f *releaseAcceptanceSeam) assertDeployedIdentity(t *testing.T, runID, deployID, acceptanceID uuid.UUID, want string) {
+	t.Helper()
+	ctx := context.Background()
+	arts, err := f.artifacts.ListForStage(ctx, deployID)
+	if err != nil {
+		t.Fatalf("list deploy artifacts: %v", err)
+	}
+	var stored struct {
+		SHA *string `json:"sha"`
+	}
+	for _, a := range arts {
+		if a.Kind == artifact.KindDeployment {
+			if err := json.Unmarshal(a.Content, &stored); err != nil {
+				t.Fatalf("decode stored deployment artifact: %v", err)
+			}
+		}
+	}
+	switch {
+	case want == "" && stored.SHA != nil:
+		t.Errorf("stored deployment artifact carries sha %q, want no sha key", *stored.SHA)
+	case want != "" && (stored.SHA == nil || *stored.SHA != want):
+		t.Errorf("stored deployment artifact sha = %v, want %q", stored.SHA, want)
+	}
+	if got := f.s.resolveAcceptanceExpectedHeadSHA(ctx, runID, acceptanceID); got != want {
+		t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want %q", got, want)
+	}
+	sha, ok := f.s.acceptanceValidatedHeadSHA(ctx, runID, acceptanceID)
+	if sha != want || ok != (want != "") {
+		t.Errorf("acceptanceValidatedHeadSHA = (%q, %v), want (%q, %v)", sha, ok, want, want != "")
+	}
+}
+
+// TestReleaseAcceptance_SymbolicRefOnly_FailsClosed_PgBacked is the fail-closed
+// leg of the deployed-target identity seam: the delegate workflow run reports no
+// head_sha, so the stored deployment carries only the symbolic ref "main". The
+// acceptance stage still dispatches (the deploy succeeded), but both the served
+// expectation and the verdict binding resolve empty — never a guess.
+func TestReleaseAcceptance_SymbolicRefOnly_FailsClosed_PgBacked(t *testing.T) {
+	ctx := context.Background()
+	f := newReleaseAcceptanceSeam(t)
+	runRow, deploy, acceptance := f.startRelease(t)
+	f.approveDeploy(t, deploy)
+	if err := f.s.ResolveDeploymentFromPollState(ctx, runRow.ID, deploy.ID, run.DeployOutcomeSucceeded, "main",
+		&githubclient.WorkflowRun{ID: 777003, HTMLURL: "https://github.com/kuhlman-labs/example/actions/runs/777003",
+			Status: "completed", Conclusion: "success"}); err != nil {
+		t.Fatalf("resolve deployment succeeded: %v", err)
+	}
+	if n := f.acceptanceDispatchedRows(t, runRow.ID); n != 1 {
+		t.Fatalf("acceptance_dispatched rows after the deploy succeeded = %d, want 1", n)
+	}
+	f.assertDeployedIdentity(t, runRow.ID, deploy.ID, acceptance.ID, "")
 }
 
 // TestReleaseAcceptance_DeployFailed_NeverDispatchesAcceptance_PgBacked is the
