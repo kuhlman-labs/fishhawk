@@ -15,6 +15,7 @@ and the forge is only read.
 | `classify.go` | `Classify`, the closed recognised-marker list, `CaptainLoginFor` |
 | `store.go` | `Store` over `user_report_cursors` (migration 0096): `Get`, `Init`, `Advance`; the closed `Source` set (`issues` plus its `issue_notes` note-floor row) |
 | `scan.go` | `Scan`, `Report`, the report-level degradation set, `Recorder` |
+| `comms.go` | The comms draft marker (E81.5 / #4011): `CommsMarkerName`, `CommsMarkerPrefix`, `MarkedReport`, `DraftMarker`, `ParseDraftMarkers`, `ContentHash` |
 
 ## Classification
 
@@ -37,14 +38,64 @@ title edit quotes the new title), so it is always `bot` and never
 Recognised markers (closed list, `recognisedMarkers`): `fishhawk-intake:v1`
 (`intakegroom.MarkerPrefix`, imported), `fishhawk-upkeep:v1` (pinned against
 `upkeep.FindingMarker`), `fishhawk-fingerprint` and `fishhawk-sticky`
-(literals; their renderers are unexported). E81.5 appends its comms marker.
+(literals; their renderers are unexported), and `fishhawk-comms:v1`
+(`CommsMarkerPrefix`, pinned against `DraftMarker`).
 `TestClassify_MarkerPrefixesMatchProducers` fails when the list grows without a
-producer check.
+producer check. `markerIn` reports the FIRST matching marker and comms is
+last, so a draft also carrying the intake marker reports basis
+`marker:fishhawk-intake:v1`; its class is `fishhawk_filed` either way, and a
+consumer reads `ParseDraftMarkers`, never the basis string.
 
 The captain counts only when its subject is provider-qualified
 (`captain.IdentityVerified`) with the page's own forge prefix
 (`CaptainLoginFor`). The captain record is read with the scan's `Repo` string,
 so the cursor and the captain record must be keyed by the same repo string.
+
+## Comms draft marker
+
+A captain-approved user-report draft (E81.5 / #3775) carries one marker naming
+the reports it answers and each report's content hash at proposal time, so a
+later scan can suppress re-proposing a report that has not materially changed.
+
+**Format.** One line: `<!-- fishhawk-comms:v1 {"reports":[{"id":"UR-issue-7","content_hash":"<64 hex>"}]} -->`.
+`CommsMarkerPrefix` is the full HTML-comment opening `<!-- fishhawk-comms:v1 `,
+the `intakegroom.MarkerPrefix` convention, so prose quoting the bare token does
+not match. `DraftMarker` keeps only valid entries, dedupes on `(id,
+content_hash)`, sorts by id then hash, and returns `""` when nothing valid
+remains. `json.Marshal` escapes `<`, `>` and `&`, and a valid entry holds only
+`[A-Za-z0-9-]`, so no payload can contain `-->` or a line break.
+
+**Entry validity.** `content_hash` matches `^[0-9a-f]{64}$`. `id` is CANONICAL:
+it parses as `UR-issue-<n>` (n ≥ 1) or `UR-comment-<n>-<c>` (n, c ≥ 1) and
+equals what `prompt.UserReportID` renders for those values, which rejects
+leading zeros, signs and spaces. `UR-unknown-*` is refused because
+`workmgmt.UserReportKind` is closed to `issue` and `comment`. An unparsable id
+loses suppression and is re-proposed — never hidden.
+
+**Strict parsing.** `ParseDraftMarkers(body)` walks EVERY occurrence of the
+prefix and returns the deduped, sorted union of valid entries plus a
+`malformed` count. A whole marker is dropped and counted when it is
+unterminated, spans a line break before its ` -->`, fails strict decoding
+(`DisallowUnknownFields` at every depth, a non-object payload), lacks the
+`reports` key or carries it as `null`, or carries a second JSON value or
+trailing data. Inside a well-formed marker each invalid entry is dropped
+individually and NOT counted, so `{"reports":[]}` is well-formed with no
+entries. Go's `encoding/json` matches field names case-insensitively and
+keeps the last of duplicate keys; neither widens what an entry can carry,
+because every entry is re-validated.
+
+**`ContentHash(kind, title, body)`** is the lowercase-hex sha256 of the
+normalized text, where `normalize(s) = TrimSpace(ReplaceAll(s, "\r\n",
+"\n"))`. An issue hashes `normalize(title) + "\n" + normalize(body)`; a
+comment (or any non-issue kind) hashes `normalize(body)` and ignores the
+title. A known-answer vector in `comms_test.go` pins the exact input. Phases
+4 and 7 call this function rather than re-deriving it.
+
+**Trust rule.** The marker is attacker-writable body text. It is trusted ONLY
+on an item `Classify` reports as `fishhawk_filed`; a `Result` with
+`MarkerFromExternal` set is never trusted. The consumers — the scan's
+suppression read (phase 4, #4014) and the on-approval filing that renders the
+marker (phase 7, #4017) — enforce that; this package only renders and parses.
 
 ## Cursor
 

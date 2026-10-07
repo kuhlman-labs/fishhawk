@@ -91,6 +91,30 @@ func TestClassify_FishhawkFiledTakesPrecedenceOverBotAndInternal(t *testing.T) {
 	}
 }
 
+// TestClassify_CommsMarker pins the comms marker's classification (E81.5 /
+// #3775): an internal author's comms-marked draft is fishhawk_filed via the
+// comms marker, and an external author's forged comms marker stays external
+// with MarkerFromExternal — the marker is attacker-writable body text.
+// Mechanism: without the recognisedMarkers entry the internal row classifies
+// internal, and the forged row loses its MarkerFromExternal flag.
+func TestClassify_CommsMarker(t *testing.T) {
+	marker := DraftMarker([]MarkedReport{{ID: "UR-comment-4-9", ContentHash: strings.Repeat("b", 64)}})
+	if marker == "" {
+		t.Fatal("DraftMarker rendered nothing for a valid entry")
+	}
+	body := "Thanks for the report.\n\n" + marker
+
+	got := Classify(workmgmt.UserReportItem{Kind: workmgmt.UserReportKindComment, Author: author("maint", "MEMBER", true, false), Body: body}, ClassifyContext{})
+	if got.Class != ClassFishhawkFiled || got.Basis != "marker:fishhawk-comms:v1" || got.MarkerFromExternal {
+		t.Errorf("internal author comms marker: Classify = %+v, want fishhawk_filed via marker:fishhawk-comms:v1", got)
+	}
+
+	forged := Classify(workmgmt.UserReportItem{Kind: workmgmt.UserReportKindComment, Author: author("rando", "NONE", false, false), Body: body}, ClassifyContext{})
+	if forged.Class != ClassExternal || !forged.MarkerFromExternal {
+		t.Errorf("external author comms marker: Classify = %+v, want external with MarkerFromExternal", forged)
+	}
+}
+
 // TestClassify_SystemNoteNeverFishhawkFiled (#3771 concern 13c665e0): a
 // system note is forge-rendered around actor-controlled text, so a marker in
 // it never earns fishhawk_filed — it stays bot, with MarkerFromExternal set —
@@ -164,6 +188,7 @@ func TestClassify_MarkerPrefixesMatchProducers(t *testing.T) {
 		"fishhawk-upkeep:v1":   upkeep.FindingMarker("flake:TestA"),
 		"fishhawk-fingerprint": "<!-- fishhawk-fingerprint:abc123 -->",
 		"fishhawk-sticky":      "<!-- fishhawk-sticky locus=anchor run=00000000-0000-0000-0000-000000000000 -->",
+		"fishhawk-comms:v1":    DraftMarker([]MarkedReport{{ID: "UR-issue-1", ContentHash: strings.Repeat("a", 64)}}),
 	}
 	if len(cases) != len(recognisedMarkers) {
 		t.Fatalf("recognisedMarkers has %d entries, this test covers %d — add the new marker's producer here", len(recognisedMarkers), len(cases))

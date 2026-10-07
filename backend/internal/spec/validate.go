@@ -529,11 +529,53 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					if k == j {
 						continue
 					}
-					if other.Artifact == ArtifactPlan || other.Artifact == ArtifactGroomingReport {
+					if other.Artifact == ArtifactPlan || other.Artifact == ArtifactGroomingReport || other.Artifact == ArtifactCommsReport {
 						return &ValidationError{
 							Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
 							Message: fmt.Sprintf(
 								"stage %q declares both the upkeep_report and %s artifacts; a propose stage proposes one thing — drop whichever this stage does not emit (E79.2)",
+								stage.ID, other.Artifact,
+							),
+						}
+					}
+				}
+			}
+			// The comms_report artifact (E81.5 / #3775) is the user-report-scan
+			// sibling of the upkeep_report binding above: emitted only by a
+			// `plan`-typed PROPOSE stage (ADR-067 §2), schema-versioned, and
+			// never beside another proposal artifact. Like the upkeep block it
+			// runs for whichever produces entry carries the artifact; the
+			// upkeep block's conflict list names comms_report too, so an
+			// upkeep-first pair is refused at the upkeep entry and every other
+			// order of a conflicting pair is refused here.
+			if p.Artifact == ArtifactCommsReport {
+				if stage.Type != StageTypePlan {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+						Message: fmt.Sprintf(
+							"comms_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 — not a %q stage (E81.5)",
+							stage.Type,
+						),
+					}
+				}
+				if p.Schema != CommsReportSchemaVersion {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/schema", j)),
+						Message: fmt.Sprintf(
+							"comms_report-producing stage must declare schema: %s, got %q",
+							CommsReportSchemaVersion, p.Schema,
+						),
+					}
+				}
+				for k, other := range stage.Produces {
+					if k == j {
+						continue
+					}
+					if other.Artifact == ArtifactPlan || other.Artifact == ArtifactGroomingReport || other.Artifact == ArtifactUpkeepReport {
+						return &ValidationError{
+							Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+							Message: fmt.Sprintf(
+								"stage %q declares both the comms_report and %s artifacts; a propose stage proposes one thing — drop whichever this stage does not emit (E81.5)",
 								stage.ID, other.Artifact,
 							),
 						}

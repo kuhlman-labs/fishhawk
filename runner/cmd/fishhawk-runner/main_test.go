@@ -2246,6 +2246,77 @@ func TestRun_PlanStage_UpkeepReportWinsOverStructuredOutput(t *testing.T) {
 	}
 }
 
+// TestValidatePlan_CommsReportByteIdentical is the same gate for the comms
+// sibling (E81.5 / #3775). Like the upkeep fixture, generated_by is a BARE
+// STRING — a registered string-elision coercion path — so an ungated
+// validatePlan runs TryCoerce and REWRITES the file in place; the assertion
+// reads the bytes back from disk after the call, so deleting the sibling entry
+// reddens it on the rewritten bytes rather than on an error value.
+func TestValidatePlan_CommsReportByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.json")
+	report := `{"kind":"comms_report","report_version":"comms_report_v1","generated_by":"claude-opus-5","drafts":[{"id":"d-1","reports":["UR-issue-1"],"summary":"s"}]}`
+	if err := os.WriteFile(path, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ev, err := validatePlan(path)
+	// Errorf, NOT Fatalf: the load-bearing assertion is the byte-identity
+	// read from disk BELOW, so the counterfactual lands on committed state.
+	if err != nil {
+		t.Errorf("validatePlan on a comms_report = %v, want nil (validation is the backend's job)", err)
+	}
+	if !strings.Contains(string(ev.Payload), `"outcome":"comms_report"`) {
+		t.Errorf("event missing outcome=comms_report: %s", ev.Payload)
+	}
+	onDisk, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) != report {
+		t.Errorf("validatePlan rewrote the comms_report (TryCoerce ran):\n got %q\nwant %q", onDisk, report)
+	}
+}
+
+// TestRun_PlanStage_CommsReportWinsOverStructuredOutput mirrors the upkeep
+// case at the run() seam: a comms_report written to the plan-out file must
+// survive a plan-stage invocation that ALSO produced a structured_output, and
+// must not be plan-validated or clarification-stripped. The byte-identity read
+// is COMMITTED STATE from disk after run() returns.
+func TestRun_PlanStage_CommsReportWinsOverStructuredOutput(t *testing.T) {
+	report := validCommsReportJSON()
+	args, planPath, bundlePath := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{
+		// structured_output ALSO carries a (throwaway) plan — the sibling must win.
+		canned: agent.Result{OK: true, StructuredOutput: []byte(validPlanJSON())},
+	})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != report {
+		t.Errorf("plan-out file = %q, want the untouched comms_report %q", onDisk, report)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "comms_report") {
+		t.Errorf("missing comms_report policy_event:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("structured_output was adopted but the comms_report should have won:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "invalid") {
+		t.Errorf("comms_report was mis-validated against standard_v1:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "clarification_props_stripped") {
+		t.Errorf("clarification prop-stripping ran on a comms_report:\n%+v", events)
+	}
+}
+
 // TestValidatePlan_ClarificationByteIdentical is the same gate for the other
 // recognized kind — the sibling set has two members and both must skip the
 // coerce+validate path.
@@ -19457,6 +19528,14 @@ func validUpkeepReportJSON() string {
 	return `{"kind":"upkeep_report","report_version":"upkeep_report_v1","generated_by":{"agent":"claude","model":"opus"},"findings":[{"id":"f-1","category":"flake","summary":"recorded-run flake in TestX"}]}`
 }
 
+// validCommsReportJSON is a minimal comms_report sibling (E81.5 / #3775). The
+// runner never validates it (the comms_report_v1 schema and its ingest handler
+// land in the BACKEND, #4015), so this fixture only needs the top-level "kind"
+// discriminator plus enough body to prove byte-identity.
+func validCommsReportJSON() string {
+	return `{"kind":"comms_report","report_version":"comms_report_v1","generated_by":{"agent":"claude","model":"opus"},"drafts":[{"id":"d-1","reports":["UR-issue-1"],"summary":"answer the reporter"}]}`
+}
+
 // TestDetectPlanSibling pins the runner-side top-level "kind" peek (#1057
 // slice 3, generalized to a recognized-sibling SET by #2833): a
 // clarification_request or a grooming_report is detected and yields a
@@ -19486,6 +19565,7 @@ func TestDetectPlanSibling(t *testing.T) {
 		{"clarification_request", write("clar.json", validClarificationJSON()), "clarification_request"},
 		{"grooming_report", write("groom.json", validGroomingReportJSON()), "grooming_report"},
 		{"upkeep_report", write("upkeep.json", validUpkeepReportJSON()), "upkeep_report"},
+		{"comms_report", write("comms.json", validCommsReportJSON()), "comms_report"},
 	}
 	for _, tc := range hits {
 		t.Run(tc.name+" detected", func(t *testing.T) {

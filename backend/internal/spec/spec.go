@@ -1103,8 +1103,9 @@ type ArtifactKind string
 // artifact (ADR-049 / #1531) — valid only on an acceptance stage;
 // grooming_report is the v2 propose-stage artifact (ADR-065 §3 / #2235)
 // — valid only on a `plan`-typed stage, which ADR-067 §2 reads as
-// PROPOSE; upkeep_report is the v2 upkeep-scan proposal (E79.2 / #3726),
-// bound the same way. All four stage-type bindings are enforced by Validate.
+// PROPOSE; upkeep_report is the v2 upkeep-scan proposal (E79.2 / #3726)
+// and comms_report the v2 user-report-scan proposal (E81.5 / #3775), both
+// bound the same way. All five stage-type bindings are enforced by Validate.
 const (
 	ArtifactPlan        ArtifactKind = "plan"
 	ArtifactPullRequest ArtifactKind = "pull_request"
@@ -1121,10 +1122,18 @@ const (
 	// PROPOSE stage emits instead of a plan (E79.2 / #3726). Declared only
 	// at workflow-v2 (v0 and v1 are frozen majors whose produces enums keep
 	// rejecting it). A stage declaring it MUST also declare schema:
-	// upkeep_report_v1, and may not ALSO declare the plan or grooming_report
-	// artifact — a propose stage proposes one thing. The upkeep_report_v1
+	// upkeep_report_v1, and may not ALSO declare the plan, grooming_report or
+	// comms_report artifact — a propose stage proposes one thing. The upkeep_report_v1
 	// contract and its ingest handler land in #3921.
 	ArtifactUpkeepReport ArtifactKind = "upkeep_report"
+	// ArtifactCommsReport is the user-report-scan proposal a `plan`-typed
+	// PROPOSE stage emits instead of a plan (E81.5 / #3775). Declared only
+	// at workflow-v2 (v0 and v1 are frozen majors whose produces enums keep
+	// rejecting it). A stage declaring it MUST also declare schema:
+	// comms_report_v1, and may not ALSO declare the plan, grooming_report
+	// or upkeep_report artifact — a propose stage proposes one thing. The
+	// comms_report_v1 contract and its ingest handler land in #4015.
+	ArtifactCommsReport ArtifactKind = "comms_report"
 )
 
 // WorkflowRequiresCharter is the STRUCTURAL discriminator for a backlog-
@@ -1149,6 +1158,13 @@ const (
 // An upkeep_report workflow (E79.2) requires NO charter: the discriminator
 // keys on grooming_report only, because an upkeep scan ranks nothing against
 // a vision document.
+//
+// A comms_report workflow (E81.5 / #3775) is deliberately NOT keyed here
+// either, although the user-report scan does need a comms charter: extending
+// this predicate would route the scan prompt into the grooming builder
+// through assertCharterInjected. The comms charter requirement is enforced
+// instead when the scan prompt is served (phase 4, #4014), so `fishhawk
+// validate` and run admission accept a charterless user_report_scan.
 func WorkflowRequiresCharter(wf Workflow) bool {
 	for _, st := range wf.Stages {
 		for _, p := range st.Produces {
@@ -1176,6 +1192,23 @@ const UpkeepReportSchemaVersion = "upkeep_report_v1"
 func StageProducesUpkeepReport(st Stage) bool {
 	for _, p := range st.Produces {
 		if p.Artifact == ArtifactUpkeepReport {
+			return true
+		}
+	}
+	return false
+}
+
+// CommsReportSchemaVersion is the `schema:` token a comms_report-producing
+// stage must declare (E81.5 / #3775), the user-report-scan sibling of
+// UpkeepReportSchemaVersion.
+const CommsReportSchemaVersion = "comms_report_v1"
+
+// StageProducesCommsReport reports whether st declares the comms_report
+// artifact in its produces list. Pure — no I/O — and keyed on what the stage
+// PRODUCES, not on a workflow or stage name, like StageProducesUpkeepReport.
+func StageProducesCommsReport(st Stage) bool {
+	for _, p := range st.Produces {
+		if p.Artifact == ArtifactCommsReport {
 			return true
 		}
 	}

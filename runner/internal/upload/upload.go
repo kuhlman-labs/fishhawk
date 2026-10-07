@@ -1504,7 +1504,10 @@ func TruncateReason(s string, max int) string {
 // backend/internal/server/plan.go; grooming_report_invalid and
 // grooming_report_stage_invalid in backend/internal/server/grooming_report.go;
 // upkeep_report_invalid and upkeep_report_stage_invalid in
-// backend/internal/server/upkeep_report.go (E79 / #3921). All six arrive on the SAME
+// backend/internal/server/upkeep_report.go (E79 / #3921); comms_report_invalid
+// and comms_report_stage_invalid (E81.5 / #3775) are FORWARD DECLARATIONS that
+// the phase-5 comms_report ingest handler (#4015) must emit verbatim, or a bad
+// comms report degrades to category-C. All eight arrive on the SAME
 // endpoint — POST /v0/runs/{run_id}/plan routes by the artifact's top-level
 // "kind" discriminator (#2833).
 //
@@ -1516,6 +1519,8 @@ var agentOutputInvalidCodes = map[string]struct{}{
 	"grooming_report_stage_invalid": {},
 	"upkeep_report_invalid":         {},
 	"upkeep_report_stage_invalid":   {},
+	"comms_report_invalid":          {},
+	"comms_report_stage_invalid":    {},
 	"clarification_request_invalid": {},
 }
 

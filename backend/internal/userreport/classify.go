@@ -4,6 +4,9 @@
 // hands the result to a caller's Recorder, and advances the forge-anchored
 // cursor (user_report_cursors, migration 0096) only after the record
 // succeeds. Nothing in production calls Scan yet (E81.5 / #3775 wires it).
+// comms.go adds the comms draft-marker primitives (DraftMarker,
+// ParseDraftMarkers, ContentHash); the marker is attacker-writable body text,
+// trusted only on an item classified fishhawk_filed.
 // Contract: README.md.
 package userreport
 
@@ -61,13 +64,15 @@ type recognisedMarker struct {
 //     writes (unexported renderer; literal).
 //   - sticky: the issuecomment sticky-comment marker (unexported renderer;
 //     literal).
-//
-// E81.5 (#3775) appends its comms marker here.
+//   - comms: CommsMarkerPrefix, this package's DraftMarker output (E81.5 /
+//     #3775; pinned against DraftMarker by
+//     TestClassify_MarkerPrefixesMatchProducers).
 var recognisedMarkers = []recognisedMarker{
 	{name: "fishhawk-intake:v1", prefix: intakegroom.MarkerPrefix},
 	{name: "fishhawk-upkeep:v1", prefix: "<!-- fishhawk-upkeep:v1 finding_id="},
 	{name: "fishhawk-fingerprint", prefix: "<!-- fishhawk-fingerprint:"},
 	{name: "fishhawk-sticky", prefix: "<!-- fishhawk-sticky "},
+	{name: CommsMarkerName, prefix: CommsMarkerPrefix},
 }
 
 // markerIn returns the name of the first recognised marker body carries, or
