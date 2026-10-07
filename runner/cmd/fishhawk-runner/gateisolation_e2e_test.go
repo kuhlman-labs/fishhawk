@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ import (
 //
 // These cross gateiso → the runner wiring (runBoundedGateArgv,
 // runVerifyCommittedTree, runVerifyFixLoop) → a REAL container runtime and
-// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o) skips with
+// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o), (p) skips with
 // the detected reason when no safe runtime or the image is unavailable, and
 // increments dockerFixturesRan at its END so main_test.go's TestMain
 // sentinel (approval condition 3) turns an all-skipped run on a docker host
@@ -914,14 +915,20 @@ func recordAuxExec(t *testing.T) *[][]string {
 }
 
 // runtimeHostCmd runs `<bin> <endpoint binding> args…` on the HOST under an
-// env bound to the validated endpoint — the inspection side of the fixtures.
+// env bound to the validated endpoint and a throwaway anonymous docker config
+// (#4046) — the inspection side of the fixtures.
 func runtimeHostCmd(t *testing.T, rt gateiso.Runtime, args ...string) (string, error) {
 	t.Helper()
 	endpoint, err := rt.EndpointArgs()
 	if err != nil {
 		t.Fatalf("endpoint args: %v", err)
 	}
-	env, err := rt.BindEndpointEnv(os.Environ())
+	cfg, err := gateiso.NewAnonymousDockerConfig(gateiso.OperatorPluginDirs(os.Getenv))
+	if err != nil {
+		t.Fatalf("anonymous docker config: %v", err)
+	}
+	defer func() { _ = cfg.Remove() }()
+	env, err := rt.BindEndpointEnv(os.Environ(), cfg.Dir)
 	if err != nil {
 		t.Fatalf("bind endpoint env: %v", err)
 	}
@@ -1447,6 +1454,141 @@ func TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses(t *testi
 	a.cleanup()
 	if out, err := runtimeHostCmd(t, rt, "volume", "inspect", volA); err == nil {
 		t.Errorf("volume %s survives A.cleanup():\n%s", volA, out)
+	}
+	dockerFixturesRan++
+}
+
+// (p) TestGateContainer_PublicPullIgnoresBlockingCredsStore (E51.26 / #4046):
+// on a docker host whose inherited DOCKER_CONFIG names a credsStore that
+// never answers — the locked-screen Docker Desktop shape — a container-path
+// gate still pulls a PUBLIC image and passes, because every post-selection
+// runtime call is pinned to the runner-owned anonymous config. Precondition
+// (#4046 approval condition 5): a direct `docker pull` under that config, in
+// its own process group, has NOT completed within 15s (then the group is
+// killed — the fixture never waits for the hang) and did invoke the helper;
+// a pull that completes means the fixture discriminates nothing and FAILS.
+// Condition 4(b): DetectRuntime, which runs before the seam under the
+// inherited env, also runs under the blocking config here and invokes no
+// helper. A logging fake of the PLATFORM DEFAULT helper (osxkeychain on
+// darwin; pass and secretservice on linux) sits first on PATH throughout and
+// must record zero calls: with an empty auths map the docker CLI auto-detects
+// that helper and consults it even for an anonymous public pull, which the
+// anonymous config's placeholder auths entry prevents (#4046 review).
+// DOCKER_HOST is pinned to the socket requireGateImage already validated, and
+// DOCKER_CONTEXT cleared, so detection under the blocking config (which holds
+// no context metadata) resolves the default context to that socket on a
+// context-based Docker Desktop install with no /var/run/docker.sock.
+func TestGateContainer_PublicPullIgnoresBlockingCredsStore(t *testing.T) {
+	rt, image := requireGateImage(t)
+	if rt.Kind != gateiso.KindDocker {
+		t.Skipf("the blocking-credsStore precondition is docker-CLI specific (runtime %s)", rt.Kind)
+	}
+	helpers := t.TempDir()
+	helperLog := filepath.Join(helpers, "calls.log")
+	helper := filepath.Join(helpers, "docker-credential-fhblock")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\necho called >> \"$FH_HELPER_LOG\"\nsleep 600\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	blocking := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blocking, "config.json"), []byte(`{"auths":{},"credsStore":"fhblock"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	platformLog := filepath.Join(helpers, "platform-calls.log")
+	platformDefaults := map[string][]string{"darwin": {"osxkeychain"}, "linux": {"pass", "secretservice"}}[runtime.GOOS]
+	if len(platformDefaults) == 0 {
+		t.Skipf("no platform-default docker credential helper is known for %s", runtime.GOOS)
+	}
+	for _, name := range platformDefaults {
+		fake := "#!/bin/sh\necho \"" + name + " $*\" >> \"$FH_PLATFORM_HELPER_LOG\"\necho 'credentials not found in native keychain'\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(helpers, "docker-credential-"+name), []byte(fake), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", helpers+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_CONFIG", blocking)
+	t.Setenv("DOCKER_HOST", "unix://"+rt.SocketPath)
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("FH_HELPER_LOG", helperLog)
+	t.Setenv("FH_PLATFORM_HELPER_LOG", platformLog)
+	helperCalls := func() string { b, _ := os.ReadFile(helperLog); return string(b) }
+	platformCalls := func() string { b, _ := os.ReadFile(platformLog); return string(b) }
+
+	// Precondition: the blocking store DOES hang a direct pull on this host.
+	endpoint, err := rt.EndpointArgs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pull := exec.Command(rt.Kind.Binary(), append(endpoint, "pull", "-q", image)...)
+	pull.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := pull.Start(); err != nil {
+		t.Fatalf("precondition pull: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- pull.Wait() }()
+	select {
+	case err := <-done:
+		t.Fatalf("precondition: a direct pull under the blocking credsStore COMPLETED within 15s (%v; helper calls %q): the fixture would discriminate nothing", err, helperCalls())
+	case <-time.After(15 * time.Second):
+		_ = syscall.Kill(-pull.Process.Pid, syscall.SIGKILL)
+		<-done
+	}
+	if helperCalls() == "" {
+		t.Fatal("precondition: the direct pull hung but never invoked docker-credential-fhblock")
+	}
+	if err := os.Remove(helperLog); err != nil {
+		t.Fatal(err)
+	}
+
+	// Runtime detection runs before the seam with the inherited env: it must
+	// invoke no credential helper (a hung probe would classify unsafe at 15s).
+	start := time.Now()
+	if det := gateiso.DetectRuntime(context.Background(), gateiso.DefaultProbes()); !det.Safe || time.Since(start) > 14*time.Second {
+		t.Fatalf("DetectRuntime under the blocking config = safe %t after %s: %s", det.Safe, time.Since(start), det.Reason)
+	}
+	if calls := helperCalls(); calls != "" {
+		t.Fatalf("DetectRuntime invoked the credential helper: %q", calls)
+	}
+
+	// The gate: a declared tag-only image is ALWAYS pulled, under the bound env.
+	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateCacheEnvVar: "off"}), gateiso.DefaultProbes(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return rt }
+	st.declare(&upload.GateContainerConfig{Image: image, Source: gateiso.ImageSourceStage})
+	installGateState(t, st)
+	var pullConfig []string
+	prev := execGateAuxArgvFn
+	execGateAuxArgvFn = func(ctx context.Context, argv []string, dir string, env []string, d time.Duration) (string, int, bool) {
+		if slices.Contains(argv, "pull") {
+			for _, kv := range env {
+				if v, ok := strings.CutPrefix(kv, "DOCKER_CONFIG="); ok {
+					pullConfig = append(pullConfig, v)
+				}
+			}
+		}
+		return prev(ctx, argv, dir, env, d)
+	}
+	t.Cleanup(func() { execGateAuxArgvFn = prev })
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, code, disp := runBoundedGateCommandDisposed(ctx, "echo gate=ran", t.TempDir(), filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if code != 0 || disp != gateExecuted || outputField(out, "gate") != "ran" {
+		t.Fatalf("gate under the blocking credsStore = %d / %s:\n%s", code, disp, out)
+	}
+	minted := st.dockerConfig.Dir
+	if len(pullConfig) != 1 || pullConfig[0] != minted || minted == blocking {
+		t.Errorf("pull ran with DOCKER_CONFIG %q, want exactly the runner-owned %q (never %q)", pullConfig, minted, blocking)
+	}
+	if calls := helperCalls(); calls != "" {
+		t.Errorf("the gate path invoked the blocking helper: %q", calls)
+	}
+	if calls := platformCalls(); calls != "" {
+		t.Errorf("the gate path invoked the platform-default credential helper %v (the anonymous config let the docker CLI auto-detect it): %q", platformDefaults, calls)
+	}
+	st.cleanup()
+	if _, err := os.Stat(minted); !os.IsNotExist(err) {
+		t.Errorf("cleanup left the runner-owned docker config %s: %v", minted, err)
 	}
 	dockerFixturesRan++
 }

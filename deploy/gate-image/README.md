@@ -122,18 +122,21 @@ as your uid. It answers "would CI's toolchain pass this tree", nothing about
 containing what the gate executes; that is the runner's container path
 (ADR-063), not this helper.
 
-**Docker Desktop: a blocked credential helper hangs the pull.** Observed on
-Docker Desktop for macOS (2026-10-06): when `docker-credential-desktop get`
-blocks (presumed to be waiting on keychain access), step 4's pull makes no
-progress and prints no error; the tell is a `docker-credential-desktop get`
-child under the `docker` process. This is the environment, not the image or the
-script. Remedy and the per-step
-bounds the runner applies: `runner/README.md` § "Gate isolation" (Docker
-Desktop: hung credential helper). The anonymous-pull remedy (`DOCKER_CONFIG` at
-a config with no `credsStore`, no `credHelpers` and no inline `auths` entries, plus an explicit
-`DOCKER_HOST`) works for the default `ghcr.io/kuhlman-labs/fishhawk-gate:main`
-only after the one-time public-visibility step below, and never for a private
-image.
+**Docker Desktop: a locked screen hangs this helper's pull.** This helper
+pulls under YOUR docker config. On Docker Desktop for macOS that config's
+`"credsStore": "desktop"` is consulted even for an anonymous public pull, and
+`docker-credential-desktop get` blocks for as long as the macOS screen is
+LOCKED (#4046), so step 4's pull makes no progress and prints no error; the
+tell is a `docker-credential-desktop get` child under the `docker` process.
+This is the environment, not the image or the script. Unlock the screen, or
+use the anonymous-pull remedy (`DOCKER_CONFIG` at a fresh config holding only
+`{"auths":{"fishhawk.invalid":{}}}` — no `credsStore`, no `credHelpers`, no
+credential; a bare `{"auths":{}}` still lets the CLI auto-detect and call
+`docker-credential-osxkeychain` — plus an explicit `DOCKER_HOST`): `docs/deploy/self-hosted.md` § "Docker Desktop: a locked screen
+and the credential helper". It works for the default
+`ghcr.io/kuhlman-labs/fishhawk-gate:main` only after the one-time
+public-visibility step below, and never for a private image. The RUNNER needs
+no such remedy: since #4046 it pins its own credential-free docker config.
 
 **Limits.** The `go test -race` loop and the patch-coverage gate do not run
 in-image here: the backend tests need a Postgres, and this helper provisions
@@ -180,12 +183,12 @@ container-path verify with pgtest-backed PASS lines and no `--- SKIP` — in
 `runner/internal/gateiso/README.md` § "Gate services (#2137)", which is also
 the contract.
 
-On Docker Desktop for macOS, a blocked `docker-credential-desktop get` makes the
-runner's image pull for this image hang silently (each runner pulling step is
-bounded and fails or degrades at its bound). Symptom and remedy:
-`runner/README.md` § "Gate isolation" (Docker Desktop: hung credential helper).
-The anonymous-pull `DOCKER_CONFIG` remedy covers this image only once its GHCR
-package is public (§ "One-time operator steps"), not a private image.
+The runner pulls this image under a runner-owned, credential-free docker
+config (E51.26 / #4046), so a locked macOS screen no longer hangs that pull —
+but the pull then succeeds only once the GHCR package is public (§ "One-time
+operator steps"). A private copy needs `FISHHAWK_GATE_DOCKER_CONFIG` naming a
+config that holds GHCR credentials. Contract: `runner/README.md` § "Gate
+isolation" (Runtime CLI credentials).
 
 ## One-time operator steps
 

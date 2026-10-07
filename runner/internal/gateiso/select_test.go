@@ -102,7 +102,30 @@ func TestSelect_Table(t *testing.T) {
 			if sel.Mode != r.mode || sel.Profile != r.profile || sel.Image != r.image || sel.Runtime != r.rt || sel.Sandbox != r.sb {
 				t.Fatalf("selection does not echo its inputs: %+v", sel)
 			}
+			// E51.26 / #4046: the credential posture is the RUNNER's stamp on
+			// a container-path selection; Select never sets it.
+			if sel.Credentials != "" {
+				t.Fatalf("Select set Credentials = %q; only the runner stamps it", sel.Credentials)
+			}
 		})
+	}
+}
+
+// TestSelection_CredentialsRecordedWhenStamped: the runner-stamped posture
+// marshals as `credentials`, and an unstamped selection omits the key (so
+// TestSelect_ExistingInputsByteIdentical's bytes do not move).
+func TestSelection_CredentialsRecordedWhenStamped(t *testing.T) {
+	sel := Select(Inputs{Mode: ModeContainer, Profile: ProfileLocal, Image: "img", Runtime: safeRT})
+	raw, _ := json.Marshal(sel)
+	if strings.Contains(string(raw), `"credentials"`) {
+		t.Fatalf("unstamped selection carries credentials: %s", raw)
+	}
+	for _, c := range []Credentials{CredentialsAnonymous, CredentialsOperatorConfig} {
+		sel.Credentials = c
+		raw, _ = json.Marshal(sel)
+		if !strings.Contains(string(raw), `"credentials":"`+string(c)+`"`) {
+			t.Errorf("stamped %s selection JSON lacks it: %s", c, raw)
+		}
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -272,11 +273,22 @@ var ErrContainerSpec = errors.New("incomplete container spec")
 // the exec environment (BindEndpointEnv: the override variables dropped and
 // DOCKER_HOST / CONTAINER_HOST re-pinned to the same socket). A Runtime with
 // no validated SocketPath cannot be rendered at all.
+//
+// The same seam pins the CLI's CONFIG dir (E51.26 / #4046): an inherited
+// DOCKER_CONFIG / REGISTRY_AUTH_FILE is dropped and DOCKER_CONFIG (plus
+// podman's REGISTRY_AUTH_FILE) re-pinned to the docker config the runner
+// chose (DockerConfig), so no runtime call reaches the operator's
+// interactive credential store.
 
 // endpointOverrideVars are the environment variables through which the
 // docker / podman CLI's effective endpoint can be redirected; BindEndpointEnv
 // drops every one of them before re-pinning the validated socket.
 var endpointOverrideVars = []string{"DOCKER_HOST", "DOCKER_CONTEXT", "CONTAINER_HOST", "CONTAINER_CONNECTION"}
+
+// configOverrideVars are the environment variables through which the CLI's
+// config dir (and with it its credential store) can be redirected;
+// BindEndpointEnv drops both before re-pinning the runner's choice.
+var configOverrideVars = []string{"DOCKER_CONFIG", "REGISTRY_AUTH_FILE"}
 
 // EndpointArgs returns the runtime CLI's global endpoint flag bound to the
 // validated socket: the tokens go between the binary and the subcommand. It
@@ -294,38 +306,39 @@ func (r Runtime) EndpointArgs() ([]string, error) {
 	return nil, fmt.Errorf("%w: runtime kind %q", ErrContainerSpec, r.Kind)
 }
 
-// BindEndpointEnv returns base with every endpoint override variable removed
-// and the validated socket re-pinned (DOCKER_HOST for docker, CONTAINER_HOST
-// for podman). It never reads the process environment; the caller supplies
-// base (the runtime CLI needs PATH and its config dir from it).
-func (r Runtime) BindEndpointEnv(base []string) ([]string, error) {
+// BindEndpointEnv returns base with every endpoint and config override
+// variable removed, the validated socket re-pinned (DOCKER_HOST for docker,
+// CONTAINER_HOST for podman) and the CLI's config pinned to dockerConfigDir:
+// DOCKER_CONFIG=<dir>, plus REGISTRY_AUTH_FILE=<dir>/config.json for podman.
+// An empty or relative dockerConfigDir is refused (ErrContainerSpec): no
+// runtime call may fall back to the operator's interactive config. It never
+// reads the process environment; the caller supplies base (the runtime CLI
+// needs PATH from it).
+func (r Runtime) BindEndpointEnv(base []string, dockerConfigDir string) ([]string, error) {
 	if r.SocketPath == "" {
 		return nil, fmt.Errorf("%w: runtime %q has no validated socket path to bind", ErrContainerSpec, r.Kind)
 	}
-	var pin string
+	if !filepath.IsAbs(dockerConfigDir) {
+		return nil, fmt.Errorf("%w: runtime %q has no absolute docker config dir to pin (got %q)", ErrContainerSpec, r.Kind, dockerConfigDir)
+	}
+	pins := []string{"", "DOCKER_CONFIG=" + dockerConfigDir}
 	switch r.Kind {
 	case KindDocker:
-		pin = "DOCKER_HOST=unix://" + r.SocketPath
+		pins[0] = "DOCKER_HOST=unix://" + r.SocketPath
 	case KindPodman:
-		pin = "CONTAINER_HOST=unix://" + r.SocketPath
+		pins[0] = "CONTAINER_HOST=unix://" + r.SocketPath
+		pins = append(pins, "REGISTRY_AUTH_FILE="+filepath.Join(dockerConfigDir, dockerConfigFile))
 	default:
 		return nil, fmt.Errorf("%w: runtime kind %q", ErrContainerSpec, r.Kind)
 	}
-	out := make([]string, 0, len(base)+1)
+	out := make([]string, 0, len(base)+len(pins))
 	for _, kv := range base {
 		k, _, _ := strings.Cut(kv, "=")
-		drop := false
-		for _, v := range endpointOverrideVars {
-			if k == v {
-				drop = true
-				break
-			}
-		}
-		if !drop {
+		if !slices.Contains(endpointOverrideVars, k) && !slices.Contains(configOverrideVars, k) {
 			out = append(out, kv)
 		}
 	}
-	return append(out, pin), nil
+	return append(out, pins...), nil
 }
 
 // BuildArgv renders the runtime command line. It validates the cache volume,

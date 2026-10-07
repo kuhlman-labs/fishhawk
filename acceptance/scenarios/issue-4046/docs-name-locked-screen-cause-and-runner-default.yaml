@@ -1,0 +1,14 @@
+id: scenario:issue-4046/docs-name-locked-screen-cause-and-runner-default
+statement: runner/README.md, docs/deploy/self-hosted.md and deploy/gate-image/README.md no longer present a presumed-keychain cause or the manual DOCKER_CONFIG remedy as the fix. They name the locked-screen cause and the runner default, and keep the manual remedy only for hand-run pulls and scripts/test --in-gate-image.
+verify_hint: 'Read the three files: ''presumed to be waiting on keychain access'' must be absent, and FISHHAWK_GATE_DOCKER_CONFIG and the locked-screen cause must be present.'
+steps: In the sanctioned checkout, grepped runner/README.md, docs/deploy/self-hosted.md and deploy/gate-image/README.md for 'presumed to be waiting on keychain', FISHHAWK_GATE_DOCKER_CONFIG and locked-screen wording, then read the surrounding sections.
+assertions:
+    expected: presumed-keychain text absent; FISHHAWK_GATE_DOCKER_CONFIG and locked-screen cause present; manual remedy only for hand-run pulls and --in-gate-image
+    observed_at_record: '''presumed to be waiting on keychain'' appears 0 times in all three (and nowhere in runner/, docs/, deploy/ or AGENTS.md). FISHHAWK_GATE_DOCKER_CONFIG appears 5/4/1 times and the locked-screen cause 5/5/3 times. self-hosted.md says the helper ''blocks ... for as long as the macOS SCREEN is LOCKED; it is not waiting on a prompt'', describes the credential-free runner default, and limits the manual DOCKER_CONFIG remedy to ''Pulls outside the runner'' (hand-run pull, scripts/test --in-gate-image). The gate-image README keeps the remedy for its own helper and states the runner pulls under a runner-owned credential-free config.'
+    repro_handle: grep -c -i 'presumed to be waiting on keychain' runner/README.md docs/deploy/self-hosted.md deploy/gate-image/README.md
+origin:
+    issue: 4046
+    pr: 0
+    run_id: 16d27070-c32c-4327-a5d5-3f82629829cf
+    head_sha: 4105871109809c541d06b0d428888f8e80cad968
+    recorded_at: 2026-10-07T09:25:10Z

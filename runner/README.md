@@ -256,15 +256,21 @@ DIGEST),
 `FISHHAWK_GATE_IMAGE_ALLOWLIST` (empty default; the operator image allowlist a
 declared `gate_container` image and every base of a declared build must pass)
 `FISHHAWK_GATE_BUILD` (`allow` | `deny`; empty = the profile default,
-`hosted` deny) and `FISHHAWK_GATE_CACHE` (`process` default | `off`; the
+`hosted` deny), `FISHHAWK_GATE_CACHE` (`process` default | `off`; the
 container path's build-cache posture, E51.18 /
-[#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967), below). A
-bad value (an unknown `FISHHAWK_GATE_SERVICES` member, allowlist entry or `FISHHAWK_GATE_CACHE` value included), or `hosted`
+[#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967), below) and
+`FISHHAWK_GATE_DOCKER_CONFIG` (empty default = a runner-owned credential-free
+docker config; an absolute path names an operator-prepared docker config dir
+for private registries, validated at startup and never removed, E51.26 /
+[#4046](https://github.com/kuhlman-labs/fishhawk/issues/4046), below). A
+bad value (an unknown `FISHHAWK_GATE_SERVICES` member, allowlist entry, `FISHHAWK_GATE_CACHE` value or defective `FISHHAWK_GATE_DOCKER_CONFIG` included), or `hosted`
 with an explicit fallback mode, fails the runner with
 `runner_failed reason=config` before it contacts the backend; a valid config
-logs `gate_isolation_configured`, and the first gate exec logs
+logs `gate_isolation_configured` (including `credentials`: `anonymous` |
+`operator_config`), and the first gate exec logs
 `gate_isolation_selected` with the whole selection (path, inputs, the classified
-runtime endpoint, the reason).
+runtime endpoint, the reason, and on the container path the credential
+posture).
 
 **Evidence (#2135).** When a gate reaches the exec seam
 (`runBoundedGateArgvDisposed`, a refusal included) the runner marks the
@@ -272,7 +278,10 @@ selection RECORDED, and the pre-pack `composeGateEvidence` call folds it into
 `gate_evidence` as a flat, pre-redacted `gate_isolation` member carrying the
 precise `path` and its `class` (`container | fallback | refused`), the selection
 inputs, the detected runtime (endpoint raw value and socket path excluded) and
-`container_unavailable`. The member comes only from the runner's own record,
+`container_unavailable`. On the container path it also carries `credentials`
+(`anonymous` | `operator_config`, E51.26 / #4046), the posture every runtime
+CLI call of the stage ran under; it is absent on every other path. The member
+comes only from the runner's own record,
 never from a stream event; it is absent when no gate reached the seam (plan
 stages, the working-tree verify gate), leaving the payload byte-identical.
 Contract: `internal/gateiso/README.md` § "Evidence (#2135)".
@@ -285,7 +294,8 @@ clone-sandbox / clone fallback. `EvaluateImagePolicy` applies the per-profile
 rules (a tag-only ref warns in `local` / `self-hosted` and is refused in
 `hosted`; `hosted` refuses every declared image or build while the allowlist
 is empty; builds are denied by default in `hosted`). The container path then
-pulls the image (10-minute bound, the runtime CLI's own credential store) and
+pulls the image (10-minute bound, under the runner-pinned docker config:
+credential-free by default, `FISHHAWK_GATE_DOCKER_CONFIG` for a private image) and
 runs it by `name@<registry digest>`, or builds the COMMITTED context at the
 gate's head SHA with `--network=none` after a static, deny-by-default
 Dockerfile guard, cached by a git-derived content digest. A policy, source or
@@ -446,36 +456,73 @@ The local default is UNCHANGED (the container path stays opt-in via
 rule. Boundary, residuals, measurement procedure and rule:
 `internal/gateiso/README.md` § "Persistent cache volume".
 
-**Docker Desktop: hung credential helper.** Observed on Docker Desktop for
-macOS (2026-10-06), not a reproduced contract: `docker-credential-desktop get`
-can block indefinitely, presumed to be waiting on keychain access. With
-`credsStore` set in the docker config, EVERY `docker pull` calls it, an
-anonymous pull of a public image included, so the pull makes no progress and
-prints no error; the tell is a `docker-credential-desktop get` child process
-under the pulling `docker`. The runner's exposure is bounded per step, and each
-step runs under the runner's inherited environment with the endpoint re-pinned
-(`DOCKER_CONFIG` is kept): the explicit declared-image pull 10m (a failure is
-`gateUnavailable`, category C), the gate-image `/etc/passwd` read 5m and the
-cache prepare helper 5m (each includes a cold pull and DEGRADES, the former with
-`gate_passwd_unavailable`, the latter with `gate_cache_volume_unavailable`), the
-service `run -d` 5m (`gateUnavailable`); a `FISHHAWK_GATE_IMAGE` pull inside the
-gate run is bounded only by the gate's own `executor.verify.timeout`. Pulls
-outside these runner steps (a hand-run pull, `scripts/test lint|verify
---in-gate-image`, the docker-gated e2e fixtures) have no such bound and hang
-until something kills them. Remedies: unlock the keychain or allow its
-prompt, if that is the cause; or, for anonymous public pulls only, point
-`DOCKER_CONFIG` at a config with NO `credsStore`, NO `credHelpers` and NO inline
-`auths`. Prefer a fresh empty one (`{"auths":{}}`) over a copy of yours, and
-set `DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` with it: a fresh config
-dir has no `currentContext` or `contexts/`, so the CLI falls back to the
-`default` context (`DOCKER_HOST`, else `/var/run/docker.sock`) and the endpoint
-would otherwise change silently. Operator-verified (2026-10-06, Docker Desktop
-on macOS): with exactly that pair a pull of `docker.io/alpine/git:v2.47.2`
-completed immediately and the live gate fixtures passed, while the default
-config hung. Set both in the RUNNER's environment; the gate container never sees
-them. A config without credentials cannot pull a private image. Operator
-walkthrough: [`docs/deploy/self-hosted.md`](../docs/deploy/self-hosted.md)
-§ "Docker Desktop: a hung credential helper".
+**Runtime CLI credentials: a locked macOS screen no longer hangs a pull
+(E51.26 / [#4046](https://github.com/kuhlman-labs/fishhawk/issues/4046)).**
+The docker CLI resolves credentials for EVERY registry it talks to, an
+anonymous public pull included, through the config's `credsStore` /
+`credHelpers`. Docker Desktop's default `~/.docker/config.json` carries
+`"credsStore": "desktop"`, and `docker-credential-desktop get` →
+`docker-credential-osxkeychain` blocks in `SecItemCopyMatching` for as long as
+the macOS SCREEN is LOCKED (operator spike 2026-10-06, from the unified log:
+the helper blocked minutes after the lock and answered in 0.1s after the
+unlock, while a `credsStore`-free pull succeeded with the screen still locked).
+Before #4046 the runner inherited that config, so an unattended laptop's
+pulls hung silently until each step's bound. Now every post-selection runtime
+call (pull, inspect, build, passwd read, cache volume steps, service
+lifecycle, gate `run`, kill, cleanup) runs with `DOCKER_CONFIG` pinned by
+`gateiso.Runtime.BindEndpointEnv` to a config the runner chose:
+
+- **Default `anonymous`:** a runner-owned temp dir whose `config.json` holds
+  only `{"auths":{"fishhawk.invalid":{}}}` plus the `cliPluginsExtraDirs`
+  carried forward so `docker buildx` still resolves — no `credsStore`, no
+  `credHelpers`. The one auths entry is a credential-free placeholder, and it
+  is what keeps the keychain out: with an EMPTY auths map the docker CLI
+  auto-detects the platform default helper (`docker-credential-osxkeychain`
+  on darwin, `-pass` / `-secretservice` on linux) when it is on `PATH` and
+  consults it even for an anonymous public pull. With the placeholder no
+  helper and no keychain is touched, so only a public image pulls. The dir is
+  removed at runner exit, after the cache volumes. The operator's interactive
+  config is never used for credentials (it is read only for its
+  `cliPluginsExtraDirs` key).
+- **Opt-in `operator_config`:** `FISHHAWK_GATE_DOCKER_CONFIG=<dir>` names an
+  operator-prepared config for a private gate, service or build-base image
+  (e.g. `credHelpers` scoped to one registry, or a token that needs no
+  keychain). Before pulling, the runner probes each helper that config would
+  invoke for an image this exec pulls, under a 20s bound; a blocked helper
+  fails the exec `gateUnavailable` (category C) with
+  `container_credentials_blocked: credential helper docker-credential-<name>
+  did not answer within <bound> for <server> (a locked keychain/screen, or a
+  slow network-backed helper)` instead of a silent 10-minute pull timeout. A
+  probe cut short by the stage's own cancellation is reported as cancelled,
+  never as blocked.
+
+Under the anonymous posture a declared-image pull failure appends the
+`FISHHAWK_GATE_DOCKER_CONFIG` remedy to its reason. Runtime DETECTION
+(`docker context show` / `inspect`, `version`) runs before selection with the
+inherited env and invokes no credential helper; podman may still call a
+helper configured in `registries.conf` `credential-helpers`, a system setting
+outside `REGISTRY_AUTH_FILE`. The per-step bounds stay as the backstop (a
+screen lock that begins mid-pull under an opt-in helper): the declared-image
+pull 10m (`gateUnavailable`), the passwd read 5m and the cache prepare helper
+5m (each DEGRADES), the service `run -d` 5m (`gateUnavailable`); a
+`FISHHAWK_GATE_IMAGE` pull inside the gate run is bounded only by the gate's
+own `executor.verify.timeout`.
+
+**Pulls OUTSIDE the runner keep the old hazard.** A hand-run pull,
+`scripts/test lint|verify --in-gate-image` and the docker-gated e2e fixtures
+run under YOUR docker config and hang on a locked screen with no bound. Their
+remedy, for anonymous public pulls only: unlock the screen, or point
+`DOCKER_CONFIG` at a fresh `{"auths":{"fishhawk.invalid":{}}}` config (no
+`credsStore`, no `credHelpers`, no credential in `auths` — the one empty
+placeholder entry is required, because an empty `{"auths":{}}` lets the CLI
+auto-detect `docker-credential-osxkeychain` and call it anyway) and set
+`DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` with it — a fresh config
+dir has no `currentContext` or `contexts/`, so the CLI would otherwise fall
+back to the `default` context (`DOCKER_HOST`, else `/var/run/docker.sock`) and
+the endpoint would change silently. The runner needs neither: it pins both
+itself. Contract: `internal/gateiso/README.md` § "Runtime CLI credentials";
+operator walkthrough: [`docs/deploy/self-hosted.md`](../docs/deploy/self-hosted.md)
+§ "Docker Desktop: a locked screen and the credential helper".
 
 **Operator walk before enabling it for this repository (approval conditions 5
 and 6 of #2137).** The implement gate proves the pieces, not the full

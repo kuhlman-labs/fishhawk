@@ -64,6 +64,12 @@ const (
 	// per-runner-process named volume for GOCACHE and the lint cache, `off`
 	// keeps the per-exec cold caches (gateiso/cachevolume.go).
 	gateCacheEnvVar = "FISHHAWK_GATE_CACHE"
+	// gateDockerConfigEnvVar names an operator-prepared docker config dir the
+	// container path's runtime CLI calls use for registry credentials
+	// (E51.26 / #4046; empty = the runner-owned anonymous config, which
+	// carries no credential and invokes no credential helper). Validated at
+	// startup (gateiso.LoadOperatorDockerConfig) and never removed.
+	gateDockerConfigEnvVar = "FISHHAWK_GATE_DOCKER_CONFIG"
 )
 
 // gateIsolationRefusedSignature leads every refusal output. It is
@@ -192,6 +198,13 @@ const (
 	gateImageBuildTimeout = 20 * time.Minute
 )
 
+// gateCredentialProbeTimeout bounds each credential helper probe (E51.26 /
+// #4046): a helper that has not answered by then — a keychain behind a
+// locked screen, or a slow network-backed helper — fails the exec
+// gateUnavailable with container_credentials_blocked instead of hanging the
+// pull it would serve. A package var SOLELY so a test can shorten it.
+var gateCredentialProbeTimeout = 20 * time.Second
+
 // gateBuildContextLimits bounds a materialized build context. A package var
 // SOLELY so a test can lower it; production leaves the gateiso default.
 var gateBuildContextLimits = gateiso.DefaultContextLimits
@@ -263,6 +276,17 @@ type gateIsolationState struct {
 	cacheUses   int
 	cacheMinted []mintedCacheVolume
 
+	// credentials is the runtime CLI's credential posture (E51.26 / #4046),
+	// fixed at startup: operator_config when FISHHAWK_GATE_DOCKER_CONFIG named
+	// a valid dir, else anonymous. dockerConfig is the config every
+	// post-selection runtime call is pinned to — the operator's, set at
+	// startup, or the runner-owned anonymous one, minted lazily on the first
+	// container exec (gateDockerConfig) and removed at cleanup AFTER the
+	// cache volumes. Guarded by dockerCfgMu.
+	credentials  gateiso.Credentials
+	dockerCfgMu  sync.Mutex
+	dockerConfig *gateiso.DockerConfig
+
 	// passwdByImage caches each gate image's /etc/passwd after a SUCCESSFUL
 	// read (#2137 approval condition 7: a failed read is never cached, so a
 	// transient failure is retried on a later exec).
@@ -329,6 +353,22 @@ var bindEndpointEnvFn = gateiso.Runtime.BindEndpointEnv
 // execBoundedHostArgv.
 var execGateAuxArgvFn = execBoundedHostArgv
 
+// newAnonymousDockerConfigFn mints the runner-owned docker config
+// (gateiso.NewAnonymousDockerConfig). A package var SOLELY so a test can make
+// the mint fail and pin that branch's disposition.
+var newAnonymousDockerConfigFn = gateiso.NewAnonymousDockerConfig
+
+// probeCredentialHelperFn probes one credential helper
+// (gateiso.ProbeCredentialHelper). A package var SOLELY so a test can count
+// probes; production leaves it the real probe.
+var probeCredentialHelperFn = gateiso.ProbeCredentialHelper
+
+// parseGateDockerfileFn parses the committed Dockerfile at the build-base
+// credential probe site (gateiso.ParseDockerfile). A package var SOLELY so a
+// test can make that parse fail and pin that it fails closed; production
+// leaves it the real parser.
+var parseGateDockerfileFn = gateiso.ParseDockerfile
+
 // writePasswdFileFn writes the per-exec passwd file (gateiso.WritePasswdFile).
 // A package var SOLELY so a test can make the write fail and pin the degrade.
 var writePasswdFileFn = gateiso.WritePasswdFile
@@ -349,7 +389,7 @@ var (
 	dockerFixturesRan      int
 )
 
-// configureGateIsolation parses the eight variables through getenv and
+// configureGateIsolation parses the nine variables through getenv and
 // applies the startup rule ProfileForbidsFallback. A configuration error names
 // the variable and the valid values (an allowlist error also names the
 // offending entry); run() logs it as runner_failed
@@ -387,6 +427,14 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", gateCacheEnvVar, err)
 	}
+	creds, dockerCfg := gateiso.CredentialsAnonymous, (*gateiso.DockerConfig)(nil)
+	if dir := strings.TrimSpace(getenv(gateDockerConfigEnvVar)); dir != "" {
+		cfg, err := gateiso.LoadOperatorDockerConfig(dir)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", gateDockerConfigEnvVar, err)
+		}
+		creds, dockerCfg = gateiso.CredentialsOperatorConfig, &cfg
+	}
 	st := &gateIsolationState{
 		mode:          mode,
 		profile:       profile,
@@ -400,6 +448,8 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 		allowlist:     allow,
 		buildAllowed:  buildAllowed,
 		cacheMode:     cacheMode,
+		credentials:   creds,
+		dockerConfig:  dockerCfg,
 	}
 	build := gateiso.BuildPolicyDeny
 	if buildAllowed {
@@ -407,8 +457,8 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	}
 	if logSink != nil {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q,"allowlist_entries":%d,"build":%q,"cache":%q}`+"\n",
-			mode, profile, st.image, joinServices(services), pgImage, len(allow), build, cacheMode)
+			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"credentials":%q,"services":%q,"postgres_image":%q,"allowlist_entries":%d,"build":%q,"cache":%q}`+"\n",
+			mode, profile, st.image, creds, joinServices(services), pgImage, len(allow), build, cacheMode)
 	}
 	return st, nil
 }
@@ -524,6 +574,11 @@ func (s *gateIsolationState) selection(ctx context.Context) gateiso.Selection {
 			PolicyRefusal: s.decision.Refusal,
 			PolicyWarning: s.decision.Warning,
 		})
+		if s.sel.Path == gateiso.PathContainer {
+			// Only the container path makes runtime CLI calls, so only it
+			// carries a credential posture (Select never stamps one).
+			s.sel.Credentials = s.credentials
+		}
 		if s.logSink != nil {
 			b, _ := json.Marshal(s.sel)
 			_, _ = fmt.Fprintf(s.logSink, `{"event":"gate_isolation_selected","selection":%s}`+"\n", b)
@@ -739,13 +794,59 @@ func (s *gateIsolationState) removeCacheVolumes() {
 	}
 }
 
+// gateDockerConfig returns the docker config the container path's runtime
+// calls are pinned to (E51.26 / #4046): the operator's
+// FISHHAWK_GATE_DOCKER_CONFIG when configured, else the runner-owned
+// anonymous config, minted ONCE per state on the first container exec — with
+// the operator's CLI plugin dirs carried forward (gateiso.OperatorPluginDirs)
+// — and reused by every later exec. A nil state has no cleanup to remove a
+// minted dir, so it is an error.
+func (s *gateIsolationState) gateDockerConfig() (gateiso.DockerConfig, error) {
+	if s == nil {
+		return gateiso.DockerConfig{}, errors.New("no gate isolation state to own a runner docker config")
+	}
+	s.dockerCfgMu.Lock()
+	defer s.dockerCfgMu.Unlock()
+	if s.dockerConfig == nil {
+		cfg, err := newAnonymousDockerConfigFn(gateiso.OperatorPluginDirs(os.Getenv))
+		if err != nil {
+			return gateiso.DockerConfig{}, err
+		}
+		s.dockerConfig = &cfg
+		s.logEvent(`{"event":"gate_docker_config_minted","dir":%q,"credentials":%q}`, cfg.Dir, cfg.Credentials)
+	}
+	return *s.dockerConfig, nil
+}
+
+// removeDockerConfig removes the runner-owned docker config dir, if one was
+// minted; an operator config is never removed (DockerConfig.Remove is a
+// no-op for it). A failure is logged and never panics.
+func (s *gateIsolationState) removeDockerConfig() {
+	s.dockerCfgMu.Lock()
+	cfg := s.dockerConfig
+	if cfg != nil && cfg.Owned() {
+		s.dockerConfig = nil
+	}
+	s.dockerCfgMu.Unlock()
+	if cfg == nil || !cfg.Owned() {
+		return
+	}
+	if err := cfg.Remove(); err != nil {
+		s.logEvent(`{"event":"gate_docker_config_cleanup_failed","dir":%q,"detail":%q}`, cfg.Dir, err.Error())
+		return
+	}
+	s.logEvent(`{"event":"gate_docker_config_removed","dir":%q}`, cfg.Dir)
+}
+
 // cleanup releases the process-wide state: it first removes every cache
-// volume the state minted (#3967), then clears the global. run() defers it
-// so a later run() in the same process (the test binary) starts
-// unconfigured. Nil-safe.
+// volume the state minted (#3967) — under the bound CLI env, which still
+// points at the runner-owned docker config — THEN that config dir (#4046),
+// then clears the global. run() defers it so a later run() in the same
+// process (the test binary) starts unconfigured. Nil-safe.
 func (s *gateIsolationState) cleanup() {
 	if s != nil {
 		s.removeCacheVolumes()
+		s.removeDockerConfig()
 	}
 	if gateIsolation == s {
 		gateIsolation = nil
@@ -792,13 +893,20 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 }
 
 // runGateInContainer is the container branch of runBoundedGateArgv. In order:
-// fresh empty visible caches; the lint-cache dir; the runtime CLI's env BOUND
-// to the validated endpoint (the runner's inherited environment — the CLI
-// needs PATH and its config dir — with DOCKER_HOST / DOCKER_CONTEXT /
-// CONTAINER_HOST / CONTAINER_CONNECTION dropped and the selection's socket
-// re-pinned; every argv carries the same binding as a global flag, so a
-// docker-context switch between gates cannot redirect any runtime call to a
-// daemon the selection never validated); for a DECLARED gate_container (E51.3
+// fresh empty visible caches; the lint-cache dir; the docker config the
+// runtime calls are pinned to (gateDockerConfig, E51.26 / #4046: the
+// runner-owned anonymous config, or the operator's FISHHAWK_GATE_DOCKER_CONFIG);
+// the runtime CLI's env BOUND to the validated endpoint AND that config (the
+// runner's inherited environment — the CLI needs PATH — with DOCKER_HOST /
+// DOCKER_CONTEXT / CONTAINER_HOST / CONTAINER_CONNECTION / DOCKER_CONFIG /
+// REGISTRY_AUTH_FILE dropped and the selection's socket and the chosen config
+// re-pinned; every argv carries the same endpoint binding as a global flag,
+// so a docker-context switch between gates cannot redirect any runtime call
+// to a daemon the selection never validated, and no runtime call reaches the
+// operator's interactive credential store); under an operator config the
+// credential probe of every helper the gate and service images match
+// (probeGateCredentials — a blocked helper is gateUnavailable with
+// container_credentials_blocked, before any pull); for a DECLARED gate_container (E51.3
 // / #2136) the image resolution (resolveDeclaredImage: explicit pull or
 // in-repo build, a refused build source/Dockerfile/base gateRefused and any
 // operational failure gateUnavailable, the resolved image recorded for the
@@ -822,8 +930,8 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // detached context when the exec returned -1 (killing the CLI does not stop
 // the container). Every failure before the exec returns -1 WITHOUT executing
 // the gate, and the third value names WHY out of band (#3448): a HOST-caused
-// pre-exec failure — visible-cache creation, the lint-cache dir, endpoint
-// binding, the gate-service argv, the mount-guard refusal, a seed failure NOT
+// pre-exec failure — visible-cache creation, the lint-cache dir, the docker
+// config, endpoint binding, a blocked credential helper, the gate-service argv, the mount-guard refusal, a seed failure NOT
 // wrapping gateiso.ErrSeedCheckout (the host GOMODCACHE probe or `go mod
 // download` on an offline host), or ANY gate-service provisioning step — is
 // gateUnavailable (category C at the gates, like a refusal; never the fix
@@ -848,25 +956,46 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
 		return "gate container: create lint cache dir: " + err.Error(), -1, gateUnavailable
 	}
+	// The docker config every runtime call below is pinned to (#4046): never
+	// the operator's interactive one, whose credsStore can block a pull
+	// behind a locked screen.
+	dockerCfg, err := st.gateDockerConfig()
+	if err != nil {
+		return "gate container: docker config: " + err.Error(), -1, gateUnavailable
+	}
 	// The runtime CLI's env is the runner's inherited environment with the
 	// endpoint bound to the socket the selection validated (concern: a
 	// context switch after selection must not redirect launch, the passwd
-	// read, the service lifecycle or cleanup). Bound FIRST: no runtime call
-	// below runs under an unbound env.
-	cliEnv, err := bindEndpointEnvFn(sel.Runtime, os.Environ())
+	// read, the service lifecycle or cleanup) and the config pinned to
+	// dockerCfg. Bound FIRST: no runtime call below runs under an unbound env.
+	cliEnv, err := bindEndpointEnvFn(sel.Runtime, os.Environ(), dockerCfg.Dir)
 	if err != nil {
 		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
+	// Probe site (a): before the resolution, the passwd read, the cache
+	// volume and the service — every one of which can pull — probe each
+	// operator-config helper the gate image (by reference) and the postgres
+	// service image match. The anonymous config matches none.
+	var pulled []string
+	if sel.Image != "" {
+		pulled = append(pulled, sel.Image)
+	}
+	if st.postgresServiceWanted() {
+		pulled = append(pulled, st.postgresImage)
+	}
+	if reason := st.probeGateCredentials(ctx, dockerCfg, pulled, cliEnv, "gate"); reason != "" {
+		return "gate container: " + reason, -1, gateUnavailable
+	}
 	// A DECLARED gate_container (E51.3 / #2136) resolves to an image on the
 	// host first — explicit pull or in-repo build, each under its own bound
-	// and the bound CLI env (the runtime CLI's own credential store; Fishhawk
+	// and the bound CLI env (the pinned docker config's credentials; Fishhawk
 	// passes no credential). The FISHHAWK_GATE_IMAGE path skips this and runs
 	// sel.Image byte-unchanged (its implicit pull stays inside the gate run).
 	image := sel.Image
-	if st != nil && gateiso.DeclaredSource(sel.ImageSource) {
+	if gateiso.DeclaredSource(sel.ImageSource) {
 		deciding := isDecidingGate(ctx)
 		st.noteDeclaredGate(deciding)
-		res, how, msg, disp := st.resolveDeclaredImage(ctx, sel.Runtime, dir, vc.Root, cliEnv)
+		res, how, msg, disp := st.resolveDeclaredImage(ctx, sel.Runtime, dir, vc.Root, cliEnv, dockerCfg)
 		if msg != "" {
 			return msg, -1, disp
 		}
@@ -999,9 +1128,9 @@ func gateContainerRefused(format string, args ...any) (gateiso.ResolvedImage, st
 // is gateRefused BEFORE any build call; every operational failure (inspect,
 // pull, digest, git read, context size, build) is gateUnavailable. Neither
 // reaches the fix agent, and neither substitutes FISHHAWK_GATE_IMAGE.
-func (s *gateIsolationState) resolveDeclaredImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
+func (s *gateIsolationState) resolveDeclaredImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string, dockerCfg gateiso.DockerConfig) (gateiso.ResolvedImage, string, string, gateDisposition) {
 	if s.decision.Build {
-		return s.resolveBuiltImage(ctx, rt, dir, root, cliEnv)
+		return s.resolveBuiltImage(ctx, rt, dir, root, cliEnv, dockerCfg)
 	}
 	return s.resolvePulledImage(ctx, rt, root, cliEnv)
 }
@@ -1029,7 +1158,8 @@ func inspectImage(ctx context.Context, rt gateiso.Runtime, ref, root string, cli
 // Either way the gate runs by name@<registry digest> from the inspected
 // RepoDigests, so a concurrent retag cannot change what runs; a pinned ref
 // must find its own digest there. A pull failure carries the named
-// local-only remedy (gateiso.PullFailedReason).
+// local-only remedy (gateiso.PullFailedReason) and, under the anonymous
+// posture, the FISHHAWK_GATE_DOCKER_CONFIG remedy for a private registry.
 func (s *gateIsolationState) resolvePulledImage(ctx context.Context, rt gateiso.Runtime, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
 	ref := s.decision.Ref
 	target := ref.String()
@@ -1053,7 +1183,7 @@ func (s *gateIsolationState) resolvePulledImage(ctx context.Context, rt gateiso.
 			if timedOut {
 				cause = fmt.Errorf("timed out after %s", gateImagePullTimeout)
 			}
-			return gateContainerUnavailable("%s", gateiso.PullFailedReason(ref, cause))
+			return gateContainerUnavailable("%s%s", gateiso.PullFailedReason(ref, cause), s.anonymousPullHint())
 		}
 		if insp, ok, ierr = inspectImage(ctx, rt, target, root, cliEnv); !ok {
 			return gateContainerUnavailable("inspect %s after pull: %v", ref, ierr)
@@ -1071,6 +1201,44 @@ func (s *gateIsolationState) resolvePulledImage(ctx context.Context, rt gateiso.
 	}
 	_, digest, _ := strings.Cut(pinned, "@")
 	return gateiso.ResolvedImage{Ref: pinned, Digest: digest, ImageID: insp.ID}, how, "", gateExecuted
+}
+
+// anonymousPullHint is appended to a pull failure under the anonymous
+// posture (#4046 approval condition 1): the runner pulled with a config that
+// carries no credential, so a private registry's image needs the operator
+// opt-in. "" under an operator config, whose credentials were offered.
+func (s *gateIsolationState) anonymousPullHint() string {
+	if s.credentials != gateiso.CredentialsAnonymous {
+		return ""
+	}
+	return "; the runner pulls with a credential-free docker config (no credsStore, no credHelpers), so an image on a private registry needs " +
+		gateDockerConfigEnvVar + " set to a docker config dir holding that registry's credentials"
+}
+
+// probeGateCredentials probes, under the bound CLI env, every credential
+// helper dockerCfg would invoke for images (E51.26 / #4046: the CLI's own
+// store choice, gateiso.DockerConfig.ProbesFor — an unmatched helper is never
+// run) and returns the blocked reason of the first that does not answer
+// within gateCredentialProbeTimeout, or a cancellation reason when the
+// stage's own context ended mid-probe — never the blocked text, which would
+// name a locked screen that did not occur ("" when none blocks). The anonymous
+// config matches no helper, so it probes nothing. Each probe logs one
+// gate_credentials_probe line naming the site, helper, server and outcome —
+// never the helper's output. Probes run on EVERY exec, uncached: a screen
+// can lock between two gates.
+func (s *gateIsolationState) probeGateCredentials(ctx context.Context, dockerCfg gateiso.DockerConfig, images, cliEnv []string, site string) string {
+	for _, p := range dockerCfg.ProbesFor(images) {
+		res := probeCredentialHelperFn(ctx, p, cliEnv, gateCredentialProbeTimeout)
+		s.logEvent(`{"event":"gate_credentials_probe","site":%q,"helper":%q,"server":%q,"outcome":%q,"detail":%q,"elapsed_ms":%d}`,
+			site, p.Executable(), p.Server, res.Outcome, res.Detail, res.Elapsed.Milliseconds())
+		switch res.Outcome {
+		case gateiso.ProbeBlocked:
+			return res.BlockedReason()
+		case gateiso.ProbeCancelled:
+			return fmt.Sprintf("credential helper %s probe for %s cancelled: %s", p.Executable(), p.Server, res.Detail)
+		}
+	}
+	return ""
 }
 
 // hasRepoDigest reports whether any inspected RepoDigest names ref's
@@ -1092,9 +1260,11 @@ func hasRepoDigest(ref gateiso.ImageRef, digests []string) bool {
 // Dockerfile bytes (parse refusals, the profile's cache-mount rule, the
 // allowlist/pinning rule for every base) — every refusal before ANY build
 // call — then inspect the content-addressed tag (a hit skips the build),
-// else materialize the committed context into a throwaway dir and build it
-// with --network=none.
-func (s *gateIsolationState) resolveBuiltImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
+// else probe the operator-config credential helpers every Dockerfile base
+// matches (probe site (b), #4046: a blocked helper is gateUnavailable BEFORE
+// any build call), materialize the committed context into a throwaway dir
+// and build it with --network=none.
+func (s *gateIsolationState) resolveBuiltImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string, dockerCfg gateiso.DockerConfig) (gateiso.ResolvedImage, string, string, gateDisposition) {
 	bctx, cancel := context.WithTimeout(ctx, gateImageBuildTimeout)
 	defer cancel()
 	git := gateiso.ExecGit(dir)
@@ -1119,6 +1289,20 @@ func (s *gateIsolationState) resolveBuiltImage(ctx context.Context, rt gateiso.R
 	if insp, ok, _ := inspectImage(ctx, rt, res.Ref, root, cliEnv); ok {
 		res.ImageID = insp.ID
 		return res, "cache_hit", "", gateExecuted
+	}
+	// ScreenDockerfile above parsed the same bytes, so this should not fail;
+	// if the two ever diverge it fails closed rather than skipping the
+	// base-helper probe straight into the build.
+	df, err := parseGateDockerfileFn(content)
+	if err != nil {
+		return gateContainerUnavailable("parse %s for the credential probe: %v", src.Dockerfile, err)
+	}
+	bases := make([]string, len(df.Bases))
+	for i, b := range df.Bases {
+		bases[i] = b.Ref
+	}
+	if reason := s.probeGateCredentials(ctx, dockerCfg, bases, cliEnv, "build"); reason != "" {
+		return gateContainerUnavailable("%s", reason)
 	}
 	tmp, err := os.MkdirTemp("", "fishhawk-gate-build-*")
 	if err != nil {
