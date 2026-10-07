@@ -463,19 +463,77 @@ var containerEnvPins = []string{
 	GateContainerMarker,
 }
 
+// containerEnvAllowGo is the explicit set of Go variable names that cross into
+// the container, admitted by EXACT match. It replaces a bare "GO" allow-prefix
+// that forwarded every host-specific Go variable into a Linux container whose
+// toolchain, GOROOT and GOOS/GOARCH are baked into the image (#4048): a
+// toolchain-switching host exports a darwin GOROOT to the runner process, so
+// the prefix put `-e GOROOT=<darwin toolchain>` in the argv and broke every
+// in-container `go`; GOOS/GOARCH silently cross-compile; GOBIN, GOWORK, GOENV,
+// GOTOOLDIR, GOCACHEPROG, GOCOVERDIR and GOTMPDIR name host paths that do not
+// exist in the container; and the prefix also admitted GOOGLE_*. Only the
+// platform-independent tuning knobs below survive. Keys the runner pins
+// (GOPATH, GOCACHE, GOMODCACHE, GOLANGCI_LINT_CACHE, GOPROXY, GOTOOLCHAIN) need
+// no entry: the pins drop-then-append them. GOFLAGS is admitted only through
+// containerGoflags. Kept sorted, one per line.
+var containerEnvAllowGo = map[string]struct{}{
+	"GO111MODULE":  {},
+	"GODEBUG":      {},
+	"GOEXPERIMENT": {},
+	"GOFIPS140":    {},
+	"GOFLAGS":      {},
+	"GOGC":         {},
+	"GOMAXPROCS":   {},
+	"GOMEMLIMIT":   {},
+	"GOTRACEBACK":  {},
+}
+
 // containerEnvAllowed reports whether a sanitized-env key crosses into the
-// container: TZ/LANG/TERM, LC_*, CGO_*, GO*.
+// container: TZ/LANG/TERM, LC_*, CGO_*, and the explicit containerEnvAllowGo
+// name set (no bare GO prefix).
 func containerEnvAllowed(key string) bool {
 	switch key {
 	case "TZ", "LANG", "TERM":
 		return true
 	}
-	return strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "CGO_") || strings.HasPrefix(key, "GO")
+	if strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "CGO_") {
+		return true
+	}
+	_, ok := containerEnvAllowGo[key]
+	return ok
+}
+
+// containerGoflags sanitizes a GOFLAGS value for the container. A field of the
+// form -name=value / --name=value whose value is an absolute path (-modfile,
+// -overlay, -pgo, -pkgdir, -toolexec, ...) names a host file that does not
+// exist in the container, so it is dropped; bare and relative-valued flags are
+// kept. A value carrying a quote character is dropped whole (fail closed): Go
+// splits GOFLAGS with a quote-aware splitter, so a quoted field could hide a
+// host path from the whitespace split below. ok is false when nothing survives,
+// so the caller omits the key rather than emitting an empty GOFLAGS.
+func containerGoflags(value string) (string, bool) {
+	if strings.ContainsAny(value, `'"`) {
+		return "", false
+	}
+	var kept []string
+	for _, f := range strings.Fields(value) {
+		if strings.HasPrefix(f, "-") {
+			if _, v, ok := strings.Cut(f, "="); ok && strings.HasPrefix(v, "/") {
+				continue
+			}
+		}
+		kept = append(kept, f)
+	}
+	if len(kept) == 0 {
+		return "", false
+	}
+	return strings.Join(kept, " "), true
 }
 
 // ContainerEnv projects the runner's sanitized gate env into the container:
-// only the TZ/LANG/TERM/LC_*/CGO_*/GO* allow-list survives, then the cache
-// and toolchain pins are appended drop-then-append (HOME, GOPATH, GOCACHE,
+// only the TZ/LANG/TERM/LC_*/CGO_* and explicit Go tuning-name (containerEnvAllowGo)
+// allow-list survives, with GOFLAGS sanitized by containerGoflags, then the
+// cache and toolchain pins are appended drop-then-append (HOME, GOPATH, GOCACHE,
 // GOMODCACHE, GOLANGCI_LINT_CACHE, GOPROXY=off, GOTOOLCHAIN=local,
 // GIT_CONFIG_GLOBAL/SYSTEM=/dev/null, FISHHAWK_GATE_CONTAINER=1), then extras
 // drop-then-append so a caller-supplied value wins over both. The volume
@@ -484,9 +542,16 @@ func containerEnvAllowed(key string) bool {
 func ContainerEnv(sanitized []string, extras []string) []string {
 	var out []string
 	for _, kv := range sanitized {
-		k, _, ok := strings.Cut(kv, "=")
+		k, v, ok := strings.Cut(kv, "=")
 		if !ok || !containerEnvAllowed(k) {
 			continue
+		}
+		if k == "GOFLAGS" {
+			clean, keep := containerGoflags(v)
+			if !keep {
+				continue
+			}
+			kv = k + "=" + clean
 		}
 		out = append(out, kv)
 	}

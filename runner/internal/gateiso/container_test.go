@@ -546,6 +546,148 @@ func TestContainerEnv_DefaultsWithoutExtras(t *testing.T) {
 	}
 }
 
+// TestContainerEnv_HostGoVarsNeverCross pins #4048: a host-specific Go variable
+// in the sanitized env (a toolchain-switching macOS host exports a darwin
+// GOROOT to the runner process) must never reach the Linux gate container, in
+// ContainerEnv's output or as a BuildArgv `-e` token. The platform-independent
+// tuning knobs survive verbatim and the runner pins still win.
+func TestContainerEnv_HostGoVarsNeverCross(t *testing.T) {
+	m := newMounts(t)
+	darwinRoot := "/Users/x/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.6.darwin-arm64"
+	dropped := []string{
+		"GOROOT=" + darwinRoot, "GOOS=darwin", "GOARCH=arm64", "GOBIN=/Users/x/go/bin",
+		"GOWORK=/Users/x/go.work", "GOENV=/Users/x/.config/go/env", "GOTOOLDIR=" + darwinRoot + "/pkg/tool/darwin_arm64",
+		"GOHOSTOS=darwin", "GOHOSTARCH=arm64", "GOMOD=/Users/x/go.mod", "GOEXE=", "GOGCCFLAGS=-fPIC -arch arm64",
+		"GOVERSION=go1.25.6", "GOCACHEPROG=/Users/x/cacheprog", "GOCOVERDIR=/Users/x/cov", "GOTMPDIR=/Users/x/tmp",
+		"GOAUTH=netrc", "GOOGLE_API_KEY=secret",
+	}
+	for _, kv := range dropped {
+		key, _, _ := strings.Cut(kv, "=")
+		t.Run("drops_"+key, func(t *testing.T) {
+			env := ContainerEnv([]string{kv, "TZ=UTC"}, nil)
+			for _, e := range env {
+				if k, _, _ := strings.Cut(e, "="); k == key {
+					t.Fatalf("%s crossed into the container env: %q", key, env)
+				}
+			}
+			if idx(env, "TZ=UTC") < 0 {
+				t.Fatalf("control: TZ=UTC must still cross: %q", env)
+			}
+			spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+			spec.Env = env
+			argv, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, a := range argv {
+				if a == "-e" && strings.HasPrefix(argv[i+1], key+"=") {
+					t.Fatalf("BuildArgv carries -e %s: %q", argv[i+1], argv)
+				}
+			}
+		})
+	}
+
+	t.Run("tuning_knobs_survive_verbatim", func(t *testing.T) {
+		keep := []string{
+			"GODEBUG=panicnil=1", "GOEXPERIMENT=jsonv2", "GOMAXPROCS=2", "GOMEMLIMIT=2GiB", "GOGC=50",
+			"GOTRACEBACK=all", "GOFIPS140=on", "GO111MODULE=on",
+		}
+		env := ContainerEnv(keep, nil)
+		for _, kv := range keep {
+			if idx(env, kv) < 0 {
+				t.Errorf("%s did not survive: %q", kv, env)
+			}
+		}
+	})
+
+	t.Run("inherited_pinned_keys_come_out_as_the_pins", func(t *testing.T) {
+		env := ContainerEnv([]string{
+			"GOTOOLCHAIN=auto", "GOPROXY=https://proxy.golang.org", "GOCACHE=/Users/x/Library/Caches/go-build",
+			"GOPATH=/Users/x/go", "GOMODCACHE=/Users/x/go/pkg/mod",
+		}, nil)
+		for _, want := range []string{"GOTOOLCHAIN=local", "GOPROXY=off", "GOCACHE=" + MountGoCache, "GOPATH=/tmp/gopath", "GOMODCACHE=" + MountGoModCache} {
+			if idx(env, want) < 0 {
+				t.Errorf("pin %s missing: %q", want, env)
+			}
+			key, _, _ := strings.Cut(want, "=")
+			n := 0
+			for _, e := range env {
+				if k, _, _ := strings.Cut(e, "="); k == key {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s appears %d times: %q", key, n, env)
+			}
+		}
+	})
+}
+
+// TestContainerGoflags pins the GOFLAGS rules: an absolute-path -flag=value
+// field names a host file and is dropped; relative values and bare flags are
+// kept byte-identical; a quote character drops the whole variable (Go parses
+// GOFLAGS quote-aware, so a quoted field can hide a host path from a
+// whitespace split); a value with nothing left omits the key.
+func TestContainerGoflags(t *testing.T) {
+	rows := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"plain kept", "-mod=mod", "-mod=mod", true},
+		{"absolute modfile dropped", "-mod=mod -modfile=/Users/x/alt.mod", "-mod=mod", true},
+		{"overlay alone omits the key", "-overlay=/Users/x/o.json", "", false},
+		{"relative modfile kept", "-modfile=alt.mod", "-modfile=alt.mod", true},
+		{"pgo dropped, bare boolean kept", "-pgo=/x/default.pgo -trimpath", "-trimpath", true},
+		{"double-dash toolexec dropped", "--toolexec=/Users/x/t -mod=mod", "-mod=mod", true},
+		{"pkgdir dropped", "-pkgdir=/Users/x/pkg -v", "-v", true},
+		{"quoted value fails closed", "-mod=mod '-modfile=/Users/x/a b.mod'", "", false},
+		{"double-quoted value fails closed", `-mod=mod "-modfile=/Users/x/a b.mod"`, "", false},
+		{"empty omits the key", "", "", false},
+		{"whitespace-only omits the key", "  \t ", "", false},
+		{"extra spaces re-joined with one", "-mod=mod   -v", "-mod=mod -v", true},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			got, ok := containerGoflags(r.in)
+			if got != r.want || ok != r.wantOK {
+				t.Fatalf("containerGoflags(%q) = (%q, %v), want (%q, %v)", r.in, got, ok, r.want, r.wantOK)
+			}
+		})
+	}
+}
+
+// TestContainerEnv_GoflagsSanitizedInProjection pins the call site: ContainerEnv
+// applies containerGoflags to the sanitized GOFLAGS only, omits the key when
+// nothing survives, and leaves a runner-supplied extra untouched.
+func TestContainerEnv_GoflagsSanitizedInProjection(t *testing.T) {
+	has := func(env []string, prefix string) bool {
+		for _, e := range env {
+			if strings.HasPrefix(e, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	env := ContainerEnv([]string{"GOFLAGS=-mod=mod -modfile=/Users/x/alt.mod"}, nil)
+	if idx(env, "GOFLAGS=-mod=mod") < 0 {
+		t.Errorf("absolute-path field not stripped: %q", env)
+	}
+	env = ContainerEnv([]string{"GOFLAGS=-overlay=/Users/x/o.json"}, nil)
+	if has(env, "GOFLAGS=") {
+		t.Errorf("all-dropped GOFLAGS must omit the key, not emit it empty: %q", env)
+	}
+	env = ContainerEnv([]string{"GOFLAGS=-mod=mod '-modfile=/Users/x/a b.mod'"}, nil)
+	if has(env, "GOFLAGS=") {
+		t.Errorf("quoted GOFLAGS must be dropped whole: %q", env)
+	}
+	env = ContainerEnv([]string{"GOFLAGS=-mod=mod"}, []string{"GOFLAGS=-modfile=/tmp/extra.mod"})
+	if idx(env, "GOFLAGS=-modfile=/tmp/extra.mod") < 0 {
+		t.Errorf("runner-supplied extras must not be filtered: %q", env)
+	}
+}
+
 // TestContainerEnv_PinsGateContainerMarker: every container exec carries
 // FISHHAWK_GATE_CONTAINER=1, and a sanitized-env value cannot unset it (the
 // allow-list drops it; the pin re-appends).
