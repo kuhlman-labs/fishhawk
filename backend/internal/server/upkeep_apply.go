@@ -92,12 +92,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/upkeep"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
-	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // The upkeep apply's audit categories. upkeep_finding_filed /
@@ -390,46 +388,29 @@ func (s *Server) applyApprovedUpkeep(ctx context.Context, stage *run.Stage, deci
 	// DETACHED and BOUNDED, on a goroutine Shutdown drains. The loop's context
 	// derives from `base` — neither the request's cancellation nor the
 	// prelaunch deadline.
-	budget := upkeepApplyBudgetFor(len(b.report.Findings))
-	s.bgUpkeepApply.Add(1)
-	go func() {
-		defer s.bgUpkeepApply.Done()
-		applyCtx, cancel := context.WithTimeout(base, budget)
-		defer cancel()
+	s.startDetachedReportApply(base, upkeepApplyBudgetFor(len(b.report.Findings)), func(applyCtx context.Context) {
 		s.runUpkeepFilingLoop(applyCtx, job)
-	}()
+	})
 }
 
 // upkeepGateRatified is C3. It degrades (window NOT closed) and returns false
-// when the gate's rows are unreadable, contested or ungranted.
+// when the gate's rows are unreadable, contested or ungranted: the shared
+// reportGateRatified (report_seam.go) outcome mapped to the upkeep degrade
+// details.
 func (s *Server) upkeepGateRatified(ctx context.Context, sink *upkeepApplySink, stage *run.Stage, artifactID string) bool {
-	if s.cfg.ApprovalRepo == nil {
+	outcome, aerr := s.reportGateRatified(ctx, stage.ID)
+	switch outcome {
+	case reportGateRatifiedOK:
+		return true
+	case reportGateNoRepository:
 		s.degradeUpkeepApplyPrelaunch(ctx, sink, artifactID, upkeepApplyNotRatified, "no approval repository is configured")
-		return false
-	}
-	approvals, aerr := s.cfg.ApprovalRepo.ListForStage(ctx, stage.ID)
-	if aerr != nil {
+	case reportGateUnreadable:
 		s.degradeUpkeepApplyPrelaunch(ctx, sink, artifactID, upkeepApplyNotRatified, aerr.Error())
-		return false
-	}
-	grants, rejections := 0, 0
-	for _, ap := range approvals {
-		if ap == nil {
-			continue
-		}
-		switch ap.Decision {
-		case approval.DecisionApprove:
-			grants++
-		case approval.DecisionReject:
-			rejections++
-		}
-	}
-	if grants == 0 || rejections > 0 {
+	default:
 		s.degradeUpkeepApplyPrelaunch(ctx, sink, artifactID, upkeepApplyNotRatified,
 			"the upkeep gate is contested or ungranted; nothing filed")
-		return false
 	}
-	return true
+	return false
 }
 
 // resolveUpkeepFilingJob resolves every input of the detached loop. It returns
@@ -472,25 +453,13 @@ func (s *Server) resolveUpkeepFilingJob(ctx context.Context, stage *run.Stage, b
 		return nil, upkeepApplyConventionsUnavailable, cerr.Error()
 	}
 
-	// The run-scoped target, built exactly as upkeepDuplicates builds it:
-	// coordinates from the run, provider connections from the conventions, the
-	// credential scope from the run's installation (else resolved for the
-	// GitHub provider). A failed scope lookup is NOT fatal: the provider fails
+	// The run-scoped target, built by the same runScopedWorkTarget
+	// upkeepDuplicates builds it through: coordinates from the run, provider
+	// connections from the conventions, the credential scope from the run's
+	// installation (else resolved for the GitHub provider). A failed scope
+	// lookup is NOT fatal: the target keeps a zero scope, the provider fails
 	// closed per finding and the finding is recorded filing_failed.
-	target := workmgmt.Target{
-		Repo:    workmgmt.Repo{Owner: owner, Name: name},
-		Project: conv.Project,
-		Jira:    conv.Jira,
-		GitLab:  conv.GitLab,
-	}
-	if rn.InstallationID != nil {
-		target.Scope = forge.FromGitHubInstallationID(*rn.InstallationID)
-	}
-	if target.Scope.IsZero() && s.cfg.GitHub != nil && conv.Provider == workmgmtgithub.ProviderName {
-		if scope, serr := s.resolveRepoScope(ctx, owner, name); serr == nil {
-			target.Scope = scope
-		}
-	}
+	target, _ := s.runScopedWorkTarget(ctx, rn, owner, name, conv)
 
 	return &upkeepFilingJob{
 		runID: stage.RunID, stageID: stage.ID, artifactID: artifactID,
@@ -764,61 +733,18 @@ func normalizeUpkeepEpicRef(ref string) string {
 
 // upkeepRecordedArtifact reads the artifact id named by the HIGHEST-sequence
 // upkeep_report_recorded row — latestUpkeepReport's selection rule, without the
-// body read. found=false with a nil error means no row.
+// body read: recordedReportArtifact (report_seam.go) over the upkeep
+// category. found=false with a nil error means no row.
 func (s *Server) upkeepRecordedArtifact(ctx context.Context, runID uuid.UUID) (uuid.UUID, bool, error) {
-	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.UpkeepReportRecordedCategory)
-	if err != nil {
-		return uuid.Nil, false, fmt.Errorf("list upkeep_report_recorded rows: %w", err)
-	}
-	var newest *audit.Entry
-	for _, e := range rows {
-		if e != nil && (newest == nil || e.Sequence >= newest.Sequence) {
-			newest = e
-		}
-	}
-	if newest == nil {
-		return uuid.Nil, false, nil
-	}
-	var p struct {
-		ArtifactID string `json:"artifact_id"`
-	}
-	if jerr := json.Unmarshal(newest.Payload, &p); jerr != nil {
-		return uuid.Nil, false, fmt.Errorf("decode upkeep_report_recorded row %d: %w", newest.Sequence, jerr)
-	}
-	id, perr := uuid.Parse(p.ArtifactID)
-	if perr != nil {
-		return uuid.Nil, false, fmt.Errorf("upkeep_report_recorded row %d names artifact %q: %w", newest.Sequence, p.ArtifactID, perr)
-	}
-	return id, true, nil
+	return s.recordedReportArtifact(ctx, runID, audit.UpkeepReportRecordedCategory)
 }
 
 // upkeepRecordedRow returns the highest-sequence upkeep_report_recorded row
 // naming artifactID: the ONE row both the duplicates and the coverage marks
-// are read from. No such row is an error (fail closed).
+// are read from (recordedReportRow, report_seam.go). No such row is an error
+// (fail closed).
 func (s *Server) upkeepRecordedRow(ctx context.Context, runID uuid.UUID, artifactID string) (*audit.Entry, error) {
-	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.UpkeepReportRecordedCategory)
-	if err != nil {
-		return nil, fmt.Errorf("list upkeep_report_recorded rows: %w", err)
-	}
-	var best *audit.Entry
-	for _, e := range rows {
-		if e == nil {
-			continue
-		}
-		var probe struct {
-			ArtifactID string `json:"artifact_id"`
-		}
-		if json.Unmarshal(e.Payload, &probe) != nil || probe.ArtifactID != artifactID {
-			continue
-		}
-		if best == nil || e.Sequence >= best.Sequence {
-			best = e
-		}
-	}
-	if best == nil {
-		return nil, fmt.Errorf("no upkeep_report_recorded row names artifact %s", artifactID)
-	}
-	return best, nil
+	return s.recordedReportRow(ctx, runID, audit.UpkeepReportRecordedCategory, artifactID)
 }
 
 // upkeepRecordedDuplicates reads the ingest's dedupe verdict from the recorded
@@ -913,91 +839,32 @@ func (s *Server) upkeepPriorFilings(ctx context.Context, runID uuid.UUID, artifa
 
 // settleUpkeepWindow closes artifactID's upkeep capture window with the given
 // settlement, returning the consumed dispositions collapsed last-wins per
-// finding id. It drives audit.UpkeepWindowAppender when present (production)
-// and a non-atomic, permanence-aware read-then-append fallback otherwise
+// finding id: settleReportWindow (report_seam.go) over upkeepWindowFamily,
+// which drives audit.UpkeepWindowAppender when present (production) and a
+// non-atomic, permanence-aware read-then-append fallback otherwise
 // (settleGroomingWindow's shape over the upkeep categories).
 func (s *Server) settleUpkeepWindow(ctx context.Context, stage *run.Stage, artifactID, settlement string) (map[string]upkeepConsumedDisposition, error) {
-	now := time.Now().UTC()
-	payload, err := json.Marshal(groomingWindowPayload{
-		RunID: stage.RunID.String(), StageID: stage.ID.String(),
-		ArtifactID: artifactID, Settlement: settlement,
-		ClosedAt: now.Format(time.RFC3339Nano),
-	})
+	consumed, err := s.settleReportWindow(ctx, upkeepWindowFamily, stage, artifactID, settlement)
 	if err != nil {
 		return nil, err
 	}
-	systemKind := audit.ActorSystem
-	stageID := stage.ID
-	params := audit.ChainAppendParams{
-		RunID: stage.RunID, StageID: &stageID, Timestamp: now,
-		Category: audit.UpkeepApplyWindowClosedCategory, ActorKind: &systemKind, Payload: payload,
-	}
-
-	if appender, ok := s.cfg.AuditRepo.(audit.UpkeepWindowAppender); ok {
-		_, consumed, aerr := appender.AppendChainedUpkeepWindowClose(ctx, params, artifactID)
-		if aerr != nil {
-			return nil, aerr
-		}
-		return collapseUpkeepConsumed(consumed, artifactID), nil
-	}
-
-	// FALLBACK (in-memory repos): permanence-aware read-then-append.
-	existing, err := s.windowSettlementFor(ctx, stage.RunID, audit.UpkeepApplyWindowClosedCategory, artifactID)
-	if err != nil {
-		return nil, err
-	}
-	var belowSeq int64
-	if existing != nil {
-		belowSeq = existing.AuditSequence // PERMANENCE: never extend the bound.
-	} else {
-		wm, aerr := s.cfg.AuditRepo.AppendChained(ctx, params)
-		if aerr != nil {
-			return nil, aerr
-		}
-		belowSeq = wm.Sequence
-	}
-	disp, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, stage.RunID, CategoryUpkeepDispositionRecorded)
-	if err != nil {
-		return nil, err
-	}
-	scoped := make([]*audit.Entry, 0, len(disp))
-	for _, e := range disp {
-		if e != nil && e.Sequence < belowSeq {
-			scoped = append(scoped, e)
-		}
-	}
-	return collapseUpkeepConsumed(scoped, artifactID), nil
+	return collapseUpkeepConsumed(consumed, artifactID), nil
 }
 
 // collapseUpkeepConsumed collapses the consumed upkeep_disposition_recorded
 // rows of artifactID LAST-WINS per finding id; an undecodable row is skipped
-// (a junk row must not manufacture a verdict).
+// (a junk row must not manufacture a verdict). collapseConsumed
+// (report_seam.go) over upkeepDispositionPayload.
 func collapseUpkeepConsumed(entries []*audit.Entry, artifactID string) map[string]upkeepConsumedDisposition {
-	type ranked struct {
-		d upkeepConsumedDisposition
-		s int64
-	}
-	latest := map[string]ranked{}
-	for _, e := range entries {
-		if e == nil {
-			continue
-		}
+	return collapseConsumed(entries, artifactID, func(payload []byte) (string, string, upkeepConsumedDisposition, bool) {
 		var p upkeepDispositionPayload
-		if json.Unmarshal(e.Payload, &p) != nil || p.FindingID == "" || p.ArtifactID != artifactID {
-			continue
+		if json.Unmarshal(payload, &p) != nil {
+			return "", "", upkeepConsumedDisposition{}, false
 		}
-		if cur, ok := latest[p.FindingID]; ok && cur.s > e.Sequence {
-			continue
-		}
-		latest[p.FindingID] = ranked{upkeepConsumedDisposition{
+		return p.FindingID, p.ArtifactID, upkeepConsumedDisposition{
 			Verdict: p.Verdict, AuthorizeDelegationTier: p.AuthorizeDelegationTier, ParentEpic: p.ParentEpic,
-		}, e.Sequence}
-	}
-	out := make(map[string]upkeepConsumedDisposition, len(latest))
-	for id, r := range latest {
-		out[id] = r.d
-	}
-	return out
+		}, true
+	})
 }
 
 // degradeUpkeepApplyPrelaunch records ONE degraded upkeep_apply_completed row

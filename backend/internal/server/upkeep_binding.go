@@ -21,11 +21,12 @@ import (
 // check. Contract: docs/spec/upkeep-report-v1.md § "Ingest" and § "Plan-path
 // guard"; residuals: backend/internal/upkeep/README.md.
 
-// Undecidable reasons carried by upkeepStageBinding. Internal: the ingest
-// collapses both into the caller-visible stage_binding_undecidable.
+// Undecidable reasons carried by upkeepStageBinding: the shared seam's
+// generic reasons (report_seam.go). Internal: the ingest collapses both into
+// the caller-visible stage_binding_undecidable.
 const (
-	upkeepBindingWorkflowUnresolved = "workflow_unresolved"
-	upkeepBindingStageUnmappable    = "stage_unmappable"
+	upkeepBindingWorkflowUnresolved = stageBindingWorkflowUnresolved
+	upkeepBindingStageUnmappable    = stageBindingStageUnmappable
 )
 
 // Ingest refusal reasons — the details.reason values of a 400
@@ -54,7 +55,8 @@ type upkeepStageBinding struct {
 }
 
 // resolveUpkeepStageBinding reads the stage's upkeep_report declaration from
-// the run's cached spec via resolveRunWorkflowDef and specStageForRunStage.
+// the run's cached spec: resolveStageArtifactBinding (report_seam.go) with the
+// kind fixed to upkeep_report, converted field-for-field.
 //
 // The returned error is reserved for a store that did not ANSWER (a GetRun or
 // ListStagesForRun transport failure); the caller maps it to 500 and leaves
@@ -69,34 +71,16 @@ type upkeepStageBinding struct {
 // some stage, so ordinary workflows pay one GetRun and one spec parse and
 // never list stages.
 func (s *Server) resolveUpkeepStageBinding(ctx context.Context, runID uuid.UUID, stage *run.Stage) (upkeepStageBinding, error) {
-	_, wf, _, _, ok, err := s.resolveRunWorkflowDef(ctx, runID)
+	b, err := s.resolveStageArtifactBinding(ctx, runID, stage, spec.ArtifactUpkeepReport)
 	if err != nil {
 		return upkeepStageBinding{}, err
 	}
-	if !ok {
-		return upkeepStageBinding{Undecidable: upkeepBindingWorkflowUnresolved}, nil
-	}
-	b := upkeepStageBinding{Resolved: true}
-	for _, st := range wf.Stages {
-		if spec.StageProducesUpkeepReport(st) {
-			b.WorkflowDeclaresUpkeep = true
-			break
-		}
-	}
-	if !b.WorkflowDeclaresUpkeep {
-		return b, nil
-	}
-	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
-	if err != nil {
-		return upkeepStageBinding{}, fmt.Errorf("list stages for run %s: %w", runID, err)
-	}
-	sp, mapped := specStageForRunStage(wf, rows, stage)
-	if !mapped {
-		b.Undecidable = upkeepBindingStageUnmappable
-		return b, nil
-	}
-	b.StageDeclaresUpkeep = spec.StageProducesUpkeepReport(sp)
-	return b, nil
+	return upkeepStageBinding{
+		Resolved:               b.Resolved,
+		WorkflowDeclaresUpkeep: b.WorkflowDeclares,
+		StageDeclaresUpkeep:    b.StageDeclares,
+		Undecidable:            b.Undecidable,
+	}, nil
 }
 
 // upkeepIngestRefusal is the upkeep_report ingest's binding decision. It
@@ -127,7 +111,12 @@ func upkeepIngestRefusal(b upkeepStageBinding) string {
 // upkeep_report, where a stage that declares it, or one that cannot be mapped,
 // refuses.
 func upkeepStageRefusesOtherProposal(b upkeepStageBinding) bool {
-	return b.Resolved && b.WorkflowDeclaresUpkeep && (b.StageDeclaresUpkeep || b.Undecidable != "")
+	return stageRefusesOtherProposal(stageArtifactBinding{
+		Resolved:         b.Resolved,
+		WorkflowDeclares: b.WorkflowDeclaresUpkeep,
+		StageDeclares:    b.StageDeclaresUpkeep,
+		Undecidable:      b.Undecidable,
+	})
 }
 
 // checkUpkeepRunRefs verifies every cited run id names a run in the reporting
