@@ -879,12 +879,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// (the PR is not even open yet at implement-stage exit), so there is no
 		// merge for this surface to observe (#1370).
 		//
-		// The release signals stay the zero value BY CHOICE too: a run_stage call
-		// executes plan/implement/acceptance, never the delegating "release"
+		// The release LOOP signals stay the zero value BY CHOICE too: a run_stage
+		// call executes plan/implement/acceptance, never the delegating "release"
 		// workflow's operator loop (E33.5 / #1590), so the release arm is inert
 		// here — and releaseSignalsFor costs extra cost-gated round-trips that
-		// getRunStatus owns.
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, releaseSignals{})
+		// getRunStatus owns. The ONE exception is RollbackOffer (E35.3 / #1600):
+		// a blocking acceptance run_stage on a post-deploy release run CAN settle
+		// on a rollback_offered triage, and the offer is derived off the
+		// recentAudit window already fetched (no round-trip), with the same
+		// helper getRunStatus uses — so this surface names the same stored
+		// rollback_handle the status surface does.
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, releaseSignals{RollbackOffer: acceptanceRollbackOfferIn(recentAudit)})
 		// E64.63 (#3222): the same display-only acceptance-blocker fold
 		// getRunStatus applies, off the SAME postStages + recentAudit slices,
 		// so the post-stage snapshot and the status snapshot cannot diverge on

@@ -564,6 +564,21 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	acceptance := stageByType(stages, "acceptance")
 	implReviewPending := implementReviewStatus != nil && implementReviewStatus.Status == "pending"
 
+	// E35.3 / #1600: a failed post-deploy acceptance verdict whose triage
+	// recorded rollback_offered. Checked BEFORE the succeeded-run block because
+	// a failed verdict leaves the acceptance stage succeeded, so a release run
+	// is typically already `succeeded` when triage offers the rollback — and the
+	// run-scoped rollback endpoint checks only the deploy stage's state, so the
+	// rollback stays callable. Without this arm a succeeded release run would
+	// read as plain {State: succeeded} and a running one would never reach the
+	// acceptance arm (a release run has no implement stage). NEVER the merge
+	// ritual. An operator arbitration bound to the verdict discharges the offer
+	// (the keep-the-deploy alternative), so an arbitrated run skips the arm.
+	if acceptanceVerdict == acceptanceVerdictFailed &&
+		acceptanceTriageDisposition == acceptanceDispositionRollbackOffered && !acceptanceArbitrated {
+		return acceptanceRollbackOfferedNextActions(run, release.RollbackOffer, acceptance)
+	}
+
 	// Run already succeeded: the wedge arm, then the merge ritual.
 	if run.State == "succeeded" {
 		if implReviewPending {
@@ -1194,6 +1209,14 @@ type releaseSignals struct {
 	// distinguishes pipeline_running (the pushed-tag pipeline is in flight)
 	// from awaiting_publish (the pipeline has settled).
 	DeployState string
+	// RollbackOffer is the E35.3 / #1600 post-deploy rollback offer correlated
+	// with the newest failed acceptance verdict (acceptanceRollbackOfferIn), or
+	// nil when there is none. Unlike the fields above it is computed for EVERY
+	// run — at BOTH nextActionsFor call sites (getRunStatus and run_stage) — off
+	// the recent-audit slice already fetched, so it costs no round-trip and is
+	// not gated on IsRelease. Additive: nil changes nothing; it is read only by
+	// the acceptance_triage_rollback_offered / _initiated arm.
+	RollbackOffer *acceptanceRollbackOffer
 }
 
 // releaseStageNextActions is the release-workflow loop arm (E33.5 / #1590,
@@ -1956,6 +1979,88 @@ func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 	}
 }
 
+// acceptanceRollbackOfferedNextActions is the E35.3 / #1600 post-deploy
+// rollback arm. A failed post-deploy verdict (class 1 or 4) on a release-shaped
+// run recorded the paged rollback_offered disposition: triage NEVER fires the
+// rollback, so the operator either rolls the deploy back or arbitrates to keep
+// it. Two states, both carrying the drive.RuleAcceptanceTriage prefix:
+//
+//   - acceptance_triage_rollback_offered: read the triage evidence, then the
+//     operator-gated deploy_rollback verb (`fishhawk deploy rollback <run-id>` /
+//     POST /v0/runs/{run_id}/deployment/rollback) carrying the stored
+//     rollback_handle, then fishhawk_arbitrate_acceptance as the
+//     keep-the-deploy alternative.
+//   - acceptance_triage_rollback_initiated: a deployment_rollback_initiated
+//     entry is newer than the triage entry, so the offer was taken — read the
+//     rollback's settle entry and poll. No deploy_rollback action: the arm
+//     never suggests a second rollback.
+//
+// offer is nil only when a caller did not thread the offer (it is computed off
+// the same recent slice as the disposition, so the two normally agree); the
+// arm then still names the rollback verb and points at the audit for the
+// handle. NEVER the merge ritual — a release run has no PR, and a failed
+// verdict is not merge-eligible until arbitrated.
+func acceptanceRollbackOfferedNextActions(run *Run, offer *acceptanceRollbackOffer, acceptance *Stage) *NextActions {
+	if offer != nil && offer.Initiated {
+		return &NextActions{
+			State: "acceptance_triage_rollback_initiated",
+			Actions: []SuggestedAction{
+				{
+					Action:       "fishhawk_list_audit",
+					Params:       map[string]string{"run_id": run.ID, "category": auditCategoryDeploymentRollbackCompleted},
+					Precondition: "the failed post-deploy acceptance verdict's rollback offer was taken: a deployment_rollback_initiated entry is newer than the rollback_offered triage entry, so the deploy pipeline was re-dispatched in rollback mode",
+					Consumes:     consumesNone,
+					Reason:       "read whether the rollback run has settled (deployment_rollback_completed carries its outcome) — do NOT roll back again; a second rollback would re-dispatch the pipeline a second time",
+				},
+				pollAction(run, derivedStageWaitPollInterval(run, acceptance),
+					"re-poll fishhawk_get_run_status until the rollback settles; if it fails, read deployment_rollback_completed and decide by hand"),
+			},
+		}
+	}
+	rollbackParams := map[string]string{"run_id": run.ID}
+	handleNote := "the stored rollback_handle (read it from the acceptance_triage_decided rollback_offer payload) is re-sent to the pipeline as the fishhawk_rollback_handle workflow_dispatch input (github_actions) or variables.FISHHAWK_ROLLBACK_HANDLE (webhook) when the deploy recorded one"
+	if offer != nil {
+		if offer.RollbackHandle != "" {
+			rollbackParams["rollback_handle"] = offer.RollbackHandle
+			handleNote = "the endpoint re-reads the stored rollback_handle (" + offer.RollbackHandle + ") and re-sends it to the pipeline as the fishhawk_rollback_handle workflow_dispatch input (github_actions) or variables.FISHHAWK_ROLLBACK_HANDLE (webhook)"
+		} else {
+			handleNote = "the deploy recorded no rollback_handle (or it could not be read at triage), so the pipeline is re-dispatched in rollback mode without one — the endpoint re-reads it and refuses 500 with no dispatch if that read fails"
+		}
+		if offer.DeploymentArtifactID != "" {
+			rollbackParams["deployment_artifact_id"] = offer.DeploymentArtifactID
+		}
+		if offer.DeployStageID != "" {
+			rollbackParams["deploy_stage_id"] = offer.DeployStageID
+		}
+	}
+	return &NextActions{
+		State: "acceptance_triage_rollback_offered",
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_list_audit",
+				Params:       map[string]string{"run_id": run.ID, "category": auditCategoryAcceptanceTriageDecided},
+				Precondition: "a failed post-deploy acceptance verdict (class 1 or 4) recorded the rollback_offered disposition (E35.3 / #1600) — triage paged the human and did NOT fire a rollback. Read the acceptance_outcome_recorded criteria results and the acceptance_triage_decided class + reason + rollback_offer first",
+				Consumes:     consumesNone,
+				Reason:       "decide on the evidence whether the deployed change must be reverted or is acceptable as deployed",
+			},
+			{
+				Action:       "deploy_rollback",
+				Params:       rollbackParams,
+				Precondition: "you judge the deployed change must be reverted. Operator-gated: nothing fires it but you",
+				Consumes:     consumesNone,
+				Reason:       "roll the deploy back with `fishhawk deploy rollback " + run.ID + "` (POST /v0/runs/{run_id}/deployment/rollback): it re-dispatches the run's deploy pipeline in rollback mode and records deployment_rollback_initiated; " + handleNote,
+			},
+			{
+				Action:       "fishhawk_arbitrate_acceptance",
+				Params:       map[string]string{"run_id": run.ID, "reason": "<why the deployed change is acceptable despite the failed post-deploy verdict>"},
+				Precondition: "you judge the deploy should STAY (a bad/ambiguous criterion, or a failure that does not warrant a revert). A verdict carrying genuinely FAILED criteria additionally needs acknowledge_failed_criteria:true",
+				Consumes:     consumesNone,
+				Reason:       "keep the deploy: record the arbitration that discharges this paged triage (E66.37 / #2474) — it writes an acceptance_triage_arbitrated entry bound to this verdict and the rollback offer is no longer suggested",
+			},
+		},
+	}
+}
+
 // acceptanceTriageNoDispositionActions is the arm for a recorded `failed`
 // acceptance verdict that carries NO triage disposition (#2512). It reuses the
 // paged arbitration menu — which is the intended route per handleShipAcceptance
@@ -2500,6 +2605,34 @@ const (
 	// arbitrates via the acceptance_triage_paged arm. MUST match
 	// backend/internal/server.acceptanceDispositionUnvalidatable.
 	acceptanceDispositionUnvalidatable = "externally_unvalidatable_paged"
+	// acceptanceDispositionRollbackOffered is the E35.3 / #1600 post-deploy
+	// disposition: a class-1/4 failed verdict on a release-shaped run (a deploy
+	// sequenced before the acceptance stage, no implement stage) is offered an
+	// operator-gated rollback of that deploy. Paged-family — triage takes no
+	// transition and NEVER fires the rollback; the human rolls back or
+	// arbitrates. classifyNextActions serves it from its own
+	// acceptance_triage_rollback_offered arm (acceptanceRollbackOfferedNextActions),
+	// ahead of the generic paged arm. MUST match
+	// backend/internal/server.acceptanceDispositionRollbackOffered (and the
+	// literal in backend/internal/issuecomment/ping.go).
+	acceptanceDispositionRollbackOffered = "rollback_offered"
+
+	// auditCategoryDeploymentRollbackInitiated is the entry the run-scoped
+	// rollback endpoint (POST /v0/runs/{run_id}/deployment/rollback) appends
+	// when it re-dispatches the deploy pipeline in rollback mode. A newer one
+	// than a rollback_offered triage entry means the offer was taken, so the
+	// arm stops suggesting a second rollback (acceptanceRollbackOfferIn).
+	// auditCategoryDeploymentRollbackCompleted is the settle entry the
+	// reconciler writes when that rollback run resolves. MUST match
+	// backend/internal/server.CategoryDeploymentRollbackInitiated /
+	// CategoryDeploymentRollbackCompleted.
+	auditCategoryDeploymentRollbackInitiated = "deployment_rollback_initiated"
+	auditCategoryDeploymentRollbackCompleted = "deployment_rollback_completed"
+	// acceptanceRollbackOfferField is the acceptance_triage_decided payload
+	// object a rollback_offered disposition carries: {deploy_stage_id,
+	// deployment_artifact_id, rollback_handle}. MUST match the json tags on
+	// backend/internal/server.acceptanceRollbackOffer.
+	acceptanceRollbackOfferField = "rollback_offer"
 )
 
 // isAcceptancePagedDisposition reports whether a triage disposition is a
@@ -2507,7 +2640,11 @@ const (
 // dispositions (fixup_dispatched / retry_dispatched) return false — they fired
 // a state transition and the re-opened stage's own arm serves the next move.
 // The class-5 externally_unvalidatable_paged disposition (#1671) returns true:
-// it is terminal (no re-open), so the human arbitrates via the paged arm.
+// it is terminal (no re-open), so the human arbitrates via the paged arm. The
+// E35.3 / #1600 rollback_offered disposition returns true too — it takes no
+// transition and pages the human (who rolls back or arbitrates), matching the
+// server's acceptanceDispositionPages; classifyNextActions serves it from its
+// own acceptance_triage_rollback_offered arm before the generic paged one.
 func isAcceptancePagedDisposition(d string) bool {
 	switch d {
 	case acceptanceDispositionPaged,
@@ -2515,7 +2652,8 @@ func isAcceptancePagedDisposition(d string) bool {
 		acceptanceDispositionFixupUnavailable,
 		acceptanceDispositionRetryUnavailable,
 		acceptanceDispositionUnsettled,
-		acceptanceDispositionUnvalidatable:
+		acceptanceDispositionUnvalidatable,
+		acceptanceDispositionRollbackOffered:
 		return true
 	default:
 		return false
@@ -2614,6 +2752,21 @@ func unshippedMarkerRetired(marker AuditEntry, anchorStages map[string]struct{},
 // (the classifier is in its defensive read arm anyway), no correlated triage
 // exists yet, or the payload is malformed.
 func latestAcceptanceTriageDisposition(recent []AuditEntry) string {
+	idx := correlatedAcceptanceTriageIndex(recent)
+	if idx < 0 {
+		return ""
+	}
+	return acceptancePayloadString(recent[idx].Payload, "disposition")
+}
+
+// correlatedAcceptanceTriageIndex is the ONE correlation rule shared by
+// latestAcceptanceTriageDisposition and acceptanceRollbackOfferIn: the index
+// (in the time-descending recent slice) of the newest acceptance_triage_decided
+// entry strictly NEWER than the newest acceptance_outcome_recorded verdict, or
+// -1 when there is no verdict or no correlated triage entry yet. Sharing it is
+// what keeps the disposition and the rollback offer from ever pairing with two
+// different triage entries.
+func correlatedAcceptanceTriageIndex(recent []AuditEntry) int {
 	verdictIdx := -1
 	for i, e := range recent {
 		if e.Category == auditCategoryAcceptanceOutcomeRecorded {
@@ -2622,14 +2775,68 @@ func latestAcceptanceTriageDisposition(recent []AuditEntry) string {
 		}
 	}
 	if verdictIdx < 0 {
-		return ""
+		return -1
 	}
 	for i := 0; i < verdictIdx; i++ {
 		if recent[i].Category == auditCategoryAcceptanceTriageDecided {
-			return acceptancePayloadString(recent[i].Payload, "disposition")
+			return i
 		}
 	}
-	return ""
+	return -1
+}
+
+// acceptanceRollbackOffer is the MCP mirror of the rollback_offer object a
+// rollback_offered acceptance_triage_decided payload carries (E35.3 / #1600),
+// plus Initiated: whether a deployment_rollback_initiated entry is newer than
+// that triage entry (the offer was taken). The three string fields mirror the
+// json keys of backend/internal/server.acceptanceRollbackOffer (mirrored, not
+// imported — the #875 compile trap); each is "" when the server recorded none
+// (no forward deployment record, no handle, or a failed handle read).
+type acceptanceRollbackOffer struct {
+	DeployStageID        string
+	DeploymentArtifactID string
+	RollbackHandle       string
+	Initiated            bool
+}
+
+// acceptanceRollbackOfferIn derives the rollback offer correlated with the
+// newest acceptance verdict, using the SAME correlation rule as
+// latestAcceptanceTriageDisposition (correlatedAcceptanceTriageIndex): the
+// triage entry must be strictly newer than the newest
+// acceptance_outcome_recorded, so a stale offer from an earlier attempt never
+// pairs with a fresh verdict. Returns nil unless that entry's disposition is
+// rollback_offered — which also covers a non-object payload (no disposition
+// can be read from it). The rollback_offer object is read best-effort: a
+// missing or non-object value, or a non-string field, yields "" for the
+// affected fields rather than nil, so Initiated is still decided and the arm
+// can never suggest a second rollback just because the offer body was
+// unreadable. Initiated is true when any deployment_rollback_initiated entry
+// sits strictly newer (a lower index) than the triage entry. Pure and
+// panic-free over any payload shape.
+func acceptanceRollbackOfferIn(recent []AuditEntry) *acceptanceRollbackOffer {
+	idx := correlatedAcceptanceTriageIndex(recent)
+	if idx < 0 {
+		return nil
+	}
+	triage := recent[idx]
+	if acceptancePayloadString(triage.Payload, "disposition") != acceptanceDispositionRollbackOffered {
+		return nil
+	}
+	offer := &acceptanceRollbackOffer{}
+	if m, ok := triage.Payload.(map[string]any); ok {
+		if body, ok := m[acceptanceRollbackOfferField].(map[string]any); ok {
+			offer.DeployStageID, _ = body["deploy_stage_id"].(string)
+			offer.DeploymentArtifactID, _ = body["deployment_artifact_id"].(string)
+			offer.RollbackHandle, _ = body["rollback_handle"].(string)
+		}
+	}
+	for i := 0; i < idx; i++ {
+		if recent[i].Category == auditCategoryDeploymentRollbackInitiated {
+			offer.Initiated = true
+			break
+		}
+	}
+	return offer
 }
 
 // acceptancePayloadString reads a string field from a decoded-JSON audit
