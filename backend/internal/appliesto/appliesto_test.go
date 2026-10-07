@@ -216,6 +216,9 @@ func TestFirstFailingCriterion_NamesTheCriterion(t *testing.T) {
 //     `trigger: [scheduled, on_demand]` grooming declaration selectable;
 //   - scheduled maps to scheduled (E79.1 / #3725) — the in-process
 //     scheduler's runs;
+//   - alert maps to diff (E35.4 / #1601) — an alert-started hotfix produces a
+//     code diff; the hotfix_change preset (#1602) must list `diff` in its
+//     applies_to.trigger or every auto-started alert run is refused;
 //   - an UNRECOGNIZED source stays diff-shaped (the conservative default arm:
 //     every existing predicate is written against a diff-form change).
 func TestTriggerFormForSource(t *testing.T) {
@@ -230,6 +233,7 @@ func TestTriggerFormForSource(t *testing.T) {
 		{"nonsense", spec.TriggerDiff},
 		{"scheduled", spec.TriggerScheduled},
 		{"on_demand", spec.TriggerOnDemand},
+		{"alert", spec.TriggerDiff},
 	}
 	for _, tc := range cases {
 		if got := TriggerFormForSource(tc.source); got != tc.want {
@@ -243,6 +247,9 @@ func TestTriggerFormForSource(t *testing.T) {
 	}
 	if got := TriggerFormForSource(string(run.TriggerScheduled)); got != spec.TriggerScheduled {
 		t.Errorf("TriggerFormForSource(run.TriggerScheduled) = %q, want scheduled", got)
+	}
+	if got := TriggerFormForSource(string(run.TriggerAlert)); got != spec.TriggerDiff {
+		t.Errorf("TriggerFormForSource(run.TriggerAlert) = %q, want diff (the hotfix_change applies_to contract, #1602)", got)
 	}
 }
 

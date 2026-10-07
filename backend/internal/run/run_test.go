@@ -99,13 +99,24 @@ func TestValidTriggerSources_ClosedSet(t *testing.T) {
 			t.Error("ValidTriggerSources() must not admit 'scheduled' — it is reserved to the in-process scheduler (POST /v0/runs refuses it as trigger_source_reserved)")
 		}
 	}
+	// `alert` (E35.4 / #1601) is the second SYSTEM-ONLY source, reserved to
+	// the alert ingress's auto-start (server.StartAlertRun) for the same reason.
+	if string(TriggerAlert) != "alert" {
+		t.Errorf("TriggerAlert = %q, want alert (the wire value the 0099 CHECK constraint enumerates)", TriggerAlert)
+	}
+	for _, ts := range ValidTriggerSources() {
+		if ts == TriggerAlert {
+			t.Error("ValidTriggerSources() must not admit 'alert' — it is reserved to the alert ingress's auto-start (POST /v0/runs refuses it as trigger_source_reserved)")
+		}
+	}
 }
 
 // TestRunIsIssueAnchored pins the source-level predicate the issue_context
 // coupling (server + MCP) and the six issuecomment suppression sites are
-// written against (E54.22 / #2826). github_issue, on_demand and scheduled
-// (E79.1 / #3725: a schedule may name an anchor issue) are anchored; cli, ui,
-// an unknown value and the empty value are not.
+// written against (E54.22 / #2826). github_issue, on_demand, scheduled
+// (E79.1 / #3725: a schedule may name an anchor issue) and alert (E35.4 /
+// #1601: an auto-started alert run always names the filed incident issue) are
+// anchored; cli, ui, an unknown value and the empty value are not.
 func TestRunIsIssueAnchored(t *testing.T) {
 	cases := []struct {
 		source TriggerSource
@@ -116,6 +127,7 @@ func TestRunIsIssueAnchored(t *testing.T) {
 		{TriggerCLI, false},
 		{TriggerUI, false},
 		{TriggerScheduled, true},
+		{TriggerAlert, true},
 		{TriggerSource("nonsense"), false},
 		{TriggerSource(""), false},
 	}
