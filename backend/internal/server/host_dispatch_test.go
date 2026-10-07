@@ -49,6 +49,41 @@ func hostDispatchServer(t *testing.T, stageState run.StageState) (*Server, *orch
 	return s, rr, runRow.ID, stage.ID
 }
 
+// lockRunRunnerKind locks the seeded run to kind on the fake's LIVE map-held
+// row, under its lock, BEFORE the request. It must not go through rr.GetRun:
+// GetRun returns a copy (#4033, mirroring the postgres repo's fresh row per
+// read), so a mutation through the returned pointer never reaches the row the
+// handler reads and the test would silently run un-locked.
+func lockRunRunnerKind(rr *orchestratorRepo, runID uuid.UUID, kind string) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	row := rr.runs[runID]
+	row.RunnerKind = kind
+	row.RunnerKindResolved = true
+}
+
+// resolvedKindObservingRepo records the RunnerKind / RunnerKindResolved the
+// handler's GetRun actually READ, so a test can assert its lock reached the
+// handler rather than inferring it from an outcome an un-locked run would share
+// (a locked-local run and an un-resolved run both answer 200).
+type resolvedKindObservingRepo struct {
+	*orchestratorRepo
+	mu       sync.Mutex
+	resolved []bool
+	kinds    []string
+}
+
+func (r *resolvedKindObservingRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	row, err := r.orchestratorRepo.GetRun(ctx, id)
+	if err == nil {
+		r.mu.Lock()
+		r.resolved = append(r.resolved, row.RunnerKindResolved)
+		r.kinds = append(r.kinds, row.RunnerKind)
+		r.mu.Unlock()
+	}
+	return row, err
+}
+
 // withHostDispatchOperator injects an operator token identity carrying
 // write:runs — the scope the host-dispatch endpoint requires.
 func withHostDispatchOperator(req *http.Request) *http.Request {
@@ -449,10 +484,8 @@ func TestHostDispatch_UnknownAndMismatchedHandle_NotFound(t *testing.T) {
 // stage 'dispatched' without a host spawn.
 func TestHostDispatch_LockedNonLocalRun_Conflict(t *testing.T) {
 	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
-	// Lock the seeded run to github_actions.
-	locked, _ := rr.GetRun(context.Background(), runID)
-	locked.RunnerKind = run.RunnerKindGitHubActions
-	locked.RunnerKindResolved = true
+	// Lock the seeded run to github_actions on the live map-held row.
+	lockRunRunnerKind(rr, runID, run.RunnerKindGitHubActions)
 
 	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
 	if w.Code != http.StatusConflict {
@@ -476,9 +509,7 @@ func TestHostDispatch_LockedNonLocalRun_Conflict(t *testing.T) {
 // classification flip did not change this site's 409 posture.
 func TestHostDispatch_LockedGitLabCI_Conflict(t *testing.T) {
 	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
-	locked, _ := rr.GetRun(context.Background(), runID)
-	locked.RunnerKind = "gitlab_ci"
-	locked.RunnerKindResolved = true
+	lockRunRunnerKind(rr, runID, "gitlab_ci")
 
 	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
 	if w.Code != http.StatusConflict {
@@ -498,10 +529,12 @@ func TestHostDispatch_LockedGitLabCI_Conflict(t *testing.T) {
 // auto-resolves it to local), mirroring the MCP guardHostDispatch posture — the
 // default seeded run is un-resolved and every happy-path test above covers it.
 func TestHostDispatch_LockedLocalRun_Admitted(t *testing.T) {
-	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
-	locked, _ := rr.GetRun(context.Background(), runID)
-	locked.RunnerKind = run.RunnerKindLocal
-	locked.RunnerKindResolved = true
+	_, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
+	// A 200 alone cannot tell a locked-local run from an un-resolved one (both
+	// are admitted), so observe what the handler's GetRun actually read.
+	obs := &resolvedKindObservingRepo{orchestratorRepo: rr}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: obs})
+	lockRunRunnerKind(rr, runID, run.RunnerKindLocal)
 
 	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
 	if w.Code != http.StatusOK {
@@ -509,6 +542,17 @@ func TestHostDispatch_LockedLocalRun_Admitted(t *testing.T) {
 	}
 	if resp := decodeHostDispatch(t, w); !resp.Transitioned {
 		t.Errorf("resp = %+v, want transitioned:true", resp)
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.resolved) == 0 {
+		t.Fatal("handler never called GetRun; the lock was not exercised")
+	}
+	for i := range obs.resolved {
+		if !obs.resolved[i] || obs.kinds[i] != run.RunnerKindLocal {
+			t.Errorf("GetRun #%d saw RunnerKindResolved=%v RunnerKind=%q, want true/%q (the lock must reach the handler)",
+				i, obs.resolved[i], obs.kinds[i], run.RunnerKindLocal)
+		}
 	}
 }
 
