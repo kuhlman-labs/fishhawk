@@ -341,9 +341,10 @@ func DerivesFromWindow(f Filing, candidates []Candidate) []SourceItem {
 	return out
 }
 
-// Charter is the repository's resolved charter, reduced to what scoring
-// needs. ContentHash is carried so a reader can tell which charter revision
-// a score was anchored to.
+// Charter is the repository's resolved charter, reduced to what its readers
+// need: the rubric scoring cites and the non-goals the comms scan renders.
+// ContentHash is carried so a reader can tell which charter revision a score
+// was anchored to.
 type Charter struct {
 	// Path is the charter's repo-relative path, as the conventions declare it.
 	Path string
@@ -353,6 +354,12 @@ type Charter struct {
 	// be cited, each with its line text for quoting. An empty rubric is a
 	// degradation, never a licence to cite an id that is not there.
 	RubricIDs Rubric
+	// NonGoals are the charter's §3 non-goal bullets, parsed from the same
+	// document content as RubricIDs (ParseNonGoals). Intake scoring ignores
+	// them; the comms scan (#4014) renders them so an n_drift entry can cite
+	// only a declared non-goal id. Empty on every path where RubricIDs is
+	// empty because the charter was never read.
+	NonGoals NonGoals
 	// Resolved reports that a charter document was actually FETCHED and its
 	// content handed to ParseRubricIDs. It is true ONLY on that one path.
 	//
