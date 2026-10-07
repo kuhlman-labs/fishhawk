@@ -15,6 +15,11 @@ Agent-evaluation harness. Two families live here:
   rubric moved reviewer severities toward the operator's label and whether it
   COST any adversarial finding. See
   [Severity calibration](#severity-calibration-and-adversarial-retention-e5022--3309).
+- **Plan-review catch-rate gate (E55.4 / #2245)** — a two-arm measurement of
+  whether the E55.3 / #2244 review-conventions section dilutes the plan
+  reviewer's catch rate on the plan-review-miss corpus, a committed evidence
+  record with a PINNED baseline, and the offline `catchrategate` command. See
+  [Plan-review catch-rate gate](#plan-review-catch-rate-gate-e554--2245).
 
 ---
 
@@ -530,6 +535,256 @@ mode (i) cannot be satisfied by deleting every probe.
 
 ---
 
+## Plan-review catch-rate gate (E55.4 / #2245)
+
+The E55.3 / #2244 review-conventions section adds repository prose to the
+plan-review prompt. This gate asks whether that prose DILUTES the plan
+reviewer's catch rate on the plan-review-miss corpus, and fails closed when it
+cannot answer.
+
+| File | Owns |
+|---|---|
+| `planreviewcatch.go` | the catch corpus loader, the two arms, `ClassifyCatch`, `RunCatchRateArm`, `CompareCatchRateArms`, the tolerance and the power floor |
+| `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
+| `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`) |
+| `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) |
+| `testdata/planreview-catchrate/` | the representative conventions fixture and, once an operator records it, `evidence.json` |
+
+### THE BASELINE HAS NOT BEEN RECORDED
+
+No `testdata/planreview-catchrate/evidence.json` is committed. The offline
+tests prove the APPARATUS is correct (the arms differ only by the conventions
+section, the loader refuses non-discriminating probes, every evidence mode
+fails closed). They prove NOTHING about whether conventions dilute the
+reviewer, because nothing in-loop calls a model: the runner denies
+`ANTHROPIC_API_KEY` to gate subprocesses (`runner/cmd/fishhawk-runner/gateenv.go`
+`gateEnvDeny`). Until an operator records and pins the first baseline,
+`catchrategate` exits 1 on the committed tree, so the standing check fails
+closed on every review-prompt change. That is the design. Run-book:
+[`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md).
+
+### Corpus authoring: `review_input.json` and the probe matcher
+
+Every case under `testdata/planreview-miss-corpus/<case>/` needs a
+hand-curated `review_input.json` beside its `miss.json`:
+
+```json
+{
+  "issue_title": "…",
+  "issue_body": "…",
+  "plan": { "plan_version": "standard_v1", "…": "a COMPLETE plan plan.Parse accepts" },
+  "catch_probes": ["criterion-id", "a phrase only a catching concern uses"],
+  "catching_examples": [{"category": "acceptance_criteria", "note": "…"}],
+  "non_catching_examples": [{"category": "security", "note": "…"}]
+}
+```
+
+**The matcher (`matchCatchProbe`, pinned in `catchRuleVersion`).** A concern
+catches the planted defect when some probe occurs as a CASE-FOLDED
+(`strings.ToLower`) SUBSTRING of the concern's `note` OR its `category`. This
+mirrors `severitycalibration.go`'s `matchLabelledConcern` in matching over both
+fields; it is a plain substring test, not a token-overlap score, because a
+probe names one planted defect. The loader's discrimination checks use the SAME
+function: a probe matching any `non_catching_examples` entry, or a
+`catching_examples` entry matching no probe, is refused at load time. Changing
+the matcher's meaning requires a `catchRuleVersion` bump, which changes the
+evidence fingerprint and forces a re-measurement.
+
+`LoadPlanReviewCatchCorpus` fails closed (an error naming the case) on: (a) an
+absent corpus dir, (b) zero cases, (c) a missing `review_input.json`, (d)
+malformed JSON or an unknown field, (e) an empty `issue_title`/`issue_body`,
+(f) a plan `plan.Parse` rejects, (g) a plan lacking the miss criterion id —
+the defect must be IN the reviewed plan, (h) a criterion statement differing
+from `miss.json`, (i) empty or blank probes, (j) a probe matching a
+non-catching example, (k) a catching example matching no probe, (l) empty
+example lists. `synthetic` is NOT required: the six `seed-synthetic-*` cases
+carry `synthetic: true`, and a curated production case (`synthetic: false`
+with a `review_input.json`) is legal. A distilled plan-review-miss case
+committed WITHOUT a `review_input.json` fails mode (c) in verify.
+
+### The arms
+
+Each case renders through the REAL `prompt.Build("plan_review")` twice:
+`ArmWithoutConventions` (no conventions section) and `ArmWithConventions` (the
+committed `representative-conventions.md`, a page of non-adversarial review
+prose rendered through the real `repodoc.ToPromptDocument` path).
+`TestCatchRateArms_DifferOnlyInConventionsSection` pins that the arms differ
+ONLY by that section. A trial is caught / missed / undecodable
+(`ClassifyCatch`); an UNDECODABLE verdict counts as a MISS in the rate and is
+reported separately, so an arm cannot look better by emitting garbage.
+
+### The rule, the tolerance and the power floor
+
+- **Within-run rule.** FAIL when the with-conventions catch rate is MORE than
+  `DefaultCatchRateRegressionTolerance` = 0.10 below the without-conventions
+  rate of the SAME measurement (exactly 0.10 passes; decided in exact
+  rationals). The 0.10 tolerance and the one-sided 95% level are JUDGEMENT
+  CALLS.
+- **Power floor.** `MinCatchRateTrialsPerArm` = 136 is DERIVED, not chosen:
+  the smallest n at which the one-sided 95% worst-case noise bound on the arm
+  difference, `1.645*sqrt(0.5/n)`, is at most the tolerance
+  (`n >= 0.5*(z/tolerance)^2 = 135.3`). An under-powered measurement is
+  REFUSED, never passed — raise the samples, do not widen the tolerance.
+  `TestMinCatchRateTrialsPerArm_DerivedFromTolerance` fails if the two drift.
+- **READ THE FLOOR HONESTLY.** The 136-trial floor bounds MODEL-SAMPLING NOISE
+  ONLY. The corpus size — six synthetic planted-defect shapes — not the trial
+  count, bounds what the gate can detect: a dilution that spares these six
+  shapes is invisible to it, however many trials are taken.
+
+### The pinned baseline (not rolling)
+
+The record carries a PINNED `baseline`: the reference catch rates every later
+measurement is compared against. Each recording is judged against BOTH its own
+same-run without-conventions arm (the within-run rule) AND the pinned
+baseline — FAIL when either arm is more than the tolerance below the SAME arm
+of the baseline — never only against the immediately preceding recording. An
+equal-arm series 0.90 → 0.82 → 0.74 drops 0.08 per step, inside the tolerance
+each time, and would erode a rolling reference without bound; against the
+pinned 0.90 the THIRD recording (0.74, 0.16 below) is refused
+(`TestRecordCatchRateEvidence_PinnedBaselineSeries`).
+
+- `RecordCatchRateEvidence` REFUSES to write a measurement that fails either
+  rule, and leaves the evidence file byte-identical: a failed run can never
+  become a baseline.
+- Moving the baseline is a separate, explicit operator action
+  (`RecordCatchRateOptions.PinBaseline`, driven by
+  `FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON`). It requires a passing
+  measurement — including against the CURRENT baseline when that baseline is
+  comparable — and records `reason` and `pinned_at` in the evidence. The first
+  recording must pin.
+- A baseline is COMPARABLE only with the same generator model, case set and
+  `samples_per_case`. After a corpus change an ordinary recording is refused
+  ("not comparable — re-pin"); the re-pin is again explicit and reasoned.
+- Residual, stated: each pin is judged against the baseline it replaces, so a
+  sequence of in-tolerance pins can still lower the reference — but only
+  through explicit, reasoned, timestamped operator actions visible in the
+  diff. Deleting `evidence.json` drops the baseline; that too is visible in
+  the diff, and the next recording must pin.
+
+### Evidence schema (`planreview-catchrate-evidence-v1`)
+
+A complete minimal valid record: the schema, the current `tolerance` and
+`min_trials_per_arm`, a `per_case` entry for EVERY committed case in both arms
+(trials = `samples_per_case` = `ceil(136 / cases)`), and a pinned `baseline`
+with a reason and an RFC 3339 `pinned_at`. The counts below are
+ILLUSTRATIVE — NOT A MEASUREMENT — and the fingerprint is a placeholder.
+`TestREADMEMinimalCatchRateEvidenceIsValid` decodes this block and checks it
+against the code and the committed corpus, so adding a corpus case obliges
+updating it. Any test fixture that writes a regression record starts from
+such a complete record (built by `RecordCatchRateEvidence` against the real
+corpus), so it fails for the regression reason, not a shape reason.
+
+<!-- BEGIN minimal-catchrate-evidence -->
+```json
+{
+  "schema": "planreview-catchrate-evidence-v1",
+  "recorded_at": "2026-10-07T00:00:00Z",
+  "generator_model": "claude-sonnet-4-6",
+  "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "tolerance": 0.1,
+  "min_trials_per_arm": 136,
+  "samples_per_case": 23,
+  "arms": {
+    "without_conventions": {
+      "per_case": {
+        "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+      }
+    },
+    "with_conventions": {
+      "per_case": {
+        "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 19, "undecodable": 1},
+        "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
+        "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+      }
+    }
+  },
+  "baseline": {
+    "pinned_at": "2026-10-07T00:00:00Z",
+    "reason": "first measurement",
+    "generator_model": "claude-sonnet-4-6",
+    "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "samples_per_case": 23,
+    "arms": {
+      "without_conventions": {
+        "per_case": {
+          "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+        }
+      },
+      "with_conventions": {
+        "per_case": {
+          "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 19, "undecodable": 1},
+          "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+        }
+      }
+    }
+  }
+}
+```
+<!-- END minimal-catchrate-evidence -->
+
+**Fingerprint inputs** (`CatchRatePromptFingerprint`, SHA-256 over a
+length-prefixed encoding): the schema id, the generator model, the tolerance,
+the power floor, `catchRuleVersion`, the generator system prompt, and per case
+in name order its name, its exact `review_input.json` bytes and BOTH rendered
+arm prompts (which cover the conventions fixture and every `prompt.Build`
+change). Residual: it does NOT cover the Go source of `ClassifyCatch` — a
+matcher change without a `catchRuleVersion` bump leaves the record fresh;
+`planreviewcatch.go` is a trigger path of `scripts/check-review-prompt-eval`,
+so such a change still runs the gate.
+
+### `CheckCatchRateEvidence` fail-closed modes
+
+It RECOMPUTES the verdict from the counts (the record has no verdict field to
+trust) and refuses, naming the run-book, on: (1) an absent record, (2)
+malformed JSON or an unknown field, (3) a wrong schema, (4) a stale
+fingerprint or another generator model, (5) a recorded tolerance /
+`min_trials_per_arm` differing from the constants, (6) inconsistent counts —
+negative, `caught + undecodable > trials`, per-case `trials != samples_per_case`,
+or the two arms disagreeing on the case set or per-case trial weights, (7) a
+case set differing from the corpus, (8) an under-powered arm, (9) a within-run
+regression, (10) a missing, malformed or non-comparable baseline or a
+regression against it, (11) an unavailable corpus, (12) an unavailable
+conventions fixture. Each mode has its own row in
+`TestCheckCatchRateEvidence_FailClosed`.
+
+### The gate command, and why it lives here
+
+`catchrategate` (package `main` under `backend/internal/agenteval/catchrategate`)
+wraps `CheckCatchRateEvidence`: exit 0 pass (report on stdout, including the
+rule in words), 1 gate failure (reason on stderr), 2 usage error.
+`--print-fingerprint` prints the current fingerprint so an operator can confirm
+staleness against the record's `prompt_fingerprint`. Defaults resolve to the
+committed testdata paths under the backend module root, found by walking up
+from the working directory. It makes no model call and opens no network.
+
+The placement is deliberate. The closest precedent for a standalone operator
+tool is `backend/cmd/fishhawk-distill-corpus`, but that tool WRITES corpus
+cases and is built and run as an operator binary; this one is a gate over
+agenteval's OWN testdata, never shipped, and is only ever `go run` by
+`scripts/check-review-prompt-eval`. Keeping it beside the package it gates
+keeps the `internal/` import, the default testdata paths and the trigger list
+(`backend/internal/agenteval/catchrategate/`) in one place, and keeps
+`backend/cmd/` to binaries an operator or user runs directly.
+
+---
+
 ## Running it
 
 ```sh
@@ -551,8 +806,18 @@ scripts/test single -run 'TestStripCalibrationCriteria|TestLoadSeverityCalibrati
 # Live severity-calibration + retention arms (opt-in; makes real model calls):
 FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run 'TestSeverityCalibrationLive|TestAdversarialRetentionLive' ./backend/internal/agenteval/
+
+# Offline plan-review catch-rate harness + evidence gate (no model call):
+scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestClassifyCatch|TestRunCatchRateArm|TestCompareCatchRateArms|TestMinCatchRateTrials|TestCheckCatchRateEvidence|TestRecordCatchRateEvidence|TestREADMEMinimalCatchRateEvidence' ./backend/internal/agenteval/
+(cd backend && go run ./internal/agenteval/catchrategate)
+
+# Live plan-review catch-rate arms (opt-in; makes real model calls; dry run unless RECORD=1):
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement' \
+  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 The #2291 live tests SKIP with a message naming #3187 and the criteria they
 leave undecided; the #3309 live arms SKIP naming #3309 and
-`docs/compliance/severity-calibration-evidence.md`.
+`docs/compliance/severity-calibration-evidence.md`. The #2245 live arm SKIPS naming
+`docs/compliance/planreview-catchrate-evidence.md`.
