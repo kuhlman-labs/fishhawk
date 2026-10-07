@@ -60,11 +60,12 @@ var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
 var ErrCharterNotInjected = errors.New("prompt: grooming propose stage has no charter among the injected documents")
 
 // ErrPlanForkConflict is Build's fail-closed refusal of a plan-stage Trigger
-// carrying BOTH fork channels — Grooming and Upkeep (#3922). The two artifact
-// contracts are exclusive, and spec validation already refuses a stage
-// declaring both, so reaching here means a caller set both; Build refuses
-// rather than pick one silently.
-var ErrPlanForkConflict = errors.New("prompt: plan stage carries both the grooming and the upkeep fork")
+// carrying MORE THAN ONE fork channel — any two or more of Grooming, Upkeep
+// (#3922) and Comms (E81.5 / #4013). The artifact contracts are mutually
+// exclusive, and spec validation already refuses a stage declaring more than
+// one, so reaching here means a caller set several; Build refuses rather than
+// pick one silently.
+var ErrPlanForkConflict = errors.New("prompt: plan stage carries more than one fork (grooming, upkeep, comms)")
 
 // PlanArtifactPath is the absolute path the runner expects to find
 // the agent's plan artifact at after a plan-stage invocation. It's
@@ -1136,6 +1137,18 @@ type Trigger struct {
 	// before this field existed. Setting it together with Grooming is
 	// ErrPlanForkConflict.
 	Upkeep *UpkeepScanContext
+
+	// Comms, when non-nil, marks this plan-typed stage as a COMMS SCAN stage
+	// (E81.5 / #4013): the stage declares `produces: comms_report`, so it
+	// reaches Build with stageType "plan" but must be served the
+	// comms_report_v1 artifact contract and the gathered user reports, NOT
+	// standard_v1 plan instructions. It is set by the server only for such a
+	// stage (phase 4, #4014). When set, Build forks the plan case to
+	// buildCommsScan; nil means an ordinary plan stage and buildPlan renders
+	// byte-identically to before this field existed. Setting it together with
+	// Grooming or Upkeep is ErrPlanForkConflict. No other stage renders its
+	// user reports — implement and implement-fixup above all (ADR-029).
+	Comms *CommsScanContext
 }
 
 // UpkeepScanContext is the deterministic evidence the server gathered for an
@@ -2210,14 +2223,22 @@ type PriorConcern struct {
 // byte-identically to before this fork existed.
 //
 // The THIRD fork (#3922): a stage declaring `produces: upkeep_report` sets
-// t.Upkeep and is served buildUpkeepScan. Both forks set is ErrPlanForkConflict
-// (fail closed); neither set reaches buildPlan byte-identically.
+// t.Upkeep and is served buildUpkeepScan. The FOURTH (E81.5 / #4013): a stage
+// declaring `produces: comms_report` sets t.Comms and is served
+// buildCommsScan. Any two or more forks set is ErrPlanForkConflict (fail
+// closed); none set reaches buildPlan byte-identically.
 func Build(stageType string, t Trigger) (string, error) {
 	switch stageType {
 	case "implement":
 		return buildImplement(t), nil
 	case "plan":
-		if t.Grooming != nil && t.Upkeep != nil {
+		forks := 0
+		for _, set := range []bool{t.Grooming != nil, t.Upkeep != nil, t.Comms != nil} {
+			if set {
+				forks++
+			}
+		}
+		if forks > 1 {
 			return "", ErrPlanForkConflict
 		}
 		if t.Grooming != nil {
@@ -2225,6 +2246,9 @@ func Build(stageType string, t Trigger) (string, error) {
 		}
 		if t.Upkeep != nil {
 			return buildUpkeepScan(t), nil
+		}
+		if t.Comms != nil {
+			return buildCommsScan(t)
 		}
 		return buildPlan(t), nil
 	case "plan_review":
@@ -2906,10 +2930,11 @@ const (
 	clarificationPlan clarificationVariant = iota
 	clarificationGrooming
 	clarificationUpkeep
+	clarificationComms
 )
 
 // writeClarificationAnswers renders the clarification-answers section shared by
-// buildPlan, buildGroomingPropose and buildUpkeepScan — ONE owner of this channel's cut, in the
+// buildPlan, buildGroomingPropose, buildUpkeepScan and buildCommsScan — ONE owner of this channel's cut, in the
 // spirit of writeOperatorConstraint owning the revision constraint.
 //
 // Before #3063 each call site carried its OWN `const maxAnswerBytes = 4000` and
@@ -2927,7 +2952,7 @@ const (
 // loudly, and the loader records a clarification_answers_truncated audit entry
 // alongside it.
 //
-// variant selects the body wording (plan, grooming propose, upkeep scan); the
+// variant selects the body wording (plan, grooming propose, upkeep scan, comms scan); the
 // heading is shared. The plan and grooming bodies are byte-identical to the two
 // inline blocks this replaced, so every under-cap render is unchanged.
 func writeClarificationAnswers(b *strings.Builder, t Trigger, variant clarificationVariant) {
@@ -2949,6 +2974,11 @@ func writeClarificationAnswers(b *strings.Builder, t Trigger, variant clarificat
 		b.WriteString("You previously parked this upkeep scan with a clarification_request. The operator answered your " +
 			"questions through the binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
 			"non-derivable facts and produce a concrete " + plan.UpkeepReportVersion + " report now. Do NOT park again on " +
+			"anything these answers resolve.\n\n")
+	case clarificationComms:
+		b.WriteString("You previously parked this comms scan with a clarification_request. The operator answered your " +
+			"questions through the binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
+			"non-derivable facts and produce a concrete " + CommsReportVersion + " report now. Do NOT park again on " +
 			"anything these answers resolve.\n\n")
 	default:
 		b.WriteString("You previously parked this issue at awaiting_input with a clarification_request " +

@@ -13897,11 +13897,14 @@ type untrustedFieldRead struct {
 // (maintainer condition 1 on #3738).
 //
 // ReportTitle and ReportBody are the E81.3 / #3773 user-report pair. Both are
-// UserReport fields (no Trigger field exists until E81.5 adds a builder), so
-// each maps straight to its sanitizing consumer: the title to sanitizeIssueTitle
-// (single-line, non-delimiting, then enveloped), the body to
-// sanitizeUntrustedComment — which is why writeUntrustedUserReports sanitizes
+// UserReport fields, so each maps straight to its sanitizing consumer: the title
+// to sanitizeIssueTitle (single-line, non-delimiting, then enveloped), the body
+// to sanitizeUntrustedComment — which is why writeUntrustedUserReports sanitizes
 // BEFORE it caps.
+//
+// UserReports is the E81.5 / #4013 Trigger-side field
+// (Trigger.Comms.UserReports): it maps to RenderUserReports, the one exported
+// enveloping form, and only buildCommsScan may read it.
 var envelopingWriterFor = map[string]string{
 	"IssueBody":     "writeUntrustedIssueBody",
 	"IssueComments": "writeIssueComments",
@@ -13910,6 +13913,7 @@ var envelopingWriterFor = map[string]string{
 	"MessageText":   "sanitizeUntrustedComment",
 	"ReportTitle":   "sanitizeIssueTitle",
 	"ReportBody":    "sanitizeUntrustedComment",
+	"UserReports":   "RenderUserReports",
 }
 
 // untrustedTriggerFieldReads parses EVERY non-test .go file in this package and
@@ -14067,21 +14071,27 @@ var allowedReadersFor = map[string]map[string]bool{
 		"writeUntrustedCrewMessages": true,
 	},
 	// E81.3 / #3773: the user-report channel. Both untrusted UserReport fields
-	// are read ONLY by the one per-report envelope writer. No Build stage reads
-	// them yet; E81.5 / #3775 adds a Trigger field and builder and must add
-	// that pair here (and never to buildImplement / buildImplementFixup).
+	// are read ONLY by the one per-report envelope writer.
 	"ReportTitle": {
 		"writeUntrustedUserReports": true,
 	},
 	"ReportBody": {
 		"writeUntrustedUserReports": true,
 	},
+	// E81.5 / #4013: the Trigger-side user-report field is read ONLY by the comms
+	// fork's builder, and only as RenderUserReports' argument. buildImplement and
+	// buildImplementFixup are deliberately absent (ADR-029 never-re-ingest), as
+	// is every other builder.
+	"UserReports": {
+		"buildCommsScan": true,
+	},
 }
 
 // TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters is the AST
 // allow-list guard over the untrusted channels — IssueBody, IssueComments and
-// IssueTitle, the #3738 crew-message pair, and the E81.3 / #3773 user-report
-// pair (ReportTitle, ReportBody), across EVERY non-test file in the package. Covering only the body would leave the
+// IssueTitle, the #3738 crew-message pair, the E81.3 / #3773 user-report
+// pair (ReportTitle, ReportBody) and the E81.5 / #4013 Trigger-side
+// CommsScanContext.UserReports, across EVERY non-test file in the package. Covering only the body would leave the
 // no-raw-render-path criterion partly enforced: a new RAW COMMENT or RAW TITLE
 // render behind a condition the fixture matrix does not activate would evade
 // both halves.
@@ -14109,9 +14119,15 @@ var allowedReadersFor = map[string]map[string]bool{
 // which half 2 catches and half 1 does not. Its completeness half additionally
 // fails when an allowed writer silently DROPS its sanitizing call, which a bare
 // allow-list would leave green.
+//
+// Counterfactual 5 (E81.5 / #4013), performed on the UserReports arm:
+// `for _, r := range t.Comms.UserReports { _ = r }` added to buildCommsScan ->
+// RED ("buildCommsScan reads UserReports as a raw read"); separately the
+// RenderUserReports argument replaced with nil -> RED on the completeness half
+// ("no reader of UserReports found … vacuous"); restored -> GREEN.
 func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 	reads := untrustedTriggerFieldReads(t)
-	for _, field := range []string{"IssueBody", "IssueComments", "IssueTitle", "CrewMessages", "MessageText", "ReportTitle", "ReportBody"} {
+	for _, field := range []string{"IssueBody", "IssueComments", "IssueTitle", "CrewMessages", "MessageText", "ReportTitle", "ReportBody", "UserReports"} {
 		allowed := allowedReadersFor[field]
 		if len(allowed) == 0 {
 			t.Fatalf("no allowed-reader set declared for watched field %s — the guard would be vacuous", field)
@@ -14129,7 +14145,8 @@ func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 					"(body) or writeIssueComments (comments), the title only through "+
 					"sanitizeIssueTitle, crew-message text only through "+
 					"writeUntrustedCrewMessages -> sanitizeUntrustedComment, and user-report "+
-					"text only through writeUntrustedUserReports; route the render "+
+					"text only through writeUntrustedUserReports (the Trigger-side reports only "+
+					"through buildCommsScan -> RenderUserReports); route the render "+
 					"through an allowed writer instead of adding a raw read.",
 					field, r.Func, r.Pos)
 				continue
@@ -14154,6 +14171,11 @@ func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 					remedy = "Pass the report body DIRECTLY to sanitizeUntrustedComment (sanitize " +
 						"first, then cap the sanitized text) so exactly one function in this " +
 						"package consumes UserReport.ReportBody."
+				}
+				if field == "UserReports" {
+					remedy = "Pass Trigger.Comms.UserReports DIRECTLY to RenderUserReports, once, in " +
+						"buildCommsScan; derive every count or id from its returned block and omitted ids, " +
+						"never from a raw read of the slice."
 				}
 				t.Errorf("%s: %s reads %s as %s — that is a RAW render inside an allowed writer. %s",
 					r.Pos, r.Func, field, r.Use, remedy)
