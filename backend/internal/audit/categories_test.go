@@ -664,3 +664,36 @@ func TestKnownCategories_Upkeep(t *testing.T) {
 		t.Error("upkeep_report (the artifact kind) is registered as an audit category; it must stay unknown")
 	}
 }
+
+// TestKnownCategories_Comms pins #4012's seven forward-registered comms
+// categories (report / capture / watermark rows of the comms window family,
+// plus the gather and apply rows), registered ahead of their writers so
+// fishhawk_await_audit can arm on them. The near-miss comms_report (the
+// artifact KIND, not an audit category) must stay unknown, so a wait armed on
+// the kind name is refused with a suggestion rather than silently never
+// firing. The three window-family rows are checked through the exported
+// constants too, so a constant and its registration cannot drift apart.
+//
+// Counterfactual: delete any one comms_* map entry from KnownCategories —
+// that name's IsKnownCategory returns false and this test goes RED naming it.
+func TestKnownCategories_Comms(t *testing.T) {
+	for _, c := range []string{
+		"comms_scan_gathered",
+		"comms_report_recorded",
+		"comms_disposition_recorded",
+		"comms_apply_window_closed",
+		"comms_draft_filed",
+		"comms_draft_skipped",
+		"comms_apply_completed",
+		CommsReportRecordedCategory,
+		CommsDispositionRecordedCategory,
+		CommsApplyWindowClosedCategory,
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; register it in categories.go", c)
+		}
+	}
+	if IsKnownCategory("comms_report") {
+		t.Error("comms_report (the artifact kind) is registered as an audit category; it must stay unknown")
+	}
+}

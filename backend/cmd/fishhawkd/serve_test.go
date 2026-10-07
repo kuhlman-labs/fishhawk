@@ -330,6 +330,11 @@ func TestNewAuditRepository_WiredRepoKeepsEveryCapability(t *testing.T) {
 	if _, ok := repo.(audit.UpkeepWindowAppender); !ok {
 		t.Error("wired audit repository lost audit.UpkeepWindowAppender (upkeep dispositions + apply window)")
 	}
+	// #4012: the generic family-keyed window capability the comms capture and
+	// apply settle through; without it they take the NON-ATOMIC fallback.
+	if _, ok := repo.(audit.FamilyWindowAppender); !ok {
+		t.Error("wired audit repository lost audit.FamilyWindowAppender (family-keyed comms dispositions + apply window)")
+	}
 	if _, ok := repo.(audit.RetryBudgetAppender); !ok {
 		t.Error("wired audit repository lost audit.RetryBudgetAppender")
 	}

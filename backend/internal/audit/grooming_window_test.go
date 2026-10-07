@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -23,6 +25,7 @@ import (
 // on. So the seam is real — pgtest Postgres, the production run + audit repos.
 
 type gwFixture struct {
+	pool  *pgxpool.Pool
 	audit audit.Repository
 	win   audit.GroomingWindowAppender
 	runID uuid.UUID
@@ -49,7 +52,7 @@ func newGWFixture(t *testing.T) *gwFixture {
 		t.Fatal("the production audit repository must implement audit.GroomingWindowAppender")
 	}
 	return &gwFixture{
-		audit: auditRepo, win: win, runID: r.ID,
+		pool: pool, audit: auditRepo, win: win, runID: r.ID,
 		artA: uuid.NewString(), artB: uuid.NewString(),
 	}
 }
@@ -761,5 +764,436 @@ func TestUpkeepWindow_RunNotFound(t *testing.T) {
 	}
 	if es, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, nil); err != nil || len(es) != 0 {
 		t.Errorf("empty batch = %v, %v; want no-op", es, err)
+	}
+}
+
+// --- comms family + the generic FamilyWindowAppender (#4012) ----------------
+//
+// The comms family has no typed entry points: every comms test drives the
+// PRODUCTION repo through audit.FamilyWindowAppender with family "comms". Like
+// upkeep it re-checks its binding under the run-row lock, so each fixture
+// records a comms_report_recorded row naming the capture's artifact first
+// (seeded by construction through AppendChained).
+
+func (f *gwFixture) familyWin(t *testing.T) audit.FamilyWindowAppender {
+	t.Helper()
+	win, ok := f.audit.(audit.FamilyWindowAppender)
+	if !ok {
+		t.Fatal("the production audit repository must implement audit.FamilyWindowAppender")
+	}
+	return win
+}
+
+func (f *gwFixture) recordCommsReport(t *testing.T, artifactID string) *audit.Entry {
+	t.Helper()
+	return f.appendRaw(t, audit.CommsReportRecordedCategory, map[string]any{"run_id": f.runID.String(), "artifact_id": artifactID})
+}
+
+func (f *gwFixture) commsDisposition(artifactID, entryID, verdict string) audit.ChainAppendParams {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": f.runID.String(), "artifact_id": artifactID,
+		"entry_id": entryID, "verdict": verdict,
+	})
+	return audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(),
+		Category: audit.CommsDispositionRecordedCategory, Payload: payload,
+	}
+}
+
+func (f *gwFixture) commsWatermark(artifactID, settlement string) audit.ChainAppendParams {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": f.runID.String(), "artifact_id": artifactID, "settlement": settlement,
+	})
+	return audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(),
+		Category: audit.CommsApplyWindowClosedCategory, Payload: payload,
+	}
+}
+
+// runRowCount reads the run's TOTAL committed audit row count.
+func (f *gwFixture) runRowCount(t *testing.T) int {
+	t.Helper()
+	rows, err := f.audit.ListForRun(context.Background(), f.runID)
+	if err != nil {
+		t.Fatalf("list run rows: %v", err)
+	}
+	return len(rows)
+}
+
+// TestCommsWindow_BatchRefusedAtClosedWindow: an artifact-bound
+// comms_apply_window_closed row (seeded DIRECTLY, by construction) refuses the
+// generic comms batch with the GENERIC *WindowClosedError naming the family,
+// and ZERO comms disposition rows commit (read after the call — an
+// error-identity assertion alone cannot tell a refusal from a
+// fired-then-rolled-back append).
+//
+// COUNTERFACTUAL (commsFamily.watermarkCategory): blank it. Fixture state that
+// makes it observable: the binding is valid (report row names A), so the
+// watermark scan is the ONLY refusal in the path, and the watermark exists
+// only as a DB row of the comms category — with the scan pointed at "" it
+// finds nothing, the batch commits both rows and the zero-rows read goes RED.
+func TestCommsWindow_BatchRefusedAtClosedWindow(t *testing.T) {
+	f := newGWFixture(t)
+	f.recordCommsReport(t, f.artA)
+	wm := f.appendRaw(t, audit.CommsApplyWindowClosedCategory, map[string]any{"artifact_id": f.artA, "settlement": "rejected"})
+
+	_, err := f.familyWin(t).AppendChainedFamilyDispositionBatch(context.Background(), audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+		f.commsDisposition(f.artA, "report:b", "rejected"),
+	})
+	var closed *audit.WindowClosedError
+	if !errors.As(err, &closed) {
+		t.Errorf("err = %v (%T), want *audit.WindowClosedError", err, err)
+	} else if closed.Family != audit.WindowFamilyComms || closed.ArtifactID != f.artA || closed.Settlement != "rejected" || closed.Sequence != wm.Sequence {
+		t.Errorf("closed = %+v, want family comms artifact %s settlement rejected sequence %d", closed, f.artA, wm.Sequence)
+	}
+	if rows := f.rowsOf(t, audit.CommsDispositionRecordedCategory); len(rows) != 0 {
+		t.Errorf("committed comms disposition rows = %d, want 0 — a closed window records nothing", len(rows))
+	}
+}
+
+// TestCommsWindow_BatchRefusedWhenReportSuperseded is the comms BINDING
+// RE-CHECK: report A, then report B — a capture still bound to A is refused
+// with the generic *ReportSupersededError naming B, and NOTHING is written.
+//
+// COUNTERFACTUAL (commsFamily.reportCategory): blank it. Fixture state that
+// makes it observable: NO comms watermark exists, so with the binding re-check
+// disabled nothing else refuses — the batch commits a row against the
+// superseded A and the zero-rows read goes RED.
+func TestCommsWindow_BatchRefusedWhenReportSuperseded(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.familyWin(t)
+	f.recordCommsReport(t, f.artA)
+	b := f.recordCommsReport(t, f.artB)
+
+	_, err := win.AppendChainedFamilyDispositionBatch(context.Background(), audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+	})
+	var sup *audit.ReportSupersededError
+	if !errors.As(err, &sup) {
+		t.Errorf("err = %v (%T), want *audit.ReportSupersededError", err, err)
+	} else if sup.Family != audit.WindowFamilyComms || sup.ArtifactID != f.artA || sup.CurrentArtifactID != f.artB || sup.CurrentSequence != b.Sequence {
+		t.Errorf("superseded = %+v, want family comms artifact %s current %s sequence %d", sup, f.artA, f.artB, b.Sequence)
+	}
+	if rows := f.rowsOf(t, audit.CommsDispositionRecordedCategory); len(rows) != 0 {
+		t.Fatalf("committed comms disposition rows = %d, want 0 — the capture landed against the superseded report", len(rows))
+	}
+
+	// The CURRENT report still captures.
+	if _, err := win.AppendChainedFamilyDispositionBatch(context.Background(), audit.WindowFamilyComms, f.artB, []audit.ChainAppendParams{
+		f.commsDisposition(f.artB, "report:a", "approved"),
+	}); err != nil {
+		t.Fatalf("capture against the current report: %v", err)
+	}
+}
+
+// TestCommsWindow_BatchRefusedWithNoReportRow: no comms_report_recorded row at
+// all — the binding cannot be confirmed, so the batch refuses (fail closed)
+// with an empty CurrentArtifactID, writing nothing. An UPKEEP report row naming
+// the same artifact is seeded so the refusal is also proof the re-check reads
+// the comms family's own report category.
+func TestCommsWindow_BatchRefusedWithNoReportRow(t *testing.T) {
+	f := newGWFixture(t)
+	f.recordUpkeepReport(t, f.artA)
+	_, err := f.familyWin(t).AppendChainedFamilyDispositionBatch(context.Background(), audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+	})
+	var sup *audit.ReportSupersededError
+	if !errors.As(err, &sup) || sup.CurrentArtifactID != "" || sup.CurrentSequence != 0 || sup.Family != audit.WindowFamilyComms {
+		t.Errorf("err = %v (%T), want comms *audit.ReportSupersededError with no current artifact", err, err)
+	}
+	if rows := f.rowsOf(t, audit.CommsDispositionRecordedCategory); len(rows) != 0 {
+		t.Errorf("committed rows = %d, want 0", len(rows))
+	}
+}
+
+// TestCommsWindow_RepeatedCloseReturnsFirstWatermark: PERMANENCE through the
+// generic entry — a second close returns the FIRST watermark unchanged,
+// appends nothing, and its consumed set stays bounded by the first watermark
+// (a disposition seeded after the first close is not consumed).
+func TestCommsWindow_RepeatedCloseReturnsFirstWatermark(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.familyWin(t)
+	ctx := context.Background()
+	f.recordCommsReport(t, f.artA)
+	es, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+	})
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	first, consumed1, err := win.AppendChainedFamilyWindowClose(ctx, audit.WindowFamilyComms, f.commsWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	// Above the first watermark, seeded DIRECTLY (the batch would refuse it).
+	f.appendRaw(t, audit.CommsDispositionRecordedCategory, map[string]any{"artifact_id": f.artA, "entry_id": "report:late", "verdict": "approved"})
+	second, consumed2, err := win.AppendChainedFamilyWindowClose(ctx, audit.WindowFamilyComms, f.commsWatermark(f.artA, "rejected"), f.artA)
+	if err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if second.Sequence != first.Sequence {
+		t.Errorf("second close returned sequence %d, want the first watermark %d", second.Sequence, first.Sequence)
+	}
+	if n := len(f.rowsOf(t, audit.CommsApplyWindowClosedCategory)); n != 1 {
+		t.Errorf("comms watermark rows = %d, want 1", n)
+	}
+	for _, set := range [][]*audit.Entry{consumed1, consumed2} {
+		if len(set) != 1 || set[0].Sequence != es[0].Sequence {
+			t.Errorf("consumed = %d entries, want exactly the captured row %d", len(set), es[0].Sequence)
+		}
+	}
+}
+
+// TestCommsWindow_FamilyIsolation: an upkeep watermark and a comms watermark
+// on the SAME artifact_id string each refuse only their own family's capture,
+// and an upkeep disposition on that artifact never enters the comms consumed
+// set.
+//
+// COUNTERFACTUAL (commsFamily.watermarkCategory): point it at
+// UpkeepApplyWindowClosedCategory. Fixture state that makes it observable: the
+// UPKEEP watermark for A is seeded before the first comms capture while no
+// comms watermark exists, so the first comms batch is refused by the foreign
+// watermark and the "comms capture refused by an UPKEEP watermark" assertion
+// goes RED.
+func TestCommsWindow_FamilyIsolation(t *testing.T) {
+	f := newGWFixture(t)
+	ctx := context.Background()
+	win := f.familyWin(t)
+	f.recordCommsReport(t, f.artA)
+	f.recordUpkeepReport(t, f.artA)
+	f.appendRaw(t, audit.UpkeepDispositionRecordedCategory, map[string]any{"artifact_id": f.artA, "finding_id": "flake:a", "verdict": "approved"})
+	upWM := f.appendRaw(t, audit.UpkeepApplyWindowClosedCategory, map[string]any{"artifact_id": f.artA, "settlement": "approved"})
+
+	es, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+	})
+	if err != nil {
+		t.Fatalf("comms capture refused by an UPKEEP watermark: %v", err)
+	}
+	// The upkeep window IS closed for its own family.
+	var upClosed *audit.UpkeepWindowClosedError
+	if _, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyUpkeep, f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:b", "approved"),
+	}); !errors.As(err, &upClosed) || upClosed.Sequence != upWM.Sequence {
+		t.Fatalf("upkeep capture err = %v, want *UpkeepWindowClosedError at its own watermark %d", err, upWM.Sequence)
+	}
+	w, consumed, err := win.AppendChainedFamilyWindowClose(ctx, audit.WindowFamilyComms, f.commsWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("comms close: %v", err)
+	}
+	if w.Sequence == upWM.Sequence || w.Category != audit.CommsApplyWindowClosedCategory {
+		t.Fatalf("comms close returned %s seq %d — the upkeep watermark was taken as the comms one", w.Category, w.Sequence)
+	}
+	if len(consumed) != 1 || consumed[0].Sequence != es[0].Sequence || consumed[0].Category != audit.CommsDispositionRecordedCategory {
+		t.Fatalf("comms consumed = %d entries, want exactly the comms row %d", len(consumed), es[0].Sequence)
+	}
+	// And now the comms window refuses for comms.
+	var closed *audit.WindowClosedError
+	if _, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:b", "approved"),
+	}); !errors.As(err, &closed) || closed.Sequence != w.Sequence {
+		t.Fatalf("second comms capture err = %v, want *WindowClosedError at comms watermark %d", err, w.Sequence)
+	}
+}
+
+// TestFamilyWindow_UnknownFamilyRefusedWritesNothing: an unregistered family
+// name is refused with ErrUnknownWindowFamily on BOTH generic entries — through
+// the repository AND through the exported Tx cores directly — and the run's
+// TOTAL committed row count is unchanged.
+//
+// COUNTERFACTUAL (resolveWindowFamily): make its body
+// `return windowFamilies[name], nil`. Fixture state that makes it observable:
+// the params are VALID appends carrying the run's own id, and the zero-value
+// family has empty categories — no binding re-check, a watermark scan over ""
+// that finds nothing — so the batch commits its row and the close commits p;
+// the Tx-core leg COMMITS its transaction after the call, so a core that
+// wrote would persist. Every row-count read goes RED (not a compile error).
+// Deleting only the postgresRepo pre-check is masked by the Tx core's own
+// check (same error, still nothing written); that pre-check's job is to not
+// OPEN a transaction, which no row count can observe.
+func TestFamilyWindow_UnknownFamilyRefusedWritesNothing(t *testing.T) {
+	f := newGWFixture(t)
+	ctx := context.Background()
+	win := f.familyWin(t)
+	f.recordCommsReport(t, f.artA)
+	before := f.runRowCount(t)
+
+	// Committed state is read FIRST, so a control that is absent reddens on
+	// the row count rather than only on the error identity.
+	assertUnknown := func(leg string, err error) {
+		t.Helper()
+		if n := f.runRowCount(t); n != before {
+			t.Fatalf("%s: run audit rows %d -> %d, want unchanged — an unknown family must write nothing", leg, before, n)
+		}
+		if !errors.Is(err, audit.ErrUnknownWindowFamily) {
+			t.Fatalf("%s: err = %v (%T), want ErrUnknownWindowFamily", leg, err, err)
+		}
+		var uf *audit.UnknownWindowFamilyError
+		if !errors.As(err, &uf) || uf.Family != "nope" {
+			t.Fatalf("%s: err = %v, want *UnknownWindowFamilyError{Family: nope}", leg, err)
+		}
+	}
+
+	es, err := win.AppendChainedFamilyDispositionBatch(ctx, "nope", f.artA, []audit.ChainAppendParams{
+		f.commsDisposition(f.artA, "report:a", "approved"),
+	})
+	if es != nil {
+		t.Errorf("batch returned entries %v on refusal", es)
+	}
+	assertUnknown("repo batch", err)
+	w, consumed, err := win.AppendChainedFamilyWindowClose(ctx, "nope", f.commsWatermark(f.artA, "approved"), f.artA)
+	if w != nil || consumed != nil {
+		t.Errorf("close returned %v / %v on refusal", w, consumed)
+	}
+	assertUnknown("repo close", err)
+
+	// The Tx cores, driven directly inside a transaction that is COMMITTED
+	// after the call, so a core that wrote anything would persist it.
+	runTx := func(fn func(tx pgx.Tx) error) error {
+		tx, berr := f.pool.Begin(ctx)
+		if berr != nil {
+			t.Fatalf("begin: %v", berr)
+		}
+		callErr := fn(tx)
+		if cerr := tx.Commit(ctx); cerr != nil {
+			t.Fatalf("commit: %v", cerr)
+		}
+		return callErr
+	}
+	assertUnknown("tx batch", runTx(func(tx pgx.Tx) error {
+		_, e := audit.AppendChainedFamilyDispositionBatchTx(ctx, tx, "nope", f.artA, []audit.ChainAppendParams{
+			f.commsDisposition(f.artA, "report:a", "approved"),
+		})
+		return e
+	}))
+	assertUnknown("tx close", runTx(func(tx pgx.Tx) error {
+		_, _, e := audit.AppendChainedFamilyWindowCloseTx(ctx, tx, "nope", f.commsWatermark(f.artA, "approved"), f.artA)
+		return e
+	}))
+
+	// The Tx cores still serve a KNOWN family (the resolve is not a blanket
+	// refusal).
+	if err := runTx(func(tx pgx.Tx) error {
+		_, e := audit.AppendChainedFamilyDispositionBatchTx(ctx, tx, audit.WindowFamilyComms, f.artA, []audit.ChainAppendParams{
+			f.commsDisposition(f.artA, "report:a", "approved"),
+		})
+		return e
+	}); err != nil {
+		t.Fatalf("tx batch for comms: %v", err)
+	}
+	if err := runTx(func(tx pgx.Tx) error {
+		_, c, e := audit.AppendChainedFamilyWindowCloseTx(ctx, tx, audit.WindowFamilyComms, f.commsWatermark(f.artA, "approved"), f.artA)
+		if e == nil && len(c) != 1 {
+			t.Errorf("tx close consumed %d, want 1", len(c))
+		}
+		return e
+	}); err != nil {
+		t.Fatalf("tx close for comms: %v", err)
+	}
+}
+
+// TestFamilyWindow_GenericEntryKeepsTypedErrorsForUpkeep: grooming and upkeep
+// reached through the GENERIC entry return THEIR pre-existing typed refusals,
+// never the generic ones, so the typed and generic entry points cannot
+// disagree about one family.
+//
+// COUNTERFACTUAL (upkeepFamily.superseded / .closed): swap either constructor
+// for the generic error type. Fixture state that makes it observable: each leg
+// seeds exactly the one refusal condition (a closed upkeep window with a valid
+// binding; a superseded upkeep binding with no watermark; a closed grooming
+// window), so the error that comes back is that constructor's output alone and
+// the errors.As on the typed error goes RED.
+func TestFamilyWindow_GenericEntryKeepsTypedErrorsForUpkeep(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("upkeep closed", func(t *testing.T) {
+		f := newGWFixture(t)
+		f.recordUpkeepReport(t, f.artA)
+		f.appendRaw(t, audit.UpkeepApplyWindowClosedCategory, map[string]any{"artifact_id": f.artA, "settlement": "approved"})
+		_, err := f.familyWin(t).AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyUpkeep, f.artA, []audit.ChainAppendParams{
+			f.upkeepDisposition(f.artA, "flake:a", "approved"),
+		})
+		var typed *audit.UpkeepWindowClosedError
+		var generic *audit.WindowClosedError
+		if !errors.As(err, &typed) || errors.As(err, &generic) {
+			t.Fatalf("err = %v (%T), want *audit.UpkeepWindowClosedError and NOT the generic type", err, err)
+		}
+	})
+	t.Run("upkeep superseded", func(t *testing.T) {
+		f := newGWFixture(t)
+		f.recordUpkeepReport(t, f.artA)
+		f.recordUpkeepReport(t, f.artB)
+		_, err := f.familyWin(t).AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyUpkeep, f.artA, []audit.ChainAppendParams{
+			f.upkeepDisposition(f.artA, "flake:a", "approved"),
+		})
+		var typed *audit.UpkeepReportSupersededError
+		var generic *audit.ReportSupersededError
+		if !errors.As(err, &typed) || errors.As(err, &generic) || typed.CurrentArtifactID != f.artB {
+			t.Fatalf("err = %v (%T), want *audit.UpkeepReportSupersededError naming %s and NOT the generic type", err, err, f.artB)
+		}
+	})
+	t.Run("grooming closed", func(t *testing.T) {
+		f := newGWFixture(t)
+		if _, err := f.audit.AppendChained(ctx, f.watermarkParams(f.artA, "approved")); err != nil {
+			t.Fatalf("seed grooming watermark: %v", err)
+		}
+		_, err := f.familyWin(t).AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyGrooming, f.artA, []audit.ChainAppendParams{
+			f.dispositionParams(f.artA, "ordering:a", "approved"),
+		})
+		var typed *audit.GroomingWindowClosedError
+		var generic *audit.WindowClosedError
+		if !errors.As(err, &typed) || errors.As(err, &generic) {
+			t.Fatalf("err = %v (%T), want *audit.GroomingWindowClosedError and NOT the generic type", err, err)
+		}
+		if rows := f.dispositionRows(t); len(rows) != 0 {
+			t.Errorf("committed grooming rows = %d, want 0", len(rows))
+		}
+	})
+}
+
+// TestLookupWindowFamily: the exported registry view returns each known
+// family's categories from the same source the Tx cores use, and ok=false for
+// an unknown name.
+func TestLookupWindowFamily(t *testing.T) {
+	cases := []audit.WindowFamilyInfo{
+		{Name: audit.WindowFamilyGrooming, DispositionCategory: audit.GroomingDispositionRecordedCategory, WatermarkCategory: audit.GroomingApplyWindowClosedCategory},
+		{Name: audit.WindowFamilyUpkeep, DispositionCategory: audit.UpkeepDispositionRecordedCategory, WatermarkCategory: audit.UpkeepApplyWindowClosedCategory, ReportCategory: audit.UpkeepReportRecordedCategory},
+		{Name: audit.WindowFamilyComms, DispositionCategory: audit.CommsDispositionRecordedCategory, WatermarkCategory: audit.CommsApplyWindowClosedCategory, ReportCategory: audit.CommsReportRecordedCategory},
+	}
+	for _, want := range cases {
+		got, ok := audit.LookupWindowFamily(want.Name)
+		if !ok || got != want {
+			t.Errorf("LookupWindowFamily(%q) = %+v, %v; want %+v, true", want.Name, got, ok, want)
+		}
+	}
+	if got, ok := audit.LookupWindowFamily("nope"); ok || got != (audit.WindowFamilyInfo{}) {
+		t.Errorf("LookupWindowFamily(nope) = %+v, %v; want zero, false", got, ok)
+	}
+}
+
+// TestWindowClosedError_Error pins the generic closed refusal's text: it names
+// the family and the watermark's facts the 409 handler renders.
+func TestWindowClosedError_Error(t *testing.T) {
+	got := (&audit.WindowClosedError{Family: "comms", ArtifactID: "art-1", Settlement: "rejected", Sequence: 9}).Error()
+	want := "audit: comms capture window for artifact art-1 is closed (settlement=rejected, watermark sequence 9)"
+	if got != want {
+		t.Errorf("WindowClosedError = %q, want %q", got, want)
+	}
+}
+
+// TestReportSupersededError_Error pins the generic superseded refusal's text,
+// and the unknown-family refusal's.
+func TestReportSupersededError_Error(t *testing.T) {
+	got := (&audit.ReportSupersededError{Family: "comms", ArtifactID: "art-1", CurrentArtifactID: "art-2", CurrentSequence: 11}).Error()
+	want := `audit: comms report art-1 is superseded by "art-2" (report sequence 11); re-capture against the current report`
+	if got != want {
+		t.Errorf("ReportSupersededError = %q, want %q", got, want)
+	}
+	uf := (&audit.UnknownWindowFamilyError{Family: "nope"}).Error()
+	for _, w := range []string{`"nope"`, "grooming", "upkeep", "comms"} {
+		if !strings.Contains(uf, w) {
+			t.Errorf("UnknownWindowFamilyError = %q, want %q", uf, w)
+		}
 	}
 }

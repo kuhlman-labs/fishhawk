@@ -83,6 +83,8 @@ func TestIndexingRepository_ForwardsEveryOptionalCapability(t *testing.T) {
 			_, ok = dec.(audit.AnchoredChainAppender)
 		case "DedupedChainAppender":
 			_, ok = dec.(audit.DedupedChainAppender)
+		case "FamilyWindowAppender":
+			_, ok = dec.(audit.FamilyWindowAppender)
 		case "GroomingWindowAppender":
 			_, ok = dec.(audit.GroomingWindowAppender)
 		case "RetryBudgetAppender":
@@ -106,8 +108,11 @@ func TestIndexingRepository_ForwardsEveryOptionalCapability(t *testing.T) {
 // AnchoredChainAppender and GroomingWindowAppender, so a decorator that
 // forwarded those without indexing would drop two decision classes.
 //
-// Counterfactual: delete the r.index call from any one forwarded method's
-// BODY — RED on that method's row assertion.
+// Counterfactual: delete the r.index call from the BODY of any forwarded
+// method whose subtest appends a DECISION-BEARING class (anchored, grooming
+// batch, family grooming batch, deduped, retry budget) — RED on that method's
+// row assertion. The upkeep, comms and close forwarders append no
+// decision-bearing row, so their subtests assert the forward COMMITS instead.
 func TestIndexingRepository_CapabilityPathsIndex(t *testing.T) {
 	f := newChainFixture(t)
 	ctx := context.Background()
@@ -210,6 +215,69 @@ func TestIndexingRepository_CapabilityPathsIndex(t *testing.T) {
 		if len(consumed) != 1 || consumed[0].Sequence != es[0].Sequence {
 			t.Fatalf("consumed = %v, want exactly the batch entry %d", consumed, es[0].Sequence)
 		}
+	})
+
+	// FamilyWindowAppender (#4012), comms family. Like the upkeep batch it
+	// re-checks its binding, so a comms_report_recorded row naming comms-1 is
+	// seeded first. comms_disposition_recorded is not decision-bearing: the
+	// assertion is that the generic forward reaches the inner repo, COMMITS,
+	// and the close consumes exactly the batch entry.
+	t.Run("FamilyWindowAppender/batch+close", func(t *testing.T) {
+		win, ok := any(d).(audit.FamilyWindowAppender)
+		if !ok {
+			t.Fatal("decorator does not forward audit.FamilyWindowAppender: the server would silently take the non-atomic family fallback")
+		}
+		f.appendEntry(t, f.runA, &f.implStageA, audit.CommsReportRecordedCategory, map[string]any{"artifact_id": "comms-1"})
+		es, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyComms, "comms-1", []audit.ChainAppendParams{
+			params(audit.CommsDispositionRecordedCategory, map[string]any{"artifact_id": "comms-1", "entry_id": "report:1", "verdict": "approved"}),
+		})
+		if err != nil {
+			t.Fatalf("AppendChainedFamilyDispositionBatch(comms): %v", err)
+		}
+		if len(es) != 1 {
+			t.Fatalf("batch appended %d entries, want 1", len(es))
+		}
+		assertEntryCommitted(t, f, es[0])
+		w, consumed, err := win.AppendChainedFamilyWindowClose(ctx, audit.WindowFamilyComms,
+			params(audit.CommsApplyWindowClosedCategory, map[string]any{"artifact_id": "comms-1", "settlement": "approved"}), "comms-1")
+		if err != nil {
+			t.Fatalf("AppendChainedFamilyWindowClose(comms): %v", err)
+		}
+		assertEntryCommitted(t, f, w)
+		if len(consumed) != 1 || consumed[0].Sequence != es[0].Sequence {
+			t.Fatalf("consumed = %v, want exactly the batch entry %d", consumed, es[0].Sequence)
+		}
+	})
+
+	// FamilyWindowAppender, GROOMING family (#4012 approval condition 4): the
+	// generic batch is a third path for grooming_disposition_recorded, a
+	// DECISION-BEARING class, so the forward must index what it appends. The
+	// comms subtest above cannot see a missing r.index call — comms rows are
+	// not decision-bearing and index() returns before writing for them.
+	// "artifact-2" because GroomingWindowAppender/close settled artifact-1.
+	//
+	// Counterfactual (performed): delete the r.index loop from
+	// IndexingRepository.AppendChainedFamilyDispositionBatch's BODY. The fixture
+	// state that makes it observable: the appended rows are
+	// grooming_disposition_recorded (IsDecisionBearing true), the resolver is
+	// the real pool resolver over a run/stage that exists, so the ONLY thing
+	// between the commit and a decision_index row is that loop — RED with
+	// "grooming_disposition_recorded entry N committed but NOT indexed".
+	t.Run("FamilyWindowAppender/grooming-batch-indexes", func(t *testing.T) {
+		win, ok := any(d).(audit.FamilyWindowAppender)
+		if !ok {
+			t.Fatal("decorator does not forward audit.FamilyWindowAppender")
+		}
+		es, err := win.AppendChainedFamilyDispositionBatch(ctx, audit.WindowFamilyGrooming, "artifact-2", []audit.ChainAppendParams{
+			params(audit.GroomingDispositionRecordedCategory, map[string]any{"artifact_id": "artifact-2", "verdict": "keep"}),
+		})
+		if err != nil {
+			t.Fatalf("AppendChainedFamilyDispositionBatch(grooming): %v", err)
+		}
+		if len(es) != 1 {
+			t.Fatalf("batch appended %d entries, want 1", len(es))
+		}
+		indexed(t, es[0], ClassGroomingDisposition)
 	})
 
 	t.Run("DedupedChainAppender", func(t *testing.T) {

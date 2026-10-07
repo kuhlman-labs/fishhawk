@@ -25,7 +25,9 @@ const IndexTimeout = 5 * time.Second
 // (acceptance_triage_arbitrated via AnchoredChainAppender,
 // grooming_disposition_recorded via GroomingWindowAppender). A decorator that
 // dropped one would silently disable a server feature (the assertion just
-// returns ok=false) and silently stop indexing a decision class.
+// returns ok=false) and silently stop indexing a decision class. The generic
+// FamilyWindowAppender is a THIRD path to grooming_disposition_recorded
+// (family grooming), so its batch forward indexes exactly as the typed one.
 //
 // capabilities_test.go scans package audit's source for every exported
 // *Appender interface and fails when one is not satisfied by the decorator, so
@@ -34,6 +36,7 @@ type FullRepository interface {
 	audit.Repository
 	audit.AnchoredChainAppender
 	audit.DedupedChainAppender
+	audit.FamilyWindowAppender
 	audit.GroomingWindowAppender
 	audit.RetryBudgetAppender
 	audit.UpkeepWindowAppender
@@ -69,7 +72,7 @@ var _ FullRepository = (*IndexingRepository)(nil)
 func NewIndexingRepository(inner audit.Repository, store *Store, resolver ContextResolver, logger *slog.Logger) (*IndexingRepository, error) {
 	full, ok := inner.(FullRepository)
 	if !ok {
-		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.GroomingWindowAppender, audit.RetryBudgetAppender and audit.UpkeepWindowAppender", ErrMissingCapability, inner)
+		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.FamilyWindowAppender, audit.GroomingWindowAppender, audit.RetryBudgetAppender and audit.UpkeepWindowAppender", ErrMissingCapability, inner)
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -182,6 +185,31 @@ func (r *IndexingRepository) AppendChainedUpkeepDispositionBatch(ctx context.Con
 // As for grooming, only the watermark is (possibly) new.
 func (r *IndexingRepository) AppendChainedUpkeepWindowClose(ctx context.Context, p audit.ChainAppendParams, artifactID string) (*audit.Entry, []*audit.Entry, error) {
 	w, consumed, err := r.FullRepository.AppendChainedUpkeepWindowClose(ctx, p, artifactID)
+	if err == nil {
+		r.index(ctx, w)
+	}
+	return w, consumed, err
+}
+
+// AppendChainedFamilyDispositionBatch forwards the generic, family-keyed
+// FamilyWindowAppender capability (#4012), then indexes every appended entry.
+// The family decides decision-bearing-ness, not this method: a grooming batch
+// through here appends grooming_disposition_recorded and MUST be indexed; a
+// comms batch is a no-op in index.
+func (r *IndexingRepository) AppendChainedFamilyDispositionBatch(ctx context.Context, family, artifactID string, ps []audit.ChainAppendParams) ([]*audit.Entry, error) {
+	es, err := r.FullRepository.AppendChainedFamilyDispositionBatch(ctx, family, artifactID, ps)
+	if err == nil {
+		for _, e := range es {
+			r.index(ctx, e)
+		}
+	}
+	return es, err
+}
+
+// AppendChainedFamilyWindowClose forwards the generic settlement. As for the
+// typed families, only the watermark is (possibly) new.
+func (r *IndexingRepository) AppendChainedFamilyWindowClose(ctx context.Context, family string, p audit.ChainAppendParams, artifactID string) (*audit.Entry, []*audit.Entry, error) {
+	w, consumed, err := r.FullRepository.AppendChainedFamilyWindowClose(ctx, family, p, artifactID)
 	if err == nil {
 		r.index(ctx, w)
 	}
