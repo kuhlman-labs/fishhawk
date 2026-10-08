@@ -3805,6 +3805,8 @@ make_prune_fixture() {
   # aged keyed /tmp sidecars (must be removed) + a fresh one (must survive).
   : > "$base/tmp/fishhawk-scope-run1-stage1.json"
   : > "$base/tmp/fishhawk-pr-run1-stage1.md"
+  # per-run/stage plan handoff (#4067): keyed, so the dash glob prunes it.
+  : > "$base/tmp/fishhawk-plan-run1-stage1.json"
   : > "$base/tmp/fishhawk-scope-fresh-x.json"
   # legacy fixed-slot transports (dash-keyed globs must NEVER match these).
   : > "$base/tmp/fishhawk-plan.json"
@@ -3816,6 +3818,7 @@ make_prune_fixture() {
   # creating files inside them does not reset the mtime the glob keys on.
   touch -t "$old_stamp" \
     "$base/tmp/fishhawk-scope-run1-stage1.json" "$base/tmp/fishhawk-pr-run1-stage1.md" \
+    "$base/tmp/fishhawk-plan-run1-stage1.json" \
     "$base/tmp/fishhawk-plan.json" "$base/tmp/fishhawk-pr.md" "$base/tmp/fishhawk-acceptance.json" \
     "$base/tmp/fishhawk-acceptance-evidence-run1" "$base/wt/run-old.runid"
   touch -t "$old_stamp" "$base/wt/run-old" "$base/wt/run-dirty" "$base/wt/run-broken"
@@ -3843,6 +3846,7 @@ else
 fi
 if [[ ! -f "$prune_run/tmp/fishhawk-scope-run1-stage1.json" ]]; then pass "_prune: removes aged keyed scope sidecar"; else fail "_prune should remove aged scope sidecar"; fi
 if [[ ! -f "$prune_run/tmp/fishhawk-pr-run1-stage1.md" ]]; then pass "_prune: removes aged keyed pr sidecar"; else fail "_prune should remove aged pr sidecar"; fi
+if [[ ! -f "$prune_run/tmp/fishhawk-plan-run1-stage1.json" ]]; then pass "_prune: removes aged keyed plan handoff (#4067)"; else fail "_prune should remove the aged keyed fishhawk-plan-<run>-<stage>.json"; fi
 if [[ -d "$prune_run/wt/run-fresh" ]]; then pass "_prune: keeps a fresh run worktree dir"; else fail "_prune should keep fresh run worktree"; fi
 if [[ -f "$prune_run/wt/run-fresh.runid" ]]; then pass "_prune: keeps a fresh runid file"; else fail "_prune should keep fresh runid"; fi
 if [[ -f "$prune_run/tmp/fishhawk-scope-fresh-x.json" ]]; then pass "_prune: keeps a fresh keyed sidecar (age boundary)"; else fail "_prune should keep the fresh keyed sidecar"; fi

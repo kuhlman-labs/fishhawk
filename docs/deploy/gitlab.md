@@ -47,7 +47,10 @@ fishhawk-runner \
 run/stage identity is what is load-bearing; `--forge=gitlab` routes the push +
 open-merge-request path through `FISHHAWK_GITLAB_TOKEN` against this instance
 (`$CI_SERVER_URL`). Bump the pinned image tag when you adopt a newer runner
-release.
+release. The fixed `--plan-out /tmp/fishhawk-plan.json` keeps working: given
+`--run-id` and `--stage-id`, the runner resolves it to the run/stage-keyed
+`/tmp/fishhawk-plan-<run_id>-<stage_id>.json`, so concurrent plan stages on one
+host never share a handoff file (#4067).
 
 ## Variables the backend supplies
 

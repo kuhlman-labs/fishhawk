@@ -1429,8 +1429,8 @@ answer, lists candidates and removes NOTHING — never a hung prompt) it:
   files;
 - prunes keyed `/tmp` sidecars (`fishhawk-scope-*-*.json`,
   `fishhawk-scope-justifications-*-*.json`, `fishhawk-acceptance-*-*.json`,
-  `fishhawk-pr-*-*.md`, `fishhawk-prompt-*.txt`) older than `--days N` (default
-  7);
+  `fishhawk-pr-*-*.md`, `fishhawk-plan-*-*.json` — the per-run/stage plan
+  handoff, #4067 — `fishhawk-prompt-*.txt`) older than `--days N` (default 7);
 - then composes `scripts/cleanup-merged` to delete the now-un-checked-out merged
   branches (git refuses to delete a branch checked out in any worktree — why
   `cleanup-merged` alone never clears these).

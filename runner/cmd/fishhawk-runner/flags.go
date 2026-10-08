@@ -88,6 +88,12 @@ type config struct {
 	stageID         string
 	fetchPrompt     bool
 
+	// planOutLegacy arms the bounded legacy-plan fallback (#4067): set by
+	// resolvePlanOut to the legacy fixed path when planOut was resolved to (or
+	// given as) the run/stage-keyed path; empty for a custom --plan-out or a
+	// run without --run-id/--stage-id. Never set from a flag.
+	planOutLegacy string
+
 	// Local-runner mode (E22.8 / #406). The runner's GHA-specific
 	// assumptions are narrow — `GITHUB_REPOSITORY` and
 	// `GITHUB_REF_NAME` env vars on the implement-stage push path.
@@ -226,7 +232,7 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 	fs.StringVar(&cfg.bundleOut, "bundle-out", "",
 		"path to write the gzipped trace bundle (ADR-007); when empty, events go to stdout as JSONL")
 	fs.StringVar(&cfg.planOut, "plan-out", "",
-		"path the agent writes its plan artifact to; when set, the runner validates it against standard_v1 after a successful agent invocation")
+		"path the agent writes its plan artifact to; when set, the runner validates it against standard_v1 after a successful agent invocation. The legacy fixed path /tmp/fishhawk-plan.json is resolved to the run/stage-keyed /tmp/fishhawk-plan-<run_id>-<stage_id>.json when --run-id and --stage-id are set (#4067)")
 	fs.StringVar(&cfg.constraintsFile, "constraints-file", "",
 		"path to a JSON file describing the stage's constraints (forbidden_paths, allowed_paths, max_files_changed, required_outcomes); requires --check-base-ref to be useful")
 	fs.StringVar(&cfg.checkBaseRef, "check-base-ref", "",
