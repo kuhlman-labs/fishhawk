@@ -29,8 +29,10 @@ import (
  *               validator (backend/internal/server/acceptance.go), plus
  *               the served-criteria-ids membership check, so a bad shape
  *               fails in-loop instead of at the signed ship.
- *   redact    — redaction.RedactDefault over the verdict bytes BEFORE
- *               they are embedded in the trace bundle or shipped: the
+ *   redact    — redaction.RedactDefaultKnown over the verdict bytes
+ *               BEFORE they are embedded in the trace bundle or shipped:
+ *               the values bound into the agent (acceptanceKnownValueSource,
+ *               E72.41 / #3793) first, then the DefaultPatterns shapes. The
  *               observed/steps_taken prose comes from a potentially
  *               prompt-injected instance, so it is treated as hostile.
  *   evidence  — the redacted verdict rides into the trace bundle as an
@@ -609,12 +611,32 @@ func coerceAcceptanceTargetURL(target *string) (bool, error) {
 	return true, nil
 }
 
-// redactAcceptanceVerdict runs RedactDefault over the verdict bytes.
-// Called BEFORE the bytes are embedded in the trace bundle or shipped:
-// the verdict's prose fields carry text observed from the target
-// instance, which is treated as potentially prompt-injected/hostile.
-func redactAcceptanceVerdict(raw []byte) ([]byte, []redaction.Hit) {
-	return redaction.RedactDefault(raw)
+// acceptanceKnownValueSource returns the credential values bound into the
+// acceptance agent through a declared credential binding (ADR-086 decision 2),
+// as {binding name, value} pairs. run() compiles them into the known-value set
+// that scrubs every acceptance evidence surface: the shipped verdict, the
+// shipped transcript, and the events + manifest agent_failure_reason of BOTH
+// trace-bundle variants (E72.41 / #3793). It returns nil until the
+// credential-binding slice (#3795) supplies values, so today's acceptance
+// stage is byte-identical to before the seam existed. A var so tests can
+// override it.
+var acceptanceKnownValueSource = func() []redaction.KnownValue { return nil }
+
+// redactAcceptanceVerdict runs RedactDefaultKnown over the verdict bytes:
+// known (acceptance-bound) values first, then DefaultPatterns. Called BEFORE
+// the bytes are embedded in the trace bundle or shipped: the verdict's prose
+// fields carry text observed from the target instance, which is treated as
+// potentially prompt-injected/hostile. A nil known set is exactly
+// RedactDefault.
+//
+// The redaction runs AFTER validation, so a bound value inside a
+// grammar-constrained string field (target_url userinfo,
+// `https://user:<value>@host`) becomes `[REDACTED:credential:<NAME>]` in a
+// shape the validator never saw; the backend may refuse that verdict on ship.
+// That is the exposure DefaultPatterns already had, not a regression, and it
+// is pinned by TestRedactAcceptanceVerdict_KnownValueInTargetURL.
+func redactAcceptanceVerdict(raw []byte, known *redaction.KnownValues) ([]byte, []redaction.Hit) {
+	return redaction.RedactDefaultKnown(raw, known)
 }
 
 // composeAcceptanceEvidence wraps the (already redacted) verdict bytes
