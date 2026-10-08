@@ -1682,11 +1682,18 @@ components:
           description: Git SHA of `.fishhawk/workflows.yaml` at run time.
         trigger_source:
           type: string
-          enum: [github_issue, cli, ui, on_demand, scheduled]
+          enum: [github_issue, cli, ui, on_demand, scheduled, alert]
           description: |
-            `scheduled` (E79.1 / #3725) is minted ONLY by the in-process
-            scheduler (`--enable-scheduler`); `POST /v0/runs` refuses it
-            `400 trigger_source_reserved`.
+            Two values are SYSTEM-ONLY, each minted by exactly one in-process
+            producer; `POST /v0/runs` refuses both
+            `400 trigger_source_reserved`. `scheduled` (E79.1 / #3725) is
+            minted ONLY by the in-process scheduler (`--enable-scheduler`).
+            `alert` (E35.4 / #1601, ADR-053) is minted ONLY by the alert
+            ingress (`POST /v0/triggers/alert`) for a source configured with
+            `auto_start: true` (default `false`); an `alert` run is always
+            anchored on the incident issue the ingress filed
+            (`trigger_ref` `issue:N`) and is routed as the `diff` trigger form
+            for `applies_to`.
         trigger_ref:
           type: [string, "null"]
           example: "issue:1247"
@@ -8634,6 +8641,115 @@ components:
         at:
           type: string
           format: date-time
+    AlertTrigger:
+      type: object
+      description: |
+        POST /v0/triggers/alert request body (E35.4 / #1601). Strict: unknown
+        fields and trailing data are refused `400 validation_failed`. Every
+        text field is UNTRUSTED — it reaches a forge issue and, through it,
+        later agent prompts; the renderer fences the description and
+        neutralizes `<!--` so a sender cannot forge Fishhawk's hidden markers.
+        Long-form: `backend/internal/alerttrigger/README.md`.
+      additionalProperties: false
+      required: [fingerprint, title, severity]
+      properties:
+        fingerprint:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: '^[A-Za-z0-9._:/-]+$'
+          description: The dedup key. One incident issue per (source, repo, fingerprint).
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: 'No control characters; the issue summary is `Incident (<severity>): <title>`.'
+        severity:
+          type: string
+          enum: [critical, high, medium, low, info]
+        description:
+          type: string
+          maxLength: 16384
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Absolute `http`/`https` with a host.
+        environment:
+          type: string
+          maxLength: 64
+          pattern: '^[a-z0-9_-]*$'
+        labels:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            type: string
+            maxLength: 256
+          description: Keys 1-64 characters; no control characters in keys or values.
+    AlertTriggerResult:
+      type: object
+      description: |
+        POST /v0/triggers/alert answer for an accepted alert (201 / 200 /
+        202), distinguished by `action`.
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [filed, occurrence, in_flight]
+          description: |
+            `filed` (201) — the first alert for this fingerprint filed a
+            conventions-complete incident issue. `occurrence` (200) — the
+            fingerprint already has an issue; the repeat was recorded as a
+            comment on it, and nothing new was filed. `in_flight` (202) —
+            another request for the fingerprint is filing right now; this one
+            is counted in `occurrences`, and nothing is filed or commented.
+        issue_number:
+          type: integer
+          description: The incident issue (`filed` / `occurrence`).
+        issue_url:
+          type: string
+          description: The incident issue's URL (`filed` / `occurrence`).
+        occurrences:
+          type: integer
+          description: How many verified alerts the fingerprint has received, this one included.
+        dedup_claim_lost:
+          type: boolean
+          description: |
+            `filed` only, present and true when the issue was filed but the
+            dedup claim had meanwhile been reclaimed as stale by another
+            request — a second issue for the fingerprint is then possible; the
+            hidden idempotency marker on its body names the duplicate.
+        auto_start:
+          $ref: '#/components/schemas/AlertAutoStart'
+    AlertAutoStart:
+      type: object
+      description: |
+        `filed` only. The optional hotfix auto-start (per source
+        `auto_start`, default `false`). Its outcome never changes the
+        response status: the incident issue is filed either way.
+      required: [enabled, outcome]
+      properties:
+        enabled:
+          type: boolean
+          description: The source's `auto_start` setting.
+        outcome:
+          type: string
+          enum: [disabled, started, already_started, refused, error]
+          description: |
+            `disabled` — the source's `auto_start` is false (the default).
+            `started` / `already_started` — a run with the system-only
+            `trigger_source: alert` was minted or replayed through the same
+            admission gates as `POST /v0/runs`. `refused` — an admission gate
+            refused it (`code` names it, e.g. `workflow_not_applicable`,
+            `budget_exhausted`, `alert_key_occupied`). `error` — the spec fetch
+            or the start failed transiently.
+        run_id:
+          type: string
+          format: uuid
+          description: The started or replayed run (`started` / `already_started`).
+        code:
+          type: string
+          description: The refusal or error code (`refused` / `error`).
     HandoverBrief:
       type: object
       description: >-
@@ -10996,11 +11112,15 @@ paths:
                     submitted with neither is still accepted (201)
                     and simply posts no issue comments, because
                     every consumer independently re-checks
-                    `trigger_ref`. `scheduled` (E79.1 / #3725) is
-                    RESERVED to the in-process scheduler: a request
-                    naming it is refused `400 trigger_source_reserved`
-                    before any other check, so only the scheduler can
-                    mint a `scheduled` run.
+                    `trigger_ref`. Two further values are RESERVED and
+                    absent from this enum: `scheduled` (E79.1 / #3725)
+                    to the in-process scheduler, and `alert`
+                    (E35.4 / #1601) to the alert ingress's per-source
+                    auto-start (`POST /v0/triggers/alert`). A request
+                    naming either is refused
+                    `400 trigger_source_reserved` before any other
+                    check, so only its in-process producer can mint a
+                    `scheduled` or `alert` run.
                 trigger_ref:
                   type: [string, "null"]
                 runner_kind:
@@ -11098,9 +11218,11 @@ paths:
                     instead of needing an installation_id to fetch
                     from GitHub. Only valid with an
                     ISSUE-ANCHORED `trigger_source` —
-                    `github_issue`, `on_demand` (E54.22 / #2826) or
+                    `github_issue`, `on_demand` (E54.22 / #2826),
                     `scheduled` (E79.1 / #3725; only the in-process
-                    scheduler can supply it) — a 400 fires when
+                    scheduler can supply it) or `alert`
+                    (E35.4 / #1601; only the alert ingress's
+                    auto-start can supply it) — a 400 fires when
                     shipped with `cli` or `ui`, which carry no
                     originating issue. The converse
                     does not hold: an ISSUE-ANCHORED source is not
@@ -11226,8 +11348,9 @@ paths:
             unregistered project still learns the pairing rule. Also
             `plan_reviewer_unconfigured` (see below), and
             `trigger_source_reserved` — `trigger_source` is `scheduled`,
-            which only the in-process scheduler may mint (E79.1 / #3725);
-            no run row is created.
+            which only the in-process scheduler may mint (E79.1 / #3725),
+            or `alert`, which only the alert ingress's per-source
+            auto-start may mint (E35.4 / #1601); no run row is created.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15463,6 +15586,138 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: '`service_unavailable` — repo visibility could not be resolved (#2071).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/triggers/alert:
+    post:
+      operationId: receiveAlertTrigger
+      summary: HMAC-authenticated alert ingress — file (or comment on) an incident issue
+      description: |
+        E35.4 / #1601, ADR-053 option A. Turns a verified alert into a
+        conventions-complete incident issue in the source's configured
+        repository, through the same work-items pipeline as
+        `POST /v0/work-items`. Deduplicated by `fingerprint` in a Postgres
+        ledger (not forge search): the first alert files the issue (`201
+        filed`); a repeat comments on the existing issue (`200 occurrence`);
+        an alert arriving while the first is still filing is counted and
+        answered `202 in_flight`.
+
+        **Auth: HMAC per source, not a bearer token** (`security: []`). The
+        sender signs `<X-Fishhawk-Alert-Timestamp>.<raw body>` with
+        HMAC-SHA256 under the source's shared secret and sends
+        `X-Fishhawk-Alert-Signature: sha256=<hex>`. The MAC is compared in
+        constant time; an unknown source does the same work and gets the same
+        answer as a mis-signed request, so source ids cannot be enumerated.
+        Only a valid MAC reaches the replay window (default 5m,
+        `FISHHAWKD_ALERT_REPLAY_WINDOW`, at most 15m) and then the
+        post-verification nonce (`alert:<source>:<decoded MAC>` in the
+        webhook delivery store, so a hex-case-flipped resend is still a
+        duplicate). Unsigned and mis-signed requests never touch the store or
+        the audit chain. A post-nonce failure that files and comments
+        nothing (an invalid body, conventions load, repo scope, an
+        unimplemented provider, the dedup claim, the filing, the occurrence
+        comment) releases the nonce, so an exact retry is re-attempted rather
+        than refused `alert_replayed`. A conventions, repo-scope or
+        dedup-claim failure answers a 5xx.
+
+        **Auto-start ships OFF.** A source with `auto_start: true` also
+        starts a run of its `workflow_id` (default `hotfix_change`) on the
+        filed issue with the system-only `trigger_source: alert`, through
+        every `POST /v0/runs` admission gate (the run is routed as the `diff`
+        trigger form for `applies_to`); the run still stops at every gate.
+        The auto-start outcome is reported in `auto_start` and never fails
+        the filing.
+
+        **Off by default.** With no `FISHHAWKD_ALERT_SOURCES_FILE` the route
+        answers `503 alert_trigger_unconfigured`. Accepted alerts append
+        `alert_incident_filed` / `alert_incident_occurrence` to the global
+        audit chain; rejections are not audited. Long-form contract:
+        `backend/internal/alerttrigger/README.md`.
+      tags: [webhooks]
+      security: []
+      parameters:
+        - name: X-Fishhawk-Alert-Source
+          in: header
+          required: true
+          description: The source id from the sources file.
+          schema: { type: string }
+        - name: X-Fishhawk-Alert-Timestamp
+          in: header
+          required: true
+          description: Unix seconds, 1-12 ASCII digits; signed, so it cannot be changed after signing.
+          schema: { type: string, pattern: '^[0-9]{1,12}$' }
+        - name: X-Fishhawk-Alert-Signature
+          in: header
+          required: true
+          description: '`sha256=<hex HMAC-SHA256(secret, timestamp + "." + raw body)>`; the hex digest is case-insensitive.'
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AlertTrigger' }
+      responses:
+        '201':
+          description: '`filed` — a new incident issue was filed (and, when the source enables it, a run was requested; see `auto_start`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertTriggerResult' }
+        '200':
+          description: '`occurrence` — the fingerprint already has an incident issue; the repeat was commented on it.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertTriggerResult' }
+        '202':
+          description: '`in_flight` — another request for the fingerprint is filing; nothing was filed or commented.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertTriggerResult' }
+        '400':
+          description: '`validation_failed` — the verified body is not a valid `AlertTrigger`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            One distinct code per refusal: `alert_signature_missing` — the
+            signature header is absent, lacks the `sha256=` prefix, or is not
+            hex; `alert_timestamp_invalid` — the timestamp is not 1-12 ASCII
+            digits; `alert_signature_invalid` — the MAC does not match, or the
+            source is unknown (indistinguishable by design);
+            `alert_replayed` — a validly signed request outside the replay
+            window (`details.reason: stale`) or an exact resend inside it
+            (`details.reason: duplicate`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: '`body_too_large` — the body exceeds 64 KiB.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`provider_unimplemented` — the repository''s work-management provider is not `github_projects`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            `alert_occurrence_failed` — the occurrence comment could not be
+            posted on the existing issue. A filing failure answers the
+            work-items pipeline's own status and code (e.g. `422
+            work_item_invalid`, `502 work_item_filing_failed`); the dedup claim
+            is released either way.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `alert_trigger_unconfigured` — no `FISHHAWKD_ALERT_SOURCES_FILE`
+            (the ingress is off); `alert_store_unconfigured` — sources are
+            configured but the database (dedup ledger), webhook delivery store
+            (replay nonce) or GitHub App (filing) is not.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

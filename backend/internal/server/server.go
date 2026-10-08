@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/alerttrigger"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -325,6 +326,36 @@ type Config struct {
 	// the receiver in "log + 202" mode (handy for early dev
 	// against a backend that hasn't been wired to GitHub yet).
 	WebhookDispatcher *webhook.Dispatcher
+
+	// AlertSources is the parsed alert-sources file
+	// (FISHHAWKD_ALERT_SOURCES_FILE) for the HMAC-authenticated
+	// POST /v0/triggers/alert ingress (E35.4 / #1601, ADR-053 option A).
+	// The zero value (no sources) keeps the ingress OFF: the route answers
+	// 503. Each source carries its own HMAC secret (resolved from the
+	// environment, never the file), target repo and auto_start switch,
+	// which defaults to false. Contract: backend/internal/alerttrigger/README.md.
+	AlertSources alerttrigger.Sources
+
+	// AlertIncidents is the alert ingress's Postgres-backed dedup ledger
+	// (alert_incidents, migration 0099): one incident issue per
+	// (source, repo, fingerprint). Nil with AlertSources configured leaves
+	// the route answering 503 — dedup is never silently skipped.
+	AlertIncidents alerttrigger.Store
+
+	// AlertReplayWindow is the alert ingress's timestamp tolerance; a
+	// request signed further than this from the server clock, in either
+	// direction, is refused. Non-positive means
+	// alerttrigger.DefaultReplayWindow (5m). fishhawkd validates it in
+	// (0, 15m] at startup.
+	AlertReplayWindow time.Duration
+
+	// AlertSpecSource fetches a repository's .fishhawk/workflows.yaml at the
+	// default branch for the alert ingress's optional auto-start, which
+	// ships the spec inline to StartAlertRun. fishhawkd wires the same
+	// GitHub App adapter the scheduler uses. Nil leaves auto-start reporting
+	// an error outcome for a source with auto_start true, while the incident
+	// issue is still filed.
+	AlertSpecSource AlertSpecSource
 
 	// GitHubTokens issues per-installation tokens for backend-side
 	// GitHub interactions (workflow_dispatch, fetching workflow
