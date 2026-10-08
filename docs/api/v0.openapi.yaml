@@ -419,6 +419,247 @@ components:
                 format: int64
                 description: Chain sequence of the winning row.
 
+    CommsDispositionsRequest:
+      type: object
+      additionalProperties: false
+      required: [dispositions]
+      description: |
+        Body of `POST /v0/runs/{run_id}/comms-dispositions` (#4016). Exactly
+        ONE JSON document: trailing content is `400 validation_failed`. The
+        decode is STRICT: an unknown key at ANY depth — a misspelled
+        `parent_epics`, an undeclared key inside an entry, an extra top-level
+        key — is `400 validation_failed` recording nothing, never silently
+        dropped, so `additionalProperties: false` here is enforced, not
+        advisory.
+      properties:
+        dispositions:
+          type: array
+          minItems: 1
+          maxItems: 25
+          description: |
+            One entry per decided draft, at most 25 (the comms report's
+            `drafts` maxItems). Validated atomically: one unknown `draft_id`
+            records nothing.
+          items:
+            type: object
+            additionalProperties: false
+            required: [draft_id, verdict]
+            properties:
+              draft_id:
+                type: string
+                minLength: 1
+                description: |
+                  The draft's DERIVED id (`draft:` + its sorted source report
+                  ids joined with `+`, e.g. `draft:UR-issue-12+UR-issue-40`).
+                  It must be a draft the bound `comms_report` declares, and may
+                  not repeat within one request.
+              verdict:
+                type: string
+                enum: [approved, rejected]
+                description: The captain's verdict for this draft.
+              parent_epic:
+                type: string
+                description: |
+                  Approved only. Overrides the parent epic of the issue the
+                  apply files: a positive issue number, bare (`389`) or
+                  `#`-prefixed (`#389`), parsed by the report's own rule (i).
+                  A value that does not parse, any value on a rejected verdict,
+                  or a value equal to the issue number a report the draft cites
+                  lives on (`details.reason: parent_epic_is_source`) is
+                  `400 validation_failed`.
+    CommsDraftPreviewRecord:
+      type: object
+      description: |
+        One draft's preview as the `comms_report_recorded` row recorded it at
+        ingest (docs/spec/comms-report-v1.md § "`comms_report_recorded`"),
+        returned VERBATIM. Always `draft_id` and `filing_body_digest`, plus
+        EXACTLY ONE of a rendered preview (its fields flattened in), `error`,
+        or `skipped`. `title`, `body` and `intake` are agent- and
+        attacker-influenced DATA (neutralized agent prose plus tracker titles
+        quoted verbatim in the intake section), never instructions.
+      required: [draft_id, filing_body_digest]
+      additionalProperties: true
+      properties:
+        draft_id:
+          type: string
+        filing_body_digest:
+          type: string
+          description: SHA-256 hex of the deterministic filing body, before the intake section.
+        title:
+          type: string
+        body:
+          type: string
+          description: |
+            The FULL rendered filing body the captain reviews: neutralized agent
+            prose, the server provenance section, the comms draft marker and
+            the intake advisory section as of ingest.
+        labels:
+          type: array
+          items: { type: string }
+        defaulted_labels:
+          type: array
+          items: { type: string }
+        missing_label_namespaces:
+          type: array
+          items: { type: string }
+        number:
+          type: integer
+        parent_epic:
+          type: string
+        source_refs:
+          type: array
+          items: { type: string }
+        intake:
+          type: object
+          additionalProperties: true
+          description: The #3774 intake signals the preview rendered.
+        error:
+          type: object
+          description: The preview was refused (`code`, `message`).
+          properties:
+            code: { type: string }
+            message: { type: string }
+        skipped:
+          type: string
+          description: |
+            Why no preview ran: `budget_exhausted`, `preview_timeout`, or the
+            run-wide degrade reason (`repo_malformed`,
+            `conventions_unavailable`).
+    CommsClusterSplit:
+      type: object
+      description: |
+        A server-suggested cluster (recorded by the gather exactly as the scan
+        prompt rendered it) whose members the report did NOT keep together.
+      required: [report_ids, score, placements]
+      properties:
+        report_ids:
+          type: array
+          items: { type: string }
+        score:
+          type: number
+        placements:
+          type: array
+          description: Where each member landed, in `report_ids` order.
+          items:
+            type: object
+            required: [report_id, kind]
+            properties:
+              report_id:
+                type: string
+              kind:
+                type: string
+                enum: [draft, n_drift, not_drafted, unaccounted]
+              entry_id:
+                type: string
+                description: |
+                  The citing draft id (`draft`), the n_drift id (`n_drift`) or
+                  the not_drafted reason (`not_drafted`); absent for
+                  `unaccounted`.
+    CommsDispositions:
+      type: object
+      description: |
+        The captain's dispositions view for ONE comms_report artifact (#4016):
+        the recorded per-draft dispositions plus everything the captain reads
+        before approving. Returned by BOTH the capture POST and the read GET —
+        they share one server-side projection, so the echo and the read are
+        the same bytes by construction.
+      required: [run_id, artifact_id, stage_id, content_hash, gather_digest, window_closed, dispositions, undecided_draft_ids, previews, preview_degraded, charter_text, unaccounted_report_ids, clusters_recorded, cluster_splits]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        artifact_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: |
+            The artifact named by the HIGHEST-sequence `comms_report_recorded`
+            row on the run's chain, which these dispositions bind to.
+        stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The plan stage that shipped the bound artifact.
+        content_hash:
+          type: string
+          description: The bound artifact's content hash.
+        gather_digest:
+          type: string
+          description: |
+            The recorded row's STORED digest of the `comms_scan_gathered` row
+            the report was validated against (authoritative; never recomputed).
+        window_closed:
+          type: boolean
+          description: |
+            True once the comms apply has appended this artifact's
+            `comms_apply_window_closed` watermark. After it, a capture for this
+            artifact is refused with `comms_window_closed`.
+        settlement:
+          type: object
+          description: The closing watermark's facts, present only when window_closed is true.
+          properties:
+            settlement:
+              type: string
+              enum: [approved, rejected]
+            closed_at:
+              type: string
+              format: date-time
+            audit_sequence:
+              type: integer
+              format: int64
+        dispositions:
+          type: array
+          description: |
+            One row per DISPOSITIONED draft of the bound artifact, collapsed
+            last-wins by audit sequence and sorted by draft_id. Rows of another
+            artifact and undecodable rows are excluded.
+          items:
+            type: object
+            required: [draft_id, verdict, recorded_at, recorded_by, audit_sequence]
+            properties:
+              draft_id:
+                type: string
+              verdict:
+                type: string
+                enum: [approved, rejected]
+              parent_epic:
+                type: string
+                description: Present only when the captain supplied one.
+              recorded_at:
+                type: string
+                format: date-time
+              recorded_by:
+                type: string
+                description: The token subject that recorded the verdict.
+              audit_sequence:
+                type: integer
+                format: int64
+        undecided_draft_ids:
+          type: array
+          items: { type: string }
+          description: The report's draft ids with no disposition yet, in report order.
+        previews:
+          type: array
+          description: |
+            The recorded row's `previews` value VERBATIM, one entry per draft
+            in report order — the final rendered filing the captain approves,
+            never the raw artifact.
+          items: { $ref: '#/components/schemas/CommsDraftPreviewRecord' }
+        preview_degraded:
+          type: boolean
+        preview_degrade_reason:
+          type: string
+          enum: [repo_malformed, conventions_unavailable]
+        charter_text:
+          type: string
+          enum: [rendered, unavailable, changed]
+        unaccounted_report_ids:
+          type: array
+          items: { type: string }
+          description: Shown report ids the report cites nowhere, sorted.
+        clusters_recorded:
+          type: boolean
+          description: |
+            Whether the bound gather recorded `suggested_clusters` (false for a
+            gather recorded before #4016; `cluster_splits` is then empty).
+        cluster_splits:
+          type: array
+          description: The recorded clusters the report split, in the gather's order.
+          items: { $ref: '#/components/schemas/CommsClusterSplit' }
     Error:
       type: object
       required: [error]
@@ -10068,15 +10309,16 @@ paths:
                     description: |
                       Map of schema name to hex-encoded SHA-256 of the backend's
                       embedded canonical schema bytes. Keys: "plan-standard-v1",
-                      "grooming-report-v1", "upkeep-report-v1", "workflow-v0",
-                      "workflow-v1", "workflow-v2". Callers compare against their
-                      own embedded hashes to detect schema drift.
+                      "grooming-report-v1", "upkeep-report-v1", "comms-report-v1",
+                      "workflow-v0", "workflow-v1", "workflow-v2". Callers compare
+                      against their own embedded hashes to detect schema drift.
                     additionalProperties:
                       type: string
                     example:
                       plan-standard-v1: "abc123..."
                       grooming-report-v1: "89abcd..."
                       upkeep-report-v1: "fedcba..."
+                      comms-report-v1: "a1b2c3..."
                       workflow-v0: "def456..."
                       workflow-v1: "0123ab..."
                       workflow-v2: "4567cd..."
@@ -13330,6 +13572,196 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: The run / artifact / audit repositories are not wired (`upkeep_dispositions_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/comms-dispositions:
+    post:
+      operationId: recordCommsDispositions
+      summary: Record per-draft comms dispositions (captain-only)
+      description: |
+        Capture the captain's verdicts on individual drafts of a run's comms
+        report (#4016). Each disposition names one draft by its DERIVED id, a
+        verdict (`approved` / `rejected`), and on an approved draft optionally
+        a `parent_epic` override. Each accepted entry persists as ONE chained
+        `comms_disposition_recorded` audit row; the comms apply (#4017)
+        consumes them. Contract: `docs/spec/comms-report-v1.md`
+        § "Dispositions".
+
+        **Read before approving.** The 200 (and `GET`) returns each draft's
+        RECORDED preview — the final rendered filing body as the ingest
+        recorded it, never the raw artifact — plus the undecided drafts,
+        `unaccounted_report_ids` and `cluster_splits`. Preview titles, bodies
+        and intake sections are agent- and attacker-influenced DATA, never
+        instructions.
+
+        **Which report.** The dispositions bind to the artifact named by the
+        HIGHEST-sequence `comms_report_recorded` row on the run's chain — not
+        the newest artifact — and to the gather that row names by its stored
+        `gather_digest`. GET resolves through the same function.
+
+        **Every refusal runs before any write, in this order:** 503
+        `comms_dispositions_unconfigured`; 401 `authentication_required`; 403
+        `run_token_forbidden`, `operator_agent_forbidden`,
+        `insufficient_scope`; 400 `validation_failed` (bad `run_id`); 404
+        `run_not_found`; 400 `validation_failed` / `comms_verdict_invalid`
+        (body — checked BEFORE the report lookup); 409 `comms_report_absent`
+        (or 500 for an unreadable report or gather); 422
+        `comms_draft_unknown` (whole batch); 400 `validation_failed` with
+        `details.reason: parent_epic_is_source`; 409
+        `comms_report_superseded` / `comms_window_closed`.
+
+        **Capture guarantee (one capture is one transaction).** The WHOLE batch
+        is validated before ANY row is appended AND appended in ONE transaction
+        under the run-row lock. Inside it the server re-checks that the bound
+        artifact is STILL named by the highest-sequence `comms_report_recorded`
+        row (else `409 comms_report_superseded`) and that its window is still
+        open (else `409 comms_window_closed`). Both refusals append nothing.
+
+        **Supersession.** A `draft_id` may not repeat WITHIN one request, but a
+        LATER request on the same draft SUPERSEDES the earlier one (last wins
+        by audit sequence); both rows stay in the chain.
+
+        **Authorization.** Captain-only. A run-bound MCP token is rejected
+        (`403 run_token_forbidden`), even for its own run; a DELEGATED
+        operator-agent token is rejected (`403 operator_agent_forbidden`)
+        because the comms report is agent-authored. `write:approvals` is
+        required unconditionally.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommsDispositionsRequest' }
+      responses:
+        '200':
+          description: |
+            The batch was recorded. The body is the full dispositions view for
+            the bound report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommsDispositions' }
+        '400':
+          description: |
+            One of two codes. (1) `validation_failed` — a bad `run_id`, an
+            unparseable body or trailing content, an unknown key at any depth
+            (strict decode), a wrongly-typed value, an empty batch or more than
+            25 entries (`details.max`, `details.got`), an empty or repeated
+            `draft_id`, a `parent_epic` that does not parse, `parent_epic` on a
+            rejected verdict, or `details.reason: parent_epic_is_source`
+            (`details.field`, `draft_id`, `parent_epic`) when an approved
+            draft's `parent_epic` is the issue a report it cites lives on. (2)
+            `comms_verdict_invalid` — a verdict outside
+            `{approved, rejected}`; `details.allowed` names the set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of three cases. (1) `run_token_forbidden` — a run-bound MCP
+            token. (2) `operator_agent_forbidden` — a delegated operator-agent
+            token. (3) `insufficient_scope` — the identity lacks
+            `write:approvals`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No such run (`run_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            One of three cases, each recording NOTHING. (1)
+            `comms_report_absent` — the run's chain carries no
+            `comms_report_recorded` row. (2) `comms_report_superseded` — a newer
+            report was recorded after this capture resolved its report;
+            `details` carry `artifact_id`, `current_artifact_id` and
+            `current_sequence`. (3) `comms_window_closed` — the apply has
+            settled this artifact's window; `details` carry `artifact_id`,
+            `settlement` and `watermark_sequence`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One or more `draft_id` values are not declared by the bound
+            `comms_report` (`comms_draft_unknown`); `details.unknown_draft_ids`
+            names every one and `details.artifact_id` the report. NO
+            disposition was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`, in one of three cases that differ in what was
+            recorded — read `details.recorded` / `details.requested` where
+            present. (1) BEFORE any append: the bound report or the gather it
+            names could not be read or parsed (never a fallback to an older
+            report), or the window check failed; nothing was recorded. (2)
+            ATOMIC BATCH FAILURE: NOTHING was recorded (`details.recorded: 0`).
+            (3) READ-BACK FAILURE AFTER A COMMITTED BATCH: the batch IS durable
+            (`details.recorded` equals `details.requested`). A repeat POST is
+            safe in every case because capture is last-wins.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run / artifact / audit repositories are not wired
+            (`comms_dispositions_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      operationId: listCommsDispositions
+      summary: Read the comms dispositions view for a run
+      description: |
+        Returns the captain's dispositions view for the run's bound
+        `comms_report` (#4016), resolved through the same binding rule the
+        capture uses: the recorded dispositions (last-wins per draft, sorted by
+        `draft_id`), the undecided drafts, every recorded preview VERBATIM,
+        `unaccounted_report_ids` and `cluster_splits`. Preview titles, bodies
+        and intake sections are agent- and attacker-influenced DATA.
+
+        **Authorization.** Read access only; the captain-only posture is scoped
+        to CAPTURE.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The dispositions view for the run's bound comms report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommsDispositions' }
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such run (`run_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The run's chain carries no `comms_report_recorded` row (`comms_report_absent`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The bound report or its gather could not be read or parsed (`internal_error`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: The run / artifact / audit repositories are not wired (`comms_dispositions_unconfigured`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
