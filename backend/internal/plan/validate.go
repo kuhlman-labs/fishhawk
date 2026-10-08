@@ -17,7 +17,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json schemas/grooming-report-v1.schema.json schemas/upkeep-report-v1.schema.json
+//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json schemas/grooming-report-v1.schema.json schemas/upkeep-report-v1.schema.json schemas/comms-report-v1.schema.json
 var schemaFS embed.FS
 
 // compiledSchema is the JSON Schema used by Validate / Parse. Compiled
@@ -37,6 +37,10 @@ var compiledGroomingReportSchema = mustCompileNamedSchema("schemas/grooming-repo
 // artifact (#3921), compiled once at init for the same fail-loud reason.
 var compiledUpkeepReportSchema = mustCompileNamedSchema("schemas/upkeep-report-v1.schema.json", "upkeep-report-v1.schema.json")
 
+// compiledCommsReportSchema is the JSON Schema for the comms_report sibling
+// artifact (#4015), compiled once at init for the same fail-loud reason.
+var compiledCommsReportSchema = mustCompileNamedSchema("schemas/comms-report-v1.schema.json", "comms-report-v1.schema.json")
+
 // embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
 // bytes of the embedded plan-standard-v1 schema. Computed once at init
 // so /healthz can serve it cheaply.
@@ -52,6 +56,11 @@ var embeddedGroomingReportSchemaHash = computeNamedSchemaHash("schemas/grooming-
 // JSON bytes of the embedded upkeep-report-v1 schema (#3921), computed once at
 // init. The /healthz advert is #3923's.
 var embeddedUpkeepReportSchemaHash = computeNamedSchemaHash("schemas/upkeep-report-v1.schema.json")
+
+// embeddedCommsReportSchemaHash is the hex-encoded SHA-256 of the canonical
+// JSON bytes of the embedded comms-report-v1 schema (#4015), computed once at
+// init. The /healthz advert is phase 6's (#4016).
+var embeddedCommsReportSchemaHash = computeNamedSchemaHash("schemas/comms-report-v1.schema.json")
 
 func computeSchemaHash() string {
 	return computeNamedSchemaHash("schemas/plan-standard-v1.schema.json")
@@ -91,6 +100,10 @@ func EmbeddedGroomingReportSchemaHash() string { return embeddedGroomingReportSc
 // EmbeddedUpkeepReportSchemaHash returns the hex-encoded SHA-256 of the
 // canonical JSON bytes of the embedded upkeep-report-v1 schema (#3921).
 func EmbeddedUpkeepReportSchemaHash() string { return embeddedUpkeepReportSchemaHash }
+
+// EmbeddedCommsReportSchemaHash returns the hex-encoded SHA-256 of the
+// canonical JSON bytes of the embedded comms-report-v1 schema (#4015).
+func EmbeddedCommsReportSchemaHash() string { return embeddedCommsReportSchemaHash }
 
 // expensiveTestRuntimeThreshold is the minimum predicted_runtime_minutes
 // value that suppresses the expensive-test-strategy advisory warning.
@@ -154,8 +167,9 @@ func Validate(data []byte) error {
 // DetectArtifactKind inspects the top-level "kind" discriminator and
 // reports which plan-stage artifact the document is. A document carrying
 // kind == "clarification_request" is ArtifactKindClarificationRequest, one
-// carrying kind == "grooming_report" is ArtifactKindGroomingReport (#2235) and
-// one carrying kind == "upkeep_report" is ArtifactKindUpkeepReport (#3921);
+// carrying kind == "grooming_report" is ArtifactKindGroomingReport (#2235),
+// one carrying kind == "upkeep_report" is ArtifactKindUpkeepReport (#3921) and
+// one carrying kind == "comms_report" is ArtifactKindCommsReport (#4015);
 // anything else (including the plan artifact, which has no "kind" field)
 // defaults to ArtifactKindPlan. The bytes are only peeked, not fully
 // validated — callers route to ValidateArtifact / Validate next. Returns
@@ -177,6 +191,8 @@ func DetectArtifactKind(data []byte) (ArtifactKind, error) {
 		return ArtifactKindGroomingReport, nil
 	case KindUpkeepReport:
 		return ArtifactKindUpkeepReport, nil
+	case KindCommsReport:
+		return ArtifactKindCommsReport, nil
 	}
 	return ArtifactKindPlan, nil
 }
@@ -187,7 +203,8 @@ func DetectArtifactKind(data []byte) (ArtifactKind, error) {
 // validated by ValidateClarificationRequest (schema + unique-id semantics), a
 // grooming_report by ValidateGroomingReport (schema + the four id/rank
 // semantics), an upkeep_report by ValidateUpkeepReport (schema +
-// CheckUpkeepReportSemantics); anything else is validated as a plan.
+// CheckUpkeepReportSemantics), a comms_report by ValidateCommsReport (schema +
+// CheckCommsReportSemantics); anything else is validated as a plan.
 func ValidateArtifact(data []byte) error {
 	kind, err := DetectArtifactKind(data)
 	if err != nil {
@@ -200,6 +217,8 @@ func ValidateArtifact(data []byte) error {
 		return ValidateGroomingReport(data)
 	case ArtifactKindUpkeepReport:
 		return ValidateUpkeepReport(data)
+	case ArtifactKindCommsReport:
+		return ValidateCommsReport(data)
 	default:
 		return Validate(data)
 	}
@@ -307,6 +326,50 @@ func ParseUpkeepReport(data []byte) (*UpkeepReport, error) {
 		return nil, err
 	}
 	return &ur, nil
+}
+
+// ValidateCommsReport validates bytes against the comms-report-v1 schema and
+// then runs CheckCommsReportSemantics (rules a-j, commsreport.go). The
+// returned error is *ParseError, *SchemaError or *SemanticError.
+//
+// It lives here rather than in commsreport.go only so that file stays
+// schema-free (#4015 slice 0); commsreport.go owns the types and the rules.
+func ValidateCommsReport(data []byte) error {
+	_, err := ParseCommsReport(data)
+	return err
+}
+
+// ParseCommsReport validates comms_report bytes (schema, then a strict decode
+// refusing unknown fields, then semantics) and returns the typed
+// *CommsReport. The schema's const kind/report_version is the first line; rule
+// (j) in CheckCommsReportSemantics is the defence in depth.
+func ParseCommsReport(data []byte) (*CommsReport, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, &ParseError{Msg: "empty document"}
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, &ParseError{Msg: err.Error(), Cause: err}
+	}
+	if err := compiledCommsReportSchema.Validate(raw); err != nil {
+		var verr *jsonschema.ValidationError
+		if errors.As(err, &verr) {
+			return nil, schemaErrorFrom(verr)
+		}
+		return nil, &SchemaError{Path: "/", Message: err.Error()}
+	}
+	var cr CommsReport
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cr); err != nil {
+		// Schema accepted the bytes; this should only fail on an internal
+		// type-mapping bug.
+		return nil, fmt.Errorf("internal: decode to CommsReport: %w", err)
+	}
+	if err := CheckCommsReportSemantics(&cr); err != nil {
+		return nil, err
+	}
+	return &cr, nil
 }
 
 // Parse validates plan bytes and returns the typed *Plan. Equivalent

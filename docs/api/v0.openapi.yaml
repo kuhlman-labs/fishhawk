@@ -5853,7 +5853,7 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         kind:
           type: string
-          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript]
+          enum: [plan, pull_request, deployment, acceptance, release_notes, grooming_report, acceptance_transcript, upkeep_report, comms_report]
         schema_version:
           type: [string, "null"]
           example: standard_v1
@@ -23527,6 +23527,24 @@ paths:
               `stage_binding_undecidable` (the workflow or the stage's spec
               entry cannot be resolved; fails CLOSED). Fails the stage
               category-B. Contract: `docs/spec/upkeep-report-v1.md` § "Ingest".
+            - `comms_report_invalid` — a comms report (`kind:
+              "comms_report"`, #4015) failed `comms-report-v1` or one of its
+              semantic rules (no `details.reason`), or failed a check against
+              the stage's recorded gather: `details.reason`
+              `report_ref_invalid` (+ `details.report_id`: a cited report the
+              scan was not shown), `rubric_id_unknown` (+ `details.rubric_id`,
+              `details.draft_id`), `non_goal_id_unknown` (+
+              `details.non_goal_id`) or `parent_epic_is_source` (+
+              `details.draft_id`, `details.parent_epic`: the parent epic is the
+              issue a cited report lives on). Fails the stage category-B.
+            - `comms_report_stage_invalid` — a comms report was shipped from a
+              stage it is not bound to, or with no gather to check it against;
+              `details.reason` is `stage_type_not_plan`,
+              `stage_does_not_declare_comms_report`,
+              `stage_binding_undecidable` (fails CLOSED) or
+              `scan_context_absent` (no decodable `comms_scan_gathered` row
+              for this stage). Fails the stage category-B. Contract:
+              `docs/spec/comms-report-v1.md` § "Ingest".
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

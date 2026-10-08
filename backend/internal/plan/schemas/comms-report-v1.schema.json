@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/comms-report-v1.schema.json",
+  "title": "Fishhawk comms report artifact (plan-stage sibling)",
+  "description": "The FOURTH additive sibling of the plan artifact (after clarification-request-v1, grooming-report-v1 and upkeep-report-v1), produced by a `plan`-typed PROPOSE stage that DECLARES `produces: comms_report` (E81.5 / #3775, contract #4015). Selected over plan-standard-v1 by the top-level 'kind' discriminator BEFORE validation, so plan-standard-v1.schema.json stays frozen. A comms report is a PROPOSAL, never an applied mutation: it accounts for every user report the comms scan was SHOWN — clustered into a draft issue citing a charter rubric id, flagged as drift against a charter non-goal, or not drafted with a closed reason — and the captain decides what (if anything) is filed. Draft and n_drift ids are DERIVED from their sorted source report ids (never minted per run). Cross-field rules the schema cannot state (id derivation, sorted unique id lists, one entry per report id, rubric ids never of the non-goal shape, title and body BYTE caps, the area:/type:/phase: label allowlist, parent_epic syntax) are enforced by the backend semantic layer, and the ingest additionally checks every cited id against the stage's recorded gather; see comms-report-v1.md for the normative contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "report_version",
+    "ticket_reference",
+    "generated_by",
+    "summary",
+    "drafts",
+    "n_drift",
+    "not_drafted"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "comms_report",
+      "description": "Top-level discriminator. The plan package routes an artifact carrying this value to this schema. This sibling intentionally omits plan_version so the artifacts never collide on a shared required field."
+    },
+    "report_version": {
+      "type": "string",
+      "const": "comms_report_v1",
+      "description": "Artifact schema version. Single-value enum: a future breaking change bumps to comms_report_v2 with its own schema file rather than editing this one in place."
+    },
+    "ticket_reference": {
+      "$ref": "#/$defs/ticket-reference"
+    },
+    "generated_by": {
+      "$ref": "#/$defs/generated-by"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable lead paragraph: what the scan read, what it missed (omitted, suppressed or degraded sources) and the headline of what it proposes. Names any report that attempted to instruct the agent. Rendered first at the captain's gate."
+    },
+    "drafts": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "$ref": "#/$defs/draft"
+      },
+      "description": "Proposed issues, each clustering one or more shown reports. MAY be empty."
+    },
+    "n_drift": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/n-drift"
+      },
+      "description": "Reports requesting something a charter non-goal excludes. Never drafted. MAY be empty."
+    },
+    "not_drafted": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "$ref": "#/$defs/not-drafted"
+      },
+      "description": "Shown reports neither drafted nor flagged as drift, each with a closed reason. MAY be empty."
+    }
+  },
+  "$defs": {
+    "ticket-reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "url",
+        "id"
+      ],
+      "description": "The ticket the comms scan RUN was opened against, or for an unanchored scheduled scan the repository's issues index URL with id `<owner>/<repo>`. Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "github_issue"
+          ],
+          "description": "v0 closed set; v0.x adds linear_ticket and jira_ticket. Mirrors plan-standard-v1."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical URL of the originating ticket."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier — e.g. \"kuhlman-labs/fishhawk#4015\"."
+        }
+      }
+    },
+    "generated-by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "model",
+        "timestamp"
+      ],
+      "description": "Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent identifier matching the workflow spec's executor.agent."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Specific model used (e.g. claude-opus-5)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Optional. Model version or build SHA when agent reports it."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp of generation. The runner wall-clock at agent invocation."
+        }
+      }
+    },
+    "report-id": {
+      "type": "string",
+      "pattern": "^UR-(issue-[1-9][0-9]*|comment-[1-9][0-9]*-[1-9][0-9]*)$",
+      "description": "A canonical user-report id as the comms scan prompt renders it: UR-issue-<n> or UR-comment-<n>-<comment id>, no leading zero. UR-unknown-* is refused: no gathered report carries it. The ingest further requires the id to be in the stage's recorded gather's SHOWN set."
+    },
+    "source-report-ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/report-id"
+      },
+      "description": "The report ids an entry answers, sorted ascending by byte order (a semantic rule)."
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_report_ids",
+        "rubric_citations",
+        "proposed_issue"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^draft:UR-[a-z0-9-]+(\\+UR-[a-z0-9-]+)*$",
+          "description": "DERIVED: `draft:` followed by source_report_ids joined with `+` (a semantic rule)."
+        },
+        "source_report_ids": {
+          "$ref": "#/$defs/source-report-ids"
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/rubric-citation"
+          },
+          "description": "The charter rubric lines this draft serves, sorted by rubric_id and unique (a semantic rule)."
+        },
+        "proposed_issue": {
+          "$ref": "#/$defs/proposed-issue"
+        }
+      }
+    },
+    "rubric-citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rubric_id"
+      ],
+      "properties": {
+        "rubric_id": {
+          "type": "string",
+          "pattern": "^[A-Z][0-9]+$",
+          "description": "A charter rubric id. Never of the non-goal shape ^N[0-9]+$ (a semantic rule); the ingest requires it in the gathered charter's rubric ids."
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Optional agent note on why the draft serves this rubric line. Read at the gate; never rendered into a filed issue."
+        }
+      }
+    },
+    "proposed-issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "title",
+        "body",
+        "labels"
+      ],
+      "description": "The issue the draft proposes filing. Filing is a separate, captain-gated step; the filed title and body are NEUTRALIZED and the body gains a server-rendered provenance section and the comms draft marker (comms-report-v1.md § Filing renderer).",
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposed work-item type (bug, feature, chore, ...)."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "ONE line, in the agent's own words. The 200 cap here counts characters; the semantic layer caps it at 200 BYTES and refuses a line break or control rune."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000,
+          "description": "Proposed issue body: a paraphrase attributed by report id, never quoted report text. The semantic layer caps it at 20000 BYTES."
+        },
+        "labels": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Proposed label names; may be empty. Only area:*, type:* and phase:* are allowed, never autonomy:* (a semantic rule)."
+        },
+        "parent_epic": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional parent epic: a positive issue number, bare or `#`-prefixed (a semantic rule). Never the issue number of a report the draft cites (an ingest rule)."
+        }
+      }
+    },
+    "n-drift": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "non_goal_id",
+        "source_report_ids",
+        "note"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ndrift:N[0-9]+:UR-[a-z0-9-]+(\\+UR-[a-z0-9-]+)*$",
+          "description": "DERIVED: `ndrift:` + non_goal_id + `:` + source_report_ids joined with `+` (a semantic rule)."
+        },
+        "non_goal_id": {
+          "type": "string",
+          "pattern": "^N[0-9]+$",
+          "description": "A charter non-goal id; the ingest requires it in the gathered charter's non-goal ids."
+        },
+        "source_report_ids": {
+          "$ref": "#/$defs/source-report-ids"
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the reports fall under the non-goal."
+        }
+      }
+    },
+    "not-drafted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_id",
+        "reason"
+      ],
+      "properties": {
+        "report_id": {
+          "$ref": "#/$defs/report-id"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "noise",
+            "question",
+            "already_tracked",
+            "insufficient_detail",
+            "other"
+          ],
+          "description": "Closed reason set, in the order the comms scan prompt lists it."
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Optional detail (e.g. `budget_exceeded` under reason `other`)."
+        }
+      }
+    }
+  }
+}

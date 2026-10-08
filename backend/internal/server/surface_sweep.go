@@ -318,6 +318,23 @@ var surfacePatterns = []surfacePattern{
 		},
 	},
 	{
+		// #4015: the comms-report-v1 schema's canonical and embedded-mirror
+		// copies must move in lockstep (scripts/sync-schemas' comms-report-*
+		// case routes the canonical to exactly the one
+		// backend/internal/plan/schemas mirror — the runner writes the report
+		// but does not embed the schema). Self-referential (Triggers ==
+		// Siblings), matching the upkeep-report entry above.
+		Name: "comms-report schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/comms-report-v1.schema.json",
+			"backend/internal/plan/schemas/comms-report-v1.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/comms-report-v1.schema.json",
+			"backend/internal/plan/schemas/comms-report-v1.schema.json",
+		},
+	},
+	{
 		// #1101/#1006 case 2: the work-management-v0 schema's canonical and
 		// embedded-mirror copies must move in lockstep. Self-referential
 		// (Triggers == Siblings): a field-add touching the canonical without

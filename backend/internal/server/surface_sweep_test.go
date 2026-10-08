@@ -379,6 +379,28 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			want: nil,
 		},
 		{
+			// #4015: the comms-report-v1 canonical scoped without its
+			// embedded mirror is the same self-referential lockstep miss.
+			name:  "comms-report canonical without mirror flags",
+			scope: []string{"docs/spec/comms-report-v1.schema.json"},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "comms-report schema requires every mirror",
+					TriggerPath:     "docs/spec/comms-report-v1.schema.json",
+					MissingSiblings: []string{"backend/internal/plan/schemas/comms-report-v1.schema.json"},
+				},
+			},
+		},
+		{
+			// Both members scoped: no finding.
+			name: "comms-report both mirrors no finding",
+			scope: []string{
+				"docs/spec/comms-report-v1.schema.json",
+				"backend/internal/plan/schemas/comms-report-v1.schema.json",
+			},
+			want: nil,
+		},
+		{
 			name:  "unrelated files no finding",
 			scope: []string{"backend/internal/foo/foo.go", "README.md"},
 			want:  nil,

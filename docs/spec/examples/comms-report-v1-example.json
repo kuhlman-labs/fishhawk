@@ -1,0 +1,56 @@
+{
+  "kind": "comms_report",
+  "report_version": "comms_report_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues",
+    "id": "kuhlman-labs/fishhawk"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-5-5",
+    "timestamp": "2026-10-07T12:00:00Z"
+  },
+  "summary": "Unanchored weekly scan (no triggering issue). Read 4 shown reports; none were omitted or suppressed and no source was degraded. Proposes one draft clustering two reports of the CSV export failing silently, flags one request for a hosted offering as drift against non-goal N2, and leaves one usage question undrafted.",
+  "drafts": [
+    {
+      "id": "draft:UR-issue-12+UR-issue-40",
+      "source_report_ids": [
+        "UR-issue-12",
+        "UR-issue-40"
+      ],
+      "rubric_citations": [
+        {
+          "rubric_id": "U1",
+          "note": "Both reports describe a correctness failure in a shipped feature."
+        }
+      ],
+      "proposed_issue": {
+        "type": "bug",
+        "title": "CSV export completes without writing any rows",
+        "body": "Two users (UR-issue-12, UR-issue-40) report that exporting a run list to CSV reports success but produces an empty file. UR-issue-40 adds that the export works for lists under one page. Expected: the file contains every listed run, or the export fails with a named error.",
+        "labels": [
+          "area:backend",
+          "type:bug"
+        ]
+      }
+    }
+  ],
+  "n_drift": [
+    {
+      "id": "ndrift:N2:UR-issue-41",
+      "non_goal_id": "N2",
+      "source_report_ids": [
+        "UR-issue-41"
+      ],
+      "note": "Requests a hosted multi-tenant offering, which non-goal N2 excludes."
+    }
+  ],
+  "not_drafted": [
+    {
+      "report_id": "UR-comment-12-7",
+      "reason": "question",
+      "note": "Asks how to change the export delimiter; answerable from the docs."
+    }
+  ]
+}
