@@ -1361,6 +1361,60 @@ Both surfaces are declarable at **workflow** level (the default for every gate) 
 
 Resolution records, per class, **which input decided it**: `explicit` (an `actions` entry), `tier` (the shorthand expansion), or `default` (the fail-closed fallback). The resolved tier and matrix are surfaced on the run-status `delegation` block alongside the evaluated-action list, so an operator can read `approve: gated (tier)` rather than infer it from a missing knob.
 
+## Incident hotfix preset (`hotfix_change`)
+
+The incident hotfix workflow (ADR-053, E35.5 / #1602) ships as [`examples/workflow-v2-hotfix-change.yaml`](examples/workflow-v2-hotfix-change.yaml). It is composed only from the grammar above; no rule in the validator is specific to it. Three tests read the shipped bytes: `backend/internal/spec/hotfix_change_test.go` (stage shape, trigger routing, resolved matrix, and the tighter-than-`feature_change` comparison against the embedded medium preset), `backend/internal/server/hotfix_change_preset_test.go` (alert admission → persisted run → run-status `delegation` block), and the CLI's `TestRunValidate_HotfixChangeExample_OK`. Nothing registers it by default: the operator copies the `hotfix_change` stanza into `.fishhawk/workflows.yaml` and adapts the repository-specific knobs (reviewer models, the verify command, the full `forbidden_paths` list). In this repository that copy also needs a `hotfix_change.implement` case in `testdata/policy/agent-instruction-paths.json` in the same commit, because `TestRepoSpecForbidsAgentInstructionPaths` requires a case for every implement stage in the live spec.
+
+**Shape.** The same in-run stages as `feature_change`: `plan` → `implement` → `acceptance` (against the **preview** instance, before merge) → `review` (human). The plan gate is **retained**. Alert text is untrusted input, and the plan gate puts the plan derived from it in front of a human before any code is written. One consequence follows: the implement stage declares no `executor.timeout`, so `policy.max_stage_runtime: 20m` is also the **plan gate's implement budget**. A hotfix plan predicting more than about 20 minutes is refused at approval and pushed to decompose (or to an explicit budget override). An incident fix that big is a `feature_change`, or a decomposed run.
+
+### Tightened knobs
+
+| Knob | medium-preset `feature_change` | `hotfix_change` | Enforced today? | Rationale |
+|---|---|---|---|---|
+| `policy.max_stage_runtime` | `30m` | `20m` | **yes**: the resolved agent stage timeout, and the plan gate's implement budget | emergency cadence; see the plan-gate consequence above |
+| `budget.limit_usd` (plan / implement / acceptance) | 4 / 12 / — (no acceptance stage) | 3 / 8 / 3 | **yes**: per-stage spend is checked on each trace upload (#2328); at the preset's `enforcement: advisory` a breach records `stage_budget_exceeded` and the run proceeds, while `blocking` cancels the run | the cost ceiling that actually binds |
+| `constraints.max_files_changed` | 45 | 15 | **yes**: post-hoc diff constraint | a hotfix is a narrow change |
+| `budget.max_runtime` (plan / implement / acceptance) | `15m` / `30m` / — | `10m` / `20m` / `10m` | **no**: declared, calibration-pending (#2328) | states intent only |
+| `budget.max_tokens` (plan / implement / acceptance) | 200000 / 500000 / — | 150000 / 300000 / 150000 | **no**: declared, calibration-pending (#2328) | states intent only |
+| `executor.verify.timeout` | `15m` | `15m`, **unchanged** | yes | a gate killed by its timeout reads as a verify failure with no failing test (#3383) |
+| `on_ci_failure.max_retries` | 1 | 1 | yes | one self-heal on a routine CI regression |
+| periodic `budgets` | weekly, advisory, $50 | **none** | — | advisory changes nothing for the run; blocking is designed to refuse a new run at admission, which would refuse an incident fix |
+| `reviewers` | two advisory agents + `human: 1` | the same | — | dual review runs concurrently, so it costs no wall-clock |
+
+The emergency cadence is enforced by `max_stage_runtime`, `max_files_changed` and `limit_usd`. The tighter `max_runtime` and `max_tokens` values state intent only and enforce nothing until #2328's calibration lands. `TestHotfixChangeExample_TighterThanFeatureChange` pins the strict-less comparisons, including `limit_usd`, and pins the unchanged verify timeout.
+
+### Delegation: merge is never delegated
+
+The workflow declares `autonomy: medium` plus explicit `actions` entries `approve`, `waive` and `merge`, each `mode: gated`, and an explicit `page_human_on` listing the full nine-event closed set. That is the medium tier's seven events plus `advisory_reviewer_reject` and `clarification_request`, so any reviewer reject pages during an incident. Resolved matrix:
+
+| Class | Mode | Source |
+|---|---|---|
+| `approve` | `gated` | `explicit` |
+| `fixup` | `auto` / `convergent_concerns` | `tier` |
+| `waive` | `gated` | `explicit` |
+| `retry` | `auto` / `infra_flake` | `tier` |
+| `merge` | `gated` | `explicit` |
+
+"Merge is never delegated" is a **convention**, and its enforcing knobs are named here:
+
+- **The explicit `actions.merge: {mode: gated}` entry.** An explicit entry wins over any tier for its class, so raising the workflow to `autonomy: high` leaves approve, waive and merge `gated`. The medium tier already gates waive and merge; the explicit entries exist so that a tier change cannot widen them. `TestHotfixChangeExample_MergeNeverDelegated` asserts `Source: explicit` and re-resolves the document with the tier raised to `high`.
+- **No gate-level `autonomy` / `actions` block.** A gate-level block replaces the workflow block wholesale ([Placement](#placement-and-the-wholesale-gate-override)), so anyone adding one must restate `merge: {mode: gated}` in it.
+- **The `review` stage's human approval gate**, whose `approvals.not: [author, agent]` excludes the change's author and any agent identity.
+
+**Limit:** the grammar does not refuse `merge: {mode: auto, when: gates_resolved_ci_green}` on this workflow. Unlike the non-delegable backlog-grooming classes, `merge` is auto-eligible, so an operator who edits their copy to delegate merge is not stopped by the validator. The tests pin the shipped bytes only.
+
+### Routing: `applies_to.trigger` includes `diff`
+
+The alert ingress (E35.4 / #1601) auto-starts its source's workflow, `hotfix_change` by default, with `trigger_source: alert`. Admission maps that source onto the `diff` trigger form (`appliesto.TriggerFormForSource`), so the preset declares `applies_to: {trigger: [diff]}`. A workflow that omits `diff` refuses every auto-started alert run with 422 `workflow_not_applicable`; `TestStartAlertRun_ShippedHotfixChangePresetAdmitted` pins this, with a `[scheduled]` variant that is refused. The preset declares no `labels` criterion: the alert path hydrates issue context best-effort, and a labels criterion fails closed on an empty snapshot. Auto-start itself is off unless the alert source sets `auto_start: true` (ADR-053 fork 2). See `backend/internal/alerttrigger/README.md`.
+
+### Post-deploy verification is a follow-on `release` run
+
+`hotfix_change` does **not** deploy and does **not** verify the deploy. Its acceptance stage validates the preview instance before merge, as in `feature_change`. A hotfix gets post-deploy verification **only** when the operator starts the follow-on `release` run after merge, built from [`examples/workflow-v2-release-acceptance.yaml`](examples/workflow-v2-release-acceptance.yaml) ([Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy)). That run is staging-only (ADR-053 Decision 3: a production alert is verified against staging), and a failed verdict there yields the operator-gated rollback offer, which applies only to a run with no `implement` stage. Three runtime facts keep deploy and verify out of this workflow today:
+
+1. Acceptance target and egress resolution read the **first** acceptance stage run-wide, so a second, post-deploy acceptance stage would get the preview's host and target URL.
+2. A plan omitting acceptance (`verification.acceptance_surface: none`) deletes **every** pending acceptance stage of the run.
+3. A post-deploy acceptance stage placed after `review` leaves the merge gate at `acceptance_pending`.
+
 ## Test conventions
 
 An optional **top-level** `test_conventions` array making test-location rules per-repo data for the plan-gate test sweep. Each entry maps production files matching a glob to candidate test-file path templates; the sweep flags a candidate test that **exists on the base ref but is missing from the plan's scope file list**. Advisory-only and fail-open — it never blocks a plan.

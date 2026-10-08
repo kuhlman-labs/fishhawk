@@ -1169,3 +1169,33 @@ func TestRunValidate_ReleaseAcceptanceExample_OK(t *testing.T) {
 		t.Errorf("stdout = %q, want it to open with %q", stdout.String(), path+": OK\n")
 	}
 }
+
+// hotfixChangeExamplePath is the shipped incident hotfix preset (E35.5 /
+// #1602), read from disk so the CLI mirror is exercised against the SHIPPED
+// bytes.
+const hotfixChangeExamplePath = "../../../docs/spec/examples/workflow-v2-hotfix-change.yaml"
+
+// TestRunValidate_HotfixChangeExample_OK pins that `fishhawk validate` admits
+// the committed hotfix_change preset: the CLI's embedded workflow-v2 schema
+// mirror and its ported autonomy/tier validation accept the explicit gated
+// approve/waive/merge entries, the nine-event page_human_on list, the
+// applies_to trigger list and the per-stage limit_usd ceilings.
+func TestRunValidate_HotfixChangeExample_OK(t *testing.T) {
+	raw, err := os.ReadFile(hotfixChangeExamplePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", hotfixChangeExamplePath, err)
+	}
+	path := writeTempSpec(t, string(raw))
+	var stdout, stderr strings.Builder
+
+	got := runValidate([]string{path}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("exit = %d, want exitOK:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want empty (no validation diagnostic)", stderr.String())
+	}
+	if !strings.HasPrefix(stdout.String(), path+": OK\n") {
+		t.Errorf("stdout = %q, want it to open with %q", stdout.String(), path+": OK\n")
+	}
+}

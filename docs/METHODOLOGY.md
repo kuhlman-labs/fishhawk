@@ -151,6 +151,64 @@ turns into binding prompt text; an unanswered escalation binds nothing.
 
 ---
 
+## Incident-context runs (`hotfix_change`)
+
+An incident hotfix runs the `hotfix_change` workflow (ADR-053, E35.5 /
+#1602), shipped as `docs/spec/examples/workflow-v2-hotfix-change.yaml`. It
+follows `feature_change`'s stages at emergency cadence, and its delegation is
+**narrower** than the medium tier it starts from. Reference:
+`docs/spec/workflow-v2.md` § "Incident hotfix preset (hotfix_change)".
+
+| Judgment | Who acts | Why |
+|---|---|---|
+| Plan approval | Human | `approve` is an explicit `mode: gated` entry. Alert text is untrusted input, and the plan gate puts the plan derived from it in front of a human before any code is written. |
+| Fix-up routing | Operator agent, under `convergent_concerns` | Medium tier. Routing converged review concerns back to the agent is mechanical and reversible. |
+| Retry | Operator agent, under `infra_flake` | Medium tier. Re-running after an infrastructure flake is mechanical. |
+| Waiver | Human | `waive` is an explicit `mode: gated` entry. |
+| Merge | Human, always | `merge` is an explicit `mode: gated` entry, and the `review` stage is a human approval gate excluding the author and any agent. |
+| Any reviewer reject (advisory or gating), plan rejection, scope amendment, budget or policy override, exception request, requirement arbitration, clarification request | Pages the human | `page_human_on` lists the full nine-event closed set. `advisory_reviewer_reject` is added, so any reviewer reject pages during an incident. |
+| Crew escalation | Pages the human | At every tier, from outside `page_human_on` (above). |
+
+**Which pages survive any delegation config:** every `page_human_on` event
+is non-delegable, and the crew-escalation page needs no configuration at all.
+The explicit `approve`, `waive` and `merge` entries win over the tier for
+their class, so raising the workflow to `autonomy: high` does not delegate
+them. A gate-level `autonomy`/`actions` block would replace the workflow
+block wholesale, so the preset declares none. "Merge is never delegated" is a
+convention pinned by tests on the shipped file, not a validator rule: an
+operator who edits their copy to `merge: auto` is not refused.
+
+**Cadence and the plan gate.** `policy.max_stage_runtime: 20m` bounds every
+agent stage and is also the plan gate's implement budget, so a hotfix plan
+predicting more than about 20 minutes is pushed to decompose. Each stage
+budget carries an enforced `limit_usd` (plan 3, implement 8, acceptance 3);
+the tighter `max_runtime` and `max_tokens` values are declared but
+calibration-pending (#2328).
+
+**Auto-start is an operator decision.** The alert ingress (E35.4 / #1601)
+files the incident issue, and starts a `hotfix_change` run only when that
+alert source sets `auto_start: true`. It ships off (ADR-053 fork 2). An
+auto-started run still stops at every gate.
+
+**Post-deploy verification.** The `hotfix_change` run does not deploy and
+does not verify the deploy; its acceptance stage checks the preview instance
+before merge. A hotfix gets post-deploy verification **only** when the
+operator starts the follow-on `release` run after merge
+(`docs/spec/examples/workflow-v2-release-acceptance.yaml`). That run verifies
+staging only (ADR-053 Decision 3), and a failed verdict there produces the
+operator-gated rollback offer; it never rolls back on its own.
+
+**This repository's companion edit.** `.fishhawk/**` is forbidden to
+implement stages, so registering `hotfix_change` here is an operator commit.
+That one commit carries both the `.fishhawk/workflows.yaml` stanza and a
+`hotfix_change.implement` case in
+`testdata/policy/agent-instruction-paths.json`:
+`TestRepoSpecForbidsAgentInstructionPaths` requires a case for every
+implement stage in the live spec, and fails on a case naming a stage that does
+not exist yet.
+
+---
+
 ## Which changes may use which workflow (`applies_to`, machine-enforced)
 
 The tier lists above say which *kinds of change* belong at which autonomy
