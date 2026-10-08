@@ -661,9 +661,10 @@ func TestUpkeepReportIngest_RunRefTransportError500(t *testing.T) {
 // the binding's branch was reached rather than the middleware's.
 func TestUpkeepReportIngest_BindingTransportError500(t *testing.T) {
 	f, repo := newUpkeepLateGetRunFailFixture(t)
-	// An upkeep_report is outside the comms guard's allowlist, so that guard
-	// (#4015) reads the run too: the third read is the handler's binding.
-	repo.from = 3
+	// The #4067 ticket guard reads the run before kind routing, and an
+	// upkeep_report is outside the comms guard's allowlist, so that guard
+	// (#4015) reads the run too: the fourth read is the handler's binding.
+	repo.from = 4
 	code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t))
 	if code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500: %v", code, resp)
@@ -671,8 +672,8 @@ func TestUpkeepReportIngest_BindingTransportError500(t *testing.T) {
 	if msg := upkeepErrorMessage(resp); msg != "resolve the stage's upkeep_report declaration failed" {
 		t.Errorf("message = %q, want the binding step's", msg)
 	}
-	if n := repo.getRunCalls(); n != 3 {
-		t.Errorf("reporting-run GetRun calls = %d, want 3 (the middleware's, the comms guard's, then the failed binding read)", n)
+	if n := repo.getRunCalls(); n != 4 {
+		t.Errorf("reporting-run GetRun calls = %d, want 4 (the middleware's, the ticket guard's, the comms guard's, then the failed binding read)", n)
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
@@ -814,6 +815,9 @@ func TestUpkeepStageGuard_OrdinaryWorkflowUnaffected(t *testing.T) {
 // message names the guard's binding step.
 func TestUpkeepStageGuard_TransportError500(t *testing.T) {
 	f, repo := newUpkeepLateGetRunFailFixture(t)
+	// The #4067 ticket guard reads the run before this guard, so the third
+	// read is this guard's.
+	repo.from = 3
 	code, resp := f.post(t, f.planStage.ID, validPlanBytes(t))
 	if code != http.StatusInternalServerError || upkeepErrorCode(resp) != "internal_error" {
 		t.Fatalf("response = %d %v, want 500 internal_error", code, resp)
@@ -821,8 +825,8 @@ func TestUpkeepStageGuard_TransportError500(t *testing.T) {
 	if msg := upkeepErrorMessage(resp); msg != "resolve the stage's upkeep_report declaration failed" {
 		t.Errorf("message = %q, want the guard's binding step's", msg)
 	}
-	if n := repo.getRunCalls(); n != 2 {
-		t.Errorf("reporting-run GetRun calls = %d, want 2 (the middleware's, then the failed guard read)", n)
+	if n := repo.getRunCalls(); n != 3 {
+		t.Errorf("reporting-run GetRun calls = %d, want 3 (the middleware's, the ticket guard's, then the failed guard read)", n)
 	}
 	if n := f.artifacts(artifact.KindPlan); n != 0 {
 		t.Errorf("plan artifacts = %d, want 0", n)
