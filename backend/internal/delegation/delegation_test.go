@@ -1206,6 +1206,17 @@ func realFlakeFailureReason() string {
 	return flakeFailureReason(realFlakeOutput)
 }
 
+// goCacheVanishedOutput3901 is the #3901 verbatim-corpus string,
+// BYTE-IDENTICAL to the runner's const of the same name in
+// runner/cmd/fishhawk-runner/gocachevanish_test.go (the two modules cannot
+// share a fixture; edit both together). It reconstructs run 26ede2f1's
+// verify failure as the #3901 comment quotes it — `could not load export
+// data: open …/go-build/e5/e5470b5b…-d: no such file or directory
+// (typecheck)` — keeping the observed `e5/e5470b5b` prefix and `-d`
+// suffix and filling the elided hash tail to the full 64 hex digits the
+// matcher keys on.
+const goCacheVanishedOutput3901 = `could not load export data: open /Users/brettkuhlman/Library/Caches/go-build/e5/e5470b5bb9216d877b13b4a5c7e153e2f649dfd191fec16d8f608ea2f2951e36-d: no such file or directory (typecheck)`
+
 func flakeFailureReason(out string) string {
 	return fmt.Sprintf("verify command %q still failing after %d iteration(s):\n%s", "scripts/test", 1, out)
 }
@@ -1240,10 +1251,30 @@ func TestInfraFlake(t *testing.T) {
 			wantMet: true,
 		},
 		{
+			// #3901 mirror row: the counterfactual vehicle for the
+			// cache-vanished disjunct in hasInfraFlakeSignature.
+			name:    "met: category-A failure embedding the #3901 vanished Go build-cache entry",
+			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(goCacheVanishedOutput3901))},
+			wantMet: true,
+		},
+		{
 			// ACCEPTED residual, not a defect — see pgtestFixtureDumpOutput.
 			name:    "met: pgtest table fixtures carrying the markers as DATA (accepted #2718 residual)",
 			stages:  []*run.Stage{failedStage(1, run.FailureA, flakeFailureReason(pgtestFixtureDumpOutput))},
 			wantMet: true,
+		},
+		{
+			// #3901 length pins: the 64-hex name is bounded on both sides.
+			name: "unmet: 63-hex build-cache name",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("open /x/go-build/e5/e5470b5bb9216d877b13b4a5c7e153e2f649dfd191fec16d8f608ea2f2951e3-d: no such file or directory"))},
+			wantReason: "no infra-flake signature",
+		},
+		{
+			name: "unmet: 65-hex build-cache name",
+			stages: []*run.Stage{failedStage(1, run.FailureA,
+				flakeFailureReason("open /x/go-build/e5/e5470b5bb9216d877b13b4a5c7e153e2f649dfd191fec16d8f608ea2f2951e360-d: no such file or directory"))},
+			wantReason: "no infra-flake signature",
 		},
 		{
 			name:       "unmet: non-numeric quoted port",

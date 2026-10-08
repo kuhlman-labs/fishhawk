@@ -1122,15 +1122,25 @@ var dockerDaemonUnavailableMarkers = []string{
 	"dial unix /var/run/docker.sock",
 }
 
+// goBuildCacheEntryVanishedRe mirrors the runner's #3901 matcher of a
+// Go build-cache entry that vanished under the build: cmd/go's
+// DiskCache.fileName shape (two-hex subdirectory, 64-hex SHA-256 name,
+// `-a`/`-d` suffix) followed by the ENOENT rendering. The `/` and the
+// `-[ad]` suffix bound the hash on both sides, so a 63- or 65-hex name
+// never matches.
+var goBuildCacheEntryVanishedRe = regexp.MustCompile(`[0-9a-f]{2}/[0-9a-f]{64}-[ad]: no such file or directory`)
+
 // hasInfraFlakeSignature reports whether a failure reason carries the
 // infra-flake classification: the literal verify_infra_flake_retry
 // marker, the conservative testcontainers start signature ("context
 // deadline exceeded" AND a container-start marker — an ordinary test
 // failure that merely mentions a deadline never matches), the
-// testcontainers port-not-found rendering, or a daemon-unreachable
-// marker. The last two mirror the runner's #2718 widening; the two live
-// in different Go modules and cannot share a fixture, so each is pinned
-// against the same corpus of verbatim observed outputs.
+// testcontainers port-not-found rendering, a daemon-unreachable
+// marker, or a vanished Go build-cache entry. The port and daemon
+// classes mirror the runner's #2718 widening and the cache class its
+// #3901 widening; the two live in different Go modules and cannot share
+// a fixture, so each is pinned against the same corpus of verbatim
+// observed outputs.
 func hasInfraFlakeSignature(reason string) bool {
 	if strings.Contains(reason, "verify_infra_flake_retry") {
 		return true
@@ -1139,6 +1149,9 @@ func hasInfraFlakeSignature(reason string) bool {
 		return true
 	}
 	if testcontainersPortNotFoundRe.MatchString(reason) {
+		return true
+	}
+	if goBuildCacheEntryVanishedRe.MatchString(reason) {
 		return true
 	}
 	lowered := strings.ToLower(reason)

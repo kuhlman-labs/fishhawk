@@ -27,6 +27,12 @@ set +e
 orig_repo_root="$REPO_ROOT"
 orig_pwd="$PWD"
 
+# Hermeticity for the Go build-cache bound (#3901): with the threshold at 0 the
+# size-gated GOCACHE paths (the up advisory, the sweep step, the post-merge
+# auto-trim) never resolve or touch the HOST cache while the older cmd_up /
+# sweep / post-merge fixtures run. The GC cases override it per subshell.
+export FISHHAWK_GOCACHE_MAX_GB=0
+
 # A high port with no LISTEN socket, for the port-preflight fixtures (#965,
 # E69.6 / #2917). Prints nothing when it cannot find one in five tries, so
 # callers assert on emptiness rather than proceeding on a squatted port.
@@ -6252,6 +6258,674 @@ if [[ -n "$lr_pm_guard_at" && -n "$lr_pm_git_at" ]] && (( lr_pm_guard_at < lr_pm
 else
   fail "LR-k guard/git ordering in cmd_post_merge (guard=${lr_pm_guard_at} git=${lr_pm_git_at})"
 fi
+
+# ---------------------------------------------------------------------------
+# Go build-cache bound (E83.20 / #3901) — GC cases
+# BEGIN GC CASES
+# ---------------------------------------------------------------------------
+# Every case runs against a FIXTURE cache (GOCACHE pointed at a temp dir) with
+# the process scanners and the size estimate stubbed in a subshell, as in the LR
+# harness, so no real cache is ever touched and every refusal branch is
+# reachable. The fixture seeds each kind of path BY CONSTRUCTION:
+#   OLD       ab/<64hex>-a, 10 days old          — the entry a trim removes
+#   OLDDIR    cd/<64hex>-d/ (a dir), 10 days old — an executable entry, removed
+#   FRESH     ab/<other 64hex>-a, now            — kept (inside the floor)
+#   BOUNDARY  ef/<64hex>-a, floor+0.5 h old      — kept (inside floor+1 h)
+#   non-entry README, trim.txt, testexpire.txt, fuzz/x, ab/stray.tmp — all aged
+#             10 days so ONLY the entry-name filter protects stray.tmp
+zmodload zsh/datetime
+GC_HEX="e5470b5bb9216d877b13b4a5c7e153e2f649dfd191fec16d8f608ea2f2951e36"
+GC_HEX2="15470b5bb9216d877b13b4a5c7e153e2f649dfd191fec16d8f608ea2f2951e36"
+
+_gc_age() {
+  # Args: <seconds ago> <path...>
+  local ago="$1"; shift
+  local ts
+  strftime -s ts '%Y%m%d%H%M.%S' $(( EPOCHSECONDS - ago ))
+  touch -t "$ts" "$@"
+}
+
+# Args: [nomarker]. Sets gc_tmp (scratch root), gc_dir (the cache), gc_root (a
+# REPO_ROOT with no .env, so _gocache_load_env sources nothing).
+_gc_fixture() {
+  gc_tmp="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-gc.XXXXXX")"
+  gc_dir="${gc_tmp}/cache"
+  gc_root="${gc_tmp}/root"
+  mkdir -p "${gc_dir}/ab" "${gc_dir}/cd/${GC_HEX}-d" "${gc_dir}/ef" "${gc_dir}/fuzz" "$gc_root"
+  if [[ "${1:-}" == nomarker ]]; then
+    print -r -- "some unrelated directory" > "${gc_dir}/README"
+  else
+    print -r -- "This directory holds cached build artifacts from the Go build system." > "${gc_dir}/README"
+  fi
+  print -r -- old > "${gc_dir}/ab/${GC_HEX}-a"
+  print -r -- fresh > "${gc_dir}/ab/${GC_HEX2}-a"
+  print -r -- boundary > "${gc_dir}/ef/${GC_HEX}-a"
+  print -r -- prog > "${gc_dir}/cd/${GC_HEX}-d/prog"
+  print -r -- stray > "${gc_dir}/ab/stray.tmp"
+  print -r -- t > "${gc_dir}/trim.txt"
+  print -r -- t > "${gc_dir}/testexpire.txt"
+  print -r -- f > "${gc_dir}/fuzz/x"
+  _gc_age 864000 "${gc_dir}/ab/${GC_HEX}-a" "${gc_dir}/cd/${GC_HEX}-d/prog" "${gc_dir}/cd/${GC_HEX}-d" \
+    "${gc_dir}/ab/stray.tmp" "${gc_dir}/README" "${gc_dir}/trim.txt" "${gc_dir}/testexpire.txt" "${gc_dir}/fuzz/x"
+  # floor 6 h -> cutoff 7 h; the boundary entry sits at 6.5 h, inside it.
+  _gc_age 23400 "${gc_dir}/ef/${GC_HEX}-a"
+}
+
+# Prints a compact presence map of every seeded path, e.g.
+# "old=0 olddir=0 fresh=1 boundary=1 readme=1 trim=1 testexpire=1 fuzz=1 stray=1".
+_gc_state() {
+  local -a parts
+  parts=()
+  local k p
+  for k p in \
+    old "ab/${GC_HEX}-a" olddir "cd/${GC_HEX}-d" fresh "ab/${GC_HEX2}-a" boundary "ef/${GC_HEX}-a" \
+    readme README trim trim.txt testexpire testexpire.txt fuzz fuzz/x stray ab/stray.tmp; do
+    if [[ -e "${gc_dir}/${p}" ]]; then parts+=("${k}=1"); else parts+=("${k}=0"); fi
+  done
+  print -r -- "${(j: :)parts}"
+}
+GC_TRIMMED="old=0 olddir=0 fresh=1 boundary=1 readme=1 trim=1 testexpire=1 fuzz=1 stray=1"
+GC_UNTOUCHED="old=1 olddir=1 fresh=1 boundary=1 readme=1 trim=1 testexpire=1 fuzz=1 stray=1"
+
+# Drive a scripts/dev function in a subshell with stubbed scanners/size.
+# Args: <runs: clean|live|degrade|real> <go: clean|live|degrade|real> <fn> [args...]
+# Knobs come from gc_max / gc_hours (unset gc_hours = the default floor) and the
+# sampled estimate from gc_est (KB). Sets gc_rc gc_out gc_err.
+_gc_call() {
+  local runs="$1" gom="$2"; shift 2
+  # `|| gc_rc=$?` keeps the expected non-zero exits in a TESTED context, so
+  # the sourced #631 ZERR trap stays quiet in this harness's output.
+  gc_rc=0
+  gc_out="$(
+    setopt errexit
+    REPO_ROOT="$gc_root"
+    export GOCACHE="$gc_dir"
+    unset GOCACHEPROG
+    export FISHHAWK_GOCACHE_MAX_GB="${gc_max:-50}"
+    if [[ -n "${gc_hours+x}" ]]; then
+      export FISHHAWK_GOCACHE_TRIM_HOURS="$gc_hours"
+    else
+      unset FISHHAWK_GOCACHE_TRIM_HOURS
+    fi
+    case "$runs" in
+      live)    _scan_live_runs() { print -r -- "5151"$'\t'"run-gc-live"; return 0 } ;;
+      clean)   _scan_live_runs() { return 0 } ;;
+      degrade) _scan_live_runs() { return 2 } ;;
+    esac
+    case "$gom" in
+      live)    _scan_live_go() { print -r -- "6161"$'\t'"golangci-lint"; return 0 } ;;
+      clean)   _scan_live_go() { return 0 } ;;
+      degrade) _scan_live_go() { return 2 } ;;
+    esac
+    if [[ -n "${gc_est:-}" ]]; then
+      _gocache_estimate_kb() { print -r -- "$gc_est" }
+    fi
+    "$@" 2>"${gc_tmp}/err"
+  )" || gc_rc=$?
+  gc_err="$(cat "${gc_tmp}/err" 2>/dev/null)"
+}
+_gc_reset() { unset gc_max gc_hours gc_est; }
+
+# GC-a the trim primitive deletes ONLY the old file and old dir entries; fresh,
+# boundary and every non-entry file survive. (C5: dropping -mmin deletes FRESH
+# and BOUNDARY; C6: dropping the entry-name filter deletes the aged stray.tmp.)
+_gc_reset; _gc_fixture
+_gc_call clean clean _gocache_trim "$gc_dir" 6 0
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_TRIMMED" ]] && [[ "$gc_out" == *"removed 2 cache entries"* ]]; then
+  pass "GC-a _gocache_trim removes only old -a/-d entries (file + dir); fresh, boundary and non-entry files survive"
+else
+  fail "GC-a trim selectivity (rc=${gc_rc} state=${gc_state} out=${gc_out} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-a2 end to end: `gocache --trim` on a clean scan trims, and the exact du is
+# announced first (approval condition 3).
+_gc_reset; _gc_fixture
+_gc_call clean clean cmd_gocache --trim
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_TRIMMED" ]] \
+   && [[ "$gc_err" == *"measuring ${gc_dir} (exact du; may take a while on a large cache)"* ]] \
+   && [[ "$gc_out" == *"dir       ${gc_dir}"* && "$gc_out" == *"(exact du)"* && "$gc_out" == *"floor     6 h"* ]]; then
+  pass "GC-a2 cmd_gocache --trim (clean scan): trims, prints dir/size/floor, announces the exact du first"
+else
+  fail "GC-a2 cmd_gocache --trim clean (rc=${gc_rc} state=${gc_state} out=${gc_out} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-a3 --dry-run counts and deletes nothing (no guard needed: nothing deleted).
+_gc_reset; _gc_fixture
+_gc_call live live cmd_gocache --dry-run
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_out" == *"would remove 2 cache entries"* ]]; then
+  pass "GC-a3 cmd_gocache --dry-run counts 2 entries and deletes nothing"
+else
+  fail "GC-a3 dry-run (rc=${gc_rc} state=${gc_state} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-b a live fishhawk-runner refuses the trim: exit 1, the run id named, the
+# OLD entry still present. (C1: no-op the _scan_live_runs arm.)
+_gc_reset; _gc_fixture
+_gc_call live clean cmd_gocache --trim
+gc_state="$(_gc_state)"
+if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *run-gc-live* && "$gc_err" == *"refusing to trim"* ]]; then
+  pass "GC-b live fishhawk-runner: cmd_gocache --trim exits 1, names the run id, cache untouched"
+else
+  fail "GC-b live-runner refusal (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-c a live Go toolchain process refuses the same way. (C2.)
+_gc_reset; _gc_fixture
+_gc_call clean live cmd_gocache --trim
+gc_state="$(_gc_state)"
+if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *"golangci-lint (pid 6161)"* ]]; then
+  pass "GC-c live Go process: cmd_gocache --trim exits 1, names the pid, cache untouched"
+else
+  fail "GC-c live-go refusal (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-d a scan DEGRADE fails CLOSED — on either scanner. (C3.)
+for gc_mode in "degrade clean" "clean degrade"; do
+  _gc_reset; _gc_fixture
+  _gc_call ${=gc_mode} cmd_gocache --trim
+  gc_state="$(_gc_state)"
+  if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *fail-closed* ]]; then
+    pass "GC-d scan degrade (${gc_mode}): refuses (fail-closed), cache untouched"
+  else
+    fail "GC-d scan degrade ${gc_mode} (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+  fi
+  rm -rf "$gc_tmp"
+done
+
+# GC-e a directory without Go's README marker is never trimmed. (C4.)
+_gc_reset; _gc_fixture nomarker
+_gc_call clean clean cmd_gocache --trim
+gc_state="$(_gc_state)"
+if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *"not provably a Go build cache"* ]]; then
+  pass "GC-e no Go README marker: trim refused, OLD entry untouched"
+else
+  fail "GC-e marker check (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-f _parse_live_go identity table: argv[0] only, never a substring or a later
+# token.
+typeset -a gc_rows
+gc_rows=(
+  "go command|101 /opt/homebrew/Cellar/go/1.25.6/libexec/bin/go test -race ./...|101	go"
+  "golangci-lint|102 /usr/local/bin/golangci-lint run ./...|102	golangci-lint"
+  "compiled test binary|103 /var/folders/x/go-build123/b001/run.test -test.v|103	run.test"
+  "pkg/tool compile|104 /usr/local/go/pkg/tool/darwin_arm64/compile -o x.a|104	compile"
+  "grep for go|105 grep go|"
+  "gopls|106 /Users/x/go/bin/gopls serve|"
+  "go as a later token|107 /bin/sleep go|"
+  "bare .test basename|108 /x/.test|"
+  "empty line||"
+)
+for gc_row in "${gc_rows[@]}"; do
+  gc_label="${gc_row%%|*}"
+  gc_rest="${gc_row#*|}"
+  gc_line="${gc_rest%%|*}"
+  gc_want="${gc_rest#*|}"
+  gc_got="$(print -r -- "$gc_line" | _parse_live_go)"
+  if [[ "$gc_got" == "$gc_want" ]]; then
+    pass "GC-f _parse_live_go: ${gc_label}"
+  else
+    fail "GC-f _parse_live_go ${gc_label}: got '${gc_got}', want '${gc_want}'"
+  fi
+done
+
+# GC-g the sweep step. A minimal git repo is REPO_ROOT (sweep resolves the main
+# repo root through git) and --days 99999 keeps the real /tmp litter glob
+# hermetic. The estimate is stubbed: gc_est over/under gc_max GB.
+_gc_sweep() {
+  # Args: <runs> <go> [sweep args...]; runs from inside the fixture repo.
+  local runs="$1" gom="$2"; shift 2
+  git init -q -b main "${gc_tmp}/repo" >/dev/null 2>&1
+  gc_root="${gc_tmp}/repo"
+  cd "$gc_root"
+  _gc_call "$runs" "$gom" cmd_sweep --days 99999 "$@"
+  cd "$orig_pwd"
+}
+# g1 past the threshold, clean scan, --yes: trimmed.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_sweep clean clean --yes </dev/null
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_TRIMMED" ]] && [[ "$gc_out" == *"candidate: trim entries unused for >6 h"* ]]; then
+  pass "GC-g1 sweep --yes past the threshold (clean scan): lists the candidate and trims"
+else
+  fail "GC-g1 sweep over threshold (rc=${gc_rc} state=${gc_state} out=${gc_out} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+# g2 under the threshold: nothing trimmed. (C7: force the comparison true.)
+_gc_reset; _gc_fixture; gc_max=1; gc_est=1024
+_gc_sweep clean clean --yes </dev/null
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_out" != *candidate:* ]] && [[ "$gc_out" == *"vs the 1 GB threshold"* ]]; then
+  pass "GC-g2 sweep --yes under the threshold: size listed, cache untouched"
+else
+  fail "GC-g2 sweep under threshold (rc=${gc_rc} state=${gc_state} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+# g3 past the threshold with a live runner: sweep exits 1, cache untouched.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_sweep live clean --yes </dev/null
+gc_state="$(_gc_state)"
+if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *REFUSED* && "$gc_err" == *run-gc-live* ]]; then
+  pass "GC-g3 sweep --yes with a live runner: trim refused, sweep exits 1, cache untouched"
+else
+  fail "GC-g3 sweep refusal (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+# g4 --dry-run and g5 non-tty without --yes: nothing deleted.
+for gc_mode in "--dry-run" ""; do
+  _gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+  _gc_sweep clean clean ${gc_mode:+$gc_mode} </dev/null
+  gc_state="$(_gc_state)"
+  if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_out" == *candidate:* ]]; then
+    pass "GC-g4 sweep ${gc_mode:-(non-tty, no --yes)}: candidate listed, nothing deleted"
+  else
+    fail "GC-g4 sweep ${gc_mode:-non-tty} (rc=${gc_rc} state=${gc_state} out=${gc_out})"
+  fi
+  rm -rf "$gc_tmp"
+done
+# g6 FISHHAWK_GOCACHE_MAX_GB=0 disables the step entirely.
+_gc_reset; _gc_fixture; gc_max=0; gc_est=$(( 5 * 1048576 ))
+_gc_sweep clean clean --yes </dev/null
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_out" == *"step disabled"* ]]; then
+  pass "GC-g6 sweep with FISHHAWK_GOCACHE_MAX_GB=0: step disabled, cache untouched"
+else
+  fail "GC-g6 sweep disabled (rc=${gc_rc} state=${gc_state} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-h the up advisory: warns past the threshold, silent under it, at
+# MAX_GB=0, and on an unresolvable cache (GOCACHE=off / GOCACHEPROG / relative).
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_call clean clean _warn_gocache_size
+if (( gc_rc == 0 )) && [[ "$gc_err" == *"$gc_dir"* && "$gc_err" == *"over the 1 GB threshold"* && "$gc_err" == *"scripts/dev gocache --trim"* ]]; then
+  pass "GC-h _warn_gocache_size past the threshold: warns naming dir, threshold and the remedy"
+else
+  fail "GC-h warn over threshold (rc=${gc_rc} err=${gc_err})"
+fi
+gc_est=1024
+_gc_call clean clean _warn_gocache_size
+if (( gc_rc == 0 )) && [[ -z "$gc_err" ]]; then pass "GC-h _warn_gocache_size under the threshold: silent"; else fail "GC-h warn under (rc=${gc_rc} err=${gc_err})"; fi
+gc_max=0; gc_est=$(( 5 * 1048576 ))
+_gc_call clean clean _warn_gocache_size
+if (( gc_rc == 0 )) && [[ -z "$gc_err" ]]; then pass "GC-h _warn_gocache_size at MAX_GB=0: silent"; else fail "GC-h warn MAX_GB=0 (rc=${gc_rc} err=${gc_err})"; fi
+gc_max=1
+gc_real_dir="$gc_dir"
+for gc_unres in off prog relative; do
+  case "$gc_unres" in
+    off)      gc_dir=off ;;
+    relative) gc_dir=relative/cache ;;
+    prog)     gc_dir="$gc_real_dir" ;;
+  esac
+  if [[ "$gc_unres" == prog ]]; then
+    gc_out="$(GOCACHEPROG=/bin/true; export GOCACHE="$gc_dir" GOCACHEPROG FISHHAWK_GOCACHE_MAX_GB=1; _gocache_estimate_kb() { print -r -- 99999999 }; _warn_gocache_size 2>&1)"
+    gc_rc=$?
+    gc_err="$(GOCACHEPROG=/bin/true; export GOCACHE="$gc_dir" GOCACHEPROG; REPO_ROOT="$gc_root"; cmd_gocache 2>&1)"
+    gc_rc2=$?
+  else
+    gc_out="$(export GOCACHE="$gc_dir" FISHHAWK_GOCACHE_MAX_GB=1; _gocache_estimate_kb() { print -r -- 99999999 }; _warn_gocache_size 2>&1)"
+    gc_rc=$?
+    gc_err="$(export GOCACHE="$gc_dir"; REPO_ROOT="$gc_root"; cmd_gocache 2>&1)"
+    gc_rc2=$?
+  fi
+  case "$gc_unres" in
+    off)      gc_reason="GOCACHE=off" ;;
+    prog)     gc_reason="GOCACHEPROG is set" ;;
+    relative) gc_reason="is not an absolute path" ;;
+  esac
+  if (( gc_rc == 0 && gc_rc2 == 0 )) && [[ -z "$gc_out" ]] && [[ "$gc_err" == *"gocache: skipping"* && "$gc_err" == *"$gc_reason"* ]]; then
+    pass "GC-h unresolvable cache (${gc_unres}): advisory silent, 'gocache' exits 0 naming '${gc_reason}'"
+  else
+    fail "GC-h unresolvable ${gc_unres} (warn rc=${gc_rc} out=${gc_out}; gocache rc=${gc_rc2} out=${gc_err})"
+  fi
+done
+gc_dir="$gc_real_dir"
+rm -rf "$gc_tmp"
+
+# GC-i post-merge. Same stubs as _lr_run_post_merge plus a fixture cache.
+# Args: <runs> <go> [cmd_post_merge args...]. Sets gc_pm_* markers.
+_gc_run_post_merge() {
+  local runs="$1" gom="$2"; shift 2
+  mkdir -p "${gc_root}/scripts"
+  gc_pm_git="${gc_tmp}/git.marker"
+  gc_pm_reload="${gc_tmp}/reload.marker"
+  gc_pm_maint="${gc_tmp}/maintain.marker"
+  print -r -- '#!/bin/sh' > "${gc_root}/scripts/cleanup-merged"
+  chmod +x "${gc_root}/scripts/cleanup-merged"
+  _gc_call "$runs" "$gom" _gc_pm_inner "$@"
+}
+_gc_pm_inner() {
+  git() { print -r -- "git $*" >> "$gc_pm_git" }
+  cmd_reload() { print -r -- "reload $*" >> "$gc_pm_reload" }
+  if [[ -n "${gc_stub_maintain:-}" ]]; then
+    _gocache_maintain() { print -r -- attempted >> "$gc_pm_maint"; return 0 }
+  fi
+  cmd_post_merge "$@"
+}
+# GC-i0 (approval condition 4): a live runner makes post-merge refuse BEFORE any
+# trim is ATTEMPTED — _gocache_maintain is never entered, the pull never ran.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 )); gc_stub_maintain=1
+_gc_run_post_merge live clean
+gc_state="$(_gc_state)"
+if (( gc_rc != 0 )) && [[ ! -f "$gc_pm_maint" && ! -f "$gc_pm_git" && ! -f "$gc_pm_reload" ]] && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *run-gc-live* ]]; then
+  pass "GC-i0 post-merge with a live runner refuses before the pull AND before any cache trim is attempted"
+else
+  fail "GC-i0 post-merge ordering (rc=${gc_rc} maint=$([[ -f $gc_pm_maint ]] && print attempted) git=$([[ -f $gc_pm_git ]] && print ran) state=${gc_state} err=${gc_err})"
+fi
+unset gc_stub_maintain
+rm -rf "$gc_tmp"
+# GC-i1 clean scans, past the threshold: post-merge trims and still reloads.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_run_post_merge clean clean
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_TRIMMED" && -f "$gc_pm_reload" ]] && [[ "$gc_out" == *"over the 1 GB threshold"* ]]; then
+  pass "GC-i1 post-merge past the threshold (clean scans): trims the cache, then reaches reload"
+else
+  fail "GC-i1 post-merge trim (rc=${gc_rc} state=${gc_state} reload=$([[ -f $gc_pm_reload ]] && print ran) out=${gc_out} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+# GC-i2 a live Go process: the trim is refused, non-fatally — reload still runs.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_run_post_merge clean live
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" && -f "$gc_pm_reload" ]] && [[ "$gc_err" == *"trim was refused"* ]]; then
+  pass "GC-i2 post-merge with a live Go process: trim refused (advisory), cache untouched, reload still reached"
+else
+  fail "GC-i2 post-merge refusal (rc=${gc_rc} state=${gc_state} reload=$([[ -f $gc_pm_reload ]] && print ran) err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+# GC-i3 --force passes the live-run guard but NOT the cache guard.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+_gc_run_post_merge live clean --force
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" && -f "$gc_pm_reload" ]] && [[ "$gc_err" == *"refusing to trim"* ]]; then
+  pass "GC-i3 post-merge --force with a live runner: reload reached, but the cache guard still refuses the trim"
+else
+  fail "GC-i3 post-merge --force (rc=${gc_rc} state=${gc_state} reload=$([[ -f $gc_pm_reload ]] && print ran) err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+# GC-i4 under the threshold: no trim, reload reached.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=1024
+_gc_run_post_merge clean clean
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "$GC_UNTOUCHED" && -f "$gc_pm_reload" ]]; then
+  pass "GC-i4 post-merge under the threshold: cache untouched, reload reached"
+else
+  fail "GC-i4 post-merge under threshold (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-j knob validation. MAX_GB: an invalid value warns and uses the default
+# (it only gates WHETHER the size-gated paths act).
+gc_out="$(export FISHHAWK_GOCACHE_MAX_GB=lots; _gocache_knobs 2>&1; print -r -- "max=${_GOCACHE_MAX_GB}")"
+if [[ "$gc_out" == *"FISHHAWK_GOCACHE_MAX_GB='lots'"* && "$gc_out" == *"max=50"* ]]; then
+  pass "GC-j invalid FISHHAWK_GOCACHE_MAX_GB warns and falls back to the 50 GB default"
+else
+  fail "GC-j MAX_GB fallback (got: ${gc_out})"
+fi
+gc_out="$(unset FISHHAWK_GOCACHE_MAX_GB FISHHAWK_GOCACHE_TRIM_HOURS; _gocache_knobs 2>&1; print -r -- "max=${_GOCACHE_MAX_GB} hours=${_GOCACHE_TRIM_HOURS}")"
+if [[ "$gc_out" == "max=50 hours=6" ]]; then
+  pass "GC-j unset knobs resolve to the defaults (50 GB, 6 h) silently"
+else
+  fail "GC-j defaults (got: ${gc_out})"
+fi
+# GC-j2 (approval condition 5): an INVALID FLOOR fails CLOSED with a named error
+# and NEVER trims — not to a default, not everything. Each row is the floor
+# value; the OLD entry AND the fresh one must both survive, on --trim and on
+# --dry-run. (C10: delete the floor check in _gocache_trim.)
+for gc_bad in abc 0 1 -3 2.5 "" 9999999; do
+  _gc_reset; _gc_fixture; gc_hours="$gc_bad"
+  _gc_call clean clean cmd_gocache --trim
+  gc_state="$(_gc_state)"
+  _gc_call clean clean cmd_gocache --dry-run
+  if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *gocache_floor_invalid* ]] \
+     && [[ "$gc_out" == *"floor     INVALID"* ]] && [[ "$(_gc_state)" == "$GC_UNTOUCHED" ]]; then
+    pass "GC-j2 invalid floor '${gc_bad}': trim and dry-run refuse with gocache_floor_invalid, nothing deleted"
+  else
+    fail "GC-j2 invalid floor '${gc_bad}' (rc=${gc_rc} state=${gc_state} err=${gc_err} out=${gc_out})"
+  fi
+  rm -rf "$gc_tmp"
+done
+# GC-j3 control for GC-j2: the minimum floor (2 h) is VALID and trims — so the
+# rows above are refused by the floor check, not by something else.
+_gc_reset; _gc_fixture; gc_hours=2
+_gc_call clean clean cmd_gocache --trim
+gc_state="$(_gc_state)"
+if (( gc_rc == 0 )) && [[ "$gc_state" == "old=0 olddir=0 fresh=1 boundary=0 readme=1 trim=1 testexpire=1 fuzz=1 stray=1" ]]; then
+  pass "GC-j3 the minimum floor (2 h) is valid: trims old AND the 6.5 h boundary entry, keeps fresh"
+else
+  fail "GC-j3 minimum floor (rc=${gc_rc} state=${gc_state} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# GC-k wiring body-greps: every call site in a tested context, post-merge's step
+# AFTER the live-run guard, the pull and cleanup-merged and BEFORE cmd_reload,
+# sweep never runs the exact du (approval condition 3), and the dispatch.
+gc_up_body="$(typeset -f cmd_up)"
+gc_sweep_body="$(typeset -f cmd_sweep)"
+gc_pm_body="$(typeset -f cmd_post_merge)"
+if print -r -- "$gc_up_body" | grep -q '_warn_gocache_size || true'; then
+  pass "GC-k cmd_up calls _warn_gocache_size non-fatally"
+else
+  fail "GC-k cmd_up should call '_warn_gocache_size || true'"
+fi
+if print -r -- "$gc_sweep_body" | grep -q 'if ! _gocache_trim_guarded' && ! print -r -- "$gc_sweep_body" | grep -q '_gocache_size_kb'; then
+  pass "GC-k cmd_sweep calls _gocache_trim_guarded in a tested context and never runs the exact du"
+else
+  fail "GC-k cmd_sweep wiring (tested trim call, no _gocache_size_kb)"
+fi
+gc_at() { print -r -- "$1" | grep -n -- "$2" | head -n 1 | cut -d: -f1 }
+gc_pm_guard="$(gc_at "$gc_pm_body" 'if ! _refuse_on_live_runs')"
+gc_pm_pull="$(gc_at "$gc_pm_body" 'git pull --ff-only')"
+gc_pm_clean="$(gc_at "$gc_pm_body" 'scripts/cleanup-merged')"
+gc_pm_maint="$(gc_at "$gc_pm_body" '_gocache_maintain || true')"
+gc_pm_reload="$(gc_at "$gc_pm_body" 'cmd_reload ')"
+if [[ -n "$gc_pm_guard" && -n "$gc_pm_pull" && -n "$gc_pm_clean" && -n "$gc_pm_maint" && -n "$gc_pm_reload" ]] \
+   && (( gc_pm_guard < gc_pm_pull && gc_pm_pull < gc_pm_clean && gc_pm_clean < gc_pm_maint && gc_pm_maint < gc_pm_reload )); then
+  pass "GC-k cmd_post_merge: live-run guard < pull < cleanup-merged < _gocache_maintain || true < cmd_reload"
+else
+  fail "GC-k post-merge ordering (guard=${gc_pm_guard} pull=${gc_pm_pull} clean=${gc_pm_clean} maint=${gc_pm_maint} reload=${gc_pm_reload})"
+fi
+if grep -qE '^[[:space:]]*gocache\)[[:space:]]*cmd_gocache' "${orig_repo_root}/scripts/dev" \
+   && _usage 2>&1 | grep -q 'gocache \[--trim\] \[--dry-run\]'; then
+  pass "GC-k the gocache) dispatch and its usage line are present"
+else
+  fail "GC-k gocache dispatch/usage missing"
+fi
+
+# GC-l the REAL process scan (the issue's explicit check): a process whose argv[0]
+# basename is fishhawk-runner makes `gocache --trim` refuse and NAME that pid,
+# with the REAL _scan_live_runs. _scan_live_go is stubbed clean so the refusal is
+# attributable to the runner arm alone.
+if command -v ps >/dev/null 2>&1; then
+  _gc_reset; _gc_fixture
+  (exec -a fishhawk-runner sleep 60) &
+  gc_sleep_pid=$!
+  sleep 0.3
+  _gc_call real clean cmd_gocache --trim
+  kill "$gc_sleep_pid" 2>/dev/null || true
+  wait "$gc_sleep_pid" 2>/dev/null || true
+  gc_state="$(_gc_state)"
+  if (( gc_rc == 1 )) && [[ "$gc_state" == "$GC_UNTOUCHED" ]] && [[ "$gc_err" == *"pid ${gc_sleep_pid}"* ]]; then
+    pass "GC-l a REAL fishhawk-runner-named process: gocache --trim exits 1, names pid ${gc_sleep_pid}, cache untouched"
+  else
+    fail "GC-l real-process refusal (pid=${gc_sleep_pid} rc=${gc_rc} state=${gc_state} err=${gc_err})"
+  fi
+  rm -rf "$gc_tmp"
+else
+  print "skip: GC-l — ps is not available on this host, the real-process scan cannot run"
+fi
+# GC-m per-branch coverage of the remaining defensive arms (one case each).
+# m1 _gocache_resolve_dir arms not covered by GC-h: a missing absolute dir; go
+# absent with GOCACHE unset; `go env GOCACHE` failing; GOCACHEPROG set in the go
+# env FILE (read via `go env`); and the positive `go env` resolution.
+_gc_reset; _gc_fixture
+gc_fakebin="${gc_tmp}/fakebin"
+mkdir -p "$gc_fakebin"
+_gc_fakego() {
+  # Args: <script body>. Writes an executable fake `go` on gc_fakebin.
+  print -r -- "#!/bin/sh"$'\n'"$1" > "${gc_fakebin}/go"
+  chmod +x "${gc_fakebin}/go"
+}
+_gc_resolve() {
+  # Args: <GOCACHE or __unset__> <PATH>. Prints "<rc>|<stdout>|<stderr>".
+  local gcv="$1" pth="$2" so se rc=0
+  so="$(
+    if [[ "$gcv" == __unset__ ]]; then unset GOCACHE; else export GOCACHE="$gcv"; fi
+    unset GOCACHEPROG
+    PATH="$pth"
+    _gocache_resolve_dir 2>"${gc_tmp}/rerr"
+  )" || rc=$?
+  se="$(cat "${gc_tmp}/rerr" 2>/dev/null)"
+  print -r -- "${rc}|${so}|${se}"
+}
+gc_got="$(_gc_resolve "${gc_tmp}/no-such-cache" "$PATH")"
+if [[ "$gc_got" == "1||"*"is not a directory"* ]]; then pass "GC-m1 resolve: a missing absolute GOCACHE refuses (not a directory)"; else fail "GC-m1 missing dir (got: ${gc_got})"; fi
+gc_got="$(_gc_resolve __unset__ "${gc_tmp}/empty-path")"
+if [[ "$gc_got" == "1||"*"go is not on PATH"* ]]; then pass "GC-m1 resolve: GOCACHE unset and no go on PATH refuses"; else fail "GC-m1 no go (got: ${gc_got})"; fi
+_gc_fakego 'exit 1'
+gc_got="$(_gc_resolve __unset__ "$gc_fakebin")"
+if [[ "$gc_got" == "1||"*"'go env GOCACHE' failed"* ]]; then pass "GC-m1 resolve: a failing 'go env GOCACHE' refuses"; else fail "GC-m1 go env fails (got: ${gc_got})"; fi
+_gc_fakego "case \"\$2\" in GOCACHE) echo '${gc_dir}' ;; GOCACHEPROG) echo /usr/local/bin/cacheprog ;; esac"
+gc_got="$(_gc_resolve __unset__ "$gc_fakebin")"
+if [[ "$gc_got" == "1||"*"GOCACHEPROG is set"* ]]; then pass "GC-m1 resolve: GOCACHEPROG from the go env file refuses"; else fail "GC-m1 go env GOCACHEPROG (got: ${gc_got})"; fi
+_gc_fakego "case \"\$2\" in GOCACHE) echo '${gc_dir}' ;; GOCACHEPROG) echo '' ;; esac"
+gc_got="$(_gc_resolve __unset__ "$gc_fakebin")"
+if [[ "$gc_got" == "0|${gc_dir}|" ]]; then pass "GC-m1 resolve: GOCACHE unset resolves through 'go env GOCACHE'"; else fail "GC-m1 go env resolution (got: ${gc_got})"; fi
+rm -rf "$gc_tmp"
+
+# m2 a Go README that is ABSENT (not merely marker-less) also refuses.
+_gc_reset; _gc_fixture
+rm -f "${gc_dir}/README"
+_gc_call clean clean _gocache_trim "$gc_dir" 6 0
+if (( gc_rc == 1 )) && [[ "$(_gc_state)" == "old=1 olddir=1 fresh=1 boundary=1 readme=0 trim=1 testexpire=1 fuzz=1 stray=1" ]] && [[ "$gc_err" == *"not provably a Go build cache"* ]]; then
+  pass "GC-m2 no README at all: trim refused, entries untouched"
+else
+  fail "GC-m2 absent README (rc=${gc_rc} state=$(_gc_state) err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# m3 a live runner whose --run-id is unreadable is still reported (by pid).
+_gc_reset; _gc_fixture
+gc_out="$(
+  export GOCACHE="$gc_dir"; REPO_ROOT="$gc_root"
+  _scan_live_runs() { print -r -- "5252"$'\t'; return 0 }
+  _scan_live_go() { return 0 }
+  _gocache_trim_guarded "$gc_dir" 6 0 2>&1
+)" || true
+if [[ "$gc_out" == *"fishhawk-runner pid 5252 (run id unreadable)"* ]] && [[ "$(_gc_state)" == "$GC_UNTOUCHED" ]]; then
+  pass "GC-m3 a live runner with an unreadable run id still refuses, reported by pid"
+else
+  fail "GC-m3 unreadable run id (out=${gc_out} state=$(_gc_state))"
+fi
+rm -rf "$gc_tmp"
+
+# m4 du failure: the status line degrades to 'unknown', and gocache still exits 0.
+_gc_reset; _gc_fixture
+_gc_du_fails() { du() { return 1 }; cmd_gocache }
+_gc_call clean clean _gc_du_fails
+if (( gc_rc == 0 )) && [[ "$gc_out" == *"size      unknown (du failed)"* ]]; then
+  pass "GC-m4 a failing du degrades the size line to 'unknown (du failed)', exit 0"
+else
+  fail "GC-m4 du failure (rc=${gc_rc} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+
+# m5 the sampled estimate: 0 with no sampled subdir (the fixture's ab/cd/ef are
+# not among 00,10,…,f0), and x16 the sampled subdirs once one exists.
+_gc_reset; _gc_fixture
+gc_e0="$(_gocache_estimate_kb "$gc_dir")"
+mkdir -p "${gc_dir}/10"
+dd if=/dev/zero of="${gc_dir}/10/${GC_HEX}-d" bs=1024 count=64 2>/dev/null
+gc_one="$(du -sk "${gc_dir}/10")"; gc_one="${gc_one%%[[:space:]]*}"
+gc_e1="$(_gocache_estimate_kb "$gc_dir")"
+if [[ "$gc_e0" == 0 ]] && (( gc_one > 0 )) && [[ "$gc_e1" == "$(( gc_one * 16 ))" ]]; then
+  pass "GC-m5 _gocache_estimate_kb: 0 with no sampled subdir, 16x the sampled du otherwise"
+else
+  fail "GC-m5 estimate (e0=${gc_e0} one=${gc_one} e1=${gc_e1})"
+fi
+rm -rf "$gc_tmp"
+
+# m6 no two-hex subdirectories at all: removes 0, exit 0.
+_gc_reset; _gc_fixture
+rm -rf "${gc_dir}/ab" "${gc_dir}/cd" "${gc_dir}/ef"
+_gc_call clean clean _gocache_trim "$gc_dir" 6 0
+if (( gc_rc == 0 )) && [[ "$gc_out" == *"removed 0 cache entries"* ]] && [[ -f "${gc_dir}/README" && -f "${gc_dir}/trim.txt" ]]; then
+  pass "GC-m6 a cache with no entry subdirectories: removes 0, non-entry files kept"
+else
+  fail "GC-m6 empty cache (rc=${gc_rc} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+
+# m7 find errors mid-walk (an unreadable subdirectory) are reported, not hidden;
+# entries elsewhere are still trimmed. Skipped as root (root reads mode 000).
+if [[ "$(id -u)" != 0 ]]; then
+  _gc_reset; _gc_fixture
+  mkdir -p "${gc_dir}/99/sub"
+  chmod 000 "${gc_dir}/99"
+  _gc_call clean clean _gocache_trim "$gc_dir" 6 0
+  chmod 755 "${gc_dir}/99"
+  if (( gc_rc == 0 )) && [[ "$gc_err" == *"find reported errors"* ]] && [[ "$(_gc_state)" == "$GC_TRIMMED" ]]; then
+    pass "GC-m7 a find error mid-walk is reported as a warning; readable entries are still trimmed"
+  else
+    fail "GC-m7 find error (rc=${gc_rc} state=$(_gc_state) err=${gc_err})"
+  fi
+  rm -rf "$gc_tmp"
+else
+  print "skip: GC-m7 — running as root, a mode-000 directory stays readable"
+fi
+
+# m8 an unknown gocache argument dies naming it.
+_gc_reset; _gc_fixture
+_gc_call clean clean cmd_gocache --bogus
+if (( gc_rc == 1 )) && [[ "$gc_err" == *"gocache: unknown argument '--bogus'"* ]] && [[ "$(_gc_state)" == "$GC_UNTOUCHED" ]]; then
+  pass "GC-m8 cmd_gocache rejects an unknown argument by name"
+else
+  fail "GC-m8 unknown arg (rc=${gc_rc} err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+
+# m9 sweep with an unresolvable cache lists 'skipped' and still completes.
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 ))
+gc_keep_dir="$gc_dir"; gc_dir=off
+_gc_sweep clean clean --yes </dev/null
+gc_dir="$gc_keep_dir"
+if (( gc_rc == 0 )) && [[ "$gc_out" == *"Go build cache: skipped"* && "$gc_out" == *"sweep: done."* ]]; then
+  pass "GC-m9 sweep with GOCACHE=off: the cache step is skipped and sweep completes"
+else
+  fail "GC-m9 sweep unresolvable (rc=${gc_rc} out=${gc_out})"
+fi
+rm -rf "$gc_tmp"
+
+# m10 post-merge: MAX_GB=0 never trims; an invalid floor refuses with the named
+# error and post-merge still reaches reload.
+_gc_reset; _gc_fixture; gc_max=0; gc_est=$(( 5 * 1048576 ))
+_gc_run_post_merge clean clean
+if (( gc_rc == 0 )) && [[ "$(_gc_state)" == "$GC_UNTOUCHED" && -f "$gc_pm_reload" ]]; then
+  pass "GC-m10 post-merge at FISHHAWK_GOCACHE_MAX_GB=0: never trims, reload reached"
+else
+  fail "GC-m10 post-merge MAX_GB=0 (rc=${gc_rc} state=$(_gc_state) err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+_gc_reset; _gc_fixture; gc_max=1; gc_est=$(( 5 * 1048576 )); gc_hours=0
+_gc_run_post_merge clean clean
+if (( gc_rc == 0 )) && [[ "$(_gc_state)" == "$GC_UNTOUCHED" && -f "$gc_pm_reload" ]] && [[ "$gc_err" == *gocache_floor_invalid* ]]; then
+  pass "GC-m10 post-merge with an invalid floor: gocache_floor_invalid, nothing deleted, reload reached"
+else
+  fail "GC-m10 post-merge invalid floor (rc=${gc_rc} state=$(_gc_state) err=${gc_err})"
+fi
+rm -rf "$gc_tmp"
+_gc_reset
+# END GC CASES
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then

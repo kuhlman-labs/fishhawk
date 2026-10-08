@@ -5055,9 +5055,16 @@ const golangciLintLockSignature = "parallel golangci-lint is running"
 //   - the #972 testcontainers container-start timeout (isTestcontainersStartFlake);
 //   - golangci-lint's global-lock contention (golangciLintLockSignature);
 //   - testcontainers-go's port-not-found rendering (isTestcontainersPortFlake);
-//   - a Docker daemon that is not reachable (isDockerDaemonUnavailable).
+//   - a Docker daemon that is not reachable (isDockerDaemonUnavailable);
+//   - a Go build-cache entry that vanished under the build
+//     (isGoBuildCacheEntryVanished, #3901).
 //
-// The last two were added by #2718, whose evidence is run 2187fa4c: a MinIO
+// The fifth was added by #3901: host build-cache maintenance (a `go clean
+// -cache`) deleted an entry while run 26ede2f1's verify was reading it, and the
+// resulting `could not load export data: … no such file or directory` was
+// recorded as an agent failure (category A).
+//
+// The third and fourth were added by #2718, whose evidence is run 2187fa4c: a MinIO
 // container in backend/internal/tracestore — a package outside that change's
 // scope — failed with `connection string: port "9000/tcp" not found`, a
 // signature that matched NEITHER recognised class (it carries no deadline text
@@ -5083,8 +5090,9 @@ const golangciLintLockSignature = "parallel golangci-lint is running"
 //
 // RESIDUAL — the input is UNTRUSTED. Verify output is influenced by the diff
 // under test: a test the agent authored can print arbitrary text, including
-// the literal lint-lock line or a `signal: <name>` rendering inside a log
-// message. A diff that embeds an infra signature in its failing output steers
+// the literal lint-lock line, a `signal: <name>` rendering or a
+// `<2hex>/<64hex>-[ad]: no such file or directory` cache-entry rendering inside a
+// log message. A diff that embeds an infra signature in its failing output steers
 // its own genuine category-B failure to category-C, converting a terminal park
 // into a retry loop. That is deliberately accepted here because the failure
 // safety above bounds it to retry CHURN and delayed parking: the push decision
@@ -5108,7 +5116,8 @@ func isVerifyInfraFailure(output string) bool {
 	return isTestcontainersStartFlake(output) ||
 		strings.Contains(output, golangciLintLockSignature) ||
 		isTestcontainersPortFlake(output) ||
-		isDockerDaemonUnavailable(output)
+		isDockerDaemonUnavailable(output) ||
+		isGoBuildCacheEntryVanished(output)
 }
 
 // signalDeathSignatures are the `signal: <name>` renderings os/exec produces
@@ -5662,11 +5671,11 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			break
 		}
 
-		// Infrastructure-failure absorb (#972, widened by #2645/#2718): a
+		// Infrastructure-failure absorb (#972, widened by #2645/#2718/#3901): a
 		// failed verify whose output carries a diff-independent infra
 		// signature (isVerifyInfraFailure — container-start timeout,
-		// golangci-lint lock contention, testcontainers port-not-found, or an
-		// unreachable Docker daemon) is
+		// golangci-lint lock contention, testcontainers port-not-found, an
+		// unreachable Docker daemon, or a vanished Go build-cache entry) is
 		// re-run ONCE in place — repeat the iteration via the existing loop
 		// body (re-stage, re-commit, re-verify) WITHOUT invoking the fix agent
 		// and WITHOUT advancing iter, mirroring the maxFixInvokeInfraRetries
@@ -5680,7 +5689,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// verify_infra_flake_retry log line + trace event.
 		if !flakeRetried && isVerifyInfraFailure(out) {
 			flakeRetried = true
-			const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once without consuming a fix iteration"
+			const detail = "diff-independent infrastructure-failure signature in verify output (see isVerifyInfraFailure); re-running verify once without consuming a fix iteration"
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, iter+1, detail)
@@ -6243,7 +6252,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		}
 	}
 	if !lockContended && !refused && !unavailable && !timedOut && outcome == "failed" && isVerifyInfraFailure(out) {
-		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
+		const detail = "diff-independent infrastructure-failure signature in verify output (see isVerifyInfraFailure); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, 1, detail)
