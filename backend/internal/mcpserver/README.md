@@ -1261,6 +1261,37 @@ The tool pre-validates the run UUID, a non-empty batch, and non-empty `finding_i
 
 Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `finding_id` (caught locally), `validation_failed` (400), `upkeep_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `run_not_found` (404), `upkeep_report_absent` (409), `upkeep_window_closed` (409), `upkeep_report_superseded` (409), `upkeep_finding_unknown` (422), `upkeep_dispositions_unconfigured` (503).
 
+## Per-draft comms dispositions (`fishhawk_record_comms_dispositions`, [#4016](https://github.com/kuhlman-labs/fishhawk/issues/4016))
+
+`fishhawk_record_comms_dispositions` **captures** the captain's verdicts on individual drafts of a comms scan run's `comms_report` — one `{draft_id, verdict, parent_epic?}` per decided draft — and persists each as ONE chained `comms_disposition_recorded` audit row. It wraps `POST /v0/runs/{run_id}/comms-dispositions`; `ListCommsDispositions` on the client wraps the `GET` read-back. It mirrors the upkeep tool above in shape; the contract is `docs/spec/comms-report-v1.md` § "Dispositions".
+
+**The 200 is the captain's review surface**, not just a disposition echo. Both verbs return each draft's RECORDED preview (`previews[]`: the final rendered filing body — neutralized agent prose, server provenance, marker and intake section — exactly as the `comms_report_recorded` row recorded it, never the raw artifact), `undecided_draft_ids` (report order), `unaccounted_report_ids` (shown reports the report cites nowhere), and `cluster_splits` (server-suggested clusters whose members landed in different places, each member placed as `draft` / `n_drift` / `not_drafted` / `unaccounted`). `clusters_recorded: false` means the bound gather predates the cluster record, so the splits are UNKNOWN rather than empty. The output types are local decode-only mirrors (`CommsDraftPreviewRecord.Intake` reuses `IntakeSignals`, for the ADR-064 reason stated on it).
+
+**Previews are untrusted DATA.** `previews[].title`, `.body` and `.intake` are agent prose written from external user reports, plus tracker titles verbatim in the intake section. The tool description says so; no MCP-side envelope is added, matching `fishhawk_list_audit`, which already exposes the same `comms_report_recorded` payload.
+
+**Consumed by the apply** ([#4017](https://github.com/kuhlman-labs/fishhawk/issues/4017)), which closes the capture WINDOW with an artifact-bound `comms_apply_window_closed` watermark; a capture after that returns `409 comms_window_closed` and records nothing. The response carries `window_closed` / `settlement` (the grooming settlement shape, so the unexported `groomingWindowSettlement` is reused).
+
+**Captain-only, with TWO refusals** — the upkeep posture: a run-bound MCP token is refused `run_token_forbidden` **even for its own run**, and a delegated operator-agent token is refused `operator_agent_forbidden`. `write:approvals` is required unconditionally (`server/mcpscopes.go`, pinned by `TestMCPToolScopeTable_CommsDispositionsMirrorsHandler`). `TestRecordCommsDispositions_SurfacesBackendRefusals` asserts the tool names every backend code, and `TestRecordCommsDispositionsFullPath_RunBoundTokenRefusedAtBackend` proves the run-bound refusal through the REAL server with zero rows persisted.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose recorded `comms_report` the dispositions bind to. |
+| `dispositions[].draft_id` | **yes** | The draft's DERIVED id (e.g. `draft:UR-issue-12+UR-issue-40`), as the report declares it. At most 25 entries (the report's drafts maximum). |
+| `dispositions[].verdict` | **yes** | `approved` or `rejected` — the closed comms verdict set. |
+| `dispositions[].parent_epic` | no | Approved only. A positive issue number, bare (`389`) or `#`-prefixed (`#389`), and not the issue a report the draft cites lives on (`validation_failed`, `details.reason` `parent_epic_is_source`). Forwarded VERBATIM — the tool does not trim it, because the backend refuses a padded value. A pointer on the wire, so a present-but-blank value reaches the backend and is refused rather than read as absent. |
+
+Semantics worth knowing before calling:
+
+- **Which report.** The dispositions bind to the artifact named by the HIGHEST-sequence `comms_report_recorded` row on the run's chain — NOT the newest artifact. The resolved `artifact_id` + `content_hash` come back in the response, and the `GET` uses the same resolver.
+- **Batch-atomic, with an in-transaction binding re-check.** One unknown `draft_id` records **NOTHING**. The batch is appended in ONE transaction under the run-row lock that re-checks the binding: a report recorded after resolution refuses `409 comms_report_superseded` (naming `current_artifact_id`) and records nothing.
+- **Last-wins supersession.** A `draft_id` may not repeat WITHIN one request (`validation_failed`), but a LATER request on the same draft **supersedes** the earlier one; both rows stay on the chain.
+
+The tool pre-validates the run UUID, a non-empty batch, and non-empty `draft_id`s **before** the HTTP hop (`TestRecordCommsDispositions_PreHopValidation` asserts zero backend calls); it deliberately does NOT duplicate the verdict, draft-id, 25-entry or `parent_epic` checks — the backend is the single authority. `TestRecordCommsDispositionsFullPath` (the cross-boundary test) seeds a real run, gather, `comms_report` artifact and a `comms_report_recorded` row carrying the production writer's FULL key set, then carries verdicts, `parent_epic`, the preview body (byte-equal), `unaccounted_report_ids` and `cluster_splits` through the real client, the real `server.Handler()` and the real Postgres `FamilyWindowAppender`, and back out of both the POST echo and the `GET`.
+
+Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `draft_id` (caught locally), `validation_failed` (400), `comms_verdict_invalid` (400), `authentication_required` (401), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `run_not_found` (404), `comms_report_absent` (409), `comms_window_closed` (409), `comms_report_superseded` (409), `comms_draft_unknown` (422), `internal_error` (500, with `details.recorded` / `details.requested`), `comms_dispositions_unconfigured` (503).
+
 ## Run-branch reset (`fishhawk_reset_run_branch`)
 
 `fishhawk_reset_run_branch` ([ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#867](https://github.com/kuhlman-labs/fishhawk/issues/867)) is the **destructive, operator-gated** remediation for a foreign commit pushed **ON TOP** of a run's own commits on the open PR branch. It force-rewinds the run/PR branch back to its **last run-authored HEAD** (the newest commit attributable to the run's reported-head ledger), dropping the on-top foreign commit, then re-parks the review gate so CI + the merge reconciler re-evaluate the rewound head. It wraps `POST /v0/runs/{run_id}/reset-branch`.
