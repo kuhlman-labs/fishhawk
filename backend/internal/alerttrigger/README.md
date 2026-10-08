@@ -231,10 +231,19 @@ fails the filing.
 including the E35.5 `hotfix_change` preset (#1602), must list `diff` in its
 `applies_to.trigger`. Otherwise every auto-started alert run is refused 422
 `workflow_not_applicable`. Until that workflow exists in the target repo, an
-auto-start is refused, and the incident issue is still filed.
+auto-start is refused, and the incident issue is still filed. The preset ships
+as `docs/spec/examples/workflow-v2-hotfix-change.yaml` (reference:
+`docs/spec/workflow-v2.md` § "Incident hotfix preset (hotfix_change)"); an
+operator copies its stanza into the target repo's `.fishhawk/workflows.yaml`.
+`server.TestStartAlertRun_ShippedHotfixChangePresetAdmitted` drives the shipped
+bytes through `StartAlertRun` and pins the contract, with a `[scheduled]`
+variant that is refused 422.
 
 **Known limitation (ADR-053 forks 2 + 3):** a production-originated alert can
-auto-start a hotfix whose post-deploy verification targets staging only.
+auto-start a hotfix whose post-deploy verification targets staging only. The
+`hotfix_change` run itself carries no post-deploy acceptance stage: a hotfix
+gets post-deploy verification only when the operator starts the follow-on
+`release` run (`docs/spec/examples/workflow-v2-release-acceptance.yaml`).
 
 ## Response codes
 

@@ -1,0 +1,215 @@
+# Workflow-v2 example — the incident hotfix preset (E35.5 / #1602, ADR-053).
+#
+# feature_change's in-run shape (plan -> implement -> preview acceptance ->
+# human review) at emergency cadence: tighter stage budgets with an enforced
+# USD ceiling on every stage, a smaller diff cap and a 20m stage-runtime
+# policy, the plan gate retained, and delegation NARROWER than feature_change.
+# Composed only from existing workflow-v2 grammar; reference:
+# docs/spec/workflow-v2.md § "Incident hotfix preset (hotfix_change)".
+#
+# Validates against ../workflow-v2.schema.json AND the backend's cross-member
+# rules. It is welded to the suite three ways, so a schema-invalid or drifted
+# example fails a test rather than only a manual check-jsonschema run:
+#
+#   (i)   backend/internal/spec/hotfix_change_test.go reads this file from disk
+#         through spec.ParseBytes and pins the stage shape, the trigger
+#         routing, the resolved delegation matrix and the tighter-than-
+#         feature_change budgets; cli/cmd/fishhawk/validate_test.go runs
+#         `fishhawk validate` on it (the CLI's embedded schema mirror);
+#   (ii)  it is the driving spec of the cross-boundary seam test
+#         backend/internal/server/hotfix_change_preset_test.go (alert
+#         admission -> persisted run -> GET /v0/runs/{id} delegation block);
+#   (iii) THIS IS THE STANZA FOR THE OPERATOR'S COMPANION EDIT.
+#         `.fishhawk/**` is in the implement stages' forbidden_paths, so an
+#         implement agent cannot register the workflow. The operator copies the
+#         `hotfix_change` stanza into `.fishhawk/workflows.yaml`, adapts the
+#         repository-specific knobs (reviewer models, the verify command and
+#         its timeout, the full forbidden_paths list), and — in THIS
+#         repository — adds a `hotfix_change.implement` case to
+#         testdata/policy/agent-instruction-paths.json in the SAME commit:
+#         TestRepoSpecForbidsAgentInstructionPaths requires a case for every
+#         implement stage in the live spec and fails on a case naming a stage
+#         that does not exist yet.
+#
+# Deploy and post-deploy verification are deliberately ABSENT. A hotfix gets
+# post-deploy verification ONLY when the operator starts the follow-on
+# `release` run (examples/workflow-v2-release-acceptance.yaml, staging-only per
+# ADR-053); this workflow itself never verifies the deploy.
+
+version: "2"
+
+workflows:
+  hotfix_change:
+    description: >-
+      Incident hotfix: feature_change's shape at emergency cadence. The agent
+      plans and implements; a human approves the plan and the PR. Tighter
+      budgets, a smaller diff cap, and no delegated approve, waive or merge.
+    # The alert ingress (E35.4 / #1601) routes an `alert` run as the `diff`
+    # trigger form (appliesto.TriggerFormForSource), so `diff` is required for
+    # an auto-started incident run to be admitted. No `labels` predicate: the
+    # alert path hydrates issue context best-effort, and a labels criterion
+    # fails closed on an empty snapshot.
+    applies_to:
+      trigger: [diff]
+    auto_advance: true
+    # Delegation: start from the medium tier (fixup under convergent_concerns
+    # and retry under infra_flake stay delegated — the mechanical, reversible
+    # moves), then pin approve, waive and merge to `gated` EXPLICITLY. An
+    # explicit entry wins over the tier for that class, so raising the tier to
+    # `high` can never widen these three. Do NOT declare an autonomy or
+    # actions block on any gate below: a gate-level block replaces this one
+    # wholesale.
+    autonomy: medium
+    actions:
+      approve:
+        mode: gated
+      waive:
+        mode: gated
+      merge:
+        mode: gated
+      # The full closed set: the tier's seven events plus
+      # advisory_reviewer_reject (any reviewer reject pages during an
+      # incident) and clarification_request.
+      page_human_on:
+        - advisory_reviewer_reject
+        - gating_reviewer_reject
+        - plan_rejection
+        - scope_amendment
+        - budget_override
+        - policy_override
+        - exception_request
+        - requirement_arbitration
+        - clarification_request
+    # Enforced: the wall-clock envelope of every agent stage, and the plan
+    # gate's implement budget — a plan predicting more than ~20 minutes is
+    # pushed to decompose.
+    policy:
+      max_stage_runtime: "20m"
+    on_ci_failure:
+      max_retries: 1
+    # No periodic `budgets`: advisory would change nothing for the run, and
+    # blocking would refuse an incident fix at admission.
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        # Dual advisory review runs concurrently, so it costs no wall-clock;
+        # the human gate below decides.
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: anthropic
+              model: claude-sonnet-4-6
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        # limit_usd is the enforced ceiling; max_tokens and max_runtime are
+        # declared but calibration-pending (#2328).
+        budget:
+          max_tokens: 150000
+          max_runtime: 10m
+          limit_usd: 3
+          enforcement: advisory
+        # Retained: alert text is untrusted input, and this gate puts the plan
+        # derived from it in front of a human before any code is written.
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            # Replace with your repository's test command.
+            command: "make test"
+            # NOT tightened: a gate killed by its timeout reads as a verify
+            # failure with no failing test (#3383).
+            timeout: "15m"
+            max_iterations: 1
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: anthropic
+              model: claude-sonnet-4-6
+          human: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          # A hotfix is a narrow change; a wider one is a feature_change.
+          max_files_changed: 15
+          forbidden_paths:
+            - ".github/workflows/**"
+            - ".gitlab-ci.yml"
+            - ".gitlab/ci/**"
+            - ".gitlab/agents/**"
+            - ".fishhawk/**"
+            - "LICENSE"
+            - "NOTICE"
+          required_outcomes:
+            - tests_added_or_updated
+            - ci_green
+        budget:
+          max_tokens: 300000
+          max_runtime: 20m
+          limit_usd: 8
+          enforcement: advisory
+
+      # Pre-merge acceptance against the PREVIEW instance, as in
+      # feature_change. Not post-deploy verification — see the header.
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        egress:
+          target_hosts:
+            - localhost:8090
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 150000
+          max_runtime: 10m
+          limit_usd: 3
+          enforcement: advisory
+
+      # The merge gate. A human executor, and an approval excluding the
+      # change's author and any agent identity. No gate-level autonomy or
+      # actions block (see the workflow-level comment).
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
