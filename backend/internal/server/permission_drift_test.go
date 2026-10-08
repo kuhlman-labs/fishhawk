@@ -38,6 +38,14 @@ const (
 	driftSpecRef = ".fishhawk/workflows.yaml"
 	driftBase    = "base0000"
 	driftHead    = "head1111"
+	// driftHead2 is a fix-up pass's pushed head (its base is driftHead, the
+	// agent-authored previous branch head).
+	driftHead2 = "head2222"
+	// driftAdmission is a run.DocumentBaseCommit distinct from every other
+	// ref, so a read at it is attributable to the DocumentBaseCommit fallback.
+	driftAdmission = "admit333"
+	// driftCut is a decomposed child's slice cut point (child_pushed base_sha).
+	driftCut = "cut44444"
 )
 
 // driftWF renders a workflow whose top-level permissions block is perms (a
@@ -94,6 +102,7 @@ type driftGH struct {
 	compareStatus int
 	contentStatus map[string]int // "ref|path" → status
 	calls         int
+	fetched       []string // every contents read, "ref|path", in order (an injected-status read included)
 }
 
 func newDriftGH() *driftGH {
@@ -113,6 +122,19 @@ func (g *driftGH) callCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls
+}
+
+// readRefs returns the refs path was read at, in order.
+func (g *driftGH) readRefs(path string) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []string
+	for _, f := range g.fetched {
+		if ref, p, _ := strings.Cut(f, "|"); p == path {
+			out = append(out, ref)
+		}
+	}
+	return out
 }
 
 func (g *driftGH) serve(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +179,7 @@ func (g *driftGH) serve(w http.ResponseWriter, r *http.Request) {
 	if i := strings.Index(p, "/contents/"); i >= 0 {
 		path := p[i+len("/contents/"):]
 		ref := r.URL.Query().Get("ref")
+		g.fetched = append(g.fetched, ref+"|"+path)
 		if st := g.contentStatus[ref+"|"+path]; st != 0 {
 			w.WriteHeader(st)
 			_, _ = w.Write([]byte(`{"message":"injected"}`))
@@ -272,6 +295,11 @@ func newDriftFixture(t *testing.T) *driftFixture {
 	runRow.Repo = "acme/widgets"
 	inst := int64(55)
 	runRow.InstallationID = &inst
+	// The run's recorded base: a fix-up / conflict-resolution check with no
+	// pull_request_opened entry reads the surface extension here. Tests of the
+	// PR-opened precedence, child resolution or the unresolved path override it.
+	docBase := driftBase
+	runRow.DocumentBaseCommit = &docBase
 	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	stage.Type = run.StageTypeImplement
 	stage.RequiresApproval = true
@@ -1362,4 +1390,433 @@ func TestPermissionDrift_ConsolidatedReviewNoReviewers(t *testing.T) {
 	if len(rows) != 1 || rows[0].CheckKey != wfWideningKey || rows[0].StageID != implStage.ID {
 		t.Fatalf("rows = %+v, want one %q row on the parent implement stage", rows, wfWideningKey)
 	}
+}
+
+// The run-base surface-extension fixtures (#3939 F3). The extension declaring
+// infra-app lives at whichever ref the arm makes the run's recorded base; the
+// agent-authored pass base (driftHead) carries an EMPTY extension (an earlier
+// pass removed the declaration); the fix-up pass (driftHead → driftHead2)
+// widens infra/app.json. So the infra-app widening raises ONLY when the
+// extension is read at the run base, and the driftGH recorder names the ref.
+const (
+	driftInfraExt = "version: 1\nsurfaces:\n  - id: infra-app\n    kind: github_app_permissions_json\n    paths: [\"infra/app.json\"]\n"
+	driftEmptyExt = "version: 1\nsurfaces: []\n"
+	driftInfraKey = "permission_drift|infra-app|infra/app.json|"
+)
+
+// fixupPassAtRunBase seeds the extension declaring infra-app at extRef, an
+// empty extension at the agent-authored pass base, and the fix-up pass's
+// infra/app.json widening.
+func (f *driftFixture) fixupPassAtRunBase(extRef string) {
+	if extRef != "" {
+		f.gh.put(extRef, permdrift.RepoSurfacesPath, driftInfraExt)
+	}
+	f.gh.put(driftHead, permdrift.RepoSurfacesPath, driftEmptyExt)
+	f.gh.put(driftHead2, permdrift.RepoSurfacesPath, driftEmptyExt)
+	f.gh.put(driftHead, "infra/app.json", `{"default_permissions":{"contents":"read"}}`)
+	f.gh.put(driftHead2, "infra/app.json", `{"default_permissions":{"contents":"write"}}`)
+	f.gh.changed = []string{"infra/app.json"}
+}
+
+// fixupReq is exactly what succeedFixupPushStage builds for the pass: Base is
+// the previous (agent-authored) branch head.
+func (f *driftFixture) fixupReq() permissionDriftRequest {
+	return permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: driftHead, Head: driftHead2, Trigger: permissionDriftTriggerFixupPushed}
+}
+
+// seedStageBase appends a stage-anchored ledger entry of category whose
+// payload carries base_sha (the shape the PR-opened and child-push handlers
+// write).
+func (f *driftFixture) seedStageBase(t *testing.T, category, baseSHA string) {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{"head_sha": driftHead, "base_sha": baseSHA})
+	if _, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: f.runRow.ID, StageID: &f.stage.ID, Timestamp: time.Now().UTC(), Category: category, Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rowsWithPrefix(rows []*concern.Concern, prefix string) []*concern.Concern {
+	var out []*concern.Concern
+	for _, r := range rows {
+		if strings.HasPrefix(r.CheckKey, prefix) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// assertRunBaseRead asserts the extension was read at exactly want, recorded
+// as surfaces_ref, and the infra-app widening it declares raised.
+func (f *driftFixture) assertRunBaseRead(t *testing.T, want string) {
+	t.Helper()
+	if got := f.gh.readRefs(permdrift.RepoSurfacesPath); len(got) != 1 || got[0] != want {
+		t.Errorf("extension reads = %v, want exactly [%s]", got, want)
+	}
+	if got := rowsWithPrefix(f.rows(t), driftInfraKey); len(got) != 1 {
+		t.Errorf("infra-app rows = %d (rows %+v), want 1 (the run-base extension declares it)", len(got), f.rows(t))
+	}
+	p := f.detected(t)
+	if len(p) != 1 || p[0].SurfacesRef != want || p[0].ExtensionError != "" {
+		t.Errorf("detected = %+v, want surfaces_ref %q and no extension_error", p, want)
+	}
+	if got := f.unevaluable(t)[permdrift.SurfaceIDSurfaceDeclarations]; got != "" {
+		t.Errorf("declarations unevaluable = %q, want none", got)
+	}
+}
+
+// TestPermissionDrift_FixupReadsExtensionAtRunBase (#3939 F3, moved from the
+// review repro): the fix-up's Base is the agent-authored previous head, whose
+// extension an earlier pass emptied; the extension is read at the run's base
+// (the stage's pull_request_opened base_sha), so the pass's widening of a
+// run-base-declared surface raises.
+//
+// COUNTERFACTUAL (permissionDriftSurfacesRef mutated to return req.Base for
+// every trigger): the extension is read at driftHead, which declares nothing →
+// no infra-app row → RED.
+func TestPermissionDrift_FixupReadsExtensionAtRunBase(t *testing.T) {
+	f := newDriftFixture(t)
+	f.runRow.DocumentBaseCommit = nil
+	f.fixupPassAtRunBase(driftBase)
+	f.seedStageBase(t, "pull_request_opened", driftBase)
+	f.run(f.fixupReq())
+	f.assertRunBaseRead(t, driftBase)
+}
+
+// TestPermissionDrift_SurfacesRefResolution: one arm per resolution mode of
+// permissionDriftSurfacesRef, each asserting the ref the extension was read at
+// (the driftGH recorder) and the payload's surfaces_ref.
+func TestPermissionDrift_SurfacesRefResolution(t *testing.T) {
+	admission := driftAdmission
+	parent := uuid.New()
+
+	// COUNTERFACTUAL (the pull_request_opened lookup deleted): the run falls
+	// back to DocumentBaseCommit, whose extension is EMPTY → no infra-app row,
+	// surfaces_ref driftAdmission → RED.
+	t.Run("pull_request_opened entry wins over DocumentBaseCommit", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.gh.put(driftAdmission, permdrift.RepoSurfacesPath, driftEmptyExt)
+		f.fixupPassAtRunBase(driftBase)
+		f.seedStageBase(t, "pull_request_opened", driftBase)
+		f.run(f.fixupReq())
+		f.assertRunBaseRead(t, driftBase)
+	})
+	// The extension exists ONLY at driftAdmission. COUNTERFACTUAL (the
+	// DocumentBaseCommit fallback deleted): the ref is unresolved → no
+	// extension read, a surfaces_ref_unresolved row, no infra-app row → RED.
+	t.Run("DocumentBaseCommit fallback", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.fixupPassAtRunBase(driftAdmission)
+		f.run(f.fixupReq())
+		f.assertRunBaseRead(t, driftAdmission)
+	})
+	// An unreadable ledger is no entry, never "read at req.Base": the
+	// pull_request_opened read errors (its entry names driftBase, whose
+	// extension is EMPTY), so the run falls back to DocumentBaseCommit.
+	t.Run("pull_request_opened read error falls back to DocumentBaseCommit", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.fixupPassAtRunBase(driftAdmission)
+		f.gh.put(driftBase, permdrift.RepoSurfacesPath, driftEmptyExt)
+		f.seedStageBase(t, "pull_request_opened", driftBase)
+		f.au.listByCategoryErrCategory = "pull_request_opened"
+		f.run(f.fixupReq())
+		f.assertRunBaseRead(t, driftAdmission)
+	})
+	// An entry whose base_sha is empty is no entry. COUNTERFACTUAL (the
+	// `p.BaseSHA == ""` clause in stageEntryBaseSHA deleted): the extension is
+	// read at the empty ref, which holds none → no infra-app row → RED.
+	t.Run("empty pull_request_opened base_sha falls back to DocumentBaseCommit", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.fixupPassAtRunBase(driftAdmission)
+		f.seedStageBase(t, "pull_request_opened", "")
+		f.run(f.fixupReq())
+		f.assertRunBaseRead(t, driftAdmission)
+	})
+	// COUNTERFACTUAL (the child_pushed lookup deleted — children then
+	// unresolved): no extension read, no infra-app row → RED. DocumentBaseCommit
+	// points at an EMPTY extension, so a child wrongly taking that fallback
+	// is RED too.
+	t.Run("decomposed child reads at its child_pushed base_sha", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DecomposedFrom = &parent
+		f.runRow.DocumentBaseCommit = &admission
+		f.gh.put(driftAdmission, permdrift.RepoSurfacesPath, driftEmptyExt)
+		f.fixupPassAtRunBase(driftCut)
+		f.seedStageBase(t, "child_pushed", driftCut)
+		f.run(f.fixupReq())
+		f.assertRunBaseRead(t, driftCut)
+	})
+	// Option (b): a child has NO DocumentBaseCommit fallback. COUNTERFACTUAL
+	// (the DecomposedFrom guard dropped, so a child takes the non-child path):
+	// DocumentBaseCommit holds the infra-app extension, so it is read and the
+	// widening raises with no surfaces_ref_unresolved row → RED.
+	t.Run("decomposed child without child_pushed is unresolved", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DecomposedFrom = &parent
+		f.runRow.DocumentBaseCommit = &admission
+		f.fixupPassAtRunBase(driftAdmission)
+		f.run(f.fixupReq())
+		assertSurfacesRefUnresolved(t, f)
+	})
+	// Neither source resolves. req.Base's extension read is seeded with a 500
+	// BY CONSTRUCTION, so a best-effort extension read there would record
+	// fetch_failed and show in the recorder. COUNTERFACTUAL (the
+	// surfaces_ref_unresolved append deleted): zero rows → RED.
+	// COUNTERFACTUAL (an extension read at req.Base re-added before the
+	// append): the stored reason is fetch_failed and the recorder shows a read
+	// → RED. COUNTERFACTUAL (the extension_error assignment deleted): RED on
+	// extension_error.
+	t.Run("unresolved ref reads no extension and fails closed", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = nil
+		f.fixupPassAtRunBase(driftBase)
+		f.gh.contentStatus[driftHead+"|"+permdrift.RepoSurfacesPath] = http.StatusInternalServerError
+		f.run(f.fixupReq())
+		assertSurfacesRefUnresolved(t, f)
+	})
+	// Approval condition 1: an unresolved ref suppresses only the EXTENSION
+	// (no extension-derived surface is evaluated); the
+	// permission-surface-declarations SURFACE comparison of RepoSurfacesPath,
+	// which this diff changes, still runs on the diff's own base → head sides
+	// and reports the declaration's removal as a widening.
+	t.Run("unresolved ref with RepoSurfacesPath changed still compares the declarations surface", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = nil
+		f.gh.put(driftHead, permdrift.RepoSurfacesPath, driftInfraExt)
+		f.gh.put(driftHead2, permdrift.RepoSurfacesPath, driftEmptyExt)
+		f.gh.put(driftHead, "infra/app.json", `{"default_permissions":{"contents":"read"}}`)
+		f.gh.put(driftHead2, "infra/app.json", `{"default_permissions":{"contents":"write"}}`)
+		f.gh.changed = []string{permdrift.RepoSurfacesPath, "infra/app.json"}
+		f.run(f.fixupReq())
+
+		if got := f.unevaluable(t)[permdrift.SurfaceIDSurfaceDeclarations]; got != permdrift.ReasonSurfacesRefUnresolved {
+			t.Errorf("declarations unevaluable = %q, want surfaces_ref_unresolved", got)
+		}
+		if got := rowsWithPrefix(f.rows(t), driftInfraKey); len(got) != 0 {
+			t.Errorf("infra-app rows = %d, want 0 (no extension-derived surface is evaluated)", len(got))
+		}
+		if got := f.gh.readRefs("infra/app.json"); len(got) != 0 {
+			t.Errorf("infra/app.json reads = %v, want none", got)
+		}
+		p := f.detected(t)
+		if len(p) != 1 {
+			t.Fatalf("detected entries = %d, want 1", len(p))
+		}
+		var removal bool
+		for _, w := range p[0].Widenings {
+			removal = removal || (w.Surface == permdrift.SurfaceIDSurfaceDeclarations && strings.HasPrefix(w.Key, "surfaces[infra-app]"))
+		}
+		if !removal || p[0].SurfacesRef != "" {
+			t.Errorf("detected = %+v, want the declarations surface's removal of surfaces[infra-app] and no surfaces_ref", p)
+		}
+		if got := f.gh.readRefs(permdrift.RepoSurfacesPath); len(got) != 2 || got[0] != driftHead || got[1] != driftHead2 {
+			t.Errorf("RepoSurfacesPath reads = %v, want only the declarations comparison's [%s %s]", got, driftHead, driftHead2)
+		}
+	})
+	// COUNTERFACTUAL (permissionDriftSurfacesRef returns req.Base for every
+	// trigger): req.Base is the pre-merge branch tip driftHead, whose
+	// extension is empty → no infra-app row → RED.
+	t.Run("conflict-resolution trigger reads at the run base", func(t *testing.T) {
+		const mainRef = "main"
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.fixupPassAtRunBase(driftBase)
+		f.gh.put(mainRef, "infra/app.json", `{"default_permissions":{"contents":"read"}}`)
+		f.seedStageBase(t, "pull_request_opened", driftBase)
+		f.seedConflictTrigger(t, mainRef)
+		pr := &pullRequestBody{BaseSHA: driftHead, HeadSHA: driftHead2}
+		f.run(f.s.conflictResolutionDriftRequest(context.Background(), f.runRow.ID, f.stage.ID, pr))
+		f.assertRunBaseRead(t, driftBase)
+	})
+	// The PR-opened trigger's Base IS the run base. COUNTERFACTUAL (the
+	// run-kind resolution applied to every trigger): no pull_request_opened
+	// entry exists yet, so it reads DocumentBaseCommit's EMPTY extension → RED.
+	t.Run("PR-opened trigger reads at its Base", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.runRow.DocumentBaseCommit = &admission
+		f.gh.put(driftAdmission, permdrift.RepoSurfacesPath, driftEmptyExt)
+		f.gh.put(driftBase, permdrift.RepoSurfacesPath, driftInfraExt)
+		f.gh.put(driftBase, "infra/app.json", `{"default_permissions":{"contents":"read"}}`)
+		f.gh.put(driftHead, "infra/app.json", `{"default_permissions":{"contents":"write"}}`)
+		f.gh.changed = []string{"infra/app.json"}
+		f.run(f.req(permissionDriftTriggerPROpened))
+		f.assertRunBaseRead(t, driftBase)
+	})
+}
+
+// assertSurfacesRefUnresolved asserts the unresolved-ref posture: exactly ONE
+// stored row — the surfaces_ref_unresolved unevaluable on
+// permission-surface-declarations at RepoSurfacesPath — no extension read, no
+// surfaces_ref, and extension_error naming surfaces_ref_unresolved (approval
+// condition 3).
+func assertSurfacesRefUnresolved(t *testing.T, f *driftFixture) {
+	t.Helper()
+	rows := f.rows(t)
+	wantKey := permdrift.UnevaluableKey(permdrift.SurfaceIDSurfaceDeclarations, permdrift.RepoSurfacesPath, driftHead2)
+	if len(rows) != 1 || rows[0].CheckKey != wantKey {
+		t.Fatalf("rows = %+v, want exactly one %q", rows, wantKey)
+	}
+	if got := f.unevaluable(t)[permdrift.SurfaceIDSurfaceDeclarations]; got != permdrift.ReasonSurfacesRefUnresolved {
+		t.Errorf("declarations reason = %q, want surfaces_ref_unresolved", got)
+	}
+	if got := f.gh.readRefs(permdrift.RepoSurfacesPath); len(got) != 0 {
+		t.Errorf("extension reads = %v, want none", got)
+	}
+	if p := f.detected(t); len(p) != 1 || p[0].SurfacesRef != "" || p[0].ExtensionError != permdrift.ReasonSurfacesRefUnresolved {
+		t.Errorf("detected = %+v, want no surfaces_ref and extension_error surfaces_ref_unresolved", p)
+	}
+}
+
+// TestPermissionDrift_FixupHandlerReadsExtensionAtRunBase is the cross-boundary
+// arm: the real PR-opened /pull-request handler appends the pull_request_opened
+// entry → the real fixup_pushed handler (base_sha = the agent-authored previous
+// head, DocumentBaseCommit nil) → background check → ledger read → forge fake →
+// concern store.
+//
+// COUNTERFACTUAL (permissionDriftSurfacesRef returns req.Base for every
+// trigger, or the pull_request_opened lookup deleted — then unresolved): no
+// infra-app row → RED.
+func TestPermissionDrift_FixupHandlerReadsExtensionAtRunBase(t *testing.T) {
+	f := newDriftFixture(t)
+	f.runRow.DocumentBaseCommit = nil
+	f.fixupPassAtRunBase(driftBase)
+	f.gh.put(driftBase, "infra/app.json", `{"default_permissions":{"contents":"read"}}`)
+	priv, _ := f.sf.issue(t, f.runRow.ID)
+
+	opened, _ := json.Marshal(pullRequestBody{
+		PRNumber: 7, PRURL: "https://github.com/acme/widgets/pull/7", Branch: "fishhawk/run-x",
+		HeadSHA: driftHead, BaseSHA: driftBase, Title: "t", FilesChangedCount: 1,
+	})
+	if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, priv, opened, ""); w.Code != http.StatusCreated {
+		t.Fatalf("PR-opened ship status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+	if n := len(f.rows(t)); n != 0 {
+		t.Fatalf("rows after PR open = %d, want 0 (infra/app.json is unchanged base → head)", n)
+	}
+
+	fixup, _ := json.Marshal(map[string]any{
+		"outcome": "fixup_pushed", "branch": "fishhawk/run-x", "head_sha": driftHead2, "base_sha": driftHead, "files_changed_count": 1,
+	})
+	if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, priv, fixup, ""); w.Code != http.StatusOK {
+		t.Fatalf("fixup ship status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+	if got := rowsWithPrefix(f.rows(t), driftInfraKey); len(got) != 1 {
+		t.Fatalf("infra-app rows = %d (rows %+v), want 1", len(got), f.rows(t))
+	}
+	var sawFixup bool
+	for _, p := range f.detected(t) {
+		sawFixup = sawFixup || (p.Trigger == permissionDriftTriggerFixupPushed && p.SurfacesRef == driftBase)
+	}
+	if !sawFixup {
+		t.Errorf("detected = %+v, want a fixup_pushed entry with surfaces_ref %q", f.detected(t), driftBase)
+	}
+}
+
+// TestPermissionDrift_ConflictIntersectAbsentBaseBranchSide (#3939 F8, moved
+// from the review repro): a surface file ABSENT at the conflict-resolution
+// IntersectRef keeps the single (superset) comparison. Absent → head reports
+// no change for a restriction the resolution removed, so intersecting would
+// drop it.
+//
+// COUNTERFACTUAL (intersectSide's absent-side early return deleted): both F8
+// arms and the base-branch-deleted arm raise nothing → RED.
+func TestPermissionDrift_ConflictIntersectAbsentBaseBranchSide(t *testing.T) {
+	removedKey := permdrift.CheckKey(permdrift.SurfaceIDForbiddenPaths, driftSpecRef,
+		"workflows.feature_change.stages.implement.forbidden_paths[infra/**]", permdrift.Absent)
+	secretsKey := permdrift.CheckKey(permdrift.SurfaceIDForbiddenPaths, driftSpecRef,
+		"workflows.feature_change.stages.implement.forbidden_paths[secrets/**]", permdrift.Absent)
+	conflict := func(t *testing.T, baseRef string, prev, head, onBase string) *driftFixture {
+		t.Helper()
+		f := newDriftFixture(t)
+		if prev != "" {
+			f.gh.put(driftBase, driftSpecRef, prev)
+		}
+		if head != "" {
+			f.gh.put(driftHead, driftSpecRef, head)
+		}
+		if onBase != "" {
+			f.gh.put(baseRef, driftSpecRef, onBase)
+		}
+		f.gh.changed = []string{driftSpecRef}
+		f.seedConflictTrigger(t, baseRef)
+		pr := &pullRequestBody{BaseSHA: driftBase, HeadSHA: driftHead}
+		f.run(f.s.conflictResolutionDriftRequest(context.Background(), f.runRow.ID, f.stage.ID, pr))
+		return f
+	}
+	both := driftSpec(`["secrets/**", "infra/**"]`)
+	one := driftSpec(`["secrets/**"]`)
+
+	// F8: the run ADDED the spec; the base branch never had it (404 at main).
+	t.Run("spec absent on the base branch raises the removal", func(t *testing.T) {
+		f := conflict(t, "main", both, one, "")
+		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != removedKey {
+			t.Errorf("rows = %+v, want exactly the removed infra/** restriction", rows)
+		}
+	})
+	// F8: the trigger names a stacked base branch since deleted (404 for every
+	// file at that ref).
+	t.Run("deleted base branch raises the removal", func(t *testing.T) {
+		f := conflict(t, "feature/stack-base", both, one, "")
+		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != removedKey {
+			t.Errorf("rows = %+v, want exactly the removed infra/** restriction", rows)
+		}
+	})
+	// Control: the base branch HAS the spec, so the intersection runs and the
+	// resolution's removal survives it.
+	t.Run("base branch has the spec: intersection keeps the removal", func(t *testing.T) {
+		f := conflict(t, "main", both, one, both)
+		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != removedKey {
+			t.Errorf("rows = %+v, want exactly the removed infra/** restriction", rows)
+		}
+	})
+	// Control: absent at the previous head AND at the base branch — the two
+	// comparisons are identical (absent → head), so the run-added file's
+	// grants raise either way.
+	t.Run("absent on both sides raises the added file's grants", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.workflowChange("", wfWidened)
+		f.seedConflictTrigger(t, "main")
+		pr := &pullRequestBody{BaseSHA: driftBase, HeadSHA: driftHead}
+		f.run(f.s.conflictResolutionDriftRequest(context.Background(), f.runRow.ID, f.stage.ID, pr))
+		if rowWithKey(f.rows(t), wfWideningKey) == nil {
+			t.Errorf("rows = %+v, want the added workflow's contents: write raised", f.rows(t))
+		}
+	})
+	// Control: a non-404 read error on the IntersectRef side still fails the
+	// pair CLOSED (it is not an absent side).
+	t.Run("base branch read error is fetch_failed", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.gh.contentStatus["main|"+driftSpecRef] = http.StatusInternalServerError
+		f.gh.put(driftBase, driftSpecRef, both)
+		f.gh.put(driftHead, driftSpecRef, one)
+		f.gh.changed = []string{driftSpecRef}
+		f.seedConflictTrigger(t, "main")
+		pr := &pullRequestBody{BaseSHA: driftBase, HeadSHA: driftHead}
+		f.run(f.s.conflictResolutionDriftRequest(context.Background(), f.runRow.ID, f.stage.ID, pr))
+		if got := f.unevaluable(t)[permdrift.SurfaceIDForbiddenPaths]; got != permdrift.ReasonFetchFailed {
+			t.Errorf("forbidden_paths reason = %q, want fetch_failed", got)
+		}
+		if rows := f.rows(t); rowWithKey(rows, removedKey) != nil {
+			t.Errorf("rows = %+v, want no widening on a failed pair", rows)
+		}
+	})
+	// Approval condition 2 (known noise, the fail-closed direction): the base
+	// branch DELETED a Restriction-polarity file the run had (present at the
+	// previous head, absent at the pushed head AND at the base branch). The
+	// IntersectRef side is absent, so the superset stands and every removed
+	// restriction raises.
+	t.Run("restriction file deleted on the base branch raises its restrictions", func(t *testing.T) {
+		f := conflict(t, "main", both, "", "")
+		rows := f.rows(t)
+		if len(rows) != 2 || rowWithKey(rows, removedKey) == nil || rowWithKey(rows, secretsKey) == nil {
+			t.Errorf("rows = %+v, want both forbidden_paths restrictions raised", rows)
+		}
+	})
 }
