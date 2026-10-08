@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/google/uuid"
@@ -847,6 +848,7 @@ func (r *postgresRepo) ListAll(ctx context.Context, p ListAllParams) ([]*Entry, 
 		Category:  p.Category,
 		RunID:     p.RunID,
 		AccountID: accountIDArg(p.AccountID),
+		RowLimit:  rowLimitArg(p.Limit),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list audit entries: %w", err)
@@ -889,6 +891,21 @@ func accountIDArg(s string) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// rowLimitArg maps a ListAllParams.Limit (<= 0 = unlimited) to the
+// nullable LIMIT argument (#4017): nil binds LIMIT NULL, which Postgres
+// treats as LIMIT ALL. A limit beyond int32 saturates at math.MaxInt32
+// rather than wrapping negative.
+func rowLimitArg(n int) *int32 {
+	if n <= 0 {
+		return nil
+	}
+	v := int32(math.MaxInt32)
+	if n < math.MaxInt32 {
+		v = int32(n)
+	}
+	return &v
 }
 
 func rowToEntry(r auditdb.AuditEntry) *Entry {
