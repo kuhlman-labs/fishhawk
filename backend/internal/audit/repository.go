@@ -125,4 +125,13 @@ type ListAllParams struct {
 	// NULL-allow window); the user-facing audit-list handler passes the
 	// caller's Identity.AccountID.
 	AccountID string
+	// Limit caps the listing at the NEWEST Limit rows of the ts-descending
+	// order, pushed into the SQL (#4017). Zero (or negative) = unlimited,
+	// the pre-#4017 behaviour every existing caller keeps. The cap counts
+	// rows AFTER the Category/RunID/AccountID WHERE clause, so with
+	// AccountID set it counts the account's rows PLUS the NULL-account rows
+	// the #1829 window admits; a caller filtering further in-app (by
+	// repository, or by exact account equality) sees fewer than Limit rows
+	// even when the cap bit.
+	Limit int
 }

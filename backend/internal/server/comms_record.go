@@ -410,7 +410,23 @@ const (
 	commsDegradeSourceAudit                  = "audit"
 	commsDegradeSuppressionMemoryUnavailable = "suppression_memory_unavailable"
 	commsDegradeDraftFiledUnavailable        = "draft_filed_unavailable"
+	commsDegradeSuppressionMemoryTruncated   = "suppression_memory_truncated"
+	commsDegradeDraftFiledTruncated          = "draft_filed_truncated"
 )
+
+// commsMemoryMaxRows caps each suppression / draft-filed category read at the
+// NEWEST rows of the category (#4017, carried from #4014): the cap is pushed
+// into the SQL (audit.ListAllParams.Limit), so the read is bounded on a busy
+// deployment instead of competing with the gather budget. A var so a
+// NON-parallel test can shrink it.
+var commsMemoryMaxRows = 2000
+
+// commsMemoryDegrader is a memory-read error that names its own gather
+// degradation (*commsMemoryUnavailableError, *commsMemoryTruncatedError).
+type commsMemoryDegrader interface {
+	error
+	Degradation() commsGatherDegradation
+}
 
 // commsMemoryUnavailableError is the named degrade a suppression or
 // draft-filed read returns: the gather proceeds with empty memory (nothing is
@@ -431,23 +447,57 @@ func (e *commsMemoryUnavailableError) Degradation() commsGatherDegradation {
 	return commsGatherDegradation{Source: commsDegradeSourceAudit, Reason: e.Reason, Count: 1}
 }
 
-// listCommsCategoryForAccount reads EVERY row of category and keeps those
-// whose entry account equals accountID (nil matches only nil). The walk is
-// bounded by the category's rows, never by a count of prior runs, so an old
-// suppression survives any number of newer runs. ListAll's AccountID also
-// admits NULL-account rows (the #1829 window), so the equality filter here is
-// the account boundary, not the query.
-func (s *Server) listCommsCategoryForAccount(ctx context.Context, category, reason string, accountID *uuid.UUID) ([]*audit.Entry, error) {
+// commsMemoryTruncatedError is the named degrade a suppression or
+// draft-filed read returns ALONGSIDE its populated result when the category
+// read hit commsMemoryMaxRows: the gather keeps the partial (newest-rows)
+// memory and records Degradation(), whose count is the cap.
+type commsMemoryTruncatedError struct {
+	Reason string
+	Cap    int
+}
+
+func (e *commsMemoryTruncatedError) Error() string {
+	return fmt.Sprintf("comms gather: %s: the category read returned the %d-row cap; older rows were not read", e.Reason, e.Cap)
+}
+
+// Degradation is the payload and prompt degradation the error names.
+func (e *commsMemoryTruncatedError) Degradation() commsGatherDegradation {
+	return commsGatherDegradation{Source: commsDegradeSourceAudit, Reason: e.Reason, Count: e.Cap}
+}
+
+// listCommsCategoryForAccount reads the NEWEST commsMemoryMaxRows rows of
+// category and keeps those whose entry account equals accountID (nil matches
+// only nil). The walk is bounded by the category's rows, never by a count of
+// prior runs, so an old suppression survives any number of newer runs that
+// wrote no row of the category.
+//
+// The cap counts ACCOUNT-category rows, not per-repo rows: it is applied in
+// the SQL BEFORE the in-app filters, so rows of sibling repositories in the
+// account and the NULL-account rows ListAll's AccountID admits (the #1829
+// window) consume it, and a nil accountID leaves the query unconstrained, so
+// every account's rows of the category consume it. The equality filter here
+// is the account boundary, not the query. A listing that returns the cap
+// (exactly the cap included: the reader cannot tell "exactly cap rows exist"
+// from "more were cut", so it records the degradation, the honest direction)
+// returns the rows PLUS a *commsMemoryTruncatedError naming truncatedReason.
+// Truncation weakens BOTH consumers: a suppression older than the cap stops
+// suppressing at the gather, and the comms apply's double-filing guard
+// (filed_elsewhere) no longer sees a filing older than the cap.
+func (s *Server) listCommsCategoryForAccount(ctx context.Context, category, unavailableReason, truncatedReason string, accountID *uuid.UUID) ([]*audit.Entry, error) {
 	if s.cfg.AuditRepo == nil {
-		return nil, &commsMemoryUnavailableError{Reason: reason, Err: errors.New("audit repository not configured")}
+		return nil, &commsMemoryUnavailableError{Reason: unavailableReason, Err: errors.New("audit repository not configured")}
 	}
-	params := audit.ListAllParams{Category: &category}
+	params := audit.ListAllParams{Category: &category, Limit: commsMemoryMaxRows}
 	if accountID != nil {
 		params.AccountID = accountID.String()
 	}
 	entries, err := s.cfg.AuditRepo.ListAll(ctx, params)
 	if err != nil {
-		return nil, &commsMemoryUnavailableError{Reason: reason, Err: err}
+		return nil, &commsMemoryUnavailableError{Reason: unavailableReason, Err: err}
+	}
+	var truncated error
+	if commsMemoryMaxRows > 0 && len(entries) >= commsMemoryMaxRows {
+		truncated = &commsMemoryTruncatedError{Reason: truncatedReason, Cap: commsMemoryMaxRows}
 	}
 	var out []*audit.Entry
 	for _, e := range entries {
@@ -456,7 +506,7 @@ func (s *Server) listCommsCategoryForAccount(ctx context.Context, category, reas
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out, truncated
 }
 
 // sameAccount holds when a and b name the same account, or are both nil.
@@ -468,15 +518,16 @@ func sameAccount(a, b *uuid.UUID) bool {
 }
 
 // loadCommsSuppressionMemory returns the suppressions every prior
-// comms_apply_completed row for repo under accountID recorded. Undecodable
-// rows are skipped. A nil AuditRepo or a list failure returns empty memory
-// and a *commsMemoryUnavailableError (suppression_memory_unavailable).
+// comms_apply_completed row for repo under accountID recorded, within the
+// newest commsMemoryMaxRows rows of the category. Undecodable rows are
+// skipped. A nil AuditRepo or a list failure returns empty memory and a
+// *commsMemoryUnavailableError (suppression_memory_unavailable); a read that
+// hit the cap returns the memory built from the rows it read AND a
+// *commsMemoryTruncatedError (suppression_memory_truncated).
 func (s *Server) loadCommsSuppressionMemory(ctx context.Context, accountID *uuid.UUID, repo string) (commsSuppressionMemory, error) {
 	mem := commsSuppressionMemory{}
-	entries, err := s.listCommsCategoryForAccount(ctx, CategoryCommsApplyCompleted, commsDegradeSuppressionMemoryUnavailable, accountID)
-	if err != nil {
-		return mem, err
-	}
+	entries, err := s.listCommsCategoryForAccount(ctx, CategoryCommsApplyCompleted,
+		commsDegradeSuppressionMemoryUnavailable, commsDegradeSuppressionMemoryTruncated, accountID)
 	for _, e := range entries {
 		var rec commsApplyCompletedRecord
 		if json.Unmarshal(e.Payload, &rec) != nil || rec.Repo != repo {
@@ -486,17 +537,18 @@ func (s *Server) loadCommsSuppressionMemory(ctx context.Context, accountID *uuid
 			mem.add(sup)
 		}
 	}
-	return mem, nil
+	return mem, err
 }
 
 // loadCommsDraftFiled returns every comms_draft_filed record for repo under
-// accountID. Undecodable rows are skipped. A nil AuditRepo or a list failure
-// returns nil and a *commsMemoryUnavailableError (draft_filed_unavailable).
+// accountID, within the newest commsMemoryMaxRows rows of the category.
+// Undecodable rows are skipped. A nil AuditRepo or a list failure returns nil
+// and a *commsMemoryUnavailableError (draft_filed_unavailable); a read that
+// hit the cap returns the records it read AND a *commsMemoryTruncatedError
+// (draft_filed_truncated).
 func (s *Server) loadCommsDraftFiled(ctx context.Context, accountID *uuid.UUID, repo string) ([]commsDraftFiledRecord, error) {
-	entries, err := s.listCommsCategoryForAccount(ctx, CategoryCommsDraftFiled, commsDegradeDraftFiledUnavailable, accountID)
-	if err != nil {
-		return nil, err
-	}
+	entries, err := s.listCommsCategoryForAccount(ctx, CategoryCommsDraftFiled,
+		commsDegradeDraftFiledUnavailable, commsDegradeDraftFiledTruncated, accountID)
 	var out []commsDraftFiledRecord
 	for _, e := range entries {
 		var rec commsDraftFiledRecord
@@ -505,7 +557,7 @@ func (s *Server) loadCommsDraftFiled(ctx context.Context, accountID *uuid.UUID, 
 		}
 		out = append(out, rec)
 	}
-	return out, nil
+	return out, err
 }
 
 // commsFiledItemKey identifies a filed item: its issue number and comment id

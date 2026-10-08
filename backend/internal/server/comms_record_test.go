@@ -7,8 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -658,6 +661,245 @@ func TestLoadCommsDraftFiled_FiltersRepoAccountAndUndecodable(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].IssueNumber != 10 || len(got[0].Reports) != 1 || got[0].Reports[0] != rep {
 		t.Fatalf("draft-filed = %+v, want only issue 10", got)
+	}
+}
+
+// --- the #4017 row cap ------------------------------------------------------
+
+// commsCappedAudit wraps the shared auditFake: it records every
+// ListAllParams and, unlike the shared fake, HONOURS Limit by keeping the
+// NEWEST rows (ts descending), mirroring the Postgres repository's
+// pushed-down LIMIT (pinned there by TestPostgres_ListAll_Limit).
+type commsCappedAudit struct {
+	*auditFake
+	pmu    sync.Mutex
+	params []audit.ListAllParams
+}
+
+func (c *commsCappedAudit) ListAll(ctx context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
+	c.pmu.Lock()
+	c.params = append(c.params, p)
+	c.pmu.Unlock()
+	out, err := c.auditFake.ListAll(ctx, p)
+	if err != nil || p.Limit <= 0 {
+		return out, err
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Timestamp.After(out[j].Timestamp) })
+	if len(out) > p.Limit {
+		out = out[:p.Limit]
+	}
+	return out, nil
+}
+
+func (c *commsCappedAudit) captured() []audit.ListAllParams {
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
+	return append([]audit.ListAllParams(nil), c.params...)
+}
+
+// withCommsMemoryMaxRows shrinks the cap for one NON-parallel test.
+func withCommsMemoryMaxRows(t *testing.T, n int) {
+	t.Helper()
+	prev := commsMemoryMaxRows
+	commsMemoryMaxRows = n
+	t.Cleanup(func() { commsMemoryMaxRows = prev })
+}
+
+// commsCapSeed seeds one row of category per payload, the i-th at minute i,
+// so a later index is a NEWER row.
+func commsCapSeed(t *testing.T, au *auditFake, category string, account *uuid.UUID, payloads ...any) {
+	t.Helper()
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	for i, p := range payloads {
+		e := commsSeed(t, category, uuid.New(), account, p)
+		e.Timestamp = base.Add(time.Duration(i) * time.Minute)
+		au.seeded = append(au.seeded, e)
+	}
+}
+
+// TestListCommsCategory_PassesRowCap: both memory reads push
+// commsMemoryMaxRows into ListAllParams.Limit (with the category and the
+// run's account), so the bound is applied in the SQL rather than after a
+// full read.
+func TestListCommsCategory_PassesRowCap(t *testing.T) {
+	acct := uuid.New()
+	capped := &commsCappedAudit{auditFake: newAuditFake()}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: capped})
+	ctx := context.Background()
+	if _, err := s.loadCommsSuppressionMemory(ctx, &acct, commsTestRepo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.loadCommsDraftFiled(ctx, &acct, commsTestRepo); err != nil {
+		t.Fatal(err)
+	}
+	got := capped.captured()
+	if len(got) != 2 {
+		t.Fatalf("ListAll calls = %d, want 2", len(got))
+	}
+	for i, wantCat := range []string{CategoryCommsApplyCompleted, CategoryCommsDraftFiled} {
+		p := got[i]
+		if p.Category == nil || *p.Category != wantCat || p.AccountID != acct.String() {
+			t.Fatalf("call %d params = %+v, want category %s account %s", i, p, wantCat, acct)
+		}
+		if p.Limit != commsMemoryMaxRows || p.Limit <= 0 {
+			t.Fatalf("call %d Limit = %d, want the row cap %d", i, p.Limit, commsMemoryMaxRows)
+		}
+	}
+}
+
+// commsAssertTruncated asserts err is the named truncation degrade.
+func commsAssertTruncated(t *testing.T, err error, reason string, capRows int) {
+	t.Helper()
+	var tr *commsMemoryTruncatedError
+	if !errors.As(err, &tr) {
+		t.Fatalf("err = %v, want *commsMemoryTruncatedError", err)
+	}
+	var d commsMemoryDegrader
+	if !errors.As(err, &d) {
+		t.Fatal("a truncation error must satisfy commsMemoryDegrader")
+	}
+	want := commsGatherDegradation{Source: commsDegradeSourceAudit, Reason: reason, Count: capRows}
+	if d.Degradation() != want {
+		t.Fatalf("Degradation() = %+v, want %+v", d.Degradation(), want)
+	}
+	if !strings.Contains(err.Error(), reason) || !strings.Contains(err.Error(), fmt.Sprint(capRows)) {
+		t.Fatalf("Error() = %q, want the reason and the cap named", err.Error())
+	}
+}
+
+// TestLoadCommsSuppressionMemory_TruncatedDegradesNamed: five apply rows
+// under a cap of three — the memory carries the three NEWEST rows'
+// suppressions (the partial memory is kept, not discarded) AND the read
+// names suppression_memory_truncated with count = cap.
+func TestLoadCommsSuppressionMemory_TruncatedDegradesNamed(t *testing.T) {
+	withCommsMemoryMaxRows(t, 3)
+	h := strings.Repeat("1", 64)
+	capped := &commsCappedAudit{auditFake: newAuditFake()}
+	var rows []any
+	for i := 1; i <= 5; i++ {
+		rows = append(rows, applyRow(commsTestRepo, commsSuppression{ID: fmt.Sprintf("UR-issue-%d", i), Hash: h, Basis: commsSuppressionBasisFiled}))
+	}
+	commsCapSeed(t, capped.auditFake, CategoryCommsApplyCompleted, nil, rows...)
+	mem, err := New(Config{Addr: "127.0.0.1:0", AuditRepo: capped}).loadCommsSuppressionMemory(context.Background(), nil, commsTestRepo)
+	commsAssertTruncated(t, err, commsDegradeSuppressionMemoryTruncated, 3)
+	for i := 1; i <= 5; i++ {
+		_, ok := mem.lookup(fmt.Sprintf("UR-issue-%d", i), h)
+		if want := i >= 3; ok != want {
+			t.Fatalf("UR-issue-%d suppressed = %v, want %v (only the 3 newest rows are read)", i, ok, want)
+		}
+	}
+}
+
+// TestLoadCommsDraftFiled_TruncatedDegradesNamed: the draft-filed read keeps
+// the three NEWEST records and names draft_filed_truncated.
+func TestLoadCommsDraftFiled_TruncatedDegradesNamed(t *testing.T) {
+	withCommsMemoryMaxRows(t, 3)
+	capped := &commsCappedAudit{auditFake: newAuditFake()}
+	var rows []any
+	for i := 1; i <= 5; i++ {
+		rows = append(rows, commsDraftFiledRecord{Repo: commsTestRepo, IssueNumber: 100 + i})
+	}
+	commsCapSeed(t, capped.auditFake, CategoryCommsDraftFiled, nil, rows...)
+	got, err := New(Config{Addr: "127.0.0.1:0", AuditRepo: capped}).loadCommsDraftFiled(context.Background(), nil, commsTestRepo)
+	commsAssertTruncated(t, err, commsDegradeDraftFiledTruncated, 3)
+	var nums []int
+	for _, r := range got {
+		nums = append(nums, r.IssueNumber)
+	}
+	if fmt.Sprint(nums) != fmt.Sprint([]int{105, 104, 103}) {
+		t.Fatalf("draft-filed issue numbers = %v, want the 3 newest [105 104 103]", nums)
+	}
+}
+
+// TestLoadCommsSuppressionMemory_BelowCapNoDegrade: a read under the cap
+// names nothing; a read returning EXACTLY the cap records the truncation
+// (the reader cannot tell it from a cut read — the honest direction).
+func TestLoadCommsSuppressionMemory_BelowCapNoDegrade(t *testing.T) {
+	withCommsMemoryMaxRows(t, 3)
+	h := strings.Repeat("2", 64)
+	row := func(id string) any {
+		return applyRow(commsTestRepo, commsSuppression{ID: id, Hash: h, Basis: commsSuppressionBasisRejected})
+	}
+	below := &commsCappedAudit{auditFake: newAuditFake()}
+	commsCapSeed(t, below.auditFake, CategoryCommsApplyCompleted, nil, row("UR-issue-1"), row("UR-issue-2"))
+	mem, err := New(Config{Addr: "127.0.0.1:0", AuditRepo: below}).loadCommsSuppressionMemory(context.Background(), nil, commsTestRepo)
+	if err != nil {
+		t.Fatalf("below-cap read err = %v, want nil", err)
+	}
+	if len(mem) != 2 {
+		t.Fatalf("below-cap memory = %+v, want both rows", mem)
+	}
+	at := &commsCappedAudit{auditFake: newAuditFake()}
+	commsCapSeed(t, at.auditFake, CategoryCommsApplyCompleted, nil, row("UR-issue-1"), row("UR-issue-2"), row("UR-issue-3"))
+	mem, err = New(Config{Addr: "127.0.0.1:0", AuditRepo: at}).loadCommsSuppressionMemory(context.Background(), nil, commsTestRepo)
+	commsAssertTruncated(t, err, commsDegradeSuppressionMemoryTruncated, 3)
+	if len(mem) != 3 {
+		t.Fatalf("at-cap memory = %+v, want all three rows", mem)
+	}
+}
+
+// TestLoadCommsSuppressionMemory_CapCountsSiblingRepoRows (approval
+// condition 7): the cap counts ACCOUNT-category rows before the in-app repo
+// filter, so newer rows of a SIBLING repository consume it and the run's own
+// older suppression is not read — with the truncation named.
+func TestLoadCommsSuppressionMemory_CapCountsSiblingRepoRows(t *testing.T) {
+	withCommsMemoryMaxRows(t, 3)
+	h := strings.Repeat("3", 64)
+	capped := &commsCappedAudit{auditFake: newAuditFake()}
+	own := applyRow(commsTestRepo, commsSuppression{ID: "UR-issue-1", Hash: h, Basis: commsSuppressionBasisFiled})
+	sib := applyRow("acme/sibling", commsSuppression{ID: "UR-issue-9", Hash: h, Basis: commsSuppressionBasisFiled})
+	commsCapSeed(t, capped.auditFake, CategoryCommsApplyCompleted, nil, own, sib, sib, sib)
+	mem, err := New(Config{Addr: "127.0.0.1:0", AuditRepo: capped}).loadCommsSuppressionMemory(context.Background(), nil, commsTestRepo)
+	commsAssertTruncated(t, err, commsDegradeSuppressionMemoryTruncated, 3)
+	if len(mem) != 0 {
+		t.Fatalf("memory = %+v, want empty: three newer sibling-repo rows consumed the cap", mem)
+	}
+}
+
+// TestCommsScan_TruncatedMemoryRecordedOnGather: a gather whose suppression
+// read hits the cap records suppression_memory_truncated (count = cap) on the
+// comms_scan_gathered payload and in the prompt's coverage block, AND still
+// applies the partial memory it read — a report matched by a returned (newest)
+// suppression stays suppressed while one whose suppression lay past the cap
+// is shown.
+func TestCommsScan_TruncatedMemoryRecordedOnGather(t *testing.T) {
+	withCommsMemoryMaxRows(t, 3)
+	var capped *commsCappedAudit
+	f := newCSFixture(t, func(c *Config) {
+		capped = &commsCappedAudit{auditFake: c.AuditRepo.(*auditFake)}
+		c.AuditRepo = capped
+	})
+	a := csIssue(1, "Crash on save", "a", csBase.Add(1*time.Minute), commsExternalAuthor)
+	old := csIssue(2, "Sync is slow", "b", csBase.Add(2*time.Minute), commsExternalAuthor)
+	f.reader.items = []workmgmt.UserReportItem{a, old}
+	sup := func(it workmgmt.UserReportItem) commsSuppression {
+		return commsSuppression{ID: prompt.UserReportID(string(it.Kind), it.IssueNumber, 0),
+			Hash: userreport.ContentHash(it.Kind, it.Title, it.Body), Basis: commsSuppressionBasisRejected}
+	}
+	pad := applyRow(commsTestRepo, commsSuppression{ID: "UR-issue-77", Hash: strings.Repeat("4", 64), Basis: commsSuppressionBasisFiled})
+	// Oldest row suppresses `old` (past the cap); the newest suppresses `a`.
+	commsCapSeed(t, f.au, CategoryCommsApplyCompleted, nil,
+		applyRow(commsTestRepo, sup(old)), pad, pad, pad, applyRow(commsTestRepo, sup(a)))
+
+	cc, g := f.gather(t)
+	want := commsGatherDegradation{Source: commsDegradeSourceAudit, Reason: commsDegradeSuppressionMemoryTruncated, Count: 3}
+	found := false
+	for _, d := range g.Payload.Degradations {
+		if d == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("payload degradations %+v lack %+v", g.Payload.Degradations, want)
+	}
+	if line := "- degraded source audit: reason suppression_memory_truncated, count 3"; !strings.Contains(csBuild(t, cc), line) {
+		t.Fatalf("prompt coverage block lacks %q", line)
+	}
+	if got := csShownIDs(g); !csEqual(got, []string{"UR-issue-2"}) {
+		t.Fatalf("shown = %v, want only UR-issue-2 (UR-issue-1 suppressed by the partial memory; UR-issue-2's suppression lay past the cap)", got)
+	}
+	if len(capped.captured()) == 0 {
+		t.Fatal("the gather never read through the capped repository (fixture precondition)")
 	}
 }
 
