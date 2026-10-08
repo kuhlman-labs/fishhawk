@@ -25,6 +25,17 @@ The `IdentityProvider` interface (`identity.go`) speaks provider-qualified subje
 
 **The NoOp is never a configured provider.** It satisfies `IdentityProvider` so an unconfigured backend has something inert to hold, but it authenticates nobody. Counting non-nil interface values would advertise it as a forge and hand a client a provider from which every `VerifyAccessToken` returns `ErrNotConfigured` — the "advertises a provider that cannot authenticate anyone" state binding constraint 8 forbids. Enumerate through `IsConfigured`.
 
+### Approver allow-list matching: `CanonicalMember` / `SubjectListed` (#4116)
+
+The ONE implementation of the workflow spec's `approvals.members` rule; the server's approval gate (`checkApprovalPredicates` pre-Submit, `filterListedSubjects` at count time) and `fishhawkd approver-members` both call it, so the gate and the dry-run inventory cannot disagree.
+
+1. A member with a provider prefix (`ProviderOf(m) != ""`, e.g. `github:kuhlman-labs`) is used **verbatim**.
+2. A plain member (`alice`) is qualified with the RUN's forge family: `CanonicalMember("alice", "github") == "github:alice"`.
+3. The SUBJECT is **never** qualified and must already be a FORGE identity (`github:` / `gitlab:`). A plain subject (a static API token such as `brett@local-mcp`, `operator-agent/...`, `anonymous`) and a non-forge-qualified one (the run-bound MCP subject `mcp:run:<uuid>`) match no member — even one spelled identically. This is the 2026-10-08 ruling that approver gates take the forge-verified `github:<login>` identity, never a static MCP-token subject, and mirrors `gitLabLoginFromSubject`'s refusal of an unqualified bare login.
+4. Byte-exact comparison after 1/2: no case folding, no trimming — a casing mismatch refuses, never admits.
+
+An empty list or empty subject returns `false`; "empty list = no restriction" is the CALLER's decision (it must not call `SubjectListed` then). Pinned by `TestSubjectListed` / `TestCanonicalMember`; the static-subject and `mcp:run:` rows are the counterfactual vehicle for rule 3 (qualifying the subject turns them true).
+
 ## GitLab implementation (`gitlab.go`, E66.4 / #2392)
 
 `GitLabIdentityProvider` is the co-equal sibling of the GitHub one against a configurable GitLab base URL (SaaS or self-managed). Unlike GitHub, the OAuth endpoints and the REST API hang off the SAME host, so the provider carries one `baseURL` rather than an api/oauth pair. Constructed with `NewGitLabIdentityProvider(baseURL, deviceClientID, token)`; an empty base URL falls back to `DefaultGitLabBaseURL` and trailing slashes are trimmed. Concurrent use is safe — the struct holds only immutable config, and the production `token` accessor is a closure over an immutable captured string (no round-trip, no lock), deliberately unlike GitHub's `operatorRepoToken`.

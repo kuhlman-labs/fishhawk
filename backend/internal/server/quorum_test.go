@@ -862,6 +862,31 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 			t.Errorf("%s must be omitted when unset: %s", k, rawBelow)
 		}
 	}
+	// The additive approvals.members fields (#4116) drop when unset, so a
+	// gate without members serialises byte-identically.
+	for _, k := range []string{"members", "members_principal", "members_listed"} {
+		if _, ok := mb[k]; ok {
+			t.Errorf("%s must be omitted when unset: %s", k, rawBelow)
+		}
+	}
+	// ... and are present when a members gate recorded them.
+	listed := true
+	withMembers := &predicateSnapshot{
+		CountRequired: 1, CountEligible: 1, Identity: snapshotIdentityFor("github:alice"),
+		SubmitterClass: "eligible", Channel: "api", QuorumReached: true,
+		Members: []string{"github:alice", "bob"}, MembersPrincipal: "github:alice", MembersListed: &listed,
+	}
+	rawMembers, _ := json.Marshal(withMembers)
+	var mm map[string]any
+	if err := json.Unmarshal(rawMembers, &mm); err != nil {
+		t.Fatalf("unmarshal members: %v", err)
+	}
+	if got, _ := mm["members"].([]any); len(got) != 2 || got[0] != "github:alice" || got[1] != "bob" {
+		t.Errorf("members = %v, want the declared list verbatim: %s", mm["members"], rawMembers)
+	}
+	if mm["members_principal"] != "github:alice" || mm["members_listed"] != true {
+		t.Errorf("members_principal=%v members_listed=%v, want github:alice / true", mm["members_principal"], mm["members_listed"])
+	}
 
 	// A resolved snapshot carries resolved_permission, member_resolved, and
 	// predicate_result.
@@ -1579,5 +1604,72 @@ func TestApproveStageAs_Escalation_PostSubmitResolverError_FailsClosed(t *testin
 	}
 	if len(rr.transitions) != 0 {
 		t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
+	}
+}
+
+// TestFilterListedSubjects pins the COUNT-TIME members filter (#4116): only
+// listed subjects survive (order preserved), plain members take the run's
+// forge, a non-forge subject never survives, and an empty list is no
+// restriction.
+func TestFilterListedSubjects(t *testing.T) {
+	tests := []struct {
+		name     string
+		subjects []string
+		members  []string
+		forge    string
+		want     []string
+	}{
+		{"keeps only listed", []string{"github:alice", "github:mallory", "github:bob"}, []string{"github:bob", "github:alice"}, identity.ProviderGitHub, []string{"github:alice", "github:bob"}},
+		{"plain member qualified by run forge", []string{"github:alice", "gitlab:alice"}, []string{"alice"}, identity.ProviderGitLab, []string{"gitlab:alice"}},
+		{"static subject never survives", []string{"brett@local-mcp"}, []string{"brett@local-mcp"}, identity.ProviderGitHub, []string{}},
+		{"nothing listed", []string{"github:mallory"}, []string{"github:alice"}, identity.ProviderGitHub, []string{}},
+		{"empty list is no restriction", []string{"github:mallory", "brett@local-mcp"}, nil, identity.ProviderGitHub, []string{"github:mallory", "brett@local-mcp"}},
+		{"no subjects", nil, []string{"github:alice"}, identity.ProviderGitHub, []string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterListedSubjects(tc.subjects, tc.members, tc.forge)
+			if len(got) != len(tc.want) {
+				t.Fatalf("filterListedSubjects = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("filterListedSubjects[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestApprovalPrincipal_NonCaptainBranches pins the identity the members list
+// is evaluated against for every branch that needs no captain store (#4116).
+// The delegated agent-kind (captain) branches need the real *captain.Store and
+// live in approval_members_pg_test.go.
+func TestApprovalPrincipal_NonCaptainBranches(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	agent := operatorrole.TokenSubjectPrefix + "driver"
+	tests := []struct {
+		name      string
+		subject   string
+		delegated bool
+		want      string
+	}{
+		{"non-delegated human is the subject", "github:alice", false, "github:alice"},
+		{"non-delegated static subject is itself", "brett@local-mcp", false, "brett@local-mcp"},
+		{"non-delegated agent-kind is itself (and lists nowhere)", agent, false, agent},
+		{"delegated human is the on_behalf_of operator, never the synthetic subject", "github:alice", true, "github:alice"},
+		{"delegated agent-kind with no captain store is empty (fail-closed)", agent, true, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.approvalPrincipal(context.Background(), stage, tc.subject, tc.delegated)
+			if got != tc.want {
+				t.Errorf("approvalPrincipal(%q, delegated=%v) = %q, want %q", tc.subject, tc.delegated, got, tc.want)
+			}
+			if got == operatorrole.DelegatedApprovalActorSubject {
+				t.Errorf("approvalPrincipal returned the synthetic delegated subject %q", got)
+			}
+		})
 	}
 }

@@ -1032,3 +1032,38 @@ func TestEscalationFiredAudit_FiredKeyStableAcrossDeclarationReordering(t *testi
 			first.FiredKeys[0], second.FiredKeys[0])
 	}
 }
+
+// TestEffectiveApprovals_MembersFromBaselineOnly pins that approvals.members
+// (#4116) is carried from the gate's BASELINE only: a firing count + member_of
+// escalation leaves it equal to the baseline (an escalation cannot widen it —
+// ComposedRequirements has no members field at all), and the returned slice is
+// a fresh copy, so mutating it never reaches the cached parsed spec.
+func TestEffectiveApprovals_MembersFromBaselineOnly(t *testing.T) {
+	n := func(i int) *int { return &i }
+	base := &spec.Approvals{Count: n(1), Members: []string{"github:alice", "bob"}}
+
+	t.Run("a firing escalation leaves members at the baseline", func(t *testing.T) {
+		got := effectiveApprovals(base, spec.ComposedRequirements{Count: n(2), MemberOf: []string{"acme/security"}})
+		if len(got.members) != 2 || got.members[0] != "github:alice" || got.members[1] != "bob" {
+			t.Errorf("members = %v, want the baseline [github:alice bob]", got.members)
+		}
+		if got.count != 2 || len(got.memberOf) != 1 {
+			t.Errorf("count=%d memberOf=%v, want the escalation applied to the other dimensions", got.count, got.memberOf)
+		}
+	})
+	t.Run("the returned slice does not alias base.Members", func(t *testing.T) {
+		got := effectiveApprovals(base, spec.ComposedRequirements{})
+		got.members[0] = "github:mallory"
+		if base.Members[0] != "github:alice" {
+			t.Errorf("base.Members[0] = %q after mutating the effective copy, want github:alice (aliased)", base.Members[0])
+		}
+	})
+	t.Run("no baseline members is no restriction", func(t *testing.T) {
+		if got := effectiveApprovals(&spec.Approvals{Count: n(1)}, spec.ComposedRequirements{}); len(got.members) != 0 {
+			t.Errorf("members = %v, want empty", got.members)
+		}
+		if got := effectiveApprovals(nil, spec.ComposedRequirements{Count: n(2)}); len(got.members) != 0 {
+			t.Errorf("nil baseline members = %v, want empty", got.members)
+		}
+	})
+}

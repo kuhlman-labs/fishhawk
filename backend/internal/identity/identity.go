@@ -112,6 +112,64 @@ func ProviderOf(subject string) string {
 	return subject[:i]
 }
 
+// isForgeProvider reports whether provider names a forge whose subjects the
+// identity layer stamps from a forge-verified login (github / gitlab). Any
+// other provider — the run-bound MCP token's "mcp:run:<uuid>", or a
+// hand-spelled "x:y" static subject — is not a forge identity.
+func isForgeProvider(provider string) bool {
+	return provider == ProviderGitHub || provider == ProviderGitLab
+}
+
+// CanonicalMember returns the canonical form of one approvals.members entry
+// (#4116). A member that already carries a provider prefix
+// (ProviderOf(member) != "", e.g. "github:kuhlman-labs") is returned
+// VERBATIM; a plain member ("alice") is qualified with forge, the RUN's forge
+// family, so "alice" on a GitHub run is "github:alice". An empty member stays
+// empty (it can never match a subject). No case folding, no trimming: the
+// result is compared byte-exact, so a casing mismatch refuses, never admits.
+func CanonicalMember(member, forge string) string {
+	if member == "" || ProviderOf(member) != "" {
+		return member
+	}
+	return forge + ":" + member
+}
+
+// SubjectListed reports whether subject is on the approvals.members allow-list
+// for a run on forge (#4116). The rule, in order:
+//
+//  1. a provider-qualified member is used verbatim (CanonicalMember);
+//  2. a plain member is qualified with the run's forge family (CanonicalMember);
+//  3. the SUBJECT is NEVER qualified, and must already be a FORGE identity
+//     (a github: or gitlab: subject). A plain subject — a static API token
+//     such as "brett@local-mcp", an agent subject "operator-agent/...",
+//     "anonymous" — and a non-forge-qualified one such as the run-bound MCP
+//     subject "mcp:run:<uuid>" are not forge identities and match no member,
+//     even one spelled identically;
+//  4. the comparison is byte-exact after steps 1/2 — no case folding, no
+//     trimming — so a mismatch refuses and never admits.
+//
+// Rule 3 implements the 2026-10-08 ruling that approver gates take the
+// forge-verified "github:<login>" identity and never a static MCP-token
+// subject. It mirrors gitLabLoginFromSubject, which already refuses an
+// unqualified bare login as not provably a forge account. An empty list or an
+// empty subject returns false: an empty list is "no restriction", which is the
+// CALLER's decision (it must not consult SubjectListed then), never "everyone
+// is listed".
+func SubjectListed(members []string, subject, forge string) bool {
+	if len(members) == 0 || subject == "" {
+		return false
+	}
+	if !isForgeProvider(ProviderOf(subject)) {
+		return false
+	}
+	for _, m := range members {
+		if CanonicalMember(m, forge) == subject {
+			return true
+		}
+	}
+	return false
+}
+
 // IsConfigured reports whether p is a provider that can actually
 // authenticate somebody. It is false for a nil interface, for a
 // typed-nil concrete provider, and for *NoOpIdentityProvider — the
