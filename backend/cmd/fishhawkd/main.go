@@ -11,6 +11,7 @@
 //	fishhawkd oauth client register|list|remove  pre-register / inventory / remove OAuth clients (#2438)
 //	fishhawkd decision-index backfill|check  rebuild / gap-check the derived decision index (#3730)
 //	fishhawkd precedent-tuning --repo R      replay the divergence threshold over recorded decisions (#3733)
+//	fishhawkd approver-members --spec F      dry-run approvals.members against recorded approvers (#4116)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -50,6 +51,8 @@ func run(args []string, logSink io.Writer) int {
 		return runDecisionIndex(rest, logSink)
 	case "precedent-tuning":
 		return runPrecedentTuning(rest, logSink)
+	case "approver-members":
+		return runApproverMembers(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
 	case "account":
@@ -85,7 +88,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -106,6 +109,7 @@ func printUsage(w io.Writer) {
 		"  decision-index backfill  Reconstruct the derived decision index from the audit chain (--rebuild, --dry-run; #3730).",
 		"  decision-index check     Report decision-bearing entries with no index row; exits 1 on a gap.",
 		"  precedent-tuning         Replay the divergence threshold over a repo's decision history for a grid of (N, X, window) candidates (#3733).",
+		"  approver-members         Dry-run approvals.members: evaluate recorded approvers against a spec's members gates; exits 1 if any human would be refused (#4116).",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}
