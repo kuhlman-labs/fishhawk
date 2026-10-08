@@ -4757,6 +4757,7 @@ func TestShipPlan_EverySiblingSettlesItsStage(t *testing.T) {
 		plan.ArtifactKindClarificationRequest: {validClarificationBytes, run.StageStateAwaitingInput, nil},
 		plan.ArtifactKindGroomingReport:       {validGroomingReportBytes, run.StageStateAwaitingApproval, nil},
 		plan.ArtifactKindUpkeepReport:         {upkeepExampleBody, run.StageStateAwaitingApproval, newUpkeepSettleServer},
+		plan.ArtifactKindCommsReport:          {commsExampleBody, run.StageStateAwaitingApproval, newCommsSettleServer},
 	}
 
 	for _, kind := range plan.AllArtifactKinds() {
@@ -4797,6 +4798,40 @@ func TestShipPlan_EverySiblingSettlesItsStage(t *testing.T) {
 	}
 }
 
+// newCommsSettleServer is the comms_report settle-row hook for
+// TestShipPlan_EverySiblingSettlesItsStage (#4015): a user-report-scan run
+// whose plan stage is stageID (its cached spec declares produces:
+// comms_report), a comms_scan_gathered row for that stage matching the
+// example's shown and charter ids, the preview conventions and a fake
+// provider. It returns the multi-run wrapper's embedded promptRunRepo, whose
+// getStages the settle table reads.
+func newCommsSettleServer(t *testing.T, runID, stageID uuid.UUID) (*Server, *signingFake, *promptRunRepo) {
+	t.Helper()
+	registerFakeProvider(t, &fakeWorkProvider{})
+	installConventions(t, commsPreviewConventions(), nil)
+	rr := newUpkeepRunRepo()
+	inst := int64(4242)
+	rr.seedRun(&run.Run{ID: runID, Repo: upkeepTestRepo, InstallationID: &inst,
+		WorkflowID: "user_report_scan", WorkflowSpec: userReportScanSpec(t), State: run.StateRunning})
+	planStage := &run.Stage{ID: stageID, RunID: runID, Sequence: 0, Type: run.StageTypePlan,
+		State: run.StageStateRunning, RequiresApproval: true}
+	rr.getStages[stageID] = planStage
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	au := newAuditFake()
+	g := commsExampleGather().normalized()
+	g.StageID = stageID
+	g.GatherDigest = commsGatherDigest(g)
+	e := commsSeed(t, CategoryCommsScanGathered, runID, nil, g)
+	e.StageID, e.Sequence = &stageID, 1
+	au.seeded = append(au.seeded, e)
+	sf := newSigningFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: au, RunRepo: rr,
+	})
+	return s, sf, rr.promptRunRepo
+}
+
 // TestShipPlan_UnknownKindDiscriminator_FallsThroughToPlanPath pins the
 // discriminator's FALL-THROUGH after #2235 turned the single
 // clarification_request branch into a switch over three artifact kinds. A
@@ -4817,7 +4852,8 @@ func TestShipPlan_UnknownKindDiscriminator_FallsThroughToPlanPath(t *testing.T) 
 	}
 	raw := w.Body.String()
 	if strings.Contains(raw, "grooming_report_invalid") || strings.Contains(raw, "clarification_request_invalid") ||
-		strings.Contains(raw, "upkeep_report_invalid") || strings.Contains(raw, "upkeep_report_stage_invalid") {
+		strings.Contains(raw, "upkeep_report_invalid") || strings.Contains(raw, "upkeep_report_stage_invalid") ||
+		strings.Contains(raw, "comms_report_invalid") || strings.Contains(raw, "comms_report_stage_invalid") {
 		t.Errorf("an unknown kind must take the PLAN path, not a sibling handler: %s", raw)
 	}
 	if !strings.Contains(raw, "plan_invalid") {

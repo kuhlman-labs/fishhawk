@@ -661,6 +661,9 @@ func TestUpkeepReportIngest_RunRefTransportError500(t *testing.T) {
 // the binding's branch was reached rather than the middleware's.
 func TestUpkeepReportIngest_BindingTransportError500(t *testing.T) {
 	f, repo := newUpkeepLateGetRunFailFixture(t)
+	// An upkeep_report is outside the comms guard's allowlist, so that guard
+	// (#4015) reads the run too: the third read is the handler's binding.
+	repo.from = 3
 	code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t))
 	if code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500: %v", code, resp)
@@ -668,8 +671,8 @@ func TestUpkeepReportIngest_BindingTransportError500(t *testing.T) {
 	if msg := upkeepErrorMessage(resp); msg != "resolve the stage's upkeep_report declaration failed" {
 		t.Errorf("message = %q, want the binding step's", msg)
 	}
-	if n := repo.getRunCalls(); n != 2 {
-		t.Errorf("reporting-run GetRun calls = %d, want 2 (the middleware's, then the failed binding read)", n)
+	if n := repo.getRunCalls(); n != 3 {
+		t.Errorf("reporting-run GetRun calls = %d, want 3 (the middleware's, the comms guard's, then the failed binding read)", n)
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
@@ -735,6 +738,9 @@ func TestUpkeepStageGuard_EveryKindClassified(t *testing.T) {
 		plan.ArtifactKindClarificationRequest: {validClarificationBytes, http.StatusCreated, "", artifact.KindPlan, 0, run.StageStateAwaitingInput},
 		// Allowlisted: the declared artifact.
 		plan.ArtifactKindUpkeepReport: {upkeepExampleBody, http.StatusCreated, "", artifact.KindUpkeepReport, 1, run.StageStateAwaitingApproval},
+		// (g5) a comms_report (#4015): refused through the plan_invalid tail
+		// before the comms handler is reached, never stored.
+		plan.ArtifactKindCommsReport: {commsExampleBody, http.StatusBadRequest, "plan_invalid", artifact.KindCommsReport, 0, run.StageStateFailed},
 	}
 	for _, kind := range plan.AllArtifactKinds() {
 		row, ok := rows[kind]

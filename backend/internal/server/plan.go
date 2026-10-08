@@ -334,7 +334,9 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// a plan. It is persisted as an artifact + a grooming_report_recorded audit
 	// entry rather than validated as a plan.
 	// An upkeep_report (#3921) is the THIRD sibling, bound at ingest to the
-	// stage's `produces: upkeep_report` declaration (handleUpkeepReport).
+	// stage's `produces: upkeep_report` declaration (handleUpkeepReport), and a
+	// comms_report (#4015) the FOURTH, bound to `produces: comms_report` and
+	// to the stage's comms_scan_gathered row (handleCommsReport).
 	kind, derr := plan.DetectArtifactKind(body)
 	if derr != nil {
 		kind = plan.ArtifactKindPlan // the plan path owns the ParseError
@@ -347,6 +349,13 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	if s.guardUpkeepStageProposal(w, r, runID, stageID, stage, kind, body, derr) {
 		return
 	}
+	// The comms twin (#4015): a stage declaring produces: comms_report may
+	// ship only the kinds on commsStageAllowedKinds. A comms_report on an
+	// upkeep stage is refused by the guard above; an upkeep_report on a comms
+	// stage by this one.
+	if s.guardCommsStageProposal(w, r, runID, stageID, stage, kind, body, derr) {
+		return
+	}
 	if derr == nil {
 		switch kind {
 		case plan.ArtifactKindClarificationRequest:
@@ -357,6 +366,9 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			return
 		case plan.ArtifactKindUpkeepReport:
 			s.handleUpkeepReport(w, r, runID, stageID, stage, body)
+			return
+		case plan.ArtifactKindCommsReport:
+			s.handleCommsReport(w, r, runID, stageID, stage, body)
 			return
 		}
 	}

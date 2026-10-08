@@ -220,12 +220,28 @@ func decodeCommsScanGathered(raw json.RawMessage) (*commsScanGatheredPayload, er
 	return &p, nil
 }
 
+// errCommsScanUnbound marks a latestCommsScanGathered failure that means the
+// stage has no usable gather — no row for the stage, an undecodable latest
+// row, or a row naming another stage — as opposed to a store that did not
+// answer. The comms_report ingest maps it to 400 comms_report_stage_invalid
+// reason scan_context_absent (#4015); every other error is a 500.
+var errCommsScanUnbound = errors.New("comms scan: no usable comms_scan_gathered row for the stage")
+
+// commsScanUnboundError carries err's message unchanged while matching both
+// errCommsScanUnbound and err under errors.Is / errors.As.
+type commsScanUnboundError struct{ err error }
+
+func (e *commsScanUnboundError) Error() string { return e.err.Error() }
+
+func (e *commsScanUnboundError) Unwrap() []error { return []error{errCommsScanUnbound, e.err} }
+
 // latestCommsScanGathered returns the stage's highest-sequence
 // comms_scan_gathered row and its strictly decoded payload. Rows are selected
 // by the entry's server-written stage column; ties on sequence go to the later
 // listed row. The selected row must decode and name the same stage, and no row
 // for the stage is an error — phases 5 and 7 bind to what was served, never
-// to a guess.
+// to a guess. Those three legs wrap errCommsScanUnbound; a nil AuditRepo or a
+// list failure does not (the store did not answer).
 func (s *Server) latestCommsScanGathered(ctx context.Context, runID, stageID uuid.UUID) (*audit.Entry, *commsScanGatheredPayload, error) {
 	if s.cfg.AuditRepo == nil {
 		return nil, nil, errors.New("latest comms scan: audit repository not configured")
@@ -244,14 +260,14 @@ func (s *Server) latestCommsScanGathered(ctx context.Context, runID, stageID uui
 		}
 	}
 	if latest == nil {
-		return nil, nil, fmt.Errorf("latest comms scan: no %s row for stage %s", CategoryCommsScanGathered, stageID)
+		return nil, nil, &commsScanUnboundError{fmt.Errorf("latest comms scan: no %s row for stage %s", CategoryCommsScanGathered, stageID)}
 	}
 	p, err := decodeCommsScanGathered(latest.Payload)
 	if err != nil {
-		return nil, nil, fmt.Errorf("latest comms scan: %w", err)
+		return nil, nil, &commsScanUnboundError{fmt.Errorf("latest comms scan: %w", err)}
 	}
 	if p.StageID != stageID {
-		return nil, nil, fmt.Errorf("latest comms scan: row names stage %s, want %s", p.StageID, stageID)
+		return nil, nil, &commsScanUnboundError{fmt.Errorf("latest comms scan: row names stage %s, want %s", p.StageID, stageID)}
 	}
 	return latest, p, nil
 }

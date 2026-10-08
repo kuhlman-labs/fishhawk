@@ -332,6 +332,10 @@ const (
 	// maintenance findings a `plan`-typed PROPOSE stage declaring
 	// `produces: upkeep_report` emits instead of a plan.
 	ArtifactKindUpkeepReport ArtifactKind = "upkeep_report"
+	// ArtifactKindCommsReport is the comms_report sibling (#4015, E81.5): the
+	// draft issues a `plan`-typed PROPOSE stage declaring
+	// `produces: comms_report` emits after reading the gathered user reports.
+	ArtifactKindCommsReport ArtifactKind = "comms_report"
 )
 
 // AllArtifactKinds returns every ArtifactKind the plan stage can produce.
@@ -352,6 +356,7 @@ func AllArtifactKinds() []ArtifactKind {
 		ArtifactKindClarificationRequest,
 		ArtifactKindGroomingReport,
 		ArtifactKindUpkeepReport,
+		ArtifactKindCommsReport,
 	}
 }
 
