@@ -26,7 +26,10 @@ var probeNetSandbox = netsandbox.Probe
 // is wrapped in the Seatbelt net sandbox and logs exactly ONE event per
 // branch. proxyURL is the running egress proxy's URL (the profile admits its
 // port); allowHosts is the proxy's composed allow-list, of which only the
-// loopback entries are admitted direct. A non-empty failReason is a
+// loopback entries are admitted direct. iso is the resolved credential
+// isolation (#3792): only while iso.active does the profile carry
+// netsandbox.WithCredentialDeny(iso.deny), so under off the profile is
+// byte-identical to the network-only one. A non-empty failReason is a
 // category-C stage failure the caller reports BEFORE any spawn.
 //
 // Branches (each asserted by acceptancesandbox_test.go):
@@ -36,10 +39,17 @@ var probeNetSandbox = netsandbox.Probe
 //     {reason, enforcement:"env-only"}, no wrapper — loud, never silent
 //   - require + unavailable     -> acceptance_net_sandbox_required (fail)
 //   - available, profile error  -> acceptance_net_sandbox_profile (fail;
-//     never spawn under a malformed or over-broad profile)
+//     never spawn under a malformed or over-broad profile — including a
+//     credential path that fails to resolve)
 //   - available                 -> acceptance_net_sandbox_applied
 //     {mechanism:"seatbelt", admitted_ports}, wrapper = sandbox-exec -p <profile>
-func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) string, proxyURL string, allowHosts []string, probe func(context.Context) (bool, string), logSink io.Writer) (wrapper []string, failReason, failDetail string) {
+//
+// The disabled, unavailable and applied events also carry the credential
+// isolation fields (credentialIsolationFields): credential_isolation,
+// home_isolated, keychain_denied, ssh_agent_denied, credential_files_denied
+// (each true only when the profile applied with that deny), and
+// home_isolation_skipped when auto kept the real HOME.
+func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) string, proxyURL string, allowHosts []string, iso acceptanceCredentialIsolation, probe func(context.Context) (bool, string), logSink io.Writer) (wrapper []string, failReason, failDetail string) {
 	mode, err := netsandbox.ParseMode(getenv(acceptanceNetSandboxEnvVar))
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,
@@ -49,7 +59,8 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 	}
 	if mode == netsandbox.ModeOff {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"acceptance_net_sandbox_disabled","mode":%q,"enforcement":"env-only"}`+"\n", mode)
+			`{"event":"acceptance_net_sandbox_disabled","mode":%q,"enforcement":"env-only"%s}`+"\n",
+			mode, credentialIsolationFields(iso, false))
 		return nil, "", ""
 	}
 	available, reason := probe(ctx)
@@ -60,8 +71,8 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 			return nil, "acceptance_net_sandbox_required", reason
 		}
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"acceptance_net_sandbox_unavailable","mode":%q,"reason":%q,"enforcement":"env-only"}`+"\n",
-			mode, reason)
+			`{"event":"acceptance_net_sandbox_unavailable","mode":%q,"reason":%q,"enforcement":"env-only"%s}`+"\n",
+			mode, reason, credentialIsolationFields(iso, false))
 		return nil, "", ""
 	}
 	u, err := url.Parse(proxyURL)
@@ -74,7 +85,11 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 			`{"event":"acceptance_net_sandbox_profile","detail":%q}`+"\n", detail)
 		return nil, "acceptance_net_sandbox_profile", detail
 	}
-	profile, err := netsandbox.Profile(u.Host, allowHosts)
+	var opts []netsandbox.ProfileOption
+	if iso.active {
+		opts = append(opts, netsandbox.WithCredentialDeny(iso.deny))
+	}
+	profile, err := netsandbox.Profile(u.Host, allowHosts, opts...)
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"acceptance_net_sandbox_profile","detail":%q}`+"\n", err.Error())
@@ -82,9 +97,23 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 	}
 	ports, _ := json.Marshal(netsandbox.AdmittedPorts(profile))
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"acceptance_net_sandbox_applied","mode":%q,"mechanism":"seatbelt","admitted_ports":%s}`+"\n",
-		mode, ports)
+		`{"event":"acceptance_net_sandbox_applied","mode":%q,"mechanism":"seatbelt","admitted_ports":%s%s}`+"\n",
+		mode, ports, credentialIsolationFields(iso, iso.active))
 	// The adapter appends the binary + args (agent.WrapArgv), so the wrapper
 	// is the sandbox-exec prefix with NO argv.
 	return netsandbox.Wrap(nil, profile), "", ""
+}
+
+// credentialIsolationFields renders the credential-isolation fields every
+// non-failing acceptance_net_sandbox_* event carries (#3792), as a
+// leading-comma JSON fragment. denied is whether the profile applied WITH the
+// credential deny; each *_denied field is that AND its deny flag, so an
+// env-only stage never claims a kernel-enforced denial.
+func credentialIsolationFields(iso acceptanceCredentialIsolation, denied bool) string {
+	s := fmt.Sprintf(`,"credential_isolation":%q,"home_isolated":%t,"keychain_denied":%t,"ssh_agent_denied":%t,"credential_files_denied":%t`,
+		iso.mode, iso.homeIsolated, denied && iso.deny.Keychain, denied && iso.deny.SSHAgent, denied && iso.deny.Files)
+	if iso.skipReason != "" {
+		s += fmt.Sprintf(`,"home_isolation_skipped":%q`, iso.skipReason)
+	}
+	return s
 }

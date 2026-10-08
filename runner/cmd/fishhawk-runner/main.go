@@ -1271,11 +1271,24 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//      can opt out of the proxy by clearing its env; policy
 	//      FISHHAWK_ACCEPTANCE_NET_SANDBOX, unavailable is LOUD, never
 	//      silent.
+	//   1b. Credential isolation (E72.40 / #3792), policy
+	//      FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION=auto|require|off: unless
+	//      off, the agent is cut off from the runner host's ambient forge
+	//      credentials — a runner-created empty 0700 synthetic HOME (only
+	//      with an env-carried model credential; auto otherwise keeps the
+	//      real HOME LOUDLY, require fails category-C pre-spawn), the git
+	//      config pins, the credential-locator passthroughs refused, and on
+	//      darwin the Seatbelt keychain / credential-file / ssh-agent denies
+	//      (2b). Both temp dirs are removed by defers, which cover the
+	//      failed, cancelled (SIGTERM cancels the NotifyContext) and
+	//      pre-spawn-failure returns; a SIGKILLed runner leaks them.
 	//   3. The invocation env is REPLACED with the acceptenv minimized
 	//      set (BaseEnv): default-deny essentials + model key +
 	//      operator-declared FISHHAWK_ACCEPTANCE_ENV_* passthrough, with
-	//      HTTP(S)_PROXY pointed at the proxy. Refused passthrough names
-	//      are logged, never honored.
+	//      HTTP(S)_PROXY pointed at the proxy, then — unless credential
+	//      isolation is off — re-pointed at the synthetic HOME and git-pinned
+	//      by acceptenv.IsolateCredentials. Refused passthrough names are
+	//      logged, never honored.
 	//   4. The verdict schema constrains claudecode structured output;
 	//      other backends fall back to the /tmp/fishhawk-acceptance.json
 	//      file transport named in the prompt's output contract.
@@ -1287,7 +1300,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				err.Error())
 			return exitFailure
 		}
+		defer cleanupAcceptanceDir(tmpDir, "acceptance_workdir_cleanup_failed", logSink)
 		inv.WorkingDir = tmpDir
+
+		// Credential isolation (1b above), resolved BEFORE the proxy starts
+		// so a config/require failure spawns nothing.
+		credIso, credFailReason, credFailDetail := resolveAcceptanceCredentialIsolation(
+			os.Getenv, os.Environ(), cfg.agent, realHomeDirs, logSink)
+		if credFailReason != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"category":"C","detail":%q}`+"\n",
+				credFailReason, credFailDetail)
+			return exitFailure
+		}
+		acceptanceHome := ""
+		if credIso.homeIsolated {
+			acceptanceHome, err = acceptanceHomeMkdirTemp("", "fishhawk-acceptance-home-*")
+			if err != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"acceptance_home","category":"C","detail":%q}`+"\n",
+					err.Error())
+				return exitFailure
+			}
+			defer cleanupAcceptanceDir(acceptanceHome, "acceptance_home_cleanup_failed", logSink)
+		}
 
 		proxy, err := egressproxy.Start(egressproxy.Config{
 			AllowHosts: egressproxy.BuildAllowlist(egressTargetHosts, cfg.backendURL),
@@ -1316,13 +1352,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// AFTER egressproxy.Start (the proxy port is dynamic) and BEFORE the
 		// target gate / tree provisioning. Policy:
 		// FISHHAWK_ACCEPTANCE_NET_SANDBOX=auto|require|off; a failing branch
-		// (invalid mode, require+unavailable, malformed profile) fails
-		// category-C with NO agent spawn — the same shape as the proxy-start
-		// failure right above.
+		// (invalid mode, require+unavailable, malformed profile, an
+		// unresolvable credential path) fails category-C with NO agent spawn
+		// — the same shape as the proxy-start failure right above. While
+		// credential isolation is active the profile also carries its
+		// keychain / credential-file / ssh-agent denies (#3792).
 		sandboxWrapper, sandboxFailReason, sandboxFailDetail := configureAcceptanceNetSandbox(
 			ctx, os.Getenv, proxy.URL(),
 			egressproxy.BuildAllowlist(egressTargetHosts, cfg.backendURL),
-			probeNetSandbox, logSink)
+			credIso, probeNetSandbox, logSink)
 		if sandboxFailReason != "" {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":%q,"category":"C","detail":%q}`+"\n",
@@ -1433,7 +1471,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			}
 		}
 
-		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
+		// Under credential isolation the home-family / GIT_CONFIG* /
+		// SSH_AUTH_SOCK passthroughs are refused and the env is re-pointed at
+		// the synthetic HOME (when created) with the git pins; under off
+		// neither runs, so the passthroughs pass exactly as before #3792.
+		var envOpts []acceptenv.EnvOption
+		if credIso.active {
+			envOpts = append(envOpts, acceptenv.WithCredentialIsolation())
+		}
+		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL(), envOpts...)
+		if credIso.active {
+			baseEnv = acceptenv.IsolateCredentials(baseEnv, acceptanceHome)
+		}
 		if len(refused) > 0 {
 			refusedJSON, _ := json.Marshal(refused)
 			_, _ = fmt.Fprintf(logSink,
