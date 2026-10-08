@@ -366,6 +366,82 @@ func TestPersonaHardening_HeldIngestDurability(t *testing.T) {
 	}
 }
 
+// (b, #3915) the held-round CARRIER ROLE. The diff modifies the declared
+// conventions file, so the round is HELD; reviewer 1 (standard) FAILS and
+// reviewer 2 (the `security` persona) succeeds with a VERIFIED remit quote, so
+// conventionsFileModifiedCarrier selects the persona: the synthesized
+// conventions_file_modified concern rides the persona's verdict and is
+// attributed to the persona on the implement_reviewed payload AND the row.
+//
+// Counterfactuals (run): (C) stamp concern.ReviewerRoleStandard instead of the
+// carrier's role in synthesizeConventionsFileModified — the payload concern
+// reads standard: RED (stampReviewerRole overwrites every differing concern,
+// so the persona's own payload concern flips too; its ROW stays persona);
+// (D) pass concern.ReviewerRoleStandard to persistReviewConcernsAs in
+// ingestImplementReview — the synthesized row reads standard: RED.
+func TestPersonaHardening_HeldRoundPersonaCarriesSynthesizedConcern(t *testing.T) {
+	const ownNote = "persona quoted remit"
+	std := &fakePlanReviewer{err: errors.New("standard backend exploded")}
+	persona := verdictFake(planreview.VerdictApproveWithConcerns, personaAgentModel, quotedConcern(ownNote, personaRemitExactQuote, personaRemitPath))
+	s, _, au, _, runRow, implStage := newImplementReviewServerWithSet(t, hardeningPersonaSet(std, persona),
+		hardeningSpec(hardeningSpecOpts{attachOn: "implement", convention: true}))
+	wireHardeningDocuments(s, runRow)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-held-carrier", nil) {
+		t.Error("runImplementReviews = true: an approve_with_concerns plus a failed reviewer must not gate")
+	}
+	if n := len(reviewerCalls(std)); n != 1 {
+		t.Fatalf("standard calls = %d, want 1", n)
+	}
+
+	vs := decodeImplementReviewed(t, au)
+	if len(vs) != 1 || vs[0].Persona != personaTestName || !vs[0].ConventionsFileModifiedSynthesized {
+		t.Fatalf("implement_reviewed = %+v, want exactly the persona's verdict, carrying the synthesized concern", vs)
+	}
+	var synthPayload []planreview.Concern
+	for _, c := range vs[0].Concerns {
+		if c.Category == planreview.ConventionsFileModifiedConcernCategory {
+			synthPayload = append(synthPayload, c)
+		}
+	}
+	if len(synthPayload) != 1 || synthPayload[0].ReviewerRole != personaTestName {
+		t.Errorf("payload conventions_file_modified concerns = %+v, want one attributed %s (its carrier)", synthPayload, personaTestName)
+	}
+	synth := concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)
+	if len(synth) != 1 || synth[0].Severity != string(planreview.SeverityMedium) || synth[0].ReviewerRole != personaTestName {
+		got := make([]string, len(synth))
+		for i, r := range synth {
+			got[i] = r.Severity + "/" + r.ReviewerRole
+		}
+		t.Errorf("conventions_file_modified rows (severity/role) = %v, want one medium row attributed %s", got, personaTestName)
+	} else if len(synthPayload) == 1 && synth[0].ReviewerRole != synthPayload[0].ReviewerRole {
+		t.Errorf("synthesized row role %q != payload role %q", synth[0].ReviewerRole, synthPayload[0].ReviewerRole)
+	}
+	if c := payloadConcernByNote(t, vs[0].Concerns, ownNote); c.Severity != planreview.SeverityHigh || c.QuoteUnverified || c.ReviewerRole != personaTestName {
+		t.Errorf("persona's own quoted payload concern = %+v, want high, verified, attributed %s", c, personaTestName)
+	}
+	own := rowsByNote(t, cr, runRow.ID)[ownNote]
+	if own == nil || own.Severity != string(planreview.SeverityHigh) || own.QuoteUnverified || own.ReviewerRole != personaTestName {
+		t.Errorf("persona's own quoted concern row = %+v, want high, verified, attributed %s", own, personaTestName)
+	}
+
+	failed := auditFakeEntries(au, "implement_review_failed")
+	if len(failed) != 1 {
+		t.Fatalf("implement_review_failed = %d, want 1 (the standard reviewer)", len(failed))
+	}
+	var fp map[string]any
+	_ = json.Unmarshal(failed[0].Payload, &fp)
+	if r, _ := fp["reason"].(string); r == "" || strings.HasPrefix(r, "persona ") {
+		t.Errorf("implement_review_failed reason = %q, want the standard reviewer's failure with no persona prefix", r)
+	}
+	started := decodeStarted(t, au, "implement_review_started")
+	if started.ConfiguredAgents != 2 || !planreview.Settled(started.ConfiguredAgents, terminalCount(au, "implement")) {
+		t.Errorf("round does not settle: configured_agents %d, terminal entries %d", started.ConfiguredAgents, terminalCount(au, "implement"))
+	}
+}
+
 // loopRun drives the IMPLEMENT invocation loop (runImplementReviewInvocations-
 // WithConventions) over the standard reviewer plus the persona invocations
 // resolveParsedReviewPersonaInvocations derives from parsed, with each
