@@ -18,6 +18,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // runStageCommand is the subprocess fishhawk_run_stage spawns.
@@ -1245,7 +1247,16 @@ func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo,
 		"--upload-trace",
 	}
 	if in.Stage == "plan" {
-		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
+		// Run/stage-keyed plan handoff (#4067): the SAME prompt.PlanArtifactPath
+		// the backend renders into the plan-stage prompt, so the spawned
+		// --plan-out and the path the agent is told to write cannot drift. The
+		// legacy fixed path survives only for an (unreachable today) empty stage
+		// id; the runner itself rewrites a legacy --plan-out to the keyed path.
+		planOut := prompt.LegacyPlanArtifactPath
+		if resolvedStageID != "" {
+			planOut = prompt.PlanArtifactPath(in.RunID, resolvedStageID)
+		}
+		argv = append(argv, "--plan-out", planOut)
 	}
 	if repo != "" {
 		argv = append(argv, "--github-repo", repo)

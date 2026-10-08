@@ -225,13 +225,26 @@ func TestRunnerStart_HappyPath_BuildsExpectedArgv(t *testing.T) {
 	}
 }
 
+// TestPlanArtifactPath_KeyedFormat pins the CLI mirror of the keyed plan
+// handoff path (#4067) to the byte-exact literal the backend
+// prompt.PlanArtifactPath and the runner's planArtifactPath tests also pin for
+// the same fixed ids, so the three independent copies cannot drift.
+func TestPlanArtifactPath_KeyedFormat(t *testing.T) {
+	const want = "/tmp/fishhawk-plan-11111111-2222-3333-4444-555555555555-22222222-3333-4444-5555-666666666666.json"
+	if got := planArtifactPath(fixtureRunID, fixtureStageID); got != want {
+		t.Errorf("planArtifactPath = %q, want %q (must match the backend + runner literal)", got, want)
+	}
+}
+
 // TestRunnerStart_PlanStage_PassesPlanOut exercises the
 // local-runner plan-validation wiring: when --stage plan, the CLI
-// auto-appends --plan-out /tmp/fishhawk-plan.json so the runner
-// validates + uploads the plan artifact the agent produces. The
-// GHA action.yml passes the same path; we mirror it here. Without
-// this flag the plan stage uploads a trace but the artifact never
-// lands and the stage is stuck.
+// auto-appends --plan-out with the run/stage-keyed
+// /tmp/fishhawk-plan-<run>-<stage>.json (#4067) so the runner
+// validates + uploads the plan artifact the agent produces — the
+// same path the backend renders into this stage's prompt, never
+// the shared legacy /tmp/fishhawk-plan.json. Without this flag the
+// plan stage uploads a trace but the artifact never lands and the
+// stage is stuck.
 func TestRunnerStart_PlanStage_PassesPlanOut(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemote(t, "https://github.com/kuhlman-labs/fishhawk.git", nil)
@@ -248,11 +261,12 @@ func TestRunnerStart_PlanStage_PassesPlanOut(t *testing.T) {
 	if got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
-	if !contains(cap.args, "--plan-out") {
-		t.Errorf("plan-stage argv missing --plan-out: %v", cap.args)
+	wantPlanOut := "/tmp/fishhawk-plan-" + fixtureRunID + "-" + fixtureStageID + ".json"
+	if i := indexOf(cap.args, "--plan-out"); i < 0 || i+1 >= len(cap.args) || cap.args[i+1] != wantPlanOut {
+		t.Errorf("plan-stage argv missing --plan-out %s: %v", wantPlanOut, cap.args)
 	}
-	if !contains(cap.args, "/tmp/fishhawk-plan.json") {
-		t.Errorf("plan-stage argv missing /tmp/fishhawk-plan.json: %v", cap.args)
+	if contains(cap.args, "/tmp/fishhawk-plan.json") {
+		t.Errorf("plan-stage argv must not pass the shared legacy /tmp/fishhawk-plan.json: %v", cap.args)
 	}
 	// Plan stages produce no diff, so --check-base-ref is omitted.
 	if contains(cap.args, "--check-base-ref") {

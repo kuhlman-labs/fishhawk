@@ -14192,6 +14192,11 @@ func TestPromptRender_NonGrooming_ByteIdenticalWithInertSeam(t *testing.T) {
 				golden.ImplementRunID = runID.String()
 				golden.ImplementStageID = stageID.String()
 			} else {
+				// #4067: both plan-prompt handlers thread the plan stage's own
+				// run/stage ids, so the golden renders the same keyed
+				// /tmp/fishhawk-plan-<run>-<stage>.json the preview does.
+				golden.PlanRunID = runID.String()
+				golden.PlanStageID = stageID.String()
 				golden.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
 				// #3437: both plan-prompt handlers thread the generated-surface
 				// derivative map identically. Restoration stays nil — no refusal

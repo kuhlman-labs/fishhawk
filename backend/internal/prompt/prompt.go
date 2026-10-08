@@ -67,13 +67,36 @@ var ErrCharterNotInjected = errors.New("prompt: grooming propose stage has no ch
 // pick one silently.
 var ErrPlanForkConflict = errors.New("prompt: plan stage carries more than one fork (grooming, upkeep, comms)")
 
-// PlanArtifactPath is the absolute path the runner expects to find
-// the agent's plan artifact at after a plan-stage invocation. It's
-// embedded in the prompt template (so the agent knows where to
-// write) and matched by the runner's --plan-out flag (so it knows
-// where to read). Hardcoded for v0; v0.x can lift this into a
-// per-stage variable if multi-tenancy demands isolation.
-const PlanArtifactPath = "/tmp/fishhawk-plan.json"
+// LegacyPlanArtifactPath is the fixed shared path every plan-typed stage was
+// told to write its artifact to before #4067 keyed it by run/stage. Two
+// concurrent plan stages on one host shared it, so a run could upload ANOTHER
+// run's plan, or have a foreign sibling (clarification_request,
+// grooming_report, ...) win the runner's adoption precedence. Retained ONLY as
+// the deprecation fallback: planArtifactPathForTrigger renders it for a
+// trigger missing the plan run/stage ids, and the runner rewrites a legacy
+// --plan-out to the keyed path and claims a fresh legacy file only under
+// backend/runner version skew. New renders use PlanArtifactPath below.
+const LegacyPlanArtifactPath = "/tmp/fishhawk-plan.json"
+
+// PlanArtifactPath is the run/stage-keyed absolute path a plan-typed stage
+// (plan, clarification park, grooming/upkeep/comms propose) writes its
+// artifact to and the runner reads, adopts structured output into and uploads
+// from (#4067). Embedded in the plan-stage prompt via
+// planArtifactPathForTrigger (so the agent knows where to write) and passed as
+// the runner's --plan-out by the MCP spawner (composeRunnerArgv calls this
+// function) and the CLI (so the runner knows where to read).
+//
+// Keyed by the FULL run id + stage id, mirroring the #1777
+// PullRequestDescriptionPath keying. The runner
+// (runner/cmd/fishhawk-runner/planout.go planArtifactPath) and the CLI
+// (cli/cmd/fishhawk/runner.go planArtifactPath) each mirror this EXACT format
+// string — separate Go modules that cannot import this package. A one-sided
+// edit to any of the three copies is caught by TestPlanArtifactPath_KeyedFormat
+// here plus the runner and CLI tests, which each assert the byte-identical
+// literal for the same fixed ids.
+func PlanArtifactPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-plan-%s-%s.json", runID, stageID)
+}
 
 // LegacyPullRequestDescriptionPath is the fixed shared path the agent-authored
 // PR description used to be written to before it was keyed by run/stage (#1777).
@@ -1027,6 +1050,17 @@ type Trigger struct {
 	// keeping those prompts byte-identical.
 	AcceptanceRunID   string
 	AcceptanceStageID string
+
+	// PlanRunID and PlanStageID are the run/stage UUIDs of the plan-typed stage
+	// being rendered (#4067). Threaded by BOTH server prompt handlers
+	// (handleGetStagePrompt and handleGetStagePromptRender, inside their plan
+	// branch) so the signed prompt and the render preview stay byte-identical;
+	// empty for every other build. planArtifactPathForTrigger renders the
+	// run/stage-keyed PlanArtifactPath from these; either empty (an older or
+	// test trigger) falls back to LegacyPlanArtifactPath, keeping those prompts
+	// — including the frozen plan-prompt golden — byte-identical.
+	PlanRunID   string
+	PlanStageID string
 
 	// PlanGateEvidence carries the backend-computed plan-gate results —
 	// the plan_scope_precheck verdict against the implement stage's path
@@ -4072,6 +4106,20 @@ func acceptanceVerdictPathForTrigger(t Trigger) string {
 	return LegacyAcceptanceVerdictPath
 }
 
+// planArtifactPathForTrigger resolves the plan-artifact handoff path for a
+// plan-typed stage's prompt (#4067), mirroring acceptanceVerdictPathForTrigger:
+// the run/stage-keyed PlanArtifactPath when the trigger threads both
+// PlanRunID and PlanStageID (the normal plan dispatch, since
+// backend/internal/server/prompt.go sets them), falling back to the legacy
+// fixed path when either is empty so a trigger missing them still renders a
+// usable (if shared) path rather than a malformed one.
+func planArtifactPathForTrigger(t Trigger) string {
+	if t.PlanRunID != "" && t.PlanStageID != "" {
+		return PlanArtifactPath(t.PlanRunID, t.PlanStageID)
+	}
+	return LegacyPlanArtifactPath
+}
+
 // acceptanceTranscriptPathForTrigger resolves the keyed transcript sidecar
 // path (E72.5 / #3329) ONLY when the trigger threads BOTH AcceptanceRunID and
 // AcceptanceStageID; otherwise "" and the `### Transcript` section is omitted —
@@ -5093,10 +5141,10 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- A well-formed issue that already states Problem / Proposal / Done-means is plannable. Parking on it is a bug: produce the plan.\n\n")
 	b.WriteString("clarification_request shape (the additive standard_v1 SIBLING — schema docs/spec/clarification-request-v1.md). " +
 		"Write it as a single JSON object to the SAME path (")
-	b.WriteString(PlanArtifactPath)
+	b.WriteString(planArtifactPathForTrigger(t))
 	b.WriteString(") INSTEAD of a plan; the runner routes the artifact by its top-level \"kind\":\n")
 	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only. " +
-		"To PARK you MUST still write the clarification_request to " + PlanArtifactPath + " as instructed here — " +
+		"To PARK you MUST still write the clarification_request to " + planArtifactPathForTrigger(t) + " as instructed here — " +
 		"that file is what the runner routes on, and you may leave the structured-output plan unfilled when parking.\n")
 	b.WriteString("- kind: \"clarification_request\" (REQUIRED discriminator; do NOT also set plan_version)\n")
 	b.WriteString("- ticket_reference, generated_by: same shape as the plan artifact\n")
@@ -5106,7 +5154,7 @@ func buildPlan(t Trigger) string {
 
 	b.WriteString("Your task: produce a `standard_v1` plan artifact describing the change. ")
 	b.WriteString("Write the plan as a single JSON object to `")
-	b.WriteString(PlanArtifactPath)
+	b.WriteString(planArtifactPathForTrigger(t))
 	b.WriteString("`. The schema is documented at docs/spec/plan-standard-v1.md and required fields are: plan_version (\"standard_v1\"), ticket_reference, generated_by, summary, scope, approach, verification, predicted_runtime_minutes, predicted_runtime_confidence. ")
 	b.WriteString("predicted_runtime_minutes and predicted_runtime_confidence are MUST-populate fields — every plan artifact must carry your runtime estimate and confidence level. ")
 	fmt.Fprintf(&b,
@@ -5562,7 +5610,7 @@ func buildGroomingPropose(t Trigger) (string, error) {
 	b.WriteString("This stage emits a `" + string(plan.ArtifactKindGroomingReport) + "` artifact — the typed set of " +
 		"PROPOSALS produced by ranking this backlog slice against the injected charter. It does NOT produce an " +
 		"implementation plan and it changes no code. Write the report as a single JSON object to `")
-	b.WriteString(PlanArtifactPath)
+	b.WriteString(planArtifactPathForTrigger(t))
 	b.WriteString("`; the runner routes the artifact on its top-level `kind` discriminator.\n\n")
 	b.WriteString("- `kind` MUST be `" + string(plan.ArtifactKindGroomingReport) + "` and `report_version` MUST be `" +
 		plan.GroomingReportVersion + "`.\n")
@@ -5591,7 +5639,7 @@ func buildGroomingPropose(t Trigger) (string, error) {
 		"model_recommendation, predicted_runtime_minutes): " + plan.GroomingReportVersion + " is " +
 		"additionalProperties:false, so an emitted plan field fails validation.\n\n")
 	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only, so you MUST WRITE the report " +
-		"to " + PlanArtifactPath + " — that file is what the runner uploads (a recognized sibling wins over " +
+		"to " + planArtifactPathForTrigger(t) + " — that file is what the runner uploads (a recognized sibling wins over " +
 		"structured-output adoption).\n\n")
 
 	// Action-class matrix + no-write rules. The four class names are rendered as
@@ -5747,7 +5795,7 @@ func buildUpkeepScan(t Trigger) string {
 	b.WriteString("This stage emits a `" + kind + "` artifact — the flake, toolchain-drift, deprecation and advisory findings over " +
 		"this repository, each proposing one issue. It does NOT produce an implementation plan and it changes no code. " +
 		"Write the report as a single JSON object to `")
-	b.WriteString(PlanArtifactPath)
+	b.WriteString(planArtifactPathForTrigger(t))
 	b.WriteString("`; the runner routes the artifact on its top-level `kind` discriminator.\n\n")
 	b.WriteString("- `kind` MUST be `" + kind + "` and `report_version` MUST be `" + plan.UpkeepReportVersion + "`. " +
 		"`ticket_reference`, `generated_by`, `summary`, `sources_scanned` and `findings` are all REQUIRED.\n")
@@ -5787,7 +5835,7 @@ func buildUpkeepScan(t Trigger) string {
 		"model_recommendation, predicted_runtime_minutes): " + plan.UpkeepReportVersion + " is " +
 		"additionalProperties:false, so an emitted plan field fails validation.\n\n")
 	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only, so you MUST WRITE the report " +
-		"to " + PlanArtifactPath + " — that file is what the runner uploads.\n\n")
+		"to " + planArtifactPathForTrigger(t) + " — that file is what the runner uploads.\n\n")
 
 	writeUpkeepFacts(&b, t.Upkeep)
 

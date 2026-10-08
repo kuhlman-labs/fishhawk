@@ -63,7 +63,13 @@ Stage budget is 45m (#2838). A real pass over this backlog measures ~24m.
 
 ## 3. Reading the report
 
-The artifact lands at `/tmp/fishhawk-plan.json` and is ingested as `grooming_report_v1`.
+The runner uploads the report and the backend ingests it as `grooming_report_v1`. Read it
+back through the artifacts API: `GET /v0/stages/{plan_stage_id}/artifacts` lists the
+groom stage's artifacts, and `GET /v0/artifacts/{artifact_id}` returns the report body.
+The `/tmp/fishhawk-plan-<run_id>-<stage_id>.json` handoff file the agent writes is keyed
+per run and stage (#4067), is transient, and is not a readback surface; the older fixed
+`/tmp/fishhawk-plan.json` is shared across concurrent plan stages and may hold another
+run's artifact.
 Typical shape: ~27 ordering entries, ~16 hygiene defects, plus duplicates, dependency
 edges, decomposition suggestions, vision drift.
 

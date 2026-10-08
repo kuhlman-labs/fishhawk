@@ -85,6 +85,29 @@ func assertContainsAll(t *testing.T, got string, wants ...string) {
 	}
 }
 
+// TestBuild_UpkeepScan_PlanArtifactPathKeyedByIds pins #4067 on the upkeep
+// fork: with the plan run/stage ids threaded, both report-path lines name the
+// keyed path and the shared legacy path appears nowhere; without them, both
+// lines fall back to the legacy path.
+func TestBuild_UpkeepScan_PlanArtifactPathKeyedByIds(t *testing.T) {
+	keyed := buildUpkeep(t, withPlanIDs(upkeepScanTrigger()))
+	assertContainsAll(t, keyed,
+		"Write the report as a single JSON object to `"+planPathTestKeyed+"`",
+		"you MUST WRITE the report to "+planPathTestKeyed,
+	)
+	if strings.Contains(keyed, LegacyPlanArtifactPath) {
+		t.Errorf("upkeep prompt with plan ids threaded still names the legacy path %q", LegacyPlanArtifactPath)
+	}
+	legacy := buildUpkeep(t, upkeepScanTrigger())
+	assertContainsAll(t, legacy,
+		"Write the report as a single JSON object to `"+LegacyPlanArtifactPath+"`",
+		"you MUST WRITE the report to "+LegacyPlanArtifactPath,
+	)
+	if strings.Contains(legacy, "/tmp/fishhawk-plan-") {
+		t.Errorf("upkeep prompt without plan ids rendered a keyed path")
+	}
+}
+
 // TestBuild_UpkeepScan_ForkContent: an Upkeep trigger is served the upkeep
 // contract — kind, version, the evidence-ref, bump-exclusion, autonomy and
 // deprecation rules — and none of the standard_v1 plan instructions. The
@@ -96,7 +119,7 @@ func TestBuild_UpkeepScan_ForkContent(t *testing.T) {
 		"You are producing an upkeep scan report for the repository `kuhlman-labs/fishhawk`",
 		"`"+string(plan.ArtifactKindUpkeepReport)+"`",
 		plan.UpkeepReportVersion,
-		PlanArtifactPath,
+		LegacyPlanArtifactPath,
 		"`<source>:<subject>`",
 		"copying `run_id` and `stage_id` VERBATIM",
 		"copying `path`, `line` and `value` VERBATIM",

@@ -201,8 +201,11 @@ func TestDispatchStage_ArgvParity_PlanStage(t *testing.T) {
 	if strings.Join(dispatchArgv, " ") != strings.Join(runStageArgv, " ") {
 		t.Errorf("dispatch argv != run_stage argv\n dispatch: %v\n run_stage: %v", dispatchArgv, runStageArgv)
 	}
-	if !strings.Contains(strings.Join(dispatchArgv, " "), "--plan-out /tmp/fishhawk-plan.json") {
-		t.Errorf("plan-stage dispatch argv missing --plan-out: %v", dispatchArgv)
+	// Run/stage-keyed plan handoff (#4067): the dispatched --plan-out is the
+	// SAME keyed path the backend renders into this stage's prompt.
+	wantPlanOut := "--plan-out /tmp/fishhawk-plan-" + runID.String() + "-" + stageID.String() + ".json"
+	if !strings.Contains(strings.Join(dispatchArgv, " "), wantPlanOut) {
+		t.Errorf("plan-stage dispatch argv missing keyed %q: %v", wantPlanOut, dispatchArgv)
 	}
 	if strings.Contains(strings.Join(dispatchArgv, " "), "--check-base-ref") {
 		t.Errorf("plan-stage dispatch argv should not carry --check-base-ref: %v", dispatchArgv)

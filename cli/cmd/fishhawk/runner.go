@@ -73,6 +73,18 @@ var gitRemoteOriginURL = func(dir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// planArtifactPath mirrors the backend's prompt.PlanArtifactPath: the
+// run/stage-keyed path a plan-typed stage writes its artifact to and the
+// runner reads via --plan-out (#4067). The format string is hardcoded in all
+// three independent modules (backend prompt, runner planout.go, this CLI) by
+// design — the same coordination as prDescriptionPath (#1777); a one-sided
+// edit is caught by TestPlanArtifactPath_KeyedFormat here plus the backend
+// and runner tests, which each pin the byte-identical literal for the same
+// fixed ids.
+func planArtifactPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-plan-%s-%s.json", runID, stageID)
+}
+
 // runRunnerStart implements `fishhawk runner start --run-id … --stage-id …`.
 //
 // The verb is intentionally thin: it gathers the operator's config
@@ -278,14 +290,16 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		"--upload-trace",
 	}
 	// For plan stages, the agent's prompt instructs it to write
-	// the plan to /tmp/fishhawk-plan.json (backend's
-	// prompt.PlanArtifactPath). The runner only validates and
-	// uploads when --plan-out is set; without it the agent
-	// writes the file but the stage never transitions to
-	// awaiting_approval. Mirror the GHA action.yml's default so
-	// the local loop matches.
+	// the plan to the run/stage-keyed /tmp/fishhawk-plan-<run>-<stage>.json
+	// (backend's prompt.PlanArtifactPath, #4067). The runner only
+	// validates and uploads when --plan-out is set; without it the
+	// agent writes the file but the stage never transitions to
+	// awaiting_approval. Passing the keyed path directly keeps two
+	// concurrent local plan stages off one shared file (the GHA
+	// action.yml still passes the legacy fixed path, which the
+	// runner itself rewrites to the same keyed path).
 	if *stage == "plan" {
-		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
+		argv = append(argv, "--plan-out", planArtifactPath(*runID, *stageID))
 	}
 	if repo != "" {
 		argv = append(argv, "--github-repo", repo)

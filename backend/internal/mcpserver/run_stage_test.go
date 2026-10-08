@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // passedWordRe is a word-boundary, case-insensitive match for "passed" (#2458
@@ -646,7 +647,9 @@ func TestRunStage_ArgvComposition_PlanStage(t *testing.T) {
 		"--working-dir /tmp/checkout",
 		"--fetch-prompt",
 		"--upload-trace",
-		"--plan-out /tmp/fishhawk-plan.json",
+		// Run/stage-keyed plan handoff (#4067): the exact literal the
+		// backend prompt renders for this stage, never the shared fixed path.
+		"--plan-out /tmp/fishhawk-plan-" + runID.String() + "-" + stageID.String() + ".json",
 		"--github-repo x/y",
 		"--base-branch main",
 		"--no-pr",
@@ -654,6 +657,9 @@ func TestRunStage_ArgvComposition_PlanStage(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("argv missing %q\nfull: %s", want, joined)
 		}
+	}
+	if strings.Contains(joined, "--plan-out /tmp/fishhawk-plan.json") {
+		t.Errorf("plan stage must not pass the shared legacy --plan-out (#4067)\nfull: %s", joined)
 	}
 	// Plan stages produce no diff, so --check-base-ref must be omitted.
 	if strings.Contains(joined, "--check-base-ref") {
@@ -4060,6 +4066,33 @@ func TestComposeRunnerArgv_GitLabTargetEmitsForgeFlags(t *testing.T) {
 	}
 	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("gitlab argv:\n got %q\nwant %q", argv, want)
+	}
+}
+
+// TestComposeRunnerArgv_PlanOutKeyedByRunAndStage pins both arms of the plan
+// stage's --plan-out (#4067): with a resolved stage id it is the SAME
+// prompt.PlanArtifactPath the backend renders into that stage's prompt; with an
+// empty stage id (unreachable through runStage/dispatchStage, which resolve one
+// first) it falls back to prompt.LegacyPlanArtifactPath, which the runner
+// itself rewrites to the keyed path, rather than a malformed half-keyed path.
+func TestComposeRunnerArgv_PlanOutKeyedByRunAndStage(t *testing.T) {
+	r := &runResolver{api: &apiClient{baseURL: "http://127.0.0.1:1"}}
+	in := RunStageInput{RunID: "run-1", Workflow: "feature_change", Stage: "plan", WorkingDir: "/tmp/checkout"}
+	planOut := func(argv []string) string {
+		for i, tok := range argv {
+			if tok == "--plan-out" && i+1 < len(argv) {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+	target := runForgeTarget{Forge: "github", Repo: "x/y"}
+	if got, want := planOut(r.composeRunnerArgv(in, "stage-1", "x/y", "main", true, target)),
+		prompt.PlanArtifactPath("run-1", "stage-1"); got != want {
+		t.Errorf("keyed --plan-out = %q, want %q", got, want)
+	}
+	if got := planOut(r.composeRunnerArgv(in, "", "x/y", "main", true, target)); got != prompt.LegacyPlanArtifactPath {
+		t.Errorf("empty stage id --plan-out = %q, want legacy %q", got, prompt.LegacyPlanArtifactPath)
 	}
 }
 

@@ -262,7 +262,7 @@ func buildCommsScan(t Trigger) (string, error) {
 			"in summary.\n\n",
 		resolveMins(t.PlanStageTimeout))
 
-	writeCommsContract(&b)
+	writeCommsContract(&b, planArtifactPathForTrigger(t))
 
 	b.WriteString("### Charter rubric\n\n")
 	b.WriteString("Every draft MUST cite at least one of these rubric ids in rubric_citations. Never invent an id.\n\n")
@@ -343,12 +343,14 @@ func buildCommsScan(t Trigger) (string, error) {
 	return b.String(), nil
 }
 
-// writeCommsContract renders the comms_report_v1 output contract.
-func writeCommsContract(b *strings.Builder) {
+// writeCommsContract renders the comms_report_v1 output contract. path is the
+// plan-artifact handoff path the report is written to — the run/stage-keyed
+// PlanArtifactPath from planArtifactPathForTrigger (#4067).
+func writeCommsContract(b *strings.Builder, path string) {
 	b.WriteString("### Your task: emit a comms report, NOT an implementation plan\n\n")
 	b.WriteString("This stage emits a `" + CommsReportKind + "` artifact proposing draft issues from the user reports below. " +
 		"It does NOT produce an implementation plan and it changes no code. Write the report as a single JSON object to `")
-	b.WriteString(PlanArtifactPath)
+	b.WriteString(path)
 	b.WriteString("`; the runner routes the artifact on its top-level `kind` discriminator.\n\n")
 	fmt.Fprintf(b, "- `kind` MUST be `%s` and `report_version` MUST be `%s`. `ticket_reference`, `generated_by`, "+
 		"`summary`, `drafts` (at most %d), `n_drift` (at most %d) and `not_drafted` (at most %d) are all REQUIRED.\n",
@@ -383,7 +385,7 @@ func writeCommsContract(b *strings.Builder) {
 	b.WriteString("Do NOT emit any standard_v1 plan field (scope, approach, verification, decomposition, " +
 		"model_recommendation, predicted_runtime_minutes).\n\n")
 	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only, so you MUST WRITE the report " +
-		"to " + PlanArtifactPath + " — that file is what the runner uploads.\n\n")
+		"to " + path + " — that file is what the runner uploads.\n\n")
 }
 
 // writeCommsClusters renders the server-suggested clusters, keeping only ids
