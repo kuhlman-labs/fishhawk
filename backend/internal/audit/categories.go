@@ -301,6 +301,15 @@ import "sort"
 // and registering them now lets fishhawk_await_audit arm on them before those
 // writers land. INTERNAL, NOT issue-comment activity categories
 // (docs/issue-comment-surfaces.md is untouched).
+// E35.4 / #1601 (ADR-053 option A) added alert_incident_filed and
+// alert_incident_occurrence, written by the HMAC-authenticated
+// POST /v0/triggers/alert ingress (server/alert_trigger.go) for an ACCEPTED
+// alert only — a rejection is never audited, so an unauthenticated caller
+// cannot append to the chain. They ride the GLOBAL chain because an incident
+// belongs to no run (an auto-started run travels in payload.auto_start.run_id),
+// and they are NOT issue-comment activity categories: the incident issue and
+// its occurrence comments are their own egress surfaces
+// (docs/issue-comment-surfaces.md).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -315,6 +324,8 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_triage_decided":               {},
 	"acceptance_verdict_unshipped":            {},
 	"agent_request_failed_alert":              {},
+	"alert_incident_filed":                    {}, // E35.4 / #1601: an accepted alert filed a new incident issue (global chain)
+	"alert_incident_occurrence":               {}, // E35.4 / #1601: a repeat alert commented on its existing incident issue (global chain)
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},
 	"api_token_revoked":                       {},
