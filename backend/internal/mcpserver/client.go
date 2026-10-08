@@ -2863,6 +2863,66 @@ func (c *apiClient) ListUpkeepDispositions(ctx context.Context, runID uuid.UUID)
 	return &out, nil
 }
 
+// commsDispositionRequestBody mirrors the backend's capture request body
+// (`backend/internal/server/comms_dispositions.go::commsDispositionRequest`),
+// which is decoded STRICTLY: an unknown key at any depth is refused 400.
+type commsDispositionRequestBody struct {
+	Dispositions []CommsDispositionEntry `json:"dispositions"`
+}
+
+// RecordCommsDispositions records a batch of per-draft comms verdicts via
+// `POST /v0/runs/{run_id}/comms-dispositions` (#4016). The batch is validated
+// ATOMICALLY server-side: a request naming one unknown draft id records
+// NOTHING. 4xx/5xx surfaces:
+//   - 400 validation_failed (unparseable body or an unknown key, empty batch,
+//     > 25 entries, empty or repeated draft_id, invalid parent_epic,
+//     parent_epic on a rejected verdict, details.reason parent_epic_is_source)
+//   - 400 comms_verdict_invalid (a verdict outside approved/rejected)
+//   - 401 authentication_required
+//   - 403 run_token_forbidden (a run-bound agent token, even for its own run)
+//   - 403 operator_agent_forbidden (a delegated operator-agent token)
+//   - 403 insufficient_scope (token lacks write:approvals)
+//   - 404 run_not_found
+//   - 409 comms_report_absent (the run has no recorded comms_report)
+//   - 409 comms_window_closed (the report's capture window has been settled; nothing recorded)
+//   - 409 comms_report_superseded (a newer report was recorded mid-capture; nothing recorded)
+//   - 422 comms_draft_unknown (an id the recorded report does not declare)
+//   - 500 internal_error (report or gather unreadable, or the append failed;
+//     details.recorded / details.requested)
+//   - 503 comms_dispositions_unconfigured
+func (c *apiClient) RecordCommsDispositions(ctx context.Context, runID uuid.UUID,
+	dispositions []CommsDispositionEntry) (*RecordCommsDispositionsOutput, error) {
+	body, err := json.Marshal(commsDispositionRequestBody{Dispositions: dispositions})
+	if err != nil {
+		return nil, fmt.Errorf("marshal comms dispositions: %w", err)
+	}
+	var out RecordCommsDispositionsOutput
+	if err := c.do(ctx, http.MethodPost,
+		"/v0/runs/"+runID.String()+"/comms-dispositions", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListCommsDispositions reads back the recorded dispositions and the captain's
+// review surface (recorded previews, undecided drafts, unaccounted report ids,
+// cluster splits) for the run's recorded comms_report via
+// `GET /v0/runs/{run_id}/comms-dispositions` (#4016). Read access only — the
+// captain-only posture is scoped to CAPTURE. 4xx/5xx surfaces:
+//   - 400 validation_failed (bad run_id)
+//   - 404 run_not_found
+//   - 409 comms_report_absent
+//   - 500 internal_error (report or gather unreadable)
+//   - 503 comms_dispositions_unconfigured
+func (c *apiClient) ListCommsDispositions(ctx context.Context, runID uuid.UUID) (*ListCommsDispositionsOutput, error) {
+	var out ListCommsDispositionsOutput
+	if err := c.do(ctx, http.MethodGet,
+		"/v0/runs/"+runID.String()+"/comms-dispositions", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // deferConcernRequest mirrors the backend's defer 200 request body
 // (`backend/internal/server/defer_concern.go::deferConcernRequest`). The
 // follow-up body is auto-drafted server-side; the operator supplies only

@@ -347,3 +347,45 @@ func TestMCPToolScopeTable_AnswerDivergenceMirrorsHandler(t *testing.T) {
 		t.Errorf("answer_divergence anyOf = %v, want [write:stages %s]", rule.anyOf, scopeFixupAlternate)
 	}
 }
+
+// TestMCPToolScopeTable_CommsDispositionsMirrorsHandler (#4016):
+// fishhawk_record_comms_dispositions carries EXACTLY the predicate
+// handleRecordCommsDispositions enforces through requireOperatorCapture —
+// write:approvals, unconditionally, with no run-bound subject admitted (the
+// handler refuses every run-bound token run_token_forbidden). A
+// write:approvals operator is ADMITTED; an operator holding only other write
+// scopes and a run-bound fhm_ token at its full vocabulary are REFUSED, so the
+// row is neither stricter nor looser than the handler.
+func TestMCPToolScopeTable_CommsDispositionsMirrorsHandler(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_record_comms_dispositions")
+	if !ok {
+		t.Fatal("fishhawk_record_comms_dispositions has no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime")
+	}
+	if len(rule.anyOf) != 1 || rule.anyOf[0] != "write:approvals" {
+		t.Errorf("rule.anyOf = %v, want exactly [write:approvals] — the scope requireOperatorCapture enforces", rule.anyOf)
+	}
+	if rule.runBoundSubjectOK {
+		t.Error("runBoundSubjectOK is set, but handleRecordCommsDispositions refuses every run-bound token")
+	}
+	cases := []struct {
+		name string
+		id   Identity
+		want bool
+	}{
+		{"write:approvals operator admitted", Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:approvals"}}, true},
+		{"write:stages+runs operator refused", Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:stages", "write:runs", "read:audit"}}, false},
+		{"run-bound token refused", Identity{
+			Subject: "mcp:run:55555555-5555-5555-5555-555555555555", TokenID: "tok",
+			Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments, scopeRunBoundMessages},
+		}, false},
+	}
+	for _, c := range cases {
+		if got := rule.satisfiedBy(c.id); got != c.want {
+			t.Errorf("%s: satisfiedBy = %v, want %v", c.name, got, c.want)
+		}
+	}
+	upkeep, _ := mcpToolScopeFor("fishhawk_record_upkeep_dispositions")
+	if strings.Join(rule.anyOf, ",") != strings.Join(upkeep.anyOf, ",") {
+		t.Errorf("comms anyOf = %v, want the upkeep capture posture %v (both captures share requireOperatorCapture)", rule.anyOf, upkeep.anyOf)
+	}
+}
