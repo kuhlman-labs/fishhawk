@@ -922,7 +922,7 @@ func TestValidateAcceptanceVerdict_CoercedRemarshalOmitsAbsentReason(t *testing.
 func TestRedactAcceptanceVerdict_RedactsCredential(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("a", 36)
 	raw := []byte(`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","observed":"token ` + secret + ` echoed"}]}`)
-	red, hits := redactAcceptanceVerdict(raw)
+	red, hits := redactAcceptanceVerdict(raw, nil)
 	if strings.Contains(string(red), secret) {
 		t.Error("credential survived redaction")
 	}
@@ -1562,7 +1562,7 @@ func TestRun_AcceptanceStage_UnderCapVerdict_ShipsByteIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("oracle validate: %v", err)
 	}
-	expected, _ := redactAcceptanceVerdict(coerced)
+	expected, _ := redactAcceptanceVerdict(coerced, nil)
 
 	var stderr strings.Builder
 	if got := run(args, &stderr); got != exitOK {

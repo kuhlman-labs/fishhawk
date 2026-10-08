@@ -126,3 +126,87 @@ func findHitCount(hits []redaction.Hit, name string) int {
 	}
 	return 0
 }
+
+// knownTestValue is a runtime-built bound value shaped to match NO
+// DefaultPatterns regex, so only the known-value pass can remove it.
+func knownTestValue() string {
+	return "acc/Zq+" + strings.Repeat("x9", 6) + ":k"
+}
+
+func knownTestSet(t *testing.T, v string) *redaction.KnownValues {
+	t.Helper()
+	kv, below := redaction.NewKnownValues(redaction.KnownValue{Name: "ACC_TOKEN", Value: v})
+	if len(below) != 0 || kv.Len() != 1 {
+		t.Fatalf("fixture value must clear the floor: below=%v len=%d", below, kv.Len())
+	}
+	return kv
+}
+
+func TestScrubKnownEvents_NilSetReturnsInput(t *testing.T) {
+	v := knownTestValue()
+	events := []agent.Event{{Kind: "raw", Payload: json.RawMessage(`{"text":"` + v + `"}`)}}
+	got, hits := scrubKnownEvents(events, nil)
+	if &got[0] != &events[0] {
+		t.Error("a nil known set must return the input slice itself")
+	}
+	if hits != nil {
+		t.Errorf("hits = %+v, want nil", hits)
+	}
+	empty, _ := redaction.NewKnownValues()
+	got, hits = scrubKnownEvents(events, empty)
+	if &got[0] != &events[0] || hits != nil {
+		t.Errorf("an empty known set must return the input slice and nil hits: %+v", hits)
+	}
+}
+
+func TestScrubKnownEvents_ReplacesValueWithoutMutatingInput(t *testing.T) {
+	v := knownTestValue()
+	kv := knownTestSet(t, v)
+	original := `{"text":"saw ` + v + ` twice ` + v + `"}`
+	events := []agent.Event{
+		{Kind: "system.init"},
+		{Kind: "raw", Payload: json.RawMessage(original)},
+	}
+	got, hits := scrubKnownEvents(events, kv)
+	if len(got) != 2 || &got[0] == &events[0] {
+		t.Fatal("scrubKnownEvents must return a fresh slice of the same length")
+	}
+	if got[0].Payload != nil {
+		t.Errorf("a nil payload must pass through: %s", got[0].Payload)
+	}
+	if strings.Contains(string(got[1].Payload), v) {
+		t.Errorf("known value survived: %s", got[1].Payload)
+	}
+	if !strings.Contains(string(got[1].Payload), "[REDACTED:credential:ACC_TOKEN]") {
+		t.Errorf("marker missing: %s", got[1].Payload)
+	}
+	if string(events[1].Payload) != original {
+		t.Errorf("input payload mutated: %s", events[1].Payload)
+	}
+	if findHitCount(hits, "credential:ACC_TOKEN") != 2 {
+		t.Errorf("hits = %+v, want 2 credential:ACC_TOKEN", hits)
+	}
+	for _, h := range hits {
+		if strings.Contains(h.Pattern, v) {
+			t.Errorf("hit carries the value: %+v", h)
+		}
+	}
+}
+
+func TestScrubKnownString(t *testing.T) {
+	v := knownTestValue()
+	kv := knownTestSet(t, v)
+	if got, hits := scrubKnownString("agent printed "+v, nil); got != "agent printed "+v || hits != nil {
+		t.Errorf("nil set must be identity: %q %+v", got, hits)
+	}
+	if got, hits := scrubKnownString("", kv); got != "" || hits != nil {
+		t.Errorf("empty string must pass through: %q %+v", got, hits)
+	}
+	got, hits := scrubKnownString("agent printed "+v, kv)
+	if got != "agent printed [REDACTED:credential:ACC_TOKEN]" {
+		t.Errorf("scrubbed = %q", got)
+	}
+	if findHitCount(hits, "credential:ACC_TOKEN") != 1 {
+		t.Errorf("hits = %+v", hits)
+	}
+}

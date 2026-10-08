@@ -38,6 +38,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
@@ -1292,6 +1293,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//   4. The verdict schema constrains claudecode structured output;
 	//      other backends fall back to the /tmp/fishhawk-acceptance.json
 	//      file transport named in the prompt's output contract.
+	//   5. Known-value redaction (E72.41 / #3793): the values bound into
+	//      the agent (acceptanceKnownValueSource) compile into
+	//      acceptanceKnown, which scrubs the shipped verdict, the shipped
+	//      transcript, and the events + manifest failure reason of BOTH
+	//      bundle variants. Values under redaction.MinKnownValueBytes are
+	//      NOT redacted and are logged by binding NAME
+	//      (acceptance_known_value_below_floor), never by value.
+	//
+	// acceptanceKnown is declared at run() scope and ASSIGNED (never
+	// re-declared) inside the block below, so the verdict, transcript and
+	// bundle sites further down see the compiled set. nil on every other
+	// stage, which keeps their redaction byte-identical.
+	var acceptanceKnown *redaction.KnownValues
 	if stageType == "acceptance" {
 		tmpDir, err := os.MkdirTemp("", "fishhawk-acceptance-*")
 		if err != nil {
@@ -1491,6 +1505,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		inv.BaseEnv = baseEnv
 		inv.JSONSchema = acceptanceVerdictJSONSchema
+
+		var below []string
+		acceptanceKnown, below = redaction.NewKnownValues(acceptanceKnownValueSource()...)
+		for _, name := range below {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_known_value_below_floor","run_id":%q,"stage_id":%q,"binding":%q,"floor_bytes":%d}`+"\n",
+				cfg.runID, cfg.stageID, name, redaction.MinKnownValueBytes)
+		}
+		if n := acceptanceKnown.Len(); n > 0 {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_known_values_loaded","run_id":%q,"stage_id":%q,"count":%d}`+"\n",
+				cfg.runID, cfg.stageID, n)
+		}
 
 		// Clear any stale fallback verdict from a PRIOR run BEFORE the
 		// acceptance agent runs (#1535 / #1777). Extracted to
@@ -2369,7 +2396,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					rawVerdict = injected
 				}
 			}
-			redacted, hits := redactAcceptanceVerdict(rawVerdict)
+			redacted, hits := redactAcceptanceVerdict(rawVerdict, acceptanceKnown)
 			acceptanceVerdictRedacted = redacted
 			if len(hits) > 0 {
 				hitsJSON, _ := json.Marshal(hits)
@@ -2390,7 +2417,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// transcript ref — it is composed pre-trace, before the ship.
 			acceptanceTranscriptRedacted = captureAcceptanceTranscript(
 				acceptanceTranscriptPath(cfg.runID, cfg.stageID),
-				acceptanceServedVerdictIDs(acceptanceCriteriaIDs, acceptanceReplaySet), acceptanceWarn)
+				acceptanceServedVerdictIDs(acceptanceCriteriaIDs, acceptanceReplaySet), acceptanceKnown, acceptanceWarn)
 		}
 	}
 
@@ -2804,7 +2831,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// from #218) read. Identical event order, identical manifest
 	// timestamps — the only difference is `redaction.RedactDefault`
 	// applied to each event's payload + the manifest's
-	// agent_failure_reason.
+	// agent_failure_reason. The one exception to the raw variant's
+	// verbatim contract (E72.41 / #3793): on an acceptance stage the
+	// values bound into the agent (acceptanceKnown) are scrubbed from
+	// the events and the failure reason BEFORE either variant is packed.
 	//
 	// Category-A is the only failure class the runner stamps in the
 	// bundle manifest (E8.5): agent process failure. B is decided by
@@ -2863,6 +2893,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if agentFailed {
 			agentFailureReason = res.FailureReason
 		}
+		// Acceptance-bound values leave the failure reason before the
+		// manifest is built, so neither variant carries them (#3793).
+		agentFailureReason, knownReasonHits := scrubKnownString(agentFailureReason, acceptanceKnown)
 
 		manifestRaw := bundle.PackInputs{
 			RunID:   cfg.runID,
@@ -2906,7 +2939,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			res.Events = append(res.Events, *ev)
 		}
 
-		bytesData, _, err := bundle.PackBytes(manifestRaw, res.Events)
+		// Scrub acceptance-bound values from the events BOTH variants are
+		// packed from (#3793). res.Events itself is not mutated; with no
+		// known set packEvents IS res.Events, so the raw bundle stays
+		// byte-identical for every other stage.
+		packEvents, knownEventHits := scrubKnownEvents(res.Events, acceptanceKnown)
+		bytesData, _, err := bundle.PackBytes(manifestRaw, packEvents)
 		if err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"bundle_pack","detail":%q}`+"\n", err.Error())
@@ -2919,9 +2957,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// trailer hash stays consistent with its events — pack
 		// produces the trailer from whatever bytes it sees, so any
 		// post-pack rewrite would invalidate it.
-		redactedEvents, eventHits := redactEvents(res.Events)
+		redactedEvents, eventHits := redactEvents(packEvents)
 		redactedReason, reasonHits := redactString(agentFailureReason)
-		hits := mergeHits(eventHits, reasonHits)
+		hits := mergeHits(mergeHits(eventHits, reasonHits), mergeHits(knownEventHits, knownReasonHits))
 		if len(hits) > 0 {
 			hitsJSON, _ := json.Marshal(hits)
 			_, _ = fmt.Fprintf(logSink,

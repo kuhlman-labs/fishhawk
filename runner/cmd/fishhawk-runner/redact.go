@@ -14,7 +14,14 @@ import (
  * variants:
  *
  *   - raw        — events as captured, gated by S3 Object Lock
- *                  for compliance.
+ *                  for compliance. Verbatim with ONE exception
+ *                  (E72.41 / #3793, ADR-086 decision 2): the values
+ *                  bound into an acceptance agent are scrubbed by
+ *                  value (scrubKnownEvents / scrubKnownString) from
+ *                  the events and the manifest's agent_failure_reason
+ *                  BEFORE either variant is packed, so they appear in
+ *                  neither. Every other stage has no known set and
+ *                  packs byte-identical raw events.
  *   - redacted   — same events with `redaction.RedactDefault`
  *                  applied to each payload (and to the manifest's
  *                  agent_failure_reason); the SPA's transcript
@@ -70,6 +77,41 @@ func redactString(s string) (string, []redaction.Hit) {
 	}
 	red, hits := redaction.RedactDefault([]byte(s))
 	return string(red), hits
+}
+
+// scrubKnownEvents replaces every acceptance-bound known value (in each
+// encoded form redaction.KnownValues covers) in each event's payload and
+// returns a FRESH slice plus the aggregated hits; the input slice and its
+// payloads are never mutated. Events with a nil/empty payload pass through.
+// A nil or empty kv returns the input slice itself and nil hits, so a
+// stage with nothing bound packs byte-identical events.
+func scrubKnownEvents(events []agent.Event, kv *redaction.KnownValues) ([]agent.Event, []redaction.Hit) {
+	if kv.Len() == 0 || len(events) == 0 {
+		return events, nil
+	}
+	out := make([]agent.Event, len(events))
+	totals := map[string]int{}
+	for i, e := range events {
+		out[i] = e
+		if len(e.Payload) == 0 {
+			continue
+		}
+		scrubbed, hits := kv.Redact([]byte(e.Payload))
+		out[i].Payload = json.RawMessage(scrubbed)
+		for _, h := range hits {
+			totals[h.Pattern] += h.Count
+		}
+	}
+	return out, hitsFromMap(totals)
+}
+
+// scrubKnownString is scrubKnownEvents for one string — the manifest's
+// agent_failure_reason, which can carry a bound value an agent printed
+// before failing. A nil or empty kv returns s unchanged (KnownValues.Redact
+// is nil-safe and returns its input with nil hits).
+func scrubKnownString(s string, kv *redaction.KnownValues) (string, []redaction.Hit) {
+	scrubbed, hits := kv.Redact([]byte(s))
+	return string(scrubbed), hits
 }
 
 // hitsFromMap normalizes a counts-by-pattern map into the sorted

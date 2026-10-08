@@ -37,6 +37,11 @@ func TestDefaultPatterns_PositiveCases(t *testing.T) {
 		{"github-pat-classic", "ghp_" + strings.Repeat("a", 36)},
 		{"github-pat-fine-grained", "github_pat_" + strings.Repeat("a", 82)},
 		{"github-app-token", "ghs_" + strings.Repeat("a", 36)},
+		{"github-oauth-token", "gho_" + strings.Repeat("a", 36)},
+		{"github-user-to-server-token", "ghu_" + strings.Repeat("a", 36)},
+		{"github-refresh-token", "ghr_" + strings.Repeat("a", 36)},
+		{"gitlab-pat", "glpat-" + strings.Repeat("a", 20)},
+		{"gitlab-pat", "glpat-" + strings.Repeat("a", 10) + "_-" + strings.Repeat("b", 10)},
 		{"openai-api-key", "sk-" + strings.Repeat("A", 48)},
 		{"openai-project-key", "sk-proj-" + strings.Repeat("A", 50)},
 		{"anthropic-api-key", "sk-ant-api03-" + strings.Repeat("A", 50)},
@@ -117,6 +122,11 @@ func TestDefaultPatterns_NegativeCases(t *testing.T) {
 		"akia0123456789abcdef",                  // lowercase doesn't match aws-access-key-id
 		"npm_short",                             // too few trailing chars for npm-publish-token
 		"ghs_short",                             // fewer than 36 trailing chars: below github-app-token floor
+		"gho_" + strings.Repeat("a", 35),        // one char below the github-oauth-token floor
+		"ghq_" + strings.Repeat("a", 36),        // no such GitHub token prefix
+		"ghu_short",                             // below the github-user-to-server-token floor
+		"glpat-" + strings.Repeat("a", 19),      // one char below the gitlab-pat floor
+		"glpat_" + strings.Repeat("a", 20),      // underscore, not the gitlab-pat hyphen
 	}
 	for _, sample := range cases {
 		t.Run(sample[:min(30, len(sample))], func(t *testing.T) {
@@ -170,6 +180,30 @@ func TestDefaultPatterns_GitHubAppTokenNewFormat(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte("@github.com/owner/repo.git")) {
 		t.Errorf("URL tail after @ was over-consumed: %s", out)
+	}
+}
+
+// TestDefaultPatterns_LongGitHubTokenLeavesNoTail pins the `{36,}`
+// floor on the gho_/ghu_/ghr_ families (E72.41 / #3793): a token longer
+// than 40 chars (GitHub documents refresh tokens that long) is consumed
+// whole. A fixed `{36}` quantifier would replace only the first 36 body
+// chars and leave the rest of the token in the output.
+func TestDefaultPatterns_LongGitHubTokenLeavesNoTail(t *testing.T) {
+	for _, prefix := range []string{"gho_", "ghu_", "ghr_"} {
+		t.Run(prefix, func(t *testing.T) {
+			body := strings.Repeat("a", 36) + strings.Repeat("Z", 40)
+			in := "token=" + prefix + body + "@github.com"
+			out, hits := redaction.RedactDefault([]byte(in))
+			if len(hits) != 1 || hits[0].Count != 1 {
+				t.Fatalf("hits = %+v, want exactly one match", hits)
+			}
+			if bytes.Contains(out, []byte("Z")) {
+				t.Errorf("token tail survived redaction: %s", out)
+			}
+			if !bytes.HasSuffix(out, []byte("@github.com")) {
+				t.Errorf("match over-consumed past the `@` boundary: %s", out)
+			}
+		})
 	}
 }
 
