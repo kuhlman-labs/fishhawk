@@ -1535,6 +1535,19 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		// applyApprovedUpkeep as a guard whose deletion is observable on the
 		// reject path.
 		s.applyApprovedUpkeep(ctx, advanced, p.Decision)
+		// On-approval comms apply (#4017): when the decided plan stage carries
+		// the run's recorded comms_report, settle its capture window and, on a
+		// ratified approve only, file the captain-approved drafts through the
+		// work-item core, record suppressions and advance the user-report
+		// cursor. It NEVER creates a run and never touches a source report.
+		// Best-effort like the hooks above.
+		//
+		// THE PLACEMENT IS PART OF THE CONTROL, exactly as for upkeep: this is
+		// the TYPE-only block and the decision is PASSED, so "a rejected comms
+		// report files nothing, settles its window rejected and records its
+		// rejected suppressions" lives in applyApprovedComms as a guard whose
+		// deletion is observable on the reject path.
+		s.applyApprovedComms(ctx, advanced, p.Decision)
 	}
 
 	// Sticky status comment (E20.4 / #330). Every approval changes the run's
