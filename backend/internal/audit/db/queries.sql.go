@@ -248,12 +248,14 @@ SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, 
    AND ($2::uuid  IS NULL OR run_id   = $2::uuid)
    AND ($3::uuid IS NULL OR account_id = $3::uuid OR account_id IS NULL)
  ORDER BY ts DESC, id DESC
+ LIMIT $4::int
 `
 
 type ListAuditEntriesAllParams struct {
 	Category  *string    `json:"category"`
 	RunID     *uuid.UUID `json:"run_id"`
 	AccountID *uuid.UUID `json:"account_id"`
+	RowLimit  *int32     `json:"row_limit"`
 }
 
 // Cross-chain feed (per-run rows + global-chain rows) used by the
@@ -265,8 +267,15 @@ type ListAuditEntriesAllParams struct {
 // set filter keeps the account's rows PLUS untenanted (NULL account_id)
 // rows — the same contract as run.ListRuns — while NULL (unset) keeps
 // the internal system readers' cross-account scans unconstrained.
+// row_limit (#4017) caps the result at the NEWEST row_limit rows of the
+// ordering above; NULL is LIMIT ALL, so an unset limit reads every row.
 func (q *Queries) ListAuditEntriesAll(ctx context.Context, arg ListAuditEntriesAllParams) ([]AuditEntry, error) {
-	rows, err := q.db.Query(ctx, listAuditEntriesAll, arg.Category, arg.RunID, arg.AccountID)
+	rows, err := q.db.Query(ctx, listAuditEntriesAll,
+		arg.Category,
+		arg.RunID,
+		arg.AccountID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

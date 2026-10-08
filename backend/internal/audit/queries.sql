@@ -99,8 +99,11 @@ ORDER BY ae.sequence ASC;
 -- set filter keeps the account's rows PLUS untenanted (NULL account_id)
 -- rows — the same contract as run.ListRuns — while NULL (unset) keeps
 -- the internal system readers' cross-account scans unconstrained.
+-- row_limit (#4017) caps the result at the NEWEST row_limit rows of the
+-- ordering above; NULL is LIMIT ALL, so an unset limit reads every row.
 SELECT * FROM audit_entries
  WHERE (sqlc.narg(category)::text IS NULL OR category = sqlc.narg(category)::text)
    AND (sqlc.narg(run_id)::uuid  IS NULL OR run_id   = sqlc.narg(run_id)::uuid)
    AND (sqlc.narg(account_id)::uuid IS NULL OR account_id = sqlc.narg(account_id)::uuid OR account_id IS NULL)
- ORDER BY ts DESC, id DESC;
+ ORDER BY ts DESC, id DESC
+ LIMIT sqlc.narg(row_limit)::int;

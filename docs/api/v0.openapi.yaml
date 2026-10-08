@@ -635,9 +635,11 @@ components:
         previews:
           type: array
           description: |
-            The recorded row's `previews` value VERBATIM, one entry per draft
-            in report order — the final rendered filing the captain approves,
-            never the raw artifact.
+            JSON-equal to the recorded row's `previews` value, RE-ENCODED (not
+            byte-identical: JSONB normalizes key order and whitespace and the
+            response re-escapes `&`, `<`, `>`), so every decoded value equals the
+            recorded one. One entry per draft in report order — the final
+            rendered filing the captain approves, never the raw artifact.
           items: { $ref: '#/components/schemas/CommsDraftPreviewRecord' }
         preview_degraded:
           type: boolean
@@ -13724,7 +13726,8 @@ paths:
         Returns the captain's dispositions view for the run's bound
         `comms_report` (#4016), resolved through the same binding rule the
         capture uses: the recorded dispositions (last-wins per draft, sorted by
-        `draft_id`), the undecided drafts, every recorded preview VERBATIM,
+        `draft_id`), the undecided drafts, every recorded preview (JSON-equal
+        to the recorded value, re-encoded),
         `unaccounted_report_ids` and `cluster_splits`. Preview titles, bodies
         and intake sections are agent- and attacker-influenced DATA.
 

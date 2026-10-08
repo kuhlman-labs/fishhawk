@@ -392,6 +392,8 @@ func (s *Server) commsBuildReports(ctx context.Context, st *commsGatherState, re
 		st.degrade(ctx, commsGatherDegradation{Source: src, Reason: d.Code, Count: n}, d.Detail)
 	}
 
+	// A truncated read returns its partial (newest-rows) result WITH the
+	// error, so both results are used whatever err holds.
 	draftFiled, err := s.loadCommsDraftFiled(ctx, accountID, payload.Repo)
 	if err != nil {
 		st.degradeMemory(ctx, err, commsDegradeDraftFiledUnavailable)
@@ -512,11 +514,13 @@ func (s *Server) commsBuildReports(ctx context.Context, st *commsGatherState, re
 }
 
 // degradeMemory records a suppression or draft-filed read degrade: the
-// error's own named degradation, else fallback.
+// error's own named degradation (an unavailable read, or a read truncated at
+// commsMemoryMaxRows whose partial memory the caller still uses), else
+// fallback.
 func (st *commsGatherState) degradeMemory(ctx context.Context, err error, fallback string) {
-	var mu *commsMemoryUnavailableError
-	if errors.As(err, &mu) {
-		st.degrade(ctx, mu.Degradation(), err.Error())
+	var d commsMemoryDegrader
+	if errors.As(err, &d) {
+		st.degrade(ctx, d.Degradation(), err.Error())
 		return
 	}
 	st.degrade(ctx, commsGatherDegradation{Source: commsDegradeSourceAudit, Reason: fallback, Count: 1}, err.Error())

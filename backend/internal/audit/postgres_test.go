@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -195,6 +196,65 @@ func TestPostgres_ListForRunByCategory(t *testing.T) {
 	for _, e := range got {
 		if e.Category != "plan_generated" {
 			t.Errorf("Category = %q, want plan_generated", e.Category)
+		}
+	}
+}
+
+// TestPostgres_ListAll_Limit pins the #4017 row cap pushed into
+// ListAuditEntriesAll: Limit N returns exactly the N NEWEST rows of the
+// category in ts-descending order, the cap counts rows AFTER the category
+// WHERE clause (a newer row of another category does not consume it), and
+// Limit 0 (LIMIT NULL = LIMIT ALL) or a limit past int32 returns every row.
+// The rows are appended OUT of timestamp order, so a cap that kept the
+// first-inserted rows instead of the newest ones fails the order check.
+func TestPostgres_ListAll_Limit(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	ctx := context.Background()
+	const category = "comms_cap_probe"
+	const n = 3
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	add := func(cat string, minute int) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"category": cat, "minute": minute})
+		rid := runID
+		if _, err := repo.Append(ctx, audit.AppendParams{
+			RunID: &rid, Timestamp: base.Add(time.Duration(minute) * time.Minute),
+			Category: cat, Payload: body, EntryHash: entryHash(0, body),
+		}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	// n+2 rows of the category, inserted out of ts order, plus a NEWER row
+	// of another category.
+	for _, m := range []int{3, 0, 4, 1, 2} {
+		add(category, m)
+	}
+	add("comms_cap_other", 10)
+
+	minutes := func(es []*audit.Entry) []int {
+		var out []int
+		for _, e := range es {
+			out = append(out, int(e.Timestamp.Sub(base)/time.Minute))
+		}
+		return out
+	}
+	cat := category
+	got, err := repo.ListAll(ctx, audit.ListAllParams{Category: &cat, Limit: n})
+	if err != nil {
+		t.Fatalf("ListAll(Limit %d): %v", n, err)
+	}
+	if fmt.Sprint(minutes(got)) != fmt.Sprint([]int{4, 3, 2}) {
+		t.Fatalf("ListAll(Limit %d) minutes = %v, want the %d newest [4 3 2]", n, minutes(got), n)
+	}
+	for _, lim := range []int{0, math.MaxInt32 + 1} {
+		all, err := repo.ListAll(ctx, audit.ListAllParams{Category: &cat, Limit: lim})
+		if err != nil {
+			t.Fatalf("ListAll(Limit %d): %v", lim, err)
+		}
+		if fmt.Sprint(minutes(all)) != fmt.Sprint([]int{4, 3, 2, 1, 0}) {
+			t.Fatalf("ListAll(Limit %d) minutes = %v, want every row [4 3 2 1 0]", lim, minutes(all))
 		}
 	}
 }
