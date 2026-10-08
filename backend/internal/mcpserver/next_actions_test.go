@@ -5868,9 +5868,17 @@ func TestNextActions_AcceptanceRollbackOffered(t *testing.T) {
 				rb.Params["deploy_stage_id"] != "deploy-stage-1" || rb.Params["run_id"] != run.ID {
 				t.Errorf("deploy_rollback params = %v, want run_id + the stored handle rev-abc + artifact-1 + deploy-stage-1", rb.Params)
 			}
-			for _, phrase := range []string{"fishhawk deploy rollback " + run.ID, "/v0/runs/{run_id}/deployment/rollback", "fishhawk_rollback_handle", "rev-abc"} {
+			for _, phrase := range []string{"fishhawk deploy rollback " + run.ID, "/v0/runs/{run_id}/deployment/rollback", "fishhawk_rollback_handle", "params.rollback_handle"} {
 				if !strings.Contains(rb.Reason, phrase) {
 					t.Errorf("deploy_rollback reason %q does not name %q", rb.Reason, phrase)
+				}
+			}
+			// The pipeline-supplied handle is untrusted free text: it rides ONLY
+			// in the structured params, never in any prose an operator agent
+			// reads as instructions.
+			for _, a := range na.Actions {
+				if strings.Contains(a.Reason, "rev-abc") || strings.Contains(a.Precondition, "rev-abc") {
+					t.Errorf("%s prose embeds the pipeline-supplied rollback_handle: reason %q precondition %q", a.Action, a.Reason, a.Precondition)
 				}
 			}
 			if !strings.Contains(rb.Precondition, "Operator-gated") {
@@ -5944,6 +5952,50 @@ func TestNextActions_AcceptanceRollbackInitiated(t *testing.T) {
 	}
 	if na.Actions[0].Params["category"] != auditCategoryDeploymentRollbackCompleted {
 		t.Errorf("list_audit category = %q, want %q", na.Actions[0].Params["category"], auditCategoryDeploymentRollbackCompleted)
+	}
+}
+
+// TestNextActions_AcceptanceRollbackInitiated_NilAcceptanceStage: the Initiated
+// branch derives its poll interval off the acceptance stage, which is nil when
+// the stage list is empty or stale. It must still return the initiated state
+// with its poll (the interval falls back to the default) rather than panic.
+func TestNextActions_AcceptanceRollbackInitiated_NilAcceptanceStage(t *testing.T) {
+	run := naReleaseRunIn("succeeded")
+	direct := acceptanceRollbackOfferedNextActions(run, &acceptanceRollbackOffer{Initiated: true}, nil)
+	recent := []AuditEntry{
+		naRollbackInitiatedEntry(12),
+		naRollbackTriageEntry(11, "rev-abc"),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	viaClassify := naNextActionsFromRecent(run, nil, recent, releaseSignals{IsRelease: true})
+	for name, na := range map[string]*NextActions{"direct": direct, "no stages": viaClassify} {
+		if na == nil || na.State != "acceptance_triage_rollback_initiated" {
+			t.Fatalf("%s: state = %+v, want acceptance_triage_rollback_initiated", name, na)
+		}
+		poll := findAction(t, na, "fishhawk_get_run_status")
+		if want := strconv.Itoa(suggestedStageWaitPollIntervalSeconds); poll.Params["poll_interval_seconds"] != want {
+			t.Errorf("%s: poll interval = %q, want the default %s for a nil acceptance stage", name, poll.Params["poll_interval_seconds"], want)
+		}
+	}
+}
+
+// TestNextActions_AcceptanceRollbackOffered_CancelledRunSkipsArm: a CANCELLED
+// release run carrying a stale rollback_offered triage reads the bare terminal
+// state — the operator ended the run, so no rollback is re-offered. A FAILED
+// run keeps the arm (its deploy is still live). Without the cancelled guard the
+// cancelled row reads acceptance_triage_rollback_offered with deploy_rollback.
+func TestNextActions_AcceptanceRollbackOffered_CancelledRunSkipsArm(t *testing.T) {
+	recent := []AuditEntry{naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed)}
+	cancelled := naNextActionsFromRecent(naReleaseRunIn("cancelled"), naReleaseStages(), recent, releaseSignals{IsRelease: true, DeployState: "succeeded"})
+	if cancelled == nil || cancelled.State != "cancelled" {
+		t.Fatalf("cancelled run state = %+v, want the bare cancelled state", cancelled)
+	}
+	if nextActionOffered(cancelled, "deploy_rollback") {
+		t.Errorf("a cancelled run must not re-offer a rollback; got %v", actionNames(cancelled))
+	}
+	failed := naNextActionsFromRecent(naReleaseRunIn("failed"), naReleaseStages(), recent, releaseSignals{IsRelease: true, DeployState: "succeeded"})
+	if failed == nil || failed.State != "acceptance_triage_rollback_offered" || !nextActionOffered(failed, "deploy_rollback") {
+		t.Errorf("a failed release run must keep the rollback offer; got %+v", failed)
 	}
 }
 

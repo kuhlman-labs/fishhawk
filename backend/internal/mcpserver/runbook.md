@@ -806,7 +806,10 @@ Once the rollback is initiated the state becomes
 `acceptance_triage_rollback_initiated`: watch `deployment_rollback_completed` and
 do NOT roll back again. A multi-deploy run (#2642) or a run with an implement
 stage never gets the offer — it pages (`paged`) or keeps the class-1 fix-up
-route.
+route. A `cancelled` run no longer surfaces the offer (`next_actions` reads the
+bare terminal state); roll back by hand with `fishhawk deploy rollback <run-id>`
+if the deploy must still be reverted. The handle is shown only in the
+`deploy_rollback` step's `params.rollback_handle`, never in its prose.
 
 **Settled-outcome-unknown recovery (E31.16 / #1567).** A different failure from
 the paged case: the acceptance stage settled `succeeded` but **no**

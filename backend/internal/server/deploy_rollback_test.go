@@ -714,4 +714,13 @@ func TestRollbackDeployment_ArtifactReadError_RefusesWithoutDispatch(t *testing.
 	if resp.Error.Code != "internal_error" || !strings.Contains(resp.Error.Message, "rollback_handle") {
 		t.Errorf("error = %s / %q, want internal_error naming the rollback_handle read", resp.Error.Code, resp.Error.Message)
 	}
+	// The raw repository cause never reaches the client: writeError's 5xx
+	// default-deny details allow-list strips the `error` key (it is logged
+	// against error_ref instead) and keeps only stage_id.
+	if strings.Contains(w.Body.String(), "artifact store down") {
+		t.Errorf("500 body leaks the raw repository error: %s", w.Body.String())
+	}
+	if resp.Error.Details["stage_id"] != stage.ID.String() {
+		t.Errorf("500 details = %v, want stage_id %s", resp.Error.Details, stage.ID)
+	}
 }

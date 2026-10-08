@@ -573,9 +573,13 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// read as plain {State: succeeded} and a running one would never reach the
 	// acceptance arm (a release run has no implement stage). NEVER the merge
 	// ritual. An operator arbitration bound to the verdict discharges the offer
-	// (the keep-the-deploy alternative), so an arbitrated run skips the arm.
+	// (the keep-the-deploy alternative), so an arbitrated run skips the arm, and
+	// so does a CANCELLED run: the operator ended it, so a stale offer is not
+	// re-surfaced (it reads the bare terminal state). A failed run keeps the arm
+	// — its deploy is still live.
 	if acceptanceVerdict == acceptanceVerdictFailed &&
-		acceptanceTriageDisposition == acceptanceDispositionRollbackOffered && !acceptanceArbitrated {
+		acceptanceTriageDisposition == acceptanceDispositionRollbackOffered && !acceptanceArbitrated &&
+		run.State != "cancelled" {
 		return acceptanceRollbackOfferedNextActions(run, release.RollbackOffer, acceptance)
 	}
 
@@ -2021,8 +2025,11 @@ func acceptanceRollbackOfferedNextActions(run *Run, offer *acceptanceRollbackOff
 	handleNote := "the stored rollback_handle (read it from the acceptance_triage_decided rollback_offer payload) is re-sent to the pipeline as the fishhawk_rollback_handle workflow_dispatch input (github_actions) or variables.FISHHAWK_ROLLBACK_HANDLE (webhook) when the deploy recorded one"
 	if offer != nil {
 		if offer.RollbackHandle != "" {
+			// The handle is pipeline-supplied free text: it rides ONLY in the
+			// structured params, never in the Reason prose an operator agent
+			// reads as instructions.
 			rollbackParams["rollback_handle"] = offer.RollbackHandle
-			handleNote = "the endpoint re-reads the stored rollback_handle (" + offer.RollbackHandle + ") and re-sends it to the pipeline as the fishhawk_rollback_handle workflow_dispatch input (github_actions) or variables.FISHHAWK_ROLLBACK_HANDLE (webhook)"
+			handleNote = "the endpoint re-reads the stored rollback_handle (shown in params.rollback_handle) and re-sends it to the pipeline as the fishhawk_rollback_handle workflow_dispatch input (github_actions) or variables.FISHHAWK_ROLLBACK_HANDLE (webhook)"
 		} else {
 			handleNote = "the deploy recorded no rollback_handle (or it could not be read at triage), so the pipeline is re-dispatched in rollback mode without one — the endpoint re-reads it and refuses 500 with no dispatch if that read fails"
 		}
