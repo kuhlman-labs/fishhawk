@@ -300,6 +300,15 @@ workflows:
       #    the pull request.
       - id: implement
         type: implement
+        # Two local implements may run at once (ADR-087 / #3964). Safe since
+        # the ADR-063 container gate path went live (#4040/#4061): each gate
+        # gets a private verify lock, golangci-lint cache and Postgres
+        # service. Measured: one container verify peaks at ~4.2 GiB / ~12 of
+        # 14 cores, so Docker Desktop memory must be >= 16 GiB. Still
+        # serialized elsewhere: acceptance (below), and the operator rule of
+        # never merging an overlapping PR under a live implement (#4083).
+        concurrency:
+          limit: 2
         executor:
           agent: claude-code
           # Pinned so the implement model is reproducible and priced rather
@@ -446,6 +455,13 @@ workflows:
       # stays conditioned on a passing or explicitly arbitrated result.
       - id: acceptance
         type: acceptance
+        # One acceptance at a time on this host: every local acceptance
+        # validates against the single shared preview (localhost:8090,
+        # fishhawk_preview DB), so two would clobber each other's target.
+        # Interim safety net until per-run previews (#4063).
+        concurrency:
+          group: local-acceptance
+          limit: 1
         executor:
           # An acceptance stage must run under an agent or human executor.
           agent: claude-code
@@ -541,6 +557,15 @@ workflows:
       #    proposal, and the allow-list below is what bounds it.
       - id: implement
         type: implement
+        # Two local implements may run at once (ADR-087 / #3964). Safe since
+        # the ADR-063 container gate path went live (#4040/#4061): each gate
+        # gets a private verify lock, golangci-lint cache and Postgres
+        # service. Measured: one container verify peaks at ~4.2 GiB / ~12 of
+        # 14 cores, so Docker Desktop memory must be >= 16 GiB. Still
+        # serialized elsewhere: acceptance (below), and the operator rule of
+        # never merging an overlapping PR under a live implement (#4083).
+        concurrency:
+          limit: 2
         executor:
           agent: claude-code
           # Routine work (docs, tests, dependency bumps) holds up at `medium`.
