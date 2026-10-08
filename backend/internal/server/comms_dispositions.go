@@ -166,9 +166,13 @@ type commsClusterSplit struct {
 
 // commsDispositionsResponse is the body BOTH verbs return.
 //
-// Previews is the recorded row's previews value VERBATIM (approval condition
-// 3): kept as json.RawMessage, never decoded into a typed shape, so no field
-// is dropped, renamed or re-ordered on the way to the captain.
+// Previews is JSON-EQUAL to the recorded row's previews value (approval
+// condition 3), RE-ENCODED, not byte-identical: Postgres JSONB normalizes key
+// order and whitespace on store, and encoding/json re-escapes the raw value on
+// the way out (`&`, `<`, `>` become &, <, >). It is kept as
+// json.RawMessage and never decoded into a typed shape, so no field is
+// dropped or renamed on the way to the captain, and every decoded value (a
+// preview body included) equals the one recorded.
 type commsDispositionsResponse struct {
 	RunID                string                     `json:"run_id"`
 	ArtifactID           string                     `json:"artifact_id"`

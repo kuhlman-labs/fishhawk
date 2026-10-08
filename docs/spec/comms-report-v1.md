@@ -271,7 +271,8 @@ ingest), title, labels, defaulted labels, `parent_epic`, `source_refs` and
 `unaccounted_report_ids` and the not_drafted / n_drift entries. The
 dispositions read (`GET /v0/runs/{run_id}/comms-dispositions`, see
 [Dispositions](#dispositions-postget-v0runsrun_idcomms-dispositions-4016)) is
-that review surface: it returns every recorded preview VERBATIM, the undecided
+that review surface: it returns every recorded preview JSON-equal to the
+recorded value (re-encoded, not byte-identical), the undecided
 drafts, `unaccounted_report_ids` and the cluster splits in one read. The raw
 artifact keeps the unneutralized agent prose and is NOT the review surface.
 Preview titles, bodies and the intake section are agent- and
@@ -295,7 +296,7 @@ guard.
 ## Residuals
 
 - **Intake section titles.** The #3774 intake advisory section appended AFTER the comms body renders tracker TITLES verbatim (derives-from and duplicate-candidate lines). For user reports those titles are attacker-authored, so an @mention, `#N` or link there is published under the bot identity. The captain sees that section verbatim in the recorded preview; fixing it is a change to the shared intake renderer.
-- **Defaulted autonomy.** Work-management conventions default `autonomy:medium` when a filing carries no autonomy label. The renderer never emits `autonomy:*`, and each preview records `defaulted_labels` so the captain sees a defaulted tier, but suppressing it at filing is phase 7's (#4017).
+- **Defaulted autonomy (resolved by #4017).** Work-management conventions default `autonomy:medium` when a filing carries no autonomy label, and each preview records it in `labels` / `defaulted_labels`. The apply suppresses it at filing (see [Apply](#apply-4017)), so the preview's defaulted autonomy label is NOT filed: the reviewed `labels` list differs from the filed one by exactly that label.
 - **Point-in-time preview.** `previewWorkItem` reserves no number and the intake section can change before filing; `filing_body_digest` covers only the deterministic renderer output.
 - **Retry after a lost response.** The idempotent path re-renders previews at retry time; it never re-validates against a newer gather.
 - **Heal ordering spans two clocks.** The heal's "recorded at or before the artifact's creation" compares the gather row's fishhawkd-stamped timestamp with the artifact's database-stamped `created_at`. Clock skew larger than the gap between the original gather and the report's creation (the agent's whole session) could pass over the original gather, and skew larger than the gap between the creation and a later gather (at least the failed POST and its retry) could admit that later gather; both gaps dwarf NTP-synced skew. Recording the binding before the artifact would remove the cross-clock read, at the cost of a binding row without an artifact id.
@@ -377,7 +378,7 @@ return the same body (the POST echo IS the read):
 | `window_closed`, `settlement?` | the artifact's window; `settlement` `{settlement, closed_at, audit_sequence}` when closed |
 | `dispositions` | `[{draft_id, verdict, parent_epic?, recorded_at, recorded_by, audit_sequence}]`, last-wins per draft, sorted by `draft_id`; undecodable rows and rows of another artifact are skipped |
 | `undecided_draft_ids` | the report's draft ids with no disposition, in report order; always an array |
-| `previews` | the recorded row's `previews` value VERBATIM (never decoded into a typed shape): per draft, in report order, `{draft_id, filing_body_digest}` plus a rendered preview, `error` or `skipped` (see [`comms_report_recorded`](#comms_report_recorded)) |
+| `previews` | JSON-equal to the recorded row's `previews` value, RE-ENCODED (Postgres JSONB normalizes key order and whitespace; the response re-escapes `&`, `<`, `>`), never decoded into a typed shape, so every decoded value, a preview body included, equals the recorded one: per draft, in report order, `{draft_id, filing_body_digest}` plus a rendered preview, `error` or `skipped` (see [`comms_report_recorded`](#comms_report_recorded)) |
 | `preview_degraded`, `preview_degrade_reason?`, `charter_text` | from the recorded row |
 | `unaccounted_report_ids` | from the recorded row; always an array |
 | `clusters_recorded` | whether the bound gather recorded `suggested_clusters` (false for a gather recorded before #4016) |
@@ -390,3 +391,109 @@ or `unaccounted` (cited nowhere; no `entry_id`). A cluster is SPLIT when its
 members' `(kind, entry_id)` placements are not all equal; only split clusters
 are listed. A split is a prompt for the captain to check the agent's reasoning,
 not an error.
+
+## Apply (#4017)
+
+When the captain DECIDES the plan stage that carries the run's recorded
+comms_report, `applyApprovedComms` (`backend/internal/server/comms_apply.go`,
+called from the approval path right after the upkeep apply) settles the
+report's window and, on a ratified approve only, files every captain-approved
+draft as a NEW tracker issue through the shared work-item filing core. It never
+creates a run and never labels, edits, closes or comments on a source report.
+Long-form contract: `backend/internal/server/README.md` § "On-approval comms
+apply".
+
+**Decision.** A decision other than approve settles the window `rejected`
+BEFORE any report-body read and files nothing; the cursor never moves. On a
+settled reject the completion row records `rejected` suppressions for the
+drafts the captain individually rejected or, when the consumed set holds NO
+disposition for this artifact (a whole-gate reject), for every draft's cited
+reports. A FAILED reject settlement leaves the consumed set unknown: it writes
+one degraded row (`comms_apply_window_unsettled`, `suppressions: []`) and
+suppresses nothing. An approve requires the report to still resolve to the
+recorded artifact and the gate to carry at least one grant and no rejection;
+either failure, or a failed `approved` settlement, degrades with the window
+left OPEN. Every later failure degrades with the window CLOSED and the cursor
+untouched.
+
+**Rows.** Exactly one `comms_draft_filed` or `comms_draft_skipped` row per
+draft, in report order, then ONE `comms_apply_completed` row.
+
+- `comms_draft_filed`: `{repo, issue_number, comment_id: 0, reports:
+  [{id, content_hash}], run_id, stage_id, artifact_id, draft_id, issue_url,
+  provider, title, parent_epic, applied_labels, stripped_labels,
+  suppressed_default_labels, filing_body_digest, prior_suppressions}`;
+  `reports` carry the GATHERED hashes.
+- `comms_draft_skipped`: `{run_id, stage_id, artifact_id, draft_id,
+  skip_reason, code?, message?, prior_issue_number?, conflicting_reports?}`.
+- `comms_apply_completed`: `{repo, artifact_id, decision, counts {drafts,
+  filed, skipped, failed, budget_exhausted}, degraded, degrade_reason?,
+  guard_truncated?, suppressions [{id, hash, basis, entry_id}], cursor
+  {advanced, cursor?, note_cursor?, held_report_ids, reason?, error?}}`. Every
+  row, degraded ones included, carries `repo` and a `suppressions` array.
+
+**Skip reasons** (closed set, first match wins): `undecided` (no consumed
+disposition); `rejected`; `already_filed` (this run already filed this
+artifact's draft); `filed_elsewhere` (a cited `(id, gathered hash)` already
+carries a `filed` suppression or appears in another artifact's
+`comms_draft_filed` record — the guard is PER REPORT); `parent_epic_is_source`
+(the effective parent epic, the captain's override else the proposal's, is the
+issue a cited report lives on); `apply_budget_exhausted`; `filing_failed` with
+`code` `filing_body_digest_absent`, `filing_body_drift`, `charter_unavailable`
+(the reviewed body quoted the charter's rubric text and the charter cannot be
+read now — a transient read failure, distinct from drift) or the filing core's
+own code. A cited report holding a prior `rejected` or `n_drift` suppression
+from another apply is FILED and flagged in `prior_suppressions`.
+
+**Degrade reasons** (closed set): `comms_apply_report_unreadable`,
+`comms_apply_not_ratified`, `comms_apply_window_unsettled`,
+`comms_apply_run_unreadable`, `comms_apply_account_unparseable`,
+`comms_apply_repo_unresolvable`, `comms_apply_conventions_unavailable`,
+`comms_apply_prior_filings_unreadable`, `comms_apply_guard_unavailable`,
+`comms_apply_lock_wait_exhausted`, `comms_apply_prelaunch_timeout`.
+
+**What is filed.** The filing renderer's body for the draft over the EXACT
+gather the report was bound to (loaded by its stored `gather_digest`), with
+rubric text rendered per the RECORDED `charter_text`. Its digest must equal the
+recorded preview's `filing_body_digest`, else the draft is skipped
+`filing_failed`: nothing the captain did not review is filed. **The digest
+covers the PRE-INTAKE renderer output.** The intake advisory section appended
+at filing is point-in-time and can differ from the preview's; the filed body
+equals the reviewed preview body exactly when neither intake run appends a
+section (a DEGRADED evaluation with no findings; a successful empty evaluation
+still appends one). Labels exclude every `autonomy:*`, and the conventions'
+DEFAULTED autonomy tier is suppressed, recorded as `suppressed_default_labels`:
+**the preview's defaulted autonomy label is NOT filed, so the reviewed labels
+list differs from the filed one by exactly that label.** No idempotency key is
+stamped (it would append a marker and change the reviewed body).
+
+**Suppressions.** Filed and already-filed drafts' cited reports get `filed`,
+rejected drafts' get `rejected`, every n_drift entry's get `n_drift`, each at
+the gathered hash; the gather's suppression memory reads them back, and a
+materially edited report (new hash) re-enters.
+
+**Cursor.** Only a ratified, non-degraded approve advances. The gather's
+pending cursor is held back to the earliest `updated_at` among the unaccounted
+reports, the undecided drafts' sources and the approved-but-unfiled drafts'
+sources; the note floor advances first, then the issues cursor, each
+monotonically. `cursor.reason` when it does not advance: `decision_reject`,
+`apply_degraded`, `scan_incomplete`, `cursor_store_unwired`, `advance_failed`.
+
+**Serialization and the row cap.** Applies for one (account, repository) are
+serialized in-process by a lock whose wait is bounded by the apply budget (on
+expiry: every draft `apply_budget_exhausted`, one degraded
+`comms_apply_lock_wait_exhausted` row, no advance); the double-filing guard is
+read inside it. The suppression and draft-filed reads keep the NEWEST
+2000 rows of their audit category. **The cap counts ACCOUNT-category rows**
+(sibling repositories' rows and NULL-account rows included), not per-repository
+rows; a read that hits it records a named truncation degradation
+(`suppression_memory_truncated` / `draft_filed_truncated` on the gather,
+`guard_truncated` on the apply). Truncation weakens BOTH the gather's
+suppression and the apply's double-filing guard.
+
+**Residuals.**
+
+- **Two replicas.** Serialization is in-process; two fishhawkd replicas can race and file one report twice.
+- **At-least-once filing.** A filing that succeeds but whose `comms_draft_filed` row is lost could re-file on a later apply of the same artifact; the filed issue carries the comms draft marker for manual dedupe.
+- **Charter drift.** A charter changed between ingest and apply skips the drafts whose reviewed body quoted it (`filing_body_drift`); their sources hold the cursor and are re-proposed.
+- **Monotonic cursor.** Overlapping applies resolve to the maximum cursor, so a report one run held can be passed by another run that accounted for it.
