@@ -214,16 +214,20 @@ func TestLatestCommsScanGathered_Errors(t *testing.T) {
 	ctx := context.Background()
 	runID, stageID := uuid.New(), uuid.New()
 
-	if _, _, err := New(Config{Addr: "127.0.0.1:0"}).latestCommsScanGathered(ctx, runID, stageID); err == nil {
-		t.Fatal("nil AuditRepo: want error")
+	// A store that did not answer is NOT errCommsScanUnbound: the comms ingest
+	// maps it to a 500, never to scan_context_absent (#4015).
+	if _, _, err := New(Config{Addr: "127.0.0.1:0"}).latestCommsScanGathered(ctx, runID, stageID); err == nil || errors.Is(err, errCommsScanUnbound) {
+		t.Fatalf("nil AuditRepo: err=%v, want a non-unbound error", err)
 	}
 	au := newAuditFake()
 	au.listByCategoryErr = errors.New("boom")
-	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil {
-		t.Fatal("list error: want error")
+	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil || errors.Is(err, errCommsScanUnbound) {
+		t.Fatalf("list error: err=%v, want a non-unbound error", err)
+	} else if !errors.Is(err, au.listByCategoryErr) {
+		t.Errorf("list error: err=%v does not wrap the store error", err)
 	}
-	if _, _, err := newCommsRecordServer(newAuditFake()).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "no comms_scan_gathered row") {
-		t.Fatalf("absent: err=%v", err)
+	if _, _, err := newCommsRecordServer(newAuditFake()).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "no comms_scan_gathered row") || !errors.Is(err, errCommsScanUnbound) {
+		t.Fatalf("absent: err=%v, want the unbound sentinel", err)
 	}
 
 	// The latest row carries an unknown field: strict decode refuses it rather
@@ -236,8 +240,10 @@ func TestLatestCommsScanGathered_Errors(t *testing.T) {
 	bad := commsSeed(t, CategoryCommsScanGathered, runID, nil, map[string]any{"stage_id": stageID, "surprise": true})
 	bad.StageID, bad.Sequence = &stageID, 2
 	au.seeded = []*audit.Entry{older, bad}
-	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "unknown field") {
-		t.Fatalf("undecodable latest: err=%v", err)
+	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "unknown field") || !errors.Is(err, errCommsScanUnbound) {
+		t.Fatalf("undecodable latest: err=%v, want the unbound sentinel", err)
+	} else if strings.Contains(err.Error(), errCommsScanUnbound.Error()) {
+		t.Errorf("undecodable latest: message %q gained the sentinel text; the message must stay unchanged", err)
 	}
 
 	// The entry's stage column and the payload's stage_id disagree.
@@ -247,8 +253,8 @@ func TestLatestCommsScanGathered_Errors(t *testing.T) {
 	mis := commsSeed(t, CategoryCommsScanGathered, runID, nil, other)
 	mis.StageID = &stageID
 	au.seeded = []*audit.Entry{mis}
-	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "row names stage") {
-		t.Fatalf("stage mismatch: err=%v", err)
+	if _, _, err := newCommsRecordServer(au).latestCommsScanGathered(ctx, runID, stageID); err == nil || !strings.Contains(err.Error(), "row names stage") || !errors.Is(err, errCommsScanUnbound) {
+		t.Fatalf("stage mismatch: err=%v, want the unbound sentinel", err)
 	}
 }
 

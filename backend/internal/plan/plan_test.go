@@ -1441,6 +1441,15 @@ func TestDetectArtifactKind(t *testing.T) {
 		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindUpkeepReport)
 	}
 
+	// The comms_report sibling (#4015) is the FOURTH additive kind.
+	k, err = plan.DetectArtifactKind(commsExampleBytes(t))
+	if err != nil {
+		t.Fatalf("DetectArtifactKind(comms_report): %v", err)
+	}
+	if k != plan.ArtifactKindCommsReport {
+		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindCommsReport)
+	}
+
 	k, err = plan.DetectArtifactKind(readFixture(t, "valid/example.json"))
 	if err != nil {
 		t.Fatalf("DetectArtifactKind(plan): %v", err)
@@ -1546,8 +1555,88 @@ func TestValidateArtifact_RoutesByKind(t *testing.T) {
 	if err := plan.ValidateArtifact(groomingMinimal()); err != nil {
 		t.Errorf("ValidateArtifact(grooming_report): %v", err)
 	}
+	if err := plan.ValidateArtifact(commsExampleBytes(t)); err != nil {
+		t.Errorf("ValidateArtifact(comms_report): %v", err)
+	}
 	if err := plan.ValidateArtifact(readFixture(t, "valid/example.json")); err != nil {
 		t.Errorf("ValidateArtifact(plan): %v", err)
+	}
+	// A comms_report violating ONLY a semantic rule must reach the comms
+	// validator: routed to the plan schema it would be a *SchemaError instead.
+	notDerived := commsExampleMutated(t, func(m map[string]any) {
+		commsDraftAt(m, 0)["id"] = "draft:UR-issue-12"
+	})
+	var se *plan.SemanticError
+	if err := plan.ValidateArtifact(notDerived); !errors.As(err, &se) {
+		t.Errorf("ValidateArtifact(comms_report, rule b): err = %v, want *SemanticError", err)
+	}
+}
+
+// TestParseCommsReport_ErrorTyping pins ParseCommsReport's order and error
+// types (#4015): parse, then the embedded comms-report-v1 schema, then the
+// strict decode, then CheckCommsReportSemantics.
+func TestParseCommsReport_ErrorTyping(t *testing.T) {
+	r, err := plan.ParseCommsReport(commsExampleBytes(t))
+	if err != nil {
+		t.Fatalf("ParseCommsReport(example): %v", err)
+	}
+	if r.Kind != plan.KindCommsReport || r.ReportVersion != plan.CommsReportVersion {
+		t.Errorf("kind/version = %q/%q", r.Kind, r.ReportVersion)
+	}
+	if len(r.Drafts) != 1 || r.Drafts[0].ID != "draft:UR-issue-12+UR-issue-40" || len(r.NDrift) != 1 || len(r.NotDrafted) != 1 {
+		t.Errorf("decoded report = %+v, want the example's one draft, one n_drift, one not_drafted", r)
+	}
+	if err := plan.ValidateCommsReport(commsExampleBytes(t)); err != nil {
+		t.Errorf("ValidateCommsReport(example): %v", err)
+	}
+
+	var pe *plan.ParseError
+	for name, body := range map[string][]byte{"empty": nil, "blank": []byte("  \n"), "not json": []byte("{ nope")} {
+		if _, err := plan.ParseCommsReport(body); !errors.As(err, &pe) {
+			t.Errorf("%s: err = %v, want *ParseError", name, err)
+		}
+	}
+
+	var sch *plan.SchemaError
+	extra := commsExampleMutated(t, func(m map[string]any) { m["extra"] = true })
+	if _, err := plan.ParseCommsReport(extra); !errors.As(err, &sch) {
+		t.Errorf("extra property: err = %v, want *SchemaError", err)
+	}
+	wrongVersion := commsExampleMutated(t, func(m map[string]any) { m["report_version"] = "comms_report_v2" })
+	if _, err := plan.ParseCommsReport(wrongVersion); !errors.As(err, &sch) {
+		t.Errorf("wrong report_version: err = %v, want *SchemaError (the schema const is the first line)", err)
+	}
+
+	var se *plan.SemanticError
+	autonomy := commsExampleMutated(t, func(m map[string]any) {
+		commsIssueAt(m, 0)["labels"] = []any{"area:backend", "autonomy:high"}
+	})
+	if _, err := plan.ParseCommsReport(autonomy); !errors.As(err, &se) || !strings.HasPrefix(se.Message, "/drafts/0/proposed_issue/labels/1:") {
+		t.Errorf("autonomy label: err = %v, want *SemanticError at /drafts/0/proposed_issue/labels/1", err)
+	}
+	if err := plan.ValidateCommsReport(autonomy); !errors.As(err, &se) {
+		t.Errorf("ValidateCommsReport(autonomy label): err = %v, want *SemanticError", err)
+	}
+}
+
+// TestEmbeddedCommsReportSchemaHash pins the advertised hash to the embedded
+// mirror's canonical bytes (#4015).
+func TestEmbeddedCommsReportSchemaHash(t *testing.T) {
+	raw, err := os.ReadFile("schemas/comms-report-v1.schema.json")
+	if err != nil {
+		t.Fatalf("read mirror: %v", err)
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("parse mirror: %v", err)
+	}
+	canonical, _ := json.Marshal(v)
+	sum := sha256.Sum256(canonical)
+	if got, want := plan.EmbeddedCommsReportSchemaHash(), hex.EncodeToString(sum[:]); got != want {
+		t.Errorf("EmbeddedCommsReportSchemaHash = %s, want %s", got, want)
+	}
+	if plan.EmbeddedCommsReportSchemaHash() == plan.EmbeddedUpkeepReportSchemaHash() {
+		t.Error("comms and upkeep schema hashes are equal; the embed points at the wrong file")
 	}
 }
 
