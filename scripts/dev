@@ -1938,6 +1938,7 @@ _prune_aged_artifacts() {
     "$tmp_dir"/fishhawk-scope-justifications-*-*.json(N.m+${days}) \
     "$tmp_dir"/fishhawk-acceptance-*-*.json(N.m+${days}) \
     "$tmp_dir"/fishhawk-pr-*-*.md(N.m+${days}) \
+    "$tmp_dir"/fishhawk-plan-*-*.json(N.m+${days}) \
     "$tmp_dir"/fishhawk-prompt-*.txt(N.m+${days}); do
     if (( dry_run )); then
       print "would remove tmp sidecar: $f"

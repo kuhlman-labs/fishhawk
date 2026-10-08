@@ -40,8 +40,10 @@ const DefaultBinary = "claude"
 // agent is permitted outside the repo working tree. It seeds BOTH the
 // `--add-dir` invocation flags AND the out-of-tree write detector's
 // allowlist, so the flag and the detector can never drift. /tmp is
-// required for the plan artifact (/tmp/fishhawk-plan.json, matched by
-// backend/internal/prompt.PlanArtifactPath). The full allowlist at
+// required for the plan artifact (the run/stage-keyed
+// /tmp/fishhawk-plan-<run_id>-<stage_id>.json, matched by
+// backend/internal/prompt.PlanArtifactPath; the pre-#4067 fixed
+// prompt.LegacyPlanArtifactPath is also under /tmp). The full allowlist at
 // runtime is inv.WorkingDir plus these.
 var allowedExtraDirs = []string{"/tmp"}
 
@@ -319,9 +321,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	//
 	// --add-dir: Claude restricts writes to the working directory tree
 	// by default. The runner needs the agent to write its plan artifact
-	// to /tmp/fishhawk-plan.json (matched by
-	// backend/internal/prompt.PlanArtifactPath); /tmp is outside the
-	// customer's repo checkout so we explicitly expand the allowlist.
+	// to the run/stage-keyed /tmp/fishhawk-plan-<run_id>-<stage_id>.json
+	// (matched by backend/internal/prompt.PlanArtifactPath; an older
+	// backend's prompt names prompt.LegacyPlanArtifactPath, also under
+	// /tmp); /tmp is outside the customer's repo checkout so we explicitly
+	// expand the allowlist.
 	// allowedExtraDirs is the single source of truth shared with the
 	// out_of_tree_write detector so the flag and the detector can't drift.
 	args := []string{

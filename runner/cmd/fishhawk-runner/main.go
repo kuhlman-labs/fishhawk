@@ -355,6 +355,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// parseFlags already wrote a usage / error message.
 		return exitUsage
 	}
+	// Key the plan handoff per run/stage (#4067) BEFORE the prompt fetch, so
+	// every later plan-out reader sees the keyed path; a legacy fixed --plan-out
+	// (the GHA workflow and GitLab template still pass it) is rewritten here.
+	resolvePlanOut(&cfg, logSink)
 
 	// Capture the operator-provided dispatch working_dir BEFORE the
 	// E22.X/#1137 lineage-worktree relocation below overwrites
@@ -1996,6 +2000,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// the fix-up push. appliedFixup never changes inside the loop, so guarding
 	// the loop condition is equivalent to an early break on the first iteration.
 	for !appliedFixup {
+		// invokedAt bounds the legacy-plan fallback's freshness check (#4067):
+		// only a legacy file written during THIS invocation can be claimed.
+		invokedAt := time.Now()
 		res, invokeErr = invoker.Invoke(ctx, inv)
 
 		// Plan validation runs only if the agent itself succeeded —
@@ -2010,6 +2017,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// the historical behavior: operator's --plan-out flag drives
 		// validation directly.
 		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+			// Version skew (#4067): an older backend's prompt names the legacy
+			// fixed path, so claim a fresh legacy file onto the keyed path FIRST,
+			// before detectPlanSibling, keeping the precedence below intact. A
+			// no-op unless the fallback is armed and the prompt does not name the
+			// keyed path.
+			claimLegacyPlanArtifact(cfg, inv.Prompt, invokedAt, logSink)
 			// Adoption precedence (#1325, generalized by #2833):
 			// recognized-sibling(file) > structured_output > agent-written file,
 			// then the existing TryCoerce+validate gate.
