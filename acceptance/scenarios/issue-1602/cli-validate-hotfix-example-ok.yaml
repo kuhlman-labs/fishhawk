@@ -1,0 +1,14 @@
+id: scenario:issue-1602/cli-validate-hotfix-example-ok
+statement: 'Running the fishhawk CLI''s validate command on docs/spec/examples/workflow-v2-hotfix-change.yaml exits 0, prints a line beginning ''<path>: OK'' on stdout, and prints nothing on stderr.'
+verify_hint: 'CLI surface: build the fishhawk CLI from the run head and run `fishhawk validate docs/spec/examples/workflow-v2-hotfix-change.yaml`; observe exit code 0, stdout ''<path>: OK'', empty stderr.'
+steps: 'Built the fishhawk CLI from the run head (sanctioned checkout at c3c935e7, which equals the preview git_sha): cd cli && go build -o /tmp/fhacc1602/bin/fishhawk ./cmd/fishhawk. Ran /tmp/fhacc1602/bin/fishhawk validate <checkout>/docs/spec/examples/workflow-v2-hotfix-change.yaml, capturing the exit code, stdout and stderr separately.'
+assertions:
+    expected: 'Exit 0, a stdout line beginning ''<path>: OK'', empty stderr.'
+    observed_at_record: 'Exit 0. The first stdout line is ''<checkout>/docs/spec/examples/workflow-v2-hotfix-change.yaml: OK'', followed by the standard ''checked locally: ...'' line. Stderr is 0 bytes. The file is version "2", sha256 83c10d34....'
+    repro_handle: fishhawk validate docs/spec/examples/workflow-v2-hotfix-change.yaml; echo $?
+origin:
+    issue: 1602
+    pr: 4099
+    run_id: 90599d60-1e1a-4274-ba6d-8a875f798c79
+    head_sha: c3c935e755f2547c4d6fdc420b989aa50450f433
+    recorded_at: 2026-10-08T04:50:56Z
