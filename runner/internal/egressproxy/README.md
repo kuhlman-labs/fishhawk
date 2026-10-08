@@ -112,14 +112,28 @@ never reaches this package.
 
 ## Invocation env (`runner/internal/acceptenv`)
 
-`acceptenv.Env(base, proxyURL)` builds a default-deny allow-list of:
+`acceptenv.Env(base, proxyURL, opts...)` builds a default-deny allow-list of:
 
 - system essentials;
-- the model API keys (the one surviving secret class);
+- the model credentials (the one surviving secret class):
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN`
+  (E72.40 / #3792 — the inference-only token `claude setup-token` mints,
+  so the agent authenticates without the host keychain). Admission is
+  independent of credential isolation and inert when unset;
 - operator-declared target creds via the
   `FISHHAWK_ACCEPTANCE_ENV_<NAME>` passthrough (prefix stripped; a
   passthrough colliding with a denied key or a proxy var is REFUSED and
-  reported, never honored);
+  reported, never honored). When credential isolation is active
+  (`acceptenv.WithCredentialIsolation()`, passed by the runner only while
+  `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION` is not `off`), a passthrough
+  named `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+  `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `GH_CONFIG_DIR`,
+  `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `SSH_AUTH_SOCK` or any `GIT_CONFIG*`
+  name (any letter case) is REFUSED the same way, and
+  `acceptenv.IsolateCredentials` then points HOME/XDG/`GH_CONFIG_DIR` at
+  the synthetic home and pins `GIT_CONFIG_GLOBAL=/dev/null` +
+  `GIT_CONFIG_NOSYSTEM=1`. Under `off` those names pass through as before
+  (`TestEnv_CredentialLocatorRefusalIsConditional`);
 - `HTTP(S)_PROXY` / `ALL_PROXY` (both cases) pointed at the proxy, with
   `NO_PROXY` cleared;
 - `FISHHAWK_FORGE_WRITES=deny` (E72.13 / #3500), a FIXED injection never
