@@ -85,6 +85,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Per-finding upkeep dispositions (#3923): captain-only capture, read-access read-back.
 	mux.HandleFunc("POST /v0/runs/{run_id}/upkeep-dispositions", s.requireRunAccount(memberWrite, s.handleRecordUpkeepDispositions))
 	mux.HandleFunc("GET /v0/runs/{run_id}/upkeep-dispositions", s.requireRunAccount(readAccess, s.handleListUpkeepDispositions))
+	// Per-draft comms dispositions (#4016): captain-only capture (write:approvals,
+	// operator-only ladder) and the read-access dispositions view, beside the
+	// upkeep pair. Contract: docs/spec/comms-report-v1.md § "Dispositions".
+	mux.HandleFunc("POST /v0/runs/{run_id}/comms-dispositions", s.requireRunAccount(memberWrite, s.handleRecordCommsDispositions))
+	mux.HandleFunc("GET /v0/runs/{run_id}/comms-dispositions", s.requireRunAccount(readAccess, s.handleListCommsDispositions))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
 	// On-demand orphaned-review recovery (#2712): the same per-run helper the
@@ -363,9 +368,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			// The upkeep_report sibling (#3921), advertised by #3923 for the
 			// same drift-detection reason.
 			"upkeep-report-v1": plan.EmbeddedUpkeepReportSchemaHash(),
-			"workflow-v0":      spec.EmbeddedSchemaHash(),
-			"workflow-v1":      spec.EmbeddedSchemaHashV1(),
-			"workflow-v2":      spec.EmbeddedSchemaHashV2(),
+			// The comms_report sibling (#4015), advertised by #4016 for the
+			// same drift-detection reason.
+			"comms-report-v1": plan.EmbeddedCommsReportSchemaHash(),
+			"workflow-v0":     spec.EmbeddedSchemaHash(),
+			"workflow-v1":     spec.EmbeddedSchemaHashV1(),
+			"workflow-v2":     spec.EmbeddedSchemaHashV2(),
 		},
 		StartNonce: s.cfg.StartNonce,
 		DevMode:    s.devModeActive(),
