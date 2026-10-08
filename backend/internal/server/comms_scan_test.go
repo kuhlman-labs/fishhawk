@@ -3,9 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1237,6 +1241,182 @@ func TestCommsSuggestClusters(t *testing.T) {
 	}
 	if !csEqual(got[1].ReportIDs, []string{"UR-comment-1-9", "UR-issue-1", "UR-issue-3"}) || got[1].Score <= 0 || got[1].Score >= 1 {
 		t.Fatalf("second cluster = %+v", got[1])
+	}
+}
+
+// csClusterHeading is the served prompt's cluster section.
+const csClusterHeading = "### Server-suggested clusters (advisory)"
+
+// csRenderedClusters parses the "- score S: id, id (+N more)" lines of the
+// served prompt's cluster section into their id lists, in render order.
+func csRenderedClusters(t *testing.T, out string) [][]string {
+	t.Helper()
+	var got [][]string
+	for _, l := range csSection(t, out, csClusterHeading) {
+		rest, ok := strings.CutPrefix(l, "- score ")
+		if !ok {
+			continue
+		}
+		_, ids, ok := strings.Cut(rest, ": ")
+		if !ok {
+			t.Fatalf("cluster line %q has no ids", l)
+		}
+		if i := strings.Index(ids, " (+"); i >= 0 {
+			ids = ids[:i]
+		}
+		got = append(got, strings.Split(ids, ", "))
+	}
+	return got
+}
+
+func csRecordedClusterIDs(cls []commsRecordedCluster) [][]string {
+	var out [][]string
+	for _, c := range cls {
+		out = append(out, c.ReportIDs)
+	}
+	return out
+}
+
+// TestCommsScan_RecordedClustersMatchRender (#4016): a gather over two
+// near-duplicate shown reports records exactly the cluster the served prompt
+// renders, and the comms_scan_gathered row carries it.
+func TestCommsScan_RecordedClustersMatchRender(t *testing.T) {
+	f := newCSFixture(t, nil)
+	f.reader.items = []workmgmt.UserReportItem{
+		csIssue(5, "Login loops forever", "a", csBase.Add(1*time.Minute), commsExternalAuthor),
+		csIssue(6, "Dark mode please", "b", csBase.Add(2*time.Minute), commsExternalAuthor),
+		csIssue(7, "Login loops forever", "c", csBase.Add(3*time.Minute), commsExternalAuthor),
+	}
+	cc, g := f.gather(t)
+	rendered := csRenderedClusters(t, csBuild(t, cc))
+	want := [][]string{{"UR-issue-5", "UR-issue-7"}}
+	if fmt.Sprint(rendered) != fmt.Sprint(want) {
+		t.Fatalf("fixture: rendered clusters %v, want %v", rendered, want)
+	}
+	if got := csRecordedClusterIDs(g.Payload.SuggestedClusters); fmt.Sprint(got) != fmt.Sprint(rendered) {
+		t.Fatalf("recorded clusters %v != rendered %v", got, rendered)
+	}
+	if g.Payload.SuggestedClusters[0].Score != cc.SuggestedClusters[0].Score {
+		t.Fatalf("recorded score %v, suggested %v", g.Payload.SuggestedClusters[0].Score, cc.SuggestedClusters[0].Score)
+	}
+
+	if _, _, err := f.s.recordCommsScanGathered(context.Background(), f.runRow.ID, f.plan.ID, g.payloadFor(f.plan)); err != nil {
+		t.Fatal(err)
+	}
+	f.au.mu.Lock()
+	body := f.au.appended[0].Payload
+	f.au.mu.Unlock()
+	rec, err := decodeCommsScanGathered(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := csRecordedClusterIDs(rec.SuggestedClusters); fmt.Sprint(got) != fmt.Sprint(want) || !commsGatheredClustersRecorded(body) {
+		t.Fatalf("recorded row clusters %v (probe %v), want %v", got, commsGatheredClustersRecorded(body), want)
+	}
+}
+
+// csClusterIDs returns n distinct UserReportID-shaped ids from start.
+func csClusterIDs(start, n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("UR-issue-%d", start+i)
+	}
+	return ids
+}
+
+// csShownSet marks ids shown.
+func csShownSet(ids ...string) map[string]bool {
+	m := map[string]bool{}
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m
+}
+
+// TestCommsRecordableClusters_Filters: one case per filter the prompt's
+// render applies; deleting a filter reddens its own case.
+func TestCommsRecordableClusters_Filters(t *testing.T) {
+	pair := []string{"UR-issue-1", "UR-issue-2"}
+	shown := csShownSet(append(csClusterIDs(1, prompt.CommsMaxClusterIDs+3), "not-a-report-id")...)
+	manyClusters := make([]prompt.CommsCluster, prompt.CommsMaxClusters+2)
+	for i := range manyClusters {
+		manyClusters[i] = prompt.CommsCluster{ReportIDs: pair, Score: 0.5}
+	}
+	cases := []struct {
+		name string
+		in   []prompt.CommsCluster
+		want [][]string
+	}{
+		{"nan score dropped", []prompt.CommsCluster{{ReportIDs: pair, Score: math.NaN()}}, nil},
+		{"+inf score dropped", []prompt.CommsCluster{{ReportIDs: pair, Score: math.Inf(1)}}, nil},
+		{"-inf score dropped", []prompt.CommsCluster{{ReportIDs: pair, Score: math.Inf(-1)}}, nil},
+		{"under two ids dropped", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1"}, Score: 0.9}}, nil},
+		{"unshown id dropped", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-99", "UR-issue-2"}, Score: 0.9}}, [][]string{pair}},
+		{"unshown id leaves under two", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-99"}, Score: 0.9}}, nil},
+		{"unshaped id dropped", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1", "not-a-report-id", "UR-issue-2"}, Score: 0.9}}, [][]string{pair}},
+		{"duplicate id collapsed", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-1", "UR-issue-2"}, Score: 0.9}}, [][]string{pair}},
+		{"duplicate leaves under two", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-1"}, Score: 0.9}}, nil},
+		{"id cap keeps the first ids", []prompt.CommsCluster{{ReportIDs: csClusterIDs(1, prompt.CommsMaxClusterIDs+3), Score: 0.9}}, [][]string{csClusterIDs(1, prompt.CommsMaxClusterIDs)}},
+		{"order preserved", []prompt.CommsCluster{{ReportIDs: []string{"UR-issue-3", "UR-issue-4"}, Score: 0.4}, {ReportIDs: pair, Score: 0.9}},
+			[][]string{{"UR-issue-3", "UR-issue-4"}, pair}},
+	}
+	for _, tc := range cases {
+		got := commsRecordableClusters(tc.in, shown)
+		if fmt.Sprint(csRecordedClusterIDs(got)) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: recorded %v, want %v", tc.name, csRecordedClusterIDs(got), tc.want)
+		}
+	}
+
+	// Cluster cap: a dropped cluster does not count toward it.
+	capped := commsRecordableClusters(append([]prompt.CommsCluster{{ReportIDs: pair, Score: math.NaN()}}, manyClusters...), shown)
+	if len(capped) != prompt.CommsMaxClusters {
+		t.Fatalf("cluster cap: recorded %d clusters, want %d", len(capped), prompt.CommsMaxClusters)
+	}
+
+	// A NaN score reaching the payload would make Marshal fail and the digest
+	// collapse onto the empty-bytes hash; filtered, the payload encodes.
+	p := commsTestPayload("a1", "UR-issue-1", "UR-issue-2")
+	p.SuggestedClusters = commsRecordableClusters([]prompt.CommsCluster{{ReportIDs: pair, Score: math.NaN()}, {ReportIDs: pair, Score: 0.7}}, shown)
+	if _, err := json.Marshal(p); err != nil {
+		t.Fatalf("filtered payload does not encode: %v", err)
+	}
+	empty := sha256.Sum256(nil)
+	if d := commsGatherDigest(p); d == hex.EncodeToString(empty[:]) || d != commsGatherDigest(p) {
+		t.Fatalf("digest %s is the empty-bytes hash or unstable", d)
+	}
+}
+
+// TestCommsRecordableClusters_MatchRender pins parity with the REAL render:
+// every filter and both caps, fed through prompt.Build, render exactly the
+// clusters commsRecordableClusters records.
+func TestCommsRecordableClusters_MatchRender(t *testing.T) {
+	shownIDs := csClusterIDs(1, prompt.CommsMaxClusterIDs+3)
+	reports := make([]prompt.UserReport, len(shownIDs))
+	for i := range reports {
+		reports[i] = prompt.UserReport{Kind: "issue", IssueNumber: i + 1, ReportTitle: fmt.Sprintf("Report %d", i+1),
+			ReportBody: "body", Classification: "external", CreatedAt: csBase, UpdatedAt: csBase}
+	}
+	pair := []string{"UR-issue-1", "UR-issue-2"}
+	clusters := []prompt.CommsCluster{
+		{ReportIDs: pair, Score: math.NaN()},
+		{ReportIDs: pair, Score: math.Inf(1)},
+		{ReportIDs: []string{"UR-issue-3"}, Score: 0.9},
+		{ReportIDs: []string{"UR-issue-3", "UR-issue-99", "not-a-report-id", "UR-issue-3", "UR-issue-4"}, Score: 0.9},
+		{ReportIDs: shownIDs, Score: 0.8},
+	}
+	for i := 0; i < prompt.CommsMaxClusters; i++ {
+		clusters = append(clusters, prompt.CommsCluster{ReportIDs: []string{"UR-issue-5", "UR-issue-6"}, Score: 0.5})
+	}
+	cc := &prompt.CommsScanContext{Repo: commsTestRepo, Rubric: []prompt.CommsCharterLine{{ID: "V1", Text: "Unblocks a user."}},
+		UserReports: reports, SuggestedClusters: clusters}
+	out := csBuild(t, cc)
+	if got := csListedIDs(csSection(t, out, "### Shown report ids (account for every one)"), csIsReportID); !csEqual(got, shownIDs) {
+		t.Fatalf("fixture: shown ids %v, want every report %v", got, shownIDs)
+	}
+	rendered := csRenderedClusters(t, out)
+	recorded := csRecordedClusterIDs(commsRecordableClusters(clusters, csShownSet(shownIDs...)))
+	if len(rendered) != prompt.CommsMaxClusters || fmt.Sprint(recorded) != fmt.Sprint(rendered) {
+		t.Fatalf("recorded %d clusters %v\nrendered %d clusters %v", len(recorded), recorded, len(rendered), rendered)
 	}
 }
 
