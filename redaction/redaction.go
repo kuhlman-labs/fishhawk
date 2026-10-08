@@ -40,6 +40,13 @@
 // Hits returned alongside the redacted output drive telemetry —
 // "the boundary redacted N GitHub tokens this run" without ever
 // surfacing the tokens themselves.
+//
+// Patterns redact by SHAPE. KnownValues (knownvalues.go, E72.41 /
+// #3793) redacts by VALUE: a caller that bound a credential into an
+// agent passes the value, and every occurrence of it — raw, JSON-,
+// URL- or base64-encoded, or inside an HTTP Basic credential — is
+// replaced with a marker naming the binding. RedactDefaultKnown runs
+// the known values first, then DefaultPatterns.
 package redaction
 
 import (
@@ -73,10 +80,11 @@ type Hit struct {
 // some secret formats outside this list will pass through. New
 // formats land here as we encounter them.
 //
-// References: GitHub Token Formats (PAT, fine-grained), OpenAI API
-// Keys, Anthropic API Keys (sk-ant-…), AWS Access Key IDs (AKIA…),
-// Authorization Bearer headers, generic password/token/secret
-// values inside JSON.
+// References: GitHub Token Formats (PAT, fine-grained, App
+// installation, OAuth gho_, user-to-server ghu_, refresh ghr_), GitLab
+// personal access tokens (glpat-), OpenAI API Keys, Anthropic API Keys
+// (sk-ant-…), AWS Access Key IDs (AKIA…), Authorization Bearer
+// headers, generic password/token/secret values inside JSON.
 var DefaultPatterns = []Pattern{
 	{
 		Name:  "github-pat-classic",
@@ -103,6 +111,33 @@ var DefaultPatterns = []Pattern{
 		// without over-consuming. Do NOT tidy this back to a fixed
 		// `{36}` length — that re-opens the new-format leak.
 		Regex: regexp.MustCompile(`ghs_[A-Za-z0-9_.\-]{36,}`),
+	},
+	// The OAuth access, user-to-server and refresh token families
+	// (E72.41 / #3793) share ghp_'s alnum body grammar, but take a
+	// `{36,}` FLOOR rather than an exact `{36}`: GitHub asks callers to
+	// treat tokens as opaque and documents refresh tokens longer than
+	// 40 chars, so a fixed length would leave a longer token's tail
+	// unredacted. The alnum class still stops at `@`, quotes,
+	// whitespace and `.`, so a git remote URL keeps its host.
+	{
+		Name:  "github-oauth-token",
+		Regex: regexp.MustCompile(`gho_[A-Za-z0-9]{36,}`),
+	},
+	{
+		Name:  "github-user-to-server-token",
+		Regex: regexp.MustCompile(`ghu_[A-Za-z0-9]{36,}`),
+	},
+	{
+		Name:  "github-refresh-token",
+		Regex: regexp.MustCompile(`ghr_[A-Za-z0-9]{36,}`),
+	},
+	{
+		Name: "gitlab-pat",
+		// GitLab personal access tokens. A routable PAT carries a
+		// `.`-separated version+CRC suffix after the random body; the
+		// class stops at that `.`, so the short non-secret suffix
+		// survives while the random body is redacted.
+		Regex: regexp.MustCompile(`glpat-[A-Za-z0-9_\-]{20,}`),
 	},
 	{
 		Name:  "openai-api-key",
