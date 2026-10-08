@@ -1679,6 +1679,13 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// rejected with --decompose, tell the agent it must populate
 	// decomposition.sub_plans in the next plan attempt.
 	if stage.Type == run.StageTypePlan {
+		// Run/stage-keyed plan handoff path (#4067): every plan-typed render
+		// (plan, clarification park, grooming/upkeep/comms propose) names
+		// prompt.PlanArtifactPath(run, stage) instead of the shared fixed path
+		// concurrent plan stages used to collide on. Set on BOTH prompt handlers
+		// so the signed prompt and the render preview stay byte-identical.
+		trigger.PlanRunID = runRow.ID.String()
+		trigger.PlanStageID = stage.ID.String()
 		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
 			trigger.DecomposeRequired = true
 		}
@@ -2474,6 +2481,13 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// rejected with --decompose, tell the agent it must populate
 	// decomposition.sub_plans in the next plan attempt.
 	if stage.Type == run.StageTypePlan {
+		// Run/stage-keyed plan handoff path (#4067): every plan-typed render
+		// (plan, clarification park, grooming/upkeep/comms propose) names
+		// prompt.PlanArtifactPath(run, stage) instead of the shared fixed path
+		// concurrent plan stages used to collide on. Set on BOTH prompt handlers
+		// so the signed prompt and the render preview stay byte-identical.
+		trigger.PlanRunID = runRow.ID.String()
+		trigger.PlanStageID = stage.ID.String()
 		if s.loadLastDecomposeRejectionReason(r.Context(), runRow.ID) {
 			trigger.DecomposeRequired = true
 		}

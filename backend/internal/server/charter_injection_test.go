@@ -819,7 +819,7 @@ func TestGroomingPrompt_M7_NonGroomingPlanStage_ByteIdentical(t *testing.T) {
 	})
 	want := chDecodePrompt(t, off, offRun, offStage, offPriv)
 
-	if got.Prompt != want.Prompt {
+	if chWithoutOwnPlanPath(got.Prompt, runID, stageID) != chWithoutOwnPlanPath(want.Prompt, offRun, offStage) {
 		t.Errorf("non-grooming plan prompt changed with the charter seam wired.\n--- wired ---\n%s\n--- disabled ---\n%s",
 			got.Prompt, want.Prompt)
 	}
@@ -860,6 +860,16 @@ func TestGroomingPrompt_M7b_NonPlanStage_NotCharterRequiring(t *testing.T) {
 // or refused prompt, by reason IDENTITY — never a comment or a symbol.
 // ---------------------------------------------------------------------------
 
+// chWithoutOwnPlanPath replaces ONLY the exact run/stage-keyed plan handoff
+// path a plan prompt names for ITS OWN run and stage (#4067) with a fixed
+// placeholder. The wired and disabled servers mint distinct run/stage ids, so
+// their prompts legitimately differ in that one path; every other byte is
+// still compared. A prompt naming any other path (the legacy fixed one, or a
+// different run's) is left untouched and still fails the comparison.
+func chWithoutOwnPlanPath(p string, runID, stageID uuid.UUID) string {
+	return strings.ReplaceAll(p, prompt.PlanArtifactPath(runID.String(), stageID.String()), "<own-plan-artifact-path>")
+}
+
 // chServesUnchangedRow asserts that a run row serves a prompt BYTE-IDENTICAL to
 // the same row with the whole feature disabled, writes no injection audit
 // entry, and never consults the conventions loader.
@@ -878,7 +888,7 @@ func chServesUnchangedRow(t *testing.T, specYAML, workflowID string, requires *b
 
 	got := chDecodePrompt(t, wired, runID, stageID, priv)
 	want := chDecodePrompt(t, off, offRun, offStage, offPriv)
-	if got.Prompt != want.Prompt {
+	if chWithoutOwnPlanPath(got.Prompt, runID, stageID) != chWithoutOwnPlanPath(want.Prompt, offRun, offStage) {
 		t.Errorf("a NON-grooming row changed the served prompt with the charter seam wired:\n--- wired ---\n%s\n--- disabled ---\n%s",
 			got.Prompt, want.Prompt)
 	}
