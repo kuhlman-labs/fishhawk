@@ -209,7 +209,7 @@ func TestShipPlan_PlanInvalid_400(t *testing.T) {
 // TestShipPlan_AgentOutputInvalid_400 is the #2833 widening: every backend
 // error code that means "the AGENT's output is bad" maps to ErrPlanInvalid
 // (runner category-B), and every other 400 stays a generic error
-// (category-C). All six codes arrive on this one endpoint because POST
+// (category-C). Every listed code arrives on this one endpoint because POST
 // /v0/runs/{run_id}/plan routes by the artifact's "kind" discriminator.
 //
 // The control rows are the point:
@@ -285,6 +285,12 @@ func TestShipPlan_AgentOutputInvalid_400(t *testing.T) {
 			body:       envelope("clarification_request_invalid", "clarification_request does not validate against clarification-request-v1"),
 			wantB:      true,
 			wantReason: "backend plan.go fails that stage category-B too",
+		},
+		{
+			name:       "plan_ticket_mismatch",
+			body:       envelope("plan_ticket_mismatch", "uploaded plan names a different ticket than the run's issue trigger"),
+			wantB:      true,
+			wantReason: "the #4067 ticket guard fails the stage category-B before writing the 400 — the artifact names another run's ticket",
 		},
 		{
 			name:       "unrelated code",
