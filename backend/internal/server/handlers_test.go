@@ -91,6 +91,18 @@ func TestHandleHealth(t *testing.T) {
 	if upkeepHash == body.Schemas["grooming-report-v1"] || upkeepHash == body.Schemas["plan-standard-v1"] {
 		t.Error("schemas[upkeep-report-v1] must differ from the grooming and plan schema hashes")
 	}
+	// comms-report-v1 (#4015, advertised by #4016): exact value, 64 lowercase
+	// hex characters, and distinct from the plan, grooming and upkeep hashes.
+	commsHash := body.Schemas["comms-report-v1"]
+	if want := plan.EmbeddedCommsReportSchemaHash(); commsHash != want {
+		t.Errorf("schemas[comms-report-v1] = %q, want %q", commsHash, want)
+	}
+	if len(commsHash) != 64 || strings.Trim(commsHash, "0123456789abcdef") != "" {
+		t.Errorf("schemas[comms-report-v1] = %q, want 64 lowercase hex characters", commsHash)
+	}
+	if commsHash == body.Schemas["plan-standard-v1"] || commsHash == body.Schemas["grooming-report-v1"] || commsHash == upkeepHash {
+		t.Error("schemas[comms-report-v1] must differ from the plan, grooming and upkeep schema hashes")
+	}
 
 	// Wire-level omission pin (#1018): with no StartNonce configured, the
 	// RAW body must not carry the key at all (omitempty), so a pre-nonce

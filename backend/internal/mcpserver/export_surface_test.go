@@ -476,6 +476,20 @@ var exportBaseline = []string{
 	// RecordUpkeep*/RecordedUpkeep* names above. Exported for the same
 	// SDK-reflection reason as the grooming-dispositions sibling.
 	"UpkeepDispositionEntry",
+	// #4016: fishhawk_record_comms_dispositions' I/O structs and the nested
+	// view types its output carries (the per-draft entry, the recorded
+	// disposition, the recorded preview and its error, the cluster split and
+	// placement), plus ListCommsDispositionsOutput. Exported for the same
+	// SDK-reflection reason as the upkeep- and grooming-dispositions siblings.
+	"CommsClusterPlacement",
+	"CommsClusterSplit",
+	"CommsDispositionEntry",
+	"CommsDraftPreviewError",
+	"CommsDraftPreviewRecord",
+	"ListCommsDispositionsOutput",
+	"RecordCommsDispositionsInput",
+	"RecordCommsDispositionsOutput",
+	"RecordedCommsDisposition",
 	// E45.65 / #3579: the fishhawk_validate tool's I/O structs. Exported for
 	// the same SDK-reflection reason as every other tool I/O type here.
 	"ValidateSpecDiagnostic",

@@ -3405,7 +3405,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// agent-reachable tracker read). It creates nothing and writes no audit.
 	// Its own tool, not a file_issue mode: a dry-run flag on a write verb is
 	// one typo away from a filing. 71 -> 72.
-	const wantToolCount = 72
+	//
+	// #4016 (2026-10-08) adds exactly ONE tool —
+	// fishhawk_record_comms_dispositions, the thin wrapper over POST
+	// /v0/runs/{run_id}/comms-dispositions. WHEN: the captain has read a comms
+	// scan run's recorded draft previews and decides, per draft, approved or
+	// rejected (optionally overriding an approved draft's parent epic).
+	// ELIGIBILITY: write:approvals; the backend refuses a run-bound token and a
+	// delegated operator-agent token (self-approval). Its own tool, not an
+	// upkeep mode: a different report, id space, binding row and window
+	// family. 72 -> 73.
+	const wantToolCount = 73
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3698,6 +3708,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawUpkeepDispositions {
 		t.Error("fishhawk_record_upkeep_dispositions is not registered/visible over ListTools")
+	}
+
+	// fishhawk_record_comms_dispositions (#4016) must be wire-visible for the
+	// same reason: a registration regression would drop the captain-only comms
+	// capture verb without tripping the count if another tool were added in
+	// the same change.
+	var sawCommsDispositions bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_record_comms_dispositions" {
+			sawCommsDispositions = true
+			break
+		}
+	}
+	if !sawCommsDispositions {
+		t.Error("fishhawk_record_comms_dispositions is not registered/visible over ListTools")
 	}
 
 	// fishhawk_reconcile_reviews (#2712) must be wire-visible: it is the only

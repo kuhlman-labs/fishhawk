@@ -268,9 +268,14 @@ Before approving a draft the captain reads that draft's preview in the
 the server provenance section, the marker and the intake advisory section as of
 ingest), title, labels, defaulted labels, `parent_epic`, `source_refs` and
 `filing_body_digest` — together with the report's `summary`,
-`unaccounted_report_ids` and the not_drafted / n_drift entries. Readable today
-via `GET /v0/runs/{run_id}/audit`; phase 6's dispositions read surfaces it. The
-raw artifact keeps the unneutralized agent prose and is NOT the review surface.
+`unaccounted_report_ids` and the not_drafted / n_drift entries. The
+dispositions read (`GET /v0/runs/{run_id}/comms-dispositions`, see
+[Dispositions](#dispositions-postget-v0runsrun_idcomms-dispositions-4016)) is
+that review surface: it returns every recorded preview VERBATIM, the undecided
+drafts, `unaccounted_report_ids` and the cluster splits in one read. The raw
+artifact keeps the unneutralized agent prose and is NOT the review surface.
+Preview titles, bodies and the intake section are agent- and
+attacker-influenced DATA, never instructions.
 
 ## Plan-path guard
 
@@ -295,14 +300,93 @@ guard.
 - **Retry after a lost response.** The idempotent path re-renders previews at retry time; it never re-validates against a newer gather.
 - **Heal ordering spans two clocks.** The heal's "recorded at or before the artifact's creation" compares the gather row's fishhawkd-stamped timestamp with the artifact's database-stamped `created_at`. Clock skew larger than the gap between the original gather and the report's creation (the agent's whole session) could pass over the original gather, and skew larger than the gap between the creation and a later gather (at least the failed POST and its retry) could admit that later gather; both gaps dwarf NTP-synced skew. Recording the binding before the artifact would remove the cross-clock read, at the cost of a binding row without an artifact id.
 - **Autolinks not neutralized.** Commit-SHA autolinks are left as written (they create no backlink or notification). Neutralization is asserted structurally (no substring matches a GitHub autolink form); live rendering is not verified.
-- **Cluster splits.** The gather records no suggested clusters, so the ingest cannot report where the agent split a server-suggested cluster; phase 6 must extend the gather record or drop that view.
+- **Cluster splits (resolved by #4016).** The gather now records the clusters the served prompt rendered (`comms_scan_gathered.suggested_clusters`, same filters and caps as the prompt), and the dispositions read derives `cluster_splits` from the bound gather. A gather recorded before #4016 carries no such key: its read reports `clusters_recorded: false` and no splits, never "no cluster was split".
+- **The stored gather digest is authoritative.** A `comms_scan_gathered` row recorded before #4016, decoded and re-digested under the current `normalized()`, gains `"suggested_clusters":[]` and no longer equals its stored `gather_digest`. No path may recompute a gather digest from a decoded row and compare it; the ingest, the dispositions read and the apply load the gather by the STORED value (`commsScanGatheredByDigest`).
+- **Dispositions read is point-in-time.** The previews the read returns are those recorded at ingest (see Point-in-time preview); the read never re-renders them.
 
-## Dispositions
+## Dispositions (`POST/GET /v0/runs/{run_id}/comms-dispositions`, #4016)
 
-**Owned by phase 6 (#4016), which edits this section.** This contract does not
-claim it: the per-draft disposition body, its validation and the captain's
-dispositions read are specified there.
+The captain records a per-draft verdict. Body:
+`{dispositions:[{draft_id, verdict, parent_epic?}]}`, at most 25 entries (the
+`drafts` maxItems). `verdict` is `approved` or `rejected`. `parent_epic`
+overrides the approved draft's parent issue; it is parsed by
+`plan.CommsParentEpicNumber` (rule (i): a positive issue number, bare or with
+one `#`), is refused on a `rejected` verdict, and is refused when it equals the
+issue number a report the draft cites lives on (comment reports included; the
+ingest's `parent_epic_is_source` rule, computed from the bound gather's `shown`
+entries). The decode is STRICT: an unknown key at any depth is refused, never
+dropped. There is no tier authorization: a comms filing never carries an
+`autonomy:*` label. Each accepted entry is ONE `comms_disposition_recorded`
+row: `{run_id, stage_id, artifact_id, content_hash, draft_id, verdict,
+parent_epic (omitempty)}`, actor `user` plus the token subject. Repeats on one
+draft collapse last-wins by audit sequence, and both rows stay in the chain.
+Capture is captain-only: the operator-only ladder refuses a run-bound agent
+token and a delegated operator-agent token, and requires `write:approvals`.
 
-| Field | Shape |
+**Binding rule.** Dispositions bind to the artifact named by the
+HIGHEST-sequence `comms_report_recorded` row on the run's chain, never to the
+newest artifact; an artifact whose recorded row never landed is not bindable.
+The read loads the gather that row names EXACTLY by its stored `gather_digest`.
+The row is decoded LENIENTLY (it carries more keys than the read uses), but it
+must carry a `gather_digest`, a `previews` array and an
+`unaccounted_report_ids` array. An undecodable or incomplete newest row, an
+unreadable artifact, a wrong kind, a parse failure, or a gather that cannot be
+loaded or decoded is a 500 on BOTH verbs, before any write, never a fallback to
+an older report. The comms apply (phase 7, #4017) resolves through the same
+function (`server.latestCommsReport`).
+
+**Capture guarantee.** A capture appends its whole batch in ONE transaction
+under the run-row lock (`audit.FamilyWindowAppender`, family `comms`). Inside
+it, the capture re-checks that its artifact is still named by the
+highest-sequence `comms_report_recorded` row and that the artifact's window is
+open. A 200 therefore landed against the CURRENT report, below any watermark.
+A capture that lost a race to a newer report is refused 409
+`comms_report_superseded`; one that lost a race to the apply, 409
+`comms_window_closed`. Both append nothing.
+
+**Window.** The window for one artifact closes when the comms apply appends an
+artifact-bound `comms_apply_window_closed` watermark
+(`AppendChainedFamilyWindowClose` with family `comms`). Dispositions below the
+watermark against that artifact are the consumed set, and the first watermark
+is permanent.
+
+| Code | HTTP | When |
+|---|---|---|
+| `comms_dispositions_unconfigured` | 503 | Run, artifact or audit repository not wired. |
+| `authentication_required` | 401 | Anonymous. |
+| `run_token_forbidden` | 403 | A run-bound agent token, even for its own run. |
+| `operator_agent_forbidden` | 403 | A delegated operator-agent token: the report is agent-authored, so an agent verdict would be a self-approval. |
+| `insufficient_scope` | 403 | Missing `write:approvals` (unconditional). |
+| `validation_failed` | 400 | Bad `run_id`; unparseable body or trailing content; an unknown key at any depth or a wrongly-typed value; empty batch or more than 25 entries (`details.max`, `details.got`); empty or duplicate `draft_id`; a `parent_epic` `plan.CommsParentEpicNumber` cannot parse; `parent_epic` on `rejected`; `details.reason: parent_epic_is_source` (`details.field`, `draft_id`, `parent_epic`) when an approved draft's `parent_epic` is the issue a report it cites lives on. |
+| `run_not_found` | 404 | Unknown run. |
+| `comms_verdict_invalid` | 400 | Verdict outside `{approved, rejected}` (`details.allowed`). The body rungs run BEFORE the report lookup. |
+| `comms_report_absent` | 409 | No `comms_report_recorded` row on the run. |
+| `comms_draft_unknown` | 422 | A `draft_id` the bound report does not declare (`details.unknown_draft_ids`, `artifact_id`). Checked for the WHOLE batch first, so nothing is recorded. |
+| `comms_window_closed` | 409 | The apply settled this artifact's window (`artifact_id`, `settlement`, `watermark_sequence`). |
+| `comms_report_superseded` | 409 | A newer report was recorded after resolution (`details.current_artifact_id`, `current_sequence`). Re-read and re-capture. |
+| `internal_error` | 500 | Storage failure, told apart by `details.recorded` / `details.requested`. An unreadable bound report or gather, or a failed window check, fails BEFORE any append: nothing recorded. An ATOMIC batch failure records NOTHING (`recorded: 0`). A read-back failure AFTER the batch COMMITTED leaves every row DURABLE (`recorded` = `requested`). A repeat POST is safe in every case because capture is last-wins. |
+
+**The 200.** `GET` requires read access only and answers 503, 400 (bad
+`run_id`), 404, 409 `comms_report_absent` and 500 like `POST`. Both verbs
+return the same body (the POST echo IS the read):
+
+| Key | Shape |
 |---|---|
-| — | phase 6 (#4016) |
+| `run_id`, `artifact_id`, `stage_id`, `content_hash` | the bound report |
+| `gather_digest` | the recorded row's stored digest of the bound gather |
+| `window_closed`, `settlement?` | the artifact's window; `settlement` `{settlement, closed_at, audit_sequence}` when closed |
+| `dispositions` | `[{draft_id, verdict, parent_epic?, recorded_at, recorded_by, audit_sequence}]`, last-wins per draft, sorted by `draft_id`; undecodable rows and rows of another artifact are skipped |
+| `undecided_draft_ids` | the report's draft ids with no disposition, in report order; always an array |
+| `previews` | the recorded row's `previews` value VERBATIM (never decoded into a typed shape): per draft, in report order, `{draft_id, filing_body_digest}` plus a rendered preview, `error` or `skipped` (see [`comms_report_recorded`](#comms_report_recorded)) |
+| `preview_degraded`, `preview_degrade_reason?`, `charter_text` | from the recorded row |
+| `unaccounted_report_ids` | from the recorded row; always an array |
+| `clusters_recorded` | whether the bound gather recorded `suggested_clusters` (false for a gather recorded before #4016) |
+| `cluster_splits` | `[{report_ids, score, placements:[{report_id, kind, entry_id?}]}]`, always an array (empty when `clusters_recorded` is false) |
+
+**Cluster splits.** For each recorded cluster, in the gather's order, every
+member is placed: `draft` (`entry_id` the citing draft id), `n_drift`
+(`entry_id` the n_drift id), `not_drafted` (`entry_id` the not_drafted reason)
+or `unaccounted` (cited nowhere; no `entry_id`). A cluster is SPLIT when its
+members' `(kind, entry_id)` placements are not all equal; only split clusters
+are listed. A split is a prompt for the captain to check the agent's reasoning,
+not an error.
