@@ -21706,7 +21706,22 @@ paths:
               recorded. `details` carries `required_permission`,
               `resolved_permission`, `member_of`, `member_resolved`, and
               `result` (`rejected`). `agent` / delegated submissions are
-              recorded-but-never-counted and skip this check.
+              recorded-but-never-counted and skip this forge check.
+              #4116: the SAME code also fires when the gate's
+              `approvals.members` list is non-empty and the approval's
+              principal is not on it (an exact-match allow-list; plain
+              members are qualified with the run's forge, the principal
+              never is, so a static-token or agent subject matches
+              nothing). This members check runs FIRST, before any forge
+              call, and applies to delegated and agent-kind submissions
+              too: a delegated submission is members-checked against its
+              `on_behalf_of` (the real operator, or the seated captain for
+              an agent-kind token) but is still not forge-gated, and a
+              listed one is admitted yet never counted. `details` then
+              carries `predicate` (`members`), `members` (the declared
+              list), `members_principal`, `subject`, `escalated` and
+              `result`. No approval row is recorded; an
+              `approval_predicate_rejected` audit entry is.
             - `self_decision` — E54.53 / #3041: a run-bound `mcp:run:`
               agent token targeting an ADMITTED human-executor review gate,
               even for its OWN run. Such a gate declares `executor: human`

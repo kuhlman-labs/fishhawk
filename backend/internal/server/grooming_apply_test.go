@@ -81,7 +81,7 @@ workflows:
             sla: 24_hours
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              members: ["github:test-operator"]
 `
 
 // groomingApplySpecHygieneReport is groomingApplySpec with HYGIENE moved to

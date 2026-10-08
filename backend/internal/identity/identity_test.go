@@ -139,3 +139,69 @@ func TestNoOp_VerifyAccessTokenFailsClosed(t *testing.T) {
 		t.Errorf("subject = %q, want empty", subject)
 	}
 }
+
+// TestCanonicalMember pins the member half of the approvals.members
+// canonicalisation rule (#4116): a provider-qualified member is verbatim, a
+// plain one is qualified with the run's forge, and nothing is case-folded or
+// trimmed.
+func TestCanonicalMember(t *testing.T) {
+	tests := []struct {
+		name, member, forge, want string
+	}{
+		{"qualified member is verbatim", "github:kuhlman-labs", ProviderGitLab, "github:kuhlman-labs"},
+		{"plain member takes the run forge (github)", "alice", ProviderGitHub, "github:alice"},
+		{"plain member takes the run forge (gitlab)", "alice", ProviderGitLab, "gitlab:alice"},
+		{"no case folding", "Alice", ProviderGitHub, "github:Alice"},
+		{"no trimming", " alice", ProviderGitHub, "github: alice"},
+		{"empty member stays empty", "", ProviderGitHub, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanonicalMember(tc.member, tc.forge); got != tc.want {
+				t.Errorf("CanonicalMember(%q, %q) = %q, want %q", tc.member, tc.forge, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubjectListed pins the exact-match approver allow-list rule the
+// approval gate and `fishhawkd approver-members` both run (#4116). The
+// subject is NEVER qualified and must already be a forge identity, so a
+// static token subject, an agent subject and a run-bound MCP subject match
+// nothing — even a member spelled identically.
+func TestSubjectListed(t *testing.T) {
+	const runUUID = "mcp:run:0b8f5a8e-6a3c-4c1e-9d55-3f1f1e0c2a11"
+	tests := []struct {
+		name    string
+		members []string
+		subject string
+		forge   string
+		want    bool
+	}{
+		{"qualified member + same subject", []string{"github:kuhlman-labs"}, "github:kuhlman-labs", ProviderGitHub, true},
+		{"qualified member admits on any run forge", []string{"github:kuhlman-labs"}, "github:kuhlman-labs", ProviderGitLab, true},
+		{"plain member on github run + github subject", []string{"alice"}, "github:alice", ProviderGitHub, true},
+		{"plain member on gitlab run + github subject", []string{"alice"}, "github:alice", ProviderGitLab, false},
+		{"plain member on gitlab run + gitlab subject", []string{"alice"}, "gitlab:alice", ProviderGitLab, true},
+		{"static plain subject never qualified", []string{"alice"}, "alice", ProviderGitHub, false},
+		{"static MCP token subject refused", []string{"github:kuhlman-labs"}, "brett@local-mcp", ProviderGitHub, false},
+		{"static subject listed verbatim still refused", []string{"brett@local-mcp"}, "brett@local-mcp", ProviderGitHub, false},
+		{"casing mismatch refuses", []string{"github:alice"}, "github:Alice", ProviderGitHub, false},
+		{"trailing space refuses", []string{"github:alice "}, "github:alice", ProviderGitHub, false},
+		{"empty list", nil, "github:alice", ProviderGitHub, false},
+		{"empty explicit list", []string{}, "github:alice", ProviderGitHub, false},
+		{"empty subject", []string{"github:alice"}, "", ProviderGitHub, false},
+		{"agent-shaped synthetic delegated subject", []string{"github:alice", "alice"}, "operator-agent/delegated", ProviderGitHub, false},
+		{"anonymous", []string{"anonymous"}, "anonymous", ProviderGitHub, false},
+		{"run-bound MCP subject vs unrelated list", []string{"github:alice"}, runUUID, ProviderGitHub, false},
+		{"run-bound MCP subject vs a list naming it verbatim", []string{runUUID, "github:alice"}, runUUID, ProviderGitHub, false},
+		{"second member matches", []string{"github:bob", "github:alice"}, "github:alice", ProviderGitHub, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SubjectListed(tc.members, tc.subject, tc.forge); got != tc.want {
+				t.Errorf("SubjectListed(%q, %q, %q) = %v, want %v", tc.members, tc.subject, tc.forge, got, tc.want)
+			}
+		})
+	}
+}
