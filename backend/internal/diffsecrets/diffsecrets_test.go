@@ -20,16 +20,20 @@ func classicPAT() string { return "ghp_" + strings.Repeat("A", 36) }
 // samples returns one runtime-built matching value per DefaultPatterns entry.
 func samples() map[string]string {
 	return map[string]string{
-		"github-pat-classic":      classicPAT(),
-		"github-pat-fine-grained": "github_pat_" + strings.Repeat("B", 82),
-		"github-app-token":        "ghs_" + strings.Repeat("C", 36),
-		"openai-api-key":          "sk-" + strings.Repeat("D", 48),
-		"openai-project-key":      "sk-proj-" + strings.Repeat("E", 40),
-		"anthropic-api-key":       "sk-ant-api03-" + strings.Repeat("F", 40),
-		"aws-access-key-id":       "AKIA" + strings.Repeat("G", 16),
-		"authorization-bearer":    "Author" + "ization: Bea" + "rer " + strings.Repeat("h", 12),
-		"npm-publish-token":       "npm_" + strings.Repeat("I", 36),
-		"json-password-field":     `{"pass` + `word"` + `: "` + strings.Repeat("j", 8) + `"}`,
+		"github-pat-classic":          classicPAT(),
+		"github-pat-fine-grained":     "github_pat_" + strings.Repeat("B", 82),
+		"github-app-token":            "ghs_" + strings.Repeat("C", 36),
+		"github-oauth-token":          "gho_" + strings.Repeat("K", 36),
+		"github-user-to-server-token": "ghu_" + strings.Repeat("L", 36),
+		"github-refresh-token":        "ghr_" + strings.Repeat("M", 36),
+		"gitlab-pat":                  "glpat-" + strings.Repeat("N", 20),
+		"openai-api-key":              "sk-" + strings.Repeat("D", 48),
+		"openai-project-key":          "sk-proj-" + strings.Repeat("E", 40),
+		"anthropic-api-key":           "sk-ant-api03-" + strings.Repeat("F", 40),
+		"aws-access-key-id":           "AKIA" + strings.Repeat("G", 16),
+		"authorization-bearer":        "Author" + "ization: Bea" + "rer " + strings.Repeat("h", 12),
+		"npm-publish-token":           "npm_" + strings.Repeat("I", 36),
+		"json-password-field":         `{"pass` + `word"` + `: "` + strings.Repeat("j", 8) + `"}`,
 	}
 }
 
