@@ -330,6 +330,18 @@ type TriggerSource string
 // issue-anchored when the schedule names an anchor `issue` (see
 // IsIssueAnchored).
 //
+// TriggerAlert (E35.4 / #1601, ADR-053) is the INCIDENT form: the producer
+// for a hotfix run auto-started on the incident issue the HMAC-authenticated
+// POST /v0/triggers/alert ingress filed. Like TriggerScheduled it is
+// SYSTEM-ONLY — minted exclusively by server.StartAlertRun, which marks its
+// request with an unexported context key, and only for a source whose
+// per-source auto_start is true (default false). POST /v0/runs refuses it
+// from any other caller with 400 trigger_source_reserved, so it is
+// deliberately ABSENT from ValidTriggerSources. It is always issue-anchored:
+// an auto-started alert run carries `issue:N` naming the filed incident (see
+// IsIssueAnchored). Its routing form is spec.TriggerDiff (see
+// backend/internal/appliesto.TriggerFormForSource).
+//
 // NOTE (visible modelling debt, #2826): trigger_source now carries BOTH the
 // run's ORIGIN and its routing FORM. github_issue/cli/ui name where a run
 // came from; on_demand names the shape of the change it routes as. The two
@@ -346,22 +358,28 @@ const (
 	// TriggerScheduled is SYSTEM-ONLY: never in ValidTriggerSources, and
 	// admitted by POST /v0/runs only on the in-process scheduler's request.
 	TriggerScheduled TriggerSource = "scheduled"
+	// TriggerAlert is SYSTEM-ONLY: never in ValidTriggerSources, and
+	// admitted by POST /v0/runs only on server.StartAlertRun's in-process
+	// request (the alert ingress's auto-start).
+	TriggerAlert TriggerSource = "alert"
 )
 
 // ValidTriggerSources is the closed set of OPERATOR-SUBMITTABLE trigger
-// sources, in declaration order. TriggerScheduled is deliberately excluded:
-// it is reserved to the in-process scheduler, and adding it here would make
-// it submittable over POST /v0/runs and the MCP start_run mirror. It is the SINGLE source of truth every consumer renders
+// sources, in declaration order. TriggerScheduled and TriggerAlert are
+// deliberately excluded: they are reserved to the in-process scheduler and
+// the alert ingress's auto-start respectively, and adding either here would
+// make it submittable over POST /v0/runs and the MCP start_run mirror. It is the SINGLE source of truth every consumer renders
 // from — the server's POST /v0/runs validation and its 400 message, and the
 // MCP start_run mirror — so the accepted set and the message an operator
 // reads cannot drift apart. Mirrors the ValidRunnerKinds idiom in this
 // package (a slice rather than a map because the message rendering needs a
 // stable order).
 //
-// A new member here — and any system-only source such as TriggerScheduled —
-// must also be added to the runs_trigger_source_check CHECK constraint (see
-// backend/internal/postgres/migrations; 0093 added 'scheduled'), or the
-// INSERT is rejected at the storage layer.
+// A new member here — and any system-only source such as TriggerScheduled or
+// TriggerAlert — must also be added to the runs_trigger_source_check CHECK
+// constraint (see backend/internal/postgres/migrations; 0093 added
+// 'scheduled', 0100 added 'alert'), or the INSERT is rejected at the storage
+// layer.
 func ValidTriggerSources() []TriggerSource {
 	return []TriggerSource{TriggerGitHubIssue, TriggerCLI, TriggerUI, TriggerOnDemand}
 }
@@ -369,10 +387,11 @@ func ValidTriggerSources() []TriggerSource {
 // IsIssueAnchored reports whether this run's trigger source is one that
 // carries an `issue:N` TriggerRef — github_issue (the webhook/CLI issue path),
 // on_demand (the operator-started grooming run, whose groom stage REQUIRES a
-// github_issue input) and scheduled (a scheduler-started run whose workflow's
-// `schedule` names an anchor `issue`, E79.1 / #3725). A scheduled run WITHOUT
-// an anchor has a nil TriggerRef, which every caller's TriggerRef check
-// already treats as "nothing to post to".
+// github_issue input), scheduled (a scheduler-started run whose workflow's
+// `schedule` names an anchor `issue`, E79.1 / #3725) and alert (an
+// auto-started run on the incident issue the alert ingress filed, E35.4 /
+// #1601). A scheduled run WITHOUT an anchor has a nil TriggerRef, which every
+// caller's TriggerRef check already treats as "nothing to post to".
 //
 // It is deliberately a SOURCE-LEVEL predicate only: it says the source is one
 // that MAY be issue-anchored, never that this particular run has a usable
@@ -384,7 +403,7 @@ func (r *Run) IsIssueAnchored() bool {
 		return false
 	}
 	return r.TriggerSource == TriggerGitHubIssue || r.TriggerSource == TriggerOnDemand ||
-		r.TriggerSource == TriggerScheduled
+		r.TriggerSource == TriggerScheduled || r.TriggerSource == TriggerAlert
 }
 
 // Run is the persisted record of a workflow execution.

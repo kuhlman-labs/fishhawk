@@ -7244,3 +7244,235 @@ VALUES ($1, $2, 'local-implement:h1', 1, 'queued')`, stageID, runID); err != nil
 		t.Errorf("stages row after rolling back 0097 = %d, want 1 (untouched)", survivors)
 	}
 }
+
+// TestMigrateDown_AlertIncidentsReversal pins 0099 (E35.4 / #1601): after
+// MigrateUp alert_incidents accepts a claim row and a filed row, refuses a
+// zero occurrence count, a non-positive issue number and a half-filed row
+// (number without URL), and nulls run_id when its run is deleted; after
+// rolling back through 0099 (0100 first, which leaves no alert run to refuse
+// it) the table is gone, the schema lands on 0098, and a runs row survives.
+func TestMigrateDown_AlertIncidentsReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	seedRun := func() uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'pending') RETURNING id`).Scan(&id); err != nil {
+			t.Fatalf("seed run: %v", err)
+		}
+		return id
+	}
+	doomedRun, survivorRun := seedRun(), seedRun()
+
+	if _, err := pool.Exec(ctx, `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token)
+VALUES ('src', 'o/r', 'claim', gen_random_uuid())`); err != nil {
+		t.Fatalf("insert claim row after MigrateUp: %v — 0099 must make it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, issue_number, issue_url, run_id)
+VALUES ('src', 'o/r', 'filed', gen_random_uuid(), 7, 'https://example.test/7', $1)`, doomedRun); err != nil {
+		t.Fatalf("insert filed row after MigrateUp: %v", err)
+	}
+	for name, sql := range map[string]string{
+		"occurrences 0":          `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, occurrences) VALUES ('src', 'o/r', 'a', gen_random_uuid(), 0)`,
+		"issue_number 0":         `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, issue_number, issue_url) VALUES ('src', 'o/r', 'b', gen_random_uuid(), 0, 'u')`,
+		"number without url":     `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, issue_number) VALUES ('src', 'o/r', 'c', gen_random_uuid(), 3)`,
+		"url without number":     `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, issue_url) VALUES ('src', 'o/r', 'd', gen_random_uuid(), 'u')`,
+		"duplicate key":          `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token) VALUES ('src', 'o/r', 'claim', gen_random_uuid())`,
+		"null claim_token":       `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token) VALUES ('src', 'o/r', 'e', NULL)`,
+		"run_id not a known run": `INSERT INTO alert_incidents (source_id, repo, fingerprint, claim_token, issue_number, issue_url, run_id) VALUES ('src', 'o/r', 'f', gen_random_uuid(), 4, 'u', gen_random_uuid())`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err == nil {
+			t.Errorf("%s accepted, want a constraint violation", name)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM runs WHERE id = $1`, doomedRun); err != nil {
+		t.Fatalf("delete a run referenced by alert_incidents: %v — ON DELETE SET NULL must not block it", err)
+	}
+	var runID *uuid.UUID
+	var incidents int
+	if err := pool.QueryRow(ctx, `SELECT run_id, (SELECT count(*) FROM alert_incidents) FROM alert_incidents WHERE fingerprint = 'filed'`).Scan(&runID, &incidents); err != nil {
+		t.Fatalf("read filed row after run delete: %v", err)
+	}
+	if runID != nil || incidents != 2 {
+		t.Errorf("after deleting its run: run_id=%v rows=%d, want NULL and 2 (SET NULL, never cascade)", runID, incidents)
+	}
+
+	downThrough(t, url, "0099")
+
+	var tables, survivors int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM information_schema.tables WHERE table_name = 'alert_incidents'),
+  (SELECT count(*) FROM runs WHERE id = $1)`, survivorRun).Scan(&tables, &survivors); err != nil {
+		t.Fatalf("read back after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("alert_incidents tables after rolling back 0099 = %d, want 0", tables)
+	}
+	if survivors != 1 {
+		t.Errorf("runs row after rolling back 0099 = %d, want 1 (untouched)", survivors)
+	}
+}
+
+// TestMigrateDown_RunsTriggerSourceAlertReversal pins 0100's
+// runs_trigger_source_check widening (E35.4 / #1601) in BOTH directions,
+// mirroring the 0093 ladder, and is where run.TriggerAlert and the storage
+// CHECK constraint are proven to agree against a real PostgreSQL (0099,
+// alert_incidents, is TestMigrateDown_AlertIncidentsReversal):
+//
+//  1. with 0100 applied an alert run INSERT SUCCEEDS, 'nonsense' is still
+//     REFUSED (relaxed, not dropped) and every earlier source — the four
+//     operator-submittable ones plus 'scheduled' — still inserts;
+//  2. a rollback attempted WHILE an alert row is live is REFUSED with SQLSTATE
+//     23514 and leaves the widened constraint intact (the down migration's
+//     documented fail-loudly posture, 0093 precedent);
+//  3. the operator action the down header names (delete the alert rows) is
+//     modelled explicitly;
+//  4. the rollback then succeeds, lands on 0099 and RESTORES 0093's
+//     five-value set: alert is refused, scheduled (0093's member) still
+//     inserts, 'nonsense' is refused — and 0099's alert_incidents is left
+//     alone (0100's down touches only the CHECK).
+//
+// Counterfactual target: delete 'alert' from 0100's re-ADDed CHECK and the
+// state-1 alert insert goes RED; delete the re-ADD entirely and the state-1
+// 'nonsense' assertion goes RED; widen 0100's down to keep 'alert' and the
+// documented-refusal probe goes RED (the rollback with a live alert row
+// succeeds), ahead of the state-4 alert-refused assertion.
+func TestMigrateDown_RunsTriggerSourceAlertReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	// Land 0100 as the APPLIED tip: the documented-refusal probe below calls
+	// MigrateDown expecting 0100's OWN down to refuse. Stepping down from
+	// whatever the tip is means migrations added above 0100 need no edit here.
+	target := migrationVersion(t, "0100")
+	for {
+		v, _, err := postgres.MigrateVersion(url)
+		if err != nil {
+			t.Fatalf("MigrateVersion: %v", err)
+		}
+		if v <= target {
+			if v != target {
+				t.Fatalf("schema at version %d after MigrateUp, want >= %d (0100 missing?)", v, target)
+			}
+			break
+		}
+		if err := postgres.MigrateDown(url); err != nil {
+			t.Fatalf("MigrateDown (roll back %04d on the way to 0100): %v", v, err)
+		}
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	insertRun := func(triggerSource string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+			 VALUES ($1, 'kuhlman-labs/fishhawk', 'hotfix_change', 'sha', $2, 'pending', 'local')`,
+			uuid.New(), triggerSource)
+		return err
+	}
+	assertRefused := func(state, triggerSource string) {
+		t.Helper()
+		err := insertRun(triggerSource)
+		if err == nil {
+			t.Errorf("%s: insert trigger_source=%q SUCCEEDED, want a 23514 runs_trigger_source_check rejection", state, triggerSource)
+			return
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "runs_trigger_source_check" {
+			t.Errorf("%s: insert trigger_source=%q failed with %v, want SQLSTATE 23514 on runs_trigger_source_check", state, triggerSource, err)
+		}
+	}
+	assertAccepted := func(state, triggerSource string) {
+		t.Helper()
+		if err := insertRun(triggerSource); err != nil {
+			t.Errorf("%s: insert trigger_source=%q: %v, want accepted", state, triggerSource, err)
+		}
+	}
+	alertIncidentsTables := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'alert_incidents'`).Scan(&n); err != nil {
+			t.Fatalf("count alert_incidents tables: %v", err)
+		}
+		return n
+	}
+
+	// ---- state 1: 0100 applied ----
+	assertAccepted("after MigrateUp", string(run.TriggerAlert))
+	assertRefused("after MigrateUp", "nonsense")
+	assertAccepted("after MigrateUp", string(run.TriggerScheduled))
+	for _, ts := range run.ValidTriggerSources() {
+		assertAccepted("after MigrateUp", string(ts))
+	}
+
+	// ---- the documented refusal: rollback with a live alert row ----
+	var cleanVersion int64
+	var cleanDirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&cleanVersion, &cleanDirty); err != nil {
+		t.Fatalf("read schema_migrations: %v", err)
+	}
+	downErr := postgres.MigrateDown(url)
+	if downErr == nil {
+		t.Fatalf("MigrateDown with a live alert run SUCCEEDED, want a refusal — 0100's down re-adds a CHECK that row violates and must fail rather than destroy run history")
+	}
+	var migrateErr database.Error
+	if !errors.As(downErr, &migrateErr) {
+		t.Fatalf("MigrateDown returned %v, want a golang-migrate database.Error carrying the CHECK violation", downErr)
+	}
+	var downCheckErr *pgconn.PgError
+	if !errors.As(migrateErr.OrigErr, &downCheckErr) || downCheckErr.Code != "23514" ||
+		!strings.Contains(downCheckErr.Message, "runs_trigger_source_check") {
+		t.Errorf("MigrateDown with a live alert run failed with %v, want SQLSTATE 23514 naming runs_trigger_source_check", migrateErr.OrigErr)
+	}
+	// ATOMIC: the widened constraint survives the refused rollback (the
+	// DROP that precedes the failing re-ADD rolls back with it).
+	assertAccepted("after the REFUSED rollback", string(run.TriggerAlert))
+	assertRefused("after the REFUSED rollback", "nonsense")
+	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET version = $1, dirty = $2`, cleanVersion, cleanDirty); err != nil {
+		t.Fatalf("force schema_migrations back to version=%d dirty=%v: %v", cleanVersion, cleanDirty, err)
+	}
+
+	// ---- the operator action the down migration requires ----
+	tag, err := pool.Exec(ctx, `DELETE FROM runs WHERE trigger_source = 'alert'`)
+	if err != nil {
+		t.Fatalf("clear alert runs before rollback: %v", err)
+	}
+	if tag.RowsAffected() != 2 {
+		t.Fatalf("DELETE removed %d alert runs, want 2 (the state-1 seed and the atomicity probe's row)", tag.RowsAffected())
+	}
+
+	// ---- state 2: 0100 rolled back ----
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0100): %v", err)
+	}
+	if v, _, err := postgres.MigrateVersion(url); err != nil || v != target-1 {
+		t.Fatalf("version after rolling back 0100 = %d (err %v), want %d (0099)", v, err, target-1)
+	}
+	assertRefused("after rollback", string(run.TriggerAlert))
+	assertRefused("after rollback", "nonsense")
+	// RESTORED to 0093's five-value set: scheduled and on_demand survive.
+	assertAccepted("after rollback", string(run.TriggerScheduled))
+	assertAccepted("after rollback", string(run.TriggerOnDemand))
+	// 0100's down touches only the CHECK; 0099's ledger is untouched.
+	if n := alertIncidentsTables(); n != 1 {
+		t.Errorf("alert_incidents tables after rolling back 0100 = %d, want 1 (0099 still applied)", n)
+	}
+}
