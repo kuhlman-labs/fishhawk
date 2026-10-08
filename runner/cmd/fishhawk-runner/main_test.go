@@ -21313,6 +21313,11 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	t.Setenv("GH_TOKEN", "gho_must_not_leak")
 	t.Setenv("FISHHAWK_GITHUB_TOKEN", "ghs_must_not_leak")
 	t.Setenv("FISHHAWK_ACCEPTANCE_ENV_TARGET_BASIC_AUTH", "user:pass")
+	// Pin the credential-isolation policy inputs (#3792): an inherited
+	// `require` knob or an ambient model key must not change this outcome.
+	t.Setenv(acceptanceCredentialIsolationEnvVar, "auto")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{

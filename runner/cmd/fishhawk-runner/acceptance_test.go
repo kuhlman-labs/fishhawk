@@ -25,6 +25,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
@@ -962,6 +963,11 @@ func acceptanceStageSetup(t *testing.T) (repo string, fu *fakeUploader, runArgs 
 	mustWrite(t, filepath.Join(repo, "README.md"), "hello\n")
 	runGit("add", "-A")
 	runGit("commit", "-m", "initial")
+	// Determinism (#3792): no env-carried model credential and the default
+	// credential-isolation knob, so a runner host's exported key or a
+	// `require` knob cannot change a row's outcome. A row expecting a
+	// synthetic HOME re-pins exactly one credential after this.
+	pinAcceptanceModelCredentials(t, "", "", "")
 
 	fu = newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
@@ -997,6 +1003,18 @@ func acceptanceStageSetup(t *testing.T) (repo string, fu *fakeUploader, runArgs 
 		"--upload-trace",
 	}
 	return repo, fu, runArgs
+}
+
+// pinAcceptanceModelCredentials pins every input of the acceptance
+// credential-isolation decision (#3792): the three env model credentials and
+// FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION (reset to the default, auto). A
+// row that needs another mode sets the knob AFTER calling this.
+func pinAcceptanceModelCredentials(t *testing.T, anthropic, oauth, openai string) {
+	t.Helper()
+	t.Setenv("ANTHROPIC_API_KEY", anthropic)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", oauth)
+	t.Setenv("OPENAI_API_KEY", openai)
+	t.Setenv(acceptanceCredentialIsolationEnvVar, "")
 }
 
 // acceptanceTestRunID / acceptanceTestStageID are the fixed run/stage ids the
@@ -2337,6 +2355,9 @@ func TestRun_AcceptanceStage_ExpectedHeadSHASeam_JSONToGate(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "README.md"), "hello\n")
 	runGit("add", "-A")
 	runGit("commit", "-m", "initial")
+	// This row builds its own args rather than acceptanceStageSetup, so it
+	// pins the credential-isolation inputs itself (#3792).
+	pinAcceptanceModelCredentials(t, "", "", "")
 
 	const seamSHA = "feedf00dfeedf00dfeedf00dfeedf00dfeedf00d"
 	healthz, _ := healthzServer(t, 200, `{"git_sha":"1234567"}`) // stale vs seamSHA
@@ -2653,5 +2674,513 @@ func TestAcceptanceReplay_RecordThenReplayEndToEnd(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("shipped body != shared golden:\n got %s\nwant %s", captured, golden)
+	}
+}
+
+// --- credential isolation (E72.40 / #3792) run()-level cases ----------------
+
+// Sentinels planted in the fake operator home the credential-isolation
+// cross-boundary test points the RUNNER's HOME at.
+const (
+	credSentinelGH     = "GHHOSTSSENTINEL"
+	credSentinelStore  = "GITCREDSSENTINEL"
+	credSentinelGlobal = "GLOBALSENTINEL"
+	credSentinelModel  = "sk-ant-model-sentinel"
+)
+
+// fakeOperatorHome builds a home holding the credential files an acceptance
+// agent must not reach: gh's hosts.yml, a git credential store, and a
+// .gitconfig whose credential helper is a BENIGN store (so the runner's own
+// git never fails for the wrong reason) and whose user.email is a sentinel.
+func fakeOperatorHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".config", "gh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(home, ".config", "gh", "hosts.yml"),
+		"github.com:\n    oauth_token: "+credSentinelGH+"\n")
+	mustWrite(t, filepath.Join(home, ".git-credentials"), "https://x:"+credSentinelStore+"@github.com\n")
+	mustWrite(t, filepath.Join(home, ".gitconfig"),
+		"[user]\n\temail = "+credSentinelGlobal+"\n[credential]\n\thelper = store --file="+
+			filepath.Join(home, ".git-credentials")+"\n")
+	return home
+}
+
+// acceptanceTempEntries lists the fishhawk-acceptance-* entries directly
+// under dir (the working dir and the synthetic HOME both match).
+func acceptanceTempEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "fishhawk-acceptance-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// baseEnvValues returns every value env carries for key, in order.
+func baseEnvValues(env []string, key string) []string {
+	var out []string
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// acceptanceCredsProbeScript is the `claude` binary stand-in for
+// TestRun_AcceptanceStage_ChildCannotReadHostCredentials: a REAL `sh` child
+// (not a re-exec of this test binary, whose TestMain would re-pin
+// GIT_CONFIG_GLOBAL and mask the git assertions). It records $HOME and its
+// entry count FIRST, then its reads via $HOME and git's NORMAL config
+// loading, into files under $1 (a dir outside every HOME), and emits a passed
+// verdict as structured output.
+const acceptanceCredsProbeScript = `out="$1"
+printf '%s' "$HOME" > "$out/home"
+if [ -d "$HOME" ]; then ls -A "$HOME" | wc -l > "$out/home-entries"; else echo missing > "$out/home-entries"; fi
+cat "$HOME/.config/gh/hosts.yml" > "$out/read-gh" 2>&1
+cat "$HOME/.git-credentials" > "$out/read-creds" 2>&1
+cat "$HOME/.gitconfig" > "$out/read-gitconfig" 2>&1
+git config --list --show-origin > "$out/git-list" 2>&1
+git config --global --list > "$out/git-global" 2>&1
+printf '%s\n' '{"type":"result","structured_output":` + passedVerdict + `,"usage":{"input_tokens":1,"output_tokens":1}}'
+`
+
+// TestRun_AcceptanceStage_ChildCannotReadHostCredentials is the
+// cross-boundary assertion for #3792: main.go's credential isolation ->
+// Invocation.BaseEnv -> the REAL claudecode adapter -> a REAL child. The
+// runner's HOME is a fake operator home holding credential sentinels (set
+// AFTER the repo fixture is built); with an env-carried model credential the
+// child must see an empty runner-created HOME, reach no sentinel via $HOME,
+// and load no git config from the fake home. It also pins the success-path
+// cleanup: the working dir and the synthetic HOME exist during the invoke
+// and are gone after run() returns.
+func TestRun_AcceptanceStage_ChildCannotReadHostCredentials(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fake := fakeOperatorHome(t)
+	t.Setenv("HOME", fake)
+	// The runner's own git must not read the fake .gitconfig; acceptenv drops
+	// this from the child, so only IsolateCredentials' pin protects it.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	t.Setenv(acceptanceNetSandboxEnvVar, "off")
+
+	probeOut := t.TempDir()
+	capture := &capturingInvoker{}
+	origNewInvoker := newInvoker
+	newInvoker = func(apiKey, _ string) agent.Invoker {
+		cc := claudecode.New(apiKey)
+		// The real adapter, with only the child binary replaced. The builder
+		// leaves cmd.Env nil so the adapter seeds it from BaseEnv.
+		cc.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, "/bin/sh", "-c", acceptanceCredsProbeScript, "sh", probeOut)
+		}
+		capture.inner = cc
+		return capture
+	}
+	t.Cleanup(func() { newInvoker = origNewInvoker })
+	readProbe := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(probeOut, name))
+		if err != nil {
+			t.Fatalf("probe output %s: %v (the child never ran?)", name, err)
+		}
+		return string(b)
+	}
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if capture.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	childHome := readProbe("home")
+	if childHome == fake || strings.HasPrefix(childHome, fake+string(filepath.Separator)) {
+		t.Errorf("child HOME = %q is the runner's (fake operator) home", childHome)
+	}
+	if !strings.HasPrefix(filepath.Base(childHome), "fishhawk-acceptance-home-") {
+		t.Errorf("child HOME = %q, want the runner-created synthetic home", childHome)
+	}
+	if n := strings.TrimSpace(readProbe("home-entries")); n != "0" {
+		t.Errorf("child HOME at start has %q entries, want an existing empty dir", n)
+	}
+	reads := readProbe("read-gh") + readProbe("read-creds") + readProbe("read-gitconfig")
+	gitList, gitGlobal := readProbe("git-list"), readProbe("git-global")
+	for _, s := range []string{credSentinelGH, credSentinelStore, credSentinelGlobal} {
+		if strings.Contains(reads+gitList+gitGlobal, s) {
+			t.Errorf("child reached host credential sentinel %s:\nreads: %s\ngit list: %s\ngit global: %s",
+				s, reads, gitList, gitGlobal)
+		}
+	}
+	if strings.Contains(gitList, "file:"+fake) {
+		t.Errorf("child git loaded config from the operator home:\n%s", gitList)
+	}
+	if strings.TrimSpace(gitGlobal) != "" {
+		t.Errorf("child `git config --global --list` = %q, want empty", gitGlobal)
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Error("a passed verdict must ship")
+	}
+
+	// Cleanup on the success path: both temp dirs are gone.
+	for _, dir := range []string{capture.gotInv.WorkingDir, childHome} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("acceptance temp dir %s survived run() (stat err %v)", dir, err)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_CredentialIsolationOff_RestoresTodaysPosture is the
+// kill-switch pin: with a credential set (so auto WOULD isolate), off keeps
+// the runner's HOME, adds no git pins, honours the SSH_AUTH_SOCK passthrough
+// with no refusal, logs every isolation boolean false, and never creates a
+// synthetic HOME.
+func TestRun_AcceptanceStage_CredentialIsolationOff_RestoresTodaysPosture(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	t.Setenv(acceptanceCredentialIsolationEnvVar, "off")
+	t.Setenv("FISHHAWK_ACCEPTANCE_ENV_SSH_AUTH_SOCK", "/x/agent.sock")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	withNetSandboxProbe(t, false, "net-sandbox unavailable: test-injected")
+	var homesDuringInvoke []string
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			for _, e := range acceptanceTempEntries(t, tmp) {
+				if strings.HasPrefix(e, "fishhawk-acceptance-home-") {
+					homesDuringInvoke = append(homesDuringInvoke, e)
+				}
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	env := invoker.gotInv.BaseEnv
+	if h := baseEnvValues(env, "HOME"); len(h) != 1 || h[0] != os.Getenv("HOME") {
+		t.Errorf("HOME = %q, want exactly the runner's %q", h, os.Getenv("HOME"))
+	}
+	for _, pin := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"} {
+		if v := baseEnvValues(env, pin); len(v) != 0 {
+			t.Errorf("%s = %q under off, want absent", pin, v)
+		}
+	}
+	if v := baseEnvValues(env, "SSH_AUTH_SOCK"); len(v) != 1 || v[0] != "/x/agent.sock" {
+		t.Errorf("SSH_AUTH_SOCK = %q under off, want the passthrough /x/agent.sock", v)
+	}
+	out := stderr.String()
+	if strings.Contains(out, `"event":"acceptance_env_refused"`) {
+		t.Errorf("a passthrough was refused under off: %s", out)
+	}
+	if !strings.Contains(out, `"event":"acceptance_net_sandbox_unavailable"`) || !strings.Contains(out, fieldsOff) {
+		t.Errorf("sandbox event lacks the off isolation fields %s: %s", fieldsOff, out)
+	}
+	if len(homesDuringInvoke) != 0 {
+		t.Errorf("a synthetic HOME was created under off: %q", homesDuringInvoke)
+	}
+}
+
+// TestRun_AcceptanceStage_CredentialIsolationAuto_NoCredential_DegradesLoudly:
+// the harness default (no env-carried credential, auto) keeps the runner's
+// HOME but still pins git and refuses the SSH_AUTH_SOCK passthrough, and says
+// so on the sandbox event (home_isolation_skipped). It is also the
+// determinism vehicle: an ambient ANTHROPIC_API_KEY leaking past
+// acceptanceStageSetup's pin would flip home_isolated to true.
+func TestRun_AcceptanceStage_CredentialIsolationAuto_NoCredential_DegradesLoudly(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	t.Setenv("FISHHAWK_ACCEPTANCE_ENV_SSH_AUTH_SOCK", "/x/agent.sock")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	withNetSandboxProbe(t, false, "net-sandbox unavailable: test-injected")
+	var homesDuringInvoke []string
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			for _, e := range acceptanceTempEntries(t, tmp) {
+				if strings.HasPrefix(e, "fishhawk-acceptance-home-") {
+					homesDuringInvoke = append(homesDuringInvoke, e)
+				}
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, fieldsNoCredEnvOnly) {
+		t.Errorf("sandbox event lacks the loud degradation fields %s: %s", fieldsNoCredEnvOnly, out)
+	}
+	env := invoker.gotInv.BaseEnv
+	if h := baseEnvValues(env, "HOME"); len(h) != 1 || h[0] != os.Getenv("HOME") {
+		t.Errorf("HOME = %q, want the runner's %q (auto without a credential keeps it)", h, os.Getenv("HOME"))
+	}
+	if v := baseEnvValues(env, "GIT_CONFIG_GLOBAL"); len(v) != 1 || v[0] != os.DevNull {
+		t.Errorf("GIT_CONFIG_GLOBAL = %q, want the /dev/null pin", v)
+	}
+	if v := baseEnvValues(env, "GIT_CONFIG_NOSYSTEM"); len(v) != 1 || v[0] != "1" {
+		t.Errorf("GIT_CONFIG_NOSYSTEM = %q, want the 1 pin", v)
+	}
+	if v := baseEnvValues(env, "SSH_AUTH_SOCK"); len(v) != 0 {
+		t.Errorf("SSH_AUTH_SOCK = %q, want the passthrough refused", v)
+	}
+	if !strings.Contains(out, `"event":"acceptance_env_refused"`) || !strings.Contains(out, `"SSH_AUTH_SOCK"`) {
+		t.Errorf("missing acceptance_env_refused naming SSH_AUTH_SOCK: %s", out)
+	}
+	if len(homesDuringInvoke) != 0 {
+		t.Errorf("a synthetic HOME was created without a credential: %q", homesDuringInvoke)
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Error("verdict must ship on the degraded path")
+	}
+}
+
+// TestRun_AcceptanceStage_CredentialIsolation_ProfileCarriesDenies pins the
+// main.go hand-off of the decision into configureAcceptanceNetSandbox: with
+// a credential and the sandbox available, the spawn's profile carries the
+// keychain mach-lookup deny and the event says so.
+func TestRun_AcceptanceStage_CredentialIsolation_ProfileCarriesDenies(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, "", credSentinelModel, "")
+	withNetSandboxProbe(t, true, "")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"home_isolated":true,"keychain_denied":true,"ssh_agent_denied":true,"credential_files_denied":true`) {
+		t.Errorf("applied event lacks the credential denies: %s", stderr.String())
+	}
+	w := invoker.gotInv.ExecWrapper
+	if len(w) != 3 || !strings.Contains(w[2], machLookupClause) {
+		t.Errorf("profile lacks the keychain deny %s: %q", machLookupClause, w)
+	}
+}
+
+// TestRun_AcceptanceStage_CredentialIsolationInvalidMode_FailsPreSpawn: a
+// misspelled knob fails category-C before any spawn.
+func TestRun_AcceptanceStage_CredentialIsolationInvalidMode_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	t.Setenv(acceptanceCredentialIsolationEnvVar, "strict")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"acceptance_credential_isolation_config","category":"C"`) {
+		t.Errorf("missing category-C acceptance_credential_isolation_config: %s", stderr.String())
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called on a config failure")
+	}
+	if left := acceptanceTempEntries(t, tmp); len(left) != 0 {
+		t.Errorf("pre-spawn failure leaked acceptance temp dirs: %q", left)
+	}
+}
+
+// TestRun_AcceptanceStage_CredentialIsolationRequire_NoCredential_FailsPreSpawn:
+// require with no env-carried model credential fails category-C naming the
+// `claude setup-token` remediation, before any spawn.
+func TestRun_AcceptanceStage_CredentialIsolationRequire_NoCredential_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	t.Setenv(acceptanceCredentialIsolationEnvVar, "require")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_credential_isolation_required","category":"C"`) ||
+		!strings.Contains(out, "claude setup-token") || !strings.Contains(out, "CLAUDE_CODE_OAUTH_TOKEN") {
+		t.Errorf("missing category-C acceptance_credential_isolation_required naming the remediation: %s", out)
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called on a require failure")
+	}
+}
+
+// TestRun_AcceptanceStage_HomeCreateError_FailsAndRemovesWorkdir: a failure
+// creating ONLY the synthetic HOME (the working dir was already made) fails
+// category-C acceptance_home before any spawn, and the working dir is
+// removed.
+func TestRun_AcceptanceStage_HomeCreateError_FailsAndRemovesWorkdir(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	var workdirsAtHomeCreate []string
+	orig := acceptanceHomeMkdirTemp
+	acceptanceHomeMkdirTemp = func(string, string) (string, error) {
+		workdirsAtHomeCreate = acceptanceTempEntries(t, tmp)
+		return "", errors.New("mkdir: injected home-create failure")
+	}
+	t.Cleanup(func() { acceptanceHomeMkdirTemp = orig })
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if !strings.Contains(stderr.String(), `"reason":"acceptance_home","category":"C"`) ||
+		!strings.Contains(stderr.String(), "injected home-create failure") {
+		t.Errorf("missing category-C acceptance_home: %s", stderr.String())
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called when the home cannot be created")
+	}
+	if len(workdirsAtHomeCreate) != 1 {
+		t.Fatalf("precondition: want the working dir created before the HOME, saw %q", workdirsAtHomeCreate)
+	}
+	if left := acceptanceTempEntries(t, tmp); len(left) != 0 {
+		t.Errorf("the working dir survived the acceptance_home failure: %q", left)
+	}
+}
+
+// withRecordedAcceptanceHome wraps the synthetic-HOME seam so a test learns
+// the path the runner created.
+func withRecordedAcceptanceHome(t *testing.T) *string {
+	t.Helper()
+	var created string
+	orig := acceptanceHomeMkdirTemp
+	acceptanceHomeMkdirTemp = func(dir, pattern string) (string, error) {
+		p, err := orig(dir, pattern)
+		created = p
+		return p, err
+	}
+	t.Cleanup(func() { acceptanceHomeMkdirTemp = orig })
+	return &created
+}
+
+// TestRun_AcceptanceStage_TempDirsRemoved_VerdictMissing: the category-B
+// return path removes the working dir and the synthetic HOME.
+func TestRun_AcceptanceStage_TempDirsRemoved_VerdictMissing(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	home := withRecordedAcceptanceHome(t)
+	var workdir string
+	withFakeInvoker(t, &fakeInvoker{
+		canned:   agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) { workdir = inv.WorkingDir },
+	})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Fatalf("precondition: want the category-B verdict-missing path: %s", stderr.String())
+	}
+	if workdir == "" || *home == "" {
+		t.Fatalf("precondition: workdir %q / home %q not created", workdir, *home)
+	}
+	for _, dir := range []string{workdir, *home} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("acceptance temp dir %s survived the category-B return (stat err %v)", dir, err)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_TempDirsRemoved_Cancelled: a cancel landing while
+// the agent runs (the SIGTERM chain) still removes both temp dirs.
+func TestRun_AcceptanceStage_TempDirsRemoved_Cancelled(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	home := withRecordedAcceptanceHome(t)
+	cancel := withCancelableRunnerContext(t)
+	var workdir string
+	var existedDuringInvoke bool
+	withFakeInvoker(t, &fakeInvoker{
+		canned:    agent.Result{OK: false, FailureCategory: "A", FailureReason: "cancelled mid-stage"},
+		returnErr: context.Canceled,
+		onInvoke: func(_ int, inv agent.Invocation) {
+			workdir = inv.WorkingDir
+			_, werr := os.Stat(workdir)
+			_, herr := os.Stat(*home)
+			existedDuringInvoke = werr == nil && herr == nil
+			cancel()
+		},
+	})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitCancelled {
+		t.Fatalf("run = %d, want exitCancelled:\n%s", got, stderr.String())
+	}
+	if !existedDuringInvoke {
+		t.Fatalf("precondition: workdir %q / home %q must exist during the invoke", workdir, *home)
+	}
+	for _, dir := range []string{workdir, *home} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("acceptance temp dir %s survived the cancelled return (stat err %v)", dir, err)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_TempDirsRemoved_PreSpawnFailure: a failure AFTER
+// both temp dirs exist but before any spawn (net sandbox require +
+// unavailable) leaves no fishhawk-acceptance-* entry behind.
+func TestRun_AcceptanceStage_TempDirsRemoved_PreSpawnFailure(t *testing.T) {
+	_, _, args := acceptanceStageSetup(t)
+	pinAcceptanceModelCredentials(t, credSentinelModel, "", "")
+	t.Setenv(acceptanceNetSandboxEnvVar, "require")
+	withNetSandboxProbe(t, false, "net-sandbox unavailable: test-injected")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	home := withRecordedAcceptanceHome(t)
+	invoker := &fakeInvoker{canned: agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 0 || !strings.Contains(stderr.String(), `"reason":"acceptance_net_sandbox_required"`) {
+		t.Fatalf("precondition: want the pre-spawn net-sandbox failure: %s", stderr.String())
+	}
+	if *home == "" || filepath.Dir(*home) != tmp {
+		t.Fatalf("precondition: the synthetic HOME %q was not created under %s", *home, tmp)
+	}
+	if left := acceptanceTempEntries(t, tmp); len(left) != 0 {
+		t.Errorf("pre-spawn failure leaked acceptance temp dirs: %q", left)
 	}
 }

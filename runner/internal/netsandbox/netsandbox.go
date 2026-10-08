@@ -15,18 +15,31 @@
 // reachable only through the proxy, which is exactly today's sanctioned
 // path.
 //
+// WithCredentialDeny (E72.40 / #3792) extends the same profile past the
+// network: it denies the macOS keychain's mach service, file reads of the
+// runner host's credential paths under each named home (each path's
+// symlink-resolved target too), and unix-socket connects under those homes,
+// to the runner's ssh-agent socket and to the launchd Listeners pattern —
+// the host credential surfaces a descendant could otherwise mint a forge
+// credential from without any env var. A zero-option Profile render is
+// byte-identical to the network-only profile.
+//
 // The package is a stdlib-only leaf mirroring gateiso/sandbox.go's
 // probe/wrap shape. Long-form contract, the empirical matrix, and the
-// stated residuals (nested sandbox_apply refused, unix sockets open, Linux
-// unavailable): README.md next to this file.
+// stated residuals (nested sandbox_apply refused, unix sockets outside the
+// credential denies open, Linux unavailable, a pre-existing hard link to a
+// credential file, a symlink re-pointed after the render): README.md next
+// to this file.
 package netsandbox
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -133,7 +146,16 @@ const (
 // proxyAddr must be host:port with a loopback host; a non-loopback proxy,
 // or a non-numeric / out-of-range port anywhere, returns an error — fail
 // closed rather than render an over-broad or malformed profile.
-func Profile(proxyAddr string, allowHosts []string) (string, error) {
+//
+// opts add optional sections (WithCredentialDeny), rendered between
+// `(allow default)` and the IP deny; with no opts the render is
+// byte-identical to the network-only profile. An option's error fails the
+// whole render the same way.
+func Profile(proxyAddr string, allowHosts []string, opts ...ProfileOption) (string, error) {
+	var o profileOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	host, port, err := net.SplitHostPort(proxyAddr)
 	if err != nil {
 		return "", fmt.Errorf("netsandbox: proxy address %q: %w", proxyAddr, err)
@@ -175,14 +197,231 @@ func Profile(proxyAddr string, allowHosts []string) (string, error) {
 		sorted = append(sorted, p)
 	}
 	sort.Ints(sorted)
+	var cred string
+	if o.cred != nil {
+		if cred, err = credentialClauses(*o.cred); err != nil {
+			return "", err
+		}
+	}
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n")
+	// The credential section renders BEFORE the IP rules, never after the
+	// port allows: a `(deny network-outbound (remote unix-socket ...))`
+	// rendered after `(allow network-outbound (remote ip "localhost:<p>"))`
+	// also denies the TCP connect to <p> for a port-dependent subset of
+	// ports (~15% of ephemeral ports on Darwin 25.6 — the proxy path breaks
+	// at random). Rendered first, the IP allow is the last match for every
+	// IP connect and the unix-socket denies still bind (#3792).
+	b.WriteString(cred)
 	b.WriteString(denyClause)
 	b.WriteString("\n")
 	for _, p := range sorted {
 		fmt.Fprintf(&b, "(allow network-outbound (remote ip \"localhost:%d\"))\n", p)
 	}
 	return b.String(), nil
+}
+
+// ProfileOption adds an optional section to a Profile render.
+type ProfileOption func(*profileOptions)
+
+type profileOptions struct {
+	cred *CredentialDeny
+}
+
+// KeychainMachService is the mach service every keychain read goes
+// through (Security.framework → securityd). Denying its lookup refuses
+// `security find-generic-password` and `gh auth token`'s keyring read
+// regardless of which keychain FILE is named, while TLS verification (the
+// system trust store) keeps working.
+const KeychainMachService = "com.apple.SecurityServer"
+
+// LaunchdListenersPattern matches the launchd-vended per-user socket
+// directory macOS hands to SSH_AUTH_SOCK by default
+// (/private/tmp/com.apple.launchd.<random>/Listeners), so a descendant that
+// guesses the system ssh-agent socket without the runner's env is refused.
+const LaunchdListenersPattern = `^/private/tmp/com\.apple\.launchd\.[^/]+/Listeners$`
+
+// CredentialDeny names the runner host's credential surfaces a Profile
+// render denies (E72.40 / #3792). Homes and AgentSockets must already be
+// canonical (absolute, filepath.Clean-equal, symlink-resolved by the
+// caller); a path that is not, or that carries a `"`, `\` or control
+// character, fails the render.
+type CredentialDeny struct {
+	// Homes are the real home directories whose credential paths and
+	// unix sockets are denied.
+	Homes []string
+	// Files denies reads of each home's credential files and directories
+	// (.ssh, .config/gh, .config/glab-cli, .gitconfig, .git-credentials,
+	// .config/git/credentials, .netrc) and of each one's symlink-resolved
+	// target when it differs.
+	Files bool
+	// Keychain denies the KeychainMachService lookup and reads of each
+	// home's Library/Keychains (and its resolved target).
+	Keychain bool
+	// SSHAgent denies unix-socket connects under each home, to each
+	// AgentSockets path, and to LaunchdListenersPattern.
+	SSHAgent bool
+	// AgentSockets are the runner's resolved SSH_AUTH_SOCK path(s).
+	AgentSockets []string
+	// EvalSymlinks resolves each credential path; nil means
+	// filepath.EvalSymlinks. A not-exist error denies the unresolved path
+	// only; any other error fails the render (fail closed).
+	EvalSymlinks func(string) (string, error)
+}
+
+// WithCredentialDeny appends d's credential-surface denies to the profile.
+func WithCredentialDeny(d CredentialDeny) ProfileOption {
+	return func(o *profileOptions) { o.cred = &d }
+}
+
+// credEntry is one credential path relative to a home. A dir entry renders
+// as a Seatbelt `subpath` (the path and everything under it, including a
+// directory created later), a file entry as a `literal`.
+type credEntry struct {
+	rel string
+	dir bool
+}
+
+var (
+	keychainEntries = []credEntry{{"Library/Keychains", true}}
+	fileEntries     = []credEntry{
+		{".ssh", true},
+		{".config/gh", true},
+		{".config/glab-cli", true},
+		{".gitconfig", false},
+		{".git-credentials", false},
+		{".config/git/credentials", false},
+		{".netrc", false},
+	}
+)
+
+// credentialClauses renders d's deny clauses in a fixed order — keychain,
+// files, unix sockets — with homes, filters and sockets de-duplicated and
+// sorted, so the output is byte-deterministic across input orderings.
+// Profile places the result ahead of the IP rules (see the comment there).
+func credentialClauses(d CredentialDeny) (string, error) {
+	eval := d.EvalSymlinks
+	if eval == nil {
+		eval = filepath.EvalSymlinks
+	}
+	homes, err := canonicalSet("home", d.Homes)
+	if err != nil {
+		return "", err
+	}
+	sockets, err := canonicalSet("agent socket", d.AgentSockets)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if d.Keychain {
+		b.WriteString(`(deny mach-lookup (global-name "` + KeychainMachService + `"))` + "\n")
+		for _, h := range homes {
+			if err := writeFileReadDeny(&b, h, keychainEntries, eval); err != nil {
+				return "", err
+			}
+		}
+	}
+	if d.Files {
+		for _, h := range homes {
+			if err := writeFileReadDeny(&b, h, fileEntries, eval); err != nil {
+				return "", err
+			}
+		}
+	}
+	if d.SSHAgent {
+		for _, h := range homes {
+			b.WriteString(`(deny network-outbound (remote unix-socket (subpath "` + h + `")))` + "\n")
+		}
+		for _, s := range sockets {
+			b.WriteString(`(deny network-outbound (remote unix-socket (path-literal "` + s + `")))` + "\n")
+		}
+		b.WriteString(`(deny network-outbound (remote unix-socket (path-regex #"` + LaunchdListenersPattern + `")))` + "\n")
+	}
+	return b.String(), nil
+}
+
+// writeFileReadDeny renders one `(deny file-read* ...)` clause for home
+// holding, per entry, the unresolved path and — when it resolves somewhere
+// else — the resolved target. Seatbelt checks each vnode a lookup meets
+// against that vnode's OWN path, so the unresolved filter alone leaves the
+// target readable directly or through any other alias, and an
+// intermediate-component symlink (~/.config → elsewhere) bypasses it
+// entirely; the resolved filter closes both.
+func writeFileReadDeny(b *strings.Builder, home string, entries []credEntry, eval func(string) (string, error)) error {
+	set := map[string]struct{}{}
+	for _, e := range entries {
+		p := filepath.Join(home, e.rel)
+		paths := []string{p}
+		r, err := eval(p)
+		switch {
+		case err == nil:
+			if r != p {
+				if err := validatePath("resolved target of "+p, r); err != nil {
+					return err
+				}
+				paths = append(paths, r)
+			}
+		case errors.Is(err, fs.ErrNotExist):
+			// Nothing there yet: deny the path itself so a later
+			// creation is still covered.
+		default:
+			return fmt.Errorf("netsandbox: resolving credential path %q: %w", p, err)
+		}
+		kind := "literal"
+		if e.dir {
+			kind = "subpath"
+		}
+		for _, q := range paths {
+			set["("+kind+` "`+q+`")`] = struct{}{}
+		}
+	}
+	filters := make([]string, 0, len(set))
+	for f := range set {
+		filters = append(filters, f)
+	}
+	sort.Strings(filters)
+	b.WriteString("(deny file-read*")
+	for _, f := range filters {
+		b.WriteString("\n  " + f)
+	}
+	b.WriteString(")\n")
+	return nil
+}
+
+// canonicalSet validates every path, then returns them de-duplicated and
+// sorted.
+func canonicalSet(what string, in []string) ([]string, error) {
+	set := map[string]struct{}{}
+	for _, p := range in {
+		if err := validatePath(what, p); err != nil {
+			return nil, err
+		}
+		set[p] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// validatePath refuses a path that cannot be rendered into a Seatbelt
+// string literal verbatim or that is not canonical: not absolute, not
+// filepath.Clean-equal, or carrying a `"`, `\` or control character.
+func validatePath(what, p string) error {
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("netsandbox: %s %q is not absolute", what, p)
+	}
+	if filepath.Clean(p) != p {
+		return fmt.Errorf("netsandbox: %s %q is not a clean path", what, p)
+	}
+	for _, r := range p {
+		if r == '"' || r == '\\' || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("netsandbox: %s %q contains a quote, backslash or control character", what, p)
+		}
+	}
+	return nil
 }
 
 // AdmittedPorts returns the loopback ports a Profile-rendered profile admits,
