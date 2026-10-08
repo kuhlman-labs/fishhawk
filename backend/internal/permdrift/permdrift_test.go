@@ -64,6 +64,27 @@ func TestCompare(t *testing.T) {
 		{"base {contents: write}, head write-all",
 			set(grant("jobs.build.contents", "write", 2)), set(grant("jobs.build.*", "write", 2)),
 			[]Change{{Key: "jobs.build.*", Before: Absent, After: "write", Direction: Widened}}},
+		// The Except carve-out (#3939 F4): a wildcard does NOT cover the one
+		// sibling it names. COUNTERFACTUAL: make coveredBy's Except clause
+		// always-true (body mutation) — the head-only id-token grant is
+		// subsumed and the "except carve-out" row goes RED; the "except names
+		// another sibling" row is the control that the carve-out is
+		// single-segment (it stays green either way).
+		{"except carve-out: the named sibling is not covered",
+			set(Entry{Key: "jobs.build.*", Value: "write", Rank: 2, Polarity: Grant, Except: "id-token"}),
+			set(Entry{Key: "jobs.build.*", Value: "write", Rank: 2, Polarity: Grant, Except: "id-token"}, grant("jobs.build.id-token", "write", 2)),
+			[]Change{{Key: "jobs.build.id-token", Before: Absent, After: "write", Direction: Widened}}},
+		{"except carve-out: a base-only named sibling is a narrowing",
+			set(grant("jobs.build.id-token", "write", 2)),
+			set(Entry{Key: "jobs.build.*", Value: "write", Rank: 2, Polarity: Grant, Except: "id-token"}),
+			[]Change{
+				{Key: "jobs.build.*", Before: Absent, After: "write", Direction: Widened},
+				{Key: "jobs.build.id-token", Before: "write", After: Absent, Direction: Narrowed},
+			}},
+		{"except names another sibling: still covered",
+			set(Entry{Key: "jobs.build.*", Value: "write", Rank: 2, Polarity: Grant, Except: "id-token"}),
+			set(Entry{Key: "jobs.build.*", Value: "write", Rank: 2, Polarity: Grant, Except: "id-token"}, grant("jobs.build.contents", "write", 2)),
+			nil},
 		{"wildcard covers one segment only",
 			set(grant("a.*", "write", 2)), set(grant("a.b.c", "write", 2)),
 			[]Change{

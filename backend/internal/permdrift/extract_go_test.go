@@ -643,3 +643,198 @@ func TestExtractGo_UnparseableIsError(t *testing.T) {
 		}
 	}
 }
+
+// readProductFile reads a real product surface file relative to this package.
+func readProductFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// replaceOnce replaces the single occurrence of old in src, failing the test
+// when old does not occur exactly once (a fixture that silently stopped
+// applying would otherwise compare a file with itself).
+func replaceOnce(t *testing.T, src, old, repl string) string {
+	t.Helper()
+	if n := strings.Count(src, old); n != 1 {
+		t.Fatalf("fixture anchor %q occurs %d times; want exactly 1", old, n)
+	}
+	return strings.Replace(src, old, repl, 1)
+}
+
+// requireShapeUnrecognized fails unless r is Unevaluable shape_unrecognized
+// with no changes and a Detail naming wantDetail.
+func requireShapeUnrecognized(t *testing.T, r Result, wantDetail string) {
+	t.Helper()
+	if r.Unevaluable != ReasonShapeUnrecognized || len(r.Widened)+len(r.Narrowed) != 0 {
+		t.Fatalf("Detect = %+v; want Unevaluable %q and no changes", r, ReasonShapeUnrecognized)
+	}
+	if !strings.Contains(r.Detail, wantDetail) {
+		t.Fatalf("Detail = %q; want it to name %q", r.Detail, wantDetail)
+	}
+}
+
+// TestDetect_RunTokenCopyIntoScopesRealFile pins #3939 F5 on the REAL
+// mcptoken.go: a `copy(scopes, …)` overwrites a granted scope in place while
+// leaving the literal and every append unchanged, so without the stray-use
+// rule base and head extract identical grants and Detect reports nothing.
+// E80.9 (#3944) added the rule; this is its regression pin on the product
+// file (TestExtractGoRunTokenScopes pins it on the synthetic template).
+//
+// COUNTERFACTUAL: make the `copy` arm's condition in checkStrayUses false
+// (body mutation) — Detect returns no unevaluable and no change, and the test
+// goes RED.
+func TestDetect_RunTokenCopyIntoScopesRealFile(t *testing.T) {
+	base := readProductFile(t, "../server/mcptoken.go")
+	head := replaceOnce(t, base,
+		"\tscopes := []string{\"mcp:read\"}\n",
+		"\tscopes := []string{\"mcp:read\"}\n\tcopy(scopes, []string{\"admin:write\"})\n")
+	r := Detect(surfaceByID(t, "run-token-scope-grants"), side(base), side(head))
+	requireShapeUnrecognized(t, r, "copy into "+runTokenScopesVar)
+}
+
+// TestDetect_PackageVarMutatedOutsideDeclaration pins #3939 F6 on the REAL
+// env.go and mcpscopes.go: an init() mutating the declaration literal the
+// extractor reads leaves that literal untouched, so without the
+// package-var write sweep base and head extract identical grants (no change,
+// no unevaluable) while the running binary carries the widening.
+//
+// COUNTERFACTUAL: make sweepPackageVarWrites return immediately (body
+// mutation; the call sites stay) — both subtests read as evaluable with no
+// change and go RED. CONTROL: each real file against itself is evaluable
+// with no change, so the sweep raises nothing on the product files as they
+// stand (TestExtractGo_RealProductFiles pins the same at extraction level).
+func TestDetect_PackageVarMutatedOutsideDeclaration(t *testing.T) {
+	cases := []struct {
+		name, surface, file, init, wantDetail string
+	}{
+		{"env allow-list appended in init", "reviewer-env-allowlist", "../reviewsandbox/env.go",
+			"\nfunc init() { BaseAllow = append(BaseAllow, \"AWS_SECRET_ACCESS_KEY\") }\n",
+			"write to package var BaseAllow outside its declaration"},
+		{"mcpToolScopes entry relaxed in init", "mcp-tool-scopes", "../server/mcpscopes.go",
+			"\nfunc init() { mcpToolScopes[\"fishhawk_merge_run\"] = mcpToolScopeRule{} }\n",
+			"write to package var mcpToolScopes outside its declaration"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := surfaceByID(t, c.surface)
+			base := readProductFile(t, c.file)
+			if r := Detect(s, side(base), side(base)); r.Unevaluable != "" || len(r.Widened)+len(r.Narrowed) != 0 {
+				t.Fatalf("control: Detect(base, base) = %+v; want evaluable with no change", r)
+			}
+			requireShapeUnrecognized(t, Detect(s, side(base), side(base+c.init)), c.wantDetail)
+		})
+	}
+}
+
+// TestExtractGo_PackageVarWriteSweep pins sweepPackageVarWrites one write
+// shape per row. Each row is seeded BY CONSTRUCTION — the synthetic base file
+// plus ONE construct — and asserts exactly one Unresolved per surface prefix,
+// so the row isolates its rule. The contexts vary across rows: init(), a
+// plain func, a method, a function literal inside a function and one inside a
+// package var initializer, and a package-level initializer expression.
+//
+// COUNTERFACTUALS (body mutations):
+//   - A: sweepPackageVarWrites returns immediately — every write row goes
+//     RED (zero unresolved); the read-only rows stay green;
+//   - B: the ExtractGoManifest call site passes only ManifestPermissionPrefix
+//     — the manifest row's events-prefix assertion goes RED.
+//
+// The read-only rows are the no-over-trigger control: each must extract with
+// ZERO unresolved constructs (a read, a by-value use, a method call, a
+// package-level append to a bare name — the recognized env-allow shape).
+func TestExtractGo_PackageVarWriteSweep(t *testing.T) {
+	env := envSrc()
+	writes := []struct {
+		name, extra, wantDetail string
+	}{
+		{"assignment in init", "func init() { BaseAllow = nil }", "write to package var BaseAllow outside its declaration"},
+		{"indexed write in a plain func", "func f() { BaseAllow[0] = \"X\" }", "write to package var BaseAllow outside its declaration"},
+		{"selector write", "var cfg struct{ list []string }\nfunc f() { cfg.list = nil }", "write to package var cfg outside its declaration"},
+		{"deref write", "var p *[]string\nfunc f() { *p = nil }", "write to package var p outside its declaration"},
+		{"op-assign", "var n int\nfunc f() { n += 2 }", "write to package var n outside its declaration"},
+		{"increment", "var n int\nfunc f() { n++ }", "increment or decrement of package var n"},
+		{"range assignment", "func f() { for _, BaseAllow[0] = range []string{\"X\"} {\n} }", "range assignment to package var BaseAllow"},
+		{"range assignment to the key only", "var n int\nfunc f() { for n = range []string{\"X\"} {\n} }", "range assignment to package var n"},
+		{"parenthesized write", "func f() { (BaseAllow)[0] = \"X\" }", "write to package var BaseAllow outside its declaration"},
+		{"generic-index-rooted write", "var tbl map[string]int\nfunc f() { tbl[int, string] = nil }", "write to package var tbl outside its declaration"},
+		{"address taken in a method", "type T struct{}\nfunc (T) m() { mutate(&BaseAllow) }", "address of package var BaseAllow taken"},
+		{"address of an element", "func f() { q := &BaseAllow[0]; *q = \"X\" }", "address of package var BaseAllow taken"},
+		{"copy into", "func f() { copy(BaseAllow, []string{\"X\"}) }", "copy into package var BaseAllow"},
+		{"delete from a map", "var m = map[string]bool{}\nfunc f() { delete(m, \"PATH\") }", "delete of package var m"},
+		{"clear", "func f() { clear(BaseAllow) }", "clear of package var BaseAllow"},
+		{"append to a reslice", "func f() { _ = append(BaseAllow[:0], \"X\") }", "append to package var BaseAllow"},
+		{"alias :=", "func f() { a := BaseAllow; a[0] = \"X\" }", "alias of package var BaseAllow"},
+		{"alias var of a reslice", "func f() { var a = BaseAllow[:]; a[0] = \"X\" }", "alias of package var BaseAllow"},
+		{"alias =", "func f() { var a []string; a = (BaseAllow[1:]); a[0] = \"X\" }", "alias of package var BaseAllow"},
+		{"function literal inside a function", "func f() { func() { BaseAllow[0] = \"X\" }() }", "write to package var BaseAllow outside its declaration"},
+		{"function literal inside a package var initializer", "var _ = func() int { BaseAllow[0] = \"X\"; return 0 }()", "write to package var BaseAllow outside its declaration"},
+		{"package-level copy initializer", "var _ = copy(BaseAllow, []string{\"X\"})", "copy into package var BaseAllow"},
+		{"package-level address initializer", "var bp = &BaseAllow", "address of package var BaseAllow taken"},
+		{"package-level append to a reslice", "var _ = len(append(BaseAllow[:1], \"X\"))", "append to package var BaseAllow"},
+		{"a shadowing local is flagged (noise, never a miss)", "func f() { BaseAllow := []string{\"A\"}; BaseAllow[0] = \"X\" }", "write to package var BaseAllow outside its declaration"},
+	}
+	for _, c := range writes {
+		t.Run(c.name, func(t *testing.T) {
+			x := mustGo(t, ExtractGoEnvAllow, env+"\n"+c.extra+"\n")
+			if len(x.Unresolved) != 1 || x.Unresolved[0].Prefix != EnvAllowPrefix || !strings.Contains(x.Unresolved[0].Detail, c.wantDetail) {
+				t.Fatalf("unresolved = %+v; want exactly one under %q naming %q", x.Unresolved, EnvAllowPrefix, c.wantDetail)
+			}
+		})
+	}
+	reads := map[string]string{
+		"index read":                          "func f() string { return BaseAllow[0] }",
+		"range with :=":                       "func f() { for _, v := range BaseAllow { _ = v } }",
+		"len and cap":                         "func f() int { return len(BaseAllow) + cap(BaseAllow) }",
+		"by-value call argument":              "func f() { use(BaseAllow) }",
+		"spread read":                         "func f() []string { return append([]string{}, BaseAllow...) }",
+		"map index read":                      "var m = map[string]bool{}\nfunc f(k string) bool { v, ok := m[k]; return v && ok }",
+		"method call on a package var":        "var tmpl = newTmpl()\nfunc f() { tmpl.Execute(nil) }",
+		"package-level append to a bare name": "var Extra = append(BaseAllow, \"X\")",
+		"package-level append to a parenthesized bare name": "var Extra = append((BaseAllow), \"X\")",
+		"blank package var does not track _":                "var _ = 0\nfunc f() { _ = BaseAllow[0] }",
+		"a local of a different name is not a var":          "func f() { x := []string{}; x[0] = \"X\" }",
+	}
+	for name, extra := range reads {
+		t.Run("read: "+name, func(t *testing.T) {
+			if x := mustGo(t, ExtractGoEnvAllow, env+"\n"+extra+"\n"); len(x.Unresolved) != 0 {
+				t.Fatalf("unresolved = %+v; want none", x.Unresolved)
+			}
+		})
+	}
+	// The other three extractors run the same sweep under their own prefix;
+	// manifest.go carries two surfaces, so its write is recorded under BOTH.
+	others := []struct {
+		name     string
+		ex       goExtractor
+		src      string
+		prefixes []string
+	}{
+		{"mcp scopes", ExtractGoMCPScopes, mcpScopes() + "\nfunc init() { mcpToolScopes[\"fishhawk_get_plan\"] = mcpToolScopeRule{} }\n",
+			[]string{MCPToolPrefix}},
+		{"run token", ExtractGoRunTokenScopes, tokenSrc() + "\nvar defaultScopes = []string{\"mcp:read\"}\nfunc init() { defaultScopes[0] = \"admin\" }\n",
+			[]string{RunTokenPrefix}},
+		{"manifest", ExtractGoManifest, manifestGo(`"contents": "write",`, `"push",`) + "\nvar appName = \"Fishhawk\"\nfunc init() { appName = \"x\" }\n",
+			[]string{ManifestPermissionPrefix, ManifestEventPrefix}},
+	}
+	for _, c := range others {
+		t.Run(c.name, func(t *testing.T) {
+			x := mustGo(t, c.ex, c.src)
+			var got []string
+			for _, u := range x.Unresolved {
+				got = append(got, u.Prefix)
+			}
+			if !reflect.DeepEqual(got, c.prefixes) {
+				t.Fatalf("unresolved prefixes = %v (%+v); want exactly %v", got, x.Unresolved, c.prefixes)
+			}
+			for _, p := range c.prefixes {
+				if part := x.withPrefix(p); len(part.Unresolved) != 1 {
+					t.Errorf("withPrefix(%q).Unresolved = %+v; want one", p, part.Unresolved)
+				}
+			}
+		})
+	}
+}

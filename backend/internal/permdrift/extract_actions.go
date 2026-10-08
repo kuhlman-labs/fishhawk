@@ -12,22 +12,39 @@ import (
 // anywhere (job or workflow level) receives. GitHub documents the default
 // GITHUB_TOKEN as either permissive (read/write) or restricted per
 // repository/organization setting, which this file cannot see — so the check
-// models the default CONSERVATIVELY as write on every scope. Removing a block
-// therefore always reads as a widening and adding one as a narrowing.
-const defaultTokenValue = "write (default token permissions)"
+// models the default CONSERVATIVELY as write on every scope EXCEPT id-token.
+// GitHub's default-permissions table
+// (https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token)
+// lists id-token as `none` under BOTH the permissive and the restricted
+// setting: the default token never carries it. The entry is therefore a write
+// wildcard with Except defaultTokenExcept, so a later explicit `id-token:
+// write` on a block-less job is a widening rather than subsumed. Removing a
+// block otherwise reads as a widening and adding one as a narrowing.
+const defaultTokenValue = "write except id-token (default token permissions)"
+
+// defaultTokenExcept is the scope the default token never grants.
+const defaultTokenExcept = "id-token"
+
+// writeAllIDTokenValue is the Value of the explicit id-token entry write-all
+// emits next to its wildcard (see addActionsBlock).
+const writeAllIDTokenValue = "write (write-all)"
 
 // ExtractActions extracts the effective GITHUB_TOKEN permissions of a GitHub
 // Actions workflow file. Each job's effective block is
 // jobs.<id>.permissions, else the top-level permissions, else the DEFAULT:
 //
-//   - `write-all` -> `jobs.<id>.*` = write; `read-all` -> `jobs.<id>.*` = read
+//   - `write-all` -> `jobs.<id>.*` = write PLUS an explicit
+//     `jobs.<id>.id-token` = write; `read-all` -> `jobs.<id>.*` = read
 //   - DEFAULT (no block at either level, or a null one) -> `jobs.<id>.*` =
-//     write (see defaultTokenValue)
+//     write with Except "id-token" (see defaultTokenValue), so DEFAULT ->
+//     write-all widens `jobs.<id>.id-token` and write-all -> DEFAULT narrows
+//     it
 //   - `{}` -> no grants
 //   - a map -> `jobs.<id>.<scope>` per scope at its level; `none` is no grant
 //
 // A file declaring no jobs keys the top-level block as `permissions.<scope>`
-// (and `permissions.*` for read-all/write-all). The job id and scope are
+// (and `permissions.*` for read-all/write-all, plus `permissions.id-token`
+// for write-all). The job id and scope are
 // FILE-DERIVED segments, escaped with keySegment, so a job or scope literally
 // named "*" (or carrying a '.') cannot mint or forge a wildcard key; only the
 // extractor's own write-all/read-all/default entries end in the literal
@@ -89,7 +106,7 @@ func ExtractActions(content []byte) (Grants, error) {
 				return nil, err
 			}
 		default:
-			out.Put(Entry{Key: prefix + WildcardSuffix, Value: defaultTokenValue, Rank: actionsWrite, Polarity: Grant})
+			out.Put(Entry{Key: prefix + WildcardSuffix, Value: defaultTokenValue, Rank: actionsWrite, Polarity: Grant, Except: defaultTokenExcept})
 		}
 	}
 	return out, nil
@@ -98,13 +115,20 @@ func ExtractActions(content []byte) (Grants, error) {
 // actionsWrite is ActionsLevels' rank for write.
 var actionsWrite, _ = ActionsLevels.Rank("write")
 
-// addActionsBlock records one permissions block under prefix.
+// addActionsBlock records one permissions block under prefix. write-all is
+// modelled as the write wildcard PLUS an explicit id-token write: GitHub's
+// workflow-syntax reference applies write-all to "all of the available
+// permissions" without singling out id-token, and recording it explicitly is
+// the conservative direction against the default token's id-token carve-out
+// (if GitHub excluded it, the only effect is a noise widening on DEFAULT ->
+// write-all).
 func addActionsBlock(out Grants, prefix string, block any) error {
 	switch b := block.(type) {
 	case string:
 		switch b {
 		case "write-all":
 			out.Put(Entry{Key: prefix + WildcardSuffix, Value: "write (write-all)", Rank: actionsWrite, Polarity: Grant})
+			out.Put(Entry{Key: prefix + "." + defaultTokenExcept, Value: writeAllIDTokenValue, Rank: actionsWrite, Polarity: Grant})
 		case "read-all":
 			r, _ := ActionsLevels.Rank("read")
 			out.Put(Entry{Key: prefix + WildcardSuffix, Value: "read (read-all)", Rank: r, Polarity: Grant})
