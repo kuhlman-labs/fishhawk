@@ -25,7 +25,10 @@ import (
 //   - Unresolved: every recognized construct holding an expression the walker
 //     cannot resolve to a value (a call, a function-local identifier, an
 //     unknown struct field, an assignment to the tracked slice other than an
-//     append). Any unresolved construct on either side is shape_unrecognized.
+//     append), plus every WRITE to a package-level var of the file outside its
+//     own declaration (sweepPackageVarWrites: an init() or helper mutating a
+//     declaration literal the extractor reads). Any unresolved construct on
+//     either side is shape_unrecognized.
 //
 // Identifier resolution, one rule for every Go extractor:
 //
@@ -418,6 +421,10 @@ func ExtractGoManifest(content []byte) (GoExtraction, error) {
 		}
 		return true
 	})
+	// manifest.go carries BOTH manifest surfaces, so a package-var write is
+	// recorded once per part: withPrefix filters Unresolved by prefix, and
+	// each surface must fail on its own.
+	g.sweepPackageVarWrites(ManifestPermissionPrefix, ManifestEventPrefix)
 	if err := AddManifestGrants(g.ext.Grants, perms, events); err != nil {
 		return GoExtraction{}, err
 	}
@@ -484,16 +491,23 @@ func ExtractGoMCPScopes(content []byte) (GoExtraction, error) {
 	if err != nil {
 		return GoExtraction{}, err
 	}
+	g.mcpToolScopesTable()
+	g.sweepPackageVarWrites(MCPToolPrefix)
+	return g.ext, nil
+}
+
+// mcpToolScopesTable reads the mcpToolScopes declaration literal.
+func (g *goFile) mcpToolScopesTable() {
 	table, ok := g.values[mcpToolScopesVar]
 	if !ok {
-		return g.ext, nil
+		return
 	}
 	anchor := MCPToolPrefix + mcpToolScopesVar
 	g.ext.Anchors[anchor] = true
 	lit, ok := table.(*ast.CompositeLit)
 	if !ok {
 		g.unresolved(MCPToolPrefix, table, mcpToolScopesVar+" value is "+exprKind(table))
-		return g.ext, nil
+		return
 	}
 	for _, el := range lit.Elts {
 		kv, ok := el.(*ast.KeyValueExpr)
@@ -508,7 +522,6 @@ func ExtractGoMCPScopes(content []byte) (GoExtraction, error) {
 		}
 		g.mcpRule(MCPToolPrefix+keySegment(tool), kv.Value, map[string]bool{})
 	}
-	return g.ext, nil
 }
 
 // mcpRule records one tool's rule under prefix (`mcp_tool.<tool>`).
@@ -624,6 +637,7 @@ func ExtractGoRunTokenScopes(content []byte) (GoExtraction, error) {
 		w.stmts(fd.Body.List, nil)
 		w.checkStrayUses(fd.Body)
 	}
+	g.sweepPackageVarWrites(RunTokenPrefix)
 	return g.ext, nil
 }
 
@@ -1160,6 +1174,7 @@ func ExtractGoEnvAllow(content []byte) (GoExtraction, error) {
 			g.ext.Grants.Put(Entry{Key: prefix + "." + keySegment(n), Value: Present, Rank: PresenceRank, Polarity: Grant})
 		}
 	}
+	g.sweepPackageVarWrites(EnvAllowPrefix)
 	return g.ext, nil
 }
 
@@ -1180,6 +1195,249 @@ func (g *goFile) isStringSliceVar(name string, v ast.Expr, hasValue bool) bool {
 		return ok && (fn.Name == "append" || fn.Name == extendFunc)
 	}
 	return false
+}
+
+// sweepPackageVarWrites records, under EACH of prefixes, every construct in
+// the file that writes (or lets a later statement write) a package-level var
+// of this file outside its own declaration. The extractors read a grant from
+// its declaration literal only, so an init(), a helper or a closure mutating
+// that var would otherwise leave base and head extracting identical grants.
+// The tracked set is EVERY package-level var the file declares (g.varOrder,
+// less the blank identifier), not only the ones an extractor resolved:
+// simpler, and conservative.
+//
+// Inside every function, method and init body — and every function literal
+// anywhere in the file, including one inside a package-level var initializer
+// — it records:
+//
+//   - an assignment (any token but :=) whose left side is rooted at a tracked
+//     name (through parens, index, selector, deref and slice expressions:
+//     `X = …`, `X[k] = …`, `X.f = …`, `X += …`);
+//   - an increment or decrement rooted at one;
+//   - a `for … = range` whose key or value is rooted at one;
+//   - `&` of an expression rooted at one (`&X`, `&X[0]`, `mutate(&X)`);
+//   - builtin `copy` whose destination, `delete` / `clear` whose first
+//     argument, or `append` whose first argument is rooted at one;
+//   - an ALIAS: a tracked name (or a slice expression of it) bound to a
+//     DIFFERENT name by :=, = or var (`m := X`, `var s = X[:]`), whose
+//     writes would share the map or backing array.
+//
+// The initializer EXPRESSIONS of package-level vars get the same call and
+// address rules (`var _ = copy(X, …)`, `var p = &X`), except that an append
+// to a BARE tracked name (`var Y = append(X, …)`) stays allowed there: it is
+// a recognized env-allow shape and cannot overwrite X's visible elements. A
+// package-level alias needs no rule of its own: it is itself a tracked var.
+//
+// Reads stay resolved: index and selector reads, `range X` with :=,
+// len/cap, a method call on X, and passing X by value as a call argument, a
+// return value or a composite-literal field (a callee writing the shared
+// elements is a residual this walker does not follow, as for `scopes`). A
+// function-local that SHADOWS a tracked name is flagged like the package var
+// (noise, never a miss).
+func (g *goFile) sweepPackageVarWrites(prefixes ...string) {
+	tracked := make(map[string]bool, len(g.varOrder))
+	for _, n := range g.varOrder {
+		if n != "_" { // the blank identifier names no storage
+			tracked[n] = true
+		}
+	}
+	if len(tracked) == 0 {
+		return
+	}
+	s := &varSweep{g: g, tracked: tracked, prefixes: prefixes}
+	for _, d := range g.file.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if d.Body != nil {
+				s.body(d.Body)
+			}
+		case *ast.GenDecl:
+			if d.Tok != token.VAR {
+				continue
+			}
+			for _, sp := range d.Specs {
+				vs, ok := sp.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, v := range vs.Values {
+					s.initializer(v)
+				}
+			}
+		}
+	}
+}
+
+// varSweep is one sweepPackageVarWrites pass.
+type varSweep struct {
+	g        *goFile
+	tracked  map[string]bool
+	prefixes []string
+}
+
+// record notes one write construct under every prefix.
+func (s *varSweep) record(at ast.Node, detail string) {
+	for _, p := range s.prefixes {
+		s.g.unresolved(p, at, detail)
+	}
+}
+
+// root returns the tracked package var e is rooted at, through parens,
+// index, generic-index, selector, deref and slice expressions.
+func (s *varSweep) root(e ast.Expr) (string, bool) {
+	for {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			e = x.X
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.IndexListExpr:
+			e = x.X
+		case *ast.SelectorExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.SliceExpr:
+			e = x.X
+		case *ast.Ident:
+			return x.Name, s.tracked[x.Name]
+		default:
+			return "", false
+		}
+	}
+}
+
+// alias returns the tracked package var e IS (or is a slice expression of):
+// a value sharing its map or backing array.
+func (s *varSweep) alias(e ast.Expr) (string, bool) {
+	for {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			e = x.X
+		case *ast.SliceExpr:
+			e = x.X
+		case *ast.Ident:
+			return x.Name, s.tracked[x.Name]
+		default:
+			return "", false
+		}
+	}
+}
+
+// body sweeps one function body (function literals inside it included) with
+// every rule.
+func (s *varSweep) body(b *ast.BlockStmt) {
+	ast.Inspect(b, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n.Tok != token.DEFINE {
+				for _, l := range n.Lhs {
+					if name, ok := s.root(l); ok {
+						s.record(l, "write to package var "+name+" outside its declaration")
+					}
+				}
+			}
+			for i, r := range n.Rhs {
+				name, ok := s.alias(r)
+				if !ok {
+					continue
+				}
+				if len(n.Lhs) == len(n.Rhs) && isIdentNamed(n.Lhs[i], name) {
+					continue // X = X[:k] is a write, judged above
+				}
+				s.record(r, "alias of package var "+name)
+			}
+		case *ast.ValueSpec:
+			for i, v := range n.Values {
+				name, ok := s.alias(v)
+				if ok && (i >= len(n.Names) || n.Names[i].Name != name) {
+					s.record(v, "alias of package var "+name)
+				}
+			}
+		case *ast.IncDecStmt:
+			if name, ok := s.root(n.X); ok {
+				s.record(n, "increment or decrement of package var "+name)
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.ASSIGN {
+				for _, e := range []ast.Expr{n.Key, n.Value} {
+					if e == nil {
+						continue
+					}
+					if name, ok := s.root(e); ok {
+						s.record(e, "range assignment to package var "+name)
+					}
+				}
+			}
+		default:
+			s.expr(n, true)
+		}
+		return true
+	})
+}
+
+// initializer sweeps one package-level var initializer expression: the call
+// and address rules over the expression itself, and every rule inside any
+// function literal it holds.
+func (s *varSweep) initializer(v ast.Expr) {
+	ast.Inspect(v, func(n ast.Node) bool {
+		if fl, ok := n.(*ast.FuncLit); ok {
+			s.body(fl.Body)
+			return false
+		}
+		s.expr(n, false)
+		return true
+	})
+}
+
+// expr applies the address-of and builtin-call rules to n. inBody is false
+// for a package-level initializer, where an append to a BARE tracked name is
+// allowed.
+func (s *varSweep) expr(n ast.Node, inBody bool) {
+	switch n := n.(type) {
+	case *ast.UnaryExpr:
+		if n.Op != token.AND {
+			return
+		}
+		if name, ok := s.root(n.X); ok {
+			s.record(n, "address of package var "+name+" taken")
+		}
+	case *ast.CallExpr:
+		fn, ok := n.Fun.(*ast.Ident)
+		if !ok || len(n.Args) == 0 {
+			return
+		}
+		switch fn.Name {
+		case "copy":
+			if name, ok := s.root(n.Args[0]); ok {
+				s.record(n, "copy into package var "+name)
+			}
+		case "delete", "clear":
+			if name, ok := s.root(n.Args[0]); ok {
+				s.record(n, fn.Name+" of package var "+name)
+			}
+		case "append":
+			name, ok := s.root(n.Args[0])
+			if !ok {
+				return
+			}
+			if !inBody && isIdentNamed(unparen(n.Args[0]), name) {
+				return
+			}
+			s.record(n, "append to package var "+name)
+		}
+	}
+}
+
+// unparen strips parentheses.
+func unparen(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = p.X
+	}
 }
 
 func emptyGoExtraction() GoExtraction {

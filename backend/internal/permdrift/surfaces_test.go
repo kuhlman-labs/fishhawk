@@ -182,6 +182,11 @@ func TestDetect_DefaultSurfaces_AcceptanceFixtures(t *testing.T) {
 //     the missing env_allow.CodexAllow anchor marks it.
 //   - zero-entries clause: "table emptied" keeps the mcpToolScopes anchor and
 //     resolves cleanly, so only "base had entries, head has none" marks it.
+//   - package-var write sweep (#3939 F6, an unresolved-clause feeder): "a
+//     package var mutated in init" keeps every declaration literal, anchor
+//     and grant unchanged, so only the sweep's Unresolved marks it; with
+//     sweepPackageVarWrites returning immediately (body mutation) the arm
+//     reads as evaluable with no change and goes RED.
 func TestDetect_GoSurfaceShapeLostIsUnevaluable(t *testing.T) {
 	surface := func(id string) Surface {
 		for _, s := range DefaultSurfaces() {
@@ -211,6 +216,8 @@ func TestDetect_GoSurfaceShapeLostIsUnevaluable(t *testing.T) {
 		{"manifest literal lost default_events", "github-app-events-go",
 			manifestGo(`"contents": "write",`, `"push",`),
 			strings.Replace(manifestGo(`"contents": "write",`, `"push",`), `"default_events"`, `"events"`, 1)},
+		{"a package var mutated in init", "reviewer-env-allowlist",
+			envSrc(), envSrc() + "\nfunc init() { BaseAllow[0] = \"GITHUB_TOKEN\" }\n"},
 		{"manifest events built by a call", "github-app-events-go",
 			manifestGo(`"contents": "write",`, `"push",`),
 			strings.Replace(manifestGo(`"contents": "write",`, `"push",`), "[]string{\n\"push\",\n\t\t}", "events()", 1)},
@@ -281,6 +288,35 @@ func TestDetect_ManifestPartsAreIndependent(t *testing.T) {
 				t.Errorf("%s = %+v; want nothing", s.ID, r)
 			}
 		}
+	}
+}
+
+// TestDetect_ManifestPackageVarWriteFailsBothParts: manifest.go carries TWO
+// surfaces (App permissions and App events), and withPrefix filters
+// Unresolved by prefix, so a package-var write the sweep finds must be
+// recorded under BOTH prefixes or one surface would read it as clean. The
+// synthetic manifest plus a package var written by init() is
+// shape_unrecognized on both surfaces; the same source without the init()
+// is evaluable on both (the control: the var alone is no write).
+//
+// COUNTERFACTUAL: change the ExtractGoManifest call site to pass only
+// ManifestPermissionPrefix — the github-app-events-go arm goes RED while the
+// permissions arm stays green, so each prefix is pinned independently.
+func TestDetect_ManifestPackageVarWriteFailsBothParts(t *testing.T) {
+	base := manifestGo(`"contents": "read",`, `"push",`) + "\nvar appName = \"Fishhawk\"\n"
+	head := base + "func init() { appName = \"Fishhawk (patched)\" }\n"
+	for _, id := range []string{"github-app-permissions-go", "github-app-events-go"} {
+		t.Run(id, func(t *testing.T) {
+			s := surfaceByID(t, id)
+			if r := Detect(s, side(base), side(base)); r.Unevaluable != "" || len(r.Widened)+len(r.Narrowed) != 0 {
+				t.Fatalf("control without init(): Detect = %+v; want evaluable with no change", r)
+			}
+			r := Detect(s, side(base), side(head))
+			if r.Unevaluable != ReasonShapeUnrecognized || len(r.Widened)+len(r.Narrowed) != 0 ||
+				!strings.Contains(r.Detail, "write to package var appName outside its declaration") {
+				t.Fatalf("Detect = %+v; want shape_unrecognized naming the appName write", r)
+			}
+		})
 	}
 }
 
@@ -585,6 +621,13 @@ func TestNote(t *testing.T) {
 			!strings.Contains(u, "Only a human can waive it") {
 			t.Errorf("NoteUnevaluable(%s) = %s", reason, u)
 		}
+	}
+	// #3939: the server's run-base resolution failure has its own class and
+	// says the extension was not read (iterating the map above would stay
+	// green with the entry deleted).
+	if u := NoteUnevaluable(s, RepoSurfacesPath, ReasonSurfacesRefUnresolved); ReasonSurfacesRefUnresolved != "surfaces_ref_unresolved" ||
+		!strings.Contains(u, "recorded base commit could not be resolved") || !strings.Contains(u, "surface extension was not read") {
+		t.Errorf("NoteUnevaluable(%s) = %s; want the run-base explanation", ReasonSurfacesRefUnresolved, u)
 	}
 	if u := NoteUnevaluable(s, "", "other_reason"); !strings.Contains(u, "other_reason") || strings.Contains(u, " in ") {
 		t.Errorf("NoteUnevaluable(unknown reason, no path) = %s", u)

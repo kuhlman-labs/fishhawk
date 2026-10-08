@@ -55,6 +55,13 @@ type Entry struct {
 	Rank int
 	// Polarity says what presence means.
 	Polarity Polarity
+	// Except is the one single-segment sibling a WILDCARD entry does NOT
+	// cover ("" = it covers every sibling). The GitHub Actions default token
+	// is a write wildcard with Except "id-token": the default GITHUB_TOKEN
+	// never carries id-token, so a later explicit `id-token: write` is not
+	// subsumed by it (see coveredBy). Meaningless on a non-wildcard key. A
+	// plain string, so Entry stays comparable.
+	Except string
 }
 
 // Grants is a normalized grant set, keyed by Entry.Key.
@@ -180,9 +187,10 @@ func keyEscapeRune(r rune, size int) bool {
 // base Grant wildcard of rank >= its own is NOT a widening (base write-all ->
 // head {contents: write} gives nothing new), and a base-only Grant covered by
 // a head Grant wildcard of rank >= its own is NOT a narrowing (base {contents:
-// write} -> head write-all takes nothing away). A wildcard key is itself an
-// ordinary key, so a NEW head wildcard is a widening and a vanished base one a
-// narrowing.
+// write} -> head write-all takes nothing away). A wildcard whose Except names
+// the entry's last segment does not cover it (base default token -> head
+// {id-token: write} is a widening). A wildcard key is itself an ordinary key,
+// so a NEW head wildcard is a widening and a vanished base one a narrowing.
 func Compare(base, head Grants) []Change {
 	keys := make([]string, 0, len(base)+len(head))
 	for k := range base {
@@ -239,10 +247,10 @@ func Compare(base, head Grants) []Change {
 }
 
 // coveredBy reports whether set holds a Grant wildcard covering e at a rank
-// >= e's own. A wildcard never covers itself (it is matched as an ordinary
-// key above), and only a single trailing segment is covered, so a key whose
-// remainder contains a '.' is never subsumed — the conservative direction
-// for widenings.
+// >= e's own and not carving e's last segment out (Except). A wildcard never
+// covers itself (it is matched as an ordinary key above), and only a single
+// trailing segment is covered, so a key whose remainder contains a '.' is
+// never subsumed — the conservative direction for widenings.
 func coveredBy(set Grants, e Entry) bool {
 	if e.Polarity != Grant || strings.HasSuffix(e.Key, WildcardSuffix) {
 		return false
@@ -252,7 +260,7 @@ func coveredBy(set Grants, e Entry) bool {
 		return false
 	}
 	w, ok := set[e.Key[:dot]+WildcardSuffix]
-	return ok && w.Polarity == Grant && w.Rank >= e.Rank
+	return ok && w.Polarity == Grant && w.Rank >= e.Rank && (w.Except == "" || w.Except != e.Key[dot+1:])
 }
 
 // Levels is an ordered level vocabulary: index is the rank, so a later
