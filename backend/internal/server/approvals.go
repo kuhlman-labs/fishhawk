@@ -626,7 +626,10 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// Approval-gate predicate resolution (E39.5 / #1710): when the stage's
 	// gate carries an approvals block that sets min_permission and/or
 	// member_of, and the submitter is a real human (not a delegated / agent
-	// submission), resolve the predicate against the forge PRE-Submit. An
+	// submission), resolve the predicate against the forge PRE-Submit. A
+	// non-empty approvals.members list (#4116) is checked first, for EVERY
+	// submission including delegated / agent ones, against the principal
+	// (approvalPrincipal); an unlisted principal is refused 403. An
 	// insufficient permission or non-membership rejects the approver (403,
 	// no row inserted); an unresolvable forge (error / rate-limit / empty
 	// repo) fails the gate closed with a retryable 503. On success the
@@ -1331,6 +1334,40 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	required := effective.count
 	gateUnreachable := escErr != nil
 
+	// approvals.members COUNT-TIME filter (#4116). The pre-Submit members leg
+	// (checkApprovalPredicates) refuses an unlisted principal before any row
+	// is inserted, but two paths reach this method without it: the
+	// in-process campaign auto-driver, and a row recorded before members was
+	// enforced. So the distinct eligible approvers are filtered through the
+	// same identity.SubjectListed rule here, BEFORE the escalated forge
+	// re-validation below (which then iterates the filtered set). Delegated
+	// rows are untouched by this: they are recorded under the synthetic
+	// subject, which the agent floor and the delegated set already exclude.
+	//
+	// The run row is read for its forge (a plain member is qualified with
+	// it) with a DIRECT s.cfg.RunRepo.GetRun call in this function's own body
+	// — the T12 fixture (callerScopedGetRunFailRepo) matches on the immediate
+	// caller. A read failure fails toward NOT ADVANCING (the post-Submit
+	// posture; there is no 503 here), never toward a guessed github forge.
+	if len(effective.members) > 0 {
+		runRow, rerr := s.cfg.RunRepo.GetRun(ctx, p.Stage.RunID)
+		if rerr != nil || runRow == nil {
+			gateUnreachable = true
+			errMsg := "run row missing"
+			if rerr != nil {
+				errMsg = rerr.Error()
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"approval: run row unreadable for the approvals.members count-time filter; not advancing the gate",
+				slog.String("stage_id", p.Stage.ID.String()),
+				slog.String("error", errMsg),
+			)
+		} else {
+			subjects = filterListedSubjects(subjects, effective.members, observationForgeID(runRow.InstallationRef))
+			eligibleCount = len(subjects)
+		}
+	}
+
 	// Cross-request TOCTOU closure (#2227). The plan scope the escalation
 	// matches against is MUTABLE (a scope amendment can move the plan into an
 	// escalated path between two approvals), so an approval recorded while the
@@ -1390,6 +1427,11 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		snapshot.Escalated = true
 		snapshot.EscalatedMemberOf = effective.memberOf
 	}
+	// The gate's approvals.members allow-list (#4116), recorded as declared.
+	// Additive + omitempty: a gate without members is byte-identical.
+	if len(effective.members) > 0 {
+		snapshot.Members = effective.members
+	}
 	// Record the forge-resolved predicate outcome on the counted-approver
 	// row when the handler resolved it (E39.5 / #1710). The campaign
 	// auto-driver / agent path leaves PredicateResolution nil, so its
@@ -1398,6 +1440,8 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		snapshot.ResolvedPermission = p.PredicateResolution.ResolvedPermission
 		snapshot.MemberResolved = p.PredicateResolution.MemberResolved
 		snapshot.PredicateResult = "satisfied"
+		snapshot.MembersPrincipal = p.PredicateResolution.MembersPrincipal
+		snapshot.MembersListed = p.PredicateResolution.MembersListed
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
@@ -1558,13 +1602,33 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 }
 
 // checkApprovalPredicates resolves the stage gate's forge predicates
-// (min_permission / member_of) against the submitter PRE-Submit (E39.5 /
-// #1710). It returns (resolution, true) to continue to Submit — the
-// resolution is non-nil and carries the resolved values ONLY when a
-// predicate was actually evaluated and satisfied; it is nil when the gate is
-// not predicate-guarded (no approvals block, no predicate fields) or the
-// submission is a delegated / agent one that is recorded-but-never-counted
-// and so not forge-gated. It returns (nil, false) after writing the response
+// (min_permission / member_of) and its approvals.members allow-list (#4116)
+// against the submitter PRE-Submit (E39.5 / #1710). It returns
+// (resolution, true) to continue to Submit — the resolution is non-nil and
+// carries the resolved values ONLY when a predicate was actually evaluated
+// and satisfied; it is nil when the gate is not predicate-guarded (no
+// approvals block, no predicate fields, no members) or the submission is a
+// delegated / agent one on a gate WITHOUT members, which is
+// recorded-but-never-counted and so not forge-gated.
+//
+// The members leg runs first, against approvalPrincipal (the subject, or a
+// delegated submission's on_behalf_of — the real operator or the seated
+// captain — never the synthetic operator-agent/delegated subject), using
+// identity.SubjectListed with the run's forge. RETURN SHAPE when members is
+// declared and the principal is listed: if there is NO forge predicate, or
+// the submission is delegated / agent-kind (never forge-gated), it returns
+// (&predicateResolution{MembersPrincipal, MembersListed: &true}, true)
+// BEFORE resolvePredicates runs — no forge call; otherwise the forge leg runs
+// and its satisfied resolution carries the same two members fields. An
+// unlisted principal is refused 403 approver_predicate_unmet
+// (details.predicate:"members") with an approval_predicate_rejected audit
+// row and no approval row. A listed delegated / agent submission is ADMITTED
+// and still never COUNTED (the #1709 agent floor). Members is enforced at
+// APPROVAL-ROW gates only: a merge-settled review gate
+// (resolveReviewStageOnMerge) records no approval row and never reaches this
+// function; approveStageAs is the count-time half.
+//
+// It returns (nil, false) after writing the response
 // on a rejection (403 approver_predicate_unmet), an unresolvable forge (503
 // forge_unavailable, details.retryable:true), a run forge with no configured
 // identity provider (503 forge_unavailable with
@@ -1662,14 +1726,19 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	}
 	effective := effectiveApprovals(approvals, escReq)
 
-	// Only the two forge predicates gate here. A count-only requirement keeps
-	// the pure-quorum path.
-	if effective.minPermission == "" && len(effective.memberOf) == 0 {
+	// Only the two forge predicates and the approvals.members allow-list
+	// (#4116) gate here. A count-only requirement keeps the pure-quorum path.
+	forgeGuarded := effective.minPermission != "" || len(effective.memberOf) > 0
+	membersGuarded := len(effective.members) > 0
+	if !forgeGuarded && !membersGuarded {
 		return nil, true
 	}
 	// A delegated / agent-kind submission is recorded but never counted
-	// toward the human quorum, so it is not forge-gated either.
-	if delegated || actorKindForSubject(subject) == audit.ActorAgent {
+	// toward the human quorum, so it is not forge-gated. It IS members-
+	// checked (below), against its principal — so it skips here only when
+	// the gate declares no members list.
+	agentOrDelegated := delegated || actorKindForSubject(subject) == audit.ActorAgent
+	if !membersGuarded && agentOrDelegated {
 		return nil, true
 	}
 
@@ -1683,33 +1752,90 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	// of a retryable 503. This read is the THIRD read of the same run row in
 	// this request (after fetchApprovalsForStage and
 	// resolveStageEscalations), so any error here is transient by
-	// construction — run.ErrNotFound is not special-cased.
+	// construction — run.ErrNotFound is not special-cased. It is read ONCE
+	// and shared by the members leg and the forge leg, and it stays a DIRECT
+	// s.cfg.RunRepo.GetRun call in this function's own body: the T10
+	// fixture (callerScopedGetRunFailRepo) matches on its immediate caller,
+	// so a helper frame would make that fault injection never fire.
 	runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
 	if rerr != nil {
 		predicate := "member_of"
-		if effective.minPermission != "" {
+		message := "the run row could not be read, so the run's forge and repository are unknown and the gate's permission/membership predicate could not be evaluated; the approval gate failed closed"
+		switch {
+		case membersGuarded:
+			// The members leg runs FIRST and needs the run's forge to
+			// qualify a plain member (#4116): it fails closed here exactly
+			// like the forge leg, never on a guessed github default.
+			predicate = "members"
+			message = "the run row could not be read, so the run's forge is unknown and the gate's approvals.members allow-list could not be evaluated; the approval gate failed closed"
+		case effective.minPermission != "":
 			predicate = "min_permission"
 		}
-		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable",
-			"the run row could not be read, so the run's forge and repository are unknown and the gate's permission/membership predicate could not be evaluated; the approval gate failed closed",
-			map[string]any{
-				"stage_id":  stage.ID.String(),
-				"retryable": true,
-				"reason":    "run_row_unreadable",
-				"error":     rerr.Error(),
-				"predicate": predicate,
-				"ref":       renderMemberOf(effective.memberOf),
-				"next_actions": []string{
-					"Retry the approval; the run row read failed transiently, so the run's forge could not be determined",
-				},
-			})
+		details := map[string]any{
+			"stage_id":  stage.ID.String(),
+			"retryable": true,
+			"reason":    "run_row_unreadable",
+			"error":     rerr.Error(),
+			"predicate": predicate,
+			"ref":       renderMemberOf(effective.memberOf),
+			"next_actions": []string{
+				"Retry the approval; the run row read failed transiently, so the run's forge could not be determined",
+			},
+		}
+		if membersGuarded {
+			details["members"] = effective.members
+		}
+		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable", message, details)
 		return nil, false
 	}
 	repo := runRow.Repo
 	installationRef := runRow.InstallationRef
 	forge := observationForgeID(installationRef)
 
+	// The approvals.members leg (#4116) runs BEFORE the delegated/agent forge
+	// skip and before any forge call: a local, byte-exact allow-list check
+	// against the PRINCIPAL (approvalPrincipal — the authenticated subject,
+	// or a delegated submission's on_behalf_of, never the synthetic
+	// operator-agent/delegated subject), with plain members qualified by the
+	// run's forge. An unlisted principal is refused 403 with no approval row.
+	var membersRes *predicateResolution
+	if membersGuarded {
+		principal := s.approvalPrincipal(r.Context(), stage, subject, delegated)
+		listed := identity.SubjectListed(effective.members, principal, forge)
+		membersRes = &predicateResolution{MembersPrincipal: principal, MembersListed: &listed}
+		if !listed {
+			s.writePredicateRejectionAudit(r.Context(), stage, subject, effective, membersRes)
+			s.writeError(w, r, http.StatusForbidden, "approver_predicate_unmet",
+				"the approver is not on the gate's approvals.members allow-list",
+				map[string]any{
+					"stage_id":          stage.ID.String(),
+					"subject":           subject,
+					"members":           effective.members,
+					"members_principal": principal,
+					"predicate":         "members",
+					"escalated":         !escReq.IsZero(),
+					"result":            "rejected",
+					"next_actions": []string{
+						"Approve with a listed forge-verified identity (e.g. a `fishhawk token login` credential, whose subject is github:<login>); a static API-token or agent subject never matches",
+						"Or ask the workflow owner to add the principal to the gate's approvals.members list",
+					},
+				})
+			return nil, false
+		}
+		// Listed, and nothing further to evaluate (no forge predicate, or a
+		// delegated / agent-kind submission, which is never forge-gated):
+		// return BEFORE resolvePredicates with the members verdict so
+		// approveStageAs records it on the predicate_snapshot.
+		if !forgeGuarded || agentOrDelegated {
+			return membersRes, true
+		}
+	}
+
 	outcome, resolution, predicate := s.resolvePredicates(r.Context(), forge, repo, subject, effective)
+	if membersRes != nil && resolution != nil {
+		resolution.MembersPrincipal = membersRes.MembersPrincipal
+		resolution.MembersListed = membersRes.MembersListed
+	}
 	switch outcome {
 	case predicateSatisfied:
 		return resolution, true
@@ -1797,6 +1923,14 @@ func (s *Server) writePredicateRejectionAudit(ctx context.Context, stage *run.St
 	if len(approvals.memberOf) > 0 {
 		snapshot["member_of"] = renderMemberOf(approvals.memberOf)
 		snapshot["member_resolved"] = resolution.MemberResolved
+	}
+	// The approvals.members leg's evaluation (#4116), when the gate declares
+	// a non-empty list: the declared list, the principal it was evaluated
+	// against, and the verdict (false on a members rejection).
+	if len(approvals.members) > 0 {
+		snapshot["members"] = approvals.members
+		snapshot["members_principal"] = resolution.MembersPrincipal
+		snapshot["members_listed"] = resolution.MembersListed
 	}
 	actorKind := actorKindForSubject(subject)
 	subj := subject

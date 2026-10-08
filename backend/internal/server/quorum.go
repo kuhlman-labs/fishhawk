@@ -107,7 +107,11 @@ func (s *Server) delegatedApproveWouldAdvance(ctx context.Context, stage *run.St
 // approvals block, an approve advances the stage only once a distinct
 // eligible-approver quorum is reached, the change author may not
 // self-approve, and delegated / agent-kind submissions are recorded but
-// never counted. Gates with no approvals block keep the first-vote-advances
+// never counted. A non-empty approvals.members list (#4116) additionally
+// admits only a listed principal (approvalPrincipal + identity.SubjectListed,
+// pre-Submit) and counts only listed subjects (filterListedSubjects, at count
+// time); resolvePredicates, eligibleApprover and effectiveApprovalSubject are
+// deliberately untouched by it. Gates with no approvals block keep the first-vote-advances
 // path byte-for-byte; the only change on that path is the ADR-055 additive
 // identity/channel enrichment on every approval_submitted audit row.
 
@@ -494,6 +498,18 @@ type predicateSnapshot struct {
 	// keeping the E9 Export v1 hash chain and strict decode unaffected.
 	Escalated         bool     `json:"escalated,omitempty"`
 	EscalatedMemberOf []string `json:"escalated_member_of,omitempty"`
+	// Members is the gate's exact-match approver allow-list (#4116), as
+	// DECLARED (pre-canonicalisation), recorded when the gate declares a
+	// non-empty one. Additive + omitempty: a gate without members serialises
+	// byte-identically, keeping the E9 Export v1 hash chain and strict
+	// decode unaffected.
+	Members []string `json:"members,omitempty"`
+	// MembersPrincipal / MembersListed record what the pre-Submit members
+	// leg evaluated (the principal and its verdict) when the HTTP handler
+	// ran it. Additive + omitempty: the campaign auto-driver path and a
+	// gate without members leave them unset.
+	MembersPrincipal string `json:"members_principal,omitempty"`
+	MembersListed    *bool  `json:"members_listed,omitempty"`
 }
 
 // submitterClass labels the submitter relative to the quorum: "author" when
@@ -582,6 +598,70 @@ const (
 type predicateResolution struct {
 	ResolvedPermission string
 	MemberResolved     *bool
+	// MembersPrincipal / MembersListed carry the approvals.members leg's
+	// evaluation (#4116) when the gate declares a non-empty members list:
+	// the principal the list was evaluated against (approvalPrincipal) and
+	// the verdict. They are populated by checkApprovalPredicates — on the
+	// members-only early return too (no forge predicate) — so approveStageAs
+	// can copy them into the approval_submitted predicate_snapshot. nil
+	// MembersListed means the members leg did not run.
+	MembersPrincipal string
+	MembersListed    *bool
+}
+
+// approvalPrincipal returns the identity the gate's approvals.members list is
+// evaluated against (#4116). It is the identity the approval_submitted row
+// records as acting or as on_behalf_of — never the synthetic
+// operatorrole.DelegatedApprovalActorSubject the #2381 remap records a
+// delegated vote under, which is provider-less and would refuse every
+// delegated submission:
+//
+//   - a NON-delegated submission: the authenticated subject itself. An
+//     agent-kind subject ("operator-agent/...") is returned as-is and, having
+//     no forge provider, matches no member — so a non-delegated agent-kind
+//     submission on a members gate is refused (it was previously recorded but
+//     never counted);
+//   - a DELEGATED human-kind submission: the subject, i.e. the real operator
+//     writeApprovalAudit records as on_behalf_of after the #2381 remap;
+//   - a DELEGATED agent-kind submission: the seated captain, the on_behalf_of
+//     writeApprovalAudit records with basis "captain" (E76.3 / #3766), read
+//     through delegatedCaptainPrincipal; "" when the seat is vacant, the store
+//     unwired or the read failed, which SubjectListed refuses (fail-closed).
+//
+// It never reaches quorum or eligibility: a listed delegated submission is
+// ADMITTED (recorded) and still never COUNTED (the unconditional #1709 agent
+// floor in eligibleApprover is untouched).
+func (s *Server) approvalPrincipal(ctx context.Context, stage *run.Stage, subject string, delegated bool) string {
+	if !delegated {
+		return subject
+	}
+	if effectiveApprovalSubject(subject, delegated) != subject {
+		// The #2381 remap fired: a human-kind operator delegated, and the row
+		// records them as on_behalf_of.
+		return subject
+	}
+	return s.delegatedCaptainPrincipal(ctx, stage, "").OnBehalfOf
+}
+
+// filterListedSubjects returns the subjects on the gate's approvals.members
+// allow-list for a run on forge (#4116), preserving order. It is the
+// COUNT-TIME half of members enforcement: approveStageAs filters the distinct
+// eligible approvers through it so an approval that reached the table without
+// the pre-Submit members leg — the in-process campaign auto-driver path, or a
+// row recorded before this enforcement deployed — can never count. An empty
+// members list is no restriction and returns subjects unchanged; the caller
+// only invokes it when the list is non-empty.
+func filterListedSubjects(subjects, members []string, forge string) []string {
+	if len(members) == 0 {
+		return subjects
+	}
+	out := make([]string, 0, len(subjects))
+	for _, sub := range subjects {
+		if identity.SubjectListed(members, sub, forge) {
+			out = append(out, sub)
+		}
+	}
+	return out
 }
 
 // predicateIdentityProvider returns the identity provider the approvals gate

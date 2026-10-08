@@ -1,7 +1,7 @@
 # fishhawkd
 
 Fishhawk control-plane daemon binary: the backend HTTP API server plus its operational subcommands
-(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`, `member.go`, `oauthclient.go`).
+(`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`, `member.go`, `oauthclient.go`, `approver_members.go`).
 
 ## Tenancy registration subcommands (`account` / `installation` / `member`, E45.33 / #2923, E44.34 / #2924)
 
@@ -819,3 +819,74 @@ all-zero report that reads as "never fires".
 
 Until E71.2 / #3242 lands, an index row's doctrine version is `runs.workflow_sha`, so any workflow
 spec edit resets precedent; the `doctrine_version_mismatch` column shows what that costs.
+
+## `approver-members`: the `approvals.members` dry-run and impact inventory (#4116)
+
+`approvals.members` is enforced as an exact-match approver allow-list at approval-row gates
+(contract: `backend/internal/server/README.md` § "`approvals.members` enforcement (#4116)"). This
+command answers "who would that refuse?" BEFORE the enforcement ships or a members list changes,
+and is the impact inventory the AGENTS.md auth-change checklist asks for.
+
+```sh
+fishhawkd approver-members --spec <path> [--db <url>] [--window 30d | --since <RFC3339>] \
+  [--repo owner/name] [--forge github|gitlab]
+```
+
+It parses `--spec` with `spec.ParseBytes` (v2 `defaults`/`extends` resolved, like the gate's
+cached-spec read), collects every approval gate with a NON-EMPTY `approvals.members` (an empty or
+absent list restricts nobody — with none, it says so and exits 0 without reading the database), and
+reads one aggregate over `audit_entries` ⋈ `runs`: `approval_submitted` rows with
+`payload.decision = approve` and `ts >=` the lower bound, optionally for one `--repo`. Each row's
+**principal** is the recorded `on_behalf_of` for a delegated row (the real operator, or the seated
+captain for an agent-kind delegation), else the actor subject. Every human principal is evaluated
+against EVERY members gate through the same `identity.SubjectListed` the gate runs, with a plain
+(unqualified) member qualified by `--forge` (default `github`) — so the inventory is an upper bound
+when gates carry different lists, since it does not join a row to the gate it was recorded at.
+
+**Window.** `--window` (default `30d`; whole days or a Go duration, via `precedent.ParseWindow`)
+bounds at `now - window`. `--since <RFC3339>` passes the parsed instant to the query VERBATIM (no
+now-relative arithmetic). The two are **mutually exclusive**: passing both explicitly is a usage
+error (exclusivity is read from `flag.FlagSet.Visit`, so the `--window` default alone never
+conflicts with `--since`).
+
+**Output** (stdout): a header naming the effective lower bound and each members gate; three
+`note:` lines — merge-settled review gates (`resolveReviewStageOnMerge`) record no approval row and
+are not members-checked, so they are NOT in the inventory; every principal is evaluated against
+every gate; and the RLS caveat (`audit_entries` is FORCE row-level secured and the command sets no
+`app.account_id`, so a role that is neither superuser nor `BYPASSRLS` sees only account-unscoped
+rows — a short inventory may be incomplete); then one line per principal and a summary:
+
+```
+principal=brett@local-mcp approvals=285 verdict=refused refusing_gates=feature_change/plan,...
+principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=-
+principal=operator-agent/driver approvals=3 verdict=agent_never_counted refusing_gates=...
+impact: refused=1 principals=2 approvals=289 refused_approvals=285 agent_rows_now_refused=3
+```
+
+`refused` / `principals` / `approvals` / `refused_approvals` count HUMAN principals and their
+approve rows. An agent-kind or empty principal (the operator-agent token family, or a delegated
+row whose seat was vacant) is reported `agent_never_counted`: the unconditional #1709 agent floor
+means it never advances a gate, so it is never an impact. Its rows are still summed into
+`agent_rows_now_refused` — a NON-delegated agent-kind submission on a members gate is now refused
+`403` where it was previously recorded but never counted — and kept OUT of `refused=` and the exit
+code.
+
+**Exit codes.** `0` — no human principal would be refused (or no members gate exists); `1` — at
+least one would be refused, or the database read failed (stderr names it, no `impact:` line); `2` —
+usage: missing `--spec`, an unreadable or invalid spec, a bad `--window`, an unparseable `--since`,
+`--window` and `--since` together, a `--forge` outside `github|gitlab`, a stray argument, or no
+`--db`/`FISHHAWKD_DATABASE_URL`. A usage error never touches the database.
+
+**The auth-checklist impact inventory for #4116.** The no-wedge check counts only approvals
+recorded AFTER the operator's forge-identity switch (`fishhawk token login` replacing the static
+`FISHHAWK_API_TOKEN`, then `/mcp`); the last static-subject approval was 2026-10-08T16:55:08Z:
+
+```sh
+fishhawkd approver-members --spec .fishhawk/workflows.yaml --db $FISHHAWKD_DATABASE_URL --since 2026-10-08T16:56:00Z
+```
+
+Safe to ship only when that exits `0`. The 30-day run
+(`fishhawkd approver-members --spec .fishhawk/workflows.yaml --db $FISHHAWKD_DATABASE_URL --window 30d`)
+is EXPECTED to exit `1` refusing the pre-switch `brett@local-mcp` approvals: that refusal is the
+correct pre-switch result, never something to "fix" by widening `members`, special-casing a
+subject, or skipping the check.

@@ -351,10 +351,18 @@ func (s *Server) escalationAlreadyAudited(ctx context.Context, runID, stageID uu
 // which is why membership can only ever narrow. The baseline group (when the
 // gate declares one) is folded in with the escalated ones for exactly that
 // reason: an escalation must not be able to REPLACE the gate's own group.
+//
+// members is the gate's exact-match approver allow-list (#4116). It comes from
+// the BASELINE only: spec.ComposedRequirements / spec.EscalatedApprovals carry
+// no members field and the workflow schema gives an escalation's
+// require.approvals no members key, so an escalation can only leave the list
+// as declared — it can never WIDEN it (and narrowing it would need a schema
+// key, which is deliberately out of scope). An empty list is no restriction.
 type escalatedApprovals struct {
 	count         int
 	memberOf      []string
 	minPermission string
+	members       []string
 }
 
 // effectiveApprovals composes a gate's baseline *spec.Approvals with the fired
@@ -377,6 +385,12 @@ func effectiveApprovals(base *spec.Approvals, req spec.ComposedRequirements) esc
 		out.minPermission = base.MinPermission
 		if base.MemberOf != "" {
 			out.memberOf = append(out.memberOf, base.MemberOf)
+		}
+		// A FRESH copy, never an alias of base.Members: the parsed spec is
+		// shared and cached on the run row, so a caller mutating the
+		// returned slice must not reach it. Never sourced from req (#4116).
+		if len(base.Members) > 0 {
+			out.members = append([]string(nil), base.Members...)
 		}
 	}
 	if req.Count != nil && *req.Count > out.count {
