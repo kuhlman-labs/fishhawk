@@ -114,7 +114,10 @@ workflows:
             sla: 24_hours
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               not: [author, agent]
 
       # There is deliberately no apply stage between these two, and adding
@@ -146,7 +149,10 @@ workflows:
             sla: 24_hours
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               not: [agent]
 
   # ---------------------------------------------------------------------------
@@ -288,7 +294,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               # Exclude the change's author and any agent identity. Taking
               # part in the loop — answering a clarification, attaching
               # approval conditions, driving a stage — is not authorship, so
@@ -508,7 +517,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               # Same predicate as the plan gate: one approval, excluding the
               # author and any agent identity.
               not: [author, agent]
@@ -663,7 +675,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               not: [author, agent]
 
   # ---------------------------------------------------------------------------
@@ -719,5 +734,8 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              members: [kuhlman-labs]
+              # Forge-verified approver identity (provider-qualified subject). Not
+              # enforced until #4116; MCP approvals must come from a `fishhawk token
+              # login` (GitHub device-flow) credential, not the static MCP token.
+              members: ["github:kuhlman-labs"]
               not: [author, agent]
