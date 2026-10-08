@@ -213,6 +213,13 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 		Generator:     testSweepGeneratorSyncSchemas,
 	},
 	{
+		// comms-report-*.schema.json case arm (#4015): backend only.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/comms-report-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/plan/schemas/comms-report-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
 		// workflow-v*.schema.json case arm, one row per shipped major.
 		Rule:        testSweepRuleGeneratedSurface,
 		TriggerGlob: "docs/spec/workflow-v0.schema.json",
