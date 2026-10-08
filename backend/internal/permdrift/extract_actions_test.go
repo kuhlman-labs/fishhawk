@@ -2,6 +2,7 @@ package permdrift
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -70,11 +71,20 @@ jobs:
 			[]Change{
 				{Key: "jobs.build.*", Before: Absent, After: defaultTokenValue, Direction: Widened},
 			}},
+		// write-all carries an explicit id-token entry next to its wildcard
+		// (the default token's carve-out), so read-all -> write-all also
+		// widens id-token, which read-all never granted.
 		{"read-all to write-all", "permissions: read-all\njobs:\n  x: {runs-on: a}\n", "permissions: write-all\njobs:\n  x: {runs-on: a}\n",
-			[]Change{{Key: "jobs.x.*", Before: "read (read-all)", After: "write (write-all)", Direction: Widened}}},
+			[]Change{
+				{Key: "jobs.x.*", Before: "read (read-all)", After: "write (write-all)", Direction: Widened},
+				{Key: "jobs.x.id-token", Before: Absent, After: writeAllIDTokenValue, Direction: Widened},
+			}},
 		{"write-all to an explicit write scope is not a widening",
 			"jobs:\n  x:\n    permissions: write-all\n", "jobs:\n  x:\n    permissions: {contents: write}\n",
-			[]Change{{Key: "jobs.x.*", Before: "write (write-all)", After: Absent, Direction: Narrowed}}},
+			[]Change{
+				{Key: "jobs.x.*", Before: "write (write-all)", After: Absent, Direction: Narrowed},
+				{Key: "jobs.x.id-token", Before: writeAllIDTokenValue, After: Absent, Direction: Narrowed},
+			}},
 		{"empty block grants nothing", "jobs:\n  x:\n    permissions: {}\n", "jobs:\n  x:\n    permissions: {contents: none}\n", nil},
 		{"a new job with no block gets the default", "jobs:\n  x:\n    permissions: {}\n", "jobs:\n  x:\n    permissions: {}\n  y:\n    runs-on: a\n",
 			[]Change{{Key: "jobs.y.*", Before: Absent, After: defaultTokenValue, Direction: Widened}}},
@@ -141,5 +151,71 @@ func TestExtractActions_FileDerivedWildcard(t *testing.T) {
 	}
 	if !reflect.DeepEqual(keysOf(g), []string{"jobs.a%2Eb.c", "jobs.a.b%2Ec"}) {
 		t.Fatalf("keys = %v, want the dotted job id and scope each escaped to one segment", keysOf(g))
+	}
+}
+
+// TestExtractActions_DefaultTokenExcludesIDToken pins #3939 F4: a job with NO
+// permissions block runs with the default GITHUB_TOKEN, which never carries
+// id-token, so adding `id-token: write` (or write-all) to it is a widening.
+// The base workflow has no block, so ExtractActions emits the `jobs.build.*`
+// write wildcard (Except "id-token"); the head grants id-token explicitly.
+//
+// COUNTERFACTUALS (body mutations, one at a time):
+//   - A: the default entry's Except set to "" — coveredBy subsumes the
+//     head-only id-token grant under the base wildcard, Compare reports only a
+//     `jobs.build.*` narrowing, and the "explicit id-token" arm goes RED;
+//   - B: coveredBy's Except clause made always-true — the same arm (and the
+//     TestCompare "except carve-out" row) goes RED;
+//   - C: the write-all explicit id-token Put deleted — the "write-all" arm
+//     goes RED (same wildcard key at the same rank on both sides, so nothing
+//     else reports a change), and so does "write-all back to block-less".
+//
+// CONTROL: block-less -> {contents: write} stays at zero widenings (the
+// carve-out names id-token only).
+func TestExtractActions_DefaultTokenExcludesIDToken(t *testing.T) {
+	const tmpl = "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n%PERMS%    steps:\n      - run: echo\n"
+	doc := func(perms string) string { return strings.Replace(tmpl, "%PERMS%", perms, 1) }
+	blockless := doc("")
+	wildcardGone := Change{Key: "jobs.build.*", Before: defaultTokenValue, After: Absent, Direction: Narrowed}
+	cases := []struct {
+		name       string
+		base, head string
+		want       []Change
+	}{
+		{"explicit id-token: write on a block-less job widens id-token",
+			blockless, doc("    permissions:\n      id-token: write\n"),
+			[]Change{wildcardGone, {Key: "jobs.build.id-token", Before: Absent, After: "write", Direction: Widened}}},
+		{"write-all on a block-less job widens id-token",
+			blockless, doc("    permissions: write-all\n"),
+			[]Change{{Key: "jobs.build.id-token", Before: Absent, After: writeAllIDTokenValue, Direction: Widened}}},
+		{"write-all back to block-less narrows id-token",
+			doc("    permissions: write-all\n"), blockless,
+			[]Change{{Key: "jobs.build.id-token", Before: writeAllIDTokenValue, After: Absent, Direction: Narrowed}}},
+		{"control: {contents: write} on a block-less job widens nothing",
+			blockless, doc("    permissions:\n      contents: write\n"),
+			[]Change{wildcardGone}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := diffActions(t, c.base, c.head); !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("changes =\n  %+v\nwant\n  %+v", got, c.want)
+			}
+		})
+	}
+	// The same through the product surface (Detect), the shape the server
+	// calls: exactly one widening, on jobs.build.id-token.
+	r := Detect(surfaceByID(t, "gha-workflow-permissions"), side(blockless), side(doc("    permissions:\n      id-token: write\n")))
+	want := []Change{{Key: "jobs.build.id-token", Before: Absent, After: "write", Direction: Widened}}
+	if r.Unevaluable != "" || !reflect.DeepEqual(r.Widened, want) {
+		t.Fatalf("Detect = %+v; want exactly the widening %+v", r, want)
+	}
+	// The jobless top-level form models write-all the same way.
+	got := diffActions(t, "permissions: read-all\n", "permissions: write-all\n")
+	wantJobless := []Change{
+		{Key: "permissions.*", Before: "read (read-all)", After: "write (write-all)", Direction: Widened},
+		{Key: "permissions.id-token", Before: Absent, After: writeAllIDTokenValue, Direction: Widened},
+	}
+	if !reflect.DeepEqual(got, wantJobless) {
+		t.Fatalf("jobless changes =\n  %+v\nwant\n  %+v", got, wantJobless)
 	}
 }

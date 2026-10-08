@@ -81,8 +81,9 @@ const (
 )
 
 // RepoSurfacesPath is where a repository extends the surface list. The server
-// reads it at the run's BASE commit only, so a change cannot remove its own
-// surface; it is itself the permission-surface-declarations surface.
+// reads it at the RUN's recorded base commit on every pass (never at an
+// agent-authored commit), so a change cannot remove its own surface; it is
+// itself the permission-surface-declarations surface.
 const RepoSurfacesPath = ".fishhawk/permission-surfaces.yaml"
 
 // DefaultSurfaces returns the product's versioned surface list
@@ -169,7 +170,9 @@ type FileSide struct {
 }
 
 // The unevaluable reason classes. Detect returns the first two; the server
-// raises the rest for failures before Detect can run.
+// raises the rest for failures before Detect can run (the extension ones,
+// extension_parse_error and surfaces_ref_unresolved, on the
+// permission-surface-declarations surface).
 const (
 	ReasonParseError        = "parse_error"
 	ReasonShapeUnrecognized = "shape_unrecognized"
@@ -187,6 +190,11 @@ const (
 	// (RepoSurfacesPath) does not parse at the base commit, so only the
 	// product surfaces were evaluated.
 	ReasonExtensionParseError = "extension_parse_error"
+	// ReasonSurfacesRefUnresolved: the run's recorded base commit (the ref the
+	// surface extension is read at on a fix-up or conflict-resolution pass)
+	// could not be resolved, so the extension was NOT read on this pass and
+	// only the product surfaces were evaluated.
+	ReasonSurfacesRefUnresolved = "surfaces_ref_unresolved"
 )
 
 // Result is one surface file's evaluation.
@@ -620,6 +628,8 @@ var unevaluableWhy = map[string]string{
 		"so a file this surface governs may have been moved away unseen",
 	ReasonExtensionParseError: "the repository's surface extension does not parse at the base commit, " +
 		"so only the product surfaces were evaluated and any surface it declares went unchecked",
+	ReasonSurfacesRefUnresolved: "the run's recorded base commit could not be resolved, " +
+		"so the repository's surface extension was not read on this pass and every surface it declares went unchecked",
 }
 
 // NoteUnevaluable renders an unevaluable concern's note. It names the reason
