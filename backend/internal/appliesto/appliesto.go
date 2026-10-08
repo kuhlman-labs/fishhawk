@@ -327,6 +327,17 @@ func normalizeTriggerForm(t spec.TriggerForm) spec.TriggerForm {
 // caller (400 trigger_source_reserved). So a predicate declaring only
 // `scheduled` admits exactly the scheduler's runs.
 //
+// `alert` (E35.4 / #1601, ADR-053) maps to TriggerDiff: an alert-started
+// hotfix run produces a code diff. Its producer is server.StartAlertRun alone
+// (the alert ingress's per-source auto_start, default off), and POST /v0/runs
+// refuses it from any other caller (400 trigger_source_reserved). This is the
+// CONTRACT the hotfix_change preset (E35.5 / #1602) must match: its
+// applies_to.trigger list must include `diff`, or every auto-started alert
+// run is refused 422 workflow_not_applicable. The arm is explicit even though
+// the default arm returns the same form, so the contract is named here rather
+// than inherited by accident (backend/internal/alerttrigger/README.md records
+// it on the ingress side).
+//
 // The DEFAULT arm returns TriggerDiff, so an unrecognized source stays
 // diff-shaped. That is the conservative reading: every existing predicate is
 // written against a diff-form change, and a source the server admitted but
@@ -347,6 +358,8 @@ func TriggerFormForSource(triggerSource string) spec.TriggerForm {
 		return spec.TriggerOnDemand
 	case string(run.TriggerScheduled):
 		return spec.TriggerScheduled
+	case string(run.TriggerAlert):
+		return spec.TriggerDiff
 	case string(run.TriggerGitHubIssue), string(run.TriggerCLI), string(run.TriggerUI):
 		return spec.TriggerDiff
 	default:
