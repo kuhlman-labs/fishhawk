@@ -31,9 +31,13 @@ import (
 //   - validates it with validateAcceptanceTranscript, the twin of the backend
 //     validator (backend/internal/server/acceptance_transcript.go) plus the
 //     SECOND-LAYER served-criterion-id membership;
-//   - redacts the bytes through redaction.RedactDefault (the verdict's posture),
-//     re-validates the redacted bytes, and bounds them at
-//     acceptanceTranscriptShipMaxBytes;
+//   - redacts the bytes through redaction.RedactDefaultKnown (the verdict's
+//     posture: acceptance-bound values by value, E72.41 / #3793, then the
+//     DefaultPatterns shapes), re-validates the redacted bytes, and bounds
+//     them at acceptanceTranscriptShipMaxBytes. A bound value inside a
+//     request path becomes a `[`-bearing marker the path grammar refuses, so
+//     that transcript is DROPPED (acceptance_transcript_invalid), never
+//     shipped;
 //   - ships them (ShipAcceptanceTranscript) BEFORE the verdict and injects the
 //     backend-minted {artifact_id, content_hash} ref into the redacted verdict
 //     (upload.InjectTranscript).
@@ -248,10 +252,13 @@ func decodeAcceptanceTranscript(raw []byte) (*upload.AcceptanceTranscript, error
 //   - decode or validation failure       → nil, acceptance_transcript_invalid
 //   - redaction hits                     → acceptance_transcript_redacted
 //   - post-redaction re-validation fails → nil, acceptance_transcript_invalid
-//     (a redaction placeholder can lengthen a body past its cap)
+//     (a redaction placeholder can lengthen a body past its cap, or put a
+//     `[`/`]` into a request path the path grammar refuses)
 //   - post-redaction > 256 KiB           → nil, acceptance_transcript_oversize
 //   - success                            → bytes, acceptance_transcript_captured
-func captureAcceptanceTranscript(keyedPath string, servedIDs []string, warn func(event, detail string)) []byte {
+//
+// known is the acceptance-bound known-value set (nil when nothing is bound).
+func captureAcceptanceTranscript(keyedPath string, servedIDs []string, known *redaction.KnownValues, warn func(event, detail string)) []byte {
 	emit := func(event, detail string) {
 		if warn != nil {
 			warn(event, detail)
@@ -297,7 +304,7 @@ func captureAcceptanceTranscript(keyedPath string, servedIDs []string, warn func
 		emit("acceptance_transcript_invalid", "marshal: "+err.Error())
 		return nil
 	}
-	redacted, hits := redaction.RedactDefault(canonical)
+	redacted, hits := redaction.RedactDefaultKnown(canonical, known)
 	if len(hits) > 0 {
 		hitsJSON, _ := json.Marshal(hits)
 		emit("acceptance_transcript_redacted", string(hitsJSON))

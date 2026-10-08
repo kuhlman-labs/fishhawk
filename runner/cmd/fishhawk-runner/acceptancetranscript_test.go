@@ -105,7 +105,7 @@ func TestAcceptanceTranscriptShipMaxBytesValue(t *testing.T) {
 func TestCaptureAcceptanceTranscript_Missing(t *testing.T) {
 	path := withTranscriptPath(t)
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil {
 		t.Fatalf("got %s, want nil", got)
 	}
 	if !w.has("acceptance_transcript_missing") {
@@ -117,7 +117,7 @@ func TestCaptureAcceptanceTranscript_Empty(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, nil)
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil || !w.has("acceptance_transcript_missing") {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil || !w.has("acceptance_transcript_missing") {
 		t.Fatalf("got %s events %v", got, w.events)
 	}
 }
@@ -129,7 +129,7 @@ func TestCaptureAcceptanceTranscript_Oversize(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, make([]byte, maxSidecarBytes+1))
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil {
 		t.Fatalf("got %d bytes, want nil", len(got))
 	}
 	if !w.has("acceptance_transcript_oversize") {
@@ -158,7 +158,7 @@ func TestCaptureAcceptanceTranscript_Oversize_Unremovable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil {
 		t.Fatalf("got %d bytes, want nil", len(got))
 	}
 	if !w.has("acceptance_transcript_oversize") || !w.has("acceptance_transcript_unremovable") {
@@ -205,7 +205,7 @@ func TestCaptureAcceptanceTranscript_Invalid(t *testing.T) {
 			path := withTranscriptPath(t)
 			mustWriteTranscript(t, path, []byte(tc.body))
 			var w warnRecorder
-			if got := captureAcceptanceTranscript(path, served, w.warn); got != nil {
+			if got := captureAcceptanceTranscript(path, served, nil, w.warn); got != nil {
 				t.Fatalf("got %s, want nil", got)
 			}
 			if !w.has("acceptance_transcript_invalid") {
@@ -229,7 +229,7 @@ func TestCaptureAcceptanceTranscript_CapCounts(t *testing.T) {
 		path := withTranscriptPath(t)
 		mustWriteTranscript(t, path, mustJSON(t, tr))
 		var w warnRecorder
-		if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil || !strings.Contains(strings.Join(w.events, "\n"), "exceeds the 100 cap") {
+		if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil || !strings.Contains(strings.Join(w.events, "\n"), "exceeds the 100 cap") {
 			t.Fatalf("got %d bytes events %v", len(got), w.events)
 		}
 	})
@@ -241,7 +241,7 @@ func TestCaptureAcceptanceTranscript_CapCounts(t *testing.T) {
 		path := withTranscriptPath(t)
 		mustWriteTranscript(t, path, mustJSON(t, tr))
 		var w warnRecorder
-		if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil || !strings.Contains(strings.Join(w.events, "\n"), "exceeds the 200 cap") {
+		if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil || !strings.Contains(strings.Join(w.events, "\n"), "exceeds the 200 cap") {
 			t.Fatalf("got %d bytes events %v", len(got), w.events)
 		}
 	})
@@ -257,14 +257,14 @@ func TestCaptureAcceptanceTranscript_UnknownCriterionID_Dropped(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, mustJSON(t, tr))
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, []string{"crit-a", "crit-b"}, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, []string{"crit-a", "crit-b"}, nil, w.warn); got != nil {
 		t.Fatalf("unknown id must be dropped, got %s", got)
 	}
 	if !strings.Contains(strings.Join(w.events, "\n"), `"crit-unknown" is not a served criterion id`) {
 		t.Errorf("events = %v", w.events)
 	}
 	mustWriteTranscript(t, path, mustJSON(t, tr))
-	if got := captureAcceptanceTranscript(path, nil, nil); got == nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, nil); got == nil {
 		t.Fatal("empty served set must skip membership")
 	}
 }
@@ -279,7 +279,7 @@ func TestCaptureAcceptanceTranscript_BodyTruncationMarker(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, mustJSON(t, tr))
 	var w warnRecorder
-	got := captureAcceptanceTranscript(path, nil, w.warn)
+	got := captureAcceptanceTranscript(path, nil, nil, w.warn)
 	if got == nil {
 		t.Fatalf("oversize bodies must be bounded not dropped: %v", w.events)
 	}
@@ -309,7 +309,7 @@ func TestCaptureAcceptanceTranscript_Redacts(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, mustJSON(t, tr))
 	var w warnRecorder
-	got := captureAcceptanceTranscript(path, nil, w.warn)
+	got := captureAcceptanceTranscript(path, nil, nil, w.warn)
 	if got == nil {
 		t.Fatalf("events = %v", w.events)
 	}
@@ -332,7 +332,7 @@ func TestCaptureAcceptanceTranscript_PostRedactionRevalidate(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, mustJSON(t, tr))
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil {
 		t.Fatalf("post-redaction over-cap body must be dropped, got %d bytes", len(got))
 	}
 	if !strings.Contains(strings.Join(w.events, "\n"), "post-redaction:") {
@@ -360,7 +360,7 @@ func TestCaptureAcceptanceTranscript_PostRedactionBound(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, raw)
 	var w warnRecorder
-	if got := captureAcceptanceTranscript(path, nil, w.warn); got != nil {
+	if got := captureAcceptanceTranscript(path, nil, nil, w.warn); got != nil {
 		t.Fatalf("got %d bytes, want nil", len(got))
 	}
 	if !strings.Contains(strings.Join(w.events, "\n"), "over the 262144 ship bound") {
@@ -379,7 +379,7 @@ func TestCaptureAcceptanceTranscript_GoldenRoundTrip(t *testing.T) {
 	path := withTranscriptPath(t)
 	mustWriteTranscript(t, path, golden)
 	var w warnRecorder
-	got := captureAcceptanceTranscript(path, transcriptGoldenServedIDs, w.warn)
+	got := captureAcceptanceTranscript(path, transcriptGoldenServedIDs, nil, w.warn)
 	if got == nil {
 		t.Fatalf("golden must capture: %v", w.events)
 	}
