@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/permdrift"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // The permission-drift check's audit categories (E80.4 / #3761). All three are
@@ -73,7 +74,8 @@ type permissionDriftRequest struct {
 	// file is ALSO evaluated IntersectRef → Head and only widenings present in
 	// BOTH comparisons raise (keyed by check key): a widening the base branch
 	// itself introduced is absent from the second comparison and is dropped,
-	// one the resolution introduced survives.
+	// one the resolution introduced survives. A file ABSENT at IntersectRef
+	// keeps the single (superset) comparison instead (intersectSide).
 	IntersectRef string
 	// IntersectUnresolved records that a conflict-resolution push's base
 	// branch could not be read, so the check ran the single comparison (a
@@ -90,6 +92,7 @@ type permissionDriftDetectedPayload struct {
 	HeadSHA             string                       `json:"head_sha"`
 	IntersectRef        string                       `json:"intersect_ref,omitempty"`
 	IntersectUnresolved bool                         `json:"intersect_unresolved,omitempty"`
+	SurfacesRef         string                       `json:"surfaces_ref,omitempty"`
 	CompareTruncated    bool                         `json:"compare_truncated"`
 	Widenings           []permissionDriftWidening    `json:"widenings"`
 	Unevaluable         []permissionDriftUnevaluable `json:"unevaluable"`
@@ -145,6 +148,9 @@ type permissionDriftFindings struct {
 	truncated   bool
 	extRejected []permdrift.Rejection
 	extError    string
+	// surfacesRef is the ref the repository extension was read at ("" when
+	// it was not read: commit_missing, or surfaces_ref_unresolved).
+	surfacesRef string
 }
 
 // checkPermissionDrift runs the deterministic permission-drift check (ADR-084
@@ -183,10 +189,15 @@ func (s *Server) permissionDriftRunnable(_ context.Context, _ permissionDriftReq
 //  3. ComparePatch(base, head) for the changed files, and resolve the head to
 //     the commit SHA every unevaluable key carries (permissionDriftKeyHead);
 //     the consolidated trigger's surface files are then read AT that commit.
-//  4. Read .fishhawk/permission-surfaces.yaml at BASE only (404 = none). An
-//     unreadable file (fetch_failed) or an unparseable one
-//     (extension_parse_error) leaves the product list only, records
-//     extension_error AND raises one unevaluable concern on the
+//  4. Read .fishhawk/permission-surfaces.yaml at the RUN's recorded base
+//     (permissionDriftSurfacesRef: req.Base for the PR-opened and
+//     consolidated triggers; for a fix-up or conflict-resolution pass the
+//     stage's pull_request_opened base_sha, else run.DocumentBaseCommit — a
+//     decomposed child's child_pushed base_sha only), never at an
+//     agent-authored pass base (404 = none). An unresolved ref
+//     (surfaces_ref_unresolved), an unreadable file (fetch_failed) or an
+//     unparseable one (extension_parse_error) leaves the product list only,
+//     records extension_error AND raises one unevaluable concern on the
 //     permission-surface-declarations surface; rejected entries are recorded.
 //  5. A compare error raises ONE check-wide compare_failed concern. A renamed
 //     file's SOURCE (PreviousPath) is evaluated against every surface it
@@ -196,7 +207,9 @@ func (s *Server) permissionDriftRunnable(_ context.Context, _ permissionDriftReq
 //     both refs anyway; on truncation each glob surface also raises one
 //     compare_truncated concern.
 //  6. For each (surface, path) fetch base and head (ErrNotFound = side
-//     absent; any other error = fetch_failed for that pair) and Detect.
+//     absent; any other error = fetch_failed for that pair) and Detect; a
+//     conflict-resolution pass intersects with IntersectRef → head
+//     (intersectSide).
 //  7. raisePermissionDrift de-duplicates and raises; narrowings go to one
 //     permission_narrowing_noticed entry, never to a concern.
 func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDriftRequest) {
@@ -247,7 +260,8 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 	if req.Trigger == permissionDriftTriggerConsolidated && cmpHead != "" {
 		evalHead = cmpHead
 	}
-	surfaces := s.permissionDriftSurfaces(ctx, req, reader, &fx, keyHead)
+	surfacesRef, surfacesResolved := s.permissionDriftSurfacesRef(ctx, req, runRow)
+	surfaces := s.permissionDriftSurfaces(ctx, req, reader, &fx, keyHead, surfacesRef, surfacesResolved)
 
 	if cerr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: forge compare failed — raising unevaluable",
@@ -315,7 +329,7 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 	for _, p := range pairs {
 		res := reader.detect(p.s, p.path, req.Base, evalHead)
 		if req.IntersectRef != "" && res.Unevaluable == "" {
-			res = intersectDrift(p.s, p.path, res, reader.detect(p.s, p.path, req.IntersectRef, evalHead))
+			res = reader.intersectSide(p.s, p.path, res, req.IntersectRef, evalHead)
 		}
 		if res.Unevaluable != "" {
 			fx.unevaluable = append(fx.unevaluable, newUnevaluable(p.s, p.path, res.Unevaluable, keyHead))
@@ -340,15 +354,32 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 }
 
 // permissionDriftSurfaces returns the product surfaces merged with the
-// repository's extension, read at req.Base ONLY so a change cannot remove its
-// own surface. Absence is no extension. Any other read failure (fetch_failed)
-// or a parse error (extension_parse_error) leaves the product list, records
-// extension_error, and FAILS CLOSED: one unevaluable concern on the
+// repository's extension, read at ref (the run's recorded base,
+// permissionDriftSurfacesRef) ONLY, so a change cannot remove its own surface.
+// Absence is no extension. An UNRESOLVED ref reads NO extension at all: it
+// records surfaces_ref_unresolved FIRST, so it is the one reason that lands
+// for the declarations check key (the de-duplication keeps the first), and
+// returns the product list. (The permission-surface-declarations SURFACE
+// comparison of RepoSurfacesPath, scheduled when the diff touches it, still
+// runs on the diff's own base → head sides: it is a separate surface.) Any
+// other read failure (fetch_failed) or a parse error (extension_parse_error)
+// likewise leaves the product list. Each of the three records extension_error
+// and FAILS CLOSED: one unevaluable concern on the
 // permission-surface-declarations surface at RepoSurfacesPath, keyed by
 // keyHead — whatever surface the extension declares went unchecked.
-func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDriftRequest, reader *permissionDriftReader, fx *permissionDriftFindings, keyHead string) []permdrift.Surface {
+func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDriftRequest, reader *permissionDriftReader, fx *permissionDriftFindings, keyHead, ref string, resolved bool) []permdrift.Surface {
 	product := permdrift.DefaultSurfaces()
-	side := reader.read(permdrift.RepoSurfacesPath, req.Base)
+	if !resolved {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: run base commit unresolved — repository surface extension not read, raising unevaluable",
+			slog.String("run_id", req.RunID.String()),
+			slog.String("stage_id", req.StageID.String()),
+			slog.String("trigger", req.Trigger))
+		fx.extError = permdrift.ReasonSurfacesRefUnresolved
+		appendDeclarationsUnevaluable(fx, product, permdrift.ReasonSurfacesRefUnresolved, keyHead)
+		return product
+	}
+	fx.surfacesRef = ref
+	side := reader.read(permdrift.RepoSurfacesPath, ref)
 	reason := ""
 	switch {
 	case side.err != nil:
@@ -368,12 +399,68 @@ func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDrif
 		slog.String("run_id", req.RunID.String()),
 		slog.String("path", permdrift.RepoSurfacesPath),
 		slog.String("reason", reason))
+	appendDeclarationsUnevaluable(fx, product, reason, keyHead)
+	return product
+}
+
+// appendDeclarationsUnevaluable raises one unevaluable on the
+// permission-surface-declarations surface at RepoSurfacesPath.
+func appendDeclarationsUnevaluable(fx *permissionDriftFindings, product []permdrift.Surface, reason, keyHead string) {
 	for _, sf := range product {
 		if sf.ID == permdrift.SurfaceIDSurfaceDeclarations {
 			fx.unevaluable = append(fx.unevaluable, newUnevaluable(sf, permdrift.RepoSurfacesPath, reason, keyHead))
 		}
 	}
-	return product
+}
+
+// permissionDriftSurfacesRef resolves the ref the repository surface extension
+// is read at: the RUN's recorded base, never an agent-authored pass base (#3939
+// F3 — a fix-up's req.Base is the previous run-branch head, which an earlier
+// pass may have stripped of a declaration). The PR-opened and consolidated
+// triggers' req.Base already is the run's base. A fix-up or conflict-resolution
+// pass resolves by run kind:
+//
+//   - a decomposed CHILD (DecomposedFrom set) reads the base_sha of the stage's
+//     newest child_pushed entry (the slice cut point the runner reports), with
+//     NO DocumentBaseCommit fallback — the admission default-branch head is not
+//     a slice's base;
+//   - any other run reads the base_sha of the stage's newest
+//     pull_request_opened entry, else run.DocumentBaseCommit (the default-branch
+//     head pinned at admission — not proven to be the run's base, #3902).
+//
+// An unreadable ledger, an undecodable payload or an empty base_sha is no
+// entry. resolved=false means no ref: the caller reads NO extension and fails
+// closed (surfaces_ref_unresolved).
+func (s *Server) permissionDriftSurfacesRef(ctx context.Context, req permissionDriftRequest, runRow *run.Run) (string, bool) {
+	if req.Trigger != permissionDriftTriggerFixupPushed && req.Trigger != permissionDriftTriggerConflictResolution {
+		return req.Base, true
+	}
+	if runRow.DecomposedFrom != nil {
+		return s.stageEntryBaseSHA(ctx, req, "child_pushed")
+	}
+	if ref, ok := s.stageEntryBaseSHA(ctx, req, "pull_request_opened"); ok {
+		return ref, true
+	}
+	if runRow.DocumentBaseCommit != nil && *runRow.DocumentBaseCommit != "" {
+		return *runRow.DocumentBaseCommit, true
+	}
+	return "", false
+}
+
+// stageEntryBaseSHA returns the base_sha of the stage's newest entry of
+// category, and whether a non-empty one was read.
+func (s *Server) stageEntryBaseSHA(ctx context.Context, req permissionDriftRequest, category string) (string, bool) {
+	entry, ok := s.newestStageEntry(ctx, req.RunID, req.StageID, category)
+	if !ok || entry == nil {
+		return "", false
+	}
+	var p struct {
+		BaseSHA string `json:"base_sha"`
+	}
+	if json.Unmarshal(entry.Payload, &p) != nil || p.BaseSHA == "" {
+		return "", false
+	}
+	return p.BaseSHA, true
 }
 
 // permissionDriftKeyHead resolves the commit SHA a check's unevaluable keys
@@ -436,7 +523,8 @@ func newUnevaluable(sf permdrift.Surface, path, reason, head string) permissionD
 // widens that key to that value, a narrowing only when second also narrows
 // it. (One union set would let first's widening to "read" survive on second's
 // NARROWING of the same key to "read" — a different change sharing the check
-// key.) An unevaluable second comparison fails the pair closed.
+// key.) An unevaluable second comparison fails the pair closed. The caller
+// (intersectSide) does not intersect against an ABSENT base-branch side.
 func intersectDrift(sf permdrift.Surface, path string, first, second permdrift.Result) permdrift.Result {
 	if second.Unevaluable != "" {
 		return second
@@ -496,6 +584,23 @@ func (r *permissionDriftReader) read(path, ref string) driftSide {
 	}
 	r.cache[k] = d
 	return d
+}
+
+// intersectSide applies the conflict-resolution intersection to first (the
+// previous-head → head result) against intersectRef → head. A file ABSENT at
+// intersectRef keeps first unchanged — the superset, noise never a miss (#3939
+// F8): absent → head reports no change for a restriction the resolution
+// removed, so intersecting would drop it. That covers a file the run added
+// that the base branch never had, and a deleted or renamed base branch (the
+// contents API answers 404 for a missing ref too). When the previous-head side
+// is absent as well the two comparisons are identical, so first IS the
+// intersection. A read error on the intersectRef side fails the pair closed
+// (fetch_failed, via detect); otherwise intersectDrift runs.
+func (r *permissionDriftReader) intersectSide(sf permdrift.Surface, path string, first permdrift.Result, intersectRef, head string) permdrift.Result {
+	if side := r.read(path, intersectRef); side.err == nil && !side.f.Exists {
+		return first
+	}
+	return intersectDrift(sf, path, first, r.detect(sf, path, intersectRef, head))
 }
 
 // detect fetches path at both refs and evaluates sf; a read failure on either
@@ -595,6 +700,7 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 		HeadSHA:             req.Head,
 		IntersectRef:        req.IntersectRef,
 		IntersectUnresolved: req.IntersectUnresolved,
+		SurfacesRef:         fx.surfacesRef,
 		CompareTruncated:    fx.truncated,
 		Widenings:           nonNilSlice(widenings),
 		Unevaluable:         nonNilSlice(unevaluable),
