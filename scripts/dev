@@ -2684,6 +2684,10 @@ cmd_up() {
     print "warning: .env not found — using current shell environment"
   fi
 
+  # Go build-cache advisory (#3901): non-fatal, after the .env load so the
+  # FISHHAWK_GOCACHE_* knobs apply. Sampled estimate, never a full du walk.
+  _warn_gocache_size || true
+
   # Pre-spawn port preflight (#965): a listener already on the fishhawkd port
   # means the spawn below would bind-fail and die while the squatter keeps
   # answering /healthz — the false-success shape. Fail loud, naming each
@@ -3197,7 +3201,8 @@ cmd_reload() {
 
 # One-step post-merge walk: collapse the per-PR post-merge ritual into a single
 # invocation. Fast-forward-pull main, prune the merged local branch via the
-# existing scripts/cleanup-merged, optionally confirm a given issue is closed,
+# existing scripts/cleanup-merged, trim the Go build cache past its threshold
+# (guarded, non-fatal, #3901), optionally confirm a given issue is closed,
 # then run reload LAST so its built-in /healthz readiness gate (#628 — non-zero
 # exit + log tail on failure) and MCP-reconnect verdict (#612) are inherited and
 # the verdict is the command's final printed line. reload is the down-then-up
@@ -3237,6 +3242,13 @@ cmd_post_merge() {
   # only branches that are ancestors of origin/main, so it is safe to call
   # unconditionally and never deletes main. Reuse, do not reimplement.
   "${REPO_ROOT}/scripts/cleanup-merged"
+
+  # Go build-cache bound (#3901): past the threshold, the GUARDED trim. It runs
+  # only here — after the live-run refusal above, the pull and cleanup-merged —
+  # and is non-fatal: a refusal (a live runner or Go process, an unverifiable
+  # scan, an invalid floor) prints an advisory and the walk continues to reload.
+  # --force does NOT bypass the cache guard.
+  _gocache_maintain || true
 
   # Optional issue-closed confirmation. Warn-only: a not-yet-closed issue must
   # not block the local stack reload, and an absent/unauthenticated gh degrades
@@ -4250,11 +4262,410 @@ cmd_preview_down() {
   return $rc
 }
 
+# ---------------------------------------------------------------------------
+# Go build-cache bound (E83.20 / #3901)
+#
+# Without -trimpath cmd/go hashes the package DIRECTORY into every compile
+# action ID, so each per-run worktree path adds fresh workspace-package entries
+# to the shared host GOCACHE and nothing ever evicts them inside Go's own 5-day
+# trim window (531 GB observed). The bound below is Go's own cache.Trim — delete
+# the `<2hex>/<hash>-a|-d` entries whose mtime is older than a cutoff — with a
+# much shorter, configurable floor. It is safe beside a live build for the same
+# reason Go's Trim is: cmd/go refreshes the mtime of any entry it uses at most an
+# hour stale (markUsed), so an entry older than floor+1h is one no build has
+# touched for that long. A full `go clean -cache` (or a rename/symlink swap,
+# which cmd/go re-resolves on every access) is NOT safe under a live build — it
+# is what failed run 26ede2f1. Every trim path also runs a fail-CLOSED liveness
+# guard on top. Long-form: scripts/README.md § "Go build-cache bound (#3901)".
+# ---------------------------------------------------------------------------
+
+_GOCACHE_DEFAULT_MAX_GB=50
+_GOCACHE_DEFAULT_TRIM_HOURS=6
+_GOCACHE_MIN_TRIM_HOURS=2
+# The sentence Go writes into <GOCACHE>/README (cmd/go/internal/cache
+# initDir). Its presence is the deletion safety check: a directory without it is
+# not provably a Go build cache, so nothing under it is ever deleted.
+_GOCACHE_README_MARKER='cached build artifacts from the Go build system'
+
+# PURE predicate: a trim floor is an integer number of hours >= the minimum (at
+# most 6 digits, so the minute arithmetic cannot overflow). Anything else —
+# empty, non-numeric, zero, negative, sub-minimum — is INVALID, and every trim
+# REFUSES on it (gocache_floor_invalid). There is deliberately no fallback: a
+# floor that silently became 0 would trim every entry, including ones a live
+# build is about to read.
+_gocache_floor_valid() {
+  local h="${1:-}"
+  if [[ "$h" != <-> ]]; then return 1; fi
+  if (( ${#h} > 6 )); then return 1; fi
+  if (( 10#$h < _GOCACHE_MIN_TRIM_HOURS )); then return 1; fi
+  return 0
+}
+
+# Resolve the two knobs into _GOCACHE_MAX_GB and _GOCACHE_TRIM_HOURS. Always
+# returns 0 (safe in an untested context).
+#   FISHHAWK_GOCACHE_MAX_GB     size threshold in GB for the SIZE-GATED paths
+#                               (the up advisory, the sweep step, the post-merge
+#                               auto-trim); 0 disables them. Default 50. An
+#                               invalid value warns and uses the default — it
+#                               only decides WHETHER those paths act.
+#   FISHHAWK_GOCACHE_TRIM_HOURS the trim floor. Default 6. Passed through RAW:
+#                               an invalid value is never replaced, so the trim
+#                               primitive refuses on it with a named error.
+_gocache_knobs() {
+  local max="${FISHHAWK_GOCACHE_MAX_GB:-}"
+  if [[ -z "$max" ]]; then
+    _GOCACHE_MAX_GB=$_GOCACHE_DEFAULT_MAX_GB
+  elif [[ "$max" == <-> ]] && (( ${#max} <= 6 )); then
+    _GOCACHE_MAX_GB=$(( 10#$max ))
+  else
+    print -u2 "warning: FISHHAWK_GOCACHE_MAX_GB='${max}' is not a non-negative integer (GB) — using the default ${_GOCACHE_DEFAULT_MAX_GB}"
+    _GOCACHE_MAX_GB=$_GOCACHE_DEFAULT_MAX_GB
+  fi
+  _GOCACHE_TRIM_HOURS="${FISHHAWK_GOCACHE_TRIM_HOURS-$_GOCACHE_DEFAULT_TRIM_HOURS}"
+  return 0
+}
+
+# Source .env (when present) the way cmd_up/cmd_down do, so the knobs and an
+# operator-pinned GOCACHE apply to the standalone surfaces too.
+_gocache_load_env() {
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  fi
+  return 0
+}
+
+# Print the build-cache directory, or return 1 with a printed reason. An
+# absolute $GOCACHE from the environment wins (no Go toolchain needed, which is
+# also what lets scripts/test-dev point it at a fixture); otherwise `go env`.
+_gocache_resolve_dir() {
+  local d="${GOCACHE:-}" prog="${GOCACHEPROG:-}"
+  if [[ -z "$d" ]]; then
+    if ! command -v go >/dev/null 2>&1; then
+      print -u2 "gocache: GOCACHE is unset and go is not on PATH — cannot resolve the build cache"
+      return 1
+    fi
+    if ! d="$(go env GOCACHE 2>/dev/null)"; then
+      print -u2 "gocache: 'go env GOCACHE' failed — cannot resolve the build cache"
+      return 1
+    fi
+    if [[ -z "$prog" ]]; then prog="$(go env GOCACHEPROG 2>/dev/null)" || prog=""; fi
+  fi
+  if [[ -n "$prog" ]]; then
+    print -u2 "gocache: GOCACHEPROG is set — an external program owns cache storage, nothing to bound here"
+    return 1
+  fi
+  if [[ "$d" == off ]]; then
+    print -u2 "gocache: GOCACHE=off — there is no build cache to bound"
+    return 1
+  fi
+  if [[ "$d" != /* ]]; then
+    print -u2 "gocache: GOCACHE '${d}' is not an absolute path"
+    return 1
+  fi
+  if [[ ! -d "$d" ]]; then
+    print -u2 "gocache: '${d}' is not a directory"
+    return 1
+  fi
+  print -r -- "$d"
+  return 0
+}
+
+# The deletion safety check: true only when <dir>/README carries Go's marker.
+_gocache_is_go_cache() {
+  local dir="$1"
+  if [[ ! -f "${dir}/README" ]]; then return 1; fi
+  if grep -qF -- "$_GOCACHE_README_MARKER" "${dir}/README" 2>/dev/null; then return 0; fi
+  return 1
+}
+
+# EXACT size in KB (a full `du` walk — minutes on a multi-hundred-GB cache, so it
+# announces itself first and only the explicit `scripts/dev gocache` status uses
+# it). Returns 1 when du produced no number.
+_gocache_size_kb() {
+  local dir="$1" line kb
+  print -u2 "measuring ${dir} (exact du; may take a while on a large cache)"
+  # du exits non-zero when an entry vanishes mid-walk (a concurrent build's own
+  # trim); the total it printed is still the answer.
+  line="$(du -sk "$dir" 2>/dev/null)" || true
+  kb="${line%%[[:space:]]*}"
+  if [[ "$kb" != <-> ]]; then return 1; fi
+  print -r -- "$kb"
+  return 0
+}
+
+# Sampled ESTIMATE in KB: one `du` over the 16 subdirectories 00,10,…,f0, times
+# 16. Valid because cmd/go files every entry under the first byte of its hash
+# (DiskCache.fileName), so entries spread uniformly over the 256 subdirectories.
+# Cheap enough for every `up`, `post-merge` and `sweep`.
+_gocache_estimate_kb() {
+  local dir="$1" line kb total=0 sub
+  local -a samples
+  samples=()
+  for sub in 00 10 20 30 40 50 60 70 80 90 a0 b0 c0 d0 e0 f0; do
+    if [[ -d "${dir}/${sub}" ]]; then samples+=("${dir}/${sub}"); fi
+  done
+  if (( ${#samples} == 0 )); then
+    print -r -- 0
+    return 0
+  fi
+  local out
+  out="$(du -sk "${samples[@]}" 2>/dev/null)" || true
+  while IFS= read -r line; do
+    kb="${line%%[[:space:]]*}"
+    if [[ "$kb" == <-> ]]; then total=$(( total + kb )); fi
+  done <<< "$out"
+  print -r -- $(( total * 16 ))
+  return 0
+}
+
+# KB -> a short human size (GB with one decimal, or MB below 1 GB).
+_gocache_human_kb() {
+  local kb="${1:-0}"
+  if (( kb >= 1048576 )); then
+    printf '%d.%d GB' $(( kb / 1048576 )) $(( (kb % 1048576) * 10 / 1048576 ))
+  else
+    printf '%d MB' $(( kb / 1024 ))
+  fi
+}
+
+# PURE. Reads `ps`-shaped lines (`<pid> <argv...>`) on stdin and prints one
+# `<pid>\t<basename>` record per Go toolchain process — anything that may be
+# reading or writing GOCACHE right now. Judged on argv[0] ONLY, the
+# _parse_live_runs discipline: the basename is exactly `go` or `golangci-lint`,
+# or ends in `.test` (a compiled test binary), or argv[0] runs from a
+# `/pkg/tool/` directory (compile, link, vet, asm, cgo, cover). A substring or a
+# later token never counts, so `grep go`, `gopls` and `/bin/sleep go` do not.
+_parse_live_go() {
+  local line pid argv0 base
+  local -a tokens
+  while IFS= read -r line; do
+    tokens=(${=line})
+    if (( ${#tokens} < 2 )); then continue; fi
+    pid="${tokens[1]}"
+    if [[ "$pid" != <-> ]]; then continue; fi
+    argv0="${tokens[2]}"
+    base="${argv0:t}"
+    if [[ "$base" == go || "$base" == golangci-lint || "$base" == ?*.test || "$argv0" == */pkg/tool/* ]]; then
+      print -r -- "${pid}"$'\t'"${base}"
+    fi
+  done
+  return 0
+}
+
+# IMPURE twin of _scan_live_runs for Go toolchain processes. Optional arg 1 is a
+# file of PRE-CAPTURED ps output (fixtures). Returns 2 — the degrade code — when
+# ps is absent or fails.
+_scan_live_go() {
+  local fixture="${1:-}"
+  local raw=""
+  if [[ -n "$fixture" ]]; then
+    if ! raw="$(cat -- "$fixture" 2>/dev/null)"; then return 2; fi
+  else
+    if ! command -v ps >/dev/null 2>&1; then return 2; fi
+    if ! raw="$(ps -axww -o pid=,args= 2>/dev/null)"; then return 2; fi
+  fi
+  print -r -- "$raw" | _parse_live_go
+  return 0
+}
+
+# The liveness guard every trim runs first. Returns 0 only on a CLEAN scan of
+# BOTH fishhawk-runner processes and Go toolchain processes; on any live process
+# it prints an error naming every pid (and the run id where readable) and
+# returns 1. A scan DEGRADE (ps absent or failing) FAILS CLOSED — the deliberate
+# inversion of _refuse_on_live_runs' fail-open: skipping a trim costs nothing
+# urgent, deleting under a live build costs a misreported stage. --force never
+# reaches this guard. The ps scan is a sample (a build starting a second later
+# is not seen); the age floor is what makes that window harmless.
+# Call sites MUST use a tested context (`if ! _gocache_live_guard`).
+_gocache_live_guard() {
+  local scan="" rc=0 pid run_id base entry
+  local -a live
+  live=()
+  scan="$(_scan_live_runs)" || rc=$?
+  if (( rc != 0 )); then
+    print -u2 "error: refusing to trim the Go build cache — could not enumerate processes (ps unavailable or failed); a trim never proceeds on an unverified scan (fail-closed)"
+    return 1
+  fi
+  while IFS=$'\t' read -r pid run_id; do
+    if [[ -z "$pid" ]]; then continue; fi
+    if [[ -n "$run_id" ]]; then
+      live+=("fishhawk-runner run ${run_id} (pid ${pid})")
+    else
+      live+=("fishhawk-runner pid ${pid} (run id unreadable)")
+    fi
+  done <<< "$scan"
+  rc=0
+  scan="$(_scan_live_go)" || rc=$?
+  if (( rc != 0 )); then
+    print -u2 "error: refusing to trim the Go build cache — could not enumerate processes (ps unavailable or failed); a trim never proceeds on an unverified scan (fail-closed)"
+    return 1
+  fi
+  while IFS=$'\t' read -r pid base; do
+    if [[ -z "$pid" ]]; then continue; fi
+    live+=("${base} (pid ${pid})")
+  done <<< "$scan"
+  if (( ${#live} == 0 )); then
+    return 0
+  fi
+  print -u2 "error: refusing to trim the Go build cache — ${#live} process(es) that may be using it are live:"
+  for entry in "${live[@]}"; do
+    print -u2 "  ${entry}"
+  done
+  print -u2 "  deleting entries under a live build fails it with '<hash>-d: no such file or directory' (#3901);"
+  print -u2 "  retry once they exit. NEVER 'go clean -cache' while a run is live."
+  return 1
+}
+
+# The trim primitive. Args: <dir> <floor hours> <dry_run 0|1>
+# Refuses (return 1) on an invalid floor (gocache_floor_invalid) or a directory
+# without Go's README marker. Otherwise deletes ONLY cache entries — depth-2
+# paths under a two-hex subdirectory, named *-a or *-d, with an mtime older than
+# floor+1 hours (the extra hour is Go's own mtimeInterval: an entry in use is up
+# to an hour stale). README, trim.txt, testexpire.txt, fuzz/ and every other
+# non-entry file are never touched. `find -delete` re-evaluates each predicate
+# immediately before its own unlink. Prints the entry count (removed, or would be
+# removed under dry_run).
+_gocache_trim() {
+  local dir="$1" hours="$2" dry_run="${3:-0}"
+  if ! _gocache_floor_valid "$hours"; then
+    print -u2 "error: gocache_floor_invalid: trim floor '${hours}' (FISHHAWK_GOCACHE_TRIM_HOURS) must be an integer number of hours >= ${_GOCACHE_MIN_TRIM_HOURS} — refusing to trim (an invalid floor never falls back to a default or to trimming everything)"
+    return 1
+  fi
+  if ! _gocache_is_go_cache "$dir"; then
+    print -u2 "error: refusing to trim '${dir}': its README does not carry Go's marker ('${_GOCACHE_README_MARKER}'), so it is not provably a Go build cache"
+    return 1
+  fi
+  local mins=$(( (10#$hours + 1) * 60 ))
+  local -a subs
+  subs=("$dir"/[0-9a-f][0-9a-f](N/))
+  local files="" dirs="" frc=0 drc=0
+  if (( ${#subs} > 0 )); then
+    if (( dry_run )); then
+      files="$(find "${subs[@]}" -mindepth 1 -maxdepth 1 -type f \( -name '*-a' -o -name '*-d' \) -mmin +"$mins" -print 2>/dev/null)" || frc=$?
+      dirs="$(find "${subs[@]}" -mindepth 1 -maxdepth 1 -type d \( -name '*-a' -o -name '*-d' \) -mmin +"$mins" -print 2>/dev/null)" || drc=$?
+    else
+      files="$(find "${subs[@]}" -mindepth 1 -maxdepth 1 -type f \( -name '*-a' -o -name '*-d' \) -mmin +"$mins" -print -delete 2>/dev/null)" || frc=$?
+      dirs="$(find "${subs[@]}" -mindepth 1 -maxdepth 1 -type d \( -name '*-a' -o -name '*-d' \) -mmin +"$mins" -prune -print -exec rm -rf {} \; 2>/dev/null)" || drc=$?
+    fi
+  fi
+  local -a found
+  found=(${(f)files} ${(f)dirs})
+  if (( dry_run )); then
+    print "gocache: would remove ${#found} cache entries unused for >${hours} h (+1 h mtime granularity) from ${dir}"
+  else
+    print "gocache: removed ${#found} cache entries unused for >${hours} h (+1 h mtime granularity) from ${dir}"
+  fi
+  if (( frc != 0 || drc != 0 )); then
+    print -u2 "warning: find reported errors during the trim (an entry vanished or was unreadable mid-walk); the count above is what it reached"
+  fi
+  return 0
+}
+
+# The guard, then the trim. Returns 1 on any refusal. Tested contexts only.
+_gocache_trim_guarded() {
+  local dir="$1" hours="$2" dry_run="${3:-0}"
+  if ! _gocache_live_guard; then return 1; fi
+  if ! _gocache_trim "$dir" "$hours" "$dry_run"; then return 1; fi
+  return 0
+}
+
+# Non-fatal `up` advisory: warn on stderr when the SAMPLED estimate exceeds the
+# threshold. Silent under the threshold, at FISHHAWK_GOCACHE_MAX_GB=0, and when
+# the cache cannot be resolved — the _warn_stale_worktrees shape. Always 0.
+_warn_gocache_size() {
+  _gocache_knobs
+  if (( _GOCACHE_MAX_GB == 0 )); then return 0; fi
+  local dir kb
+  if ! dir="$(_gocache_resolve_dir 2>/dev/null)"; then return 0; fi
+  if ! kb="$(_gocache_estimate_kb "$dir")"; then return 0; fi
+  if (( kb <= _GOCACHE_MAX_GB * 1048576 )); then return 0; fi
+  print -u2 ""
+  print -u2 "warning: the Go build cache ${dir} is ≈$(_gocache_human_kb "$kb") (sampled estimate), over the ${_GOCACHE_MAX_GB} GB threshold (FISHHAWK_GOCACHE_MAX_GB)."
+  print -u2 "  per-run worktree paths grow it without bound (#3901); run 'scripts/dev gocache --trim' or 'scripts/dev sweep'"
+  print -u2 "  to remove entries unused for >${_GOCACHE_TRIM_HOURS} h. Never 'go clean -cache' while a run is live."
+  return 0
+}
+
+# The automatic post-merge step: past the threshold (sampled estimate), run the
+# GUARDED trim. Returns 1 on a refusal so the caller can stay non-fatal with
+# `|| true`; it prints its own advisory. cmd_post_merge calls it only AFTER its
+# live-run refusal, the pull and cleanup-merged.
+_gocache_maintain() {
+  _gocache_load_env
+  _gocache_knobs
+  if (( _GOCACHE_MAX_GB == 0 )); then return 0; fi
+  local dir kb
+  if ! dir="$(_gocache_resolve_dir 2>/dev/null)"; then return 0; fi
+  if ! kb="$(_gocache_estimate_kb "$dir")"; then return 0; fi
+  if (( kb <= _GOCACHE_MAX_GB * 1048576 )); then return 0; fi
+  print "post-merge: Go build cache ${dir} is ≈$(_gocache_human_kb "$kb") (sampled), over the ${_GOCACHE_MAX_GB} GB threshold — trimming entries unused for >${_GOCACHE_TRIM_HOURS} h"
+  if ! _gocache_trim_guarded "$dir" "$_GOCACHE_TRIM_HOURS" 0; then
+    print -u2 "warning: post-merge: the Go build-cache trim was refused (reason above) — the cache is untouched; retry with 'scripts/dev gocache --trim'"
+    return 1
+  fi
+  return 0
+}
+
+# `scripts/dev gocache [--trim] [--dry-run]` — status of the host Go build cache
+# (dir, EXACT size, threshold, floor, verdict). --trim runs the guarded trim
+# REGARDLESS of the threshold (the explicit request is the consent) and exits 1
+# on a refusal; --dry-run counts what a trim would remove and deletes nothing.
+cmd_gocache() {
+  local do_trim=0 dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --trim)    do_trim=1 ;;
+      --dry-run) dry_run=1 ;;
+      *)         _die "gocache: unknown argument '$1' (usage: scripts/dev gocache [--trim] [--dry-run])" ;;
+    esac
+    shift
+  done
+  _gocache_load_env
+  _gocache_knobs
+  local dir
+  if ! dir="$(_gocache_resolve_dir)"; then
+    print "gocache: skipping — the build cache could not be resolved (reason above)"
+    return 0
+  fi
+  local kb size="unknown (du failed)"
+  if kb="$(_gocache_size_kb "$dir")"; then size="$(_gocache_human_kb "$kb")"; else kb=""; fi
+  print "gocache: dir       ${dir}"
+  print "gocache: size      ${size} (exact du)"
+  if (( _GOCACHE_MAX_GB == 0 )); then
+    print "gocache: threshold disabled (FISHHAWK_GOCACHE_MAX_GB=0 — up/sweep/post-merge never trim)"
+  else
+    print "gocache: threshold ${_GOCACHE_MAX_GB} GB (FISHHAWK_GOCACHE_MAX_GB)"
+  fi
+  if _gocache_floor_valid "$_GOCACHE_TRIM_HOURS"; then
+    print "gocache: floor     ${_GOCACHE_TRIM_HOURS} h (+1 h mtime granularity; FISHHAWK_GOCACHE_TRIM_HOURS)"
+  else
+    print "gocache: floor     INVALID ('${_GOCACHE_TRIM_HOURS}') — every trim refuses (gocache_floor_invalid)"
+  fi
+  if (( _GOCACHE_MAX_GB > 0 )) && [[ -n "$kb" ]]; then
+    if (( kb > _GOCACHE_MAX_GB * 1048576 )); then
+      print "gocache: verdict   OVER the threshold — 'scripts/dev gocache --trim' removes entries unused for >${_GOCACHE_TRIM_HOURS} h"
+    else
+      print "gocache: verdict   under the threshold"
+    fi
+  fi
+  if (( dry_run )); then
+    if ! _gocache_trim "$dir" "$_GOCACHE_TRIM_HOURS" 1; then exit 1; fi
+  elif (( do_trim )); then
+    if ! _gocache_trim_guarded "$dir" "$_GOCACHE_TRIM_HOURS" 0; then exit 1; fi
+  fi
+  return 0
+}
+
 # `scripts/dev sweep [--days N] [--yes] [--dry-run]` — remove merged-clean
 # operator worktrees under .claude/worktrees (never a dirty one, never the
 # worktree the command runs from, never the main checkout), then prune aged run
 # litter (.git/fishhawk-worktrees/run-* dirs + run-*.runid files) and keyed /tmp
-# sidecars older than N days (default 7). ONE confirmation gates all removal:
+# sidecars older than N days (default 7), and — past FISHHAWK_GOCACHE_MAX_GB —
+# trim Go build-cache entries unused for >FISHHAWK_GOCACHE_TRIM_HOURS (#3901;
+# guarded, and a refusal makes sweep exit 1). ONE confirmation gates all removal:
 # `read -q` when stdin is a tty; a non-tty stdin without --yes (or a 'no' answer)
 # lists candidates and exits 0 WITHOUT removing anything — never a hung prompt in
 # a non-interactive session. Branch deletion is delegated to scripts/cleanup-merged
@@ -4319,6 +4730,24 @@ cmd_sweep() {
   print "sweep: aged run/tmp litter older than ${days} day(s):"
   _prune_aged_artifacts "$days" 1 || true
 
+  # Go build-cache step (#3901). The listing uses the SAMPLED estimate (no full
+  # du walk — that is reserved for `scripts/dev gocache`); past the threshold the
+  # trim is a candidate under the SAME single confirmation below.
+  local gc_dir="" gc_kb=0 gc_over=0 gc_refused=0
+  _gocache_knobs
+  if (( _GOCACHE_MAX_GB == 0 )); then
+    print "sweep: Go build cache: step disabled (FISHHAWK_GOCACHE_MAX_GB=0)"
+  elif gc_dir="$(_gocache_resolve_dir)"; then
+    gc_kb="$(_gocache_estimate_kb "$gc_dir")" || gc_kb=0
+    print "sweep: Go build cache ${gc_dir}: ≈$(_gocache_human_kb "$gc_kb") (sampled estimate) vs the ${_GOCACHE_MAX_GB} GB threshold"
+    if (( gc_kb > _GOCACHE_MAX_GB * 1048576 )); then
+      gc_over=1
+      print "  candidate: trim entries unused for >${_GOCACHE_TRIM_HOURS} h"
+    fi
+  else
+    print "sweep: Go build cache: skipped (reason above)"
+  fi
+
   if (( dry_run )); then
     print "sweep: --dry-run — nothing removed."
     return 0
@@ -4354,25 +4783,43 @@ cmd_sweep() {
   # Prune aged run/tmp litter for real.
   _prune_aged_artifacts "$days" 0 || true
 
+  # Trim the Go build cache (guarded). A refusal leaves the cache untouched and
+  # lets the remaining steps finish; sweep then exits 1 naming it.
+  if (( gc_over )); then
+    if ! _gocache_trim_guarded "$gc_dir" "$_GOCACHE_TRIM_HOURS" 0; then gc_refused=1; fi
+  fi
+
   # Delete the now-un-checked-out merged branches. Reuse, don't reimplement.
   if [[ -x "${REPO_ROOT}/scripts/cleanup-merged" ]]; then
     "${REPO_ROOT}/scripts/cleanup-merged" || print -u2 "warning: cleanup-merged reported an error"
   fi
 
+  if (( gc_refused )); then
+    print -u2 "sweep: done, but the Go build-cache trim was REFUSED (reason above) — the cache is untouched."
+    exit 1
+  fi
   print "sweep: done."
 }
 
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps] [--force]|post-merge [<issue>] [--start-deps] [--force]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps] [--force]|post-merge [<issue>] [--start-deps] [--force]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|gocache [--trim] [--dry-run]|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  sweep removes merged-clean operator worktrees under .claude/worktrees"
   print -u2 "  (never a dirty one, never the current worktree) and prunes aged run/tmp"
   print -u2 "  litter older than --days N (default 7); one confirmation, --yes to skip"
   print -u2 "  it, --dry-run to list only. A non-tty stdin lists and removes nothing."
+  print -u2 "  Past FISHHAWK_GOCACHE_MAX_GB (default 50) it also trims Go build-cache"
+  print -u2 "  entries unused for >FISHHAWK_GOCACHE_TRIM_HOURS (default 6) h (#3901)."
+  print -u2 ""
+  print -u2 "  gocache prints the host Go build cache's dir, exact size, threshold and"
+  print -u2 "  floor; --trim removes entries unused for >floor+1 h regardless of size,"
+  print -u2 "  --dry-run counts them. Every trim REFUSES while a fishhawk-runner or Go"
+  print -u2 "  toolchain process is live, or when ps cannot list processes (fail-closed)."
   print -u2 ""
   print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
-  print -u2 "  scripts/cleanup-merged, an optional issue-closed check (<issue>), then"
-  print -u2 "  reload (whose /healthz gate + MCP reconnect verdict are inherited)."
+  print -u2 "  scripts/cleanup-merged, a guarded Go build-cache trim past the threshold"
+  print -u2 "  (non-fatal), an optional issue-closed check (<issue>), then reload"
+  print -u2 "  (whose /healthz gate + MCP reconnect verdict are inherited)."
   print -u2 ""
   print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
   print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."
@@ -4416,6 +4863,7 @@ if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
     preview)      cmd_preview "${@:2}" ;;
     preview-down) cmd_preview_down ;;
     sweep)        cmd_sweep "${@:2}" ;;
+    gocache)      cmd_gocache "${@:2}" ;;
     k8s)        cmd_k8s_up "${@:2}" ;;
     k8s-down)   cmd_k8s_down ;;
     down)       cmd_down ;;

@@ -12427,6 +12427,9 @@ func TestIsVerifyInfraFailure(t *testing.T) {
 		{"verbatim #2718 MinIO port-not-found failure", portFlakeOutput2718, true, true, true},
 		{"verbatim #2718 daemon-unreachable failure", dockerDownOutput2718, true, true, true},
 		{"pgtest fixtures carrying the markers as DATA (accepted #2718 residual)", pgtestFixtureDumpOutput, true, true, true},
+		// #3901 widening: the counterfactual vehicle for the cache-vanished
+		// disjunct (deleting it from isVerifyInfraFailure reddens this row).
+		{"verbatim-corpus #3901 vanished Go build-cache entry", goCacheVanishedOutput3901, true, true, true},
 		// #2718 false-positive guards: the widening must not claim these.
 		{"non-numeric quoted port", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port \"invalid port\" not found\nFAIL", false, false, false},
 		{"unquoted port mention", "--- FAIL: TestPort (0.00s)\n    port_test.go:3: port 9000/tcp not found\nFAIL", false, false, false},
@@ -12594,6 +12597,7 @@ func TestRun_VerifyFixLoop_InfraFlakeRetry_NoBudgetBurn(t *testing.T) {
 		{"testcontainers start timeout (#972)", flakeEchoLine},
 		{"testcontainers port not found (#2718)", portFlakeOutput2718},
 		{"docker daemon unavailable (#2718)", dockerDownOutput2718},
+		{"vanished Go build-cache entry (#3901)", goCacheVanishedOutput3901},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := verifyFixBaseRepo(t)

@@ -304,8 +304,15 @@ func redactURLEntryUserinfo(entry string) string {
 // cached lint results could surface in run B's strict re-verify — a spurious
 // category-B (#1796). Isolating the linter cache per verify-gate invocation
 // makes that leak impossible. GOCACHE is deliberately left SHARED: the Go build
-// cache is content-addressed (not path-keyed) and safe across worktrees, so
-// sharing it keeps compilation warm; only the linter analysis re-runs cold.
+// cache is SAFE across worktrees (a hit is keyed by an action ID covering every
+// input, so it can never serve a stale artifact), and sharing it keeps the
+// standard library and module-cache dependencies warm; only the linter analysis
+// re-runs cold. It is NOT path-independent, though: without -trimpath cmd/go
+// hashes the package directory into each compile action ID (go1.25.6
+// src/cmd/go/internal/work/exec.go buildActionID, `dir %s`), so a workspace
+// package compiled in a fresh per-run worktree path misses and adds new entries
+// every run — the unbounded host growth #3901 measured and `scripts/dev
+// gocache` bounds.
 func withIsolatedLintCache(env []string, cacheDir string) []string {
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {

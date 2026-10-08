@@ -1,0 +1,13 @@
+id: scenario:issue-3901/gocache-status-reports-size-and-threshold
+statement: Running `scripts/dev gocache` with GOCACHE pointing at a directory that carries Go's cache README exits 0, and its stdout names that directory, its measured size, the threshold (50 GB by default, or FISHHAWK_GOCACHE_MAX_GB), the trim floor in hours, and whether the cache is over or under the threshold.
+verify_hint: 'CLI stdout/exit code: create a temp dir holding a README containing ''cached build artifacts from the Go build system'', then run `GOCACHE=<dir> scripts/dev gocache`. Expect exit 0 and stdout containing <dir>, ''threshold'' and the floor hours.'
+steps: 'Against the sanctioned checkout at 785bb6d1: made /tmp/fhacc3901/gc1 containing a README with ''cached build artifacts from the Go build system'' and one ab/<64 hex>-d entry. Ran GOCACHE=/tmp/fhacc3901/gc1 scripts/dev gocache, capturing stdout and stderr. Repeated with FISHHAWK_GOCACHE_MAX_GB=0.'
+assertions:
+    expected: exit 0; stdout names the dir, size, threshold, floor hours and the over/under verdict
+    observed_at_record: 'exit 0. stdout lines: dir /tmp/fhacc3901/gc1; size 0 MB (exact du); threshold 50 GB (FISHHAWK_GOCACHE_MAX_GB); floor 6 h (+1 h mtime granularity); verdict under the threshold. stderr: the ''measuring <dir> (exact du; may take a while...)'' announcement. With MAX_GB=0 it reports ''threshold disabled''.'
+origin:
+    issue: 3901
+    pr: 4123
+    run_id: 5b831217-2cf8-4907-b451-ecbae7bc62b3
+    head_sha: 785bb6d1bb964ef7a4c3898fc3c7332c13ccbafc
+    recorded_at: 2026-10-08T20:17:52Z

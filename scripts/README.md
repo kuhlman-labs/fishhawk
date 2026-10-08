@@ -1316,7 +1316,7 @@ stale-lock-broken dead-owner, live-delayed-acquire → a live holder's atomic lo
 never broken, live-stuck-lock fail-safe, register-timeout → no lease + reap
 unarmed; plus the #3122 generation-sweep cases above).
 
-## `scripts/dev` lifecycle: `up` / `reload` / `post-merge` / `sweep`
+## `scripts/dev` lifecycle: `up` / `reload` / `post-merge` / `sweep` / `gocache`
 
 Long-form contract for the `scripts/dev` behaviours `AGENTS.md` § "Rebuild
 matrix" states as rules. The rebuild table and the activation table themselves
@@ -1331,7 +1331,9 @@ in-loop rather than only when a human runs the harness.
 post-merge walk: it `git pull --ff-only origin main` (a diverged local main
 fails loud rather than landing a merge commit), prunes the merged local branch
 via `scripts/cleanup-merged` (reused, not reimplemented — it deletes only
-ancestors of `origin/main`, never `main`), optionally confirms a given issue is
+ancestors of `origin/main`, never `main`), trims the host Go build cache when its
+sampled size is past the threshold (guarded and non-fatal, #3901 — see "Go
+build-cache bound" below), optionally confirms a given issue is
 `CLOSED` via `gh issue view` (warn-only, non-fatal), then runs `reload` LAST so
 reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure)
 and MCP-reconnect verdict are inherited and the verdict is the command's final
@@ -1431,6 +1433,12 @@ answer, lists candidates and removes NOTHING — never a hung prompt) it:
   `fishhawk-scope-justifications-*-*.json`, `fishhawk-acceptance-*-*.json`,
   `fishhawk-pr-*-*.md`, `fishhawk-plan-*-*.json` — the per-run/stage plan
   handoff, #4067 — `fishhawk-prompt-*.txt`) older than `--days N` (default 7);
+- trims the host Go build cache when its SAMPLED size is past
+  `FISHHAWK_GOCACHE_MAX_GB` (default 50; `0` disables the step): the listing
+  always shows `≈size vs threshold` and, past it, the candidate `trim entries
+  unused for >H h`; the trim itself is the guarded one (see "Go build-cache
+  bound" below). A refusal leaves the cache untouched, lets the remaining steps
+  finish, and makes `sweep` exit 1 with a closing line naming it;
 - then composes `scripts/cleanup-merged` to delete the now-un-checked-out merged
   branches (git refuses to delete a branch checked out in any worktree — why
   `cleanup-merged` alone never clears these).
@@ -1704,6 +1712,134 @@ invocation, and `LR-j`/`LR-k` the tested-context and ordering pins.
 
 The runner-side half of #2897 — the terminal-egress retry budget that makes a
 `--force`d restart survivable — is in `runner/README.md`.
+
+## Go build-cache bound (E83.20 / [#3901](https://github.com/kuhlman-labs/fishhawk/issues/3901))
+
+**Why the host cache grows without bound.** Without `-trimpath`, cmd/go hashes
+the package DIRECTORY into every compile action ID (go1.25.6
+`src/cmd/go/internal/work/exec.go` `buildActionID`: `fmt.Fprintf(h, "dir %s\n",
+p.Dir)`). Every run builds in a fresh per-run worktree path
+(`.git/fishhawk-worktrees/run-<id>`), so every workspace package compiles to NEW
+cache entries each run; the standard library and module-cache dependencies are
+still shared. A two-path planning experiment against one fresh shared GOCACHE
+added 18 entries for the second path without `-trimpath` and 2 with it. Go's own
+trim evicts only entries unused for 5 days, so the host cache reached 531 GB.
+`-trimpath` is deliberately NOT adopted: about 30 test files anchor fixtures on
+`runtime.Caller(0)`, which it rewrites; the patch-coverage loop's `-coverpkg` set
+differs per diff, so those builds miss regardless of path; and the container
+gate already builds at a fixed `/work` in a per-process volume removed at exit.
+
+**The trim (`_gocache_trim`).** It reproduces cmd/go's own `DiskCache.Trim`
+(`src/cmd/go/internal/cache/cache.go`): delete the `<2hex>/<hash>-a` / `-d`
+entries (files, and `-d` executable-entry DIRECTORIES) whose mtime is older than
+`floor + 1 h`, and nothing else — `README`, `trim.txt`, `testexpire.txt`, `fuzz/`
+and any non-entry name are never touched. The extra hour is Go's
+`mtimeInterval`: cmd/go refreshes an entry's mtime when it uses it, but only when
+the stored mtime is more than an hour stale (`markUsed`), so an entry older than
+`floor + 1 h` is one no build has used for at least `floor` hours. That is what
+makes it safe beside a live build, exactly as Go's own Trim (which runs unlocked
+at the end of ordinary go commands) is; files go through `find … -delete`, which
+re-checks each entry immediately before its unlink. The residual race is the one
+Go already accepts: an entry older than the cutoff looked up in the same instant
+it is unlinked.
+
+**Why not `go clean -cache`, a rename, or a lock.** A full clear deletes entries
+a live build is about to read — the #3901 incident: a clear that passed its "no
+runner is live" check at 14:24:24 broke run `26ede2f1`, dispatched at 14:24:25,
+with `could not load export data: open …/go-build/e5/e5470b5b…-d: no such file
+or directory`. A rename or symlink swap does NOT keep in-flight builds consistent
+either: `DiskCache.fileName` re-joins the cache dir on every access, so an
+in-flight build reads through the new, empty directory and hits the same ENOENT.
+A lock that dispatch respects would not cover the agents' own host `go test` /
+`golangci-lint`, which take no lock. The age floor is the primitive that protects
+in-flight work; the liveness guard is defense in depth.
+
+**The guard (`_gocache_live_guard`), FAIL-CLOSED.** Every trim first scans for
+live `fishhawk-runner` processes (the #2897 `_scan_live_runs`) and live Go
+toolchain processes (`_scan_live_go` / pure `_parse_live_go`: argv[0] basename
+exactly `go` or `golangci-lint`, a `*.test` binary, or argv[0] under
+`/pkg/tool/`; never a substring or later token, so `grep go`, `gopls` and
+`/bin/sleep go` do not count). Any live process → the trim is refused, naming
+every pid (and run id). A scan DEGRADE (ps absent or failing) also refuses —
+the deliberate inversion of the reload guard's fail-open, because skipping a
+trim costs nothing urgent and deleting under a live build costs a misreported
+stage. `--force` never bypasses it. The scan is a sample: a build that starts a
+second after it is not seen, and the age floor is what makes that harmless (a
+new build only touches fresh entries or refreshes old ones). The trim also
+refuses a directory whose `README` lacks Go's marker sentence (`cached build
+artifacts from the Go build system`).
+
+**Knobs** (`.env`, documented in `.env.example`):
+
+- `FISHHAWK_GOCACHE_MAX_GB` (default `50`) — the threshold for the SIZE-GATED
+  paths (the `up` advisory, the `sweep` step, the `post-merge` auto-trim); `0`
+  disables them. An invalid value warns and uses the default: it only decides
+  WHETHER those paths act, never what a trim deletes.
+- `FISHHAWK_GOCACHE_TRIM_HOURS` (default `6`, minimum `2`) — the floor. It FAILS
+  CLOSED: an empty, non-numeric, non-positive, fractional, sub-minimum or
+  over-six-digit value makes EVERY trim refuse with `gocache_floor_invalid` and
+  is never replaced by a default or by "trim everything".
+
+**The documented bound.** After a trim the cache holds the entries used in the
+last `floor + 1` hours plus whatever a live process is touching. At the single
+observed production rate (16 GB about 7 h after the 2026-10-08 clear, two
+concurrent implements, ≈2.3 GB/h) the default floor keeps ≈16 GB plus the
+stdlib/dependency working set — under the 50 GB threshold. A faster rate raises
+the post-trim size proportionally.
+
+**Surfaces.**
+
+- `scripts/dev gocache [--trim] [--dry-run]` — status: dir, EXACT size (a full
+  `du`, announced first with `measuring <dir> (exact du; may take a while on a
+  large cache)`), threshold, floor and an over/under verdict. `--trim` runs the
+  guarded trim REGARDLESS of the threshold (the explicit request is the consent)
+  and exits 1 on a refusal; `--dry-run` counts what it would remove. An
+  unresolvable cache (`GOCACHE=off`, `GOCACHEPROG` set, a non-absolute or missing
+  directory, `go` absent with `GOCACHE` unset) prints a `skipping` line and exits 0.
+- `sweep` — the size-gated step above, measured by the SAMPLED estimate (no full
+  `du` walk).
+- `post-merge` — `_gocache_maintain || true` runs AFTER the live-run refusal,
+  the pull and `cleanup-merged`, and before the issue check and `reload`. Past
+  the threshold it runs the guarded trim; a refusal prints an advisory and the
+  walk continues. The new step first fires on the post-merge AFTER the one that
+  lands it, because `post-merge` runs the old `scripts/dev`.
+- `up` — `_warn_gocache_size || true` after the `.env` load: a non-fatal stderr
+  advisory past the threshold (sampled estimate), silent otherwise.
+
+**Sampled estimate (`_gocache_estimate_kb`).** One `du -sk` over the 16
+subdirectories `00, 10, …, f0`, times 16. cmd/go files each entry under the
+first byte of its hash (`DiskCache.fileName`), so entries spread uniformly over
+the 256 subdirectories and `up`/`post-merge`/`sweep` never walk a
+multi-hundred-GB cache.
+
+**Runner classification.** The same incident's failure was recorded as category
+A (an agent failure). `isVerifyInfraFailure` now recognises a vanished cache entry
+(`[0-9a-f]{2}/[0-9a-f]{64}-[ad]: no such file or directory`), so such a verify is
+re-run once in place and, if it persists, classified category C; the backend's
+`infra_flake` delegation condition mirrors it. Long-form:
+`runner/cmd/fishhawk-runner/README.md`.
+
+**Residuals.** The ps scan is a sample (above), and the one race Go itself
+accepts remains (an over-age entry looked up as it is unlinked). The trim only
+bounds the HOST cache: the container gate's cache volume is per-process and
+removed at exit, so it is out of scope. A run whose stage hits a vanished entry
+anyway is reclassified, not prevented (next paragraph's matcher).
+
+### Tests
+
+`scripts/test-dev` GC-a … GC-l drive every surface against a FIXTURE cache
+(`GOCACHE` pointed at a temp dir holding Go's README marker, a 10-day-old entry
+file and `-d` directory, a fresh entry, a boundary entry at floor + 0.5 h, and
+aged non-entry files) with the scanners and the estimate stubbed in a subshell,
+and assert which files survive plus the exit code and stderr: trim selectivity
+(GC-a), the live-runner / live-Go / degrade / missing-marker refusals (GC-b … e),
+the `_parse_live_go` table (GC-f), the sweep step (GC-g), the `up` advisory
+(GC-h), post-merge ordering and non-fatality including a live runner refusing
+BEFORE any trim is attempted (GC-i), knob validation including the fail-closed
+floor (GC-j), wiring body-greps (GC-k), and a REAL `fishhawk-runner`-named
+process found by the real `_scan_live_runs` (GC-l, skipped only when `ps` is
+absent). The file sets `FISHHAWK_GOCACHE_MAX_GB=0` at the top so the older
+`up`/`sweep`/`post-merge` fixtures never touch the host cache.
 
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 

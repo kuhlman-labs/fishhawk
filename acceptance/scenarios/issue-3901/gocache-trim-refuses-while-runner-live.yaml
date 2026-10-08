@@ -1,0 +1,13 @@
+id: scenario:issue-3901/gocache-trim-refuses-while-runner-live
+statement: While a process whose argv[0] is fishhawk-runner is live, `scripts/dev gocache --trim` exits non-zero, its stderr names that process's pid as live, and a cache entry older than the trim floor in the target GOCACHE directory is still present afterwards.
+verify_hint: 'CLI exit code/stderr: build a fixture GOCACHE (README marker plus `ab/<64 hex>-a` touched 10 days back), start `(exec -a fishhawk-runner sleep 60) &`, run `GOCACHE=<dir> scripts/dev gocache --trim`, then check that the exit is non-zero, that stderr contains the sleep''s pid, and that the entry file still exists. Kill the sleep afterwards. This holds even if other runners are also live.'
+steps: 'Fixture /tmp/fhacc3901/gc2: the Go README marker plus ab/<64 b>-a touched 10 days back. Started (exec -a fishhawk-runner sleep 120) & (pid 11979). (1) GOCACHE=<dir> scripts/dev gocache --trim, unmodified. (2) The sandbox forbids executing ps, so the same command was run with PATH prefixed by a ps shim that execs ''/usr/bin/pgrep -lf .'' (the real process table). (3) After killing the sleep, the same command with the shim.'
+assertions:
+    expected: exit non-zero, stderr names the live pid, the aged entry is still present
+    observed_at_record: '(1) exit 1, fail-closed ''could not enumerate processes''; entry kept. (2) exit 1; stderr ''refusing to trim ... live: fishhawk-runner pid 11979 (run id unreadable)''; entry still present. (3) with no runner live: ''removed 1 cache entries''. Harness case GC-l (a REAL fishhawk-runner-named process) also passed.'
+origin:
+    issue: 3901
+    pr: 4123
+    run_id: 5b831217-2cf8-4907-b451-ecbae7bc62b3
+    head_sha: 785bb6d1bb964ef7a4c3898fc3c7332c13ccbafc
+    recorded_at: 2026-10-08T20:17:52Z
