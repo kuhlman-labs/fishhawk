@@ -57,6 +57,10 @@ func TestCSRFExemptPath(t *testing.T) {
 		"/v0/auth/gitlab/callback",
 		"/webhooks/github",
 		"/webhooks/gitlab",
+		// The alert ingress (E35.4 / #1601): authenticated only by the
+		// per-source HMAC over the raw body; handleAlertTrigger never reads
+		// the session identity.
+		"/v0/triggers/alert",
 		// The MCP surface (ADR-076 / #2390): a bearer-authenticated,
 		// non-cookie JSON-RPC transport. handleMCP independently refuses
 		// any cookie-session identity with 401, so the exemption cannot
@@ -87,6 +91,9 @@ func TestCSRFExemptPath(t *testing.T) {
 		// cookie-authenticated and stays CSRF-enforced via the form-field
 		// fallback.
 		"/v0/oauth/authorize",
+		// Exact match only: a sibling of the alert ingress inherits nothing.
+		"/v0/triggers/alert/x",
+		"/v0/triggers",
 	}
 	for _, p := range notExempt {
 		if csrfExemptPath(p) {

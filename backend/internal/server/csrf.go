@@ -102,6 +102,12 @@ func csrfExemptPath(p string) bool {
 	switch p {
 	case "/webhooks/github", "/webhooks/gitlab":
 		return true
+	// POST /v0/triggers/alert (E35.4 / #1601) is authenticated ONLY by the
+	// per-source HMAC over the raw body: handleAlertTrigger never reads the
+	// session identity, so a forged cross-site POST without the source's
+	// secret is refused 401 regardless. Belt-and-braces like the webhooks.
+	case "/v0/triggers/alert":
+		return true
 	// /mcp (ADR-076 / #2390) is a bearer-authenticated, non-cookie,
 	// non-browser JSON-RPC transport: the streamable-HTTP body carries no
 	// form encoding a browser could forge, and handleMCP independently

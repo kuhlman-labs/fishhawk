@@ -300,6 +300,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 	mux.HandleFunc("POST /webhooks/gitlab", s.handleWebhookGitLab)
+	// The HMAC-authenticated alert ingress (E35.4 / #1601, ADR-053 option A).
+	// It takes no bearer token: the per-source HMAC is its only
+	// authentication, and it answers 503 alert_trigger_unconfigured until
+	// FISHHAWKD_ALERT_SOURCES_FILE is set.
+	mux.HandleFunc("POST /v0/triggers/alert", s.handleAlertTrigger)
 }
 
 type healthResponse struct {

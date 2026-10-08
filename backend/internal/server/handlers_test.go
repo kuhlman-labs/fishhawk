@@ -295,6 +295,27 @@ func TestReleaseNotesPreviewRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestAlertTriggerRouteRegistered guards the route table: POST
+// /v0/triggers/alert (E35.4 / #1601) must reach handleAlertTrigger. The route
+// takes no bearer token, so an ANONYMOUS request passes the middleware and,
+// with no alert sources configured, the handler answers 503
+// alert_trigger_unconfigured — an unregistered route would 404 (or 405) with
+// the mux's default body instead.
+func TestAlertTriggerRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/triggers/alert", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handleAlertTrigger):\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "alert_trigger_unconfigured") {
+		t.Errorf("body = %s, want alert_trigger_unconfigured", rec.Body.String())
+	}
+}
+
 // TestAcceptanceTranscriptRouteRegistered guards the route table: POST
 // /v0/runs/{run_id}/acceptance/transcript (E72.5 / #3329) must reach
 // handleShipAcceptanceTranscript. With no repositories configured
