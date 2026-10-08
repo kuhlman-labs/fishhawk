@@ -14190,7 +14190,8 @@ paths:
         transitions only the run row, so a parked or queued stage of a dead
         run is never spawned.
 
-        **Post-deploy hold (E35.1 / #1598, ADR-053).** A `pending` stage
+        **Post-deploy hold (E35.1 / #1598, ADR-053).** A `pending` or
+        `awaiting_host_dispatch` stage (both admissible arms, E35.3 / #1600)
         sequenced behind a `deploy` stage that has not `succeeded` (awaiting
         its approval, in flight, `failed` or `cancelled`) returns 409
         `dispatch_not_admissible` with `details.reason`
@@ -14200,7 +14201,7 @@ paths:
         succeeded. A `failed` deploy is refused here even while the run is
         still `running`, because the deploy's failure commits before the run
         advance that fails the run. The refusal fires BEFORE the state CAS,
-        so the stage stays `pending`.
+        so the stage keeps its state.
 
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
@@ -14339,11 +14340,12 @@ paths:
               (`details.run_state`), a run locked to a non-local
               `runner_kind`, or a non-host-spawn stage, so a fresh spawn
               marker cannot be applied. Also the post-deploy hold (E35.1 /
-              #1598, ADR-053): a `pending` stage behind a `deploy` stage that
-              has not `succeeded` — in flight, `failed` or `cancelled` — is
-              refused with `details.reason` `deploy_not_succeeded`,
+              #1598, ADR-053): a `pending` or `awaiting_host_dispatch` stage
+              (both admissible arms, E35.3 / #1600) behind a `deploy` stage
+              that has not `succeeded` — in flight, `failed` or `cancelled` —
+              is refused with `details.reason` `deploy_not_succeeded`,
               `details.deploy_stage_id` and `details.deploy_state`. It fires
-              BEFORE the state CAS, so the stage stays `pending`; retry once
+              BEFORE the state CAS, so the stage keeps its state; retry once
               the deploy succeeded (a failed or cancelled deploy never clears
               it).
             - `dependency_not_satisfied` — the decomposition wave-order guard
@@ -14402,7 +14404,8 @@ paths:
             guard could not read the parent's `slices_integrated` history to
             derive `base_branch` (E50.13 / #2363), or the post-deploy hold
             could not list the run's stages to check for an unsucceeded
-            `deploy` stage ahead of a `pending` stage (E35.1 / #1598).
+            `deploy` stage ahead of a `pending` or `awaiting_host_dispatch`
+            stage (E35.1 / #1598, E35.3 / #1600).
             Retryable: all three fail closed on a read error rather than
             admitting out of order, on an unverified base, or behind an
             unchecked deploy, and commit no state. `internal_error` — the state
@@ -23762,10 +23765,38 @@ paths:
         - **webhook** — POSTs a rollback payload (`fishhawk_rollback: true`)
           to the delegate URL.
 
+        **Stored `rollback_handle` (E35.3 / #1600, ADR-053).** Before
+        dispatching, the endpoint reads the deploy stage's stored deployment
+        artifacts and selects the NEWEST FORWARD record (no
+        `rollback_action`, outcome not `rolled_back`) that carries a
+        non-empty `rollback_handle` — so a handle the pipeline reported via
+        `POST /v0/runs/{run_id}/deployment` wins over a newer handle-less
+        record such as the github_actions reconciler's poll-state artifact.
+        The handle rides the re-dispatch ONLY when non-empty:
+
+        - **github_actions** — as the extra `workflow_dispatch` input
+          `fishhawk_rollback_handle`. GitHub refuses an undeclared
+          `workflow_dispatch` input (422 `Unexpected inputs provided`), so a
+          pipeline that returns a `rollback_handle` in its deployment record
+          MUST declare `fishhawk_rollback_handle` under
+          `on.workflow_dispatch.inputs`; a pipeline that never returns one
+          never receives it. The handle is NOT part of the correlation the
+          rollback run id is resolved by.
+        - **webhook** — as `variables.FISHHAWK_ROLLBACK_HANDLE` (no new
+          top-level body key).
+
+        With no handle-bearing forward record the rollback dispatches
+        without one, exactly as before. If the artifact read itself fails
+        the endpoint refuses 500 `internal_error` and dispatches NOTHING
+        (retryable): a rollback never fires without the revert reference
+        the pipeline returned.
+
         On a successful dispatch it writes a `deployment_rollback_initiated`
         chained audit entry carrying the rollback run handle — **distinct**
-        from the initial deploy's `deployment_dispatched` handle — and
-        refreshes the run's living-anchor issue comment.
+        from the initial deploy's `deployment_dispatched` handle — plus the
+        `rollback_handle` it carried and the `deployment_artifact_id` it was
+        read from (both empty strings when none), and refreshes the run's
+        living-anchor issue comment.
 
         **Terminal completion is NOT recorded here.** Setting the
         `rolled_back` outcome and writing `deployment_rollback_completed`
@@ -23796,10 +23827,16 @@ paths:
       responses:
         '202':
           description: |
-            Rollback re-dispatched; the rollback run handle is echoed back.
+            Rollback re-dispatched; the rollback run handle is echoed back,
+            with the stored `rollback_handle` the re-dispatch carried and the
+            deployment artifact it was read from (both omitted when empty).
             Terminal completion (the `rolled_back` outcome +
             `deployment_rollback_completed`) is recorded later via the
-            deployment callback.
+            deployment callback. The CLI's `fishhawk deploy rollback --output
+            json` does not yet decode `rollback_handle` /
+            `deployment_artifact_id`, so its JSON output omits them; read
+            them from this response or the `deployment_rollback_initiated`
+            audit entry.
           content:
             application/json:
               schema:
@@ -23810,6 +23847,8 @@ paths:
                   target: { type: string, enum: [github_actions, webhook], description: 'The delegate target the rollback was re-dispatched against.' }
                   gha_run_id: { type: integer, format: int64, description: 'Resolved GitHub Actions rollback run id; omitted/0 when not yet resolvable.' }
                   external_run_url: { type: string, description: 'URL of the external rollback run (GHA run html_url, or the webhook delegate URL).' }
+                  rollback_handle: { type: string, description: 'The stored deployment rollback_handle the re-dispatch carried (github_actions input fishhawk_rollback_handle / webhook variables.FISHHAWK_ROLLBACK_HANDLE; E35.3 / #1600). Omitted when no forward deployment record carried one.' }
+                  deployment_artifact_id: { type: string, format: uuid, description: 'The deployment artifact the rollback_handle was read from — the newest handle-bearing forward record, else the newest forward record. Omitted when the deploy stage has no forward deployment record.' }
                   message: { type: string }
         '400':
           description: '`run_id` is not a valid UUID (`validation_failed`).'
@@ -23857,6 +23896,17 @@ paths:
             The external rollback trigger failed (`rollback_dispatch_failed`):
             the `workflow_dispatch` returned non-204, or the webhook POST
             errored / returned a non-2xx status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`: reading the run or its stages failed; reading
+            the deploy stage's stored deployment artifacts (the
+            `rollback_handle` lookup) failed — refused BEFORE any dispatch,
+            so nothing was triggered and the request is safe to retry; or the
+            `deployment_rollback_initiated` audit append failed after the
+            dispatch fired.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

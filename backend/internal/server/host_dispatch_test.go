@@ -1933,3 +1933,68 @@ func TestHostDispatch_DeployHold_SequenceZero_SkipsRead(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (sequence 0 skips the stage list):\n%s", w.Code, w.Body.String())
 	}
 }
+
+// (C15) TestHostDispatch_DeployHold_AwaitingHostDispatch_RefusesBehindUnsucceededDeploy
+// pins the E35.3 / #1600 widening: the post-deploy hold applies to BOTH
+// admissible arms, so an acceptance stage parked at awaiting_host_dispatch
+// behind a deploy that has not succeeded (failed, cancelled, or still in
+// flight) is refused 409 dispatch_not_admissible / deploy_not_succeeded. The
+// stage is RE-READ after the call (the control's effect is the absence of a
+// committed transition): it is still awaiting_host_dispatch, with no
+// acceptance spawn anchor written.
+//
+// Counterfactual: reverting the guard to the pending arm only lets the switch
+// admit awaiting_host_dispatch, the CAS commits dispatched, and every row
+// answers 200 with the stage read back dispatched.
+func TestHostDispatch_DeployHold_AwaitingHostDispatch_RefusesBehindUnsucceededDeploy(t *testing.T) {
+	for _, deployState := range []run.StageState{run.StageStateFailed, run.StageStateCancelled, run.StageStateAwaitingDeployment} {
+		t.Run(string(deployState), func(t *testing.T) {
+			rr, au, runRow, deploy, acceptance := deployHoldHostDispatchFixture(t, deployState, run.StageStateAwaitingHostDispatch)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+			w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			for _, want := range []string{
+				`"dispatch_not_admissible"`,
+				`"reason":"` + hostDispatchReasonDeployNotSucceeded + `"`,
+				`"deploy_stage_id":"` + deploy.ID.String() + `"`,
+				`"deploy_state":"` + string(deployState) + `"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("body missing %s: %s", want, body)
+				}
+			}
+			cur, err := rr.GetStage(context.Background(), acceptance.ID)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if cur.State != run.StageStateAwaitingHostDispatch || cur.DispatchedAt != nil {
+				t.Errorf("acceptance stage = {state:%s dispatched_at:%v}, want awaiting_host_dispatch untouched", cur.State, cur.DispatchedAt)
+			}
+			if got := acceptanceDispatchEntries(au, acceptance.ID); len(got) != 0 {
+				t.Errorf("acceptance_dispatched entries = %d, want 0 (nothing spawned)", len(got))
+			}
+		})
+	}
+}
+
+// TestHostDispatch_DeployHold_DispatchedArmStaysIdempotent pins the SCOPE of
+// the E35.3 / #1600 widening: a stage already `dispatched` (a spawn attempt
+// exists; the operator is re-spawning a dead runner) keeps the idempotent 200
+// {transitioned:false} even behind a failed deploy — the hold covers only the
+// pending and awaiting_host_dispatch arms.
+func TestHostDispatch_DeployHold_DispatchedArmStaysIdempotent(t *testing.T) {
+	rr, au, runRow, _, acceptance := deployHoldHostDispatchFixture(t, run.StageStateFailed, run.StageStateDispatched)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+	w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the idempotent 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:false dispatched", resp)
+	}
+}

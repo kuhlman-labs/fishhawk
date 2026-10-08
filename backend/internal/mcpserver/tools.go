@@ -2195,6 +2195,13 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	if runRow.WorkflowID == "release" {
 		release = r.releaseSignalsFor(ctx, stages, recent)
 	}
+	// E35.3 (#1600): the post-deploy rollback offer correlated with the newest
+	// failed verdict, read off the SAME recent slice — for EVERY run, not just
+	// release-workflow ones (no round-trip, so no cost gate), so the
+	// acceptance_triage_rollback_offered arm names the stored rollback_handle and
+	// switches to acceptance_triage_rollback_initiated once a rollback was
+	// taken. Wired at BOTH nextActionsFor call sites (here and run_stage.go).
+	release.RollbackOffer = acceptanceRollbackOfferIn(recent)
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 	// E64.63 (#3222): a merge-ritual arm whose acceptance stage is still
 	// NON-TERMINAL cannot actually merge — the fishhawk_audit_complete check is

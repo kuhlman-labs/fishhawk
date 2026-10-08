@@ -67,10 +67,11 @@ declared.
 The host-dispatch spawn marker
 (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`) also holds a stage
 that sits behind a deploy, which the table does not spell out. A `pending`
-stage sequenced after a `deploy` stage that has not succeeded (still awaiting
-approval, in flight, failed or cancelled) is refused with 409
-`dispatch_not_admissible`, `details.reason` `deploy_not_succeeded` and the
-deploy stage's id and state, and the stage stays `pending`. It is the same
+or `awaiting_host_dispatch` stage sequenced after a `deploy` stage that has
+not succeeded (still awaiting approval, in flight, failed or cancelled) is
+refused with 409 `dispatch_not_admissible`, `details.reason`
+`deploy_not_succeeded` and the deploy stage's id and state, and the stage
+keeps its state. It is the same
 rule the server applies when it advances a run on its own: a post-deploy
 acceptance stage runs only once every earlier deploy stage succeeded.
 

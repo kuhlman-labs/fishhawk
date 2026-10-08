@@ -1,8 +1,13 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -16,10 +21,15 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
 // --- fixture helpers -------------------------------------------------------
@@ -2455,6 +2465,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"retry_unavailable_paged":            acceptanceDispositionRetryUnavailable,
 		"unsettled_paged":                    acceptanceDispositionUnsettled,
 		"externally_unvalidatable_paged":     acceptanceDispositionUnvalidatable,
+		"rollback_offered":                   acceptanceDispositionRollbackOffered,
 	}
 	expect := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
@@ -2487,6 +2498,9 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"retry_unavailable_paged":        "retry_unavailable_paged",
 		"unsettled_paged":                "unsettled_paged",
 		"externally_unvalidatable_paged": "externally_unvalidatable_paged",
+		// E35.3 / #1600: the post-deploy rollback offer. A rename with no mirror
+		// would drop the offer into the no-match rerouting poll arm.
+		"rollback_offered": "rollback_offered",
 	}
 	for k, wantVal := range expect {
 		if want[k] != wantVal {
@@ -2495,7 +2509,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 	}
 
 	// The paged-family predicate: auto-routed dispositions are NOT paged.
-	for _, d := range []string{"paged", "rerun_budget_exhausted", "fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged", "externally_unvalidatable_paged"} {
+	for _, d := range []string{"paged", "rerun_budget_exhausted", "fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged", "externally_unvalidatable_paged", "rollback_offered"} {
 		if !isAcceptancePagedDisposition(d) {
 			t.Errorf("isAcceptancePagedDisposition(%q) = false, want true", d)
 		}
@@ -2540,7 +2554,14 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	// #2512: the empty-disposition arm is a THIRD failed-arm state, so it must
 	// carry the same drive triage prefix.
 	noDisposition := acceptanceStageNextActions(run, acc("succeeded"), false, false, acceptanceVerdictFailed, "").State
-	for _, st := range []string{paged, rerouting, noDisposition} {
+	// E35.3 / #1600: the post-deploy rollback arm's two states are failed-verdict
+	// states too, so they carry the same drive triage prefix.
+	rollbackOffered := acceptanceRollbackOfferedNextActions(run, &acceptanceRollbackOffer{RollbackHandle: "rev-abc"}, acc("succeeded")).State
+	rollbackInitiated := acceptanceRollbackOfferedNextActions(run, &acceptanceRollbackOffer{Initiated: true}, acc("succeeded")).State
+	if rollbackOffered != "acceptance_triage_rollback_offered" || rollbackInitiated != "acceptance_triage_rollback_initiated" {
+		t.Errorf("rollback arm states = %q / %q, want acceptance_triage_rollback_offered / acceptance_triage_rollback_initiated", rollbackOffered, rollbackInitiated)
+	}
+	for _, st := range []string{paged, rerouting, noDisposition, rollbackOffered, rollbackInitiated} {
 		if !strings.HasPrefix(st, string(drive.RuleAcceptanceTriage)) {
 			t.Errorf("failed-arm state %q does not carry the drive triage prefix %q", st, drive.RuleAcceptanceTriage)
 		}
@@ -5761,4 +5782,504 @@ func TestNextActions_ReviewHeadMismatchAdvisory(t *testing.T) {
 			t.Errorf("nil run folded %v, want nothing", na.Actions)
 		}
 	})
+}
+
+// --- E35.3 / #1600: post-deploy rollback offer --------------------------------
+
+// naRollbackTriageEntry is a rollback_offered acceptance_triage_decided entry
+// carrying the EXACT payload keys backend/internal/server.writeAcceptanceTriageAudit
+// writes for the offer (rollback_offer: {deploy_stage_id, deployment_artifact_id,
+// rollback_handle}). TestNextActions_RollbackOffer_ServerProducedRoundTrip pins
+// those keys against the real producer; this literal is the unit-test twin.
+func naRollbackTriageEntry(seq int64, handle string) AuditEntry {
+	return AuditEntry{
+		Category: auditCategoryAcceptanceTriageDecided,
+		Sequence: seq,
+		Payload: map[string]any{
+			"class":       "1",
+			"disposition": acceptanceDispositionRollbackOffered,
+			"rollback_offer": map[string]any{
+				"deploy_stage_id":        "deploy-stage-1",
+				"deployment_artifact_id": "artifact-1",
+				"rollback_handle":        handle,
+			},
+		},
+	}
+}
+
+// naRollbackInitiatedEntry is the run-scoped rollback endpoint's
+// deployment_rollback_initiated entry.
+func naRollbackInitiatedEntry(seq int64) AuditEntry {
+	return AuditEntry{
+		Category: auditCategoryDeploymentRollbackInitiated,
+		Sequence: seq,
+		Payload:  map[string]any{"rollback_handle": "rev-abc"},
+	}
+}
+
+// naReleaseRunIn / naReleaseStages are the release shape the server offers a
+// rollback on: a deploy sequenced before the acceptance stage, no implement.
+func naReleaseRunIn(state string) *Run {
+	r := naReleaseRun()
+	r.State = state
+	return r
+}
+
+func naReleaseStages() []Stage {
+	return []Stage{naStage("deploy", "succeeded"), naStage("acceptance", "succeeded")}
+}
+
+// naNextActionsFromRecent drives nextActionsFor with every acceptance signal
+// derived from recent by the SAME helpers both production call sites use, and
+// RollbackOffer threaded the way tools.go / run_stage.go thread it.
+func naNextActionsFromRecent(run *Run, stages []Stage, recent []AuditEntry, release releaseSignals) *NextActions {
+	release.RollbackOffer = acceptanceRollbackOfferIn(recent)
+	return nextActionsFor(run, stages, nil, nil, nil, nil, false, false,
+		acceptanceArbitratedIn(recent), latestAcceptanceVerdict(recent), latestAcceptanceTriageDisposition(recent), release)
+}
+
+// TestNextActions_AcceptanceRollbackOffered (C16): a failed post-deploy verdict
+// whose triage recorded rollback_offered takes the
+// acceptance_triage_rollback_offered arm — for a SUCCEEDED release run (a failed
+// verdict settles the acceptance stage succeeded, so the run is often already
+// succeeded) AND a RUNNING one (which would otherwise reach the release loop
+// arm). The arm reads the evidence, offers the operator-gated deploy_rollback
+// verb carrying the stored handle, then arbitration — never the merge ritual.
+// Without the arm a succeeded release run reads {State: succeeded} with no
+// actions, and a running one reads the release-loop notes_ready arm.
+func TestNextActions_AcceptanceRollbackOffered(t *testing.T) {
+	recent := []AuditEntry{naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed)}
+	for _, state := range []string{"succeeded", "running"} {
+		t.Run(state, func(t *testing.T) {
+			run := naReleaseRunIn(state)
+			na := naNextActionsFromRecent(run, naReleaseStages(), recent, releaseSignals{IsRelease: true, DeployState: "succeeded"})
+			if na == nil || na.State != "acceptance_triage_rollback_offered" {
+				t.Fatalf("state = %+v, want acceptance_triage_rollback_offered", na)
+			}
+			want := []string{"fishhawk_list_audit", "deploy_rollback", "fishhawk_arbitrate_acceptance"}
+			if got := actionNames(na); !slices.Equal(got, want) {
+				t.Fatalf("actions = %v, want %v", got, want)
+			}
+			if p := na.Actions[0].Params; p["category"] != auditCategoryAcceptanceTriageDecided || p["run_id"] != run.ID {
+				t.Errorf("list_audit params = %v, want the acceptance_triage_decided read for run %s", p, run.ID)
+			}
+			rb := findAction(t, na, "deploy_rollback")
+			if rb.Params["rollback_handle"] != "rev-abc" || rb.Params["deployment_artifact_id"] != "artifact-1" ||
+				rb.Params["deploy_stage_id"] != "deploy-stage-1" || rb.Params["run_id"] != run.ID {
+				t.Errorf("deploy_rollback params = %v, want run_id + the stored handle rev-abc + artifact-1 + deploy-stage-1", rb.Params)
+			}
+			for _, phrase := range []string{"fishhawk deploy rollback " + run.ID, "/v0/runs/{run_id}/deployment/rollback", "fishhawk_rollback_handle", "params.rollback_handle"} {
+				if !strings.Contains(rb.Reason, phrase) {
+					t.Errorf("deploy_rollback reason %q does not name %q", rb.Reason, phrase)
+				}
+			}
+			// The pipeline-supplied handle is untrusted free text: it rides ONLY
+			// in the structured params, never in any prose an operator agent
+			// reads as instructions.
+			for _, a := range na.Actions {
+				if strings.Contains(a.Reason, "rev-abc") || strings.Contains(a.Precondition, "rev-abc") {
+					t.Errorf("%s prose embeds the pipeline-supplied rollback_handle: reason %q precondition %q", a.Action, a.Reason, a.Precondition)
+				}
+			}
+			if !strings.Contains(rb.Precondition, "Operator-gated") {
+				t.Errorf("deploy_rollback precondition %q should say the rollback is operator-gated", rb.Precondition)
+			}
+			for _, banned := range []string{"approve_pr", "fishhawk_merge_run", "merge_and_file_follow_up"} {
+				if nextActionOffered(na, banned) {
+					t.Errorf("the rollback-offered arm must never offer %s; got %v", banned, actionNames(na))
+				}
+			}
+		})
+	}
+}
+
+// TestNextActions_AcceptanceRollbackOffered_NoHandle covers the two degraded
+// offers: a recorded offer with NO stored handle (the deploy recorded none) and
+// an offer the caller did not thread (nil). Both still name the rollback verb
+// — the endpoint re-reads the handle itself — but neither carries a
+// rollback_handle param, and each reason says why.
+func TestNextActions_AcceptanceRollbackOffered_NoHandle(t *testing.T) {
+	run := naReleaseRunIn("succeeded")
+	acc := naStage("acceptance", "succeeded")
+
+	empty := acceptanceRollbackOfferedNextActions(run, &acceptanceRollbackOffer{DeployStageID: "deploy-stage-1"}, &acc)
+	rb := findAction(t, empty, "deploy_rollback")
+	if _, ok := rb.Params["rollback_handle"]; ok {
+		t.Errorf("an empty stored handle must omit the rollback_handle param; got %v", rb.Params)
+	}
+	if _, ok := rb.Params["deployment_artifact_id"]; ok {
+		t.Errorf("an empty artifact id must omit the deployment_artifact_id param; got %v", rb.Params)
+	}
+	if !strings.Contains(rb.Reason, "recorded no rollback_handle") {
+		t.Errorf("reason %q should say the deploy recorded no handle", rb.Reason)
+	}
+
+	unthreaded := acceptanceRollbackOfferedNextActions(run, nil, nil)
+	if unthreaded.State != "acceptance_triage_rollback_offered" {
+		t.Fatalf("nil offer state = %q, want acceptance_triage_rollback_offered", unthreaded.State)
+	}
+	rb = findAction(t, unthreaded, "deploy_rollback")
+	if len(rb.Params) != 1 || rb.Params["run_id"] != run.ID {
+		t.Errorf("nil offer params = %v, want only run_id", rb.Params)
+	}
+	if !strings.Contains(rb.Reason, "read it from the acceptance_triage_decided rollback_offer payload") {
+		t.Errorf("nil offer reason %q should point at the audit for the handle", rb.Reason)
+	}
+}
+
+// TestNextActions_AcceptanceRollbackInitiated (C17): once a
+// deployment_rollback_initiated entry is newer than the rollback_offered triage
+// entry the offer was taken, so the arm switches to
+// acceptance_triage_rollback_initiated and NEVER offers a second rollback.
+// Without the Initiated branch the same snapshot would keep offering
+// deploy_rollback.
+func TestNextActions_AcceptanceRollbackInitiated(t *testing.T) {
+	recent := []AuditEntry{
+		naRollbackInitiatedEntry(12),
+		naRollbackTriageEntry(11, "rev-abc"),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	na := naNextActionsFromRecent(naReleaseRunIn("succeeded"), naReleaseStages(), recent, releaseSignals{IsRelease: true})
+	if na == nil || na.State != "acceptance_triage_rollback_initiated" {
+		t.Fatalf("state = %+v, want acceptance_triage_rollback_initiated", na)
+	}
+	if nextActionOffered(na, "deploy_rollback") {
+		t.Fatalf("a taken rollback offer must not suggest a second rollback; got %v", actionNames(na))
+	}
+	want := []string{"fishhawk_list_audit", "fishhawk_get_run_status"}
+	if got := actionNames(na); !slices.Equal(got, want) {
+		t.Fatalf("actions = %v, want %v", got, want)
+	}
+	if na.Actions[0].Params["category"] != auditCategoryDeploymentRollbackCompleted {
+		t.Errorf("list_audit category = %q, want %q", na.Actions[0].Params["category"], auditCategoryDeploymentRollbackCompleted)
+	}
+}
+
+// TestNextActions_AcceptanceRollbackInitiated_NilAcceptanceStage: the Initiated
+// branch derives its poll interval off the acceptance stage, which is nil when
+// the stage list is empty or stale. It must still return the initiated state
+// with its poll (the interval falls back to the default) rather than panic.
+func TestNextActions_AcceptanceRollbackInitiated_NilAcceptanceStage(t *testing.T) {
+	run := naReleaseRunIn("succeeded")
+	direct := acceptanceRollbackOfferedNextActions(run, &acceptanceRollbackOffer{Initiated: true}, nil)
+	recent := []AuditEntry{
+		naRollbackInitiatedEntry(12),
+		naRollbackTriageEntry(11, "rev-abc"),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	viaClassify := naNextActionsFromRecent(run, nil, recent, releaseSignals{IsRelease: true})
+	for name, na := range map[string]*NextActions{"direct": direct, "no stages": viaClassify} {
+		if na == nil || na.State != "acceptance_triage_rollback_initiated" {
+			t.Fatalf("%s: state = %+v, want acceptance_triage_rollback_initiated", name, na)
+		}
+		poll := findAction(t, na, "fishhawk_get_run_status")
+		if want := strconv.Itoa(suggestedStageWaitPollIntervalSeconds); poll.Params["poll_interval_seconds"] != want {
+			t.Errorf("%s: poll interval = %q, want the default %s for a nil acceptance stage", name, poll.Params["poll_interval_seconds"], want)
+		}
+	}
+}
+
+// TestNextActions_AcceptanceRollbackOffered_CancelledRunSkipsArm: a CANCELLED
+// release run carrying a stale rollback_offered triage reads the bare terminal
+// state — the operator ended the run, so no rollback is re-offered. A FAILED
+// run keeps the arm (its deploy is still live). Without the cancelled guard the
+// cancelled row reads acceptance_triage_rollback_offered with deploy_rollback.
+func TestNextActions_AcceptanceRollbackOffered_CancelledRunSkipsArm(t *testing.T) {
+	recent := []AuditEntry{naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed)}
+	cancelled := naNextActionsFromRecent(naReleaseRunIn("cancelled"), naReleaseStages(), recent, releaseSignals{IsRelease: true, DeployState: "succeeded"})
+	if cancelled == nil || cancelled.State != "cancelled" {
+		t.Fatalf("cancelled run state = %+v, want the bare cancelled state", cancelled)
+	}
+	if nextActionOffered(cancelled, "deploy_rollback") {
+		t.Errorf("a cancelled run must not re-offer a rollback; got %v", actionNames(cancelled))
+	}
+	failed := naNextActionsFromRecent(naReleaseRunIn("failed"), naReleaseStages(), recent, releaseSignals{IsRelease: true, DeployState: "succeeded"})
+	if failed == nil || failed.State != "acceptance_triage_rollback_offered" || !nextActionOffered(failed, "deploy_rollback") {
+		t.Errorf("a failed release run must keep the rollback offer; got %+v", failed)
+	}
+}
+
+// TestNextActions_AcceptanceRollbackOffered_ArbitratedSkipsArm (C19): an
+// operator arbitration bound to the verdict is the keep-the-deploy discharge,
+// so the rollback arm is NOT taken.
+func TestNextActions_AcceptanceRollbackOffered_ArbitratedSkipsArm(t *testing.T) {
+	recent := []AuditEntry{
+		naArbitrationEntry(12, 10),
+		naRollbackTriageEntry(11, "rev-abc"),
+		naOutcomeEntry(10, acceptanceVerdictFailed),
+	}
+	if !acceptanceArbitratedIn(recent) {
+		t.Fatal("fixture precondition: the arbitration must discharge the newest verdict")
+	}
+	na := naNextActionsFromRecent(naReleaseRunIn("succeeded"), naReleaseStages(), recent, releaseSignals{IsRelease: true})
+	if na == nil {
+		t.Fatal("nil next_actions")
+	}
+	if strings.HasPrefix(na.State, "acceptance_triage_rollback") || nextActionOffered(na, "deploy_rollback") {
+		t.Fatalf("an arbitrated verdict must not take the rollback arm; got state %q actions %v", na.State, actionNames(na))
+	}
+}
+
+// TestNextActions_RollbackArm_FeatureChangeUnchanged is the regression row: a
+// failed + paged verdict on an implement-bearing feature_change run still reads
+// acceptance_triage_paged with RollbackOffer threaded (nil — not a
+// rollback_offered disposition), so the new arm is inert outside its
+// disposition.
+func TestNextActions_RollbackArm_FeatureChangeUnchanged(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	recent := []AuditEntry{rsTriageEntry(11, acceptanceDispositionPaged), naOutcomeEntry(10, acceptanceVerdictFailed)}
+	if acceptanceRollbackOfferIn(recent) != nil {
+		t.Fatal("a paged disposition must yield no rollback offer")
+	}
+	release := releaseSignals{RollbackOffer: acceptanceRollbackOfferIn(recent)}
+	na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil, naReviewStatus("implement", "complete"), nil, nil,
+		false, false, false, latestAcceptanceVerdict(recent), latestAcceptanceTriageDisposition(recent), release)
+	if na == nil || na.State != "acceptance_triage_paged" {
+		t.Fatalf("state = %+v, want acceptance_triage_paged", na)
+	}
+	if nextActionOffered(na, "deploy_rollback") {
+		t.Errorf("a feature_change paged triage must not offer a rollback; got %v", actionNames(na))
+	}
+}
+
+// TestAcceptanceRollbackOfferIn (C18) pins the correlation: the offer pairs
+// only with a triage entry strictly NEWER than the newest verdict (the SAME
+// rule latestAcceptanceTriageDisposition applies, via
+// correlatedAcceptanceTriageIndex), Initiated only for a rollback entry newer
+// than that triage entry, and no payload shape panics.
+func TestAcceptanceRollbackOfferIn(t *testing.T) {
+	malformedOffer := naRollbackTriageEntry(11, "")
+	malformedOffer.Payload = map[string]any{"disposition": acceptanceDispositionRollbackOffered, "rollback_offer": "not-an-object"}
+	nonStringFields := naRollbackTriageEntry(11, "")
+	nonStringFields.Payload = map[string]any{
+		"disposition":    acceptanceDispositionRollbackOffered,
+		"rollback_offer": map[string]any{"rollback_handle": float64(7), "deploy_stage_id": true},
+	}
+	nonObjectPayload := AuditEntry{Category: auditCategoryAcceptanceTriageDecided, Sequence: 11, Payload: "garbage"}
+
+	cases := []struct {
+		name   string
+		recent []AuditEntry
+		want   *acceptanceRollbackOffer
+	}{
+		{"no verdict", []AuditEntry{naRollbackTriageEntry(11, "rev-abc")}, nil},
+		{"stale offer below the newest verdict", []AuditEntry{
+			naOutcomeEntry(12, acceptanceVerdictFailed), naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed),
+		}, nil},
+		{"non-rollback disposition", []AuditEntry{rsTriageEntry(11, acceptanceDispositionPaged), naOutcomeEntry(10, acceptanceVerdictFailed)}, nil},
+		{"non-object payload", []AuditEntry{nonObjectPayload, naOutcomeEntry(10, acceptanceVerdictFailed)}, nil},
+		{"offer correlated, not initiated", []AuditEntry{naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed)},
+			&acceptanceRollbackOffer{DeployStageID: "deploy-stage-1", DeploymentArtifactID: "artifact-1", RollbackHandle: "rev-abc"}},
+		{"initiated OLDER than the triage entry", []AuditEntry{
+			naRollbackTriageEntry(12, "rev-abc"), naRollbackInitiatedEntry(11), naOutcomeEntry(10, acceptanceVerdictFailed),
+		}, &acceptanceRollbackOffer{DeployStageID: "deploy-stage-1", DeploymentArtifactID: "artifact-1", RollbackHandle: "rev-abc"}},
+		{"initiated NEWER than the triage entry", []AuditEntry{
+			naRollbackInitiatedEntry(12), naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed),
+		}, &acceptanceRollbackOffer{DeployStageID: "deploy-stage-1", DeploymentArtifactID: "artifact-1", RollbackHandle: "rev-abc", Initiated: true}},
+		{"rollback_offer not an object", []AuditEntry{malformedOffer, naOutcomeEntry(10, acceptanceVerdictFailed)}, &acceptanceRollbackOffer{}},
+		{"non-string offer fields", []AuditEntry{nonStringFields, naOutcomeEntry(10, acceptanceVerdictFailed)}, &acceptanceRollbackOffer{}},
+		{"nil slice", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := acceptanceRollbackOfferIn(tc.recent)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("acceptanceRollbackOfferIn = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRollbackOfferVocabularyMatchesBackend pins the mirrored literals the
+// rollback arm reads against the backend's EXPORTED category constants, and
+// the unexported disposition / payload-key literals verbatim.
+func TestRollbackOfferVocabularyMatchesBackend(t *testing.T) {
+	if auditCategoryDeploymentRollbackInitiated != server.CategoryDeploymentRollbackInitiated {
+		t.Errorf("deployment_rollback_initiated mirror = %q, want %q", auditCategoryDeploymentRollbackInitiated, server.CategoryDeploymentRollbackInitiated)
+	}
+	if auditCategoryDeploymentRollbackCompleted != server.CategoryDeploymentRollbackCompleted {
+		t.Errorf("deployment_rollback_completed mirror = %q, want %q", auditCategoryDeploymentRollbackCompleted, server.CategoryDeploymentRollbackCompleted)
+	}
+	if acceptanceDispositionRollbackOffered != "rollback_offered" || acceptanceRollbackOfferField != "rollback_offer" {
+		t.Errorf("rollback literals drifted: disposition=%q field=%q", acceptanceDispositionRollbackOffered, acceptanceRollbackOfferField)
+	}
+	if !isAcceptancePagedDisposition(acceptanceDispositionRollbackOffered) {
+		t.Error("rollback_offered must be a paged-family disposition (it pages the human, matching server acceptanceDispositionPages)")
+	}
+}
+
+// TestGetRunStatus_RollbackOffer_ThreadsHandle (C21): the get_run_status
+// wiring — tools.go derives the offer off the recent-audit slice and threads it
+// into the classifier, so the stored handle reaches next_actions over the wire
+// (fake backend JSON -> MCP client decode -> classifier). Deleting the
+// `release.RollbackOffer = ...` line leaves the arm with a nil offer, so the
+// rollback_handle param disappears.
+func TestGetRunStatus_RollbackOffer_ThreadsHandle(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "release", State: "succeeded"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 0, Type: "deploy", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "acceptance", State: "succeeded"},
+	}
+	triage := naRollbackTriageEntry(11, "rev-abc")
+	triage.ID, triage.RunID, triage.EntryHash = uuid.NewString(), runID.String(), "h2"
+	outcome := naOutcomeEntry(10, acceptanceVerdictFailed)
+	outcome.ID, outcome.RunID, outcome.EntryHash = uuid.NewString(), runID.String(), "h1"
+	fb.auditByRun[runID] = []AuditEntry{triage, outcome}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil || out.NextActions.State != "acceptance_triage_rollback_offered" {
+		t.Fatalf("next_actions = %+v, want acceptance_triage_rollback_offered", out.NextActions)
+	}
+	if rb := findAction(t, out.NextActions, "deploy_rollback"); rb.Params["rollback_handle"] != "rev-abc" {
+		t.Errorf("deploy_rollback params = %v, want rollback_handle rev-abc threaded by tools.go", rb.Params)
+	}
+}
+
+// TestRunStage_RollbackOffer_ThreadsHandle is approval condition 2: the
+// run_stage surface threads the offer too. It drives the REAL runStage handler
+// for the acceptance stage of a release-shaped run whose window carries a
+// rollback_offered triage; reverting run_stage.go's
+// `releaseSignals{RollbackOffer: acceptanceRollbackOfferIn(recentAudit)}` to
+// `releaseSignals{}` drops the rollback_handle param.
+func TestRunStage_RollbackOffer_ThreadsHandle(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	fb.mu.Lock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", WorkflowID: "release"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 0, Type: "deploy", State: "succeeded"},
+		{ID: acceptanceID.String(), RunID: runID.String(), Sequence: 1, Type: "acceptance", State: "succeeded"},
+	}
+	fb.auditByRun[runID] = []AuditEntry{naRollbackTriageEntry(11, "rev-abc"), naOutcomeEntry(10, acceptanceVerdictFailed)}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_triage_rollback_offered" {
+		t.Fatalf("next_actions.state = %q, want acceptance_triage_rollback_offered", out.NextActions.State)
+	}
+	if rb := findAction(t, out.NextActions, "deploy_rollback"); rb.Params["rollback_handle"] != "rev-abc" {
+		t.Errorf("deploy_rollback params = %v, want rollback_handle rev-abc threaded by run_stage.go", rb.Params)
+	}
+}
+
+// TestNextActions_RollbackOffer_ServerProducedRoundTrip is approval condition 5:
+// a SERVER-PRODUCED rollback offer reaches the MCP consumer. Nothing in the
+// audit payload here is handwritten — the acceptance_triage_decided entry is
+// written by the REAL triage path: a failed (failure_mode=error) verdict is
+// POSTed to the real POST /v0/runs/{run_id}/acceptance handler as an operator
+// bearer, on a release-shaped run persisted in real Postgres (deploy seq 0 +
+// acceptance seq 1, both succeeded, no implement stage) whose deploy stage
+// carries a stored deployment record with rollback_handle rev-abc. The handler
+// triages (decidePostDeployRollback -> storedRollbackHandleFor ->
+// writeAcceptanceTriageAudit), the real GET /v0/runs/{run_id}/audit serves the
+// chained entry, the real MCP client (client.go) decodes it inside
+// getRunStatus, and next_actions must name the rollback verb with the handle.
+// A json-tag drift on either side of the mirrored rollback_offer keys, or a
+// producer that stops writing the offer, drops rollback_handle and turns this
+// RED.
+func TestNextActions_RollbackOffer_ServerProducedRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runmodel.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runmodel.CreateRunParams{
+		Repo: "x/y", WorkflowID: "release", WorkflowSHA: "abc", TriggerSource: runmodel.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	newSettledStage := func(seq int, typ runmodel.StageType) *runmodel.Stage {
+		t.Helper()
+		st, err := runRepo.CreateStage(ctx, runmodel.CreateStageParams{
+			RunID: row.ID, Sequence: seq, Type: typ, ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create %s stage: %v", typ, err)
+		}
+		for _, to := range []runmodel.StageState{runmodel.StageStateDispatched, runmodel.StageStateRunning, runmodel.StageStateSucceeded} {
+			if _, err := runRepo.TransitionStage(ctx, st.ID, to, nil); err != nil {
+				t.Fatalf("transition %s stage to %s: %v", typ, to, err)
+			}
+		}
+		return st
+	}
+	deploy := newSettledStage(0, runmodel.StageTypeDeploy)
+	acceptance := newSettledStage(1, runmodel.StageTypeAcceptance)
+
+	// The pipeline's forward deployment record carrying the rollback_handle the
+	// triage reads back through storedRollbackHandleFor.
+	deployBody := []byte(`{"environment":"staging","ref":"main","outcome":"succeeded","rollback_handle":"rev-abc"}`)
+	sum := sha256.Sum256(deployBody)
+	deployArt, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: deploy.ID, Kind: artifact.KindDeployment, Content: deployBody, ContentHash: hex.EncodeToString(sum[:]),
+	})
+	if err != nil {
+		t.Fatalf("create deployment artifact: %v", err)
+	}
+
+	const bearer = "fhk_rollback_offer_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:runs"}, PlainText: bearer,
+	}}
+	srv := server.New(server.Config{
+		RunRepo: runRepo, ArtifactRepo: artRepo, AuditRepo: auditRepo,
+		SigningRepo: signing.NewPostgresRepository(pool), APITokenRepo: tokRepo,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// The producer under test: the real acceptance ship handler triages the
+	// failed verdict and writes the acceptance_triage_decided entry.
+	verdict := []byte(`{"verdict":"failed","failure_mode":"error","notes":"post-deploy smoke check returned 500"}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		ts.URL+"/v0/runs/"+row.ID.String()+"/acceptance?stage_id="+acceptance.ID.String(), bytes.NewReader(verdict))
+	if err != nil {
+		t.Fatalf("build ship request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ship acceptance: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("ship acceptance = %d, want 201:\n%s", resp.StatusCode, body)
+	}
+
+	// The consumer: the real MCP client decodes the served audit inside
+	// getRunStatus and the classifier builds next_actions from it.
+	r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: bearer}), getenv: envFuncFromMap(nil)}
+	_, out, err := r.getRunStatus(ctx, nil, GetRunStatusInput{RunID: row.ID.String(), AuditLimit: 20})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil || out.NextActions.State != "acceptance_triage_rollback_offered" {
+		t.Fatalf("next_actions = %+v, want acceptance_triage_rollback_offered from the server-produced triage", out.NextActions)
+	}
+	rb := findAction(t, out.NextActions, "deploy_rollback")
+	if rb.Params["rollback_handle"] != "rev-abc" {
+		t.Errorf("deploy_rollback rollback_handle = %q, want rev-abc from the server-produced rollback_offer", rb.Params["rollback_handle"])
+	}
+	if rb.Params["deployment_artifact_id"] != deployArt.ID.String() || rb.Params["deploy_stage_id"] != deploy.ID.String() {
+		t.Errorf("deploy_rollback params = %v, want deployment_artifact_id %s + deploy_stage_id %s", rb.Params, deployArt.ID, deploy.ID)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_merge_run") || nextActionOffered(out.NextActions, "approve_pr") {
+		t.Errorf("the server-produced offer must never surface the merge ritual; got %v", actionNames(out.NextActions))
+	}
 }

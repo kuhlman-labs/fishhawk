@@ -31,14 +31,18 @@ const rollbackDispatchInput = "fishhawk_rollback"
 
 // rollbackResponse is the 202 body of POST /v0/runs/{run_id}/deployment/rollback.
 // It echoes the external rollback run handle so an operator (or the issue
-// timeline) can follow the rollback pipeline to its terminal outcome.
+// timeline) can follow the rollback pipeline to its terminal outcome, plus the
+// stored rollback_handle the re-dispatch carried and the deployment artifact it
+// was read from (E35.3 / #1600; both omitted when empty — additive).
 type rollbackResponse struct {
-	RunID          string `json:"run_id"`
-	StageID        string `json:"stage_id"`
-	Target         string `json:"target"`
-	GHARunID       int64  `json:"gha_run_id,omitempty"`
-	ExternalRunURL string `json:"external_run_url,omitempty"`
-	Message        string `json:"message"`
+	RunID                string `json:"run_id"`
+	StageID              string `json:"stage_id"`
+	Target               string `json:"target"`
+	GHARunID             int64  `json:"gha_run_id,omitempty"`
+	ExternalRunURL       string `json:"external_run_url,omitempty"`
+	RollbackHandle       string `json:"rollback_handle,omitempty"`
+	DeploymentArtifactID string `json:"deployment_artifact_id,omitempty"`
+	Message              string `json:"message"`
 }
 
 // handleRollbackDeployment implements POST /v0/runs/{run_id}/deployment/rollback.
@@ -64,6 +68,18 @@ type rollbackResponse struct {
 // pipeline that does NOT call back is a deferred follow-up: the deploy
 // reconciler scans only awaiting_deployment stages, and a rolled-back deploy
 // stage is already terminal.)
+//
+// Stored rollback_handle (E35.3 / #1600, ADR-053): before dispatching, the
+// handler reads the deploy stage's stored deployment artifacts and selects the
+// newest FORWARD record carrying a non-empty rollback_handle
+// (storedRollbackHandleFor). The handle rides the re-dispatch as the
+// workflow_dispatch input fishhawk_rollback_handle (github_actions) or as
+// variables.FISHHAWK_ROLLBACK_HANDLE (webhook) — in both cases ONLY when
+// non-empty — and is echoed with its deployment_artifact_id on the
+// deployment_rollback_initiated payload and the 202 body. A failed artifact
+// read refuses 500 and dispatches NOTHING: firing a rollback without the
+// revert reference the pipeline returned is the worse outcome, and the
+// refusal is retryable.
 //
 // Auth: operator-only (an authenticated bearer with write:runs scope). A
 // rollback is never runner-initiated, so there is no Ed25519 signature path. A
@@ -166,6 +182,16 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Read the stored rollback_handle BEFORE any dispatch, failing closed: a
+	// read error must never degrade into a handle-less rollback firing.
+	stored, err := s.storedRollbackHandleFor(r.Context(), deployStage.ID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"read stored rollback_handle failed; no rollback was dispatched",
+			map[string]any{"error": err.Error(), "stage_id": deployStage.ID.String()})
+		return
+	}
+
 	delegate, err := deployDelegateForRun(runRow)
 	if err != nil {
 		s.writeError(w, r, http.StatusUnprocessableEntity, "rollback_unconfigured",
@@ -174,7 +200,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	target, ghaRunID, externalURL, hook, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate)
+	target, ghaRunID, externalURL, hook, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate, stored.Handle)
 	if derr != nil {
 		s.writeError(w, r, derr.status, derr.code, derr.message, derr.details)
 		return
@@ -200,6 +226,10 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		"dispatched_at":    dispatchedAt.Format(time.RFC3339),
 		"auth_method":      "bearer",
 		"actor_subject":    subj,
+		// The stored rollback reference the re-dispatch carried (E35.3 /
+		// #1600); both empty when the deploy recorded no handle.
+		"rollback_handle":        stored.Handle,
+		"deployment_artifact_id": stored.artifactIDString(),
 	}
 	if hook != nil && hook.SecretEnv != "" {
 		// Webhook secret channel NAMES only (E45.57 / #3497), matching the
@@ -228,11 +258,13 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 	s.notifyOperatorVisible(r.Context(), runID, CategoryDeploymentRollbackInitiated)
 
 	s.writeJSON(w, r, http.StatusAccepted, rollbackResponse{
-		RunID:          runID.String(),
-		StageID:        deployStage.ID.String(),
-		Target:         target,
-		GHARunID:       ghaRunID,
-		ExternalRunURL: externalURL,
+		RunID:                runID.String(),
+		StageID:              deployStage.ID.String(),
+		Target:               target,
+		GHARunID:             ghaRunID,
+		ExternalRunURL:       externalURL,
+		RollbackHandle:       stored.Handle,
+		DeploymentArtifactID: stored.artifactIDString(),
 		Message: "rollback re-dispatched; deployment_rollback_completed and the " +
 			"rolled_back outcome are recorded when the rollback run reaches terminal " +
 			"(the external pipeline calls back into POST /v0/runs/{run_id}/deployment).",
@@ -256,15 +288,17 @@ func (e *rollbackDispatchError) Error() string { return e.code + ": " + e.messag
 // same workflow_ref carrying the fishhawk correlation + rollbackDispatchInput,
 // then best-effort resolves the rollback run id (the dispatch endpoint returns
 // 204 with no body, mirroring slice-1's trigger). webhook POSTs a rollback
-// payload to the delegate URL. A dispatch failure returns a *rollbackDispatchError
-// the handler maps to the response.
-func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (target string, ghaRunID int64, externalURL string, hook *webhookDeployResult, derr *rollbackDispatchError) {
+// payload to the delegate URL. rollbackHandle, when non-empty, is the stored
+// deployment rollback_handle each target carries to the pipeline (E35.3 /
+// #1600). A dispatch failure returns a *rollbackDispatchError the handler maps
+// to the response.
+func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (target string, ghaRunID int64, externalURL string, hook *webhookDeployResult, derr *rollbackDispatchError) {
 	switch delegate.Target {
 	case spec.DelegateTargetGitHubActions:
-		target, ghaRunID, externalURL, derr = s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate)
+		target, ghaRunID, externalURL, derr = s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate, rollbackHandle)
 		return target, ghaRunID, externalURL, nil, derr
 	case spec.DelegateTargetWebhook:
-		return s.dispatchRollbackWebhook(ctx, runRow, stage, delegate)
+		return s.dispatchRollbackWebhook(ctx, runRow, stage, delegate, rollbackHandle)
 	default:
 		return "", 0, "", nil, &rollbackDispatchError{
 			status:  http.StatusUnprocessableEntity,
@@ -275,7 +309,7 @@ func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *r
 	}
 }
 
-func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (string, int64, string, *rollbackDispatchError) {
+func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (string, int64, string, *rollbackDispatchError) {
 	if delegate.WorkflowRef == "" {
 		return "", 0, "", &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
@@ -313,9 +347,20 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 		"fishhawk_stage_id":   stage.ID.String(),
 		rollbackDispatchInput: "true",
 	}
+	// The dispatch inputs are a COPY of the correlation map plus, only when
+	// non-empty, the stored rollback_handle (E35.3 / #1600). The correlation
+	// map ResolveDispatchedRun matches against stays exactly the three markers,
+	// so the handle never becomes part of run-id resolution.
+	inputs := make(map[string]string, len(correlation)+1)
+	for k, v := range correlation {
+		inputs[k] = v
+	}
+	if rollbackHandle != "" {
+		inputs[rollbackHandleDispatchInput] = rollbackHandle
+	}
 	dispatchedAt := time.Now().UTC()
 	if err := s.cfg.GitHub.DispatchWorkflow(ctx, scope, repo,
-		delegate.WorkflowRef, branch, githubclient.DispatchInputs(correlation)); err != nil {
+		delegate.WorkflowRef, branch, githubclient.DispatchInputs(inputs)); err != nil {
 		return "", 0, "", &rollbackDispatchError{
 			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
 			message: "workflow_dispatch of the rollback path failed",
@@ -353,17 +398,29 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 // dispatcher as the forward trigger (postWebhookDeploy; E45.57 / #3497), so the
 // rollback carries the same secret channel, the same redirect refusal, the same
 // error classification and the same redaction: a missing secret names the
-// variable, never its value; a non-2xx carries ONLY {status, url}. It returns
-// the secret_env / secret_placement NAMES for the deployment_rollback_initiated
-// payload.
-func (s *Server) dispatchRollbackWebhook(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig) (string, int64, string, *webhookDeployResult, *rollbackDispatchError) {
+// variable, never its value; a non-2xx carries ONLY {status, url}. A non-empty
+// rollbackHandle rides variables.FISHHAWK_ROLLBACK_HANDLE (E35.3 / #1600) — the
+// already-reserved variables object, so the body's top-level key set is
+// unchanged. It returns the secret_env / secret_placement NAMES for the
+// deployment_rollback_initiated payload.
+func (s *Server) dispatchRollbackWebhook(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (string, int64, string, *webhookDeployResult, *rollbackDispatchError) {
 	if delegate.URL == "" {
 		return "", 0, "", nil, &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
 			message: "webhook delegate is missing url",
 		}
 	}
-	res, werr := s.postWebhookDeploy(ctx, stage, delegate, webhookTriggerBody(stage, runRow, true))
+	body := webhookTriggerBody(stage, runRow, true)
+	if rollbackHandle != "" {
+		// webhookTriggerBody (same package) always builds variables as a
+		// map[string]string. Should that shape ever change, the handle would
+		// silently stop riding the body, which
+		// TestRollbackDeployment_Webhook_CarriesStoredHandle fails on.
+		if vars, ok := body["variables"].(map[string]string); ok {
+			vars[rollbackHandleWebhookVariable] = rollbackHandle
+		}
+	}
+	res, werr := s.postWebhookDeploy(ctx, stage, delegate, body)
 	if werr != nil {
 		return "", 0, "", nil, &rollbackDispatchError{
 			status: http.StatusBadGateway, code: "rollback_dispatch_failed",

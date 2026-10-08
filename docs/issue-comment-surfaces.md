@@ -509,7 +509,10 @@ Notes:
     and the disposition needs a human — the paged variants only (`paged`,
     `rerun_budget_exhausted`, `fixup_unavailable_paged`, `retry_unavailable_paged`,
     `unsettled_paged`, `externally_unvalidatable_paged` — the class-5 all-skip
-    externally-unvalidatable terminal page, #1671). The auto-routed dispositions (`fixup_dispatched`,
+    externally-unvalidatable terminal page, #1671 — and `rollback_offered`, the
+    E35.3 / #1600 operator-gated post-deploy rollback offer, which the backend
+    never auto-fires; the ping names only the class and disposition and never
+    renders the payload's pipeline-supplied `rollback_offer.rollback_handle`). The auto-routed dispositions (`fixup_dispatched`,
     `retry_dispatched`) stay **edit-only** — the fixup/retry surfaces already
     render, so a ping there would double-notify. The paged variants are
     otherwise silent on anchor edits, so they get a page-class ping: "🔎
@@ -1445,14 +1448,20 @@ Notes:
   `acceptance_triage_decided`. **`acceptance_triage_decided` is now WRITTEN by
   E31.8** — one chained entry per triaged failed verdict, payload
   `{run_id, stage_id, artifact_id, class, disposition, criterion_ids,
-  failure_mode, prior_routed_passes, reason}`. The **disposition vocabulary**
+  failure_mode, prior_routed_passes, reason}` (plus `plan_review_miss` on
+  class 3, and `rollback_offer: {deploy_stage_id, deployment_artifact_id,
+  rollback_handle}` on `rollback_offered`). The **disposition vocabulary**
   is a closed set: the auto-routed `fixup_dispatched` (class-1 → bounded
   implement fix-up) / `retry_dispatched` (class-2 → acceptance-stage reopen);
   and the human-paged `paged` (class-3/class-4) / `rerun_budget_exhausted` (the
   per-run re-run cap of 2 hit) / `fixup_unavailable_paged` (a class-1 fix-up
   route refused — budget/ceiling/not-applicable) / `retry_unavailable_paged` (a
   class-2 reopen refused) / `unsettled_paged` (the acceptance stage was not yet
-  settled `succeeded` at ship time). The auto-routed dispositions stay
+  settled `succeeded` at ship time) / `externally_unvalidatable_paged` (class 5,
+  #1671) / `rollback_offered` (E35.3 / #1600: a class-1/class-4 failed verdict on
+  a post-deploy acceptance stage of a run with no implement stage — an
+  operator-gated rollback offer, never auto-fired; a multi-deploy run records
+  `paged` instead, #2642). The auto-routed dispositions stay
   render-only edit surfaces; the paged variants ALSO fire the page-class ping
   registered above. The class-3 entry keyed by `criterion_ids` is the durable
   per-criterion disposition record E31.11 consumes.

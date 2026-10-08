@@ -748,7 +748,9 @@ at **2 auto re-runs** per run):
 At the re-run budget, or when the fix-up/retry route is unavailable, the
 disposition degrades to a paged variant (`rerun_budget_exhausted`,
 `fixup_unavailable_paged`, `retry_unavailable_paged`, `unsettled_paged`) so
-non-convergence always lands on the human.
+non-convergence always lands on the human. A failed post-deploy verdict on a
+release-shaped run records the paged `rollback_offered` instead (see "Post-deploy
+rollback offer" below).
 
 **LOCAL-runner re-open rule.** An auto-routed re-open (`fixup_dispatched` or
 `retry_dispatched`) re-opens the stage server-side but **never spawns the local
@@ -779,6 +781,35 @@ and `fishhawk_arbitrate_acceptance` is the only verb that discharges the gate.
 `fishhawk_fixup_stage` (a manual fix-up pass, consumes the shared fix-up budget),
 `merge_and_file_follow_up` (accept-and-ship, e.g. a class-3 bad criterion), or
 `fishhawk_cancel_run`.
+
+**Post-deploy rollback offer (E35.3 / #1600).** On a release-shaped run (a
+deploy sequenced before the acceptance stage, no implement stage) a class-1 or
+class-4 failed verdict records the paged disposition `rollback_offered` instead:
+triage takes no transition and **never fires the rollback**. `next_actions`
+surfaces `acceptance_triage_rollback_offered`: read the evidence
+(`fishhawk_list_audit` on `acceptance_triage_decided` — its `rollback_offer`
+carries `deploy_stage_id`, `deployment_artifact_id` and the stored
+`rollback_handle`), then decide:
+
+- **Revert** — `fishhawk deploy rollback <run-id>` (`POST
+  /v0/runs/{run_id}/deployment/rollback`, the `deploy_rollback` step). The
+  endpoint re-reads the stored handle and re-dispatches the pipeline in
+  rollback mode with it (`fishhawk_rollback_handle` workflow_dispatch input for
+  github_actions — the pipeline must declare it when it returns a handle — or
+  `variables.FISHHAWK_ROLLBACK_HANDLE` for webhook); a failed handle read
+  refuses 500 with no dispatch, so just retry. `--output json` does not yet echo
+  `rollback_handle` / `deployment_artifact_id`.
+- **Keep the deploy** — `fishhawk_arbitrate_acceptance`, which discharges the
+  offer.
+
+Once the rollback is initiated the state becomes
+`acceptance_triage_rollback_initiated`: watch `deployment_rollback_completed` and
+do NOT roll back again. A multi-deploy run (#2642) or a run with an implement
+stage never gets the offer — it pages (`paged`) or keeps the class-1 fix-up
+route. A `cancelled` run no longer surfaces the offer (`next_actions` reads the
+bare terminal state); roll back by hand with `fishhawk deploy rollback <run-id>`
+if the deploy must still be reverted. The handle is shown only in the
+`deploy_rollback` step's `params.rollback_handle`, never in its prose.
 
 **Settled-outcome-unknown recovery (E31.16 / #1567).** A different failure from
 the paged case: the acceptance stage settled `succeeded` but **no**
