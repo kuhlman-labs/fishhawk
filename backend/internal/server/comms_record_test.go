@@ -1,9 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -321,6 +325,121 @@ func TestDecodeCommsScanGathered_RefusesTrailingData(t *testing.T) {
 	}
 	if commsEntryDigest(&audit.Entry{Payload: json.RawMessage(`nope`)}) != "" {
 		t.Fatal("an undecodable row must read as no digest")
+	}
+}
+
+// TestCommsGatherDigest_NilAndEmptyClustersDigestIdentically: no clusters
+// records as [] (never null), so a nil and an empty list digest and record
+// identically.
+func TestCommsGatherDigest_NilAndEmptyClustersDigestIdentically(t *testing.T) {
+	nilClusters := commsTestPayload("a1", "UR-issue-1")
+	emptyClusters := nilClusters
+	emptyClusters.SuggestedClusters = []commsRecordedCluster{}
+	if dn, de := commsGatherDigest(nilClusters), commsGatherDigest(emptyClusters); dn != de {
+		t.Fatalf("nil clusters digest %s != empty clusters digest %s", dn, de)
+	}
+	withCluster := nilClusters
+	withCluster.SuggestedClusters = []commsRecordedCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-2"}, Score: 0.8}}
+	if commsGatherDigest(withCluster) == commsGatherDigest(nilClusters) {
+		t.Fatal("a recorded cluster must change the digest")
+	}
+
+	au := newAuditFake()
+	if _, _, err := newCommsRecordServer(au).recordCommsScanGathered(context.Background(), uuid.New(), uuid.New(), nilClusters); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(au.appended[0].Payload), `"suggested_clusters":[]`) {
+		t.Fatalf("nil clusters recorded as %s, want suggested_clusters []", au.appended[0].Payload)
+	}
+	if !commsGatheredClustersRecorded(au.appended[0].Payload) {
+		t.Fatal("a row recorded with no clusters must still read as clusters-recorded")
+	}
+}
+
+// TestRecordCommsScanGathered_RefusesUnencodablePayload: a payload Marshal
+// rejects (a NaN score) is refused, not digested as empty bytes and appended
+// with a null payload.
+func TestRecordCommsScanGathered_RefusesUnencodablePayload(t *testing.T) {
+	au := newAuditFake()
+	p := commsTestPayload("a1", "UR-issue-1", "UR-issue-2")
+	p.SuggestedClusters = []commsRecordedCluster{{ReportIDs: []string{"UR-issue-1", "UR-issue-2"}, Score: math.NaN()}}
+	_, appended, err := newCommsRecordServer(au).recordCommsScanGathered(context.Background(), uuid.New(), uuid.New(), p)
+	if err == nil || appended || !strings.Contains(err.Error(), "encode payload") {
+		t.Fatalf("record = appended %v, err %v; want an encode refusal", appended, err)
+	}
+	if n := len(au.appended); n != 0 {
+		t.Fatalf("an unencodable gather appended %d row(s), want 0", n)
+	}
+}
+
+// TestCommsGatheredClustersRecorded_LegacyRow: a row recorded before #4016
+// (no suggested_clusters key) still strictly decodes with nil clusters and
+// probes not-recorded; a null value and an undecodable row probe
+// not-recorded; a present key probes recorded. The stored gather_digest is
+// authoritative: the legacy row re-digested no longer equals its stored
+// digest, and the exact-digest lookup still finds it by the stored value.
+func TestCommsGatheredClustersRecorded_LegacyRow(t *testing.T) {
+	p := commsTestPayload("a1", "UR-issue-1").normalized()
+	p.StageID = uuid.New()
+	current, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pre-#4016 struct is this one minus the field, so stripping its
+	// encoding reproduces the old writer's bytes exactly.
+	legacy := bytes.Replace(current, []byte(`"suggested_clusters":[],`), nil, 1)
+	if bytes.Equal(legacy, current) {
+		t.Fatalf("fixture: no suggested_clusters key to strip in %s", current)
+	}
+	sum := sha256.Sum256(legacy)
+	legacyDigest := hex.EncodeToString(sum[:])
+	p.GatherDigest = legacyDigest
+	legacyRow, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRow = bytes.Replace(legacyRow, []byte(`"suggested_clusters":[],`), nil, 1)
+
+	got, err := decodeCommsScanGathered(legacyRow)
+	if err != nil {
+		t.Fatalf("a legacy row must still strictly decode: %v", err)
+	}
+	if got.SuggestedClusters != nil {
+		t.Fatalf("legacy row decoded clusters %v, want nil", got.SuggestedClusters)
+	}
+	if commsGatheredClustersRecorded(legacyRow) {
+		t.Fatal("a legacy row must probe clusters-NOT-recorded")
+	}
+	if d := commsGatherDigest(*got); d == legacyDigest {
+		t.Fatal("fixture: a re-digested legacy row should NOT equal its stored digest")
+	}
+	au := newAuditFake()
+	runID := uuid.New()
+	au.seeded = []*audit.Entry{{ID: uuid.New(), RunID: &runID, Category: CategoryCommsScanGathered, Payload: legacyRow}}
+	if _, byDigest, err := newCommsRecordServer(au).commsScanGatheredByDigest(context.Background(), runID, legacyDigest); err != nil || byDigest.GatherDigest != legacyDigest {
+		t.Fatalf("lookup by the STORED legacy digest = %v, %v", byDigest, err)
+	}
+
+	for name, raw := range map[string]string{
+		"null":        `{"repo":"a/b","suggested_clusters":null}`,
+		"undecodable": `nope`,
+		"absent":      `{"repo":"a/b"}`,
+	} {
+		if commsGatheredClustersRecorded(json.RawMessage(raw)) {
+			t.Errorf("%s: probe = true, want false", name)
+		}
+	}
+	for name, raw := range map[string]string{
+		"empty":   `{"repo":"a/b","suggested_clusters":[]}`,
+		"present": `{"repo":"a/b","suggested_clusters":[{"report_ids":["UR-issue-1","UR-issue-2"],"score":1}]}`,
+	} {
+		if !commsGatheredClustersRecorded(json.RawMessage(raw)) {
+			t.Errorf("%s: probe = false, want true", name)
+		}
+	}
+	withKey, err := decodeCommsScanGathered(json.RawMessage(`{"repo":"a/b","suggested_clusters":[{"report_ids":["UR-issue-1","UR-issue-2"],"score":0.5}]}`))
+	if err != nil || len(withKey.SuggestedClusters) != 1 || withKey.SuggestedClusters[0].Score != 0.5 {
+		t.Fatalf("row with clusters decoded %+v, %v", withKey, err)
 	}
 }
 

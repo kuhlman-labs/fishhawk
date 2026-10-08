@@ -43,23 +43,37 @@ const (
 // recordCommsScanGathered stamps. StageID and StageAttempt are part of the
 // digest, so a new stage attempt over the same reports records a new row.
 // Omitted and Suppressed are capped by the gather (OmittedCount and
-// SuppressedCount carry the true totals). PendingCursor is nil when the scan
-// did not complete: there is nothing phase 7 may advance to.
+// SuppressedCount carry the true totals). SuggestedClusters are the clusters
+// the served prompt RENDERED (commsRecordableClusters: same filters and caps
+// as the prompt), which the dispositions read (#4016) derives cluster_splits
+// from; a row recorded before #4016 has no suggested_clusters key and decodes
+// with the field nil (commsGatheredClustersRecorded tells the two apart).
+// PendingCursor is nil when the scan did not complete: there is nothing phase
+// 7 may advance to.
 type commsScanGatheredPayload struct {
-	StageID          uuid.UUID                `json:"stage_id"`
-	StageAttempt     string                   `json:"stage_attempt"`
-	Repo             string                   `json:"repo"`
-	GatherDigest     string                   `json:"gather_digest"`
-	Shown            []commsShownReport       `json:"shown"`
-	Omitted          []string                 `json:"omitted"`
-	OmittedCount     int                      `json:"omitted_count"`
-	Suppressed       []commsSuppression       `json:"suppressed"`
-	SuppressedCount  int                      `json:"suppressed_count"`
-	ClassExcluded    commsClassExcluded       `json:"class_excluded"`
-	Degradations     []commsGatherDegradation `json:"degradations"`
-	MalformedMarkers int                      `json:"malformed_markers"`
-	Charter          commsCharterRecord       `json:"charter"`
-	PendingCursor    *commsPendingCursor      `json:"pending_cursor,omitempty"`
+	StageID           uuid.UUID                `json:"stage_id"`
+	StageAttempt      string                   `json:"stage_attempt"`
+	Repo              string                   `json:"repo"`
+	GatherDigest      string                   `json:"gather_digest"`
+	Shown             []commsShownReport       `json:"shown"`
+	Omitted           []string                 `json:"omitted"`
+	OmittedCount      int                      `json:"omitted_count"`
+	Suppressed        []commsSuppression       `json:"suppressed"`
+	SuppressedCount   int                      `json:"suppressed_count"`
+	ClassExcluded     commsClassExcluded       `json:"class_excluded"`
+	Degradations      []commsGatherDegradation `json:"degradations"`
+	MalformedMarkers  int                      `json:"malformed_markers"`
+	Charter           commsCharterRecord       `json:"charter"`
+	SuggestedClusters []commsRecordedCluster   `json:"suggested_clusters"`
+	PendingCursor     *commsPendingCursor      `json:"pending_cursor,omitempty"`
+}
+
+// commsRecordedCluster is one server-suggested cluster as the served prompt
+// rendered it: its shown, de-duplicated report ids (capped at
+// prompt.CommsMaxClusterIDs, in render order) and its finite score.
+type commsRecordedCluster struct {
+	ReportIDs []string `json:"report_ids"`
+	Score     float64  `json:"score"`
 }
 
 // commsShownReport is one report the served prompt rendered. ContentHash is
@@ -131,12 +145,25 @@ func (p commsScanGatheredPayload) normalized() commsScanGatheredPayload {
 	if p.Charter.NonGoalIDs == nil {
 		p.Charter.NonGoalIDs = []string{}
 	}
+	if p.SuggestedClusters == nil {
+		p.SuggestedClusters = []commsRecordedCluster{}
+	}
 	return p
 }
 
 // commsGatherDigest is the lowercase-hex sha256 of json.Marshal of p
 // (normalized) with GatherDigest blank. The payload is a closed shape of
-// strings, ints, times and uuids, so Marshal cannot fail.
+// strings, ints, finite floats, times and uuids, so Marshal cannot fail for a
+// gather-built payload: commsRecordableClusters drops a non-finite score,
+// the one value Marshal refuses, and recordCommsScanGathered refuses a
+// payload Marshal rejects rather than digest it.
+//
+// The digest is computed ONCE, at record time, and the stored gather_digest
+// is authoritative: a row recorded before suggested_clusters existed,
+// decoded and re-digested here, gains `"suggested_clusters":[]` from
+// normalized() and no longer equals its stored digest. No path may recompute
+// a digest from a decoded row and compare it; look rows up by the stored
+// value (commsScanGatheredByDigest).
 func commsGatherDigest(p commsScanGatheredPayload) string {
 	p = p.normalized()
 	p.GatherDigest = ""
@@ -162,6 +189,9 @@ func (s *Server) recordCommsScanGathered(ctx context.Context, runID, stageID uui
 	}
 	payload = payload.normalized()
 	payload.StageID = stageID
+	if _, err := json.Marshal(payload); err != nil {
+		return nil, false, fmt.Errorf("record comms scan: encode payload: %w", err)
+	}
 	digest := commsGatherDigest(payload)
 	payload.GatherDigest = digest
 	body, _ := json.Marshal(payload)
@@ -218,6 +248,21 @@ func decodeCommsScanGathered(raw json.RawMessage) (*commsScanGatheredPayload, er
 		return nil, errors.New("decode comms_scan_gathered payload: trailing data after the object")
 	}
 	return &p, nil
+}
+
+// commsGatheredClustersRecorded reports whether a comms_scan_gathered row
+// carries a non-null suggested_clusters key: true for every row recorded
+// since #4016 (normalized() writes [] for no clusters), false for a row
+// recorded before it, and false for a null or an undecodable row. The
+// dispositions read uses it to tell "this gather predates the record" (no
+// cluster view) from "the prompt rendered no cluster".
+func commsGatheredClustersRecorded(raw json.RawMessage) bool {
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(raw, &keys) != nil {
+		return false
+	}
+	v, ok := keys["suggested_clusters"]
+	return ok && !bytes.Equal(bytes.TrimSpace(v), []byte("null"))
 }
 
 // errCommsScanUnbound marks a latestCommsScanGathered failure that means the

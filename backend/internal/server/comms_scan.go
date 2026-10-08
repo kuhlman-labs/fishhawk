@@ -7,8 +7,9 @@ package server
 // user_report_cursors), keeps only external reports, suppresses the ones a
 // prior comms apply or a trusted draft marker already accounted for, caps
 // and orders what is rendered so the cursor can always make forward progress,
-// suggests clusters, and builds both the prompt's CommsScanContext and the
-// comms_scan_gathered payload facts (comms_record.go records them). Contract:
+// suggests clusters (recording the ones the prompt renders), and builds both
+// the prompt's CommsScanContext and the comms_scan_gathered payload facts
+// (comms_record.go records them). Contract:
 // README.md § "Comms scan gather".
 
 import (
@@ -16,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -128,6 +130,10 @@ const (
 var (
 	commsRubricIDConforms  = regexp.MustCompile(`^[A-Z][0-9]+$`)
 	commsNonGoalIDConforms = regexp.MustCompile(`^N[0-9]+$`)
+	// commsReportIDConforms is the prompt's UserReportID shape, the id filter
+	// writeCommsClusters applies (TestCommsRecordableClusters_MatchRender
+	// pins parity).
+	commsReportIDConforms = regexp.MustCompile(`^UR-(issue-[0-9]+|comment-[0-9]+-[0-9]+|unknown-[0-9]+-[0-9]+)$`)
 )
 
 // commsGather is one completed gather: the prompt input and the
@@ -250,7 +256,7 @@ func commsRubricConforms(id string) bool {
 //  7. The gather cap keeps the OLDEST commsScanMaxReports.
 //  8. Newest-first render order; the render cap drops the NEWEST.
 //  9. The pending cursor held back to the earliest omitted report.
-//  10. Advisory clusters.
+//  10. Advisory clusters, and the record of the ones the prompt renders.
 func (s *Server) gatherCommsScan(ctx context.Context, runRow *run.Run) (*commsGather, error) {
 	st := &commsGatherState{s: s, runID: runRow.ID}
 	repo := runRow.Repo
@@ -370,7 +376,9 @@ type commsKept struct {
 }
 
 // commsBuildReports applies the class partition, suppression, both caps,
-// the pending cursor and the clusters to a captured report.
+// the pending cursor and the clusters to a captured report. The payload
+// records the clusters as RENDERED (commsRecordableClusters over the shown
+// ids), not the raw suggestions.
 func (s *Server) commsBuildReports(ctx context.Context, st *commsGatherState, report *userreport.Report, accountID *uuid.UUID, cc *prompt.CommsScanContext, payload *commsScanGatheredPayload) {
 	for _, d := range report.Degradations {
 		src := commsDegradeSourcePage
@@ -496,6 +504,11 @@ func (s *Server) commsBuildReports(ctx context.Context, st *commsGatherState, re
 	}
 	payload.PendingCursor = commsPendingCursorFor(report, omitted)
 	cc.SuggestedClusters = commsSuggestClusters(shown)
+	isShown := make(map[string]bool, len(payload.Shown))
+	for _, r := range payload.Shown {
+		isShown[r.ID] = true
+	}
+	payload.SuggestedClusters = commsRecordableClusters(cc.SuggestedClusters, isShown)
 }
 
 // degradeMemory records a suppression or draft-filed read degrade: the
@@ -656,6 +669,48 @@ func commsSuggestClusters(reports []commsKept) []prompt.CommsCluster {
 		}
 		return out[i].ReportIDs[0] < out[j].ReportIDs[0]
 	})
+	return out
+}
+
+// commsRecordableClusters returns the clusters prompt.writeCommsClusters
+// RENDERS for clusters and the shown ids, mirroring its filters in its order:
+// a cluster with a non-finite score is dropped; only ids that are
+// UserReportID-shaped, shown and not yet seen in the cluster are kept; a
+// cluster left with fewer than two ids is dropped; at most
+// prompt.CommsMaxClusters clusters are kept (a dropped cluster does not count
+// toward the cap) and each keeps its first prompt.CommsMaxClusterIDs ids.
+// Order is preserved. The server mirrors rather than shares the render
+// because backend/internal/prompt is a review-prompt-eval trigger path;
+// TestCommsRecordableClusters_MatchRender and
+// TestCommsScan_RecordedClustersMatchRender pin parity against the served
+// prompt. Dropping a non-finite score also keeps the payload encodable
+// (encoding/json refuses NaN and Inf).
+func commsRecordableClusters(clusters []prompt.CommsCluster, isShown map[string]bool) []commsRecordedCluster {
+	var out []commsRecordedCluster
+	for _, cl := range clusters {
+		if math.IsNaN(cl.Score) || math.IsInf(cl.Score, 0) {
+			continue
+		}
+		var ids []string
+		inCluster := map[string]bool{}
+		for _, id := range cl.ReportIDs {
+			if !commsReportIDConforms.MatchString(id) || !isShown[id] || inCluster[id] {
+				continue
+			}
+			inCluster[id] = true
+			ids = append(ids, id)
+		}
+		if len(ids) < 2 {
+			continue
+		}
+		if len(out) >= prompt.CommsMaxClusters {
+			continue
+		}
+		if len(ids) > prompt.CommsMaxClusterIDs {
+			ids = ids[:prompt.CommsMaxClusterIDs]
+		}
+		out = append(out, commsRecordedCluster{ReportIDs: ids, Score: cl.Score})
+	}
 	return out
 }
 
