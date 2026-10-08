@@ -855,7 +855,7 @@ type createRunRequest struct {
 	// nil and fall through to the existing GitHub-fetch path
 	// inside prompt.fillIssueContext. Only accepted with an
 	// issue-anchored trigger_source (github_issue, on_demand,
-	// scheduled — see run.IsIssueAnchored); any other source is
+	// scheduled, alert — see run.IsIssueAnchored); any other source is
 	// refused 400 so the shape can't attach prose to non-issue runs.
 	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
 	// Drive is the per-run drive-mode override (#1023 / #996 theme
@@ -1077,26 +1077,43 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reserved trigger source (E79.1 / #3725). `scheduled` is SYSTEM-ONLY:
-	// the in-process scheduler mints it through StartScheduledRun, whose
-	// request carries the unexported scheduledAdmissionKey marker. Any other
-	// caller — however well-scoped its token — is refused here with a
-	// DEDICATED code, FIRST in body validation and before any repo-dependent
-	// gate, so a refused request touches no forge, spec or audit state. The
-	// control is the marker, not the identity subject: an HTTP request cannot
-	// set an unexported context key, while any subject string is forgeable
-	// by whoever can mint a token. A marked request falls through and is
-	// exempted from the ValidTriggerSources membership check below, which
-	// stays the OPERATOR-SUBMITTABLE set.
-	scheduledAdmitted := false
-	if req.TriggerSource == string(run.TriggerScheduled) {
+	// Reserved trigger sources. Two values are SYSTEM-ONLY, each minted by
+	// exactly one in-process producer whose request carries an unexported
+	// context-key marker:
+	//
+	//   - `scheduled` (E79.1 / #3725): the scheduler, via StartScheduledRun
+	//     (scheduledAdmissionKey);
+	//   - `alert` (E35.4 / #1601, ADR-053): the alert ingress's per-source
+	//     auto_start, via StartAlertRun (alertAdmissionKey).
+	//
+	// Any other caller — however well-scoped its token — is refused here
+	// with a DEDICATED code, FIRST in body validation and before any
+	// repo-dependent gate, so a refused request touches no forge, spec or
+	// audit state. The control is the marker, not the identity subject: an
+	// HTTP request cannot set an unexported context key, while any subject
+	// string is forgeable by whoever can mint a token. Each marker admits
+	// ONLY its own source (a scheduler-marked request naming `alert` is
+	// still refused). A marked request falls through and is exempted from
+	// the ValidTriggerSources membership check below, which stays the
+	// OPERATOR-SUBMITTABLE set.
+	reservedAdmitted := false
+	switch req.TriggerSource {
+	case string(run.TriggerScheduled):
 		if !isScheduledAdmission(r.Context()) {
 			s.writeError(w, r, http.StatusBadRequest, "trigger_source_reserved",
 				"trigger_source scheduled is reserved to the fishhawkd scheduler and cannot be submitted to POST /v0/runs; declare a workflow `schedule` and enable the scheduler (--enable-scheduler) instead",
 				map[string]any{"field": "trigger_source", "got": req.TriggerSource})
 			return
 		}
-		scheduledAdmitted = true
+		reservedAdmitted = true
+	case string(run.TriggerAlert):
+		if !isAlertAdmission(r.Context()) {
+			s.writeError(w, r, http.StatusBadRequest, "trigger_source_reserved",
+				"trigger_source alert is reserved to the fishhawkd alert ingress (POST /v0/triggers/alert) and cannot be submitted to POST /v0/runs; configure an alert source (FISHHAWKD_ALERT_SOURCES_FILE) with auto_start: true instead",
+				map[string]any{"field": "trigger_source", "got": req.TriggerSource})
+			return
+		}
+		reservedAdmitted = true
 	}
 
 	if req.Repo == "" {
@@ -1114,7 +1131,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			"workflow_sha is required", map[string]any{"field": "workflow_sha"})
 		return
 	}
-	if _, ok := validTriggerSources[req.TriggerSource]; !ok && !scheduledAdmitted {
+	if _, ok := validTriggerSources[req.TriggerSource]; !ok && !reservedAdmitted {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			validTriggerSourcesMessage,
 			map[string]any{"field": "trigger_source", "got": req.TriggerSource})
@@ -1152,11 +1169,13 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// `inputs: [{source: github_issue, required: true}]`, so the run an
 	// operator starts on-demand is exactly a run that must carry an issue
 	// context. scheduled (E79.1 / #3725) is anchored when its schedule names
-	// an `issue`, and reaches here only from the in-process scheduler. cli
-	// and ui still 400 — they carry no issue at all.
+	// an `issue`, and reaches here only from the in-process scheduler; alert
+	// (E35.4 / #1601) is always anchored on the incident issue the alert
+	// ingress filed, and reaches here only from StartAlertRun. cli and ui
+	// still 400 — they carry no issue at all.
 	if req.IssueContext != nil && !(&run.Run{TriggerSource: run.TriggerSource(req.TriggerSource)}).IsIssueAnchored() {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand, scheduled)",
+			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand, scheduled, alert)",
 			map[string]any{"field": "issue_context", "trigger_source": req.TriggerSource})
 		return
 	}

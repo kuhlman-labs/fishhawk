@@ -265,7 +265,9 @@ func TestSchedulesRoute_Registered(t *testing.T) {
 }
 
 // TestOpenAPI_SchedulesRouteDocumented: the route, its response fields and the
-// reserved `scheduled` trigger source are in the OpenAPI source of truth.
+// reserved `scheduled` and `alert` trigger sources are in the OpenAPI source of
+// truth, as is the alert ingress (E35.4 / #1601) that mints `alert`: its route,
+// request/response schemas, the default-off auto-start, and every 401 code.
 func TestOpenAPI_SchedulesRouteDocumented(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "api", "v0.openapi.yaml"))
 	if err != nil {
@@ -275,7 +277,11 @@ func TestOpenAPI_SchedulesRouteDocumented(t *testing.T) {
 	for _, want := range []string{
 		"\n  /v0/schedules:\n", "operationId: listSchedules", "ScheduleList:", "repo_scanned:",
 		"current_window_start:", "next_due_at:", "last_outcome:", "dispatch_note:",
-		"enum: [github_issue, cli, ui, on_demand, scheduled]", "trigger_source_reserved",
+		"enum: [github_issue, cli, ui, on_demand, scheduled, alert]", "trigger_source_reserved",
+		"\n  /v0/triggers/alert:\n", "operationId: receiveAlertTrigger", "\n    AlertTrigger:\n",
+		"\n    AlertTriggerResult:\n", "enum: [disabled, started, already_started, refused, error]",
+		"alert_signature_missing", "alert_timestamp_invalid", "alert_signature_invalid",
+		"alert_replayed", "alert_trigger_unconfigured", "alert_store_unconfigured",
 	} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/api/v0.openapi.yaml is missing %q", strings.TrimSpace(want))
