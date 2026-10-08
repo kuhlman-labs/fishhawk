@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -113,6 +114,13 @@ type commsIngestFixture struct {
 // store the ingest must never touch.
 func newCommsIngestFixture(t *testing.T, wfSpec []byte, workflowID string) *commsIngestFixture {
 	t.Helper()
+	return newCommsIngestFixtureWith(t, wfSpec, workflowID, nil)
+}
+
+// newCommsIngestFixtureWith is newCommsIngestFixture with the server's run
+// repository optionally wrapped (wrap nil = the plain fake).
+func newCommsIngestFixtureWith(t *testing.T, wfSpec []byte, workflowID string, wrap func(*upkeepRunRepo) run.Repository) *commsIngestFixture {
+	t.Helper()
 	registerFakeProvider(t, &fakeWorkProvider{})
 	installConventions(t, commsPreviewConventions(), nil)
 	rr := newUpkeepRunRepo()
@@ -133,8 +141,12 @@ func newCommsIngestFixture(t *testing.T, wfSpec []byte, workflowID string) *comm
 		runRow:  runRow, planStage: planStage, implStage: implStage,
 	}
 	sf := newSigningFake()
+	var runRepo run.Repository = rr
+	if wrap != nil {
+		runRepo = wrap(rr)
+	}
 	f.s = New(Config{
-		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: f.ar, AuditRepo: f.au, RunRepo: rr,
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: f.ar, AuditRepo: f.au, RunRepo: runRepo,
 		UserReportCursors: f.cursors,
 		Logger:            slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
 	})
@@ -148,15 +160,22 @@ func newCommsScanFixture(t *testing.T) *commsIngestFixture {
 }
 
 // seedGather records p as a comms_scan_gathered row for stageID at sequence
-// seq (stage column, payload stage_id and digest stamped as the gather does)
-// and returns its digest.
+// seq (stage column, payload stage_id and digest stamped as the gather does),
+// timestamped an hour before now so it precedes any artifact the test then
+// creates, and returns its digest.
 func (f *commsIngestFixture) seedGather(t *testing.T, stageID uuid.UUID, seq int64, p commsScanGatheredPayload) string {
+	t.Helper()
+	return f.seedGatherAt(t, stageID, seq, time.Now().UTC().Add(-time.Hour), p)
+}
+
+// seedGatherAt is seedGather with the row's timestamp at.
+func (f *commsIngestFixture) seedGatherAt(t *testing.T, stageID uuid.UUID, seq int64, at time.Time, p commsScanGatheredPayload) string {
 	t.Helper()
 	p = p.normalized()
 	p.StageID = stageID
 	p.GatherDigest = commsGatherDigest(p)
 	e := commsSeed(t, CategoryCommsScanGathered, f.runRow.ID, nil, p)
-	e.StageID, e.Sequence = &stageID, seq
+	e.StageID, e.Sequence, e.Timestamp = &stageID, seq, at
 	f.au.mu.Lock()
 	f.au.seeded = append(f.au.seeded, e)
 	f.au.mu.Unlock()
@@ -499,61 +518,114 @@ func TestCommsReportIngest_IdempotentRetryIgnoresNewerGather(t *testing.T) {
 	}
 }
 
-// A retry after a lost append HEALS the missing row, bound to the newest
-// gather the stored report validates against (A), never to a newer gather
-// that omits a cited report (B).
-func TestCommsReportIngest_HealBindsToValidatingGather(t *testing.T) {
-	f := newCommsScanFixture(t)
-	digestA := f.seedGather(t, f.planStage.ID, 5, commsExampleGather())
+// commsFailFirstIngestAppend ingests the example with the comms_report_recorded
+// append failing after the artifact Create (500, artifact stored, no row,
+// stage running), and returns the stored artifact's creation time.
+func commsFailFirstIngestAppend(t *testing.T, f *commsIngestFixture) time.Time {
+	t.Helper()
 	f.au.appendErrCategory = CategoryCommsReportRecorded
 	if code, resp := f.post(t, f.planStage.ID, commsExampleBody(t)); code != http.StatusInternalServerError {
 		t.Fatalf("first ingest = %d %v, want 500 (append failed)", code, resp)
 	}
+	f.au.appendErrCategory = ""
 	if n := f.artifacts(artifact.KindCommsReport); n != 1 || len(f.recorded(t)) != 0 {
 		t.Fatalf("artifacts = %d rows = %d, want 1 and 0 after the failed append", n, len(f.recorded(t)))
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Fatalf("stage = %q, want running after a 500", got)
 	}
-	f.au.appendErrCategory = ""
-	gB := commsExampleGather()
-	gB.Shown = gB.Shown[:2]
-	gB.StageAttempt = "2"
-	f.seedGather(t, f.planStage.ID, 9, gB)
+	f.ar.mu.Lock()
+	defer f.ar.mu.Unlock()
+	return f.ar.all[0].CreatedAt
+}
 
-	code, resp := f.post(t, f.planStage.ID, commsExampleBody(t))
-	if code != http.StatusOK || resp["idempotent"] != true {
-		t.Fatalf("retry = %d %v, want 200 idempotent", code, resp)
+// A retry after a lost append HEALS the missing row bound to the gather the
+// FIRST ingest validated against (A): the newest gather recorded at or before
+// the artifact's creation. A gather B recorded AFTER the creation is never the
+// binding — neither when it omits a cited report nor when it keeps every
+// cited id but carries different content hashes, where B validates and only
+// the creation-time ordering keeps the heal (and the preview's filing marker)
+// on A's hashes.
+func TestCommsReportIngest_HealBindsToOriginalGather(t *testing.T) {
+	cases := []struct {
+		name   string
+		gather func() commsScanGatheredPayload
+	}{
+		{name: "B omits cited reports", gather: func() commsScanGatheredPayload {
+			g := commsExampleGather()
+			g.Shown = g.Shown[:2]
+			return g
+		}},
+		{name: "B keeps the ids with different hashes", gather: func() commsScanGatheredPayload {
+			g := commsExampleGather()
+			for i := range g.Shown {
+				g.Shown[i].ContentHash = strings.Repeat("e", 64)
+			}
+			return g
+		}},
 	}
-	rows := f.recorded(t)
-	if len(rows) != 1 {
-		t.Fatalf("recorded rows = %d, want 1 healed row", len(rows))
-	}
-	if got := commsJSONString(t, rows[0]["gather_digest"]); got != digestA {
-		t.Errorf("healed gather_digest = %q, want gather A's %q", got, digestA)
-	}
-	if string(rows[0]["gather_sequence"]) != "5" {
-		t.Errorf("healed gather_sequence = %s, want 5", rows[0]["gather_sequence"])
-	}
-	if got := f.stageState(f.planStage.ID); got != run.StageStateAwaitingApproval {
-		t.Errorf("stage = %q, want awaiting_approval", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCommsScanFixture(t)
+			digestA := f.seedGather(t, f.planStage.ID, 5, commsExampleGather())
+			created := commsFailFirstIngestAppend(t, f)
+			gB := tc.gather()
+			gB.StageAttempt = "2"
+			// Anchored to the artifact's own creation stamp: recorded after it.
+			digestB := f.seedGatherAt(t, f.planStage.ID, 9, created.Add(time.Minute), gB)
+			if digestB == digestA {
+				t.Fatal("fixture: the two gathers must differ")
+			}
+
+			code, resp := f.post(t, f.planStage.ID, commsExampleBody(t))
+			if code != http.StatusOK || resp["idempotent"] != true {
+				t.Fatalf("retry = %d %v, want 200 idempotent", code, resp)
+			}
+			rows := f.recorded(t)
+			if len(rows) != 1 {
+				t.Fatalf("recorded rows = %d, want 1 healed row", len(rows))
+			}
+			if got := commsJSONString(t, rows[0]["gather_digest"]); got != digestA {
+				t.Errorf("healed gather_digest = %q, want gather A's %q (B is %q)", got, digestA, digestB)
+			}
+			if string(rows[0]["gather_sequence"]) != "5" {
+				t.Errorf("healed gather_sequence = %s, want 5", rows[0]["gather_sequence"])
+			}
+			var previews []commsDraftPreview
+			if err := json.Unmarshal(rows[0]["previews"], &previews); err != nil {
+				t.Fatalf("decode previews: %v", err)
+			}
+			if len(previews) != 1 || previews[0].CommsRenderedPreview == nil {
+				t.Fatalf("previews = %+v, want one rendered preview", previews)
+			}
+			got, malformed := userreport.ParseDraftMarkers(previews[0].Body)
+			want := []userreport.MarkedReport{
+				{ID: "UR-issue-12", ContentHash: strings.Repeat("c", 64)},
+				{ID: "UR-issue-40", ContentHash: strings.Repeat("c", 64)},
+			}
+			if malformed != 0 || len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+				t.Errorf("preview filing marker = %+v (malformed %d), want gather A's hashes %+v", got, malformed, want)
+			}
+			if got := f.stageState(f.planStage.ID); got != run.StageStateAwaitingApproval {
+				t.Errorf("stage = %q, want awaiting_approval", got)
+			}
+		})
 	}
 }
 
-// A heal with NO gather the stored report validates against is a 500 (never a
-// binding to a gather that omits a cited report), stage left running.
+// A heal whose original gather (the newest recorded at or before the
+// artifact's creation) no longer validates the stored report is a named 500
+// — never a binding to it — with the stage left running.
 func TestCommsReportIngest_HealWithoutValidatingGather500(t *testing.T) {
 	f := newCommsScanFixture(t)
 	f.seedGather(t, f.planStage.ID, 5, commsExampleGather())
-	f.au.appendErrCategory = CategoryCommsReportRecorded
-	f.post(t, f.planStage.ID, commsExampleBody(t))
-	f.au.appendErrCategory = ""
+	commsFailFirstIngestAppend(t, f)
 	f.au.mu.Lock()
 	f.au.seeded = nil // the only validating gather is gone
 	f.au.mu.Unlock()
 	gB := commsExampleGather()
 	gB.Shown = gB.Shown[:2]
-	f.seedGather(t, f.planStage.ID, 9, gB)
+	f.seedGather(t, f.planStage.ID, 9, gB) // recorded before the artifact
 
 	code, resp := f.post(t, f.planStage.ID, commsExampleBody(t))
 	if code != http.StatusInternalServerError {
@@ -562,8 +634,43 @@ func TestCommsReportIngest_HealWithoutValidatingGather500(t *testing.T) {
 	if msg := upkeepErrorMessage(resp); msg != commsNoGatherValidates {
 		t.Errorf("message = %q, want %q", msg, commsNoGatherValidates)
 	}
+	if got := upkeepErrorDetails(t, resp)["reason"]; got != commsHealReasonGatherInvalid {
+		t.Errorf("details.reason = %v, want %q", got, commsHealReasonGatherInvalid)
+	}
 	if len(f.recorded(t)) != 0 {
 		t.Error("a heal bound to a non-validating gather")
+	}
+	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
+		t.Errorf("stage = %q, want running", got)
+	}
+}
+
+// A heal with NO gather recorded at or before the artifact's creation cannot
+// determine the original binding: a named 500, even though a LATER gather
+// validates the stored report, with the stage left running.
+func TestCommsReportIngest_HealOriginalGatherUndecidable500(t *testing.T) {
+	f := newCommsScanFixture(t)
+	f.seedGather(t, f.planStage.ID, 5, commsExampleGather())
+	created := commsFailFirstIngestAppend(t, f)
+	f.au.mu.Lock()
+	f.au.seeded = nil // the original gather is gone
+	f.au.mu.Unlock()
+	gB := commsExampleGather() // validates the stored report
+	gB.StageAttempt = "2"
+	f.seedGatherAt(t, f.planStage.ID, 9, created.Add(time.Minute), gB)
+
+	code, resp := f.post(t, f.planStage.ID, commsExampleBody(t))
+	if code != http.StatusInternalServerError {
+		t.Fatalf("retry = %d %v, want 500", code, resp)
+	}
+	if msg := upkeepErrorMessage(resp); msg != commsOriginalGatherUndecidable {
+		t.Errorf("message = %q, want %q", msg, commsOriginalGatherUndecidable)
+	}
+	if got := upkeepErrorDetails(t, resp)["reason"]; got != commsHealReasonGatherUndecidable {
+		t.Errorf("details.reason = %v, want %q", got, commsHealReasonGatherUndecidable)
+	}
+	if len(f.recorded(t)) != 0 {
+		t.Error("a heal bound to a gather recorded after the artifact")
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
@@ -799,6 +906,22 @@ func TestCommsReportIngest_BindingTransportError500(t *testing.T) {
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
 	}
+}
+
+// The handler's own read of the reporting run, AFTER the binding listed its
+// stages (upkeepRereadFailRepo, so the ownership middleware and the binding
+// read the run normally), finding the row vanished refuses as
+// stage_binding_undecidable: 400, stage failed category-B, nothing stored.
+func TestCommsReportIngest_ReportingRunVanished(t *testing.T) {
+	var repo *upkeepRereadFailRepo
+	f := newCommsIngestFixtureWith(t, userReportScanSpec(t), "user_report_scan", func(rr *upkeepRunRepo) run.Repository {
+		repo = &upkeepRereadFailRepo{upkeepRunRepo: rr, err: run.ErrNotFound}
+		return repo
+	})
+	repo.id = f.runRow.ID
+	f.seedGather(t, f.planStage.ID, 1, commsExampleGather())
+	code, resp := f.post(t, f.planStage.ID, commsExampleBody(t))
+	assertCommsRefused(t, f, f.planStage.ID, code, resp, commsReportStageInvalidCode, commsRefusalStageBindingUndecidable)
 }
 
 func TestCommsUnaccountedReportIDs_AlwaysArray(t *testing.T) {

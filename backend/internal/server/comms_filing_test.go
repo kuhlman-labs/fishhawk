@@ -88,6 +88,8 @@ func TestNeutralizeCommsProse(t *testing.T) {
 		{name: "decimal char ref", in: "&#35;12", mustContain: []string{"\uFF06"}},
 		{name: "provenance heading", in: "intro\n### Comms provenance (server-rendered)\n- UR-issue-1", mustContain: []string{commsDemotedPrefix + commsProvenanceHeadingText}},
 		{name: "setext provenance heading", in: "comms PROVENANCE (server-rendered)\n---", mustContain: []string{commsDemotedPrefix}},
+		{name: "closing-hash provenance heading", in: "intro\n### Comms provenance (server-rendered) ###\n- UR-issue-1", mustContain: []string{commsDemotedPrefix + commsProvenanceHeadingText + "\n"}},
+		{name: "extra-space provenance heading", in: "intro\n##  Comms\tprovenance ( server-rendered )\n- UR-issue-1", mustContain: []string{commsDemotedPrefix + "Comms\tprovenance ( server-rendered )\n"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

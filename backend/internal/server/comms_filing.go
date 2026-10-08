@@ -35,7 +35,8 @@ import (
 var commsPreviewTotalBudget = 30 * time.Second
 
 // commsProvenanceHeading opens the server-rendered provenance section. An agent
-// line carrying the same text is demoted, so this section is the only one.
+// line carrying the same text is demoted (best-effort against lookalikes; see
+// demoteCommsProvenanceHeading).
 const commsProvenanceHeading = "### Comms provenance (server-rendered)"
 
 // commsProvenanceHeadingText is the heading's text without its markers, the
@@ -107,19 +108,29 @@ func commsDefangScheme(m string) string {
 }
 
 // demoteCommsProvenanceHeading prefixes every line whose text, stripped of
-// heading markers and surrounding space, equals the provenance heading text.
+// leading and trailing heading markers ('#' runs, so a closing-hash ATX
+// heading too) and with ALL whitespace removed, equals the provenance heading
+// text the same way, case-insensitively. Best-effort against lookalikes (a
+// non-ASCII hyphen or confusable rune is not caught): the authentic section is
+// the one after the final `---` rule, which ends in the marker.
 func demoteCommsProvenanceHeading(s string) string {
-	if !strings.Contains(strings.ToLower(s), strings.ToLower(commsProvenanceHeadingText)) {
-		return s
-	}
 	lines := strings.Split(s, "\n")
 	for i, line := range lines {
-		text := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "#"))
-		if strings.EqualFold(text, commsProvenanceHeadingText) {
+		text := strings.TrimSpace(strings.Trim(strings.TrimSpace(line), "#"))
+		if strings.EqualFold(commsStripSpace(text), commsProvenanceHeadingKey) {
 			lines[i] = commsDemotedPrefix + text
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// commsProvenanceHeadingKey is commsProvenanceHeadingText with its whitespace
+// removed, the form demoteCommsProvenanceHeading compares against.
+var commsProvenanceHeadingKey = commsStripSpace(commsProvenanceHeadingText)
+
+// commsStripSpace returns s with every whitespace rune removed.
+func commsStripSpace(s string) string {
+	return strings.Join(strings.Fields(s), "")
 }
 
 // neutralizeCommsTitle renders an agent title as one neutralized line of at

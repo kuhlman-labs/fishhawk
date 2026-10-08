@@ -61,7 +61,14 @@ const (
 // The 500 messages and details the ingest writes.
 const (
 	commsStageBindingResolveFailed = "resolve the stage's comms_report declaration failed"
-	commsNoGatherValidates         = "no recorded comms_scan_gathered row for the stage validates the stored report"
+	commsOriginalGatherUndecidable = "the gather the stored comms_report was validated against cannot be determined: the stage's newest comms_scan_gathered row recorded at or before the artifact's creation is absent or unusable"
+	commsNoGatherValidates         = "the gather the stored comms_report was validated against no longer validates it"
+)
+
+// The details.reason values of the heal's fail-closed 500s (commsOriginalGather).
+const (
+	commsHealReasonGatherUndecidable = "original_gather_undecidable"
+	commsHealReasonGatherInvalid     = "original_gather_does_not_validate"
 )
 
 // commsIngestMu serializes the comms-report ingest critical section
@@ -409,10 +416,11 @@ func (s *Server) handleCommsReport(w http.ResponseWriter, r *http.Request, runID
 // commsIdempotent is the retry of a report already durable for this stage. It
 // NEVER validates against the latest gather. When the comms_report_recorded
 // row exists it only settles; when it is missing (Create succeeded, the
-// append failed) the heal binds to the NEWEST of the stage's gathers the
-// stored report validates against — the one the first ingest validated
-// against unless a later gather it also passes exists — and re-renders the
-// previews at retry time.
+// append failed) the heal binds to the gather the FIRST ingest validated
+// against (commsOriginalGather) — never to a gather recorded after the
+// artifact, however well the report validates against it — fails closed with a
+// named 500 when that gather cannot be determined or no longer validates, and
+// re-renders the previews at retry time.
 func (s *Server) commsIdempotent(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, runRow *run.Run, report *plan.CommsReport, existing *artifact.Artifact, sizeBytes int) {
 	ctx := r.Context()
 	row, err := s.recordedReportRow(ctx, runID, CategoryCommsReportRecorded, existing.ID.String())
@@ -423,15 +431,19 @@ func (s *Server) commsIdempotent(w http.ResponseWriter, r *http.Request, runID, 
 	}
 	var heal func() json.RawMessage
 	if row == nil {
-		bound, ok, gerr := s.commsGatherValidating(ctx, runID, stageID, report)
+		bound, reason, gerr := s.commsOriginalGather(ctx, runID, stageID, report, existing.CreatedAt)
 		if gerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"heal comms report audit entry failed", map[string]any{"error": gerr.Error()})
 			return
 		}
-		if !ok {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				commsNoGatherValidates, map[string]any{"artifact_id": existing.ID.String()})
+		if reason != "" {
+			msg := commsNoGatherValidates
+			if reason == commsHealReasonGatherUndecidable {
+				msg = commsOriginalGatherUndecidable
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error", msg,
+				map[string]any{"artifact_id": existing.ID.String(), "reason": reason})
 			return
 		}
 		previews := s.commsPreviewDrafts(ctx, runRow, report, bound.payload)
@@ -470,40 +482,48 @@ func (s *Server) commsSettleExisting(w http.ResponseWriter, r *http.Request, run
 	})
 }
 
-// commsGatherValidating returns the stage's highest-sequence comms_scan_gathered
-// row that strictly decodes, names the stage, and against which report passes
-// checkCommsCharterRefs. ok is false when none does; err only for a store that
-// did not answer.
-func (s *Server) commsGatherValidating(ctx context.Context, runID, stageID uuid.UUID, report *plan.CommsReport) (commsBoundGather, bool, error) {
+// commsOriginalGather returns the gather the FIRST ingest of a stored report
+// validated against: the stage's highest-sequence comms_scan_gathered row
+// recorded at or before createdAt, the artifact's creation (that ingest bound
+// to the stage's latest gather, then created the artifact; a tie on sequence
+// goes to the later-listed row, as in latestCommsScanGathered). A row recorded
+// after the creation is never a candidate, however well the report validates
+// against it. The row must strictly decode, name the stage and still pass
+// checkCommsCharterRefs; otherwise reason is commsHealReasonGatherUndecidable
+// (no such row, or it does not decode or names another stage) or
+// commsHealReasonGatherInvalid. err only for a store that did not answer.
+//
+// The ordering compares the gather row's fishhawkd-stamped timestamp with the
+// artifact's database-stamped created_at: two clock domains (docs/spec
+// comms-report-v1.md § "Residuals").
+func (s *Server) commsOriginalGather(ctx context.Context, runID, stageID uuid.UUID, report *plan.CommsReport, createdAt time.Time) (commsBoundGather, string, error) {
 	if s.cfg.AuditRepo == nil {
-		return commsBoundGather{}, false, errors.New("comms gather: audit repository not configured")
+		return commsBoundGather{}, "", errors.New("comms gather: audit repository not configured")
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryCommsScanGathered)
 	if err != nil {
-		return commsBoundGather{}, false, fmt.Errorf("comms gather: list rows: %w", err)
+		return commsBoundGather{}, "", fmt.Errorf("comms gather: list rows: %w", err)
 	}
-	var stageRows []*audit.Entry
+	var orig *audit.Entry
 	for _, e := range entries {
-		if e != nil && e.StageID != nil && *e.StageID == stageID {
-			stageRows = append(stageRows, e)
-		}
-	}
-	// Highest sequence first; a tie puts the later-listed row first, as
-	// latestCommsScanGathered does (reverse, then a stable sort).
-	for i, j := 0, len(stageRows)-1; i < j; i, j = i+1, j-1 {
-		stageRows[i], stageRows[j] = stageRows[j], stageRows[i]
-	}
-	sort.SliceStable(stageRows, func(i, j int) bool { return stageRows[i].Sequence > stageRows[j].Sequence })
-	for _, e := range stageRows {
-		p, derr := decodeCommsScanGathered(e.Payload)
-		if derr != nil || p.StageID != stageID {
+		if e == nil || e.StageID == nil || *e.StageID != stageID || e.Timestamp.After(createdAt) {
 			continue
 		}
-		if checkCommsCharterRefs(report, p) == nil {
-			return commsBoundGather{entry: e, payload: p}, true, nil
+		if orig == nil || e.Sequence >= orig.Sequence {
+			orig = e
 		}
 	}
-	return commsBoundGather{}, false, nil
+	if orig == nil {
+		return commsBoundGather{}, commsHealReasonGatherUndecidable, nil
+	}
+	p, derr := decodeCommsScanGathered(orig.Payload)
+	if derr != nil || p.StageID != stageID {
+		return commsBoundGather{}, commsHealReasonGatherUndecidable, nil
+	}
+	if checkCommsCharterRefs(report, p) != nil {
+		return commsBoundGather{}, commsHealReasonGatherInvalid, nil
+	}
+	return commsBoundGather{entry: orig, payload: p}, "", nil
 }
 
 // appendCommsRecorded appends one comms_report_recorded row.

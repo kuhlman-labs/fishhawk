@@ -154,6 +154,8 @@ stage.
 | `comms_report_invalid` | 400 | `non_goal_id_unknown` (+ `non_goal_id`) | An n_drift `non_goal_id` is not in the gathered charter's `non_goal_ids`. Category-B. |
 | `comms_report_invalid` | 400 | `parent_epic_is_source` (+ `draft_id`, `parent_epic`) | A draft's `parent_epic` equals the issue number of a report it cites — comment reports included (`UR-comment-12-7` lives on issue 12). Category-B. |
 | `internal_error` | 500 | — | Storage or transport failure (including a gather LIST failure); the stage is left running. |
+| `internal_error` | 500 | `original_gather_undecidable` (+ `artifact_id`) | Heal only (below): the stage's newest `comms_scan_gathered` row recorded at or before the stored artifact's creation is absent, does not decode or names another stage, so the gather the first ingest validated against cannot be determined. Nothing is recorded; the stage is left running. |
+| `internal_error` | 500 | `original_gather_does_not_validate` (+ `artifact_id`) | Heal only (below): that original gather no longer passes the charter checks for the stored report. Nothing is recorded; the stage is left running. |
 
 The charter checks run in the fixed order above; the first failure is returned.
 
@@ -168,6 +170,18 @@ heals a missing `comms_report_recorded` row and settles the stage, and is NEVER
 re-validated against a newer gather — so a later gather that omits a cited
 report cannot fail an already-committed stage. A first ingest validates against
 exactly one gather and records which (`gather_digest`, `gather_sequence`).
+
+**The heal binds to the ORIGINAL gather.** When the artifact was created but
+its `comms_report_recorded` append failed, the retry heals the row bound to the
+gather the first ingest validated against: the stage's highest-sequence
+`comms_scan_gathered` row recorded at or before the artifact's `created_at`
+(that ingest bound to the stage's latest gather, then created the artifact).
+A gather recorded AFTER the creation is never the binding, even when the stored
+report validates against it — a later gather with the same report ids but
+different content hashes would otherwise put ITS hashes in the filing marker.
+When that row is absent, does not decode, or no longer validates the report,
+the heal fails closed (500 `original_gather_undecidable` /
+`original_gather_does_not_validate`) and records nothing.
 
 **No cursor side effect.** The ingest never advances the user-report scan
 cursor (`cfg.UserReportCursors`); the gather's `pending_cursor` is phase 7's to
@@ -240,7 +254,12 @@ provenance when filed under the bot identity:
 | `#` before a digit (`#12`, `owner/repo#12`) | U+FF03 |
 | `GH-` before a digit | `GH` + U+2011 + digit |
 | `@` before a username character at a word start | U+FF20 |
-| an agent line equal to the provenance heading | demoted, so the server section is the only one |
+| an agent line whose text equals the provenance heading's — leading AND trailing `#` runs stripped (so a closing-hash `### … ###` heading too), whitespace ignored, case-insensitive | prefixed `(agent-written) ` (demoted) |
+
+The demotion is best-effort: a lookalike line (a non-ASCII hyphen, a
+confusable rune) is not caught and can render as a heading identical to the
+server's. The authentic provenance section is the one AFTER the final `---`
+rule, ending in the comms marker; the captain trusts only that section.
 
 ## Captain's view
 
@@ -274,6 +293,7 @@ guard.
 - **Defaulted autonomy.** Work-management conventions default `autonomy:medium` when a filing carries no autonomy label. The renderer never emits `autonomy:*`, and each preview records `defaulted_labels` so the captain sees a defaulted tier, but suppressing it at filing is phase 7's (#4017).
 - **Point-in-time preview.** `previewWorkItem` reserves no number and the intake section can change before filing; `filing_body_digest` covers only the deterministic renderer output.
 - **Retry after a lost response.** The idempotent path re-renders previews at retry time; it never re-validates against a newer gather.
+- **Heal ordering spans two clocks.** The heal's "recorded at or before the artifact's creation" compares the gather row's fishhawkd-stamped timestamp with the artifact's database-stamped `created_at`. Clock skew larger than the gap between the original gather and the report's creation (the agent's whole session) could pass over the original gather, and skew larger than the gap between the creation and a later gather (at least the failed POST and its retry) could admit that later gather; both gaps dwarf NTP-synced skew. Recording the binding before the artifact would remove the cross-clock read, at the cost of a binding row without an artifact id.
 - **Autolinks not neutralized.** Commit-SHA autolinks are left as written (they create no backlink or notification). Neutralization is asserted structurally (no substring matches a GitHub autolink form); live rendering is not verified.
 - **Cluster splits.** The gather records no suggested clusters, so the ingest cannot report where the agent split a server-suggested cluster; phase 6 must extend the gather record or drop that view.
 
