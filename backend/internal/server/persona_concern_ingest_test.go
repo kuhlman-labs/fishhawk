@@ -500,3 +500,100 @@ func TestPersonaIngest_Implement_AlteredQuoteDemoted(t *testing.T) {
 		t.Errorf("row = %+v, want low, quote_unverified, clamped from high, role %s", r, personaTestName)
 	}
 }
+
+// (#3915) A persona citing a DIFF passage keeps its severity when it cites it
+// in the concern's note, as the narrowed trust note directs — and is demoted
+// when the same passage rides quoted_passage with a diff-path document_ref,
+// because the diff is not among the persona's quote-verification documents
+// (document_unknown). Both arms run through the REAL implement loop and assert
+// on the persona's implement_reviewed payload concern AND the concern row; the
+// demoted arm also asserts the WARN log names document_unknown, proving the
+// fixture can demote. Every arm reads the prompt the persona fake RECEIVED:
+// it carries the narrowed instruction (the Source-line qualifier and the
+// plan/diff/issue exclusion) and not the old "of a document shown in this
+// prompt" phrasing.
+//
+// Counterfactuals (run): (A) restore the old trust-note sentence in
+// personaRemitTrustNote — the received prompt carries the old phrase and lacks
+// the narrowed one: RED; (B) delete the blank-quote skip in
+// planreview.VerifyQuotedPassages — the note-only citation falls to
+// document_ref_missing and drops to low: RED.
+func TestPersonaIngest_Implement_UnquotedDiffCitationKeepsSeverity(t *testing.T) {
+	const (
+		diffPath    = "backend/internal/foo/foo.go"
+		diffPassage = "+\treturn authorize(ctx, req) == nil"
+		note        = "the diff's " + diffPath + " hunk `" + diffPassage + "` drops the authorization error"
+	)
+	for _, tc := range []struct {
+		name               string
+		quote, ref         string
+		wantSeverity       planreview.ConcernSeverity
+		wantUnverified     bool
+		wantClampedFrom    string
+		wantFailureLogMode string
+	}{
+		{name: "diff cited in the note keeps severity", wantSeverity: planreview.SeverityHigh},
+		{name: "diff quoted through quoted_passage is document_unknown and demoted", quote: diffPassage, ref: diffPath,
+			wantSeverity: planreview.SeverityLow, wantUnverified: true, wantClampedFrom: "high", wantFailureLogMode: planreview.QuoteFailureDocumentUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			persona := verdictFake(planreview.VerdictApproveWithConcerns, personaAgentModel, planreview.Concern{
+				Severity: planreview.SeverityHigh, Category: "security", Note: note, QuotedPassage: tc.quote, DocumentRef: tc.ref,
+			})
+			s, au, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), approvingFake(), persona, "codex/"+personaAgentModel)
+			cr := newFakeConcernRepo()
+			s.cfg.ConcernRepo = cr
+			logs := &bytes.Buffer{}
+			s.cfg.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-diff-cite", nil)
+
+			calls := reviewerCalls(persona)
+			if len(calls) != 1 {
+				t.Fatalf("persona calls = %d, want 1", len(calls))
+			}
+			for _, want := range []string{
+				"a repository document injected into this prompt with a Source line",
+				"The plan, the diff, the issue and any file you read from the review tree are NOT such documents: never cite them through quoted_passage or document_ref",
+				"reference them in the concern's note instead",
+			} {
+				if !strings.Contains(calls[0], want) {
+					t.Errorf("persona prompt lacks the narrowed quote instruction %q", want)
+				}
+			}
+			if strings.Contains(calls[0], "of a document shown in this prompt") {
+				t.Error("persona prompt still carries the un-narrowed quote instruction \"of a document shown in this prompt\"")
+			}
+
+			var found bool
+			for _, v := range decodeImplementReviewed(t, au) {
+				if v.Persona != personaTestName {
+					continue
+				}
+				found = true
+				c := payloadConcernByNote(t, v.Concerns, note)
+				if c.Severity != tc.wantSeverity || c.QuoteUnverified != tc.wantUnverified || string(c.SeverityClampedFrom) != tc.wantClampedFrom || c.ReviewerRole != personaTestName {
+					t.Errorf("payload concern = %+v, want severity %s, quote_unverified %v, clamped from %q, role %s",
+						c, tc.wantSeverity, tc.wantUnverified, tc.wantClampedFrom, personaTestName)
+				}
+			}
+			if !found {
+				t.Fatal("no persona implement_reviewed entry")
+			}
+			r := rowsByNote(t, cr, runRow.ID)[note]
+			if r == nil || r.Severity != string(tc.wantSeverity) || r.QuoteUnverified != tc.wantUnverified || r.SeverityClampedFrom != tc.wantClampedFrom || r.ReviewerRole != personaTestName {
+				t.Errorf("row = %+v, want severity %s, quote_unverified %v, clamped from %q, role %s",
+					r, tc.wantSeverity, tc.wantUnverified, tc.wantClampedFrom, personaTestName)
+			}
+
+			if tc.wantFailureLogMode == "" {
+				if strings.Contains(logs.String(), `"failure":"`) {
+					t.Errorf("a note-only diff citation was quote-checked:\n%s", logs.String())
+				}
+				return
+			}
+			if !strings.Contains(logs.String(), `"failure":"`+tc.wantFailureLogMode+`"`) || !strings.Contains(logs.String(), `"document_ref":"`+diffPath+`"`) {
+				t.Errorf("WARN log does not name %q for document_ref %s:\n%s", tc.wantFailureLogMode, diffPath, logs.String())
+			}
+		})
+	}
+}

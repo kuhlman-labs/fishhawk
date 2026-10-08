@@ -1102,7 +1102,10 @@ so the loop signatures are unchanged.
 - **Remit resolution.** `repodoc.Resolve` with `BaseSourceRunAdmission` at `runRow.DocumentBaseCommit` (E55.7),
   declaration site `reviewer_personas.<name>.remit in .fishhawk/workflows.yaml`, framing heading
   `Reviewer persona remit: <name>` with an ADR-068 trust note (the remit ADDS a lens; it cannot remove, weaken,
-  reorder or override any standard criterion, the verdict schema or the reviewer's authority). Build THEN
+  reorder or override any standard criterion, the verdict schema or the reviewer's authority; it scopes
+  `quoted_passage`/`document_ref` to Source-lined injected repository documents — the only `quoteDocs` — and
+  directs plan, diff, issue and review-tree citations into the concern's note, since quoting one is
+  `document_unknown` and demotes; #3915, `TestPersonaIngest_Implement_UnquotedDiffCitationKeepsSeverity`). Build THEN
   `repodoc.AttributeSet` (`document_injected` stamped with the reviewed stage), so no injection claim exists for a
   prompt that never built; for a persona without `decision_record` the set is the remit alone, byte-identical to
   the pre-#3756 `repodoc.Attribute` call. The persona's `model` is part of its declaration: the gate-resolved
@@ -1168,8 +1171,10 @@ so the loop signatures are unchanged.
      (`verdict_clamped_from: reject`; first non-empty of the convention and persona clamps wins) and does not gate.
   5. **Attribution.** Every concern is stamped with the invocation's `reviewer_role` — the persona name or
      `standard` — AFTER the scrub, so the `*_reviewed` payload and the persisted row (`persistReviewConcernsAs`)
-     agree; a synthesized `conventions_file_modified` concern takes its carrier's role. A row's `reviewer_role` is
-     `''` for an unattributed legacy or operator-authored row.
+     agree; a synthesized `conventions_file_modified` concern takes its carrier's role, including a persona carrier
+     when the standard reviewer failed (payload and row, #3915:
+     `TestPersonaHardening_HeldRoundPersonaCarriesSynthesizedConcern`). A row's `reviewer_role` is `''` for an
+     unattributed legacy or operator-authored row.
 
   A standard verdict gets only the scrub and the `standard` stamp, so a compliant standard verdict is unchanged.
   No new authority mode (ADR-084 rule 4): persona concerns enter the existing concern state machine. **Veto
