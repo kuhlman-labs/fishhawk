@@ -24,6 +24,8 @@ it.
 | Split parent close (#2062) | _(none at the comment; the parent thread's own stamped `fishhawk-split-parent-close` marker is the dedup record)_ | _(none)_ | `Server.handleContractChildClosed` (`issues.closed` on a filed split's contract child) | when the contract child closes as landed (any `state_reason` except `not_planned` / `duplicate`) | No (best-effort; the comment is posted BEFORE the close and deduped by re-reading the parent thread for the `fishhawk-split-parent-close` marker, so a redelivery finds the marker and posts nothing — the residual is a duplicate under two GENUINELY CONCURRENT deliveries, deliberately accepted over a lock) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 | Run not applicable (applies_to) | _(none at notifier; global-chain `run_rejected_applies_to` on the dispatcher)_ | _(none)_ | `Dispatcher.refusedByAppliesTo` applies_to admission gate (E53.10 / #2361) | dispatch refusal (workflow's `applies_to` labels/trigger not satisfied) | No (each refusal posts its own comment) |
+| Alert incident issue (E35.4 / #1601) | _(none at notifier; global-chain `alert_incident_filed` written by the ingress)_ | _(none)_ | `Server.handleAlertTrigger` (`POST /v0/triggers/alert`) → `applyAndFileWorkItem` | first verified alert for a `(source, repo, fingerprint)`: a NEW issue in the alert source's configured repo, not a run thread | No (one issue per fingerprint, deduped by the `alert_incidents` ledger; the body carries the `alert-incident` idempotency marker, which names a duplicate filed under a lost claim) |
+| Alert occurrence comment (E35.4 / #1601) | _(none at notifier; global-chain `alert_incident_occurrence` written by the ingress)_ | _(none)_ | `Server.handleAlertTrigger` → `githubclient.CreateIssueComment` | each repeat verified alert for a fingerprint whose incident issue is already filed | No (a NEW comment per repeat alert; an exact resend is refused by the replay nonce first; a failed post answers 502 and releases the nonce, so the retry re-posts) |
 
 Notes:
 - **Run-link degradation when `FISHHAWKD_EXTERNAL_URL` is unset (#1787).** Every
@@ -2117,6 +2119,22 @@ Notes:
   append failure never fails the response since the item is already filed. No
   sticky status comment is refreshed. Listed here so a future reader grepping
   the audit categories doesn't mistake it for a comment surface.
+- The alert-ingress kinds — `alert_incident_filed` and
+  `alert_incident_occurrence` (E35.4 / #1601, ADR-053 option A) — are
+  **global-chain audit-only categories, not issue-comment activity
+  categories**. Nothing in `issuecomment` posts them; they have no Notifier
+  method and are absent from `activityCategories`. They are written by
+  `server/alert_trigger.go::auditAlertIncident` via
+  `AuditRepo.AppendGlobalChained` (an incident belongs to no run) under the
+  attribution-only subject `AlertRunSubject`, for an ACCEPTED alert only: a
+  rejected request is never audited, so an unauthenticated caller cannot
+  append to the chain. `alert_incident_filed` carries `{source, repo,
+  fingerprint, severity, issue_number, issue_url, auto_start}` (plus
+  `dedup_claim_lost` when set); `alert_incident_occurrence` carries `{source,
+  repo, fingerprint, issue_number, occurrences}`. Best-effort: an append failure
+  is WARN-logged and never fails the response, since the issue or comment
+  already landed. The egress surfaces themselves are the two "Alert incident
+  issue" / "Alert occurrence comment" rows in the table above.
 - The refinement-gate decision + edit kinds — `refinement_draft_approved`,
   `refinement_draft_rejected`, and `refinement_draft_edited` (#1593, ADR-052
   option A) — are **internal, global-chain audit-only categories, not
