@@ -23980,6 +23980,18 @@ paths:
               `scan_context_absent` (no decodable `comms_scan_gathered` row
               for this stage). Fails the stage category-B. Contract:
               `docs/spec/comms-report-v1.md` § "Ingest".
+            - `plan_ticket_mismatch` — the uploaded artifact's
+              `ticket_reference` (any kind: plan, clarification request,
+              grooming, upkeep or comms report) confidently names a different
+              issue than the run's `issue:N` trigger — a different number, or
+              a different repository (compared case-insensitively) (#4067).
+              Checked on a parseable body BEFORE kind routing, so nothing is
+              stored. Fails OPEN (no refusal) when the run has no `issue:`
+              trigger, cannot be loaded, or the `ticket_reference` names no
+              parseable issue (`id` `owner/name#N` / `#N`, or a url ending
+              `/issues/N` / `/-/issues/N`). `details` carry `artifact_kind`,
+              `claimed_id`, `claimed_url`, `run_trigger_ref` and `run_repo`.
+              Fails the stage category-B; not retried in-run.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

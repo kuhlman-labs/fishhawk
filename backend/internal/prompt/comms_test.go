@@ -147,7 +147,7 @@ func TestBuildCommsScan_ContractStrings(t *testing.T) {
 	assertContainsAll(t, got,
 		"`kind` MUST be `comms_report` and `report_version` MUST be `comms_report_v1`",
 		"`drafts` (at most 25), `n_drift` (at most 50) and `not_drafted` (at most 500)",
-		PlanArtifactPath,
+		LegacyPlanArtifactPath,
 		"`draft:` followed by those sorted ids joined with `+`",
 		"1 to 20 report ids, sorted and unique",
 		"1 to 8 `{rubric_id, note?}`",
@@ -164,11 +164,34 @@ func TestBuildCommsScan_ContractStrings(t *testing.T) {
 		"NEVER quote report text as fact",
 		"say so in `summary` citing its report id",
 		"Do NOT emit any standard_v1 plan field",
-		"you MUST WRITE the report to "+PlanArtifactPath,
+		"you MUST WRITE the report to "+LegacyPlanArtifactPath,
 		"You file, label, edit, close or comment on nothing, start no run, run no forge command and change no code",
 		"Stage budget (ADR-025): comms scan stage 30 minutes",
 		"Triggering issue: #4013",
 	)
+}
+
+// TestBuildCommsScan_PlanArtifactPathKeyedByIds pins #4067 on the comms fork:
+// with the plan run/stage ids threaded, both report-path lines name the keyed
+// path and the shared legacy path appears nowhere; without them, both lines
+// fall back to the legacy path.
+func TestBuildCommsScan_PlanArtifactPathKeyedByIds(t *testing.T) {
+	keyed := buildComms(t, withPlanIDs(commsScanTrigger()))
+	assertContainsAll(t, keyed,
+		"Write the report as a single JSON object to `"+planPathTestKeyed+"`",
+		"you MUST WRITE the report to "+planPathTestKeyed,
+	)
+	if strings.Contains(keyed, LegacyPlanArtifactPath) {
+		t.Errorf("comms prompt with plan ids threaded still names the legacy path %q", LegacyPlanArtifactPath)
+	}
+	legacy := buildComms(t, commsScanTrigger())
+	assertContainsAll(t, legacy,
+		"Write the report as a single JSON object to `"+LegacyPlanArtifactPath+"`",
+		"you MUST WRITE the report to "+LegacyPlanArtifactPath,
+	)
+	if strings.Contains(legacy, "/tmp/fishhawk-plan-") {
+		t.Errorf("comms prompt without plan ids rendered a keyed path")
+	}
 }
 
 // TestBuildCommsScan_CharterTables: conforming rubric and non-goal lines

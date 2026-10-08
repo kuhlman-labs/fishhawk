@@ -210,6 +210,7 @@ endpoint (`POST /v0/runs/{run_id}/plan`, routed by `kind`), so `upload.ShipPlan`
 | `upkeep_report_stage_invalid` | **B** | the same handler ([#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921)) — a forward declaration |
 | `comms_report_invalid` | **B** | the comms_report ingest handler ([#4015](https://github.com/kuhlman-labs/fishhawk/issues/4015)) — a forward declaration the handler must emit verbatim |
 | `comms_report_stage_invalid` | **B** | the same handler ([#4015](https://github.com/kuhlman-labs/fishhawk/issues/4015)) — a forward declaration |
+| `plan_ticket_mismatch` | **B** | `backend/internal/server/plan_ticket_guard.go` ([#4067](https://github.com/kuhlman-labs/fishhawk/issues/4067)) — the cross-kind ticket guard, checked before kind routing |
 | anything else (e.g. `validation_failed`) | **C** — generic error | — |
 
 Each B code is one the backend handler has ALREADY transitioned the stage to

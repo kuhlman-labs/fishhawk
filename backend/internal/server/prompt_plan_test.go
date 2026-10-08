@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -1070,4 +1071,59 @@ func promptRequestForStage(t *testing.T, s *Server, _ uuid.UUID, stageID uuid.UU
 // tenant account, matching its pre-promotion effective behavior.
 func (*planPromptRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// TestPlanPrompt_BothEndpointsRenderKeyedPlanPath pins the server half of
+// #4067: for a plan stage, BOTH the signed runner-facing GET
+// /v0/stages/{id}/prompt and the SPA-readable /prompt-render thread the run and
+// stage ids into the trigger, so each renders the run/stage-keyed handoff path
+// /tmp/fishhawk-plan-<run>-<stage>.json for THAT stage's real ids — and never
+// the shared legacy path concurrent plan stages collided on. Deleting the
+// PlanRunID/PlanStageID assignment in either handler makes that endpoint render
+// the legacy path, which reddens its row here.
+func TestPlanPrompt_BothEndpointsRenderKeyedPlanPath(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:              runID,
+		Repo:            "kuhlman-labs/example",
+		WorkflowID:      "feature_change",
+		RequiresCharter: chFalse(),
+		TriggerSource:   run.TriggerGitHubIssue,
+		TriggerRef:      &triggerRef,
+		InstallationID:  &installation,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "T", Body: "B", State: "open"}
+
+	keyed := fmt.Sprintf("/tmp/fishhawk-plan-%s-%s.json", runID, stageID)
+	if got := prompt.PlanArtifactPath(runID.String(), stageID.String()); got != keyed {
+		t.Fatalf("prompt.PlanArtifactPath = %q, want %q", got, keyed)
+	}
+
+	signed := promptRequest(t, s, runID, stageID, priv, "")
+	render := httptest.NewRecorder()
+	s.Handler().ServeHTTP(render, httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil))
+
+	for name, w := range map[string]*httptest.ResponseRecorder{"/prompt": signed, "/prompt-render": render} {
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200:\n%s", name, w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s decode: %v", name, err)
+		}
+		if !strings.Contains(resp.Prompt, "Write the plan as a single JSON object to `"+keyed+"`") {
+			t.Errorf("%s: plan prompt does not name the run/stage-keyed path %q", name, keyed)
+		}
+		if strings.Contains(resp.Prompt, prompt.LegacyPlanArtifactPath) {
+			t.Errorf("%s: plan prompt still names the shared legacy path %q", name, prompt.LegacyPlanArtifactPath)
+		}
+	}
 }

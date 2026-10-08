@@ -439,7 +439,7 @@ func TestBuild_Plan(t *testing.T) {
 		"implementation plan",
 		"Do not modify source files",
 		"Triggering issue: #7",
-		PlanArtifactPath,
+		LegacyPlanArtifactPath,
 		"standard_v1",
 		"scripts/sync-schemas",
 		"docs/spec/",
@@ -451,6 +451,112 @@ func TestBuild_Plan(t *testing.T) {
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+// planPathTestRunID / planPathTestStageID are the fixed UUIDs the backend,
+// runner (runner/cmd/fishhawk-runner/planout_test.go) and CLI
+// (cli/cmd/fishhawk/runner_test.go) plan-path tests all key the SAME literal
+// by (#4067), so the three independent copies of the format cannot drift.
+const (
+	planPathTestRunID   = "11111111-2222-3333-4444-555555555555"
+	planPathTestStageID = "22222222-3333-4444-5555-666666666666"
+	planPathTestKeyed   = "/tmp/fishhawk-plan-11111111-2222-3333-4444-555555555555-22222222-3333-4444-5555-666666666666.json"
+)
+
+// TestPlanArtifactPath_KeyedFormat pins the keyed plan handoff literal (#4067)
+// the runner and CLI mirrors also pin, and that distinct stages never share a
+// path or collide with the legacy fixed path.
+func TestPlanArtifactPath_KeyedFormat(t *testing.T) {
+	if got := PlanArtifactPath(planPathTestRunID, planPathTestStageID); got != planPathTestKeyed {
+		t.Errorf("PlanArtifactPath = %q, want %q (must match the runner + CLI literal)", got, planPathTestKeyed)
+	}
+	if other := PlanArtifactPath(planPathTestRunID, "33333333-4444-5555-6666-777777777777"); other == planPathTestKeyed {
+		t.Errorf("distinct stage ids must yield distinct paths: %q", other)
+	}
+	if planPathTestKeyed == LegacyPlanArtifactPath {
+		t.Errorf("keyed path must differ from the legacy fixed path %q", LegacyPlanArtifactPath)
+	}
+}
+
+// withPlanIDs returns tr with the plan run/stage ids threaded, as both server
+// prompt handlers do for a plan-typed stage.
+func withPlanIDs(tr Trigger) Trigger {
+	tr.PlanRunID, tr.PlanStageID = planPathTestRunID, planPathTestStageID
+	return tr
+}
+
+// TestBuild_Plan_RendersKeyedPlanPathWhenIdsThreaded pins #4067 on every
+// plan-typed render in this file: with PlanRunID/PlanStageID threaded, the
+// standard plan task line, both clarification_request park lines and both
+// grooming lines name the run/stage-keyed path, and the shared legacy path
+// appears NOWHERE (any surviving legacy line would steer the agent back onto
+// the cross-run-contaminated file). The upkeep and comms forks are pinned in
+// upkeep_test.go / comms_test.go.
+func TestBuild_Plan_RendersKeyedPlanPathWhenIdsThreaded(t *testing.T) {
+	plain := Trigger{IssueNumber: 7, IssueTitle: "Plan a refactor", Repo: "x/y"}
+	cases := map[string]struct {
+		tr    Trigger
+		wants []string
+	}{
+		"standard plan": {
+			tr: withPlanIDs(plain),
+			wants: []string{
+				"Write the plan as a single JSON object to `" + planPathTestKeyed + "`",
+			},
+		},
+		"clarification park": {
+			tr: withPlanIDs(plain),
+			wants: []string{
+				"Write it as a single JSON object to the SAME path (" + planPathTestKeyed + ") INSTEAD of a plan",
+				"To PARK you MUST still write the clarification_request to " + planPathTestKeyed,
+			},
+		},
+		"grooming": {
+			tr: withPlanIDs(groomingTriggerWithCharter()),
+			wants: []string{
+				"Write the report as a single JSON object to `" + planPathTestKeyed + "`",
+				"you MUST WRITE the report to " + planPathTestKeyed,
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := Build("plan", tc.tr)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			for _, w := range tc.wants {
+				if !strings.Contains(got, w) {
+					t.Errorf("prompt missing keyed plan path line %q", w)
+				}
+			}
+			if strings.Contains(got, LegacyPlanArtifactPath) {
+				t.Errorf("prompt with plan ids threaded still names the legacy path %q", LegacyPlanArtifactPath)
+			}
+		})
+	}
+}
+
+// TestBuild_Plan_LegacyPathWithoutIds pins the fallback: a trigger missing
+// either plan id renders the legacy fixed path (never a malformed half-keyed
+// one), which is what keeps the frozen pre-change golden byte-identical.
+func TestBuild_Plan_LegacyPathWithoutIds(t *testing.T) {
+	for name, tr := range map[string]Trigger{
+		"no ids":        {IssueNumber: 7, Repo: "x/y"},
+		"run id only":   {IssueNumber: 7, Repo: "x/y", PlanRunID: planPathTestRunID},
+		"stage id only": {IssueNumber: 7, Repo: "x/y", PlanStageID: planPathTestStageID},
+	} {
+		got, err := Build("plan", tr)
+		if err != nil {
+			t.Fatalf("%s: Build: %v", name, err)
+		}
+		if !strings.Contains(got, "Write the plan as a single JSON object to `"+LegacyPlanArtifactPath+"`") {
+			t.Errorf("%s: prompt missing the legacy plan path", name)
+		}
+		if strings.Contains(got, "/tmp/fishhawk-plan-") {
+			t.Errorf("%s: prompt rendered a keyed path without both ids", name)
 		}
 	}
 }
@@ -970,7 +1076,7 @@ func TestBuild_Plan_StructuredOutputParkViaFile(t *testing.T) {
 	}
 	wants := []string{
 		"structured-output channel constrains the PLAN artifact only",
-		"To PARK you MUST still write the clarification_request to " + PlanArtifactPath,
+		"To PARK you MUST still write the clarification_request to " + LegacyPlanArtifactPath,
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -12655,7 +12761,7 @@ func TestBuild_GroomingPropose_NamesArtifactAndCitationRule(t *testing.T) {
 	for _, want := range []string{
 		string(plan.ArtifactKindGroomingReport),
 		plan.GroomingReportVersion,
-		PlanArtifactPath,
+		LegacyPlanArtifactPath,
 		"rubric_citations", // per-ordering-entry citation requirement
 		"V*, R*, U*, S*",   // the concrete rubric-id families
 		"ordering, duplicates, hygiene_defects, dependency_edges, vision_drift, decomposition_suggestions", // six required arrays

@@ -341,6 +341,15 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	if derr != nil {
 		kind = plan.ArtifactKindPlan // the plan path owns the ParseError
 	}
+	// Ticket guard (#4067): refuse any kind whose ticket_reference names a
+	// different issue than the run's issue:N trigger, before kind routing
+	// and before anything is stored. Only on a parseable body — an
+	// unparseable one keeps flowing to the plan path, which owns the
+	// ParseError. Fails OPEN with no issue trigger, an unparseable
+	// reference, or a run load error (plan_ticket_guard.go).
+	if derr == nil && s.guardPlanTicketReference(w, r, runID, stageID, kind, body) {
+		return
+	}
 	// Plan-path guard (#3921): a stage declaring produces: upkeep_report may
 	// ship only the kinds on upkeepStageAllowedKinds; every other kind is
 	// refused here, before anything is stored. Fails OPEN when the RunRepo,
