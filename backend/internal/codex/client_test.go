@@ -253,6 +253,9 @@ func TestHelperProcess(t *testing.T) {
 		// GROUP; then this fake codex sleeps past the review deadline. A naive
 		// single-child kill would leave the grandchild holding the pipe and
 		// wedge cmd.Output(); procgroup.Harden's whole-group SIGKILL reaps both.
+		// HELPER_SPAWN_DELAY (the #4177 margin pin) delays the fork to model a
+		// slow spawn on a loaded host.
+		time.Sleep(helperSpawnDelay())
 		spawnGrandchild(false)
 		time.Sleep(timescale.D(30 * time.Second))
 	case "pipe_leak_escape":
@@ -262,15 +265,17 @@ func TestHelperProcess(t *testing.T) {
 		// grandchild, so only cmd.WaitDelay can force-close the parent-side pipe
 		// fd — the branch whose forced return is a non-ExitError the timeout
 		// hoist must still classify.
+		time.Sleep(helperSpawnDelay())
 		spawnGrandchild(true)
-		// exit immediately (deferred os.Exit(0)), leaving the pipe held.
+		// Stamp the exit instant so a failing escape case can report the
+		// arm-to-exit latency (#4177), then exit immediately (deferred
+		// os.Exit(0)), leaving the pipe held.
+		writeExitStamp()
 	case "pipe_grandchild":
-		// The stdout-inheriting grandchild forked by the pipe_leak_* modes:
-		// record our pid so the driving test can assert reap/survival, then hold
-		// the inherited stdout open well past any deadline+grace.
-		if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
-			_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o600)
-		}
+		// The stdout-inheriting grandchild forked by the pipe_leak_* modes: hold
+		// the inherited stdout open well past any deadline+grace. Its pid is
+		// recorded by the fake codex right after exec.Cmd.Start (#4177), not
+		// here, so the spawn precondition excludes this process's runtime init.
 		time.Sleep(timescale.D(30 * time.Second))
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
@@ -361,29 +366,92 @@ func clientWithMode(mode string) *Client {
 	return c
 }
 
+// The #4177 deadline roles (the #3587 separation). The CHEAP deadlines are the
+// ones whose expiry IS the verdict under test. The spawn budget is the
+// must-complete window for the fake codex to fork its grandchild, more than 30x
+// the cheap deadlines; it costs nothing on the happy path because the
+// timescale.SpawnGate arms the cheap deadline the moment the grandchild pid is
+// recorded, and exhausting it fails the test as a named PRECONDITION, never as
+// the group kill. Functions, not consts, so the factor is read at call time.
+func groupKillDeadline() time.Duration { return timescale.D(300 * time.Millisecond) }
+func escapeDeadline() time.Duration    { return timescale.D(200 * time.Millisecond) }
+func spawnBudget() time.Duration       { return timescale.D(10 * time.Second) }
+
+// escapeGrace is the escape arm's WaitDelay grace. os/exec starts the WaitDelay
+// timer when Wait observes the fake's exit, and the escape fake exits right
+// after it records the grandchild pid, i.e. near the gate's arm instant — so the
+// gated deadline must still fire before exit+grace for the trigger to be the
+// deadline. The margin: arm-to-exit latency (armedAt minus the fake's exit) must
+// stay below escapeGrace() - escapeDeadline() (1.8s at factor 1). Do NOT shrink
+// this back toward the deadline (#4177).
+func escapeGrace() time.Duration { return 10 * escapeDeadline() }
+
+// helperSpawnDelay is the fake's pre-spawn sleep from HELPER_SPAWN_DELAY (a
+// time.Duration string; empty or unparseable means none). It models a slow
+// fork/exec on a loaded host for the #4177 margin pin.
+func helperSpawnDelay() time.Duration {
+	d, err := time.ParseDuration(os.Getenv("HELPER_SPAWN_DELAY"))
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
 // spawnGrandchild re-execs the test binary as a stdout-inheriting grandchild of
 // the fake codex process (the pipe_grandchild mode). escape=true makes it its
 // own process-group leader so procgroup.Harden's kill(-pgid) misses it (the
 // WaitDelay path); escape=false leaves it in the fake codex's group so the group
-// kill reaps it. Used only inside TestHelperProcess (the fake-codex re-exec).
+// kill reaps it. Right after Start it records the grandchild pid in
+// HELPER_GC_PIDFILE (atomic tmp+rename, #4177): Start returns only once the
+// child has exec'd, so a recorded pid proves the grandchild exists, holds the
+// inherited stdout and (escape) has already left the group — the spawn
+// precondition the driving test's SpawnGate arms on. Used only inside
+// TestHelperProcess (the fake-codex re-exec).
 func spawnGrandchild(escape bool) {
 	gc := exec.Command(os.Args[0], "-test.run=TestHelperProcess") //nolint:gosec // re-exec of the test binary itself
-	env := append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=pipe_grandchild")
-	if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
-		env = append(env, "HELPER_GC_PIDFILE="+pf)
-	}
-	gc.Env = env
+	gc.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=pipe_grandchild")
 	gc.Stdout = os.Stdout // inherit the pipe write-end so it stays open after the fake codex dies
 	if escape {
 		gc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
-	_ = gc.Start()
+	if gc.Start() != nil {
+		return // no pid recorded: the driving test fails as a SpawnGate PRECONDITION
+	}
+	if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
+		_ = timescale.WritePidFile(pf, gc.Process.Pid)
+	}
+}
+
+// exitStampPath is where the escape fake records its exit instant.
+func exitStampPath(pidfile string) string { return pidfile + ".exit" }
+
+// writeExitStamp records the escape fake's exit instant (wall-clock UnixNano)
+// beside HELPER_GC_PIDFILE, for runEscapeCase's arm-to-exit diagnostic.
+func writeExitStamp() {
+	if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
+		_ = os.WriteFile(exitStampPath(pf), []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o600)
+	}
+}
+
+// armToExitDiag renders armedAt minus the escape fake's recorded exit instant
+// against the escape-arm margin, reported by a failing runEscapeCase.
+func armToExitDiag(pidfile string, armedAt time.Time) string {
+	b, err := os.ReadFile(exitStampPath(pidfile))
+	if err != nil {
+		return fmt.Sprintf("armedAt - child exit unknown (no exit stamp: %v)", err)
+	}
+	ns, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return fmt.Sprintf("armedAt - child exit unknown (bad exit stamp %q)", b)
+	}
+	return fmt.Sprintf("armedAt - child exit = %s; the escape arm needs it below escapeGrace() - escapeDeadline() = %s (#4177)",
+		armedAt.Sub(time.Unix(0, ns)), escapeGrace()-escapeDeadline())
 }
 
 // countingPipeLeakHelper returns a Cmd-builder for a pipe_leak_* mode that
-// threads HELPER_GC_PIDFILE through to the fake codex (so the forked grandchild
-// records its pid) and counts subprocess attempts.
-func countingPipeLeakHelper(mode, pidfile string, attempts *int) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+// threads HELPER_GC_PIDFILE (where the fake records the grandchild pid) and
+// HELPER_SPAWN_DELAY through to the fake codex, and counts subprocess attempts.
+func countingPipeLeakHelper(mode, pidfile string, spawnDelay time.Duration, attempts *int) func(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		*attempts++
 		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
@@ -391,6 +459,7 @@ func countingPipeLeakHelper(mode, pidfile string, attempts *int) func(ctx contex
 			"GO_HELPER_PROCESS=1",
 			"HELPER_MODE="+mode,
 			"HELPER_GC_PIDFILE="+pidfile,
+			"HELPER_SPAWN_DELAY="+spawnDelay.String(),
 		)
 		return c
 	}
@@ -407,53 +476,36 @@ func setKillGrace(d time.Duration) func() {
 // killPidFromFile best-effort SIGKILLs the pid recorded in pidfile — cleanup for
 // an escaped grandchild the group kill cannot reap.
 func killPidFromFile(pidfile string) {
-	if b, err := os.ReadFile(pidfile); err == nil {
-		if pid, perr := strconv.Atoi(string(b)); perr == nil && pid > 0 {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-		}
+	if pid, ok := timescale.ReadPidFile(pidfile); ok {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 }
 
 // pidAliveFromFile reports whether the pid recorded in pidfile is still live.
 func pidAliveFromFile(t *testing.T, pidfile string) bool {
 	t.Helper()
-	b, err := os.ReadFile(pidfile)
-	if err != nil {
-		t.Fatalf("read grandchild pidfile %s: %v", pidfile, err)
-	}
-	pid, err := strconv.Atoi(string(b))
-	if err != nil {
-		t.Fatalf("parse grandchild pid %q: %v", b, err)
+	pid, ok := timescale.ReadPidFile(pidfile)
+	if !ok {
+		t.Fatalf("grandchild pid not recorded in %s", pidfile)
 	}
 	return syscall.Kill(pid, 0) == nil
 }
 
-// grandchildLivenessWait bounds how long a loaded CI runner may take to START
-// (fork/exec the grandchild and flush its pid file) or REAP (deliver the
-// group-kill signal and have the kernel remove the process) a helper process in
-// waitPidGone. This is spawn/reap liveness, NOT the kill-latency behavior under
-// test — raised from the stale 3s to the shared scaled 30s-base bound (parity
-// with claudecode), closing the second copy of the spawn race that produced the
-// 30.31s CI failure. A function, not a const, so the factor is read at call
-// time.
+// grandchildLivenessWait bounds how long a loaded host may take to REAP (deliver
+// the group-kill signal and have the kernel remove the process) the grandchild
+// in waitPidGone. This is reap liveness, NOT the kill-latency behavior under
+// test. Spawn is no longer waited on here: the SpawnGate precondition
+// (RequireArmed, #4177) guarantees the pid was recorded before waitPidGone
+// runs. A function, not a const, so the factor is read at call time.
 func grandchildLivenessWait() time.Duration { return timescale.D(30 * time.Second) }
 
-// waitPidGone polls until the pid recorded in pidfile is gone, or fails the test.
+// waitPidGone polls until the already-recorded grandchild pid is gone, or fails
+// the test.
 func waitPidGone(t *testing.T, pidfile string) {
 	t.Helper()
-	// Wait for the grandchild to have written its pid first.
-	var pid int
-	for deadline := time.Now().Add(grandchildLivenessWait()); time.Now().Before(deadline); {
-		if b, err := os.ReadFile(pidfile); err == nil {
-			if p, perr := strconv.Atoi(string(b)); perr == nil && p > 0 {
-				pid = p
-				break
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if pid == 0 {
-		t.Fatalf("grandchild never wrote its pid to %s", pidfile)
+	pid, ok := timescale.ReadPidFile(pidfile)
+	if !ok {
+		t.Fatalf("grandchild pid not recorded in %s", pidfile)
 	}
 	for deadline := time.Now().Add(grandchildLivenessWait()); time.Now().Before(deadline); {
 		if syscall.Kill(pid, 0) != nil {
@@ -465,42 +517,49 @@ func waitPidGone(t *testing.T, pidfile string) {
 	t.Errorf("grandchild pid %d still alive — the group kill did not reap it", pid)
 }
 
-// TestInference_PipeLeakGroupKillTimeout is the #1805 group-kill arm through the
-// full Review()/Inference() path: a wedged fake codex holds an in-group
-// grandchild that inherited stdout, run under a genuine incoming context
-// DEADLINE. procgroup.Harden's whole-group SIGKILL reaps the grandchild so
-// cmd.Output() returns AT the deadline (not minutes later), the error is the
-// (timeout) classification, the deadline (not a bare cancel) is the trigger, the
-// attempt is not retried, and the grandchild is reaped.
-func TestInference_PipeLeakGroupKillTimeout(t *testing.T) {
+// runGroupKillCase is the #1805 group-kill arm through the full Inference() path:
+// a wedged fake codex holds an in-group grandchild that inherited stdout, run
+// under a genuine incoming context DEADLINE. procgroup.Harden's whole-group
+// SIGKILL reaps the grandchild so cmd.Output() returns AT the deadline (not
+// minutes later), the error is the (timeout) classification, the deadline (not
+// a bare cancel) is the trigger, the attempt is not retried, and the grandchild
+// is reaped. The deadline is a timescale.SpawnGate (#4177): it arms only once
+// the grandchild pid is recorded, so it cannot fire the group kill before the
+// grandchild exists, and the elapsed bound is measured from that ARM instant
+// so a slow spawn cannot eat it. spawnDelay > 0 is the margin pin.
+func runGroupKillCase(t *testing.T, spawnDelay time.Duration) {
+	t.Helper()
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
 	// Every deadline-competing duration derives from timescale.D (base × the
 	// shared factor) so the discrimination ratios (bound/deadline,
-	// long-grace/bound, wedge/bound) hold at any factor while CI gains headroom.
+	// long-grace/bound, wedge/bound) hold at any factor.
 	defer setKillGrace(timescale.D(10 * time.Second))() // a long grace: group-kill must return well before it
 
 	var attempts int
 	c := NewClient(testConfig())
-	c.Cmd = countingPipeLeakHelper("pipe_leak_group", pidfile, &attempts)
+	c.Cmd = countingPipeLeakHelper("pipe_leak_group", pidfile, spawnDelay, &attempts)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(300*time.Millisecond))
-	defer cancel()
+	gate := timescale.NewSpawnGate(spawnBudget(), groupKillDeadline(), timescale.PidFileReady(pidfile))
+	t.Cleanup(gate.Stop)
 
-	start := time.Now()
-	_, _, _, err := c.Inference(ctx, "review")
-	elapsed := time.Since(start)
+	_, _, _, err := c.Inference(gate, "review")
+	returned := time.Now()
+	// PRECONDITION first: a starved host fails here, named as host load, never
+	// below as a defect in the group kill.
+	armedAt := gate.RequireArmed(t)
+	elapsed := returned.Sub(armedAt)
 
 	if err == nil {
 		t.Fatal("expected a timeout error from the wedged reviewer, got nil")
 	}
-	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline, not a bare cancel, must be the trigger)", ctx.Err())
+	if !errors.Is(gate.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline, not a bare cancel, must be the trigger)", gate.Err())
 	}
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("error = %q, want it labelled a timeout", err)
 	}
 	if elapsed > timescale.D(3*time.Second) {
-		t.Errorf("Inference took %s — the group kill should return at the deadline, not wait the 10s grace (the #1805 hang)", elapsed)
+		t.Errorf("Inference returned %s after the deadline armed — the group kill should return at the deadline, not wait the 10s grace (the #1805 hang)", elapsed)
 	}
 	if attempts != 1 {
 		t.Errorf("attempts = %d, want 1 (a timeout must not be retried)", attempts)
@@ -508,43 +567,56 @@ func TestInference_PipeLeakGroupKillTimeout(t *testing.T) {
 	waitPidGone(t, pidfile)
 }
 
-// TestInference_PipeLeakEscapedGroupWaitDelayTimeout is the #1805 WaitDelay arm
-// and the step-5 hoist guard: the fake codex forks a grandchild that ESCAPES its
-// group and holds the inherited stdout pipe, then exits. The group kill cannot
-// reach the escaped grandchild, so cmd.WaitDelay force-closes the parent pipe fd
-// and cmd.Output() returns a NON-ExitError (context.DeadlineExceeded). The
-// HOISTED ctx.Err() check must still classify this as a (timeout); the pre-hoist
-// in-ExitError-branch code would have mislabelled it a generic invocation
-// failure. The trigger is asserted to be a genuine deadline.
-func TestInference_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) {
+// runEscapeCase is the #1805 WaitDelay arm and the step-5 hoist guard: the fake
+// codex forks a grandchild that ESCAPES its group and holds the inherited stdout
+// pipe, then exits. The group kill cannot reach the escaped grandchild, so
+// cmd.WaitDelay force-closes the parent pipe fd and cmd.Output() returns a
+// NON-ExitError. The HOISTED ctx.Err() check must still classify this as a
+// (timeout); the pre-hoist in-ExitError-branch code would have mislabelled it a
+// generic invocation failure. The trigger is asserted to be a genuine deadline.
+//
+// The deadline is a timescale.SpawnGate (#4177), so it arms near the fake's
+// exit, which is also when os/exec starts the WaitDelay timer. The margin: the
+// arm-to-exit latency must stay below escapeGrace() - escapeDeadline(), or
+// WaitDelay fires before the deadline and the trigger is no longer the
+// deadline. A failing run reports armedAt minus the fake's exit beside the
+// error.
+func runEscapeCase(t *testing.T, spawnDelay time.Duration) {
+	t.Helper()
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
-	// Grace and deadline both derive from timescale.D so the WaitDelay path
-	// stays fast and the elapsed bound below preserves its ratio at any factor.
-	defer setKillGrace(timescale.D(300 * time.Millisecond))() // short grace so the WaitDelay path is fast
+	// Grace and deadline both derive from timescale.D so the elapsed bound below
+	// preserves its ratio at any factor.
+	defer setKillGrace(escapeGrace())()
 	t.Cleanup(func() { killPidFromFile(pidfile) })
 
 	var attempts int
 	c := NewClient(testConfig())
-	c.Cmd = countingPipeLeakHelper("pipe_leak_escape", pidfile, &attempts)
+	c.Cmd = countingPipeLeakHelper("pipe_leak_escape", pidfile, spawnDelay, &attempts)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(200*time.Millisecond))
-	defer cancel()
+	gate := timescale.NewSpawnGate(spawnBudget(), escapeDeadline(), timescale.PidFileReady(pidfile))
+	t.Cleanup(gate.Stop)
 
-	start := time.Now()
-	_, _, _, err := c.Inference(ctx, "review")
-	elapsed := time.Since(start)
+	_, _, _, err := c.Inference(gate, "review")
+	returned := time.Now()
+	armedAt := gate.RequireArmed(t) // PRECONDITION first (see runGroupKillCase)
+	elapsed := returned.Sub(armedAt)
+	defer func() {
+		if t.Failed() {
+			t.Logf("escape margin: %s", armToExitDiag(pidfile, armedAt))
+		}
+	}()
 
 	if err == nil {
 		t.Fatal("expected a timeout error from the WaitDelay-forced return, got nil")
 	}
-	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline must be the trigger, not a bare cancel)", ctx.Err())
+	if !errors.Is(gate.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline must be the trigger, not a bare cancel)", gate.Err())
 	}
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("error = %q, want the WaitDelay-forced non-ExitError return still classified as a timeout (the step-5 hoist)", err)
 	}
 	if elapsed > timescale.D(5*time.Second) {
-		t.Errorf("Inference took %s — WaitDelay should force-close near deadline+grace, not hang on the escaped grandchild", elapsed)
+		t.Errorf("Inference returned %s after the deadline armed — WaitDelay should force-close near exit+grace, not hang on the escaped grandchild", elapsed)
 	}
 	if attempts != 1 {
 		t.Errorf("attempts = %d, want 1 (a timeout must not be retried)", attempts)
@@ -553,6 +625,63 @@ func TestInference_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) {
 	// the WaitDelay path); cleanup kills it.
 	if !pidAliveFromFile(t, pidfile) {
 		t.Error("grandchild was reaped — it should have escaped the group and been force-closed via WaitDelay")
+	}
+}
+
+// TestInference_PipeLeakGroupKillTimeout is the #1805 group-kill arm (runGroupKillCase) with a fast spawn.
+func TestInference_PipeLeakGroupKillTimeout(t *testing.T) { runGroupKillCase(t, 0) }
+
+// TestInference_PipeLeakEscapedGroupWaitDelayTimeout is the #1805 WaitDelay arm (runEscapeCase) with a fast spawn.
+func TestInference_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) { runEscapeCase(t, 0) }
+
+// TestInference_PipeLeakToleratesSlowSpawn is the #4177 margin pin: the same group and escape cases with the
+// fake sleeping D(1s) before it forks — between the old ungated cheap deadline
+// and the spawn budget — must pass under the SpawnGate. Its NEGATIVE old-shape
+// arm runs the same slow fixture under a plain context.WithTimeout(cheap
+// deadline) started at call time and asserts the grandchild pid is never
+// recorded: that deadline group-kills the fake during its pre-spawn sleep, and
+// Output returns only after that fake is reaped, so it can no longer fork. That
+// is the 30s "grandchild never wrote its pid" failure the gate removes.
+func TestInference_PipeLeakToleratesSlowSpawn(t *testing.T) {
+	cases := []struct {
+		name     string
+		mode     string
+		deadline func() time.Duration
+		grace    func() time.Duration
+		run      func(*testing.T, time.Duration)
+	}{
+		{"group", "pipe_leak_group", groupKillDeadline, func() time.Duration { return timescale.D(10 * time.Second) }, runGroupKillCase},
+		{"escape", "pipe_leak_escape", escapeDeadline, escapeGrace, runEscapeCase},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slow := timescale.D(1 * time.Second)
+			if slow <= tc.deadline() {
+				t.Fatalf("pin precondition: the slow spawn %s must exceed the cheap %s deadline, or the pin cannot tell the gate from the old raw deadline", slow, tc.deadline())
+			}
+			if slow >= spawnBudget() {
+				t.Fatalf("pin precondition: the slow spawn %s must stay below the %s spawn budget, or the gated case fails as a PRECONDITION", slow, spawnBudget())
+			}
+
+			tc.run(t, slow)
+
+			// NEGATIVE old-shape arm.
+			pidfile := filepath.Join(t.TempDir(), "old.pid")
+			t.Cleanup(func() { killPidFromFile(pidfile) })
+			defer setKillGrace(tc.grace())()
+			var attempts int
+			c := NewClient(testConfig())
+			c.Cmd = countingPipeLeakHelper(tc.mode, pidfile, slow, &attempts)
+			ctx, cancel := context.WithTimeout(context.Background(), tc.deadline())
+			defer cancel()
+			_, _, _, err := c.Inference(ctx, "review")
+			if err == nil {
+				t.Fatal("old-shape arm: expected the ungated deadline to kill the slow fake, got nil")
+			}
+			if pid, ok := timescale.ReadPidFile(pidfile); ok {
+				t.Fatalf("old-shape arm: grandchild pid %d was recorded under the ungated %s deadline — the slow spawn no longer outlasts it, so this pin does not discriminate the gate from the old shape", pid, tc.deadline())
+			}
+		})
 	}
 }
 

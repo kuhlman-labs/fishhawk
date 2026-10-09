@@ -8,6 +8,13 @@
 // long-grace/bound) is preserved by construction while the family gains headroom
 // on CI-class hardware.
 //
+// Scaling cannot separate a deadline whose expiry IS the verdict from a spawn
+// that must complete first (the factor is 1 where CI is unset, as in the
+// runner's gate container), so the package also provides SpawnGate, a context
+// whose cheap deadline arms only once the spawn precondition holds, and the
+// WritePidFile/ReadPidFile/PidFileReady helpers it pairs with (#4177). Like the
+// rest of the package they are test support, imported only by _test.go files.
+//
 // Factor precedence:
 //
 //	FISHHAWK_TEST_TIME_SCALE (explicit positive integer) — wins over everything.
