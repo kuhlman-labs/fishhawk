@@ -643,14 +643,126 @@ func initRepoWithOrigin(t *testing.T) (operator, tipSHA string) {
 	return operator, tipSHA
 }
 
-// TestProvisionLineageWorktree_RefusesDivergedSeed is the #1866 repro: a
-// leftover unmerged commit on the operator HEAD (never pushed to the base)
-// makes a FRESH provision refuse with a *baseDivergenceError naming both the
-// HEAD SHA and the base tip SHA, and no new worktree is registered (the refusal
-// fires before `git worktree add`).
-func TestProvisionLineageWorktree_RefusesDivergedSeed(t *testing.T) {
+// withLineageSeedGetenv swaps the environment reader provisionLineageWorktree
+// hands resolveLineageSeed (#3973), so a test drives the
+// FISHHAWK_LINEAGE_SEED_FROM_HEAD opt-in without t.Setenv.
+func withLineageSeedGetenv(t *testing.T, optIn string) {
+	t.Helper()
+	orig := lineageSeedGetenv
+	lineageSeedGetenv = func(k string) string {
+		if k == lineageSeedFromHeadEnvVar {
+			return optIn
+		}
+		return ""
+	}
+	t.Cleanup(func() { lineageSeedGetenv = orig })
+}
+
+// initRepoBehindOrigin builds initRepoWithOrigin's shape, then advances
+// origin/main by one pushed commit and resets the operator HEAD back to the
+// previous tip — so HEAD is strictly an ANCESTOR of origin/main (the fallback's
+// ancestry guard passes) and the two SHAs differ (a seed from the wrong source
+// is observable). Returns the operator checkout, its HEAD and the origin tip.
+func initRepoBehindOrigin(t *testing.T) (operator, headSHA, tipSHA string) {
+	t.Helper()
+	operator, headSHA = initRepoWithOrigin(t)
+	if err := os.WriteFile(filepath.Join(operator, "adv.txt"), []byte("adv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "-A"},
+		{"commit", "-q", "-m", "advance base"},
+		{"push", "-q", "origin", "HEAD:main"},
+		{"fetch", "-q", "origin"},
+	} {
+		if err := runGitErr(operator, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var err error
+	if tipSHA, err = runGitOut(operator, "rev-parse", "refs/remotes/origin/main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGitErr(operator, "reset", "-q", "--hard", headSHA); err != nil {
+		t.Fatal(err)
+	}
+	if headSHA == tipSHA {
+		t.Fatalf("fixture: HEAD %q == origin tip; want HEAD behind", headSHA)
+	}
+	return operator, headSHA, tipSHA
+}
+
+// worktreeHead returns the HEAD SHA of a provisioned worktree.
+func worktreeHead(t *testing.T, wt string) string {
+	t.Helper()
+	sha, err := runGitOut(wt, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sha
+}
+
+// TestProvisionLineageWorktree_DivergedHeadSeedsFromDeclaredBase is the #3973
+// default-path successor of the #1866 repro: a leftover unmerged commit on the
+// operator HEAD no longer reaches the fresh worktree at all, because the seed is
+// the FETCHED tip of origin/main, not HEAD. The provision succeeds, the worktree
+// sits at the origin tip without the stray file, no fallback is logged, and the
+// operator HEAD and tree are untouched.
+func TestProvisionLineageWorktree_DivergedHeadSeedsFromDeclaredBase(t *testing.T) {
 	operator, tipSHA := initRepoWithOrigin(t)
 	ctx := context.Background()
+
+	if err := os.WriteFile(filepath.Join(operator, "leftover.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "leftover unmerged commit"}} {
+		if err := runGitErr(operator, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	headSHA := gitPorcelainHead(t, operator)
+
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(ctx, operator, "div00000", "main", &log)
+	if err != nil {
+		t.Fatalf("provision refused; want the declared-base seed to bypass the diverged HEAD: %v", err)
+	}
+	if got := worktreeHead(t, wt); got != tipSHA {
+		t.Errorf("worktree seeded at %q, want the origin/main tip %q (operator HEAD is %q)", got, tipSHA, headSHA)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "leftover.txt")); err == nil {
+		t.Error("the operator's unmerged leftover.txt reached the fresh worktree (#1866)")
+	}
+	for _, want := range []string{
+		`"event":"lineage_worktree_seeded"`,
+		`"seed_sha":"` + tipSHA + `"`,
+		`"source":"declared_base"`,
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("missing %s in provision log:\n%s", want, log.String())
+		}
+	}
+	if strings.Contains(log.String(), `"event":"lineage_seed_fallback"`) {
+		t.Errorf("declared-base seed logged a fallback:\n%s", log.String())
+	}
+	if got := gitPorcelainHead(t, operator); got != headSHA {
+		t.Errorf("operator HEAD moved: %q, want %q", got, headSHA)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator tree dirtied by the seed fetch:\n%s", status)
+	}
+}
+
+// TestProvisionLineageWorktree_FallbackStillRefusesDivergedHead pins the #1866
+// guard on the #3973 FALLBACK path: remoteHasBranch reports the base absent
+// (base_ref_absent), so the seed falls back to the operator HEAD — which carries
+// a local-only commit while a real refs/remotes/origin/main exists. The fresh
+// provision must refuse with a *baseDivergenceError naming both SHAs, before any
+// worktree is registered.
+func TestProvisionLineageWorktree_FallbackStillRefusesDivergedHead(t *testing.T) {
+	operator, tipSHA := initRepoWithOrigin(t)
+	ctx := context.Background()
+	withFakeRemoteHasBranch(t, false, nil)
 
 	// A leftover unmerged commit on the operator HEAD — the MCP-cwd-default
 	// footgun (#1866): committed locally, never pushed to the base.
@@ -668,19 +780,31 @@ func TestProvisionLineageWorktree_RefusesDivergedSeed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, provErr := provisionLineageWorktree(ctx, operator, "div00000", "main", io.Discard)
+	var log bytes.Buffer
+	_, provErr := provisionLineageWorktree(ctx, operator, "div00000", "main", &log)
 	if provErr == nil {
-		t.Fatal("provision succeeded from a diverged seed; want a loud refusal")
+		t.Fatal("fallback provision succeeded from a diverged seed; want a loud refusal")
 	}
 	var bde *baseDivergenceError
 	if !errors.As(provErr, &bde) {
 		t.Fatalf("error = %T (%v), want *baseDivergenceError", provErr, provErr)
+	}
+	if got := worktreeProvisionFailureReason(provErr); got != "working_dir_diverged_from_base" {
+		t.Errorf("reason = %q, want working_dir_diverged_from_base", got)
+	}
+	// The refusal reaches runner_failed's detail unwrapped, byte-identical to
+	// the pre-#3973 text.
+	if !strings.HasPrefix(provErr.Error(), "seed checkout HEAD ") {
+		t.Errorf("refusal text was wrapped or rewritten: %q", provErr.Error())
 	}
 	if !strings.Contains(provErr.Error(), headSHA) {
 		t.Errorf("refusal message missing HEAD SHA %q:\n%s", headSHA, provErr.Error())
 	}
 	if !strings.Contains(provErr.Error(), tipSHA) {
 		t.Errorf("refusal message missing base tip SHA %q:\n%s", tipSHA, provErr.Error())
+	}
+	if !strings.Contains(log.String(), `"event":"lineage_seed_fallback","reason":"base_ref_absent"`) {
+		t.Errorf("missing base_ref_absent fallback line before the refusal:\n%s", log.String())
 	}
 	// The refusal fired before `git worktree add` — no worktree registered.
 	registered, err := listWorktreePaths(ctx, operator)
@@ -693,54 +817,211 @@ func TestProvisionLineageWorktree_RefusesDivergedSeed(t *testing.T) {
 	}
 }
 
-// TestProvisionLineageWorktree_EqualAndBehindSeedPass asserts the two allowed
-// shapes: HEAD equal to the base tip provisions, and HEAD strictly BEHIND the
-// base tip (an ancestor — commit-time FreshFetchBase handles a base that has
-// since advanced, ADR-043) also provisions.
+// TestProvisionLineageWorktree_EqualAndBehindSeedPass asserts the two common
+// default-path shapes: HEAD equal to the origin tip seeds at that tip, and HEAD
+// strictly BEHIND it (the plan stage dispatched from a stale operator checkout)
+// now seeds at the ORIGIN TIP, not the stale HEAD (#3973).
 func TestProvisionLineageWorktree_EqualAndBehindSeedPass(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("EqualToTip", func(t *testing.T) {
-		operator, _ := initRepoWithOrigin(t)
+		operator, tipSHA := initRepoWithOrigin(t)
 		wt, err := provisionLineageWorktree(ctx, operator, "eq000000", "main", io.Discard)
 		if err != nil {
 			t.Fatalf("provision at tip refused: %v", err)
 		}
-		if st, err := os.Stat(wt); err != nil || !st.IsDir() {
-			t.Fatalf("worktree not created: %v", err)
+		if got := worktreeHead(t, wt); got != tipSHA {
+			t.Errorf("worktree seeded at %q, want %q", got, tipSHA)
 		}
 	})
 
 	t.Run("BehindTip", func(t *testing.T) {
-		operator, _ := initRepoWithOrigin(t)
-		base, err := runGitOut(operator, "rev-parse", "HEAD")
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Advance origin/main by one commit (updating refs/remotes/origin/main),
-		// then move HEAD back to base so HEAD is strictly an ancestor of the tip.
-		if err := os.WriteFile(filepath.Join(operator, "adv.txt"), []byte("adv\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		for _, args := range [][]string{
-			{"add", "-A"},
-			{"commit", "-q", "-m", "advance base"},
-			{"push", "-q", "origin", "HEAD:main"},
-			{"fetch", "-q", "origin"},
-			{"reset", "--hard", base},
-		} {
-			if err := runGitErr(operator, args...); err != nil {
-				t.Fatal(err)
-			}
-		}
-		wt, err := provisionLineageWorktree(ctx, operator, "bh000000", "main", io.Discard)
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(ctx, operator, "bh000000", "main", &log)
 		if err != nil {
 			t.Fatalf("provision behind tip refused: %v", err)
 		}
-		if st, err := os.Stat(wt); err != nil || !st.IsDir() {
-			t.Fatalf("worktree not created: %v", err)
+		if got := worktreeHead(t, wt); got != tipSHA {
+			t.Errorf("worktree seeded at %q, want the origin/main tip %q (not the stale HEAD %q)", got, tipSHA, headSHA)
+		}
+		if !strings.Contains(log.String(), `"seed_sha":"`+tipSHA+`","source":"declared_base"`) {
+			t.Errorf("missing declared_base seed record naming %q:\n%s", tipSHA, log.String())
+		}
+		if got := gitPorcelainHead(t, operator); got != headSHA {
+			t.Errorf("operator HEAD moved: %q, want %q", got, headSHA)
 		}
 	})
+}
+
+// assertHeadSeedFallback asserts the shared shape of every #3973 fallback:
+// the fresh worktree sits at the operator HEAD (NOT the origin tip), and one
+// lineage_seed_fallback line names the expected reason and an operator_head
+// seed record follows.
+func assertHeadSeedFallback(t *testing.T, wt, headSHA, tipSHA, reason, log string) {
+	t.Helper()
+	if got := worktreeHead(t, wt); got != headSHA {
+		t.Errorf("worktree seeded at %q, want the operator HEAD %q (origin tip %q)", got, headSHA, tipSHA)
+	}
+	if !strings.Contains(log, `"event":"lineage_seed_fallback","reason":"`+reason+`"`) {
+		t.Errorf("missing lineage_seed_fallback reason %q:\n%s", reason, log)
+	}
+	if got := strings.Count(log, `"event":"lineage_seed_fallback"`); got != 1 {
+		t.Errorf("lineage_seed_fallback lines = %d, want exactly 1:\n%s", got, log)
+	}
+	if !strings.Contains(log, `"seed_sha":"`+headSHA+`","source":"operator_head"`) {
+		t.Errorf("missing operator_head seed record naming %q:\n%s", headSHA, log)
+	}
+}
+
+// The per-reason fallback tests (#3973). Each fixture has HEAD strictly BEHIND
+// a REAL, fetchable origin/main, so a reason branch that wrongly fell through
+// to the declared-base path would seed the (different) origin tip — or, where
+// the next seam is the one stubbed to fail, error — and the test goes red on
+// its seed or reason assertion.
+
+func TestProvisionLineageWorktree_SeedFallback_OperatorOptIn(t *testing.T) {
+	operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+	withLineageSeedGetenv(t, "1")
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(context.Background(), operator, "optin000", "main", &log)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	assertHeadSeedFallback(t, wt, headSHA, tipSHA, "operator_opt_in", log.String())
+}
+
+// TestProvisionLineageWorktree_SeedFallback_OptInRequiresExactlyOne pins the
+// opt-in's value contract: anything other than "1" keeps the declared-base seed.
+func TestProvisionLineageWorktree_SeedFallback_OptInRequiresExactlyOne(t *testing.T) {
+	operator, _, tipSHA := initRepoBehindOrigin(t)
+	withLineageSeedGetenv(t, "true")
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(context.Background(), operator, "optin001", "main", &log)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if got := worktreeHead(t, wt); got != tipSHA {
+		t.Errorf("FISHHAWK_LINEAGE_SEED_FROM_HEAD=true seeded %q, want the origin tip %q", got, tipSHA)
+	}
+}
+
+func TestProvisionLineageWorktree_SeedFallback_RemoteUnconfigured(t *testing.T) {
+	operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+	// origin is REALLY configured and fetchable; only the discriminator says
+	// otherwise, so a fall-through would fetch and seed the origin tip.
+	withFakeRemoteConfigured(t, false)
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(context.Background(), operator, "unconf00", "main", &log)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	assertHeadSeedFallback(t, wt, headSHA, tipSHA, "remote_unconfigured", log.String())
+}
+
+func TestProvisionLineageWorktree_SeedFallback_BaseQueryFailed(t *testing.T) {
+	operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+	withFakeRemoteHasBranch(t, true, errors.New("ls-remote: could not resolve host"))
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(context.Background(), operator, "qfail000", "main", &log)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	assertHeadSeedFallback(t, wt, headSHA, tipSHA, "base_query_failed", log.String())
+	if !strings.Contains(log.String(), "could not resolve host") {
+		t.Errorf("fallback line does not carry the query error detail:\n%s", log.String())
+	}
+}
+
+func TestProvisionLineageWorktree_SeedFallback_BaseRefAbsent(t *testing.T) {
+	t.Run("NeverPushedBase", func(t *testing.T) {
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		withFakeRemoteHasBranch(t, false, nil)
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(context.Background(), operator, "absent00", "main", &log)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		assertHeadSeedFallback(t, wt, headSHA, tipSHA, "base_ref_absent", log.String())
+	})
+	t.Run("NoDeclaredBase", func(t *testing.T) {
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(context.Background(), operator, "absent01", "", &log)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		assertHeadSeedFallback(t, wt, headSHA, tipSHA, "base_ref_absent", log.String())
+	})
+}
+
+func TestProvisionLineageWorktree_SeedFallback_FetchFailed(t *testing.T) {
+	t.Run("FetchError", func(t *testing.T) {
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+			return "", errors.New("fetch: authentication failed")
+		})
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(context.Background(), operator, "ffail000", "main", &log)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		assertHeadSeedFallback(t, wt, headSHA, tipSHA, "fetch_failed", log.String())
+		if !strings.Contains(log.String(), "authentication failed") {
+			t.Errorf("fallback line does not carry the fetch error detail:\n%s", log.String())
+		}
+	})
+	t.Run("TipNotALocalCommit", func(t *testing.T) {
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+			return "1111111111111111111111111111111111111111", nil
+		})
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(context.Background(), operator, "ffail002", "main", &log)
+		if err != nil {
+			t.Fatalf("provision failed on an absent fetched tip; want the fetch_failed fallback: %v", err)
+		}
+		assertHeadSeedFallback(t, wt, headSHA, tipSHA, "fetch_failed", log.String())
+		if !strings.Contains(log.String(), "not a commit in the local object store") {
+			t.Errorf("fallback line does not name the absent tip object:\n%s", log.String())
+		}
+	})
+	t.Run("EmptyTip", func(t *testing.T) {
+		operator, headSHA, tipSHA := initRepoBehindOrigin(t)
+		withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+			return " ", nil
+		})
+		var log bytes.Buffer
+		wt, err := provisionLineageWorktree(context.Background(), operator, "ffail001", "main", &log)
+		if err != nil {
+			t.Fatalf("provision: %v", err)
+		}
+		assertHeadSeedFallback(t, wt, headSHA, tipSHA, "fetch_failed", log.String())
+	})
+}
+
+// TestProvisionLineageWorktree_FallbackUnresolvableHeadFails pins the fallback's
+// resolveHead error: a repo with no commit (no origin, so remote_unconfigured)
+// cannot be seeded from HEAD, and the error is the generic worktree_provision
+// one, not a #1866 refusal.
+func TestProvisionLineageWorktree_FallbackUnresolvableHeadFails(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	if err := runGitErr(repo, "init", "-q"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := provisionLineageWorktree(context.Background(), repo, "nohead00", "main", io.Discard)
+	if err == nil {
+		t.Fatal("provision succeeded with an unresolvable HEAD")
+	}
+	if !strings.Contains(err.Error(), "resolve HEAD") {
+		t.Errorf("error does not name the HEAD resolution: %v", err)
+	}
+	if got := worktreeProvisionFailureReason(err); got != "worktree_provision" {
+		t.Errorf("reason = %q, want worktree_provision", got)
+	}
 }
 
 // TestProvisionLineageWorktree_RemoteUnconfiguredSkips asserts the #1302
@@ -761,15 +1042,20 @@ func TestProvisionLineageWorktree_RemoteUnconfiguredSkips(t *testing.T) {
 		!strings.Contains(log.String(), `"reason":"remote_unconfigured"`) {
 		t.Errorf("missing remote_unconfigured skip event:\n%s", log.String())
 	}
+	if !strings.Contains(log.String(), `"event":"lineage_seed_fallback","reason":"remote_unconfigured"`) {
+		t.Errorf("missing remote_unconfigured seed fallback:\n%s", log.String())
+	}
 }
 
 // TestProvisionLineageWorktree_TrackingRefAbsentSkips asserts the
-// base_ref_unresolvable degrade: origin is configured but
-// refs/remotes/origin/main is absent (never fetched / deleted), so the guard
+// base_ref_unresolvable degrade of the fallback's ancestry guard: origin is
+// configured but refs/remotes/origin/main is absent (never fetched / deleted)
+// and the seed has fallen back to HEAD (base_ref_absent, #3973), so the guard
 // skips and provisions.
 func TestProvisionLineageWorktree_TrackingRefAbsentSkips(t *testing.T) {
 	operator, _ := initRepoWithOrigin(t)
 	ctx := context.Background()
+	withFakeRemoteHasBranch(t, false, nil)
 	// Origin stays configured; delete only the remote-tracking ref.
 	if err := runGitErr(operator, "update-ref", "-d", "refs/remotes/origin/main"); err != nil {
 		t.Fatal(err)
@@ -795,6 +1081,8 @@ func TestProvisionLineageWorktree_TrackingRefAbsentSkips(t *testing.T) {
 func TestProvisionLineageWorktree_AncestryProbeFailedSkips(t *testing.T) {
 	operator, _ := initRepoWithOrigin(t)
 	ctx := context.Background()
+	// The ancestry guard runs on the operator-HEAD fallback only (#3973).
+	withLineageSeedGetenv(t, "1")
 
 	orig := ancestryProbe
 	ancestryProbe = func(_ context.Context, _, _, _ string) error {
@@ -827,6 +1115,9 @@ func TestProvisionLineageWorktree_AncestryProbeFailedSkips(t *testing.T) {
 func TestProvisionLineageWorktree_PinsSeedAgainstConcurrentHeadAdvance(t *testing.T) {
 	operator, tipSHA := initRepoWithOrigin(t)
 	ctx := context.Background()
+	// The HEAD pin matters on the operator-HEAD fallback only (#3973); the
+	// declared-base seed is an immutable fetched SHA with no window to race.
+	withLineageSeedGetenv(t, "1")
 
 	orig := ancestryProbe
 	var advancedSHA string
