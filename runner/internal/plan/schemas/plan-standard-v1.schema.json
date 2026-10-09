@@ -132,8 +132,25 @@
     "new_architectural_decision": {
       "$ref": "#/$defs/new-architectural-decision",
       "description": "Optional (E78.4 / #3748). The planner's declaration that this plan sets NEW ARCHITECTURAL DIRECTION — PRESENCE of this object is the declaration, the same idiom as irreducible. Declare it when the plan introduces a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or departs from a cited ADR. Do NOT declare it for routine work inside existing decisions, which is most plans. It is surfaced to the captain as one plan_warnings advisory naming the decision summary, the rationale and the related ADRs, and the captain decides whether the direction needs an ADR. It gates nothing: unlike irreducible, no enforcement path reads it. Additive-optional within standard_v1 (no major bump)."
+    },
+    "delivery": {
+      "type": "string",
+      "enum": ["full", "partial"],
+      "description": "Optional (E83.52 / #4085). Absent means full. `partial` declares that the approved plan deliberately delivers only a slice of the triggering issue's scope (part of its done-means is left for a later run). For a partial plan the PR references the issue with `Refs #N` instead of `Closes #N`, so merging it does not close the issue; Fishhawk posts remaining_scope on the issue at merge; and the plan gate surfaces the declaration to the approver as a PARTIAL DELIVERY plan_warnings advisory. Omit it for a full delivery, which is the normal case. Additive-optional within standard_v1 (no major bump)."
+    },
+    "remaining_scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "Optional (E83.52 / #4085). The short statement of what the triggering issue still needs after this delivery. REQUIRED when delivery is partial (enforced by the root if/then) and INVALID otherwise (plan.Parse rejects a remaining_scope paired with an absent or full delivery, and a whitespace-only one, which minLength:1 admits). Posted on the issue at merge and shown to the approver in the PARTIAL DELIVERY advisory."
     }
   },
+
+  "if": {
+    "properties": { "delivery": { "const": "partial" } },
+    "required": ["delivery"]
+  },
+  "then": { "required": ["remaining_scope"] },
 
   "$defs": {
     "ticket-reference": {

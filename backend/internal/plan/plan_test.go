@@ -1716,7 +1716,11 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the E78.4 / #3748 top-level
+// no validation behavior — most recently the E83.52 / #4085 top-level
+// delivery / remaining_scope pair and the root if/then requiring
+// remaining_scope when delivery is partial (the planner's declaration that a
+// plan delivers only a slice of its triggering issue, so the PR references the
+// issue with Refs instead of Closes). Before that: the E78.4 / #3748 top-level
 // new_architectural_decision field (the planner's declaration that a plan sets
 // new architectural direction, read only by the plan-gate advisory pass and
 // never by an enforcement site). Before that: the E72.1 / #3325
@@ -1747,7 +1751,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "d37e4356672223f77b0efddb697cad11fcddecd4641e7b938163d27046735f7c"
+	const wantHash = "55782c088a988977f15f32d1370aa8a398304bdea359f092a36dabddd6ba2b6d"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -2957,6 +2961,185 @@ func TestNewArchitecturalDecision_Declared_TruthTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.in.Declared(); got != tc.want {
 				t.Errorf("Declared() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// --- delivery / remaining_scope (E83.52 / #4085) ---
+
+const testRemainingScope = "the merge-time issue comment and the ship-time guard land in a later run"
+
+// deliveryPlan returns a valid plan fixture carrying the given delivery and
+// remaining_scope values. An empty string leaves that key absent.
+func deliveryPlan(t *testing.T, delivery, remaining string) []byte {
+	t.Helper()
+	return marshalFixture(t, planfixture.Valid(func(m map[string]any) {
+		if delivery != "" {
+			m["delivery"] = delivery
+		}
+		if remaining != "" {
+			m["remaining_scope"] = remaining
+		}
+	}))
+}
+
+// TestParse_PartialDelivery_RoundTrips covers the additive optional pair: a
+// partial plan carrying remaining_scope validates, decodes both fields, reports
+// IsPartialDelivery, and re-marshals with both keys.
+func TestParse_PartialDelivery_RoundTrips(t *testing.T) {
+	p, err := plan.Parse(deliveryPlan(t, plan.DeliveryPartial, testRemainingScope))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Delivery != plan.DeliveryPartial || p.RemainingScope != testRemainingScope {
+		t.Errorf("decoded delivery=%q remaining_scope=%q", p.Delivery, p.RemainingScope)
+	}
+	if !p.IsPartialDelivery() {
+		t.Error("a partial plan should report IsPartialDelivery() == true")
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+	if !strings.Contains(string(out), `"delivery":"partial"`) || !strings.Contains(string(out), `"remaining_scope":"`+testRemainingScope+`"`) {
+		t.Errorf("re-marshalled plan lost delivery/remaining_scope: %s", out)
+	}
+	if _, err := plan.Parse(out); err != nil {
+		t.Fatalf("re-marshalled plan must re-validate: %v", err)
+	}
+}
+
+// TestParse_FullDelivery_NoRemainingScope_Accepted pins that an explicit full
+// delivery needs no remaining_scope, and that a legacy plan omitting both keys
+// still re-marshals without them (omitempty), so a full or legacy plan is
+// byte-shape-identical to before.
+func TestParse_FullDelivery_NoRemainingScope_Accepted(t *testing.T) {
+	p, err := plan.Parse(deliveryPlan(t, plan.DeliveryFull, ""))
+	if err != nil {
+		t.Fatalf("Parse full delivery: %v", err)
+	}
+	if p.IsPartialDelivery() {
+		t.Error("delivery: full must not report IsPartialDelivery")
+	}
+	legacy, err := plan.Parse(deliveryPlan(t, "", ""))
+	if err != nil {
+		t.Fatalf("Parse legacy plan: %v", err)
+	}
+	out, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("re-marshal legacy plan: %v", err)
+	}
+	if strings.Contains(string(out), `"delivery"`) || strings.Contains(string(out), `"remaining_scope"`) {
+		t.Errorf("legacy plan must re-marshal without delivery/remaining_scope keys: %s", out)
+	}
+}
+
+// TestValidate_PartialWithoutRemainingScope pins the schema's root if/then on
+// the SCHEMA-ONLY path (Validate never runs semanticCheck), which is the path
+// the runner uses before the plan stage succeeds. Nothing else in Validate
+// requires the key, so the root if/then is the only control deciding this.
+func TestValidate_PartialWithoutRemainingScope(t *testing.T) {
+	err := plan.Validate(deliveryPlan(t, plan.DeliveryPartial, ""))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	found := false
+	for _, v := range se.Violations {
+		if strings.Contains(v.Message, "remaining_scope") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Violations should name remaining_scope; got %+v", se.Violations)
+	}
+}
+
+// TestValidate_UnknownDeliveryValue_Rejected pins the enum.
+func TestValidate_UnknownDeliveryValue_Rejected(t *testing.T) {
+	err := plan.Validate(deliveryPlan(t, "slice", ""))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	found := false
+	for _, v := range se.Violations {
+		if v.Path == "/delivery" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Violations should name /delivery; got %+v", se.Violations)
+	}
+}
+
+// TestParse_PartialWithBlankRemainingScope_Rejected isolates checkDelivery's
+// blank branch: a whitespace-only remaining_scope satisfies minLength:1 and the
+// root if/then (proved before Parse), so only the semantic check can refuse it.
+func TestParse_PartialWithBlankRemainingScope_Rejected(t *testing.T) {
+	data := deliveryPlan(t, plan.DeliveryPartial, "   ")
+	if err := plan.Validate(data); err != nil {
+		t.Fatalf("schema Validate should admit a whitespace remaining_scope (minLength:1), got %v", err)
+	}
+	_, err := plan.Parse(data)
+	var sem *plan.SemanticError
+	if !errors.As(err, &sem) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(sem.Error(), "remaining_scope") || !strings.Contains(sem.Error(), "non-blank") {
+		t.Errorf("SemanticError should name remaining_scope as blank, got %q", sem.Error())
+	}
+}
+
+// TestParse_RemainingScopeWithoutPartial_Rejected isolates checkDelivery's
+// mismatch branch, which the schema does not express: a remaining_scope paired
+// with delivery full, or with delivery absent, passes schema Validate (proved
+// per case before Parse), so only the semantic check can refuse it.
+func TestParse_RemainingScopeWithoutPartial_Rejected(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		delivery string
+	}{
+		{"delivery full", plan.DeliveryFull},
+		{"delivery absent", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := deliveryPlan(t, tc.delivery, testRemainingScope)
+			if err := plan.Validate(data); err != nil {
+				t.Fatalf("schema Validate should admit remaining_scope without partial, got %v", err)
+			}
+			_, err := plan.Parse(data)
+			var sem *plan.SemanticError
+			if !errors.As(err, &sem) {
+				t.Fatalf("err = %v, want *SemanticError", err)
+			}
+			if !strings.Contains(sem.Error(), "only valid with delivery: partial") {
+				t.Errorf("SemanticError should name the delivery mismatch, got %q", sem.Error())
+			}
+		})
+	}
+}
+
+// TestPlan_IsPartialDelivery_TruthTable pins the ONE shared definition. A
+// partial plan with a blank remaining_scope still reads as partial: consumers
+// skip semanticCheck, and partial is the safe direction (the issue stays open).
+func TestPlan_IsPartialDelivery_TruthTable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   *plan.Plan
+		want bool
+	}{
+		{"nil plan", nil, false},
+		{"delivery absent", &plan.Plan{}, false},
+		{"delivery full", &plan.Plan{Delivery: plan.DeliveryFull}, false},
+		{"unknown value", &plan.Plan{Delivery: "Partial"}, false},
+		{"delivery partial", &plan.Plan{Delivery: plan.DeliveryPartial, RemainingScope: testRemainingScope}, true},
+		{"partial, blank remaining_scope", &plan.Plan{Delivery: plan.DeliveryPartial}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.IsPartialDelivery(); got != tc.want {
+				t.Errorf("IsPartialDelivery() = %v, want %v", got, tc.want)
 			}
 		})
 	}

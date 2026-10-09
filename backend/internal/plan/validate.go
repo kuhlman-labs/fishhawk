@@ -468,6 +468,11 @@ func semanticCheck(p *Plan) error {
 	if err := checkNewArchitecturalDecision(p.NewArchitecturalDecision); err != nil {
 		return err
 	}
+	// delivery / remaining_scope coupling (E83.52 / #4085). Valid on any plan,
+	// so it precedes the decomposition early return.
+	if err := checkDelivery(p); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -675,6 +680,35 @@ func checkNewArchitecturalDecision(d *NewArchitecturalDecision) error {
 			return &SemanticError{
 				Message: fmt.Sprintf("new_architectural_decision.related_adrs[%d]: an ADR id must be non-blank; use an empty related_adrs array when no existing ADR covers the direction", i),
 			}
+		}
+	}
+	return nil
+}
+
+// checkDelivery validates a plan's optional delivery declaration (E83.52 /
+// #4085). The schema's root if/then already requires remaining_scope when
+// delivery is partial; two hard-rejection branches close what it cannot
+// express:
+//   - delivery partial with a whitespace-only remaining_scope → minLength:1
+//     admits a single space, but a partial delivery that states no remaining
+//     scope posts nothing useful on the issue at merge;
+//   - a non-empty remaining_scope with delivery absent or full → the remaining
+//     scope would never be posted and the issue would close on merge anyway,
+//     so the pairing is contradictory.
+//
+// A plan declaring neither field is a no-op.
+func checkDelivery(p *Plan) error {
+	if p.IsPartialDelivery() {
+		if strings.TrimSpace(p.RemainingScope) == "" {
+			return &SemanticError{
+				Message: "remaining_scope: a partial delivery must carry a non-blank remaining_scope stating what the issue still needs after this delivery",
+			}
+		}
+		return nil
+	}
+	if p.RemainingScope != "" {
+		return &SemanticError{
+			Message: "remaining_scope: remaining_scope is only valid with delivery: partial; drop it for a full delivery, or set delivery to partial when this plan deliberately delivers only a slice of the issue",
 		}
 	}
 	return nil
