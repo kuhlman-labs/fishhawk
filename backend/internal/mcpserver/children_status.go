@@ -4,26 +4,50 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/wavecoverage"
 )
 
 // Integration-phase values for ChildrenStatus.IntegrationPhase (E24.7 /
-// #1147). A pure classification over the children's lifecycle states plus
-// the presence of the fan-in audit kinds (slices_integrated /
-// slice_integration_conflict, ADR-041 / #1142):
+// #1147, reworked #4080). A pure classification over the children's lifecycle
+// states plus the parent's fan-in audit kinds (slices_integrated /
+// slice_integration_conflict, ADR-041 / #1142; slice_head_missing, #4079;
+// slice_integration_failed, #1243):
 //
 //   - running_children     — at least one child is still pending/running (or
-//     failed) and the fan-in has not been attempted.
-//   - ready_to_integrate   — every child succeeded but no fan-in audit landed.
-//   - integrated           — a slices_integrated audit recorded a clean fan-in.
-//   - integration_conflict — a slice_integration_conflict audit recorded a
-//     merge conflict and no later clean integration.
+//     failed), and no fan-in failure is newer than the newest clean
+//     integration. A between-wave slices_integrated entry does NOT make a
+//     mid-fan-out parent integrated (#4080).
+//   - ready_to_integrate   — every child succeeded but the NEWEST clean
+//     slices_integrated entry (if any) does not cover every child.
+//   - integrated           — every child succeeded AND the newest clean
+//     slices_integrated entry covers every child (wavecoverage.Uncovered is
+//     empty). Before #4080 ANY slices_integrated entry, including a partial
+//     between-wave one, read as integrated.
+//   - integration_conflict — a slice_integration_conflict audit is the newest
+//     fan-in failure and is strictly newer than the newest clean integration.
+//   - integration_failed   — a slice_head_missing or slice_integration_failed
+//     audit is the newest fan-in failure and is strictly newer than the newest
+//     clean integration (#4080).
 const (
 	integrationPhaseRunningChildren  = "running_children"
 	integrationPhaseReadyToIntegrate = "ready_to_integrate"
 	integrationPhaseIntegrated       = "integrated"
 	integrationPhaseConflict         = "integration_conflict"
+	integrationPhaseFailed           = "integration_failed"
+)
+
+// Fan-in audit categories the children-status block reads (#4080). The three
+// FAILURE kinds compete on Sequence with the one clean kind: the newest failure
+// wins only when strictly newer than the newest clean integration.
+const (
+	auditCategorySlicesIntegrated         = "slices_integrated"
+	auditCategorySliceIntegrationConflict = "slice_integration_conflict"
+	auditCategorySliceHeadMissing         = "slice_head_missing"
+	auditCategorySliceIntegrationFailed   = "slice_integration_failed"
 )
 
 // ChildStatus is one decomposed child's live lifecycle state, paired with
@@ -76,20 +100,23 @@ type ChildStatus struct {
 // State="unknown" rather than failing the snapshot, and the whole block is
 // omitted for non-decomposed runs.
 type ChildrenStatus struct {
-	IntegrationPhase string        `json:"integration_phase" jsonschema:"the fan-in phase: running_children (a child is still in flight), ready_to_integrate (all children succeeded, no fan-in yet), integrated (a slices_integrated audit recorded a clean fan-in), or integration_conflict (a slice_integration_conflict audit recorded a merge conflict)"`
+	IntegrationPhase string        `json:"integration_phase" jsonschema:"the fan-in phase: running_children (a child is still in flight or failed), ready_to_integrate (all children succeeded but the newest slices_integrated does not cover every child), integrated (all children succeeded AND the newest slices_integrated covers every child), integration_conflict (a slice_integration_conflict newer than the newest clean integration), or integration_failed (a slice_head_missing or slice_integration_failed newer than the newest clean integration)"`
 	Children         []ChildStatus `json:"children" jsonschema:"one entry per discovered child, in plan_decomposed (slice-index) order"`
 	Total            int           `json:"total" jsonschema:"number of discovered children"`
 	Pending          int           `json:"pending" jsonschema:"children in state pending"`
 	Running          int           `json:"running" jsonschema:"children in state running"`
 	Succeeded        int           `json:"succeeded" jsonschema:"children in state succeeded"`
 	Failed           int           `json:"failed" jsonschema:"children in state failed"`
-	// ConsolidatedBranch is the fan-in target branch surfaced from the
-	// slices_integrated audit payload when a clean integration landed.
-	ConsolidatedBranch string `json:"consolidated_branch,omitempty" jsonschema:"the consolidated branch a clean fan-in merged the slices onto; from the slices_integrated audit payload, present only in the integrated phase"`
+	// ConsolidatedBranch is the fan-in target branch decoded from the NEWEST
+	// slices_integrated audit payload — in ANY phase, not only integrated: a
+	// between-wave entry names the branch too, and it carries whatever slices
+	// IntegratedChildRunIDs lists.
+	ConsolidatedBranch string `json:"consolidated_branch,omitempty" jsonschema:"the consolidated branch the newest slices_integrated audit merged slices onto (in any phase); integrated_child_run_ids says which slices it carries"`
 	// ConflictingChildRunID is the slice child whose branch could not merge,
 	// surfaced from the slice_integration_conflict audit payload — the same
 	// structured value the next_actions slices_integration_conflict arm reads.
-	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty" jsonschema:"the child run whose slice branch failed to merge during fan-in; from the slice_integration_conflict audit payload, present only in the integration_conflict phase"`
+	// Kept for back-compat; IntegrationFailure is the cause-general form.
+	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty" jsonschema:"the child run whose slice branch failed to merge during fan-in; from the newest slice_integration_conflict audit payload"`
 	// IntegratedChildRunIDs is the child_run_ids recorded on the NEWEST
 	// slices_integrated audit entry (E50.13 / #2363) — the complete set of slice
 	// branches merged onto ConsolidatedBranch at that moment. It is decoded from
@@ -102,42 +129,134 @@ type ChildrenStatus struct {
 	// weaker Blocked flag. Blocked keys on predecessor run STATE, which flips to
 	// succeeded BEFORE the between-wave integration runs.
 	IntegratedChildRunIDs []string `json:"integrated_child_run_ids,omitempty" jsonschema:"the child run ids already merged onto consolidated_branch, from the NEWEST slices_integrated audit payload; the coverage set a dependent child's dispatchability is decided against"`
+	// UnintegratedChildRunIDs is every SUCCEEDED child the newest clean
+	// slices_integrated entry does not cover, in slice order (#4080) — decided
+	// by wavecoverage.Uncovered, the same predicate the server's acceptance
+	// gate refuses on. Non-empty means the consolidated branch lacks those
+	// slices, so acceptance and review must wait.
+	UnintegratedChildRunIDs []string `json:"unintegrated_child_run_ids,omitempty" jsonschema:"succeeded children whose slices the newest slices_integrated entry does NOT carry, in slice order; acceptance and review must wait until this is empty"`
+	// IntegrationFailure names the newest fan-in FAILURE (#4080) — a
+	// slice_head_missing, slice_integration_conflict or slice_integration_failed
+	// audit — when it is strictly newer than the newest clean integration. nil
+	// otherwise, including when a later clean integration superseded it.
+	IntegrationFailure *integrationFailure `json:"integration_failure,omitempty" jsonschema:"the newest fan-in failure (cause = its audit category) when it is newer than the newest clean slices_integrated; absent otherwise"`
+
+	// fanInRecorded is true when ANY of the four fan-in audit kinds was read
+	// for the parent. Unexported, so it never reaches the wire: it feeds the
+	// read-side mirror of the server's no-integration-authority stand-down
+	// (integrationAuthorityAbsent, approval condition C3).
+	fanInRecorded bool
 }
 
-// classifyIntegrationPhase is the pure phase classifier (#1147).
-// integratedSeq / conflictSeq are the highest audit Sequence among the
-// slices_integrated / slice_integration_conflict fan-in audit kinds (-1 when
-// that kind is absent). Ordering is significant: a slice_integration_conflict
-// yields integration_conflict UNLESS a strictly later slices_integrated event
-// recorded a clean re-integration that superseded it — so an older
-// slices_integrated entry can never mask a newer conflict. A clean integration
-// (with no later conflict) is terminal; otherwise the phase is derived from the
-// children's states (all-succeeded vs still-in-flight). No I/O so every branch
-// is exhaustively unit-testable.
-func classifyIntegrationPhase(children []ChildStatus, integratedSeq, conflictSeq int64) string {
-	// A conflict wins unless a strictly later clean integration superseded it.
+// integrationFailure is the decoded newest fan-in failure (#4080). Cause is the
+// audit category (slice_head_missing, slice_integration_conflict or
+// slice_integration_failed). ChildRunID / SliceIndex name the failing slice
+// when the payload carries one (slice_integration_failed is parent-wide and
+// names none).
+type integrationFailure struct {
+	Cause      string `json:"cause" jsonschema:"the fan-in failure's audit category: slice_head_missing, slice_integration_conflict or slice_integration_failed"`
+	ChildRunID string `json:"child_run_id,omitempty" jsonschema:"the child whose slice failed to integrate; absent for slice_integration_failed, which is parent-wide"`
+	SliceIndex *int   `json:"slice_index,omitempty" jsonschema:"the failing child's slice index, when the payload carries one"`
+	Branch     string `json:"branch,omitempty" jsonschema:"the slice branch that is missing (slice_head_missing only)"`
+	Detail     string `json:"detail,omitempty" jsonschema:"the failure detail from the audit payload (the head-missing detail, or the give-up error with its attempt count)"`
+	Sequence   int64  `json:"sequence" jsonschema:"the failure audit entry's sequence; it is newer than the newest clean slices_integrated"`
+}
+
+// fanInSnapshot is the classifier's view of the parent's fan-in audit (#4080):
+// the newest clean integration (its Sequence and the child_run_ids it merged)
+// and the newest fan-in FAILURE of any of the three failure kinds (its Sequence
+// and its category). A -1 Sequence means that kind is absent.
+type fanInSnapshot struct {
+	integratedSeq         int64
+	integratedChildRunIDs []string
+	failureSeq            int64
+	failureCause          string
+}
+
+// classifyIntegrationPhase is the pure phase classifier (#1147, reworked for
+// coverage in #4080). Evaluation order:
+//
+//  1. The newest fan-in FAILURE is strictly newer than the newest clean
+//     integration → integration_conflict when that failure is a
+//     slice_integration_conflict, otherwise integration_failed. An older
+//     slices_integrated entry can never mask a newer failure, and a later clean
+//     re-integration supersedes an earlier one.
+//  2. Every child succeeded AND a clean integration exists AND it covers every
+//     child (wavecoverage.Uncovered is empty) → integrated. A partial
+//     between-wave entry therefore no longer reads as integrated.
+//  3. Every child succeeded → ready_to_integrate.
+//  4. Otherwise → running_children.
+//
+// No I/O, so every branch is exhaustively unit-testable.
+func classifyIntegrationPhase(children []ChildStatus, fi fanInSnapshot) string {
 	// Sequences are strictly increasing per run, so equality is impossible and
-	// the -1 absent sentinel makes a lone conflict (conflictSeq >= 0) win over an
+	// the -1 absent sentinel makes a lone failure (failureSeq >= 0) win over an
 	// absent integration (integratedSeq == -1).
-	if conflictSeq >= 0 && conflictSeq > integratedSeq {
-		return integrationPhaseConflict
+	if fi.failureSeq >= 0 && fi.failureSeq > fi.integratedSeq {
+		if fi.failureCause == auditCategorySliceIntegrationConflict {
+			return integrationPhaseConflict
+		}
+		return integrationPhaseFailed
 	}
-	if integratedSeq >= 0 {
+	if !allChildrenSucceeded(children) {
+		return integrationPhaseRunningChildren
+	}
+	if fi.integratedSeq >= 0 && len(wavecoverage.Uncovered(childRunIDsOf(children), fi.integratedChildRunIDs)) == 0 {
 		return integrationPhaseIntegrated
 	}
-	if len(children) > 0 {
-		allSucceeded := true
-		for _, c := range children {
-			if c.State != "succeeded" {
-				allSucceeded = false
-				break
-			}
-		}
-		if allSucceeded {
-			return integrationPhaseReadyToIntegrate
+	return integrationPhaseReadyToIntegrate
+}
+
+// allChildrenSucceeded reports whether there is at least one child and every
+// child is in run state succeeded. An "unknown" child (its read failed) is not
+// succeeded, so a read failure can never fake a completed fan-out.
+func allChildrenSucceeded(children []ChildStatus) bool {
+	if len(children) == 0 {
+		return false
+	}
+	for _, c := range children {
+		if c.State != "succeeded" {
+			return false
 		}
 	}
-	return integrationPhaseRunningChildren
+	return true
+}
+
+// childRunIDsOf returns the children's run ids in their slice order.
+func childRunIDsOf(children []ChildStatus) []string {
+	ordered := childrenInSliceOrder(children)
+	ids := make([]string, 0, len(ordered))
+	for _, c := range ordered {
+		ids = append(ids, c.RunID)
+	}
+	return ids
+}
+
+// childrenInSliceOrder returns a copy of children sorted by ascending slice
+// index, ties broken by run id so the order is total.
+func childrenInSliceOrder(children []ChildStatus) []ChildStatus {
+	ordered := make([]ChildStatus, len(children))
+	copy(ordered, children)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].SliceIndex != ordered[j].SliceIndex {
+			return ordered[i].SliceIndex < ordered[j].SliceIndex
+		}
+		return ordered[i].RunID < ordered[j].RunID
+	})
+	return ordered
+}
+
+// succeededChildRunIDs returns the run ids of the SUCCEEDED children in slice
+// order — the set the server's acceptance gate requires the newest
+// slices_integrated entry to cover.
+func succeededChildRunIDs(children []ChildStatus) []string {
+	var ids []string
+	for _, c := range childrenInSliceOrder(children) {
+		if c.State == "succeeded" {
+			ids = append(ids, c.RunID)
+		}
+	}
+	return ids
 }
 
 // childrenStatusFor builds the decomposed-parent ChildrenStatus block (#1147).
@@ -145,9 +264,10 @@ func classifyIntegrationPhase(children []ChildStatus, integratedSeq, conflictSeq
 // (reusing api.LatestPlanDecomposed), returning (nil, nil) when the run is not
 // a decomposed parent. Each child's lifecycle state is read with one GetRun;
 // a per-child read failure is best-effort (State="unknown", never fails the
-// snapshot). The integration phase + ConsolidatedBranch / ConflictingChildRunID
-// are derived from the slices_integrated / slice_integration_conflict
-// categories in the already-fetched recentAudit window.
+// snapshot). The integration phase and the fan-in fields are derived from the
+// four fan-in categories (slices_integrated, slice_integration_conflict,
+// slice_head_missing, slice_integration_failed) in the already-fetched
+// recentAudit window.
 func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID, recentAudit []AuditEntry) (*ChildrenStatus, error) {
 	pd, err := r.api.LatestPlanDecomposed(ctx, parentID)
 	if err != nil {
@@ -157,7 +277,16 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		// Not a decomposed parent — the block is omitted.
 		return nil, nil
 	}
+	return r.childrenStatusFromDecomposition(ctx, pd, recentAudit), nil
+}
 
+// childrenStatusFromDecomposition is childrenStatusFor past the
+// plan_decomposed probe: the per-child reads, the dependency pass and the
+// fan-in classification. Split out so fanInChildrenStatus can probe the
+// decomposition FIRST and pay the paginated fan-in walk only for a real
+// decomposed parent (approval condition C1), without a second
+// LatestPlanDecomposed read.
+func (r *runResolver) childrenStatusFromDecomposition(ctx context.Context, pd *PlanDecomposed, recentAudit []AuditEntry) *ChildrenStatus {
 	cs := &ChildrenStatus{
 		Children: make([]ChildStatus, 0, len(pd.ChildRunIDs)),
 		Total:    len(pd.ChildRunIDs),
@@ -239,37 +368,50 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		}
 	}
 
-	// Scan the recent-audit window for the fan-in outcome, tracking the HIGHEST
+	// Scan the audit window for the fan-in outcome, tracking the HIGHEST
 	// Sequence per kind so the classifier can honour ordering (a later clean
-	// integration supersedes an earlier conflict, and vice-versa). recentAudit
-	// is time-descending but we do not rely on its order: we keep the
-	// max-sequence entry for each kind and decode the surfaced branch / child
-	// from that same latest entry. The cost gate in getRunStatus only calls this
-	// when recentAudit carries a decomposition marker (or the implement stage is
-	// awaiting_children), so the markers land here when present.
-	var integratedSeq, conflictSeq int64 = -1, -1
+	// integration supersedes an earlier failure, and vice-versa). The window is
+	// time-descending (recent) or category-paged ascending (await) — we do not
+	// rely on its order: we keep the max-sequence entry for each kind and decode
+	// the surfaced fields from that same newest entry.
+	fi := fanInSnapshot{integratedSeq: -1, failureSeq: -1}
+	var failureEntry *AuditEntry
+	conflictSeq := int64(-1)
 	for i := range recentAudit {
 		e := &recentAudit[i]
 		switch e.Category {
-		case "slices_integrated":
-			if e.Sequence > integratedSeq {
-				integratedSeq = e.Sequence
+		case auditCategorySlicesIntegrated:
+			cs.fanInRecorded = true
+			if e.Sequence > fi.integratedSeq {
+				fi.integratedSeq = e.Sequence
 				// Both fields come from the SAME newest entry (E50.13 / #2363):
 				// a branch paired with an older entry's coverage set would
 				// admit a dependent child onto a base missing its predecessors.
-				cs.ConsolidatedBranch = decodeConsolidatedBranch(e.Payload)
-				cs.IntegratedChildRunIDs = decodeIntegratedChildRunIDs(e.Payload)
+				p := decodeSlicesIntegrated(e.Payload)
+				cs.ConsolidatedBranch = p.ConsolidatedBranch
+				cs.IntegratedChildRunIDs = p.ChildRunIDs
+				fi.integratedChildRunIDs = p.ChildRunIDs
 			}
-		case "slice_integration_conflict":
-			if e.Sequence > conflictSeq {
+		case auditCategorySliceIntegrationConflict, auditCategorySliceHeadMissing, auditCategorySliceIntegrationFailed:
+			cs.fanInRecorded = true
+			if e.Category == auditCategorySliceIntegrationConflict && e.Sequence > conflictSeq {
 				conflictSeq = e.Sequence
-				cs.ConflictingChildRunID = decodeConflictingChildRunID(e.Payload)
+				cs.ConflictingChildRunID = decodeSliceIntegrationConflict(e.Payload).ConflictingChildRunID
+			}
+			if e.Sequence > fi.failureSeq {
+				fi.failureSeq = e.Sequence
+				fi.failureCause = e.Category
+				failureEntry = e
 			}
 		}
 	}
 
-	cs.IntegrationPhase = classifyIntegrationPhase(cs.Children, integratedSeq, conflictSeq)
-	return cs, nil
+	cs.IntegrationPhase = classifyIntegrationPhase(cs.Children, fi)
+	cs.UnintegratedChildRunIDs = wavecoverage.Uncovered(succeededChildRunIDs(cs.Children), fi.integratedChildRunIDs)
+	if failureEntry != nil && fi.failureSeq > fi.integratedSeq {
+		cs.IntegrationFailure = decodeIntegrationFailure(failureEntry)
+	}
+	return cs
 }
 
 // slicesIntegratedPayload is the ONE declaration of the slices_integrated audit
@@ -322,20 +464,79 @@ func decodeIntegratedChildRunIDs(payload any) []string {
 	return decodeSlicesIntegrated(payload).ChildRunIDs
 }
 
-// decodeConflictingChildRunID pulls conflicting_child_run_id from a
+// sliceIntegrationConflictPayload is the ONE read-side declaration of the
 // slice_integration_conflict payload (shape {parent_stage_id,
-// conflicting_slice_index, conflicting_child_run_id}). Returns "" when absent
-// or unparseable.
-func decodeConflictingChildRunID(payload any) string {
+// conflicting_slice_index, conflicting_child_run_id}).
+type sliceIntegrationConflictPayload struct {
+	ConflictingChildRunID string `json:"conflicting_child_run_id"`
+	ConflictingSliceIndex *int   `json:"conflicting_slice_index"`
+}
+
+// sliceHeadMissingPayload is the ONE read-side declaration of the
+// slice_head_missing payload (#4079). Its json tags are tied to
+// childcompletion's emitSliceHeadMissing literal on disk by
+// TestSliceHeadMissingPayloadKeysMatchEmitter, so a rename on either side
+// reddens.
+type sliceHeadMissingPayload struct {
+	ChildRunID string `json:"child_run_id"`
+	SliceIndex *int   `json:"slice_index"`
+	Branch     string `json:"branch"`
+	Detail     string `json:"detail"`
+}
+
+// sliceIntegrationFailedPayload is the ONE read-side declaration of the
+// slice_integration_failed payload (#1243 bounded-retry give-up). Its json
+// tags are tied to childcompletion's emitSliceIntegrationFailed literal on
+// disk by TestSliceIntegrationFailedPayloadKeysMatchEmitter.
+type sliceIntegrationFailedPayload struct {
+	Attempts int    `json:"attempts"`
+	Error    string `json:"error"`
+}
+
+// decodeAuditPayload re-decodes an audit payload into out. A marshal or
+// unmarshal failure leaves out at its zero value — best-effort, like the other
+// audit decodes.
+func decodeAuditPayload(payload any, out any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return ""
+		return
 	}
-	var p struct {
-		ConflictingChildRunID string `json:"conflicting_child_run_id"`
+	_ = json.Unmarshal(raw, out)
+}
+
+// decodeSliceIntegrationConflict decodes a slice_integration_conflict payload;
+// the zero value when absent or unparseable.
+func decodeSliceIntegrationConflict(payload any) sliceIntegrationConflictPayload {
+	var p sliceIntegrationConflictPayload
+	decodeAuditPayload(payload, &p)
+	return p
+}
+
+// decodeIntegrationFailure turns the newest fan-in failure entry into the
+// cause-general integrationFailure. An undecodable payload still yields the
+// cause and sequence (the category alone tells the operator which recovery
+// applies); only the per-cause fields degrade to empty.
+func decodeIntegrationFailure(e *AuditEntry) *integrationFailure {
+	f := &integrationFailure{Cause: e.Category, Sequence: e.Sequence}
+	switch e.Category {
+	case auditCategorySliceIntegrationConflict:
+		p := decodeSliceIntegrationConflict(e.Payload)
+		f.ChildRunID = p.ConflictingChildRunID
+		f.SliceIndex = p.ConflictingSliceIndex
+	case auditCategorySliceHeadMissing:
+		var p sliceHeadMissingPayload
+		decodeAuditPayload(e.Payload, &p)
+		f.ChildRunID = p.ChildRunID
+		f.SliceIndex = p.SliceIndex
+		f.Branch = p.Branch
+		f.Detail = p.Detail
+	case auditCategorySliceIntegrationFailed:
+		var p sliceIntegrationFailedPayload
+		decodeAuditPayload(e.Payload, &p)
+		f.Detail = p.Error
+		if p.Attempts > 0 {
+			f.Detail = fmt.Sprintf("after %d attempts: %s", p.Attempts, p.Error)
+		}
 	}
-	if json.Unmarshal(raw, &p) != nil {
-		return ""
-	}
-	return p.ConflictingChildRunID
+	return f
 }
