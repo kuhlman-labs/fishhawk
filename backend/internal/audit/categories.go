@@ -310,6 +310,14 @@ import "sort"
 // and they are NOT issue-comment activity categories: the incident issue and
 // its occurrence comments are their own egress surfaces
 // (docs/issue-comment-surfaces.md).
+// E72.59 / #4077 added review_round_redispatched, written by the boot sweep
+// (server/review_redispatch.go) once per ADVISORY plan/implement review round
+// orphaned by a daemon restart that it re-dispatches against the same plan
+// artifact or reviewed head instead of synthesizing *_review_failed. It names
+// the orphaned round's *_review_started sequence, which is also the cross-boot
+// crash-loop guard: a round already named by one is never re-dispatched again.
+// INTERNAL, actor system, NOT an issue-comment activity category
+// (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -510,6 +518,7 @@ var KnownCategories = map[string]struct{}{
 	"release_cut":                             {},
 	"release_published":                       {},
 	"review_head_mismatch":                    {}, // #3655: reviewed tree != pushed tree on a success ship (server/pullrequest.go)
+	"review_round_redispatched":               {}, // #4077: boot re-dispatch of a restart-orphaned advisory review round (server/review_redispatch.go)
 	"reviewer_capability_unavailable":         {},
 	"run_admitted_applies_to_override":        {},
 	"run_admitted_budget_override":            {},

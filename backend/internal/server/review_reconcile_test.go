@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 	"time"
 
@@ -406,8 +407,10 @@ func TestReconcileOrphanedReviews_SynthesizedFailedIsTerminal(t *testing.T) {
 	if consumer.ReviewerModel != "" {
 		t.Errorf("consumer reviewer_model = %q, want empty placeholder", consumer.ReviewerModel)
 	}
-	if consumer.Reason != orphanedReviewRestartReason {
-		t.Errorf("consumer reason = %q, want %q", consumer.Reason, orphanedReviewRestartReason)
+	// The boot sweep names why it did not re-dispatch the round (#4077): this
+	// minimal server wires no reviewer backend.
+	if want := orphanedReviewNotRedispatchedReason(redispatchSlugReviewerUnwired); consumer.Reason != want {
+		t.Errorf("consumer reason = %q, want %q", consumer.Reason, want)
 	}
 	// A cleanly-decoded placeholder is a terminal "failed" row for the consumer,
 	// so a 1-of-1 round settles — reviewStatusFor flips pending -> failed.
@@ -740,5 +743,65 @@ func TestReconcileStageOrphanedReviews_NilStageIDSkipReason(t *testing.T) {
 	}
 	if got.Synthesized != 0 || got.SkipReason != reconcileSkipNoStageID {
 		t.Fatalf("got = %+v, want synthesized 0 and skip_reason %q", got, reconcileSkipNoStageID)
+	}
+}
+
+// TestReconcileRunReviews_Endpoint_NeverRedispatches pins approval condition C1
+// of #4077: the on-demand POST /v0/runs/{run_id}/reviews/reconcile stays
+// TERMINATE-ONLY. Over a round the boot sweep WOULD re-dispatch (the eligible
+// fixture: advisory, reviewer wired, awaiting_approval plan stage, stored
+// plan), the verb synthesizes the #1781 failure with the unchanged reason, runs
+// no reviewer and appends no review_round_redispatched.
+func TestReconcileRunReviews_Endpoint_NeverRedispatches(t *testing.T) {
+	f := newRedispatchFixture(t, redispatchFixtureOpts{})
+	seq := f.seedEligiblePlanRound(t, advisoryPlanStarted())
+
+	rec := postReconcile(t, f.s, f.runRow.ID.String(), reconcileEndpointIdentity())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+	if row := stageRow(t, decodeReconcileBody(t, rec), "plan"); row.Synthesized != 2 {
+		t.Fatalf("plan row = %+v, want synthesized 2", row)
+	}
+	reasons := failedReasonsAfter(t, f.au, f.runRow.ID, "plan_review_failed", seq)
+	if len(reasons) != 2 || reasons[0] != orphanedReviewRestartReason || reasons[1] != orphanedReviewRestartReason {
+		t.Fatalf("reasons = %v, want 2 x %q", reasons, orphanedReviewRestartReason)
+	}
+	if rows := redispatchedRows(t, f.au, f.runRow.ID); len(rows) != 0 {
+		t.Errorf("%s rows = %d, want 0 (the verb never re-dispatches)", categoryReviewRoundRedispatched, len(rows))
+	}
+	f.reviewer.mu.Lock()
+	defer f.reviewer.mu.Unlock()
+	if len(f.reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0", len(f.reviewer.calls))
+	}
+}
+
+// TestReconcileRunReviews_Endpoint_SkipsPendingRedispatch: a round mid-handoff
+// to a boot re-dispatch is still the latest round and still predates the boot
+// marker, so without the pending set the verb would fail it under the
+// re-dispatch. It reports the EXISTING review_dispatched_by_this_process skip
+// instead (the skip_reason enum is unchanged) and synthesizes nothing.
+//
+// COUNTERFACTUAL C9: delete the pending check in
+// reconcileStageOrphanedReviewsMode → the verb synthesizes 2 failures → RED.
+func TestReconcileRunReviews_Endpoint_SkipsPendingRedispatch(t *testing.T) {
+	f := newRedispatchFixture(t, redispatchFixtureOpts{})
+	seq := f.seedEligiblePlanRound(t, advisoryPlanStarted())
+	key := pendingRedispatchKey{runID: f.runRow.ID, stage: "plan", seq: seq}
+	markRedispatchPending(key)
+	t.Cleanup(func() { clearRedispatchPending(key) })
+
+	rec := postReconcile(t, f.s, f.runRow.ID.String(), reconcileEndpointIdentity())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	row := stageRow(t, decodeReconcileBody(t, rec), "plan")
+	if !row.Skipped || row.SkipReason != reconcileSkipInFlight || row.Synthesized != 0 {
+		t.Fatalf("plan row = %+v, want skipped %q with nothing synthesized", row, reconcileSkipInFlight)
+	}
+	if reasons := failedReasonsAfter(t, f.au, f.runRow.ID, "plan_review_failed", seq); len(reasons) != 0 {
+		t.Fatalf("plan_review_failed = %v, want none for a pending re-dispatch", reasons)
 	}
 }
