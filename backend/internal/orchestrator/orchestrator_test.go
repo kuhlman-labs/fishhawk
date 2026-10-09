@@ -350,8 +350,12 @@ type stubGitHub struct {
 	// branch to its tip sha (absence => GetBranchSHA reports not-found).
 	branchSHAs      map[string]string
 	getBranchSHAErr error
-	createRefErr    error
-	createRefCalls  []createRefCall
+	// branchSHAErrByBranch programs a per-branch GetBranchSHA error, so a
+	// test can fail ONE probe (the #4079 slice-head probe) while the base
+	// and consolidated reads still resolve.
+	branchSHAErrByBranch map[string]error
+	createRefErr         error
+	createRefCalls       []createRefCall
 	// mergeErrByHead programs a per-head-branch MergeBranch error (e.g.
 	// forge.ErrMergeConflict on a specific slice branch).
 	mergeErrByHead map[string]error
@@ -460,6 +464,9 @@ func (g *stubGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
 	defer g.mu.Unlock()
 	if g.getBranchSHAErr != nil {
 		return "", false, g.getBranchSHAErr
+	}
+	if err, ok := g.branchSHAErrByBranch[branch]; ok {
+		return "", false, err
 	}
 	sha, ok := g.branchSHAs[branch]
 	if !ok {
@@ -2972,6 +2979,104 @@ func TestIntegrateSlices_PartialMergeThenAPIError_RecordsCreatedMergeSHAs(t *tes
 	}
 	if records[0]["child_run_id"] != child0.ID.String() {
 		t.Errorf("records[0] child_run_id = %v, want %q", records[0]["child_run_id"], child0.ID.String())
+	}
+}
+
+// TestIntegrateSlices_MissingSliceHead_ReturnsSliceHeadMissing is CONTROL H
+// (#4079): a slice head the merge endpoint 404s on AND a GetBranchSHA probe
+// confirms absent is classified as a typed *SliceHeadMissingError naming the
+// child, its slice index and the branch — the shape the child-completion
+// sweeper parks on instead of burning its bounded retry into category B.
+func TestIntegrateSlices_MissingSliceHead_ReturnsSliceHeadMissing(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.branchSHAs = map[string]string{"main": "basesha"} // slice-1 head absent
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	head1 := sliceBranch(parent.ID, 1)
+	gh.mergeErrByHead = map[string]error{head1: forge.ErrNotFound}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil", conflict)
+	}
+	var missing *SliceHeadMissingError
+	if !errors.As(err, &missing) {
+		t.Fatalf("err = %v, want a *SliceHeadMissingError", err)
+	}
+	if !errors.Is(err, ErrSliceHeadMissing) {
+		t.Errorf("errors.Is(err, ErrSliceHeadMissing) = false, want true")
+	}
+	if missing.ChildRunID != child1.ID || missing.SliceIndex != 1 || missing.Branch != head1 {
+		t.Errorf("missing = %+v, want child %s slice 1 branch %q", missing, child1.ID, head1)
+	}
+	if !strings.Contains(err.Error(), child1.ID.String()) || !strings.Contains(err.Error(), head1) {
+		t.Errorf("err text %q must name the child and the slice branch", err.Error())
+	}
+}
+
+// TestIntegrateSlices_NotFoundWithExistingHead_StaysGeneric is CONTROL H2: the
+// same merge 404, but the probe reports the head EXISTS (so the 404 is the
+// base or something else). It must stay the generic wrapped error, never a
+// *SliceHeadMissingError — a misclassification would park a parent whose
+// real failure is unrelated.
+func TestIntegrateSlices_NotFoundWithExistingHead_StaysGeneric(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	head0 := sliceBranch(parent.ID, 0)
+	gh.branchSHAs = map[string]string{"main": "basesha", head0: "headsha0"}
+	gh.mergeErrByHead = map[string]error{head0: forge.ErrNotFound}
+
+	_, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil || !errors.Is(err, forge.ErrNotFound) {
+		t.Fatalf("err = %v, want the generic wrapped forge.ErrNotFound", err)
+	}
+	var missing *SliceHeadMissingError
+	if errors.As(err, &missing) {
+		t.Errorf("err classified as *SliceHeadMissingError (%+v) for an EXISTING head; want the generic error", missing)
+	}
+}
+
+// TestIntegrateSlices_NotFoundWithProbeError_StaysGeneric pins the probe's
+// fail-closed direction: a GetBranchSHA error is NOT confirmation of absence,
+// so the 404 stays the generic wrapped error.
+func TestIntegrateSlices_NotFoundWithProbeError_StaysGeneric(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	head0 := sliceBranch(parent.ID, 0)
+	gh.mergeErrByHead = map[string]error{head0: forge.ErrNotFound}
+	gh.branchSHAErrByBranch = map[string]error{head0: errors.New("github: 502 bad gateway")}
+
+	_, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil || !errors.Is(err, forge.ErrNotFound) {
+		t.Fatalf("err = %v, want the generic wrapped forge.ErrNotFound", err)
+	}
+	if errors.Is(err, ErrSliceHeadMissing) {
+		t.Errorf("a failed probe classified the 404 as a missing slice head; want the generic error")
+	}
+}
+
+// TestIntegrateSlices_SliceHeadMissingIsAsThroughWrap pins the typed error's
+// errors.As / errors.Is contract through a %w wrap, which is what lets the
+// serve.go adapter classify it for the sweeper's park (#4079).
+func TestIntegrateSlices_SliceHeadMissingIsAsThroughWrap(t *testing.T) {
+	err := fmt.Errorf("wrap: %w", &SliceHeadMissingError{SliceIndex: 2, ChildRunID: uuid.New(), Branch: "b"})
+	var missing *SliceHeadMissingError
+	if !errors.As(err, &missing) || missing.SliceIndex != 2 {
+		t.Fatalf("errors.As through a wrap = %v, want the typed error", err)
+	}
+	if !errors.Is(err, ErrSliceHeadMissing) {
+		t.Errorf("errors.Is through a wrap = false, want true")
+	}
+	if errors.Is(errors.New("other"), ErrSliceHeadMissing) {
+		t.Errorf("an unrelated error matched ErrSliceHeadMissing")
 	}
 }
 

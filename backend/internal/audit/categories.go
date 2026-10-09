@@ -539,6 +539,7 @@ var KnownCategories = map[string]struct{}{
 	"scope_completeness_failed":               {},
 	"scope_completeness_parked":               {},
 	"scope_files_exempted":                    {},
+	"slice_head_missing":                      {},
 	"slice_integration_conflict":              {},
 	"slice_integration_failed":                {},
 	"slices_integrated":                       {},

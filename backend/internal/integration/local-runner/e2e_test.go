@@ -824,8 +824,9 @@ func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
 	}
 
 	// Working tree: a git repo on `main` with one base commit, so the child's
-	// scope-bounded diff (added.txt) is non-empty — the signal that fires the
-	// push_to_shared_branch gate.
+	// scope-bounded diff (added.txt) is non-empty and there is work to push.
+	// (The push_to_shared_branch gate itself fires on the manifest flag alone
+	// since #4079; the absent-diff variant is the test below.)
 	workDir := t.TempDir()
 	gitRepoInit(t, workDir)
 
@@ -909,6 +910,180 @@ func TestE2E_LocalRunner_DecomposedChildPushFailure_NoZombie(t *testing.T) {
 	// see the function doc — the sweeper only consolidates terminal-succeeded
 	// children and is not wired into this fixture, so asserting parent state
 	// here would be vacuous.
+}
+
+// TestE2E_LocalRunner_DecomposedChildPushFailure_AbsentDiff_FailsC reproduces
+// the #4079 incident end to end on the real runner binary and the real trace +
+// /pull-request handlers. It is the NoZombie test above with the three changes
+// that make the incident's shape:
+//
+//   - the child implement stage is GATELESS (RequiresApproval=false). This is
+//     load-bearing: an awaiting_approval terminal would MASK the bug, because
+//     awaiting_approval → failed is a legal edge, whereas succeeded is terminal
+//     and the later failed-C report's FailStage is refused;
+//   - --check-base-ref names a ref that never exists, so the runner's diff
+//     capture fails (diff_failed policy_event) and the trace bundle carries NO
+//     git_diff event — the stage 0afdfa73 bundle;
+//   - the fake agent still writes added.txt, so there IS work to push.
+//
+// The push fails hermetically (the gh-CLI token fallback is denied, as in
+// NoZombie). Before #4079 the trace handler's child-push gate required a
+// non-empty diff, so the absent-diff trace moved the stage straight to
+// succeeded at trace time and the runner's pull_request_failed report was
+// refused; the child read succeeded while its branch was never pushed.
+func TestE2E_LocalRunner_DecomposedChildPushFailure_AbsentDiff_FailsC(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; skipping decomposed-child absent-diff push-failure E2E")
+	}
+	fx := newLocalRunnerFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef-childabsentdiff-parent",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun parent: %v", err)
+	}
+	child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "deadbeef-childabsentdiff-child",
+		TriggerSource:  runpkg.TriggerCLI,
+		RunnerKind:     runpkg.RunnerKindLocal,
+		DecomposedFrom: &parent.ID,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun child: %v", err)
+	}
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := fx.artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       scopedPlanJSON(t, "added.txt"),
+		ContentHash:   "childabsentdiff-e2e",
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+
+	// GATELESS — the incident's shape (see the function doc).
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: child.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code", RequiresApproval: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+
+	workDir := t.TempDir()
+	gitRepoInit(t, workDir)
+
+	fakeDir := t.TempDir()
+	fakeScript := filepath.Join(fakeDir, "claude")
+	if runtime.GOOS == "windows" {
+		fakeScript = filepath.Join(fakeDir, "claude.bat")
+	}
+	scriptBody := "#!/bin/sh\nprintf '{\"type\":\"result\"}\\n'\necho 'package main' > added.txt\n"
+	if err := os.WriteFile(fakeScript, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+
+	// Deny the gh-CLI push fallback (#713): the hermetic forced push failure.
+	ghConfigDir := t.TempDir()
+
+	cmd := exec.CommandContext(ctx, fx.runnerBinary,
+		"--run-id", child.ID.String(),
+		"--backend-url", fx.url,
+		"--workflow", "feature_change",
+		"--stage", "implement",
+		"--stage-id", implStage.ID.String(),
+		"--fetch-prompt",
+		"--upload-trace",
+		"--working-dir", workDir,
+		// A base ref that never resolves: the incident's
+		// fishhawk/run-<parent>-consolidated was absent locally.
+		"--check-base-ref", "fishhawk/run-deadbeef-consolidated",
+		"--github-repo", "kuhlman-labs/fishhawk",
+		"--base-branch", "main",
+	)
+	runnerEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		switch {
+		case strings.HasPrefix(e, "PATH="):
+			e = "PATH=" + fakeDir + ":" + strings.TrimPrefix(e, "PATH=")
+		case strings.HasPrefix(e, "GH_TOKEN="), strings.HasPrefix(e, "GITHUB_TOKEN="), strings.HasPrefix(e, "GH_CONFIG_DIR="):
+			continue
+		}
+		runnerEnv = append(runnerEnv, e)
+	}
+	runnerEnv = append(runnerEnv, "GH_TOKEN=", "GITHUB_TOKEN=", "GH_CONFIG_DIR="+ghConfigDir)
+	cmd.Env = runnerEnv
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("runner exited 0; expected failure on the child push step\noutput:\n%s", out.String())
+	}
+
+	// The incident precondition actually held: the diff capture failed, so
+	// the bundle the trace handler received carries a diff_failed
+	// policy_event and NO git_diff event. Read back through the real stage
+	// trace endpoint; without this the test would re-cover the non-empty-diff
+	// case NoZombie already pins.
+	traceResp, err := http.Get(fx.url + "/v0/stages/" + implStage.ID.String() + "/trace")
+	if err != nil {
+		t.Fatalf("GET stage trace: %v", err)
+	}
+	traceBody, err := io.ReadAll(traceResp.Body)
+	_ = traceResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read stage trace: %v", err)
+	}
+	if traceResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET stage trace status = %d, want 200:\n%s", traceResp.StatusCode, traceBody)
+	}
+	if !bytes.Contains(traceBody, []byte(`diff_failed`)) {
+		t.Fatalf("shipped bundle carries no diff_failed policy event; the fixture did not reproduce the absent-diff shape\nbundle:\n%s\nrunner output:\n%s", traceBody, out.String())
+	}
+	if bytes.Contains(traceBody, []byte(`"kind":"git_diff"`)) {
+		t.Fatalf("shipped bundle carries a git_diff event; want none (the #4079 absent-diff shape)\nbundle:\n%s", traceBody)
+	}
+
+	got, err := fx.runRepo.GetStage(ctx, implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State == runpkg.StageStateSucceeded {
+		t.Fatalf("child implement stage reached succeeded with its push failed (the #4079 shape)\nrunner output:\n%s", out.String())
+	}
+	if got.State != runpkg.StageStateFailed {
+		t.Fatalf("child implement stage State = %q, want failed\nrunner output:\n%s", got.State, out.String())
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != runpkg.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)\nrunner output:\n%s", got.FailureCategory, out.String())
+	}
+
+	gotChild, err := fx.runRepo.GetRun(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetRun child: %v", err)
+	}
+	if gotChild.State == runpkg.StateSucceeded {
+		t.Errorf("child run State = succeeded, want non-succeeded after a push failure")
+	}
 }
 
 // TestE2E_LocalRunner_DecomposedChildNoChanges_TerminalizesFailedC is the

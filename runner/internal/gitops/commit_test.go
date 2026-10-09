@@ -6686,3 +6686,149 @@ func runGitT(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
+
+// baseFetchFailureRepo builds the #4079 fixture: a work repo with one commit, a
+// bare origin carrying only `main`, and an agent edit to a TRACKED file plus a
+// new UNTRACKED file sitting uncommitted in the work tree. Returns the work
+// repo, the bare origin, and the pre-call HEAD.
+func baseFetchFailureRepo(t *testing.T) (repo, bare, headBefore string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	headBefore = mustGitOut(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# the verified slice edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("new agent file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo, bare, headBefore
+}
+
+// assertBaseFetchError pins the #4079 contract on one CommitAndPush error: the
+// sentinel matches, the typed error names a stash commit that EXISTS and holds
+// BOTH agent edits (the tracked one in the stash tree, the untracked one in its
+// third parent), HEAD did not move, the work tree is clean, the original
+// error text survives as the prefix, and the push-transport sentinel does NOT
+// match (a base-fetch failure has no commit to resume from).
+func assertBaseFetchError(t *testing.T, repo, headBefore, wantPrefix, wantRef string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("CommitAndPush succeeded; want a base-fetch failure")
+	}
+	if !errors.Is(err, ErrBaseFetchFailed) {
+		t.Fatalf("errors.Is(err, ErrBaseFetchFailed) = false; err = %v", err)
+	}
+	if errors.Is(err, ErrPushFailed) {
+		t.Errorf("a base-fetch failure must not claim ErrPushFailed: %v", err)
+	}
+	var bfe *BaseFetchError
+	if !errors.As(err, &bfe) {
+		t.Fatalf("errors.As(*BaseFetchError) = false; err = %v", err)
+	}
+	if bfe.Ref != wantRef {
+		t.Errorf("BaseFetchError.Ref = %q, want %q", bfe.Ref, wantRef)
+	}
+	if !strings.HasPrefix(err.Error(), wantPrefix) {
+		t.Errorf("error text = %q, want the unchanged %q prefix", err.Error(), wantPrefix)
+	}
+	if bfe.StashSHA == "" {
+		t.Fatalf("BaseFetchError.StashSHA is empty; the edits would be unaddressable: %v", err)
+	}
+	if !strings.Contains(err.Error(), bfe.StashSHA) {
+		t.Errorf("error text %q does not name the stash commit %s", err.Error(), bfe.StashSHA)
+	}
+	mustGit(t, repo, "cat-file", "-e", bfe.StashSHA+"^{commit}")
+	if got := mustGitOut(t, repo, "show", bfe.StashSHA+":README.md"); got != "# the verified slice edit" {
+		t.Errorf("stash tree README.md = %q, want the agent edit", got)
+	}
+	if got := mustGitOut(t, repo, "show", bfe.StashSHA+"^3:agent.txt"); got != "new agent file" {
+		t.Errorf("stash untracked parent agent.txt = %q, want the agent's new file", got)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != headBefore {
+		t.Errorf("HEAD moved to %s on a base-fetch failure; want it unchanged at %s", got, headBefore)
+	}
+	if st := mustGitOut(t, repo, "status", "--porcelain"); st != "" {
+		t.Errorf("work tree not clean after the stash (the stash must not be popped): %q", st)
+	}
+}
+
+// TestCommitAndPush_FreshFetchBase_FetchFailure_WrapsBaseFetchError is the
+// #4079 incident shape: the base ref (a consolidated branch that never
+// resolved) is absent on the remote, so the real `git fetch` fails AFTER the
+// agent's edits were stashed.
+func TestCommitAndPush_FreshFetchBase_FetchFailure_WrapsBaseFetchError(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const base = "fishhawk/run-deadbeef-consolidated"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         "fishhawk/run-deadbeef/slice-0",
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: base,
+	})
+	assertBaseFetchError(t, repo, headBefore, "gitops: fetch "+base+":", base, err)
+}
+
+// TestCommitAndPush_RebaseFromRemote_FetchFailure_WrapsBaseFetchError covers
+// the sibling arm: the shared branch the subsequent child rebases from is
+// absent on the remote.
+func TestCommitAndPush_RebaseFromRemote_FetchFailure_WrapsBaseFetchError(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const branch = "fishhawk/run-deadbeef/never-pushed"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:          repo,
+		Branch:           branch,
+		CommitMessage:    "child",
+		RemoteURL:        bare,
+		RebaseFromRemote: true,
+	})
+	assertBaseFetchError(t, repo, headBefore, "gitops: fetch "+branch+":", branch, err)
+}
+
+// TestCommitAndPush_FreshFetchBase_CheckoutFailure_WrapsBaseFetchError pins the
+// second half of the arm: the fetch SUCCEEDS but `checkout -B <branch>
+// FETCH_HEAD` fails. The injection is a held ref lock on the branch, so the
+// branch update cannot be written on ANY git version. (Refusing to reset a
+// branch another worktree has checked out is NOT version-independent: that
+// rule landed in git 2.44, and the gate image's bookworm git 2.39 lets the
+// checkout succeed.) FETCH_HEAD is main, the tree HEAD already holds, so the
+// work-tree half of the checkout is a no-op: HEAD stays put and the edits are
+// only in the stash.
+func TestCommitAndPush_FreshFetchBase_CheckoutFailure_WrapsBaseFetchError(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const branch = "fishhawk/run-deadbeef/slice-1"
+	lock := filepath.Join(repo, ".git", "refs", "heads", filepath.FromSlash(branch)+".lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+	assertBaseFetchError(t, repo, headBefore, "gitops: checkout "+branch+":", "main", err)
+}

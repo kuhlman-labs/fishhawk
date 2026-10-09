@@ -196,6 +196,12 @@ type auditFake struct {
 	// reads cost_recorded entries via ListAll to build its rolling
 	// baseline, so tests seed prior-hour samples here.
 	seeded []*audit.Entry
+	// stampSequence, when set, makes ListForRunByCategory stamp each
+	// APPENDED entry with its 1-based append index as Sequence, the way the
+	// real chain orders entries. Opt-in so every existing caller keeps its
+	// zero sequences; a test driving a newest-wins reader across categories
+	// (resolvePushCheckpointResume, #4079) needs the real ordering.
+	stampSequence bool
 }
 
 func newAuditFake() *auditFake { return &auditFake{} }
@@ -339,13 +345,17 @@ func (a *auditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, cat
 			continue
 		}
 		rid := ap.RunID
-		out = append(out, &audit.Entry{
+		e := &audit.Entry{
 			RunID:     &rid,
 			StageID:   ap.StageID,
 			Timestamp: ap.Timestamp,
 			Category:  ap.Category,
 			Payload:   ap.Payload,
-		})
+		}
+		if a.stampSequence {
+			e.Sequence = int64(i + 1)
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }
@@ -1706,9 +1716,23 @@ func TestShipTrace_PushAndOpenPR_EmptyDiffAdvances(t *testing.T) {
 // makeChildPushBundle builds a gzip JSONL bundle whose manifest carries the
 // given push_to_shared_branch flag plus a git_diff with fileCount changed
 // files — the decomposed-child analogue of makePushPRBundle (#771). It drives
-// the trace handler's childPushGated check, which only defers the terminal
-// transition when push_to_shared_branch is set AND the diff is non-empty.
+// the trace handler's childPushGated check, which defers the terminal
+// transition whenever push_to_shared_branch is set, whatever the diff (#4079).
 func makeChildPushBundle(t *testing.T, pushToShared bool, fileCount int, t0, t1 time.Time) []byte {
+	t.Helper()
+	return buildChildPushBundle(t, pushToShared, fileCount, true, t0, t1)
+}
+
+// makeChildPushBundleNoDiff is the #4079 incident shape: a decomposed-child
+// bundle whose manifest stamps push_to_shared_branch but which carries NO
+// git_diff event at all, because the runner's computeAndEmitDiff failed to
+// resolve the base ref and emitted a diff_failed policy_event instead.
+func makeChildPushBundleNoDiff(t *testing.T, pushToShared bool, t0, t1 time.Time) []byte {
+	t.Helper()
+	return buildChildPushBundle(t, pushToShared, 0, false, t0, t1)
+}
+
+func buildChildPushBundle(t *testing.T, pushToShared bool, fileCount int, withDiff bool, t0, t1 time.Time) []byte {
 	t.Helper()
 	type line struct {
 		Seq  int             `json:"seq"`
@@ -1730,9 +1754,16 @@ func makeChildPushBundle(t *testing.T, pushToShared bool, fileCount int, t0, t1 
 	if err != nil {
 		t.Fatal(err)
 	}
+	second := line{Seq: 2, TS: t0, Kind: bundle.EventKindGitDiff, Data: diffData}
+	if !withDiff {
+		// The diff-capture-failure shape: the runner emits a diff_failed
+		// policy_event and no git_diff (#4079's stage 0afdfa73 bundle).
+		second = line{Seq: 2, TS: t0, Kind: "policy_event", Data: json.RawMessage(
+			`{"check":"diff","outcome":"diff_failed","error":"ambiguous argument 'fishhawk/run-f16f2e77-consolidated'"}`)}
+	}
 	lines := []line{
 		{Seq: 1, TS: t0.Add(-time.Second), Kind: bundle.EventKindManifest, Data: mdata},
-		{Seq: 2, TS: t0, Kind: bundle.EventKindGitDiff, Data: diffData},
+		second,
 		{Seq: 3, TS: t1, Kind: "agent_end", Data: json.RawMessage(`{}`)},
 		{Seq: 4, TS: t1.Add(time.Second), Kind: "trailer", Data: json.RawMessage(`{}`)},
 	}
@@ -1757,6 +1788,9 @@ func makeChildPushBundle(t *testing.T, pushToShared bool, fileCount int, t0, t1 
 }
 
 // TestChildPushGated is the true/false matrix for the #771 gate predicate.
+// Since #4079 the predicate is diff-INDEPENDENT: every child arm after the
+// trace upload sends a /pull-request report, so the empty-diff and the
+// ABSENT-diff (diff-capture failure) rows are gated too.
 func TestChildPushGated(t *testing.T) {
 	s := &Server{}
 	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
@@ -1765,11 +1799,17 @@ func TestChildPushGated(t *testing.T) {
 	if !s.childPushGated(makeChildPushBundle(t, true, 2, t0, t1)) {
 		t.Error("flag set + non-empty diff → want gated (true)")
 	}
-	if s.childPushGated(makeChildPushBundle(t, true, 0, t0, t1)) {
-		t.Error("flag set + empty diff → want NOT gated (false): no-changes child POSTs no report")
+	if !s.childPushGated(makeChildPushBundle(t, true, 0, t0, t1)) {
+		t.Error("flag set + empty diff → want gated (true): a no-changes child still POSTs its failed-C report (#1036)")
+	}
+	if !s.childPushGated(makeChildPushBundleNoDiff(t, true, t0, t1)) {
+		t.Error("flag set + NO git_diff event → want gated (true): the #4079 diff-capture-failure shape still gets a /pull-request report")
 	}
 	if s.childPushGated(makeChildPushBundle(t, false, 2, t0, t1)) {
 		t.Error("flag unset + non-empty diff → want NOT gated (false): a standalone / older bundle")
+	}
+	if s.childPushGated(makeChildPushBundleNoDiff(t, false, t0, t1)) {
+		t.Error("flag unset + NO git_diff event → want NOT gated (false)")
 	}
 }
 
@@ -1824,29 +1864,99 @@ func TestShipTrace_ChildPush_ImplementStaysRunning(t *testing.T) {
 	}
 }
 
-// TestShipTrace_ChildPush_EmptyDiffAdvances pins the no-changes carve-out for
-// the child-push gate: an empty-diff decomposed child POSTs no /pull-request
-// report, so gating it would hang the stage in running — the gate must NOT
-// fire and the stage advances as before.
-func TestShipTrace_ChildPush_EmptyDiffAdvances(t *testing.T) {
+// TestShipTrace_ChildPush_AbsentDiffStaysRunning is the #4079 forward gate on
+// the REAL trace handler: a decomposed-child bundle stamping
+// push_to_shared_branch with NO git_diff event (the runner's diff capture
+// failed) must leave a GATELESS child implement stage in `running`. Before
+// #4079 the gate's non-empty-diff precondition advanced it straight to
+// terminal succeeded, and the runner's later pull_request_failed report was
+// refused on the terminal stage. RequiresApproval=false is load-bearing: an
+// awaiting_approval terminal would mask the bug (awaiting_approval → failed is
+// a legal edge).
+func TestShipTrace_ChildPush_AbsentDiffStaysRunning(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bundle func(t *testing.T, t0, t1 time.Time) []byte
+	}{
+		{"absent git_diff", func(t *testing.T, t0, t1 time.Time) []byte { return makeChildPushBundleNoDiff(t, true, t0, t1) }},
+		{"empty git_diff", func(t *testing.T, t0, t1 time.Time) []byte { return makeChildPushBundle(t, true, 0, t0, t1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			art := newFakeArtifactRepo()
+			sf := newSigningFake()
+			ts := newTraceStoreFake()
+			au := newAuditFake()
+
+			runRow := rr.seedRun()
+			planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+			seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+			implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+			implStage.Type = run.StageTypeImplement
+			implStage.RequiresApproval = false
+
+			priv, _ := sf.issue(t, runRow.ID)
+			t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+			t1 := t0.Add(3 * time.Minute)
+
+			s := New(Config{
+				Addr:         "127.0.0.1:0",
+				SigningRepo:  sf,
+				TraceStore:   ts,
+				AuditRepo:    au,
+				RunRepo:      rr,
+				ArtifactRepo: art,
+			})
+
+			w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, tc.bundle(t, t0, t1), "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+			}
+
+			got, err := rr.GetStage(t.Context(), implStage.ID)
+			if err != nil {
+				t.Fatalf("GetStage: %v", err)
+			}
+			if got.State != run.StageStateRunning {
+				t.Errorf("stage.State = %q, want %q (a child bundle must defer the terminal transition to the /pull-request report whatever its diff, #4079)",
+					got.State, run.StageStateRunning)
+			}
+		})
+	}
+}
+
+// TestChildPushFailure_AbsentDiff_FailsCThenResumes is the #4079 cross-layer
+// chain on the real handlers, in the incident's shape: a GATELESS decomposed
+// child implement stage ships a trace with no git_diff (diff capture failed),
+// then its commit+push fails and the runner reports pull_request_failed
+// category C carrying a push-kind checkpoint. The chain must hold end to end:
+//
+//  1. the trace leaves the stage running (the forward gate);
+//  2. the failed report lands it failed-C and records pull_request_failed +
+//     push_resume_checkpoint — impossible had (1) moved it to succeeded,
+//     because succeeded is terminal and FailStage is refused;
+//  3. the retry dispatch is served the held commit as a push-kind resume;
+//  4. after a retry walk, the "pushed" report records child_pushed and the
+//     stage leaves running.
+func TestChildPushFailure_AbsentDiff_FailsCThenResumes(t *testing.T) {
 	rr := newOrchestratorRepo()
 	art := newFakeArtifactRepo()
 	sf := newSigningFake()
 	ts := newTraceStoreFake()
-	au := newAuditFake()
+	// stampSequence: resolvePushCheckpointResume's newest-wins rule compares
+	// entry sequences, which the plain fake leaves zero.
+	au := &auditFake{stampSequence: true}
 
 	runRow := rr.seedRun()
+	parentID := uuid.New()
+	runRow.DecomposedFrom = &parentID
 	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
 	seedPlanArtifactForRun(t, art, planStage.ID, 15)
 
 	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
 	implStage.Type = run.StageTypeImplement
-	implStage.RequiresApproval = true
-
-	priv, _ := sf.issue(t, runRow.ID)
-	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-	t1 := t0.Add(3 * time.Minute)
-	bundleBytes := makeChildPushBundle(t, true, 0, t0, t1) // 0 files → empty diff
+	implStage.RequiresApproval = false
 
 	s := New(Config{
 		Addr:         "127.0.0.1:0",
@@ -1855,20 +1965,105 @@ func TestShipTrace_ChildPush_EmptyDiffAdvances(t *testing.T) {
 		AuditRepo:    au,
 		RunRepo:      rr,
 		ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
 	})
 
-	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
-	}
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(3 * time.Minute)
 
+	// (1) Absent-diff child trace → stage stays running.
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, makeChildPushBundleNoDiff(t, true, t0, t1), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
 	got, err := rr.GetStage(t.Context(), implStage.ID)
 	if err != nil {
 		t.Fatalf("GetStage: %v", err)
 	}
-	if got.State != run.StageStateAwaitingApproval {
-		t.Errorf("stage.State = %q, want %q (empty-diff child must NOT be gated)",
-			got.State, run.StageStateAwaitingApproval)
+	if got.State != run.StageStateRunning {
+		t.Fatalf("after trace: stage.State = %q, want running (the #4079 forward gate)", got.State)
+	}
+
+	// (2) The runner's commit+push failure report, push-kind checkpoint.
+	const (
+		branch   = "fishhawk/run-f16f2e77/slice-1"
+		headSHA  = "head4079"
+		baseSHA  = "base4079"
+		treeSHA  = "tree4079"
+		failText = "commit+push: gitops: fetch fishhawk/run-f16f2e77-consolidated: couldn't find remote ref"
+	)
+	failBody, err := json.Marshal(map[string]any{
+		"outcome": "failed", "category": "C", "reason": failText,
+		"branch": branch, "head_sha": headSHA, "base_sha": baseSHA,
+		"verified_tree_sha": treeSHA, "resume_kind": "push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, failBody, ""); w.Code != http.StatusOK {
+		t.Fatalf("failed report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err = rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("after failed report: stage.State = %q, want failed (a push-failed child must never read succeeded)", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("FailureCategory = %v, want C (retryable)", got.FailureCategory)
+	}
+	au.mu.Lock()
+	entries := append([]audit.ChainAppendParams(nil), au.appended...)
+	au.mu.Unlock()
+	if n := len(entriesByCategory(entries, "pull_request_failed")); n != 1 {
+		t.Errorf("pull_request_failed entries = %d, want 1", n)
+	}
+	if n := len(entriesByCategory(entries, CategoryPushResumeCheckpoint)); n != 1 {
+		t.Errorf("%s entries = %d, want 1", CategoryPushResumeCheckpoint, n)
+	}
+
+	// (3) The retry dispatch is served the held commit as a push-kind resume.
+	held, resume := s.resolvePushCheckpointResume(t.Context(), runRow, got, false, true, false)
+	if !resume {
+		t.Fatal("resolvePushCheckpointResume: resume = false, want true for the child's push-kind checkpoint")
+	}
+	if held.resumeKind != resumeKindPush || held.sha != headSHA || held.branch != branch ||
+		held.baseSHA != baseSHA || held.verifiedTreeSHA != treeSHA {
+		t.Errorf("held = %+v, want push kind with the reported coordinates", held)
+	}
+
+	// (4) Retry walk failed → pending → dispatched → running, then "pushed".
+	if _, err := rr.RetryStage(t.Context(), implStage.ID, run.StageStatePending); err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := rr.TransitionStage(t.Context(), implStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage %s: %v", to, err)
+		}
+	}
+	pushedBody, err := json.Marshal(map[string]any{
+		"outcome": "pushed", "branch": branch, "head_sha": headSHA, "base_sha": baseSHA,
+		"files_changed_count": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, pushedBody, ""); w.Code != http.StatusOK {
+		t.Fatalf("pushed report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err = rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State == run.StageStateRunning {
+		t.Errorf("after pushed report: stage still running, want it to leave running")
+	}
+	au.mu.Lock()
+	entries = append([]audit.ChainAppendParams(nil), au.appended...)
+	au.mu.Unlock()
+	if n := len(entriesByCategory(entries, "child_pushed")); n != 1 {
+		t.Errorf("child_pushed entries = %d, want 1", n)
 	}
 }
 

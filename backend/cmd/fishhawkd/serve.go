@@ -4068,7 +4068,8 @@ func (a childCompletionAdvancer) Advance(ctx context.Context, runID uuid.UUID) e
 
 // IntegrateSlices satisfies childcompletion.Integrator by delegating to
 // the orchestrator's fan-in step (ADR-041 / #1142) and converting the
-// orchestrator's *SliceConflict to childcompletion's identical type — the
+// orchestrator's *SliceConflict (and, via translateSliceHeadMissing, its
+// *SliceHeadMissingError, #4079) to childcompletion's identical types — the
 // bridge that keeps childcompletion's import graph free of orchestrator.
 func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*childcompletion.SliceConflict, error) {
 	if a.o == nil {
@@ -4076,13 +4077,32 @@ func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunI
 	}
 	conflict, err := a.o.IntegrateSlices(ctx, parentRunID)
 	if err != nil || conflict == nil {
-		return nil, err
+		return nil, translateSliceHeadMissing(err)
 	}
 	return &childcompletion.SliceConflict{
 		SliceIndex: conflict.SliceIndex,
 		ChildRunID: conflict.ChildRunID,
 		Detail:     conflict.Detail,
 	}, nil
+}
+
+// translateSliceHeadMissing converts an orchestrator *SliceHeadMissingError
+// (#4079), wrapped or not, into childcompletion's identical type, carrying the
+// original error text as Detail, so the sweeper can park the parent on it
+// without importing orchestrator. Every other error — nil included — passes
+// through unchanged. Both adapter integration methods route their error
+// through it.
+func translateSliceHeadMissing(err error) error {
+	var missing *orchestrator.SliceHeadMissingError
+	if !errors.As(err, &missing) {
+		return err
+	}
+	return &childcompletion.SliceHeadMissingError{
+		SliceIndex: missing.SliceIndex,
+		ChildRunID: missing.ChildRunID,
+		Branch:     missing.Branch,
+		Detail:     err.Error(),
+	}
 }
 
 // IntegrateCompletedWave satisfies childcompletion.WaveIntegrator by
@@ -4097,7 +4117,7 @@ func (a childCompletionAdvancer) IntegrateCompletedWave(ctx context.Context, par
 	}
 	integrated, conflict, err := a.o.IntegrateCompletedWave(ctx, parentRunID)
 	if err != nil || conflict == nil {
-		return integrated, nil, err
+		return integrated, nil, translateSliceHeadMissing(err)
 	}
 	return integrated, &childcompletion.SliceConflict{
 		SliceIndex: conflict.SliceIndex,

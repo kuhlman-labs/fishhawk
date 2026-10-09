@@ -1652,6 +1652,35 @@ type SliceConflict struct {
 	Detail     string
 }
 
+// ErrSliceHeadMissing is the sentinel a *SliceHeadMissingError matches under
+// errors.Is (#4079): a succeeded decomposed child's slice branch does not
+// exist on the forge, so the fan-in cannot merge it.
+var ErrSliceHeadMissing = errors.New("orchestrator: slice head missing")
+
+// SliceHeadMissingError is the typed fan-in failure for a CONFIRMED-absent
+// slice branch (#4079): MergeBranch answered 404 for the slice head AND a
+// GetBranchSHA probe confirmed the head does not exist. It is the shape a
+// child that reached succeeded without ever pushing its slice leaves behind.
+// The child-completion sweeper keeps the parent parked on it (never a
+// category-B give-up), so the next tick's idempotent merge integrates the
+// slice once its branch exists — a resumed child push, or an operator push of
+// the runner's pinned checkpoint ref. Callers that park on ANY integration
+// error (the event-driven maybeAdvanceDecomposedParent arm and
+// IntegrateCompletedWave, which returns the error unwrapped) need no change.
+type SliceHeadMissingError struct {
+	SliceIndex int
+	ChildRunID uuid.UUID
+	Branch     string
+}
+
+func (e *SliceHeadMissingError) Error() string {
+	return fmt.Sprintf("slice head missing: slice %d (child run %s) branch %q does not exist; the child never pushed its slice",
+		e.SliceIndex, e.ChildRunID, e.Branch)
+}
+
+// Is makes errors.Is(err, ErrSliceHeadMissing) true for the typed error.
+func (*SliceHeadMissingError) Is(target error) bool { return target == ErrSliceHeadMissing }
+
 // integrateSlicesPageSize bounds each ListRuns page the fan-in
 // children-listing walk fetches. Decompositions are small (a handful of
 // slices), so this is far above any realistic child count — but the walk
@@ -1798,6 +1827,20 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 				slog.String("conflicting_child_run_id", c.ID.String()),
 				slog.Int("conflicting_slice_index", *c.SliceIndex))
 			return &SliceConflict{SliceIndex: *c.SliceIndex, ChildRunID: c.ID, Detail: detail}, nil
+		case errors.Is(err, forge.ErrNotFound) && o.sliceHeadAbsent(ctx, scope, repo, head):
+			// #4079: the merge endpoint 404s when the base OR the head is
+			// missing. The consolidated base was created or confirmed just
+			// above, so probe the head; only a CONFIRMED-absent head (exists
+			// false, nil probe error) is classified. A probe error or an
+			// existing head falls through to the generic wrap below, so an
+			// unrelated 404 is never misread as a missing slice. Merge SHAs
+			// already recorded for earlier slices are unaffected.
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: slice head missing; a succeeded child never pushed its slice branch",
+				slog.String("parent_run_id", parent.ID.String()),
+				slog.String("child_run_id", c.ID.String()),
+				slog.Int("slice_index", *c.SliceIndex),
+				slog.String("branch", head))
+			return nil, &SliceHeadMissingError{SliceIndex: *c.SliceIndex, ChildRunID: c.ID, Branch: head}
 		default:
 			return nil, fmt.Errorf("merge slice %d (child %s) onto %s: %w", *c.SliceIndex, c.ID, consolidated, err)
 		}
@@ -1809,6 +1852,20 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		slog.String("consolidated_branch", consolidated),
 		slog.Int("slice_count", len(childIDs)))
 	return nil, nil
+}
+
+// sliceHeadAbsent reports whether the slice head branch is CONFIRMED absent:
+// GetBranchSHA answered (_, false, nil). A probe error is NOT confirmation —
+// it returns false so the caller keeps the generic error (#4079).
+func (o *Orchestrator) sliceHeadAbsent(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, head string) bool {
+	_, exists, err := o.GitHub.GetBranchSHA(ctx, scope, repo, head)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: slice head probe failed after a merge 404; keeping the generic integration error",
+			slog.String("branch", head),
+			slog.String("error", err.Error()))
+		return false
+	}
+	return !exists
 }
 
 // listAllDecomposedChildren pages ListRuns(DecomposedFrom=parent) to
@@ -2878,7 +2935,9 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 	// — the issue's requirement. A non-conflict error leaves the stage
 	// parked (next tick/retry re-enters; merges are idempotent). On success
 	// we fall through to the existing succeeded transition + Advance, which
-	// opens the consolidated PR from the now-integrated branch.
+	// opens the consolidated PR from the now-integrated branch. A
+	// *SliceHeadMissingError (#4079) parks the same way as any other error —
+	// no change is needed here; the sweeper owns its dedup'd audit row.
 	if !anyFailed {
 		conflict, err := o.IntegrateSlices(ctx, parentRunID)
 		switch {
