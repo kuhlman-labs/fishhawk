@@ -1,0 +1,14 @@
+id: scenario:issue-4085/get-plan-surfaces-partial-delivery
+statement: 'For a run whose plan declares delivery: partial with a remaining_scope, the plan gate shows it prominently: fishhawk_get_plan returns delivery "partial" and the remaining_scope text, and its plan_warnings carries an advisory containing PARTIAL DELIVERY and the remaining scope; a plan without the declaration carries neither the keys nor the advisory.'
+verify_hint: 'MCP tool result: fishhawk_get_plan for the run (content.delivery, content.remaining_scope, plan_warnings); equivalently GET /v0/runs/{run_id}/audit carries a plan_warnings entry whose payload names PARTIAL DELIVERY.'
+steps: '1) POST /v0/dev/fixtures {"scenario":"trace-upload-target"}. Read run_id and stage plan id from the 201 body; the run''s trigger_ref is issue:3. 2) Built a standard_v1 plan: the plan-gate-parked fixture''s plan content, with ticket_reference kuhlman-labs/fishhawk#3, delivery ''partial'' and remaining_scope ''Wire the CLI flag and docs page (left for a later run).''. 3) POST /v0/runs/{run}/signing-key; POST /v0/dev/sign with the plan bytes and header X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/plan?stage_id={plan} with X-Fishhawk-Signature (201). 4) GET /v0/runs/{run}/audit. 5) Got a run token: signing-key, then /v0/dev/sign over ''{}'', then POST /v0/runs/{run}/mcp-token. 6) POST /mcp tools/call fishhawk_get_plan {run_id}, with Mcp-Protocol-Version 2026-07-28, Mcp-Method and _meta. 7) Control: repeated steps 1-6 on a fresh trace-upload-target run with the same plan minus delivery and remaining_scope.'
+assertions:
+    expected: delivery 'partial', remaining_scope text and a PARTIAL DELIVERY advisory with the scope; a plan without the declaration carries neither
+    observed_at_record: 'For the partial plan, structuredContent.plan.delivery is ''partial'' and plan.remaining_scope is the scope text. plan_warnings has one entry: ''plan declares a PARTIAL DELIVERY: this run is NOT meant to close the triggering issue ... Remaining scope: Wire the CLI flag and docs page (left for a later run).. Confirm the issue should stay open; ...''. The audit carries a plan_warnings row with the same text. For the full plan, the plan has no delivery and no remaining_scope key, plan_warnings is absent, and the audit has no plan_warnings row.'
+    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_get_plan {"run_id":"<run>"} with a run-bound fhm_ bearer
+origin:
+    issue: 4085
+    pr: 0
+    run_id: 0697f4cb-e633-426d-b597-dc0374bbe426
+    head_sha: 6f9a673885fdcda0d5b637e03217f0b47ea5959a
+    recorded_at: 2026-10-09T06:30:29Z

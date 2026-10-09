@@ -1,0 +1,14 @@
+id: scenario:issue-4085/implement-prompt-uses-refs-for-partial
+statement: 'The rendered implement prompt for a stage whose approved plan is a partial delivery of issue N instructs ending the PR body with `Refs #N`, forbids closing keywords before #N, and renders the remaining scope as not-to-implement; for a full-delivery plan it still instructs `Closes #N`.'
+verify_hint: 'Rendered prompt: GET /v0/stages/{stage_id}/prompt for the implement stage contains `Refs #N` and no `Closes #N` directive for the partial run, and `Closes #N` for the full run.'
+steps: '1) POST /v0/dev/fixtures {"scenario":"plan-gate-criteria"}. Read run_id plus the plan and implement stage ids from the 201 body; the trigger is issue:3181. 2) GET /v0/stages/{plan}/artifacts. Took the latest plan content, set delivery ''partial'' and remaining_scope ''Document the new flag in docs/ and wire the CLI (later run).''. Signed it (signing-key, then /v0/dev/sign) and POSTed it to /v0/runs/{run}/plan?stage_id={plan} (201). 3) GET /v0/stages/{implement}/prompt-render. The signed /prompt route answers 401 signature_missing to an unsigned GET; prompt-render serves the same renderer. 4) Control: seeded a fresh plan-gate-criteria run with its unmodified full plan and fetched GET /v0/stages/{implement}/prompt-render.'
+assertions:
+    expected: 'Refs #N plus a ban on closing keywords and remaining scope as do-not-implement for partial; Closes #N for full'
+    observed_at_record: 'The partial prompt shows ''Delivery: PARTIAL (declared by the planner). Remaining scope — NOT part of this change; do not implement it:'' followed by the scope text. It says ''End the body with `Refs #3181` on its own line. This plan is a PARTIAL delivery of #3181, so the PR must NOT close it: write no closing keyword (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved) before #3181 anywhere ...''. It has no ''Closes #3181''. The full prompt says ''End the body with `Closes #3181` on its own line so merging the PR auto-closes the originating issue.'' and has no PARTIAL or Refs text.'
+    repro_handle: GET http://localhost:8090/v0/stages/<implement_stage_id>/prompt-render
+origin:
+    issue: 4085
+    pr: 0
+    run_id: 0697f4cb-e633-426d-b597-dc0374bbe426
+    head_sha: 6f9a673885fdcda0d5b637e03217f0b47ea5959a
+    recorded_at: 2026-10-09T06:30:29Z
