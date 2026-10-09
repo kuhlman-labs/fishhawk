@@ -12,6 +12,12 @@ import (
 // it without depending on the database driver.
 var ErrNotFound = errors.New("not found")
 
+// ErrReopenNotApplicable is the sentinel every RunReopenReviver refusal wraps
+// (#4082): the run or stage passed to ReviveRunOnReopen is not in the shape
+// the PR-reopen revive may write. The wrapping message names the failed
+// precondition. Nothing is mutated when it is returned.
+var ErrReopenNotApplicable = errors.New("run not revivable on reopen")
+
 // CreateRunParams are the inputs needed to insert a new run.
 type CreateRunParams struct {
 	Repo           string
@@ -351,6 +357,34 @@ type Repository interface {
 // race window; production always has the capability.
 type StageCASTransitioner interface {
 	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
+}
+
+// RunReopenReviver is an OPTIONAL capability on the concrete postgres repo —
+// the repository half of the PR-reopen revive (#4082). ReviveRunOnReopen
+// re-parks a run's cancelled REVIEW stage at awaiting_approval AND reopens
+// the cancelled run to running, in ONE transaction, or does neither.
+//
+// It locks the stage row and then the run row (the order
+// TransitionStageFromLiveRunTx documents) and refuses, wrapping
+// ErrReopenNotApplicable and rolling back, unless: the stage belongs to
+// runID; ValidStageReopenTransition(stage_type, state, awaiting_approval)
+// holds (a review stage that is cancelled); and ValidRunReopenTransition(
+// run state, running) holds (the run is cancelled). A missing row returns
+// ErrNotFound. The edges live in their own tables (transition.go), so no
+// other repository method can write them.
+//
+// It decides only WHICH state pair may be written. Whether a reopen is a
+// revive at all (the close cancelled a running run, the reopen is inside the
+// window, the head is unchanged, no stage is in flight) is the caller's
+// decision: the server's pull_request.reopened handler is the only caller.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner
+// is — widening Repository would break every manually-written full-interface
+// test fake — and probed with a type assertion by its consumer.
+//
+//nolint:revive // the approved #4082 plan names run.RunReopenReviver as the server handler's type assertion; "Run" names the run (not the stage) being reopened.
+type RunReopenReviver interface {
+	ReviveRunOnReopen(ctx context.Context, runID, reviewStageID uuid.UUID) (*Run, *Stage, error)
 }
 
 // StageAttemptCASTransitioner is an OPTIONAL capability on the concrete
