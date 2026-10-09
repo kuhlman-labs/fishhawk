@@ -69,7 +69,9 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "over_cap": false,
   "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] },
   "irreducible": { "rationale": "...", "atomicity_basis": "..." },
-  "new_architectural_decision": { "rationale": "...", "related_adrs": ["..."], "decision_summary": "..." }
+  "new_architectural_decision": { "rationale": "...", "related_adrs": ["..."], "decision_summary": "..." },
+  "delivery": "full|partial",
+  "remaining_scope": "..."
 }
 ```
 
@@ -249,7 +251,7 @@ Optional string, enum `["none"]` (E72.1 / #3325). The plan's explicit declaratio
 }
 ```
 
-**Mutually exclusive with any drivable criterion.** `plan.Parse` rejects `none` alongside a criterion that is NOT `skip_expected` with a non-whitespace `expectation_basis` (a `*SemanticError` naming the criterion id and both remedies: mark it skip_expected with an expectation_basis, or drop `acceptance_surface`). A JSON Schema `if/then` cannot express "every array element satisfies X when a sibling property is set", so the guard lives in `semanticCheck`, beside the duplicate-id check, and runs on a non-decomposed plan too. It is ALSO enforced directly on the plan-upload path (E72.6 / #3381): `plan.Parse` is not on the ship path (`POST /v0/runs/{run_id}/plan` validates schema only), so `handleShipPlan` calls the narrow `plan.CheckAcceptanceSurface` after schema validation and refuses `400 plan_invalid` — `details.error` naming the criterion id — BEFORE the artifact is stored; otherwise the plan reached the gate and approval deleted the acceptance stage that would have verified its own criterion. Zero criteria plus `none` is legal, with or without `out_of_scope`. The TrimSpace reading matches `AcceptanceSkippableAllSkipWithBasis`, so a `none` plan that carries any criterion is exactly the all-skip shape by construction. `plan.DeclaresNoAcceptanceSurface(v)` is the single predicate (exact match — the enum constrains the wire value) the gate hook, the pre-check headline, and the advisory suppression dispatch through.
+**Mutually exclusive with any drivable criterion.** `plan.Parse` rejects `none` alongside a criterion that is NOT `skip_expected` with a non-whitespace `expectation_basis` (a `*SemanticError` naming the criterion id and both remedies: mark it skip_expected with an expectation_basis, or drop `acceptance_surface`). A JSON Schema `if/then` cannot express "every array element satisfies X when a sibling property is set", so the guard lives in `semanticCheck`, beside the duplicate-id check, and runs on a non-decomposed plan too. It is ALSO enforced directly on the plan-upload path (E72.6 / #3381): `plan.Parse` is not on the ship path (`POST /v0/runs/{run_id}/plan` validates the schema plus only the `delivery` rule), so `handleShipPlan` calls the narrow `plan.CheckAcceptanceSurface` after schema validation and refuses `400 plan_invalid` — `details.error` naming the criterion id — BEFORE the artifact is stored; otherwise the plan reached the gate and approval deleted the acceptance stage that would have verified its own criterion. Zero criteria plus `none` is legal, with or without `out_of_scope`. The TrimSpace reading matches `AcceptanceSkippableAllSkipWithBasis`, so a `none` plan that carries any criterion is exactly the all-skip shape by construction. `plan.DeclaresNoAcceptanceSurface(v)` is the single predicate (exact match — the enum constrains the wire value) the gate hook, the pre-check headline, and the advisory suppression dispatch through.
 
 **What the declaration does at the plan gate (marker first, then stage delete).** On approval of a plan declaring `none`, the plan gate records an `acceptance_stage_omitted` audit row scoped to the PLAN stage FIRST, and only then deletes the run's pending acceptance stage — so the run is genuinely minted without an acceptance stage instead of carrying one that short-circuits to a `not_validated` verdict with reviewer ceremony. The ordering is durable-record-first: a failure between the two writes leaves the run with its stage and no marker (it short-circuits as today), or with the marker and its stage (repaired by the next approval, which finds the marker and completes the idempotent delete) — never stage-less and marker-less. The merge gate reads the marker as its own merge-eligible disposition only when no acceptance-stage row exists. The hook, the marker category, and the gate disposition are owned by `backend/internal/server` (see its README); this document owns the artifact contract. Under `none` the `all_criteria_skip_expected` advisory is suppressed as moot, and `no_observable_criterion` is not emitted.
 
@@ -512,6 +514,31 @@ The optional object a planner sets to declare that the plan sets **new architect
 
 **Advisory only — the contrast with `irreducible`.** `irreducible` is read by an enforcement site (`server.overCapSplitRejection`). `new_architectural_decision` is read by **no** enforcement site: only the plan-gate advisory pass (`server.runPlanWarnings`) reads it, appending **one** `plan_warnings` advisory, last in order, that names the decision summary, the rationale and the related ADRs (`none cited` when empty). The captain decides whether the direction needs an ADR: approve (optionally filing one with `fishhawk_file_issue` type `adr`) or reject the plan. The plan-review prompt renders the declaration for the reviewers, and the `revise_plan` revision base carries it forward in both whole and digest mode. Additive-optional within `standard_v1.x` (no `x-intended-required`); a plan that omits it validates, warns and renders exactly as before.
 
+### `delivery` / `remaining_scope`
+
+The optional pair a planner sets to declare a **partial delivery** (E83.52 / #4085): the approved plan deliberately delivers only a slice of the triggering issue's scope, and part of its done-means is left for a later run. Absent `delivery` means `full`; a full delivery (the normal case) omits both keys.
+
+```json
+{
+  "delivery": "partial",
+  "remaining_scope": "the merge-time issue comment and the held-commit resume land in a later run"
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `delivery` | no | `full` or `partial`. Absent means `full`. |
+| `remaining_scope` | when `delivery` is `partial` | The short statement (≤ 2000 chars) of what the issue still needs after this delivery. Required by the schema's root `if`/`then` when `delivery` is `partial`; rejected by `plan.Parse` and by `plan.Validate` when blank or when `delivery` is absent or `full`, so `POST /v0/runs/{run_id}/plan` refuses those shapes `400 plan_invalid` before the artifact is stored. |
+
+`plan.(*Plan).IsPartialDelivery()` is the one shared definition every consumer reads; it is true exactly when `delivery` is `partial` (it does not re-check `remaining_scope`, because reading a malformed declaration as partial is the safe direction). For a partial plan:
+
+- **PR body.** Every PR-body producer references the issue with `Refs #N` instead of `Closes #N`: the implement prompt's PR-description instruction (the agent-authored body), the decomposed parent's consolidated PR (`consolidatedPRTitleBody`), and the held-commit resume (`heldCommitPRTitleBody`).
+- **Ship-time guard.** When the implement stage ships its PR, the server rewrites any active closing reference to `#N` the agent still wrote (`Closes`/`Fixes`/`Resolves #N`, code spans and fences excluded) to `Refs #N` and records a `partial_delivery_closing_reference_neutralized` audit row.
+- **Merge-time comment.** When the PR merges, Fishhawk posts one deduplicated comment on issue N naming the merged PR and the remaining scope (prose-neutralized), stating that the remaining scope was not delivered by that PR, and records `partial_delivery_remaining_scope_posted`.
+- **Plan gate.** The declaration surfaces to the approver as a `PARTIAL DELIVERY` `plan_warnings` advisory naming the remaining scope, on `fishhawk_get_plan` (`delivery` / `remaining_scope`), on the issue anchor's current-plan block, and in the plan-review and implement prompt renders.
+
+Named residuals: (a) a later fix-up or operator PR-body edit that reintroduces `Closes #N` is not re-checked before merge; (b) on GitLab the merge-time comment posts while the ship-time guard is GitHub-only; (c) an agent-authored commit message carrying a closing keyword is not rewritten (the implement prompt forbids it). A full or legacy plan is unaffected on every surface and still closes its issue. Additive-optional within `standard_v1.x` (no `x-intended-required`).
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -527,6 +554,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `split_proposal.phases[*].title` must be unique within the array, every phase must declare a non-empty `scope.files`, and `split_proposal.phases[*].depends_on` must form a valid DAG (every index in `[0, len(phases))`, never self-referential, free of cycles — reusing the same Kahn sort as `plan.Waves`). Each returns `*SemanticError` on violation (semantic check `checkSplitProposal` in the plan package, #2055).
 - `irreducible` is **mutually exclusive** with `split_proposal`: a plan carrying both returns `*SemanticError` (a plan cannot both decline and propose a split). And an `irreducible` whose `rationale` is blank/whitespace-only — which the schema's `minLength: 1` admits (a single space) — returns `*SemanticError`: an unjustified declaration is exactly the bare flag the design refuses (semantic check `checkIrreducible` in the plan package, #2412). `irreducible` adds **no** cap-aware logic to the semantic validator (it still has no view of the resolved cap), so no under-cap plan changes behaviour; the cap-aware relaxation lives at the server gate (`overCapSplitRejection`).
 - `new_architectural_decision` rejects whitespace-only values the schema's `minLength: 1` admits: a blank `rationale`, a blank `decision_summary`, or a blank `related_adrs` entry each returns `*SemanticError` naming the exact field path (`new_architectural_decision.rationale`, `.decision_summary`, `.related_adrs[i]`) (semantic check `checkNewArchitecturalDecision` in the plan package, E78.4 / #3748). `NewArchitecturalDecision.Declared()` applies the same three rules, so the advisory and the renders agree with the validator. No cap-aware or cross-field coupling.
+- `delivery` / `remaining_scope` (E83.52 / #4085): the schema's root `if`/`then` requires `remaining_scope` when `delivery` is `partial`, which the runner's schema-only `Validate` already enforces. The semantic check `checkDelivery` adds the two rules the schema does not express: a `partial` delivery with a whitespace-only `remaining_scope` (which `minLength: 1` admits) and a non-empty `remaining_scope` paired with an absent or `full` delivery each return `*SemanticError` naming `remaining_scope`. The backend runs `checkDelivery` from BOTH `plan.Parse` (`semanticCheck`) and `plan.Validate` (the plan-upload path, which never reaches `Parse`); the runner's copy does not, so such a plan passes the runner and is refused at upload.
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

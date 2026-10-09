@@ -55,6 +55,16 @@ type AnchorPlanView struct {
 	// renders nothing). Only renderCurrentPlan reads it; a superseded plan's
 	// render is unchanged.
 	ArchitecturalDecision *plan.NewArchitecturalDecision
+	// PartialDelivery is the plan's PARTIAL delivery declaration (E83.52 /
+	// #4085), copied from plan.(*Plan).IsPartialDelivery — the one shared
+	// definition. Rendered as one bold line under the plan header, and only
+	// when true. Only renderCurrentPlan reads it; a superseded plan's render is
+	// unchanged.
+	PartialDelivery bool
+	// RemainingScope is the plan's remaining_scope, paired with
+	// PartialDelivery: what the issue still needs after this delivery. Rendered
+	// flattened to one line and word-bounded; blank renders "not stated".
+	RemainingScope string
 	// UnpublishedRevisions counts later plan artifacts that were never
 	// republished to this anchor because the plan stage's persistence
 	// declaration omits `update_on_change` (E45.41 / #3346, one-shot pin —
@@ -643,6 +653,19 @@ func renderCurrentPlan(p *AnchorPlanView, suppressed bool) string {
 	}
 	var b strings.Builder
 	b.WriteString("**Plan**\n\n")
+	if p.PartialDelivery {
+		// The planner's PARTIAL delivery declaration (E83.52 / #4085), shown
+		// first so the approver sees it before the summary. Worded as intent
+		// ("not meant to close"), not a guarantee: the ship-time closing-
+		// reference guard is GitHub-only and a later PR-body edit is not
+		// re-checked, so the issue CAN still close on merge. Planner-authored
+		// text is flattened and bounded; no @-mention is rendered.
+		scope := oneLineWords(p.RemainingScope, 300)
+		if scope == "" {
+			scope = "not stated"
+		}
+		fmt.Fprintf(&b, "**Partial delivery** — this run delivers only part of this issue; merging it is not meant to close the issue. _Remaining scope: %s_\n\n", scope)
+	}
 	if p.Summary != "" {
 		fmt.Fprintf(&b, "%s\n", p.Summary)
 	} else {

@@ -5120,7 +5120,10 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 			}
 		}
 	}
-	title, body := heldCommitPRTitleBody(runRow, prTitle, prBody)
+	// E83.52 / #4085: a partial-delivery plan resumes with `Refs #N`, not
+	// `Closes #N` (heldCommitPRTitleBody's partial branch).
+	_, partial := s.partialDeliveryPlan(ctx, runRow.ID)
+	title, body := heldCommitPRTitleBody(runRow, prTitle, prBody, partial)
 	return heldCommitResume{
 		sha: park.HeldCommitSHA, branch: park.RunBranch, baseSHA: base,
 		prTitle: title, prBody: body,
@@ -5462,7 +5465,9 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 	// #2570: resolve the PR text off the same checkpoint payload. Empty recovered
 	// fields fall through to the issue-context synthesis; nothing here can
 	// withhold the resume.
-	title, body := heldCommitPRTitleBody(runRow, cp.PRTitle, cp.PRBody)
+	// E83.52 / #4085: a partial-delivery plan resumes with `Refs #N`.
+	_, partial := s.partialDeliveryPlan(ctx, runRow.ID)
+	title, body := heldCommitPRTitleBody(runRow, cp.PRTitle, cp.PRBody, partial)
 	held := heldCommitResume{
 		sha: cp.HeadSHA, branch: cp.Branch, baseSHA: cp.BaseSHA,
 		prTitle: title, prBody: body,

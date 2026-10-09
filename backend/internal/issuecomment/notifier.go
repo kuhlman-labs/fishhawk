@@ -1188,6 +1188,11 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, runRow *run.Run, stages 
 			// Surface the planner's new-architectural-decision declaration
 			// (E78.4 / #3748); renderCurrentPlan shows it only when Declared().
 			av.ArchitecturalDecision = p.NewArchitecturalDecision
+			// Surface the planner's PARTIAL delivery declaration (E83.52 /
+			// #4085) through the one shared definition; renderCurrentPlan
+			// shows it only when PartialDelivery.
+			av.PartialDelivery = p.IsPartialDelivery()
+			av.RemainingScope = p.RemainingScope
 			views = append(views, dated{view: av, at: a.CreatedAt})
 		}
 	}

@@ -1926,6 +1926,37 @@ func TestConsolidatedPRTitleBody(t *testing.T) {
 			},
 			wantAbsent: []string{"(run c0000000)", "(run "},
 		},
+		{
+			// E83.52 / #4085: a PARTIAL delivery references the issue with
+			// Refs, never Closes, so merging leaves the issue open. The
+			// fixture's ONLY partial signal is delivery: partial.
+			name: "partial-delivery plan references the issue with Refs, not Closes",
+			r:    &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "Add widget", Number: 714}},
+			p: &plan.Plan{
+				Summary:        "Ship the first slice.",
+				Delivery:       plan.DeliveryPartial,
+				RemainingScope: "the runner mirror",
+			},
+			baseURL:   "https://app.fishhawk.test/",
+			wantTitle: "chore: Add widget",
+			wantContains: []string{
+				"## Summary\n\nShip the first slice.",
+				"\n\nRefs #714",
+				wantFooterA,
+			},
+			wantAbsent: []string{"Closes #"},
+		},
+		{
+			name:      "full-delivery plan keeps Closes",
+			r:         &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "Add widget", Number: 714}},
+			p:         &plan.Plan{Summary: "Ship it all.", Delivery: plan.DeliveryFull},
+			baseURL:   "https://app.fishhawk.test/",
+			wantTitle: "chore: Add widget",
+			wantContains: []string{
+				"\n\nCloses #714",
+			},
+			wantAbsent: []string{"Refs #"},
+		},
 	}
 
 	for _, tc := range tests {

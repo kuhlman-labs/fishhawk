@@ -4962,6 +4962,146 @@ func TestGetPlan_NewArchitecturalDecision_AbsentWhenNotDeclared(t *testing.T) {
 	}
 }
 
+// seedPlanArtifactWithDelivery seeds a plan artifact whose wire content
+// carries the delivery declaration (E83.52 / #4085) marshalled from the
+// BACKEND type: it marshals a zero plan.Plan and one carrying delivery and
+// remainingScope, and copies only the keys the second adds. A json-tag drift
+// between plan.Plan and this package's PlanContent therefore lands the
+// declaration under a key get_plan does not decode, and the test reddens
+// instead of the field silently vanishing in production.
+func seedPlanArtifactWithDelivery(t *testing.T, fb *fakeBackend, stageID uuid.UUID, delivery, remainingScope string) {
+	t.Helper()
+	art := seedPlanArtifact(fb, stageID, samplePlanContent(), time.Hour)
+	toMap := func(p plan.Plan) map[string]any {
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan.Plan: %v", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("decode plan.Plan: %v", err)
+		}
+		return m
+	}
+	base := toMap(plan.Plan{})
+	declared := toMap(plan.Plan{Delivery: delivery, RemainingScope: remainingScope})
+	content, ok := art.Content.(map[string]any)
+	if !ok {
+		t.Fatalf("seeded plan content is %T, want map[string]any", art.Content)
+	}
+	added := 0
+	for k, v := range declared {
+		if _, inBase := base[k]; inBase {
+			continue
+		}
+		content[k] = v
+		added++
+	}
+	want := 0
+	if delivery != "" {
+		want++
+	}
+	if remainingScope != "" {
+		want++
+	}
+	if added != want {
+		t.Fatalf("backend plan.Plan marshal added %d keys for delivery=%q remaining_scope=%q, want %d", added, delivery, remainingScope, want)
+	}
+}
+
+// TestGetPlan_PartialDelivery_Surfaced pins the get_plan surface of the
+// E83.52 / #4085 declaration: a partial plan artifact decodes into
+// Plan.Delivery / Plan.RemainingScope, the MARSHALLED tool output carries both
+// keys (so deleting either PlanContent field compiles and still reddens this
+// test), and the server-side PARTIAL DELIVERY advisory seeded as a
+// plan_warnings entry (the shape server.partialDeliveryWarning emits) echoes
+// through PlanWarnings.
+func TestGetPlan_PartialDelivery_Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	const remaining = "the merge-time remaining-scope comment and the held-commit Refs footer"
+	seedPlanArtifactWithDelivery(t, fb, planStageID, plan.DeliveryPartial, remaining)
+	advisory := "plan declares a PARTIAL DELIVERY: this run is NOT meant to close the triggering issue — its PR references " +
+		"the issue with Refs instead of Closes, and Fishhawk posts the remaining scope on the issue at merge. " +
+		"Remaining scope: " + remaining + ". Confirm the issue should stay open; reject the plan if this run should deliver the " +
+		"whole issue."
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{advisory}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil when Status=available")
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	remainingJSON, _ := json.Marshal(remaining)
+	for _, want := range []string{`"delivery":"partial"`, `"remaining_scope":` + string(remainingJSON)} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("get_plan output missing %s:\n%s", want, raw)
+		}
+	}
+	if len(out.PlanWarnings) != 1 || out.PlanWarnings[0] != advisory {
+		t.Errorf("PlanWarnings = %q, want exactly the seeded partial-delivery advisory", out.PlanWarnings)
+	}
+}
+
+// TestGetPlan_Delivery_FullOrAbsentShape pins the additive shape: a plan that
+// omits delivery marshals neither key (byte-identical to a pre-#4085 plan),
+// and an explicit full delivery surfaces delivery "full" with no
+// remaining_scope key.
+func TestGetPlan_Delivery_FullOrAbsentShape(t *testing.T) {
+	cases := []struct {
+		name         string
+		delivery     string
+		wantDelivery bool
+	}{
+		{name: "absent", delivery: ""},
+		{name: "full", delivery: plan.DeliveryFull, wantDelivery: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			planStageID := uuid.New()
+			fb.stagesByRun[runID] = []Stage{
+				{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+			}
+			seedPlanArtifactWithDelivery(t, fb, planStageID, tc.delivery, "")
+
+			r := newResolver(srv, nil)
+			_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getPlan: %v", err)
+			}
+			if out.Plan == nil {
+				t.Fatal("Plan should be non-nil")
+			}
+			raw, err := json.Marshal(out.Plan)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := strings.Contains(string(raw), `"delivery":"full"`); got != tc.wantDelivery {
+				t.Errorf(`"delivery":"full" present = %v, want %v: %s`, got, tc.wantDelivery, raw)
+			}
+			if !tc.wantDelivery && strings.Contains(string(raw), `"delivery"`) {
+				t.Errorf("marshalled plan carries a delivery key for a plan without it: %s", raw)
+			}
+			if strings.Contains(string(raw), "remaining_scope") {
+				t.Errorf("marshalled plan carries remaining_scope for a non-partial plan: %s", raw)
+			}
+		})
+	}
+}
+
 // --- get_plan reviews field (ADR-027 / #560 sub-plan E) ---
 
 // seedPlanReviewAudit adds a plan_reviewed audit entry to the fake's

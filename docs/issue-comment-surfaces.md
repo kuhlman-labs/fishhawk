@@ -22,6 +22,7 @@ it.
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
 | Split filing refusal (#2412) | _(none at the comment; the sibling `split_filing_refused` marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` → `refuseSplitFilingOverCapPhase` (plan-gate approve of a `split_proposal` whose phase is over the implement cap) | on refusal to file any children (a phase declares more files than the resolved `max_files_changed` cap) | No (best-effort; the `split_filing_refused` marker is persisted BEFORE this comment, so once it is durable a re-approval of the still-over-cap proposal no-ops at the prior-refusal gate and never re-posts) |
 | Split parent close (#2062) | _(none at the comment; the parent thread's own stamped `fishhawk-split-parent-close` marker is the dedup record)_ | _(none)_ | `Server.handleContractChildClosed` (`issues.closed` on a filed split's contract child) | when the contract child closes as landed (any `state_reason` except `not_planned` / `duplicate`) | No (best-effort; the comment is posted BEFORE the close and deduped by re-reading the parent thread for the `fishhawk-split-parent-close` marker, so a redelivery finds the marker and posts nothing — the residual is a duplicate under two GENUINELY CONCURRENT deliveries, deliberately accepted over a lock) |
+| Partial-delivery remaining scope (E83.52 / #4085) | `partial_delivery_remaining_scope_posted` (run chain; the dedup record) | _(none)_ | `Server.postPartialDeliveryRemainingScope` (`server/partial_delivery_merge.go`), called on BOTH merged arms of `resolveReviewStageOnMerge` — never on closed-without-merge | merge of a run that carries a triggering issue and whose approved plan declares `delivery: partial` | No (one comment on the triggering issue per run, forge-neutral; deduped on a prior `partial_delivery_remaining_scope_posted` row, appended only AFTER a successful post so a failed post is retried on redelivery — the residuals are a duplicate under two GENUINELY CONCURRENT deliveries or an append failure after a successful post) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 | Run not applicable (applies_to) | _(none at notifier; global-chain `run_rejected_applies_to` on the dispatcher)_ | _(none)_ | `Dispatcher.refusedByAppliesTo` applies_to admission gate (E53.10 / #2361) | dispatch refusal (workflow's `applies_to` labels/trigger not satisfied) | No (each refusal posts its own comment) |
 | Alert incident issue (E35.4 / #1601) | _(none at notifier; global-chain `alert_incident_filed` written by the ingress)_ | _(none)_ | `Server.handleAlertTrigger` (`POST /v0/triggers/alert`) → `applyAndFileWorkItem` | first verified alert for a `(source, repo, fingerprint)`: a NEW issue in the alert source's configured repo, not a run thread | No (one issue per fingerprint, deduped by the `alert_incidents` ledger; the body carries the `alert-incident` idempotency marker, which names a duplicate filed under a lost claim) |
@@ -94,6 +95,20 @@ Notes:
   Superseded plans and `status_template.go` are unchanged. This is a rendered
   line inside an existing section, not a new surface: no Notifier method or
   audit kind is added.
+  The current plan's section also renders, directly under the `**Plan**` header
+  and above the summary, one bold line `**Partial delivery** — this run delivers
+  only part of this issue; merging it is not meant to close the issue.
+  _Remaining scope: <remaining_scope>_` when the plan declares `delivery:
+  partial` (E83.52 / #4085, `anchor_template.go::renderCurrentPlan`, copied into
+  `AnchorPlanView.PartialDelivery` / `RemainingScope` by
+  `notifier.go::loadAnchorPlans` through `plan.(*Plan).IsPartialDelivery`). The
+  remaining scope is flattened and word-bounded to 300 bytes, a blank one
+  renders `not stated`, and no `@`-mention is rendered. It is worded as INTENT,
+  not a guarantee: the ship-time closing-reference guard is GitHub-only and a
+  later PR-body edit is not re-checked (see the partial-delivery activity kinds
+  below). A full or absent delivery and every superseded plan render
+  byte-identically. A rendered line inside an existing section, not a new
+  surface.
 - **Plan content lives in the artifact store, not the audit chain.** The
   anchor loads the current + superseded plans via the optional
   `Deps.Artifacts` (`PlanArtifactLister`) — the latest plan artifact (by
@@ -874,9 +889,13 @@ Notes:
   advisory (#2053), and the NEAR-cap advisory (#2492) — the plan's scope
   lands within a few files of the implement `max_files_changed` cap, naming
   the remaining headroom (more emphatically for a decomposed plan) — and,
-  appended last, the new-architectural-decision advisory (E78.4 / #3748)
-  when the plan declares `new_architectural_decision` — with payload
-  `{warnings}`.
+  the new-architectural-decision advisory (E78.4 / #3748) when the plan
+  declares `new_architectural_decision`, and, appended last, the PARTIAL
+  DELIVERY advisory (E83.52 / #4085) when the plan declares `delivery: partial`
+  — naming the remaining scope and stating that the run "is NOT meant to
+  close the triggering issue" (it does not promise the issue stays open; see
+  the named residuals in `backend/internal/server/README.md` § Partial
+  delivery) — with payload `{warnings}`.
   Advisory + fail-open (an unparseable plan or an audit-append failure
   writes no entry and never blocks the upload) and — the one divergence
   from the sibling plan-gate sweeps — written ONLY when `Warnings()`
@@ -1323,6 +1342,36 @@ Notes:
   nothing. Listed here only so a reader grepping the audit categories doesn't
   mistake it for a comment surface; the comment it accompanies is the "Split
   parent close (#2062)" row in the table above.
+- The partial-delivery audit kinds (E83.52 / #4085) —
+  `partial_delivery_closing_reference_neutralized` and
+  `partial_delivery_remaining_scope_posted` — are **system-actor audit kinds
+  with no dedicated Notifier method** that render **data-drivenly** on the
+  living-anchor / status-comment timeline through `activityCategories`
+  (`status_template.go`), each marked by `notifyOperatorVisible` at its writer
+  (the #3406 intent marker). They are not new comment surfaces of their own.
+  - `partial_delivery_closing_reference_neutralized` is written by the ship-time
+    guard `server/partial_delivery_pr.go::neutralizePartialDeliveryClosingRef`,
+    called from `handleShipPullRequest` on every successful implement ship
+    (after the branch-lineage guard, outside the running-stage terminal drive).
+    When the run carries a triggering issue and its approved plan declares
+    `delivery: partial`, it re-reads the LIVE PR body and rewrites every active
+    closing reference to the issue (`Closes/Fixes/Resolves #N`, outside code
+    spans and fences, the #2570 `hasClosingReference` rules) to `Refs #N` via
+    `EditPullRequest`, appending the row ONLY after the edit succeeds. Payload
+    `{issue_number, pr_number, rewritten}`; rendered as "Partial delivery:
+    closing reference rewritten to `Refs #N`". Named residuals: a later fix-up
+    push or operator PR-body edit that reintroduces `Closes #N` is not
+    re-checked before merge, and the guard is GitHub-only (GitLab, or a run
+    with no installation, is an INFO skip) while the merge-time comment still
+    posts there.
+  - `partial_delivery_remaining_scope_posted` is written by the merge-time
+    remaining-scope comment (the "Partial-delivery remaining scope" table row
+    above) after the comment posts, and is that comment's dedup record. Rendered
+    as "Partial delivery: remaining scope posted on the issue". The comment's
+    wording stays true even when the issue was closed anyway (the GitHub-only
+    guard and the unchecked later edit above): it states that the remaining
+    scope was not delivered by the merged PR rather than asserting the issue
+    stays open.
 - The slice-integration audit kinds — `slices_integrated` and
   `slice_integration_conflict` (ADR-041 / #1142) — are **system-actor audit
   kinds with no dedicated Notifier method**, but as of E24.7 (#1147) both ALSO

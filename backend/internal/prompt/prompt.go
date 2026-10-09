@@ -2545,11 +2545,28 @@ func buildImplement(t Trigger) string {
 	b.WriteString("  - `## Notes` — optional. Use only when there's something deferred, surprising, or non-obvious worth flagging.\n")
 	b.WriteString("- Don't add other top-level sections. Don't open the body with prose that floats above the first heading; everything narrative goes under `## Summary`.\n")
 
+	// A PARTIAL-delivery plan (E83.52 / #4085) must not close its issue, so
+	// the closing bullet becomes a Refs bullet that forbids every closing
+	// keyword. A full, legacy or nil plan keeps the Closes bullet byte-for-byte.
+	// This is an instruction, not the control: the server's ship-time guard
+	// rewrites a closing reference the agent still writes. Named residuals: a
+	// later fix-up or operator PR-body edit that reintroduces `Closes #N` is not
+	// re-checked before merge, and on GitLab the ship-time guard does not run
+	// (it is GitHub-only) while the merge-time remaining-scope comment does.
 	if t.IssueNumber > 0 {
-		fmt.Fprintf(&b,
-			"- End the body with `Closes #%d` on its own line so merging the PR auto-closes the originating issue.\n",
-			t.IssueNumber,
-		)
+		if t.ApprovedPlan.IsPartialDelivery() {
+			fmt.Fprintf(&b,
+				"- End the body with `Refs #%d` on its own line. This plan is a PARTIAL delivery of #%d, so the PR must NOT close it: "+
+					"write no closing keyword (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved) before #%d "+
+					"anywhere in the PR description or the commit message.\n",
+				t.IssueNumber, t.IssueNumber, t.IssueNumber,
+			)
+		} else {
+			fmt.Fprintf(&b,
+				"- End the body with `Closes #%d` on its own line so merging the PR auto-closes the originating issue.\n",
+				t.IssueNumber,
+			)
+		}
 	}
 
 	b.WriteString("\n")
@@ -4841,6 +4858,26 @@ func writeAcceptanceOutOfScope(b *strings.Builder, outOfScope []string) {
 	b.WriteString("\n")
 }
 
+// partialDeliveryHeading opens the planner-facing partial-delivery section
+// (E83.52 / #4085).
+const partialDeliveryHeading = "### Partial delivery"
+
+// writePartialDeliveryGuidance renders the planner-facing partial-delivery
+// section: when to set the standard_v1 `delivery` / `remaining_scope` pair and
+// what it changes downstream. A standalone writer so the frozen plan-prompt
+// golden can replay it as a delta (applyPartialDeliveryGoldenDelta) instead of
+// being re-captured.
+func writePartialDeliveryGuidance(b *strings.Builder) {
+	b.WriteString("\n" + partialDeliveryHeading + "\n\n")
+	b.WriteString("Set the optional top-level `delivery` field to `\"partial\"`, together with `remaining_scope`, ONLY when this plan deliberately delivers a slice of the triggering issue's scope " +
+		"— part of the issue's done-means is left for a later run. " +
+		"`remaining_scope` is a short statement of what the issue still needs after this delivery; it is required with `delivery: \"partial\"` and invalid without it. " +
+		"Omit both fields for a full delivery — that is the normal case.\n")
+	b.WriteString("A partial delivery changes what merging does: the PR references the issue with `Refs #N` instead of `Closes #N`, " +
+		"and Fishhawk posts `remaining_scope` on the issue at merge, so merging does not close the issue. " +
+		"The declaration is shown to the approver as a plan warning.\n")
+}
+
 func buildPlan(t Trigger) string {
 	var b strings.Builder
 	b.WriteString("You are drafting an implementation plan for a change in the repository ")
@@ -5438,6 +5475,10 @@ func buildPlan(t Trigger) string {
 		"`related_adrs` (the ADR ids it relates to or departs from; an EMPTY array is valid and means no existing ADR covers it).\n")
 	b.WriteString("The declaration surfaces to the captain as a plan warning; the captain decides whether the direction needs an ADR. " +
 		"It gates nothing. On a revision, carry a prior declaration forward unless the revision removes the new direction.\n")
+	// Partial-delivery declaration (E83.52 / #4085). Unconditional, so every
+	// plan prompt carries it; it sits after the new-architectural-decision
+	// section and before the optional calibration hint.
+	writePartialDeliveryGuidance(&b)
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
 		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual p50 = %.1f min, p95 = %.1f min, ratio = %.2f.\n",
@@ -8300,6 +8341,17 @@ func writeGateAcceptanceTranscript(b *strings.Builder, tr *GateAcceptanceTranscr
 	b.WriteString("\n")
 }
 
+// remainingScopeOrNotStated returns a partial-delivery plan's trimmed
+// remaining_scope, or "not stated" when it is blank. IsPartialDelivery
+// deliberately does not require a non-blank remaining_scope (consumers skip
+// semanticCheck), so every render names the gap instead of an empty line.
+func remainingScopeOrNotStated(p *plan.Plan) string {
+	if rs := strings.TrimSpace(p.RemainingScope); rs != "" {
+		return rs
+	}
+	return "not stated"
+}
+
 // writePlanForReview renders a standard_v1 plan for the review-agent prompt.
 // It mirrors writeApprovedPlan but uses a neutral "Plan artifact" header
 // (the plan is under review, not yet approved).
@@ -8310,6 +8362,14 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 		b.WriteString("Summary:\n")
 		b.WriteString(p.Summary)
 		b.WriteString("\n\n")
+	}
+
+	// Partial delivery (E83.52 / #4085): shown right under the summary so the
+	// reviewer can judge whether the declared remaining scope is honest against
+	// the issue's done-means. Byte-identical for a full or legacy plan.
+	if p.IsPartialDelivery() {
+		fmt.Fprintf(b, "Delivery: PARTIAL — this run will not close the issue. Remaining scope: %s\n", remainingScopeOrNotStated(p))
+		b.WriteString("Judge whether the split is honest: the remaining scope must name what the issue's done-means still needs after this run.\n\n")
 	}
 
 	if len(p.Scope.Files) > 0 {
@@ -8593,6 +8653,15 @@ func writeApprovedPlan(b *strings.Builder, p *plan.Plan) {
 	if p.Summary != "" {
 		b.WriteString("Summary:\n")
 		b.WriteString(p.Summary)
+		b.WriteString("\n\n")
+	}
+
+	// Partial delivery (E83.52 / #4085): name the remaining scope as OUT of
+	// this change so the agent does not implement it. Byte-identical for a
+	// full or legacy plan.
+	if p.IsPartialDelivery() {
+		b.WriteString("Delivery: PARTIAL (declared by the planner). Remaining scope — NOT part of this change; do not implement it:\n")
+		b.WriteString(remainingScopeOrNotStated(p))
 		b.WriteString("\n\n")
 	}
 

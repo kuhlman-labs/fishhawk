@@ -148,12 +148,21 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
-	// NEW ARCHITECTURAL DECISION advisory (E78.4 / #3748), appended LAST so the
-	// #2053 ordering guarantee (count-derived over-cap advisory first) is
-	// unchanged. It reads only the parsed plan — no RunRepo, no cap — so it
+	// NEW ARCHITECTURAL DECISION advisory (E78.4 / #3748), appended after every
+	// cap-family advisory so the #2053 ordering guarantee (count-derived over-cap
+	// advisory first) is unchanged. It reads only the parsed plan — no RunRepo, no cap — so it
 	// fires even when the cap is unresolvable. It rides this plan_warnings entry;
 	// there is no separate audit category.
 	if w := newArchitecturalDecisionWarning(&parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
+	// PARTIAL DELIVERY advisory (E83.52 / #4085), appended after the
+	// new-architectural-decision advisory so the #2053 ordering guarantee
+	// (count-derived over-cap advisory first) is unchanged. Like its predecessor
+	// it reads only the parsed plan — no RunRepo, no cap — and rides this
+	// plan_warnings entry; there is no separate audit category.
+	if w := partialDeliveryWarning(&parsedPlan); w != "" {
 		warnings = append(warnings, w)
 	}
 
@@ -415,6 +424,45 @@ func newArchitecturalDecisionWarning(parsedPlan *plan.Plan) string {
 			"This is an advisory, not a gate: the captain decides whether the direction needs an ADR — "+
 			"approve (optionally filing one with fishhawk_file_issue type adr) or reject the plan.",
 		strings.TrimSpace(d.DecisionSummary), strings.TrimSpace(d.Rationale), adrs,
+	)
+}
+
+// partialDeliveryWarning surfaces a plan's PARTIAL delivery declaration
+// (E83.52 / #4085) to the approver as ONE advisory: the run is not meant to
+// close the triggering issue (the PR references it with Refs instead of Closes,
+// and Fishhawk posts the remaining scope on the issue at merge), followed by the
+// declared remaining scope. It is an advisory, not a gate: the approver confirms
+// the issue should stay open or rejects the plan.
+//
+// The wording says "not meant to close", not "will not close", because two
+// named residuals can still close the issue on merge: (a) a later fix-up or
+// operator PR-body edit that reintroduces `Closes #N` is not re-checked before
+// merge, and (b) on GitLab the ship-time closing-reference neutralizer does not
+// run (it is GitHub-only) while the merge-time remaining-scope comment still
+// posts.
+//
+// It returns "" unless plan.(*Plan).IsPartialDelivery, the one shared
+// definition. A blank remaining_scope renders as "not stated" rather than
+// suppressing the advisory. On the ship path handleShipPlan's plan.Validate
+// already refuses a whitespace-only value (checkDelivery), so this fallback is
+// defence in depth: runPlanWarnings decodes with json.Unmarshal and never runs
+// semanticCheck itself, and the declaration that the issue stays open is still
+// the load-bearing fact the approver must see.
+// Pure: no RunRepo or cap dependency.
+func partialDeliveryWarning(parsedPlan *plan.Plan) string {
+	if !parsedPlan.IsPartialDelivery() {
+		return ""
+	}
+	remaining := strings.TrimSpace(parsedPlan.RemainingScope)
+	if remaining == "" {
+		remaining = "not stated"
+	}
+	return fmt.Sprintf(
+		"plan declares a PARTIAL DELIVERY: this run is NOT meant to close the triggering issue — its PR references "+
+			"the issue with Refs instead of Closes, and Fishhawk posts the remaining scope on the issue at merge. "+
+			"Remaining scope: %s. Confirm the issue should stay open; reject the plan if this run should deliver the "+
+			"whole issue.",
+		remaining,
 	)
 }
 

@@ -4586,6 +4586,163 @@ func TestWritePlanForReview_RendersNewArchitecturalDecision(t *testing.T) {
 	}
 }
 
+// partialDeliveryFixturePlan is fixturePlan with a PARTIAL delivery declared.
+// Its ONLY partial signal is Delivery: partial, so a regression in
+// plan.(*Plan).IsPartialDelivery flips every render built from it.
+func partialDeliveryFixturePlan(remaining string) *plan.Plan {
+	p := fixturePlan()
+	p.Delivery = plan.DeliveryPartial
+	p.RemainingScope = remaining
+	return p
+}
+
+// TestBuild_Plan_PartialDeliveryGuidance pins the planner-facing
+// partial-delivery section (E83.52 / #4085): it exists, names both fields, the
+// when-to and omit-for-full cases and the downstream effects, and sits after
+// the New architectural decision section and before the Calibration hint.
+func TestBuild_Plan_PartialDeliveryGuidance(t *testing.T) {
+	got, err := Build("plan", preChangeGoldenTrigger())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"### Partial delivery",
+		"`delivery` field to `\"partial\"`, together with `remaining_scope`",
+		"ONLY when this plan deliberately delivers a slice of the triggering issue's scope",
+		"required with `delivery: \"partial\"` and invalid without it",
+		"Omit both fields for a full delivery — that is the normal case.",
+		"the PR references the issue with `Refs #N` instead of `Closes #N`",
+		"Fishhawk posts `remaining_scope` on the issue at merge, so merging does not close the issue",
+		"shown to the approver as a plan warning",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt missing partial-delivery guidance %q", want)
+		}
+	}
+	nad := strings.Index(got, "### New architectural decision")
+	pd := strings.Index(got, "### Partial delivery")
+	ch := strings.Index(got, "### Calibration hint")
+	if nad < 0 || pd < nad || ch < pd {
+		t.Errorf("partial-delivery section must sit between New architectural decision and Calibration hint (nad=%d pd=%d ch=%d)", nad, pd, ch)
+	}
+	if n := strings.Count(got, "### Partial delivery"); n != 1 {
+		t.Errorf("partial-delivery section rendered %d times, want 1", n)
+	}
+}
+
+// TestWritePlanForReview_RendersPartialDelivery pins the plan-review render
+// (E83.52 / #4085): a partial plan's review prompt carries the Delivery block
+// with the remaining scope; a blank remaining scope renders "not stated"; a
+// full or absent delivery renders byte-identically to the legacy plan.
+func TestWritePlanForReview_RendersPartialDelivery(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		IssueNumber: 42, IssueTitle: "Add foo", IssueBody: "b", Repo: "kuhlman-labs/example",
+		ApprovedPlan: partialDeliveryFixturePlan("  the runner mirror and its docs  "),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"Delivery: PARTIAL — this run will not close the issue. Remaining scope: the runner mirror and its docs\n",
+		"Judge whether the split is honest",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan_review prompt missing %q", want)
+		}
+	}
+
+	var blank strings.Builder
+	writePlanForReview(&blank, partialDeliveryFixturePlan("   "))
+	if !strings.Contains(blank.String(), "Remaining scope: not stated\n") {
+		t.Errorf("a blank remaining_scope must render 'not stated':\n%s", blank.String())
+	}
+
+	var absent, full strings.Builder
+	writePlanForReview(&absent, fixturePlan())
+	fullPlan := fixturePlan()
+	fullPlan.Delivery = plan.DeliveryFull
+	writePlanForReview(&full, fullPlan)
+	if absent.String() != full.String() {
+		t.Errorf("delivery: full must render byte-identically to an absent delivery")
+	}
+	if strings.Contains(absent.String(), "Delivery:") {
+		t.Errorf("a full-delivery plan must not render the Delivery block:\n%s", absent.String())
+	}
+}
+
+// TestWriteApprovedPlan_RendersPartialDeliveryRemainingScope pins the
+// implement render (E83.52 / #4085): a partial plan names the remaining scope
+// as NOT part of this change; a full or absent delivery renders
+// byte-identically to the legacy plan.
+func TestWriteApprovedPlan_RendersPartialDeliveryRemainingScope(t *testing.T) {
+	var partial strings.Builder
+	writeApprovedPlan(&partial, partialDeliveryFixturePlan("the runner mirror"))
+	want := "Delivery: PARTIAL (declared by the planner). Remaining scope — NOT part of this change; do not implement it:\nthe runner mirror\n\n"
+	if !strings.Contains(partial.String(), want) {
+		t.Errorf("approved-plan render missing %q:\n%s", want, partial.String())
+	}
+
+	var absent, full strings.Builder
+	writeApprovedPlan(&absent, fixturePlan())
+	fullPlan := fixturePlan()
+	fullPlan.Delivery = plan.DeliveryFull
+	writeApprovedPlan(&full, fullPlan)
+	if absent.String() != full.String() {
+		t.Errorf("delivery: full must render byte-identically to an absent delivery")
+	}
+	if strings.Contains(absent.String(), "Delivery:") {
+		t.Errorf("a full-delivery plan must not render the Delivery block:\n%s", absent.String())
+	}
+}
+
+// TestBuild_Implement_PartialDelivery_UsesRefsNotCloses pins the agent-authored
+// PR-description instruction (E83.52 / #4085): a partial plan on an
+// issue-triggered run asks for `Refs #N` and forbids every closing keyword,
+// and never mentions `Closes #N`; a full plan and a nil plan keep the legacy
+// Closes bullet byte-for-byte; no issue renders neither.
+func TestBuild_Implement_PartialDelivery_UsesRefsNotCloses(t *testing.T) {
+	const legacyCloses = "- End the body with `Closes #42` on its own line so merging the PR auto-closes the originating issue.\n"
+	build := func(t *testing.T, issue int, p *plan.Plan) string {
+		t.Helper()
+		got, err := Build("implement", Trigger{Repo: "kuhlman-labs/example", IssueNumber: issue, IssueTitle: "Add foo", ApprovedPlan: p})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	partial := build(t, 42, partialDeliveryFixturePlan("the runner mirror"))
+	for _, want := range []string{
+		"- End the body with `Refs #42` on its own line.",
+		"This plan is a PARTIAL delivery of #42, so the PR must NOT close it",
+		"write no closing keyword (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved) before #42 anywhere in the PR description or the commit message.",
+	} {
+		if !strings.Contains(partial, want) {
+			t.Errorf("partial implement prompt missing %q", want)
+		}
+	}
+	if strings.Contains(partial, "Closes #42") {
+		t.Errorf("partial implement prompt must not instruct `Closes #42`")
+	}
+
+	fullPlan := fixturePlan()
+	fullPlan.Delivery = plan.DeliveryFull
+	for name, p := range map[string]*plan.Plan{"full": fullPlan, "absent": fixturePlan(), "nil": nil} {
+		got := build(t, 42, p)
+		if !strings.Contains(got, legacyCloses) {
+			t.Errorf("%s plan: implement prompt missing the legacy Closes bullet", name)
+		}
+		if strings.Contains(got, "Refs #42") {
+			t.Errorf("%s plan: implement prompt must not carry `Refs #42`", name)
+		}
+	}
+
+	none := build(t, 0, partialDeliveryFixturePlan("the runner mirror"))
+	if strings.Contains(none, "Closes #") || strings.Contains(none, "Refs #") {
+		t.Errorf("no-issue implement prompt must carry neither Closes nor Refs")
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_ContradictionClauseRenders pins the
 // #1611 escape valve: the always-rendered header must carry the
 // evidence_conflict contradiction clause so a reviewer whose artifact
@@ -12582,7 +12739,38 @@ func applyConsultChannelGoldenDelta(t *testing.T, pre string) string {
 	}
 	var section strings.Builder
 	writeConsultChannel(&section)
-	return strings.Replace(pre, consultChannelGoldenAnchor, "\n\n"+section.String()+"File-count constraint (HARD)", 1)
+	out := strings.Replace(pre, consultChannelGoldenAnchor, "\n\n"+section.String()+"File-count constraint (HARD)", 1)
+	// E83.52 / #4085's delta is chained HERE rather than at each call site:
+	// comms_test.go and upkeep_test.go replay the golden through this helper
+	// too, so every byte-identity caller picks up the partial-delivery section
+	// without each re-deriving the composition.
+	return applyPartialDeliveryGoldenDelta(t, out)
+}
+
+// partialDeliveryGoldenAnchor is the last line of the plan prompt's
+// '### New architectural decision' section; the E83.52 partial-delivery
+// section is inserted immediately after it.
+const partialDeliveryGoldenAnchor = "It gates nothing. On a revision, carry a prior declaration forward unless the revision removes the new direction.\n"
+
+// applyPartialDeliveryGoldenDelta replays E83.52 / #4085's ONE deliberate
+// plan-prompt change — the writePartialDeliveryGuidance section inserted after
+// the '### New architectural decision' section — onto the frozen pre-change
+// golden, so the golden keeps pinning every other byte without being
+// re-captured. Same guards as applyConsultChannelGoldenDelta: the anchor must
+// match EXACTLY once, and the pre-change bytes must not already carry the
+// section.
+func applyPartialDeliveryGoldenDelta(t *testing.T, pre string) string {
+	t.Helper()
+	if strings.Contains(pre, partialDeliveryHeading) {
+		t.Fatalf("the pre-change golden already carries %q — it was re-captured from post-change code", partialDeliveryHeading)
+	}
+	if n := strings.Count(pre, partialDeliveryGoldenAnchor); n != 1 {
+		t.Fatalf("partial-delivery golden anchor %q matched %d times, want exactly 1 — re-derive the delta rather than relaxing the count",
+			partialDeliveryGoldenAnchor, n)
+	}
+	var section strings.Builder
+	writePartialDeliveryGuidance(&section)
+	return strings.Replace(pre, partialDeliveryGoldenAnchor, partialDeliveryGoldenAnchor+section.String(), 1)
 }
 
 // groomingProseMarkers are strings that appear ONLY in the grooming propose
@@ -12673,6 +12861,14 @@ var groomingProseMarkers = []string{
 // section's own content is pinned independently by
 // TestBuild_Plan_NewArchitecturalDecisionGuidance.
 //
+// NOT REGENERATED at E83.52 / #4085, which DELIBERATELY added the
+// planner-facing '### Partial delivery' section immediately after the New
+// architectural decision section. The test replays that ONE insertion via
+// applyPartialDeliveryGoldenDelta (chained inside applyConsultChannelGoldenDelta
+// so every golden caller replays it), so the file on disk is still the E78.4
+// capture. The section's own content is pinned independently by
+// TestBuild_Plan_PartialDeliveryGuidance.
+//
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden
 //     regenerated from the grooming-forked path is rejected (retained from the
@@ -12693,7 +12889,7 @@ func TestBuild_Plan_ByteIdenticalToPreChangeGolden(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	if got != applyConsultChannelGoldenDelta(t, string(want)) {
-		t.Errorf("ordinary plan prompt diverged from the pre-change golden (with the E77.5 consult-channel delta replayed).\n"+
+		t.Errorf("ordinary plan prompt diverged from the pre-change golden (with the E77.5 consult-channel and E83.52 partial-delivery deltas replayed).\n"+
 			"If you deliberately changed the plan prompt, regenerate the golden by rendering "+
 			"Build(\"plan\", preChangeGoldenTrigger()) at the BASE commit and overwriting %s, "+
 			"then confirm the anti-vacuity guard still holds.\n--- got ---\n%q\n--- want ---\n%q",

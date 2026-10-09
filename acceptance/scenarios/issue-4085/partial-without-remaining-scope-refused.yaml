@@ -1,0 +1,14 @@
+id: scenario:issue-4085/partial-without-remaining-scope-refused
+statement: 'A plan declaring delivery: partial with no (or a blank) remaining_scope, or a remaining_scope without delivery: partial, is refused at plan ship with an error naming remaining_scope.'
+verify_hint: HTTP response of the plan-upload route on the preview names remaining_scope; deciding tests are the backend/internal/plan Parse/Validate tests.
+steps: 'For each of 5 cases, POSTed /v0/dev/fixtures {"scenario":"trace-upload-target"} and took the fresh run and plan stage ids from the 201 body. Built the plan-gate-parked fixture plan with ticket_reference kuhlman-labs/fishhawk#3, plus one of: (a) delivery partial with no remaining_scope; (b) delivery partial, remaining_scope ''   ''; (c) remaining_scope only; (d) delivery full plus remaining_scope; (e) delivery partial, remaining_scope ''''. Signed each (signing-key, then /v0/dev/sign) and POSTed it to /v0/runs/{run}/plan?stage_id={plan}.'
+assertions:
+    expected: refused at plan ship with an error naming remaining_scope
+    observed_at_record: 'All 5 return 400 plan_invalid. (a) "schema: /: missing property ''remaining_scope''". (b) ''semantic: remaining_scope: a partial delivery must carry a non-blank remaining_scope ...''. (c) and (d) ''semantic: remaining_scope: remaining_scope is only valid with delivery: partial ...''. (e) ''schema: /remaining_scope: got 0, want 1''.'
+    repro_handle: 'POST http://localhost:8090/v0/runs/<run>/plan?stage_id=<plan> with a signed plan {delivery: partial} and no remaining_scope'
+origin:
+    issue: 4085
+    pr: 0
+    run_id: 0697f4cb-e633-426d-b597-dc0374bbe426
+    head_sha: 6f9a673885fdcda0d5b637e03217f0b47ea5959a
+    recorded_at: 2026-10-09T06:30:29Z

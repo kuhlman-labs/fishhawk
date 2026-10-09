@@ -141,12 +141,32 @@ func mustCompileNamedSchema(path, resourceName string) *jsonschema.Schema {
 	return s
 }
 
-// Validate validates plan bytes against the standard_v1 schema. The
-// returned error is *ParseError (malformed JSON) or *SchemaError
-// (schema violation). Use errors.As to distinguish.
+// Validate validates plan bytes against the standard_v1 schema plus ONE
+// semantic rule, the delivery / remaining_scope coupling (checkDelivery,
+// E83.52 / #4085). The returned error is *ParseError (malformed JSON),
+// *SchemaError (schema violation) or *SemanticError (the delivery rule). Use
+// errors.As to distinguish.
 //
-// Used by the runner (E5.4) which only needs the pass/fail signal.
+// The delivery rule lives here, not only in semanticCheck, because the
+// plan-upload path (handleShipPlan) validates through Validate and never
+// reaches plan.Parse: without it a remaining_scope paired with an absent or
+// full delivery, or a whitespace-only one, shipped 201. No other semanticCheck
+// rule runs here. Parse does NOT call Validate — it calls validateSchema and
+// then semanticCheck, which runs checkDelivery in its existing position — so
+// Parse's behaviour, including which error it reports first, is unchanged.
+//
+// The runner (E5.4) validates through its own module's schema-only copy, so a
+// plan breaking the delivery rule passes the runner and is refused at upload.
 func Validate(data []byte) error {
+	if err := validateSchema(data); err != nil {
+		return err
+	}
+	return checkDeliveryBytes(data)
+}
+
+// validateSchema is the schema-only leg of Validate: malformed JSON is a
+// *ParseError, a standard_v1 violation a *SchemaError.
+func validateSchema(data []byte) error {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return &ParseError{Msg: "empty document"}
 	}
@@ -380,7 +400,9 @@ func ParseCommsReport(data []byte) (*CommsReport, error) {
 // After JSON decode, semantic checks run via semanticCheck. A non-nil
 // result is a hard rejection (*SemanticError).
 func Parse(data []byte) (*Plan, error) {
-	if err := Validate(data); err != nil {
+	// validateSchema, not Validate: semanticCheck below runs checkDelivery in
+	// its existing position, so Parse's error precedence is unchanged.
+	if err := validateSchema(data); err != nil {
 		return nil, err
 	}
 	var p Plan
@@ -466,6 +488,11 @@ func semanticCheck(p *Plan) error {
 	// plan, so it precedes the decomposition early return. No cap-aware or
 	// cross-field coupling: the declaration gates nothing.
 	if err := checkNewArchitecturalDecision(p.NewArchitecturalDecision); err != nil {
+		return err
+	}
+	// delivery / remaining_scope coupling (E83.52 / #4085). Valid on any plan,
+	// so it precedes the decomposition early return.
+	if err := checkDelivery(p); err != nil {
 		return err
 	}
 	if p.Decomposition == nil {
@@ -678,6 +705,52 @@ func checkNewArchitecturalDecision(d *NewArchitecturalDecision) error {
 		}
 	}
 	return nil
+}
+
+// checkDelivery validates a plan's optional delivery declaration (E83.52 /
+// #4085). The schema's root if/then already requires remaining_scope when
+// delivery is partial; two hard-rejection branches close what it cannot
+// express:
+//   - delivery partial with a whitespace-only remaining_scope → minLength:1
+//     admits a single space, but a partial delivery that states no remaining
+//     scope posts nothing useful on the issue at merge;
+//   - a non-empty remaining_scope with delivery absent or full → the remaining
+//     scope would never be posted and the issue would close on merge anyway,
+//     so the pairing is contradictory.
+//
+// A plan declaring neither field is a no-op. semanticCheck runs it for
+// plan.Parse; checkDeliveryBytes runs it for Validate (the plan-upload path).
+func checkDelivery(p *Plan) error {
+	if p.IsPartialDelivery() {
+		if strings.TrimSpace(p.RemainingScope) == "" {
+			return &SemanticError{
+				Message: "remaining_scope: a partial delivery must carry a non-blank remaining_scope stating what the issue still needs after this delivery",
+			}
+		}
+		return nil
+	}
+	if p.RemainingScope != "" {
+		return &SemanticError{
+			Message: "remaining_scope: remaining_scope is only valid with delivery: partial; drop it for a full delivery, or set delivery to partial when this plan deliberately delivers only a slice of the issue",
+		}
+	}
+	return nil
+}
+
+// checkDeliveryBytes is Validate's delivery leg: it decodes ONLY delivery and
+// remaining_scope from schema-valid bytes and delegates to checkDelivery, the
+// same function plan.Parse runs, so the two paths cannot disagree. Schema-valid
+// bytes cannot fail this decode (both fields are schema-typed strings), so a
+// decode failure is returned as a *ParseError — fail closed, not a skip.
+func checkDeliveryBytes(data []byte) error {
+	var d struct {
+		Delivery       string `json:"delivery"`
+		RemainingScope string `json:"remaining_scope"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return &ParseError{Msg: "delivery check: " + err.Error(), Cause: err}
+	}
+	return checkDelivery(&Plan{Delivery: d.Delivery, RemainingScope: d.RemainingScope})
 }
 
 // Warnings returns advisory strings for a successfully-parsed Plan.
@@ -987,7 +1060,8 @@ func checkAcceptanceSurfaceNone(v Verification) error {
 // acceptance_surface guard, for the plan-upload path (E72.6 / #3381).
 //
 // checkAcceptanceSurfaceNone runs inside semanticCheck, which only plan.Parse
-// reaches — and handleShipPlan validates SCHEMA only (plan.Validate), so
+// reaches — and handleShipPlan validates through plan.Validate (the schema
+// plus only the delivery rule, never checkAcceptanceSurfaceNone), so
 // without this a plan declaring verification.acceptance_surface: none beside
 // a drivable criterion is stored, reaches the gate, and approval deletes the
 // run's acceptance stage. The ship path must NOT call plan.Parse wholesale
@@ -995,7 +1069,7 @@ func checkAcceptanceSurfaceNone(v Verification) error {
 // semanticCheck over_cap ⇒ split_proposal coupling cannot reject a monolith
 // before the count-derived gate sees it; see the cap-gate comment in
 // handleShipPlan), so this is the ONE semantic rule the ship path enforces
-// directly. It decodes ONLY `verification` from the raw
+// directly (the delivery rule reaches it through Validate). It decodes ONLY `verification` from the raw
 // bytes (no DisallowUnknownFields, no other semanticCheck rule) and delegates
 // to the same guard plan.Parse runs, so the two paths cannot disagree.
 //
