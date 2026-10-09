@@ -8759,6 +8759,11 @@ func heldCommitShipCategory(_ error) string {
 //     report re-carries the checkpoint, so a resume that itself fails (the
 //     outage is still up) leaves the NEXT retry_stage resumable rather than
 //     silently degrading back to a full agent re-run.
+//   - "push" — the PUSH-FAILURE resume (E45.86 / #3621): publish the
+//     locally-held commit, then open the PR. For a DECOMPOSITION CHILD
+//     (#4079) it publishes the slice branch, reports outcome "pushed" and
+//     returns without opening a PR; a child served any other kind is refused
+//     (child_resume_kind_unsupported) before any forge touch.
 func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind, servedVerifiedTreeSHA, servedPRTitle, servedPRBody string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
 	isPROpenResume := resumeKind == resumeKindPROpen
 	// E45.86 / #3621. isPushResume selects the PUBLISH arm: the held commit
@@ -8768,6 +8773,13 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// is what makes the re-armed checkpoint describe the state the run is
 	// actually in rather than the state it started the resume in.
 	isPushResume := resumeKind == resumeKindPush
+	// #4079. isChildResume selects the DECOMPOSITION-CHILD arm. A child never
+	// opens a pull request (ADR-032: the parent opens one consolidated PR), so
+	// its push resume publishes the held commit to the slice branch and reports
+	// outcome "pushed" — the same report the ordinary child arm sends — instead
+	// of falling into the PR-open + artifact tail. Every non-push kind is
+	// refused for a child before any token mint or forge touch.
+	isChildResume := cfg.decomposedFromRunID != ""
 	pushed := false
 	failedReason := "scope_exempt_open_pr"
 	switch {
@@ -8809,7 +8821,12 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 			// the branch is on the remote, so any later failure re-arms as the
 			// ordinary pr_open kind.
 			reArmKind := resumeKindPROpen
-			if isPushResume && !pushed {
+			// #4079: a CHILD re-arms as push even after publishing — it has no
+			// PR to open, and pr_open would send the next retry to open one from
+			// the slice branch. Re-serving push is safe at an equal tip: the
+			// non-clobber guard accepts tip == heldSHA and PushCommittedBranch is
+			// idempotent there, so the next retry just re-reports pushed.
+			if isPushResume && (!pushed || isChildResume) {
 				reArmKind = resumeKindPush
 			}
 			cp = &pushCheckpoint{
@@ -8879,6 +8896,14 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	if resumeKind != "" && !isPROpenResume && !isPushResume {
 		return failWithToken("C", refusePushUnknownResumeKind,
 			fmt.Sprintf("backend served held_commit_resume_kind %q, which this runner does not implement", resumeKind))
+	}
+	// CHILD KIND REFUSAL (#4079). A decomposition child arms only the push kind
+	// and never parks exempt-eligible, so pr_open or the legacy exempt kind for
+	// a child would open a PR from a slice branch. Refuse having touched
+	// nothing. Permanent: no retry of the same served kind changes it.
+	if isChildResume && !isPushResume {
+		return failWithToken("C", refuseChildResumeKindUnsupported,
+			fmt.Sprintf("decomposition child (parent run %s) was served held_commit_resume_kind %q; a child resumes only the push kind and never opens a pull request", cfg.decomposedFromRunID, resumeKind))
 	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
@@ -9013,6 +9038,32 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"push_resume_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"verified_tree_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, heldSHA, servedVerifiedTreeSHA)
+
+		// CHILD TAIL (#4079). The slice branch is published; report "pushed"
+		// exactly as the ordinary child arm does (branch/head/base + the diff
+		// size, no PR artifact) and stop — the parent integrates the slice. A
+		// report failure re-arms as push (see fail above), so the next retry
+		// re-publishes idempotently and re-reports.
+		if isChildResume {
+			filesChanged := heldCommitFilesChanged(ctx, cfg.workingDir, heldBaseSHA, heldSHA, cfg.runID, cfg.stageID, logSink)
+			if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+				RunID:             cfg.runID,
+				StageID:           cfg.stageID,
+				PrivateKey:        issued.PrivateKey,
+				Outcome:           "pushed",
+				Branch:            branch,
+				HeadSHA:           heldSHA,
+				BaseSHA:           heldBaseSHA,
+				FilesChangedCount: filesChanged,
+			}); err != nil {
+				return fail(heldCommitShipCategory(err), fmt.Sprintf("report child push from held commit: %v", err))
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"push_resume_child_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, branch, heldSHA, heldBaseSHA)
+			releaseCheckpointRefs(ctx, cfg.workingDir, cfg.runID, cfg.stageID, logSink)
+			return exitOK
+		}
 	}
 
 	// RECOVERED PR TEXT (#2570). The agent's PR description is unreachable from
@@ -9143,6 +9194,13 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"pull_request_uploaded","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
 		cfg.runID, cfg.stageID, shipRes.ID, shipRes.ContentHash, shipRes.Idempotent)
+	// #4079: the work is published and its artifact landed, so the checkpoint
+	// refs a push-kind arm pinned are no longer needed. A push resume that
+	// re-armed as pr_open after publishing finishes on this pr_open path, so
+	// release on both kinds; best-effort, absent refs are a no-op.
+	if isPushResume || isPROpenResume {
+		releaseCheckpointRefs(ctx, cfg.workingDir, cfg.runID, cfg.stageID, logSink)
+	}
 	return exitOK
 }
 
@@ -9198,6 +9256,14 @@ const (
 	refusePushRemoteTipUnreadable = "remote_tip_unreadable"
 	refusePushTokenMintFailed     = "token_mint_failed"
 	refusePushPushFailed          = "push_failed"
+	// refuseChildResumeKindUnsupported (#4079): a decomposition child served
+	// any held-commit kind other than push. A child never opens a pull request
+	// (ADR-032: the parent opens one consolidated PR), never arms pr_open, and
+	// never parks exempt-eligible (build-required parks are exempt-ineligible),
+	// so a pr_open or legacy exempt resume for a child is a backend anomaly
+	// that would open a PR from a slice branch. Refused before any token mint or
+	// forge touch.
+	refuseChildResumeKindUnsupported = "child_resume_kind_unsupported"
 )
 
 // permanentPushResumeRefusals is the classification table. A token ABSENT from
@@ -9211,6 +9277,8 @@ var permanentPushResumeRefusals = map[string]bool{
 	refusePushTreeMismatch:        true,
 	refusePushRemoteTipNotAnc:     true,
 	refusePushUnknownResumeKind:   true,
+	// Permanent: no retry of the same served kind makes a child PR-eligible.
+	refuseChildResumeKindUnsupported: true,
 }
 
 // Bounded reasons the PRE-PUSH checkpoint arm declines (E45.86 / #3621),
@@ -9303,11 +9371,16 @@ func gitRevParseIn(ctx context.Context, repoDir, rev string) (string, error) {
 //     at the arming point, which is what makes the checkpoint's promise true
 //     rather than assumed.
 //
-// The APPLICABILITY predicate (standalone open-PR path only: not --no-pr, not a
-// fix-up, not a decomposed child, not a scope-completeness park) is structural
-// rather than re-tested: every one of those paths returns from
-// openPRAndShipArtifact BEFORE CommitAndPush, so this site is reachable only on
-// the standalone arm — the same property the post-push arm relies on.
+// APPLICABILITY. --no-pr returns from openPRAndShipArtifact before
+// CommitAndPush, so it never reaches this site. Decomposition children and
+// fix-ups DO reach it: CommitAndPush runs for both (#4079 corrected an older
+// claim that only the standalone arm could). A child's push-kind checkpoint is
+// served back to a child-aware consume arm (openHeldCommitPR publishes the slice
+// branch and reports pushed, never opening a PR). A scope-completeness park is
+// not an error return, so it never arms here.
+//
+// An armed checkpoint's held commit is pinned at checkpointRef by the caller
+// (pinPushFailureCheckpoint) so gc cannot prune it before the retry.
 func maybeArmPushFailureCheckpoint(ctx context.Context, cfg config, logSink io.Writer, checkpoint *pushCheckpoint, supportsPushResume bool, pushErr error, repoDir, branch, verifiedTreeSHA, prTitle, prBody string) {
 	if checkpoint == nil {
 		return
@@ -10281,7 +10354,20 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// arm ships a PR from an unintended tree, a wrong omission costs exactly
 		// what happens today.
 		maybeArmPushFailureCheckpoint(ctx, cfg, logSink, checkpoint, supportsPushResume, err, repoDir, branch, verifiedTreeSHA, agentPRTitle, agentPRBody)
-		return fmt.Errorf("commit+push: %w", err)
+		// #4079: pin every recovery point under refs/fishhawk/checkpoints/ and
+		// NAME it in the reason, so the pull_request_failed audit row says where
+		// the work is. The ErrPushFailed arm's held commit is pinned here; the
+		// base-fetch arm (CommitAndPush stashed the edits, then the base fetch or
+		// checkout failed) pins the stash commit and, for a decomposition child
+		// with a verified tree, arms a push-kind checkpoint from a commit of that
+		// tree. Both are silent on every other error, so those reasons are
+		// byte-identical.
+		armedRef := pinPushFailureCheckpoint(ctx, cfg, logSink, checkpoint, repoDir)
+		baseFetchArmedRef, stashRef := maybeArmBaseFetchFailureCheckpoint(ctx, cfg, logSink, checkpoint, supportsPushResume, err, repoDir, branch, verifiedTreeSHA, commitMessage, agentPRTitle, agentPRBody)
+		if baseFetchArmedRef != "" {
+			armedRef = baseFetchArmedRef
+		}
+		return fmt.Errorf("commit+push: %w%s", err, checkpointFailureSuffix(armedRef, stashRef))
 	}
 	// #3400: the commit now exists, so this is the ONE point where the
 	// approval-condition responses the pre-pack peek captured from the
