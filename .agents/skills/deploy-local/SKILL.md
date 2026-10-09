@@ -46,6 +46,7 @@ uptime
 - **Docker down** → `open -a Docker`, then poll until `docker info` succeeds (a bounded until-loop, not one long `sleep`).
 - **`.env` missing** → `cp .env.example .env`; `FISHHAWKD_DATABASE_URL` already matches `docker-compose.yml`. Tell the user which optional blocks (GitHub App, OAuth) are unset; fishhawkd starts without them but logs warnings. Never print secret values from `.env`.
 - **Live runner** → `reload` restarts fishhawkd and can strand that run's stage in `running`. `reload` refuses on its own; STOP and ask the user before passing `--force`. Same if the user has an in-flight `fishhawk_await_*` on another run.
+- **Want to wait instead of forcing** → `scripts/dev reload --when-quiet`. It waits, bounded, until no runner is live and no reload-relevant restart blocker is reported, then runs the normal guards. `reload` ignores `undispatched_child`; only `post-merge` refuses on it. Knobs and exit codes: `scripts/README.md` § "`reload --when-quiet`".
 - **Dirty tree** → fine for `up`/`reload` (binaries get stamped `-dirty`). Pulling `main` after a merge is the `sync-main` skill.
 - **Load average far above core count** → warn the user; a starved host makes the readiness gate flaky (orphaned agent busy-loops, see AGENTS.md Traps).
 
@@ -73,7 +74,7 @@ curl -fsS "http://${FISHHAWKD_ADDR:-localhost:8080}/healthz" | python3 -m json.t
 One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MCP banner verbatim if one printed** — it is the only thing the user must act on:
 - `ACTION REQUIRED` / shim-rebuilt banner → the user must reconnect their MCP client (`/mcp` in Claude Code).
 - auto-swap / `schema_major_shim` → expectation only; verify with `fishhawk_doctor` (`spec.valid: true`) or a version-returning tool reflecting the new GitSHA. If stale: `bin/fishhawk-mcp-shim --status`, then reconnect the MCP client.
-- `fishhawk-runner` needs nothing — it is spawned fresh from `bin/` per stage.
+- `fishhawk-runner` is spawned fresh from `bin/` per stage, and `reload` rebuilds it (`--all`). If the change touched runner stages, confirm `bin/fishhawk-runner version` shows the new GitSHA. Never restart fishhawkd alone: a stale runner silently ignores new stage instructions (#4183).
 
 ## Troubleshooting
 
@@ -92,5 +93,5 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 
 - `scripts/dev` (`_usage` for every subcommand), `scripts/README.md`
 - `AGENTS.md` § Rebuild matrix (rebuild + activation tables, the short rules) and § Traps
-- `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge" (the `reload` half), § "Local k8s ergonomics"
+- `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge" (the `reload` half), § "Restart-blocker guard for reload / post-merge" and § "`reload --when-quiet`", § "Local k8s ergonomics"
 - `docs/deploy/kubernetes.md`, `docs/local-tls.md` (`FISHHAWK_DEV_TLS=1`), `docs/local-webhook-relay.md` (`FISHHAWK_DEV_WEBHOOK_RELAY=1`)
