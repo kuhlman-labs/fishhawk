@@ -221,8 +221,9 @@ func (*BuildRequiredDriftError) Unwrap() error { return ErrCommittedTestsFailed 
 // committed-tree verify gates (#651/#802) passed against and a single strict
 // re-verify of the real committed HEAD did not explicitly pass. The gates
 // verify a throwaway scope-only commit that is reset away; the real commit
-// CommitAndPush builds later can differ (e.g. FreshFetchBase fetched a moved
-// origin/<base> between gate and push), and without this check stage_state
+// CommitAndPush builds later can differ (e.g. an unpinned FreshFetchBase
+// fetched a moved origin/<base> between gate and push — a PinnedBaseSHA cut,
+// #3973, cannot move that way), and without this check stage_state
 // = succeeded would vouch for a pushed head no gate ever saw (run 07bce059).
 // Returned before the push, so origin stays untouched; the runner classifies
 // it category-B (artifact broken → re-scope/re-plan), symmetric with
@@ -263,6 +264,9 @@ func (e *pushFailedError) Unwrap() []error { return []error{e.err, ErrPushFailed
 // CommitAndPush's two stash-then-fetch arms (RebaseFromRemote, FreshFetchBase)
 // had already stashed the agent's uncommitted edits when the `git fetch` of the
 // base — or the `git checkout -B <branch> FETCH_HEAD` that follows it — failed.
+// The pinned FreshFetchBase sub-arm (PinnedBaseSHA, #3973) fetches nothing but
+// returns the same typed error when its `git checkout -B <branch> <pin>` fails
+// after the stash, so the recovery contract below holds there too.
 // HEAD and the index are untouched (a failed fetch moves nothing, and
 // git-checkout refuses before switching), the working tree is CLEAN, and the
 // agent's edits live ONLY in the stash commit named on the typed
@@ -288,7 +292,8 @@ var ErrBaseFetchFailed = errors.New("gitops: base fetch failed after the agent e
 // (`git stash apply <sha>`), and the runner pins it under a durable ref.
 type BaseFetchError struct {
 	// Ref is the ref the failing fetch targeted (the base for FreshFetchBase,
-	// the shared branch for RebaseFromRemote).
+	// the shared branch for RebaseFromRemote). On the pinned FreshFetchBase
+	// sub-arm it is the declared base, FreshFetchBase, though no fetch ran.
 	Ref string
 	// StashSHA is the stash commit holding the agent's edits.
 	StashSHA string
@@ -535,8 +540,27 @@ type CommitAndPushArgs struct {
 	// isolation GitHub Actions' actions/checkout already provides.
 	// Empty (the default) keeps the unchanged `checkout -b` path, so
 	// the decomposed-child and fix-up callers are unaffected (ADR-035,
-	// #861).
+	// #861). With PinnedBaseSHA set, this arm cuts from the pin instead
+	// of fetching (see PinnedBaseSHA).
 	FreshFetchBase string
+
+	// PinnedBaseSHA is the dispatch-time base the stage was judged against
+	// (#3973): the commit the runner established the working tree on before
+	// the agent ran (the standalone #3454 advance tip, a decomposition
+	// child's wave base, or its own slice branch tip). It applies ONLY on the
+	// FreshFetchBase arm (RebaseFromRemote false, FreshFetchBase non-empty)
+	// and only when non-empty. There, CommitAndPush does NOT fetch the base:
+	// it verifies the pin is a commit in RepoDir BEFORE stashing (an absent
+	// object fails closed with the edits still in the working tree, never a
+	// silent re-fetch of a moved tip), then stashes, cuts Branch from the pin
+	// with `checkout -B`, reapplies the edits, and records BaseSHA = the pin.
+	// A base that moved mid-stage therefore cannot cause a commit-time
+	// stash-pop conflict, and the commit is cut from the base the gates
+	// verified; merge time reconciles any later movement. FreshFetchBase still
+	// names the base on a *BaseFetchError from the pinned checkout. Empty (the
+	// default) keeps the fetch path byte-identical for fix-ups, degrade paths
+	// and every unpinned caller. The RebaseFromRemote arm ignores it.
+	PinnedBaseSHA string
 
 	// UpdateTrackingRef, when true, sets the local remote-tracking ref
 	// refs/remotes/<remote>/<branch> to the pushed HEAD after a
@@ -799,6 +823,43 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.popStash(ctx, args.RepoDir); err != nil {
 			return nil, err
 		}
+	} else if args.FreshFetchBase != "" && args.PinnedBaseSHA != "" {
+		// Pinned sub-branch of the FreshFetchBase arm (#3973): cut the run
+		// branch from the dispatch-time base the stage was judged against, with
+		// NO base fetch, so a PR merged into the base mid-stage can neither
+		// stash-pop-conflict the commit nor move the recorded base.
+		//
+		// The object check runs BEFORE the stash: nothing has been stashed yet,
+		// so an absent pin fails closed with the agent's edits still in the
+		// working tree. It is deliberately NOT a BaseFetchError (there is no
+		// stash to name) and never falls back to fetching a moved tip.
+		pin := args.PinnedBaseSHA
+		if _, err := p.runOut(ctx, args.RepoDir, "rev-parse", "--verify", "--quiet", pin+"^{commit}"); err != nil {
+			return nil, fmt.Errorf("gitops: pinned base %s is not a commit in the repository (nothing stashed; the agent edits remain in the working tree): %w", pin, err)
+		}
+		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
+			return nil, fmt.Errorf("gitops: stash: %w", err)
+		}
+		// #4079: capture this invocation's stash commit immediately, at the
+		// same position the fetch arm below captures it.
+		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
+		// A failed checkout keeps #4079's contract exactly: the same typed
+		// error, Err text and un-popped stash the fetch arm returns, so
+		// ErrBaseFetchFailed matches and the runner pins and names the stash.
+		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, pin); err != nil {
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
+		}
+		// The pin is the commit the edits were made on, so the reapply lands
+		// where it was taken; popStash's ErrBaseRebaseConflict machinery is
+		// unchanged for the case where it was not.
+		if err := p.popStash(ctx, args.RepoDir); err != nil {
+			return nil, err
+		}
+		pinnedBase, err := p.runOut(ctx, args.RepoDir, "rev-parse", "HEAD")
+		if err != nil {
+			return nil, fmt.Errorf("gitops: rev-parse pinned base: %w", err)
+		}
+		baseSHA = strings.TrimSpace(pinnedBase)
 	} else if args.FreshFetchBase != "" {
 		// Standalone single-writer path (#861, ADR-035 prevention): cut the
 		// run branch from a freshly-fetched authoritative base instead of the
@@ -820,6 +881,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// Base-freshness positioning (ADR-043 rev 2, #1294): this fetch sits as
 		// LATE in CommitAndPush as the reapply-before-commit invariant allows.
+		// Since #3973 it runs only for UNPINNED callers (fix-ups, degrade
+		// paths, a child whose wave base was absent at dispatch); a pinned
+		// stage takes the arm above and cuts from its dispatch-time base.
 		// The fetch -> checkout -B FETCH_HEAD -> popStash sequence MUST complete
 		// before the staging/commit below: the checkout resets the working tree
 		// to the fetched base and popStash reapplies the agent's edits onto it,
@@ -1694,9 +1758,10 @@ func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branc
 //
 // The decomposed-child commit path does not require HEAD to be ON the base
 // branch: CommitAndPush cuts each per-slice sole-writer branch fresh from a
-// freshly-fetched origin/<base> (freshFetchBase routing, ADR-035), so
-// establishing the working tree at the base tip via a detached HEAD is
-// sufficient. Auth mirrors CheckoutRemoteBranch: env-scoped fresh-token auth
+// freshly-fetched origin/<base> (freshFetchBase routing, ADR-035), or, when the
+// runner pins the tip this function returns (PinnedBaseSHA, #3973), from that
+// pinned commit with no commit-time fetch, so establishing the working tree at
+// the base tip via a detached HEAD is sufficient. Auth mirrors CheckoutRemoteBranch: env-scoped fresh-token auth
 // (with the stale-header reset) when pushToken is supplied and the remote is
 // http(s), ambient fallback otherwise (#1951). The function is package-level
 // for the same reasons as CheckoutRemoteBranch.
