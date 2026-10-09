@@ -123,6 +123,39 @@ Pinned by `TestGetPlan_NewArchitecturalDecision_*` (`tools_test.go`), which seed
 the artifact from the backend `plan.NewArchitecturalDecision` type so a tag
 drift between the two sides fails the decode.
 
+## `fishhawk_get_plan` partial-delivery surface ([E83.52 / #4085](https://github.com/kuhlman-labs/fishhawk/issues/4085))
+
+`PlanContent.delivery` and `PlanContent.remaining_scope` surface the plan's
+optional delivery declaration. `delivery: "partial"` means the approved plan
+deliberately delivers only a slice of the triggering issue: the run's PR
+references the issue with `Refs #N` instead of `Closes #N`, so merging it is
+not meant to close the issue, and the server posts `remaining_scope` on the
+issue at merge. Both keys are `omitempty`: a plan without the declaration (a full
+delivery, the normal case) marshals neither, byte-identical to a pre-#4085
+plan, and an explicit `delivery: "full"` surfaces with no `remaining_scope`.
+Like `new_architectural_decision`, the fields are decoded straight from the
+artifact by `tryGetPlanForRun`'s `json.Unmarshal` (tags mirror the schema's
+root properties and `plan.Plan`), so there is no DTO type and the exported
+surface (`exportBaseline`) is unchanged.
+
+The same declaration reaches `plan_warnings` as ONE `PARTIAL DELIVERY`
+advisory written by the server's plan-gate pass (`partialDeliveryWarning`,
+appended after the new-architectural-decision advisory): it states that the
+run is not meant to close the issue, names the remaining scope (`not stated`
+when blank), and asks the approver to confirm the issue should stay open or
+reject the plan. It says "not meant to", not "will not", because of two named
+residuals: a later fix-up or operator PR-body edit that reintroduces
+`Closes #N` is not re-checked before merge, and on GitLab the ship-time
+closing-reference neutralizer does not run (GitHub-only) while the merge-time
+comment still posts. It gates nothing; this package only echoes the audit
+entry. No tool was added, so the registered tool count is unchanged.
+
+Pinned by `TestGetPlan_PartialDelivery_Surfaced` (asserts both keys on the
+MARSHALLED output, so deleting either field compiles and still reddens) and
+`TestGetPlan_Delivery_FullOrAbsentShape` (`tools_test.go`); both seed the
+artifact keys from a backend `plan.Plan` marshal so a tag drift between the
+two sides fails the decode.
+
 ## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
 
 A connecting client whose agent holds no operator memory gets enough to drive a run without a CLI alt-tab, delivered over the protocol itself:

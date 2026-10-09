@@ -1835,7 +1835,8 @@ func TestRunPlanWarnings_NewArchitecturalDecision_WhitespaceRationaleNoWarning(t
 
 // TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap pins the ordering:
 // on an over-cap plan the count-derived over-cap advisory stays at index 0
-// (#2053) and the architectural advisory is appended LAST.
+// (#2053) and the architectural advisory is appended after it (last on this
+// fixture, which declares no partial delivery).
 func TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap(t *testing.T) {
 	const capLimit = 2
 	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
@@ -1850,5 +1851,131 @@ func TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap(t *testing.T) {
 	}
 	if last := got.Warnings[len(got.Warnings)-1]; !strings.Contains(last, "NEW ARCHITECTURAL DECISION") {
 		t.Errorf("architectural advisory must be last; warnings = %v", got.Warnings)
+	}
+}
+
+// --- delivery: partial (E83.52 / #4085) ---
+
+// withDelivery returns body with the top-level delivery / remaining_scope keys
+// set (an empty value omits the key). It runs plan.Validate (schema only,
+// never semanticCheck), so a whitespace-only remaining_scope the schema's
+// minLength:1 admits still reaches runPlanWarnings, mirroring its
+// json.Unmarshal decode path.
+func withDelivery(t *testing.T, body []byte, delivery, remainingScope string) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode plan body: %v", err)
+	}
+	if delivery != "" {
+		m["delivery"] = delivery
+	}
+	if remainingScope != "" {
+		m["remaining_scope"] = remainingScope
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(out); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return out
+}
+
+const partialRemainingScope = "the merge-time remaining-scope comment and the held-commit Refs footer"
+
+// TestRunPlanWarnings_PartialDelivery_ExactlyOneWarning is the counterfactual
+// vehicle for partialDeliveryWarning and for its IsPartialDelivery guard: on an
+// otherwise warning-free plan (nil RunRepo, no decomposition) whose ONLY
+// partial signal is delivery: partial, the declaration alone yields exactly
+// one warning naming PARTIAL DELIVERY, the Refs-instead-of-Closes consequence
+// and the remaining scope, recorded as exactly one plan_warnings row.
+func TestRunPlanWarnings_PartialDelivery_ExactlyOneWarning(t *testing.T) {
+	s, au := newNilRunRepoWarningsServer(t)
+	body := withDelivery(t, warningsPlanBody(t, nil), plan.DeliveryPartial, "  "+partialRemainingScope+"\n")
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+	if got == nil || len(got.Warnings) != 1 {
+		t.Fatalf("want exactly one warning, got %+v", got)
+	}
+	w := got.Warnings[0]
+	for _, want := range []string{
+		"PARTIAL DELIVERY",
+		"is NOT meant to close the triggering issue",
+		"Refs instead of Closes",
+		"Remaining scope: " + partialRemainingScope + ".",
+		"Confirm the issue should stay open",
+		"reject the plan if this run should deliver the whole issue",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning missing %q: %q", want, w)
+		}
+	}
+	entries := planWarningsEntries(t, au)
+	if len(entries) != 1 || len(entries[0].Warnings) != 1 || entries[0].Warnings[0] != w {
+		t.Fatalf("plan_warnings entries = %+v, want exactly one row carrying the warning", entries)
+	}
+}
+
+// TestRunPlanWarnings_PartialDelivery_NotPartialNoWarning: an absent delivery
+// and an explicit full delivery both return nil and append nothing
+// (byte-identical to a pre-#4085 plan).
+func TestRunPlanWarnings_PartialDelivery_NotPartialNoWarning(t *testing.T) {
+	for name, delivery := range map[string]string{"absent": "", "full": plan.DeliveryFull} {
+		t.Run(name, func(t *testing.T) {
+			s, au := newNilRunRepoWarningsServer(t)
+			body := withDelivery(t, warningsPlanBody(t, nil), delivery, "")
+			if got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body); got != nil {
+				t.Fatalf("want nil result for delivery %q, got %+v", delivery, got)
+			}
+			if entries := planWarningsEntries(t, au); len(entries) != 0 {
+				t.Fatalf("plan_warnings entries = %d, want 0", len(entries))
+			}
+		})
+	}
+}
+
+// TestRunPlanWarnings_PartialDelivery_BlankRemainingScopeSaysNotStated is the
+// vehicle for the blank fallback: runPlanWarnings never runs semanticCheck, so
+// a whitespace-only remaining_scope (schema-admitted) reaches the advisory,
+// which still fires — the issue-stays-open declaration is the load-bearing
+// fact — and says the remaining scope is not stated.
+func TestRunPlanWarnings_PartialDelivery_BlankRemainingScopeSaysNotStated(t *testing.T) {
+	s, _ := newNilRunRepoWarningsServer(t)
+	body := withDelivery(t, warningsPlanBody(t, nil), plan.DeliveryPartial, "   ")
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+	if got == nil || len(got.Warnings) != 1 {
+		t.Fatalf("want exactly one warning, got %+v", got)
+	}
+	if !strings.Contains(got.Warnings[0], "Remaining scope: not stated.") {
+		t.Errorf("warning should say the remaining scope is not stated, got %q", got.Warnings[0])
+	}
+}
+
+// TestRunPlanWarnings_PartialDelivery_OrderedAfterOverCapAndArchitectural pins
+// the ordering: the count-derived over-cap advisory stays at index 0 (#2053)
+// and the partial-delivery advisory is appended after the
+// new-architectural-decision advisory.
+func TestRunPlanWarnings_PartialDelivery_OrderedAfterOverCapAndArchitectural(t *testing.T) {
+	const capLimit = 2
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	body := withNewArchitecturalDecision(t, overCapPlanBody(t, 3, nil), nadDecl("ADR-082"))
+	body = withDelivery(t, body, plan.DeliveryPartial, partialRemainingScope)
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil || len(got.Warnings) < 3 {
+		t.Fatalf("want at least 3 warnings (over-cap + architectural + partial), got %+v", got)
+	}
+	if !hasOverCapWarning(got.Warnings[:1], 3, capLimit) {
+		t.Errorf("count-derived over-cap advisory must be first; warnings = %v", got.Warnings)
+	}
+	n := len(got.Warnings)
+	if !strings.Contains(got.Warnings[n-2], "NEW ARCHITECTURAL DECISION") {
+		t.Errorf("architectural advisory must be second to last; warnings = %v", got.Warnings)
+	}
+	if !strings.Contains(got.Warnings[n-1], "PARTIAL DELIVERY") {
+		t.Errorf("partial-delivery advisory must be last; warnings = %v", got.Warnings)
 	}
 }
