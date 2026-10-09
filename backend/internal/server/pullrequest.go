@@ -928,6 +928,19 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Partial-delivery ship-time guard (E83.52 / #4085). When the approved plan
+	// declares a PARTIAL delivery, rewrite any active closing reference to the
+	// triggering issue in the live PR body to `Refs #N`, so a missed prompt
+	// instruction cannot silently close an issue whose remaining scope is still
+	// owed. Deliberately OUTSIDE the running-stage drive below: every successful
+	// implement ship runs it, including the non-gated flow whose stage the trace
+	// handler already advanced. Best-effort; it never alters this response.
+	// Residuals (see partial_delivery_pr.go): a later fix-up or operator edit that
+	// reintroduces `Closes #N` is not re-checked, and the guard is GitHub-only.
+	if stage.Type == run.StageTypeImplement {
+		s.neutralizePartialDeliveryClosingRef(r.Context(), runID, stageID, pr.PRNumber)
+	}
+
 	// Push-and-open-pr terminal drive (#742). When the implement stage was
 	// left in `running` by the trace gate (the runner stamped
 	// push_and_open_pr), THIS upload is the authoritative driver of the

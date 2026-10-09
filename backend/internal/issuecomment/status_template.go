@@ -217,6 +217,16 @@ var activityCategories = map[string]struct{}{
 	// notifyPageClass path instead — see ping.go's crew_message_sent case and
 	// docs/issue-comment-surfaces.md.
 	"crew_message_escalated": {},
+	// PARTIAL delivery trail (E83.52 / #4085). System-actor audit kinds with NO
+	// dedicated Notifier method — they render data-drivenly through this set
+	// (and renderActivityLine below), and their server writers mark them with
+	// notifyOperatorVisible. The ship-time guard's rewrite of a closing
+	// reference to the issue (server/partial_delivery_pr.go) and the merge-time
+	// remaining-scope comment (server/partial_delivery_merge.go) are the two
+	// moments a partial delivery changes what the issue thread will do, so both
+	// belong on the timeline.
+	"partial_delivery_closing_reference_neutralized": {},
+	"partial_delivery_remaining_scope_posted":        {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -319,6 +329,10 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderAcceptanceRetirementDroppedLine(e.Payload)
 	case "crew_message_escalated":
 		return crewEscalatedActivityLine
+	case "partial_delivery_closing_reference_neutralized":
+		return renderPartialDeliveryNeutralizedLine(e.Payload)
+	case "partial_delivery_remaining_scope_posted":
+		return "Partial delivery: remaining scope posted on the issue"
 	default:
 		if actor == "" {
 			return e.Category
@@ -409,6 +423,23 @@ func approvalDecisionVerb(payload json.RawMessage) string {
 		return "rejected"
 	}
 	return "acted on"
+}
+
+// renderPartialDeliveryNeutralizedLine renders a
+// partial_delivery_closing_reference_neutralized row (E83.52 / #4085): the
+// ship-time guard rewrote a closing reference to the issue in the PR body, e.g.
+// "Partial delivery: closing reference rewritten to `Refs #7`". The reference
+// sits in a code span so the timeline line itself never autolinks. Falls back
+// to the bare phrase when the payload carries no positive issue_number.
+func renderPartialDeliveryNeutralizedLine(payload json.RawMessage) string {
+	const verb = "Partial delivery: closing reference rewritten to Refs"
+	var p struct {
+		IssueNumber int `json:"issue_number"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil || p.IssueNumber <= 0 {
+		return verb
+	}
+	return fmt.Sprintf("Partial delivery: closing reference rewritten to `Refs #%d`", p.IssueNumber)
 }
 
 // renderModelResolvedLine renders a model_resolved activity row (#1013):
