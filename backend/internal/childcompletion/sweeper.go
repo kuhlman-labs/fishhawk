@@ -49,6 +49,34 @@ type SliceConflict struct {
 	Detail     string
 }
 
+// ErrSliceHeadMissing is the sentinel a *SliceHeadMissingError matches under
+// errors.Is (#4079).
+var ErrSliceHeadMissing = errors.New("childcompletion: slice head missing")
+
+// SliceHeadMissingError mirrors orchestrator.SliceHeadMissingError (#4079): the
+// fan-in found a succeeded child's slice branch CONFIRMED absent on the forge
+// (a merge 404 plus a branch probe), so the child never pushed its slice. The
+// serve.go adapter translates the orchestrator's type into this one so
+// childcompletion need not import orchestrator — the same bridge as
+// SliceConflict. Detail carries the original error text.
+//
+// The sweeper PARKS the parent on it in both fan-in arms rather than counting
+// it toward the bounded-retry give-up: a category-B parent failure would
+// strand a fan-out whose only defect is one unpushed slice, while the parked
+// parent self-heals on the next tick's idempotent merge once the slice branch
+// exists.
+type SliceHeadMissingError struct {
+	SliceIndex int
+	ChildRunID uuid.UUID
+	Branch     string
+	Detail     string
+}
+
+func (e *SliceHeadMissingError) Error() string { return e.Detail }
+
+// Is makes errors.Is(err, ErrSliceHeadMissing) true for the typed error.
+func (*SliceHeadMissingError) Is(target error) bool { return target == ErrSliceHeadMissing }
+
 // Integrator is the slice of orchestrator.Orchestrator the sweeper calls
 // to fan a decomposed parent's succeeded slice branches into its
 // consolidated branch (ADR-041 / E24.2 / #1142) before resolving the
@@ -154,6 +182,14 @@ type Sweeper struct {
 	// operator-facing defect. A DISTINCT conflict still emits; a clean
 	// integration clears the key so a recurrence after a fix emits again.
 	waveConflicts map[uuid.UUID]string
+	// headMissing remembers the last slice_head_missing EMITTED per parent,
+	// keyed by slice + child run id (#4079) — the same shape and mutex as
+	// waveConflicts, shared by BOTH fan-in arms. A parked parent re-observes
+	// the missing head every tick; without this it would append one identical
+	// row per tick forever. Cleared on a clean integration and on every
+	// settling exit, so a head that self-heals and later goes missing again
+	// is surfaced again.
+	headMissing map[uuid.UUID]string
 }
 
 // maxIntegrationAttempts bounds how many CONSECUTIVE non-conflict
@@ -343,7 +379,18 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 	// (pre-#1142 behavior).
 	if !anyFailed && s.Integrate != nil {
 		conflict, err := s.Integrate.IntegrateSlices(ctx, parentRunID)
+		var headMissing *SliceHeadMissingError
 		switch {
+		case errors.As(err, &headMissing):
+			// #4079: a succeeded child's slice branch is CONFIRMED absent.
+			// Checked BEFORE the bounded-retry arm: it must NOT count toward
+			// the category-B give-up and must NOT transition the parent. The
+			// parent stays parked in awaiting_children with one dedup'd
+			// slice_head_missing row; once the slice branch exists (a resumed
+			// child push, or an operator push of the runner's pinned
+			// checkpoint ref) the next tick's idempotent merge integrates it.
+			s.parkOnSliceHeadMissing(ctx, parentRunID, parentStage.ID, headMissing)
+			return nil
 		case err != nil:
 			// Bounded-retry give-up (#1243): a deterministically-failing
 			// IntegrateSlices would otherwise be retried every tick forever,
@@ -372,6 +419,7 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 				// only (a long-lived sweeper must not accumulate one entry per
 				// ever-conflicted parent).
 				s.clearWaveConflict(parentRunID)
+				s.clearHeadMissing(parentRunID)
 				s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: parent failed after bounded slice-integration retries",
 					slog.String("parent_run_id", parentRunID.String()),
 					slog.String("parent_stage_id", parentStage.ID.String()),
@@ -396,6 +444,7 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			// the parent, so clear the between-wave conflict dedup key too
 			// (bookkeeping/memory hygiene, keyed by parent run id).
 			s.clearWaveConflict(parentRunID)
+			s.clearHeadMissing(parentRunID)
 			cat := run.FailureB
 			reason := conflict.Detail
 			if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
@@ -412,8 +461,10 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			)
 			return nil
 		}
-		// Clean integration — reset the counter so a future epoch starts fresh.
+		// Clean integration — reset the counter so a future epoch starts fresh,
+		// and forget any slice_head_missing so a later recurrence re-surfaces.
 		s.clearIntegrationError(parentRunID)
+		s.clearHeadMissing(parentRunID)
 	}
 
 	if _, err := s.Runs.TransitionStage(ctx, parentStage.ID, target, completion); err != nil {
@@ -425,8 +476,10 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 	// above) — so clearing the between-wave conflict dedup key here covers all
 	// three in one place. Keyed by parent run id, so this is bookkeeping/memory
 	// hygiene only: no all-terminal exit leaves the key set (the give-up and
-	// slice-conflict early returns clear it on their own paths).
+	// slice-conflict early returns clear it on their own paths). The #4079
+	// slice_head_missing dedup key is cleared here for the same reason.
 	s.clearWaveConflict(parentRunID)
+	s.clearHeadMissing(parentRunID)
 
 	s.emitChildrenSettled(ctx, parentRunID, parentStage.ID, children, target)
 
@@ -474,6 +527,9 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 //     DISTINCT conflict — the coverage predicate stays false for as long as the
 //     wave is blocked, so an undeduped emit would append an identical entry
 //     every tick forever → SHORT-CIRCUIT (return false);
+//   - a *SliceHeadMissingError (#4079) parks exactly as the all-terminal arm
+//     does — one dedup'd slice_head_missing row, NO increment of the shared
+//     error counter, no transition → SHORT-CIRCUIT (return false);
 //   - a CLEAN integration OR a no-op (nothing to integrate) → clears BOTH the
 //     shared error counter and the conflict dedup key, then PROCEED (return
 //     true). Clearing on the no-op — not only the integrated=true case — keeps
@@ -484,7 +540,17 @@ func (s *Sweeper) integrateCompletedWave(ctx context.Context, parentRunID, paren
 		return true
 	}
 	integrated, conflict, err := s.WaveIntegrate.IntegrateCompletedWave(ctx, parentRunID)
+	var headMissing *SliceHeadMissingError
 	switch {
+	case errors.As(err, &headMissing):
+		// #4079 (condition C2): the same park-and-audit as the all-terminal
+		// arm. It must NOT feed the shared consecutive-error counter — that
+		// counter would otherwise hand the all-terminal arm a premature
+		// category-B give-up for a parent whose only defect is one unpushed
+		// slice. The consolidated base still lacks that slice, so the tick
+		// short-circuits the dispatch backstop like any other failure.
+		s.parkOnSliceHeadMissing(ctx, parentRunID, parentStageID, headMissing)
+		return false
 	case err != nil:
 		attempts := s.recordIntegrationError(parentRunID)
 		level := slog.LevelWarn
@@ -523,6 +589,7 @@ func (s *Sweeper) integrateCompletedWave(ctx context.Context, parentRunID, paren
 	// later recurrence of the same conflict is silently suppressed.
 	s.clearIntegrationError(parentRunID)
 	s.clearWaveConflict(parentRunID)
+	s.clearHeadMissing(parentRunID)
 	if integrated {
 		s.logger().LogAttrs(ctx, slog.LevelInfo, "childcompletion: integrated a completed wave mid-fan-out",
 			slog.String("parent_run_id", parentRunID.String()),
@@ -557,6 +624,79 @@ func (s *Sweeper) clearWaveConflict(parentRunID uuid.UUID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.waveConflicts, parentRunID)
+}
+
+// parkOnSliceHeadMissing is the shared #4079 park for BOTH fan-in arms: it
+// WARN-logs, leaves the parent untransitioned, and emits slice_head_missing
+// only when this (slice, child) is NEW for the parent. It never touches the
+// bounded-retry counter.
+func (s *Sweeper) parkOnSliceHeadMissing(ctx context.Context, parentRunID, parentStageID uuid.UUID, missing *SliceHeadMissingError) {
+	s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: slice head missing; parent parked until the slice branch exists",
+		slog.String("parent_run_id", parentRunID.String()),
+		slog.String("parent_stage_id", parentStageID.String()),
+		slog.String("child_run_id", missing.ChildRunID.String()),
+		slog.Int("slice_index", missing.SliceIndex),
+		slog.String("branch", missing.Branch),
+	)
+	if s.recordHeadMissing(parentRunID, missing) {
+		s.emitSliceHeadMissing(ctx, parentRunID, parentStageID, missing)
+	}
+}
+
+// recordHeadMissing reports whether this slice_head_missing is NEW for the
+// parent and remembers it either way — the waveConflicts dedup shape.
+func (s *Sweeper) recordHeadMissing(parentRunID uuid.UUID, missing *SliceHeadMissingError) bool {
+	key := fmt.Sprintf("%d/%s", missing.SliceIndex, missing.ChildRunID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.headMissing == nil {
+		s.headMissing = make(map[uuid.UUID]string)
+	}
+	if s.headMissing[parentRunID] == key {
+		return false
+	}
+	s.headMissing[parentRunID] = key
+	return true
+}
+
+// clearHeadMissing forgets the parent's last emitted slice_head_missing so a
+// recurrence after a clean integration or a settle is surfaced again.
+func (s *Sweeper) clearHeadMissing(parentRunID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.headMissing, parentRunID)
+}
+
+// emitSliceHeadMissing writes a slice_head_missing audit entry (system actor)
+// naming the child whose slice branch is absent (#4079). Best-effort,
+// mirroring emitSliceIntegrationConflict. An operator diagnostic like
+// slice_integration_failed — deliberately NOT an issue-comment activity
+// category.
+func (s *Sweeper) emitSliceHeadMissing(ctx context.Context, parentRunID, parentStageID uuid.UUID, missing *SliceHeadMissingError) {
+	payload, err := json.Marshal(map[string]any{
+		"parent_stage_id": parentStageID.String(),
+		"child_run_id":    missing.ChildRunID.String(),
+		"slice_index":     missing.SliceIndex,
+		"branch":          missing.Branch,
+		"detail":          missing.Detail,
+	})
+	if err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: marshal slice_head_missing payload",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := s.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &parentStageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slice_head_missing",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: append slice_head_missing",
+			slog.String("error", err.Error()))
+	}
 }
 
 // failedChildrenAllRecoverable reports whether every failed child run's
