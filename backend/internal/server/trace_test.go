@@ -5098,6 +5098,37 @@ func TestDispatchConsolidatedReview_TruncatedDiff_EmitsDegradationAndStillReview
 	}
 }
 
+// TestDispatchConsolidatedReview_FanInHold_RecordsNoReviewTrace pins WHERE the
+// ADR-090 D5 hold sits in DispatchConsolidatedReview (#4018): after the compare
+// resolved the consolidated head, and BEFORE anything the round records. A
+// held round on a truncated compare therefore appends neither the
+// consolidated_review_truncated degradation row nor a review round — the
+// released round records them once, for the head it actually reviews — while
+// the verify-only pass is triggered for exactly the compare's head.
+func TestDispatchConsolidatedReview_FanInHold_RecordsNoReviewTrace(t *testing.T) {
+	f := newFanInFixture(t, fanInVerifySpec)
+	f.s.cfg.GitHub = cannedComparePatchClient(t, `{
+		"total_commits": 1,
+		"commits": [{"sha":"truncatedhead"}],
+		"files": [{"filename":"big.go","status":"modified","changes":99999,"patch":""}]
+	}`)
+	f.dispatch()
+
+	f.assertHeld()
+	if n := f.count(consolidatedReviewTruncatedCategory); n != 0 {
+		t.Errorf("%s entries = %d, want 0 (a held round records nothing)", consolidatedReviewTruncatedCategory, n)
+	}
+	rows := mcvTriggerRows(f.au)
+	if len(rows) != 1 {
+		t.Fatalf("stage_merge_candidate_verify_triggered = %d, want 1", len(rows))
+	}
+	var trig mergeCandidateVerifyTrigger
+	_ = json.Unmarshal(rows[0].Payload, &trig)
+	if trig.ExpectedHeadSHA != "truncatedhead" {
+		t.Errorf("trigger head = %q, want the compare's resolved head truncatedhead", trig.ExpectedHeadSHA)
+	}
+}
+
 // TestShipTrace_RunBudgetTripwire_FamilyAggregateHalts is the family-budget
 // aggregation end-to-end (E24.6 / #1146): a decomposed CHILD whose own
 // cost_usd_total stays under the per-run ceiling is still halted because the
