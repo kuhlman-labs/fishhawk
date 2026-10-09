@@ -75,6 +75,15 @@ type acceptanceAdmissionResponse struct {
 // cross-run). The endpoint reuses write:stages and adds no new scope, so the
 // auth-change impact inventory is empty (AGENTS.md Auth-change-checklist).
 //
+// Decomposed-parent gate (#4080): BEFORE any short-circuit evaluation the run
+// is loaded (a load error is 500 internal_error, fail closed) and
+// guardDecomposedParentAcceptance refuses 409 acceptance_integration_incomplete
+// — no state change — when the run is a decomposed parent whose newest
+// slices_integrated does not cover every succeeded child (or a child has not
+// succeeded, or no consolidated branch is recorded), so a short-circuit can
+// never settle acceptance against a partial consolidated tree. A guard read
+// error is 500 internal_error.
+//
 // Fail-open by design (the reconciliation binding condition): a non-admissible
 // stage state (already settled, mixed criteria, an un-wired orchestrator)
 // returns short_circuited:false with NO warning — it is the normal no-op path,
@@ -152,6 +161,37 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Decomposed-parent integration gate (#4080), BEFORE the nil-orchestrator
+	// fail-open and the short-circuit walk: an all-skip or out-of-scope
+	// short-circuit would otherwise settle a decomposed parent's acceptance as
+	// not_validated against a consolidated branch missing slices — the same
+	// partial tree the host-dispatch marker refuses to spawn on. The run read is
+	// fail-CLOSED (500 internal_error, approval condition C6): the gate cannot
+	// decide without it. A refusal answers 409 acceptance_integration_incomplete
+	// with NO state change; the MCP dispatch verbs fail closed on any admission
+	// 4xx, so the spawn stops here. Inert (no extra reads beyond the run and the
+	// children list) for a non-parent run and for a deployment with no
+	// slice-integration authority. See guardDecomposedParentAcceptance.
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not load the stage's run to validate decomposed-parent integration coverage",
+			map[string]any{"run_id": stage.RunID.String(), "error": err.Error()})
+		return
+	}
+	accErr, err := s.guardDecomposedParentAcceptance(r.Context(), runRow, stage)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not read the decomposed parent's children or slices_integrated record to validate acceptance integration coverage",
+			map[string]any{"run_id": stage.RunID.String(), "error": err.Error()})
+		return
+	}
+	if accErr != nil {
+		s.writeError(w, r, http.StatusConflict, "acceptance_integration_incomplete",
+			accErr.message(), accErr.details())
+		return
+	}
+
 	// Fail-open: an un-wired orchestrator can never block a legitimate dispatch.
 	// Admission is an evaluate-and-maybe-settle pre-step; the caller's own spawn
 	// path handles everything else.
@@ -189,21 +229,23 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 		// position differs from the operator host under a k8s deployment). All
 		// three fields stay omitted on a non-admissible / non-live no-op or a spec
 		// with no declared hosts (the runner skips its target gate then anyway).
+		//
+		// The run row is the one the integration gate above already loaded
+		// (fail-closed there, C6): nothing on the no-short-circuit path mutates
+		// the run, so a second read would only add a failure mode.
 		resp := acceptanceAdmissionResponse{ShortCircuited: false}
 		if liveValidationRequired {
-			if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); gerr == nil {
-				if hosts := s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow); len(hosts) > 0 {
-					resp.NeedsTarget = true
-					resp.TargetHosts = hosts
-					// Resolve the merge-candidate head, walking ParentRunID as a
-					// fallback (#2028) so a plan-stageless recovery child — whose
-					// implement lineage was recorded under the PARENT runID — carries
-					// its ancestor's non-empty head rather than an empty one that
-					// degrades the #1953 verb from a hard-block to proceed-with-warning.
-					// May STILL be empty when the walk exhausts — still emit
-					// needs_target; the verb degrades to a proceed-with-warning.
-					resp.ExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHAWalkingParents(r.Context(), runRow, stage.ID)
-				}
+			if hosts := s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow); len(hosts) > 0 {
+				resp.NeedsTarget = true
+				resp.TargetHosts = hosts
+				// Resolve the merge-candidate head, walking ParentRunID as a
+				// fallback (#2028) so a plan-stageless recovery child — whose
+				// implement lineage was recorded under the PARENT runID — carries
+				// its ancestor's non-empty head rather than an empty one that
+				// degrades the #1953 verb from a hard-block to proceed-with-warning.
+				// May STILL be empty when the walk exhausts — still emit
+				// needs_target; the verb degrades to a proceed-with-warning.
+				resp.ExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHAWalkingParents(r.Context(), runRow, stage.ID)
 			}
 		}
 		s.writeJSON(w, r, http.StatusOK, resp)

@@ -3210,24 +3210,81 @@ func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
 	}
 }
 
-func TestIntegrateSlices_SkipsChildMissingSliceIndex(t *testing.T) {
+// TestIntegrateSlices_SucceededChildMissingSliceIndex_FailsClosed pins the
+// #4080 fail-closed rule: a SUCCEEDED decomposed child with no slice_index has
+// no derivable slice branch, and skipping it (the pre-#4080 behaviour, which
+// this test used to pin as TestIntegrateSlices_SkipsChildMissingSliceIndex)
+// emitted a slices_integrated naming only the OTHER slices — a partial fan-in
+// the parent then advanced on. The refusal must land BEFORE any GitHub write.
+//
+// MECHANISM: one valid succeeded slice plus the orphan. Under the old skip the
+// call returns nil with ONE MergeBranch and a slices_integrated naming only
+// the valid child, so each assertion below goes red on its own.
+// COUNTERFACTUAL: restoring the `continue` body reddens all three.
+func TestIntegrateSlices_SucceededChildMissingSliceIndex_FailsClosed(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
 
 	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
 	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
-	// A succeeded child with NO slice index has no derivable branch — it is
-	// a defensive skip, not a guessed merge.
+	// A succeeded child with NO slice index — unreachable through
+	// fanoutDecomposition (it sets DecomposedFrom and SliceIndex together),
+	// so only a malformed legacy row looks like this.
 	orphan, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), nil)
 	orphan.DecomposedFrom = &parent.ID
 	orphan.State = run.StateSucceeded
 
-	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
-		t.Fatalf("IntegrateSlices: %v", err)
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil {
+		t.Fatal("IntegrateSlices err = nil, want a fail-closed refusal naming the slice-less succeeded child")
 	}
-	if len(gh.mergeCalls) != 1 {
-		t.Errorf("MergeBranch calls = %d, want 1 (orphan child skipped)", len(gh.mergeCalls))
+	if conflict != nil {
+		t.Errorf("conflict = %+v, want nil — a missing slice_index is not a merge conflict", conflict)
+	}
+	if !strings.Contains(err.Error(), orphan.ID.String()) || !strings.Contains(err.Error(), "no slice_index") {
+		t.Errorf("err = %q, want it to name child %s and the missing slice_index", err, orphan.ID)
+	}
+	if len(gh.mergeCalls) != 0 || len(gh.createRefCalls) != 0 {
+		t.Errorf("GitHub writes = merges %d / createRefs %d, want 0/0 — the refusal must precede every write",
+			len(gh.mergeCalls), len(gh.createRefCalls))
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "slices_integrated" {
+			t.Errorf("a slices_integrated entry was emitted (%s); a fan-in that drops a slice must record nothing", e.Payload)
+		}
+	}
+}
+
+// TestSliceIntegrationUnavailable pins the shared integration-authority
+// predicate (#4080, approval condition C3) per mode. The server's
+// decomposed-parent acceptance gate stands down exactly when this reports a
+// reason, so each mode is asserted here rather than only through the
+// GracefulSkip fixture below.
+func TestSliceIntegrationUnavailable(t *testing.T) {
+	gh := &stubGitHub{}
+	cases := []struct {
+		name string
+		o    *Orchestrator
+		inst *int64
+		want string
+	}{
+		{"nil orchestrator", nil, int64Ptr(55), "GitHub not configured"},
+		{"nil GitHub", &Orchestrator{}, int64Ptr(55), "GitHub not configured"},
+		{"nil installation id", &Orchestrator{GitHub: gh}, nil, "run has no installation_id"},
+		{"zero installation id", &Orchestrator{GitHub: gh}, int64Ptr(0), "run has no installation_id"},
+		{"available", &Orchestrator{GitHub: gh}, int64Ptr(55), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.o.SliceIntegrationUnavailable(&run.Run{InstallationID: tc.inst}); got != tc.want {
+				t.Errorf("SliceIntegrationUnavailable = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -14831,6 +14831,21 @@ paths:
         advance that fails the run. The refusal fires BEFORE the state CAS,
         so the stage keeps its state.
 
+        **Decomposed-parent acceptance (#4080).** An `acceptance` stage of a
+        run that has decomposed children is refused 409
+        `acceptance_integration_incomplete` — on every state arm, the
+        idempotent already-`dispatched` no-op included, BEFORE the state CAS
+        so the stage keeps its state — unless the parent's NEWEST
+        `slices_integrated` audit entry covers EVERY child, every child has
+        reached run state `succeeded`, and that entry names a consolidated
+        branch. Acceptance validates the consolidated branch, so spawning it
+        earlier validates a partial tree. The refusal stands down on a
+        deployment with no slice-integration authority (no GitHub client, or
+        a parent with no GitHub installation id), where the fan-in never
+        writes a `slices_integrated` entry; there the stage dispatches as
+        before. A non-acceptance stage and a non-decomposed run are
+        unaffected.
+
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
         operator/MCP token that drives dispatch already carries it.
@@ -14951,7 +14966,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            One of three refusals, or the concurrency queue answer:
+            One of four refusals, or the concurrency queue answer:
 
             - `concurrency_slot_queued` (#3964 / ADR-087) — NOT a refusal: the
               grouped stage is queued FIFO for a concurrency slot and its state
@@ -15021,6 +15036,19 @@ paths:
               child stays cleanly re-dispatchable. Nothing must be dispatched
               first to clear it: the server integrates between waves, so the
               action is to retry the dispatch shortly.
+            - `acceptance_integration_incomplete` — the decomposed-parent
+              acceptance gate (#4080): this is an `acceptance` stage of a
+              decomposed parent whose consolidated branch does not provably
+              carry every child's slice. `details` carries
+              `unintegrated_child_run_ids` (SUCCEEDED children the newest
+              `slices_integrated` entry does not name), `non_succeeded_child_run_ids`
+              (children not yet `succeeded`), `consolidated_branch` and
+              `consolidated_branch_present`; both id lists are always arrays,
+              in slice order. It fires on every state arm (the idempotent
+              already-`dispatched` no-op included) BEFORE the state CAS, so the
+              stage keeps its state. Do not retry blindly: wait for the fan-in
+              to cover every child (`fishhawk_await_children` names a stuck
+              child and its recovery), then re-dispatch.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15033,10 +15061,13 @@ paths:
             derive `base_branch` (E50.13 / #2363), or the post-deploy hold
             could not list the run's stages to check for an unsucceeded
             `deploy` stage ahead of a `pending` or `awaiting_host_dispatch`
-            stage (E35.1 / #1598, E35.3 / #1600).
-            Retryable: all three fail closed on a read error rather than
-            admitting out of order, on an unverified base, or behind an
-            unchecked deploy, and commit no state. `internal_error` — the state
+            stage (E35.1 / #1598, E35.3 / #1600), or the decomposed-parent
+            acceptance gate could not list the parent's decomposition children
+            or read its `slices_integrated` history (#4080).
+            Retryable: all four fail closed on a read error rather than
+            admitting out of order, on an unverified base, behind an
+            unchecked deploy, or onto an unproven consolidated tree, and
+            commit no state. `internal_error` — the state
             CAS or (for a grouped stage) the concurrency admission failed; the
             admission is one transaction, so a failure commits nothing and the
             stage keeps its state and queue standing.
@@ -22714,6 +22745,20 @@ paths:
         longer abort the walk mid-flight, so the outcome is binary — nothing
         changed, or the stage fully settled.
 
+        **Decomposed-parent gate (#4080).** Before any predicate is evaluated
+        the server loads the stage's run (a load error is 500
+        `internal_error`, fail closed) and refuses 409
+        `acceptance_integration_incomplete` — settling nothing — when the run
+        is a decomposed parent whose NEWEST `slices_integrated` audit entry
+        does not cover every child, a child has not `succeeded`, or no
+        consolidated branch is recorded. A short-circuit would otherwise
+        settle the parent's acceptance as `not_validated` against a partial
+        consolidated tree. The same gate refuses the host-dispatch spawn
+        marker, and it stands down on a deployment with no slice-integration
+        authority (no GitHub client, or a parent with no GitHub installation
+        id). The MCP dispatch verbs fail closed on any admission 4xx, so a
+        refusal stops the spawn.
+
         **Fail-open by design.** A non-admissible stage state (already
         settled, a `dispatched` stage, mixed criteria, an unconfigured
         orchestrator) returns `short_circuited: false` — the normal no-op
@@ -22825,10 +22870,33 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `acceptance_integration_incomplete` (#4080) — the stage belongs to
+            a decomposed parent whose consolidated branch does not provably
+            carry every child's slice. `details` carries
+            `unintegrated_child_run_ids`, `non_succeeded_child_run_ids` (both
+            always arrays, in slice order), `consolidated_branch` and
+            `consolidated_branch_present`. No state is changed and no
+            short-circuit is evaluated; wait for the fan-in to cover every
+            child (`fishhawk_await_children`), then dispatch again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
             The target is not an acceptance-typed stage. Body's `error`
             is `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the stage's run could not be loaded, the
+            decomposed-parent gate could not list the run's decomposition
+            children or read its `slices_integrated` history (#4080; both fail
+            closed and change no state), or the short-circuit evaluation
+            itself failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

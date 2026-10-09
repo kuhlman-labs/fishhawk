@@ -1706,6 +1706,27 @@ func (o *Orchestrator) IntegrateSlices(ctx context.Context, parentRunID uuid.UUI
 	return o.integrateSlices(ctx, r)
 }
 
+// SliceIntegrationUnavailable reports why integrateSlices cannot integrate
+// parent's slices at all, or "" when it can. It is the ONE predicate behind
+// integrateSlices' graceful skip — no GitHub client wired, or a parent with no
+// GitHub installation id (a GitHub-less or GitLab-forge deployment) — exported
+// so the server's decomposed-parent acceptance gate (#4080) can tell "no
+// integration authority exists, so no slices_integrated record will ever be
+// written" from "integration exists but has not covered every child yet". The
+// gate stands down on the former (approval condition C3: a deployment that
+// cannot integrate must never be wedged waiting for a record nobody writes)
+// and refuses on the latter. A nil receiver reports unavailable too, so a
+// caller holding a nil *Orchestrator needs no separate nil check.
+func (o *Orchestrator) SliceIntegrationUnavailable(parent *run.Run) string {
+	if o == nil || o.GitHub == nil {
+		return "GitHub not configured"
+	}
+	if parent.InstallationID == nil || *parent.InstallationID == 0 {
+		return "run has no installation_id"
+	}
+	return ""
+}
+
 // integrateSlices is the fan-in step (ADR-041 / E24.2 / #1142): once every
 // decomposed child has succeeded, it sequentially merges each succeeded
 // slice branch fishhawk/run-<parent>/slice-<n> onto the consolidated
@@ -1722,14 +1743,12 @@ func (o *Orchestrator) IntegrateSlices(ctx context.Context, parentRunID uuid.UUI
 func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*SliceConflict, error) {
 	// Graceful-skip when GitHub can't be reached (no client / no
 	// installation) — the consolidated branch is simply not produced, the
-	// same posture maybeOpenConsolidatedPR takes.
-	if o.GitHub == nil {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping slice integration",
-			slog.String("run_id", parent.ID.String()))
-		return nil, nil
-	}
-	if parent.InstallationID == nil || *parent.InstallationID == 0 {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping slice integration",
+	// same posture maybeOpenConsolidatedPR takes. The predicate is
+	// SliceIntegrationUnavailable, shared with the server's decomposed-parent
+	// acceptance gate (#4080) so the gate stands down on EXACTLY the
+	// deployments where this skip fires.
+	if reason := o.SliceIntegrationUnavailable(parent); reason != "" {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: "+reason+"; skipping slice integration",
 			slog.String("run_id", parent.ID.String()))
 		return nil, nil
 	}
@@ -1740,26 +1759,36 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		return nil, fmt.Errorf("list decomposed children: %w", err)
 	}
 
-	// Keep succeeded children with a slice index, ascending by index. A
-	// succeeded child missing SliceIndex is a defensive skip (it has no
-	// derivable slice branch) — WARN rather than guess a branch name.
+	// Keep succeeded children, ascending by slice index. A SUCCEEDED child
+	// missing SliceIndex FAILS CLOSED (#4080): it has no derivable slice
+	// branch, and skipping it would emit a slices_integrated whose
+	// child_run_ids silently omits a slice — a partial fan-in every caller
+	// would then advance on toward review and acceptance. Refusing BEFORE any
+	// CreateRef / MergeBranch keeps slices_integrated.child_run_ids equal to
+	// the FULL succeeded set on every pass. The invariant this rests on: the
+	// ONLY site that mints a decomposition child is fanoutDecomposition, which
+	// sets DecomposedFrom and SliceIndex together (run.ChildParamsFrom
+	// inherits neither), so a minted child can never lack slice_index — only a
+	// malformed legacy row reaches this branch. Non-succeeded children are
+	// filtered out as before; whether the PARENT may advance with them is the
+	// caller's decision.
 	succeeded := make([]*run.Run, 0, len(children))
 	for _, c := range children {
 		if c.State != run.StateSucceeded {
 			continue
 		}
 		if c.SliceIndex == nil {
-			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: succeeded decomposed child missing slice_index; skipping integration of it",
+			o.logger().LogAttrs(ctx, slog.LevelError, "orchestrator: succeeded decomposed child missing slice_index; refusing the fan-in",
 				slog.String("parent_run_id", parent.ID.String()),
 				slog.String("child_run_id", c.ID.String()))
-			continue
+			return nil, fmt.Errorf("succeeded decomposed child %s has no slice_index; refusing a fan-in that would drop its slice", c.ID)
 		}
 		succeeded = append(succeeded, c)
 	}
 	if len(succeeded) == 0 {
 		// Zero children to integrate — an ordinary non-decomposed run, or a
-		// decomposition whose children all lack a slice branch. Same skip
-		// posture as maybeOpenConsolidatedPR's zero-children branch.
+		// decomposition with no succeeded child yet. Same skip posture as
+		// maybeOpenConsolidatedPR's zero-children branch.
 		return nil, nil
 	}
 	sort.SliceStable(succeeded, func(i, j int) bool {
