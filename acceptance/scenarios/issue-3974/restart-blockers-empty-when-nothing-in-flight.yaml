@@ -1,0 +1,14 @@
+id: scenario:issue-3974/restart-blockers-empty-when-nothing-in-flight
+statement: 'On a preview with no decomposition child runs and no review round dispatched since boot, GET /v0/restart-blockers returns an empty `items` array and `truncated: false`.'
+verify_hint: 'HTTP surface: on a fresh preview (optionally after applying the plan-gate-parked fixture), GET /v0/restart-blockers and check items is [].'
+steps: 1) GET /v0/restart-blockers on the fresh preview. 2) POST /v0/dev/fixtures plan-gate-parked, then GET /v0/restart-blockers. 3) Seeded trace-upload-target and acceptance-dispatched; GET /v0/restart-blockers after each. None of these creates a decomposed_from run or a review round started by this daemon.
+assertions:
+    expected: items [] and truncated false
+    observed_at_record: items [] and truncated false at each step. scanned_runs went 0, 1, 2, 3.
+    repro_handle: curl http://localhost:8090/v0/restart-blockers
+origin:
+    issue: 3974
+    pr: 4157
+    run_id: 5aa9baaf-76cd-4eaa-9ee6-d929effae895
+    head_sha: f70a9db80e54ff1178b3b6edadac96c19900fe78
+    recorded_at: 2026-10-09T02:40:40Z
