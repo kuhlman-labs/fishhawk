@@ -4676,22 +4676,15 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 
 	// Review grounding (#2486): when the whole loop is grounding-capable, export
 	// the post-change HEAD under review (the in-scope headSHA — requirement 4) as
-	// a read-only tree and name that commit in the prompt. An empty headSHA (the
-	// no-verify / head_sha-less path) degrades to ungrounded via exportReviewTree's
-	// empty-ref guard, as do the kill switch, an absent working dir, and any export
-	// failure. cleanup ownership is decided at dispatch below (C6).
-	var treeDir string
-	treeCleanup := func() {}
-	if allInvocationsGrounded(invocations) {
-		dir, commit, stats, cleanup := s.exportReviewTree(ctx, runRow, headSHA)
-		if dir != "" {
-			treeDir = dir
-			treeCleanup = cleanup
-			trig.ReviewTreeCommit = commit
-			trig.ReviewTreeSkippedSymlinks = stats.Symlinks
-			trig.ReviewTreeSkippedInstructions = stats.Instructions
-		}
-	}
+	// a read-only tree and name that commit in the prompt. A headSHA absent from
+	// the local repository (a decomposed parent's server-pushed consolidated
+	// commit) is fetched from origin by reviewsandbox.ExportTree (#4066). An
+	// empty headSHA (the no-verify / head_sha-less path) degrades to ungrounded
+	// via exportReviewTree's empty-ref guard, as do the kill switch, a reviewer
+	// that cannot ground, an absent working dir, and any export failure;
+	// groundReview stamps the degrade reason on trig. cleanup ownership is
+	// decided at dispatch below (C6).
+	treeDir, treeCleanup := s.groundReview(ctx, runRow, headSHA, invocations, &trig)
 
 	// Deferred crew delivery (E77.7 / #3741): the OPEN findings/notices
 	// addressed to the reviewer, resolved ONCE per round under the implement

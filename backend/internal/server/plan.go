@@ -1661,25 +1661,15 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 
 	// Review grounding (#2486): when the whole loop is grounding-capable, export
 	// the working dir's resolved HEAD (no change exists yet at plan stage) as a
-	// read-only tree and name that commit in the prompt. exportReviewTree returns
-	// an empty treeDir + no-op cleanup on every degrade (kill switch, no working
-	// dir, export failure), so the prompt then renders the diff-only clause and
-	// the loop runs ungrounded. cleanup ownership is decided at dispatch below
-	// (C6): the synchronous gating path defers it in this scope; the detached
-	// advisory path hands it into the goroutine so the export survives the
-	// detached reviewers' lifetime.
-	var treeDir string
-	treeCleanup := func() {}
-	if allInvocationsGrounded(invocations) {
-		dir, commit, stats, cleanup := s.exportReviewTree(ctx, runRow, "HEAD")
-		if dir != "" {
-			treeDir = dir
-			treeCleanup = cleanup
-			trig.ReviewTreeCommit = commit
-			trig.ReviewTreeSkippedSymlinks = stats.Symlinks
-			trig.ReviewTreeSkippedInstructions = stats.Instructions
-		}
-	}
+	// read-only tree and name that commit in the prompt. groundReview returns
+	// an empty treeDir + no-op cleanup on every degrade (kill switch, a
+	// reviewer that cannot ground, no working dir, export failure) and stamps
+	// the degrade reason on trig (#4066), so the prompt then renders the
+	// matching diff-only clause and the loop runs ungrounded. cleanup ownership
+	// is decided at dispatch below (C6): the synchronous gating path defers it
+	// in this scope; the detached advisory path hands it into the goroutine so
+	// the export survives the detached reviewers' lifetime.
+	treeDir, treeCleanup := s.groundReview(ctx, runRow, "HEAD", invocations, &trig)
 
 	// Deferred crew delivery (E77.7 / #3741): the OPEN findings/notices
 	// addressed to the reviewer, resolved ONCE per round (every reviewer reads

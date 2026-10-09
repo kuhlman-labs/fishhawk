@@ -48,12 +48,65 @@ untracked files, no other branches, no operator-personal working-tree state.
 Read this precisely: the export bounds what is CONVENIENT, **not** what is
 REACHABLE. It is not a jail — see "Accepted residual risks" below and #2522.
 An earlier draft of this file (and ADR-078) claimed export-not-mount gives
-"LESS exposure"; that claim was wrong and is corrected here. Both
-git children run under `Env(os.Environ(), BaseAllow, nil)`, inheriting no repo
-credentials. On ANY error (unresolvable ref, git absent, not a work tree, a
-bounds violation, a traversal entry, a non-zero git exit) it removes its own
-partial dir and returns a no-op cleanup; the caller degrades to an ungrounded,
-diff-only review.
+"LESS exposure"; that claim was wrong and is corrected here. Every
+git child runs under `Env(os.Environ(), BaseAllow, nil)`, inheriting no repo
+credentials. On ANY error (unresolvable ref, a failed or timed-out fetch, git
+absent, not a work tree, a bounds violation, a traversal entry, a non-zero git
+exit) it removes its own partial dir and returns a no-op cleanup; the caller
+degrades to an ungrounded, diff-only review.
+
+### Fetch-on-miss (#4066)
+
+A decomposed parent's consolidated review runs against a commit the server
+pushed to origin, which the run's working dir has usually never fetched — so a
+local-only `rev-parse` silently degraded every such review to diff-only.
+`resolveCommit` now fetches on a miss, under these rules:
+
+- **SHA-only guard (`isFullObjectID`).** Only a full object id (exactly 40 or
+  64 hex chars) is ever fetched. A branch name, `HEAD`, an abbreviated SHA or
+  any token starting with `-` is never placed in the fetch argv: fetching a
+  named ref downloads its objects even with `--refmap=` and no FETCH_HEAD, and
+  a leading `-` would be parsed as a fetch option (`--upload-pack=…` executes
+  on the local transport). Pinned by `TestExportTree_NonSHARefNeverFetches`.
+- **Only a real miss fetches.** The context is checked FIRST: a cancelled or
+  deadline-killed `rev-parse` surfaces as an `*exec.ExitError` (signal: killed)
+  and is a ctx error, never a miss (`TestExportTree_CancelledRevParseIsNotAMiss`).
+  Then only an `*exec.ExitError` is a miss; git absent or another start failure
+  returns a plain error with no fetch.
+- **Command.** `git -C <repo> fetch --no-tags --no-write-fetch-head
+  --no-auto-maintenance --refmap= origin <sha>`. The refspec names no
+  destination and the refmap is disabled, so no local branch, remote-tracking
+  ref or FETCH_HEAD moves — only objects land (unreferenced; normal gc expiry
+  prunes them). `--no-auto-maintenance` keeps the fetch from forking a detached
+  maintenance child (AGENTS.md #3503 class).
+- **Env.** `Env(os.Environ(), BaseAllow, nil)` plus `GIT_TERMINAL_PROMPT=0`, so
+  a remote demanding credentials fails instead of prompting.
+- **Bound + group kill.** `Limits.FetchTimeout` (default 30s, `DefaultLimits`;
+  a zero value resolves to the default) bounds the child, which is
+  `procgroup.Harden`ed: the deadline kills the whole process group (git plus any
+  upload-pack / ssh / credential-helper grandchild holding the stderr pipe) and
+  `WaitDelay` bounds `Wait`. Pinned by `TestExportTree_FetchTimeoutDegrades`.
+  A PARENT-context cancel mid-fetch is named as the ctx error, not as the
+  fetch's own timeout (`TestExportTree_ParentCancelDuringFetchIsCtxError`).
+- **Sentinel.** Every miss — a non-SHA ref, a failed or timed-out fetch (exit
+  status + a single-line stderr tail ≤256 bytes, or "timed out after <d>"), an
+  object still not a commit after the fetch — wraps `ErrRefUnavailable` and
+  names the cause. git absent, a ctx error, an archive failure or a bounds
+  violation does not. The server maps the sentinel to the `ref_unavailable`
+  prompt reason (below).
+- **Residuals.** (1) Credentials: the fetch authenticates only via HOME-resolved
+  git config (a credential helper, `~/.ssh/config`); `GH_TOKEN`, `GITHUB_TOKEN`
+  and `SSH_AUTH_SOCK` are scrubbed, so a deployment whose git auth lives only in
+  those env vars degrades with a named `ref_unavailable` cause in the WARN log
+  rather than hanging. Widening the fetch child's allow-list was deliberately
+  not done. (2) Fetch-by-SHA against a hosted forge assumes it serves a want
+  for a commit reachable from a ref (the consolidated branch); only the
+  local-transport half is hermetically tested. (3) `--refmap=`,
+  `--no-auto-maintenance` and `GIT_TERMINAL_PROMPT=0` are not observable in a
+  hermetic test (each deletion was run and stays green): the SHA-only guard
+  masks `--refmap=`, a detached maintenance child is not deterministically
+  observable, and there is no hermetic credential-prompting remote — the
+  timeout + group kill is the tested backstop.
 
 ### Named extractor guards (each counts or refuses)
 
@@ -104,6 +157,16 @@ partially grounded. Cleanup ownership follows the dispatch shape: the synchronou
 gating path defers cleanup in the dispatch scope; the DETACHED advisory path
 hands cleanup into the goroutine (C6) so the export survives the detached
 reviewers' lifetime and is removed exactly when the loop returns.
+
+Both call sites (`plan.go`, `trace.go`) go through ONE helper, `groundReview`,
+which stamps `prompt.Trigger.ReviewUngroundedReason` on every degrade (#4066):
+`disabled` (kill switch — also for a mixed panel while the switch is on),
+`reviewer_cannot_ground` (a mixed panel with grounding enabled),
+`no_working_dir`, `no_ref`, `ref_unavailable` (`errors.Is(err,
+ErrRefUnavailable)`), or `export_failed` (any other `ExportTree` error). The
+prompt names `FISHHAWKD_REVIEW_GROUNDING` only for `disabled` (or an unset
+reason); every other reason says grounding IS enabled and names why this
+round's tree could not be provided (`backend/internal/prompt/README.md`).
 
 ## Accepted residual risks (advisory-verdicts-only)
 

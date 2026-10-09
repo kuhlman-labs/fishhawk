@@ -1102,6 +1102,17 @@ type Trigger struct {
 	// ungrounded prompt) omits the disclosure.
 	ReviewTreeSkippedSymlinks     int
 	ReviewTreeSkippedInstructions int
+	// ReviewUngroundedReason names WHY an ungrounded review (ReviewTreeCommit
+	// empty) has no tree (#4066), one of the ReviewUngrounded* constants. The
+	// zero value and ReviewUngroundedDisabled render the switch-off text
+	// byte-identically to the pre-#4066 prompt (grounding is off on this
+	// deployment; FISHHAWKD_REVIEW_GROUNDING is named as the switch). Every
+	// other value renders the enabled-but-unavailable variant: grounding IS
+	// enabled, this round's tree could not be provided for the named reason,
+	// and the reviewer is told NOT to recommend enabling it. An unknown
+	// non-empty value renders a generic enabled-but-unavailable phrase, never
+	// the switch text. Ignored on a grounded review.
+	ReviewUngroundedReason string
 
 	// InjectedDocuments carries repo-authored documents the server resolved
 	// server-side and injected into this prompt (E55.1 / #2242): a governance
@@ -6047,6 +6058,57 @@ func writeReviewToolClause(b *strings.Builder, t Trigger) {
 	}
 }
 
+// Review ungrounded reasons (#4066): the closed set the server stamps on
+// Trigger.ReviewUngroundedReason when a review runs without a tree.
+const (
+	// ReviewUngroundedDisabled: the deployment's kill switch
+	// (FISHHAWKD_REVIEW_GROUNDING=false) is on. Renders the switch-off text.
+	ReviewUngroundedDisabled = "disabled"
+	// ReviewUngroundedNoWorkingDir: the run has no local checkout on this host.
+	ReviewUngroundedNoWorkingDir = "no_working_dir"
+	// ReviewUngroundedNoRef: the review has no resolved commit to export.
+	ReviewUngroundedNoRef = "no_ref"
+	// ReviewUngroundedReviewerCannotGround: a reviewer on this round cannot
+	// read an exported tree, so the round (or that reviewer) runs diff-only.
+	ReviewUngroundedReviewerCannotGround = "reviewer_cannot_ground"
+	// ReviewUngroundedRefUnavailable: the reviewed commit is not present
+	// locally and could not be fetched from origin.
+	ReviewUngroundedRefUnavailable = "ref_unavailable"
+	// ReviewUngroundedExportFailed: exporting the tree failed for another
+	// reason (git absent, an archive failure, a bound exceeded).
+	ReviewUngroundedExportFailed = "export_failed"
+)
+
+// reviewUngroundedPhrases renders each enabled-but-unavailable reason as the
+// clause completing "the tree for this review could not be provided: ".
+var reviewUngroundedPhrases = map[string]string{
+	ReviewUngroundedNoWorkingDir:         "this run has no local checkout on the review host to export",
+	ReviewUngroundedNoRef:                "no resolved commit was available to export",
+	ReviewUngroundedReviewerCannotGround: "a reviewer on this round cannot read an exported tree, so this review runs without one",
+	ReviewUngroundedRefUnavailable:       "the reviewed commit is not present locally and could not be fetched from origin",
+	ReviewUngroundedExportFailed:         "exporting the tree failed on the review host",
+}
+
+// reviewUngroundedGenericPhrase is the clause for an unknown non-empty reason:
+// still the enabled-but-unavailable variant, never the switch-off text.
+const reviewUngroundedGenericPhrase = "the export did not complete for this round"
+
+// reviewGroundingSwitchedOff reports whether an ungrounded review is ungrounded
+// because the deployment switch is off — the zero value (a caller that stamps
+// no reason, the pre-#4066 shape) or ReviewUngroundedDisabled.
+func reviewGroundingSwitchedOff(t Trigger) bool {
+	return t.ReviewUngroundedReason == "" || t.ReviewUngroundedReason == ReviewUngroundedDisabled
+}
+
+// reviewUngroundedPhrase returns the enabled-but-unavailable clause for t's
+// reason, falling back to the generic phrase for an unknown value.
+func reviewUngroundedPhrase(t Trigger) string {
+	if p, ok := reviewUngroundedPhrases[t.ReviewUngroundedReason]; ok {
+		return p
+	}
+	return reviewUngroundedGenericPhrase
+}
+
 // writeReviewRepoAccess writes the REPOSITORY ACCESS section for a review prompt
 // (#2486). Grounded: name the exported tree and its commit, state the reviewer
 // has read+search but no shell-write and no network, and bind evidence-citing;
@@ -6056,16 +6118,32 @@ func writeReviewToolClause(b *strings.Builder, t Trigger) {
 // degrade path, the issue's option 3) — and, since E45.90 / #3625, name
 // FISHHAWKD_REVIEW_GROUNDING as the DEPLOYMENT switch, so the posture reads as
 // configurable rather than as a product limit. The flag is named on the
-// UNGROUNDED branch only; a grounded render must never carry it.
+// UNGROUNDED switch-off branch only; a grounded render must never carry it.
+//
+// Since #4066 the ungrounded branch has two variants keyed on
+// Trigger.ReviewUngroundedReason: switch-off (the zero value or "disabled",
+// byte-identical to the pre-#4066 text) and enabled-but-unavailable (grounding
+// IS on, this round's tree could not be provided for the named reason). The
+// second never names the env var: telling the operator to enable a switch that
+// is already on is the wrong instruction reviewers wrote on #4064/#4057.
 func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
 	b.WriteString("REPOSITORY ACCESS\n")
 	b.WriteString("=================\n\n")
 	if t.ReviewTreeCommit == "" {
+		if reviewGroundingSwitchedOff(t) {
+			b.WriteString("No repository tree is available for this review: it is DIFF-ONLY. " +
+				"Scope your confidence to the diff and the context provided below, and say so rather than " +
+				"requesting evidence you cannot reach. This is a DEPLOYMENT setting, not a product limit: " +
+				"the operator can ground a review against an exported read-only tree at the reviewed commit by " +
+				"setting FISHHAWKD_REVIEW_GROUNDING=true, which ships off by default.\n\n")
+			return
+		}
 		b.WriteString("No repository tree is available for this review: it is DIFF-ONLY. " +
 			"Scope your confidence to the diff and the context provided below, and say so rather than " +
-			"requesting evidence you cannot reach. This is a DEPLOYMENT setting, not a product limit: " +
-			"the operator can ground a review against an exported read-only tree at the reviewed commit by " +
-			"setting FISHHAWKD_REVIEW_GROUNDING=true, which ships off by default.\n\n")
+			"requesting evidence you cannot reach. Review grounding IS ENABLED on this deployment, so do " +
+			"not recommend enabling it; the tree for this review could not be provided: ")
+		b.WriteString(reviewUngroundedPhrase(t))
+		b.WriteString(".\n\n")
 		return
 	}
 	b.WriteString("Your working directory holds the repository's TRACKED files exported at commit ")
@@ -6110,7 +6188,12 @@ func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
 // the concern note alongside the operator-runs-the-checker resolution, so the
 // note the operator reads carries the switch that would have made the
 // prediction traceable. This is satisfied at the PROMPT layer: the render is
-// pinned by a golden, but nothing here proves a reviewer complies.
+// pinned by a golden, but nothing here proves a reviewer complies. Since #4066
+// that switch clause renders only when grounding is switched off
+// (reviewGroundingSwitchedOff); when grounding is enabled but this round's
+// tree could not be provided, criterion 10 names only "run the check
+// themselves" and says grounding is already enabled. Criterion 9 is unchanged
+// by the reason.
 //
 // The closing carve-out sentence renders in BOTH postures and is what keeps
 // these rules from suppressing adversarial reasoning — a threat model, a
@@ -6139,14 +6222,22 @@ func writeGroundedCalibrationCriteria(b *strings.Builder, t Trigger) {
 		"traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture. NEVER " +
 		"infer that behavior from a type or function name; a test fake routinely overrides the base behavior its " +
 		"name implies. ")
-	if t.ReviewTreeCommit != "" {
+	switch {
+	case t.ReviewTreeCommit != "":
 		b.WriteString("Resolve the prediction against the exported tree and CITE the definition you read.\n")
-	} else {
+	case reviewGroundingSwitchedOff(t):
 		b.WriteString("No repository tree is available for this review, so where the governing definition is not " +
 			"itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert " +
 			"what a fake or a fixture does when you cannot read it. In that note, name BOTH resolutions open to " +
 			"the operator: they can run the check themselves, or they can set FISHHAWKD_REVIEW_GROUNDING=true to " +
 			"ground future reviews against the tree so the prediction is traceable.\n")
+	default:
+		b.WriteString("No repository tree is available for this review, so where the governing definition is not " +
+			"itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert " +
+			"what a fake or a fixture does when you cannot read it. In that note, name the resolution open to " +
+			"the operator: they can run the check themselves. Review grounding is already enabled on this " +
+			"deployment and only this round's tree could not be provided (see REPOSITORY ACCESS), so do not " +
+			"recommend enabling it.\n")
 	}
 	b.WriteString("These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY. They " +
 		"are NOT a requirement to cite a line for every claim. Adversarial reasoning about implications — a threat " +
