@@ -219,6 +219,9 @@ type rebaseOpts struct {
 	repo           string
 	noPRURL        bool
 	noPublisher    bool
+	// verifySpec, when set, is the run's cached workflow spec, so the
+	// merge-candidate producer sees a declared verify command (ADR-090 D4).
+	verifySpec string
 }
 
 // seedRebaseRun wires a run + GitHub stub + a REAL auditcheckpublisher over a
@@ -240,6 +243,10 @@ func seedRebaseRun(t *testing.T, stub *rebaseGitHub, opt rebaseOpts) *rebaseSeed
 	}
 	if opt.noPRURL {
 		runRow.PullRequestURL = nil
+	}
+	if opt.verifySpec != "" {
+		runRow.WorkflowSpec = []byte(opt.verifySpec)
+		runRow.WorkflowID = "feature_change"
 	}
 	implStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement,
 		State: run.StageStateSucceeded}
@@ -1640,5 +1647,257 @@ func TestRebaseRunBranch_NoAttributableSHA_ThroughReinvocation_NamesVouch(t *tes
 	if sd.s.ReverifyBranchLineage(context.Background(), sd.runID, 77) {
 		t.Error("the ledger accepted the un-attributed merge commit after re-invocation; " +
 			"if that becomes true, invocation 1's fishhawk_vouch_commit instruction is no longer required and must be revisited")
+	}
+}
+
+// --- ADR-090 / #4018: the merge-candidate verify producer ---
+
+// seedMCVRebase seeds a rebase world whose workflow declares a verify command
+// and whose audit fake stamps real append-order sequences, so trigger
+// consumption behaves like the chain.
+func seedMCVRebase(t *testing.T, stub *rebaseGitHub) *rebaseSeed {
+	t.Helper()
+	sd := seedRebaseRun(t, stub, rebaseOpts{verifySpec: mcvUndelegatedSpecYAML})
+	sd.au.stampSequence = true
+	return sd
+}
+
+// seedMCVRow appends a chain row for the seeded run in append order.
+func seedMCVRow(sd *rebaseSeed, stageID *uuid.UUID, category string, payload any) {
+	raw, _ := json.Marshal(payload)
+	sd.au.mu.Lock()
+	defer sd.au.mu.Unlock()
+	sd.au.appended = append(sd.au.appended, audit.ChainAppendParams{
+		RunID: sd.runID, StageID: stageID, Category: category, Payload: raw,
+	})
+}
+
+func decodeRebase(t *testing.T, w *httptest.ResponseRecorder) rebaseBranchResponse {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return resp
+}
+
+func mcvTriggerPayloads(t *testing.T, au *auditFake) []mergeCandidateVerifyTrigger {
+	t.Helper()
+	var out []mergeCandidateVerifyTrigger
+	for _, e := range auditEntries(au, CategoryStageMergeCandidateVerifyTriggered) {
+		var p mergeCandidateVerifyTrigger
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode trigger: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestRebaseRunBranch_PerformedMergeTriggersMergeCandidateVerify: a performed
+// base merge authorizes ONE verify-only pass anchored to the RE-READ new head
+// (never the pre-merge head), cause base_advance, recorded under the operator,
+// and the 200 names the re-opened stage and the dispatch/await next step.
+func TestRebaseRunBranch_PerformedMergeTriggersMergeCandidateVerify(t *testing.T) {
+	sd := seedMCVRebase(t, cleanRebaseStub())
+	impl := crImplementStage(t, sd)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+	triggers := mcvTriggerPayloads(t, sd.au)
+	if len(triggers) != 1 {
+		t.Fatalf("stage_merge_candidate_verify_triggered rows = %d, want 1", len(triggers))
+	}
+	tr := triggers[0]
+	if tr.ExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("trigger expected_head_sha = %q, want the re-read new head %q", tr.ExpectedHeadSHA, rebaseNewHeadSHA)
+	}
+	if tr.Cause != mergeCandidateCauseBaseAdvance || tr.Branch != rebaseBranchName || tr.BaseRef != rebaseBaseRef {
+		t.Errorf("trigger = %+v, want cause base_advance on %s/%s", tr, rebaseBranchName, rebaseBaseRef)
+	}
+	row := auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)[0]
+	if row.ActorKind == nil || *row.ActorKind != audit.ActorUser || row.ActorSubject == nil || *row.ActorSubject == "" ||
+		*row.ActorSubject == mergeCandidateSystemSubject {
+		t.Errorf("trigger actor = %v/%v, want the operator (user kind)", row.ActorKind, row.ActorSubject)
+	}
+	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyState != mergeCandidateStateInFlight {
+		t.Errorf("response triggered/state = %v/%q, want true/in_flight", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyState)
+	}
+	if resp.MergeCandidateVerifyStageID != impl.ID.String() {
+		t.Errorf("merge_candidate_verify_stage_id = %q, want %s", resp.MergeCandidateVerifyStageID, impl.ID)
+	}
+	for _, want := range []string{"fishhawk_dispatch_stage", "fishhawk_await_stage", "NOTHING"} {
+		if !strings.Contains(resp.MergeCandidateVerifyNote, want) {
+			t.Errorf("merge_candidate_verify_note must name %q: %q", want, resp.MergeCandidateVerifyNote)
+		}
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("implement stage = %q, want pending (re-opened for the pass)", impl.State)
+	}
+	if branchRebasedAudit(sd.au) == nil {
+		t.Error("the branch_rebased row must still be written")
+	}
+}
+
+// TestRebaseRunBranch_NoVerifyCommandTriggersNothing: D4 — with no declared
+// verify command a performed merge starts nothing and reports not_required.
+func TestRebaseRunBranch_NoVerifyCommandTriggersNothing(t *testing.T) {
+	sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{verifySpec: mcvNoVerifySpecYAML})
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if n := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Errorf("trigger rows = %d, want 0 (no verify command declared)", n)
+	}
+	if resp.MergeCandidateVerifyState != mergeCandidateStateNotRequired || resp.MergeCandidateVerifyTriggered {
+		t.Errorf("state/triggered = %q/%v, want not_required/false", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+}
+
+// TestRebaseRunBranch_UnreadableNewHeadTriggersNothing: when the post-merge
+// re-read fails there is no head to anchor a pass to, so nothing is triggered
+// and the 200 names the re-invoke route.
+func TestRebaseRunBranch_UnreadableNewHeadTriggersNothing(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.prStatusSeq = []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError}
+	sd := seedMCVRebase(t, stub)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if n := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Errorf("trigger rows = %d, want 0 (no head could be read back)", n)
+	}
+	if resp.MergeCandidateVerifyTriggered {
+		t.Error("merge_candidate_verify_triggered = true with an unknown head")
+	}
+	if !strings.Contains(resp.MergeCandidateVerifyRefusal, "fishhawk_rebase_run_branch") {
+		t.Errorf("refusal must name the re-invoke route: %q", resp.MergeCandidateVerifyRefusal)
+	}
+}
+
+// TestRebaseRunBranch_UpToDateReTriggersUnverifiedHead: an already-up-to-date
+// invocation whose live head is a conflict-resolution push with no verdict
+// re-triggers a pass for EXACTLY that head with cause conflict_resolution.
+func TestRebaseRunBranch_UpToDateReTriggersUnverifiedHead(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl := crImplementStage(t, sd)
+	seedMCVRow(sd, &impl.ID, CategoryConflictResolutionPushed, map[string]any{"head_sha": rebaseNewHeadSHA})
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	triggers := mcvTriggerPayloads(t, sd.au)
+	if len(triggers) != 1 {
+		t.Fatalf("trigger rows = %d, want 1 (the unverified conflict-resolution head must be re-triggered)", len(triggers))
+	}
+	if triggers[0].ExpectedHeadSHA != rebaseNewHeadSHA || triggers[0].Cause != mergeCandidateCauseConflictResolution {
+		t.Errorf("trigger = %+v, want head %s cause conflict_resolution", triggers[0], rebaseNewHeadSHA)
+	}
+	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyStageID != impl.ID.String() {
+		t.Errorf("response triggered/stage = %v/%q, want true/%s", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyStageID, impl.ID)
+	}
+}
+
+// TestRebaseRunBranch_UpToDateSettledHeadTriggersNothing: a passed verdict, a
+// live pass, or a head needing nothing starts no new pass.
+func TestRebaseRunBranch_UpToDateSettledHeadTriggersNothing(t *testing.T) {
+	cases := []struct {
+		name      string
+		seed      func(sd *rebaseSeed, impl *run.Stage)
+		wantState string
+		wantStage bool
+	}{
+		{"passed", func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, CategoryConflictResolutionPushed, map[string]any{"head_sha": rebaseNewHeadSHA})
+			seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+				HeadSHA: rebaseNewHeadSHA, Cause: mergeCandidateCauseConflictResolution, VerifyCommand: mcvCommand,
+				Result: mergeCandidateResultPassed, OutputUntrusted: true})
+		}, mergeCandidateStatePassed, false},
+		{"in_flight", func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, CategoryConflictResolutionPushed, map[string]any{"head_sha": rebaseNewHeadSHA})
+			seedMCVRow(sd, &impl.ID, CategoryStageMergeCandidateVerifyTriggered, mergeCandidateVerifyTrigger{
+				Branch: rebaseBranchName, BaseRef: rebaseBaseRef, ExpectedHeadSHA: rebaseNewHeadSHA,
+				Cause: mergeCandidateCauseConflictResolution, VerifyCommand: mcvCommand})
+		}, mergeCandidateStateInFlight, true},
+		{"runner_gated", func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, "fixup_pushed", map[string]any{"head_sha": rebaseNewHeadSHA})
+		}, mergeCandidateStateNotRequired, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := seedMCVRebase(t, upToDateRebaseStub())
+			impl := crImplementStage(t, sd)
+			tc.seed(sd, impl)
+			before := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered))
+
+			resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+				rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+			if after := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); after != before {
+				t.Errorf("trigger rows %d → %d, want unchanged", before, after)
+			}
+			if resp.MergeCandidateVerifyTriggered {
+				t.Error("merge_candidate_verify_triggered = true, want false")
+			}
+			if resp.MergeCandidateVerifyState != tc.wantState {
+				t.Errorf("state = %q, want %q", resp.MergeCandidateVerifyState, tc.wantState)
+			}
+			if got := resp.MergeCandidateVerifyStageID != ""; got != tc.wantStage {
+				t.Errorf("stage id = %q, want present=%v", resp.MergeCandidateVerifyStageID, tc.wantStage)
+			}
+			if impl.State != run.StageStateSucceeded {
+				t.Errorf("implement stage = %q, want succeeded (no re-open)", impl.State)
+			}
+		})
+	}
+}
+
+// TestRebaseRunBranch_UpToDateStateReadErrorTriggersNothing: an unreadable
+// merge-candidate chain is never read as "nothing required" — the 200 names
+// the read failure and no pass is started on an uncertain state.
+func TestRebaseRunBranch_UpToDateStateReadErrorTriggersNothing(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl := crImplementStage(t, sd)
+	seedMCVRow(sd, &impl.ID, CategoryConflictResolutionPushed, map[string]any{"head_sha": rebaseNewHeadSHA})
+	sd.au.listByCategoryErrCategory = CategoryMergeCandidateVerified
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if n := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Errorf("trigger rows = %d, want 0 on an unreadable chain", n)
+	}
+	if !strings.Contains(resp.MergeCandidateVerifyRefusal, "could not be read") {
+		t.Errorf("refusal must name the read failure: %q", resp.MergeCandidateVerifyRefusal)
+	}
+	if resp.MergeCandidateVerifyState != "" {
+		t.Errorf("state = %q, want empty (undecided)", resp.MergeCandidateVerifyState)
+	}
+}
+
+// TestRebaseRunBranch_MergeCandidatePassCannotStartStill200: a pass that
+// cannot start never fails the rebase — the 200 carries the refusal, the
+// branch_rebased row is written, and no trigger is appended.
+func TestRebaseRunBranch_MergeCandidatePassCannotStartStill200(t *testing.T) {
+	sd := seedMCVRebase(t, cleanRebaseStub())
+	impl := crImplementStage(t, sd)
+	impl.State = run.StageStateRunning // not parked at its gate
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if n := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Errorf("trigger rows = %d, want 0", n)
+	}
+	if resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyRefusal == "" {
+		t.Errorf("triggered/refusal = %v/%q, want false and a named refusal", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRefusal)
+	}
+	if resp.MergeCandidateVerifyState != mergeCandidateStateUnverified {
+		t.Errorf("state = %q, want unverified", resp.MergeCandidateVerifyState)
+	}
+	if branchRebasedAudit(sd.au) == nil {
+		t.Error("the branch_rebased row must be written even when the pass cannot start")
+	}
+	if resp.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("new_head_sha = %q, want %q", resp.NewHeadSHA, rebaseNewHeadSHA)
 	}
 }
