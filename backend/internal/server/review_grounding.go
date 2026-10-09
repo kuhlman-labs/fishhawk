@@ -61,8 +61,10 @@ func (*Server) invokeReview(ctx context.Context, inv reviewerInvocation, promptT
 }
 
 // groundReview is the single grounding decision for a review round (#2486,
-// #4066), shared by the plan-review (plan.go) and implement-review (trace.go)
-// call sites. It returns the export directory ("" when the round runs
+// #4066), shared by all three review call sites: runPlanReviews (plan.go),
+// runImplementReviews and runSupplementalReinvokeReview (trace.go, the
+// base-rebase re-invoke pass grounded against the re-landed head since #4160).
+// It returns the export directory ("" when the round runs
 // diff-only) and a cleanup closure the caller MUST call (a no-op on every
 // degrade), and stamps trig:
 //   - grounded: ReviewTreeCommit + the skip counts, from the export;
