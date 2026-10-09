@@ -15767,17 +15767,28 @@ paths:
 
         - `undispatched_child` — a decomposition child whose `implement`
           stage is still `pending` or `awaiting_host_dispatch`. Carries
-          `parent_run_id` and `stage_state`.
-        - `review_in_flight` — a `plan` or `implement` review round whose
-          latest `*_review_started` entry was written by THIS process (at or
-          after its boot marker) and has fewer verdicts landed after it than
-          `configured_agents`. The in-process reviewer dies with the daemon.
-          A round an EARLIER process dispatched is NOT a blocker: the next
-          boot sweep (#1781 / #2712) closes it. Carries `configured_agents`
-          and `landed`.
+          `parent_run_id` and `stage_state`. A hazard for `post-merge` (its
+          `git pull` makes the child's dispatch fail
+          `working_dir_diverged_from_base`); `scripts/dev reload` ignores it
+          (#4077). The endpoint reports it regardless of caller.
+        - `review_in_flight` — an unsettled `plan` or `implement` review round
+          (fewer verdicts landed after its latest `*_review_started` entry
+          than `configured_agents`) that a restart would LOSE (E72.59 /
+          #4077): either the round was written by THIS process (at or after
+          its boot marker) and the next boot sweep would NOT re-dispatch it
+          (a gating round, no reviewer backend, the re-dispatch depth cap,
+          an implement round with no recorded round source, a superseded
+          round, or an unrecoverable input source), or it is an orphaned
+          round this process's boot sweep is still re-dispatching. An
+          eligible current-process round is NOT a blocker: the next boot
+          re-dispatches it against the same plan or head. A round an EARLIER
+          process dispatched that this process did not take over is NOT a
+          blocker: this process's boot sweep already re-dispatched or closed
+          it. Carries `configured_agents` and `landed`.
         - `check_failed` — a per-run stage or audit read failed, so the daemon
-          could not decide that run's state. `scripts/dev` treats it as a
-          REFUSING blocker.
+          could not decide that run's state, including a read the
+          re-dispatch decision needs. `scripts/dev` treats it as a REFUSING
+          blocker.
 
         Items carry only ids, enum slugs and counts — no free text — sorted by
         `run_id`, then `reason`, then `stage`.

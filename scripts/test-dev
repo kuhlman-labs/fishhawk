@@ -7103,29 +7103,53 @@ _rb_m() { [[ -f "$1" ]] && print present || print absent }
 if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
   print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n)"
 else
-  # RB-a DONE-MEANS (negative): an undispatched child refuses, never reaches
-  # the teardown, and names the child, its parent and what --force breaks.
-  _rb_run_reload "200 OK" "$RB_CHILD"
-  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-child-1* && "$rb_err" == *rb-parent-9* ]] \
+  # RB-a DONE-MEANS (negative): an undispatched child makes POST-MERGE refuse
+  # (its git pull is what strands the child, #4077), before any git step, and
+  # the refusal names the child, its parent and what --force breaks.
+  _rb_run_post_merge "200 OK" "$RB_CHILD"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_git" && ! -f "$rb_reload" ]] && [[ "$rb_err" == *rb-child-1* && "$rb_err" == *rb-parent-9* ]] \
      && [[ "$rb_err" == *"refusing to restart fishhawkd"* && "$rb_err" == *undispatched_child* && "$rb_err" == *"--force breaks"* ]]; then
-    pass "RB-a undispatched child: cmd_reload refuses before the teardown, naming child + parent"
+    pass "RB-a undispatched child: cmd_post_merge refuses before git, naming child + parent"
   else
-    fail "RB-a undispatched child (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+    fail "RB-a undispatched child (rc=${rb_rc} git=$(_rb_m "$rb_git") reload=$(_rb_m "$rb_reload") err=${rb_err})"
   fi
   rm -rf "$rb_dir"
 
-  # RB-b an in-flight review round refuses the same way.
+  # RB-o (#4077) a plain reload performs no git pull, so an undispatched child
+  # alone does NOT refuse it: the teardown is reached and the guard is silent.
+  # Counterfactual C11: dropping the reload-context filter refuses here.
+  _rb_run_reload "200 OK" "$RB_CHILD"
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ -z "$rb_err" ]]; then
+    pass "RB-o undispatched child only: cmd_reload proceeds to the teardown, guard silent (reload context)"
+  else
+    fail "RB-o reload on child-only (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-o mixed: a child next to a review round still refuses reload, naming
+  # the review round but not the ignored child.
+  _rb_run_reload "200 OK" '{"items":[{"run_id":"rb-child-1","reason":"undispatched_child","stage":"implement","parent_run_id":"rb-parent-9"},{"run_id":"rb-review-2","reason":"review_in_flight","stage":"implement","configured_agents":1,"landed":0}],"scanned_runs":2,"truncated":false}'
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-review-2* && "$rb_err" != *rb-child-1* ]]; then
+    pass "RB-o child + review round: cmd_reload refuses on the review round alone"
+  else
+    fail "RB-o mixed (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-b a review round a restart would lose (the daemon reports only rounds
+  # the next boot would NOT re-dispatch, e.g. a gating one) still refuses reload.
   _rb_run_reload "200 OK" "$RB_REVIEW"
-  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-review-2* && "$rb_err" == *review_in_flight* ]]; then
-    pass "RB-b review round in flight: cmd_reload refuses before the teardown, naming the run"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-review-2* && "$rb_err" == *review_in_flight* ]] \
+     && [[ "$rb_err" == *"reload --when-quiet waits"* ]]; then
+    pass "RB-b review round in flight: cmd_reload refuses before the teardown, naming the run and pointing at --when-quiet"
   else
     fail "RB-b review in flight (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
   fi
   rm -rf "$rb_dir"
 
   # RB-c --force: the same blocker is loud but UNBLOCKED, and says what --force breaks.
-  _rb_run_reload "200 OK" "$RB_CHILD" --force
-  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *warning* && "$rb_err" == *rb-child-1* ]] \
+  _rb_run_reload "200 OK" "$RB_REVIEW" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *warning* && "$rb_err" == *rb-review-2* ]] \
      && [[ "$rb_err" == *"--force breaks"* && "$rb_err" != *"refusing to restart"* ]]; then
     pass "RB-c blocker + --force: teardown reached, exit 0, warning names the run and what --force breaks"
   else
@@ -7209,8 +7233,8 @@ else
   rm -rf "$rb_dir"
 
   # RB-j curl absent: fail-open, even though the responder would have served a
-  # blocker had the guard reached it.
-  _rb_run_reload nocurl "$RB_CHILD"
+  # reload-relevant blocker had the guard reached it.
+  _rb_run_reload nocurl "$RB_REVIEW"
   rb_lines=("${(@f)rb_err}")
   if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"could not ask fishhawkd"* ]] \
      && (( ${#rb_lines} == 1 )); then
@@ -7311,6 +7335,184 @@ if [[ "$rb_ctl_body" == *_fetch_restart_blockers* && "$rb_ctl_body" == *_parse_r
 else
   fail "RB-m _refuse_on_restart_blockers should compose _fetch_restart_blockers and _parse_restart_blockers"
 fi
+
+# RB-m (#4077) the two call sites pass their CONTEXT: reload ignores
+# undispatched_child, post-merge stays strict.
+if print -r -- "$rb_reload_body" | grep -q '_refuse_on_restart_blockers "$force" "" reload' \
+   && print -r -- "$rb_pm_body" | grep -q '_refuse_on_restart_blockers "$pm_force" "" post-merge'; then
+  pass "RB-m cmd_reload passes the reload context and cmd_post_merge the post-merge context"
+else
+  fail "RB-m the guard's context arg should be 'reload' in cmd_reload and 'post-merge' in cmd_post_merge"
+fi
+# RB-m the --when-quiet wait sits BEFORE both guards (it falls through to them).
+rb_wait_at="$(print -r -- "$rb_reload_body" | grep -n '_reload_wait_until_quiet' | head -n 1 | cut -d: -f1)"
+rb_lr_at="$(print -r -- "$rb_reload_body" | grep -n '_refuse_on_live_runs' | head -n 1 | cut -d: -f1)"
+if [[ -n "$rb_wait_at" && -n "$rb_lr_at" ]] && (( rb_wait_at < rb_lr_at )); then
+  pass "RB-m reload --when-quiet waits BEFORE the live-run and restart-blocker guards"
+else
+  fail "RB-m --when-quiet ordering (wait=${rb_wait_at} live-run guard=${rb_lr_at})"
+fi
+
+# ---------------------------------------------------------------------------
+# reload --when-quiet (E72.59 / #4077) — WQ cases
+# ---------------------------------------------------------------------------
+# Drive the REAL cmd_reload --when-quiet with the poll sources stubbed through
+# per-call COUNTER FILES (each poll runs in a command-substitution subshell):
+# the first <K> _scan_live_runs calls report a live runner, the first <B>
+# _fetch_restart_blockers calls report <blocker body>, and _reload_quiet_sleep
+# records each sleep instead of sleeping. Teardown legs append to a marker, as
+# in the RB cases. No network, no host process.
+
+# Args: <K live polls> <B blocker polls> <blocker body> [cmd_reload args...].
+# Env knobs are read from wq_interval / wq_timeout (empty = unset).
+_wq_run() {
+  local wq_k="$1" wq_b="$2" wq_body="$3"; shift 3
+  wq_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-wq.XXXXXX")"
+  wq_marker="${wq_dir}/teardown"
+  wq_sleeps="${wq_dir}/sleeps"
+  wq_scans="${wq_dir}/scans"
+  wq_fetches="${wq_dir}/fetches"
+  wq_out="$(
+    setopt errexit
+    REPO_ROOT="$wq_dir"
+    PID_FILE="${wq_dir}/dev.pid"
+    : > "$PID_FILE"
+    unset FISHHAWK_RELOAD_QUIET_INTERVAL FISHHAWK_RELOAD_QUIET_TIMEOUT
+    if [[ -n "${wq_interval:-}" ]]; then export FISHHAWK_RELOAD_QUIET_INTERVAL="$wq_interval"; fi
+    if [[ -n "${wq_timeout:-}" ]]; then export FISHHAWK_RELOAD_QUIET_TIMEOUT="$wq_timeout"; fi
+    _wq_tick() {
+      local n=0
+      if [[ -f "$1" ]]; then n="$(cat "$1")"; fi
+      n=$(( n + 1 ))
+      print -r -- "$n" > "$1"
+      print -r -- "$n"
+    }
+    _scan_live_runs() {
+      if [[ "$wq_k" == degrade ]]; then _wq_tick "$wq_scans" >/dev/null; return 2; fi
+      local n; n="$(_wq_tick "$wq_scans")"
+      if (( n <= wq_k )); then print -r -- "4242"$'\t'"wq-run-1"; fi
+      return 0
+    }
+    _fetch_restart_blockers() {
+      if [[ "$wq_b" == degrade ]]; then _wq_tick "$wq_fetches" >/dev/null; return 2; fi
+      local n; n="$(_wq_tick "$wq_fetches")"
+      if (( n <= wq_b )); then print -r -- "$wq_body"; else print -r -- "$RB_EMPTY"; fi
+      return 0
+    }
+    _reload_quiet_sleep() { print -r -- "$1" >> "$wq_sleeps" }
+    cmd_down() { print -r -- "down" >> "$wq_marker" }
+    cmd_up()   { print -r -- "up" >> "$wq_marker" }
+    cmd_reload "$@" 2>"${wq_dir}/err"
+  )"
+  wq_rc=$?
+  wq_err="$(cat "${wq_dir}/err" 2>/dev/null)"
+  wq_waits="$(print -r -- "$wq_err" | grep -c 'waiting on:')"
+  wq_nsleeps=0
+  if [[ -f "$wq_sleeps" ]]; then wq_nsleeps="$(wc -l < "$wq_sleeps" | tr -d ' ')"; fi
+}
+
+# WQ-a DONE-MEANS: --when-quiet waits through K=3 live polls — one
+# `waiting on:` line and one default-interval (15 s) sleep per live poll —
+# then proceeds through the normal guards to the teardown. Counterfactual C11:
+# without the wait loop the live-run guard refuses on poll 1 (no marker).
+wq_interval="" wq_timeout=""
+_wq_run 3 0 "" --when-quiet
+if (( wq_rc == 0 )) && [[ -f "$wq_marker" ]] && (( wq_waits == 3 && wq_nsleeps == 3 )) \
+   && [[ "$(sort -u "$wq_sleeps")" == "15" && "$wq_err" == *"runner for run wq-run-1"* ]]; then
+  pass "WQ-a --when-quiet waits through 3 live polls (15 s default interval), then tears down"
+else
+  fail "WQ-a wait-then-proceed (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} sleeps=${wq_nsleeps} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+
+# WQ-b a reload-relevant blocker (review_in_flight) is waited on too; an
+# undispatched_child alone is not (reload context), so it never waits.
+_wq_run 0 2 "$RB_REVIEW" --when-quiet
+if (( wq_rc == 0 )) && [[ -f "$wq_marker" ]] && (( wq_waits == 2 )) && [[ "$wq_err" == *"review_in_flight on run rb-review-2"* ]]; then
+  pass "WQ-b --when-quiet waits through 2 review_in_flight polls, then tears down"
+else
+  fail "WQ-b review wait (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+_wq_run 0 1000 "$RB_CHILD" --when-quiet
+if (( wq_rc == 0 )) && [[ -f "$wq_marker" ]] && (( wq_waits == 0 && wq_nsleeps == 0 )) && [[ -z "$wq_err" ]]; then
+  pass "WQ-b --when-quiet does not wait on an undispatched_child alone (silent, immediate teardown)"
+else
+  fail "WQ-b child-only wait (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+
+# WQ-c timeout: a runner that never settles exhausts FISHHAWK_RELOAD_QUIET_TIMEOUT
+# (30 s at a 10 s interval: polls at 0/10/20 wait, the poll at 30 gives up),
+# exit 1 naming what is still live, and the teardown is never reached.
+wq_interval=10 wq_timeout=30
+_wq_run 1000 0 "" --when-quiet
+if (( wq_rc == 1 )) && [[ ! -f "$wq_marker" ]] && (( wq_nsleeps == 3 )) \
+   && [[ "$wq_err" == *"gave up after 30s"* && "$wq_err" == *"still live: runner for run wq-run-1"* ]]; then
+  pass "WQ-c --when-quiet times out at FISHHAWK_RELOAD_QUIET_TIMEOUT: exit 1, names the live runner, no teardown"
+else
+  fail "WQ-c timeout (rc=${wq_rc} marker=$(_rb_m "$wq_marker") sleeps=${wq_nsleeps} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+# The last sleep is clipped to the remaining budget (25 s at 10 s: 10, 10, 5).
+wq_interval=10 wq_timeout=25
+_wq_run 1000 0 "" --when-quiet
+if (( wq_rc == 1 )) && [[ "$(tr '\n' ' ' < "$wq_sleeps")" == "10 10 5 " ]]; then
+  pass "WQ-c the final sleep is clipped to the remaining timeout (10 10 5 at 25 s)"
+else
+  fail "WQ-c clipped sleep (rc=${wq_rc} sleeps=$(tr '\n' ' ' < "$wq_sleeps" 2>/dev/null))"
+fi
+rm -rf "$wq_dir"
+
+# WQ-d degrades count as quiet: ps and the daemon both unavailable -> no wait,
+# then the normal guards print their one-line degrade reasons and proceed.
+wq_interval="" wq_timeout=""
+_wq_run degrade degrade "" --when-quiet
+if (( wq_rc == 0 )) && [[ -f "$wq_marker" ]] && (( wq_waits == 0 )) \
+   && [[ "$wq_err" == *"could not enumerate processes"* && "$wq_err" == *"could not ask fishhawkd"* ]]; then
+  pass "WQ-d ps + daemon degraded: --when-quiet treats them as quiet, the guards print their reasons, teardown reached"
+else
+  fail "WQ-d degrade (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+
+# WQ-e --when-quiet --force is a usage error (exit 2) BEFORE any check or
+# teardown: no scan, no fetch, no marker.
+_wq_run 1000 0 "" --when-quiet --force
+if (( wq_rc == 2 )) && [[ ! -f "$wq_marker" && ! -f "$wq_scans" && ! -f "$wq_fetches" ]] && [[ "$wq_err" == *"mutually exclusive"* ]]; then
+  pass "WQ-e --when-quiet --force: usage error exit 2 before any check or teardown"
+else
+  fail "WQ-e --when-quiet --force (rc=${wq_rc} marker=$(_rb_m "$wq_marker") scans=$(_rb_m "$wq_scans") err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+
+# WQ-f an invalid knob is a usage error (exit 2) naming it, before any check.
+for wq_bad in "interval=abc" "interval=0" "timeout=-5" "timeout=1.5"; do
+  wq_interval="" wq_timeout=""
+  if [[ "$wq_bad" == interval=* ]]; then wq_interval="${wq_bad#*=}"; wq_name=FISHHAWK_RELOAD_QUIET_INTERVAL; fi
+  if [[ "$wq_bad" == timeout=* ]]; then wq_timeout="${wq_bad#*=}"; wq_name=FISHHAWK_RELOAD_QUIET_TIMEOUT; fi
+  _wq_run 1000 0 "" --when-quiet
+  if (( wq_rc == 2 )) && [[ ! -f "$wq_marker" && ! -f "$wq_scans" ]] && [[ "$wq_err" == *"$wq_name"* ]]; then
+    pass "WQ-f invalid knob ${wq_bad}: usage error exit 2 naming ${wq_name}, no check, no teardown"
+  else
+    fail "WQ-f invalid knob ${wq_bad} (rc=${wq_rc} marker=$(_rb_m "$wq_marker") scans=$(_rb_m "$wq_scans") err=${wq_err})"
+  fi
+  rm -rf "$wq_dir"
+done
+wq_interval="" wq_timeout=""
+
+# WQ-g without --when-quiet the knobs are not read: a plain reload with an
+# invalid knob and a live runner refuses through the #2897 guard (exit 1),
+# never the usage error.
+wq_interval=abc
+_wq_run 1000 0 ""
+if (( wq_rc == 1 )) && [[ ! -f "$wq_marker" ]] && [[ "$wq_err" == *"refusing to tear down"* && "$wq_err" != *usage* ]]; then
+  pass "WQ-g plain reload ignores the --when-quiet knobs and refuses on the live runner"
+else
+  fail "WQ-g plain reload (rc=${wq_rc} marker=$(_rb_m "$wq_marker") err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+wq_interval=""
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then

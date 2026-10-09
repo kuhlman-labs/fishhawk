@@ -1345,8 +1345,9 @@ reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure
 and MCP-reconnect verdict are inherited and the verdict is the command's final
 line. Since E68.7 / #2897 it REFUSES at its very top — before the git walk —
 while any `fishhawk-runner` process is live, and since E83.30 / #3974 also while
-fishhawkd reports a restart blocker (an undispatched decomposition child, or a
-review round in flight in the serving daemon); `--force` overrides both (see
+fishhawkd reports a restart blocker (an undispatched decomposition child, which
+its `git pull` would strand, or a review round a restart would lose — one the
+next boot would not re-dispatch, #4077); `--force` overrides both (see
 "Live-run guard for reload / post-merge" and "Restart-blocker guard for reload /
 post-merge" below).
 
@@ -1356,8 +1357,11 @@ never rebuilds. **`reload` always rebuilds all five binaries (it forces
 `--all`)** — after a merge `HEAD == origin/main`, so the `origin/main...HEAD`
 diff is empty and the rebuild matrix would match nothing, silently skipping
 runner/CLI/mcp/shim. Forcing `--all` closes that gap. `reload` also REFUSES
-while a runner is live (E68.7 / #2897) or fishhawkd reports a restart blocker
-(E83.30 / #3974), and STRIPS its own `--force` from the argv it forwards to
+while a runner is live (E68.7 / #2897) or fishhawkd reports a reload-relevant
+restart blocker (E83.30 / #3974; since #4077 an undispatched decomposition child
+alone does not refuse a reload, which pulls nothing). `reload --when-quiet`
+(#4077) waits, bounded, until nothing is live instead of refusing. `reload`
+STRIPS its own `--force` / `--when-quiet` from the argv it forwards to
 `cmd_up`.
 
 ### Rebuild detection and the `README.md` carve-out (#2403)
@@ -1775,19 +1779,24 @@ The runner-side half of #2897 — the terminal-egress retry budget that makes a
 ## Restart-blocker guard for reload / post-merge (E83.30 / [#3974](https://github.com/kuhlman-labs/fishhawk/issues/3974))
 
 The live-run guard above protects a runner PROCESS. Two hazards have no runner
-process and live inside fishhawkd itself, so a restart orphans them silently:
+process and live inside fishhawkd itself:
 
 - a **decomposition child whose `implement` stage is still `pending` /
-  `awaiting_host_dispatch`** — restarting mid-fan-out strands it; and
-- a **plan/implement review round dispatched by the SERVING daemon** with no
-  verdict yet — the in-process reviewer goroutine dies with the daemon, and the
-  next boot sweep can only record the round as `failed`.
+  `awaiting_host_dispatch`** — `post-merge`'s `git pull` moves main under it,
+  so its later dispatch fails `working_dir_diverged_from_base`. This is a
+  POST-MERGE hazard only: a plain `reload` pulls nothing (#4077); and
+- a **plan/implement review round a restart would LOSE** — since #4077 the boot
+  sweep RE-DISPATCHES an eligible orphaned round (advisory, reviewer wired,
+  under the depth cap, not superseded) against the same plan or head, so the
+  daemon reports only a current-process round the next boot would NOT
+  re-dispatch (e.g. a gating round), or a boot re-dispatch still settling.
 
 The daemon owns both predicates, so the guard ASKS it:
 `GET /v0/restart-blockers` (contract: `backend/internal/server/README.md`
 § "Restart blockers") returns `{items, scanned_runs, truncated}`, each item
 `{run_id, reason, stage, parent_run_id?, …}` with no free text. A round an
-EARLIER process dispatched is not a blocker (the boot sweep closes it).
+EARLIER process dispatched and this one did not take over is not a blocker (the
+boot sweep already re-dispatched or closed it).
 
 ### Three functions, kept separately callable
 
@@ -1795,17 +1804,28 @@ EARLIER process dispatched is not a blocker (the boot sweep closes it).
 |---|---|---|
 | `_parse_restart_blockers` | PURE (stdin → stdout) | body → one `<run_id>\t<reason>\t<stage>\t<parent_run_id>` record per item via whitespace-tolerant, order-independent zsh `=~` (no jq); returns **3** when there is no `items` array; an item missing `run_id`/`reason`, or non-object array content, becomes reason `unreadable` |
 | `_fetch_restart_blockers [url]` | IMPURE | `curl -s --max-time 5` against `http://localhost:<_healthz_port>/v0/restart-blockers` (after a guarded `.env` source, inside its command-substitution subshell, so a `FISHHAWKD_ADDR` override applies); returns **2** when the request fails (refused / timeout / empty reply / curl absent), **4** with the status printed on a non-200 |
-| `_refuse_on_restart_blockers <force 0\|1> [url]` | the CONTROL | see the modes below |
+| `_refuse_on_restart_blockers <force 0\|1> [url] [context]` | the CONTROL | see the modes below; `context` is `reload` or `post-merge` (the default, strict) |
+| `_reload_wait_until_quiet <interval> <timeout> [url]` | the `--when-quiet` wait | see "`reload --when-quiet`" below |
 
-The query (`_fetch` + `_parse`) and the refusal are separate on purpose: #4077's
-relaxed `reload --when-quiet` reuses the query without the refusal.
+The query (`_fetch` + `_parse`) and the refusal are separate on purpose: the
+relaxed `reload --when-quiet` (#4077) reuses the query without the refusal.
+
+### Context: `reload` vs `post-merge` (#4077)
+
+`cmd_post_merge` passes `post-merge` and refuses on every blocker, because its
+`git pull` is what strands an undispatched child. `cmd_reload` passes `reload`
+and IGNORES `undispatched_child` records (silently: a child-only answer is a
+clean answer for reload). Every other reason refuses in both contexts. Since
+`post-merge` ends with `cmd_reload`, its second check after the pull is the
+reload-context one — the child hazard was already decided before the pull.
 
 ### Modes
 
 | Condition | Result |
 |---|---|
 | no blocker | SILENT, proceed |
-| `undispatched_child` / `review_in_flight` | refusal naming each run + reason and what `--force` breaks, exit 1 |
+| `review_in_flight` (both contexts); `undispatched_child` (`post-merge` only) | refusal naming each run + reason and what `--force` breaks, exit 1 |
+| only `undispatched_child`, `reload` context | SILENT, proceed |
 | **`check_failed`** — a per-run stage/audit read error from a REACHABLE daemon | **REFUSES** like any blocker, naming the run and saying the daemon could not decide its state; `--force` overrides. Fail-CLOSED on purpose: an unreachable daemon has nothing in flight to orphan, but a reachable one that cannot decide must not risk orphaning work |
 | an item the parser cannot read (`unreadable`) | REFUSES — the daemon said something blocks |
 | any blocker + `--force` | the same inventory as a `warning:`, proceed |
@@ -1832,6 +1852,34 @@ the already-loaded old `scripts/dev`.
 - **TOCTOU.** A blocker that appears between the check and the teardown is not
   caught — the same class as #2897. `post-merge`'s second check inside
   `cmd_reload` runs AFTER the pull, so a refusal there leaves main pulled.
+  `--when-quiet` narrows the window (the guards re-check right after the wait)
+  but does not close it.
+
+### `reload --when-quiet` (#4077)
+
+`scripts/dev reload --when-quiet` waits until a restart would orphan nothing,
+then reloads. Each poll (`_reload_quiet_check`) runs `_scan_live_runs` and the
+reload-context blocker query (`_fetch_restart_blockers` +
+`_parse_restart_blockers`, `undispatched_child` ignored) and prints one
+`reload --when-quiet: waiting on: <what> (<waited>s of <timeout>s)` line per
+live poll; a quiet first poll prints nothing.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `FISHHAWK_RELOAD_QUIET_INTERVAL` | `15` | seconds between polls (the last sleep is clipped to the remaining budget) |
+| `FISHHAWK_RELOAD_QUIET_TIMEOUT` | `3600` | seconds of waiting before giving up |
+
+- **Quiet** → falls through to the normal live-run and restart-blocker guards
+  (a cheap re-check), then the teardown.
+- **Timeout** → `error: reload --when-quiet gave up after <N>s … still live:
+  <what>`, exit 1, no teardown.
+- **Degrades count as quiet**: `ps` or curl unavailable, daemon unreachable, a
+  non-200 (404 = old daemon), a malformed body. The guards that run next print
+  their own one-line degrade reasons.
+- **Usage errors, exit 2, BEFORE any check or teardown**: `--when-quiet` with
+  `--force` (one waits for the guards, the other overrides them), or a knob
+  that is not a positive integer. Without `--when-quiet` the knobs are not read.
+- The one sleep goes through `_reload_quiet_sleep`, which the tests stub.
 
 ### Tests
 
@@ -1840,14 +1888,25 @@ the already-loaded old `scripts/dev`.
 (REPO_ROOT at an empty temp dir, `FISHHAWKD_ADDR` at a free port, teardown legs
 stubbed to marker files, the #2897 `_scan_live_runs` stubbed clean so a live
 runner on the host cannot refuse first). They skip with a printed reason when
-`nc`, `lsof` or `curl` is absent. RB-a/b/n/h refuse (child, review, check_failed,
-unreadable) with the marker absent; RB-c/n `--force` proceeds; RB-d/f/g/j fail
-open (unreachable, 404, malformed, curl absent); RB-e is silent; RB-i warns on
-`truncated`; RB-l pins post-merge's refusal ahead of git/cleanup/reload. RB-k
+`nc`, `lsof` or `curl` is absent. RB-a refuses POST-MERGE on an undispatched
+child before git (#4077); RB-b/n/h refuse reload (review, check_failed,
+unreadable) with the marker absent; RB-o pins the reload context — a child-only
+answer proceeds silently, a child next to a review round refuses on the review
+round alone; RB-c/n `--force` proceeds; RB-d/f/g/j fail open (unreachable, 404,
+malformed, curl absent); RB-e is silent; RB-i warns on `truncated`; RB-l pins
+post-merge's refusal ahead of git/cleanup/reload. RB-k
 parses `testdata/wire/restart_blockers.json` — the SAME golden the backend's
 `TestRestartBlockers_EndToEnd_Golden` pins byte-for-byte — plus a table of
 indented / reordered / malformed bodies. RB-m body-greps the call sites, their
-order, and `--max-time 5` (pinned by grep only). The existing LR and GC
+order, each call site's context argument, the `--when-quiet` wait's position
+ahead of both guards, and `--max-time 5` (pinned by grep only). The WQ cases
+drive the real `cmd_reload --when-quiet` with `_scan_live_runs` /
+`_fetch_restart_blockers` stubbed through per-call counter files and
+`_reload_quiet_sleep` recording instead of sleeping: WQ-a waits through 3 live
+polls then tears down, WQ-b waits on `review_in_flight` but never on a child
+alone, WQ-c times out (exit 1, the clipped last sleep), WQ-d treats degrades as
+quiet, WQ-e/f are the exit-2 usage errors with no scan and no teardown, and
+WQ-g shows a plain reload never reads the knobs. The existing LR and GC
 harnesses stub `_refuse_on_restart_blockers` so they never query the host
 daemon.
 
