@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,6 +27,11 @@ import (
 type rbFixture struct {
 	runs  *attnRunRepo
 	audit *auditFake
+	// redispatchWired wires what redispatchEligibility needs for an ADVISORY
+	// round to be genuinely eligible (approval condition C3): a reviewer
+	// backend, an ArtifactRepo and a trace store. wireRedispatch also seeds
+	// the awaiting_approval plan stage row the plan-round check reads.
+	redispatchWired bool
 }
 
 func newRBFixture() *rbFixture {
@@ -33,8 +39,30 @@ func newRBFixture() *rbFixture {
 }
 
 func (f *rbFixture) config() Config {
-	return Config{Addr: "127.0.0.1:0", RunRepo: f.runs, AuditRepo: f.audit, ProcessStart: bootMarker}
+	cfg := Config{Addr: "127.0.0.1:0", RunRepo: f.runs, AuditRepo: f.audit, ProcessStart: bootMarker}
+	if f.redispatchWired {
+		cfg.PlanReviewers = singleReviewerSet{&fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}}
+		cfg.ArtifactRepo = newFakeArtifactRepo()
+		cfg.TraceStore = newRedispatchTraceStore()
+	}
+	return cfg
 }
+
+// wireRedispatch makes an advisory round on runID ELIGIBLE for boot
+// re-dispatch: it wires the reviewer/artifact/trace backends and seeds the
+// round's stage (rbRoundStage) as an awaiting_approval plan stage that
+// GetStage resolves.
+func (f *rbFixture) wireRedispatch(runID uuid.UUID) {
+	f.redispatchWired = true
+	f.runs.mu.Lock()
+	defer f.runs.mu.Unlock()
+	f.runs.stagesByRun[runID] = append(f.runs.stagesByRun[runID], &run.Stage{
+		ID: rbRoundStage, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval,
+	})
+}
+
+// rbRoundStage is the stage every seeded review round is recorded against.
+var rbRoundStage = attnID(900)
 
 func (f *rbFixture) server() *Server { return New(f.config()) }
 
@@ -47,11 +75,58 @@ func (f *rbFixture) seedChild(childID, parentID, stageID uuid.UUID, state run.St
 	f.runs.addStage(childID, stageID, run.StageTypeImplement, state, created)
 }
 
-// seedReviewRound seeds one *_review_started entry for a running run.
+// seedReviewRound seeds one GATING *_review_started entry for a running run.
+// A gating round is never re-dispatched on boot (redispatchEligibility), so a
+// current-process unsettled one is a blocker whatever the fixture wires —
+// the in-flight tests below do not depend on the reviewer wiring (#4077).
 func (f *rbFixture) seedReviewRound(t *testing.T, runID uuid.UUID, kind string, seq int64, ts time.Time, configured int) {
 	t.Helper()
-	seedReviewAuditEntry(t, f.audit, runID, attnID(900), seq, ts, kind+"_review_started",
-		planreview.ReviewStartedPayload{ConfiguredAgents: configured, Authority: planreview.AuthorityAdvisory})
+	f.seedStarted(t, runID, kind, seq, ts, planreview.ReviewStartedPayload{ConfiguredAgents: configured, Authority: planreview.AuthorityGating})
+}
+
+// seedStarted seeds one *_review_started entry with an explicit payload.
+func (f *rbFixture) seedStarted(t *testing.T, runID uuid.UUID, kind string, seq int64, ts time.Time, payload planreview.ReviewStartedPayload) {
+	t.Helper()
+	seedReviewAuditEntry(t, f.audit, runID, rbRoundStage, seq, ts, kind+"_review_started", payload)
+}
+
+// rbAdvisoryStarted is an advisory round redispatchEligibility accepts once
+// wireRedispatch has run: an implement round carries a trace round source.
+func rbAdvisoryStarted(kind string, depth int) planreview.ReviewStartedPayload {
+	p := planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityAdvisory, RedispatchDepth: depth}
+	if kind == "implement" {
+		p.RoundOrigin = reviewRoundOriginTrace
+		p.HeadSHA = "abc123"
+	}
+	return p
+}
+
+// rbStageKind resolves a "plan" / "implement" label to its reconcile kind.
+func rbStageKind(t *testing.T, kind string) orphanedReviewStageKind {
+	t.Helper()
+	for _, st := range orphanedReviewStages {
+		if st.label == kind {
+			return st
+		}
+	}
+	t.Fatalf("no orphaned review stage kind %q", kind)
+	return orphanedReviewStageKind{}
+}
+
+// assertRoundEligible is the C3 fixture precondition: the seeded round must be
+// genuinely ELIGIBLE under redispatchEligibility, or a "not a blocker" result
+// could come from some other branch.
+func assertRoundEligible(t *testing.T, s *Server, runID uuid.UUID, kind string, want bool) {
+	t.Helper()
+	stage := rbStageKind(t, kind)
+	latest, payload, found, err := s.latestReviewStarted(context.Background(), runID, stage)
+	if err != nil || !found {
+		t.Fatalf("fixture: latest %s round: found=%v err=%v", kind, found, err)
+	}
+	ok, slug, err := s.redispatchEligibility(context.Background(), runID, stage, latest, payload)
+	if err != nil || ok != want {
+		t.Fatalf("fixture precondition: redispatchEligibility(%s) = (%v, %q, %v), want eligible=%v", kind, ok, slug, err, want)
+	}
 }
 
 func getRestartBlockers(t *testing.T, s *Server, id Identity) *httptest.ResponseRecorder {
@@ -126,8 +201,9 @@ func TestRestartBlockers_NonChildPendingImplement_NotBlocker(t *testing.T) {
 	}
 }
 
-// TestRestartBlockers_ReviewInFlight: a round dispatched by THIS process with
-// fewer verdicts than configured reviewers is a blocker, for both stages.
+// TestRestartBlockers_ReviewInFlight: a GATING round dispatched by THIS
+// process with fewer verdicts than configured reviewers is a blocker, for both
+// stages — the next boot would not re-dispatch it.
 func TestRestartBlockers_ReviewInFlight(t *testing.T) {
 	for _, kind := range []string{"plan", "implement"} {
 		t.Run(kind, func(t *testing.T) {
@@ -150,6 +226,107 @@ func TestRestartBlockers_ReviewInFlight(t *testing.T) {
 	}
 }
 
+// TestRestartBlockers_AdvisoryRound: an advisory current-process round the
+// next boot sweep WOULD re-dispatch is not a blocker; the same round with no
+// reviewer backend wired is. Counterfactual C10: dropping the
+// redispatchEligibility call reports the eligible arm. The fixture is
+// asserted ELIGIBLE first (approval condition C3), so the eligible arm cannot
+// pass through another branch.
+func TestRestartBlockers_AdvisoryRound(t *testing.T) {
+	for _, kind := range []string{"plan", "implement"} {
+		t.Run(kind+"/eligible_not_blocker", func(t *testing.T) {
+			f := newRBFixture()
+			f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+			f.wireRedispatch(attnID(1))
+			f.seedStarted(t, attnID(1), kind, 1, afterBoot, rbAdvisoryStarted(kind, 0))
+			s := f.server()
+			assertRoundEligible(t, s, attnID(1), kind, true)
+			got := decodeRestartBlockers(t, getRestartBlockers(t, s, anonymous()))
+			if len(got.Items) != 0 {
+				t.Fatalf("items = %+v, want none: the next boot re-dispatches an eligible advisory round", got.Items)
+			}
+		})
+		t.Run(kind+"/reviewer_unwired_blocker", func(t *testing.T) {
+			f := newRBFixture()
+			f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+			f.seedStarted(t, attnID(1), kind, 1, afterBoot, rbAdvisoryStarted(kind, 0))
+			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+			if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerReviewInFlight || got.Items[0].Stage != kind {
+				t.Fatalf("items = %+v, want one %s review_in_flight (no reviewer to re-dispatch to)", got.Items, kind)
+			}
+		})
+	}
+}
+
+// TestRestartBlockers_IneligibleWiredRoundIsBlocker: on the fully wired
+// (otherwise eligible) fixture, a round the boot sweep would close failed is a
+// blocker — a GATING round, and an advisory round at the re-dispatch depth cap.
+// Counterfactual: a permissive authority or depth branch in
+// redispatchEligibility drops the item.
+func TestRestartBlockers_IneligibleWiredRoundIsBlocker(t *testing.T) {
+	cases := map[string]planreview.ReviewStartedPayload{
+		"gating":    {ConfiguredAgents: 2, Authority: planreview.AuthorityGating},
+		"depth_cap": rbAdvisoryStarted("plan", maxReviewRoundRedispatches),
+		"under_cap": rbAdvisoryStarted("plan", maxReviewRoundRedispatches-1),
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRBFixture()
+			f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+			f.wireRedispatch(attnID(1))
+			f.seedStarted(t, attnID(1), "plan", 1, afterBoot, payload)
+			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+			if name == "under_cap" {
+				// The control arm: one level below the cap is still re-dispatched.
+				if len(got.Items) != 0 {
+					t.Fatalf("items = %+v, want none one level under the depth cap", got.Items)
+				}
+				return
+			}
+			if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerReviewInFlight || got.Items[0].Stage != "plan" {
+				t.Fatalf("items = %+v, want one plan review_in_flight", got.Items)
+			}
+			if *got.Items[0].ConfiguredAgents != 2 || *got.Items[0].Landed != 0 {
+				t.Errorf("counts = %d/%d, want 2/0", *got.Items[0].ConfiguredAgents, *got.Items[0].Landed)
+			}
+		})
+	}
+}
+
+// TestRestartBlockers_PendingRedispatchIsBlocker: an orphaned round this
+// process's boot sweep handed to a re-dispatch goroutine is a blocker even
+// though it predates the boot marker and is otherwise eligible — a restart
+// kills the goroutine, and the next boot closes the round failed
+// (already_redispatched). Counterfactual C9: deleting the pending check, or
+// moving it after the boot-marker skip, drops the item. The unmarked arm is
+// the control: the same round with no pending entry blocks nothing.
+func TestRestartBlockers_PendingRedispatchIsBlocker(t *testing.T) {
+	runID := attnID(4077)
+	for _, pending := range []bool{true, false} {
+		t.Run(map[bool]string{true: "pending", false: "not_pending"}[pending], func(t *testing.T) {
+			f := newRBFixture()
+			f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "")
+			f.wireRedispatch(runID)
+			f.seedStarted(t, runID, "plan", 7, beforeBoot, rbAdvisoryStarted("plan", 0))
+			if pending {
+				key := pendingRedispatchKey{runID: runID, stage: "plan", seq: 7}
+				markRedispatchPending(key)
+				t.Cleanup(func() { clearRedispatchPending(key) })
+			}
+			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+			if !pending {
+				if len(got.Items) != 0 {
+					t.Fatalf("items = %+v, want none for a prior-process round with no pending re-dispatch", got.Items)
+				}
+				return
+			}
+			if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerReviewInFlight || got.Items[0].Stage != "plan" {
+				t.Fatalf("items = %+v, want one plan review_in_flight for the pending re-dispatch", got.Items)
+			}
+		})
+	}
+}
+
 // TestRestartBlockers_ReviewSettled_NotBlocker — counterfactual: mutating the
 // landed comparison reports a settled round.
 func TestRestartBlockers_ReviewSettled_NotBlocker(t *testing.T) {
@@ -166,7 +343,8 @@ func TestRestartBlockers_ReviewSettled_NotBlocker(t *testing.T) {
 
 // TestRestartBlockers_PriorProcessOrphan_NotBlocker — counterfactual: deleting
 // the boot-marker condition reports a round an EARLIER process dispatched
-// (the next boot sweep closes it; a restart loses nothing more).
+// (this process's boot sweep already re-dispatched or closed it; a restart
+// loses nothing more).
 func TestRestartBlockers_PriorProcessOrphan_NotBlocker(t *testing.T) {
 	f := newRBFixture()
 	f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
@@ -267,6 +445,19 @@ func TestRestartBlockers_CheckFailed(t *testing.T) {
 		got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
 		if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerCheckFailed || got.Items[0].Stage != "implement" {
 			t.Fatalf("items = %+v, want one implement check_failed", got.Items)
+		}
+	})
+	t.Run("eligibility_read", func(t *testing.T) {
+		// Counterfactual: mapping the redispatchEligibility error to
+		// "eligible" (continue) drops the item.
+		f := newRBFixture()
+		f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+		f.wireRedispatch(attnID(1))
+		f.seedStarted(t, attnID(1), "plan", 1, afterBoot, rbAdvisoryStarted("plan", 0))
+		f.audit.listByCategoryErrCategory = categoryReviewRoundRedispatched
+		got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+		if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerCheckFailed || got.Items[0].Stage != "plan" {
+			t.Fatalf("items = %+v, want one plan check_failed", got.Items)
 		}
 	})
 	t.Run("audit_landed_read", func(t *testing.T) {
@@ -394,7 +585,9 @@ func TestRestartBlockers_EndToEnd_Golden(t *testing.T) {
 	f := newRBFixture()
 	// undispatched_child
 	f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStateAwaitingHostDispatch, attnT0)
-	// review_in_flight (plan)
+	// review_in_flight (plan): a GATING round, which no boot re-dispatches
+	// (#4077), so the item survives the narrowed predicate and the golden
+	// stays byte-identical.
 	f.runs.seed(attnID(4), "acme/app", run.StatePending, attnT0.Add(time.Minute), "")
 	f.seedReviewRound(t, attnID(4), "plan", 1, afterBoot, 2)
 	// check_failed (child stage read)
