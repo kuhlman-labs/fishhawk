@@ -166,8 +166,12 @@ func resolveHead(ctx context.Context, repoDir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// verifySeedAncestry is the #1866 seed-ancestry guard: before a FRESH lineage
-// worktree is seeded from the operator checkout, it verifies headRev — the
+// verifySeedAncestry is the #1866 seed-ancestry guard. Since #3973 it runs
+// only on resolveLineageSeed's operator-HEAD FALLBACK (a logged
+// lineage_seed_fallback reason or the FISHHAWK_LINEAGE_SEED_FROM_HEAD=1
+// opt-in): a seed that is the fetched declared-base tip needs no ancestry
+// proof. Before a FRESH lineage worktree is seeded from the operator
+// checkout, it verifies headRev — the
 // PINNED commit the caller will seed the worktree from — is an ancestor of (or
 // equal to) the declared base's remote-tracking ref refs/remotes/origin/<base>.
 // On PROVEN divergence it returns a *baseDivergenceError (mapped by the caller
@@ -312,18 +316,140 @@ func worktreeAdminGit(ctx context.Context, repoDir string, logSink io.Writer, ar
 	return out, err
 }
 
+// lineageSeedFromHeadEnvVar is the runner-env opt-in (#3973) that restores the
+// pre-#3973 seed: a FRESH lineage worktree is seeded from the operator
+// checkout's HEAD (still behind verifySeedAncestry) instead of from the fetched
+// tip of the declared base. It is the ONLY way to seed a run from unpushed
+// local commits while the declared base is fetchable; the value must be
+// exactly "1".
+const lineageSeedFromHeadEnvVar = "FISHHAWK_LINEAGE_SEED_FROM_HEAD"
+
+// Lineage seed sources, logged as `source` on lineage_worktree_seeded.
+const (
+	lineageSeedSourceDeclaredBase = "declared_base"
+	lineageSeedSourceOperatorHead = "operator_head"
+)
+
+// lineageSeedGetenv is the environment reader provisionLineageWorktree hands
+// resolveLineageSeed. It is a package-level var — the injected-getenv shape
+// orphansweep uses for FISHHAWK_ORPHAN_SWEEP — so a test drives the opt-in
+// without t.Setenv (which would forbid t.Parallel in the caller).
+var lineageSeedGetenv = os.Getenv
+
+// resolveLineageSeed picks the commit a FRESH lineage worktree is seeded from
+// (#3973). By default that is the freshly fetched tip of the run's DECLARED
+// base ref — main for a top-level run, the consolidated or wave base for a
+// decomposition child — NOT the HEAD of the shared, mutable operator checkout.
+// So the #1866 contamination class (a leftover unmerged commit, or a newer
+// pulled main that is not an ancestor of a child's consolidated base, on the
+// operator HEAD) is closed whenever the declared base is fetchable, and the
+// lineage_seed_fallback line names the hosts where it is not.
+//
+// The steps, in order; the first that applies selects the operator-HEAD
+// fallback with the named reason:
+//
+//	FISHHAWK_LINEAGE_SEED_FROM_HEAD == "1" → operator_opt_in
+//	empty baseRef                          → base_ref_absent (nothing declared)
+//	!remoteConfigured                      → remote_unconfigured (#1302 not wired)
+//	remoteHasBranch error                  → base_query_failed (offline host)
+//	remoteHasBranch false                  → base_ref_absent (never-pushed base)
+//	fetchDiffBaseTip error, or a tip that  → fetch_failed
+//	  is not a local commit (verifySeedCommit)
+//
+// Otherwise the seed is the fetched tip (source declared_base). The query and
+// fetch use AMBIENT auth (token "" — the #1951 degrade contract): there is no
+// token mint at provision time, and an auth failure lands on fetch_failed or
+// base_query_failed, i.e. today's HEAD seed, never a hard failure. The fetch
+// writes refs/remotes/origin/<base> in the shared repo but never moves the
+// operator's HEAD or working tree.
+//
+// The fallback is the pre-#3973 path exactly: resolveHead ONCE (the pinned SHA
+// closes the #1866 check-then-add TOCTOU), then verifySeedAncestry, whose
+// *baseDivergenceError still maps to working_dir_diverged_from_base. The
+// ancestry guard runs on the fallback ONLY — a seed that IS the base tip needs
+// no ancestry proof. One lineage_seed_fallback {reason, base_ref} line is
+// logged before the HEAD resolution, so a refusal also names why HEAD was used.
+func resolveLineageSeed(ctx context.Context, repoDir, baseRef string, getenv func(string) string, logSink io.Writer) (seedSHA, source string, err error) {
+	reason, detail := "", ""
+	switch {
+	case strings.TrimSpace(getenv(lineageSeedFromHeadEnvVar)) == "1":
+		reason = "operator_opt_in"
+	case baseRef == "":
+		reason = "base_ref_absent"
+	case !remoteConfigured(ctx, repoDir, gitops.DefaultRemote):
+		reason = "remote_unconfigured"
+	default:
+		exists, qErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef, "")
+		switch {
+		case qErr != nil:
+			reason, detail = "base_query_failed", qErr.Error()
+		case !exists:
+			reason = "base_ref_absent"
+		default:
+			tip, fErr := fetchDiffBaseTip(ctx, repoDir, gitops.DefaultRemote, baseRef, "")
+			tip = strings.TrimSpace(tip)
+			if fErr == nil {
+				fErr = verifySeedCommit(ctx, repoDir, tip)
+			}
+			if fErr != nil {
+				reason, detail = "fetch_failed", fErr.Error()
+				break
+			}
+			return tip, lineageSeedSourceDeclaredBase, nil
+		}
+	}
+
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"lineage_seed_fallback","reason":%q,"base_ref":%q,"detail":%q}`+"\n", reason, baseRef, detail)
+
+	// Resolve HEAD to a concrete commit ONCE and pin it: the same immutable
+	// SHA is both checked by the seed-ancestry guard and handed to `git
+	// worktree add`. Because the operator checkout is mutable, resolving the
+	// symbolic "HEAD" twice (once in the guard, once at `worktree add`) would
+	// open a TOCTOU window — HEAD could advance to a local-only commit in
+	// between and seed the fresh worktree from the diverged commit the guard is
+	// meant to prevent (#1866 concurrency). Pinning closes that window.
+	headSHA, err := resolveHead(ctx, repoDir)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve HEAD: %w", err)
+	}
+	// #1866 seed-ancestry guard — on the operator-HEAD fallback only.
+	if err := verifySeedAncestry(ctx, repoDir, headSHA, baseRef, logSink); err != nil {
+		return "", "", err
+	}
+	return headSHA, lineageSeedSourceOperatorHead, nil
+}
+
+// verifySeedCommit proves a fetched base tip names a commit object present in
+// repoDir before it is handed to `git worktree add`. A fetch that reported
+// success but left no usable commit (an empty tip, or a SHA whose object is not
+// local) is a failed fetch: resolveLineageSeed maps it to the fetch_failed
+// fallback instead of failing the provision with an unresolvable seed.
+func verifySeedCommit(ctx context.Context, repoDir, tip string) error {
+	if tip == "" {
+		return errors.New("fetch returned an empty base tip")
+	}
+	if err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"rev-parse", "--verify", "--quiet", tip+"^{commit}").Run(); err != nil {
+		return fmt.Errorf("fetched base tip %s is not a commit in the local object store: %w", tip, gitErr(err))
+	}
+	return nil
+}
+
 // provisionLineageWorktree returns the absolute path to the lineage's
 // worktree, creating it on first use and reusing it for every subsequent
 // run that keys on the same root (decomposed-child sharing). The worktree
-// is a detached checkout of HEAD at <worktrees-dir>/run-<root>; downstream
-// git ops re-derive their repo dir from cfg.workingDir, so relocating that
-// one field into the returned path isolates the whole stage.
+// is a detached checkout at <worktrees-dir>/run-<root>; downstream git ops
+// re-derive their repo dir from cfg.workingDir, so relocating that one field
+// into the returned path isolates the whole stage.
 //
-// baseRef is the declared PR base branch; on a FRESH provision (not the reuse
-// path) verifySeedAncestry refuses to seed from an operator HEAD that has
-// diverged from origin/<baseRef> (#1866). The reuse path is exempt: a
+// baseRef is the declared PR base branch. A FRESH provision (not the reuse
+// path) is seeded by resolveLineageSeed: the fetched tip of origin/<baseRef>
+// by default, the operator HEAD behind verifySeedAncestry (#1866) only on a
+// logged lineage_seed_fallback (#3973). The reuse path is exempt: a
 // mid-lineage worktree's HEAD is legitimately the run branch, and its seed was
-// validated at first provision.
+// chosen at first provision. Plan and implement stages share this call site,
+// so both get the declared-base seed.
 func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string, logSink io.Writer) (string, error) {
 	if repoDir == "" {
 		repoDir = "."
@@ -347,42 +473,37 @@ func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string
 		return target, nil
 	}
 
-	// Resolve HEAD to a concrete commit ONCE and pin it: the same immutable
-	// SHA is both checked by the seed-ancestry guard and handed to `git
-	// worktree add` below. Because the operator checkout is mutable, resolving
-	// the symbolic "HEAD" twice (once in the guard, once at `worktree add`)
-	// would open a TOCTOU window — HEAD could advance to a local-only commit
-	// in between and seed the fresh worktree from the diverged commit the guard
-	// is meant to prevent (#1866 concurrency). Pinning closes that window.
-	headSHA, err := resolveHead(ctx, repoDir)
+	// Pick the seed — FRESH provisions only (the reuse return above exempts
+	// mid-lineage stages and already-seeded siblings). The #1866 refusal is
+	// returned unwrapped so its runner_failed detail stays byte-identical.
+	seedSHA, source, err := resolveLineageSeed(ctx, repoDir, baseRef, lineageSeedGetenv, logSink)
 	if err != nil {
-		return "", fmt.Errorf("provisionLineageWorktree: resolve HEAD: %w", err)
-	}
-
-	// #1866 seed-ancestry guard — FRESH provisions only (the reuse return
-	// above exempts mid-lineage stages and already-seeded siblings). A fresh
-	// worktree is seeded from the pinned HEAD SHA, so a diverged operator HEAD
-	// would contaminate the agent's tree and the review diff.
-	if err := verifySeedAncestry(ctx, repoDir, headSHA, baseRef, logSink); err != nil {
-		return "", err
+		var bde *baseDivergenceError
+		if errors.As(err, &bde) {
+			return "", err
+		}
+		return "", fmt.Errorf("provisionLineageWorktree: %w", err)
 	}
 
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
 		return "", fmt.Errorf("provisionLineageWorktree: mkdir worktrees dir: %w", err)
 	}
-	// `git worktree add --detach <path> <pinned-sha>` — the same pattern the
-	// verify gate uses (main.go runVerifyCommittedTree), but seeded from the
-	// pinned SHA rather than the symbolic HEAD so it agrees with the guard
-	// above. --detach avoids claiming a branch; the run's own branch/commit
-	// work happens via the downstream FreshFetchBase / checkoutChildBase /
-	// commit sequences in the worktree.
+	// `git worktree add --detach <path> <seed-sha>` — the same pattern the
+	// verify gate uses (main.go runVerifyCommittedTree), seeded from the
+	// concrete SHA resolveLineageSeed chose (the fetched base tip, or the pinned
+	// operator HEAD the ancestry guard checked). --detach avoids claiming a
+	// branch; the run's own branch/commit work happens via the downstream
+	// FreshFetchBase / checkoutChildBase / commit sequences in the worktree.
 	if out, err := worktreeAdminGit(ctx, repoDir, logSink,
-		"worktree", "add", "--detach", target, headSHA); err != nil {
+		"worktree", "add", "--detach", target, seedSHA); err != nil {
 		return "", fmt.Errorf("provisionLineageWorktree: worktree add: %v: %s",
 			err, strings.TrimSpace(string(out)))
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"lineage_worktree_created","root":%q,"path":%q}`+"\n", root, target)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"lineage_worktree_seeded","root":%q,"base_ref":%q,"seed_sha":%q,"source":%q}`+"\n",
+		root, baseRef, seedSHA, source)
 	return target, nil
 }
 
