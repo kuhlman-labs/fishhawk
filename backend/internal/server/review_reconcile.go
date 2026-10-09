@@ -58,6 +58,11 @@ type reconciledStage struct {
 	Synthesized      int    `json:"synthesized"`
 	Skipped          bool   `json:"skipped"`
 	SkipReason       string `json:"skip_reason,omitempty"`
+	// Redispatched is set when the BOOT sweep handed the orphaned round to a
+	// re-dispatch (#4077) instead of synthesizing its failure. Never set by the
+	// terminate-only on-demand verb, and kept off the wire (json:"-") so that
+	// endpoint's response shape is unchanged.
+	Redispatched bool `json:"-"`
 }
 
 // orphanedReviewStageKind describes one review-bearing stage's audit
@@ -100,7 +105,9 @@ var orphanedReviewStages = []orphanedReviewStageKind{
 const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no terminal review entry from the prior process"
 
 // ReconcileOrphanedReviews is the one-shot startup recovery for the review
-// twin of #727 (#1781): when fishhawkd restarts while an in-process plan or
+// twin of #727 (#1781), which since #4077 RE-DISPATCHES an eligible orphaned
+// round instead of failing it (see "Boot re-dispatch" below): when fishhawkd
+// restarts while an in-process plan or
 // implement review is in flight, the detached reviewing goroutine dies with
 // the process, so no terminal audit entry (*_reviewed / *_review_skipped /
 // *_review_failed) ever lands. review_status is computed on demand from the
@@ -121,6 +128,17 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // twin (detached runner dying pre-report → terminal failed) and reuses the
 // existing terminal writers.
 //
+// Boot re-dispatch (E72.59 / #4077). That synthesize-failed closure is now the
+// FALLBACK. The sweep runs in boot mode (reconcileRunOrphanedReviewsForBoot):
+// an orphaned round that redispatchEligibility accepts (advisory, reviewer
+// wired, under the depth cap, not already re-dispatched, not superseded, its
+// input source wired) is handed to redispatchOrphanedRound, which audits
+// review_round_redispatched and re-runs the round against the same plan
+// artifact or reviewed head in a bgReviews goroutine. Every other orphaned
+// round is synthesized failed with a reason naming the slug that refused it.
+// The on-demand POST /v0/runs/{run_id}/reviews/reconcile stays
+// terminate-only.
+//
 // Attempt correlation (the binding condition): a stage can accumulate several
 // review rounds (a fixup re-triggers the review, appending a fresh
 // *_review_started). The CURRENT attempt is the latest *_review_started for
@@ -133,7 +151,8 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // Best-effort PER RUN: a per-run error is logged and skipped so a single
 // unresolvable run never wedges the boot sweep. Only a systemic ListRuns
 // paging failure aborts (and is returned). Returns the count of runs whose
-// reviews were terminated.
+// reviews were terminated (synthesized failed); re-dispatched rounds are
+// logged, not counted.
 func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 	if s.cfg.RunRepo == nil {
 		return 0, fmt.Errorf("server: reconcile orphaned reviews: RunRepo is nil")
@@ -143,6 +162,7 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 	}
 
 	terminated := 0
+	redispatched := 0
 	failed := 0
 	// healed de-duplicates the run count across the state filters. A run
 	// cannot appear under two state filters in one pass, so this is defensive
@@ -166,7 +186,7 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 				break
 			}
 			for _, r := range runs {
-				stages, err := s.reconcileRunOrphanedReviews(ctx, r.ID)
+				stages, err := s.reconcileRunOrphanedReviewsForBoot(ctx, r.ID)
 				if err != nil {
 					failed++
 					s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: skipped run on error",
@@ -174,6 +194,15 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 						slog.String("error", err.Error()),
 					)
 					continue
+				}
+				for _, st := range stages {
+					if st.Redispatched {
+						redispatched++
+						s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: re-dispatched orphaned review round",
+							slog.String("run_id", r.ID.String()),
+							slog.String("stage", st.Stage),
+						)
+					}
 				}
 				if _, seen := healed[r.ID]; !seen && reconcileSynthesizedAny(stages) {
 					healed[r.ID] = struct{}{}
@@ -193,6 +222,7 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: orphaned-review reconciliation complete",
 		slog.Int("terminated", terminated),
+		slog.Int("redispatched", redispatched),
 		slog.Int("failed", failed),
 	)
 	return terminated, nil
@@ -249,8 +279,25 @@ func reconcileEmitLockFor(runID uuid.UUID) *sync.Mutex {
 // conditional write (an advisory lock or a uniqueness constraint on the
 // synthesized row); this closes the realistic single-daemon race, which is the
 // one an operator can actually trigger by double-clicking the verb.
+//
+// This is the TERMINATE-ONLY path the on-demand verb calls (approval condition
+// C1 of #4077): it never re-dispatches. The boot sweep calls
+// reconcileRunOrphanedReviewsForBoot.
 func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
-	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLocked(ctx, runID)
+	return s.reconcileRunOrphanedReviewsMode(ctx, runID, false)
+}
+
+// reconcileRunOrphanedReviewsForBoot is the boot-mode sibling of
+// reconcileRunOrphanedReviews (#4077): identical, except that an orphaned round
+// redispatchEligibility accepts is re-dispatched instead of failed.
+func (s *Server) reconcileRunOrphanedReviewsForBoot(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
+	return s.reconcileRunOrphanedReviewsMode(ctx, runID, true)
+}
+
+// reconcileRunOrphanedReviewsMode is the shared body; allowRedispatch is true
+// only on the boot sweep's path.
+func (s *Server) reconcileRunOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, allowRedispatch bool) ([]reconciledStage, error) {
+	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, allowRedispatch)
 	if err != nil {
 		return out, err
 	}
@@ -274,7 +321,15 @@ func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUI
 // whether the implement stage synthesized anything so the caller can republish
 // fishhawk_audit_complete OUTSIDE the lock — that republish is a read + publish
 // which is idempotent on its own and must not extend the critical section.
+//
+// Terminate-only, like reconcileRunOrphanedReviews (C1 of #4077).
 func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uuid.UUID) ([]reconciledStage, bool, error) {
+	return s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, false)
+}
+
+// reconcileRunOrphanedReviewsLockedMode is reconcileRunOrphanedReviewsLocked
+// with the boot-mode flag threaded to the stage-level reconcile.
+func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runID uuid.UUID, allowRedispatch bool) ([]reconciledStage, bool, error) {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -282,7 +337,7 @@ func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uu
 	out := make([]reconciledStage, 0, len(orphanedReviewStages))
 	emittedImplement := false
 	for _, stage := range orphanedReviewStages {
-		res, err := s.reconcileStageOrphanedReviews(ctx, runID, stage)
+		res, err := s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, allowRedispatch)
 		if err != nil {
 			return out, emittedImplement, err
 		}
@@ -305,7 +360,20 @@ func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uu
 // MUST be called under the run's reconcileEmitLockFor stripe lock: the
 // count-landed -> append-missing sequence below is not atomic on its own (see
 // reconcileRunOrphanedReviews).
+//
+// Terminate-only (C1 of #4077); the boot sweep reaches
+// reconcileStageOrphanedReviewsMode with allowRedispatch=true.
 func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (reconciledStage, error) {
+	return s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, false)
+}
+
+// reconcileStageOrphanedReviewsMode is the stage-level body. With
+// allowRedispatch (boot mode only) an orphaned round redispatchEligibility
+// accepts is handed to redispatchOrphanedRound instead of synthesized, and an
+// ineligible one is synthesized with a reason naming the refusing slug.
+// Without it the behaviour is the #1781 synthesis, byte-identical reasons
+// included.
+func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, allowRedispatch bool) (reconciledStage, error) {
 	out := reconciledStage{Stage: stage.label}
 	skip := func(reason string) reconciledStage {
 		out.Skipped = true
@@ -352,6 +420,16 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 		return skip(reconcileSkipAlreadySettled), nil
 	}
 
+	// Pending boot re-dispatch (#4077): the orphaned round is mid-handoff to a
+	// re-dispatch goroutine in THIS process — it is still the latest round and
+	// still predates the boot marker until the new round's started entry
+	// lands. Report it exactly like a current-process round (the existing skip
+	// reason, so the on-demand verb's skip_reason enum is unchanged) rather
+	// than fail it under the re-dispatch.
+	if reviewRedispatchPending(runID, stage.label, latest.Sequence) {
+		return skip(reconcileSkipInFlight), nil
+	}
+
 	// Boot-marker gate: a review whose latest started entry is NOT before the
 	// current process boot is still legitimately in-flight in THIS process —
 	// never fail it. At startup processStart == now, so every prior-process
@@ -368,9 +446,31 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	// condition 2): the dead goroutine's model/authority-per-reviewer state is
 	// gone, but reviewStatusFor / await_review treat *_review_failed as a
 	// terminal failed entry regardless of model.
+	reason := orphanedReviewRestartReason
+	if allowRedispatch {
+		ok, slug, eerr := s.redispatchEligibility(ctx, runID, stage, latest, payload)
+		if eerr != nil {
+			// An undecidable round falls back to today's closure rather than
+			// staying pending until an operator notices.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: re-dispatch eligibility check failed — closing the round failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage", stage.label),
+				slog.String("error", eerr.Error()),
+			)
+			ok, slug = false, redispatchSlugEligibilityCheckFailed
+		}
+		if ok {
+			if s.redispatchOrphanedRound(ctx, runID, stage, latest, payload, landed) {
+				out.Redispatched = true
+				return out, nil
+			}
+			slug = redispatchSlugRedispatchAuditFailed
+		}
+		reason = orphanedReviewNotRedispatchedReason(slug)
+	}
 	missing := payload.ConfiguredAgents - landed
 	for i := 0; i < missing; i++ {
-		s.emitReviewFailed(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", orphanedReviewRestartReason, false)
+		s.emitReviewFailed(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", reason, false)
 	}
 	out.Synthesized = missing
 	return out, nil
