@@ -32,13 +32,13 @@ pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
 git branch --show-current; git status --short
 ```
 
-If the fishhawk MCP tools are available, also run `fishhawk_list_runs` and look for runs in a non-terminal state whose `working_dir` is this checkout. Each of these makes a pull or restart harmful:
+If the fishhawk MCP tools are available, also run `fishhawk_list_runs` and look for runs in a non-terminal state whose `working_dir` is this checkout. `post-merge` itself queries `GET /v0/restart-blockers` and refuses on what it reports (`scripts/README.md` § "Restart-blocker guard for reload / post-merge"). Each of these makes a pull or restart harmful:
 
 | Live state | What a pull / restart breaks |
 |---|---|
 | A runner mid-stage | Restarting fishhawkd can strand its stage in `running` (recoverable only via the REST `reap-failure` endpoint). `post-merge` refuses on its own; `--force` needs the user's explicit OK |
-| A decomposed parent with children not yet dispatched | Advancing `main` makes each later child fail `working_dir_diverged_from_base` |
-| An implement/plan review round in flight | `post-merge` orphans it, and there is no re-dispatch verb |
+| A decomposed parent with children not yet dispatched | Advancing `main` can break each later child's seed. `post-merge` refuses (`undispatched_child`). Known false positive: children of a CANCELLED or otherwise terminal parent are still reported (#4184, #4186). Confirm the parent is terminal before asking the user for `--force` |
+| A review round in flight that a restart would not re-dispatch | Advisory rounds are re-dispatched at boot (ADR-091). A gating-authority round, a capped round, or one whose inputs cannot be rebuilt is still terminated as failed. `post-merge` refuses on it (`review_in_flight`); `--force` needs the user's explicit OK |
 | The user is awaiting (`fishhawk_await_*`) on another run | The restart kills the await with `connection refused` |
 
 If any apply, report what's live and **hold**. Offer to do the safe parts now (delete stale local copies, prune branches) and pull later.
@@ -68,7 +68,7 @@ scripts/dev post-merge <issue-number-if-known> --start-deps
 ## 4. Confirm the new code is live
 
 - **fishhawkd:** `/healthz` `git_sha` equals `git rev-parse --short HEAD`.
-- **fishhawk-runner:** nothing to do; it is spawned fresh from `bin/` per stage.
+- **fishhawk-runner:** spawned fresh from `bin/` per stage, and `post-merge` rebuilds it (`reload` forces `--all`). When the merge changed runner stages (e.g. ADR-090's merge-candidate verify-only stage), confirm `bin/fishhawk-runner version` shows the new GitSHA. Never restart fishhawkd alone: a stale runner silently ignores new stage instructions.
 - **fishhawk-mcp:** relay the closing banner verbatim.
   - `auto-swap` / `schema_major_shim`: this is an expectation, not a confirmed swap. Confirm with `fishhawk_doctor` or a version-returning MCP call showing the new GitSHA. If it is stale, run `bin/fishhawk-mcp-shim --status`, then the user reconnects the MCP client.
   - `ACTION REQUIRED` / shim rebuilt: the user must reconnect their MCP client (`/mcp` in Claude Code).
