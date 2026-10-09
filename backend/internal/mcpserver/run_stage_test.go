@@ -4380,3 +4380,61 @@ func TestRunStage_OlderBackendNoForgeField_DefaultsGitHub(t *testing.T) {
 		t.Fatalf("argv missing --github-repo x/y: %v", *argv)
 	}
 }
+
+// TestRunStage_NextActions_AcceptanceHeldOnPartialIntegration is approval
+// condition C2: the SECOND nextActionsFor call site — the run_stage post-stage
+// snapshot — carries the same #4080 hold getRunStatus does. MECHANISM: a local
+// decomposed parent whose plan/implement/review settled and whose acceptance
+// stage is still awaiting a host dispatch after the stage call returns, so
+// classifyNextActions emits acceptance_pending with a fishhawk_dispatch_stage
+// stage=acceptance; its newest slices_integrated covers only one of two
+// succeeded children. Without the run_stage.go wiring the snapshot offers that
+// dispatch under state acceptance_pending.
+func TestRunStage_NextActions_AcceptanceHeldOnPartialIntegration(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID, acceptanceID := uuid.New(), uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "awaiting_host_dispatch")
+	fb.mu.Lock()
+	row := fb.getRunByID[runID]
+	row.RunnerKind = "local"
+	fb.getRunByID[runID] = row
+	fb.mu.Unlock()
+	a, b := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedChildWithSlice(fb, b, "succeeded", "succeeded", 1, nil)
+	seedPlanDecomposed(fb, runID, []string{a.String(), b.String()}, 0)
+	seedSlicesIntegrated(t, fb, runID, "fishhawk/run-x", []string{a.String()})
+
+	// Drive the already-SETTLED implement stage: the fake host-dispatch marker
+	// leaves a succeeded stage untouched, so the post-stage snapshot still sees
+	// the acceptance stage awaiting its host dispatch (driving the acceptance
+	// stage itself would flip it to dispatched and classify the poll arm).
+	fb.mu.Lock()
+	implID := fb.stagesByRun[runID][1].ID
+	fb.mu.Unlock()
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    implID,
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage(implement): %v", err)
+	}
+	if out.NextActions == nil {
+		t.Fatal("NextActions is nil; want the post-stage snapshot block")
+	}
+	if out.NextActions.State != acceptanceHeldIntegrationIncompleteState {
+		t.Fatalf("next_actions.state = %q, want %s through the run_stage post-stage snapshot", out.NextActions.State, acceptanceHeldIntegrationIncompleteState)
+	}
+	if offersAcceptanceDispatch(out.NextActions) {
+		t.Errorf("post-stage next_actions still offers an acceptance dispatch: %+v", out.NextActions.Actions)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_await_children") || out.NextActions.Actions[0].Action != "fishhawk_await_children" {
+		t.Errorf("first action = %+v, want fishhawk_await_children", out.NextActions.Actions)
+	}
+}

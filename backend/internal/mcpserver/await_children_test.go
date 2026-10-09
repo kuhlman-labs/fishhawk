@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -182,8 +183,13 @@ func TestAwaitChildren_SucceededButNotCoveredDoesNotRelease(t *testing.T) {
 	}
 }
 
-// --- release condition (3): children_settled ---
+// --- release condition (4): children_failed / integration_pending / children_settled ---
 
+// TestAwaitChildren_AllTerminalReleasesSettled: a succeeded + failed fan-out is
+// terminal but NOT settled (#4080) — it releases children_failed naming the
+// failed child, with next_step get_run_status on it. Before #4080 this released
+// children_settled and pointed at fishhawk_consolidate_slices, which cannot
+// integrate a failed slice.
 func TestAwaitChildren_AllTerminalReleasesSettled(t *testing.T) {
 	fb, r := newAwaitResolver(t)
 	parent, a, b := uuid.New(), uuid.New(), uuid.New()
@@ -195,11 +201,17 @@ func TestAwaitChildren_AllTerminalReleasesSettled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("awaitChildren: %v", err)
 	}
-	if out.Status != "children_settled" {
-		t.Fatalf("status = %q, want children_settled", out.Status)
+	if out.Status != "children_failed" {
+		t.Fatalf("status = %q, want children_failed", out.Status)
 	}
-	if out.NextStep == nil || out.NextStep.Action != "fishhawk_consolidate_slices" {
-		t.Errorf("next_step = %+v, want fishhawk_consolidate_slices", out.NextStep)
+	if len(out.FailedChildRunIDs) != 1 || out.FailedChildRunIDs[0] != b.String() {
+		t.Errorf("failed_child_run_ids = %v, want [%s]", out.FailedChildRunIDs, b)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != b.String() {
+		t.Errorf("next_step = %+v, want fishhawk_get_run_status on the failed child %s", out.NextStep, b)
+	}
+	if !strings.Contains(out.Message, b.String()) {
+		t.Errorf("message %q does not name the failed child", out.Message)
 	}
 }
 
@@ -524,6 +536,11 @@ func TestAwaitChildren_MultiPageFanInWalkKeepsLastPage(t *testing.T) {
 func TestAwaitChildren_FanInHistoryExceedsPageCapFailsLoud(t *testing.T) {
 	fb, r := newAwaitResolver(t)
 	parent := uuid.New()
+	// A real decomposed parent: fanInChildrenStatus probes plan_decomposed FIRST
+	// (approval condition C1) and only then walks the fan-in categories. The
+	// plan_decomposed probe is a single read, so the never-ending cursor below
+	// reaches only the fan-in walk this test pins.
+	seedPlanDecomposed(fb, parent, []string{uuid.NewString()}, 0)
 	fb.mu.Lock()
 	fb.perRunAuditNeverEndByRun[parent] = true // advancing cursor that never terminates
 	fb.mu.Unlock()
@@ -551,6 +568,8 @@ func TestAwaitChildren_FanInHistoryExceedsPageCapFailsLoud(t *testing.T) {
 func TestAwaitChildren_FanInCursorNonProgressingFailsLoud(t *testing.T) {
 	fb, r := newAwaitResolver(t)
 	parent := uuid.New()
+	// See the cap-exhaustion test: plan_decomposed is probed first (C1).
+	seedPlanDecomposed(fb, parent, []string{uuid.NewString()}, 0)
 	fb.mu.Lock()
 	// A FIXED (non-advancing) next cursor on every page — the back-compat literal
 	// branch returns it verbatim, so the walk sees next == the cursor it just sent.
@@ -606,5 +625,354 @@ func TestAwaitChildrenDispatchableIsPure(t *testing.T) {
 	cs.IntegratedChildRunIDs = nil
 	if got := awaitChildrenDispatchable(cs); len(got) != 0 {
 		t.Errorf("dispatchable with NO integration = %v, want none", got)
+	}
+}
+
+// --- #4080: coverage-aware releases ---
+
+// seedParentImplementStage seeds the decomposed parent's implement stage at
+// state, so the integration_pending arm can read whether the parent is still
+// awaiting_children (approval condition C4) and the C3 arm whether it already
+// succeeded.
+func seedParentImplementStage(fb *fakeBackend, parent uuid.UUID, state string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.stagesByRun[parent] = []Stage{
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 2, Type: "implement", State: state},
+	}
+}
+
+// seedFanInEntry appends a fan-in audit entry of category to the parent. The
+// payload is a DECODER struct (sliceHeadMissingPayload, …) marshalled through
+// encoding/json, so its keys come from the decoder's own json tags — which the
+// payload-key-tie tests separately bind to the real emitters on disk. No test
+// hand-writes a key that could agree with a wrong decoder.
+func seedFanInEntry(t *testing.T, fb *fakeBackend, parent uuid.UUID, category string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("re-decode %s payload: %v", category, err)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	seq := int64(len(fb.perRunAuditByRun[parent]) + 1)
+	fb.perRunAuditByRun[parent] = append(fb.perRunAuditByRun[parent], AuditEntry{
+		ID:       uuid.NewString(),
+		Sequence: seq,
+		RunID:    parent.String(),
+		Category: category,
+		Payload:  m,
+	})
+}
+
+// seedFourSucceeded seeds a decomposed parent with four SUCCEEDED, terminal
+// children at slices 0..3.
+func seedFourSucceeded(fb *fakeBackend, parent uuid.UUID) []uuid.UUID {
+	kids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
+	ids := make([]string, len(kids))
+	for i, k := range kids {
+		seedChildWithSlice(fb, k, "succeeded", "succeeded", i, nil)
+		ids[i] = k.String()
+	}
+	seedPlanDecomposed(fb, parent, ids, 0)
+	return kids
+}
+
+// TestAwaitChildren_FourSucceededThreeIntegrated_IntegrationPendingNotSettled is
+// the DONE-MEANS test (#4080). All four children are succeeded and terminal, so
+// the pre-change awaitChildrenAllSettled arm WOULD release children_settled; the
+// newest slices_integrated names only three. The verb must release
+// integration_pending naming the fourth, with next_step consolidate (the parent
+// is still awaiting_children, C4), and only release children_settled once an
+// entry covering all four lands.
+func TestAwaitChildren_FourSucceededThreeIntegrated_IntegrationPendingNotSettled(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	kids := seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "awaiting_children")
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", []string{kids[0].String(), kids[1].String(), kids[2].String()})
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "integration_pending" {
+		t.Fatalf("status = %q, want integration_pending — 3 of 4 slices integrated must NOT read as settled", out.Status)
+	}
+	if len(out.UnintegratedChildRunIDs) != 1 || out.UnintegratedChildRunIDs[0] != kids[3].String() {
+		t.Errorf("unintegrated_child_run_ids = %v, want [%s]", out.UnintegratedChildRunIDs, kids[3])
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_consolidate_slices" || out.NextStep.Params["run_id"] != parent.String() {
+		t.Errorf("next_step = %+v, want fishhawk_consolidate_slices on the parent", out.NextStep)
+	}
+	if !strings.Contains(out.Message, kids[3].String()) || !strings.Contains(out.Message, "Acceptance and review must wait") {
+		t.Errorf("message %q must name the uncovered child and hold acceptance/review", out.Message)
+	}
+	if out.Children == nil || out.Children.IntegrationPhase != integrationPhaseReadyToIntegrate {
+		t.Errorf("children.integration_phase = %+v, want ready_to_integrate", out.Children)
+	}
+
+	// A covering entry lands: the SAME absolute predicate now releases settled.
+	all := []string{kids[0].String(), kids[1].String(), kids[2].String(), kids[3].String()}
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", all)
+	_, out2, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren (covered): %v", err)
+	}
+	if out2.Status != "children_settled" {
+		t.Fatalf("status after full coverage = %q, want children_settled", out2.Status)
+	}
+	if out2.NextStep == nil || out2.NextStep.Action != "fishhawk_consolidate_slices" {
+		t.Errorf("settled next_step = %+v, want fishhawk_consolidate_slices", out2.NextStep)
+	}
+}
+
+// TestAwaitChildren_IntegrationPending_ParentAdvanced (approval condition C4):
+// once the parent's implement stage has LEFT awaiting_children,
+// fishhawk_consolidate_slices answers 409 not_awaiting_children, so
+// integration_pending must not point there. next_step reads the uncovered
+// child and the message names the real recovery (re-drive or resume it). An
+// UNREADABLE parent stage takes the same non-consolidate arm.
+func TestAwaitChildren_IntegrationPending_ParentAdvanced(t *testing.T) {
+	cases := []struct {
+		name        string
+		parentState string // "" = no parent stage seeded (unreadable)
+		wantInMsg   string
+	}{
+		{"parent implement succeeded", "succeeded", "implement stage is succeeded"},
+		{"parent implement failed", "failed", "implement stage is failed"},
+		{"parent stage unreadable", "", "implement stage is unreadable"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fb, r := newAwaitResolver(t)
+			parent := uuid.New()
+			kids := seedFourSucceeded(fb, parent)
+			if c.parentState != "" {
+				seedParentImplementStage(fb, parent, c.parentState)
+			}
+			seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", []string{kids[0].String(), kids[1].String(), kids[2].String()})
+
+			_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+			if err != nil {
+				t.Fatalf("awaitChildren: %v", err)
+			}
+			if out.Status != "integration_pending" {
+				t.Fatalf("status = %q, want integration_pending", out.Status)
+			}
+			if out.NextStep == nil || out.NextStep.Action == "fishhawk_consolidate_slices" {
+				t.Fatalf("next_step = %+v — must NOT be fishhawk_consolidate_slices for an advanced parent (409 not_awaiting_children)", out.NextStep)
+			}
+			if out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != kids[3].String() {
+				t.Errorf("next_step = %+v, want fishhawk_get_run_status on the uncovered child %s", out.NextStep, kids[3])
+			}
+			for _, want := range []string{"re-drive or resume the uncovered child", "409 not_awaiting_children", c.wantInMsg, kids[3].String()} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message %q missing %q", out.Message, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAwaitChildren_NoIntegrationAuthority_FallsBackToSettled (approval
+// condition C3): on a deployment with no slice-integration authority the
+// server writes NO fan-in record and advances the parent anyway. Requiring
+// coverage there would wedge the parent forever, so — exactly where the server
+// gate stands down — the verb falls back to the pre-#4080 settled release. The
+// negative arm pins that the fallback needs the parent's implement stage to
+// have SUCCEEDED: with the parent still awaiting_children the same no-record
+// snapshot is integration_pending (the fan-in simply has not run yet).
+func TestAwaitChildren_NoIntegrationAuthority_FallsBackToSettled(t *testing.T) {
+	t.Run("no record + parent implement succeeded -> settled", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q, want children_settled (no integration authority — nothing to require)", out.Status)
+		}
+		if !strings.Contains(out.Message, "no slice-integration authority") {
+			t.Errorf("message %q must say the deployment has no slice-integration authority", out.Message)
+		}
+	})
+	t.Run("no record + parent still awaiting_children -> integration_pending", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "awaiting_children")
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" {
+			t.Fatalf("status = %q, want integration_pending", out.Status)
+		}
+		if len(out.UnintegratedChildRunIDs) != 4 {
+			t.Errorf("unintegrated_child_run_ids = %v, want all four", out.UnintegratedChildRunIDs)
+		}
+	})
+	t.Run("PARTIAL record + parent implement succeeded -> integration_pending", func(t *testing.T) {
+		// A record exists, so integration authority demonstrably exists: the
+		// fallback must not fire on an advanced parent with partial coverage.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		kids := seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", []string{kids[0].String()})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" {
+			t.Fatalf("status = %q, want integration_pending", out.Status)
+		}
+	})
+}
+
+// TestAwaitChildren_IntegrationFailed_PerCause pins one release per fan-in
+// failure cause (#4080). MECHANISM: every child is succeeded, so without the
+// failure arm the snapshot would release integration_pending — a different
+// status this test catches. Each asserts the cause, the failing child, and
+// next_step fishhawk_list_audit category=<cause>.
+func TestAwaitChildren_IntegrationFailed_PerCause(t *testing.T) {
+	type tc struct {
+		name      string
+		category  string
+		payload   func(kids []uuid.UUID) any
+		wantChild func(kids []uuid.UUID) string
+		wantInMsg []string
+	}
+	cases := []tc{
+		{
+			name:     "slice_head_missing names the child, slice and detail",
+			category: auditCategorySliceHeadMissing,
+			payload: func(kids []uuid.UUID) any {
+				return sliceHeadMissingPayload{ChildRunID: kids[2].String(), SliceIndex: intPtr(2), Branch: "fishhawk/run-p/slice-2", Detail: "ref not found"}
+			},
+			wantChild: func(kids []uuid.UUID) string { return kids[2].String() },
+			wantInMsg: []string{"slice 2", "ref not found", "fishhawk/run-p/slice-2", "push the missing slice branch"},
+		},
+		{
+			name:     "slice_integration_conflict names the conflicting child",
+			category: auditCategorySliceIntegrationConflict,
+			payload: func(kids []uuid.UUID) any {
+				return sliceIntegrationConflictPayload{ConflictingChildRunID: kids[1].String(), ConflictingSliceIndex: intPtr(1)}
+			},
+			wantChild: func(kids []uuid.UUID) string { return kids[1].String() },
+			wantInMsg: []string{"slice 1", "merge conflict", "re-drive the conflicting child"},
+		},
+		{
+			name:     "slice_integration_failed names the cause",
+			category: auditCategorySliceIntegrationFailed,
+			payload: func([]uuid.UUID) any {
+				return sliceIntegrationFailedPayload{Attempts: 5, Error: "github 502"}
+			},
+			wantChild: func([]uuid.UUID) string { return "" },
+			wantInMsg: []string{"after 5 attempts: github 502", "category-B"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fb, r := newAwaitResolver(t)
+			parent := uuid.New()
+			kids := seedFourSucceeded(fb, parent)
+			seedParentImplementStage(fb, parent, "awaiting_children")
+			seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", []string{kids[0].String()})
+			seedFanInEntry(t, fb, parent, c.category, c.payload(kids))
+
+			_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+			if err != nil {
+				t.Fatalf("awaitChildren: %v", err)
+			}
+			if out.Status != "integration_failed" {
+				t.Fatalf("status = %q, want integration_failed", out.Status)
+			}
+			if out.IntegrationFailure == nil || out.IntegrationFailure.Cause != c.category {
+				t.Fatalf("integration_failure = %+v, want cause %s", out.IntegrationFailure, c.category)
+			}
+			if got, want := out.IntegrationFailure.ChildRunID, c.wantChild(kids); got != want {
+				t.Errorf("integration_failure.child_run_id = %q, want %q", got, want)
+			}
+			if out.NextStep == nil || out.NextStep.Action != "fishhawk_list_audit" ||
+				out.NextStep.Params["category"] != c.category || out.NextStep.Params["run_id"] != parent.String() {
+				t.Errorf("next_step = %+v, want fishhawk_list_audit {run_id: parent, category: %s}", out.NextStep, c.category)
+			}
+			if !strings.Contains(out.Message, "Do NOT dispatch acceptance or approve the review") {
+				t.Errorf("message %q must forbid acceptance/review", out.Message)
+			}
+			for _, want := range append(c.wantInMsg, c.wantChild(kids)) {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message %q missing %q", out.Message, want)
+				}
+			}
+			if out.Children == nil || out.Children.IntegrationFailure == nil {
+				t.Errorf("children block lacks integration_failure: %+v", out.Children)
+			}
+		})
+	}
+}
+
+// TestAwaitChildren_IntegrationFailedReleasedMidFanOut: a between-wave
+// slice_head_missing blocks the dependent wave indefinitely, so the failure
+// releases even while a sibling is still running. Without the arm nothing
+// releases (a running child is neither dispatchable nor terminal) and the
+// short timeout returns 'timeout'.
+func TestAwaitChildren_IntegrationFailedReleasedMidFanOut(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedChildWithSlice(fb, b, "running", "running", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	seedFanInEntry(t, fb, parent, auditCategorySliceHeadMissing,
+		sliceHeadMissingPayload{ChildRunID: a.String(), SliceIndex: intPtr(0), Branch: "fishhawk/run-p/slice-0", Detail: "absent"})
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "integration_failed" {
+		t.Fatalf("status = %q, want integration_failed released mid-fan-out", out.Status)
+	}
+	if out.IntegrationFailure == nil || out.IntegrationFailure.ChildRunID != a.String() {
+		t.Errorf("integration_failure = %+v, want child %s", out.IntegrationFailure, a)
+	}
+}
+
+// TestAwaitChildren_CleanIntegrationNewerThanHeadMissingSettles pins the
+// ordering: a full clean integration NEWER than a head-missing supersedes it.
+func TestAwaitChildren_CleanIntegrationNewerThanHeadMissingSettles(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	kids := seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "awaiting_children")
+	seedFanInEntry(t, fb, parent, auditCategorySliceHeadMissing,
+		sliceHeadMissingPayload{ChildRunID: kids[3].String(), SliceIndex: intPtr(3), Branch: "b", Detail: "absent"})
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x",
+		[]string{kids[0].String(), kids[1].String(), kids[2].String(), kids[3].String()})
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_settled" {
+		t.Fatalf("status = %q, want children_settled (the newer clean integration supersedes the head-missing)", out.Status)
+	}
+	if out.IntegrationFailure != nil {
+		t.Errorf("integration_failure = %+v, want nil once superseded", out.IntegrationFailure)
 	}
 }
