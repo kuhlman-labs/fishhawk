@@ -325,6 +325,10 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// next_actions can surface succeeded_merged. No review stage
 			// on this shape, so the entry carries no stage id.
 			s.writePostMergeObservedAudit(ctx, target.ID, nil, meta)
+			// Partial delivery (E83.52 / #4085): post the approved plan's
+			// remaining scope on the triggering issue. A no-op unless the plan
+			// declares delivery: partial. Best-effort; never unwinds the merge.
+			s.postPartialDeliveryRemainingScope(ctx, target, meta)
 			// Stamp the per-change economics into the PR body (#1702).
 			// Best-effort; never unwinds the merge resolution above.
 			s.stampEconomicsIntoPRBody(ctx, target)
@@ -421,6 +425,11 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// observation alongside the run_merged board move so next_actions
 		// can surface succeeded_merged. Carries the resolved review stage id.
 		s.writePostMergeObservedAudit(ctx, target.ID, stageID, meta)
+		// Partial delivery (E83.52 / #4085): post the approved plan's remaining
+		// scope on the triggering issue. A no-op unless the plan declares
+		// delivery: partial; never on the closed-without-merge arm below.
+		// Best-effort; never unwinds the merge.
+		s.postPartialDeliveryRemainingScope(ctx, target, meta)
 		// Stamp the per-change economics into the PR body (#1702).
 		// Best-effort; never unwinds the merge resolution above.
 		s.stampEconomicsIntoPRBody(ctx, target)

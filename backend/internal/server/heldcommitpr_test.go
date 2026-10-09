@@ -1,11 +1,17 @@
 package server
 
 import (
+	"encoding/json"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -25,6 +31,7 @@ func TestHeldCommitPRTitleBody_RecoveredVerbatim(t *testing.T) {
 		heldCommitIssueRun("[E67.5] a held-commit resume opens a placeholder PR", 2570),
 		"feat(server): carry agent PR text across a held-commit resume",
 		"## Summary\n\n- capture at park time\n\n## Test plan\n\n- [ ] run it",
+		false,
 	)
 	if title != "feat(server): carry agent PR text across a held-commit resume" {
 		t.Errorf("recovered title must be used verbatim, got %q", title)
@@ -41,7 +48,7 @@ func TestHeldCommitPRTitleBody_RecoveredVerbatim(t *testing.T) {
 // (every pre-#2570 park row) still yields a real, conventional, issue-closing PR.
 func TestHeldCommitPRTitleBody_IssueContextFallback(t *testing.T) {
 	t.Run("non-conventional issue title gets the chore prefix", func(t *testing.T) {
-		title, body := heldCommitPRTitleBody(heldCommitIssueRun("[E67.5] resume opens a placeholder PR", 2570), "", "")
+		title, body := heldCommitPRTitleBody(heldCommitIssueRun("[E67.5] resume opens a placeholder PR", 2570), "", "", false)
 		if title != "chore: [E67.5] resume opens a placeholder PR" {
 			t.Errorf("title = %q, want the chore-prefixed issue title", title)
 		}
@@ -57,14 +64,14 @@ func TestHeldCommitPRTitleBody_IssueContextFallback(t *testing.T) {
 	})
 
 	t.Run("already-conventional issue title is used verbatim", func(t *testing.T) {
-		title, _ := heldCommitPRTitleBody(heldCommitIssueRun("fix(runner): stop dropping the PR text", 2570), "", "")
+		title, _ := heldCommitPRTitleBody(heldCommitIssueRun("fix(runner): stop dropping the PR text", 2570), "", "", false)
 		if title != "fix(runner): stop dropping the PR text" {
 			t.Errorf("title = %q, want the issue title verbatim (no double prefix)", title)
 		}
 	})
 
 	t.Run("number but no title", func(t *testing.T) {
-		title, body := heldCommitPRTitleBody(heldCommitIssueRun("", 2570), "", "")
+		title, body := heldCommitPRTitleBody(heldCommitIssueRun("", 2570), "", "", false)
 		if title != "" {
 			t.Errorf("with no issue title there is nothing to synthesize a title from, got %q", title)
 		}
@@ -85,7 +92,7 @@ func TestHeldCommitPRTitleBody_NoContextReturnsEmpty(t *testing.T) {
 		"empty context":     heldCommitIssueRun("", 0),
 	} {
 		t.Run(name, func(t *testing.T) {
-			title, body := heldCommitPRTitleBody(r, "", "")
+			title, body := heldCommitPRTitleBody(r, "", "", false)
 			if title != "" || body != "" {
 				t.Errorf("want both empty so the runner keeps its placeholder, got (%q, %q)", title, body)
 			}
@@ -99,7 +106,7 @@ func TestHeldCommitPRTitleBody_NoContextReturnsEmpty(t *testing.T) {
 func TestHeldCommitPRTitleBody_PartialRecovery(t *testing.T) {
 	t.Run("title only", func(t *testing.T) {
 		title, body := heldCommitPRTitleBody(heldCommitIssueRun("[E67.5] a placeholder PR", 2570),
-			"feat(server): recovered subject", "")
+			"feat(server): recovered subject", "", false)
 		if title != "feat(server): recovered subject" {
 			t.Errorf("a recovered title must survive an empty body, got %q", title)
 		}
@@ -110,7 +117,7 @@ func TestHeldCommitPRTitleBody_PartialRecovery(t *testing.T) {
 
 	t.Run("body only", func(t *testing.T) {
 		title, body := heldCommitPRTitleBody(heldCommitIssueRun("[E67.5] a placeholder PR", 2570),
-			"", "## Summary\n\n- recovered narrative")
+			"", "## Summary\n\n- recovered narrative", false)
 		if title != "chore: [E67.5] a placeholder PR" {
 			t.Errorf("the MISSING title must be synthesized, got %q", title)
 		}
@@ -120,7 +127,7 @@ func TestHeldCommitPRTitleBody_PartialRecovery(t *testing.T) {
 	})
 
 	t.Run("title only, no issue context", func(t *testing.T) {
-		title, body := heldCommitPRTitleBody(nil, "feat(server): recovered subject", "")
+		title, body := heldCommitPRTitleBody(nil, "feat(server): recovered subject", "", false)
 		if title != "feat(server): recovered subject" {
 			t.Errorf("title = %q, want the recovered one", title)
 		}
@@ -157,7 +164,7 @@ func TestHeldCommitPRTitleBody_ClosesNotDuplicated(t *testing.T) {
 	}
 	for name, body := range suppress {
 		t.Run("suppress/"+name, func(t *testing.T) {
-			_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 2570), "feat: x", body)
+			_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 2570), "feat: x", body, false)
 			if n := strings.Count(got, "#2570"); n != 1 {
 				t.Errorf("want exactly one reference to #2570, got %d:\n%s", n, got)
 			}
@@ -195,7 +202,7 @@ func TestHeldCommitPRTitleBody_ClosesNotDuplicated(t *testing.T) {
 	}
 	for name, body := range appendCases {
 		t.Run("append/"+name, func(t *testing.T) {
-			_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 2570), "feat: x", body)
+			_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 2570), "feat: x", body, false)
 			if !strings.HasSuffix(got, "\n\nCloses #2570") {
 				t.Errorf("this is not an ACTIVE closing directive, so one must be appended:\n%s", got)
 			}
@@ -209,7 +216,7 @@ func TestHasClosingReference_ZeroIssueNumber(t *testing.T) {
 	if hasClosingReference("Closes #0", 0) {
 		t.Error("issue number 0 is not a real issue")
 	}
-	_, body := heldCommitPRTitleBody(heldCommitIssueRun("t", 0), "feat: x", "## Summary\n\n- x")
+	_, body := heldCommitPRTitleBody(heldCommitIssueRun("t", 0), "feat: x", "## Summary\n\n- x", false)
 	if strings.Contains(body, "Closes #") {
 		t.Errorf("with no issue number there is nothing to close, got %q", body)
 	}
@@ -273,4 +280,154 @@ func TestConventionalCommitHeaderRe_MatchesOrchestratorSource(t *testing.T) {
 		t.Errorf("the conventional-commit-header pattern drifted between its two backend copies:\n"+
 			" server: %s\n orchestrator: %s", got, want)
 	}
+}
+
+// TestHeldCommitPRTitleBody_PartialUsesRefs pins the partial-delivery branch
+// (E83.52 / #4085): a partial plan's resumed PR references the issue with
+// `Refs #N` and never closes it — the recovered body's closing reference is
+// rewritten, a missing reference is appended as `Refs`, and code is untouched.
+func TestHeldCommitPRTitleBody_PartialUsesRefs(t *testing.T) {
+	for _, tc := range []struct {
+		name, recovered string
+		// wantSuffix is the body's required ending; "" skips the check.
+		wantSuffix   string
+		wantVerbatim bool
+	}{
+		{name: "recovered closing reference rewritten", recovered: "## Summary\n\n- x\n\nCloses #2570", wantSuffix: "\n\nRefs #2570"},
+		{name: "colon form rewritten", recovered: "## Summary\n\nFixes: #2570 partly.", wantSuffix: "Refs #2570 partly."},
+		{name: "no reference gets Refs appended", recovered: "## Summary\n\n- x", wantSuffix: "\n\nRefs #2570"},
+		{name: "synthesized body gets Refs", recovered: "", wantSuffix: "\n\nRefs #2570"},
+		{name: "existing Refs used verbatim", recovered: "## Summary\n\n- x\n\nRefs #2570", wantVerbatim: true},
+		{name: "Refs inside code still appended", recovered: "## Summary\n\nWrite `Refs #2570` at the end.", wantSuffix: "\n\nRefs #2570"},
+		{name: "fenced Closes kept, Refs appended", recovered: "## Summary\n\n```\nCloses #2570\n```", wantSuffix: "```\n\nRefs #2570"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 2570), "feat: x", tc.recovered, true)
+			if hasClosingReference(got, 2570) {
+				t.Errorf("a partial delivery's resumed body must not close #2570:\n%s", got)
+			}
+			if strings.Contains(got, "\n\nCloses #2570") {
+				t.Errorf("Closes appended to a partial delivery's body:\n%s", got)
+			}
+			if !hasRefsReference(got, 2570) {
+				t.Errorf("body must carry an active Refs #2570:\n%s", got)
+			}
+			if tc.wantVerbatim && got != tc.recovered {
+				t.Errorf("a body already referencing #2570 must be used verbatim:\n got: %q\nwant: %q", got, tc.recovered)
+			}
+			if tc.wantSuffix != "" && !strings.HasSuffix(got, tc.wantSuffix) {
+				t.Errorf("body = %q, want suffix %q", got, tc.wantSuffix)
+			}
+		})
+	}
+
+	t.Run("no issue number: nothing to reference", func(t *testing.T) {
+		_, got := heldCommitPRTitleBody(heldCommitIssueRun("t", 0), "feat: x", "## Summary\n\n- x", true)
+		if got != "## Summary\n\n- x" {
+			t.Errorf("with no issue number the body is unchanged, got %q", got)
+		}
+	})
+}
+
+// TestHasRefsReference covers the Refs detector's boundaries.
+func TestHasRefsReference(t *testing.T) {
+	for body, want := range map[string]bool{
+		"Refs #7":           true,
+		"refs  #7.":         true,
+		"Refs #70":          false,
+		"Refs #7foo":        false,
+		"`Refs #7`":         false,
+		"```\nRefs #7\n```": false,
+		"See #7":            false,
+	} {
+		if got := hasRefsReference(body, 7); got != want {
+			t.Errorf("hasRefsReference(%q, 7) = %v, want %v", body, got, want)
+		}
+	}
+	if hasRefsReference("Refs #0", 0) {
+		t.Error("issue number 0 is not a real issue")
+	}
+}
+
+// TestPromptHeldCommitPRText_PartialDeliveryServesRefs is the CROSS-BOUNDARY
+// half: the REAL /prompt and /prompt-render handlers resolve the run's approved
+// plan (a standard_v1 artifact declaring delivery: partial) through
+// partialDeliveryPlan and serve a resumed PR body that references the issue
+// with `Refs #2570` instead of closing it. Deleting either prompt.go call
+// site's partial lookup (passing false) serves `Closes #2570` and reddens this.
+func TestPromptHeldCommitPRText_PartialDeliveryServesRefs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		park    func() *run.ScopeCompletenessPark
+		entries func() []*audit.Entry
+	}{
+		{
+			name: "exempt park",
+			park: func() *run.ScopeCompletenessPark {
+				p := exemptPark()
+				p.PRTitle, p.PRBody = "feat: slice", "## Summary\n\n- slice\n\nCloses #2570"
+				return p
+			},
+			entries: func() []*audit.Entry { return exemptDecided(uuid.New()) },
+		},
+		{
+			name: "push checkpoint",
+			park: func() *run.ScopeCompletenessPark { return nil },
+			entries: func() []*audit.Entry {
+				return []*audit.Entry{scopeDecisionEntryPayload(uuid.New(), "pull_request_failed", 7, `{
+		"category":"C","reason":"open PR: 503",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+					`","base_sha":"`+checkpointBaseSHA+`","verified_tree_sha":"6666666666666666666666666666666666666666",`+
+					`"pr_title":"feat: slice","pr_body":"## Summary\n\n- slice\n\nCloses #2570"}}`)}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, delivery := range []string{plan.DeliveryPartial, plan.DeliveryFull} {
+				s, runID, stageID, priv := prTextFixture(t, tc.park(),
+					&run.IssueContext{Title: "[E83.52] partial", Number: 2570}, tc.entries())
+				seedHeldCommitPlan(t, s, runID, delivery)
+				keys := exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+				var body string
+				if raw, ok := keys["held_commit_pr_body"]; ok {
+					if err := json.Unmarshal(raw, &body); err != nil {
+						t.Fatal(err)
+					}
+				}
+				partial := delivery == plan.DeliveryPartial
+				if got := hasClosingReference(body, 2570); got == partial {
+					t.Errorf("delivery %s: body closes #2570 = %v, want %v:\n%s", delivery, got, !partial, body)
+				}
+				if got := hasRefsReference(body, 2570); got != partial {
+					t.Errorf("delivery %s: body Refs #2570 = %v, want %v:\n%s", delivery, got, partial, body)
+				}
+			}
+		})
+	}
+}
+
+// seedHeldCommitPlan gives prTextFixture's run a succeeded plan stage holding a
+// standard_v1 artifact with the given delivery, alongside its implement stage.
+func seedHeldCommitPlan(t *testing.T, s *Server, runID uuid.UUID, delivery string) {
+	t.Helper()
+	rr, ok := s.cfg.RunRepo.(*promptRunRepo)
+	if !ok {
+		t.Fatalf("RunRepo is %T, want *promptRunRepo", s.cfg.RunRepo)
+	}
+	p := plan.Plan{Summary: "Ship one slice.", Delivery: delivery}
+	if delivery == plan.DeliveryPartial {
+		p.RemainingScope = "the rest lands later"
+	}
+	content, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage, rr.stage}}
+	ar := newFakeArtifactRepo()
+	sv := "standard_v1"
+	ar.all = append(ar.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: content,
+	})
+	s.cfg.ArtifactRepo = ar
 }

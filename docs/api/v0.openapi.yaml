@@ -20304,14 +20304,21 @@ paths:
                       `held_commit_pr_title` — a recovered title is never
                       discarded because the body was empty, and vice versa.
                       Falls back to a synthesized body naming the triggering
-                      issue and stating that the agent did not re-run. A
-                      `Closes #<number>` line is appended unless the body
-                      already carries an ACTIVE closing reference to that
-                      issue (a closing keyword immediately preceding the exact
-                      `#<number>`, outside any code span or fenced code block),
-                      so merging a resumed PR still auto-closes the trigger
-                      issue. The body EXCLUDES the Fishhawk attribution
-                      footer — the opening runner appends it exactly once.
+                      issue and stating that the agent did not re-run. For a
+                      full delivery (the approved plan declares no `delivery`,
+                      or `delivery: full`) a `Closes #<number>` line is
+                      appended unless the body already carries an ACTIVE
+                      closing reference to that issue (a closing keyword
+                      immediately preceding the exact `#<number>`, outside any
+                      code span or fenced code block), so merging a resumed PR
+                      still auto-closes the trigger issue. For a partial
+                      delivery (`delivery: partial`, E83.52 / #4085) every
+                      active closing reference to the issue is rewritten to
+                      `Refs #<number>` and a `Refs #<number>` line is appended
+                      unless an active one is already present, so the merge
+                      does not close the issue. The body EXCLUDES the Fishhawk
+                      attribution footer — the opening runner appends it
+                      exactly once.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -20690,7 +20697,7 @@ paths:
                   held_commit_pr_body:
                     type: string
                     description: |
-                      The pull-request body the resumed runner opens with (#2570), resolved independently of `held_commit_pr_title` so a recovered title is not discarded because the body was empty. Falls back to a body naming the triggering issue and stating the agent did not re-run. A `Closes #<number>` line is appended unless the body already carries an ACTIVE closing reference to that issue (a closing keyword immediately preceding the exact `#<number>`, outside any code span or fenced code block). Excludes the Fishhawk attribution footer, which the opening runner appends exactly once.
+                      The pull-request body the resumed runner opens with (#2570), resolved independently of `held_commit_pr_title` so a recovered title is not discarded because the body was empty. Falls back to a body naming the triggering issue and stating the agent did not re-run. For a full delivery (the approved plan declares no `delivery`, or `delivery: full`) a `Closes #<number>` line is appended unless the body already carries an ACTIVE closing reference to that issue (a closing keyword immediately preceding the exact `#<number>`, outside any code span or fenced code block). For a partial delivery (`delivery: partial`, E83.52 / #4085) every active closing reference to the issue is rewritten to `Refs #<number>` and a `Refs #<number>` line is appended unless an active one is already present, so the merge does not close the issue. Excludes the Fishhawk attribution footer, which the opening runner appends exactly once.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

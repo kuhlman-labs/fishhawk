@@ -49,6 +49,17 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // ¹ appended only when the recovered body carries no CLOSING reference to this
 // issue already — see hasClosingReference.
 //
+// PARTIAL DELIVERY (E83.52 / #4085). When partial is true — the run's approved
+// plan declares `delivery: partial` (plan.(*Plan).IsPartialDelivery, resolved by
+// the caller through partialDeliveryPlan) — the resumed PR must NOT close the
+// issue, so `Closes #N` in the table above becomes `Refs #N`: the recovered or
+// synthesized body is first passed through neutralizeClosingReferences (every
+// active closing reference to the issue becomes `Refs #N`), and `Refs #N` is
+// appended unless the body already carries an active `Refs #N`. The ship-time
+// guard (neutralizePartialDeliveryClosingRef) still re-checks the live body when
+// the resumed runner ships the PR; this keeps the served text honest on its own.
+// partial=false is byte-identical to the pre-#4085 behavior.
+//
 // An empty return for either field is not a failure: the runner falls back to
 // its own placeholder half, i.e. exactly today's behavior. Recovered text is a
 // QUALITY input, never a safety precondition — nothing here can withhold a
@@ -58,7 +69,7 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // appends the Fishhawk attribution footer exactly once at open time, so the
 // footer is stamped with the branch and audit URL of the run that actually
 // opened the PR and can never be doubled.
-func heldCommitPRTitleBody(runRow *run.Run, recoveredTitle, recoveredBody string) (title, body string) {
+func heldCommitPRTitleBody(runRow *run.Run, recoveredTitle, recoveredBody string, partial bool) (title, body string) {
 	title = recoveredTitle
 	body = recoveredBody
 
@@ -98,6 +109,18 @@ func heldCommitPRTitleBody(runRow *run.Run, recoveredTitle, recoveredBody string
 		body = b.String()
 	}
 
+	if partial && issueNumber > 0 {
+		// A partial delivery references the issue without closing it: rewrite
+		// any active closing reference the recovered text carries, then append
+		// `Refs #N` unless an active one is already there (the rewrite itself
+		// produces one).
+		body, _ = neutralizeClosingReferences(body, issueNumber)
+		if !hasRefsReference(body, issueNumber) {
+			body += fmt.Sprintf("\n\nRefs #%d", issueNumber)
+		}
+		return title, body
+	}
+
 	// `Closes #N` is the issue's blocking requirement: merging the resumed PR
 	// must auto-close the trigger issue. Append it unless the body ALREADY
 	// carries a real closing reference to this exact issue.
@@ -105,6 +128,18 @@ func heldCommitPRTitleBody(runRow *run.Run, recoveredTitle, recoveredBody string
 		body += fmt.Sprintf("\n\nCloses #%d", issueNumber)
 	}
 	return title, body
+}
+
+// hasRefsReference reports whether body already carries an ACTIVE `Refs #n`
+// (case-insensitive, `#n` terminated by a real word boundary) outside any code
+// span or fenced block — the same code-context rules as hasClosingReference, so
+// a `Refs #n` quoted in code does not suppress the partial-delivery append.
+func hasRefsReference(body string, n int) bool {
+	if n <= 0 {
+		return false
+	}
+	re := regexp.MustCompile(`(?i)\brefs\s+#` + fmt.Sprint(n) + `\b`)
+	return re.MatchString(stripCodeContexts(body))
 }
 
 // issueContextOf reads the run's cached triggering-issue title + number,
