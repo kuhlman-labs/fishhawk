@@ -151,6 +151,43 @@ type Plan struct {
 	// DisallowUnknownFields. JSON tags mirror the new-architectural-decision $def
 	// in the schema.
 	NewArchitecturalDecision *NewArchitecturalDecision `json:"new_architectural_decision,omitempty"`
+	// Delivery is the plan's optional delivery declaration (E83.52 / #4085):
+	// DeliveryPartial declares that the approved plan deliberately delivers only
+	// a slice of the triggering issue, so the PR references the issue with
+	// `Refs #N` instead of `Closes #N` and Fishhawk posts RemainingScope on the
+	// issue at merge. Empty (absent) and DeliveryFull both mean a full delivery.
+	// Read it through IsPartialDelivery, never by comparing the string.
+	// Additive-optional within standard_v1; the field must exist on the struct
+	// because plan.Parse strict-decodes with DisallowUnknownFields.
+	Delivery string `json:"delivery,omitempty"`
+	// RemainingScope is the short statement of what the triggering issue still
+	// needs after a partial delivery (E83.52 / #4085). The schema's root if/then
+	// requires it when Delivery is DeliveryPartial; semanticCheck
+	// (checkDelivery) rejects a whitespace-only value and any value paired with
+	// an absent or full Delivery. Additive-optional within standard_v1.
+	RemainingScope string `json:"remaining_scope,omitempty"`
+}
+
+// Delivery values for Plan.Delivery (E83.52 / #4085). An absent delivery is a
+// full delivery.
+const (
+	DeliveryFull    = "full"
+	DeliveryPartial = "partial"
+)
+
+// IsPartialDelivery reports whether the plan declares a PARTIAL delivery of its
+// triggering issue (E83.52 / #4085). It is the ONE shared definition every
+// consumer reads (the PR-body producers, the ship-time closing-reference guard,
+// the merge-time remaining-scope comment, the plan-gate advisory and the issue
+// anchor), so they cannot disagree about which plans keep the issue open. A nil
+// receiver is not partial.
+//
+// It deliberately does NOT require a non-blank RemainingScope: consumers decode
+// the artifact with json.Unmarshal and skip semanticCheck, and reading a
+// malformed declaration as partial keeps the issue open, which is the safe
+// direction. Each consumer renders a blank RemainingScope on its own terms.
+func (p *Plan) IsPartialDelivery() bool {
+	return p != nil && p.Delivery == DeliveryPartial
 }
 
 // GateRuntimeMinutes returns the runtime estimate the implement-budget gate must

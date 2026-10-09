@@ -166,3 +166,31 @@ func TestValidate_NewArchitecturalDecision_MirrorSynced(t *testing.T) {
 		t.Errorf("SchemaError should name rationale, got %q", serr.Error())
 	}
 }
+
+// TestValidate_PartialDelivery_MirrorSynced pins that the runner's embedded
+// schema mirror carries delivery / remaining_scope and the root if/then
+// (E83.52 / #4085): a partial plan with remaining_scope is accepted, and a
+// partial plan without it is rejected with an error naming remaining_scope, so
+// the runner refuses it before the plan stage succeeds. An un-synced mirror
+// would reject the delivery key itself via the root additionalProperties:false,
+// so the error would name delivery, not remaining_scope.
+func TestValidate_PartialDelivery_MirrorSynced(t *testing.T) {
+	ok := planfixture.Valid(func(m map[string]any) {
+		m["delivery"] = "partial"
+		m["remaining_scope"] = "the merge-time issue comment lands in a later run"
+	})
+	if err := Validate(fixtureJSON(t, ok)); err != nil {
+		t.Fatalf("runner mirror should accept a partial delivery with remaining_scope, got %v", err)
+	}
+
+	bad := planfixture.Valid(func(m map[string]any) {
+		m["delivery"] = "partial"
+	})
+	var serr *SchemaError
+	if err := Validate(fixtureJSON(t, bad)); !errors.As(err, &serr) {
+		t.Fatalf("err = %v, want *SchemaError for a partial delivery missing remaining_scope", err)
+	}
+	if !strings.Contains(serr.Error(), "remaining_scope") {
+		t.Errorf("SchemaError should name remaining_scope, got %q", serr.Error())
+	}
+}
