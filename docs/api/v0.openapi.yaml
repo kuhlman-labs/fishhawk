@@ -20294,7 +20294,13 @@ paths:
             `held_commit_resume_kind: push`. A request WITHOUT it is served no
             held-commit fields for a push-kind checkpoint (never a downgraded
             `pr_open`), and the decline appends a `verified_tree_discarded`
-            audit row.
+            audit row. `merge-candidate-verify` (#4183) — this runner
+            implements the ADR-090 merge-candidate verify-only pass (the
+            `merge_candidate_verify_*` fields). A request WITHOUT it for an
+            implement stage carrying a LIVE merge-candidate trigger is REFUSED
+            `409 runner_capability_missing`: no prompt is built and the pass is
+            settled `not_executed`, so an older runner exits before spawning an
+            agent instead of running a plain implement pass.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -20829,6 +20835,7 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+                      - `runner_capability_missing` — the implement stage carries a live ADR-090 merge-candidate verify trigger and the request's `X-Fishhawk-Runner-Capabilities` does not carry `merge-candidate-verify` (#4183). Checked right after the signature, before the liveness flip and any prompt construction: no prompt is built, the pass is settled as `merge_candidate_verified{result: not_executed}` (FailStage C, then restore to the pre-pass gate), and the head stays re-triggerable. `error.details` carries `run_id`, `stage_id`, `required_capability`, `expected_head_sha` and `settled` (false when the settlement did not complete; if the row could not be appended, nothing was transitioned and the trigger stays live). Remedy: rebuild the runner, then re-trigger the pass with `fishhawk_rebase_run_branch`.
         '422':
           description: |
             Comms scan charter refused (E81.5 / #4014). A `plan` stage whose

@@ -1775,10 +1775,12 @@ const ReachabilityHeader = "X-Fishhawk-Plan-Reachability"
 // a resume shape an older runner would mishandle.
 //
 // It is a BUILD-TIME property, not a per-call option: FetchPrompt sets it on
-// every prompt fetch with no arg threading and no opt-in. An old runner simply
-// does not send it, and the backend then declines to serve a push-kind
-// checkpoint AT ALL (not a degraded pr_open, which would open a PR on a branch
-// that was never pushed).
+// every prompt fetch with no arg threading and no opt-in. An older binary that
+// omits a token is never served the shape that token gates: the backend
+// declines to serve a push-kind checkpoint AT ALL (not a degraded pr_open,
+// which would open a PR on a branch that was never pushed), and it REFUSES a
+// live merge-candidate verify pass (409 runner_capability_missing) rather than
+// serve it to a runner that would run a plain agent pass instead.
 //
 // WIRE VALUE: byte-identical to the backend's runnerCapabilitiesHeader
 // (backend/internal/server/prompt.go).
@@ -1793,8 +1795,18 @@ const RunnerCapabilitiesHeader = "X-Fishhawk-Runner-Capabilities"
 // which is the fail-safe direction.
 const CapabilityPushResume = "push-resume"
 
+// CapabilityMergeCandidateVerify is the RunnerCapabilitiesHeader token for the
+// ADR-090 merge-candidate verify-only pass (#4183): this runner understands
+// the merge_candidate_verify_* prompt fields and runs the declared verify
+// command instead of an agent. A runner that omits it is REFUSED a live pass.
+//
+// WIRE VALUE: byte-identical to the backend's capabilityMergeCandidateVerify
+// (backend/internal/server/prompt.go). A drift is fail-SAFE: every runner is
+// refused the pass and nothing runs an agent.
+const CapabilityMergeCandidateVerify = "merge-candidate-verify"
+
 // runnerCapabilities is the full static token list FetchPrompt advertises.
-var runnerCapabilities = []string{CapabilityPushResume}
+var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify}
 
 // RunnerCapabilitiesValue is the RunnerCapabilitiesHeader value this binary
 // sends. Exported so the backend-facing tests and the runner's own seam tests
