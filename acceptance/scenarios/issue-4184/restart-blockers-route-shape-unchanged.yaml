@@ -1,0 +1,14 @@
+id: scenario:issue-4184/restart-blockers-route-shape-unchanged
+statement: Anonymous GET /v0/restart-blockers on the preview still returns 200 with a JSON object carrying an items array, an integer scanned_runs and a boolean truncated, and every item reason is one of undispatched_child, review_in_flight or check_failed.
+verify_hint: 'HTTP: curl -s http://localhost:<preview-port>/v0/restart-blockers with no Authorization header; inspect status and top-level keys.'
+steps: 1) Sent GET http://localhost:8090/v0/restart-blockers with no Authorization header on the fresh preview. 2) POST /v0/dev/fixtures for plan-gate-parked, trace-upload-target, acceptance-dispatched and plan-gate-criteria, with GET /v0/restart-blockers after each one. 3) A final anonymous GET /v0/restart-blockers, captured with response headers.
+assertions:
+    expected: 200, JSON object with items array, integer scanned_runs, boolean truncated; item reasons limited to undispatched_child/review_in_flight/check_failed
+    observed_at_record: Every response was HTTP 200 with Content-Type application/json and the body {"items":[],"scanned_runs":N,"truncated":false}, where N is an integer that went 0,1,2,3,4. items is an array and truncated is a boolean. No item was emitted, so no reason value falls outside the allowed set.
+    repro_handle: curl -s -i http://localhost:8090/v0/restart-blockers
+origin:
+    issue: 4184
+    pr: 4189
+    run_id: ba9d93f8-52a6-4f2a-860a-f99d3a8069e2
+    head_sha: 7855406fd67d052644e6403c9e611f923d845a74
+    recorded_at: 2026-10-09T18:18:41Z
