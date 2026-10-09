@@ -5267,7 +5267,7 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed, pushed, fixup_pushed, fixup_no_changes, scope_park, conflict_resolution_pushed, acceptance_scenarios_pushed, acceptance_scenario_retirement_dropped]
+          enum: [failed, pushed, fixup_pushed, fixup_no_changes, scope_park, conflict_resolution_pushed, merge_candidate_verified, acceptance_scenarios_pushed, acceptance_scenario_retirement_dropped]
           description: |
             Present only on the non-success variants. `failed` (#742)
             reports a commit/push/PR-open failure (PR fields absent;
@@ -5347,6 +5347,49 @@ components:
             `acceptance_scenario_retirement_dropped` audit entry (idempotent
             per `stage_id` + `reason`), refreshes the status comment, 200, no
             transition.
+
+            `merge_candidate_verified` (ADR-090 D3 / E83.33 / #4018) reports
+            the result of a runner VERIFY-ONLY merge-candidate pass: the runner
+            fetched the run-branch tip, ran ONLY the declared verify command in
+            full form in the isolated committed-tree gate, and pushed NOTHING.
+            `branch` + `head_sha` (the verified tip) + `merge_candidate_result`
+            are required; there is no `base_sha` and no PR. Accepted ONLY on an
+            implement stage carrying a LIVE `stage_merge_candidate_verify_triggered`
+            entry (409 `merge_candidate_verify_not_live` otherwise). A
+            `passed`/`failed` result whose `head_sha` is not the trigger's
+            expected head is recorded as `not_executed` (head mismatch), so a
+            verdict never binds to a head the runner did not verify. It appends
+            ONE `merge_candidate_verified` audit entry (idempotent per stage +
+            trigger: a retried report appends nothing), returns the implement
+            stage to the gate it held before the pass, and — on `failed` only —
+            applies ADR-090 D6: one bounded fix-up is routed when the workflow
+            delegates fix-up routing, otherwise none (the response names
+            `fishhawk_fixup_stage`).
+        merge_candidate_result:
+          type: string
+          enum: [passed, failed, not_executed]
+          description: |
+            `merge_candidate_verified` only (ADR-090 D3): the pass result.
+            `not_executed` means the pass reached no verdict (the tip moved off
+            the expected head, no verify command, an infrastructure or
+            lock-contention disposition, a crashed runner); the head may be
+            re-triggered.
+        merge_candidate_reason:
+          type: string
+          description: |
+            `merge_candidate_verified` only: why the pass reached no verdict
+            (e.g. `head_moved`, `no_verify_command`), or a short note on a
+            verdict. Product-owned prose, not verify output.
+        merge_candidate_output_tail:
+          type: string
+          description: |
+            `merge_candidate_verified` only: the tail of the verify command's
+            output. UNTRUSTED — it is produced by the repository's own verify
+            command over the merge candidate, so it may carry attacker-
+            controlled text. The runner redacts and bounds it (4 KiB) before
+            shipping and the server re-bounds it; it is recorded on the audit
+            row with `output_untrusted: true`, is rendered only as framed data,
+            and is NEVER embedded in a routed fix-up concern (ADR-090 D6).
         scenario_ids:
           type: array
           items: { type: string }
@@ -5621,6 +5664,20 @@ components:
         outcome: { type: string, enum: [fixup_no_changes] }
         branch: { type: string }
 
+    PullRequestMergeCandidateResponse:
+      type: object
+      description: |
+        200 body for the `merge_candidate_verified` variant (ADR-090 D3 /
+        E83.33 / #4018).
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [merge_candidate_verified] }
+        branch: { type: string }
+        head_sha: { type: string, description: 'The head the result is bound to (the trigger''s expected head).' }
+        merge_candidate_result: { type: string, enum: [passed, failed, not_executed], description: 'The result IN FORCE for the trigger — on an idempotent replay, the one first recorded.' }
+        idempotent: { type: boolean, description: 'True when the result was already recorded for this trigger; nothing new was appended, settled or routed.' }
+        fixup_routed: { type: boolean, description: 'On a failed result: true when ONE bounded fix-up was routed because the workflow delegates fix-up routing (ADR-090 D6).' }
+        fixup_refusal: { type: string, description: 'On a failed result with no fix-up routed: why (not delegated, budget spent, unevaluable delegation), naming fishhawk_fixup_stage.' }
     PullRequestScopeParkResponse:
       type: object
       description: |
@@ -12697,6 +12754,21 @@ paths:
         head, which would pin the required check to exactly the stale sha this
         endpoint exists to move off. The warning names re-invocation.
 
+        **Merge-candidate verify pass (ADR-090 / E83.33 / #4018).** A base
+        merge produces a head no runner gated on the committed tree, so when
+        the workflow declares an `executor.verify` command a performed merge's
+        200 also authorizes a runner VERIFY-ONLY pass for the re-read new head
+        (cause `base_advance`): a `stage_merge_candidate_verify_triggered`
+        entry is recorded under the operator's identity and the implement
+        stage re-opens. The pass has its OWN per-head idempotency and never
+        reads or spends the fix-up budget. The already-up-to-date arm
+        re-triggers when the live head is an `unverified` Fishhawk-written head
+        (e.g. after a conflict-resolution push). A pass that cannot start never
+        fails the rebase: the refusal rides on the 200 as
+        `merge_candidate_verify_refusal`, and `POST /v0/runs/{run_id}/merge`
+        refuses the head `409 merge_candidate_unverified` until a `passed`
+        result is recorded for it.
+
         **Sibling endpoint.** `POST /v0/runs/{run_id}/reset-branch` is the
         right verb for a FOREIGN COMMIT pushed ON TOP of the run's commits — a
         different problem. Both refusals cross-link the other.
@@ -12775,6 +12847,45 @@ paths:
                       already-contains-base arm, which attributes nothing — so
                       the warning names fishhawk_vouch_commit as the required
                       step instead.
+                  merge_candidate_verify_state:
+                    type: string
+                    enum: [not_required, unverified, in_flight, passed, failed]
+                    description: |
+                      The live head's ADR-090 merge-candidate verify state after
+                      this call (E83.33 / #4018). `not_required` when the
+                      workflow declares no `executor.verify` command or the head
+                      is not one Fishhawk wrote. Omitted when no pass could be
+                      anchored (see `merge_candidate_verify_refusal`).
+                  merge_candidate_verify_triggered:
+                    type: boolean
+                    description: |
+                      True when THIS call appended a
+                      `stage_merge_candidate_verify_triggered` entry and
+                      re-opened the implement stage for a runner verify-only
+                      pass. A performed base merge triggers one for the re-read
+                      new head; the already-up-to-date arm re-triggers only for
+                      an `unverified` Fishhawk-written head.
+                  merge_candidate_verify_stage_id:
+                    type: string
+                    description: |
+                      The re-opened implement stage, set whenever a pass is live
+                      for the head. On a local runner dispatch it with
+                      `fishhawk_dispatch_stage` and await it with
+                      `fishhawk_await_stage`.
+                  merge_candidate_verify_note:
+                    type: string
+                    description: |
+                      Constant sentence for a live pass: what the verify-only
+                      pass does (fetch the run-branch tip, run ONLY the declared
+                      verify command in full form in the isolated gate, report
+                      the result — no commit, no push) and the next step.
+                  merge_candidate_verify_refusal:
+                    type: string
+                    description: |
+                      Why no pass could be started, or why the head's state
+                      could not be read. The rebase itself still answers 200;
+                      `POST /v0/runs/{run_id}/merge` then refuses
+                      `409 merge_candidate_unverified`.
         '202':
           description: |
             The base merge CONFLICTED and a bounded, agent-driven
@@ -13220,7 +13331,10 @@ paths:
         run has no PR url or is failed/cancelled (`409 run_not_mergeable`),
         when the acceptance gate does not admit a merge
         (`409 acceptance_gate_not_passed`), when the pull request has a merge
-        conflict against its base (`409 merge_conflicting`, E64.14 / #3109), or
+        conflict against its base (`409 merge_conflicting`, E64.14 / #3109),
+        when the merge-candidate gate refuses (`409 merge_base_behind` /
+        `merge_candidate_unverified` / `merge_candidate_verify_failed`, or
+        `502 merge_candidate_check_failed` — ADR-090, below), or
         when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
         deliberately does NOT block on a review stage awaiting approval (that
         stage settles ON merge).
@@ -13246,6 +13360,35 @@ paths:
         classified here (the mergeability fields are GitHub-only, so a
         conflicting GitLab MR falls through to today's queue-then-timeout
         behavior — `merge_status`/`detailed_merge_status` would be the signal).
+
+        **Merge-candidate gate (ADR-090 / E83.33 / #4018).** Fishhawk verifies
+        the MERGE CANDIDATE, not the branch. AFTER the conflict precondition
+        and BEFORE the verdict append (so a refused merge records no verdict),
+        on a run whose GitHub client, installation, repo and PR number all
+        resolve, the endpoint:
+
+        1. reads the live pull request; one the forge reports MERGED skips the
+           gate, so the already-merged resume above still answers `200`;
+        2. probes behind-ness with the three-dot compare
+           `base=<live PR head>...head=<base ref>` that `rebase-branch` uses —
+           ANY commit means the head does not contain the base tip, refused
+           `409 merge_base_behind` regardless of a declared verify command
+           (D1, universal);
+        3. when the workflow declares an `executor.verify` command (D4), reads
+           the merge-candidate verify state of EXACTLY the live head: a head
+           Fishhawk wrote (a performed base merge, a conflict-resolution push,
+           a decomposed parent's fan-in integration) needs a `passed`
+           `merge_candidate_verified` result for that SHA — none or an
+           in-flight pass is `409 merge_candidate_unverified`, a `failed` one
+           is `409 merge_candidate_verify_failed` (D2). Runner-gated implement
+           and fix-up heads and operator-vouched heads need nothing more.
+
+        Fail posture (D7): any read error on a fully wired run fails CLOSED
+        with `502 merge_candidate_check_failed` and records nothing. A run the
+        deployment cannot probe — no GitHub client, no installation (which
+        includes every GitLab-family run), an unparseable repo, or no PR number
+        — proceeds ungated with a server WARN; GitLab merge requests therefore
+        keep today's behaviour, a stated residual.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -13306,7 +13449,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of four cases. (1) The run cannot be merged: no PR url or a
+            One of seven cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -13336,12 +13479,47 @@ paths:
             resolve the conflict on the run branch, vouch the resulting commit
             with `vouch-commit` so the `fishhawk_audit_complete` check re-posts,
             re-approve the pull request, and re-invoke the merge.
+            (5) The pull request head does not contain the current base tip
+            (`merge_base_behind`, ADR-090 D1). `details` carry
+            `{run_id, pr_url, head_sha, base_ref, behind_by, next_step:
+            "fishhawk_rebase_run_branch"}`; advance the branch with
+            `POST /v0/runs/{run_id}/rebase-branch`, which also authorizes a
+            verify-only merge-candidate pass for the new head when a verify
+            command is declared, then re-invoke.
+            (6) The live head was written by Fishhawk and has no passing
+            merge-candidate verify for exactly that SHA
+            (`merge_candidate_unverified`, ADR-090 D2). `details` carry
+            `{run_id, pr_url, head_sha, cause, verify_state, next_step}` where
+            `cause` is `base_advance` / `conflict_resolution` / `fan_in` and
+            `verify_state` is `unverified` (next step
+            `fishhawk_rebase_run_branch`, whose already-up-to-date arm
+            re-triggers the pass) or `in_flight` (adds `stage_id`, the re-opened
+            implement stage; next step `fishhawk_await_stage`, after
+            `fishhawk_dispatch_stage` on a local runner).
+            (7) The merge-candidate verify FAILED for the live head
+            (`merge_candidate_verify_failed`, ADR-090 D2/D6). `details` carry
+            `{run_id, pr_url, head_sha, cause, verify_state: "failed",
+            next_step: "fishhawk_fixup_stage"}`. When the workflow delegates
+            fix-up routing one bounded fix-up was already routed when the result
+            was recorded; otherwise, or when that route was refused, route it
+            with `fishhawk_fixup_stage`. Cases (5)–(7) record NO verdict row and
+            dispatch nothing.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '502':
           description: |
-            The verdict row is recorded and durable, but queuing the squash
+            One of two cases.
+
+            `merge_candidate_check_failed` (ADR-090 D7): on a fully wired
+            GitHub run the merge-candidate gate could not read the live pull
+            request, the behind-probe compare, or the run's audit chain, so it
+            fails CLOSED. Nothing was recorded and nothing was dispatched; the
+            call is retryable. `details` carry `{run_id, reason, retryable:
+            true}` where `reason` is `forge_read` or `audit_read`; the raw
+            cause stays in the operator log.
+
+            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the squash
             merge failed for a reason OTHER than the checks-pending precondition
             above (`merge_dispatch_failed`); the merge is retryable — a re-POST
             re-queues without duplicating the verdict. A checks-not-all-passed
@@ -24482,7 +24660,12 @@ paths:
             - the scope-completeness park variant (`outcome: scope_park`) was
               accepted and the implement stage was parked in
               `awaiting_scope_decision` for an operator exempt-or-fail
-              decision (#1231).
+              decision (#1231), or
+            - the merge-candidate verify variant
+              (`outcome: merge_candidate_verified`, ADR-090 / #4018) was
+              accepted: the head-bound result was recorded (or an idempotent
+              replay found it already recorded) and the implement stage was
+              returned to its pre-pass gate.
           content:
             application/json:
               schema:
@@ -24493,6 +24676,16 @@ paths:
                   - $ref: '#/components/schemas/PullRequestFixupPushResponse'
                   - $ref: '#/components/schemas/PullRequestFixupNoChangesResponse'
                   - $ref: '#/components/schemas/PullRequestScopeParkResponse'
+                  - $ref: '#/components/schemas/PullRequestMergeCandidateResponse'
+        '409':
+          description: |
+            `merge_candidate_verify_not_live`: a `merge_candidate_verified`
+            report arrived for a stage with no live (unconsumed, fully
+            populated) merge-candidate verify trigger, so it cannot be bound to
+            a head. Nothing is recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)

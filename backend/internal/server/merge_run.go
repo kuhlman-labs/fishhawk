@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -102,6 +103,13 @@ type mergeRunResponse struct {
 //     BEFORE the merge_verdict_recorded append, so a merge that structurally
 //     cannot queue records no verdict; the post-resolution route is
 //     operator-resolve-then-vouch-then-re-merge.
+//   - the merge-candidate gate (ADR-090 / E83.33 / #4018), AFTER the conflict
+//     guard and BEFORE the verdict append: 409 merge_base_behind when the PR
+//     head does not contain the base tip, 409 merge_candidate_unverified /
+//     merge_candidate_verify_failed when a Fishhawk-written head has no
+//     passing merge-candidate verify, and 502 merge_candidate_check_failed on
+//     a forge or audit read error once every anchor resolved. See
+//     mergeCandidateGate for the determinability ladder.
 //
 // It deliberately does NOT block on a review stage parked at awaiting_approval:
 // in feature_change that stage settles ON merge via resolveReviewStageOnMerge,
@@ -288,6 +296,17 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusConflict, "merge_conflicting",
 			"the pull request has a merge conflict against its base and GitHub can never queue the merge; resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit so the fishhawk_audit_complete check re-posts on the new head, re-approve the pull request, and re-invoke the merge",
 			map[string]any{"run_id": runID.String(), "pr_url": prURL, "mergeable_state": mergeableState})
+		return
+	}
+
+	// Merge-candidate gate (ADR-090 D1/D2/D7, E83.33 / #4018): Fishhawk
+	// verifies the MERGE CANDIDATE, not the branch. AFTER the #3109 conflict
+	// guard (a conflicting PR keeps its own, more specific refusal) and BEFORE
+	// the merge_verdict_recorded append, so a merge that cannot land records no
+	// verdict. Unlike the conflict guard it FAILS CLOSED on a read error once
+	// every anchor resolved (D7); see mergeCandidateGate.
+	if gate := s.mergeCandidateGate(r.Context(), runRow); !gate.admits() {
+		s.writeMergeCandidateRefusal(w, r, runID, prURL, gate)
 		return
 	}
 
@@ -529,8 +548,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 // documented Mergeable == false. mergeable_state "blocked" / "behind" /
 // "unstable" / "draft" / "unknown" / "" and a nil Mergeable (GitHub's
 // background mergeability job is still running, returning JSON null) all
-// proceed unchanged — a behind-but-clean or checks-pending branch still merges
-// as it does today. The documented boolean is kept load-bearing alongside the
+// proceed unchanged — a behind-but-clean or checks-pending branch is not a
+// conflict, so THIS guard does not refuse it (a behind branch is refused by
+// the ADR-090 merge-candidate gate that runs next, as merge_base_behind; see
+// mergeCandidateGate). The documented boolean is kept load-bearing alongside the
 // advisory mergeable_state (binding condition 2): mergeable_state can never
 // quietly become the only path.
 //
@@ -570,6 +591,204 @@ func (s *Server) prMergeConflicting(ctx context.Context, runRow *run.Run) (confl
 		return true, pr.MergeableState
 	}
 	return false, ""
+}
+
+// Merge-candidate gate error codes (ADR-090 / E83.33 / #4018). The three 409s
+// are preconditions an operator clears with a named verb; the 502 is a read
+// failure on a fully wired run and is retryable.
+const (
+	mergeCodeBaseBehind            = "merge_base_behind"
+	mergeCodeCandidateUnverified   = "merge_candidate_unverified"
+	mergeCodeCandidateVerifyFailed = "merge_candidate_verify_failed"
+	mergeCodeCandidateCheckFailed  = "merge_candidate_check_failed"
+)
+
+// Reasons a merge_candidate_check_failed 502 names, carried under the
+// allow-listed `reason` detail key so they survive 5xx redaction.
+const (
+	mergeCandidateCheckForgeRead = "forge_read"
+	mergeCandidateCheckAuditRead = "audit_read"
+)
+
+// mergeCandidateGateResult is mergeCandidateGate's answer. Code is empty when
+// the gate admits the merge; otherwise it is one of the mergeCode* constants
+// and Message / Details are the refusal both dispatch paths render. Cause is
+// the raw read error on merge_candidate_check_failed: it is LOGGED, never
+// shipped to the caller.
+type mergeCandidateGateResult struct {
+	Code    string
+	Message string
+	Details map[string]any
+	Cause   error
+}
+
+func (g mergeCandidateGateResult) admits() bool { return g.Code == "" }
+
+// mergeCandidateCheckFailed builds the D7 fail-closed refusal. The message is
+// a static literal per reason: the raw cause rides Cause (logged) and never
+// the message, which reaches the caller.
+func mergeCandidateCheckFailed(reason string, cause error) mergeCandidateGateResult {
+	msg := "the merge-candidate check could not read the pull request from the forge"
+	if reason == mergeCandidateCheckAuditRead {
+		msg = "the merge-candidate check could not read the run's audit chain"
+	}
+	msg += ", so the merge is refused (ADR-090 D7: a fully wired GitHub run fails closed on a read error). Nothing was recorded and the call is retryable; re-invoke the merge."
+	return mergeCandidateGateResult{
+		Code:    mergeCodeCandidateCheckFailed,
+		Message: msg,
+		Details: map[string]any{"reason": reason, "retryable": true},
+		Cause:   cause,
+	}
+}
+
+// mergeCandidateGate is the ADR-090 merge gate both Fishhawk-owned dispatch
+// paths consult — POST /v0/runs/{id}/merge and the delegated may_merge arm —
+// before a merge is dispatched.
+//
+// Determinability ladder (D7), the prMergeConflicting anchors: no GitHub
+// client, no installation (which includes every GitLab-family run), an
+// unparseable repo, or no PR number means the deployment cannot probe, so the
+// gate ADMITS with a WARN log — GitLab merge requests keep today's behaviour as
+// a stated residual. Once every anchor resolved, every read FAILS CLOSED with
+// merge_candidate_check_failed: a GetPullRequest error, an empty head or base,
+// a CompareCommits error, or a mergeCandidateVerifyState error.
+//
+// Then, in order:
+//
+//   - a PR the forge reports Merged ADMITS, so the #3622 already-merged resume
+//     still answers 200 already_merged;
+//   - D1 (universal, Q5): CompareCommits(base=<live PR head>, head=<base ref>)
+//     returning ANY commit means the head does not contain the base tip →
+//     merge_base_behind naming fishhawk_rebase_run_branch;
+//   - D2/D4: mergeCandidateVerifyState for exactly the live head —
+//     unverified / in_flight → merge_candidate_unverified, failed →
+//     merge_candidate_verify_failed naming fishhawk_fixup_stage (D6: a
+//     delegated route was already attempted when the result was recorded),
+//     passed / not_required → admit.
+func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeCandidateGateResult {
+	warnUngated := func(why string) mergeCandidateGateResult {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: merge-candidate gate cannot probe this run; proceeding ungated (ADR-090 D7)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("why", why))
+		return mergeCandidateGateResult{}
+	}
+	if s.cfg.GitHub == nil {
+		return warnUngated("no GitHub client is wired")
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return warnUngated("the run carries no GitHub installation")
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return warnUngated("the run repo is unparseable")
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return warnUngated("the run carries no parseable pull request number")
+	}
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
+
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
+	if err != nil {
+		return mergeCandidateCheckFailed(mergeCandidateCheckForgeRead, err)
+	}
+	if pr.Merged {
+		return mergeCandidateGateResult{}
+	}
+	headSHA, baseRef := pr.HeadSHA, pr.BaseRef
+	if headSHA == "" || baseRef == "" {
+		return mergeCandidateCheckFailed(mergeCandidateCheckForgeRead,
+			errors.New("the forge returned an empty head sha or base ref"))
+	}
+
+	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, headSHA, baseRef)
+	if err != nil {
+		return mergeCandidateCheckFailed(mergeCandidateCheckForgeRead, err)
+	}
+	if len(behind) > 0 {
+		return mergeCandidateGateResult{
+			Code: mergeCodeBaseBehind,
+			Message: fmt.Sprintf("the pull request head %s does not contain the current tip of %s (behind by %d commit(s)), so Fishhawk refuses to merge an unverified merge candidate (ADR-090 D1). Advance the run branch with fishhawk_rebase_run_branch — when the workflow declares a verify command it also authorizes a verify-only merge-candidate pass for the new head — then re-invoke the merge. No merge verdict was recorded.",
+				headSHA, baseRef, len(behind)),
+			Details: map[string]any{
+				"head_sha":  headSHA,
+				"base_ref":  baseRef,
+				"behind_by": len(behind),
+				"next_step": "fishhawk_rebase_run_branch",
+			},
+		}
+	}
+
+	st, err := s.mergeCandidateVerifyState(ctx, runRow, headSHA)
+	if err != nil {
+		return mergeCandidateCheckFailed(mergeCandidateCheckAuditRead, err)
+	}
+	switch st.State {
+	case mergeCandidateStateInFlight:
+		return mergeCandidateGateResult{
+			Code: mergeCodeCandidateUnverified,
+			Message: fmt.Sprintf("a verify-only merge-candidate pass is in flight for head %s (cause %s) on implement stage %s, and the merge waits for its result (ADR-090 D2). On a local runner dispatch the stage with fishhawk_dispatch_stage, await it with fishhawk_await_stage, then re-invoke the merge. No merge verdict was recorded.",
+				headSHA, st.Cause, st.StageID),
+			Details: map[string]any{
+				"head_sha":     headSHA,
+				"cause":        st.Cause,
+				"verify_state": st.State,
+				"stage_id":     st.StageID.String(),
+				"next_step":    "fishhawk_await_stage",
+			},
+		}
+	case mergeCandidateStateUnverified:
+		return mergeCandidateGateResult{
+			Code: mergeCodeCandidateUnverified,
+			Message: fmt.Sprintf("head %s was written by Fishhawk (cause %s) and has no passing merge-candidate verify, so the merge is refused (ADR-090 D2). Re-invoke fishhawk_rebase_run_branch: its already-up-to-date arm triggers a verify-only pass for the live head. Dispatch and await that stage, then re-invoke the merge. No merge verdict was recorded.",
+				headSHA, st.Cause),
+			Details: map[string]any{
+				"head_sha":     headSHA,
+				"cause":        st.Cause,
+				"verify_state": st.State,
+				"next_step":    "fishhawk_rebase_run_branch",
+			},
+		}
+	case mergeCandidateStateFailed:
+		return mergeCandidateGateResult{
+			Code: mergeCodeCandidateVerifyFailed,
+			Message: fmt.Sprintf("the merge-candidate verify pass FAILED for head %s (cause %s): the declared verify command is red on the combined tree, so the merge is refused (ADR-090 D2/D6). %s No merge verdict was recorded.",
+				headSHA, st.Cause, mergeCandidateFixupRoute),
+			Details: map[string]any{
+				"head_sha":     headSHA,
+				"cause":        st.Cause,
+				"verify_state": st.State,
+				"next_step":    "fishhawk_fixup_stage",
+			},
+		}
+	}
+	return mergeCandidateGateResult{}
+}
+
+// writeMergeCandidateRefusal renders a refused mergeCandidateGate on the
+// operator merge endpoint: 502 for merge_candidate_check_failed (the raw cause
+// goes to the log and to a non-allow-listed detail key the 5xx redaction
+// drops), 409 for the three preconditions.
+func (s *Server) writeMergeCandidateRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, gate mergeCandidateGateResult) {
+	details := map[string]any{"run_id": runID.String(), "pr_url": prURL}
+	for k, v := range gate.Details {
+		details[k] = v
+	}
+	attrs := []slog.Attr{slog.String("run_id", runID.String()), slog.String("code", gate.Code)}
+	if gate.Code == mergeCodeCandidateCheckFailed {
+		cause := ""
+		if gate.Cause != nil {
+			cause = gate.Cause.Error()
+		}
+		details["error"] = cause
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge-candidate check failed; refusing (fail closed)",
+			append(attrs, slog.String("error", cause))...)
+		s.writeError(w, r, http.StatusBadGateway, mergeCodeCandidateCheckFailed, gate.Message, details)
+		return
+	}
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: merge-candidate gate refused before verdict", attrs...)
+	s.writeError(w, r, http.StatusConflict, gate.Code, gate.Message, details)
 }
 
 // earliestMergeVerdictSequence returns the smallest Sequence among the given

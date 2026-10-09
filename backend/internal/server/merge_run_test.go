@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1138,6 +1139,7 @@ type mergeConflictGitHub struct {
 	mergeable      string // raw JSON: "true" | "false" | "null"
 	mergeableState string
 	prStatus       int // 0 => 200
+	behind         int // commits the ADR-090 behind-probe reports (0 => up to date)
 }
 
 func newMergeConflictGitHubClient(t *testing.T, stub *mergeConflictGitHub) *githubclient.Client {
@@ -1152,6 +1154,18 @@ func newMergeConflictGitHubClient(t *testing.T, stub *mergeConflictGitHub) *gith
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","mergeable":%s,"mergeable_state":%q,"head":{"sha":"H"},"base":{"ref":"main"}}`,
 				stub.mergeable, stub.mergeableState)
+		})
+	// The ADR-090 merge-candidate gate (which runs after this guard) probes
+	// behind-ness on every fully wired run; answer "up to date" so these
+	// #3109 fixtures exercise the conflict guard alone.
+	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			commits := make([]string, 0, stub.behind)
+			for i := 0; i < stub.behind; i++ {
+				commits = append(commits, fmt.Sprintf(`{"sha":"b%d"}`, i))
+			}
+			fmt.Fprintf(w, `{"commits":[%s]}`, strings.Join(commits, ","))
 		})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -1278,8 +1292,10 @@ func TestMergeRun_NullMergeableProceeds(t *testing.T) {
 
 // TestMergeRun_BlockedStateProceeds pins the predicate's narrowness (binding
 // condition 2 / risk assumption): mergeable_state=="blocked" with
-// mergeable==true still returns 200 and dispatches — a behind/blocked/unstable
-// branch is not a conflict and must merge as it does today.
+// mergeable==true still returns 200 and dispatches — a blocked/unstable branch
+// is not a conflict, so the conflict guard lets it through. (A BEHIND branch is
+// refused by the ADR-090 merge-candidate gate that follows; this fixture's
+// compare answers up to date, so only the conflict guard is exercised.)
 func TestMergeRun_BlockedStateProceeds(t *testing.T) {
 	merger := &fakeMerger{}
 	s, repo, _ := newAutoDriveMergeServer(t, merger)
@@ -1296,22 +1312,29 @@ func TestMergeRun_BlockedStateProceeds(t *testing.T) {
 	}
 }
 
-// TestMergeRun_GetPRErrorProceeds (m5) pins the fail-open on a GetPullRequest
-// error: a non-2xx PR read proceeds to dispatch rather than refusing on an
-// unresolved signal.
+// TestMergeRun_GetPRErrorProceeds (m5) pins the CONFLICT guard's fail-open on
+// a GetPullRequest error: the guard does not refuse merge_conflicting on an
+// unresolved signal. Since ADR-090 (E83.33 / #4018) the merge-candidate gate
+// that follows it FAILS CLOSED on the same read once every anchor resolved
+// (D7, deliberately stricter than #3109), so the request is answered 502
+// merge_candidate_check_failed — proving the conflict guard let it through —
+// and nothing is recorded or dispatched.
 func TestMergeRun_GetPRErrorProceeds(t *testing.T) {
 	merger := &fakeMerger{}
-	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	s, repo, au := newAutoDriveMergeServer(t, merger)
 	runID := uuid.New()
 	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{prStatus: http.StatusInternalServerError})
 	seedMergeConflictRun(t, s, repo, runID, gh)
 
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (GetPullRequest error fails open):\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadGateway || decodeMergeErr(t, w).Error.Code != mergeCodeCandidateCheckFailed {
+		t.Fatalf("status = %d body = %s, want 502 merge_candidate_check_failed (the conflict guard fails open; D7 fails closed)", w.Code, w.Body.String())
 	}
-	if merger.called != 1 {
-		t.Errorf("merger called %d times, want 1 (fail open dispatches)", merger.called)
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (D7 fails closed)", merger.called)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0", len(rows))
 	}
 }
 
@@ -2156,5 +2179,408 @@ func TestMergeRun_AlreadyMerged_NilOrchestrator_Still200(t *testing.T) {
 	// A still-NON-TERMINAL run names the settling verb.
 	if !strings.Contains(resp.Message, "reconcile-merge") {
 		t.Errorf("message must name reconcile-merge on a still-running run; got %q", resp.Message)
+	}
+}
+
+// --- ADR-090 / E83.33 / #4018: the merge-candidate gate ---------------------
+//
+// Every refusal below reads COMMITTED state after the call — zero
+// merge_verdict_recorded rows and zero GateMerger dispatches — never only the
+// error code, because a refusal and a dispatch failure both return an error
+// envelope.
+
+// mergeCandidateGitHub serves the two forge reads the merge-candidate gate
+// makes: GET /pulls/{number} (head sha, base ref, merged, or a non-2xx) and
+// GET /compare/{base}...{head} (behind commits, or a non-2xx). It records the
+// compare's base and head so the probe DIRECTION is asserted, not assumed.
+type mergeCandidateGitHub struct {
+	mu            sync.Mutex
+	headSHA       string
+	baseRef       string
+	merged        bool
+	prStatus      int // 0 => 200
+	behind        int
+	compareStatus int // 0 => 200
+	compareCalls  int
+	compareBase   string
+	compareHead   string
+}
+
+func newMergeCandidateGitHubClient(t *testing.T, stub *mergeCandidateGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		if stub.prStatus != 0 && stub.prStatus != http.StatusOK {
+			w.WriteHeader(stub.prStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		state := "open"
+		if stub.merged {
+			state = "closed"
+		}
+		fmt.Fprintf(w, `{"node_id":"PR_x","state":%q,"merged":%v,"mergeable":true,"mergeable_state":"clean","head":{"sha":%q,"ref":"fishhawk/run-mcv"},"base":{"ref":%q}}`,
+			state, stub.merged, stub.headSHA, stub.baseRef)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}", func(w http.ResponseWriter, r *http.Request) {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		stub.compareCalls++
+		base, head, _ := strings.Cut(r.PathValue("basehead"), "...")
+		stub.compareBase, stub.compareHead = base, head
+		if stub.compareStatus != 0 && stub.compareStatus != http.StatusOK {
+			w.WriteHeader(stub.compareStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		commits := make([]string, 0, stub.behind)
+		for i := 0; i < stub.behind; i++ {
+			commits = append(commits, fmt.Sprintf(`{"sha":"base%039d"}`, i))
+		}
+		fmt.Fprintf(w, `{"commits":[%s]}`, strings.Join(commits, ","))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// mcGateFixture is an mcvFixture (a run under a chosen workflow spec, with the
+// slice-0 merge-candidate chain helpers) made merge-ready: PR url, repo,
+// installation, a GateMerger and a GitHub stub whose live head is mcvHead.
+type mcGateFixture struct {
+	*mcvFixture
+	merger *fakeMerger
+	gh     *mergeCandidateGitHub
+}
+
+func newMCGateFixture(t *testing.T, specYAML string) *mcGateFixture {
+	t.Helper()
+	f := newMCVFixture(t, specYAML)
+	merger := &fakeMerger{}
+	gh := &mergeCandidateGitHub{headSHA: mcvHead, baseRef: mcvBaseRef}
+	f.s.cfg.GateMerger = merger
+	f.s.cfg.GitHub = newMergeCandidateGitHubClient(t, gh)
+	pr := mergePR
+	f.repo.mu.Lock()
+	r := f.repo.runs[f.runID]
+	r.PullRequestURL = &pr
+	r.Repo = "x/y"
+	r.InstallationID = instID(42)
+	r.State = run.StateRunning
+	f.repo.mu.Unlock()
+	return &mcGateFixture{mcvFixture: f, merger: merger, gh: gh}
+}
+
+func (g *mcGateFixture) post(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	return postMergeRun(t, g.s, g.runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+}
+
+// mergeErrEnvelope decodes a writeError body.
+type mergeErrEnvelope struct {
+	Error struct {
+		Code    string         `json:"code"`
+		Message string         `json:"message"`
+		Details map[string]any `json:"details"`
+	} `json:"error"`
+}
+
+func decodeMergeErr(t *testing.T, w *httptest.ResponseRecorder) mergeErrEnvelope {
+	t.Helper()
+	var env mergeErrEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal error envelope: %v\n%s", err, w.Body.String())
+	}
+	return env
+}
+
+// assertMergeRefused asserts the status + code AND the committed state: no
+// verdict row, no dispatch.
+func (g *mcGateFixture) assertRefused(t *testing.T, w *httptest.ResponseRecorder, status int, code string) mergeErrEnvelope {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("status = %d, want %d:\n%s", w.Code, status, w.Body.String())
+	}
+	env := decodeMergeErr(t, w)
+	if env.Error.Code != code {
+		t.Errorf("error code = %q, want %q", env.Error.Code, code)
+	}
+	if rows := mergeVerdictRows(g.au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0 (the gate refuses before the append)", len(rows))
+	}
+	if g.merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (the gate refuses before dispatch)", g.merger.called)
+	}
+	return env
+}
+
+func (g *mcGateFixture) assertAdmitted(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the gate admits):\n%s", w.Code, w.Body.String())
+	}
+	if g.merger.called != 1 {
+		t.Errorf("merger called %d times, want 1", g.merger.called)
+	}
+	if rows := mergeVerdictRows(g.au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(rows))
+	}
+}
+
+// TestMergeRun_MergeCandidate_BehindRefused pins D1: a PR whose head does not
+// contain the base tip is refused 409 merge_base_behind naming
+// fishhawk_rebase_run_branch, and the probe runs in the rebase verb's
+// direction (base = live PR head, head = base ref). The spec declares NO
+// verify command, so the refusal is D1's alone (D4: up-to-date applies
+// regardless). Counterfactual: deleting the len(behind) > 0 refusal admits
+// the merge (a verdict row and a dispatch appear) → RED.
+func TestMergeRun_MergeCandidate_BehindRefused(t *testing.T) {
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.gh.behind = 1
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeBaseBehind)
+	if !strings.Contains(env.Error.Message, "fishhawk_rebase_run_branch") {
+		t.Errorf("message does not name fishhawk_rebase_run_branch: %q", env.Error.Message)
+	}
+	d := env.Error.Details
+	if d["head_sha"] != mcvHead || d["base_ref"] != mcvBaseRef || d["behind_by"] != float64(1) {
+		t.Errorf("details = %v, want head_sha/base_ref/behind_by=1", d)
+	}
+	if d["next_step"] != "fishhawk_rebase_run_branch" {
+		t.Errorf("details.next_step = %v, want fishhawk_rebase_run_branch", d["next_step"])
+	}
+	if g.gh.compareBase != mcvHead || g.gh.compareHead != mcvBaseRef {
+		t.Errorf("compare base...head = %s...%s, want %s...%s (base = live PR head, head = base ref)",
+			g.gh.compareBase, g.gh.compareHead, mcvHead, mcvBaseRef)
+	}
+}
+
+// TestMergeRun_MergeCandidate_UnverifiedRefused pins D2: a base-advance head
+// with no verdict is refused 409 merge_candidate_unverified naming the
+// re-trigger verb. Counterfactual: mapping unverified to admit → RED.
+func TestMergeRun_MergeCandidate_UnverifiedRefused(t *testing.T) {
+	g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	g.seedRebased(mcvHead, mcvHead, false)
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+	if env.Error.Details["verify_state"] != mergeCandidateStateUnverified ||
+		env.Error.Details["cause"] != mergeCandidateCauseBaseAdvance {
+		t.Errorf("details = %v, want verify_state unverified, cause base_advance", env.Error.Details)
+	}
+	if !strings.Contains(env.Error.Message, "fishhawk_rebase_run_branch") {
+		t.Errorf("message does not name the re-trigger verb: %q", env.Error.Message)
+	}
+}
+
+// TestMergeRun_MergeCandidate_InFlightRefused pins the in-flight arm: a live
+// trigger for the head is merge_candidate_unverified naming the stage and
+// fishhawk_await_stage.
+func TestMergeRun_MergeCandidate_InFlightRefused(t *testing.T) {
+	g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	g.seedRebased(mcvHead, mcvHead, false)
+	g.seedTrigger(mcvHead)
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+	if env.Error.Details["verify_state"] != mergeCandidateStateInFlight {
+		t.Errorf("verify_state = %v, want in_flight", env.Error.Details["verify_state"])
+	}
+	if env.Error.Details["stage_id"] != g.impl.ID.String() {
+		t.Errorf("stage_id = %v, want %s", env.Error.Details["stage_id"], g.impl.ID)
+	}
+	if !strings.Contains(env.Error.Message, "fishhawk_await_stage") {
+		t.Errorf("message does not name fishhawk_await_stage: %q", env.Error.Message)
+	}
+}
+
+// TestMergeRun_MergeCandidate_FailedRefused pins D6 at the merge gate: a
+// failed verdict is refused 409 merge_candidate_verify_failed naming
+// fishhawk_fixup_stage on BOTH the not-delegated workflow and a delegated one
+// whose fix-up budget is spent — and the gate itself routes NOTHING (zero
+// stage_fixup_triggered appended by the merge call). Counterfactual: mapping
+// failed to admit → RED.
+func TestMergeRun_MergeCandidate_FailedRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		spec        string
+		budgetSpent bool
+	}{
+		"not delegated":              {spec: mcvUndelegatedSpecYAML},
+		"delegated but budget spent": {spec: mcvDelegatedV0SpecYAML, budgetSpent: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newMCGateFixture(t, tc.spec)
+			g.seedRebased(mcvHead, mcvHead, false)
+			g.seedTrigger(mcvHead)
+			g.seedVerdict(mcvHead, mergeCandidateResultFailed)
+			if tc.budgetSpent {
+				seedFixupPass(t, g.au, g.runID, g.impl.ID, defaultFixupCeiling)
+			}
+
+			env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateVerifyFailed)
+			if !strings.Contains(env.Error.Message, "fishhawk_fixup_stage") {
+				t.Errorf("message does not name fishhawk_fixup_stage: %q", env.Error.Message)
+			}
+			if env.Error.Details["next_step"] != "fishhawk_fixup_stage" {
+				t.Errorf("details.next_step = %v, want fishhawk_fixup_stage", env.Error.Details["next_step"])
+			}
+			if n := len(auditEntries(g.au, CategoryStageFixupTriggered)); n != 0 {
+				t.Errorf("stage_fixup_triggered rows appended = %d, want 0 (the merge gate never routes)", n)
+			}
+		})
+	}
+}
+
+// TestMergeRun_MergeCandidate_PassedAdmits pins exact-head binding on the
+// admit side: a passed verdict for the LIVE head admits the merge, while a
+// passed verdict for a DIFFERENT head leaves the live head unverified.
+func TestMergeRun_MergeCandidate_PassedAdmits(t *testing.T) {
+	g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	g.seedRebased(mcvHead, mcvHead, false)
+	g.seedTrigger(mcvHead)
+	g.seedVerdict(mcvHead, mergeCandidateResultPassed)
+	g.assertAdmitted(t, g.post(t))
+
+	other := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	other.seedRebased(mcvHead, mcvHead, false)
+	other.seedVerdict(mcvOtherHead, mergeCandidateResultPassed)
+	other.assertRefused(t, other.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+}
+
+// TestMergeRun_MergeCandidate_NoVerifyDeclaredAdmits pins D4: with no
+// declared verify command a base-advance head needs no pass, so an up-to-date
+// PR merges.
+func TestMergeRun_MergeCandidate_NoVerifyDeclaredAdmits(t *testing.T) {
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.seedRebased(mcvHead, mcvHead, false)
+	g.assertAdmitted(t, g.post(t))
+}
+
+// TestMergeRun_MergeCandidate_MergedPRSkipsGate pins the #3622 carve-out: a
+// PR the forge reports merged skips the gate even when behind, so the
+// already-merged resume still answers 200 already_merged with no dispatch.
+// Counterfactual: deleting the pr.Merged skip → 409 merge_base_behind → RED.
+func TestMergeRun_MergeCandidate_MergedPRSkipsGate(t *testing.T) {
+	g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	g.gh.merged = true
+	g.gh.behind = 1
+	g.seedRebased(mcvHead, mcvHead, false) // would be unverified, too
+	// The #3622 resume shape: the chain already carries merge evidence, so the
+	// observe rung answers already_merged once the gate lets the call through.
+	seedChainMergeEvidence(g.au, g.runID, "pr_merged")
+
+	w := g.post(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 already_merged:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeMergeResponse(t, w); !resp.AlreadyMerged || resp.MergeQueued {
+		t.Errorf("response = %+v, want already_merged:true merge_queued:false", resp)
+	}
+	if g.merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (already merged)", g.merger.called)
+	}
+}
+
+// TestMergeRun_MergeCandidate_FailClosedReads pins D7's fail-closed half, one
+// case per read on a fully wired run: each answers 502
+// merge_candidate_check_failed with the reason, retryable, and records
+// nothing. Counterfactual: replacing the 502 with an admit → a verdict row
+// and a dispatch appear → RED.
+func TestMergeRun_MergeCandidate_FailClosedReads(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(g *mcGateFixture)
+		reason string
+	}{
+		"GetPullRequest error": {func(g *mcGateFixture) { g.gh.prStatus = http.StatusInternalServerError }, mergeCandidateCheckForgeRead},
+		"empty head sha":       {func(g *mcGateFixture) { g.gh.headSHA = "" }, mergeCandidateCheckForgeRead},
+		"CompareCommits error": {func(g *mcGateFixture) { g.gh.compareStatus = http.StatusInternalServerError }, mergeCandidateCheckForgeRead},
+		"audit read error": {func(g *mcGateFixture) {
+			g.seedRebased(mcvHead, mcvHead, false)
+			g.au.listByCategoryErrCategory = CategoryMergeCandidateVerified
+		}, mergeCandidateCheckAuditRead},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+			tc.mutate(g)
+			env := g.assertRefused(t, g.post(t), http.StatusBadGateway, mergeCodeCandidateCheckFailed)
+			if env.Error.Details["reason"] != tc.reason {
+				t.Errorf("details.reason = %v, want %s", env.Error.Details["reason"], tc.reason)
+			}
+			if env.Error.Details["retryable"] != true {
+				t.Errorf("details.retryable = %v, want true", env.Error.Details["retryable"])
+			}
+			if _, leaked := env.Error.Details["error"]; leaked {
+				t.Errorf("details carries the raw cause on a 5xx: %v", env.Error.Details)
+			}
+			for _, cause := range []string{"githubclient", "injected", "empty head sha"} {
+				if strings.Contains(env.Error.Message, cause) {
+					t.Errorf("message carries the raw cause %q: %q", cause, env.Error.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeRun_MergeCandidate_FailOpenLadder pins D7's fail-open half, one
+// case per anchor: when the deployment cannot probe, the gate admits. Each
+// fixture's stub WOULD refuse (behind=1) if it were reached, so admitting
+// proves the anchor — not the stub — is what lets the merge through.
+func TestMergeRun_MergeCandidate_FailOpenLadder(t *testing.T) {
+	cases := map[string]func(g *mcGateFixture){
+		"nil GitHub client": func(g *mcGateFixture) { g.s.cfg.GitHub = nil },
+		"no installation": func(g *mcGateFixture) {
+			g.repo.mu.Lock()
+			g.repo.runs[g.runID].InstallationID = nil
+			g.repo.mu.Unlock()
+		},
+		"unparseable repo": func(g *mcGateFixture) {
+			g.repo.mu.Lock()
+			g.repo.runs[g.runID].Repo = "not-a-repo"
+			g.repo.mu.Unlock()
+		},
+		"no PR number": func(g *mcGateFixture) {
+			pr := "https://github.com/x/y/pull/not-a-number"
+			g.repo.mu.Lock()
+			g.repo.runs[g.runID].PullRequestURL = &pr
+			g.repo.mu.Unlock()
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+			g.gh.behind = 1
+			mutate(g)
+			g.assertAdmitted(t, g.post(t))
+			if g.gh.compareCalls != 0 {
+				t.Errorf("compare calls = %d, want 0 (the gate could not probe)", g.gh.compareCalls)
+			}
+		})
+	}
+}
+
+// TestMergeRun_MergeCandidate_ConflictGuardRunsFirst pins the ordering: a
+// conflicting PR that is ALSO behind still answers 409 merge_conflicting (the
+// more specific refusal). Because the fixture is behind, the gate would answer
+// merge_base_behind if it ran first. Counterfactual: moving the gate above the
+// conflict guard → merge_base_behind → RED.
+func TestMergeRun_MergeCandidate_ConflictGuardRunsFirst(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "false", mergeableState: "dirty", behind: 1})
+	seedMergeConflictRun(t, s, repo, runID, gh)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict || decodeMergeErr(t, w).Error.Code != "merge_conflicting" {
+		t.Fatalf("status = %d body = %s, want 409 merge_conflicting first", w.Code, w.Body.String())
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0", len(rows))
 	}
 }

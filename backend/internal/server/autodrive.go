@@ -290,6 +290,16 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		if !mergeGateReady(runRow, stages) {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
 				slog.String("run_id", runRow.ID.String()))
+		} else if gate := s.mergeCandidateGate(ctx, runRow); !gate.admits() {
+			// ADR-090 D1/D2/D7 (E83.33 / #4018): the SAME merge-candidate gate the
+			// operator merge endpoint consults, translated to observe-only. A
+			// behind PR names fishhawk_rebase_run_branch and is NEVER auto-rebased;
+			// an unverified / failed candidate and a check read error fail closed.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but the merge-candidate gate refused; observe-only",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("code", gate.Code),
+				slog.Bool("check_read_error", gate.Cause != nil))
+			return observeOnly(mergeCandidateObserveNote(gate)), nil
 		} else {
 			outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger)
 			switch outcome {
@@ -329,6 +339,22 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 	}
 
 	return observeOnly("no delegated knob met and state-matched; observe-only"), nil
+}
+
+// mergeCandidateObserveNote renders a refused merge-candidate gate as the
+// delegated arm's observe-only note, naming the operator's next step. The
+// delegated arm acts on none of them: it never rebases, never triggers a pass
+// and never routes a fix-up from here.
+func mergeCandidateObserveNote(gate mergeCandidateGateResult) string {
+	switch gate.Code {
+	case mergeCodeBaseBehind:
+		return "merge base behind: the PR head does not contain the base tip (ADR-090 D1); advance it with fishhawk_rebase_run_branch — the delegated arm never auto-rebases; observe-only"
+	case mergeCodeCandidateUnverified:
+		return "merge candidate unverified: the live head has no passing merge-candidate verify (ADR-090 D2); trigger or await the pass (fishhawk_rebase_run_branch / fishhawk_await_stage) (fail-closed); observe-only"
+	case mergeCodeCandidateVerifyFailed:
+		return "merge candidate verify failed: the declared verify command is red on the combined tree (ADR-090 D6); route a fix-up with fishhawk_fixup_stage (fail-closed); observe-only"
+	}
+	return "merge-candidate check could not read the forge or audit state (ADR-090 D7, fail-closed); observe-only"
 }
 
 // mergeDispatchOutcome classifies what dispatchAcceptanceGatedMerge decided at

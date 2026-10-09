@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -68,8 +69,17 @@ type MergeRunInput struct {
 //     all false). The Message names the resolution path — resolve the conflict,
 //     vouch the resulting commit so the audit-complete check re-posts, re-approve,
 //     and re-merge.
+//   - "behind_base", "merge_candidate_unverified", "merge_candidate_verify_failed"
+//     — the ADR-090 merge-candidate gate (E83.33 / #4018) refused the merge:
+//     the PR head does not contain the base tip (409 merge_base_behind), a
+//     Fishhawk-written head has no passing merge-candidate verify, or its
+//     verify FAILED. Like conflicting these are IMMEDIATE returns (no poll, no
+//     re-POST, no verdict row); NextAction names the verb that clears each one
+//     (fishhawk_rebase_run_branch, fishhawk_await_stage, fishhawk_fixup_stage).
+//     The gate's 502 merge_candidate_check_failed stays a TOOL ERROR: it is a
+//     retryable read failure, not a precondition.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -104,8 +114,8 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038)"`
-	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending statuses"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage)"`
+	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate statuses"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
@@ -200,6 +210,26 @@ Statuses:
                      conflict on the run branch, vouch the resulting commit with
                      fishhawk_vouch_commit (so the fishhawk_audit_complete check
                      re-posts on the new head), re-approve, and re-invoke.
+  - "behind_base"   — the PR head does not contain the current base tip, so
+                     Fishhawk refuses to merge an unverified merge candidate
+                     (ADR-090 D1). Immediate, no verdict row. next_action names
+                     fishhawk_rebase_run_branch, which advances the branch and,
+                     when the workflow declares a verify command, authorizes a
+                     verify-only merge-candidate pass for the new head.
+  - "merge_candidate_unverified" — the live head was written by Fishhawk (a base
+                     advance, a conflict-resolution push or a fan-in
+                     integration) and has no passing merge-candidate verify for
+                     EXACTLY that SHA (ADR-090 D2). Immediate, no verdict row.
+                     next_action names fishhawk_await_stage (a pass is in flight
+                     on the named stage — dispatch it with fishhawk_dispatch_stage
+                     on a local runner) or fishhawk_rebase_run_branch (whose
+                     already-up-to-date arm triggers the pass).
+  - "merge_candidate_verify_failed" — the merge-candidate verify FAILED for the
+                     live head: the declared verify command is red on the
+                     combined tree. Immediate, no verdict row. next_action names
+                     fishhawk_fixup_stage (ADR-090 D6: a delegated workflow
+                     already routed one bounded fix-up when the result was
+                     recorded; otherwise route it yourself).
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -223,6 +253,9 @@ Tool errors:
     as already_merged instead. A surviving 502 carries forge_merge_state and
     names POST /v0/runs/{run_id}/record-merge-observation then
     POST /v0/runs/{run_id}/reconcile-merge as the recovery),
+    merge_candidate_check_failed (502 — ADR-090 D7: on a fully wired GitHub
+    run a forge or audit read error fails the merge-candidate gate CLOSED;
+    nothing was recorded and the call is retryable; re-invoke),
     merge_unconfigured (503)
 
 The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
@@ -234,6 +267,11 @@ The backend's 409 merge_conflicting is likewise NOT a tool error: it is the
 merge-conflict precondition the tool returns IMMEDIATELY as status=conflicting
 (no poll, no re-POST — waiting cannot resolve a conflict), naming the
 resolve-then-vouch-then-re-merge path.
+
+The backend's 409 merge_base_behind / merge_candidate_unverified /
+merge_candidate_verify_failed (ADR-090) are likewise NOT tool errors: each is
+returned IMMEDIATELY as status=behind_base / merge_candidate_unverified /
+merge_candidate_verify_failed with next_action naming the clearing verb.
 `),
 	}, resolver.mergeRun)
 }
@@ -287,6 +325,75 @@ func conflictingOutput(ae *apiError, start time.Time) MergeRunOutput {
 		WaitedSeconds:   time.Since(start).Seconds(),
 		Note:            mergeRunNote,
 		Message:         msg,
+	}
+}
+
+// mergeCandidateStatuses maps the backend's ADR-090 merge-candidate 409 codes
+// (E83.33 / #4018) to the tool's IMMEDIATE statuses. The gate's 502
+// merge_candidate_check_failed is deliberately absent: a retryable read
+// failure stays a tool error.
+var mergeCandidateStatuses = map[string]string{
+	"merge_base_behind":             "behind_base",
+	"merge_candidate_unverified":    "merge_candidate_unverified",
+	"merge_candidate_verify_failed": "merge_candidate_verify_failed",
+}
+
+// isMergeCandidateRefusal reports whether err is one of the backend's ADR-090
+// merge-candidate 409 refusals and returns the tool status it maps to. Like a
+// conflict, none of them clears by waiting, so the tool returns at once.
+func isMergeCandidateRefusal(err error) (*apiError, string, bool) {
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict {
+		return nil, "", false
+	}
+	status, ok := mergeCandidateStatuses[ae.Code]
+	if !ok {
+		return nil, "", false
+	}
+	return ae, status, true
+}
+
+// mergeCandidateOutput builds the IMMEDIATE checkpoint for a merge-candidate
+// refusal. Nothing was queued and no verdict row was appended (the backend
+// refuses before the append), so every flag is false. Message carries the
+// backend's explanation verbatim; NextAction names the verb from the
+// response's details.next_step, falling back to the status's documented verb
+// when an older detail map omits it.
+func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start time.Time) MergeRunOutput {
+	prURL, _ := ae.Details["pr_url"].(string)
+	verb, _ := ae.Details["next_step"].(string)
+	if verb == "" {
+		verb = map[string]string{
+			"behind_base":                   "fishhawk_rebase_run_branch",
+			"merge_candidate_unverified":    "fishhawk_rebase_run_branch",
+			"merge_candidate_verify_failed": "fishhawk_fixup_stage",
+		}[status]
+	}
+	params := map[string]string{"run_id": runID.String()}
+	if stageID, _ := ae.Details["stage_id"].(string); stageID != "" {
+		params["stage_id"] = stageID
+	}
+	consumes := consumesNone
+	if verb == "fishhawk_fixup_stage" {
+		consumes = consumesFixupBudget
+	}
+	msg := ae.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "the merge-candidate gate (ADR-090) refused the merge; call " + verb + ", then re-invoke fishhawk_merge_run."
+	}
+	return MergeRunOutput{
+		Status:        status,
+		PRURL:         prURL,
+		WaitedSeconds: time.Since(start).Seconds(),
+		Note:          mergeRunNote,
+		Message:       msg,
+		NextAction: &SuggestedAction{
+			Action:       verb,
+			Params:       params,
+			Precondition: "the merge-candidate gate refused this run's merge (" + ae.Code + ")",
+			Consumes:     consumes,
+			Reason:       "ADR-090: Fishhawk merges only an up-to-date, verified merge candidate; re-invoke fishhawk_merge_run once this clears",
+		},
 	}
 }
 
@@ -632,6 +739,11 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		// waiting cannot clear a merge conflict.
 		if cae, conflicting := isConflicting(merr); conflicting {
 			return nil, conflictingOutput(cae, start), nil
+		}
+		// The ADR-090 merge-candidate refusals (E83.33 / #4018) clear only by a
+		// named operator verb, never by waiting: return them immediately too.
+		if mae, status, refused := isMergeCandidateRefusal(merr); refused {
+			return nil, mergeCandidateOutput(mae, status, runID, start), nil
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {

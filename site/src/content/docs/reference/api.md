@@ -24,12 +24,23 @@ pushes a branch or opens a pull request on the real forge.
 Two runner-facing report bodies share one endpoint each and are discriminated
 by an `outcome` field the table below does not spell out: the pull-request
 report (`POST /v0/runs/{run_id}/pull-request`) accepts the implement stage's
-success, failure, child-push, fix-up, park and conflict-resolution shapes plus
-the acceptance runner's scenario-corpus reports (`acceptance_scenarios_pushed`,
+success, failure, child-push, fix-up, park and conflict-resolution shapes, the
+verify-only merge-candidate result (`merge_candidate_verified`), plus the
+acceptance runner's scenario-corpus reports (`acceptance_scenarios_pushed`,
 `acceptance_scenario_retirement_dropped`), and the acceptance verdict (`POST
 /v0/runs/{run_id}/acceptance`) may carry a runner-injected `replay` object
 alongside the agent's rows. The shape of each is in the companion
 [`docs/api/v0.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.md).
+
+The merge verb (`POST /v0/runs/{run_id}/merge`) verifies the merge candidate,
+not the branch (ADR-090). On a GitHub run it refuses a pull request whose head
+does not contain the current base tip (409 `merge_base_behind`) and, when the
+workflow declares a verify command, a head Fishhawk wrote (a base advance, a
+conflict-resolution push, a fan-in integration) that has no passing verify for
+exactly that commit (409 `merge_candidate_unverified` or
+`merge_candidate_verify_failed`). A forge or audit read error there fails
+closed (502 `merge_candidate_check_failed`). Each refusal names the verb that
+clears it; the error-code table in the companion document has the details.
 
 Review concerns record which reviewer raised them, which the table also does
 not spell out. The concern items on `GET /v0/runs/{run_id}` and the open and
