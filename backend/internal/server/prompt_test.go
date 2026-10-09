@@ -15965,3 +15965,130 @@ func TestGetStagePrompt_ReasoningEffort_OmittedWhenAbsent(t *testing.T) {
 		}
 	}
 }
+
+// --- merge-candidate verify instruction (ADR-090 D3 / #4018) ---
+
+func mergeCandidateTriggerEntry(runID, stageID uuid.UUID, seq int64, head string) *audit.Entry {
+	payload, _ := json.Marshal(mergeCandidateVerifyTrigger{
+		Branch: "fishhawk/run-1", BaseRef: "main", ExpectedHeadSHA: head,
+		Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: "scripts/test verify",
+		PriorState: string(run.StageStateSucceeded),
+	})
+	sid, rid := stageID, runID
+	return &audit.Entry{
+		Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: CategoryStageMergeCandidateVerifyTriggered, Payload: payload,
+	}
+}
+
+func mergeCandidateVerifiedEntry(runID, stageID uuid.UUID, seq int64, head, result string) *audit.Entry {
+	payload, _ := json.Marshal(mergeCandidateVerifiedPayload{
+		HeadSHA: head, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: "scripts/test verify",
+		Result: result, TriggerSequence: seq - 1, OutputUntrusted: true,
+	})
+	sid, rid := stageID, runID
+	return &audit.Entry{
+		Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: CategoryMergeCandidateVerified, Payload: payload,
+	}
+}
+
+// promptBothPathsWithEntries drives BOTH implement serve paths — the signed
+// runner /prompt and the SPA /prompt-render preview — for an implement stage
+// whose run carries the given audit entries, returning both decoded responses.
+func promptBothPathsWithEntries(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) map[string]promptResponse {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries(runID, implStageID)}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	out := map[string]promptResponse{}
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"prompt":        promptRequest(t, s, runID, implStageID, priv, ""),
+		"prompt_render": promptRenderRequest(t, s, implStageID),
+	} {
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200:\n%s", name, w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+		out[name] = resp
+	}
+	return out
+}
+
+// TestGetStagePrompt_ServesMergeCandidateVerifyInstruction: a live trigger is
+// served as the four merge_candidate_verify_* fields on BOTH serve paths, and
+// it SUPPRESSES the fix-up concern block and a conflict-resolution
+// instruction on the same stage — the verify-only pass must never be handed
+// an instruction to edit, commit or push.
+func TestGetStagePrompt_ServesMergeCandidateVerifyInstruction(t *testing.T) {
+	got := promptBothPathsWithEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			makeFixupEntry(runID, stageID, []planreview.Concern{{Severity: planreview.SeverityHigh, Note: "fix the thing"}}),
+			conflictTriggerEntry(runID, stageID, 1, "fishhawk/run-1", "main", "head0"),
+			mergeCandidateTriggerEntry(runID, stageID, 2, "head1"),
+		}
+	})
+	for path, resp := range got {
+		t.Run(path, func(t *testing.T) {
+			if !resp.MergeCandidateVerify {
+				t.Fatal("merge_candidate_verify = false, want true for a stage with a live trigger")
+			}
+			if resp.MergeCandidateVerifyBranch != "fishhawk/run-1" ||
+				resp.MergeCandidateVerifyExpectedHeadSHA != "head1" ||
+				resp.MergeCandidateVerifyCause != mergeCandidateCauseBaseAdvance {
+				t.Errorf("anchors = %q/%q/%q", resp.MergeCandidateVerifyBranch,
+					resp.MergeCandidateVerifyExpectedHeadSHA, resp.MergeCandidateVerifyCause)
+			}
+			if resp.Fixup || resp.FixupBranch != "" {
+				t.Errorf("fix-up instruction served beside the verify-only pass: fixup=%v branch=%q", resp.Fixup, resp.FixupBranch)
+			}
+			if strings.Contains(resp.Prompt, "fix the thing") {
+				t.Error("fix-up concern rendered into the verify-only pass's prompt")
+			}
+			if resp.ConflictResolution {
+				t.Error("conflict_resolution served beside the verify-only pass")
+			}
+		})
+	}
+}
+
+// TestGetStagePrompt_ConsumedMergeCandidateTriggerIsNotServed: a
+// merge_candidate_verified row at a later sequence consumes the trigger, so
+// neither serve path re-serves the pass, and an ordinary fix-up that follows
+// it takes the unchanged fix-up path.
+func TestGetStagePrompt_ConsumedMergeCandidateTriggerIsNotServed(t *testing.T) {
+	got := promptBothPathsWithEntries(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			mergeCandidateTriggerEntry(runID, stageID, 1, "head1"),
+			mergeCandidateVerifiedEntry(runID, stageID, 2, "head1", mergeCandidateResultFailed),
+			makeFixupEntry(runID, stageID, []planreview.Concern{{Severity: planreview.SeverityHigh, Note: "fix the thing"}}),
+		}
+	})
+	for path, resp := range got {
+		t.Run(path, func(t *testing.T) {
+			if resp.MergeCandidateVerify || resp.MergeCandidateVerifyBranch != "" ||
+				resp.MergeCandidateVerifyExpectedHeadSHA != "" || resp.MergeCandidateVerifyCause != "" {
+				t.Fatalf("consumed trigger served: %+v", resp)
+			}
+			if !resp.Fixup {
+				t.Error("fixup = false, want the ordinary fix-up that follows a consumed pass served unchanged")
+			}
+		})
+	}
+}

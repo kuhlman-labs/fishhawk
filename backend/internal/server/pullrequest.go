@@ -282,6 +282,24 @@ type pullRequestBody struct {
 	// The retired element tags mirror runner/internal/scenario.RetiredEntry.
 	ScenarioIDs      []string               `json:"scenario_ids,omitempty"`
 	RetiredScenarios []retiredScenarioEntry `json:"retired,omitempty"`
+
+	// MergeCandidateResult, MergeCandidateReason and MergeCandidateOutputTail
+	// form the verify-only merge-candidate pass report (ADR-090 D3 / #4018),
+	// present only when Outcome=="merge_candidate_verified": the result
+	// (passed | failed | not_executed), why the pass reached no verdict, and the
+	// verify output's tail. branch/head_sha carry the verified run-branch tip;
+	// there is no base_sha and no PR (the pass pushed nothing). The tail is
+	// runner-redacted, re-bounded server-side and UNTRUSTED: it is recorded as
+	// data and never reaches a routed fix-up. Declared here (with omitempty) so
+	// the DisallowUnknownFields decoder accepts the body; absent on every other
+	// variant.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+	// runner's upload.pullRequestMergeCandidateBody (the ship_merge_candidate
+	// pair in backend/internal/wirecontract).
+	MergeCandidateResult     string `json:"merge_candidate_result,omitempty"`
+	MergeCandidateReason     string `json:"merge_candidate_reason,omitempty"`
+	MergeCandidateOutputTail string `json:"merge_candidate_output_tail,omitempty"`
 }
 
 // Acceptance-stage scenario-corpus report outcomes (E72.4 / #3328).
@@ -289,6 +307,10 @@ const (
 	outcomeAcceptanceScenariosPushed           = "acceptance_scenarios_pushed"
 	outcomeAcceptanceScenarioRetirementDropped = "acceptance_scenario_retirement_dropped"
 )
+
+// outcomeMergeCandidateVerified is the verify-only merge-candidate pass report
+// (ADR-090 D3). It MIRRORS the runner's upload.OutcomeMergeCandidateVerified.
+const outcomeMergeCandidateVerified = "merge_candidate_verified"
 
 // validate returns a human-readable error if any required field is
 // missing. PR upload is irreversible (real PR exists on GitHub by
@@ -420,8 +442,22 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Merge-candidate verify report (ADR-090 D3): require the verified head and
+	// a result in the closed set, so the recorded verdict binds to a named head
+	// and a typo can never read as a pass.
+	if p.Outcome == outcomeMergeCandidateVerified {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a merge_candidate_verified outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for a merge_candidate_verified outcome")
+		case !validMergeCandidateResult(p.MergeCandidateResult):
+			return fmt.Errorf("merge_candidate_result must be \"passed\", \"failed\" or \"not_executed\" for a merge_candidate_verified outcome, got %q", p.MergeCandidateResult)
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", \"scope_park\", \"conflict_resolution_pushed\", \"acceptance_scenarios_pushed\", or \"acceptance_scenario_retirement_dropped\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", \"scope_park\", \"conflict_resolution_pushed\", \"merge_candidate_verified\", \"acceptance_scenarios_pushed\", or \"acceptance_scenario_retirement_dropped\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -633,6 +669,17 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// branch.
 	if pr.Outcome == "conflict_resolution_pushed" {
 		s.succeedConflictResolutionPushStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Merge-candidate verify report (ADR-090 D3 / #4018): a verify-only pass
+	// ran the declared verify command against a Fishhawk-written head and
+	// pushed nothing. Record the head-bound result, return the implement stage
+	// to the gate it held before the pass, and route a red result per D6. No
+	// PR artifact, no pull_request_url backfill and no permission-drift check —
+	// the pass wrote nothing.
+	if pr.Outcome == outcomeMergeCandidateVerified {
+		s.succeedMergeCandidateVerifiedStage(w, r, runID, stage, &pr, actorKind, actorSubject)
 		return
 	}
 
@@ -1681,7 +1728,17 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// ConflictResolutionFailure returns false whenever there is no LIVE
 	// conflict-resolution trigger (including one a prior failure already
 	// consumed), so an ordinary fix-up failure falls through unchanged.
-	recovered := s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stage.ID, pr.Reason)
+	// Merge-candidate verify recovery (ADR-090 D3) runs ahead of both: a
+	// crashed verify-only pass writes merge_candidate_verified{not_executed}
+	// (so its head is re-triggerable rather than read as in flight forever)
+	// and restores the pre-pass gate from ITS OWN trigger's anchors. It keys
+	// on a LIVE merge-candidate trigger for this stage, so every other failure
+	// — a decomposition child's pull_request_failed (#4079) included — falls
+	// through unchanged.
+	recovered := s.maybeRecoverMergeCandidateVerifyFailure(r.Context(), runID, stage.ID, pr.Reason)
+	if !recovered {
+		recovered = s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stage.ID, pr.Reason)
+	}
 	if !recovered {
 		recovered = s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
 	}
@@ -2075,6 +2132,168 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		Branch:  pr.Branch,
 		HeadSHA: pr.HeadSHA,
 	})
+}
+
+// pullRequestMergeCandidateResponse is the 200 body for the merge-candidate
+// verify report (ADR-090 D3). Result is the result IN FORCE for the trigger
+// (on an idempotent replay, the one first recorded); HeadSHA is the head it is
+// bound to. FixupRouted / FixupRefusal report the D6 route of a failed result.
+type pullRequestMergeCandidateResponse struct {
+	StageID      uuid.UUID `json:"stage_id"`
+	Outcome      string    `json:"outcome"`
+	Branch       string    `json:"branch"`
+	HeadSHA      string    `json:"head_sha"`
+	Result       string    `json:"merge_candidate_result"`
+	Idempotent   bool      `json:"idempotent"`
+	FixupRouted  bool      `json:"fixup_routed,omitempty"`
+	FixupRefusal string    `json:"fixup_refusal,omitempty"`
+}
+
+// mergeCandidateRunnerSubject is the actor subject recorded for a
+// signature-authenticated (runner) merge-candidate report, which carries no
+// token subject.
+const mergeCandidateRunnerSubject = "runner"
+
+// succeedMergeCandidateVerifiedStage handles the merge-candidate verify report
+// (ADR-090 D3 / #4018). In order:
+//
+//  1. HEAD BINDING (D2): a passed/failed result whose reported head is not the
+//     trigger's expected head is recorded as not_executed (head_mismatch), so a
+//     verdict can never bind to a head the runner did not verify.
+//  2. recordMergeCandidateVerified writes the head-bound row and CONSUMES the
+//     trigger. It is idempotent per (stage, trigger sequence): a runner retry
+//     after a 5xx appends nothing, settles nothing and routes nothing.
+//  3. settleMergeCandidateVerifyStage returns a `running` implement stage to
+//     the gate it held BEFORE the pass and calls Orchestrator.Advance.
+//  4. On `failed` only, routeMergeCandidateFailure applies D6.
+func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
+	ctx := r.Context()
+	stageID := stage.ID
+	if stage.Type != run.StageTypeImplement {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"merge_candidate_verified is accepted only on an implement stage",
+			map[string]any{"stage_id": stageID.String(), "stage_type": string(stage.Type)})
+		return
+	}
+
+	result, reason := pr.MergeCandidateResult, pr.MergeCandidateReason
+	live, err := s.liveMergeCandidateTrigger(ctx, runID, stageID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"the merge-candidate verify trigger could not be read; retry the report",
+			map[string]any{"stage_id": stageID.String(), "error": err.Error()})
+		return
+	}
+	if live != nil && result != mergeCandidateResultNotExecuted && pr.HeadSHA != live.payload.ExpectedHeadSHA {
+		reason = fmt.Sprintf("head_mismatch: the pass reported %s for head %s but the trigger expected %s; no verdict is bound",
+			result, pr.HeadSHA, live.payload.ExpectedHeadSHA)
+		result = mergeCandidateResultNotExecuted
+	}
+
+	subject := mergeCandidateRunnerSubject
+	if actorSubject != nil && *actorSubject != "" {
+		subject = *actorSubject
+	}
+	rec, err := s.recordMergeCandidateVerified(ctx, runID, stageID, result, reason, pr.MergeCandidateOutputTail, actorKind, subject)
+	if err != nil {
+		if errors.Is(err, errMergeCandidateNoLiveTrigger) || errors.Is(err, errMergeCandidateTriggerPayload) {
+			s.writeError(w, r, http.StatusConflict, "merge_candidate_verify_not_live",
+				"no live merge-candidate verify pass is recorded for this stage, so the report cannot be bound to a head",
+				map[string]any{"stage_id": stageID.String(), "error": err.Error()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"recording the merge-candidate verify result failed; retry the report",
+			map[string]any{"stage_id": stageID.String(), "error": err.Error()})
+		return
+	}
+	resp := pullRequestMergeCandidateResponse{
+		StageID:    stageID,
+		Outcome:    outcomeMergeCandidateVerified,
+		Branch:     pr.Branch,
+		HeadSHA:    rec.Trigger.ExpectedHeadSHA,
+		Result:     rec.Result,
+		Idempotent: rec.Duplicate,
+	}
+	if rec.Duplicate {
+		s.writeJSON(w, r, http.StatusOK, resp)
+		return
+	}
+
+	if stage.State == run.StageStateRunning {
+		s.settleMergeCandidateVerifyStage(ctx, runID, stage, rec.Trigger)
+	}
+
+	if rec.Result == mergeCandidateResultFailed {
+		runRow, gerr := s.cfg.RunRepo.GetRun(ctx, runID)
+		if gerr != nil {
+			resp.FixupRefusal = "the run could not be read (" + gerr.Error() + "), so no fix-up was routed. " + mergeCandidateFixupRoute
+		} else {
+			resp.FixupRouted, resp.FixupRefusal = s.routeMergeCandidateFailure(ctx, runRow, stageID, &rec.Trigger)
+		}
+		if !resp.FixupRouted {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"merge-candidate verify FAILED and no fix-up was routed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("head_sha", rec.Trigger.ExpectedHeadSHA),
+				slog.String("refusal", resp.FixupRefusal))
+		}
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// settleMergeCandidateVerifyStage returns the re-opened implement stage from
+// `running` to the gate it held BEFORE the pass — the trigger's recorded
+// PriorState — and then calls Orchestrator.Advance explicitly (approval
+// condition C1 on #4018). It deliberately does NOT go through
+// advanceImplementStageAfterPR: that settles by stage.RequiresApproval and
+// advances only on succeeded, so an approval-gated implement stage that had
+// already SUCCEEDED would re-park at awaiting_approval, the re-parked review
+// stage would never be re-walked, and a decomposed parent's consolidated-
+// review hold would never release. Advance re-walks the pending review stage
+// (re-entering DispatchConsolidatedReview on a parent) and is a no-op when
+// the implement stage is its own gate.
+//
+// A trigger whose PriorState is not a restorable gate (no producer writes
+// one) falls back to the approval-gate settle, so the stage never strands in
+// `running`. Best-effort like advanceImplementStageAfterPR: errors are
+// WARN-logged and never unwind the recorded result.
+func (s *Server) settleMergeCandidateVerifyStage(ctx context.Context, runID uuid.UUID, stage *run.Stage, trigger mergeCandidateVerifyTrigger) {
+	target := run.StageState(trigger.PriorState)
+	if target != run.StageStateSucceeded && target != run.StageStateAwaitingApproval {
+		fallback := run.StageStateSucceeded
+		if stage.RequiresApproval {
+			fallback = run.StageStateAwaitingApproval
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: trigger carries no restorable prior state; settling by the stage's approval gate",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("prior_state", trigger.PriorState),
+			slog.String("target", string(fallback)))
+		target = fallback
+	}
+	if _, err := s.cfg.RunRepo.TransitionStage(ctx, stage.ID, target, nil); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: settling the implement stage to its prior gate failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("target", string(target)),
+			slog.String("error", err.Error()))
+		return
+	}
+	if s.cfg.Orchestrator == nil {
+		return
+	}
+	if _, err := s.cfg.Orchestrator.Advance(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: orchestrator advance after settling the implement stage failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // pullRequestAcceptanceScenarioResponse is the 200 body for both acceptance

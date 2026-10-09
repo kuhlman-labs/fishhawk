@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1624,5 +1625,154 @@ func TestMergeRun_AlreadyMerged_ObservationNotRecorded_NamesRecovery(t *testing.
 	}
 	if !strings.Contains(out.Message, "record-merge-observation") {
 		t.Errorf("message must name record-merge-observation; got %q", out.Message)
+	}
+}
+
+// --- ADR-090 / E83.33 / #4018: merge-candidate refusals ----------------------
+
+// mergeCandidateErrBody renders a backend merge-candidate refusal envelope.
+func mergeCandidateErrBody(code, message string, details map[string]any) string {
+	raw, _ := json.Marshal(map[string]any{"error": map[string]any{"code": code, "message": message, "details": details}})
+	return string(raw)
+}
+
+// TestMergeRun_MergeCandidateRefusalsReturnImmediately pins each ADR-090 409
+// as an IMMEDIATE status: exactly ONE POST, ZERO terminal-await audit reads
+// (the await is never armed — a fake that would serve the poll is never
+// reached), no verdict flags, the backend message verbatim, and next_action
+// naming the clearing verb. Counterfactual: deleting the
+// isMergeCandidateRefusal arm surfaces each 409 as a tool error → RED.
+func TestMergeRun_MergeCandidateRefusalsReturnImmediately(t *testing.T) {
+	stageID := uuid.NewString()
+	cases := []struct {
+		code       string
+		details    map[string]any
+		wantStatus string
+		wantVerb   string
+		wantStage  bool
+		consumes   string
+	}{
+		{"merge_base_behind", map[string]any{"pr_url": "https://github.com/x/y/pull/7", "head_sha": "H", "base_ref": "main", "behind_by": 3, "next_step": "fishhawk_rebase_run_branch"},
+			"behind_base", "fishhawk_rebase_run_branch", false, consumesNone},
+		{"merge_candidate_unverified", map[string]any{"head_sha": "H", "cause": "base_advance", "verify_state": "in_flight", "stage_id": stageID, "next_step": "fishhawk_await_stage"},
+			"merge_candidate_unverified", "fishhawk_await_stage", true, consumesNone},
+		{"merge_candidate_verify_failed", map[string]any{"head_sha": "H", "cause": "fan_in", "verify_state": "failed", "next_step": "fishhawk_fixup_stage"},
+			"merge_candidate_verify_failed", "fishhawk_fixup_stage", false, consumesFixupBudget},
+		// An older detail map with no next_step falls back to the documented verb.
+		{"merge_candidate_unverified", map[string]any{"head_sha": "H", "verify_state": "unverified"},
+			"merge_candidate_unverified", "fishhawk_rebase_run_branch", false, consumesNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code+"/"+tc.wantVerb, func(t *testing.T) {
+			msg := "backend says: " + tc.code
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				mergeStickyStatus: http.StatusConflict,
+				mergeErrBody:      mergeCandidateErrBody(tc.code, msg, tc.details),
+				// A pr_merged entry the await WOULD resolve on, so an armed
+				// await would turn this into status=merged.
+				auditEntries: []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			runID := uuid.New()
+
+			start := time.Now()
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+			if err != nil {
+				t.Fatalf("mergeRun: %v — a %s 409 must be a status, not a tool error", err, tc.code)
+			}
+			if out.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q", out.Status, tc.wantStatus)
+			}
+			if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged {
+				t.Errorf("flags = %+v, want all false (nothing queued, no verdict)", out)
+			}
+			if out.Message != msg {
+				t.Errorf("message = %q, want the backend message verbatim", out.Message)
+			}
+			if out.NextAction == nil || out.NextAction.Action != tc.wantVerb {
+				t.Fatalf("next_action = %+v, want %s", out.NextAction, tc.wantVerb)
+			}
+			if out.NextAction.Params["run_id"] != runID.String() {
+				t.Errorf("next_action run_id = %q, want %s", out.NextAction.Params["run_id"], runID)
+			}
+			if got := out.NextAction.Params["stage_id"]; tc.wantStage != (got == stageID) {
+				t.Errorf("next_action stage_id = %q, want present=%v", got, tc.wantStage)
+			}
+			if out.NextAction.Consumes != tc.consumes {
+				t.Errorf("next_action consumes = %q, want %q", out.NextAction.Consumes, tc.consumes)
+			}
+			fb.mu.Lock()
+			calls, reads := fb.mergeCalls, fb.auditReadCalls
+			fb.mu.Unlock()
+			if calls != 1 {
+				t.Errorf("merge POSTed %d times, want EXACTLY 1 (no re-POST)", calls)
+			}
+			if reads != 0 {
+				t.Errorf("terminal-await audit reads = %d, want 0 (no await is armed)", reads)
+			}
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Errorf("mergeRun took %s, want an immediate return", elapsed)
+			}
+		})
+	}
+}
+
+// TestMergeRun_MergeCandidateCheckFailedIsToolError pins the 502 as a tool
+// error (a retryable read failure, not a precondition), and that an
+// unrelated 409 code is NOT swallowed as a merge-candidate status.
+func TestMergeRun_MergeCandidateCheckFailedIsToolError(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{
+		{http.StatusBadGateway, "merge_candidate_check_failed"},
+		{http.StatusConflict, "acceptance_gate_not_passed"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				mergeStickyStatus: tc.status,
+				mergeErrBody:      mergeCandidateErrBody(tc.code, "refused", map[string]any{"reason": "forge_read", "retryable": true}),
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 1})
+			if err == nil {
+				t.Fatalf("err = nil, out = %+v; want a tool error for %s", out, tc.code)
+			}
+			if !strings.Contains(err.Error(), tc.code) {
+				t.Errorf("error %q does not name %s", err, tc.code)
+			}
+		})
+	}
+}
+
+// TestIsMergeCandidateRefusal pins the code→status table and that only a 409
+// maps (a merge-candidate code on another status is not swallowed).
+func TestIsMergeCandidateRefusal(t *testing.T) {
+	for code, want := range map[string]string{
+		"merge_base_behind":             "behind_base",
+		"merge_candidate_unverified":    "merge_candidate_unverified",
+		"merge_candidate_verify_failed": "merge_candidate_verify_failed",
+	} {
+		if _, got, ok := isMergeCandidateRefusal(&apiError{StatusCode: http.StatusConflict, Code: code}); !ok || got != want {
+			t.Errorf("%s → (%q, %v), want (%q, true)", code, got, ok, want)
+		}
+		if _, _, ok := isMergeCandidateRefusal(&apiError{StatusCode: http.StatusBadGateway, Code: code}); ok {
+			t.Errorf("%s on a 502 mapped to a status, want a tool error", code)
+		}
+	}
+	for _, err := range []error{
+		&apiError{StatusCode: http.StatusBadGateway, Code: "merge_candidate_check_failed"},
+		&apiError{StatusCode: http.StatusConflict, Code: "merge_conflicting"},
+		errors.New("plain"),
+	} {
+		if _, _, ok := isMergeCandidateRefusal(err); ok {
+			t.Errorf("%v mapped to a merge-candidate status, want not", err)
+		}
 	}
 }
