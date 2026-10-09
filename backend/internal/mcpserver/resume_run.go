@@ -15,7 +15,7 @@ import (
 // a NEW plan-stage-less child run executing against the parent's
 // approved plan.
 type ResumeRunInput struct {
-	ParentRunID string `json:"parent_run_id" jsonschema:"UUID of the failed run to recover: a top-level category-B-failed run (mints a new plan-stage-less child against its approved plan) OR a failed decomposition CHILD (re-drives that child in place on the shared parent branch)"`
+	ParentRunID string `json:"parent_run_id" jsonschema:"UUID of the failed run to recover: a top-level category-B-failed run (mints a new plan-stage-less child against its approved plan) OR a failed decomposition CHILD (re-drives that child in place on the shared parent branch). A top-level DECOMPOSED run (its approved plan carries decomposition.sub_plans, or it has decomposition children) is refused with resume_unsupported_decomposed — restart it instead"`
 	// AddScopeFiles are operator-named paths folded into the recovery
 	// run's effective scope as a pre-approved scope amendment.
 	AddScopeFiles []RecoverScopePath `json:"add_scope_files,omitempty" jsonschema:"paths to fold into the recovery run's effective scope; each entry is {path, operation} with operation 'modify' (default) or 'create' for net-new files the #818 gate would otherwise fail"`
@@ -76,6 +76,18 @@ Two target shapes, auto-detected from parent_run_id:
     parent_run_id at the failed child's own id (next_actions surfaces
     it); pointing it at the parent run replans from scratch instead.
 
+A top-level DECOMPOSED run is refused, never flattened: when its
+approved plan (resolved through the parent walk, so a recovery of a
+recovery counts) carries decomposition.sub_plans, or it has
+decomposition children, the backend answers 422
+resume_unsupported_decomposed and mints nothing. A flat recovery run
+cannot re-fan-out, so one implement stage would carry the whole
+decomposition against one implement timeout. Restart instead:
+fishhawk_start_campaign_item_run for a campaign item, otherwise
+fishhawk_start_run, re-stating the prior plan approval's conditions —
+or re-drive ONE failed slice in place by pointing parent_run_id at that
+decomposition child's own id.
+
 Either way an ineligible target returns a recovery_not_eligible error
 naming which leg failed the gate, and a plan_reused_from audit entry
 records the recovery. Parents without a cached workflow spec (legacy
@@ -135,6 +147,15 @@ func (r *runResolver) resumeRun(ctx context.Context, req *mcp.CallToolRequest, i
 			case "recovery_unsupported":
 				return nil, ResumeRunOutput{}, fmt.Errorf(
 					"recovery_unsupported: %s — start a fresh run with fishhawk_start_run", ae.Message)
+			case "resume_unsupported_decomposed":
+				// E72.62 / #4081: the target is a decomposed parent (or a flat
+				// recovery of one). A flat, plan-stage-less recovery run can
+				// never re-fan-out, so the backend refuses and mints nothing.
+				// Name the restart verbs here rather than relying on the
+				// backend's message carrying them.
+				return nil, ResumeRunOutput{}, fmt.Errorf(
+					"resume_unsupported_decomposed: %s (sub_plan_count=%v decomposed_child_count=%v). fishhawk_resume_run never mints a flat recovery run for a decomposed plan — it could not re-fan-out, so one implement stage would carry the whole decomposition against one implement timeout. Restart instead: if this run belongs to a campaign, restart the item with fishhawk_start_campaign_item_run; otherwise start a fresh run for the same issue with fishhawk_start_run (its plan stage re-decomposes and approving it fans the slices out again), and re-state the prior plan approval's conditions at the new plan gate. To re-drive ONE failed slice in place instead, point fishhawk_resume_run at that decomposition child's own run id (failed_child_run_ids)",
+					ae.Message, ae.Details["sub_plan_count"], ae.Details["decomposed_child_count"])
 			}
 		}
 		return nil, ResumeRunOutput{}, fmt.Errorf("recover run: %w", err)

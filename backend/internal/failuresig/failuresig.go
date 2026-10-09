@@ -30,6 +30,20 @@ import "strings"
 // and a future breaking re-cut of the ids is distinguishable on the wire.
 const RegistryVersion = "v1"
 
+// AnchorSliceIntegrationGiveUp is the stable prefix the decomposition fan-in
+// sweeper stamps on the PARENT implement stage's failure reason when its
+// bounded-retry IntegrateSlices give-up fires (#1243): "slice integration
+// failed after %d attempts: %v" (backend/internal/childcompletion/sweeper.go,
+// which renders the reason FROM this constant). It is the classifier key the
+// mcpserver next_actions arm reads to steer that decomposed-parent shape to a
+// restart instead of fishhawk_resume_run (E72.62 / #4081).
+//
+// It is declared HERE, not beside the catalog anchors in registry.go, and no
+// v1 signature matches on it: it is a backend-internal producer -> classifier
+// seam, and this package is the single place the backend module declares such
+// failure-reason literals, so the producer and the classifier cannot diverge.
+const AnchorSliceIntegrationGiveUp = "slice integration failed after"
+
 // stageStateFailed is the one stage state that describes a failure. Evidence
 // carrying any OTHER non-empty state describes a live or settled-healthy
 // stage, which is never a failure to diagnose.

@@ -2,12 +2,25 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	planpkg "github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
 // --- fishhawk_resume_run (#978) ---
@@ -224,5 +237,205 @@ func TestResumeRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
 	assertBoundedWithElisions(t, "fishhawk_resume_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
 	if out.Run.ID != childID {
 		t.Errorf("the recovery run id was lost to the bound: %+v", out.Run)
+	}
+}
+
+// --- E72.62 / #4081: decomposed-parent refusal -----------------------------
+
+// TestResumeRun_UnsupportedDecomposed_MapsRestartActions: the backend's 422
+// resume_unsupported_decomposed maps to an actionable error naming the
+// restart verbs. The fake's message deliberately names NO tool and carries no
+// details, so only the mapping arm can put the verbs in the error.
+func TestResumeRun_UnsupportedDecomposed_MapsRestartActions(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	fb.mu.Lock()
+	fb.recoverStatus = http.StatusUnprocessableEntity
+	fb.recoverErrBody = `{"error":{"code":"resume_unsupported_decomposed","message":"the run is a decomposed parent"}}`
+	fb.mu.Unlock()
+
+	_, _, err := r.resumeRun(context.Background(), nil, ResumeRunInput{ParentRunID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("resumeRun succeeded, want the resume_unsupported_decomposed refusal")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"resume_unsupported_decomposed",
+		"the run is a decomposed parent",
+		"fishhawk_start_campaign_item_run",
+		"fishhawk_start_run",
+		"re-state the prior plan approval's conditions",
+		"decomposition child's own run id",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error does not carry %q:\n%s", want, msg)
+		}
+	}
+}
+
+// recoverE2ESpecYAML is a plan+implement workflow the real recover handler
+// parses to re-create the non-plan stages on a minted child.
+const recoverE2ESpecYAML = `version: "0.4"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// seedRecoverE2EParent persists, in real Postgres, a top-level run with the
+// cached spec, a SUCCEEDED plan stage carrying a standard_v1 plan artifact
+// (decomposed into subPlans sub_plans when subPlans > 0) and an implement
+// stage FAILED category-B with the given reason — the fully eligible recover
+// shape. Returns the run id.
+func seedRecoverE2EParent(t *testing.T, ctx context.Context, runRepo runmodel.Repository, artRepo artifact.Repository, subPlans int, reason string) uuid.UUID {
+	t.Helper()
+	row, err := runRepo.CreateRun(ctx, runmodel.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runmodel.TriggerCLI,
+		WorkflowSpec: []byte(recoverE2ESpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	newStage := func(seq int, typ runmodel.StageType, final runmodel.StageState, done *runmodel.StageCompletion) *runmodel.Stage {
+		t.Helper()
+		st, err := runRepo.CreateStage(ctx, runmodel.CreateStageParams{
+			RunID: row.ID, Sequence: seq, Type: typ, ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create %s stage: %v", typ, err)
+		}
+		for _, to := range []runmodel.StageState{runmodel.StageStateDispatched, runmodel.StageStateRunning} {
+			if _, err := runRepo.TransitionStage(ctx, st.ID, to, nil); err != nil {
+				t.Fatalf("transition %s stage to %s: %v", typ, to, err)
+			}
+		}
+		if _, err := runRepo.TransitionStage(ctx, st.ID, final, done); err != nil {
+			t.Fatalf("transition %s stage to %s: %v", typ, final, err)
+		}
+		return st
+	}
+	planStage := newStage(0, runmodel.StageTypePlan, runmodel.StageStateSucceeded, nil)
+	catB := runmodel.FailureB
+	newStage(1, runmodel.StageTypeImplement, runmodel.StageStateFailed,
+		&runmodel.StageCompletion{FailureCategory: &catB, FailureReason: &reason})
+
+	p := planpkg.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "e2e recover plan",
+		Verification: planpkg.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: planpkg.Scope{
+			Files: []planpkg.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: planpkg.FileOpModify}},
+		},
+	}
+	if subPlans > 0 {
+		p.Decomposition = &planpkg.Decomposition{Rationale: "too big for one implement timeout"}
+		for i := 0; i < subPlans; i++ {
+			p.Decomposition.SubPlans = append(p.Decomposition.SubPlans, planpkg.SubPlanSummary{
+				Title: "slice " + string(rune('A'+i)), ScopeHint: "backend/internal/server",
+				PredictedRuntimeMinutes: 30, PredictedRuntimeConfidence: planpkg.RuntimeConfidenceMedium,
+			})
+		}
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sum := sha256.Sum256(body)
+	sv := "standard_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv,
+		Content: body, ContentHash: hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("create plan artifact: %v", err)
+	}
+	return row.ID
+}
+
+// childrenOf lists the runs whose ParentRunID is parent, read back from Postgres.
+func childrenOf(t *testing.T, ctx context.Context, runRepo runmodel.Repository, parent uuid.UUID) []*runmodel.Run {
+	t.Helper()
+	rows, err := runRepo.ListRuns(ctx, runmodel.ListRunsFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	var out []*runmodel.Run
+	for _, r := range rows {
+		if r.ParentRunID != nil && *r.ParentRunID == parent {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestResumeRun_DecomposedParentRefusal_EndToEnd is the cross-boundary test:
+// MCP tool -> real HTTP client -> real route + auth (requireWriteScope,
+// requireRunAccount) -> handleRecoverRun -> plan resolution over the real
+// artifact store -> run persistence in real Postgres. The decomposed parent's
+// call is refused with resume_unsupported_decomposed and NO child run with
+// ParentRunID = that parent exists afterwards; the flat control parent's call
+// through the IDENTICAL wiring SUCCEEDS and mints a child, so the decomposed
+// arm's refusal cannot be a 401/403/404 masking it.
+func TestResumeRun_DecomposedParentRefusal_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runmodel.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	giveUp := failuresig.AnchorSliceIntegrationGiveUp + " 5 attempts: seeded"
+	decomposed := seedRecoverE2EParent(t, ctx, runRepo, artRepo, 2, giveUp)
+	control := seedRecoverE2EParent(t, ctx, runRepo, artRepo, 0, "undeclared created file")
+
+	const bearer = "fhk_resume_decomposed_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:runs"}, PlainText: bearer,
+	}}
+	srv := server.New(server.Config{
+		RunRepo: runRepo, ArtifactRepo: artRepo, AuditRepo: auditRepo,
+		SigningRepo: signing.NewPostgresRepository(pool), APITokenRepo: tokRepo,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: bearer}), getenv: envFuncFromMap(nil)}
+
+	// Decomposed parent: refused, nothing minted.
+	// Errorf, not Fatal: on a regression the no-child assertion below (C4)
+	// must still run and report the minted flat run.
+	_, _, err := r.resumeRun(ctx, nil, ResumeRunInput{ParentRunID: decomposed.String()})
+	if err == nil {
+		t.Errorf("resume of the decomposed parent succeeded, want resume_unsupported_decomposed")
+	} else {
+		for _, want := range []string{"resume_unsupported_decomposed", "fishhawk_start_campaign_item_run", "fishhawk_start_run", "sub_plan_count=2"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("decomposed refusal does not carry %q:\n%v", want, err)
+			}
+		}
+	}
+	if kids := childrenOf(t, ctx, runRepo, decomposed); len(kids) != 0 {
+		t.Errorf("runs with ParentRunID = decomposed parent = %d, want 0 (a flat run was minted)", len(kids))
+	}
+
+	// Flat control parent: the same wiring mints a child.
+	_, out, err := r.resumeRun(ctx, nil, ResumeRunInput{ParentRunID: control.String()})
+	if err != nil {
+		t.Fatalf("resume of the flat control parent: %v", err)
+	}
+	if out.Run.ParentRunID == nil || *out.Run.ParentRunID != control.String() {
+		t.Errorf("control child ParentRunID = %v, want %s", out.Run.ParentRunID, control)
+	}
+	if kids := childrenOf(t, ctx, runRepo, control); len(kids) != 1 {
+		t.Errorf("runs with ParentRunID = control parent = %d, want 1", len(kids))
 	}
 }

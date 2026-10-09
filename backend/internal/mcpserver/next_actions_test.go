@@ -6283,3 +6283,76 @@ func TestNextActions_RollbackOffer_ServerProducedRoundTrip(t *testing.T) {
 		t.Errorf("the server-produced offer must never surface the merge ritual; got %v", actionNames(out.NextActions))
 	}
 }
+
+// --- E72.62 / #4081: decomposed-parent fan-in give-up ----------------------
+
+// naDecomposedParentGiveUpStages is the observed failure shape: a decomposed
+// parent (plan succeeded) whose implement (awaiting_children) stage failed
+// category-B by the fan-in sweeper's bounded-retry give-up. The reason is
+// built from the SAME failuresig anchor the sweeper renders it from.
+func naDecomposedParentGiveUpStages() []Stage {
+	return []Stage{
+		naStage("plan", "succeeded"),
+		naFailedImplement("B", failuresig.AnchorSliceIntegrationGiveUp+" 5 attempts: boom"),
+	}
+}
+
+// TestImplementFailedNextActions_DecomposedParentIntegrationGiveUp: the plan
+// stage SUCCEEDED, so without the give-up arm the generic
+// implement_failed_category_b arm would offer fishhawk_resume_run on the
+// parent — the exact trap the backend now refuses. The arm must route to a
+// restart instead.
+func TestImplementFailedNextActions_DecomposedParentIntegrationGiveUp(t *testing.T) {
+	if sliceIntegrationGiveUpReasonPrefix == "" {
+		t.Fatal("sliceIntegrationGiveUpReasonPrefix is empty: strings.HasPrefix would hijack EVERY category-B failure")
+	}
+	run := naRun("failed")
+	stages := naDecomposedParentGiveUpStages()
+	plan, impl := &stages[0], &stages[1]
+
+	na := implementFailedNextActions(run, plan, nil, impl)
+	if na == nil || na.State != "implement_failed_category_b_decomposed_parent" {
+		t.Fatalf("state = %+v, want implement_failed_category_b_decomposed_parent", na)
+	}
+	if len(na.Actions) != 1 {
+		t.Fatalf("actions = %v, want exactly one (fishhawk_start_run)", actionNames(na))
+	}
+	start := findAction(t, na, "fishhawk_start_run")
+	if start.Params["repo"] != run.Repo || start.Params["workflow_id"] != run.WorkflowID {
+		t.Errorf("fishhawk_start_run params = %v, want repo %q + workflow_id %q", start.Params, run.Repo, run.WorkflowID)
+	}
+	if start.Consumes != consumesNewRun {
+		t.Errorf("consumes = %q, want %q", start.Consumes, consumesNewRun)
+	}
+	if nextActionOffered(na, "fishhawk_resume_run") {
+		t.Errorf("fishhawk_resume_run offered on a decomposed parent; the backend refuses it (resume_unsupported_decomposed)")
+	}
+	for _, want := range []string{"resume_unsupported_decomposed"} {
+		if !strings.Contains(start.Precondition, want) {
+			t.Errorf("precondition = %q, want it to name %q", start.Precondition, want)
+		}
+	}
+	for _, want := range []string{"fishhawk_start_campaign_item_run", "conditions"} {
+		if !strings.Contains(start.Reason, want) {
+			t.Errorf("reason = %q, want it to name %q", start.Reason, want)
+		}
+	}
+}
+
+// TestNextActions_DecomposedParentGiveUpOffersFilingSuggestion: the new state
+// is a product-failure shape, so foldProductIssueSuggestion appends the
+// fishhawk_report_product_issue suggestion LAST.
+func TestNextActions_DecomposedParentGiveUpOffersFilingSuggestion(t *testing.T) {
+	run := naRun("failed")
+	na := nextActionsFor(run, naDecomposedParentGiveUpStages(), nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_failed_category_b_decomposed_parent" {
+		t.Fatalf("state = %+v, want implement_failed_category_b_decomposed_parent", na)
+	}
+	if na.Actions[0].Action != "fishhawk_start_run" {
+		t.Errorf("actions[0] = %q, want the restart to lead", na.Actions[0].Action)
+	}
+	got := wantFilingLast(t, na, run.ID)
+	if !strings.Contains(got.Reason, "category B") {
+		t.Errorf("filing reason = %q, want it to carry the category-B evidence anchor", got.Reason)
+	}
+}

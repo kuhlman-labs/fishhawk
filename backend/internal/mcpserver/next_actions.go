@@ -278,6 +278,7 @@ func productIssueActionFor(run *Run, why string) SuggestedAction {
 var productIssueFilingStates = map[string]struct{}{
 	"implement_failed_category_b":                     {},
 	"implement_failed_category_b_decomposition_child": {},
+	"implement_failed_category_b_decomposed_parent":   {},
 	"slices_integration_conflict":                     {},
 	"implement_failed":                                {},
 	"ci_failed_routable":                              {},
@@ -1367,7 +1368,9 @@ func reviveRunAction(run *Run) SuggestedAction {
 
 // implementFailedNextActions branches on the failed implement stage's
 // failure category: B routes to the no-replan recovery run (or, for a
-// decomposition child, an IN-PLACE re-drive), A to an in-place retry
+// decomposition child, an IN-PLACE re-drive; for a decomposed parent whose
+// fan-in gave up, a RESTART — fishhawk_resume_run refuses it with
+// resume_unsupported_decomposed, E72.62 / #4081), A to an in-place retry
 // (citing a known flake trace event when the failure detail carries one),
 // everything else to retry-or-cancel. The category-A and default (retryable)
 // arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park.
@@ -1404,6 +1407,28 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					Precondition: "the parent implement (awaiting_children) stage failed category-B with a slice integration conflict; read the conflicting child id from the latest slice_integration_conflict audit entry's structured payload (conflicting_child_run_id), NOT from the failure reason string",
 					Consumes:     consumesNone,
 					Reason:       "slice integration conflict during fan-in: the consolidated branch already holds the earlier slices, so re-drive ONLY the conflicting slice child in place (fishhawk_resume_run pointed at conflicting_child_run_id from the slice_integration_conflict audit) to resolve the conflict and resume fan-in — pointing resume at the parent would replan from scratch and discard the succeeded sibling slices",
+				}},
+			}
+		}
+		// Decomposed-parent fan-in give-up (E72.62 / #4081): the PARENT's
+		// implement (awaiting_children) stage failed category-B because the
+		// sweeper's bounded IntegrateSlices retry gave up (#1243). Its plan
+		// stage SUCCEEDED, so without this arm the generic arm below would
+		// steer straight into fishhawk_resume_run on the parent — which the
+		// backend refuses (resume_unsupported_decomposed): a flat recovery
+		// run cannot re-fan-out. Recognized by the stable reason PREFIX the
+		// sweeper renders from the same failuresig anchor. Placed AFTER the
+		// slice-integration-conflict arm and BEFORE the decomposition-child
+		// and generic arms.
+		if impl.FailureReason != nil && strings.HasPrefix(*impl.FailureReason, sliceIntegrationGiveUpReasonPrefix) {
+			return &NextActions{
+				State: "implement_failed_category_b_decomposed_parent",
+				Actions: []SuggestedAction{{
+					Action:       "fishhawk_start_run",
+					Params:       map[string]string{"repo": run.Repo, "workflow_id": run.WorkflowID},
+					Precondition: "this is a DECOMPOSED parent whose implement (awaiting_children) stage failed category-B because the fan-in's bounded slice-integration retry gave up; fishhawk_resume_run refuses it (resume_unsupported_decomposed) because a flat, plan-stage-less recovery run cannot re-fan-out",
+					Consumes:     consumesNewRun,
+					Reason:       "decomposed-parent fan-in give-up: restart so a new plan stage re-decomposes and its approval fans the slices out again — if this run belongs to a campaign, restart the item with fishhawk_start_campaign_item_run instead; either way re-state the prior plan approval's conditions at the new plan gate (they are not carried automatically)",
 				}},
 			}
 		}
@@ -2518,6 +2543,17 @@ func stageByType(stages []Stage, stageType string) *Stage {
 // SOURCED FROM the failure-signature registry (#1703) rather than declared
 // locally, for the same single-source reason as flakeTraceEvents above.
 const sliceIntegrationConflictReasonPrefix = failuresig.AnchorSliceIntegrationConflict
+
+// sliceIntegrationGiveUpReasonPrefix is the stable prefix the decomposition
+// fan-in sweeper stamps on a decomposed parent's implement stage when its
+// bounded-retry IntegrateSlices give-up fires (#1243): "slice integration
+// failed after %d attempts: %v". The E72.62 / #4081 next_actions arm keys on
+// it to steer that parent to a restart instead of fishhawk_resume_run.
+//
+// SOURCED FROM failuresig, the one declaration the producer
+// (childcompletion's sweeper renders the reason from it) also reads — no
+// second copy exists to drift.
+const sliceIntegrationGiveUpReasonPrefix = failuresig.AnchorSliceIntegrationGiveUp
 
 // Acceptance audit categories + verdict/disposition vocabulary (E31.9 /
 // ADR-049). These strings are the cross-module seam between the backend, which

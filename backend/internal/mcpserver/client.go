@@ -4088,6 +4088,10 @@ type RecoverRunParams struct {
 //   - 409 recovery_not_eligible (plan not succeeded / implement not
 //     failed category-B)
 //   - 422 recovery_unsupported (no cached workflow spec)
+//   - 422 resume_unsupported_decomposed (E72.62 / #4081: the target is a
+//     decomposed parent — its parent-walked approved plan carries
+//     decomposition.sub_plans or it has decomposition children — so a flat
+//     recovery run is refused and nothing is minted)
 func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, bool, error) {
 	body, err := json.Marshal(recoverRunRequest{
 		AddScopeFiles:    p.AddScopeFiles,

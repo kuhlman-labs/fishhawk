@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -68,6 +69,15 @@ type recoverRunRequest struct {
 // implement stage failed category-B: recovery is a NEW run against an
 // already-approved plan, not a retry of the terminal one
 // (fishhawk_retry_stage keeps refusing B).
+//
+// An ELIGIBLE top-level target that is a decomposed parent — its
+// parent-walked approved plan carries decomposition.sub_plans, or it has
+// decomposition children — is refused with 422
+// resume_unsupported_decomposed (E72.62 / #4081) BEFORE anything is minted:
+// the orchestrator fans out only from a run's OWN plan stage, so a flat
+// plan-stage-less child could never re-fan-out and its single implement
+// stage would carry the whole decomposition against one implement timeout.
+// A decomposition CHILD target still re-drives in place (below).
 //
 // RetryAttempt is carried UNCHANGED from the parent — operator
 // recovery is not an auto-retry and must not consume the
@@ -242,6 +252,18 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Decomposed-parent refusal (E72.62 / #4081). Placed AFTER the
+	// eligibility gate, so an ineligible decomposed run keeps its
+	// recovery_not_eligible answer, and BEFORE the spec parse, the
+	// Idempotency-Key replay, the budget gate, CreateRun, the amendment
+	// folds and the plan_reused_from append, so a refused call mints no run,
+	// folds no amendment and appends no audit row. approvedPlan is the
+	// parent-walked plan, so a flat recovery child of a decomposed parent
+	// (recovery-of-a-recovery) is refused too.
+	if s.refuseDecomposedRecovery(w, r, parent, approvedPlan) {
+		return
+	}
+
 	parsed, err := spec.ParseBytes(parent.WorkflowSpec)
 	if err != nil {
 		s.writeError(w, r, http.StatusUnprocessableEntity, "recovery_unsupported",
@@ -395,6 +417,81 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, inheritedPaths, exemptPaths, req.Reason, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
+}
+
+// codeResumeUnsupportedDecomposed is the 422 refusal for a category-B
+// recovery of a DECOMPOSED run (E72.62 / #4081): see refuseDecomposedRecovery.
+const codeResumeUnsupportedDecomposed = "resume_unsupported_decomposed"
+
+// decomposedRecoveryNextActions is the FIXED next_actions list the
+// resume_unsupported_decomposed refusal carries. It is deliberately static:
+// run.Run carries no campaign membership, so the campaign-vs-fresh restart
+// choice is stated conditionally rather than resolved by a lookup, and the
+// in-place slice re-drive is likewise conditioned on a failed child existing
+// (failed_child_run_ids in the same details names them).
+var decomposedRecoveryNextActions = []string{
+	"If this run belongs to a campaign, restart the item with fishhawk_start_campaign_item_run; otherwise start a fresh run for the same issue with fishhawk_start_run. The new run's plan stage re-decomposes, and approving it fans the slices out again",
+	"Re-state the prior plan approval's conditions at the new run's plan gate (fishhawk_approve_plan): they are not carried to a restarted run automatically",
+	"If a decomposition child of this run failed category-B (failed_child_run_ids), re-drive that ONE slice in place instead by pointing fishhawk_resume_run at the child's own run id, not at this run",
+}
+
+// refuseDecomposedRecovery is the E72.62 / #4081 guard on the top-level
+// recover branch: a DECOMPOSED run cannot be recovered by a flat,
+// plan-stage-less child, because orchestrator.fanoutIfDecomposed reads the
+// approved plan only from the run's OWN plan stage — the child would never
+// re-fan-out, and its single implement stage would have to carry the whole
+// decomposition against one implement timeout (run 3c0e224b from parent
+// f16f2e77).
+//
+// Two shape signals, either sufficient:
+//   - the parent-walked approved plan carries decomposition.sub_plans (the
+//     SAME len(SubPlans) > 0 predicate fanoutIfDecomposed uses), which also
+//     catches a flat recovery child OF a decomposed parent;
+//   - the target has decomposition children (DecomposedFrom = target).
+//
+// It writes the response and returns true when it refused; it returns false
+// with nothing written when the target is not decomposed. A children-lookup
+// error FAILS CLOSED (500, nothing minted): failing open would be exactly the
+// flat-run mint this guard exists to prevent.
+func (s *Server) refuseDecomposedRecovery(w http.ResponseWriter, r *http.Request, target *run.Run, approvedPlan *plan.Plan) bool {
+	subPlanCount := 0
+	if approvedPlan != nil && approvedPlan.Decomposition != nil {
+		subPlanCount = len(approvedPlan.Decomposition.SubPlans)
+	}
+	children, err := s.listAllDecomposedChildren(r.Context(), target.ID)
+	if err != nil {
+		// Static message + cause via internalCauseKey (E67.15 / #2587).
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not determine whether the run is a decomposed parent; refusing rather than minting a flat recovery run",
+			map[string]any{"run_id": target.ID.String(), internalCauseKey: err.Error()})
+		return true
+	}
+	if subPlanCount == 0 && len(children) == 0 {
+		return false
+	}
+	var failedChildren []string
+	for _, c := range children {
+		if c.State == run.StateFailed {
+			failedChildren = append(failedChildren, c.ID.String())
+		}
+	}
+	details := map[string]any{
+		"run_id":                 target.ID.String(),
+		"sub_plan_count":         subPlanCount,
+		"decomposed_child_count": len(children),
+		"next_actions":           decomposedRecoveryNextActions,
+	}
+	if len(failedChildren) > 0 {
+		details["failed_child_run_ids"] = failedChildren
+	}
+	if approvedPlan != nil {
+		details["gate_runtime_minutes"] = approvedPlan.GateRuntimeMinutes()
+	}
+	s.writeError(w, r, http.StatusUnprocessableEntity, codeResumeUnsupportedDecomposed,
+		fmt.Sprintf("run %s is a decomposed parent (sub_plans=%d, decomposition children=%d): a flat, plan-stage-less recovery run cannot re-fan-out, so its single implement stage would have to carry the whole decomposition against one implement timeout; nothing was minted — restart the run instead (see next_actions)",
+			target.ID, subPlanCount, len(children)),
+		details)
+	return true
 }
 
 // createApprovedScopeAmendment folds the operator-named paths into the

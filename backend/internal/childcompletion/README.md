@@ -57,6 +57,8 @@ A process restart resets the counter (acceptable — it retries `maxIntegrationA
 
 A `*SliceHeadMissingError` never reaches this counter (see below).
 
+**The give-up reason's lead is a classifier key (E72.62 / #4081).** The reason renders as `slice integration failed after <N> attempts: <error>` FROM `failuresig.AnchorSliceIntegrationGiveUp` (the one declaration; `TestTick_Integrate_BoundedRetryGivesUpAtCap` pins the prefix AND the exact bytes). `backend/internal/mcpserver`'s `next_actions` reads that prefix to classify the parent as `implement_failed_category_b_decomposed_parent` and offer a RESTART, not `fishhawk_resume_run`: a flat, plan-stage-less recovery run cannot re-fan-out (the orchestrator reads the approved plan only from the run's OWN plan stage), so `POST /v0/runs/{id}/recover` refuses a decomposed parent with 422 `resume_unsupported_decomposed` and mints nothing. Recover by restarting the campaign item (`fishhawk_start_campaign_item_run`) or a fresh `fishhawk_start_run`, or re-drive one failed slice child in place.
+
 ## Missing slice head: park, never category-B (#4079)
 
 `orchestrator.integrateSlices` returns a typed `*SliceHeadMissingError{SliceIndex, ChildRunID, Branch}` when `MergeBranch` 404s for a slice head AND a `GetBranchSHA` probe confirms the head is absent — a child that reached `succeeded` without ever pushing its slice branch. A probe error or an existing head stays the generic error, so a base-missing or unrelated 404 is never misclassified. The serve.go adapter's `translateSliceHeadMissing` converts it (wrapped or bare) into this package's `SliceHeadMissingError` — the same import-graph bridge as `SliceConflict` — for BOTH `IntegrateSlices` and `IntegrateCompletedWave`.
