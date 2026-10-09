@@ -154,6 +154,18 @@ type config struct {
 	// Drives shared-branch routing in openPRAndShipArtifact.
 	decomposedFromRunID string
 
+	// pinnedBaseSHA is set at runtime (not a flag) by run() before the agent
+	// is invoked (#3973): the base the implement stage starts from — the
+	// standalone #3454 advance tip, a decomposition child's wave-base tip, or
+	// its own pre-existing slice branch tip. Both git_diff emitters
+	// (resolveStageDiffBase) merge-base against it with no fetch, and
+	// openPRAndShipArtifact hands it to CommitAndPush as PinnedBaseSHA so the
+	// commit is cut from it instead of a re-fetched, possibly moved, base tip.
+	// Empty on every unpinned path: fix-up passes, every advance/wave-base
+	// skip or degrade, and the #4079 held-commit resume short-circuit — those
+	// keep today's commit-time fetch and diff re-anchor unchanged.
+	pinnedBaseSHA string
+
 	// scopeFiles is set at runtime (not a flag) from the fetched
 	// prompt's scope_files on implement stages (#581). When non-empty
 	// it bounds the implement commit + policy diff to exactly these

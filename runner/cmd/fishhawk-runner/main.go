@@ -1923,13 +1923,23 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// extraheader (#1951). A mint failure degrades to "" (ambient auth),
 		// never a stage failure.
 		advanceAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
-		if _, advErr := advanceLineageWorktreeToBase(
-			ctx, repoDir, resolveImplementBaseRef(cfg), advanceAuthToken, logSink); advErr != nil {
+		advanceBaseRef := resolveImplementBaseRef(cfg)
+		advanceTip, _, advErr := advanceLineageWorktreeToBase(
+			ctx, repoDir, advanceBaseRef, advanceAuthToken, logSink)
+		if advErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n",
 				lineageBaseAdvanceFailureReason(advErr), advErr.Error())
 			return exitFailure
 		}
+		// Stage-lifetime base pin (#3973): the tip the worktree now sits on (the
+		// advanced-to tip, or the already-current tip) is the base this stage
+		// is judged against for its whole lifetime — the policy-diff merge-base
+		// (resolveStageDiffBase) and the commit-time branch cut (CommitAndPush
+		// PinnedBaseSHA) both use it instead of re-fetching a base that may
+		// move mid-stage. Every advance SKIP returns "" and leaves the stage
+		// unpinned, so the commit-time fetch still runs exactly as before.
+		pinBase(&cfg, advanceBaseRef, advanceTip, baseSourceStandaloneAdvance, logSink)
 	}
 
 	// Child wave-base establishment (#1302, supersedes the dormant #1036 /
@@ -1944,11 +1954,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// sees them and can compile, instead of correctly writing nothing and
 	// failing child_no_changes (#1302). The prior block keyed this checkout on
 	// the child's OWN sole-writer slice branch (childSliceBranch), which is
-	// minted once and so NEVER pre-exists on the remote: remoteBranchExists was
-	// always false and the block silently no-oped in production — the exact
-	// #1302 defect. The remoteBranchExists guard is retained so an absent base
-	// (a never-pushed main, or an empty consolidated when GitHub is not wired)
-	// gracefully skips and falls through to today's ambient-HEAD behavior. This
+	// absent on the remote for a FRESH child: remoteBranchExists was always
+	// false there and the block silently no-oped in production — the exact
+	// #1302 defect. A RESUMED, amended or retried child's slice branch MAY
+	// already exist (its earlier attempt pushed it), and since #3973 that case
+	// is handled FIRST, below: the child bases on its own slice branch tip,
+	// pins it, bounds its policy diff against origin/<slice-branch> (the #765
+	// increment base, see resolvePolicyBaseRef), and its commit is cut from
+	// that pinned tip so the non-force push is a fast-forward instead of the
+	// #3991 non-fast-forward rejection. The remoteBranchExists guard is
+	// retained so an absent base (a never-pushed main, or an empty consolidated
+	// when GitHub is not wired) gracefully skips and falls through to today's
+	// ambient-HEAD behavior, unpinned. This
 	// base now AGREES with the commit-time branch cut (resolveImplementBranch-
 	// Routing's freshFetchBase = baseRef) and the policy diff (decomposedPolicy-
 	// Base → cfg.checkBaseRef), so the agent's view, the policy-diff base, and
@@ -1990,7 +2007,35 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// any stale persisted extraheader (#1951). A mint failure degrades to ""
 		// (ambient auth), never a stage failure.
 		baseAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
-		baseExists, rhErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef, baseAuthToken)
+
+		// Own slice branch first (#3973). A fresh child's slice branch is absent
+		// and the wave base below is established exactly as before; a resumed,
+		// amended or retried child whose slice branch already exists on the
+		// remote bases on THAT tip instead, so the re-run builds on its earlier
+		// published commit and pushes fast-forward onto it. A query FAILURE
+		// takes the same configured-vs-not-wired split as the wave-base query:
+		// fail loud pre-agent against a configured remote (the child has an
+		// expected base of unknown state), treat as absent when not wired.
+		establishRef, establishSource := baseRef, baseSourceWaveBase
+		sliceBranch := childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
+		sliceExists, sliceErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, sliceBranch, baseAuthToken)
+		if sliceErr != nil {
+			if remoteConfigured(ctx, repoDir, gitops.DefaultRemote) {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n",
+					fmt.Sprintf("query own slice branch %q on %s: %v", sliceBranch, gitops.DefaultRemote, sliceErr))
+				return exitFailure
+			}
+			sliceExists = false
+		}
+		var baseExists bool
+		var rhErr error
+		if sliceExists {
+			establishRef, establishSource = sliceBranch, baseSourceOwnSliceBranch
+			baseExists = true
+		} else {
+			baseExists, rhErr = remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef, baseAuthToken)
+		}
 		if rhErr != nil {
 			// A remote-query FAILURE splits two ways. Against a CONFIGURED remote
 			// it is a genuine transient failure (network/auth/SSH-agent drop) on a
@@ -2025,7 +2070,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 						cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
 				}()
 			}
-			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef, baseAuthToken)
+			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, establishRef, baseAuthToken)
 			if coErr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n", coErr.Error())
@@ -2033,8 +2078,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			}
 			childCheckoutMoved = true
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"child_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
-				cfg.runID, cfg.stageID, baseRef, tipSHA, preAgentRef)
+				`{"event":"child_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q,"source":%q}`+"\n",
+				cfg.runID, cfg.stageID, establishRef, tipSHA, preAgentRef, establishSource)
+			// Stage-lifetime base pin (#3973): the established tip is the base
+			// the child is judged against for its whole lifetime — the policy-diff
+			// merge-base and the commit-time slice-branch cut (CommitAndPush
+			// PinnedBaseSHA) use it instead of re-fetching the base at commit
+			// time. A child whose wave base is ABSENT at dispatch never reaches
+			// here and stays unpinned, keeping the commit-time fetch and #4079's
+			// BaseFetchError net byte-identical.
+			pinBase(&cfg, establishRef, tipSHA, establishSource, logSink)
 		}
 	}
 
@@ -4034,22 +4087,25 @@ func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) st
 	if cfg.decomposedFromRunID == "" {
 		return cfg.checkBaseRef
 	}
-	// Same slice-branch derivation and predicate the upload-phase routing
-	// uses (see the branch-routing block). Under ADR-041 (#1141) each child
-	// owns a sole-writer slice branch minted once, so it never pre-exists on
-	// the remote: remoteBranchExists is always false and this returns
-	// cfg.checkBaseRef — each child's policy diff is bounded against base,
-	// the correct behavior for an independent slice cut fresh from base
-	// (the pre-ADR-041 origin/<shared-branch> cumulative-diff base belonged
-	// to the shared-branch model; fan-in is E24.2).
+	// Same slice-branch derivation the upload-phase routing uses (see the
+	// branch-routing block). Under ADR-041 (#1141) each child owns a
+	// sole-writer slice branch. A FRESH child's slice branch is absent on the
+	// remote, so remoteBranchExists is false and this returns cfg.checkBaseRef
+	// — the policy diff is bounded against base, correct for a slice cut fresh
+	// from base. A RESUMED, amended or retried child's slice branch may already
+	// exist (#3973): run()'s child-base block then checks that branch out,
+	// whose explicit-refspec fetch writes refs/remotes/origin/<slice-branch>,
+	// so remoteBranchExists is true here and the policy diff is bounded against
+	// origin/<slice-branch> — the #765 increment base, re-enabled — while the
+	// commit is cut from the pinned slice tip (cfg.pinnedBaseSHA).
 	sharedBranch := childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
 	if !remoteBranchExists(ctx, repoDir, sharedBranch) {
-		// Slice branch not on the remote (always, for a sole-writer slice):
-		// HEAD == base, so the policy base is cfg.checkBaseRef.
+		// Slice branch not on the remote (a fresh child): HEAD == base, so
+		// the policy base is cfg.checkBaseRef.
 		return cfg.checkBaseRef
 	}
 	baseRef := "origin/" + sharedBranch
@@ -4081,8 +4137,9 @@ func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) st
 // the commit-ish the staged index is actually measured against, so the
 // name-status (Run), patch (RunPatch), and numstat are all 3-dot and
 // internally consistent. Both git_diff emitters (computeAndEmitDiff and
-// reemitScopedGitDiff) call this so the two paths cannot drift apart —
-// that drift was the #1801 phantom-deletion re-emit bug.
+// reemitScopedGitDiff) reach this through resolveStageDiffBase, which uses
+// the stage's pinned base instead when it has one (#3973), so the two paths
+// cannot drift apart — that drift was the #1801 phantom-deletion re-emit bug.
 //
 // RE-ANCHOR (#1975): before merge-basing against the LOCAL base ref, when a
 // remote is configured, fetch the base branch's CURRENT tip from that remote
@@ -4149,6 +4206,41 @@ func resolveDiffBaseRef(ctx context.Context, baseRef, repoDir, stageID string, l
 	return mb
 }
 
+// resolveStageDiffBase is the ONE diff-base entry point both git_diff emitters
+// (computeAndEmitDiff and reemitScopedGitDiff) call, so the #1801 two-emitter
+// drift cannot recur for the pinned base either (#3973).
+//
+// When the stage carries a base pin (cfg.pinnedBaseSHA, recorded by run()
+// before the agent ran), the staged index is measured against
+// merge-base(pin, HEAD) with NO fetch: the stage is judged against the base it
+// started from, so a PR merged into the base mid-stage can neither re-anchor
+// the diff nor change what the policy gate counts. HEAD descends from the pin,
+// so the merge-base is the pin itself; baseRef stays the human-meaningful label
+// on the git_diff event. One diff_base_pinned line records the result.
+//
+// FAIL-OPEN: if the merge-base against the pin cannot be resolved (the pin is
+// not a commit in this repository), it logs diff_base_pin_unresolved and
+// delegates to resolveDiffBaseRef — today's re-anchor chain — rather than
+// blocking the diff. An UNPINNED stage (fix-ups, every advance / wave-base
+// skip, the held-commit resume) delegates directly, so fix-ups keep the #1975
+// re-anchor byte-identically.
+func resolveStageDiffBase(ctx context.Context, cfg config, baseRef, repoDir string, logSink io.Writer) string {
+	if cfg.pinnedBaseSHA == "" {
+		return resolveDiffBaseRef(ctx, baseRef, repoDir, cfg.stageID, logSink)
+	}
+	mb, err := (&gitdiff.Runner{}).MergeBase(ctx, cfg.pinnedBaseSHA, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"diff_base_pin_unresolved","stage_id":%q,"base_ref":%q,"base_sha":%q,"detail":%q}`+"\n",
+			cfg.stageID, baseRef, cfg.pinnedBaseSHA, err.Error())
+		return resolveDiffBaseRef(ctx, baseRef, repoDir, cfg.stageID, logSink)
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"diff_base_pinned","stage_id":%q,"base_ref":%q,"base_sha":%q,"merge_base":%q}`+"\n",
+		cfg.stageID, baseRef, cfg.pinnedBaseSHA, mb)
+	return mb
+}
+
 func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -4161,11 +4253,12 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// (#765); for everything else it is cfg.checkBaseRef unchanged.
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
-	// Anchor the diff to the run's fork point (3-dot) — see resolveDiffBaseRef.
+	// Anchor the diff to the run's fork point (3-dot) — the stage's pinned base
+	// when it has one, else resolveDiffBaseRef (see resolveStageDiffBase).
 	// baseRef stays the human-meaningful label on the git_diff event;
 	// diffBaseRef is the commit-ish the staged index is actually measured
 	// against.
-	diffBaseRef := resolveDiffBaseRef(context.Background(), baseRef, repoDir, cfg.stageID, logSink)
+	diffBaseRef := resolveStageDiffBase(context.Background(), cfg, baseRef, repoDir, logSink)
 
 	var events []agent.Event
 
@@ -4320,7 +4413,7 @@ func categorizeDrift(ctx context.Context, repoDir string, drift []string, decomp
 // re-emit error — the load-bearing gate already passed inside the loop.
 //
 // Like computeAndEmitDiff, this anchors the reviewed diff to the run's fork
-// point (3-dot) via resolveDiffBaseRef — because ExtractDiff's last-write-wins
+// point (3-dot) via resolveStageDiffBase — because ExtractDiff's last-write-wins
 // invariant makes THIS re-emitted event the one the implement reviewer reads.
 // The two emitters share the same merge-base helper so they cannot drift apart:
 // the prior 2-dot re-emit reported a parallel mid-run merge to main as phantom
@@ -4333,8 +4426,8 @@ func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 	// diffBaseRef is what the diff is measured against (3-dot fork point);
 	// baseRef stays the human-meaningful label on the git_diff event, exactly
-	// as computeAndEmitDiff does.
-	diffBaseRef := resolveDiffBaseRef(context.Background(), baseRef, repoDir, cfg.stageID, logSink)
+	// as computeAndEmitDiff does, through the same resolveStageDiffBase.
+	diffBaseRef := resolveStageDiffBase(context.Background(), cfg, baseRef, repoDir, logSink)
 
 	// Re-stage the reconciled in-scope tree. The verify-fix loop's final
 	// `git reset --soft` preserves the index, but re-staging is deterministic and
@@ -7905,6 +7998,15 @@ var (
 	// HEAD claims no branch name, so it never collides; the per-slice
 	// sole-writer branch is cut later by CommitAndPush's freshFetchBase routing
 	// (ADR-035), which does not require HEAD to be ON the base branch.
+	//
+	// The ref it checks out is the child's WAVE base for a fresh child, whose
+	// own slice branch is absent on the remote. A resumed, amended or retried
+	// child's slice branch may already exist (#3973): run() then checks out
+	// THAT branch instead, the child bases on its tip, its policy diff is
+	// bounded against origin/<slice-branch> (the explicit-refspec fetch writes
+	// that tracking ref, re-enabling the #765 increment base), and the commit
+	// is cut from the pinned slice tip so the push is a fast-forward. Either
+	// way the returned tip is the stage-lifetime base pin (cfg.pinnedBaseSHA).
 	checkoutChildBase = gitops.CheckoutRemoteBranchDetached
 
 	// fetchDiffBaseTip re-anchors the policy-gate/review diff to the CURRENT
@@ -8526,11 +8628,16 @@ func resolveImplementBranchRouting(_ context.Context, cfg config, _, baseRef str
 		// shared fishhawk/run-<parent> branch every sibling force-pushed.
 		// isDecomposed stays true so the scope-gate exemptions and the
 		// child_pushed audit/report path (both keyed on it) are preserved;
-		// only the push MECHANICS decouple. A sole-writer slice branch is
-		// minted once and so never pre-exists on the remote — cut it fresh
-		// from the freshly-fetched authoritative base (ADR-035 prevention,
-		// #861/#865) and leave isSubsequent false so RebaseFromRemote is
-		// false (no prior sibling commit to rebase onto; fan-in is E24.2).
+		// only the push MECHANICS decouple. A FRESH child's slice branch is
+		// absent on the remote — cut it fresh from the authoritative base
+		// (ADR-035 prevention, #861/#865) and leave isSubsequent false so
+		// RebaseFromRemote is false (no prior sibling commit to rebase onto;
+		// fan-in is E24.2). A RESUMED or retried child's slice branch may
+		// already exist (#3973): run() then bases the child on that branch's
+		// tip and pins it, so CommitAndPush cuts the branch from the pinned
+		// slice tip (PinnedBaseSHA) and the non-force push is a fast-forward.
+		// freshFetchBase stays baseRef either way; the pin, when set, replaces
+		// the commit-time fetch of it.
 		r.isDecomposed = true
 		r.branch = childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
 		r.freshFetchBase = baseRef
@@ -10303,6 +10410,16 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// machinery (RebaseFromRemote / checkout -b from a controlled base).
 		// Empty for those callers keeps the unchanged checkout -b path.
 		FreshFetchBase: freshFetchBase,
+		// Stage-lifetime base pin (#3973): the base run() established before
+		// the agent ran (the standalone #3454 advance tip, the child's wave
+		// base, or its own pre-existing slice branch tip). On the
+		// FreshFetchBase arm CommitAndPush cuts the branch from it with no
+		// commit-time fetch, so a base that moved mid-stage cannot stash-pop
+		// conflict the commit and the recorded base_sha equals the pin. Empty
+		// (fix-ups, skip/degrade paths) keeps the fetch path unchanged; the
+		// pinned arm returns the same ErrPushFailed / *BaseFetchError shapes,
+		// so the #4079 failure-site handling below is unchanged.
+		PinnedBaseSHA: cfg.pinnedBaseSHA,
 		// ADR-041 (#1141): a sole-writer slice branch is pushed once by one
 		// child and never re-read by a sibling's routing or lease, so there is
 		// nothing to keep in sync — the pre-ADR-041 shared-branch tracking-ref
@@ -10961,8 +11078,10 @@ func shortID(id string) string {
 // child pushes onto (E24.1 / #1141 / ADR-041 point 1):
 // fishhawk/run-<short-parent>/slice-<sliceIndex>. Each slice index is
 // minted once by orchestrator fanout, so each child owns a distinct
-// branch cut fresh from the declared base — replacing the pre-ADR-041
-// shared fishhawk/run-<parent> branch every sibling force-pushed onto.
+// branch — replacing the pre-ADR-041 shared fishhawk/run-<parent> branch
+// every sibling force-pushed onto. A fresh child cuts it from its declared
+// base; a resumed or retried child whose branch already exists on the remote
+// bases on, and pushes fast-forward onto, that branch's tip (#3973).
 // Fan-in onto the consolidated branch is ADR-041 / E24.2, out of scope
 // here.
 func childSliceBranch(decomposedFromRunID string, sliceIndex int) string {

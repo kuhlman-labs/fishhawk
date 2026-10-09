@@ -121,6 +121,13 @@ type runResult struct {
 // path is driven with a real client by
 // TestLineageLock_CancelledRunHolder_NextDispatchAdmitted below.
 func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, parallelIsolate bool, client lineageStatusClient) (wt string, release func(), err error) {
+	return provisionFlowOnBase(ctx, repo, runID, decomposedFrom, "main", parallelIsolate, client)
+}
+
+// provisionFlowOnBase is provisionFlow with an explicit declared base ref — the
+// value main.go passes as resolveImplementBaseRef(cfg): main for a top-level
+// run, the consolidated or wave base for a decomposition child (#3973).
+func provisionFlowOnBase(ctx context.Context, repo, runID, decomposedFrom, baseRef string, parallelIsolate bool, client lineageStatusClient) (wt string, release func(), err error) {
 	root := lineageRoot(runID, decomposedFrom, parallelIsolate)
 	// Cross-lineage worktree-admin lock (#1181): serialize the fast
 	// sweep+provision critical section against sibling lineages, then release
@@ -130,7 +137,7 @@ func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, para
 		return "", nil, err
 	}
 	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
-	wt, err = provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
+	wt, err = provisionLineageWorktree(ctx, repo, root, baseRef, io.Discard)
 	if err != nil {
 		adminRelease()
 		return "", nil, err
@@ -621,31 +628,115 @@ func TestWorktreeIsolation_ParallelChildren(t *testing.T) {
 	}
 }
 
-// TestWorktreeIsolation_DivergedSeedRefusesNewLineageReusesExisting is the
-// #1866 cross-lineage integration case over REAL git (bare origin + linked
-// worktrees): once the operator HEAD diverges from origin/main, a NEW lineage's
-// FRESH provision refuses (working_dir_diverged_from_base) while an
-// ALREADY-provisioned lineage's next stage still REUSES its worktree — proving
-// the guard + the reuse-path exemption interact correctly at the layer where
-// main.go's wiring (provisionFlow), worktree.go, and git compose.
-func TestWorktreeIsolation_DivergedSeedRefusesNewLineageReusesExisting(t *testing.T) {
-	operator, _ := initRepoWithOrigin(t)
+// divergedConsolidatedRepo builds the #3973 child done-means fixture with REAL
+// git: a bare origin carrying `fishhawk/run-<parent>-consolidated` cut from an
+// OLDER main (it adds predecessor.go), and an operator checkout pulled to a
+// NEWER main (newer.txt) that is provably NOT an ancestor of the consolidated
+// tip. Returns the operator checkout, its HEAD (the newer main), the
+// consolidated branch and its tip.
+func divergedConsolidatedRepo(t *testing.T, parentID string) (operator, newMainSHA, consolidated, consolidatedSHA string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		if err := runGitErr(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	consolidated = "fishhawk/run-" + shortID(parentID) + "-consolidated"
+	seed := t.TempDir()
+	mustGit(seed, "init", "-q")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "older main")
+	mustGit(seed, "branch", "-M", "main")
+	// The consolidated branch is cut from the OLDER main.
+	mustGit(seed, "checkout", "-q", "-b", consolidated)
+	if err := os.WriteFile(filepath.Join(seed, "predecessor.go"), []byte("package fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "predecessor slice integrated onto consolidated")
+	mustGit(seed, "checkout", "-q", "main")
+	// main then moves on past the consolidated cut.
+	if err := os.WriteFile(filepath.Join(seed, "newer.txt"), []byte("newer\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "newer main merged after the consolidated cut")
+
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(seed, "init", "--bare", "-q", bare)
+	mustGit(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+	mustGit(seed, "remote", "add", "origin", bare)
+	mustGit(seed, "push", "-q", "origin", "main", consolidated)
+
+	// The operator checkout is pulled to the NEWER main.
+	operator = filepath.Join(t.TempDir(), "operator")
+	mustGit(seed, "clone", "-q", "-b", "main", bare, operator)
+	var err error
+	if newMainSHA, err = runGitOut(operator, "rev-parse", "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	if consolidatedSHA, err = runGitOut(seed, "rev-parse", consolidated); err != nil {
+		t.Fatal(err)
+	}
+	// Precondition: the operator HEAD is provably NOT an ancestor of the
+	// consolidated tip — the shape the pre-#3973 HEAD seed refused (#1866).
+	if runGitErr(operator, "merge-base", "--is-ancestor", newMainSHA, consolidatedSHA) == nil {
+		t.Fatalf("fixture: newer main %q is an ancestor of consolidated %q", newMainSHA, consolidatedSHA)
+	}
+	return operator, newMainSHA, consolidated, consolidatedSHA
+}
+
+// TestWorktreeIsolation_ChildSeedsFromConsolidatedBaseDespiteNewerOperatorHead
+// is the #3973 child done-means test over REAL git (bare origin + linked
+// worktrees). The operator checkout was pulled to a newer main that is not an
+// ancestor of the run's consolidated base — the shape that made every fresh
+// child provision refuse with working_dir_diverged_from_base while the operator
+// HEAD was the seed. With the declared-base seed, the fresh child provision
+// SUCCEEDS at the consolidated tip, the operator's HEAD and tree are untouched,
+// and an already-provisioned lineage still REUSES its worktree after the
+// operator HEAD diverges further.
+func TestWorktreeIsolation_ChildSeedsFromConsolidatedBaseDespiteNewerOperatorHead(t *testing.T) {
+	const (
+		parentID = "c7c7c7c7-0000-0000-0000-000000000007"
+		child1   = "d8d8d8d8-0000-0000-0000-000000000008"
+		child2   = "e9e9e9e9-0000-0000-0000-000000000009"
+	)
+	operator, newMainSHA, consolidated, consolidatedSHA := divergedConsolidatedRepo(t, parentID)
 	ctx := context.Background()
 	client := &syncLineageClient{complete: map[string]bool{}}
 
-	const (
-		existingID = "a1a1a1a1-0000-0000-0000-000000000001"
-		newID      = "b2b2b2b2-0000-0000-0000-000000000002"
-	)
-
-	// (1) An already-provisioned lineage seeded from a CLEAN operator HEAD.
-	existingWT, release, err := provisionFlow(ctx, operator, existingID, "", false, client)
+	// (1) A FRESH child provision against the consolidated declared base.
+	childWT, release, err := provisionFlowOnBase(ctx, operator, child1, parentID, consolidated, false, client)
 	if err != nil {
-		t.Fatalf("provision existing lineage: %v", err)
+		t.Fatalf("fresh child provision refused (the pre-#3973 HEAD-seed defect): %v", err)
 	}
 	release()
+	if got := gitPorcelainHead(t, childWT); got != consolidatedSHA {
+		t.Errorf("child worktree seeded at %q, want the consolidated tip %q (operator HEAD %q)", got, consolidatedSHA, newMainSHA)
+	}
+	if _, serr := os.Stat(filepath.Join(childWT, "predecessor.go")); serr != nil {
+		t.Errorf("predecessor.go absent from the child worktree: %v", serr)
+	}
+	if _, serr := os.Stat(filepath.Join(childWT, "newer.txt")); serr == nil {
+		t.Error("the operator's newer main leaked into the child worktree")
+	}
+	// The operator's checkout never moved and stays clean.
+	if got := gitPorcelainHead(t, operator); got != newMainSHA {
+		t.Errorf("operator HEAD moved: %q, want %q", got, newMainSHA)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator git status not clean after the child provision:\n%s", status)
+	}
 
-	// (2) Diverge the operator HEAD with a leftover unmerged commit (#1866).
+	// (2) The operator HEAD diverges further (a leftover unmerged commit); the
+	// lineage's NEXT child REUSES the shared worktree untouched.
 	if err := os.WriteFile(filepath.Join(operator, "leftover.txt"), []byte("stray\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -654,43 +745,69 @@ func TestWorktreeIsolation_DivergedSeedRefusesNewLineageReusesExisting(t *testin
 			t.Fatal(err)
 		}
 	}
-
-	// (3) A NEW lineage's fresh provision refuses — its seed diverged from base.
-	_, newRelease, newErr := provisionFlow(ctx, operator, newID, "", false, client)
-	if newRelease != nil {
-		newRelease()
-	}
-	if newErr == nil {
-		t.Fatal("new lineage provisioned from a diverged seed; want a loud refusal")
-	}
-	var bde *baseDivergenceError
-	if !errors.As(newErr, &bde) {
-		t.Fatalf("new lineage error = %T (%v), want *baseDivergenceError", newErr, newErr)
-	}
-
-	// (4) The already-provisioned lineage's NEXT stage still reuses its worktree
-	// despite the since-diverged operator HEAD (the reuse-path exemption).
-	reuseWT, reuseRelease, reuseErr := provisionFlow(ctx, operator, existingID, "", false, client)
+	reuseWT, reuseRelease, reuseErr := provisionFlowOnBase(ctx, operator, child2, parentID, consolidated, false, client)
 	if reuseErr != nil {
 		t.Fatalf("already-provisioned lineage refused on reuse: %v", reuseErr)
 	}
 	reuseRelease()
-	if canonPath(reuseWT) != canonPath(existingWT) {
-		t.Errorf("reuse returned a different worktree: %q vs %q", reuseWT, existingWT)
+	if canonPath(reuseWT) != canonPath(childWT) {
+		t.Errorf("reuse returned a different worktree: %q vs %q", reuseWT, childWT)
 	}
+	if got := gitPorcelainHead(t, reuseWT); got != consolidatedSHA {
+		t.Errorf("reused worktree HEAD = %q, want it untouched at %q", got, consolidatedSHA)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator git status not clean after the reuse:\n%s", status)
+	}
+}
 
-	// The refused new lineage left no registered worktree, and the operator's
-	// tracked tree stays clean (worktrees live under .git).
-	registered, err := listWorktreePaths(ctx, operator)
+// TestWorktreeIsolation_PlanStageBehindMainSeedsFromOriginTip is the #3973
+// plan-stage done-means test over REAL git: a plan stage dispatched from an
+// operator checkout that is BEHIND origin/main — and has not even fetched the
+// newer tip — gets a fresh lineage worktree at origin/main's CURRENT tip, not at
+// the stale operator HEAD. The operator's HEAD and tree are untouched.
+func TestWorktreeIsolation_PlanStageBehindMainSeedsFromOriginTip(t *testing.T) {
+	operator, staleSHA := initRepoWithOrigin(t)
+	ctx := context.Background()
+	client := &syncLineageClient{complete: map[string]bool{}}
+
+	// Another clone merges a fix to origin/main; the operator never fetches it.
+	bare, err := runGitOut(operator, "remote", "get-url", "origin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wtDir, _ := worktreesDir(ctx, operator)
-	if isRegisteredWorktree(filepath.Join(wtDir, "run-"+lineageRoot(newID, "", false)), registered) {
-		t.Errorf("refused new lineage left a registered worktree: %v", registered)
+	other := filepath.Join(t.TempDir(), "other")
+	if err := runGitErr(operator, "clone", "-q", "-b", "main", bare, other); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitFile(other, "merged.txt", "merged after the operator last pulled\n", "fix merged to main"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGitErr(other, "push", "-q", "origin", "main"); err != nil {
+		t.Fatal(err)
+	}
+	tipSHA := gitPorcelainHead(t, other)
+	if tipSHA == staleSHA {
+		t.Fatal("fixture: origin tip did not advance")
+	}
+
+	const planRunID = "f1f1f1f1-0000-0000-0000-000000000001"
+	wt, release, err := provisionFlow(ctx, operator, planRunID, "", false, client)
+	if err != nil {
+		t.Fatalf("plan-stage provision: %v", err)
+	}
+	release()
+	if got := gitPorcelainHead(t, wt); got != tipSHA {
+		t.Errorf("plan-stage worktree seeded at %q, want origin/main's tip %q (stale operator HEAD %q)", got, tipSHA, staleSHA)
+	}
+	if _, serr := os.Stat(filepath.Join(wt, "merged.txt")); serr != nil {
+		t.Errorf("the plan stage cannot see the fix merged to main: %v", serr)
+	}
+	if got := gitPorcelainHead(t, operator); got != staleSHA {
+		t.Errorf("operator HEAD moved: %q, want %q", got, staleSHA)
 	}
 	if status := gitPorcelain(t, operator); status != "" {
-		t.Errorf("operator git status not clean after the refusal + reuse:\n%s", status)
+		t.Errorf("operator git status not clean after the plan-stage provision:\n%s", status)
 	}
 }
 
@@ -1148,9 +1265,10 @@ func TestRun_StandaloneImplement_AdvancesLineageWorktreeToMovedBase_CrossBoundar
 	)
 
 	// (0) The PLAN stage's exact call: seed the lineage worktree from the
-	// operator checkout's HEAD as it stands NOW. The implement dispatch below
-	// then takes provisionLineageWorktree's `lineage_worktree_reused` path —
-	// the path that never moved HEAD, which is the whole defect.
+	// declared base's fetched tip as it stands NOW (== the operator HEAD in this
+	// fixture; #3973). The implement dispatch below then takes
+	// provisionLineageWorktree's `lineage_worktree_reused` path — the path that
+	// never moved HEAD, which is the whole defect.
 	ctx := context.Background()
 	planWT, err := provisionLineageWorktree(ctx, operator, lineageRoot(runID, "", false), "main", io.Discard)
 	if err != nil {
