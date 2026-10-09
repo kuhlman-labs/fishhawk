@@ -12,6 +12,7 @@
 //	fishhawkd decision-index backfill|check  rebuild / gap-check the derived decision index (#3730)
 //	fishhawkd precedent-tuning --repo R      replay the divergence threshold over recorded decisions (#3733)
 //	fishhawkd approver-members --spec F      dry-run approvals.members against recorded approvers (#4116)
+//	fishhawkd version | --version    print "<Version> (<GitSHA>)" and exit (#4117)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -24,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 const (
@@ -36,9 +39,20 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stderr))
 }
 
+// versionOut is where `version` / `--version` print. A package-level seam so
+// tests can capture it without threading a stdout through every run call.
+var versionOut io.Writer = os.Stdout
+
 // run dispatches to the appropriate subcommand. Split out of main so
 // tests can drive it without exiting the test process.
 func run(args []string, logSink io.Writer) int {
+	// `version` / `--version` are handled BEFORE splitCommand, which routes
+	// any "-"-prefixed first arg to the implicit serve (#4117). The output
+	// shape matches `fishhawk version`: "<Version> (<GitSHA>)".
+	if len(args) > 0 && (args[0] == "version" || args[0] == "--version") {
+		_, _ = fmt.Fprintln(versionOut, version.String())
+		return exitOK
+	}
 	cmd, rest := splitCommand(args)
 	switch cmd {
 	case "", "serve":
@@ -88,7 +102,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members|version] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -110,6 +124,7 @@ func printUsage(w io.Writer) {
 		"  decision-index check     Report decision-bearing entries with no index row; exits 1 on a gap.",
 		"  precedent-tuning         Replay the divergence threshold over a repo's decision history for a grid of (N, X, window) candidates (#3733).",
 		"  approver-members         Dry-run approvals.members: evaluate recorded approvers against a spec's members gates; exits 1 if any human would be refused (#4116).",
+		"  version | --version      Print the build version and git SHA, \"<Version> (<GitSHA>)\", and exit.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}

@@ -1,0 +1,14 @@
+id: scenario:issue-4117/helper-posix-shell-parity
+statement: '`sh -n scripts/release-ldflags` exits 0. For every component, the helper''s stdout under /bin/sh is byte-identical to its stdout under dash, when dash is installed.'
+verify_hint: Run `sh -n`, then run the helper per component under `/bin/sh` and under `dash` and diff the two stdouts. scripts/test-release-ldflags prints one PASS line per component on stdout.
+steps: 'Posture B: sh -n scripts/release-ldflags; for each of 5 components x 2 SHAs compared $(/bin/sh scripts/release-ldflags ...) with $(dash scripts/release-ldflags ...) (dash at /bin/dash). Also ran scripts/test-release-ldflags.'
+assertions:
+    expected: sh -n 0; /bin/sh == dash output per component
+    observed_at_record: 'sh -n exit 0; shebang #!/bin/sh; all 10 comparisons identical; harness r3 printed 5 PASS lines and r4 reported the zsh/bash denylist self-check plus a clean helper'
+    repro_handle: scripts/test-release-ldflags
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z

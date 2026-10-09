@@ -1,0 +1,14 @@
+id: scenario:issue-4117/helper-emits-pinned-flags
+statement: Running `scripts/release-ldflags fishhawk-runner v1.2.3 0123456789abcdef0123456789abcdef01234567` exits 0 and prints exactly `-X github.com/kuhlman-labs/fishhawk/runner/internal/version.Version=v1.2.3 -X github.com/kuhlman-labs/fishhawk/runner/internal/version.GitSHA=0123456789abcdef0123456789abcdef01234567`. A 7-character SHA appears verbatim, unexpanded. fishhawkd, fishhawk-mcp and fishhawk-mcp-shim name backend/internal/version, and fishhawk names cli/internal/version.
+verify_hint: Run the helper under /bin/sh for each of the five components with a 40-char and a short SHA, and compare stdout byte-for-byte to the expected flag line.
+steps: 'Posture B on the sanctioned checkout e7f39c9c: ran /bin/sh scripts/release-ldflags <c> v1.2.3 <sha> for c in fishhawkd, fishhawk-mcp, fishhawk-mcp-shim, fishhawk-runner, fishhawk, with sha 0123456789abcdef0123456789abcdef01234567 and abc1234. String-compared the runner output to the expected line.'
+assertions:
+    expected: exact flag line per component; SHA verbatim
+    observed_at_record: fishhawk-runner exit 0 and stdout exactly '-X github.com/kuhlman-labs/fishhawk/runner/internal/version.Version=v1.2.3 -X github.com/kuhlman-labs/fishhawk/runner/internal/version.GitSHA=0123456789abcdef0123456789abcdef01234567' plus a trailing newline. The 7-char SHA abc1234 passes through verbatim. fishhawkd, fishhawk-mcp and fishhawk-mcp-shim name backend/internal/version; fishhawk names cli/internal/version. Harness r2 reported 10/10 byte-exact
+    repro_handle: /bin/sh scripts/release-ldflags fishhawk-runner v1.2.3 0123456789abcdef0123456789abcdef01234567
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z

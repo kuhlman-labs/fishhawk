@@ -17,6 +17,20 @@ built inline before. This is a behaviour-preserving relocation: no route, no
 new dependency, and the handshake identity, tool surface, onboarding
 instructions, and embedded runbook resource are byte-identical before and after.
 
+## Handshake identity
+
+`serverInfo` on `initialize` is `{name: "fishhawk-mcp", version:
+handshakeVersion(version.Version, version.GitSHA)}` — the stamped build version
+plus `+<GitSHA>` (e.g. `dev+abc1234-dirty` for a `scripts/dev` build,
+`v1.2.3+<40-char sha>` for a release), or the bare version when no SHA was
+stamped. Both halves come from `scripts/release-ldflags` (#4117); there is no
+manually bumped base any more (it was a frozen `v0.1.0`). fishhawkd's `/mcp`
+route builds through the same `NewServer`, so it advertises the identical
+string. `serverInfo.version` is informational: no client parses or gates on it;
+operators read the SHA half to confirm a rebuilt server is live.
+`TestInitializeAdvertisesBuildVersion` reads it off a real in-memory
+`initialize`.
+
 ## Entry points
 
 Three exported identifiers are the intended surface (fishhawkd's `/mcp` route

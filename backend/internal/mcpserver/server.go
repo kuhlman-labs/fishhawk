@@ -7,9 +7,10 @@
 // before.
 //
 // This is a behaviour-preserving relocation: no route, no new dependency,
-// and the handshake identity (serverName/serverVersion/GitSHA), tool
-// surface, onboarding instructions, and embedded runbook resource are all
-// byte-identical before and after the move.
+// and the tool surface, onboarding instructions, and embedded runbook
+// resource are all byte-identical before and after the move. The handshake
+// identity (serverName + handshakeVersion) has since moved off a frozen
+// manual base onto the stamped build version (#4117).
 //
 // The package's exported surface is intentionally large — 232 identifiers.
 // Only Config, NewServer, and Instructions are the intended entry points
@@ -30,13 +31,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
-// serverName and serverVersion identify this binary on the MCP
-// handshake. Bumped manually as the tool surface evolves; tied to
-// the Fishhawk release line rather than the protocol spec version.
-const (
-	serverName    = "fishhawk-mcp"
-	serverVersion = "v0.1.0"
-)
+// serverName identifies this server on the MCP handshake. The version half
+// is the stamped build version (handshakeVersion), not a manual constant.
+const serverName = "fishhawk-mcp"
 
 // Instructions is the server `instructions` field advertised on the MCP
 // initialize handshake — the intended public alias of the package-private
@@ -121,16 +118,17 @@ func (c Config) internal() config {
 }
 
 // handshakeVersion returns the version string advertised on the MCP
-// handshake: the manually-bumped serverVersion base, suffixed with the
-// build's git SHA when one was stamped (e.g. "v0.1.0+abc1234-dirty") so
-// an operator can tell which commit the connected server was built from.
-// serverInfo.version is informational in the MCP handshake — clients do
-// not parse or gate on it.
-func handshakeVersion(sha string) string {
+// handshake: the stamped build version (version.Version — the release
+// version for releases, "dev" for scripts/dev builds), suffixed with the
+// build's git SHA when one was stamped (e.g. "dev+abc1234-dirty") so an
+// operator can tell which commit the connected server was built from. Both
+// halves come from scripts/release-ldflags (#4117). serverInfo.version is
+// informational in the MCP handshake — clients do not parse or gate on it.
+func handshakeVersion(ver, sha string) string {
 	if sha == "unknown" || sha == "" {
-		return serverVersion
+		return ver
 	}
-	return serverVersion + "+" + sha
+	return ver + "+" + sha
 }
 
 // buildServer constructs the MCP server shell without any tools.
@@ -141,7 +139,7 @@ func handshakeVersion(sha string) string {
 func buildServer(_ config) *mcp.Server {
 	return mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
-		Version: handshakeVersion(version.GitSHA),
+		Version: handshakeVersion(version.Version, version.GitSHA),
 	}, &mcp.ServerOptions{Instructions: onboardingInstructions})
 }
 

@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 // envFunc returns a func(string) string backed by a literal map. Relocated
@@ -40,22 +42,42 @@ func TestBuildServer_HandshakeReady(t *testing.T) {
 }
 
 func TestHandshakeVersion(t *testing.T) {
-	// Unstamped builds (GitSHA "unknown") advertise the bare base so the
-	// handshake string is unchanged from pre-stamping behavior; stamped
-	// builds append "+<sha>" including any -dirty suffix. Relocated from
-	// the command's main_test.go with handshakeVersion (E66.7 / #2408).
+	// Unstamped builds (GitSHA "unknown") advertise the bare version; stamped
+	// builds append "+<sha>", passing the SHA through verbatim (short, -dirty
+	// and full 40-char alike). The version half is the stamped build version,
+	// not a frozen manual base (#4117).
+	const full = "0123456789abcdef0123456789abcdef01234567"
 	for _, tc := range []struct {
-		sha  string
-		want string
+		ver, sha string
+		want     string
 	}{
-		{"unknown", serverVersion},
-		{"", serverVersion},
-		{"abc1234", serverVersion + "+abc1234"},
-		{"abc1234-dirty", serverVersion + "+abc1234-dirty"},
+		{"dev", "unknown", "dev"},
+		{"dev", "", "dev"},
+		{"dev", "abc1234", "dev+abc1234"},
+		{"dev", "abc1234-dirty", "dev+abc1234-dirty"},
+		{"v1.2.3", full, "v1.2.3+" + full},
+		{"v1.2.3", "unknown", "v1.2.3"},
 	} {
-		if got := handshakeVersion(tc.sha); got != tc.want {
-			t.Errorf("handshakeVersion(%q) = %q, want %q", tc.sha, got, tc.want)
+		if got := handshakeVersion(tc.ver, tc.sha); got != tc.want {
+			t.Errorf("handshakeVersion(%q, %q) = %q, want %q", tc.ver, tc.sha, got, tc.want)
 		}
+	}
+}
+
+// TestInitializeAdvertisesBuildVersion drives a real in-memory initialize
+// and reads serverInfo.version off the result: it must be the STAMPED build
+// version (version.Version) plus the SHA, never a frozen constant (#4117).
+func TestInitializeAdvertisesBuildVersion(t *testing.T) {
+	cs := connectInMemory(t)
+	info := cs.InitializeResult().ServerInfo
+	if info == nil {
+		t.Fatal("InitializeResult().ServerInfo is nil")
+	}
+	if info.Name != serverName {
+		t.Errorf("ServerInfo.Name = %q, want %q", info.Name, serverName)
+	}
+	if want := handshakeVersion(version.Version, version.GitSHA); info.Version != want {
+		t.Errorf("ServerInfo.Version = %q, want %q", info.Version, want)
 	}
 }
 

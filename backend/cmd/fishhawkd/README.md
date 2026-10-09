@@ -3,6 +3,10 @@
 Fishhawk control-plane daemon binary: the backend HTTP API server plus its operational subcommands
 (`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`, `account.go`, `installation.go`, `member.go`, `oauthclient.go`, `approver_members.go`).
 
+## `version` (E74.8 / #4117)
+
+`fishhawkd version` and `fishhawkd --version` print `version.String()` — `<Version> (<GitSHA>)`, or the bare `<Version>` on an unstamped build — to stdout and exit 0, the same shape `fishhawk version` prints. Both are handled in `run` BEFORE `splitCommand`, which would otherwise route the `-`-prefixed `--version` to the implicit `serve` (whose flag parse rejects it). The values are stamped by `scripts/release-ldflags fishhawkd …`; see `backend/internal/version/README.md` for every binary's surface.
+
 ## Tenancy registration subcommands (`account` / `installation` / `member`, E45.33 / #2923, E44.34 / #2924)
 
 The operator write path for the ADR-057 tenancy `accounts` / `installations` / `account_members`

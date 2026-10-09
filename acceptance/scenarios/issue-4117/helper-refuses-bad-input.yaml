@@ -1,0 +1,14 @@
+id: scenario:issue-4117/helper-refuses-bad-input
+statement: 'Each of these makes the helper exit non-zero with empty stdout and a stderr message naming the problem: an unknown component, a wrong argument count (stderr shows the usage line), an empty version, an empty SHA, or a value containing whitespace or a quote.'
+verify_hint: Invoke the helper from a shell with each bad input and check the exit code, stdout and stderr.
+steps: 'Posture B: ran /bin/sh scripts/release-ldflags with: nope v1 abc1234; fishhawk v1; no args; 5 args; empty version; empty sha; ''v1 x''; sha ''ab c''; version with single quote; version with double quote; sha with tab. Captured rc, stdout and stderr.'
+assertions:
+    expected: non-zero exit, empty stdout, stderr naming the problem (usage for wrong arg count)
+    observed_at_record: 'Every case exited 2 with 0 stdout bytes. stderr was: ''unknown component "nope" (want one of ...)''; ''usage: scripts/release-ldflags <component> <version> <git-sha>'' for wrong counts; ''<version> must not be empty''; ''<git-sha> must not be empty''; ''... must not contain whitespace, quotes or backslashes (got ...)'''
+    repro_handle: /bin/sh scripts/release-ldflags nope v1 abc1234
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z

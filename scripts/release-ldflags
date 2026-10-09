@@ -1,0 +1,71 @@
+#!/bin/sh
+# scripts/release-ldflags — the ONE source of the `-X` link-time stamping pairs
+# for every Fishhawk binary (E74.8 / #4117).
+#
+#   scripts/release-ldflags <component> <version> <git-sha>
+#
+# Prints exactly one line:
+#
+#   -X <pkg>.Version=<version> -X <pkg>.GitSHA=<git-sha>
+#
+# where <pkg> is the component's internal/version package. The SHA is passed
+# through VERBATIM (no truncation, no expansion). Only the -X pairs are
+# emitted: callers add `-s -w` themselves, and `-trimpath` is a `go build`
+# flag, not a linker flag, so neither belongs here.
+#
+# Callers: scripts/dev's _build_ldflags (stamping Version=dev), and the
+# release workflows of #3716. backend/Dockerfile cannot exec this file
+# (.dockerignore excludes scripts/), so it carries the same -X stanza as a
+# literal that scripts/test-dev pins byte-for-byte to this helper's output.
+#
+# Why POSIX /bin/sh and not zsh like every other script here: GitHub's
+# ubuntu-latest release jobs have no zsh, and #3716's release workflows call
+# this helper directly. Keep it POSIX: scripts/test-release-ldflags runs it
+# under /bin/sh AND dash and denylists bash/zsh-only constructs (macOS /bin/sh
+# is bash 3.2 in POSIX mode, which would accept some of them silently).
+#
+# CAUTION: `-ldflags -X` on a package path that does not declare the var is a
+# SILENT no-op, not a build error. scripts/test-release-ldflags builds every
+# binary with this output and reads each version surface back.
+set -eu
+
+if [ "$#" -ne 3 ]; then
+  echo "usage: scripts/release-ldflags <component> <version> <git-sha>" >&2
+  exit 2
+fi
+
+component=$1
+version=$2
+sha=$3
+
+case "$component" in
+  fishhawkd|fishhawk-mcp|fishhawk-mcp-shim)
+    pkg=github.com/kuhlman-labs/fishhawk/backend/internal/version ;;
+  fishhawk-runner)
+    pkg=github.com/kuhlman-labs/fishhawk/runner/internal/version ;;
+  fishhawk)
+    pkg=github.com/kuhlman-labs/fishhawk/cli/internal/version ;;
+  *)
+    echo "release-ldflags: unknown component \"$component\" (want one of: fishhawkd fishhawk-mcp fishhawk-mcp-shim fishhawk-runner fishhawk)" >&2
+    exit 2 ;;
+esac
+
+# check_value <name> <value>: an empty -X value stamps an empty string, and
+# cmd/go splits -ldflags on whitespace and honours quotes, so a value carrying
+# whitespace, a quote or a backslash would be re-tokenised rather than stamped.
+check_value() {
+  if [ -z "$2" ]; then
+    echo "release-ldflags: <$1> must not be empty" >&2
+    exit 2
+  fi
+  case "$2" in
+    *[[:space:]]*|*\'*|*\"*|*\\*)
+      echo "release-ldflags: <$1> must not contain whitespace, quotes or backslashes (got \"$2\")" >&2
+      exit 2 ;;
+  esac
+}
+
+check_value version "$version"
+check_value git-sha "$sha"
+
+printf '%s\n' "-X ${pkg}.Version=${version} -X ${pkg}.GitSHA=${sha}"

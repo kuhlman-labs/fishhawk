@@ -1,8 +1,10 @@
 # Multi-stage build for fishhawkd (E13.3 / #60).
 #
 # Stage 1: full Go toolchain compiles a static binary with the
-# version stamped via -ldflags (matching runner/release.yml's
-# convention).
+# version stamped via -ldflags. The -X stanza is byte-pinned to
+# `scripts/release-ldflags fishhawkd` (the one stamping source, #4117)
+# by scripts/test-dev (4f); the image cannot exec the helper itself
+# because .dockerignore excludes scripts/.
 #
 # Stage 2: distroless/static-debian12 runs the binary as a
 # non-root user. The image carries no shell, no package manager,

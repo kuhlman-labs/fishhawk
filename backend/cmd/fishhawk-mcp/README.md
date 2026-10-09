@@ -111,6 +111,7 @@ Two transports, selected by flag. **stdio is the default and unchanged** — eve
 | `--transport` | `stdio` | `stdio` \| `http`. `http` is the opt-in [ADR-033](https://github.com/kuhlman-labs/fishhawk/issues/843) option-b streamable-HTTP transport ([#927](https://github.com/kuhlman-labs/fishhawk/issues/927)). |
 | `--allowed-roots` | *(empty — fail closed)* | OS path-list (`:` unix, `;` Windows) of absolute checkout roots every path-taking MCP input (`working_dir`, `spec_file`) must resolve inside when serving `--transport http` (E66.63 / [#3589](https://github.com/kuhlman-labs/fishhawk/issues/3589)). Overrides `FISHHAWK_MCP_ALLOWED_ROOTS`. Inert on the stdio default. Leaving BOTH unset is **fail closed** over http: every path-taking verb is refused `path_outside_allowed_roots`. |
 | `--addr` | `127.0.0.1:8765` | `host:port` for `--transport http`; ignored for stdio. **Loopback-only** — see below. A bind collision surfaces as an operator-visible error. |
+| `--version` | off | Print the build identity, `<Version> (<GitSHA>)` (bare `<Version>` when unstamped), to stdout and exit 0 (E74.8 / [#4117](https://github.com/kuhlman-labs/fishhawk/issues/4117)). Answered BEFORE the config is loaded, so it needs no backend URL, token or stored credential. The MCP `initialize` handshake advertises the same identity as `serverInfo.version` = `<Version>+<GitSHA>`. |
 
 ```sh
 fishhawk-mcp --transport http --addr 127.0.0.1:8765

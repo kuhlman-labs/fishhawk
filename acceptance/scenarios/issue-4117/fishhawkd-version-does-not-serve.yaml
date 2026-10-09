@@ -1,0 +1,14 @@
+id: scenario:issue-4117/fishhawkd-version-does-not-serve
+statement: '`fishhawkd --version` and `fishhawkd version` exit 0 and print the build identity on stdout without starting the HTTP server or needing a database URL.'
+verify_hint: Run the preview's fishhawkd binary with `--version` while FISHHAWKD_DATABASE_URL is unset, and check that the exit code is 0, stdout shows `dev (<short sha>)` for a scripts/dev-built binary, and no listen log line appears on stderr.
+steps: Found the preview's listener with lsof -iTCP:8090 (pid 59691) and its binary, /Users/brettkuhlman/Projects/fishhawk/.fishhawk/cache/preview-worktree/bin/fishhawkd. Ran it with --version, then with version, under env -u FISHHAWKD_DATABASE_URL -u DATABASE_URL.
+assertions:
+    expected: exit 0, 'dev (<short sha>)', no listen log, no DB URL needed
+    observed_at_record: Both exit 0 with stdout 'dev (e7f39c9c)' and 0 bytes on stderr (no listen log). The commands returned immediately. The stamped build also answers --version with exit 0
+    repro_handle: env -u FISHHAWKD_DATABASE_URL <preview>/bin/fishhawkd --version
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z
