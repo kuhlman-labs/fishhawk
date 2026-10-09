@@ -340,6 +340,9 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDelegation(srv, resolver)
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)
+	// E83.49 / #4082: the safe CI re-trigger, so nobody closes and reopens a
+	// run's PR (which cancels the run) to re-fire CI.
+	registerRetriggerCI(srv, resolver)
 	registerMergeRun(srv, resolver)
 	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
