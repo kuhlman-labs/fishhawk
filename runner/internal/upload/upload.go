@@ -837,6 +837,29 @@ type FetchedPrompt struct {
 	// anchored the trigger to. The runner refuses BEFORE mutating anything when
 	// the checked-out tip differs.
 	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
+
+	// MergeCandidateVerify is true when this implement stage is a VERIFY-ONLY
+	// merge-candidate pass (ADR-090 D3 / #4018): a Fishhawk write (base
+	// advance, conflict-resolution push or fan-in integration) produced a head
+	// no runner gated. The runner fetches the run-branch tip, refuses unless it
+	// equals MergeCandidateVerifyExpectedHeadSHA, runs ONLY the declared verify
+	// command in full form in the isolated committed-tree gate, and ships one
+	// OutcomeMergeCandidateVerified report — no agent, no commit, no push.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (merge_candidate_verify /
+	// merge_candidate_verify_branch / merge_candidate_verify_expected_head_sha /
+	// merge_candidate_verify_cause) MUST stay byte-identical to the backend's
+	// promptResponse (backend/internal/server/prompt.go). A tag drift silently
+	// DISABLES the pass: the runner decodes false and takes the ordinary
+	// implement path.
+	MergeCandidateVerify bool `json:"merge_candidate_verify,omitempty"`
+	// MergeCandidateVerifyBranch is the run branch whose tip is verified.
+	MergeCandidateVerifyBranch string `json:"merge_candidate_verify_branch,omitempty"`
+	// MergeCandidateVerifyExpectedHeadSHA is the head the result binds to.
+	MergeCandidateVerifyExpectedHeadSHA string `json:"merge_candidate_verify_expected_head_sha,omitempty"`
+	// MergeCandidateVerifyCause names the write that produced the head:
+	// base_advance, conflict_resolution or fan_in.
+	MergeCandidateVerifyCause string `json:"merge_candidate_verify_cause,omitempty"`
 	// OpenPRFromHeldCommit is true on an operator EXEMPT resolution of a
 	// scope-completeness park (#1231): the implement stage previously parked
 	// because the missing-declared-scope-file gate was its sole failure, and the
@@ -2286,6 +2309,58 @@ type ShipPullRequestArgs struct {
 	// Reason naming the exit path. Unused on every other outcome.
 	ScenarioIDs      []string
 	RetiredScenarios []scenario.RetiredEntry
+
+	// MergeCandidateResult, MergeCandidateReason and MergeCandidateOutputTail
+	// carry the OutcomeMergeCandidateVerified report (ADR-090 D3 / #4018):
+	// the result (passed | failed | not_executed), why a pass did not reach a
+	// verdict, and the verify output's tail. The caller REDACTS the tail
+	// before handing it here; ShipPullRequest only bounds it. Branch and
+	// HeadSHA carry the verified run-branch tip. Unused on every other outcome.
+	MergeCandidateResult     string
+	MergeCandidateReason     string
+	MergeCandidateOutputTail string
+}
+
+// OutcomeMergeCandidateVerified is the report outcome of a verify-only
+// merge-candidate pass (ADR-090 D3). It MIRRORS the backend's pullRequestBody
+// outcome literal (backend/internal/server/pullrequest.go).
+const OutcomeMergeCandidateVerified = "merge_candidate_verified"
+
+// MaxMergeCandidateOutputTailBytes bounds the shipped verify-output tail. It
+// MIRRORS the backend's mergeCandidateOutputTailMax
+// (backend/internal/server/merge_candidate_verify.go), which re-bounds it
+// server-side; keeping the runner's bound equal means the stored tail is
+// exactly what was shipped. MaxMergeCandidateReasonBytes bounds the reason.
+// Both keep the merge_candidate_verified body far under
+// MaxPullRequestReportBytes.
+const (
+	MaxMergeCandidateOutputTailBytes = 4096
+	MaxMergeCandidateReasonBytes     = 1024
+)
+
+// pullRequestMergeCandidateBody is the wire shape for
+// Outcome=="merge_candidate_verified" (ADR-090 D3): the verified head plus the
+// result. No base_sha and no PR fields — the pass pushed nothing.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's pullRequestBody (backend/internal/server/pullrequest.go); the
+// ship_merge_candidate pair in backend/internal/wirecontract pins them.
+type pullRequestMergeCandidateBody struct {
+	Outcome                  string `json:"outcome"`
+	Branch                   string `json:"branch"`
+	HeadSHA                  string `json:"head_sha"`
+	MergeCandidateResult     string `json:"merge_candidate_result"`
+	MergeCandidateReason     string `json:"merge_candidate_reason,omitempty"`
+	MergeCandidateOutputTail string `json:"merge_candidate_output_tail,omitempty"`
+}
+
+// boundMergeCandidateTail keeps the LAST max bytes of s (the end of verify
+// output names the failure), re-validated as UTF-8 after the cut.
+func boundMergeCandidateTail(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[len(s)-max:], "")
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -3116,6 +3191,28 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)
+		}
+		body = marshalled
+	case OutcomeMergeCandidateVerified:
+		// Merge-candidate verify report (ADR-090 D3): the verified head plus
+		// the result. The reason keeps its HEAD (it names the cause first) and
+		// the output its TAIL (the end names the failure); both are bounded so
+		// the body stays far under MaxPullRequestReportBytes whatever the
+		// verify command printed.
+		reason := args.MergeCandidateReason
+		if len(reason) > MaxMergeCandidateReasonBytes {
+			reason = strings.ToValidUTF8(reason[:MaxMergeCandidateReasonBytes], "")
+		}
+		marshalled, err := json.Marshal(pullRequestMergeCandidateBody{
+			Outcome:                  args.Outcome,
+			Branch:                   args.Branch,
+			HeadSHA:                  args.HeadSHA,
+			MergeCandidateResult:     args.MergeCandidateResult,
+			MergeCandidateReason:     reason,
+			MergeCandidateOutputTail: boundMergeCandidateTail(args.MergeCandidateOutputTail, MaxMergeCandidateOutputTailBytes),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal merge-candidate verify body: %w", err)
 		}
 		body = marshalled
 	case OutcomeAcceptanceScenariosPushed:

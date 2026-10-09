@@ -229,6 +229,17 @@ func SeedManifest() Manifest {
 				EmitterOnlyUnchecked: true,
 			},
 			{
+				// The verify-only merge-candidate pass's report (ADR-090 D3 /
+				// #4018). A renamed merge_candidate_* tag on either side would
+				// 400 the report under DisallowUnknownFields and strand the
+				// re-opened implement stage in `running`.
+				Name: "ship_merge_candidate", Anchor: "ADR-090/#4018",
+				Emitter:              Endpoint{File: pullRequestGo, Type: "pullRequestBody"},
+				Consumer:             Endpoint{File: uploadFile, Type: "pullRequestMergeCandidateBody"},
+				Mode:                 ModeSubset,
+				EmitterOnlyUnchecked: true,
+			},
+			{
 				// The runner's terminal-failure self-report (#3598). ModeExact:
 				// the guard compares json TAGS (names + options), not Go types,
 				// so the server's json.RawMessage expected_state/expected_attempt

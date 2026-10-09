@@ -5100,3 +5100,114 @@ func TestFetchPrompt_DecodesReasoningEffort(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchedPrompt_DecodesMergeCandidateVerifyFields feeds the BACKEND's
+// literal json field names (ADR-090 D3). A tag drift silently DISABLES the
+// verify-only pass: the runner decodes false and takes the ordinary path.
+func TestFetchedPrompt_DecodesMergeCandidateVerifyFields(t *testing.T) {
+	const body = `{
+		"stage_id":"s1","stage_type":"implement","prompt":"p","prompt_hash":"h",
+		"merge_candidate_verify":true,
+		"merge_candidate_verify_branch":"fishhawk/run-1",
+		"merge_candidate_verify_expected_head_sha":"deadbeef",
+		"merge_candidate_verify_cause":"base_advance"
+	}`
+	var got FetchedPrompt
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.MergeCandidateVerify || got.MergeCandidateVerifyBranch != "fishhawk/run-1" ||
+		got.MergeCandidateVerifyExpectedHeadSHA != "deadbeef" || got.MergeCandidateVerifyCause != "base_advance" {
+		t.Fatalf("decoded %+v", got)
+	}
+	var off FetchedPrompt
+	if err := json.Unmarshal([]byte(`{"stage_id":"s1","stage_type":"implement","prompt":"p","prompt_hash":"h"}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	if off.MergeCandidateVerify || off.MergeCandidateVerifyBranch != "" ||
+		off.MergeCandidateVerifyExpectedHeadSHA != "" || off.MergeCandidateVerifyCause != "" {
+		t.Fatalf("absent instruction decoded as %+v, want the zero value", off)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerifiedBody pins the EXACT key set the
+// backend's pullRequestBody decodes for the merge_candidate_verified outcome
+// (the handler uses DisallowUnknownFields, so an extra key is a 400 that
+// strands the stage), and the tail/reason bounds that keep the body under
+// MaxPullRequestReportBytes whatever the verify command printed.
+func TestShipPullRequest_MergeCandidateVerifiedBody(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stage_id":"s","outcome":"merge_candidate_verified"}`))
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	ship := func(args ShipPullRequestArgs) map[string]any {
+		t.Helper()
+		args.RunID, args.StageID, args.PrivateKey = "r", "s", priv
+		args.Outcome = OutcomeMergeCandidateVerified
+		if _, err := c.ShipPullRequest(context.Background(), args); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	got := ship(ShipPullRequestArgs{
+		Branch: "fishhawk/run-1", HeadSHA: "h1", BaseSHA: "ignored", FilesChangedCount: 9,
+		MergeCandidateResult: "failed", MergeCandidateReason: "verify red", MergeCandidateOutputTail: "FAIL x",
+	})
+	want := map[string]any{
+		"outcome": "merge_candidate_verified", "branch": "fishhawk/run-1", "head_sha": "h1",
+		"merge_candidate_result": "failed", "merge_candidate_reason": "verify red",
+		"merge_candidate_output_tail": "FAIL x",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("body = %v\nwant %v (exactly the backend's merge_candidate_verified key set)", got, want)
+	}
+
+	// Bounds: the tail keeps its LAST bytes, the reason its FIRST.
+	tail := strings.Repeat("a", 3*MaxMergeCandidateOutputTailBytes) + "END-OF-OUTPUT"
+	reason := "START-OF-REASON" + strings.Repeat("r", 3*MaxMergeCandidateReasonBytes)
+	got = ship(ShipPullRequestArgs{
+		Branch: "b", HeadSHA: "h", MergeCandidateResult: "failed",
+		MergeCandidateReason: reason, MergeCandidateOutputTail: tail,
+	})
+	gotTail, _ := got["merge_candidate_output_tail"].(string)
+	if len(gotTail) != MaxMergeCandidateOutputTailBytes || !strings.HasSuffix(gotTail, "END-OF-OUTPUT") {
+		t.Errorf("tail len = %d (suffix kept %v), want %d keeping the end", len(gotTail), strings.HasSuffix(gotTail, "END-OF-OUTPUT"), MaxMergeCandidateOutputTailBytes)
+	}
+	gotReason, _ := got["merge_candidate_reason"].(string)
+	if len(gotReason) != MaxMergeCandidateReasonBytes || !strings.HasPrefix(gotReason, "START-OF-REASON") {
+		t.Errorf("reason len = %d, want %d keeping the start", len(gotReason), MaxMergeCandidateReasonBytes)
+	}
+	if len(raw) > MaxPullRequestReportBytes {
+		t.Errorf("body = %d bytes, over MaxPullRequestReportBytes", len(raw))
+	}
+
+	// A not_executed report with no tail omits the optional keys.
+	got = ship(ShipPullRequestArgs{Branch: "b", HeadSHA: "h", MergeCandidateResult: "not_executed"})
+	for _, absent := range []string{"merge_candidate_reason", "merge_candidate_output_tail", "base_sha", "pr_number"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("body carries %s, want it omitted", absent)
+		}
+	}
+}
+
+// TestMergeCandidateTailBoundsMirrorBackend pins the runner-side tail bound to
+// the backend's mergeCandidateOutputTailMax
+// (backend/internal/server/merge_candidate_verify.go): update both together.
+func TestMergeCandidateTailBoundsMirrorBackend(t *testing.T) {
+	if MaxMergeCandidateOutputTailBytes != 4096 {
+		t.Fatalf("MaxMergeCandidateOutputTailBytes = %d; it mirrors backend mergeCandidateOutputTailMax (4096) — update both", MaxMergeCandidateOutputTailBytes)
+	}
+}
