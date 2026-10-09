@@ -75,6 +75,13 @@ func (f *rbFixture) seedChild(childID, parentID, stageID uuid.UUID, state run.St
 	f.runs.addStage(childID, stageID, run.StageTypeImplement, state, created)
 }
 
+// seedParent seeds the decomposition parent run of a seedChild in an explicit
+// state, so the undispatched_child parent-state filter (#4184) is exercised
+// rather than masked. The parent has no stages and no review rounds.
+func (f *rbFixture) seedParent(parentID uuid.UUID, state run.State, created time.Time) {
+	f.runs.seed(parentID, "acme/app", state, created, "")
+}
+
 // seedReviewRound seeds one GATING *_review_started entry for a running run.
 // A gating round is never re-dispatched on boot (redispatchEligibility), so a
 // current-process unsettled one is a blocker whatever the fixture wires —
@@ -157,6 +164,7 @@ func TestRestartBlockers_UndispatchedChild(t *testing.T) {
 	for _, state := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
 		t.Run(string(state), func(t *testing.T) {
 			f := newRBFixture()
+			f.seedParent(attnID(2), run.StateRunning, attnT0)
 			f.seedChild(attnID(1), attnID(2), attnID(3), state, attnT0)
 			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
 			if len(got.Items) != 1 {
@@ -167,8 +175,9 @@ func TestRestartBlockers_UndispatchedChild(t *testing.T) {
 				it.Stage != "implement" || it.ParentRunID != attnID(2).String() || it.StageState != string(state) {
 				t.Errorf("item = %+v, want child %s of parent %s at %s", it, attnID(1), attnID(2), state)
 			}
-			if got.ScannedRuns != 1 || got.Truncated {
-				t.Errorf("scanned_runs = %d truncated = %v, want 1/false", got.ScannedRuns, got.Truncated)
+			// The running parent is scanned too: it is non-terminal.
+			if got.ScannedRuns != 2 || got.Truncated {
+				t.Errorf("scanned_runs = %d truncated = %v, want 2/false", got.ScannedRuns, got.Truncated)
 			}
 		})
 	}
@@ -180,10 +189,123 @@ func TestRestartBlockers_ChildDispatched_NotBlocker(t *testing.T) {
 	for _, state := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateSucceeded} {
 		t.Run(string(state), func(t *testing.T) {
 			f := newRBFixture()
+			// A LIVE parent, so the zero-item result cannot come from the
+			// terminal-parent filter.
+			f.seedParent(attnID(2), run.StateRunning, attnT0)
 			f.seedChild(attnID(1), attnID(2), attnID(3), state, attnT0)
 			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
 			if len(got.Items) != 0 {
 				t.Fatalf("items = %+v, want none for a dispatched child", got.Items)
+			}
+		})
+	}
+}
+
+// TestRestartBlockers_TerminalParentChild_NotBlocker: a pending child of a
+// SUCCEEDED / FAILED / CANCELLED decomposition parent can never be dispatched
+// (cancel does not cascade, #4186), so it is not a blocker (#4184). The live
+// parent arms are the control: the same child under a pending / running parent
+// IS reported. Counterfactuals: forcing the terminal test to false reports the
+// terminal arms; forcing it to true drops the live arms.
+func TestRestartBlockers_TerminalParentChild_NotBlocker(t *testing.T) {
+	cases := []struct {
+		parent      run.State
+		wantItems   int
+		wantScanned int
+	}{
+		// A terminal parent is not in the non-terminal scan set.
+		{run.StateCancelled, 0, 1},
+		{run.StateFailed, 0, 1},
+		{run.StateSucceeded, 0, 1},
+		{run.StatePending, 1, 2},
+		{run.StateRunning, 1, 2},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.parent), func(t *testing.T) {
+			f := newRBFixture()
+			f.seedParent(attnID(2), tc.parent, attnT0)
+			f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStatePending, attnT0)
+			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+			if len(got.Items) != tc.wantItems || got.ScannedRuns != tc.wantScanned {
+				t.Fatalf("parent %s: items = %+v scanned_runs = %d, want %d items over %d runs",
+					tc.parent, got.Items, got.ScannedRuns, tc.wantItems, tc.wantScanned)
+			}
+			if tc.wantItems == 0 {
+				return
+			}
+			it := got.Items[0]
+			if it.RunID != attnID(1).String() || it.Reason != restartBlockerUndispatchedChild ||
+				it.ParentRunID != attnID(2).String() || it.StageState != string(run.StageStatePending) {
+				t.Errorf("item = %+v, want undispatched_child naming child %s of parent %s", it, attnID(1), attnID(2))
+			}
+		})
+	}
+}
+
+// TestRestartBlockers_IncidentShape_TerminalParents_NoItems replays the #4184
+// incident through the REAL mux (anonymous, as scripts/dev calls it), the
+// handler, the fake run repository and the JSON encoder: running children with
+// pending / awaiting_host_dispatch implement stages spread across two CANCELLED
+// parents, plus one pending child under a SUCCEEDED parent. None can ever
+// dispatch, so the response is 200 with zero items.
+func TestRestartBlockers_IncidentShape_TerminalParents_NoItems(t *testing.T) {
+	f := newRBFixture()
+	cancelledA, cancelledB, succeeded := attnID(10), attnID(11), attnID(12)
+	f.seedParent(cancelledA, run.StateCancelled, attnT0)
+	f.seedParent(cancelledB, run.StateCancelled, attnT0)
+	f.seedParent(succeeded, run.StateSucceeded, attnT0)
+	for i, tc := range []struct {
+		parent uuid.UUID
+		state  run.StageState
+	}{
+		{cancelledA, run.StageStatePending},
+		{cancelledA, run.StageStateAwaitingHostDispatch},
+		{cancelledA, run.StageStatePending},
+		{cancelledB, run.StageStateAwaitingHostDispatch},
+		{cancelledB, run.StageStatePending},
+		{succeeded, run.StageStatePending},
+	} {
+		f.seedChild(attnID(100+i), tc.parent, attnID(200+i), tc.state, attnT0.Add(time.Duration(i)*time.Second))
+	}
+
+	rec := httptest.NewRecorder()
+	f.server().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/restart-blockers", nil))
+	got := decodeRestartBlockers(t, rec)
+	if len(got.Items) != 0 {
+		t.Fatalf("items = %+v, want none: every pending child belongs to a terminal parent", got.Items)
+	}
+	if got.ScannedRuns != 6 || got.Truncated {
+		t.Errorf("scanned_runs = %d truncated = %v, want the 6 running children / false", got.ScannedRuns, got.Truncated)
+	}
+}
+
+// TestRestartBlockers_ParentReadMemoized: the parent is read ONCE per distinct
+// parent per request, however many pending children it has. Driver (approval
+// condition C1): getRestartBlockers calls s.handleListRestartBlockers
+// directly, NOT s.Handler(), so fakeRepo.getRunCalls counts only the parent
+// reads the restart-blockers check makes and not the run-scoped authz wrappers
+// (resolveRunForAuthz) the mux would add. Counterfactual: bypassing the memo
+// makes getRunCalls 2.
+func TestRestartBlockers_ParentReadMemoized(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		parent    run.State
+		wantItems int
+	}{
+		{"terminal_parent", run.StateCancelled, 0},
+		{"live_parent", run.StateRunning, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRBFixture()
+			f.seedParent(attnID(2), tc.parent, attnT0)
+			f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStatePending, attnT0)
+			f.seedChild(attnID(4), attnID(2), attnID(5), run.StageStateAwaitingHostDispatch, attnT0.Add(time.Second))
+			got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+			if len(got.Items) != tc.wantItems {
+				t.Fatalf("items = %+v, want %d", got.Items, tc.wantItems)
+			}
+			if f.runs.getRunCalls != 1 {
+				t.Errorf("GetRun calls = %d, want 1 (one memoized read for the shared parent)", f.runs.getRunCalls)
 			}
 		})
 	}
@@ -425,6 +547,33 @@ func TestRestartBlockers_CheckFailed(t *testing.T) {
 			t.Fatalf("items = %+v, want one implement check_failed", got.Items)
 		}
 	})
+	t.Run("parent_read", func(t *testing.T) {
+		// GetRun is the ONLY failing read: the stage read succeeds and no
+		// review round is seeded, so nothing else reaches GetRun. Counterfactual:
+		// skipping the child on a parent error yields zero items, and falling
+		// through to the live-parent path yields undispatched_child.
+		f := newRBFixture()
+		f.seedParent(attnID(2), run.StateRunning, attnT0)
+		f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStatePending, attnT0)
+		f.runs.getErr = errors.New("db down")
+		got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+		if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerCheckFailed ||
+			got.Items[0].Stage != "implement" || got.Items[0].RunID != attnID(1).String() {
+			t.Fatalf("items = %+v, want one implement check_failed on the child", got.Items)
+		}
+	})
+	t.Run("parent_not_found", func(t *testing.T) {
+		// The parent is never seeded, so GetRun returns run.ErrNotFound (the
+		// concurrent-delete race decomposed_from ON DELETE SET NULL leaves).
+		// Fail closed: a parent that cannot be decided is check_failed.
+		f := newRBFixture()
+		f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStatePending, attnT0)
+		got := decodeRestartBlockers(t, getRestartBlockers(t, f.server(), anonymous()))
+		if len(got.Items) != 1 || got.Items[0].Reason != restartBlockerCheckFailed ||
+			got.Items[0].Stage != "implement" || got.Items[0].RunID != attnID(1).String() {
+			t.Fatalf("items = %+v, want one implement check_failed on the child", got.Items)
+		}
+	})
 	t.Run("audit_started_read", func(t *testing.T) {
 		f := newRBFixture()
 		f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
@@ -583,7 +732,7 @@ func restartBlockersGoldenPath(t *testing.T) string {
 // FISHHAWK_UPDATE_WIRE_GOLDEN=1.
 func TestRestartBlockers_EndToEnd_Golden(t *testing.T) {
 	f := newRBFixture()
-	// undispatched_child
+	// undispatched_child (the parent, attnID(2), is seeded LIVE below)
 	f.seedChild(attnID(1), attnID(2), attnID(3), run.StageStateAwaitingHostDispatch, attnT0)
 	// review_in_flight (plan): a GATING round, which no boot re-dispatches
 	// (#4077), so the item survives the narrowed predicate and the golden
@@ -593,8 +742,10 @@ func TestRestartBlockers_EndToEnd_Golden(t *testing.T) {
 	// check_failed (child stage read)
 	f.seedChild(attnID(5), attnID(2), attnID(6), run.StageStatePending, attnT0.Add(2*time.Minute))
 	f.runs.stageErr[attnID(5)] = errors.New("boom")
-	// a clean run that blocks nothing
-	f.runs.seed(attnID(7), "acme/app", run.StateRunning, attnT0.Add(3*time.Minute), "")
+	// the live decomposition parent of the two children above: a running run
+	// with no stages and no review rounds, so it is scanned and blocks nothing.
+	// It must be non-terminal or the undispatched_child item is filtered (#4184).
+	f.seedParent(attnID(2), run.StateRunning, attnT0.Add(3*time.Minute))
 
 	rec := httptest.NewRecorder()
 	f.server().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/restart-blockers", nil))
