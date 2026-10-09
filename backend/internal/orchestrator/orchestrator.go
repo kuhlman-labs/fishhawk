@@ -1024,7 +1024,10 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // deterministic run-id-stamped fallback); the body carries `## Summary` (the
 // approved-plan summary plus a per-slice bullet list from decomposition
 // sub_plans), a `Closes #N` line for issue-triggered parents, and the SAME
-// attribution footer literal the runner appends.
+// attribution footer literal the runner appends. A plan that declares a
+// PARTIAL delivery (plan.(*Plan).IsPartialDelivery, E83.52 / #4085) gets
+// `Refs #N` instead, so merging the consolidated PR does not close the issue; a
+// nil plan keeps `Closes #N`.
 //
 // Defensive by construction: nil/empty IssueContext, a nil plan, and a plan
 // lacking a summary or sub_plan titles each still yield a valid, run-id-stamped
@@ -1072,7 +1075,11 @@ func consolidatedPRTitleBody(r *run.Run, p *plan.Plan, implStageID uuid.UUID, he
 	}
 
 	if r.IssueContext != nil && r.IssueContext.Number > 0 {
-		fmt.Fprintf(&b, "\n\nCloses #%d", r.IssueContext.Number)
+		keyword := "Closes"
+		if p.IsPartialDelivery() {
+			keyword = "Refs"
+		}
+		fmt.Fprintf(&b, "\n\n%s #%d", keyword, r.IssueContext.Number)
 	}
 
 	b.WriteString(consolidatedPRFooter(r.ID, implStageID, head, baseURL))
