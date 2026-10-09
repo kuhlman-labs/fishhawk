@@ -795,6 +795,15 @@
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-089",
+      "title": "First officer: a structurally read-only crew seat whose evidence-backed findings gate actions",
+      "path": "docs/adr/089-first-officer-read-only-crew-seat.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
