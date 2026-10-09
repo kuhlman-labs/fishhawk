@@ -51,12 +51,15 @@ var (
 
 // TERMINAL-EGRESS retry budget (E68.7 / #2897). The short budget above is a
 // BLIP budget: 3 retries at 500ms doubling is ~3.5s of sleep, which a lost
-// progress tick can afford because the next tick supersedes it. The three
+// progress tick can afford because the next tick supersedes it. The four
 // POSTs that SETTLE a stage's outcome cannot — ShipTrace (the stage-completion
-// POST), ShipPlan (the plan stage's settling artifact) and ReportRunnerFailure
-// (the reap-failure channel that is the only backstop when the trace POST
-// itself is what failed). A lost one of those leaves the stage `running`
-// forever, recoverable only via POST /v0/runs/{id}/stages/{id}/reap-failure.
+// POST), ShipPlan (the plan stage's settling artifact), ShipAcceptance (the
+// acceptance stage's settling verdict, #4077) and ReportRunnerFailure (the
+// reap-failure channel that is the only backstop when the trace POST itself is
+// what failed). A lost one of those leaves the stage `running` forever (or,
+// for an unshipped acceptance verdict, an agent-settled outcome the backend
+// never sees), recoverable only via POST
+// /v0/runs/{id}/stages/{id}/reap-failure.
 // A `scripts/dev reload` / `post-merge` restarts fishhawkd for tens of
 // seconds, so the blip budget cannot ride one out.
 //
@@ -78,8 +81,8 @@ var (
 	DefaultTerminalEgressBudget = 90 * time.Second
 
 	// DefaultTerminalEgressReserve is the tail of the phase WITHHELD from the
-	// settling uploads (ShipTrace / ShipPlan) and left for the last-word
-	// ReportRunnerFailure report.
+	// settling uploads (ShipTrace / ShipPlan / ShipAcceptance) and left for the
+	// last-word ReportRunnerFailure report.
 	//
 	// Without it a shared deadline has a sharp edge: a ShipTrace that spends
 	// the entire phase hands the fallback an ALREADY-EXPIRED context, so the
@@ -187,7 +190,7 @@ type Client struct {
 
 	// TerminalMaxRetries / TerminalBackoff / TerminalBackoffCap override the
 	// TERMINAL-EGRESS budget (see DefaultTerminalMaxRetries) used by
-	// ShipTrace, ShipPlan and ReportRunnerFailure. Zero means the
+	// ShipTrace, ShipPlan, ShipAcceptance and ReportRunnerFailure. Zero means the
 	// corresponding default, mirroring the MaxRetries/Backoff convention
 	// exactly so tests can shrink them.
 	TerminalMaxRetries int
@@ -251,7 +254,7 @@ func (c *Client) retryPolicy() (maxRetries int, backoff time.Duration) {
 
 // terminalRetryPolicy resolves the TERMINAL-EGRESS retry budget: a CAPPED
 // doubling backoff over a longer attempt count. See
-// DefaultTerminalMaxRetries for why the three settling POSTs need it.
+// DefaultTerminalMaxRetries for why the four settling POSTs need it.
 func (c *Client) terminalRetryPolicy() (maxRetries int, backoff, backoffCap time.Duration) {
 	maxRetries = c.TerminalMaxRetries
 	if maxRetries == 0 {
@@ -310,8 +313,9 @@ func (c *Client) terminalEgressPhaseDeadline() time.Time {
 }
 
 // settlingEgressContext is the phase context for the SETTLING uploads
-// (ShipTrace, ShipPlan): the shared phase deadline MINUS the reserve withheld
-// for the last-word report. The caller MUST defer the returned cancel.
+// (ShipTrace, ShipPlan, ShipAcceptance): the shared phase deadline MINUS the
+// reserve withheld for the last-word report. The caller MUST defer the
+// returned cancel.
 //
 // The reserve is a SPLIT of the phase, not an addition to it, so the combined
 // bound stays the budget. A reserve at or above the whole budget would leave a
@@ -340,8 +344,8 @@ func (c *Client) lastWordEgressContext(ctx context.Context) (context.Context, co
 }
 
 // endTerminalEgressPhase CLOSES the shared terminal-egress phase so the next
-// terminal call opens a fresh one. Called by ShipTrace, ShipPlan and
-// ReportRunnerFailure on their SUCCESS paths only.
+// terminal call opens a fresh one. Called by ShipTrace, ShipPlan,
+// ShipAcceptance and ReportRunnerFailure on their SUCCESS paths only.
 //
 // Success is the signal because it is the one outcome that PROVES the backend
 // is reachable: the phase exists to bound the blocking cost of ONE outage, and
@@ -2013,8 +2017,11 @@ type ShipAcceptanceResult struct {
 
 // ShipAcceptance signs the verdict bytes and POSTs them to
 // /v0/runs/{run_id}/acceptance?stage_id=… (E31.7 / #1535). Modeled on
-// ShipPlan: retries transient failures (5xx, network errors) with the
-// ShipTrace backoff policy. Permanent failures bubble up:
+// ShipPlan: retries transient failures (5xx, network errors) on the
+// TERMINAL-EGRESS budget and shared phase deadline (#2897, moved here by
+// #4077 — the verdict is the acceptance stage's SETTLING upload, so a
+// fishhawkd restart mid-upload must be ridden out, not lost on the ~3.5s blip
+// budget). Permanent failures bubble up after ONE attempt:
 //
 //   - 400 acceptance_invalid → ErrAcceptanceInvalid (bad verdict shape;
 //     category-B at the call site)
@@ -2044,7 +2051,14 @@ func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*
 		url.PathEscape(args.StageID),
 	)
 
-	maxRetries, backoff := c.retryPolicy()
+	// TERMINAL EGRESS (E68.7 / #2897, #4077): the verdict is the acceptance
+	// stage's SETTLING upload — without it the agent's settled outcome never
+	// reaches the backend — so it shares the terminal budget and the same phase
+	// deadline as ShipTrace, ShipPlan and ReportRunnerFailure. A failure here is
+	// followed promptly by the last-word report, which joins this phase.
+	maxRetries, backoff, backoffCap := c.terminalRetryPolicy()
+	ctx, cancel := c.settlingEgressContext(ctx)
+	defer cancel()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -2054,7 +2068,7 @@ func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff = capBackoff(backoff, backoffCap)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Body))
@@ -2080,6 +2094,9 @@ func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*
 			if err != nil {
 				return nil, fmt.Errorf("upload: decode acceptance response: %w", err)
 			}
+			// The verdict landed: close the phase so a ShipTrace later in the
+			// same stage opens a fresh one (see endTerminalEgressPhase).
+			c.endTerminalEgressPhase()
 			return &out, nil
 		case resp.StatusCode == http.StatusBadRequest:
 			detail := readBriefBody(resp)
@@ -2796,9 +2813,11 @@ type ShipAcceptanceTranscriptResult struct {
 }
 
 // ShipAcceptanceTranscript signs the transcript bytes and POSTs them to
-// /v0/runs/{run_id}/acceptance/transcript?stage_id=… (E72.5 / #3329), the
-// ShipAcceptance retry/classification contract: transient failures (5xx,
-// network) retry with the ShipTrace backoff; permanent failures bubble up:
+// /v0/runs/{run_id}/acceptance/transcript?stage_id=… (E72.5 / #3329), with
+// the ShipAcceptance CLASSIFICATION contract but deliberately NOT its
+// terminal-egress budget (#4077): the transcript is best-effort — on failure
+// the verdict ships without the ref — so transient failures (5xx, network)
+// retry on the SHORT blip budget; permanent failures bubble up:
 //
 //   - 400 acceptance_transcript_invalid → ErrAcceptanceTranscriptInvalid
 //   - 401 signature_*                   → ErrSignatureRejected
