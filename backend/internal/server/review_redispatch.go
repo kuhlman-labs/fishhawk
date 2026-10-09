@@ -354,6 +354,16 @@ func (s *Server) runOrphanedRoundRedispatch(ctx context.Context, runID uuid.UUID
 // orphanedRoundStillOpen re-checks, under the run's stripe lock, that the
 // orphaned round is still the stage's latest round and still unsettled. A
 // newer round (or a settle) since the handoff means there is nothing to do.
+//
+// The lock is released BEFORE the dispatch, so this check does not serialize
+// two concurrent re-dispatch goroutines for the SAME round: both would pass it
+// and both would dispatch. One goroutine per round is guaranteed upstream
+// instead — redispatchOrphanedRound runs only under the boot sweep's per-run
+// stripe lock, after the already_redispatched check, and records the round in
+// the pending set — and TestReviewRedispatchD6Guard_RealPackage pins
+// redispatchOrphanedRound and runOrphanedRoundRedispatch to their single
+// callers. A second hand-off path must therefore add its own dedup (or hold the
+// lock across the dispatch); it must not lean on this check.
 func (s *Server) orphanedRoundStillOpen(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, orphanedSeq int64, configured int) bool {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
