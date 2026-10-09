@@ -13,6 +13,8 @@ The Go control-plane service that orchestrates workflow runs, persists state, ev
 
 - **Container image**: `ghcr.io/kuhlman-labs/fishhawkd:<version>` and `:latest`. Multi-stage build → distroless static binary, ~25 MB. Runs as `nonroot` (uid 65532), no shell, no package manager.
 - **`fishhawkd-<version>.sbom.spdx.json`** — SPDX-JSON SBOM of the image, listing every Go module the binary links against.
+- **`fishhawkd-<version>-darwin-arm64`, `-darwin-amd64`, `-linux-amd64`, `-linux-arm64`** — standalone binaries for a local install, stamped with this tag's version and commit (`/healthz` reports `git_sha`).
+- **`SHA256SUMS`** + **`SHA256SUMS.sig`** + **`SHA256SUMS.pem`** — sha256 of the four binaries, signed with cosign keyless. Verify with `cosign verify-blob --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/\.github/workflows/backend-release\.yml@.*' --certificate-oidc-issuer https://token.actions.githubusercontent.com --signature SHA256SUMS.sig --certificate SHA256SUMS.pem SHA256SUMS`, then `sha256sum -c --ignore-missing SHA256SUMS`.
 - Image is signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless via GitHub Actions OIDC. No managed PGP key in the loop.
 
 ## Pulling and verifying

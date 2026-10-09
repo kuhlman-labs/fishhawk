@@ -11,8 +11,17 @@
 #  4. Signs the resulting image digest with cosign keyless.
 #  5. Generates an SPDX-JSON SBOM as a downloadable artifact.
 #  6. Publishes a GitHub Release with the SBOM + image-digest
-#     reference. (No separate binary asset — the image IS the
-#     release; tag-only operators can pull it from GHCR.)
+#     reference, plus the standalone `fishhawkd` binaries below.
+#
+# Standalone binaries (#3716): the `binaries` job builds `fishhawkd`
+# for darwin-arm64/amd64 and linux-amd64/arm64, stamped through
+# `scripts/release-ldflags` (#4117), checksums them into SHA256SUMS and
+# signs that with cosign keyless. It runs BEFORE the image job and
+# hands its files over as a workflow artifact, because this repository
+# has immutable releases enabled: GitHub accepts asset uploads only
+# before a release is published, so every asset must go out in the one
+# `action-gh-release` call that creates it. Nothing is published unless
+# the image job's lint + test re-run passes.
 #
 # Versioning convention: `backend/vX.Y.Z`. Path-prefixed tags are
 # the Go-module convention for non-root modules in a monorepo.
@@ -30,10 +39,123 @@ permissions:
   id-token: write    # cosign keyless signing via GitHub OIDC
 
 jobs:
+  binaries:
+    name: Build and sign fishhawkd binaries
+    runs-on: ubuntu-latest
+    # Narrower than the workflow default: this job pushes no image and
+    # creates no release.
+    permissions:
+      contents: read
+      id-token: write   # cosign keyless signing via GitHub OIDC
+    steps:
+      - name: Validate release tag (final or -rc.N only)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A published release locks its tag (immutable releases), so the
+          # tag must read unambiguously: a final release or a release
+          # candidate. -alpha, -beta and any other suffix are refused.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^(backend|runner|mcp|cli)/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::release tag '$TAG' must be <component>/vX.Y.Z or <component>/vX.Y.Z-rc.N (no -alpha, -beta or other suffix)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Compute version and build binaries
+        run: |
+          set -eu
+          # refs/tags/backend/v0.1.0 → v0.1.0
+          version="${GITHUB_REF#refs/tags/backend/}"
+          # One stamping source (#4117). Fail closed if it is absent rather
+          # than ship an unstamped `dev` binary.
+          if [ ! -x scripts/release-ldflags ]; then
+            echo "::error::scripts/release-ldflags is missing at this commit; it lands with #4117" >&2
+            exit 1
+          fi
+          stamp="$(scripts/release-ldflags fishhawkd "${version}" "${GITHUB_SHA}")"
+          mkdir -p dist
+          # CGO disabled, as in backend/Dockerfile, so the static binary
+          # works against any libc.
+          for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            goos="${target%-*}"
+            goarch="${target#*-}"
+            out="dist/fishhawkd-${version}-${target}"
+            (
+              cd backend
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
+                -ldflags="-s -w ${stamp}" \
+                -o "../${out}" \
+                ./cmd/fishhawkd
+            )
+            echo "built ${out}"
+          done
+          # No exec check: fishhawkd reports its version through /healthz,
+          # which needs a database to serve. #4117's per-binary test pins
+          # the stamp's package path.
+
+      - name: Compute checksums
+        run: |
+          set -eu
+          cd dist
+          # `./*` keeps shellcheck happy: filenames starting with `-`
+          # would otherwise be interpreted as flags. Covers the binaries;
+          # the image SBOM is produced later, by the image job.
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums (keyless)
+        run: |
+          set -eu
+          cd dist
+          # Verify downstream with:
+          #
+          #   cosign verify-blob \
+          #     --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/\.github/workflows/backend-release\.yml@.*' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     --signature SHA256SUMS.sig \
+          #     --certificate SHA256SUMS.pem \
+          #     SHA256SUMS
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Hand the binaries to the release job
+        uses: actions/upload-artifact@v7
+        with:
+          name: fishhawkd-binaries
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Build, sign, and publish fishhawkd release
+    needs: binaries
     runs-on: ubuntu-latest
     steps:
+      - name: Validate release tag (final or -rc.N only)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A published release locks its tag (immutable releases), so the
+          # tag must read unambiguously: a final release or a release
+          # candidate. -alpha, -beta and any other suffix are refused.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^(backend|runner|mcp|cli)/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::release tag '$TAG' must be <component>/vX.Y.Z or <component>/vX.Y.Z-rc.N (no -alpha, -beta or other suffix)"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -110,6 +232,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.ver.outputs.version }}
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=backend-release
           cache-to: type=gha,mode=max,scope=backend-release
           provenance: true
@@ -132,6 +255,12 @@ jobs:
           format: spdx-json
           output-file: ./fishhawkd-${{ steps.ver.outputs.version }}.sbom.spdx.json
 
+      - name: Fetch the fishhawkd binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: fishhawkd-binaries
+          path: dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -140,5 +269,13 @@ jobs:
           generate_release_notes: true
           body_path: .github/release-notes/backend.md
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
             ./fishhawkd-${{ steps.ver.outputs.version }}.sbom.spdx.json
+            dist/fishhawkd-${{ steps.ver.outputs.version }}-darwin-arm64
+            dist/fishhawkd-${{ steps.ver.outputs.version }}-darwin-amd64
+            dist/fishhawkd-${{ steps.ver.outputs.version }}-linux-amd64
+            dist/fishhawkd-${{ steps.ver.outputs.version }}-linux-arm64
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
