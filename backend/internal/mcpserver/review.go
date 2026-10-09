@@ -1246,8 +1246,12 @@ the failure reason. A "pending" status after the timeout means the review is
 genuinely STILL RUNNING (no terminal entry yet); re-call to resume, switch
 to fishhawk_get_run_status polling on poll_interval_seconds, or check the
 fishhawkd logs. If the message reports the run has gone terminal while the
-review is in flight, the verdict will still land but the run must be
-re-admitted with fishhawk_revive_run to progress past the gate.
+review is in flight, the verdict will still land; what to do next depends on
+the terminal state the message names (#4101). A FAILED run must be
+re-admitted with fishhawk_revive_run to progress past the gate. A SUCCEEDED
+run (e.g. a decomposition child whose slice was already integrated) needs
+nothing re-admitted — re-call to keep waiting. A CANCELLED run cannot be
+re-admitted by an operator verb; its verdict lands as a record only.
 `),
 	}, resolver.awaitReview)
 }
@@ -1269,41 +1273,46 @@ func runStateIsTerminal(state string) bool {
 
 // awaitRunTerminalBackstop decides how a pending review's wait resolves when
 // the run itself has gone terminal (ADR-036 #874, refined for in-flight reviews
-// by #1915). Three outcomes, via the (output, resolved, terminalInFlight)
+// by #1915 and #4101). Three outcomes, via the (output, resolved, terminalState)
 // return:
 //
 //   - (output, true, _): resolve the wait NOW — the run is terminal and NO
 //     dispatched review is in flight, so no verdict can ever land (the #874
 //     non-stranding backstop). The message explains the review can no longer
 //     progress.
-//   - (zero, false, false): keep polling — the run is not terminal (a GetRun
+//   - (zero, false, ""): keep polling — the run is not terminal (a GetRun
 //     error or a non-terminal run leaves the normal poll/timeout path in
 //     charge, byte-identical to before).
-//   - (zero, false, true): keep polling, but the run is terminal WITH a review
-//     still in flight. A dispatched review's verdict is RECORDED server-side
-//     with no run-state guard (runPlanReviews / runImplementReviews and their
-//     append loops never gate on IsTerminal, pinned by the server-side plan/
-//     trace tests), so a 'pending' review on a terminal run WILL still land its
-//     verdict. Resolving early here would abandon a review that is genuinely
-//     about to answer. The caller records terminalInFlight so a subsequent
-//     timeout names fishhawk_revive_run for re-admitting the run.
+//   - (zero, false, <state>): keep polling, but the run is terminal WITH a
+//     review still in flight; <state> is the observed terminal run state
+//     (succeeded / failed / cancelled). A dispatched review's verdict is
+//     RECORDED server-side with no run-state guard (runPlanReviews /
+//     runImplementReviews and their append loops never gate on IsTerminal,
+//     pinned by the server-side plan/trace tests), so a 'pending' review on a
+//     terminal run WILL still land its verdict — whichever terminal state the
+//     run is in. Resolving early here would abandon a review that is genuinely
+//     about to answer. The caller records the state so a subsequent timeout
+//     gives state-specific advice: only a FAILED run is named for
+//     fishhawk_revive_run, because run.ReviveRun refuses every other state
+//     (#4101).
 //
 // review_status 'pending' is the in-flight signal: it implies a *_review_started
 // marker exists (#600) with fewer than the configured verdicts landed. The fast-
 // path statuses (none/skipped/failed/complete) never reach this backstop — the
 // caller only invokes it on 'pending'.
-func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time, heartbeat bool, timeoutCap int) (AwaitReviewOutput, bool, bool) {
+func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time, heartbeat bool, timeoutCap int) (AwaitReviewOutput, bool, string) {
 	runRow, err := r.api.GetRun(ctx, runID)
 	if err != nil || runRow == nil {
-		return AwaitReviewOutput{}, false, false
+		return AwaitReviewOutput{}, false, ""
 	}
 	if !runStateIsTerminal(runRow.State) {
-		return AwaitReviewOutput{}, false, false
+		return AwaitReviewOutput{}, false, ""
 	}
 	// Terminal run with a dispatched review still in flight: keep polling and
-	// signal terminalInFlight so a timeout names fishhawk_revive_run (#1915).
+	// report the observed terminal state so a timeout gives state-specific
+	// advice (#1915, #4101).
 	if st.Status == "pending" {
-		return AwaitReviewOutput{}, false, true
+		return AwaitReviewOutput{}, false, runRow.State
 	}
 	// Terminal run, no review in flight — resolve early (#874).
 	return AwaitReviewOutput{
@@ -1317,7 +1326,7 @@ func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.U
 			"the review can no longer progress, so the wait resolved instead of holding the "+
 			"session open. Poll fishhawk_get_run_status for the final run state.",
 			stage, st.Status, runID, runRow.State),
-	}, true, false
+	}, true, ""
 }
 
 // awaitReview is the tool handler.
@@ -1363,17 +1372,20 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	// before the loop so a run that is already terminal at call time resolves
 	// (or, with an in-flight review, is flagged) without a poll tick.
 	//
-	// terminalInFlight tracks the #1915 case: the run went terminal while the
+	// terminalState tracks the #1915 case: the run went terminal while the
 	// review is still in flight. The verdict is recorded with no run-state
 	// guard so it WILL land, so we keep polling — but a subsequent timeout must
-	// name fishhawk_revive_run rather than the ordinary still-running message.
+	// give advice for the observed terminal state rather than the ordinary
+	// still-running message (fishhawk_revive_run only for a failed run, #4101).
 	// Terminality is captured HERE (with a live context) rather than re-queried
-	// at timeout, where the poll context is already cancelled.
-	terminalInFlight := false
-	if out, done, tif := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
+	// at timeout, where the poll context is already cancelled. It is
+	// overwritten only by a NON-EMPTY observation, so a transient GetRun error
+	// on a later tick never clears it.
+	terminalState := ""
+	if out, done, ts := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
 		return nil, out, nil
-	} else if tif {
-		terminalInFlight = true
+	} else if ts != "" {
+		terminalState = ts
 	}
 
 	// Restart-strand probe (#2712). boundaryCache is PER-CALL state with a
@@ -1401,7 +1413,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds, lastStrand), nil
+			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalState, heartbeat, capSeconds, lastStrand), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in): keeps a
 			// long wait from being aborted by the client's idle timeout. Emitted
@@ -1414,7 +1426,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
 					ProgressToken: progToken,
 					Progress:      progress,
-					Message:       awaitReviewProgressMessage(in.Stage, time.Since(start), terminalInFlight),
+					Message:       awaitReviewProgressMessage(in.Stage, time.Since(start), terminalState),
 				})
 			}
 			round, err := r.loadReviewRound(pollCtx, runID, in.Stage)
@@ -1423,7 +1435,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 				// that is a timeout, not a transport failure — return
 				// pending rather than surfacing the cancellation as an error.
 				if pollCtx.Err() != nil {
-					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds, lastStrand), nil
+					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalState, heartbeat, capSeconds, lastStrand), nil
 				}
 				return nil, AwaitReviewOutput{}, fmt.Errorf("poll review status: %w", err)
 			}
@@ -1442,12 +1454,12 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 			// itself has gone terminal with NO review in flight the review
 			// never will — resolve now (#874). With a review still in flight
 			// keep polling (its verdict is recorded unguarded and WILL land)
-			// but flag terminalInFlight so a timeout names fishhawk_revive_run
-			// (#1915).
-			if out, done, tif := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
+			// but record the terminal state so a timeout gives state-specific
+			// advice (#1915, #4101).
+			if out, done, ts := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
 				return nil, out, nil
-			} else if tif {
-				terminalInFlight = true
+			} else if ts != "" {
+				terminalState = ts
 			}
 		}
 	}
@@ -1519,12 +1531,19 @@ func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start tim
 // restart or a delivered-nothing fix-up can leave a round pending with no
 // reviewer behind it).
 //
-// terminalInFlight (#1915): when the run went terminal while the review was
+// terminalState (#1915, #4101): when the run went terminal while the review was
 // still in flight, the verdict IS recorded server-side (unguarded) and will
-// land, but the run must be re-admitted to progress past the gate. That case
-// names fishhawk_revive_run instead of the ordinary still-running message. The
-// caller captures terminalInFlight during polling (with a live context) rather
-// than re-querying here, where the poll context is already cancelled.
+// land; the message then branches on the observed terminal state. "failed":
+// the run must be re-admitted to progress past the gate, so the message names
+// fishhawk_revive_run. "succeeded" (e.g. a decomposition child whose slice was
+// integrated): nothing needs re-admitting, so the message says to re-call.
+// "cancelled": the verdict lands as a record only and no operator verb
+// re-admits the run (only a PR reopen restores a PR-close cancel). Neither of the latter two names fishhawk_revive_run in any
+// form, because run.ReviveRun refuses every non-failed state. "" means the
+// run was not observed terminal and the ordinary still-pending message is
+// used. The caller captures terminalState during polling (with a live
+// context) rather than re-querying here, where the poll context is already
+// cancelled.
 // strand (#2712) carries the last restart-boundary verdict the poll loop
 // resolved (nil when the probe never produced one). It replaces the old
 // UNCONDITIONAL "the review is genuinely still running" assertion — which was
@@ -1535,7 +1554,7 @@ func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start tim
 // recovery if a restart did happen; and a verdict from one of the early returns
 // that never reached the boundary check falls back to the neutral pre-#2712
 // wording rather than claiming a verification that never ran.
-func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool, heartbeat bool, timeoutCap int, strand *reviewStrand) AwaitReviewOutput {
+func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalState string, heartbeat bool, timeoutCap int, strand *reviewStrand) AwaitReviewOutput {
 	out := AwaitReviewOutput{
 		Stage:               stage,
 		Status:              "pending",
@@ -1549,7 +1568,26 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 		out.LandedTerminal = strand.LandedTerminal
 		out.ConfiguredAgents = strand.ConfiguredAgents
 	}
-	if terminalInFlight {
+	// "" (not observed terminal) matches no case and falls through to the
+	// ordinary pending message below.
+	switch terminalState {
+	case "succeeded":
+		out.Message = fmt.Sprintf("%s review still pending after %ds and the run has SUCCEEDED while the review is "+
+			"still in flight (e.g. a decomposition child whose slice was already integrated). The review's verdict is "+
+			"recorded with no run-state guard, so it WILL land, and nothing needs re-admitting. Re-call "+
+			"fishhawk_await_review to keep waiting, or poll fishhawk_get_run_status every %ds (the authoritative path).",
+			stage, timeout, suggestedReviewPollIntervalSeconds)
+		return out
+	case "cancelled":
+		out.Message = fmt.Sprintf("%s review still pending after %ds and the run was CANCELLED while the review is "+
+			"still in flight. The review's verdict will still land, but as a record only: a cancelled run cannot be "+
+			"re-admitted by an operator verb (the one way back is reopening the pull request whose close cancelled it). "+
+			"Re-call fishhawk_await_review to keep waiting for the verdict, or poll fishhawk_get_run_status every %ds "+
+			"(the authoritative path).",
+			stage, timeout, suggestedReviewPollIntervalSeconds)
+		return out
+	case "failed":
+		// The only state run.ReviveRun accepts, so the only one that names it.
 		out.Message = fmt.Sprintf("%s review still pending after %ds and the run has reached a terminal state while the "+
 			"review is still in flight. The review's verdict is recorded with no run-state guard, so it WILL land — but "+
 			"the run must be re-admitted to progress past the gate. Call fishhawk_revive_run to re-park the failed "+
@@ -1600,12 +1638,12 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 // awaitReviewProgressMessage builds the per-tick heartbeat message for a
 // pending review wait (#1963): the stage, the pending status, the elapsed
 // wall-clock seconds, and — when the run has gone terminal while the review is
-// still in flight (#1915) — a short note. Pure (no I/O) so a table test pins
-// it.
-func awaitReviewProgressMessage(stage string, elapsed time.Duration, terminalInFlight bool) string {
+// still in flight (#1915) — a short note naming the observed terminal state
+// (#4101). Pure (no I/O) so a table test pins it.
+func awaitReviewProgressMessage(stage string, elapsed time.Duration, terminalState string) string {
 	msg := fmt.Sprintf("await_review: %s review pending; elapsed %ds", stage, int(elapsed.Seconds()))
-	if terminalInFlight {
-		msg += "; run terminal with review still in flight"
+	if terminalState != "" {
+		msg += fmt.Sprintf("; run %s with review still in flight", terminalState)
 	}
 	return msg
 }
