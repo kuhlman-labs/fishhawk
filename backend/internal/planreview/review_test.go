@@ -1189,6 +1189,12 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 	if pre3665.ChangeID != "" || pre3665.TreeSHA != "t1" {
 		t.Errorf("pre-#3665 decode = %+v, want ChangeID empty and TreeSHA t1", pre3665)
 	}
+	// #4077: a pre-change stored payload decodes an EMPTY round source and a
+	// zero re-dispatch lineage — the boot sweep reads that as an unknown round
+	// source, never as a re-dispatched round.
+	if pre3665.RoundOrigin != "" || pre3665.RoundBaseSHA != "" || pre3665.RedispatchOf != 0 || pre3665.RedispatchDepth != 0 {
+		t.Errorf("pre-#4077 decode = %+v, want empty round source and zero redispatch lineage", pre3665)
+	}
 
 	cases := []struct {
 		name string
@@ -1223,6 +1229,41 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 			name: "tree without change id omits the key",
 			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), TreeSHA: "t1"},
 			want: `{"configured_agents":1,"authority":"gating","tree_sha":"t1"}`,
+		},
+		{
+			// #4077: a pre-#4077 implement round (head, tree and change id, no
+			// round source and no re-dispatch lineage) stays byte-identical.
+			name: "implement path without round source or redispatch lineage",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("advisory"), HeadSHA: "h1", TreeSHA: "t1", ChangeID: "c1"},
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","tree_sha":"t1","change_id":"c1"}`,
+		},
+		{
+			name: "round origin only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("advisory"), HeadSHA: "h1", RoundOrigin: "trace"},
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","round_origin":"trace"}`,
+		},
+		{
+			name: "round base sha only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("advisory"), HeadSHA: "h1", RoundBaseSHA: "b1"},
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","round_base_sha":"b1"}`,
+		},
+		{
+			name: "redispatch of only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), RedispatchOf: 41},
+			want: `{"configured_agents":2,"authority":"advisory","redispatch_of":41}`,
+		},
+		{
+			name: "redispatch depth only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), RedispatchDepth: 1},
+			want: `{"configured_agents":2,"authority":"advisory","redispatch_depth":1}`,
+		},
+		{
+			name: "compare-origin redispatch carries all four",
+			in: planreview.ReviewStartedPayload{
+				ConfiguredAgents: 1, Authority: planreview.AuthorityMode("advisory"), HeadSHA: "h1",
+				RoundOrigin: "fixup_push", RoundBaseSHA: "b1", RedispatchOf: 41, RedispatchDepth: 2,
+			},
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","round_origin":"fixup_push","round_base_sha":"b1","redispatch_of":41,"redispatch_depth":2}`,
 		},
 	}
 	for _, tc := range cases {
