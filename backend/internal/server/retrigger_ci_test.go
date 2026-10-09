@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -27,6 +28,8 @@ import (
 type retriggerGitHubFake struct {
 	mu       sync.Mutex
 	requests []string
+	// listedHeads records the head_sha query of every workflow-runs listing.
+	listedHeads []string
 
 	// prStatus, when non-zero, answers the PR read with that status.
 	prStatus int
@@ -83,6 +86,9 @@ func newRetriggerGitHub(t *testing.T, f *retriggerGitHubFake) *githubclient.Clie
 			}
 			_, _ = fmt.Fprintf(w, `{"node_id":"PR_x","state":%q,"head":{"sha":%q,"ref":"run/b"},"base":{"ref":"main"}}`, state, head)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/x/y/actions/runs":
+			f.mu.Lock()
+			f.listedHeads = append(f.listedHeads, r.URL.Query().Get("head_sha"))
+			f.mu.Unlock()
 			if f.runsStatus != 0 {
 				w.WriteHeader(f.runsStatus)
 				return
@@ -303,6 +309,101 @@ func TestRetriggerCI_WorkflowDispatchExcluded(t *testing.T) {
 	resp := decodeRetrigger(t, w)
 	if len(resp.Skipped) != 1 || resp.Skipped[0].ID != 21 || resp.Skipped[0].Reason != retriggerSkipEventExcluded {
 		t.Errorf("skipped = %+v, want run 21 event_excluded", resp.Skipped)
+	}
+}
+
+// TestRetriggerCI_HeadBinding pins the head binding: the workflow-runs listing
+// is queried at the PR's CURRENT head, and a returned run recorded for any
+// other commit is neither re-run nor reported. The PR head is "ccc"; the fake
+// answers one failed pull_request run at that head (71) and one at the stale
+// head "aaa" (72).
+//
+// Counterfactual: delete the wr.HeadSHA filter — the stale run 72 receives a
+// rerun POST, RED.
+func TestRetriggerCI_HeadBinding(t *testing.T) {
+	f := newRetriggerFixture(t, func(_ *run.Run, gh *retriggerGitHubFake) {
+		gh.prHead = "ccc"
+		current := wfRun(71, "pull_request", "completed", "failure")
+		current["head_sha"] = "ccc"
+		gh.runs = []map[string]any{current, wfRun(72, "pull_request", "completed", "failure")}
+	})
+	w := postRetriggerCI(t, f.s, f.runID.String(), withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	f.gh.mu.Lock()
+	listed := append([]string(nil), f.gh.listedHeads...)
+	f.gh.mu.Unlock()
+	if fmt.Sprint(listed) != "[ccc]" {
+		t.Errorf("workflow-runs listing head_sha queries = %v, want [ccc] (the PR's current head)", listed)
+	}
+	if reruns := f.gh.reruns(); strings.Join(reruns, ",") != "POST /repos/x/y/actions/runs/71/rerun" {
+		t.Fatalf("rerun POSTs = %v, want only run 71 (the stale-head run 72 must never be re-run)", reruns)
+	}
+	resp := decodeRetrigger(t, w)
+	if resp.HeadSHA != "ccc" || len(resp.Rerun) != 1 || resp.Rerun[0].ID != 71 || len(resp.Skipped) != 0 || len(resp.Failed) != 0 {
+		t.Errorf("response = %+v, want head ccc, rerun [71], nothing skipped or failed", resp)
+	}
+}
+
+// TestRetriggerCI_CrossAccountForbidden pins the route's account wrapper
+// (requireRunAccount(memberWrite, …) in handlers.go) through the full mux: a
+// bearer token bound to account A and carrying write:stages POSTs to a run
+// owned by account B → 403 account_forbidden, with no forge request and no
+// ci_retriggered entry. The same_account_control row sends the identical
+// request with an account-B token and re-runs CI, proving the fixture itself
+// refuses nothing (scope and every handler guard pass).
+//
+// Counterfactual: unwrap requireRunAccount on the route — the account-A
+// request re-runs CI (200), RED.
+func TestRetriggerCI_CrossAccountForbidden(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		tokenAccount string
+		wantStatus   int
+		wantReruns   int
+	}{
+		{name: "cross_account", tokenAccount: authzAcctA, wantStatus: http.StatusForbidden},
+		{name: "same_account_control", tokenAccount: authzAcctB, wantStatus: http.StatusOK, wantReruns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := &retriggerGitHubFake{runs: []map[string]any{wfRun(11, "pull_request", "completed", "failure")}}
+			runID := uuid.New()
+			prURL := "https://github.com/x/y/pull/7"
+			rr := newPromptRunRepo()
+			rr.getRuns[runID] = &run.Run{ID: runID, Repo: "x/y", AccountID: authzAcctB, State: run.StateRunning,
+				InstallationID: instID(99), PullRequestURL: &prURL}
+			au := newAuditFake()
+			tokens := &stubAPITokenRepo{tok: &apitoken.Token{
+				ID: uuid.New(), Subject: "github:op", AccountID: tc.tokenAccount,
+				Scopes: []string{"write:stages"}, PlainText: "fhk_retrigger_account",
+			}}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au,
+				GitHub: newRetriggerGitHub(t, gh), APITokenRepo: tokens})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/retrigger-ci", nil)
+			req.Header.Set("Authorization", "Bearer "+tokens.tok.PlainText)
+			s.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d:\n%s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus == http.StatusForbidden {
+				if !strings.Contains(rec.Body.String(), `"account_forbidden"`) {
+					t.Errorf("body missing account_forbidden: %s", rec.Body.String())
+				}
+				if r := gh.recorded(); len(r) != 0 {
+					t.Errorf("forge requests = %v, want none for a cross-account caller", r)
+				}
+			}
+			if r := gh.reruns(); len(r) != tc.wantReruns {
+				t.Errorf("rerun POSTs = %v, want %d", r, tc.wantReruns)
+			}
+			if n := len(retriggerAudit(au)); n != tc.wantReruns {
+				t.Errorf("ci_retriggered entries = %d, want %d", n, tc.wantReruns)
+			}
+		})
 	}
 }
 

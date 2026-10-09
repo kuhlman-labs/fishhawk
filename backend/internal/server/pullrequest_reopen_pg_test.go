@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -38,6 +39,13 @@ type reopenPGFixture struct {
 // implement succeeded, review parked at awaiting_approval, PR URL set.
 func newReopenPGFixture(t *testing.T) *reopenPGFixture {
 	t.Helper()
+	return newReopenPGFixtureAt(t, run.StageStateAwaitingApproval)
+}
+
+// newReopenPGFixtureAt is newReopenPGFixture with the review stage driven to
+// reviewState instead of awaiting_approval.
+func newReopenPGFixtureAt(t *testing.T, reviewState run.StageState) *reopenPGFixture {
+	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	runRepo := run.NewPostgresRepository(pool)
@@ -69,7 +77,7 @@ func newReopenPGFixture(t *testing.T) *reopenPGFixture {
 		}
 		want := run.StageStateSucceeded
 		if typ == run.StageTypeReview {
-			want = run.StageStateAwaitingApproval
+			want = reviewState
 		}
 		st = driveStageTo(t, runRepo, st, want)
 		if typ == run.StageTypeReview {
@@ -210,5 +218,111 @@ func TestPullRequestReopen_PG_WindowElapsedStaysCancelled(t *testing.T) {
 	}
 	if err := json.Unmarshal(refused[0].Payload, &p); err != nil || p.Reason != reopenRefusedWindowElapsed {
 		t.Fatalf("refused payload = %s, want reason %s", refused[0].Payload, reopenRefusedWindowElapsed)
+	}
+}
+
+// TestPullRequestReopen_PG_CloseTimeStateStamps pins the close-time state
+// stamps resolveReviewStageOnMerge writes onto pr_closed_without_merge
+// (run_state_at_close / review_state_at_close) to the states the close
+// ACTUALLY found — not constants — and that the reopen guards act on them.
+// Each row drives a real close (signed webhook) from a state the stamp must
+// record faithfully, asserts the committed payload, then delivers a same-head
+// reopen inside the window and asserts the run is NOT revived.
+//
+//   - operator_cancelled_then_closed: the operator cancel (handleCancelRun:
+//     the run alone goes cancelled, the review stays parked) precedes the
+//     close. The close path has no early return for a terminal run, so
+//     run_state_at_close is the ONLY thing stopping the reopen from reviving
+//     a run the operator cancelled. Counterfactual: stamp a constant
+//     "running" — the payload reads running and the reopen revives the run,
+//     RED.
+//   - closed_while_review_running: the PR closes while the review stage is
+//     still running. Counterfactual: stamp a constant "awaiting_approval" —
+//     the payload reads awaiting_approval and the reopen revives the run, RED.
+func TestPullRequestReopen_PG_CloseTimeStateStamps(t *testing.T) {
+	cases := []struct {
+		name           string
+		reviewState    run.StageState
+		operatorCancel bool
+		wantRunAtClose string
+		wantRevAtClose string
+		wantRefusedWhy string
+	}{
+		{
+			name: "operator_cancelled_then_closed", reviewState: run.StageStateAwaitingApproval, operatorCancel: true,
+			wantRunAtClose: "cancelled", wantRevAtClose: "awaiting_approval", wantRefusedWhy: reopenRefusedCloseDidNotCancelRun,
+		},
+		{
+			name: "closed_while_review_running", reviewState: run.StageStateRunning,
+			wantRunAtClose: "running", wantRevAtClose: "running", wantRefusedWhy: reopenRefusedReviewNotParkedAtClose,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReopenPGFixtureAt(t, tc.reviewState)
+			if tc.operatorCancel {
+				f.operatorCancel(t)
+				if runState, _ := f.states(t); runState != run.StateCancelled {
+					t.Fatalf("after operator cancel: run = %s, want cancelled", runState)
+				}
+			}
+
+			f.deliver(t, "closed", false, "aaa")
+			if runState, reviewState := f.states(t); runState != run.StateCancelled || reviewState != run.StageStateCancelled {
+				t.Fatalf("after close: run/review = %s/%s, want cancelled/cancelled", runState, reviewState)
+			}
+			closes := f.rows(t, CategoryPRClosedWithoutMerge)
+			if len(closes) != 1 {
+				t.Fatalf("pr_closed_without_merge rows = %d, want 1", len(closes))
+			}
+			var cp struct {
+				RunStateAtClose    string `json:"run_state_at_close"`
+				ReviewStateAtClose string `json:"review_state_at_close"`
+			}
+			if err := json.Unmarshal(closes[0].Payload, &cp); err != nil {
+				t.Fatalf("close payload: %v", err)
+			}
+			if cp.RunStateAtClose != tc.wantRunAtClose || cp.ReviewStateAtClose != tc.wantRevAtClose {
+				// Errorf, not Fatalf: the reopen below still runs, so a wrong
+				// stamp is ALSO observed as the revive it lets through.
+				t.Errorf("close stamps run/review = %q/%q, want %q/%q (the states the close found)",
+					cp.RunStateAtClose, cp.ReviewStateAtClose, tc.wantRunAtClose, tc.wantRevAtClose)
+			}
+
+			f.deliver(t, "reopened", false, "aaa")
+			if runState, reviewState := f.states(t); runState != run.StateCancelled || reviewState != run.StageStateCancelled {
+				t.Fatalf("after reopen: run/review = %s/%s, want the run left cancelled", runState, reviewState)
+			}
+			if n := len(f.rows(t, CategoryRunRevivedOnReopen)); n != 0 {
+				t.Fatalf("run_revived_on_reopen rows = %d, want 0", n)
+			}
+			refused := f.rows(t, CategoryRunReviveOnReopenRefused)
+			if len(refused) != 1 {
+				t.Fatalf("run_revive_on_reopen_refused rows = %d, want 1", len(refused))
+			}
+			var rp struct {
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal(refused[0].Payload, &rp); err != nil || rp.Reason != tc.wantRefusedWhy {
+				t.Fatalf("refused payload = %s, want reason %s", refused[0].Payload, tc.wantRefusedWhy)
+			}
+		})
+	}
+}
+
+// operatorCancel drives the real operator cancel handler (POST
+// /v0/runs/{run_id}/cancel's body) with an operator identity carrying
+// write:runs.
+func (f *reopenPGFixture) operatorCancel(t *testing.T) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+f.runID.String()+"/cancel", nil)
+	req.SetPathValue("run_id", f.runID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "github:ops", TokenID: "tok-ops", Scopes: []string{"write:runs"},
+	}))
+	w := httptest.NewRecorder()
+	f.s.handleCancelRun(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("operator cancel: status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 }

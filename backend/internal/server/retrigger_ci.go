@@ -70,7 +70,8 @@ type retriggerCIResponse struct {
 // It is the SAFE CI re-trigger: closing and reopening a run's pull request to
 // re-fire CI cancels the run, so this verb re-runs the PR's completed,
 // non-successful CI workflow runs at the PR's CURRENT head through the GitHub
-// Actions re-run API instead. It makes NO pull-request write, NO ref write and
+// Actions re-run API instead. A listed workflow run whose head_sha is not that
+// head is dropped before selection, so a stale head's run is never re-run. It makes NO pull-request write, NO ref write and
 // NO commit: the only writes are the re-run POSTs and one audit entry.
 //
 // Auth mirrors handleVouchCommit exactly: anonymous → 401; a run-bound agent
@@ -198,6 +199,12 @@ func (s *Server) handleRetriggerCI(w http.ResponseWriter, r *http.Request) {
 	ciRuns := 0
 	for _, wr := range workflowRuns {
 		if wr == nil {
+			continue
+		}
+		// Bind to the PR's CURRENT head: a listed run GitHub recorded for any
+		// other commit is not this head's CI, so it is neither re-run nor
+		// counted nor reported.
+		if wr.HeadSHA != headSHA {
 			continue
 		}
 		entry := retriggerCIRun{

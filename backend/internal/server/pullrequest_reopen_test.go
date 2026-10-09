@@ -22,10 +22,19 @@ import (
 // layer proof over real Postgres is pullrequest_reopen_pg_test.go.
 
 // reopenAuditRepo wraps prEventsAuditRepo with a per-category list failure,
-// the input the audit_unreadable guard reads.
+// the input the audit_unreadable guard reads, and a per-category append
+// failure.
 type reopenAuditRepo struct {
 	*prEventsAuditRepo
-	listErr map[string]error
+	listErr   map[string]error
+	appendErr map[string]error
+}
+
+func (r *reopenAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if err := r.appendErr[p.Category]; err != nil {
+		return nil, err
+	}
+	return r.prEventsAuditRepo.AppendChained(ctx, p)
 }
 
 func (r *reopenAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
@@ -59,6 +68,7 @@ type reopenFixture struct {
 
 	reopenHead string
 	listErr    map[string]error
+	appendErr  map[string]error
 	reviveErr  error
 	noReviver  bool
 }
@@ -119,6 +129,7 @@ func (f *reopenFixture) build(t *testing.T) (*Server, *prEventsRunRepo, *reopenA
 	ar := &reopenAuditRepo{
 		prEventsAuditRepo: &prEventsAuditRepo{byRunCategory: map[uuid.UUID]map[string][]*audit.Entry{f.runID: byCat}},
 		listErr:           f.listErr,
+		appendErr:         f.appendErr,
 	}
 	var repo run.Repository = rr
 	if f.noReviver {
@@ -249,6 +260,27 @@ func TestPullRequestReopened_Guards(t *testing.T) {
 		{name: "a_audit_unreadable", mutate: func(f *reopenFixture) {
 			f.listErr = map[string]error{CategoryPRClosedWithoutMerge: errors.New("db down")}
 		}, outcome: outcomeRefused, wantReason: reopenRefusedAuditUnreadable},
+		// Guard (a)'s other reads, one row each. The baseline seeds no rows in
+		// these categories, so a deleted error arm reads them as empty and the
+		// run revives instead of refusing.
+		{name: "a_audit_unreadable_revives_list", mutate: func(f *reopenFixture) {
+			f.listErr = map[string]error{CategoryRunRevivedOnReopen: errors.New("db down")}
+		}, outcome: outcomeRefused, wantReason: reopenRefusedAuditUnreadable},
+		{name: "a_audit_unreadable_drops_list", mutate: func(f *reopenFixture) {
+			f.listErr = map[string]error{CategoryAcceptanceScenarioRetirementDropped: errors.New("db down")}
+		}, outcome: outcomeRefused, wantReason: reopenRefusedAuditUnreadable},
+		{
+			// The (e) fallback read: the close row records no head, so the
+			// run's reported heads are read, and that read fails. With the
+			// error arm deleted the head resolves empty and (e) refuses
+			// close_head_unrecorded instead.
+			name: "a_audit_unreadable_reported_head",
+			mutate: func(f *reopenFixture) {
+				f.closeFields["head_sha"] = ""
+				f.listErr = map[string]error{"pull_request_opened": errors.New("db down")}
+			},
+			outcome: outcomeRefused, wantReason: reopenRefusedAuditUnreadable,
+		},
 		{name: "b_close_found_run_already_cancelled", mutate: func(f *reopenFixture) {
 			f.closeFields["run_state_at_close"] = "cancelled"
 		}, outcome: outcomeRefused, wantReason: reopenRefusedCloseDidNotCancelRun},
@@ -380,6 +412,39 @@ func TestPullRequestReopened_Guards(t *testing.T) {
 	}
 }
 
+// TestPullRequestReopened_RevivedAuditAppendFails pins the error branch AFTER
+// a successful revive: the run_revived_on_reopen append fails, the revive is
+// NOT undone (the run stays running with its review re-parked), and the
+// failure is not misreported as a refusal.
+//
+// Counterfactual: route that append failure through appendReopenReviveRefused
+// — a refused row is recorded for a run that WAS revived, RED.
+func TestPullRequestReopened_RevivedAuditAppendFails(t *testing.T) {
+	f := baselineReopenFixture()
+	f.appendErr = map[string]error{CategoryRunRevivedOnReopen: errors.New("audit db down")}
+	s, rr, ar := f.build(t)
+
+	s.handlePullRequestReopened(context.Background(), reopenPayload(f.reopenHead, "bob"))
+
+	rr.mu.Lock()
+	calls := len(rr.revives)
+	runState := rr.listResult[0].State
+	reviewState := rr.curState[f.reviewID]
+	rr.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("ReviveRunOnReopen calls = %d, want 1", calls)
+	}
+	if runState != run.StateRunning || reviewState != run.StageStateAwaitingApproval {
+		t.Fatalf("run/review = %s/%s, want running/awaiting_approval: a failed append must not undo the revive", runState, reviewState)
+	}
+	if n := len(appendedOf(ar, CategoryRunRevivedOnReopen)); n != 0 {
+		t.Errorf("run_revived_on_reopen rows = %d, want 0 (the append failed)", n)
+	}
+	if n := len(appendedOf(ar, CategoryRunReviveOnReopenRefused)); n != 0 {
+		t.Errorf("run_revive_on_reopen_refused rows = %d, want 0: the run WAS revived", n)
+	}
+}
+
 // TestPullRequestReopened_InertInputs pins the early returns that precede the
 // candidate gate: an unconfigured server, an unparseable body, a payload with
 // no PR URL, and a PR no Fishhawk run owns all record nothing and never reach
@@ -387,8 +452,21 @@ func TestPullRequestReopened_Guards(t *testing.T) {
 func TestPullRequestReopened_InertInputs(t *testing.T) {
 	f := baselineReopenFixture()
 
-	t.Run("unconfigured", func(t *testing.T) {
-		New(Config{Addr: "127.0.0.1:0"}).handlePullRequestReopened(context.Background(), reopenPayload("aaa", "bob"))
+	// Each half of the unconfigured early return, with the OTHER repository
+	// wired over the all-guards-pass baseline so its effect is observable.
+	t.Run("unconfigured_no_run_repo", func(t *testing.T) {
+		_, _, ar := f.build(t)
+		New(Config{Addr: "127.0.0.1:0", AuditRepo: ar}).handlePullRequestReopened(context.Background(), reopenPayload("aaa", "bob"))
+		if n := len(ar.appended); n != 0 {
+			t.Errorf("appended = %d, want nothing without a run repository", n)
+		}
+	})
+	t.Run("unconfigured_no_audit_repo", func(t *testing.T) {
+		_, rr, _ := f.build(t)
+		New(Config{Addr: "127.0.0.1:0", RunRepo: rr}).handlePullRequestReopened(context.Background(), reopenPayload("aaa", "bob"))
+		if n := len(rr.revives); n != 0 || rr.listResult[0].State != run.StateCancelled {
+			t.Errorf("revives = %d, run = %s; want no revive without an audit repository", n, rr.listResult[0].State)
+		}
 	})
 	for name, body := range map[string][]byte{
 		"unparseable": []byte("{"),
