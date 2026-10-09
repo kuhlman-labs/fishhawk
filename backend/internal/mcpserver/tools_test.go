@@ -3416,7 +3416,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// delegated operator-agent token (self-approval). Its own tool, not an
 	// upkeep mode: a different report, id space, binding row and window
 	// family. 72 -> 73.
-	const wantToolCount = 73
+	//
+	// #4082 (E83.49) adds exactly ONE tool — fishhawk_retrigger_ci, the thin
+	// wrapper over POST /v0/runs/{run_id}/retrigger-ci. WHEN: a run's PR has
+	// failed CI and the operator wants it run again at the current head,
+	// instead of closing and reopening the PR (which cancels the run).
+	// ELIGIBILITY: write:stages; the backend refuses a run-bound token. It
+	// re-runs only completed, non-successful pull_request /
+	// pull_request_target / push workflow runs and makes no PR-state change.
+	// Its own tool, not a vouch or merge mode: a different forge write and a
+	// different audit category. 73 -> 74.
+	const wantToolCount = 74
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3483,6 +3493,20 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawValidate {
 		t.Error("fishhawk_validate is not in the registered tool list — the pre-commit spec check is unreachable")
+	}
+	// fishhawk_retrigger_ci (#4082) must be wire-visible by NAME: the 73 -> 74
+	// bump alone stays green if its registration is dropped and a DIFFERENT
+	// tool added in the same change, leaving close/reopen as the only CI
+	// re-trigger an operator can reach.
+	var sawRetriggerCI bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_retrigger_ci" {
+			sawRetriggerCI = true
+			break
+		}
+	}
+	if !sawRetriggerCI {
+		t.Error("fishhawk_retrigger_ci is not in the registered tool list — the safe CI re-trigger is unreachable")
 	}
 	// The #3623 merge-recovery pair must EACH be wire-visible by NAME. The
 	// 55 -> 57 count bump alone is not enough: it stays green if one of the two

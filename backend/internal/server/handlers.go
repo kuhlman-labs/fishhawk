@@ -75,6 +75,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/consolidate", s.requireRunAccount(memberWrite, s.handleConsolidateRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", s.requireRunAccount(memberWrite, s.handleIntegrateWave))
 	mux.HandleFunc("POST /v0/runs/{run_id}/vouch-commit", s.requireRunAccount(memberWrite, s.handleVouchCommit))
+	mux.HandleFunc("POST /v0/runs/{run_id}/retrigger-ci", s.requireRunAccount(memberWrite, s.handleRetriggerCI))
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", s.requireRunAccount(memberWrite, s.handleMergeRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
 	// Per-entry grooming disposition capture + read-back (E54.30 / #2843).
