@@ -15,9 +15,12 @@ import (
 //
 // A STANDALONE implement stage ran its agent AND its committed-tree verify
 // gates against the lineage worktree's PLAN-TIME base. provisionLineage-
-// Worktree seeds the worktree from the operator checkout's HEAD at the PLAN
-// stage and then takes the `lineage_worktree_reused` path for implement
-// WITHOUT moving HEAD, and the only pre-agent base checkout in run() was
+// Worktree seeds the worktree once, at the PLAN stage (from the declared
+// base's fetched tip since #3973, from the operator checkout's HEAD before it
+// and still on a logged lineage_seed_fallback), and then takes the
+// `lineage_worktree_reused` path for implement WITHOUT moving HEAD, so a base
+// that moved between plan and implement stays invisible unless something
+// advances it. The only pre-agent base checkout in run() was
 // gated on cfg.decomposedFromRunID != "" (the #1302/#1363 wave-base block).
 // Only the COMMIT-time gitops FreshFetchBase re-staged the finished commit
 // onto the moved base — far too late: the agent reasoned against the stale
@@ -31,7 +34,9 @@ import (
 // (the SAME ref resolveImplementBranchRouting hands CommitAndPush as
 // freshFetchBase), fast-forward the lineage worktree's detached HEAD to that
 // tip, and log `lineage_worktree_advanced {from,to}` — so the agent view, the
-// gate tree and the commit base become ONE base.
+// gate tree and the commit base become ONE base. Since #3973 the tip it
+// returns is also the stage-lifetime base PIN (cfg.pinnedBaseSHA): the commit
+// is cut from it rather than from a base re-fetched at commit time.
 //
 // It REFUSES loud, pre-agent, mutating nothing, when the worktree is dirty or
 // its HEAD is not an ancestor-equal of the base tip (it carries run commits,
@@ -116,9 +121,17 @@ func lineageBaseAdvanceFailureReason(err error) string {
 
 // advanceLineageWorktreeToBase fast-forwards the lineage worktree's detached
 // HEAD to the freshly-fetched tip of the declared base, BEFORE the agent is
-// invoked and before every verify gate. It returns (true, nil) when it moved
-// HEAD, (false, nil) on every graceful degrade / already-current fast path, and
-// a non-nil error when it fails loud.
+// invoked and before every verify gate. It returns (tip, true, nil) when it
+// moved HEAD to the fetched tip, (tip, false, nil) on the already-current fast
+// path (HEAD already equals the fetched tip), ("", false, nil) on every
+// graceful skip (empty baseRef, remote_unconfigured, base_ref_absent), and a
+// non-nil error when it fails loud.
+//
+// The returned tip is the stage-lifetime base pin (#3973): run() records it as
+// cfg.pinnedBaseSHA before the agent runs, so the policy-diff merge-base and
+// the commit-time branch cut (gitops PinnedBaseSHA) use THIS fetched tip
+// instead of re-fetching a base that may have moved mid-stage. A skip returns
+// "" so the stage stays unpinned and keeps today's commit-time fetch.
 //
 // The ORDER is load-bearing — every guard runs before anything mutates:
 //
@@ -150,13 +163,13 @@ func lineageBaseAdvanceFailureReason(err error) string {
 // minting parallel ones, so withFakeGitOps already stubs all of them — with
 // remoteHasBranch defaulting to (false, nil), every pre-existing run() test
 // takes the base_ref_absent skip at (b) and its behaviour is unchanged.
-func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authToken string, logSink io.Writer) (bool, error) {
+func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authToken string, logSink io.Writer) (tipSHA string, moved bool, err error) {
 	if repoDir == "" {
 		repoDir = "."
 	}
 	// (a) Nothing declared to advance to.
 	if baseRef == "" {
-		return false, nil
+		return "", false, nil
 	}
 
 	// (b) Remote-authoritative base existence (#1363's ls-remote seam). A
@@ -172,31 +185,31 @@ func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authTok
 	baseExists, rhErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef, authToken)
 	if rhErr != nil {
 		if remoteConfigured(ctx, repoDir, gitops.DefaultRemote) {
-			return false, fmt.Errorf("lineage base advance: query base %q on %s: %w",
+			return "", false, fmt.Errorf("lineage base advance: query base %q on %s: %w",
 				baseRef, gitops.DefaultRemote, rhErr)
 		}
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"lineage_worktree_advance_skipped","reason":"remote_unconfigured","base_ref":%q}`+"\n", baseRef)
-		return false, nil
+		return "", false, nil
 	}
 	if !baseExists {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"lineage_worktree_advance_skipped","reason":"base_ref_absent","base_ref":%q}`+"\n", baseRef)
-		return false, nil
+		return "", false, nil
 	}
 
 	// (c) The worktree's current HEAD — the `from` SHA, pinned ONCE so the
 	// ancestry probe and the advanced record name the same immutable commit.
 	fromSHA, err := resolveHead(ctx, repoDir)
 	if err != nil {
-		return false, fmt.Errorf("lineage base advance: resolve worktree HEAD: %w", err)
+		return "", false, fmt.Errorf("lineage base advance: resolve worktree HEAD: %w", err)
 	}
 
 	// (d) The base's live tip, fetched into the tracking ref WITHOUT touching
 	// the working tree, so (f) and (g) decide before anything moves.
 	toSHA, err := fetchDiffBaseTip(ctx, repoDir, gitops.DefaultRemote, baseRef, authToken)
 	if err != nil {
-		return false, fmt.Errorf("lineage base advance: fetch base %q tip: %w", baseRef, err)
+		return "", false, fmt.Errorf("lineage base advance: fetch base %q tip: %w", baseRef, err)
 	}
 
 	// (e) Already current: the no-advance-needed fast path that keeps every
@@ -207,7 +220,7 @@ func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authTok
 	if fromSHA == toSHA {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"lineage_worktree_base_current","base_ref":%q,"head_sha":%q}`+"\n", baseRef, fromSHA)
-		return false, nil
+		return toSHA, false, nil
 	}
 
 	// (f) Dirty-tree guard. A non-empty dirty set OR a probe ERROR refuses: we
@@ -215,14 +228,14 @@ func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authTok
 	// nothing while a silent force would destroy work.
 	dirty, dErr := dirtyPaths(ctx, repoDir)
 	if dErr != nil {
-		return false, &lineageBaseAdvanceRefusal{
+		return "", false, &lineageBaseAdvanceRefusal{
 			kind: "dirty_probe_failed", repoDir: repoDir, baseRef: baseRef,
 			fromSHA: fromSHA, toSHA: toSHA,
 			detail: "the worktree's dirty set could not be read, so the tree cannot be proven safe to fast-forward: " + dErr.Error(),
 		}
 	}
 	if len(dirty) > 0 {
-		return false, &lineageBaseAdvanceRefusal{
+		return "", false, &lineageBaseAdvanceRefusal{
 			kind: "dirty_worktree", repoDir: repoDir, baseRef: baseRef,
 			fromSHA: fromSHA, toSHA: toSHA,
 			detail: "the worktree carries uncommitted changes (" + strings.Join(dirty, ", ") + ")",
@@ -242,13 +255,13 @@ func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authTok
 	if probeErr != nil {
 		var ee *exec.ExitError
 		if errors.As(probeErr, &ee) && ee.ExitCode() == 1 {
-			return false, &lineageBaseAdvanceRefusal{
+			return "", false, &lineageBaseAdvanceRefusal{
 				kind: "head_not_ancestor", repoDir: repoDir, baseRef: baseRef,
 				fromSHA: fromSHA, toSHA: toSHA,
 				detail: "the worktree HEAD is provably NOT an ancestor of the base tip — it carries its own commits, or diverged, and a fast-forward would discard them",
 			}
 		}
-		return false, &lineageBaseAdvanceRefusal{
+		return "", false, &lineageBaseAdvanceRefusal{
 			kind: "ancestry_probe_failed", repoDir: repoDir, baseRef: baseRef,
 			fromSHA: fromSHA, toSHA: toSHA,
 			detail: "the ancestry probe itself failed, so the fast-forward cannot be proven safe: " + probeErr.Error(),
@@ -259,11 +272,41 @@ func advanceLineageWorktreeToBase(ctx context.Context, repoDir, baseRef, authTok
 	// would OVERWRITE a local modification (a dirty path that DIFFERS between
 	// from and to), so this is a narrow backstop and not a general second layer
 	// under (f) — see the doc comment. Guard (f) carries the dirty case.
-	tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef, authToken)
+	checkedOut, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef, authToken)
 	if coErr != nil {
-		return false, fmt.Errorf("lineage base advance: check out base %q tip: %w", baseRef, coErr)
+		return "", false, fmt.Errorf("lineage base advance: check out base %q tip: %w", baseRef, coErr)
 	}
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"lineage_worktree_advanced","base_ref":%q,"from":%q,"to":%q}`+"\n", baseRef, fromSHA, tipSHA)
-	return true, nil
+		`{"event":"lineage_worktree_advanced","base_ref":%q,"from":%q,"to":%q}`+"\n", baseRef, fromSHA, checkedOut)
+	return checkedOut, true, nil
+}
+
+// Stage-lifetime base pin sources (#3973), logged as `source` on base_pinned
+// and, for a decomposition child, on child_base_established.
+const (
+	// baseSourceStandaloneAdvance: the standalone #3454 advance's fetched tip
+	// (advanced-to, or already current).
+	baseSourceStandaloneAdvance = "standalone_advance"
+	// baseSourceWaveBase: a decomposition child's resolved wave base tip (main
+	// for wave 0, the consolidated branch for wave N).
+	baseSourceWaveBase = "wave_base"
+	// baseSourceOwnSliceBranch: a resumed / amended / retried decomposition
+	// child whose OWN slice branch already exists on the remote — the child
+	// bases on that branch's tip and pushes fast-forward onto it (#3991).
+	baseSourceOwnSliceBranch = "own_slice_branch"
+)
+
+// pinBase records the base an implement stage starts from as the stage-lifetime
+// pin (#3973) and logs one base_pinned line. An empty sha is a no-op: every
+// skip / degrade path leaves the stage UNPINNED, so the commit-time
+// FreshFetchBase fetch (and #4079's BaseFetchError net) and the #1975 diff
+// re-anchor run exactly as they did before the pin existed.
+func pinBase(cfg *config, baseRef, sha, source string, logSink io.Writer) {
+	if sha == "" {
+		return
+	}
+	cfg.pinnedBaseSHA = sha
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"base_pinned","run_id":%q,"stage_id":%q,"base_ref":%q,"base_sha":%q,"source":%q}`+"\n",
+		cfg.runID, cfg.stageID, baseRef, sha, source)
 }

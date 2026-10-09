@@ -178,12 +178,15 @@ func TestLineageBaseAdvanceFailureReason_Table(t *testing.T) {
 func TestAdvanceLineageWorktreeToBase_EmptyBaseRef_NoOp(t *testing.T) {
 	repoDir, planSHA, _ := advanceBaseFixture(t)
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "", "", &log)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "", "", &log)
 	if err != nil {
 		t.Fatalf("empty baseRef must be a no-op, got %v", err)
 	}
 	if advanced {
 		t.Error("empty baseRef reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if log.String() != "" {
 		t.Errorf("empty baseRef logged %q, want silence", log.String())
@@ -199,13 +202,16 @@ func TestAdvanceLineageWorktreeToBase_EmptyBaseRef_NoOp(t *testing.T) {
 func TestAdvanceLineageWorktreeToBase_BaseRefAbsent_Skips(t *testing.T) {
 	repoDir, planSHA, _ := advanceBaseFixture(t)
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(
+	tip, advanced, err := advanceLineageWorktreeToBase(
 		context.Background(), repoDir, "never-pushed-branch", "", &log)
 	if err != nil {
 		t.Fatalf("an absent base must skip, got %v", err)
 	}
 	if advanced {
 		t.Error("an absent base reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if !strings.Contains(log.String(), `"reason":"base_ref_absent"`) {
 		t.Errorf("missing base_ref_absent skip:\n%s", log.String())
@@ -224,12 +230,15 @@ func TestAdvanceLineageWorktreeToBase_RemoteQueryError_RemoteConfigured_FailsLou
 	withFakeRemoteHasBranch(t, false, errors.New("ls-remote: transient network failure"))
 
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
 	if err == nil {
 		t.Fatal("a remote-query failure against a configured remote must fail loud")
 	}
 	if advanced {
 		t.Error("a failed advance reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if got := lineageBaseAdvanceFailureReason(err); got != "lineage_base_advance" {
 		t.Errorf("reason = %q, want lineage_base_advance", got)
@@ -249,12 +258,15 @@ func TestAdvanceLineageWorktreeToBase_RemoteQueryError_RemoteUnconfigured_Skips(
 	withFakeRemoteHasBranch(t, false, errors.New("ls-remote: no such remote"))
 
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
 	if err != nil {
 		t.Fatalf("an unconfigured remote must skip, got %v", err)
 	}
 	if advanced {
 		t.Error("an unconfigured remote reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if !strings.Contains(log.String(), `"reason":"remote_unconfigured"`) {
 		t.Errorf("missing remote_unconfigured skip:\n%s", log.String())
@@ -276,12 +288,17 @@ func TestAdvanceLineageWorktreeToBase_AlreadyAtBaseTip_NoOp(t *testing.T) {
 	}
 
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
 	if err != nil {
 		t.Fatalf("an already-current base must be a no-op, got %v", err)
 	}
 	if advanced {
 		t.Error("an already-current base reported an advance")
+	}
+	// The already-current path still returns the FETCHED tip (#3973): it is
+	// the stage-lifetime base pin even though HEAD did not move.
+	if tip != planSHA {
+		t.Errorf("tip = %q, want the fetched (already-current) base tip %q", tip, planSHA)
 	}
 	if !strings.Contains(log.String(), `"event":"lineage_worktree_base_current"`) {
 		t.Errorf("missing lineage_worktree_base_current:\n%s", log.String())
@@ -319,9 +336,12 @@ func TestAdvanceLineageWorktreeToBase_DirtyWorktree_Refuses(t *testing.T) {
 			tc.dirty(t, repoDir)
 
 			var log strings.Builder
-			advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
+			tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
 			if advanced {
 				t.Error("a dirty worktree reported an advance")
+			}
+			if tip != "" {
+				t.Errorf("tip = %q, want \"\" on a refusal", tip)
 			}
 			var refusal *lineageBaseAdvanceRefusal
 			if !errors.As(err, &refusal) {
@@ -355,9 +375,12 @@ func TestAdvanceLineageWorktreeToBase_DirtyProbeError_Refuses(t *testing.T) {
 	advance()
 	withStubbedDirtyPaths(t, nil, errors.New("status: git unavailable"))
 
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
 	if advanced {
 		t.Error("an unreadable dirty set reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	var refusal *lineageBaseAdvanceRefusal
 	if !errors.As(err, &refusal) {
@@ -391,9 +414,12 @@ func TestAdvanceLineageWorktreeToBase_HeadNotAncestorOfBase_Refuses(t *testing.T
 	}
 	localSHA := headOf(t, repoDir)
 
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
 	if advanced {
 		t.Error("a non-ancestor HEAD reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	var refusal *lineageBaseAdvanceRefusal
 	if !errors.As(err, &refusal) {
@@ -425,9 +451,12 @@ func TestAdvanceLineageWorktreeToBase_AncestryProbeError_Refuses(t *testing.T) {
 	// A plain error, NOT an *exec.ExitError with code 1 — the probe itself failed.
 	withStubbedAncestryProbe(t, errors.New("merge-base: git unavailable"))
 
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
 	if advanced {
 		t.Error("a failed ancestry probe reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	var refusal *lineageBaseAdvanceRefusal
 	if !errors.As(err, &refusal) {
@@ -449,12 +478,15 @@ func TestAdvanceLineageWorktreeToBase_FetchTipError_FailsLoud(t *testing.T) {
 	advance()
 	withStubbedFetchDiffBaseTip(t, "", errors.New("fetch: transient failure"))
 
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
 	if err == nil {
 		t.Fatal("a fetch-tip failure must fail loud")
 	}
 	if advanced {
 		t.Error("a failed advance reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if got := lineageBaseAdvanceFailureReason(err); got != "lineage_base_advance" {
 		t.Errorf("reason = %q, want lineage_base_advance", got)
@@ -472,12 +504,15 @@ func TestAdvanceLineageWorktreeToBase_CheckoutError_FailsLoud(t *testing.T) {
 	advance()
 	withStubbedCheckoutChildBase(t, "", errors.New("checkout: would overwrite local modifications"))
 
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", io.Discard)
 	if err == nil {
 		t.Fatal("a checkout failure must fail loud")
 	}
 	if advanced {
 		t.Error("a failed advance reported an advance")
+	}
+	if tip != "" {
+		t.Errorf("tip = %q, want \"\" on a non-pinning path (the stage must stay unpinned)", tip)
 	}
 	if got := lineageBaseAdvanceFailureReason(err); got != "lineage_base_advance" {
 		t.Errorf("reason = %q, want lineage_base_advance", got)
@@ -496,12 +531,16 @@ func TestAdvanceLineageWorktreeToBase_MovedBase_Advances(t *testing.T) {
 	advancedSHA := advance()
 
 	var log strings.Builder
-	advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
+	tip, advanced, err := advanceLineageWorktreeToBase(context.Background(), repoDir, "main", "", &log)
 	if err != nil {
 		t.Fatalf("advance failed: %v\n%s", err, log.String())
 	}
 	if !advanced {
 		t.Fatalf("advance reported no move on a moved base:\n%s", log.String())
+	}
+	// The advanced path returns the tip it moved HEAD to (#3973's pin).
+	if tip != advancedSHA {
+		t.Errorf("tip = %q, want the advanced base tip %q", tip, advancedSHA)
 	}
 	if got := headOf(t, repoDir); got != advancedSHA {
 		t.Errorf("HEAD = %q, want the advanced base tip %q (plan-time was %q)", got, advancedSHA, planSHA)
