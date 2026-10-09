@@ -3508,6 +3508,17 @@ const concernNoteTruncationMarker = " […truncated; read the review's full free
 // fix-up code path. Per-child reviews remain advisory early signal; this
 // consolidated review is the gating one (closes #677's parent-merge gap).
 //
+// FAN-IN HOLD (ADR-090 D5 / #4018). When the workflow declares a verify
+// command, the round is not dispatched until the consolidated head (the
+// compare's HeadSHA) carries a `passed` merge-candidate verify: an unverified
+// head starts the verify-only pass under the system actor, and an in-flight or
+// failed one simply holds (holdConsolidatedReviewForFanInVerify). The pass's
+// report settles the re-opened parent implement stage and calls
+// Orchestrator.Advance, which re-walks the re-parked review stage and re-enters
+// this function; the passed result then rides the round as its authoritative
+// parent-level verify evidence (fanInVerifyGateRun). No declared verify command
+// means no hold and no evidence, exactly as before.
+//
 // Best-effort and idempotent: every guard that doesn't add up — not a
 // decomposed parent, no children, no implement stage, GitHub/installation
 // not wired, or a compare failure — logs and returns without dispatching,
@@ -3598,6 +3609,16 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 				slog.String("run_id", parentRunID.String()),
 				slog.String("base", base), slog.String("head", head),
 				slog.String("error", cerr.Error()))
+			return
+		}
+		// ADR-090 D5 (#4018): hold the gating review until the consolidated
+		// fan-in head carries a passed merge-candidate verify, triggering the
+		// verify-only pass when it has none. Consulted only once the compare has
+		// resolved the head, and before anything this round records, so a held
+		// round leaves no review trace. A parent with no declared verify command
+		// (D4) is never held. Release is the pass's report re-walking the review
+		// stage back into this function (fanin_verify.go).
+		if s.holdConsolidatedReviewForFanInVerify(reviewCtx, runRow, base, head, cmp.HeadSHA) {
 			return
 		}
 		if cmp.Truncated {
@@ -4154,12 +4175,33 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// section (buildImplementReview) and the provenance fold (scopeProvenanceForReview,
 	// which receives trig by value below). nil for every non-decomposed run.
 	trig.ChildAmendedScopeFiles = s.childApprovedAmendmentScopePaths(ctx, runID)
+	// Decomposed-parent fan-in verify (ADR-090 D5 / #4018): on a consolidated
+	// round, the passed merge-candidate verify bound to exactly this head is the
+	// AUTHORITATIVE parent-level verify evidence. It is injected HERE, after
+	// bundleDerivedGateEvidence was decided at entry, so the approval-conditions
+	// branch below reads this round exactly as before — no bundle was uploaded,
+	// so there is no commit-message sidecar to call unrecorded — and AHEAD of
+	// the per-slice rollup, so the decomposed_parent_no_parent_level_verify
+	// marker is never stamped over a real parent-level verify. Nil for every
+	// other round (fanInVerifyGateRun keys on the consolidated round origin).
+	if fanInRun, fanInSummary := s.fanInVerifyGateRun(ctx, runID, headSHA); fanInRun != nil {
+		if gateEvidence == nil {
+			gateEvidence = &prompt.GateEvidence{}
+			trig.GateEvidence = gateEvidence
+		}
+		gateEvidence.VerifyRuns = append(gateEvidence.VerifyRuns, *fanInRun)
+		if gateEvidence.VerifySummary == nil {
+			gateEvidence.VerifySummary = fanInSummary
+		}
+	}
 	// Decomposed-parent per-slice verify rollup (#3132), sitting next to its
 	// sibling parent-only resolver above. A fan-out parent's implement stage
-	// spawns no agent and uploads no bundle, so gateEvidence is nil here on the
-	// consolidated review and the reviewer judged the LARGEST diff the loop
-	// produces with the tree's compile/test state unknown. Each CHILD did upload
-	// a trace carrying its own committed-tree gate; this resolves them per slice.
+	// spawns no agent and uploads no bundle, so on the consolidated review
+	// gateEvidence carries at most the fan-in merge-candidate verify injected
+	// just above (ADR-090 D5) — nil when the workflow declares no verify command
+	// — and the reviewer would otherwise judge the LARGEST diff the loop
+	// produces with no per-slice compile/test state. Each CHILD did upload a
+	// trace carrying its own committed-tree gate; this resolves them per slice.
 	//
 	// Placed HERE rather than at the DispatchConsolidatedReview call site so it
 	// covers BOTH parent review paths — the consolidated first review (which
@@ -4386,8 +4428,10 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// can tell "declined with a reason" from "silently ignored" on the run
 	// surface. A placeholder-only evidence (no bundle) sets neither: the
 	// section may well be in a sidecar this round never saw. The
-	// decomposed-parent review path (nil gate evidence, no bundle) is likewise
-	// untouched. EVIDENCE ONLY, the #1407/#2737 posture: never touches the
+	// decomposed-parent review path (no bundle) is likewise untouched, even
+	// when the ADR-090 fan-in verify above made its gate evidence non-nil:
+	// bundleDerivedGateEvidence was decided at entry, before that injection.
+	// EVIDENCE ONLY, the #1407/#2737 posture: never touches the
 	// review outcome, the stage result, or the fix-up budget.
 	if trig.ApprovalConditions != nil && gateEvidence != nil && bundleDerivedGateEvidence {
 		gateEvidence.ApprovalConditionsAttached = true
