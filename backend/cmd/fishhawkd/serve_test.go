@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
@@ -51,6 +53,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
@@ -6874,6 +6877,60 @@ func TestServe_SchedulerWiresScheduleSource(t *testing.T) {
 		}
 		if !strings.Contains(log, "--scheduler-repos") || !strings.Contains(log, "scheduler not started") {
 			t.Errorf("missing the no-repos skip reason in the log:\n%s", log)
+		}
+	})
+}
+
+// TestChildCompletionAdvancer_TranslatesSliceHeadMissing is CONTROL A (#4079,
+// approval condition C1). childCompletionAdvancer holds a concrete
+// *orchestrator.Orchestrator, so the bridge is factored into
+// translateSliceHeadMissing — which BOTH IntegrateSlices and
+// IntegrateCompletedWave route their error through — and tested directly: an
+// orchestrator *SliceHeadMissingError, bare or wrapped, must come out as
+// childcompletion's *SliceHeadMissingError carrying the same fields and the
+// original error text; anything else passes through untranslated.
+func TestChildCompletionAdvancer_TranslatesSliceHeadMissing(t *testing.T) {
+	childID := uuid.New()
+	typed := &orchestrator.SliceHeadMissingError{SliceIndex: 3, ChildRunID: childID, Branch: "fishhawk/run-abcd1234/slice-3"}
+	for _, tc := range []struct {
+		name string
+		in   error
+	}{
+		{"bare typed error", typed},
+		{"wrapped typed error", fmt.Errorf("orchestrator: wave integration: %w", typed)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := translateSliceHeadMissing(tc.in)
+			var missing *childcompletion.SliceHeadMissingError
+			if !errors.As(got, &missing) {
+				t.Fatalf("translateSliceHeadMissing(%v) = %T %v, want a *childcompletion.SliceHeadMissingError", tc.in, got, got)
+			}
+			if missing.SliceIndex != 3 || missing.ChildRunID != childID || missing.Branch != typed.Branch {
+				t.Errorf("translated = %+v, want slice 3 child %s branch %q", missing, childID, typed.Branch)
+			}
+			if missing.Detail != tc.in.Error() {
+				t.Errorf("Detail = %q, want the original error text %q", missing.Detail, tc.in.Error())
+			}
+			if !errors.Is(got, childcompletion.ErrSliceHeadMissing) {
+				t.Error("errors.Is(translated, childcompletion.ErrSliceHeadMissing) = false, want true")
+			}
+		})
+	}
+
+	t.Run("generic error passes through", func(t *testing.T) {
+		generic := errors.New("merge slice 0: githubclient: 502")
+		got := translateSliceHeadMissing(generic)
+		if got != generic {
+			t.Errorf("translateSliceHeadMissing(generic) = %v, want the same error untranslated", got)
+		}
+		var missing *childcompletion.SliceHeadMissingError
+		if errors.As(got, &missing) {
+			t.Error("a generic error was translated into a SliceHeadMissingError")
+		}
+	})
+	t.Run("nil passes through", func(t *testing.T) {
+		if got := translateSliceHeadMissing(nil); got != nil {
+			t.Errorf("translateSliceHeadMissing(nil) = %v, want nil", got)
 		}
 	})
 }

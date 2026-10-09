@@ -704,15 +704,22 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// than hanging it in running. Non-push stages are byte-identical: the
 	// flag is false → the gate is a no-op.
 	//
-	// The decomposed-child push (#771) is gated identically: a child stamps
-	// push_to_shared_branch (not push_and_open_pr) and commits + pushes onto
-	// the shared parent branch after the trace ships. childPushGated mirrors
-	// pushAndOpenPRGated — leave the child stage in `running` and let the
-	// /pull-request "pushed"/"failed" report drive the terminal transition,
-	// so a child commit/push failure lands the stage `failed` instead of
-	// reaching terminal succeeded with no code on the shared branch (the
-	// childcompletion sweeper would otherwise consolidate the parent into a
-	// PR silently missing that child's work).
+	// The decomposed-child push (#771) is gated on the FLAG ALONE, with no
+	// diff precondition (#4079): a child stamps push_to_shared_branch (not
+	// push_and_open_pr) and commits + pushes onto its slice branch after the
+	// trace ships, and EVERY child arm after the trace upload sends a
+	// /pull-request report — "pushed" on success, "failed" via
+	// reportPullRequestFailure on a commit/push failure, and the #1036
+	// failed-C report on no-changes. An empty or absent diff is therefore NOT
+	// evidence that no report follows; an absent git_diff is exactly the
+	// diff-capture-failure shape of #4079, where the trace-time transition
+	// moved a gateless child to succeeded and the later failed-C report was
+	// refused on the terminal stage. childPushGated leaves the child stage in
+	// `running` and lets the /pull-request report drive the terminal
+	// transition, so a child commit/push failure lands the stage `failed`
+	// instead of reaching terminal succeeded with no code on its slice branch
+	// (the childcompletion sweeper would otherwise consolidate the parent into
+	// a PR silently missing that child's work).
 	// The fix-up re-dispatch push (#794) is gated identically: a fix-up stamps
 	// push_fixup (not push_and_open_pr / push_to_shared_branch) and commits onto
 	// the EXISTING PR branch after the trace ships. fixupPushGated mirrors
@@ -850,31 +857,27 @@ func (*Server) pushAndOpenPRGated(bundleBytes []byte) bool {
 
 // childPushGated reports whether a decomposed-child implement-stage trace
 // upload should DEFER its terminal transition to the /pull-request upload
-// (#771). It mirrors pushAndOpenPRGated for the decomposition-child case.
-// True only when BOTH hold:
+// (#771). True exactly when the bundle manifest's push_to_shared_branch flag
+// is set (the runner is a decomposed child that will commit + push onto its
+// slice branch after the trace ships, without opening its own PR).
 //
-//   - the bundle manifest's push_to_shared_branch flag is set (the runner is
-//     a decomposed child that will commit + push onto the shared parent
-//     branch after the trace ships, without opening its own PR), and
-//   - the bundle carries a non-empty git_diff (a commit + push will actually
-//     follow, so a /pull-request "pushed"/"failed" report is guaranteed).
-//
-// A false flag — every non-child stage and every older bundle — returns
-// false so the prior trace-driven transition is byte-identical. An empty or
-// absent diff is the no-changes path: the child made no edits, so the runner
-// pushes nothing and never POSTs to /pull-request; gating it would hang the
-// stage in running, so it returns false and the caller advances the stage as
-// before (matching the push_and_open_pr empty-diff case).
+// Unlike pushAndOpenPRGated and fixupPushGated there is NO non-empty-diff
+// precondition (#4079): every child arm after the trace upload sends a
+// /pull-request report — "pushed"; "failed" via reportPullRequestFailure on a
+// commit/push failure; and the no-changes failed-C report (#1036) — so the
+// report always follows and gating never hangs the stage. An empty or absent
+// git_diff is not evidence that no report follows: an ABSENT diff is the
+// diff-capture-failure shape (the runner's computeAndEmitDiff emitted
+// diff_failed), and advancing on it moved a gateless child to terminal
+// succeeded before its push failed. A false flag — every non-child stage and
+// every older bundle — returns false so the prior trace-driven transition is
+// byte-identical.
 func (*Server) childPushGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
-	if err != nil || !manifest.PushToSharedBranch {
-		return false
-	}
-	diff, err := bundle.ExtractDiff(bundleBytes)
 	if err != nil {
 		return false
 	}
-	return len(diff.ChangedFiles) > 0
+	return manifest.PushToSharedBranch
 }
 
 // fixupPushGated reports whether a fix-up re-dispatch implement-stage trace
@@ -893,7 +896,8 @@ func (*Server) childPushGated(bundleBytes []byte) bool {
 // diff is the no-changes path: the fix-up made no edits, so the runner pushes
 // nothing and never POSTs to /pull-request; gating it would hang the stage in
 // running, so it returns false and the caller advances the stage as before
-// (matching the push_and_open_pr / push_to_shared_branch empty-diff cases).
+// (matching the push_and_open_pr empty-diff case; a decomposed child's
+// childPushGated deliberately has no such carve-out, #4079).
 func (*Server) fixupPushGated(bundleBytes []byte) bool {
 	manifest, err := bundle.ExtractManifest(bundleBytes)
 	if err != nil || !manifest.PushFixup {

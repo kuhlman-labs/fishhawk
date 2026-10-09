@@ -23,6 +23,7 @@ On the all-succeeded path, `resolveParent` calls the nil-safe `Sweeper.Integrate
 - A clean fan-in falls through to `succeeded` + `Advance`.
 - A `*SliceConflict` fails the stage category-B + emits `slice_integration_conflict` + does NOT `Advance`.
 - A non-conflict error leaves the parent parked (the next tick re-enters; merges are idempotent).
+- A `*SliceHeadMissingError` parks the parent WITHOUT counting toward the bounded-retry give-up — see "Missing slice head" below.
 - A nil `Integrate` (dev posture / pre-#1142) skips integration entirely, preserving the prior resolve behavior.
 
 ## Between-wave fan-in (#2363)
@@ -53,3 +54,18 @@ A deterministically-failing `IntegrateSlices` (e.g. the pre-#1243 consolidated-b
 Ticks 1..`maxIntegrationAttempts`-1 leave the parent parked (one WARN per tick, bounding spam to `maxIntegrationAttempts` lines); the give-up fires ON the `maxIntegrationAttempts`-th tick.
 
 A process restart resets the counter (acceptable — it retries `maxIntegrationAttempts` more times then gives up again, still bounding steady-state spam).
+
+A `*SliceHeadMissingError` never reaches this counter (see below).
+
+## Missing slice head: park, never category-B (#4079)
+
+`orchestrator.integrateSlices` returns a typed `*SliceHeadMissingError{SliceIndex, ChildRunID, Branch}` when `MergeBranch` 404s for a slice head AND a `GetBranchSHA` probe confirms the head is absent — a child that reached `succeeded` without ever pushing its slice branch. A probe error or an existing head stays the generic error, so a base-missing or unrelated 404 is never misclassified. The serve.go adapter's `translateSliceHeadMissing` converts it (wrapped or bare) into this package's `SliceHeadMissingError` — the same import-graph bridge as `SliceConflict` — for BOTH `IntegrateSlices` and `IntegrateCompletedWave`.
+
+The sweeper matches it with `errors.As` BEFORE the generic error arm, in both fan-in arms:
+
+- **all-terminal** → no `recordIntegrationError` increment, no transition, no `Advance`: the parent stays parked in `awaiting_children`.
+- **between-wave** → the same park; also no increment of the shared counter (a between-wave increment would hand the all-terminal arm a premature give-up). Returns false, so the dispatch backstop is skipped like any other failure.
+- Both WARN-log and emit ONE `slice_head_missing` audit row (system actor, payload `{parent_stage_id, child_run_id, slice_index, branch, detail}`), deduped per parent and per `{slice_index}/{child_run_id}` in a `headMissing` map shared by both arms (same shape and mutex as the wave-conflict dedup), so a parked parent does not append one row per tick.
+- The dedup key is cleared on a clean (or no-op) between-wave result, on a clean all-terminal integration, and on every settling exit, so a head that self-heals and later goes missing again is surfaced again.
+
+**Self-heal:** once the slice branch exists — a resumed child push, or an operator push of the runner's pinned checkpoint ref (`runner/cmd/fishhawk-runner/README.md` § "Push-failure resume") — the next tick's idempotent merge integrates it and the parent settles normally. The child is NOT flipped from `succeeded` to failed: `succeeded` is terminal in the stage and run state machines. The primary #4079 fix is upstream — the trace handler's `childPushGated` defers on `push_to_shared_branch` alone, so a push-failed child lands failed-C instead of reaching `succeeded` (`backend/internal/server/trace.go`). `slice_head_missing` is an operator diagnostic like `slice_integration_failed` and is deliberately NOT an issue-comment activity category. Pinned by `TestTick_Integrate_SliceHeadMissing_{ParksWithoutCategoryB,SelfHeals}` and `TestSweeper_WaveIntegration_SliceHeadMissing_ParksWithoutCountingTowardGiveUp`.

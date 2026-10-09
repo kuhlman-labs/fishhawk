@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -1473,5 +1474,209 @@ func TestSweeper_WaveIntegrationSkippedWhenAllChildrenTerminal(t *testing.T) {
 	defer integ.mu.Unlock()
 	if len(integ.called) != 1 {
 		t.Errorf("IntegrateSlices calls = %d, want 1 (the all-terminal settling fan-in still runs)", len(integ.called))
+	}
+}
+
+// sliceHeadMissingRows returns the slice_head_missing entries appended so far.
+func sliceHeadMissingRows(au *fakeAudit) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, p := range au.appended {
+		if p.Category == "slice_head_missing" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func hasCategory(au *fakeAudit, category string) bool {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, p := range au.appended {
+		if p.Category == category {
+			return true
+		}
+	}
+	return false
+}
+
+func mkHeadMissing(childRun uuid.UUID, slice int) *SliceHeadMissingError {
+	return &SliceHeadMissingError{
+		SliceIndex: slice, ChildRunID: childRun,
+		Branch: "fishhawk/run-f16f2e77/slice-1",
+		Detail: "slice head missing: slice 1 branch does not exist",
+	}
+}
+
+// TestTick_Integrate_SliceHeadMissing_ParksWithoutCategoryB is CONTROL P and
+// CONTROL D (#4079): an Integrator returning *SliceHeadMissingError on EVERY
+// tick — well past maxIntegrationAttempts — must keep the parent parked in
+// awaiting_children (no transition, no Advance, no slice_integration_failed)
+// and emit exactly ONE slice_head_missing row naming the child. Routing the
+// error into the bounded-retry arm would fail the parent category B on the
+// maxIntegrationAttempts-th tick.
+func TestTick_Integrate_SliceHeadMissing_ParksWithoutCategoryB(t *testing.T) {
+	parentRun := uuid.New()
+	childRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{parentRun: {mkChild(childRun, run.StateSucceeded)}},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{returnErr: fmt.Errorf("adapter: %w", mkHeadMissing(childRun, 1))}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	for i := 0; i < maxIntegrationAttempts+2; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+
+	rs.mu.Lock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none: the parent stays awaiting_children (a missing slice head is never a category-B give-up)", rs.transitions)
+	}
+	rs.mu.Unlock()
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none while parked", ad.advanced)
+	}
+	if hasCategory(au, "slice_integration_failed") {
+		t.Error("slice_integration_failed emitted for a missing slice head; it must not reach the bounded-retry give-up")
+	}
+	rows := sliceHeadMissingRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("slice_head_missing rows = %d over %d ticks, want exactly 1 (dedup)", len(rows), maxIntegrationAttempts+2)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p["child_run_id"] != childRun.String() || p["parent_stage_id"] != parentStage.ID.String() ||
+		p["branch"] != "fishhawk/run-f16f2e77/slice-1" || p["slice_index"] != float64(1) || p["detail"] == "" {
+		t.Errorf("payload = %v, want child/parent-stage/branch/slice_index/detail", p)
+	}
+}
+
+// TestTick_Integrate_SliceHeadMissing_SelfHeals: once the slice branch exists
+// the next tick's clean integration resolves the parent succeeded, and a LATER
+// recurrence of the same missing head is surfaced again (the dedup key is
+// cleared on the clean integration / settle).
+func TestTick_Integrate_SliceHeadMissing_SelfHeals(t *testing.T) {
+	parentRun := uuid.New()
+	childRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{parentRun: {mkChild(childRun, run.StateSucceeded)}},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{returnErr: mkHeadMissing(childRun, 1)}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	for i := 0; i < 3; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	// The slice branch now exists: a clean integration settles the parent.
+	integ.mu.Lock()
+	integ.returnErr = nil
+	integ.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("clean Tick: %v", err)
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want one to succeeded after the head self-healed", rs.transitions)
+	}
+	rs.mu.Unlock()
+	if len(ad.advanced) != 1 {
+		t.Errorf("Advance calls = %d, want 1 after the self-healed settle", len(ad.advanced))
+	}
+
+	// A later recurrence (the fake still lists the stage) is surfaced again.
+	integ.mu.Lock()
+	integ.returnErr = mkHeadMissing(childRun, 1)
+	integ.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("recurrence Tick: %v", err)
+	}
+	if n := len(sliceHeadMissingRows(au)); n != 2 {
+		t.Errorf("slice_head_missing rows = %d, want 2 (one per episode; the clean integration cleared the dedup key)", n)
+	}
+}
+
+// TestSweeper_WaveIntegration_SliceHeadMissing_ParksWithoutCountingTowardGiveUp
+// is approval condition C2 (#4079): the BETWEEN-WAVE arm parks on a
+// *SliceHeadMissingError exactly as the all-terminal arm does — one dedup'd
+// slice_head_missing row, no transition, the dispatch backstop short-circuited
+// — and does NOT feed the shared consecutive-error counter. The counter is
+// observed through its consequence: after many between-wave head-missing ticks
+// the children settle and the all-terminal integration fails ONCE with a
+// generic error; that first all-terminal error must leave the parent parked.
+// Had the between-wave arm incremented the counter, that tick would already be
+// past maxIntegrationAttempts and fail the parent category B.
+func TestSweeper_WaveIntegration_SliceHeadMissing_ParksWithoutCountingTowardGiveUp(t *testing.T) {
+	parentRun, parentStage, rs := midFanOutParent()
+	childRun := rs.childrenByParent[parentRun][0].ID
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	disp := &recordingDispatcher{}
+	wi := &recordingWaveIntegrator{returnErr: mkHeadMissing(childRun, 0)}
+	integ := &recordingIntegrator{returnErr: mkHeadMissing(childRun, 0)}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, WaveIntegrate: wi, Dispatch: disp, Logger: slog.Default()}
+
+	for i := 0; i < maxIntegrationAttempts+1; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none mid-fan-out", rs.transitions)
+	}
+	rs.mu.Unlock()
+	disp.mu.Lock()
+	if len(disp.calls) != 0 {
+		t.Errorf("dispatch backstop calls = %d, want 0 (the consolidated base still lacks the slice)", len(disp.calls))
+	}
+	disp.mu.Unlock()
+	rows := sliceHeadMissingRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("slice_head_missing rows = %d, want exactly 1 across the between-wave ticks", len(rows))
+	}
+	if rows[0].StageID == nil || *rows[0].StageID != parentStage.ID {
+		t.Errorf("row StageID = %v, want the parent stage %s", rows[0].StageID, parentStage.ID)
+	}
+
+	// The fan-out settles: every child terminal-succeeded. The all-terminal
+	// arm sees the SAME missing head first — shared dedup, no second row.
+	rs.mu.Lock()
+	for _, c := range rs.childrenByParent[parentRun] {
+		c.State = run.StateSucceeded
+	}
+	rs.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("all-terminal Tick: %v", err)
+	}
+	if n := len(sliceHeadMissingRows(au)); n != 1 {
+		t.Errorf("slice_head_missing rows = %d after the all-terminal arm saw the same head, want 1 (dedup shared across arms)", n)
+	}
+
+	// Now ONE generic all-terminal integration error: attempt 1, still parked.
+	integ.mu.Lock()
+	integ.returnErr = errors.New("github: 502 bad gateway")
+	integ.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("generic-error Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none: the between-wave head-missing ticks must not have counted toward the bounded-retry give-up", rs.transitions)
 	}
 }
