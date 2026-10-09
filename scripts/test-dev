@@ -6099,6 +6099,9 @@ _lr_run_reload() {
       clean)   _scan_live_runs() { return 0 } ;;
       degrade) _scan_live_runs() { return 2 } ;;
     esac
+    # Hermeticity (E83.30 / #3974): the restart-blocker guard would otherwise
+    # GET the HOST daemon on :8080. The RB cases below drive it for real.
+    _refuse_on_restart_blockers() { return 0 }
     cmd_down() { print -r -- "down" >> "$lr_marker" }
     cmd_up()   { print -r -- "$*" > "$lr_upargs"; print -r -- "up" >> "$lr_marker" }
     cmd_reload "$@" 2>"${lr_dir}/err"
@@ -6187,6 +6190,7 @@ CLEAN
       live)  _scan_live_runs() { print -r -- "7777"$'\t'"run-live-xyz"; return 0 } ;;
       clean) _scan_live_runs() { return 0 } ;;
     esac
+    _refuse_on_restart_blockers() { return 0 }
     git() { print -r -- "git $*" >> "$lr_git" }
     cmd_reload() { print -r -- "reload $*" >> "$lr_reload" }
     cmd_post_merge "$@" 2>"${lr_dir}/err"
@@ -6404,6 +6408,8 @@ _gc_call() {
       clean)   _scan_live_go() { return 0 } ;;
       degrade) _scan_live_go() { return 2 } ;;
     esac
+    # Hermeticity (E83.30 / #3974): never GET the host daemon from a GC case.
+    _refuse_on_restart_blockers() { return 0 }
     if [[ -n "${gc_est:-}" ]]; then
       _gocache_estimate_kb() { print -r -- "$gc_est" }
     fi
@@ -6973,6 +6979,338 @@ fi
 rm -rf "$gc_tmp"
 _gc_reset
 # END GC CASES
+
+# ---------------------------------------------------------------------------
+# Restart-blocker guard for reload / post-merge (E83.30 / #3974) — RB cases
+# ---------------------------------------------------------------------------
+# The nc-driven cases drive the REAL _refuse_on_restart_blockers through the
+# REAL cmd_reload / cmd_post_merge with a REAL curl against a one-shot `nc -l`
+# fake fishhawkd (the section-14b fixture family). REPO_ROOT points at an empty
+# temp dir (no .env), so FISHHAWKD_ADDR is the only port source and no case can
+# reach the host daemon on :8080. The teardown legs are stubbed to append to
+# marker files, so "did the restart proceed?" is a file-existence question.
+
+RB_CHILD='{"items":[{"run_id":"rb-child-1","reason":"undispatched_child","stage":"implement","parent_run_id":"rb-parent-9","stage_state":"pending"}],"scanned_runs":2,"truncated":false}'
+RB_REVIEW='{"items":[{"run_id":"rb-review-2","reason":"review_in_flight","stage":"plan","configured_agents":2,"landed":0}],"scanned_runs":1,"truncated":false}'
+RB_CHECK_FAILED='{"items":[{"run_id":"rb-undecided-3","reason":"check_failed","stage":"implement"}],"scanned_runs":1,"truncated":false}'
+RB_EMPTY='{"items":[],"scanned_runs":3,"truncated":false}'
+RB_MALFORMED='{"error":{"code":"internal_error"}}'
+RB_UNREADABLE='{"items":[{"surprise":true}],"scanned_runs":1,"truncated":false}'
+RB_TRUNCATED='{"items":[],"scanned_runs":500,"truncated":true}'
+
+# One-shot fake fishhawkd on <port>: one HTTP response (<status>, <body>), then
+# nc exits. Waits for the bind so curl cannot race the listener. Sets
+# rb_responder_pid.
+_rb_serve_once() {
+  local port="$1" rb_status="$2" body="$3"
+  printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' "$rb_status" "${#body}" "$body" | nc -l 127.0.0.1 "$port" >/dev/null 2>&1 &
+  rb_responder_pid=$!
+  local i=0
+  while (( i < 20 )); do
+    if [[ -n "$(_port_listeners "$port")" ]]; then break; fi
+    sleep 0.1
+    (( ++i ))
+  done
+}
+
+# Shared setup. <mode> is an HTTP status line ("200 OK", "404 Not Found"),
+# `none` (no responder: connection refused) or `nocurl` (a "200 OK" responder
+# serving <body>, with curl off PATH inside the subshell — so a guard that
+# still reached the responder would refuse instead of failing open).
+_rb_setup() {
+  local mode="$1" body="$2"
+  rb_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-rb.XXXXXX")"
+  rb_marker="${rb_dir}/teardown"
+  rb_err=""
+  rb_rc=0
+  rb_responder_pid=""
+  rb_port="$(_free_high_port)"
+  if [[ -n "$rb_port" ]]; then
+    case "$mode" in
+      none)   ;;
+      nocurl) _rb_serve_once "$rb_port" "200 OK" "$body" ;;
+      *)      _rb_serve_once "$rb_port" "$mode" "$body" ;;
+    esac
+  fi
+}
+_rb_teardown() {
+  rb_err="$(cat "${rb_dir}/err" 2>/dev/null)"
+  if [[ -n "$rb_responder_pid" ]]; then
+    kill "$rb_responder_pid" 2>/dev/null
+    wait "$rb_responder_pid" 2>/dev/null
+  fi
+}
+
+# Args: <mode> <body> [cmd_reload args...]. Sets rb_rc rb_err rb_marker.
+_rb_run_reload() {
+  local mode="$1" body="$2"; shift 2
+  _rb_setup "$mode" "$body"
+  if [[ -z "$rb_port" ]]; then rb_rc=99; rb_err="no free port"; return; fi
+  rb_out="$(
+    setopt errexit
+    REPO_ROOT="$rb_dir"
+    FISHHAWKD_ADDR=":${rb_port}"
+    PID_FILE="${rb_dir}/dev.pid"
+    : > "$PID_FILE"
+    if [[ "$mode" == nocurl ]]; then
+      mkdir -p "${rb_dir}/emptybin"
+      PATH="${rb_dir}/emptybin"
+    fi
+    # Approval condition C1: stub the #2897 live-run scan, exactly as
+    # _lr_run_post_merge does. Without it every case refuses (or passes for
+    # the wrong reason) on a host with a live fishhawk-runner — precisely the
+    # host this suite runs on during a campaign.
+    _scan_live_runs() { return 0 }
+    cmd_down() { print -r -- "down" >> "$rb_marker" }
+    cmd_up()   { print -r -- "up" >> "$rb_marker" }
+    cmd_reload "$@" 2>"${rb_dir}/err"
+  )"
+  rb_rc=$?
+  _rb_teardown
+}
+
+# Args: <mode> <body> [cmd_post_merge args...]. Each post-merge leg gets its
+# own marker; cleanup-merged is a PATH, so it is a real stub executable.
+_rb_run_post_merge() {
+  local mode="$1" body="$2"; shift 2
+  _rb_setup "$mode" "$body"
+  if [[ -z "$rb_port" ]]; then rb_rc=99; rb_err="no free port"; return; fi
+  mkdir -p "${rb_dir}/scripts"
+  rb_git="${rb_dir}/git.marker"
+  rb_clean="${rb_dir}/cleanup.marker"
+  rb_reload="${rb_dir}/reload.marker"
+  cat > "${rb_dir}/scripts/cleanup-merged" <<CLEAN
+#!/bin/sh
+echo ran >> "${rb_clean}"
+CLEAN
+  chmod +x "${rb_dir}/scripts/cleanup-merged"
+  rb_out="$(
+    setopt errexit
+    REPO_ROOT="$rb_dir"
+    FISHHAWKD_ADDR=":${rb_port}"
+    _scan_live_runs() { return 0 }   # C1, as above
+    _gocache_maintain() { return 0 }
+    git() { print -r -- "git $*" >> "$rb_git" }
+    cmd_reload() { print -r -- "reload $*" >> "$rb_reload" }
+    cmd_post_merge "$@" 2>"${rb_dir}/err"
+  )"
+  rb_rc=$?
+  _rb_teardown
+}
+
+_rb_m() { [[ -f "$1" ]] && print present || print absent }
+
+if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
+  print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n)"
+else
+  # RB-a DONE-MEANS (negative): an undispatched child refuses, never reaches
+  # the teardown, and names the child, its parent and what --force breaks.
+  _rb_run_reload "200 OK" "$RB_CHILD"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-child-1* && "$rb_err" == *rb-parent-9* ]] \
+     && [[ "$rb_err" == *"refusing to restart fishhawkd"* && "$rb_err" == *undispatched_child* && "$rb_err" == *"--force breaks"* ]]; then
+    pass "RB-a undispatched child: cmd_reload refuses before the teardown, naming child + parent"
+  else
+    fail "RB-a undispatched child (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-b an in-flight review round refuses the same way.
+  _rb_run_reload "200 OK" "$RB_REVIEW"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-review-2* && "$rb_err" == *review_in_flight* ]]; then
+    pass "RB-b review round in flight: cmd_reload refuses before the teardown, naming the run"
+  else
+    fail "RB-b review in flight (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-c --force: the same blocker is loud but UNBLOCKED, and says what --force breaks.
+  _rb_run_reload "200 OK" "$RB_CHILD" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *warning* && "$rb_err" == *rb-child-1* ]] \
+     && [[ "$rb_err" == *"--force breaks"* && "$rb_err" != *"refusing to restart"* ]]; then
+    pass "RB-c blocker + --force: teardown reached, exit 0, warning names the run and what --force breaks"
+  else
+    fail "RB-c --force (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-n (approval condition C2): a check_failed item from a REACHABLE daemon
+  # REFUSES, naming the run and saying the daemon could not decide it; --force
+  # proceeds.
+  _rb_run_reload "200 OK" "$RB_CHECK_FAILED"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-undecided-3* && "$rb_err" == *"could not decide"* ]]; then
+    pass "RB-n check_failed: cmd_reload refuses, naming the run the daemon could not decide"
+  else
+    fail "RB-n check_failed refusal (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  _rb_run_reload "200 OK" "$RB_CHECK_FAILED" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *rb-undecided-3* && "$rb_err" == *warning* ]]; then
+    pass "RB-n check_failed + --force: teardown reached with a warning"
+  else
+    fail "RB-n check_failed --force (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-d unreachable daemon (connection refused): fail-OPEN with ONE line.
+  _rb_run_reload none ""
+  rb_lines=("${(@f)rb_err}")
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"could not ask fishhawkd"* ]] \
+     && (( ${#rb_lines} == 1 )); then
+    pass "RB-d unreachable daemon: proceeds to the teardown with a one-line reason (fail-open)"
+  else
+    fail "RB-d unreachable (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-e no blocker: proceeds and the guard is SILENT.
+  _rb_run_reload "200 OK" "$RB_EMPTY"
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ -z "$rb_err" ]]; then
+    pass "RB-e empty items: teardown reached, guard silent"
+  else
+    fail "RB-e empty items (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-f a daemon older than the route answers 404: fail-open naming the status.
+  _rb_run_reload "404 Not Found" '{"error":{"code":"not_found"}}'
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"HTTP 404"* && "$rb_err" == *predates* ]] \
+     && [[ "$rb_err" != *"command failed"* ]]; then
+    pass "RB-f HTTP 404 (old daemon): proceeds, naming 'HTTP 404' and the predates-the-route hint"
+  else
+    fail "RB-f 404 (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-g a 200 with no items array: fail-open.
+  _rb_run_reload "200 OK" "$RB_MALFORMED"
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"no items array"* ]] && [[ "$rb_err" != *"command failed"* ]]; then
+    pass "RB-g malformed 200: proceeds with a one-line reason (fail-open)"
+  else
+    fail "RB-g malformed (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-h an item the parser cannot read is still a blocker.
+  _rb_run_reload "200 OK" "$RB_UNREADABLE"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *"could not read"* ]]; then
+    pass "RB-h unparseable item: cmd_reload refuses (an unreadable blocker still blocks)"
+  else
+    fail "RB-h unreadable item (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-i a truncated scan warns and (with no item) proceeds.
+  _rb_run_reload "200 OK" "$RB_TRUNCATED"
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *truncated* ]]; then
+    pass "RB-i truncated scan: proceeds with a warning naming the cap"
+  else
+    fail "RB-i truncated (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-j curl absent: fail-open, even though the responder would have served a
+  # blocker had the guard reached it.
+  _rb_run_reload nocurl "$RB_CHILD"
+  rb_lines=("${(@f)rb_err}")
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"could not ask fishhawkd"* ]] \
+     && (( ${#rb_lines} == 1 )); then
+    pass "RB-j curl absent: proceeds with a one-line reason (fail-open)"
+  else
+    fail "RB-j curl absent (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-l post-merge refuses BEFORE git, cleanup-merged and reload.
+  _rb_run_post_merge "200 OK" "$RB_CHILD"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_git" && ! -f "$rb_clean" && ! -f "$rb_reload" ]] && [[ "$rb_err" == *rb-child-1* ]]; then
+    pass "RB-l cmd_post_merge with a blocker refuses BEFORE git checkout/pull, cleanup-merged and reload"
+  else
+    fail "RB-l post-merge refusal (rc=${rb_rc} git=$(_rb_m "$rb_git") cleanup=$(_rb_m "$rb_clean") reload=$(_rb_m "$rb_reload") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  # RB-l control: no blocker lets the whole walk run.
+  _rb_run_post_merge "200 OK" "$RB_EMPTY"
+  if (( rb_rc == 0 )) && [[ -f "$rb_git" && -f "$rb_clean" && -f "$rb_reload" ]]; then
+    pass "RB-l control: with no blocker cmd_post_merge runs its whole walk"
+  else
+    fail "RB-l post-merge control (rc=${rb_rc} git=$(_rb_m "$rb_git") cleanup=$(_rb_m "$rb_clean") reload=$(_rb_m "$rb_reload") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+fi
+
+# RB-k the cross-boundary seam: _parse_restart_blockers reads the SAME wire
+# golden the backend's TestRestartBlockers_EndToEnd_Golden pins byte-for-byte,
+# so a field rename on either side fails one of the two.
+rb_golden="$(_parse_restart_blockers < "${REPO_ROOT}/testdata/wire/restart_blockers.json")"
+rb_want="00000000-0000-4000-8000-000000000001"$'\t'"undispatched_child"$'\t'"implement"$'\t'"00000000-0000-4000-8000-000000000002"
+rb_want+=$'\n'"00000000-0000-4000-8000-000000000004"$'\t'"review_in_flight"$'\t'"plan"$'\t'
+rb_want+=$'\n'"00000000-0000-4000-8000-000000000005"$'\t'"check_failed"$'\t'"implement"$'\t'
+if [[ "$rb_golden" == "$rb_want" ]]; then
+  pass "RB-k _parse_restart_blockers reads the shared Go wire golden (testdata/wire/restart_blockers.json)"
+else
+  fail "RB-k parser vs wire golden (got: ${rb_golden})"
+fi
+
+# RB-k table: indentation, key order and whitespace are not load-bearing; a
+# missing items array is rc 3; unreadable content is an `unreadable` record.
+# <label>|<body>|<expected rc>|<expected records, \t and \n as literal escapes>
+typeset -a rb_rows
+rb_rows=(
+  'indented + reordered keys|{\n  "truncated": false,\n  "items": [\n    {\n      "stage": "plan",\n      "landed": 0,\n      "reason": "review_in_flight",\n      "run_id": "r1"\n    }\n  ]\n}|0|r1\treview_in_flight\tplan\t'
+  'parent before run_id|{"items":[{"parent_run_id":"p1","reason":"undispatched_child","run_id":"c1","stage":"implement"}]}|0|c1\tundispatched_child\timplement\tp1'
+  'two items|{"items":[ {"run_id":"a","reason":"check_failed","stage":"plan"} , {"run_id":"b","reason":"check_failed","stage":"implement"} ]}|0|a\tcheck_failed\tplan\t\nb\tcheck_failed\timplement\t'
+  'empty items|{"items":[],"truncated":false}|0|'
+  'no items array|{"error":{"code":"x"}}|3|'
+  'object missing run_id|{"items":[{"reason":"review_in_flight","stage":"plan"}]}|0|?\tunreadable\tplan\t'
+  'non-object item|{"items":[1]}|0|?\tunreadable\t?\t'
+)
+for rb_row in "${rb_rows[@]}"; do
+  rb_label="${rb_row%%|*}"; rb_rest="${rb_row#*|}"
+  rb_body="${rb_rest%%|*}"; rb_rest="${rb_rest#*|}"
+  rb_wrc="${rb_rest%%|*}"; rb_wrec="${rb_rest#*|}"
+  rb_got="$(print -- "$rb_body" | _parse_restart_blockers)"
+  rb_grc=$?
+  if (( rb_grc == rb_wrc )) && [[ "$rb_got" == "$(print -- "$rb_wrec")" ]]; then
+    pass "RB-k parser: ${rb_label}"
+  else
+    fail "RB-k parser: ${rb_label} (rc=${rb_grc} want ${rb_wrc}; got: ${rb_got})"
+  fi
+done
+
+# RB-m body pins: both call sites in a TESTED context, structurally BEFORE the
+# teardown / git walk; the GET is bounded by --max-time (pinned by grep only —
+# a live hang fixture would cost the 5s per run); query and refusal stay
+# separately callable (approval condition C5, #4077).
+rb_reload_body="$(typeset -f cmd_reload)"
+rb_pm_body="$(typeset -f cmd_post_merge)"
+if print -r -- "$rb_reload_body" | grep -q 'if ! _refuse_on_restart_blockers' \
+   && print -r -- "$rb_pm_body" | grep -q 'if ! _refuse_on_restart_blockers'; then
+  pass "RB-m both cmd_reload and cmd_post_merge call _refuse_on_restart_blockers in a tested context"
+else
+  fail "RB-m call sites must be 'if ! _refuse_on_restart_blockers' in cmd_reload and cmd_post_merge"
+fi
+rb_guard_at="$(print -r -- "$rb_reload_body" | grep -n '_refuse_on_restart_blockers' | head -n 1 | cut -d: -f1)"
+rb_down_at="$(print -r -- "$rb_reload_body" | grep -n 'cmd_down' | head -n 1 | cut -d: -f1)"
+rb_pm_guard_at="$(print -r -- "$rb_pm_body" | grep -n '_refuse_on_restart_blockers' | head -n 1 | cut -d: -f1)"
+rb_pm_git_at="$(print -r -- "$rb_pm_body" | grep -n 'git checkout main' | head -n 1 | cut -d: -f1)"
+if [[ -n "$rb_guard_at" && -n "$rb_down_at" && -n "$rb_pm_guard_at" && -n "$rb_pm_git_at" ]] \
+   && (( rb_guard_at < rb_down_at && rb_pm_guard_at < rb_pm_git_at )); then
+  pass "RB-m the guard runs BEFORE cmd_down (reload) and BEFORE 'git checkout main' (post-merge)"
+else
+  fail "RB-m guard ordering (reload guard=${rb_guard_at} down=${rb_down_at}; post-merge guard=${rb_pm_guard_at} git=${rb_pm_git_at})"
+fi
+if typeset -f _fetch_restart_blockers | grep -q -- '--max-time 5'; then
+  pass "RB-m _fetch_restart_blockers bounds the GET with curl --max-time 5"
+else
+  fail "RB-m _fetch_restart_blockers should pass --max-time 5 to curl"
+fi
+rb_ctl_body="$(typeset -f _refuse_on_restart_blockers)"
+if [[ "$rb_ctl_body" == *_fetch_restart_blockers* && "$rb_ctl_body" == *_parse_restart_blockers* ]] \
+   && (( ${+functions[_fetch_restart_blockers]} && ${+functions[_parse_restart_blockers]} )); then
+  pass "RB-m the blocker query (_fetch/_parse) and the refusal are separately callable functions"
+else
+  fail "RB-m _refuse_on_restart_blockers should compose _fetch_restart_blockers and _parse_restart_blockers"
+fi
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then

@@ -6115,6 +6115,46 @@ components:
           type: string
           format: date-time
 
+    RestartBlockerList:
+      type: object
+      description: GET /v0/restart-blockers body (E83.30 / #3974).
+      required: [items, scanned_runs, truncated]
+      properties:
+        items:
+          type: array
+          description: Sorted by `run_id`, then `reason`, then `stage`. Empty means no blocker was found.
+          items: { $ref: '#/components/schemas/RestartBlocker' }
+        scanned_runs:
+          type: integer
+          description: Non-terminal runs examined after account and repo narrowing.
+        truncated:
+          type: boolean
+          description: The candidate-run scan hit its 500-run cap; runs past it were not checked.
+    RestartBlocker:
+      type: object
+      required: [run_id, reason, stage]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        reason:
+          type: string
+          enum: [undispatched_child, review_in_flight, check_failed]
+        stage:
+          type: string
+          enum: [plan, implement]
+        parent_run_id:
+          type: string
+          format: uuid
+          description: '`undispatched_child` only — the decomposition parent run.'
+        stage_state:
+          type: string
+          enum: [pending, awaiting_host_dispatch]
+          description: '`undispatched_child` only — the child implement stage state.'
+        configured_agents:
+          type: integer
+          description: '`review_in_flight` only — reviewers configured on the current round.'
+        landed:
+          type: integer
+          description: '`review_in_flight` only — verdicts landed after the current round started.'
     AttentionList:
       type: object
       description: GET /v0/attention body (E40.1 / #1713).
@@ -15646,6 +15686,69 @@ paths:
         '503':
           description: |
             `run_repo_unconfigured` — no run repository on this instance; or
+            `service_unavailable` — repo visibility could not be resolved
+            (#2071), so no partially-narrowed page is returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/restart-blockers:
+    get:
+      operationId: listRestartBlockers
+      summary: Work a daemon restart would orphan right now
+      description: |
+        E83.30 / #3974. Answers one question for `scripts/dev reload` and
+        `scripts/dev post-merge`: would restarting THIS fishhawkd orphan work?
+        A read-only PROJECTION of already-recorded state: it writes nothing
+        and mints no audit entry. Scans the non-terminal runs (`pending` +
+        `running`, the set the orphaned-review boot sweep pages) and reports
+        one item per blocker:
+
+        - `undispatched_child` — a decomposition child whose `implement`
+          stage is still `pending` or `awaiting_host_dispatch`. Carries
+          `parent_run_id` and `stage_state`.
+        - `review_in_flight` — a `plan` or `implement` review round whose
+          latest `*_review_started` entry was written by THIS process (at or
+          after its boot marker) and has fewer verdicts landed after it than
+          `configured_agents`. The in-process reviewer dies with the daemon.
+          A round an EARLIER process dispatched is NOT a blocker: the next
+          boot sweep (#1781 / #2712) closes it. Carries `configured_agents`
+          and `landed`.
+        - `check_failed` — a per-run stage or audit read failed, so the daemon
+          could not decide that run's state. `scripts/dev` treats it as a
+          REFUSING blocker.
+
+        Items carry only ids, enum slugs and counts — no free text — sorted by
+        `run_id`, then `reason`, then `stage`.
+
+        **Bounded scan.** At most 500 non-terminal runs (oldest first) are
+        scanned; a bite sets `truncated: true` and the runs past the cap were
+        not checked.
+
+        **Auth and narrowing.** Mirrors `GET /v0/runs`: anonymous callers are
+        accepted (no scope check — `scripts/dev` calls it with no token), the
+        caller's workspace account bounds the scan, and for a non-admin
+        cookie-session caller rows are narrowed to repositories the caller can
+        read at the forge (ADR-057 Amendment A2 / #2071). It exposes nothing
+        beyond what anonymous `GET /v0/runs` and `GET /v0/runs/{run_id}/stages`
+        already serve. A repo-visibility fault fails the WHOLE request closed
+        (503).
+      tags: [runs]
+      responses:
+        '200':
+          description: The blocker inventory (empty `items` = safe to restart).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestartBlockerList' }
+        '500':
+          description: '`internal_error` — the candidate-run scan failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `run_repo_unconfigured` / `audit_repo_unconfigured` — the run or
+            audit repository is not configured on this instance; or
             `service_unavailable` — repo visibility could not be resolved
             (#2071), so no partially-narrowed page is returned.
           content:

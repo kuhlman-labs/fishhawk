@@ -115,6 +115,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Cross-run attention queue (E40.1 / #1713): account-scoped, non-run-scoped
 	// read — narrowing is inside the handler, like GET /v0/runs.
 	mux.HandleFunc("GET /v0/attention", s.handleListAttention)
+	// Restart blockers (E83.30 / #3974): read-only, non-run-scoped; anonymous
+	// accepted like GET /v0/runs, so scripts/dev reload/post-merge can ask it
+	// with no token. Narrowing is inside the handler.
+	mux.HandleFunc("GET /v0/restart-blockers", s.handleListRestartBlockers)
 	// "Since you last looked" digest (E75.6 / #3734): GET never writes;
 	// mark-read appends digest_marked_read BEFORE advancing the watermark.
 	mux.HandleFunc("GET /v0/digest", s.handleGetDigest)

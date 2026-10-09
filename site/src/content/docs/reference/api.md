@@ -95,7 +95,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **162 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **163 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -165,6 +165,7 @@ The v0 REST API exposes **162 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/status-comment` | Record the GitHub comment ID after posting the sticky comment |
 | `GET` | `/v0/audit` | Search the cross-chain audit log |
 | `GET` | `/v0/attention` | Cross-run attention queue ("Needs You") |
+| `GET` | `/v0/restart-blockers` | Work a daemon restart would orphan right now |
 | `GET` | `/v0/digest` | "Since you last looked" digest for one repository |
 | `POST` | `/v0/digest/mark-read` | Advance the caller's digest read watermark |
 | `GET` | `/v0/handover-brief` | Handover brief for one repository |
