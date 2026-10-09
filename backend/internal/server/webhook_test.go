@@ -441,3 +441,60 @@ func TestIsIssueClosedDelivery_ForgeVocabulary(t *testing.T) {
 		})
 	}
 }
+
+// TestWebhook_PullRequestReopenedRoutesToRevive is the CROSS-BOUNDARY routing
+// test for the PR-reopen revive (#4082): a signed `pull_request` delivery to
+// the REAL POST /webhooks/github route, over a run its PR close cancelled
+// (pullrequest_reopen_test.go's all-guards-pass baseline). `reopened` must
+// reach handlePullRequestReopened and revive the run; `edited` / `labeled`
+// must not. Counterfactual: delete the reopened routing line in webhook.go and
+// the reopened row observes no revive (RED).
+func TestWebhook_PullRequestReopenedRoutesToRevive(t *testing.T) {
+	for i, tc := range []struct {
+		action     string
+		wantRevive bool
+	}{
+		{"reopened", true},
+		{"edited", false},
+		{"labeled", false},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			f := baselineReopenFixture()
+			s, rr, ar := f.build(t)
+			body, err := json.Marshal(map[string]any{
+				"action":       tc.action,
+				"repository":   map[string]any{"full_name": "x/y"},
+				"sender":       map[string]any{"login": "bob"},
+				"installation": map[string]any{"id": 99},
+				"pull_request": map[string]any{
+					"html_url": reopenTestPRURL, "number": 42, "head": map[string]any{"sha": f.reopenHead},
+				},
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			w := postWebhook(t, s, map[string]string{
+				"X-GitHub-Event":      "pull_request",
+				"X-GitHub-Delivery":   fmt.Sprintf("00000000-0000-0000-0000-0000000041%02d", i),
+				"X-Hub-Signature-256": sign(body),
+				"Content-Type":        "application/json",
+			}, body)
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+			}
+			rr.mu.Lock()
+			calls, runState := len(rr.revives), rr.listResult[0].State
+			rr.mu.Unlock()
+			revived := len(appendedOf(ar, CategoryRunRevivedOnReopen)) == 1
+			if tc.wantRevive {
+				if calls != 1 || runState != "running" || !revived {
+					t.Fatalf("action %q: revive calls = %d, run = %s, revived row = %v; want 1, running, true", tc.action, calls, runState, revived)
+				}
+				return
+			}
+			if calls != 0 || runState != "cancelled" || len(appendedOf(ar, CategoryRunReviveOnReopenRefused)) != 0 || revived {
+				t.Fatalf("action %q reached the reopen handler: revive calls = %d, run = %s", tc.action, calls, runState)
+			}
+		})
+	}
+}

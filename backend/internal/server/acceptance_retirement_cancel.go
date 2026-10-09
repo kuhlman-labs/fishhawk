@@ -81,8 +81,12 @@ func (s *Server) OnRunCancelled(ctx context.Context, runID uuid.UUID, source str
 // Terminal-FAILED runs are deliberately NOT hooked: `failed` is not absorbing
 // (runRetryTransitions failed→running via revive/redrive), so a row at
 // failure would be a false report once the run is revived and its acceptance
-// stage persists the retirement. `cancelled` IS absorbing (no retry edge
-// leaves it), so a row recorded here can never be contradicted later.
+// stage persists the retirement. `cancelled` has no RETRY edge out of it; its
+// ONLY exit is the PR-reopen revive (#4082, run.RunReopenReviver), and that
+// revive's guard (g) in handlePullRequestReopened (pullrequest_reopen.go)
+// refuses whenever this writer recorded a cancelSourceStageCancelled row at or
+// after the PR close that cancelled the run. So a row recorded here is still
+// never contradicted later.
 func (s *Server) recordAcceptanceRetirementsDroppedOnCancel(ctx context.Context, runID uuid.UUID, cancelSource string) {
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
 		return

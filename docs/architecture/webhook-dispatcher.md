@@ -40,7 +40,7 @@ Implementation: `backend/internal/webhook/dispatcher.go` (`MatchEvent` pure + `D
 
 ## PR closed without merging
 
-(#316) Transitions the review stage to `cancelled` + writes a `pr_closed_without_merge` audit row naming the closer from `sender.login`. The run-level state cascades to `cancelled` once every stage is terminal (existing state-machine behavior). Reopen is intentionally out of scope — terminal stages don't resurrect; the reviewer re-triggers via `/fishhawk run` and the new run threads off the cancelled parent via `parent_run_id`. Plan-stage approval flow (#238) unchanged; the review stage is now a read-only summary of PR-side activity. App manifest adds `pull_request_review` to default events.
+(#316) Transitions the review stage to `cancelled` + writes a `pr_closed_without_merge` audit row naming the closer from `sender.login`. The run-level state cascades to `cancelled` once every stage is terminal (existing state-machine behavior). A GitHub reopen of the PR revives the run (#4082): within 10 minutes of the close that cancelled it, at the same head, it re-parks the review stage at `awaiting_approval` and the run at `running` (`server/pullrequest_reopen.go`); GitHub only, since the GitLab MR reopen is not routed to it. Past the window, at a moved head, or on any refused guard the run stays cancelled and the recovery is a new run (`/fishhawk run` or `fishhawk_start_run`), which threads off the cancelled parent via `parent_run_id`. Contract and guards: `backend/internal/server/README.md` § "PR-reopen revive". Plan-stage approval flow (#238) unchanged; the review stage is now a read-only summary of PR-side activity. App manifest adds `pull_request_review` to default events.
 
 ## In-Fishhawk approval prune
 

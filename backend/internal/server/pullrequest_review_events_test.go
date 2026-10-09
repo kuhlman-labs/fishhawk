@@ -67,6 +67,12 @@ type prEventsRunRepo struct {
 	// (zero audit rows) and never on a fixture-setup failure. Mirrors
 	// run.casMemRepo's hook in failure_test.go.
 	beforeCAS func(id uuid.UUID)
+
+	// revives records every ReviveRunOnReopen call (#4082) as the review stage
+	// id passed, whether or not it applied; reviveErr, when set, is returned
+	// before any precondition is evaluated (an infrastructure failure).
+	revives   []uuid.UUID
+	reviveErr error
 }
 
 type prEventsTransition struct {
@@ -253,6 +259,69 @@ func (r *prEventsRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, f
 	r.transitions = append(r.transitions, prEventsTransition{StageID: id, To: to})
 	return &run.Stage{ID: id, State: to}, nil
 }
+
+// ReviveRunOnReopen models run.RunReopenReviver (#4082) with the SAME
+// preconditions as the postgres method, evaluated before any write: the stage
+// must belong to runID, ValidStageReopenTransition(type, current, awaiting_
+// approval) must hold, and ValidRunReopenTransition(run state, running) must
+// hold — otherwise it refuses wrapping run.ErrReopenNotApplicable and changes
+// nothing. On success it re-parks the stage and reopens the run, so a later
+// ListStagesForRun / GetRun reads the revived state.
+func (r *prEventsRunRepo) ReviveRunOnReopen(_ context.Context, runID, reviewStageID uuid.UUID) (*run.Run, *run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.revives = append(r.revives, reviewStageID)
+	if r.reviveErr != nil {
+		return nil, nil, r.reviveErr
+	}
+	var stage *run.Stage
+	for _, sts := range r.stages {
+		for _, st := range sts {
+			if st.ID == reviewStageID {
+				stage = st
+			}
+		}
+	}
+	if stage == nil {
+		return nil, nil, run.ErrNotFound
+	}
+	if stage.RunID != runID {
+		return nil, nil, fmt.Errorf("%w: stage %s belongs to run %s", run.ErrReopenNotApplicable, reviewStageID, stage.RunID)
+	}
+	cur := stage.State
+	if c, ok := r.curState[reviewStageID]; ok {
+		cur = c
+	}
+	if !run.ValidStageReopenTransition(stage.Type, cur, run.StageStateAwaitingApproval) {
+		return nil, nil, fmt.Errorf("%w: %s stage is %s", run.ErrReopenNotApplicable, stage.Type, cur)
+	}
+	var target *run.Run
+	for _, rn := range r.listResult {
+		if rn.ID == runID {
+			target = rn
+		}
+	}
+	if target == nil {
+		return nil, nil, run.ErrNotFound
+	}
+	if !run.ValidRunReopenTransition(target.State, run.StateRunning) {
+		return nil, nil, fmt.Errorf("%w: run is %s", run.ErrReopenNotApplicable, target.State)
+	}
+	if r.curState == nil {
+		r.curState = map[uuid.UUID]run.StageState{}
+	}
+	if r.runStates == nil {
+		r.runStates = map[uuid.UUID]run.State{}
+	}
+	r.curState[reviewStageID] = run.StageStateAwaitingApproval
+	target.State = run.StateRunning
+	r.runStates[runID] = run.StateRunning
+	revivedStage := *stage
+	revivedStage.State = run.StageStateAwaitingApproval
+	return target, &revivedStage, nil
+}
+
+var _ run.RunReopenReviver = (*prEventsRunRepo)(nil)
 
 // compile-time proof that the fake carries the capability the sweep requires.
 // Without it supersedeParkedStagesOnMerge warn-logs and sweeps NOTHING, so
@@ -474,6 +543,16 @@ func TestPullRequestClosed_NotMerged_CancelsReviewStageAndAudits(t *testing.T) {
 	}
 	if body["head_sha"] != "headsha" || body["closer"] != "alice" {
 		t.Errorf("audit payload missing expected fields: %+v", body)
+	}
+	// #4082: the close row records what the close found, for the reopen
+	// revive's guards. The run fixture carries no State, so the field is the
+	// empty string; TestPullRequestClosed_NotMerged_RecordsStatesAtClose
+	// pins the populated shape.
+	if body["review_state_at_close"] != string(run.StageStateAwaitingApproval) {
+		t.Errorf("review_state_at_close = %v, want awaiting_approval", body["review_state_at_close"])
+	}
+	if _, ok := body["run_state_at_close"]; !ok {
+		t.Errorf("run_state_at_close missing from the close payload: %+v", body)
 	}
 	// No pr_merged row written.
 	if findCategory(ar.appended, CategoryPRMerged) != nil {
@@ -2272,4 +2351,80 @@ func TestResolveReviewStageOnMerge_SweepsRunBranches(t *testing.T) {
 	if len(row.Deleted) != 0 || len(row.Errors) != 0 || !reflect.DeepEqual(row.AlreadyAbsent, want) {
 		t.Errorf("redelivered run_branches_swept = %+v, want every ref already_absent", row)
 	}
+}
+
+// --- PR-reopen revive inputs on the close row (#4082) ---
+
+// closeRowStates decodes run_state_at_close / review_state_at_close off the
+// single pr_closed_without_merge row.
+func closeRowStates(t *testing.T, ar *prEventsAuditRepo) (runState, reviewState any) {
+	t.Helper()
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+	if n := countCategory(ar.appended, CategoryPRClosedWithoutMerge); n != 1 {
+		t.Fatalf("pr_closed_without_merge rows = %d, want 1; got %v", n, auditCategories(ar.appended))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(findCategory(ar.appended, CategoryPRClosedWithoutMerge).Payload, &body); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	return body["run_state_at_close"], body["review_state_at_close"]
+}
+
+// TestPullRequestClosed_NotMerged_RecordsStatesAtClose pins the two additive
+// close-row fields on BOTH resolution surfaces: the webhook and the
+// merge-reconciler poll each record the run's state when the close was handled
+// (running, BEFORE the close's Advance cancels it) and the review stage's state
+// before its cancel transition (awaiting_approval). A run with no review stage
+// records an empty review_state_at_close. Counterfactual: drop either field
+// from writePRClosedWithoutMergeAudit's payload and the matching assertion goes
+// RED (and the reopen revive refuses close_did_not_cancel_run end to end,
+// TestPullRequestReopen_PG_CloseReopenMerge).
+func TestPullRequestClosed_NotMerged_RecordsStatesAtClose(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	seed := func(withReview bool) (*prEventsRunRepo, uuid.UUID) {
+		runID := uuid.New()
+		stages := []*run.Stage{{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}}
+		if withReview {
+			stages = append(stages, &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval})
+		}
+		return &prEventsRunRepo{
+			listResult: []*run.Run{{ID: runID, State: run.StateRunning, PullRequestURL: &prURL}},
+			stages:     map[uuid.UUID][]*run.Stage{runID: stages},
+		}, runID
+	}
+	closedPayload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{"html_url": prURL, "merged": false, "head": map[string]any{"sha": "aaa"}},
+		"sender":       map[string]any{"login": "alice"},
+	})
+
+	t.Run("webhook", func(t *testing.T) {
+		rr, _ := seed(true)
+		ar := &prEventsAuditRepo{}
+		prEventsTestServer(t, rr, ar).handlePullRequestClosed(context.Background(), closedPayload)
+		runState, reviewState := closeRowStates(t, ar)
+		if runState != string(run.StateRunning) || reviewState != string(run.StageStateAwaitingApproval) {
+			t.Errorf("states at close = (%v, %v), want (running, awaiting_approval)", runState, reviewState)
+		}
+	})
+	t.Run("poll", func(t *testing.T) {
+		rr, runID := seed(true)
+		ar := &prEventsAuditRepo{}
+		if err := prEventsTestServer(t, rr, ar).ResolveReviewFromPollState(context.Background(), runID, false, prURL); err != nil {
+			t.Fatalf("ResolveReviewFromPollState: %v", err)
+		}
+		runState, reviewState := closeRowStates(t, ar)
+		if runState != string(run.StateRunning) || reviewState != string(run.StageStateAwaitingApproval) {
+			t.Errorf("states at close = (%v, %v), want (running, awaiting_approval)", runState, reviewState)
+		}
+	})
+	t.Run("no_review_stage", func(t *testing.T) {
+		rr, _ := seed(false)
+		ar := &prEventsAuditRepo{}
+		prEventsTestServer(t, rr, ar).handlePullRequestClosed(context.Background(), closedPayload)
+		runState, reviewState := closeRowStates(t, ar)
+		if runState != string(run.StateRunning) || reviewState != "" {
+			t.Errorf("states at close = (%v, %v), want (running, \"\")", runState, reviewState)
+		}
+	})
 }
