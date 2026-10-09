@@ -53,14 +53,25 @@ func ValidRunTransition(from, to State) bool {
 //
 // `succeeded` IS DELIBERATELY ABSENT FROM THIS TABLE, and its absence is
 // LOAD-BEARING FOR A DOWNSTREAM READER (#2586). runs.state is written by
-// exactly one query (UpdateRunState, queries.sql), reached by exactly two
+// exactly one query (UpdateRunState, queries.sql), reached by exactly three
 // repository methods — postgresRepo.TransitionRun (gated by
 // ValidRunTransition, which returns false for any terminal `from`, and
-// State.IsTerminal() includes StateSucceeded) and postgresRepo.RetryRun
-// (gated by ValidRunRetryTransition, i.e. this table) — each inside a
-// SELECT ... FOR UPDATE transaction; ReviveRun refuses any non-failed run
-// outright (revive.go), and there is no run-deletion path. Together those
-// make run state `succeeded` ABSORBING: no code path moves a run out of it.
+// State.IsTerminal() includes StateSucceeded), postgresRepo.RetryRun
+// (gated by ValidRunRetryTransition, i.e. this table) and
+// postgresRepo.ReviveRunOnReopen (gated by ValidRunReopenTransition, i.e.
+// runReopenTransitions below, which admits only cancelled → running, #4082)
+// — each inside a SELECT ... FOR UPDATE transaction; ReviveRun refuses any
+// non-failed run outright (revive.go), and there is no run-deletion path.
+// Together those make run state `succeeded` ABSORBING: no code path moves a
+// run out of it.
+//
+// `cancelled` is terminal for every ordinary path too (no key here, and
+// ValidRunTransition refuses a terminal `from`), but it is NOT absorbing:
+// it leaves through exactly one edge, cancelled → running, and only via the
+// PR-reopen revive capability (RunReopenReviver.ReviveRunOnReopen, #4082).
+// That edge lives in its own table, runReopenTransitions, which nothing but
+// that capability consults — it is deliberately NOT added here, so RetryRun
+// and the redrive verb keep refusing a cancelled run.
 //
 // server.guardDecompositionWaveOrder (#2546) depends on that. It snapshots
 // a decomposed child's SIBLING run states with ListRuns and then CASes a
@@ -92,6 +103,71 @@ var runRetryTransitions = map[State]map[State]struct{}{
 func ValidRunRetryTransition(from, to State) bool {
 	_, ok := runRetryTransitions[from][to]
 	return ok
+}
+
+// runReopenTransitions is the run half of the PR-reopen revive (#4082): a
+// run whose PR close cancelled it is reopened cancelled → running when the
+// PR is reopened quickly at an unchanged head. It is a SEPARATE table from
+// runTransitions and runRetryTransitions, consulted ONLY by the
+// RunReopenReviver capability (postgresRepo.ReviveRunOnReopen), so
+// TransitionRun, RetryRun and the redrive verb keep refusing the edge. The
+// server-side guards that decide WHEN a reopen is a revive (window, head,
+// the close having cancelled a running run) live in the caller; this table
+// only decides WHICH state pair the repository will write.
+//
+// `succeeded` has NO key here and must never get one: an out-of-succeeded
+// edge would re-open the #2586 wave-order guard window described above
+// runRetryTransitions. TestRunSucceededIsAbsorbing reads this table
+// white-box for exactly that reason.
+var runReopenTransitions = map[State]map[State]struct{}{
+	StateCancelled: {
+		StateRunning: {},
+	},
+}
+
+// ValidRunReopenTransition reports whether a run in `from` may be reopened
+// into `to` by the PR-reopen revive. There is no idempotent same-state
+// shortcut: a run already `running` is not a revive candidate.
+func ValidRunReopenTransition(from, to State) bool {
+	_, ok := runReopenTransitions[from][to]
+	return ok
+}
+
+// stageReopenPair is one row of the stage half of the PR-reopen revive
+// table: the stage type and from-state the revive may re-park. It is a PAIR,
+// like stageMergeSupersedePair, because the edge is type-dependent — only
+// the review gate the PR close dissolved is re-parked.
+type stageReopenPair struct {
+	StageType StageType
+	From      StageState
+	To        StageState
+}
+
+// stageReopenTransitions is the DEFAULT-DENY stage table for the PR-reopen
+// revive (#4082). Exactly one row: a REVIEW stage cancelled by a PR close is
+// re-parked at its approval gate (cancelled → awaiting_approval). A
+// cancelled plan, implement, acceptance or deploy stage is never re-opened
+// by a reopen — none of them was parked at a gate the close dissolved.
+//
+// Separate from every other stage table and consulted by nothing except
+// RunReopenReviver.ReviveRunOnReopen: it is deliberately NOT in the
+// transitionStageTx union (postgres.go), so TransitionStage, RetryStage and
+// the CAS siblings keep refusing cancelled → awaiting_approval.
+var stageReopenTransitions = []stageReopenPair{
+	{StageType: StageTypeReview, From: StageStateCancelled, To: StageStateAwaitingApproval},
+}
+
+// ValidStageReopenTransition reports whether a stage of stageType may move
+// from→to via the PR-reopen revive. The stageType comparison is
+// load-bearing: without it a cancelled implement stage could be flipped to
+// awaiting_approval, a gate that stage type never parks at through a PR.
+func ValidStageReopenTransition(stageType StageType, from, to StageState) bool {
+	for _, p := range stageReopenTransitions {
+		if p.StageType == stageType && p.From == from && p.To == to {
+			return true
+		}
+	}
+	return false
 }
 
 // stageTransitions enumerates allowed Stage state transitions.
