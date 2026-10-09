@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 // TestFrameReaderLargeFrameNoTruncation pins that the newline-delimited framing
@@ -181,6 +183,29 @@ func TestStatusRendersSupervisorPublishedState(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("--status perturbed the state dir: %v", entries)
+	}
+}
+
+// TestRunVersionFlag pins the shim's --version surface (#4117): it prints
+// version.String() and exits OK, spawning no child (the --child path does not
+// exist, so a spawn would fail fast) and writing no state file.
+func TestRunVersionFlag(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	var out, errOut bytes.Buffer
+	rc := run([]string{
+		"fishhawk-mcp-shim", "--version",
+		"--state-dir", stateDir,
+		"--child", filepath.Join(dir, "definitely-not-here"),
+	}, strings.NewReader(""), &out, &errOut)
+	if rc != exitOK {
+		t.Fatalf("run(--version) = %d, want %d (stderr: %s)", rc, exitOK, errOut.String())
+	}
+	if got, want := out.String(), version.String()+"\n"; got != want {
+		t.Errorf("run(--version) stdout = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Errorf("--version must not create the state dir; stat err = %v", err)
 	}
 }
 

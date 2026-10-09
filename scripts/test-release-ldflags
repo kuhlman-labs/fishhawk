@@ -1,0 +1,264 @@
+#!/bin/sh
+# Hermetic harness for scripts/release-ldflags, the one source of every Fishhawk
+# binary's `-X` Version/GitSHA stamping pairs (E74.8 / #4117).
+#
+# POSIX sh on purpose, like the helper it pins: it runs unchanged in the
+# dash-based gate image, where there is no zsh. Run by `scripts/test verify`
+# (via _verify_gate_harnesses) and runnable standalone. It builds only into a
+# mktemp dir removed on exit and never writes to the tree.
+#
+#   r1  `sh -n` parses the helper.
+#   r2  /bin/sh output is byte-exact against INDEPENDENT literals, for every
+#       component x {40-char SHA, short SHA}: pins each package path and the
+#       verbatim SHA pass-through (a truncation reddens the 40-char case only).
+#   r3  dash output is byte-identical to /bin/sh for every component (SKIP with
+#       a reason when dash is absent). macOS /bin/sh is bash 3.2 in POSIX mode,
+#       which ACCEPTS `[[`, so r2 alone cannot catch that class there.
+#   r4  a bash/zsh-construct denylist over the helper (comment lines stripped),
+#       with an anti-vacuity self-check that every pattern fires on a sample.
+#   r5  one case per refusal: wrong arg count (2 and 4), unknown component,
+#       empty version/sha, whitespace (space, tab), quotes (single, double)
+#       and a backslash — each non-zero, EMPTY stdout, named stderr text.
+#   r6  each mapped package's version.go declares `var Version` + `var GitSHA`
+#       (an -X on an undeclared var is a SILENT link no-op).
+#   r7  cross-boundary: builds all five binaries with the helper's flags and
+#       reads every version surface back (SKIP with a reason when go is absent).
+#       Prints its wall time.
+#   r8  the stamped fishhawk-mcp's stdio `initialize` handshake advertises
+#       serverInfo.version "<Version>+<GitSHA>" (bounded: killed after ~20s).
+set -u
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+HELPER="$ROOT/scripts/release-ldflags"
+PASS=0
+FAIL=0
+
+pass() { printf 'PASS: %s\n' "$1"; PASS=$((PASS + 1)); }
+fail() { printf 'FAIL: %s\n' "$1"; FAIL=$((FAIL + 1)); }
+skip() { printf 'SKIP: %s\n' "$1"; }
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/test-release-ldflags.XXXXXX") || { echo "test-release-ldflags: mktemp failed" >&2; exit 1; }
+MCP_PID=""
+cleanup() {
+  if [ -n "$MCP_PID" ]; then kill -9 "$MCP_PID" 2>/dev/null; fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM
+
+FULL_SHA=0123456789abcdef0123456789abcdef01234567
+SHORT_SHA=abc1234
+MOD=github.com/kuhlman-labs/fishhawk
+
+# component:package-relative-path — independent of the helper's own `case`.
+COMPONENTS="fishhawkd:backend/internal/version fishhawk-mcp:backend/internal/version fishhawk-mcp-shim:backend/internal/version fishhawk-runner:runner/internal/version fishhawk:cli/internal/version"
+
+# --- r1 ----------------------------------------------------------------------
+if sh -n "$HELPER" 2>"$TMP/r1.err"; then
+  pass "r1 sh -n parses scripts/release-ldflags"
+else
+  fail "r1 sh -n rejects scripts/release-ldflags: $(cat "$TMP/r1.err")"
+fi
+
+# --- r2 ----------------------------------------------------------------------
+for pair in $COMPONENTS; do
+  comp=${pair%%:*}
+  rel=${pair#*:}
+  for sha in "$FULL_SHA" "$SHORT_SHA"; do
+    printf '%s\n' "-X $MOD/$rel.Version=v1.2.3 -X $MOD/$rel.GitSHA=$sha" >"$TMP/want"
+    /bin/sh "$HELPER" "$comp" v1.2.3 "$sha" >"$TMP/got" 2>"$TMP/err"
+    rc=$?
+    if [ "$rc" -eq 0 ] && cmp -s "$TMP/want" "$TMP/got"; then
+      pass "r2 $comp sha=${#sha}-char -> $rel (byte-exact)"
+    else
+      fail "r2 $comp sha=${#sha}-char: rc=$rc want [$(cat "$TMP/want")] got [$(cat "$TMP/got")] stderr [$(cat "$TMP/err")]"
+    fi
+  done
+done
+
+# --- r3 ----------------------------------------------------------------------
+if command -v dash >/dev/null 2>&1; then
+  for pair in $COMPONENTS; do
+    comp=${pair%%:*}
+    /bin/sh "$HELPER" "$comp" v1.2.3 "$FULL_SHA" >"$TMP/sh.out" 2>&1
+    dash "$HELPER" "$comp" v1.2.3 "$FULL_SHA" >"$TMP/dash.out" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ -s "$TMP/dash.out" ] && cmp -s "$TMP/sh.out" "$TMP/dash.out"; then
+      pass "r3 $comp: dash output byte-identical to /bin/sh"
+    else
+      fail "r3 $comp: dash rc=$rc [$(cat "$TMP/dash.out")] vs /bin/sh [$(cat "$TMP/sh.out")]"
+    fi
+  done
+else
+  skip "r3 dash is absent from PATH; the /bin/sh-vs-dash identity check did not run"
+fi
+
+# --- r4 ----------------------------------------------------------------------
+# denylisted <file>: print every non-comment line using a bash/zsh-only construct.
+# `[[`/`]]` exclude a POSIX bracket character class (`[[:space:]]`), which is
+# valid in a sh case pattern.
+denylisted() {
+  grep -v '^[[:space:]]*#' "$1" | grep -nE \
+    -e '\[\[([^:]|$)' -e '(^|[^:])\]\]' \
+    -e '(^|[^[:alnum:]_])typeset([^[:alnum:]_]|$)' \
+    -e '(^|[;&|({[:space:]])local[[:space:]]' \
+    -e '(^|[;&|({[:space:]])print[[:space:]]' \
+    -e '(^|[;&|({[:space:]])function[[:space:]]' \
+    -e '[[:alnum:]_]=\(' \
+    -e '\$\(\(.*(\+\+|--)' \
+    -e '<<<' \
+    -e '\$\{[[:alnum:]_#]*:[AahtrelLuU]'
+}
+# Anti-vacuity: every pattern must fire on a sample, or a broken regex would
+# green the real check below.
+printf '%s\n' \
+  '[[ -n x ]] && y' 'x ]]' 'typeset -A m' '  local v=1' 'print -r -- x' 'function f { :; }' \
+  'arr=(a b)' 'echo $((i++))' 'cat <<< x' 'echo ${0:A:h}' >"$TMP/r4.samples"
+sample_lines=$(wc -l <"$TMP/r4.samples" | tr -d ' ')
+caught_lines=$(denylisted "$TMP/r4.samples" | wc -l | tr -d ' ')
+if [ "$sample_lines" -eq "$caught_lines" ]; then
+  pass "r4 denylist self-check: all $sample_lines construct samples are caught"
+else
+  fail "r4 denylist self-check: caught $caught_lines of $sample_lines samples (a pattern is vacuous)"
+fi
+# ...and POSIX constructs that merely LOOK similar must not be flagged.
+printf '%s\n' '  *[[:space:]]*|*x*) ;;' 'printf "%s\n" x' 'x=$((x + 1))' 'v=${v:-dflt}' >"$TMP/r4.posix"
+if posix_hits=$(denylisted "$TMP/r4.posix") && [ -n "$posix_hits" ]; then
+  fail "r4 denylist self-check: POSIX constructs wrongly flagged: $posix_hits"
+else
+  pass "r4 denylist self-check: POSIX look-alikes are not flagged"
+fi
+if hits=$(denylisted "$HELPER") && [ -n "$hits" ]; then
+  fail "r4 scripts/release-ldflags uses bash/zsh-only constructs: $hits"
+else
+  pass "r4 scripts/release-ldflags uses no denylisted bash/zsh-only construct"
+fi
+
+# --- r5 ----------------------------------------------------------------------
+# refuse <label> <stderr-substring> <args...>: the helper must exit non-zero,
+# print NOTHING on stdout, and name the cause on stderr.
+refuse() {
+  label=$1
+  want=$2
+  shift 2
+  /bin/sh "$HELPER" "$@" >"$TMP/r5.out" 2>"$TMP/r5.err"
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -s "$TMP/r5.out" ] && grep -qF -- "$want" "$TMP/r5.err"; then
+    pass "r5 refuses $label (rc=$rc)"
+  else
+    fail "r5 should refuse $label: rc=$rc stdout [$(cat "$TMP/r5.out")] stderr [$(cat "$TMP/r5.err")], want stderr containing [$want]"
+  fi
+}
+refuse "an unknown component" 'unknown component "nope"' nope v1.2.3 "$SHORT_SHA"
+refuse "2 args" 'usage:' fishhawkd v1.2.3
+refuse "4 args" 'usage:' fishhawkd v1.2.3 "$SHORT_SHA" extra
+refuse "an empty version" '<version> must not be empty' fishhawkd '' "$SHORT_SHA"
+refuse "an empty sha" '<git-sha> must not be empty' fishhawkd v1.2.3 ''
+refuse "a space in the version" '<version> must not contain' fishhawkd 'v1.2.3 x' "$SHORT_SHA"
+refuse "a tab in the version" '<version> must not contain' fishhawkd "$(printf 'v1\tx')" "$SHORT_SHA"
+refuse "a double quote in the version" '<version> must not contain' fishhawkd 'v1"x' "$SHORT_SHA"
+refuse "a single quote in the sha" '<git-sha> must not contain' fishhawkd v1.2.3 "abc'1234"
+refuse "a backslash in the sha" '<git-sha> must not contain' fishhawkd v1.2.3 'abc\1234'
+
+# --- r6 ----------------------------------------------------------------------
+for rel in backend/internal/version runner/internal/version cli/internal/version; do
+  if grep -q '^var Version' "$ROOT/$rel/version.go" && grep -q '^var GitSHA' "$ROOT/$rel/version.go"; then
+    pass "r6 $rel/version.go declares var Version and var GitSHA"
+  else
+    fail "r6 $rel/version.go must declare var Version and var GitSHA — an -X on an undeclared var is a silent no-op"
+  fi
+done
+
+# --- r7 + r8 -----------------------------------------------------------------
+if ! command -v go >/dev/null 2>&1; then
+  skip "r7/r8 go is absent from PATH; the build-and-read-back legs did not run"
+else
+  VER=v9.8.7-rl-test
+  BIN="$TMP/bin"
+  mkdir -p "$BIN"
+  r7_start=$(date +%s)
+  built=1
+  for spec in fishhawkd:./backend/cmd/fishhawkd fishhawk-mcp:./backend/cmd/fishhawk-mcp \
+              fishhawk-mcp-shim:./backend/cmd/fishhawk-mcp-shim \
+              fishhawk-runner:./runner/cmd/fishhawk-runner fishhawk:./cli/cmd/fishhawk; do
+    name=${spec%%:*}
+    src=${spec#*:}
+    if ! flags=$(/bin/sh "$HELPER" "$name" "$VER" "$FULL_SHA"); then
+      fail "r7 scripts/release-ldflags $name failed"
+      built=0
+      continue
+    fi
+    if (cd "$ROOT" && go build -trimpath -ldflags "$flags" -o "$BIN/$name" "$src") >"$TMP/build.$name" 2>&1; then
+      :
+    else
+      fail "r7 go build $name failed: $(cat "$TMP/build.$name")"
+      built=0
+    fi
+  done
+  r7_end=$(date +%s)
+  printf 'r7: built five binaries in %ss\n' "$((r7_end - r7_start))"
+
+  if [ "$built" -eq 1 ]; then
+    want="$VER ($FULL_SHA)"
+    # surface <label> <cmd...>: the command's stdout must be exactly $want.
+    surface() {
+      label=$1
+      shift
+      got=$("$@" 2>"$TMP/surface.err")
+      rc=$?
+      if [ "$rc" -eq 0 ] && [ "$got" = "$want" ]; then
+        pass "r7 $label reports the stamped identity"
+      else
+        fail "r7 $label: rc=$rc got [$got] want [$want] stderr [$(cat "$TMP/surface.err")]"
+      fi
+    }
+    surface "fishhawk version" "$BIN/fishhawk" version
+    surface "fishhawkd version" "$BIN/fishhawkd" version
+    surface "fishhawk-mcp --version" "$BIN/fishhawk-mcp" --version
+    surface "fishhawk-mcp-shim --version" "$BIN/fishhawk-mcp-shim" --version
+    runner_out=$("$BIN/fishhawk-runner" version 2>&1)
+    case "$runner_out" in
+      *"\"version\":\"$VER\""*"\"git_sha\":\"$FULL_SHA\""* | *"\"git_sha\":\"$FULL_SHA\""*"\"version\":\"$VER\""*)
+        pass "r7 fishhawk-runner version JSON reports the stamped version and git_sha" ;;
+      *)
+        fail "r7 fishhawk-runner version: got [$runner_out], want \"version\":\"$VER\" and \"git_sha\":\"$FULL_SHA\"" ;;
+    esac
+
+    # r8: hold stdin open on a FIFO until the initialize response lands — a
+    # plain file hits EOF and the server exits before answering.
+    mkfifo "$TMP/mcp.in"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-release-ldflags","version":"0"}}}' >"$TMP/init.json"
+    FISHHAWK_API_TOKEN=x FISHHAWK_BACKEND_URL=http://127.0.0.1:9 HOME="$TMP" XDG_CONFIG_HOME="$TMP" \
+      "$BIN/fishhawk-mcp" <"$TMP/mcp.in" >"$TMP/mcp.out" 2>"$TMP/mcp.err" &
+    MCP_PID=$!
+    exec 3>"$TMP/mcp.in"
+    cat "$TMP/init.json" >&3
+    i=0
+    while [ "$i" -lt 200 ] && ! grep -q '"serverInfo"' "$TMP/mcp.out" 2>/dev/null; do
+      i=$((i + 1))
+      sleep 0.1
+    done
+    exec 3>&-
+    j=0
+    while kill -0 "$MCP_PID" 2>/dev/null; do
+      j=$((j + 1))
+      if [ "$j" -gt 50 ]; then
+        kill -9 "$MCP_PID" 2>/dev/null
+        break
+      fi
+      sleep 0.1
+    done
+    wait "$MCP_PID" 2>/dev/null
+    MCP_PID=""
+    if grep -qF "\"version\":\"$VER+$FULL_SHA\"" "$TMP/mcp.out"; then
+      pass "r8 fishhawk-mcp initialize advertises serverInfo.version $VER+<sha>"
+    else
+      fail "r8 fishhawk-mcp initialize: want \"version\":\"$VER+$FULL_SHA\" in [$(cat "$TMP/mcp.out")] stderr [$(cat "$TMP/mcp.err")]"
+    fi
+  else
+    fail "r7/r8 skipped the read-back: a build above failed"
+  fi
+fi
+
+printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

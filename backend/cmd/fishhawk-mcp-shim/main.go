@@ -64,6 +64,10 @@ type shimFlags struct {
 	staleOnly  bool
 	stateDir   string
 	staleGrace time.Duration
+
+	// version prints version.String() and exits (#4117), spawning no child
+	// and reading no stdin.
+	version bool
 }
 
 // parseFlags parses the shim flags from args[1:]. An empty --child resolves to
@@ -80,6 +84,7 @@ func parseFlags(args []string, stderr io.Writer) (shimFlags, error) {
 	fs.BoolVar(&f.staleOnly, "stale-only", false, "with --status: print ONLY shims whose swap is stale, and nothing at all when none are")
 	fs.StringVar(&f.stateDir, "state-dir", resolveStateDir(), "directory holding per-shim swap-state snapshots (env: "+stateDirEnv+")")
 	fs.DurationVar(&f.staleGrace, "stale-grace", 60*time.Second, "how long a pending swap must have been outstanding before it counts as stale")
+	fs.BoolVar(&f.version, "version", false, "print the shim's build version and git SHA, \"<Version> (<GitSHA>)\", and exit, without spawning a child or reading stdin")
 	if err := fs.Parse(args[1:]); err != nil {
 		return shimFlags{}, err
 	}
@@ -107,6 +112,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		// flag already wrote the error to stderr.
 		return exitFailure
+	}
+
+	// Build identity (#4117): print and exit before anything else — no child,
+	// no stdin, no state file.
+	if f.version {
+		_, _ = fmt.Fprintln(stdout, version.String())
+		return exitOK
 	}
 
 	// Diagnostic mode: report and exit. It spawns no child, reads no stdin and

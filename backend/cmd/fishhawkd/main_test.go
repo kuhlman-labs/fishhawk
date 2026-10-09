@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
 // TestRun_NoArgs falls through to serve — but we don't actually want
@@ -22,6 +23,31 @@ import (
 func TestRun_HelpExitsZero(t *testing.T) {
 	if got := run([]string{"help"}, io.Discard); got != exitOK {
 		t.Errorf("run(help) = %d, want %d", got, exitOK)
+	}
+}
+
+// TestRunVersion pins both spellings of the version surface (#4117). Not
+// parallel: it swaps the package-level versionOut seam. `--version` must be
+// handled BEFORE splitCommand — which routes any "-"-prefixed first arg to the
+// implicit serve — so nothing may reach logSink (serve was never entered).
+func TestRunVersion(t *testing.T) {
+	for _, arg := range []string{"version", "--version"} {
+		t.Run(arg, func(t *testing.T) {
+			var stdout, logs strings.Builder
+			orig := versionOut
+			versionOut = &stdout
+			t.Cleanup(func() { versionOut = orig })
+
+			if got := run([]string{arg}, &logs); got != exitOK {
+				t.Fatalf("run(%s) = %d, want %d (logs: %s)", arg, got, exitOK, logs.String())
+			}
+			if got, want := stdout.String(), version.String()+"\n"; got != want {
+				t.Errorf("run(%s) stdout = %q, want %q", arg, got, want)
+			}
+			if logs.Len() != 0 {
+				t.Errorf("run(%s) wrote to logSink (serve entered?): %s", arg, logs.String())
+			}
+		})
 	}
 }
 

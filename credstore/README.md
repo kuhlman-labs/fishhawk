@@ -74,4 +74,8 @@ When a stored credential needs refresh and the refresh fails, every consumer lad
 ## Consumers
 
 - **CLI** — `cli/cmd/fishhawk/token.go` (`token login` writes, `token list` reads), `cli/cmd/fishhawk/run.go` (the `newClient` fallback when no `--token`/env is set, refreshing via `RefreshStored` when the stored credential is inside its skew) and `cli/cmd/fishhawk/doctor.go` (the same ladder, reporting a refresh or a refresh failure on the `token valid` rung).
+### How each consumer resolves this module
+
+The **CLI** module (`cli/go.mod`) requires credstore by **pseudo-version** with NO `replace` directive, so `go install github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@…` works (#4117); a credstore change the CLI consumes is not picked up by a `go install` until that pin is bumped (procedure: `cli/README.md` § "Install"). The **backend** module still resolves credstore through a filesystem `replace`. Inside the repo, `go.work`'s `use ./credstore` overrides both, so every local, CI and gate build compiles THIS tree.
+
 - **fishhawk-mcp** — `backend/cmd/fishhawk-mcp/main.go`'s startup token-resolution ladder: `FISHHAWK_API_TOKEN` wins when set; when empty, the credential keyed by the resolved backend URL is loaded and refreshed if inside its skew; a not-usable credential (including one whose refresh failed) fails startup rather than degrading to an empty or stale bearer.

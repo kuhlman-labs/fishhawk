@@ -9,7 +9,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 - `cmd/fishhawk/` — the binary entrypoint. Subcommand dispatch in `main.go`, per-command flags in `run.go`, validate logic in `validate.go`.
 - `internal/httpclient/` — typed wrapper around the backend API. Marshals `CreateRunInput`, decodes `Run`, surfaces `*APIError` for non-2xx responses.
 - `internal/spec/` — workflow-spec validator. Embeds `workflow-v0.schema.json` (mirrored from `docs/spec/`; the schema-sync diff in CI fails if the copies drift) and runs JSON Schema validation locally so users iterate on errors before opening a PR.
-- `internal/version/` — build-version package; set via `-ldflags` at release time.
+- `internal/version/` — build-version package; `Version`/`GitSHA` are stamped via the `-X` pairs `scripts/release-ldflags fishhawk <version> <sha>` prints (unstamped `go install` builds report `dev`).
 
 ## Status
 
@@ -446,6 +446,22 @@ Operator guide: `docs/onboarding.md`.
 **Enable Device Flow (setup, GitHub).** The OAuth App backing `FISHHAWK_OAUTH_CLIENT_ID` must have GitHub's per-app **Enable Device Flow** checkbox turned on (GitHub → Settings → Developer settings → the App → check **Enable Device Flow** → Update application). Until it is, GitHub answers the device-code request with `device_flow_disabled` — in either a non-2xx error body or a 200 response with no `device_code` — and `token login` now appends an actionable hint naming the exact checkbox location on top of GitHub's error text, rather than surfacing `error_description` verbatim (#1752).
 
 **Two GitLab applications (setup, GitLab).** A GitLab-configured backend registers **two** applications, because one cannot serve both legs: a **Confidential** one for browser sign-in (`FISHHAWKD_GITLAB_OAUTH_CLIENT_ID`/`_SECRET`/`_CALLBACK_URL`, whose code exchange sends a `client_secret`) and a **NON-Confidential** one for the device flow (`FISHHAWKD_GITLAB_DEVICE_CLIENT_ID`, which posts `client_id` only per RFC 8628 §3.4). There is deliberately no fallback between them. `token login --provider gitlab` drives the device application; the id it uses is whatever the backend advertises for the gitlab entry.
+
+## Install
+
+    go install github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@latest
+
+This works because `cli/go.mod` carries NO `replace` directive — `go install` refuses a module with one ([go.dev/ref/mod#go-install](https://go.dev/ref/mod#go-install)) — and requires the sibling `credstore` module by **pseudo-version** instead (#4117). `cmd/fishhawk/gomod_test.go`'s `TestCLIModuleIsGoInstallable` pins that precondition: no `replace` (single-line or block), a pseudo-version credstore require, and both `go.sum` hashes for exactly that version. A plain `go build` cannot catch a regression there, because workspace mode ignores both.
+
+A `go install`ed CLI is **unstamped**: `fishhawk version` prints `dev` (no git SHA). Stamped builds come from `scripts/release-ldflags` (see `scripts/README.md` § "Release stamping").
+
+**Workspace precedence.** Inside the repo, `go.work`'s `use ./credstore` wins over the pin, so local, CI and gate builds always compile the in-tree credstore; the pin only governs `go install` and `GOWORK=off` builds.
+
+**Bumping the pin (upkeep contract).** After a credstore change the CLI consumes MERGES to `main`, bump the pin to the merged commit:
+
+    cd cli && GOWORK=off go get github.com/kuhlman-labs/fishhawk/credstore@<merged-sha> && GOWORK=off go mod tidy
+
+and commit `cli/go.mod` + `cli/go.sum`. Until then a `go install` at a later commit builds against the OLD credstore: a missing API fails to compile (loud), but a behaviour-only credstore change is silent. The bump needs network (the module proxy resolves the pseudo-version); never run `go mod tidy` with `GOPROXY=off`.
 
 ## Build and test
 

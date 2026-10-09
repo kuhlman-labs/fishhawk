@@ -388,10 +388,13 @@ else
   fail "_sha_with_dirty should append -dirty (got: $out)"
 fi
 
-# 4c. _build_ldflags: each binary stamps GitSHA into the right version package,
-# AND that package actually declares `var GitSHA` — load-bearing: -ldflags -X
-# on a package path without the var is a SILENT no-op, not a build error, so a
-# package move/rename must fail here instead of shipping unstamped binaries.
+# 4c. _build_ldflags: each binary stamps Version=dev + GitSHA into the right
+# version package, AND that package actually declares `var Version` and `var
+# GitSHA` — load-bearing: -ldflags -X on a package path without the var is a
+# SILENT no-op, not a build error, so a package move/rename must fail here
+# instead of shipping unstamped binaries. The expectations are INDEPENDENT
+# literals: _build_ldflags delegates to scripts/release-ldflags (#4117), so a
+# wrong path in the helper reddens this table too.
 typeset -A gitsha_pkg
 gitsha_pkg=(
   fishhawkd         backend/internal/version
@@ -403,21 +406,30 @@ gitsha_pkg=(
 for bin in fishhawkd fishhawk-mcp fishhawk-mcp-shim fishhawk-runner fishhawk; do
   rel="${gitsha_pkg[$bin]}"
   out="$(_build_ldflags "$bin" abc1234)"
-  if [[ "$out" == "-X github.com/kuhlman-labs/fishhawk/${rel}.GitSHA=abc1234" ]]; then
-    pass "_build_ldflags ${bin} -> ${rel}.GitSHA"
+  if [[ "$out" == "-X github.com/kuhlman-labs/fishhawk/${rel}.Version=dev -X github.com/kuhlman-labs/fishhawk/${rel}.GitSHA=abc1234" ]]; then
+    pass "_build_ldflags ${bin} -> ${rel}.{Version=dev,GitSHA}"
   else
-    fail "_build_ldflags ${bin} should stamp ${rel}.GitSHA (got: $out)"
+    fail "_build_ldflags ${bin} should stamp ${rel}.Version=dev and ${rel}.GitSHA (got: $out)"
   fi
-  if grep -q '^var GitSHA' "${REPO_ROOT}/${rel}/version.go"; then
-    pass "${rel}/version.go declares var GitSHA (-X target exists)"
+  if grep -q '^var GitSHA' "${REPO_ROOT}/${rel}/version.go" && grep -q '^var Version' "${REPO_ROOT}/${rel}/version.go"; then
+    pass "${rel}/version.go declares var Version and var GitSHA (-X targets exist)"
   else
-    fail "${rel}/version.go should declare var GitSHA — the ${bin} -X stamp is a silent no-op without it"
+    fail "${rel}/version.go should declare var Version and var GitSHA — the ${bin} -X stamp is a silent no-op without them"
   fi
 done
-if _build_ldflags no-such-binary abc1234 >/dev/null; then
+if _build_ldflags no-such-binary abc1234 >/dev/null 2>&1; then
   fail "_build_ldflags should return non-zero for an unknown binary name"
 else
   pass "_build_ldflags rejects an unknown binary name"
+fi
+# Single source: _build_ldflags delegates to scripts/release-ldflags and carries
+# no package-path literal of its own (#4117).
+bl_body="$(typeset -f _build_ldflags)"
+if print -r -- "$bl_body" | grep -q 'RELEASE_LDFLAGS' && [[ "$_RELEASE_LDFLAGS" == */scripts/release-ldflags ]] \
+   && ! print -r -- "$bl_body" | grep -q 'internal/version'; then
+  pass "_build_ldflags delegates to scripts/release-ldflags with no internal/version literal"
+else
+  fail "_build_ldflags should delegate to scripts/release-ldflags and hold no internal/version literal (single source, #4117)"
 fi
 
 # 4d. Wiring body-greps: _build_binary must stamp via _build_ldflags, and the
@@ -432,6 +444,24 @@ if print -r -- "$bb_body" | grep -q '_dev_git_sha'; then
   pass "_build_binary derives the sha via _dev_git_sha"
 else
   fail "_build_binary should call _dev_git_sha"
+fi
+# 4d (behavioral, #4117): a failing _build_ldflags must STOP the build loudly,
+# never expand to an empty -ldflags and ship an unstamped binary. Stub the
+# helper to fail and `go` to announce itself; the build must exit non-zero,
+# never invoke go, and name the cause on stderr.
+fl_errf="$(mktemp)"
+fl_out="$(
+  REPO_ROOT="$orig_repo_root"
+  DEV_GIT_SHA=abc1234
+  _build_ldflags() { return 1 }
+  go() { print "GO-INVOKED" }
+  _build_binary fishhawk-runner __all__ 2>"$fl_errf"
+)"; fl_rc=$?
+fl_err="$(cat "$fl_errf")"; rm -f "$fl_errf"
+if [[ "$fl_rc" -ne 0 && "$fl_out" != *GO-INVOKED* && "$fl_err" == *"could not derive -ldflags for fishhawk-runner"* ]]; then
+  pass "_build_binary fails loud (no go build) when _build_ldflags fails"
+else
+  fail "_build_binary should exit non-zero without invoking go when _build_ldflags fails (rc=${fl_rc} out=${fl_out} err=${fl_err})"
 fi
 k8s_body="$(typeset -f cmd_k8s_up)"
 if print -r -- "$k8s_body" | grep -q -- '--build-arg GIT_SHA'; then
@@ -481,6 +511,23 @@ if print -r -- "$dockerfile_no_comments" | grep -qE \
   fail "backend/Dockerfile should not hardcode a GOARCH architecture literal"
 else
   pass "backend/Dockerfile has no hardcoded GOARCH architecture literal"
+fi
+
+# 4f. backend/Dockerfile's -X stanza is byte-pinned to scripts/release-ldflags
+# (#4117). The image cannot exec the helper (.dockerignore excludes scripts/),
+# so it carries the stanza as a literal; the helper passes values VERBATIM, so
+# running it with the literal build-arg references '${VERSION}' / '${GIT_SHA}'
+# must reproduce the Dockerfile's -ldflags value minus the caller-added
+# `-s -w `. Reads the SHIPPED files via orig_repo_root.
+df_ldflags_line="$(sed -n "${buildrun_line:-1},\$p" "$dockerfile_path" | grep -m1 -E '^[[:space:]]*-ldflags="')"
+df_ldflags="${df_ldflags_line#*-ldflags=\"}"
+df_ldflags="${df_ldflags%%\"*}"
+df_xpairs="${df_ldflags#-s -w }"
+helper_xpairs="$(/bin/sh "${orig_repo_root}/scripts/release-ldflags" fishhawkd '${VERSION}' '${GIT_SHA}')"
+if [[ -n "$df_ldflags_line" && "$df_ldflags" == "-s -w "* && "$df_xpairs" == "$helper_xpairs" ]]; then
+  pass "backend/Dockerfile's -X stanza equals scripts/release-ldflags fishhawkd output"
+else
+  fail "backend/Dockerfile's -ldflags should be '-s -w ' + scripts/release-ldflags fishhawkd '\${VERSION}' '\${GIT_SHA}' (dockerfile: ${df_ldflags}; helper: ${helper_xpairs})"
 fi
 
 # 5. _decide_mcp_signal: all three branches plus the reflog-unavailable fallback.

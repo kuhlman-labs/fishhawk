@@ -55,23 +55,26 @@ page recovers from an absent prerequisite.
 
 ## Get the binaries
 
-There is no packaged install. No CLI release workflow exists in the repository,
-no version tag has ever been cut, and `go install` does not work either — the
-CLI module carries a filesystem `replace` directive for its sibling
-`credstore` module, which module-aware installs refuse:
+There is no packaged install. No CLI release workflow exists in the repository
+and no version tag has ever been cut.
 
-```console
-$ go install github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@latest
-go: github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@latest (in github.com/kuhlman-labs/fishhawk/cli@v0.0.0-20260825053024-219e3c55a98e):
-	The go.mod file for the module providing named packages contains one or
-	more replace directives. It must not contain directives that would cause
-	it to be interpreted differently than if it were the main module.
+The CLI installs with `go install`:
+
+```sh
+go install github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@latest
 ```
 
-Build from a clone instead. You need three binaries: the CLI you drive the loop
-with, the runner the CLI spawns per stage, and `fishhawkd` — which you need on
-`PATH` for the token step below even though you will run the *server* through
-`make`.
+A `go install`ed CLI is unstamped, so `fishhawk version` prints `dev`. Only the
+CLI is supported this way: its module pins the sibling `credstore` module by
+pseudo-version and carries no `replace` directive, which `go install` requires.
+The backend module still carries filesystem `replace` directives, which
+`go install` refuses, so `fishhawkd` builds from a clone, and so does the
+runner, so the two come from the same tree.
+
+You need three binaries: the CLI you drive the loop with, the runner the CLI
+spawns per stage, and `fishhawkd` — which you need on `PATH` for the token step
+below even though you will run the *server* through `make`. To build all three
+from a clone instead:
 
 ```sh
 git clone https://github.com/kuhlman-labs/fishhawk.git
@@ -95,8 +98,11 @@ $ command -v fishhawkd
 
 `fishhawk version` printing `dev` is correct — an unstamped build reports the
 `dev` version, which also carries "do not enforce a minimum runner version"
-semantics. `fishhawk-runner` has no `--version` flag; `command -v` is the
-check that it is on `PATH`, which is what the CLI needs it for.
+semantics; `fishhawkd version` prints the same. `fishhawk-runner` has no
+`--version` flag; it has a `version` subcommand (`fishhawk-runner version`)
+that prints JSON with `version`, `git_sha` and `plan_schema_hash`. `command -v`
+is still the check that matters here: it confirms the runner is on `PATH`,
+which is how the CLI finds it.
 
 Packaged installs are tracked under
 [E36 / #1638](https://github.com/kuhlman-labs/fishhawk/issues/1638).

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
@@ -79,6 +81,43 @@ func TestParseFlags_RejectsUnknownTransport(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "grpc") {
 		t.Errorf("error should name the offending value; got %q", err.Error())
+	}
+}
+
+func TestParseFlags_Version(t *testing.T) {
+	tf, err := parseFlags([]string{"fishhawk-mcp", "--version"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if !tf.version {
+		t.Error("--version should set transportFlags.version")
+	}
+	tf, err = parseFlags([]string{"fishhawk-mcp"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if tf.version {
+		t.Error("version should default to false")
+	}
+}
+
+// TestRunVersionFlag pins that --version answers BEFORE loadConfig (#4117):
+// with no env token, no backend URL and an empty credential store (HOME and
+// XDG_CONFIG_HOME at a fresh temp dir), loadConfig would fail, so a green
+// here proves --version needs none of them. Not parallel: t.Setenv.
+func TestRunVersionFlag(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	t.Setenv("FISHHAWK_BACKEND_URL", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", home)
+
+	var stdout, stderr strings.Builder
+	if got := run(context.Background(), []string{"fishhawk-mcp", "--version"}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("run(--version) = %d, want %d (stderr: %s)", got, exitOK, stderr.String())
+	}
+	if got, want := stdout.String(), version.String()+"\n"; got != want {
+		t.Errorf("run(--version) stdout = %q, want %q", got, want)
 	}
 }
 

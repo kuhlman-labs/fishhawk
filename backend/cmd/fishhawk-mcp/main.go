@@ -49,6 +49,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
@@ -71,7 +72,7 @@ const (
 )
 
 func main() {
-	os.Exit(run(context.Background(), os.Args, os.Stderr))
+	os.Exit(run(context.Background(), os.Args, os.Stdout, os.Stderr))
 }
 
 // transportFlags captures the parsed CLI flags governing the transport.
@@ -84,6 +85,10 @@ type transportFlags struct {
 	// Empty leaves FISHHAWK_MCP_ALLOWED_ROOTS in effect.
 	allowedRoots string
 	addr         string
+
+	// version asks for the build identity only (#4117): print
+	// version.String() and exit, before any config is loaded.
+	version bool
 }
 
 // parseFlags parses the transport-selection flags from args[1:] (args
@@ -100,6 +105,7 @@ func parseFlags(args []string, stderr io.Writer) (transportFlags, error) {
 			"resolve inside when serving --transport http (E66.63 / #3589). Overrides FISHHAWK_MCP_ALLOWED_ROOTS. "+
 			"Inert on the stdio default. Leaving BOTH unset is FAIL CLOSED over http: every path-taking verb is "+
 			"refused path_outside_allowed_roots")
+	fs.BoolVar(&tf.version, "version", false, "print the build version and git SHA, \"<Version> (<GitSHA>)\", and exit; needs no backend URL or token")
 	if err := fs.Parse(args[1:]); err != nil {
 		return transportFlags{}, err
 	}
@@ -116,11 +122,17 @@ func parseFlags(args []string, stderr io.Writer) (transportFlags, error) {
 // disconnects (stdio) or ctx is cancelled (http). Errors terminate the
 // process with exitFailure — MCP clients restart their server
 // processes, so a graceful exit on transport failure is correct.
-func run(ctx context.Context, args []string, stderr io.Writer) int {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	tf, err := parseFlags(args, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
+	}
+	// --version is answered BEFORE loadConfig, so it needs no backend URL,
+	// token or stored credential (#4117).
+	if tf.version {
+		_, _ = fmt.Fprintln(stdout, version.String())
+		return exitOK
 	}
 	cfg, err := loadConfig(os.Getenv, credstore.Load, refreshStoredCredential)
 	if err != nil {

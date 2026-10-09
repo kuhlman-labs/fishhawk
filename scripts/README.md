@@ -1389,17 +1389,66 @@ be revisited.
 ### GitSHA-stamped dev builds (#1007)
 
 `scripts/dev` stamps the short HEAD SHA (`-dirty` suffix on a dirty tree) into
-all five binaries via `-ldflags -X <module>/internal/version.GitSHA=…`, and
-`scripts/dev k8s` passes the same value as the image's `GIT_SHA` build arg — so
-`/healthz` `git_sha`, the runner's `runner_started`/`version` output, the MCP
-handshake version, and `fishhawk version` report the real build commit instead
-of `unknown`. `Version` intentionally stays `dev` — it carries the
-MinRunnerVersion no-enforcement semantics. A wrong `-X` package path is a
-**silent no-op**, not a build error: `scripts/test-dev` body-greps each
-`_build_ldflags` path against the `var GitSHA` declaration in the matching
-`version.go`, so keep them in sync when moving a version package.
-Release-workflow GitSHA stamping (`.github/workflows/**`, human-led) is a
-separate follow-up.
+all five binaries, and `scripts/dev k8s` passes the same value as the image's
+`GIT_SHA` build arg — so `/healthz` `git_sha`, the runner's
+`runner_started`/`version` output, the MCP handshake version, and every
+binary's version surface report the real build commit instead of `unknown`.
+`_build_ldflags <name> <sha>` holds no package path of its own: it runs
+`scripts/release-ldflags <name> dev <sha>` as a child process (see "Release
+stamping" below), so dev builds stamp `Version=dev` explicitly — the var's
+default, which carries the MinRunnerVersion no-enforcement semantics — plus
+`GitSHA`. `_build_binary` captures the flags BEFORE `go build` and exits 1
+naming the helper when it fails, because an inline `$(...)` would expand a
+missing or failing helper to an EMPTY `-ldflags` and ship an unstamped binary
+silently. A wrong `-X` package path is a **silent no-op**, not a build error:
+`scripts/test-dev` (4c) asserts `_build_ldflags` output for every binary against
+independent literal package paths, checks each `version.go` declares
+`var Version` and `var GitSHA`, and greps that `_build_ldflags` delegates; (4d)
+proves the fail-loud capture behaviourally.
+
+### Release stamping: `scripts/release-ldflags` (E74.8 / #4117)
+
+`scripts/release-ldflags <component> <version> <git-sha>` is the ONE source of
+the `-X <module>/internal/version.{Version,GitSHA}` pairs for all five binaries
+(`fishhawkd`, `fishhawk-mcp`, `fishhawk-mcp-shim` → `backend/internal/version`;
+`fishhawk-runner` → `runner/internal/version`; `fishhawk` →
+`cli/internal/version`). It prints exactly one line,
+`-X <pkg>.Version=<version> -X <pkg>.GitSHA=<git-sha>`, and nothing else:
+
+- **SHA verbatim.** The SHA is passed through as given — no truncation, no
+  expansion — so a release can stamp the full 40-char commit and `scripts/dev`
+  the short one.
+- **Only the `-X` pairs.** Callers add `-s -w` themselves, and release builds
+  add `-trimpath`, which is a `go build` flag, not a linker flag.
+- **Refusals (exit 2, empty stdout, named stderr):** a wrong argument count
+  (`usage:`), an unknown component, an EMPTY version or sha (an empty `-X` value
+  stamps an empty string), and a value containing whitespace, a quote or a
+  backslash (cmd/go splits `-ldflags` on spaces and honours quotes).
+- **POSIX `/bin/sh`, not zsh** — the one such script here, because GitHub's
+  `ubuntu-latest` release jobs have no zsh and #3716's release workflows call it.
+- **`backend/Dockerfile`** cannot exec it (`.dockerignore` excludes `scripts/`),
+  so it carries the fishhawkd stanza as a literal; `scripts/test-dev` (4f)
+  byte-pins that literal to `release-ldflags fishhawkd '${VERSION}' '${GIT_SHA}'`.
+
+`scripts/test-release-ldflags` (POSIX sh, wired into `scripts/test verify`'s
+`_verify_gate_harnesses`) pins it: r1 `sh -n`; r2 byte-exact output against
+independent literals for every component × {40-char, short} SHA; r3 dash vs
+`/bin/sh` byte identity (SKIP when dash is absent — macOS `/bin/sh` is bash 3.2
+in POSIX mode and ACCEPTS `[[`, so r2 alone cannot catch that there); r4 a
+bash/zsh-construct denylist with an anti-vacuity self-check; r5 one case per
+refusal; r6 the `var Version`/`var GitSHA` declarations; r7 builds all five
+binaries with `go build -trimpath -ldflags "$(scripts/release-ldflags …)"` and
+reads every version surface back (SKIP when go is absent); r8 drives the
+stamped `fishhawk-mcp` through a stdio `initialize` (stdin held open on a FIFO,
+killed after ~20s) and asserts `serverInfo.version` is `<Version>+<GitSHA>`.
+
+**r7 cost.** Five `-trimpath` links run on every verify. `-trimpath` drops the
+worktree path from compile action IDs, so package builds are shared across
+worktrees and the leg is mostly link time. Observed on 2026-10-08 (14-core
+macOS host, load ~7): ~20s with an empty `GOCACHE`, 4–5s warm. The harness
+prints `r7: built five binaries in Ns` on every run, so the cost stays visible
+in verify output. If it proves too slow, gating r7 behind a diff-scope check is
+a follow-up.
 
 ### Stale operator-worktree warning + `sweep` (#1917)
 

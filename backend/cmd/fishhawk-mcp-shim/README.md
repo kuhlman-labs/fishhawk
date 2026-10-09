@@ -109,6 +109,7 @@ Because that prune DELETES files in an operator-supplied directory, the reader o
 | `--quiesce-timeout` | `30s` | how long to wait for zero in-flight requests before deferring a swap |
 | `--status` | off | report every live shim's swap state and exit — spawns no child, reads no stdin, writes no state file |
 | `--stale-only` | off | with `--status`: print ONLY stale shims, and **nothing at all** (stdout or stderr) when none are stale |
+| `--version` | off | print the SHIM's own build identity, `<Version> (<GitSHA>)` (bare `<Version>` when unstamped), and exit — like `--status` it spawns no child, reads no stdin and writes no state file (#4117). The CHILD's identity is the `serverInfo.version` it advertises on `initialize` |
 | `--state-dir` | `${TMPDIR:-/tmp}/fishhawk-mcp-shim` | where per-shim snapshots live (env: `FISHHAWK_MCP_SHIM_STATE_DIR`) |
 | `--stale-grace` | `60s` | how long a pending swap must have been outstanding before it counts as stale |
 
