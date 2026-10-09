@@ -175,12 +175,26 @@ func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 // merge-status reconciler poll (ResolveReviewFromPollState) populates
 // only prURL and sets actorLogin = mergeReconcilerActor + a system
 // actorKind, leaving the SHAs empty.
+//
+// runStateAtClose and reviewStateAtClose are set by resolveReviewStageOnMerge
+// itself on the closed-without-merge arm (never by a caller), so every surface
+// that shares that resolver — webhook, poll, GitLab MR — records them on the
+// pr_closed_without_merge row. The PR-reopen revive (pullrequest_reopen.go,
+// #4082) reads them back to prove the close is what cancelled a running run
+// whose review was parked at its gate.
 type reviewMergeMeta struct {
 	prURL      string
 	headSHA    string
 	baseSHA    string
 	actorLogin string
 	actorKind  audit.ActorKind
+
+	// runStateAtClose is the run row's state when the close was handled
+	// (before the close's Advance cancels it).
+	runStateAtClose string
+	// reviewStateAtClose is the review stage's state before the cancel
+	// transition; empty when the run has no review stage.
+	reviewStateAtClose string
 }
 
 // resolveReviewStageOnMerge is the shared review-gate resolution path
@@ -442,7 +456,14 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 	}
 
 	// Closed without merging (ADR-018's "closed without merge =
-	// abandoned work" stance). Audit row first.
+	// abandoned work" stance). Audit row first, stamped with the run and
+	// review states the close found (#4082): the reopen-revive guards read
+	// them to tell a close that cancelled a running run parked at its review
+	// gate from a close of an already-cancelled run.
+	meta.runStateAtClose = string(target.State)
+	if reviewStage != nil {
+		meta.reviewStateAtClose = string(reviewStage.State)
+	}
 	s.writePRClosedWithoutMergeAudit(ctx, target.ID, stageID, meta)
 	if reviewStage == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
@@ -648,19 +669,25 @@ func (s *Server) findReviewStage(ctx context.Context, runID uuid.UUID) *run.Stag
 // `sender.login`, or the mergeReconcilerActor marker on the poll path;
 // closed-without-merge events don't populate `merged_by`).
 //
-// Reopening is intentionally out of scope: the cancelled stage is
-// terminal. If a reviewer reopens the PR and wants Fishhawk involved
-// again, they re-trigger via `/fishhawk run` on the issue; the new run
-// threads off the cancelled parent via the `parent_run_id` lineage
-// primitive (#216).
+// The payload's run_state_at_close / review_state_at_close (#4082, additive)
+// record what the close found. A GitHub reopen of the PR within
+// reopenReviveWindow, at the same head, revives the run to its review gate
+// (handlePullRequestReopened, pullrequest_reopen.go) — but only when this row
+// shows the close cancelled a RUNNING run whose review was parked at
+// awaiting_approval. Past the window, at a moved head, or on any refused
+// guard, the cancelled run stays terminal and the recovery is a fresh run
+// (fishhawk_start_run), which threads off the cancelled parent via the
+// `parent_run_id` lineage primitive (#216).
 func (s *Server) writePRClosedWithoutMergeAudit(ctx context.Context, runID uuid.UUID, stageID *uuid.UUID, meta reviewMergeMeta) {
 	closer := meta.actorLogin
 	actorKind := meta.actorKind
 	payload, _ := json.Marshal(map[string]any{
-		"pr_url":   meta.prURL,
-		"closer":   closer,
-		"head_sha": meta.headSHA,
-		"base_sha": meta.baseSHA,
+		"pr_url":                meta.prURL,
+		"closer":                closer,
+		"head_sha":              meta.headSHA,
+		"base_sha":              meta.baseSHA,
+		"run_state_at_close":    meta.runStateAtClose,
+		"review_state_at_close": meta.reviewStateAtClose,
 	})
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,

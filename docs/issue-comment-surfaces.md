@@ -1372,6 +1372,28 @@ Notes:
     guard and the unchecked later edit above): it states that the remaining
     scope was not delivered by the merged PR rather than asserting the issue
     stays open.
+- The PR-reopen revive audit kind (E83.49 / #4082) — `run_revived_on_reopen`
+  — is a **user-actor audit kind with no dedicated Notifier method** that
+  renders **data-drivenly** on the living-anchor / status-comment timeline
+  through `activityCategories` (`status_template.go`), marked by
+  `notifyOperatorVisible` at its writer,
+  `server/pullrequest_reopen.go::handlePullRequestReopened`. It is not a new
+  comment surface of its own. The writer appends it when a GitHub
+  `pull_request.reopened` delivery revives a run its PR close cancelled (within
+  10 minutes of the close, at the same head, every guard passing): the review
+  stage is re-parked at `awaiting_approval` and the run is `running` again.
+  Payload `{pr_url, reopened_by, head_sha, closed_at, closed_by,
+  elapsed_seconds, window_seconds, review_stage_id}`; rendered as "<actor>
+  reopened the PR; the run was revived to its review gate" (the bare phrase
+  "PR reopened; …" when the actor is not a renderable login). Its sibling
+  `run_revive_on_reopen_refused` (a candidate reopen a guard refused, payload
+  `{pr_url, reason, detail, reopened_by, reopen_head_sha}`) is **internal
+  only** — deliberately NOT in `activityCategories` and never marked
+  operator-visible: the run stays cancelled, which the anchor already shows,
+  and `get_run_status` names the fresh-run fallback under `cancelled_pr_closed`.
+  Residual: the SPA run narrative (`frontend/src/run-narrative/narrative.ts`
+  `MERGE_CATEGORIES`) still renders a revived run as "closed without merge"
+  until it merges, so the anchor is the authoritative surface meanwhile.
 - The slice-integration audit kinds — `slices_integrated` and
   `slice_integration_conflict` (ADR-041 / #1142) — are **system-actor audit
   kinds with no dedicated Notifier method**, but as of E24.7 (#1147) both ALSO
@@ -2696,10 +2718,10 @@ explicit intent marker and a cross-package static gate:
   is false — before and independent of the notifier nil-guard, because the
   mismatch is a defect whether or not a notifier is configured — and then
   delegates to `notifyStatusUpdate` unconditionally, so the refresh behaviour
-  is unchanged. The six writers whose refresh trigger IS a rendered category
-  use it: the two `acceptance_scenario_retirement_dropped` writers
+  is unchanged. The writers whose refresh trigger IS a rendered category
+  use it — among them the two `acceptance_scenario_retirement_dropped` writers
   (runner-reported + cancel), `fixup_pushed`, `deployment_rollback_initiated`,
-  `pr_merged`, `pr_closed_without_merge`.
+  `pr_merged`, `pr_closed_without_merge` and `run_revived_on_reopen` (#4082).
 - **`notifyStatusUpdate`'s `source` is a call-site TRANSITION tag**
   (`trace_handler`, `approval_submit`, `scope_parked`, …), never an audit
   category the writer intends the operator to see.

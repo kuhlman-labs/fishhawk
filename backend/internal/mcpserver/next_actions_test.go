@@ -6356,3 +6356,81 @@ func TestNextActions_DecomposedParentGiveUpOffersFilingSuggestion(t *testing.T) 
 		t.Errorf("filing reason = %q, want it to carry the category-B evidence anchor", got.Reason)
 	}
 }
+
+// TestNextActions_CancelledPRClosed pins the cancelled_pr_closed arm (#4082): a
+// run cancelled by its PR closing without merge (run cancelled, review stage
+// cancelled, PR URL present) names the reopen-within-window ritual step, then
+// the fresh-run fallback, then the filing suggestion LAST — on GitHub and on an
+// older backend that omits forge. A GitLab run gets ONLY the fresh-run
+// fallback (operator condition C1): the GitLab MR reopen is not routed to the
+// revive handler. An operator-cancelled run (review still awaiting_approval) and
+// a PR-less cancelled run keep the plain cancelled state.
+//
+// Counterfactuals: delete the arm's call site and every cancelled_pr_closed row
+// reads plain "cancelled" (RED); drop the forge gate and the gitlab row lists
+// reopen_pr (RED).
+func TestNextActions_CancelledPRClosed(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	closedStages := func(reviewState string) []Stage {
+		return []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), naStage("review", reviewState)}
+	}
+	runWith := func(forge string, pr *string) *Run {
+		r := naRun("cancelled")
+		r.Forge = forge
+		r.PullRequestURL = pr
+		return r
+	}
+	cases := []struct {
+		name        string
+		run         *Run
+		stages      []Stage
+		wantState   string
+		wantActions []string
+	}{
+		{"github", runWith("github", &prURL), closedStages("cancelled"),
+			"cancelled_pr_closed", []string{"reopen_pr", "fishhawk_start_run", "fishhawk_report_product_issue"}},
+		{"forge_absent_older_backend", runWith("", &prURL), closedStages("cancelled"),
+			"cancelled_pr_closed", []string{"reopen_pr", "fishhawk_start_run", "fishhawk_report_product_issue"}},
+		{"gitlab_fresh_run_only", runWith("gitlab", &prURL), closedStages("cancelled"),
+			"cancelled_pr_closed", []string{"fishhawk_start_run", "fishhawk_report_product_issue"}},
+		{"operator_cancelled_review_still_parked", runWith("github", &prURL), closedStages("awaiting_approval"),
+			"cancelled", []string{"fishhawk_report_product_issue"}},
+		{"no_pr_url", runWith("github", nil), closedStages("cancelled"),
+			"cancelled", []string{"fishhawk_report_product_issue"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(tc.run, tc.stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+			if na == nil || na.State != tc.wantState {
+				t.Fatalf("state = %+v, want %q", na, tc.wantState)
+			}
+			got := actionNames(na)
+			if strings.Join(got, ",") != strings.Join(tc.wantActions, ",") {
+				t.Fatalf("actions = %v, want %v", got, tc.wantActions)
+			}
+			wantFilingLast(t, na, tc.run.ID)
+			if tc.wantState != "cancelled_pr_closed" {
+				return
+			}
+			fresh := findAction(t, na, "fishhawk_start_run")
+			if fresh.Consumes != consumesNewRun || fresh.Params["repo"] != "x/y" || fresh.Params["workflow_id"] != "feature_change" {
+				t.Errorf("fishhawk_start_run = %+v, want consumes new_run with the run's repo + workflow_id", fresh)
+			}
+			if tc.wantActions[0] != "reopen_pr" {
+				return
+			}
+			reopen := na.Actions[0]
+			if reopen.Consumes != consumesNone || reopen.Params["pr_url"] != prURL {
+				t.Errorf("reopen_pr = %+v, want consumes none with params.pr_url %q", reopen, prURL)
+			}
+			for _, want := range []string{"10 minutes", "head"} {
+				if !strings.Contains(reopen.Precondition, want) {
+					t.Errorf("reopen_pr precondition %q missing %q", reopen.Precondition, want)
+				}
+			}
+			if !strings.Contains(reopen.Reason, "fishhawk_retrigger_ci") {
+				t.Errorf("reopen_pr reason %q must name fishhawk_retrigger_ci as the CI re-trigger", reopen.Reason)
+			}
+		})
+	}
+}

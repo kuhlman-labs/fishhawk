@@ -227,6 +227,14 @@ var activityCategories = map[string]struct{}{
 	// belong on the timeline.
 	"partial_delivery_closing_reference_neutralized": {},
 	"partial_delivery_remaining_scope_posted":        {},
+	// PR-reopen revive (E83.49 / #4082). A user-actor audit kind with NO
+	// dedicated Notifier method: server/pullrequest_reopen.go marks it with
+	// notifyOperatorVisible when a quick reopen of the PR revives a
+	// PR-close-cancelled run to its review gate. The anchor must say so, or
+	// the thread keeps showing the run cancelled while it is live again. Its
+	// refused sibling run_revive_on_reopen_refused is DELIBERATELY not
+	// registered: the run stays cancelled, which the anchor already shows.
+	"run_revived_on_reopen": {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -333,6 +341,11 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderPartialDeliveryNeutralizedLine(e.Payload)
 	case "partial_delivery_remaining_scope_posted":
 		return "Partial delivery: remaining scope posted on the issue"
+	case "run_revived_on_reopen":
+		if actor == "" {
+			return "PR reopened; the run was revived to its review gate"
+		}
+		return fmt.Sprintf("%s reopened the PR; the run was revived to its review gate", actor)
 	default:
 		if actor == "" {
 			return e.Category
