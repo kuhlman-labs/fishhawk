@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -406,4 +408,171 @@ func (s *Server) resolveDependentChildBase(ctx context.Context, runRow *run.Run)
 		}, nil
 	}
 	return branch, nil, nil
+}
+
+// acceptanceIntegrationError is the refusal a DECOMPOSED PARENT's acceptance
+// stage produces (#4080) when the parent's consolidated branch does not provably
+// carry every child's slice: acceptance would validate a partial tree and fail
+// as a wrong-tree false negative (run f16f2e77 validated 3 of 4 slices and
+// failed 5/5). Both the host-dispatch marker and the acceptance-admission
+// endpoint answer it as 409 acceptance_integration_incomplete BEFORE any state
+// change, so the stage stays re-dispatchable once the fan-in completes.
+//
+// It carries every refusal cause so an operator can tell them apart from the
+// 409 body alone:
+//
+//   - nonSucceeded — children that have not reached run state succeeded (still
+//     in flight, failed or cancelled): the fan-out itself is incomplete.
+//   - unintegrated — SUCCEEDED children the parent's NEWEST slices_integrated
+//     entry does not name: their slices are not on the consolidated branch.
+//   - consolidatedBranch == "" — no slices_integrated entry (or an
+//     undecodable / branch-less one) was read: nothing proves any integration.
+//
+// Both id lists are in slice order (the guard sorts children by slice_index).
+type acceptanceIntegrationError struct {
+	unintegrated       []string
+	nonSucceeded       []string
+	consolidatedBranch string
+}
+
+// message names the blocking children and the wait, never a blind retry: the
+// fan-in is the server's job (the child-completion sweeper, the event-driven
+// advance, or an on-demand fishhawk_consolidate_slices), and
+// fishhawk_await_children names the failing child and its recovery when it is
+// stuck.
+func (e *acceptanceIntegrationError) message() string {
+	var causes []string
+	if len(e.nonSucceeded) > 0 {
+		causes = append(causes, fmt.Sprintf("children %v have not succeeded", e.nonSucceeded))
+	}
+	if len(e.unintegrated) > 0 {
+		causes = append(causes, fmt.Sprintf("succeeded children %v are not covered by the parent's newest slices_integrated record", e.unintegrated))
+	}
+	if e.consolidatedBranch == "" {
+		causes = append(causes, "no consolidated branch is recorded")
+	}
+	return "acceptance for this decomposed parent cannot start: the consolidated branch does not carry every child's slice (" +
+		strings.Join(causes, "; ") +
+		"), so acceptance would validate a partial tree. Wait for the fan-in to cover every child with fishhawk_await_children, which names a stuck child and its recovery; do not retry this dispatch blindly"
+}
+
+// details is the structured 409 body payload. Both id lists are always non-nil
+// arrays so a consumer need not distinguish null from empty.
+func (e *acceptanceIntegrationError) details() map[string]any {
+	unintegrated := e.unintegrated
+	if unintegrated == nil {
+		unintegrated = []string{}
+	}
+	nonSucceeded := e.nonSucceeded
+	if nonSucceeded == nil {
+		nonSucceeded = []string{}
+	}
+	return map[string]any{
+		"unintegrated_child_run_ids":  unintegrated,
+		"non_succeeded_child_run_ids": nonSucceeded,
+		"consolidated_branch":         e.consolidatedBranch,
+		"consolidated_branch_present": e.consolidatedBranch != "",
+	}
+}
+
+// guardDecomposedParentAcceptance is the decomposed-parent acceptance gate
+// (#4080), called by BOTH the host-dispatch marker and the acceptance-admission
+// endpoint before either can start (or short-circuit) an acceptance stage. It
+// refuses (a non-nil *acceptanceIntegrationError) unless the parent's NEWEST
+// slices_integrated entry covers EVERY child, every child has succeeded, and
+// that entry names a consolidated branch. Coverage is decided by the shared
+// wavecoverage.Uncovered predicate, the same one the MCP children_status
+// classifier uses, so the await verb can never announce a settled fan-in this
+// gate would refuse.
+//
+// The partition, in evaluation order:
+//
+//   - a non-acceptance stage → admit, with NO reads (every other stage type on
+//     the marker path pays nothing);
+//   - a decomposed CHILD run (DecomposedFrom set) → admit: a child has no
+//     acceptance stage of its own to gate;
+//   - the children LIST errors → err, which the caller answers 500 (fail
+//     closed, retryable — never a silent admit);
+//   - zero children → admit: the run is not a decomposed parent, so every
+//     ordinary run behaves byte-identically to before #4080;
+//   - no integration AUTHORITY (orchestrator.SliceIntegrationUnavailable: no
+//     orchestrator, no GitHub client, or a parent with no installation id —
+//     a GitHub-less or GitLab-forge deployment) → admit with a WARN (approval
+//     condition C3). integrateSlices graceful-skips there and never writes a
+//     slices_integrated record, so requiring one would wedge every decomposed
+//     parent forever; that deployment keeps its pre-#4080 behaviour;
+//   - a nil AuditRepo → REFUSE with every succeeded child unintegrated (fail
+//     closed — the same posture resolveDependentChildBase takes: no record can
+//     be read, so no coverage can be proven);
+//   - the slices_integrated LIST errors → err (500, fail closed); an absent or
+//     undecodable newest entry reads as no branch and no coverage → REFUSE;
+//   - otherwise REFUSE when any child has not succeeded, any succeeded child is
+//     uncovered, or the branch is empty; admit only on full coverage.
+//
+// Snapshot staleness is safe in one direction only, and it is the direction
+// that matters: run state succeeded is absorbing, and every integrateSlices
+// pass merges EVERY succeeded child (a slice-less one now fails closed rather
+// than being dropped), so a newer slices_integrated entry only ever covers a
+// SUPERSET. A stale snapshot can therefore cause a spurious refusal the caller
+// clears by re-dispatching, never an admit on a partial tree.
+func (s *Server) guardDecomposedParentAcceptance(ctx context.Context, runRow *run.Run, stage *run.Stage) (*acceptanceIntegrationError, error) {
+	if stage.Type != run.StageTypeAcceptance {
+		return nil, nil
+	}
+	if runRow.DecomposedFrom != nil {
+		return nil, nil
+	}
+	children, err := s.listAllDecomposedChildren(ctx, runRow.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(children) == 0 {
+		return nil, nil
+	}
+	if reason := s.cfg.Orchestrator.SliceIntegrationUnavailable(runRow); reason != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"decomposed-parent acceptance gate: no slice-integration authority ("+reason+"); no slices_integrated record will be written, so acceptance is admitted without a coverage check",
+			slog.String("run_id", runRow.ID.String()),
+			slog.Int("children", len(children)))
+		return nil, nil
+	}
+	sort.SliceStable(children, func(i, j int) bool {
+		a, b := children[i].SliceIndex, children[j].SliceIndex
+		switch {
+		case a != nil && b != nil && *a != *b:
+			return *a < *b
+		case a != nil && b == nil:
+			return true
+		case a == nil && b != nil:
+			return false
+		}
+		return children[i].ID.String() < children[j].ID.String()
+	})
+	var succeeded, nonSucceeded []string
+	for _, c := range children {
+		if c.State == run.StateSucceeded {
+			succeeded = append(succeeded, c.ID.String())
+		} else {
+			nonSucceeded = append(nonSucceeded, c.ID.String())
+		}
+	}
+	if s.cfg.AuditRepo == nil {
+		return &acceptanceIntegrationError{
+			unintegrated: wavecoverage.Uncovered(succeeded, nil),
+			nonSucceeded: nonSucceeded,
+		}, nil
+	}
+	branch, integrated, err := s.latestSlicesIntegrated(ctx, runRow.ID)
+	if err != nil {
+		return nil, err
+	}
+	unintegrated := wavecoverage.Uncovered(succeeded, integrated)
+	if len(nonSucceeded) == 0 && len(unintegrated) == 0 && branch != "" {
+		return nil, nil
+	}
+	return &acceptanceIntegrationError{
+		unintegrated:       unintegrated,
+		nonSucceeded:       nonSucceeded,
+		consolidatedBranch: branch,
+	}, nil
 }

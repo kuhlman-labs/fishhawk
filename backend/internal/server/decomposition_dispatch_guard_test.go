@@ -11,6 +11,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -738,4 +740,341 @@ func TestWaveIntegrationError_MessageAndDetails(t *testing.T) {
 	if got, ok := none.details()["missing_dependency_slices"].([]int); !ok || got == nil {
 		t.Errorf("missing_dependency_slices = %v, want a non-nil empty array", none.details()["missing_dependency_slices"])
 	}
+}
+
+// --- guardDecomposedParentAcceptance: the decomposed-parent acceptance gate (#4080) ---
+
+// accGuardInstallationID is the GitHub installation id the decomposed-parent
+// fixtures carry, so orchestrator.SliceIntegrationUnavailable reports an
+// integration authority and the gate is ARMED (approval condition C3).
+const accGuardInstallationID = int64(42)
+
+// newAccGuardServer wires the counting run repo, a chained audit fake and an
+// orchestrator holding a GitHub client — the integration authority the gate
+// requires before it will hold acceptance. au is passed in so a test can swap
+// in an error-injecting audit wrapper.
+func newAccGuardServer(t *testing.T, au audit.Repository) (*Server, *guardCountingRepo) {
+	t.Helper()
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	o := &orchestrator.Orchestrator{Runs: rr, GitHub: newConsolidateGitHub()}
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, Orchestrator: o}), rr
+}
+
+// seedAccParent seeds a top-level parent run (with an installation id) and an
+// ACCEPTANCE stage on it, returning both for the guard call.
+func seedAccParent(rr *guardCountingRepo) (*run.Run, *run.Stage) {
+	parent := rr.seedRun()
+	inst := accGuardInstallationID
+	parent.InstallationID = &inst
+	acc := rr.seedStage(parent.ID, 3, run.StageStateAwaitingHostDispatch)
+	acc.Type = run.StageTypeAcceptance
+	return parent, acc
+}
+
+// mustRefuse runs the guard and fails unless it refused without error,
+// returning the refusal.
+func mustRefuse(t *testing.T, s *Server, parent *run.Run, acc *run.Stage) *acceptanceIntegrationError {
+	t.Helper()
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+	if err != nil {
+		t.Fatalf("err = %v, want a refusal (nil error)", err)
+	}
+	if accErr == nil {
+		t.Fatal("guard admitted; want a 409 acceptance_integration_incomplete refusal")
+	}
+	return accErr
+}
+
+// (1) a NON-acceptance stage admits with ZERO reads: every implement / review /
+// plan dispatch on the marker path pays nothing for the gate.
+func TestAccGuard_NonAcceptanceStage_AdmitsNoReads(t *testing.T) {
+	s, rr := newAccGuardServer(t, newAuditCompleteAuditFake())
+	parent, _ := seedAccParent(rr)
+	impl := rr.seedStage(parent.ID, 1, run.StageStateAwaitingHostDispatch)
+	impl.Type = run.StageTypeImplement
+	seedGuardChild(rr, parent.ID, 0, run.StateRunning)
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, impl)
+	if err != nil || accErr != nil {
+		t.Fatalf("guard = (%v, %v), want (nil, nil)", accErr, err)
+	}
+	if rr.listRunsCalls != 0 {
+		t.Errorf("ListRuns calls = %d, want 0 — a non-acceptance stage must take the no-read fast path", rr.listRunsCalls)
+	}
+}
+
+// (2) a decomposed CHILD run admits with no children read: a child carries no
+// acceptance stage of its own to gate.
+func TestAccGuard_DecomposedChildRun_Admits(t *testing.T) {
+	s, rr := newAccGuardServer(t, newAuditCompleteAuditFake())
+	parent, _ := seedAccParent(rr)
+	child := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	acc := rr.seedStage(child.ID, 1, run.StageStateAwaitingHostDispatch)
+	acc.Type = run.StageTypeAcceptance
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), child, acc)
+	if err != nil || accErr != nil {
+		t.Fatalf("guard = (%v, %v), want (nil, nil)", accErr, err)
+	}
+	if rr.listRunsCalls != 0 {
+		t.Errorf("ListRuns calls = %d, want 0 for a decomposed child", rr.listRunsCalls)
+	}
+}
+
+// (3) zero children admits: the run is not a decomposed parent, so an ordinary
+// run's acceptance behaves byte-identically to before #4080 — even with NO
+// slices_integrated record at all, which would refuse a real parent.
+func TestAccGuard_NoChildren_Admits(t *testing.T) {
+	s, rr := newAccGuardServer(t, newAuditCompleteAuditFake())
+	parent, acc := seedAccParent(rr)
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+	if err != nil || accErr != nil {
+		t.Fatalf("guard = (%v, %v), want (nil, nil) for a non-decomposed run", accErr, err)
+	}
+}
+
+// (4) full coverage admits: every child succeeded and the newest entry names
+// them all plus a branch.
+func TestAccGuard_FullCoverage_Admits(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	b := seedGuardChild(rr, parent.ID, 1, run.StateSucceeded)
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String(), b.ID.String()})
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+	if err != nil || accErr != nil {
+		t.Fatalf("guard = (%v, %v), want (nil, nil) on full coverage", accErr, err)
+	}
+}
+
+// (5) the #4080 incident: the newest entry misses a SUCCEEDED child → refuse,
+// naming exactly that child.
+func TestAccGuard_NewestEntryMissesChild_Refuses(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	b := seedGuardChild(rr, parent.ID, 1, run.StateSucceeded)
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String()})
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if want := []string{b.ID.String()}; !reflectStrings(accErr.unintegrated, want) {
+		t.Errorf("unintegrated = %v, want %v", accErr.unintegrated, want)
+	}
+	if len(accErr.nonSucceeded) != 0 {
+		t.Errorf("nonSucceeded = %v, want empty", accErr.nonSucceeded)
+	}
+	if accErr.consolidatedBranch != waveConsolidatedBranch {
+		t.Errorf("consolidatedBranch = %q, want %q", accErr.consolidatedBranch, waveConsolidatedBranch)
+	}
+}
+
+// (6) the NEWEST-entry rule: an OLDER entry covering every child does not
+// excuse a newer one that misses one — coverage is read from one entry only.
+func TestAccGuard_OlderEntryCoversNewestMisses_Refuses(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	b := seedGuardChild(rr, parent.ID, 1, run.StateSucceeded)
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String(), b.ID.String()})
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String()})
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if want := []string{b.ID.String()}; !reflectStrings(accErr.unintegrated, want) {
+		t.Errorf("unintegrated = %v, want %v — the NEWEST entry decides", accErr.unintegrated, want)
+	}
+}
+
+// (7) no slices_integrated entry at all → refuse with consolidated_branch_present
+// false and every succeeded child unintegrated, in SLICE order even though the
+// children were seeded out of order.
+func TestAccGuard_NoEntry_RefusesInSliceOrder(t *testing.T) {
+	s, rr := newAccGuardServer(t, newAuditCompleteAuditFake())
+	parent, acc := seedAccParent(rr)
+	b := seedGuardChild(rr, parent.ID, 1, run.StateSucceeded)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if want := []string{a.ID.String(), b.ID.String()}; !reflectStrings(accErr.unintegrated, want) {
+		t.Errorf("unintegrated = %v, want %v (slice order)", accErr.unintegrated, want)
+	}
+	if d := accErr.details(); d["consolidated_branch_present"] != false {
+		t.Errorf("consolidated_branch_present = %v, want false", d["consolidated_branch_present"])
+	}
+}
+
+// (8) a non-succeeded child refuses even when every SUCCEEDED child is covered:
+// the fan-out itself is incomplete.
+func TestAccGuard_NonSucceededChild_Refuses(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	failed := seedGuardChild(rr, parent.ID, 1, run.StateFailed)
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String()})
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if want := []string{failed.ID.String()}; !reflectStrings(accErr.nonSucceeded, want) {
+		t.Errorf("nonSucceeded = %v, want %v", accErr.nonSucceeded, want)
+	}
+	if len(accErr.unintegrated) != 0 {
+		t.Errorf("unintegrated = %v, want empty — the succeeded child is covered", accErr.unintegrated)
+	}
+}
+
+// (9) covered but the newest entry names NO branch → refuse: there is no
+// consolidated tree to validate, so coverage alone is not sufficient.
+func TestAccGuard_CoveredEmptyBranch_Refuses(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	seedSlicesIntegrated(t, au, parent.ID, "", []string{a.ID.String()})
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if len(accErr.unintegrated) != 0 || len(accErr.nonSucceeded) != 0 {
+		t.Errorf("unintegrated=%v nonSucceeded=%v, want both empty — the branch is what is absent", accErr.unintegrated, accErr.nonSucceeded)
+	}
+	if !strings.Contains(accErr.message(), "no consolidated branch") {
+		t.Errorf("message = %q, want it to name the absent consolidated branch", accErr.message())
+	}
+}
+
+// (10) a nil AuditRepo REFUSES (fail closed): no record can be read, so no
+// coverage can be proven.
+func TestAccGuard_NilAuditRepo_Refuses(t *testing.T) {
+	s, rr := newAccGuardServer(t, nil)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if want := []string{a.ID.String()}; !reflectStrings(accErr.unintegrated, want) {
+		t.Errorf("unintegrated = %v, want %v — every succeeded child is unproven", accErr.unintegrated, want)
+	}
+}
+
+// (11) a children-LIST error propagates (the caller answers 500), never a
+// silent admit.
+func TestAccGuard_ChildrenListError_Errors(t *testing.T) {
+	s, rr := newAccGuardServer(t, newAuditCompleteAuditFake())
+	parent, acc := seedAccParent(rr)
+	rr.listRunsErr = errors.New("list runs boom")
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+	if err == nil {
+		t.Fatal("err = nil, want the children-list error propagated (fail closed)")
+	}
+	if accErr != nil {
+		t.Errorf("accErr = %+v, want nil — an errored read is retryable, not a refusal", accErr)
+	}
+}
+
+// (12) a slices_integrated LIST error propagates (the caller answers 500).
+func TestAccGuard_AuditListError_Errors(t *testing.T) {
+	au := &slicesIntegratedErrAudit{auditCompleteAuditFake: newAuditCompleteAuditFake(), err: errors.New("audit read boom")}
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+
+	accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+	if err == nil {
+		t.Fatal("err = nil, want the audit-read error propagated (fail closed)")
+	}
+	if accErr != nil {
+		t.Errorf("accErr = %+v, want nil", accErr)
+	}
+}
+
+// (13) an UNDECODABLE newest payload reads as no record and REFUSES — even
+// when an older, decodable entry covered every child.
+func TestAccGuard_UndecodablePayload_Refuses(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s, rr := newAccGuardServer(t, au)
+	parent, acc := seedAccParent(rr)
+	a := seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+	seedSlicesIntegrated(t, au, parent.ID, waveConsolidatedBranch, []string{a.ID.String()})
+	au.appendChained(t, parent.ID, nil, "slices_integrated", json.RawMessage(`"not-an-object"`))
+
+	accErr := mustRefuse(t, s, parent, acc)
+	if accErr.consolidatedBranch != "" {
+		t.Errorf("consolidatedBranch = %q, want empty on an undecodable newest payload", accErr.consolidatedBranch)
+	}
+}
+
+// (14) approval condition C3: with NO slice-integration authority the gate
+// stands down even on a parent with NO integration record, because
+// integrateSlices graceful-skips there and never writes one — holding
+// acceptance would wedge the parent forever. Each authority-less shape is a
+// subtest. The audit fake ERRORS on any slices_integrated read, so a nil error
+// also proves the gate never consulted the record.
+func TestAccGuard_NoIntegrationAuthority_StandsDown(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(s *Server, parent *run.Run)
+	}{
+		{"nil orchestrator", func(s *Server, _ *run.Run) { s.cfg.Orchestrator = nil }},
+		{"orchestrator without GitHub", func(s *Server, _ *run.Run) { s.cfg.Orchestrator.GitHub = nil }},
+		{"parent without installation id", func(_ *Server, parent *run.Run) { parent.InstallationID = nil }},
+		{"parent with zero installation id", func(_ *Server, parent *run.Run) { zero := int64(0); parent.InstallationID = &zero }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			au := &slicesIntegratedErrAudit{auditCompleteAuditFake: newAuditCompleteAuditFake(), err: errors.New("must not be read")}
+			s, rr := newAccGuardServer(t, au)
+			parent, acc := seedAccParent(rr)
+			seedGuardChild(rr, parent.ID, 0, run.StateSucceeded)
+			seedGuardChild(rr, parent.ID, 1, run.StateRunning)
+			tc.setup(s, parent)
+
+			accErr, err := s.guardDecomposedParentAcceptance(context.Background(), parent, acc)
+			if err != nil || accErr != nil {
+				t.Fatalf("guard = (%v, %v), want (nil, nil) — no integration authority means no record to require (C3)", accErr, err)
+			}
+		})
+	}
+}
+
+// TestAcceptanceIntegrationError_MessageAndDetails pins the refusal message and
+// the structured 409 payload, including the always-non-nil id arrays.
+func TestAcceptanceIntegrationError_MessageAndDetails(t *testing.T) {
+	full := &acceptanceIntegrationError{unintegrated: []string{"run-b"}, nonSucceeded: []string{"run-c"}, consolidatedBranch: "fishhawk/run-x"}
+	msg := full.message()
+	for _, want := range []string{"run-b", "run-c", "fishhawk_await_children", "partial tree", "do not retry this dispatch blindly"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "no consolidated branch") {
+		t.Errorf("message = %q, must not claim an absent branch when one was read", msg)
+	}
+	d := full.details()
+	if !reflectStrings(d["unintegrated_child_run_ids"].([]string), []string{"run-b"}) ||
+		!reflectStrings(d["non_succeeded_child_run_ids"].([]string), []string{"run-c"}) ||
+		d["consolidated_branch"] != "fishhawk/run-x" || d["consolidated_branch_present"] != true {
+		t.Errorf("details = %+v, want the four structured keys", d)
+	}
+	empty := (&acceptanceIntegrationError{}).details()
+	for _, k := range []string{"unintegrated_child_run_ids", "non_succeeded_child_run_ids"} {
+		if got, ok := empty[k].([]string); !ok || got == nil {
+			t.Errorf("%s = %#v, want a non-nil empty array", k, empty[k])
+		}
+	}
+	if empty["consolidated_branch_present"] != false {
+		t.Errorf("consolidated_branch_present = %v, want false", empty["consolidated_branch_present"])
+	}
+}
+
+func reflectStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
