@@ -423,7 +423,9 @@
       "path": "docs/adr/043-stale-base-integration-policy.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-090"
+      ],
       "applies_to": []
     },
     {
@@ -800,6 +802,26 @@
       "id": "ADR-089",
       "title": "First officer: a structurally read-only crew seat whose evidence-backed findings gate actions",
       "path": "docs/adr/089-first-officer-read-only-crew-seat.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-090",
+      "title": "Verify the merge candidate: a Fishhawk-dispatched merge requires an up-to-date head, and a base-advanced head must pass the project's declared verify command in a runner verify-only pass",
+      "path": "docs/adr/090-verify-the-merge-candidate.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-043"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-091",
+      "title": "Restart recovery re-dispatches orphaned advisory review rounds from a durable round-source descriptor instead of terminating them as failed",
+      "path": "docs/adr/091-restart-recovery-redispatches-advisory-review-rounds.md",
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
