@@ -259,6 +259,68 @@ func (e *pushFailedError) Error() string { return e.err.Error() }
 
 func (e *pushFailedError) Unwrap() []error { return []error{e.err, ErrPushFailed} }
 
+// ErrBaseFetchFailed is the PRE-COMMIT base-fetch sentinel (#4079): one of
+// CommitAndPush's two stash-then-fetch arms (RebaseFromRemote, FreshFetchBase)
+// had already stashed the agent's uncommitted edits when the `git fetch` of the
+// base — or the `git checkout -B <branch> FETCH_HEAD` that follows it — failed.
+// HEAD and the index are untouched (a failed fetch moves nothing, and
+// git-checkout refuses before switching), the working tree is CLEAN, and the
+// agent's edits live ONLY in the stash commit named on the typed
+// BaseFetchError. That is the incident shape: the consolidated base ref did not
+// resolve, the fetch failed, and the slice's work survived only because an
+// operator found the stash entry by hand.
+//
+// It wraps nothing about the push transport, so ErrPushFailed never matches it,
+// and it adds no classification arm: pushFailureCategory's default arm already
+// returns category C for a git fault.
+var ErrBaseFetchFailed = errors.New("gitops: base fetch failed after the agent edits were stashed")
+
+// BaseFetchError is the typed form of ErrBaseFetchFailed. StashSHA is the
+// commit `refs/stash` named IMMEDIATELY after this invocation's own
+// `git stash --include-untracked` succeeded — never read later from stash@{0},
+// because the stash stack is shared by every worktree of the repository and
+// another session may push onto it in between. Empty when the capture itself
+// failed (best-effort: the capture never blocks the commit path).
+//
+// The stash is deliberately NOT popped on this path: the caller's deferred
+// working-tree restore runs on a clean tree today, and a dirty tree would change
+// its behavior. The SHA is what keeps the edits recoverable
+// (`git stash apply <sha>`), and the runner pins it under a durable ref.
+type BaseFetchError struct {
+	// Ref is the ref the failing fetch targeted (the base for FreshFetchBase,
+	// the shared branch for RebaseFromRemote).
+	Ref string
+	// StashSHA is the stash commit holding the agent's edits.
+	StashSHA string
+	// Err is the original failure, carrying the unchanged
+	// "gitops: fetch <ref>: …" / "gitops: checkout <branch>: …" text.
+	Err error
+}
+
+func (e *BaseFetchError) Error() string {
+	msg := e.Err.Error()
+	if e.StashSHA != "" {
+		msg += "; agent edits preserved in stash commit " + e.StashSHA + " (recover with `git stash apply " + e.StashSHA + "`)"
+	}
+	return msg
+}
+
+// Unwrap yields BOTH the original error and the sentinel, so errors.Is matches
+// ErrBaseFetchFailed and every assertion on the underlying git error still
+// holds.
+func (e *BaseFetchError) Unwrap() []error { return []error{e.Err, ErrBaseFetchFailed} }
+
+// captureStashSHA resolves refs/stash right after a successful
+// `git stash --include-untracked`. Best-effort: an error returns "" so the
+// commit path proceeds exactly as before.
+func (p *Pusher) captureStashSHA(ctx context.Context, repoDir string) string {
+	out, err := p.runOut(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/stash")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
 // ErrFixupWorkStranded is the category-B sentinel for a fix-up pass that
 // reported no changes while leaving its work behind rather than on the branch
 // (#2884, run 8ae65577). The stranding shapes are a net-new stash entry (a
@@ -717,18 +779,22 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
+		// #4079: name THIS invocation's stash commit now, before anything else
+		// can push onto the shared stash stack, so a fetch/checkout failure
+		// below can say where the agent's edits are.
+		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// Fetch the remote branch tip into FETCH_HEAD. A URL fetch does not
 		// create or update any refs/remotes/<name>/<branch> tracking ref, so
 		// the subsequent checkout references FETCH_HEAD explicitly.
 		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.Branch); err != nil {
-			return nil, fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)
+			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: stashSHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)}
 		}
 		// Create/reset the local branch to the fetched remote tip. The agent's
 		// edits are stashed (uncommitted), so there are no local commits to
 		// rebase — this is equivalent to the prior fetch+checkout+pull --rebase
 		// with the branch fast-forwarded to the remote tip.
 		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
-			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
+			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
 		}
 		if err := p.popStash(ctx, args.RepoDir); err != nil {
 			return nil, err
@@ -749,6 +815,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
+		// #4079: capture this invocation's stash commit immediately (see the
+		// RebaseFromRemote arm above).
+		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// Base-freshness positioning (ADR-043 rev 2, #1294): this fetch sits as
 		// LATE in CommitAndPush as the reapply-before-commit invariant allows.
 		// The fetch -> checkout -B FETCH_HEAD -> popStash sequence MUST complete
@@ -767,11 +836,15 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// does not create a refs/remotes tracking ref, so the checkout
 		// references FETCH_HEAD explicitly. authEnv carries the run token to
 		// the fetch as process-scoped git config (#1933, #772).
+		//
+		// A failure of either step below is a BaseFetchError (#4079): the edits
+		// are stashed, HEAD has not moved, and the stash SHA is the recovery
+		// point the runner pins and names in the failure reason.
 		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
-			return nil, fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)}
 		}
 		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
-			return nil, fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
 		}
 		if err := p.popStash(ctx, args.RepoDir); err != nil {
 			return nil, err
