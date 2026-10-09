@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -3158,5 +3160,155 @@ func TestCrewEscalationOpen_UnconfiguredAuditRepo(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	if s.crewEscalationOpen(context.Background(), &run.Run{ID: uuid.New()}) {
 		t.Error("crewEscalationOpen = true with no audit repository configured; want false")
+	}
+}
+
+// --- ADR-090 / E83.33 / #4018: the merge-candidate gate on may_merge ---------
+
+// autoDriveVerifySpecYAML is autoDriveSpecYAML with a declared implement
+// verify command, so the merge-candidate verify requirement (D2/D4) applies.
+var autoDriveVerifySpecYAML = strings.Replace(autoDriveSpecYAML,
+	"      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n",
+	"      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n          verify:\n            command: \"scripts/test verify\"\n            timeout: \"5m\"\n", 1)
+
+// seedMayMergeCandidateRun walks a run under specYAML to the may_merge-Met,
+// merge-ready state, wires a merge-candidate GitHub stub whose live head is
+// mcvHead, and returns the run row the driver would pass.
+func seedMayMergeCandidateRun(t *testing.T, specYAML string) (*Server, *auditFake, *run.Run, *mergeCandidateGitHub) {
+	t.Helper()
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, specYAML)
+	stages[0].State = run.StageStateSucceeded
+	stages[1].State = run.StageStateSucceeded
+	if _, err := repo.TransitionRun(context.Background(), runID, run.StateRunning); err != nil {
+		t.Fatalf("TransitionRun -> running: %v", err)
+	}
+	if _, err := repo.SetRunPullRequestURL(context.Background(), runID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
+	gh := &mergeCandidateGitHub{headSHA: mcvHead, baseRef: mcvBaseRef}
+	s.cfg.GitHub = newMergeCandidateGitHubClient(t, gh)
+	runRow := getRun(t, repo, runID)
+	runRow.InstallationID = instID(42)
+	return s, au, runRow, gh
+}
+
+// seedAutoDriveChainRow appends a run-scoped chain row the merge-candidate
+// state predicate reads.
+func seedAutoDriveChainRow(au *auditFake, runID uuid.UUID, category string, payload any) {
+	raw, _ := json.Marshal(payload)
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	au.appended = append(au.appended, audit.ChainAppendParams{RunID: runID, Category: category, Payload: raw})
+}
+
+// TestAutoDriveRunGate_MergeCandidate_BehindObservesOnly pins D1 on the
+// delegated arm: a behind PR is observe-only naming fishhawk_rebase_run_branch,
+// nothing is dispatched, and the arm never rebases (the stub serves no merges
+// route, and only the probe's compare is issued). Counterfactual: deleting the
+// gate call in the may_merge arm dispatches the merge → RED.
+func TestAutoDriveRunGate_MergeCandidate_BehindObservesOnly(t *testing.T) {
+	s, au, runRow, gh := seedMayMergeCandidateRun(t, autoDriveSpecYAML)
+	gh.behind = 2
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || out.Paged || out.DecisionRequired {
+		t.Fatalf("outcome = %+v, want observe-only", out)
+	}
+	if !strings.Contains(out.Note, "fishhawk_rebase_run_branch") {
+		t.Errorf("note %q does not name fishhawk_rebase_run_branch", out.Note)
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", merger.called)
+	}
+	if gh.compareCalls != 1 {
+		t.Errorf("compare calls = %d, want exactly the one behind-probe", gh.compareCalls)
+	}
+	if n := countAudit(au, CategoryBranchRebased); n != 0 {
+		t.Errorf("branch_rebased rows = %d, want 0 (the delegated arm never auto-rebases)", n)
+	}
+}
+
+// TestAutoDriveRunGate_MergeCandidate_FailsClosed pins the fail-closed arms
+// on the delegated path: an unverified head, a failed verdict and a check
+// read error each return observe-only and dispatch nothing.
+func TestAutoDriveRunGate_MergeCandidate_FailsClosed(t *testing.T) {
+	cases := map[string]struct {
+		seed     func(au *auditFake, runID uuid.UUID, gh *mergeCandidateGitHub)
+		wantNote string
+	}{
+		"unverified": {func(au *auditFake, runID uuid.UUID, _ *mergeCandidateGitHub) {
+			seedAutoDriveChainRow(au, runID, CategoryBranchRebased, map[string]any{"new_head_sha": mcvHead})
+		}, "unverified"},
+		"verify failed": {func(au *auditFake, runID uuid.UUID, _ *mergeCandidateGitHub) {
+			seedAutoDriveChainRow(au, runID, CategoryBranchRebased, map[string]any{"new_head_sha": mcvHead})
+			seedAutoDriveChainRow(au, runID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+				HeadSHA: mcvHead, Cause: mergeCandidateCauseBaseAdvance, Result: mergeCandidateResultFailed})
+		}, "fishhawk_fixup_stage"},
+		"check read error": {func(_ *auditFake, _ uuid.UUID, gh *mergeCandidateGitHub) {
+			gh.compareStatus = http.StatusInternalServerError
+		}, "fail-closed"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, au, runRow, gh := seedMayMergeCandidateRun(t, autoDriveVerifySpecYAML)
+			tc.seed(au, runRow.ID, gh)
+
+			merger := &fakeMerger{}
+			out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+			if err != nil {
+				t.Fatalf("AutoDriveRunGate: %v", err)
+			}
+			if out.Acted || out.Paged || out.DecisionRequired {
+				t.Fatalf("outcome = %+v, want observe-only", out)
+			}
+			if !strings.Contains(out.Note, tc.wantNote) {
+				t.Errorf("note %q does not contain %q", out.Note, tc.wantNote)
+			}
+			if merger.called != 0 {
+				t.Errorf("merger called %d times, want 0 (fail-closed)", merger.called)
+			}
+		})
+	}
+}
+
+// TestAutoDriveRunGate_MergeCandidate_PassedDispatches pins the admit side on
+// the delegated arm: an up-to-date head with a passed verdict for exactly that
+// head dispatches the merge.
+func TestAutoDriveRunGate_MergeCandidate_PassedDispatches(t *testing.T) {
+	s, au, runRow, _ := seedMayMergeCandidateRun(t, autoDriveVerifySpecYAML)
+	seedAutoDriveChainRow(au, runRow.ID, CategoryBranchRebased, map[string]any{"new_head_sha": mcvHead})
+	seedAutoDriveChainRow(au, runRow.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: mcvHead, Cause: mergeCandidateCauseBaseAdvance, Result: mergeCandidateResultPassed})
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1", merger.called)
+	}
+}
+
+// TestMergeCandidateObserveNote pins the note per refusal code.
+func TestMergeCandidateObserveNote(t *testing.T) {
+	for code, want := range map[string]string{
+		mergeCodeBaseBehind:            "fishhawk_rebase_run_branch",
+		mergeCodeCandidateUnverified:   "fishhawk_await_stage",
+		mergeCodeCandidateVerifyFailed: "fishhawk_fixup_stage",
+		mergeCodeCandidateCheckFailed:  "D7",
+	} {
+		if got := mergeCandidateObserveNote(mergeCandidateGateResult{Code: code}); !strings.Contains(got, want) || !strings.Contains(got, "observe-only") {
+			t.Errorf("note(%s) = %q, want it to contain %q and observe-only", code, got, want)
+		}
 	}
 }
