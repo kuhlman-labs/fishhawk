@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sort"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -27,7 +29,10 @@ const restartBlockersRunScanLimit = 500
 // _parse_restart_blockers.
 const (
 	// restartBlockerUndispatchedChild: a decomposition child whose implement
-	// stage is still pending / awaiting_host_dispatch.
+	// stage is still pending / awaiting_host_dispatch AND whose decomposition
+	// parent is not terminal. A child of a succeeded / failed / cancelled
+	// parent can never be dispatched by that parent's fan-out, so a restart
+	// strands nothing (#4184).
 	restartBlockerUndispatchedChild = "undispatched_child"
 	// restartBlockerReviewInFlight: an unsettled plan/implement review round a
 	// restart would LOSE — one dispatched by THIS process that the next boot
@@ -36,8 +41,8 @@ const (
 	// that has not settled yet (#4077). An eligible current-process round is
 	// not a blocker: the next boot re-dispatches it.
 	restartBlockerReviewInFlight = "review_in_flight"
-	// restartBlockerCheckFailed: a per-run stage or audit read failed, so the
-	// daemon could not decide that run's state. scripts/dev treats it as a
+	// restartBlockerCheckFailed: a per-run stage, parent-run or audit read
+	// failed, so the daemon could not decide that run's state. scripts/dev treats it as a
 	// REFUSING blocker (fail-closed on a reachable-but-undecided daemon).
 	restartBlockerCheckFailed = "check_failed"
 )
@@ -72,6 +77,14 @@ type restartBlocker struct {
 	// real zero (no verdict yet) is emitted rather than omitted.
 	ConfiguredAgents *int `json:"configured_agents,omitempty"`
 	Landed           *int `json:"landed,omitempty"`
+}
+
+// parentLookup is one memoized decomposition-parent read: the parent's state,
+// or the error that read returned (including run.ErrNotFound). Caching the
+// error keeps a failing parent from being re-read once per child.
+type parentLookup struct {
+	state run.State
+	err   error
 }
 
 // handleListRestartBlockers implements GET /v0/restart-blockers.
@@ -130,6 +143,7 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	parents := map[uuid.UUID]parentLookup{}
 	for _, ru := range candidates {
 		allowed, ferr := filter.allows(ctx, ru.Repo)
 		if ferr != nil {
@@ -140,7 +154,7 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 		resp.ScannedRuns++
-		resp.Items = append(resp.Items, s.runRestartBlockers(ctx, ru)...)
+		resp.Items = append(resp.Items, s.runRestartBlockers(ctx, ru, parents)...)
 	}
 
 	sort.SliceStable(resp.Items, func(i, j int) bool {
@@ -158,13 +172,21 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 
 // runRestartBlockers derives every blocker one non-terminal run contributes.
 // Each check is independent: a read failure yields a check_failed item for
-// that check only and the others still run.
-func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run) []restartBlocker {
+// that check only and the others still run. parents memoizes the decomposition
+// parent reads for one request, so N children of one parent cost one GetRun.
+func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run, parents map[uuid.UUID]parentLookup) []restartBlocker {
 	var out []restartBlocker
 	runID := ru.ID.String()
 
 	// (a) Undispatched decomposition child: restarting mid-fan-out strands a
-	// child the operator (or run_children) has not dispatched yet.
+	// child the operator (or run_children) has not dispatched yet. Only a child
+	// of a NON-terminal parent counts: cancelling a parent does not cascade to
+	// its children (the source-side fix and backfill are #4186), so a child of a
+	// succeeded / failed / cancelled parent stays pending forever, can never be
+	// dispatched, and would otherwise wedge `scripts/dev post-merge` (#4184,
+	// defence in depth). A parent read that fails — including run.ErrNotFound
+	// across a concurrent delete, since decomposed_from is ON DELETE SET NULL —
+	// is a check_failed item, never a silent drop.
 	if ru.DecomposedFrom != nil {
 		stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, ru.ID)
 		if err != nil {
@@ -175,6 +197,14 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run) []restartB
 					continue
 				}
 				if st.State == run.StageStatePending || st.State == run.StageStateAwaitingHostDispatch {
+					parent := s.restartBlockerParent(ctx, *ru.DecomposedFrom, parents)
+					if parent.err != nil {
+						out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: restartBlockerStageImplement})
+						break
+					}
+					if parent.state.IsTerminal() {
+						break
+					}
 					out = append(out, restartBlocker{
 						RunID:       runID,
 						Reason:      restartBlockerUndispatchedChild,
@@ -249,4 +279,21 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run) []restartB
 		out = append(out, inFlight)
 	}
 	return out
+}
+
+// restartBlockerParent resolves a decomposition parent's state through the
+// per-request memo, reading the run once per distinct parent and caching the
+// error as well as the state.
+func (s *Server) restartBlockerParent(ctx context.Context, parentID uuid.UUID, parents map[uuid.UUID]parentLookup) parentLookup {
+	if p, ok := parents[parentID]; ok {
+		return p
+	}
+	var p parentLookup
+	if pr, err := s.cfg.RunRepo.GetRun(ctx, parentID); err != nil {
+		p.err = err
+	} else {
+		p.state = pr.State
+	}
+	parents[parentID] = p
+	return p
 }
