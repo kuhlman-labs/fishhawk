@@ -17362,3 +17362,131 @@ func TestAnswerDivergenceTool(t *testing.T) {
 		t.Errorf("result = %+v", out.Result)
 	}
 }
+
+// --- #4080: acceptance held on a decomposed parent's partial integration ---
+
+// seedAcceptancePendingRun seeds a LOCAL run whose plan + implement succeeded
+// and whose acceptance stage awaits a host dispatch, so classifyNextActions
+// emits acceptance_pending with a fishhawk_dispatch_stage stage=acceptance.
+func seedAcceptancePendingRun(fb *fakeBackend, runID uuid.UUID) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "awaiting_host_dispatch"},
+	}
+}
+
+// TestGetRunStatus_AcceptanceHeldOnPartialIntegration pins the next_actions
+// hold at the getRunStatus call site. MECHANISM: plan + implement succeeded and
+// acceptance awaits a host dispatch on a local run, so classifyNextActions
+// emits acceptance_pending with fishhawk_dispatch_stage stage=acceptance; the
+// partial slices_integrated comes from the fake backend's paginated audit.
+func TestGetRunStatus_AcceptanceHeldOnPartialIntegration(t *testing.T) {
+	setup := func(t *testing.T, integrated func(a, b uuid.UUID) []string) (*fakeBackend, *runResolver, uuid.UUID, uuid.UUID) {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedAcceptancePendingRun(fb, parent)
+		seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+		seedChildWithSlice(fb, b, "succeeded", "succeeded", 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+		if ids := integrated(a, b); ids != nil {
+			seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", ids)
+		}
+		return fb, newResolver(srv, nil), parent, b
+	}
+
+	t.Run("partial coverage holds acceptance", func(t *testing.T) {
+		_, r, parent, b := setup(t, func(a, _ uuid.UUID) []string { return []string{a.String()} })
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != acceptanceHeldIntegrationIncompleteState {
+			t.Fatalf("next_actions = %+v, want state %s", out.NextActions, acceptanceHeldIntegrationIncompleteState)
+		}
+		if offersAcceptanceDispatch(out.NextActions) {
+			t.Errorf("next_actions still offers an acceptance dispatch: %+v", out.NextActions.Actions)
+		}
+		if first := out.NextActions.Actions[0]; first.Action != "fishhawk_await_children" || first.Params["run_id"] != parent.String() {
+			t.Errorf("first action = %+v, want fishhawk_await_children on the parent", first)
+		}
+		if !strings.Contains(out.NextActions.Actions[0].Reason, b.String()) {
+			t.Errorf("reason %q must name the uncovered child %s", out.NextActions.Actions[0].Reason, b)
+		}
+		// The preview bring-up advisory precedes an acceptance dispatch; with the
+		// dispatch stripped it must not appear either.
+		for _, a := range out.NextActions.Actions {
+			if strings.Contains(a.Action, "preview") {
+				t.Errorf("acceptance preview advisory survived the hold: %+v", a)
+			}
+		}
+	})
+
+	t.Run("full coverage keeps the acceptance dispatch", func(t *testing.T) {
+		_, r, parent, _ := setup(t, func(a, b uuid.UUID) []string { return []string{a.String(), b.String()} })
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "acceptance_pending" || !offersAcceptanceDispatch(out.NextActions) {
+			t.Fatalf("next_actions = %+v, want acceptance_pending with the dispatch kept", out.NextActions)
+		}
+	})
+
+	t.Run("C3: no record + implement succeeded keeps the dispatch", func(t *testing.T) {
+		// No slices_integrated was ever written although the parent's implement
+		// stage succeeded: no integration authority — the server admits, so the
+		// display must not hold either.
+		_, r, parent, _ := setup(t, func(uuid.UUID, uuid.UUID) []string { return nil })
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "acceptance_pending" || !offersAcceptanceDispatch(out.NextActions) {
+			t.Fatalf("next_actions = %+v, want acceptance_pending unchanged on a deployment with no integration authority", out.NextActions)
+		}
+	})
+
+	t.Run("non-decomposed run is unchanged", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedAcceptancePendingRun(fb, runID)
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "acceptance_pending" || !offersAcceptanceDispatch(out.NextActions) {
+			t.Fatalf("next_actions = %+v, want acceptance_pending with the dispatch", out.NextActions)
+		}
+	})
+}
+
+// TestGetRunStatus_AcceptanceGate_NonDecomposed_NoFanInRead is the approval
+// condition C1 cost gate, in the TestGetRunStatus_ChildrenStatus_NonDecomposed_
+// NoRead style: a NON-decomposed acceptance_pending run (so the gate IS
+// consulted) probes plan_decomposed once and reads ZERO entries of the four
+// fan-in categories — fanInChildrenStatus returns before the paginated walk.
+func TestGetRunStatus_AcceptanceGate_NonDecomposed_NoFanInRead(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedAcceptancePendingRun(fb, runID)
+	r := newResolver(srv, nil)
+	if _, _, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()}); err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if fb.perRunAuditCategoryReads["plan_decomposed"] == 0 {
+		t.Error("plan_decomposed was never probed — the gate was not consulted, so this cost gate proves nothing")
+	}
+	for _, cat := range []string{"slices_integrated", "slice_head_missing", "slice_integration_failed", "slice_integration_conflict"} {
+		if n := fb.perRunAuditCategoryReads[cat]; n != 0 {
+			t.Errorf("%s reads = %d, want 0 for a non-decomposed run (C1: probe plan_decomposed first)", cat, n)
+		}
+	}
+}

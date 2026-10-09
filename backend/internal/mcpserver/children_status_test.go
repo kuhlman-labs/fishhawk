@@ -64,6 +64,18 @@ func TestShouldFetchChildrenStatus(t *testing.T) {
 			[]AuditEntry{{Category: "slice_integration_conflict"}}, true,
 		},
 		{
+			"slice_head_missing marker fires the gate (#4080)",
+			&Run{ID: uuid.NewString()},
+			[]Stage{{Type: "implement", State: "succeeded"}},
+			[]AuditEntry{{Category: "slice_head_missing"}}, true,
+		},
+		{
+			"slice_integration_failed marker fires the gate (#4080)",
+			&Run{ID: uuid.NewString()},
+			[]Stage{{Type: "implement", State: "failed"}},
+			[]AuditEntry{{Category: "slice_integration_failed"}}, true,
+		},
+		{
 			"ordinary run: no awaiting_children, no marker",
 			&Run{ID: uuid.NewString()},
 			[]Stage{{Type: "implement", State: "running"}},
@@ -102,33 +114,49 @@ func TestChildrenStatusFor_PlanDecomposedDecodeError(t *testing.T) {
 // --- pure classifier: one behavioral assertion per phase ---
 
 func TestClassifyIntegrationPhase(t *testing.T) {
-	succeeded := []ChildStatus{{State: "succeeded"}, {State: "succeeded"}}
-	inFlight := []ChildStatus{{State: "succeeded"}, {State: "running"}}
+	// C5: every row seeds NON-EMPTY child run ids and, where a clean
+	// integration exists, a REAL IntegratedChildRunIDs set — an empty id would
+	// be ignored by wavecoverage.Uncovered and let a row pass vacuously.
+	const idA, idB = "child-a", "child-b"
+	succeeded := []ChildStatus{{RunID: idA, SliceIndex: 0, State: "succeeded"}, {RunID: idB, SliceIndex: 1, State: "succeeded"}}
+	inFlight := []ChildStatus{{RunID: idA, SliceIndex: 0, State: "succeeded"}, {RunID: idB, SliceIndex: 1, State: "running"}}
+	full := []string{idA, idB}
+	partial := []string{idA}
 
-	// integratedSeq / conflictSeq are the highest audit Sequence of each fan-in
-	// kind, or -1 when absent. The both-present cases assert the ORDERING
-	// semantics (the relative sequences decide), not mere presence.
+	// Sequences are the highest audit Sequence of the clean kind and of the
+	// newest failure kind, or -1 when absent. The both-present cases assert
+	// the ORDERING semantics (the relative sequences decide), not mere presence.
 	const absent = int64(-1)
+	snap := func(intSeq int64, ids []string, failSeq int64, cause string) fanInSnapshot {
+		return fanInSnapshot{integratedSeq: intSeq, integratedChildRunIDs: ids, failureSeq: failSeq, failureCause: cause}
+	}
 	cases := []struct {
-		name          string
-		children      []ChildStatus
-		integratedSeq int64
-		conflictSeq   int64
-		want          string
+		name     string
+		children []ChildStatus
+		fi       fanInSnapshot
+		want     string
 	}{
-		{"a child still in flight, no fan-in", inFlight, absent, absent, integrationPhaseRunningChildren},
-		{"all succeeded, no fan-in audit yet", succeeded, absent, absent, integrationPhaseReadyToIntegrate},
-		{"slices_integrated present", succeeded, 10, absent, integrationPhaseIntegrated},
-		{"slice_integration_conflict present", succeeded, absent, 10, integrationPhaseConflict},
-		{"conflict superseded by a later clean integration", succeeded, 11, 7, integrationPhaseIntegrated},
-		{"older integration masked by a NEWER conflict stays conflict", succeeded, 7, 11, integrationPhaseConflict},
-		{"no children at all classifies running_children", nil, absent, absent, integrationPhaseRunningChildren},
+		{"a child still in flight, no fan-in", inFlight, snap(absent, nil, absent, ""), integrationPhaseRunningChildren},
+		{"all succeeded, no fan-in audit yet", succeeded, snap(absent, nil, absent, ""), integrationPhaseReadyToIntegrate},
+		{"full coverage + all succeeded -> integrated", succeeded, snap(10, full, absent, ""), integrationPhaseIntegrated},
+		{"PARTIAL newest entry + all succeeded -> ready_to_integrate", succeeded, snap(10, partial, absent, ""), integrationPhaseReadyToIntegrate},
+		{"partial newest entry + a child running -> running_children", inFlight, snap(10, partial, absent, ""), integrationPhaseRunningChildren},
+		{"FULL entry but a child running -> running_children", inFlight, snap(10, full, absent, ""), integrationPhaseRunningChildren},
+		{"all succeeded + EMPTY integrated set -> NOT integrated", succeeded, snap(10, []string{}, absent, ""), integrationPhaseReadyToIntegrate},
+		{"integrated set naming only unrelated ids -> NOT integrated", succeeded, snap(10, []string{"other"}, absent, ""), integrationPhaseReadyToIntegrate},
+		{"head-missing newer than integration -> integration_failed", succeeded, snap(5, full, 9, auditCategorySliceHeadMissing), integrationPhaseFailed},
+		{"slice_integration_failed newer -> integration_failed", succeeded, snap(5, partial, 9, auditCategorySliceIntegrationFailed), integrationPhaseFailed},
+		{"conflict newer -> integration_conflict", succeeded, snap(5, partial, 9, auditCategorySliceIntegrationConflict), integrationPhaseConflict},
+		{"lone conflict, no integration -> integration_conflict", succeeded, snap(absent, nil, 9, auditCategorySliceIntegrationConflict), integrationPhaseConflict},
+		{"head-missing mid-fan-out -> integration_failed", inFlight, snap(absent, nil, 3, auditCategorySliceHeadMissing), integrationPhaseFailed},
+		{"clean full integration newer than a head-missing -> integrated", succeeded, snap(11, full, 7, auditCategorySliceHeadMissing), integrationPhaseIntegrated},
+		{"conflict superseded by a later clean FULL integration", succeeded, snap(11, full, 7, auditCategorySliceIntegrationConflict), integrationPhaseIntegrated},
+		{"no children at all classifies running_children", nil, snap(absent, nil, absent, ""), integrationPhaseRunningChildren},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyIntegrationPhase(c.children, c.integratedSeq, c.conflictSeq); got != c.want {
-				t.Errorf("classifyIntegrationPhase(%+v, integratedSeq=%d, conflictSeq=%d) = %q, want %q",
-					c.children, c.integratedSeq, c.conflictSeq, got, c.want)
+			if got := classifyIntegrationPhase(c.children, c.fi); got != c.want {
+				t.Errorf("classifyIntegrationPhase(%+v, %+v) = %q, want %q", c.children, c.fi, got, c.want)
 			}
 		})
 	}
@@ -826,4 +854,178 @@ func TestDecodeIntegratedChildRunIDs_FailsClosed(t *testing.T) {
 	if got := decodeIntegratedChildRunIDs(map[string]any{"consolidated_branch": "b"}); got != nil {
 		t.Errorf("payload without the key -> %v, want nil", got)
 	}
+}
+
+// --- #4080: coverage + fan-in failure fields ---
+
+// fanInEntry builds an audit entry whose payload keys come from a DECODER
+// struct's json tags (marshalled through encoding/json), never hand-written.
+func fanInEntry(t *testing.T, seq int64, category string, payload any) AuditEntry {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return AuditEntry{ID: uuid.NewString(), Sequence: seq, Category: category, Payload: m}
+}
+
+// TestChildrenStatusFor_UnintegratedChildRunIDs pins the coverage field: the
+// succeeded children the NEWEST slices_integrated does not cover, in slice
+// order; a running child is never listed (it has no slice to integrate yet).
+func TestChildrenStatusFor_UnintegratedChildRunIDs(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	seedChildRunSliceDeps(fb, a, "succeeded", 0, nil)
+	seedChildRunSliceDeps(fb, b, "succeeded", 1, nil)
+	seedChildRunSliceDeps(fb, c, "running", 2, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+	recent := []AuditEntry{
+		{Sequence: 3, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "br", []string{a.String(), b.String()})},
+		// The NEWEST entry covers only a — b must be reported uncovered.
+		{Sequence: 8, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "br", []string{a.String()})},
+	}
+	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	if len(cs.UnintegratedChildRunIDs) != 1 || cs.UnintegratedChildRunIDs[0] != b.String() {
+		t.Errorf("unintegrated_child_run_ids = %v, want [%s] (newest entry rule; running child excluded)", cs.UnintegratedChildRunIDs, b)
+	}
+	if cs.IntegrationPhase != integrationPhaseRunningChildren {
+		t.Errorf("phase = %q, want running_children (a between-wave entry no longer reads as integrated)", cs.IntegrationPhase)
+	}
+	if cs.IntegrationFailure != nil {
+		t.Errorf("integration_failure = %+v, want nil with no failure record", cs.IntegrationFailure)
+	}
+}
+
+// TestChildrenStatusFor_IntegrationFailureDecodePerCause pins the decode of
+// each fan-in failure kind into IntegrationFailure, and that the failure is
+// surfaced only when strictly newer than the newest clean integration.
+func TestChildrenStatusFor_IntegrationFailureDecodePerCause(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildRunSliceDeps(fb, a, "succeeded", 0, nil)
+	seedChildRunSliceDeps(fb, b, "succeeded", 1, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	clean := AuditEntry{Sequence: 5, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "br", []string{a.String()})}
+
+	cases := []struct {
+		name      string
+		failure   AuditEntry
+		wantPhase string
+		want      integrationFailure
+	}{
+		{
+			name: "slice_head_missing",
+			failure: fanInEntry(t, 9, auditCategorySliceHeadMissing,
+				sliceHeadMissingPayload{ChildRunID: b.String(), SliceIndex: intPtr(1), Branch: "fishhawk/run-p/slice-1", Detail: "404"}),
+			wantPhase: integrationPhaseFailed,
+			want:      integrationFailure{Cause: auditCategorySliceHeadMissing, ChildRunID: b.String(), SliceIndex: intPtr(1), Branch: "fishhawk/run-p/slice-1", Detail: "404", Sequence: 9},
+		},
+		{
+			name: "slice_integration_conflict",
+			failure: fanInEntry(t, 9, auditCategorySliceIntegrationConflict,
+				sliceIntegrationConflictPayload{ConflictingChildRunID: b.String(), ConflictingSliceIndex: intPtr(1)}),
+			wantPhase: integrationPhaseConflict,
+			want:      integrationFailure{Cause: auditCategorySliceIntegrationConflict, ChildRunID: b.String(), SliceIndex: intPtr(1), Sequence: 9},
+		},
+		{
+			name: "slice_integration_failed",
+			failure: fanInEntry(t, 9, auditCategorySliceIntegrationFailed,
+				sliceIntegrationFailedPayload{Attempts: 3, Error: "boom"}),
+			wantPhase: integrationPhaseFailed,
+			want:      integrationFailure{Cause: auditCategorySliceIntegrationFailed, Detail: "after 3 attempts: boom", Sequence: 9},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cs, err := r.childrenStatusFor(context.Background(), parent, []AuditEntry{clean, c.failure})
+			if err != nil {
+				t.Fatalf("childrenStatusFor: %v", err)
+			}
+			if cs.IntegrationPhase != c.wantPhase {
+				t.Errorf("phase = %q, want %q", cs.IntegrationPhase, c.wantPhase)
+			}
+			if !reflect.DeepEqual(cs.IntegrationFailure, &c.want) {
+				t.Errorf("integration_failure = %+v, want %+v", cs.IntegrationFailure, c.want)
+			}
+			// Superseded: a NEWER clean integration clears the failure.
+			newer := AuditEntry{Sequence: 12, Category: "slices_integrated", Payload: slicesIntegratedPayloadMap(t, "br", []string{a.String(), b.String()})}
+			cs2, err := r.childrenStatusFor(context.Background(), parent, []AuditEntry{clean, c.failure, newer})
+			if err != nil {
+				t.Fatalf("childrenStatusFor (superseded): %v", err)
+			}
+			if cs2.IntegrationFailure != nil || cs2.IntegrationPhase != integrationPhaseIntegrated {
+				t.Errorf("superseded: phase=%q failure=%+v, want integrated + nil", cs2.IntegrationPhase, cs2.IntegrationFailure)
+			}
+		})
+	}
+}
+
+// TestDecodeIntegrationFailure_UndecodablePayloadKeepsCause: a garbled payload
+// still yields the cause and sequence (the category alone selects the remedy).
+func TestDecodeIntegrationFailure_UndecodablePayloadKeepsCause(t *testing.T) {
+	f := decodeIntegrationFailure(&AuditEntry{Sequence: 4, Category: auditCategorySliceHeadMissing, Payload: map[string]any{"child_run_id": 7}})
+	if f.Cause != auditCategorySliceHeadMissing || f.Sequence != 4 || f.ChildRunID != "" {
+		t.Errorf("decodeIntegrationFailure = %+v, want cause+sequence with empty child", f)
+	}
+	f = decodeIntegrationFailure(&AuditEntry{Sequence: 6, Category: auditCategorySliceIntegrationFailed, Payload: func() {}})
+	if f.Cause != auditCategorySliceIntegrationFailed || f.Detail != "" {
+		t.Errorf("unmarshalable payload = %+v, want cause with empty detail", f)
+	}
+}
+
+// assertDecoderKeysInEmitter is the payload-key-tie pin shared by the fan-in
+// failure decoders (#4080), the TestSlicesIntegratedPayloadKeysMatchEmitter
+// pattern: the producers live in childcompletion (unexported), so this reflects
+// the decoder's json tags and asserts each appears VERBATIM in the named
+// emitter's payload literal on disk. A rename on either side reddens.
+func assertDecoderKeysInEmitter(t *testing.T, decoder any, emitterMarker string) {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join("..", "childcompletion", "sweeper.go"))
+	if err != nil {
+		t.Fatalf("read the emitter source: %v", err)
+	}
+	body := string(src)
+	idx := strings.Index(body, emitterMarker)
+	if idx < 0 {
+		t.Fatalf("%q not found in childcompletion/sweeper.go — the producer moved; retarget this pin", emitterMarker)
+	}
+	rest := body[idx:]
+	if end := strings.Index(rest, "\nfunc "); end > 0 {
+		rest = rest[:end]
+	}
+	typ := reflect.TypeOf(decoder)
+	if typ.NumField() == 0 {
+		t.Fatalf("%s has no fields — the pin would be vacuous", typ.Name())
+	}
+	for i := 0; i < typ.NumField(); i++ {
+		tag := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if tag == "" {
+			t.Fatalf("%s field %s has no json tag", typ.Name(), typ.Field(i).Name)
+		}
+		if !strings.Contains(rest, `"`+tag+`"`) {
+			t.Errorf("decoder key %q (%s) is absent from %s's payload literal — the read side and the write side have drifted", tag, typ.Name(), emitterMarker)
+		}
+	}
+}
+
+func TestSliceHeadMissingPayloadKeysMatchEmitter(t *testing.T) {
+	assertDecoderKeysInEmitter(t, sliceHeadMissingPayload{}, "func (s *Sweeper) emitSliceHeadMissing(")
+}
+
+func TestSliceIntegrationFailedPayloadKeysMatchEmitter(t *testing.T) {
+	assertDecoderKeysInEmitter(t, sliceIntegrationFailedPayload{}, "func (s *Sweeper) emitSliceIntegrationFailed(")
+}
+
+func TestSliceIntegrationConflictPayloadKeysMatchEmitter(t *testing.T) {
+	assertDecoderKeysInEmitter(t, sliceIntegrationConflictPayload{}, "func (s *Sweeper) emitSliceIntegrationConflict(")
 }

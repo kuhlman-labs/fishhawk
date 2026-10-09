@@ -28,7 +28,21 @@ type AwaitChildrenInput struct {
 //   - "children_dispatchable" — some child's implement stage is awaiting a host
 //     dispatch AND its dependency slices are provably merged onto the parent's
 //     consolidated branch, so fishhawk_run_children will actually spawn it.
-//   - "children_settled"      — every child reached a terminal run state.
+//   - "integration_failed"    — the parent's newest fan-in FAILURE
+//     (slice_head_missing, slice_integration_conflict or
+//     slice_integration_failed) is newer than its newest clean integration
+//     (#4080). Released even while children are in flight: a between-wave
+//     failure blocks the dependent wave indefinitely.
+//   - "children_failed"       — every child is terminal and some did not
+//     succeed (#4080).
+//   - "integration_pending"   — every child succeeded but the newest
+//     slices_integrated entry does not cover every child (#4080): the
+//     consolidated branch lacks those slices, so acceptance and review wait.
+//   - "children_settled"      — every child succeeded AND the newest
+//     slices_integrated entry covers every child (#4080; before, any terminal
+//     fan-out released this). On a deployment with no slice-integration
+//     authority — no record is ever written — it falls back to the pre-#4080
+//     all-terminal release (approval condition C3).
 //   - "timeout"               — none of the above within the window. The wait
 //     holds no server state, so re-calling is a safe no-op.
 //
@@ -39,7 +53,7 @@ type AwaitChildrenInput struct {
 // neither fire before the integration it is waiting for, nor — when the
 // interesting change already happened before the call — ever fire at all.
 type AwaitChildrenOutput struct {
-	Status string `json:"status" jsonschema:"one of amendment_pending, children_dispatchable, children_settled, timeout"`
+	Status string `json:"status" jsonschema:"one of amendment_pending, children_dispatchable, integration_failed, children_failed, integration_pending, children_settled, timeout"`
 	RunID  string `json:"run_id" jsonschema:"the decomposed parent run UUID the wait was armed against"`
 	// Children is the SAME ChildrenStatus snapshot fishhawk_get_run_status
 	// carries, returned on every release so the operator sees the whole fan-out
@@ -55,8 +69,17 @@ type AwaitChildrenOutput struct {
 	// DispatchableChildRunIDs names every child that is dispatchable NOW, in
 	// ascending slice order (status children_dispatchable).
 	DispatchableChildRunIDs []string `json:"dispatchable_child_run_ids,omitempty" jsonschema:"the children whose implement stage awaits a host dispatch AND whose dependency slices are already merged onto the consolidated branch, in ascending slice order"`
+	// UnintegratedChildRunIDs names the succeeded children the newest
+	// slices_integrated entry does not cover (status integration_pending).
+	UnintegratedChildRunIDs []string `json:"unintegrated_child_run_ids,omitempty" jsonschema:"the succeeded children whose slices are NOT on the consolidated branch yet, in slice order (status integration_pending)"`
+	// IntegrationFailure names the fan-in failure that released the wait
+	// (status integration_failed).
+	IntegrationFailure *integrationFailure `json:"integration_failure,omitempty" jsonschema:"the fan-in failure that released the wait (status integration_failed): its cause (audit category), the failing child and slice, and the detail"`
+	// FailedChildRunIDs names the terminal children that did not succeed
+	// (status children_failed), in slice order.
+	FailedChildRunIDs []string `json:"failed_child_run_ids,omitempty" jsonschema:"the terminal children that did not succeed, in slice order (status children_failed)"`
 	// NextStep is the single pre-filled call to make on this release.
-	NextStep            *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on this release: decide the amendment, re-invoke run_children, or consolidate"`
+	NextStep            *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on this release: decide the amendment, re-invoke run_children, read the failure's audit, read the failed child's status, consolidate, or re-arm the wait"`
 	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation of the release"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	Heartbeat           bool             `json:"heartbeat" jsonschema:"true when your MCP client supplied a progressToken and a per-tick keep-alive was emitted"`
@@ -98,8 +121,35 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               so a state-keyed release would announce a dispatch
                               the server then refuses 409 wave_not_integrated.
                               next_step re-invokes fishhawk_run_children.
-  - "children_settled"      — every child reached a terminal run state.
-                              next_step is fishhawk_consolidate_slices.
+  - "integration_failed"    — the parent's newest fan-in FAILURE
+                              (slice_head_missing, slice_integration_conflict
+                              or slice_integration_failed) is newer than its
+                              newest clean integration. Released even while
+                              children are in flight. integration_failure names
+                              the cause, child, slice and detail; next_step is
+                              fishhawk_list_audit on that category. Do NOT
+                              dispatch acceptance or approve the review.
+  - "children_failed"       — every child is terminal and some did not
+                              succeed. next_step is fishhawk_get_run_status on
+                              the lowest-slice failed child, whose next_actions
+                              own its recovery.
+  - "integration_pending"   — every child succeeded but the newest
+                              slices_integrated record does not cover every
+                              child: the consolidated branch lacks those
+                              slices (unintegrated_child_run_ids), so
+                              acceptance and review must wait. next_step is
+                              fishhawk_consolidate_slices while the parent's
+                              implement stage is awaiting_children; once it has
+                              advanced (consolidate would answer 409
+                              not_awaiting_children) the message names the real
+                              recovery — re-drive or resume the uncovered child.
+  - "children_settled"      — every child succeeded AND the newest
+                              slices_integrated record covers every child.
+                              next_step is fishhawk_consolidate_slices. On a
+                              deployment with no slice-integration authority
+                              (no record is ever written and the parent's
+                              implement stage already succeeded) it falls back
+                              to releasing on an all-succeeded fan-out.
   - "timeout"               — none of the above within the window. The wait
                               holds no server state, so re-calling is a safe
                               idempotent no-op.
@@ -117,7 +167,7 @@ chosen deterministically: the LOWEST SLICE INDEX first (ties broken by run id so
 the order is total), and within that child the OLDEST pending request — the one
 closest to expiring. The loop is: await releases on one amendment; decide it;
 re-invoke await, which releases on the next pending one; repeat until it
-releases with children_dispatchable or children_settled. Because every child's
+releases with another status. Because every child's
 window runs concurrently while your session is free, serial decisions still land
 inside their individual windows — which is exactly the property this change
 exists to create.
@@ -281,41 +331,172 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 		return out, true, nil
 	}
 
-	// (3) children_settled — every child terminal.
-	if awaitChildrenAllSettled(cs) {
+	// (3) integration_failed — a fan-in failure newer than the newest clean
+	// integration. Released even mid-fan-out (#4080): a between-wave
+	// slice_head_missing or conflict blocks the dependent wave indefinitely, so
+	// waiting for every child to settle first would hide it.
+	if cs.IntegrationFailure != nil {
+		return awaitChildrenIntegrationFailedOutput(base, parentUUID, cs.IntegrationFailure), true, nil
+	}
+
+	// (4) every child terminal: children_failed, integration_pending or
+	// children_settled — settled ONLY on full coverage (#4080).
+	if !awaitChildrenAllSettled(cs) {
+		return AwaitChildrenOutput{}, false, nil
+	}
+	if failed := awaitChildrenNonSucceeded(cs); len(failed) > 0 {
 		out := base
-		out.Status = "children_settled"
+		out.Status = "children_failed"
+		out.FailedChildRunIDs = failed
+		out.NextStep = &SuggestedAction{
+			Action:       "fishhawk_get_run_status",
+			Params:       map[string]string{"run_id": failed[0]},
+			Precondition: "every decomposed child is terminal and this one (the lowest slice) did not succeed",
+			Consumes:     "none",
+			Reason:       "the failed child's next_actions own its recovery by failure category; the parent cannot integrate, review or accept until every child succeeds",
+		}
+		out.Message = fmt.Sprintf(
+			"all %d children are terminal but %d did not succeed (%s). The parent cannot integrate, so do NOT consolidate, approve the review or dispatch acceptance. "+
+				"Read fishhawk_get_run_status on %s (next_step) for its recovery, then re-invoke fishhawk_await_children.",
+			cs.Total, len(failed), strings.Join(failed, ", "), failed[0])
+		return out, true, nil
+	}
+	if cs.IntegrationPhase != integrationPhaseIntegrated {
+		parentImplementState := r.parentImplementStageState(ctx, parentUUID)
+		if !integrationAuthorityAbsent(cs, parentImplementState) {
+			return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
+		}
+		// C3: no fan-in record was EVER written although the parent's implement
+		// stage already succeeded — the server had no slice-integration
+		// authority and skipped the fan-in, and its acceptance gate stands down
+		// on exactly that deployment. Fall back to the pre-#4080 release.
+		out := awaitChildrenSettledOutput(base, parentUUID, cs)
+		out.Message += " No slices_integrated record exists although the parent's implement stage already succeeded: this deployment has no slice-integration authority (no GitHub client or no installation id), so no coverage is required."
+		return out, true, nil
+	}
+	return awaitChildrenSettledOutput(base, parentUUID, cs), true, nil
+}
+
+// awaitChildrenSettledOutput builds the children_settled release.
+func awaitChildrenSettledOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus) AwaitChildrenOutput {
+	out := base
+	out.Status = "children_settled"
+	out.NextStep = &SuggestedAction{
+		Action:       "fishhawk_consolidate_slices",
+		Params:       map[string]string{"run_id": parentUUID.String()},
+		Precondition: "every decomposed child succeeded and the newest slices_integrated record covers every child",
+		Consumes:     "none",
+		Reason:       "the fan-out is complete; consolidate the slices into the parent's consolidated branch and PR",
+	}
+	out.Message = fmt.Sprintf(
+		"all %d children succeeded and the consolidated branch carries every slice. Consolidate with fishhawk_consolidate_slices.",
+		cs.Total)
+	return out
+}
+
+// awaitChildrenIntegrationFailedOutput builds the integration_failed release
+// (#4080). next_step is fishhawk_list_audit on the failure's own category —
+// always legal and read-only — and the message carries the per-cause remedy.
+func awaitChildrenIntegrationFailedOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, f *integrationFailure) AwaitChildrenOutput {
+	out := base
+	out.Status = "integration_failed"
+	out.IntegrationFailure = f
+	out.NextStep = &SuggestedAction{
+		Action:       "fishhawk_list_audit",
+		Params:       map[string]string{"run_id": parentUUID.String(), "category": f.Cause},
+		Precondition: "the parent's newest fan-in failure is newer than its newest clean slices_integrated record",
+		Consumes:     "none",
+		Reason:       "read the failure record; the consolidated branch does not carry every slice, so acceptance and review must wait",
+	}
+	slice := "unknown"
+	if f.SliceIndex != nil {
+		slice = fmt.Sprintf("%d", *f.SliceIndex)
+	}
+	var what, remedy string
+	switch f.Cause {
+	case auditCategorySliceHeadMissing:
+		what = fmt.Sprintf("the slice branch %q of child %s (slice %s) is missing: %s", f.Branch, f.ChildRunID, slice, f.Detail)
+		remedy = "push the missing slice branch, or resume the child's push (fishhawk_get_run_status on the child names how); the server re-integrates once the branch exists"
+	case auditCategorySliceIntegrationConflict:
+		what = fmt.Sprintf("child %s (slice %s) could not merge onto the consolidated branch (merge conflict)", f.ChildRunID, slice)
+		remedy = "re-drive the conflicting child onto the current consolidated branch (fishhawk_get_run_status on the parent names the conflict-resolution move)"
+	default:
+		what = fmt.Sprintf("the fan-in gave up: %s", f.Detail)
+		remedy = "read fishhawk_get_run_status on the parent for the category-B decomposed-parent recovery"
+	}
+	out.Message = fmt.Sprintf(
+		"slice integration failed for parent %s (%s, audit sequence %d): %s. Do NOT dispatch acceptance or approve the review — the consolidated branch does not carry every slice. Remedy: %s; then re-invoke fishhawk_await_children.",
+		parentUUID, f.Cause, f.Sequence, what, remedy)
+	return out
+}
+
+// awaitChildrenIntegrationPendingOutput builds the integration_pending release
+// (#4080): every child succeeded but the newest slices_integrated does not
+// cover every child. next_step is CONDITIONAL on the parent's implement stage
+// (approval condition C4): fishhawk_consolidate_slices only answers while that
+// stage is awaiting_children — once it has advanced it answers 409
+// not_awaiting_children — so an advanced parent is pointed at the lowest-slice
+// uncovered child instead, and the message names the real recovery.
+func awaitChildrenIntegrationPendingOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus, parentImplementState string) AwaitChildrenOutput {
+	out := base
+	out.Status = "integration_pending"
+	out.UnintegratedChildRunIDs = cs.UnintegratedChildRunIDs
+	uncovered := strings.Join(cs.UnintegratedChildRunIDs, ", ")
+	if parentImplementState == "awaiting_children" {
 		out.NextStep = &SuggestedAction{
 			Action:       "fishhawk_consolidate_slices",
 			Params:       map[string]string{"run_id": parentUUID.String()},
-			Precondition: "every decomposed child reached a terminal run state",
+			Precondition: "every child succeeded, the newest slices_integrated record does not cover every child, and the parent's implement stage is awaiting_children",
 			Consumes:     "none",
-			Reason:       "the fan-out is complete; consolidate the slices into the parent's consolidated branch and PR",
+			Reason:       "run the fan-in on demand; it surfaces any integration error instead of waiting for the sweeper",
 		}
 		out.Message = fmt.Sprintf(
-			"all %d children are terminal (%d succeeded, %d failed). Consolidate with fishhawk_consolidate_slices.",
-			cs.Total, cs.Succeeded, cs.Failed)
-		return out, true, nil
+			"all %d children succeeded but the consolidated branch lacks the slices of %s (not covered by the newest slices_integrated record). Acceptance and review must wait. "+
+				"Run the fan-in now with fishhawk_consolidate_slices (next_step), then re-invoke fishhawk_await_children.",
+			cs.Total, uncovered)
+		return out
 	}
+	target := parentUUID.String()
+	if len(cs.UnintegratedChildRunIDs) > 0 {
+		target = cs.UnintegratedChildRunIDs[0]
+	}
+	out.NextStep = &SuggestedAction{
+		Action:       "fishhawk_get_run_status",
+		Params:       map[string]string{"run_id": target},
+		Precondition: "every child succeeded but the newest slices_integrated record does not cover every child, and the parent's implement stage is no longer awaiting_children",
+		Consumes:     "none",
+		Reason:       "fishhawk_consolidate_slices would answer 409 not_awaiting_children here; the uncovered child's slice must be re-driven or resumed",
+	}
+	stateText := parentImplementState
+	if stateText == "" {
+		stateText = "unreadable"
+	}
+	out.Message = fmt.Sprintf(
+		"all %d children succeeded but the consolidated branch lacks the slices of %s (not covered by the newest slices_integrated record). Acceptance and review must wait. "+
+			"The parent's implement stage is %s, not awaiting_children, so fishhawk_consolidate_slices would answer 409 not_awaiting_children. "+
+			"Recovery: re-drive or resume the uncovered child (fishhawk_get_run_status on it, next_step, names the move) so its slice reaches the consolidated branch, then re-invoke fishhawk_await_children.",
+		cs.Total, uncovered, stateText)
+	return out
+}
 
-	return AwaitChildrenOutput{}, false, nil
+// parentImplementStageState reads the parent's implement stage state for the
+// integration_pending / C3 arms. Best-effort: "" when the stage cannot be
+// resolved, which both arms treat as NOT awaiting_children and NOT succeeded —
+// so an unreadable parent is never read as an authority-less deployment.
+func (r *runResolver) parentImplementStageState(ctx context.Context, parentUUID uuid.UUID) string {
+	stage, err := r.resolveStage(ctx, parentUUID, "implement", "")
+	if err != nil {
+		return ""
+	}
+	return stage.State
 }
 
 // childrenStatusForAwait assembles the parent's ChildrenStatus snapshot for the
-// await verb. It reuses childrenStatusFor VERBATIM — the same block
-// fishhawk_get_run_status carries — feeding it the parent's recent audit window
-// so the integration phase, the consolidated branch and (E50.13 / #2363) the
-// integrated child run ids are decoded from the same entries.
+// await verb: fanInChildrenStatus (the same block fishhawk_get_run_status
+// carries, built from the FULL paginated fan-in history rather than the bounded
+// recent window) enriched with each child's implement-stage state.
 func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uuid.UUID) (*ChildrenStatus, error) {
-	entries, err := r.latestFanInAudit(ctx, parentUUID)
-	if err != nil {
-		// latestFanInAudit already wraps as "read parent audit: …" — the
-		// UNCHANGED contract awaitChildrenEvaluate reads, so a read failure
-		// (including cap exhaustion / a non-progressing cursor) surfaces as an
-		// error rather than a silently stale snapshot.
-		return nil, err
-	}
-	cs, err := r.childrenStatusFor(ctx, parentUUID, entries)
+	cs, err := r.fanInChildrenStatus(ctx, parentUUID)
 	if err != nil || cs == nil {
 		return cs, err
 	}
@@ -338,10 +519,37 @@ func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uui
 	return cs, nil
 }
 
+// fanInChildrenStatus is the FRESH decomposed-parent snapshot (#4080) shared by
+// fishhawk_await_children and the next_actions acceptance hold. It probes
+// LatestPlanDecomposed FIRST and returns (nil, nil) for a non-decomposed run
+// BEFORE any category-paginated audit walk (approval condition C1), so an
+// ordinary run pays one plan_decomposed read and zero fan-in reads. For a
+// decomposed parent it walks each fan-in category to its last page
+// (latestFanInAudit) and classifies off that, never off the bounded recent
+// window, where an aged-out slices_integrated would mis-classify the parent.
+func (r *runResolver) fanInChildrenStatus(ctx context.Context, parentUUID uuid.UUID) (*ChildrenStatus, error) {
+	pd, err := r.api.LatestPlanDecomposed(ctx, parentUUID)
+	if err != nil {
+		return nil, err
+	}
+	if pd == nil {
+		return nil, nil
+	}
+	entries, err := r.latestFanInAudit(ctx, parentUUID)
+	if err != nil {
+		// latestFanInAudit already wraps as "read parent audit: …" — the
+		// UNCHANGED contract awaitChildrenEvaluate reads, so a read failure
+		// (including cap exhaustion / a non-progressing cursor) surfaces as an
+		// error rather than a silently stale snapshot.
+		return nil, err
+	}
+	return r.childrenStatusFromDecomposition(ctx, pd, entries), nil
+}
+
 // awaitChildrenAuditLimit is the PER-PAGE size for the category-filtered fan-in
 // reads (#2695). It takes the endpoint's per-request cap of 500. A SINGLE window
 // no longer suffices and the old comment claiming it did was the bug: the fan-in
-// kinds (slices_integrated / slice_integration_conflict) land LATE in a
+// kinds (fanInCategories) land LATE in a
 // decomposed parent's audit, so on a parent with a longer history the newest
 // marker sits beyond the first 500-entry page — an unfiltered single read then
 // silently omits it and every await times out. latestFanInAudit instead
@@ -358,12 +566,22 @@ const awaitChildrenAuditLimit = 500
 // either way exhaustion is a READ FAILURE, never a silently-truncated snapshot.
 const awaitChildrenAuditMaxPages = 256
 
-// fanInCategories is the EXACTLY-TWO audit categories childrenStatusFor consumes
-// from the window it is handed (children_status.go switches on only these two and
-// keeps the max-Sequence entry per kind). Feeding it category-filtered pages of
-// just these is semantically identical to the old unfiltered window on a short
-// history and strictly correct on a long one.
-var fanInCategories = []string{"slices_integrated", "slice_integration_conflict"}
+// fanInCategories is the EXACTLY-FOUR audit categories childrenStatusFor consumes
+// from the window it is handed (children_status.go switches on only these four
+// and keeps the max-Sequence entry per kind): the clean slices_integrated plus
+// the three fan-in FAILURE kinds — slice_integration_conflict,
+// slice_head_missing (#4079) and slice_integration_failed (#1243) — added in
+// #4080 so a failure newer than the newest clean integration releases
+// integration_failed instead of hiding behind it. Feeding it category-filtered
+// pages of just these is semantically identical to an unfiltered window on a
+// short history and strictly correct on a long one; the cost is one bounded
+// paginated read per kind per poll.
+var fanInCategories = []string{
+	auditCategorySlicesIntegrated,
+	auditCategorySliceIntegrationConflict,
+	auditCategorySliceHeadMissing,
+	auditCategorySliceIntegrationFailed,
+}
 
 // latestFanInAudit assembles the fan-in markers for the await snapshot by
 // paginating EACH fan-in category to its last page and concatenating those final
@@ -537,6 +755,18 @@ func awaitChildrenDispatchable(cs *ChildrenStatus) []string {
 	return out
 }
 
+// awaitChildrenNonSucceeded returns the run ids of every child not in run state
+// succeeded, in slice order (status children_failed).
+func awaitChildrenNonSucceeded(cs *ChildrenStatus) []string {
+	var out []string
+	for _, c := range childrenInSliceOrder(cs.Children) {
+		if c.State != "succeeded" {
+			out = append(out, c.RunID)
+		}
+	}
+	return out
+}
+
 // awaitChildrenAllSettled reports whether every discovered child reached a
 // terminal run state. An "unknown" child (its per-child GetRun failed) is NOT
 // terminal, so a read failure can never fake a settled fan-out.
@@ -600,7 +830,7 @@ func awaitChildrenTimeoutOutput(runID string, timeout int, start time.Time, hear
 			Consumes:     "none",
 			Reason:       "re-arm the in-band wait — a timeout is a resumable idempotent checkpoint, not a terminal state",
 		},
-		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, or settled within %ds. "+
+		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, hit a fan-in failure, or settled within %ds. "+
 			"The wait holds nothing: re-call fishhawk_await_children to resume it (a safe idempotent no-op), "+
 			"or poll fishhawk_get_run_status every %ds (the authoritative path).",
 			runID, timeout, suggestedStageWaitPollIntervalSeconds),
@@ -617,6 +847,6 @@ func awaitChildrenNextStep(parentRunID string) *SuggestedAction {
 		Precondition: "children were dispatched detached on this parent",
 		Consumes:     "none",
 		Reason: "the dispatch is detached and this session is free — block here until a child files a mid-stage " +
-			"scope amendment (decidable IN BAND), another child becomes dispatchable, or every child settles",
+			"scope amendment (decidable IN BAND), another child becomes dispatchable, the fan-in fails, or every child settles",
 	}
 }

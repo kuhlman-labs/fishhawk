@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -619,9 +620,9 @@ func TestAcceptanceAdmission_RecoveryChild_NeedsTargetWithAncestorHead(t *testin
 }
 
 // getRunErrRepo wraps an orchestratorRepo and forces GetRun to fail while every
-// other method (GetStage, transitions, …) still works, so the handler's GetRun
-// call in the needs_target augmentation can be driven into its fail-open branch
-// without disturbing the orchestrator's own repo access.
+// other method (GetStage, transitions, …) still works, so the handler's own
+// run load can be driven into its error branch without disturbing the
+// orchestrator's repo access.
 type getRunErrRepo struct {
 	*orchestratorRepo
 }
@@ -630,41 +631,155 @@ func (r *getRunErrRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
 	return nil, errors.New("simulated run-repo transport failure")
 }
 
-// TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently pins the
-// deliberate fail-open branch (#1953): when live validation is required but the
-// handler's GetRun lookup fails, needs_target is dropped silently
-// (short_circuited:false, no hosts) rather than erroring the dispatch — the
-// caller's own spawn path still applies. The orchestrator keeps the working repo;
-// only the server's RunRepo GetRun fails.
-func TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently(t *testing.T) {
-	exampleBytes, _ := readAcceptanceExampleSpec(t)
-	mixed := []map[string]any{
-		allSkipWithBasisCriteria[0],
-		{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
-	}
-	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
-	seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
-
-	// Rebuild the server with a RunRepo that errors on GetRun; the orchestrator
-	// keeps seam.rr, so the short-circuit evaluation still runs and reports
-	// liveValidationRequired before the failing GetRun drops needs_target.
+// TestAcceptanceAdmission_GetRunError_FailsClosed500 pins approval condition C6
+// (#4080): the handler loads the run BEFORE the decomposed-parent integration
+// gate, and the gate cannot decide without it, so a load error answers 500
+// internal_error and settles nothing. This REPLACES the pre-#4080
+// TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently, which pinned
+// a post-walk GetRun failure silently dropping needs_target: the handler now
+// reuses the run the gate loaded, so that later read (and its fail-open) no
+// longer exists.
+//
+// MECHANISM: the plan is ALL-SKIP-WITH-BASIS and the orchestrator keeps the
+// working repo, so a handler that ignored the load error and fell through
+// would short-circuit — 200 short_circuited:true with the stage succeeded and
+// an acceptance_outcome_recorded row. The stage-state and outcome assertions
+// read committed state, not just the response code.
+func TestAcceptanceAdmission_GetRunError_FailsClosed500(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &getRunErrRepo{seam.rr}, AuditRepo: seam.au, Orchestrator: seam.o})
+
 	w := postAdmission(t, s, seam.acceptanceID, testOperatorIdentity())
+	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+		t.Errorf("acceptance stage = %q, want pending (nothing settled)", got)
+	}
+	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+		t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (fail closed, C6):\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+}
+
+// decomposeAdmissionSeam turns the seam's run into a decomposed PARENT with
+// two SUCCEEDED children (slice 0 and slice 1) and arms the #4080 gate: the
+// parent carries a GitHub installation id and the orchestrator a GitHub client,
+// so orchestrator.SliceIntegrationUnavailable reports an integration authority.
+// It returns the two children for the coverage fixtures.
+func decomposeAdmissionSeam(t *testing.T, seam *admissionSeam) (a, b *run.Run) {
+	t.Helper()
+	parent := seam.rr.runs[seam.runID]
+	inst := int64(42)
+	parent.InstallationID = &inst
+	seam.o.GitHub = newConsolidateGitHub()
+	seam.o.ConsolidatedReview = nil
+	child := func(idx int) *run.Run {
+		c := seam.rr.seedRun()
+		c.DecomposedFrom = &parent.ID
+		i := idx
+		c.SliceIndex = &i
+		c.State = run.StateSucceeded
+		return c
+	}
+	return child(0), child(1)
+}
+
+// seedAdmissionSlicesIntegrated appends a slices_integrated entry for the seam's
+// parent through the audit fake's real append path.
+func seedAdmissionSlicesIntegrated(t *testing.T, seam *admissionSeam, childRunIDs []string) {
+	t.Helper()
+	if _, err := seam.au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     seam.runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slices_integrated",
+		Payload:   slicesIntegratedPayload(t, waveConsolidatedBranch, childRunIDs),
+	}); err != nil {
+		t.Fatalf("seed slices_integrated: %v", err)
+	}
+}
+
+// TestAcceptanceAdmission_DecomposedParent_PartialIntegration_Refuses is the
+// #4080 done-means at the admission endpoint: a decomposed parent whose newest
+// slices_integrated covers only child a must not have its acceptance settled
+// against that partial tree.
+//
+// MECHANISM: the plan is ALL-SKIP-WITH-BASIS, so without the gate
+// TryShortCircuitAcceptance WOULD settle the stage succeeded with a
+// not_validated acceptance_outcome_recorded (the full-coverage test below
+// proves the short-circuit fires on this exact seam). Stage state and the
+// outcome row are read back after the call.
+//
+// COUNTERFACTUAL: deleting only the guard call in handleAcceptanceAdmission
+// answers 200 short_circuited:true with the stage succeeded — red.
+func TestAcceptanceAdmission_DecomposedParent_PartialIntegration_Refuses(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	a, b := decomposeAdmissionSeam(t, seam)
+	seedAdmissionSlicesIntegrated(t, seam, []string{a.ID.String()})
+
+	w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+		t.Errorf("acceptance stage = %q, want pending — the refusal must settle nothing", got)
+	}
+	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+		t.Errorf("acceptance_outcome_recorded = %d, want 0 — no verdict on a partial tree", n)
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "acceptance_integration_incomplete" {
+		t.Errorf("code = %q, want acceptance_integration_incomplete", code)
+	}
+	if got, _ := details["unintegrated_child_run_ids"].([]any); len(got) != 1 || got[0] != b.ID.String() {
+		t.Errorf("unintegrated_child_run_ids = %v, want [%s]", details["unintegrated_child_run_ids"], b.ID)
+	}
+}
+
+// TestAcceptanceAdmission_DecomposedParent_FullIntegration_ShortCircuits is the
+// paired admit, and the proof that the partial-coverage seam WOULD short-circuit
+// without the gate: with the newest entry covering both children the same
+// all-skip-with-basis plan settles the stage exactly as before #4080.
+func TestAcceptanceAdmission_DecomposedParent_FullIntegration_ShortCircuits(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	a, b := decomposeAdmissionSeam(t, seam)
+	seedAdmissionSlicesIntegrated(t, seam, []string{a.ID.String(), b.ID.String()})
+
+	w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	var resp acceptanceAdmissionResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.ShortCircuited {
-		t.Errorf("short_circuited = true, want false")
+	if !resp.ShortCircuited {
+		t.Errorf("short_circuited = false, want true on full coverage:\n%s", w.Body.String())
 	}
-	if resp.NeedsTarget {
-		t.Errorf("needs_target = true, want false (GetRun error drops it silently)")
+	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance stage = %q, want succeeded", got)
 	}
-	if len(resp.TargetHosts) != 0 {
-		t.Errorf("target_hosts = %v, want empty (dropped)", resp.TargetHosts)
+}
+
+// TestAcceptanceAdmission_DecomposedParent_AuditReadError_500 pins the gate's
+// fail-closed read arm on this endpoint: a slices_integrated read error answers
+// 500 internal_error and settles nothing.
+func TestAcceptanceAdmission_DecomposedParent_AuditReadError_500(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	decomposeAdmissionSeam(t, seam)
+	seam.au.listByCategoryErrCategory = "slices_integrated"
+
+	w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+		t.Errorf("acceptance stage = %q, want pending", got)
 	}
 }
 

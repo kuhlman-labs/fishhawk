@@ -97,6 +97,15 @@ type hostDispatchResponse struct {
 // deliberately NOT checked (a dead-runner re-spawn of an already-marked stage).
 // A stage-list read error there answers 500 dependency_check_failed.
 //
+// Decomposed-parent acceptance (#4080): an ACCEPTANCE stage of a run that has
+// decomposed children returns 409 acceptance_integration_incomplete — on every
+// state arm, idempotent included, and leaving the stage untouched — unless the
+// parent's newest slices_integrated covers EVERY child, every child succeeded,
+// and a consolidated branch is recorded (guardDecomposedParentAcceptance). It
+// stands down on a deployment with no slice-integration authority (no GitHub
+// client / no installation id), where no such record is ever written. A
+// children-list or audit read error answers 500 dependency_check_failed.
+//
 // Dev mode (E72.13 / #3500): a daemon with a dev-only surface mounted
 // (Config.DevFixtures / Config.DevStubForge — what `scripts/dev preview`
 // runs) refuses EVERY caller, identity-independent, with 403
@@ -317,6 +326,31 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	if waveErr != nil {
 		s.writeError(w, r, http.StatusConflict, "wave_not_integrated",
 			waveErr.message(), waveErr.details())
+		return
+	}
+
+	// Decomposed-parent acceptance integration gate (#4080). A decomposed
+	// PARENT's acceptance stage validates the consolidated branch, so spawning
+	// it before the parent's newest slices_integrated covers EVERY child
+	// validates a partial tree and fails as a wrong-tree false negative (run
+	// f16f2e77: 3 of 4 slices integrated, 5/5 criteria failed). Refusing 409
+	// acceptance_integration_incomplete HERE — after the wave guards, before
+	// the post-deploy hold and the state switch/CAS, inside the held
+	// stage-admission lock — commits NO state, so the stage stays parked and
+	// re-dispatchable once the fan-in completes. Like the wave-order guard it
+	// covers BOTH admissible arms AND the idempotent already-dispatched arm (a
+	// dead-runner re-spawn must not validate a partial tree either). Inert for
+	// every non-acceptance stage (no reads), every non-parent run, and a
+	// deployment with no slice-integration authority (C3); fail-CLOSED on an
+	// errored read. See guardDecomposedParentAcceptance.
+	if accErr, aerr := s.guardDecomposedParentAcceptance(r.Context(), runRow, stage); aerr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+			"could not read the decomposed parent's children or slices_integrated record to validate acceptance integration coverage",
+			map[string]any{"run_id": runID.String(), "error": aerr.Error()})
+		return
+	} else if accErr != nil {
+		s.writeError(w, r, http.StatusConflict, "acceptance_integration_incomplete",
+			accErr.message(), accErr.details())
 		return
 	}
 

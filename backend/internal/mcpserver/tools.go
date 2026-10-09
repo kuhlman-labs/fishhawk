@@ -1753,14 +1753,15 @@ type GetRunStatusOutput struct {
 	Precedent  *gatePrecedent  `json:"precedent,omitempty" jsonschema:"how this kind of gate was decided before (E75.4): the open gate's decision class, up to 3 cited prior decisions with explained scores + matched keys, the aggregate summary (modal outcome, agreement ratio) and a full_query pointer (fishhawk_precedent) to the unbounded set. DISPLAY-ONLY — never authority, never a gate input, never an agent input; the decision is still the captain's. Reason excerpts are elided unless include_review_prose=true. Omitted when no human gate is open or no precedent is indexed"`
 	// ChildrenStatus is the decomposed-parent per-child + integration-phase
 	// view (#1147): each child's live lifecycle state in slice-index order
-	// plus the fan-in phase classified from the slices_integrated /
-	// slice_integration_conflict audit kinds. Best-effort — a per-child read
+	// plus the fan-in phase classified from the four fan-in audit kinds
+	// (slices_integrated, slice_integration_conflict, slice_head_missing,
+	// slice_integration_failed; #4080). Best-effort — a per-child read
 	// failure degrades that child to state="unknown" rather than failing the
 	// snapshot. Cost-gated: fetched only for a decomposed parent (no
 	// parent_run_id, plus an awaiting_children implement stage or a
 	// decomposition audit marker in the recent window), so ordinary runs pay
 	// nothing. Omitted for non-decomposed runs.
-	ChildrenStatus *ChildrenStatus `json:"children_status,omitempty" jsonschema:"decomposed-parent per-child status + fan-in phase (#1147): children[] lists each child's live state (pending/running/succeeded/failed/unknown) in slice-index order; integration_phase is running_children, ready_to_integrate, integrated, or integration_conflict; consolidated_branch / conflicting_child_run_id surface the fan-in outcome. Best-effort (a child read failure yields state=unknown, never fails the snapshot). Omitted for non-decomposed runs"`
+	ChildrenStatus *ChildrenStatus `json:"children_status,omitempty" jsonschema:"decomposed-parent per-child status + fan-in phase (#1147): children[] lists each child's live state (pending/running/succeeded/failed/unknown) in slice-index order; integration_phase is running_children, ready_to_integrate, integrated (every child succeeded AND the newest slices_integrated covers every child), integration_conflict, or integration_failed; consolidated_branch / integrated_child_run_ids / unintegrated_child_run_ids / integration_failure / conflicting_child_run_id surface the fan-in outcome. Best-effort (a child read failure yields state=unknown, never fails the snapshot). Omitted for non-decomposed runs"`
 	// SecurityFindings surfaces the run's unresolved high-severity
 	// code-scanning (CodeQL/SAST) findings on the implement diff (#1096),
 	// distilled from the newest implement_security_findings audit entry. A
@@ -2061,10 +2062,18 @@ Also returns children_status for a DECOMPOSED PARENT (#1147): children[]
 lists each child's live lifecycle state (pending/running/succeeded/failed,
 or unknown when a per-child read failed) in slice-index order, and
 integration_phase classifies the fan-in — running_children (a child is
-still in flight), ready_to_integrate (all children succeeded, no fan-in
-yet), integrated (a slices_integrated audit recorded a clean fan-in, with
-consolidated_branch), or integration_conflict (a slice_integration_conflict
-audit recorded a merge conflict, with conflicting_child_run_id). Cost-gated:
+still in flight or failed), ready_to_integrate (all children succeeded but
+the newest slices_integrated does not cover every child;
+unintegrated_child_run_ids names them), integrated (all children succeeded
+AND the newest slices_integrated covers every child, with
+consolidated_branch), integration_conflict (a slice_integration_conflict
+newer than the newest clean integration, with conflicting_child_run_id), or
+integration_failed (a slice_head_missing or slice_integration_failed newer
+than the newest clean integration; integration_failure names the cause and
+child). While a decomposed parent is not integrated, next_actions never
+offers its acceptance dispatch: it reports
+acceptance_held_integration_incomplete with fishhawk_await_children first,
+matching the server's 409 acceptance_integration_incomplete. Cost-gated:
 fetched only for a decomposed parent (an awaiting_children implement stage
 or a decomposition audit marker), so ordinary runs make zero extra calls.
 Best-effort — never gates the run; omitted for non-decomposed runs.
@@ -2216,6 +2225,17 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// taken. Wired at BOTH nextActionsFor call sites (here and run_stage.go).
 	release.RollbackOffer = acceptanceRollbackOfferIn(recent)
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
+	// #4080: hold the acceptance dispatch for a decomposed parent whose
+	// consolidated branch does not provably carry every child's slice —
+	// state acceptance_held_integration_incomplete, fishhawk_await_children
+	// first. Folded IMMEDIATELY after nextActionsFor and BEFORE the acceptance
+	// redispatch/preview folds, so the preview bring-up advisory no-ops once
+	// the dispatch is stripped. Zero reads unless an acceptance dispatch is
+	// offered on a top-level run; reads a FRESH paginated fan-in snapshot (never
+	// the bounded recent window); fails open on a read error, because the
+	// server's 409 acceptance_integration_incomplete is the authority. Wired at
+	// BOTH nextActionsFor call sites (here and run_stage.go).
+	r.gateAcceptanceOnIntegration(ctx, runID, runRow, stages, nextActions)
 	// E64.63 (#3222): a merge-ritual arm whose acceptance stage is still
 	// NON-TERMINAL cannot actually merge — the fishhawk_audit_complete check is
 	// pending on that stage — so name the stage and the move. Display-only and
@@ -2737,9 +2757,11 @@ func (r *runResolver) latestFixupSequenceFor(ctx context.Context, runID uuid.UUI
 // top-level run, signal it is a decomposed parent whose children-status block
 // is worth the bounded per-child fetch (#1147).
 var decompositionAuditCategories = map[string]struct{}{
-	"plan_decomposed":            {},
-	"slices_integrated":          {},
-	"slice_integration_conflict": {},
+	"plan_decomposed":                     {},
+	auditCategorySlicesIntegrated:         {},
+	auditCategorySliceIntegrationConflict: {},
+	auditCategorySliceHeadMissing:         {},
+	auditCategorySliceIntegrationFailed:   {},
 }
 
 // shouldFetchChildrenStatus is the cost gate for the decomposed-parent

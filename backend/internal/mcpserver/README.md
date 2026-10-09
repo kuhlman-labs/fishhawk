@@ -841,8 +841,20 @@ detection anywhere in the verb. A transition-keyed release could neither fire be
 |---|---|---|
 | `amendment_pending` | some child has a pending mid-stage scope amendment (the strict [#2588](https://github.com/kuhlman-labs/fishhawk/issues/2588) predicate, reused verbatim per child) | `fishhawk_decide_scope_amendment`, pre-filled |
 | `children_dispatchable` | some child's **implement-stage** state is host-dispatchable (`{pending, awaiting_host_dispatch}`) **and** its dependency slices are COVERED per the shared `wavecoverage.Covered` predicate | `fishhawk_run_children` |
-| `children_settled` | every child reached a terminal run state | `fishhawk_consolidate_slices` |
+| `integration_failed` | the parent's newest fan-in FAILURE (`slice_head_missing`, `slice_integration_conflict` or `slice_integration_failed`) is newer than its newest clean `slices_integrated` — released **even while children are in flight**, since a between-wave failure blocks the dependent wave indefinitely ([#4080](https://github.com/kuhlman-labs/fishhawk/issues/4080)). `integration_failure` names the cause, child, slice and detail; the message carries the per-cause remedy and forbids acceptance/review | `fishhawk_list_audit` `{run_id: parent, category: <cause>}` |
+| `children_failed` | every child is terminal and some did not succeed (#4080); `failed_child_run_ids` names them | `fishhawk_get_run_status` on the lowest-slice failed child |
+| `integration_pending` | every child succeeded but the newest `slices_integrated` does not cover every child (`wavecoverage.Uncovered`, the predicate the server's acceptance gate refuses on); `unintegrated_child_run_ids` names them, and acceptance and review must wait (#4080) | `fishhawk_consolidate_slices` while the parent's implement stage is `awaiting_children`; once it has left that state (consolidate would answer 409 `not_awaiting_children`, approval condition C4) `fishhawk_get_run_status` on the lowest-slice uncovered child, with the message naming the recovery — re-drive or resume that child |
+| `children_settled` | every child succeeded **and** the newest `slices_integrated` covers every child (#4080; before, any all-terminal fan-out released this, so a parent could be consolidated, reviewed and accepted on a partial tree) | `fishhawk_consolidate_slices` |
 | `timeout` | none of the above within the window (resumable; the wait holds no server state) | `fishhawk_await_children` (re-arm) |
+
+**No integration authority (approval condition C3).** On a deployment where the server cannot integrate — no GitHub
+client, or a run with no installation id — `integrateSlices` graceful-skips, never writes a `slices_integrated`
+record, and the server's acceptance gate stands down. The MCP surface cannot see that configuration, so it infers it
+from its one observable consequence: **no fan-in record of any kind** although the parent's implement stage already
+**succeeded** (where authority exists, that stage resolves succeeded only after a fan-in pass wrote
+`slices_integrated`). On that snapshot `await_children` falls back to the pre-#4080 `children_settled` release and the
+`next_actions` hold below stands down, so a deployment that cannot integrate is never wedged. An unreadable parent
+stage is never read as authority-less.
 
 Every release — **including `timeout`** — carries the same `ChildrenStatus` snapshot and a `next_step`; a timeout's
 `next_step` re-arms the wait, since a timeout is a resumable checkpoint, not a terminal state.
@@ -854,14 +866,17 @@ approved 600s contract (`clampAwaitChildrenTimeout`, an await_children-specific 
 the **full 600s cap** by construction, and no other await verb's 360s default is touched.
 
 **The fan-in snapshot read is category-filtered and paginated ([#2695](https://github.com/kuhlman-labs/fishhawk/issues/2695)
-item 1).** The snapshot's fan-in markers (`slices_integrated` / `slice_integration_conflict`) land **late** in a
+item 1).** The snapshot's fan-in markers (`slices_integrated`, `slice_integration_conflict`, and — since
+[#4080](https://github.com/kuhlman-labs/fishhawk/issues/4080) — `slice_head_missing` and `slice_integration_failed`;
+`fanInCategories`) land **late** in a
 decomposed parent's audit, so the old single unfiltered 500-entry window silently dropped the newest marker on any
 parent with a longer history — every await then timed out. `latestFanInAudit` instead issues a **category-filtered**
 read per fan-in kind and walks each to its **LAST page** (the endpoint returns entries ascending, so the max-Sequence
 entry `childrenStatusFor` keeps is always on the last page). The walk **fails loud** rather than returning a stale page:
 a history exceeding the per-category page cap, and a non-progressing (looping) cursor, each surface as their OWN wrapped
 `read parent audit` error (distinct diagnoses), so `awaitChildrenEvaluate` sees a read FAILURE — never a confidently
-wrong snapshot.
+wrong snapshot. The walk is reached only through `fanInChildrenStatus`, which probes `plan_decomposed` FIRST and returns
+for a non-decomposed run before any fan-in read (approval condition C1).
 
 `children_dispatchable` keys on the child's **implement-stage** state, NOT its run-level state. A local decomposed
 child parked by `RuleChildrenDispatch` has its RUN advanced to `running` while its implement stage sits at
@@ -883,7 +898,7 @@ release. The selection is **deterministic**, not implementation-defined:
   closest to expiring.
 
 The loop is: await releases on one amendment → decide it → re-invoke await, which releases on the next pending one →
-repeat until it releases `children_dispatchable` or `children_settled`. Because every child's window runs concurrently
+repeat until it releases any other status. Because every child's window runs concurrently
 while the session is free, serial decisions still land inside their individual windows — which is exactly the property
 this change exists to create. `TestAwaitChildren_TwoPendingAmendments_DeterministicSelectionAndReArm` pins it.
 
@@ -907,9 +922,10 @@ detached child does not return.
 For a **decomposed parent**, `fishhawk_get_run_status` carries a `children_status` block so the operator sees the fan-out's live progress instead of a bare `awaiting_children`:
 
 - `children[]` — one entry per discovered child (`{run_id, slice_index, state, depends_on, blocked, blocked_by}`) in `plan_decomposed` (slice-index) order. `state` is the child run's lifecycle state (`pending`/`running`/`succeeded`/`failed`) or `unknown` when that child's read failed. Aggregate counts (`total`/`pending`/`running`/`succeeded`/`failed`) accompany it. **`depends_on`/`blocked`/`blocked_by` (E48.99 / #2546)** answer "what may I dispatch next" in one read: `depends_on` mirrors each child's `slice_depends_on` (from the parent plan's `decomposition`), and a second pass (keyed by SLICE INDEX, not slice position, so a non-dense `child_run_ids` never mis-associates a dependency) sets `blocked=true` with `blocked_by` naming the run ids of any dependency slice not yet `succeeded` — an `unknown`-state dependency counts as blocking, never as dispatchable. A dependency slice with NO minted sibling (absent from `child_run_ids`) ALSO counts as blocking — the read-side mirror of the host-dispatch guard's `not_minted` refusal, so the view never advertises a dispatch the backend would 409 `dependency_not_satisfied`; it has no run id, so `blocked_by` names it with a synthetic `slice N (not_minted)` marker. A wave-0 child (or a legacy backend that omits `slice_depends_on`) decodes to `depends_on=nil`, `blocked=false`, rendering exactly as before the field existed. This is the read-side companion to the host-dispatch wave-order guard (`backend/internal/server/decomposition_dispatch_guard.go`): the guard REFUSES an out-of-order individual dispatch `409 dependency_not_satisfied`, and the MCP api client annotates that refusal ONCE in `apiClient.HostDispatchStage` as a deliberate ordering refusal (so all three host-spawn verbs inherit it) pointing back here.
-- `integration_phase` — the fan-in phase classified from the `slices_integrated` / `slice_integration_conflict` audit kinds (ADR-041 / #1142): `running_children` (a child is still in flight), `ready_to_integrate` (all children succeeded, no fan-in yet), `integrated` (a clean fan-in — `consolidated_branch` is surfaced), or `integration_conflict` (a slice branch failed to merge — `conflicting_child_run_id` is surfaced).
+- `integration_phase` — the fan-in phase classified from the four fan-in audit kinds (`slices_integrated`, `slice_integration_conflict` — ADR-041 / #1142; `slice_head_missing` — #4079; `slice_integration_failed` — #1243) by the pure `classifyIntegrationPhase`, reworked for coverage in [#4080](https://github.com/kuhlman-labs/fishhawk/issues/4080): `integration_conflict` / `integration_failed` when the newest fan-in FAILURE is strictly newer than the newest clean integration (a conflict vs a head-missing or bounded-retry give-up); otherwise `integrated` ONLY when every child succeeded **and** the newest `slices_integrated` covers every child (`wavecoverage.Uncovered` empty); otherwise `ready_to_integrate` when every child succeeded; otherwise `running_children`. A partial between-wave `slices_integrated` therefore no longer reads as `integrated`. `consolidated_branch` / `integrated_child_run_ids` come from the newest `slices_integrated` in any phase; `unintegrated_child_run_ids` names the succeeded children it does not cover; `integration_failure` `{cause, child_run_id, slice_index, branch, detail, sequence}` names a failure newer than the newest clean integration; `conflicting_child_run_id` is kept for back-compat. Each failure payload decodes through ONE declared struct whose json tags are bound to the childcompletion sweeper's emitter literal on disk (`Test*PayloadKeysMatchEmitter`).
 - **Best-effort:** a per-child read failure degrades that child to `state="unknown"` and never fails the snapshot.
-- **Cost-gated:** the per-child fetch runs only for a top-level run (no `parent_run_id`) whose implement stage is `awaiting_children` **or** whose recent-audit window carries a decomposition marker (`plan_decomposed` / `slices_integrated` / `slice_integration_conflict`). An ordinary run makes **zero** extra calls (no `plan_decomposed` read), and the block is omitted for non-decomposed runs. The `next_actions` `implement_awaiting_children` arm points the operator at `fishhawk_run_children` plus this block.
+- **Cost-gated:** the per-child fetch runs only for a top-level run (no `parent_run_id`) whose implement stage is `awaiting_children` **or** whose recent-audit window carries a decomposition marker (`plan_decomposed` or one of the four fan-in kinds). An ordinary run makes **zero** extra calls (no `plan_decomposed` read), and the block is omitted for non-decomposed runs. The `next_actions` `implement_awaiting_children` arm points the operator at `fishhawk_run_children` plus this block.
+- **Acceptance hold in `next_actions` ([#4080](https://github.com/kuhlman-labs/fishhawk/issues/4080), `acceptance_integration_gate.go`).** When `next_actions` would offer an acceptance dispatch (`fishhawk_dispatch_stage` / `fishhawk_run_stage` with `stage=acceptance`) on a top-level decomposed parent whose `integration_phase` is not `integrated`, `gateAcceptanceOnIntegration` strips every acceptance dispatch, sets `state` to `acceptance_held_integration_incomplete`, and prepends `fishhawk_await_children` whose reason names the uncovered children or the integration failure and the server's 409 `acceptance_integration_incomplete` (the authority: the host-dispatch marker and the acceptance-admission endpoint refuse the dispatch). It is wired at BOTH `nextActionsFor` call sites (`getRunStatus` and the `run_stage` post-stage snapshot), immediately after `nextActionsFor` and before the acceptance redispatch/preview folds, so the preview bring-up advisory no-ops once the dispatch is stripped. It makes **zero** reads unless an acceptance dispatch is offered on a top-level run; then it reads a FRESH snapshot via `fanInChildrenStatus` (the `plan_decomposed` probe first, then the paginated fan-in walk — never the bounded recent window, where an aged-out `slices_integrated` would wrongly strip a fully integrated parent's dispatch). It fails OPEN on a read error (display-only; the server refusal stands) and stands down where the server has no integration authority (C3, above).
 
 ### Acceptance transcript on the run snapshot (`acceptance_transcript`, [E72.5 / #3329](https://github.com/kuhlman-labs/fishhawk/issues/3329))
 

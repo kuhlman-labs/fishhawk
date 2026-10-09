@@ -1,19 +1,28 @@
-// Package wavecoverage holds the ONE shared predicate that answers a single
-// question about a decomposed fan-out: are a dependent child's dependency
-// slices already merged onto the parent's consolidated branch?
+// Package wavecoverage holds the shared predicates that answer coverage
+// questions about a decomposed fan-out against the parent's NEWEST
+// slices_integrated record: are a dependent child's dependency slices already
+// merged onto the parent's consolidated branch (Covered), and which children
+// has that integration not merged at all (Uncovered)?
 //
 // It exists as a leaf package — no repository, HTTP or git dependency — for
-// exactly one reason: THREE callers inside the backend module must answer that
-// question identically, and a duplicated reconstruction is the drift class this
-// repo already names as load-bearing (see the SliceBranch / childSliceBranch
-// "MUST stay byte-identical" note in internal/orchestrator). The callers are
+// exactly one reason: several callers inside the backend module must answer
+// those questions identically, and a duplicated reconstruction is the drift
+// class this repo already names as load-bearing (see the SliceBranch /
+// childSliceBranch "MUST stay byte-identical" note in internal/orchestrator).
+// The callers are
 //
 //   - the child-completion sweeper's steady-state short-circuit, which skips a
 //     between-wave re-merge once the pending wave's dependencies are already
 //     covered (internal/orchestrator.IntegrateCompletedWave);
 //   - the host-dispatch marker's admission decision, which derives a dependent
-//     child's base_branch and otherwise refuses 409 wave_not_integrated; and
-//   - the MCP await verb's children_dispatchable release decision.
+//     child's base_branch and otherwise refuses 409 wave_not_integrated;
+//   - the MCP await verb's children_dispatchable release decision;
+//   - the decomposed-parent acceptance gate (#4080), which refuses 409
+//     acceptance_integration_incomplete on the host-dispatch marker and the
+//     acceptance-admission endpoint until the newest integration covers EVERY
+//     child (Uncovered); and
+//   - the MCP children_status coverage classifier, which reports the parent
+//     integrated only on full coverage (Uncovered).
 //
 // A caller keying on predecessor run STATE instead would be wrong in a way that
 // is invisible in its own tests: run state flips to succeeded BEFORE the
@@ -77,4 +86,48 @@ func Covered(dependsOn []int, sliceRunID map[int]string, integratedChildRunIDs [
 	}
 	sort.Ints(missing)
 	return false, missing
+}
+
+// Uncovered returns the child run ids in childRunIDs that are NOT present in
+// integratedChildRunIDs — the children the parent's newest slices_integrated
+// entry has not merged onto the consolidated branch (#4080).
+//
+// Inputs:
+//   - childRunIDs — the decomposed parent's children whose slices must be on
+//     the consolidated branch (the caller decides which: the acceptance gate
+//     passes its SUCCEEDED children).
+//   - integratedChildRunIDs — the child_run_ids recorded on the parent's NEWEST
+//     slices_integrated audit entry.
+//
+// Semantics:
+//   - The result preserves INPUT order and is duplicate-free, so a caller that
+//     passes children in slice order gets the uncovered ones in slice order.
+//   - An empty id is ignored on BOTH sides: it is never reported as uncovered,
+//     and an empty entry in the integrated set never covers anything.
+//   - It returns nil exactly when every child is covered. An EMPTY childRunIDs
+//     also returns nil — the zero-children case is the CALLER's to decide (a
+//     run with no children is not a decomposed parent at all), never this
+//     predicate's.
+func Uncovered(childRunIDs, integratedChildRunIDs []string) []string {
+	integrated := make(map[string]struct{}, len(integratedChildRunIDs))
+	for _, id := range integratedChildRunIDs {
+		if id != "" {
+			integrated[id] = struct{}{}
+		}
+	}
+	var uncovered []string
+	seen := make(map[string]struct{}, len(childRunIDs))
+	for _, id := range childRunIDs {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := integrated[id]; !ok {
+			uncovered = append(uncovered, id)
+		}
+	}
+	return uncovered
 }

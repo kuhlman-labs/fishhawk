@@ -1998,3 +1998,187 @@ func TestHostDispatch_DeployHold_DispatchedArmStaysIdempotent(t *testing.T) {
 		t.Errorf("resp = %+v, want transitioned:false dispatched", resp)
 	}
 }
+
+// --- Decomposed-parent acceptance integration gate (#4080) ---
+
+// accDispatchFixture is a decomposed PARENT (with a GitHub installation id and
+// an orchestrator holding a GitHub client, so the gate is armed) whose plan,
+// implement and review stages succeeded, whose acceptance stage sits in the
+// given state, and which has two SUCCEEDED children a (slice 0) and b (slice 1).
+// Nothing ELSE on the marker path refuses this stage: the wave-order and
+// dependent-base guards are inert for a non-child run, the run is non-terminal,
+// no deploy stage sits ahead, and an agent-executed acceptance stage is
+// admissible — so with the gate absent the marker would CAS it to dispatched
+// and append an acceptance_dispatched anchor.
+type accDispatchFixture struct {
+	s      *Server
+	rr     *orchestratorRepo
+	au     *auditCompleteAuditFake
+	parent *run.Run
+	a, b   *run.Run
+	acc    *run.Stage
+}
+
+func seedAccDispatchFixture(t *testing.T, accState run.StageState) *accDispatchFixture {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditCompleteAuditFake()
+	parent := rr.seedRun()
+	inst := int64(42)
+	parent.InstallationID = &inst
+	for i, typ := range []run.StageType{run.StageTypePlan, run.StageTypeImplement, run.StageTypeReview} {
+		st := rr.seedStage(parent.ID, i, run.StageStateSucceeded)
+		st.Type = typ
+	}
+	acc := rr.seedStage(parent.ID, 3, accState)
+	acc.Type = run.StageTypeAcceptance
+	child := func(idx int) *run.Run {
+		c := rr.seedRun()
+		c.DecomposedFrom = &parent.ID
+		i := idx
+		c.SliceIndex = &i
+		c.State = run.StateSucceeded
+		return c
+	}
+	a, b := child(0), child(1)
+	o := &orchestrator.Orchestrator{Runs: rr, GitHub: newConsolidateGitHub(), Audit: au}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, Orchestrator: o})
+	o.ConsolidatedReview = nil
+	return &accDispatchFixture{s: s, rr: rr, au: au, parent: parent, a: a, b: b, acc: acc}
+}
+
+// stageState reads the acceptance stage back from the repository — the gate's
+// effect is COMMITTED STATE (a refusal that fired then rolled back would return
+// a byte-identical error), so every refusal test asserts this too.
+func (f *accDispatchFixture) stageState(t *testing.T) run.StageState {
+	t.Helper()
+	st, err := f.rr.GetStage(context.Background(), f.acc.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	return st.State
+}
+
+func (f *accDispatchFixture) anchors(t *testing.T) int {
+	t.Helper()
+	entries, err := f.au.ListForRunByCategory(context.Background(), f.parent.ID, CategoryAcceptanceDispatched)
+	if err != nil {
+		t.Fatalf("list acceptance_dispatched: %v", err)
+	}
+	return len(entries)
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_PartialIntegration_Refuses409 is
+// the #4080 done-means at the marker: the newest slices_integrated names only
+// child a, so the acceptance stage must NOT be spawned onto a consolidated
+// branch missing slice b.
+//
+// COUNTERFACTUAL: mutating guardDecomposedParentAcceptance's body to
+// `return nil, nil`, or deleting only its call in handleHostDispatchStage,
+// answers 200 transitioned with the stage dispatched and one anchor — every
+// assertion below goes red.
+func TestHostDispatch_DecomposedParentAcceptance_PartialIntegration_Refuses409(t *testing.T) {
+	f := seedAccDispatchFixture(t, run.StageStateAwaitingHostDispatch)
+	seedSlicesIntegrated(t, f.au, f.parent.ID, waveConsolidatedBranch, []string{f.a.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	if got := f.stageState(t); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %q, want awaiting_host_dispatch — the refusal must commit NO state", got)
+	}
+	if n := f.anchors(t); n != 0 {
+		t.Errorf("acceptance_dispatched anchors = %d, want 0 — no spawn was marked", n)
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "acceptance_integration_incomplete" {
+		t.Errorf("code = %q, want acceptance_integration_incomplete", code)
+	}
+	if got, _ := details["unintegrated_child_run_ids"].([]any); len(got) != 1 || got[0] != f.b.ID.String() {
+		t.Errorf("unintegrated_child_run_ids = %v, want [%s]", details["unintegrated_child_run_ids"], f.b.ID)
+	}
+	if details["consolidated_branch"] != waveConsolidatedBranch || details["consolidated_branch_present"] != true {
+		t.Errorf("details = %+v, want the newest entry's branch reported present", details)
+	}
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_FullIntegration_Admits is the
+// paired admit: the same fixture with a newest entry covering BOTH children is
+// transitioned and anchored exactly as a non-decomposed acceptance stage is.
+func TestHostDispatch_DecomposedParentAcceptance_FullIntegration_Admits(t *testing.T) {
+	f := seedAccDispatchFixture(t, run.StageStateAwaitingHostDispatch)
+	seedSlicesIntegrated(t, f.au, f.parent.ID, waveConsolidatedBranch, []string{f.a.ID.String(), f.b.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned {
+		t.Error("transitioned = false, want true")
+	}
+	if got := f.stageState(t); got != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched", got)
+	}
+	if n := f.anchors(t); n != 1 {
+		t.Errorf("acceptance_dispatched anchors = %d, want 1", n)
+	}
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_AlreadyDispatched_Refuses pins
+// that the gate also covers the idempotent arm: a dead-runner re-spawn of an
+// already-marked acceptance stage must not validate a partial tree either.
+// Without the gate this answers 200 {transitioned:false} and the caller
+// re-spawns.
+func TestHostDispatch_DecomposedParentAcceptance_AlreadyDispatched_Refuses(t *testing.T) {
+	f := seedAccDispatchFixture(t, run.StageStateDispatched)
+	seedSlicesIntegrated(t, f.au, f.parent.ID, waveConsolidatedBranch, []string{f.a.ID.String()})
+
+	w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 on the idempotent arm too:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "acceptance_integration_incomplete" {
+		t.Errorf("code = %q, want acceptance_integration_incomplete", code)
+	}
+	if got := f.stageState(t); got != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (unchanged)", got)
+	}
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_AuditReadError_500 pins the
+// fail-closed read arm: a slices_integrated read error answers 500
+// dependency_check_failed and commits nothing — never a silent admit.
+func TestHostDispatch_DecomposedParentAcceptance_AuditReadError_500(t *testing.T) {
+	f := seedAccDispatchFixture(t, run.StageStateAwaitingHostDispatch)
+	f.s.cfg.AuditRepo = &slicesIntegratedErrAudit{auditCompleteAuditFake: f.au, err: errors.New("audit read boom")}
+
+	w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "dependency_check_failed" {
+		t.Errorf("code = %q, want dependency_check_failed", code)
+	}
+	if got := f.stageState(t); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage state = %q, want awaiting_host_dispatch (unchanged)", got)
+	}
+}
+
+// TestHostDispatch_DecomposedParentAcceptance_NoIntegrationAuthority_Admits is
+// approval condition C3 at the endpoint: a parent with no installation id is
+// one integrateSlices graceful-skips, so no slices_integrated is ever written.
+// The gate stands down and the acceptance stage dispatches exactly as before
+// #4080 — even with NO integration record at all.
+func TestHostDispatch_DecomposedParentAcceptance_NoIntegrationAuthority_Admits(t *testing.T) {
+	f := seedAccDispatchFixture(t, run.StageStateAwaitingHostDispatch)
+	f.parent.InstallationID = nil
+
+	w := postHostDispatch(t, f.s, f.parent.ID, f.acc.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a deployment that cannot integrate must not be wedged (C3):\n%s", w.Code, w.Body.String())
+	}
+	if got := f.stageState(t); got != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched", got)
+	}
+}

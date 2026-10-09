@@ -892,6 +892,14 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// helper getRunStatus uses — so this surface names the same stored
 		// rollback_handle the status surface does.
 		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, releaseSignals{RollbackOffer: acceptanceRollbackOfferIn(recentAudit)})
+		// #4080: the same decomposed-parent acceptance hold getRunStatus
+		// applies, folded IMMEDIATELY after nextActionsFor and BEFORE the
+		// acceptance redispatch/preview folds, so the two snapshot surfaces
+		// cannot diverge on whether acceptance is offered on a partial
+		// consolidated tree. Zero reads unless an acceptance dispatch is
+		// offered on a top-level run; fails open on a read error (the server's
+		// 409 acceptance_integration_incomplete is the authority).
+		r.gateAcceptanceOnIntegration(ctx, runUUID, &runView.Run, postStages, nextActions)
 		// E64.63 (#3222): the same display-only acceptance-blocker fold
 		// getRunStatus applies, off the SAME postStages + recentAudit slices,
 		// so the post-stage snapshot and the status snapshot cannot diverge on
