@@ -591,12 +591,36 @@ type PlanSplitPhase struct {
 	DependsOn []int           `json:"depends_on,omitempty"`
 }
 
-// PlanSubPlan describes one sub-plan within a decomposed plan.
+// PlanSubPlan describes one sub-plan within a decomposed plan. Decoded
+// straight from the artifact by tryGetPlanForRun's json.Unmarshal, so its json
+// tags MUST mirror the schema's $defs.sub-plan-summary properties: a property
+// with no field here is silently elided from get_plan (#4068, the depends_on
+// elision). TestGetPlan_SurfacesEverySchemaProperty reads the canonical schema
+// at test time and fails on any property absent from the tool output.
 type PlanSubPlan struct {
 	Title                      string `json:"title"`
 	ScopeHint                  string `json:"scope_hint"`
 	PredictedRuntimeMinutes    int    `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence string `json:"predicted_runtime_confidence"`
+	// Scope is the files this slice owns. Nil only on a legacy plan: the plan
+	// gate rejects a decomposition whose slice declares no scope.files (#1669).
+	Scope *PlanScope `json:"scope,omitempty" jsonschema:"the files THIS sub-plan's slice owns; its decomposition fan-out child is scoped to them. The plan gate rejects a slice that declares none (#1669), so this is absent only on a legacy plan"`
+	// DependsOn is ALWAYS emitted (no omitempty): normalizeSubPlanDependsOn
+	// turns an omitted list into [] so a wave-0 slice can never read as "no
+	// dependency declared" by absence (#4068).
+	DependsOn []int `json:"depends_on" jsonschema:"0-based indices of sibling sub_plans this slice depends on; run_children dispatches the slices in topological waves. Always present: an empty list means the slice has no dependency and runs in wave 0"`
+	// ModelRecommendation is this slice's optional per-child model
+	// recommendation. Nil when the slice carries none.
+	ModelRecommendation *PlanModelRecommendation `json:"model_recommendation,omitempty" jsonschema:"the optional model recommendation for THIS sub-plan's decomposition child; absent when the slice carries none"`
+}
+
+// PlanModelRecommendation mirrors the standard_v1 model-recommendation $def
+// (#1013) for get_plan. Its json tags must mirror the schema; the
+// schema-driven drift test enforces that for a sub-plan's recommendation.
+type PlanModelRecommendation struct {
+	ImplementModel     string `json:"implement_model" jsonschema:"model identifier recommended for the implement stage"`
+	Rationale          string `json:"rationale" jsonschema:"why this model fits the assessed complexity"`
+	ComplexityAssessed string `json:"complexity_assessed" jsonschema:"the assessed complexity: low, medium or high"`
 }
 
 // PlanTicketRef identifies the ticket that originated the run.
@@ -633,10 +657,41 @@ type PlanApproachStep struct {
 	Description string `json:"description"`
 }
 
-// PlanVerification carries the test_strategy and rollback_plan.
+// PlanVerification carries the plan's verification block. Decoded straight
+// from the artifact by tryGetPlanForRun's json.Unmarshal, so its json tags MUST
+// mirror the schema's $defs.verification properties (and PlanAcceptanceCriterion
+// those of $defs.acceptance-criterion): a property with no field here is
+// silently elided from get_plan (#4068). TestGetPlan_SurfacesEverySchemaProperty
+// reads the canonical schema at test time and fails on any elided property.
 type PlanVerification struct {
 	TestStrategy string `json:"test_strategy"`
 	RollbackPlan string `json:"rollback_plan"`
+	// AcceptanceCriteria is the plan's structured acceptance-criteria
+	// contract (ADR-049). Empty when the plan declares none.
+	AcceptanceCriteria []PlanAcceptanceCriterion `json:"acceptance_criteria,omitempty" jsonschema:"the plan's structured, provenance-tagged acceptance criteria (ADR-049); each id is the join key across acceptance execution, evidence and triage. Absent when the plan declares none"`
+	// OutOfScope lists what the change deliberately does not cover.
+	OutOfScope []string `json:"out_of_scope,omitempty" jsonschema:"statements of what this change deliberately does NOT cover; absent when the plan declares none"`
+	// AcceptanceSurface is "none" when the plan declares no
+	// operator-observable surface (E72.1 / #3325); empty otherwise.
+	AcceptanceSurface string `json:"acceptance_surface,omitempty" jsonschema:"'none' when the plan declares the change exposes no operator-observable surface, which omits the run's acceptance stage on approval (E72.1 / #3325); absent otherwise"`
+}
+
+// PlanAcceptanceCriterion mirrors one entry of the standard_v1
+// verification.acceptance_criteria array ($defs.acceptance-criterion).
+type PlanAcceptanceCriterion struct {
+	ID        string `json:"id" jsonschema:"slug identifier, unique within acceptance_criteria; the join key across acceptance execution, evidence and triage"`
+	Statement string `json:"statement" jsonschema:"what must hold for the change to be accepted"`
+	Source    string `json:"source" jsonschema:"provenance: explicit (stated in the ticket/spec) or inferred (derived by the agent)"`
+	SourceRef string `json:"source_ref,omitempty" jsonschema:"where an explicit criterion came from; absent when not given"`
+	Rationale string `json:"rationale,omitempty" jsonschema:"why the agent inferred this criterion; present for an inferred criterion"`
+	// Blocking is a pointer so an omitted value stays distinguishable from
+	// an explicit false: absent means the schema default, true.
+	Blocking               *bool    `json:"blocking,omitempty" jsonschema:"whether failing this criterion blocks acceptance; absent means the schema default, true"`
+	VerifyHint             string   `json:"verify_hint,omitempty" jsonschema:"a hint to the acceptance executor on how to verify this criterion"`
+	Preconditions          []string `json:"preconditions,omitempty" jsonschema:"preconditions that must hold before this criterion can be verified"`
+	SkipExpected           bool     `json:"skip_expected,omitempty" jsonschema:"true when the acceptance agent cannot validate this criterion against the localhost preview; expectation_basis then names where it is validated"`
+	ExpectationBasis       string   `json:"expectation_basis,omitempty" jsonschema:"where a skip_expected criterion's expectation is actually validated"`
+	RequiresLiveValidation bool     `json:"requires_live_validation,omitempty" jsonschema:"true when true verification needs a live forge/deploy/external target the sandbox lacks (a declared operator walk)"`
 }
 
 // PlanReviewConcern is one flagged issue within a review verdict,
@@ -963,9 +1018,12 @@ Walks parent_run_id up to 8 levels so CI-retry runs (which skip the
 plan stage and re-execute against the parent's plan) resolve to the
 canonical plan. Returns the parsed standard_v1 plan shape: summary,
 scope.files, approach steps, verification (test_strategy +
-rollback_plan), risks_and_assumptions when present,
+rollback_plan, plus acceptance_criteria / out_of_scope /
+acceptance_surface when declared), risks_and_assumptions when present,
 predicted_runtime_minutes + predicted_runtime_confidence (every plan),
-decomposition (when the agent proposed sub-plans), and reviews[]
+decomposition (when the agent proposed sub-plans: each sub_plan carries
+its scope, depends_on — always present; [] = wave 0, no dependency —
+and model_recommendation when set), and reviews[]
 (when plan-review agents were configured on the stage — each entry
 has reviewer_kind, authority, verdict, concerns[], and free_form). A
 verdict of "skipped" with a reason marks an agent layer that was
@@ -1145,7 +1203,23 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	// FileCount. Decode the wire shape explicitly and overwrite the (flat, so
 	// mis-decoded) SplitProposal the top-level Unmarshal produced.
 	p.SplitProposal = mapSplitProposal(raw)
+	normalizeSubPlanDependsOn(&p)
 	return &p, true, nil
+}
+
+// normalizeSubPlanDependsOn turns every decomposition sub-plan's omitted
+// depends_on into an explicit empty list (#4068), so the always-emitted field
+// marshals as [] for a wave-0 slice rather than null: a reader can then never
+// mistake an elided field for "no dependency declared".
+func normalizeSubPlanDependsOn(p *PlanContent) {
+	if p.Decomposition == nil {
+		return
+	}
+	for i := range p.Decomposition.SubPlans {
+		if p.Decomposition.SubPlans[i].DependsOn == nil {
+			p.Decomposition.SubPlans[i].DependsOn = []int{}
+		}
+	}
 }
 
 // mapSplitProposal decodes the plan artifact's optional split_proposal (#2055,

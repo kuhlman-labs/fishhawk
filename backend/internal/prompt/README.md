@@ -28,6 +28,19 @@ A standard_v1 plan may declare `delivery: "partial"` plus `remaining_scope` (con
 - **The instruction is not the control.** An agent can still write `Closes #N`; the server-side ship-time guard (`backend/internal/server`) rewrites it. The consolidated parent PR (`backend/internal/orchestrator` `consolidatedPRTitleBody`) emits `Refs #N` itself.
 - **Golden.** `testdata/plan-prompt-pre-change.golden` was NOT re-captured: `applyPartialDeliveryGoldenDelta` replays the section after the New-architectural-decision anchor, chained inside `applyConsultChannelGoldenDelta` so every byte-identity caller (`prompt_test.go`, `comms_test.go`, `upkeep_test.go`) replays it.
 
+## Plan-review decomposition block ([#4068](https://github.com/kuhlman-labs/fishhawk/issues/4068))
+
+`writePlanForReview` calls `writeDecompositionForReview` last, after the runtime-prediction line (and so after #4085's `Delivery: PARTIAL` line). For a decomposed plan it renders the rationale, then per sub-plan its 0-based index and title, `scope_hint`, `scope.files` (with `~N lines` when `estimated_lines_changed` is set), `depends_on`, the runtime prediction, and `model_recommendation` when set, closing with the dispatch waves `plan.Waves` derives from `depends_on`. Before #4068 the reviewer saw only sub-plan titles and minutes in the budget gate-evidence line, and raised false "no dependency declared" concerns.
+
+- **`depends_on` is always rendered**, as `[a, b]` or `none (wave 0)`.
+- **A missing per-slice scope is never described as inherited.** The plan gate rejects it (#1669, `checkSubPlanScopesDeclared`), and the render says so. It is reachable only on a hand-built plan.
+- **`Dispatch waves: not derivable (<err>)`** is defensive: `plan.Parse`'s `semanticCheck` already runs `Waves`, so a parsed plan never hits it.
+- **Declared slice scopes only.** The per-slice `scope.files` are the stored plan's. Approve-time slice amendments (`add_scope_files_to_slice` #2515, `move_scope_files_to_slice` #2596) are not folded into this block; they reach only the slice child's resolved scope (`backend/internal/server` `resolveDecomposedScopeFiles` / `resolveDecomposedScopeConstraint`).
+- **Byte-identity.** The nil guard sits inside the writer, so a non-decomposed plan renders no new bytes. Pinned by `TestWritePlanForReview_NoDecomposition_ByteIdentical` and the `review_conventions_absent_*` goldens.
+- **Reach.** `writePlanForReview` is shared by the plan-review, implement-review and scope-exemption-review builders, so the block reaches all three, including a slice child's implement review (whose `ApprovedPlan` is the parent plan). Pinned by `TestBuild_ImplementReview_RendersDecomposition`.
+- **Drift test.** `TestBuild_PlanReview_RendersEverySubPlanSchemaProperty` reads `$defs.sub-plan-summary` from `docs/spec/plan-standard-v1.schema.json` at test time and requires a sentinel per property in the `plan_review` render of a `plan.Parse`d fixture. It fails on a schema property with no probe entry and on a stale probe. `TestWritePlanForReview_Decomposition_Branches` asserts one behavior per render branch.
+- **Review-prompt eval.** This package is a `scripts/check-review-prompt-eval` trigger path. The catch-rate evidence for this change is operator-owed.
+
 ## Issue link, not snapshot (#244)
 
 The implement-stage prompt renders the issue as `Triggering issue: #N · <title>` + `URL:` (`writeIssueLink` in `prompt.go`) — the body is dropped and the agent is told to fetch via its GitHub tooling using the run's installation token.

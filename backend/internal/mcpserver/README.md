@@ -52,10 +52,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 340 identifiers, not 3
+## Exported surface: why 363 identifiers, not 3
 
-The package presents **340** exported top-level identifiers, but only the three
-above are intended entry points. The other 337 are the tool I/O
+The package presents **363** exported top-level identifiers, but only the three
+above are intended entry points. The other 360 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -155,6 +155,40 @@ MARSHALLED output, so deleting either field compiles and still reddens) and
 `TestGetPlan_Delivery_FullOrAbsentShape` (`tools_test.go`); both seed the
 artifact keys from a backend `plan.Plan` marshal so a tag drift between the
 two sides fails the decode.
+
+## `fishhawk_get_plan` sub-plan and acceptance-criteria surface ([#4068](https://github.com/kuhlman-labs/fishhawk/issues/4068))
+
+Each `decomposition.sub_plans[]` entry (`PlanSubPlan`) carries every
+`$defs.sub-plan-summary` property: `title`, `scope_hint`, `scope`
+(`PlanScope`), `depends_on`, the runtime prediction pair, and
+`model_recommendation` (`PlanModelRecommendation`). `verification`
+(`PlanVerification`) carries `acceptance_criteria` (`PlanAcceptanceCriterion`,
+every `$defs.acceptance-criterion` property; `blocking` is a pointer so an
+omitted value stays the schema default, true), `out_of_scope` and
+`acceptance_surface` beside `test_strategy` / `rollback_plan`. Before #4068 the
+DTOs carried only title / scope_hint / runtime and test_strategy /
+rollback_plan, so `json.Unmarshal` silently dropped the rest and a reviewer read
+an elided `depends_on` as "no dependency declared".
+
+- **`depends_on` is always present.** It has no `omitempty`, and
+  `normalizeSubPlanDependsOn` (called from `tryGetPlanForRun`) turns an omitted
+  list into `[]`, so a wave-0 slice marshals `"depends_on": []`, never null or
+  absent.
+- **No mapping step.** `tryGetPlanForRun` decodes the artifact straight into
+  `PlanContent`, so these DTOs' json tags must mirror the schema `$defs`. A
+  property with no field is elided silently.
+- **The drift test enforces it.** `TestGetPlan_SurfacesEverySchemaProperty`
+  reads `docs/spec/plan-standard-v1.schema.json` at test time, seeds a RAW
+  artifact map (not a `PlanContent`, so an elided field cannot be filtered out
+  of the seed) through the httptest fake backend, and fails naming any
+  `sub-plan-summary`, `verification` or `acceptance-criterion` property absent
+  or null in the tool output. A sub-plan field added to the schema later fails
+  it until the DTO gains the field. `TestMissingKeys_FlagsUnrenderedSchemaProperty`
+  and `TestSchemaDefProperties_FailsClosedOnMissingDef` pin the helper itself (a
+  missing `$def` is an error, never an empty key list).
+
+The plan-review prompt renders the same sub-plan fields (`backend/internal/prompt/README.md`
+§ "Plan-review decomposition block").
 
 ## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
 

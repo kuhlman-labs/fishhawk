@@ -8432,6 +8432,81 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
 			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
 	}
+
+	// Decomposition (#4068): every sub-plan field, depends_on always explicit,
+	// so a reviewer never reads an elided depends_on as "no dependency
+	// declared". Nil-guarded inside: a non-decomposed plan renders
+	// byte-identically.
+	writeDecompositionForReview(b, p.Decomposition)
+}
+
+// writeDecompositionForReview renders a decomposed plan's sub-plans for a
+// reviewer (#4068): the rationale, then per sub-plan its 0-based index, title,
+// scope_hint, scope.files, depends_on (ALWAYS rendered — "none (wave 0)" when
+// empty), runtime prediction and model_recommendation when set, closing with
+// the dispatch waves plan.Waves derives from depends_on. Writes nothing for a
+// nil decomposition. Deterministic: slice order is preserved and no map is
+// iterated. TestBuild_PlanReview_RendersEverySubPlanSchemaProperty reads the
+// schema's $defs.sub-plan-summary at test time and fails on any property this
+// render omits.
+func writeDecompositionForReview(b *strings.Builder, d *plan.Decomposition) {
+	if d == nil {
+		return
+	}
+	fmt.Fprintf(b, "Decomposition (%d sub-plans; depends_on lists 0-based sub-plan indices — an empty list means the slice runs in wave 0 with no dependency):\n", len(d.SubPlans))
+	fmt.Fprintf(b, "- Rationale: %s\n", d.Rationale)
+	for i, sp := range d.SubPlans {
+		fmt.Fprintf(b, "- Sub-plan %d: %s\n", i, sp.Title)
+		fmt.Fprintf(b, "  scope_hint: %s\n", sp.ScopeHint)
+		if sp.Scope != nil && len(sp.Scope.Files) > 0 {
+			files := make([]string, len(sp.Scope.Files))
+			for j, f := range sp.Scope.Files {
+				files[j] = fmt.Sprintf("%s (%s)", f.Path, f.Operation)
+			}
+			fmt.Fprintf(b, "  scope.files (%d): %s", len(files), strings.Join(files, ", "))
+			if sp.Scope.EstimatedLinesChanged > 0 {
+				fmt.Fprintf(b, "; ~%d lines", sp.Scope.EstimatedLinesChanged)
+			}
+			b.WriteString("\n")
+		} else {
+			// Never claim inheritance: a slice with no scope.files of its own is
+			// rejected at the plan gate (#1669, checkSubPlanScopesDeclared).
+			b.WriteString("  scope: not declared (a sub-plan without its own scope.files is rejected at the plan gate — #1669, checkSubPlanScopesDeclared)\n")
+		}
+		fmt.Fprintf(b, "  depends_on: %s\n", dependsOnText(sp.DependsOn))
+		fmt.Fprintf(b, "  runtime: %d minutes (%s confidence)\n", sp.PredictedRuntimeMinutes, sp.PredictedRuntimeConfidence)
+		if mr := sp.ModelRecommendation; mr != nil {
+			fmt.Fprintf(b, "  model_recommendation: %s (complexity: %s) — %s\n", mr.ImplementModel, mr.ComplexityAssessed, mr.Rationale)
+		}
+	}
+	waves, err := plan.Waves(d)
+	if err != nil {
+		fmt.Fprintf(b, "Dispatch waves: not derivable (%v)\n\n", err)
+		return
+	}
+	parts := make([]string, len(waves))
+	for w, wave := range waves {
+		parts[w] = fmt.Sprintf("wave %d = %s", w, intListText(wave))
+	}
+	fmt.Fprintf(b, "Dispatch waves derived from depends_on: %s\n\n", strings.Join(parts, "; "))
+}
+
+// dependsOnText renders a sub-plan's depends_on: "[a, b]", or "none (wave 0)"
+// for an empty list, so the field is explicit either way (#4068).
+func dependsOnText(deps []int) string {
+	if len(deps) == 0 {
+		return "none (wave 0)"
+	}
+	return intListText(deps)
+}
+
+// intListText renders a list of ints as "[a, b]".
+func intListText(xs []int) string {
+	parts := make([]string, len(xs))
+	for i, x := range xs {
+		parts[i] = strconv.Itoa(x)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 // relatedADRsText renders a new-architectural-decision's related ADR ids as a
