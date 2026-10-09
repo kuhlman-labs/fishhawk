@@ -6,11 +6,13 @@
 #
 #  1. Re-runs lint + tests at the tag's commit (catches a tag
 #     pushed from a dirty branch).
-#  2. Builds a `fishhawk-runner` binary with -ldflags=-X to inject
-#     the tag version. Customers don't actually need a binary —
-#     the published Action is composite — but the binary is
-#     useful for ad-hoc CLI invocation, supply-chain verification,
-#     and as a reference for what the Action runs.
+#  2. Builds `fishhawk-runner` for four platforms (darwin-arm64,
+#     darwin-amd64, linux-amd64, linux-arm64), stamping Version +
+#     GitSHA through `scripts/release-ldflags` (#4117), then checks
+#     the linux-amd64 binary's `version` output reports both.
+#     Customers don't actually need a binary — the published Action
+#     is composite — but the binary is what a local install runs,
+#     and it serves supply-chain verification and ad-hoc invocation.
 #  3. Generates an SPDX-JSON SBOM of the runner module via
 #     anchore/sbom-action.
 #  4. Computes SHA-256 checksums of every release artifact.
@@ -41,6 +43,18 @@ jobs:
     name: Build, sign, and publish runner release
     runs-on: ubuntu-latest
     steps:
+      - name: Validate release tag (final or -rc.N only)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A published release locks its tag (immutable releases), so the
+          # tag must read unambiguously: a final release or a release
+          # candidate. -alpha, -beta and any other suffix are refused.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^(backend|runner|mcp|cli)/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::release tag '$TAG' must be <component>/vX.Y.Z or <component>/vX.Y.Z-rc.N (no -alpha, -beta or other suffix)"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -74,21 +88,51 @@ jobs:
             go test -race ./...
           )
 
-      - name: Compute version and build binary
+      - name: Compute version and build binaries
         id: build
         run: |
           set -eu
           # refs/tags/runner/v0.1.0 → v0.1.0
           version="${GITHUB_REF#refs/tags/runner/}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          # One stamping source (#4117). Fail closed if it is absent rather
+          # than ship an unstamped binary.
+          if [ ! -x scripts/release-ldflags ]; then
+            echo "::error::scripts/release-ldflags is missing at this commit; it lands with #4117" >&2
+            exit 1
+          fi
+          stamp="$(scripts/release-ldflags fishhawk-runner "${version}" "${GITHUB_SHA}")"
           mkdir -p dist
-          cd runner
-          CGO_ENABLED=0 go build \
-            -ldflags="-s -w -X github.com/kuhlman-labs/fishhawk/runner/internal/version.Version=${version}" \
-            -o "../dist/fishhawk-runner-${version}-linux-amd64" \
-            ./cmd/fishhawk-runner
-          # Sanity-check the embedded version.
-          "../dist/fishhawk-runner-${version}-linux-amd64" --help 2>&1 | head -n 3 || true
+          # darwin-arm64 / amd64 for local installs on macOS; linux-amd64 /
+          # arm64 for servers and CI hosts. CGO disabled so the static
+          # binary works against any libc.
+          for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            goos="${target%-*}"
+            goarch="${target#*-}"
+            out="dist/fishhawk-runner-${version}-${target}"
+            (
+              cd runner
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
+                -ldflags="-s -w ${stamp}" \
+                -o "../${out}" \
+                ./cmd/fishhawk-runner
+            )
+            echo "built ${out}"
+          done
+          # Only the linux-amd64 binary can execute on this host.
+          # `fishhawk-runner version` prints a JSON object carrying
+          # "version" and "git_sha"; a wrong -X package path is a silent
+          # no-op in the linker, so check both values landed.
+          got="$("dist/fishhawk-runner-${version}-linux-amd64" version)"
+          echo "fishhawk-runner version: ${got}"
+          case "${got}" in
+            *"\"version\":\"${version}\""*) ;;
+            *) echo "::error::fishhawk-runner version did not report ${version}" >&2; exit 1 ;;
+          esac
+          case "${got}" in
+            *"\"git_sha\":\"${GITHUB_SHA}\""*) ;;
+            *) echo "::error::fishhawk-runner version did not report git_sha ${GITHUB_SHA}" >&2; exit 1 ;;
+          esac
 
       - name: Generate SBOM (SPDX-JSON)
         uses: anchore/sbom-action@v0
@@ -140,8 +184,12 @@ jobs:
           # (e.g. runner/v0.1.0-rc.1). softprops's prerelease
           # flag is OR'd with the tag-name heuristic.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
+            dist/fishhawk-runner-${{ steps.build.outputs.version }}-darwin-arm64
+            dist/fishhawk-runner-${{ steps.build.outputs.version }}-darwin-amd64
             dist/fishhawk-runner-${{ steps.build.outputs.version }}-linux-amd64
+            dist/fishhawk-runner-${{ steps.build.outputs.version }}-linux-arm64
             dist/runner-${{ steps.build.outputs.version }}.sbom.spdx.json
             dist/SHA256SUMS
             dist/SHA256SUMS.sig

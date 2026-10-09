@@ -18,7 +18,7 @@ GitHub Action that runs an agent under a Fishhawk workflow stage and ships the s
 
 ## What's in this release
 
-- `fishhawk-runner-<version>-linux-amd64` — standalone binary (`-ldflags`-stamped with this tag's version). Useful for ad-hoc invocation, replay, and supply-chain inspection.
+- `fishhawk-runner-<version>-darwin-arm64`, `-darwin-amd64`, `-linux-amd64`, `-linux-arm64` — standalone binaries, stamped with this tag's version and commit (`fishhawk-runner version` reports both). What a local install runs; also useful for ad-hoc invocation, replay, and supply-chain inspection.
 - `runner-<version>.sbom.spdx.json` — SPDX-JSON Software Bill of Materials produced by [`anchore/sbom-action`](https://github.com/anchore/sbom-action). Lists every Go module the runner links against.
 - `SHA256SUMS` — sha256 of every artifact above.
 - `SHA256SUMS.sig` + `SHA256SUMS.pem` — keyless [cosign](https://docs.sigstore.dev/cosign/overview/) signature + Fulcio certificate chain. Issued by the GitHub Actions OIDC identity for this repo + workflow.

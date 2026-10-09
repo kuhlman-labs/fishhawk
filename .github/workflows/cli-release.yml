@@ -1,37 +1,35 @@
-# MCP server release workflow (E19.7 / #347).
+# CLI release workflow (E74.1 / #3716).
 #
-# Triggered by a tag push matching `mcp/v*` (path-prefixed module
-# tag, same convention as runner / backend / verifier releases).
-# The workflow:
+# Triggered by a tag push matching `cli/v*`. The CLI is the non-root Go
+# module at `cli/`, so `cli/vX.Y.Z` is the tag Go's module system itself
+# resolves for it (the same path-prefixed convention as `runner/v*` and
+# `backend/v*`). The workflow:
 #
-#  1. Re-runs lint + tests at the tag's commit (catches a tag
-#     pushed from a dirty branch).
-#  2. Builds `fishhawk-mcp` for four platforms via a single Go
-#     loop (darwin-arm64, darwin-amd64, linux-amd64, linux-arm64).
-#     CGO disabled so the binary is statically linked and works
-#     across libc variants. Version + GitSHA are stamped through
-#     `scripts/release-ldflags` (#4117), the one stamping source
-#     shared with `scripts/dev` and the other release workflows.
-#  3. Generates an SPDX-JSON SBOM of the backend module (the MCP
-#     binary lives under `backend/cmd/fishhawk-mcp/`, so the SBOM
-#     covers the whole module's dependency tree — including the
-#     MCP SDK pulled in by E19.2).
-#  4. Computes SHA-256 checksums of every release artifact.
-#  5. Signs the SHA256SUMS file with cosign (keyless / OIDC).
-#  6. Publishes a GitHub Release with the artifacts attached.
+#  1. Re-runs lint + tests at the tag's commit (catches a tag pushed
+#     from a dirty branch).
+#  2. Builds `fishhawk` for four platforms (darwin-arm64, darwin-amd64,
+#     linux-amd64, linux-arm64), stamping Version + GitSHA through
+#     `scripts/release-ldflags` (#4117), the one stamping source shared
+#     with `scripts/dev` and the other release workflows. CGO disabled:
+#     the module links no cgo package, and a static binary works against
+#     any libc.
+#  3. Checks the linux-amd64 binary's `fishhawk version` reports the tag
+#     and commit, so a wrong `-X` package path (a silent no-op in the Go
+#     linker) fails the release instead of shipping a `dev` binary.
+#  4. Generates an SPDX-JSON SBOM of the cli module.
+#  5. Computes SHA-256 checksums of every release artifact.
+#  6. Signs the SHA256SUMS file with cosign (keyless / OIDC).
+#  7. Publishes a GitHub Release with the artifacts attached.
 #
-# Versioning convention: `mcp/vX.Y.Z`. Go's module system doesn't
-# strictly require a path-prefixed tag for `backend/cmd/fishhawk-
-# mcp/` because it's a sub-package, not its own module — but using
-# the same prefix shape as the other releases keeps the operator
-# mental model uniform.
+# Versioning convention: `cli/vX.Y.Z`. A tag with a prerelease suffix
+# (e.g. `cli/v0.1.0-rc.1`) publishes a GitHub pre-release.
 
-name: MCP Release
+name: CLI Release
 
 on:
   push:
     tags:
-      - 'mcp/v*'
+      - 'cli/v*'
 
 permissions:
   contents: write   # create release + upload assets
@@ -39,7 +37,7 @@ permissions:
 
 jobs:
   release:
-    name: Build, sign, and publish MCP release
+    name: Build, sign, and publish CLI release
     runs-on: ubuntu-latest
     steps:
       - name: Validate release tag (final or -rc.N only)
@@ -80,7 +78,7 @@ jobs:
           set -eu
           GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
           (
-            cd backend
+            cd cli
             "$GOLANGCI_LINT" run ./...
             go build ./...
             go test -race ./...
@@ -90,8 +88,8 @@ jobs:
         id: build
         run: |
           set -eu
-          # refs/tags/mcp/v0.1.0 → v0.1.0
-          version="${GITHUB_REF#refs/tags/mcp/}"
+          # refs/tags/cli/v0.1.0 → v0.1.0
+          version="${GITHUB_REF#refs/tags/cli/}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           # One stamping source (#4117). Fail closed if it is absent rather
           # than ship an unstamped `dev` binary.
@@ -99,38 +97,43 @@ jobs:
             echo "::error::scripts/release-ldflags is missing at this commit; it lands with #4117" >&2
             exit 1
           fi
-          stamp="$(scripts/release-ldflags fishhawk-mcp "${version}" "${GITHUB_SHA}")"
+          stamp="$(scripts/release-ldflags fishhawk "${version}" "${GITHUB_SHA}")"
           mkdir -p dist
           # Operator-facing targets:
           #   darwin-arm64 / amd64 — most dev machines run macOS.
-          #   linux-amd64 / arm64 — server installs + the runner
-          #   container image.
-          # CGO disabled so the static binary works against any libc.
+          #   linux-amd64 / arm64 — server installs and CI hosts.
           for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
             goos="${target%-*}"
             goarch="${target#*-}"
-            out="dist/fishhawk-mcp-${version}-${target}"
+            out="dist/fishhawk-${version}-${target}"
             (
-              cd backend
+              cd cli
               CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
                 -ldflags="-s -w ${stamp}" \
                 -o "../${out}" \
-                ./cmd/fishhawk-mcp
+                ./cmd/fishhawk
             )
             echo "built ${out}"
           done
-          # No sanity-check exec on the linux-amd64 binary: the
-          # server has no --help flag and would block on stdin
-          # waiting for an MCP handshake. The build itself proves
-          # the binary is well-formed; downstream verification is
-          # SHA256SUMS + cosign.
+          # The runner is linux-amd64, so only that binary can execute
+          # here. `fishhawk version` prints "<version> (<git-sha>)" today;
+          # the check asks only that both values appear.
+          got="$("dist/fishhawk-${version}-linux-amd64" version)"
+          echo "fishhawk version: ${got}"
+          case "${got}" in
+            *"${version}"*"${GITHUB_SHA}"*) ;;
+            *)
+              echo "::error::fishhawk version reported '${got}', want ${version} and ${GITHUB_SHA}; the -ldflags stamp did not take effect" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Generate SBOM (SPDX-JSON)
         uses: anchore/sbom-action@v0
         with:
-          path: ./backend
+          path: ./cli
           format: spdx-json
-          output-file: ./dist/mcp-${{ steps.build.outputs.version }}.sbom.spdx.json
+          output-file: ./dist/cli-${{ steps.build.outputs.version }}.sbom.spdx.json
 
       - name: Compute checksums
         run: |
@@ -151,7 +154,7 @@ jobs:
           # Verify downstream with:
           #
           #   cosign verify-blob \
-          #     --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/.+' \
+          #     --certificate-identity-regexp 'https://github.com/kuhlman-labs/fishhawk/\.github/workflows/cli-release\.yml@.*' \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
           #     --signature SHA256SUMS.sig \
           #     --certificate SHA256SUMS.pem \
@@ -165,17 +168,17 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: MCP ${{ steps.build.outputs.version }}
+          name: CLI ${{ steps.build.outputs.version }}
           generate_release_notes: true
-          body_path: .github/release-notes/mcp.md
+          body_path: .github/release-notes/cli.md
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
-            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-darwin-arm64
-            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-darwin-amd64
-            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-amd64
-            dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-arm64
-            dist/mcp-${{ steps.build.outputs.version }}.sbom.spdx.json
+            dist/fishhawk-${{ steps.build.outputs.version }}-darwin-arm64
+            dist/fishhawk-${{ steps.build.outputs.version }}-darwin-amd64
+            dist/fishhawk-${{ steps.build.outputs.version }}-linux-amd64
+            dist/fishhawk-${{ steps.build.outputs.version }}-linux-arm64
+            dist/cli-${{ steps.build.outputs.version }}.sbom.spdx.json
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
             dist/SHA256SUMS.pem
