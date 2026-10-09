@@ -113,6 +113,7 @@ var (
 	_ workmgmt.Transitioner               = (*Provider)(nil)
 	_ workmgmt.NumberDiscoverer           = (*Provider)(nil)
 	_ workmgmt.EpicChildrenQuerier        = (*Provider)(nil)
+	_ workmgmt.EpicLinker                 = (*Provider)(nil)
 	_ workmgmt.IssueSetDependencyResolver = (*Provider)(nil)
 	_ workmgmt.WorkItemReader             = (*Provider)(nil)
 	_ workmgmt.GroomingMutator            = (*Provider)(nil)
@@ -178,6 +179,12 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Status:        req.Item.BoardPlacement.Status,
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
 	}
+
+	// Write-ahead hook (#4153): the issue now exists, so tell the caller
+	// BEFORE board placement and epic linking — the slower, interruptible
+	// steps a cancelled filing can die inside. Labels and the Depends on
+	// marker rode the create body, so they are already atomic with it.
+	req.NotifyCreated(ctx, created)
 
 	// Board placement is best-effort (#1107): the issue is the durable
 	// result, so a placement failure records the cause and leaves Boarded
@@ -603,6 +610,40 @@ func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, re
 		return fmt.Errorf("workmgmt/github: link parent epic #%d: %w", number, err)
 	}
 	return nil
+}
+
+// LinkToEpic attaches the already-filed issue req.Child as a sub-issue of
+// req.Epic — the same link File applies best-effort after a create — so a
+// filing interrupted between a child's create and its link can be finished
+// without re-creating the child (#4153). It is the optional
+// workmgmt.EpicLinker capability. It validates the target repo + installation
+// with File's fail-closed messages and the epic ref and child number before
+// any API call, resolves the child's node id, then reuses linkEpic. The caller
+// links only children absent from EpicChildren (GitHub refuses AddSubIssue for
+// an issue that is already a sub-issue).
+func (p *Provider) LinkToEpic(ctx context.Context, req workmgmt.EpicLinkRequest) error {
+	if p.api == nil {
+		return errors.New("workmgmt/github: provider missing API client")
+	}
+	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
+		return errors.New("workmgmt/github: target repo owner and name required")
+	}
+	scope := req.Target.Scope
+	if scope.IsZero() {
+		return errors.New("workmgmt/github: no installation id available; linking a child to its epic is run-scoped in v0 — file with a run_id whose run carries an installation")
+	}
+	if _, err := parseIssueRef(req.Epic); err != nil {
+		return fmt.Errorf("workmgmt/github: parent epic %q: %w", req.Epic, err)
+	}
+	if req.Child <= 0 {
+		return fmt.Errorf("workmgmt/github: child issue number %d is not positive", req.Child)
+	}
+	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+	childNodeID, err := p.api.IssueNodeID(ctx, scope, repo, req.Child)
+	if err != nil {
+		return fmt.Errorf("workmgmt/github: resolve child #%d: %w", req.Child, err)
+	}
+	return p.linkEpic(ctx, scope, repo, req.Epic, childNodeID)
 }
 
 // subIssueChildCap is GitHub's documented HARD maximum number of sub-issues one
