@@ -1,6 +1,7 @@
 package workmgmt
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -1152,6 +1153,60 @@ func TestApply_SourceRefsAreInert(t *testing.T) {
 				if strings.Contains(got.Title, leak) || strings.Contains(got.Body, leak) {
 					t.Errorf("source ref %q leaked into the rendered title/body: %q / %q", leak, got.Title, got.Body)
 				}
+			}
+		})
+	}
+}
+
+// TestApply_OnCreatedIsInert pins that FilingRequest.OnCreated never leaks into
+// what Apply renders and is never invoked by Apply (#4153): the WorkItem and the
+// allocated number are identical with and without it. Its only consumer is the
+// provider, through ProviderRequest.OnCreated, which the server filing core
+// threads it into verbatim.
+func TestApply_OnCreatedIsInert(t *testing.T) {
+	conv := testConventions(t)
+	for name, req := range map[string]FilingRequest{
+		"feature with caller body": {
+			Type:      "feature",
+			Summary:   "do the thing",
+			Body:      "## Summary\n\ndo the thing\n",
+			TitleVars: map[string]string{"epic": "1", "n": "1"},
+			Relations: Relations{ParentEpic: "#1"},
+			Labels:    []string{"area:backend"},
+		},
+		"chore with skeleton body": {
+			Type:      "chore",
+			Summary:   "tidy the thing",
+			Sections:  map[string]string{"Summary": "tidy it"},
+			TitleVars: map[string]string{"epic": "1", "n": "2"},
+		},
+		"numbered adr": {
+			Type:            "adr",
+			Summary:         "use postgres",
+			Body:            "## Context\n\n…\n",
+			ExistingNumbers: []int{34, 12, 35},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plain, plainNum, err := Apply(req, conv)
+			if err != nil {
+				t.Fatalf("Apply (no hook): %v", err)
+			}
+			invoked := false
+			withHook := req
+			withHook.OnCreated = func(context.Context, CreatedItem) { invoked = true }
+			got, gotNum, err := Apply(withHook, conv)
+			if err != nil {
+				t.Fatalf("Apply (with hook): %v", err)
+			}
+			if invoked {
+				t.Error("Apply invoked OnCreated; only a provider may, after its create")
+			}
+			if gotNum != plainNum {
+				t.Errorf("number = %d with hook, %d without", gotNum, plainNum)
+			}
+			if !reflect.DeepEqual(got, plain) {
+				t.Errorf("OnCreated changed the applied item:\n with: %+v\n w/o:  %+v", got, plain)
 			}
 		})
 	}

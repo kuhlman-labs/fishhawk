@@ -98,6 +98,37 @@ type EpicChildrenRequest struct {
 	Epic   string
 }
 
+// EpicLinker is the optional link-an-existing-issue-to-its-epic capability
+// (#4153): attach an ALREADY-FILED issue to its parent epic, the same link
+// File applies best-effort right after it creates a child. It exists so the
+// refinement filing executor can finish a child whose create landed but whose
+// link did not (an interrupted or budget-expired filing) WITHOUT re-creating
+// it: the resume reads EpicChildren, and links every recorded child absent
+// from that set through this capability, so the link step is idempotent and
+// resumable per child. Like EpicChildrenQuerier it is a SEPARATE capability
+// interface rather than folded into Provider, because not every provider links
+// (jira is interface-only in v0) and widening Provider would force every
+// registered fake to grow the method. A caller type-asserts it; a provider
+// that does not implement it yields no link pass.
+//
+// LinkToEpic must NOT be called for a child already linked under the epic: a
+// forge may refuse a duplicate link (GitHub refuses AddSubIssue for an issue
+// that is already a sub-issue), so the caller reads EpicChildren first and
+// links only the children absent from it.
+type EpicLinker interface {
+	LinkToEpic(ctx context.Context, req EpicLinkRequest) error
+}
+
+// EpicLinkRequest is the resolved input to LinkToEpic: the filing Target
+// (repo + installation / project), the epic issue reference (`N`, `#N` or
+// `issue:N`, the same shapes File's parent_epic accepts), and the number of
+// the already-filed child issue to attach under it.
+type EpicLinkRequest struct {
+	Target Target
+	Epic   string
+	Child  int
+}
+
 // IssueSetDependencyResolver is the optional no-epic campaign source (E48.36 /
 // #2051): resolve the depends_on edges over an ARBITRARY, explicitly-named set
 // of issues that share no epic parent. It is the items-without-epic_ref
@@ -578,6 +609,31 @@ type ProviderRequest struct {
 	Item   WorkItem
 	Number int
 	Target Target
+	// OnCreated, when non-nil, is the caller's write-ahead hook (#4153). A
+	// provider invokes it through NotifyCreated SYNCHRONOUSLY, exactly once,
+	// immediately after the forge create succeeds and BEFORE any post-create
+	// enrichment (board placement, epic linking), with the created item's
+	// number and URL. It lets a caller durably record "this issue exists"
+	// while the slower, interruptible enrichment is still ahead, so a filing
+	// cancelled mid-enrichment can be resumed without re-creating the issue.
+	//
+	// It returns nothing on purpose: a caller's bookkeeping failure is the
+	// caller's to handle (it has the number in hand) and must never abort the
+	// provider's best-effort enrichment. A provider that never calls it (jira)
+	// is legal; the caller then records after File returns. Only the
+	// refinement filing executor sets it today (via FilingRequest.OnCreated).
+	OnCreated func(ctx context.Context, item CreatedItem)
+}
+
+// NotifyCreated invokes r.OnCreated with a copy of item. It is nil-safe on
+// both sides — a nil hook or a nil item is a no-op — so a provider calls it
+// unconditionally right after its create succeeds (see OnCreated for the
+// ordering contract).
+func (r ProviderRequest) NotifyCreated(ctx context.Context, item *CreatedItem) {
+	if r.OnCreated == nil || item == nil {
+		return
+	}
+	r.OnCreated(ctx, *item)
 }
 
 // CreatedItem is what a Provider returns on a successful filing: the
