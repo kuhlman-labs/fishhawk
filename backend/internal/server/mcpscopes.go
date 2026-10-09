@@ -214,6 +214,7 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// --- write:stages.
 	"fishhawk_rebase_run_branch":         {anyOf: []string{"write:stages"}}, // rebase_branch.go handleRebaseRunBranch
 	"fishhawk_vouch_commit":              {anyOf: []string{"write:stages"}}, // vouch.go handleVouchCommit
+	"fishhawk_retrigger_ci":              {anyOf: []string{"write:stages"}}, // retrigger_ci.go handleRetriggerCI (E83.49 / #4082)
 	"fishhawk_decide_scope_amendment":    {anyOf: []string{"write:stages"}}, // scope_amendment.go handleDecideScopeAmendment
 	"fishhawk_decide_scope_completeness": {anyOf: []string{"write:stages"}}, // scope_completeness.go handleDecideScopeCompleteness
 

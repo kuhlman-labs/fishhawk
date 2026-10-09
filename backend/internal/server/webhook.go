@@ -140,6 +140,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// No other action is routed. `edited` / `labeled` and friends do not
 	// move the head and must not reach the handler; that negative is
 	// pinned by TestWebhook_PullRequestActionRouting_NotApplicable.
+	//
+	// `reopened` FIRST reaches the reopen-revive handler (#4082): a reopen
+	// within reopenReviveWindow of the PR close that cancelled the run, at
+	// the same head, revives the run to its review gate. It is routed AHEAD
+	// of the republish below on purpose, so the audit-complete republish the
+	// same delivery triggers recomputes against the revived run rather than
+	// the cancelled one. Pinned by TestWebhook_PullRequestReopenedRoutesToRevive.
+	if ev.Type == "pull_request" && ev.Action == "reopened" {
+		s.handlePullRequestReopened(r.Context(), ev.RawBody)
+	}
 	if ev.Type == "pull_request" && isAuditRepublishAction(ev.Action) {
 		s.republishOnPullRequestEvent(r.Context(), ev)
 	}
@@ -149,9 +159,12 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// already gated the merge — Fishhawk just records who merged
 	// and transitions the review stage. Closed WITHOUT merging
 	// CANCELS the run (#316 / ADR-018: change not accepted is
-	// terminal; see resolveReviewStageOnMerge), and a later reopen
-	// does not undo it, so never close a run's PR to re-trigger CI
-	// (#4008). Best-effort.
+	// terminal; see resolveReviewStageOnMerge). A reopen undoes it
+	// only within reopenReviveWindow and at the same head (the
+	// `reopened` route above, #4082); past that the run stays
+	// cancelled. Still never close a run's PR to re-trigger CI
+	// (#4008): fishhawk_retrigger_ci re-runs the PR's failed CI with
+	// no PR-state change. Best-effort.
 	if ev.Type == "pull_request" && ev.Action == "closed" {
 		s.handlePullRequestClosed(r.Context(), ev.RawBody)
 	}

@@ -151,11 +151,16 @@ func (s *Server) listDecomposedSiblings(ctx context.Context, parentID uuid.UUID)
 //
 // Correctness rests on run-state MONOTONICITY: run state 'succeeded' is
 // ABSORBING. runs.state is written by exactly one query (UpdateRunState),
-// reached by exactly two repository methods, each gated inside a
+// reached by exactly three repository methods, each gated inside a
 // SELECT ... FOR UPDATE transaction — TransitionRun (ValidRunTransition refuses
-// any terminal `from`) and RetryRun (ValidRunRetryTransition admits only
-// failed → running); ReviveRun refuses a non-failed run outright, and there is
-// no run-deletion path. See backend/internal/run/transition.go, pinned by
+// any terminal `from`), RetryRun (ValidRunRetryTransition admits only
+// failed → running) and ReviveRunOnReopen (the PR-reopen revive, #4082:
+// ValidRunReopenTransition admits only cancelled → running, through its own
+// runReopenTransitions table); ReviveRun refuses a non-failed run outright,
+// and there is no run-deletion path. None of the three gates admits an edge
+// out of `succeeded` (the reopen table is keyed on cancelled alone), so no
+// writer can move a run out of succeeded. See
+// backend/internal/run/transition.go, pinned by
 // run.TestRunSucceededIsAbsorbing and
 // run.TestPostgres_SucceededRunNeverLeavesSucceeded.
 //

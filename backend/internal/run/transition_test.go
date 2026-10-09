@@ -118,6 +118,125 @@ func TestRunSucceededIsAbsorbing(t *testing.T) {
 		t.Errorf("runRetryTransitions[succeeded] has %d entries (%v), want 0 — adding one re-opens the #2586 wave-order guard window; see the comment above runRetryTransitions",
 			n, runRetryTransitions[StateSucceeded])
 	}
+
+	// (4) The PR-reopen revive table (#4082) is the third run-state writer's
+	// gate: it, too, admits no succeeded → X edge, and carries no succeeded
+	// key (white-box, for the same reason as (3)).
+	for _, to := range allRunStates {
+		if ValidRunReopenTransition(StateSucceeded, to) {
+			t.Errorf("ValidRunReopenTransition(succeeded, %q) = true, want false (the reopen revive never leaves succeeded)", to)
+		}
+	}
+	if _, ok := runReopenTransitions[StateSucceeded]; ok {
+		t.Errorf("runReopenTransitions has a succeeded key (%v), want none — it re-opens the #2586 wave-order guard window; see the comment above runRetryTransitions",
+			runReopenTransitions[StateSucceeded])
+	}
+
+	// (5) No leak: the reopen edge cancelled → running lives ONLY in
+	// runReopenTransitions. Were it added to runRetryTransitions (or the
+	// ordinary table), RetryRun / TransitionRun / the redrive verb would
+	// reopen any cancelled run, not only a PR-closed one the reopen handler
+	// vetted.
+	if ValidRunRetryTransition(StateCancelled, StateRunning) {
+		t.Error("ValidRunRetryTransition(cancelled, running) = true, want false — the reopen edge leaked into runRetryTransitions; it belongs only in runReopenTransitions (#4082)")
+	}
+	if _, ok := runRetryTransitions[StateCancelled]; ok {
+		t.Errorf("runRetryTransitions has a cancelled key (%v), want none — the reopen edge belongs only in runReopenTransitions (#4082)", runRetryTransitions[StateCancelled])
+	}
+	if ValidRunTransition(StateCancelled, StateRunning) {
+		t.Error("ValidRunTransition(cancelled, running) = true, want false — cancelled stays terminal for every ordinary path (#4082)")
+	}
+}
+
+// TestRunReopenTransitions table-tests the run half of the PR-reopen revive
+// (#4082). Only cancelled → running is admitted; there is no idempotent
+// same-state shortcut and no reopen off any other state.
+func TestRunReopenTransitions(t *testing.T) {
+	cases := []struct {
+		from, to State
+		want     bool
+	}{
+		{StateCancelled, StateRunning, true},
+		// Wrong source state: a revive reopens only a cancelled run.
+		{StateFailed, StateRunning, false},
+		{StateSucceeded, StateRunning, false},
+		{StatePending, StateRunning, false},
+		{StateRunning, StateRunning, false}, // no same-state shortcut
+		// Wrong target: the revive reopens to running, nothing else.
+		{StateCancelled, StatePending, false},
+		{StateCancelled, StateSucceeded, false},
+		{StateCancelled, StateFailed, false},
+		{StateCancelled, StateCancelled, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"→"+string(tc.to), func(t *testing.T) {
+			if got := ValidRunReopenTransition(tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidRunReopenTransition(%q, %q) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStageReopenTransitions table-tests the stage half of the PR-reopen
+// revive (#4082). It is TYPE-AWARE: the admitted state pair on any stage
+// type other than review is refused, which is the half a state-only
+// predicate would get wrong.
+func TestStageReopenTransitions(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType StageType
+		from, to  StageState
+		want      bool
+	}{
+		{"review cancelled → awaiting_approval", StageTypeReview, StageStateCancelled, StageStateAwaitingApproval, true},
+		// The admitted pair on the wrong stage type.
+		{"implement cancelled → awaiting_approval", StageTypeImplement, StageStateCancelled, StageStateAwaitingApproval, false},
+		{"plan cancelled → awaiting_approval", StageTypePlan, StageStateCancelled, StageStateAwaitingApproval, false},
+		{"acceptance cancelled → awaiting_approval", StageTypeAcceptance, StageStateCancelled, StageStateAwaitingApproval, false},
+		{"deploy cancelled → awaiting_approval", StageTypeDeploy, StageStateCancelled, StageStateAwaitingApproval, false},
+		// Review, wrong source state.
+		{"review failed → awaiting_approval", StageTypeReview, StageStateFailed, StageStateAwaitingApproval, false},
+		{"review succeeded → awaiting_approval", StageTypeReview, StageStateSucceeded, StageStateAwaitingApproval, false},
+		{"review superseded → awaiting_approval", StageTypeReview, StageStateSuperseded, StageStateAwaitingApproval, false},
+		{"review awaiting_approval → awaiting_approval", StageTypeReview, StageStateAwaitingApproval, StageStateAwaitingApproval, false},
+		// Review cancelled, wrong target.
+		{"review cancelled → pending", StageTypeReview, StageStateCancelled, StageStatePending, false},
+		{"review cancelled → running", StageTypeReview, StageStateCancelled, StageStateRunning, false},
+		{"review cancelled → succeeded", StageTypeReview, StageStateCancelled, StageStateSucceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ValidStageReopenTransition(tc.stageType, tc.from, tc.to); got != tc.want {
+				t.Errorf("ValidStageReopenTransition(%q, %q, %q) = %v, want %v",
+					tc.stageType, tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStageReopenEdgeDoesNotLeak pins that cancelled → awaiting_approval is
+// admitted by NO other stage table (#4082): the ordinary machine, the retry,
+// fix-up, fix-up recovery, revise and merge-supersede tables all refuse it,
+// so transitionStageTx's union and RetryStage cannot write it. Only
+// ValidStageReopenTransition admits it, and only for a review stage.
+func TestStageReopenEdgeDoesNotLeak(t *testing.T) {
+	from, to := StageStateCancelled, StageStateAwaitingApproval
+	checks := []struct {
+		name string
+		got  bool
+	}{
+		{"ValidStageTransition", ValidStageTransition(from, to)},
+		{"ValidStageRetryTransition", ValidStageRetryTransition(from, to)},
+		{"ValidStageFixupTransition", ValidStageFixupTransition(from, to)},
+		{"ValidStageFixupRecoveryTransition", ValidStageFixupRecoveryTransition(from, to)},
+		{"ValidStageReviseTransition", ValidStageReviseTransition(from, to)},
+		{"ValidStageMergeSupersedeTransition(review)", ValidStageMergeSupersedeTransition(StageTypeReview, from, to)},
+	}
+	for _, c := range checks {
+		if c.got {
+			t.Errorf("%s(cancelled, awaiting_approval) = true, want false — the reopen edge belongs only in stageReopenTransitions (#4082)", c.name)
+		}
+	}
 }
 
 func TestStageTransitions_AllowedAndForbidden(t *testing.T) {

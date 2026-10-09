@@ -662,6 +662,24 @@ components:
           type: array
           description: The recorded clusters the report split, in the gather's order.
           items: { $ref: '#/components/schemas/CommsClusterSplit' }
+    RetriggerCIRun:
+      type: object
+      description: |
+        One GitHub Actions workflow run as `POST /v0/runs/{run_id}/retrigger-ci`
+        reports it (E83.49 / #4082). `reason` is set on skipped entries only;
+        `error` on failed entries only.
+      required: [id, event]
+      properties:
+        id: { type: integer, format: int64, description: 'GitHub workflow run id.' }
+        event: { type: string, description: 'The run''s triggering event (e.g. pull_request, push, workflow_dispatch).' }
+        status: { type: string, description: 'GitHub run status (completed, in_progress, queued, ...).' }
+        conclusion: { type: string, description: 'GitHub run conclusion; omitted until the run completes.' }
+        html_url: { type: string }
+        reason:
+          type: string
+          enum: [event_excluded, not_completed, succeeded]
+          description: Why a skipped run was not re-run.
+        error: { type: string, description: "GitHub's error for a failed re-run request." }
     Error:
       type: object
       required: [error]
@@ -13008,6 +13026,130 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/retrigger-ci:
+    post:
+      operationId: retriggerCI
+      summary: Re-run a run PR's failed CI at the current head
+      description: |
+        The SAFE CI re-trigger (`fishhawk_retrigger_ci`, E83.49 / #4082).
+        Closing and reopening a run's pull request to re-fire CI CANCELS the
+        run; this endpoint re-runs the PR's completed, non-successful CI
+        workflow runs at the PR's CURRENT head through the GitHub Actions
+        re-run API (`POST /repos/{owner}/{repo}/actions/runs/{id}/rerun`)
+        instead. It makes NO pull-request write, NO ref write and NO commit.
+
+        **Selection.** The handler reads the PR's live head, lists the
+        workflow runs at that head (first page, 100 runs), and re-runs every
+        run whose `event` is `pull_request`, `pull_request_target` or `push`,
+        whose `status` is `completed` and whose `conclusion` is not
+        `success`. `workflow_dispatch` runs are EXCLUDED, so a Fishhawk runner
+        dispatch is never re-executed; every other event, every run not yet
+        completed and every successful run is reported under `skipped` with a
+        reason (`event_excluded`, `not_completed`, `succeeded`).
+
+        **Audit.** One `ci_retriggered` entry (actor = the caller; payload
+        `pr_url`, `head_sha`, `rerun` ids, `skipped`, `failed`) when at least
+        one re-run was accepted. None when nothing was eligible (200 with an
+        empty `rerun`), and none when every re-run request failed (502
+        `retrigger_failed`).
+
+        **Authorization.** Operator-token-only, mirroring `vouch-commit`:
+        requires `write:stages` (enforced unconditionally, no cookie-session
+        bypass); a run-bound MCP token (subject `mcp:run:<uuid>`) is rejected
+        outright 403 (`run_token_forbidden`), even for its own run.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            At least one CI run was re-run, or nothing was eligible. The three
+            lists are always present (never null).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, pr_url, head_sha, rerun, skipped, failed]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  pr_url: { type: string, description: "The run's pull request." }
+                  head_sha: { type: string, description: "The PR head the CI was re-triggered at." }
+                  rerun:
+                    type: array
+                    description: Workflow runs GitHub accepted a re-run for.
+                    items: { $ref: '#/components/schemas/RetriggerCIRun' }
+                  skipped:
+                    type: array
+                    description: Workflow runs at the head that were not re-run, each with a `reason`.
+                    items: { $ref: '#/components/schemas/RetriggerCIRun' }
+                  failed:
+                    type: array
+                    description: Re-runs GitHub refused, each with its `error`.
+                    items: { $ref: '#/components/schemas/RetriggerCIRun' }
+        '400':
+          description: The `run_id` is not a UUID (`validation_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) the identity lacks `write:stages` —
+            `insufficient_scope`; (2) a run-bound MCP token attempted the
+            re-trigger — `run_token_forbidden` (rejected outright, even for its
+            own run).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No run with that id (`run_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            One of three cases: (1) `run_has_no_pull_request` — the run tracks
+            no pull request; (2) `pull_request_not_open` — the PR is closed or
+            merged, so nothing is re-run (the message warns never to close a
+            run's PR, and that a reopen within 10 minutes of the close with the
+            head unchanged revives the run); (3) `no_ci_runs_at_head` — no
+            `pull_request` / `pull_request_target` / `push` workflow run exists
+            at the head (remediation: push a commit to the PR branch and record
+            it with `vouch-commit`; do not close and reopen the PR).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            The run has no GitHub App installation (a GitLab run) —
+            `retrigger_unsupported_forge`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`: the run could not be read, its repo is
+            unparseable, or — after the re-runs were requested — the
+            `ci_retriggered` audit append failed (details name the re-run ids).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            One of two cases: (1) `forge_error` — the PR or the workflow runs at
+            its head could not be read, or the PR reported an empty head sha;
+            (2) `retrigger_failed` — every attempted re-run request failed
+            (details carry each run's error); no audit entry is written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run or audit repositories, or the GitHub client, are not wired
+            (`retrigger_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/runs/{run_id}/merge:
     post:
       operationId: mergeRun

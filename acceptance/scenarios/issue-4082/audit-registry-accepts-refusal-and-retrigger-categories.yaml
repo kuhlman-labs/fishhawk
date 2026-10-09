@@ -1,0 +1,14 @@
+id: scenario:issue-4082/audit-registry-accepts-refusal-and-retrigger-categories
+statement: The audit endpoint also accepts run_revive_on_reopen_refused and ci_retriggered as known categories.
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=run_revive_on_reopen_refused and ?category=ci_retriggered each return 200.'
+steps: 'GET /v0/runs?limit=1 -> a run id. On that run: GET /v0/runs/{run}/audit?category=run_revive_on_reopen_refused, GET /v0/runs/{run}/audit?category=ci_retriggered, and the control GET /v0/runs/{run}/audit?category=not_a_real_category_xyz.'
+assertions:
+    expected: 200 for each
+    observed_at_record: Both new categories -> 200 with items []; the control -> 400 validation_failed
+    repro_handle: GET /v0/runs/{run}/audit?category=ci_retriggered
+origin:
+    issue: 4082
+    pr: 0
+    run_id: bb368904-e9a4-478e-943b-de55bb011323
+    head_sha: c1f194204f18a62b9711fc20111dfb944ba3948c
+    recorded_at: 2026-10-09T12:06:44Z

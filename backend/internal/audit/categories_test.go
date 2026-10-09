@@ -697,3 +697,41 @@ func TestKnownCategories_Comms(t *testing.T) {
 		t.Error("comms_report (the artifact kind) is registered as an audit category; it must stay unknown")
 	}
 }
+
+// TestKnownCategories_CIRetriggered pins the E83.49 / #4082 category the
+// fishhawk_retrigger_ci handler (server/retrigger_ci.go) appends after it
+// re-runs a PR's failed CI at the current head. An unregistered category
+// would redden TestKnownCategoriesCoversEmittedCategories and leave the
+// re-trigger un-awaitable.
+//
+// Counterfactual: delete the ci_retriggered map entry — this test goes RED.
+func TestKnownCategories_CIRetriggered(t *testing.T) {
+	if !IsKnownCategory("ci_retriggered") {
+		t.Fatal("ci_retriggered is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_RunRevivedOnReopen pins the E83.49 / #4082 category the
+// pull_request.reopened handler appends when a quick reopen revives a run its
+// PR close cancelled. It is registered ahead of its writer so the reopen
+// slice compiles its emitter against an already-registered set.
+//
+// Counterfactual: delete the run_revived_on_reopen map entry — this test goes
+// RED.
+func TestKnownCategories_RunRevivedOnReopen(t *testing.T) {
+	if !IsKnownCategory("run_revived_on_reopen") {
+		t.Fatal("run_revived_on_reopen is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_RunReviveOnReopenRefused pins the E83.49 / #4082
+// category the pull_request.reopened handler appends when a reopen of a
+// PR-close-cancelled run fails a revive guard, naming the reason.
+//
+// Counterfactual: delete the run_revive_on_reopen_refused map entry — this
+// test goes RED.
+func TestKnownCategories_RunReviveOnReopenRefused(t *testing.T) {
+	if !IsKnownCategory("run_revive_on_reopen_refused") {
+		t.Fatal("run_revive_on_reopen_refused is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

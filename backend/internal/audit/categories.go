@@ -373,6 +373,7 @@ var KnownCategories = map[string]struct{}{
 	"ci_green":                                {},
 	"ci_retry_exhausted":                      {},
 	"ci_retry_skipped":                        {},
+	"ci_retriggered":                          {}, // E83.49 / #4082: fishhawk_retrigger_ci re-ran the PR's failed CI at the current head (server/retrigger_ci.go) — INTERNAL
 	"clarification_answered":                  {},
 	"clarification_answers_truncated":         {},
 	"clarification_requested":                 {},
@@ -535,6 +536,8 @@ var KnownCategories = map[string]struct{}{
 	"run_rejected_misconfigured":              {},
 	"run_rejected_missing_charter":            {},
 	"run_revived":                             {},
+	"run_revived_on_reopen":                   {}, // E83.49 / #4082: a quick PR reopen revived a PR-close-cancelled run to its review gate (server/pullrequest_reopen.go) — operator-visible
+	"run_revive_on_reopen_refused":            {}, // E83.49 / #4082: a PR reopen of a PR-close-cancelled run was refused, naming the guard (server/pullrequest_reopen.go) — INTERNAL
 	"runner_kind_mismatch":                    {},
 	"runner_kind_resolved":                    {},
 	"runtime_observed":                        {},

@@ -946,6 +946,12 @@ func TestPostgres_SucceededRunNeverLeavesSucceeded(t *testing.T) {
 	if _, err := repo.TransitionRun(ctx, r.ID, run.StateRunning); err != nil {
 		t.Fatalf("pending → running: %v", err)
 	}
+	// A cancelled review stage of this run, so the ReviveRunOnReopen escape
+	// below is refused by its RUN-state check alone.
+	review := makeTypedStage(t, repo, r.ID, 0, run.StageTypeReview)
+	if _, err := repo.TransitionStage(ctx, review.ID, run.StageStateCancelled, nil); err != nil {
+		t.Fatalf("review → cancelled: %v", err)
+	}
 	settled, err := repo.TransitionRun(ctx, r.ID, run.StateSucceeded)
 	if err != nil {
 		t.Fatalf("running → succeeded: %v", err)
@@ -964,14 +970,27 @@ func TestPostgres_SucceededRunNeverLeavesSucceeded(t *testing.T) {
 		{"TransitionRun→failed", func() (*run.Run, error) { return repo.TransitionRun(ctx, r.ID, run.StateFailed) }},
 		{"TransitionRun→cancelled", func() (*run.Run, error) { return repo.TransitionRun(ctx, r.ID, run.StateCancelled) }},
 		{"RetryRun→running", func() (*run.Run, error) { return repo.RetryRun(ctx, r.ID, run.StateRunning) }},
+		// The PR-reopen revive (#4082), the third runs.state writer. Its
+		// review-stage precondition is satisfied by construction (a cancelled
+		// review stage of THIS run), so only its run-state check stands
+		// between it and the escape.
+		{"ReviveRunOnReopen", func() (*run.Run, error) {
+			rr, _, err := repo.(run.RunReopenReviver).ReviveRunOnReopen(ctx, r.ID, review.ID)
+			return rr, err
+		}},
 	}
 	for _, esc := range escapes {
 		t.Run(esc.name, func(t *testing.T) {
 			_, err := esc.call()
 			var ite run.InvalidTransitionError
-			if !errors.As(err, &ite) {
+			switch {
+			case esc.name == "ReviveRunOnReopen":
+				if !errors.Is(err, run.ErrReopenNotApplicable) {
+					t.Errorf("err = %v, want ErrReopenNotApplicable", err)
+				}
+			case !errors.As(err, &ite):
 				t.Errorf("err = %v, want InvalidTransitionError", err)
-			} else if ite.Kind != "run" || ite.From != string(run.StateSucceeded) {
+			case ite.Kind != "run" || ite.From != string(run.StateSucceeded):
 				t.Errorf("ite = %+v, want kind=run from=succeeded", ite)
 			}
 			// COMMITTED STATE after the attempt returned — the assertion the
@@ -983,7 +1002,291 @@ func TestPostgres_SucceededRunNeverLeavesSucceeded(t *testing.T) {
 			if cur.State != run.StateSucceeded {
 				t.Errorf("persisted state = %q after %s, want succeeded (run left an absorbing state)", cur.State, esc.name)
 			}
+			curReview, gerr := repo.GetStage(ctx, review.ID)
+			if gerr != nil {
+				t.Fatalf("get review stage: %v", gerr)
+			}
+			if curReview.State != run.StageStateCancelled {
+				t.Errorf("review stage persisted state = %q after %s, want cancelled (a refused escape wrote the stage)", curReview.State, esc.name)
+			}
 		})
+	}
+}
+
+// walkStage drives a stage through `states` in order via the ordinary
+// TransitionStage path, failing the test on any refused hop.
+func walkStage(t *testing.T, repo run.Repository, id uuid.UUID, states ...run.StageState) {
+	t.Helper()
+	for _, to := range states {
+		if _, err := repo.TransitionStage(context.Background(), id, to, nil); err != nil {
+			t.Fatalf("stage %s → %s: %v", id, to, err)
+		}
+	}
+}
+
+// walkRun drives a run through `states` in order via TransitionRun.
+func walkRun(t *testing.T, repo run.Repository, id uuid.UUID, states ...run.State) {
+	t.Helper()
+	for _, to := range states {
+		if _, err := repo.TransitionRun(context.Background(), id, to); err != nil {
+			t.Fatalf("run %s → %s: %v", id, to, err)
+		}
+	}
+}
+
+// reopenFixture is one run in the shape the PR-reopen revive is built for
+// (#4082), seeded through the ordinary transition paths: implement succeeded
+// (PR opened), review parked at awaiting_approval and then cancelled by the PR
+// close, the run cancelled by completeRun. Callers perturb it from there.
+type reopenFixture struct {
+	run       *run.Run
+	implement *run.Stage
+	review    *run.Stage
+}
+
+// seedReopenFixture builds a reopenFixture up to (but not including) the
+// close. With closeIt, it applies the close the way the pull_request.closed
+// handler and completeRun do: review awaiting_approval → cancelled, then run
+// running → cancelled.
+func seedReopenFixture(t *testing.T, repo run.Repository, closeIt bool) reopenFixture {
+	t.Helper()
+	r := makeRun(t, repo)
+	walkRun(t, repo, r.ID, run.StateRunning)
+	impl := makeTypedStage(t, repo, r.ID, 0, run.StageTypeImplement)
+	walkStage(t, repo, impl.ID, run.StageStateDispatched, run.StageStateRunning, run.StageStateSucceeded)
+	rev := makeTypedStage(t, repo, r.ID, 1, run.StageTypeReview)
+	walkStage(t, repo, rev.ID, run.StageStateDispatched, run.StageStateRunning, run.StageStateAwaitingApproval)
+	if closeIt {
+		walkStage(t, repo, rev.ID, run.StageStateCancelled)
+		walkRun(t, repo, r.ID, run.StateCancelled)
+	}
+	return reopenFixture{run: r, implement: impl, review: rev}
+}
+
+// reread returns the committed run and stage rows.
+func reread(t *testing.T, repo run.Repository, runID, stageID uuid.UUID) (*run.Run, *run.Stage) {
+	t.Helper()
+	r, err := repo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("get run %s: %v", runID, err)
+	}
+	s, err := repo.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("get stage %s: %v", stageID, err)
+	}
+	return r, s
+}
+
+// TestPostgres_ReviveRunOnReopen_RevivesPRClosedRun is the positive half of
+// the PR-reopen revive's repository capability (#4082): from a real close
+// shape, ONE call re-parks the review stage at awaiting_approval (ended_at
+// cleared, started_at kept) and reopens the run to running. Both rows are
+// read back, because the capability's effect is committed state.
+func TestPostgres_ReviveRunOnReopen_RevivesPRClosedRun(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	f := seedReopenFixture(t, repo, true)
+
+	closedRun, closedReview := reread(t, repo, f.run.ID, f.review.ID)
+	if closedRun.State != run.StateCancelled || closedReview.State != run.StageStateCancelled || closedReview.EndedAt == nil {
+		t.Fatalf("setup: run=%s review=%s ended_at=%v, want cancelled/cancelled/stamped",
+			closedRun.State, closedReview.State, closedReview.EndedAt)
+	}
+
+	gotRun, gotStage, err := repo.(run.RunReopenReviver).ReviveRunOnReopen(ctx, f.run.ID, f.review.ID)
+	if err != nil {
+		t.Fatalf("ReviveRunOnReopen: %v", err)
+	}
+	if gotRun.State != run.StateRunning || gotStage.State != run.StageStateAwaitingApproval {
+		t.Errorf("returned run=%s stage=%s, want running/awaiting_approval", gotRun.State, gotStage.State)
+	}
+
+	curRun, curReview := reread(t, repo, f.run.ID, f.review.ID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("persisted run state = %q, want running", curRun.State)
+	}
+	if curReview.State != run.StageStateAwaitingApproval {
+		t.Errorf("persisted review state = %q, want awaiting_approval", curReview.State)
+	}
+	if curReview.EndedAt != nil {
+		t.Errorf("review ended_at = %v, want nil (a re-parked gate is not terminal)", curReview.EndedAt)
+	}
+	if curReview.FailureCategory != nil || curReview.FailureReason != nil {
+		t.Errorf("review failure metadata = %v/%v, want nil", curReview.FailureCategory, curReview.FailureReason)
+	}
+	if curReview.StartedAt == nil || closedReview.StartedAt == nil || !curReview.StartedAt.Equal(*closedReview.StartedAt) {
+		t.Errorf("review started_at = %v, want preserved %v", curReview.StartedAt, closedReview.StartedAt)
+	}
+	impl, err := repo.GetStage(ctx, f.implement.ID)
+	if err != nil {
+		t.Fatalf("get implement stage: %v", err)
+	}
+	if impl.State != run.StageStateSucceeded {
+		t.Errorf("implement stage state = %q, want succeeded (the revive touches only the review stage)", impl.State)
+	}
+
+	// The revived run is an ordinary running run at its review gate: the
+	// normal merge path resolves it.
+	walkStage(t, repo, f.review.ID, run.StageStateSucceeded)
+	walkRun(t, repo, f.run.ID, run.StateSucceeded)
+
+	// A second revive of the now-succeeded run is refused (redelivery).
+	if _, _, err := repo.(run.RunReopenReviver).ReviveRunOnReopen(ctx, f.run.ID, f.review.ID); !errors.Is(err, run.ErrReopenNotApplicable) {
+		t.Errorf("revive of a succeeded run: err = %v, want ErrReopenNotApplicable", err)
+	}
+}
+
+// TestPostgres_ReviveRunOnReopen_Refusals pins one refusal per precondition
+// of ReviveRunOnReopen (#4082). Every case RE-READS every row the revive could
+// have written: the control's effect is committed state, and a refusal that
+// fired after a partial write would still return the same error identity.
+func TestPostgres_ReviveRunOnReopen_Refusals(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	reviver := repo.(run.RunReopenReviver)
+
+	type rowWant struct {
+		runID   uuid.UUID
+		run     run.State
+		stageID uuid.UUID
+		stage   run.StageState
+	}
+	cases := []struct {
+		name string
+		// setup returns the (runID, stageID) to pass and every row that must
+		// be unchanged afterwards.
+		setup   func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant)
+		wantErr error
+	}{
+		{
+			name: "run succeeded",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				f := seedReopenFixture(t, repo, false)
+				walkStage(t, repo, f.review.ID, run.StageStateCancelled)
+				walkRun(t, repo, f.run.ID, run.StateSucceeded)
+				return f.run.ID, f.review.ID, []rowWant{{f.run.ID, run.StateSucceeded, f.review.ID, run.StageStateCancelled}}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			name: "run failed",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				f := seedReopenFixture(t, repo, false)
+				walkStage(t, repo, f.review.ID, run.StageStateCancelled)
+				walkRun(t, repo, f.run.ID, run.StateFailed)
+				return f.run.ID, f.review.ID, []rowWant{{f.run.ID, run.StateFailed, f.review.ID, run.StageStateCancelled}}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			// The run-state check is the ONLY control on this fixture: the
+			// review stage is a cancelled review of this run, so the stage
+			// checks pass. Absent the run check the stage would be re-parked
+			// at awaiting_approval under a run that never closed.
+			name: "run running with review cancelled",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				f := seedReopenFixture(t, repo, false)
+				walkStage(t, repo, f.review.ID, run.StageStateCancelled)
+				return f.run.ID, f.review.ID, []rowWant{{f.run.ID, run.StateRunning, f.review.ID, run.StageStateCancelled}}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			// A cancelled IMPLEMENT stage of a cancelled run: only the
+			// stage-type arm of ValidStageReopenTransition refuses it.
+			name: "non-review stage",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				r := makeRun(t, repo)
+				walkRun(t, repo, r.ID, run.StateRunning)
+				impl := makeTypedStage(t, repo, r.ID, 0, run.StageTypeImplement)
+				walkStage(t, repo, impl.ID, run.StageStateDispatched, run.StageStateRunning, run.StageStateCancelled)
+				walkRun(t, repo, r.ID, run.StateCancelled)
+				return r.ID, impl.ID, []rowWant{{r.ID, run.StateCancelled, impl.ID, run.StageStateCancelled}}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			// Run A's id with run B's cancelled review stage. Both runs are
+			// PR-closed, so every check but run_id ownership passes.
+			name: "review stage of a different cancelled run",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				a := seedReopenFixture(t, repo, true)
+				b := seedReopenFixture(t, repo, true)
+				return a.run.ID, b.review.ID, []rowWant{
+					{a.run.ID, run.StateCancelled, a.review.ID, run.StageStateCancelled},
+					{b.run.ID, run.StateCancelled, b.review.ID, run.StageStateCancelled},
+				}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			// An operator-cancelled run: the run is cancelled but the review
+			// stage is still parked (a run cancel does not cancel stages).
+			name: "review still awaiting_approval",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				f := seedReopenFixture(t, repo, false)
+				walkRun(t, repo, f.run.ID, run.StateCancelled)
+				return f.run.ID, f.review.ID, []rowWant{{f.run.ID, run.StateCancelled, f.review.ID, run.StageStateAwaitingApproval}}
+			},
+			wantErr: run.ErrReopenNotApplicable,
+		},
+		{
+			name: "stage not found",
+			setup: func(t *testing.T) (uuid.UUID, uuid.UUID, []rowWant) {
+				f := seedReopenFixture(t, repo, true)
+				return f.run.ID, uuid.New(), []rowWant{{f.run.ID, run.StateCancelled, f.review.ID, run.StageStateCancelled}}
+			},
+			wantErr: run.ErrNotFound,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID, wants := tc.setup(t)
+			gotRun, gotStage, err := reviver.ReviveRunOnReopen(ctx, runID, stageID)
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("err = %v, want %v", err, tc.wantErr)
+			}
+			if gotRun != nil || gotStage != nil {
+				t.Errorf("returned run=%v stage=%v on refusal, want nil/nil", gotRun, gotStage)
+			}
+			for _, w := range wants {
+				curRun, curStage := reread(t, repo, w.runID, w.stageID)
+				if curRun.State != w.run {
+					t.Errorf("run %s persisted state = %q, want %q (refused revive wrote the run)", w.runID, curRun.State, w.run)
+				}
+				if curStage.State != w.stage {
+					t.Errorf("stage %s persisted state = %q, want %q (refused revive wrote the stage)", w.stageID, curStage.State, w.stage)
+				}
+			}
+		})
+	}
+}
+
+// TestPostgres_ReopenEdgesRefusedByOrdinaryPaths pins, at the repository
+// boundary, that the revive's two edges did not leak into the ordinary
+// writers (#4082): on a PR-closed run, TransitionRun / RetryRun refuse
+// cancelled → running and TransitionStage / RetryStage refuse review
+// cancelled → awaiting_approval, and the rows stay cancelled.
+func TestPostgres_ReopenEdgesRefusedByOrdinaryPaths(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	f := seedReopenFixture(t, repo, true)
+
+	if _, err := repo.TransitionRun(ctx, f.run.ID, run.StateRunning); err == nil {
+		t.Error("TransitionRun(cancelled → running) succeeded, want refusal")
+	}
+	if _, err := repo.RetryRun(ctx, f.run.ID, run.StateRunning); err == nil {
+		t.Error("RetryRun(cancelled → running) succeeded, want refusal")
+	}
+	if _, err := repo.TransitionStage(ctx, f.review.ID, run.StageStateAwaitingApproval, nil); err == nil {
+		t.Error("TransitionStage(review cancelled → awaiting_approval) succeeded, want refusal")
+	}
+	if _, err := repo.RetryStage(ctx, f.review.ID, run.StageStateAwaitingApproval); err == nil {
+		t.Error("RetryStage(review cancelled → awaiting_approval) succeeded, want refusal")
+	}
+	curRun, curReview := reread(t, repo, f.run.ID, f.review.ID)
+	if curRun.State != run.StateCancelled || curReview.State != run.StageStateCancelled {
+		t.Errorf("persisted run=%s review=%s, want cancelled/cancelled", curRun.State, curReview.State)
 	}
 }
 

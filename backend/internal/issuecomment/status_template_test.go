@@ -1430,3 +1430,47 @@ func TestRenderStatusBody_PartialDeliveryActivity(t *testing.T) {
 		t.Errorf("payload without issue_number should render the bare phrase\n---\n%s", noIssue)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// PR-reopen revive (E83.49 / #4082).
+// ---------------------------------------------------------------------------
+
+// TestRenderStatusBody_RunRevivedOnReopenActivity pins the run_revived_on_reopen
+// timeline line BYTE-FOR-BYTE (with and without a renderable login) and proves
+// the bare category name never leaks (the renderActivityLine case) and the row
+// is not filtered as noise (the activityCategories entry). Its refused sibling
+// is DELIBERATELY not on the timeline.
+func TestRenderStatusBody_RunRevivedOnReopenActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "pr_closed_without_merge", "alice", now.Add(-3*time.Minute), nil),
+		auditEntry(runID, 6, "run_revived_on_reopen", "alice", now.Add(-2*time.Minute),
+			map[string]any{"pr_url": "https://github.com/x/y/pull/12", "head_sha": "aaa"}),
+		auditEntry(runID, 7, "run_revive_on_reopen_refused", "system", now.Add(-time.Minute),
+			map[string]any{"reason": "window_elapsed"}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if want := "@alice reopened the PR; the run was revived to its review gate"; !strings.Contains(body, want) {
+		t.Errorf("timeline missing %q\n---\n%s", want, body)
+	}
+	for _, leak := range []string{"run_revived_on_reopen", "run_revive_on_reopen_refused", "window_elapsed"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("%q leaked into the activity section\n---\n%s", leak, body)
+		}
+	}
+	if !issuecomment.RendersActivity("run_revived_on_reopen") {
+		t.Error("RendersActivity(run_revived_on_reopen) = false; notifyOperatorVisible would ERROR-log it")
+	}
+	if issuecomment.RendersActivity("run_revive_on_reopen_refused") {
+		t.Error("run_revive_on_reopen_refused must NOT render on the timeline; it is internal only")
+	}
+
+	noLogin := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{
+		auditEntry(runID, 5, "run_revived_on_reopen", "", now, nil),
+	}, "https://x", now)
+	if want := "PR reopened; the run was revived to its review gate"; !strings.Contains(noLogin, want) {
+		t.Errorf("an unrenderable actor should render the bare phrase %q\n---\n%s", want, noLogin)
+	}
+}

@@ -3631,6 +3631,49 @@ func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reaso
 	return &res, nil
 }
 
+// retriggerCIRun mirrors one workflow-run entry of the backend's
+// retrigger-ci 200 body (server/retrigger_ci.go retriggerCIRun). Reason is
+// set on skipped entries, Error on failed entries.
+type retriggerCIRun struct {
+	ID         int64  `json:"id"`
+	Event      string `json:"event"`
+	Status     string `json:"status,omitempty"`
+	Conclusion string `json:"conclusion,omitempty"`
+	HTMLURL    string `json:"html_url,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// retriggerCIResult mirrors the backend's retrigger-ci 200 body: the PR head
+// the CI was re-triggered at and the re-run / skipped / failed workflow runs.
+type retriggerCIResult struct {
+	RunID   string           `json:"run_id"`
+	PRURL   string           `json:"pr_url"`
+	HeadSHA string           `json:"head_sha"`
+	Rerun   []retriggerCIRun `json:"rerun"`
+	Skipped []retriggerCIRun `json:"skipped"`
+	Failed  []retriggerCIRun `json:"failed"`
+}
+
+// RetriggerCI re-runs a run PR's completed, non-successful CI workflow runs at
+// the PR's current head (E83.49 / #4082), via
+// `POST /v0/runs/{run_id}/retrigger-ci`. No PR-state change, no push.
+// Operator-token-only (write:stages). Mirrors VouchCommit. 4xx/5xx surfaces:
+//   - 400 validation_failed (bad run_id)
+//   - 403 run_token_forbidden / insufficient_scope
+//   - 404 run_not_found
+//   - 409 run_has_no_pull_request / pull_request_not_open / no_ci_runs_at_head
+//   - 422 retrigger_unsupported_forge (no GitHub installation)
+//   - 502 forge_error / retrigger_failed
+//   - 503 retrigger_unconfigured
+func (c *apiClient) RetriggerCI(ctx context.Context, runID uuid.UUID) (*retriggerCIResult, error) {
+	var res retriggerCIResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/retrigger-ci", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // acceptanceArbitrationRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/acceptance-arbitration` body
 // (`backend/internal/server/acceptance_arbitration.go::acceptanceArbitrationRequest`).

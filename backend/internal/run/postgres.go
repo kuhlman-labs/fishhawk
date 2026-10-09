@@ -779,6 +779,77 @@ func (r *postgresRepo) TransitionStageFromLiveRun(ctx context.Context, id uuid.U
 	return result, nil
 }
 
+// Compile-time assertion that the concrete postgres repo carries the
+// RunReopenReviver capability (#4082), so the pull_request.reopened handler's
+// type assertion cannot silently degrade to its reviver_unavailable refusal.
+var _ RunReopenReviver = (*postgresRepo)(nil)
+
+// ReviveRunOnReopen is the PR-reopen revive (RunReopenReviver, #4082): in ONE
+// transaction it re-parks the run's cancelled review stage at
+// awaiting_approval and reopens the cancelled run to running. Locks are taken
+// stage row first, then run row — the order TransitionStageFromLiveRunTx
+// documents — so it cannot deadlock against that path. Every precondition is
+// checked under the locks BEFORE any write, and any refusal returns an error
+// wrapping ErrReopenNotApplicable so BeginFunc rolls back: either both rows
+// move or neither does.
+//
+// It reuses the existing UpdateStageState and UpdateRunState queries. For the
+// non-terminal awaiting_approval target UpdateStageState writes ended_at,
+// failure_category and failure_reason as NULL (the params leave them unset),
+// clearing the cancel's ended_at; started_at is COALESCEd, so it is kept.
+func (r *postgresRepo) ReviveRunOnReopen(ctx context.Context, runID, reviewStageID uuid.UUID) (*Run, *Stage, error) {
+	var (
+		revivedRun   *Run
+		revivedStage *Stage
+	)
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		stage, err := q.LockStageForUpdate(ctx, reviewStageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		if stage.RunID != runID {
+			return fmt.Errorf("%w: stage %s belongs to run %s, not %s", ErrReopenNotApplicable, reviewStageID, stage.RunID, runID)
+		}
+		stageType, stageFrom := StageType(stage.StageType), StageState(stage.State)
+		if !ValidStageReopenTransition(stageType, stageFrom, StageStateAwaitingApproval) {
+			return fmt.Errorf("%w: %s stage %s is %s; only a cancelled review stage is re-parked", ErrReopenNotApplicable, stageType, reviewStageID, stageFrom)
+		}
+		// runID == stage.run_id here, and stages.run_id references runs.id,
+		// so the run row exists; a lock error is an infrastructure failure.
+		current, err := q.LockRunForUpdate(ctx, runID)
+		if err != nil {
+			return fmt.Errorf("lock run: %w", err)
+		}
+		if runFrom := State(current.State); !ValidRunReopenTransition(runFrom, StateRunning) {
+			return fmt.Errorf("%w: run %s is %s; only a cancelled run is reopened", ErrReopenNotApplicable, runID, runFrom)
+		}
+		updatedStage, err := q.UpdateStageState(ctx, rundb.UpdateStageStateParams{
+			ID:    reviewStageID,
+			State: string(StageStateAwaitingApproval),
+		})
+		if err != nil {
+			return fmt.Errorf("update stage state: %w", err)
+		}
+		updatedRun, err := q.UpdateRunState(ctx, rundb.UpdateRunStateParams{
+			ID:    runID,
+			State: string(StateRunning),
+		})
+		if err != nil {
+			return fmt.Errorf("update run state: %w", err)
+		}
+		revivedStage, revivedRun = rowToStage(updatedStage), rowToRun(updatedRun)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return revivedRun, revivedStage, nil
+}
+
 // validateStageCompletion is the completion/FailureCategory pairing rule every
 // stage transition enforces before touching the database.
 func validateStageCompletion(to StageState, completion *StageCompletion) error {

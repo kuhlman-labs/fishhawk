@@ -268,7 +268,8 @@ func productIssueActionFor(run *Run, why string) SuggestedAction {
 // productIssueFilingStates is the CLOSED set of classified next-actions states
 // on which the filing suggestion is offered (#1737): the category-B/C/D
 // implement-failure arms, the terminal failed/cancelled arm that today carries
-// zero actions, and the two drive-derived ci_failed arms.
+// zero actions, the PR-close-cancelled arm (cancelled_pr_closed, #4082), and
+// the two drive-derived ci_failed arms.
 //
 // Deliberately EXCLUDED: every healthy state (the anti-noise contract —
 // TestNextActions_NoFilingSuggestionOnHealthyRun), and
@@ -285,6 +286,7 @@ var productIssueFilingStates = map[string]struct{}{
 	"ci_failed_unroutable":                            {},
 	"failed":                                          {},
 	"cancelled":                                       {},
+	"cancelled_pr_closed":                             {},
 }
 
 // productIssueFilingState reports whether the classified state is a
@@ -694,6 +696,13 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// (the usual case — a failed stage fails the run) or still running.
 	if impl != nil && impl.State == "failed" {
 		return implementFailedNextActions(run, plan, stageByType(stages, "review"), impl)
+	}
+
+	// A run cancelled by its PR closing without merge (#4082). Checked AHEAD
+	// of the generic terminal arm, which would read it as a bare cancelled.
+	if run.State == "cancelled" && review != nil && review.State == "cancelled" &&
+		run.PullRequestURL != nil && *run.PullRequestURL != "" {
+		return cancelledPRClosedNextActions(run)
 	}
 
 	if runStateIsTerminal(run.State) {
@@ -2110,6 +2119,50 @@ func acceptanceTriageNoDispositionActions(run *Run, acceptance *Stage) []Suggest
 	}
 	return append(actions, pollAction(run, derivedStageWaitPollInterval(run, acceptance),
 		"re-poll with a larger audit_limit in case a triage disposition was decided and merely aged out of the recent-audit window — if none ever appears, arbitrate"))
+}
+
+// cancelledPRClosedNextActions is the cancelled_pr_closed arm (#4082): a
+// cancelled run whose review stage is cancelled and which carries a PR URL.
+// The PR closing without merge is the only writer that cancels a review stage
+// (resolveReviewStageOnMerge; an operator cancel leaves the stages as they
+// are), so this shape names a run the PR close cancelled.
+//
+// On GitHub a reopen of the PR inside the backend's 10-minute revive window,
+// at the head the PR closed at, revives the run to its review gate
+// (server.handlePullRequestReopened), so the reopen_pr ritual step leads. A
+// GitLab run (forge "gitlab") gets ONLY the fresh-run fallback: the GitLab MR
+// reopen action is not routed to the revive handler, so offering the reopen
+// there would point at a move that cannot work. An empty forge is an older
+// backend that predates the field, which only ever served GitHub runs.
+//
+// The window and the head check are evaluated server-side at reopen time and
+// are NOT re-derived here (the close timestamp is not on this read): the step
+// states them as its precondition, and the fishhawk_start_run fallback covers
+// every case where they no longer hold.
+func cancelledPRClosedNextActions(run *Run) *NextActions {
+	freshRun := SuggestedAction{
+		Action:       "fishhawk_start_run",
+		Params:       map[string]string{"repo": run.Repo, "workflow_id": run.WorkflowID},
+		Precondition: "the revive window has passed, the PR head changed since the close, the reopen was refused (run_revive_on_reopen_refused names why), or the close was intended",
+		Consumes:     consumesNewRun,
+		Reason:       "the PR closed without merging and cancelled this run; a fresh run re-plans the change (it threads off this run via parent_run_id)",
+	}
+	if run.Forge != "" && run.Forge != "github" {
+		return &NextActions{State: "cancelled_pr_closed", Actions: []SuggestedAction{freshRun}}
+	}
+	return &NextActions{
+		State: "cancelled_pr_closed",
+		Actions: []SuggestedAction{
+			{
+				Action:       "reopen_pr",
+				Params:       prParams(run),
+				Precondition: "under 10 minutes since the PR closed (the pr_closed_without_merge audit entry) and the PR head is unchanged since the close",
+				Consumes:     consumesNone,
+				Reason:       "the PR closed without merging and cancelled this run; reopening it within the window at the same head revives the run to its review gate (run_revived_on_reopen). To re-trigger CI use fishhawk_retrigger_ci — never close and reopen a run's PR for that",
+			},
+			freshRun,
+		},
+	}
 }
 
 // mergeRitualActions is the ordered operator merge ritual for a run whose
