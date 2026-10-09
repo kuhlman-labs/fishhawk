@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -404,7 +405,12 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			attempts := s.recordIntegrationError(parentRunID)
 			if attempts >= maxIntegrationAttempts {
 				cat := run.FailureB
-				reason := fmt.Sprintf("slice integration failed after %d attempts: %v", attempts, err)
+				// The reason's lead is the failuresig anchor the mcpserver
+				// next_actions classifier keys on (E72.62 / #4081): rendered
+				// FROM the one declaration, so producer and classifier cannot
+				// drift. The rendered bytes are unchanged and pinned by
+				// TestTick_Integrate_BoundedRetryGivesUpAtCap.
+				reason := fmt.Sprintf("%s %d attempts: %v", failuresig.AnchorSliceIntegrationGiveUp, attempts, err)
 				if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
 					FailureCategory: &cat,
 					FailureReason:   &reason,

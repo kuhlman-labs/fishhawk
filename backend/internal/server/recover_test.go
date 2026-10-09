@@ -804,6 +804,13 @@ func TestRecoverRun_PromptRenderCrossesAllSeams(t *testing.T) {
 // per-slice narrowing never runs for a child with no DecomposedFrom, so the
 // slice-only create is dropped: this test must be observed RED on HEAD and
 // GREEN after the scopeFilesFromApprovedPlanFull fix.
+//
+// Since E72.62 / #4081 POST /v0/runs/{id}/recover REFUSES a decomposed parent
+// (resume_unsupported_decomposed), so the plan-stage-less child is seeded
+// BY CONSTRUCTION here rather than minted through the endpoint. The shape is
+// still live: a CI-failure retry child (webhook.handleCIFailureRetry) of a
+// decomposed parent is exactly this plan-stage-less ParentRunID child, and the
+// prompt render's inclusion of slice-declared creates is what this pins.
 func TestRecoverRun_ParentPlanCreateEntryReachesRecoveryChild(t *testing.T) {
 	const topLevelFile = "backend/internal/server/handlers.go"
 	const sliceCreateFile = "backend/internal/server/credential_scope_gate_test.go"
@@ -858,19 +865,26 @@ func TestRecoverRun_ParentPlanCreateEntryReachesRecoveryChild(t *testing.T) {
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	// The plan-stage-less child, seeded the way run.ChildParamsFrom +
+	// webhook.FilterOutPlanStages mint it: ParentRunID = the decomposed
+	// parent, one implement stage, no plan stage of its own.
+	child, err := rr.CreateRun(context.Background(), run.ChildParamsFrom(parent))
+	if err != nil {
+		t.Fatalf("seed plan-stage-less child: %v", err)
 	}
-	var created runResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
-		t.Fatalf("decode recover response: %v", err)
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Fatalf("seeded child ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
 	}
-	childStages, err := rr.ListStagesForRun(context.Background(), created.ID)
-	if err != nil || len(childStages) != 1 {
-		t.Fatalf("child stages = %v (err %v), want exactly one", childStages, err)
+	childImplement, err := rr.CreateStage(context.Background(), run.CreateStageParams{
+		RunID:        child.ID,
+		Sequence:     0,
+		Type:         run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("seed child implement stage: %v", err)
 	}
-	childImplement := childStages[0]
 
 	req := httptest.NewRequest(http.MethodGet,
 		"/v0/stages/"+childImplement.ID.String()+"/prompt-render", nil)
@@ -2362,4 +2376,305 @@ func TestRecoverRun_InheritBestEffortOnParentListError(t *testing.T) {
 	if !strings.Contains(logBuf.String(), "recover: list parent scope amendments for inheritance failed") {
 		t.Errorf("expected a best-effort warning log, got:\n%s", logBuf.String())
 	}
+}
+
+// --- E72.62 / #4081: decomposed-parent refusal -----------------------------
+
+// seedDecomposedPlanParent mirrors seedPlanBearingParent but writes a
+// standard_v1 plan artifact whose decomposition carries subPlans sub_plans —
+// the shape orchestrator.fanoutIfDecomposed fans out from. The parent is
+// otherwise fully eligible (cached spec declaring an implement stage, plan
+// succeeded, implement failed category-B) and seeds NO decomposition children.
+func seedDecomposedPlanParent(t *testing.T, rr *recoverRepo, art *fakeArtifactRepo, subPlans int) *run.Run {
+	t.Helper()
+	parent, planStage, implStage := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	reason := "slice integration failed after 5 attempts: seeded"
+	implStage.FailureReason = &reason
+	d := &plan.Decomposition{Rationale: "too big for one implement timeout"}
+	for i := 0; i < subPlans; i++ {
+		d.SubPlans = append(d.SubPlans, plan.SubPlanSummary{
+			Title:                      "slice " + string(rune('A'+i)),
+			ScopeHint:                  "backend/internal/server",
+			PredictedRuntimeMinutes:    30,
+			PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		})
+	}
+	p := &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "decomposed plan",
+		Verification:               plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		PredictedRuntimeMinutes:    90,
+		RawPredictedRuntimeMinutes: 120,
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: plan.FileOpModify}},
+		},
+		Decomposition: d,
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+	return parent
+}
+
+// decomposedRefusalDetails decodes the resume_unsupported_decomposed details.
+type decomposedRefusalDetails struct {
+	RunID                string   `json:"run_id"`
+	SubPlanCount         *int     `json:"sub_plan_count"`
+	DecomposedChildCount *int     `json:"decomposed_child_count"`
+	FailedChildRunIDs    []string `json:"failed_child_run_ids"`
+	GateRuntimeMinutes   *int     `json:"gate_runtime_minutes"`
+	NextActions          []string `json:"next_actions"`
+}
+
+func decodeDecomposedRefusal(t *testing.T, w *httptest.ResponseRecorder) decomposedRefusalDetails {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string                   `json:"code"`
+			Details decomposedRefusalDetails `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != codeResumeUnsupportedDecomposed {
+		t.Fatalf("error code = %q, want %q\n%s", env.Error.Code, codeResumeUnsupportedDecomposed, w.Body.String())
+	}
+	return env.Error.Details
+}
+
+// assertRestartNextActions pins that the refusal's next_actions name both
+// restart verbs and the in-place child alternative.
+func assertRestartNextActions(t *testing.T, got []string) {
+	t.Helper()
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"fishhawk_start_campaign_item_run", "fishhawk_start_run", "fishhawk_resume_run"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("next_actions do not name %s:\n%s", want, joined)
+		}
+	}
+}
+
+func countPlanReusedFrom(au *recoverAuditRepo) int {
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == CategoryPlanReusedFrom {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRecoverRun_DecomposedPlanRefused: an otherwise fully eligible top-level
+// run whose approved plan carries two sub_plans (and NO children, so only the
+// plan arm stands between the request and the mint) is refused 422
+// resume_unsupported_decomposed, minting no run, folding no amendment and
+// appending no plan_reused_from row.
+func TestRecoverRun_DecomposedPlanRefused(t *testing.T) {
+	s, rr, sa, au, art := newDecompositionRecoverServer(t)
+	parent := seedDecomposedPlanParent(t, rr, art, 2)
+
+	w := postRecover(t, s, parent.ID.String(),
+		`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"try flat"}`, nil)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	d := decodeDecomposedRefusal(t, w)
+	if d.RunID != parent.ID.String() {
+		t.Errorf("run_id = %q, want %s", d.RunID, parent.ID)
+	}
+	if d.SubPlanCount == nil || *d.SubPlanCount != 2 {
+		t.Errorf("sub_plan_count = %v, want 2", d.SubPlanCount)
+	}
+	if d.DecomposedChildCount == nil || *d.DecomposedChildCount != 0 {
+		t.Errorf("decomposed_child_count = %v, want 0", d.DecomposedChildCount)
+	}
+	if len(d.FailedChildRunIDs) != 0 {
+		t.Errorf("failed_child_run_ids = %v, want absent (no children)", d.FailedChildRunIDs)
+	}
+	if d.GateRuntimeMinutes == nil || *d.GateRuntimeMinutes != 120 {
+		t.Errorf("gate_runtime_minutes = %v, want 120 (the raw prediction)", d.GateRuntimeMinutes)
+	}
+	assertRestartNextActions(t, d.NextActions)
+	if !reflect.DeepEqual(d.NextActions, decomposedRecoveryNextActions) {
+		t.Errorf("next_actions = %v, want the fixed list %v", d.NextActions, decomposedRecoveryNextActions)
+	}
+	assertNoRunMinted(t, rr)
+	if n := len(sa.rows); n != 0 {
+		t.Errorf("scope-amendment rows = %d, want 0 (refusal precedes the fold)", n)
+	}
+	if n := countPlanReusedFrom(au); n != 0 {
+		t.Errorf("plan_reused_from appends = %d, want 0", n)
+	}
+}
+
+// TestRecoverRun_RecoveryOfDecomposedRecoveryRefused: the 3c0e224b shape — a
+// flat recovery child of a decomposed parent (no plan stage, no children of
+// its own, implement failed category-B). Only the PARENT-WALKED plan's
+// decomposition can trip the refusal; without it the recovery-of-recovery path
+// would mint a grandchild.
+func TestRecoverRun_RecoveryOfDecomposedRecoveryRefused(t *testing.T) {
+	s, rr, _, au, art := newDecompositionRecoverServer(t)
+	original := seedDecomposedPlanParent(t, rr, art, 3)
+
+	child := rr.seedRun()
+	child.WorkflowID = "feature_change"
+	child.WorkflowSpec = []byte(gatedSpecYAML)
+	child.State = run.StateFailed
+	oid := original.ID
+	child.ParentRunID = &oid
+	childImpl := rr.seedStage(child.ID, 0, run.StageStateFailed)
+	childImpl.Type = run.StageTypeImplement
+	childImpl.FailureCategory = failureCat(run.FailureB)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	d := decodeDecomposedRefusal(t, w)
+	if d.SubPlanCount == nil || *d.SubPlanCount != 3 {
+		t.Errorf("sub_plan_count = %v, want 3 (from the parent-walked plan)", d.SubPlanCount)
+	}
+	if d.DecomposedChildCount == nil || *d.DecomposedChildCount != 0 {
+		t.Errorf("decomposed_child_count = %v, want 0", d.DecomposedChildCount)
+	}
+	rows, err := rr.ListRuns(context.Background(), run.ListRunsFilter{})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("runs = %d, want 2 (original + the flat child; no grandchild minted)", len(rows))
+	}
+	if n := countPlanReusedFrom(au); n != 0 {
+		t.Errorf("plan_reused_from appends = %d, want 0", n)
+	}
+}
+
+// TestRecoverRun_DecomposedChildrenRefusedWithoutPlanDecomposition: the plan
+// carries NO decomposition, so the children arm is the only guard — one failed
+// decomposition child of the target is enough to refuse.
+func TestRecoverRun_DecomposedChildrenRefusedWithoutPlanDecomposition(t *testing.T) {
+	s, rr, _, _, art := newDecompositionRecoverServer(t)
+	parent := seedPlanBearingParent(t, rr, art)
+
+	slice := rr.seedRun()
+	slice.State = run.StateFailed
+	pid := parent.ID
+	slice.ParentRunID = &pid
+	slice.DecomposedFrom = &pid
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	d := decodeDecomposedRefusal(t, w)
+	if d.SubPlanCount == nil || *d.SubPlanCount != 0 {
+		t.Errorf("sub_plan_count = %v, want 0", d.SubPlanCount)
+	}
+	if d.DecomposedChildCount == nil || *d.DecomposedChildCount != 1 {
+		t.Errorf("decomposed_child_count = %v, want 1", d.DecomposedChildCount)
+	}
+	if !reflect.DeepEqual(d.FailedChildRunIDs, []string{slice.ID.String()}) {
+		t.Errorf("failed_child_run_ids = %v, want [%s]", d.FailedChildRunIDs, slice.ID)
+	}
+	rows, err := rr.ListRuns(context.Background(), run.ListRunsFilter{})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("runs = %d, want 2 (parent + its slice; nothing minted)", len(rows))
+	}
+}
+
+// TestRecoverRun_DecomposedChildLookupErrorFailsClosed: on an eligible
+// NON-decomposed parent, a failed children lookup refuses 500 and mints
+// nothing — the plan arm cannot refuse it, so a swallowed error would mint.
+// ListRuns is reached on this path only by the children lookup.
+func TestRecoverRun_DecomposedChildLookupErrorFailsClosed(t *testing.T) {
+	s, rr, _, au, art := newDecompositionRecoverServer(t)
+	parent := seedPlanBearingParent(t, rr, art)
+	const causeSentinel = "children-list-boom-4081"
+	rr.listRunsErr = errors.New(causeSentinel)
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	rr.listRunsErr = nil
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "internal_error")
+	if strings.Contains(w.Body.String(), causeSentinel) {
+		t.Errorf("raw cause leaked to the caller:\n%s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "refusing rather than minting a flat recovery run") {
+		t.Errorf("body does not carry the fail-closed message:\n%s", w.Body.String())
+	}
+	assertNoRunMinted(t, rr)
+	if n := countPlanReusedFrom(au); n != 0 {
+		t.Errorf("plan_reused_from appends = %d, want 0", n)
+	}
+}
+
+// TestRecoverRun_DecompositionChildInPlace_DecomposedParentPlanStillRedrives:
+// a decomposition child whose parent-walked plan IS decomposed still
+// re-drives IN PLACE — the refusal lives on the top-level branch only.
+func TestRecoverRun_DecompositionChildInPlace_DecomposedParentPlanStillRedrives(t *testing.T) {
+	s, rr, _, _, art := newDecompositionRecoverServer(t)
+	parent := seedDecomposedPlanParent(t, rr, art, 2)
+
+	child := rr.seedRun()
+	child.WorkflowID = "feature_change"
+	child.WorkflowSpec = []byte(gatedSpecYAML)
+	child.State = run.StateFailed
+	pid := parent.ID
+	child.ParentRunID = &pid
+	child.DecomposedFrom = &pid
+	impl := rr.seedStage(child.ID, 0, run.StageStateFailed)
+	impl.Type = run.StageTypeImplement
+	impl.FailureCategory = failureCat(run.FailureB)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (in-place re-drive):\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ID != child.ID {
+		t.Errorf("recovered run id = %s, want the SAME child id %s", resp.ID, child.ID)
+	}
+}
+
+// TestRecoverRun_IneligibleDecomposedRunStaysNotEligible pins the ordering:
+// the refusal sits AFTER the eligibility gate, so a decomposed run whose
+// implement failed category-C keeps the recovery_not_eligible answer.
+func TestRecoverRun_IneligibleDecomposedRunStaysNotEligible(t *testing.T) {
+	s, rr, _, _, art := newDecompositionRecoverServer(t)
+	parent := seedDecomposedPlanParent(t, rr, art, 2)
+	// Flip the LIVE seeded implement stage to category-C (ListStagesForRun
+	// hands out copies, so mutate the stored pointer).
+	rr.mu.Lock()
+	for _, st := range rr.stagesByRunID[parent.ID] {
+		if st.Type == run.StageTypeImplement {
+			st.FailureCategory = failureCat(run.FailureC)
+		}
+	}
+	rr.mu.Unlock()
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "recovery_not_eligible")
+	assertNoRunMinted(t, rr)
 }

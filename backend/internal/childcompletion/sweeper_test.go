@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -670,6 +672,24 @@ func TestTick_Integrate_BoundedRetryGivesUpAtCap(t *testing.T) {
 	}
 	if rs.transitions[0].Failure == nil || *rs.transitions[0].Failure != run.FailureB {
 		t.Errorf("FailureCategory = %v, want B (recoverable)", rs.transitions[0].Failure)
+	}
+	// The give-up reason is the producer half of the E72.62 / #4081
+	// classifier seam: mcpserver's next_actions keys on its lead to steer
+	// the decomposed parent to a restart instead of fishhawk_resume_run.
+	// Pin BOTH that it starts with the shared failuresig anchor AND the
+	// exact rendered bytes, so rendering it from the anchor changed nothing
+	// an operator or a log reader sees.
+	if rs.transitions[0].Reason == nil {
+		t.Errorf("give-up FailureReason = nil, want the bounded-retry reason")
+	} else {
+		got := *rs.transitions[0].Reason
+		if !strings.HasPrefix(got, failuresig.AnchorSliceIntegrationGiveUp) {
+			t.Errorf("give-up FailureReason = %q, want prefix %q (the next_actions classifier key)", got, failuresig.AnchorSliceIntegrationGiveUp)
+		}
+		want := fmt.Sprintf("slice integration failed after %d attempts: consolidated branch D/F conflict", maxIntegrationAttempts)
+		if got != want {
+			t.Errorf("give-up FailureReason = %q, want byte-identical %q", got, want)
+		}
 	}
 	rs.mu.Unlock()
 

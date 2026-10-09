@@ -12043,6 +12043,31 @@ paths:
         category B — recovery is broader than a retry, not a retry of
         the terminal stage.
 
+        **Decomposed plans (E72.62 / #4081).** An ELIGIBLE top-level
+        target that is a decomposed parent is refused 422
+        `resume_unsupported_decomposed` instead of being flattened: its
+        approved plan (resolved through the `parent_run_id` walk, so a
+        flat recovery of a decomposed parent counts too) carries
+        `decomposition.sub_plans`, OR the target has decomposition
+        children. A flat, plan-stage-less recovery run cannot re-fan-out —
+        the orchestrator fans out only from a run's own plan stage — so
+        its single implement stage would carry the whole decomposition
+        against one implement timeout. The check runs AFTER the
+        eligibility gate (an ineligible decomposed run still gets 409
+        `recovery_not_eligible`) and BEFORE the spec parse, the
+        `Idempotency-Key` replay, the budget gate and any mint: nothing is
+        created, no amendment is folded, no audit entry is appended — so a
+        replayed key that minted a flat child before this refusal existed
+        now gets the 422 too. `details` carries `{run_id, sub_plan_count,
+        decomposed_child_count, failed_child_run_ids?,
+        gate_runtime_minutes?, next_actions}` (`next_actions` is a fixed
+        list: restart the campaign item, or start a fresh run for the same
+        issue; re-state the prior approval's conditions; or re-drive one
+        failed slice in place by targeting the child's own id). A failure
+        to list the target's decomposition children fails CLOSED with 500
+        `internal_error` (nothing minted). A decomposition-child target is
+        unaffected and still re-drives in place.
+
         **Scope amendments.** Optional `add_scope_files` paths land as
         a PRE-APPROVED #961 scope-amendment row on the implement stage
         — the newly minted one for a top-level target, the EXISTING
@@ -12217,6 +12242,11 @@ paths:
             workflow spec (legacy row), its cached spec no longer
             parses or defines the workflow, or the workflow has no
             non-plan stages. Start a fresh run instead.
+            `resume_unsupported_decomposed` (E72.62 / #4081) — the
+            top-level target is a decomposed parent (its approved plan
+            carries `decomposition.sub_plans` or it has decomposition
+            children), so a flat recovery run is refused and nothing is
+            minted; `details.next_actions` names the restart.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
