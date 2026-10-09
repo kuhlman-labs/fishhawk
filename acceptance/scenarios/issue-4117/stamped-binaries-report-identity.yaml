@@ -1,0 +1,14 @@
+id: scenario:issue-4117/stamped-binaries-report-identity
+statement: Each of the five binaries, built with the helper's flags for version v9.8.7-rl-test and a 40-character SHA, reports both values on its version surface. `fishhawk version`, `fishhawkd version`, `fishhawk-mcp --version` and `fishhawk-mcp-shim --version` each print `v9.8.7-rl-test (<sha>)`. `fishhawk-runner version` prints JSON carrying version v9.8.7-rl-test and git_sha <sha>.
+verify_hint: Build each binary into a temp dir with `go build -trimpath -ldflags "$(scripts/release-ldflags <component> v9.8.7-rl-test <sha>)"`, run each version surface, and read stdout. scripts/test-release-ldflags r7 does this and prints PASS/FAIL per binary.
+steps: 'Posture B: for each module/cmd (cli/fishhawk, backend/fishhawkd, backend/fishhawk-mcp, backend/fishhawk-mcp-shim, runner/fishhawk-runner) ran go build -trimpath -ldflags "$(/bin/sh scripts/release-ldflags <c> v9.8.7-rl-test fedcba9876543210fedcba9876543210fedcba98)" -o /tmp/fhacc4117/st/<c>. Ran fishhawk version, fishhawkd version, fishhawk-mcp --version, fishhawk-mcp-shim --version, fishhawk-runner version.'
+assertions:
+    expected: each surface reports v9.8.7-rl-test and the 40-char sha
+    observed_at_record: The first four each print 'v9.8.7-rl-test (fedcba9876543210fedcba9876543210fedcba98)', exit 0. fishhawk-runner prints {"git_sha":"fedcba98...98","plan_schema_hash":"11ebb525...","version":"v9.8.7-rl-test"}. Harness r7 also passed 5/5 ('built five binaries in 5s')
+    repro_handle: go build -trimpath -ldflags "$(scripts/release-ldflags fishhawkd v9.8.7-rl-test <sha>)" ./cmd/fishhawkd && ./fishhawkd version
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z

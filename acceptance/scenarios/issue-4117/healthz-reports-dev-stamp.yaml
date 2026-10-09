@@ -1,0 +1,14 @@
+id: scenario:issue-4117/healthz-reports-dev-stamp
+statement: On the localhost preview, whose fishhawkd scripts/dev builds through the delegated `_build_ldflags`, `GET /healthz` returns 200 with version `dev` and a git_sha equal to the preview commit's short SHA. The delegation preserves the dev stamping path end to end.
+verify_hint: GET /healthz on the preview and read the version and git_sha fields.
+steps: GET http://localhost:8090/healthz; compared git_sha with the sanctioned checkout HEAD (e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31).
+assertions:
+    expected: 200, version dev, git_sha equals the preview commit's short SHA
+    observed_at_record: 200 with version 'dev', git_sha 'e7f39c9c', min_runner_version 'dev'
+    repro_handle: curl http://localhost:8090/healthz
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z

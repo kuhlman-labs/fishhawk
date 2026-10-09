@@ -1,0 +1,14 @@
+id: scenario:issue-4117/mcp-handshake-reports-version-and-sha
+statement: When a stamped fishhawk-mcp receives an MCP initialize request over stdio, it answers with serverInfo.version equal to `<Version>+<GitSHA>` (for example `v9.8.7-rl-test+<sha>`), not the former fixed `v0.1.0` base.
+verify_hint: Pipe one initialize JSON-RPC line into the stamped fishhawk-mcp binary, with FISHHAWK_API_TOKEN and FISHHAWK_BACKEND_URL set to dummy values, and read serverInfo.version from the JSON-RPC response on stdout.
+steps: Piped one initialize JSON-RPC line (protocolVersion 2025-06-18) and a 2s sleep into the stamped /tmp/fhacc4117/st/fishhawk-mcp, built as in stamped-binaries-report-identity, with FISHHAWK_API_TOKEN=dummy FISHHAWK_BACKEND_URL=http://localhost:8090. Parsed result.serverInfo from stdout.
+assertions:
+    expected: serverInfo.version == '<Version>+<GitSHA>'
+    observed_at_record: serverInfo {name fishhawk-mcp, version 'v9.8.7-rl-test+fedcba9876543210fedcba9876543210fedcba98'}. An unstamped build reports 'dev'
+    repro_handle: echo '{initialize}' | fishhawk-mcp
+origin:
+    issue: 4117
+    pr: 4138
+    run_id: 8da7e7ca-8538-473b-9748-af502ef2978f
+    head_sha: e7f39c9c6eb1c93de28cc8d2cfb9666fb0bcba31
+    recorded_at: 2026-10-09T00:28:32Z
