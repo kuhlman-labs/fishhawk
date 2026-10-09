@@ -286,6 +286,8 @@ one, never in batches:
 | [ADR-087](087-local-stage-concurrency-groups.md) | Local stage concurrency groups: server-coordinated admission of host-dispatched stages | `accepted` | [#3968](https://github.com/kuhlman-labs/fishhawk/issues/3968) |
 | [ADR-088](088-declarative-gate-services.md) | Declarative gate services: a closed, Fishhawk-owned `services:` schema under workflow-v2 `gate_container`, joined to the gate by a shared --network=none namespace (not raw compose, not a bridge network) | `accepted` | [#4042](https://github.com/kuhlman-labs/fishhawk/issues/4042) |
 | [ADR-089](089-first-officer-read-only-crew-seat.md) | First officer: a structurally read-only crew seat whose evidence-backed findings gate actions | `accepted` | [#4149](https://github.com/kuhlman-labs/fishhawk/issues/4149) |
+| [ADR-090](090-verify-the-merge-candidate.md) | Verify the merge candidate: a Fishhawk-dispatched merge requires an up-to-date head, and a base-advanced head must pass the project's declared verify command in a runner verify-only pass | `accepted` | [#4170](https://github.com/kuhlman-labs/fishhawk/issues/4170) |
+| [ADR-091](091-restart-recovery-redispatches-advisory-review-rounds.md) | Restart recovery re-dispatches orphaned advisory review rounds from a durable round-source descriptor instead of terminating them as failed | `accepted` | [#4171](https://github.com/kuhlman-labs/fishhawk/issues/4171) |
 
 ## Status unknown — needs captain confirmation
 
