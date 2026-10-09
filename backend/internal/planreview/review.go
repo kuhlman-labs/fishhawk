@@ -1205,6 +1205,34 @@ type ReviewStartedPayload struct {
 	// payload decodes "", which the ship-side check treats as undecidable and
 	// records nothing.
 	ChangeID string `json:"change_id,omitempty"`
+
+	// RoundOrigin records WHERE an implement-review round's diff came from
+	// (#4077), so a round orphaned by a daemon restart can be re-dispatched
+	// against the same input: "trace" (the stage's uploaded trace bundle),
+	// "fixup_push" (ComparePatch(RoundBaseSHA, HeadSHA) after a fix-up push)
+	// or "consolidated" (a decomposed parent's ComparePatch(RoundBaseSHA,
+	// HeadSHA)). Empty on plan_review_started and on every implement round
+	// written before #4077 — a reader treats empty as an unknown source.
+	// omitempty keeps those payloads byte-identical.
+	RoundOrigin string `json:"round_origin,omitempty"`
+
+	// RoundBaseSHA is the compare base of a fixup_push / consolidated round
+	// (#4077): the re-dispatch rebuilds the diff as ComparePatch(RoundBaseSHA,
+	// HeadSHA). Empty for a trace round (its diff lives in the stored bundle)
+	// and for plan rounds. omitempty keeps those payloads byte-identical.
+	RoundBaseSHA string `json:"round_base_sha,omitempty"`
+
+	// RedispatchOf is the audit sequence of the ORPHANED round's
+	// *_review_started entry this round re-dispatches after a daemon restart
+	// (#4077). 0 (omitted) on an ordinary round.
+	RedispatchOf int64 `json:"redispatch_of,omitempty"`
+
+	// RedispatchDepth counts how many re-dispatches separate this round from
+	// the round that was originally dispatched (#4077): 1 for the first
+	// re-dispatch, the orphaned round's depth + 1 thereafter. The boot sweep
+	// caps it so a crash loop cannot re-dispatch forever. 0 (omitted) on an
+	// ordinary round.
+	RedispatchDepth int `json:"redispatch_depth,omitempty"`
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with
