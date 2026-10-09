@@ -3189,6 +3189,26 @@ type RebaseBranchResult struct {
 	// ConflictResolutionNote states that nothing was written by this call and
 	// names the await-then-re-invoke route.
 	ConflictResolutionNote string `json:"conflict_resolution_note,omitempty"`
+
+	// --- merge-candidate verify (ADR-090 D3 / #4018) ---
+	//
+	// A performed base merge produces a head no runner gated, so the 200
+	// authorizes a verify-only pass for it; an already-up-to-date call
+	// re-triggers one for an unverified base-advance or conflict-resolution
+	// head. A pass that cannot start does not fail the rebase.
+
+	// MergeCandidateVerifyState is the live head's state after the call:
+	// not_required, unverified, in_flight, passed or failed.
+	MergeCandidateVerifyState string `json:"merge_candidate_verify_state,omitempty"`
+	// MergeCandidateVerifyTriggered is true when THIS call started the pass.
+	MergeCandidateVerifyTriggered bool `json:"merge_candidate_verify_triggered,omitempty"`
+	// MergeCandidateVerifyStageID is the re-opened implement stage to
+	// dispatch (fishhawk_dispatch_stage) and await (fishhawk_await_stage).
+	MergeCandidateVerifyStageID string `json:"merge_candidate_verify_stage_id,omitempty"`
+	// MergeCandidateVerifyNote names the next step for a live pass.
+	MergeCandidateVerifyNote string `json:"merge_candidate_verify_note,omitempty"`
+	// MergeCandidateVerifyRefusal names why no pass could be started.
+	MergeCandidateVerifyRefusal string `json:"merge_candidate_verify_refusal,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the

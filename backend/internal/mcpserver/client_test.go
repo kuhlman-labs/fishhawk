@@ -2975,6 +2975,48 @@ func TestRebaseRunBranch_Decodes200WithoutConflictResolution(t *testing.T) {
 	}
 }
 
+// --- ADR-090 / #4018: the rebase verb's merge-candidate verify fields ---
+
+// TestRebaseRunBranch_DecodesMergeCandidateVerify pins the hand mirror of the
+// backend's merge_candidate_verify_* rebase fields. The tags are spelled here
+// exactly as the backend's rebaseBranchResponse emits them, so a tag renamed
+// on either side decodes to the zero value and this test goes red on the
+// missing signal — a triggered pass must never read as a plain advance.
+func TestRebaseRunBranch_DecodesMergeCandidateVerify(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.NewString()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","new_head_sha":"cccc3333","mechanism_note":"...",`+
+			`"merge_candidate_verify_state":"in_flight","merge_candidate_verify_triggered":true,`+
+			`"merge_candidate_verify_stage_id":"`+stageID+`",`+
+			`"merge_candidate_verify_note":"dispatch with fishhawk_dispatch_stage",`+
+			`"merge_candidate_verify_refusal":"none"}`)
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("RebaseRunBranch = %v", err)
+	}
+	if res.MergeCandidateVerifyState != "in_flight" {
+		t.Errorf("merge_candidate_verify_state = %q, want in_flight", res.MergeCandidateVerifyState)
+	}
+	if !res.MergeCandidateVerifyTriggered {
+		t.Error("merge_candidate_verify_triggered = false, want true")
+	}
+	if res.MergeCandidateVerifyStageID != stageID {
+		t.Errorf("merge_candidate_verify_stage_id = %q, want %q", res.MergeCandidateVerifyStageID, stageID)
+	}
+	if !strings.Contains(res.MergeCandidateVerifyNote, "fishhawk_dispatch_stage") {
+		t.Errorf("merge_candidate_verify_note = %q, want the dispatch next step", res.MergeCandidateVerifyNote)
+	}
+	if res.MergeCandidateVerifyRefusal != "none" {
+		t.Errorf("merge_candidate_verify_refusal = %q, want none", res.MergeCandidateVerifyRefusal)
+	}
+}
+
 // TestSubmitApproval_SendsClaimsAllOpenPlanConcernsBody pins the apiClient half
 // of the #3318 wire contract against a real HTTP server: the shorthand must
 // arrive under the exact key claims_all_open_plan_concerns (the backend's

@@ -124,6 +124,47 @@ type rebaseBranchResponse struct {
 	// ConflictResolutionNote is the constant sentence stating that nothing was
 	// written by this call and naming the await-then-re-invoke route.
 	ConflictResolutionNote string `json:"conflict_resolution_note,omitempty"`
+
+	// --- merge-candidate verify (ADR-090 D3 / #4018) ---
+	//
+	// A performed base merge produces a head no runner gated on the
+	// committed tree, so the 200 authorizes a verify-only pass for it; an
+	// already-up-to-date invocation re-triggers one when the live head is a
+	// base-advance or conflict-resolution head with no passing verdict. A
+	// pass that cannot start never fails the rebase: the refusal rides on
+	// this 200 and the merge gate later answers merge_candidate_unverified.
+
+	// MergeCandidateVerifyState is the live head's merge-candidate state
+	// after this call: not_required, unverified, in_flight, passed or failed.
+	MergeCandidateVerifyState string `json:"merge_candidate_verify_state,omitempty"`
+	// MergeCandidateVerifyTriggered is true when THIS call appended a
+	// verify-only pass trigger and re-opened the implement stage.
+	MergeCandidateVerifyTriggered bool `json:"merge_candidate_verify_triggered,omitempty"`
+	// MergeCandidateVerifyStageID is the re-opened implement stage to
+	// dispatch and await, set whenever a pass is live for the head.
+	MergeCandidateVerifyStageID string `json:"merge_candidate_verify_stage_id,omitempty"`
+	// MergeCandidateVerifyNote names the next step for a live pass.
+	MergeCandidateVerifyNote string `json:"merge_candidate_verify_note,omitempty"`
+	// MergeCandidateVerifyRefusal names why no pass could be started or why
+	// the head's state could not be read.
+	MergeCandidateVerifyRefusal string `json:"merge_candidate_verify_refusal,omitempty"`
+}
+
+// mergeCandidateVerifyTriggeredNote is the constant sentence shipped whenever
+// a verify-only pass is live for the head after this call.
+const mergeCandidateVerifyTriggeredNote = "A verify-only merge-candidate pass (ADR-090) is authorized for this head: the implement stage is re-opened and the runner fetches the run-branch tip, runs ONLY the declared verify command in full form in the isolated gate, and reports the result. The pass writes NOTHING — no commit, no push. On a local runner, dispatch the stage with fishhawk_dispatch_stage and await it with fishhawk_await_stage; fishhawk_merge_run refuses this head until the pass reports passed."
+
+// mergeCandidateUnreadableHeadNote is shipped when a performed merge's new
+// head could not be read back, so no pass could be anchored.
+const mergeCandidateUnreadableHeadNote = "the base merge SUCCEEDED but its resulting head could not be read back, so no merge-candidate verify pass was anchored; re-invoke fishhawk_rebase_run_branch — the retry takes the already-up-to-date arm and triggers the pass for the live head"
+
+// rebaseMergeCandidateFields is the merge-candidate block of a 200.
+type rebaseMergeCandidateFields struct {
+	State     string
+	Triggered bool
+	StageID   string
+	Note      string
+	Refusal   string
 }
 
 // handleRebaseRunBranch implements POST /v0/runs/{run_id}/rebase-branch.
@@ -182,6 +223,13 @@ type rebaseBranchResponse struct {
 //     republish warning advertises is real: invocation 1 merges and fails to
 //     publish; the operator re-invokes; the probe short-circuits here and the
 //     required check IS published at the correct post-merge head.
+//
+// After the shared tail a 200 also authorizes the ADR-090 merge-candidate
+// verify pass (rebaseMergeCandidateVerify): a performed merge triggers a
+// verify-only pass for the re-read new head, and an already-up-to-date call
+// re-triggers one for an unverified base-advance or conflict-resolution head.
+// The pass re-opens the implement stage but writes nothing to the branch, and
+// a pass that cannot start rides on the 200 as merge_candidate_verify_refusal.
 func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -434,6 +482,11 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 
 	s.notifyStatusUpdate(r.Context(), runID, "branch_rebased")
 
+	// MERGE-CANDIDATE VERIFY (ADR-090 D3), after the shared tail so the
+	// branch_rebased row the state predicate classifies on is already on the
+	// chain and the review gate is already re-parked.
+	mc := s.rebaseMergeCandidateVerify(r, runRow, branch, baseRef, headSHA, newHead, mergePerformed)
+
 	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
 		RunID:                      runID.String(),
 		PRNumber:                   prNumber,
@@ -448,7 +501,77 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		AuditCheckRepublished:      republished,
 		AuditCheckRepublishWarning: republishWarning,
 		LineageAttributionWarning:  lineageWarning,
+
+		MergeCandidateVerifyState:     mc.State,
+		MergeCandidateVerifyTriggered: mc.Triggered,
+		MergeCandidateVerifyStageID:   mc.StageID,
+		MergeCandidateVerifyNote:      mc.Note,
+		MergeCandidateVerifyRefusal:   mc.Refusal,
 	})
+}
+
+// rebaseMergeCandidateVerify is the rebase verb's merge-candidate producer.
+//
+//   - A PERFORMED merge triggers a pass for the re-read new head (cause
+//     base_advance). When the new head could not be read back nothing is
+//     anchored; the retry takes the already-up-to-date arm below.
+//   - An ALREADY-UP-TO-DATE invocation reads mergeCandidateVerifyState for
+//     the live head and re-triggers only when it is unverified (a
+//     conflict-resolution push, or a base advance whose pass never reported
+//     a verdict); passed, failed, in_flight and not_required start nothing.
+//
+// The actor is the OPERATOR who invoked the verb. Nothing here fails the
+// rebase: a refusal is carried on the 200.
+func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
+	branch, baseRef, priorHead, newHead string, mergePerformed bool) rebaseMergeCandidateFields {
+	ctx := r.Context()
+	if mergePerformed && newHead == "" {
+		return rebaseMergeCandidateFields{Refusal: mergeCandidateUnreadableHeadNote}
+	}
+	head, cause := newHead, mergeCandidateCauseBaseAdvance
+	if !mergePerformed {
+		head = priorHead
+		st, err := s.mergeCandidateVerifyState(ctx, runRow, head)
+		if err != nil {
+			return rebaseMergeCandidateFields{Refusal: "the merge-candidate verify state of " + head +
+				" could not be read (" + err.Error() + "), so no pass was triggered; re-invoke fishhawk_rebase_run_branch to retry"}
+		}
+		if st.State != mergeCandidateStateUnverified {
+			out := rebaseMergeCandidateFields{State: st.State}
+			if st.State == mergeCandidateStateInFlight {
+				out.StageID = st.StageID.String()
+				out.Note = mergeCandidateVerifyTriggeredNote
+			}
+			return out
+		}
+		cause = st.Cause
+	}
+
+	id := IdentityFrom(ctx)
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	start, refusal := s.startMergeCandidateVerifyPass(ctx, runRow.ID, mergeCandidateVerifyParams{
+		Branch:  branch,
+		BaseRef: baseRef,
+		HeadSHA: head,
+		Cause:   cause,
+	}, mergeCandidateActor{Kind: audit.ActorUser, Subject: subject})
+	if refusal != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch rebase: merge-candidate verify pass could not be started",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("head_sha", head),
+			slog.String("reason", refusal.Reason))
+		return rebaseMergeCandidateFields{State: mergeCandidateStateUnverified, Refusal: refusal.Reason}
+	}
+	out := rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered}
+	if start.State == mergeCandidateStateInFlight {
+		out.StageID = start.StageID.String()
+		out.Note = mergeCandidateVerifyTriggeredNote
+	}
+	return out
 }
 
 // writeRebaseNotDeterminable is the fail-CLOSED refusal: a 422 carrying the
