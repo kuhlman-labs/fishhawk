@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -4761,7 +4762,13 @@ func TestGetPlan_WithDecomposition_FieldsSurfaced(t *testing.T) {
 		Rationale: "Two independent file areas allow parallel execution.",
 		SubPlans: []PlanSubPlan{
 			{Title: "Add dispatcher flag", ScopeHint: "backend/internal/webhook/", PredictedRuntimeMinutes: 10, PredictedRuntimeConfidence: "high"},
-			{Title: "Add unit tests", ScopeHint: "backend/internal/webhook/dispatcher_test.go", PredictedRuntimeMinutes: 8, PredictedRuntimeConfidence: "medium"},
+			{
+				Title: "Add unit tests", ScopeHint: "backend/internal/webhook/dispatcher_test.go", PredictedRuntimeMinutes: 8, PredictedRuntimeConfidence: "medium",
+				// #4068: the fields get_plan used to elide.
+				Scope:               &PlanScope{Files: []PlanScopeFile{{Path: "backend/internal/webhook/dispatcher_test.go", Operation: "modify"}}},
+				DependsOn:           []int{0},
+				ModelRecommendation: &PlanModelRecommendation{ImplementModel: "claude-sonnet-5-5", Rationale: "test-only slice", ComplexityAssessed: "low"},
+			},
 		},
 	}
 	seedPlanArtifact(fb, planStageID, content, time.Hour)
@@ -4784,10 +4791,239 @@ func TestGetPlan_WithDecomposition_FieldsSurfaced(t *testing.T) {
 		t.Error("Plan.Decomposition.Rationale should be non-empty")
 	}
 	if got := len(out.Plan.Decomposition.SubPlans); got != 2 {
-		t.Errorf("len(Plan.Decomposition.SubPlans) = %d, want 2", got)
+		t.Fatalf("len(Plan.Decomposition.SubPlans) = %d, want 2", got)
 	}
 	if out.Plan.PredictedRuntimeMinutes <= 0 {
 		t.Errorf("Plan.PredictedRuntimeMinutes = %d, want > 0", out.Plan.PredictedRuntimeMinutes)
+	}
+	// #4068: depends_on, scope and model_recommendation round-trip, and a
+	// wave-0 slice's depends_on is an explicit empty list, never nil.
+	first, second := out.Plan.Decomposition.SubPlans[0], out.Plan.Decomposition.SubPlans[1]
+	if first.DependsOn == nil || len(first.DependsOn) != 0 {
+		t.Errorf("SubPlans[0].DependsOn = %#v, want a non-nil empty slice (wave 0)", first.DependsOn)
+	}
+	if !reflect.DeepEqual(second.DependsOn, []int{0}) {
+		t.Errorf("SubPlans[1].DependsOn = %#v, want [0]", second.DependsOn)
+	}
+	if second.Scope == nil || len(second.Scope.Files) != 1 || second.Scope.Files[0].Path != "backend/internal/webhook/dispatcher_test.go" {
+		t.Errorf("SubPlans[1].Scope = %+v, want the slice's one scope file", second.Scope)
+	}
+	if second.ModelRecommendation == nil || second.ModelRecommendation.ImplementModel != "claude-sonnet-5-5" ||
+		second.ModelRecommendation.ComplexityAssessed != "low" || second.ModelRecommendation.Rationale != "test-only slice" {
+		t.Errorf("SubPlans[1].ModelRecommendation = %+v, want the seeded recommendation", second.ModelRecommendation)
+	}
+}
+
+// planSchemaPath is the canonical standard_v1 plan schema, read at test time
+// so a property added to it later is checked against the get_plan output
+// without editing this test (#4068).
+const planSchemaPath = "../../../docs/spec/plan-standard-v1.schema.json"
+
+// schemaDefProperties returns the sorted property names of $defs.<defName> in
+// the canonical plan schema. Fails the test (never skips) on an unreadable
+// schema, so a mis-resolved path cannot pass the drift test vacuously.
+func schemaDefProperties(t *testing.T, defName string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(planSchemaPath)
+	if err != nil {
+		t.Fatalf("read canonical plan schema %s: %v", planSchemaPath, err)
+	}
+	keys, err := schemaDefPropertiesFrom(raw, defName)
+	if err != nil {
+		t.Fatalf("%s: %v", planSchemaPath, err)
+	}
+	return keys
+}
+
+// schemaDefPropertiesFrom is schemaDefProperties' pure half: it errors when the
+// $def or its properties map is missing or empty (the vacuity guard), so a
+// renamed $def cannot turn the drift test into a check over zero properties.
+func schemaDefPropertiesFrom(raw []byte, defName string) ([]string, error) {
+	var doc struct {
+		Defs map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("decode schema: %w", err)
+	}
+	def, ok := doc.Defs[defName]
+	if !ok {
+		return nil, fmt.Errorf("schema has no $defs.%s", defName)
+	}
+	if len(def.Properties) == 0 {
+		return nil, fmt.Errorf("schema $defs.%s declares no properties", defName)
+	}
+	keys := make([]string, 0, len(def.Properties))
+	for k := range def.Properties {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// missingKeys returns the schema keys absent (or null) in got, in schema order.
+func missingKeys(schemaKeys []string, got map[string]any) []string {
+	var missing []string
+	for _, k := range schemaKeys {
+		if v, ok := got[k]; !ok || v == nil {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
+
+// TestGetPlan_SurfacesEverySchemaProperty is the #4068 drift test: every
+// property of $defs.sub-plan-summary, $defs.verification and
+// $defs.acceptance-criterion — read from the canonical schema at test time —
+// must survive the fake backend -> apiClient -> tryGetPlanForRun decode ->
+// GetPlanOutput JSON path. A schema property with no PlanSubPlan /
+// PlanVerification / PlanAcceptanceCriterion field fails here, naming it.
+func TestGetPlan_SurfacesEverySchemaProperty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	// Seeded RAW (seedRawPlanArtifact, not via PlanContent) so a field the DTO
+	// elides cannot be pre-filtered out of the seed.
+	seedRawPlanArtifact(fb, planStageID, map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "Drift fixture.",
+		"scope": map[string]any{"files": []any{
+			map[string]any{"path": "a.go", "operation": "modify"},
+			map[string]any{"path": "b.go", "operation": "modify"},
+		}},
+		"verification": map[string]any{
+			"test_strategy":      "Run the tests.",
+			"rollback_plan":      "Revert the PR.",
+			"out_of_scope":       []any{"the CLI"},
+			"acceptance_surface": "none",
+			"acceptance_criteria": []any{map[string]any{
+				"id":                       "drift-1",
+				"statement":                "Every property surfaces.",
+				"source":                   "inferred",
+				"source_ref":               "#4068",
+				"rationale":                "The issue implies it.",
+				"blocking":                 false,
+				"verify_hint":              "Call get_plan.",
+				"preconditions":            []any{"a decomposed plan exists"},
+				"skip_expected":            true,
+				"expectation_basis":        "TestGetPlan_SurfacesEverySchemaProperty",
+				"requires_live_validation": true,
+			}},
+		},
+		"predicted_runtime_minutes":    30,
+		"predicted_runtime_confidence": "medium",
+		"decomposition": map[string]any{
+			"rationale": "Two slices.",
+			"sub_plans": []any{
+				// Slice 0 carries NO depends_on key: the output must still
+				// carry an explicit [] (normalizeSubPlanDependsOn).
+				map[string]any{
+					"title": "Slice A", "scope_hint": "a", "predicted_runtime_minutes": 10, "predicted_runtime_confidence": "high",
+					"scope": map[string]any{"files": []any{map[string]any{"path": "a.go", "operation": "modify"}}},
+				},
+				// Slice 1 populates every sub-plan-summary property.
+				map[string]any{
+					"title": "Slice B", "scope_hint": "b", "predicted_runtime_minutes": 20, "predicted_runtime_confidence": "low",
+					"scope":      map[string]any{"files": []any{map[string]any{"path": "b.go", "operation": "modify"}}, "estimated_lines_changed": 12},
+					"depends_on": []any{0},
+					"model_recommendation": map[string]any{
+						"implement_model": "claude-sonnet-5-5", "rationale": "small slice", "complexity_assessed": "low",
+					},
+				},
+			},
+		},
+	}, time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" || out.Plan == nil {
+		t.Fatalf("Status = %q, Plan nil = %v; want an available plan", out.Status, out.Plan == nil)
+	}
+	body, err := json.Marshal(out.Plan)
+	if err != nil {
+		t.Fatalf("marshal plan output: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode plan output: %v", err)
+	}
+	subPlans := got["decomposition"].(map[string]any)["sub_plans"].([]any)
+	if len(subPlans) != 2 {
+		t.Fatalf("decomposition.sub_plans has %d entries, want 2", len(subPlans))
+	}
+	slice0 := subPlans[0].(map[string]any)
+	slice1 := subPlans[1].(map[string]any)
+	verification := got["verification"].(map[string]any)
+	criteria, _ := verification["acceptance_criteria"].([]any)
+	if len(criteria) != 1 {
+		t.Fatalf("verification.acceptance_criteria = %v, want one criterion", verification["acceptance_criteria"])
+	}
+
+	for _, c := range []struct {
+		def, where, dto string
+		got             map[string]any
+	}{
+		{"sub-plan-summary", "decomposition.sub_plans[1]", "PlanSubPlan", slice1},
+		{"verification", "verification", "PlanVerification", verification},
+		{"acceptance-criterion", "verification.acceptance_criteria[0]", "PlanAcceptanceCriterion", criteria[0].(map[string]any)},
+	} {
+		if missing := missingKeys(schemaDefProperties(t, c.def), c.got); len(missing) > 0 {
+			t.Errorf("get_plan elides schema $defs.%s properties %v from %s: add a json-tag-mirroring field to %s in backend/internal/mcpserver/tools.go (#4068)",
+				c.def, missing, c.where, c.dto)
+		}
+	}
+
+	// depends_on is ALWAYS present: an explicit [] on the wave-0 slice that
+	// omitted it, and the declared [0] on slice 1.
+	dep0, ok := slice0["depends_on"].([]any)
+	if !ok || len(dep0) != 0 {
+		t.Errorf("sub_plans[0].depends_on = %#v (present=%v), want an explicit empty JSON array", slice0["depends_on"], ok)
+	}
+	if dep1, _ := slice1["depends_on"].([]any); !reflect.DeepEqual(dep1, []any{float64(0)}) {
+		t.Errorf("sub_plans[1].depends_on = %#v, want [0]", slice1["depends_on"])
+	}
+}
+
+// TestMissingKeys_FlagsUnrenderedSchemaProperty proves the drift mechanism
+// catches a NEW schema property without editing the canonical schema: a
+// synthetic key absent from the rendered map is reported, as is a null one.
+func TestMissingKeys_FlagsUnrenderedSchemaProperty(t *testing.T) {
+	got := map[string]any{"title": "x", "depends_on": []any{}, "nulled": nil}
+	if missing := missingKeys([]string{"title", "future_field", "depends_on", "nulled"}, got); !reflect.DeepEqual(missing, []string{"future_field", "nulled"}) {
+		t.Errorf("missingKeys = %v, want [future_field nulled]", missing)
+	}
+	if missing := missingKeys([]string{"title", "depends_on"}, got); len(missing) != 0 {
+		t.Errorf("missingKeys = %v, want none when every key is rendered", missing)
+	}
+}
+
+// TestSchemaDefProperties_FailsClosedOnMissingDef pins the extraction's
+// vacuity guard: a schema doc lacking the $def (or with an empty properties
+// map) is an error, never an empty key list the drift loop would pass over.
+func TestSchemaDefProperties_FailsClosedOnMissingDef(t *testing.T) {
+	for _, tc := range []struct{ name, doc string }{
+		{"missing def", `{"$defs":{"other":{"properties":{"a":{}}}}}`},
+		{"no defs", `{}`},
+		{"empty properties", `{"$defs":{"sub-plan-summary":{"properties":{}}}}`},
+		{"malformed", `{`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keys, err := schemaDefPropertiesFrom([]byte(tc.doc), "sub-plan-summary")
+			if err == nil {
+				t.Fatalf("schemaDefPropertiesFrom = %v, nil; want an error", keys)
+			}
+		})
+	}
+	keys, err := schemaDefPropertiesFrom([]byte(`{"$defs":{"sub-plan-summary":{"properties":{"b":{},"a":{}}}}}`), "sub-plan-summary")
+	if err != nil || !reflect.DeepEqual(keys, []string{"a", "b"}) {
+		t.Errorf("schemaDefPropertiesFrom = %v, %v; want [a b], nil", keys, err)
 	}
 }
 

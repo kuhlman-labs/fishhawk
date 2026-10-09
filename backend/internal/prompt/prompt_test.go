@@ -4115,6 +4115,264 @@ func TestBuild_Implement_WorkspaceHygiene_LanguageAgnostic(t *testing.T) {
 	}
 }
 
+// decomposedPlanJSON is a raw standard_v1 plan carrying a valid two-slice
+// decomposition (#4068): each slice declares its own non-empty, mutually
+// disjoint scope.files (checkSubPlanScopesDeclared, checkCrossSliceSharedFiles)
+// and slice 1 populates every $defs.sub-plan-summary property with a sentinel,
+// so the tests below cross the plan.Parse -> render seam.
+const decomposedPlanJSON = `{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://github.com/kuhlman-labs/example/issues/42", "id": "kuhlman-labs/example#42"},
+  "generated_by": {"agent": "claude-code", "model": "claude-opus-5-5", "timestamp": "2026-10-09T00:00:00Z"},
+  "summary": "Split foo across two slices.",
+  "scope": {"files": [
+    {"path": "sentinel/slice_a.go", "operation": "modify"},
+    {"path": "sentinel/slice_b.go", "operation": "create"}
+  ]},
+  "approach": [{"step": 1, "description": "Do both slices."}],
+  "verification": {"test_strategy": "Unit tests.", "rollback_plan": "Revert the PR."},
+  "predicted_runtime_minutes": 60,
+  "predicted_runtime_confidence": "medium",
+  "decomposition": {
+    "rationale": "SENTINEL-RATIONALE: slice B consumes slice A's symbol.",
+    "sub_plans": [
+      {
+        "title": "SENTINEL-TITLE-A",
+        "scope_hint": "SENTINEL-HINT-A",
+        "scope": {"files": [{"path": "sentinel/slice_a.go", "operation": "modify"}]},
+        "predicted_runtime_minutes": 23,
+        "predicted_runtime_confidence": "high"
+      },
+      {
+        "title": "SENTINEL-TITLE-B",
+        "scope_hint": "SENTINEL-HINT-B",
+        "scope": {"files": [{"path": "sentinel/slice_b.go", "operation": "create"}], "estimated_lines_changed": 41},
+        "depends_on": [0],
+        "predicted_runtime_minutes": 37,
+        "predicted_runtime_confidence": "low",
+        "model_recommendation": {"implement_model": "sentinel-model-b", "rationale": "SENTINEL-MODEL-RATIONALE", "complexity_assessed": "low"}
+      }
+    ]
+  }
+}`
+
+// parsedDecomposedPlan parses decomposedPlanJSON through plan.Parse.
+func parsedDecomposedPlan(t *testing.T) *plan.Plan {
+	t.Helper()
+	p, err := plan.Parse([]byte(decomposedPlanJSON))
+	if err != nil {
+		t.Fatalf("plan.Parse(decomposedPlanJSON): %v", err)
+	}
+	return p
+}
+
+// subPlanSchemaProperties reads the property names of $defs.sub-plan-summary
+// from the canonical plan schema at test time (never skipping), so a property
+// added to the schema later fails the drift test below until it is rendered.
+func subPlanSchemaProperties(t *testing.T) []string {
+	t.Helper()
+	const path = "../../../docs/spec/plan-standard-v1.schema.json"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical plan schema %s: %v", path, err)
+	}
+	var doc struct {
+		Defs map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	def, ok := doc.Defs["sub-plan-summary"]
+	if !ok || len(def.Properties) == 0 {
+		t.Fatalf("%s: $defs.sub-plan-summary missing or has no properties", path)
+	}
+	keys := make([]string, 0, len(def.Properties))
+	for k := range def.Properties {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// TestBuild_PlanReview_RendersEverySubPlanSchemaProperty is the #4068 drift
+// test for the review-prompt render: every $defs.sub-plan-summary property in
+// the canonical schema must map to a sentinel the plan_review render contains.
+func TestBuild_PlanReview_RendersEverySubPlanSchemaProperty(t *testing.T) {
+	probes := map[string]string{
+		"title":                        "- Sub-plan 1: SENTINEL-TITLE-B",
+		"scope_hint":                   "scope_hint: SENTINEL-HINT-B",
+		"scope":                        "scope.files (1): sentinel/slice_b.go (create); ~41 lines",
+		"depends_on":                   "depends_on: [0]",
+		"predicted_runtime_minutes":    "runtime: 37 minutes (low confidence)",
+		"predicted_runtime_confidence": "runtime: 37 minutes (low confidence)",
+		"model_recommendation":         "model_recommendation: sentinel-model-b (complexity: low) — SENTINEL-MODEL-RATIONALE",
+	}
+	schemaKeys := subPlanSchemaProperties(t)
+	inSchema := make(map[string]bool, len(schemaKeys))
+	for _, k := range schemaKeys {
+		inSchema[k] = true
+		if _, ok := probes[k]; !ok {
+			t.Errorf("schema $defs.sub-plan-summary property %q has no probe: render it in writeDecompositionForReview (called from writePlanForReview) and add a sentinel here (#4068)", k)
+		}
+	}
+	for k := range probes {
+		if !inSchema[k] {
+			t.Errorf("probe %q names a property $defs.sub-plan-summary no longer declares: drop it", k)
+		}
+	}
+
+	got, err := Build("plan_review", Trigger{
+		IssueNumber:  42,
+		IssueTitle:   "Add foo",
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: parsedDecomposedPlan(t),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for k, want := range probes {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan_review render elides sub-plan property %q: missing %q", k, want)
+		}
+	}
+	for _, want := range []string{
+		"- Rationale: SENTINEL-RATIONALE: slice B consumes slice A's symbol.",
+		"- Sub-plan 0: SENTINEL-TITLE-A\n  scope_hint: SENTINEL-HINT-A\n  scope.files (1): sentinel/slice_a.go (modify)\n  depends_on: none (wave 0)\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan_review render missing %q", want)
+		}
+	}
+	if t.Failed() {
+		t.Logf("plan_review render:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_RendersDecomposition pins the shared writer's
+// reach (#4068): writePlanForReview also feeds the implement-review prompt,
+// so its reviewer sees which slice owns what and in which wave.
+func TestBuild_ImplementReview_RendersDecomposition(t *testing.T) {
+	got, err := Build("implement_review", Trigger{Repo: "o/r", IssueNumber: 42, ApprovedPlan: parsedDecomposedPlan(t)})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"depends_on: [0]",
+		"Dispatch waves derived from depends_on: wave 0 = [0]; wave 1 = [1]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("implement_review render missing %q", want)
+		}
+	}
+}
+
+// TestWritePlanForReview_Decomposition_Branches asserts one behavior per
+// writeDecompositionForReview render branch on hand-built decompositions.
+func TestWritePlanForReview_Decomposition_Branches(t *testing.T) {
+	scoped := func(path string) *plan.Scope {
+		return &plan.Scope{Files: []plan.ScopeFile{{Path: path, Operation: plan.FileOpModify}}}
+	}
+	for _, tc := range []struct {
+		name       string
+		subPlans   []plan.SubPlanSummary
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name: "missing per-slice scope is named as a plan-gate rejection, never as inheritance",
+			subPlans: []plan.SubPlanSummary{
+				{Title: "A", PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+				{Title: "B", Scope: scoped("b.go"), PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+			},
+			want:       []string{"- Sub-plan 0: A\n  scope_hint: \n  scope: not declared (a sub-plan without its own scope.files is rejected at the plan gate — #1669, checkSubPlanScopesDeclared)\n"},
+			wantAbsent: []string{"inherit"},
+		},
+		{
+			name: "empty depends_on renders explicitly as wave 0",
+			subPlans: []plan.SubPlanSummary{
+				{Title: "A", Scope: scoped("a.go"), PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+				{Title: "B", Scope: scoped("b.go"), DependsOn: []int{}, PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+			},
+			want: []string{
+				"- Sub-plan 0: A\n  scope_hint: \n  scope.files (1): a.go (modify)\n  depends_on: none (wave 0)\n",
+				"- Sub-plan 1: B\n  scope_hint: \n  scope.files (1): b.go (modify)\n  depends_on: none (wave 0)\n",
+				"Dispatch waves derived from depends_on: wave 0 = [0, 1]\n",
+			},
+		},
+		{
+			name: "nil model_recommendation renders no model line",
+			subPlans: []plan.SubPlanSummary{
+				{Title: "A", Scope: scoped("a.go"), PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+				{Title: "B", Scope: scoped("b.go"), PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+			},
+			want:       []string{"  runtime: 5 minutes (high confidence)\n"},
+			wantAbsent: []string{"model_recommendation:"},
+		},
+		{
+			name: "cyclic depends_on is reported as not derivable",
+			subPlans: []plan.SubPlanSummary{
+				{Title: "A", Scope: scoped("a.go"), DependsOn: []int{1}, PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+				{Title: "B", Scope: scoped("b.go"), DependsOn: []int{0}, PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+			},
+			want:       []string{"  depends_on: [1]\n", "  depends_on: [0]\n", "Dispatch waves: not derivable ("},
+			wantAbsent: []string{"Dispatch waves derived from depends_on"},
+		},
+		{
+			name: "a [0] <- [1] chain derives two waves",
+			subPlans: []plan.SubPlanSummary{
+				{Title: "A", Scope: scoped("a.go"), PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+				{Title: "B", Scope: scoped("b.go"), DependsOn: []int{0}, PredictedRuntimeMinutes: 5, PredictedRuntimeConfidence: plan.RuntimeConfidenceHigh},
+			},
+			want: []string{"Dispatch waves derived from depends_on: wave 0 = [0]; wave 1 = [1]\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fixturePlan()
+			p.Decomposition = &plan.Decomposition{Rationale: "split", SubPlans: tc.subPlans}
+			var b strings.Builder
+			writePlanForReview(&b, p)
+			got := b.String()
+			if !strings.Contains(got, "Decomposition (2 sub-plans; depends_on lists 0-based sub-plan indices") {
+				t.Fatalf("render carries no decomposition header:\n%s", got)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("render missing %q\n---\n%s", w, got)
+				}
+			}
+			for _, w := range tc.wantAbsent {
+				if strings.Contains(got, w) {
+					t.Errorf("render unexpectedly contains %q\n---\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestWritePlanForReview_NoDecomposition_ByteIdentical pins the nil guard
+// (#4068): a non-decomposed plan renders no decomposition bytes at all. The
+// review_conventions_absent goldens additionally pin full byte-identity.
+func TestWritePlanForReview_NoDecomposition_ByteIdentical(t *testing.T) {
+	p := fixturePlan()
+	if p.Decomposition != nil {
+		t.Fatal("fixturePlan carries a decomposition; this test needs a non-decomposed plan")
+	}
+	var b strings.Builder
+	writePlanForReview(&b, p)
+	got := b.String()
+	for _, absent := range []string{"Decomposition (", "Sub-plan ", "Dispatch waves"} {
+		if strings.Contains(got, absent) {
+			t.Errorf("non-decomposed render contains %q\n---\n%s", absent, got)
+		}
+	}
+	var direct strings.Builder
+	writeDecompositionForReview(&direct, nil)
+	if direct.Len() != 0 {
+		t.Errorf("writeDecompositionForReview(nil) wrote %q, want nothing", direct.String())
+	}
+}
+
 func TestBuild_PlanReview_ContainsVerdictSchema(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		IssueNumber:  42,
