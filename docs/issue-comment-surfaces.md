@@ -892,8 +892,10 @@ Notes:
   the new-architectural-decision advisory (E78.4 / #3748) when the plan
   declares `new_architectural_decision`, and, appended last, the PARTIAL
   DELIVERY advisory (E83.52 / #4085) when the plan declares `delivery: partial`
-  — naming the remaining scope and that merging will not close the triggering
-  issue — with payload `{warnings}`.
+  — naming the remaining scope and stating that the run "is NOT meant to
+  close the triggering issue" (it does not promise the issue stays open; see
+  the named residuals in `backend/internal/server/README.md` § Partial
+  delivery) — with payload `{warnings}`.
   Advisory + fail-open (an unparseable plan or an audit-append failure
   writes no entry and never blocks the upload) and — the one divergence
   from the sibling plan-gate sweeps — written ONLY when `Warnings()`

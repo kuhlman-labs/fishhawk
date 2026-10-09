@@ -162,9 +162,10 @@ type Plan struct {
 	Delivery string `json:"delivery,omitempty"`
 	// RemainingScope is the short statement of what the triggering issue still
 	// needs after a partial delivery (E83.52 / #4085). The schema's root if/then
-	// requires it when Delivery is DeliveryPartial; semanticCheck
-	// (checkDelivery) rejects a whitespace-only value and any value paired with
-	// an absent or full Delivery. Additive-optional within standard_v1.
+	// requires it when Delivery is DeliveryPartial; checkDelivery, run by both
+	// semanticCheck (Parse) and Validate (the plan-upload path), rejects a
+	// whitespace-only value and any value paired with an absent or full
+	// Delivery. Additive-optional within standard_v1.
 	RemainingScope string `json:"remaining_scope,omitempty"`
 }
 

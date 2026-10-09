@@ -443,10 +443,11 @@ func newArchitecturalDecisionWarning(parsedPlan *plan.Plan) string {
 //
 // It returns "" unless plan.(*Plan).IsPartialDelivery, the one shared
 // definition. A blank remaining_scope renders as "not stated" rather than
-// suppressing the advisory: runPlanWarnings decodes with json.Unmarshal and
-// never runs semanticCheck, so a whitespace-only value (which the schema's
-// minLength:1 admits) reaches this function unrejected, and the declaration that
-// the issue stays open is still the load-bearing fact the approver must see.
+// suppressing the advisory. On the ship path handleShipPlan's plan.Validate
+// already refuses a whitespace-only value (checkDelivery), so this fallback is
+// defence in depth: runPlanWarnings decodes with json.Unmarshal and never runs
+// semanticCheck itself, and the declaration that the issue stays open is still
+// the load-bearing fact the approver must see.
 // Pure: no RunRepo or cap dependency.
 func partialDeliveryWarning(parsedPlan *plan.Plan) string {
 	if !parsedPlan.IsPartialDelivery() {

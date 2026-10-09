@@ -1857,10 +1857,11 @@ func TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap(t *testing.T) {
 // --- delivery: partial (E83.52 / #4085) ---
 
 // withDelivery returns body with the top-level delivery / remaining_scope keys
-// set (an empty value omits the key). It runs plan.Validate (schema only,
-// never semanticCheck), so a whitespace-only remaining_scope the schema's
-// minLength:1 admits still reaches runPlanWarnings, mirroring its
-// json.Unmarshal decode path.
+// set (an empty value omits the key). It requires the fixture to be SCHEMA-valid
+// but tolerates plan.Validate's delivery-rule *SemanticError, so a
+// whitespace-only remaining_scope (which handleShipPlan refuses before
+// runPlanWarnings) still reaches runPlanWarnings directly, exercising its
+// defence-in-depth json.Unmarshal decode path.
 func withDelivery(t *testing.T, body []byte, delivery, remainingScope string) []byte {
 	t.Helper()
 	var m map[string]any
@@ -1877,8 +1878,9 @@ func withDelivery(t *testing.T, body []byte, delivery, remainingScope string) []
 	if err != nil {
 		t.Fatalf("marshal plan: %v", err)
 	}
-	if err := plan.Validate(out); err != nil {
-		t.Fatalf("fixture plan does not validate: %v", err)
+	var sem *plan.SemanticError
+	if err := plan.Validate(out); err != nil && !errors.As(err, &sem) {
+		t.Fatalf("fixture plan is not schema-valid: %v", err)
 	}
 	return out
 }
@@ -1938,7 +1940,8 @@ func TestRunPlanWarnings_PartialDelivery_NotPartialNoWarning(t *testing.T) {
 
 // TestRunPlanWarnings_PartialDelivery_BlankRemainingScopeSaysNotStated is the
 // vehicle for the blank fallback: runPlanWarnings never runs semanticCheck, so
-// a whitespace-only remaining_scope (schema-admitted) reaches the advisory,
+// a whitespace-only remaining_scope (schema-admitted; refused upstream by
+// handleShipPlan's plan.Validate) reaches the advisory when called directly,
 // which still fires — the issue-stays-open declaration is the load-bearing
 // fact — and says the remaining scope is not stated.
 func TestRunPlanWarnings_PartialDelivery_BlankRemainingScopeSaysNotStated(t *testing.T) {

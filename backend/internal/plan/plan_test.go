@@ -3035,10 +3035,11 @@ func TestParse_FullDelivery_NoRemainingScope_Accepted(t *testing.T) {
 	}
 }
 
-// TestValidate_PartialWithoutRemainingScope pins the schema's root if/then on
-// the SCHEMA-ONLY path (Validate never runs semanticCheck), which is the path
-// the runner uses before the plan stage succeeds. Nothing else in Validate
-// requires the key, so the root if/then is the only control deciding this.
+// TestValidate_PartialWithoutRemainingScope pins the schema's root if/then,
+// which is what the runner's schema-only copy enforces before the plan stage
+// succeeds. Validate's delivery leg would also refuse this shape, but it runs
+// only after the schema passes, so a *SchemaError naming remaining_scope can
+// come only from the root if/then (without it the refusal is a *SemanticError).
 func TestValidate_PartialWithoutRemainingScope(t *testing.T) {
 	err := plan.Validate(deliveryPlan(t, plan.DeliveryPartial, ""))
 	var se *plan.SchemaError
@@ -3074,28 +3075,33 @@ func TestValidate_UnknownDeliveryValue_Rejected(t *testing.T) {
 	}
 }
 
-// TestParse_PartialWithBlankRemainingScope_Rejected isolates checkDelivery's
-// blank branch: a whitespace-only remaining_scope satisfies minLength:1 and the
-// root if/then (proved before Parse), so only the semantic check can refuse it.
+// TestParse_PartialWithBlankRemainingScope_Rejected pins checkDelivery's blank
+// branch on BOTH entry points: a whitespace-only remaining_scope satisfies
+// minLength:1 and the root if/then, so only checkDelivery can refuse it —
+// through semanticCheck for Parse and through Validate's delivery leg for the
+// plan-upload path (handleShipPlan never reaches Parse).
 func TestParse_PartialWithBlankRemainingScope_Rejected(t *testing.T) {
 	data := deliveryPlan(t, plan.DeliveryPartial, "   ")
-	if err := plan.Validate(data); err != nil {
-		t.Fatalf("schema Validate should admit a whitespace remaining_scope (minLength:1), got %v", err)
-	}
-	_, err := plan.Parse(data)
-	var sem *plan.SemanticError
-	if !errors.As(err, &sem) {
-		t.Fatalf("err = %v, want *SemanticError", err)
-	}
-	if !strings.Contains(sem.Error(), "remaining_scope") || !strings.Contains(sem.Error(), "non-blank") {
-		t.Errorf("SemanticError should name remaining_scope as blank, got %q", sem.Error())
+	for name, run := range map[string]func() error{
+		"Validate": func() error { return plan.Validate(data) },
+		"Parse":    func() error { _, err := plan.Parse(data); return err },
+	} {
+		err := run()
+		var sem *plan.SemanticError
+		if !errors.As(err, &sem) {
+			t.Fatalf("%s: err = %v, want *SemanticError", name, err)
+		}
+		if !strings.Contains(sem.Error(), "remaining_scope") || !strings.Contains(sem.Error(), "non-blank") {
+			t.Errorf("%s: SemanticError should name remaining_scope as blank, got %q", name, sem.Error())
+		}
 	}
 }
 
-// TestParse_RemainingScopeWithoutPartial_Rejected isolates checkDelivery's
-// mismatch branch, which the schema does not express: a remaining_scope paired
-// with delivery full, or with delivery absent, passes schema Validate (proved
-// per case before Parse), so only the semantic check can refuse it.
+// TestParse_RemainingScopeWithoutPartial_Rejected pins checkDelivery's mismatch
+// branch, which the schema does not express: a remaining_scope paired with
+// delivery full, or with delivery absent, is refused by Validate (the
+// plan-upload path; the E83.52 acceptance failure was this pair shipping 201
+// because the rule lived only in semanticCheck) AND by Parse.
 func TestParse_RemainingScopeWithoutPartial_Rejected(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -3106,18 +3112,41 @@ func TestParse_RemainingScopeWithoutPartial_Rejected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := deliveryPlan(t, tc.delivery, testRemainingScope)
-			if err := plan.Validate(data); err != nil {
-				t.Fatalf("schema Validate should admit remaining_scope without partial, got %v", err)
-			}
-			_, err := plan.Parse(data)
-			var sem *plan.SemanticError
-			if !errors.As(err, &sem) {
-				t.Fatalf("err = %v, want *SemanticError", err)
-			}
-			if !strings.Contains(sem.Error(), "only valid with delivery: partial") {
-				t.Errorf("SemanticError should name the delivery mismatch, got %q", sem.Error())
+			for name, run := range map[string]func() error{
+				"Validate": func() error { return plan.Validate(data) },
+				"Parse":    func() error { _, err := plan.Parse(data); return err },
+			} {
+				err := run()
+				var sem *plan.SemanticError
+				if !errors.As(err, &sem) {
+					t.Fatalf("%s: err = %v, want *SemanticError", name, err)
+				}
+				if !strings.Contains(sem.Error(), "only valid with delivery: partial") {
+					t.Errorf("%s: SemanticError should name the delivery mismatch, got %q", name, sem.Error())
+				}
 			}
 		})
+	}
+}
+
+// TestParse_DeliveryRule_ErrorPrecedenceUnchanged pins that moving the
+// delivery rule into Validate did not change Parse's behaviour: Parse runs the
+// schema-only leg and then semanticCheck, where the duplicate-criterion check
+// precedes checkDelivery, so a plan breaking BOTH still reports the duplicate
+// id first. Validate, which runs only the delivery rule, reports the mismatch.
+func TestParse_DeliveryRule_ErrorPrecedenceUnchanged(t *testing.T) {
+	crit := map[string]any{"id": "dup", "statement": "the thing works", "source": "explicit", "source_ref": "#4085"}
+	data := marshalFixture(t, planfixture.Valid(func(m map[string]any) {
+		m["remaining_scope"] = testRemainingScope
+		v, _ := m["verification"].(map[string]any)
+		v["acceptance_criteria"] = []any{crit, crit}
+	}))
+	_, err := plan.Parse(data)
+	if err == nil || !strings.Contains(err.Error(), `duplicate id "dup"`) {
+		t.Errorf("Parse err = %v, want the duplicate-criterion error first (unchanged precedence)", err)
+	}
+	if err := plan.Validate(data); err == nil || !strings.Contains(err.Error(), "only valid with delivery: partial") {
+		t.Errorf("Validate err = %v, want the delivery mismatch", err)
 	}
 }
 

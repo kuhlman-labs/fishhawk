@@ -408,3 +408,92 @@ func TestPartialDeliveryPlan(t *testing.T) {
 		t.Errorf("no artifact repo: got (%v, %v), want (nil, false)", p, ok)
 	}
 }
+
+// --- plan-upload delivery rule (E83.52 / #4085 acceptance failure) ---
+
+// deliveryShipBody returns a schema-shaped plan body (one drivable criterion)
+// with the top-level delivery / remaining_scope keys set; an empty value omits
+// the key. Unlike withDelivery it validates nothing, so it can build the
+// schema-invalid partial-without-remaining_scope shape too.
+func deliveryShipBody(t *testing.T, delivery, remainingScope string) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(acceptancePlanBody(t, []map[string]any{drivableCriterion("c1")}, nil), &m); err != nil {
+		t.Fatalf("decode plan body: %v", err)
+	}
+	if delivery != "" {
+		m["delivery"] = delivery
+	}
+	if remainingScope != "" {
+		m["remaining_scope"] = remainingScope
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan body: %v", err)
+	}
+	return out
+}
+
+// TestShipPlan_DeliveryRule_RefusedAtUpload drives the REAL
+// POST /v0/runs/{id}/plan route with each delivery / remaining_scope shape the
+// schema description and plan.Parse call invalid, and reads COMMITTED state
+// after the call: 400 plan_invalid with details.error naming the rule, and no
+// artifact row (assertNoSideEffects). handleShipPlan never reaches plan.Parse,
+// so before the rule moved into plan.Validate the full+remaining_scope,
+// remaining_scope-only and whitespace-only shapes shipped 201 (the acceptance
+// failure at 1628eded).
+//
+// Counterfactual (run): make plan.Validate skip checkDeliveryBytes → the
+// "full with remaining_scope", "remaining_scope only" and "partial with
+// whitespace" rows go RED (201, artifact stored); the schema row stays green.
+func TestShipPlan_DeliveryRule_RefusedAtUpload(t *testing.T) {
+	for _, tc := range []struct {
+		name, delivery, remaining, wantInError string
+	}{
+		{"partial without remaining_scope", plan.DeliveryPartial, "", "remaining_scope"},
+		{"full with remaining_scope", plan.DeliveryFull, "x", "only valid with delivery: partial"},
+		{"remaining_scope only", "", "the rest", "only valid with delivery: partial"},
+		{"partial with whitespace remaining_scope", plan.DeliveryPartial, "   ", "non-blank"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSurfaceRefusalHarness(t)
+			code, resp := h.ship(t, deliveryShipBody(t, tc.delivery, tc.remaining))
+			if code != http.StatusBadRequest {
+				t.Errorf("plan status = %d, want 400:\n%s", code, resp)
+			} else {
+				env := decodePlanInvalid(t, resp)
+				if env.Error.Code != "plan_invalid" {
+					t.Errorf("error.code = %q, want plan_invalid", env.Error.Code)
+				}
+				if !strings.Contains(env.Error.Details.Error, tc.wantInError) {
+					t.Errorf("details.error = %q, want it to name the rule (%q)", env.Error.Details.Error, tc.wantInError)
+				}
+			}
+			h.assertNoSideEffects(t)
+		})
+	}
+}
+
+// TestShipPlan_DeliveryRule_ValidPartialAdmitted is the narrowness control: a
+// partial plan carrying a non-blank remaining_scope ships 201, its artifact is
+// stored and the plan stage reaches awaiting_approval.
+func TestShipPlan_DeliveryRule_ValidPartialAdmitted(t *testing.T) {
+	h := newSurfaceRefusalHarness(t)
+	code, resp := h.ship(t, deliveryShipBody(t, plan.DeliveryPartial, "the merge-time comment lands in a later run"))
+	if code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", code, resp)
+	}
+	arts, err := h.art.ListForStage(context.Background(), h.plan.ID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(arts) != 1 {
+		t.Errorf("artifact rows for the plan stage = %d, want 1", len(arts))
+	}
+	h.rr.mu.Lock()
+	got := h.rr.stagesByID[h.plan.ID]
+	h.rr.mu.Unlock()
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("plan stage state = %q, want awaiting_approval", got.State)
+	}
+}
