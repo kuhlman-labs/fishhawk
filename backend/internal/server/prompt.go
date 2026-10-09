@@ -229,6 +229,36 @@ type promptResponse struct {
 	// ConflictResolutionExpectedHeadSHA is the run-branch tip the trigger was
 	// anchored to; the runner refuses BEFORE mutating anything on a mismatch.
 	ConflictResolutionExpectedHeadSHA string `json:"conflict_resolution_expected_head_sha,omitempty"`
+
+	// Merge-candidate verify pass (ADR-090 D3 / #4018): a Fishhawk write
+	// (a base advance, a conflict-resolution push or a fan-in integration)
+	// produced a head no runner gated, and the backend re-opened this
+	// implement stage for a VERIFY-ONLY pass. The runner fetches the run-branch
+	// tip, refuses unless it equals the expected head, runs ONLY the declared
+	// verify command in full form in the isolated committed-tree gate, and ships
+	// one merge_candidate_verified report — no agent, no commit, no push.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (merge_candidate_verify /
+	// merge_candidate_verify_branch / merge_candidate_verify_expected_head_sha /
+	// merge_candidate_verify_cause) MUST stay byte-identical to the runner's
+	// upload.FetchedPrompt (runner/internal/upload/upload.go). A tag drift
+	// silently DISABLES the pass: the runner decodes false and takes the
+	// ordinary implement path.
+	//
+	// All four are served TOGETHER or not at all: the resolver refuses a
+	// half-populated trigger. A live pass suppresses the fix-up and
+	// conflict-resolution instructions on the same response, so the runner is
+	// never handed two passes at once.
+	MergeCandidateVerify bool `json:"merge_candidate_verify,omitempty"`
+	// MergeCandidateVerifyBranch is the run branch whose tip is verified.
+	MergeCandidateVerifyBranch string `json:"merge_candidate_verify_branch,omitempty"`
+	// MergeCandidateVerifyExpectedHeadSHA is the head the result binds to; the
+	// runner reports not_executed (head_moved) without running verify on a
+	// mismatch.
+	MergeCandidateVerifyExpectedHeadSHA string `json:"merge_candidate_verify_expected_head_sha,omitempty"`
+	// MergeCandidateVerifyCause names the write that produced the head:
+	// base_advance, conflict_resolution or fan_in.
+	MergeCandidateVerifyCause string `json:"merge_candidate_verify_cause,omitempty"`
 	// ScopeExemptions is the operator's exempt_scope_files list (#1229) echoed
 	// on a recovery run's implement stage so the runner's #1151 MissingScopeFiles
 	// shortfall gate subtracts each operator-justified-unchanged declared path —
@@ -1443,6 +1473,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
 	var conflictResolution *conflictResolutionTrigger
+	var mergeCandidate *mergeCandidateVerifyTrigger
 	if stage.Type == run.StageTypeImplement {
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
@@ -1604,8 +1635,18 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
 		// EITHER terminal outcome is served conflict_resolution=false and takes
 		// the unchanged fix-up path.
-		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
-		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
+		// Merge-candidate verify pass (ADR-090 D3 / #4018). Resolved FIRST and
+		// EXCLUSIVE: a live trigger makes this dispatch a verify-only pass, so
+		// neither the conflict-resolution instruction nor the fix-up concern block
+		// is served beside it — the pass must never be handed an instruction to
+		// edit, commit or push. The resolver returns nil for a CONSUMED trigger
+		// (a later merge_candidate_verified row), so an ordinary fix-up that
+		// follows the pass takes the unchanged fix-up path.
+		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
+		if mergeCandidate == nil {
+			conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
+		}
+		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); mergeCandidate == nil && len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
 			// from the SAME newest stage-bound trigger entry — and this serve PINS
@@ -1908,6 +1949,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.ConflictResolutionBranch = conflictResolution.Branch
 		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
 		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
+	}
+	// Merge-candidate verify instruction (ADR-090 D3). Served as a UNIT for
+	// the same reason: the resolver refused a half-populated trigger.
+	if mergeCandidate != nil {
+		resp.MergeCandidateVerify = true
+		resp.MergeCandidateVerifyBranch = mergeCandidate.Branch
+		resp.MergeCandidateVerifyExpectedHeadSHA = mergeCandidate.ExpectedHeadSHA
+		resp.MergeCandidateVerifyCause = mergeCandidate.Cause
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -2277,6 +2326,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
 	var conflictResolution *conflictResolutionTrigger
+	var mergeCandidate *mergeCandidateVerifyTrigger
 	if stage.Type == run.StageTypeImplement {
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
@@ -2409,8 +2459,18 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
 		// EITHER terminal outcome is served conflict_resolution=false and takes
 		// the unchanged fix-up path.
-		conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
-		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); len(rendered) > 0 {
+		// Merge-candidate verify pass (ADR-090 D3 / #4018). Resolved FIRST and
+		// EXCLUSIVE: a live trigger makes this dispatch a verify-only pass, so
+		// neither the conflict-resolution instruction nor the fix-up concern block
+		// is served beside it — the pass must never be handed an instruction to
+		// edit, commit or push. The resolver returns nil for a CONSUMED trigger
+		// (a later merge_candidate_verified row), so an ordinary fix-up that
+		// follows the pass takes the unchanged fix-up path.
+		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
+		if mergeCandidate == nil {
+			conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
+		}
+		if rendered := s.resolveFixupConcerns(r.Context(), runRow.ID, stage.ID); mergeCandidate == nil && len(rendered) > 0 {
 			trigger.FixupConcerns = rendered
 			// Routed reporting obligations (#2737) ride the same trigger, derived
 			// from the SAME newest stage-bound trigger entry. This is the
@@ -2675,6 +2735,14 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		resp.ConflictResolutionBranch = conflictResolution.Branch
 		resp.ConflictResolutionBaseRef = conflictResolution.BaseRef
 		resp.ConflictResolutionExpectedHeadSHA = conflictResolution.ExpectedHeadSHA
+	}
+	// Merge-candidate verify instruction (ADR-090 D3). Served as a UNIT for
+	// the same reason: the resolver refused a half-populated trigger.
+	if mergeCandidate != nil {
+		resp.MergeCandidateVerify = true
+		resp.MergeCandidateVerifyBranch = mergeCandidate.Branch
+		resp.MergeCandidateVerifyExpectedHeadSHA = mergeCandidate.ExpectedHeadSHA
+		resp.MergeCandidateVerifyCause = mergeCandidate.Cause
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()

@@ -4380,3 +4380,483 @@ func TestShipPullRequest_ReviewHeadMismatch_BundleToShipEndToEnd(t *testing.T) {
 		})
 	}
 }
+
+// --- merge-candidate verify report (ADR-090 D3 / #4018) ---
+
+// mcvShipFixture is the slice-0 mcvFixture (real orchestrator, sequenced audit
+// chain, fix-up recovery edges) plus the signing and artifact repositories the
+// /pull-request handler requires, so a report crosses the real mux.
+type mcvShipFixture struct {
+	*mcvFixture
+	sf   *signingFake
+	ar   *fakeArtifactRepo
+	priv ed25519.PrivateKey
+}
+
+func newMCVShipFixture(t *testing.T, specYAML string) *mcvShipFixture {
+	t.Helper()
+	f := newMCVFixture(t, specYAML)
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	f.s.cfg.SigningRepo = sf
+	f.s.cfg.ArtifactRepo = ar
+	priv, _ := sf.issue(t, f.runID)
+	return &mcvShipFixture{mcvFixture: f, sf: sf, ar: ar, priv: priv}
+}
+
+// startRunning starts a real pass for head and moves the re-opened implement
+// stage to `running`, as the runner's stage start does.
+func (f *mcvShipFixture) startRunning(t *testing.T, head string) {
+	t.Helper()
+	if _, refusal := f.start(t, head, mergeCandidateCauseBaseAdvance, mcvOperator()); refusal != nil {
+		t.Fatal(refusal.Reason)
+	}
+	f.repo.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.repo.mu.Unlock()
+}
+
+// mcvReportBody is the EXACT key set the runner's
+// upload.pullRequestMergeCandidateBody marshals (the ship_merge_candidate
+// wirecontract pair pins the tags on both sides).
+func mcvReportBody(head, result, reason, tail string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": mcvBranch, "head_sha": head,
+		"merge_candidate_result": result, "merge_candidate_reason": reason,
+		"merge_candidate_output_tail": tail,
+	})
+	return b
+}
+
+func (f *mcvShipFixture) ship(t *testing.T, body []byte) (*httptest.ResponseRecorder, pullRequestMergeCandidateResponse) {
+	t.Helper()
+	w := shipPRRequest(t, f.s, f.runID, f.impl.ID, f.priv, body, "")
+	var resp pullRequestMergeCandidateResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	return w, resp
+}
+
+func (f *mcvShipFixture) stageState(t *testing.T, id uuid.UUID) run.StageState {
+	t.Helper()
+	st, err := f.repo.GetStage(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.State
+}
+
+func mcvVerdictRows(au *auditFake) []mergeCandidateVerifiedPayload {
+	var out []mergeCandidateVerifiedPayload
+	for _, row := range auditEntries(au, CategoryMergeCandidateVerified) {
+		var p mergeCandidateVerifiedPayload
+		_ = json.Unmarshal(row.Payload, &p)
+		out = append(out, p)
+	}
+	return out
+}
+
+func TestPullRequestBody_MergeCandidateValidation(t *testing.T) {
+	full := pullRequestBody{Outcome: outcomeMergeCandidateVerified, Branch: "b", HeadSHA: "h", MergeCandidateResult: "passed"}
+	for _, result := range []string{"passed", "failed", "not_executed"} {
+		b := full
+		b.MergeCandidateResult = result
+		if err := b.validate(); err != nil {
+			t.Fatalf("result %q rejected: %v", result, err)
+		}
+	}
+	cases := []struct {
+		name  string
+		mut   func(*pullRequestBody)
+		wants string
+	}{
+		{"branch", func(p *pullRequestBody) { p.Branch = "" }, "branch is required for a merge_candidate_verified outcome"},
+		{"head_sha", func(p *pullRequestBody) { p.HeadSHA = "" }, "head_sha is required for a merge_candidate_verified outcome"},
+		{"result absent", func(p *pullRequestBody) { p.MergeCandidateResult = "" }, "merge_candidate_result must be"},
+		{"result out of set", func(p *pullRequestBody) { p.MergeCandidateResult = "PASSED" }, "merge_candidate_result must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := full
+			tc.mut(&b)
+			if err := b.validate(); err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wants)
+			}
+		})
+	}
+	t.Run("allow-list names the outcome", func(t *testing.T) {
+		b := pullRequestBody{Outcome: "merge_candidate", Branch: "b", HeadSHA: "h"}
+		if err := b.validate(); err == nil || !strings.Contains(err.Error(), outcomeMergeCandidateVerified) {
+			t.Fatalf("err = %v, want the closed allow-list refusal naming merge_candidate_verified", err)
+		}
+	})
+}
+
+// TestShipPullRequest_MergeCandidateVerified_InvalidBodyIs400: a
+// merge_candidate_verified report with a missing head or an out-of-set result
+// is refused 400 at the handler and records nothing.
+func TestShipPullRequest_MergeCandidateVerified_InvalidBodyIs400(t *testing.T) {
+	for name, body := range map[string][]byte{
+		"missing head":  mcvReportBody("", "passed", "", ""),
+		"out-of-set":    mcvReportBody(mcvHead, "green", "", ""),
+		"unknown field": []byte(`{"outcome":"merge_candidate_verified","branch":"b","head_sha":"h","merge_candidate_result":"passed","merge_candidate_verdict":"x"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+			f.startRunning(t, mcvHead)
+			w, _ := f.ship(t, body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			if n := len(mcvVerdictRows(f.au)); n != 0 {
+				t.Errorf("merge_candidate_verified rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_RecordsAndSettles is the
+// END-TO-END crossing: start a pass, serve it on the runner prompt, POST the
+// runner-shaped report through the real mux, then read the merge-candidate
+// state the merge gate reads. Committed state is asserted throughout.
+func TestShipPullRequest_MergeCandidateVerified_RecordsAndSettles(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	f.seedRebased(mcvHead, mcvHead, false)
+	f.startRunning(t, mcvHead)
+	f.s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	pw := promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, "")
+	if pw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d:\n%s", pw.Code, pw.Body.String())
+	}
+	var served promptResponse
+	if err := json.Unmarshal(pw.Body.Bytes(), &served); err != nil {
+		t.Fatal(err)
+	}
+	if !served.MergeCandidateVerify || served.MergeCandidateVerifyExpectedHeadSHA != mcvHead ||
+		served.MergeCandidateVerifyBranch != mcvBranch || served.MergeCandidateVerifyCause != mergeCandidateCauseBaseAdvance {
+		t.Fatalf("runner prompt did not serve the pass: %+v", served)
+	}
+
+	w, resp := f.ship(t, mcvReportBody(mcvHead, "passed", "", "ok 412 tests"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a rejected report strands the stage in running):\n%s", w.Code, w.Body.String())
+	}
+	if resp.Result != mergeCandidateResultPassed || resp.HeadSHA != mcvHead || resp.Idempotent {
+		t.Errorf("response = %+v", resp)
+	}
+	rows := mcvVerdictRows(f.au)
+	if len(rows) != 1 || rows[0].Result != mergeCandidateResultPassed || rows[0].HeadSHA != mcvHead ||
+		rows[0].OutputTail != "ok 412 tests" || !rows[0].OutputUntrusted {
+		t.Fatalf("merge_candidate_verified rows = %+v", rows)
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want awaiting_approval (the pre-pass gate)", got)
+	}
+	if n := len(auditEntries(f.au, "implement_review_started")); n != 0 {
+		t.Errorf("implement_review_started rows = %d, want 0 (a verify-only pass ships no trace)", n)
+	}
+	if len(f.ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0", len(f.ar.all))
+	}
+	state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+	if err != nil || state.State != mergeCandidateStatePassed {
+		t.Fatalf("mergeCandidateVerifyState = %+v, %v; want passed for exactly this head", state, err)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_IsIdempotent: a runner retry
+// after a 5xx appends no second row and settles nothing again.
+func TestShipPullRequest_MergeCandidateVerified_IsIdempotent(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	f.startRunning(t, mcvHead)
+	body := mcvReportBody(mcvHead, "failed", "", "FAIL")
+	for i := 0; i < 2; i++ {
+		w, resp := f.ship(t, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("delivery %d: status = %d:\n%s", i, w.Code, w.Body.String())
+		}
+		if resp.Idempotent != (i == 1) {
+			t.Errorf("delivery %d: idempotent = %v", i, resp.Idempotent)
+		}
+	}
+	if n := len(mcvVerdictRows(f.au)); n != 1 {
+		t.Errorf("merge_candidate_verified rows = %d, want exactly 1", n)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_HeadMismatchBindsNoVerdict (D2):
+// a passed report naming a head other than the trigger's is recorded as
+// not_executed, so no verdict binds to a head the runner did not verify.
+func TestShipPullRequest_MergeCandidateVerified_HeadMismatchBindsNoVerdict(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	f.seedRebased(mcvHead, mcvHead, false)
+	f.startRunning(t, mcvHead)
+
+	w, resp := f.ship(t, mcvReportBody(mcvOtherHead, "passed", "", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	rows := mcvVerdictRows(f.au)
+	if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || !strings.Contains(rows[0].Reason, "head_mismatch") {
+		t.Fatalf("rows = %+v, want one not_executed head_mismatch row", rows)
+	}
+	if resp.Result != mergeCandidateResultNotExecuted {
+		t.Errorf("response result = %q", resp.Result)
+	}
+	state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+	if err != nil || state.State != mergeCandidateStateUnverified {
+		t.Fatalf("state = %+v, %v; want unverified (no verdict bound)", state, err)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_SettlesToPriorStateAndAdvances
+// pins approval condition C1: an APPROVAL-GATED implement stage that had
+// SUCCEEDED before the pass is settled back to succeeded (its recorded
+// PriorState, NOT awaiting_approval by RequiresApproval), and
+// Orchestrator.Advance is called explicitly so the re-parked review stage is
+// re-walked (on a decomposed parent that re-enters DispatchConsolidatedReview).
+func TestShipPullRequest_MergeCandidateVerified_SettlesToPriorStateAndAdvances(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	review := f.addOpenReviewStage()
+	f.impl.RequiresApproval = true
+	f.startRunning(t, mcvHead)
+	if got := f.stageState(t, review.ID); got != run.StageStatePending {
+		t.Fatalf("precondition: review state = %q, want pending (re-parked by the pass)", got)
+	}
+
+	if w, _ := f.ship(t, mcvReportBody(mcvHead, "passed", "", "")); w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateSucceeded {
+		t.Fatalf("implement state = %q, want succeeded (the trigger's PriorState); awaiting_approval means the settle went by RequiresApproval and the hold never releases", got)
+	}
+	if got := f.stageState(t, review.ID); got == run.StageStatePending {
+		t.Fatal("review stage still pending — Orchestrator.Advance did not re-walk it")
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_FallbackSettle: a trigger with
+// no restorable PriorState settles by the stage's approval gate instead of
+// stranding the stage in `running`.
+func TestShipPullRequest_MergeCandidateVerified_FallbackSettle(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	id := f.impl.ID
+	f.appendRow(&id, CategoryStageMergeCandidateVerifyTriggered, mergeCandidateVerifyTrigger{
+		Branch: mcvBranch, BaseRef: mcvBaseRef, ExpectedHeadSHA: mcvHead,
+		Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand,
+	})
+	f.impl.State = run.StageStateRunning
+	f.impl.RequiresApproval = true
+
+	if w, _ := f.ship(t, mcvReportBody(mcvHead, "passed", "", "")); w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateAwaitingApproval {
+		t.Fatalf("implement state = %q, want awaiting_approval (the approval-gate fallback)", got)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_FailedRoutesPerD6 drives a red
+// result through the report arm: NOT delegated routes nothing and names
+// fishhawk_fixup_stage; delegated routes exactly ONE fix-up whose payload
+// never carries the untrusted output tail.
+func TestShipPullRequest_MergeCandidateVerified_FailedRoutesPerD6(t *testing.T) {
+	t.Run("not delegated", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, mcvReportBody(mcvHead, "failed", "", "FAIL "+mcvSentinel))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if resp.FixupRouted || !strings.Contains(resp.FixupRefusal, "fishhawk_fixup_stage") {
+			t.Errorf("routed=%v refusal=%q, want a refusal naming fishhawk_fixup_stage", resp.FixupRouted, resp.FixupRefusal)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 0", n)
+		}
+	})
+	t.Run("delegated", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		f.startRunning(t, mcvHead)
+		w, resp := f.ship(t, mcvReportBody(mcvHead, "failed", "", "FAIL "+mcvSentinel))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if !resp.FixupRouted {
+			t.Fatalf("routed = false (refusal %q), want one routed fix-up", resp.FixupRefusal)
+		}
+		rows := auditEntries(f.au, CategoryStageFixupTriggered)
+		if len(rows) != 1 {
+			t.Fatalf("stage_fixup_triggered rows = %d, want 1", len(rows))
+		}
+		if strings.Contains(string(rows[0].Payload), mcvSentinel) {
+			t.Error("routed fix-up carries the untrusted output tail")
+		}
+	})
+	t.Run("passed routes nothing", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+		f.startRunning(t, mcvHead)
+		if w, resp := f.ship(t, mcvReportBody(mcvHead, "passed", "", "")); w.Code != http.StatusOK || resp.FixupRouted {
+			t.Fatalf("status = %d routed = %v", w.Code, resp.FixupRouted)
+		}
+		if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+			t.Errorf("stage_fixup_triggered rows = %d, want 0", n)
+		}
+	})
+}
+
+// TestShipPullRequest_MergeCandidateVerified_RefusalArms: a report with no
+// live trigger is a 409 that records nothing and leaves the stage running; a
+// trigger read error is a retryable 500 that records nothing; a non-implement
+// stage is a 400.
+func TestShipPullRequest_MergeCandidateVerified_RefusalArms(t *testing.T) {
+	t.Run("no live trigger", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.impl.State = run.StageStateRunning
+		w, _ := f.ship(t, mcvReportBody(mcvHead, "passed", "", ""))
+		if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "merge_candidate_verify_not_live") {
+			t.Fatalf("status = %d, want 409 merge_candidate_verify_not_live:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(mcvVerdictRows(f.au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+		if got := f.stageState(t, f.impl.ID); got != run.StageStateRunning {
+			t.Errorf("implement state = %q, want running (nothing settled)", got)
+		}
+	})
+	t.Run("trigger read error", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		f.au.listByCategoryErrCategory = CategoryStageMergeCandidateVerifyTriggered
+		w, _ := f.ship(t, mcvReportBody(mcvHead, "passed", "", ""))
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		f.au.listByCategoryErrCategory = ""
+		if n := len(mcvVerdictRows(f.au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+		if got := f.stageState(t, f.impl.ID); got != run.StageStateRunning {
+			t.Errorf("implement state = %q, want running", got)
+		}
+	})
+	t.Run("record error", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		f.au.appendErrCategory = CategoryMergeCandidateVerified
+		w, _ := f.ship(t, mcvReportBody(mcvHead, "not_executed", "head_moved", ""))
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(mcvVerdictRows(f.au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+		if got := f.stageState(t, f.impl.ID); got != run.StageStateRunning {
+			t.Errorf("implement state = %q, want running (nothing settled before the record landed)", got)
+		}
+	})
+	t.Run("non-implement stage", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		plan := f.repo.stagesFor(f.runID)[0]
+		w := shipPRRequest(t, f.s, f.runID, plan.ID, f.priv, mcvReportBody(mcvHead, "passed", "", ""), "")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestFailPullRequestStage_MergeCandidateVerifyRecovery: a runner `failed`
+// report while a merge-candidate trigger is live writes not_executed (the head
+// stays re-triggerable) and restores the pre-pass gate; with NO trigger — a
+// decomposition child's pull_request_failed (#4079) — today's failure path is
+// unchanged.
+func TestFailPullRequestStage_MergeCandidateVerifyRecovery(t *testing.T) {
+	failBody := []byte(`{"outcome":"failed","category":"C","reason":"runner crashed"}`)
+	t.Run("live trigger", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		if w := shipPRRequest(t, f.s, f.runID, f.impl.ID, f.priv, failBody, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		rows := mcvVerdictRows(f.au)
+		if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted {
+			t.Fatalf("rows = %+v, want one not_executed", rows)
+		}
+		if got := f.stageState(t, f.impl.ID); got != run.StageStateAwaitingApproval {
+			t.Errorf("implement state = %q, want awaiting_approval (restored)", got)
+		}
+	})
+	t.Run("no trigger", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.impl.State = run.StageStateRunning
+		if w := shipPRRequest(t, f.s, f.runID, f.impl.ID, f.priv, failBody, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(mcvVerdictRows(f.au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+		if got := f.stageState(t, f.impl.ID); got != run.StageStateFailed {
+			t.Errorf("implement state = %q, want failed (today's path)", got)
+		}
+	})
+}
+
+// oneShotListErrAudit fails the FIRST ListForRunByCategory read of one
+// category and serves every later read, isolating a guard whose read a later
+// read would otherwise mask.
+type oneShotListErrAudit struct {
+	*auditFake
+	category string
+	fired    bool
+}
+
+func (a *oneShotListErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category && !a.fired {
+		a.fired = true
+		return nil, errors.New("transient audit read failure")
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestShipPullRequest_MergeCandidateVerified_TransientTriggerReadFailsClosed:
+// when the head-binding read fails, the report is a retryable 500 that binds
+// NOTHING — it never falls through to record a mismatched head's verdict.
+func TestShipPullRequest_MergeCandidateVerified_TransientTriggerReadFailsClosed(t *testing.T) {
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	f.startRunning(t, mcvHead)
+	f.s.cfg.AuditRepo = &oneShotListErrAudit{auditFake: f.au, category: CategoryStageMergeCandidateVerifyTriggered}
+	w, _ := f.ship(t, mcvReportBody(mcvOtherHead, "passed", "", ""))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if rows := mcvVerdictRows(f.au); len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none recorded on an unreadable trigger", rows)
+	}
+}
+
+// TestShipPullRequest_MergeCandidateVerified_DuplicateRoutesOnce: a DELAYED
+// retry of a failed report — arriving while the D6-routed fix-up it caused is
+// already `running` — settles nothing and routes nothing again. Without the
+// duplicate short-circuit it would settle the FIX-UP's running stage back to
+// the verify pass's prior gate, aborting the fix-up underneath its runner.
+func TestShipPullRequest_MergeCandidateVerified_DuplicateRoutesOnce(t *testing.T) {
+	f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+	f.startRunning(t, mcvHead)
+	body := mcvReportBody(mcvHead, "failed", "", "FAIL")
+	if w, resp := f.ship(t, body); w.Code != http.StatusOK || !resp.FixupRouted {
+		t.Fatalf("first delivery: status = %d routed = %v refusal = %q", w.Code, resp.FixupRouted, resp.FixupRefusal)
+	}
+	// The routed fix-up is dispatched and its runner starts.
+	f.repo.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.repo.mu.Unlock()
+	if w, resp := f.ship(t, body); w.Code != http.StatusOK || !resp.Idempotent || resp.FixupRouted {
+		t.Fatalf("retry: status = %d idempotent = %v routed = %v", w.Code, resp.Idempotent, resp.FixupRouted)
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateRunning {
+		t.Errorf("implement state = %q, want running (the fix-up's stage must not be settled by a stale verify report)", got)
+	}
+	if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 1 {
+		t.Errorf("stage_fixup_triggered rows = %d, want exactly 1 across both deliveries", n)
+	}
+}
