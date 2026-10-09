@@ -1,0 +1,14 @@
+id: scenario:issue-3974/restart-blockers-route-anonymous-200
+statement: GET /v0/restart-blockers with no Authorization header returns HTTP 200 and a JSON body carrying an `items` array, an integer `scanned_runs`, and a boolean `truncated`.
+verify_hint: 'HTTP surface: curl the preview''s GET /v0/restart-blockers without a bearer header; check the status and the three top-level fields.'
+steps: GET http://localhost:8090/v0/restart-blockers with no Authorization header, on the freshly booted preview, before any seeding.
+assertions:
+    expected: 200 with items[], integer scanned_runs, boolean truncated
+    observed_at_record: HTTP 200, body {"items":[],"scanned_runs":0,"truncated":false}. items is an array, scanned_runs an integer, truncated a boolean.
+    repro_handle: curl -s -w '%{http_code}' http://localhost:8090/v0/restart-blockers
+origin:
+    issue: 3974
+    pr: 4157
+    run_id: 5aa9baaf-76cd-4eaa-9ee6-d929effae895
+    head_sha: f70a9db80e54ff1178b3b6edadac96c19900fe78
+    recorded_at: 2026-10-09T02:40:40Z

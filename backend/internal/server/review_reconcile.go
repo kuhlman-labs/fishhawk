@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -312,28 +313,13 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 		return out
 	}
 
-	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, stage.started)
+	latest, payload, ok, err := s.latestReviewStarted(ctx, runID, stage)
 	if err != nil {
-		return out, fmt.Errorf("list %s for run %s: %w", stage.started, runID, err)
+		return out, err
 	}
-	if len(started) == 0 {
+	if !ok {
 		// No review was ever dispatched for this stage — nothing to heal.
 		return skip(reconcileSkipNoStartedEntry), nil
-	}
-
-	// The CURRENT attempt is the latest *_review_started (highest audit
-	// sequence). A fixup re-triggers the review, appending a fresh started
-	// entry; we correlate strictly to this round.
-	latest := started[0]
-	for _, e := range started[1:] {
-		if e.Sequence > latest.Sequence {
-			latest = e
-		}
-	}
-
-	var payload planreview.ReviewStartedPayload
-	if err := json.Unmarshal(latest.Payload, &payload); err != nil {
-		return out, fmt.Errorf("decode %s payload for run %s: %w", stage.started, runID, err)
 	}
 	out.ConfiguredAgents = payload.ConfiguredAgents
 	if payload.ConfiguredAgents <= 0 {
@@ -346,28 +332,18 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 		return skip(reconcileSkipNoStageID), nil
 	}
 
-	// Count landed terminals for THIS round only: audit sequence strictly
-	// greater than the latest started entry's sequence. A prior round's landed
-	// verdicts carry a lower sequence and are excluded — the attempt-mixing
-	// fix (binding condition 1). Counted BEFORE the boot-marker gate (#3395)
-	// so LandedBefore is real on EVERY skip and a settled round reports
-	// round_already_settled rather than review_dispatched_by_this_process:
-	// counted after the gate, an in-flight skip always reported landed_before
-	// 0, which an operator read as "the round is genuinely empty" when it was
-	// the count that had never run. Costs three reads on an in-flight skip
-	// (boot sweep + on-demand verb only; not a polling path); synthesis
-	// behaviour is unchanged.
-	landed := 0
-	for _, cat := range stage.terminals {
-		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
-		if err != nil {
-			return out, fmt.Errorf("list %s for run %s: %w", cat, runID, err)
-		}
-		for _, e := range entries {
-			if e.Sequence > latest.Sequence {
-				landed++
-			}
-		}
+	// Count landed terminals for THIS round only (see
+	// countLandedReviewTerminals). Counted BEFORE the boot-marker gate
+	// (#3395) so LandedBefore is real on EVERY skip and a settled round
+	// reports round_already_settled rather than
+	// review_dispatched_by_this_process: counted after the gate, an in-flight
+	// skip always reported landed_before 0, which an operator read as "the
+	// round is genuinely empty" when it was the count that had never run.
+	// Costs three reads on an in-flight skip (boot sweep + on-demand verb
+	// only; not a polling path); synthesis behaviour is unchanged.
+	landed, err := s.countLandedReviewTerminals(ctx, runID, stage, latest.Sequence)
+	if err != nil {
+		return out, err
 	}
 	out.LandedBefore = landed
 	if landed >= payload.ConfiguredAgents {
@@ -398,4 +374,53 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 	}
 	out.Synthesized = missing
 	return out, nil
+}
+
+// latestReviewStarted returns the stage's CURRENT review round anchor: the
+// highest-sequence *_review_started entry and its decoded payload. ok is false
+// when no review was ever dispatched for the stage. A fixup re-triggers the
+// review, appending a fresh started entry, so callers correlate strictly to
+// this round (the attempt-correlation binding condition). Shared by the
+// orphaned-review reconcile and GET /v0/restart-blockers (E83.30 / #3974) so
+// both read one definition of "the current round".
+func (s *Server) latestReviewStarted(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (*audit.Entry, planreview.ReviewStartedPayload, bool, error) {
+	var payload planreview.ReviewStartedPayload
+	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, stage.started)
+	if err != nil {
+		return nil, payload, false, fmt.Errorf("list %s for run %s: %w", stage.started, runID, err)
+	}
+	if len(started) == 0 {
+		return nil, payload, false, nil
+	}
+	latest := started[0]
+	for _, e := range started[1:] {
+		if e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	if err := json.Unmarshal(latest.Payload, &payload); err != nil {
+		return nil, payload, false, fmt.Errorf("decode %s payload for run %s: %w", stage.started, runID, err)
+	}
+	return latest, payload, true, nil
+}
+
+// countLandedReviewTerminals counts the stage's terminal review entries
+// (reviewed / skipped / failed) with audit sequence STRICTLY greater than
+// afterSeq — the round's own verdicts. A prior round's landed verdicts carry a
+// lower sequence and are excluded (the attempt-mixing fix, binding condition
+// 1 of #1781). Shared with GET /v0/restart-blockers (E83.30 / #3974).
+func (s *Server) countLandedReviewTerminals(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, afterSeq int64) (int, error) {
+	landed := 0
+	for _, cat := range stage.terminals {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			return 0, fmt.Errorf("list %s for run %s: %w", cat, runID, err)
+		}
+		for _, e := range entries {
+			if e.Sequence > afterSeq {
+				landed++
+			}
+		}
+	}
+	return landed, nil
 }

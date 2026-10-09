@@ -3168,6 +3168,193 @@ _refuse_on_live_runs() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Restart-blocker guard for reload / post-merge (E83.30 / #3974)
+#
+# The #2897 guard above protects a live RUNNER process. Two hazards have no
+# runner process at all and live inside fishhawkd itself: a decomposition child
+# whose implement stage is not dispatched yet (a restart mid-fan-out strands
+# it), and a plan/implement review round the SERVING daemon dispatched that has
+# no verdict yet (the in-process reviewer dies with the daemon). The daemon
+# owns both predicates, so the guard asks it: GET /v0/restart-blockers returns
+# a flat list of {run_id, reason, stage, parent_run_id?, ...} items with no
+# free text. Three functions, kept separately callable so #4077's relaxed
+# `reload --when-quiet` can reuse the query without the refusal:
+#   _parse_restart_blockers    PURE: body -> records
+#   _fetch_restart_blockers    IMPURE: the GET
+#   _refuse_on_restart_blockers  the CONTROL
+# Long-form contract: scripts/README.md § "Restart-blocker guard".
+# ---------------------------------------------------------------------------
+
+# PURE. Reads a GET /v0/restart-blockers body on stdin and prints one
+# `<run_id>\t<reason>\t<stage>\t<parent_run_id>` record per item (the parent is
+# empty unless the item carries one). No jq: newlines are folded to spaces and
+# each field is pulled by its own zsh =~ match, so whitespace, indentation and
+# key ORDER are not load-bearing — only the flat-object, no-free-text shape the
+# backend pins with testdata/wire/restart_blockers.json.
+#
+# Returns 3 when the body carries no `"items": [...]` array (malformed). An
+# item object missing run_id or reason, or array content that is not an object,
+# yields a record with reason `unreadable` ('?' for an unknown field): the
+# daemon said SOMETHING blocks, so an unreadable item still refuses.
+_parse_restart_blockers() {
+  local body="" chunk items rest obj run_id reason stage parent leftover
+  local found=0
+  while IFS= read -r chunk || [[ -n "$chunk" ]]; do
+    body+="${chunk} "
+  done
+  body="${body//$'\r'/ }"
+  if [[ ! "$body" =~ '"items"[[:space:]]*:[[:space:]]*\[([^]]*)\]' ]]; then
+    return 3
+  fi
+  items="${match[1]}"
+  rest="$items"
+  leftover="$items"
+  while [[ "$rest" =~ '\{([^}]*)\}' ]]; do
+    obj="${match[1]}"
+    rest="${rest:$MEND}"
+    found=1
+    run_id="?" reason="" stage="?" parent=""
+    if [[ "$obj" =~ '"run_id"[[:space:]]*:[[:space:]]*"([^"]*)"' ]]; then run_id="${match[1]}"; fi
+    if [[ "$obj" =~ '"reason"[[:space:]]*:[[:space:]]*"([^"]*)"' ]]; then reason="${match[1]}"; fi
+    if [[ "$obj" =~ '"stage"[[:space:]]*:[[:space:]]*"([^"]*)"' ]]; then stage="${match[1]}"; fi
+    if [[ "$obj" =~ '"parent_run_id"[[:space:]]*:[[:space:]]*"([^"]*)"' ]]; then parent="${match[1]}"; fi
+    if [[ "$run_id" == "?" || -z "$run_id" || -z "$reason" ]]; then
+      reason="unreadable"
+    fi
+    print -r -- "${run_id}"$'\t'"${reason}"$'\t'"${stage}"$'\t'"${parent}"
+  done
+  # Array content that is not an object (e.g. `"items":[1]`) is unreadable,
+  # never a clean empty list.
+  if (( ! found )); then
+    leftover="${leftover//[[:space:],]/}"
+    if [[ -n "$leftover" ]]; then
+      print -r -- "?"$'\t'"unreadable"$'\t'"?"$'\t'
+    fi
+  fi
+  return 0
+}
+
+# The restart-blocker URL on the fishhawkd port _healthz_port derives.
+_restart_blockers_url() {
+  print "http://localhost:$(_healthz_port)/v0/restart-blockers"
+}
+
+# IMPURE. GETs the blocker inventory and prints the body. Optional arg 1
+# overrides the URL. Without it, .env is sourced first (guarded, and only in
+# the caller's command-substitution subshell, so nothing leaks into the
+# command) so a FISHHAWKD_ADDR override applies — reload/post-merge run this
+# BEFORE cmd_up's own .env load.
+#
+# --max-time 5 bounds the whole transfer, so a wedged daemon cannot hang a
+# post-merge. Returns 2 (degrade) when the request fails — refused, timeout,
+# empty reply, or curl absent from PATH (the failed command substitution covers
+# it; no separate `command -v` probe); returns 4 with the HTTP status printed in
+# place of the body when the daemon answers anything but 200.
+_fetch_restart_blockers() {
+  local url="${1:-}"
+  local out="" code=""
+  if [[ -z "$url" ]]; then
+    if [[ -f "${REPO_ROOT}/.env" ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      source "${REPO_ROOT}/.env" 2>/dev/null || true
+      set +a
+    fi
+    url="$(_restart_blockers_url)"
+  fi
+  if ! out="$(curl -s --max-time 5 -w $'\n%{http_code}' "$url" 2>/dev/null)"; then return 2; fi
+  code="${out##*$'\n'}"
+  if [[ "$code" != "200" ]]; then
+    print -r -- "$code"
+    return 4
+  fi
+  print -r -- "${out%$'\n'*}"
+  return 0
+}
+
+# The control. Args: <force 0|1> [url]
+#   no blocker                 -> SILENT, return 0
+#   blockers + force=0         -> refusal naming each run + reason on stderr, return 1
+#   blockers + force=1         -> the same inventory as a WARNING, return 0
+#   unreachable / curl absent  -> one-line reason, return 0 (fail-open)
+#   non-200 (404 = old daemon) -> one-line reason naming the status, return 0
+#   malformed 200 (no items)   -> one-line reason, return 0
+#   truncated scan             -> one warning line, then the verdict above
+#
+# Fail-OPEN on every "could not ask" mode mirrors the #2897 guard: a daemon
+# that is down has nothing in flight to orphan, and the first post-merge after
+# this lands hits the OLD daemon, which answers 404. A check_failed item is the
+# opposite case — a REACHABLE daemon that could not decide a run — and it
+# REFUSES like any other blocker (fail-closed; --force overrides).
+#
+# Call sites MUST invoke this in a tested context
+# (`if ! _refuse_on_restart_blockers …`) so the #631 ZERR trap never fires on a
+# deliberate refusal.
+_refuse_on_restart_blockers() {
+  local force="${1:-0}"
+  local url="${2:-}"
+  local body="" records="" rc=0 prc=0
+  body="$(_fetch_restart_blockers "$url")" || rc=$?
+  if (( rc == 4 )); then
+    local hint=""
+    if [[ "$body" == "404" ]]; then hint=" (the running daemon predates GET /v0/restart-blockers)"; fi
+    print -u2 "warning: fishhawkd answered HTTP ${body} to the restart-blocker check${hint} — skipping it (degraded)"
+    return 0
+  fi
+  if (( rc != 0 )); then
+    print -u2 "warning: could not ask fishhawkd for restart blockers (curl unavailable or the daemon is not answering) — skipping the check (degraded)"
+    return 0
+  fi
+  records="$(print -r -- "$body" | _parse_restart_blockers)" || prc=$?
+  if (( prc != 0 )); then
+    print -u2 "warning: fishhawkd's restart-blocker answer carried no items array — skipping the check (degraded)"
+    return 0
+  fi
+  if [[ "$body" =~ '"truncated"[[:space:]]*:[[:space:]]*true' ]]; then
+    print -u2 "warning: the restart-blocker scan hit its run cap (truncated) — runs past it were not checked"
+  fi
+
+  local -a blockers
+  blockers=()
+  local b_run b_reason b_stage b_parent entry
+  while IFS=$'\t' read -r b_run b_reason b_stage b_parent; do
+    if [[ -z "$b_run" ]]; then continue; fi
+    case "$b_reason" in
+      undispatched_child)
+        blockers+=("run ${b_run}: decomposition child of ${b_parent:-?} whose ${b_stage} stage is not dispatched yet (undispatched_child)") ;;
+      review_in_flight)
+        blockers+=("run ${b_run}: ${b_stage} review round dispatched by this daemon has no verdict yet (review_in_flight)") ;;
+      check_failed)
+        blockers+=("run ${b_run}: fishhawkd could not decide this run's ${b_stage} state — a stage or audit read failed (check_failed)") ;;
+      *)
+        blockers+=("run ${b_run}: blocker item the guard could not read (${b_reason})") ;;
+    esac
+  done <<< "$records"
+  if (( ${#blockers} == 0 )); then
+    return 0
+  fi
+
+  print -u2 ""
+  if (( force )); then
+    print -u2 "warning: restarting fishhawkd with ${#blockers} restart blocker(s) reported (--force):"
+  else
+    print -u2 "error: refusing to restart fishhawkd — it reports ${#blockers} restart blocker(s):"
+  fi
+  for entry in "${blockers[@]}"; do
+    print -u2 "  ${entry}"
+  done
+  print -u2 "  what --force breaks: an undispatched decomposition child is stranded mid-fan-out, and an in-flight"
+  print -u2 "  review round's reviewer dies with the daemon, so its verdict never lands (the next boot sweep records"
+  print -u2 "  it failed and the review must be re-run); an undecided run may be either."
+  if (( force )); then
+    print -u2 "  proceeding anyway because --force was given."
+    return 0
+  fi
+  print -u2 "  dispatch the children / let the review rounds settle, or re-run with --force to restart anyway."
+  return 1
+}
+
 # One-step post-merge command: stop fishhawkd (if running), rebuild ALL four
 # binaries, restart fishhawkd, and emit the MCP reconnect signal. Plain `up`
 # no-ops when fishhawkd is already running, so it never rebuilds after a merge;
@@ -3200,6 +3387,12 @@ cmd_reload() {
   if ! _refuse_on_live_runs "$force"; then
     exit 1
   fi
+  # Restart-blocker guard (E83.30 / #3974), also BEFORE any teardown: the
+  # daemon-side hazards (an undispatched decomposition child, an in-process
+  # review round) that no runner-process scan can see.
+  if ! _refuse_on_restart_blockers "$force"; then
+    exit 1
+  fi
 
   if [[ -f "$PID_FILE" ]]; then
     cmd_down
@@ -3230,6 +3423,12 @@ cmd_post_merge() {
     if [[ "$pm_arg" == "--force" ]]; then pm_force=1; fi
   done
   if ! _refuse_on_live_runs "$pm_force"; then
+    exit 1
+  fi
+  # Restart-blocker guard (E83.30 / #3974), likewise before any git step.
+  # cmd_reload re-asks after the pull (a blocker appearing in between refuses
+  # THERE, with main already pulled — the TOCTOU residual).
+  if ! _refuse_on_restart_blockers "$pm_force"; then
     exit 1
   fi
 
@@ -4834,7 +5033,10 @@ _usage() {
   print -u2 ""
   print -u2 "  reload and post-merge REFUSE while any fishhawk-runner process is live"
   print -u2 "  (#2897): restarting fishhawkd under a mid-stage runner can strand its"
-  print -u2 "  stage in 'running'. Pass --force to tear down anyway."
+  print -u2 "  stage in 'running'. They also REFUSE while fishhawkd reports a restart"
+  print -u2 "  blocker (#3974): an undispatched decomposition child, a review round in"
+  print -u2 "  flight in the serving daemon, or a run it could not decide. Pass --force"
+  print -u2 "  to tear down anyway."
   print -u2 ""
   print -u2 "  preview builds fishhawkd from <sha-or-ref> (default \$FISHHAWK_PREVIEW_SHA) in"
   print -u2 "  a detached worktree, serves it on FISHHAWK_PREVIEW_ADDR (default"

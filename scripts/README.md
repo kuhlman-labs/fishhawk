@@ -1344,8 +1344,11 @@ build-cache bound" below), optionally confirms a given issue is
 reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure)
 and MCP-reconnect verdict are inherited and the verdict is the command's final
 line. Since E68.7 / #2897 it REFUSES at its very top — before the git walk —
-while any `fishhawk-runner` process is live; `--force` overrides (see "Live-run
-guard for reload / post-merge" below).
+while any `fishhawk-runner` process is live, and since E83.30 / #3974 also while
+fishhawkd reports a restart blocker (an undispatched decomposition child, or a
+review round in flight in the serving daemon); `--force` overrides both (see
+"Live-run guard for reload / post-merge" and "Restart-blocker guard for reload /
+post-merge" below).
 
 `scripts/dev reload` (down-then-up) is the stack-only primitive `post-merge`
 composes: plain `scripts/dev up` no-ops when fishhawkd is already running and so
@@ -1353,8 +1356,9 @@ never rebuilds. **`reload` always rebuilds all five binaries (it forces
 `--all`)** — after a merge `HEAD == origin/main`, so the `origin/main...HEAD`
 diff is empty and the rebuild matrix would match nothing, silently skipping
 runner/CLI/mcp/shim. Forcing `--all` closes that gap. `reload` also REFUSES
-while a runner is live (E68.7 / #2897), and STRIPS its own `--force` from the
-argv it forwards to `cmd_up`.
+while a runner is live (E68.7 / #2897) or fishhawkd reports a restart blocker
+(E83.30 / #3974), and STRIPS its own `--force` from the argv it forwards to
+`cmd_up`.
 
 ### Rebuild detection and the `README.md` carve-out (#2403)
 
@@ -1767,6 +1771,85 @@ invocation, and `LR-j`/`LR-k` the tested-context and ordering pins.
 
 The runner-side half of #2897 — the terminal-egress retry budget that makes a
 `--force`d restart survivable — is in `runner/README.md`.
+
+## Restart-blocker guard for reload / post-merge (E83.30 / [#3974](https://github.com/kuhlman-labs/fishhawk/issues/3974))
+
+The live-run guard above protects a runner PROCESS. Two hazards have no runner
+process and live inside fishhawkd itself, so a restart orphans them silently:
+
+- a **decomposition child whose `implement` stage is still `pending` /
+  `awaiting_host_dispatch`** — restarting mid-fan-out strands it; and
+- a **plan/implement review round dispatched by the SERVING daemon** with no
+  verdict yet — the in-process reviewer goroutine dies with the daemon, and the
+  next boot sweep can only record the round as `failed`.
+
+The daemon owns both predicates, so the guard ASKS it:
+`GET /v0/restart-blockers` (contract: `backend/internal/server/README.md`
+§ "Restart blockers") returns `{items, scanned_runs, truncated}`, each item
+`{run_id, reason, stage, parent_run_id?, …}` with no free text. A round an
+EARLIER process dispatched is not a blocker (the boot sweep closes it).
+
+### Three functions, kept separately callable
+
+| Function | Purity | Contract |
+|---|---|---|
+| `_parse_restart_blockers` | PURE (stdin → stdout) | body → one `<run_id>\t<reason>\t<stage>\t<parent_run_id>` record per item via whitespace-tolerant, order-independent zsh `=~` (no jq); returns **3** when there is no `items` array; an item missing `run_id`/`reason`, or non-object array content, becomes reason `unreadable` |
+| `_fetch_restart_blockers [url]` | IMPURE | `curl -s --max-time 5` against `http://localhost:<_healthz_port>/v0/restart-blockers` (after a guarded `.env` source, inside its command-substitution subshell, so a `FISHHAWKD_ADDR` override applies); returns **2** when the request fails (refused / timeout / empty reply / curl absent), **4** with the status printed on a non-200 |
+| `_refuse_on_restart_blockers <force 0\|1> [url]` | the CONTROL | see the modes below |
+
+The query (`_fetch` + `_parse`) and the refusal are separate on purpose: #4077's
+relaxed `reload --when-quiet` reuses the query without the refusal.
+
+### Modes
+
+| Condition | Result |
+|---|---|
+| no blocker | SILENT, proceed |
+| `undispatched_child` / `review_in_flight` | refusal naming each run + reason and what `--force` breaks, exit 1 |
+| **`check_failed`** — a per-run stage/audit read error from a REACHABLE daemon | **REFUSES** like any blocker, naming the run and saying the daemon could not decide its state; `--force` overrides. Fail-CLOSED on purpose: an unreachable daemon has nothing in flight to orphan, but a reachable one that cannot decide must not risk orphaning work |
+| an item the parser cannot read (`unreadable`) | REFUSES — the daemon said something blocks |
+| any blocker + `--force` | the same inventory as a `warning:`, proceed |
+| daemon unreachable, or curl absent | one-line reason, proceed (fail-OPEN) |
+| non-200 | one-line reason naming `HTTP <status>`, proceed; a **404** adds "the running daemon predates GET /v0/restart-blockers" |
+| 200 with no `items` array | one-line reason, proceed |
+| `truncated: true` | one warning line (runs past the 500-run cap were not checked), then the verdict above |
+
+**The first `post-merge` after this lands hits the OLD daemon**, which answers
+404 — the guard fails open with the hint above, and that post-merge also runs
+the already-loaded old `scripts/dev`.
+
+### Wiring, scope and residuals
+
+- Called as `if ! _refuse_on_restart_blockers …` (a TESTED context, #631) in
+  `cmd_reload` right after the live-run guard and **before `cmd_down`**, and in
+  `cmd_post_merge` right after the live-run guard and **before `git checkout
+  main`**. `post-merge` forwards `--force` to `cmd_reload`, which re-asks after
+  the pull.
+- **Daemon-wide scope.** The check covers every run the fishhawkd this
+  checkout's `scripts/dev` manages can see, not only runs bound to this checkout.
+  It over-refuses only for a child bound to ANOTHER checkout of the same daemon,
+  which `--force` clears; under-refusing would orphan in-process review rounds.
+- **TOCTOU.** A blocker that appears between the check and the teardown is not
+  caught — the same class as #2897. `post-merge`'s second check inside
+  `cmd_reload` runs AFTER the pull, so a refusal there leaves main pulled.
+
+### Tests
+
+`scripts/test-dev` RB cases drive the REAL guard through the REAL `cmd_reload` /
+`cmd_post_merge` with a REAL curl against a one-shot `nc -l` responder
+(REPO_ROOT at an empty temp dir, `FISHHAWKD_ADDR` at a free port, teardown legs
+stubbed to marker files, the #2897 `_scan_live_runs` stubbed clean so a live
+runner on the host cannot refuse first). They skip with a printed reason when
+`nc`, `lsof` or `curl` is absent. RB-a/b/n/h refuse (child, review, check_failed,
+unreadable) with the marker absent; RB-c/n `--force` proceeds; RB-d/f/g/j fail
+open (unreachable, 404, malformed, curl absent); RB-e is silent; RB-i warns on
+`truncated`; RB-l pins post-merge's refusal ahead of git/cleanup/reload. RB-k
+parses `testdata/wire/restart_blockers.json` — the SAME golden the backend's
+`TestRestartBlockers_EndToEnd_Golden` pins byte-for-byte — plus a table of
+indented / reordered / malformed bodies. RB-m body-greps the call sites, their
+order, and `--max-time 5` (pinned by grep only). The existing LR and GC
+harnesses stub `_refuse_on_restart_blockers` so they never query the host
+daemon.
 
 ## Go build-cache bound (E83.20 / [#3901](https://github.com/kuhlman-labs/fishhawk/issues/3901))
 
