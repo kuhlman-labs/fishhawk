@@ -1555,3 +1555,79 @@ func TestRenderCurrentPlan_NewArchitecturalDecision_UndeclaredIsByteIdentical(t 
 		})
 	}
 }
+
+// TestRenderCurrentPlan_PartialDelivery pins the E83.52 / #4085 anchor line: a
+// plan declaring a PARTIAL delivery renders ONE bold line directly under the
+// **Plan** header (above the summary) naming the remaining scope, with
+// planner-authored newlines flattened so the line cannot break out of its
+// italic span. The fixture's ONLY partial signal is PartialDelivery, so a
+// guard that stops reading it reddens here.
+func TestRenderCurrentPlan_PartialDelivery(t *testing.T) {
+	got := renderCurrentPlan(&AnchorPlanView{
+		Summary:         "Ship the schema fields only.",
+		Files:           []plan.ScopeFile{{Path: "docs/spec/plan-standard-v1.schema.json", Operation: "modify"}},
+		PartialDelivery: true,
+		RemainingScope:  "the merge-time comment\nand the ship-time guard",
+	}, false)
+	const wantLine = "**Partial delivery** — this run delivers only part of this issue; merging it is not meant to close the issue. " +
+		"_Remaining scope: the merge-time comment and the ship-time guard_"
+	if !strings.HasPrefix(got, "**Plan**\n\n"+wantLine+"\n\nShip the schema fields only.") {
+		t.Fatalf("partial-delivery line must sit directly under the Plan header and above the summary, want %q:\n%s", wantLine, got)
+	}
+	if strings.Contains(got, "@") {
+		t.Errorf("partial-delivery line must render no @-mention:\n%s", got)
+	}
+}
+
+// TestRenderCurrentPlan_PartialDelivery_BlankAndBoundedScope pins the two
+// remaining_scope edge renders: a blank scope (IsPartialDelivery deliberately
+// does not require one) says "not stated" rather than an empty span, and an
+// over-long scope is word-bounded with a real ellipsis.
+func TestRenderCurrentPlan_PartialDelivery_BlankAndBoundedScope(t *testing.T) {
+	blank := renderCurrentPlan(&AnchorPlanView{Summary: "s", PartialDelivery: true, RemainingScope: " \n "}, false)
+	if !strings.Contains(blank, "_Remaining scope: not stated_") {
+		t.Errorf("blank remaining scope should render as not stated:\n%s", blank)
+	}
+	long := renderCurrentPlan(&AnchorPlanView{
+		Summary:         "s",
+		PartialDelivery: true,
+		RemainingScope:  strings.TrimSpace(strings.Repeat("remaining ", 80)),
+	}, false)
+	if !strings.Contains(long, "remaining…_") {
+		t.Errorf("over-long remaining scope should truncate on a word boundary with a real ellipsis:\n%s", long)
+	}
+	if n := strings.Count(long, "remaining"); n > 31 {
+		t.Errorf("remaining scope not bounded: %d repetitions survived:\n%s", n, long)
+	}
+}
+
+// TestRenderCurrentPlan_PartialDelivery_FullIsByteIdentical pins the additive
+// guarantee: a full/absent delivery renders byte-identically to a view without
+// the fields, even when a stray RemainingScope is present (plan.Parse refuses
+// that pairing, but consumers decode with json.Unmarshal), and a superseded
+// plan's render ignores the declaration entirely.
+func TestRenderCurrentPlan_PartialDelivery_FullIsByteIdentical(t *testing.T) {
+	base := AnchorPlanView{
+		Summary:          "Resolve the implement model at the gate.",
+		Files:            []plan.ScopeFile{{Path: "a.go", Operation: "modify"}},
+		RecommendedModel: "claude-sonnet-4-6",
+	}
+	want := renderCurrentPlan(&base, false)
+	stray := base
+	stray.RemainingScope = "left for later"
+	if got := renderCurrentPlan(&stray, false); got != want {
+		t.Errorf("non-partial view with a stray remaining scope changed the render:\n got: %q\nwant: %q", got, want)
+	}
+	if strings.Contains(want, "Partial delivery") {
+		t.Errorf("full delivery must not render the partial line:\n%s", want)
+	}
+
+	superseded := base
+	superseded.RejectionReason = "too broad"
+	wantSuperseded := renderSupersededPlans([]AnchorPlanView{superseded})
+	superseded.PartialDelivery = true
+	superseded.RemainingScope = "left for later"
+	if got := renderSupersededPlans([]AnchorPlanView{superseded}); got != wantSuperseded {
+		t.Errorf("superseded plan render changed by a partial declaration:\n got: %q\nwant: %q", got, wantSuperseded)
+	}
+}

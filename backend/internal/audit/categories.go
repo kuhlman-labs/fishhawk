@@ -571,6 +571,15 @@ var KnownCategories = map[string]struct{}{
 	"verified_tree_discarded":                 {},
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},
+
+	// Kept as its own alignment section (the keys outrun the block's column):
+	// E83.52 / #4085, the PARTIAL delivery pair, both issue-comment ACTIVITY
+	// categories. closing_reference_neutralized: the ship-time guard rewrote a
+	// closing reference to the issue as Refs #N (server/partial_delivery_pr.go).
+	// remaining_scope_posted: the merge-time remaining-scope comment landed on
+	// the issue, and is its dedup key (server/partial_delivery_merge.go).
+	"partial_delivery_closing_reference_neutralized": {},
+	"partial_delivery_remaining_scope_posted":        {},
 }
 
 // knownCategoryList is the sorted slice form of KnownCategories, computed

@@ -1382,3 +1382,51 @@ func TestRenderStatusBody_CrewEscalatedActivity(t *testing.T) {
 		t.Error("crew_message_sent must NOT render on the timeline; it pages via notifyPageClass only")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// partial delivery (E83.52 / #4085).
+// ---------------------------------------------------------------------------
+
+// TestRenderStatusBody_PartialDeliveryActivity pins both partial-delivery
+// activity kinds BYTE-FOR-BYTE on the timeline and proves neither leaks its bare
+// category name (the renderActivityLine case) nor is filtered as noise (the
+// activityCategories entry). A payload without a positive issue_number falls
+// back to the bare phrase instead of rendering `Refs #0`.
+func TestRenderStatusBody_PartialDeliveryActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "partial_delivery_closing_reference_neutralized", "system", now.Add(-3*time.Minute),
+			map[string]any{"issue_number": 7, "pr_number": 12, "rewritten": 1}),
+		auditEntry(runID, 6, "partial_delivery_remaining_scope_posted", "system", now.Add(-2*time.Minute),
+			map[string]any{"issue_number": 7, "pr_url": "https://github.com/x/y/pull/12", "forge": "github"}),
+		auditEntry(runID, 7, "trace_uploaded", "system", now, nil),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	for _, want := range []string{
+		"Partial delivery: closing reference rewritten to `Refs #7`",
+		"Partial delivery: remaining scope posted on the issue",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("timeline missing %q\n---\n%s", want, body)
+		}
+	}
+	for _, leak := range []string{"partial_delivery_closing_reference_neutralized", "partial_delivery_remaining_scope_posted", "trace_uploaded"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("category name %q leaked into the activity section\n---\n%s", leak, body)
+		}
+	}
+	for _, c := range []string{"partial_delivery_closing_reference_neutralized", "partial_delivery_remaining_scope_posted"} {
+		if !issuecomment.RendersActivity(c) {
+			t.Errorf("RendersActivity(%s) = false; notifyOperatorVisible would ERROR-log it", c)
+		}
+	}
+
+	noIssue := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{
+		auditEntry(runID, 5, "partial_delivery_closing_reference_neutralized", "system", now, map[string]any{"pr_number": 12}),
+	}, "https://x", now)
+	if !strings.Contains(noIssue, "Partial delivery: closing reference rewritten to Refs") || strings.Contains(noIssue, "#0") {
+		t.Errorf("payload without issue_number should render the bare phrase\n---\n%s", noIssue)
+	}
+}
