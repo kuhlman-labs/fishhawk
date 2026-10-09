@@ -6832,3 +6832,406 @@ func TestCommitAndPush_FreshFetchBase_CheckoutFailure_WrapsBaseFetchError(t *tes
 	})
 	assertBaseFetchError(t, repo, headBefore, "gitops: checkout "+branch+":", "main", err)
 }
+
+// pinnedAdvanceFixture builds the #3973 mid-stage base-advance shape: a work
+// repo whose HEAD is the pin P (origin/main's tip when the stage started), an
+// agent edit to shared.txt sitting uncommitted in the work tree, and a bare
+// origin whose main has since ADVANCED past P with a commit that edits the SAME
+// line of shared.txt — a PR merged into main while the agent ran. The advance
+// is pushed from a second clone so the work repo never sees it. Returns the
+// work repo, the bare origin, the pin and the advanced tip.
+func pinnedAdvanceFixture(t *testing.T) (repo, bare, pin, advanced string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	other := filepath.Join(dir, "other")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("base line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	pin = mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// The mid-stage merge, made in a SEPARATE clone.
+	mustGit(t, dir, "clone", "--branch", "main", bare, other)
+	mustGit(t, other, "config", "user.name", "merger")
+	mustGit(t, other, "config", "user.email", "merger@example.com")
+	if err := os.WriteFile(filepath.Join(other, "shared.txt"), []byte("merged mid-stage line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, other, "commit", "-am", "a PR merged into main mid-stage")
+	mustGit(t, other, "push", "origin", "main")
+	advanced = mustGitOut(t, other, "rev-parse", "HEAD")
+
+	// The agent's edit, made on the pin, to the line the merge also changed.
+	if err := os.WriteFile(filepath.Join(repo, "shared.txt"), []byte("agent-edited line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo, bare, pin, advanced
+}
+
+// TestCommitAndPush_PinnedBase_MidStageBaseAdvance_NoConflict is the #3973
+// done-means at the gitops seam: with the stage's base pinned, a commit merged
+// into origin/main mid-stage that edits the same line as the agent no longer
+// turns into a commit-time stash-pop category-B conflict. The branch is cut
+// from the pin, BaseSHA records the pin, and the pushed branch's first parent
+// is the pin — never the moved tip.
+func TestCommitAndPush_PinnedBase_MidStageBaseAdvance_NoConflict(t *testing.T) {
+	repo, bare, pin, advanced := pinnedAdvanceFixture(t)
+	const branch = "fishhawk/run-3973/stage-pin"
+	res, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  pin,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush (pinned) = %v; want success (errors.Is ErrBaseRebaseConflict = %v)", err, errors.Is(err, ErrBaseRebaseConflict))
+	}
+	if res.BaseSHA != pin {
+		t.Errorf("result.BaseSHA = %s, want the pin %s (advanced tip is %s)", res.BaseSHA, pin, advanced)
+	}
+	if got := mustGitOut(t, bare, "rev-parse", branch+"^"); got != pin {
+		t.Errorf("pushed branch first parent = %s, want the pin %s (advanced tip is %s)", got, pin, advanced)
+	}
+	if got := mustGitOut(t, bare, "show", branch+":shared.txt"); got != "agent-edited line" {
+		t.Errorf("pushed shared.txt = %q, want the agent edit", got)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q, want empty after the pinned reapply", list)
+	}
+}
+
+// TestCommitAndPush_UnpinnedControl_MidStageBaseAdvance_Conflicts proves the
+// fixture above really conflicts: the SAME shape with PinnedBaseSHA empty takes
+// the unchanged fetch path, reapplies the edit onto the moved tip, and fails
+// ErrBaseRebaseConflict with nothing pushed.
+func TestCommitAndPush_UnpinnedControl_MidStageBaseAdvance_Conflicts(t *testing.T) {
+	repo, bare, _, _ := pinnedAdvanceFixture(t)
+	const branch = "fishhawk/run-3973/stage-unpinned"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "agent stage commit",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+	})
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("unpinned CommitAndPush = %v; want ErrBaseRebaseConflict (the fixture must conflict)", err)
+	}
+	if out := mustGitOut(t, bare, "for-each-ref", "refs/heads/"+branch); out != "" {
+		t.Errorf("branch %s pushed on a conflicted pop: %q", branch, out)
+	}
+}
+
+// existingSliceBranchFixture builds the #3991 resume shape: origin carries the
+// declared base `main` at B and the child's slice branch at S, a commit on top
+// of B (a prior attempt's published work). The work repo sits DETACHED at S —
+// where the runner's own-slice-branch checkout puts a resumed child — with a
+// new agent edit uncommitted on top. Returns the repo, the bare origin, the
+// slice branch and S.
+func existingSliceBranchFixture(t *testing.T) (repo, bare, slice, sliceTip string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	slice = "fishhawk/run-3991/slice-0"
+	repo, bare, _ = baseFetchFailureRepo(t)
+	// Discard baseFetchFailureRepo's pending edits; this fixture adds its own.
+	mustGit(t, repo, "checkout", "--", "README.md")
+	if err := os.Remove(filepath.Join(repo, "agent.txt")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "checkout", "-b", slice)
+	if err := os.WriteFile(filepath.Join(repo, "prior.txt"), []byte("prior attempt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "prior attempt's published slice work")
+	mustGit(t, repo, "push", "origin", slice)
+	sliceTip = mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "checkout", "--detach", sliceTip)
+	mustGit(t, repo, "branch", "-D", slice)
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("resumed agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo, bare, slice, sliceTip
+}
+
+// TestCommitAndPush_PinnedBase_ExistingSliceBranch_FastForwards is the #3991
+// shape: a resumed child pinned to its own slice branch tip S pushes its new
+// commit as a FAST-FORWARD onto that branch with a plain (non-force) push. The
+// unpinned arm re-cuts the branch from the declared base B, so the same push
+// is rejected non-fast-forward.
+func TestCommitAndPush_PinnedBase_ExistingSliceBranch_FastForwards(t *testing.T) {
+	t.Run("pinned", func(t *testing.T) {
+		repo, bare, slice, sliceTip := existingSliceBranchFixture(t)
+		res, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir:        repo,
+			Branch:         slice,
+			CommitMessage:  "resumed slice",
+			RemoteURL:      bare,
+			FreshFetchBase: "main",
+			PinnedBaseSHA:  sliceTip,
+		})
+		if err != nil {
+			t.Fatalf("pinned CommitAndPush onto the existing slice branch = %v; want a fast-forward push", err)
+		}
+		if got := mustGitOut(t, bare, "rev-parse", slice); got != res.HeadSHA {
+			t.Errorf("remote %s = %s, want the pushed head %s", slice, got, res.HeadSHA)
+		}
+		if got := mustGitOut(t, bare, "rev-parse", slice+"^"); got != sliceTip {
+			t.Errorf("remote %s^ = %s, want the prior slice tip %s (a fast-forward)", slice, got, sliceTip)
+		}
+		if res.BaseSHA != sliceTip {
+			t.Errorf("result.BaseSHA = %s, want the pinned slice tip %s", res.BaseSHA, sliceTip)
+		}
+	})
+	t.Run("unpinned control", func(t *testing.T) {
+		repo, bare, slice, sliceTip := existingSliceBranchFixture(t)
+		_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+			RepoDir:        repo,
+			Branch:         slice,
+			CommitMessage:  "resumed slice",
+			RemoteURL:      bare,
+			FreshFetchBase: "main",
+		})
+		if !errors.Is(err, ErrPushFailed) {
+			t.Fatalf("unpinned CommitAndPush = %v; want the push rejected (ErrPushFailed)", err)
+		}
+		if !strings.Contains(err.Error(), "non-fast-forward") && !strings.Contains(err.Error(), "fetch first") {
+			t.Errorf("push error = %q, want a non-fast-forward rejection", err.Error())
+		}
+		if got := mustGitOut(t, bare, "rev-parse", slice); got != sliceTip {
+			t.Errorf("remote %s moved to %s; want it untouched at %s", slice, got, sliceTip)
+		}
+	})
+}
+
+// TestCommitAndPush_PinnedBase_AbsentObject_FailsClosedBeforeStash pins the
+// pre-stash object guard: a pin naming no commit in the repository fails
+// closed BEFORE anything is stashed, so the agent's edits stay in the working
+// tree, the stash stack is untouched, HEAD does not move, nothing is pushed,
+// and the error names the SHA. It is NOT a BaseFetchError — there is no stash
+// to name — and it never falls back to fetching the moved base.
+func TestCommitAndPush_PinnedBase_AbsentObject_FailsClosedBeforeStash(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const absent = "0123456789abcdef0123456789abcdef01234567"
+	const branch = "fishhawk/run-3973/slice-absent"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  absent,
+	})
+	if err == nil {
+		t.Fatal("CommitAndPush succeeded with an absent pinned base; want a fail-closed error")
+	}
+	if !strings.Contains(err.Error(), absent) {
+		t.Errorf("error %q does not name the absent pin %s", err.Error(), absent)
+	}
+	var bfe *BaseFetchError
+	if errors.As(err, &bfe) || errors.Is(err, ErrBaseFetchFailed) {
+		t.Errorf("an absent pin is refused before the stash and must NOT be a BaseFetchError: %v", err)
+	}
+	if errors.Is(err, ErrPushFailed) {
+		t.Errorf("an absent pin must not claim ErrPushFailed: %v", err)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q; the guard must refuse before stashing", list)
+	}
+	if got := mustGitOut(t, repo, "show", ":README.md"); got != "# initial" {
+		t.Errorf("index README.md = %q, want the untouched base", got)
+	}
+	if data, rerr := os.ReadFile(filepath.Join(repo, "README.md")); rerr != nil || string(data) != "# the verified slice edit\n" {
+		t.Errorf("work-tree README.md = %q (%v), want the agent edit still in place", data, rerr)
+	}
+	if data, rerr := os.ReadFile(filepath.Join(repo, "agent.txt")); rerr != nil || string(data) != "new agent file\n" {
+		t.Errorf("work-tree agent.txt = %q (%v), want the agent's new file still in place", data, rerr)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != headBefore {
+		t.Errorf("HEAD moved to %s, want it unchanged at %s", got, headBefore)
+	}
+	if out := mustGitOut(t, bare, "for-each-ref", "refs/heads/"+branch); out != "" {
+		t.Errorf("branch %s pushed despite the absent pin: %q", branch, out)
+	}
+}
+
+// TestCommitAndPush_PinnedBase_PushTransportFailure_NamesErrPushFailed mirrors
+// TestCommitAndPush_PushTransportFailureNamesErrPushFailed on the pinned arm:
+// the pin leaves the push tail untouched, so a transport failure still
+// satisfies ErrPushFailed (category C, a resumable checkpoint) and NOT
+// ErrBaseFetchFailed, and the local commit's parent is the pin — the #3621 /
+// #4079 arming precondition sees the pinned base. The RemoteURL is not a
+// repository, so an arm that fetched would fail at the fetch instead.
+func TestCommitAndPush_PinnedBase_PushTransportFailure_NamesErrPushFailed(t *testing.T) {
+	repo, _, headBefore := baseFetchFailureRepo(t)
+	notARepo := t.TempDir()
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         "fishhawk/run-3973/stage-push",
+		CommitMessage:  "held commit",
+		RemoteURL:      notARepo,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  headBefore,
+	})
+	if err == nil {
+		t.Fatal("want a push failure")
+	}
+	if !errors.Is(err, ErrPushFailed) {
+		t.Fatalf("pinned push transport failure must satisfy errors.Is(err, ErrPushFailed): %v", err)
+	}
+	if errors.Is(err, ErrBaseFetchFailed) {
+		t.Errorf("pinned push transport failure must NOT claim ErrBaseFetchFailed: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "gitops: push ") {
+		t.Errorf("the push error text must be unchanged, got %q", err.Error())
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD^"); got != headBefore {
+		t.Errorf("local HEAD^ = %s, want the pin %s", got, headBefore)
+	}
+}
+
+// TestCommitAndPush_PinnedBase_CheckoutFailure_WrapsBaseFetchError mirrors
+// TestCommitAndPush_FreshFetchBase_CheckoutFailure_WrapsBaseFetchError on the
+// pinned arm: the pin exists, the stash succeeds, and `checkout -B <branch>
+// <pin>` then fails on a held branch-ref lock. The arm returns #4079's typed
+// error — Ref is the declared base, the stash commit holding both edits is
+// named, HEAD has not moved, the stash is not popped, and the message carries
+// the `git stash apply <sha>` recovery.
+func TestCommitAndPush_PinnedBase_CheckoutFailure_WrapsBaseFetchError(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const branch = "fishhawk/run-3973/slice-1"
+	lock := filepath.Join(repo, ".git", "refs", "heads", filepath.FromSlash(branch)+".lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  headBefore,
+	})
+	assertBaseFetchError(t, repo, headBefore, "gitops: checkout "+branch+":", "main", err)
+	var bfe *BaseFetchError
+	if errors.As(err, &bfe) && !strings.Contains(err.Error(), "git stash apply "+bfe.StashSHA) {
+		t.Errorf("error %q does not carry the `git stash apply %s` recovery", err.Error(), bfe.StashSHA)
+	}
+}
+
+// TestCommitAndPush_PinnedBase_StashFailure_FailsBeforeCheckout pins the pinned
+// arm's stash-failure branch: the pin exists, `stash --include-untracked`
+// fails, and the arm returns the plain stash error — NOT a BaseFetchError,
+// because nothing was stashed — with HEAD unmoved and nothing pushed.
+func TestCommitAndPush_PinnedBase_StashFailure_FailsBeforeCheckout(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const branch = "fishhawk/run-3973/slice-stash"
+	p := &Pusher{Cmd: failingProbeCmd("stash", "--include-untracked")}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  headBefore,
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "gitops: stash:") {
+		t.Fatalf("CommitAndPush = %v; want the pinned arm's stash error", err)
+	}
+	var bfe *BaseFetchError
+	if errors.As(err, &bfe) || errors.Is(err, ErrBaseFetchFailed) {
+		t.Errorf("a failed stash has no stash to name and must NOT be a BaseFetchError: %v", err)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != headBefore {
+		t.Errorf("HEAD moved to %s, want it unchanged at %s", got, headBefore)
+	}
+	if out := mustGitOut(t, bare, "for-each-ref", "refs/heads/"+branch); out != "" {
+		t.Errorf("branch %s pushed despite the failed stash: %q", branch, out)
+	}
+}
+
+// TestCommitAndPush_PinnedBase_PopConflict_SurfacesErrBaseRebaseConflict pins
+// the pinned arm's reapply-failure branch: when the pin is NOT the commit the
+// edits were made on (here the advanced tip, which edits the agent's line),
+// popStash's unchanged conflict machinery surfaces ErrBaseRebaseConflict and
+// nothing is pushed.
+func TestCommitAndPush_PinnedBase_PopConflict_SurfacesErrBaseRebaseConflict(t *testing.T) {
+	repo, bare, _, advanced := pinnedAdvanceFixture(t)
+	// Make the advanced tip's object local so the pre-stash guard passes.
+	mustGit(t, repo, "fetch", "origin", "main")
+	const branch = "fishhawk/run-3973/slice-conflict"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  advanced,
+	})
+	if !errors.Is(err, ErrBaseRebaseConflict) {
+		t.Fatalf("CommitAndPush = %v; want ErrBaseRebaseConflict from the pinned reapply", err)
+	}
+	if out := mustGitOut(t, bare, "for-each-ref", "refs/heads/"+branch); out != "" {
+		t.Errorf("branch %s pushed on a conflicted pinned pop: %q", branch, out)
+	}
+}
+
+// TestCommitAndPush_PinnedBase_RevParseFailure_FailsClosed pins the pinned
+// arm's post-reapply `rev-parse HEAD` failure: the error names the pinned base
+// read and nothing is pushed. Only the FIRST `rev-parse HEAD` after the stash
+// pop fails, so every earlier probe runs for real.
+func TestCommitAndPush_PinnedBase_RevParseFailure_FailsClosed(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	const branch = "fishhawk/run-3973/slice-revparse"
+	popped, failed := false, false
+	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		joined := strings.Join(args, " ")
+		if joined == "stash pop" {
+			popped = true
+		}
+		if popped && !failed && joined == "rev-parse HEAD" {
+			failed = true
+			return exec.CommandContext(ctx, "sh", "-c", "exit 3")
+		}
+		return exec.CommandContext(ctx, name, args...)
+	}}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		PinnedBaseSHA:  headBefore,
+	})
+	if !failed {
+		t.Fatal("the post-pop rev-parse HEAD was never reached")
+	}
+	if err == nil || !strings.HasPrefix(err.Error(), "gitops: rev-parse pinned base:") {
+		t.Fatalf("CommitAndPush = %v; want the pinned-base rev-parse error", err)
+	}
+	if out := mustGitOut(t, bare, "for-each-ref", "refs/heads/"+branch); out != "" {
+		t.Errorf("branch %s pushed despite the failed pinned-base read: %q", branch, out)
+	}
+}
