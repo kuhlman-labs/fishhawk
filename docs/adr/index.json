@@ -815,7 +815,9 @@
       "supersedes": [
         "ADR-043"
       ],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-092"
+      ],
       "applies_to": []
     },
     {
@@ -824,6 +826,17 @@
       "path": "docs/adr/091-restart-recovery-redispatches-advisory-review-rounds.md",
       "status": "accepted",
       "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-092",
+      "title": "Serialize merge-candidate verify passes per repository, re-anchor a queued pass at admission, and admit passes through a local-verify group (amends ADR-090)",
+      "path": "docs/adr/092-serialize-merge-candidate-verify-passes.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-090"
+      ],
       "superseded_by": [],
       "applies_to": []
     }
