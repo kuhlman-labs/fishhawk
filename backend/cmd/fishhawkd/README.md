@@ -894,3 +894,18 @@ Safe to ship only when that exits `0`. The 30-day run
 is EXPECTED to exit `1` refusing the pre-switch `brett@local-mcp` approvals: that refusal is the
 correct pre-switch result, never something to "fix" by widening `members`, special-casing a
 subject, or skipping the check.
+
+## `reconcile-orphan-children`: backfill decomposition children orphaned before the cancel cascade (#4186)
+
+```sh
+fishhawkd reconcile-orphan-children [--db <url>] [--apply]
+```
+
+Lists every NON-terminal (`pending`/`running`) decomposition child whose parent is `cancelled` or `succeeded` — the rows the pre-#4186 parent cancel left behind — one line each (`child`, `child_state`, `parent`, `parent_state`, `implement_state`, `live`). A `failed` parent is deliberately excluded: `ReviveRun` can re-admit it, and its children are then wanted again. Scans every tenant (no account filter), like the other host-admin subcommands. `--db` falls back to `FISHHAWKD_DATABASE_URL`.
+
+- **Dry run is the default** and writes nothing: it ends with `dry-run: N orphan(s); re-run with --apply to cancel them`.
+- **`--apply`** cancels each orphan through the run state machine and appends one system-actor `decomposition_child_cancelled` row on the child's chain (`reason: parent_terminal`, `cancel_source: orphan_backfill`), deduped per parent, then prints a per-child outcome and `applied: N orphan(s): cancelled=… skipped_terminal=… failed=…`. A second `--apply` finds 0.
+- **Exit codes:** `0` success (including the dry run), `1` a connect or scan failure, or any child that failed to cancel or whose row failed to append, `2` a usage error.
+- **Parent stages settle on the next sweeper tick.** The child-completion sweeper never reads the parent run state, so once `--apply` makes every child of a cancelled parent terminal, the first sweeper tick after it settles each affected parent's `awaiting_children` implement stage `failed`-C with one `children_settled` row (its `Advance` no-ops on the cancelled run). See `backend/internal/childcompletion/README.md`.
+
+Core: `backend/internal/childcancel` (`FindOrphans` + `Reconcile`). Tests: `reconcile_children_test.go` (`TestReconcileOrphanChildren_DryRunThenApply` end to end over pgtest).

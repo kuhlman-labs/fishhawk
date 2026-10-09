@@ -3309,6 +3309,11 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	// on the chain (best-effort, idempotent — the already-cancelled 200
 	// re-enters here and appends nothing new). The 200 body is unchanged.
 	s.recordAcceptanceRetirementsDroppedOnCancel(r.Context(), runID, cancelSourceOperator)
+	// #4186: cancel the run's non-terminal decomposition children BEFORE the
+	// 200, so a caller reading them after the response sees them cancelled.
+	// The already-cancelled re-entry runs it too, converging a child a
+	// transient error left behind. Best-effort; the body is unchanged.
+	s.cascadeCancelToDecomposedChildren(r.Context(), runID, cancelSourceOperator)
 
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
 
