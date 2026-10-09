@@ -5988,6 +5988,32 @@ func withFakeRemoteHasBranch(t *testing.T, exists bool, err error) {
 	t.Cleanup(func() { remoteHasBranch = orig })
 }
 
+// withFakeRemoteHasBranchFunc is the BRANCH-AWARE form of
+// withFakeRemoteHasBranch (#3973): fn answers per queried branch. Since #3973 a
+// decomposed child's base block queries its OWN slice branch before the wave
+// base, so a stub answering true for EVERY branch would model a resumed child
+// whose slice branch pre-exists — not the fresh-child "slice branch absent,
+// wave base present" shape the #1302/#1363 tests pin. Call it AFTER
+// withFakeGitOps.
+func withFakeRemoteHasBranchFunc(t *testing.T, fn func(branch string) (bool, error)) {
+	t.Helper()
+	orig := remoteHasBranch
+	remoteHasBranch = func(_ context.Context, _, _, branch, _ string) (bool, error) { return fn(branch) }
+	t.Cleanup(func() { remoteHasBranch = orig })
+}
+
+// freshChildRemote answers remoteHasBranch for a FRESH decomposed child: its own
+// slice branch (fishhawk/run-<parent>/slice-<n>) is absent, every other branch
+// (the wave base) answers (baseExists, baseErr).
+func freshChildRemote(baseExists bool, baseErr error) func(branch string) (bool, error) {
+	return func(branch string) (bool, error) {
+		if strings.Contains(branch, "/slice-") {
+			return false, nil
+		}
+		return baseExists, baseErr
+	}
+}
+
 // withFakeRemoteConfigured swaps the not-wired-vs-transient discriminator seam
 // (#1363) the wave-base block consults on a remoteHasBranch error. configured ==
 // false models a bare checkout with no origin (GitHub not wired, #1302), so a
@@ -6022,7 +6048,7 @@ func withFakeFetchDiffBaseTip(t *testing.T, fn func(ctx context.Context, repoDir
 func TestRun_ImplementStage_DecomposedChild_SliceZero(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists
+	withFakeRemoteBranchExists(t, false) // a fresh child: its sole-writer slice branch is absent
 
 	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	fu := newFakeUploader(t)
@@ -6111,7 +6137,7 @@ func TestRun_ImplementStage_DecomposedChild_SliceZero(t *testing.T) {
 func TestRun_ImplementStage_DecomposedChild_SliceTwo(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
-	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists
+	withFakeRemoteBranchExists(t, false) // a fresh child: its sole-writer slice branch is absent
 
 	parentRunID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	fu := newFakeUploader(t)
@@ -6327,7 +6353,7 @@ func runDecomposedChildStageWithBase(t *testing.T, stderr *strings.Builder, base
 // Checkout for the base-absent graceful-skip case.
 func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists (resolvePolicyBaseRef routing)
+	withFakeRemoteBranchExists(t, false) // a fresh child: its slice branch is absent (resolvePolicyBaseRef routing)
 	const waveBase = "fishhawk/run-aaaaaaaa/consolidated"
 
 	// Ordered spy: the agent invocation must observe the checkout already
@@ -6346,7 +6372,9 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	withFakeGitOps(t, fp, &fakePROpener{})
 	// Force the wave-base establishment path (remote-authoritative guard,
 	// #1363) AFTER withFakeGitOps, which defaults remoteHasBranch to absent.
-	withFakeRemoteHasBranch(t, true, nil)
+	// Branch-aware (#3973): the child's own slice branch is absent (a fresh
+	// child), the wave base is present.
+	withFakeRemoteHasBranchFunc(t, freshChildRemote(true, nil))
 
 	// The operator's tree sits on main — the exact run-d816e58a shape. Both
 	// restore seams record into restoredRefs: run()'s child defer calls
@@ -6401,6 +6429,10 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 		`"branch":"fishhawk/run-aaaaaaaa/consolidated"`,
 		`"head_sha":"shared-branch-tip-sha"`,
 		`"original_ref":"main"`,
+		`"source":"wave_base"`,
+		// #3973: the established wave-base tip is the stage-lifetime pin.
+		`"event":"base_pinned"`,
+		`"base_sha":"shared-branch-tip-sha"`,
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("missing %s in child_base_established emission:\n%s", want, stderr.String())
@@ -6529,9 +6561,9 @@ func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T
 	fu.promptResp = decomposedChildPromptResp()
 	withFakeUploader(t, fu)
 	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
-	// Wave base present (forced AFTER withFakeGitOps's absent default); the
-	// checkout itself fails below.
-	withFakeRemoteHasBranch(t, true, nil)
+	// Wave base present, own slice branch absent (forced AFTER
+	// withFakeGitOps's absent default); the checkout itself fails below.
+	withFakeRemoteHasBranchFunc(t, freshChildRemote(true, nil))
 
 	var restoredRefs []string
 	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutChildBase
@@ -6590,7 +6622,9 @@ func TestRun_DecomposedChild_RemoteQueryFailure_FailsBeforeAgentInvoke(t *testin
 	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
 	// A transient ls-remote query failure (forced AFTER withFakeGitOps's
 	// absent default) on a child with an expected base — must fail loud.
-	withFakeRemoteHasBranch(t, false, errors.New("ls-remote origin: ssh: connect to host github.com port 22: operation timed out"))
+	// Branch-aware (#3973): the own-slice-branch query succeeds (absent), so
+	// the failure lands on the WAVE-base query this test pins.
+	withFakeRemoteHasBranchFunc(t, freshChildRemote(false, errors.New("ls-remote origin: ssh: connect to host github.com port 22: operation timed out")))
 
 	checkoutCalled := false
 	origCheckout := checkoutChildBase
@@ -14766,10 +14800,11 @@ func TestTouchedPackageArgs(t *testing.T) {
 }
 
 // TestResolvePolicyBaseRef covers base-ref selection under ADR-041 (#1141):
-// standalone, a decomposed child whose sole-writer slice branch is absent (the
-// production invariant — a slice branch is minted once and never pre-exists),
-// and the retained-but-dormant forced-present path. It drives the
-// remoteBranchExists seam.
+// standalone, a FRESH decomposed child whose sole-writer slice branch is absent,
+// and a resumed / retried child whose slice branch is present (#3973: run()'s
+// own-slice-branch checkout writes its tracking ref). It drives the
+// remoteBranchExists seam; TestRun_ChildOwnSliceBranch_PinsSliceTip covers the
+// present case end to end with real git.
 func TestResolvePolicyBaseRef(t *testing.T) {
 	const sharedRunID = "abcdef0123456789"
 	// Under ADR-041 the policy base for a decomposed child keys off the
@@ -14786,8 +14821,8 @@ func TestResolvePolicyBaseRef(t *testing.T) {
 	})
 
 	t.Run("decomposed child (slice branch absent) returns checkBaseRef", func(t *testing.T) {
-		// The ADR-041 production case: a sole-writer slice branch never
-		// pre-exists, so each child's policy diff is bounded against base —
+		// The ADR-041 fresh-child case: the slice branch is absent, so the
+		// child's policy diff is bounded against base —
 		// each slice is an independent increment off base, not a cumulative
 		// fan-out (#765 superseded). The policy_base_decomposition_child
 		// event must NOT fire (no shared-branch tip to bound against).
@@ -14805,10 +14840,9 @@ func TestResolvePolicyBaseRef(t *testing.T) {
 	})
 
 	t.Run("decomposed child (slice branch forced present) returns origin/<slice-branch>", func(t *testing.T) {
-		// Dormant path: a sole-writer slice branch never pre-exists in
-		// production, but if the seam reports it present the retained logic
-		// bounds against origin/<slice-branch> and emits the event — covering
-		// the branch so it stays correct if a future variant re-enables it.
+		// The resumed / retried child (#3973): its slice branch already
+		// exists, so the policy diff is bounded against origin/<slice-branch>
+		// (the #765 increment base, re-enabled) and the event fires.
 		withFakeRemoteBranchExists(t, true)
 		cfg := config{checkBaseRef: "main", decomposedFromRunID: sharedRunID, stageID: "s1"}
 		runSliceIndex = 0
@@ -31650,7 +31684,7 @@ func TestRun_DecomposedChild_DoesNotTakeStandaloneBaseAdvance(t *testing.T) {
 	fp := &fakePusher{}
 	fpr := &fakePROpener{}
 	withFakeGitOps(t, fp, fpr)
-	withFakeRemoteHasBranch(t, true, nil)
+	withFakeRemoteHasBranchFunc(t, freshChildRemote(true, nil))
 
 	var stderr strings.Builder
 	if got := runDecomposedChildStageWithBase(t, &stderr, "fishhawk/run-aaaaaaaa/consolidated"); got != exitOK {
