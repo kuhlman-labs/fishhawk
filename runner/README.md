@@ -586,20 +586,22 @@ Residual: the FIRST agent invocation's `FISHHAWK_API_TOKEN` is still the stage-s
 
 **The blip budget** (`DefaultMaxRetries = 3`, `DefaultBackoff = 500ms`, uncapped
 doubling) is ~3.5s of sleep across 4 attempts. It is what every non-settling
-call uses — `FetchPrompt`, `ShipAcceptance`, `ShipAcceptanceTranscript`,
-`ShipPullRequest`, `FetchMCPToken`, `FetchScopeAmendments`, and the
-single-attempt `ReportStageProgress`. A lost progress tick is cosmetic: the next
-tick supersedes it.
+call uses — `FetchPrompt`, `ShipAcceptanceTranscript`, `ShipPullRequest`,
+`FetchMCPToken`, `FetchScopeAmendments`, and the single-attempt
+`ReportStageProgress`. A lost progress tick is cosmetic: the next tick
+supersedes it. `ShipAcceptanceTranscript` stays here deliberately: it is
+best-effort, and on failure the verdict ships without the transcript ref.
 
 **The terminal-egress budget** (`DefaultTerminalMaxRetries = 8`,
 `DefaultTerminalBackoff = 1s`, `DefaultTerminalBackoffCap = 15s`) is the capped
 doubling series 1,2,4,8,15,15,15,15 = **75s of sleep across 9 attempts**. It is
-used by exactly three methods, the ones that SETTLE a stage's outcome:
+used by exactly four methods, the ones that SETTLE a stage's outcome:
 
 | Method | Why it is terminal |
 |---|---|
 | `ShipTrace` | the stage-completion POST; a lost one leaves the stage `running` forever |
 | `ShipPlan` | the plan stage's settling artifact — without it the gate has nothing to read |
+| `ShipAcceptance` | the acceptance stage's settling verdict ([#4077](https://github.com/kuhlman-labs/fishhawk/issues/4077)) — without it the agent's settled outcome never reaches the backend; it rode the blip budget until #4077 |
 | `ReportRunnerFailure` | the reap-failure channel, the ONLY backstop when the trace POST is itself what failed |
 
 The motivation is a `scripts/dev reload` / `post-merge`: fishhawkd is down for
@@ -610,7 +612,7 @@ restart.
 
 ### One shared phase deadline, not stacked budgets
 
-The three methods do **not** each get their own 75s. They share ONE
+The four methods do **not** each get their own 75s. They share ONE
 terminal-egress phase deadline, `DefaultTerminalEgressBudget = 90s`, armed by
 whichever terminal call OPENS the phase (`terminalEgressPhaseDeadline`) and
 joined by every terminal call after it until the phase is closed. Without that,
@@ -626,8 +628,8 @@ of blocking, once, at egress — not 2 x 75s.**
 The phase is **split**, not extended: `DefaultTerminalEgressReserve = 15s` is a
 tail withheld from the settling uploads and left for the last-word report.
 
-- `settlingEgressContext` (ShipTrace, ShipPlan) → phase deadline **minus** the
-  reserve, so ~75s.
+- `settlingEgressContext` (ShipTrace, ShipPlan, ShipAcceptance) → phase
+  deadline **minus** the reserve, so ~75s.
 - `lastWordEgressContext` (ReportRunnerFailure) → the **full** phase deadline,
   so it spends whatever the settling call left plus the reserve.
 
@@ -672,8 +674,10 @@ condition on #2897 asks for.
 still returns a 4xx after ONE attempt (400/403/409 are terminal answers, and
 retrying a 409 `stage_attempt_superseded` would retry exactly what the anchor
 refuses); `ShipTrace` still stops immediately on 401/404; `ShipPlan` still maps
-400 `plan_invalid` to `ErrPlanInvalid` without retrying. Only the attempt cap,
-the backoff schedule, and the phase deadline changed.
+400 `plan_invalid` to `ErrPlanInvalid` without retrying; `ShipAcceptance` still
+returns 400 (`acceptance_invalid` → `ErrAcceptanceInvalid`), 401, 404 and 413
+(`*AcceptanceBodyTooLargeError`) after ONE attempt. Only the attempt cap, the
+backoff schedule, and the phase deadline changed.
 
 **Per-Client overrides** (`TerminalMaxRetries`, `TerminalBackoff`,
 `TerminalBackoffCap`, `TerminalEgressBudget`, `TerminalEgressReserve`) each mean
@@ -699,7 +703,10 @@ the settling window, a last-word call past the whole phase) go red with
 `context deadline exceeded` if the close is deleted;
 `TestReportRunnerFailure_409_SingleAttempt`; and
 `TestNonTerminalCalls_KeepShortBudget`, the narrowness control proving
-`FetchPrompt` and `ReportStageProgress` were not swept along.
+`FetchPrompt`, `ShipAcceptanceTranscript` and `ReportStageProgress` were not
+swept along. `TestShipAcceptance_TerminalBudget_RidesOutRestartSizedOutage` is
+the #4077 discriminator: reverting `ShipAcceptance` to the blip budget fails it,
+because the outage outlasts `DefaultMaxRetries+1` attempts.
 
 The operator-side half of #2897 — `scripts/dev reload` / `post-merge` refusing
 to tear the stack down while a runner is live — is in `scripts/README.md`.

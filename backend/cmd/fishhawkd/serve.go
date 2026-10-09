@@ -3818,13 +3818,20 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
-	// One-shot startup orphaned-review recovery (#1781). A fishhawkd restart
-	// mid-review kills the detached reviewing goroutine, so no terminal
+	// One-shot startup orphaned-review recovery (#1781, #4077). A fishhawkd
+	// restart mid-review kills the detached reviewing goroutine, so no terminal
 	// *_reviewed/*_review_failed entry lands and review_status stays 'pending'
 	// forever, wedging the plan/implement gate. ReconcileOrphanedReviews
-	// synthesizes the missing terminal *_review_failed entries for any review
-	// dispatched by a prior process, flipping review_status to a terminal
-	// 'failed' the operator can re-trigger. Best-effort — a failure logs at
+	// RE-DISPATCHES each eligible orphaned round (advisory, reviewer wired,
+	// under the re-dispatch depth cap, not superseded, its plan artifact or
+	// diff source recoverable) against the same plan artifact or reviewed head,
+	// auditing review_round_redispatched; the dispatch runs in a bgReviews
+	// goroutine, so this call does not wait on reviewers and the listener is
+	// not delayed. Every other round dispatched by a prior process keeps the
+	// #1781 closure: the missing terminal *_review_failed entries are
+	// synthesized with a reason naming why it was not re-dispatched, flipping
+	// review_status to a terminal 'failed' the operator can re-trigger. The
+	// returned count is the runs so terminated. Best-effort — a failure logs at
 	// warn and never blocks server start. Gated on the audit + run wiring the
 	// pass reads/writes.
 	if srv != nil && cfg.RunRepo != nil && cfg.AuditRepo != nil {

@@ -640,7 +640,11 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 					slog.String("error", geerr.Error()),
 				)
 			}
-			if s.runImplementReviewsForTree(r.Context(), runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence) {
+			// The round source (#4077): a trace round's diff is THIS stage's
+			// uploaded bundle, so a restart-orphaned round is re-dispatched from
+			// the stored bundle. Only the review call carries it.
+			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace})
+			if s.runImplementReviewsForTree(reviewCtx, runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence) {
 				cat := run.FailureB
 				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
@@ -3615,7 +3619,11 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 		// operator reading the verdicts and routing a fix-up. The
 		// implement_review_started/_reviewed round and any concerns attach
 		// to the parent implement stage regardless of authority.
-		s.runImplementReviews(reviewCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
+		//
+		// The round source (#4077) records the compare base so a
+		// restart-orphaned round is re-dispatched as ComparePatch(base, head).
+		srcCtx := withReviewRoundSource(reviewCtx, reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base})
+		s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
 	}()
 }
 
@@ -3816,7 +3824,10 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 		if gateEvidence == nil && reason != "" {
 			gateEvidence = &prompt.GateEvidence{VerifyEvidenceUnavailableReason: reason}
 		}
-		s.runImplementReviews(reviewCtx, runID, stageID, diff, nil, headSHA, gateEvidence)
+		// The round source (#4077) records the compare base so a
+		// restart-orphaned round is re-dispatched as ComparePatch(baseSHA, headSHA).
+		srcCtx := withReviewRoundSource(reviewCtx, reviewRoundSource{Origin: reviewRoundOriginFixupPush, BaseSHA: baseSHA})
+		s.runImplementReviews(srcCtx, runID, stageID, diff, nil, headSHA, gateEvidence)
 	}()
 }
 
@@ -4024,7 +4035,16 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// reviewer is configured, and before persona resolution (the seam E80.5 /
 	// #3762 will consume). Nothing here auto-clears a raised concern, so a
 	// later pass delta that omits an earlier hit can never falsely clear it.
-	_ = s.raiseDiffSecretConcerns(ctx, runID, stageID, diff, headSHA)
+	//
+	// A boot re-dispatch of a restart-orphaned round (#4077) SKIPS it: the check
+	// ran synchronously, here, before the orphaned round's
+	// implement_review_started was appended, and the re-dispatch reviews that
+	// same diff. Only the server-internal re-dispatch marker skips it
+	// (review_round_context.go); every ordinary round runs it.
+	_, redispatch := reviewRedispatchFrom(ctx)
+	if !redispatch {
+		_ = s.raiseDiffSecretConcerns(ctx, runID, stageID, diff, headSHA)
+	}
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
 	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
@@ -4720,8 +4740,14 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// build (#2797): a duplicate dispatch is a silent no-op — no forge read, no
 	// document_injected append, no crew-delivery record and no new failure path
 	// for an already-reviewed stage.
+	//
+	// A boot re-dispatch of a restart-orphaned round (#4077) BYPASSES the guard:
+	// it deliberately reviews the orphaned round's SAME head, which the guard
+	// would otherwise find and suppress. Only the server-internal re-dispatch
+	// marker bypasses it (review_round_context.go) — no request path can carry
+	// that marker, so a retried upload of the same head still dedups.
 	reviewDispatchMu.Lock()
-	if headSHA != "" && s.cfg.AuditRepo != nil {
+	if headSHA != "" && s.cfg.AuditRepo != nil && !redispatch {
 		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
 		if lerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list implement_review_started failed — proceeding with dispatch",

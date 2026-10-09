@@ -2176,10 +2176,16 @@ func TestShipAcceptance_NotFound_404(t *testing.T) {
 	}
 }
 
+// ShipAcceptance rides the TERMINAL-egress budget (#4077), so its attempt cap
+// is TerminalMaxRetries. The blip knob is set BELOW the outage on purpose: a
+// ShipAcceptance on the blip budget would give up after MaxRetries+1 = 2
+// attempts and fail here, so the test discriminates which budget is wired.
 func TestShipAcceptance_RetriesOn5xxThenSucceeds(t *testing.T) {
 	af, srv := newAcceptanceFakeBackend(t)
 	af.errCount = 2
 	c := quickClient(srv)
+	c.MaxRetries = 1
+	c.TerminalMaxRetries = 3
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 
 	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
@@ -2198,11 +2204,15 @@ func TestShipAcceptance_RetriesOn5xxThenSucceeds(t *testing.T) {
 	}
 }
 
+// The exhausted cap is the TERMINAL one (#4077). MaxRetries is set to a
+// DIFFERENT value so a ShipAcceptance still on the blip budget makes
+// MaxRetries+1 = 6 calls instead of 3 and fails the count assertion.
 func TestShipAcceptance_5xxExhaustedIsError(t *testing.T) {
 	af, srv := newAcceptanceFakeBackend(t)
-	af.errCount = 100 // more than MaxRetries+1
+	af.errCount = 100 // more than TerminalMaxRetries+1
 	c := quickClient(srv)
-	c.MaxRetries = 2
+	c.TerminalMaxRetries = 2
+	c.MaxRetries = 5
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 
 	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
@@ -2214,7 +2224,7 @@ func TestShipAcceptance_5xxExhaustedIsError(t *testing.T) {
 		t.Fatalf("err = %v, want exhausted-retries error", err)
 	}
 	if af.calls != 3 {
-		t.Errorf("calls = %d, want 3 (initial + 2 retries)", af.calls)
+		t.Errorf("calls = %d, want 3 (initial + TerminalMaxRetries=2 retries)", af.calls)
 	}
 }
 
@@ -4543,6 +4553,54 @@ func TestReportRunnerFailure_TerminalBudget_RidesOutRestartSizedOutage(t *testin
 	}
 }
 
+// TestShipAcceptance_TerminalBudget_RidesOutRestartSizedOutage is the #4077
+// discriminator: the acceptance verdict is the acceptance stage's SETTLING
+// upload, so a fishhawkd restart mid-upload must be ridden out. The outage is
+// DefaultMaxRetries+2 consecutive 503s — derived from the blip cap, so it
+// outlasts the blip budget's DefaultMaxRetries+1 attempts by construction —
+// then a 201, on the DEFAULT attempt caps (only the sleeps are shrunk). Revert
+// ShipAcceptance to retryPolicy() and it exhausts after DefaultMaxRetries+1
+// requests and fails.
+func TestShipAcceptance_TerminalBudget_RidesOutRestartSizedOutage(t *testing.T) {
+	failFor := DefaultMaxRetries + 2
+	if failFor+1 > DefaultTerminalMaxRetries+1 {
+		t.Fatalf("fixture outage (%d failures) outlasts the terminal budget (%d attempts) too", failFor, DefaultTerminalMaxRetries+1)
+	}
+	o, srv := newOutageServer(t, failFor, http.StatusCreated,
+		`{"id":"a1","stage_id":"s","content_hash":"abc","verdict":"passed","idempotent":false}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	// Shrink only the SLEEPS of BOTH budgets; the attempt caps stay the shipped
+	// defaults, so the test measures the default budget and a blip-budget
+	// regression fails fast rather than sleeping its ~3.5s.
+	c.Backoff = time.Millisecond
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "r", StageID: "s", Body: []byte(`{"verdict":"passed"}`), PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptance should have ridden out a restart-sized outage: %v (after %d requests)", err, o.count())
+	}
+	if res.Verdict != "passed" {
+		t.Errorf("verdict = %q, want passed", res.Verdict)
+	}
+	if got, want := o.count(), failFor+1; got != want {
+		t.Errorf("requests = %d, want %d", got, want)
+	}
+	// The landed verdict CLOSES the terminal-egress phase, so the ShipTrace that
+	// follows later in the acceptance stage opens a fresh one instead of
+	// inheriting this outage's (possibly spent) deadline.
+	if armed := c.terminalEgressDeadline.Load(); armed != 0 {
+		t.Errorf("terminalEgressDeadline = %d after a successful ShipAcceptance, want 0 (phase closed)", armed)
+	}
+}
+
 // TestTerminalRetryPolicy_DefaultBudgetExceedsRestartWindow is the done-means
 // test for the CONSTANT VALUES: a quiet shrink of any of the three goes red
 // here without the test sleeping at all.
@@ -4749,6 +4807,79 @@ func TestTerminalEgress_ShipTraceAndReportRunnerFailureShareOneDeadline(t *testi
 	}
 }
 
+// TestTerminalEgress_ShipAcceptanceAndReportRunnerFailureShareOneDeadline pins
+// the SETTLING context #4077 wired into ShipAcceptance: against a persistent
+// outage whose retry budget (40 x 100ms = 4s) far outlasts the phase, the
+// DEADLINE — phase minus reserve — is what stops ShipAcceptance, and the
+// last-word report the runner sends next (reportTerminalRunnerFailure) still
+// gets the reserve. Four discriminators:
+//
+//	(1) ShipAcceptance fails with context.DeadlineExceeded, not "exhausted
+//	    retries" — without settlingEgressContext nothing bounds the attempts
+//	    and it spends its whole attempt cap.
+//	(2) total blocking < the combined bound (one shared phase, not stacked).
+//	(3) the last-word report got a REAL attempt — run ShipAcceptance on the
+//	    FULL phase (lastWordEgressContext) and it hands the fallback an
+//	    already-expired context: zero requests.
+//	(4) the fallback made strictly fewer requests than ShipAcceptance, since it
+//	    had only the reserve.
+func TestTerminalEgress_ShipAcceptanceAndReportRunnerFailureShareOneDeadline(t *testing.T) {
+	const (
+		phaseBudget = 1500 * time.Millisecond
+		reserve     = 400 * time.Millisecond
+		perSleep    = 100 * time.Millisecond
+		attemptCap  = 40 // 4s of sleep: far more than the phase, so the DEADLINE stops each call
+	)
+	o, srv := newOutageServer(t, 1<<30, http.StatusOK, `{}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	c.TerminalMaxRetries = attemptCap
+	c.TerminalBackoff = perSleep
+	c.TerminalBackoffCap = perSleep
+	c.TerminalEgressBudget = phaseBudget
+	c.TerminalEgressReserve = reserve
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, accErr := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "r", StageID: "s", Body: []byte(`{"verdict":"passed"}`), PrivateKey: priv,
+	})
+	accHits := o.count()
+	if err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+		Reason: "acceptance_upload", StageAttempt: "a",
+	}); err == nil {
+		t.Fatal("ReportRunnerFailure must fail against a persistent outage")
+	}
+	elapsed := time.Since(start)
+	reapHits := o.count() - accHits
+
+	// (1) The settling deadline, not the attempt cap, stopped ShipAcceptance.
+	if !errors.Is(accErr, context.DeadlineExceeded) {
+		t.Errorf("ShipAcceptance err = %v after %d requests, want context.DeadlineExceeded — "+
+			"the settling phase deadline must bound it, not its attempt cap", accErr, accHits)
+	}
+	// (2) The combined bound (slack absorbs request + scheduling time).
+	const combinedBound = 2500 * time.Millisecond
+	if elapsed >= combinedBound {
+		t.Errorf("combined terminal-egress blocking = %v, want < %v (one shared %v phase)",
+			elapsed, combinedBound, phaseBudget)
+	}
+	// (3) The reserve survived for the last-word report.
+	if reapHits < 1 {
+		t.Errorf("ReportRunnerFailure made %d requests; want >= 1 — ShipAcceptance must not spend the reserve", reapHits)
+	}
+	// (4) A ratio, so a loaded host cannot flip it.
+	if accHits < 2 || reapHits >= accHits {
+		t.Errorf("ShipAcceptance made %d requests and ReportRunnerFailure %d; want ShipAcceptance >= 2 and "+
+			"the fallback strictly fewer (it had only the %v reserve)", accHits, reapHits, reserve)
+	}
+}
+
 // TestTerminalEgressPhase_ReopensAfterASuccessfulUpload pins the phase
 // LIFECYCLE, the half a shared deadline alone does not give: the phase is
 // closed by a terminal call that SUCCEEDS, so a later terminal call opens a
@@ -4845,9 +4976,11 @@ func TestTerminalEgressPhase_ReopensAfterASuccessfulUpload(t *testing.T) {
 }
 
 // TestNonTerminalCalls_KeepShortBudget is the narrowness control: #2897 moved
-// exactly three methods onto the terminal budget, and a global change would
-// make every progress tick block for ~75s. FetchPrompt must still give up on
-// the SHORT budget and ReportStageProgress must still be single-attempt.
+// exactly three methods onto the terminal budget and #4077 a fourth
+// (ShipAcceptance), and a global change would make every progress tick block
+// for ~75s. FetchPrompt and the best-effort ShipAcceptanceTranscript must still
+// give up on the SHORT budget and ReportStageProgress must still be
+// single-attempt.
 func TestNonTerminalCalls_KeepShortBudget(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -4867,6 +5000,25 @@ func TestNonTerminalCalls_KeepShortBudget(t *testing.T) {
 		}
 		if o.count() >= DefaultTerminalMaxRetries+1 {
 			t.Errorf("FetchPrompt reached the terminal attempt cap (%d requests) — the change is not narrow", o.count())
+		}
+	})
+
+	t.Run("ShipAcceptanceTranscript", func(t *testing.T) {
+		// Best-effort (#3329): on failure the verdict ships without the ref, so
+		// #4077 deliberately left it on the blip budget beside ShipAcceptance.
+		o, srv := newOutageServer(t, 1<<30, http.StatusCreated, `{}`)
+		c := New(srv.URL)
+		c.HTTP = srv.Client()
+		c.Backoff = time.Millisecond
+		c.TerminalBackoff = time.Millisecond
+		c.TerminalBackoffCap = time.Millisecond
+		if _, err := c.ShipAcceptanceTranscript(context.Background(), ShipAcceptanceTranscriptArgs{
+			RunID: "r", StageID: "s", Body: []byte(`{}`), PrivateKey: priv,
+		}); err == nil {
+			t.Fatal("ShipAcceptanceTranscript must fail against a persistent outage")
+		}
+		if got, want := o.count(), DefaultMaxRetries+1; got != want {
+			t.Errorf("requests = %d, want %d (the SHORT blip budget, unchanged by #4077)", got, want)
 		}
 	})
 

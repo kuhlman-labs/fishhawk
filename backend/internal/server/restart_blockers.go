@@ -13,9 +13,10 @@ import (
 // work right now? It is a read-only PROJECTION of already-recorded state — it
 // writes nothing and mints no audit entry — and reuses the orphaned-review
 // boot sweep's own round tally (latestReviewStarted /
-// countLandedReviewTerminals in review_reconcile.go) rather than re-deriving
-// the in-flight predicate. Long-form contract: backend/internal/server/README.md
-// § "Restart blockers".
+// countLandedReviewTerminals in review_reconcile.go) and its re-dispatch
+// predicate (redispatchEligibility in review_redispatch.go, E72.59 / #4077)
+// rather than re-deriving either. Long-form contract:
+// backend/internal/server/README.md § "Restart blockers".
 
 // restartBlockersRunScanLimit bounds the non-terminal runs scanned per
 // request (pending + running combined). A bite sets truncated=true.
@@ -28,9 +29,12 @@ const (
 	// restartBlockerUndispatchedChild: a decomposition child whose implement
 	// stage is still pending / awaiting_host_dispatch.
 	restartBlockerUndispatchedChild = "undispatched_child"
-	// restartBlockerReviewInFlight: a plan/implement review round dispatched
-	// by THIS process with fewer landed verdicts than configured reviewers —
-	// the in-process reviewing goroutine dies with the daemon.
+	// restartBlockerReviewInFlight: an unsettled plan/implement review round a
+	// restart would LOSE — one dispatched by THIS process that the next boot
+	// sweep would NOT re-dispatch (redispatchEligibility says no), or an
+	// orphaned round this process's boot sweep has handed to a re-dispatch
+	// that has not settled yet (#4077). An eligible current-process round is
+	// not a blocker: the next boot re-dispatches it.
 	restartBlockerReviewInFlight = "review_in_flight"
 	// restartBlockerCheckFailed: a per-run stage or audit read failed, so the
 	// daemon could not decide that run's state. scripts/dev treats it as a
@@ -184,11 +188,11 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run) []restartB
 		}
 	}
 
-	// (b) Review round in flight in THIS process. The round tally is the
+	// (b) Review round a restart would lose. The round tally is the
 	// orphaned-review reconcile's own (latest started round, verdicts landed
-	// strictly after it). A round dispatched BEFORE this process booted is
-	// not a blocker: its goroutine is already dead and the next boot sweep
-	// (#1781 / #2712) closes it, so a restart loses nothing more.
+	// strictly after it), and the re-dispatch decision is the boot sweep's
+	// own redispatchEligibility, so this surface and the boot sweep cannot
+	// disagree about which rounds survive a restart (#4077).
 	for _, stage := range orphanedReviewStages {
 		latest, payload, found, err := s.latestReviewStarted(ctx, ru.ID, stage)
 		if err != nil {
@@ -208,17 +212,41 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run) []restartB
 		if landed >= payload.ConfiguredAgents {
 			continue
 		}
-		if latest.Timestamp.Before(s.processStart) {
-			continue
-		}
 		configured := payload.ConfiguredAgents
-		out = append(out, restartBlocker{
+		inFlight := restartBlocker{
 			RunID:            runID,
 			Reason:           restartBlockerReviewInFlight,
 			Stage:            stage.label,
 			ConfiguredAgents: &configured,
 			Landed:           &landed,
-		})
+		}
+		// A boot re-dispatch mid-handoff: the orphaned round predates this
+		// process, so it is checked BEFORE the boot-marker skip. A restart
+		// kills the re-dispatch goroutine, and the next boot finds the round
+		// already named by its review_round_redispatched entry, so it closes
+		// the round failed instead of re-dispatching it again.
+		if reviewRedispatchPending(ru.ID, stage.label, latest.Sequence) {
+			out = append(out, inFlight)
+			continue
+		}
+		// A round dispatched BEFORE this process booted is not a blocker: its
+		// goroutine is already dead and this process's boot sweep either
+		// re-dispatched it (the pending check above) or closed it, so a
+		// restart loses nothing more.
+		if latest.Timestamp.Before(s.processStart) {
+			continue
+		}
+		eligible, _, err := s.redispatchEligibility(ctx, ru.ID, stage, latest, payload)
+		if err != nil {
+			out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: stage.label})
+			continue
+		}
+		// The next boot sweep re-dispatches an eligible round against the
+		// same plan or head, so a restart loses nothing.
+		if eligible {
+			continue
+		}
+		out = append(out, inFlight)
 	}
 	return out
 }

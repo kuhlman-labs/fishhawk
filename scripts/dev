@@ -3173,16 +3173,23 @@ _refuse_on_live_runs() {
 #
 # The #2897 guard above protects a live RUNNER process. Two hazards have no
 # runner process at all and live inside fishhawkd itself: a decomposition child
-# whose implement stage is not dispatched yet (a restart mid-fan-out strands
-# it), and a plan/implement review round the SERVING daemon dispatched that has
-# no verdict yet (the in-process reviewer dies with the daemon). The daemon
-# owns both predicates, so the guard asks it: GET /v0/restart-blockers returns
-# a flat list of {run_id, reason, stage, parent_run_id?, ...} items with no
-# free text. Three functions, kept separately callable so #4077's relaxed
-# `reload --when-quiet` can reuse the query without the refusal:
+# whose implement stage is not dispatched yet, and a plan/implement review
+# round a restart would LOSE (a current-process round the next boot would not
+# re-dispatch, or a boot re-dispatch still settling — #4077). The daemon owns
+# both predicates, so the guard asks it: GET /v0/restart-blockers returns a
+# flat list of {run_id, reason, stage, parent_run_id?, ...} items with no free
+# text.
+#
+# The child hazard is POST-MERGE's: its `git pull` moves main under a child not
+# yet dispatched, whose dispatch then fails working_dir_diverged_from_base. A
+# plain reload pulls nothing, so the guard takes a CONTEXT (post-merge, the
+# strict default, or reload) and the reload context ignores undispatched_child.
+# Four functions, kept separately callable so `reload --when-quiet` (#4077)
+# reuses the query without the refusal:
 #   _parse_restart_blockers    PURE: body -> records
 #   _fetch_restart_blockers    IMPURE: the GET
 #   _refuse_on_restart_blockers  the CONTROL
+#   _reload_wait_until_quiet   the bounded --when-quiet wait
 # Long-form contract: scripts/README.md § "Restart-blocker guard".
 # ---------------------------------------------------------------------------
 
@@ -3273,8 +3280,11 @@ _fetch_restart_blockers() {
   return 0
 }
 
-# The control. Args: <force 0|1> [url]
+# The control. Args: <force 0|1> [url] [context reload|post-merge]
 #   no blocker                 -> SILENT, return 0
+#   context reload             -> undispatched_child records are IGNORED (a
+#                                 reload pulls nothing, so it cannot strand a
+#                                 child); any other context is post-merge
 #   blockers + force=0         -> refusal naming each run + reason on stderr, return 1
 #   blockers + force=1         -> the same inventory as a WARNING, return 0
 #   unreachable / curl absent  -> one-line reason, return 0 (fail-open)
@@ -3294,6 +3304,7 @@ _fetch_restart_blockers() {
 _refuse_on_restart_blockers() {
   local force="${1:-0}"
   local url="${2:-}"
+  local context="${3:-post-merge}"
   local body="" records="" rc=0 prc=0
   body="$(_fetch_restart_blockers "$url")" || rc=$?
   if (( rc == 4 )); then
@@ -3320,11 +3331,12 @@ _refuse_on_restart_blockers() {
   local b_run b_reason b_stage b_parent entry
   while IFS=$'\t' read -r b_run b_reason b_stage b_parent; do
     if [[ -z "$b_run" ]]; then continue; fi
+    if [[ "$context" == reload && "$b_reason" == undispatched_child ]]; then continue; fi
     case "$b_reason" in
       undispatched_child)
         blockers+=("run ${b_run}: decomposition child of ${b_parent:-?} whose ${b_stage} stage is not dispatched yet (undispatched_child)") ;;
       review_in_flight)
-        blockers+=("run ${b_run}: ${b_stage} review round dispatched by this daemon has no verdict yet (review_in_flight)") ;;
+        blockers+=("run ${b_run}: ${b_stage} review round a restart would lose — the next boot would not re-dispatch it, or its boot re-dispatch has not settled (review_in_flight)") ;;
       check_failed)
         blockers+=("run ${b_run}: fishhawkd could not decide this run's ${b_stage} state — a stage or audit read failed (check_failed)") ;;
       *)
@@ -3344,15 +3356,117 @@ _refuse_on_restart_blockers() {
   for entry in "${blockers[@]}"; do
     print -u2 "  ${entry}"
   done
-  print -u2 "  what --force breaks: an undispatched decomposition child is stranded mid-fan-out, and an in-flight"
-  print -u2 "  review round's reviewer dies with the daemon, so its verdict never lands (the next boot sweep records"
-  print -u2 "  it failed and the review must be re-run); an undecided run may be either."
+  print -u2 "  what --force breaks: pulling main under an undispatched decomposition child makes its dispatch fail"
+  print -u2 "  working_dir_diverged_from_base (post-merge only), and a listed review round's reviewer dies with the"
+  print -u2 "  daemon and the next boot records it failed instead of re-dispatching it (an advisory round the next"
+  print -u2 "  boot re-dispatches is never listed); an undecided run may be either."
   if (( force )); then
     print -u2 "  proceeding anyway because --force was given."
     return 0
   fi
-  print -u2 "  dispatch the children / let the review rounds settle, or re-run with --force to restart anyway."
+  if [[ "$context" == reload ]]; then
+    print -u2 "  let the review rounds settle (reload --when-quiet waits for them), or re-run with --force to restart anyway."
+  else
+    print -u2 "  dispatch the children / let the review rounds settle, or re-run with --force to restart anyway."
+  fi
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# reload --when-quiet (E72.59 / #4077)
+#
+# A bounded wait until a restart would orphan nothing: no live fishhawk-runner
+# (_scan_live_runs) and no RELOAD-relevant restart blocker (the query half of
+# the guard above, with undispatched_child ignored as in the reload context).
+# Every "could not ask" mode counts as quiet — ps or curl unavailable, daemon
+# unreachable, a non-200 (404 = old daemon), a malformed body — because the
+# normal guards run right after the wait and print their own one-line degrade
+# reason. Knobs: FISHHAWK_RELOAD_QUIET_INTERVAL (seconds between polls, default
+# 15) and FISHHAWK_RELOAD_QUIET_TIMEOUT (seconds before giving up, default
+# 3600), each a positive integer. Long-form: scripts/README.md.
+# ---------------------------------------------------------------------------
+
+# The one sleep the wait performs, a separate function so scripts/test-dev can
+# stub it and drive many polls instantly.
+_reload_quiet_sleep() {
+  sleep "$1"
+}
+
+# Validates the two knobs. Prints a usage error naming the bad one and returns
+# 1; returns 0 when both are positive integers.
+_reload_quiet_knobs_valid() {
+  local interval="$1" timeout="$2"
+  if [[ "$interval" != <-> ]] || (( interval <= 0 )); then
+    print -u2 "usage: FISHHAWK_RELOAD_QUIET_INTERVAL must be a positive integer number of seconds (got '${interval}')"
+    return 1
+  fi
+  if [[ "$timeout" != <-> ]] || (( timeout <= 0 )); then
+    print -u2 "usage: FISHHAWK_RELOAD_QUIET_TIMEOUT must be a positive integer number of seconds (got '${timeout}')"
+    return 1
+  fi
+  return 0
+}
+
+# One poll. Args: [url]. Returns 0 when quiet; returns 1 and prints what is
+# still live (one comma-joined line) otherwise.
+_reload_quiet_check() {
+  local url="${1:-}"
+  local -a live
+  live=()
+  local scan="" rc=0 pid run_id
+  scan="$(_scan_live_runs)" || rc=$?
+  if (( rc == 0 )); then
+    while IFS=$'\t' read -r pid run_id; do
+      if [[ -z "$pid" ]]; then continue; fi
+      if [[ -n "$run_id" ]]; then
+        live+=("runner for run ${run_id}")
+      else
+        live+=("runner pid ${pid}")
+      fi
+    done <<< "$scan"
+  fi
+  local body="" brc=0 records="" prc=0 b_run b_reason b_stage b_parent
+  body="$(_fetch_restart_blockers "$url")" || brc=$?
+  if (( brc == 0 )); then
+    records="$(print -r -- "$body" | _parse_restart_blockers)" || prc=$?
+    if (( prc == 0 )); then
+      while IFS=$'\t' read -r b_run b_reason b_stage b_parent; do
+        if [[ -z "$b_run" ]]; then continue; fi
+        if [[ "$b_reason" == undispatched_child ]]; then continue; fi
+        live+=("${b_reason} on run ${b_run} (${b_stage})")
+      done <<< "$records"
+    fi
+  fi
+  if (( ${#live} == 0 )); then
+    return 0
+  fi
+  print -r -- "${(j:, :)live}"
+  return 1
+}
+
+# The wait. Args: <interval> <timeout> [url]. Returns 0 once a poll is quiet
+# (the first poll included, with no output); prints one `waiting on: …` line
+# per live poll; returns 1 after <timeout> seconds of waiting, naming what is
+# still live. Call it in a TESTED context (`if ! _reload_wait_until_quiet …`).
+_reload_wait_until_quiet() {
+  local interval="$1" timeout="$2" url="${3:-}"
+  local waited=0 step=0 what="" qrc=0
+  while true; do
+    qrc=0
+    what="$(_reload_quiet_check "$url")" || qrc=$?
+    if (( qrc == 0 )); then
+      return 0
+    fi
+    if (( waited >= timeout )); then
+      print -u2 "error: reload --when-quiet gave up after ${waited}s (FISHHAWK_RELOAD_QUIET_TIMEOUT=${timeout}) — still live: ${what}"
+      return 1
+    fi
+    print -u2 "reload --when-quiet: waiting on: ${what} (${waited}s of ${timeout}s)"
+    step=$interval
+    if (( timeout - waited < step )); then step=$(( timeout - waited )); fi
+    _reload_quiet_sleep "$step"
+    waited=$(( waited + step ))
+  done
 }
 
 # One-step post-merge command: stop fishhawkd (if running), rebuild ALL four
@@ -3364,13 +3478,16 @@ _refuse_on_restart_blockers() {
 # reconnect banner is decoupled from the rebuild: it consults the merge-aware
 # diff (HEAD@{1}..HEAD), so a full rebuild does not false-nag a reconnect.
 # Extra flags (--start-deps, a redundant --all) forward to cmd_up unchanged.
+# --when-quiet (#4077) waits, bounded, for the guards to clear instead of
+# refusing; it is mutually exclusive with --force.
 cmd_reload() {
   print "reload: starting"
 
-  # --force is THIS command's flag and is STRIPPED from what is forwarded:
-  # cmd_up scans for --all/--start-deps and has no meaning for --force, so
-  # carrying it through would hand cmd_up an argument it cannot interpret.
-  local arg force=0
+  # --force and --when-quiet are THIS command's flags and are STRIPPED from
+  # what is forwarded: cmd_up scans for --all/--start-deps and has no meaning
+  # for either, so carrying them through would hand cmd_up an argument it
+  # cannot interpret.
+  local arg force=0 when_quiet=0
   local -a fwd
   fwd=()
   for arg in "$@"; do
@@ -3378,8 +3495,30 @@ cmd_reload() {
       force=1
       continue
     fi
+    if [[ "$arg" == "--when-quiet" ]]; then
+      when_quiet=1
+      continue
+    fi
     fwd+=("$arg")
   done
+
+  # --when-quiet: usage checks BEFORE any check or teardown (exit 2), then the
+  # bounded wait. Once quiet it falls through to the normal guards below — a
+  # cheap re-check that narrows (never closes) the scan-to-teardown window.
+  if (( when_quiet )); then
+    if (( force )); then
+      print -u2 "usage: scripts/dev reload: --when-quiet and --force are mutually exclusive (--when-quiet waits for the guards to clear; --force overrides them)"
+      exit 2
+    fi
+    local q_interval="${FISHHAWK_RELOAD_QUIET_INTERVAL:-15}"
+    local q_timeout="${FISHHAWK_RELOAD_QUIET_TIMEOUT:-3600}"
+    if ! _reload_quiet_knobs_valid "$q_interval" "$q_timeout"; then
+      exit 2
+    fi
+    if ! _reload_wait_until_quiet "$q_interval" "$q_timeout"; then
+      exit 1
+    fi
+  fi
 
   # Live-run guard (#2897) BEFORE any teardown, so the refusal is structurally
   # ahead of the stop. Tested context: a deliberate refusal must not fire the
@@ -3388,9 +3527,10 @@ cmd_reload() {
     exit 1
   fi
   # Restart-blocker guard (E83.30 / #3974), also BEFORE any teardown: the
-  # daemon-side hazards (an undispatched decomposition child, an in-process
-  # review round) that no runner-process scan can see.
-  if ! _refuse_on_restart_blockers "$force"; then
+  # daemon-side hazard no runner-process scan can see — a review round a
+  # restart would lose. The RELOAD context ignores undispatched_child (#4077):
+  # that hazard is post-merge's git pull, which reload never performs.
+  if ! _refuse_on_restart_blockers "$force" "" reload; then
     exit 1
   fi
 
@@ -3425,10 +3565,12 @@ cmd_post_merge() {
   if ! _refuse_on_live_runs "$pm_force"; then
     exit 1
   fi
-  # Restart-blocker guard (E83.30 / #3974), likewise before any git step.
-  # cmd_reload re-asks after the pull (a blocker appearing in between refuses
-  # THERE, with main already pulled — the TOCTOU residual).
-  if ! _refuse_on_restart_blockers "$pm_force"; then
+  # Restart-blocker guard (E83.30 / #3974), likewise before any git step, in
+  # the strict POST-MERGE context: it refuses on undispatched_child too,
+  # because the pull below is what strands such a child. cmd_reload re-asks
+  # after the pull in the reload context (a review blocker appearing in
+  # between refuses THERE, with main already pulled — the TOCTOU residual).
+  if ! _refuse_on_restart_blockers "$pm_force" "" post-merge; then
     exit 1
   fi
 
@@ -5009,7 +5151,7 @@ cmd_sweep() {
 }
 
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps] [--force]|post-merge [<issue>] [--start-deps] [--force]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|gocache [--trim] [--dry-run]|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps] [--force|--when-quiet]|post-merge [<issue>] [--start-deps] [--force]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|gocache [--trim] [--dry-run]|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  sweep removes merged-clean operator worktrees under .claude/worktrees"
   print -u2 "  (never a dirty one, never the current worktree) and prunes aged run/tmp"
@@ -5034,9 +5176,12 @@ _usage() {
   print -u2 "  reload and post-merge REFUSE while any fishhawk-runner process is live"
   print -u2 "  (#2897): restarting fishhawkd under a mid-stage runner can strand its"
   print -u2 "  stage in 'running'. They also REFUSE while fishhawkd reports a restart"
-  print -u2 "  blocker (#3974): an undispatched decomposition child, a review round in"
-  print -u2 "  flight in the serving daemon, or a run it could not decide. Pass --force"
-  print -u2 "  to tear down anyway."
+  print -u2 "  blocker (#3974): a review round a restart would lose (one the next boot"
+  print -u2 "  would not re-dispatch, #4077) or a run it could not decide; post-merge"
+  print -u2 "  also refuses on an undispatched decomposition child, which its git pull"
+  print -u2 "  would strand. Pass --force to tear down anyway, or reload --when-quiet"
+  print -u2 "  to wait until nothing is live (FISHHAWK_RELOAD_QUIET_INTERVAL, default"
+  print -u2 "  15 s; FISHHAWK_RELOAD_QUIET_TIMEOUT, default 3600 s; exit 1 on timeout)."
   print -u2 ""
   print -u2 "  preview builds fishhawkd from <sha-or-ref> (default \$FISHHAWK_PREVIEW_SHA) in"
   print -u2 "  a detached worktree, serves it on FISHHAWK_PREVIEW_ADDR (default"
