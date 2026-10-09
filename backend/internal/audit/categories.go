@@ -453,6 +453,7 @@ var KnownCategories = map[string]struct{}{
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
 	"merge_verdict_recorded":                  {},
+	"merge_candidate_verified":                {}, // E83.33 / #4018 (ADR-090): the result of a runner verify-only merge-candidate pass, bound to EXACTLY one head SHA; CONSUMES its trigger (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},
@@ -564,6 +565,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_concurrency_queued":                {},
 	"stage_conflict_resolution_failed":        {},
 	"stage_conflict_resolution_triggered":     {},
+	"stage_merge_candidate_verify_triggered":  {}, // E83.33 / #4018 (ADR-090): the durable trigger that re-opens the implement stage for a verify-only merge-candidate pass; never reads or spends the fix-up budget (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},

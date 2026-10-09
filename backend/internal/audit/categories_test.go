@@ -735,3 +735,22 @@ func TestKnownCategories_RunReviveOnReopenRefused(t *testing.T) {
 		t.Fatal("run_revive_on_reopen_refused is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_MergeCandidateVerify pins the two E83.33 / #4018
+// (ADR-090) categories the merge-candidate verify pass writes
+// (server/merge_candidate_verify.go): the durable trigger that re-opens the
+// implement stage for a verify-only pass, and the head-bound result that
+// consumes it. The merge gate and the decomposed-parent hold both await them,
+// so an unregistered category would make every such wait unsatisfiable.
+//
+// Counterfactual: delete either map entry — this test goes RED.
+func TestKnownCategories_MergeCandidateVerify(t *testing.T) {
+	for _, c := range []string{
+		"stage_merge_candidate_verify_triggered",
+		"merge_candidate_verified",
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}
