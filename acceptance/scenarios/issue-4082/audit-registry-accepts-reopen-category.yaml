@@ -1,0 +1,14 @@
+id: scenario:issue-4082/audit-registry-accepts-reopen-category
+statement: 'The audit endpoint accepts the new reopen-revive category: a filtered audit read for run_revived_on_reopen returns 200 instead of the 400 validation_failed it returns for an unknown category.'
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=run_revived_on_reopen returns 200 (compare: an unregistered category returns 400 validation_failed).'
+steps: GET /v0/runs?limit=1 -> a run id. GET /v0/runs/{run}/audit?category=run_revived_on_reopen; control GET /v0/runs/{run}/audit?category=not_a_real_category_xyz.
+assertions:
+    expected: 200 for the new category, 400 validation_failed for an unknown one
+    observed_at_record: run_revived_on_reopen -> 200 {"items":[],"next_cursor":""}; control -> 400 validation_failed 'category is not a known audit category'
+    repro_handle: GET /v0/runs/{run}/audit?category=run_revived_on_reopen
+origin:
+    issue: 4082
+    pr: 0
+    run_id: bb368904-e9a4-478e-943b-de55bb011323
+    head_sha: c1f194204f18a62b9711fc20111dfb944ba3948c
+    recorded_at: 2026-10-09T12:06:44Z
