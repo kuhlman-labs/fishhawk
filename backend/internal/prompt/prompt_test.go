@@ -15411,6 +15411,136 @@ func TestReviewGroundingFlag_AbsentFromGroundedRenders(t *testing.T) {
 	}
 }
 
+// --- ungrounded reason: switch-off vs enabled-but-unavailable (#4066) ---
+
+// ungroundedReasonReview builds a review prompt of kind with no tree and the
+// given ReviewUngroundedReason.
+func ungroundedReasonReview(t *testing.T, kind, reason string) string {
+	t.Helper()
+	got, err := Build(kind, Trigger{
+		Repo:                   "kuhlman-labs/example",
+		IssueNumber:            4066,
+		IssueTitle:             "grounding degrades on decomposed parents",
+		ApprovedPlan:           fixturePlan(),
+		Diff:                   "- M pkg/bar/bar.go\n",
+		ReviewUngroundedReason: reason,
+	})
+	if err != nil {
+		t.Fatalf("Build(%s): %v", kind, err)
+	}
+	return got
+}
+
+const (
+	// switchOffRepoAccessText is the pre-#4066 switch-off sentence.
+	switchOffRepoAccessText = "This is a DEPLOYMENT setting, not a product limit"
+	// enabledRepoAccessText opens the enabled-but-unavailable sentence.
+	enabledRepoAccessText = "Review grounding IS ENABLED on this deployment, so do not recommend enabling it; the tree for this review could not be provided: "
+)
+
+// TestReviewUngroundedReason_RepoAccessVariants is the reason table over BOTH
+// review renders: "" and "disabled" render the switch-off text naming the env
+// var (the untouched goldens prove the zero value is byte-identical); every
+// other reason renders its own phrase in the enabled variant and the render
+// never names FISHHAWKD_REVIEW_GROUNDING; an unknown reason renders the
+// generic enabled phrase, never the switch text.
+func TestReviewUngroundedReason_RepoAccessVariants(t *testing.T) {
+	cases := map[string]string{
+		"":                                   "",
+		ReviewUngroundedDisabled:             "",
+		ReviewUngroundedNoWorkingDir:         "this run has no local checkout on the review host to export",
+		ReviewUngroundedNoRef:                "no resolved commit was available to export",
+		ReviewUngroundedReviewerCannotGround: "a reviewer on this round cannot read an exported tree, so this review runs without one",
+		ReviewUngroundedRefUnavailable:       "the reviewed commit is not present locally and could not be fetched from origin",
+		ReviewUngroundedExportFailed:         "exporting the tree failed on the review host",
+		"some_future_reason":                 reviewUngroundedGenericPhrase,
+	}
+	for _, kind := range []string{"plan_review", "implement_review"} {
+		for reason, phrase := range cases {
+			t.Run(kind+"/"+reason, func(t *testing.T) {
+				got := ungroundedReasonReview(t, kind, reason)
+				if !strings.Contains(got, "it is DIFF-ONLY") {
+					t.Errorf("ungrounded render must stay DIFF-ONLY\n---\n%s", got)
+				}
+				if phrase == "" {
+					if !strings.Contains(got, switchOffRepoAccessText) || !strings.Contains(got, reviewGroundingFlag) {
+						t.Errorf("switch-off reason %q must render the switch text naming %s\n---\n%s", reason, reviewGroundingFlag, got)
+					}
+					if strings.Contains(got, enabledRepoAccessText) {
+						t.Errorf("switch-off reason %q must not render the enabled variant\n---\n%s", reason, got)
+					}
+					return
+				}
+				if !strings.Contains(got, enabledRepoAccessText+phrase+".") {
+					t.Errorf("reason %q must render the enabled variant with phrase %q\n---\n%s", reason, phrase, got)
+				}
+				if strings.Contains(got, reviewGroundingFlag) || strings.Contains(got, switchOffRepoAccessText) {
+					t.Errorf("enabled-but-unavailable reason %q must NOT name %s or the switch text\n---\n%s", reason, reviewGroundingFlag, got)
+				}
+			})
+		}
+	}
+}
+
+// criterion10 returns the implement-review render's standing criterion 10.
+func criterion10(t *testing.T, got string) string {
+	t.Helper()
+	i := strings.Index(got, "10. **Trace mechanical predictions")
+	j := strings.Index(got, "These two standing rules apply")
+	if i < 0 || j < i {
+		t.Fatalf("criterion 10 not found (start=%d end=%d)", i, j)
+	}
+	return got[i:j]
+}
+
+// TestReviewUngroundedReason_Criterion10 pins criterion 10 SEPARATELY from the
+// repo-access block, so editing that block alone cannot green it: with
+// grounding enabled but this round's tree unavailable it names only the
+// operator-runs-the-check resolution and says grounding is already enabled;
+// switched off it still carries the #3625 switch clause.
+func TestReviewUngroundedReason_Criterion10(t *testing.T) {
+	const switchClause = "or they can set " + reviewGroundingFlag + "=true to ground future reviews"
+	const enabledClause = "they can run the check themselves. Review grounding is already enabled on this deployment"
+	for _, reason := range []string{ReviewUngroundedRefUnavailable, ReviewUngroundedReviewerCannotGround, "some_future_reason"} {
+		c10 := criterion10(t, ungroundedReasonReview(t, "implement_review", reason))
+		if !strings.Contains(c10, enabledClause) || !strings.Contains(c10, ungroundedTraceText) {
+			t.Errorf("reason %q: criterion 10 must keep UNTRACED and say grounding is already enabled\n---\n%s", reason, c10)
+		}
+		if strings.Contains(c10, reviewGroundingFlag) {
+			t.Errorf("reason %q: criterion 10 must NOT name %s\n---\n%s", reason, reviewGroundingFlag, c10)
+		}
+	}
+	for _, reason := range []string{"", ReviewUngroundedDisabled} {
+		c10 := criterion10(t, ungroundedReasonReview(t, "implement_review", reason))
+		if !strings.Contains(c10, switchClause) || strings.Contains(c10, enabledClause) {
+			t.Errorf("switch-off reason %q: criterion 10 must carry the switch clause only\n---\n%s", reason, c10)
+		}
+	}
+	// Criterion 9 does not vary with the reason.
+	off, on := ungroundedReasonReview(t, "implement_review", ""), ungroundedReasonReview(t, "implement_review", ReviewUngroundedRefUnavailable)
+	if !strings.Contains(off, ungroundedBaselineText) || !strings.Contains(on, ungroundedBaselineText) {
+		t.Error("criterion 9's ungrounded baseline text must render for every reason")
+	}
+}
+
+// TestReviewUngroundedReason_IgnoredWhenGrounded: a grounded render ignores a
+// stray reason — no DIFF-ONLY clause, no enabled-but-unavailable sentence.
+func TestReviewUngroundedReason_IgnoredWhenGrounded(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:                   "kuhlman-labs/example",
+		ApprovedPlan:           fixturePlan(),
+		Diff:                   "- M pkg/bar/bar.go\n",
+		ReviewTreeCommit:       "0123456789abcdef0123456789abcdef01234567",
+		ReviewUngroundedReason: ReviewUngroundedRefUnavailable,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "DIFF-ONLY") || strings.Contains(got, enabledRepoAccessText) || strings.Contains(got, "already enabled") {
+		t.Errorf("grounded render must ignore the ungrounded reason\n---\n%s", got)
+	}
+}
+
 // TestImplementReview_CalibrationCriteria_AdversarialCarveOut: the carve-out
 // bounding criteria 9/10 to pattern-based and mechanical-prediction findings
 // renders in BOTH grounding postures. This is the guard #2119's "Explicitly NOT

@@ -819,3 +819,59 @@ func TestPersona_PromptBuildFailure_DegradesWithoutAttribution(t *testing.T) {
 		t.Errorf("remit attributed %d times for a prompt that never built, want 0", n)
 	}
 }
+
+// (#4066) A non-grounding persona on a GROUNDED round renders the
+// reviewer_cannot_ground phrase — not the zero value's switch-off text naming
+// FISHHAWKD_REVIEW_GROUNDING, which is wrong when grounding is enabled. On an
+// UNGROUNDED round (no working dir) the round's own reason carries over.
+//
+// Counterfactual: delete the persona reason assignment — the grounded case's
+// persona prompt then names the env var: RED.
+func TestPersona_NonGroundingPersonaNamesReviewerCannotGround(t *testing.T) {
+	repo, _ := gitFixtureRepo(t)
+	newStd := func() *groundingFakeReviewer {
+		return &groundingFakeReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+	}
+	const (
+		cannotGround = "a reviewer on this round cannot read an exported tree"
+		noCheckout   = "this run has no local checkout on the review host"
+		envVar       = "FISHHAWKD_REVIEW_GROUNDING"
+	)
+
+	t.Run("grounded round", func(t *testing.T) {
+		std, persona := newStd(), approvingFake()
+		p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
+		p.rr.getRuns[p.runID].WorkingDir = repo
+		p.review(t)
+		if !std.reviewGroundedHit {
+			t.Fatal("fixture: the round must be grounded")
+		}
+		calls := reviewerCalls(persona)
+		if len(calls) != 1 {
+			t.Fatalf("persona calls = %d, want 1", len(calls))
+		}
+		if !strings.Contains(calls[0], cannotGround) || strings.Contains(calls[0], envVar) {
+			t.Errorf("persona prompt must name reviewer_cannot_ground and not %s:\n%s", envVar, calls[0])
+		}
+		if strings.Contains(std.prompt, cannotGround) {
+			t.Error("the grounded standard prompt must not carry the persona's reason")
+		}
+	})
+
+	t.Run("ungrounded round carries its reason", func(t *testing.T) {
+		std, persona := newStd(), approvingFake()
+		p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
+		p.rr.getRuns[p.runID].WorkingDir = ""
+		p.review(t)
+		calls := reviewerCalls(persona)
+		if len(calls) != 1 {
+			t.Fatalf("persona calls = %d, want 1", len(calls))
+		}
+		if !strings.Contains(calls[0], noCheckout) || strings.Contains(calls[0], cannotGround) {
+			t.Errorf("persona on an ungrounded round must carry the round's no_working_dir reason:\n%s", calls[0])
+		}
+		if !strings.Contains(std.prompt, noCheckout) {
+			t.Errorf("standard prompt must carry no_working_dir:\n%s", std.prompt)
+		}
+	})
+}

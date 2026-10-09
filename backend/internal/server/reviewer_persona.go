@@ -531,6 +531,12 @@ func (s *Server) buildPersonaPrompt(ctx context.Context, runRow *run.Run, review
 		ptrig.ReviewTreeSkippedSymlinks = 0
 		ptrig.ReviewTreeSkippedInstructions = 0
 		ptree = ""
+		if treeDir != "" {
+			// The round WAS grounded and only this persona's reviewer lacks
+			// the capability (#4066): say so, rather than the zero value's
+			// switch-off text. An ungrounded round's reason carries over.
+			ptrig.ReviewUngroundedReason = prompt.ReviewUngroundedReviewerCannotGround
+		}
 	}
 	ptrig.InjectedDocuments = append(slices.Clone(standardInjected), repodoc.ToPromptDocument(*doc, framing))
 	set := repodoc.InjectionSet{Documents: []repodoc.Document{*doc}}

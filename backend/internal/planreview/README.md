@@ -374,6 +374,16 @@ read-only tree (`reviewsandbox.ExportTree`) and the adapters run grounded (codex
 so a reviewer can confirm diff-invisible facts. Long-form contract:
 `backend/internal/reviewsandbox/README.md`.
 
+The ungrounded prompt has TWO variants (#4066): **switch-off** (this flag is
+`false`) names `FISHHAWKD_REVIEW_GROUNDING` as the switch, while
+**enabled-but-unavailable** (the flag is on but this round's tree could not be
+provided — no working dir, no ref, a reviewer that cannot ground, a commit not
+present locally and not fetchable from origin, or another export failure) says
+grounding IS enabled, names the reason, and never tells the operator to set the
+flag. The server's `groundReview` stamps the reason on every degrade
+(`prompt.Trigger.ReviewUngroundedReason`); `backend/internal/prompt/README.md`
+holds the render contract.
+
 | Env var | Default | Effect |
 |---|---|---|
 | `FISHHAWKD_REVIEW_GROUNDING` | `false` | Opt-in. Grounding ships DORMANT (#2522) — the per-adapter read bounds landed but the flip to on-by-default is a SEPARATE operator-filed follow-up gated on a recorded operator run of `live_confinement_test.go` passing on BOTH adapters. `false` reverts both adapters to the diff-only (ungrounded) posture and the prompts to diff-only wording, without a rollback. The environment scrub is independent of this flag and always applied. |

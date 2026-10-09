@@ -2,7 +2,9 @@ package reviewsandbox
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +12,32 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
 )
+
+// ErrRefUnavailable is wrapped by every ExportTree error that means "the ref
+// does not name a commit this repository has, and fetch-on-miss could not
+// supply it" (#4066): a non-SHA ref that does not resolve locally, a full
+// object id that is absent locally and could not be fetched from origin (the
+// fetch failed or timed out), or one that is still not a commit after the
+// fetch. The server classifies it as the ref_unavailable degrade reason, so
+// the review prompt says the tree for this round could not be provided rather
+// than telling the operator to enable grounding. A git-absent host, a
+// cancelled context, an archive failure or a bounds violation is NOT wrapped.
+var ErrRefUnavailable = errors.New("reviewsandbox: ref unavailable")
+
+// defaultFetchTimeout bounds the fetch-on-miss child (#4066).
+const defaultFetchTimeout = 30 * time.Second
+
+// fetchKillGrace is the procgroup.Harden WaitDelay for the fetch child: how
+// long Wait may block on a stderr pipe still held by a group member that
+// escaped the whole-group kill.
+const fetchKillGrace = 2 * time.Second
+
+// fetchStderrTail caps the stderr bytes a failed fetch names in its error.
+const fetchStderrTail = 256
 
 // Limits bounds an extraction so a pathological or hostile archive cannot fill
 // the disk. Zero fields fall back to the defaults in DefaultLimits.
@@ -19,14 +46,19 @@ type Limits struct {
 	MaxFiles int
 	// MaxBytes caps the total bytes written across all regular files.
 	MaxBytes int64
+	// FetchTimeout bounds the fetch-on-miss child (#4066): the whole process
+	// group is killed when it fires and the export degrades with a named
+	// timeout.
+	FetchTimeout time.Duration
 }
 
 // DefaultLimits are the export bounds a review loop uses: 50000 files and
 // 512 MiB, an order of magnitude over this repository's own tree while still
 // refusing a runaway monorepo (the caller degrades to an ungrounded, diff-only
-// review rather than exhausting the daemon's disk).
+// review rather than exhausting the daemon's disk), and a 30s fetch-on-miss
+// bound.
 func DefaultLimits() Limits {
-	return Limits{MaxFiles: 50000, MaxBytes: 512 << 20}
+	return Limits{MaxFiles: 50000, MaxBytes: 512 << 20, FetchTimeout: defaultFetchTimeout}
 }
 
 func (l Limits) resolved() Limits {
@@ -35,6 +67,9 @@ func (l Limits) resolved() Limits {
 	}
 	if l.MaxBytes <= 0 {
 		l.MaxBytes = 512 << 20
+	}
+	if l.FetchTimeout <= 0 {
+		l.FetchTimeout = defaultFetchTimeout
 	}
 	return l
 }
@@ -71,17 +106,29 @@ func (s Stats) AnySkipped() bool { return s.Symlinks > 0 || s.Instructions > 0 }
 // caller MUST call to remove the directory.
 //
 // Only tracked files at that commit are written — no .git, no untracked files,
-// no other branches. Both git children run with a scrubbed minimal environment
-// (Env(os.Environ(), BaseAllow, nil)) so they inherit no repository credentials.
+// no other branches. Every git child runs with a scrubbed minimal environment
+// (Env(os.Environ(), BaseAllow, nil)) so it inherits no repository credentials.
 //
-// On ANY error (unresolvable ref, git absent, not a work tree, a bounds
-// violation, a traversal entry, a non-zero git exit) ExportTree removes its own
-// partial directory before returning, so no caller can leak it, and returns a
-// no-op cleanup. The caller degrades to an ungrounded, diff-only review.
+// Fetch-on-miss (#4066): when ref is a full object id (40 or 64 hex chars) that
+// the repository does not have locally — a server-pushed consolidated commit a
+// decomposed parent's review runs against before it was ever fetched — the
+// resolve step fetches exactly that object from origin, bounded by
+// limits.FetchTimeout, and resolves again. The fetch names no destination,
+// writes no FETCH_HEAD and disables the refmap, so no local branch,
+// remote-tracking ref or FETCH_HEAD moves; only objects land. A non-SHA ref is
+// never fetched. See resolveCommit.
+//
+// On ANY error (unresolvable ref, a failed or timed-out fetch, git absent, not
+// a work tree, a bounds violation, a traversal entry, a non-zero git exit)
+// ExportTree removes its own partial directory before returning, so no caller
+// can leak it, and returns a no-op cleanup. An unavailable ref wraps
+// ErrRefUnavailable and names the cause. The caller degrades to an ungrounded,
+// diff-only review.
 func ExportTree(ctx context.Context, repoDir, ref string, limits Limits) (dir, commit string, stats Stats, cleanup func(), err error) {
 	noop := func() {}
+	limits = limits.resolved()
 
-	sha, err := resolveCommit(ctx, repoDir, ref)
+	sha, err := resolveCommit(ctx, repoDir, ref, limits.FetchTimeout)
 	if err != nil {
 		return "", "", Stats{}, noop, err
 	}
@@ -92,7 +139,7 @@ func ExportTree(ctx context.Context, repoDir, ref string, limits Limits) (dir, c
 	}
 	cleanupFn := func() { _ = os.RemoveAll(dest) }
 
-	st, err := archiveInto(ctx, repoDir, sha, dest, limits.resolved())
+	st, err := archiveInto(ctx, repoDir, sha, dest, limits)
 	if err != nil {
 		cleanupFn()
 		return "", "", Stats{}, noop, err
@@ -101,13 +148,63 @@ func ExportTree(ctx context.Context, repoDir, ref string, limits Limits) (dir, c
 }
 
 // resolveCommit resolves ref to a full commit SHA via
-// `git -C repoDir rev-parse --verify <ref>^{commit}`. The ^{commit} peel makes a
-// tag or tree ref resolve to its commit (or fail), and --verify makes an
-// ambiguous or absent ref a non-zero exit rather than a printed error line.
-func resolveCommit(ctx context.Context, repoDir, ref string) (string, error) {
+// `git -C repoDir rev-parse --verify <ref>^{commit}` (revParse), fetching the
+// object from origin once on a miss (#4066).
+//
+// The miss path is taken only when ALL of these hold, in this order:
+//   - the context is still live. A cancelled or deadline-killed rev-parse
+//     surfaces as an *exec.ExitError (signal: killed), so the ctx check runs
+//     FIRST: that is a ctx error, never a ref miss — no fetch, and the error
+//     does not wrap ErrRefUnavailable;
+//   - rev-parse exited non-zero (*exec.ExitError). git being absent, or any
+//     other start failure, returns as a plain error with no fetch;
+//   - ref is a full object id (isFullObjectID). A branch name, `HEAD`, or any
+//     token starting with '-' never reaches the fetch argv: fetching a named
+//     ref would download its objects under a name the caller did not pin, and
+//     a leading '-' would be parsed as a fetch option.
+//
+// Every miss — a non-SHA ref, a failed or timed-out fetch, or an object still
+// not a commit after the fetch — wraps ErrRefUnavailable and names its cause.
+func resolveCommit(ctx context.Context, repoDir, ref string, fetchTimeout time.Duration) (string, error) {
 	if ref == "" {
 		return "", fmt.Errorf("reviewsandbox: empty ref")
 	}
+	sha, err := revParse(ctx, repoDir, ref)
+	if err == nil {
+		return sha, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("reviewsandbox: resolve ref %q: %w (%w)", ref, ctxErr, err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return "", err
+	}
+	if !isFullObjectID(ref) {
+		return "", fmt.Errorf("%w: %v (not a full object id, so it is not fetched from origin)", ErrRefUnavailable, err)
+	}
+	if ferr := fetchFromOrigin(ctx, repoDir, ref, fetchTimeout); ferr != nil {
+		if ctx.Err() != nil {
+			return "", ferr
+		}
+		return "", fmt.Errorf("%w: commit %s is not present locally and could not be fetched from origin: %v", ErrRefUnavailable, ref, ferr)
+	}
+	sha, err = revParse(ctx, repoDir, ref)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("%w: %s is still not a commit after fetching it from origin: %v", ErrRefUnavailable, ref, err)
+	}
+	return sha, nil
+}
+
+// revParse runs `git -C repoDir rev-parse --verify <ref>^{commit}`. The
+// ^{commit} peel makes a tag or tree ref resolve to its commit (or fail), and
+// --verify makes an ambiguous or absent ref a non-zero exit rather than a
+// printed error line. The returned error wraps the exec error unchanged so
+// resolveCommit can tell a non-zero exit from a start failure.
+func revParse(ctx context.Context, repoDir, ref string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "--verify", ref+"^{commit}")
 	cmd.Env = Env(os.Environ(), BaseAllow, nil)
 	out, err := cmd.Output()
@@ -119,6 +216,82 @@ func resolveCommit(ctx context.Context, repoDir, ref string) (string, error) {
 		return "", fmt.Errorf("reviewsandbox: resolve ref %q: empty output", ref)
 	}
 	return sha, nil
+}
+
+// isFullObjectID reports whether ref is a full hex object id: exactly 40 (SHA-1)
+// or 64 (SHA-256) characters, each 0-9 or a-f/A-F. It is the guard that keeps
+// every non-SHA token — a branch name, `HEAD`, an abbreviated SHA, anything
+// starting with '-' — out of the fetch argv.
+func isFullObjectID(ref string) bool {
+	if len(ref) != 40 && len(ref) != 64 {
+		return false
+	}
+	for i := 0; i < len(ref); i++ {
+		c := ref[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchFromOrigin fetches one object id from the repository's origin remote:
+//
+//	git -C repoDir fetch --no-tags --no-write-fetch-head --no-auto-maintenance --refmap= origin <sha>
+//
+// The flags keep the fetch object-only: no tags follow, FETCH_HEAD is not
+// written, the configured refmap is disabled (so even a configured
+// remote.origin.fetch moves no remote-tracking ref), and no detached
+// maintenance child is forked (the AGENTS.md #3503 class). The refspec names
+// no destination, so no local ref moves.
+//
+// The child runs under the scrubbed BaseAllow environment plus
+// GIT_TERMINAL_PROMPT=0, so a remote demanding credentials fails instead of
+// prompting. It is bounded by timeout and procgroup-hardened: when the bound
+// (or the parent context) fires, the WHOLE process group — git plus any
+// upload-pack, ssh or credential-helper grandchild holding the stderr pipe —
+// is killed, and WaitDelay bounds Wait.
+//
+// The returned error names the cause: the parent context's error when the
+// PARENT was cancelled (C1: a ctx error, never a timeout or a miss), "timed out
+// after <timeout>" when only the fetch bound fired, and otherwise the exit
+// status plus a single-line stderr tail of at most fetchStderrTail bytes.
+func fetchFromOrigin(ctx context.Context, repoDir, sha string, timeout time.Duration) error {
+	fctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(fctx, "git", "-C", repoDir, "fetch",
+		"--no-tags", "--no-write-fetch-head", "--no-auto-maintenance", "--refmap=",
+		"origin", sha)
+	cmd.Env = append(Env(os.Environ(), BaseAllow, nil), "GIT_TERMINAL_PROMPT=0")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	procgroup.Harden(cmd, fetchKillGrace)
+
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("reviewsandbox: fetch %s from origin: %w", sha, ctxErr)
+	}
+	if errors.Is(fctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("fetch from origin timed out after %s", timeout)
+	}
+	return fmt.Errorf("fetch from origin: %v: %s", err, stderrTail(stderr.Bytes()))
+}
+
+// stderrTail renders the last fetchStderrTail bytes of a child's stderr as one
+// line (newlines and runs of whitespace collapsed) for an error message.
+func stderrTail(b []byte) string {
+	if len(b) > fetchStderrTail {
+		b = b[len(b)-fetchStderrTail:]
+	}
+	tail := strings.Join(strings.Fields(string(b)), " ")
+	if tail == "" {
+		return "(no stderr)"
+	}
+	return tail
 }
 
 // archiveInto streams `git archive` for sha into dest via extractTar. The tar
