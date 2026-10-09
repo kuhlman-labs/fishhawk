@@ -40,8 +40,33 @@ func pushToOrigin(t *testing.T, bare, from, branch string, files map[string]stri
 	if from == "" {
 		from = branch
 	}
+	side := cloneOriginForPush(t, bare, from)
+	return commitAndPushFromClone(t, side, branch, files, msg, false)
+}
+
+// rewriteOrigin force-pushes branch to a NON-fast-forward tip: a new commit cut
+// from onto (an ancestor of the branch's current tip) rather than from the tip
+// itself. It is the shape of a force-push / history rewrite on the remote, so
+// merge-base(new tip, any descendant of the old tip) is onto — NOT the old tip
+// a fast-forward would leave it at. Returns the new tip.
+func rewriteOrigin(t *testing.T, bare, branch, onto string, files map[string]string, msg string) string {
+	t.Helper()
+	side := cloneOriginForPush(t, bare, branch)
+	if err := runGitErr(side, "checkout", "-q", "-B", branch, onto); err != nil {
+		t.Fatal(err)
+	}
+	return commitAndPushFromClone(t, side, branch, files, msg, true)
+}
+
+// cloneOriginForPush clones bare at branch into a fresh temp dir with a
+// throwaway committer identity and signing off. It never sets GIT_CONFIG_GLOBAL:
+// the package TestMain already pins maintenance.auto=false through it (#3503),
+// so a push into the t.TempDir() bare origin leaves no detached maintenance
+// child racing the temp-dir cleanup.
+func cloneOriginForPush(t *testing.T, bare, branch string) string {
+	t.Helper()
 	side := filepath.Join(t.TempDir(), "side")
-	if err := runGitErr(filepath.Dir(side), "clone", "-q", "-b", from, bare, side); err != nil {
+	if err := runGitErr(filepath.Dir(side), "clone", "-q", "-b", branch, bare, side); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
@@ -53,6 +78,13 @@ func pushToOrigin(t *testing.T, bare, from, branch string, files map[string]stri
 			t.Fatal(err)
 		}
 	}
+	return side
+}
+
+// commitAndPushFromClone commits files in side and pushes HEAD to
+// refs/heads/<branch> on origin (forced when force), returning the new tip.
+func commitAndPushFromClone(t *testing.T, side, branch string, files map[string]string, msg string, force bool) string {
+	t.Helper()
 	for name, body := range files {
 		mustWrite(t, filepath.Join(side, name), body)
 	}
@@ -62,7 +94,12 @@ func pushToOrigin(t *testing.T, bare, from, branch string, files map[string]stri
 	if err := runGitErr(side, "commit", "-q", "-m", msg); err != nil {
 		t.Fatal(err)
 	}
-	if err := runGitErr(side, "push", "-q", "origin", "HEAD:refs/heads/"+branch); err != nil {
+	pushArgs := []string{"push", "-q"}
+	if force {
+		pushArgs = append(pushArgs, "--force")
+	}
+	pushArgs = append(pushArgs, "origin", "HEAD:refs/heads/"+branch)
+	if err := runGitErr(side, pushArgs...); err != nil {
 		t.Fatal(err)
 	}
 	tip, err := runGitOut(side, "rev-parse", "HEAD")
@@ -197,6 +234,197 @@ func TestRun_StandalonePin_ThreadsDispatchTipThroughDiffAndPush(t *testing.T) {
 			t.Errorf("the diff re-anchored onto the mid-stage tip T2 %s: %s", t2, l)
 		}
 	}
+	bp := logLines(log, "base_pinned")
+	if len(bp) != 1 || !strings.Contains(bp[0], `"source":"standalone_advance"`) || !strings.Contains(bp[0], `"base_sha":"`+t1+`"`) {
+		t.Errorf("base_pinned lines = %v, want exactly one standalone_advance pin at T1 %s", bp, t1)
+	}
+}
+
+// TestRun_StandalonePin_VerifyFixReinvoke_ReemitStaysPinned pins the CONTROL
+// that reemitScopedGitDiff measures its diff against the stage's pinned base
+// (resolveStageDiffBase), not a freshly fetched one (resolveDiffBaseRef). The
+// verify-fix reinvoke (and an amendment fold) re-emits git_diff AFTER the agent
+// ran again, and a re-emit that re-anchors would silently swap the stage's base
+// mid-stage — folding every commit that landed on main since the pin into the
+// authoritative diff the reviewer and policy re-eval read (the #1932 class).
+//
+// Real git throughout; only the push/PR egress is faked. The fixture choices
+// are what make the control observable:
+//
+//   - the #3454 advance moves the lineage worktree from the plan-time T0 to T1
+//     (advanced.txt) and pins T1, so T1 != T0 and a diff measured against T0
+//     would carry advanced.txt as an added file;
+//   - the verify probe (`grep -q fixed scope.txt`) fails on the first committed
+//     scope-only tree and passes on the second, forcing EXACTLY ONE verify-fix
+//     reinvoke, so reemitScopedGitDiff is guaranteed to run;
+//   - DURING that reinvoke origin/main is force-pushed to T2', a NON-fast-forward
+//     rewrite cut from T0, so merge-base(T2', HEAD=T1) == T0 != the pin. On a
+//     fast-forward advance merge-base(new tip, HEAD) is still T1, so a
+//     `merge_base == T1` assertion would pass with the control deleted — the
+//     masking case this fixture exists to avoid;
+//   - origin stays configured on the lineage worktree, so the unpinned resolver
+//     takes its fetch-and-re-anchor branch rather than the remote-less fallback.
+//
+// With the control deleted the re-emit fetches T2', logs diff_base_reanchored
+// with merge_base T0, emits only ONE diff_base_pinned (the first emit's), and the
+// authoritative last git_diff carries advanced.txt.
+func TestRun_StandalonePin_VerifyFixReinvoke_ReemitStaysPinned(t *testing.T) {
+	operator, t0, advanceOrigin := standaloneMovedBaseRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	bare := cprGit(t, operator, "remote", "get-url", "origin")
+
+	ctx := context.Background()
+	if _, err := provisionLineageWorktree(ctx, operator, lineageRoot(basePinRunID, "", false), "main", io.Discard); err != nil {
+		t.Fatalf("plan-stage provision: %v", err)
+	}
+	t1 := advanceOrigin()
+
+	var t2, invokeHEAD string
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(idx int, inv agent.Invocation) {
+			scope := filepath.Join(inv.WorkingDir, "scope.txt")
+			switch idx {
+			case 0:
+				invokeHEAD, _ = runGitOut(inv.WorkingDir, "rev-parse", "HEAD")
+				// The committed scope-only tree fails the probe: one reinvoke.
+				mustWrite(t, scope, "buggy edit\n")
+			case 1:
+				// The verify-fix reinvoke: origin/main is force-pushed to a
+				// rewrite cut from T0 (NOT from T1), THEN the fix lands.
+				t2 = rewriteOrigin(t, bare, "main", t0,
+					map[string]string{"rewrite.txt": "history rewritten on origin/main\n"}, "force-push rewrite from T0")
+				mustWrite(t, scope, "fixed edit\n")
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             basePinStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "grep -q fixed scope.txt",
+		VerifyMaxIterations: 2,
+		ScopeFiles:          []upload.ScopeFile{{Path: "scope.txt", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{HeadSHA: "head-sha-abc", BaseSHA: "base"}}
+	origPusher, origOpener := newPusher, newPROpener
+	newPusher = func() pusher { return fp }
+	newPROpener = func(string) prOpener { return &fakePROpener{} }
+	t.Cleanup(func() { newPusher = origPusher; newPROpener = origOpener })
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", basePinRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", basePinStageID,
+		"--working-dir", operator,
+		"--check-base-ref", "main",
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", bundlePath,
+	}, &stderr)
+	log := stderr.String()
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, log)
+	}
+
+	// Fixture-validity preconditions: each is t.Fatalf so a vacuous fixture can
+	// never reach a behavioural check and pass.
+	if t1 == t0 {
+		t.Fatalf("fixture: the #3454 advance did not move origin/main (t0 == t1 == %s)", t0)
+	}
+	if invokeHEAD != t1 {
+		t.Fatalf("worktree HEAD at the first invoke = %q, want the advanced tip T1 %q (the pin must differ from the plan-time T0 %q)", invokeHEAD, t1, t0)
+	}
+	if t2 == "" || t2 == t1 || t2 == t0 {
+		t.Fatalf("fixture: the force-push did not produce a new tip (t0=%s t1=%s t2=%s)", t0, t1, t2)
+	}
+	if err := runGitErr(bare, "merge-base", "--is-ancestor", t1, t2); err == nil {
+		t.Fatalf("fixture: T2' %s descends from T1 %s — the rewrite is a fast-forward, which cannot discriminate a re-anchor", t2, t1)
+	}
+	if mb, err := runGitOut(bare, "merge-base", t2, t1); err != nil || mb != t0 {
+		t.Fatalf("fixture: merge-base(T2', T1) = %q (err %v), want the plan-time T0 %q so a re-anchor lands OFF the pin", mb, err, t0)
+	}
+	if invoker.callIdx != 2 {
+		t.Fatalf("agent invocations = %d, want 2 (initial + exactly one verify-fix reinvoke):\n%s", invoker.callIdx, log)
+	}
+	events := readBundleEvents(t, bundlePath)
+	// The expected verify_run sequence behind the iteration count asserted
+	// below. scope.txt is not a Go file, so the scoped pre-pass and the #3315
+	// full re-verify never engage (no scoped packages): each loop iteration runs
+	// ONE full-form verify. Iteration 0 fails the probe on the committed
+	// scope-only tree ("buggy edit"), iteration 1 passes it ("fixed edit"). A
+	// change to that loop shape breaks this assertion for that stated reason.
+	var verifyOutcomes []string
+	var diffPayloads []string
+	for _, ev := range events {
+		switch ev.Kind {
+		case "verify_run":
+			p := string(ev.Data)
+			switch {
+			case strings.Contains(p, `"outcome":"failed"`):
+				verifyOutcomes = append(verifyOutcomes, "failed")
+			case strings.Contains(p, `"outcome":"passed"`):
+				verifyOutcomes = append(verifyOutcomes, "passed")
+			default:
+				verifyOutcomes = append(verifyOutcomes, "other:"+p)
+			}
+		case "git_diff":
+			diffPayloads = append(diffPayloads, string(ev.Data))
+		}
+	}
+	if want := []string{"failed", "passed"}; strings.Join(verifyOutcomes, ",") != strings.Join(want, ",") {
+		t.Fatalf("verify_run outcomes = %v, want %v", verifyOutcomes, want)
+	}
+	assertVerifySummary(t, events, "passed", 2, 2)
+	if len(diffPayloads) != 2 {
+		t.Fatalf("git_diff events = %d, want 2 (computeAndEmitDiff + the reemitScopedGitDiff re-emit — a GREEN must not come from the re-emit never running):\n%s", len(diffPayloads), log)
+	}
+
+	// (a) Both emits measured against the pin: two diff_base_pinned, each T1/T1.
+	pinned := logLines(log, "diff_base_pinned")
+	if len(pinned) != 2 {
+		t.Errorf("diff_base_pinned lines = %d, want 2 (first emit + the re-emit): %v", len(pinned), pinned)
+	}
+	for _, l := range pinned {
+		if !strings.Contains(l, `"base_sha":"`+t1+`"`) || !strings.Contains(l, `"merge_base":"`+t1+`"`) {
+			t.Errorf("diff_base_pinned = %s, want base_sha and merge_base == the pin T1 %s", l, t1)
+		}
+	}
+	// (b) The pinned resolver never fetches, so nothing re-anchors or degrades.
+	for _, ev := range []string{"diff_base_reanchored", "diff_base_refresh_degraded", "merge_base_unresolved", "diff_base_pin_unresolved"} {
+		if lines := logLines(log, ev); len(lines) != 0 {
+			t.Errorf("%s lines = %v, want none — a pinned stage must not re-resolve its diff base (T2' = %s)", ev, lines, t2)
+		}
+	}
+	// (c) The authoritative (last-write-wins) git_diff is the scope edit alone.
+	// advanced.txt and "fixed edit" are the load-bearing observations: measured
+	// against T0 (a re-anchor) advanced.txt would appear as an added file.
+	last := diffPayloads[len(diffPayloads)-1]
+	if strings.Contains(last, "advanced.txt") {
+		t.Errorf("the authoritative git_diff carries advanced.txt — the diff was re-anchored off the pin T1 %s onto T0 %s:\n%s", t1, t0, last)
+	}
+	if !strings.Contains(last, "fixed edit") {
+		t.Errorf("the authoritative git_diff lacks the reconciled scope edit %q:\n%s", "fixed edit", last)
+	}
+	// FIXTURE-SANITY check only, NOT a discriminating observation: it stays green
+	// with the control deleted, because the diff is measured from the staged
+	// index and rewrite.txt exists only on T2', never in the worktree. The
+	// load-bearing content assertions are the two above — advanced.txt ABSENT and
+	// "fixed edit" PRESENT.
+	if strings.Contains(last, "rewrite.txt") {
+		t.Errorf("the authoritative git_diff carries rewrite.txt from the rewritten origin tip T2' %s:\n%s", t2, last)
+	}
+	// (d) The human label stays the declared base on both events.
+	if refs := gitDiffBaseRefs(t, bundlePath); len(refs) != 2 || refs[0] != "main" || refs[1] != "main" {
+		t.Errorf("git_diff base_ref labels = %v, want [main main]", refs)
+	}
+	// (e) One pin, at T1, from the standalone advance.
 	bp := logLines(log, "base_pinned")
 	if len(bp) != 1 || !strings.Contains(bp[0], `"source":"standalone_advance"`) || !strings.Contains(bp[0], `"base_sha":"`+t1+`"`) {
 		t.Errorf("base_pinned lines = %v, want exactly one standalone_advance pin at T1 %s", bp, t1)
