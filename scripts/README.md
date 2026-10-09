@@ -1238,7 +1238,13 @@ the first-start name conflict AND on a stale reuse reference — docker `No such
 container` — re-creating a daemon-evicted container, #1402) shared across every
 package process, with each test handed its OWN ephemeral `CREATE DATABASE ...
 TEMPLATE` clone for isolation (cross-process-idempotent template bootstrap,
-advisory-locked, tolerating SQLSTATE 42P04). Consumers call `pgtest.NewPool(t)`
+advisory-locked, tolerating SQLSTATE 42P04). The template is named
+`fishhawk_tmpl_<12-hex sha256 of the embedded migration set>` (#3848), so two
+trees carrying different migrations (two worktrees, or main against a feature
+branch) each bootstrap and clone their OWN template on the one container instead
+of the first bootstrapper's set winning (`no migration found for version N` for
+the older tree); distinct templates accumulate only until the lease drains and
+the container is removed. Consumers call `pgtest.NewPool(t)`
 / `pgtest.NewURL(t)` — do NOT hand-roll a per-package `tcpostgres.Run`. The
 Go-side hazards and their classifiers are documented in the `pgtest.go` package
 comment.

@@ -4,12 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 )
 
 // --- pure classifier unit tests (no container) ---
@@ -64,7 +71,7 @@ func TestIsDuplicateDatabase(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"42P04", &pgconn.PgError{Code: "42P04", Message: `database "fishhawk_tmpl" already exists`}, true},
+		{"42P04", &pgconn.PgError{Code: "42P04", Message: `database "fishhawk_tmpl_0123456789ab" already exists`}, true},
 		{"wrapped 42P04", fmt.Errorf("create template db: %w", &pgconn.PgError{Code: "42P04"}), true},
 		{"55006 not duplicate", &pgconn.PgError{Code: "55006"}, false},
 		{"plain error", errors.New("boom"), false},
@@ -229,9 +236,10 @@ func TestSharedContainer_StaleRefReattaches(t *testing.T) {
 // asserts the bootstrap ADOPTS the existing template (returns nil) instead
 // of failing — the cross-process race fix.
 func TestBootstrap_DuplicateDatabaseTolerated(t *testing.T) {
-	dup := &pgconn.PgError{Code: "42P04", Message: `database "fishhawk_tmpl" already exists`}
+	const tmpl = "fishhawk_tmpl_0123456789ab"
+	dup := &pgconn.PgError{Code: "42P04", Message: `database "` + tmpl + `" already exists`}
 	migrated := false
-	err := bootstrapWith(
+	err := bootstrapWith(tmpl,
 		func() error { return dup },
 		func() error { migrated = true; return nil },
 	)
@@ -242,22 +250,171 @@ func TestBootstrap_DuplicateDatabaseTolerated(t *testing.T) {
 		t.Error("bootstrapWith did not run migrate after adopting the template")
 	}
 
-	// A non-duplicate create error propagates (not tolerated).
+	// A non-duplicate create error propagates (not tolerated) and names the
+	// template, i.e. the migration set it was for.
 	createErr := errors.New("permission denied")
-	if err := bootstrapWith(
+	err = bootstrapWith(tmpl,
 		func() error { return createErr },
 		func() error { return nil },
-	); !errors.Is(err, createErr) {
+	)
+	if !errors.Is(err, createErr) {
 		t.Errorf("bootstrapWith returned %v, want the create error", err)
 	}
+	if err == nil || !strings.Contains(err.Error(), tmpl) {
+		t.Errorf("create error %v should name the template %q", err, tmpl)
+	}
 
-	// A migrate error after a clean create propagates.
+	// A migrate error after a clean create propagates and names the template.
 	migErr := errors.New("bad migration")
-	if err := bootstrapWith(
+	err = bootstrapWith(tmpl,
 		func() error { return nil },
 		func() error { return migErr },
-	); !errors.Is(err, migErr) {
+	)
+	if !errors.Is(err, migErr) {
 		t.Errorf("bootstrapWith returned %v, want the migrate error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), tmpl) {
+		t.Errorf("migrate error %v should name the template %q", err, tmpl)
+	}
+}
+
+// --- migration-set-keyed template name (#3848), no container ---
+
+// failingFS is an fs.FS whose Open fails for every name in failOpen; every
+// other name is served from files. Not a ReadDirFS/ReadFileFS, so fs.WalkDir
+// and fs.ReadFile both go through Open.
+type failingFS struct {
+	files    fstest.MapFS
+	failOpen map[string]bool
+}
+
+func (f failingFS) Open(name string) (fs.File, error) {
+	if f.failOpen[name] {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: errors.New("injected open failure")}
+	}
+	return f.files.Open(name)
+}
+
+func TestMigrationSetDigest(t *testing.T) {
+	base := func() fstest.MapFS {
+		return fstest.MapFS{
+			"0001_a.up.sql":   {Data: []byte("CREATE TABLE a (id int);")},
+			"0001_a.down.sql": {Data: []byte("DROP TABLE a;")},
+		}
+	}
+	digest := func(t *testing.T, m fstest.MapFS) string {
+		t.Helper()
+		d, err := migrationSetDigest(m)
+		if err != nil {
+			t.Fatalf("migrationSetDigest: %v", err)
+		}
+		return d
+	}
+	want := digest(t, base())
+
+	if !regexp.MustCompile(`^[0-9a-f]{12}$`).MatchString(want) {
+		t.Errorf("digest %q is not 12 lowercase hex characters", want)
+	}
+	if got := digest(t, base()); got != want {
+		t.Errorf("same set digested twice: %q vs %q, want identical", got, want)
+	}
+
+	added := base()
+	added["0002_b.up.sql"] = &fstest.MapFile{Data: []byte("CREATE TABLE b (id int);")}
+	if got := digest(t, added); got == want {
+		t.Errorf("added file did not change the digest (%q)", got)
+	}
+
+	// Same name, same LENGTH, different bytes: only the content can tell the
+	// two sets apart, so the length frame cannot mask a dropped content hash.
+	edited := base()
+	edited["0001_a.up.sql"] = &fstest.MapFile{Data: []byte("CREATE TABLE b (id int);")}
+	if got := digest(t, edited); got == want {
+		t.Errorf("edited bytes under the same names did not change the digest (%q)", got)
+	}
+
+	renamed := base()
+	renamed["0001_z.up.sql"] = renamed["0001_a.up.sql"]
+	delete(renamed, "0001_a.up.sql")
+	if got := digest(t, renamed); got == want {
+		t.Errorf("same bytes under a renamed file did not change the digest (%q)", got)
+	}
+
+	// Name/content boundary: both sets stream the same bytes "abc" absent the
+	// separator and length frame.
+	one := digest(t, fstest.MapFS{"a": {Data: []byte("bc")}})
+	two := digest(t, fstest.MapFS{"ab": {Data: []byte("c")}})
+	if one == two {
+		t.Errorf("{a:bc} and {ab:c} digest identically (%q); the name/content boundary is ambiguous", one)
+	}
+}
+
+// TestMigrationSetDigest_ReadErrorPropagates: a walk or read failure returns
+// an error and an empty digest, never the digest of a partial set.
+func TestMigrationSetDigest_ReadErrorPropagates(t *testing.T) {
+	files := fstest.MapFS{
+		"0001_a.up.sql": {Data: []byte("CREATE TABLE a (id int);")},
+		"0002_b.up.sql": {Data: []byte("CREATE TABLE b (id int);")},
+	}
+	for name, failOpen := range map[string]map[string]bool{
+		"walk root unreadable":  {".": true},
+		"later file unreadable": {"0002_b.up.sql": true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := migrationSetDigest(failingFS{files: files, failOpen: failOpen})
+			if err == nil {
+				t.Fatalf("migrationSetDigest = %q, nil; want an error", got)
+			}
+			if got != "" {
+				t.Errorf("digest = %q on error, want empty", got)
+			}
+		})
+	}
+}
+
+func TestTemplateNameFor(t *testing.T) {
+	a, b := templateNameFor("0123456789ab"), templateNameFor("ba9876543210")
+	if a != "fishhawk_tmpl_0123456789ab" {
+		t.Errorf("templateNameFor = %q, want fishhawk_tmpl_<digest>", a)
+	}
+	if len(a) > 63 {
+		t.Errorf("template name %q is %d bytes, over Postgres's 63-byte identifier limit", a, len(a))
+	}
+	if a == b {
+		t.Errorf("distinct digests gave the same template name %q", a)
+	}
+}
+
+// TestTemplateNameForFS_ErrorPropagates covers the single seam every caller
+// resolves a name through, including bootstrapTemplate, which fails before it
+// connects anywhere when the set cannot be digested.
+func TestTemplateNameForFS_ErrorPropagates(t *testing.T) {
+	bad := failingFS{files: fstest.MapFS{}, failOpen: map[string]bool{".": true}}
+	if name, err := templateNameForFS(bad); err == nil || name != "" {
+		t.Errorf("templateNameForFS = %q, %v; want empty name and an error", name, err)
+	}
+	if err := bootstrapTemplate(context.Background(), "postgres://unreachable.invalid/db", bad); err == nil ||
+		!strings.Contains(err.Error(), "digest migration set") {
+		t.Errorf("bootstrapTemplate = %v, want the digest error before any connection", err)
+	}
+}
+
+// TestEmbeddedTemplateName pins the production name to the embedded migration
+// set and away from the legacy fixed name.
+func TestEmbeddedTemplateName(t *testing.T) {
+	digest, err := migrationSetDigest(postgres.Migrations())
+	if err != nil {
+		t.Fatalf("migrationSetDigest(embedded): %v", err)
+	}
+	got, err := embeddedTemplateName()
+	if err != nil {
+		t.Fatalf("embeddedTemplateName: %v", err)
+	}
+	if got != templateNameFor(digest) {
+		t.Errorf("embeddedTemplateName = %q, want %q", got, templateNameFor(digest))
+	}
+	if got == "fishhawk_tmpl" {
+		t.Errorf("embeddedTemplateName = the legacy fixed name %q", got)
 	}
 }
 
@@ -510,7 +667,11 @@ func TestExternalURL_BootstrapsAgainstProvidedServer(t *testing.T) {
 		t.Fatalf("second bootstrapExternalOnce = %v, want the cached nil", err)
 	}
 
-	conn, err := pgx.Connect(ctx, newURLFrom(t, got))
+	tmpl, err := embeddedTemplateName()
+	if err != nil {
+		t.Fatalf("embeddedTemplateName: %v", err)
+	}
+	conn, err := pgx.Connect(ctx, newURLFrom(t, got, tmpl))
 	if err != nil {
 		t.Fatalf("connect per-test db: %v", err)
 	}
@@ -554,4 +715,111 @@ func TestSharedContainer_SharesAndIsolates(t *testing.T) {
 	if n != 0 {
 		t.Errorf("iso_check visible in pool B (count=%d); databases are not isolated", n)
 	}
+}
+
+// TestBootstrap_DistinctMigrationSetsCoexist is the #3848 done-means: two
+// trees carrying different migration sets bootstrap side by side against one
+// server without either failing, and the OLDER set no longer fails after the
+// NEWER one has migrated, because each set gets its own template. The NEWER
+// set goes first (the order that used to red-line the older tree), then the
+// OLDER set and a NEWER re-bootstrap race each other.
+func TestBootstrap_DistinctMigrationSetsCoexist(t *testing.T) {
+	base := sharedBaseURL(t)
+	// A per-test nonce keeps concurrent invocations (and aborted earlier ones)
+	// from sharing, or cleanup-dropping, each other's templates.
+	nonce := uuid.NewString()
+	older := fstest.MapFS{
+		"0001_a.up.sql":   {Data: []byte("-- " + nonce + "\nCREATE TABLE a_only (id int);")},
+		"0001_a.down.sql": {Data: []byte("DROP TABLE a_only;")},
+	}
+	newer := fstest.MapFS{
+		"0001_a.up.sql":   older["0001_a.up.sql"],
+		"0001_a.down.sql": older["0001_a.down.sql"],
+		"0002_b.up.sql":   {Data: []byte("CREATE TABLE b_only (id int);")},
+		"0002_b.down.sql": {Data: []byte("DROP TABLE b_only;")},
+	}
+	olderName, err := templateNameForFS(older)
+	if err != nil {
+		t.Fatalf("templateNameForFS(older): %v", err)
+	}
+	newerName, err := templateNameForFS(newer)
+	if err != nil {
+		t.Fatalf("templateNameForFS(newer): %v", err)
+	}
+
+	// Registered before any per-test clone, so (LIFO) the clones are dropped
+	// first and the templates last.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := pgx.Connect(ctx, base)
+		if err != nil {
+			return // best-effort drop
+		}
+		defer func() { _ = c.Close(ctx) }()
+		for _, name := range []string{olderName, newerName} {
+			_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	failed := false
+	if err := bootstrapTemplate(ctx, base, newer); err != nil {
+		t.Errorf("bootstrap newer set first: %v", err)
+		failed = true
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, set := range []fs.FS{older, newer} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = bootstrapTemplate(ctx, base, set)
+		}()
+	}
+	wg.Wait()
+	for i, label := range []string{"older set after the newer one", "newer set re-bootstrap"} {
+		if errs[i] != nil {
+			t.Errorf("bootstrap %s: %v", label, errs[i])
+			failed = true
+		}
+	}
+	if olderName == newerName {
+		t.Errorf("distinct migration sets share the template name %q", olderName)
+		failed = true
+	}
+	if failed {
+		t.FailNow()
+	}
+
+	check := func(label, tmpl string, wantTables map[string]bool, wantVersion int64) {
+		t.Helper()
+		conn, err := pgx.Connect(ctx, newURLFrom(t, base, tmpl))
+		if err != nil {
+			t.Fatalf("%s: connect per-test db: %v", label, err)
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		for table, want := range wantTables {
+			var n int
+			if err := conn.QueryRow(ctx,
+				`SELECT count(*) FROM information_schema.tables WHERE table_name = $1`, table).Scan(&n); err != nil {
+				t.Fatalf("%s: query table %s: %v", label, table, err)
+			}
+			if (n == 1) != want {
+				t.Errorf("%s: table %s present=%v, want %v", label, table, n == 1, want)
+			}
+		}
+		var version int64
+		var dirty bool
+		if err := conn.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty); err != nil {
+			t.Fatalf("%s: read schema_migrations: %v", label, err)
+		}
+		if version != wantVersion || dirty {
+			t.Errorf("%s: schema_migrations = (%d, dirty=%v), want (%d, clean)", label, version, dirty, wantVersion)
+		}
+	}
+	check("older template", olderName, map[string]bool{"a_only": true, "b_only": false}, 1)
+	check("newer template", newerName, map[string]bool{"a_only": true, "b_only": true}, 2)
 }

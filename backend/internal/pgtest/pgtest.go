@@ -6,6 +6,17 @@
 // is shared across every test binary, and each test gets its own cheap
 // ephemeral database via CREATE DATABASE ... TEMPLATE.
 //
+// The template is keyed by the migration set (#3848). Its name is
+// fishhawk_tmpl_<12 hex of a sha256 over every embedded migration file's name
+// and bytes>, so two trees carrying different migration sets (two worktrees,
+// or main against a feature branch) that share the one reused container each
+// bootstrap and clone their OWN template. A fixed name made the first
+// bootstrapper's set win: a newer tree migrated it past an older tree's head
+// and the older tree then failed every test at setup with golang-migrate's
+// "no migration found for version N", while the reverse order ran the newer
+// tree against an under-migrated template. Distinct sets coexist as distinct
+// templates until the scripts/test lease drains and removes the container.
+//
 // Because `scripts/test` runs with TESTCONTAINERS_RYUK_DISABLED=true, the
 // named container persists across package processes, so three concurrency
 // hazards arise and are each handled with a pure, unit-testable classifier:
@@ -22,8 +33,8 @@
 //     once the dangling id is gone.
 //   - Cross-process template bootstrap (isDuplicateDatabase): each process
 //     has its own sync.Once, so the 2nd+ processes re-attempt CREATE DATABASE
-//     fishhawk_tmpl and hit SQLSTATE 42P04. The advisory-locked bootstrap
-//     tolerates 42P04 and adopts the already-bootstrapped template.
+//     fishhawk_tmpl_<digest> and hit SQLSTATE 42P04. The advisory-locked
+//     bootstrap tolerates 42P04 and adopts the already-bootstrapped template.
 //   - Per-test template contention (isTemplate1Contention): concurrent
 //     CREATE DATABASE ... TEMPLATE can fail with SQLSTATE 55006; a bounded
 //     retry rides it out.
@@ -46,8 +57,12 @@ package pgtest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -73,9 +88,12 @@ const (
 	baseUser      = "fishhawk"
 	basePass      = "fishhawk"
 
-	// templateDB is migrated once per container and used as the source
-	// for each per-test CREATE DATABASE ... TEMPLATE.
-	templateDB = "fishhawk_tmpl"
+	// templatePrefix + the migration-set digest names the template that is
+	// migrated once per migration set per container and used as the source
+	// for each per-test CREATE DATABASE ... TEMPLATE (#3848). The 26-byte
+	// result stays inside Postgres's 63-byte identifier limit.
+	templatePrefix = "fishhawk_tmpl_"
+	digestHexLen   = 12
 
 	// bootstrapLockKey serializes the template bootstrap across the
 	// processes sharing the container. Advisory locks are cluster-wide,
@@ -102,6 +120,10 @@ var (
 
 	externalOnce sync.Once
 	externalErr  error
+
+	embeddedTmplOnce sync.Once
+	embeddedTmpl     string
+	embeddedTmplErr  error
 )
 
 // NewURL returns the connection URL of a freshly-migrated, per-test
@@ -109,11 +131,17 @@ var (
 // is dropped via t.Cleanup. Skips the test if Docker is unavailable.
 func NewURL(t *testing.T) string {
 	t.Helper()
-	return newURLFrom(t, sharedBaseURL(t))
+	base := sharedBaseURL(t)
+	tmpl, err := embeddedTemplateName()
+	if err != nil {
+		t.Fatalf("resolve template name: %v", err)
+	}
+	return newURLFrom(t, base, tmpl)
 }
 
-// newURLFrom creates the per-test database on the server behind baseURL.
-func newURLFrom(t *testing.T, baseURL string) string {
+// newURLFrom creates the per-test database on the server behind baseURL,
+// cloned from the named template.
+func newURLFrom(t *testing.T, baseURL, tmpl string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -128,7 +156,7 @@ func newURLFrom(t *testing.T, baseURL string) string {
 	create := func() error {
 		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE %s",
 			pgx.Identifier{dbName}.Sanitize(),
-			pgx.Identifier{templateDB}.Sanitize()))
+			pgx.Identifier{tmpl}.Sanitize()))
 		return err
 	}
 	if err := createWithContentionRetry(contentionAttempts, contentionDelay, create); err != nil {
@@ -218,7 +246,7 @@ func bootstrapExternalOnce(baseURL string) error {
 	externalOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 		defer cancel()
-		externalErr = bootstrapTemplate(ctx, baseURL)
+		externalErr = bootstrapTemplate(ctx, baseURL, postgres.Migrations())
 	})
 	return externalErr
 }
@@ -255,15 +283,79 @@ func startSharedContainer() (string, error) {
 		return "", fmt.Errorf("connection string: %w", err)
 	}
 
-	if err := bootstrapTemplate(ctx, baseURL); err != nil {
+	if err := bootstrapTemplate(ctx, baseURL, postgres.Migrations()); err != nil {
 		return "", err
 	}
 	return baseURL, nil
 }
 
-// bootstrapTemplate creates and migrates the shared template database under
-// a cluster-wide advisory lock, tolerating the cross-process duplicate.
-func bootstrapTemplate(ctx context.Context, baseURL string) error {
+// migrationSetDigest returns the first digestHexLen lowercase hex characters
+// of a sha256 over every regular file in fsys: for each, in lexical walk
+// order, its path, a 0x00 separator, its 8-byte big-endian length, then its
+// bytes. The length frame and the separator keep the name/content boundary
+// unambiguous ({"a":"bc"} and {"ab":"c"} differ). A walk or read error is
+// returned with an empty digest, never a digest of a partial set.
+func migrationSetDigest(fsys fs.FS) (string, error) {
+	h := sha256.New()
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, err := fs.ReadFile(fsys, p)
+		if err != nil {
+			return err
+		}
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(data)))
+		h.Write([]byte(p))
+		h.Write([]byte{0})
+		h.Write(size[:])
+		h.Write(data)
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("digest migration set: %w", err)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:digestHexLen], nil
+}
+
+// templateNameFor is the template database name for a migration-set digest.
+func templateNameFor(digest string) string {
+	return templatePrefix + digest
+}
+
+// templateNameForFS is the template database name for the migration set in
+// fsys: the one seam every caller resolves a name through, so a test can
+// inject a failing FS.
+func templateNameForFS(fsys fs.FS) (string, error) {
+	digest, err := migrationSetDigest(fsys)
+	if err != nil {
+		return "", err
+	}
+	return templateNameFor(digest), nil
+}
+
+// embeddedTemplateName is the template name of the migration set this test
+// binary embeds, computed once per process.
+func embeddedTemplateName() (string, error) {
+	embeddedTmplOnce.Do(func() {
+		embeddedTmpl, embeddedTmplErr = templateNameForFS(postgres.Migrations())
+	})
+	return embeddedTmpl, embeddedTmplErr
+}
+
+// bootstrapTemplate creates and migrates the template database for the
+// migration set in fsys under a cluster-wide advisory lock, tolerating the
+// cross-process duplicate. The lock is shared by every set, but each set
+// writes only its own digest-named template, so sets never touch each other.
+func bootstrapTemplate(ctx context.Context, baseURL string, fsys fs.FS) error {
+	tmpl, err := templateNameForFS(fsys)
+	if err != nil {
+		return err
+	}
 	conn, err := pgx.Connect(ctx, baseURL)
 	if err != nil {
 		return fmt.Errorf("connect base db: %w", err)
@@ -276,29 +368,29 @@ func bootstrapTemplate(ctx context.Context, baseURL string) error {
 	defer func() { _, _ = conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", bootstrapLockKey) }()
 
 	createTemplate := func() error {
-		_, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{templateDB}.Sanitize())
+		_, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{tmpl}.Sanitize())
 		return err
 	}
 	migrateTemplate := func() error {
-		return postgres.MigrateUp(replaceDBName(baseURL, templateDB))
+		return postgres.MigrateUpFS(fsys, replaceDBName(baseURL, tmpl))
 	}
-	return bootstrapWith(createTemplate, migrateTemplate)
+	return bootstrapWith(tmpl, createTemplate, migrateTemplate)
 }
 
 // bootstrapWith is the pure, injectable core of bootstrapTemplate: create
 // the template, TOLERATING SQLSTATE 42P04 (duplicate_database) so a process
 // that lost the cross-process race ADOPTS the already-created template,
 // then run migrations (golang-migrate no-ops at head, so re-verifying an
-// adopted template is safe).
-func bootstrapWith(createTemplate, migrate func() error) error {
+// adopted template is safe). Errors name tmpl, i.e. the migration set.
+func bootstrapWith(tmpl string, createTemplate, migrate func() error) error {
 	if err := createTemplate(); err != nil {
 		if !isDuplicateDatabase(err) {
-			return fmt.Errorf("create template db: %w", err)
+			return fmt.Errorf("create template db %s: %w", tmpl, err)
 		}
 		// Adopted an already-bootstrapped template (cross-process race).
 	}
 	if err := migrate(); err != nil {
-		return fmt.Errorf("migrate template db: %w", err)
+		return fmt.Errorf("migrate template db %s: %w", tmpl, err)
 	}
 	return nil
 }
