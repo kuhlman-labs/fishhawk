@@ -56,6 +56,12 @@ type runResolver struct {
 	// the poll loop runs without wall-clock sleeps.
 	reviewPollInterval time.Duration
 
+	// acceptanceVerdictWindow, when non-zero, OVERRIDES
+	// acceptanceVerdictInFlightWindow for fishhawk_await_stage's acceptance
+	// verdict hold (E72.56 / #4072). Tests inject a tiny or a huge value to
+	// exercise the window-elapsed and caller-cap releases without a 120s wait.
+	acceptanceVerdictWindow time.Duration
+
 	// strandProbeTTL is how long fishhawk_await_review reuses one resolved
 	// /healthz process_start before re-probing WITHIN a single call (#2712).
 	// Zero falls back to strandProbeCacheTTL; tests inject a sub-millisecond
@@ -1755,7 +1761,7 @@ type GetRunStatusOutput struct {
 	// FAILED acceptance VERDICT leaves the stage 'succeeded' — this field
 	// tracks stage EXECUTION, not the verdict; read the acceptance_outcome_recorded
 	// audit entry (and next_actions) for the verdict + triage disposition.
-	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
+	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled, superseded (a coarser BUCKET than the raw stage 'state' the REST API reports; the mapping is total: pending -> pending, awaiting_host_dispatch -> pending, dispatched -> pending, awaiting_approval -> pending, awaiting_children -> pending, awaiting_input -> pending, awaiting_scope_decision -> pending, awaiting_deploy_approval -> pending, awaiting_deployment -> pending, running -> running, succeeded -> succeeded, failed -> failed, cancelled -> cancelled, superseded -> superseded, and any state added later also buckets to pending; superseded is TERMINAL — a merge made the stage unreachable (#3083) — so a wait on it resolves). Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence plus (when the agent wall clock is known) elapsed_seconds, agent_timeout_seconds and deadline_seconds_remaining. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition. verdict_pending is true when the stage settled succeeded within the ~2-minute in-flight window and no verdict is visible yet (the runner ships it AFTER the trace upload settles the stage, #4072): wait (fishhawk_await_stage holds for it) — do NOT fishhawk_retry_stage"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -2273,7 +2279,19 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// must read the audit payloads, not the stage state. Empty when the run
 	// declares no acceptance stage or the entries aged out of the window (the
 	// defensive arm covers that).
-	acceptanceVerdict := latestAcceptanceVerdict(recent)
+	//
+	// E72.56 / #4072: acceptanceVerdictSignal wraps latestAcceptanceVerdict and,
+	// when no verdict is visible, returns the classifier-local
+	// acceptanceVerdictPending sentinel for an acceptance stage that settled
+	// succeeded inside the in-flight window (the runner ships the verdict AFTER
+	// the trace upload settles the stage). Measured against the SAME waitNow
+	// the wait statuses above use. This read is the caller's clamped
+	// audit_limit window, NOT the await_stage probe's auditLimitMax window, so
+	// a too-narrow window fails toward verdict_pending, never toward retry.
+	acceptanceVerdict := acceptanceVerdictSignal(recent, stages, waitNow)
+	if acceptanceVerdict == acceptanceVerdictPending && acceptanceStageWaitStatus != nil {
+		acceptanceStageWaitStatus.VerdictPending = true
+	}
 	acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recent)
 	// E38.3 (#1657): the orchestrator auto-terminated the acceptance stage for an
 	// out_of_scope / zero-acceptance_criteria plan — read off the SAME recent

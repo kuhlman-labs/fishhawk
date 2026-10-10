@@ -5527,6 +5527,12 @@ type RunStageWait struct {
 	FailureCategory *string    `json:"failure_category,omitempty"`
 	FailureReason   *string    `json:"failure_reason,omitempty"`
 	StartedAt       *time.Time `json:"started_at,omitempty"`
+	// EndedAt is the embedded stage shape's `ended_at` (E72.56 / #4072):
+	// fishhawk_await_stage anchors its acceptance verdict hold's in-flight
+	// window on it. The tag MUST byte-match the backend's stageResponse
+	// (server/reads.go) or the field silently decodes to nil (the #371
+	// wire-mirror trap), which degrades the hold to a full window from now.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
 	// Concurrency is the embedded stage shape's `concurrency` block (#3964):
 	// fishhawk_await_stage holds through a settled awaiting_host_dispatch read
 	// while the stage is queued for a slot with a live waiter.
