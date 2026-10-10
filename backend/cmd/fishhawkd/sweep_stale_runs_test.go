@@ -339,7 +339,7 @@ func TestSweepStaleRuns_DryRunThenApply(t *testing.T) {
 	e.mkStage(decomposed.ID, 0, runpkg.StageTypeImplement, runpkg.StageStateAwaitingChildren)
 	decomposedChild := e.mkRun(&decomposed.ID, runpkg.StateRunning)
 
-	e.backdate(pendingAll.ID, prClosed.ID, merged.ID, unobserved.ID, staleChild.ID, decomposed.ID)
+	e.backdate(pendingAll.ID, prClosed.ID, merged.ID, unobserved.ID, staleChild.ID, decomposed.ID, decomposedChild.ID)
 
 	all := []uuid.UUID{abandoned.ID, pendingAll.ID, prClosed.ID, merged.ID, unobserved.ID, fresh.ID, staleChild.ID, decomposed.ID, decomposedChild.ID}
 	initial := map[uuid.UUID]runpkg.State{}

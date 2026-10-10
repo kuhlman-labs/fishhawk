@@ -43,7 +43,11 @@ type memRuns struct {
 	failOnTarget   map[uuid.UUID]run.State
 	listErr        error
 	cascadeListErr error
-	seq            int
+	// cascadeListOK is how many DecomposedFrom ListRuns calls succeed before
+	// cascadeListErr applies (0: it applies to the first).
+	cascadeListOK    int
+	decomposedListed int
+	seq              int
 }
 
 func newMemRuns() *memRuns {
@@ -92,6 +96,13 @@ func (m *memRuns) stageState(runID, stageID uuid.UUID) run.StageState {
 	return ""
 }
 
+// bumpStage moves the updated_at of runID's stage at index i.
+func (m *memRuns) bumpStage(runID uuid.UUID, i int, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stages[runID][i].UpdatedAt = at
+}
+
 func (m *memRuns) mutate(id uuid.UUID, f func(r *run.Run)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -119,7 +130,10 @@ func (m *memRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run,
 		return nil, m.listErr
 	}
 	if f.DecomposedFrom != nil && m.cascadeListErr != nil {
-		return nil, m.cascadeListErr
+		if m.decomposedListed >= m.cascadeListOK {
+			return nil, m.cascadeListErr
+		}
+		m.decomposedListed++
 	}
 	var matched []*run.Run
 	for _, r := range m.runs {
@@ -423,6 +437,60 @@ func TestFind_DecompositionChildExcluded(t *testing.T) {
 	assertUntouched(t, m, a, child.ID, run.StateRunning)
 }
 
+// TestFind_ChildActivityKeepsParent: a decomposed parent parked at
+// awaiting_children has a quiet chain of its own while its children progress,
+// and a child's runner carries the CHILD's --run-id. Each fixture's only
+// non-stale signal (or only live runner) is on the child, so dropping the
+// child half of readEvidence/classify makes the parent abandoned, and the
+// cancel cascade then cancels the busy child.
+func TestFind_ChildActivityKeepsParent(t *testing.T) {
+	for name, tc := range map[string]struct {
+		seed  func(m *memRuns, a *memAudit, child *run.Run)
+		live  bool
+		class Class
+	}{
+		"child run updated_at": {seed: func(m *memRuns, _ *memAudit, ch *run.Run) {
+			m.mutate(ch.ID, func(x *run.Run) { x.UpdatedAt = recent })
+		}, class: ClassFresh},
+		"child stage updated_at": {seed: func(m *memRuns, _ *memAudit, ch *run.Run) {
+			m.addStage(ch.ID, run.StageTypeImplement, run.StageStateRunning, recent)
+		}, class: ClassFresh},
+		"child audit entry": {seed: func(_ *memRuns, a *memAudit, ch *run.Run) {
+			a.seed(ch.ID, "stage_heartbeat", recent, nil)
+		}, class: ClassFresh},
+		"child live runner": {live: true, class: ClassLiveRunner},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, a := newMemRuns(), newMemAudit()
+			parent := m.addRun(run.StateRunning, stale, nil, "")
+			m.addStage(parent.ID, run.StageTypeImplement, run.StageStateAwaitingChildren, stale)
+			a.seed(parent.ID, "run_created", stale, nil)
+			child := m.addRun(run.StateRunning, stale, &parent.ID, "")
+			if tc.seed != nil {
+				tc.seed(m, a, child)
+			}
+			probe := noRunners
+			if tc.live {
+				probe = fakeProbe{rep: ProbeReport{RunIDs: map[uuid.UUID]bool{child.ID: true}}}
+			}
+			cands, res := sweep(t, m, a, probe, testOpts())
+			if c := candidateFor(t, cands, parent.ID); c.Class != tc.class || c.Action != ActionSkip {
+				t.Errorf("parent class/action = %s/%s, want %s/skip", c.Class, c.Action, tc.class)
+			}
+			if len(res) != 0 {
+				t.Errorf("Apply results = %+v, want none", res)
+			}
+			assertUntouched(t, m, a, parent.ID, run.StateRunning)
+			if s := m.state(child.ID); s != run.StateRunning {
+				t.Errorf("child state = %s, want running (untouched)", s)
+			}
+			if es, _ := a.ListForRunByCategory(context.Background(), child.ID, childcancel.Category); len(es) != 0 {
+				t.Errorf("child carries %d %s rows, want 0", len(es), childcancel.Category)
+			}
+		})
+	}
+}
+
 func TestFind_StagesSettled(t *testing.T) {
 	type stg struct {
 		typ   run.StageType
@@ -593,6 +661,15 @@ func TestFind_FailsClosed(t *testing.T) {
 		"ListRunsError":  func(m *memRuns, _ *memAudit, _ *run.Run) { m.listErr = errors.New("list boom") },
 		"StageReadError": func(m *memRuns, _ *memAudit, r *run.Run) { m.stageErr[r.ID] = errors.New("stage boom") },
 		"AuditReadError": func(_ *memRuns, a *memAudit, r *run.Run) { a.listErr[r.ID] = errors.New("audit boom") },
+		"ChildListError": func(m *memRuns, _ *memAudit, _ *run.Run) { m.cascadeListErr = errors.New("children boom") },
+		"ChildStageReadError": func(m *memRuns, _ *memAudit, r *run.Run) {
+			ch := m.addRun(run.StateRunning, stale, &r.ID, "")
+			m.stageErr[ch.ID] = errors.New("child stage boom")
+		},
+		"ChildAuditReadError": func(m *memRuns, a *memAudit, r *run.Run) {
+			ch := m.addRun(run.StateRunning, stale, &r.ID, "")
+			a.listErr[ch.ID] = errors.New("child audit boom")
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m, a := newMemRuns(), newMemAudit()
@@ -651,11 +728,14 @@ func TestApply_ReReadTerminalSkips(t *testing.T) {
 }
 
 func TestApply_ChangedSinceScanSkips(t *testing.T) {
+	// The run's updated_at starts and ends BELOW the stage/audit signals, so
+	// only the run-updated_at leg sees the move.
 	t.Run("updated_at moved but still stale", func(t *testing.T) {
 		m, a := newMemRuns(), newMemAudit()
 		r := staleRunning(m, a)
+		m.mutate(r.ID, func(x *run.Run) { x.UpdatedAt = stale.Add(-48 * time.Hour) })
 		cands, _, _ := Find(context.Background(), m, a, noRunners, testOpts())
-		m.mutate(r.ID, func(x *run.Run) { x.UpdatedAt = stale.Add(time.Hour) })
+		m.mutate(r.ID, func(x *run.Run) { x.UpdatedAt = stale.Add(-24 * time.Hour) })
 		res := Apply(context.Background(), m, a, cands, testOpts())
 		if got := resultFor(t, res, r.ID); got.Outcome != OutcomeSkippedChanged {
 			t.Errorf("outcome = %s, want skipped_changed", got.Outcome)
@@ -676,25 +756,67 @@ func TestApply_ChangedSinceScanSkips(t *testing.T) {
 	t.Run("hand-built fresh snapshot (threshold leg alone)", func(t *testing.T) {
 		m, a := newMemRuns(), newMemAudit()
 		r := m.addRun(run.StateRunning, recent, nil, "")
-		c := Candidate{Run: r, Class: ClassAbandoned, Action: ActionCancel, Target: run.StateCancelled, Reason: ReasonStaleSweep}
+		c := Candidate{Run: r, Class: ClassAbandoned, Action: ActionCancel, Target: run.StateCancelled, Reason: ReasonStaleSweep, LastActivity: recent}
 		res := Apply(context.Background(), m, a, []Candidate{c}, testOpts())
 		if got := resultFor(t, res, r.ID); got.Outcome != OutcomeSkippedChanged {
 			t.Errorf("outcome = %s, want skipped_changed", got.Outcome)
 		}
 		assertUntouched(t, m, a, r.ID, run.StateRunning)
 	})
+	// Activity that lands on a stage, the chain or a child between Find and
+	// Apply, with run.updated_at untouched: only the evidence re-read sees it.
+	for name, bump := range map[string]func(m *memRuns, a *memAudit, r *run.Run, child *run.Run){
+		"stage updated_at moved but still stale": func(m *memRuns, _ *memAudit, r *run.Run, _ *run.Run) {
+			m.bumpStage(r.ID, 0, stale.Add(time.Hour))
+		},
+		"stage heartbeat inside the threshold": func(m *memRuns, _ *memAudit, r *run.Run, _ *run.Run) {
+			m.bumpStage(r.ID, 0, recent)
+		},
+		"audit entry after the scan": func(_ *memRuns, a *memAudit, r *run.Run, _ *run.Run) {
+			a.seed(r.ID, "stage_heartbeat", stale.Add(time.Hour), nil)
+		},
+		"child activity after the scan": func(m *memRuns, _ *memAudit, _ *run.Run, child *run.Run) {
+			m.mutate(child.ID, func(x *run.Run) { x.UpdatedAt = stale.Add(time.Hour) })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, a := newMemRuns(), newMemAudit()
+			r := staleRunning(m, a)
+			child := m.addRun(run.StateRunning, stale, &r.ID, "")
+			cands, _, _ := Find(context.Background(), m, a, noRunners, testOpts())
+			if c := candidateFor(t, cands, r.ID); c.Class != ClassAbandoned {
+				t.Fatalf("scan class = %s, want abandoned", c.Class)
+			}
+			bump(m, a, r, child)
+			res := Apply(context.Background(), m, a, cands, testOpts())
+			if got := resultFor(t, res, r.ID); got.Outcome != OutcomeSkippedChanged {
+				t.Errorf("outcome = %s, want skipped_changed", got.Outcome)
+			}
+			assertUntouched(t, m, a, r.ID, run.StateRunning)
+			if s := m.state(child.ID); s != run.StateRunning {
+				t.Errorf("child state = %s, want running", s)
+			}
+		})
+	}
 }
 
 func TestApply_ReReadError(t *testing.T) {
-	m, a := newMemRuns(), newMemAudit()
-	r := staleRunning(m, a)
-	cands, _, _ := Find(context.Background(), m, a, noRunners, testOpts())
-	m.getErr[r.ID] = errors.New("get boom")
-	got := resultFor(t, Apply(context.Background(), m, a, cands, testOpts()), r.ID)
-	if got.Outcome != OutcomeFailed || got.Err == nil || !strings.Contains(got.Err.Error(), "get boom") {
-		t.Errorf("result = %+v, want failed carrying the read error", got)
+	for name, inject := range map[string]func(m *memRuns, r *run.Run){
+		"get boom":   func(m *memRuns, r *run.Run) { m.getErr[r.ID] = errors.New("get boom") },
+		"stage boom": func(m *memRuns, r *run.Run) { m.stageErr[r.ID] = errors.New("stage boom") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, a := newMemRuns(), newMemAudit()
+			r := staleRunning(m, a)
+			cands, _, _ := Find(context.Background(), m, a, noRunners, testOpts())
+			inject(m, r)
+			got := resultFor(t, Apply(context.Background(), m, a, cands, testOpts()), r.ID)
+			if got.Outcome != OutcomeFailed || got.Err == nil || !strings.Contains(got.Err.Error(), name) {
+				t.Errorf("result = %+v, want failed carrying the read error", got)
+			}
+			assertUntouched(t, m, a, r.ID, run.StateRunning)
+		})
 	}
-	assertUntouched(t, m, a, r.ID, run.StateRunning)
 }
 
 func TestApply_TransitionError(t *testing.T) {
@@ -823,7 +945,7 @@ func TestApply_CascadesToChildren(t *testing.T) {
 	m, a := newMemRuns(), newMemAudit()
 	parent := m.addRun(run.StateRunning, stale, nil, "")
 	m.addStage(parent.ID, run.StageTypeImplement, run.StageStateAwaitingChildren, stale)
-	child := m.addRun(run.StateRunning, recent, &parent.ID, "")
+	child := m.addRun(run.StateRunning, stale, &parent.ID, "")
 	_, res := sweep(t, m, a, noRunners, testOpts())
 	got := resultFor(t, res, parent.ID)
 	if got.Outcome != OutcomeTransitioned || got.ChildrenCancelled != 1 || got.Err != nil {
@@ -851,6 +973,7 @@ func TestApply_CascadeErrorsRecorded(t *testing.T) {
 		m, a := newMemRuns(), newMemAudit()
 		r := staleRunning(m, a)
 		m.cascadeListErr = errors.New("children boom")
+		m.cascadeListOK = 2 // Find's and Apply's evidence reads succeed; the cascade's list fails
 		got := resultFor(t, func() []Result { _, res := sweep(t, m, a, noRunners, testOpts()); return res }(), r.ID)
 		if got.Outcome != OutcomeTransitioned || got.Err == nil || !strings.Contains(got.Err.Error(), "cascade: ") {
 			t.Errorf("result = %+v, want transitioned carrying the cascade error", got)
@@ -865,7 +988,7 @@ func TestApply_CascadeErrorsRecorded(t *testing.T) {
 	t.Run("child failure", func(t *testing.T) {
 		m, a := newMemRuns(), newMemAudit()
 		r := staleRunning(m, a)
-		child := m.addRun(run.StateRunning, recent, &r.ID, "")
+		child := m.addRun(run.StateRunning, stale, &r.ID, "")
 		m.transitionErr[child.ID] = errors.New("child boom")
 		_, res := sweep(t, m, a, noRunners, testOpts())
 		got := resultFor(t, res, r.ID)

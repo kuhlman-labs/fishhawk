@@ -5,8 +5,9 @@
 // It is the core of the one-shot operator subcommand `fishhawkd
 // sweep-stale-runs`. Find pages every pending and running run, drops
 // decomposition children (those belong to `fishhawkd
-// reconcile-orphan-children`, #4186), reads each run's stages and audit chain,
-// and classifies it (first match wins): fresh, live_runner, stages_settled,
+// reconcile-orphan-children`, #4186), reads each run's stages and audit chain
+// (and its decomposition children's, so a busy child keeps a quiet parent
+// fresh), and classifies it (first match wins): fresh, live_runner, stages_settled,
 // merged, pr_closed, pr_unobserved, abandoned. Apply transitions the
 // candidates whose class calls for it through the run state machine, cancels
 // the parked stages of a cancelled run, cascades the cancel to decomposition
@@ -57,10 +58,11 @@ type Class string
 
 // The class vocabulary, in precedence order.
 const (
-	// ClassFresh: some activity signal falls inside the threshold. Skipped.
+	// ClassFresh: some activity signal on the run or one of its decomposition
+	// children falls inside the threshold. Skipped.
 	ClassFresh Class = "fresh"
-	// ClassLiveRunner: a host fishhawk-runner process carries this run's id.
-	// Skipped.
+	// ClassLiveRunner: a host fishhawk-runner process carries this run's id or
+	// one of its decomposition children's. Skipped.
 	ClassLiveRunner Class = "live_runner"
 	// ClassStagesSettled: Advance's own walk says the run should already have
 	// completed. Reconciled to the completeRun target.
@@ -133,8 +135,10 @@ const (
 	// OutcomeSkippedTerminal: the re-read found the run terminal, or the state
 	// machine refused the transition (a race). No row.
 	OutcomeSkippedTerminal Outcome = "skipped_terminal"
-	// OutcomeSkippedChanged: the run's updated_at moved since the scan, or is
-	// now inside the threshold. No transition, no row.
+	// OutcomeSkippedChanged: the re-read found new activity since the scan
+	// (the run's updated_at moved, or any run/stage/audit/child signal is
+	// newer than the scanned last activity), or the newest signal is now
+	// inside the threshold. No transition, no row.
 	OutcomeSkippedChanged Outcome = "skipped_changed"
 	// OutcomeFailed: the re-read or a transition failed with a non-transition
 	// error. Err is set; no row.
@@ -228,8 +232,9 @@ type Result struct {
 // Find pages every pending and running run (every tenant: the filter's
 // AccountID is left empty, the host-admin convention), COLLECTS the full set
 // before reading anything else, drops decomposition children, reads each run's
-// stages and audit chain, probes for live runners once, and classifies each
-// run. Any run-list, stage or audit read error fails the WHOLE scan closed
+// stages and audit chain plus its children's (readEvidence), probes for live
+// runners once, and classifies each run. Any run-list, child-list, stage or
+// audit read error fails the WHOLE scan closed
 // (nil candidates): unreadable evidence must never default a run into a
 // cancelling class. A probe failure does NOT fail the scan; it is returned in
 // ProbeReport.Err and no run is classified live_runner — the caller must
@@ -249,34 +254,87 @@ func Find(ctx context.Context, runs RunStore, au AuditStore, probe RunnerProbe, 
 		}
 	}
 
-	type evidence struct {
-		r       *run.Run
-		stages  []*run.Stage
-		entries []*audit.Entry
-	}
 	var scanned []evidence
 	for _, r := range collected {
 		if r.DecomposedFrom != nil {
 			continue
 		}
-		stages, err := runs.ListStagesForRun(ctx, r.ID)
+		ev, err := readEvidence(ctx, runs, au, r)
 		if err != nil {
-			return nil, ProbeReport{}, fmt.Errorf("list stages of run %s: %w", r.ID, err)
+			return nil, ProbeReport{}, err
 		}
-		entries, err := au.ListForRun(ctx, r.ID)
-		if err != nil {
-			return nil, ProbeReport{}, fmt.Errorf("list audit entries of run %s: %w", r.ID, err)
-		}
-		scanned = append(scanned, evidence{r: r, stages: stages, entries: entries})
+		scanned = append(scanned, ev)
 	}
 
 	report := probeOnce(ctx, probe)
 	now := opts.now()
 	out := make([]Candidate, 0, len(scanned))
 	for _, e := range scanned {
-		out = append(out, classify(e.r, e.stages, e.entries, report.RunIDs, now, opts))
+		out = append(out, classify(e, report.RunIDs, now, opts))
 	}
 	return out, report, nil
+}
+
+// evidence is one top-level run's activity evidence: its stages and audit
+// chain, plus its decomposition children's ids and newest activity. A child's
+// progress writes to the CHILD's rows and chain (the parent chain sees only
+// settlement events) and its fishhawk-runner carries the child's --run-id, so
+// a parent parked at awaiting_children reads quiet while a child is busy; the
+// child half is what keeps the sweep (and the cancel cascade) off it.
+type evidence struct {
+	r             *run.Run
+	stages        []*run.Stage
+	entries       []*audit.Entry
+	childIDs      []uuid.UUID
+	childActivity time.Time
+}
+
+// activity is the newest activity signal on the run or any of its children.
+func (e evidence) activity() time.Time {
+	last := lastActivity(e.r, e.stages, e.entries)
+	if e.childActivity.After(last) {
+		last = e.childActivity
+	}
+	return last
+}
+
+// readEvidence reads r's stages and audit chain, then pages its decomposition
+// children (ListRuns by DecomposedFrom, every state) and reads each child's
+// stages and chain for its last activity. Any read error is returned: the
+// caller fails closed.
+func readEvidence(ctx context.Context, runs RunStore, au AuditStore, r *run.Run) (evidence, error) {
+	ev := evidence{r: r}
+	var err error
+	if ev.stages, err = runs.ListStagesForRun(ctx, r.ID); err != nil {
+		return evidence{}, fmt.Errorf("list stages of run %s: %w", r.ID, err)
+	}
+	if ev.entries, err = au.ListForRun(ctx, r.ID); err != nil {
+		return evidence{}, fmt.Errorf("list audit entries of run %s: %w", r.ID, err)
+	}
+	for offset := 0; ; offset += pageSize {
+		page, err := runs.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &r.ID, Limit: pageSize, Offset: offset})
+		if err != nil {
+			return evidence{}, fmt.Errorf("list decomposition children of run %s: %w", r.ID, err)
+		}
+		for _, ch := range page {
+			stages, err := runs.ListStagesForRun(ctx, ch.ID)
+			if err != nil {
+				return evidence{}, fmt.Errorf("list stages of child run %s: %w", ch.ID, err)
+			}
+			entries, err := au.ListForRun(ctx, ch.ID)
+			if err != nil {
+				return evidence{}, fmt.Errorf("list audit entries of child run %s: %w", ch.ID, err)
+			}
+			ev.childIDs = append(ev.childIDs, ch.ID)
+			if t := lastActivity(ch, stages, entries); t.After(ev.childActivity) {
+				ev.childActivity = t
+			}
+		}
+		if len(page) < pageSize {
+			break
+		}
+	}
+	return ev, nil
 }
 
 // probeOnce runs the probe, folding its error (or an absent probe) into
@@ -383,12 +441,14 @@ func prEvidence(r *run.Run, entries []*audit.Entry) PREvidence {
 }
 
 // classify assigns the first matching class. See the package README for the
-// precedence table.
-func classify(r *run.Run, stages []*run.Stage, entries []*audit.Entry, live map[uuid.UUID]bool, now time.Time, opts Options) Candidate {
+// precedence table. Freshness and the live-runner check both count the run's
+// decomposition children: a quiet parent with a busy child is not stale.
+func classify(e evidence, live map[uuid.UUID]bool, now time.Time, opts Options) Candidate {
+	r, stages := e.r, e.stages
 	c := Candidate{
 		Run: r, Stages: stages, Action: ActionSkip,
-		LastActivity: lastActivity(r, stages, entries),
-		PREvidence:   prEvidence(r, entries),
+		LastActivity: e.activity(),
+		PREvidence:   prEvidence(r, e.entries),
 	}
 	if r.PullRequestURL != nil {
 		c.PullRequestURL = *r.PullRequestURL
@@ -397,7 +457,7 @@ func classify(r *run.Run, stages []*run.Stage, entries []*audit.Entry, live map[
 		c.Class = ClassFresh
 		return c
 	}
-	if live[r.ID] {
+	if live[r.ID] || anyLive(e.childIDs, live) {
 		c.Class = ClassLiveRunner
 		return c
 	}
@@ -446,6 +506,16 @@ func classify(r *run.Run, stages []*run.Stage, entries []*audit.Entry, live map[
 	return c
 }
 
+// anyLive reports whether the probe saw a runner for any of ids.
+func anyLive(ids []uuid.UUID, live map[uuid.UUID]bool) bool {
+	for _, id := range ids {
+		if live[id] {
+			return true
+		}
+	}
+	return false
+}
+
 // transitionPath is the sequence of legal TransitionRun targets from from to
 // target: pending→succeeded is not a legal edge, so it walks via running.
 func transitionPath(from, target run.State) []run.State {
@@ -456,9 +526,11 @@ func transitionPath(from, target run.State) []run.State {
 }
 
 // Apply transitions every candidate whose Action transitions, in order, and
-// returns one Result each. Per candidate: (a) re-read the run — terminal →
-// skipped_terminal; updated_at moved since the snapshot or inside the
-// threshold → skipped_changed; a read error → failed. (b) Walk the legal
+// returns one Result each. Per candidate: (a) re-read the run, its stages, its
+// audit chain and its children's — terminal → skipped_terminal; updated_at
+// moved since the snapshot, any activity signal newer than the scan's, or the
+// newest one inside the threshold → skipped_changed; a read error → failed.
+// (b) Walk the legal
 // transition path; an InvalidTransitionError → skipped_terminal, any other
 // error → failed, both with no row. (c) A cancelled target also CAS-cancels
 // every non-terminal stage (pinned to its scanned state; a refused CAS is
@@ -490,7 +562,17 @@ func applyOne(ctx context.Context, runs RunStore, au AuditStore, c Candidate, op
 		res.Outcome = OutcomeSkippedTerminal
 		return res
 	}
-	if cur.UpdatedAt.After(c.Run.UpdatedAt) || opts.now().Sub(cur.UpdatedAt) < opts.Threshold {
+	// Find's freshness rule counts stage, audit and child activity, so the
+	// re-read does too: a heartbeat or audit row that landed after the scan
+	// skips the run exactly as it would have at scan time.
+	ev, err := readEvidence(ctx, runs, au, cur)
+	if err != nil {
+		res.Outcome = OutcomeFailed
+		res.Err = fmt.Errorf("re-read evidence: %w", err)
+		return res
+	}
+	last := ev.activity()
+	if cur.UpdatedAt.After(c.Run.UpdatedAt) || last.After(c.LastActivity) || opts.now().Sub(last) < opts.Threshold {
 		res.Outcome = OutcomeSkippedChanged
 		return res
 	}
