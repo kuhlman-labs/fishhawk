@@ -17756,6 +17756,37 @@ func TestGetRunStatus_AcceptanceHeldOnPartialIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("authority present + PARTIAL (wave-0) record + implement succeeded HOLDS naming integrate-wave, not re-drive", func(t *testing.T) {
+		// #4221: the FINAL slices_integrated of a multi-wave fan-out was lost and
+		// only the wave-0 record (covering a) survives. Every child succeeded,
+		// so no fan-in is coming and b must not be re-driven: the hold names the
+		// integrate-wave recovery and the uncovered child.
+		fb, r, parent, b := setup(t, func(a, _ uuid.UUID) []string { return []string{a.String()} })
+		withSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != acceptanceHeldIntegrationIncompleteState {
+			t.Fatalf("next_actions = %+v, want state %s", out.NextActions, acceptanceHeldIntegrationIncompleteState)
+		}
+		if offersAcceptanceDispatch(out.NextActions) {
+			t.Errorf("next_actions still offers an acceptance dispatch: %+v", out.NextActions.Actions)
+		}
+		first := out.NextActions.Actions[0]
+		if first.Action != "fishhawk_await_children" || first.Params["run_id"] != parent.String() {
+			t.Errorf("first action = %+v, want fishhawk_await_children on the parent", first)
+		}
+		for _, want := range []string{"/v0/runs/" + parent.String() + "/integrate-wave", b.String()} {
+			if !strings.Contains(first.Reason, want) {
+				t.Errorf("reason %q missing %q", first.Reason, want)
+			}
+		}
+		if strings.Contains(first.Reason, "re-drive") {
+			t.Errorf("reason %q must not advise a re-drive: %s already succeeded", first.Reason, b)
+		}
+	})
+
 	t.Run("authority absent + PARTIAL record keeps the dispatch", func(t *testing.T) {
 		// The server's predicate says no authority: its gate admits without a
 		// coverage check, so the partial record that would otherwise hold is
