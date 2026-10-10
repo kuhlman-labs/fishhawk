@@ -3057,21 +3057,37 @@ func TestValidate_PartialWithoutRemainingScope(t *testing.T) {
 	}
 }
 
-// TestValidate_UnknownDeliveryValue_Rejected pins the enum.
+// TestValidate_UnknownDeliveryValue_Rejected pins the delivery enum on BOTH
+// entry points. The case and whitespace variants matter because
+// IsPartialDelivery is case-sensitive: a schema that admitted `Partial` (or
+// ` partial`) would let a plan meant as partial read as a full delivery and
+// close the issue on merge. The fixtures carry no remaining_scope, so
+// checkDelivery has nothing to refuse for a non-`partial` value and only the
+// schema enum can reject it.
 func TestValidate_UnknownDeliveryValue_Rejected(t *testing.T) {
-	err := plan.Validate(deliveryPlan(t, "slice", ""))
-	var se *plan.SchemaError
-	if !errors.As(err, &se) {
-		t.Fatalf("err = %v, want *SchemaError", err)
-	}
-	found := false
-	for _, v := range se.Violations {
-		if v.Path == "/delivery" {
-			found = true
+	for _, value := range []string{"slice", "Partial", "PARTIAL", " partial", "partial ", "none"} {
+		data := deliveryPlan(t, value, "")
+		for name, run := range map[string]func() error{
+			"Validate": func() error { return plan.Validate(data) },
+			"Parse":    func() error { _, err := plan.Parse(data); return err },
+		} {
+			t.Run(fmt.Sprintf("%s/%q", name, value), func(t *testing.T) {
+				err := run()
+				var se *plan.SchemaError
+				if !errors.As(err, &se) {
+					t.Fatalf("err = %v, want *SchemaError", err)
+				}
+				found := false
+				for _, v := range se.Violations {
+					if v.Path == "/delivery" {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("Violations should name /delivery; got %+v", se.Violations)
+				}
+			})
 		}
-	}
-	if !found {
-		t.Errorf("Violations should name /delivery; got %+v", se.Violations)
 	}
 }
 
