@@ -816,7 +816,8 @@
         "ADR-043"
       ],
       "superseded_by": [
-        "ADR-092"
+        "ADR-092",
+        "ADR-093"
       ],
       "applies_to": []
     },
@@ -836,6 +837,20 @@
       "status": "accepted",
       "supersedes": [
         "ADR-090"
+      ],
+      "superseded_by": [
+        "ADR-093"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-093",
+      "title": "A Fishhawk-owned merge queue: extend ADR-092's per-base serializer so the queue advances, verifies and MERGES the head of line, provider-agnostic, batch size 1",
+      "path": "docs/adr/093-fishhawk-owned-merge-queue.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-090",
+        "ADR-092"
       ],
       "superseded_by": [],
       "applies_to": []
