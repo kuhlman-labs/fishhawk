@@ -43,9 +43,12 @@ type AwaitChildrenInput struct {
 //   - "integration_pending"   — every child succeeded but the newest
 //     slices_integrated entry does not cover every child (#4080): the
 //     consolidated branch lacks those slices, so acceptance and review wait.
-//     Also released when the server HAS slice-integration authority, the
-//     parent's implement stage succeeded and NO record exists — the lost
-//     slices_integrated append (#4165) — naming the integrate-wave recovery.
+//     When the server HAS slice-integration authority and the parent's
+//     implement stage already succeeded, the uncovered slices mean a lost
+//     best-effort slices_integrated append — NO record at all (#4165), or only
+//     an earlier between-wave record surviving a lost FINAL append in a
+//     multi-wave fan-out (#4221) — and the release names the integrate-wave
+//     recovery instead of re-driving the already-succeeded children.
 //   - "children_settled"      — every child succeeded AND the newest
 //     slices_integrated entry covers every child (#4080; before, any terminal
 //     fan-out released this). On a deployment with no slice-integration
@@ -177,14 +180,18 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               advanced (consolidate would answer 409
                               not_awaiting_children) the message names the real
                               recovery — re-drive or resume the uncovered child.
-                              When the server HAS slice-integration authority,
-                              the parent's implement stage succeeded and NO
-                              slices_integrated record exists, the record was
-                              lost: the server refuses acceptance 409
+                              When the server HAS slice-integration authority
+                              and the parent's implement stage succeeded, the
+                              uncovered slices mean the record was lost — no
+                              slices_integrated record at all, or only an
+                              earlier between-wave record because the FINAL
+                              append of a multi-wave fan-out was lost: the
+                              server refuses acceptance 409
                               acceptance_integration_incomplete, next_step is
                               fishhawk_get_run_status on the parent and the
                               message names the recovery, POST
-                              /v0/runs/{run_id}/integrate-wave.
+                              /v0/runs/{run_id}/integrate-wave (do NOT re-drive
+                              the uncovered children; they already succeeded).
   - "children_settled"      — every child succeeded AND the newest
                               slices_integrated record covers every child.
                               next_step is fishhawk_consolidate_slices. On a
@@ -446,9 +453,10 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 			return awaitChildrenNoAuthorityOutput(base, parentUUID, cs, parentImplementState, authority), true, nil
 		}
 		if fanInRecordLost(cs, parentImplementState, authority) {
-			// #4165: authority present, the parent advanced, and the fan-in
-			// record was lost — the server refuses acceptance and nothing
-			// re-integrates on its own. Hold, and name the recovery.
+			// #4165/#4221: authority present, the parent advanced, and the
+			// fan-in record covering every child was lost (no record, or only
+			// an earlier between-wave one) — the server refuses acceptance and
+			// nothing re-integrates on its own. Hold, and name the recovery.
 			return awaitChildrenFanInRecordLostOutput(base, parentUUID, cs), true, nil
 		}
 		return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
@@ -499,12 +507,14 @@ func awaitChildrenNoAuthorityOutput(base AwaitChildrenOutput, parentUUID uuid.UU
 }
 
 // awaitChildrenFanInRecordLostOutput builds the integration_pending release for
-// the #4165 wedge (fanInRecordLost): every child succeeded, the server HAS
-// slice-integration authority, the parent's implement stage already succeeded,
-// and no slices_integrated record exists. It holds — agreeing with the
-// server's 409 acceptance_integration_incomplete — and names the recovery,
-// POST /v0/runs/{run_id}/integrate-wave. next_step is fishhawk_get_run_status
-// on the PARENT (its next_actions carry the same hold and recovery).
+// the lost-record wedge (fanInRecordLost, #4165/#4221): every child succeeded,
+// the server HAS slice-integration authority, the parent's implement stage
+// already succeeded, and the newest slices_integrated record (if any) does not
+// cover every child. It holds — agreeing with the server's 409
+// acceptance_integration_incomplete — and names the recovery, POST
+// /v0/runs/{run_id}/integrate-wave, never a re-drive of the uncovered
+// children (they already succeeded). next_step is fishhawk_get_run_status on
+// the PARENT (its next_actions carry the same hold and recovery).
 func awaitChildrenFanInRecordLostOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus) AwaitChildrenOutput {
 	out := base
 	out.Status = "integration_pending"
@@ -512,12 +522,12 @@ func awaitChildrenFanInRecordLostOutput(base AwaitChildrenOutput, parentUUID uui
 	out.NextStep = &SuggestedAction{
 		Action:       "fishhawk_get_run_status",
 		Params:       map[string]string{"run_id": parentUUID.String()},
-		Precondition: "every child succeeded and the parent's implement stage succeeded, but no slices_integrated record exists although the server has slice-integration authority",
+		Precondition: "every child succeeded and the parent's implement stage succeeded, but the newest slices_integrated record (if any) does not cover every child although the server has slice-integration authority",
 		Consumes:     "none",
-		Reason:       "the fan-in record was lost; the server refuses acceptance 409 acceptance_integration_incomplete until POST /v0/runs/" + parentUUID.String() + "/integrate-wave rewrites it",
+		Reason:       "the fan-in record covering every child was lost; the server refuses acceptance 409 acceptance_integration_incomplete until POST /v0/runs/" + parentUUID.String() + "/integrate-wave rewrites it",
 	}
 	out.Message = fmt.Sprintf("all %d children succeeded but %s, then re-invoke fishhawk_await_children.",
-		cs.Total, fanInRecordLostRecovery(parentUUID.String()))
+		cs.Total, fanInRecordLostRecovery(parentUUID.String(), cs))
 	return out
 }
 

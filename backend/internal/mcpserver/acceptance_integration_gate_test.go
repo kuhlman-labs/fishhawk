@@ -213,12 +213,88 @@ func TestFoldAcceptanceIntegrationHold_FanInRecordLost(t *testing.T) {
 	}
 }
 
-// TestFanInRecordLost pins the wedge predicate's every conjunct: it needs a
-// POSITIVE authority, no record, no failure, and a SUCCEEDED parent.
+// TestFoldAcceptanceIntegrationHold_LostFinalRecordMultiWave pins the #4221
+// generalisation: a two-wave fan-out whose FINAL slices_integrated append was
+// lost, with only the wave-0 record (covering child-a) surviving. Every child
+// succeeded, authority is present and the parent's implement stage succeeded,
+// so the server refuses acceptance 409 and nothing re-integrates on its own.
+// The hold must name integrate-wave and the uncovered child — never the
+// generic "wait for the fan-in" (no fan-in is coming) nor a re-drive of an
+// already-succeeded child. MECHANISM: fanInRecorded is true here, so the old
+// !fanInRecorded conjunct would drop this snapshot to the generic reason.
+func TestFoldAcceptanceIntegrationHold_LostFinalRecordMultiWave(t *testing.T) {
+	na := acceptancePendingActions("parent-1")
+	foldAcceptanceIntegrationHold("parent-1", partialChildrenStatus(), "succeeded", &runSliceIntegration{Available: true}, na)
+
+	if na.State != acceptanceHeldIntegrationIncompleteState {
+		t.Fatalf("state = %q, want %s", na.State, acceptanceHeldIntegrationIncompleteState)
+	}
+	if offersAcceptanceDispatch(na) {
+		t.Errorf("actions still offer an acceptance dispatch: %+v", na.Actions)
+	}
+	first := na.Actions[0]
+	if first.Action != "fishhawk_await_children" || first.Params["run_id"] != "parent-1" {
+		t.Errorf("first action = %+v, want fishhawk_await_children on the parent", first)
+	}
+	for _, want := range []string{"POST /v0/runs/parent-1/integrate-wave", "acceptance_integration_incomplete", "child-b", "final", "covers only an earlier wave"} {
+		if !strings.Contains(first.Reason, want) {
+			t.Errorf("reason %q missing %q", first.Reason, want)
+		}
+	}
+	for _, banned := range []string{"re-drive", "wait for the fan-in to cover every child"} {
+		if strings.Contains(first.Reason, banned) {
+			t.Errorf("reason %q must not contain %q (the uncovered child already succeeded; no fan-in is coming)", first.Reason, banned)
+		}
+	}
+}
+
+// TestFanInRecordLost pins the wedge predicate's every conjunct (#4165,
+// generalised in #4221): a POSITIVE authority, a SUCCEEDED parent, every child
+// succeeded, no newer failure, and a newest clean record that does not cover
+// every child. Each FALSE case varies exactly one conjunct from a TRUE base
+// (two succeeded children, slice 1 depending on slice 0), so deleting any one
+// conjunct reddens exactly the case it isolates.
 func TestFanInRecordLost(t *testing.T) {
 	avail := &runSliceIntegration{Available: true}
 	unavail := &runSliceIntegration{Available: false, Reason: "run has no installation_id"}
-	none := &ChildrenStatus{}
+	// base: no record of any kind (the #4165 case) — both children uncovered.
+	base := func() *ChildrenStatus {
+		return &ChildrenStatus{
+			IntegrationPhase: integrationPhaseReadyToIntegrate,
+			Children: []ChildStatus{
+				{RunID: "child-a", SliceIndex: 0, State: "succeeded"},
+				{RunID: "child-b", SliceIndex: 1, State: "succeeded", DependsOn: []int{0}},
+			},
+			Total:                   2,
+			Succeeded:               2,
+			UnintegratedChildRunIDs: []string{"child-a", "child-b"},
+		}
+	}
+	// betweenWave: the wave-0 record (child-a) survives, the final one was lost
+	// (the #4221 case).
+	betweenWave := func() *ChildrenStatus {
+		cs := base()
+		cs.fanInRecorded = true
+		cs.IntegratedChildRunIDs = []string{"child-a"}
+		cs.UnintegratedChildRunIDs = []string{"child-b"}
+		return cs
+	}
+	withFailure := base()
+	withFailure.fanInRecorded = true
+	withFailure.IntegrationFailure = &integrationFailure{Cause: auditCategorySliceHeadMissing, ChildRunID: "child-b"}
+	// fullCoverage: every other conjunct holds; only the coverage conjunct can
+	// make it false.
+	fullCoverage := betweenWave()
+	fullCoverage.IntegratedChildRunIDs = []string{"child-a", "child-b"}
+	fullCoverage.UnintegratedChildRunIDs = nil
+	// childNotSucceeded: child-b unknown (its read failed) while the uncovered
+	// set is still non-empty, so only allChildrenSucceeded can make it false.
+	childNotSucceeded := betweenWave()
+	childNotSucceeded.Children[1].State = "unknown"
+	childNotSucceeded.Succeeded = 1
+	childNotSucceeded.IntegratedChildRunIDs = nil
+	childNotSucceeded.UnintegratedChildRunIDs = []string{"child-a"}
+
 	cases := []struct {
 		name      string
 		cs        *ChildrenStatus
@@ -226,19 +302,54 @@ func TestFanInRecordLost(t *testing.T) {
 		authority *runSliceIntegration
 		want      bool
 	}{
-		{"authority available + no record + succeeded", none, "succeeded", avail, true},
-		{"nil authority (older backend)", none, "succeeded", nil, false},
-		{"authority unavailable", none, "succeeded", unavail, false},
-		{"record present", &ChildrenStatus{fanInRecorded: true}, "succeeded", avail, false},
-		{"integration failure recorded", &ChildrenStatus{IntegrationFailure: &integrationFailure{Cause: auditCategorySliceHeadMissing}}, "succeeded", avail, false},
-		{"parent still awaiting_children", none, "awaiting_children", avail, false},
-		{"parent stage unreadable", none, "", avail, false},
+		{"no record (#4165)", base(), "succeeded", avail, true},
+		{"between-wave record only, final record lost (#4221)", betweenWave(), "succeeded", avail, true},
 		{"nil status", nil, "succeeded", avail, false},
+		{"nil authority (older backend)", betweenWave(), "succeeded", nil, false},
+		{"authority unavailable", betweenWave(), "succeeded", unavail, false},
+		{"parent still awaiting_children", betweenWave(), "awaiting_children", avail, false},
+		{"parent stage unreadable", betweenWave(), "", avail, false},
+		{"integration failure recorded", withFailure, "succeeded", avail, false},
+		{"full coverage", fullCoverage, "succeeded", avail, false},
+		{"a child not succeeded", childNotSucceeded, "succeeded", avail, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := fanInRecordLost(c.cs, c.state, c.authority); got != c.want {
 				t.Errorf("fanInRecordLost = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestFanInRecordLostRecovery pins both wording variants: with no record the
+// lead says the append was lost; with an earlier-wave record it names the
+// uncovered children and the lost final append. Both carry the shared tail
+// and neither advises a re-drive. A nil status takes the no-record wording.
+func TestFanInRecordLostRecovery(t *testing.T) {
+	tail := []string{"409 acceptance_integration_incomplete", "not_awaiting_children", "Recovery: POST /v0/runs/p/integrate-wave (write:runs)"}
+	noRecord := &ChildrenStatus{UnintegratedChildRunIDs: []string{"child-a", "child-b"}}
+	partial := partialChildrenStatus()
+	for name, c := range map[string]struct {
+		cs      *ChildrenStatus
+		want    []string
+		notWant []string
+	}{
+		"no record":      {noRecord, append([]string{"no slices_integrated record exists", "slices_integrated append was lost"}, tail...), []string{"earlier wave", "re-drive"}},
+		"nil status":     {nil, append([]string{"no slices_integrated record exists"}, tail...), []string{"earlier wave", "re-drive"}},
+		"partial record": {partial, append([]string{"covers only an earlier wave", "lacks the slices of child-b", "the final best-effort slices_integrated append was lost"}, tail...), []string{"no slices_integrated record exists", "re-drive"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := fanInRecordLostRecovery("p", c.cs)
+			for _, w := range c.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("recovery %q missing %q", got, w)
+				}
+			}
+			for _, nw := range c.notWant {
+				if strings.Contains(got, nw) {
+					t.Errorf("recovery %q must not contain %q", got, nw)
+				}
 			}
 		})
 	}

@@ -83,8 +83,10 @@ func sliceIntegrationOf(run *Run) *runSliceIntegration {
 // capabilities.slice_integration (#4165). When it is present it is
 // AUTHORITATIVE: the answer is !authority.Available, and neither the fan-in
 // record nor the parent's stage state is consulted, exactly as the server gate
-// consults neither. So a parent whose slices_integrated append was lost (the
-// #4165 wedge, fanInRecordLost) is NOT read as authority-less.
+// consults neither. So a parent whose slices_integrated append was lost — no
+// record at all (#4165), or only an earlier between-wave record surviving a
+// lost final append (#4221); the wedge fanInRecordLost names — is NOT read as
+// authority-less.
 //
 // When authority is nil (an older backend, or a list read) it falls back to
 // the pre-#4165 inference from the one observable consequence of a missing
@@ -101,31 +103,63 @@ func integrationAuthorityAbsent(cs *ChildrenStatus, parentImplementState string,
 	return !cs.fanInRecorded && parentImplementState == "succeeded"
 }
 
-// fanInRecordLost reports the #4165 wedge: the server HAS slice-integration
-// authority, the parent's implement stage already SUCCEEDED (so the fan-in
-// ran), yet NO fan-in record of any kind exists and no integration failure is
-// recorded. The orchestrator's slices_integrated append is best-effort (it
-// WARN-logs a failed append), so the record can be lost while the stage
-// advances. The server gate then refuses acceptance 409
+// fanInRecordLost reports the lost-record wedge (#4165, generalised in
+// #4221): the server HAS slice-integration authority, every child SUCCEEDED,
+// the parent's implement stage already SUCCEEDED (so the terminal fan-in ran),
+// no integration failure is newer than the newest clean integration, and yet
+// the newest clean slices_integrated record does not cover every child. The
+// orchestrator's slices_integrated append is best-effort (it WARN-logs a failed
+// append), so the record can be lost while the stage advances. That covers
+// both the single-wave case where NO record survives (#4165) and a multi-wave
+// fan-out whose FINAL append was lost while an earlier between-wave record
+// survives (#4221) — the no-record case is the special case where nothing is
+// covered. The server gate then refuses acceptance 409
 // acceptance_integration_incomplete forever and nothing re-integrates
 // automatically; fishhawk_consolidate_slices answers 409 not_awaiting_children
-// on the advanced parent. The recovery is POST /v0/runs/{run_id}/integrate-wave,
-// the idempotent non-settling fan-in that rewrites the record without
-// transitioning the stage. Requires a POSITIVE authority signal: with nil
-// authority the C3 inference reads this snapshot as authority-less instead.
+// on the advanced parent, and the uncovered children already succeeded, so
+// re-driving them is wrong. The recovery is POST
+// /v0/runs/{run_id}/integrate-wave, the idempotent non-settling fan-in that
+// rewrites the record without transitioning the stage.
+//
+// Each conjunct:
+//   - authority.Available: a POSITIVE authority signal; with nil authority the
+//     C3 inference decides instead (integrationAuthorityAbsent).
+//   - parentImplementState == "succeeded": every settle path integrates BEFORE
+//     stamping the stage succeeded (runConsolidation in server/consolidate.go,
+//     and the childcompletion sweeper's resolveParent), so a succeeded stage
+//     means the terminal fan-in already ran — an awaiting_children parent is
+//     still integrating, not wedged.
+//   - allChildrenSucceeded: "every child succeeded" must be provable; an
+//     unknown, failed or running child takes the generic hold reason.
+//   - IntegrationFailure == nil: a newer failure has its own recovery.
+//   - len(UnintegratedChildRunIDs) > 0: with every child succeeded this is
+//     exactly "the newest clean record does not cover every child".
 func fanInRecordLost(cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) bool {
 	return cs != nil && authority != nil && authority.Available &&
-		!cs.fanInRecorded && cs.IntegrationFailure == nil && parentImplementState == "succeeded"
+		parentImplementState == "succeeded" && allChildrenSucceeded(cs.Children) &&
+		cs.IntegrationFailure == nil && len(cs.UnintegratedChildRunIDs) > 0
 }
 
-// fanInRecordLostRecovery names the integrate-wave recovery for the #4165
-// wedge, shared by the next_actions hold reason and fishhawk_await_children's
-// integration_pending message so the two surfaces name the same move.
-func fanInRecordLostRecovery(runID string) string {
-	return fmt.Sprintf("no slices_integrated record exists although the parent's implement stage already succeeded and the server HAS slice-integration authority — "+
-		"the best-effort slices_integrated append was lost (the orchestrator WARN-logs it). The server refuses an acceptance dispatch here with 409 acceptance_integration_incomplete "+
+// fanInRecordLostRecovery names the integrate-wave recovery for the
+// lost-record wedge (fanInRecordLost), shared by the next_actions hold reason
+// and fishhawk_await_children's integration_pending message so the two
+// surfaces name the same move. The lead clause says which record is missing:
+// with fanInRecordLost true, cs.fanInRecorded is true exactly when a clean
+// slices_integrated exists (a failure with no clean record would have set
+// IntegrationFailure), so it selects between "no record exists" (#4165) and
+// "the newest record covers only an earlier wave" (#4221). Neither variant
+// advises re-driving the uncovered children: they already succeeded.
+func fanInRecordLostRecovery(runID string, cs *ChildrenStatus) string {
+	lead := "no slices_integrated record exists although the parent's implement stage already succeeded and the server HAS slice-integration authority — " +
+		"the best-effort slices_integrated append was lost (the orchestrator WARN-logs it)"
+	if cs != nil && cs.fanInRecorded {
+		lead = fmt.Sprintf("the newest slices_integrated record covers only an earlier wave and lacks the slices of %s, although every child and the parent's implement stage already succeeded "+
+			"and the server HAS slice-integration authority — the final best-effort slices_integrated append was lost (the orchestrator WARN-logs it)",
+			strings.Join(cs.UnintegratedChildRunIDs, ", "))
+	}
+	return fmt.Sprintf("%s. The server refuses an acceptance dispatch here with 409 acceptance_integration_incomplete "+
 		"and nothing re-integrates automatically (fishhawk_consolidate_slices answers 409 not_awaiting_children on an advanced parent). "+
-		"Recovery: POST /v0/runs/%s/integrate-wave (write:runs) — it re-runs the idempotent fan-in WITHOUT transitioning the stage and writes the missing record", runID)
+		"Recovery: POST /v0/runs/%s/integrate-wave (write:runs) — it re-runs the idempotent fan-in WITHOUT transitioning the stage and writes the missing record", lead, runID)
 }
 
 // foldAcceptanceIntegrationHold is the pure next_actions hold (#4080). When the
@@ -133,8 +167,9 @@ func fanInRecordLostRecovery(runID string) string {
 // integration phase is not integrated, it removes every acceptance dispatch
 // action, sets State to acceptance_held_integration_incomplete, and PREPENDS a
 // fishhawk_await_children action whose reason names the uncovered children,
-// the integration failure, or the lost fan-in record (#4165), and the
-// server's 409.
+// the integration failure, or the lost fan-in record (fanInRecordLost: no
+// record, #4165, or a lost final record in a multi-wave fan-out, #4221), and
+// the server's 409.
 //
 // It is a no-op when:
 //   - na or cs is nil (not a decomposed parent, or the snapshot was not read);
@@ -177,12 +212,12 @@ func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImple
 }
 
 // acceptanceIntegrationHoldReason names what is blocking: the lost fan-in
-// record (#4165) first, then the integration failure when one is newer than
-// the newest clean integration, otherwise the uncovered or non-succeeded
-// children.
+// record (fanInRecordLost, #4165/#4221) first, then the integration failure
+// when one is newer than the newest clean integration, otherwise the uncovered
+// or non-succeeded children.
 func acceptanceIntegrationHoldReason(runID string, cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) string {
 	if fanInRecordLost(cs, parentImplementState, authority) {
-		return "acceptance held: " + fanInRecordLostRecovery(runID) + "; then re-invoke fishhawk_await_children"
+		return "acceptance held: " + fanInRecordLostRecovery(runID, cs) + "; then re-invoke fishhawk_await_children"
 	}
 	const tail = "; the server refuses an acceptance dispatch here with 409 acceptance_integration_incomplete, so wait for the fan-in to cover every child"
 	if f := cs.IntegrationFailure; f != nil {
