@@ -2906,7 +2906,7 @@ const slotQueuedBody = `{"error":{"code":"concurrency_slot_queued","message":"qu
 // fishhawk_await_stage next step — not a tool error.
 func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T) {
 	f, r := newSlotDispatchFake(t, http.StatusConflict, slotQueuedBody)
-	r.api.hostLabel = "h1"
+	r.api.hostLabel = fixedHostLabel("h1")
 	runnerBin := "/old/fishhawk-runner"
 	r.getenv = func(k string) string {
 		if k == "FISHHAWK_RUNNER_BIN" {

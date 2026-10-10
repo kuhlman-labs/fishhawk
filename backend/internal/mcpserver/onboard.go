@@ -31,10 +31,49 @@ type DoctorInput struct {
 // re-emission tests pin its json tags against the backend's — and this rung is
 // computed LOCALLY by this MCP process about its OWN environment. Folding it
 // into `report` would render a locally-computed fact as something the daemon
-// answered, which is a false claim about provenance.
+// answered, which is a false claim about provenance. HostLabel (#4212) is the
+// second such locally-computed sibling, under the same rule.
 type DoctorOutput struct {
 	Report            OnboardingReadinessReport `json:"report"`
 	RunnerCredentials *runnerCredentialsRung    `json:"runner_credentials,omitempty" jsonschema:"computed LOCALLY by this MCP server about its OWN process environment (NOT served by fishhawkd): whether the RUNNER-held GitLab push credential a local runner would inherit is present; reports PRESENCE only and says nothing about a gitlab_ci runner"`
+	HostLabel         *hostLabelRung            `json:"host_label,omitempty" jsonschema:"computed LOCALLY by this MCP server (NOT served by fishhawkd): the host label this process sends on the host-dispatch marker, which keys the default local-implement:<label> concurrency group, and which rung of the resolution ladder answered it"`
+}
+
+// hostLabelRung is the LOCALLY-computed doctor rung reporting this process's
+// host-dispatch host label (#4212). Like runnerCredentialsRung it is a sibling
+// of `report`, never inside it: the daemon does not know the label until a
+// marker carries it. Unexported for the same export-surface reason.
+type hostLabelRung struct {
+	Label        string `json:"label" jsonschema:"the sanitised host label the host-dispatch marker sends; empty when nothing resolved (source none)"`
+	Source       string `json:"source" jsonschema:"which rung answered, in precedence order: override (FISHHAWK_HOST_LABEL), persisted (the per-machine host-id file), hostname (the volatile os.Hostname fallback), or none"`
+	DefaultGroup string `json:"default_group" jsonschema:"the default local concurrency group a host-dispatched stage from this process lands in: local-implement:<label>, or local-implement:unknown with no label. A spec-named group is repo-scoped and does not carry the label"`
+	Path         string `json:"path,omitempty" jsonschema:"the host-id file path the persisted rung read or created; absent when the override answered or the path could not be resolved"`
+	Variable     string `json:"variable" jsonschema:"the override env var: FISHHAWK_HOST_LABEL"`
+	Note         string `json:"note" jsonschema:"the human sentence on how the label was resolved, naming the cause on a fallback"`
+	Remediation  string `json:"remediation,omitempty" jsonschema:"on source hostname or none: the operator next step, naming FISHHAWK_HOST_LABEL and the host-id path"`
+}
+
+// newHostLabelRung renders a resolution as the doctor rung. The volatile rungs
+// (hostname, none) carry a remediation: the hostname can change with the
+// network and split this machine's local-implement group.
+func newHostLabelRung(res hostLabelResolution) *hostLabelRung {
+	rung := &hostLabelRung{
+		Label:        res.Label,
+		Source:       res.Source,
+		DefaultGroup: defaultGroupKeyFor(res.Label),
+		Path:         res.Path,
+		Variable:     hostLabelEnv,
+		Note:         res.Note,
+	}
+	switch res.Source {
+	case hostLabelSourceHostname, hostLabelSourceNone:
+		where := "the per-machine host-id file"
+		if res.Path != "" {
+			where = "the host-id file at " + res.Path
+		}
+		rung.Remediation = "Pin a stable label: export " + hostLabelEnv + "=<label> in the environment that LAUNCHES fishhawk-mcp (or fishhawkd, for the /mcp route) and reconnect the MCP server (/mcp), or fix " + where + " so the persisted rung can answer (a damaged file is never overwritten: delete it to regenerate)."
+	}
+	return rung
 }
 
 // gitLabRunnerPushCredentialEnv is the env var the RUNNER reads its GitLab
@@ -399,9 +438,9 @@ work_item_provider rung (see below):
               fishhawkd; absence means the backend cannot answer, which is
               NOT the same claim as unregistered.
 
-Alongside the report key — a SIBLING key, never a field inside it — the output
-carries runner_credentials, the one rung computed LOCALLY by this MCP server
-about its own process environment and NOT served by fishhawkd:
+Alongside the report key the output carries two rungs, each a SIBLING key,
+never a field inside it: runner_credentials and host_label, computed LOCALLY
+by this MCP server about its own process and NOT served by fishhawkd:
 
   - runner_credentials — a GitLab run needs TWO credentials: fishhawkd's
               FISHHAWKD_GITLAB_TOKEN (what the app rung covers) and the RUNNER
@@ -423,6 +462,23 @@ about its own process environment and NOT served by fishhawkd:
               the GitLab instance this process cannot read. On missing,
               remediation names where the variable must live — the environment
               that LAUNCHES fishhawk-mcp.
+  - host_label — the host label this process sends on the host-dispatch
+              marker, which keys the default local concurrency group
+              local-implement:<label> (default_group). One machine must send
+              ONE label, or its stages split across two groups and the
+              effective limit doubles. source names the rung that answered,
+              in precedence order: override (FISHHAWK_HOST_LABEL, sanitised) |
+              persisted (the per-machine host-id file at path, created once
+              from the then-current hostname and never overwritten, so it
+              survives a hostname change) | hostname (the volatile fallback
+              when the host-id file is unusable: the name can change with the
+              network, which splits the group) | none (no label; the server
+              files the stage under local-implement:unknown). On hostname and
+              none, remediation names FISHHAWK_HOST_LABEL and the host-id
+              path. A spec-named concurrency group is repo-scoped and does not
+              carry the label, so default_group applies only to stages
+              without one. Resolved once per process, on the first doctor or
+              host-dispatch call.
 
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
@@ -569,6 +625,9 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 	// attached AFTER the report is copied verbatim, so `report` stays the
 	// byte-mirror of what fishhawkd served.
 	out.RunnerCredentials = runnerCredentials(report.Forge, r.getenv)
+	// The second LOCALLY-computed rung (#4212): this process's host label,
+	// resolved lazily (the first doctor or host-dispatch call resolves it).
+	out.HostLabel = newHostLabelRung(r.api.hostLabelResolution())
 	return nil, out, nil
 }
 

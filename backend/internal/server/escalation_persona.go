@@ -56,7 +56,11 @@ import (
 // A Match error or a persona-selection refusal is reported to the caller as
 // the escalation_unevaluable degrade detail, which the orchestrator in
 // reviewer_persona.go turns into a terminal *_review_skipped entry — never a
-// silent "nothing fired".
+// silent "nothing fired". That skip is escalation-attached, and so is every
+// persona a fired escalation selected: under GATING review authority, one that
+// cannot run fails the reviewed stage with a named
+// escalation_persona_unavailable reason instead of letting the round settle on
+// the standard reviewers alone (#3913, escalationPersonaGateBlock).
 
 // CategoryEscalationPersonaAttached is the audit category recording that the
 // escalations which fired for a review round attached reviewer personas to it.
@@ -122,7 +126,8 @@ type escalationPersonaResolution struct {
 	viaDiffOnly map[string]bool
 	// degraded is the escalation_unevaluable detail when the escalations could
 	// not be evaluated or their personas could not be selected; non-empty
-	// means selected is empty and a skip entry must be recorded.
+	// means selected is empty and a skip entry must be recorded. Under gating
+	// authority that skip also fails the reviewed stage (#3913).
 	degraded string
 }
 

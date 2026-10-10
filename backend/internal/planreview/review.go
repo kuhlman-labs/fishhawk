@@ -1077,7 +1077,11 @@ const ReasonReviewerUnavailable = "reviewer_unavailable"
 // it never runs on a remit-less prompt — while the stage's standard reviewers
 // still run. ReviewSkippedPayload.Detail names which step failed. It is a skip
 // REASON value on the existing *_review_skipped categories, not a new audit
-// category.
+// category. Exception (#3913): when a FIRED escalation attached the persona
+// (ReviewSkippedPayload.EscalationAttached) and the round's authority is
+// gating, the dispatch site fails the reviewed stage with a named
+// escalation_persona_unavailable reason instead of settling on the standard
+// reviewers alone.
 const ReasonPersonaRemitUnavailable = "persona_remit_unavailable"
 
 // ReasonPersonaAttachmentUnresolvable is the ReviewSkippedPayload.Reason for a
@@ -1090,13 +1094,16 @@ const ReasonPersonaRemitUnavailable = "persona_remit_unavailable"
 // of silently running none; it is counted in configured_agents so the round
 // still settles exactly. Persona is empty — no persona was identified. A skip
 // REASON value on the existing *_review_skipped categories, not a new audit
-// category.
+// category. Exception (#3913): the escalation_unevaluable skip is
+// escalation-attached (ReviewSkippedPayload.EscalationAttached), so under
+// gating authority the dispatch site fails the reviewed stage; the
+// persona_stage_unresolvable skip is static-source and never does.
 const ReasonPersonaAttachmentUnresolvable = "persona_attachment_unresolvable"
 
 // ReviewSkippedPayload is the JSON payload stored in an audit
 // entry with category "plan_review_skipped" / "implement_review_skipped"
 // (#574). It records that an agent review the spec requested did not run.
-// Three degradation reasons share this payload:
+// Four degradation reasons share this payload:
 //   - ReasonReviewerNotConfigured: no reviewer backend wired at all (#574).
 //   - ReasonReviewerUnavailable: this specific spec-declared reviewer's
 //     provider is unavailable on the deployment — the capability-gate
@@ -1111,6 +1118,11 @@ const ReasonPersonaAttachmentUnresolvable = "persona_attachment_unresolvable"
 //
 // Authority captures whether the skip degraded a gating or advisory gate;
 // in advisory mode the human gate remains authoritative.
+//
+// A skip never fails the stage by itself, with ONE exception (#3913): a skip
+// carrying EscalationAttached under gating authority — a persona a fired
+// escalation requires could not run — fails the reviewed stage at the
+// dispatch site with a named escalation_persona_unavailable reason.
 type ReviewSkippedPayload struct {
 	Reason           string        `json:"reason"`
 	ConfiguredAgents int           `json:"configured_agents"`
@@ -1143,6 +1155,17 @@ type ReviewSkippedPayload struct {
 	// (persona_stage_unresolvable, escalation_unevaluable). Empty on every
 	// other skip; omitempty keeps those payloads byte-identical.
 	Detail string `json:"detail,omitempty"`
+
+	// EscalationAttached is set (#3913) on a persona skip (reason
+	// ReasonPersonaRemitUnavailable, or ReasonReviewerUnavailable for a
+	// persona) whose persona a FIRED escalation's require.reviewers selected —
+	// including one the stage also attaches statically — and on the
+	// ReasonPersonaAttachmentUnresolvable skip whose Detail is
+	// escalation_unevaluable. Under gating authority such a skip fails the
+	// reviewed stage. It is never set for a standard reviewer, a static-only
+	// persona, or the persona_stage_unresolvable skip; omitempty keeps every
+	// one of those payloads byte-identical.
+	EscalationAttached bool `json:"escalation_attached,omitempty"`
 }
 
 // ReviewStartedPayload is the JSON payload stored in an audit entry with

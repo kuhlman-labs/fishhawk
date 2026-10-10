@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -49,12 +48,14 @@ type apiClient struct {
 	// issueSetClientTimeout for why it is its own client rather than the 30s
 	// short one.
 	httpIssueSet *http.Client
-	// hostLabel is this MCP process's host label (#3964 / ADR-087), captured
-	// ONCE by newAPIClient (hostDispatchLabel) and sent as the host-dispatch
-	// marker's {"host"} body. The server keys the default local concurrency
-	// group `local-implement:<host>` on it. Empty sends no body, which the
-	// server reads as the `unknown` host.
-	hostLabel string
+	// hostLabel resolves this MCP process's host label (#3964 / ADR-087),
+	// sent as the host-dispatch marker's {"host"} body. The server keys the
+	// default local concurrency group `local-implement:<host>` on it. It is
+	// resolved lazily, once per process, on first use (processHostLabel in
+	// production, via the stable resolveHostLabel ladder of #4212); read it
+	// through hostLabelResolution, which tolerates nil. An empty label sends
+	// no body, which the server reads as the `unknown` host.
+	hostLabel func() hostLabelResolution
 }
 
 // refinementDraftClientTimeout bounds the MCP client's wait on the two
@@ -116,7 +117,7 @@ func newAPIClient(cfg config) *apiClient {
 		// budgets (refinementDraftBudget vs MaxIssueSetResolutionBudget), so
 		// sharing one would silently couple them.
 		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
-		hostLabel:    hostDispatchLabel(os.Hostname),
+		hostLabel:    cfg.hostLabel,
 	}
 }
 
@@ -124,21 +125,14 @@ func newAPIClient(cfg config) *apiClient {
 // backend/internal/server/stage_concurrency.go hostLabelMax).
 const hostLabelMax = 253
 
-// hostDispatchLabel derives the host label the host-dispatch marker sends
-// (#3964 / ADR-087): os.Hostname sanitised to the server's accepted class
-// [A-Za-z0-9._-] (every other character becomes '-') and truncated to
-// hostLabelMax. A hostname error or an empty name yields "", so the marker
-// sends no body and the server files the stage under the `unknown` host. The
-// label is a coordination key, not a security boundary: a write:runs caller
-// can already spawn runners. hostname is the seam (os.Hostname in
-// production): a parameter rather than a package var, so a test pins the
-// label without racing parallel tests that build clients.
-func hostDispatchLabel(hostname func() (string, error)) string {
-	name, err := hostname()
-	if err != nil {
-		return ""
+// hostLabelResolution is the client's resolved host label. A nil resolver
+// (a test-built config{} literal) is no label, as with the stock `unknown`
+// host.
+func (c *apiClient) hostLabelResolution() hostLabelResolution {
+	if c.hostLabel == nil {
+		return hostLabelResolution{Source: hostLabelSourceNone}
 	}
-	return sanitizeHostLabel(name)
+	return c.hostLabel()
 }
 
 // sanitizeHostLabel maps raw onto the server's accepted host-label class. Pure
@@ -2317,11 +2311,12 @@ func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.U
 func (c *apiClient) HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
 	var body []byte
-	if c.hostLabel != "" || nonce != "" {
+	host := c.hostLabelResolution().Label
+	if host != "" || nonce != "" {
 		b, err := json.Marshal(struct {
 			Host           string `json:"host,omitempty"`
 			AdmissionNonce string `json:"admission_nonce,omitempty"`
-		}{Host: c.hostLabel, AdmissionNonce: nonce})
+		}{Host: host, AdmissionNonce: nonce})
 		if err != nil {
 			return nil, fmt.Errorf("marshal host-dispatch body: %w", err)
 		}

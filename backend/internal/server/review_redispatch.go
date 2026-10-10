@@ -50,9 +50,12 @@ const maxReviewRoundRedispatches = 3
 
 // Re-dispatch reason slugs. The INELIGIBILITY slugs are returned by
 // redispatchEligibility and stamped on the synthesized *_review_failed as
-// "...; not re-dispatched: <slug>". The FAILURE slugs name why a re-dispatch
-// that was audited as review_round_redispatched started no new round; the
-// fallback stamps them as "...; re-dispatch did not start a round: <slug>".
+// "...; not re-dispatched: <slug>" (gating_authority through
+// advanced_past_review, plus eligibility_check_failed and
+// redispatch_audit_failed, which the boot sweep stamps itself). The FAILURE
+// slugs name why a re-dispatch that was audited as review_round_redispatched
+// started no new round; the fallback stamps them as "...; re-dispatch did not
+// start a round: <slug>".
 const (
 	redispatchSlugGatingAuthority        = "gating_authority"
 	redispatchSlugReviewerUnwired        = "reviewer_unwired"
@@ -62,6 +65,8 @@ const (
 	redispatchSlugPlanStageNotAwaiting   = "plan_stage_not_awaiting_approval"
 	redispatchSlugSupersededByNewPlan    = "superseded_by_new_plan"
 	redispatchSlugSupersededByFixup      = "superseded_by_fixup"
+	redispatchSlugImplementStageTerminal = "implement_stage_terminal"
+	redispatchSlugAdvancedPastReview     = "advanced_past_review"
 	redispatchSlugPlanArtifactUnavail    = "plan_artifact_unavailable"
 	redispatchSlugTraceBundleUnavail     = "trace_bundle_unavailable"
 	redispatchSlugForgeCompareUnavail    = "forge_compare_unavailable"
@@ -153,6 +158,14 @@ func reviewRedispatchPending(runID uuid.UUID, stage string, orphanedSeq int64) b
 // (false, slug, nil) naming the first failed condition. err is non-nil only
 // when a read needed to decide failed; the caller decides how to degrade.
 //
+// Check order per round kind, after the shared authority / wiring / depth /
+// already-redispatched checks: superseded, then stage state, then input-source
+// wiring. A plan round: superseded_by_new_plan, plan_stage_not_awaiting_approval,
+// plan_artifact_unavailable. An implement round: unknown_round_source,
+// superseded_by_fixup, implement_stage_terminal / advanced_past_review
+// (implementRoundStageSlug, #4174), then trace_bundle_unavailable or
+// forge_compare_unavailable.
+//
 // The checks are CHEAP (audit and stage reads plus wiring), never input
 // loading: a round eligible here can still fail to rebuild its inputs at
 // dispatch time, which the fallback closes.
@@ -226,6 +239,9 @@ func (s *Server) redispatchEligibility(ctx context.Context, runID uuid.UUID, sta
 	if newer {
 		return false, redispatchSlugSupersededByFixup, nil
 	}
+	if slug, err := s.implementRoundStageSlug(ctx, runID, stageID); err != nil || slug != "" {
+		return false, slug, err
+	}
 	if payload.RoundOrigin == reviewRoundOriginTrace {
 		if s.cfg.TraceStore == nil {
 			return false, redispatchSlugTraceBundleUnavail, nil
@@ -240,6 +256,44 @@ func (s *Server) redispatchEligibility(ctx context.Context, runID uuid.UUID, sta
 		return false, redispatchSlugForgeCompareUnavail, nil
 	}
 	return true, "", nil
+}
+
+// implementRoundStageSlug is redispatchEligibility's stage-state check for an
+// implement round (#4174). It returns implement_stage_terminal when the round's
+// implement stage is failed (a reap-failure lands here), cancelled or
+// superseded, and advanced_past_review when a review-type stage sequenced after
+// it is already terminal: the merge gate the advisory verdict feeds has been
+// decided. "" means the stage state does not refuse the round.
+//
+// SUCCEEDED is deliberately not refused, so StageState.IsTerminal is not used
+// here: a gateless implement stage settles succeeded on PR upload
+// (advanceImplementStageAfterPR) while the advisory round dispatched at trace
+// upload is still in flight, which is the main case boot re-dispatch exists for.
+//
+// The round's stage is read with GetStage rather than found in the
+// ListStagesForRun result, the same read the plan branch uses. A read error,
+// including a missing stage row (run.ErrNotFound), is returned so the caller
+// degrades: the boot sweep closes the round eligibility_check_failed and
+// GET /v0/restart-blockers reports check_failed.
+func (s *Server) implementRoundStageSlug(ctx context.Context, runID, stageID uuid.UUID) (string, error) {
+	st, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		return "", fmt.Errorf("get implement stage %s: %w", stageID, err)
+	}
+	switch st.State {
+	case run.StageStateFailed, run.StageStateCancelled, run.StageStateSuperseded:
+		return redispatchSlugImplementStageTerminal, nil
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("list stages for run %s: %w", runID, err)
+	}
+	for _, other := range stages {
+		if other.Type == run.StageTypeReview && other.Sequence > st.Sequence && other.State.IsTerminal() {
+			return redispatchSlugAdvancedPastReview, nil
+		}
+	}
+	return "", nil
 }
 
 // roundAlreadyRedispatched reports whether a review_round_redispatched entry
@@ -333,6 +387,14 @@ func (s *Server) redispatchOrphanedRound(ctx context.Context, runID uuid.UUID, s
 
 // runOrphanedRoundRedispatch is the re-dispatch goroutine body: re-check, then
 // rebuild the inputs and dispatch, then the fallback.
+//
+// Read-error exits (#4174): when the re-check (orphanedRoundStillOpen) or the
+// fallback (closeUnstartedRedispatch) cannot read the round's audit state, the
+// goroutine WARN-logs and returns without dispatching or synthesizing. This is
+// deliberate best-effort, the per-run posture ReconcileOrphanedReviews takes:
+// the round keeps its review_round_redispatched record, the pending entry is
+// cleared on return, the on-demand reconcile verb can close it, and the next
+// boot closes it failed as already_redispatched — the cross-boot bound.
 func (s *Server) runOrphanedRoundRedispatch(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, orphanedSeq int64, payload planreview.ReviewStartedPayload) {
 	if !s.orphanedRoundStillOpen(ctx, runID, stage, orphanedSeq, payload.ConfiguredAgents) {
 		return
@@ -364,17 +426,33 @@ func (s *Server) runOrphanedRoundRedispatch(ctx context.Context, runID uuid.UUID
 // redispatchOrphanedRound and runOrphanedRoundRedispatch to their single
 // callers. A second hand-off path must therefore add its own dedup (or hold the
 // lock across the dispatch); it must not lean on this check.
+//
+// A read error also returns false, with a WARN naming it, so it is not
+// mistaken for "superseded": the round is left for the next boot, which closes
+// it failed as already_redispatched (see runOrphanedRoundRedispatch).
 func (s *Server) orphanedRoundStillOpen(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, orphanedSeq int64, configured int) bool {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
 	defer lock.Unlock()
+	readFailed := func(err error) bool {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: re-dispatch re-check read failed — leaving the orphaned round for the next boot",
+			slog.String("run_id", runID.String()),
+			slog.String("stage", stage.label),
+			slog.Int64("orphaned_round_sequence", orphanedSeq),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
 	latest, _, ok, err := s.latestReviewStarted(ctx, runID, stage)
-	if err != nil || !ok || latest.Sequence != orphanedSeq {
+	if err != nil {
+		return readFailed(err)
+	}
+	if !ok || latest.Sequence != orphanedSeq {
 		return false
 	}
 	landed, err := s.countLandedReviewTerminals(ctx, runID, stage, orphanedSeq)
 	if err != nil {
-		return false
+		return readFailed(err)
 	}
 	return landed < configured
 }
@@ -389,13 +467,27 @@ func (s *Server) orphanedRoundStillOpen(ctx context.Context, runID uuid.UUID, st
 // *_review_failed, sequenced after the orphaned round, which therefore counts
 // toward it; synthesizing from the handoff-time count would close the round
 // twice.
+//
+// Either read failing (the round anchor or the landed count) WARN-logs and
+// synthesizes nothing: the round is left for the next boot, which closes it
+// failed as already_redispatched (see runOrphanedRoundRedispatch).
 func (s *Server) closeUnstartedRedispatch(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, orphanedSeq int64, payload planreview.ReviewStartedPayload, slug string) {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
 	latest, _, ok, err := s.latestReviewStarted(ctx, runID, stage)
-	if err != nil || !ok || latest.Sequence != orphanedSeq || latest.StageID == nil {
-		// A newer round started (the re-dispatch succeeded) or the anchor is
-		// unreadable: nothing to close.
+	if err != nil {
+		lock.Unlock()
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: re-dispatch fallback could not read the round anchor — leaving the orphaned round for the next boot",
+			slog.String("run_id", runID.String()),
+			slog.String("stage", stage.label),
+			slog.Int64("orphaned_round_sequence", orphanedSeq),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if !ok || latest.Sequence != orphanedSeq || latest.StageID == nil {
+		// A newer round started (the re-dispatch succeeded) or the anchor
+		// carries no stage: nothing to close.
 		lock.Unlock()
 		return
 	}

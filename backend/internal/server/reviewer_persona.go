@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,14 @@ import (
 //     CLOSED for that persona only: it never runs on a remit-less prompt and
 //     records one terminal *_review_skipped entry (reason
 //     persona_remit_unavailable, a named detail); the standard reviewers run.
+//   - EXCEPTION (#3913): a persona a FIRED escalation attached that cannot run
+//     (cannotRun: a remit degrade, a provider this deployment cannot run, or
+//     the escalation_unevaluable pseudo invocation) FAILS a GATING round at
+//     the dispatch site (escalationPersonaGateBlock) with a named
+//     escalation_persona_unavailable reason. The loops' verdict accumulator
+//     (hasRejection) is still never touched. Static-only personas, the
+//     persona_stage_unresolvable pseudo invocation and advisory rounds keep
+//     the degrade.
 //   - The persona SET is the reviewed stage's static attachments UNION the
 //     personas fired escalations attach (E55.9 / #3754,
 //     escalation_persona.go), de-duplicated. A set that cannot be resolved
@@ -154,6 +163,12 @@ type personaInvocation struct {
 	// (planreview.ReasonPersonaAttachmentUnresolvable), which carries no
 	// selected persona.
 	reason string
+	// escalation is true (#3913) when a FIRED escalation's require.reviewers
+	// selected this persona — by MEMBERSHIP, so a persona the stage also
+	// attaches statically (de-duplicated into the static slot) is still
+	// tagged — and on the escalation_unevaluable pseudo invocation. An
+	// escalation-attached invocation that cannotRun blocks a gating round.
+	escalation bool
 	// quoteDocs is every document injected into THIS persona's prompt, in
 	// render order — the standard injected set, then the remit, then (for a
 	// decision_record persona) the decision-record index and each selected
@@ -179,6 +194,66 @@ func (inv reviewerInvocation) personaName() string {
 		return ""
 	}
 	return inv.persona.selected.Name
+}
+
+// escalationAttached reports whether a fired escalation attached this
+// invocation's persona (or it is the escalation_unevaluable pseudo invocation)
+// — the invocations escalationPersonaGateBlock considers (#3913).
+func (inv reviewerInvocation) escalationAttached() bool {
+	return inv.persona != nil && inv.persona.escalation
+}
+
+// cannotRun reports whether this invocation will be skipped without running:
+// its provider is not runnable on this deployment (resolveErr), or it is a
+// persona with no prompt (a remit / decision-record degrade, or a pseudo
+// invocation for an unresolvable attachment set). It is the ONE definition of
+// the predicate both review loops skip an invocation on.
+func (inv reviewerInvocation) cannotRun() bool {
+	return inv.resolveErr != nil || (inv.persona != nil && inv.persona.promptText == "")
+}
+
+// escalationPersonaGateBlockSlug is the second segment of the gating failure
+// reason a blocked round records (#3913), after the *_review_rejected prefix.
+const escalationPersonaGateBlockSlug = "escalation_persona_unavailable"
+
+// escalationPersonaGateBlock returns the named block for a GATING round when
+// any escalation-attached invocation cannot run (#3913), or "" when none does.
+// It is pure over invs; the dispatch site (runPlanReviews, the trace-upload
+// caller of runImplementReviewsForTree) decides authority and prefixes the
+// returned text with its *_review_rejected prefix. Entries are in invocation
+// order: a named persona renders `persona "<name>" (<reason>: <detail>)` —
+// reason reviewer_unavailable (no detail) when its provider did not resolve —
+// and the escalation_unevaluable pseudo invocation renders
+// `escalation source (persona_attachment_unresolvable: escalation_unevaluable)`.
+func escalationPersonaGateBlock(invs []reviewerInvocation) string {
+	var entries []string
+	for _, inv := range invs {
+		if !inv.escalationAttached() || !inv.cannotRun() {
+			continue
+		}
+		entries = append(entries, escalationPersonaGateBlockEntry(inv))
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	return escalationPersonaGateBlockSlug + ": " + strings.Join(entries, ", ") +
+		" could not run under gating authority; a fired escalation requires them for this change, so the round cannot settle on the standard reviewers alone"
+}
+
+// escalationPersonaGateBlockEntry renders one blocked invocation for
+// escalationPersonaGateBlock.
+func escalationPersonaGateBlockEntry(inv reviewerInvocation) string {
+	if inv.resolveErr != nil {
+		return fmt.Sprintf("persona %q (%s)", inv.personaName(), planreview.ReasonReviewerUnavailable)
+	}
+	reason := inv.persona.reason
+	if reason == "" {
+		reason = planreview.ReasonPersonaRemitUnavailable
+	}
+	if inv.personaName() == "" {
+		return fmt.Sprintf("escalation source (%s: %s)", reason, inv.persona.degraded)
+	}
+	return fmt.Sprintf("persona %q (%s: %s)", inv.personaName(), reason, inv.persona.degraded)
 }
 
 // promptFor returns the prompt and review tree THIS invocation runs on: the
@@ -240,7 +315,20 @@ func personaNames(invs []reviewerInvocation) []string {
 // COUNTED in configured_agents and emits a terminal *_review_skipped stamped
 // on the reviewed stage AFTER *_review_started, so planreview.Settled still
 // waits for every standard reviewer. It never touches hasRejection. The other
-// source's personas still run.
+// source's personas still run. The escalation_unevaluable pseudo invocation is
+// tagged escalation-attached (#3913), so under gating authority the dispatch
+// site fails the stage on it (escalationPersonaGateBlock); the
+// persona_stage_unresolvable one is static-source by construction (the
+// reviewed stage could not be located, so the static set is unknown) and stays
+// a non-blocking skip, while an escalation-selected persona still joins the
+// union and is tagged by membership.
+//
+// ESCALATION TAGGING (#3913). Every invocation whose persona name is among the
+// escalation resolution's selected names is tagged escalation-attached — by
+// MEMBERSHIP, not position, because a persona attached both statically and by
+// a fired escalation de-dups into the static slot. The early return for a
+// workflow absent from the spec stays untagged; it is unreachable from the
+// production callers, which stop at resolveStageReviewers first.
 //
 // AUTHORITY RESIDUAL. The persona SET is the reviewed stage's, but the
 // round's AUTHORITY is resolveStageReviewers' — the FIRST stage of the type —
@@ -304,9 +392,20 @@ func (s *Server) resolveParsedReviewPersonaInvocations(ctx context.Context, runR
 		s.writeEscalationPersonaAttachedAudit(ctx, runRow, stageID, kind, paths, esc, staticNames, staticDegraded)
 	}
 	invs := s.resolvePersonaInvocations(union, degraded...)
+	escNames := make(map[string]bool, len(esc.selected))
+	for _, p := range esc.selected {
+		escNames[p.Name] = true
+	}
 	changePaths := reviewChangePaths(paths)
 	for i := range invs {
-		invs[i].persona.changePaths = changePaths
+		p := invs[i].persona
+		p.changePaths = changePaths
+		if escNames[p.selected.Name] {
+			p.escalation = true
+		}
+		if p.reason == planreview.ReasonPersonaAttachmentUnresolvable && p.degraded == personaDetailEscalationUnevaluable {
+			p.escalation = true
+		}
 	}
 	return invs
 }
@@ -636,14 +735,21 @@ func personaPromptDocuments(trig prompt.Trigger) []prompt.InjectedDocument {
 // persona whose remit could not be resolved, rendered or attributed (reason
 // persona_remit_unavailable, the persona, its provider and the failed step)
 // and WARN-logs it. The entry is terminal (planreview.Settled), so the round
-// still settles at configured_agents; hasRejection is never touched — a
-// degraded persona never blocks a gating stage.
+// still settles at configured_agents; the loop's verdict accumulator
+// (hasRejection) is never touched. An escalation-attached one is stamped
+// escalation_attached and, under gating authority, blocks the round at the
+// dispatch site (escalationPersonaGateBlock, #3913); any other degraded
+// persona never blocks.
 func (s *Server) emitPersonaDegraded(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, inv reviewerInvocation, configuredAgents int) {
 	reason := inv.persona.reason
 	if reason == "" {
 		reason = planreview.ReasonPersonaRemitUnavailable
 	}
-	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: "+reason+" — persona skipped, standard reviewers unaffected",
+	msg := "review: " + reason + " — persona skipped, standard reviewers unaffected"
+	if authority == planreview.AuthorityGating && inv.escalationAttached() {
+		msg = "review: " + reason + " — escalation-attached persona cannot run under gating authority; the stage is failed"
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg,
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageID.String()),
 		slog.String("category", category),
@@ -655,12 +761,13 @@ func (s *Server) emitPersonaDegraded(ctx context.Context, runID, stageID uuid.UU
 		return
 	}
 	payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
-		Reason:           reason,
-		ConfiguredAgents: configuredAgents,
-		Authority:        authority,
-		Provider:         inv.provider,
-		Persona:          inv.personaName(),
-		Detail:           inv.persona.degraded,
+		Reason:             reason,
+		ConfiguredAgents:   configuredAgents,
+		Authority:          authority,
+		Provider:           inv.provider,
+		Persona:            inv.personaName(),
+		Detail:             inv.persona.degraded,
+		EscalationAttached: inv.escalationAttached(),
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
