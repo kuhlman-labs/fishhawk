@@ -2588,11 +2588,27 @@ Every session-view result (open/preview/edit/decide) carries the `RefinementSess
 derived state; the `awaiting_approval` guidance names any criteria-flagged child ordinals via
 `flaggedCriteriaOrdinals`/`formatOrdinals`.
 
+**Detached file arm (#4153).** The backend files in the background, so the file arm returns at once:
+`RefinementFilingResult.Status` is `filing_in_progress` (202, launched), `already_in_progress` (202,
+`AlreadyInProgress` true — a filing for the draft was already running; nothing launched) or `filed` (200,
+`AlreadyCompleted` — a completed session's replay); `Epic` is a pointer because a launch may have recorded nothing yet.
+Progress lives on the session view's `Filing *RefinementFilingProgress` mirror (`state` in_progress | failed |
+incomplete | filed, the items filed so far, `last_error`/`failed_ordinal`/`step`), and the top-level `State` becomes
+`filed` once the filing session completes. Guidance precedence in `guidanceForSession`: `filed` → terminal (with the
+filed coordinates), then `drifted` → decide (the file arm would refuse a drifted revision), then
+`guidanceForFilingProgress` — `in_progress` → preview, `failed`/`incomplete` → file with the PINNED repo (the reason
+names `last_error` and the failure point) — then the approval-state switch. `guidanceForFiling` routes a
+`filing_in_progress`/`already_in_progress` result to preview; anything else, including a pre-#4153 backend's
+statusless 200, is terminal. `draft_epic_contract_test.go` decodes the REAL server's 202 body and session JSON
+(pgtest + `server.Handler()` + a gated in-memory provider) into these mirrors, so a server JSON-tag rename goes red.
+
 Backend error codes surface verbatim through typed `apiError` unwraps: `amendment_budget_exhausted`,
 `decision_already_recorded`, `refinement_not_approved`, `refinement_draft_drifted`, `refinement_filing_repo_mismatch`,
-and `refinement_filing_failed` — the last carrying the filed-so-far ordinals for a resumable re-invoke via
-`filedSoFarDetail`. Wire mirrors (`RefinementSession`/`RefinementFilingResult`/`CriteriaPrecheck`) live in `client.go`
-as #371-safe shapes (UUIDs typed `string`, no reflect-array pitfalls). Registered via `registerDraftEpic` in
+and `refinement_filing_failed` — since #4153 a SYNCHRONOUS refusal to start (the target repo's installation could not
+be resolved; nothing was launched), surfaced with the re-invoke-with-the-same-repo remedy; a mid-sequence failure is no
+longer an error, it is the `failed` filing state above. Wire mirrors (`RefinementSession`/`RefinementFilingResult`/
+`RefinementFilingProgress`/`CriteriaPrecheck`) live in `client.go` as #371-safe shapes (UUIDs typed `string`, no
+reflect-array pitfalls). Registered via `registerDraftEpic` in
 `tools.go`, bumping the tool-count guard to **40** (`tools_test.go` `wantToolCount`).
 
 **Auth:** `write:approvals` — NO new scope (the E34.2 precedent), so the operator token already driving

@@ -374,6 +374,10 @@ var exportBaseline = []string{
 	"RefinementDecision",
 	"RefinementFilingChild",
 	"RefinementFilingEpic",
+	// #4153: the session view's `filing` block mirror (the detached file
+	// arm's progress), exported for the SDK's jsonschema reflection like
+	// every DTO.
+	"RefinementFilingProgress",
 	"RefinementFilingResult",
 	"RefinementSession",
 	"RejectDeployInput",

@@ -3889,3 +3889,55 @@ func TestFileWorkItem_SourceRefsExcludedFromIntakeDuplicates(t *testing.T) {
 		t.Errorf("the filed body does not render the Derives-from block:\n%s", p.captured.Item.Body)
 	}
 }
+
+// hookFiringProvider is a capturing provider that, like the real github and
+// gitlab providers, fires the request's write-ahead hook right after its
+// "create" (#4153).
+type hookFiringProvider struct {
+	name     string
+	captured workmgmt.ProviderRequest
+}
+
+func (p *hookFiringProvider) Name() string { return p.name }
+
+func (p *hookFiringProvider) File(ctx context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	p.captured = req
+	created := &workmgmt.CreatedItem{Provider: p.name, Number: 5150, URL: "https://x/issues/5150"}
+	req.NotifyCreated(ctx, created)
+	return created, nil
+}
+
+// TestApplyAndFileWorkItem_ThreadsOnCreatedToProvider pins the server half of
+// the write-ahead seam (#4153): FilingRequest.OnCreated reaches the provider's
+// ProviderRequest verbatim through the shared filing core, so the caller's
+// closure observes the created issue the moment the provider reports it.
+func TestApplyAndFileWorkItem_ThreadsOnCreatedToProvider(t *testing.T) {
+	p := &hookFiringProvider{name: "test_oncreated_probe"}
+	workmgmt.Register(p)
+	conv := workmgmt.Default()
+	conv.Provider = p.name
+	s := New(Config{})
+
+	var observed []workmgmt.CreatedItem
+	filing := workmgmt.FilingRequest{
+		Type:      "chore",
+		Summary:   "thread the write-ahead hook",
+		TitleVars: map[string]string{"epic": "1", "n": "1"},
+		OnCreated: func(_ context.Context, item workmgmt.CreatedItem) { observed = append(observed, item) },
+	}
+	target := workmgmt.Target{Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}}
+
+	_, created, werr := s.applyAndFileWorkItem(context.Background(), filing, conv, target, "kuhlman-labs", "fishhawk")
+	if werr != nil {
+		t.Fatalf("applyAndFileWorkItem: %+v", werr)
+	}
+	if created.Number != 5150 {
+		t.Fatalf("created = %+v, want #5150", created)
+	}
+	if p.captured.OnCreated == nil {
+		t.Fatal("the provider received no OnCreated hook — the filing core dropped it")
+	}
+	if len(observed) != 1 || observed[0].Number != 5150 || observed[0].URL != "https://x/issues/5150" {
+		t.Errorf("caller closure observed %+v, want exactly one call carrying #5150", observed)
+	}
+}

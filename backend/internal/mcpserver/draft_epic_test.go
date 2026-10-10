@@ -48,6 +48,30 @@ type refineFakeBackend struct {
 	// needs_attention in criteria_precheck (the E34.5 advisory flag); 0 means a
 	// clean, checked-and-clean pre-check over two children.
 	flaggedOrdinal int
+
+	// filing, when non-nil, is the session view's `filing` block (#4153). The
+	// file route sets it in_progress (the detached launch); completeFiling
+	// flips it to filed, as the backend's detached goroutine would.
+	filing map[string]any
+}
+
+// completeFiling simulates the backend's detached filing finishing: the
+// filing block goes filed with the epic + both children recorded, and the
+// session's top-level state becomes filed.
+func (fb *refineFakeBackend) completeFiling(repo string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.state = "filed"
+	fb.filing = map[string]any{
+		"state": "filed", "repo": repo, "in_flight": false, "child_count": 2, "filed_count": 3,
+		"epic": map[string]any{"number": 2000, "url": "https://github.com/" + repo + "/issues/2000"},
+		"children": []any{
+			map[string]any{"ordinal": 1, "number": 2001, "url": "https://github.com/" + repo + "/issues/2001"},
+			map[string]any{"ordinal": 2, "number": 2002, "url": "https://github.com/" + repo + "/issues/2002"},
+		},
+		"started_at":   "2026-10-09T00:00:00Z",
+		"completed_at": "2026-10-09T00:01:00Z",
+	}
 }
 
 func defaultDraftJSON() json.RawMessage {
@@ -77,6 +101,9 @@ func (fb *refineFakeBackend) sessionViewJSON() []byte {
 	}
 	if fb.drifted {
 		m["drifted"] = true
+	}
+	if fb.filing != nil {
+		m["filing"] = fb.filing
 	}
 	b, _ := json.Marshal(m)
 	return b
@@ -237,19 +264,26 @@ func newRefineFakeBackend(t *testing.T) (*refineFakeBackend, *httptest.Server) {
 			Repo string `json:"repo"`
 		}
 		_ = json.Unmarshal(body, &req)
-		w.WriteHeader(http.StatusOK)
+		// The detached file arm (#4153): the launch returns 202 at once with
+		// nothing filed yet, and progress moves onto the session view.
+		fb.filing = map[string]any{
+			"state": "in_progress", "repo": req.Repo, "in_flight": true,
+			"child_count": 2, "filed_count": 0, "children": []any{},
+			"started_at": "2026-10-09T00:00:00Z",
+		}
+		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{
+			"status": "filing_in_progress",
 			"session_id": "` + testSessionID + `",
 			"draft_id": "22222222-2222-2222-2222-222222222222",
 			"repo": "` + req.Repo + `",
-			"epic": {"number": 2000, "url": "https://github.com/` + req.Repo + `/issues/2000"},
-			"children": [
-				{"ordinal": 1, "number": 2001, "url": "https://github.com/` + req.Repo + `/issues/2001"},
-				{"ordinal": 2, "number": 2002, "url": "https://github.com/` + req.Repo + `/issues/2002"}
-			],
+			"child_count": 2,
+			"budget_seconds": 300,
+			"already_in_progress": false,
+			"children": [],
 			"resumed": false,
 			"already_completed": false,
-			"verified": true
+			"verified": false
 		}`))
 	})
 
@@ -484,14 +518,99 @@ func TestDraftEpic_FileArm_WiresFile(t *testing.T) {
 	if out.Filing == nil {
 		t.Fatal("out.Filing is nil")
 	}
-	if out.Filing.Epic.Number != 2000 || len(out.Filing.Children) != 2 || !out.Filing.Verified {
-		t.Errorf("filing = %+v", out.Filing)
+	// The 202 launch body decodes into the mirror: status, child count and
+	// budget present, nothing filed yet (no epic, no children).
+	if out.Filing.Status != "filing_in_progress" || out.Filing.AlreadyInProgress {
+		t.Errorf("status/already_in_progress = %q/%v, want filing_in_progress/false", out.Filing.Status, out.Filing.AlreadyInProgress)
 	}
-	if out.Filing.Children[1].Ordinal != 2 || out.Filing.Children[1].Number != 2002 {
-		t.Errorf("child[1] = %+v", out.Filing.Children[1])
+	if out.Filing.ChildCount != 2 || out.Filing.BudgetSeconds != 300 {
+		t.Errorf("child_count/budget_seconds = %d/%d, want 2/300", out.Filing.ChildCount, out.Filing.BudgetSeconds)
 	}
-	if len(out.SessionGuidance) == 0 || out.SessionGuidance[0].Arm != "terminal" {
-		t.Errorf("guidance = %+v, want first arm 'terminal'", out.SessionGuidance)
+	if out.Filing.Epic != nil || len(out.Filing.Children) != 0 {
+		t.Errorf("a fresh launch has filed nothing yet; filing = %+v", out.Filing)
+	}
+	// The filing is detached: the next move is the preview arm, never terminal.
+	if len(out.SessionGuidance) != 1 {
+		t.Fatalf("guidance = %+v, want exactly one entry", out.SessionGuidance)
+	}
+	g := out.SessionGuidance[0]
+	if g.Arm != "preview" || g.State != "filing_in_progress" || g.Arguments["session_id"] != testSessionID {
+		t.Errorf("guidance = %+v, want filing_in_progress -> preview(session_id)", g)
+	}
+	if !strings.Contains(g.Reason, "kuhlman-labs/fishhawk") || !strings.Contains(g.Reason, "300s") {
+		t.Errorf("guidance reason = %q, want the repo and the budget named", g.Reason)
+	}
+}
+
+// TestDraftEpic_FileArm_AlreadyInProgress_GuidancePreview: a concurrent file
+// call (202 already_in_progress) launched nothing, so the next move is the
+// preview arm. Counterfactual: delete the in-progress branch of
+// guidanceForFiling -> terminal guidance -> RED.
+func TestDraftEpic_FileArm_AlreadyInProgress_GuidancePreview(t *testing.T) {
+	fb, srv := newRefineFakeBackend(t)
+	fb.overrideStatus = http.StatusAccepted
+	fb.overrideBody = `{
+		"status": "already_in_progress",
+		"session_id": "` + testSessionID + `",
+		"draft_id": "22222222-2222-2222-2222-222222222222",
+		"repo": "kuhlman-labs/fishhawk",
+		"child_count": 2,
+		"budget_seconds": 300,
+		"already_in_progress": true,
+		"epic": {"number": 2000, "url": "https://github.com/kuhlman-labs/fishhawk/issues/2000"},
+		"children": [],
+		"resumed": true,
+		"already_completed": false,
+		"verified": false
+	}`
+	r := newResolver(srv, nil)
+
+	_, out, err := r.draftEpic(context.Background(), nil, DraftEpicInput{SessionID: testSessionID, Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("file(already_in_progress): %v", err)
+	}
+	if out.Filing == nil || !out.Filing.AlreadyInProgress || out.Filing.Status != "already_in_progress" {
+		t.Fatalf("filing = %+v, want already_in_progress", out.Filing)
+	}
+	if out.Filing.Epic == nil || out.Filing.Epic.Number != 2000 {
+		t.Errorf("the filed-so-far epic must decode; got %+v", out.Filing.Epic)
+	}
+	if len(out.SessionGuidance) != 1 || out.SessionGuidance[0].Arm != "preview" || out.SessionGuidance[0].Arguments["session_id"] != testSessionID {
+		t.Fatalf("guidance = %+v, want preview(session_id)", out.SessionGuidance)
+	}
+	if !strings.Contains(out.SessionGuidance[0].Reason, "already running") {
+		t.Errorf("guidance reason = %q, want it to say a filing is already running", out.SessionGuidance[0].Reason)
+	}
+}
+
+// TestDraftEpic_FileArm_StatuslessBody_Terminal pins the rollback posture: a
+// pre-#4153 backend's synchronous 200 carries no status and means the session
+// filed, so the guidance stays terminal (the plan's rollback note).
+func TestDraftEpic_FileArm_StatuslessBody_Terminal(t *testing.T) {
+	fb, srv := newRefineFakeBackend(t)
+	fb.overrideStatus = http.StatusOK
+	fb.overrideBody = `{
+		"session_id": "` + testSessionID + `",
+		"draft_id": "22222222-2222-2222-2222-222222222222",
+		"repo": "kuhlman-labs/fishhawk",
+		"epic": {"number": 2000, "url": "https://github.com/kuhlman-labs/fishhawk/issues/2000"},
+		"children": [{"ordinal": 1, "number": 2001, "url": "u1"}],
+		"resumed": false,
+		"already_completed": false,
+		"verified": true
+	}`
+	r := newResolver(srv, nil)
+
+	_, out, err := r.draftEpic(context.Background(), nil, DraftEpicInput{SessionID: testSessionID, Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("file(statusless 200): %v", err)
+	}
+	if len(out.SessionGuidance) != 1 || out.SessionGuidance[0].Arm != "terminal" {
+		t.Fatalf("guidance = %+v, want terminal", out.SessionGuidance)
+	}
+	args := out.SessionGuidance[0].Arguments
+	if args["epic"] != "#2000 https://github.com/kuhlman-labs/fishhawk/issues/2000" || args["child_1"] != "#2001 u1" {
+		t.Errorf("terminal arguments = %v, want the filed coordinates", args)
 	}
 }
 
@@ -499,7 +618,7 @@ func TestDraftEpic_FileArm_WiresFile(t *testing.T) {
 // asserted at EVERY transition (criterion session-guidance-correct-arm) ---
 
 func TestDraftEpic_SessionLoop(t *testing.T) {
-	_, srv := newRefineFakeBackend(t)
+	fb, srv := newRefineFakeBackend(t)
 	r := newResolver(srv, nil)
 	ctx := context.Background()
 
@@ -571,13 +690,32 @@ func TestDraftEpic_SessionLoop(t *testing.T) {
 		t.Fatalf("after approve: state=%q arm=%q, want approved/file", out.Session.State, firstArm(out))
 	}
 
-	// 7. file -> terminal
+	// 7. file -> 202 filing_in_progress -> guidance: preview (detached, #4153)
 	_, out, err = r.draftEpic(ctx, nil, DraftEpicInput{SessionID: sid, Repo: "kuhlman-labs/fishhawk"})
 	if err != nil {
 		t.Fatalf("file: %v", err)
 	}
-	if out.Filing == nil || firstArm(out) != "terminal" {
-		t.Fatalf("after file: filing=%v arm=%q, want terminal", out.Filing, firstArm(out))
+	if out.Filing == nil || out.Filing.Status != "filing_in_progress" || firstArm(out) != "preview" {
+		t.Fatalf("after file: filing=%+v arm=%q, want filing_in_progress/preview", out.Filing, firstArm(out))
+	}
+
+	// 8. preview while the filing runs -> filing in_progress -> guidance: preview
+	_, out, err = r.draftEpic(ctx, nil, DraftEpicInput{SessionID: sid})
+	if err != nil {
+		t.Fatalf("preview(in progress): %v", err)
+	}
+	if out.Session.Filing == nil || out.Session.Filing.State != "in_progress" || firstArm(out) != "preview" {
+		t.Fatalf("while filing: filing=%+v arm=%q, want in_progress/preview", out.Session.Filing, firstArm(out))
+	}
+
+	// 9. the detached filing completes -> preview -> state filed -> terminal
+	fb.completeFiling("kuhlman-labs/fishhawk")
+	_, out, err = r.draftEpic(ctx, nil, DraftEpicInput{SessionID: sid})
+	if err != nil {
+		t.Fatalf("preview(filed): %v", err)
+	}
+	if out.Session.State != "filed" || firstArm(out) != "terminal" {
+		t.Fatalf("after completion: state=%q arm=%q, want filed/terminal", out.Session.State, firstArm(out))
 	}
 }
 
@@ -804,25 +942,214 @@ func TestDraftEpic_FileAlreadyCompleted_TerminalGuidance(t *testing.T) {
 	}
 }
 
-func TestDraftEpic_FilingFailed_ResumeSameRepo(t *testing.T) {
+// TestDraftEpic_FilingLaunchRefused_ReinvokeSameRepo: since the file arm
+// detached (#4153) a 502 refinement_filing_failed is a synchronous refusal to
+// START (the installation could not be resolved) — nothing was launched — so
+// the error says so and names the re-invoke with the same repo, surfacing the
+// backend code and details verbatim.
+func TestDraftEpic_FilingLaunchRefused_ReinvokeSameRepo(t *testing.T) {
 	fb, srv := newRefineFakeBackend(t)
 	fb.overrideStatus = http.StatusBadGateway
-	fb.overrideBody = `{"error":{"code":"refinement_filing_failed","message":"a work item could not be filed","details":{"failed_ordinal":2,"filed":[{"ordinal":1,"number":2001}]}}}`
+	fb.overrideBody = `{"error":{"code":"refinement_filing_failed","message":"could not resolve the GitHub App installation for the target repo","details":{"error_ref":"ref-123"}}}`
 	r := newResolver(srv, nil)
 
 	_, _, err := r.draftEpic(context.Background(), nil, DraftEpicInput{SessionID: testSessionID, Repo: "kuhlman-labs/fishhawk"})
 	if err == nil {
 		t.Fatal("want an error on 502 refinement_filing_failed")
 	}
-	// filed-so-far details surfaced + re-invoke-same-repo guidance.
-	if !strings.Contains(err.Error(), "refinement_filing_failed") {
-		t.Errorf("err = %v, want verbatim code", err)
+	if !strings.Contains(err.Error(), "refinement_filing_failed") || !strings.Contains(err.Error(), "ref-123") {
+		t.Errorf("err = %v, want the verbatim code and details", err)
+	}
+	if !strings.Contains(err.Error(), "nothing was launched") {
+		t.Errorf("err = %v, want it to say nothing was launched", err)
 	}
 	if !strings.Contains(err.Error(), "re-invoke the file arm with the SAME repo") || !strings.Contains(err.Error(), "kuhlman-labs/fishhawk") {
 		t.Errorf("err = %v, want re-invoke-same-repo guidance naming the repo", err)
 	}
-	if !strings.Contains(err.Error(), "failed_ordinal") || !strings.Contains(err.Error(), "filed so far") {
-		t.Errorf("err = %v, want filed-so-far details", err)
+}
+
+// --- preview-arm guidance over the filing block (#4153): one test per
+// branch, each a deletion counterfactual of its case ---
+
+// approvedSessionWithFiling builds a preview body for an approved session
+// carrying filing block `filing` (raw JSON), and optionally drifted.
+func approvedSessionWithFiling(state, filing string, drifted bool) string {
+	d := ""
+	if drifted {
+		d = `"drifted": true,`
+	}
+	return `{
+		"session_id": "` + testSessionID + `",
+		"state": "` + state + `",
+		` + d + `
+		"revision_count": 1,
+		"latest_origin": "brief",
+		"latest_draft": ` + string(defaultDraftJSON()) + `,
+		"preview": [],
+		"waves": [[1],[2]],
+		"criteria_precheck": {"needs_attention": false, "children": []},
+		"decisions": [],
+		"filing": ` + filing + `
+	}`
+}
+
+func previewWith(t *testing.T, body string) DraftEpicOutput {
+	t.Helper()
+	fb, srv := newRefineFakeBackend(t)
+	fb.overrideStatus = http.StatusOK
+	fb.overrideBody = body
+	r := newResolver(srv, nil)
+	_, out, err := r.draftEpic(context.Background(), nil, DraftEpicInput{SessionID: testSessionID})
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if len(out.SessionGuidance) != 1 {
+		t.Fatalf("guidance = %+v, want exactly one entry", out.SessionGuidance)
+	}
+	return out
+}
+
+// TestDraftEpic_Preview_FilingInProgress_GuidancePreview: a running detached
+// filing routes to the preview arm, not the file arm the approved state
+// would otherwise name. Counterfactual: delete the in_progress case -> the
+// approved -> file guidance -> RED.
+func TestDraftEpic_Preview_FilingInProgress_GuidancePreview(t *testing.T) {
+	out := previewWith(t, approvedSessionWithFiling("approved", `{
+		"state": "in_progress", "repo": "kuhlman-labs/fishhawk", "in_flight": true,
+		"child_count": 2, "filed_count": 2,
+		"epic": {"number": 2000, "url": "https://github.com/kuhlman-labs/fishhawk/issues/2000"},
+		"children": [{"ordinal": 1, "number": 2001, "url": "u1"}],
+		"started_at": "2026-10-09T00:00:00Z"
+	}`, false))
+	f := out.Session.Filing
+	if f == nil || f.State != "in_progress" || !f.InFlight || f.FiledCount != 2 || f.ChildCount != 2 {
+		t.Fatalf("filing block must decode into the mirror; got %+v", f)
+	}
+	if f.Epic == nil || f.Epic.Number != 2000 || len(f.Children) != 1 || f.Children[0].Number != 2001 || f.StartedAt == nil {
+		t.Errorf("filed-so-far items must decode; got %+v", f)
+	}
+	g := out.SessionGuidance[0]
+	if g.State != "filing_in_progress" || g.Arm != "preview" || g.Arguments["session_id"] != testSessionID {
+		t.Fatalf("guidance = %+v, want filing_in_progress -> preview(session_id)", g)
+	}
+	if !strings.Contains(g.Reason, "2 of 3 items") {
+		t.Errorf("guidance reason = %q, want the progress (2 of 3 items)", g.Reason)
+	}
+}
+
+// TestDraftEpic_Preview_FilingFailed_GuidanceFileWithPinnedRepo: a failed
+// filing routes to the file arm carrying the PINNED repo, with the failure
+// named. Counterfactual: delete the failed case -> the approved -> file
+// guidance carries the placeholder owner/name, not the pinned repo -> RED.
+func TestDraftEpic_Preview_FilingFailed_GuidanceFileWithPinnedRepo(t *testing.T) {
+	out := previewWith(t, approvedSessionWithFiling("approved", `{
+		"state": "failed", "repo": "kuhlman-labs/fishhawk", "in_flight": false,
+		"child_count": 2, "filed_count": 2, "children": [{"ordinal": 1, "number": 2001, "url": "u1"}],
+		"last_error": "link child #2001 to epic #2000: context deadline exceeded",
+		"failed_ordinal": 1, "step": "link"
+	}`, false))
+	f := out.Session.Filing
+	if f == nil || f.State != "failed" || f.FailedOrdinal == nil || *f.FailedOrdinal != 1 || f.Step != "link" || f.LastError == "" {
+		t.Fatalf("failure fields must decode into the mirror; got %+v", f)
+	}
+	g := out.SessionGuidance[0]
+	if g.State != "filing_failed" || g.Arm != "file" {
+		t.Fatalf("guidance = %+v, want filing_failed -> file", g)
+	}
+	if g.Arguments["repo"] != "kuhlman-labs/fishhawk" || g.Arguments["session_id"] != testSessionID {
+		t.Errorf("guidance arguments = %v, want the pinned repo + session_id", g.Arguments)
+	}
+	for _, want := range []string{"context deadline exceeded", "step link", "ordinal 1", "SAME repo"} {
+		if !strings.Contains(g.Reason, want) {
+			t.Errorf("guidance reason = %q, want it to contain %q", g.Reason, want)
+		}
+	}
+}
+
+// TestDraftEpic_Preview_FilingIncomplete_GuidanceFileWithPinnedRepo: an open
+// filing session with nothing running (a restart) routes to the file arm with
+// the pinned repo. Counterfactual: delete the incomplete case -> the approved
+// -> file guidance carries owner/name -> RED.
+func TestDraftEpic_Preview_FilingIncomplete_GuidanceFileWithPinnedRepo(t *testing.T) {
+	out := previewWith(t, approvedSessionWithFiling("approved", `{
+		"state": "incomplete", "repo": "kuhlman-labs/fishhawk", "in_flight": false,
+		"child_count": 2, "filed_count": 1, "children": []
+	}`, false))
+	g := out.SessionGuidance[0]
+	if g.State != "filing_incomplete" || g.Arm != "file" || g.Arguments["repo"] != "kuhlman-labs/fishhawk" {
+		t.Fatalf("guidance = %+v, want filing_incomplete -> file(pinned repo)", g)
+	}
+	if !strings.Contains(g.Reason, "1 of 3 items") || !strings.Contains(g.Reason, "nothing is running") {
+		t.Errorf("guidance reason = %q, want the progress and the nothing-running cause", g.Reason)
+	}
+}
+
+// TestDraftEpic_Preview_Filed_Terminal: a completed filing (top-level state
+// filed) is terminal and names the filed coordinates. Counterfactual: delete
+// the filed branch of guidanceForSession -> the unknown state falls to the
+// awaiting_approval default (decide) -> RED.
+func TestDraftEpic_Preview_Filed_Terminal(t *testing.T) {
+	out := previewWith(t, approvedSessionWithFiling("filed", `{
+		"state": "filed", "repo": "kuhlman-labs/fishhawk", "in_flight": false,
+		"child_count": 1, "filed_count": 2,
+		"epic": {"number": 2000, "url": "e"},
+		"children": [{"ordinal": 1, "number": 2001, "url": "c1"}],
+		"completed_at": "2026-10-09T00:01:00Z"
+	}`, false))
+	if out.Session.State != "filed" || out.Session.Filing.CompletedAt == nil {
+		t.Fatalf("session = %+v, want state filed with completed_at", out.Session)
+	}
+	g := out.SessionGuidance[0]
+	if g.State != "filed" || g.Arm != "terminal" {
+		t.Fatalf("guidance = %+v, want filed -> terminal", g)
+	}
+	if g.Arguments["epic"] != "#2000 e" || g.Arguments["child_1"] != "#2001 c1" {
+		t.Errorf("terminal arguments = %v, want the filed coordinates", g.Arguments)
+	}
+}
+
+// TestDraftEpic_Preview_DriftedBeatsFailedFiling: a drifted revision must be
+// re-decided before any re-file (the file arm would refuse it 409), so drift
+// takes precedence over a failed filing block. Counterfactual: evaluate the
+// filing block before drift -> file guidance -> RED.
+func TestDraftEpic_Preview_DriftedBeatsFailedFiling(t *testing.T) {
+	out := previewWith(t, approvedSessionWithFiling("awaiting_approval", `{
+		"state": "failed", "repo": "kuhlman-labs/fishhawk", "in_flight": false,
+		"child_count": 2, "filed_count": 1, "children": [], "last_error": "boom"
+	}`, true))
+	if g := out.SessionGuidance[0]; g.State != "drifted" || g.Arm != "decide" {
+		t.Fatalf("guidance = %+v, want drifted -> decide", g)
+	}
+}
+
+// TestGuidanceForFilingProgress_Fallbacks pins the pure helper's edges: a
+// failed block with no pinned repo names the owner/name placeholder and no
+// failure point; an unknown state yields no filing-specific move (the caller
+// falls back to the approval-state guidance); a nil block yields nothing.
+func TestGuidanceForFilingProgress_Fallbacks(t *testing.T) {
+	g := guidanceForFilingProgress(testSessionID, &RefinementFilingProgress{State: "failed", LastError: "boom"})
+	if len(g) != 1 || g[0].Arguments["repo"] != "owner/name" {
+		t.Fatalf("failed without repo = %+v, want the owner/name placeholder", g)
+	}
+	if !strings.Contains(g[0].Reason, "the last filing stopped: boom") {
+		t.Errorf("reason = %q, want no failure point when neither step nor ordinal is named", g[0].Reason)
+	}
+	if got := guidanceForFilingProgress(testSessionID, &RefinementFilingProgress{State: "something_new"}); got != nil {
+		t.Errorf("unknown state = %+v, want nil (fall through)", got)
+	}
+	if got := guidanceForFilingProgress(testSessionID, nil); got != nil {
+		t.Errorf("nil block = %+v, want nil", got)
+	}
+	// An unknown filing state on an approved session falls through to the
+	// approval-state guidance (file).
+	out := guidanceForSession(&RefinementSession{SessionID: testSessionID, State: "approved", Filing: &RefinementFilingProgress{State: "something_new"}})
+	if len(out) != 1 || out[0].Arm != "file" {
+		t.Errorf("approved + unknown filing state = %+v, want the approved -> file guidance", out)
+	}
+	// A filed session with no filing block still terminates (no coordinates).
+	out = guidanceForSession(&RefinementSession{SessionID: testSessionID, State: "filed"})
+	if len(out) != 1 || out[0].Arm != "terminal" || out[0].Arguments != nil {
+		t.Errorf("filed without a block = %+v, want terminal with no arguments", out)
 	}
 }
 
