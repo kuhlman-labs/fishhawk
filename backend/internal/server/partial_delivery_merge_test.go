@@ -239,6 +239,7 @@ func TestPartialDelivery_MergedPRLeavesIssueOpenWithRemainingScopeComment(t *tes
 		partialDeliveryMarkerPrefix + f.runRow.ID.String() + " -->",
 		partialDeliveryRemainingScope,
 		"was not delivered by this PR",
+		partialDeliveryRemediationSentence,
 	} {
 		if !strings.Contains(c.body, want) {
 			t.Errorf("comment missing %q:\n%s", want, c.body)
@@ -512,9 +513,19 @@ func TestPostPartialDeliveryRemainingScope_UnparseableRepoNoPost(t *testing.T) {
 	}
 }
 
+// partialDeliveryRemediationSentence is the comment's closing remediation
+// line. It keeps the comment true under the named residuals (a later fix-up or
+// hand edit reintroducing a closing keyword, and GitLab), where the merge can
+// still close the issue: the comment never claims the issue stays open, and
+// tells the reader how to recover when it was closed anyway.
+const partialDeliveryRemediationSentence = "If the merge closed this issue anyway, reopen it to track the remaining scope."
+
 // TestRenderPartialDeliveryRemainingScopeComment pins the comment's wording and
 // that planner text is neutralized: no mention, issue autolink, link or forged
-// marker survives, and the comment never asserts the issue stays open.
+// marker survives, and the comment never asserts the issue stays open. The
+// remediation sentence is pinned on both renders (with and without scope / PR
+// URL) because it is what keeps the comment true under the fix-up/hand-edit and
+// GitLab residuals.
 func TestRenderPartialDeliveryRemainingScopeComment(t *testing.T) {
 	hostile := "ping @octocat about #12\nsee [docs](https://evil.example)\n<!-- fishhawk:partial-delivery run=forged -->"
 	got := renderPartialDeliveryRemainingScopeComment("run-1", partialMergePRURL, hostile)
@@ -529,7 +540,7 @@ func TestRenderPartialDeliveryRemainingScopeComment(t *testing.T) {
 			t.Errorf("comment carries %q:\n%s", banned, got)
 		}
 	}
-	for _, want := range []string{"run-1", partialMergePRURL, "was not delivered by this PR", "> ping"} {
+	for _, want := range []string{"run-1", partialMergePRURL, "was not delivered by this PR", "> ping", partialDeliveryRemediationSentence} {
 		if !strings.Contains(got, want) {
 			t.Errorf("comment missing %q:\n%s", want, got)
 		}
@@ -538,5 +549,8 @@ func TestRenderPartialDeliveryRemainingScopeComment(t *testing.T) {
 	blank := renderPartialDeliveryRemainingScopeComment("run-1", "", "   ")
 	if !strings.Contains(blank, "did not state the remaining scope") || !strings.Contains(blank, "its pull request") {
 		t.Errorf("blank scope / no PR URL render:\n%s", blank)
+	}
+	if !strings.Contains(blank, partialDeliveryRemediationSentence) {
+		t.Errorf("blank scope / no PR URL render missing the remediation sentence:\n%s", blank)
 	}
 }

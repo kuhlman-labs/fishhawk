@@ -871,8 +871,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// empty one, so an audit fetch error or a window that has aged the
 		// entries out leaves false/false/""/"" — which lands the DEFENSIVE
 		// acceptance_settled_outcome_unknown arm (fail toward read, never toward
-		// merge), i.e. today's behavior.
-		acceptanceVerdict := latestAcceptanceVerdict(recentAudit)
+		// merge) — EXCEPT inside the in-flight window below.
+		//
+		// E72.56 / #4072: acceptanceVerdictSignal is the SAME wrapper
+		// getRunStatus uses — a fresh acceptance settle (ended_at within
+		// acceptanceVerdictInFlightWindow) with no verdict visible yet, including
+		// on an empty or un-fetched window, classifies acceptance_verdict_pending
+		// (wait, never retry or merge) rather than the retry-offering
+		// outcome-unknown arm, because the runner ships the verdict AFTER the
+		// trace upload settles the stage. Past the window it degrades to the
+		// outcome-unknown arm exactly as before.
+		acceptanceVerdict := acceptanceVerdictSignal(recentAudit, postStages, time.Now().UTC())
 		acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recentAudit)
 		acceptanceSkippedOutOfScope := acceptanceSkippedOutOfScopeIn(recentAudit)
 		acceptanceArbitrated := acceptanceArbitratedIn(recentAudit)

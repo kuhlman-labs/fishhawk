@@ -162,6 +162,13 @@ type StageWaitStatus struct {
 	// Populated by the MCP layer's best-effort audit probe, never by the pure
 	// classifier: see fixup_recovery_surface.go.
 	FixupRecovered *FixupRecovery `json:"fixup_recovered,omitempty" jsonschema:"present ONLY when the LATEST fix-up pass for this stage FAILED and the backend recovered the stage to its prior state (#3081). Its presence means status 'succeeded' is TRUE of the stage and MISLEADING of the fix-up: no fix-up commit landed, the PR head still carries the pre-fix-up commit, and the routed concerns were NOT addressed. Absent when the fix-up landed, when no fix-up ran, or when a later pass superseded an earlier recovery"`
+	// VerdictPending is the E72.56 / #4072 marker: set ONLY for an acceptance
+	// stage that settled `succeeded` while no verdict for its latest attempt has
+	// been confirmed yet. The runner settles the stage with its trace upload and
+	// ships the verdict AFTER that, so a fresh settle legitimately carries no
+	// acceptance_outcome_recorded entry for a few seconds. Omitted in every
+	// other case, so nothing that read this block before reads differently now.
+	VerdictPending bool `json:"verdict_pending,omitempty" jsonschema:"set ONLY for an acceptance stage that settled succeeded when no verdict for its latest attempt has been confirmed yet (#4072): the runner ships the verdict AFTER the trace upload settles the stage, so it may still land. This is NOT the settled-outcome-unknown state — do NOT fishhawk_retry_stage on it; re-call fishhawk_await_stage (stage=acceptance) or re-poll fishhawk_get_run_status. Absent in every other case"`
 	// Concurrency projects the stage's local concurrency-slot block (#3964 /
 	// ADR-087) while the stage is non-terminal: a stage QUEUED for a slot
 	// buckets to status pending (its raw state stays awaiting_host_dispatch),

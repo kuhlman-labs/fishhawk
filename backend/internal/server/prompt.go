@@ -1427,6 +1427,35 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge-candidate verify pass (ADR-090 D3 / #4018), resolved HERE — as early
+	// as the trigger is resolvable, since it needs only the run and stage ids —
+	// so the runner-capability gate (#4183) runs before the liveness flip, the
+	// issue fetch, the plan_missing_for_implement row and the decomposed-scope
+	// branch. A live trigger fetched by a runner that does not advertise
+	// capabilityMergeCandidateVerify is a STALE runner: it would ignore the
+	// merge_candidate_verify_* fields and run a plain implement agent pass on the
+	// re-opened stage. Build no prompt, settle the pass as not_executed and
+	// answer 409, so the runner exits before any agent spawn and the head stays
+	// re-triggerable. The refused fetch makes no forge call and appends no
+	// issue_context_unresolved / plan_missing_for_implement row.
+	var mergeCandidate *mergeCandidateVerifyTrigger
+	if stage.Type == run.StageTypeImplement {
+		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
+		if mergeCandidate != nil && !runnerAdvertises(r, capabilityMergeCandidateVerify) {
+			settled := s.refuseMergeCandidatePassToIncapableRunner(r.Context(), runRow.ID, stage.ID)
+			s.writeError(w, r, http.StatusConflict, mergeCandidateReasonRunnerCapabilityMissing,
+				"this stage carries a live merge-candidate verify pass and "+mergeCandidateCapabilityMissingDetail,
+				map[string]any{
+					"run_id":              runRow.ID.String(),
+					"stage_id":            stage.ID.String(),
+					"required_capability": capabilityMergeCandidateVerify,
+					"expected_head_sha":   mergeCandidate.ExpectedHeadSHA,
+					"settled":             settled,
+				})
+			return
+		}
+	}
+
 	// Liveness flip (#1924): a valid signature proves a runner holding
 	// THIS run's signing key is fetching THIS stage's prompt, and that
 	// fetch lands within seconds of spawn — so it is the earliest
@@ -1473,7 +1502,6 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixupExpectedHeadSHA string
 	var fixupApplyPatches []fixupApplyPatch
 	var conflictResolution *conflictResolutionTrigger
-	var mergeCandidate *mergeCandidateVerifyTrigger
 	if stage.Type == run.StageTypeImplement {
 		// Run/stage ids for the implement prompt's scope self-exempt sidecar
 		// path (#1153). Populated only on the implement path; plan/review
@@ -1635,14 +1663,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
 		// EITHER terminal outcome is served conflict_resolution=false and takes
 		// the unchanged fix-up path.
-		// Merge-candidate verify pass (ADR-090 D3 / #4018). Resolved FIRST and
-		// EXCLUSIVE: a live trigger makes this dispatch a verify-only pass, so
-		// neither the conflict-resolution instruction nor the fix-up concern block
-		// is served beside it — the pass must never be handed an instruction to
-		// edit, commit or push. The resolver returns nil for a CONSUMED trigger
-		// (a later merge_candidate_verified row), so an ordinary fix-up that
-		// follows the pass takes the unchanged fix-up path.
-		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
+		// Merge-candidate verify pass (ADR-090 D3 / #4018). Resolved FIRST (at
+		// the capability gate above) and EXCLUSIVE: a live trigger makes this
+		// dispatch a verify-only pass, so neither the conflict-resolution
+		// instruction nor the fix-up concern block is served beside it — the pass
+		// must never be handed an instruction to edit, commit or push. The
+		// resolver returns nil for a CONSUMED trigger (a later
+		// merge_candidate_verified row), so an ordinary fix-up that follows the
+		// pass takes the unchanged fix-up path.
 		if mergeCandidate == nil {
 			conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		}
@@ -2459,13 +2487,16 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// pushed (succeeded) entry spent — so an ordinary fix-up that follows
 		// EITHER terminal outcome is served conflict_resolution=false and takes
 		// the unchanged fix-up path.
-		// Merge-candidate verify pass (ADR-090 D3 / #4018). Resolved FIRST and
-		// EXCLUSIVE: a live trigger makes this dispatch a verify-only pass, so
-		// neither the conflict-resolution instruction nor the fix-up concern block
-		// is served beside it — the pass must never be handed an instruction to
-		// edit, commit or push. The resolver returns nil for a CONSUMED trigger
-		// (a later merge_candidate_verified row), so an ordinary fix-up that
-		// follows the pass takes the unchanged fix-up path.
+		// Merge-candidate verify pass (ADR-090 D3 / #4018). This PREVIEW is
+		// deliberately NOT capability-gated (#4183): the gate SETTLES a live
+		// trigger (a not_executed row, a stage transition), and a preview must
+		// never mutate the run, so it always renders the served shape. Resolved
+		// FIRST and EXCLUSIVE: a live trigger makes this dispatch a verify-only
+		// pass, so neither the conflict-resolution instruction nor the fix-up
+		// concern block is served beside it — the pass must never be handed an
+		// instruction to edit, commit or push. The resolver returns nil for a
+		// CONSUMED trigger (a later merge_candidate_verified row), so an ordinary
+		// fix-up that follows the pass takes the unchanged fix-up path.
 		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
 		if mergeCandidate == nil {
 			conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
@@ -5256,6 +5287,16 @@ const runnerCapabilitiesHeader = "X-Fishhawk-Runner-Capabilities"
 // push-failure resume. WIRE VALUE: byte-identical to the runner's
 // upload.CapabilityPushResume.
 const capabilityPushResume = "push-resume"
+
+// capabilityMergeCandidateVerify is the runnerCapabilitiesHeader token for the
+// ADR-090 merge-candidate verify-only pass (#4183): this runner understands
+// the merge_candidate_verify_* prompt fields and runs the declared verify
+// command instead of an agent. A runner that does not advertise it is REFUSED
+// a live pass (409 runner_capability_missing), never served it.
+// WIRE VALUE: byte-identical to the runner's
+// upload.CapabilityMergeCandidateVerify. A drift is fail-SAFE: every runner is
+// refused the pass and nothing runs an agent.
+const capabilityMergeCandidateVerify = "merge-candidate-verify"
 
 // runnerAdvertises reports whether the request's capability header carries
 // token. Comma-separated, space-trimmed, CASE-SENSITIVE (the tokens are wire

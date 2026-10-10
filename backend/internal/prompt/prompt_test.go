@@ -7361,6 +7361,95 @@ func TestBuild_ImplementReview_SupplementalReinvoke_FalseRendersDiffNotFraming(t
 	}
 }
 
+// TestBuild_ImplementReview_SupplementalReinvoke_RendersGroundingPosture pins
+// #4160: the supplemental base-rebase re-invoke render carries the REPOSITORY
+// ACCESS section (buildImplementReview renders it BEFORE the supplemental early
+// return), so the reviewer is told the pass's grounding posture — the exported
+// tree at the re-landed head, or the named reason it runs without one. Each
+// case asserts PRESENCE of that posture: before #4160 the section was absent,
+// so an absence-only "no FISHHAWKD_REVIEW_GROUNDING" check passed vacuously.
+// Moving writeReviewRepoAccess back below the early return reddens every case.
+func TestBuild_ImplementReview_SupplementalReinvoke_RendersGroundingPosture(t *testing.T) {
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	const framing = "The exported tree named under REPOSITORY ACCESS is the re-landed head this pass reviews"
+	base := Trigger{
+		Repo:                 "kuhlman-labs/example",
+		ApprovedPlan:         fixturePlan(),
+		SupplementalReinvoke: true,
+		GateEvidence: &GateEvidence{
+			ScopeExemptions: []GateScopeExemption{
+				{Path: "pkg/foo/foo.go", Reason: "already correct after the rebase"},
+			},
+		},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*Trigger)
+		want   []string
+		absent []string
+	}{
+		{
+			name:   "grounded",
+			mutate: func(tr *Trigger) { tr.ReviewTreeCommit = commit },
+			want: []string{
+				"REPOSITORY ACCESS",
+				"TRACKED files exported at commit " + commit[:12],
+				"- Invoke any tools beyond reading and searching files within the provided working directory.",
+				framing,
+			},
+			absent: []string{"FISHHAWKD_REVIEW_GROUNDING", "DIFF-ONLY"},
+		},
+		{
+			name:   "enabled but unavailable",
+			mutate: func(tr *Trigger) { tr.ReviewUngroundedReason = ReviewUngroundedNoWorkingDir },
+			want: []string{
+				"REPOSITORY ACCESS",
+				"DIFF-ONLY",
+				"IS ENABLED",
+				reviewUngroundedPhrases[ReviewUngroundedNoWorkingDir],
+			},
+			absent: []string{"FISHHAWKD_REVIEW_GROUNDING", framing},
+		},
+		{
+			name:   "switched off (zero reason)",
+			mutate: func(*Trigger) {},
+			want: []string{
+				"REPOSITORY ACCESS",
+				"DIFF-ONLY",
+				"FISHHAWKD_REVIEW_GROUNDING=true",
+			},
+			absent: []string{"IS ENABLED", framing},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := base
+			tc.mutate(&tr)
+			got, err := Build("implement_review", tr)
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("supplemental render missing %q:\n%s", w, got)
+				}
+			}
+			for _, w := range tc.absent {
+				if strings.Contains(got, w) {
+					t.Errorf("supplemental render must not carry %q:\n%s", w, got)
+				}
+			}
+			// The posture leads the supplemental body: REPOSITORY ACCESS renders
+			// before the supplemental framing header.
+			ra := strings.Index(got, "REPOSITORY ACCESS")
+			sup := strings.Index(got, "### Supplemental review: base-rebase re-invoke scope exemptions")
+			if ra < 0 || sup < 0 || ra > sup {
+				t.Errorf("REPOSITORY ACCESS (at %d) must precede the supplemental framing (at %d)", ra, sup)
+			}
+		})
+	}
+}
+
 func TestBuild_ImplementReview_OperatorScopeUndelivered_RendersWarningAndBindingBullet(t *testing.T) {
 	// #1407: when GateEvidence.OperatorScopeUndelivered is populated, the
 	// gate-evidence section renders the named operator_scope_path_undelivered

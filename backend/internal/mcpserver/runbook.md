@@ -811,6 +811,18 @@ bare terminal state); roll back by hand with `fishhawk deploy rollback <run-id>`
 if the deploy must still be reverted. The handle is shown only in the
 `deploy_rollback` step's `params.rollback_handle`, never in its prose.
 
+**Verdict pending (#4072).** The runner settles the acceptance stage `succeeded`
+with its trace upload and ships the verdict AFTER that, so an empty verdict
+within ~2 minutes of the settle is the verdict IN FLIGHT, not the #1567 hole
+below. `next_actions` names it `acceptance_verdict_pending` (or
+`succeeded_acceptance_verdict_pending` on a succeeded run), and
+`acceptance_stage_wait_status.verdict_pending` is true. Wait rather than retry:
+`fishhawk_await_stage` (stage=acceptance) holds a settled acceptance release
+until the latest attempt's verdict lands and reports it as
+`acceptance_verdict`. If it releases with `verdict_pending: true` (your deadline
+came first, or the audit read could not decide), re-call it. Do NOT
+`fishhawk_retry_stage` and do not merge on `verdict_pending`.
+
 **Settled-outcome-unknown recovery (E31.16 / #1567).** A different failure from
 the paged case: the acceptance stage settled `succeeded` but **no**
 `acceptance_outcome_recorded` verdict shipped at all — the agent emitted a

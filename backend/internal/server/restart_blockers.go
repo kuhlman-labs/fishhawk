@@ -180,11 +180,14 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run, parents ma
 
 	// (a) Undispatched decomposition child: restarting mid-fan-out strands a
 	// child the operator (or run_children) has not dispatched yet. Only a child
-	// of a NON-terminal parent counts: cancelling a parent does not cascade to
-	// its children (the source-side fix and backfill are #4186), so a child of a
-	// succeeded / failed / cancelled parent stays pending forever, can never be
-	// dispatched, and would otherwise wedge `scripts/dev post-merge` (#4184,
-	// defence in depth). A parent read that fails — including run.ErrNotFound
+	// of a NON-terminal parent counts: a child of a succeeded / failed /
+	// cancelled parent can never be dispatched by that parent's fan-out, and
+	// would otherwise wedge `scripts/dev post-merge` (#4184, defence in depth).
+	// The #4186 cascade cancels a parent's non-terminal children only on the
+	// CANCEL sinks, so this skip still covers (1) the undispatched children of a
+	// FAILED or SUCCEEDED parent, which the cascade never touches, and (2)
+	// children orphaned before `fishhawkd reconcile-orphan-children --apply`
+	// runs. A parent read that fails — including run.ErrNotFound
 	// across a concurrent delete, since decomposed_from is ON DELETE SET NULL —
 	// is a check_failed item, never a silent drop.
 	if ru.DecomposedFrom != nil {

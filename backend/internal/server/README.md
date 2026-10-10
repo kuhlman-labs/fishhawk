@@ -1145,15 +1145,19 @@ so the loop signatures are unchanged.
 - **Grounding.** `allInvocationsGrounded` is evaluated over the STANDARD invocations only, before personas join,
   so a persona's capability can never change the standard prompt. A persona that cannot ground (or a round with
   no exported tree) gets the diff-only clause and no tree. `TestPlanReview_Persona_GroundingIsolation`.
-  Both call sites (`plan.go`, `trace.go`) decide grounding through ONE helper, `groundReview`
+  All three call sites (`runPlanReviews` in `plan.go`; `runImplementReviews` and `runSupplementalReinvokeReview`
+  in `trace.go`, the last since #4160) decide grounding through ONE helper, `groundReview`
   (`review_grounding.go`), which stamps `Trigger.ReviewUngroundedReason` on every degrade (#4066), so the
   ungrounded prompt renders one of two variants: switch-off (`disabled`, naming `FISHHAWKD_REVIEW_GROUNDING`) or
   enabled-but-unavailable with the named reason (`no_working_dir`, `no_ref`, `reviewer_cannot_ground`,
   `ref_unavailable`, `export_failed`). A non-grounding persona on a GROUNDED round is stamped
   `reviewer_cannot_ground`; on an ungrounded round the round's reason carries over
-  (`TestPersona_NonGroundingPersonaNamesReviewerCannotGround`). Residual: `runSupplementalReinvokeReview` is not
-  routed through `groundReview`, so its always-ungrounded prompt can still show the switch-off wording while
-  grounding is enabled.
+  (`TestPersona_NonGroundingPersonaNamesReviewerCannotGround`). The supplemental base-rebase re-invoke pass is
+  grounded against the pushed re-landed head (`pr.HeadSHA`), taken after every early exit, with the
+  `runImplementReviews` cleanup ownership (goroutine defer, synchronous defer, build-error cleanup); its render
+  carries REPOSITORY ACCESS (`buildImplementReview` writes it before the supplemental early return) plus one
+  grounded-only framing sentence (#4160; `TestSupplementalReinvokeReview_*` in `review_grounding_test.go`,
+  `TestBuild_ImplementReview_SupplementalReinvoke_RendersGroundingPosture`).
 - **Implement-path ordering.** Persona resolution sits inside `reviewDispatchMu`, AFTER the #797 duplicate-dispatch
   guard and the standard build, BEFORE `implement_review_started` — a duplicate dispatch reads no remit and writes
   no attribution (`TestImplementReview_Persona_DuplicateDispatchReadsNothing`). `runSupplementalReinvokeReview`
@@ -2168,12 +2172,13 @@ Flow:
   for an advance. Any other merge error → 502 `rebase_merge_failed`,
   likewise nothing written. The full contract is the
   **Bounded conflict-resolution pass** section below.
-- **The AUTHORITATIVE new head is a live PR RE-READ**, never
-  `MergeBranch`'s return. That is what makes a decoded-201 and an
-  undecodable-201 behave IDENTICALLY: the live head is the truth in both
-  cases, so no value is ever asked to mean two things. Both are reported —
+- **The new head is resolved by PROVENANCE (#4199)**, not taken from one
+  PR re-read: a DECODED `MergeBranch` sha is the new head unless the
+  bounded re-read observed a genuine concurrent push; only on the
+  undecodable-201 shape does the re-read supply the head (see
+  **Post-merge read-after-write lag** below). Both are reported —
   `merge_commit_sha` (may legitimately be empty) and `new_head_sha` (the
-  authority, and the head the check is published at).
+  resolved head, and the head the check is published at).
 
 **THE SHARED TAIL, and why the advertised retry is REAL.** Both arms —
 merged, and already-contains-base — fall into ONE re-park → audit →
@@ -2189,15 +2194,66 @@ SUCCESSES, which is what makes the re-post reachable a second time.
 `TestRebaseRunBranch_PublishFailsThenReinvokeRepublishesAtHead` drives
 exactly that sequence.
 
-**The degraded head read does NOT fall back to "no override".** If the
-merge succeeds but the post-merge re-read fails, the response is 200 with
-`new_head_sha` empty and publication SKIPPED. Publishing at no override
-resolves to the pre-merge audit-recorded head — precisely the staleness
-this endpoint exists to remove — so a fallback would make the verb cause
-the bug it fixes. The warning names re-invocation, and the shared tail
-above makes that retry real.
+**Post-merge read-after-write lag (#4199).** The forge's PR head lags the
+branch-ref update, so a single post-merge `GetPullRequest` routinely
+returned the PRE-merge head (3 of 3 live rebases): the handler then
+reported a false concurrent push AND anchored `new_head_sha`, the
+`branch_rebased` row, the check re-post and the ADR-090 merge-candidate
+trigger on the stale head, so every performed-merge pass settled
+`head_moved`. `rebase_postmerge_read.go::readPostMergeHead` now re-reads
+boundedly (an initial read plus 5 re-reads over
+`defaultPostMergeHeadReadBackoff`, ~10s, ctx-aware; the
+`Server.postMergeHeadReadBackoff` seam scales it in tests) and CLASSIFIES:
+`converged` (read == merge sha), `read_after_write_lag` (every successful
+read == the pre-merge head — the ONLY lag signature; an ancestry probe is
+deliberately not used, because it would read a foreign force-push that
+rewinds the branch as benign lag), `concurrent_push` (a decoded merge sha
+and a head that is neither), `unreadable` (no read succeeded) and
+`read_back` (no decoded merge sha, a head that differs from the pre-merge
+head). `resolvePostMergeHead` then resolves the head by PROVENANCE: a
+decoded merge sha IS the new head for `converged`, `read_after_write_lag`
+and `unreadable`; only a genuine `concurrent_push` keeps the observed head
+(the merge commit is then already superseded). The outcome ships as
+`post_merge_head_read` / `post_merge_head_read_note` on the 200 and as
+`post_merge_head_read` / `post_merge_observed_head_sha` /
+`post_merge_read_attempts` on the existing `branch_rebased` payload. Pinned
+by `TestRebaseRunBranch_LaggingPostMergeReadConverges`,
+`TestRebaseRunBranch_PersistentPostMergeLag_ReportsReadAfterWriteLag`,
+`TestRebaseRunBranch_PostMergeLagAnchorsMergeCandidateTriggerOnMergeCommit`
+(the trigger's `expected_head_sha` and the `branch_rebased` `new_head_sha`
+are the merge commit), `TestRebaseRunBranch_PostMergeReadIsBounded`,
+`TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit`,
+`TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted` and the
+`rebase_postmerge_read_test.go` classifier table.
+
+**The post-merge tail runs DETACHED from request cancellation.** The MCP
+client calls this verb with a 30s timeout, and against a degraded forge
+(every post-merge read 5xx or slow, each with githubclient's own retry
+budget) the re-read plus its backoff can outlast it. The re-read itself
+stays on the request context, so a departed caller ends it early; but once
+`mergePerformed` is true the handler rebinds `r` to
+`context.WithTimeout(context.WithoutCancel(r.Context()),
+rebasePostMergeTailBudget)` (60s) before the shared tail. On the request
+context every append would fail AFTER the installation-authored merge
+landed — no `branch_rebased` row and no attribution, the wedged-FOREIGN
+state the attribution exists to prevent. The already-contains-base arm
+keeps the request context: it performed no irreversible write. Pinned by
+`TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge`,
+whose audit fake fails an append on a dead context the way pgx does.
+
+**The degraded head read does NOT fall back to "no override" — only when
+the merge sha did not decode.** On the undecodable-201 shape the re-read
+supplies the head, accepted only when it differs from the pre-merge head;
+if every re-read failed or stayed at the pre-merge head, the response is
+200 with `new_head_sha` empty and publication SKIPPED. Publishing at no
+override (or at the stale read) resolves to the pre-merge audit-recorded
+head — precisely the staleness this endpoint exists to remove — so a
+fallback would make the verb cause the bug it fixes. The warning names
+re-invocation, and the shared tail above makes that retry real.
 `TestRebaseRunBranch_PostMergeHeadReadFails_NoPublication` asserts NO
-publication occurred.
+publication occurred. A DECODED merge sha with an unreadable re-read is NOT
+this case: the merge commit is the head the forge reported creating, so it
+is published there.
 
 **LINEAGE ATTRIBUTION.** The merge commit is authored by the App
 installation but appears in NO head-report audit category, so
@@ -2219,18 +2275,21 @@ that an unattributed foreign commit still violates).
 **EXACTLY ONE SHA is ever attributed, chosen by PROVENANCE not by
 availability.** The lease re-check runs only BEFORE the merge, so a foreign
 push landing in the window between `MergeBranch` and the post-merge
-`GetPullRequest` becomes `new_head_sha`. Attributing it would launder into
+re-read becomes the observed head. Attributing it would launder into
 the ledger precisely the commit the ledger exists to catch — the same
 laundering the already-contains-base arm refuses. So when the merge SHA
-decoded it is the ONLY sha attributed, and a non-empty `new_head_sha` that
-DIFFERS from it is treated as in-band evidence of a concurrent push: not
-attributed, logged, and surfaced on the response.
+decoded it is the ONLY sha attributed, and a head the bounded re-read
+classified `concurrent_push` (neither the pre-merge head nor the merge
+commit) is treated as in-band evidence of a concurrent push: not
+attributed, logged, and surfaced on the response with today's warning
+sentence. A re-read stuck at the pre-merge head is `read_after_write_lag`
+(#4199), NOT a concurrent push, and warns nothing.
 `TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed`
 seeds that race BY CONSTRUCTION (the merges endpoint returns one sha, the
-subsequent PR read returns a different one) and asserts against committed
+subsequent PR read returns a third one) and asserts against committed
 state plus the REAL recompute. `new_head_sha` is attributed alone ONLY on
-the undecodable-201 shape, where the merge provably happened and there is
-nothing else to attribute.
+the undecodable-201 shape (`read_back`), where the merge provably happened
+and there is nothing else to attribute.
 
 **An incomplete attribution is REPORTED, never silent.** The attribution is
 load-bearing — without it the merge commit is classified FOREIGN and the run
@@ -2238,16 +2297,17 @@ stays wedged — so "best-effort with only a Warn log" would let the endpoint
 return 200, publish `fishhawk_audit_complete` and leave the run wedged with
 the operator told nothing. The append failure is still non-fatal to the
 already-completed merge, but the response carries
-`lineage_attribution_warning` in all three incomplete cases: a divergent
-post-merge head, a failed attribution append, and nothing attributable at
-all. Pinned by
+`lineage_attribution_warning` in all three incomplete cases: a
+concurrent-push post-merge head, a failed attribution append, and nothing
+attributable at all. Pinned by
 `TestRebaseRunBranch_AttributionAppendFails_WarnsAndNamesVouch` (the
 failure injected in isolation on the `operator_commit_vouched` category, so
 the `branch_rebased` entry still lands and the test discriminates an
 attribution failure from a blanket audit outage).
 
 **Residual, stated rather than papered over:** when the merge SHA is
-undecodable AND the post-merge re-read fails, that invocation has no SHA to
+undecodable AND the post-merge re-read fails or stays at the pre-merge
+head, that invocation has no SHA to
 attribute, and the retry invocation takes the already-contains-base arm,
 which attributes nothing. Such a run needs `fishhawk_vouch_commit`, exactly
 as it did before this verb existed — and the response now SAYS so rather
@@ -2775,6 +2835,18 @@ A deterministic, model-free check that turns a change WIDENING a declared permis
 - **Precedent block (E75.4 / #3732).** At an open human gate the view also carries `precedent` (§ "Precedent at the gate"). It makes this READ handler append one best-effort, fingerprint-deduped `precedent_surfaced` entry the first time a given block is shown — the only write the gate view (and `handleGetRun`) performs; a failed append never changes the 200. **It is omitted for the run-bound `mcp:run:<uuid>` identity the auth bullet above admits.** That token clears this surface on the cross-run subject guard alone, and the block carries reason EXCERPTS from OTHER runs' decisions, so handing it over would breach ADR-082 rule 6 ("never an agent input") at the API even though no prompt renders it. A run-bound read therefore gets the pre-E75.4 response byte-for-byte and appends nothing (§ "Precedent at the gate" → Isolation).
 - **Gate isolation block (E51.2 / #2135, `gate_isolation.go`).** The trace handler appends one stage-scoped `gate_isolation_recorded` row per RAW upload whose `gate_evidence` carries a `gate_isolation` member — inside the raw-variant guard and BEFORE the budget short-circuits and the agent-failed branch, so a refused stage's isolation path is on the chain before the stage fails — deduplicated on (`stage_id`, `content_hash`) so a re-POST of the same raw bundle appends nothing. `gateIsolationForRun` adds an `omitempty` `gate_isolation` block: the NEWEST row's fields plus `worst_class` / `worst_stage_id` / `worst_sequence`, the most severe class recorded on ANY stage (refused > fallback > container, newest on a tie), so an earlier fallback or refusal is never masked by a later container stage. Run-level (no `stage_kind` filter). A list error or ANY undecodable row degrades WHOLESALE — no block, a `gate_isolation_recorded` `history_gaps` entry and `history_incomplete` — because a worst class computed around an unreadable row could hide a refusal.
 
+## Run concern listing (`run_concerns.go`, #4101)
+
+`GET /v0/runs/{run_id}/concerns` (`handleListRunConcerns`) lists a run's review concerns and, with `include_children=true`, its decomposition children's — the one call an operator makes to collect concern ids across a fan-out for bulk-waive / defer, instead of one `gate-view` read per child. It is a pure read: no audit row, no new store method, no migration.
+
+- **Query.** `state=open` (default; `concern.State.IsOpen()` — `raised`/`addressed_pending`/`reopened`) or `state=all` (every row). `include_children` is parsed with `strconv.ParseBool` (absent = false). Anything else → 400 `validation_failed` with `details.field` (`run_id` / `state` / `include_children`).
+- **Children are `DecomposedFrom`, never `ParentRunID`.** They are paged through `listAllDecomposedChildren` (past the 100-row cap); `run.ChildParamsFrom` sets `parent_run_id` for every child kind, so a `ParentRunID` walk would sweep in recovery children. A recovery child's concerns are never listed.
+- **Ordering.** The parent's rows in `ListByRun` order (origin sequence), then each child's rows in `ListByRun` order, children ordered by `sortDecomposedChildren` (SliceIndex ascending with nil last, then CreatedAt, then ID) — the SAME helper `childApprovedAmendmentScopePaths` uses, so both surfaces order children identically.
+- **Response.** `run_id`, `state`, `include_children`, `count`, `items[]` (never null) and — only when `include_children=true` — `children[]` (`run_id`, `slice_index`, run `state`, `item_count`; a non-nil `[]` on a non-decomposed run, so presence means the children were read). Each item: `id`, `run_id` (the OWNING run), `child_run_id` + `slice_index` (child rows only), `stage_id`, `stage_kind`, `severity`, `category`, `state`, `reviewer_model`, `reviewer_role`, `short_summary` (`concernShortSummary(DisplayNote())`, the bounded label — never the full note, which stays on the gate view), `origin_review_sequence`, `has_suggested_patch`, `provenance`.
+- **Fail-closed reads.** `GetRun` (non-NotFound), the parent's `ListByRun`, `listAllDecomposedChildren` and EACH child's `ListByRun` error → 500 `internal_error`; never a partial list, because a missing child would read as "no open concerns there" to an operator collecting ids. The failing child's id is in the 500 MESSAGE: the 5xx detail redactor (`errors.go`) keeps only allow-listed keys, so `details.child_run_id` reaches only the server log (same `error_ref`).
+- **Auth mirrors the gate view.** `requireRunAccount` authorizes the PARENT's account (children are minted from the parent, so they share it). Then a run-bound `mcp:run:<uuid>` token may list only its own run (403 `cross_run_concerns`) and may NOT pass `include_children=true` (403 `cross_run_concerns` — children are other runs); a malformed `mcp:run:` subject → 401. Every other caller must clear `read:audit` (`scopeGateViewRead`): anonymous → 401, a token missing it → 403 `insufficient_scope`, cookie sessions bypass. 503 `concern_store_unconfigured` when either repository is unwired; 404 `run_not_found` for an unknown run.
+- **Tests.** `run_concerns_test.go` (package fakes, one test per branch) and `run_concerns_pg_test.go` (real Postgres through the REGISTERED route via `s.Handler()` with a real bearer token: parent + decomposition child + recovery child + a waived row).
+
 ## Attention queue (`attention.go`, E40.1 / #1713)
 
 `GET /v0/attention` (`handleListAttention`) is the cross-run "Needs You" read the SPA home page renders: one ranked list of every decision parked on a human. It is a pure PROJECTION — it writes nothing, mints no audit entry, persists nothing, and reuses the existing derivations rather than re-stating any gate rule.
@@ -2797,7 +2869,8 @@ A deterministic, model-free check that turns a change WIDENING a declared permis
 `GET /v0/restart-blockers` (`handleListRestartBlockers`) answers one question for `scripts/dev reload` / `post-merge`: would restarting THIS daemon orphan work right now? A pure read-only PROJECTION — it writes nothing, mints no audit entry, persists nothing. The shell guard that consumes it (`_refuse_on_restart_blockers`) is documented in `scripts/README.md` § "Restart-blocker guard".
 
 - **Scan set.** The orphaned-review boot sweep's own `reconcileOrphanedReviewStates` (`pending` + `running`), one `ListRuns` per state with `restartBlockersRunScanLimit + 1` (500 + 1), merged oldest-first and cut at the cap; a bite sets `truncated` and the runs past the cap are NOT checked.
-- **`undispatched_child`.** A run with `DecomposedFrom` set whose `implement` stage is `pending` or `awaiting_host_dispatch` AND whose decomposition PARENT run is not terminal (`run.State.IsTerminal()` false); carries `parent_run_id` + `stage_state`. A non-child's pending implement is not a blocker (`TestRestartBlockers_NonChildPendingImplement_NotBlocker`). A child of a `succeeded` / `failed` / `cancelled` parent is not a blocker either (#4184): cancelling a parent does not cascade to its children (source-side cascade + backfill is #4186), so such a child stays `running` with a `pending` implement stage forever, can never be dispatched by that parent's fan-out, and a restart strands nothing — reporting it wedged `scripts/dev post-merge` on 41 stale rows. This is defence in depth: the children still exist as running runs until #4186 lands. The parent is read through `restartBlockerParent`, a per-request memo (one `GetRun` per distinct parent, the error cached too). Tests: `TestRestartBlockers_TerminalParentChild_NotBlocker` (cancelled / failed / succeeded → no item; pending / running parents are the control arms), `TestRestartBlockers_IncidentShape_TerminalParents_NoItems` (the #4184 shape through the real mux), `TestRestartBlockers_ParentReadMemoized`.
+- **`undispatched_child`.** A run with `DecomposedFrom` set whose `implement` stage is `pending` or `awaiting_host_dispatch` AND whose decomposition PARENT run is not terminal (`run.State.IsTerminal()` false); carries `parent_run_id` + `stage_state`. A non-child's pending implement is not a blocker (`TestRestartBlockers_NonChildPendingImplement_NotBlocker`). A child of a `succeeded` / `failed` / `cancelled` parent is not a blocker either (#4184): it can never be dispatched by that parent's fan-out, so a restart strands nothing — reporting it wedged `scripts/dev post-merge` on 41 stale rows. This stays defence in depth after the #4186 cancel cascade (below): the cascade fires only on CANCEL sinks, so the undispatched children of a FAILED or SUCCEEDED parent still reach this skip, as do children orphaned before `fishhawkd reconcile-orphan-children --apply` runs. The parent is read through `restartBlockerParent`, a per-request memo (one `GetRun` per distinct parent, the error cached too). Tests: `TestRestartBlockers_TerminalParentChild_NotBlocker` (cancelled / failed / succeeded → no item; pending / running parents are the control arms), `TestRestartBlockers_IncidentShape_TerminalParents_NoItems` (the #4184 shape through the real mux), `TestRestartBlockers_ParentReadMemoized`.
+- **Decomposition-child cancel cascade (#4186, `decomposition_cancel_cascade.go`).** Every post-admission run-cancel sink calls `cascadeCancelToDecomposedChildren` immediately after `recordAcceptanceRetirementsDroppedOnCancel`, with the same `cancel_source`: `handleCancelRun` (`operator_cancel`, synchronously BEFORE the 200 so a caller reading the children afterwards sees them cancelled, and on the idempotent already-cancelled re-entry too, so re-POSTing cancel converges a child a transient error left behind), `checkRunBudget` (`run_budget_exceeded`), `checkStageBudget`'s blocking arm (`stage_budget_exceeded`) and `OnRunCancelled` (`stage_cancelled`, `orchestrator.completeRun`, which covers the PR-closed-without-merge path). `applies_to.go`'s `abandonUnauditedOverrideRun` stays unwired: it cancels a run in the request that created it, which cannot have children yet. The helper re-reads the parent and calls `childcancel.CascadeFromParent` (contract: `backend/internal/childcancel/README.md`): each non-terminal child is cancelled through the state machine with ONE system-actor `decomposition_child_cancelled` row on its chain, deduped per `parent_run_id`; terminal children are skipped with no row; a child whose implement is `dispatched`/`running` is CANCELLED, not refused (its stage and runner are untouched, `live_stage: true`). Best-effort: a parent re-read or child-list failure WARN-logs and cancels nothing, a per-child transition or append failure WARN-logs that child, and nothing changes the caller's response; one INFO summary names `children` / `cancelled` / `skipped_terminal` / `failed` / `live_stage`. With every child of the cancelled parent terminal, the child-completion sweeper settles the parent's `awaiting_children` stage failed-C (see `backend/internal/childcompletion/README.md`). Tests: `decomposition_cancel_cascade_test.go` (every sink, the skip, the live-runner arm, re-entry, the restart-blockers `scanned_runs` drop, each failure mode, both dedup legs).
 - **`review_in_flight` — a round a restart would LOSE (narrowed by E72.59 / #4077).** For each `orphanedReviewStages` kind: the latest `*_review_started` round (`latestReviewStarted`) with verdicts landed strictly after it (`countLandedReviewTerminals`) `< ConfiguredAgents`, and then EITHER (a) the round is in this process's pending-redispatch set (`reviewRedispatchPending`: an orphaned round this process's boot sweep handed to a re-dispatch goroutine that has not settled — checked BEFORE the boot-marker skip, because that orphaned round predates `s.processStart`; a restart kills the goroutine and the next boot finds the round already named by its `review_round_redispatched` entry, so it closes it failed), OR (b) the started entry is NOT before `s.processStart` AND `redispatchEligibility` says the next boot would NOT re-dispatch it (a gating round, no reviewer backend, the depth cap, an unknown implement round source, a superseded round, a plan stage no longer `awaiting_approval`, an unwired artifact/trace/forge source). An ELIGIBLE current-process round is not a blocker: the next boot re-dispatches it against the same plan or head. Both the round tally and the eligibility decision are the boot sweep's own helpers (§ "Boot re-dispatch of orphaned review rounds"), so the two surfaces cannot disagree about which rounds survive a restart. A round an EARLIER process dispatched and this process did not take over is not a blocker — its goroutine is already dead and this process's boot sweep already re-dispatched or closed it (`TestRestartBlockers_PriorProcessOrphan_NotBlocker`). A zero-reviewer round is settled at zero verdicts. Carries `configured_agents` + `landed` (pointers, so a real `landed: 0` is emitted). The eligibility checks are CHEAP (audit + stage reads and wiring, never input loading), so a round reported re-dispatchable can still fail its input rebuild at boot (a deleted artifact) and then close failed — the TOCTOU residual. Tests: `TestRestartBlockers_AdvisoryRound` (eligible → not a blocker; unwired → blocker; the fixture wires a reviewer, an `awaiting_approval` plan stage row and an `ArtifactRepo` and asserts `redispatchEligibility` true FIRST, approval condition C3), `TestRestartBlockers_IneligibleWiredRoundIsBlocker` (gating, depth cap, the under-cap control), `TestRestartBlockers_PendingRedispatchIsBlocker`.
 - **`check_failed`.** A per-run `ListStagesForRun`, decomposition-parent `GetRun` (including a parent that is not found: `decomposed_from` is `ON DELETE SET NULL`, so that is reachable only across a concurrent delete — `TestRestartBlockers_CheckFailed/parent_read`, `/parent_not_found`) or audit read error — including any read `redispatchEligibility` needs (`TestRestartBlockers_CheckFailed/eligibility_read`) — yields an item naming the run and the stage whose check failed, never a silent skip — the daemon is reachable but cannot decide, and the shell guard REFUSES on it (fail-closed).
 - **No free text.** Every item value is an id, an enum slug or a count, so `scripts/dev` parses it with zsh `=~` and no JSON decoder; sorted `(run_id, reason, stage)`.

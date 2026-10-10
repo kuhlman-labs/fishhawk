@@ -3146,10 +3146,14 @@ type RebaseBranchResult struct {
 	MechanismNote         string `json:"mechanism_note"`
 	// AuditCheckRepublished reports whether the fishhawk_audit_complete Check
 	// Run was re-posted at the new head. FALSE when it errored, when no
-	// publisher is wired, or when the new head could not be read back at all
-	// — in that last case publication is SKIPPED deliberately rather than
-	// falling back to the pre-merge head, which would pin the required check
-	// to the stale sha this verb exists to move off.
+	// publisher is wired, or when the new head could not be resolved at all —
+	// which happens only when the merge sha did not decode AND the bounded
+	// post-merge re-read failed or stayed at the pre-merge head (#4199). In
+	// that last case publication is SKIPPED deliberately rather than falling
+	// back to the pre-merge head, which would pin the required check to the
+	// stale sha this verb exists to move off. A decoded merge sha is itself
+	// the new head, so it is published there even when the re-read lags or
+	// fails.
 	AuditCheckRepublished      bool   `json:"audit_check_republished"`
 	AuditCheckRepublishWarning string `json:"audit_check_republish_warning,omitempty"`
 	// LineageAttributionWarning, when non-empty, reports that the merge
@@ -3157,14 +3161,27 @@ type RebaseBranchResult struct {
 	// this success must NOT be read as a clean recovery — the run stays
 	// wedged on the lineage check until the operator acts. It fires when a
 	// concurrent push made the post-merge head diverge from the merge commit
-	// (the divergent head is deliberately NOT attributed, because vouching a
-	// commit this call did not create would launder a foreign commit into the
-	// ledger), when the attribution append failed to persist, or when nothing
-	// was attributable at all. In the latter two cases re-invoking
+	// — after the bounded re-read, a head that is neither the pre-merge head
+	// nor the merge commit; a read stuck at the pre-merge head is
+	// read-after-write lag (#4199) and does not warn — (the divergent head is
+	// deliberately NOT attributed, because vouching a commit this call did not
+	// create would launder a foreign commit into the ledger), when the
+	// attribution append failed to persist, or when nothing was attributable
+	// at all (only when the merge sha did not decode). In the latter two cases
+	// re-invoking
 	// fishhawk_rebase_run_branch does NOT repair it — the retry takes the
 	// already-contains-base arm, which attributes nothing — so the warning
 	// names fishhawk_vouch_commit as the required step.
 	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
+	// PostMergeHeadRead classifies the bounded post-merge PR head re-read
+	// (#4199): converged, read_after_write_lag, concurrent_push, unreadable or
+	// read_back. Set only when this call performed a merge.
+	PostMergeHeadRead string `json:"post_merge_head_read,omitempty"`
+	// PostMergeHeadReadNote explains a degraded classification
+	// (read_after_write_lag, unreadable): what was observed and what the head
+	// was anchored on. read_after_write_lag with a decoded merge sha is NOT a
+	// concurrent push and needs no fishhawk_vouch_commit.
+	PostMergeHeadReadNote string `json:"post_merge_head_read_note,omitempty"`
 
 	// --- 202 conflict-resolution trigger arm (E64.62 / #3202) ---
 	//
@@ -5550,6 +5567,12 @@ type RunStageWait struct {
 	FailureCategory *string    `json:"failure_category,omitempty"`
 	FailureReason   *string    `json:"failure_reason,omitempty"`
 	StartedAt       *time.Time `json:"started_at,omitempty"`
+	// EndedAt is the embedded stage shape's `ended_at` (E72.56 / #4072):
+	// fishhawk_await_stage anchors its acceptance verdict hold's in-flight
+	// window on it. The tag MUST byte-match the backend's stageResponse
+	// (server/reads.go) or the field silently decodes to nil (the #371
+	// wire-mirror trap), which degrades the hold to a full window from now.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
 	// Concurrency is the embedded stage shape's `concurrency` block (#3964):
 	// fishhawk_await_stage holds through a settled awaiting_host_dispatch read
 	// while the stage is queued for a slot with a live waiter.

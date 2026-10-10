@@ -1226,6 +1226,14 @@ type Server struct {
 	// fake to drive TTL expiry without sleeping or to fix the spend-alert hour.
 	nowFunc func() time.Time
 
+	// postMergeHeadReadBackoff is the rebase verb's post-merge PR head
+	// re-read schedule (#4199). nil in production, which selects
+	// defaultPostMergeHeadReadBackoff (~10s cumulative) via
+	// postMergeHeadReadSchedule; tests inject timescale-scaled steps so a
+	// lagging or failing stub never sleeps the production budget. No New()
+	// default installs it.
+	postMergeHeadReadBackoff []time.Duration
+
 	// stageBudgetProbe is nil in production. When a test sets it, it is
 	// invoked at the TOP of checkStageBudget — before any read or guard — so
 	// the test can observe how many times the stage-budget check is EVALUATED
