@@ -2,13 +2,14 @@ id: scenario:issue-4101/concerns-route-lists-existing-run
 statement: GET /v0/runs/{run_id}/concerns for an existing run returns HTTP 200 with a JSON body carrying run_id, state open, include_children false, a count, and an items array (an empty array, not null, when the run has no open concerns).
 verify_hint: 'HTTP: GET /v0/runs to pick a run id, then GET /v0/runs/{that id}/concerns with an operator token; observe 200 and the listed fields, items being a JSON array.'
 steps: '1) POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}, giving run 3ea5945e-c56a-44d2-b302-c4f435243193. 2) Mint a run-bound bearer: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over the bytes ''{}'' with header X-Fishhawk-Dev-Private-Key, POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature. 3) GET /v0/runs/{run}/concerns with that bearer. No operator token was mintable, so the run-bound bearer, which the route authorizes for its own run, was used.'
+steps_carried_from: head e07028e41061b49160adc62a13780374330d2e58 recorded_at 2026-10-10T00:32:34Z
 assertions:
-    expected: 200 with run_id, state open, include_children false, count, and items as an array ([] when empty)
-    observed_at_record: 200 application/json {"run_id":"3ea5945e-c56a-44d2-b302-c4f435243193","state":"open","include_children":false,"count":0,"items":[]}
-    repro_handle: 'curl -s -H ''Authorization: Bearer <fhm_ for run>'' http://localhost:8090/v0/runs/<run>/concerns'
+    expected: 200 with run_id, state open, include_children false, count, items array
+    observed_at_record: 200 application/json {"run_id":"c31206d8-0059-498c-85e4-c81c6ec035fa","state":"open","include_children":false,"count":0,"items":[]}
+    repro_handle: GET http://localhost:8090/v0/runs/{run}/concerns
 origin:
     issue: 4101
     pr: 4210
     run_id: f97b843c-1b79-49b5-9c79-268381a35461
-    head_sha: e07028e41061b49160adc62a13780374330d2e58
-    recorded_at: 2026-10-10T00:32:34Z
+    head_sha: 24763f0d8a7b09da045b297bcf44911c2707fd9a
+    recorded_at: 2026-10-10T02:13:27Z
