@@ -1,0 +1,14 @@
+id: scenario:issue-4101/concerns-route-rejects-bad-query-params
+statement: GET /v0/runs/{run_id}/concerns refuses an unrecognised state value or an unparseable include_children value with HTTP 400 and a JSON validation_failed error naming the offending field.
+verify_hint: 'HTTP: GET /v0/runs/<any UUID>/concerns?state=opne and ?include_children=maybe on the localhost preview; each returns 400 with error validation_failed and details.field state / include_children.'
+steps: GET /v0/runs/6d612f67-59c3-4650-b6c1-d9d714b27b50/concerns?state=opne and GET /v0/runs/6d612f67-59c3-4650-b6c1-d9d714b27b50/concerns?include_children=maybe on http://localhost:8090.
+assertions:
+    expected: 400 validation_failed with details.field state / include_children
+    observed_at_record: 'Both 400 application/json: {"error":{"code":"validation_failed","message":"state must be ''open'' or ''all'' when set","details":{"field":"state","got":"opne"}}} and {"error":{"code":"validation_failed","message":"include_children must be a boolean when set","details":{"field":"include_children","got":"maybe"}}}'
+    repro_handle: curl -s -i 'http://localhost:8090/v0/runs/<uuid>/concerns?state=opne'
+origin:
+    issue: 4101
+    pr: 4210
+    run_id: f97b843c-1b79-49b5-9c79-268381a35461
+    head_sha: e07028e41061b49160adc62a13780374330d2e58
+    recorded_at: 2026-10-10T00:32:34Z
