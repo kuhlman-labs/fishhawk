@@ -1,0 +1,14 @@
+id: scenario:issue-4212/doctor-override-wins
+statement: With FISHHAWK_HOST_LABEL=acceptance-pin set in the environment of the fishhawk-mcp process, the fishhawk_doctor tool result carries a host_label key whose label is acceptance-pin and whose source is override, independent of the machine's hostname, and whose default_group is local-implement:acceptance-pin.
+verify_hint: 'Launch fishhawk-mcp over stdio with FISHHAWK_HOST_LABEL=acceptance-pin and FISHHAWK_BACKEND_URL pointed at the preview, send initialize then tools/call fishhawk_doctor {repo: <any owner/name>}, and read structuredContent.host_label (an MCP tool result). The hermetic decider is TestResolveHostLabel_OverrideWins in backend/internal/mcpserver/hostlabel_test.go.'
+steps: 'Built fishhawk-mcp from the sanctioned checkout: cd backend && go build -o /tmp/fh4212/fishhawk-mcp ./cmd/fishhawk-mcp. Minted a run token: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}, then POST /v0/runs/{run}/signing-key, then POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key, then POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature. Launched fishhawk-mcp over stdio with FISHHAWK_BACKEND_URL=http://localhost:8090, FISHHAWK_API_TOKEN=<fhm token>, FISHHAWK_HOST_LABEL=acceptance-pin and XDG_STATE_HOME=<empty dir>. Sent initialize, notifications/initialized, then tools/call fishhawk_doctor {repo: kuhlman-labs/fishhawk}. Read structuredContent.host_label.'
+assertions:
+    expected: label acceptance-pin, source override, default_group local-implement:acceptance-pin, regardless of hostname
+    observed_at_record: 'host_label = {label: acceptance-pin, source: override, default_group: local-implement:acceptance-pin, variable: FISHHAWK_HOST_LABEL, note: ''Pinned by FISHHAWK_HOST_LABEL.''} on a machine whose hostname is Mac. No host-id file was created under XDG_STATE_HOME.'
+    repro_handle: python3 -I /tmp/fh4212/scripts/drive.py FISHHAWK_HOST_LABEL=acceptance-pin XDG_STATE_HOME=/tmp/fh4212/xdg-ov
+origin:
+    issue: 4212
+    pr: 4231
+    run_id: 3c61f92e-2753-41cc-aff5-a960e2b631db
+    head_sha: e3189599186cb299724fa62d5d7c1a078264c02d
+    recorded_at: 2026-10-10T14:41:59Z

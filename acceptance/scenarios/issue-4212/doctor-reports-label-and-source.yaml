@@ -1,0 +1,14 @@
+id: scenario:issue-4212/doctor-reports-label-and-source
+statement: Every successful fishhawk_doctor result carries a host_label key beside (not inside) report, naming label, source (override | persisted | hostname | none), default_group, the FISHHAWK_HOST_LABEL variable and a note. The report key's contents are unchanged from what fishhawkd served. When the source is hostname or none, a remediation names FISHHAWK_HOST_LABEL.
+verify_hint: 'Read the top-level keys of the fishhawk_doctor MCP tool result: host_label is a sibling of report and runner_credentials. Compare report against GET /v0/onboarding/readiness for the same repo on the preview.'
+steps: Read the top-level keys of structuredContent from the override, persisted and hostname-fallback stdio fishhawk_doctor calls. For the hostname fallback, XDG_STATE_HOME pointed at a chmod 500 directory so the host-id file could not be created. Then sent GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk directly with the same bearer and compared it key-by-key with structuredContent.report.
+assertions:
+    expected: host_label beside report with label, source, default_group, variable and note; report unchanged; a remediation naming FISHHAWK_HOST_LABEL for hostname or none
+    observed_at_record: The top-level keys are [host_label, report, runner_credentials], so host_label is a sibling of report and not inside it. report matched the direct readiness response with no differing keys in all three runs. host_label carries label, source, default_group, variable FISHHAWK_HOST_LABEL and note. The hostname-source result also carries a remediation telling the operator to 'export FISHHAWK_HOST_LABEL=<label>' and saying why the host-id file was unusable.
+    repro_handle: 'python3 -I /tmp/fh4212/scripts/drive.py FISHHAWK_HOST_LABEL=__UNSET__ XDG_STATE_HOME=/tmp/fh4212/xdg-ro (dir chmod 500); curl -H ''Authorization: Bearer <fhm>'' ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk'''
+origin:
+    issue: 4212
+    pr: 4231
+    run_id: 3c61f92e-2753-41cc-aff5-a960e2b631db
+    head_sha: e3189599186cb299724fa62d5d7c1a078264c02d
+    recorded_at: 2026-10-10T14:41:59Z

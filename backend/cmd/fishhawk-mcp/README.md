@@ -78,13 +78,14 @@ go build -o fishhawk-mcp ./backend/cmd/fishhawk-mcp
 
 ## Configuration
 
-Two env vars; both honored from the OS environment when the binary launches.
+Four env vars, all read from the OS environment: `FISHHAWK_HOST_LABEL` lazily, on the first host-dispatch or `fishhawk_doctor` call; the other three when the binary launches.
 
 | Variable                | Required | Default                 | Notes                                                                                                                                                                                                  |
 | ----------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `FISHHAWK_API_TOKEN`    | no, when a credential is stored | — | Bearer token. Wins outright when set. When empty, the credential minted by `fishhawk token login` (the shared [`credstore`](../../../credstore/README.md) module, keyed by backend URL) is used instead — so the MCP server can be registered with no secret in any client config. There is still no "anonymous" mode: if neither an env token nor a usable stored credential is present, startup fails. |
 | `FISHHAWK_MCP_ALLOWED_ROOTS` | no, for stdio; **yes, for `--transport http`** | — | OS path-list of absolute checkout roots every path-taking MCP input (`working_dir`, `spec_file`) must resolve inside over the HTTP transport (E66.63 / [#3589](https://github.com/kuhlman-labs/fishhawk/issues/3589)). `--allowed-roots` overrides it. Inert on stdio. EMPTY over http is **fail closed** — not unrestricted — so every path-taking verb is refused until a root is set. |
 | `FISHHAWK_BACKEND_URL`  | no       | `http://localhost:8080` | Same fallback as the CLI. Trailing slash is stripped — and the trimmed value is the key the credential store is looked up under, matching `fishhawk token login --backend-url <url>`.                    |
+| `FISHHAWK_HOST_LABEL` | no | — (the persisted host-id, else the hostname) | Pins the host label this process sends on the host-dispatch marker, which keys the default local concurrency group `local-implement:<label>` ([#4212](https://github.com/kuhlman-labs/fishhawk/issues/4212)). Sanitised to `[A-Za-z0-9._-]`. Unset, the label is the per-machine host id persisted at `$XDG_STATE_HOME/fishhawk/host-id` (darwin: `~/Library/Application Support/fishhawk/host-id`; else `~/.local/state/fishhawk/host-id`), created once from the then-current hostname and never overwritten, so one machine stays ONE group when its hostname changes. `fishhawk_doctor`'s `host_label` rung shows the label and its source. fishhawkd's `/mcp` route honours the same variable (it serves the same `mcpserver` registry). Ladder: `backend/internal/mcpserver/README.md` § "Local concurrency slot waiter". |
 
 ### Token-resolution ladder ([#2389](https://github.com/kuhlman-labs/fishhawk/issues/2389) / ADR-076)
 

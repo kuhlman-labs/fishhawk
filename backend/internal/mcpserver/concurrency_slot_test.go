@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -609,7 +611,7 @@ func newE2ESlotFixtureWith(t *testing.T, wrap func(concurrency.Store) concurrenc
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	api := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
-	api.hostLabel = "e2e-host"
+	api.hostLabel = fixedHostLabel("e2e-host")
 	r := &runResolver{api: api, getenv: func(string) string { return "" }}
 
 	// The two (or more) fake runners: a recorder behind the detached-spawn
@@ -863,6 +865,49 @@ func TestConcurrencySlot_E2E_TwoFakeRunners(t *testing.T) {
 		defer slotWaiters.mu.Unlock()
 		return len(slotWaiters.active) == 0
 	})
+}
+
+// TestConcurrencySlot_E2E_PersistedLabelSharesOneGroup is the cross-boundary
+// proof for #4212: two MCP sessions on one machine whose hostname changed
+// between them (`Bretts-MacBook-Pro.local`, then `Mac`) each carry their OWN
+// resolver over ONE host-id file, so both send the persisted label and land in
+// ONE local-implement group. At the default limit 1 the second is QUEUED, not
+// admitted into a second group (the doubled-limit bug), read from the stage's
+// committed state after the call.
+func TestConcurrencySlot_E2E_PersistedLabelSharesOneGroup(t *testing.T) {
+	f := newE2ESlotFixture(t)
+	path := filepath.Join(t.TempDir(), "fishhawk", "host-id")
+	f.r.api.hostLabel = func() hostLabelResolution {
+		return resolveHostLabel(testHostLabelDeps("Bretts-MacBook-Pro.local", path))
+	}
+	session2 := newAPIClient(config{backendURL: f.baseURL, apiToken: f.bearer, hostLabel: func() hostLabelResolution {
+		return resolveHostLabel(testHostLabelDeps("Mac", path))
+	}})
+	const group = "local-implement:Bretts-MacBook-Pro.local"
+	a, b := f.park(t, nil), f.park(t, nil)
+
+	outA := f.dispatch(t, a)
+	if outA.ConcurrencySlot == nil || outA.ConcurrencySlot.Group != group || !slotContains(f.rec.spawned(), a.ID.String()) {
+		t.Fatalf("A = %+v (slot %+v), spawns %v; want an admitted spawn in %s", outA, outA.ConcurrencySlot, f.rec.spawned(), group)
+	}
+
+	_, err := session2.HostDispatchStage(f.ctx, b.RunID, b.ID)
+	if got := f.stageState(t, b); got != "awaiting_host_dispatch" {
+		t.Fatalf("B state = %s after session 2's marker (err %v), want awaiting_host_dispatch: B was admitted into a second group", got, err)
+	}
+	q, ok := asConcurrencySlotQueued(err)
+	if !ok {
+		t.Fatalf("session 2 marker err = %v, want the typed queued error", err)
+	}
+	if q.Group != group || q.Position != 1 || len(q.Holders) != 1 || q.Holders[0].StageID != a.ID.String() {
+		t.Fatalf("queued = %+v, want position 1 behind A in %s", q, group)
+	}
+	if n := f.spawnCount(b); n != 0 {
+		t.Errorf("B spawned %d times while queued, want 0", n)
+	}
+	if c, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(c)) != "Bretts-MacBook-Pro.local" {
+		t.Errorf("host-id file = %q, %v; want the first session's hostname seed", c, err)
+	}
 }
 
 // TestConcurrencySlot_E2E_LostResponseOwnership pins approval condition 3
