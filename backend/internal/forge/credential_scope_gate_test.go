@@ -1,16 +1,35 @@
 package forge
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // This file is the contract gate for the #1855 forge-credential split
 // (phase 5/5, #2013). The staged migration replaced every cross-forge
@@ -228,14 +247,11 @@ func isClientReceiver(expr ast.Expr) bool {
 }
 
 // repoRoot returns the workspace root by hopping three parents up from
-// this file's directory (<root>/backend/internal/forge).
+// this package's init-captured source dir, pkgSrcDir
+// (<root>/backend/internal/forge).
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed: cannot locate the repo root")
-	}
-	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(self))))
+	root := filepath.Dir(filepath.Dir(filepath.Dir(pkgSrcDir)))
 	for _, m := range scanModules {
 		if _, err := os.Stat(filepath.Join(root, m)); err != nil {
 			t.Fatalf("module %q not found under derived repo root %q: %v"+

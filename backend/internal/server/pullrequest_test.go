@@ -13,7 +13,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +29,25 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // validPRBytes returns a complete pullRequestBody payload that
 // satisfies the handler's structural validation.
@@ -125,17 +143,14 @@ func TestShipPullRequest_HappyPath(t *testing.T) {
 // parity the two-byte-identical-literals pattern (#2501) could not provide, and
 // which #2558 will make compile-enforced with a shared wire package.
 //
-// The path is anchored to THIS test source via runtime.Caller (not cwd): the
-// backend suite runs under pgtest with an unspecified cwd. runtime.Caller yields
-// <repo>/backend/internal/server/pullrequest_test.go; three dirs up is the repo
-// root, the same anchor the runner test uses from its own source file.
+// The path is anchored on pkgSrcDir — this package's source dir, captured at
+// package init (#4179) — never on runtime.Caller, whose file name is
+// module-relative under -trimpath. pkgSrcDir is <repo>/backend/internal/server;
+// three dirs up is the repo root, the same anchor the runner test derives from
+// its own init-captured package dir.
 func wireGoldenHeldCommitBytes(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared wire golden %s: %v", path, err)
@@ -3160,15 +3175,10 @@ func TestShipPullRequest_FixupNoChanges_NoReviewDispatched(t *testing.T) {
 // needs its own two-sided fixture or omitting pr_body_fallback_reason from the
 // ordinary artifact map ships silently.
 //
-// Anchored to THIS test source via runtime.Caller, for the same reason
-// wireGoldenHeldCommitBytes is.
+// Anchored on pkgSrcDir, for the same reason wireGoldenHeldCommitBytes is.
 func wireGoldenOrdinaryBytes(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared wire golden %s: %v", path, err)
