@@ -1700,3 +1700,89 @@ func TestSweeper_WaveIntegration_SliceHeadMissing_ParksWithoutCountingTowardGive
 		t.Errorf("transitions = %+v, want none: the between-wave head-missing ticks must not have counted toward the bounded-retry give-up", rs.transitions)
 	}
 }
+
+// cancelledParentRepo seeds the parent RUN (cancelled) the #4186 cascade left
+// behind, and counts GetRun calls so the pin can prove the sweeper never reads
+// it.
+type cancelledParentRepo struct {
+	*fakeRunRepo
+	parent     *run.Run
+	getRunCall int
+}
+
+func (r *cancelledParentRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.getRunCall++
+	if id == r.parent.ID {
+		return r.parent, nil
+	}
+	return nil, run.ErrNotFound
+}
+
+// TestTick_CancelledParentAllChildrenCancelled_SettlesStageNoAdvance is a
+// CHARACTERIZATION pin (#4186 approval condition C2), not a behaviour change.
+// Once the cancel cascade (or the reconcile-orphan-children backfill) makes
+// every child of a CANCELLED parent terminal, the sweeper's next tick resolves
+// the parent's awaiting_children implement stage: cancelled children count as
+// non-succeeded, their implement stages are not failed (so not recoverable),
+// and the stage settles failed-C with ONE children_settled row. The sweeper
+// never reads the parent RUN state (GetRun is never called) and never
+// integrates on a failed settle. What it does today on that family, pinned
+// here: it STILL calls Advance once for the parent run — the sweeper is
+// run-state-blind — and it is the real orchestrator's Advance that no-ops on
+// the terminal (cancelled) run, so nothing dispatches. The test is named for
+// that observable end state ("no advance" of the run), while asserting the
+// sweeper-side Advance call it actually makes.
+func TestTick_CancelledParentAllChildrenCancelled_SettlesStageNoAdvance(t *testing.T) {
+	parentRun := &run.Run{ID: uuid.New(), State: run.StateCancelled}
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun.ID, Type: run.StageTypeImplement, State: run.StageStateAwaitingChildren}
+	c1, c2 := mkChild(uuid.New(), run.StateCancelled), mkChild(uuid.New(), run.StateCancelled)
+	rs := &cancelledParentRepo{parent: parentRun, fakeRunRepo: &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{parentRun.ID: {c1, c2}},
+		stagesByRun: map[uuid.UUID][]*run.Stage{
+			c1.ID: {{ID: uuid.New(), RunID: c1.ID, Type: run.StageTypeImplement, State: run.StageStatePending}},
+			c2.ID: {{ID: uuid.New(), RunID: c2.ID, Type: run.StageTypeImplement, State: run.StageStateRunning}},
+		},
+	}}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(rs.transitions))
+	}
+	tr := rs.transitions[0]
+	if tr.StageID != parentStage.ID || tr.To != run.StageStateFailed || tr.Failure == nil || *tr.Failure != run.FailureC {
+		t.Errorf("transition = %+v, want the parent stage to failed-C", tr)
+	}
+	if rs.getRunCall != 0 {
+		t.Errorf("GetRun calls = %d, want 0 (the sweeper never reads the parent run state)", rs.getRunCall)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	settled := 0
+	for _, p := range au.appended {
+		if p.Category == "children_settled" {
+			settled++
+		}
+	}
+	if settled != 1 {
+		t.Errorf("children_settled rows = %d, want 1", settled)
+	}
+	integ.mu.Lock()
+	defer integ.mu.Unlock()
+	if len(integ.called) != 0 {
+		t.Errorf("IntegrateSlices calls = %d, want 0 (a failed settle never integrates)", len(integ.called))
+	}
+	if len(ad.advanced) != 1 || ad.advanced[0] != parentRun.ID {
+		t.Errorf("Advance calls = %v, want exactly [%s] (today's run-state-blind behaviour)", ad.advanced, parentRun.ID)
+	}
+}

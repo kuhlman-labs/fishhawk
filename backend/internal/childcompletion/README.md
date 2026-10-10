@@ -16,6 +16,10 @@ Off by default; enable with `--enable-child-completion-sweeper` (`FISHHAWKD_ENAB
 
 The sweeper does NOT emit `parent_awaiting_redrive` and drops its park log to debug, so an indefinitely-parked parent does not spam the audit chain or logs every tick; discoverability rests on the orchestrator hook's one-time entry (see `backend/internal/orchestrator/README.md`).
 
+## Cancelled parent: settled failed-C, run-state-blind (#4186)
+
+The sweeper never reads the parent RUN state. Once the decomposition-child cancel cascade (or `fishhawkd reconcile-orphan-children --apply`) makes every child of a CANCELLED parent terminal, the next tick resolves that parent's `awaiting_children` implement stage like any other all-terminal family: cancelled children count as non-succeeded, their implement stages are not `failed` so they are not recoverable, and the stage settles `failed`-C with ONE `children_settled` row and no slice integration. The sweeper still calls `Advance` for the parent; the orchestrator's `Advance` no-ops on the terminal (cancelled) run, so nothing dispatches. This is deliberate and unchanged — it only closes out the parent stage. Pinned (characterization, not a behaviour change) by `TestTick_CancelledParentAllChildrenCancelled_SettlesStageNoAdvance`.
+
 ## Fan-in (ADR-041 / E24.2 / #1142)
 
 On the all-succeeded path, `resolveParent` calls the nil-safe `Sweeper.Integrate` (an `Integrator` whose serve.go adapter delegates to `orchestrator.IntegrateSlices`) BEFORE stamping the stage succeeded:
