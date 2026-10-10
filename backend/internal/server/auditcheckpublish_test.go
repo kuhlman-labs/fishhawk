@@ -1549,9 +1549,17 @@ func shortStageID(id uuid.UUID) string {
 // reopenAcceptanceOnFixupPush, so the string literal auditcomplete duplicates
 // (it cannot import package server) is bound to server.CategoryAcceptanceReopened
 // by a test rather than by convention.
+//
+// #4086: a merge on the UN-re-run strand (stage pending, stale `passed`
+// outcome) is now refused 409 acceptance_stale BEFORE the pre-merge republish,
+// naming its own remedy (assertStaleStrandRefused). The four-hop seam is driven
+// on the in-flight re-run instead (shipAcceptanceReRunInFlight): the newer
+// outcome clears acceptance_stale while fishhawk_audit_complete is still
+// pending on the re-opened stage, so the derived detail — now the in-flight
+// wording — still crosses every hop.
 func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	merger := &fakeMerger{err: unstableMergeErr()}
-	s, rr, _, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
+	s, rr, au, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
 	ctx := context.Background()
 
 	// The fix-up push strands the check: reopen, then publish pending.
@@ -1563,6 +1571,13 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	if got := len(gh.calls()); got != 1 {
 		t.Fatalf("after the fix-up synchronize: %d check runs, want 1", got)
 	}
+
+	// Before the re-run, the merge is refused as acceptance_stale, naming the
+	// re-dispatch and the fix-up head, with no republish and no dispatch.
+	assertStaleStrandRefused(t, s, r.ID, acc.ID, merger, gh)
+
+	// The acceptance re-run ships its verdict; its stage is still running.
+	shipAcceptanceReRunInFlight(t, rr, au, r.ID, acc.ID)
 
 	// The operator merges. GitHub refuses on the required in_progress check.
 	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
@@ -1580,7 +1595,7 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	}
 	forgeText := calls[len(calls)-1].params.OutputText
 	wantStage := shortStageID(acc.ID)
-	for _, want := range []string{"stage_not_terminal", wantStage, "re-opened by a fix-up push", "fishhawk_dispatch_stage"} {
+	for _, want := range []string{"stage_not_terminal", wantStage, "re-opened by a fix-up push", "re-run is already in flight", "Wait for the re-run to settle"} {
 		if !strings.Contains(forgeText, want) {
 			t.Errorf("forge output.text = %q, want it to contain %q", forgeText, want)
 		}
@@ -1612,7 +1627,7 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 		t.Errorf("missing[0].kind = %v, want stage_not_terminal", item["kind"])
 	}
 	detail, _ := item["detail"].(string)
-	for _, want := range []string{wantStage, "re-opened by a fix-up push", "fishhawk_dispatch_stage"} {
+	for _, want := range []string{wantStage, "re-opened by a fix-up push", "re-run is already in flight", "Wait for the re-run to settle"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("missing[0].detail = %q, want it to contain %q", detail, want)
 		}

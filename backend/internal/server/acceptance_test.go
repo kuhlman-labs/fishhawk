@@ -524,9 +524,10 @@ func TestAcceptanceReopenedWriters_AreExactlyTheKnownSites(t *testing.T) {
 // that residual by construction.
 //
 // EXCLUSIONS. The const DECLARATION is a plain const spec with no enclosing
-// FuncDecl, so it is naturally excluded. The one benign NON-writer reference in
-// this package is latestAcceptanceEpisodeRestartSeq, which passes categoryConst to
-// ListForRunByCategory to READ the reopen markers; it is excluded EXPLICITLY and
+// FuncDecl, so it is naturally excluded. The benign NON-writer references in
+// this package are latestAcceptanceEpisodeRestartSeq and (#4086)
+// latestAcceptanceReopenEntry, each of which passes categoryConst to
+// ListForRunByCategory to READ the reopen markers; they are excluded EXPLICITLY and
 // BY NAME (readerExemptions) rather than by narrowing the match back to a writer
 // shape, so adding an exemption is a recorded, reviewed decision. A NEW benign
 // reader added WITHOUT an exemption entry deliberately trips the gate as an
@@ -547,6 +548,12 @@ func functionsWritingCategory(t *testing.T, categoryConst string) []string {
 	// NAME. Adding an entry here is a recorded decision — see the doc comment.
 	readerExemptions := map[string]struct{}{
 		"latestAcceptanceEpisodeRestartSeq": {},
+		// #4086: the merge-readiness acceptance_stale check's reader. It is
+		// strictly READ-ONLY — one ListForRunByCategory call and a fold to
+		// the newest stage-scoped entry, with NO Append / AppendChained /
+		// AppendGlobalChained anywhere in its body — so it can never be a
+		// re-open path the #3176 guard must see.
+		"latestAcceptanceReopenEntry": {},
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
