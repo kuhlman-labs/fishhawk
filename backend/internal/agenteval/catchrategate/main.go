@@ -101,7 +101,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		defaultTo(corpus, filepath.Join(root, defaultCorpusRel))
 		defaultTo(conventions, filepath.Join(root, defaultConventionsRel))
 	}
-	model := agenteval.DefaultQualityGeneratorModel
+	model := agenteval.DefaultCatchRateGeneratorModel
 
 	if *printFingerprint {
 		cases, err := agenteval.LoadPlanReviewCatchCorpus(*corpus)

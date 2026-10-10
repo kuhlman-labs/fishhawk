@@ -6,24 +6,25 @@ reviewer's catch rate. Sibling of
 [`severity-calibration-evidence.md`](severity-calibration-evidence.md), and it
 ships with the same honest residual.
 
-## THE BASELINE HAS NOT BEEN RECORDED
+## Baseline status: RECORDED 2026-10-10
 
-The results table at the bottom of this document is **explicitly
-unpopulated**, and no
-`backend/internal/agenteval/testdata/planreview-catchrate/evidence.json` is
-committed. #2245 shipped the measurement APPARATUS and the offline gate, not
-the measurement:
+The first baseline was recorded and pinned on 2026-10-10 on
+`claude-sonnet-5-5` (row in the results table at the bottom;
+`backend/internal/agenteval/testdata/planreview-catchrate/evidence.json`).
+#2245 shipped the measurement APPARATUS and the offline gate; the measurement
+is the operator's recording:
 
 - The offline tests run in every `scripts/test verify` and make **no model
   call**. They prove the arms differ only by the conventions section, that
   the catch probes discriminate, and that every evidence-check mode fails
   closed.
-- They prove **nothing** about whether conventions dilute the reviewer.
-- Until an operator records and pins the first baseline, the gate command
-  (`catchrategate`) exits 1 on the committed tree, so the standing check
-  `scripts/check-review-prompt-eval` **fails closed on every review-prompt
-  change**. That is by design: conventions already shipped in #2244 without
-  evidence.
+- They prove **nothing** about whether conventions dilute the reviewer; only
+  the recorded evidence speaks to that, and only for the six committed
+  planted-defect shapes.
+- The gate command (`catchrategate`) passes on the committed record until the
+  record goes stale (a prompt, corpus, fixture, model or catch-rule change),
+  after which `scripts/check-review-prompt-eval` **fails closed on the next
+  review-prompt change** until an operator re-measures.
 
 This is not a shortfall being papered over. The runner sanitizes
 gate-subprocess environments through a default-deny allow-list that names
@@ -103,18 +104,16 @@ variance.
 
 ## Step 3 — commit the evidence and confirm the gate
 
-**Binding: switch the gate's model in the SAME PR as the evidence.** The first
-recording is made on `claude-sonnet-5-5`, but `catchrategate/main.go`'s
-`model :=` line still reads `agenteval.DefaultQualityGeneratorModel`
-(`claude-sonnet-4-6`), and `CheckCatchRateEvidence` mode (4) refuses any record
-from another model. Until that line (and `main_test.go`'s matching references)
-reads `agenteval.DefaultCatchRateGeneratorModel`, `catchrategate` FAILS with
-`recorded generator model "claude-sonnet-5-5" is not the gate's model
-"claude-sonnet-4-6": re-measure`. Do NOT re-measure on that message: the
-measurement is fine, the gate's model is stale. The switch is not part of the
-change that introduced `DefaultCatchRateGeneratorModel`, because `catchrategate/`
-is a `scripts/check-review-prompt-eval` trigger path; the recording PR already
-triggers that check by adding `evidence.json`.
+**Binding: the gate's model and the evidence's model must agree.** The first
+recording (2026-10-10) was made on `claude-sonnet-5-5`, and the same commit
+switched `catchrategate/main.go`'s `model :=` line (and `main_test.go`'s
+matching references) from `agenteval.DefaultQualityGeneratorModel`
+(`claude-sonnet-4-6`) to `agenteval.DefaultCatchRateGeneratorModel`, because
+`CheckCatchRateEvidence` mode (4) refuses any record from another model. If
+`catchrategate` ever FAILS with `recorded generator model "<x>" is not the
+gate's model "<y>": re-measure` right after a deliberate generator-model
+change, do NOT re-measure on that message: the gate's model line is what is
+stale, not the measurement. Switch it in the same PR as the new evidence.
 
 ```sh
 (cd backend && go run ./internal/agenteval/catchrategate)
@@ -138,4 +137,4 @@ Re-measure on staleness — never hand-edit the record.
 
 | Recorded at | Generator model | Without conventions | With conventions | Delta | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|
-| — not yet measured — | | | | | | |
+| 2026-10-10T18:33:25Z | `claude-sonnet-5-5` | 80/138 (0.580) | 83/138 (0.601) | -0.022 | pinned (first measurement, #4235) | PASS |
