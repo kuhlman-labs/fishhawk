@@ -1,6 +1,6 @@
 # backend/internal/childcancel
 
-Cancels the non-terminal decomposition children of a cancelled (or otherwise terminal) parent run (#4186). One core, two consumers: the server's run-cancel sinks (`CascadeFromParent`, wired in `backend/internal/server/decomposition_cancel_cascade.go`) and the one-shot backfill `fishhawkd reconcile-orphan-children` (`FindOrphans` + `Reconcile`, `backend/cmd/fishhawkd/reconcile_children.go`).
+Cancels the non-terminal decomposition children of a cancelled (or otherwise terminal) parent run (#4186). One core, three consumers: the server's run-cancel sinks (`CascadeFromParent`, wired in `backend/internal/server/decomposition_cancel_cascade.go`), the one-shot backfill `fishhawkd reconcile-orphan-children` (`FindOrphans` + `Reconcile`, `backend/cmd/fishhawkd/reconcile_children.go`), and the stale top-level run sweep `fishhawkd sweep-stale-runs` (`CascadeFromParent` with `cancel_source: stale_sweep` after it cancels a stale run, `backend/internal/stalesweep`, #4185).
 
 ## Contract
 

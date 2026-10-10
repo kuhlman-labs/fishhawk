@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
@@ -64,26 +67,49 @@ type fakeGHAPI struct {
 	createGateEntered chan struct{}
 	createGateRelease chan struct{}
 	gateOnce          sync.Once
+
+	// blockLinkFor (#4153): AddSubIssue for the child whose issue number ==
+	// this blocks until its context is done and returns the context error —
+	// a sub-issue link wedged until the detached filing's budget expires.
+	blockLinkFor int
+
+	// release closes createGateRelease exactly once (set by releaseOnCleanup).
+	release func()
+
+	// linkUnblock releases a blockLinkFor-wedged AddSubIssue at test cleanup,
+	// so a failing (or counterfactual) run never strands the detached filing
+	// holding a pooled connection.
+	linkUnblock chan struct{}
 }
 
 func newFakeGHAPI() *fakeGHAPI {
 	return &fakeGHAPI{
-		next:      1,
-		byNumber:  map[int]*fakeIssue{},
-		byNode:    map[string]*fakeIssue{},
-		subIssues: map[string][]string{},
+		next:        1,
+		byNumber:    map[int]*fakeIssue{},
+		byNode:      map[string]*fakeIssue{},
+		subIssues:   map[string][]string{},
+		linkUnblock: make(chan struct{}),
 	}
 }
 
-func (f *fakeGHAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeGHAPI) CreateIssue(ctx context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	// Concurrency gate: hold the winner inside the filing critical section on its
 	// FIRST create so a second concurrent POST provably blocks on the per-draft
-	// advisory lock. Done before f.mu so it never blocks other API calls.
+	// advisory lock. Done before f.mu so it never blocks other API calls. The
+	// wait respects ctx, so a budget-expired detached filing is released.
 	if f.createGateRelease != nil {
+		var gateErr error
 		f.gateOnce.Do(func() {
 			close(f.createGateEntered)
-			<-f.createGateRelease
+			select {
+			case <-f.createGateRelease:
+			case <-ctx.Done():
+				gateErr = ctx.Err()
+			}
 		})
+		if gateErr != nil {
+			return nil, gateErr
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -126,7 +152,19 @@ func (f *fakeGHAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.Creden
 	return nil
 }
 
-func (f *fakeGHAPI) AddSubIssue(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
+func (f *fakeGHAPI) AddSubIssue(ctx context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
+	f.mu.Lock()
+	child, known := f.byNode[childNodeID]
+	block := known && f.blockLinkFor != 0 && child.number == f.blockLinkFor
+	f.mu.Unlock()
+	if block {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.linkUnblock:
+			return errors.New("fake link released by test cleanup")
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if child, ok := f.byNode[childNodeID]; ok && child.number == f.dropLinkFor {
@@ -184,6 +222,53 @@ func (f *fakeGHAPI) issueTitle(number int) (string, bool) {
 }
 
 func (f *fakeGHAPI) ProjectsTokenConfigured() bool { return true }
+
+// creates / issueCount / linkedUnder / setLinkFaults read and steer the fake
+// under its lock: the detached filing goroutine drives it concurrently with
+// the test body.
+func (f *fakeGHAPI) creates() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createCalls
+}
+
+func (f *fakeGHAPI) issueCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.byNumber)
+}
+
+func (f *fakeGHAPI) linkedUnder(epicNumber int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	iss, ok := f.byNumber[epicNumber]
+	if !ok {
+		return 0
+	}
+	return len(f.subIssues[iss.nodeID])
+}
+
+func (f *fakeGHAPI) setLinkFaults(drop, block int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropLinkFor, f.blockLinkFor = drop, block
+}
+
+func (f *fakeGHAPI) setCreateErrOn(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createErrOn = n
+}
+
+func (f *fakeGHAPI) titles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.byNumber))
+	for _, iss := range f.byNumber {
+		out = append(out, iss.title)
+	}
+	return out
+}
 
 // ListRepoIssues satisfies the work-item read capability's slice of the
 // workmgmt/github API interface (#2230). This fake exercises the FILING and
@@ -291,6 +376,25 @@ func sixChildDraft() refinement.EpicDraft {
 	}
 }
 
+// independentDraft is an n-child draft with no depends_on edges, so the wave
+// order is ordinal order and child ordinal i files as issue #(i+1).
+func independentDraft(n int) refinement.EpicDraft {
+	children := make([]refinement.ChildDraft, n)
+	for i := range children {
+		children[i] = refinement.ChildDraft{
+			Summary:            fmt.Sprintf("independent child %d", i+1),
+			Proposal:           "do it",
+			DoneMeans:          "done",
+			AcceptanceCriteria: []string{"works"},
+			Labels:             []string{"area:backend", "autonomy:medium"},
+		}
+	}
+	return refinement.EpicDraft{
+		Epic:     refinement.EpicSpec{Summary: "stand up Z", Scope: "the Z wiring", OutOfScope: "W"},
+		Children: children,
+	}
+}
+
 // seedApprovedDraft persists an approved, hash-pinned draft revision and returns
 // its session id.
 func seedApprovedDraft(t *testing.T, repo refinement.Repository, d refinement.EpicDraft) uuid.UUID {
@@ -330,14 +434,102 @@ func decodeFileResp(t *testing.T, rec *httptest.ResponseRecorder) refinementFile
 	return resp
 }
 
+// postFile runs one POST /file and returns the recorder.
+func postFile(s *Server, sessionID uuid.UUID, repo string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	s.handleFileRefinementSession(rec, fileReq(sessionID, repo))
+	return rec
+}
+
+// postFileLaunched POSTs /file and asserts the 202 filing_in_progress launch.
+func postFileLaunched(t *testing.T, s *Server, sessionID uuid.UUID, repo string) refinementFileResponse {
+	t.Helper()
+	rec := postFile(s, sessionID, repo)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /file status = %d, want 202 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeFileResp(t, rec)
+	if resp.Status != refinementFilingStatusInProgress || resp.AlreadyInProgress {
+		t.Fatalf("POST /file status=%q already_in_progress=%v, want %q/false (a launch)",
+			resp.Status, resp.AlreadyInProgress, refinementFilingStatusInProgress)
+	}
+	return resp
+}
+
+// waitFilingBounded waits for every detached filing, FAILING after D(10s)
+// instead of hanging the suite.
+func waitFilingBounded(t *testing.T, s *Server) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		s.waitRefinementFiling()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("the detached refinement filing did not finish within the bound")
+	}
+}
+
+// getSessionView GETs the session and decodes the view.
+func getSessionView(t *testing.T, s *Server, sessionID uuid.UUID) refinementSessionView {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.handleGetRefinementSession(rec, refinementReq(http.MethodGet,
+		"/v0/refinement/sessions/"+sessionID.String(), sessionID.String(), ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET session status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var view refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode session view: %v (body=%s)", err, rec.Body.String())
+	}
+	return view
+}
+
+// globalPayload decodes the first global-chain entry of category.
+func globalPayload(t *testing.T, repo audit.Repository, category string) map[string]any {
+	t.Helper()
+	entries, err := repo.ListGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("ListGlobal: %v", err)
+	}
+	for _, e := range entries {
+		if e.Category == category {
+			var m map[string]any
+			if err := json.Unmarshal(e.Payload, &m); err != nil {
+				t.Fatalf("decode %s payload: %v", category, err)
+			}
+			return m
+		}
+	}
+	t.Fatalf("no %s entry on the global chain", category)
+	return nil
+}
+
+// releaseOnCleanup closes the create gate at cleanup if the test did not, so a
+// failing test never strands the detached goroutine.
+func releaseOnCleanup(t *testing.T, api *fakeGHAPI, s *Server) {
+	t.Helper()
+	var once sync.Once
+	release := func() { once.Do(func() { close(api.createGateRelease) }) }
+	t.Cleanup(func() {
+		release()
+		s.waitRefinementFiling()
+	})
+	api.release = release
+}
+
 // ---- integration: happy path ----------------------------------------------
 
 // TestFileRefinementSession_Integration is the cross-boundary done-means test:
-// HTTP handler -> ApprovedDraft gate -> executor -> applyAndFileWorkItem -> REAL
-// github provider over a fake API -> pgtest persistence -> EpicChildren +
-// campaign.Assemble round-trip. An approved 6-child draft files as epic + 6
-// conventions-complete children with real-number depends_on markers, sub-issue
-// links, and board placement; the filed epic passes campaign assembly.
+// HTTP handler -> ApprovedDraft gate -> detached executor -> applyAndFileWorkItem
+// -> REAL github provider over a fake API -> pgtest persistence -> EpicChildren
+// + campaign.Assemble round-trip -> GET session view. An approved 6-child draft
+// files as epic + 6 conventions-complete children with real-number depends_on
+// markers, sub-issue links, and board placement; the filed epic passes campaign
+// assembly.
 func TestFileRefinementSession_Integration(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
@@ -345,8 +537,7 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	// Force the epic's DISCOVERED ordinal ABOVE its issue number: seed a prior
 	// [E35] epic so discovery parses 35 -> the new epic's title ordinal is 36,
 	// while its issue number stays #1 (the CreateIssue counter). Without this
-	// divergence the two coincide and the #1644 bug hides (the original test's
-	// gap).
+	// divergence the two coincide and the #1644 bug hides.
 	api.searchResults = []githubclient.IssueTitleResult{{Number: 35, Title: "[E35] prior epic"}}
 	installGHProvider(t, api)
 
@@ -357,24 +548,38 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
-	rec := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec, fileReq(sessionID, "kuhlman-labs/fishhawk"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	launch := postFileLaunched(t, s, sessionID, "kuhlman-labs/fishhawk")
+	if launch.ChildCount != 6 || launch.BudgetSeconds != int(refinementFilingBudgetFor(6)/time.Second) {
+		t.Errorf("launch child_count=%d budget_seconds=%d, want 6/%d", launch.ChildCount, launch.BudgetSeconds, int(refinementFilingBudgetFor(6)/time.Second))
 	}
-	resp := decodeFileResp(t, rec)
+	waitFilingBounded(t, s)
 
-	if resp.Epic.Number != 1 {
-		t.Errorf("epic number = %d, want 1", resp.Epic.Number)
+	view := getSessionView(t, s, sessionID)
+	if view.State != refinementFilingStateFiled {
+		t.Errorf("session state = %q, want filed", view.State)
 	}
-	if len(resp.Children) != 6 {
-		t.Fatalf("children = %d, want 6", len(resp.Children))
+	if view.Filing == nil || view.Filing.State != refinementFilingStateFiled || view.Filing.CompletedAt == nil {
+		t.Fatalf("filing block = %+v, want state filed with completed_at", view.Filing)
 	}
-	if !resp.Verified {
-		t.Error("verified = false, want true (round-trip passed)")
+	if view.Filing.Epic == nil || view.Filing.Epic.Number != 1 {
+		t.Errorf("filing epic = %+v, want #1", view.Filing.Epic)
 	}
-	if resp.Resumed || resp.AlreadyCompleted {
-		t.Errorf("fresh fill: resumed=%v already_completed=%v, want both false", resp.Resumed, resp.AlreadyCompleted)
+	if len(view.Filing.Children) != 6 || view.Filing.FiledCount != 7 {
+		t.Fatalf("filing children=%d filed_count=%d, want 6/7", len(view.Filing.Children), view.Filing.FiledCount)
+	}
+	if p := globalPayload(t, auditRepo, "refinement_filing_completed"); p["verified"] != true {
+		t.Errorf("completion audit verified = %v, want true (round-trip passed)", p["verified"])
+	}
+	// The detached context keeps the request's identity: the completion audit
+	// names the filing caller, not an anonymous actor.
+	entries, err := auditRepo.ListGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("ListGlobal: %v", err)
+	}
+	for _, e := range entries {
+		if e.Category == "refinement_filing_completed" && (e.ActorSubject == nil || *e.ActorSubject != "github:op") {
+			t.Errorf("completion audit actor = %v, want github:op (the detached filing lost the caller identity)", e.ActorSubject)
+		}
 	}
 
 	// Provider created exactly epic + 6 children.
@@ -400,10 +605,8 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	if title := api.byNumber[2].title; !strings.HasPrefix(title, "[E36.1]") {
 		t.Errorf("child ordinal 1 (#2) title = %q, want [E36.1] prefix (discovered ordinal, not issue number)", title)
 	}
-	// Round-trip consistency: parse the epic's ordinal from its own title and
-	// every child's (epic-ordinal, n) from theirs; assert all children agree on
-	// the discovered ordinal (36), their n values cover 1..6, and NO child uses
-	// the epic ISSUE number ([E1.n]) — the #1644 regression guard.
+	// Round-trip consistency: every child agrees on the discovered ordinal (36),
+	// their n values cover 1..6, and NO child uses the epic ISSUE number.
 	titleRE := regexp.MustCompile(`^\[E(\d+)(?:\.(\d+))?\]`)
 	epicM := titleRE.FindStringSubmatch(api.byNumber[1].title)
 	if epicM == nil {
@@ -436,12 +639,8 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
 		t.Errorf("refinement_filing_completed entries = %d, want 1", got)
 	}
-	sess, err := repo.GetFilingSession(context.Background(), mustDraftID(t, repo, sessionID))
-	if err != nil {
-		t.Fatalf("GetFilingSession: %v", err)
-	}
-	if sess.CompletedAt == nil {
-		t.Error("completed_at is nil after a full fill, want set")
+	if _, tracked := s.refinementFiling.snapshot(mustDraftID(t, repo, sessionID)); tracked {
+		t.Error("tracker entry survives a successful filing, want cleared")
 	}
 }
 
@@ -455,82 +654,228 @@ func mustDraftID(t *testing.T, repo refinement.Repository, sessionID uuid.UUID) 
 	return drafts[len(drafts)-1].ID
 }
 
-// ---- integration: kill-and-resume -----------------------------------------
+// ---- C8: the POST returns before the forge --------------------------------
 
-func TestFileRefinementSession_KillAndResume(t *testing.T) {
+// TestFileRefinementSession_DetachedReturnsBeforeForge (#4153 AC 1): with the
+// forge wedged on its first create (the gate stands in for "every forge call
+// is slow" — an unbounded latency until release), the POST still answers 202
+// within D(2s) with zero issues created; releasing the gate lets the detached
+// filing finish all 8 children.
+func TestFileRefinementSession_DetachedReturnsBeforeForge(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
-	api.createErrOn = 5 // fail the 5th CreateIssue (epic + 3 children ok, 4th fails)
+	api.createGateEntered = make(chan struct{})
+	api.createGateRelease = make(chan struct{})
 	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, independentDraft(8))
+	s := New(Config{RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), GitHub: newRefinementGHClient(t, api, 42)})
+	releaseOnCleanup(t, api, s)
 
-	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
-	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newRefinementGHClient(t, api, 42)
-	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
-
-	// First POST: fails mid-sequence -> 502, partial rows durable.
-	rec1 := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec1, fileReq(sessionID, "o/r"))
-	if rec1.Code != http.StatusBadGateway {
-		t.Fatalf("first status = %d, want 502 (body=%s)", rec1.Code, rec1.Body.String())
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- postFile(s, sessionID, "o/r") }()
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(timescale.D(2 * time.Second)):
+		t.Fatal("POST /file did not return within D(2s) while the forge was wedged — the filing is not detached")
 	}
-	var env errorEnvelope
-	_ = json.Unmarshal(rec1.Body.Bytes(), &env)
-	if env.Error.Code != "refinement_filing_failed" {
-		t.Errorf("first code = %q, want refinement_filing_failed", env.Error.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body=%s)", rec.Code, rec.Body.String())
 	}
-	draftID := mustDraftID(t, repo, sessionID)
-	recorded, _ := repo.ListFiledItems(context.Background(), draftID)
-	if len(recorded) != 4 { // epic + 3 children
-		t.Fatalf("recorded after kill = %d, want 4 (epic + 3 children)", len(recorded))
+	if resp := decodeFileResp(t, rec); resp.Status != refinementFilingStatusInProgress || resp.ChildCount != 8 {
+		t.Errorf("response status=%q child_count=%d, want filing_in_progress/8", resp.Status, resp.ChildCount)
 	}
-	// No completion audit, completed_at NULL.
-	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 0 {
-		t.Errorf("completion audit after kill = %d, want 0", got)
+	if n := api.issueCount(); n != 0 {
+		t.Errorf("issues created at response time = %d, want 0", n)
+	}
+	// While wedged, the preview reports the filing in progress.
+	<-api.createGateEntered
+	if view := getSessionView(t, s, sessionID); view.Filing == nil || view.Filing.State != refinementFilingStateInProgress || !view.Filing.InFlight {
+		t.Errorf("filing block while wedged = %+v, want in_progress/in_flight", view.Filing)
 	}
 
-	// Re-invoke: exactly the remaining 3 children created (no duplicate creates).
-	api.createErrOn = 0
-	rec2 := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec2, fileReq(sessionID, "o/r"))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("resume status = %d, want 200 (body=%s)", rec2.Code, rec2.Body.String())
+	api.release()
+	waitFilingBounded(t, s)
+	view := getSessionView(t, s, sessionID)
+	if view.State != refinementFilingStateFiled || view.Filing == nil || view.Filing.State != refinementFilingStateFiled {
+		t.Fatalf("after release: state=%q filing=%+v, want filed/filed", view.State, view.Filing)
 	}
-	resp := decodeFileResp(t, rec2)
-	if !resp.Resumed {
-		t.Error("resume: resumed = false, want true")
+	if len(view.Filing.Children) != 8 {
+		t.Errorf("filed children = %d, want 8", len(view.Filing.Children))
 	}
-	if !resp.Verified {
-		t.Error("resume: verified = false, want true")
-	}
-	// createCalls: 5 on the first pass (1 epic + 3 ok + 1 failed) + 3 on resume
-	// (the remaining children) = 8; but only 7 issues were actually created
-	// (the failed call created nothing). Assert distinct issues == 7.
-	if len(api.byNumber) != 7 {
-		t.Errorf("distinct issues created = %d, want 7 (no duplicates)", len(api.byNumber))
-	}
-	final, _ := repo.ListFiledItems(context.Background(), draftID)
-	if len(final) != 7 {
-		t.Errorf("final recorded = %d, want 7", len(final))
+	if got := api.linkedUnder(1); got != 8 {
+		t.Errorf("children linked under the epic = %d, want 8", got)
 	}
 }
 
-// ---- binding condition: concurrent filing serializes ----------------------
+// ---- C12 + C4: budget expiry mid-link, resume without duplicates -----------
 
-// TestFileRefinementSession_ConcurrentFilesOnce is the operator binding
-// condition: two goroutines POST /file for the same approved draft
-// simultaneously; the per-draft advisory lock guarantees exactly ONE epic + N
-// children are provider-created and zero duplicate records.
+// TestFileRefinementSession_BudgetExpiryMidLink_ResumeNoDuplicates (#4153 AC
+// 2/3, C4): child ordinal 4 (#5)'s sub-issue link wedges until the detached
+// filing's budget expires. The first filing ends failed (preview: filing.state
+// failed, last_error, #5 recorded); a re-invoke LAUNCHES a resume (202
+// filing_in_progress, never already_in_progress) that creates only the
+// remaining children, links #5 through the link pass, and completes — 9
+// creates in all, no duplicate titles, all 8 linked.
+func TestFileRefinementSession_BudgetExpiryMidLink_ResumeNoDuplicates(t *testing.T) {
+	prevFloor, prevPer := refinementFilingBudget, refinementFilingPerItemBudget
+	refinementFilingBudget, refinementFilingPerItemBudget = timescale.D(2*time.Second), 0
+	t.Cleanup(func() { refinementFilingBudget, refinementFilingPerItemBudget = prevFloor, prevPer })
+
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	api.setLinkFaults(0, 5) // child ordinal 4 is issue #5
+	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, independentDraft(8))
+	auditRepo := audit.NewPostgresRepository(pool)
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: newRefinementGHClient(t, api, 42)})
+	t.Cleanup(func() {
+		close(api.linkUnblock)
+		s.waitRefinementFiling()
+	})
+
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+
+	view := getSessionView(t, s, sessionID)
+	f := view.Filing
+	if f == nil || f.State != refinementFilingStateFailed || f.InFlight {
+		t.Fatalf("after budget expiry: filing = %+v, want state failed, not in flight", f)
+	}
+	if f.LastError == "" || f.Step != refinement.FilingStepCreate || f.FailedOrdinal == nil || *f.FailedOrdinal != 5 {
+		t.Errorf("failure detail last_error=%q step=%q failed_ordinal=%v, want non-empty/create/5", f.LastError, f.Step, f.FailedOrdinal)
+	}
+	recordedFive := false
+	for _, c := range f.Children {
+		if c.Ordinal == 4 && c.Number == 5 {
+			recordedFive = true
+		}
+	}
+	if !recordedFive {
+		t.Errorf("child ordinal 4 (#5) not recorded after its link was cut off: %+v", f.Children)
+	}
+	if view.State == refinementFilingStateFiled || f.CompletedAt != nil {
+		t.Error("session reported filed after a budget-expired filing")
+	}
+
+	// C4: a re-invoke after a failure LAUNCHES a resume.
+	api.setLinkFaults(0, 0)
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+
+	view = getSessionView(t, s, sessionID)
+	if view.State != refinementFilingStateFiled || view.Filing == nil || view.Filing.State != refinementFilingStateFiled {
+		t.Fatalf("after resume: state=%q filing=%+v, want filed", view.State, view.Filing)
+	}
+	if got := api.creates(); got != 9 {
+		t.Errorf("CreateIssue calls = %d, want 9 (1 epic + 8 children, no duplicates)", got)
+	}
+	seen := map[string]bool{}
+	for _, title := range api.titles() {
+		if seen[title] {
+			t.Errorf("duplicate filed title %q", title)
+		}
+		seen[title] = true
+	}
+	if got := api.linkedUnder(1); got != 8 {
+		t.Errorf("children linked under the epic = %d, want 8 (#5 linked by the link pass)", got)
+	}
+	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
+		t.Errorf("refinement_filing_completed entries = %d, want 1", got)
+	}
+}
+
+// ---- C9: in-process single-flight -----------------------------------------
+
+// noLockRefinementRepo makes WithFilingLock a pass-through, removing the
+// advisory lock that would otherwise MASK the in-process single-flight guard.
+type noLockRefinementRepo struct{ refinement.Repository }
+
+func (r noLockRefinementRepo) WithFilingLock(ctx context.Context, _ uuid.UUID, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+// TestFileRefinementSession_ConcurrentCalls_SingleFlight (#4153 AC 4): with
+// the advisory lock removed, a second POST while the first filing is in flight
+// returns 202 already_in_progress and launches nothing — exactly one epic + 8
+// children are created.
+func TestFileRefinementSession_ConcurrentCalls_SingleFlight(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	api.createGateEntered = make(chan struct{})
+	api.createGateRelease = make(chan struct{})
+	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, independentDraft(8))
+	s := New(Config{RefinementRepo: noLockRefinementRepo{repo}, AuditRepo: audit.NewPostgresRepository(pool), GitHub: newRefinementGHClient(t, api, 42)})
+	releaseOnCleanup(t, api, s)
+
+	postFileLaunched(t, s, sessionID, "o/r")
+	<-api.createGateEntered // the first filing is in flight, wedged on its epic create
+
+	rec := postFile(s, sessionID, "o/r")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("second POST status = %d, want 202 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if resp := decodeFileResp(t, rec); resp.Status != refinementFilingStatusAlreadyInProgress || !resp.AlreadyInProgress {
+		t.Errorf("second POST status=%q already_in_progress=%v, want already_in_progress/true", resp.Status, resp.AlreadyInProgress)
+	}
+
+	api.release()
+	waitFilingBounded(t, s)
+	if got := api.creates(); got != 9 {
+		t.Errorf("CreateIssue calls = %d, want 9 (one filing: no concurrent double-file)", got)
+	}
+	if got := api.issueCount(); got != 9 {
+		t.Errorf("distinct issues = %d, want 9", got)
+	}
+}
+
+// TestFileRefinementSession_InFlightOtherRepo409: a POST naming a different
+// repo than the filing already in flight for the draft is the pinned-repo
+// mismatch (409), not an already_in_progress that would silently ignore it.
+func TestFileRefinementSession_InFlightOtherRepo409(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
+	s := New(Config{RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), GitHub: newRefinementGHClient(t, api, 42)})
+	draftID := mustDraftID(t, repo, sessionID)
+	if _, started := s.refinementFiling.tryStart(draftID, "other/repo", 6, time.Minute); !started {
+		t.Fatal("seed tryStart did not start")
+	}
+
+	rec := postFile(s, sessionID, "o/r")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "refinement_filing_repo_mismatch" {
+		t.Errorf("code = %q, want refinement_filing_repo_mismatch", env.Error.Code)
+	}
+	waitFilingBounded(t, s)
+	if got := api.creates(); got != 0 {
+		t.Errorf("CreateIssue calls = %d, want 0", got)
+	}
+}
+
+// ---- binding condition: concurrent filing serializes across processes -----
+
+// TestFileRefinementSession_ConcurrentFilesOnce: two SERVERS (two replicas,
+// each with its own in-process tracker) file the same approved draft
+// concurrently; the per-draft advisory lock guarantees exactly ONE epic + N
+// children are provider-created, zero duplicate records and one completion
+// audit.
 //
-// The overlap is FORCED deterministically (no reliance on scheduler timing): the
-// winner is pinned inside the filing critical section by a provider-side gate on
-// its first CreateIssue (barrier 1), the loser is then launched and its arrival
-// is confirmed by observing a real non-granted advisory-lock waiter in pg_locks
-// (barrier 2), and only THEN is the winner released. This guarantees the two
-// requests genuinely overlap on the lock — the concurrent-observer race the
-// condition requires — rather than the winner completing before the loser starts
-// and the test passing through the already-completed replay path.
+// The overlap is FORCED deterministically: the winner's detached filing is
+// pinned inside the critical section by a provider-side gate on its first
+// CreateIssue (barrier 1), the loser's filing is then launched and its arrival
+// confirmed by a real non-granted advisory-lock waiter in pg_locks (barrier
+// 2), and only THEN is the winner released.
 func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
@@ -542,63 +887,34 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
 	gh := newRefinementGHClient(t, api, 42)
-	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	winner := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	loser := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	releaseOnCleanup(t, api, winner)
+	t.Cleanup(loser.waitRefinementFiling)
 
-	var wg sync.WaitGroup
-	codes := make([]int, 2)
-	post := func(idx int) {
-		defer wg.Done()
-		rec := httptest.NewRecorder()
-		s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
-		codes[idx] = rec.Code
-	}
-
-	// Goroutine 0 (the presumptive winner) acquires the advisory lock and enters
-	// the filing critical section; its first CreateIssue blocks on the gate.
-	wg.Add(1)
-	go post(0)
-
-	// Barrier 1: the winner is provably inside the critical section, holding the
-	// per-draft advisory lock, blocked on its first provider create.
+	postFileLaunched(t, winner, sessionID, "o/r")
 	select {
 	case <-api.createGateEntered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(timescale.D(10 * time.Second)):
 		t.Fatal("winner never reached its first CreateIssue under the filing lock")
 	}
 
-	// Goroutine 1 (the loser) races in while the winner holds the lock.
-	wg.Add(1)
-	go post(1)
-
-	// Barrier 2: wait until the loser is provably BLOCKED acquiring the advisory
-	// lock (a non-granted advisory row appears in pg_locks). Only now release the
-	// winner — this forces the concurrent overlap instead of a serial replay.
+	postFileLaunched(t, loser, sessionID, "o/r")
 	waitForAdvisoryLockWaiter(t, pool)
-	close(api.createGateRelease)
+	api.release()
 
-	wg.Wait()
+	waitFilingBounded(t, winner)
+	waitFilingBounded(t, loser)
 
-	for i, c := range codes {
-		if c != http.StatusOK {
-			t.Errorf("goroutine %d status = %d, want 200", i, c)
-		}
-	}
-	// Exactly one epic + 6 children created, zero duplicates.
-	if api.createCalls != 7 {
-		t.Errorf("CreateIssue calls = %d, want 7 (serialized: no concurrent double-file)", api.createCalls)
-	}
-	if len(api.byNumber) != 7 {
-		t.Errorf("distinct issues = %d, want 7", len(api.byNumber))
+	if got := api.creates(); got != 7 {
+		t.Errorf("CreateIssue calls = %d, want 7 (serialized: no concurrent double-file)", got)
 	}
 	final, _ := repo.ListFiledItems(context.Background(), mustDraftID(t, repo, sessionID))
 	if len(final) != 7 {
 		t.Errorf("recorded items = %d, want 7 (zero duplicate records)", len(final))
 	}
-	// The completion side effects run under the SAME per-draft lock as filing, so
-	// the loser sees completed_at set and appends NO second completion audit: the
-	// refinement_filing_completed entry lands EXACTLY once (high/concurrency fix —
-	// without it the loser enters after all rows are recorded but before
-	// completed_at is set, observes AlreadyCompleted=false, and double-audits).
+	// The completion side effects run under the SAME per-draft lock as filing,
+	// so the loser sees completed_at set and appends NO second completion audit.
 	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
 		t.Errorf("refinement_filing_completed entries = %d, want 1 (no duplicate completion under concurrency)", got)
 	}
@@ -612,13 +928,11 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 }
 
 // waitForAdvisoryLockWaiter blocks until a session is waiting on (blocked
-// acquiring) a Postgres advisory lock — the signal that the loser goroutine has
-// reached WithFilingLock and is contending for the per-draft lock the winner
-// holds. The isolated pgtest database has no other advisory-lock activity during
-// the test, so a single non-granted advisory row is unambiguous.
+// acquiring) a Postgres advisory lock — the signal that the loser has reached
+// WithFilingLock and is contending for the per-draft lock the winner holds.
 func waitForAdvisoryLockWaiter(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
 	for {
 		var waiters int
 		if err := pool.QueryRow(context.Background(),
@@ -630,9 +944,49 @@ func waitForAdvisoryLockWaiter(t *testing.T, pool *pgxpool.Pool) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("loser goroutine never blocked on the per-draft advisory lock")
+			t.Fatal("loser never blocked on the per-draft advisory lock")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ---- integration: kill-and-resume -----------------------------------------
+
+func TestFileRefinementSession_KillAndResume(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	api.createErrOn = 5 // fail the 5th CreateIssue (epic + 3 children ok, 4th fails)
+	installGHProvider(t, api)
+
+	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
+	auditRepo := audit.NewPostgresRepository(pool)
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: newRefinementGHClient(t, api, 42)})
+
+	// First filing fails mid-sequence: observed on the preview, partial rows durable.
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	f := getSessionView(t, s, sessionID).Filing
+	if f == nil || f.State != refinementFilingStateFailed || f.FiledCount != 4 || f.Step != refinement.FilingStepCreate {
+		t.Fatalf("after kill: filing = %+v, want failed with 4 filed at step create", f)
+	}
+	if !strings.Contains(f.LastError, "provider could not file the work item") || f.FailedOrdinal == nil || *f.FailedOrdinal != 5 {
+		t.Errorf("last_error=%q failed_ordinal=%v, want the provider failure at ordinal 5", f.LastError, f.FailedOrdinal)
+	}
+	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 0 {
+		t.Errorf("completion audit after kill = %d, want 0", got)
+	}
+
+	// Re-invoke: exactly the remaining children created (no duplicate creates).
+	api.setCreateErrOn(0)
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	f = getSessionView(t, s, sessionID).Filing
+	if f == nil || f.State != refinementFilingStateFiled || f.FiledCount != 7 {
+		t.Fatalf("after resume: filing = %+v, want filed with 7", f)
+	}
+	if got := api.issueCount(); got != 7 {
+		t.Errorf("distinct issues created = %d, want 7 (no duplicates)", got)
 	}
 }
 
@@ -735,7 +1089,10 @@ func TestFileRefinementSession_MalformedRepo400(t *testing.T) {
 	}
 }
 
-func TestFileRefinementSession_RepoMismatchOnResume409(t *testing.T) {
+// TestFileRefinementSession_RepoMismatch409IsSynchronous (C10): a filing
+// session pinning a different repo is refused 409 SYNCHRONOUSLY — no goroutine
+// launched, no tracker entry, zero creates.
+func TestFileRefinementSession_RepoMismatch409IsSynchronous(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
@@ -750,8 +1107,7 @@ func TestFileRefinementSession_RepoMismatchOnResume409(t *testing.T) {
 	}
 	gh := newInstallationGitHubClient(t, 42, false)
 	s := New(Config{RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), GitHub: gh})
-	rec := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
+	rec := postFile(s, sessionID, "o/r")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body=%s)", rec.Code, rec.Body.String())
 	}
@@ -760,104 +1116,264 @@ func TestFileRefinementSession_RepoMismatchOnResume409(t *testing.T) {
 	if env.Error.Code != "refinement_filing_repo_mismatch" {
 		t.Errorf("code = %q, want refinement_filing_repo_mismatch", env.Error.Code)
 	}
-	// Nothing was filed.
-	if api.createCalls != 0 {
-		t.Errorf("CreateIssue calls = %d, want 0 on repo mismatch", api.createCalls)
+	waitFilingBounded(t, s)
+	if _, tracked := s.refinementFiling.snapshot(draftID); tracked {
+		t.Error("a repo-mismatch POST left a tracker entry (a filing was launched)")
+	}
+	if got := api.creates(); got != 0 {
+		t.Errorf("CreateIssue calls = %d, want 0 on repo mismatch", got)
 	}
 }
 
-func TestFileRefinementSession_VerificationFailure502(t *testing.T) {
+// TestFileRefinementSession_VerificationFailure_SurfacesOnPreview (C13): a
+// child whose sub-issue link never sticks fails the round-trip verification;
+// the preview reports filing.state failed at step verify, completed_at stays
+// NULL and no completion audit lands. A later re-invoke (link healthy) links
+// the child through the link pass and completes.
+func TestFileRefinementSession_VerificationFailure_SurfacesOnPreview(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
-	api.dropLinkFor = 4 // drop one child's sub-issue link -> EpicChildren misses it
+	api.setLinkFaults(4, 0) // drop child #4's sub-issue link -> EpicChildren misses it
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newRefinementGHClient(t, api, 42)
-	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: newRefinementGHClient(t, api, 42)})
 
-	rec := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	f := getSessionView(t, s, sessionID).Filing
+	if f == nil || f.State != refinementFilingStateFailed || f.Step != refinementFilingStepVerify {
+		t.Fatalf("filing = %+v, want failed at step verify", f)
 	}
-	var env errorEnvelope
-	_ = json.Unmarshal(rec.Body.Bytes(), &env)
-	if env.Error.Code != "refinement_filing_verification_failed" {
-		t.Errorf("code = %q, want refinement_filing_verification_failed", env.Error.Code)
+	if !strings.Contains(f.LastError, "verification") || f.CompletedAt != nil {
+		t.Errorf("last_error=%q completed_at=%v, want a verification error and NULL", f.LastError, f.CompletedAt)
 	}
-	// NO completion audit; completed_at NULL (items are durable, re-invoke re-verifies).
 	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 0 {
 		t.Errorf("completion audit on verification failure = %d, want 0", got)
 	}
-	sess, err := repo.GetFilingSession(context.Background(), mustDraftID(t, repo, sessionID))
-	if err != nil {
-		t.Fatalf("GetFilingSession: %v", err)
+
+	api.setLinkFaults(0, 0)
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	if f := getSessionView(t, s, sessionID).Filing; f == nil || f.State != refinementFilingStateFiled {
+		t.Fatalf("after re-invoke: filing = %+v, want filed", f)
 	}
-	if sess.CompletedAt != nil {
-		t.Error("completed_at set despite verification failure, want NULL")
+	if got := api.creates(); got != 7 {
+		t.Errorf("CreateIssue calls = %d, want 7 (the re-invoke re-verifies, files nothing)", got)
 	}
 }
 
-func TestFileRefinementSession_AuditFailure500(t *testing.T) {
+// toggleAuditRepo fails AppendGlobalChained while fail is set.
+type toggleAuditRepo struct {
+	audit.Repository
+	fail atomic.Bool
+}
+
+func (r *toggleAuditRepo) AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	if r.fail.Load() {
+		return nil, errors.New("injected audit failure")
+	}
+	return r.Repository.AppendGlobalChained(ctx, p)
+}
+
+// TestFileRefinementSession_AuditFailure_SurfacesOnPreview (C13): a failed
+// completion-audit append leaves the session open (completed_at NULL) and the
+// preview reports filing.state failed at step audit; a re-invoke with a
+// healthy audit chain completes.
+func TestFileRefinementSession_AuditFailure_SurfacesOnPreview(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
-	gh := newRefinementGHClient(t, api, 42)
-	// erroringAuditRepo fails every AppendGlobalChained -> the completion audit fails.
-	s := New(Config{RefinementRepo: repo, AuditRepo: erroringAuditRepo{}, GitHub: gh})
+	auditRepo := &toggleAuditRepo{Repository: audit.NewPostgresRepository(pool)}
+	auditRepo.fail.Store(true)
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: newRefinementGHClient(t, api, 42)})
 
-	rec := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 (body=%s)", rec.Code, rec.Body.String())
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	f := getSessionView(t, s, sessionID).Filing
+	if f == nil || f.State != refinementFilingStateFailed || f.Step != refinementFilingStepAudit {
+		t.Fatalf("filing = %+v, want failed at step audit", f)
 	}
-	// Items are durable but the session stays open (completed_at NULL) so a
-	// re-invoke retries the close.
-	sess, err := repo.GetFilingSession(context.Background(), mustDraftID(t, repo, sessionID))
-	if err != nil {
-		t.Fatalf("GetFilingSession: %v", err)
+	if !strings.Contains(f.LastError, "refinement_filing_completed audit") || f.CompletedAt != nil {
+		t.Errorf("last_error=%q completed_at=%v, want the audit append error and NULL", f.LastError, f.CompletedAt)
 	}
-	if sess.CompletedAt != nil {
-		t.Error("completed_at set despite an audit-append failure, want NULL")
+
+	auditRepo.fail.Store(false)
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
+	if f := getSessionView(t, s, sessionID).Filing; f == nil || f.State != refinementFilingStateFiled {
+		t.Fatalf("after re-invoke: filing = %+v, want filed", f)
+	}
+	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
+		t.Errorf("completion audit entries = %d, want 1", got)
 	}
 }
 
-func TestFileRefinementSession_AlreadyCompletedReplay(t *testing.T) {
+// TestFileRefinementSession_CompletedReplay200NoForgeCalls (C11): a completed
+// session replays 200 status filed / already_completed with the recorded
+// items and zero forge calls.
+func TestFileRefinementSession_CompletedReplay200NoForgeCalls(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newRefinementGHClient(t, api, 42)
-	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: newRefinementGHClient(t, api, 42)})
 
-	// First POST completes the filing.
-	rec1 := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec1, fileReq(sessionID, "o/r"))
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("first status = %d, want 200 (body=%s)", rec1.Code, rec1.Body.String())
-	}
+	postFileLaunched(t, s, sessionID, "o/r")
+	waitFilingBounded(t, s)
 
-	// Second POST replays: 200, already_completed=true, NO new creates, NO
-	// second completion audit.
-	rec2 := httptest.NewRecorder()
-	s.handleFileRefinementSession(rec2, fileReq(sessionID, "o/r"))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("replay status = %d, want 200 (body=%s)", rec2.Code, rec2.Body.String())
+	rec := postFile(s, sessionID, "o/r")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
-	resp := decodeFileResp(t, rec2)
-	if !resp.AlreadyCompleted {
-		t.Error("replay already_completed = false, want true")
+	resp := decodeFileResp(t, rec)
+	if !resp.AlreadyCompleted || resp.Status != refinementFilingStatusFiled {
+		t.Errorf("replay already_completed=%v status=%q, want true/filed", resp.AlreadyCompleted, resp.Status)
 	}
-	if api.createCalls != 7 {
-		t.Errorf("CreateIssue calls after replay = %d, want 7 (no new creates)", api.createCalls)
+	if resp.Epic == nil || resp.Epic.Number != 1 || len(resp.Children) != 6 {
+		t.Errorf("replay epic=%+v children=%d, want #1 and 6", resp.Epic, len(resp.Children))
+	}
+	waitFilingBounded(t, s)
+	if got := api.creates(); got != 7 {
+		t.Errorf("CreateIssue calls after replay = %d, want 7 (no new creates)", got)
 	}
 	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
 		t.Errorf("completion audit entries = %d, want 1 (replay appends none)", got)
 	}
+}
+
+// filingFaultRepo injects a filing-ledger read fault into an otherwise
+// approved seeded session.
+type filingFaultRepo struct {
+	*seededRefinementRepo
+	sess    *refinement.FilingSession
+	getErr  error
+	listErr error
+}
+
+func (r *filingFaultRepo) GetFilingSession(context.Context, uuid.UUID) (*refinement.FilingSession, error) {
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
+	if r.sess == nil {
+		return nil, refinement.ErrNotFound
+	}
+	return r.sess, nil
+}
+
+func (r *filingFaultRepo) ListFiledItems(context.Context, uuid.UUID) ([]*refinement.FiledItem, error) {
+	return nil, r.listErr
+}
+
+// approvedSeeded is an approved, un-drifted in-memory session.
+func approvedSeeded(t *testing.T) *seededRefinementRepo {
+	t.Helper()
+	draft := sixChildDraft()
+	rev := &refinement.StoredDraft{ID: uuid.New(), SessionID: uuid.New(), Draft: draft}
+	hash, err := refinement.ContentHash(draft)
+	if err != nil {
+		t.Fatalf("ContentHash: %v", err)
+	}
+	dec := &refinement.Decision{DraftID: rev.ID, Decision: refinement.DecisionApproved, DraftContentHash: hash}
+	return &seededRefinementRepo{drafts: []*refinement.StoredDraft{rev}, decisions: []*refinement.Decision{dec}}
+}
+
+// TestFileRefinementSession_LedgerReadFaults500: a fault reading the filing
+// session or its items in the synchronous gate is a 500, never a launch.
+func TestFileRefinementSession_LedgerReadFaults500(t *testing.T) {
+	installGHProvider(t, newFakeGHAPI())
+	cases := map[string]*filingFaultRepo{
+		"get filing session": {getErr: errors.New("filing_sessions down")},
+		"list filed items":   {sess: &refinement.FilingSession{Repo: "o/r"}, listErr: errors.New("filed_items down")},
+	}
+	for name, repo := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo.seededRefinementRepo = approvedSeeded(t)
+			s := New(Config{RefinementRepo: repo, AuditRepo: okAuditRepo{}})
+			rec := postFile(s, uuid.New(), "o/r")
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500 (body=%s)", rec.Code, rec.Body.String())
+			}
+			waitFilingBounded(t, s)
+			if _, tracked := s.refinementFiling.snapshot(repo.drafts[0].ID); tracked {
+				t.Error("a ledger read fault launched a filing")
+			}
+		})
+	}
+}
+
+// ---- C14: Shutdown drains the detached filing -----------------------------
+
+// TestShutdown_DrainsDetachedRefinementFiling: Shutdown WAITS for an in-flight
+// detached filing (it has not returned while the forge is wedged) and returns
+// once the released filing completes.
+func TestShutdown_DrainsDetachedRefinementFiling(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	api.createGateEntered = make(chan struct{})
+	api.createGateRelease = make(chan struct{})
+	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
+	s := New(Config{Addr: "127.0.0.1:0", ShutdownTimeout: timescale.D(30 * time.Second),
+		RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), GitHub: newRefinementGHClient(t, api, 42)})
+	releaseOnCleanup(t, api, s)
+
+	postFileLaunched(t, s, sessionID, "o/r")
+	<-api.createGateEntered
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned while the detached refinement filing was still in flight — it did not drain")
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	api.release()
+	select {
+	case <-shutdownDone:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("Shutdown did not return after the detached filing finished")
+	}
+	sess, err := repo.GetFilingSession(context.Background(), mustDraftID(t, repo, sessionID))
+	if err != nil {
+		t.Fatalf("GetFilingSession: %v", err)
+	}
+	if sess.CompletedAt == nil {
+		t.Error("Shutdown returned before the drained filing completed")
+	}
+}
+
+// TestShutdown_RefinementFilingDrainBoundedByDeadline: a wedged detached
+// filing cannot hold Shutdown past its deadline; once released, the goroutine
+// still exits (the WaitGroup reaches zero).
+func TestShutdown_RefinementFilingDrainBoundedByDeadline(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	api := newFakeGHAPI()
+	api.createGateEntered = make(chan struct{})
+	api.createGateRelease = make(chan struct{})
+	installGHProvider(t, api)
+	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
+	s := New(Config{Addr: "127.0.0.1:0", ShutdownTimeout: timescale.D(200 * time.Millisecond),
+		RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), GitHub: newRefinementGHClient(t, api, 42)})
+	releaseOnCleanup(t, api, s)
+
+	postFileLaunched(t, s, sessionID, "o/r")
+	<-api.createGateEntered
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+	select {
+	case <-shutdownDone:
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("Shutdown was held past its deadline by a wedged detached filing")
+	}
+	api.release()
+	waitFilingBounded(t, s)
 }

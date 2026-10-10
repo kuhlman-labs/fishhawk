@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // groundingFakeReviewer implements BOTH Review and the optional groundedReviewer
@@ -656,5 +657,256 @@ func TestPlanReviewGrounded_AdvisoryExportsAndCleansUp(t *testing.T) {
 	}
 	if _, err := os.Stat(reviewer.treeDir); !os.IsNotExist(err) {
 		t.Errorf("plan-review export not removed after the detached loop returned: %v", err)
+	}
+}
+
+// --- Supplemental base-rebase re-invoke review grounding (#4160) ---
+//
+// These cross the grounding → export → prompt → reviewer boundary end to end
+// through the real runSupplementalReinvokeReview, and assert the PRESENCE of
+// the REPOSITORY ACCESS posture (the tree commit, or the named reason) rather
+// than only the absence of the switch-off text: before #4160 the supplemental
+// render carried no REPOSITORY ACCESS section at all, so an absence-only
+// assertion passed vacuously.
+
+// supplementalGroundedFraming is the grounded-only sentence
+// writeSupplementalReinvokeReview adds when the pass carries a tree.
+const supplementalGroundedFraming = "is the re-landed head this pass reviews"
+
+// reviewTreeExports lists the reviewsandbox export directories under dir.
+func reviewTreeExports(t *testing.T, dir string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "fishhawk-review-tree-*"))
+	if err != nil {
+		t.Fatalf("glob review-tree exports: %v", err)
+	}
+	return matches
+}
+
+// TestSupplementalReinvokeReview_GroundingEnabledNamesReason (T1): grounding is
+// enabled and every reviewer can ground, but the run has no local checkout, so
+// the supplemental pass runs DIFF-ONLY carrying the no_working_dir reason. The
+// prompt must render REPOSITORY ACCESS with that reason and must NOT tell the
+// operator to set FISHHAWKD_REVIEW_GROUNDING (the #4160 defect). Deleting the
+// groundReview call leaves the reason zero, which renders the switch-off text:
+// RED.
+func TestSupplementalReinvokeReview_GroundingEnabledNamesReason(t *testing.T) {
+	reviewer := &groundingFakeReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.WorkingDir = ""
+
+	const reHead = "abc123abc123abc123abc123abc123abc123abcd"
+	if s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, reHead, supplementalExemptions()) {
+		t.Fatal("advisory supplemental review returned true")
+	}
+	s.waitBackgroundReviews()
+
+	if findSupplementalImplementReviewed(t, au, implStage.ID) == nil {
+		t.Fatal("no supplemental implement_reviewed entry recorded")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if reviewer.reviewGroundedHit || reviewer.treeDir != "" {
+		t.Fatalf("no-working-dir supplemental pass must run ungrounded: grounded=%v treeDir=%q", reviewer.reviewGroundedHit, reviewer.treeDir)
+	}
+	for _, w := range []string{"REPOSITORY ACCESS", "DIFF-ONLY", "IS ENABLED", "this run has no local checkout on the review host to export"} {
+		if !strings.Contains(reviewer.prompt, w) {
+			t.Errorf("supplemental prompt missing %q:\n%s", w, reviewer.prompt)
+		}
+	}
+	if strings.Contains(reviewer.prompt, "FISHHAWKD_REVIEW_GROUNDING") {
+		t.Errorf("enabled-but-unavailable supplemental prompt must NOT name FISHHAWKD_REVIEW_GROUNDING:\n%s", reviewer.prompt)
+	}
+	if strings.Contains(reviewer.prompt, supplementalGroundedFraming) {
+		t.Errorf("ungrounded supplemental prompt carries the grounded framing sentence:\n%s", reviewer.prompt)
+	}
+}
+
+// TestSupplementalReinvokeReview_GroundedAdvisoryLifecycle (T2): an advisory
+// supplemental pass over a run with a checkout is GROUNDED against the
+// re-landed head — the reviewer receives the tree and a prompt naming that
+// commit plus the grounded framing — the export SURVIVES the detached review,
+// and it is removed after the loop returns (C6, the runImplementReviews
+// ownership contract).
+func TestSupplementalReinvokeReview_GroundedAdvisoryLifecycle(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	reviewer := &groundingFakeReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.WorkingDir = repo
+	// A first review round already landed; grounding must not change the
+	// additive, no-started discipline (#1250).
+	seedFirstReviewRound(t, au, runRow.ID, implStage.ID)
+
+	if s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, headSHA, supplementalExemptions()) {
+		t.Fatal("advisory supplemental review returned true")
+	}
+
+	select {
+	case <-reviewer.started:
+	case <-time.After(timescale.D(10 * time.Second)):
+		close(reviewer.release)
+		t.Fatal("supplemental reviewer never started")
+	}
+	reviewer.mu.Lock()
+	treeDir := reviewer.treeDir
+	grounded := reviewer.reviewGroundedHit
+	existed := reviewer.dirExistedAtReview
+	got := reviewer.prompt
+	reviewer.mu.Unlock()
+	if !grounded || treeDir == "" {
+		close(reviewer.release)
+		t.Fatalf("supplemental pass not grounded: grounded=%v treeDir=%q\n%s", grounded, treeDir, got)
+	}
+	if !existed {
+		t.Error("export dir did not exist at review time")
+	}
+	// Mid-review: the detached review still holds the export (C6).
+	if _, err := os.Stat(treeDir); err != nil {
+		t.Errorf("export dir removed before the detached supplemental review released: %v", err)
+	}
+	for _, w := range []string{"REPOSITORY ACCESS", "TRACKED files exported at commit " + headSHA[:12], supplementalGroundedFraming} {
+		if !strings.Contains(got, w) {
+			t.Errorf("grounded supplemental prompt missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "FISHHAWKD_REVIEW_GROUNDING") {
+		t.Errorf("grounded supplemental prompt must NOT name FISHHAWKD_REVIEW_GROUNDING:\n%s", got)
+	}
+
+	close(reviewer.release)
+	s.waitBackgroundReviews()
+
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("export dir not removed after the detached supplemental review returned: %v", err)
+	}
+	if sup := findSupplementalImplementReviewed(t, au, implStage.ID); sup == nil || sup.HeadSHA != headSHA {
+		t.Errorf("supplemental implement_reviewed = %+v, want one with head %s", sup, headSHA)
+	}
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started = %d, want 1 (the grounded supplemental pass must not emit a fresh started)", n)
+	}
+}
+
+// TestSupplementalReinvokeReview_GroundedGatingCleansUp (T3): a gating
+// supplemental pass runs grounded synchronously and the synchronous scope owns
+// the cleanup, so the export is gone once the call returns.
+func TestSupplementalReinvokeReview_GroundedGatingCleansUp(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	reviewer := &groundingFakeReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	runRow.WorkingDir = repo
+
+	if s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, headSHA, supplementalExemptions()) {
+		t.Fatal("gating supplemental approve returned true")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if !reviewer.reviewGroundedHit || reviewer.treeDir == "" || !reviewer.dirExistedAtReview {
+		t.Fatalf("gating supplemental pass not grounded: hit=%v treeDir=%q existed=%v",
+			reviewer.reviewGroundedHit, reviewer.treeDir, reviewer.dirExistedAtReview)
+	}
+	if !strings.Contains(reviewer.prompt, "TRACKED files exported at commit "+headSHA[:12]) {
+		t.Errorf("gating supplemental prompt does not name the re-landed head %s:\n%s", headSHA[:12], reviewer.prompt)
+	}
+	if _, err := os.Stat(reviewer.treeDir); !os.IsNotExist(err) {
+		t.Errorf("export dir not removed after the gating supplemental review returned: %v", err)
+	}
+	if findSupplementalImplementReviewed(t, au, implStage.ID) == nil {
+		t.Fatal("no supplemental implement_reviewed entry recorded")
+	}
+}
+
+// TestSupplementalReinvokeReview_KillSwitchKeepsSwitchOffText (T4): with the
+// kill switch on, the supplemental pass is DIFF-ONLY and its REPOSITORY ACCESS
+// section renders the switch-off text naming FISHHAWKD_REVIEW_GROUNDING — the
+// one posture in which that instruction is correct.
+func TestSupplementalReinvokeReview_KillSwitchKeepsSwitchOffText(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	reviewer := &groundingFakeReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	s.cfg.ReviewGroundingDisabled = true
+	runRow.WorkingDir = repo
+
+	s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, headSHA, supplementalExemptions())
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if reviewer.reviewGroundedHit || reviewer.treeDir != "" {
+		t.Fatalf("kill switch must degrade the supplemental pass: grounded=%v treeDir=%q", reviewer.reviewGroundedHit, reviewer.treeDir)
+	}
+	for _, w := range []string{"REPOSITORY ACCESS", "DIFF-ONLY", "This is a DEPLOYMENT setting", "FISHHAWKD_REVIEW_GROUNDING=true"} {
+		if !strings.Contains(reviewer.prompt, w) {
+			t.Errorf("kill-switch supplemental prompt missing %q:\n%s", w, reviewer.prompt)
+		}
+	}
+	if strings.Contains(reviewer.prompt, "IS ENABLED") {
+		t.Errorf("kill-switch supplemental prompt must not claim grounding is enabled:\n%s", reviewer.prompt)
+	}
+}
+
+// TestSupplementalReinvokeReview_BuildErrorRemovesExport (C4): a prompt build
+// that fails AFTER the tree was exported removes the export before returning —
+// the build-error branch of the runImplementReviews cleanup contract. The
+// export is created under a test-private TMPDIR so the test can observe it
+// exist DURING the build (the seam sees it, so the arm is not vacuous) and be
+// gone after the return. Deleting the treeCleanup() call on that branch leaves
+// the export behind: RED.
+func TestSupplementalReinvokeReview_BuildErrorRemovesExport(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+	scratch := t.TempDir()
+	t.Setenv("TMPDIR", scratch)
+
+	reviewer := &groundingFakeReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.WorkingDir = repo
+
+	orig := buildImplementReviewPrompt
+	t.Cleanup(func() { buildImplementReviewPrompt = orig })
+	var duringBuild []string
+	var builtCommit string
+	buildImplementReviewPrompt = func(_ string, trig prompt.Trigger) (string, error) {
+		duringBuild = reviewTreeExports(t, scratch)
+		builtCommit = trig.ReviewTreeCommit
+		return "", errors.New("injected prompt build failure")
+	}
+
+	if s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, headSHA, supplementalExemptions()) {
+		t.Fatal("a prompt-build failure gated the stage")
+	}
+	s.waitBackgroundReviews()
+
+	if builtCommit != headSHA || len(duringBuild) != 1 {
+		t.Fatalf("precondition: the build must run over a live export of %s; commit=%q exports=%v", headSHA, builtCommit, duringBuild)
+	}
+	if left := reviewTreeExports(t, scratch); len(left) != 0 {
+		t.Errorf("export left behind after the build-error return: %v", left)
+	}
+	if reviewer.prompt != "" {
+		t.Error("a reviewer ran despite the prompt-build failure")
+	}
+	if findSupplementalImplementReviewed(t, au, implStage.ID) != nil {
+		t.Error("a supplemental implement_reviewed was recorded despite the prompt-build failure")
 	}
 }

@@ -461,8 +461,27 @@ func init() {
 // is exported, so encoding/json and the jsonschema reflector reach it exactly
 // as they would an exported type. If a consumer ever needs to name it,
 // exporting it is a one-line change plus a baseline row.
+//
+// SliceIntegration (#4165) is the server's decomposed-parent slice-integration
+// authority — orchestrator.SliceIntegrationUnavailable, the EXACT predicate the
+// server's decomposed-parent acceptance gate stands down on. THREE states:
+// Capabilities nil (a list read, or an older backend) OR SliceIntegration nil
+// (an older backend whose block predates the key) is UNDECIDABLE, so a caller
+// falls back to the "no fan-in record + parent implement succeeded" inference
+// (approval condition C3); PRESENT is the server gate's own answer and wins
+// over the inference. The backend always emits the key inside the block, so
+// the omitempty here only governs this mirror's own re-encoding.
 type runCapabilities struct {
-	ProductFeedbackProviders []string `json:"product_feedback_providers" jsonschema:"the deployment's registered feedback-provider ids. An EMPTY list means positively none is registered, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented"`
+	ProductFeedbackProviders []string             `json:"product_feedback_providers" jsonschema:"the deployment's registered feedback-provider ids. An EMPTY list means positively none is registered, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented"`
+	SliceIntegration         *runSliceIntegration `json:"slice_integration,omitempty" jsonschema:"whether the server can integrate a decomposed parent's slices (the decomposed-parent acceptance gate's own predicate). Absent means undecidable (an older backend), never unavailable"`
+}
+
+// runSliceIntegration mirrors the backend's runSliceIntegration (#4165 —
+// backend/internal/server/runs.go). The json tags MUST stay byte-identical
+// with the backend's. Unexported on the runCapabilities precedent above.
+type runSliceIntegration struct {
+	Available bool   `json:"available" jsonschema:"true when the server has slice-integration authority, so a decomposed parent's acceptance waits for a slices_integrated record covering every child"`
+	Reason    string `json:"reason,omitempty" jsonschema:"why the server has no slice-integration authority (e.g. GitHub not configured, run has no installation_id). Present only when available is false"`
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry
@@ -5035,7 +5054,7 @@ type CriteriaPrecheck struct {
 // SDK's schema reflection sees an object, not a base64 string.
 type RefinementSession struct {
 	SessionID        string               `json:"session_id"`
-	State            string               `json:"state" jsonschema:"awaiting_approval, approved, or rejected (derived)"`
+	State            string               `json:"state" jsonschema:"awaiting_approval, approved, rejected, or filed (derived; filed once the latest revision's filing session has completed)"`
 	Drifted          bool                 `json:"drifted,omitempty" jsonschema:"true when the latest revision's decision pins a content hash that no longer matches (fail-closed to awaiting_approval)"`
 	RevisionCount    int                  `json:"revision_count" jsonschema:"number of draft revisions in the session"`
 	LatestOrigin     string               `json:"latest_origin" jsonschema:"how the latest revision came to exist: brief, amendment, or edit"`
@@ -5044,6 +5063,32 @@ type RefinementSession struct {
 	Waves            [][]int              `json:"waves" jsonschema:"the topological dispatch order as waves of 1-based child ordinals"`
 	CriteriaPrecheck CriteriaPrecheck     `json:"criteria_precheck" jsonschema:"the advisory acceptance-criteria pre-check over the latest draft's children; needs_attention flags an unjustified missing blocking criterion (approval remains legal)"`
 	Decisions        []RefinementDecision `json:"decisions" jsonschema:"the append-only decision history"`
+	// Filing is the latest revision's filing progress (#4153): where the
+	// detached file arm is observed. nil when the revision has no filing
+	// session and no filing is in flight.
+	Filing *RefinementFilingProgress `json:"filing,omitempty" jsonschema:"the latest revision's filing progress — where the detached file arm is observed; absent when nothing has been filed and no filing is in flight"`
+}
+
+// RefinementFilingProgress mirrors the backend's RefinementFilingProgress
+// schema (#4153): the session view's `filing` block. State is in_progress (a
+// detached filing is running in the backend process), failed (the last
+// detached filing stopped; LastError / FailedOrdinal / Step name where),
+// incomplete (a filing session is open but nothing is in flight and no
+// failure is recorded — a restart or another replica), or filed (the filing
+// session completed). Epic / Children are the items recorded so far.
+type RefinementFilingProgress struct {
+	State         string                  `json:"state" jsonschema:"in_progress, failed, incomplete, or filed"`
+	Repo          string                  `json:"repo,omitempty" jsonschema:"the owner/name the filing session pins (or the in-flight filing targets); a resume must name this repo"`
+	InFlight      bool                    `json:"in_flight" jsonschema:"true while a detached filing is running in the backend process"`
+	ChildCount    int                     `json:"child_count" jsonschema:"number of children in the draft"`
+	FiledCount    int                     `json:"filed_count" jsonschema:"items recorded so far, the epic included"`
+	Epic          *RefinementFilingEpic   `json:"epic,omitempty" jsonschema:"the filed epic; absent until it is recorded"`
+	Children      []RefinementFilingChild `json:"children" jsonschema:"the children recorded so far, ordinal ascending"`
+	StartedAt     *time.Time              `json:"started_at,omitempty"`
+	CompletedAt   *time.Time              `json:"completed_at,omitempty"`
+	LastError     string                  `json:"last_error,omitempty" jsonschema:"why the last filing stopped; present when state is failed"`
+	FailedOrdinal *int                    `json:"failed_ordinal,omitempty" jsonschema:"the ordinal the failed filing stopped at (0 is the epic), when the failure names one"`
+	Step          string                  `json:"step,omitempty" jsonschema:"the step the failed filing stopped at: create, reconcile, link, verify, audit, or complete"`
 }
 
 // RefinementFilingEpic mirrors the file response's `epic` sub-object.
@@ -5059,18 +5104,27 @@ type RefinementFilingChild struct {
 	URL     string `json:"url"`
 }
 
-// RefinementFilingResult mirrors the backend's POST .../file 200 body: the
-// outcome of filing an approved draft into tracker items (fresh, resumed, or an
-// already-completed replay). SessionID / DraftID are strings (the #371 trap).
+// RefinementFilingResult mirrors the backend's POST .../file body (#4153). A
+// 202 is a launch (Status filing_in_progress) or a concurrent call that
+// launched nothing (Status already_in_progress, AlreadyInProgress true); its
+// Epic / Children are the items filed so far, and progress is then observed
+// on the session view's Filing block. A 200 is an already-completed session's
+// replay (Status filed, AlreadyCompleted true, no writes). Epic is a pointer
+// because a launch that has recorded nothing yet carries no epic. SessionID /
+// DraftID are strings (the #371 trap).
 type RefinementFilingResult struct {
-	SessionID        string                  `json:"session_id"`
-	DraftID          string                  `json:"draft_id"`
-	Repo             string                  `json:"repo"`
-	Epic             RefinementFilingEpic    `json:"epic"`
-	Children         []RefinementFilingChild `json:"children"`
-	Resumed          bool                    `json:"resumed" jsonschema:"true when this invocation resumed a partially-filed session"`
-	AlreadyCompleted bool                    `json:"already_completed" jsonschema:"true when replaying a fully-completed session (no writes performed)"`
-	Verified         bool                    `json:"verified" jsonschema:"true when the filed epic passed the epic-children + campaign-assembly round-trip"`
+	Status            string                  `json:"status" jsonschema:"filing_in_progress (this call launched the detached filing), already_in_progress (a filing was already in flight; nothing launched), or filed (an already-completed session's replay)"`
+	SessionID         string                  `json:"session_id"`
+	DraftID           string                  `json:"draft_id"`
+	Repo              string                  `json:"repo"`
+	ChildCount        int                     `json:"child_count" jsonschema:"number of children in the draft"`
+	BudgetSeconds     int                     `json:"budget_seconds,omitempty" jsonschema:"the detached filing's budget in seconds; present on a 202"`
+	AlreadyInProgress bool                    `json:"already_in_progress" jsonschema:"true when a filing for the draft was already in flight; nothing new was launched"`
+	Epic              *RefinementFilingEpic   `json:"epic,omitempty" jsonschema:"the epic filed so far (on a replay, the filed epic); absent when unrecorded"`
+	Children          []RefinementFilingChild `json:"children" jsonschema:"the children filed so far (on a replay, every child), ordinal ascending"`
+	Resumed           bool                    `json:"resumed" jsonschema:"true when items were already recorded for the draft"`
+	AlreadyCompleted  bool                    `json:"already_completed" jsonschema:"true when replaying a fully-completed session (no writes performed)"`
+	Verified          bool                    `json:"verified" jsonschema:"always false on this response: verification runs inside the detached filing and is recorded in its completion audit entry"`
 }
 
 // createRefinementSessionRequest mirrors the backend's POST
@@ -5196,24 +5250,29 @@ func (c *apiClient) DecideRefinementSession(ctx context.Context, sessionID uuid.
 	return &out, nil
 }
 
-// FileRefinementSession files an approved, un-drifted draft into tracker items
-// (the epic then children in wave order) via `POST .../file` (E34.3). It is
+// FileRefinementSession launches the filing of an approved, un-drifted draft
+// into tracker items (the epic then children in wave order) via `POST
+// .../file` (E34.3, detached by #4153). The backend checks synchronously and
+// then files on a server-lifetime goroutine, so this call returns at once:
+// 202 status filing_in_progress (launched) or already_in_progress (a filing
+// for the draft is already in flight; nothing launched), observed afterwards
+// on GetRefinementSession's Filing block; or 200 status filed with
+// already_completed for a completed session's replay (no forge calls). It is
 // IDEMPOTENT: the target repo is pinned at first invoke (a re-invoke naming a
-// different repo is 409 refinement_filing_repo_mismatch); a mid-sequence
-// provider failure is 502 refinement_filing_failed with the filed-so-far items
-// + failing ordinal in details, and re-invoking resumes at the first unfiled
-// ordinal; a fully completed session replays as 200 with already_completed.
-// Requires write:approvals (no new scope — the E34.2 precedent). 4xx/5xx
-// surface as *apiError:
+// different repo is 409 refinement_filing_repo_mismatch), and re-invoking
+// after a failed or incomplete filing launches a resume that never re-files a
+// recorded item. Requires write:approvals (no new scope — the E34.2
+// precedent). 4xx/5xx surface as *apiError:
 //   - 400 validation_failed (malformed JSON / unknown fields / non-UUID id /
 //     repo not owner/name)
 //   - 403 insufficient_scope
 //   - 404 refinement_session_not_found
 //   - 409 refinement_not_approved / refinement_draft_drifted /
 //     refinement_filing_repo_mismatch
-//   - 500 internal_error (audit_append_failed on the completion close)
-//   - 502 refinement_filing_failed (resumable) /
-//     refinement_filing_verification_failed
+//   - 500 internal_error (the filing ledger could not be read)
+//   - 502 refinement_filing_failed (the target repo's GitHub App installation
+//     could not be resolved; a mid-sequence failure is no longer a 502 — it
+//     is reported on the session view's Filing block)
 //   - 503 refinement_repo_unconfigured
 func (c *apiClient) FileRefinementSession(ctx context.Context, sessionID uuid.UUID, repo string) (*RefinementFilingResult, error) {
 	body, err := json.Marshal(fileRefinementSessionRequest{Repo: repo})
@@ -5527,6 +5586,12 @@ type RunStageWait struct {
 	FailureCategory *string    `json:"failure_category,omitempty"`
 	FailureReason   *string    `json:"failure_reason,omitempty"`
 	StartedAt       *time.Time `json:"started_at,omitempty"`
+	// EndedAt is the embedded stage shape's `ended_at` (E72.56 / #4072):
+	// fishhawk_await_stage anchors its acceptance verdict hold's in-flight
+	// window on it. The tag MUST byte-match the backend's stageResponse
+	// (server/reads.go) or the field silently decodes to nil (the #371
+	// wire-mirror trap), which degrades the hold to a full window from now.
+	EndedAt *time.Time `json:"ended_at,omitempty"`
 	// Concurrency is the embedded stage shape's `concurrency` block (#3964):
 	// fishhawk_await_stage holds through a settled awaiting_host_dispatch read
 	// while the stage is queued for a slot with a live waiter.

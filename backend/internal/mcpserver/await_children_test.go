@@ -643,6 +643,117 @@ func seedParentImplementStage(fb *fakeBackend, parent uuid.UUID, state string) {
 	}
 }
 
+// seedParentSliceIntegration seeds the decomposed parent's single-run GET with
+// a capabilities.slice_integration block (#4165) — the server gate's own
+// predicate the await's C3 arm keys on. nil seeds a block WITHOUT the key (an
+// older backend).
+func seedParentSliceIntegration(fb *fakeBackend, parent uuid.UUID, si *runSliceIntegration) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[parent] = Run{
+		ID: parent.String(), Repo: "x/y", State: "running",
+		Capabilities: &runCapabilities{ProductFeedbackProviders: []string{}, SliceIntegration: si},
+	}
+}
+
+// TestAwaitChildren_SliceIntegrationReadOnlyOnUncoveredArm pins the cost
+// claim: the parent's single-run GET (capabilities.slice_integration) is read
+// ONLY inside the not-integrated all-terminal arm. A fully integrated fan-out
+// releases children_settled without it.
+func TestAwaitChildren_SliceIntegrationReadOnlyOnUncoveredArm(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	kids := seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "awaiting_children")
+	ids := make([]string, len(kids))
+	for i, k := range kids {
+		ids[i] = k.String()
+	}
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", ids)
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_settled" {
+		t.Fatalf("status = %q, want children_settled", out.Status)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if n := fb.getRunCalledByID[parent]; n != 0 {
+		t.Errorf("parent GET /v0/runs/{id} reads = %d, want 0 on a fully integrated release", n)
+	}
+}
+
+// TestAwaitChildren_ParentReadsFailClosed pins the best-effort direction of the
+// two parent reads the C3 arm takes (#4165): a failed parent stage list or a
+// parent with no implement stage reads "" (never "succeeded"), and a failed
+// parent GET reads nil authority (undecidable, never "unavailable"). Either
+// way an unreadable parent is never read as authority-less.
+func TestAwaitChildren_ParentReadsFailClosed(t *testing.T) {
+	t.Run("stage list error reads empty state", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedParentImplementStage(fb, parent, "succeeded")
+		fb.mu.Lock()
+		fb.stagesStatusByRun[parent] = 500
+		fb.mu.Unlock()
+		if got := r.parentImplementStageState(context.Background(), parent); got != "" {
+			t.Errorf("parentImplementStageState = %q, want \"\" on a read error", got)
+		}
+	})
+	t.Run("no implement stage reads empty state", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		fb.mu.Lock()
+		fb.stagesByRun[parent] = []Stage{{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"}}
+		fb.mu.Unlock()
+		if got := r.parentImplementStageState(context.Background(), parent); got != "" {
+			t.Errorf("parentImplementStageState = %q, want \"\" with no implement stage", got)
+		}
+	})
+	t.Run("parent GET error reads nil authority", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
+		fb.mu.Lock()
+		fb.getStatusByID[parent] = 500
+		fb.mu.Unlock()
+		if got := r.parentSliceIntegration(context.Background(), parent); got != nil {
+			t.Errorf("parentSliceIntegration = %+v, want nil on a read error", got)
+		}
+	})
+	t.Run("authority available + no record + UNREADABLE parent stage -> integration_pending, not the wedge", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+		fb.mu.Lock()
+		fb.stagesStatusByRun[parent] = 500
+		fb.mu.Unlock()
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" || strings.Contains(out.Message, "integrate-wave") {
+			t.Errorf("status = %q message %q, want the ordinary integration_pending (an unreadable parent stage is not the lost-record wedge)", out.Status, out.Message)
+		}
+	})
+}
+
+// TestAwaitChildrenNoAuthorityOutput_EmptyReason pins the defensive arm for an
+// authority block that says unavailable without a reason: the message still
+// states the stand-down and never renders an empty parenthetical.
+func TestAwaitChildrenNoAuthorityOutput_EmptyReason(t *testing.T) {
+	parent := uuid.New()
+	cs := &ChildrenStatus{Total: 1}
+	out := awaitChildrenNoAuthorityOutput(AwaitChildrenOutput{}, parent, cs, "awaiting_children", &runSliceIntegration{Available: false})
+	if !strings.Contains(out.Message, "(unspecified)") || strings.Contains(out.Message, "()") {
+		t.Errorf("message %q must name an unspecified reason", out.Message)
+	}
+}
+
 // seedFanInEntry appends a fan-in audit entry of category to the parent. The
 // payload is a DECODER struct (sliceHeadMissingPayload, …) marshalled through
 // encoding/json, so its keys come from the decoder's own json tags — which the
@@ -804,6 +915,175 @@ func TestAwaitChildren_NoIntegrationAuthority_FallsBackToSettled(t *testing.T) {
 		}
 		if !strings.Contains(out.Message, "no slice-integration authority") {
 			t.Errorf("message %q must say the deployment has no slice-integration authority", out.Message)
+		}
+		// run 671e7f41 low (a): the parent's implement stage already left
+		// awaiting_children, so fishhawk_consolidate_slices would answer 409
+		// not_awaiting_children — next_step reads the PARENT's status instead.
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
+			t.Errorf("next_step = %+v, want fishhawk_get_run_status on the parent %s", out.NextStep, parent)
+		}
+	})
+	t.Run("authority unavailable + parent awaiting_children -> settled with consolidate", func(t *testing.T) {
+		// #4165: the server's own predicate says no authority. Under the
+		// inference alone a parent still awaiting_children would release
+		// integration_pending; only the authority signal settles it, and
+		// consolidate is the right step because it graceful-skips and resolves
+		// an awaiting_children parent.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "awaiting_children")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q, want children_settled (the server reports no integration authority)", out.Status)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_consolidate_slices" || out.NextStep.Params["run_id"] != parent.String() {
+			t.Errorf("next_step = %+v, want fishhawk_consolidate_slices on the awaiting_children parent", out.NextStep)
+		}
+		if !strings.Contains(out.Message, "GitHub not configured") {
+			t.Errorf("message %q must name the server's reason", out.Message)
+		}
+	})
+	t.Run("authority unavailable + PARTIAL record + parent succeeded -> settled", func(t *testing.T) {
+		// A partial record would keep the inference's hold; the server gate
+		// stands down on the predicate alone, so the await must too.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		kids := seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedSlicesIntegrated(t, fb, parent, "fishhawk/run-x", []string{kids[0].String()})
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "run has no installation_id"})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q, want children_settled", out.Status)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
+			t.Errorf("next_step = %+v, want fishhawk_get_run_status on the advanced parent", out.NextStep)
+		}
+		if !strings.Contains(out.Message, "run has no installation_id") {
+			t.Errorf("message %q must name the server's reason", out.Message)
+		}
+	})
+	t.Run("authority AVAILABLE + no record + parent succeeded -> integration_pending naming integrate-wave", func(t *testing.T) {
+		// #4165 wedge: this snapshot IS the inference's positive case, so
+		// without the authority signal it would release children_settled while
+		// the server refuses acceptance 409 acceptance_integration_incomplete.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" {
+			t.Fatalf("status = %q, want integration_pending (authority present, record lost)", out.Status)
+		}
+		if len(out.UnintegratedChildRunIDs) != 4 {
+			t.Errorf("unintegrated_child_run_ids = %v, want all four", out.UnintegratedChildRunIDs)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
+			t.Errorf("next_step = %+v, want fishhawk_get_run_status on the parent", out.NextStep)
+		}
+		for _, want := range []string{"/v0/runs/" + parent.String() + "/integrate-wave", "409 acceptance_integration_incomplete", "not_awaiting_children", "re-invoke fishhawk_await_children"} {
+			if !strings.Contains(out.Message, want) {
+				t.Errorf("message %q missing %q", out.Message, want)
+			}
+		}
+	})
+	t.Run("authority AVAILABLE + no record + parent awaiting_children -> integration_pending with consolidate", func(t *testing.T) {
+		// The fan-in simply has not run yet: the ordinary pending release, not
+		// the lost-record wedge.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "awaiting_children")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" || out.NextStep == nil || out.NextStep.Action != "fishhawk_consolidate_slices" {
+			t.Fatalf("status = %q next_step = %+v, want integration_pending with fishhawk_consolidate_slices", out.Status, out.NextStep)
+		}
+		if strings.Contains(out.Message, "integrate-wave") {
+			t.Errorf("message %q must not name the lost-record recovery before the fan-in ran", out.Message)
+		}
+	})
+	t.Run("multi-implement-stage parent reads the NEWEST implement stage", func(t *testing.T) {
+		// A retried parent carries two implement stages. resolveStage would
+		// error on the ambiguity, the state would read "", and the nil-authority
+		// inference would refuse to fire (integration_pending). Selecting the
+		// newest by Sequence reads succeeded and takes the C3 fallback.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		fb.mu.Lock()
+		fb.stagesByRun[parent] = []Stage{
+			{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: parent.String(), Sequence: 2, Type: "implement", State: "failed"},
+			{ID: uuid.NewString(), RunID: parent.String(), Sequence: 4, Type: "implement", State: "succeeded"},
+		}
+		fb.mu.Unlock()
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q, want children_settled (newest implement stage succeeded)", out.Status)
+		}
+	})
+	t.Run("C1: authority unavailable + failed child blocking a dependent -> child_failed", func(t *testing.T) {
+		// #4178's child_failed arm runs BEFORE the all-terminal arm that hosts
+		// C3, so a no-authority parent with a failed slice and a parked
+		// dependent still releases child_failed — never children_settled.
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+		seedChildWithSlice(fb, b, "pending", "awaiting_host_dispatch", 1, []int{0})
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+		seedParentImplementStage(fb, parent, "awaiting_children")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "child_failed" {
+			t.Fatalf("status = %q, want child_failed (#4178 precedes the C3 fallback)", out.Status)
+		}
+		if len(out.FailedChildRunIDs) != 1 || out.FailedChildRunIDs[0] != a.String() {
+			t.Errorf("failed_child_run_ids = %v, want [%s]", out.FailedChildRunIDs, a)
+		}
+	})
+	t.Run("C1: authority unavailable + all terminal with a failed child -> children_failed", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+		seedChildWithSlice(fb, b, "failed", "failed", 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_failed" {
+			t.Fatalf("status = %q, want children_failed (a failed child is never settled by C3)", out.Status)
 		}
 	})
 	t.Run("no record + parent still awaiting_children -> integration_pending", func(t *testing.T) {

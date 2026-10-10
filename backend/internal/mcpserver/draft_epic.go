@@ -2,7 +2,6 @@ package mcpserver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -73,7 +72,7 @@ type DraftEpicInput struct {
 // unrelated lifecycles). Every session-view arm returns at least one entry so
 // the operator never guesses the next verb.
 type SessionGuidance struct {
-	State     string            `json:"state" jsonschema:"the derived session state this guidance is for (awaiting_approval, approved, rejected, drifted, filed)"`
+	State     string            `json:"state" jsonschema:"the derived session state this guidance is for (awaiting_approval, approved, rejected, drifted, filing_in_progress, filing_failed, filing_incomplete, filed)"`
 	Arm       string            `json:"arm" jsonschema:"the fishhawk_draft_epic arm to invoke next, or 'terminal' when the session is complete"`
 	Arguments map[string]string `json:"arguments,omitempty" jsonschema:"the arguments to pass to that arm; values naming a field describe what to supply"`
 	Reason    string            `json:"reason" jsonschema:"one-line why-this-now"`
@@ -85,7 +84,7 @@ type SessionGuidance struct {
 // SessionGuidance always names the next invocation for the derived state.
 type DraftEpicOutput struct {
 	Session         *RefinementSession      `json:"session,omitempty" jsonschema:"the session view (state, drifted, revision_count, latest_origin, latest_draft, preview, waves, criteria_precheck, decisions) for the open/preview/edit/decide arms"`
-	Filing          *RefinementFilingResult `json:"filing,omitempty" jsonschema:"the filing result (epic + children numbers/urls, resumed, already_completed, verified) for the file arm"`
+	Filing          *RefinementFilingResult `json:"filing,omitempty" jsonschema:"the file arm's result: status (filing_in_progress, already_in_progress, or filed), the epic + children filed so far, child_count, budget_seconds, already_in_progress, resumed, already_completed"`
 	SessionGuidance []SessionGuidance       `json:"session_guidance" jsonschema:"the legal next fishhawk_draft_epic moves for the current derived state, first is the suggested default"`
 }
 
@@ -129,29 +128,45 @@ It wraps five mutually-exclusive arms, exactly one populated per call:
 - preview: session_id (alone)                      -> reads the current draft + derived approval state
 - edit:    session_id + (brief_amendment | draft)  -> appends a new revision (agent re-draft, or a direct EpicDraft edit); either re-gates the session to awaiting_approval
 - decide:  session_id + decision + reason          -> approves or rejects the latest revision (reason required)
-- file:    session_id + repo                        -> files the approved, un-drifted draft into the tracker (idempotent; the repo is pinned at first invoke)
+- file:    session_id + repo                        -> launches filing of the approved, un-drifted draft into the tracker (detached and idempotent; the repo is pinned at first invoke)
 
 Arm dispatch fails closed with NO HTTP call when zero arms or an illegal
 combination is populated, and the error enumerates the legal combinations.
 
 Every arm returns the session view (state, drifted, revision_count,
-latest_origin, latest_draft, preview, waves, criteria_precheck, decisions), or —
-for the file arm — the filing result (epic/children numbers + urls, resumed,
-already_completed, verified). criteria_precheck is the E34.5 advisory
-acceptance-criteria screen over the draft's children: a child flagged
-no_blocking_criterion sets needs_attention (approval remains legal). Each result
-also carries session_guidance: the exact next fishhawk_draft_epic arm +
-arguments for the derived state (awaiting_approval -> decide, naming any
+latest_origin, latest_draft, preview, waves, criteria_precheck, decisions,
+filing), or — for the file arm — the filing result (status, the epic/children
+filed so far, child_count, budget_seconds, already_in_progress, resumed,
+already_completed). criteria_precheck is the E34.5 advisory acceptance-criteria
+screen over the draft's children: a child flagged no_blocking_criterion sets
+needs_attention (approval remains legal).
+
+The file arm is DETACHED: the backend checks the gate synchronously, then files
+in the background and returns at once with status filing_in_progress (or
+already_in_progress when a filing for the draft is already running — nothing
+new is launched), so a long filing can no longer time out mid-sequence. Watch it
+with the preview arm: the session's filing block reports in_progress, failed
+(last_error, failed_ordinal, step), incomplete (a filing session is open but
+nothing is running — a backend restart), or filed, with the items filed so far;
+the session state becomes filed once it completes. After failed or incomplete,
+re-invoke the file arm with the SAME repo: it resumes without re-filing a
+recorded item. A completed session's file arm replays status filed with
+already_completed (no writes).
+
+Each result also carries session_guidance: the exact next fishhawk_draft_epic
+arm + arguments for the derived state (awaiting_approval -> decide, naming any
 criteria-flagged child ordinals; rejected -> re-draft via brief_amendment or a
 direct draft edit; approved -> file; drifted -> re-decide the latest revision;
-filed -> terminal), so you never guess the next verb.
+filing in progress -> preview; filing failed or incomplete -> file with the
+pinned repo; filed -> terminal), so you never guess the next verb.
 
 Tool errors surface the backend code verbatim: amendment_budget_exhausted (the
 per-session brief-amendment budget of 3 is spent — switch to a direct draft
 edit), decision_already_recorded (re-gate by EDITING, never decide twice),
 refinement_not_approved (approve before filing), refinement_draft_drifted
-(re-decide the latest revision), refinement_filing_repo_mismatch,
-refinement_filing_failed (resumable — re-invoke the file arm with the SAME
+(re-decide the latest revision), refinement_filing_repo_mismatch (re-invoke
+with the pinned repo), refinement_filing_failed (the filing could not be
+started — nothing was launched; fix the cause and re-invoke with the SAME
 repo), refinement_session_not_found, refinement_repo_unconfigured,
 refinement_drafting_unavailable / refinement_drafting_failed.
 `),
@@ -294,10 +309,14 @@ func (r *runResolver) draftEpicFile(ctx context.Context, sessionID uuid.UUID, re
 			case "refinement_draft_drifted":
 				return nil, DraftEpicOutput{}, fmt.Errorf("file refinement draft: %w: the approved content drifted (an edit landed after approval) — re-decide the latest revision (session_id + decision + reason), then re-invoke the file arm", err)
 			case "refinement_filing_failed":
-				// Filing is idempotent and resumable: the items filed so far are
-				// durable, and a re-invoke resumes at the first unfiled ordinal and
-				// never re-files a recorded one. The repo is pinned at first invoke.
-				return nil, DraftEpicOutput{}, fmt.Errorf("file refinement draft: %w: filing is resumable — re-invoke the file arm with the SAME repo %q; it resumes at the first unfiled ordinal and never re-files a recorded item%s", err, repo, filedSoFarDetail(ae))
+				// Since the file arm detached (#4153) this is a SYNCHRONOUS refusal
+				// to start (e.g. the target repo's GitHub App installation could
+				// not be resolved): nothing was launched. A mid-sequence failure
+				// is no longer an error here — it surfaces on the preview arm's
+				// filing block. Filing is idempotent, so a re-invoke with the
+				// pinned repo never re-files a recorded item. The backend's
+				// details (the underlying error) ride the wrapped apiError.
+				return nil, DraftEpicOutput{}, fmt.Errorf("file refinement draft: %w: the backend could not start the filing, so nothing was launched — fix the cause, then re-invoke the file arm with the SAME repo %q; filing is idempotent and never re-files a recorded item", err, repo)
 			}
 		}
 		return nil, DraftEpicOutput{}, fmt.Errorf("file refinement draft: %w", err)
@@ -305,27 +324,40 @@ func (r *runResolver) draftEpicFile(ctx context.Context, sessionID uuid.UUID, re
 	return nil, DraftEpicOutput{Filing: fr, SessionGuidance: guidanceForFiling(fr)}, nil
 }
 
-// filedSoFarDetail renders the 502 refinement_filing_failed details (the
-// failing ordinal and the items filed so far) so a resuming caller sees exactly
-// what already landed. Empty when the backend supplied no details.
-func filedSoFarDetail(ae *apiError) string {
-	if len(ae.Details) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(ae.Details)
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf(" (filed so far: %s)", string(b))
-}
+// The file response statuses and the session view's filing.state values
+// (#4153), mirrored from backend/internal/server/refinement_file.go.
+const (
+	refinementFilingStatusInProgress        = "filing_in_progress"
+	refinementFilingStatusAlreadyInProgress = "already_in_progress"
+
+	refinementFilingStateInProgress = "in_progress"
+	refinementFilingStateFailed     = "failed"
+	refinementFilingStateIncomplete = "incomplete"
+	refinementFilingStateFiled      = "filed"
+)
 
 // guidanceForSession maps a session's DERIVED state onto the legal next
-// fishhawk_draft_epic arm(s). drifted takes precedence over the derived state
-// (it fail-closes back to awaiting_approval, so a stale approval must be
-// re-decided). Every non-terminal state names at least one arm.
+// fishhawk_draft_epic arm(s). A filed session is terminal. drifted then takes
+// precedence (it fail-closes back to awaiting_approval, so a stale approval
+// must be re-decided, and the file arm would refuse it). Next the filing
+// block (#4153): a filing in progress routes to the preview arm, a failed or
+// incomplete one to the file arm with the PINNED repo. Every non-terminal
+// state names at least one arm.
 func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 	if sess == nil {
 		return nil
+	}
+	if sess.State == refinementFilingStateFiled || (sess.Filing != nil && sess.Filing.State == refinementFilingStateFiled) {
+		var args map[string]string
+		if sess.Filing != nil {
+			args = filedCoordinates(sess.Filing.Epic, sess.Filing.Children)
+		}
+		return []SessionGuidance{{
+			State:     "filed",
+			Arm:       "terminal",
+			Arguments: args,
+			Reason:    "the approved draft is filed — the session is complete",
+		}}
 	}
 	if sess.Drifted {
 		return []SessionGuidance{{
@@ -334,6 +366,9 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 			Arguments: map[string]string{"session_id": sess.SessionID, "decision": "approved|rejected", "reason": "why"},
 			Reason:    "the latest revision's approval pins a content hash that no longer matches (an edit landed after approval); fail-closed to awaiting_approval — re-decide the latest revision",
 		}}
+	}
+	if g := guidanceForFilingProgress(sess.SessionID, sess.Filing); g != nil {
+		return g
 	}
 	switch sess.State {
 	case "approved":
@@ -405,18 +440,104 @@ func formatOrdinals(ordinals []int) string {
 	return "children " + strings.Join(parts, ", ")
 }
 
-// guidanceForFiling names the terminal 'filed' guidance for a successful file
-// arm (fresh, resumed, or an already_completed replay) — the session is
-// complete; there is no next arm to suggest, only the filed coordinates.
+// guidanceForFilingProgress maps the session view's filing block onto the
+// next arm (#4153): in_progress -> preview (the detached filing is running;
+// re-invoking would only return already_in_progress), failed / incomplete ->
+// file with the PINNED repo (a re-invoke launches a resume that never re-files
+// a recorded item). nil when there is no filing block or its state needs no
+// filing-specific move (filed is handled by the caller; an unknown state falls
+// through to the approval-state guidance).
+func guidanceForFilingProgress(sessionID string, f *RefinementFilingProgress) []SessionGuidance {
+	if f == nil {
+		return nil
+	}
+	repo := f.Repo
+	if repo == "" {
+		repo = "owner/name"
+	}
+	switch f.State {
+	case refinementFilingStateInProgress:
+		return []SessionGuidance{{
+			State:     "filing_in_progress",
+			Arm:       "preview",
+			Arguments: map[string]string{"session_id": sessionID},
+			Reason: fmt.Sprintf("the filing into %s is running in the background (%d of %d items recorded) — re-read the session with the preview arm until filing.state leaves in_progress; do not re-invoke the file arm while it runs",
+				repo, f.FiledCount, f.ChildCount+1),
+		}}
+	case refinementFilingStateFailed:
+		return []SessionGuidance{{
+			State:     "filing_failed",
+			Arm:       "file",
+			Arguments: map[string]string{"session_id": sessionID, "repo": repo},
+			Reason: fmt.Sprintf("the last filing stopped%s: %s — the %d recorded item(s) are durable; re-invoke the file arm with the SAME repo %s to resume (it never re-files a recorded item)",
+				failurePoint(f), f.LastError, f.FiledCount, repo),
+		}}
+	case refinementFilingStateIncomplete:
+		return []SessionGuidance{{
+			State:     "filing_incomplete",
+			Arm:       "file",
+			Arguments: map[string]string{"session_id": sessionID, "repo": repo},
+			Reason: fmt.Sprintf("a filing into %s is open with %d of %d items recorded but nothing is running (e.g. the backend restarted) — re-invoke the file arm with the SAME repo to resume (it never re-files a recorded item)",
+				repo, f.FiledCount, f.ChildCount+1),
+		}}
+	}
+	return nil
+}
+
+// failurePoint renders where a failed filing stopped (" at step link,
+// ordinal 3"), or "" when the failure names neither.
+func failurePoint(f *RefinementFilingProgress) string {
+	var parts []string
+	if f.Step != "" {
+		parts = append(parts, "step "+f.Step)
+	}
+	if f.FailedOrdinal != nil {
+		parts = append(parts, fmt.Sprintf("ordinal %d", *f.FailedOrdinal))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " at " + strings.Join(parts, ", ")
+}
+
+// filedCoordinates renders the filed epic + children as guidance arguments
+// (epic, child_<ordinal>). nil when nothing is recorded.
+func filedCoordinates(epic *RefinementFilingEpic, children []RefinementFilingChild) map[string]string {
+	if epic == nil && len(children) == 0 {
+		return nil
+	}
+	args := make(map[string]string, len(children)+1)
+	if epic != nil {
+		args["epic"] = fmt.Sprintf("#%d %s", epic.Number, epic.URL)
+	}
+	for _, c := range children {
+		args[fmt.Sprintf("child_%d", c.Ordinal)] = fmt.Sprintf("#%d %s", c.Number, c.URL)
+	}
+	return args
+}
+
+// guidanceForFiling maps the file arm's result onto the next arm. A launch
+// (filing_in_progress) or a concurrent call (already_in_progress) routes to
+// the preview arm, where the detached filing's progress is observed (#4153).
+// Anything else — a completed session's replay (status filed,
+// already_completed), or a pre-#4153 backend's synchronous 200 that carries
+// no status — is terminal: the session is complete.
 func guidanceForFiling(fr *RefinementFilingResult) []SessionGuidance {
 	if fr == nil {
 		return nil
 	}
-	args := map[string]string{
-		"epic": fmt.Sprintf("#%d %s", fr.Epic.Number, fr.Epic.URL),
-	}
-	for _, c := range fr.Children {
-		args[fmt.Sprintf("child_%d", c.Ordinal)] = fmt.Sprintf("#%d %s", c.Number, c.URL)
+	if fr.AlreadyInProgress || fr.Status == refinementFilingStatusInProgress || fr.Status == refinementFilingStatusAlreadyInProgress {
+		reason := fmt.Sprintf("the filing into %s was launched in the background (budget %ds) — re-read the session with the preview arm and follow its filing block; do not re-invoke the file arm while it runs",
+			fr.Repo, fr.BudgetSeconds)
+		if fr.AlreadyInProgress || fr.Status == refinementFilingStatusAlreadyInProgress {
+			reason = fmt.Sprintf("a filing into %s is already running; nothing new was launched — re-read the session with the preview arm and follow its filing block", fr.Repo)
+		}
+		return []SessionGuidance{{
+			State:     "filing_in_progress",
+			Arm:       "preview",
+			Arguments: map[string]string{"session_id": fr.SessionID},
+			Reason:    reason,
+		}}
 	}
 	reason := "the approved draft was filed — the session is complete"
 	if fr.AlreadyCompleted {
@@ -427,7 +548,7 @@ func guidanceForFiling(fr *RefinementFilingResult) []SessionGuidance {
 	return []SessionGuidance{{
 		State:     "filed",
 		Arm:       "terminal",
-		Arguments: args,
+		Arguments: filedCoordinates(fr.Epic, fr.Children),
 		Reason:    reason,
 	}}
 }

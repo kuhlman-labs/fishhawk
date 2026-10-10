@@ -909,3 +909,20 @@ Lists every NON-terminal (`pending`/`running`) decomposition child whose parent 
 - **Parent stages settle on the next sweeper tick.** The child-completion sweeper never reads the parent run state, so once `--apply` makes every child of a cancelled parent terminal, the first sweeper tick after it settles each affected parent's `awaiting_children` implement stage `failed`-C with one `children_settled` row (its `Advance` no-ops on the cancelled run). See `backend/internal/childcompletion/README.md`.
 
 Core: `backend/internal/childcancel` (`FindOrphans` + `Reconcile`). Tests: `reconcile_children_test.go` (`TestReconcileOrphanChildren_DryRunThenApply` end to end over pgtest).
+
+## `sweep-stale-runs`: reconcile stale non-terminal top-level runs (#4185)
+
+```sh
+fishhawkd sweep-stale-runs [--db <url>] [--days 14] [--apply] [--cancel-unobserved-pr]
+```
+
+Classifies every `pending`/`running` run with NO decomposition parent whose last activity — max(`run.updated_at`, every `stage.updated_at`, the newest audit entry), over the run and every decomposition child it has — is older than `--days` (default 14), and prints one line per candidate: `run=<id> state=<s> class=<c> action=<a> target=<t|-> last_activity=<RFC3339> stages=<type:state,...> pr=<merged|closed|opened|none> [pr_url=<url>]`. Classes, first match wins: `fresh` and `live_runner` (skipped), `stages_settled` (reconciled to the run's `completeRun` target), `merged` (delegated: a `remedy: fishhawk_reconcile_merge / POST /v0/runs/<id>/reconcile-merge` line, no transition), `pr_closed` (cancelled), `pr_unobserved` (skipped with a remedy line unless `--cancel-unobserved-pr`), `abandoned` (cancelled). Scans every tenant. `--db` falls back to `FISHHAWKD_DATABASE_URL`. Contract, precedence and payload: `backend/internal/stalesweep/README.md`.
+
+- **Operator order.** Run `fishhawkd reconcile-orphan-children --apply` FIRST (decomposition children are out of this sweep's scope), then `sweep-stale-runs` (dry run, read it, then `--apply`). Re-run until it reports `re-run with --apply to transition 0`.
+- **Dry run is the default** and writes nothing: it ends with `dry-run: N candidate(s): fresh=… live_runner=… stages_settled=… merged=… pr_closed=… pr_unobserved=… abandoned=…; re-run with --apply to transition M`.
+- **`--apply`** transitions each eligible run through the run state machine (`pending → succeeded` walks via `running`); a cancelled run also gets its non-terminal stages CAS-cancelled and its decomposition children cascaded (`cancel_source: stale_sweep`). Each transitioned run gets ONE system-actor `stale_run_swept` row, deduped per run. It prints `applied run=<id> class=… outcome=… from=… to=… path=… stages_cancelled=N children_cancelled=N [error=…]` per run and an `applied: N run(s): transitioned=… skipped_terminal=… skipped_changed=… failed=… errors=…` summary. A second `--apply` transitions 0.
+- **Live-runner probe; `--apply` fails closed.** The sweep shells `ps -axww -o pid=,args=` and skips any run a live `fishhawk-runner … --run-id <uuid>` process carries, or whose decomposition child one carries. If `ps` is unavailable (the distroless fishhawkd image has none) or a live runner carries no attributable `--run-id` (including the single-token `--run-id=<id>` form), a dry run prints a `runner-probe:` warning and `--apply` exits 1 BEFORE any write. Run it from the host that runs the runners, with database access.
+- **Role.** `runs` and `audit_entries` are FORCE row-level secured (migration 0057) and the command sets no `app.account_id`: run it as a superuser or `BYPASSRLS` role, or it silently under-sweeps runs and misses audit evidence (which can misclassify a run as `abandoned`).
+- **Exit codes:** `0` success (including the dry run; delegated and skipped runs never fail it), `1` a connect or scan failure, an `--apply` refusal (probe failure / unattributed runner), or any run that failed to transition or transitioned with a cascade/append error, `2` a usage error (including `--days` < 1).
+
+Core: `backend/internal/stalesweep` (`Find` + `Apply`). Tests: `sweep_stale_runs_test.go` (`TestSweepStaleRuns_DryRunThenApply` end to end over pgtest).

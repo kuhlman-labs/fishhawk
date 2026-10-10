@@ -114,6 +114,33 @@ type refinementSessionView struct {
 	// still approve.
 	CriteriaPrecheck refinement.CriteriaPrecheck `json:"criteria_precheck"`
 	Decisions        []refinementDecisionView    `json:"decisions"`
+	// Filing is the latest revision's filing progress (#4153): the detached
+	// file arm's observable state. Omitted when no filing session exists for
+	// the latest revision and none is in flight. When the filing session has
+	// completed, State is "filed".
+	Filing *refinementFilingView `json:"filing,omitempty"`
+}
+
+// refinementFilingView is the session view's filing block (#4153). State is
+// in_progress (a detached filing is running in this process), failed (the
+// last detached filing in this process stopped; LastError / FailedOrdinal /
+// Step name where), incomplete (a filing session is open but nothing is in
+// flight here and no failure is recorded — e.g. after a restart or on another
+// replica), or filed (completed_at is set). Epic / Children are the items
+// filed so far, read from the durable ledger.
+type refinementFilingView struct {
+	State         string                     `json:"state"`
+	Repo          string                     `json:"repo,omitempty"`
+	InFlight      bool                       `json:"in_flight"`
+	ChildCount    int                        `json:"child_count"`
+	FiledCount    int                        `json:"filed_count"`
+	Epic          *refinementFiledEpicView   `json:"epic,omitempty"`
+	Children      []refinementFiledChildView `json:"children"`
+	StartedAt     *time.Time                 `json:"started_at,omitempty"`
+	CompletedAt   *time.Time                 `json:"completed_at,omitempty"`
+	LastError     string                     `json:"last_error,omitempty"`
+	FailedOrdinal *int                       `json:"failed_ordinal,omitempty"`
+	Step          string                     `json:"step,omitempty"`
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -640,6 +667,14 @@ func countRefinementAmendments(drafts []*refinement.StoredDraft) int {
 // refinement session is not a run). ActorUser + the auth subject. Returns the
 // append error so the caller can fail the request BEFORE persisting.
 func (s *Server) appendRefinementAudit(r *http.Request, category string, payload map[string]any) error {
+	return s.appendRefinementAuditCtx(r.Context(), category, payload)
+}
+
+// appendRefinementAuditCtx is appendRefinementAudit over a context rather than
+// a request: the actor subject and account are read from ctx's identity value,
+// so the detached refinement filing (#4153), whose context keeps the request's
+// values without its cancellation, appends under the filing caller's identity.
+func (s *Server) appendRefinementAuditCtx(ctx context.Context, category string, payload map[string]any) error {
 	if s.cfg.AuditRepo == nil {
 		return errors.New("audit repository not configured")
 	}
@@ -648,18 +683,18 @@ func (s *Server) appendRefinementAudit(r *http.Request, category string, payload
 		return err
 	}
 	userKind := audit.ActorUser
-	subject := IdentityFrom(r.Context()).Subject
+	subject := IdentityFrom(ctx).Subject
 	var subjectPtr *string
 	if subject != "" {
 		subjectPtr = &subject
 	}
-	_, err = s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+	_, err = s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
 		Timestamp:    time.Now().UTC(),
 		Category:     category,
 		ActorKind:    &userKind,
 		ActorSubject: subjectPtr,
 		Payload:      body,
-		AccountID:    identityAccountID(r.Context()),
+		AccountID:    identityAccountID(ctx),
 	})
 	return err
 }
@@ -701,9 +736,20 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	filing, err := s.refinementFilingProgress(r.Context(), latest)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not load the filing progress", map[string]any{"error": err.Error()})
+		return
+	}
+	state := string(res.State)
+	if filing != nil && filing.State == refinementFilingStateFiled {
+		state = refinementFilingStateFiled
+	}
+
 	view := refinementSessionView{
 		SessionID:        sessionID,
-		State:            string(res.State),
+		State:            state,
 		Drifted:          res.Drifted,
 		RevisionCount:    len(drafts),
 		LatestOrigin:     latest.Origin,
@@ -712,6 +758,7 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 		Waves:            waves,
 		CriteriaPrecheck: refinement.EvaluateDraftCriteria(latest.Draft),
 		Decisions:        make([]refinementDecisionView, 0, len(decisions)),
+		Filing:           filing,
 	}
 	for _, d := range decisions {
 		view.Decisions = append(view.Decisions, refinementDecisionView{
@@ -724,4 +771,59 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 		})
 	}
 	s.writeJSON(w, r, status, view)
+}
+
+// refinementFilingProgress derives the latest revision's filing block from the
+// durable ledger (the filing session + filed items) and the in-process
+// tracker. It returns nil when no filing session exists and the tracker has no
+// entry for the draft (never filed).
+func (s *Server) refinementFilingProgress(ctx context.Context, latest *refinement.StoredDraft) (*refinementFilingView, error) {
+	sess, err := s.cfg.RefinementRepo.GetFilingSession(ctx, latest.ID)
+	switch {
+	case errors.Is(err, refinement.ErrNotFound):
+		sess = nil
+	case err != nil:
+		return nil, err
+	}
+	entry, tracked := s.refinementFiling.snapshot(latest.ID)
+	if sess == nil && !tracked {
+		return nil, nil
+	}
+	view := &refinementFilingView{
+		ChildCount: len(latest.Draft.Children),
+		Children:   []refinementFiledChildView{},
+	}
+	if sess != nil {
+		items, err := s.cfg.RefinementRepo.ListFiledItems(ctx, latest.ID)
+		if err != nil {
+			return nil, err
+		}
+		view.Repo = sess.Repo
+		view.FiledCount = len(items)
+		view.Epic, view.Children = filedItemViews(items)
+		started := sess.CreatedAt
+		view.StartedAt = &started
+		view.CompletedAt = sess.CompletedAt
+	} else {
+		view.Repo = entry.repo
+		if !entry.startedAt.IsZero() {
+			started := entry.startedAt
+			view.StartedAt = &started
+		}
+	}
+	switch {
+	case sess != nil && sess.CompletedAt != nil:
+		view.State = refinementFilingStateFiled
+	case tracked && entry.inFlight:
+		view.State = refinementFilingStateInProgress
+		view.InFlight = true
+	case tracked:
+		view.State = refinementFilingStateFailed
+		view.LastError = entry.lastError
+		view.FailedOrdinal = entry.failedOrdinal
+		view.Step = entry.step
+	default:
+		view.State = refinementFilingStateIncomplete
+	}
+	return view, nil
 }

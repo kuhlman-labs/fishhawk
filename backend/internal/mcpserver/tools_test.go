@@ -133,6 +133,13 @@ type fakeBackend struct {
 	auditStatus     int
 	lastAuditLimit  string
 	auditCalledByID map[uuid.UUID]int
+	// recentAuditFlip, when non-nil, is invoked under fb.mu on every
+	// GET /v0/audit read with (run id, running read count) BEFORE the response
+	// snapshot is taken, so a test can land an audit entry (e.g. the acceptance
+	// verdict the #4072 hold waits for) at a chosen read without wall-clock
+	// sleeps. Mirrors stageWaitFlip; it mutates auditByRun directly (the caller
+	// already holds fb.mu, so it must not re-lock).
+	recentAuditFlip func(runID uuid.UUID, reads int)
 
 	// E19.6 fixtures: per-run audit responses + recorded query
 	// state for the /v0/runs/{id}/audit endpoint. Distinct from
@@ -1952,6 +1959,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		fb.lastAuditLimit = r.URL.Query().Get("limit")
 		fb.auditCalledByID[id]++
+		if fb.recentAuditFlip != nil {
+			fb.recentAuditFlip(id, fb.auditCalledByID[id])
+		}
 		items := fb.auditByRun[id]
 		fb.mu.Unlock()
 		w.WriteHeader(fb.auditStatus)
@@ -17708,6 +17718,56 @@ func TestGetRunStatus_AcceptanceHeldOnPartialIntegration(t *testing.T) {
 		}
 		if out.NextActions == nil || out.NextActions.State != "acceptance_pending" || !offersAcceptanceDispatch(out.NextActions) {
 			t.Fatalf("next_actions = %+v, want acceptance_pending unchanged on a deployment with no integration authority", out.NextActions)
+		}
+	})
+
+	// withSliceIntegration stamps the parent's single-run GET with the server's
+	// capabilities.slice_integration (#4165).
+	withSliceIntegration := func(fb *fakeBackend, parent uuid.UUID, si *runSliceIntegration) {
+		fb.mu.Lock()
+		defer fb.mu.Unlock()
+		row := fb.getRunByID[parent]
+		row.Capabilities = &runCapabilities{ProductFeedbackProviders: []string{}, SliceIntegration: si}
+		fb.getRunByID[parent] = row
+	}
+
+	t.Run("authority present + no record + implement succeeded HOLDS naming integrate-wave", func(t *testing.T) {
+		// #4165: the C3 inference alone reads this snapshot as authority-less
+		// and keeps the dispatch the server refuses 409
+		// acceptance_integration_incomplete. The server's predicate wins.
+		fb, r, parent, _ := setup(t, func(uuid.UUID, uuid.UUID) []string { return nil })
+		withSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != acceptanceHeldIntegrationIncompleteState {
+			t.Fatalf("next_actions = %+v, want state %s", out.NextActions, acceptanceHeldIntegrationIncompleteState)
+		}
+		if offersAcceptanceDispatch(out.NextActions) {
+			t.Errorf("next_actions still offers an acceptance dispatch: %+v", out.NextActions.Actions)
+		}
+		first := out.NextActions.Actions[0]
+		if first.Action != "fishhawk_await_children" {
+			t.Errorf("first action = %+v, want fishhawk_await_children", first)
+		}
+		if want := "/v0/runs/" + parent.String() + "/integrate-wave"; !strings.Contains(first.Reason, want) {
+			t.Errorf("reason %q must name the recovery %s", first.Reason, want)
+		}
+	})
+
+	t.Run("authority absent + PARTIAL record keeps the dispatch", func(t *testing.T) {
+		// The server's predicate says no authority: its gate admits without a
+		// coverage check, so the partial record that would otherwise hold is
+		// irrelevant and the display must not hold either.
+		fb, r, parent, _ := setup(t, func(a, _ uuid.UUID) []string { return []string{a.String()} })
+		withSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "acceptance_pending" || !offersAcceptanceDispatch(out.NextActions) {
+			t.Fatalf("next_actions = %+v, want acceptance_pending with the dispatch kept (server stands down)", out.NextActions)
 		}
 	})
 

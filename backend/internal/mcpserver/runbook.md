@@ -811,6 +811,18 @@ bare terminal state); roll back by hand with `fishhawk deploy rollback <run-id>`
 if the deploy must still be reverted. The handle is shown only in the
 `deploy_rollback` step's `params.rollback_handle`, never in its prose.
 
+**Verdict pending (#4072).** The runner settles the acceptance stage `succeeded`
+with its trace upload and ships the verdict AFTER that, so an empty verdict
+within ~2 minutes of the settle is the verdict IN FLIGHT, not the #1567 hole
+below. `next_actions` names it `acceptance_verdict_pending` (or
+`succeeded_acceptance_verdict_pending` on a succeeded run), and
+`acceptance_stage_wait_status.verdict_pending` is true. Wait rather than retry:
+`fishhawk_await_stage` (stage=acceptance) holds a settled acceptance release
+until the latest attempt's verdict lands and reports it as
+`acceptance_verdict`. If it releases with `verdict_pending: true` (your deadline
+came first, or the audit read could not decide), re-call it. Do NOT
+`fishhawk_retry_stage` and do not merge on `verdict_pending`.
+
 **Settled-outcome-unknown recovery (E31.16 / #1567).** A different failure from
 the paged case: the acceptance stage settled `succeeded` but **no**
 `acceptance_outcome_recorded` verdict shipped at all — the agent emitted a
@@ -918,10 +930,10 @@ The arms and the happy path (brief → draft → preview → edit → approve �
 | Arm | Input | Does |
 |---|---|---|
 | open | `brief` alone | drafts the epic + children, opens a session, returns `awaiting_approval` |
-| preview | `session_id` alone | reads the current draft + derived approval `state` |
+| preview | `session_id` alone | reads the current draft + derived approval `state`, and the `filing` progress block once a filing has started |
 | edit | `session_id` + (`brief_amendment` \| `draft`) | appends a new revision — agent re-draft, or a direct `EpicDraft` field edit |
 | decide | `session_id` + `decision` (`approved`\|`rejected`) + `reason` | records the verdict on the latest revision |
-| file | `session_id` + `repo` | files the approved, un-drifted draft into the tracker |
+| file | `session_id` + `repo` | launches filing of the approved, un-drifted draft into the tracker (detached — returns at once) |
 
 Arm dispatch **fails closed with no HTTP call** when zero arms or an illegal
 combination is populated (e.g. `brief` + `decision`, or both edit arms) — the
@@ -954,13 +966,26 @@ content hash no longer matches: the session view reports `drifted: true` and
 fail-closes to `awaiting_approval`. `session_guidance` says **re-decide the
 latest revision** — a premature `file` arm returns `refinement_draft_drifted`.
 
-**Idempotent filing resume.** The `file` arm pins the target `repo` at first
-invoke (a re-invoke naming a different repo is `refinement_filing_repo_mismatch`).
-A mid-sequence provider failure is `refinement_filing_failed` (502) carrying the
-filed-so-far items + failing ordinal — **re-invoke the `file` arm with the SAME
-repo**; it resumes at the first unfiled ordinal and never re-files a recorded
-one. A fully completed session replays as `already_completed: true` and files
-nothing.
+**Idempotent filing resume (detached, #4153).** The `file` arm no longer files
+on the request: the backend checks the gate synchronously, then files in the
+background and returns `202` with `status: filing_in_progress` (and
+`budget_seconds`) at once, so a long filing cannot time out mid-sequence.
+`session_guidance` then names the **preview** arm: watch the session's
+`filing` block — `in_progress` (with the items filed so far), `failed`
+(`last_error`, `failed_ordinal`, `step`), `incomplete` (a filing session is open
+but nothing is running, e.g. after a backend restart), or `filed`, at which
+point the session `state` is `filed` and the guidance is terminal. A second
+`file` call while a filing is running is `202` `status: already_in_progress`
+(`already_in_progress: true`) and launches nothing — keep polling preview. The
+`repo` is pinned at first invoke (a re-invoke naming a different repo is
+`refinement_filing_repo_mismatch`). **After `failed` or `incomplete`,
+re-invoke the `file` arm with the SAME repo** (the guidance carries it): that
+launches a resume that never re-files a recorded item — each item is recorded
+the moment it is created, and a child created but not yet linked to the epic is
+adopted and linked rather than created again. A `502 refinement_filing_failed`
+now means the filing could not be started at all (nothing was launched); fix
+the cause and re-invoke. A fully completed session replays `status: filed` with
+`already_completed: true` and files nothing.
 
 **Auth.** A write tool requiring `write:approvals` — **no new scope** (the E34.2
 precedent), so the operator token already driving `fishhawk_approve_plan` works
