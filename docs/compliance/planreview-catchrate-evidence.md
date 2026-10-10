@@ -62,6 +62,11 @@ matcher: `backend/internal/agenteval/README.md` § "Corpus authoring").
 
 ## Step 2 — run the arms
 
+Authenticate with exactly one of `FISHHAWKD_ANTHROPIC_API_KEY` or
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth bearer; substitute it for the key in
+any command below). Neither set skips the arm naming both variables; both set
+fails it. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
+
 Dry run (measures and judges against the committed baseline, writes
 nothing):
 

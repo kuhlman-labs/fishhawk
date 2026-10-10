@@ -32,21 +32,18 @@ import (
 // at all. The operator walk is docs/compliance/severity-calibration-evidence.md.
 //
 // Both are DOUBLE-GATED on FISHHAWK_AGENTEVAL_CALIBRATION_LIVE plus
-// FISHHAWKD_ANTHROPIC_API_KEY — the same posture injectionlive_test.go and
-// envelopequalitylive_test.go take.
+// one credential (FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN,
+// exactly one; see livecredential_test.go) — the same posture
+// injectionlive_test.go and envelopequalitylive_test.go take.
 
 // calibrationLiveGate skips unless BOTH env gates are set, with a message
 // naming #3309 and the done-means clauses the skip leaves undecided.
-func calibrationLiveGate(t *testing.T, undecided string) string {
+func calibrationLiveGate(t *testing.T, undecided string) liveCredential {
 	t.Helper()
 	if os.Getenv("FISHHAWK_AGENTEVAL_CALIBRATION_LIVE") == "" {
 		t.Skip("set FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 to run the live severity-calibration arms. Until they run, #3309 " + undecided + " remains UNMEASURED — see docs/compliance/severity-calibration-evidence.md.")
 	}
-	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live severity-calibration arms. #3309 " + undecided + " remains UNMEASURED — see docs/compliance/severity-calibration-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
-	}
-	return apiKey
+	return requireLiveCredential(t, "Skipping the live severity-calibration arms. #3309 "+undecided+" remains UNMEASURED — see docs/compliance/severity-calibration-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
 }
 
 // TestSeverityCalibrationLive is #3309 done-means 2: does the #2119
@@ -64,19 +61,18 @@ func calibrationLiveGate(t *testing.T, undecided string) string {
 // MISSED labelled concern at the maximum tier distance, so a delta computed
 // mostly from penalties measures COVERAGE, not calibration.
 func TestSeverityCalibrationLive(t *testing.T) {
-	apiKey := calibrationLiveGate(t, "acceptance criterion 2 (the severity-calibration delta is measured)")
+	cred := calibrationLiveGate(t, "acceptance criterion 2 (the severity-calibration delta is measured)")
 
 	cases, err := LoadSeverityCalibrationCorpus(severityCalibrationCorpusDir)
 	if err != nil {
 		t.Fatalf("load severity-calibration corpus: %v", err)
 	}
 	ctx := context.Background()
-	generator := anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	generator := anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultQualityGeneratorModel,
 		MaxTokens: 4096,
 		Timeout:   120 * time.Second,
-	})
+	}))
 
 	pre, err := RunSeverityArm(ctx, generator, cases, ArmPreCalibration, DefaultCalibrationSamples)
 	if err != nil {
@@ -117,25 +113,23 @@ func TestSeverityCalibrationLive(t *testing.T) {
 // per-fixture; JudgeRubric decodes strictly and an undecodable card
 // resolves to INDETERMINATE, which is explicitly not a pass.
 func TestAdversarialRetentionLive(t *testing.T) {
-	apiKey := calibrationLiveGate(t, "acceptance criterion 2(b) (adversarial-finding retention) and the criterion 3 revert-or-fix decision it feeds")
+	cred := calibrationLiveGate(t, "acceptance criterion 2(b) (adversarial-finding retention) and the criterion 3 revert-or-fix decision it feeds")
 
 	cases, err := LoadAdversarialRetentionCorpus(adversarialRetentionCorpusDir)
 	if err != nil {
 		t.Fatalf("load adversarial-retention corpus: %v", err)
 	}
 	ctx := context.Background()
-	generator := anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	generator := anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultQualityGeneratorModel,
 		MaxTokens: 4096,
 		Timeout:   120 * time.Second,
-	})
-	judge := NewRubricJudge(anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	}))
+	judge := NewRubricJudge(anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultJudgeModel,
 		MaxTokens: 1024,
 		Timeout:   60 * time.Second,
-	}), DefaultJudgeModel, 2)
+	})), DefaultJudgeModel, 2)
 
 	pre, err := RunRetentionArm(ctx, generator, judge, cases, ArmPreCalibration)
 	if err != nil {

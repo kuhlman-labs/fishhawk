@@ -212,8 +212,9 @@ func TestCalibrateCorpusReplay(t *testing.T) {
 }
 
 // TestCalibrateLive is the opt-in live-model calibration. It is SKIPPED
-// unless BOTH FISHHAWK_AGENTEVAL_JUDGE_LIVE and FISHHAWKD_ANTHROPIC_API_KEY
-// are set, so the committed-tree verify / CI never makes a live model
+// unless BOTH FISHHAWK_AGENTEVAL_JUDGE_LIVE and a credential —
+// FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN (exactly one,
+// see livecredential_test.go) — are set, so the committed-tree verify / CI never makes a live model
 // call. Passing *anthropic.Client where MessageSender is expected is
 // also the compile-time proof the SDK adapter's signature has not
 // drifted from the interface.
@@ -221,13 +222,9 @@ func TestCalibrateLive(t *testing.T) {
 	if os.Getenv("FISHHAWK_AGENTEVAL_JUDGE_LIVE") == "" {
 		t.Skip("set FISHHAWK_AGENTEVAL_JUDGE_LIVE=1 to run the live judge calibration")
 	}
-	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping live judge calibration")
-	}
+	cred := requireLiveCredential(t, "Skipping live judge calibration.")
 
-	client := anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	client := anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultJudgeModel,
 		MaxTokens: 1024,
 		Timeout:   60 * time.Second,
@@ -235,7 +232,7 @@ func TestCalibrateLive(t *testing.T) {
 		// request (#1326), exercising the same output_config.format path the
 		// committed-tree integration test asserts.
 		Schema: JudgeCardSchema(),
-	})
+	}))
 	// Passing *anthropic.Client to NewLLMJudge's MessageSender parameter
 	// is the compile-time proof the SDK adapter's signature still matches.
 	judge := NewLLMJudge(client, DefaultJudgeModel, 2)
