@@ -1,0 +1,14 @@
+id: scenario:issue-4212/doctor-persisted-id-reused
+statement: Without FISHHAWK_HOST_LABEL, and with XDG_STATE_HOME pointing at an empty directory, the first fishhawk_doctor result reports host_label source persisted and creates <dir>/fishhawk/host-id. A second, separately started fishhawk-mcp process reports the same label. A host-id file pre-seeded with a value that differs from the hostname (e.g. pinned-machine-id) is reported verbatim as the label with source persisted, so the hostname is not consulted.
+verify_hint: Two stdio fishhawk-mcp invocations sharing one XDG_STATE_HOME; compare structuredContent.host_label.label across the two MCP tool results and read the host-id file; then overwrite it with pinned-machine-id and re-run the tool. The hermetic deciders are TestResolveHostLabel_PersistedIDStableAcrossHostnames and TestReadOrCreateHostID_NeverOverwritesExisting in hostlabel_test.go.
+steps: 'Used the same stdio fishhawk-mcp build, token and doctor call as doctor-override-wins, with FISHHAWK_HOST_LABEL unset and XDG_STATE_HOME=/tmp/fh4212/xdg1 (an empty directory). (1) First process: called fishhawk_doctor, then read xdg1/fishhawk/host-id. (2) Started a second, separate fishhawk-mcp process with the same XDG_STATE_HOME and called fishhawk_doctor again. (3) Overwrote host-id with ''pinned-machine-id'', started a third process and called fishhawk_doctor.'
+assertions:
+    expected: first call reports source persisted and creates the host-id file; a second process reports the same label; a pre-seeded value is reported verbatim with source persisted
+    observed_at_record: '(1) source persisted, label Mac, path /tmp/fh4212/xdg1/fishhawk/host-id. The file was created (mode 0600) with content ''Mac'', seeded from today''s hostname as approval condition 4 requires. (2) Identical host_label: label Mac, source persisted; the full result bytes hash the same as (1). (3) label pinned-machine-id, source persisted, default_group local-implement:pinned-machine-id; the hostname was not consulted and the file was not rewritten.'
+    repro_handle: python3 -I /tmp/fh4212/scripts/drive.py FISHHAWK_HOST_LABEL=__UNSET__ XDG_STATE_HOME=/tmp/fh4212/xdg1 (x2); printf 'pinned-machine-id\n' > /tmp/fh4212/xdg1/fishhawk/host-id; rerun
+origin:
+    issue: 4212
+    pr: 4231
+    run_id: 3c61f92e-2753-41cc-aff5-a960e2b631db
+    head_sha: e3189599186cb299724fa62d5d7c1a078264c02d
+    recorded_at: 2026-10-10T14:41:59Z

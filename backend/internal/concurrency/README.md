@@ -155,8 +155,8 @@ A queued row counts as "ahead" only while all of these hold: it is fresh
 
 | Constant | Value | Why |
 |---|---|---|
-| `DefaultGroupPrefix` | `local-implement:` | The default group is per host: `local-implement:<host>`. |
-| `UnknownHost` | `unknown` | The host label used when the client sends none (a pre-change MCP). |
+| `DefaultGroupPrefix` | `local-implement:` | The default group is per host: `local-implement:<host>`. The MCP client derives `<host>` in `backend/internal/mcpserver/hostlabel.go` (`FISHHAWK_HOST_LABEL` > persisted host-id > hostname, #4212). |
+| `UnknownHost` | `unknown` | The host label used when the client sends none (a pre-change MCP, or an MCP whose `hostlabel.go` ladder resolved nothing). |
 | `DefaultLimit` / `MaxLimit` | 1 / 64 | One local implement per host by default. 64 matches the 0097 CHECK and the spec bound. |
 | `QueueTTL` | 60s | 12× the waiter poll interval, so a live waiter never goes stale. A dead waiter stops blocking the queue within a minute. |
 | `WaiterPollInterval` | 5s | The cadence of the MCP slot waiter. Also the marker's `Retry-After`. |

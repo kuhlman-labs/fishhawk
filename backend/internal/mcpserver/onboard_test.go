@@ -2205,3 +2205,104 @@ func TestMCPInit_RefusesConnectionInjection(t *testing.T) {
 		t.Errorf("a legitimate gitlab project was refused: %v", err)
 	}
 }
+
+// --- host_label rung (#4212) ---
+
+// TestDoctor_HostLabel_PopulatedAndReportUnchanged: the doctor attaches the
+// locally-resolved host_label rung as a SIBLING of `report`, which stays the
+// byte-mirror of what the backend served.
+func TestDoctor_HostLabel_PopulatedAndReportUnchanged(t *testing.T) {
+	const served = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": true, "installation_id": 4242}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = served
+	r := newResolver(srv, nil)
+	r.api.hostLabel = func() hostLabelResolution {
+		return hostLabelResolution{Label: "doc-pin", Source: hostLabelSourcePersisted, Path: "/state/fishhawk/host-id", Note: "persisted note"}
+	}
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	hl := out.HostLabel
+	if hl == nil {
+		t.Fatal("host_label is absent")
+	}
+	if hl.Label != "doc-pin" || hl.Source != hostLabelSourcePersisted || hl.DefaultGroup != "local-implement:doc-pin" ||
+		hl.Path != "/state/fishhawk/host-id" || hl.Variable != hostLabelEnv || hl.Note != "persisted note" || hl.Remediation != "" {
+		t.Errorf("host_label = %+v, want the injected resolution rendered", hl)
+	}
+
+	var wantReport OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(served), &wantReport); err != nil {
+		t.Fatalf("decode the served body: %v", err)
+	}
+	wantBytes, _ := json.Marshal(wantReport)
+	gotBytes, _ := json.Marshal(out.Report)
+	if string(gotBytes) != string(wantBytes) {
+		t.Errorf("report changed:\n got: %s\nwant: %s", gotBytes, wantBytes)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"host_label":{`) {
+		t.Errorf("DoctorOutput lacks the host_label sibling key:\n%s", encoded)
+	}
+	if strings.Contains(string(gotBytes), "host_label") {
+		t.Errorf("host_label leaked INSIDE report:\n%s", gotBytes)
+	}
+}
+
+// TestHostLabelRung: the stable sources carry no remediation; the volatile
+// ones (hostname, none) name FISHHAWK_HOST_LABEL and the host-id path.
+func TestHostLabelRung(t *testing.T) {
+	for _, tc := range []struct {
+		res             hostLabelResolution
+		wantGroup       string
+		wantRemediation bool
+	}{
+		{hostLabelResolution{Label: "pin", Source: hostLabelSourceOverride}, "local-implement:pin", false},
+		{hostLabelResolution{Label: "Mac", Source: hostLabelSourcePersisted, Path: "/s/host-id"}, "local-implement:Mac", false},
+		{hostLabelResolution{Label: "Mac", Source: hostLabelSourceHostname, Path: "/s/host-id"}, "local-implement:Mac", true},
+		{hostLabelResolution{Source: hostLabelSourceNone, Path: "/s/host-id"}, "local-implement:unknown", true},
+		{hostLabelResolution{Source: hostLabelSourceNone}, "local-implement:unknown", true},
+	} {
+		t.Run(tc.res.Source+"/"+tc.res.Path, func(t *testing.T) {
+			rung := newHostLabelRung(tc.res)
+			if rung.DefaultGroup != tc.wantGroup || rung.Variable != hostLabelEnv || rung.Label != tc.res.Label || rung.Source != tc.res.Source {
+				t.Errorf("rung = %+v, want default_group %s", rung, tc.wantGroup)
+			}
+			if !tc.wantRemediation {
+				if rung.Remediation != "" {
+					t.Errorf("remediation = %q, want none on a stable source", rung.Remediation)
+				}
+				return
+			}
+			if !strings.Contains(rung.Remediation, hostLabelEnv) {
+				t.Errorf("remediation = %q, want it to name %s", rung.Remediation, hostLabelEnv)
+			}
+			if tc.res.Path != "" && !strings.Contains(rung.Remediation, tc.res.Path) {
+				t.Errorf("remediation = %q, want it to name the path %s", rung.Remediation, tc.res.Path)
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesHostLabel: the wire-visible description
+// documents the rung, its override, all four sources and the spec-group
+// exception.
+func TestDoctorToolDescription_DescribesHostLabel(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"host_label", hostLabelEnv, "local-implement:<label>",
+		"override (", "persisted (", "hostname (", "none (",
+		"spec-named concurrency group is repo-scoped",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
