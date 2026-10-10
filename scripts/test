@@ -1434,7 +1434,8 @@ _verify_patch_coverage() {
 # (ten temp-dir fixture cases, no network, no Docker), so it needs no zsh guard.
 # test-site-ia (E12.7 / #2318) pins scripts/check-site-ia, the sidebar<->pages IA
 # gate over site/; same shape (bash, temp-dir fixtures, no network/Docker, no zsh
-# guard), eleven cases including the parser-limitation pin and both fail-opens.
+# guard), twelve cases including the parser-limitation pin, both fail-opens and
+# the #4233 large-list first-line-match pin (c12).
 # test-helm-render (E62.2 / #2301) is the render gate for deploy/helm/fishhawk:
 # it drives the real chart through `helm template`/`helm lint` and asserts on
 # shipped rendered output — the only machine check that the chart's YAML
@@ -1490,6 +1491,11 @@ _verify_patch_coverage() {
 # fishhawk-mcp initialize handshake) back. It is POSIX sh (no zsh guard); the
 # go-absent and dash-absent SKIPs live INSIDE the harness, like
 # test-site-reference's.
+# test-check-pipefail-grep (#4233) pins scripts/check-pipefail-grep, the guard
+# against a pipe into a quiet grep under pipefail, plus this script's
+# _verify_pipefail_grep leg and its place before the --no-tests return; its G13
+# case also EXECUTES every shipped copy of the harnesses' drain helper against a
+# >= 256 KiB first-line match. Bash, temp-dir fixtures, no network/Docker, ~3s.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
@@ -1508,7 +1514,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1599,6 +1605,29 @@ _verify_gate_image_pins() {
   fi
   printf '>>> scripts/check-gate-image\n'
   "$ROOT/scripts/check-gate-image" --root "$ROOT"
+}
+
+# _verify_pipefail_grep: run scripts/check-pipefail-grep over the COMMITTED
+# scripts/ tree (#4233). Under `pipefail`, a pipe into a quiet grep fails when
+# grep exits on its first match while the writer still holds unwritten bytes
+# (EPIPE/SIGPIPE), so an assertion reports a false result once its input
+# outgrows the pipe buffer — the scripts/check-site-ia flake. The guard flags
+# that shape in every pipefail shell script, and a call of the harnesses'
+# drain helper in a file that does not define it (an undefined helper exits
+# 127, so a negated assertion would pass vacuously). It reads files only (no
+# Docker, no network), so it runs before the --no-tests return and in the gate
+# image. Same shape as _verify_adr_records: a missing or non-executable script
+# skips with a reason, which keeps the fixture ROOTs of scripts/test-patch-
+# coverage and scripts/test-in-gate-image from running it. A finding exits 1
+# (a failed scan exits 2) and, under set -e, fails verify. Long form:
+# scripts/README.md § "Pipefail grep guard (#4233)".
+_verify_pipefail_grep() {
+  if [ ! -x "$ROOT/scripts/check-pipefail-grep" ]; then
+    echo "scripts/test: scripts/check-pipefail-grep missing or not executable — skipping the pipefail grep guard" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-pipefail-grep\n'
+  "$ROOT/scripts/check-pipefail-grep" "$ROOT/scripts"
 }
 
 # --------------------------------------------------------------------------
@@ -2131,8 +2160,9 @@ _release_verify_lock() {
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
 # (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop,
 # as are the gate harnesses, the site voice gate (#2261), the site IA gate
-# (E12.7 / #2318), the ADR record gate (E78.1 / #3722), and the gate-image pin
-# check (E51.17 / #3966). `--no-tests` stops right after those legs. The legs
+# (E12.7 / #2318), the ADR record gate (E78.1 / #3722), the gate-image pin
+# check (E51.17 / #3966), and the pipefail grep guard (#4233). `--no-tests`
+# stops right after those legs. The legs
 # stay INLINE here rather than behind a helper: scripts/test-patch-coverage and
 # scripts/test-schema-sync-verify assert their order by reading this function's
 # own body.
@@ -2153,6 +2183,7 @@ cmd_verify() {
   _verify_site_ia
   _verify_adr_records
   _verify_gate_image_pins
+  _verify_pipefail_grep
   # --no-tests (E51.17 / #3966): the legs above need no Docker daemon, so they
   # are what the gate image can run. The test loop below needs testcontainers
   # Postgres, which the image path reaches only with full gate isolation.

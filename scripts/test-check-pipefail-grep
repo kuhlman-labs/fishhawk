@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-pipefail-grep (#4233) and its `scripts/test
+# verify` leg. Drives the REAL script against temp-dir fixtures, one case per
+# detection rule and failure mode, each asserting the exit code AND the named
+# output. House style follows scripts/test-site-ia: PASS/FAIL counters, non-zero
+# exit on any FAIL, no network, no Docker, nothing that depends on uid (the gate
+# image runs as root, so no chmod-000 fixture). Run by `scripts/test verify` via
+# _verify_gate_harnesses, and standalone.
+#
+# SELF-HOSTING (approval condition 1). This file is a pipefail script that the
+# guard scans, so every seeded line is BUILT at runtime: the pipe character comes
+# from $P, the drain helper's name from $GQ and the allow marker from $MARK. The
+# harness's own assertions use here-strings (`has`), never a pipe into grep.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — each run EMPIRICALLY (host: bash 3.2.57, BSD awk): mutate
+# the BODY of the control (or delete only a CALL SITE), run this harness, observe
+# the named case go RED, restore byte-identically (`cmp` against a saved copy).
+# Observed REDs, not reasoned:
+#   CF-1  pipe-rule `if (line ~ ...)` made `if (0 && ...)`  -> G1, G7.1-9, G8a/b RED
+#         ("G1: ... exited 0 (expected 1)")
+#   CF-2  `if (pipefail)` reporting made `if (1)`           -> G2 RED (exit 1)
+#   CF-3  whole-line comment skip deleted                   -> G3 RED (exit 1)
+#   CF-4  `(^|[^|])` anchor dropped from the pipe ERE       -> G4 RED (exit 1)
+#   CF-5  `reason == ""` test made `0`                      -> G6 RED (exit 0)
+#   CF-5b `if (allowed) next` made `if (0)`                 -> G5 and G9b RED (exit 1)
+#   CF-6  undefined-helper findings made `if (0)`           -> G9.1-13 RED (exit 0)
+#   CF-6b command-position prefix dropped from the call ERE -> G9n RED (exit 1,
+#         `echo "the <helper> helper"` read as a call)
+#   CF-7  awk-failure `exit 2` made `:`                     -> G12 RED (exit 0)
+#   CF-8  `cat >/dev/null` deleted from scripts/test-site-voice's helper copy
+#                                                           -> G13 RED: "test-site-
+#         voice's helper (bash) under pipefail: match=141 miss=1"
+#   CF-9  `_verify_pipefail_grep` CALL deleted from cmd_verify -> G15 RED
+#   CF-10 `_verify_pipefail_grep`'s missing-script guard deleted -> G14 RED
+#   CF-11 q made optional in the ERE's flag cluster (`q?`)  -> G7n RED (exit 1;
+#         first attempt hit the header comment's copy of the ERE and stayed green —
+#         a no-op mutation, re-run against the awk line)
+#   CF-12 `exit 1` inserted after the first finding         -> G17 RED
+#   CF-13 missing-dir fail-open block deleted               -> G11 RED (no reason)
+#   CF-14 non-shell `else exit 0` made `else shell = 1`     -> G16 RED (exit 1)
+#   CF-15 `/pipe_?fail/` narrowed to `/pipefail/`           -> G8a, G8b RED (exit 0)
+#   CF-16 definition detection made `if (0)`                -> G7n, G10a, G10b RED
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-pipefail-grep"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+# has <haystack> <needle>: fixed-string membership via a here-string — no writer
+# process, so it cannot EPIPE (the very defect this harness guards against).
+has() { grep -qF -- "$2" <<< "$1"; }
+
+P='|'
+GQ="grep""_q"
+MARK="check-pipefail-grep"": allow"
+SEED="printf x $P grep -q y"
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+out=""
+status=0
+run_check() { # <scripts-dir> [env-prefix PATH]
+  out="$("$CHECK" "$1" 2>&1)"
+  status=$?
+}
+
+# mk <dir> <line>... — write <dir>/s, one argument per line.
+mk() {
+  local d="$1"; shift
+  mkdir -p "$d"
+  printf '%s\n' "$@" > "$d/s"
+}
+
+# expect <case> <want-exit> <needle-or-empty> <description>
+expect() {
+  if [ "$status" -ne "$2" ]; then
+    fail "$1: $4 exited $status (expected $2); output: $out"
+  elif [ -n "$3" ] && ! has "$out" "$3"; then
+    fail "$1: $4 output does not name '$3'; output: $out"
+  else
+    pass "$1: $4"
+  fi
+}
+
+# --- G1: a pipe into grep -q in a pipefail bash script --------------------------
+mk "$tmproot/g1" '#!/usr/bin/env bash' 'set -o pipefail' "$SEED"
+run_check "$tmproot/g1"
+expect G1 1 "$tmproot/g1/s:3: quiet grep at the read end of a pipe" "pipefail script piping into grep -q is flagged at path:line"
+
+# --- G2: the same line WITHOUT pipefail (differs from G1 only on line 2) ---------
+mk "$tmproot/g2" '#!/usr/bin/env bash' 'set -o errexit' "$SEED"
+run_check "$tmproot/g2"
+expect G2 0 "1 shell script(s)" "the same pipe in a script without pipefail is clean"
+
+# --- G3: the seeded text only inside a whole-line comment -----------------------
+mk "$tmproot/g3" '#!/usr/bin/env bash' 'set -o pipefail' "  # $SEED"
+run_check "$tmproot/g3"
+expect G3 0 "1 shell script(s)" "the seed inside a comment is not a finding"
+
+# --- G4: `||` before grep is not a pipe -------------------------------------------
+mk "$tmproot/g4" '#!/usr/bin/env bash' 'set -o pipefail' "true $P$P grep -q y file"
+run_check "$tmproot/g4"
+expect G4 0 "1 shell script(s)" "an || list into grep -q is not a pipe"
+
+# --- G5: a reason-bearing allow marker exempts the line --------------------------
+mk "$tmproot/g5" '#!/usr/bin/env bash' 'set -o pipefail' "$SEED # $MARK fixture seed"
+run_check "$tmproot/g5"
+expect G5 0 "1 shell script(s)" "a reason-bearing allow marker exempts the line"
+
+# --- G6: the same marker with an empty reason is itself a finding ----------------
+mk "$tmproot/g6" '#!/usr/bin/env bash' 'set -o pipefail' "$SEED # $MARK"
+run_check "$tmproot/g6"
+expect G6 1 "$tmproot/g6/s:3: allow marker without a reason" "a reasonless allow marker is a finding"
+
+# --- G7: every quiet-flag spelling is flagged ------------------------------------
+i=0
+for v in "grep -Fxq y" "grep -qE y" "grep -E -q y" "grep --quiet y" "grep --silent y" \
+         "command grep -q y" "egrep -q y" "fgrep -q y" "grep -iq -- y"; do
+  i=$((i + 1))
+  mk "$tmproot/g7-$i" '#!/usr/bin/env bash' 'set -euo pipefail' "printf x $P $v"
+  run_check "$tmproot/g7-$i"
+  expect "G7.$i" 1 "$tmproot/g7-$i/s:3: quiet grep" "'| $v' is flagged"
+done
+
+# --- G7n: a pipe into a NON-quiet grep is clean -----------------------------------
+mk "$tmproot/g7n" '#!/usr/bin/env bash' 'set -o pipefail' \
+  "printf x $P grep -c y" "printf x $P grep -Fv y" "printf x $P grep -o -- y" "printf x $P $GQ -F y"
+printf '%s\n' "$GQ() { local rc=0; grep -q \"\$@\" || rc=\$?; cat >/dev/null; return \"\$rc\"; }" >> "$tmproot/g7n/s"
+run_check "$tmproot/g7n"
+expect G7n 0 "1 shell script(s)" "pipes into grep -c / -Fv / -o and into a defined drain helper are clean"
+
+# --- G8: zsh enabling pipefail only through setopt, both letter cases -------------
+mk "$tmproot/g8a" '#!/usr/bin/env zsh' 'setopt pipe_fail' "$SEED"
+run_check "$tmproot/g8a"
+expect G8a 1 "$tmproot/g8a/s:3: quiet grep" "zsh 'setopt pipe_fail' enables the pipe rule"
+mk "$tmproot/g8b" '#!/bin/zsh' 'setopt PIPE_FAIL' "$SEED"
+run_check "$tmproot/g8b"
+expect G8b 1 "$tmproot/g8b/s:3: quiet grep" "zsh 'setopt PIPE_FAIL' enables the pipe rule"
+
+# --- G9: a drain-helper CALL with no definition, in every command position --------
+# No pipefail and no quiet-grep pipe in these fixtures, so only the
+# undefined-helper rule can produce exit 1.
+i=0
+for v in "$GQ -F y < f" "printf x $P $GQ -F y" "false $P$P $GQ -F y" "if ! $GQ -F y < f; then :; fi" \
+         "true && $GQ -F y < f" "true; $GQ -F y < f" "x=\$($GQ -F y < f)" "( $GQ -F y < f )" \
+         "if true; then $GQ -F y < f; fi" "for i in 1; do $GQ -F y < f; done" "{ $GQ -F y < f; }" \
+         "if $GQ -F y < f; then :; fi" "true & $GQ -F y < f"; do
+  i=$((i + 1))
+  mk "$tmproot/g9-$i" '#!/usr/bin/env bash' 'set -o errexit' "$v"
+  run_check "$tmproot/g9-$i"
+  expect "G9.$i" 1 "$tmproot/g9-$i/s:3: $GQ called but not defined in this file" "an undefined helper called as '$v' is flagged"
+done
+
+# --- G9n: mentions that are NOT command-position calls are clean -------------------
+mk "$tmproot/g9n" '#!/usr/bin/env bash' 'set -o errexit' \
+  "echo \"the $GQ helper\"" "name=$GQ" "my$GQ -F y < f" "${GQ}x -F y < f" "echo \$$GQ"
+run_check "$tmproot/g9n"
+expect G9n 0 "1 shell script(s)" "a substring, assignment or string mention is not a call"
+
+# --- G9b: the allow marker also covers the undefined-helper rule -------------------
+mk "$tmproot/g9b" '#!/usr/bin/env bash' 'set -o pipefail' "printf x $P $GQ -F y # $MARK defined in a sourced file"
+run_check "$tmproot/g9b"
+expect G9b 0 "1 shell script(s)" "a reason-bearing allow marker exempts an undefined-helper call"
+
+# --- G10: a file that defines and calls the helper is clean (both forms) -----------
+mk "$tmproot/g10a" '#!/usr/bin/env bash' 'set -euo pipefail' \
+  "$GQ() { local rc=0; grep -q \"\$@\" || rc=\$?; cat >/dev/null; return \"\$rc\"; }" \
+  "if ! printf x $P $GQ -F y; then :; fi"
+run_check "$tmproot/g10a"
+expect G10a 0 "1 shell script(s)" "a 'name() {' definition satisfies the undefined-helper rule"
+mk "$tmproot/g10b" '#!/usr/bin/env zsh' 'setopt pipe_fail' \
+  "printf x $P $GQ -F y" "function $GQ {" '  local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"' '}'
+run_check "$tmproot/g10b"
+expect G10b 0 "1 shell script(s)" "a 'function name' definition AFTER the call satisfies the rule"
+
+# --- G11: a missing SCRIPTS_DIR fails open with a reason ---------------------------
+run_check "$tmproot/does-not-exist"
+expect G11 0 "does not exist — nothing to check" "a missing scripts dir exits 0 with a printed reason"
+
+# --- G12: a failed awk scan fails CLOSED (exit 2) ----------------------------------
+mkdir -p "$tmproot/stubawk"
+printf '#!/bin/sh\nexit 3\n' > "$tmproot/stubawk/awk"
+chmod +x "$tmproot/stubawk/awk"
+mk "$tmproot/g12" '#!/usr/bin/env bash' 'echo clean'
+out="$(PATH="$tmproot/stubawk:$PATH" "$CHECK" "$tmproot/g12" 2>&1)"
+status=$?
+expect G12 2 "refusing to report a clean tree" "an awk that exits 3 makes the scan exit 2"
+
+# --- G16: a non-shell shebang is skipped -------------------------------------------
+mkdir -p "$tmproot/g16"
+printf '%s\n' '#!/usr/bin/env python3' 'set -o pipefail' "$SEED" > "$tmproot/g16/tool"
+printf '%s\n' '# notes' 'set -o pipefail' "$SEED" > "$tmproot/g16/README.md"
+run_check "$tmproot/g16"
+expect G16 0 "0 shell script(s)" "python and shebang-less files are not scanned"
+
+# --- G17: every finding is reported before the single exit -------------------------
+mkdir -p "$tmproot/g17"
+printf '%s\n' '#!/bin/sh' 'set -o pipefail' "$SEED" > "$tmproot/g17/a"
+printf '%s\n' '#!/bin/bash' 'set -o pipefail' 'true' "$SEED" > "$tmproot/g17/b"
+run_check "$tmproot/g17"
+if [ "$status" -eq 1 ] && has "$out" "$tmproot/g17/a:3:" && has "$out" "$tmproot/g17/b:4:" \
+   && has "$out" "2 finding(s)"; then
+  pass "G17: findings in two files are all reported, then one exit 1"
+else
+  fail "G17: multi-file report (status=$status); output: $out"
+fi
+
+# --- G13: every SHIPPED drain helper survives a large first-line match --------------
+# For each shell file under the real scripts/ that defines the helper, extract its
+# definition block, evaluate it in that file's own shell under pipefail, and pipe
+# a >= 256 KiB haystack whose FIRST line matches. Without the drain, grep's early
+# exit EPIPEs the writer and the pipeline fails (#4233). A miss must still return
+# 1, so a helper that swallows grep's status is caught too.
+hay="$tmproot/g13.hay"
+awk 'BEGIN { print "g13-first-line"; for (i = 0; i < 8192; i++) printf "%063d\n", i }' > "$hay"
+hay_bytes=$(wc -c < "$hay" | tr -d ' ')
+if [ "$hay_bytes" -lt 262144 ]; then
+  fail "G13: haystack is only $hay_bytes bytes (want >= 262144) — the probe would not discriminate"
+fi
+g13_count=0
+for f in "$REPO_ROOT"/scripts/*; do
+  [ -f "$f" ] || continue
+  first=""
+  IFS= read -r first < "$f" || true
+  case "$first" in
+    '#!'*zsh*) sh=zsh ;;
+    '#!'*bash*) sh=bash ;;
+    '#!'*/sh | '#!'*' sh') sh=sh ;;
+    *) continue ;;
+  esac
+  def="$(awk -v helper="$GQ" '
+    !on && ($0 ~ ("^[ \t]*" helper "[ \t]*[(][ \t]*[)]") || $0 ~ ("^[ \t]*function[ \t]+" helper "([ \t({]|$)")) { on = 1 }
+    on {
+      print
+      t = $0; opened += gsub(/[{]/, "", t)
+      t = $0; closed += gsub(/[}]/, "", t)
+      if (opened > 0 && closed >= opened) exit
+    }' "$f")"
+  [ -n "$def" ] || continue
+  g13_count=$((g13_count + 1))
+  name="${f##*/}"
+  if ! command -v "$sh" >/dev/null 2>&1; then
+    echo "SKIP: G13 $name: $sh is absent from PATH"
+    continue
+  fi
+  probe="$tmproot/g13-$name.probe"
+  printf '%s\n' 'set -o pipefail' "$def" 'hay="$(cat "$1")"' \
+    "printf '%s\\n' \"\$hay\" $P $GQ -Fx -- g13-first-line; echo \"match=\$?\"" \
+    "printf '%s\\n' \"\$hay\" $P $GQ -Fx -- g13-absent; echo \"miss=\$?\"" > "$probe"
+  if [ "$sh" = zsh ]; then
+    res="$(zsh -f "$probe" "$hay" 2>&1)"
+  else
+    res="$("$sh" "$probe" "$hay" 2>&1)"
+  fi
+  if has "$res" "match=0" && has "$res" "miss=1"; then
+    pass "G13: $name's helper ($sh) returns 0 on a first-line match in a $hay_bytes-byte pipe and 1 on a miss"
+  else
+    fail "G13: $name's helper ($sh) under pipefail: $(printf '%s' "$res" | tr '\n' ' ')"
+  fi
+done
+if [ "$g13_count" -eq 0 ]; then
+  fail "G13: no shell file under $REPO_ROOT/scripts defines the drain helper — nothing was probed (update G13 if it was removed on purpose)"
+fi
+
+# --- G14: _verify_pipefail_grep, the `scripts/test verify` leg ----------------------
+mkdir -p "$tmproot/noroot/scripts"
+g14_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$tmproot/noroot"
+  ( set -e; _verify_pipefail_grep ) 2>&1
+  echo "RC=$?"
+)"
+if has "$g14_out" "RC=0" && has "$g14_out" "check-pipefail-grep missing or not executable — skipping"; then
+  pass "G14: a ROOT without scripts/check-pipefail-grep skips the leg with a printed reason"
+else
+  fail "G14: skip branch ('$g14_out')"
+fi
+
+mkdir -p "$tmproot/stubroot/scripts"
+printf '#!/bin/sh\necho "STUB_ARGS:$*"\nexit 1\n' > "$tmproot/stubroot/scripts/check-pipefail-grep"
+chmod +x "$tmproot/stubroot/scripts/check-pipefail-grep"
+g14b_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$tmproot/stubroot"
+  ( set -e; _verify_pipefail_grep ) 2>&1
+  echo "RC=$?"
+)"
+if has "$g14b_out" "RC=1" && has "$g14b_out" "STUB_ARGS:$tmproot/stubroot/scripts" \
+   && has "$g14b_out" ">>> scripts/check-pipefail-grep"; then
+  pass "G14b: the leg runs the guard against \$ROOT/scripts and propagates its failure"
+else
+  fail "G14b: run + propagation ('$g14b_out')"
+fi
+
+# --- G15: cmd_verify runs the leg BEFORE the --no-tests early return ----------------
+# Every other leg and every test loop is stubbed; only the call order is real.
+g15_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  unset FISHHAWK_VERIFY_LOCK_OWNER
+  export FISHHAWK_VERIFY_LOCK_PATH="$tmproot/verify.lock"
+  ROOT="$tmproot/noroot"
+  cmd_lint() { :; }
+  _verify_doc_line_budget() { :; }
+  _verify_schema_sync() { :; }
+  _verify_gate_harnesses() { :; }
+  _verify_site_voice() { :; }
+  _verify_site_ia() { :; }
+  _verify_adr_records() { :; }
+  _verify_gate_image_pins() { echo LEG:pins; }
+  _verify_pipefail_grep() { echo LEG:pipefail; }
+  cmd_test() { echo LEG:tests; }
+  cmd_test_scoped() { echo LEG:tests; }
+  cmd_test_with_patch_coverage() { echo LEG:tests; }
+  _parse_verify_args --no-tests
+  ( set -e; cmd_verify ) 2>&1
+  echo "RC=$?"
+)"
+g15_order="$(awk '/^LEG:pins$/ { p = NR } /^LEG:pipefail$/ { g = NR } END { print (p > 0 && g > p) ? "ordered" : "unordered" }' <<< "$g15_out")"
+if has "$g15_out" "RC=0" && has "$g15_out" "LEG:pipefail" && ! has "$g15_out" "LEG:tests" \
+   && [ "$g15_order" = ordered ]; then
+  pass "G15: verify --no-tests runs the pipefail grep leg right after the gate-image pins, and no test loop"
+else
+  fail "G15: cmd_verify wiring (order=$g15_order) ('$g15_out')"
+fi
+
+echo
+echo "test-check-pipefail-grep: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
