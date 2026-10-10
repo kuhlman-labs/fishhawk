@@ -1920,7 +1920,12 @@ components:
             endpoint; a consumer MUST fail OPEN on it. The block PRESENT with
             an EMPTY `product_feedback_providers` means POSITIVELY no feedback
             provider is registered. PRESENT and non-empty means one is.
-          required: [product_feedback_providers]
+
+            `slice_integration` (#4165) is the block's second member: the
+            decomposed-parent acceptance gate's own slice-integration
+            authority predicate. A present block WITHOUT the key is an older
+            backend, equally UNDECIDABLE.
+          required: [product_feedback_providers, slice_integration]
           properties:
             product_feedback_providers:
               type: array
@@ -1934,6 +1939,37 @@ components:
                 block. An empty list means `fishhawk_report_product_issue`
                 would refuse with 501 `provider_unimplemented`.
               example: [github_projects]
+            slice_integration:
+              type: object
+              description: |
+                Whether this deployment can integrate a decomposed parent's
+                slices for THIS run (#4165): `orchestrator.SliceIntegrationUnavailable`
+                evaluated on the run row the read loaded — the EXACT predicate
+                the decomposed-parent acceptance gate (the host-dispatch marker
+                and `POST /v0/stages/{stage_id}/acceptance-admission`) stands
+                down on. `available: false` means no `slices_integrated` record
+                will ever be written for the run (no GitHub client wired, or the
+                run has no installation id), so the gate admits acceptance
+                without a coverage check; `available: true` means the gate
+                refuses `409 acceptance_integration_incomplete` until a
+                `slices_integrated` record covers every child. The MCP read
+                side keys "no integration authority" on this value instead of
+                inferring it. Computed for every run, meaningful only for a
+                decomposed parent.
+              required: [available]
+              properties:
+                available:
+                  type: boolean
+                  description: |
+                    True when the server has slice-integration authority for
+                    the run. Never omitted, so `false` reaches the wire.
+                reason:
+                  type: string
+                  description: |
+                    Why the server has no slice-integration authority. Present
+                    ONLY when `available` is false.
+                  example: GitHub not configured
+              example: { available: false, reason: GitHub not configured }
         workflow_id:
           type: string
           example: feature_change
