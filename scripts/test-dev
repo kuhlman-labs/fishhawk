@@ -3962,6 +3962,55 @@ else
   fail "_run_with_timeout left files under TMPDIR: $(print -l -- "$pr15n_tmp"/*(N))"
 fi
 
+# (h2) Expiry is RACE-FREE under repetition: 40 concurrent runs against a
+# hanging command at a 0.2s bound must ALL return 124. Without the watchdog's
+# `trap '' TERM`, the main shell's TERM of the watchdog could land after the
+# watchdog killed the command but before it exited, giving 143 (a plain
+# failure) — ~1 run in 100 under load; the concurrency is the load.
+pr15n_rep="${pr15n_dir}/rep"
+mkdir -p "$pr15n_rep"
+pr15n_pids=()
+for pr15n_i in {1..40}; do
+  ( pr15n_r=0; _run_with_timeout 0.2 /dev/null sleep 5 || pr15n_r=$?; print -r -- "$pr15n_r" > "${pr15n_rep}/${pr15n_i}" ) &
+  pr15n_pids+=($!)
+done
+for pr15n_p in "${pr15n_pids[@]}"; do wait "$pr15n_p" 2>/dev/null; done
+pr15n_n124=0
+pr15n_other=""
+for pr15n_f in "$pr15n_rep"/*(N); do
+  pr15n_s="$(<"$pr15n_f")"
+  if [[ "$pr15n_s" == 124 ]]; then (( ++pr15n_n124 )); else pr15n_other+=" ${pr15n_s}"; fi
+done
+if (( pr15n_n124 == 40 )); then
+  pass "_run_with_timeout returns 124 on EVERY expiry across 40 concurrent runs"
+else
+  fail "_run_with_timeout should return 124 on every expiry (124 x${pr15n_n124}/40, others:${pr15n_other:- none})"
+fi
+
+# (h3) The same race, FORCED: a `kill` wrapper (functions reach subshells)
+# keeps the WATCHDOG alive 0.5s after it delivers its TERM, so the main
+# shell's TERM of the watchdog always lands inside that window. Only the
+# caller's own subshell level is exempt from the delay.
+pr15n_v="$(
+  pr15n_kill_base=$ZSH_SUBSHELL
+  kill() {
+    builtin kill "$@"
+    local r=$?
+    if (( ZSH_SUBSHELL > pr15n_kill_base )); then sleep 0.5; fi
+    return "$r"
+  }
+  for pr15n_i in 1 2 3; do
+    pr15n_r=0
+    _run_with_timeout 0.2 /dev/null sleep 5 || pr15n_r=$?
+    print -rn -- "${pr15n_r} "
+  done
+)"
+if [[ "$pr15n_v" == '124 124 124 ' ]]; then
+  pass "_run_with_timeout returns 124 when its TERM of the watchdog lands after the watchdog fired"
+else
+  fail "_run_with_timeout should return 124 when the watchdog is still exiting (got: $pr15n_v)"
+fi
+
 # (i) cmd_preview wiring: resolution goes through the bounded helper, the raw
 # unbounded fetch is gone, and resolution precedes the prior-preview teardown.
 preview_body="$(typeset -f cmd_preview)"
@@ -3981,6 +4030,44 @@ if [[ -n "$pr15n_resolve_ln" && -n "$pr15n_kill_ln" ]] && (( pr15n_resolve_ln < 
   pass "cmd_preview resolves the ref BEFORE tearing down the prior preview"
 else
   fail "cmd_preview should call _preview_resolve_ref before _preview_kill_tracked (resolve ${pr15n_resolve_ln:-none}, kill ${pr15n_kill_ln:-none})"
+fi
+
+# (j) cmd_preview hands the FISHHAWK_PREVIEW_FETCH_TIMEOUT value — not a
+# literal — to the fetch bound: with the knob at 2 and a hanging fetch it
+# fails naming "timed out after 2s", in seconds. Everything before resolution
+# is pure (no .env in the fixture REPO_ROOT, a dummy database URL), and the
+# resolution failure exits before any DB, worktree or build work.
+: > "$pr15n_log"
+pr15n_start=$SECONDS
+pr15n_rc=0
+pr15n_out="$(
+  {
+    export PATH="${pr15n_stub}:${PATH}" TMPDIR="$pr15n_tmp"
+    export PR15N_FETCH_MODE=hang PR15N_FETCH_LOG="$pr15n_log" PR15N_REAL_GIT="$pr15n_real_git"
+    REPO_ROOT="${pr15n_dir}/local"
+    rehash
+    unset FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK FISHHAWK_PREVIEW_SEED
+    export FISHHAWKD_DATABASE_URL='postgres://u:p@127.0.0.1:1/pr15n'
+    export FISHHAWK_PREVIEW_SHA="$pr15n_absent" FISHHAWK_PREVIEW_FETCH_TIMEOUT=2
+    cmd_preview
+  } 2>&1
+)" || pr15n_rc=$?
+pr15n_el=$(( SECONDS - pr15n_start ))
+if [[ "$pr15n_rc" -ne 0 && "$pr15n_out" == *'fetching origin (bounded 2s)'* \
+      && "$pr15n_out" == *'git fetch origin timed out after 2s'* ]] && (( pr15n_el < 10 )); then
+  pass "cmd_preview bounds its fetch by FISHHAWK_PREVIEW_FETCH_TIMEOUT (${pr15n_el}s)"
+else
+  fail "cmd_preview should pass FISHHAWK_PREVIEW_FETCH_TIMEOUT to the fetch bound (rc=$pr15n_rc el=${pr15n_el}s out: $pr15n_out)"
+fi
+
+# (k) An ABBREVIATED SHA is only a prefix (ambiguous, not content-addressed
+# proof), so even when it resolves locally it stays on the fetch path.
+pr15n_resolve fail "${pr15n_A[1,12]}"
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_A" && "$pr15n_fetches" == 1 \
+      && "$pr15n_out" != *'skipping git fetch'* ]]; then
+  pass "_preview_resolve_ref: an abbreviated local SHA still fetches first"
+else
+  fail "_preview_resolve_ref should keep an abbreviated SHA on the fetch path (rc=$pr15n_rc reply=$pr15n_reply fetches=$pr15n_fetches out: $pr15n_out)"
 fi
 unfunction pr15n_g pr15n_resolve pr15n_leftovers 2>/dev/null
 rm -rf "$pr15n_dir"

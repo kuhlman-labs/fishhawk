@@ -2831,8 +2831,13 @@ stderr, never `_die`):
   DISTINCT `124` on expiry (GNU `timeout`'s convention), read from the
   watchdog (it exits 0 only when it delivered the TERM) rather than from
   `$SECONDS`; `124` is reported only when the command's own status is also
-  non-zero. Its other caller, the stale-shim advisory, treats any non-zero
-  as a silent degrade and is unchanged.
+  non-zero. The watchdog sets `trap '' TERM` before it kills, so the main
+  shell's TERM of the watchdog (sent once the command has exited) cannot
+  land between the watchdog's kill and its exit and turn a real expiry into
+  `143` — without it ~1 expiry in 100 under load read as a plain failure,
+  costing a second bounded fetch and the wrong error. Its other caller, the
+  stale-shim advisory, treats any non-zero as a silent degrade and is
+  unchanged.
 - **Residual.** A descendant the TERM does not reach (`git-remote-https`, a
   credential helper) can linger as an orphan until its blocking condition
   clears. It holds no caller fd, so neither `scripts/dev` nor the runner
@@ -2858,9 +2863,13 @@ failed fetch degrades to local resolution; an unresolvable SHA fails after
 exactly two fetches with the stderr tail; a missing `TMPDIR` still fetches;
 no temp file survives; the `_preview_fetch_timeout` table; `cmd_preview`
 exiting on an invalid knob before resolution and DB checks; the
-`_run_with_timeout` 0 / own-status / 124 contract; and `cmd_preview` body
-greps (resolves via the helper, no raw `fetch origin`, resolution before
-the prior-preview teardown). Every control was deleted → RED → restored
+`_run_with_timeout` 0 / own-status / 124 contract, 124 on all of 40
+concurrent expiries, and 124 when a `kill` wrapper holds the watchdog open
+after its TERM (the forced race); `cmd_preview` body greps (resolves via the
+helper, no raw `fetch origin`, resolution before the prior-preview
+teardown); `cmd_preview` with `FISHHAWK_PREVIEW_FETCH_TIMEOUT=2` and a
+hanging fetch failing `timed out after 2s` (the knob, not a literal, reaches
+the bound); and an abbreviated local SHA still fetching first. Every control was deleted → RED → restored
 (record in the PR notes for #4058).
 
 ### Testing

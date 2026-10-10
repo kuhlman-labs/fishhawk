@@ -1762,6 +1762,16 @@ _SHIM_PROBE_TIMEOUT=5
 # command's own status is non-zero, so a command that finished exactly at the
 # boundary keeps its own status.
 #
+# The watchdog IGNORES TERM (`trap '' TERM`) before it kills, which is what
+# makes that status race-free. The main shell can only reach its own
+# `kill -TERM "$watch_pid"` after the command has exited; when the watchdog is
+# what killed it, that TERM can land before the watchdog subshell has exited,
+# and without the trap it turned a real expiry into 143 — a plain failure, so
+# _preview_resolve_ref ran a second bounded fetch with the wrong error (#4058
+# review, ~1 run in 100 under load). A TERM that lands while the watchdog still
+# sleeps, or before it sets the trap, kills it before it has signalled anything,
+# so a 143 still means "the command finished on its own".
+#
 # Invariant: neither the command nor the watchdog may inherit the caller's
 # stdout/stderr. An inherited fd held by a surviving descendant (a credential
 # helper the TERM did not reach) would keep a caller's pipe open — the runner's
@@ -1772,7 +1782,7 @@ _run_with_timeout() {
   local outfile="$1"; shift
   "$@" >"$outfile" 2>/dev/null &
   local cmd_pid=$!
-  ( sleep "$secs" && kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
+  ( sleep "$secs" && trap '' TERM && kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
   local watch_pid=$!
   local rc=0 watch_rc=0
   wait "$cmd_pid" 2>/dev/null || rc=$?
