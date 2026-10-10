@@ -66,8 +66,33 @@ func identityAccountID(ctx context.Context) *uuid.UUID {
 // "positively none". Adding omitempty here silently collapses "positively
 // none" into "undecidable" (runs_get_test.go's raw-body assertion is what
 // catches that; a decoded-struct assertion would not).
+//
+// SliceIntegration (#4165) is the decomposed-parent slice-integration
+// authority: orchestrator.SliceIntegrationUnavailable evaluated on the run row
+// this read loaded — the EXACT predicate guardDecomposedParentAcceptance (the
+// host-dispatch marker and acceptance-admission guard) stands down on — so the
+// MCP read side decides "no integration authority" by the server gate's own
+// predicate instead of inferring it. It is ALWAYS set by handleGetRun and the
+// key carries NO omitempty, DELIBERATELY: a consumer reads a block lacking the
+// key as an older backend (undecidable, fall back to the inference), so the
+// key's presence is what says "positively decided". Meaningful only for a
+// decomposed parent; every other run reports the deployment-and-row value
+// with nothing reading it.
 type runCapabilities struct {
-	ProductFeedbackProviders []string `json:"product_feedback_providers"`
+	ProductFeedbackProviders []string             `json:"product_feedback_providers"`
+	SliceIntegration         *runSliceIntegration `json:"slice_integration"`
+}
+
+// runSliceIntegration is runCapabilities.SliceIntegration's shape (#4165).
+// Available is true exactly when orchestrator.SliceIntegrationUnavailable
+// reports "" — it carries NO omitempty so a `false` reaches the wire rather
+// than collapsing into an absent key. Reason is the predicate's non-empty
+// reason ("GitHub not configured", "run has no installation_id"), present only
+// when Available is false. The MCP client mirror decodes it; the json tags
+// MUST byte-match their counterparts.
+type runSliceIntegration struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 type runResponse struct {
@@ -135,6 +160,11 @@ type runResponse struct {
 	// EMPTY product_feedback_providers means POSITIVELY no feedback provider is
 	// registered; PRESENT and non-empty means one is. A consumer must fail OPEN
 	// on absent, never read it as "unavailable".
+	//
+	// The block's second member, slice_integration (#4165), is the
+	// decomposed-parent acceptance gate's own slice-integration-authority
+	// predicate (orchestrator.SliceIntegrationUnavailable). Its key ABSENT
+	// inside a present block is likewise undecidable (an older backend).
 	Capabilities *runCapabilities `json:"capabilities,omitempty"`
 	// RunnerKindResolved echoes whether RunnerKind has been LOCKED by the
 	// run's first signed runner self-report (#1346/#1348). Always emitted
@@ -2100,7 +2130,19 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// guaranteed NON-NIL so an empty registry marshals as `[]` (positively no
 	// feedback provider) rather than null, which is what lets a consumer tell
 	// it apart from an absent block (undecidable).
-	resp.Capabilities = &runCapabilities{ProductFeedbackProviders: s.registeredFeedbackProviders()}
+	//
+	// slice_integration (#4165) is orchestrator.SliceIntegrationUnavailable on
+	// the run row this read loaded — the EXACT call guardDecomposedParentAcceptance
+	// makes (nil-receiver safe, zero reads), so the MCP read side keys "no
+	// integration authority" on the server gate's own predicate.
+	sliceIntegrationReason := s.cfg.Orchestrator.SliceIntegrationUnavailable(got)
+	resp.Capabilities = &runCapabilities{
+		ProductFeedbackProviders: s.registeredFeedbackProviders(),
+		SliceIntegration: &runSliceIntegration{
+			Available: sliceIntegrationReason == "",
+			Reason:    sliceIntegrationReason,
+		},
+	}
 	// Attach the open-concern summary (#964) on the single-run read
 	// ONLY — the list endpoint deliberately omits it (no N+1 concern
 	// query per row). Best-effort: a concern-store failure warn-logs

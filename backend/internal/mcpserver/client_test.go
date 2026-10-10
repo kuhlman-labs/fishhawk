@@ -3624,6 +3624,60 @@ func TestRunMirror_DecodesCapabilities(t *testing.T) {
 				got.Capabilities.ProductFeedbackProviders)
 		}
 	})
+
+	// slice_integration (#4165): the server gate's own slice-integration
+	// authority predicate. A block WITHOUT the key is an older backend
+	// (undecidable → the C3 inference fallback); a present key decodes the
+	// server's answer, including the reason on the unavailable side.
+	t.Run("slice_integration absent from a present block decodes to nil (undecidable)", func(t *testing.T) {
+		var got Run
+		body := head + `"capabilities":{"product_feedback_providers":[]},` + tail
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities == nil {
+			t.Fatal("Run.Capabilities = nil for a PRESENT block (json tag mismatch?)")
+		}
+		if got.Capabilities.SliceIntegration != nil {
+			t.Errorf("SliceIntegration = %+v, want nil (an older backend's block is undecidable)",
+				got.Capabilities.SliceIntegration)
+		}
+	})
+
+	t.Run("slice_integration available decodes", func(t *testing.T) {
+		var got Run
+		body := head + `"capabilities":{"product_feedback_providers":[],"slice_integration":{"available":true}},` + tail
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities == nil || got.Capabilities.SliceIntegration == nil {
+			t.Fatalf("Capabilities.SliceIntegration = nil for a PRESENT key (json tag mismatch?): %+v", got.Capabilities)
+		}
+		if !got.Capabilities.SliceIntegration.Available {
+			t.Error("SliceIntegration.Available = false, want true (inner json tag mismatch?)")
+		}
+		if got.Capabilities.SliceIntegration.Reason != "" {
+			t.Errorf("SliceIntegration.Reason = %q, want empty", got.Capabilities.SliceIntegration.Reason)
+		}
+	})
+
+	t.Run("slice_integration unavailable decodes the reason", func(t *testing.T) {
+		var got Run
+		body := head + `"capabilities":{"product_feedback_providers":[],"slice_integration":{"available":false,"reason":"GitHub not configured"}},` + tail
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities == nil || got.Capabilities.SliceIntegration == nil {
+			t.Fatalf("Capabilities.SliceIntegration = nil for a PRESENT key (json tag mismatch?): %+v", got.Capabilities)
+		}
+		if got.Capabilities.SliceIntegration.Available {
+			t.Error("SliceIntegration.Available = true, want false")
+		}
+		if got.Capabilities.SliceIntegration.Reason != "GitHub not configured" {
+			t.Errorf("SliceIntegration.Reason = %q, want %q (inner json tag mismatch?)",
+				got.Capabilities.SliceIntegration.Reason, "GitHub not configured")
+		}
+	})
 }
 
 // TestCampaignStatus_DecodesResolvedBy pins the #3563 client mirror: the
