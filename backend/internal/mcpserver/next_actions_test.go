@@ -6434,3 +6434,102 @@ func TestNextActions_CancelledPRClosed(t *testing.T) {
 		})
 	}
 }
+
+// naBannedPendingActions are the actions the #4072 verdict-pending arms must
+// never offer: a retry would re-run a stage whose verdict is about to land, and
+// the merge ritual would merge a head nothing has verified yet.
+var naBannedPendingActions = []string{"fishhawk_retry_stage", "approve_pr", "merge_pr", "fishhawk_merge_run"}
+
+// TestNextActions_AcceptanceVerdictPending pins the E72.56 / #4072 arm: the
+// classifier-local verdict_pending sentinel on a succeeded acceptance stage
+// classifies acceptance_verdict_pending with fishhawk_await_stage first and a
+// poll, never retry or merge. Counterfactual (run): delete the arm -> the
+// sentinel reaches the switch default, the outcome-unknown arm, which offers
+// fishhawk_retry_stage -> RED.
+func TestNextActions_AcceptanceVerdictPending(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+	acceptanceID := stages[2].ID
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, acceptanceVerdictPending, "", releaseSignals{})
+	if na == nil || na.State != "acceptance_verdict_pending" {
+		t.Fatalf("state = %+v, want acceptance_verdict_pending", na)
+	}
+	if len(na.Actions) < 2 {
+		t.Fatalf("actions = %+v, want await_stage then a poll", na.Actions)
+	}
+	first := na.Actions[0]
+	if first.Action != "fishhawk_await_stage" || first.Params["stage_id"] != acceptanceID || first.Params["stage"] != "acceptance" || first.Params["run_id"] != run.ID {
+		t.Errorf("actions[0] = %+v, want fishhawk_await_stage on the acceptance stage %q", first, acceptanceID)
+	}
+	if na.Actions[1].Action != "fishhawk_get_run_status" {
+		t.Errorf("actions[1] = %+v, want the fishhawk_get_run_status poll", na.Actions[1])
+	}
+	for _, a := range na.Actions {
+		for _, banned := range naBannedPendingActions {
+			if a.Action == banned {
+				t.Fatalf("%s offered on a verdict-pending acceptance stage — must wait, never retry or merge", banned)
+			}
+		}
+	}
+}
+
+// TestNextActions_SucceededAcceptanceVerdictPending_NoMerge pins the
+// terminal-run twin: a succeeded run with its PR open whose acceptance verdict
+// is still in flight classifies succeeded_acceptance_verdict_pending, never
+// the merge ritual. Counterfactual (run): delete the twin -> the run falls to
+// succeeded_pr_open with approve_pr / fishhawk_merge_run -> RED.
+func TestNextActions_SucceededAcceptanceVerdictPending_NoMerge(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("succeeded")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, acceptanceVerdictPending, "", releaseSignals{})
+	if na == nil || na.State != "succeeded_acceptance_verdict_pending" {
+		t.Fatalf("state = %+v, want succeeded_acceptance_verdict_pending", na)
+	}
+	if !nextActionOffered(na, "fishhawk_await_stage") {
+		t.Errorf("actions = %+v, want fishhawk_await_stage offered", na.Actions)
+	}
+	for _, banned := range naBannedPendingActions {
+		if nextActionOffered(na, banned) {
+			t.Fatalf("%s offered on a succeeded run whose acceptance verdict is still in flight", banned)
+		}
+	}
+}
+
+// TestAcceptanceVerdictPendingActions_NilStageDegradesToPoll pins the
+// defensive nil-stage branch: the poll alone, never retry or merge.
+func TestAcceptanceVerdictPendingActions_NilStageDegradesToPoll(t *testing.T) {
+	na := acceptanceVerdictPendingActions("succeeded_acceptance_verdict_pending", naRun("succeeded"), nil)
+	if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_get_run_status" {
+		t.Errorf("actions = %+v, want the poll alone", na.Actions)
+	}
+}
+
+// TestNextActions_SkipMarkerWinsOverVerdictPending is binding condition C1 on
+// #4072: an out-of-scope skip writes NO outcome row, and the skip arm keys on
+// an EMPTY verdict, so the sentinel must never be derived while the skip marker
+// is in the window. A RUNNING run with the marker inside the 120s window still
+// classifies acceptance_skipped_out_of_scope, through the REAL derivation.
+// Counterfactual (run): drop the skip check in acceptanceVerdictSignal -> the
+// sentinel shadows the skip arm and the state reads acceptance_verdict_pending
+// -> RED.
+func TestNextActions_SkipMarkerWinsOverVerdictPending(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	stages := naAcceptanceStages("succeeded")
+	ended := time.Now().UTC().Add(-5 * time.Second)
+	stages[2].EndedAt = &ended
+	recent := []AuditEntry{rsSkipEntry(4)}
+
+	verdict := acceptanceVerdictSignal(recent, stages, time.Now().UTC())
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, acceptanceSkippedOutOfScopeIn(recent), false, verdict, "", releaseSignals{})
+	if na == nil || na.State != "acceptance_skipped_out_of_scope" {
+		t.Fatalf("state = %+v, want acceptance_skipped_out_of_scope (the skip marker must win over verdict_pending)", na)
+	}
+}

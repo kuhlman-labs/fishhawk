@@ -2821,6 +2821,9 @@ func (s *Server) checkRunBudget(ctx context.Context, runID, stageID uuid.UUID) b
 	// #3389: the halt cancelled the run; an approved scenario retirement whose
 	// acceptance stage never spawned is dropped by it. Best-effort record.
 	s.recordAcceptanceRetirementsDroppedOnCancel(ctx, runID, cancelSourceRunBudget)
+	// #4186: the halt cancelled the run; cancel its non-terminal
+	// decomposition children too. Best-effort.
+	s.cascadeCancelToDecomposedChildren(ctx, runID, cancelSourceRunBudget)
 
 	payload, _ := json.Marshal(map[string]any{
 		"dimension":      d.Dimension,
@@ -3118,6 +3121,9 @@ func (s *Server) checkStageBudget(ctx context.Context, runID, stageID uuid.UUID)
 		// approved scenario retirements (if any) before the breach audit.
 		// An advisory breach never reaches here — it cancels nothing.
 		s.recordAcceptanceRetirementsDroppedOnCancel(ctx, runID, cancelSourceStageBudget)
+		// #4186: cascade the blocking halt to the run's non-terminal
+		// decomposition children. Best-effort.
+		s.cascadeCancelToDecomposedChildren(ctx, runID, cancelSourceStageBudget)
 	}
 
 	payload, _ := json.Marshal(map[string]any{

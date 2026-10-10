@@ -2233,3 +2233,356 @@ func awaitStageToolDescription(t *testing.T) string {
 	t.Fatal("fishhawk_await_stage not registered")
 	return ""
 }
+
+// --- E72.56 / #4072: the acceptance verdict hold ---
+
+// seedSettledAcceptance seeds a SUCCEEDED acceptance stage whose wait envelope
+// carries the given ended_at, plus its stage-scoped acceptance_dispatched
+// anchor (seq 10) in the recent-audit window — the shape a fresh settle has
+// before the runner's verdict ship lands.
+func seedSettledAcceptance(fb *fakeBackend, runID uuid.UUID, endedAt time.Time) uuid.UUID {
+	stageID := seedStageWait(fb, runID, "acceptance", "succeeded", true)
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	env := fb.stageWaitByStageID[stageID]
+	env.EndedAt = &endedAt
+	fb.stageWaitByStageID[stageID] = env
+	fb.auditByRun[runID] = append(fb.auditByRun[runID], avDispatched(10, stageID.String()))
+	return stageID
+}
+
+func recentAuditReads(fb *fakeBackend, runID uuid.UUID) int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return fb.auditCalledByID[runID]
+}
+
+// TestAwaitStage_AcceptanceHoldsForVerdict is the #4072 done-means test: the
+// stage settles on the FAST path, but its verdict exists only from audit read
+// #3 on, so a wait that released on the settle alone would carry no verdict.
+// Counterfactual (run): return the settled output without the hold -> RED
+// (acceptance_verdict "", 0 audit reads).
+func TestAwaitStage_AcceptanceHoldsForVerdict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedSettledAcceptance(fb, runID, time.Now().UTC())
+	fb.recentAuditFlip = func(id uuid.UUID, reads int) {
+		if id == runID && reads == 3 {
+			fb.auditByRun[runID] = append([]AuditEntry{avOutcome(11, stageID.String(), "passed")}, fb.auditByRun[runID]...)
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance"})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" {
+		t.Fatalf("Status/State = %q/%q, want settled/succeeded", out.Status, out.State)
+	}
+	if out.AcceptanceVerdict != "passed" {
+		t.Errorf("acceptance_verdict = %q, want passed (the wait must hold until the verdict lands)", out.AcceptanceVerdict)
+	}
+	if out.VerdictPending || out.StageWaitStatus.VerdictPending {
+		t.Errorf("verdict_pending = %v/%v, want false once the verdict landed", out.VerdictPending, out.StageWaitStatus.VerdictPending)
+	}
+	if got := recentAuditReads(fb, runID); got < 3 {
+		t.Errorf("audit reads = %d, want >= 3 (the hold re-probed until the verdict landed)", got)
+	}
+}
+
+// TestAwaitStage_AcceptanceVerdictPendingOnCallerCap pins the caller-deadline
+// release (binding condition C3, FAST path): the hold is bounded by start + the
+// CLAMPED timeout, so a 1s wait inside a 1h window releases at ~1s with
+// verdict_pending. Counterfactuals (run): Pending=false on the before-holdUntil
+// branch -> RED on the flag; deadline = start + capSeconds -> RED on the
+// elapsed bound (the hold runs to the parent ctx's timeout instead).
+func TestAwaitStage_AcceptanceVerdictPendingOnCallerCap(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedSettledAcceptance(fb, runID, time.Now().UTC())
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = time.Hour
+
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(10*time.Second))
+	defer cancel()
+	begin := time.Now()
+	_, out, err := r.awaitStage(ctx, nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 1})
+	elapsed := time.Since(begin)
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" {
+		t.Fatalf("Status = %q, want settled", out.Status)
+	}
+	if !out.VerdictPending || out.StageWaitStatus == nil || !out.StageWaitStatus.VerdictPending {
+		t.Errorf("verdict_pending top/block = %v/%+v, want true/true", out.VerdictPending, out.StageWaitStatus)
+	}
+	if out.AcceptanceVerdict != "" {
+		t.Errorf("acceptance_verdict = %q, want empty", out.AcceptanceVerdict)
+	}
+	if !strings.Contains(out.Message, "do NOT fishhawk_retry_stage") {
+		t.Errorf("message = %q, want the do-not-retry advisory", out.Message)
+	}
+	if bound := timescale.D(5 * time.Second); elapsed >= bound {
+		t.Errorf("await took %v, want < %v (the hold is bounded by the caller's 1s deadline)", elapsed, bound)
+	}
+}
+
+// TestAwaitStage_AcceptancePollPathCancelReleasesPending is the POLL-path twin
+// (binding condition C3): the stage settles mid-poll, so the hold runs under
+// pollCtx, which the same caller deadline cancels. The release must be the
+// verdict_pending one, never an error or a timeout status.
+func TestAwaitStage_AcceptancePollPathCancelReleasesPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "acceptance", "running", false)
+	ended := time.Now().UTC()
+	fb.mu.Lock()
+	env := fb.stageWaitByStageID[stageID]
+	env.EndedAt = &ended
+	fb.stageWaitByStageID[stageID] = env
+	fb.auditByRun[runID] = []AuditEntry{avDispatched(10, stageID.String())}
+	fb.mu.Unlock()
+	fb.stageWaitFlip = settleStageWaitAt(fb, stageID, 2, "succeeded")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = time.Hour
+
+	begin := time.Now()
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 1})
+	elapsed := time.Since(begin)
+	if err != nil {
+		t.Fatalf("awaitStage returned an error on the poll-path hold: %v", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" {
+		t.Fatalf("Status/State = %q/%q, want settled/succeeded", out.Status, out.State)
+	}
+	if got := stageReads(fb, stageID); got < 2 {
+		t.Fatalf("stage reads = %d, want >= 2 (the stage must settle on the POLL path)", got)
+	}
+	if !out.VerdictPending {
+		t.Errorf("verdict_pending = false, want true on a poll-path release at the caller's deadline")
+	}
+	if bound := timescale.D(5 * time.Second); elapsed >= bound {
+		t.Errorf("await took %v, want < %v", elapsed, bound)
+	}
+}
+
+// TestAwaitAcceptanceVerdict_CancelledCtxReleasesPending pins the cancelled-
+// probe shape directly: a ctx cancelled while the hold is mid-wait (the
+// pollCtx-at-the-cap case, with a deadline that would otherwise hold for an
+// hour) releases Pending=true promptly. Counterfactual (run): drop the
+// ctx.Err() break -> the hold re-probes until the 1h release and the bound
+// below fires RED.
+func TestAwaitAcceptanceVerdict_CancelledCtxReleasesPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.auditByRun[runID] = []AuditEntry{avDispatched(10, stageID.String())}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = time.Hour
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan acceptanceVerdictHold, 1)
+	go func() {
+		done <- r.awaitAcceptanceVerdict(ctx, runID, stageID, nil, time.Now().Add(time.Hour))
+	}()
+	select {
+	case hold := <-done:
+		if !hold.Pending || hold.Verdict != "" || hold.Disposition != "" {
+			t.Errorf("hold = %+v, want Pending=true with no verdict on a cancelled ctx", hold)
+		}
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("awaitAcceptanceVerdict did not release after its ctx was cancelled")
+	}
+}
+
+// TestAwaitStage_AcceptanceVerdictMissingAfterWindow pins the confirmed-absence
+// release: the stage settled long ago, so the window has closed and ONE probe
+// that finds only the anchor releases verdict_pending:false with the
+// settled-outcome-unknown recovery. Counterfactuals (run): make
+// acceptanceVerdictHoldUntil ignore endedAt -> RED on the read count; force
+// Pending=true -> RED on the flag.
+func TestAwaitStage_AcceptanceVerdictMissingAfterWindow(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedSettledAcceptance(fb, runID, time.Now().UTC().Add(-time.Hour))
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = 200 * time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.VerdictPending {
+		t.Errorf("verdict_pending = true, want false on a confirmed absence past the window")
+	}
+	li, ri := strings.Index(out.Message, "fishhawk_list_audit"), strings.Index(out.Message, "fishhawk_retry_stage")
+	if li < 0 || ri < 0 || li > ri {
+		t.Errorf("message = %q, want fishhawk_list_audit then fishhawk_retry_stage", out.Message)
+	}
+	if got := recentAuditReads(fb, runID); got != 1 {
+		t.Errorf("audit reads = %d, want exactly 1 (the window had already closed)", got)
+	}
+}
+
+// TestAwaitStage_AcceptanceStalePriorAttemptVerdictNotReported pins attempt
+// anchoring end to end: a PRIOR attempt's failed outcome sits below the latest
+// attempt's dispatch anchor, so it must not be reported as this attempt's
+// verdict. Counterfactual (run): anchor case -> continue -> RED (failed).
+func TestAwaitStage_AcceptanceStalePriorAttemptVerdictNotReported(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "acceptance", "succeeded", true)
+	ended := time.Now().UTC().Add(-time.Hour)
+	fb.mu.Lock()
+	env := fb.stageWaitByStageID[stageID]
+	env.EndedAt = &ended
+	fb.stageWaitByStageID[stageID] = env
+	fb.auditByRun[runID] = []AuditEntry{avDispatched(12, stageID.String()), avOutcome(11, stageID.String(), "failed")}
+	fb.mu.Unlock()
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = 200 * time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.AcceptanceVerdict != "" {
+		t.Errorf("acceptance_verdict = %q, want empty (the failed verdict belongs to a PRIOR attempt)", out.AcceptanceVerdict)
+	}
+}
+
+// TestAwaitStage_AcceptanceNamedDispositionsReleaseImmediately pins that a live
+// unshipped or skip marker releases on the FIRST probe with a message naming
+// it, even inside a 1h window. Counterfactual (run): treat a Disposition as
+// no-verdict -> the wait holds to the 2s cap, reads > 1 and pending -> RED.
+func TestAwaitStage_AcceptanceNamedDispositionsReleaseImmediately(t *testing.T) {
+	cases := []struct {
+		name, category string
+	}{
+		{"unshipped", auditCategoryAcceptanceVerdictUnshipped},
+		{"skipped out of scope", auditCategoryAcceptanceSkippedOutOfScope},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			stageID := seedSettledAcceptance(fb, runID, time.Now().UTC())
+			fb.mu.Lock()
+			fb.auditByRun[runID] = append([]AuditEntry{avEntry(tc.category, 11, stageID.String(), map[string]any{})}, fb.auditByRun[runID]...)
+			fb.mu.Unlock()
+			r := newResolver(srv, nil)
+			r.reviewPollInterval = 20 * time.Millisecond
+			r.acceptanceVerdictWindow = time.Hour
+
+			_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 2})
+			if err != nil {
+				t.Fatalf("awaitStage: %v", err)
+			}
+			if got := recentAuditReads(fb, runID); got != 1 {
+				t.Errorf("audit reads = %d, want 1 (a named disposition releases at once)", got)
+			}
+			if out.VerdictPending {
+				t.Error("verdict_pending = true, want false on a named disposition")
+			}
+			if !strings.Contains(out.Message, tc.category) {
+				t.Errorf("message = %q, want it to name %s", out.Message, tc.category)
+			}
+		})
+	}
+}
+
+// TestAwaitStage_AcceptanceAuditReadErrorFailsSafe pins the best-effort probe:
+// a 500 on the audit read never fails the wait, and an undetermined release is
+// verdict_pending (never a claimed outcome-unknown). Counterfactual (run): map
+// undetermined to Pending=false -> RED. (There is no error-propagation
+// mutation to run: awaitStageSettled has no error return BY CONSTRUCTION.)
+func TestAwaitStage_AcceptanceAuditReadErrorFailsSafe(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedSettledAcceptance(fb, runID, time.Now().UTC().Add(-time.Hour))
+	fb.mu.Lock()
+	fb.auditStatus = http.StatusInternalServerError
+	fb.mu.Unlock()
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 20 * time.Millisecond
+	r.acceptanceVerdictWindow = 200 * time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("awaitStage returned an error on a failing audit read: %v (the probe must be best-effort)", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" {
+		t.Fatalf("Status/State = %q/%q, want settled/succeeded", out.Status, out.State)
+	}
+	if !out.VerdictPending {
+		t.Error("verdict_pending = false, want true when the audit read could not decide")
+	}
+}
+
+// TestAwaitStage_NonAcceptanceSettledMakesNoVerdictRead is the cost guard: a
+// settled plan / review wait pays ZERO recent-audit reads. Counterfactual
+// (run): drop the stageType condition -> the plan wait probes -> RED. (An
+// implement stage is caught by the earlier implement case of the switch, so
+// it cannot isolate this condition; plan and review can.)
+func TestAwaitStage_NonAcceptanceSettledMakesNoVerdictRead(t *testing.T) {
+	for _, stageType := range []string{"plan", "review", "implement"} {
+		t.Run(stageType, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			seedStageWait(fb, runID, stageType, "succeeded", true)
+			r := newResolver(srv, nil)
+			r.reviewPollInterval = time.Millisecond
+			_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: stageType, TimeoutSeconds: 1})
+			if err != nil {
+				t.Fatalf("awaitStage: %v", err)
+			}
+			if got := recentAuditReads(fb, runID); got != 0 {
+				t.Errorf("recent-audit reads = %d, want 0 on a %s wait", got, stageType)
+			}
+			if out.VerdictPending || out.AcceptanceVerdict != "" {
+				t.Errorf("verdict fields = %v/%q, want absent on a %s wait", out.VerdictPending, out.AcceptanceVerdict, stageType)
+			}
+		})
+	}
+}
+
+// TestAwaitStage_AcceptanceFailedMakesNoVerdictRead: only a SUCCEEDED
+// acceptance stage holds — a failed one has no verdict to wait for.
+// Counterfactual (run): drop the state condition -> RED.
+func TestAwaitStage_AcceptanceFailedMakesNoVerdictRead(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "acceptance", "failed", true)
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "acceptance", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if got := recentAuditReads(fb, runID); got != 0 {
+		t.Errorf("recent-audit reads = %d, want 0 on a failed acceptance stage", got)
+	}
+	if out.VerdictPending {
+		t.Error("verdict_pending = true, want absent on a failed acceptance stage")
+	}
+}
+
+// TestAwaitStageToolDescription_NamesAcceptanceVerdictHold pins the operator-
+// facing contract in the tool description.
+func TestAwaitStageToolDescription_NamesAcceptanceVerdictHold(t *testing.T) {
+	desc := awaitStageToolDescription(t)
+	for _, want := range []string{"verdict_pending", "acceptance_verdict", "do\nNOT fishhawk_retry_stage"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_await_stage description does not mention %q", want)
+		}
+	}
+}

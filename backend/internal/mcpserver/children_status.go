@@ -71,6 +71,12 @@ type ChildStatus struct {
 	// path (childrenStatusForAwait resolves each child's implement stage); left
 	// empty on the plain get_run_status snapshot, which does not need it.
 	ImplementStageState string `json:"implement_stage_state,omitempty" jsonschema:"the child's implement-stage state (pending, awaiting_host_dispatch, dispatched, running, or a terminal state) — the value dispatchability is keyed on, distinct from the run-level state; populated on the fishhawk_await_children path"`
+	// ImplementFailureCategory is the child's implement-stage failure category
+	// (A, B, C, D) when that stage failed (#4178). Populated ONLY on the await
+	// path, from the SAME implement-stage read that fills ImplementStageState,
+	// exactly like it: the plain get_run_status snapshot leaves it empty, so that
+	// wire is unchanged.
+	ImplementFailureCategory string `json:"implement_failure_category,omitempty" jsonschema:"the child's implement-stage failure category (A, B, C, D) when that stage failed; populated on the fishhawk_await_children path, empty otherwise"`
 	// DependsOn lists the slice indices this child depends on (E48.99 / #2546),
 	// mirrored from the child run row's slice_depends_on (resolved from the
 	// parent's approved plan on the single-run read). Omitted for a wave-0
@@ -146,6 +152,15 @@ type ChildrenStatus struct {
 	// read-side mirror of the server's no-integration-authority stand-down
 	// (integrationAuthorityAbsent, approval condition C3).
 	fanInRecorded bool
+
+	// implementStages maps a child run id to the implement Stage read for this
+	// snapshot (#4178). Unexported, so it never reaches the wire: it lets the
+	// await verb's child_failed arm build its next_step from the SAME stage read
+	// the release predicate was decided on — no second read, so no TOCTOU between
+	// the predicate and the recovery target. Populated only on the await path
+	// (childrenStatusForAwait); a child whose stage could not be resolved has no
+	// entry.
+	implementStages map[string]Stage
 }
 
 // integrationFailure is the decoded newest fan-in failure (#4080). Cause is the

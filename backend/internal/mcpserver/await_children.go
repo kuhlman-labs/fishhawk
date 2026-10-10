@@ -33,6 +33,11 @@ type AwaitChildrenInput struct {
 //     slice_integration_failed) is newer than its newest clean integration
 //     (#4080). Released even while children are in flight: a between-wave
 //     failure blocks the dependent wave indefinitely.
+//   - "child_failed"          — some child is terminal-failed (failed or
+//     cancelled) AND every non-terminal child is undispatched and transitively
+//     depends on a failed child (#4178): no child can make progress until the
+//     failed slice recovers, so waiting for every child to settle would block
+//     until the timeout.
 //   - "children_failed"       — every child is terminal and some did not
 //     succeed (#4080).
 //   - "integration_pending"   — every child succeeded but the newest
@@ -53,7 +58,7 @@ type AwaitChildrenInput struct {
 // neither fire before the integration it is waiting for, nor — when the
 // interesting change already happened before the call — ever fire at all.
 type AwaitChildrenOutput struct {
-	Status string `json:"status" jsonschema:"one of amendment_pending, children_dispatchable, integration_failed, children_failed, integration_pending, children_settled, timeout"`
+	Status string `json:"status" jsonschema:"one of amendment_pending, children_dispatchable, integration_failed, child_failed, children_failed, integration_pending, children_settled, timeout"`
 	RunID  string `json:"run_id" jsonschema:"the decomposed parent run UUID the wait was armed against"`
 	// Children is the SAME ChildrenStatus snapshot fishhawk_get_run_status
 	// carries, returned on every release so the operator sees the whole fan-out
@@ -76,10 +81,13 @@ type AwaitChildrenOutput struct {
 	// (status integration_failed).
 	IntegrationFailure *integrationFailure `json:"integration_failure,omitempty" jsonschema:"the fan-in failure that released the wait (status integration_failed): its cause (audit category), the failing child and slice, and the detail"`
 	// FailedChildRunIDs names the terminal children that did not succeed
-	// (status children_failed), in slice order.
-	FailedChildRunIDs []string `json:"failed_child_run_ids,omitempty" jsonschema:"the terminal children that did not succeed, in slice order (status children_failed)"`
+	// (status children_failed or child_failed), in slice order.
+	FailedChildRunIDs []string `json:"failed_child_run_ids,omitempty" jsonschema:"the terminal children that did not succeed, in slice order (status children_failed or child_failed)"`
+	// BlockedChildRunIDs names the non-terminal children parked behind a failed
+	// child (status child_failed, #4178), in slice order.
+	BlockedChildRunIDs []string `json:"blocked_child_run_ids,omitempty" jsonschema:"the non-terminal children that cannot progress because they are undispatched and transitively depend on a failed child, in slice order (status child_failed)"`
 	// NextStep is the single pre-filled call to make on this release.
-	NextStep            *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on this release: decide the amendment, re-invoke run_children, read the failure's audit, read the failed child's status, consolidate, or re-arm the wait"`
+	NextStep            *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on this release: decide the amendment, re-invoke run_children, read the failure's audit, recover the failed child (retry_stage, resume_run or its status), read the failed child's status, consolidate, or re-arm the wait"`
 	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation of the release"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	Heartbeat           bool             `json:"heartbeat" jsonschema:"true when your MCP client supplied a progressToken and a per-tick keep-alive was emitted"`
@@ -129,6 +137,26 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               the cause, child, slice and detail; next_step is
                               fishhawk_list_audit on that category. Do NOT
                               dispatch acceptance or approve the review.
+  - "child_failed"          — some child is terminal-failed (run failed or
+                              cancelled) AND no other child can progress: at
+                              least one child is non-terminal and EVERY
+                              non-terminal child is undispatched (implement
+                              stage pending/awaiting_host_dispatch) and
+                              transitively depends on a failed child through
+                              the plan's slice depends_on. An independent
+                              sibling still in flight (or waiting only on the
+                              between-wave integration) keeps the wait armed;
+                              an unknown-state child or a not-minted dependency
+                              fails closed to the wait. failed_child_run_ids
+                              and blocked_child_run_ids name both sides.
+                              next_step recovers the lowest-slice failed child
+                              from its implement failure category:
+                              fishhawk_retry_stage {stage_id} for A/C/D,
+                              fishhawk_resume_run {parent_run_id: <child>}
+                              (in-place re-drive) for B, and
+                              fishhawk_get_run_status on the child when it was
+                              cancelled or its stage is unreadable. Do NOT
+                              cancel the dependents.
   - "children_failed"       — every child is terminal and some did not
                               succeed. next_step is fishhawk_get_run_status on
                               the lowest-slice failed child, whose next_actions
@@ -260,7 +288,9 @@ func (r *runResolver) awaitChildren(ctx context.Context, req *mcp.CallToolReques
 }
 
 // awaitChildrenEvaluate reads ONE snapshot of the parent's fan-out and applies
-// the three absolute release conditions in their fixed order. It returns
+// the absolute release conditions in their fixed order: amendment_pending,
+// children_dispatchable, integration_failed, child_failed (#4178), then the
+// all-terminal arm (children_failed / integration_pending / children_settled). It returns
 // (output, true, nil) to release, (zero, false, nil) to keep polling, and a
 // non-nil error only for a failure that makes the snapshot unreadable at all
 // (an unreadable parent is a caller error, not something to spin on).
@@ -337,6 +367,16 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 	// waiting for every child to settle first would hide it.
 	if cs.IntegrationFailure != nil {
 		return awaitChildrenIntegrationFailedOutput(base, parentUUID, cs.IntegrationFailure), true, nil
+	}
+
+	// (3b) child_failed (#4178) — a terminal-failed child while every
+	// non-terminal child is undispatched and transitively depends on a failed
+	// one: no child can progress, so waiting for (4) would block until the
+	// timeout. Placed after (2) and (3) so a progressable sibling or a fan-in
+	// failure keeps precedence, and before (4), whose all-terminal territory it
+	// never enters (it requires a non-terminal child).
+	if failed, blocked := awaitChildrenFailureBlocked(cs); len(failed) > 0 {
+		return awaitChildrenChildFailedOutput(base, parentUUID, cs, failed, blocked), true, nil
 	}
 
 	// (4) every child terminal: children_failed, integration_pending or
@@ -514,6 +554,16 @@ func (r *runResolver) childrenStatusForAwait(ctx context.Context, parentUUID uui
 		}
 		if stage, serr := r.resolveStage(ctx, childUUID, "implement", ""); serr == nil {
 			cs.Children[i].ImplementStageState = stage.State
+			// The failure category and the stage itself come from this SAME read
+			// (#4178), so the child_failed arm's next_step targets exactly the
+			// stage its release predicate saw.
+			if stage.FailureCategory != nil {
+				cs.Children[i].ImplementFailureCategory = *stage.FailureCategory
+			}
+			if cs.implementStages == nil {
+				cs.implementStages = make(map[string]Stage, len(cs.Children))
+			}
+			cs.implementStages[cs.Children[i].RunID] = stage
 		}
 	}
 	return cs, nil
@@ -782,6 +832,192 @@ func awaitChildrenAllSettled(cs *ChildrenStatus) bool {
 	return true
 }
 
+// awaitChildrenFailureBlocked is the child_failed release predicate (#4178).
+// Pure — no I/O — so every branch is unit-testable like
+// awaitChildrenDispatchable.
+//
+// F is every child whose run state is terminal and not succeeded (failed or
+// cancelled — the same non-succeeded terminal set awaitChildrenNonSucceeded and
+// the childcompletion sweeper use). N is every child whose run state is NOT
+// terminal, "unknown" included. It returns (F, N), each in ascending slice
+// order, ONLY when F and N are both non-empty AND every child in N is
+//
+//   - undispatched: implementStageDispatchable(ImplementStageState), the same
+//     {pending, awaiting_host_dispatch} partition fishhawk_run_children uses. A
+//     dispatched/running stage is progress, and an unresolved "" stage is
+//     unknown — neither releases; and
+//   - failure-blocked: some DependsOn slice resolves BY SLICE INDEX to a minted
+//     sibling in F, or to a non-terminal sibling that is itself failure-blocked
+//     (transitive).
+//
+// Otherwise it returns (nil, nil). Every uncertain case fails CLOSED to the
+// existing wait: a child whose GetRun failed (State "unknown") counts as NOT
+// failure-blocked whatever its readable implement stage says (approval
+// condition C3 — the next poll re-reads it); a not-minted dependency
+// contributes false; a dependency cycle resolves false. The len(N) > 0
+// requirement keeps the all-terminal arm (4) unchanged: an all-terminal
+// fan-out never releases here.
+func awaitChildrenFailureBlocked(cs *ChildrenStatus) (failed, blocked []string) {
+	ordered := childrenInSliceOrder(cs.Children)
+	bySlice := make(map[int]ChildStatus, len(ordered))
+	for _, c := range ordered {
+		bySlice[c.SliceIndex] = c
+	}
+	isFailed := func(c ChildStatus) bool {
+		return runStateIsTerminal(c.State) && c.State != "succeeded"
+	}
+	for _, c := range ordered {
+		if isFailed(c) {
+			failed = append(failed, c.RunID)
+		} else if !runStateIsTerminal(c.State) {
+			blocked = append(blocked, c.RunID)
+		}
+	}
+	if len(failed) == 0 || len(blocked) == 0 {
+		return nil, nil
+	}
+
+	// Memoized DFS over the slice depends_on graph. A slice still being
+	// visited resolves false, so a cycle fails closed.
+	const (
+		visiting = iota + 1
+		resolvedTrue
+		resolvedFalse
+	)
+	memo := make(map[int]int, len(ordered))
+	var blockedByFailure func(c ChildStatus) bool
+	blockedByFailure = func(c ChildStatus) bool {
+		if c.State == "unknown" {
+			return false
+		}
+		switch memo[c.SliceIndex] {
+		case visiting, resolvedFalse:
+			return false
+		case resolvedTrue:
+			return true
+		}
+		memo[c.SliceIndex] = visiting
+		result := false
+		for _, depIdx := range c.DependsOn {
+			dep, minted := bySlice[depIdx]
+			if !minted {
+				continue
+			}
+			if isFailed(dep) || (!runStateIsTerminal(dep.State) && blockedByFailure(dep)) {
+				result = true
+				break
+			}
+		}
+		if result {
+			memo[c.SliceIndex] = resolvedTrue
+		} else {
+			memo[c.SliceIndex] = resolvedFalse
+		}
+		return result
+	}
+
+	for _, c := range ordered {
+		if runStateIsTerminal(c.State) {
+			continue
+		}
+		if !implementStageDispatchable(c.ImplementStageState) || !blockedByFailure(c) {
+			return nil, nil
+		}
+	}
+	return failed, blocked
+}
+
+// awaitChildFailedAcceptedStates is the allow-list of implementFailedNextActions
+// states whose first action the child_failed arm may surface verbatim
+// (approval condition C1): an in-place retry (A, and the C/D default arm) or
+// the decomposition child's in-place resume (B). Every other state —
+// slices_integration_conflict (a field-path-pointer param meant for a PARENT),
+// implement_failed_category_b_decomposed_parent (a fishhawk_start_run restart),
+// or any arm added later — falls back to fishhawk_get_run_status on the child.
+var awaitChildFailedAcceptedStates = map[string]bool{
+	"implement_failed_category_a":                     true,
+	"implement_failed":                                true,
+	"implement_failed_category_b_decomposition_child": true,
+}
+
+// awaitChildrenChildFailedNextStep derives the child_failed next_step for the
+// lowest-slice failed child from the implement stage read the release
+// predicate was decided on (ChildrenStatus.implementStages).
+//
+//   - A CANCELLED child run cannot be retried, so it NEVER maps to
+//     fishhawk_retry_stage or fishhawk_fixup_stage (approval condition C2): it
+//     gets fishhawk_get_run_status with a reason saying the parent must be
+//     re-planned or the item restarted.
+//   - A failed implement stage is routed through the existing
+//     implementFailedNextActions table, with a Run built from the snapshot's
+//     own facts: membership in the parent's plan_decomposed IS the
+//     decomposition-child fact that table's category-B arm detects (a
+//     parent_run_id and no plan/review stage), so B maps to the in-place
+//     fishhawk_resume_run {parent_run_id: <child>}. Its first action is taken
+//     ONLY for an awaitChildFailedAcceptedStates state (C1).
+//   - Anything else (stage unreadable, not in state failed, or a state off the
+//     allow-list) falls back to fishhawk_get_run_status on the child, whose
+//     next_actions own the recovery.
+func awaitChildrenChildFailedNextStep(parentUUID uuid.UUID, cs *ChildrenStatus, child ChildStatus) *SuggestedAction {
+	if child.State == "cancelled" {
+		return &SuggestedAction{
+			Action:       "fishhawk_get_run_status",
+			Params:       map[string]string{"run_id": child.RunID},
+			Precondition: "this decomposed child's run was cancelled while its dependents are parked behind it",
+			Consumes:     "none",
+			Reason:       "the child run was cancelled, so fishhawk_retry_stage and fishhawk_fixup_stage cannot apply to it; its dependents can never dispatch, so the parent must be re-planned or the item restarted",
+		}
+	}
+	if stage, ok := cs.implementStages[child.RunID]; ok && stage.State == "failed" {
+		parentID := parentUUID.String()
+		na := implementFailedNextActions(&Run{ID: child.RunID, ParentRunID: &parentID}, nil, nil, &stage)
+		if na != nil && len(na.Actions) > 0 && awaitChildFailedAcceptedStates[na.State] {
+			action := na.Actions[0]
+			return &action
+		}
+	}
+	return &SuggestedAction{
+		Action:       "fishhawk_get_run_status",
+		Params:       map[string]string{"run_id": child.RunID},
+		Precondition: "this decomposed child is terminal-failed and its implement stage's recovery could not be derived from the snapshot (stage unreadable, not failed, or a failure shape this wait does not route)",
+		Consumes:     "none",
+		Reason:       "the failed child's next_actions own its recovery by failure category; its dependents cannot dispatch until it recovers",
+	}
+}
+
+// awaitChildrenChildFailedOutput builds the child_failed release (#4178).
+// failed and blocked come from awaitChildrenFailureBlocked, in slice order.
+func awaitChildrenChildFailedOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus, failed, blocked []string) AwaitChildrenOutput {
+	byRunID := make(map[string]ChildStatus, len(cs.Children))
+	for _, c := range cs.Children {
+		byRunID[c.RunID] = c
+	}
+	out := base
+	out.Status = "child_failed"
+	out.FailedChildRunIDs = failed
+	out.BlockedChildRunIDs = blocked
+	out.NextStep = awaitChildrenChildFailedNextStep(parentUUID, cs, byRunID[failed[0]])
+
+	described := make([]string, 0, len(failed))
+	for _, id := range failed {
+		c := byRunID[id]
+		// failureClass is the run failure class (A–D), not an audit category;
+		// the name keeps the audit-category registry sweep from reading this
+		// placeholder literal as an emitted category.
+		failureClass := c.ImplementFailureCategory
+		if failureClass == "" {
+			failureClass = "unknown"
+		}
+		described = append(described, fmt.Sprintf("%s (slice %d, run %s, implement failure category %s)", id, c.SliceIndex, c.State, failureClass))
+	}
+	out.Message = fmt.Sprintf(
+		"%d child(ren) failed: %s. Every remaining child (%s) is undispatched and depends, directly or transitively, on a failed slice, so none can ever dispatch until the failed slice recovers — waiting longer only runs out the timeout. "+
+			"Do NOT cancel the dependents, and do NOT consolidate, approve the review or dispatch acceptance. "+
+			"Apply next_step to recover %s, then re-invoke fishhawk_await_children (a retried local slice parks at awaiting_host_dispatch, which then releases children_dispatchable).",
+		len(failed), strings.Join(described, "; "), strings.Join(blocked, ", "), failed[0])
+	return out
+}
+
 // amendmentPathList renders an amendment's requested paths for an operator
 // message, matching awaitStageAmendmentPendingOutput's phrasing.
 func amendmentPathList(item *ScopeAmendmentItem) string {
@@ -830,7 +1066,7 @@ func awaitChildrenTimeoutOutput(runID string, timeout int, start time.Time, hear
 			Consumes:     "none",
 			Reason:       "re-arm the in-band wait — a timeout is a resumable idempotent checkpoint, not a terminal state",
 		},
-		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, hit a fan-in failure, or settled within %ds. "+
+		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, hit a fan-in failure, had a failed child blocking every remaining child, or settled within %ds. "+
 			"The wait holds nothing: re-call fishhawk_await_children to resume it (a safe idempotent no-op), "+
 			"or poll fishhawk_get_run_status every %ds (the authoritative path).",
 			runID, timeout, suggestedStageWaitPollIntervalSeconds),
@@ -847,6 +1083,6 @@ func awaitChildrenNextStep(parentRunID string) *SuggestedAction {
 		Precondition: "children were dispatched detached on this parent",
 		Consumes:     "none",
 		Reason: "the dispatch is detached and this session is free — block here until a child files a mid-stage " +
-			"scope amendment (decidable IN BAND), another child becomes dispatchable, the fan-in fails, or every child settles",
+			"scope amendment (decidable IN BAND), another child becomes dispatchable, the fan-in fails, a failed child blocks every remaining child, or every child settles",
 	}
 }

@@ -67,6 +67,8 @@ func run(args []string, logSink io.Writer) int {
 		return runPrecedentTuning(rest, logSink)
 	case "approver-members":
 		return runApproverMembers(rest, logSink)
+	case "reconcile-orphan-children":
+		return runReconcileOrphanChildren(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
 	case "account":
@@ -102,7 +104,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members|version] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members|reconcile-orphan-children|version] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -124,6 +126,7 @@ func printUsage(w io.Writer) {
 		"  decision-index check     Report decision-bearing entries with no index row; exits 1 on a gap.",
 		"  precedent-tuning         Replay the divergence threshold over a repo's decision history for a grid of (N, X, window) candidates (#3733).",
 		"  approver-members         Dry-run approvals.members: evaluate recorded approvers against a spec's members gates; exits 1 if any human would be refused (#4116).",
+		"  reconcile-orphan-children  Dry-run (default) or --apply: cancel non-terminal decomposition children of cancelled/succeeded parents (#4186).",
 		"  version | --version      Print the build version and git SHA, \"<Version> (<GitSHA>)\", and exit.",
 	} {
 		_, _ = fmt.Fprintln(w, line)

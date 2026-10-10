@@ -24,7 +24,16 @@ import (
 // keyword form aimed at #7 becomes `Refs`, while non-closing mentions, other
 // issue numbers, and text inside inline code or fenced blocks are
 // byte-preserved. The fenced and inline rows are each the fixture's ONLY
-// closing directive, so treating code as active text reddens them.
+// closing directive, so treating code as active text reddens them. Every
+// keyword inflection the neutralizer matches (close/closes/closed,
+// fix/fixes/fixed, resolve/resolves/resolved) has a row that is its fixture's
+// ONLY closing directive, so narrowing the regex to drop one form leaves that
+// body unrewritten and reddens the row for the dropped form. Observed RED rows
+// per keyword-drop mutation of the regex literal (each run alone, restored
+// after): `close[sd]?` -> `close[sd]` reddens "bare close" and "bare close
+// upper"; `fix(?:e[sd])?` -> `fix(?:es)?` reddens "fixed" and "fixed mixed
+// case"; `resolve[sd]?` -> `resolves?` reddens "resolved" and "resolved mixed
+// case colon". The pre-existing rows stay GREEN under all three.
 func TestNeutralizeClosingReferences(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -37,6 +46,14 @@ func TestNeutralizeClosingReferences(t *testing.T) {
 		{"closed upper", "CLOSED #7", "Refs #7", 1},
 		{"fixes colon", "Fixes: #7", "Refs #7", 1},
 		{"resolve", "resolve #7", "Refs #7", 1},
+		{"resolves", "resolves #7", "Refs #7", 1},
+		{"resolved", "resolved #7", "Refs #7", 1},
+		{"fix", "fix #7", "Refs #7", 1},
+		{"fixed", "Fixed #7", "Refs #7", 1},
+		{"bare close", "close #7", "Refs #7", 1},
+		{"bare close upper", "CLOSE #7", "Refs #7", 1},
+		{"fixed mixed case", "FiXeD #7", "Refs #7", 1},
+		{"resolved mixed case colon", "ReSoLvEd: #7", "Refs #7", 1},
 		{"fix space colon", "Fix : #7", "Refs #7", 1},
 		{"mid sentence", "This PR closes #7 partially.", "This PR Refs #7 partially.", 1},
 		{"two references", "Closes #7\n\nFixes #7", "Refs #7\n\nRefs #7", 2},
