@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +26,24 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // fakeBackend builds a httptest.Server with handlers that mimic the
 // production endpoints' shape. Tests can drive each handler's
@@ -2701,11 +2718,7 @@ func TestFetchPrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
 // real /prompt handler's gate_container bytes against. Fails closed.
 func gateContainerGolden(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
 	if err != nil {
 		t.Fatalf("read shared gate_container golden: %v", err)
 	}
@@ -3614,11 +3627,7 @@ func TestInjectReplay_SetsTopLevelFieldOnly(t *testing.T) {
 // replay field, re-injected with the golden's replay set, is JSON-equivalent
 // to the golden — the runner-side half of the backend's attribution seam.
 func TestInjectReplay_GoldenRoundTrip(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	golden, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4228,11 +4237,7 @@ func TestShipAcceptance_BodyTooLarge_413_Typed(t *testing.T) {
 // against and its reap handler test drives through the real handler.
 func reapSelfReportGolden(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "reap_failure_self_report.json"))
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "reap_failure_self_report.json"))
 	if err != nil {
 		t.Fatalf("read shared reap self-report golden: %v", err)
 	}

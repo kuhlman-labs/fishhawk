@@ -85,11 +85,7 @@ func assertSingleMarker(t *testing.T, dump, want string) {
 // const value; any other label form is an error, as is a missing function or
 // zero labels, so the enumeration can never pass vacuously.
 func selectInvokerCaseLabels(fnName string) ([]string, error) {
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		return nil, fmt.Errorf("runtime.Caller failed")
-	}
-	dir := filepath.Dir(self)
+	dir := pkgSrcDir
 	fset := token.NewFileSet()
 	consts := map[string]string{}
 	var target *ast.FuncDecl
@@ -386,11 +382,7 @@ var agentSpawnSiteAllowlist = map[string]allowedSpawnSite{
 //   - A package whose declared name differs from the last element of its import
 //     path (true of none of the stdlib paths above).
 func TestNoAgentSpawnOutsideAdapters(t *testing.T) {
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(self), "..", ".."))
+	root := filepath.Clean(filepath.Join(pkgSrcDir, "..", ".."))
 	skipDirs := map[string]bool{
 		filepath.Join(root, "internal", "agent", "claudecode"): true,
 		filepath.Join(root, "internal", "agent", "codex"):      true,

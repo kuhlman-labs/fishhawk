@@ -1294,13 +1294,9 @@ func TestGateContainer_SelfHostPgtestSuite(t *testing.T) {
 	}
 	rt, _ := requireGateImage(t)
 	requirePostgresImage(t, rt)
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: no source path")
-	}
-	top, err := exec.Command("git", "-C", filepath.Dir(self), "rev-parse", "--show-toplevel").Output()
+	top, err := exec.Command("git", "-C", pkgSrcDir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		t.Skipf("repository root not resolvable from %s: %v", self, err)
+		t.Fatalf("repository root not resolvable from %s: %v", pkgSrcDir, err)
 	}
 	root := strings.TrimSpace(string(top))
 	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()

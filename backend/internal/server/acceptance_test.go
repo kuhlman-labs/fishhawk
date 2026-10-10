@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -4561,14 +4560,10 @@ func TestAcceptanceCriteriaTally_CountsUndecidable(t *testing.T) {
 // wireGoldenAcceptanceReplayBytes reads the SHARED replay verdict golden
 // testdata/wire/acceptance_replay_verdict.json — the same bytes the runner's
 // record-then-replay test asserts its real loader + InjectReplay produce.
-// Anchored via runtime.Caller like wireGoldenHeldCommitBytes.
+// Anchored on pkgSrcDir like wireGoldenHeldCommitBytes.
 func wireGoldenAcceptanceReplayBytes(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared wire golden %s: %v", path, err)

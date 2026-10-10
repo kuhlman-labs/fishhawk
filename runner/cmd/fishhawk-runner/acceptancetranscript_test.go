@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -19,11 +18,7 @@ import (
 // test), so the two validators are proven to accept identical bytes.
 func transcriptGoldenBytes(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_transcript.json"))
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "acceptance_transcript.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

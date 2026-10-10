@@ -692,15 +692,13 @@ func readGoLog(t *testing.T, path string) []string {
 	return lines
 }
 
-// repoRootForVerifyScopeTest resolves the workspace root, reusing the same
-// go.work walk the gate-env CLI cross-check uses. It SKIPS only when there is
-// genuinely no workspace (a vendored or module-cache build); a present-but-
-// unreadable peer is a detector malfunction and FAILS at the call site.
+// repoRootForVerifyScopeTest resolves the workspace root from the
+// init-captured pkgSrcDir, reusing the same go.work walk the gate-env CLI
+// cross-check uses. It FAILS CLOSED when there is no workspace (#4179 reversed
+// the earlier SKIP degrade): a vendored or module-cache build now fails the
+// shell cross-checks instead of skipping them. A present-but-unreadable peer
+// is a detector malfunction and FAILS at the call site.
 func repoRootForVerifyScopeTest(t *testing.T) string {
 	t.Helper()
-	root, err := findWorkspaceRoot()
-	if err != nil {
-		t.Skipf("go.work not found from the test source directory (%v); skipping the shell cross-check", err)
-	}
-	return root
+	return requireWorkspaceRoot(t, pkgSrcDir)
 }
