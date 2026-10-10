@@ -1922,3 +1922,305 @@ func TestGateView_GateIsolationUndecodableIsGap(t *testing.T) {
 		})
 	}
 }
+
+// --- merge readiness (#4086) ---------------------------------------------
+
+// failStagesRepo fails ListStagesForRun so the merge-readiness block's stages
+// read degrades visibly.
+type failStagesRepo struct{ *fakeRepo }
+
+func (r *failStagesRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return nil, errors.New("injected list-stages error")
+}
+
+// readinessGateViewServer is gateViewServer over driveE2ERepo, whose
+// ListStagesForRun serves the seeded stagesByRun (the bare fakeRepo does not
+// implement it).
+func readinessGateViewServer(t *testing.T) (*Server, *fakeRepo, *auditFake, *fakeConcernRepo) {
+	t.Helper()
+	repo := &driveE2ERepo{fakeRepo: newFakeRepo()}
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: cr})
+	return s, repo.fakeRepo, au, cr
+}
+
+// seedMergeReadinessRun stores a run row carrying a pull request url and the
+// given stages directly in the fake repo.
+func seedMergeReadinessRun(repo *fakeRepo, state run.State, prURL string, stages func(uuid.UUID) []*run.Stage) *run.Run {
+	runRow := &run.Run{ID: uuid.New(), Repo: "x/y", InstallationID: instID(42), State: state, WorkflowID: "feature_change"}
+	if prURL != "" {
+		runRow.PullRequestURL = &prURL
+	}
+	repo.mu.Lock()
+	repo.runs[runRow.ID] = runRow
+	if stages != nil {
+		repo.stagesByRun[runRow.ID] = stages(runRow.ID)
+	}
+	repo.mu.Unlock()
+	return runRow
+}
+
+func pendingAcceptanceStages(runID uuid.UUID) []*run.Stage {
+	return acceptanceMergeStages(runID, run.StageStatePending)
+}
+
+// seedStaleAcceptance seeds a `passed` outcome at H1 then a stage-scoped
+// re-open at H2 on the run's acceptance stage — the state
+// reopenAcceptanceOnFixupPush leaves.
+func seedStaleAcceptance(au *auditFake, repo *fakeRepo, runID uuid.UUID, h1, h2 string) uuid.UUID {
+	repo.mu.Lock()
+	accID := repo.stagesByRun[runID][2].ID
+	repo.mu.Unlock()
+	seedReadinessEntry(au, runID, &accID, CategoryAcceptanceOutcomeRecorded, 5, map[string]any{"verdict": "passed", "head_sha": h1})
+	seedReadinessEntry(au, runID, &accID, CategoryAcceptanceReopened, 8, map[string]any{"head_sha": h2})
+	return accID
+}
+
+func mergeBlockerByCode(mr *gateViewMergeReadiness, code string) *gateViewMergeBlocker {
+	for i := range mr.Blockers {
+		if mr.Blockers[i].Code == code {
+			return &mr.Blockers[i]
+		}
+	}
+	return nil
+}
+
+func undeterminedContains(mr *gateViewMergeReadiness, sub string) bool {
+	for _, u := range mr.Undetermined {
+		if strings.Contains(u, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGateView_MergeReadiness pins the gate view's merge_readiness block: the
+// same two helpers the merge endpoint calls, rendered as blockers, with every
+// fail-open reason and the acceptance-history read failure surfaced instead of
+// a silent empty block.
+func TestGateView_MergeReadiness(t *testing.T) {
+	const h1, h2 = "aaaa000000000000000000000000000000000001", "bbbb000000000000000000000000000000000002"
+
+	t.Run("acceptance_stale blocker and no GitHub client undetermined", func(t *testing.T) {
+		s, repo, au, _ := readinessGateViewServer(t)
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, pendingAcceptanceStages)
+		accID := seedStaleAcceptance(au, repo, runRow.ID, h1, h2)
+
+		resp := decodeGateView(t, getGateView(t, s, runRow.ID, ""))
+		mr := resp.MergeReadiness
+		if mr == nil {
+			t.Fatal("merge_readiness = nil, want the block for a run with a pull request")
+		}
+		b := mergeBlockerByCode(mr, mergeCodeAcceptanceStale)
+		if b == nil {
+			t.Fatalf("blockers = %+v, want acceptance_stale", mr.Blockers)
+		}
+		if b.Details["verified_head_sha"] != h1 || b.Details["current_head_sha"] != h2 ||
+			b.Details["next_step"] != "fishhawk_dispatch_stage" || b.Details["acceptance_stage_id"] != accID.String() {
+			t.Errorf("acceptance_stale details = %+v, want H1/H2/dispatch/stage id", b.Details)
+		}
+		if !strings.Contains(b.Message, h1) || !strings.Contains(b.Message, h2) {
+			t.Errorf("acceptance_stale message %q does not name both heads", b.Message)
+		}
+		if !undeterminedContains(mr, "no GitHub client") {
+			t.Errorf("undetermined = %v, want the approval check's 'no GitHub client' reason", mr.Undetermined)
+		}
+		if resp.HistoryIncomplete || containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want no merge_readiness gap on a healthy read", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	})
+
+	t.Run("approval_dismissed blocker via the forge", func(t *testing.T) {
+		s, repo, au, _ := readinessGateViewServer(t)
+		gh := blockedDismissed()
+		s.cfg.GitHub = newApprovalGitHubClient(t, gh)
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, nil)
+		seedReadinessEntry(au, runRow.ID, nil, CategoryOperatorCommitVouched, 3, map[string]any{lineageVouchedSHAField: adHead})
+
+		resp := decodeGateView(t, getGateView(t, s, runRow.ID, ""))
+		mr := resp.MergeReadiness
+		if mr == nil {
+			t.Fatal("merge_readiness = nil, want the block")
+		}
+		b := mergeBlockerByCode(mr, mergeCodeApprovalDismissed)
+		if b == nil {
+			t.Fatalf("blockers = %+v, want approval_dismissed", mr.Blockers)
+		}
+		if b.Details["dismissing_commit"] != adHead || b.Details["approved_commit"] != adApproved ||
+			b.Details["dismissing_cause"] != dismissingCauseVouchCommit || b.Details["next_step"] != "approve_pr" {
+			t.Errorf("approval_dismissed details = %+v", b.Details)
+		}
+		if len(mr.Undetermined) != 0 {
+			t.Errorf("undetermined = %v, want none (both checks determined)", mr.Undetermined)
+		}
+		if mergeBlockerByCode(mr, mergeCodeAcceptanceStale) != nil {
+			t.Errorf("blockers = %+v, want no acceptance_stale on a run without an acceptance stage", mr.Blockers)
+		}
+	})
+
+	t.Run("no blocker on a clean determined read", func(t *testing.T) {
+		s, repo, _, _ := readinessGateViewServer(t)
+		s.cfg.GitHub = newApprovalGitHubClient(t, &approvalGitHub{mergeableState: "blocked", headSHA: adHead,
+			reviews: []map[string]any{review(1, "alice", "APPROVED", adHead)}})
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, pendingAcceptanceStages)
+
+		mr := decodeGateView(t, getGateView(t, s, runRow.ID, "")).MergeReadiness
+		if mr == nil || len(mr.Blockers) != 0 || len(mr.Undetermined) != 0 {
+			t.Fatalf("merge_readiness = %+v, want an empty, fully-determined block", mr)
+		}
+		// Always-present arrays: the wire carries [] rather than null.
+		raw := getGateView(t, s, runRow.ID, "").Body.String()
+		if !strings.Contains(raw, `"merge_readiness":{"blockers":[],"undetermined":[]}`) {
+			t.Errorf("merge_readiness wire = %s, want both arrays present and empty", raw)
+		}
+	})
+
+	t.Run("omitted without a pull request or on a failed/cancelled run", func(t *testing.T) {
+		s, repo, au, _ := readinessGateViewServer(t)
+		for name, row := range map[string]*run.Run{
+			"no PR url": seedMergeReadinessRun(repo, run.StateRunning, "", pendingAcceptanceStages),
+			"failed":    seedMergeReadinessRun(repo, run.StateFailed, mergePR, pendingAcceptanceStages),
+			"cancelled": seedMergeReadinessRun(repo, run.StateCancelled, mergePR, pendingAcceptanceStages),
+		} {
+			seedStaleAcceptance(au, repo, row.ID, h1, h2)
+			w := getGateView(t, s, row.ID, "")
+			if resp := decodeGateView(t, w); resp.MergeReadiness != nil {
+				t.Errorf("%s: merge_readiness = %+v, want omitted", name, resp.MergeReadiness)
+			}
+			if strings.Contains(w.Body.String(), "merge_readiness") {
+				t.Errorf("%s: wire carries merge_readiness, want the key omitted", name)
+			}
+		}
+	})
+
+	t.Run("acceptance history read error is a visible gap", func(t *testing.T) {
+		s, repo, au, _ := readinessGateViewServer(t)
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, pendingAcceptanceStages)
+		seedStaleAcceptance(au, repo, runRow.ID, h1, h2)
+		au.listByCategoryErrCategory = CategoryAcceptanceReopened
+
+		resp := decodeGateView(t, getGateView(t, s, runRow.ID, ""))
+		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want a merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+		mr := resp.MergeReadiness
+		if mr == nil {
+			t.Fatal("merge_readiness = nil, want the block with the failure named")
+		}
+		if !undeterminedContains(mr, "acceptance staleness: the acceptance history could not be read") {
+			t.Errorf("undetermined = %v, want the acceptance read failure named", mr.Undetermined)
+		}
+		if mergeBlockerByCode(mr, mergeCodeAcceptanceStale) != nil {
+			t.Errorf("blockers = %+v, want no acceptance_stale built from a failed read", mr.Blockers)
+		}
+	})
+
+	t.Run("stages read error is a visible gap", func(t *testing.T) {
+		base := newFakeRepo()
+		repo := &failStagesRepo{fakeRepo: base}
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: newFakeConcernRepo()})
+		runRow := seedMergeReadinessRun(base, run.StateRunning, mergePR, nil)
+
+		resp := decodeGateView(t, getGateView(t, s, runRow.ID, ""))
+		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want a merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+		if resp.MergeReadiness == nil || !undeterminedContains(resp.MergeReadiness, "the run's stages could not be read") {
+			t.Errorf("merge_readiness = %+v, want the stages read failure named", resp.MergeReadiness)
+		}
+	})
+
+	t.Run("buildGateView never computes it (attention-scan cost)", func(t *testing.T) {
+		s, repo, au, cr := readinessGateViewServer(t)
+		gh := blockedDismissed()
+		s.cfg.GitHub = newApprovalGitHubClient(t, gh)
+		runRow := seedMergeReadinessRun(repo, run.StateRunning, mergePR, pendingAcceptanceStages)
+		seedStaleAcceptance(au, repo, runRow.ID, h1, h2)
+		rows, _ := cr.ListByRun(context.Background(), runRow.ID)
+
+		resp := s.buildGateView(context.Background(), runRow.ID, "", rows)
+		if resp.MergeReadiness != nil {
+			t.Errorf("buildGateView merge_readiness = %+v, want nil: only the gate-view handler pays the forge reads", resp.MergeReadiness)
+		}
+		gh.mu.Lock()
+		calls := gh.reviewsCalls
+		gh.mu.Unlock()
+		if calls != 0 {
+			t.Errorf("reviews reads = %d, want 0 from buildGateView", calls)
+		}
+	})
+}
+
+// --- settled resolution_basis (#4086) -------------------------------------
+
+// TestGateView_SettledResolutionBasis: a concern resolved through the REAL
+// resolve handler reads back in the settled ledger as state=addressed with
+// resolution_basis=operator_evidence, while a reviewer-confirmed addressed
+// row, a row whose operator resolution a later review overtook, a waived row
+// and a prefix-only row without a chain record carry no basis.
+func TestGateView_SettledResolutionBasis(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	ctx := context.Background()
+
+	resolved := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 1, "high", "correctness", "resolved by operator", "")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{resolved.ID}, "routed by fix-up"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	const evidence = "re-ran the reproduction at the fix-up head"
+	w := postResolve(t, s, runID.String(), resolveConcernsRequest{ConcernIDs: []string{resolved.ID.String()}, Evidence: evidence})
+	if w.Code != http.StatusOK {
+		t.Fatalf("resolve status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 2, "high", "correctness", "reviewer confirmed", "")
+	reviewer.State = concern.StateAddressed
+	reviewer.StateReason = "confirmed by re-review"
+
+	// Operator-resolved, then reopened and re-confirmed by a review: the intent
+	// entry exists, but the review overwrote the state_reason.
+	overtaken := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 3, "high", "correctness", "overtaken", "")
+	overtaken.State = concern.StateAddressed
+	overtaken.StateReason = "confirmed by a later re-review"
+	seedHeadEntry(au, runID, &overtaken.StageID, CategoryConcernResolvedWithEvidence, 50, map[string]any{"concern_id": overtaken.ID.String()})
+
+	// Waived with an intent entry and the prefix: the state alone excludes it.
+	waived := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 4, "low", "style", "waived", "")
+	waived.State = concern.StateWaived
+	waived.StateReason = resolveConcernsReasonPrefix + "not a resolve"
+	seedHeadEntry(au, runID, &waived.StageID, CategoryConcernResolvedWithEvidence, 51, map[string]any{"concern_id": waived.ID.String()})
+
+	// The prefix with no chain record: the join alone excludes it.
+	prefixOnly := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 5, "low", "style", "prefix only", "")
+	prefixOnly.State = concern.StateAddressed
+	prefixOnly.StateReason = resolveConcernsReasonPrefix + "no chain record"
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	byID := map[uuid.UUID]gateViewSettledConcern{}
+	for _, sc := range resp.Settled {
+		byID[sc.ID] = sc
+	}
+	if got := byID[resolved.ID]; got.State != string(concern.StateAddressed) || got.ResolutionBasis != gateViewResolutionBasisOperatorEvidence {
+		t.Errorf("resolved row = state %q basis %q, want addressed/operator_evidence", got.State, got.ResolutionBasis)
+	}
+	for name, id := range map[string]uuid.UUID{"reviewer-confirmed": reviewer.ID, "overtaken": overtaken.ID, "waived": waived.ID, "prefix-only": prefixOnly.ID} {
+		if got, ok := byID[id]; !ok || got.ResolutionBasis != "" {
+			t.Errorf("%s row = %+v (present %v), want settled with no resolution_basis", name, got, ok)
+		}
+	}
+
+	// A failed concern_resolved_with_evidence read is a named gap and the
+	// basis is withheld rather than guessed.
+	au.listByCategoryErrCategory = CategoryConcernResolvedWithEvidence
+	resp = decodeGateView(t, getGateView(t, s, runID, ""))
+	if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, CategoryConcernResolvedWithEvidence) {
+		t.Errorf("history_incomplete=%v gaps=%v, want a concern_resolved_with_evidence gap", resp.HistoryIncomplete, resp.HistoryGaps)
+	}
+	for _, sc := range resp.Settled {
+		if sc.ResolutionBasis != "" {
+			t.Errorf("row %s basis = %q under a failed read, want none", sc.ID, sc.ResolutionBasis)
+		}
+	}
+}

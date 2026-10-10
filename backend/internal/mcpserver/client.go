@@ -747,6 +747,33 @@ type GateView struct {
 	// shipped default, for a run-bound caller, when none is open, or against
 	// an older backend. The json tag MUST byte-match the backend.
 	Divergence *gateDivergence `json:"divergence,omitempty"`
+	// MergeReadiness mirrors the backend's gate-view merge_readiness block
+	// (#4086): what would make fishhawk_merge_run refuse fast (a stale
+	// acceptance verdict, a dismissed PR approval) instead of queueing a merge
+	// that times out, computed by the same helpers the merge endpoint calls.
+	// Omitted (nil) when the run has no pull request, is failed or cancelled,
+	// or against an older backend. The json tag MUST byte-match the backend's
+	// gateViewResponse or the block silently decodes to nil (the #371 trap).
+	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
+}
+
+// gateViewMergeReadiness mirrors the backend's gateViewMergeReadiness
+// (backend/internal/server/gateview.go, #4086). Deliberately UNEXPORTED, like
+// gateDivergence: the MCP SDK reflects its exported fields for the output
+// schema, and the package's export baseline stays unchanged. The json tags
+// MUST byte-match the backend; TestGateViewMergeReadiness_WireShape pins them
+// against a REAL server response.
+type gateViewMergeReadiness struct {
+	Blockers     []gateViewMergeBlocker `json:"blockers" jsonschema:"each refusal the merge endpoint would return now, with its message and details verbatim; empty when none was determined"`
+	Undetermined []string               `json:"undetermined" jsonschema:"each merge-readiness check that could not reach a verdict and why (the approval check fails OPEN; an acceptance-history read failure is also a history_gaps entry) — an empty blockers list does not mean nothing blocks while this is non-empty"`
+}
+
+// gateViewMergeBlocker mirrors the backend's gateViewMergeBlocker. Tags MUST
+// byte-match.
+type gateViewMergeBlocker struct {
+	Code    string         `json:"code" jsonschema:"the merge endpoint's 409 code: acceptance_stale or approval_dismissed"`
+	Message string         `json:"message" jsonschema:"the merge endpoint's refusal message, naming the heads involved and the verb that clears the blocker"`
+	Details map[string]any `json:"details,omitempty" jsonschema:"the refusal's details object, including next_step (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage for acceptance_stale, approve_pr for approval_dismissed)"`
 }
 
 // gateDivergence mirrors the backend's divergenceQuestion
@@ -1014,6 +1041,9 @@ type GateViewSettledConcern struct {
 	ReviewerRole        string `json:"reviewer_role,omitempty" jsonschema:"which reviewer raised the concern: a reviewer persona name, or standard for the stage's standard reviewer. Absent for an unattributed legacy concern recorded before reviewer attribution existed"`
 	QuoteUnverified     bool   `json:"quote_unverified,omitempty" jsonschema:"true when the reviewer quoted a document passage the server could not find in the text it injected into that review, so the concern was demoted to low at ingest. Absent/false otherwise"`
 	SeverityClampedFrom string `json:"severity_clamped_from,omitempty" jsonschema:"the reviewer's original severity when ingest lowered it (a persona severity_cap clamp or an unverified quote); absent when the severity is the reviewer's own"`
+	// ResolutionBasis mirrors the server's gateViewSettledConcern
+	// resolution_basis (#4086). Same byte-match requirement.
+	ResolutionBasis string `json:"resolution_basis,omitempty" jsonschema:"operator_evidence when a human operator resolved this addressed concern with fishhawk_resolve_concerns (distinct from waived); absent for a reviewer-confirmed addressed concern and every other settled state"`
 }
 
 // GateViewSuppressedRelitig is one suppressed relitigation (#1913).

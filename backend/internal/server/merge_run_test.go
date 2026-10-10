@@ -1303,12 +1303,28 @@ func TestMergeRun_BlockedStateProceeds(t *testing.T) {
 	gh := newMergeConflictGitHubClient(t, &mergeConflictGitHub{mergeable: "true", mergeableState: "blocked"})
 	seedMergeConflictRun(t, s, repo, runID, gh)
 
+	var logs bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (blocked is not a conflict):\n%s", w.Code, w.Body.String())
 	}
 	if merger.called != 1 {
 		t.Errorf("merger called %d times, want 1 (blocked dispatches)", merger.called)
+	}
+	// #4086 approval condition 4: mergeable_state=="blocked" is exactly what
+	// arms the approval-dismissed check, and this stub serves no reviews
+	// listing, so the check must FAIL OPEN with its reason named — not refuse
+	// and not silently skip. Pinned on the handler's log line (the wiring)
+	// and on the helper's own result (the branch).
+	if !strings.Contains(logs.String(), "approval-dismissed check undetermined") ||
+		!strings.Contains(logs.String(), "reviews read failed") {
+		t.Errorf("merge log does not record the approval check's fail-open reason:\n%s", logs.String())
+	}
+	res := s.approvalDismissedCheck(context.Background(), repo.runs[runID])
+	if res.Determined || res.Refusal != nil || !strings.Contains(res.Undetermined, "reviews read failed") {
+		t.Errorf("approvalDismissedCheck = %+v, want undetermined (reviews read failed) and no refusal", res)
 	}
 }
 
@@ -1461,20 +1477,77 @@ func TestMergeRun_RepublishFailure_StillDispatchesMerge(t *testing.T) {
 
 // --- E64.59 / #3190: the 409 names the blocking audit-complete item ----------
 
+// shipAcceptanceReRunInFlight moves the strand fixture past the #4086 stale
+// state into the realistic window between an acceptance re-run SHIPPING its
+// verdict and its trace upload terminalizing the stage: the re-opened stage is
+// running and a NEWER `passed` outcome is on the chain. acceptance_stale admits
+// (the newest outcome postdates the reopen) while fishhawk_audit_complete is
+// still pending on the non-terminal re-opened stage — the state in which the
+// #3190 enrichment still reaches the merge endpoint's 409.
+func shipAcceptanceReRunInFlight(t *testing.T, rr *orchestratorRepo, au *auditCompleteAuditFake, runID, accID uuid.UUID) {
+	t.Helper()
+	rr.mu.Lock()
+	rr.stagesByID[accID].State = run.StageStateRunning
+	rr.mu.Unlock()
+	payload, _ := json.Marshal(map[string]any{"verdict": acceptanceVerdictPassed, "head_sha": fixupHeadSHA})
+	au.appendChained(t, runID, &accID, CategoryAcceptanceOutcomeRecorded, payload)
+}
+
+// assertStaleStrandRefused POSTs the merge on the UN-re-run fix-up strand and
+// asserts the #4086 refusal end to end: 409 acceptance_stale whose body NAMES
+// ITS REMEDY (fishhawk_dispatch_stage on the re-opened stage, and the fix-up
+// head the verdict no longer covers), with nothing dispatched and NO pre-merge
+// republish reaching the forge (the guard runs before it).
+func assertStaleStrandRefused(t *testing.T, s *Server, runID, accID uuid.UUID, merger *fakeMerger, gh *publisherFakeGitHub) {
+	t.Helper()
+	checksBefore := len(gh.calls())
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("un-re-run strand: status = %d, want 409 acceptance_stale:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeMergeErr(t, w)
+	if env.Error.Code != mergeCodeAcceptanceStale {
+		t.Fatalf("un-re-run strand: code = %q, want acceptance_stale", env.Error.Code)
+	}
+	d := env.Error.Details
+	if d["next_step"] != "fishhawk_dispatch_stage" || d["acceptance_stage_id"] != accID.String() || d["current_head_sha"] != fixupHeadSHA {
+		t.Errorf("un-re-run strand details = %v, want next_step fishhawk_dispatch_stage on stage %s at current head %s", d, accID, fixupHeadSHA)
+	}
+	for _, want := range []string{"fishhawk_dispatch_stage", fixupHeadSHA, accID.String()} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("un-re-run strand message %q does not name its remedy part %q", env.Error.Message, want)
+		}
+	}
+	if merger.called != 0 {
+		t.Errorf("un-re-run strand: merger called %d times, want 0", merger.called)
+	}
+	if got := len(gh.calls()); got != checksBefore {
+		t.Errorf("un-re-run strand: check runs %d -> %d, want no pre-merge republish (refused before it)", checksBefore, got)
+	}
+}
+
 // TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing pins the enriched
 // 409: when the pre-merge recompute yields a PENDING fishhawk_audit_complete
 // with a non-empty missing list, the response names the cause and the remedy —
 // in details.audit_complete_missing AND inline in the message. Counterfactual:
 // deleting the details injection in the ErrPullRequestUnstableStatus branch
 // makes this RED.
+//
+// #4086: a fix-up-re-opened acceptance stage that has NOT been re-run is now
+// refused earlier as 409 acceptance_stale (pinned below and by
+// TestMergeRun_AcceptanceStale_AfterFixupPush), so the enrichment is driven on
+// the in-flight re-run instead (shipAcceptanceReRunInFlight).
 func TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing(t *testing.T) {
 	merger := &fakeMerger{err: unstableMergeErr()}
-	s, rr, _, _, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
+	s, rr, au, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", merger)
 	ctx := context.Background()
 	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
 	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
 		t.Fatalf("acceptance stage state = %q, want pending (fixture did not seed the strand)", got)
 	}
+	// The un-re-run strand refuses as acceptance_stale before any dispatch.
+	assertStaleStrandRefused(t, s, r.ID, acc.ID, merger, gh)
+	shipAcceptanceReRunInFlight(t, rr, au, r.ID, acc.ID)
 
 	w := postMergeRun(t, s, r.ID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
 	if w.Code != http.StatusConflict {
@@ -1501,12 +1574,24 @@ func TestHandleMergeRun_ChecksPending409NamesAuditCompleteMissing(t *testing.T) 
 	if item["kind"] != "stage_not_terminal" {
 		t.Errorf("missing[0].kind = %v, want stage_not_terminal", item["kind"])
 	}
-	if detail, _ := item["detail"].(string); !strings.Contains(detail, "fishhawk_dispatch_stage") {
-		t.Errorf("missing[0].detail = %q, want it to name the re-dispatch action", detail)
+	detail, _ := item["detail"].(string)
+	for _, want := range []string{shortStageID(acc.ID), "re-opened by a fix-up push", "re-run is already in flight", "Wait for the re-run to settle"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("missing[0].detail = %q, want it to contain %q", detail, want)
+		}
 	}
 	if !strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because:") ||
-		!strings.Contains(env.Error.Message, "fishhawk_dispatch_stage") {
+		!strings.Contains(env.Error.Message, "Wait for the re-run to settle") {
 		t.Errorf("message must state the cause and the remedy inline: %q", env.Error.Message)
+	}
+	// The forge hop: the pre-merge republish carried the SAME derived detail
+	// on the check run's output.text (#4086 approval condition 3).
+	calls := gh.calls()
+	if len(calls) == 0 {
+		t.Fatal("no check run reached the forge; the pre-merge republish did not land")
+	}
+	if forgeText := calls[len(calls)-1].params.OutputText; !strings.Contains(forgeText, detail) {
+		t.Errorf("forge output.text does not carry the 409's detail verbatim:\n forge = %q\n 409   = %q", forgeText, detail)
 	}
 	// Purely ADDITIVE: every pre-#3190 key survives unchanged.
 	if env.Error.Details["reason"] != "checks_pending" {
@@ -2204,6 +2289,11 @@ type mergeCandidateGitHub struct {
 	compareCalls  int
 	compareBase   string
 	compareHead   string
+	// mergeableState is the PR's mergeable_state ("" => clean). reviews is
+	// the GET /pulls/{n}/reviews listing the #4086 approval-dismissed check
+	// reads; nil serves an empty listing.
+	mergeableState string
+	reviews        []map[string]any
 }
 
 func newMergeCandidateGitHubClient(t *testing.T, stub *mergeCandidateGitHub) *githubclient.Client {
@@ -2221,8 +2311,23 @@ func newMergeCandidateGitHubClient(t *testing.T, stub *mergeCandidateGitHub) *gi
 		if stub.merged {
 			state = "closed"
 		}
-		fmt.Fprintf(w, `{"node_id":"PR_x","state":%q,"merged":%v,"mergeable":true,"mergeable_state":"clean","head":{"sha":%q,"ref":"fishhawk/run-mcv"},"base":{"ref":%q}}`,
-			state, stub.merged, stub.headSHA, stub.baseRef)
+		mergeableState := stub.mergeableState
+		if mergeableState == "" {
+			mergeableState = "clean"
+		}
+		fmt.Fprintf(w, `{"node_id":"PR_x","state":%q,"merged":%v,"mergeable":true,"mergeable_state":%q,"head":{"sha":%q,"ref":"fishhawk/run-mcv"},"base":{"ref":%q}}`,
+			state, stub.merged, mergeableState, stub.headSHA, stub.baseRef)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}/reviews", func(w http.ResponseWriter, _ *http.Request) {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		reviews := stub.reviews
+		if reviews == nil {
+			reviews = []map[string]any{}
+		}
+		raw, _ := json.Marshal(reviews)
+		_, _ = w.Write(raw)
 	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}", func(w http.ResponseWriter, r *http.Request) {
 		stub.mu.Lock()
@@ -2582,5 +2687,144 @@ func TestMergeRun_MergeCandidate_ConflictGuardRunsFirst(t *testing.T) {
 	}
 	if rows := mergeVerdictRows(au); len(rows) != 0 {
 		t.Errorf("merge_verdict_recorded rows = %d, want 0", len(rows))
+	}
+}
+
+// --- #4086: merge-readiness refusals -----------------------------------------
+
+// TestMergeRun_ApprovalDismissed_AfterVouchCommit pins D1: a PR GitHub reports
+// blocked, whose only review was DISMISSED by an operator vouch commit, is
+// refused 409 approval_dismissed naming the dismissed review's commit, the
+// vouched head and the cause — and the committed state is untouched (zero
+// verdict rows, no dispatch). The merge-candidate gate admits this fixture
+// (compare reports zero commits behind and the spec declares no
+// merge-candidate verify), so the approval check is the only thing in the
+// path. Counterfactual: deleting the approvalDismissedCheck call dispatches
+// the merge (merger.called==1, a verdict row) → RED.
+func TestMergeRun_ApprovalDismissed_AfterVouchCommit(t *testing.T) {
+	const approved = "2222222222222222222222222222222222222222"
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.gh.mergeableState = "blocked"
+	g.gh.reviews = []map[string]any{
+		{"id": 11, "user": map[string]any{"login": "operator"}, "state": "DISMISSED", "commit_id": approved},
+	}
+	seedReadinessEntry(g.au, g.runID, nil, CategoryOperatorCommitVouched, 40, map[string]any{lineageVouchedSHAField: mcvHead})
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeApprovalDismissed)
+	d := env.Error.Details
+	if d["dismissing_commit"] != mcvHead || d["approved_commit"] != approved || d["dismissing_cause"] != dismissingCauseVouchCommit {
+		t.Errorf("details = %v, want dismissing_commit %s, approved_commit %s, dismissing_cause vouch_commit", d, mcvHead, approved)
+	}
+	if d["next_step"] != "approve_pr" || d["pr_url"] != mergePR || d["run_id"] != g.runID.String() {
+		t.Errorf("details = %v, want next_step approve_pr with run_id + pr_url", d)
+	}
+	for _, want := range []string{mcvHead, approved, "gh pr review --approve"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("message %q does not name %q", env.Error.Message, want)
+		}
+	}
+}
+
+// TestMergeRun_ApprovalDismissed_NeverReviewedStillQueues pins the preserved
+// "queueing before approval is safe" contract: a blocked PR with NO review
+// has no DISMISSED review, so the merge queues as before.
+func TestMergeRun_ApprovalDismissed_NeverReviewedStillQueues(t *testing.T) {
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.gh.mergeableState = "blocked"
+	g.assertAdmitted(t, g.post(t))
+}
+
+// seedStaleAcceptanceRun seeds a running run under the acceptance spec with a
+// succeeded acceptance stage and a `passed` outcome for head h1, then
+// invalidates it through the REAL producer, reopenAcceptanceOnFixupPush, at
+// head h2. Returns the acceptance stage id.
+func seedStaleAcceptanceRun(t *testing.T, s *Server, repo *autoDriveRepo, au *auditFake, runID uuid.UUID, h1, h2 string) uuid.UUID {
+	t.Helper()
+	au.stampSequence = true
+	stages := acceptanceMergeStages(runID, run.StageStateSucceeded)
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	accID := stages[2].ID
+	payload, _ := json.Marshal(map[string]any{"verdict": acceptanceVerdictPassed, "head_sha": h1})
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &accID, Timestamp: time.Now().UTC(),
+		Category: CategoryAcceptanceOutcomeRecorded, Payload: payload,
+	}); err != nil {
+		t.Fatalf("seed outcome: %v", err)
+	}
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, h2)
+	if st := stages[2].State; st != run.StageStatePending {
+		t.Fatalf("acceptance stage state after the fix-up reopen = %s, want pending (the producer did not run)", st)
+	}
+	return accID
+}
+
+// TestMergeRun_AcceptanceStale_AfterFixupPush pins D2: after a fix-up push
+// re-opened a `passed` acceptance stage, the merge is refused 409
+// acceptance_stale naming both heads and fishhawk_dispatch_stage with the
+// stage id — not admitted on the stale verdict. Counterfactual: deleting the
+// acceptanceStaleRefusal call (or making its body return nil) admits the
+// merge on the stale `passed` outcome: 200 with merger.called==1 → RED.
+func TestMergeRun_AcceptanceStale_AfterFixupPush(t *testing.T) {
+	const h1, h2 = "aaaa000000000000000000000000000000000001", "bbbb000000000000000000000000000000000002"
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	accID := seedStaleAcceptanceRun(t, s, repo, au, runID, h1, h2)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeMergeErr(t, w)
+	if env.Error.Code != mergeCodeAcceptanceStale {
+		t.Errorf("code = %q, want acceptance_stale", env.Error.Code)
+	}
+	d := env.Error.Details
+	if d["verified_head_sha"] != h1 || d["current_head_sha"] != h2 {
+		t.Errorf("heads = %v / %v, want %s / %s", d["verified_head_sha"], d["current_head_sha"], h1, h2)
+	}
+	if d["next_step"] != "fishhawk_dispatch_stage" || d["acceptance_stage_id"] != accID.String() || d["pr_url"] != mergePR {
+		t.Errorf("details = %v, want next_step fishhawk_dispatch_stage on stage %s with pr_url", d, accID)
+	}
+	if merger.called != 0 || len(mergeVerdictRows(au)) != 0 {
+		t.Errorf("merger.called=%d rows=%d, want 0/0 (refused before the append and dispatch)", merger.called, len(mergeVerdictRows(au)))
+	}
+}
+
+// TestMergeRun_AcceptanceStale_ReadErrorFailsClosed: an acceptance_reopened
+// read error is a 500 with nothing recorded and nothing dispatched — never an
+// admit. The stage is pending with a `passed` outcome seeded by construction,
+// so the acceptance gate (which does not read the reopen category on a
+// non-terminal stage) admits and the stale check's read is the only one that
+// fails.
+func TestMergeRun_AcceptanceStale_ReadErrorFailsClosed(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	stages := acceptanceMergeStages(runID, run.StageStatePending)
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, []byte(autoDriveAcceptanceSpecYAML), stages)
+	seedStageScopedOutcome(au, runID, stages[2].ID, 5, acceptanceVerdictPassed)
+	au.listByCategoryErrCategory = CategoryAcceptanceReopened
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (fail closed):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 || len(mergeVerdictRows(au)) != 0 {
+		t.Errorf("merger.called=%d rows=%d, want 0/0", merger.called, len(mergeVerdictRows(au)))
+	}
+}
+
+// TestMergeRun_AcceptanceStale_GuardPrecedesMergeSeam pins the placement: with
+// NO GateMerger wired the stale verdict is still reported (409
+// acceptance_stale), not masked by the 503 merge_seam_unconfigured.
+func TestMergeRun_AcceptanceStale_GuardPrecedesMergeSeam(t *testing.T) {
+	s, repo, au := newAutoDriveMergeServer(t, nil)
+	runID := uuid.New()
+	seedStaleAcceptanceRun(t, s, repo, au, runID, "h1", "h2")
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict || decodeMergeErr(t, w).Error.Code != mergeCodeAcceptanceStale {
+		t.Fatalf("status = %d body = %s, want 409 acceptance_stale before the merge-seam guard", w.Code, w.Body.String())
 	}
 }

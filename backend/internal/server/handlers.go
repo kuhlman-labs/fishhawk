@@ -290,6 +290,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// #4101: list a run's (and optionally its decomposition children's) concerns.
 	mux.HandleFunc("GET /v0/runs/{run_id}/concerns", s.requireRunAccount(readAccess, s.handleListRunConcerns))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
+	// E83.53 / #4086: a HUMAN operator resolves routed (addressed_pending)
+	// concerns as addressed on operator evidence — the counterpart to the
+	// operator_evidence_routed veto.
+	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/resolve", s.requireRunAccount(memberWrite, s.handleResolveConcerns))
 	// E75.5 / #3733: the captain's answer to a divergence question.
 	mux.HandleFunc("POST /v0/runs/{run_id}/divergence/{sequence}/answer", s.requireRunAccount(memberWrite, s.handleAnswerDivergence))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))

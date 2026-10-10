@@ -78,8 +78,17 @@ type MergeRunInput struct {
 //     (fishhawk_rebase_run_branch, fishhawk_await_stage, fishhawk_fixup_stage).
 //     The gate's 502 merge_candidate_check_failed stays a TOOL ERROR: it is a
 //     retryable read failure, not a precondition.
+//   - "acceptance_stale", "approval_dismissed" — the #4086 merge-readiness
+//     refusals: the recorded acceptance verdict was invalidated by a later
+//     acceptance_reopened (a fix-up push), or GitHub reports the PR blocked with
+//     no live approval and a dismissed review. IMMEDIATE returns (no poll, no
+//     verdict row) instead of a timeout; the Message is the server's verbatim
+//     and NextAction names the clearing verb — details.next_step for
+//     acceptance_stale (fishhawk_dispatch_stage / fishhawk_await_stage /
+//     fishhawk_retry_stage with the stage_id), the approve_pr ritual for
+//     approval_dismissed.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, acceptance_stale, approval_dismissed"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -114,8 +123,8 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage)"`
-	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate statuses"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual"`
+	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness statuses"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
@@ -230,6 +239,23 @@ Statuses:
                      fishhawk_fixup_stage (ADR-090 D6: a delegated workflow
                      already routed one bounded fix-up when the result was
                      recorded; otherwise route it yourself).
+  - "acceptance_stale" — the recorded acceptance verdict is stale: acceptance
+                     was re-opened (a fix-up push landed a new head) after the
+                     verdict was recorded, so fishhawk_audit_complete cannot
+                     clear and the merge would only time out. Immediate, no
+                     verdict row; the message names the verified and current
+                     heads. next_action names fishhawk_dispatch_stage (stage
+                     pending), fishhawk_await_stage (re-run in flight) or
+                     fishhawk_retry_stage, with the acceptance stage_id.
+  - "approval_dismissed" — GitHub reports the PR blocked, no reviewer's latest
+                     review is APPROVED and a prior review was DISMISSED (a vouch
+                     commit, fix-up push or rebase dismissed the approval), so the
+                     queued merge would never fire. Immediate, no verdict row;
+                     the message names the dismissed review's commit, the
+                     current head and what wrote it. next_action is the
+                     approve_pr ritual. Best-effort: when the forge cannot be
+                     read the merge queues as before. A never-reviewed PR still
+                     queues.
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -272,6 +298,10 @@ The backend's 409 merge_base_behind / merge_candidate_unverified /
 merge_candidate_verify_failed (ADR-090) are likewise NOT tool errors: each is
 returned IMMEDIATELY as status=behind_base / merge_candidate_unverified /
 merge_candidate_verify_failed with next_action naming the clearing verb.
+
+The backend's 409 acceptance_stale / approval_dismissed (#4086) are likewise
+NOT tool errors: each is returned IMMEDIATELY under the same status name with
+next_action naming the clearing verb, instead of a timeout.
 `),
 	}, resolver.mergeRun)
 }
@@ -394,6 +424,87 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 			Consumes:     consumes,
 			Reason:       "ADR-090: Fishhawk merges only an up-to-date, verified merge candidate; re-invoke fishhawk_merge_run once this clears",
 		},
+	}
+}
+
+// readinessStatuses maps the backend's merge-readiness 409 codes (#4086) to the
+// tool's IMMEDIATE statuses. Neither clears by waiting: a stale acceptance
+// verdict needs an acceptance re-run, a dismissed approval needs a re-approval.
+var readinessStatuses = map[string]string{
+	"acceptance_stale":   "acceptance_stale",
+	"approval_dismissed": "approval_dismissed",
+}
+
+// isMergeReadinessRefusal reports whether err is one of the backend's
+// merge-readiness 409 refusals and returns the tool status it maps to.
+func isMergeReadinessRefusal(err error) (*apiError, string, bool) {
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict {
+		return nil, "", false
+	}
+	status, ok := readinessStatuses[ae.Code]
+	if !ok {
+		return nil, "", false
+	}
+	return ae, status, true
+}
+
+// mergeReadinessOutput builds the IMMEDIATE checkpoint for a merge-readiness
+// refusal (#4086). The backend refuses before the merge_verdict_recorded append,
+// so every flag is false, and the server's message is passed through verbatim.
+// approval_dismissed names the approve_pr ritual; acceptance_stale names
+// details.next_step (falling back to fishhawk_dispatch_stage) with the
+// re-opened acceptance stage's id.
+func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start time.Time) MergeRunOutput {
+	prURL, _ := ae.Details["pr_url"].(string)
+	params := map[string]string{"run_id": runID.String()}
+	var next *SuggestedAction
+	if status == "approval_dismissed" {
+		if prURL != "" {
+			params["pr_url"] = prURL
+		}
+		next = &SuggestedAction{
+			Action:       "approve_pr",
+			Params:       params,
+			Precondition: "no approval is live on the pull request and a prior review was dismissed (approval_dismissed)",
+			Consumes:     consumesNone,
+			Reason:       "re-approve the pull request under your own GitHub identity (gh pr review --approve), then re-invoke fishhawk_merge_run",
+		}
+	} else {
+		verb, _ := ae.Details["next_step"].(string)
+		if verb == "" {
+			verb = "fishhawk_dispatch_stage"
+		}
+		stageID, _ := ae.Details["acceptance_stage_id"].(string)
+		if stageID == "" {
+			stageID, _ = ae.Details["stage_id"].(string)
+		}
+		if stageID != "" {
+			params["stage_id"] = stageID
+		}
+		consumes := consumesNone
+		if verb == "fishhawk_retry_stage" {
+			consumes = consumesRetryBudget
+		}
+		next = &SuggestedAction{
+			Action:       verb,
+			Params:       params,
+			Precondition: "the recorded acceptance verdict was invalidated by a later re-open (acceptance_stale)",
+			Consumes:     consumes,
+			Reason:       "re-run acceptance against the current head and await its verdict, then re-invoke fishhawk_merge_run",
+		}
+	}
+	msg := ae.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "the merge-readiness check refused the merge (" + ae.Code + "); call " + next.Action + ", then re-invoke fishhawk_merge_run."
+	}
+	return MergeRunOutput{
+		Status:        status,
+		PRURL:         prURL,
+		WaitedSeconds: time.Since(start).Seconds(),
+		Note:          mergeRunNote,
+		Message:       msg,
+		NextAction:    next,
 	}
 }
 
@@ -744,6 +855,13 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 		// named operator verb, never by waiting: return them immediately too.
 		if mae, status, refused := isMergeCandidateRefusal(merr); refused {
 			return nil, mergeCandidateOutput(mae, status, runID, start), nil
+		}
+		// The #4086 merge-readiness refusals (a stale acceptance verdict, a
+		// dismissed approval) likewise clear only by a named verb. Checked on
+		// every POST, so a re-POST during the checks_pending wait that meets one
+		// returns it at once instead of waiting out the budget.
+		if rae, status, refused := isMergeReadinessRefusal(merr); refused {
+			return nil, mergeReadinessOutput(rae, status, runID, start), nil
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {

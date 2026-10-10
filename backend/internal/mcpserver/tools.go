@@ -323,6 +323,9 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerFixupStage(srv, resolver)
 	registerWaiveConcern(srv, resolver)
 	registerWaiveConcerns(srv, resolver)
+	// E83.53 / #4086: the human-only resolve-with-evidence counterpart to the
+	// operator_evidence_routed veto, adjacent to the waive it is NOT.
+	registerResolveConcerns(srv, resolver)
 	registerDeferConcern(srv, resolver)
 	registerAnswerDivergence(srv, resolver)
 	registerRecordGroomingDispositions(srv, resolver)

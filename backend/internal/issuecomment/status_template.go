@@ -235,6 +235,15 @@ var activityCategories = map[string]struct{}{
 	// refused sibling run_revive_on_reopen_refused is DELIBERATELY not
 	// registered: the run stays cancelled, which the anchor already shows.
 	"run_revived_on_reopen": {},
+	// Operator-evidence concern resolution (E83.53 / #4086). A user-actor
+	// audit kind with NO dedicated Notifier method: server/resolve_concerns.go
+	// writes it when a HUMAN operator resolves a routed (addressed_pending)
+	// concern as `addressed` on their own evidence. It is a decision-class
+	// row like concern_waived — and must read as distinct from one, since the
+	// concern was resolved, not waived. Its corrective sibling
+	// concern_resolve_failed is DELIBERATELY not registered: the concern's
+	// state did not change, which the thread already shows.
+	"concern_resolved_with_evidence": {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -331,6 +340,8 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderConcernWaivedLine(e.Payload)
 	case "concern_deferred":
 		return renderConcernDeferredLine(e.Payload)
+	case "concern_resolved_with_evidence":
+		return renderConcernResolvedWithEvidenceLine(e.Payload)
 	case "scope_amendment_decided":
 		return renderScopeAmendmentDecidedLine(e.Payload)
 	case "acceptance_scenario_retirement_dropped":
@@ -876,6 +887,34 @@ func renderConcernDeferredLine(payload json.RawMessage) string {
 	}
 	if c.reason != "" {
 		return fmt.Sprintf("%s: %s", verb, oneLine(c.reason))
+	}
+	return verb
+}
+
+// renderConcernResolvedWithEvidenceLine renders a
+// concern_resolved_with_evidence activity row (E83.53 / #4086): "Concern
+// 1a2b3c4d resolved with operator evidence: <evidence>". The verb says
+// RESOLVED, never waived, because the concern lands in `addressed`. Degrades
+// field-by-field: an absent concern_id drops the short id, an absent evidence
+// drops the clause, and an empty/undecodable payload degrades to the bare
+// verb. The evidence is oneLine-capped so a long note stays one row.
+func renderConcernResolvedWithEvidenceLine(payload json.RawMessage) string {
+	var p struct {
+		ConcernID string `json:"concern_id"`
+		Evidence  string `json:"evidence"`
+	}
+	if len(payload) > 0 {
+		_ = json.Unmarshal(payload, &p)
+	}
+	verb := "Concern resolved with operator evidence"
+	if id := strings.TrimSpace(p.ConcernID); id != "" {
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		verb = fmt.Sprintf("Concern %s resolved with operator evidence", id)
+	}
+	if p.Evidence != "" {
+		return fmt.Sprintf("%s: %s", verb, oneLine(p.Evidence))
 	}
 	return verb
 }

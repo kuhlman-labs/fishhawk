@@ -3100,7 +3100,9 @@ components:
             `crew_messages` when the crew-message read failed, and the consults
             block adds `crew_consults` when any of its reads failed. The gate
             isolation block adds `gate_isolation_recorded` when its read, or the
-            decode of any of its rows, failed.
+            decode of any of its rows, failed. The merge-readiness block adds
+            `merge_readiness` when the run's stages or its acceptance re-open /
+            outcome history could not be read.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3141,6 +3143,54 @@ components:
             read failure yields an EMPTY array plus a `crew_consults`
             `history_gaps` entry and `history_incomplete=true`, never a
             partially-built block.
+        merge_readiness:
+          $ref: '#/components/schemas/GateViewMergeReadiness'
+
+    GateViewMergeReadiness:
+      type: object
+      description: |
+        #4086. What `POST /v0/runs/{run_id}/merge` would refuse with NOW
+        instead of queueing a merge that times out, computed by the SAME
+        checks the merge endpoint runs. Computed only on this endpoint (never
+        on the attention scan), because the approval half costs forge reads.
+        Omitted when the run has no pull request url or is failed/cancelled.
+        Both arrays are always present (possibly empty) when the block is.
+      required: [blockers, undetermined]
+      properties:
+        blockers:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewMergeBlocker' }
+          description: |
+            Each determined refusal: `acceptance_stale` and/or
+            `approval_dismissed`, with the merge endpoint's message and details
+            verbatim (see that operation's 409 cases 8 and 9).
+        undetermined:
+          type: array
+          items: { type: string }
+          description: |
+            Each check that could not reach a verdict and why: the approval
+            check's fail-open reasons (`approval dismissal: …` — e.g. no GitHub
+            client, a read error, a `mergeable_state` other than `blocked`),
+            and an acceptance-history read failure (`acceptance staleness: …`,
+            which also adds the `merge_readiness` `history_gaps` entry). An
+            empty `blockers` is not "nothing blocks" while this is non-empty.
+
+    GateViewMergeBlocker:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [acceptance_stale, approval_dismissed]
+        message:
+          type: string
+          description: The merge endpoint's refusal message, verbatim.
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            The merge endpoint's refusal details (without `run_id` / `pr_url`),
+            including `next_step`.
 
     GateViewCrewMessage:
       type: object
@@ -3674,6 +3724,18 @@ components:
           description: |
             Same semantics as `GateViewConcern.severity_clamped_from`. Omitted
             when empty.
+        resolution_basis:
+          type: string
+          enum: [operator_evidence]
+          description: |
+            #4086. `operator_evidence` on an `addressed` row a HUMAN operator
+            resolved with `POST /v0/runs/{run_id}/concerns/resolve`: its
+            current `state_reason` carries the `operator evidence: ` prefix AND
+            the chain holds a `concern_resolved_with_evidence` entry for it.
+            Omitted for a reviewer-confirmed `addressed` row (including one a
+            later review re-confirmed), every other settled state, and when
+            the `concern_resolved_with_evidence` read failed (a `history_gaps`
+            entry).
 
     GateViewSuppressedRelitigation:
       type: object
@@ -13610,11 +13672,16 @@ paths:
         **Fail-closed.** The merge is refused (no verdict recorded) when the
         run has no PR url or is failed/cancelled (`409 run_not_mergeable`),
         when the acceptance gate does not admit a merge
-        (`409 acceptance_gate_not_passed`), when the pull request has a merge
+        (`409 acceptance_gate_not_passed`), when the recorded acceptance
+        verdict is stale because the acceptance stage was re-opened after it
+        (`409 acceptance_stale`, #4086; an audit read error here is
+        `500 internal_error`, fail-closed), when the pull request has a merge
         conflict against its base (`409 merge_conflicting`, E64.14 / #3109),
         when the merge-candidate gate refuses (`409 merge_base_behind` /
         `merge_candidate_unverified` / `merge_candidate_verify_failed`, or
-        `502 merge_candidate_check_failed` — ADR-090, below), or
+        `502 merge_candidate_check_failed` — ADR-090, below), when the pull
+        request's approval was dismissed and not re-given
+        (`409 approval_dismissed`, #4086, best-effort and fail-open), or
         when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
         deliberately does NOT block on a review stage awaiting approval (that
         stage settles ON merge).
@@ -13748,10 +13815,13 @@ paths:
             detail inline (E64.59 / #3190). Both keys are ADDITIVE and are
             omitted when the pre-merge recompute did not run or did not yield a
             pending audit-complete, so an unrelated failing required check is
-            never mislabelled. A `stage_not_terminal` item naming a
-            fix-up-re-opened acceptance stage means the merge clears by
-            re-dispatching that acceptance stage — or, when the item reports
-            the re-run as already in flight, by waiting for it to settle.
+            never mislabelled. A fix-up-re-opened acceptance stage whose
+            earlier verdict is still recorded no longer reaches this case: it
+            is refused up front as `acceptance_stale` (case 8). A
+            `stage_not_terminal` item naming an acceptance stage means the
+            merge clears by re-dispatching that acceptance stage — or, when the
+            item reports the re-run as already in flight, by waiting for it to
+            settle.
             (4) The pull request has a merge conflict against its base
             (`merge_conflicting`, E64.14 / #3109). NO verdict row is recorded
             (the guard runs before the append) and `details` carry
@@ -13784,6 +13854,48 @@ paths:
             was recorded; otherwise, or when that route was refused, route it
             with `fishhawk_fixup_stage`. Cases (5)–(7) record NO verdict row and
             dispatch nothing.
+            (8) The recorded acceptance verdict is STALE (`acceptance_stale`,
+            #4086): the run's acceptance stage carries a stage-scoped
+            `acceptance_reopened` entry NEWER than the newest
+            `acceptance_outcome_recorded` (a fix-up push or an operator
+            re-open), so the `fishhawk_audit_complete` check would never clear.
+            It keys on the chain's own invalidation record, never on comparing
+            heads, so a vouch commit or an ADR-090 rebase does not trigger it.
+            `details` carry `{run_id, pr_url, acceptance_stage_id,
+            acceptance_stage_state, verified_head_sha, current_head_sha,
+            outcome_sequence, reopened_sequence, next_step}` where
+            `verified_head_sha` is the outcome's `head_sha` (empty when
+            unrecorded), `current_head_sha` the re-open's, and `next_step` is
+            `fishhawk_dispatch_stage` (stage pending), `fishhawk_await_stage`
+            (dispatched/running) or `fishhawk_retry_stage` (settled without a
+            newer verdict). Checked BEFORE the merge seam, so it is reported
+            even where `merge_seam_unconfigured` would follow.
+            (9) The pull request's approval was dismissed and not re-given
+            (`approval_dismissed`, #4086): GitHub reports
+            `mergeable_state=blocked`, no reviewer's latest review is
+            `APPROVED`, and at least one reviewer's latest review is
+            `DISMISSED` (a vouch commit, fix-up push or rebase under "dismiss
+            stale reviews"). `details` carry `{run_id, pr_url,
+            dismissed_reviewer, approved_commit, dismissing_commit,
+            dismissing_cause, mergeable_state, next_step: "approve_pr"}` where
+            `approved_commit` is the dismissed review's commit,
+            `dismissing_commit` the live head, and `dismissing_cause` is
+            `vouch_commit` / `fixup_push` / `push` / `unknown` from the audit
+            chain. BEST-EFFORT and FAIL-OPEN: any forge uncertainty (no
+            client or installation, an unparseable repo or PR, a read error, a
+            merged PR, a `mergeable_state` other than `blocked`, a truncated
+            reviews listing) admits the merge. A never-reviewed PR still
+            queues. Re-approve the pull request, then re-invoke. Cases (8) and
+            (9) record NO verdict row and dispatch nothing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`: the run's stages, or the acceptance re-open /
+            outcome history the stale-acceptance check reads (#4086), could
+            not be read. FAIL-CLOSED: nothing was recorded and nothing was
+            dispatched; retry once the store is healthy.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -23852,8 +23964,11 @@ paths:
                     a later `confirmed` delta-verification verdict is VETOED
                     (`operator_evidence_routed`, surfaced on the gate view as
                     `disputed` + `disputes[]`) and the concern stays open until
-                    the operator waives or defers it, or a fix-up genuinely
-                    resolves it — a PERMANENT exemption for those concerns. It
+                    the operator waives or defers it, a HUMAN operator resolves
+                    it as `addressed` on their own evidence
+                    (`POST /v0/runs/{run_id}/concerns/resolve`, #4086), or a
+                    fix-up genuinely resolves it — a PERMANENT exemption from
+                    REVIEWER confirmation for those concerns. It
                     is NOT a selection input: supplying it alone does not
                     satisfy the at-least-one-of rule. A whitespace-only value,
                     or one whose byte length exceeds 4000, is rejected (400
@@ -24314,6 +24429,167 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/concerns/resolve:
+    post:
+      operationId: resolveConcernsWithEvidence
+      summary: Resolve routed concerns as addressed on the operator's evidence (human-only)
+      description: |
+        E83.53 / #4086. A HUMAN operator resolves a list of THIS run's ROUTED
+        (`addressed_pending`) concerns as `addressed`, on the strength of an
+        evidence note. It is the counterpart to the permanent
+        `operator_evidence_routed` veto: a fix-up pass carrying
+        `operator_evidence` makes every concern it routes immune to
+        reviewer-confirmation auto-resolve, and before this verb the only way
+        to clear such a concern was a waiver, which misrecords a resolved
+        concern as a non-blocking one. The concern lands in `addressed` — the
+        same state a reviewer confirmation produces, so a later review can
+        still reopen it — and the gate view's settled ledger marks it with
+        `resolution_basis: operator_evidence`, distinct from `waived`.
+
+        Like the bulk waive the batch has two halves:
+
+        - **PRE-VALIDATION is all-or-nothing and mutates NOTHING.** The first
+          violation refuses the WHOLE batch.
+        - **the APPLY loop is per-item.** Each item appends its
+          `concern_resolved_with_evidence` audit entry FIRST (payload
+          `{concern_id, prior_state, evidence, stage_kind, severity, category}`
+          plus `provenance` when set); an append failure fails that item with
+          `audit_append_failed` and changes nothing. Then the
+          `addressed_pending -> addressed` transition runs, storing
+          `operator evidence: <evidence>` as the `state_reason`; a transition
+          failure appends the warn-only corrective `concern_resolve_failed`
+          entry and fails that ONE item.
+
+        A batch that resolved at least one concern refreshes the issue-thread
+        status comment, whose activity section renders
+        `Concern <id8> resolved with operator evidence: <evidence>`.
+
+        Auth: authenticated; `write:stages` OR `write:fixups`; the run's
+        account (403 `account_forbidden` for another workspace's bearer); and
+        HUMAN-ONLY — ANY agent subject (an `operator-agent/…` token or a
+        run-bound `mcp:run:<uuid>` token, even on its own run) is refused 403
+        `resolve_requires_human`. There is no delegated path: operator evidence
+        is a human authority claim.
+      tags: [stages]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [concern_ids, evidence]
+              properties:
+                concern_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items: { $ref: '#/components/schemas/UUID' }
+                  description: |
+                    The concerns to resolve. Every id must be an
+                    `addressed_pending` concern of THIS run. At most 50 per
+                    batch — a named `400` refusal, never a silent truncation.
+                evidence:
+                  type: string
+                  minLength: 1
+                  maxLength: 4000
+                  description: |
+                    REQUIRED evidence note (non-blank, at most 4000 bytes, not
+                    truncated): what the operator re-ran and observed. Recorded
+                    on every `concern_resolved_with_evidence` entry and stored
+                    as each concern's `state_reason` behind the
+                    `operator evidence: ` prefix.
+      responses:
+        '200':
+          description: |
+            The batch was applied. `resolved` counts items with
+            `applied: true`, `failed` counts `applied: false`, and `results` is
+            in REQUEST order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, evidence, resolved, failed, results]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  evidence: { type: string }
+                  resolved: { type: integer }
+                  failed: { type: integer }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [concern_id, applied]
+                      properties:
+                        concern_id: { $ref: '#/components/schemas/UUID' }
+                        applied: { type: boolean }
+                        state: { type: string, description: 'The concern state after the resolve (`addressed`); present only when applied.' }
+                        state_reason: { type: string, description: 'The stored `operator evidence: <evidence>` reason; present only when applied.' }
+                        error_code:
+                          type: string
+                          description: |
+                            Present only when this item FAILED:
+                            `concern_resolve_conflict` (a concurrent transition
+                            raced the pre-validation), `audit_append_failed`, or
+                            `internal_error`.
+                        error: { type: string, description: 'The failure detail for this item.' }
+        '400':
+          description: |
+            Body's `error` is `validation_failed` for: a malformed body or
+            non-UUID `run_id`; a blank or whitespace-only `evidence`; evidence
+            over 4000 bytes (`details` carries `bytes` and `max`); an empty
+            `concern_ids`; more than 50 ids; a non-UUID id; a duplicate id
+            compared on the PARSED uuid (`details` carries `concern_id`,
+            `canonical_concern_id` and `first_spelling`); or an id belonging to
+            ANOTHER run (`details.rule` `concern_run_mismatch`). Every one
+            refuses the whole batch with nothing resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (the token lacks both `write:stages` and
+            `write:fixups`), `account_forbidden` (the bearer belongs to another
+            account), or `resolve_requires_human` (an agent subject — refused
+            before the body is read, nothing appended).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            One of the named ids resolves to no concern row
+            (`concern_not_found`, `details.concern_id`); the whole batch is
+            refused with nothing resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `concern_resolve_conflict`: one of the named concerns is not
+            `addressed_pending`. The message names its state and the recovery —
+            route a `raised` / `reopened` concern with a fix-up first (or waive
+            it); an already-closed concern has nothing to resolve. `details`
+            carry `concern_id` and the rejected `from`/`to` pair. The WHOLE
+            batch is refused with nothing resolved and no audit entry appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`: a concern read failed during pre-validation.
+            Nothing was resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `concern_store_unconfigured`: the concern or audit repository is
+            not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/runs/{run_id}/divergence/{sequence}/answer:
     post:
       operationId: answerDivergence

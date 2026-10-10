@@ -52,10 +52,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 363 identifiers, not 3
+## Exported surface: why 368 identifiers, not 3
 
-The package presents **363** exported top-level identifiers, but only the three
-above are intended entry points. The other 360 are the tool I/O
+The package presents **368** exported top-level identifiers, but only the three
+above are intended entry points. The other 365 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -1173,7 +1173,7 @@ Both fields are `omitempty` on every surface — the common no-evidence concern 
 | `force_additional_pass` | Bounded override: ONE pass past the budget, capped at the ceiling. Delivered-nothing refunds credit the ceiling up to 3 (#3335), so the absolute cap is 6 triggered passes. |
 | `implement_model` | Per-pass model override; empty inherits the run's resolved implement model. |
 | `operator_concern` | Free-text binding instruction with NO pre-existing review concern ([#1311](https://github.com/kuhlman-labs/fishhawk/issues/1311)), minted as a durable tracked concern (#2623). |
-| `operator_evidence` | Declares YOU executed a reproduction of the routed concern(s) ([#2551](https://github.com/kuhlman-labs/fishhawk/issues/2551)). **Authority, not prose** — the reproduction text still travels in `reason`/`operator_concern`. Every concern routed by the pass becomes EXEMPT from reviewer-confirmation auto-resolve: a later `confirmed` delta-verification verdict is vetoed (`operator_evidence_routed`) and the concern stays open until an operator waive/defer or a genuine fix. **PERMANENT** for those concerns, so it raises the waive burden — use it when a reviewer has already retired a defect you can still reproduce. NOT a selection input; whitespace-only or >4000 bytes → 400 `validation_failed`. |
+| `operator_evidence` | Declares YOU executed a reproduction of the routed concern(s) ([#2551](https://github.com/kuhlman-labs/fishhawk/issues/2551)). **Authority, not prose** — the reproduction text still travels in `reason`/`operator_concern`. Every concern routed by the pass becomes EXEMPT from reviewer-confirmation auto-resolve: a later `confirmed` delta-verification verdict is vetoed (`operator_evidence_routed`) and the concern stays open until the operator resolves it with evidence (`fishhawk_resolve_concerns`, below — the fix landed and the reproduction was re-run), waives or defers it. **PERMANENT** for those concerns, so every one of them needs an explicit operator verb to close — use it when a reviewer has already retired a defect you can still reproduce. NOT a selection input; whitespace-only or >4000 bytes → 400 `validation_failed`. |
 
 **PR-body instructions are unsatisfiable ([#2782](https://github.com/kuhlman-labs/fishhawk/issues/2782)).** A fix-up pass CANNOT update the pull-request body or title — the PR body is composed once at PR-open by the first implement attempt, and a fix-up only pushes commits. When a routed instruction (in any of `reason`, `operator_concern`, or a routed concern note) names the PR body, the backend returns the obligation set on the fix-up response's optional `pr_body_obligations` field and `FixupStageOutput.Warnings` renders one advisory line per obligation FROM that server-minted set — naming the arrival channel and the obligation id (the SAME id the reviewer later sees), and pointing at the surfaces that DO work (the self-report sidecar, a run log, a file in scope). The verb never re-derives locally and never renders the (possibly untrusted) excerpt into the warning, so it opens no injection path. `warnings` is `omitempty` — absent for an ordinary pass. The fix-up still proceeds regardless; the signal is advisory. The reviewer later sees such an obligation as `unsatisfiable` (a routing-surface limitation, not an agent omission), and the backend records an advisory `fixup_pr_body_unsatisfiable` audit entry.
 
@@ -1310,6 +1310,27 @@ The two halves have deliberately different atomicity, and a caller must not assu
 - **the APPLY loop is per-item.** The batch is not a database transaction (each concern carries its own audit row), so a concurrent transition that raced the validation fails ONE concern while the rest still apply. Read `results[]` — it is in REQUEST order and each entry carries `applied` plus either `state`/`state_reason` or `error_code`/`error`. `waived + failed == len(concern_ids)`.
 
 `error_code` reuses the single verb's vocabulary (`concern_waive_conflict`, `audit_append_failed`, `internal_error`). Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` UUID, empty `concern_ids`, blank `reason` — all caught before the HTTP hop), `validation_failed` (400 — over the cap, a non-UUID, a duplicate (deduped on the PARSED uuid, so two spellings of one id collide), or an id from another run carrying `details.rule` `concern_run_mismatch`), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — an id is not open; the WHOLE batch is refused), `concern_store_unconfigured` (503).
+
+## Resolve with operator evidence (`fishhawk_resolve_concerns`)
+
+`fishhawk_resolve_concerns` (E83.53 / [#4086](https://github.com/kuhlman-labs/fishhawk/issues/4086)) is the counterpart to the permanent `operator_evidence_routed` veto. A fix-up pass carrying `operator_evidence` makes every concern it routes immune to reviewer-confirmation auto-resolve, so once the fix lands the re-review cannot close those concerns. Before this verb the only exit was a waiver, which misrecords a fixed concern as a non-blocking one. This verb lets a HUMAN operator resolve a list of one run's routed (`addressed_pending`) concerns as **`addressed`** with an evidence note. It wraps `POST /v0/runs/{run_id}/concerns/resolve`; the client method lives in `resolve_concerns.go`, next to the tool, not in `client.go`.
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose concerns to resolve. Every id must belong to THIS run. |
+| `concern_ids` | **yes** | At most 50 per batch; duplicates (deduped on the PARSED uuid) and non-UUIDs are refused. Every id must be `addressed_pending`. Non-UUIDs are also caught locally. |
+| `evidence` | **yes** | What you executed or observed that shows the fix landed; at most 4000 bytes. Recorded on EVERY `concern_resolved_with_evidence` entry and stored as each concern's `state_reason`, prefixed `operator evidence: `. |
+
+What a resolve does, and what it is not:
+
+- **`addressed`, not `waived`.** The concern lands in the state a reviewer confirmation produces, so a later review can still reopen it. Use `fishhawk_waive_concerns` when a concern does not warrant a change at all.
+- **Human-only, never delegated.** The backend refuses EVERY agent subject with 403 `resolve_requires_human`: an `operator-agent/` token, and a run-bound `mcp:run:` token even on its own run. Operator evidence is the operator's authority claim, so no agent can make it. Scopes are the waive pair (`write:stages` or `write:fixups`), and the route is wrapped in `requireRunAccount(memberWrite, …)`, so a bearer from another account gets 403 `account_forbidden`.
+- **Durable record first.** Each concern's `concern_resolved_with_evidence` audit row (`concern_id`, `prior_state`, `evidence`, `stage_kind`, `severity`, `category`, plus `provenance` when non-empty) is appended BEFORE the transition. An append failure fails that item with `audit_append_failed` and changes nothing. A transition that fails after the append writes the warn-only corrective `concern_resolve_failed` row (`intended_state` `addressed`, `actual_state`), and the item fails with `concern_resolve_conflict` or `internal_error`.
+- **Atomicity matches the bulk waive.** PRE-VALIDATION is all-or-nothing and mutates nothing. The APPLY loop is per-item, so read `results[]` in request order; `resolved + failed == len(concern_ids)`.
+- **Not yet on the issue thread or the gate view.** This verb does not refresh the status comment. The `concern_resolved_with_evidence` activity line, the gate view's settled `resolution_basis: operator_evidence` and the API docs land in a sibling change of #4086.
+- **Not yet visible to the historian.** `decisionindex`'s decision-bearing set does not include `concern_resolved_with_evidence`, so operator-evidence resolutions do not reach the precedent index (`fishhawk_precedent`) or historian consults yet. The operator files that follow-up.
+
+Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` or concern UUID, empty `concern_ids`, blank `evidence` — all caught before the HTTP hop), `validation_failed` (400 — over the 50-id cap, evidence over 4000 bytes, a duplicate, or an id from another run carrying `details.rule` `concern_run_mismatch`), `resolve_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_resolve_conflict` (409 — an id not in `addressed_pending`, which refuses the WHOLE batch; the message names the state and the recovery: route a `raised`/`reopened` concern with a fix-up first, and an already-closed concern has nothing to resolve), `concern_store_unconfigured` (503).
 
 ## Concern defer (`fishhawk_defer_concern`)
 
