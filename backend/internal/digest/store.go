@@ -283,13 +283,16 @@ func (s *Store) parked(ctx context.Context, sql string, args ...any) ([]ParkedRo
 	return out, nil
 }
 
+// getWatermarkSQL reads one captain's watermark row. A package constant so a
+// test DBTX can target the advance path's separate-statement re-read.
+const getWatermarkSQL = `SELECT sequence FROM captain_read_watermarks
+	WHERE captain_subject = $1 AND repo = $2 AND account_id IS NOT DISTINCT FROM $3`
+
 // GetWatermark returns the captain's last-read sequence for repo under the
 // account (nil = the untenanted partition), and whether one is recorded.
 func (s *Store) GetWatermark(ctx context.Context, accountID *uuid.UUID, subject, repo string) (int64, bool, error) {
 	var seq int64
-	err := s.db.QueryRow(ctx, `SELECT sequence FROM captain_read_watermarks
-		WHERE captain_subject = $1 AND repo = $2 AND account_id IS NOT DISTINCT FROM $3`,
-		subject, repo, accountID).Scan(&seq)
+	err := s.db.QueryRow(ctx, getWatermarkSQL, subject, repo, accountID).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -318,34 +321,58 @@ func (s *Store) UpsertWatermark(ctx context.Context, accountID *uuid.UUID, subje
 	return nil
 }
 
-// advanceWatermarkSQL upserts monotonically and reports the COMMITTED sequence
-// plus whether THIS statement raised it. The `up` CTE returns a row only when
-// the INSERT (first mark) or the conflicting UPDATE (a strictly higher mark)
-// fired; when the monotonic WHERE refuses the update — a concurrent request
-// already committed a value at or above this one — `up` is empty and the second
-// arm re-reads the row the winner committed. So MarkRead can report the
-// watermark the database actually holds, with advanced=false, rather than the
-// value it merely requested (#3734 fix-up condition 4).
-const advanceWatermarkSQL = `WITH up AS (
-	INSERT INTO captain_read_watermarks (account_id, captain_subject, repo, sequence)
-	VALUES ($1, $2, $3, $4)
-	ON CONFLICT (captain_subject, repo, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
-	DO UPDATE SET sequence = EXCLUDED.sequence, updated_at = now()
-	WHERE captain_read_watermarks.sequence < EXCLUDED.sequence
-	RETURNING sequence
-)
-SELECT sequence, true FROM up
-UNION ALL
-SELECT sequence, false FROM captain_read_watermarks
-	WHERE captain_subject = $2 AND repo = $3 AND account_id IS NOT DISTINCT FROM $1
-	  AND NOT EXISTS (SELECT 1 FROM up)
-LIMIT 1`
+// ErrWatermarkRowVanished is returned (wrapped) by MarkRead when the monotonic
+// upsert refused to move the row — so an equal-or-higher watermark was
+// committed — but the separate re-read of that row then found none. No product
+// path deletes captain_read_watermarks rows, so only a concurrent manual DELETE
+// reaches it; the digest_marked_read entry was already appended, so a retry
+// converges the watermark (#3852).
+var ErrWatermarkRowVanished = errors.New("digest: watermark row vanished between the refused advance and its re-read")
+
+// advanceWatermarkSQL is the monotonic upsert (upsertWatermarkSQL) with
+// RETURNING: it returns a row ONLY when this statement raised the watermark —
+// the INSERT of a first mark, or the conflict-arm UPDATE to a strictly higher
+// sequence. No row means the monotonic WHERE refused the update because an
+// equal-or-higher value is committed.
+//
+// It deliberately does NOT re-read the row in the same statement. Every
+// sub-statement of a WITH query runs against ONE snapshot
+// (https://www.postgresql.org/docs/16/queries-with.html#QUERIES-WITH-MODIFYING),
+// while INSERT ... ON CONFLICT DO UPDATE locks the conflicting row even when its
+// WHERE is false and, under READ COMMITTED, waits for a concurrent writer and
+// then acts on its COMMITTED row
+// (https://www.postgresql.org/docs/16/transaction-iso.html#XACT-READ-COMMITTED).
+// So a same-statement fallback read — the CTE + UNION ALL arm this replaced —
+// predates a commit the statement blocked on: it reported the STALE pre-commit
+// sequence when a concurrent higher mark won the row, and found NO row (a
+// "no rows in result set" error) when a concurrent FIRST insert won the
+// unique-index conflict (#3852).
+const advanceWatermarkSQL = upsertWatermarkSQL + `
+RETURNING sequence`
 
 // advanceWatermark upserts the watermark monotonically and returns the
-// COMMITTED sequence and whether this call raised it. See advanceWatermarkSQL.
+// COMMITTED sequence and whether this call raised it. When the upsert refuses
+// (pgx.ErrNoRows: an equal-or-higher value is committed) it re-reads the row in
+// a SEPARATE statement, which under READ COMMITTED takes a fresh snapshot that
+// includes the conflicting writer's commit, so the reported sequence is the
+// latest committed watermark with changed=false (#3734 fix-up condition 4,
+// #3852). Any other upsert error is returned as an error — never treated as a
+// refusal. A refusal whose re-read finds no row fails closed with
+// ErrWatermarkRowVanished.
 func (s *Store) advanceWatermark(ctx context.Context, accountID *uuid.UUID, subject, repo string, sequence int64) (committed int64, changed bool, err error) {
-	if err := s.db.QueryRow(ctx, advanceWatermarkSQL, accountID, subject, repo, sequence).Scan(&committed, &changed); err != nil {
+	err = s.db.QueryRow(ctx, advanceWatermarkSQL, accountID, subject, repo, sequence).Scan(&committed)
+	if err == nil {
+		return committed, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, fmt.Errorf("digest: advance watermark: %w", err)
 	}
-	return committed, changed, nil
+	committed, has, err := s.GetWatermark(ctx, accountID, subject, repo)
+	if err != nil {
+		return 0, false, fmt.Errorf("digest: advance watermark: re-read committed watermark: %w", err)
+	}
+	if !has {
+		return 0, false, fmt.Errorf("digest: advance watermark: refused upsert of %d for %s/%s: %w", sequence, subject, repo, ErrWatermarkRowVanished)
+	}
+	return committed, false, nil
 }

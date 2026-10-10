@@ -7,9 +7,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // recordingAppender records every digest_marked_read event and optionally
@@ -57,6 +61,44 @@ func (d *failingUpsertDB) QueryRow(ctx context.Context, sql string, args ...any)
 type errRow struct{ err error }
 
 func (r errRow) Scan(_ ...any) error { return r.err }
+
+// valueRow is a pgx.Row scanning one int64 into its single destination.
+type valueRow struct{ v int64 }
+
+func (r valueRow) Scan(dest ...any) error {
+	if len(dest) != 1 {
+		return errors.New("valueRow: want exactly one scan destination")
+	}
+	p, ok := dest[0].(*int64)
+	if !ok {
+		return errors.New("valueRow: destination is not *int64")
+	}
+	*p = r.v
+	return nil
+}
+
+// refusedUpsertDB is a pure (no database) DBTX whose QueryRow answers per SQL
+// text: rows[sql] when present, otherwise an error naming the unexpected
+// statement. Exec and Query are never reached by advanceWatermark and fail
+// loudly if they are.
+type refusedUpsertDB struct {
+	rows map[string]pgx.Row
+}
+
+func (d *refusedUpsertDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("refusedUpsertDB: unexpected Exec")
+}
+
+func (d *refusedUpsertDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("refusedUpsertDB: unexpected Query")
+}
+
+func (d *refusedUpsertDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+	if r, ok := d.rows[sql]; ok {
+		return r
+	}
+	return errRow{err: errors.New("refusedUpsertDB: unexpected QueryRow " + sql)}
+}
 
 func (f *fixture) watermark(t *testing.T, account *uuid.UUID, subject string) (int64, bool) {
 	t.Helper()
@@ -277,6 +319,248 @@ func TestMarkRead_ConcurrentAdvanceReportsCommitted(t *testing.T) {
 	}
 	if got, _ := f.watermark(t, nil, "cap"); got != higher {
 		t.Errorf("watermark = %d, want %d (the higher commit stands)", got, higher)
+	}
+}
+
+// overlapMarkRead overlaps two REAL transactions on two dedicated pool
+// connections through the public MarkRead (#3852). It optionally seeds the
+// watermark at *seed, then:
+//
+//  1. tx1 (conn1) upserts `higher` and stays UNCOMMITTED, holding the row lock
+//     (or, with no seed, the uncommitted first insert's unique-index entry);
+//  2. MarkRead(lower) runs on conn2 on a goroutine — its GetWatermark read does
+//     not block, but its advance statement must wait on tx1;
+//  3. pg_stat_activity is polled (via a third pool connection) until conn2's
+//     backend is in a Lock wait — POSITIVE blocked-state evidence, so the
+//     advance statement's snapshot provably predates tx1's commit. If MarkRead
+//     returns first, or no Lock wait appears by the deadline, the helper fails
+//     LOUDLY: a non-overlapping run can never pass vacuously;
+//  4. tx1 commits and MarkRead's result is returned.
+//
+// Three connections are in use at once (conn1, conn2, the poller). The fixture
+// pool comes from pgtest.NewPool -> postgres.Connect, which sets MaxConns = 10
+// (backend/internal/postgres/postgres.go:24), so all three are served without
+// waiting on the pool. The poll deadline is timescale.D-scaled; the 20ms poll
+// interval stays unscaled (the timescale trap). Precedent:
+// repoacl TestRepoACLPostgres_PurgeOverlapRejectsInFlightGuardedInsert.
+//
+// The fail-loud guard was run: committing tx1 BEFORE MarkRead starts (no
+// overlap) reddens both overlap tests with "MarkRead returned ({... Sequence:3
+// Advanced:false}, err=<nil>) before tx1 committed" — a result that would
+// otherwise have passed their assertions.
+func overlapMarkRead(t *testing.T, f *fixture, seed *int64, higher, lower int64) (MarkReadResult, error) {
+	t.Helper()
+	ctx := context.Background()
+	if seed != nil {
+		if err := f.st.UpsertWatermark(ctx, nil, "cap", testRepo, *seed); err != nil {
+			t.Fatalf("seed watermark: %v", err)
+		}
+	}
+
+	conn1, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn1: %v", err)
+	}
+	defer conn1.Release()
+	tx1, err := conn1.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer func() { _ = tx1.Rollback(ctx) }() // no-op after commit
+	if err := NewStore(tx1).UpsertWatermark(ctx, nil, "cap", testRepo, higher); err != nil {
+		t.Fatalf("uncommitted higher upsert in tx1: %v", err)
+	}
+
+	conn2, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn2: %v", err)
+	}
+	defer conn2.Release()
+	var conn2pid int
+	if err := conn2.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&conn2pid); err != nil {
+		t.Fatalf("conn2 backend pid: %v", err)
+	}
+
+	type outcome struct {
+		res MarkReadResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := NewStore(conn2).MarkRead(ctx, &recordingAppender{}, MarkReadParams{
+			CaptainSubject: "cap", Repo: testRepo, ToSequence: lower,
+		})
+		done <- outcome{res, err}
+	}()
+	// On any early t.Fatalf below, unblock conn2 (roll tx1 back) and drain the
+	// goroutine BEFORE conn2.Release runs — defers are LIFO, so this runs first.
+	received := false
+	defer func() {
+		if received {
+			return
+		}
+		_ = tx1.Rollback(ctx)
+		select {
+		case <-done:
+		case <-time.After(timescale.D(5 * time.Second)):
+		}
+	}()
+
+	deadline := timescale.D(5 * time.Second)
+	blockDeadline := time.Now().Add(deadline)
+	blocked := false
+	for time.Now().Before(blockDeadline) {
+		select {
+		case out := <-done:
+			received = true
+			t.Fatalf("MarkRead returned (%+v, err=%v) before tx1 committed — its advance did NOT wait on tx1, so the overlap this test exists to exercise did not happen", out.res, out.err)
+		default:
+		}
+		var waitEventType string
+		if err := f.pool.QueryRow(ctx,
+			`SELECT coalesce(wait_event_type, '') FROM pg_stat_activity WHERE pid = $1`, conn2pid,
+		).Scan(&waitEventType); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if waitEventType == "Lock" {
+			blocked = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !blocked {
+		t.Fatalf("conn2 never entered a Lock wait within %v — MarkRead's advance did not block on tx1, so the overlap was not exercised", deadline)
+	}
+
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+	select {
+	case out := <-done:
+		received = true
+		return out.res, out.err
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("MarkRead did not return after tx1 committed")
+	}
+	return MarkReadResult{}, nil // unreachable: t.Fatal stops the goroutine
+}
+
+// TestMarkRead_OverlappingHigherCommitReportsLatest (#3852): the watermark is
+// at head-2; a concurrent higher mark (head) holds the row uncommitted while
+// MarkRead(head-1) blocks on it, then commits. MarkRead must report the LATEST
+// committed sequence (head) with advanced=false — not the stale head-2 its own
+// statement snapshot held, and not its requested head-1.
+//
+// Counterfactuals run (each RED, then restored): pre-fix store.go (the CTE +
+// UNION ALL same-statement fallback, from HEAD) -> "result = {PreviousSequence:
+// 1 HadPrevious:true Sequence:1 Advanced:false}, want committed 3" (the stale
+// head-2); the refused branch returning the requested sequence without a
+// re-read -> "Sequence:2 ... want committed 3" (head-1).
+func TestMarkRead_OverlappingHigherCommitReportsLatest(t *testing.T) {
+	f := newFixture(t)
+	head := f.seedHead(t, 3)
+	seed := head - 2
+	res, err := overlapMarkRead(t, f, &seed, head, head-1)
+	if err != nil {
+		t.Fatalf("overlapped MarkRead: %v", err)
+	}
+	if res.Advanced || res.Sequence != head {
+		t.Errorf("result = %+v, want committed %d with advanced=false (not the stale %d, not the requested %d)", res, head, head-2, head-1)
+	}
+	if got, ok := f.watermark(t, nil, "cap"); !ok || got != head {
+		t.Errorf("stored watermark = %d/%v, want %d", got, ok, head)
+	}
+}
+
+// TestMarkRead_OverlappingFirstInsertReportsLatest (#3852): NO watermark row
+// exists; a concurrent FIRST mark (head) inserts it uncommitted while
+// MarkRead(head-1) waits on the unique-index conflict, then commits. MarkRead
+// must succeed and report head with advanced=false and had_previous=false.
+//
+// Counterfactual run (RED, then restored): pre-fix store.go -> "overlapped
+// MarkRead: digest: mark read: entry appended but watermark not advanced (a
+// retry converges it): digest: advance watermark: no rows in result set".
+func TestMarkRead_OverlappingFirstInsertReportsLatest(t *testing.T) {
+	f := newFixture(t)
+	head := f.seedHead(t, 3)
+	res, err := overlapMarkRead(t, f, nil, head, head-1)
+	if err != nil {
+		t.Fatalf("overlapped MarkRead: %v", err)
+	}
+	if res.Advanced || res.HadPrevious || res.Sequence != head {
+		t.Errorf("result = %+v, want committed %d, advanced=false, had_previous=false", res, head)
+	}
+	if got, ok := f.watermark(t, nil, "cap"); !ok || got != head {
+		t.Errorf("stored watermark = %d/%v, want %d", got, ok, head)
+	}
+	if n := f.watermarkRows(t, "cap"); n != 1 {
+		t.Errorf("watermark rows = %d, want 1", n)
+	}
+}
+
+// TestAdvanceWatermark_RefusedUpsertBranches drives advanceWatermark over a
+// pure fake DBTX whose upsert is REFUSED (pgx.ErrNoRows), one subtest per
+// branch of the separate-statement re-read.
+//
+// Counterfactuals run (each RED, then restored): the re-read-error branch
+// returning (sequence, false, nil) -> "reread error propagates" RED ("err =
+// <nil>, want errors.Is re-read unavailable"); the no-row branch returning
+// (0, false, nil) -> "reread finds no row fails closed" RED ("err = <nil>, want
+// errors.Is digest: watermark row vanished between the refused advance and its
+// re-read").
+func TestAdvanceWatermark_RefusedUpsertBranches(t *testing.T) {
+	boom := errors.New("re-read unavailable")
+	refused := errRow{err: pgx.ErrNoRows}
+	for _, tc := range []struct {
+		name        string
+		reread      pgx.Row
+		wantErr     error
+		wantCommitd int64
+	}{
+		{"reread error propagates", errRow{err: boom}, boom, 0},
+		{"reread finds no row fails closed", errRow{err: pgx.ErrNoRows}, ErrWatermarkRowVanished, 0},
+		{"reread value reported", valueRow{v: 42}, nil, 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &refusedUpsertDB{rows: map[string]pgx.Row{advanceWatermarkSQL: refused, getWatermarkSQL: tc.reread}}
+			committed, changed, err := NewStore(db).advanceWatermark(context.Background(), nil, "cap", testRepo, 7)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want errors.Is %v", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if changed || committed != tc.wantCommitd {
+				t.Errorf("advanceWatermark = (%d, %v), want (%d, false)", committed, changed, tc.wantCommitd)
+			}
+		})
+	}
+}
+
+// TestMarkRead_GenericAdvanceErrorIsNotARefusal: an advance failure that is
+// NOT pgx.ErrNoRows must surface as an error, never be mistaken for a refused
+// upsert. The PRIOR head-2 row is what makes a mis-classification observable:
+// a generic error that fell into the re-read branch would find head-2 and
+// return a nil error with advanced=false — a silent success, watermark unmoved.
+//
+// Counterfactual run (RED, then restored): classifying ANY upsert error as a
+// refusal -> "MarkRead = {... Sequence:1 Advanced:false}, <nil>; want the
+// injected advance error".
+func TestMarkRead_GenericAdvanceErrorIsNotARefusal(t *testing.T) {
+	f := newFixture(t)
+	head := f.seedHead(t, 3)
+	ctx := context.Background()
+	if err := f.st.UpsertWatermark(ctx, nil, "cap", testRepo, head-2); err != nil {
+		t.Fatal(err)
+	}
+	flaky := NewStore(&failingUpsertDB{DBTX: f.pool, failures: 1})
+	res, err := flaky.MarkRead(ctx, &recordingAppender{}, MarkReadParams{CaptainSubject: "cap", Repo: testRepo, ToSequence: head})
+	if err == nil {
+		t.Fatalf("MarkRead = %+v, %v; want the injected advance error", res, err)
+	}
+	if got, _ := f.watermark(t, nil, "cap"); got != head-2 {
+		t.Errorf("watermark after failed advance = %d, want the prior %d", got, head-2)
 	}
 }
 
