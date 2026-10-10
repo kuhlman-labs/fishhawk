@@ -52,6 +52,21 @@ const (
 // model, or the treatment effect is confounded with a model difference.
 const DefaultQualityGeneratorModel = DefaultJudgeModel
 
+// DefaultCatchRateGeneratorModel is the model that GENERATES the review for
+// BOTH arms of the E55.4 / #2245 plan-review catch-rate measurement (one model
+// for both arms, so a model difference cannot confound the conventions
+// effect). It deliberately diverges from DefaultQualityGeneratorModel
+// (maintainer decision 2026-10-10, #4235): it is about one third cheaper per
+// the repo pricing table (pricing/pricing.go, claude-sonnet-5 $2/$10 against
+// claude-sonnet $3/$15 per Mtok) and a newer reviewer. The first recording
+// pins the baseline to it, and a baseline is comparable only with the same
+// model. A literal rather than an alias, so the catch-rate model cannot move
+// when DefaultJudgeModel does. The offline gate (catchrategate/main.go) must
+// read THIS constant for a record made with it to pass CheckCatchRateEvidence
+// mode (4); that switch rides the operator's recording PR (see
+// docs/compliance/planreview-catchrate-evidence.md, Step 3).
+const DefaultCatchRateGeneratorModel = "claude-sonnet-5-5"
+
 // DefaultQualitySamples is the sample count per fixture per arm.
 //
 // N=1 cannot separate a treatment effect from judge and generator
