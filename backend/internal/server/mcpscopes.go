@@ -229,6 +229,9 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_waive_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	"fishhawk_waive_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}}, // bulk_waive.go handleBulkWaiveConcerns (E64.77 / #3318) — same predicate as the singular verb
 	"fishhawk_defer_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	// resolve_concerns.go handleResolveConcerns (E83.53 / #4086) — the waive
+	// predicate; the handler additionally refuses every agent subject.
+	"fishhawk_resolve_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	// divergence_answer.go handleAnswerDivergence (E75.5 / #3733) — the waive/defer posture.
 	"fishhawk_answer_divergence": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 

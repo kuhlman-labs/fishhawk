@@ -391,6 +391,8 @@ var KnownCategories = map[string]struct{}{
 	"concern_note_backfilled":                 {},
 	"concern_relitigation_suppressed":         {},
 	"concern_resolution_vetoed":               {},
+	"concern_resolve_failed":                  {}, // E83.53 / #4086: corrective after a failed resolve transition (server/resolve_concerns.go)
+	"concern_resolved_with_evidence":          {}, // E83.53 / #4086: a human operator resolved a routed concern as addressed on operator evidence (server/resolve_concerns.go)
 	"concern_waive_failed":                    {},
 	"concern_waived":                          {},
 	"consolidated_pr_opened":                  {},
