@@ -1,0 +1,14 @@
+id: scenario:issue-4185/apply-cancels-stale-abandoned-run
+statement: With --apply, a top-level run older than the threshold with no PR evidence ends cancelled. GET /v0/runs/{run_id}/audit carries exactly one stale_run_swept entry with reason stale_sweep, and an immediate second --apply reports 0 transitions.
+verify_hint: CLI stdout `applied:` summary, GET /v0/runs/{run_id} state=cancelled, and GET /v0/runs/{run_id}/audit with exactly one stale_run_swept entry. Decided in-repo by TestSweepStaleRuns_DryRunThenApply.
+steps: Posture B on the sanctioned checkout @0b022a3d, which the preview serves. The running target's DB was unreachable. Started a throwaway Postgres 14 on a unix socket in /tmp/fh4185/pg, then ran FISHHAWK_TEST_PG_URL=<socket url> go test -count=1 -v -run SweepStale ./cmd/fishhawkd/.
+assertions:
+    expected: ""
+    observed_at_record: TestSweepStaleRuns_DryRunThenApply PASS, along with ScanFailure, ApplyRefusesOnProbeProblem, LiveRunnerNeverTouched, InvalidDays, ConnectFailure, RequiresDB and BadFlag (8/8). Evidence sha256:d528af45a85521fe866c65c91dd103c1b61c47cb5403b2433936939b3ed9e2d7.
+    repro_handle: FISHHAWK_TEST_PG_URL=... go test -run TestSweepStaleRuns_DryRunThenApply ./backend/cmd/fishhawkd/
+origin:
+    issue: 4185
+    pr: 4216
+    run_id: 19a8b1da-a689-4d6b-b25e-b89769a4ecc3
+    head_sha: 0b022a3dfdc13a95cbcb5a09a2a356c4270243bf
+    recorded_at: 2026-10-10T05:12:58Z

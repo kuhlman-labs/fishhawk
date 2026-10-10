@@ -2,13 +2,14 @@ id: scenario:issue-4185/invalid-days-usage-error
 statement: '`fishhawkd sweep-stale-runs --days 0` exits 2 with a stderr line naming --days, before any database connection is attempted.'
 verify_hint: CLI exit code 2 and stderr naming --days from `fishhawkd sweep-stale-runs --days 0` with no --db or FISHHAWKD_DATABASE_URL set.
 steps: Ran the preview's serving binary as env -u FISHHAWKD_DATABASE_URL -u DATABASE_URL fishhawkd sweep-stale-runs --days 0, capturing stdout and stderr separately. Also tried --days -3, and --days 0 with --db pointing at an unreachable postgres://x:y@127.0.0.1:1/z.
+steps_carried_from: head 98ba01c90e344012cf33b1a4defc059df88b74a1 recorded_at 2026-10-10T03:48:35Z
 assertions:
     expected: exit 2 with a stderr line naming --days, before any database connection
-    observed_at_record: 'Exit 2 with empty stdout. stderr: ''fishhawkd sweep-stale-runs: --days must be >= 1, got 0'' plus the usage line. --days -3 also exited 2. With an unreachable --db, it still exited 2 with the --days message and no connection error, so validation happens before any connect.'
+    observed_at_record: 'Exit 2 every time with empty stdout. stderr was ''fishhawkd sweep-stale-runs: --days must be >= 1, got 0'' (or ''got -3'') plus a usage line. With the unreachable --db there was no connect attempt.'
     repro_handle: env -u FISHHAWKD_DATABASE_URL fishhawkd sweep-stale-runs --days 0; echo $?
 origin:
     issue: 4185
     pr: 4216
     run_id: 19a8b1da-a689-4d6b-b25e-b89769a4ecc3
-    head_sha: 98ba01c90e344012cf33b1a4defc059df88b74a1
-    recorded_at: 2026-10-10T03:48:35Z
+    head_sha: 0b022a3dfdc13a95cbcb5a09a2a356c4270243bf
+    recorded_at: 2026-10-10T05:12:58Z
