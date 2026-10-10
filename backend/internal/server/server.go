@@ -1190,6 +1190,18 @@ type Server struct {
 	// budget. Shutdown drains it alongside bgReviews / bgGroomingApply.
 	bgBranchSweeps sync.WaitGroup
 
+	// bgRefinementFiling tracks the DETACHED refinement filing (#4153):
+	// handleFileRefinementSession returns 202 once its synchronous gate
+	// passes and runs refinement.ExecuteFilingWith on a goroutine in this
+	// group under a child-count-scaled budget. Shutdown drains it alongside
+	// bgBranchSweeps, bounded by the shutdown context.
+	bgRefinementFiling sync.WaitGroup
+
+	// refinementFiling is the detached filing arm's in-process per-draft
+	// single-flight guard and status store (#4153), read by the session
+	// GET's filing block. Zero value ready.
+	refinementFiling refinementFilingTracker
+
 	// p95Cache memoizes implement-stage calibration p95 results keyed
 	// by workflow_id so resolveImplementTimeout's per-prompt-fetch call
 	// to implementCalibrationP95 doesn't run a full AuditRepo.ListAll
@@ -1536,8 +1548,9 @@ func (s *Server) Start() error {
 // Shutdown gracefully drains in-flight requests, capped by
 // ShutdownTimeout from the parent context. After the HTTP server
 // drains, it also waits for any detached advisory review goroutines
-// (#584), any detached grooming apply (E54.77 / #3232) and any detached
-// proposal-report apply (bgReportApply: the upkeep apply, #3924) to finish,
+// (#584), any detached grooming apply (E54.77 / #3232), any detached
+// proposal-report apply (bgReportApply: the upkeep apply, #3924) and any
+// detached refinement filing (bgRefinementFiling, #4153) to finish,
 // bounded by the same shutdown context so a hung reviewer or a wedged
 // forge can't block shutdown past the deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -1555,6 +1568,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.bgReportApply.Wait()
 		s.bgUpkeepInflight.Wait()
 		s.bgBranchSweeps.Wait()
+		s.bgRefinementFiling.Wait()
 		close(done)
 	}()
 	select {
@@ -1600,6 +1614,13 @@ func (s *Server) waitUpkeepInflight() { s.bgUpkeepInflight.Wait() }
 // (E68.67 / #3562) has finished — the deterministic sync point tests use to
 // assert on the run_branches_swept row. Production code never calls it.
 func (s *Server) waitBranchSweeps() { s.bgBranchSweeps.Wait() }
+
+// waitRefinementFiling blocks until every detached refinement filing (#4153)
+// has finished — the deterministic sync point tests use to assert on the
+// ledger rows, audit entries and tracker state a detached filing writes.
+// Production code never calls it (Shutdown drains the same group, bounded by
+// its context).
+func (s *Server) waitRefinementFiling() { s.bgRefinementFiling.Wait() }
 
 // resolveRepoScope resolves the GitHub App installation for owner/name into a
 // forge.CredentialScope (ADR-058 / #1855), the input the scope-taking

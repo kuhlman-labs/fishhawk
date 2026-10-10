@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,6 +74,16 @@ func (r *disconnectRefinementRepo) ListDecisions(_ context.Context, _ uuid.UUID)
 	return nil, nil
 }
 
+// GetFilingSession / ListFiledItems: never filed. respondRefinementSession
+// reads the filing block (#4153), and the embedded nil Repository would panic.
+func (r *disconnectRefinementRepo) GetFilingSession(context.Context, uuid.UUID) (*refinement.FilingSession, error) {
+	return nil, refinement.ErrNotFound
+}
+
+func (r *disconnectRefinementRepo) ListFiledItems(context.Context, uuid.UUID) ([]*refinement.FiledItem, error) {
+	return nil, nil
+}
+
 func (r *disconnectRefinementRepo) CreateDraft(ctx context.Context, p refinement.CreateParams) (*refinement.StoredDraft, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -124,6 +135,16 @@ func (r *seededRefinementRepo) ListForSession(context.Context, uuid.UUID) ([]*re
 
 func (r *seededRefinementRepo) ListDecisions(context.Context, uuid.UUID) ([]*refinement.Decision, error) {
 	return r.decisions, nil
+}
+
+// GetFilingSession / ListFiledItems: never filed (the #4153 filing block and
+// the file arm's synchronous ledger check read them).
+func (r *seededRefinementRepo) GetFilingSession(context.Context, uuid.UUID) (*refinement.FilingSession, error) {
+	return nil, refinement.ErrNotFound
+}
+
+func (r *seededRefinementRepo) ListFiledItems(context.Context, uuid.UUID) ([]*refinement.FiledItem, error) {
+	return nil, nil
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -1182,6 +1203,12 @@ func (r *filingRepoStub) GetFilingSession(_ context.Context, draftID uuid.UUID) 
 	return &refinement.FilingSession{DraftID: draftID, Repo: r.repo}, nil
 }
 
+// ListFiledItems: nothing recorded (the #4153 filing block reads it once a
+// filing session exists).
+func (r *filingRepoStub) ListFiledItems(context.Context, uuid.UUID) ([]*refinement.FiledItem, error) {
+	return nil, nil
+}
+
 func newFilingRepoStub(repo string) *filingRepoStub {
 	return &filingRepoStub{
 		repo: repo,
@@ -1537,5 +1564,115 @@ func TestRefinementSession_BearerUnfiltered(t *testing.T) {
 	}
 	if vis.callCount() != 0 {
 		t.Errorf("bearer caller consulted the mirror %d times, want 0", vis.callCount())
+	}
+}
+
+// ---- filing progress on the session view (#4153) ---------------------------
+
+// TestGetRefinementSession_NoFilingBlockBeforeFiling: a never-filed session
+// carries no filing block and its approval state is unchanged.
+func TestGetRefinementSession_NoFilingBlockBeforeFiling(t *testing.T) {
+	seeded := approvedSeeded(t)
+	s := New(Config{RefinementRepo: seeded, AuditRepo: okAuditRepo{}})
+	rec := httptest.NewRecorder()
+	id := seeded.drafts[0].SessionID
+	s.handleGetRefinementSession(rec, refinementReq(http.MethodGet, "/v0/refinement/sessions/"+id.String(), id.String(), ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"filing"`) {
+		t.Errorf("never-filed session view carries a filing block: %s", rec.Body.String())
+	}
+	if view := getSessionView(t, s, id); view.State != string(refinement.StateApproved) {
+		t.Errorf("state = %q, want approved", view.State)
+	}
+}
+
+// TestGetRefinementSession_FilingInProgressBlock: a filing in flight in this
+// process (no filing session opened yet) is reported in_progress with the
+// tracker's repo; a failed one is reported failed with its detail.
+func TestGetRefinementSession_FilingInProgressBlock(t *testing.T) {
+	seeded := approvedSeeded(t)
+	s := New(Config{RefinementRepo: seeded, AuditRepo: okAuditRepo{}})
+	draftID, id := seeded.drafts[0].ID, seeded.drafts[0].SessionID
+	if _, started := s.refinementFiling.tryStart(draftID, "o/r", 6, time.Minute); !started {
+		t.Fatal("seed tryStart did not start")
+	}
+
+	f := getSessionView(t, s, id).Filing
+	if f == nil || f.State != refinementFilingStateInProgress || !f.InFlight || f.Repo != "o/r" || f.ChildCount != 6 || f.StartedAt == nil {
+		t.Fatalf("filing = %+v, want in_progress/in_flight on o/r with 6 children and started_at", f)
+	}
+
+	// C4: a failure keeps the detail; the next launch overwrites it.
+	ord := 3
+	s.refinementFiling.fail(draftID, "boom", &ord, refinement.FilingStepLink)
+	f = getSessionView(t, s, id).Filing
+	if f == nil || f.State != refinementFilingStateFailed || f.InFlight || f.LastError != "boom" || f.Step != refinement.FilingStepLink || f.FailedOrdinal == nil || *f.FailedOrdinal != 3 {
+		t.Fatalf("filing = %+v, want failed with boom/link/3", f)
+	}
+	if _, started := s.refinementFiling.tryStart(draftID, "o/r", 6, time.Minute); !started {
+		t.Fatal("a launch after a failure did not start (it must, never already_in_progress)")
+	}
+	f = getSessionView(t, s, id).Filing
+	if f == nil || f.State != refinementFilingStateInProgress || f.LastError != "" || f.FailedOrdinal != nil || f.Step != "" {
+		t.Fatalf("filing after relaunch = %+v, want in_progress with the failure cleared", f)
+	}
+	s.refinementFiling.succeed(draftID)
+	if _, tracked := s.refinementFiling.snapshot(draftID); tracked {
+		t.Error("succeed left the tracker entry")
+	}
+}
+
+// TestGetRefinementSession_FilingIncompleteBlock: an open filing session with
+// nothing in flight here and no recorded failure (a restart, another replica)
+// is incomplete, carrying the filed-so-far items from the ledger.
+func TestGetRefinementSession_FilingIncompleteBlock(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
+	draftID := mustDraftID(t, repo, sessionID)
+	ctx := context.Background()
+	if _, err := repo.CreateFilingSession(ctx, refinement.FilingSessionParams{DraftID: draftID, SessionID: sessionID, Repo: "o/r"}); err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+	for ord, num := range map[int]int{0: 10, 1: 11} {
+		if _, err := repo.RecordFiledItem(ctx, refinement.FiledItemParams{DraftID: draftID, Ordinal: ord, IssueNumber: num, IssueURL: fmt.Sprintf("u/%d", num)}); err != nil {
+			t.Fatalf("RecordFiledItem: %v", err)
+		}
+	}
+	s := New(Config{RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool)})
+
+	view := getSessionView(t, s, sessionID)
+	f := view.Filing
+	if f == nil || f.State != refinementFilingStateIncomplete || f.InFlight || f.Repo != "o/r" || f.FiledCount != 2 {
+		t.Fatalf("filing = %+v, want incomplete on o/r with 2 filed", f)
+	}
+	if f.Epic == nil || f.Epic.Number != 10 || len(f.Children) != 1 || f.Children[0].Number != 11 || f.CompletedAt != nil {
+		t.Errorf("filing items epic=%+v children=%+v completed_at=%v, want #10, [#11], nil", f.Epic, f.Children, f.CompletedAt)
+	}
+	if view.State != string(refinement.StateApproved) {
+		t.Errorf("state = %q, want approved (not filed until completed_at)", view.State)
+	}
+}
+
+// TestGetRefinementSession_FilingReadFaults500: a fault reading the filing
+// ledger for the view is a 500, never a silently-omitted filing block.
+func TestGetRefinementSession_FilingReadFaults500(t *testing.T) {
+	cases := map[string]*filingFaultRepo{
+		"get filing session": {getErr: errors.New("filing_sessions down")},
+		"list filed items":   {sess: &refinement.FilingSession{Repo: "o/r"}, listErr: errors.New("filed_items down")},
+	}
+	for name, repo := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo.seededRefinementRepo = approvedSeeded(t)
+			s := New(Config{RefinementRepo: repo, AuditRepo: okAuditRepo{}})
+			id := repo.drafts[0].SessionID
+			rec := httptest.NewRecorder()
+			s.handleGetRefinementSession(rec, refinementReq(http.MethodGet, "/v0/refinement/sessions/"+id.String(), id.String(), ""))
+			if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "filing progress") {
+				t.Fatalf("status = %d, want 500 naming the filing progress (body=%s)", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
