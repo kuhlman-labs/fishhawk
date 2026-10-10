@@ -15,6 +15,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 # Signing/identity isolation, mirroring scripts/test (#912): a global
 # commit.gpgsign would otherwise break the throwaway-repo commits below.
 export GIT_CONFIG_GLOBAL=/dev/null
@@ -113,7 +119,7 @@ foo_profile "$tmproot/a.out" 0 0 0
 out="$(run_diff "$repo" "$tmproot/a.out")"
 rc=$?
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+   && printf '%s' "$out" | grep_q 'backend/internal/foo/foo.go:7'; then
   pass "(a) 0%-covered new function fails and names the uncovered path:line"
 else
   fail "(a) expected non-zero + uncovered path:line (rc=$rc, out='$out')"
@@ -125,7 +131,7 @@ fi
 foo_profile "$tmproot/b.out" 1 1 1
 out="$(run_diff "$repo" "$tmproot/b.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PATCH PASS'; then
   pass "(b) fully covered new function passes"
 else
   fail "(b) expected 0 + PATCH PASS (rc=$rc, out='$out')"
@@ -139,7 +145,7 @@ out="$(run_diff "$repo" "$tmproot/c.out" --diff-threshold 90)"
 rc_low=$?
 out2="$(run_diff "$repo" "$tmproot/c.out" --diff-threshold 80)"
 rc_at=$?
-if [ "$rc_low" -ne 0 ] && printf '%s' "$out" | grep -q '80.0%' \
+if [ "$rc_low" -ne 0 ] && printf '%s' "$out" | grep_q '80.0%' \
    && [ "$rc_at" -eq 0 ]; then
   pass "(c) 80% patch coverage fails at threshold 90 and passes at 80"
 else
@@ -173,7 +179,7 @@ ${PFX}backend/internal/store/db/queries.sql.go:3.22,5.2 1 0
 EOF
 out="$(run_diff "$repo" "$tmproot/d.out" --exclude '/db/')"
 rc=$?
-if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'queries.sql.go'; then
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep_q 'queries.sql.go'; then
   pass "(d) --exclude '/db/' drops the generated file from the patch denominator"
 else
   fail "(d) expected 0 with no queries.sql.go in the report (rc=$rc, out='$out')"
@@ -192,8 +198,8 @@ out="$(python3 "$CC" --threshold 70 "$tmproot/agg.out" 2>&1)"
 rc_pass=$?
 out2="$(python3 "$CC" --threshold 90 "$tmproot/agg.out" 2>&1)"
 rc_fail=$?
-if [ "$rc_pass" -eq 0 ] && printf '%s' "$out" | grep -q '^PASS$' \
-   && [ "$rc_fail" -eq 1 ] && printf '%s' "$out2" | grep -q 'below threshold'; then
+if [ "$rc_pass" -eq 0 ] && printf '%s' "$out" | grep_q '^PASS$' \
+   && [ "$rc_fail" -eq 1 ] && printf '%s' "$out2" | grep_q 'below threshold'; then
   pass "(e) aggregate mode without --diff-base is unchanged (pass and fail paths)"
 else
   fail "(e) aggregate regression (rc_pass=$rc_pass rc_fail=$rc_fail out='$out' out2='$out2')"
@@ -232,8 +238,8 @@ ${PFX}backend/internal/foo/foo.go:3.1,7.2 4 0
 ${PFX}backend/internal/foo/foo.go:9.1,9.10 1 1
 EOF
 out_split="$(python3 "$CC" --threshold 90 "$tmproot/m1-a.out" "$tmproot/m1-b.out" 2>&1)"; rc_split=$?
-if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep -q '5/5 = 100.0%' \
-   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep -q '5/5 = 100.0%'; then
+if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep_q '5/5 = 100.0%' \
+   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep_q '5/5 = 100.0%'; then
   pass "(m1) two overlapping shard profiles aggregate to the same 100% as one full profile"
 else
   fail "(m1) expected both 100.0% (rc_full=$rc_full out_full='$out_full' rc_split=$rc_split out_split='$out_split')"
@@ -253,7 +259,7 @@ mode: atomic
 ${PFX}backend/internal/bar/b.go:3.1,3.10 1 0
 EOF
 out="$(python3 "$CC" --threshold 70 "$tmproot/m2-a.out" "$tmproot/m2-b.out" 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '4/5 = 80.0%'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q '4/5 = 80.0%'; then
   pass "(m2) two disjoint profiles aggregate to the unchanged 80.0% (merge is an identity map)"
 else
   fail "(m2) expected 4/5 = 80.0% (rc=$rc, out='$out')"
@@ -299,7 +305,7 @@ print("MERGE OK")
 PY
 )"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'MERGE OK'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'MERGE OK'; then
   pass "(m3) merge_profiles combines set by MAX (1) and count/atomic by SUM (5)"
 else
   fail "(m3) per-mode combination (rc=$rc, out='$out')"
@@ -311,8 +317,8 @@ fi
 #      deleted the run proceeds and exits 0 with a printed percentage.
 # ---------------------------------------------------------------------------
 out="$(python3 "$CC" --threshold 50 "$tmproot/m3-set-a.out" "$tmproot/m3-atomic-a.out" 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'differing modes' \
-   && printf '%s' "$out" | grep -q "'set'" && printf '%s' "$out" | grep -q "'atomic'"; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'differing modes' \
+   && printf '%s' "$out" | grep_q "'set'" && printf '%s' "$out" | grep_q "'atomic'"; then
   pass "(m4) mixed set/atomic profiles fail closed (exit 1) naming both modes"
 else
   fail "(m4) expected exit 1 naming both modes (rc=$rc, out='$out')"
@@ -332,8 +338,8 @@ mode: atomic
 ${PFX}backend/internal/foo/foo.go:3.1,7.2 3 1
 EOF
 out="$(python3 "$CC" --threshold 50 "$tmproot/m5-a.out" "$tmproot/m5-b.out" 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'conflicting numstmts' \
-   && printf '%s' "$out" | grep -q 'foo/foo.go:3.1,7.2'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'conflicting numstmts' \
+   && printf '%s' "$out" | grep_q 'foo/foo.go:3.1,7.2'; then
   pass "(m5) same span with conflicting numstmts fails closed (exit 1) naming the file and span"
 else
   fail "(m5) expected exit 1 naming the file and span (rc=$rc, out='$out')"
@@ -356,8 +362,8 @@ foo_profile "$tmproot/m6-a.out" 1 1 0
 foo_profile "$tmproot/m6-b.out" 0 0 1
 out_split="$(python3 "$CC" --diff-base main --repo-root "$repo" \
               "$tmproot/m6-a.out" "$tmproot/m6-b.out" 2>&1)"; rc_split=$?
-if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep -q 'Patch coverage: 5/5' \
-   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep -q 'Patch coverage: 5/5'; then
+if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep_q 'Patch coverage: 5/5' \
+   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep_q 'Patch coverage: 5/5'; then
   pass "(m6) the diff gate over two overlapping shards reports the same 5/5 as one full profile"
 else
   fail "(m6) expected both 5/5 (rc_full=$rc_full out_full='$out_full' rc_split=$rc_split out_split='$out_split')"
@@ -375,7 +381,7 @@ git -C "$repo" commit -q -m docs
 foo_profile "$tmproot/f.out" 0 0 0
 out="$(run_diff "$repo" "$tmproot/f.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP: no changed Go files'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'SKIP: no changed Go files'; then
   pass "(f) no changed Go files skips with a printed reason (exit 0)"
 else
   fail "(f) expected 0 + 'no changed Go files' skip (rc=$rc, out='$out')"
@@ -396,7 +402,7 @@ ${PFX}backend/internal/foo/foo.go:7.1,7.13 1 0
 EOF
 out="$(run_diff "$repo" "$tmproot/g.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'diff-min-statements'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'diff-min-statements'; then
   pass "(g) sub-floor diff skips with a printed reason (exit 0)"
 else
   fail "(g) expected 0 + sub-floor skip (rc=$rc, out='$out')"
@@ -423,7 +429,7 @@ EOF
 out="$(run_diff "$repo" "$tmproot/g2.out")"
 rc=$?
 if [ "$rc" -eq 0 ] \
-   && printf '%s' "$out" | grep -q 'no coverable new Go statements in the diff'; then
+   && printf '%s' "$out" | grep_q 'no coverable new Go statements in the diff'; then
   pass "(g2) a changed file whose lines hit no profile block skips (total_new==0, exit 0)"
 else
   fail "(g2) expected 0 + 'no coverable new Go statements' skip (rc=$rc, out='$out')"
@@ -435,7 +441,7 @@ fi
 repo="$tmproot/a"
 out="$(python3 "$CC" --diff-base nosuchref --repo-root "$repo" "$tmproot/a.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'does not resolve'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'does not resolve'; then
   pass "(h) unresolvable base ref skips with a printed reason (exit 0)"
 else
   fail "(h) expected 0 + does-not-resolve skip (rc=$rc, out='$out')"
@@ -446,7 +452,7 @@ fi
 # ---------------------------------------------------------------------------
 out="$(python3 "$CC" --diff-base=-oops --repo-root "$repo" "$tmproot/a.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'invalid --diff-base value'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'invalid --diff-base value'; then
   pass "(h2) invalid base-ref override skips with its own reason (exit 0)"
 else
   fail "(h2) expected 0 + invalid-override skip (rc=$rc, out='$out')"
@@ -464,7 +470,7 @@ git -C "$repo" add -A
 git -C "$repo" commit -q -m orphan
 out="$(run_diff "$repo" "$tmproot/a.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no merge base'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'no merge base'; then
   pass "(h3) resolved ref with no merge base skips with a printed reason (exit 0)"
 else
   fail "(h3) expected 0 + no-merge-base skip (rc=$rc, out='$out')"
@@ -476,7 +482,7 @@ fi
 mkdir -p "$tmproot/nogit"
 out="$(python3 "$CC" --diff-base main --repo-root "$tmproot/nogit" "$tmproot/a.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'not a git work tree'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'not a git work tree'; then
   pass "(i) non-git repo root skips with a printed reason (exit 0)"
 else
   fail "(i) expected 0 + not-a-work-tree skip (rc=$rc, out='$out')"
@@ -485,7 +491,7 @@ fi
 git init -q --bare "$tmproot/bare"
 out="$(python3 "$CC" --diff-base main --repo-root "$tmproot/bare" "$tmproot/a.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'not a git work tree'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'not a git work tree'; then
   pass "(i2) bare repo skips with a printed reason (exit 0)"
 else
   fail "(i2) expected 0 + not-a-work-tree skip for a bare repo (rc=$rc, out='$out')"
@@ -497,7 +503,7 @@ fi
 out="$(PATH="/nonexistent" "$(command -v python3)" "$CC" --diff-base main \
         --repo-root "$tmproot/a" "$tmproot/a.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'git not found on PATH'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'git not found on PATH'; then
   pass "(i3) git binary absent skips with a printed reason (exit 0)"
 else
   fail "(i3) expected 0 + git-not-found skip (rc=$rc, out='$out')"
@@ -514,9 +520,9 @@ rc_fail=$?
 out2="$(python3 "$CC" --threshold 70 --diff-base main --repo-root "$tmproot/nogit" \
         "$tmproot/agg.out" 2>&1)"
 rc_pass=$?
-if [ "$rc_fail" -eq 1 ] && printf '%s' "$out" | grep -q 'not a git work tree' \
-   && printf '%s' "$out" | grep -q 'below threshold' \
-   && [ "$rc_pass" -eq 0 ] && printf '%s' "$out2" | grep -q 'not a git work tree'; then
+if [ "$rc_fail" -eq 1 ] && printf '%s' "$out" | grep_q 'not a git work tree' \
+   && printf '%s' "$out" | grep_q 'below threshold' \
+   && [ "$rc_pass" -eq 0 ] && printf '%s' "$out2" | grep_q 'not a git work tree'; then
   pass "(4) combined mode: a git failure skips the patch gate; the aggregate decides"
 else
   fail "(4) combined mode (rc_fail=$rc_fail rc_pass=$rc_pass out='$out' out2='$out2')"
@@ -534,7 +540,7 @@ example.com/other/backend/internal/foo/foo.go:11.2,11.13 1 0
 EOF
 out="$(run_diff "$repo" "$tmproot/j.out" --module-prefix 'example.com/other/')"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'backend/internal/foo/foo.go:7'; then
   pass "(j) --module-prefix maps a profile import path to the repo-relative path"
 else
   fail "(j) expected the mapped path to be gated (rc=$rc, out='$out')"
@@ -547,7 +553,7 @@ fi
 # ---------------------------------------------------------------------------
 out="$(run_diff "$repo" "$tmproot/b.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Patch coverage: 5/5'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'Patch coverage: 5/5'; then
   pass "(k) statement-free added lines are ignored, not counted uncovered"
 else
   fail "(k) expected 5/5 (rc=$rc, out='$out')"
@@ -602,7 +608,7 @@ print("HUNK OK")
 PY
 )"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'HUNK OK'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'HUNK OK'; then
   pass "(l) hunk-header edge cases: omitted count, pure deletion, deleted file, ++-prefixed body line"
 else
   fail "(l) hunk-header parsing (rc=$rc, out='$out')"
@@ -637,7 +643,7 @@ ${PFX}backend/internal/foo/sibling.go:3.22,5.2 1 0
 EOF
 out="$(run_diff "$repo" "$tmproot/m.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'sibling.go'; then
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep_q 'sibling.go'; then
   pass "(m) a post-fork commit on the base branch is not attributed to the patch"
 else
   fail "(m) expected sibling.go excluded via the merge base (rc=$rc, out='$out')"
@@ -655,7 +661,7 @@ patched_go > "$repo/backend/internal/foo/foo.go"   # deliberately NOT committed
 foo_profile "$tmproot/n.out" 0 0 0
 out="$(run_diff "$repo" "$tmproot/n.out")"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'backend/internal/foo/foo.go:7'; then
   pass "(n) work-tree diffing gates an uncommitted new function (dirty-tree contract)"
 else
   fail "(n) expected the uncommitted change to be gated (rc=$rc, out='$out')"
@@ -689,7 +695,7 @@ ${PFX}backend/internal/foo/brand_new.go:7.2,7.13 1 0
 EOF
 out="$(run_diff "$repo" "$tmproot/n2.out" --diff-min-statements 1)"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/brand_new.go:3'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'backend/internal/foo/brand_new.go:3'; then
   pass "(n2) an untracked new .go file is gated (git diff cannot see it; go test compiles it)"
 else
   fail "(n2) expected the untracked new file to be gated (rc=$rc, out='$out')"
@@ -704,7 +710,7 @@ ${PFX}backend/internal/foo/brand_new.go:7.2,7.13 1 1
 EOF
 out="$(run_diff "$repo" "$tmproot/n2b.out" --diff-min-statements 1)"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PATCH PASS'; then
   pass "(n2b) the same untracked file fully covered passes"
 else
   fail "(n2b) expected 0 + PATCH PASS (rc=$rc, out='$out')"
@@ -722,7 +728,7 @@ func G() int {
 EOF
 out="$(run_diff "$repo" "$tmproot/n2b.out" --diff-min-statements 1)"
 rc=$?
-if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'generated/gen.go'; then
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep_q 'generated/gen.go'; then
   pass "(n2c) a git-ignored untracked .go file is not folded into the denominator"
 else
   fail "(n2c) expected generated/gen.go excluded (rc=$rc, out='$out')"
@@ -764,7 +770,7 @@ out="$(run_diff "$repo" "$tmproot/p.out" --diff-min-statements 1)"
 rc=$?
 miss=""
 for wf in "$weird_quote" "$weird_slash" "$weird_space" "$weird_utf8"; do
-  if ! printf '%s' "$out" | grep -qF "backend/internal/foo/${wf}:3"; then
+  if ! printf '%s' "$out" | grep_q -F "backend/internal/foo/${wf}:3"; then
     miss="$miss $wf"
   fi
 done
@@ -804,7 +810,7 @@ print("NEWLINE OK")
 PY
 )"
   rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'NEWLINE OK'; then
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'NEWLINE OK'; then
     pass "(p2) a filename containing a newline is discovered, not split into two paths"
   else
     fail "(p2) newline filename (rc=$rc, out='$out')"
@@ -860,7 +866,7 @@ print("DECODE OK")
 PY
 )"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'DECODE OK'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'DECODE OK'; then
   pass "(p3) C-quoted decoding, NUL-only splitting, and undecodable forms fail closed"
 else
   fail "(p3) decoding layer (rc=$rc, out='$out')"
@@ -883,9 +889,9 @@ rc = cc.main()
 print(f"RC={rc}")
 PY
 )"
-if printf '%s' "$out" | grep -q 'RC=1' \
-   && printf '%s' "$out" | grep -q 'FAIL: undecodable changed path' \
-   && printf '%s' "$out" | grep -q 'foo.go'; then
+if printf '%s' "$out" | grep_q 'RC=1' \
+   && printf '%s' "$out" | grep_q 'FAIL: undecodable changed path' \
+   && printf '%s' "$out" | grep_q 'foo.go'; then
   pass "(p4) an unidentifiable changed path fails the gate closed, naming the path"
 else
   fail "(p4) expected a fail-closed exit 1 naming the path (out='$out')"
@@ -897,7 +903,7 @@ fi
 # ---------------------------------------------------------------------------
 out="$(python3 "$CC" "$tmproot/agg.out" 2>&1)"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'required'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'required'; then
   pass "(o) neither --threshold nor --diff-base is a usage error"
 else
   fail "(o) expected a usage error (rc=$rc, out='$out')"
@@ -1027,7 +1033,7 @@ dig="$(snap_digest "$tmproot/snap1.json")"
 foo_profile "$tmproot/snap1_b.out" 1 1 1
 out="$(consume "$repo" "$tmproot/snap1.json" "$dig" "$tmproot/snap1_b.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PATCH PASS'; then
   pass "(s2) consume of a valid snapshot produces the correct verdict (PATCH PASS)"
 else
   fail "(s2) consume verdict (rc=$rc out='$out')"
@@ -1051,8 +1057,8 @@ git -C "$repo" show main:backend/internal/foo/foo.go > "$repo/backend/internal/f
 foo_profile "$tmproot/snap3.out" 0 0 0
 out_snap="$(consume "$repo" "$tmproot/snap3.json" "$dig3" "$tmproot/snap3.out")"; rc_snap=$?
 out_recompute="$(run_diff "$repo" "$tmproot/snap3.out")"; rc_recompute=$?
-if [ "$rc_snap" -ne 0 ] && printf '%s' "$out_snap" | grep -q 'backend/internal/foo/foo.go:7' \
-   && [ "$rc_recompute" -eq 0 ] && printf '%s' "$out_recompute" | grep -q 'no changed Go files'; then
+if [ "$rc_snap" -ne 0 ] && printf '%s' "$out_snap" | grep_q 'backend/internal/foo/foo.go:7' \
+   && [ "$rc_recompute" -eq 0 ] && printf '%s' "$out_recompute" | grep_q 'no changed Go files'; then
   pass "(s3) snapshot consume fails closed after a mid-loop revert; recompute would SKIP (the bypass)"
 else
   fail "(s3) TOCTOU invariance (rc_snap=$rc_snap out_snap='$out_snap' rc_recompute=$rc_recompute out_recompute='$out_recompute')"
@@ -1067,7 +1073,7 @@ emit_snap "$tmproot/snognit" "$tmproot/skip.json" >/dev/null   # non-git -> skip
 sdig="$(snap_digest "$tmproot/skip.json")"
 out="$(consume "$repo" "$tmproot/skip.json" "$sdig" "$tmproot/snap3.out")"
 rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP:'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'SKIP:'; then
   pass "(s4) a skip-snapshot is consumed as a skip (exit 0)"
 else
   fail "(s4) skip-snapshot consume (rc=$rc out='$out')"
@@ -1078,9 +1084,9 @@ fi
 # ---------------------------------------------------------------------------
 out="$(consume "$repo" "$tmproot/does-not-exist.json" deadbeef "$tmproot/snap3.out")"
 rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'FAIL' \
-   && printf '%s' "$out" | grep -q 'cannot read changed snapshot' \
-   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'FAIL' \
+   && printf '%s' "$out" | grep_q 'cannot read changed snapshot' \
+   && ! printf '%s' "$out" | grep_q 'SKIP'; then
   pass "(s5) a missing snapshot fails closed (exit 1), never a skip"
 else
   fail "(s5) missing-snapshot fail-closed (rc=$rc out='$out')"
@@ -1095,8 +1101,8 @@ printf 'not json{' > "$tmproot/corrupt.json"
 cdig="$(snap_digest "$tmproot/corrupt.json")"
 out="$(consume "$repo" "$tmproot/corrupt.json" "$cdig" "$tmproot/snap3.out")"
 rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'malformed changed snapshot' \
-   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'malformed changed snapshot' \
+   && ! printf '%s' "$out" | grep_q 'SKIP'; then
   pass "(s6) a corrupt snapshot fails closed (exit 1), never a skip"
 else
   fail "(s6) corrupt-snapshot fail-closed (rc=$rc out='$out')"
@@ -1108,8 +1114,8 @@ fi
 # ---------------------------------------------------------------------------
 out="$(consume "$repo" "$tmproot/snap3.json" 0000000000000000000000000000000000000000000000000000000000000000 "$tmproot/snap3.out")"
 rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'digest mismatch' \
-   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'digest mismatch' \
+   && ! printf '%s' "$out" | grep_q 'SKIP'; then
   pass "(s7) a digest mismatch fails closed (exit 1), never a skip"
 else
   fail "(s7) digest-mismatch fail-closed (rc=$rc out='$out')"
@@ -1121,8 +1127,8 @@ fi
 out="$(python3 "$CC" --diff-base main --repo-root "$repo" \
         --changed-snapshot "$tmproot/snap3.json" "$tmproot/snap3.out" 2>&1)"
 rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no expected snapshot digest' \
-   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'no expected snapshot digest' \
+   && ! printf '%s' "$out" | grep_q 'SKIP'; then
   pass "(s7b) a missing expected digest fails closed (exit 1)"
 else
   fail "(s7b) absent-digest fail-closed (rc=$rc out='$out')"
@@ -1143,9 +1149,9 @@ sys.argv = ["cc", "--emit-changed-snapshot", sys.argv[3], "--diff-base", "main",
 print(f"RC={cc.main()}")
 PY
 )"
-if printf '%s' "$out" | grep -q 'RC=1' \
-   && printf '%s' "$out" | grep -q 'FAIL: undecodable changed path' \
-   && printf '%s' "$out" | grep -q '\.go'; then
+if printf '%s' "$out" | grep_q 'RC=1' \
+   && printf '%s' "$out" | grep_q 'FAIL: undecodable changed path' \
+   && printf '%s' "$out" | grep_q '\.go'; then
   pass "(s8) an undecodable changed path at emit fails closed, naming the path"
 else
   fail "(s8) emit undecodable-path fail-closed (out='$out')"
@@ -1156,7 +1162,7 @@ fi
 # ---------------------------------------------------------------------------
 out="$(python3 "$CC" --diff-base main --repo-root "$repo" 2>&1)"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'at least one coverage profile is required'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'at least one coverage profile is required'; then
   pass "(s9) zero profiles is a usage error in non-emit mode (nargs guard preserved)"
 else
   fail "(s9) zero-profile guard (rc=$rc out='$out')"
@@ -1186,8 +1192,8 @@ for bad in \
   bdig="$(snap_digest "$tmproot/s10.json")"
   bout="$(consume "$repo" "$tmproot/s10.json" "$bdig" "$tmproot/snap3.out")"
   brc=$?
-  if [ "$brc" -ne 1 ] || printf '%s' "$bout" | grep -q 'SKIP' \
-     || ! printf '%s' "$bout" | grep -q 'FAIL'; then
+  if [ "$brc" -ne 1 ] || printf '%s' "$bout" | grep_q 'SKIP' \
+     || ! printf '%s' "$bout" | grep_q 'FAIL'; then
     echo "  s10 payload not rejected: '$bad' (rc=$brc out='$bout')"
     s10_fail=1
   fi
@@ -1213,10 +1219,10 @@ out="$(python3 "$CC" --diff-base main --repo-root "$repo" \
   --changed-snapshot "$tmproot/snap1.json" --expected-snapshot-digest "$dig1" 2>&1)"; rc=$?
 out_skip="$(python3 "$CC" --diff-base main --repo-root "$repo" \
   --changed-snapshot "$tmproot/skip.json" --expected-snapshot-digest "$sdig" 2>&1)"; rc_skip=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'FAIL' \
-   && printf '%s' "$out" | grep -q 'no coverage profiles were produced' \
-   && ! printf '%s' "$out" | grep -q 'SKIP' \
-   && [ "$rc_skip" -eq 0 ] && printf '%s' "$out_skip" | grep -q 'SKIP'; then
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep_q 'FAIL' \
+   && printf '%s' "$out" | grep_q 'no coverage profiles were produced' \
+   && ! printf '%s' "$out" | grep_q 'SKIP' \
+   && [ "$rc_skip" -eq 0 ] && printf '%s' "$out_skip" | grep_q 'SKIP'; then
   pass "(s11) zero profiles: a non-empty change set fails closed, a skip-snapshot still skips"
 else
   fail "(s11) zero-profile snapshot handling (rc=$rc out='$out' rc_skip=$rc_skip out_skip='$out_skip')"

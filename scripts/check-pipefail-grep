@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# check-pipefail-grep: fail the build when a shell script under scripts/ that
+# enables `pipefail` pipes into a QUIET grep (#4233).
+#
+# MECHANISM. `grep -q` exits on its first match and closes the read end of the
+# pipe. A writer that still has bytes to write then gets EPIPE/SIGPIPE, and
+# `pipefail` turns that into a pipeline FAILURE even though grep MATCHED. It is
+# silent below the pipe buffer and deterministic above it: a first-line match
+# against a haystack of >= 100 KiB (macOS bash 3.2 + /usr/bin/grep) or >= 160 KiB
+# (the gate image: bash 5.2 + GNU grep 3.8) failed 20/20, so an assertion like
+# `if ! printf '%s' "$list" | grep -Fxq -- "$x"` reports a false violation once the
+# list outgrows the buffer. That is how scripts/check-site-ia flaked verify.
+#
+# THE TWO SAFE FORMS (scripts/README.md § "Pipefail grep guard"):
+#   * a here-string, `grep -Fxq -- "$x" <<< "$list"` — no writer process exists.
+#     Production scripts use this form;
+#   * the pipe-only drain helper the verify harnesses define,
+#     `grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }`,
+#     which keeps the read end open and drains stdin after grep decides, so
+#     `printf '%s' "$out" | grep_q -F needle` never EPIPEs its writer.
+#
+# Usage: scripts/check-pipefail-grep [SCRIPTS_DIR]
+#   SCRIPTS_DIR defaults to <repo>/scripts. scripts/test-check-pipefail-grep
+#   injects temp-dir fixtures so the harness never depends on the committed tree.
+#
+# WHAT IS SCANNED. The directory's top-level regular files (a shell glob — no
+# `find`, so there is no failed-walk mode). A file is a shell script only when its
+# shebang names sh, bash or zsh; python, markdown and shebang-less files are
+# skipped. A whole-line comment (first non-blank character `#`) is never a
+# finding.
+#
+# RULES (each finding prints `<path>:<line>: <rule>: <text>`):
+#   1. PIPE RULE. In a file that ENABLES PIPEFAIL — any non-comment line
+#      containing `pipe_fail` or `pipefail` in any letter case (`set -o
+#      pipefail`, `set -euo pipefail`, zsh `setopt pipe_fail` / `PIPE_FAIL`) — a
+#      non-comment line matching the ERE
+#        (^|[^|])\|[ \t]*(command[ \t]+)?[ef]?grep[ \t]([^|;&]*[ \t])?(-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)([ \t]|$)
+#      is a finding: a single `|` (never `||`), then grep / egrep / fgrep /
+#      `command grep`, then a quiet flag (`-q`, a cluster holding q such as
+#      `-Fxq`, a later `-q` token, `--quiet`, `--silent`).
+#   2. UNDEFINED-HELPER RULE. In ANY shell file, pipefail or not, a call of the
+#      drain helper in COMMAND POSITION — at line start, or after `|`, `||`, `!`,
+#      `&&`, `&`, `;`, `(`, `{`, or one of the keywords then / do / if / elif /
+#      else / while / until — is a finding unless the same file DEFINES it (a
+#      `<name>() {` or `function <name>` line). An undefined helper exits 127, so
+#      a negated assertion (`if ! ... | <helper> ...`) would pass vacuously. A
+#      mention that is not in command position (inside a word, after `$`, in
+#      prose) is not a call.
+#   3. REASONLESS MARKER. An allow marker with no reason (below) is itself a
+#      finding, on any non-comment line.
+#
+# ALLOW MARKER. A non-comment line ending in
+#   # check-pipefail-grep: allow <reason>
+# with a non-empty <reason> is exempt from BOTH rule 1 and rule 2 on that line —
+# a reviewed exception (for example a helper defined in a file this one sources,
+# which a text scan cannot see). The marker covers only its own line.
+#
+# LIMITATIONS — a TEXT scan, not a shell parser. It MISSES: a pipe at the END of
+# one line with the quiet grep on the next; grep reached through a variable, an
+# alias or a wrapper function; pipefail enabled only in a SOURCED file; a script
+# without a shebang. It OVER-FLAGS: matching text inside a heredoc body or a
+# string literal, a trailing `# ...` comment, and any non-comment `pipefail`
+# token — `set +o pipefail` included — counts as enabling. Over-flags take the
+# allow marker; misses are what review is for.
+#
+# EXIT CODES: 0 = clean, or SCRIPTS_DIR missing (fail-OPEN with a printed reason,
+# mirroring scripts/check-site-ia); 1 = findings, every one reported before the
+# single exit; 2 = the awk scan of a file FAILED (fail-CLOSED — an unscanned file
+# is not a clean file, so this refuses to report a clean tree).
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPTS_DIR="${1:-$ROOT/scripts}"
+
+if [ ! -d "$SCRIPTS_DIR" ]; then
+  echo "check-pipefail-grep: scripts dir $SCRIPTS_DIR does not exist — nothing to check"
+  exit 0
+fi
+
+# The helper's name is assembled from pieces so this file never contains it in a
+# shape rule 2 reads as a call (approval condition 1, #4233).
+helper="grep""_q"
+
+# One awk pass per file. Findings are buffered and printed in END, so rule 1 sees
+# a pipefail line that comes AFTER the pipe and rule 2 sees a definition that
+# comes after the call. Only `[ \t]` classes: BSD awk and mawk 1.3.4 agree.
+scan_prog='
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+BEGIN {
+  call_re = "(^[ \t]*|[|!;(&{][ \t]*|(^|[^A-Za-z0-9_])(then|do|if|elif|else|while|until)[ \t]+)" helper "([ \t]|$)"
+  def_re  = "(^|[^A-Za-z0-9_$])" helper "[ \t]*[(][ \t]*[)]|function[ \t]+" helper "([ \t({]|$)"
+  shell = 0; pipefail = 0; defined = 0; n = 0; ncall = 0
+}
+FNR == 1 {
+  if ($0 ~ /^#!/ && $0 ~ /[\/ \t](sh|bash|zsh)([ \t]|$)/) shell = 1
+  else exit 0
+}
+/^[ \t]*#/ { next }
+{
+  line = $0
+  if (tolower(line) ~ /pipe_?fail/) pipefail = 1
+  if (line ~ def_re) defined = 1
+  allowed = 0
+  if (match(line, /#[ \t]*check-pipefail-grep:[ \t]*allow([ \t]|$)/)) {
+    reason = trim(substr(line, RSTART + RLENGTH))
+    if (reason == "") { n++; msg[n] = FNR ": allow marker without a reason: " line }
+    else allowed = 1
+  }
+  if (allowed) next
+  if (line ~ /(^|[^|])\|[ \t]*(command[ \t]+)?[ef]?grep[ \t]([^|;&]*[ \t])?(-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)([ \t]|$)/) {
+    pipe_n++; pipe_msg[pipe_n] = FNR ": quiet grep at the read end of a pipe under pipefail (use a here-string or the drain helper): " line
+  }
+  if (line ~ call_re) {
+    ncall++; call_msg[ncall] = FNR ": " helper " called but not defined in this file: " line
+  }
+}
+END {
+  if (!shell) exit 0
+  print "SHELL"
+  for (i = 1; i <= n; i++) print "F " msg[i]
+  if (pipefail) for (i = 1; i <= pipe_n; i++) print "F " pipe_msg[i]
+  if (!defined) for (i = 1; i <= ncall; i++) print "F " call_msg[i]
+}
+'
+
+findings=0
+scanned=0
+for f in "$SCRIPTS_DIR"/*; do
+  [ -f "$f" ] || continue
+  if ! result="$(awk -v helper="$helper" "$scan_prog" "$f")"; then
+    echo "check-pipefail-grep: scanning $f FAILED — refusing to report a clean tree" >&2
+    exit 2
+  fi
+  [ -n "$result" ] || continue
+  while IFS= read -r r; do
+    case "$r" in
+      SHELL) scanned=$((scanned + 1)) ;;
+      "F "*)
+        echo "$f:${r#F }"
+        findings=$((findings + 1))
+        ;;
+    esac
+  done <<< "$result"
+done
+
+if [ "$findings" -gt 0 ]; then
+  echo "check-pipefail-grep: $findings finding(s) under $SCRIPTS_DIR — never pipe into a quiet grep under pipefail; use a here-string or the drain helper (scripts/README.md § \"Pipefail grep guard\")" >&2
+  exit 1
+fi
+
+echo "check-pipefail-grep: $scanned shell script(s) under $SCRIPTS_DIR clean"
+exit 0

@@ -47,6 +47,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot="$(mktemp -d)"
 trap 'rm -rf "$tmproot"' EXIT
 
@@ -443,11 +449,11 @@ expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "o
   "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
 argv="$(cat "$log")"
 first_run="$(awk '/^--- invocation/{n++} n==1' "$log")"
-if printf '%s\n' "$first_run" | grep -qxF '[run]' \
-  && printf '%s\n' "$first_run" | grep -qxF '[--rm]' \
+if printf '%s\n' "$first_run" | grep_q -xF '[run]' \
+  && printf '%s\n' "$first_run" | grep_q -xF '[--rm]' \
   && printf '%s\n' "$first_run" | awk 'p=="[--entrypoint]"{ok=($0=="[]")} {p=$0} END{exit !ok}' \
   && printf '%s\n' "$first_run" | awk 'p=="[--platform]"{ok=($0=="[linux/arm64]")} {p=$0} END{exit !ok}' \
-  && printf '%s\n' "$first_run" | grep -qxF '[fishhawk-gate:test]'; then
+  && printf '%s\n' "$first_run" | grep_q -xF '[fishhawk-gate:test]'; then
   pass "d8: the probe argv carries run --rm --entrypoint '' --platform linux/arm64 and the image ref"
 else
   fail "d8: probe argv contract broken; argv: $argv"

@@ -29,6 +29,12 @@ pass() {
 }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot=$(mktemp -d)
 trap 'rm -rf "$tmproot"' EXIT
 
@@ -274,7 +280,7 @@ eval "$saved_trap"                        # restore cleanup trap (untouched if u
 kill "$other" 2>/dev/null
 if [ "$reg_rc" -ne 0 ] && [ ! -e "$LEASE_DIR/$(_lease_token)" ] \
    && [ -e "$LEASE_DIR/$other" ] \
-   && ! printf '%s' "$armed_trap" | grep -q _reap_shared_container \
+   && ! printf '%s' "$armed_trap" | grep_q _reap_shared_container \
    && [ "$(rm_count)" -eq 0 ]; then
   pass "register-timeout: stuck lock records no lease, reap unarmed, container kept"
 else
@@ -329,8 +335,8 @@ unset FISHHAWK_TEST_LEASE_TOKEN
 # The warning's OPERATOR CLEANUP HINT is the third `docker rm` site (#3710): a
 # hand cleanup must not leak either, so assert the printed command carries `-v`.
 if grep -qx 'rm -f -v cNew' "$rmlog" && ! grep -qx 'rm -f -v cPre' "$rmlog" \
-   && printf '%s' "$warnout" | grep -q 'pre-existing' \
-   && printf '%s' "$warnout" | grep -qF 'docker rm -f -v $(docker ps -aq' \
+   && printf '%s' "$warnout" | grep_q 'pre-existing' \
+   && printf '%s' "$warnout" | grep_q -F 'docker rm -f -v $(docker ps -aq' \
    && no_volume_removal; then
   pass "pre-generation sparing: cPre spared + reported, cNew swept, hint carries -v"
 else
@@ -494,8 +500,8 @@ printf 'v1\nv2\nv3\n' > "$volfile"
 export FISHHAWK_TEST_VOLUME_WARN_AT=2
 volout=$(_preflight_volume_warn 2>&1 >/dev/null)
 unset FISHHAWK_TEST_VOLUME_WARN_AT
-if printf '%s' "$volout" | grep -q '3 dangling anonymous Docker volume' \
-   && printf '%s' "$volout" | grep -qF 'docker volume prune -f' \
+if printf '%s' "$volout" | grep_q '3 dangling anonymous Docker volume' \
+   && printf '%s' "$volout" | grep_q -F 'docker volume prune -f' \
    && no_volume_removal; then
   pass "volume warning: fires above threshold with the count and the prune command"
 else
@@ -524,7 +530,7 @@ seq 1 101 | sed 's/^/v/' > "$volfile"                # arm 4: 101 > default 100
 garbage_warn_out=$(_preflight_volume_warn 2>&1 >/dev/null)
 unset FISHHAWK_TEST_VOLUME_WARN_AT
 if [ -z "$at_out" ] && [ -z "$below_out" ] && [ -z "$garbage_out" ] \
-   && printf '%s' "$garbage_warn_out" | grep -q '101 dangling anonymous Docker volume' \
+   && printf '%s' "$garbage_warn_out" | grep_q '101 dangling anonymous Docker volume' \
    && no_volume_removal; then
   pass "volume warning: silent at threshold, below threshold, and non-numeric knob falls back to 100"
 else
@@ -562,8 +568,8 @@ callsite_out=$(_register_lease 2>&1 >/dev/null)
 unset FISHHAWK_TEST_ORPHAN_WARN_AT
 unset FISHHAWK_TEST_VOLUME_WARN_AT
 unset FISHHAWK_TEST_LEASE_TOKEN
-if printf '%s' "$callsite_out" | grep -q '7 dangling anonymous Docker volume' \
-   && printf '%s' "$callsite_out" | grep -qF 'docker volume prune -f' \
+if printf '%s' "$callsite_out" | grep_q '7 dangling anonymous Docker volume' \
+   && printf '%s' "$callsite_out" | grep_q -F 'docker volume prune -f' \
    && no_volume_removal; then
   pass "warning call site: _register_lease's generation-open path emits the volume warning"
 else

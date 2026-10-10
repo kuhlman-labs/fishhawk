@@ -24,11 +24,17 @@ git -C "$tmpdir" commit -q -m "init"
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 # Case 1: Mach-O header at repo root — must be rejected
 printf '\xcf\xfa\xed\xfe\x00\x00\x00\x00' > "$tmpdir/macho-binary"
 git -C "$tmpdir" add macho-binary
 output=$(git -C "$tmpdir" commit -m "add macho" 2>&1) && status=0 || status=$?
-if [ "$status" -ne 0 ] && echo "$output" | grep -q 'refusing to commit'; then
+if [ "$status" -ne 0 ] && echo "$output" | grep_q 'refusing to commit'; then
   pass "Mach-O header at root is rejected"
 else
   fail "Mach-O header at root should be rejected (status=$status, output=$output)"
@@ -39,7 +45,7 @@ git -C "$tmpdir" restore --staged macho-binary 2>/dev/null || true
 printf '\x7f\x45\x4c\x46\x00\x00\x00\x00' > "$tmpdir/elf-binary"
 git -C "$tmpdir" add elf-binary
 output=$(git -C "$tmpdir" commit -m "add elf" 2>&1) && status=0 || status=$?
-if [ "$status" -ne 0 ] && echo "$output" | grep -q 'refusing to commit'; then
+if [ "$status" -ne 0 ] && echo "$output" | grep_q 'refusing to commit'; then
   pass "ELF header at root is rejected"
 else
   fail "ELF header at root should be rejected (status=$status, output=$output)"
