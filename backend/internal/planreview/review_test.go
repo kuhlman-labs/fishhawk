@@ -1329,6 +1329,9 @@ func TestPersonaPayloadFields_CarriedForPersona(t *testing.T) {
 			[]string{`"persona":"security"`}},
 		{"review_skipped", planreview.ReviewSkippedPayload{Reason: planreview.ReasonPersonaRemitUnavailable, Persona: "security", Detail: "remit_missing"},
 			[]string{`"reason":"persona_remit_unavailable"`, `"persona":"security"`, `"detail":"remit_missing"`}},
+		// #3913: an escalation-attached persona skip carries escalation_attached.
+		{"review_skipped_escalation_attached", planreview.ReviewSkippedPayload{Reason: planreview.ReasonPersonaRemitUnavailable, Persona: "security", Detail: "remit_missing", EscalationAttached: true},
+			[]string{`"persona":"security"`, `"escalation_attached":true`}},
 		{"review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2, Personas: []string{"security"}},
 			[]string{`"configured_agents":2`, `"personas":["security"]`}},
 	}

@@ -548,8 +548,32 @@ cannot answer.
 | `planreviewcatch.go` | the catch corpus loader, the two arms, `ClassifyCatch`, `RunCatchRateArm`, `CompareCatchRateArms`, the tolerance and the power floor |
 | `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`) |
-| `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) |
+| `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `testdata/planreview-catchrate/` | the representative conventions fixture and, once an operator records it, `evidence.json` |
+
+### Generator model
+
+The arms generate with `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`),
+NOT `DefaultQualityGeneratorModel` (decided 2026-10-10, #4235: about one third
+cheaper per `pricing/pricing.go`, `claude-sonnet-5` $2/$10 against
+`claude-sonnet` $3/$15 per Mtok, and a newer reviewer). `DefaultJudgeModel` and
+`DefaultQualityGeneratorModel` do not move. The generator client config and
+the recorded `generator_model` come from ONE seam (`recordPlanReviewCatchLive`
+in `planreviewcatchlive_test.go`), so they cannot disagree; the offline wiring
+test pins both. The first recording pins the baseline to this model, and a
+baseline is comparable only with the same model, so changing it later is an
+explicit re-pin.
+
+GATE-MODEL COUPLING: `catchrategate/main.go` still reads
+`agenteval.DefaultQualityGeneratorModel`, and `CheckCatchRateEvidence` mode (4)
+refuses a record from any other model. The PR that commits the first
+`claude-sonnet-5-5` evidence must therefore switch that line (and
+`catchrategate/main_test.go`'s matching references) to
+`DefaultCatchRateGeneratorModel`. That PR already triggers
+`scripts/check-review-prompt-eval` through `evidence.json`, so the switch costs
+no extra check run. Until it lands, a `claude-sonnet-5-5` record is refused
+with `recorded generator model "claude-sonnet-5-5" is not the gate's model
+"claude-sonnet-4-6": re-measure`; do not re-measure on that message.
 
 ### THE BASELINE HAS NOT BEEN RECORDED
 
@@ -699,7 +723,7 @@ corpus), so it fails for the regression reason, not a shape reason.
 {
   "schema": "planreview-catchrate-evidence-v1",
   "recorded_at": "2026-10-07T00:00:00Z",
-  "generator_model": "claude-sonnet-4-6",
+  "generator_model": "claude-sonnet-5-5",
   "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
@@ -729,7 +753,7 @@ corpus), so it fails for the regression reason, not a shape reason.
   "baseline": {
     "pinned_at": "2026-10-07T00:00:00Z",
     "reason": "first measurement",
-    "generator_model": "claude-sonnet-4-6",
+    "generator_model": "claude-sonnet-5-5",
     "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "samples_per_case": 23,
     "arms": {

@@ -26,7 +26,8 @@ import (
 // clamping is E55.10 #3755) and a declaration-site string the repo-document
 // resolver echoes. A convention's `required` (default true = fail the review
 // stage) and `applies_to` semantics are deliberately NOT carried: a missing
-// remit degrades only the persona, never the stage.
+// remit degrades only the persona, never the stage — except that an
+// escalation-attached persona that cannot run fails a GATING stage (#3913).
 //
 // RULE ORDER IS A CONTRACT, mirrored by the CLI's raw-map port so the
 // backend's FIRST error is the CLI list's first entry. Each persona rung runs
@@ -328,7 +329,8 @@ func validateReviewerPersonasReferenced(s *Spec) error {
 //
 // Whether the remit document exists at the reviewed base is NOT decided here:
 // that is the repo-document resolver's ErrMissingDocument at review time, and
-// a missing remit degrades only the persona (never the stage).
+// a missing remit degrades only the persona (never the stage — except that an
+// escalation-attached persona that cannot run fails a GATING stage, #3913).
 func (s *Spec) SelectReviewerPersonas(st *Stage) ([]SelectedReviewerPersona, error) {
 	if st == nil || st.Reviewers == nil || len(st.Reviewers.Personas) == 0 {
 		return nil, nil

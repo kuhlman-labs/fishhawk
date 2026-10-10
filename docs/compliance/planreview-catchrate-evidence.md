@@ -94,11 +94,27 @@ baseline is not comparable, an ordinary recording is refused, and you re-pin.
 
 Cost: each measurement is two arms of `ceil(136 / cases) x cases` plan-review
 calls — 2 x 138 with the six committed cases — against
-`DefaultQualityGeneratorModel`. Sampling cannot be pinned (`anthropic.Config`
+`DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
+#4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
+$3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
+roughly $10-20 per recording. Sampling cannot be pinned (`anthropic.Config`
 has no temperature knob); the power floor is the answer to run-to-run
 variance.
 
 ## Step 3 — commit the evidence and confirm the gate
+
+**Binding: switch the gate's model in the SAME PR as the evidence.** The first
+recording is made on `claude-sonnet-5-5`, but `catchrategate/main.go`'s
+`model :=` line still reads `agenteval.DefaultQualityGeneratorModel`
+(`claude-sonnet-4-6`), and `CheckCatchRateEvidence` mode (4) refuses any record
+from another model. Until that line (and `main_test.go`'s matching references)
+reads `agenteval.DefaultCatchRateGeneratorModel`, `catchrategate` FAILS with
+`recorded generator model "claude-sonnet-5-5" is not the gate's model
+"claude-sonnet-4-6": re-measure`. Do NOT re-measure on that message: the
+measurement is fine, the gate's model is stale. The switch is not part of the
+change that introduced `DefaultCatchRateGeneratorModel`, because `catchrategate/`
+is a `scripts/check-review-prompt-eval` trigger path; the recording PR already
+triggers that check by adding `evidence.json`.
 
 ```sh
 (cd backend && go run ./internal/agenteval/catchrategate)
