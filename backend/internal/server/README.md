@@ -2168,12 +2168,13 @@ Flow:
   for an advance. Any other merge error → 502 `rebase_merge_failed`,
   likewise nothing written. The full contract is the
   **Bounded conflict-resolution pass** section below.
-- **The AUTHORITATIVE new head is a live PR RE-READ**, never
-  `MergeBranch`'s return. That is what makes a decoded-201 and an
-  undecodable-201 behave IDENTICALLY: the live head is the truth in both
-  cases, so no value is ever asked to mean two things. Both are reported —
+- **The new head is resolved by PROVENANCE (#4199)**, not taken from one
+  PR re-read: a DECODED `MergeBranch` sha is the new head unless the
+  bounded re-read observed a genuine concurrent push; only on the
+  undecodable-201 shape does the re-read supply the head (see
+  **Post-merge read-after-write lag** below). Both are reported —
   `merge_commit_sha` (may legitimately be empty) and `new_head_sha` (the
-  authority, and the head the check is published at).
+  resolved head, and the head the check is published at).
 
 **THE SHARED TAIL, and why the advertised retry is REAL.** Both arms —
 merged, and already-contains-base — fall into ONE re-park → audit →
@@ -2189,15 +2190,66 @@ SUCCESSES, which is what makes the re-post reachable a second time.
 `TestRebaseRunBranch_PublishFailsThenReinvokeRepublishesAtHead` drives
 exactly that sequence.
 
-**The degraded head read does NOT fall back to "no override".** If the
-merge succeeds but the post-merge re-read fails, the response is 200 with
-`new_head_sha` empty and publication SKIPPED. Publishing at no override
-resolves to the pre-merge audit-recorded head — precisely the staleness
-this endpoint exists to remove — so a fallback would make the verb cause
-the bug it fixes. The warning names re-invocation, and the shared tail
-above makes that retry real.
+**Post-merge read-after-write lag (#4199).** The forge's PR head lags the
+branch-ref update, so a single post-merge `GetPullRequest` routinely
+returned the PRE-merge head (3 of 3 live rebases): the handler then
+reported a false concurrent push AND anchored `new_head_sha`, the
+`branch_rebased` row, the check re-post and the ADR-090 merge-candidate
+trigger on the stale head, so every performed-merge pass settled
+`head_moved`. `rebase_postmerge_read.go::readPostMergeHead` now re-reads
+boundedly (an initial read plus 5 re-reads over
+`defaultPostMergeHeadReadBackoff`, ~10s, ctx-aware; the
+`Server.postMergeHeadReadBackoff` seam scales it in tests) and CLASSIFIES:
+`converged` (read == merge sha), `read_after_write_lag` (every successful
+read == the pre-merge head — the ONLY lag signature; an ancestry probe is
+deliberately not used, because it would read a foreign force-push that
+rewinds the branch as benign lag), `concurrent_push` (a decoded merge sha
+and a head that is neither), `unreadable` (no read succeeded) and
+`read_back` (no decoded merge sha, a head that differs from the pre-merge
+head). `resolvePostMergeHead` then resolves the head by PROVENANCE: a
+decoded merge sha IS the new head for `converged`, `read_after_write_lag`
+and `unreadable`; only a genuine `concurrent_push` keeps the observed head
+(the merge commit is then already superseded). The outcome ships as
+`post_merge_head_read` / `post_merge_head_read_note` on the 200 and as
+`post_merge_head_read` / `post_merge_observed_head_sha` /
+`post_merge_read_attempts` on the existing `branch_rebased` payload. Pinned
+by `TestRebaseRunBranch_LaggingPostMergeReadConverges`,
+`TestRebaseRunBranch_PersistentPostMergeLag_ReportsReadAfterWriteLag`,
+`TestRebaseRunBranch_PostMergeLagAnchorsMergeCandidateTriggerOnMergeCommit`
+(the trigger's `expected_head_sha` and the `branch_rebased` `new_head_sha`
+are the merge commit), `TestRebaseRunBranch_PostMergeReadIsBounded`,
+`TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit`,
+`TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted` and the
+`rebase_postmerge_read_test.go` classifier table.
+
+**The post-merge tail runs DETACHED from request cancellation.** The MCP
+client calls this verb with a 30s timeout, and against a degraded forge
+(every post-merge read 5xx or slow, each with githubclient's own retry
+budget) the re-read plus its backoff can outlast it. The re-read itself
+stays on the request context, so a departed caller ends it early; but once
+`mergePerformed` is true the handler rebinds `r` to
+`context.WithTimeout(context.WithoutCancel(r.Context()),
+rebasePostMergeTailBudget)` (60s) before the shared tail. On the request
+context every append would fail AFTER the installation-authored merge
+landed — no `branch_rebased` row and no attribution, the wedged-FOREIGN
+state the attribution exists to prevent. The already-contains-base arm
+keeps the request context: it performed no irreversible write. Pinned by
+`TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge`,
+whose audit fake fails an append on a dead context the way pgx does.
+
+**The degraded head read does NOT fall back to "no override" — only when
+the merge sha did not decode.** On the undecodable-201 shape the re-read
+supplies the head, accepted only when it differs from the pre-merge head;
+if every re-read failed or stayed at the pre-merge head, the response is
+200 with `new_head_sha` empty and publication SKIPPED. Publishing at no
+override (or at the stale read) resolves to the pre-merge audit-recorded
+head — precisely the staleness this endpoint exists to remove — so a
+fallback would make the verb cause the bug it fixes. The warning names
+re-invocation, and the shared tail above makes that retry real.
 `TestRebaseRunBranch_PostMergeHeadReadFails_NoPublication` asserts NO
-publication occurred.
+publication occurred. A DECODED merge sha with an unreadable re-read is NOT
+this case: the merge commit is the head the forge reported creating, so it
+is published there.
 
 **LINEAGE ATTRIBUTION.** The merge commit is authored by the App
 installation but appears in NO head-report audit category, so
@@ -2219,18 +2271,21 @@ that an unattributed foreign commit still violates).
 **EXACTLY ONE SHA is ever attributed, chosen by PROVENANCE not by
 availability.** The lease re-check runs only BEFORE the merge, so a foreign
 push landing in the window between `MergeBranch` and the post-merge
-`GetPullRequest` becomes `new_head_sha`. Attributing it would launder into
+re-read becomes the observed head. Attributing it would launder into
 the ledger precisely the commit the ledger exists to catch — the same
 laundering the already-contains-base arm refuses. So when the merge SHA
-decoded it is the ONLY sha attributed, and a non-empty `new_head_sha` that
-DIFFERS from it is treated as in-band evidence of a concurrent push: not
-attributed, logged, and surfaced on the response.
+decoded it is the ONLY sha attributed, and a head the bounded re-read
+classified `concurrent_push` (neither the pre-merge head nor the merge
+commit) is treated as in-band evidence of a concurrent push: not
+attributed, logged, and surfaced on the response with today's warning
+sentence. A re-read stuck at the pre-merge head is `read_after_write_lag`
+(#4199), NOT a concurrent push, and warns nothing.
 `TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed`
 seeds that race BY CONSTRUCTION (the merges endpoint returns one sha, the
-subsequent PR read returns a different one) and asserts against committed
+subsequent PR read returns a third one) and asserts against committed
 state plus the REAL recompute. `new_head_sha` is attributed alone ONLY on
-the undecodable-201 shape, where the merge provably happened and there is
-nothing else to attribute.
+the undecodable-201 shape (`read_back`), where the merge provably happened
+and there is nothing else to attribute.
 
 **An incomplete attribution is REPORTED, never silent.** The attribution is
 load-bearing — without it the merge commit is classified FOREIGN and the run
@@ -2238,16 +2293,17 @@ stays wedged — so "best-effort with only a Warn log" would let the endpoint
 return 200, publish `fishhawk_audit_complete` and leave the run wedged with
 the operator told nothing. The append failure is still non-fatal to the
 already-completed merge, but the response carries
-`lineage_attribution_warning` in all three incomplete cases: a divergent
-post-merge head, a failed attribution append, and nothing attributable at
-all. Pinned by
+`lineage_attribution_warning` in all three incomplete cases: a
+concurrent-push post-merge head, a failed attribution append, and nothing
+attributable at all. Pinned by
 `TestRebaseRunBranch_AttributionAppendFails_WarnsAndNamesVouch` (the
 failure injected in isolation on the `operator_commit_vouched` category, so
 the `branch_rebased` entry still lands and the test discriminates an
 attribution failure from a blanket audit outage).
 
 **Residual, stated rather than papered over:** when the merge SHA is
-undecodable AND the post-merge re-read fails, that invocation has no SHA to
+undecodable AND the post-merge re-read fails or stays at the pre-merge
+head, that invocation has no SHA to
 attribute, and the retry invocation takes the already-contains-base arm,
 which attributes nothing. Such a run needs `fishhawk_vouch_commit`, exactly
 as it did before this verb existed — and the response now SAYS so rather
