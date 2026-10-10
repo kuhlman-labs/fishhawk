@@ -288,6 +288,7 @@ one, never in batches:
 | [ADR-089](089-first-officer-read-only-crew-seat.md) | First officer: a structurally read-only crew seat whose evidence-backed findings gate actions | `accepted` | [#4149](https://github.com/kuhlman-labs/fishhawk/issues/4149) |
 | [ADR-090](090-verify-the-merge-candidate.md) | Verify the merge candidate: a Fishhawk-dispatched merge requires an up-to-date head, and a base-advanced head must pass the project's declared verify command in a runner verify-only pass | `accepted` | [#4170](https://github.com/kuhlman-labs/fishhawk/issues/4170) |
 | [ADR-091](091-restart-recovery-redispatches-advisory-review-rounds.md) | Restart recovery re-dispatches orphaned advisory review rounds from a durable round-source descriptor instead of terminating them as failed | `accepted` | [#4171](https://github.com/kuhlman-labs/fishhawk/issues/4171) |
+| [ADR-092](092-serialize-merge-candidate-verify-passes.md) | Serialize merge-candidate verify passes per repository, re-anchor a queued pass at admission, and admit passes through a local-verify group (amends ADR-090) | `accepted` | [#4202](https://github.com/kuhlman-labs/fishhawk/issues/4202) |
 
 ## Status unknown — needs captain confirmation
 
