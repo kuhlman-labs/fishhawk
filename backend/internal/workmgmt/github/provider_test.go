@@ -4040,3 +4040,146 @@ func TestProvider_EpicChildren_ReportsChildCap(t *testing.T) {
 		t.Errorf("ResolveDependencies ChildCap = %d, want 0 (no parent link, so no cap applies)", rd.ChildCap)
 	}
 }
+
+// orderLogAPI wraps fakeAPI and appends each create / board / link write to a
+// shared call log, so a test can assert the write-ahead hook's position
+// relative to them (#4153).
+type orderLogAPI struct {
+	*fakeAPI
+	log *[]string
+}
+
+func (o orderLogAPI) CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	*o.log = append(*o.log, "CreateIssue")
+	return o.fakeAPI.CreateIssue(ctx, scope, repo, p)
+}
+
+func (o orderLogAPI) AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error) {
+	*o.log = append(*o.log, "AddProjectItem")
+	return o.fakeAPI.AddProjectItem(ctx, scope, projectID, contentID)
+}
+
+func (o orderLogAPI) AddSubIssue(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error {
+	*o.log = append(*o.log, "AddSubIssue")
+	return o.fakeAPI.AddSubIssue(ctx, scope, parentNodeID, childNodeID)
+}
+
+// TestProvider_File_NotifyCreatedBeforeBoardAndLink pins the write-ahead hook
+// contract (#4153): File fires OnCreated exactly once, right after CreateIssue
+// and BEFORE board placement and the sub-issue link, with the created number
+// and URL — so a caller records the issue before the interruptible steps.
+func TestProvider_File_NotifyCreatedBeforeBoardAndLink(t *testing.T) {
+	var log []string
+	api := orderLogAPI{
+		fakeAPI: &fakeAPI{
+			created:    &githubclient.CreatedIssue{Number: 1234, NodeID: "ISSUE_NODE", HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/1234"},
+			meta:       &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{"Backlog": "OPT_BACKLOG"}},
+			itemID:     "ITEM",
+			parentNode: "EPIC_NODE",
+		},
+		log: &log,
+	}
+	req := baseRequest()
+	req.Item.Relations.ParentEpic = "#1005"
+	var got []workmgmt.CreatedItem
+	req.OnCreated = func(_ context.Context, item workmgmt.CreatedItem) {
+		log = append(log, "hook")
+		got = append(got, item)
+	}
+
+	created, err := New(api).File(context.Background(), req)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	want := []string{"CreateIssue", "hook", "AddProjectItem", "AddSubIssue"}
+	if strings.Join(log, ",") != strings.Join(want, ",") {
+		t.Errorf("call order = %v, want %v (the hook must precede board placement and the epic link)", log, want)
+	}
+	if len(got) != 1 || got[0].Number != 1234 || got[0].URL != "https://github.com/kuhlman-labs/fishhawk/issues/1234" {
+		t.Errorf("hook received %+v, want exactly one call carrying #1234 and its URL", got)
+	}
+	if !created.Boarded || !created.EpicLinked {
+		t.Errorf("enrichment after the hook: boarded=%v linked=%v, want both true", created.Boarded, created.EpicLinked)
+	}
+}
+
+// TestProvider_File_NoHookOnCreateFailure: no issue exists, so the hook is
+// never fired.
+func TestProvider_File_NoHookOnCreateFailure(t *testing.T) {
+	api := &fakeAPI{createErr: errors.New("boom")}
+	req := baseRequest()
+	fired := false
+	req.OnCreated = func(context.Context, workmgmt.CreatedItem) { fired = true }
+	if _, err := New(api).File(context.Background(), req); err == nil {
+		t.Fatal("File succeeded, want the create error")
+	}
+	if fired {
+		t.Error("OnCreated fired although CreateIssue failed")
+	}
+}
+
+func linkRequest() workmgmt.EpicLinkRequest {
+	return workmgmt.EpicLinkRequest{
+		Target: workmgmt.Target{
+			Scope: forge.FromGitHubInstallationID(99),
+			Repo:  workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		},
+		Epic:  "#1005",
+		Child: 42,
+	}
+}
+
+// TestProvider_LinkToEpic links an already-filed child under its epic with the
+// child and epic node ids in the right AddSubIssue positions (#4153).
+func TestProvider_LinkToEpic(t *testing.T) {
+	api := &fakeAPI{nodeIDs: map[int]string{42: "CHILD_NODE", 1005: "EPIC_NODE"}}
+	if err := New(api).LinkToEpic(context.Background(), linkRequest()); err != nil {
+		t.Fatalf("LinkToEpic: %v", err)
+	}
+	if api.subParent != "EPIC_NODE" || api.subChild != "CHILD_NODE" {
+		t.Errorf("AddSubIssue(parent=%q, child=%q), want (EPIC_NODE, CHILD_NODE)", api.subParent, api.subChild)
+	}
+	if api.issueParents[42] != 1005 {
+		t.Errorf("recorded parent of #42 = %d, want 1005", api.issueParents[42])
+	}
+}
+
+// TestProvider_LinkToEpic_FailsClosed covers every refusal and error branch.
+// The validation branches must refuse BEFORE any API call.
+func TestProvider_LinkToEpic_FailsClosed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		api      *fakeAPI
+		nilAPI   bool
+		mutate   func(*workmgmt.EpicLinkRequest)
+		wantErr  string
+		wantNoIO bool
+	}{
+		"nil api":          {nilAPI: true, wantErr: "missing API client"},
+		"missing repo":     {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Target.Repo = workmgmt.Repo{} }, wantErr: "target repo owner and name required", wantNoIO: true},
+		"zero scope":       {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Target.Scope = forge.CredentialScope{} }, wantErr: "no installation id available", wantNoIO: true},
+		"bad epic ref":     {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Epic = "not-a-ref" }, wantErr: `parent epic "not-a-ref"`, wantNoIO: true},
+		"non-positive":     {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Child = 0 }, wantErr: "child issue number 0 is not positive", wantNoIO: true},
+		"child node error": {api: &fakeAPI{nodeIDErr: errors.New("graphql 502")}, wantErr: "resolve child #42: graphql 502"},
+		"link error":       {api: &fakeAPI{nodeIDs: map[int]string{42: "C", 1005: "E"}, subErr: errors.New("already a sub-issue")}, wantErr: "link parent epic #1005: already a sub-issue"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := linkRequest()
+			if tc.mutate != nil {
+				tc.mutate(&r)
+			}
+			var p *Provider
+			if tc.nilAPI {
+				p = New(nil)
+			} else {
+				p = New(tc.api)
+			}
+			err := p.LinkToEpic(context.Background(), r)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if tc.wantNoIO && (tc.api.nodeIDNumber != 0 || tc.api.subChild != "") {
+				t.Errorf("API reached (node lookup #%d, sub child %q) before the refusal", tc.api.nodeIDNumber, tc.api.subChild)
+			}
+		})
+	}
+}

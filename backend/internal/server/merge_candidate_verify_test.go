@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -139,9 +142,16 @@ workflows:
 // run.RestoreFixupStage lands here exactly as it does against Postgres.
 type mcvRepo struct {
 	*autoDriveRepo
+	// refuseTo, when set, refuses every stage transition INTO that state — the
+	// hook the #4183 refusal tests use to fail FailStage (refuseTo = failed) or
+	// the restore (refuseTo = the prior gate state) after the append landed.
+	refuseTo run.StageState
 }
 
 func (r *mcvRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if r.refuseTo != "" && to == r.refuseTo {
+		return nil, fmt.Errorf("mcvRepo: injected refusal of the transition to %s", to)
+	}
 	r.mu.Lock()
 	for _, stages := range r.stagesByRun {
 		for _, st := range stages {
@@ -977,4 +987,231 @@ func TestRouteMergeCandidateFailure_FailClosedArms(t *testing.T) {
 			t.Fatalf("routed=%v refusal=%q", routed, refusal)
 		}
 	})
+}
+
+// --- runner-capability gate (#4183) ----------------------------------------
+
+// newMCVStaleRunnerFixture starts a real base-advance pass for mcvHead and
+// walks the re-opened implement stage to dispatched (the orchestrator's walk),
+// the state a runner's prompt fetch meets. The run carries an issue trigger and
+// NO approved plan, so a fetch that got PAST the capability gate would reach the
+// forge (or record issue_context_unresolved) and append
+// plan_missing_for_implement — which is what pins the gate's EARLY placement.
+func newMCVStaleRunnerFixture(t *testing.T) (*mcvShipFixture, *stubIssueGetter) {
+	t.Helper()
+	f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+	f.seedRebased(mcvHead, mcvHead, false)
+	if _, refusal := f.start(t, mcvHead, mergeCandidateCauseBaseAdvance, mcvOperator()); refusal != nil {
+		t.Fatal(refusal.Reason)
+	}
+	runRow := f.runRow(t)
+	ref := "issue:42"
+	f.repo.mu.Lock()
+	f.impl.State = run.StageStateDispatched
+	runRow.TriggerRef = &ref
+	f.repo.mu.Unlock()
+	ig := &stubIssueGetter{}
+	f.s.promptIssueGetterOverride = ig
+	return f, ig
+}
+
+// mcvRefusal decodes a 409 runner_capability_missing body.
+func mcvRefusal(t *testing.T, w *httptest.ResponseRecorder) errorBody {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 %s:\n%s", w.Code, mergeCandidateReasonRunnerCapabilityMissing, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Code != mergeCandidateReasonRunnerCapabilityMissing {
+		t.Fatalf("code = %q, want %q", env.Error.Code, mergeCandidateReasonRunnerCapabilityMissing)
+	}
+	if env.Error.Details["required_capability"] != capabilityMergeCandidateVerify ||
+		env.Error.Details["expected_head_sha"] != mcvHead {
+		t.Errorf("details = %+v", env.Error.Details)
+	}
+	return env.Error
+}
+
+// assertNoPreGateWork pins approval condition C2: a refused fetch never got
+// past the gate, so it made no forge call and appended no
+// issue_context_unresolved / plan_missing_for_implement row.
+func assertNoPreGateWork(t *testing.T, f *mcvShipFixture, ig *stubIssueGetter) {
+	t.Helper()
+	if ig.called {
+		t.Error("the refused fetch called the forge for the issue")
+	}
+	for _, category := range []string{issueContextUnresolvedCategory, "plan_missing_for_implement"} {
+		if n := len(auditEntries(f.au, category)); n != 0 {
+			t.Errorf("%s rows = %d, want 0 (the gate must run before prompt construction)", category, n)
+		}
+	}
+}
+
+// TestGetStagePrompt_MergeCandidateStaleRunnerRefused is the #4183 end-to-end
+// crossing through the real mux: a live merge-candidate trigger fetched by a
+// runner that does not advertise merge-candidate-verify is refused 409 with
+// NO prompt, the pass is settled not_executed (FailStage C then restore to
+// the pre-pass gate), the run stays live, the head stays re-triggerable, and a
+// rebuilt runner is then served the re-started pass.
+func TestGetStagePrompt_MergeCandidateStaleRunnerRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		do   func(f *mcvShipFixture) *httptest.ResponseRecorder
+	}{
+		{"no header", func(f *mcvShipFixture) *httptest.ResponseRecorder {
+			return promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, "")
+		}},
+		{"push-resume only", func(f *mcvShipFixture) *httptest.ResponseRecorder {
+			return promptRequestWithCapabilities(t, f.s, f.impl.ID, f.priv, capabilityPushResume)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, ig := newMCVStaleRunnerFixture(t)
+			runBefore := f.runRow(t).State
+			w := tc.do(f)
+			refusal := mcvRefusal(t, w)
+			if refusal.Details["settled"] != true {
+				t.Errorf("settled = %v, want true", refusal.Details["settled"])
+			}
+			// What a stale runner decodes: no prompt to hand an agent.
+			var stale struct {
+				Prompt string `json:"prompt"`
+			}
+			_ = json.Unmarshal(w.Body.Bytes(), &stale)
+			if stale.Prompt != "" {
+				t.Errorf("a stale runner decoded a prompt from the refusal: %q", stale.Prompt)
+			}
+			rows := mcvVerdictRows(f.au)
+			if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || rows[0].HeadSHA != mcvHead ||
+				!strings.HasPrefix(rows[0].Reason, mergeCandidateReasonRunnerCapabilityMissing) {
+				t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed %s row", rows, mergeCandidateReasonRunnerCapabilityMissing)
+			}
+			if got := f.stageState(t, f.impl.ID); got != run.StageStateAwaitingApproval {
+				t.Errorf("implement state = %q, want awaiting_approval (the pre-pass gate)", got)
+			}
+			if got := f.runRow(t).State; got != runBefore || got == run.StateFailed {
+				t.Errorf("run state = %q, want unchanged %q", got, runBefore)
+			}
+			state, err := f.s.mergeCandidateVerifyState(t.Context(), f.runRow(t), mcvHead)
+			if err != nil || state.State != mergeCandidateStateUnverified {
+				t.Errorf("mergeCandidateVerifyState = %+v, %v; want unverified (re-triggerable)", state, err)
+			}
+			if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+				t.Errorf("stage_fixup_triggered rows = %d, want 0", n)
+			}
+			assertNoPreGateWork(t, f, ig)
+
+			// The rebuilt runner: re-start the pass for the same head and fetch it
+			// advertising the capability.
+			if _, refusal := f.start(t, mcvHead, mergeCandidateCauseBaseAdvance, mcvOperator()); refusal != nil {
+				t.Fatalf("re-trigger refused: %s", refusal.Reason)
+			}
+			f.repo.mu.Lock()
+			f.impl.State = run.StageStateDispatched
+			f.repo.mu.Unlock()
+			cw := promptRequestWithCapabilities(t, f.s, f.impl.ID, f.priv, capableRunnerCapabilities)
+			if cw.Code != http.StatusOK {
+				t.Fatalf("capable fetch status = %d, want 200:\n%s", cw.Code, cw.Body.String())
+			}
+			var served promptResponse
+			if err := json.Unmarshal(cw.Body.Bytes(), &served); err != nil {
+				t.Fatal(err)
+			}
+			if !served.MergeCandidateVerify || served.MergeCandidateVerifyExpectedHeadSHA != mcvHead {
+				t.Errorf("capable runner was not served the re-started pass: %+v", served)
+			}
+		})
+	}
+}
+
+// TestGetStagePrompt_MergeCandidateStaleRunnerSettleRecordFails pins approval
+// condition C1 (record-first): when the not_executed row cannot be appended,
+// NOTHING else runs — no FailStage, no Advance. The stage is left exactly as
+// it was, the trigger stays live for the D8 reap path, the run is not failed,
+// and the runner is still answered 409 so it spawns no agent.
+func TestGetStagePrompt_MergeCandidateStaleRunnerSettleRecordFails(t *testing.T) {
+	f, ig := newMCVStaleRunnerFixture(t)
+	runBefore := f.runRow(t).State
+	f.au.appendErrCategory = CategoryMergeCandidateVerified
+	refusal := mcvRefusal(t, promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, ""))
+	f.au.appendErrCategory = ""
+	if refusal.Details["settled"] != false {
+		t.Errorf("settled = %v, want false", refusal.Details["settled"])
+	}
+	if n := len(mcvVerdictRows(f.au)); n != 0 {
+		t.Errorf("merge_candidate_verified rows = %d, want 0", n)
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateDispatched {
+		t.Errorf("implement state = %q, want dispatched (a transient audit error must not transition the stage)", got)
+	}
+	if got := f.runRow(t).State; got != runBefore || got == run.StateFailed {
+		t.Errorf("run state = %q, want unchanged %q (a transient audit error must not fail the run)", got, runBefore)
+	}
+	if live := f.s.resolveMergeCandidateVerifyTrigger(t.Context(), f.runID, f.impl.ID); live == nil || live.ExpectedHeadSHA != mcvHead {
+		t.Errorf("live trigger = %+v, want still live for %s", live, mcvHead)
+	}
+	assertNoPreGateWork(t, f, ig)
+}
+
+// TestGetStagePrompt_MergeCandidateStaleRunnerFailStageFails: the row landed
+// (the trigger is consumed) but failing the stage is refused. The refusal
+// reports settled=false, never restores and never fails the run.
+func TestGetStagePrompt_MergeCandidateStaleRunnerFailStageFails(t *testing.T) {
+	f, _ := newMCVStaleRunnerFixture(t)
+	runBefore := f.runRow(t).State
+	f.repo.refuseTo = run.StageStateFailed
+	refusal := mcvRefusal(t, promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, ""))
+	f.repo.refuseTo = ""
+	if refusal.Details["settled"] != false {
+		t.Errorf("settled = %v, want false (the stage was never failed or restored)", refusal.Details["settled"])
+	}
+	if rows := mcvVerdictRows(f.au); len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted {
+		t.Fatalf("rows = %+v, want the one not_executed row written before FailStage", rows)
+	}
+	if got := f.stageState(t, f.impl.ID); got == run.StageStateFailed || got == run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want neither failed nor restored", got)
+	}
+	if got := f.runRow(t).State; got != runBefore || got == run.StateFailed {
+		t.Errorf("run state = %q, want unchanged %q", got, runBefore)
+	}
+}
+
+// TestGetStagePrompt_MergeCandidateStaleRunnerRestoreFails: the row landed and
+// the stage was failed, but the restore is refused. The failure path stays in
+// force — Orchestrator.Advance fails the run, mirroring failPullRequestStage
+// for the same pass — rather than stranding a failed stage under a live run.
+func TestGetStagePrompt_MergeCandidateStaleRunnerRestoreFails(t *testing.T) {
+	f, _ := newMCVStaleRunnerFixture(t)
+	f.repo.refuseTo = run.StageStateAwaitingApproval
+	refusal := mcvRefusal(t, promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, ""))
+	f.repo.refuseTo = ""
+	if refusal.Details["settled"] != false {
+		t.Errorf("settled = %v, want false", refusal.Details["settled"])
+	}
+	if got := f.stageState(t, f.impl.ID); got != run.StageStateFailed {
+		t.Errorf("implement state = %q, want failed (the restore was refused)", got)
+	}
+	if got := f.runRow(t).State; got != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance keeps the failure path in force)", got)
+	}
+}
+
+// TestRefuseMergeCandidatePassToIncapableRunner_NoLiveTrigger: a trigger
+// consumed between the gate's resolve and the refusal (or never written)
+// settles nothing — no row, no transition — and reports settled=false.
+func TestRefuseMergeCandidatePassToIncapableRunner_NoLiveTrigger(t *testing.T) {
+	f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+	f.impl.State = run.StageStateDispatched
+	if f.s.refuseMergeCandidatePassToIncapableRunner(t.Context(), f.runID, f.impl.ID) {
+		t.Error("settled = true, want false with no live trigger")
+	}
+	if n := len(mcvVerdictRows(f.au)); n != 0 {
+		t.Errorf("merge_candidate_verified rows = %d, want 0", n)
+	}
+	if got := f.impl.State; got != run.StageStateDispatched {
+		t.Errorf("implement state = %q, want dispatched (nothing to settle)", got)
+	}
 }

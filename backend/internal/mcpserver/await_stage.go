@@ -78,6 +78,13 @@ type AwaitStageInput struct {
 // advisory at the top level where an operator cannot miss it. See
 // awaitStageSettled.
 //
+// A settled `succeeded` ACCEPTANCE stage does not release on the settle alone
+// (E72.56 / #4072): the runner ships the verdict AFTER the trace upload settles
+// the stage, so the wait HOLDS until the latest attempt's verdict lands
+// (AcceptanceVerdict), the in-flight window after ended_at closes, or the
+// caller's deadline arrives (VerdictPending + Message). See
+// awaitAcceptanceVerdict.
+//
 // WHY the "timeout" TOKEN WAS KEPT (E45.91 / #3626). The issue offered two
 // fixes: a NEW status value naming the client cap, or a discriminator field
 // alongside the existing token. The second was taken. `status` is the token
@@ -87,7 +94,7 @@ type AwaitStageInput struct {
 // pre-existing consumer reads byte-identical `status`, and a consumer that
 // wants the distinction gets an exhaustive switch on the new field.
 type AwaitStageOutput struct {
-	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending. The 'timeout' status is the CALLER's wait cap expiring, not a stage failure; it is discriminated by timeout_kind (#3626)"`
+	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending. The 'timeout' status is the CALLER's wait cap expiring, not a stage failure; it is discriminated by timeout_kind (#3626). A settled succeeded ACCEPTANCE stage releases only once its verdict lands, the in-flight window after ended_at closes, or your deadline arrives — read acceptance_verdict / verdict_pending (#4072)"`
 	// TimeoutKind names WHICH deadline expired on the "timeout" status (E45.91 /
 	// #3626). Empty on every other status. It is DERIVED from a best-effort
 	// stage-health read at timeout time, never a constant.
@@ -119,7 +126,7 @@ type AwaitStageOutput struct {
 	FailureReason       string           `json:"failure_reason,omitempty" jsonschema:"the failed stage's reason, when the settled state is failed"`
 	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed. On the 'timeout' status it carries the best-effort health read behind timeout_kind (#3626) — agent_timeout_seconds / deadline_seconds_remaining — and is ABSENT when that read failed, in which case stage health is UNKNOWN"`
 	WaitedSeconds       float64          `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
-	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up — AND on a SETTLED awaiting_host_dispatch stage queued for a local concurrency slot with NO live waiter (#3964), telling you to re-dispatch it with fishhawk_dispatch_stage"`
+	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up — AND on a SETTLED awaiting_host_dispatch stage queued for a local concurrency slot with NO live waiter (#3964), telling you to re-dispatch it with fishhawk_dispatch_stage, AND on a SETTLED succeeded acceptance stage with no confirmed verdict (#4072): verdict_pending (the verdict may still land — wait, do not retry), a confirmed absence past the in-flight window (the settled-outcome-unknown shape — confirm with fishhawk_list_audit, then fishhawk_retry_stage), or a named acceptance_verdict_unshipped / acceptance_skipped_out_of_scope disposition"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	// Heartbeat reports whether the CLIENT supplied a progressToken and a
 	// per-tick keep-alive was therefore emitted (#2490). Present on every return
@@ -144,6 +151,13 @@ type AwaitStageOutput struct {
 	// awaiting_host_dispatch stage it is how a queued stage whose waiter is
 	// gone (waiter_live false) is told apart from one simply never dispatched.
 	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot block on a settled read (#3964), when it has one: status awaiting_concurrency_slot with waiter_live false means the stage is queued for a slot but NO waiter will spawn it — re-dispatch with fishhawk_dispatch_stage"`
+	// AcceptanceVerdict / VerdictPending are the E72.56 / #4072 acceptance
+	// verdict hold's result, set only on a settled `succeeded` ACCEPTANCE stage:
+	// the recorded verdict for the stage's latest attempt, or — when the wait
+	// released without confirming one — the verdict_pending marker (also carried
+	// on stage_wait_status). See awaitAcceptanceVerdict.
+	AcceptanceVerdict string `json:"acceptance_verdict,omitempty" jsonschema:"present only on a SETTLED acceptance stage whose state is succeeded: the verdict recorded for the stage's LATEST attempt (passed / failed / not_validated / undecidable), read from the newest stage-scoped acceptance_outcome_recorded entry above the attempt's dispatch/reopen anchor. A failed verdict leaves the stage succeeded — this field, not state, is the verdict. Absent when no verdict for the latest attempt was confirmed (see verdict_pending and message) (#4072)"`
+	VerdictPending    bool   `json:"verdict_pending,omitempty" jsonschema:"true only on a SETTLED succeeded acceptance stage when the wait released WITHOUT confirming a verdict for the latest attempt — either your deadline arrived inside the ~2-minute in-flight window after the stage's ended_at, or the audit read could not decide. The runner ships the verdict AFTER the trace upload settles the stage, so it may still land: re-call fishhawk_await_stage (stage=acceptance) or read fishhawk_list_audit. This is NOT the settled-outcome-unknown state — do NOT fishhawk_retry_stage on it. Mirrored on stage_wait_status.verdict_pending (#4072)"`
 }
 
 // awaitStageDefaultStageType is the stage type awaited when the caller omits
@@ -201,6 +215,21 @@ can legitimately be awaiting_host_dispatch, which IS settled — so a wait
 against a never-dispatched stage returns immediately, and the raw state says
 why.)
 
+Acceptance verdict hold (#4072): an acceptance stage that settles succeeded
+does NOT release on the settle alone. The runner settles the stage with its
+trace upload and ships the verdict AFTER that, so for a few seconds a settled
+acceptance stage has no acceptance_outcome_recorded entry — the same shape as
+the settled-outcome-unknown hole. The wait therefore HOLDS until the verdict for
+the stage's LATEST attempt lands (acceptance_verdict carries it), bounded by
+your deadline and a ~2-minute in-flight window measured from the stage's
+ended_at. If it releases without one, verdict_pending is true (top level and on
+stage_wait_status) when the verdict may still land: re-call this tool, and do
+NOT fishhawk_retry_stage. Past the window with a confirmed absence,
+verdict_pending is false and the message names the settled-outcome-unknown
+recovery (fishhawk_list_audit, then fishhawk_retry_stage). A live
+acceptance_verdict_unshipped or acceptance_skipped_out_of_scope marker releases
+at once with a message naming it.
+
 Local concurrency queue (#3964): a local implement stage that could not get
 this host's concurrency slot stays awaiting_host_dispatch, QUEUED
 (concurrency.status awaiting_concurrency_slot). While a live waiter refreshes
@@ -219,7 +248,8 @@ change.
 
 Statuses:
   - "settled"      — the stage settled; state carries the raw state and
-                     terminal is true.
+                     terminal is true. A succeeded acceptance stage also
+                     carries acceptance_verdict or verdict_pending (#4072).
   - "amendment_pending" — the awaited stage filed a mid-stage scope amendment
                      that is still pending. The stage is STILL RUNNING
                      (terminal is false; state carries the raw running state).
@@ -337,6 +367,10 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 	capSeconds := effectiveAwaitCap(heartbeat, in.LongWait)
 	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, heartbeat, in.LongWait)
 	start := time.Now()
+	// deadline is the CALLER's: start + the CLAMPED timeout (never start +
+	// capSeconds). It bounds the acceptance verdict hold on every settled path,
+	// and on the poll path it is the same instant pollCtx cancels at (#4072).
+	deadline := start.Add(time.Duration(timeout) * time.Second)
 
 	// Fast path: the stage may already be settled. A wait=0 read returns
 	// immediately with the envelope's terminal (IsSettled) flag.
@@ -345,7 +379,7 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, AwaitStageOutput{}, fmt.Errorf("read stage wait: %w", err)
 	}
 	if stageWaitSettled(sw) {
-		return nil, r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
+		return nil, r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, deadline, heartbeat, capSeconds), nil
 	}
 
 	// Second release condition (#2588), probed on the FAST PATH before the first
@@ -353,13 +387,13 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 	// operator re-arming after a timeout hits — releases IMMEDIATELY rather than
 	// after a poll interval. Evaluated AFTER the settled check above so a settled
 	// stage can never surface as amendment_pending.
-	if out, done := r.awaitStageAmendmentRelease(ctx, runID, stageUUID, stageType, sw.State, start, heartbeat, capSeconds); done {
+	if out, done := r.awaitStageAmendmentRelease(ctx, runID, stageUUID, stageType, sw.State, start, deadline, heartbeat, capSeconds); done {
 		return nil, out, nil
 	}
 
 	// Nothing settled yet: check the run-terminal backstop once before the loop
 	// so a run already terminal at call time resolves without a poll tick.
-	if out, done := r.awaitStageRunTerminalBackstop(ctx, runID, stageUUID, stageType, start, heartbeat, capSeconds); done {
+	if out, done := r.awaitStageRunTerminalBackstop(ctx, runID, stageUUID, stageType, start, deadline, heartbeat, capSeconds); done {
 		return nil, out, nil
 	}
 
@@ -413,17 +447,17 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 				return nil, AwaitStageOutput{}, fmt.Errorf("poll stage wait: %w", err)
 			}
 			if stageWaitSettled(sw) {
-				return nil, r.awaitStageSettled(pollCtx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
+				return nil, r.awaitStageSettled(pollCtx, runID, stageUUID, stageType, sw, start, deadline, heartbeat, capSeconds), nil
 			}
 			// Second release condition (#2588) on every tick, after the settled
 			// check and before the ADR-036 backstop. pollCtx (not ctx) so a
 			// deadline hit cancels the probe with everything else — an errored
 			// probe yields nil and the loop's pollCtx.Done() arm produces the
 			// resumable timeout.
-			if out, done := r.awaitStageAmendmentRelease(pollCtx, runID, stageUUID, stageType, sw.State, start, heartbeat, capSeconds); done {
+			if out, done := r.awaitStageAmendmentRelease(pollCtx, runID, stageUUID, stageType, sw.State, start, deadline, heartbeat, capSeconds); done {
 				return nil, out, nil
 			}
-			if out, done := r.awaitStageRunTerminalBackstop(pollCtx, runID, stageUUID, stageType, start, heartbeat, capSeconds); done {
+			if out, done := r.awaitStageRunTerminalBackstop(pollCtx, runID, stageUUID, stageType, start, deadline, heartbeat, capSeconds); done {
 				return nil, out, nil
 			}
 		}
@@ -461,7 +495,7 @@ func stageWaitSettled(sw *RunStageWait) bool {
 // (final-read-wins). Returns (output, true) to resolve the wait; (zero, false)
 // to keep polling. Best-effort — a GetRun error or a non-terminal run leaves
 // the normal poll/timeout path in charge, never spinning or failing the wait.
-func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, stageID uuid.UUID, stageType string, start time.Time, heartbeat bool, capSeconds int) (AwaitStageOutput, bool) {
+func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, stageID uuid.UUID, stageType string, start, deadline time.Time, heartbeat bool, capSeconds int) (AwaitStageOutput, bool) {
 	runRow, err := r.api.GetRun(ctx, runID)
 	if err != nil || runRow == nil {
 		return AwaitStageOutput{}, false
@@ -473,7 +507,7 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 	// resolves as settled and beats the backstop.
 	sw, ferr := r.api.GetRunStageWait(ctx, runID, stageID, 0)
 	if ferr == nil && sw != nil && stageWaitSettled(sw) {
-		return r.awaitStageSettled(ctx, runID, stageID, stageType, sw, start, heartbeat, capSeconds), true
+		return r.awaitStageSettled(ctx, runID, stageID, stageType, sw, start, deadline, heartbeat, capSeconds), true
 	}
 	return AwaitStageOutput{
 		Status:            "run_terminal",
@@ -546,13 +580,13 @@ func (r *runResolver) awaitStagePendingAmendment(ctx context.Context, runID uuid
 // amendment_pending output so Terminal/State stay the honest settledness
 // signal. stageUUID is uuid.UUID only because the api-client reads require it;
 // both helpers below key on its string form, matching ScopeAmendmentItem.
-func (r *runResolver) awaitStageAmendmentRelease(ctx context.Context, runID, stageUUID uuid.UUID, stageType, state string, start time.Time, heartbeat bool, capSeconds int) (AwaitStageOutput, bool) {
+func (r *runResolver) awaitStageAmendmentRelease(ctx context.Context, runID, stageUUID uuid.UUID, stageType, state string, start, deadline time.Time, heartbeat bool, capSeconds int) (AwaitStageOutput, bool) {
 	item := r.awaitStagePendingAmendment(ctx, runID, stageUUID.String())
 	if item == nil {
 		return AwaitStageOutput{}, false
 	}
 	if sw, err := r.api.GetRunStageWait(ctx, runID, stageUUID, 0); err == nil && sw != nil && stageWaitSettled(sw) {
-		return r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), true
+		return r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, deadline, heartbeat, capSeconds), true
 	}
 	return awaitStageAmendmentPendingOutput(stageType, stageUUID.String(), runID, state, item, start, heartbeat, capSeconds), true
 }
@@ -615,12 +649,68 @@ func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID
 // BEST-EFFORT (fixupRecoveryFor returns nil on any audit read error), so a
 // transient audit failure loses the advisory and returns the settled response
 // INTACT rather than failing a wait that may have been running for hours.
-func (r *runResolver) awaitStageSettled(ctx context.Context, runID, stageUUID uuid.UUID, stageType string, sw *RunStageWait, start time.Time, heartbeat bool, capSeconds int) AwaitStageOutput {
+//
+// An ACCEPTANCE stage settled `succeeded` takes the E72.56 / #4072 verdict hold
+// instead: the runner settles the stage with its trace upload and ships the
+// verdict AFTER that, so releasing on the settle alone hands the caller a
+// verdict-less succeeded stage that reads like the #1574 settled-outcome-unknown
+// hole. awaitAcceptanceVerdict holds — bounded by deadline (the caller's
+// start + clamped timeout) and the in-flight window after sw.EndedAt — until
+// the latest attempt's verdict lands. Every other stage type and every other
+// acceptance state pays ZERO audit reads.
+func (r *runResolver) awaitStageSettled(ctx context.Context, runID, stageUUID uuid.UUID, stageType string, sw *RunStageWait, start, deadline time.Time, heartbeat bool, capSeconds int) AwaitStageOutput {
 	out := awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds)
-	if stageType != "implement" {
+	switch {
+	case stageType == "implement":
+		return decorateSettledWithFixupRecovery(out, r.fixupRecoveryFor(ctx, runID, stageUUID))
+	case stageType == "acceptance" && sw.State == "succeeded":
+		out = decorateSettledWithAcceptanceVerdict(out, r.awaitAcceptanceVerdict(ctx, runID, stageUUID, sw.EndedAt, deadline))
+		// The hold may have spent real wall time; report it.
+		out.WaitedSeconds = time.Since(start).Seconds()
+		return out
+	default:
 		return out
 	}
-	return decorateSettledWithFixupRecovery(out, r.fixupRecoveryFor(ctx, runID, stageUUID))
+}
+
+// decorateSettledWithAcceptanceVerdict attaches the #4072 verdict hold's result
+// to a settled acceptance response. PURE so every branch is table-testable:
+//
+//   - a recorded verdict: AcceptanceVerdict, no message;
+//   - a named disposition (unshipped / skipped out of scope): a Message naming
+//     that state, never verdict_pending;
+//   - Pending: VerdictPending on the top level AND on StageWaitStatus, attached
+//     TOGETHER (the #3081 pairing), plus a Message saying the verdict may still
+//     land and NOT to retry;
+//   - a confirmed absence past the window: the settled-outcome-unknown Message
+//     (fishhawk_list_audit FIRST, then fishhawk_retry_stage).
+func decorateSettledWithAcceptanceVerdict(out AwaitStageOutput, hold acceptanceVerdictHold) AwaitStageOutput {
+	switch {
+	case hold.Verdict != "":
+		out.AcceptanceVerdict = hold.Verdict
+	case hold.Disposition == acceptanceVerdictUnshipped:
+		out.Message = "acceptance stage settled succeeded but its verdict upload FAILED: the newest signal for this attempt is an " +
+			auditCategoryAcceptanceVerdictUnshipped + " marker, so NO verdict exists for this head and the server refuses the merge. " +
+			"Read the marker with fishhawk_list_audit (category " + auditCategoryAcceptanceVerdictUnshipped + "), then fishhawk_retry_stage the acceptance stage to re-run it. Never merge on it."
+	case hold.Disposition == acceptanceAttemptDispositionSkipped:
+		out.Message = "acceptance stage was auto-terminated out of scope (" + auditCategoryAcceptanceSkippedOutOfScope +
+			"): the approved plan declared verification.out_of_scope with no acceptance_criteria, so no verdict is recorded BY DESIGN and the run is merge-eligible. " +
+			"Do not wait for a verdict and do not retry."
+	case hold.Pending:
+		out.VerdictPending = true
+		if out.StageWaitStatus != nil {
+			out.StageWaitStatus.VerdictPending = true
+		}
+		out.Message = "acceptance stage settled succeeded, but no verdict for its latest attempt is confirmed yet (verdict_pending): " +
+			"the runner ships the verdict AFTER the trace upload settles the stage, so it may still land. " +
+			"Re-call fishhawk_await_stage (stage=acceptance) or read fishhawk_list_audit (category " + auditCategoryAcceptanceOutcomeRecorded + "). " +
+			"This is NOT the settled-outcome-unknown state — do NOT fishhawk_retry_stage on it."
+	default:
+		out.Message = "acceptance stage settled succeeded but recorded NO verdict for its latest attempt, and the in-flight window after its ended_at has closed — " +
+			"the settled-outcome-unknown shape (#1567). Confirm with fishhawk_list_audit (category " + auditCategoryAcceptanceOutcomeRecorded +
+			") that no verdict exists for this stage, then fishhawk_retry_stage it (the server 422s the retry if a verdict IS recorded)."
+	}
+	return out
 }
 
 // decorateSettledWithFixupRecovery attaches the #3081 marker to a settled

@@ -1251,6 +1251,27 @@ func TestFetchPrompt_UnsupportedStage(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_ConflictIsTerminal pins what an OLDER runner does with the
+// backend's 409 runner_capability_missing (#4183): the default arm returns an
+// error after ONE request, never retrying, so run() exits before any agent
+// spawn (TestRun_FetchPrompt_FetchFailure pins the no-spawn half).
+func TestFetchPrompt_ConflictIsTerminal(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptStatus = http.StatusConflict
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "s", PrivateKey: priv,
+	})
+	if err == nil || got != nil {
+		t.Fatalf("FetchPrompt = %+v, %v; want an error and no prompt on 409", got, err)
+	}
+	if fb.promptCalls != 1 {
+		t.Errorf("prompt calls = %d, want exactly 1 (a 409 is not retried)", fb.promptCalls)
+	}
+}
+
 func TestFetchPrompt_RetriesOn5xx(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)
@@ -4390,6 +4411,11 @@ func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
 	}
 	if !strings.Contains(gotHeader, CapabilityPushResume) {
 		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityPushResume)
+	}
+	// #4183: without this token the backend refuses every merge-candidate
+	// verify pass to this runner.
+	if !strings.Contains(gotHeader, CapabilityMergeCandidateVerify) {
+		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityMergeCandidateVerify)
 	}
 }
 

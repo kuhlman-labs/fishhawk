@@ -27,8 +27,8 @@ import (
 // These helpers are deliberately provider-agnostic: they know nothing about
 // runs, split proposals or HTTP. backend/internal/splitfiling composes them
 // into the split-filing keys; FilingRequest.IdempotencyKey routes a key through
-// Apply so any filing path can adopt the mechanism (refinement.ExecuteFiling's
-// identical residual is a named follow-up, not wired here).
+// Apply so any filing path can adopt the mechanism (refinement.ExecuteFiling
+// now adopts it too: every refinement item carries ItemIdempotencyKey, #4153).
 
 // idempotencyMarkerPrefix and idempotencyMarkerSuffix bracket the hidden
 // marker line. The prefix is namespaced to Fishhawk so a marker can never

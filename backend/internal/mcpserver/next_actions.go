@@ -687,6 +687,19 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			if acceptanceVerdict == acceptanceVerdictUnshipped {
 				return succeededAcceptanceVerdictUnshippedActions(run, acceptance)
 			}
+			// E72.56 / #4072: the terminal-run twin of the
+			// acceptance_verdict_pending arm. The acceptance stage settled
+			// succeeded inside the in-flight window and its verdict has not
+			// landed yet (the runner ships it AFTER the trace upload settles the
+			// stage). NEVER the merge ritual — nothing has verified this head yet
+			// — and never fishhawk_retry_stage: wait for the verdict. Checked
+			// beside the unshipped twin and BEFORE the succeeded_pr_open
+			// fallthrough. acceptanceVerdictSignal already returns "" when the
+			// out-of-scope skip marker is in the window, so this cannot shadow the
+			// skip arm above.
+			if acceptanceVerdict == acceptanceVerdictPending {
+				return acceptanceVerdictPendingActions("succeeded_acceptance_verdict_pending", run, acceptance)
+			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
 		return &NextActions{State: run.State}
@@ -1763,6 +1776,16 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		return acceptanceVerdictUnshippedActions(run, acceptance)
 	}
 
+	// E72.56 / #4072: the stage settled succeeded inside the in-flight window
+	// and no verdict is visible yet — the runner ships the verdict AFTER the
+	// trace upload settles the stage, so this is the verdict IN FLIGHT, not the
+	// #1567 settled-outcome-unknown hole. A NAMED wait state, checked BEFORE the
+	// outcome-unknown fallthrough so the sentinel never reaches an arm that
+	// offers fishhawk_retry_stage; NEVER the merge ritual.
+	if verdict == acceptanceVerdictPending && acceptance.State == "succeeded" {
+		return acceptanceVerdictPendingActions("acceptance_verdict_pending", run, acceptance)
+	}
+
 	// A terminal acceptance stage that never recorded a verdict in the recent
 	// window (verdict==""; the default audit_limit is 5, so the entry can age
 	// out), or a stage that failed/cancelled its own execution, falls to the
@@ -1902,6 +1925,42 @@ func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 			},
 			pollAction(run, derivedStageWaitPollInterval(run, acceptance),
 				"re-poll fishhawk_get_run_status with a larger audit_limit to surface the acceptance_outcome_recorded / acceptance_triage_decided entries"),
+		},
+	}
+}
+
+// acceptanceVerdictPendingActions is the wait arm for a `succeeded`
+// acceptance stage whose verdict is still IN FLIGHT (E72.56 / #4072): it
+// settled inside acceptanceVerdictInFlightWindow and no verdict is visible
+// yet. Shared by the running-run arm (acceptance_verdict_pending) and its
+// terminal-run twin (succeeded_acceptance_verdict_pending), so the two cannot
+// drift. It offers fishhawk_await_stage — which HOLDS a settled acceptance
+// release until the verdict lands — and then a poll. Load-bearing: it offers
+// NO fishhawk_retry_stage (a retry would re-run a stage whose verdict is about
+// to land) and NO merge-ritual action (nothing has verified this head yet).
+//
+// When the acceptance stage is absent from the snapshot (defensive: the
+// sentinel is derived FROM the acceptance stage, so this is unreachable today)
+// it degrades to the poll alone — still never retry, never merge.
+func acceptanceVerdictPendingActions(state string, run *Run, acceptance *Stage) *NextActions {
+	poll := pollAction(run, derivedStageWaitPollInterval(run, acceptance),
+		"re-poll fishhawk_get_run_status; the acceptance_outcome_recorded verdict normally lands within seconds of the settle, and the verdict arm then serves the next move")
+	if acceptance == nil {
+		return &NextActions{State: state, Actions: []SuggestedAction{poll}}
+	}
+	precondition := "the acceptance stage settled succeeded less than " + acceptanceVerdictInFlightWindow.String() +
+		" ago and no acceptance_outcome_recorded verdict is visible yet — the runner ships the verdict AFTER the trace upload settles the stage, so it is IN FLIGHT"
+	return &NextActions{
+		State: state,
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_await_stage",
+				Params:       map[string]string{"run_id": run.ID, "stage_id": acceptance.ID, "stage": "acceptance"},
+				Precondition: precondition,
+				Consumes:     consumesNone,
+				Reason:       "blocks until the acceptance verdict for the stage's latest attempt lands (acceptance_verdict), the in-flight window closes, or your deadline arrives — this is NOT the settled-outcome-unknown state, so do NOT fishhawk_retry_stage and do not merge yet",
+			},
+			poll,
 		},
 	}
 }
@@ -2657,6 +2716,16 @@ const (
 	// the four real verdicts, and TestNextActions_AcceptanceVerdictUnshipped
 	// pins that it reaches ONLY the read/retry arm, never a merge arm.
 	acceptanceVerdictUnshipped = "verdict_unshipped"
+
+	// acceptanceVerdictPending is a CLASSIFIER-LOCAL sentinel, never a wire
+	// verdict (E72.56 / #4072, the acceptanceVerdictUnshipped precedent):
+	// acceptanceVerdictSignal returns it when the acceptance stage settled
+	// `succeeded` inside acceptanceVerdictInFlightWindow and no verdict is
+	// visible yet — the runner ships the verdict AFTER the trace upload settles
+	// the stage. It reaches ONLY the acceptance_verdict_pending arm and its
+	// succeeded_acceptance_verdict_pending twin, which offer a wait and a poll —
+	// never fishhawk_retry_stage and never the merge ritual.
+	acceptanceVerdictPending = "verdict_pending"
 
 	// acceptanceArbitrationOutcomeSequenceField is the arbitration payload field
 	// carrying the acceptance_outcome_recorded sequence the discharge BINDS to.

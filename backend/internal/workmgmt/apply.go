@@ -1,6 +1,7 @@
 package workmgmt
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"sort"
@@ -76,6 +77,15 @@ type FilingRequest struct {
 	// instead. It lives here only so it can ride the one FilingRequest every
 	// filing entry point already threads to that hook.
 	SourceRefs []string
+	// OnCreated is the caller's write-ahead hook (#4153), carried VERBATIM to
+	// ProviderRequest.OnCreated by the server filing core so the provider can
+	// invoke it right after the forge create and before any post-create
+	// enrichment (see ProviderRequest.OnCreated for the contract). Like
+	// SourceRefs, Apply NEVER reads it: the rendered title, body, labels and
+	// number are byte-identical with or without it. Only the refinement filing
+	// executor sets it, to record each created issue in its resume ledger
+	// before the interruptible board/link steps run.
+	OnCreated func(ctx context.Context, item CreatedItem)
 }
 
 // placeholderRE matches a `{name}` title_format placeholder.

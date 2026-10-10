@@ -133,6 +133,13 @@ type fakeBackend struct {
 	auditStatus     int
 	lastAuditLimit  string
 	auditCalledByID map[uuid.UUID]int
+	// recentAuditFlip, when non-nil, is invoked under fb.mu on every
+	// GET /v0/audit read with (run id, running read count) BEFORE the response
+	// snapshot is taken, so a test can land an audit entry (e.g. the acceptance
+	// verdict the #4072 hold waits for) at a chosen read without wall-clock
+	// sleeps. Mirrors stageWaitFlip; it mutates auditByRun directly (the caller
+	// already holds fb.mu, so it must not re-lock).
+	recentAuditFlip func(runID uuid.UUID, reads int)
 
 	// E19.6 fixtures: per-run audit responses + recorded query
 	// state for the /v0/runs/{id}/audit endpoint. Distinct from
@@ -1952,6 +1959,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		fb.lastAuditLimit = r.URL.Query().Get("limit")
 		fb.auditCalledByID[id]++
+		if fb.recentAuditFlip != nil {
+			fb.recentAuditFlip(id, fb.auditCalledByID[id])
+		}
 		items := fb.auditByRun[id]
 		fb.mu.Unlock()
 		w.WriteHeader(fb.auditStatus)

@@ -536,7 +536,7 @@ Both review prompts (`buildPlanReview`, `buildImplementReview`) render a
 The server sets `ReviewTreeCommit` (and the skip counts) only when the whole review
 loop is grounding-capable and the `reviewsandbox.ExportTree` export succeeded; the
 SHA is the one `ExportTree` resolved and archived (C4). The supplemental
-base-rebase re-invoke prompt renders no diff and is always ungrounded. Pinned by
+base-rebase re-invoke prompt renders no diff but carries REPOSITORY ACCESS (rendered before its early return, #4160), grounded at the re-landed head when every reviewer can ground and otherwise naming the ungrounded reason. Pinned by
 `TestBuild_ReviewGrounding_*` in `prompt_test.go`, and the #3625 switch-naming by
 `TestReviewGroundingFlag_NamedInUngroundedRenders` (both reviewed renders),
 `_UntracedNoteNamesTheFlag` (the criterion-10 clause, asserted separately so the

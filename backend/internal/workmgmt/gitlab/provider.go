@@ -12,6 +12,8 @@
 // relates_to links, confirmed by the child's `Parent epic:` body marker) and
 // IssueSetDependencyResolver (#2051, items / grooming-order mode), both in
 // campaign.go with is_blocked_by links as the depends_on source (#3658). The
+// EpicLinker capability (#4153, LinkToEpic below) links an already-filed
+// child to its epic for the refinement executor's resume. The
 // UserReportReader capability (E81.1 / #3771) is implemented in
 // userreports.go: issue and note activity since a cursor, with every gap the
 // GitLab API leaves named on the page as a degradation code. The
@@ -76,6 +78,10 @@ type API interface {
 type Provider struct {
 	api API
 }
+
+// EpicLinker (#4153) lets the refinement filing executor finish a child whose
+// create landed but whose relates_to link to the epic did not.
+var _ workmgmt.EpicLinker = (*Provider)(nil)
 
 // New returns a Provider backed by api (in production *gitlabclient.Client).
 func New(api API) *Provider { return &Provider{api: api} }
@@ -150,6 +156,12 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Boarded: status != "",
 	}
 
+	// Write-ahead hook (#4153): the issue exists, so tell the caller BEFORE
+	// the separate post-create LinkIssues call — the interruptible step a
+	// cancelled filing can die inside. The board label rode the create, so
+	// board placement is already atomic with it.
+	req.NotifyCreated(ctx, created)
+
 	// Epic linking is best-effort (#1107) via a separate post-create call:
 	// an empty parent means nothing to link (EpicLinked false, no error); a
 	// parse or link failure records the cause in EpicLinkError and leaves
@@ -169,6 +181,44 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	}
 
 	return created, nil
+}
+
+// LinkToEpic attaches the already-filed issue req.Child to req.Epic with the
+// same Free-tier relates_to issue link File applies best-effort after a create,
+// so a filing interrupted between a child's create and its link can be finished
+// without re-creating the child (#4153). It is the optional workmgmt.EpicLinker
+// capability. It validates the epic ref and child number first, then repeats
+// File's project resolution exactly — the gitlab connection is required,
+// resolveProjectPath must yield a path (an empty one fails closed), and
+// GetProject resolves the numeric id every issue call is addressed by — before
+// LinkIssues.
+func (p *Provider) LinkToEpic(ctx context.Context, req workmgmt.EpicLinkRequest) error {
+	if p.api == nil {
+		return errors.New("workmgmt/gitlab: provider missing API client")
+	}
+	epicIID, err := parseIssueRef(strings.TrimSpace(req.Epic))
+	if err != nil {
+		return fmt.Errorf("workmgmt/gitlab: parse parent epic %q: %w", req.Epic, err)
+	}
+	if req.Child <= 0 {
+		return fmt.Errorf("workmgmt/gitlab: child issue iid %d is not positive", req.Child)
+	}
+	conn := req.Target.GitLab
+	if conn == nil {
+		return errors.New("workmgmt/gitlab: target gitlab connection required; the conventions must declare a gitlab block")
+	}
+	projectPath := resolveProjectPath(conn, req.Target.Repo)
+	if projectPath == "" {
+		return errors.New("workmgmt/gitlab: no target project; set the gitlab.project override or supply a filing repo")
+	}
+	project, err := p.api.GetProject(ctx, projectPath)
+	if err != nil {
+		return fmt.Errorf("workmgmt/gitlab: resolve project %q: %w", projectPath, err)
+	}
+	if err := p.api.LinkIssues(ctx, project.ID, req.Child, epicIID); err != nil {
+		return fmt.Errorf("workmgmt/gitlab: link #%d to parent epic #%d: %w", req.Child, epicIID, err)
+	}
+	return nil
 }
 
 // resolveProjectPath picks the target GitLab project path: the conventions

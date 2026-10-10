@@ -116,11 +116,17 @@ The `httptest` fixtures pin the **request shape this provider emits** — method
 
 The acceptance stage could not close that gap when this was written: no run could select the grooming workflow (its non-diff trigger form matched nothing v0 minted), so an acceptance pass on this slice short-circuited with every criterion skipped, as it did on #2234. **That is no longer true as of E54.22 / #2826:** `trigger_source: on_demand` maps to `spec.TriggerOnDemand`, so a grooming run can now be STARTED and GATED. It does not make the live-validation items above decidable against a fixture — they still need a real forge — and it does not close the grooming LOOP: `ApplyGrooming` still has no production caller (#2822), so an approved report applies nothing. This section remains the honest record for the live-validation items.
 
+## Write-ahead hook and `LinkToEpic` (#4153)
+
+`File` calls `req.NotifyCreated(ctx, created)` right after `CreateIssue` returns and BEFORE `placeOnBoard` / `linkEpic`, with the created number and `HTMLURL`. Labels and the `Depends on:` marker ride the create body, so they are atomic with the create; only the board and sub-issue steps follow the hook. `TestProvider_File_NotifyCreatedBeforeBoardAndLink` asserts the order `CreateIssue, hook, AddProjectItem, AddSubIssue`; `TestProvider_File_NoHookOnCreateFailure` pins that a failed create fires nothing.
+
+`LinkToEpic` (the `workmgmt.EpicLinker` capability) attaches an already-filed child: it validates repo, installation scope, the epic ref and a positive child number BEFORE any API call (File's fail-closed messages), resolves the child's node id, then reuses `linkEpic`. GitHub refuses `AddSubIssue` for an issue that is already a sub-issue, so the caller (the refinement executor's link pass) links only children absent from `EpicChildren`. `TestProvider_LinkToEpic` and `TestProvider_LinkToEpic_FailsClosed` cover the happy path and every refusal.
+
 ## `EpicChild.Body` / `EpicChild.URL` and the create-payload marker guarantee (E50.7 / #2064)
 
 `EpicChildren` maps two additive fields off each sub-issue, and both are carried **verbatim**:
 
-- **`Body`** — the child's raw issue body, from the `body` field the `ListSubIssues` GraphQL selection already returned. It is the surface the split-filing forge-state adoption lookup reads (`splitfiling.FindAdoptableChild` asks `workmgmt.BodyHasIdempotencyKey` of it).
+- **`Body`** — the child's raw issue body, from the `body` field the `ListSubIssues` GraphQL selection already returned. It is the surface the split-filing forge-state adoption lookup reads (`splitfiling.FindAdoptableChild` asks `workmgmt.BodyHasIdempotencyKey` of it), and since #4153 the refinement executor's resume adoption too.
 - **`URL`** — the child's canonical absolute URL, from the `url` field #2064 **added** to that selection (`githubclient.SubIssue.URL`). It is **never composed** from owner/repo/number: the filed path records `issue.HTMLURL` as the forge returned it and `githubclient.Client.BaseURL` is configurable, so a literal `https://github.com/{owner}/{repo}/issues/{n}` would be wrong on a GitHub Enterprise Server host. The split-filing adoption path records this value, so a composed url would put a URL no operator can follow on the completion marker.
 
 `EpicChildren` applies **no state filter** — a child CLOSED before a re-approval is still returned and therefore still adoptable, because it was FILED and re-filing it would duplicate it. `TestProvider_EpicChildren_PopulatesBodyAndURLVerbatim` asserts both fields and the closed-child case; introducing a `state == "CLOSED"` skip in the mapping loop reddens it (`children = [...], want 2`).
