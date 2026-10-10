@@ -118,7 +118,9 @@ The default test suite uses a `fakeSender` / stub `Judge`, so the
 committed-tree verify and CI make **no** live model call. A separate
 `TestCalibrateLive` constructs an `*anthropic.Client` and runs the real
 judge over the corpus, but it `t.Skip`s unless BOTH
-`FISHHAWK_AGENTEVAL_JUDGE_LIVE` and `FISHHAWKD_ANTHROPIC_API_KEY` are set.
+`FISHHAWK_AGENTEVAL_JUDGE_LIVE` and a model credential are set —
+`FISHHAWKD_ANTHROPIC_API_KEY` or `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, exactly one
+(`livecredential_test.go`, E83.96 / #4223).
 Passing the `*anthropic.Client` to `NewLLMJudge` is also the compile-time
 proof the SDK adapter's signature has not drifted from `MessageSender`.
 
@@ -440,7 +442,8 @@ behaviour-preservation pin for that refactor and pass unchanged.
 ### Status: apparatus shipped, measurement NOT taken
 
 The offline gates run in every `scripts/test verify`. Both live arms skip for
-want of `FISHHAWKD_ANTHROPIC_API_KEY`, so #2291 acceptance criteria 1, 2 and 4
+want of a model credential (`FISHHAWKD_ANTHROPIC_API_KEY` or
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN`), so #2291 acceptance criteria 1, 2 and 4
 are **UNMEASURED**; **#3187** owns them and the treatment decision they
 license. Evidence document (what is proven vs what is not, plus the re-run
 recipe): `docs/compliance/prompt-injection-evidence.md`. Long-form contract:
@@ -452,14 +455,17 @@ recipe): `docs/compliance/prompt-injection-evidence.md`. Long-form contract:
 scripts/test single -run TestScore ./backend/internal/agenteval/        # Tier-A corpus replay
 scripts/test single -run 'TestJudge|TestCalibrat' ./backend/internal/agenteval/   # Tier-B judge + calibration
 
-# Opt-in live judge calibration (makes a real model call; skipped otherwise):
+# Opt-in live judge calibration (makes a real model call; skipped otherwise).
+# Credential: set exactly one of FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ANTHROPIC_AUTH_TOKEN:
 FISHHAWK_AGENTEVAL_JUDGE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run TestCalibrateLive ./backend/internal/agenteval/
+FISHHAWK_AGENTEVAL_JUDGE_LIVE=1 FISHHAWKD_ANTHROPIC_AUTH_TOKEN=... \
   scripts/test single -run TestCalibrateLive ./backend/internal/agenteval/
 
 # Prompt-envelope corpora, offline halves (E60.2 / #2291; no model call):
 scripts/test single -run 'TestInjection|TestLoadInjection|TestEnvelopeQuality|TestStripBodyEnvelope|TestQualityArm' ./backend/internal/agenteval/
 
-# Opt-in live prompt-envelope arms (both SKIP without an API key):
+# Opt-in live prompt-envelope arms (both SKIP without a model credential):
 FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run TestInjectionLive ./backend/internal/agenteval/
 FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \

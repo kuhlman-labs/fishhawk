@@ -11,12 +11,13 @@ import (
 )
 
 // TestInjectionLive is the opt-in BEHAVIOURAL arm of the #2291 injection
-// corpus. It is SKIPPED unless BOTH FISHHAWK_AGENTEVAL_INJECTION_LIVE and
-// FISHHAWKD_ANTHROPIC_API_KEY are set — the same double gate
+// corpus. It is SKIPPED unless BOTH FISHHAWK_AGENTEVAL_INJECTION_LIVE and a
+// credential (FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN,
+// exactly one) are set — the same double gate
 // TestCalibrateLive uses — so the committed-tree `scripts/test verify` and
 // CI never make a model call.
 //
-// IT SKIPS IN THIS RUN. No FISHHAWKD_ANTHROPIC_API_KEY is configured in
+// IT SKIPS IN THIS RUN. No model credential is configured in
 // the environment that produced this change, so issue acceptance
 // criterion 4 — the criterion THIS arm decides (the agent does not FOLLOW
 // any adversarial fixture) — is NOT decided by it. #3187 owns that
@@ -38,33 +39,28 @@ func TestInjectionLive(t *testing.T) {
 	if os.Getenv("FISHHAWK_AGENTEVAL_INJECTION_LIVE") == "" {
 		t.Skip("set FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 to run the live injection arm. Until it runs, #2291 acceptance criterion 4 (behavioural injection resistance) remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
-	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live injection arm. #2291 acceptance criterion 4 remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
-	}
+	cred := requireLiveCredential(t, "Skipping the live injection arm. #2291 acceptance criterion 4 remains UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 
 	// The TARGET call: an unconstrained sender, because the point is what the
 	// agent does with the prompt, not whether it can emit a schema.
 	target := func(ctx context.Context, render, renderedPrompt string) (string, error) {
-		client := anthropic.NewClient(anthropic.Config{
-			APIKey:    apiKey,
+		client := anthropic.NewClient(cred.config(anthropic.Config{
 			Model:     DefaultQualityGeneratorModel,
 			MaxTokens: 4096,
 			Timeout:   120 * time.Second,
-		})
+		}))
 		responseText, _, _, _, _, _, err := client.Messages(ctx, injectionTargetSystemPrompt(render), renderedPrompt)
 		return responseText, err
 	}
 	// The JUDGE call is schema-pinned to the rubric's own dimension set,
 	// exactly as TestCalibrateLive pins JudgeCardSchema.
 	judge := func(ctx context.Context, rubric Rubric, response string) (RubricCard, error) {
-		judgeClient := anthropic.NewClient(anthropic.Config{
-			APIKey:    apiKey,
+		judgeClient := anthropic.NewClient(cred.config(anthropic.Config{
 			Model:     DefaultJudgeModel,
 			MaxTokens: 1024,
 			Timeout:   60 * time.Second,
 			Schema:    RubricCardSchema(rubric.Dimensions),
-		})
+		}))
 		return NewRubricJudge(judgeClient, DefaultJudgeModel, 2).JudgeRubric(ctx, rubric, response)
 	}
 

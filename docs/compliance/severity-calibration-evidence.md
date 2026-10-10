@@ -43,8 +43,10 @@ visible after the change merges.
 | adversarial retention | `TestAdversarialRetentionLive` | done-means 2(b) — did #2119 LOSE a finding the pre-#2119 prompt produced? This feeds the done-means 3 revert-or-fix decision. |
 
 Both are double-gated: they SKIP unless BOTH
-`FISHHAWK_AGENTEVAL_CALIBRATION_LIVE` and `FISHHAWKD_ANTHROPIC_API_KEY` are
-set, and the skip message names #3309 and this document.
+`FISHHAWK_AGENTEVAL_CALIBRATION_LIVE` and a model credential —
+`FISHHAWKD_ANTHROPIC_API_KEY` or `FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth
+bearer), exactly one — are set, and the skip message names both credential
+variables, #3309 and this document.
 
 ## Step 1 — build the labelled corpus
 
@@ -91,6 +93,7 @@ Contract and fail-loud modes: `backend/internal/corpusdistill/README.md`.
 ## Step 2 — run the arms
 
 ```sh
+# Swap FISHHAWKD_ANTHROPIC_API_KEY for FISHHAWKD_ANTHROPIC_AUTH_TOKEN to use a bearer token:
 FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run 'TestSeverityCalibrationLive|TestAdversarialRetentionLive' \
   ./backend/internal/agenteval/

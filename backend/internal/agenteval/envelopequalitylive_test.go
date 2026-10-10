@@ -12,11 +12,12 @@ import (
 // TestEnvelopeQualityLive is the opt-in live arm of measurement 1: does
 // the #2290 quarantine envelope DILUTE plan quality on legitimate issues?
 //
-// Double-gated on FISHHAWK_AGENTEVAL_QUALITY_LIVE +
-// FISHHAWKD_ANTHROPIC_API_KEY, the same pattern TestCalibrateLive uses, so
+// Double-gated on FISHHAWK_AGENTEVAL_QUALITY_LIVE + one credential
+// (FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN, exactly one),
+// the same pattern TestCalibrateLive uses, so
 // the committed-tree verify and CI never make a model call.
 //
-// IT SKIPS IN THIS RUN — no FISHHAWKD_ANTHROPIC_API_KEY is configured
+// IT SKIPS IN THIS RUN — no model credential is configured
 // here, so #2291 acceptance criteria 1 and 2 — the criteria THIS arm
 // decides (the delta is reported; a material regression changes the
 // treatment) — are NOT decided by this change. #3187 owns them,
@@ -29,29 +30,24 @@ func TestEnvelopeQualityLive(t *testing.T) {
 	if os.Getenv("FISHHAWK_AGENTEVAL_QUALITY_LIVE") == "" {
 		t.Skip("set FISHHAWK_AGENTEVAL_QUALITY_LIVE=1 to run the live envelope-quality arms. Until they run, #2291 acceptance criteria 1 and 2 (the quality delta is reported; a material regression changes the treatment) remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 	}
-	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live envelope-quality arms. #2291 acceptance criteria 1 and 2 remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
-	}
+	cred := requireLiveCredential(t, "Skipping the live envelope-quality arms. #2291 acceptance criteria 1 and 2 remain UNMEASURED — see #3187 and docs/compliance/prompt-injection-evidence.md.")
 
 	cases := loadQualityCases(t)
 	ctx := context.Background()
 
 	// ONE generator config for BOTH arms: same model, same limits. A model
 	// difference between arms would confound the treatment effect.
-	generator := anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	generator := anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultQualityGeneratorModel,
 		MaxTokens: 4096,
 		Timeout:   120 * time.Second,
-	})
-	judge := NewRubricJudge(anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	}))
+	judge := NewRubricJudge(anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultJudgeModel,
 		MaxTokens: 1024,
 		Timeout:   60 * time.Second,
 		Schema:    RubricCardSchema(qualityDimensions),
-	}), DefaultJudgeModel, 2)
+	})), DefaultJudgeModel, 2)
 
 	envelope, err := RunQualityArm(ctx, generator, judge, cases, ArmEnvelope, DefaultQualitySamples)
 	if err != nil {
