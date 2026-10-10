@@ -52,7 +52,8 @@ type AwaitChildrenInput struct {
 //     authority — capabilities.slice_integration.available false, the server
 //     gate's own predicate (#4165); on an older backend inferred from no record
 //     and a succeeded parent implement stage — it falls back to the pre-#4080
-//     all-terminal release (approval condition C3).
+//     all-terminal release (approval condition C3). A FAILED read of the
+//     parent keeps the wait instead (#4220); it is never the absent key.
 //   - "timeout"               — none of the above within the window. The wait
 //     holds no server state, so re-calling is a safe no-op.
 //
@@ -197,6 +198,8 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               fishhawk_consolidate_slices only while the
                               parent's implement stage is awaiting_children and
                               fishhawk_get_run_status on the parent otherwise.
+                              A FAILED read of the parent's capabilities keeps
+                              waiting and never takes this fallback.
   - "timeout"               — none of the above within the window. The wait
                               holds no server state, so re-calling is a safe
                               idempotent no-op.
@@ -423,9 +426,19 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 	if cs.IntegrationPhase != integrationPhaseIntegrated {
 		parentImplementState := r.parentImplementStageState(ctx, parentUUID)
 		// The server's own slice-integration predicate (#4165), read ONLY here
-		// so every other release pays zero extra reads. nil = undecidable (an
-		// older backend or a failed read) → the C3 inference fallback.
-		authority := r.parentSliceIntegration(ctx, parentUUID)
+		// so every other release pays zero extra reads. Three states (#4220): a
+		// present key is authoritative; an ABSENT key on a successful read (an
+		// older backend) is undecidable → the C3 inference fallback; a FAILED
+		// read is distinct from an absent key and fails CLOSED to the wait — no
+		// release on this poll, the next tick re-reads, a persistent failure
+		// surfaces as the resumable timeout. Releasing children_settled on the
+		// inference there would hand the exact #4165 lost-record wedge a green
+		// light. Same precedent as the child_failed arm, which fails closed to
+		// the wait on a child whose GetRun failed.
+		authority, aerr := r.parentSliceIntegration(ctx, parentUUID)
+		if aerr != nil {
+			return AwaitChildrenOutput{}, false, nil
+		}
 		if integrationAuthorityAbsent(cs, parentImplementState, authority) {
 			// C3: the server has no slice-integration authority, so its
 			// acceptance gate stands down and no coverage is required. Fall
@@ -633,16 +646,19 @@ func (r *runResolver) parentImplementStageState(ctx context.Context, parentUUID 
 
 // parentSliceIntegration reads the parent's capabilities.slice_integration —
 // the server gate's own slice-integration predicate (#4165) — with one bounded
-// (5s) single-run GetRun. Best-effort: nil on any read error, which is
-// UNDECIDABLE and takes the C3 inference fallback, never "unavailable".
-func (r *runResolver) parentSliceIntegration(ctx context.Context, parentUUID uuid.UUID) *runSliceIntegration {
+// (5s) single-run GetRun. Three distinct states: a non-nil authority is
+// AUTHORITATIVE; a nil authority with a nil error means the key is ABSENT on a
+// SUCCESSFUL read (an older backend), which is UNDECIDABLE and takes the C3
+// inference fallback; a non-nil error is a READ FAILURE, which is never the
+// absent key (#4220) — the caller must not fall back to the inference on it.
+func (r *runResolver) parentSliceIntegration(ctx context.Context, parentUUID uuid.UUID) (*runSliceIntegration, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	run, err := r.api.GetRun(fetchCtx, parentUUID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return sliceIntegrationOf(run)
+	return sliceIntegrationOf(run), nil
 }
 
 // childrenStatusForAwait assembles the parent's ChildrenStatus snapshot for the
