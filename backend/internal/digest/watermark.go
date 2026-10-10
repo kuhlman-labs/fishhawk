@@ -19,12 +19,18 @@ import (
 //     upsert). An append error returns with the row untouched.
 //
 // The result describes what was COMMITTED, not what was requested: Sequence is
-// the watermark the upsert statement left in the row and Advanced is true only
-// when THIS call raised it. Two captains' requests can race here — a lower one
+// the watermark the row holds after the call and Advanced is true only when
+// THIS call raised it. Two captains' requests can race here — a lower one
 // reads the old watermark before a higher one commits, then its own monotonic
 // upsert makes no change — so the lower call reports the higher committed
 // Sequence with Advanced=false rather than falsely claiming it advanced to its
-// own lower ToSequence (#3734 fix-up condition 4).
+// own lower ToSequence (#3734 fix-up condition 4). When the upsert refuses, the
+// row is re-read in a SEPARATE statement (a fresh READ COMMITTED snapshot), so
+// a call whose upsert blocked on a concurrent higher mark — or on a concurrent
+// FIRST insert of the row — reports the LATEST committed Sequence with
+// Advanced=false, not a stale pre-commit value or a "no rows" error (#3852;
+// see advanceWatermarkSQL). A refused upsert whose re-read finds no row (only a
+// concurrent manual DELETE) fails closed with ErrWatermarkRowVanished.
 //
 // Idempotence is a property of the WATERMARK, not of the chain. A retry after
 // an append succeeded but the advance failed appends a SECOND entry — an
@@ -111,6 +117,10 @@ type MarkReadParams struct {
 
 // MarkReadResult reports what MarkRead did.
 type MarkReadResult struct {
+	// PreviousSequence and HadPrevious are the watermark THIS call READ before
+	// appending — what its digest_marked_read entry records. Under a concurrent
+	// advance they can be below the value the upsert actually compared against
+	// (a higher mark committed between the read and the upsert).
 	PreviousSequence int64 `json:"previous_sequence"`
 	HadPrevious      bool  `json:"had_previous"`
 	// Sequence is the watermark COMMITTED after the call (not necessarily the

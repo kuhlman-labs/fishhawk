@@ -549,7 +549,7 @@ cannot answer.
 | `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`) |
 | `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
-| `testdata/planreview-catchrate/` | the representative conventions fixture and, once an operator records it, `evidence.json` |
+| `testdata/planreview-catchrate/` | the representative conventions fixture and the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) |
 
 ### Generator model
 
@@ -564,28 +564,30 @@ test pins both. The first recording pins the baseline to this model, and a
 baseline is comparable only with the same model, so changing it later is an
 explicit re-pin.
 
-GATE-MODEL COUPLING: `catchrategate/main.go` still reads
-`agenteval.DefaultQualityGeneratorModel`, and `CheckCatchRateEvidence` mode (4)
-refuses a record from any other model. The PR that commits the first
-`claude-sonnet-5-5` evidence must therefore switch that line (and
-`catchrategate/main_test.go`'s matching references) to
-`DefaultCatchRateGeneratorModel`. That PR already triggers
-`scripts/check-review-prompt-eval` through `evidence.json`, so the switch costs
-no extra check run. Until it lands, a `claude-sonnet-5-5` record is refused
-with `recorded generator model "claude-sonnet-5-5" is not the gate's model
-"claude-sonnet-4-6": re-measure`; do not re-measure on that message.
+GATE-MODEL COUPLING: `CheckCatchRateEvidence` mode (4) refuses a record from
+any model other than the gate's. The commit that recorded the first
+`claude-sonnet-5-5` evidence switched `catchrategate/main.go` (and
+`catchrategate/main_test.go`'s matching references) from
+`DefaultQualityGeneratorModel` to `DefaultCatchRateGeneratorModel`, so the gate
+reads the same constant the arms run on. A later generator-model change must
+switch that line in the same PR as its new evidence; a `recorded generator
+model ... is not the gate's model ...: re-measure` failure right after such a
+change means the gate line is stale, not the measurement.
 
-### THE BASELINE HAS NOT BEEN RECORDED
+### Baseline status: RECORDED 2026-10-10
 
-No `testdata/planreview-catchrate/evidence.json` is committed. The offline
-tests prove the APPARATUS is correct (the arms differ only by the conventions
-section, the loader refuses non-discriminating probes, every evidence mode
-fails closed). They prove NOTHING about whether conventions dilute the
-reviewer, because nothing in-loop calls a model: the runner denies
-`ANTHROPIC_API_KEY` to gate subprocesses (`runner/cmd/fishhawk-runner/gateenv.go`
-`gateEnvDeny`). Until an operator records and pins the first baseline,
-`catchrategate` exits 1 on the committed tree, so the standing check fails
-closed on every review-prompt change. That is the design. Run-book:
+`testdata/planreview-catchrate/evidence.json` holds the first pinned baseline
+(2026-10-10, `claude-sonnet-5-5`: without conventions 80/138, with conventions
+83/138, PASS). The offline tests prove the APPARATUS is correct (the arms
+differ only by the conventions section, the loader refuses non-discriminating
+probes, every evidence mode fails closed); they prove NOTHING about whether
+conventions dilute the reviewer, because nothing in-loop calls a model: the
+runner denies `ANTHROPIC_API_KEY` to gate subprocesses
+(`runner/cmd/fishhawk-runner/gateenv.go` `gateEnvDeny`). Only the recorded
+evidence speaks to dilution, and only for the six committed planted-defect
+shapes. When the record goes stale, `catchrategate` exits 1 and the standing
+check fails closed on the next review-prompt change until an operator
+re-measures. Run-book:
 [`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md).
 
 ### Corpus authoring: `review_input.json` and the probe matcher

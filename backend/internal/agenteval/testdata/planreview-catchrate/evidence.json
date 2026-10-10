@@ -1,0 +1,156 @@
+{
+  "schema": "planreview-catchrate-evidence-v1",
+  "recorded_at": "2026-10-10T18:33:25Z",
+  "generator_model": "claude-sonnet-5-5",
+  "prompt_fingerprint": "sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f",
+  "tolerance": 0.1,
+  "min_trials_per_arm": 136,
+  "samples_per_case": 23,
+  "arms": {
+    "without_conventions": {
+      "per_case": {
+        "seed-synthetic-contradicts-issue": {
+          "trials": 23,
+          "caught": 9,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-criterion": {
+          "trials": 23,
+          "caught": 4,
+          "undecodable": 0
+        },
+        "seed-synthetic-restates-approach": {
+          "trials": 23,
+          "caught": 23,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-adjective": {
+          "trials": 23,
+          "caught": 2,
+          "undecodable": 0
+        },
+        "seed-synthetic-unwarranted-rate-limit": {
+          "trials": 23,
+          "caught": 19,
+          "undecodable": 0
+        },
+        "seed-synthetic-vacuous-criterion": {
+          "trials": 23,
+          "caught": 23,
+          "undecodable": 0
+        }
+      }
+    },
+    "with_conventions": {
+      "per_case": {
+        "seed-synthetic-contradicts-issue": {
+          "trials": 23,
+          "caught": 10,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-criterion": {
+          "trials": 23,
+          "caught": 3,
+          "undecodable": 0
+        },
+        "seed-synthetic-restates-approach": {
+          "trials": 23,
+          "caught": 23,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-adjective": {
+          "trials": 23,
+          "caught": 7,
+          "undecodable": 0
+        },
+        "seed-synthetic-unwarranted-rate-limit": {
+          "trials": 23,
+          "caught": 17,
+          "undecodable": 0
+        },
+        "seed-synthetic-vacuous-criterion": {
+          "trials": 23,
+          "caught": 23,
+          "undecodable": 0
+        }
+      }
+    }
+  },
+  "baseline": {
+    "pinned_at": "2026-10-10T18:33:25Z",
+    "reason": "first measurement, claude-sonnet-5-5 per #4235; E55.4 baseline (#2245)",
+    "generator_model": "claude-sonnet-5-5",
+    "prompt_fingerprint": "sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f",
+    "samples_per_case": 23,
+    "arms": {
+      "without_conventions": {
+        "per_case": {
+          "seed-synthetic-contradicts-issue": {
+            "trials": 23,
+            "caught": 9,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-criterion": {
+            "trials": 23,
+            "caught": 4,
+            "undecodable": 0
+          },
+          "seed-synthetic-restates-approach": {
+            "trials": 23,
+            "caught": 23,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-adjective": {
+            "trials": 23,
+            "caught": 2,
+            "undecodable": 0
+          },
+          "seed-synthetic-unwarranted-rate-limit": {
+            "trials": 23,
+            "caught": 19,
+            "undecodable": 0
+          },
+          "seed-synthetic-vacuous-criterion": {
+            "trials": 23,
+            "caught": 23,
+            "undecodable": 0
+          }
+        }
+      },
+      "with_conventions": {
+        "per_case": {
+          "seed-synthetic-contradicts-issue": {
+            "trials": 23,
+            "caught": 10,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-criterion": {
+            "trials": 23,
+            "caught": 3,
+            "undecodable": 0
+          },
+          "seed-synthetic-restates-approach": {
+            "trials": 23,
+            "caught": 23,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-adjective": {
+            "trials": 23,
+            "caught": 7,
+            "undecodable": 0
+          },
+          "seed-synthetic-unwarranted-rate-limit": {
+            "trials": 23,
+            "caught": 17,
+            "undecodable": 0
+          },
+          "seed-synthetic-vacuous-criterion": {
+            "trials": 23,
+            "caught": 23,
+            "undecodable": 0
+          }
+        }
+      }
+    }
+  }
+}
