@@ -3747,7 +3747,8 @@ func TestRun_FetchPrompt_RequiresStageID(t *testing.T) {
 }
 
 func TestRun_FetchPrompt_FetchFailure(t *testing.T) {
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fi := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fi)
 	fu := newFakeUploader(t)
 	fu.promptErr = errors.New("backend down")
 	withFakeUploader(t, fu)
@@ -3764,6 +3765,12 @@ func TestRun_FetchPrompt_FetchFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "fetch_prompt") {
 		t.Errorf("missing fetch_prompt error: %s", stderr.String())
+	}
+	// A refused fetch (e.g. the backend's 409 runner_capability_missing for a
+	// merge-candidate pass this binary cannot run, #4183) must exit BEFORE
+	// any agent spawn.
+	if fi.callIdx != 0 || fi.gotInv != nil {
+		t.Errorf("agent invoked %d time(s) after a failed prompt fetch, want 0", fi.callIdx)
 	}
 }
 
@@ -31028,6 +31035,9 @@ func TestResumeKindWireValues(t *testing.T) {
 	}
 	if upload.CapabilityPushResume != "push-resume" {
 		t.Errorf("CapabilityPushResume = %q", upload.CapabilityPushResume)
+	}
+	if upload.CapabilityMergeCandidateVerify != "merge-candidate-verify" {
+		t.Errorf("CapabilityMergeCandidateVerify = %q", upload.CapabilityMergeCandidateVerify)
 	}
 }
 

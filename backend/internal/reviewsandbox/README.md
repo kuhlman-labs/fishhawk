@@ -158,7 +158,7 @@ gating path defers cleanup in the dispatch scope; the DETACHED advisory path
 hands cleanup into the goroutine (C6) so the export survives the detached
 reviewers' lifetime and is removed exactly when the loop returns.
 
-Both call sites (`plan.go`, `trace.go`) go through ONE helper, `groundReview`,
+All three call sites (`runPlanReviews` in `plan.go`; `runImplementReviews` and `runSupplementalReinvokeReview` in `trace.go`) go through ONE helper, `groundReview`,
 which stamps `prompt.Trigger.ReviewUngroundedReason` on every degrade (#4066):
 `disabled` (kill switch — also for a mixed panel while the switch is on),
 `reviewer_cannot_ground` (a mixed panel with grounding enabled),

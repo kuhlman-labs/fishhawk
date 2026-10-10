@@ -435,3 +435,27 @@ func TestIssueSetResolutionTimeoutUnwrap(t *testing.T) {
 		t.Fatalf("errors.As must reach the counts through a wrap, got %+v", to)
 	}
 }
+
+// TestProviderRequest_NotifyCreated pins the write-ahead hook seam (#4153):
+// it forwards a copy of the created item to OnCreated, and is a no-op for a
+// nil hook or a nil item, so a provider calls it unconditionally.
+func TestProviderRequest_NotifyCreated(t *testing.T) {
+	var got []CreatedItem
+	req := ProviderRequest{OnCreated: func(_ context.Context, item CreatedItem) { got = append(got, item) }}
+	item := &CreatedItem{Number: 12, URL: "https://x/12"}
+	req.NotifyCreated(context.Background(), item)
+	if len(got) != 1 || got[0].Number != 12 || got[0].URL != "https://x/12" {
+		t.Fatalf("hook received %+v, want one call carrying #12", got)
+	}
+	item.Number = 99
+	if got[0].Number != 12 {
+		t.Error("the hook received an alias of the provider's item, want a copy")
+	}
+
+	req.NotifyCreated(context.Background(), nil)
+	if len(got) != 1 {
+		t.Errorf("a nil item reached the hook (%d calls)", len(got))
+	}
+	// A nil hook must not panic.
+	ProviderRequest{}.NotifyCreated(context.Background(), &CreatedItem{Number: 1})
+}

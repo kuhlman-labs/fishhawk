@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -726,5 +727,135 @@ func TestMutatorFor_GitLabResolvesTypedUnavailable(t *testing.T) {
 	}
 	if ue.Capability != workmgmt.GroomingCapability {
 		t.Errorf("Capability = %q, want %q", ue.Capability, workmgmt.GroomingCapability)
+	}
+}
+
+// TestProvider_File_NotifyCreatedBeforeLink pins GitLab's write-ahead path
+// (#4153): File fires OnCreated exactly once, right after CreateIssue and
+// BEFORE the post-create LinkIssues call, so the refinement executor records
+// a GitLab child from the hook — not the post-File fallback.
+func TestProvider_File_NotifyCreatedBeforeLink(t *testing.T) {
+	api := &fakeAPI{}
+	item := workmgmt.WorkItem{
+		Type:      "feature",
+		Title:     "[E3.1] child",
+		Body:      "body",
+		Relations: workmgmt.Relations{ParentEpic: "#3"},
+	}
+	r := req(item, &workmgmt.GitLabConnection{}, workmgmt.Repo{Owner: "acme", Name: "widgets"})
+	var calls []workmgmt.CreatedItem
+	var createdBeforeHook, linkedBeforeHook bool
+	r.OnCreated = func(_ context.Context, ci workmgmt.CreatedItem) {
+		calls = append(calls, ci)
+		createdBeforeHook = api.createID == 42
+		linkedBeforeHook = api.linkCalled
+	}
+
+	created, err := New(api).File(context.Background(), r)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if len(calls) != 1 || calls[0].Number != 7 || calls[0].URL != "https://gitlab.com/acme/widgets/-/issues/7" {
+		t.Fatalf("hook calls = %+v, want exactly one carrying #7 and its URL", calls)
+	}
+	if !createdBeforeHook {
+		t.Error("hook fired before CreateIssue")
+	}
+	if linkedBeforeHook {
+		t.Error("hook fired AFTER LinkIssues; it must precede the post-create link")
+	}
+	if !api.linkCalled || !created.EpicLinked {
+		t.Errorf("link after the hook: called=%v linked=%v, want both true", api.linkCalled, created.EpicLinked)
+	}
+}
+
+// TestProvider_File_NoHookOnCreateFailure: no issue exists, so the hook is
+// never fired.
+func TestProvider_File_NoHookOnCreateFailure(t *testing.T) {
+	api := &fakeAPI{createErr: errors.New("boom")}
+	r := req(workmgmt.WorkItem{Title: "t"}, &workmgmt.GitLabConnection{}, workmgmt.Repo{Owner: "acme", Name: "widgets"})
+	fired := false
+	r.OnCreated = func(context.Context, workmgmt.CreatedItem) { fired = true }
+	if _, err := New(api).File(context.Background(), r); err == nil {
+		t.Fatal("File succeeded, want the create error")
+	}
+	if fired {
+		t.Error("OnCreated fired although CreateIssue failed")
+	}
+}
+
+func gitlabLinkRequest() workmgmt.EpicLinkRequest {
+	return workmgmt.EpicLinkRequest{
+		Target: workmgmt.Target{Repo: workmgmt.Repo{Owner: "acme", Name: "widgets"}, GitLab: &workmgmt.GitLabConnection{}},
+		Epic:   "#3",
+		Child:  9,
+	}
+}
+
+// TestProvider_LinkToEpic resolves the project exactly as File does (GetProject
+// scripted on the fake) and links the child to the epic with a relates_to link.
+func TestProvider_LinkToEpic(t *testing.T) {
+	api := &fakeAPI{}
+	if err := New(api).LinkToEpic(context.Background(), gitlabLinkRequest()); err != nil {
+		t.Fatalf("LinkToEpic: %v", err)
+	}
+	if api.getPath != "acme/widgets" {
+		t.Errorf("GetProject path = %q, want acme/widgets", api.getPath)
+	}
+	if !api.linkCalled || api.linkProj != 42 || api.linkIID != 9 || api.linkTarget != 3 {
+		t.Errorf("LinkIssues(proj=%d, iid=%d, target=%d) called=%v, want (42, 9, 3)", api.linkProj, api.linkIID, api.linkTarget, api.linkCalled)
+	}
+
+	// The conventions override wins, as in File.
+	api = &fakeAPI{}
+	r := gitlabLinkRequest()
+	r.Target.GitLab = &workmgmt.GitLabConnection{Project: "group/sub/app"}
+	if err := New(api).LinkToEpic(context.Background(), r); err != nil {
+		t.Fatalf("LinkToEpic (override): %v", err)
+	}
+	if api.getPath != "group/sub/app" {
+		t.Errorf("GetProject path = %q, want the override group/sub/app", api.getPath)
+	}
+}
+
+// TestProvider_LinkToEpic_FailsClosed covers every refusal and error branch;
+// the validation branches (and an empty project path) refuse before any link.
+func TestProvider_LinkToEpic_FailsClosed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		api     *fakeAPI
+		nilAPI  bool
+		mutate  func(*workmgmt.EpicLinkRequest)
+		wantErr string
+	}{
+		"nil api":            {nilAPI: true, wantErr: "missing API client"},
+		"bad epic ref":       {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Epic = "x" }, wantErr: `parse parent epic "x"`},
+		"non-positive child": {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Child = -1 }, wantErr: "child issue iid -1 is not positive"},
+		"no connection":      {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Target.GitLab = nil }, wantErr: "target gitlab connection required"},
+		"empty project path": {api: &fakeAPI{}, mutate: func(r *workmgmt.EpicLinkRequest) { r.Target.Repo = workmgmt.Repo{} }, wantErr: "no target project"},
+		"project error":      {api: &fakeAPI{getErr: errors.New("404")}, wantErr: `resolve project "acme/widgets": 404`},
+		"link error":         {api: &fakeAPI{linkErr: errors.New("409 already linked")}, wantErr: "link #9 to parent epic #3: 409 already linked"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := gitlabLinkRequest()
+			if tc.mutate != nil {
+				tc.mutate(&r)
+			}
+			var p *Provider
+			if tc.nilAPI {
+				p = New(nil)
+			} else {
+				p = New(tc.api)
+			}
+			err := p.LinkToEpic(context.Background(), r)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+			}
+			if tc.api != nil && name != "link error" && tc.api.linkCalled {
+				t.Error("LinkIssues reached despite the refusal")
+			}
+			if tc.api != nil && (name == "bad epic ref" || name == "non-positive child" || name == "no connection" || name == "empty project path") && tc.api.getPath != "" {
+				t.Errorf("GetProject(%q) reached before the refusal", tc.api.getPath)
+			}
+		})
 	}
 }

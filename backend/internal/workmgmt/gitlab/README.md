@@ -9,6 +9,8 @@ GitLab issues work-item provider (`provider: gitlab`) — the concrete third pro
 - It then creates the issue with the conventions-resolved labels **plus the board-status label** (see below), the second and last fatal step — no issue exists if `CreateIssue` fails.
 - It finally links `Relations.ParentEpic` **best-effort** (#1107) via a Free-tier issue link (see below): a parse or link failure records `EpicLinkError` and leaves `EpicLinked=false` rather than discarding the issue.
 - `CreatedItem.Number` is the issue iid; `URL` is the issue web URL.
+- **Write-ahead hook (#4153).** Right after `CreateIssue` and BEFORE the `LinkIssues` call, `File` fires `req.NotifyCreated` with the iid and web URL, so the refinement executor records a GitLab child from the hook — NOT its post-`File` fallback. The board label rode the create, so only the link follows the hook. Pinned by `TestProvider_File_NotifyCreatedBeforeLink` (and `TestProvider_File_NoHookOnCreateFailure`).
+- **`LinkToEpic` (`workmgmt.EpicLinker`, #4153)** attaches an already-filed child to its epic with the same Free-tier `relates_to` link. It validates the epic ref and a positive child iid, then repeats `File`'s project resolution exactly — the gitlab connection is required, `resolveProjectPath` must yield a path (empty fails closed), `GetProject` resolves the numeric id — before `LinkIssues`. `TestProvider_LinkToEpic` / `TestProvider_LinkToEpic_FailsClosed`.
 
 ## Mapping decisions
 
@@ -43,7 +45,7 @@ Both reuse the github sibling's three-phase bounded-concurrency shape (#3113): P
 
 ## Capability posture
 
-- `File`, `EpicChildrenQuerier`, `IssueSetDependencyResolver` (above) and `UserReportReader` (below). `Transitioner` (#1012) and `NumberDiscoverer` (#1269) are **not** implemented — the capability-asserting hooks yield a no-op, matching the jira sibling. Because `EpicChildrenQuerier` is now served, the child-number `{n}` allocation for a filing with a `parent_epic` resolves through `EpicChildren`.
+- `File`, `EpicChildrenQuerier`, `EpicLinker`, `IssueSetDependencyResolver` (above) and `UserReportReader` (below). `Transitioner` (#1012) and `NumberDiscoverer` (#1269) are **not** implemented — the capability-asserting hooks yield a no-op, matching the jira sibling. Because `EpicChildrenQuerier` is now served, the child-number `{n}` allocation for a filing with a `parent_epic` resolves through `EpicChildren`.
 - Auth deliberately bypasses `forge.CredentialScope` in v0 (`Target.Scope` stays zero for gitlab filings): the client authenticates with the env token like `jiraclient`. Rehoming it onto the credential-scope seam is deferred to the #1855 chain.
 
 ## Work-item read/list: reviewed, not implemented in v0 (#2230 / ADR-064)

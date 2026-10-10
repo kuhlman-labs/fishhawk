@@ -3966,10 +3966,12 @@ var reviewDispatchMu sync.Mutex
 
 // buildImplementReviewPrompt is the prompt builder the implement-review
 // dispatch (runImplementReviewsForTree) calls INSIDE the reviewDispatchMu
-// section. It is a package-level seam (#2797 item 2) only so a test can make
-// the build fail and prove the lock is released on that exit; production never
-// reassigns it. Server tests do not run in parallel, so a test overriding it
-// restores it in t.Cleanup.
+// section, and the supplemental base-rebase re-invoke pass
+// (runSupplementalReinvokeReview) calls after exporting its review tree. It is
+// a package-level seam (#2797 item 2) only so a test can make the build fail
+// and prove the lock is released, and the exported tree removed (#4160), on
+// that exit; production never reassigns it. Server tests do not run in
+// parallel, so a test overriding it restores it in t.Cleanup.
 var buildImplementReviewPrompt = prompt.Build
 
 // runImplementReviews resolves the implement stage's review config and
@@ -6003,9 +6005,18 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 // It reuses the lower-level implement-review machinery: resolveStageReviewers
 // + ResolveAuthority (skip when no agent reviewers), the wired-reviewer check
 // (skip when none), loadApprovedPlanForRun (skip on nil — nothing to judge
-// soundness against), resolveReviewerInvocations, and
+// soundness against), resolveReviewerInvocations, groundReview, and
 // runImplementReviewInvocations, stamping Origin=base_rebase_reinvoke +
 // headSHA so the verdict is labelable and the dispatch idempotent.
+//
+// Grounding (#4160): the pass goes through the shared groundReview decision.
+// When every reviewer can ground, it is grounded against the pushed re-landed
+// head (headSHA) so the reviewer can read each exempted path at that commit;
+// otherwise the round carries the named ReviewUngroundedReason. The export is
+// taken after every early exit, and its cleanup is owned exactly as in
+// runImplementReviews: deferred inside the detached goroutine (advisory),
+// deferred in the synchronous scope (gating), and called on the build-error
+// branch.
 //
 // CRITICAL — it does NOT call emitReviewStarted. The anchor floors
 // verdict-counting at the latest implement_review_started Sequence
@@ -6130,8 +6141,32 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 		return authority == planreview.AuthorityGating
 	}
 	trig.InjectedDocuments = injected
-	promptText, err := prompt.Build("implement_review", trig)
+
+	// Resolve the per-invocation reviewer list BEFORE building the prompt
+	// (#4160), as runImplementReviews does, so the grounding decision can key
+	// on whether every reviewer in the loop implements the grounding
+	// capability. The gate-resolved review_model override (#1416/#1426) is
+	// threaded in so the supplemental reinvoke verdict runs under the same
+	// operator-resolved model as the first review; an empty override leaves
+	// the spawn byte-identical to today.
+	reviewModelOverride := s.gateResolvedReviewModel(ctx, runID)
+	invocations := s.resolveReviewerInvocationsWithReviewModel(reviewersCfg, reviewModelOverride)
+
+	// Review grounding (#4160, via the shared #2486/#4066 helper): when the
+	// whole loop is grounding-capable, export the PUSHED re-landed head
+	// (headSHA = pr.HeadSHA) as a read-only tree so the reviewer can read each
+	// exempted path at that commit; otherwise groundReview stamps the named
+	// ReviewUngroundedReason, so the prompt never tells the operator to enable
+	// a grounding switch that is already on. Taken AFTER every early exit above
+	// (nil repo, get-run failure, no reviewers, no backend, no plan, the
+	// idempotency dedup, the document-injection fail-closed), so a skipped
+	// dispatch never exports. Cleanup ownership is decided at dispatch below
+	// (C6, mirroring runImplementReviews).
+	treeDir, treeCleanup := s.groundReview(ctx, runRow, headSHA, invocations, &trig)
+
+	promptText, err := buildImplementReviewPrompt("implement_review", trig)
 	if err != nil {
+		treeCleanup()
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: build prompt failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
@@ -6139,11 +6174,6 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 		return false
 	}
 
-	// Thread the gate-resolved review_model override (#1416/#1426) so the
-	// supplemental reinvoke verdict runs under the same operator-resolved model
-	// as the first review; an empty override leaves the spawn byte-identical to today.
-	reviewModelOverride := s.gateResolvedReviewModel(ctx, runID)
-	invocations := s.resolveReviewerInvocationsWithReviewModel(reviewersCfg, reviewModelOverride)
 	authorModel := approvedPlan.GeneratedBy.Model
 	reviewCtx := context.WithoutCancel(ctx)
 
@@ -6158,23 +6188,31 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 	// the reviewer. Stamp the provenance markers so the additive verdict is
 	// labelable and idempotent. Deliberately no emitReviewStarted (see the
 	// function doc): the first review's started entry remains the anchor floor.
+	//
+	// Cleanup ownership (#4160, C6 — the runImplementReviews contract): the
+	// DETACHED goroutine owns treeCleanup, deferred INSIDE it. A defer in this
+	// dispatch scope would remove the export as soon as this function returns
+	// (immediately, on the advisory path) while the detached reviewers still
+	// hold it as their working directory.
 	if authority != planreview.AuthorityGating {
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
+			defer treeCleanup()
 			// roundSeq 0 (#3593): the supplemental pass emits no
 			// implement_review_started row, so it records no round key and marks
 			// nothing; the relay's legacy fallback applies to its verdicts.
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "", 0)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, treeDir, 0)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage category-B
-	// before responding. Same no-started-emission discipline. The supplemental
-	// reinvoke pass renders no diff and needs no tree — always ungrounded (#2486).
+	// before responding. Same no-started-emission discipline. Cleanup is owned
+	// by THIS scope because the loop runs to completion before this returns.
 	// roundSeq 0 (#3593): no started row, so no round key is recorded.
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "", 0)
+	defer treeCleanup()
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, treeDir, 0)
 }
 
 // supplementalReinvokeReviewAlreadyRecorded reports whether a base-rebase

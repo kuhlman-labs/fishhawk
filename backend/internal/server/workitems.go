@@ -550,6 +550,12 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 		Item:   item,
 		Number: number,
 		Target: target,
+		// The caller's write-ahead hook rides through verbatim (#4153): the
+		// provider fires it right after its create and before board/link, so
+		// the refinement executor records the issue before the interruptible
+		// enrichment runs. prepareWorkItem works on its own copy of filing and
+		// never touches the hook; every other entry point leaves it nil.
+		OnCreated: filing.OnCreated,
 	})
 	if err != nil {
 		return nil, nil, &workItemError{

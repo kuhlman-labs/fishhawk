@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"log/slog"
-	"sort"
 
 	"github.com/google/uuid"
 
@@ -33,9 +32,10 @@ import (
 // Children are discriminated by DecomposedFrom (via listAllDecomposedChildren),
 // NOT ParentRunID: run.ChildParamsFrom sets parent_run_id for every child kind
 // including recovery children, so ParentRunID would wrongly sweep in a recovery
-// child. Children are sorted deterministically (SliceIndex nil-last ascending,
-// then CreatedAt ascending, then ID string) so the rendered prompt is stable
-// across repeated builds. Paths are deduped first-wins so two slices amending
+// child. Children are sorted deterministically by sortDecomposedChildren
+// (SliceIndex nil-last ascending, then CreatedAt ascending, then ID string) —
+// the same order the run-concerns listing uses — so the rendered prompt is
+// stable across repeated builds. Paths are deduped first-wins so two slices amending
 // the same path render once.
 func (s *Server) childApprovedAmendmentScopePaths(ctx context.Context, parentRunID uuid.UUID) []prompt.ChildAmendedScopePath {
 	if s.cfg.RunRepo == nil || s.cfg.ScopeAmendmentRepo == nil {
@@ -58,24 +58,7 @@ func (s *Server) childApprovedAmendmentScopePaths(ctx context.Context, parentRun
 		return nil
 	}
 
-	sort.SliceStable(children, func(i, j int) bool {
-		a, b := children[i], children[j]
-		ai, bi := a.SliceIndex, b.SliceIndex
-		switch {
-		case ai != nil && bi != nil:
-			if *ai != *bi {
-				return *ai < *bi
-			}
-		case ai != nil && bi == nil:
-			return true // known slice index sorts before an unknown one
-		case ai == nil && bi != nil:
-			return false
-		}
-		if !a.CreatedAt.Equal(b.CreatedAt) {
-			return a.CreatedAt.Before(b.CreatedAt)
-		}
-		return a.ID.String() < b.ID.String()
-	})
+	sortDecomposedChildren(children)
 
 	var out []prompt.ChildAmendedScopePath
 	seen := make(map[string]struct{})

@@ -1713,7 +1713,10 @@ components:
         session_id: { type: string, format: uuid }
         state:
           type: string
-          enum: [awaiting_approval, approved, rejected]
+          enum: [awaiting_approval, approved, rejected, filed]
+          description: >-
+            The derived approval state; `filed` once the latest revision's
+            filing session has completed (#4153).
         drifted:
           type: boolean
           description: >-
@@ -1740,6 +1743,91 @@ components:
         decisions:
           type: array
           items: { $ref: '#/components/schemas/RefinementDecision' }
+        filing:
+          allOf: [{ $ref: '#/components/schemas/RefinementFilingProgress' }]
+          description: >-
+            The latest revision's filing progress (#4153) — where the detached
+            file arm is observed. Absent when the revision has no filing session
+            and no filing is in flight.
+
+    RefinementFilingResult:
+      type: object
+      required: [status, session_id, draft_id, repo, child_count, already_in_progress, children, resumed, already_completed, verified]
+      description: The POST /file response (#4153).
+      properties:
+        status: { type: string, enum: [filing_in_progress, already_in_progress, filed] }
+        session_id: { type: string, format: uuid }
+        draft_id: { type: string, format: uuid }
+        repo: { type: string }
+        child_count: { type: integer, description: "Number of children in the draft." }
+        budget_seconds: { type: integer, description: "The detached filing's budget; present on a 202." }
+        already_in_progress: { type: boolean, description: "True when a filing for the draft was already in flight in this process; nothing new was launched." }
+        epic:
+          type: object
+          description: The epic filed so far (or, on a replay, the filed epic); absent when unrecorded.
+          properties:
+            number: { type: integer }
+            url: { type: string }
+        children:
+          type: array
+          description: The children filed so far (on a replay, every child), ordinal ASC.
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer, description: "1-based draft child ordinal." }
+              number: { type: integer }
+              url: { type: string }
+        resumed: { type: boolean, description: "True when items were already recorded for the draft." }
+        already_completed: { type: boolean, description: "True when replaying a fully-completed session (no writes performed)." }
+        verified:
+          type: boolean
+          description: >-
+            Always false on this response: the epic-children + campaign-assembly
+            round-trip runs inside the detached filing (its result is recorded
+            in the `refinement_filing_completed` audit entry), and a replay does
+            not re-verify.
+
+    RefinementFilingProgress:
+      type: object
+      required: [state, in_flight, child_count, filed_count, children]
+      description: >-
+        Filing progress for one approved draft revision (#4153). `in_progress`:
+        a detached filing is running in this process. `failed`: the last
+        detached filing in this process stopped (`last_error`,
+        `failed_ordinal`, `step`); re-invoking the file arm resumes it.
+        `incomplete`: a filing session is open but nothing is in flight here and
+        no failure is recorded (a restart, another replica); re-invoke to
+        resume. `filed`: the filing session completed. The in-flight/failed
+        status is in-process; the items and completion are durable.
+      properties:
+        state: { type: string, enum: [in_progress, failed, incomplete, filed] }
+        repo: { type: string, description: "The target repository the filing session pins (or the in-flight filing targets)." }
+        in_flight: { type: boolean }
+        child_count: { type: integer, description: "Number of children in the draft." }
+        filed_count: { type: integer, description: "Items recorded so far, the epic included." }
+        epic:
+          type: object
+          description: The filed epic; absent until it is recorded.
+          properties:
+            number: { type: integer }
+            url: { type: string }
+        children:
+          type: array
+          description: The children recorded so far, ordinal ASC.
+          items:
+            type: object
+            properties:
+              ordinal: { type: integer, description: "1-based draft child ordinal." }
+              number: { type: integer }
+              url: { type: string }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        last_error: { type: string, description: "Present when state is failed." }
+        failed_ordinal: { type: integer, description: "The ordinal the failed filing stopped at (0 is the epic), when the failure names one." }
+        step:
+          type: string
+          enum: [create, reconcile, link, verify, audit, complete]
+          description: "The step the failed filing stopped at: an item create, the resume reconcile, the link pass, or the finalize verify / completion-audit / close."
 
     Pagination:
       type: object
@@ -1920,7 +2008,12 @@ components:
             endpoint; a consumer MUST fail OPEN on it. The block PRESENT with
             an EMPTY `product_feedback_providers` means POSITIVELY no feedback
             provider is registered. PRESENT and non-empty means one is.
-          required: [product_feedback_providers]
+
+            `slice_integration` (#4165) is the block's second member: the
+            decomposed-parent acceptance gate's own slice-integration
+            authority predicate. A present block WITHOUT the key is an older
+            backend, equally UNDECIDABLE.
+          required: [product_feedback_providers, slice_integration]
           properties:
             product_feedback_providers:
               type: array
@@ -1934,6 +2027,37 @@ components:
                 block. An empty list means `fishhawk_report_product_issue`
                 would refuse with 501 `provider_unimplemented`.
               example: [github_projects]
+            slice_integration:
+              type: object
+              description: |
+                Whether this deployment can integrate a decomposed parent's
+                slices for THIS run (#4165): `orchestrator.SliceIntegrationUnavailable`
+                evaluated on the run row the read loaded — the EXACT predicate
+                the decomposed-parent acceptance gate (the host-dispatch marker
+                and `POST /v0/stages/{stage_id}/acceptance-admission`) stands
+                down on. `available: false` means no `slices_integrated` record
+                will ever be written for the run (no GitHub client wired, or the
+                run has no installation id), so the gate admits acceptance
+                without a coverage check; `available: true` means the gate
+                refuses `409 acceptance_integration_incomplete` until a
+                `slices_integrated` record covers every child. The MCP read
+                side keys "no integration authority" on this value instead of
+                inferring it. Computed for every run, meaningful only for a
+                decomposed parent.
+              required: [available]
+              properties:
+                available:
+                  type: boolean
+                  description: |
+                    True when the server has slice-integration authority for
+                    the run. Never omitted, so `false` reaches the wire.
+                reason:
+                  type: string
+                  description: |
+                    Why the server has no slice-integration authority. Present
+                    ONLY when `available` is false.
+                  example: GitHub not configured
+              example: { available: false, reason: GitHub not configured }
         workflow_id:
           type: string
           example: feature_change
@@ -6189,6 +6313,75 @@ components:
         created_at:
           type: string
           format: date-time
+
+    RunConcernList:
+      type: object
+      description: GET /v0/runs/{run_id}/concerns body (#4101).
+      required: [run_id, state, include_children, count, items]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        state:
+          type: string
+          enum: [open, all]
+          description: The state filter applied (`open` when the query omitted it).
+        include_children: { type: boolean }
+        count:
+          type: integer
+          description: Number of `items`.
+        items:
+          type: array
+          description: Parent rows first, then each decomposition child's rows in `children[]` order. Never null; empty is `[]`.
+          items: { $ref: '#/components/schemas/RunConcernListItem' }
+        children:
+          type: array
+          description: Present only when `include_children=true`; `[]` on a run with no decomposition children.
+          items: { $ref: '#/components/schemas/RunConcernListChild' }
+    RunConcernListItem:
+      type: object
+      required: [id, run_id, stage_id, stage_kind, severity, category, state, origin_review_sequence, has_suggested_patch]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id:
+          $ref: '#/components/schemas/UUID'
+          description: The run that OWNS the concern (the child's id for a child's row).
+        child_run_id:
+          $ref: '#/components/schemas/UUID'
+          description: Set only on a decomposition child's row.
+        slice_index:
+          type: integer
+          description: The child's 0-based slice index; set only on a decomposition child's row whose slice index is known.
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_kind: { type: string, enum: [plan, implement] }
+        severity: { type: string }
+        category: { type: string }
+        state:
+          type: string
+          description: The concern lifecycle state (`raised`, `addressed_pending`, `reopened`, `addressed`, `waived`, `superseded`, `deferred`, `addressed_by_condition`).
+        reviewer_model: { type: string }
+        reviewer_role: { type: string }
+        short_summary:
+          type: string
+          maxLength: 100
+          description: A one-line label derived from the note (whitespace collapsed, at most 100 bytes); omitted when the note is blank.
+        origin_review_sequence:
+          type: integer
+          format: int64
+        has_suggested_patch: { type: boolean }
+        provenance:
+          type: string
+          description: '`server_check` for a server-synthesized concern; omitted for a reviewer-raised one.'
+    RunConcernListChild:
+      type: object
+      required: [run_id, state, item_count]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        slice_index: { type: integer }
+        state:
+          type: string
+          description: The child run's state.
+        item_count:
+          type: integer
+          description: Number of `items` this child contributed under the state filter.
 
     RestartBlockerList:
       type: object
@@ -12764,17 +12957,38 @@ paths:
         re-parks and republishes at the current head — which is what makes
         re-invoking this endpoint a REAL retry after a failed check re-post.
 
-        **Degraded head read.** If the merge succeeds but the post-merge head
-        cannot be read back, the response is 200 with `new_head_sha` empty and
-        publication SKIPPED — deliberately NOT falling back to the pre-merge
-        head, which would pin the required check to exactly the stale sha this
-        endpoint exists to move off. The warning names re-invocation.
+        **The post-merge head (#4199).** The forge's PR head lags the
+        branch-ref update (read-after-write lag), so after a performed merge
+        the endpoint re-reads the PR head boundedly (an initial read plus up
+        to 5 re-reads, ~10s of backoff) and CLASSIFIES what it saw as
+        `post_merge_head_read`: `converged` (the head is the merge commit),
+        `read_after_write_lag` (every successful read returned the pre-merge
+        head), `concurrent_push` (a head that is neither the pre-merge head
+        nor the merge commit), `unreadable` (no read succeeded) or
+        `read_back` (the merge sha did not decode and a read returned a head
+        that differs from the pre-merge head). The new head is resolved by
+        PROVENANCE: when the merges API decoded the merge commit sha, that
+        sha IS the new head for `converged`, `read_after_write_lag` and
+        `unreadable` — so the check re-post, the `branch_rebased` entry and
+        the merge-candidate verify trigger all anchor on the merge commit and
+        read-after-write lag is never reported as a concurrent push. Only a
+        genuine `concurrent_push` keeps the observed head.
+
+        **Degraded head read — only when the merge sha did not decode.** On
+        the benign undecodable-201 shape the re-read supplies the head, and
+        it is accepted only when it differs from the pre-merge head. If the
+        re-read failed or stayed at the pre-merge head, the response is 200
+        with `new_head_sha` empty and publication SKIPPED — deliberately NOT
+        falling back to the pre-merge head, which would pin the required check
+        to exactly the stale sha this endpoint exists to move off. The warning
+        names re-invocation.
 
         **Merge-candidate verify pass (ADR-090 / E83.33 / #4018).** A base
         merge produces a head no runner gated on the committed tree, so when
         the workflow declares an `executor.verify` command a performed merge's
-        200 also authorizes a runner VERIFY-ONLY pass for the re-read new head
-        (cause `base_advance`): a `stage_merge_candidate_verify_triggered`
+        200 also authorizes a runner VERIFY-ONLY pass for the resolved new head
+        (the decoded merge commit, per the provenance rule above; cause
+        `base_advance`): a `stage_merge_candidate_verify_triggered`
         entry is recorded under the operator's identity and the implement
         stage re-opens. The pass has its OWN per-head idempotency and never
         reads or spends the fix-up budget. The already-up-to-date arm
@@ -12837,13 +13051,39 @@ paths:
                   branch: { type: string }
                   base_ref: { type: string, description: 'The declared base ref that was merged in.' }
                   prior_head_sha: { type: string, description: 'The run branch tip before the advance.' }
-                  new_head_sha: { type: string, description: 'The AUTHORITATIVE post-advance head, from a live PR re-read. Empty when the re-read failed, in which case the check re-post was deliberately skipped.' }
-                  merge_commit_sha: { type: string, description: 'The merge commit the merges API returned. May legitimately be EMPTY on an undecodable 201 body — the merge still happened; use new_head_sha as the authority.' }
+                  new_head_sha: { type: string, description: 'The post-advance head, resolved by PROVENANCE (#4199). When merge_commit_sha decoded it is the authority: new_head_sha equals it unless the bounded post-merge re-read observed a genuine concurrent push (post_merge_head_read concurrent_push), in which case it is the observed head. Only when the merge sha did not decode does the re-read supply the head, accepted only when it differs from prior_head_sha; it is EMPTY when that re-read failed or stayed at the pre-merge head, in which case the check re-post was deliberately skipped.' }
+                  merge_commit_sha: { type: string, description: 'The merge commit the merges API returned — the authority for new_head_sha when it decoded. May legitimately be EMPTY on an undecodable 201 body — the merge still happened; new_head_sha then comes from the bounded post-merge re-read.' }
                   already_up_to_date: { type: boolean, description: 'The branch already contained the base, so no merge was attempted. Still re-parks and republishes.' }
                   reparked_review_stage_id: { type: string, description: 'The re-parked review stage id; omitted on the commit-yourself shape.' }
                   mechanism_note: { type: string, description: 'Constant sentence stating the merge-commit mechanism, shipped on every 200.' }
                   audit_check_republished: { type: boolean, description: 'Whether the fishhawk_audit_complete Check Run re-posted at the new head.' }
-                  audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land; names the reason and the idempotent re-invocation retry.' }
+                  audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land (including when the head could not be resolved, which happens only when the merge sha did not decode); names the reason and the idempotent re-invocation retry.' }
+                  post_merge_head_read:
+                    type: string
+                    enum: [converged, read_after_write_lag, concurrent_push, unreadable, read_back]
+                    description: |
+                      Classification of the bounded post-merge PR head re-read
+                      (#4199), present only when THIS call performed a merge.
+                      `converged`: a read returned the merge commit.
+                      `read_after_write_lag`: every successful read returned
+                      the pre-merge head — the forge lagging the branch-ref
+                      update, NOT a concurrent push. `concurrent_push`: a head
+                      that is neither the pre-merge head nor the merge commit.
+                      `unreadable`: no read succeeded. `read_back`: the merge
+                      sha did not decode and a read returned a head that
+                      differs from the pre-merge head.
+                  post_merge_head_read_note:
+                    type: string
+                    description: |
+                      Present for the degraded classifications
+                      (`read_after_write_lag`, `unreadable`). For
+                      `read_after_write_lag` with a decoded merge sha it names
+                      the pre-merge head, the merge commit and the read count,
+                      and states that this is NOT a concurrent push and that no
+                      fishhawk_vouch_commit is needed — the merge commit is
+                      attributed and anchors both the check and the verify
+                      pass. For `unreadable` it names the last read error and
+                      that post-merge divergence could not be checked.
                   lineage_attribution_warning:
                     type: string
                     description: |
@@ -12851,13 +13091,18 @@ paths:
                       reported-head attribution is INCOMPLETE, so this 200 must
                       NOT be read as a clean recovery — the run stays wedged on
                       the lineage check until the operator acts. Three cases:
-                      (a) a CONCURRENT PUSH made new_head_sha diverge from the
-                      merge commit this call created, so the divergent head was
-                      deliberately NOT attributed (attributing a commit this
-                      invocation did not create would launder a foreign commit
-                      into the ledger); (b) the attribution append failed to
-                      persist; (c) nothing was attributable at all (an
-                      undecodable merge sha AND a failed post-merge re-read).
+                      (a) a CONCURRENT PUSH: after the bounded post-merge
+                      re-read the head is neither the pre-merge head nor the
+                      merge commit this call created
+                      (`post_merge_head_read` `concurrent_push`), so the
+                      divergent head was deliberately NOT attributed
+                      (attributing a commit this invocation did not create
+                      would launder a foreign commit into the ledger); a read
+                      stuck at the pre-merge head is read-after-write lag and
+                      does not warn; (b) the attribution append failed to
+                      persist; (c) nothing was attributable at all (only when
+                      the merge sha did not decode AND the post-merge re-read
+                      failed or stayed at the pre-merge head).
                       In cases (b) and (c) re-invoking this endpoint does NOT
                       repair the attribution — the retry takes the
                       already-contains-base arm, which attributes nothing — so
@@ -12878,8 +13123,10 @@ paths:
                       True when THIS call appended a
                       `stage_merge_candidate_verify_triggered` entry and
                       re-opened the implement stage for a runner verify-only
-                      pass. A performed base merge triggers one for the re-read
-                      new head; the already-up-to-date arm re-triggers only for
+                      pass. A performed base merge triggers one for the
+                      resolved new head (the decoded merge commit unless a
+                      genuine concurrent push was observed, #4199); the
+                      already-up-to-date arm re-triggers only for
                       an `unverified` Fishhawk-written head.
                   merge_candidate_verify_stage_id:
                     type: string
@@ -19168,10 +19415,13 @@ paths:
       summary: Get a refinement session's preview + approval state
       description: |
         Returns the session view: the derived approval `state`
-        (`awaiting_approval` / `approved` / `rejected`), `drifted` when the
+        (`awaiting_approval` / `approved` / `rejected`, or `filed` once the
+        latest revision's filing session has completed), `drifted` when the
         latest revision's decision pins a content hash that no longer matches
         (fail-closed), the revision count, the latest `EpicDraft`, the full
-        filing preview, the wave DAG, and the decision history.
+        filing preview, the wave DAG, the decision history, and — once a filing
+        has started — the `filing` progress block (#4153), where the detached
+        file arm's progress and any mid-sequence failure are observed.
 
         Session state is DERIVED, never stored: a decision counts only when it
         targets the latest revision and its pinned hash still matches — so an
@@ -19380,28 +19630,46 @@ paths:
         un-drifted (`409 refinement_draft_drifted` — its content no longer
         matches the approval hash).
 
-        **Idempotent.** A per-draft filing session pins the target `repo` at
-        first invoke (a re-invoke naming a different repo is
-        `409 refinement_filing_repo_mismatch`) and one durable row per filed item
-        is recorded IMMEDIATELY after each provider create. A mid-sequence
-        provider failure is `502 refinement_filing_failed` with the filed-so-far
-        items and the failing ordinal in `details`; re-invoking resumes at the
-        first unfiled ordinal and never re-files a recorded one. A fully
+        **Detached (#4153).** The handler checks synchronously — scope,
+        session, body, approval/drift, `repo` form, conventions, installation
+        resolution, then the filing ledger: a filing session pinning a
+        different repo is `409 refinement_filing_repo_mismatch`, and a fully
         completed session replays the recorded result as `200` with
-        `already_completed=true` and files/audits nothing.
+        `status: filed` / `already_completed=true` and makes no forge calls.
+        Otherwise it launches the filing on a server-lifetime goroutine under a
+        child-count-scaled budget (`budget_seconds`: max(5 min, (children+1) ×
+        45 s)) and returns `202` with `status: filing_in_progress` at once. A
+        second call while that filing is in flight in this process returns
+        `202` with `status: already_in_progress` / `already_in_progress=true`
+        and launches nothing (a call naming a different repo is `409
+        refinement_filing_repo_mismatch`). Progress — and a mid-sequence
+        failure, formerly a `502` body — is observed on `GET
+        /v0/refinement/sessions/{session_id}`'s `filing` block; re-invoking
+        after a `failed` or `incomplete` filing launches a resume.
 
-        Concurrent invocations for the same draft are serialized by a per-draft
-        advisory lock, so two callers cannot both file — the second observes the
-        first's recorded progress. The residual at-least-once seam (a crash
-        between the external create and the durable record) can re-file exactly
-        one item on resume; GitHub's issue-create API offers no idempotency key
-        to close it, and the unique `(draft_id, ordinal)` constraint prevents
+        **Idempotent.** A per-draft filing session pins the target `repo` at
+        first invoke and one durable row per filed item is recorded
+        write-ahead, the moment the provider reports the create and before
+        its board placement / sub-issue linking, so a filing cut off
+        mid-item does not re-create that item on resume. Every filed body
+        carries a hidden per-item idempotency key; a resume adopts an
+        unrecorded child already linked under the epic by that key, and links
+        every recorded child missing from the epic. Re-invoking resumes at the
+        first unfiled ordinal and never re-files a recorded one.
+
+        Concurrent filings for the same draft are also serialized by a
+        per-draft advisory lock (the cross-process guard), so two replicas
+        cannot both file. The residual at-least-once seam is a create whose
+        response was lost (the forge created the issue, the client saw an
+        error): it can re-file the epic, or a child that also never got
+        linked, on resume; the unique `(draft_id, ordinal)` constraint prevents
         double-recording.
 
         The `refinement_filing_completed` audit entry is written on the global
         chain BEFORE the filing session's `completed_at` is set
-        (durable-before-state-change): an audit-append failure is a `500` with
-        the session left open so a re-invoke retries the close.
+        (durable-before-state-change): an audit-append failure leaves the
+        session open (`filing.state: failed`, `step: audit`) so a re-invoke
+        retries the close.
 
         Requires `write:approvals` scope (no new scope — the E34.2 precedent).
       tags: [refinement]
@@ -19422,38 +19690,26 @@ paths:
                 repo: { type: string, description: "Target repository in `owner/name` form." }
       responses:
         '200':
-          description: The filing result (fresh, resumed, or an already-completed replay).
+          description: An already-completed session's replay (`status` filed, `already_completed` true; no forge calls).
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  session_id: { type: string, format: uuid }
-                  draft_id: { type: string, format: uuid }
-                  repo: { type: string }
-                  epic:
-                    type: object
-                    properties:
-                      number: { type: integer }
-                      url: { type: string }
-                  children:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        ordinal: { type: integer, description: "1-based draft child ordinal." }
-                        number: { type: integer }
-                        url: { type: string }
-                  resumed: { type: boolean, description: "True when this invocation resumed a partially-filed session." }
-                  already_completed: { type: boolean, description: "True when replaying a fully-completed session (no writes performed)." }
-                  verified: { type: boolean, description: "True when the filed epic passed the epic-children + campaign-assembly round-trip. False when the provider lacks the read-back capability (fail-open) or on a replay." }
+              schema: { $ref: '#/components/schemas/RefinementFilingResult' }
+        '202':
+          description: >-
+            The filing was launched (`status` filing_in_progress) or is already
+            in flight in this process (`status` already_in_progress,
+            `already_in_progress` true). Observe progress on the session view's
+            `filing` block.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefinementFilingResult' }
         '400': { description: "`validation_failed` — malformed JSON, unknown fields, non-UUID `session_id`, or `repo` not in `owner/name` form." }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
         '404': { description: "`refinement_session_not_found`." }
-        '409': { description: "`refinement_not_approved` / `refinement_draft_drifted` / `refinement_filing_repo_mismatch`." }
-        '500': { description: "`internal_error` — e.g. `audit_append_failed`: the completion audit could not be recorded; items are durable but the session stays open for a retry." }
-        '502': { description: "`refinement_filing_failed` (a provider create failed mid-sequence; resumable) or `refinement_filing_verification_failed` (the filed epic did not round-trip; items are durable, re-invoke re-verifies)." }
+        '409': { description: "`refinement_not_approved` / `refinement_draft_drifted` / `refinement_filing_repo_mismatch` (the filing session, or the filing in flight, targets a different repo)." }
+        '500': { description: "`internal_error` — the filing ledger could not be read." }
+        '502': { description: "`refinement_filing_failed` — the GitHub App installation for the target repo could not be resolved. A mid-sequence filing failure is no longer a 502: it is reported on the session view's `filing` block." }
         '503': { description: "`refinement_repo_unconfigured`." }
 
   /v0/calibration:
@@ -20313,7 +20569,13 @@ paths:
             `held_commit_resume_kind: push`. A request WITHOUT it is served no
             held-commit fields for a push-kind checkpoint (never a downgraded
             `pr_open`), and the decline appends a `verified_tree_discarded`
-            audit row.
+            audit row. `merge-candidate-verify` (#4183) — this runner
+            implements the ADR-090 merge-candidate verify-only pass (the
+            `merge_candidate_verify_*` fields). A request WITHOUT it for an
+            implement stage carrying a LIVE merge-candidate trigger is REFUSED
+            `409 runner_capability_missing`: no prompt is built and the pass is
+            settled `not_executed`, so an older runner exits before spawning an
+            agent instead of running a plain implement pass.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -20848,6 +21110,7 @@ paths:
                       `error.code` is one of:
                       - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
                       - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
+                      - `runner_capability_missing` — the implement stage carries a live ADR-090 merge-candidate verify trigger and the request's `X-Fishhawk-Runner-Capabilities` does not carry `merge-candidate-verify` (#4183). Checked right after the signature, before the liveness flip and any prompt construction: no prompt is built, the pass is settled as `merge_candidate_verified{result: not_executed}` (FailStage C, then restore to the pre-pass gate), and the head stays re-triggerable. `error.details` carries `run_id`, `stage_id`, `required_capability`, `expected_head_sha` and `settled` (false when the settlement did not complete; if the row could not be appended, nothing was transitioned and the trigger stays live). Remedy: rebuild the runner, then re-trigger the pass with `fishhawk_rebase_run_branch`.
         '422':
           description: |
             Comms scan charter refused (E81.5 / #4014). A `plan` stage whose
@@ -23765,6 +24028,81 @@ paths:
           description: |
             Concern or audit store not configured on this deployment.
             Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/concerns:
+    get:
+      operationId: listRunConcerns
+      summary: List a run's review concerns, optionally with its decomposition children's
+      description: |
+        Lists a run's review concerns (#4101) and, with
+        `include_children=true`, those of its decomposition children, so an
+        operator collecting concern ids across a fan-out for
+        `bulkWaiveConcerns` / the defer verb needs ONE call instead of a
+        gate-view read per child. Each item carries the bounded
+        `short_summary` label, never the full reviewer note (that stays on
+        `getRunGateView`). Read-only: no audit row, no state change.
+
+        Children are the runs whose `decomposed_from` is this run — NEVER
+        `parent_run_id`, which also links recovery children, so a recovery
+        child's concerns are never listed. Ordering: the parent's rows in
+        store order (oldest review first), then each child's rows, children
+        ordered by `slice_index` ascending (a missing index last), then
+        creation time, then id.
+
+        Every store read fails CLOSED with `500`, including a SINGLE child's
+        concern read (the message names that child): a partial list would
+        read as "no open concerns on that child", the wrong signal for an
+        operator collecting ids.
+
+        Auth mirrors `getRunGateView`: an ordinary caller must hold the
+        `read:audit` scope (cookie sessions pass), while a run-bound
+        `mcp:run:<uuid>` token may list only its OWN run and may NOT use
+        `include_children` — children are other runs.
+      tags: [stages]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: state
+          in: query
+          schema: { type: string, enum: [open, all], default: open }
+          description: |
+            `open` (default) lists only open concerns (`raised`,
+            `addressed_pending`, `reopened`) — the ones a waive or defer can
+            act on. `all` lists every row, including settled ones.
+        - name: include_children
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            When true, also list the concerns of every decomposition child
+            and return a `children[]` summary (an empty array on a run with
+            no decomposition children). Refused for a run-bound token.
+      responses:
+        '200':
+          description: The concern listing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunConcernList' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID, `state` not `open`/`all`, or `include_children` not a boolean (`details.field` names which).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` — a token missing the `read:audit` scope; or `cross_run_concerns` — a run-bound `mcp:run:<uuid>` token listing a run other than its own, or passing `include_children=true`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: '`internal_error` — a run, concern or decomposition-children read failed. Fail-closed: no partial listing is ever returned.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`concern_store_unconfigured` — the concern or run repository is not configured.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
