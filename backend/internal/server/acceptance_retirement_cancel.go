@@ -31,7 +31,11 @@ const acceptanceRetirementCancelUnreadableEvent = "acceptance_retirements_cancel
 // reachable AFTER plan approval is hooked; applies_to.go's
 // abandonUnauditedOverrideRun is NOT (it fires at run creation, before any
 // approval can carry a retirement, and its audit store is the thing that just
-// failed).
+// failed). Each hooked sink ALSO cascades the cancel to the run's non-terminal
+// decomposition children (cascadeCancelToDecomposedChildren, #4186), stamping
+// the same cancel_source on each child's decomposition_child_cancelled row;
+// abandonUnauditedOverrideRun stays unwired there too, because a run cancelled
+// in the request that created it cannot have decomposition children yet.
 const (
 	// cancelSourceOperator is POST /v0/runs/{id}/cancel (the REST verb behind
 	// fishhawk_cancel_run).
@@ -51,9 +55,11 @@ const (
 // OnRunCancelled satisfies orchestrator.RunCancelledObserver: server.New
 // wires the Server as the orchestrator's back-reference (exactly like
 // ConsolidatedReview) so completeRun's cancelled resolution reaches the same
-// helper the REST and budget sinks call.
+// helper the REST and budget sinks call, and the same decomposition-child
+// cascade (#4186).
 func (s *Server) OnRunCancelled(ctx context.Context, runID uuid.UUID, source string) {
 	s.recordAcceptanceRetirementsDroppedOnCancel(ctx, runID, source)
+	s.cascadeCancelToDecomposedChildren(ctx, runID, source)
 }
 
 // recordAcceptanceRetirementsDroppedOnCancel is the ONE server-side helper

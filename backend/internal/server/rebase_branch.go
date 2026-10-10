@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,12 +51,17 @@ type rebaseBranchRequest struct {
 
 // rebaseBranchResponse summarizes a successful base advance.
 //
-// Both PriorHeadSHA and NewHeadSHA are reported, and NewHeadSHA is the
-// AUTHORITATIVE head: it comes from a live PR re-read after the merge, not
-// from MergeBranch's return. MergeCommitSHA is MergeBranch's own return and
-// may legitimately be EMPTY (the deliberately benign undecodable-201 shape
-// pinned by githubclient's TestMergeBranch_MergedMissingSHAIsBenign), which
-// is why nothing in this handler treats it as a signal.
+// Both PriorHeadSHA and NewHeadSHA are reported. NewHeadSHA is resolved by
+// PROVENANCE (#4199): when MergeBranch decoded the merge commit sha
+// (MergeCommitSHA), that sha IS the new head unless the bounded post-merge
+// PR re-read observed a genuine concurrent push (a head that is neither the
+// pre-merge head nor the merge commit), in which case the observed head is
+// reported. MergeCommitSHA may legitimately be EMPTY (the deliberately benign
+// undecodable-201 shape pinned by githubclient's
+// TestMergeBranch_MergedMissingSHAIsBenign); only then does the re-read
+// supply the head, and only when it differs from PriorHeadSHA — a read stuck
+// at the pre-merge head leaves NewHeadSHA empty. An empty MergeCommitSHA is
+// never read as "already up to date": the behind-probe decides that.
 type rebaseBranchResponse struct {
 	RunID          string `json:"run_id"`
 	PRNumber       int    `json:"pr_number"`
@@ -78,7 +84,8 @@ type rebaseBranchResponse struct {
 	// AuditCheckRepublished reports whether the fishhawk_audit_complete Check
 	// Run was successfully re-posted at the new head. FALSE when the re-post
 	// did not land — it errored, no publisher is wired, or the new head could
-	// not be resolved at all (see AuditCheckRepublishWarning).
+	// not be resolved at all, which happens only when the merge sha did not
+	// decode (see AuditCheckRepublishWarning).
 	AuditCheckRepublished bool `json:"audit_check_republished"`
 	// AuditCheckRepublishWarning, when non-empty, names why the re-post did
 	// not land and names re-invoking this verb as the idempotent retry.
@@ -89,19 +96,29 @@ type rebaseBranchResponse struct {
 	// each of which leaves the run wedged on the lineage check until the
 	// operator acts:
 	//
-	//   - a CONCURRENT PUSH: the post-merge head diverged from the merge
-	//     commit this invocation created, so the divergent head was
-	//     deliberately NOT attributed (attributing it would launder a foreign
-	//     commit into the ledger);
+	//   - a CONCURRENT PUSH: after the bounded post-merge re-read the head is
+	//     neither the pre-merge head nor the merge commit this invocation
+	//     created, so the divergent head was deliberately NOT attributed
+	//     (attributing it would launder a foreign commit into the ledger). A
+	//     re-read stuck at the pre-merge head is read-after-write lag, not a
+	//     concurrent push (#4199), and warns nothing;
 	//   - the attribution APPEND FAILED to persist;
 	//   - NOTHING was attributable at all (an undecodable merge sha AND a
-	//     failed post-merge re-read).
+	//     post-merge re-read that failed or stayed at the pre-merge head).
 	//
 	// In the last two cases re-invoking this verb does NOT repair the
 	// attribution — the retry takes the already-contains-base arm, which
 	// deliberately attributes nothing — so the warning names
 	// fishhawk_vouch_commit as the required step instead.
 	LineageAttributionWarning string `json:"lineage_attribution_warning,omitempty"`
+	// PostMergeHeadRead classifies the bounded post-merge PR head re-read
+	// (#4199): converged, read_after_write_lag, concurrent_push, unreadable or
+	// read_back. Set only when THIS call performed a merge.
+	PostMergeHeadRead string `json:"post_merge_head_read,omitempty"`
+	// PostMergeHeadReadNote explains a degraded classification
+	// (read_after_write_lag, unreadable): what was observed and what the head
+	// was anchored on.
+	PostMergeHeadReadNote string `json:"post_merge_head_read_note,omitempty"`
 
 	// --- 202 conflict-resolution trigger arm (E64.62 / #3202) ---
 	//
@@ -155,8 +172,10 @@ type rebaseBranchResponse struct {
 const mergeCandidateVerifyTriggeredNote = "A verify-only merge-candidate pass (ADR-090) is authorized for this head: the implement stage is re-opened and the runner fetches the run-branch tip, runs ONLY the declared verify command in full form in the isolated gate, and reports the result. The pass writes NOTHING — no commit, no push. On a local runner, dispatch the stage with fishhawk_dispatch_stage and await it with fishhawk_await_stage; fishhawk_merge_run refuses this head until the pass reports passed."
 
 // mergeCandidateUnreadableHeadNote is shipped when a performed merge's new
-// head could not be read back, so no pass could be anchored.
-const mergeCandidateUnreadableHeadNote = "the base merge SUCCEEDED but its resulting head could not be read back, so no merge-candidate verify pass was anchored; re-invoke fishhawk_rebase_run_branch — the retry takes the already-up-to-date arm and triggers the pass for the live head"
+// head could not be resolved — only when the merge sha did not decode and the
+// post-merge re-read failed or stayed at the pre-merge head — so no pass could
+// be anchored.
+const mergeCandidateUnreadableHeadNote = "the base merge SUCCEEDED but its resulting head could not be resolved (the merge sha did not decode and the post-merge re-read returned no new head), so no merge-candidate verify pass was anchored; re-invoke fishhawk_rebase_run_branch — the retry takes the already-up-to-date arm and triggers the pass for the live head"
 
 // rebaseMergeCandidateFields is the merge-candidate block of a 200.
 type rebaseMergeCandidateFields struct {
@@ -224,9 +243,17 @@ type rebaseMergeCandidateFields struct {
 //     publish; the operator re-invokes; the probe short-circuits here and the
 //     required check IS published at the correct post-merge head.
 //
+// THE POST-MERGE HEAD (#4199). The forge's PR head lags the branch-ref
+// update, so a single post-merge read routinely returns the PRE-merge head.
+// The handler therefore re-reads boundedly (readPostMergeHead), classifies
+// what it saw, and resolves the new head by provenance
+// (resolvePostMergeHead): a decoded merge sha anchors the check, the
+// branch_rebased row and the verify pass unless a genuine concurrent push was
+// observed. The classification ships as post_merge_head_read.
+//
 // After the shared tail a 200 also authorizes the ADR-090 merge-candidate
 // verify pass (rebaseMergeCandidateVerify): a performed merge triggers a
-// verify-only pass for the re-read new head, and an already-up-to-date call
+// verify-only pass for the resolved new head, and an already-up-to-date call
 // re-triggers one for an unverified base-advance or conflict-resolution head.
 // The pass re-opens the implement stage but writes nothing to the branch, and
 // a pass that cannot start rides on the 200 as merge_candidate_verify_refusal.
@@ -339,6 +366,9 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	alreadyUpToDate := len(behind) == 0
 	mergePerformed := false
 	republishWarning := ""
+	// postMerge is the classified post-merge head read; nil unless THIS call
+	// performed a merge.
+	var postMerge *postMergeHeadRead
 
 	if !alreadyUpToDate {
 		// LEASE RE-CHECK — the only TOCTOU guard (the merges API has no
@@ -402,28 +432,66 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		mergePerformed = true
 		mergeSHA = sha
 
-		// The AUTHORITATIVE new head comes from a live PR re-read, never from
-		// mergeSHA. This is what makes a decoded-201 and the deliberately
-		// benign undecodable-201 ("", nil) behave IDENTICALLY.
-		postPR, perr := s.cfg.GitHub.GetPullRequest(r.Context(), scope, repo, prNumber)
-		if perr != nil || postPR.HeadSHA == "" {
-			// The merge ALREADY happened, so a refusal here would misreport a
-			// completed write. Return 200 with a warning instead — and
-			// deliberately do NOT fall back to publishing at "no override":
-			// that resolves to the pre-merge audit-recorded head, which is
-			// precisely the staleness this verb exists to remove. Skipping
+		// THE POST-MERGE HEAD (#4199): a bounded, classified re-read, with the
+		// new head resolved by PROVENANCE rather than taken from one read. The
+		// forge's PR head lags the branch-ref update, so trusting a single
+		// read anchored everything on the PRE-merge head and misreported the
+		// lag as a concurrent push.
+		pm := readPostMergeHead(r.Context(), func(ctx context.Context) (string, error) {
+			p, rerr := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
+			if rerr != nil {
+				return "", rerr
+			}
+			return p.HeadSHA, nil
+		}, headSHA, mergeSHA, s.postMergeHeadReadSchedule())
+		postMerge = &pm
+		newHead = resolvePostMergeHead(pm, mergeSHA)
+		if pm.Outcome == postMergeHeadReadReadAfterWriteLag || pm.Outcome == postMergeHeadReadUnreadable {
+			lastErr := ""
+			if pm.LastErr != nil {
+				lastErr = pm.LastErr.Error()
+			}
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"branch rebase: post-merge PR head read did not converge on the merge commit",
+				slog.String("run_id", runID.String()),
+				slog.String("outcome", pm.Outcome),
+				slog.String("prior_head_sha", headSHA),
+				slog.String("merge_commit_sha", mergeSHA),
+				slog.Int("attempts", pm.Attempts),
+				slog.String("last_error", lastErr))
+		}
+		if newHead == "" {
+			// Reachable ONLY when the merge sha did not decode: the merge
+			// ALREADY happened, so a refusal here would misreport a completed
+			// write. Return 200 with a warning instead — and deliberately do
+			// NOT fall back to publishing at "no override" or at a read stuck
+			// on the pre-merge head: both resolve to the pre-merge head, which
+			// is precisely the staleness this verb exists to remove. Skipping
 			// publication and relying on the idempotent retry is strictly
 			// safer than pinning the required check to a stale head.
-			newHead = ""
-			reason := "the post-merge PR re-read returned an empty head"
-			if perr != nil {
-				reason = perr.Error()
-			}
-			republishWarning = "the base merge SUCCEEDED, but the resulting head could not be read back (" + reason +
+			republishWarning = "the base merge SUCCEEDED, but the resulting head could not be read back (" +
+				postMergeHeadUnresolvedReason(pm, headSHA) +
 				"), so the fishhawk_audit_complete check was NOT re-posted — publishing at the pre-merge head would pin the required check to a stale sha. Re-invoke fishhawk_rebase_run_branch to retry the re-post; the branch now contains the base, so the retry short-circuits the merge and publishes at the correct head."
-		} else {
-			newHead = postPR.HeadSHA
 		}
+	}
+
+	// DETACH THE POST-MERGE TAIL. Once THIS call performed the merge, the
+	// commit is on the branch and nothing unwinds it, so the re-park, the
+	// branch_rebased row, the lineage attribution, the republish and the
+	// merge-candidate pass must not depend on the caller still listening. The
+	// MCP client's 30s timeout can cancel the request while the bounded
+	// post-merge re-read runs against a degraded forge, and on a cancelled
+	// context every append below would fail AFTER the installation-authored
+	// merge landed — no branch_rebased row and no attribution, the
+	// wedged-FOREIGN state the attribution exists to prevent. WithoutCancel
+	// keeps the identity values; rebasePostMergeTailBudget bounds the tail.
+	// Every call below reads r.Context(), so this one rebind covers them all.
+	// The re-read above stays on the request context, so a departed caller
+	// ends the reads early rather than extending them.
+	if mergePerformed {
+		tailCtx, cancelTail := context.WithTimeout(context.WithoutCancel(r.Context()), rebasePostMergeTailBudget)
+		defer cancelTail()
+		r = r.WithContext(tailCtx)
 	}
 
 	// --- SHARED TAIL: re-park → audit → attribute → republish → notify ---
@@ -443,7 +511,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// The branch_rebased entry is appended BEFORE the recompute so the
 	// recompute observes it.
 	s.writeBranchRebasedAudit(r, runID, prNumber, branch, baseRef,
-		headSHA, newHead, mergeSHA, alreadyUpToDate, reqBody.Reason, reparkedID)
+		headSHA, newHead, mergeSHA, alreadyUpToDate, reqBody.Reason, reparkedID, postMerge)
 
 	// LINEAGE ATTRIBUTION (E64.23 / #3125). The merge commit this verb
 	// creates is authored by the App installation but appears in NO
@@ -459,16 +527,20 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// Attribution is written ONLY when THIS invocation performed the merge,
 	// and covers EXACTLY ONE sha: the merge commit whose provenance this call
 	// can prove. The already-contains-base arm deliberately attributes
-	// NOTHING, and a post-merge head that DIVERGES from the merge commit is
-	// likewise not attributed — vouching whatever head happens to be live
+	// NOTHING, and a post-merge head the bounded re-read classified as a
+	// concurrent push is likewise not attributed — vouching whatever head
+	// happens to be live
 	// would silently launder a genuinely foreign pushed commit and defeat the
 	// fail-closed property that makes reset-branch and vouch-commit
 	// meaningful. An incomplete attribution is surfaced on the response as
 	// lineage_attribution_warning, so a 200 is never read as a clean recovery
 	// while the run is still wedged on the lineage check.
 	lineageWarning := ""
-	if mergePerformed {
-		lineageWarning = s.writeRebaseLineageAttribution(r, runID, branch, baseRef, mergeSHA, newHead)
+	postMergeOutcome, postMergeNote := "", ""
+	if mergePerformed && postMerge != nil {
+		lineageWarning = s.writeRebaseLineageAttribution(r, runID, branch, baseRef, mergeSHA, newHead, *postMerge)
+		postMergeOutcome = postMerge.Outcome
+		postMergeNote = postMergeHeadReadNote(*postMerge, headSHA, mergeSHA)
 	}
 
 	republished := false
@@ -501,6 +573,8 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		AuditCheckRepublished:      republished,
 		AuditCheckRepublishWarning: republishWarning,
 		LineageAttributionWarning:  lineageWarning,
+		PostMergeHeadRead:          postMergeOutcome,
+		PostMergeHeadReadNote:      postMergeNote,
 
 		MergeCandidateVerifyState:     mc.State,
 		MergeCandidateVerifyTriggered: mc.Triggered,
@@ -512,9 +586,11 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 
 // rebaseMergeCandidateVerify is the rebase verb's merge-candidate producer.
 //
-//   - A PERFORMED merge triggers a pass for the re-read new head (cause
-//     base_advance). When the new head could not be read back nothing is
-//     anchored; the retry takes the already-up-to-date arm below.
+//   - A PERFORMED merge triggers a pass for the resolved new head (cause
+//     base_advance): the decoded merge sha, or the observed head on a genuine
+//     concurrent push (#4199). Only when the merge sha did not decode AND the
+//     post-merge re-read returned no new head is nothing anchored; the retry
+//     then takes the already-up-to-date arm below.
 //   - An ALREADY-UP-TO-DATE invocation reads mergeCandidateVerifyState for
 //     the live head and re-triggers only when it is unverified (a
 //     conflict-resolution push, or a base advance whose pass never reported
@@ -584,15 +660,17 @@ func (s *Server) writeRebaseNotDeterminable(w http.ResponseWriter, r *http.Reque
 }
 
 // writeBranchRebasedAudit appends the branch_rebased audit entry recording
-// the full action — the prior head, the authoritative new head, the merge
-// commit (which may legitimately be empty), whether the branch already
-// contained the base, the operator reason, and the mechanism note — so the
-// advance is auditable. Operator actor (never a silent system action).
-// Best-effort like branch_reset: the write already happened, so an append
-// failure WARNs rather than unwinding the response.
+// the full action — the prior head, the resolved new head, the merge commit
+// (which may legitimately be empty), whether the branch already contained the
+// base, the operator reason, and the mechanism note — so the advance is
+// auditable. On a performed merge (postMerge non-nil) it also records the
+// post-merge read classification, the last observed head and the read count
+// (#4199). Operator actor (never a silent system action). Best-effort like
+// branch_reset: the write already happened, so an append failure WARNs rather
+// than unwinding the response.
 func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNumber int,
 	branch, baseRef, priorHeadSHA, newHeadSHA, mergeCommitSHA string,
-	alreadyUpToDate bool, reason, reparkedReviewStageID string) {
+	alreadyUpToDate bool, reason, reparkedReviewStageID string, postMerge *postMergeHeadRead) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -614,6 +692,11 @@ func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNum
 	}
 	if reparkedReviewStageID != "" {
 		fields["reparked_review_stage_id"] = reparkedReviewStageID
+	}
+	if postMerge != nil {
+		fields["post_merge_head_read"] = postMerge.Outcome
+		fields["post_merge_observed_head_sha"] = postMerge.Observed
+		fields["post_merge_read_attempts"] = postMerge.Attempts
 	}
 	payload, _ := json.Marshal(fields)
 
@@ -650,8 +733,8 @@ const rebaseVouchRequiredNote = " Re-invoking fishhawk_rebase_run_branch will NO
 // EXACTLY ONE SHA IS EVER ATTRIBUTED, and which one is decided by PROVENANCE
 // rather than by availability. This is the fix for the post-merge attribution
 // race: the lease re-check runs only BEFORE the merge, so a foreign push
-// landing in the window between MergeBranch and the post-merge GetPullRequest
-// becomes newHeadSHA. Vouching it would launder into the ledger precisely the
+// landing in the window between MergeBranch and the post-merge re-read
+// becomes the observed head. Vouching it would launder into the ledger precisely the
 // foreign commit the ledger exists to catch — the same laundering the
 // already-contains-base arm refuses, and that
 // TestRebaseRunBranch_LedgerStillFlagsAnUnattributedForeignCommit exists to
@@ -659,14 +742,18 @@ const rebaseVouchRequiredNote = " Re-invoking fishhawk_rebase_run_branch will NO
 //
 //   - mergeCommitSHA NON-EMPTY: attribute ONLY mergeCommitSHA. It is the sha
 //     the merges endpoint returned for the commit THIS call created, so it is
-//     the only sha whose provenance this invocation can prove. A non-empty
-//     newHeadSHA that DIFFERS from it is positive in-band evidence that
-//     something else landed in the window: it is NOT attributed, and the
-//     divergence is logged AND surfaced on the response so the operator
-//     learns a concurrent push occurred.
+//     the only sha whose provenance this invocation can prove. The
+//     concurrent-push warning fires ONLY when the bounded re-read classified
+//     the post-merge head as concurrent_push — a head that is neither the
+//     pre-merge head nor the merge commit, which is positive in-band evidence
+//     that something else landed in the window: it is NOT attributed, and the
+//     divergence is logged AND surfaced on the response. A re-read stuck at
+//     the pre-merge head (read_after_write_lag, #4199) or an unreadable one
+//     warns nothing: newHeadSHA is then the merge commit itself.
 //   - mergeCommitSHA EMPTY (the deliberately benign undecodable-201 shape
 //     pinned by githubclient's TestMergeBranch_MergedMissingSHAIsBenign):
-//     fall back to attributing newHeadSHA alone, because the merge
+//     fall back to attributing newHeadSHA alone — non-empty only on read_back,
+//     a re-read head that differs from the pre-merge head — because the merge
 //     provably happened and there is nothing else to attribute.
 //   - BOTH empty: nothing is attributable at all.
 //
@@ -678,10 +765,10 @@ const rebaseVouchRequiredNote = " Re-invoking fishhawk_rebase_run_branch will NO
 // are contradictory, so the append failure is still non-fatal to the already
 // completed merge but is no longer SILENT.
 func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
-	branch, baseRef, mergeCommitSHA, newHeadSHA string) string {
-	// Nothing attributable: an undecodable merge sha AND a failed post-merge
-	// re-read. Re-invocation cannot repair this — say so rather than
-	// advertising a retry that cannot deliver.
+	branch, baseRef, mergeCommitSHA, newHeadSHA string, postMerge postMergeHeadRead) string {
+	// Nothing attributable: an undecodable merge sha AND a post-merge re-read
+	// that failed or stayed at the pre-merge head. Re-invocation cannot repair
+	// this — say so rather than advertising a retry that cannot deliver.
 	if mergeCommitSHA == "" && newHeadSHA == "" {
 		warning := "the base merge SUCCEEDED, but NEITHER the merge commit sha nor the post-merge head could be resolved, so NO lineage attribution was recorded; the merge commit is authored by the App installation and carries no head-report entry, so the ADR-035 ledger classifies it as FOREIGN and the run stays wedged." + rebaseVouchRequiredNote
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -692,20 +779,20 @@ func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
 
 	warning := ""
 	// PROVENANCE, not availability: prefer the merge sha, and treat a
-	// divergent live head as evidence of a concurrent push rather than as a
-	// second sha to vouch.
+	// classified concurrent push as evidence of a foreign commit rather than
+	// as a second sha to vouch.
 	sha := mergeCommitSHA
 	if sha == "" {
 		sha = newHeadSHA
-	} else if newHeadSHA != "" && newHeadSHA != mergeCommitSHA {
+	} else if postMerge.Outcome == postMergeHeadReadConcurrentPush {
 		warning = "the base merge SUCCEEDED and its merge commit " + mergeCommitSHA +
-			" was attributed, but the post-merge head read back as " + newHeadSHA +
+			" was attributed, but the post-merge head read back as " + postMerge.Observed +
 			", which DIFFERS from it — a concurrent push landed after the merge. That head was deliberately NOT attributed: vouching a commit this invocation did not create would launder a foreign commit into the ADR-035 ledger. Review the pushed commit and, if it is legitimate, admit it with fishhawk_vouch_commit."
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"branch rebase: post-merge head diverged from the merge commit; the divergent head was NOT attributed (concurrent push)",
 			slog.String("run_id", runID.String()),
 			slog.String("merge_commit_sha", mergeCommitSHA),
-			slog.String("post_merge_head_sha", newHeadSHA))
+			slog.String("post_merge_head_sha", postMerge.Observed))
 	}
 
 	id := IdentityFrom(r.Context())

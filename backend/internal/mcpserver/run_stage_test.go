@@ -4438,3 +4438,37 @@ func TestRunStage_NextActions_AcceptanceHeldOnPartialIntegration(t *testing.T) {
 		t.Errorf("first action = %+v, want fishhawk_await_children", out.NextActions.Actions)
 	}
 }
+
+// TestRunStage_NextActions_AcceptanceVerdictPending pins the E72.56 / #4072
+// sentinel THROUGH the run_stage call site: a blocking acceptance run_stage
+// that returns seconds after the stage settled — with only its dispatch anchor
+// in the window, because the runner ships the verdict AFTER the trace upload —
+// classifies acceptance_verdict_pending (wait), not the retry-offering
+// outcome-unknown arm. Counterfactual (run): revert run_stage.go to
+// latestAcceptanceVerdict -> acceptance_settled_outcome_unknown -> RED.
+func TestRunStage_NextActions_AcceptanceVerdictPending(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedAcceptanceArmRun(fb, runID, acceptanceID, "succeeded")
+	ended := time.Now().UTC().Add(-2 * time.Second)
+	sid := acceptanceID.String()
+	fb.mu.Lock()
+	fb.stagesByRun[runID][3].EndedAt = &ended
+	fb.auditByRun[runID] = []AuditEntry{{Category: auditCategoryAcceptanceDispatched, Sequence: 10, StageID: &sid, Payload: map[string]any{}}}
+	fb.mu.Unlock()
+
+	out := runAcceptanceStage(t, r, runID, acceptanceID)
+	if out.NextActions.State != "acceptance_verdict_pending" {
+		t.Errorf("next_actions.state = %q, want acceptance_verdict_pending", out.NextActions.State)
+	}
+	if !nextActionOffered(out.NextActions, "fishhawk_await_stage") {
+		t.Errorf("verdict_pending should offer fishhawk_await_stage; got %+v", out.NextActions.Actions)
+	}
+	if nextActionOffered(out.NextActions, "fishhawk_retry_stage") || nextActionOffered(out.NextActions, "fishhawk_merge_run") {
+		t.Errorf("verdict_pending must offer neither retry nor merge; got %+v", out.NextActions.Actions)
+	}
+}

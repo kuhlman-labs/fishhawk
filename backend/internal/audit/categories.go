@@ -403,6 +403,7 @@ var KnownCategories = map[string]struct{}{
 	"crew_message_escalated":                  {},
 	"crew_message_sent":                       {},
 	"crew_work_request_filed":                 {},
+	"decomposition_child_cancelled":           {}, // #4186: a parent cancel or the orphan backfill cancelled this decomposition child (childcancel) — INTERNAL, not in issuecomment activityCategories
 	"delegation_confirmed":                    {},
 	"delegation_lower_proposed":               {},
 	"delegation_shadow_evaluated":             {},

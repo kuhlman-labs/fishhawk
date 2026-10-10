@@ -372,6 +372,22 @@ func promptRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed255
 	return w
 }
 
+// promptRequestWithCapabilities is promptRequest plus the runner capability
+// header (#3621 / #4183) carrying caps verbatim.
+func promptRequestWithCapabilities(t *testing.T, s *Server, stageID uuid.UUID, priv ed25519.PrivateKey, caps string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt", stageID), nil)
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(ed25519.Sign(priv, PromptCanonicalMessage(stageID))))
+	req.Header.Set(runnerCapabilitiesHeader, caps)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// capableRunnerCapabilities is the header value a current runner sends.
+const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify
+
 // promptRenderRequest exercises the unsigned /prompt-render preview endpoint,
 // the sibling surface of promptRequest's signed /prompt dispatch endpoint.
 func promptRenderRequest(t *testing.T, s *Server, stageID uuid.UUID) *httptest.ResponseRecorder {
@@ -14812,6 +14828,7 @@ func TestResumeKindWireValues(t *testing.T) {
 		{resumeKindPushDiscarded, "push_discarded", "resumeKindPushDiscarded"},
 		{runnerCapabilitiesHeader, "X-Fishhawk-Runner-Capabilities", "runnerCapabilitiesHeader"},
 		{capabilityPushResume, "push-resume", "capabilityPushResume"},
+		{capabilityMergeCandidateVerify, "merge-candidate-verify", "capabilityMergeCandidateVerify"},
 		{CategoryPushResumeCheckpoint, "push_resume_checkpoint", "CategoryPushResumeCheckpoint"},
 	} {
 		if tc.got != tc.want {
@@ -15993,10 +16010,17 @@ func mergeCandidateVerifiedEntry(runID, stageID uuid.UUID, seq int64, head, resu
 	}
 }
 
-// promptBothPathsWithEntries drives BOTH implement serve paths — the signed
-// runner /prompt and the SPA /prompt-render preview — for an implement stage
-// whose run carries the given audit entries, returning both decoded responses.
-func promptBothPathsWithEntries(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) map[string]promptResponse {
+// implementPromptServer is a server whose one run has a single implement
+// stage carrying the given audit entries.
+type mcvImplementPromptServer struct {
+	s       *Server
+	rr      *promptRunRepo
+	au      *feedbackAuditRepo
+	stageID uuid.UUID
+	priv    ed25519.PrivateKey
+}
+
+func newMCVImplementPromptServer(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) *mcvImplementPromptServer {
 	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
@@ -16008,16 +16032,27 @@ func promptBothPathsWithEntries(t *testing.T, entries func(runID, stageID uuid.U
 	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
 	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
 	priv, _ := sf.issue(t, runID)
+	au := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries(runID, implStageID)}}
 	s := New(Config{
 		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
-		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries(runID, implStageID)}},
+		AuditRepo: au,
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
+	return &mcvImplementPromptServer{s: s, rr: rr, au: au, stageID: implStageID, priv: priv}
+}
+
+// promptBothPathsWithEntries drives BOTH implement serve paths — the signed
+// runner /prompt (from a CURRENT runner, advertising every capability) and the
+// SPA /prompt-render preview — for an implement stage whose run carries the
+// given audit entries, returning both decoded responses.
+func promptBothPathsWithEntries(t *testing.T, entries func(runID, stageID uuid.UUID) []*audit.Entry) map[string]promptResponse {
+	t.Helper()
+	ps := newMCVImplementPromptServer(t, entries)
 
 	out := map[string]promptResponse{}
 	for name, w := range map[string]*httptest.ResponseRecorder{
-		"prompt":        promptRequest(t, s, runID, implStageID, priv, ""),
-		"prompt_render": promptRenderRequest(t, s, implStageID),
+		"prompt":        promptRequestWithCapabilities(t, ps.s, ps.stageID, ps.priv, capableRunnerCapabilities),
+		"prompt_render": promptRenderRequest(t, ps.s, ps.stageID),
 	} {
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s: status = %d, want 200:\n%s", name, w.Code, w.Body.String())
@@ -16090,5 +16125,75 @@ func TestGetStagePrompt_ConsumedMergeCandidateTriggerIsNotServed(t *testing.T) {
 				t.Error("fixup = false, want the ordinary fix-up that follows a consumed pass served unchanged")
 			}
 		})
+	}
+}
+
+// TestGetStagePrompt_NoMergeCandidateTrigger_UnadvertisingRunnerServed: the
+// #4183 capability gate fires ONLY on a live merge-candidate trigger. A stage
+// with no trigger is served to a runner sending no capability header at all,
+// exactly as before the gate existed.
+func TestGetStagePrompt_NoMergeCandidateTrigger_UnadvertisingRunnerServed(t *testing.T) {
+	ps := newMCVImplementPromptServer(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			makeFixupEntry(runID, stageID, []planreview.Concern{{Severity: planreview.SeverityHigh, Note: "fix the thing"}}),
+		}
+	})
+	w := promptRequest(t, ps.s, uuid.Nil, ps.stageID, ps.priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no live trigger means no capability is required):\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Prompt == "" || !resp.Fixup || resp.MergeCandidateVerify {
+		t.Errorf("served prompt=%d bytes fixup=%v merge_candidate_verify=%v, want the ordinary fix-up prompt",
+			len(resp.Prompt), resp.Fixup, resp.MergeCandidateVerify)
+	}
+}
+
+// TestGetStagePromptRender_MergeCandidateTrigger_NeverSettles: the SPA preview
+// is NOT capability-gated (#4183). Previewing a stage with a live trigger and
+// no capability header renders the served pass and mutates nothing: no
+// merge_candidate_verified row, no stage transition.
+func TestGetStagePromptRender_MergeCandidateTrigger_NeverSettles(t *testing.T) {
+	ps := newMCVImplementPromptServer(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{mergeCandidateTriggerEntry(runID, stageID, 1, "head1")}
+	})
+	ps.rr.getStages[ps.stageID].State = run.StageStateDispatched
+	w := promptRenderRequest(t, ps.s, ps.stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("preview status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.MergeCandidateVerify || resp.MergeCandidateVerifyExpectedHeadSHA != "head1" {
+		t.Errorf("preview did not render the live pass: %+v", resp)
+	}
+	if n := len(ps.au.appendedByCategory(CategoryMergeCandidateVerified)); n != 0 {
+		t.Errorf("merge_candidate_verified rows = %d, want 0 (a preview must never settle a live trigger)", n)
+	}
+	if got := ps.rr.getStages[ps.stageID].State; got != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (a preview must never transition the stage)", got)
+	}
+}
+
+// TestPromptCapabilityRefusal_Documented pins the #4183 refusal into the API
+// contract: both the OpenAPI source of truth and its human companion must name
+// the 409 code and the capability token a runner must advertise. Update
+// docs/api/v0.openapi.yaml AND docs/api/v0.md if either literal changes.
+func TestPromptCapabilityRefusal_Documented(t *testing.T) {
+	for _, doc := range []string{"v0.openapi.yaml", "v0.md"} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "api", doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{mergeCandidateReasonRunnerCapabilityMissing, capabilityMergeCandidateVerify} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("docs/api/%s does not document %q", doc, want)
+			}
+		}
 	}
 }
