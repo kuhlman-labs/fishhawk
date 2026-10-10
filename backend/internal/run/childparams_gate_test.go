@@ -7,12 +7,30 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // This file is the USE pin for ChildParamsFrom (E67.17 / #2589). The
 // reflection pins in childparams_test.go prove the helper is CORRECT;
@@ -299,15 +317,12 @@ func collectChildParamsLiterals(root string) ([]literalSite, int, error) {
 	return sites, scanned, nil
 }
 
-// gateRepoRoot returns the workspace root by hopping four parents up
-// from this file's directory (<root>/backend/internal/run).
+// gateRepoRoot returns the workspace root by hopping three parents up
+// from this package's init-captured source dir, pkgSrcDir
+// (<root>/backend/internal/run).
 func gateRepoRoot(t *testing.T) string {
 	t.Helper()
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed: cannot locate the repo root")
-	}
-	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(self))))
+	root := filepath.Dir(filepath.Dir(filepath.Dir(pkgSrcDir)))
 	anchor := filepath.Join(root, "backend", "internal", "run", "repository.go")
 	if _, err := os.Stat(anchor); err != nil {
 		t.Fatalf("anchor %q not found under derived repo root %q: %v"+

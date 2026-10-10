@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -767,11 +766,7 @@ func TestRestartBlockers_Narrowing(t *testing.T) {
 
 func restartBlockersGoldenPath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "restart_blockers.json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "restart_blockers.json")
 }
 
 // TestRestartBlockers_EndToEnd_Golden drives the REAL mux (s.Handler()) with

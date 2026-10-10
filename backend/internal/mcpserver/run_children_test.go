@@ -539,8 +539,7 @@ func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree(t *testing
 	}
 
 	// (1) Build the real fishhawk-runner from the runner module.
-	_, thisFile, _, _ := runtime.Caller(0)
-	runnerDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "runner", "cmd", "fishhawk-runner")
+	runnerDir := filepath.Join(pkgSrcDir, "..", "..", "..", "runner", "cmd", "fishhawk-runner")
 	runnerBin := filepath.Join(t.TempDir(), "fishhawk-runner")
 	build := exec.Command("go", "build", "-o", runnerBin, ".")
 	build.Dir = runnerDir
