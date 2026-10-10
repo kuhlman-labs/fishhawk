@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -617,11 +616,7 @@ type cliRedirectFixture struct {
 }
 
 func TestOAuthLogin_RedirectURIShapeMatchesSharedFixture(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	root := filepath.Join(pkgSrcDir, "..", "..", "..")
 	raw, err := os.ReadFile(filepath.Join(root, "testdata", "wire", "oauth_cli_redirect_uri.json"))
 	if err != nil {
 		t.Fatalf("read shared fixture: %v", err)

@@ -1,13 +1,32 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even after a test
+// (validate_test.go) chdirs the process. Fixtures anchor here, never on
+// runtime.Caller, whose file name is module-relative under -trimpath and so
+// misses every fixture.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // validConventions is a schema-valid work-management conventions body used as
 // the base for the loadCharterDeclaration fixtures. Callers append (or omit) a
@@ -135,12 +154,8 @@ func TestLoadCharterDeclaration(t *testing.T) {
 // ever drops its charter block or changes the path, the absent-file admit would
 // silently become a fail-open — this test turns that into a RED instead.
 func TestDefaultCharterPathMatchesShippedDefault(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed; cannot locate the repo root")
-	}
 	// cli/cmd/fishhawk -> repo root.
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
+	root := filepath.Join(pkgSrcDir, "..", "..", "..")
 	defaultPath := filepath.Join(root, "docs", "spec", "work-management-default.yaml")
 	data, err := os.ReadFile(defaultPath)
 	if err != nil {

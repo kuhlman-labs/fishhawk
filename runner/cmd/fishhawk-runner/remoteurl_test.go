@@ -6,7 +6,6 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -103,13 +102,9 @@ func TestRemoteURLFor_PerForge(t *testing.T) {
 // carries its own behavioural per-forge assertion.
 func TestNoHardcodedForgeHostInRemoteURLConstruction(t *testing.T) {
 	// runTestMain chdirs the whole test binary into a throwaway git repo, so
-	// the package directory must be resolved from this file's own path, not
-	// from the working directory.
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot resolve this test file's path")
-	}
-	pkgDir := filepath.Dir(thisFile)
+	// the package directory is the init-captured pkgSrcDir, not the working
+	// directory.
+	pkgDir := pkgSrcDir
 	entries, err := os.ReadDir(pkgDir)
 	if err != nil {
 		t.Fatal(err)
