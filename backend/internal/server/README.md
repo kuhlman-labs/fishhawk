@@ -2168,12 +2168,13 @@ Flow:
   for an advance. Any other merge error → 502 `rebase_merge_failed`,
   likewise nothing written. The full contract is the
   **Bounded conflict-resolution pass** section below.
-- **The AUTHORITATIVE new head is a live PR RE-READ**, never
-  `MergeBranch`'s return. That is what makes a decoded-201 and an
-  undecodable-201 behave IDENTICALLY: the live head is the truth in both
-  cases, so no value is ever asked to mean two things. Both are reported —
+- **The new head is resolved by PROVENANCE (#4199)**, not taken from one
+  PR re-read: a DECODED `MergeBranch` sha is the new head unless the
+  bounded re-read observed a genuine concurrent push; only on the
+  undecodable-201 shape does the re-read supply the head (see
+  **Post-merge read-after-write lag** below). Both are reported —
   `merge_commit_sha` (may legitimately be empty) and `new_head_sha` (the
-  authority, and the head the check is published at).
+  resolved head, and the head the check is published at).
 
 **THE SHARED TAIL, and why the advertised retry is REAL.** Both arms —
 merged, and already-contains-base — fall into ONE re-park → audit →
@@ -2220,6 +2221,21 @@ are the merge commit), `TestRebaseRunBranch_PostMergeReadIsBounded`,
 `TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit`,
 `TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted` and the
 `rebase_postmerge_read_test.go` classifier table.
+
+**The post-merge tail runs DETACHED from request cancellation.** The MCP
+client calls this verb with a 30s timeout, and against a degraded forge
+(every post-merge read 5xx or slow, each with githubclient's own retry
+budget) the re-read plus its backoff can outlast it. The re-read itself
+stays on the request context, so a departed caller ends it early; but once
+`mergePerformed` is true the handler rebinds `r` to
+`context.WithTimeout(context.WithoutCancel(r.Context()),
+rebasePostMergeTailBudget)` (60s) before the shared tail. On the request
+context every append would fail AFTER the installation-authored merge
+landed — no `branch_rebased` row and no attribution, the wedged-FOREIGN
+state the attribution exists to prevent. The already-contains-base arm
+keeps the request context: it performed no irreversible write. Pinned by
+`TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge`,
+whose audit fake fails an append on a dead context the way pgx does.
 
 **The degraded head read does NOT fall back to "no override" — only when
 the merge sha did not decode.** On the undecodable-201 shape the re-read

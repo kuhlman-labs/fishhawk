@@ -475,6 +475,25 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// DETACH THE POST-MERGE TAIL. Once THIS call performed the merge, the
+	// commit is on the branch and nothing unwinds it, so the re-park, the
+	// branch_rebased row, the lineage attribution, the republish and the
+	// merge-candidate pass must not depend on the caller still listening. The
+	// MCP client's 30s timeout can cancel the request while the bounded
+	// post-merge re-read runs against a degraded forge, and on a cancelled
+	// context every append below would fail AFTER the installation-authored
+	// merge landed — no branch_rebased row and no attribution, the
+	// wedged-FOREIGN state the attribution exists to prevent. WithoutCancel
+	// keeps the identity values; rebasePostMergeTailBudget bounds the tail.
+	// Every call below reads r.Context(), so this one rebind covers them all.
+	// The re-read above stays on the request context, so a departed caller
+	// ends the reads early rather than extending them.
+	if mergePerformed {
+		tailCtx, cancelTail := context.WithTimeout(context.WithoutCancel(r.Context()), rebasePostMergeTailBudget)
+		defer cancelTail()
+		r = r.WithContext(tailCtx)
+	}
+
 	// --- SHARED TAIL: re-park → audit → attribute → republish → notify ---
 	// Reachable WITHOUT a merge on this invocation, which is what makes the
 	// advertised retry true.

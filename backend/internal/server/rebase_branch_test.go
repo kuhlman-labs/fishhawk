@@ -52,6 +52,9 @@ const (
 //     run branch already contains the base.
 //   - mergeStatus / mergeBody drive the merges endpoint (409 = conflict,
 //     500 = merge_failed, 201 with or without a `sha`).
+//   - onPRCall, when set, is invoked with the 1-based call number of every
+//     GET /pulls before it is answered, so a test can act at a precise point
+//     in the handler (e.g. cancel the request during the post-merge re-read).
 type rebaseGitHub struct {
 	baseRef       string
 	headRef       string
@@ -62,6 +65,7 @@ type rebaseGitHub struct {
 	compareStatus int
 	mergeStatus   int
 	mergeBody     string
+	onPRCall      func(n int)
 
 	mu          sync.Mutex
 	prCallCount int
@@ -106,8 +110,11 @@ func newRebaseGitHubClient(t *testing.T, stub *rebaseGitHub) *githubclient.Clien
 				}
 				status = stub.prStatusSeq[i]
 			}
-			ref, base := stub.headRef, stub.baseRef
+			ref, base, hook := stub.headRef, stub.baseRef, stub.onPRCall
 			stub.mu.Unlock()
+			if hook != nil {
+				hook(idx + 1)
+			}
 			if status != http.StatusOK {
 				w.WriteHeader(status)
 				return
@@ -2187,5 +2194,67 @@ func TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted(t *testing.T
 	}
 	if !strings.Contains(resp.PostMergeHeadReadNote, "unresolved") {
 		t.Errorf("post_merge_head_read_note must say the head is unresolved: %q", resp.PostMergeHeadReadNote)
+	}
+}
+
+// ctxHonouringAudit is the rebase world's audit fake with one change: an
+// append on a cancelled or expired context fails the way the real pgx-backed
+// chain does, so a write issued on a dead request context is observable.
+type ctxHonouringAudit struct{ *auditFake }
+
+func (a ctxHonouringAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return a.auditFake.AppendChained(ctx, p)
+}
+
+// TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge:
+// the MCP client's 30s timeout can cancel the request while the bounded
+// post-merge re-read runs. The merge has already landed, so the shared tail
+// must still record it: the branch_rebased row, the lineage attribution of
+// the merge commit and the merge-candidate trigger all anchored on M. On the
+// request context every one of those appends fails AFTER the
+// installation-authored merge landed, leaving it unattributed (FOREIGN).
+func TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stub := laggingRebaseStub()
+	// PR reads: 1 = handler head, 2 = lease re-check, 3 = the first
+	// post-merge read — the caller gives up there.
+	stub.onPRCall = func(n int) {
+		if n == 3 {
+			cancel()
+		}
+	}
+	sd := seedMCVRebase(t, stub)
+	sd.s.cfg.AuditRepo = ctxHonouringAudit{sd.au}
+	crImplementStage(t, sd)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true},
+		func(req *http.Request) *http.Request { return withRebaseOperator(req.WithContext(ctx)) }))
+
+	// Precondition: the cancellation reached the handler — the re-read
+	// stopped after its first read instead of running the full schedule.
+	if n := prCalls(stub); n != 3 {
+		t.Fatalf("GET /pulls calls = %d, want 3 — the request cancel must stop the post-merge re-read, or this test proves nothing", n)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("request context was never cancelled")
+	}
+	if resp.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("new_head_sha = %q, want the decoded merge commit %q", resp.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s] — a cancelled caller must not strand the merge unattributed", got, rebaseNewHeadSHA)
+	}
+	if resp.LineageAttributionWarning != "" {
+		t.Errorf("lineage_attribution_warning = %q, want empty", resp.LineageAttributionWarning)
+	}
+	if triggers := mcvTriggerPayloads(t, sd.au); len(triggers) != 1 || triggers[0].ExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("merge-candidate triggers = %+v, want exactly one anchored on %q", triggers, rebaseNewHeadSHA)
+	}
+	if p := decodeBranchRebased(t, sd.au); p.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("branch_rebased new_head_sha = %q, want the merge commit %q", p.NewHeadSHA, rebaseNewHeadSHA)
 	}
 }

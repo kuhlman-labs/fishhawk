@@ -34,6 +34,13 @@ var defaultPostMergeHeadReadBackoff = []time.Duration{
 	500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second, 3500 * time.Millisecond,
 }
 
+// rebasePostMergeTailBudget bounds the rebase handler's post-merge tail
+// (re-park, branch_rebased, attribution, republish, notify, merge-candidate
+// pass), which runs detached from request cancellation once a merge was
+// performed, so a caller that times out during the re-read cannot strand the
+// landed merge without its audit row and attribution.
+const rebasePostMergeTailBudget = 60 * time.Second
+
 // errPostMergeEmptyHead is recorded as the read error when a post-merge PR
 // read succeeded but carried an empty head sha.
 var errPostMergeEmptyHead = errors.New("the post-merge PR re-read returned an empty head")
