@@ -1188,7 +1188,7 @@ Operator env vars (runner-process config; acceptenv excludes all of them from th
 
 #### Dogfood preview (`scripts/dev preview` / `preview-down`)
 
-`scripts/dev preview [<sha-or-ref>]` (the arg defaults to `$FISHHAWK_PREVIEW_SHA` so the provisioning hook can invoke it bare) fetches + resolves the merge candidate and checks it out in a detached worktree under `.fishhawk/cache/preview-worktree` — inside the already-gitignored `.fishhawk/cache/`, so a live preview never dirties the main tree's `git status` or `-dirty`-stamps dev builds.
+`scripts/dev preview [<sha-or-ref>]` (the arg defaults to `$FISHHAWK_PREVIEW_SHA` so the provisioning hook can invoke it bare) resolves the merge candidate — a full SHA already in the checkout with no fetch, otherwise through a bounded, non-interactive `git fetch` (`FISHHAWK_PREVIEW_FETCH_TIMEOUT`, default 60s; [#4058](https://github.com/kuhlman-labs/fishhawk/issues/4058), `scripts/README.md` § "Ref resolution and the bounded fetch") — and checks it out in a detached worktree under `.fishhawk/cache/preview-worktree` — inside the already-gitignored `.fishhawk/cache/`, so a live preview never dirties the main tree's `git status` or `-dirty`-stamps dev builds.
 
 It builds fishhawkd GitSHA-stamped via the existing `_build_ldflags` path (clean detached checkout → no `-dirty`), DROP/CREATEs the isolated `<dbname>_preview` database on each start (PR-branch migrations never touch the dev DB) and migrates it with the preview binary, then serves on `FISHHAWK_PREVIEW_ADDR` (default `localhost:8090`, distinct from the orchestrating 8080), gated on `/healthz` echoing the stamped `git_sha` (pid tracked in `.fishhawk/preview.pid`). `scripts/dev preview-down` TERM→KILLs the tracked pid and removes the worktree.
 

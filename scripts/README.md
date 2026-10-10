@@ -2769,6 +2769,100 @@ half-provisioned target never lingers looking healthy), and
 `cmd_preview` exits 1. A malformed name reaching the apply seam takes the
 same teardown. No temp file survives any path.
 
+### Ref resolution and the bounded fetch (E72.52 / [#4058](https://github.com/kuhlman-labs/fishhawk/issues/4058))
+
+The acceptance runner's `auto_preview` hook used to hang `scripts/dev
+preview` at an UNBOUNDED `git fetch origin`: a fetch wedged on credentials
+or a stalled remote ate the runner's 5-minute provision budget
+(`FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`) and failed acceptance as
+category C. `cmd_preview` now resolves its ref through
+`_preview_resolve_ref <ref> <secs>` (result in `REPLY`, `error: …` on
+stderr, never `_die`):
+
+- **Local first, full SHAs only.** A full-length hex SHA (40 or 64 chars,
+  `_preview_ref_is_full_sha`) that already resolves to a local commit is
+  used with NO fetch: it is content-addressed, so a fetch cannot change the
+  answer. This is the runner's common path — it passes the SHA it pushed,
+  which is present in the dispatch checkout the lineage worktrees hang off.
+- **Fetch first otherwise.** A symbolic ref (`main`, `origin/x`) is mutable
+  and an abbreviated SHA is ambiguous, so both keep the fetch-first
+  freshness semantics: one bounded `git fetch origin`, then resolve, then
+  one bounded direct `git fetch origin <ref>` retry (a PR-head SHA need not
+  be reachable from any fetched branch), then fail with `could not resolve
+  '<ref>' to a commit (after git fetch origin) — is the run branch pushed?`.
+- **The bound.** Each fetch is wall-clock bounded by
+  `FISHHAWK_PREVIEW_FETCH_TIMEOUT` seconds (default 60; `.env` honored),
+  validated fail-closed by `_preview_fetch_timeout` right after `.env`
+  lands and before any DB or build work: anything but an integer in
+  1..3600 exits 1 naming the knob.
+- **Timeout vs failure.** A fetch that FAILS degrades to local resolution
+  with `warning: git fetch origin failed …`. A fetch that TIMES OUT warns
+  `… timed out after <secs>s …`; if the ref is then unresolved the
+  direct-fetch retry is SKIPPED (it would only hit the same wedge, so the
+  worst case is one bound, not two) and the error names the `git fetch`,
+  the bound and the remedy. The runner strips global/system git config
+  from the hook (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`,
+  `runner/cmd/fishhawk-runner/gateenv.go`), so a credential helper the
+  fetch needs must be configured repo-local; otherwise push the run branch
+  and fetch the SHA into the checkout by hand so it resolves locally, or
+  raise the knob. Both the timeout error and the `could not resolve` error
+  append the last lines of the fetch's captured stdout+stderr (`git fetch
+  output (last lines):`), so what git said is in the runner's output tail.
+- **Non-interactive.** Every fetch runs under `GIT_TERMINAL_PROMPT=0` and
+  `GIT_ASKPASS=/bin/false`, the runner's `gitops.NonInteractiveEnv()` pins.
+  `GIT_TERMINAL_PROMPT=0` is load-bearing under the runner: with global
+  config stripped, a `/dev/tty` username prompt is the likeliest wedge, and
+  the pin turns it into a fast failure. It does NOT stop a configured
+  credential helper from running, which is why the wall-clock bound is the
+  second control.
+- **Detached fds.** `_preview_git_fetch` runs `git fetch` through
+  `_run_with_timeout` behind a `sh -c 'exec "$@" 2>&1'` wrapper: stdout and
+  stderr go to a private temp file (removed on every path; an unavailable
+  `mktemp` degrades to an uncaptured fetch), background stdin is
+  `/dev/null`. No fd of the fetch or a descendant is the runner's
+  `CombinedOutput` pipe, so a credential helper that outlives the TERM
+  cannot hold the provision command open.
+- **Progress lines.** `preview: resolving <ref>...`, `preview: <sha> is
+  already local — skipping git fetch`, `preview: fetching origin (bounded
+  <secs>s)...` and `preview: fetching origin <ref> (bounded <secs>s)...`, so
+  a future hang names its last step in the runner's output tail.
+- **`_run_with_timeout` contract.** stdout to `<outfile>`, stderr
+  discarded, the command's own status when it finishes in time, and a
+  DISTINCT `124` on expiry (GNU `timeout`'s convention), read from the
+  watchdog (it exits 0 only when it delivered the TERM) rather than from
+  `$SECONDS`; `124` is reported only when the command's own status is also
+  non-zero. Its other caller, the stale-shim advisory, treats any non-zero
+  as a silent degrade and is unchanged.
+- **Residual.** A descendant the TERM does not reach (`git-remote-https`, a
+  credential helper) can linger as an orphan until its blocking condition
+  clears. It holds no caller fd, so neither `scripts/dev` nor the runner
+  waits on it; the runner's stage-exit orphan sweep (E51.11, sampling-based)
+  may or may not reap it.
+- **Deployment lag.** Acceptance provisioning runs the operator checkout's
+  `scripts/dev`, so this behavior reaches `auto_preview` only after the
+  change is pulled (`scripts/dev post-merge`).
+
+`scripts/test-dev` §15n pins it hermetically: a non-bare `origin` with
+commit A cloned to `local`, commit B added directly in origin (never pushed,
+avoiding the #3503 receive-pack maintenance race), and a `PATH` `git` shim
+that logs each fetch with its env pins and then hangs (a `sleep` grandchild
+holding stdout/stderr, standing in for a wedged credential helper), fails,
+or runs the real git. Each resolve runs inside a `$( … 2>&1 )` substitution,
+which waits for EOF like the runner's `CombinedOutput`. Cases: a local full
+SHA under a hanging fetch resolves with zero fetches; an absent SHA under a
+hanging fetch fails in under 8s with the named-timeout error, the captured
+stderr tail, exactly one fetch (no retry), and `GTP=0` / `ASKPASS=/bin/false`
+on that fetch; a non-local SHA resolves through a real fetch; a symbolic
+`origin/main` resolves to origin's moved tip, not the stale local one; a
+failed fetch degrades to local resolution; an unresolvable SHA fails after
+exactly two fetches with the stderr tail; a missing `TMPDIR` still fetches;
+no temp file survives; the `_preview_fetch_timeout` table; `cmd_preview`
+exiting on an invalid knob before resolution and DB checks; the
+`_run_with_timeout` 0 / own-status / 124 contract; and `cmd_preview` body
+greps (resolves via the helper, no raw `fetch origin`, resolution before
+the prior-preview teardown). Every control was deleted → RED → restored
+(record in the PR notes for #4058).
+
 ### Testing
 
 `scripts/test-dev` §15l pins: the `_preview_parse_args` table (bare ref,
