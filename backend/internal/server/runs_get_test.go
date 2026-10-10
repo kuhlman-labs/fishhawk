@@ -3845,6 +3845,67 @@ func TestGetRun_CapabilitiesBlock(t *testing.T) {
 		}
 	})
 
+	// slice_integration (#4165): the decomposed-parent acceptance gate's own
+	// authority predicate, orchestrator.SliceIntegrationUnavailable, evaluated
+	// on the run row the read loaded. Every assertion is on the RAW bytes so an
+	// omitempty on `available` (a `false` vanishing) or on the key itself (the
+	// block reading as an older backend) reddens.
+	getRaw := func(t *testing.T, s *Server, id uuid.UUID) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs/"+id.String(), nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+	seedWithOrchestrator := func(t *testing.T, installationID *int64) (*Server, *run.Run) {
+		t.Helper()
+		repo := newFakeRepo()
+		s := newServer(t, repo)
+		s.cfg.FeedbackProviders = func() []string { return nil }
+		s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: repo, GitHub: newConsolidateGitHub()}
+		got, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+			Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+			InstallationID: installationID,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		return s, got
+	}
+
+	t.Run("slice_integration unavailable when no orchestrator is wired", func(t *testing.T) {
+		s, got := seed(t, nil)
+		body := getRaw(t, s, got.ID)
+		want := `"slice_integration":{"available":false,"reason":"GitHub not configured"}`
+		if !strings.Contains(body, want) {
+			t.Errorf("raw body must carry %s (newServer wires no Orchestrator, so the gate's\n"+
+				"predicate reports no authority); got:\n%s", want, body)
+		}
+	})
+
+	t.Run("slice_integration available with GitHub and an installation id", func(t *testing.T) {
+		installationID := int64(42)
+		s, got := seedWithOrchestrator(t, &installationID)
+		body := getRaw(t, s, got.ID)
+		want := `"slice_integration":{"available":true}`
+		if !strings.Contains(body, want) {
+			t.Errorf("raw body must carry %s (GitHub wired + the run row carries an\n"+
+				"installation id, so the gate's predicate reports authority); got:\n%s", want, body)
+		}
+	})
+
+	t.Run("slice_integration reads the run row's installation id", func(t *testing.T) {
+		s, got := seedWithOrchestrator(t, nil)
+		body := getRaw(t, s, got.ID)
+		want := `"slice_integration":{"available":false,"reason":"run has no installation_id"}`
+		if !strings.Contains(body, want) {
+			t.Errorf("raw body must carry %s (GitHub wired but this run row has no\n"+
+				"installation id); got:\n%s", want, body)
+		}
+	})
+
 	t.Run("list endpoint omits the block", func(t *testing.T) {
 		s, _ := seed(t, []string{"github_projects"})
 		w := httptest.NewRecorder()

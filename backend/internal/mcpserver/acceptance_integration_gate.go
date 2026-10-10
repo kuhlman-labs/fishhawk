@@ -42,29 +42,99 @@ func isAcceptanceDispatchAction(a SuggestedAction) bool {
 	return a.Params["stage"] == "acceptance"
 }
 
+// newestStageByType returns the stage of typ with the HIGHEST Sequence,
+// regardless of the slice's order, or nil when there is none. A parent whose
+// implement stage was retried carries more than one implement stage; the
+// newest is the one whose state decides the fan-in, and the
+// ambiguity-erroring resolveStage would read such a parent as unreadable
+// (#4165, run 671e7f41 low (b)).
+func newestStageByType(stages []Stage, typ string) *Stage {
+	var newest *Stage
+	for i := range stages {
+		if stages[i].Type != typ {
+			continue
+		}
+		if newest == nil || stages[i].Sequence > newest.Sequence {
+			newest = &stages[i]
+		}
+	}
+	return newest
+}
+
+// sliceIntegrationOf returns the run's capabilities.slice_integration block
+// (#4165), nil-safe through run and Capabilities. nil means UNDECIDABLE — a
+// list read, or an older backend whose capabilities block predates the key —
+// never "unavailable".
+func sliceIntegrationOf(run *Run) *runSliceIntegration {
+	if run == nil || run.Capabilities == nil {
+		return nil
+	}
+	return run.Capabilities.SliceIntegration
+}
+
 // integrationAuthorityAbsent is the read-side mirror of the server's
 // no-integration-authority stand-down (approval condition C3). The server's
-// acceptance gate admits without a coverage check where integrateSlices
-// graceful-skips — no GitHub client, or a run with no installation id — because
-// no slices_integrated record is ever written there. The MCP surface cannot see
-// that configuration, so it infers it from its one observable consequence: NO
-// fan-in record of any kind exists although the parent's implement stage has
-// already SUCCEEDED. Where integration authority exists that combination does
-// not arise: the parent's implement stage resolves succeeded only after
-// IntegrateSlices ran, and every non-skipped pass writes slices_integrated (a
-// succeeded child lacking slice_index now fails the pass closed instead of
-// being dropped). An unreadable parent stage ("") is never read as
+// decomposed-parent acceptance gate (guardDecomposedParentAcceptance, on both
+// the host-dispatch marker and acceptance-admission) admits without a coverage
+// check where orchestrator.SliceIntegrationUnavailable reports a reason — no
+// GitHub client, or a run with no installation id.
+//
+// authority is that SAME predicate, surfaced on GET /v0/runs/{run_id} as
+// capabilities.slice_integration (#4165). When it is present it is
+// AUTHORITATIVE: the answer is !authority.Available, and neither the fan-in
+// record nor the parent's stage state is consulted, exactly as the server gate
+// consults neither. So a parent whose slices_integrated append was lost (the
+// #4165 wedge, fanInRecordLost) is NOT read as authority-less.
+//
+// When authority is nil (an older backend, or a list read) it falls back to
+// the pre-#4165 inference from the one observable consequence of a missing
+// authority: NO fan-in record of any kind although the parent's implement
+// stage already SUCCEEDED. An unreadable parent stage ("") is never read as
 // authority-less, so a read failure cannot release a hold.
-func integrationAuthorityAbsent(cs *ChildrenStatus, parentImplementState string) bool {
-	return cs != nil && !cs.fanInRecorded && parentImplementState == "succeeded"
+func integrationAuthorityAbsent(cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) bool {
+	if cs == nil {
+		return false
+	}
+	if authority != nil {
+		return !authority.Available
+	}
+	return !cs.fanInRecorded && parentImplementState == "succeeded"
+}
+
+// fanInRecordLost reports the #4165 wedge: the server HAS slice-integration
+// authority, the parent's implement stage already SUCCEEDED (so the fan-in
+// ran), yet NO fan-in record of any kind exists and no integration failure is
+// recorded. The orchestrator's slices_integrated append is best-effort (it
+// WARN-logs a failed append), so the record can be lost while the stage
+// advances. The server gate then refuses acceptance 409
+// acceptance_integration_incomplete forever and nothing re-integrates
+// automatically; fishhawk_consolidate_slices answers 409 not_awaiting_children
+// on the advanced parent. The recovery is POST /v0/runs/{run_id}/integrate-wave,
+// the idempotent non-settling fan-in that rewrites the record without
+// transitioning the stage. Requires a POSITIVE authority signal: with nil
+// authority the C3 inference reads this snapshot as authority-less instead.
+func fanInRecordLost(cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) bool {
+	return cs != nil && authority != nil && authority.Available &&
+		!cs.fanInRecorded && cs.IntegrationFailure == nil && parentImplementState == "succeeded"
+}
+
+// fanInRecordLostRecovery names the integrate-wave recovery for the #4165
+// wedge, shared by the next_actions hold reason and fishhawk_await_children's
+// integration_pending message so the two surfaces name the same move.
+func fanInRecordLostRecovery(runID string) string {
+	return fmt.Sprintf("no slices_integrated record exists although the parent's implement stage already succeeded and the server HAS slice-integration authority — "+
+		"the best-effort slices_integrated append was lost (the orchestrator WARN-logs it). The server refuses an acceptance dispatch here with 409 acceptance_integration_incomplete "+
+		"and nothing re-integrates automatically (fishhawk_consolidate_slices answers 409 not_awaiting_children on an advanced parent). "+
+		"Recovery: POST /v0/runs/%s/integrate-wave (write:runs) — it re-runs the idempotent fan-in WITHOUT transitioning the stage and writes the missing record", runID)
 }
 
 // foldAcceptanceIntegrationHold is the pure next_actions hold (#4080). When the
 // run is a decomposed parent (cs != nil with at least one child) whose
 // integration phase is not integrated, it removes every acceptance dispatch
 // action, sets State to acceptance_held_integration_incomplete, and PREPENDS a
-// fishhawk_await_children action whose reason names the uncovered children or
-// the integration failure and the server's 409.
+// fishhawk_await_children action whose reason names the uncovered children,
+// the integration failure, or the lost fan-in record (#4165), and the
+// server's 409.
 //
 // It is a no-op when:
 //   - na or cs is nil (not a decomposed parent, or the snapshot was not read);
@@ -73,8 +143,9 @@ func integrationAuthorityAbsent(cs *ChildrenStatus, parentImplementState string)
 //   - no acceptance dispatch is offered;
 //   - integrationAuthorityAbsent (C3: the server stands down, so the display
 //     must not hold either — a deployment that cannot integrate is never
-//     wedged by this hold).
-func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImplementState string, na *NextActions) {
+//     wedged by this hold). authority is the server's own predicate when the
+//     backend surfaces it (#4165); nil falls back to the inference.
+func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration, na *NextActions) {
 	if na == nil || cs == nil || len(cs.Children) == 0 {
 		return
 	}
@@ -84,7 +155,7 @@ func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImple
 	if !offersAcceptanceDispatch(na) {
 		return
 	}
-	if integrationAuthorityAbsent(cs, parentImplementState) {
+	if integrationAuthorityAbsent(cs, parentImplementState, authority) {
 		return
 	}
 	kept := make([]SuggestedAction, 0, len(na.Actions)+1)
@@ -93,7 +164,7 @@ func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImple
 		Params:       map[string]string{"run_id": runID},
 		Precondition: "this decomposed parent's consolidated branch does not carry every child's slice yet",
 		Consumes:     "none",
-		Reason:       acceptanceIntegrationHoldReason(cs),
+		Reason:       acceptanceIntegrationHoldReason(runID, cs, parentImplementState, authority),
 	})
 	for _, a := range na.Actions {
 		if isAcceptanceDispatchAction(a) {
@@ -105,10 +176,14 @@ func foldAcceptanceIntegrationHold(runID string, cs *ChildrenStatus, parentImple
 	na.Actions = kept
 }
 
-// acceptanceIntegrationHoldReason names what is blocking: the integration
-// failure when one is newer than the newest clean integration, otherwise the
-// uncovered or non-succeeded children.
-func acceptanceIntegrationHoldReason(cs *ChildrenStatus) string {
+// acceptanceIntegrationHoldReason names what is blocking: the lost fan-in
+// record (#4165) first, then the integration failure when one is newer than
+// the newest clean integration, otherwise the uncovered or non-succeeded
+// children.
+func acceptanceIntegrationHoldReason(runID string, cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) string {
+	if fanInRecordLost(cs, parentImplementState, authority) {
+		return "acceptance held: " + fanInRecordLostRecovery(runID) + "; then re-invoke fishhawk_await_children"
+	}
 	const tail = "; the server refuses an acceptance dispatch here with 409 acceptance_integration_incomplete, so wait for the fan-in to cover every child"
 	if f := cs.IntegrationFailure; f != nil {
 		who := ""
@@ -139,6 +214,12 @@ func acceptanceIntegrationHoldReason(cs *ChildrenStatus) string {
 // strip its acceptance dispatch. It FAILS OPEN on a read error: next_actions is
 // display-only and the server's 409 is the authority, so a stale display cannot
 // cause a wrong-tree acceptance spawn.
+//
+// The no-authority decision keys on run.capabilities.slice_integration — the
+// server gate's own predicate (#4165) — read off the run the caller already
+// holds (zero extra reads); a run without it takes the C3 inference fallback.
+// The parent's implement state is the NEWEST implement stage by Sequence, so a
+// retried parent with two implement stages is not misread.
 func (r *runResolver) gateAcceptanceOnIntegration(ctx context.Context, runID uuid.UUID, run *Run, stages []Stage, na *NextActions) {
 	if run == nil || !offersAcceptanceDispatch(na) {
 		return
@@ -151,8 +232,8 @@ func (r *runResolver) gateAcceptanceOnIntegration(ctx context.Context, runID uui
 		return
 	}
 	parentImplementState := ""
-	if impl := stageByType(stages, "implement"); impl != nil {
+	if impl := newestStageByType(stages, "implement"); impl != nil {
 		parentImplementState = impl.State
 	}
-	foldAcceptanceIntegrationHold(runID.String(), cs, parentImplementState, na)
+	foldAcceptanceIntegrationHold(runID.String(), cs, parentImplementState, sliceIntegrationOf(run), na)
 }

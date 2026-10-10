@@ -461,8 +461,27 @@ func init() {
 // is exported, so encoding/json and the jsonschema reflector reach it exactly
 // as they would an exported type. If a consumer ever needs to name it,
 // exporting it is a one-line change plus a baseline row.
+//
+// SliceIntegration (#4165) is the server's decomposed-parent slice-integration
+// authority — orchestrator.SliceIntegrationUnavailable, the EXACT predicate the
+// server's decomposed-parent acceptance gate stands down on. THREE states:
+// Capabilities nil (a list read, or an older backend) OR SliceIntegration nil
+// (an older backend whose block predates the key) is UNDECIDABLE, so a caller
+// falls back to the "no fan-in record + parent implement succeeded" inference
+// (approval condition C3); PRESENT is the server gate's own answer and wins
+// over the inference. The backend always emits the key inside the block, so
+// the omitempty here only governs this mirror's own re-encoding.
 type runCapabilities struct {
-	ProductFeedbackProviders []string `json:"product_feedback_providers" jsonschema:"the deployment's registered feedback-provider ids. An EMPTY list means positively none is registered, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented"`
+	ProductFeedbackProviders []string             `json:"product_feedback_providers" jsonschema:"the deployment's registered feedback-provider ids. An EMPTY list means positively none is registered, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented"`
+	SliceIntegration         *runSliceIntegration `json:"slice_integration,omitempty" jsonschema:"whether the server can integrate a decomposed parent's slices (the decomposed-parent acceptance gate's own predicate). Absent means undecidable (an older backend), never unavailable"`
+}
+
+// runSliceIntegration mirrors the backend's runSliceIntegration (#4165 —
+// backend/internal/server/runs.go). The json tags MUST stay byte-identical
+// with the backend's. Unexported on the runCapabilities precedent above.
+type runSliceIntegration struct {
+	Available bool   `json:"available" jsonschema:"true when the server has slice-integration authority, so a decomposed parent's acceptance waits for a slices_integrated record covering every child"`
+	Reason    string `json:"reason,omitempty" jsonschema:"why the server has no slice-integration authority (e.g. GitHub not configured, run has no installation_id). Present only when available is false"`
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry
