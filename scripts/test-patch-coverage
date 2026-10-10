@@ -15,6 +15,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot=$(mktemp -d)
 cleanup_trap='rm -rf "$tmproot"'
 trap "$cleanup_trap" EXIT
@@ -63,9 +69,9 @@ fi
 # would still pass if a red harness failed to turn verify red — which is why the
 # behavioral cases (a3)-(a6) below drive the REAL function. (#2455 added test-dev.)
 harness_body="$(declare -f _verify_gate_harnesses)"
-if printf '%s' "$harness_body" | grep -q 'test-check-coverage' \
-   && printf '%s' "$harness_body" | grep -q 'test-patch-coverage' \
-   && printf '%s' "$harness_body" | grep -q 'test-dev' \
+if printf '%s' "$harness_body" | grep_q 'test-check-coverage' \
+   && printf '%s' "$harness_body" | grep_q 'test-patch-coverage' \
+   && printf '%s' "$harness_body" | grep_q 'test-dev' \
    && [ -x "$REPO_ROOT/scripts/test-check-coverage" ] \
    && [ -x "$REPO_ROOT/scripts/test-patch-coverage" ] \
    && [ -x "$REPO_ROOT/scripts/test-dev" ]; then
@@ -192,7 +198,7 @@ chmod +x "$fake/scripts/test-dev"
 mkdir -p "$tmproot/emptypath"
 ( set -e; PATH="$tmproot/emptypath"; ROOT="$fake"; _verify_gate_harnesses ) >"$tmproot/a5.out" 2>&1; rc=$?
 a5_out="$(cat "$tmproot/a5.out")"
-if [ "$rc" -eq 0 ] && printf '%s' "$a5_out" | grep -q 'zsh' \
+if [ "$rc" -eq 0 ] && printf '%s' "$a5_out" | grep_q 'zsh' \
    && [ ! -e "$fake/markers/test-dev" ]; then
   pass "(a5) test-dev is skipped (not failed) when zsh is unresolvable: rc=0, reason names zsh, stub never ran"
 else
@@ -208,7 +214,7 @@ make_harnesses "$fake" 0 0 0
 chmod -x "$fake/scripts/test-dev"
 ( set -e; ROOT="$fake"; _verify_gate_harnesses ) >"$tmproot/a6.out" 2>&1; rc=$?
 a6_out="$(cat "$tmproot/a6.out")"
-if [ "$rc" -eq 0 ] && printf '%s' "$a6_out" | grep -q 'missing or not executable' \
+if [ "$rc" -eq 0 ] && printf '%s' "$a6_out" | grep_q 'missing or not executable' \
    && [ -e "$fake/markers/test-check-coverage" ] && [ -e "$fake/markers/test-patch-coverage" ] \
    && [ ! -e "$fake/markers/test-dev" ]; then
   pass "(a6) a non-executable test-dev takes the documented skip; the other two still ran"
@@ -278,11 +284,11 @@ a7_out="$(cat "$tmproot/a7.out")"
 a7_lock_after="$(readlink "$tmproot/a7.lock" 2>/dev/null)"
 
 if [ "$rc" -eq 0 ] \
-   && ! printf '%s' "$a7_out" | grep -q 'waiting up to' \
-   && ! printf '%s' "$a7_out" | grep -q 'another RUNNER verify' \
+   && ! printf '%s' "$a7_out" | grep_q 'waiting up to' \
+   && ! printf '%s' "$a7_out" | grep_q 'another RUNNER verify' \
    && [ -e "$fake/markers/nested" ] \
-   && printf '%s' "$a7_out" | grep -qF "NESTED_LOCK:$nested_lock_expected" \
-   && printf '%s' "$a7_out" | grep -q 'NESTED_KIND:shell' \
+   && printf '%s' "$a7_out" | grep_q -F "NESTED_LOCK:$nested_lock_expected" \
+   && printf '%s' "$a7_out" | grep_q 'NESTED_KIND:shell' \
    && [ "$a7_lock_after" = "${a7_holder}:runner" ] \
    && [ ! -L "$nested_lock_expected" ]; then
   pass "(a7) a runner-injected verify lock override never reaches a gate harness's nested cmd_verify: no wait/refusal, nested verify keyed its own root as shell-kind, the pre-held lock is untouched, the nested lock is released"
@@ -458,7 +464,7 @@ printf 'ignored/\n' > "$ROOT/.gitignore"
 mkdir -p "$ROOT/ignored"
 printf 'package ignored\n\nfunc I() {}\n' > "$ROOT/ignored/i.go"
 got="$(_patch_cov_changed_modules main)"; rc=$?
-if [ "$rc" -eq 0 ] && ! printf '%s' "$got" | grep -q 'ignored'; then
+if [ "$rc" -eq 0 ] && ! printf '%s' "$got" | grep_q 'ignored'; then
   pass "(c6) a git-ignored untracked .go file is not bucketed"
 else
   fail "(c6) ignored-file bucketing (rc=$rc got='$got')"
@@ -582,7 +588,7 @@ case "$PATCHCOV_DIR" in
 esac
 if [ "$mk_rc" -eq 0 ] && [ -d "$PATCHCOV_DIR" ] && [ "$inside_repo" = no ] \
    && [ "$pid_keyed" = yes ] \
-   && printf '%s' "$armed_trap" | grep -q '_patchcov_cleanup'; then
+   && printf '%s' "$armed_trap" | grep_q '_patchcov_cleanup'; then
   pass "(d1) profile dir is PID-keyed, outside the repo, and swept by an EXIT trap"
 else
   fail "(d1) profile dir contract (rc=$mk_rc dir='$PATCHCOV_DIR' inside_repo=$inside_repo pid_keyed=$pid_keyed trap='$armed_trap')"
@@ -621,8 +627,8 @@ else
 fi
 
 # The EXIT handler must reap the shared container ONLY when a lease was armed.
-if printf '%s' "$EXIT_TRAP" | grep -q 'LEASE_ARMED' \
-   && printf '%s' "$EXIT_TRAP" | grep -q '_reap_shared_container'; then
+if printf '%s' "$EXIT_TRAP" | grep_q 'LEASE_ARMED' \
+   && printf '%s' "$EXIT_TRAP" | grep_q '_reap_shared_container'; then
   pass "(d3) the EXIT handler gates the container reap on LEASE_ARMED"
 else
   fail "(d3) EXIT_TRAP does not gate the reap on LEASE_ARMED ('$EXIT_TRAP')"
@@ -640,8 +646,8 @@ PATCHCOV_DIR="$tmproot/emptyprof"; mkdir -p "$PATCHCOV_DIR"
 printf '{"schema":1,"skip":"none"}' > "$PATCHCOV_DIR/changed-snapshot.json"
 PATCHCOV_SNAPSHOT_DIGEST="$(_sha256_file "$PATCHCOV_DIR/changed-snapshot.json")"
 out="$(_verify_patch_coverage main 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP' \
-   && ! printf '%s' "$out" | grep -q 'FAIL'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'SKIP' \
+   && ! printf '%s' "$out" | grep_q 'FAIL'; then
   pass "(e) a skip-snapshot with no emitted profiles skips (exit 0)"
 else
   fail "(e) expected 0 + skip on a skip-snapshot with no profiles (rc=$rc out='$out')"
@@ -652,8 +658,8 @@ fi
 # missing snapshot rather than skipping.
 rm -f "$PATCHCOV_DIR/changed-snapshot.json"
 out="$(_verify_patch_coverage main 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'missing or unreadable' \
-   && ! printf '%s' "$out" | grep -q 'no coverage profiles'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'missing or unreadable' \
+   && ! printf '%s' "$out" | grep_q 'no coverage profiles'; then
   pass "(e2) a missing snapshot fails closed before the no-profiles skip (exit 1)"
 else
   fail "(e2) expected fail-closed on missing snapshot (rc=$rc out='$out')"
@@ -664,8 +670,8 @@ fi
 # digest mismatch fails closed.
 printf '{"schema":1,"skip":"pwned"}' > "$PATCHCOV_DIR/changed-snapshot.json"
 out="$(_verify_patch_coverage main 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'digest mismatch' \
-   && ! printf '%s' "$out" | grep -q 'no coverage profiles'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'digest mismatch' \
+   && ! printf '%s' "$out" | grep_q 'no coverage profiles'; then
   pass "(e3) a tampered snapshot fails closed before the no-profiles skip (exit 1)"
 else
   fail "(e3) expected fail-closed on digest mismatch (rc=$rc out='$out')"
@@ -698,10 +704,10 @@ cmd_test() { echo "PLAIN_TEST"; echo "LOCK_HELD:$VERIFY_LOCK_HELD"; }
 
 ROOT="$tmproot/testonly"          # a _test.go-only diff -> nothing to gate
 out="$(cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
-   && printf '%s' "$out" | grep -q 'no changed Go packages' \
-   && ! printf '%s' "$out" | grep -q 'COV_GATE' \
-   && printf '%s' "$out" | grep -qF "LOCK_HELD:$tmproot/f-verify.lock" \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep_q 'no changed Go packages' \
+   && ! printf '%s' "$out" | grep_q 'COV_GATE' \
+   && printf '%s' "$out" | grep_q -F "LOCK_HELD:$tmproot/f-verify.lock" \
    && [ ! -L "$tmproot/f-verify.lock" ]; then
   pass "(f1) no changed Go packages: plain cmd_test, printed reason, gate not run, own lock key acquired and released"
 else
@@ -710,18 +716,18 @@ fi
 
 ROOT="$tmproot/buckets"
 out="$(cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'COV_TEST:' \
-   && printf '%s' "$out" | grep -q 'COV_GATE:main' \
-   && ! printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'COV_TEST:' \
+   && printf '%s' "$out" | grep_q 'COV_GATE:main' \
+   && ! printf '%s' "$out" | grep_q 'PLAIN_TEST'; then
   pass "(f2) changed Go packages: the coverage loop and the patch gate both run"
 else
   fail "(f2) changed-Go path (rc=$rc out='$out')"
 fi
 
 out="$(FISHHAWK_SKIP_PATCH_COVERAGE=1 cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
-   && printf '%s' "$out" | grep -q 'FISHHAWK_SKIP_PATCH_COVERAGE' \
-   && ! printf '%s' "$out" | grep -q 'COV_GATE'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep_q 'FISHHAWK_SKIP_PATCH_COVERAGE' \
+   && ! printf '%s' "$out" | grep_q 'COV_GATE'; then
   pass "(f3) FISHHAWK_SKIP_PATCH_COVERAGE takes the plain path with a printed reason"
 else
   fail "(f3) skip-override path (rc=$rc out='$out')"
@@ -729,8 +735,8 @@ fi
 
 ROOT="$tmproot/nogit"
 out="$(cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
-   && printf '%s' "$out" | grep -q 'no usable diff base'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep_q 'no usable diff base'; then
   pass "(f4) an unusable diff base degrades to plain cmd_test with a printed reason"
 else
   fail "(f4) unusable-base path (rc=$rc out='$out')"
@@ -738,8 +744,8 @@ fi
 
 ROOT="$tmproot/nomb"
 out="$(cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
-   && printf '%s' "$out" | grep -q 'could not bucket changed Go files'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep_q 'could not bucket changed Go files'; then
   pass "(f5) an unbucketable diff degrades to plain cmd_test with a printed reason"
 else
   fail "(f5) bucketing-failure path (rc=$rc out='$out')"
@@ -747,8 +753,8 @@ fi
 
 ROOT="$tmproot/base"
 out="$(PATH=/nonexistent cmd_verify 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
-   && printf '%s' "$out" | grep -q 'no usable diff base'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep_q 'no usable diff base'; then
   pass "(f6) git absent degrades to plain cmd_test with a printed reason"
 else
   fail "(f6) git-absent path (rc=$rc out='$out')"
@@ -794,11 +800,11 @@ _patchcov_cleanup
 backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
 cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
 if [ "$e2e_rc" -eq 0 ] \
-   && printf '%s' "$backend_cmd" | grep -q -- '-coverpkg=./internal/foo' \
-   && printf '%s' "$backend_cmd" | grep -q -- '-coverprofile=' \
-   && printf '%s' "$backend_cmd" | grep -q -- './\.\.\.' \
-   && printf '%s' "$cli_cmd" | grep -q 'test -race' \
-   && ! printf '%s' "$cli_cmd" | grep -q -- '-coverpkg'; then
+   && printf '%s' "$backend_cmd" | grep_q -- '-coverpkg=./internal/foo' \
+   && printf '%s' "$backend_cmd" | grep_q -- '-coverprofile=' \
+   && printf '%s' "$backend_cmd" | grep_q -- './\.\.\.' \
+   && printf '%s' "$cli_cmd" | grep_q 'test -race' \
+   && ! printf '%s' "$cli_cmd" | grep_q -- '-coverpkg'; then
   pass "(g) changed module runs ./... with -coverpkg restricted; other modules unchanged"
 else
   fail "(g) e2e loop (rc=$e2e_rc backend='$backend_cmd' cli='$cli_cmd')"
@@ -854,8 +860,8 @@ _patchcov_cleanup
 g3_backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
 g3_cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
 if [ "$g3_default_rc" -eq 0 ] \
-   && printf '%s' "$g3_backend_cmd" | grep -q -- '-timeout 20m' \
-   && printf '%s' "$g3_cli_cmd" | grep -q -- '-timeout 20m'; then
+   && printf '%s' "$g3_backend_cmd" | grep_q -- '-timeout 20m' \
+   && printf '%s' "$g3_cli_cmd" | grep_q -- '-timeout 20m'; then
   pass "(g3) default -timeout 20m reaches both the instrumented and plain branches"
 else
   fail "(g3) default -timeout (rc=$g3_default_rc backend='$g3_backend_cmd' cli='$g3_cli_cmd')"
@@ -881,8 +887,8 @@ _patchcov_cleanup
 g3o_backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
 g3o_cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
 if [ "$g3_override_rc" -eq 0 ] \
-   && printf '%s' "$g3o_backend_cmd" | grep -q -- '-timeout 7m' \
-   && printf '%s' "$g3o_cli_cmd" | grep -q -- '-timeout 7m'; then
+   && printf '%s' "$g3o_backend_cmd" | grep_q -- '-timeout 7m' \
+   && printf '%s' "$g3o_cli_cmd" | grep_q -- '-timeout 7m'; then
   pass "(g3) FISHHAWK_TEST_TIMEOUT=7m is reflected in both branches' argv"
 else
   fail "(g3) FISHHAWK_TEST_TIMEOUT override (rc=$g3_override_rc backend='$g3o_backend_cmd' cli='$g3o_cli_cmd')"
@@ -900,9 +906,9 @@ _arm_container_lease() { :; }
 g3_test_body="$(declare -f cmd_test)"
 g3_scoped_body="$(declare -f cmd_test_scoped)"
 g3_coverage_body="$(declare -f cmd_coverage)"
-if printf '%s' "$g3_test_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
-   && printf '%s' "$g3_scoped_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
-   && printf '%s' "$g3_coverage_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"'; then
+if printf '%s' "$g3_test_body" | grep_q -- '-timeout "\$TEST_TIMEOUT"' \
+   && printf '%s' "$g3_scoped_body" | grep_q -- '-timeout "\$TEST_TIMEOUT"' \
+   && printf '%s' "$g3_coverage_body" | grep_q -- '-timeout "\$TEST_TIMEOUT"'; then
   pass "(g3 static) cmd_test / cmd_test_scoped / cmd_coverage all carry -timeout \"\$TEST_TIMEOUT\""
 else
   fail "(g3 static) missing -timeout \"\$TEST_TIMEOUT\" in cmd_test/cmd_test_scoped/cmd_coverage"
@@ -985,11 +991,11 @@ printf 'mode: atomic\n' > "$kroot/backend/coverage.out"
 k_run
 k1_argv="$(cat "$KCOV_ARGV")"
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q '>>> \./backend' \
-   && printf '%s' "$out" | grep -q '>>> \./cli' \
-   && printf '%s' "$out" | grep -q -- '- \./backend (tests failed)' \
-   && printf '%s' "$k1_argv" | grep -q -- './cli/coverage.out' \
-   && ! printf '%s' "$k1_argv" | grep -q -- './backend/coverage.out'; then
+   && printf '%s' "$out" | grep_q '>>> \./backend' \
+   && printf '%s' "$out" | grep_q '>>> \./cli' \
+   && printf '%s' "$out" | grep_q -- '- \./backend (tests failed)' \
+   && printf '%s' "$k1_argv" | grep_q -- './cli/coverage.out' \
+   && ! printf '%s' "$k1_argv" | grep_q -- './backend/coverage.out'; then
   pass "(k1) a failing module no longer hides later modules; its stale profile is not credited"
 else
   fail "(k1) aggregation/stale-profile (rc=$rc out='$out' argv='$k1_argv')"
@@ -999,9 +1005,9 @@ fi
 KGO_FAIL="cli" KGO_BUILDFAIL="backend"
 k_run
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q -- '- \./backend (build failed)' \
-   && printf '%s' "$out" | grep -q -- '- \./cli (tests failed)' \
-   && printf '%s' "$out" | grep -q 'scripts/test: 2 of 2 modules failed:'; then
+   && printf '%s' "$out" | grep_q -- '- \./backend (build failed)' \
+   && printf '%s' "$out" | grep_q -- '- \./cli (tests failed)' \
+   && printf '%s' "$out" | grep_q 'scripts/test: 2 of 2 modules failed:'; then
   pass "(k2) failures are classified build-vs-test from go's [build failed] marker"
 else
   fail "(k2) build-vs-test classification (rc=$rc out='$out')"
@@ -1019,11 +1025,11 @@ _covlog_mktemp() { return 1; }
 k_run
 k2d_argv="$(cat "$KCOV_ARGV")"
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'failures will be reported unclassified' \
-   && printf '%s' "$out" | grep -q -- '- \./backend (failed, unclassified)' \
-   && ! printf '%s' "$out" | grep -q -- '- \./cli' \
-   && printf '%s' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
-   && printf '%s' "$k2d_argv" | grep -q -- './cli/coverage.out'; then
+   && printf '%s' "$out" | grep_q 'failures will be reported unclassified' \
+   && printf '%s' "$out" | grep_q -- '- \./backend (failed, unclassified)' \
+   && ! printf '%s' "$out" | grep_q -- '- \./cli' \
+   && printf '%s' "$out" | grep_q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s' "$k2d_argv" | grep_q -- './cli/coverage.out'; then
   pass "(k2d) a failed log-dir mktemp degrades the LABEL only — no tee, every module still runs"
 else
   fail "(k2d) mktemp degrade (rc=$rc out='$out' argv='$k2d_argv')"
@@ -1040,9 +1046,9 @@ KGO_FAIL="" KGO_BUILDFAIL=""
 k_run
 k3_argv="$(cat "$KCOV_ARGV")"
 if [ "$rc" -eq 0 ] \
-   && printf '%s' "$k3_argv" | grep -q -- './backend/coverage.out' \
-   && printf '%s' "$k3_argv" | grep -q -- './cli/coverage.out' \
-   && ! printf '%s' "$out" | grep -q 'modules failed:'; then
+   && printf '%s' "$k3_argv" | grep_q -- './backend/coverage.out' \
+   && printf '%s' "$k3_argv" | grep_q -- './cli/coverage.out' \
+   && ! printf '%s' "$out" | grep_q 'modules failed:'; then
   pass "(k3) all-green: rc 0 and both profiles reach the aggregate gate"
 else
   fail "(k3) all-green passthrough (rc=$rc out='$out' argv='$k3_argv')"
@@ -1056,7 +1062,7 @@ KGO_FAIL="backend cli" KGO_BUILDFAIL=""
 k_run
 k4_argv="$(cat "$KCOV_ARGV")"
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'no coverage profiles were produced' \
+   && printf '%s' "$out" | grep_q 'no coverage profiles were produced' \
    && [ ! -s "$KCOV_ARGV" ]; then
   pass "(k4) zero surviving profiles: printed reason, gate never invoked, still rc non-zero"
 else
@@ -1074,8 +1080,8 @@ modules() { printf ''; }
 k_run
 k5b_rc=$rc; k5b_out="$out"
 eval "$k5_saved"
-if [ "$k5a_rc" -ne 0 ] && printf '%s' "$k5a_out" | grep -q 'refusing to report success' \
-   && [ "$k5b_rc" -ne 0 ] && printf '%s' "$k5b_out" | grep -q 'refusing to report success'; then
+if [ "$k5a_rc" -ne 0 ] && printf '%s' "$k5a_out" | grep_q 'refusing to report success' \
+   && [ "$k5b_rc" -ne 0 ] && printf '%s' "$k5b_out" | grep_q 'refusing to report success'; then
   pass "(k5) cmd_coverage fails closed on an unavailable AND on an empty module list"
 else
   fail "(k5) module-list fail-closed (a: rc=$k5a_rc out='$k5a_out'; b: rc=$k5b_rc out='$k5b_out')"
@@ -1085,7 +1091,7 @@ fi
 #      cmd_coverage must return non-zero (the `return "$cov_rc"` tail).
 KGO_FAIL="" KGO_BUILDFAIL="" COVGATE_RC=1
 k_run
-if [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q 'modules failed:'; then
+if [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep_q 'modules failed:'; then
   pass "(k6) all modules pass but the aggregate gate fails -> cmd_coverage returns non-zero"
 else
   fail "(k6) coverage-gate failure with no module failures (rc=$rc out='$out')"
@@ -1097,8 +1103,8 @@ fi
 KGO_FAIL="backend" KGO_BUILDFAIL="" COVGATE_RC=1
 k_run
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
-   && printf '%s' "$out" | grep -q -- '- \./backend (tests failed)'; then
+   && printf '%s' "$out" | grep_q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s' "$out" | grep_q -- '- \./backend (tests failed)'; then
   pass "(k7) a failing gate does not suppress the per-module failure summary"
 else
   fail "(k7) summary survives a failing coverage gate (rc=$rc out='$out')"
@@ -1110,8 +1116,8 @@ COVGATE_RC=0
 #      fail-closed block exists to catch. `declare -f` is captured ONCE and
 #      matched in the form bash actually prints (binding condition 3).
 k8_body="$(declare -f cmd_coverage)"
-if printf '%s\n' "$k8_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
-   && ! printf '%s\n' "$k8_body" | grep -q '< <(modules)'; then
+if printf '%s\n' "$k8_body" | grep_q -- '-timeout "\$TEST_TIMEOUT"' \
+   && ! printf '%s\n' "$k8_body" | grep_q '< <(modules)'; then
   pass "(k8) cmd_coverage keeps -timeout \"\$TEST_TIMEOUT\" and does not feed from < <(modules)"
 else
   fail "(k8) cmd_coverage static shape ('$k8_body')"
@@ -1155,9 +1161,9 @@ m_run cmd_test
 if [ "$rc" -ne 0 ] \
    && grep -q '^backend|' "$KGO_LOG" \
    && grep -q '^cli|' "$KGO_LOG" \
-   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
-   && printf '%s\n' "$out" | grep -qxF -- '  - ./backend' \
-   && ! printf '%s\n' "$out" | grep -qF -- '  - ./cli'; then
+   && printf '%s\n' "$out" | grep_q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep_q -xF -- '  - ./backend' \
+   && ! printf '%s\n' "$out" | grep_q -F -- '  - ./cli'; then
   pass "(m1) cmd_test: a failing first module no longer hides the second; summary names it; rc non-zero"
 else
   fail "(m1) cmd_test aggregation (rc=$rc out='$out' log='$(cat "$KGO_LOG")')"
@@ -1170,7 +1176,7 @@ m_run cmd_test
 if [ "$rc" -eq 0 ] \
    && grep -q '^backend|' "$KGO_LOG" \
    && grep -q '^cli|' "$KGO_LOG" \
-   && ! printf '%s\n' "$out" | grep -q 'modules failed'; then
+   && ! printf '%s\n' "$out" | grep_q 'modules failed'; then
   pass "(m2) cmd_test all-green: rc 0, both modules ran, no failure summary"
 else
   fail "(m2) cmd_test all-green control (rc=$rc out='$out')"
@@ -1182,11 +1188,11 @@ fi
 KGO_FAIL="backend" KGO_BUILDFAIL=""
 m_run cmd_test_with_patch_coverage "$m_mods" main
 if [ "$rc" -ne 0 ] \
-   && grep '^backend|' "$KGO_LOG" | grep -q -- '-coverpkg=./internal/foo' \
+   && grep '^backend|' "$KGO_LOG" | grep_q -- '-coverpkg=./internal/foo' \
    && grep -q '^cli|' "$KGO_LOG" \
-   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
-   && printf '%s\n' "$out" | grep -qxF -- '  - ./backend' \
-   && ! printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED'; then
+   && printf '%s\n' "$out" | grep_q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep_q -xF -- '  - ./backend' \
+   && ! printf '%s\n' "$out" | grep_q 'PATCH_GATE_REACHED'; then
   pass "(m3) patch-coverage loop: instrumented module fails, later module still runs, gate not reached"
 else
   fail "(m3) patch-coverage loop aggregation, instrumented branch (rc=$rc out='$out' log='$(cat "$KGO_LOG")')"
@@ -1198,9 +1204,9 @@ KGO_FAIL="cli" KGO_BUILDFAIL=""
 m_run cmd_test_with_patch_coverage "$m_mods" main
 if [ "$rc" -ne 0 ] \
    && grep -q '^backend|' "$KGO_LOG" \
-   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
-   && printf '%s\n' "$out" | grep -qxF -- '  - ./cli' \
-   && ! printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED'; then
+   && printf '%s\n' "$out" | grep_q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep_q -xF -- '  - ./cli' \
+   && ! printf '%s\n' "$out" | grep_q 'PATCH_GATE_REACHED'; then
   pass "(m4) patch-coverage loop: a failing plain-branch module is summarised and the gate not reached"
 else
   fail "(m4) patch-coverage loop aggregation, plain branch (rc=$rc out='$out')"
@@ -1211,8 +1217,8 @@ fi
 KGO_FAIL="" KGO_BUILDFAIL=""
 m_run cmd_test_with_patch_coverage "$m_mods" main
 if [ "$rc" -eq 0 ] \
-   && printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED:main' \
-   && ! printf '%s\n' "$out" | grep -q 'modules failed'; then
+   && printf '%s\n' "$out" | grep_q 'PATCH_GATE_REACHED:main' \
+   && ! printf '%s\n' "$out" | grep_q 'modules failed'; then
   pass "(m5) patch-coverage loop all-green: rc 0, no summary, the gate is reached"
 else
   fail "(m5) patch-coverage loop all-green control (rc=$rc out='$out')"
@@ -1231,8 +1237,8 @@ modules() { return 1; }
 cmd_test() { echo "PLAIN_TEST"; }
 out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main 2>&1)"; rc=$?
 eval "$saved_trap"
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'could not enumerate go.work modules' \
-   && printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep_q 'could not enumerate go.work modules' \
+   && printf '%s' "$out" | grep_q 'PLAIN_TEST'; then
   pass "(i1) module enumeration failing in the coverage loop degrades to the plain loop"
 else
   fail "(i1) coverage-loop module-list degrade (rc=$rc out='$out')"
@@ -1243,14 +1249,14 @@ fi
 FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
 set +e
 out="$(modules() { return 1; }; cmd_test 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'refusing to report success'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'refusing to report success'; then
   pass "(i2) cmd_test fails closed when no modules can be enumerated"
 else
   fail "(i2) plain-loop fail-closed (rc=$rc out='$out')"
 fi
 
 out="$(modules() { printf ''; }; cmd_test 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'refusing to report success'; then
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep_q 'refusing to report success'; then
   pass "(i3) cmd_test fails closed on an EMPTY module list"
 else
   fail "(i3) empty-module-list fail-closed (rc=$rc out='$out')"
@@ -1335,8 +1341,8 @@ EOF
   _patchcov_cleanup
 
   if [ "$loop_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] \
-     && printf '%s' "$gate_out" | grep -q 'PATCH PASS' \
-     && printf '%s' "$gate_out" | grep -qE 'Patch coverage: ([0-9]+)/\1 = 100\.0%'; then
+     && printf '%s' "$gate_out" | grep_q 'PATCH PASS' \
+     && printf '%s' "$gate_out" | grep_q -E 'Patch coverage: ([0-9]+)/\1 = 100\.0%'; then
     pass "(j) a sibling package's test credits changed code: 100% patch coverage, PATCH PASS"
   else
     fail "(j) sibling attribution (loop_rc=$loop_rc gate_rc=$gate_rc out='$gate_out' log='$(tail -5 "$tmproot/realcov.log")')"
@@ -1454,9 +1460,9 @@ ROOT="$tmproot/adv1"
 adv_repo "$ROOT"
 run_adv revert "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'backend/internal/foo/foo.go:7' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP: no changed'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'backend/internal/foo/foo.go:7' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP: no changed'; then
   pass "(t1) a mid-loop revert of a changed tracked .go file fails closed, never a passing SKIP"
 else
   fail "(t1) tracked-revert (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
@@ -1474,9 +1480,9 @@ printf 'package foo\n\nfunc Fresh(a int) int {\n\tif a > 0 {\n\t\treturn a\n\t}\
   > "$ROOT/backend/internal/foo/brand_new.go"   # UNTRACKED
 run_adv delnew "$tmproot/adv_new.out"
 if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'brand_new.go' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP: no'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'brand_new.go' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP: no'; then
   pass "(t2) a mid-loop delete of an untracked new .go file fails closed, never a passing SKIP"
 else
   fail "(t2) untracked-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
@@ -1489,9 +1495,9 @@ ROOT="$tmproot/adv3"
 adv_repo "$ROOT"
 run_adv skipsnap "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP'; then
   pass "(t3) a snapshot rewritten to a skip-snapshot mid-loop fails closed (digest mismatch), never a SKIP"
 else
   fail "(t3) snapshot->skip tamper (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
@@ -1504,9 +1510,9 @@ ROOT="$tmproot/adv4"
 adv_repo "$ROOT"
 run_adv dropfile "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP'; then
   pass "(t4) a snapshot rewritten to drop the changed file fails closed (digest mismatch), never a SKIP"
 else
   fail "(t4) snapshot->drop-file tamper (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
@@ -1524,7 +1530,7 @@ ROOT="$tmproot/adv5"
 adv_repo "$ROOT"
 run_adv none "$tmproot/adv_foo_cov.out"
 if [ "$ADV_GATE_RC" -eq 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS'; then
   pass "(t5) with no mutation the snapshot pipeline passes and the snapshot exists post-loop"
 else
   fail "(t5) clean-run control (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
@@ -1537,8 +1543,8 @@ emit_ln=$(printf '%s\n' "$covbody" | grep -n '_patch_cov_emit_snapshot' | head -
 loop_ln=$(printf '%s\n' "$covbody" | grep -n 'go test' | head -1 | cut -d: -f1)
 vbody="$(declare -f _verify_patch_coverage)"
 if [ -n "$emit_ln" ] && [ -n "$loop_ln" ] && [ "$emit_ln" -lt "$loop_ln" ] \
-   && printf '%s' "$vbody" | grep -q -- '--changed-snapshot' \
-   && printf '%s' "$vbody" | grep -q -- '--expected-snapshot-digest'; then
+   && printf '%s' "$vbody" | grep_q -- '--changed-snapshot' \
+   && printf '%s' "$vbody" | grep_q -- '--expected-snapshot-digest'; then
   pass "(t6) emit precedes the go-test loop; the gate consumes --changed-snapshot with a digest"
 else
   fail "(t6) wiring (emit_ln=$emit_ln loop_ln=$loop_ln vbody has snapshot flags?)"
@@ -1546,7 +1552,7 @@ fi
 
 # (t7) the digest anchor is held in parent memory only: never exported, never
 # written under the profile dir where a test could read it.
-if ! printf '%s' "$(export -p)" | grep -q 'PATCHCOV_SNAPSHOT_DIGEST'; then
+if ! printf '%s' "$(export -p)" | grep_q 'PATCHCOV_SNAPSHOT_DIGEST'; then
   pass "(t7) the snapshot digest is not exported into the test subprocess environment"
 else
   fail "(t7) PATCHCOV_SNAPSHOT_DIGEST is exported (must stay in parent memory only)"
@@ -1560,10 +1566,10 @@ ROOT="$tmproot/adv8"
 adv_repo "$ROOT"
 run_adv delsnap "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = no ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'missing or unreadable' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'missing or unreadable' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'no coverage profiles' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP'; then
   pass "(t8) deleting the snapshot AND the profile fails closed before the no-profiles skip"
 else
   fail "(t8) combined snapshot-delete + no-profile (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
@@ -1576,10 +1582,10 @@ ROOT="$tmproot/adv9"
 adv_repo "$ROOT"
 run_adv tampernoprof "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'no coverage profiles' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP'; then
   pass "(t9) tampering the snapshot AND removing the profile fails closed (digest mismatch), never a SKIP"
 else
   fail "(t9) combined snapshot-tamper + no-profile (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
@@ -1598,7 +1604,7 @@ eval "$saved_trap"
 _patchcov_cleanup
 eval "$orig_emit"   # restore the sourced original (unset -f would delete it)
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'failed to capture the pre-test changed-line snapshot'; then
+   && printf '%s' "$out" | grep_q 'failed to capture the pre-test changed-line snapshot'; then
   pass "(t10) a failed snapshot emit fails the coverage loop closed (non-zero)"
 else
   fail "(t10) emit-fail-closed (rc=$rc out='$out')"
@@ -1616,7 +1622,7 @@ eval "$saved_trap"
 _patchcov_cleanup
 eval "$orig_sha"   # restore the sourced original (unset -f would delete it)
 if [ "$rc" -ne 0 ] \
-   && printf '%s' "$out" | grep -q 'could not anchor the snapshot digest'; then
+   && printf '%s' "$out" | grep_q 'could not anchor the snapshot digest'; then
   pass "(t11) a failed digest anchor fails the coverage loop closed (non-zero)"
 else
   fail "(t11) digest-anchor-fail-closed (rc=$rc out='$out')"
@@ -1632,9 +1638,9 @@ ROOT="$tmproot/adv12"
 adv_repo "$ROOT"
 run_adv delprof "$tmproot/adv_foo.out"
 if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
-   && printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles were produced' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
-   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+   && printf '%s' "$ADV_GATE_OUT" | grep_q 'no coverage profiles were produced' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep_q 'SKIP'; then
   pass "(t12) a pristine snapshot with a non-empty change set and zero profiles fails closed, never a SKIP"
 else
   fail "(t12) pristine-snapshot profile-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
@@ -1661,8 +1667,8 @@ out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./inte
 eval "$saved_trap"
 eval "$orig_mktemp"   # restore the sourced original (unset -f would delete it)
 if [ "$rc" -eq 0 ] \
-   && printf '%s' "$out" | grep -q 'could not create the coverage scratch dir' \
-   && printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+   && printf '%s' "$out" | grep_q 'could not create the coverage scratch dir' \
+   && printf '%s' "$out" | grep_q 'PLAIN_TEST'; then
   pass "(t13) a failed coverage-scratch-dir mktemp degrades to the plain loop (gate skipped, exit 0)"
 else
   fail "(t13) mktemp-degrade (rc=$rc out='$out')"

@@ -28,6 +28,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 if ! command -v helm >/dev/null 2>&1; then
   echo "scripts/test-helm-render: helm absent from PATH — skipping the chart render gate"
   exit 0
@@ -55,7 +61,7 @@ render() {
 
 # assert_contains <label> <haystack> <needle>
 assert_contains() {
-  if printf '%s' "$2" | grep -qF -- "$3"; then pass "$1"; else
+  if printf '%s' "$2" | grep_q -F -- "$3"; then pass "$1"; else
     fail "$1 (expected to find: $3)"
   fi
 }
@@ -65,14 +71,14 @@ assert_contains() {
 # text — the rendered manifest carries explanatory comments that name the field,
 # and a substring match would be satisfied by those comments alone.
 assert_field_absent() {
-  if printf '%s' "$2" | grep -qE "^[[:space:]]*$3:"; then
+  if printf '%s' "$2" | grep_q -E "^[[:space:]]*$3:"; then
     fail "$1 (unexpectedly rendered the field: $3)"
   else pass "$1"; fi
 }
 
 # assert_absent <label> <haystack> <needle>
 assert_absent() {
-  if printf '%s' "$2" | grep -qF -- "$3"; then
+  if printf '%s' "$2" | grep_q -F -- "$3"; then
     fail "$1 (unexpectedly found: $3)"
   else pass "$1"; fi
 }
@@ -88,7 +94,7 @@ assert_render_ok() {
 assert_render_fails() {
   if [ "$status" -eq 0 ]; then
     fail "$1 (render succeeded; expected a failure naming: $2)"
-  elif printf '%s' "$err" | grep -qF -- "$2"; then
+  elif printf '%s' "$err" | grep_q -F -- "$2"; then
     pass "$1"
   else
     fail "$1 (failed, but stderr did not name: $2 — got: $(printf '%s' "$err" | tail -2))"
@@ -1446,7 +1452,7 @@ fi
 reverse_ok=1
 while IFS= read -r k; do
   [ -n "$k" ] || continue
-  if ! printf '%s\n' "$emitted_keys" | grep -qxF -- "$k"; then
+  if ! printf '%s\n' "$emitted_keys" | grep_q -xF -- "$k"; then
     fail "r12g anti-drift (reverse): fishhawk.managedConfigKeys lists $k but the all-config-keys fixture never emits it (stale/misspelled entry, or a key the fixture leaves unset)"
     reverse_ok=0
   fi
@@ -2986,7 +2992,7 @@ else
     else
       fail "r15e degraded-network harness run should exit 0 (got rc=$selftest_rc): $(printf '%s' "$selftest_out" | tail -3)"
     fi
-    if printf '%s' "$selftest_out" | grep -qF 'SKIPPING the live registry probes'; then
+    if printf '%s' "$selftest_out" | grep_q -F 'SKIPPING the live registry probes'; then
       pass "r15e degraded-network run exercises the r15b sentinel skip branch (prints the skip reason)"
     else
       fail "r15e degraded-network run should print the r15b skip reason (got: $(printf '%s' "$selftest_out" | tail -3))"

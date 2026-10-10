@@ -27,6 +27,12 @@ git -C "$tmpdir" branch -m main
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 # Create a branch, commit to it, then merge it back into main.
 git -C "$tmpdir" checkout -q -b merged-branch
 echo "merged" > "$tmpdir/merged.txt"
@@ -91,8 +97,8 @@ fi
 
 # Case 4: the warning names the holding worktree path (resolved realpath) and
 # points at scripts/dev sweep.
-if printf '%s' "$output" | grep -qF "$held_wt_resolved" \
-  && printf '%s' "$output" | grep -qF "scripts/dev sweep"; then
+if printf '%s' "$output" | grep_q -F "$held_wt_resolved" \
+  && printf '%s' "$output" | grep_q -F "scripts/dev sweep"; then
   pass "warning names the holding worktree path and scripts/dev sweep"
 else
   fail "warning should name '$held_wt_resolved' and 'scripts/dev sweep' (output: $output)"

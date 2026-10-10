@@ -15,6 +15,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot=$(mktemp -d)
 trap 'rm -rf "$tmproot"' EXIT
 
@@ -62,11 +68,11 @@ EOF
 run_check "$c2"
 if [ "$status" -ne 1 ]; then
   fail "c2: banned term exited $status (expected 1); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'page\.md'; then
+elif ! printf '%s\n' "$out" | grep_q 'page\.md'; then
   fail "c2: report does not name the file; output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'page\.md:5:'; then
+elif ! printf '%s\n' "$out" | grep_q 'page\.md:5:'; then
   fail "c2: report does not name line 5; output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'empower'; then
+elif ! printf '%s\n' "$out" | grep_q 'empower'; then
   fail "c2: report does not name the matched term; output: $out"
 else
   pass "c2: banned term exits 1 and names file, line number and term"
@@ -90,7 +96,7 @@ EOF
 run_check "$c3"
 if [ "$status" -ne 1 ]; then
   fail "c3: mixed-case banned terms exited $status (expected 1); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'frictionless'; then
+elif ! printf '%s\n' "$out" | grep_q 'frictionless'; then
   fail "c3: mixed-case 'Frictionless' not matched; output: $out"
 else
   pass "c3: matching is case-insensitive"
@@ -149,9 +155,9 @@ EOF
 run_check "$c5"
 if [ "$status" -ne 1 ]; then
   fail "c5: two offending pages exited $status (expected 1); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'alpha\.md'; then
+elif ! printf '%s\n' "$out" | grep_q 'alpha\.md'; then
   fail "c5: report does not name the FIRST offending page; output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'omega\.md'; then
+elif ! printf '%s\n' "$out" | grep_q 'omega\.md'; then
   fail "c5: report does not name the SECOND offending page — first-hit-and-stop; output: $out"
 else
   pass "c5: every violation is reported, both offending pages named"
@@ -165,7 +171,7 @@ c6="$tmproot/c6-does-not-exist"
 run_check "$c6"
 if [ "$status" -ne 0 ]; then
   fail "c6: absent content root exited $status (expected 0); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'does not exist'; then
+elif ! printf '%s\n' "$out" | grep_q 'does not exist'; then
   fail "c6: absent content root printed no reason; output: $out"
 else
   pass "c6: absent content root exits 0 with a printed reason"
@@ -182,7 +188,7 @@ mkdir -p "$c7/nested"
 run_check "$c7"
 if [ "$status" -ne 0 ]; then
   fail "c7: page-less content root exited $status (expected 0); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'no .md/.mdx pages'; then
+elif ! printf '%s\n' "$out" | grep_q 'no .md/.mdx pages'; then
   fail "c7: page-less content root printed no reason; output: $out"
 else
   pass "c7: content root with no pages exits 0 with a printed reason"
@@ -205,9 +211,9 @@ c8out="$(
   _verify_site_voice 2>&1
   printf 'STATUS=%s\n' "$?"
 )"
-if ! printf '%s\n' "$c8out" | grep -q 'STATUS=0'; then
+if ! printf '%s\n' "$c8out" | grep_q 'STATUS=0'; then
   fail "c8: _verify_site_voice did not return 0 with the gate absent; output: $c8out"
-elif ! printf '%s\n' "$c8out" | grep -q 'missing or not executable'; then
+elif ! printf '%s\n' "$c8out" | grep_q 'missing or not executable'; then
   fail "c8: _verify_site_voice printed no skip reason; output: $c8out"
 else
   pass "c8: verify skips the gate with a reason when check-site-voice is absent"
@@ -240,9 +246,9 @@ c9out="$(PATH="$tmproot/c9-stub:$PATH" "$CHECK" "$c9" 2>&1)"
 c9status=$?
 if [ "$c9status" -eq 0 ]; then
   fail "c9: enumeration failure exited 0 — the gate was silently bypassed; output: $c9out"
-elif ! printf '%s\n' "$c9out" | grep -q 'FAILED'; then
+elif ! printf '%s\n' "$c9out" | grep_q 'FAILED'; then
   fail "c9: enumeration failure printed no reason; output: $c9out"
-elif printf '%s\n' "$c9out" | grep -q 'page(s) clean'; then
+elif printf '%s\n' "$c9out" | grep_q 'page(s) clean'; then
   fail "c9: enumeration failure still reported pages clean; output: $c9out"
 else
   pass "c9: a failed page enumeration exits non-zero ($c9status) with a printed reason"
@@ -270,7 +276,7 @@ c10out="$(cd "$tmproot" && "$CHECK" "a=b" 2>&1 </dev/null)"
 c10status=$?
 if [ "$c10status" -ne 1 ]; then
   fail "c10: page under an 'a=b/' path exited $c10status (expected 1) — awk read it as an assignment; output: $c10out"
-elif ! printf '%s\n' "$c10out" | grep -q 'a=b/page\.md'; then
+elif ! printf '%s\n' "$c10out" | grep_q 'a=b/page\.md'; then
   fail "c10: report does not name the page under 'a=b/'; output: $c10out"
 else
   pass "c10: a page path containing '=' is linted, not read as an awk assignment"
