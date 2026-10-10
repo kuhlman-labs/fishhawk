@@ -3,9 +3,11 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -434,12 +436,18 @@ func TestClient_Messages_RefusalErrorNamesCategory(t *testing.T) {
 }
 
 // observedRequest is what the region-scoped inference endpoint saw.
+//
+// apiKeyPresent / authPresent record header PRESENCE, which r.Header.Get cannot
+// tell apart from an empty value: option.WithAPIKey("") puts a present-but-empty
+// X-Api-Key header on the wire (E83.96 / #4223 probe E).
 type observedRequest struct {
-	host   string
-	apiKey string
-	auth   string
-	system string
-	user   string
+	host          string
+	apiKey        string
+	auth          string
+	apiKeyPresent bool
+	authPresent   bool
+	system        string
+	user          string
 }
 
 // regionEndpoint stands in for a cell's in-region inference endpoint. It
@@ -463,9 +471,11 @@ func regionEndpoint(t *testing.T) (*httptest.Server, *[]observedRequest) {
 		}
 		_ = json.Unmarshal(body, &req)
 		obs := observedRequest{
-			host:   r.Host,
-			apiKey: r.Header.Get("x-api-key"),
-			auth:   r.Header.Get("Authorization"),
+			host:          r.Host,
+			apiKey:        r.Header.Get("x-api-key"),
+			auth:          r.Header.Get("Authorization"),
+			apiKeyPresent: len(r.Header.Values("x-api-key")) > 0,
+			authPresent:   len(r.Header.Values("Authorization")) > 0,
 		}
 		if len(req.System) > 0 {
 			obs.system = req.System[0].Text
@@ -570,6 +580,7 @@ func TestNewClient_EmptyKeyNeutralizesAmbientCredentials(t *testing.T) {
 		{"both ambient sources", ambientAPIKey, ambientAuthToken},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			isolateAmbientAnthropicEnv(t)
 			t.Setenv("ANTHROPIC_API_KEY", tc.apiKeyEnv)
 			t.Setenv("ANTHROPIC_AUTH_TOKEN", tc.authTokenEnv)
 
@@ -586,6 +597,10 @@ func TestNewClient_EmptyKeyNeutralizesAmbientCredentials(t *testing.T) {
 			_, _, _, _, _, _, _ = c.Messages(context.Background(), "sys", "user")
 
 			for i, obs := range *seen {
+				if obs.apiKey != "" || obs.auth != "" {
+					t.Errorf("request %d carried a credential value (x-api-key=%q Authorization=%q); an empty explicit key must present none",
+						i, obs.apiKey, obs.auth)
+				}
 				if strings.Contains(obs.apiKey, ambientAPIKey) || strings.Contains(obs.auth, ambientAPIKey) {
 					t.Errorf("request %d carried the ambient ANTHROPIC_API_KEY sentinel to the endpoint (x-api-key=%q Authorization=%q); an empty explicit key must neutralize it",
 						i, obs.apiKey, obs.auth)
@@ -603,6 +618,7 @@ func TestNewClient_EmptyKeyNeutralizesAmbientCredentials(t *testing.T) {
 	// wins and is presented on the wire. Proves the neutralization bites only on
 	// the empty-key path, leaving every existing non-empty-key caller unchanged.
 	t.Run("non-empty key still presented", func(t *testing.T) {
+		isolateAmbientAnthropicEnv(t)
 		t.Setenv("ANTHROPIC_API_KEY", ambientAPIKey)
 
 		srv, seen := regionEndpoint(t)
@@ -660,5 +676,149 @@ func TestNewClient_ExplicitOptionOverridesConfigBaseURL(t *testing.T) {
 	}
 	if len(*captured) == 0 {
 		t.Error("no request reached the test server; the explicit option must override cfg.BaseURL")
+	}
+}
+
+// isolateAmbientAnthropicEnv removes every ambient source the SDK autoloader
+// reads, for the duration of the test, and points the step-5 fallback profile at
+// an empty directory so the host's real `ant auth login` profile cannot load.
+// t.Setenv(k, "") registers the restore; os.Unsetenv then truly unsets it (an
+// empty value is not an unset one to the SDK). Callers must not use t.Parallel.
+func isolateAmbientAnthropicEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_PROFILE",
+		"ANTHROPIC_CUSTOM_HEADERS",
+		"ANTHROPIC_FEDERATION_RULE_ID",
+		"ANTHROPIC_ORGANIZATION_ID",
+		"ANTHROPIC_IDENTITY_TOKEN_FILE",
+	} {
+		t.Setenv(k, "")
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unset %s: %v", k, err)
+		}
+	}
+	t.Setenv("ANTHROPIC_CONFIG_DIR", t.TempDir())
+}
+
+// TestNewClient_AuthTokenSendsBearerOnly is the AuthToken wire contract (E83.96
+// / #4223): with Config.AuthToken set, the request carries `Authorization:
+// Bearer <tok>` and NO X-Api-Key header — not even an empty one — and no
+// ambient credential rides alongside it. The ambient ANTHROPIC_API_KEY sentinel
+// is what makes the autoloader guard observable (with only an ambient
+// ANTHROPIC_AUTH_TOKEN the explicit bearer would overwrite it, masking the
+// deletion); presence, not value, is asserted for X-Api-Key because
+// WithAPIKey("") leaves a present-but-empty header that Get() cannot see.
+func TestNewClient_AuthTokenSendsBearerOnly(t *testing.T) {
+	const (
+		tok              = "tok-sentinel"
+		ambientAPIKey    = "ambient-api-key-sentinel"
+		ambientAuthToken = "ambient-auth-token-sentinel"
+	)
+	isolateAmbientAnthropicEnv(t)
+	t.Setenv("ANTHROPIC_API_KEY", ambientAPIKey)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", ambientAuthToken)
+
+	srv, seen := regionEndpoint(t)
+	cfg := testConfig()
+	cfg.APIKey = ""
+	cfg.AuthToken = tok
+	cfg.BaseURL = srv.URL
+	c := NewClient(cfg)
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("endpoint saw %d requests, want 1", len(*seen))
+	}
+	obs := (*seen)[0]
+	if obs.auth != "Bearer "+tok {
+		t.Errorf("Authorization = %q, want %q", obs.auth, "Bearer "+tok)
+	}
+	if obs.apiKeyPresent {
+		t.Errorf("X-Api-Key header present (value %q); the AuthToken path must not send one, not even an empty one", obs.apiKey)
+	}
+	for _, sentinel := range []string{ambientAPIKey, ambientAuthToken} {
+		if strings.Contains(obs.apiKey, sentinel) || strings.Contains(obs.auth, sentinel) {
+			t.Errorf("ambient sentinel %q rode alongside the bearer (x-api-key=%q Authorization=%q)", sentinel, obs.apiKey, obs.auth)
+		}
+	}
+}
+
+// TestNewClient_APIKeySendsXAPIKeyOnly pins today's API-key behaviour (a
+// no-regression pin, not a new control): X-Api-Key carries the key and no
+// Authorization header is sent.
+func TestNewClient_APIKeySendsXAPIKeyOnly(t *testing.T) {
+	const key = "key-sentinel"
+	isolateAmbientAnthropicEnv(t)
+
+	srv, seen := regionEndpoint(t)
+	cfg := testConfig()
+	cfg.APIKey = key
+	cfg.BaseURL = srv.URL
+	c := NewClient(cfg)
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("endpoint saw %d requests, want 1", len(*seen))
+	}
+	obs := (*seen)[0]
+	if obs.apiKey != key {
+		t.Errorf("X-Api-Key = %q, want %q", obs.apiKey, key)
+	}
+	if obs.authPresent {
+		t.Errorf("Authorization header present (value %q); the API-key path must not send one", obs.auth)
+	}
+}
+
+// TestNewClient_BothCredentialsRefused is the fail-closed control: with BOTH
+// APIKey and AuthToken set, Messages returns ErrConflictingCredentials before
+// any network I/O. The server is REACHABLE and request-counting on purpose, so
+// a deleted refusal shows up as a request, not as a dial failure that happens to
+// map to a similar error.
+func TestNewClient_BothCredentialsRefused(t *testing.T) {
+	isolateAmbientAnthropicEnv(t)
+	srv, seen := regionEndpoint(t)
+
+	cfg := testConfig()
+	cfg.APIKey = "key-sentinel"
+	cfg.AuthToken = "tok-sentinel"
+	cfg.BaseURL = srv.URL
+	c := NewClient(cfg)
+
+	_, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if !errors.Is(err, ErrConflictingCredentials) {
+		t.Errorf("Messages error = %v, want errors.Is ErrConflictingCredentials", err)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("endpoint saw %d requests, want 0: a conflicting-credential client must fail before any I/O", len(*seen))
+	}
+}
+
+// TestNewReviewer_BothCredentialsRefused pins the transitive Reviewer path:
+// NewReviewer routes through NewClient, so a both-set Reviewer fails every
+// Review with an error that still satisfies errors.Is (the %w wrap in Review
+// survives planreview.DecodeVerdictRetrying).
+func TestNewReviewer_BothCredentialsRefused(t *testing.T) {
+	isolateAmbientAnthropicEnv(t)
+	srv, seen := regionEndpoint(t)
+
+	cfg := testConfig()
+	cfg.APIKey = "key-sentinel"
+	cfg.AuthToken = "tok-sentinel"
+	cfg.BaseURL = srv.URL
+	r := NewReviewer(cfg)
+
+	_, _, err := r.Review(context.Background(), "review criteria"+prompt.PlanReviewSplitMarker+"the plan")
+	if !errors.Is(err, ErrConflictingCredentials) {
+		t.Fatalf("Review error = %v, want errors.Is ErrConflictingCredentials", err)
+	}
+	if len(*seen) != 0 {
+		t.Errorf("endpoint saw %d requests, want 0", len(*seen))
 	}
 }

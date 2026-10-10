@@ -382,6 +382,55 @@ func TestRestartBlockers_AdvisoryRound(t *testing.T) {
 	}
 }
 
+// TestRestartBlockers_ImplementRoundOnTerminalStage: GET /v0/restart-blockers
+// shares redispatchEligibility's implement stage-state check (#4174). A
+// current-process advisory implement round on a FAILED or CANCELLED implement
+// stage is a blocker, because the next boot would close it failed
+// (implement_stage_terminal) instead of re-dispatching it. A SUCCEEDED stage
+// is the control: a gateless implement stage settles succeeded on PR upload
+// while its advisory round is still in flight, so that round stays eligible
+// and blocks nothing. Counterfactuals: a no-op stage-state check drops the
+// failed / cancelled items; refusing every terminal state (IsTerminal)
+// reports the succeeded arm.
+func TestRestartBlockers_ImplementRoundOnTerminalStage(t *testing.T) {
+	for _, tc := range []struct {
+		state     run.StageState
+		wantItems int
+	}{
+		{run.StageStateFailed, 1},
+		{run.StageStateCancelled, 1},
+		{run.StageStateSucceeded, 0},
+	} {
+		t.Run(string(tc.state), func(t *testing.T) {
+			runID := attnID(1)
+			f := newRBFixture()
+			f.runs.seed(runID, "acme/app", run.StateRunning, attnT0, "")
+			f.wireRedispatch(runID)
+			f.runs.mu.Lock()
+			for _, st := range f.runs.stagesByRun[runID] {
+				if st.ID == rbRoundStage {
+					st.Type, st.State = run.StageTypeImplement, tc.state
+				}
+			}
+			f.runs.mu.Unlock()
+			f.seedStarted(t, runID, "implement", 1, afterBoot, rbAdvisoryStarted("implement", 0))
+			s := f.server()
+			if tc.wantItems == 0 {
+				// C3: the control must be genuinely eligible, not pass through
+				// another branch.
+				assertRoundEligible(t, s, runID, "implement", true)
+			}
+			got := decodeRestartBlockers(t, getRestartBlockers(t, s, anonymous()))
+			if len(got.Items) != tc.wantItems {
+				t.Fatalf("items = %+v, want %d on a %s implement stage", got.Items, tc.wantItems, tc.state)
+			}
+			if tc.wantItems == 1 && (got.Items[0].Reason != restartBlockerReviewInFlight || got.Items[0].Stage != "implement") {
+				t.Fatalf("item = %+v, want one implement review_in_flight", got.Items[0])
+			}
+		})
+	}
+}
+
 // TestRestartBlockers_IneligibleWiredRoundIsBlocker: on the fully wired
 // (otherwise eligible) fixture, a round the boot sweep would close failed is a
 // blocker — a GATING round, and an advisory round at the re-dispatch depth cap.

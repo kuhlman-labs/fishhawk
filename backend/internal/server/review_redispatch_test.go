@@ -11,6 +11,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -185,17 +186,72 @@ type redispatchFixtureOpts struct {
 	traceStore      tracestore.Storage
 	github          *githubclient.Client
 	planStageState  run.StageState
+	// implStageState, when set, overrides the implement stage's running
+	// state (#4174).
+	implStageState run.StageState
+	// reviewStageState, when set, seeds a review-type stage sequenced after
+	// the implement stage in this state (#4174).
+	reviewStageState run.StageState
+	// logOut, when set, is the server's only logger sink. The re-dispatch
+	// goroutine logs concurrently with the test, so pass a *syncBuffer.
+	logOut io.Writer
+	// oneShotAudit wires the audit fake behind a redispatchOneShotAudit, so a
+	// test can fail exactly one category read (#4174).
+	oneShotAudit bool
 }
 
 type redispatchFixture struct {
-	s         *Server
-	au        *auditFake
-	rr        *orchestratorRepo
-	art       *fakeArtifactRepo
-	runRow    *run.Run
-	planStage *run.Stage
-	implStage *run.Stage
-	reviewer  *fakePlanReviewer
+	s           *Server
+	au          *auditFake
+	oneShot     *redispatchOneShotAudit
+	rr          *orchestratorRepo
+	art         *fakeArtifactRepo
+	runRow      *run.Run
+	planStage   *run.Stage
+	implStage   *run.Stage
+	reviewStage *run.Stage
+	reviewer    *fakePlanReviewer
+}
+
+// redispatchOneShotAudit fails ListForRunByCategory ONCE for the armed category
+// and reads through to the wrapped auditFake otherwise. A one-shot (rather than
+// the auditFake's persistent listByCategoryErrCategory) confines the injected
+// error to the FIRST read after arming, so a test can fail the re-dispatch
+// goroutine's re-check alone while every later read (input rebuild, dispatch,
+// fallback) succeeds: a re-check that wrongly proceeded is then observable as
+// a newer *_review_started. Unlike pullrequest_test.go's oneShotListErrAudit it
+// is armed after construction and guarded by its own mutex, because the
+// goroutine reads it concurrently with the test.
+type redispatchOneShotAudit struct {
+	*auditFake
+	armMu    sync.Mutex
+	category string
+	fired    bool
+}
+
+func (a *redispatchOneShotAudit) arm(category string) {
+	a.armMu.Lock()
+	defer a.armMu.Unlock()
+	a.category, a.fired = category, false
+}
+
+func (a *redispatchOneShotAudit) hasFired() bool {
+	a.armMu.Lock()
+	defer a.armMu.Unlock()
+	return a.fired
+}
+
+func (a *redispatchOneShotAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.armMu.Lock()
+	fire := a.category != "" && a.category == category
+	if fire {
+		a.category, a.fired = "", true
+	}
+	a.armMu.Unlock()
+	if fire {
+		return nil, errors.New("redispatchOneShotAudit: injected ListForRunByCategory error for " + category)
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
 }
 
 // newRedispatchFixture builds the RESTARTED server (processStart = bootMarker)
@@ -230,12 +286,26 @@ func newRedispatchFixture(t *testing.T, opts redispatchFixtureOpts) *redispatchF
 	f.implStage = f.rr.seedStage(f.runRow.ID, 1, run.StageStateRunning)
 	f.implStage.Type = run.StageTypeImplement
 	f.implStage.RequiresApproval = true
+	if opts.implStageState != "" {
+		f.implStage.State = opts.implStageState
+	}
+	if opts.reviewStageState != "" {
+		f.reviewStage = f.rr.seedStage(f.runRow.ID, 2, opts.reviewStageState)
+		f.reviewStage.Type = run.StageTypeReview
+	}
 
 	cfg := Config{
 		Addr:         "127.0.0.1:0",
 		AuditRepo:    f.au,
 		RunRepo:      f.rr,
 		ProcessStart: bootMarker,
+	}
+	if opts.oneShotAudit {
+		f.oneShot = &redispatchOneShotAudit{auditFake: f.au}
+		cfg.AuditRepo = f.oneShot
+	}
+	if opts.logOut != nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(opts.logOut, nil))
 	}
 	if !opts.noArtifactRepo {
 		cfg.ArtifactRepo = f.art
@@ -693,6 +763,39 @@ func TestReviewRedispatch_IneligibleModes(t *testing.T) {
 				return f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginFixupPush, "b1", "h1"))
 			},
 		},
+		// #4174: the implement stage-state check. Each row wires a trace store
+		// and seeds no bundle, so without the check the round is ELIGIBLE
+		// (EligiblePredicate/"implement trace") and a hand-off would surface as
+		// a review_round_redispatched row plus a trace_bundle_unavailable
+		// fallback closure.
+		{
+			name: "implement stage failed (reap-failed)", stage: orphanedReviewStages[1], slug: redispatchSlugImplementStageTerminal,
+			opts: func() redispatchFixtureOpts {
+				return redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), implStageState: run.StageStateFailed}
+			},
+			seed: seedTraceImplementRound,
+		},
+		{
+			name: "implement stage cancelled", stage: orphanedReviewStages[1], slug: redispatchSlugImplementStageTerminal,
+			opts: func() redispatchFixtureOpts {
+				return redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), implStageState: run.StageStateCancelled}
+			},
+			seed: seedTraceImplementRound,
+		},
+		{
+			name: "implement stage superseded", stage: orphanedReviewStages[1], slug: redispatchSlugImplementStageTerminal,
+			opts: func() redispatchFixtureOpts {
+				return redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), implStageState: run.StageStateSuperseded}
+			},
+			seed: seedTraceImplementRound,
+		},
+		{
+			name: "review gate already decided", stage: orphanedReviewStages[1], slug: redispatchSlugAdvancedPastReview,
+			opts: func() redispatchFixtureOpts {
+				return redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), reviewStageState: run.StageStateSucceeded}
+			},
+			seed: seedTraceImplementRound,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -732,6 +835,13 @@ func TestReviewRedispatch_IneligibleModes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// seedTraceImplementRound seeds an orphaned advisory trace-origin implement
+// round on the fixture's implement stage.
+func seedTraceImplementRound(t *testing.T, f *redispatchFixture) int64 {
+	t.Helper()
+	return f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginTrace, "", "h1"))
 }
 
 // TestReviewRedispatch_FallbackModes: one row per fallback failure. The round
@@ -936,6 +1046,11 @@ func TestReviewRedispatch_EligiblePredicate(t *testing.T) {
 		{name: "implement fixup_push", stage: orphanedReviewStages[1], opts: redispatchFixtureOpts{github: cannedComparePatchClient(t, cannedCompareOneFile)}, seed: func(t *testing.T, f *redispatchFixture) int64 {
 			return f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginFixupPush, "b1", "h1"))
 		}},
+		// #4174 controls: a gateless implement stage settles succeeded on PR
+		// upload while its advisory round is in flight, and a review stage
+		// that has not decided yet has not advanced the run past review.
+		{name: "implement trace on a succeeded implement stage", stage: orphanedReviewStages[1], opts: redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), implStageState: run.StageStateSucceeded}, seed: seedTraceImplementRound},
+		{name: "implement trace with the review stage awaiting approval", stage: orphanedReviewStages[1], opts: redispatchFixtureOpts{traceStore: newRedispatchTraceStore(), reviewStageState: run.StageStateAwaitingApproval}, seed: seedTraceImplementRound},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -994,6 +1109,165 @@ func TestReviewRedispatch_GoroutineRechecksBeforeAndAfter(t *testing.T) {
 			t.Error("orphanedRoundStillOpen = false for an open round, want true")
 		}
 	})
+}
+
+// TestReviewRedispatch_ImplementStageUnreadable: an implement round whose
+// stage row cannot be read is undecidable, not eligible. The predicate returns
+// the read error and the boot sweep closes the round eligibility_check_failed
+// with no hand-off (#4174).
+func TestReviewRedispatch_ImplementStageUnreadable(t *testing.T) {
+	stage := orphanedReviewStages[1]
+	f := newRedispatchFixture(t, redispatchFixtureOpts{traceStore: newRedispatchTraceStore()})
+	seq := f.appendAt(t, uuid.New(), beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginTrace, "", "h1"))
+
+	latest, payload, ok, err := f.s.latestReviewStarted(context.Background(), f.runRow.ID, stage)
+	if err != nil || !ok {
+		t.Fatalf("latestReviewStarted: ok=%v err=%v", ok, err)
+	}
+	if eligible, slug, eerr := f.s.redispatchEligibility(context.Background(), f.runRow.ID, stage, latest, payload); eerr == nil {
+		t.Fatalf("redispatchEligibility = (%v, %q, nil) for an unreadable implement stage, want the read error", eligible, slug)
+	}
+
+	bootSweep(t, f.s)
+
+	if rows := redispatchedRows(t, f.au, f.runRow.ID); len(rows) != 0 {
+		t.Fatalf("%s rows = %+v, want none for an undecidable round", categoryReviewRoundRedispatched, rows)
+	}
+	reasons := failedReasonsAfter(t, f.au, f.runRow.ID, stage.failed, seq)
+	want := orphanedReviewNotRedispatchedReason(redispatchSlugEligibilityCheckFailed)
+	if len(reasons) != 1 || reasons[0] != want {
+		t.Fatalf("%s reasons = %v, want 1 x %q", stage.failed, reasons, want)
+	}
+}
+
+// redispatchRecheckReadFailedLog / redispatchFallbackAnchorReadFailedLog /
+// redispatchFallbackCountFailedLog are the WARN lines the re-dispatch
+// goroutine's read-error exits log (#4174).
+const (
+	redispatchRecheckReadFailedLog        = "re-dispatch re-check read failed"
+	redispatchFallbackAnchorReadFailedLog = "re-dispatch fallback could not read the round anchor"
+	redispatchFallbackCountFailedLog      = "re-dispatch fallback could not count landed terminals"
+)
+
+// TestReviewRedispatch_GoroutineReadErrorLeavesRoundForNextBoot pins the
+// re-dispatch goroutine's re-check read-error exits (#4174). The round is
+// ELIGIBLE (stored plan, its plan_generated, a completing reviewer), so the
+// injected read error is the only thing stopping a dispatch. The goroutine
+// must dispatch nothing and synthesize nothing, WARN-log the read failure and
+// clear its pending entry; the next boot then closes the round failed as
+// already_redispatched — the cross-boot bound.
+//
+// The error is ONE-SHOT (redispatchOneShotAudit): only the re-check's read fails,
+// so a re-check that wrongly treated the error as "open" would go on to
+// dispatch and append a newer plan_review_started (approval condition CF1).
+//
+// COUNTERFACTUALS: CF1 (either error branch treated as open) → a newer
+// plan_review_started → RED; CF2 (no clearRedispatchPending) → pending still
+// set → RED; CF3 (roundAlreadyRedispatched always false) → the next boot
+// re-dispatches instead of closing → RED; CF4 (no WARN) → RED.
+func TestReviewRedispatch_GoroutineReadErrorLeavesRoundForNextBoot(t *testing.T) {
+	stage := orphanedReviewStages[0]
+	for _, tc := range []struct {
+		name, category string
+	}{
+		{name: "latest started read fails", category: stage.started},
+		{name: "landed count read fails", category: stage.terminals[0]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			logs := &syncBuffer{}
+			f := newRedispatchFixture(t, redispatchFixtureOpts{logOut: logs, oneShotAudit: true})
+			runID := f.runRow.ID
+			seq := f.seedEligiblePlanRound(t, advisoryPlanStarted())
+			latest, payload, ok, err := f.s.latestReviewStarted(ctx, runID, stage)
+			if err != nil || !ok || latest.Sequence != seq {
+				t.Fatalf("latestReviewStarted: ok=%v err=%v", ok, err)
+			}
+
+			f.oneShot.arm(tc.category)
+			handed := func() bool {
+				lock := reconcileEmitLockFor(runID)
+				lock.Lock()
+				defer lock.Unlock()
+				return f.s.redispatchOrphanedRound(ctx, runID, stage, latest, payload, 0)
+			}()
+			f.s.waitBackgroundReviews()
+
+			if !handed {
+				t.Fatal("redispatchOrphanedRound = false, want the round handed to the goroutine")
+			}
+			if !f.oneShot.hasFired() {
+				t.Fatalf("the injected %s read never fired: the goroutine did not reach the re-check read", tc.category)
+			}
+			rows := redispatchedRows(t, f.au, runID)
+			if len(rows) != 1 || rows[0].OrphanedRoundSequence != seq {
+				t.Fatalf("%s rows = %+v, want one naming %d", categoryReviewRoundRedispatched, rows, seq)
+			}
+			if started, _ := startedAfter(t, f.au, runID, stage.started, seq); len(started) != 0 {
+				t.Fatalf("newer %s rounds = %d, want 0: a read error must not dispatch", stage.started, len(started))
+			}
+			if n := countAfter(t, f.au, runID, stage.failed, seq); n != 0 {
+				t.Fatalf("%s after the round = %d, want 0: a read error must not synthesize", stage.failed, n)
+			}
+			if reviewRedispatchPending(runID, stage.label, seq) {
+				t.Error("the round is still pending after the goroutine returned")
+			}
+			if !strings.Contains(logs.String(), redispatchRecheckReadFailedLog) {
+				t.Errorf("log = %q, want the %q WARN", logs.String(), redispatchRecheckReadFailedLog)
+			}
+
+			// The next boot: the round still predates the boot marker.
+			bootSweep(t, f.s)
+
+			reasons := failedReasonsAfter(t, f.au, runID, stage.failed, seq)
+			want := orphanedReviewNotRedispatchedReason(redispatchSlugAlreadyRedispatched)
+			if len(reasons) != 2 {
+				t.Fatalf("next boot %s = %v, want 2 x %q", stage.failed, reasons, want)
+			}
+			for _, r := range reasons {
+				if r != want {
+					t.Errorf("next boot reason = %q, want %q", r, want)
+				}
+			}
+			if started, _ := startedAfter(t, f.au, runID, stage.started, seq); len(started) != 0 {
+				t.Errorf("next boot started %d newer %s rounds, want 0", len(started), stage.started)
+			}
+		})
+	}
+}
+
+// TestReviewRedispatch_FallbackReadErrorSynthesizesNothing pins the fallback's
+// two read-error exits (#4174): on an OPEN round with 0 of 2 verdicts landed,
+// an unreadable anchor or landed count synthesizes nothing and logs the
+// branch's WARN, leaving the round for the next boot.
+//
+// COUNTERFACTUALS: CF5 (no anchor WARN) → RED; CF6 (count error falls through
+// with landed = 0) → 2 synthesized failures → RED.
+func TestReviewRedispatch_FallbackReadErrorSynthesizesNothing(t *testing.T) {
+	stage := orphanedReviewStages[0]
+	for _, tc := range []struct {
+		name, category, wantLog string
+	}{
+		{name: "anchor read fails", category: stage.started, wantLog: redispatchFallbackAnchorReadFailedLog},
+		{name: "landed count read fails", category: stage.terminals[0], wantLog: redispatchFallbackCountFailedLog},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			f := newRedispatchFixture(t, redispatchFixtureOpts{logOut: logs})
+			seq := f.seedEligiblePlanRound(t, advisoryPlanStarted())
+
+			f.au.listByCategoryErrCategory = tc.category
+			f.s.closeUnstartedRedispatch(context.Background(), f.runRow.ID, stage, seq, advisoryPlanStarted(), redispatchSlugRoundNotStarted)
+			f.au.listByCategoryErrCategory = ""
+
+			if n := countAfter(t, f.au, f.runRow.ID, stage.failed, seq); n != 0 {
+				t.Errorf("%s after the round = %d, want 0: a read error must not synthesize", stage.failed, n)
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("log = %q, want the %q WARN", logs.String(), tc.wantLog)
+			}
+		})
+	}
 }
 
 // TestReviewRedispatchMarker_SetOnlyByBootRedispatch is approval condition C4's
