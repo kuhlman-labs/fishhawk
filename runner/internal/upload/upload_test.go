@@ -4417,6 +4417,28 @@ func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
 	if !strings.Contains(gotHeader, CapabilityMergeCandidateVerify) {
 		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityMergeCandidateVerify)
 	}
+	// E55.16 / #3916: without this token the backend declines every
+	// decomposition-child push resume to this runner (an agent re-run).
+	if !strings.Contains(gotHeader, CapabilityChildPushResume) {
+		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityChildPushResume)
+	}
+}
+
+// TestRunnerCapabilityWireValues is the upload-side half of the cross-module
+// capability pin: the child-push-resume token is asserted against the same
+// literal backend/internal/server's TestResumeKindWireValues pins, and the
+// FULL combined header value is pinned in list order (append-only — #3621's
+// push-resume, then #4183's merge-candidate-verify, then E55.16 / #3916's
+// child-push-resume), matching the capableRunnerCapabilities row of the
+// backend's TestResumeKindWireValues.
+func TestRunnerCapabilityWireValues(t *testing.T) {
+	if CapabilityChildPushResume != "child-push-resume" {
+		t.Errorf("CapabilityChildPushResume = %q, want %q", CapabilityChildPushResume, "child-push-resume")
+	}
+	const want = "push-resume,merge-candidate-verify,child-push-resume"
+	if got := RunnerCapabilitiesValue(); got != want {
+		t.Errorf("RunnerCapabilitiesValue() = %q, want %q", got, want)
+	}
 }
 
 // TestFetchPrompt_OldBackendDecodesNoPushResume is the SKEW guard in the

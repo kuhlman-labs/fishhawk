@@ -2024,7 +2024,7 @@ func TestChildPushFailure_AbsentDiff_FailsCThenResumes(t *testing.T) {
 	}
 
 	// (3) The retry dispatch is served the held commit as a push-kind resume.
-	held, resume := s.resolvePushCheckpointResume(t.Context(), runRow, got, false, true, false)
+	held, resume := s.resolvePushCheckpointResume(t.Context(), runRow, got, false, true, true, false)
 	if !resume {
 		t.Fatal("resolvePushCheckpointResume: resume = false, want true for the child's push-kind checkpoint")
 	}
@@ -2064,6 +2064,170 @@ func TestChildPushFailure_AbsentDiff_FailsCThenResumes(t *testing.T) {
 	au.mu.Unlock()
 	if n := len(entriesByCategory(entries, "child_pushed")); n != 1 {
 		t.Errorf("child_pushed entries = %d, want 1", n)
+	}
+}
+
+// TestChildPushFailure_RetryRedispatch_NeverOpensPR is the E55.16 / #3916
+// DONE-MEANS lifecycle on the real handlers: a decomposed child implement
+// stage fails its push (category C, push-kind checkpoint), is retried through
+// the real POST /v0/stages/{id}/retry handler (what fishhawk_retry_stage
+// calls), is re-dispatched by run_children, and its runner fetches the signed
+// /prompt with the current capability header. The fetch must serve the push
+// kind on the SLICE branch with decomposed_from_run_id set, and after the
+// runner's `pushed` report the child must have opened NO pull request: zero
+// pull_request_opened entries, no pull_request artifact, a nil PullRequestURL,
+// and exactly one child_pushed entry.
+func TestChildPushFailure_RetryRedispatch_NeverOpensPR(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := &auditFake{stampSequence: true}
+
+	runRow := rr.seedRun()
+	parentID := uuid.New()
+	runRow.DecomposedFrom = &parentID
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = false
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(3 * time.Minute)
+
+	// (1) The child trace leaves the stage running.
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, makeChildPushBundleNoDiff(t, true, t0, t1), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// (2) The push-transport failure report on the slice branch.
+	branch := orchestrator.SliceBranch(parentID, 0)
+	const (
+		headSHA = "head3916"
+		baseSHA = "base3916"
+		treeSHA = "tree3916"
+	)
+	failBody, err := json.Marshal(map[string]any{
+		"outcome": "failed", "category": "C", "reason": "commit+push: gitops: push: push failed",
+		"branch": branch, "head_sha": headSHA, "base_sha": baseSHA,
+		"verified_tree_sha": treeSHA, "resume_kind": "push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, failBody, ""); w.Code != http.StatusOK {
+		t.Fatalf("failed report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed || got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Fatalf("after failed report: state=%q category=%v, want failed/C", got.State, got.FailureCategory)
+	}
+	au.mu.Lock()
+	entries := append([]audit.ChainAppendParams(nil), au.appended...)
+	au.mu.Unlock()
+	if n := len(entriesByCategory(entries, CategoryPushResumeCheckpoint)); n != 1 {
+		t.Fatalf("%s entries = %d, want 1", CategoryPushResumeCheckpoint, n)
+	}
+
+	// (3) The real retry handler: failed-C → pending, which the orchestrator
+	// handoff inside the handler immediately re-dispatches (the gateless
+	// stage has no approval to wait on).
+	if w := postRetry(t, s, implStage.ID); w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got, err = rr.GetStage(t.Context(), implStage.ID); err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStatePending && got.State != run.StageStateDispatched {
+		t.Fatalf("after retry: stage.State = %q, want pending or dispatched", got.State)
+	}
+
+	// (4) The rest of run_children's re-dispatch walk, up to running.
+	walk := []run.StageState{run.StageStateDispatched, run.StageStateRunning}
+	if got.State == run.StageStateDispatched {
+		walk = walk[1:]
+	}
+	for _, to := range walk {
+		if _, err := rr.TransitionStage(t.Context(), implStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage %s: %v", to, err)
+		}
+	}
+
+	// (5) The re-dispatched runner's signed prompt fetch, current header.
+	pw := promptRequestWithCapabilities(t, s, implStage.ID, priv, capabilityPushResume+", "+capabilityChildPushResume)
+	if pw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+	}
+	var served struct {
+		DecomposedFromRunID  string `json:"decomposed_from_run_id"`
+		OpenPRFromHeldCommit bool   `json:"open_pr_from_held_commit"`
+		HeldCommitResumeKind string `json:"held_commit_resume_kind"`
+		HeldCommitBranch     string `json:"held_commit_branch"`
+		HeldCommitSHA        string `json:"held_commit_sha"`
+	}
+	if err := json.Unmarshal(pw.Body.Bytes(), &served); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	if served.DecomposedFromRunID != parentID.String() || !served.OpenPRFromHeldCommit ||
+		served.HeldCommitResumeKind != resumeKindPush || served.HeldCommitBranch != branch || served.HeldCommitSHA != headSHA {
+		t.Fatalf("served = %+v, want decomposed_from=%s, push kind on %s at %s", served, parentID, branch, headSHA)
+	}
+
+	// (6) The runner's child-resume report.
+	pushedBody, err := json.Marshal(map[string]any{
+		"outcome": "pushed", "branch": branch, "head_sha": headSHA, "base_sha": baseSHA,
+		"files_changed_count": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, pushedBody, ""); w.Code != http.StatusOK {
+		t.Fatalf("pushed report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// (7) No PR for the slice branch, by every observable.
+	au.mu.Lock()
+	entries = append([]audit.ChainAppendParams(nil), au.appended...)
+	au.mu.Unlock()
+	if n := len(entriesByCategory(entries, "child_pushed")); n != 1 {
+		t.Errorf("child_pushed entries = %d, want 1", n)
+	}
+	for _, e := range entriesByCategory(entries, "pull_request_opened") {
+		if e.StageID != nil && *e.StageID == implStage.ID {
+			t.Errorf("a decomposition child must open NO pull request, got pull_request_opened %s", e.Payload)
+		}
+	}
+	arts, err := art.ListForStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	for _, a := range arts {
+		if a.Kind == artifact.KindPullRequest {
+			t.Errorf("a decomposition child must ship NO pull_request artifact, got %+v", a)
+		}
+	}
+	finalRun, err := rr.GetRun(t.Context(), runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if finalRun.PullRequestURL != nil {
+		t.Errorf("child run PullRequestURL = %q, want nil", *finalRun.PullRequestURL)
 	}
 }
 

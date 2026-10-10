@@ -385,8 +385,12 @@ func promptRequestWithCapabilities(t *testing.T, s *Server, stageID uuid.UUID, p
 	return w
 }
 
-// capableRunnerCapabilities is the header value a current runner sends.
-const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify
+// capableRunnerCapabilities is the header value a current runner sends: the
+// full token list in the runner's append-only order (#3621, #4183, E55.16 /
+// #3916). TestResumeKindWireValues pins it against the same literal the
+// runner's upload.TestRunnerCapabilityWireValues pins RunnerCapabilitiesValue()
+// against.
+const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify + "," + capabilityChildPushResume
 
 // promptRenderRequest exercises the unsigned /prompt-render preview endpoint,
 // the sibling surface of promptRequest's signed /prompt dispatch endpoint.
@@ -10437,6 +10441,26 @@ func exemptPromptKeysWithAudit(t *testing.T, park *run.ScopeCompletenessPark,
 func exemptPromptFixture(t *testing.T, park *run.ScopeCompletenessPark,
 	auditFor func(stageID uuid.UUID) audit.Repository) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
 	t.Helper()
+	return exemptPromptFixtureRun(t, park, auditFor, nil)
+}
+
+// exemptPromptFixtureChild is exemptPromptFixture for a DECOMPOSITION CHILD
+// (E55.16 / #3916): the run row carries DecomposedFrom = parentID and nothing
+// else changes. SliceIndex stays nil and there is no plan, so the prompt
+// handler's decomposed-scope guard does not engage — the callers assert 200
+// (exemptBodyKeys) before reading keys, so an engaged guard surfaces as a
+// fixture failure, not a false pass.
+func exemptPromptFixtureChild(t *testing.T, parentID uuid.UUID, park *run.ScopeCompletenessPark,
+	auditFor func(stageID uuid.UUID) audit.Repository) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+	t.Helper()
+	return exemptPromptFixtureRun(t, park, auditFor, func(r *run.Run) { r.DecomposedFrom = &parentID })
+}
+
+// exemptPromptFixtureRun is the shared body of the two fixtures above;
+// mutateRun (nil = none) edits the run row before the server is built.
+func exemptPromptFixtureRun(t *testing.T, park *run.ScopeCompletenessPark,
+	auditFor func(stageID uuid.UUID) audit.Repository, mutateRun func(*run.Run)) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
 	runID := uuid.New()
@@ -10450,6 +10474,9 @@ func exemptPromptFixture(t *testing.T, park *run.ScopeCompletenessPark,
 	rr.runRow = &run.Run{
 		ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
 		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+	}
+	if mutateRun != nil {
+		mutateRun(rr.runRow)
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, ScopeCompletenessPark: park}
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, AuditRepo: au})
@@ -10972,7 +10999,7 @@ func TestResolvePushCheckpointResume_NilAuditRepo(t *testing.T) {
 func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	stage.Type = run.StageTypeReview
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); ok {
 		t.Error("a non-implement stage must never resume")
 	}
 }
@@ -10981,10 +11008,10 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	// Control: the SAME state without the fixup flag DOES resolve, so the RED
 	// below lands on the fixup guard rather than on a broken fixture.
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); !ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); !ok {
 		t.Fatal("fixture must resolve a checkpoint on a non-fixup dispatch")
 	}
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, true, true, false); ok {
 		t.Error("a fix-up dispatch must re-invoke the agent, never take the resume short-circuit")
 	}
 }
@@ -10992,7 +11019,7 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 // TestResolvePushCheckpointResume_NilStage: the nil guard.
 func TestResolvePushCheckpointResume_NilStage(t *testing.T) {
 	s, runRow, _ := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false, true, true, false); ok {
 		t.Error("a nil stage must never resume")
 	}
 }
@@ -14829,6 +14856,8 @@ func TestResumeKindWireValues(t *testing.T) {
 		{runnerCapabilitiesHeader, "X-Fishhawk-Runner-Capabilities", "runnerCapabilitiesHeader"},
 		{capabilityPushResume, "push-resume", "capabilityPushResume"},
 		{capabilityMergeCandidateVerify, "merge-candidate-verify", "capabilityMergeCandidateVerify"},
+		{capabilityChildPushResume, "child-push-resume", "capabilityChildPushResume"},
+		{capableRunnerCapabilities, "push-resume,merge-candidate-verify,child-push-resume", "capableRunnerCapabilities"},
 		{CategoryPushResumeCheckpoint, "push_resume_checkpoint", "CategoryPushResumeCheckpoint"},
 	} {
 		if tc.got != tc.want {
@@ -14870,7 +14899,7 @@ func TestLegacyPROpenResolver_BlindToPushCheckpoint(t *testing.T) {
 	// Control: the NEW resolver DOES find it, so the assertion above is a
 	// statement about the old query rather than about an empty fixture.
 	s, runRow, stage := checkpointGateFixture(t, entries)
-	held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false)
+	held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false)
 	if !ok || held.resumeKind != resumeKindPush {
 		t.Fatalf("the new resolver must serve the push checkpoint, got ok=%t kind=%q", ok, held.resumeKind)
 	}
@@ -14965,7 +14994,7 @@ func TestPushResume_ServedToAdvertisingRunner(t *testing.T) {
 func TestResolvePushCheckpointResume_PROpenUnaffectedByCapability(t *testing.T) {
 	for _, advertises := range []bool{true, false} {
 		s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-		held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, advertises, false)
+		held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, advertises, true, false)
 		if !ok {
 			t.Fatalf("advertises=%t: the pr_open resume must be unaffected by the capability flag", advertises)
 		}
@@ -15016,11 +15045,198 @@ func TestResolvePushCheckpointResume_PushKindRefusals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, runRow, stage := checkpointGateFixture(t, tc.entries)
-			if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); ok {
+			if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); ok {
 				t.Error("must refuse")
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DECOMPOSITION-CHILD GATING (E55.16 / #3916): a child never opens a
+// standalone PR for its slice branch, so the backend serves it a push kind
+// only on the child-push-resume token, and never a pr_open or exempt resume.
+// ---------------------------------------------------------------------------
+
+// childCheckpointGateFixture is checkpointGateFixture with the run row made a
+// decomposition child (DecomposedFrom set) when child is true.
+func childCheckpointGateFixture(t *testing.T, entries []*audit.Entry, child bool) (*Server, *run.Run, *run.Stage) {
+	t.Helper()
+	s, runRow, stage := checkpointGateFixture(t, entries)
+	if child {
+		parent := uuid.New()
+		runRow.DecomposedFrom = &parent
+	}
+	return s, runRow, stage
+}
+
+// TestResolvePushCheckpointResume_ChildPushKindRequiresChildCapability pins the
+// child capability gate on the resolver. Every row's NEWEST carrier is a
+// complete push-kind checkpoint WITH a verified tree, so the push-resume and
+// verified-tree gates admit it; the child gate is the only thing that can
+// withhold the push kind. The both-tokens row proves the child fixture is
+// resumable, and the standalone row proves the new token never gates a
+// non-child run.
+func TestResolvePushCheckpointResume_ChildPushKindRequiresChildCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		child, childToken bool
+		wantServed        bool
+	}{
+		{"child_push_resume_only_declined", true, false, false},
+		{"child_both_tokens_served", true, true, true},
+		{"standalone_push_resume_only_served", false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runRow, stage := childCheckpointGateFixture(t,
+				[]*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)}, tc.child)
+			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, tc.childToken, false)
+			if ok != tc.wantServed {
+				t.Fatalf("served = %t (kind %q), want %t", ok, held.resumeKind, tc.wantServed)
+			}
+			if !tc.wantServed {
+				return
+			}
+			if held.resumeKind != resumeKindPush || held.verifiedTreeSHA != checkpointVerifiedTree || held.branch != checkpointBranch {
+				t.Errorf("held = %+v, want the push kind with the verified tree on %s", held, checkpointBranch)
+			}
+		})
+	}
+}
+
+// TestResolvePushCheckpointResume_ChildPROpenDeclined pins the child pr_open
+// decline: a child whose newest carrier is a pr_open checkpoint is served
+// NOTHING, even with both tokens advertised. The paired standalone row on the
+// IDENTICAL entries is served, so the decline — not an unresumable fixture —
+// is what withholds it (the capability flags do not apply to pr_open, see
+// TestResolvePushCheckpointResume_PROpenUnaffectedByCapability).
+func TestResolvePushCheckpointResume_ChildPROpenDeclined(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		child      bool
+		wantServed bool
+	}{
+		{"child_pr_open_declined", true, false},
+		{"standalone_pr_open_served", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runRow, stage := childCheckpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)}, tc.child)
+			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false)
+			if ok != tc.wantServed {
+				t.Fatalf("served = %t (kind %q), want %t", ok, held.resumeKind, tc.wantServed)
+			}
+			if ok && held.resumeKind != resumeKindPROpen {
+				t.Errorf("resumeKind = %q, want %q", held.resumeKind, resumeKindPROpen)
+			}
+		})
+	}
+}
+
+// childPushCheckpointAudit seeds the push-kind checkpoint state both real-
+// handler child tests share and hands back the fake for row inspection.
+func childPushCheckpointAudit(au **exemptAuditFake) func(uuid.UUID) audit.Repository {
+	return func(sid uuid.UUID) audit.Repository {
+		*au = &exemptAuditFake{}
+		for _, e := range []*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)} {
+			id := sid
+			e.StageID = &id
+			(*au).entries = append((*au).entries, e)
+		}
+		return *au
+	}
+}
+
+// TestPushResume_ChildNotServedWithoutChildCapability is the real-/prompt
+// half of the child capability gate: a child fetch advertising ONLY
+// push-resume — the header a runner built before #4079's child arm sends —
+// gets NO held-commit fields, and the decline writes one verified_tree_discarded
+// row naming the tree and runner_child_capability_absent.
+func TestPushResume_ChildNotServedWithoutChildCapability(t *testing.T) {
+	var au *exemptAuditFake
+	s, _, stageID, priv := exemptPromptFixtureChild(t, uuid.New(), nil, childPushCheckpointAudit(&au))
+	keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv, capabilityPushResume), "/prompt")
+	assertNoResumeEmission(t, keys, "a child fetch without child-push-resume must be served NO held-commit fields")
+	if raw, ok := keys["held_commit_verified_tree_sha"]; ok {
+		t.Errorf("held_commit_verified_tree_sha must be ABSENT on a decline, got %s", raw)
+	}
+	var rows []audit.ChainAppendParams
+	for _, p := range au.appended {
+		if p.Category == "verified_tree_discarded" {
+			rows = append(rows, p)
+		}
+	}
+	if len(rows) != 1 {
+		cats := make([]string, 0, len(au.appended))
+		for _, p := range au.appended {
+			cats = append(cats, p.Category)
+		}
+		t.Fatalf("verified_tree_discarded rows = %d, want 1 (appended: %v)", len(rows), cats)
+	}
+	for _, want := range []string{checkpointVerifiedTree, `"reason":"runner_child_capability_absent"`} {
+		if !strings.Contains(string(rows[0].Payload), want) {
+			t.Errorf("discard row must carry %s, got %s", want, rows[0].Payload)
+		}
+	}
+}
+
+// TestPushResume_ChildServedWithChildCapability is the positive control: the
+// SAME child state with BOTH tokens is served the push kind, its verified
+// tree and decomposed_from_run_id, and writes no discard row.
+func TestPushResume_ChildServedWithChildCapability(t *testing.T) {
+	var au *exemptAuditFake
+	parent := uuid.New()
+	s, _, stageID, priv := exemptPromptFixtureChild(t, parent, nil, childPushCheckpointAudit(&au))
+	keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv,
+		capabilityPushResume+", "+capabilityChildPushResume), "/prompt")
+	for key, want := range map[string]string{
+		"held_commit_resume_kind":       `"push"`,
+		"held_commit_sha":               `"` + checkpointHeadSHA + `"`,
+		"held_commit_branch":            `"` + checkpointBranch + `"`,
+		"held_commit_verified_tree_sha": `"` + checkpointVerifiedTree + `"`,
+		"decomposed_from_run_id":        `"` + parent.String() + `"`,
+	} {
+		raw, ok := keys[key]
+		if !ok {
+			t.Errorf("%s must be emitted to a child runner advertising both tokens", key)
+			continue
+		}
+		if string(raw) != want {
+			t.Errorf("%s = %s, want %s", key, raw, want)
+		}
+	}
+	for _, p := range au.appended {
+		if p.Category == "verified_tree_discarded" {
+			t.Errorf("a SERVED resume must write no discard row, got %s", p.Payload)
+		}
+	}
+}
+
+// TestPromptHeldCommit_ChildExemptRefused pins resolveHeldCommitExemption's
+// child refusal: the exempt-resolved park state that emits the four exempt
+// fields on a standalone run (the paired row) emits NONE on a child run. The
+// decomposed-scope guard cannot mask it (no plan, nil SliceIndex) and
+// exemptBodyKeys asserts 200 first.
+func TestPromptHeldCommit_ChildExemptRefused(t *testing.T) {
+	auditFor := func(sid uuid.UUID) audit.Repository {
+		return &exemptAuditFake{entries: []*audit.Entry{
+			scopeDecisionEntry(sid, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(sid, CategoryScopeCompletenessExempted, 2),
+		}}
+	}
+	t.Run("standalone_emits", func(t *testing.T) {
+		s, runID, stageID, priv := exemptPromptFixture(t, exemptPark(), auditFor)
+		keys := exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+		for _, k := range []string{"open_pr_from_held_commit", "held_commit_sha", "held_commit_branch", "held_commit_base_sha"} {
+			if _, ok := keys[k]; !ok {
+				t.Errorf("standalone exempt-resolved park must emit %s (positive control)", k)
+			}
+		}
+	})
+	t.Run("child_refused", func(t *testing.T) {
+		s, runID, stageID, priv := exemptPromptFixtureChild(t, uuid.New(), exemptPark(), auditFor)
+		keys := exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+		assertNoExemptKeys(t, keys, "a decomposition child must never resume through the exempt open-PR path")
+	})
 }
 
 // TestRunnerAdvertises pins the header parse: comma-separated, space-trimmed,

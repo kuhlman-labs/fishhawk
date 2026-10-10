@@ -20374,6 +20374,15 @@ paths:
             `409 runner_capability_missing`: no prompt is built and the pass is
             settled `not_executed`, so an older runner exits before spawning an
             agent instead of running a plain implement pass.
+            `child-push-resume` (E55.16 / #3916) — this runner's held-commit
+            resume carries the decomposition-child arm (#4079): a child push
+            resume publishes the slice branch, reports `pushed` and never opens
+            a PR. A decomposition child's request WITHOUT it is served no
+            held-commit fields for a push-kind checkpoint, and the decline
+            appends a `verified_tree_discarded` row with reason
+            `runner_child_capability_absent`. It never gates a non-child run.
+            A current runner sends
+            `push-resume,merge-candidate-verify,child-push-resume`.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -20831,6 +20840,18 @@ paths:
                       — never a downgraded `pr_open`, which would open a PR on
                       a branch that was never pushed — and the decline appends
                       a `verified_tree_discarded` audit row.
+
+                      DECOMPOSITION CHILD (E55.16 / #3916). A child run (one
+                      with `decomposed_from_run_id`) never opens a standalone
+                      PR for its slice branch, so it is served `push` only to a
+                      request advertising BOTH `push-resume` and
+                      `child-push-resume` (otherwise declined, reason
+                      `runner_child_capability_absent`), and is NEVER served
+                      `pr_open` (declined, reason
+                      `child_resume_kind_unsupported`) or the exempt
+                      resolution (refused, log-only). Each decline is a total
+                      decline: no held-commit fields, so the retry is an
+                      ordinary agent re-run.
                   held_commit_verified_tree_sha:
                     type: string
                     description: |
@@ -21258,7 +21279,7 @@ paths:
                   held_commit_resume_kind:
                     type: string
                     enum: [pr_open, push]
-                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
+                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). A decomposition child (E55.16 / #3916) is served `push` only to a request advertising both `push-resume` and `child-push-resume`, and never `pr_open` or the exempt resolution. NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
                   held_commit_verified_tree_sha:
                     type: string
                     description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it.

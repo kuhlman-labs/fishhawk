@@ -2019,7 +2019,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), true); resume {
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), true); resume {
 			// Held-commit CHECKPOINT resume (#2169 pr_open, E45.86 / #3621 push),
 			// taken ONLY when the exempt resolution above returned false. An
 			// exempt-resolved park always wins: #1231 keeps precedence, and the two
@@ -2804,7 +2804,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), false); resume {
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), false); resume {
 			// Held-commit CHECKPOINT resume, same derivation + same exempt-wins
 			// precedence as the dispatch path so the rendered (SPA-readable) prompt
 			// response stays byte-consistent with it. recordDrop is FALSE here: a
@@ -5066,6 +5066,10 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // sibling resolvePushCheckpointResume already refuses a fix-up for the same
 // reason; this gate mirrors it exactly so both held-commit emission paths agree.
 //
+// DECOMPOSITION-CHILD REFUSAL (E55.16 / #3916). A child run (DecomposedFrom
+// set) never takes the exempt resume: it opens a PR from the held commit, and
+// a child must never open a standalone PR for its slice branch.
+//
 // The newest-wins rule across every category is what makes the gate
 // self-invalidating: a re-park after an earlier exempt emits nothing because the
 // later `parked` entry wins, AND — with the invalidator categories now in the
@@ -5098,6 +5102,17 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 	// pre-agent openHeldCommitPR short-circuit and discard that prompt. Mirror
 	// the sibling resolvePushCheckpointResume's refusal exactly.
 	if fixup {
+		return heldCommitResume{}, false
+	}
+	// DECOMPOSITION-CHILD REFUSAL (E55.16 / #3916): the exempt resume opens a PR
+	// from the held commit, and a child must never open one. A post-#4079
+	// runner refuses that kind for a child permanently; refusing here turns the
+	// hard runner refusal into an ordinary dispatch. Log-only: no audit row.
+	if runRow != nil && runRow.DecomposedFrom != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: decomposed child never resumes through the exempt open-PR path; omitting held-commit exempt fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()))
 		return heldCommitResume{}, false
 	}
 	if s.cfg.AuditRepo == nil {
@@ -5297,6 +5312,20 @@ const capabilityPushResume = "push-resume"
 // upload.CapabilityMergeCandidateVerify. A drift is fail-SAFE: every runner is
 // refused the pass and nothing runs an agent.
 const capabilityMergeCandidateVerify = "merge-candidate-verify"
+
+// capabilityChildPushResume is the runnerCapabilitiesHeader token for the
+// decomposition-child push resume (E55.16 / #3916). It certifies that this
+// runner's openHeldCommitPR carries the E72.60 / #4079 decomposition-child
+// arm: a child push resume publishes the slice branch, reports `pushed` and
+// NEVER opens a PR, and every non-push kind is refused for a child. A runner
+// advertising only capabilityPushResume may predate that arm and open a
+// standalone PR from the slice branch (the #3910 mechanism), so
+// resolvePushCheckpointResume serves a push kind to a decomposition child only
+// when this token is present too.
+// WIRE VALUE: byte-identical to the runner's upload.CapabilityChildPushResume.
+// A drift is fail-SAFE: no request advertises it, so every child push resume
+// is declined and the agent re-runs.
+const capabilityChildPushResume = "child-push-resume"
 
 // runnerAdvertises reports whether the request's capability header carries
 // token. Comma-separated, space-trimmed, CASE-SENSITIVE (the tokens are wire
@@ -5522,6 +5551,18 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 // AUDITED (verified_tree_discarded) on the dispatch path so no recorded
 // verified tree is thrown away silently.
 //
+// DECOMPOSITION-CHILD GATING (E55.16 / #3916), also a TOTAL DECLINE. A child
+// (runRow.DecomposedFrom set) must never open a standalone PR for its slice
+// branch, so: (a) a push kind is served to a child ONLY when the runner also
+// advertises capabilityChildPushResume — the token certifying the #4079 child
+// arm that publishes the slice branch and reports `pushed` — and is otherwise
+// declined with reason runner_child_capability_absent (a runner advertising
+// push-resume alone may predate that arm and fall into the PR-open tail, the
+// #3910 mechanism); (b) a pr_open kind is never served to a child (reason
+// child_resume_kind_unsupported, mirroring the runner's own refusal token),
+// since serving it sends the runner to open a PR from the slice branch. The
+// child token never gates a non-child run.
+//
 // recordDrop selects the DISPATCH path (handleGetStagePrompt, true) over the
 // preview render (handleGetStagePromptRender, false): only a real dispatch may
 // write the decline audit row, so previewing a stage never mutates the chain.
@@ -5532,7 +5573,7 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 // unrecognized kind. The cost of a wrong emission is a PR opened from an
 // unintended head; the cost of a wrong omission is today's agent re-run. Those
 // are not symmetric.
-func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, recordDrop bool) (heldCommitResume, bool) {
+func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, runnerAdvertisesChildPushResume, recordDrop bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement {
 		return heldCommitResume{}, false
 	}
@@ -5554,14 +5595,25 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 		}
 		return heldCommitResume{}, false
 	}
+	isChild := runRow != nil && runRow.DecomposedFrom != nil
 	switch cp.ResumeKind {
 	case resumeKindPROpen:
-		// Unchanged by #3621 and UNAFFECTED by the capability flag: every
-		// pre-existing checkpoint is a post-push one, and this is what keeps the
-		// #2169 path byte-identical.
+		// Unchanged by #3621 and UNAFFECTED by the capability flags for a
+		// standalone run: every pre-existing checkpoint is a post-push one, and
+		// this is what keeps the #2169 path byte-identical.
+		if isChild {
+			// E55.16 / #3916: a child never arms pr_open after #4079, and serving
+			// one sends the runner to open a PR from the slice branch.
+			return decline("child_resume_kind_unsupported")
+		}
 	case resumeKindPush:
 		if !runnerAdvertisesPushResume {
 			return decline("runner_capability_absent")
+		}
+		if isChild && !runnerAdvertisesChildPushResume {
+			// E55.16 / #3916: only a runner with the #4079 child arm may resume a
+			// child's push; an older push-resume runner opens a standalone PR.
+			return decline("runner_child_capability_absent")
 		}
 		if cp.VerifiedTreeSHA == "" {
 			return decline("verified_tree_missing")
