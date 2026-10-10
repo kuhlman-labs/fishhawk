@@ -97,7 +97,11 @@ type reviewerInvocation struct {
 	// capability-framed *_review_skipped audit instead of *_review_failed and
 	// uses optional to pick the surface: true → quiet graceful skip, false
 	// (default, including the bare count form which has no per-reviewer flag)
-	// → loud ERROR log + skipped audit. It never blocks the gate either way.
+	// → loud ERROR log + skipped audit. It never blocks the gate either way —
+	// EXCEPT that optional never exempts an ESCALATION-attached persona under
+	// gating authority (#3913): an escalation may only raise, so a flag on the
+	// persona declaration cannot downgrade the escalation's requirement
+	// (escalationPersonaGateBlock).
 	optional bool
 
 	// persona is non-nil when this invocation is a reviewer PERSONA (ADR-084 /
@@ -1501,12 +1505,21 @@ func deref(s *string) string {
 // their severity caps at ingest (runPlanReviewLoopWithConventions) BEFORE the
 // payload, the gating decision or the concern store read it.
 //
+// Under gating authority it ALSO fails the stage category-B and returns true
+// when a persona a FIRED escalation attached cannot run (#3913,
+// escalationPersonaGateBlock): the reason reads
+// "plan_review_rejected: escalation_persona_unavailable: ..." naming each
+// blocked persona, and takes precedence over a reject verdict
+// (planReviewGatingFailureReason). Every reviewer still runs first, so the
+// round settles at configured_agents.
+//
 // Returns false (no gating rejection) when:
 //   - no reviewer backend is configured (nil ReviewerSet or Default() nil)
 //   - RunRepo is nil
 //   - the run's workflow spec carries no plan stage with reviewers.agent>0
 //   - authority is advisory (review runs detached, never blocks)
-//   - all review agents approve (or approve_with_concerns)
+//   - all review agents approve (or approve_with_concerns) and no
+//     escalation-attached persona was blocked
 //
 // All per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't fail the upload response — the plan artifact
@@ -1821,16 +1834,18 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// returns, so the export is live for every reviewer and removed right after.
 	defer treeCleanup()
 	hasRejection := s.runPlanReviewLoopWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
-	if hasRejection {
+	// An escalation-attached persona that could not run blocks the gating
+	// round (#3913), decided HERE rather than in the loop so hasRejection keeps
+	// its verdict-only meaning.
+	if reason := planReviewGatingFailureReason(hasRejection, escalationPersonaGateBlock(personaInvs)); reason != "" {
 		cat := run.FailureB
-		reason := "plan_review_rejected: agent review verdict reject under gating authority"
 		if _, terr := s.cfg.RunRepo.TransitionStage(reviewCtx, stageID,
 			run.StageStateFailed, &run.StageCompletion{
 				FailureCategory: &cat,
 				FailureReason:   &reason,
 			}); terr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn,
-				"plan review: transition to failed-B after gating reject failed",
+				"plan review: transition to failed-B after gating reject or escalation-persona block failed",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
 				slog.String("error", terr.Error()),
@@ -1839,6 +1854,26 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return true
 	}
 	return false
+}
+
+// planReviewGatingRejectReason is the plan stage's category-B failure reason
+// for a gating reject verdict.
+const planReviewGatingRejectReason = "plan_review_rejected: agent review verdict reject under gating authority"
+
+// planReviewGatingFailureReason returns the category-B failure reason a gating
+// plan-review round records, or "" when the round does not fail the stage.
+// block is escalationPersonaGateBlock's result (#3913); when non-empty it wins
+// over a reject verdict, because a fix-up or replan cannot clear it (the
+// reject stays visible in the plan_reviewed entries). A reject alone keeps the
+// pre-#3913 literal byte-unchanged.
+func planReviewGatingFailureReason(rejected bool, block string) string {
+	if block != "" {
+		return "plan_review_rejected: " + block
+	}
+	if rejected {
+		return planReviewGatingRejectReason
+	}
+	return ""
 }
 
 // planGateEvidence maps the plan-gate result payloads handleShipPlan's
@@ -2138,7 +2173,10 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 //
 // persona names the reviewer persona (#3753) whose provider is unavailable,
 // stamped on the payload; "" for a standard reviewer (byte-identical).
-func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, provider, persona string, optional bool, configuredAgents int, resolveErr error) {
+// escalationAttached (#3913) stamps escalation_attached for a persona a fired
+// escalation attached: under gating authority that skip DOES fail the stage,
+// at the dispatch site (escalationPersonaGateBlock), whatever optional says.
+func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, provider, persona string, optional, escalationAttached bool, configuredAgents int, resolveErr error) {
 	knob := reviewerProviderEnvKnob(provider)
 	if optional {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
@@ -2165,12 +2203,13 @@ func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uui
 		return
 	}
 	payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
-		Reason:           planreview.ReasonReviewerUnavailable,
-		ConfiguredAgents: configuredAgents,
-		Authority:        authority,
-		Provider:         provider,
-		Optional:         optional,
-		Persona:          persona,
+		Reason:             planreview.ReasonReviewerUnavailable,
+		ConfiguredAgents:   configuredAgents,
+		Authority:          authority,
+		Provider:           provider,
+		Optional:           optional,
+		Persona:            persona,
+		EscalationAttached: escalationAttached,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2343,7 +2382,7 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 		// untouched. *_review_skipped counts as terminal (planreview.Settled),
 		// so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
-			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, len(invocations), inv.resolveErr)
+			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, inv.escalationAttached(), len(invocations), inv.resolveErr)
 			continue
 		}
 		// A reviewer persona whose remit could not be resolved, rendered or

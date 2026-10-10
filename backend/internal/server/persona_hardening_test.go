@@ -529,7 +529,10 @@ func assertSettledWith(t *testing.T, au *auditFake, configured int) {
 // carries ONE pseudo invocation that is counted (configured_agents 2 on its
 // skip), emits ONE terminal implement_review_skipped with reason
 // persona_attachment_unresolvable and detail escalation_unevaluable, never
-// rejects, and the round settles; the standard reviewer still runs.
+// sets the LOOP's verdict accumulator, and the round settles; the standard
+// reviewer still runs. The skip is escalation_attached: under gating authority
+// the DISPATCH SITE fails the stage on it (#3913, escalationPersonaGateBlock —
+// TestEscalationPersonaGateBlock_Sources), not the loop.
 //
 // Counterfactual (run): drop the `for _, detail := range unresolvable` loop in
 // resolvePersonaInvocations — no pseudo invocation, no skip, the standard
@@ -539,7 +542,7 @@ func TestPersonaHardening_EscalationUnevaluable_ThroughImplementLoop(t *testing.
 	l := newLoopRun(t, "")
 	rejected, configured := l.review(t, l.parsed(t, true))
 	if rejected {
-		t.Error("hasRejection = true: an unevaluable escalation must never gate")
+		t.Error("hasRejection = true: the loop's verdict accumulator must stay verdict-only — the escalation_unevaluable block is decided at the dispatch site (#3913)")
 	}
 	if configured != 2 {
 		t.Fatalf("invocations = %d, want 2 (standard + the escalation_unevaluable pseudo invocation)", configured)
@@ -547,6 +550,9 @@ func TestPersonaHardening_EscalationUnevaluable_ThroughImplementLoop(t *testing.
 	sk := skipsWith(t, l.au, personaDetailEscalationUnevaluable)
 	if len(sk) != 1 || sk[0].Reason != planreview.ReasonPersonaAttachmentUnresolvable || sk[0].ConfiguredAgents != 2 || sk[0].Persona != "" {
 		t.Fatalf("escalation_unevaluable skips = %+v, want one persona_attachment_unresolvable skip counted at configured_agents 2", sk)
+	}
+	if !sk[0].EscalationAttached {
+		t.Error("escalation_unevaluable skip escalation_attached = false, want true (#3913)")
 	}
 	if n := len(reviewerCalls(l.persona)); n != 0 {
 		t.Errorf("persona calls = %d, want 0 — nothing fired that could be evaluated", n)
@@ -594,6 +600,8 @@ func TestPersonaHardening_Mixed_StaticDegradedEscalationRuns(t *testing.T) {
 	}
 	if sk := skipsWith(t, l.au, personaDetailStageUnresolvable); len(sk) != 1 || sk[0].ConfiguredAgents != 3 {
 		t.Errorf("persona_stage_unresolvable skips = %+v, want one counted at configured_agents 3", sk)
+	} else if sk[0].EscalationAttached {
+		t.Error("persona_stage_unresolvable skip escalation_attached = true, want false — it is static-source by construction (#3913)")
 	}
 	if sk := skipsWith(t, l.au, personaDetailEscalationUnevaluable); len(sk) != 0 {
 		t.Errorf("escalation_unevaluable skips = %+v, want none — the escalation source resolved", sk)
@@ -604,7 +612,8 @@ func TestPersonaHardening_Mixed_StaticDegradedEscalationRuns(t *testing.T) {
 // (c3) MIXED, the other way: the ESCALATION source is unevaluable while the
 // statically attached persona still runs. Standard + static security + the
 // escalation pseudo invocation; the static persona's verdict lands and the
-// round settles at three.
+// round settles at three. The loop's verdict accumulator stays false; the
+// escalation_attached skip blocks a gating round at the dispatch site (#3913).
 //
 // Counterfactual (run): return early from resolveParsedReviewPersonaInvocations
 // when the escalation source degrades (dropping the static personas) — the
@@ -613,7 +622,7 @@ func TestPersonaHardening_Mixed_EscalationUnevaluableStaticRuns(t *testing.T) {
 	l := newLoopRun(t, "implement")
 	rejected, configured := l.review(t, l.parsed(t, true))
 	if rejected {
-		t.Error("hasRejection = true, want false")
+		t.Error("hasRejection = true, want false — the loop stays verdict-only; the block is decided at the dispatch site (#3913)")
 	}
 	if configured != 3 {
 		t.Fatalf("invocations = %d, want 3 (standard + static security + the escalation pseudo invocation)", configured)
@@ -623,6 +632,8 @@ func TestPersonaHardening_Mixed_EscalationUnevaluableStaticRuns(t *testing.T) {
 	}
 	if sk := skipsWith(t, l.au, personaDetailEscalationUnevaluable); len(sk) != 1 || sk[0].ConfiguredAgents != 3 {
 		t.Errorf("escalation_unevaluable skips = %+v, want one counted at configured_agents 3", sk)
+	} else if !sk[0].EscalationAttached {
+		t.Error("escalation_unevaluable skip escalation_attached = false, want true (#3913)")
 	}
 	if sk := skipsWith(t, l.au, personaDetailStageUnresolvable); len(sk) != 0 {
 		t.Errorf("persona_stage_unresolvable skips = %+v, want none — the static source resolved", sk)
