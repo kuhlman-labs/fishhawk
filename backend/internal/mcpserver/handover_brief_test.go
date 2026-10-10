@@ -2,12 +2,14 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -119,6 +121,87 @@ func TestHandoverBrief_BoundsAtSessionBudgetKeepingCanonicalHash(t *testing.T) {
 	}
 	if rehash := handoverbrief.Hash(*out.Brief); rehash == canon.BriefHash {
 		t.Errorf("the bounded body hashes to the canonical hash; the fixture does not distinguish a re-hash")
+	}
+}
+
+// scanLimitedCampaigns is a campaigns part as handoverbrief.Compose builds it
+// with BOTH pending and running over the scan limit: limit rows per state and
+// one continuation per state at the limit (next the first). Each row carries
+// a long ref so the in_flight section dominates the brief's size.
+func scanLimitedCampaigns(limit int) handoverbrief.Part {
+	at := time.Unix(1_700_000_000, 0).UTC()
+	p := handoverbrief.Part{Kind: handoverbrief.PartCampaigns, Truncated: true, OmittedCount: 2}
+	for _, st := range []string{"pending", "running"} {
+		for i := 0; i < limit; i++ {
+			p.InFlight = append(p.InFlight, handoverbrief.InFlightItem{Kind: "campaign", ID: uuid.New(), State: st, Ref: strings.Repeat("r", 200), CreatedAt: at})
+		}
+		q := url.Values{"repo": {briefTestRepo}, "state": {st}, "cursor": {base64.URLEncoding.EncodeToString([]byte("offset:" + strconv.Itoa(limit)))}}
+		p.Continuations = append(p.Continuations, handoverbrief.Cursor{Part: handoverbrief.PartCampaigns, Call: "GET /v0/campaigns?" + q.Encode(), Offset: limit})
+	}
+	next := p.Continuations[0]
+	p.Next = &next
+	return p
+}
+
+// TestHandoverBrief_RebindKeepsEveryStateContinuation (#3862): the REST
+// route's bound (DefaultByteBudget) cuts inside pending and drops running
+// ENTIRELY, so the REST body carries running only as a running@0
+// continuation; the tool's re-bound at its session budget cuts further into
+// pending and must still name BOTH states — pending at its kept count and
+// running at 0 — with next the first.
+func TestHandoverBrief_RebindKeepsEveryStateContinuation(t *testing.T) {
+	canon := briefFixture(5)
+	canon.Sections[1].Parts = []handoverbrief.Part{scanLimitedCampaigns(120)}
+	canon.BriefHash = handoverbrief.Hash(canon)
+
+	rest, err := handoverbrief.Bound(canon, handoverbrief.DefaultByteBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := rest.Sections[1].Parts[0]
+	for _, it := range rp.InFlight {
+		if it.State != "pending" {
+			t.Fatalf("REST bound kept a %s campaign; the fixture must leave running only in a continuation", it.State)
+		}
+	}
+	if len(rp.InFlight) == 0 || len(rp.Continuations) != 2 {
+		t.Fatalf("REST campaigns = %d items, continuations %+v; want a cut inside pending", len(rp.InFlight), rp.Continuations)
+	}
+	restRaw, _ := json.Marshal(rest)
+	budget := len(restRaw) / 2
+
+	ts, _ := fakeBriefBackend(t, canon)
+	r := digestResolver(ts.URL, map[string]string{mcpResponseBudgetEnvVar: strconv.Itoa(budget)})
+	_, out, err := r.handoverBrief(context.Background(), nil, HandoverBriefInput{Repo: briefTestRepo})
+	if err != nil {
+		t.Fatalf("handover brief: %v", err)
+	}
+	p := out.Brief.Sections[1].Parts[0]
+	kept := len(p.InFlight)
+	if kept == 0 || kept >= len(rp.InFlight) {
+		t.Fatalf("tool kept %d campaigns of the REST body's %d; the re-bound must cut inside pending", kept, len(rp.InFlight))
+	}
+	if len(p.Continuations) != 2 {
+		t.Fatalf("tool campaigns continuations = %+v, want one for pending and one for running", p.Continuations)
+	}
+	for i, want := range []struct {
+		state  string
+		offset int
+	}{{"pending", kept}, {"running", 0}} {
+		cur := p.Continuations[i]
+		_, query, _ := strings.Cut(cur.Call, "?")
+		q, _ := url.ParseQuery(query)
+		off := 0
+		if c := q.Get("cursor"); c != "" {
+			raw, _ := base64.URLEncoding.DecodeString(c)
+			off, _ = strconv.Atoi(strings.TrimPrefix(string(raw), "offset:"))
+		}
+		if !strings.HasPrefix(cur.Call, "GET /v0/campaigns?") || q.Get("state") != want.state || off != want.offset || cur.Offset != want.offset {
+			t.Errorf("continuation %d = %+v, want GET /v0/campaigns state=%s at offset %d", i, cur, want.state, want.offset)
+		}
+	}
+	if p.Next == nil || *p.Next != p.Continuations[0] {
+		t.Errorf("next = %+v, want continuations[0] %+v", p.Next, p.Continuations[0])
 	}
 }
 

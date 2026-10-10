@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -465,6 +466,180 @@ func TestHandoverBriefDelegation_UnavailableDegradesTheBrief(t *testing.T) {
 	if !found {
 		t.Errorf("degradations = %+v, want delegation_unavailable naming the missing cached spec", b.Degradations)
 	}
+}
+
+// followListContinuation issues a brief continuation's call against the REAL
+// list handler it names (handleListCampaigns / handleListRuns) with a reader
+// identity, pages through next_cursor until it is empty, and returns every
+// row id it reached in order.
+func followListContinuation(t *testing.T, s *Server, cur handoverbrief.Cursor) []uuid.UUID {
+	t.Helper()
+	method, target, _ := strings.Cut(cur.Call, " ")
+	path, query, _ := strings.Cut(target, "?")
+	handler := map[string]http.HandlerFunc{"/v0/campaigns": s.handleListCampaigns, "/v0/runs": s.handleListRuns}[path]
+	if method != http.MethodGet || handler == nil {
+		t.Fatalf("continuation %q does not name a list route", cur.Call)
+	}
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatalf("continuation %q: %v", cur.Call, err)
+	}
+	var ids []uuid.UUID
+	for page := 0; ; page++ {
+		if page > 20 {
+			t.Fatalf("continuation %q: next_cursor never ran out", cur.Call)
+		}
+		req := httptest.NewRequest(method, path+"?"+q.Encode(), nil)
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: "github:reader"}))
+		w := httptest.NewRecorder()
+		handler(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s %s?%s = %d:\n%s", method, path, q.Encode(), w.Code, w.Body.String())
+		}
+		var body struct {
+			Items []struct {
+				ID uuid.UUID `json:"id"`
+			} `json:"items"`
+			NextCursor string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		for _, it := range body.Items {
+			ids = append(ids, it.ID)
+		}
+		if body.NextCursor == "" {
+			return ids
+		}
+		q.Set("cursor", body.NextCursor)
+	}
+}
+
+// assertBriefCoversSeeded: for each in_flight part, the kept items plus every
+// continuation followed through the real list routes reach every seeded row
+// of every state exactly once.
+func assertBriefCoversSeeded(t *testing.T, label string, s *Server, b handoverbrief.Brief, seeded map[handoverbrief.PartKind]map[string][]uuid.UUID) {
+	t.Helper()
+	for kind, states := range seeded {
+		p := briefPart(t, b, handoverbrief.SectionInFlight, kind)
+		if p.Truncated && (len(p.Continuations) == 0 || p.Next == nil || *p.Next != p.Continuations[0]) {
+			t.Fatalf("%s: %s part truncated with next %+v / continuations %+v", label, kind, p.Next, p.Continuations)
+		}
+		got := map[string][]uuid.UUID{}
+		for _, it := range p.InFlight {
+			got[it.State] = append(got[it.State], it.ID)
+		}
+		for _, cur := range p.Continuations {
+			_, query, _ := strings.Cut(cur.Call, "?")
+			q, _ := url.ParseQuery(query)
+			got[q.Get("state")] = append(got[q.Get("state")], followListContinuation(t, s, cur)...)
+		}
+		for st, want := range states {
+			seen := map[uuid.UUID]bool{}
+			for _, id := range got[st] {
+				if seen[id] {
+					t.Errorf("%s: %s %s row %s reached twice", label, kind, st, id)
+				}
+				seen[id] = true
+			}
+			for _, id := range want {
+				if !seen[id] {
+					t.Errorf("%s: %s %s seeded row %s unreachable (kept+followed %v, continuations %+v)", label, kind, st, id, got[st], p.Continuations)
+				}
+			}
+			if len(got[st]) != len(want) {
+				t.Errorf("%s: %s %s kept+followed %d rows, want %d", label, kind, st, len(got[st]), len(want))
+			}
+		}
+	}
+}
+
+// TestHandoverBrief_ContinuationsFollowThroughRealListRoutes (#3862) crosses
+// composition, the wire cursor, the REST list routes' cursor decode and the
+// repositories: TWO states over the scan limit in both in_flight parts, every
+// continuation issued against the REAL handleListCampaigns / handleListRuns.
+// It composes through handoverbrief.Compose with the production deps (the
+// route fixes DefaultScanLimit 500, impractical to overflow in two states);
+// every follow goes through the real handlers. Arm 2 Bounds the in_flight
+// section so the cut lands inside the campaigns part, proving the byte-bound
+// cursors decode and page correctly too.
+func TestHandoverBrief_ContinuationsFollowThroughRealListRoutes(t *testing.T) {
+	f := newBriefPG(t)
+	ctx := context.Background()
+	seeded := map[handoverbrief.PartKind]map[string][]uuid.UUID{handoverbrief.PartCampaigns: {}, handoverbrief.PartRuns: {}}
+	for _, st := range []campaign.State{campaign.StatePending, campaign.StateRunning} {
+		for i := 0; i < 3; i++ {
+			c, err := f.srv.cfg.CampaignRepo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: briefPGRepo, EpicRef: "issue:" + uuid.NewString()[:6]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.State != st {
+				if c, err = f.srv.cfg.CampaignRepo.TransitionCampaign(ctx, c.ID, st); err != nil {
+					t.Fatal(err)
+				}
+			}
+			seeded[handoverbrief.PartCampaigns][string(st)] = append(seeded[handoverbrief.PartCampaigns][string(st)], c.ID)
+		}
+		for i := 0; i < 3; i++ {
+			id := uuid.New()
+			if _, err := f.pool.Exec(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+				VALUES ($1, $2, 'feature_change', 'sha', 'cli', $3, 'local')`, id, briefPGRepo, string(st)); err != nil {
+				t.Fatal(err)
+			}
+			seeded[handoverbrief.PartRuns][string(st)] = append(seeded[handoverbrief.PartRuns][string(st)], id)
+		}
+	}
+	composed, err := handoverbrief.Compose(ctx, f.srv.handoverBriefDeps(ctx, briefPGRepo), handoverbrief.Request{Repo: briefPGRepo, ScanLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := func(b handoverbrief.Brief, budget int) handoverbrief.Brief {
+		t.Helper()
+		bounded, err := handoverbrief.Bound(b, budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(bounded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out handoverbrief.Brief
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	full := wire(composed, handoverbrief.DefaultByteBudget)
+	for kind := range seeded {
+		if p := briefPart(t, full, handoverbrief.SectionInFlight, kind); len(p.Continuations) != 2 {
+			t.Fatalf("%s continuations = %+v, want one per overflowing state (2)", kind, p.Continuations)
+		}
+	}
+	assertBriefCoversSeeded(t, "scan-limit continuations", f.srv, full, seeded)
+
+	sel, err := handoverbrief.Select(composed, handoverbrief.SectionInFlight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The floor of a selected section keeps one element of its first part;
+	// the smallest budget Bound accepts is that floor, which cuts inside the
+	// campaigns' pending state and drops running and every run.
+	lo, hi := 1, handoverbrief.DefaultByteBudget
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if _, err := handoverbrief.Bound(sel, mid); errors.Is(err, handoverbrief.ErrBudgetTooSmall) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	cut := wire(sel, lo)
+	camp := briefPart(t, cut, handoverbrief.SectionInFlight, handoverbrief.PartCampaigns)
+	if len(camp.InFlight) != 1 || camp.InFlight[0].State != "pending" || len(camp.Continuations) != 2 {
+		t.Fatalf("floor-bounded campaigns = %d items %+v, continuations %+v; want a cut inside pending", len(camp.InFlight), camp.InFlight, camp.Continuations)
+	}
+	assertBriefCoversSeeded(t, "byte-bound continuations", f.srv, cut, seeded)
 }
 
 // TestOpenAPI_HandoverBriefDocumented: the route and the offer's brief fields

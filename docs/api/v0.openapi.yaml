@@ -9458,7 +9458,24 @@ components:
         complete: { type: boolean }
         truncated: { type: boolean }
         omitted_count: { type: integer }
-        next: { $ref: '#/components/schemas/HandoverBriefCursor' }
+        next:
+          allOf:
+            - $ref: '#/components/schemas/HandoverBriefCursor'
+          description: >-
+            The continuation at the first omitted element. On `campaigns` /
+            `runs` it is `continuations[0]` — follow every entry of
+            `continuations` to reach every omitted row.
+        continuations:
+          type: array
+          items: { $ref: '#/components/schemas/HandoverBriefCursor' }
+          description: >-
+            `campaigns` / `runs` only, emitted whenever the part is truncated.
+            Such a part is one list query PER non-terminal state, so it carries
+            one cursor per state with omitted rows, in state order (campaigns:
+            pending, running, paused, awaiting_human; runs: pending, running);
+            `next` equals the first. Offsets are absolute per state (every
+            composition reads each state from offset 0). Excluded from
+            `brief_hash`.
     HandoverBriefCursor:
       type: object
       description: The exact UNDERLYING query that retrieves an elided remainder.

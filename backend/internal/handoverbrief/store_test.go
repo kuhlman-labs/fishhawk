@@ -2,9 +2,11 @@ package handoverbrief
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -202,6 +204,9 @@ func TestStore_LimitPlusOneBite(t *testing.T) {
 	if len(p.InFlight) != 2 || !p.Truncated || p.Complete || p.Next == nil || p.Next.Offset != 2 {
 		t.Fatalf("campaigns part = %+v, want 2 items truncated with offset-2 cursor", p)
 	}
+	if len(p.Continuations) != 1 || p.Continuations[0] != *p.Next {
+		t.Errorf("continuations = %+v, want exactly the one overflowing state's cursor %+v", p.Continuations, *p.Next)
+	}
 	if p.InFlight[0].ID != all[0].ID || p.InFlight[1].ID != all[1].ID {
 		t.Errorf("kept %v, want the first two of %v", p.InFlight, all)
 	}
@@ -214,6 +219,124 @@ func TestStore_LimitPlusOneBite(t *testing.T) {
 	}
 	if b.BriefHash == "" {
 		t.Error("brief hash empty on a degraded brief")
+	}
+}
+
+// decodeContinuation reads a list continuation's state and offset back out of
+// its call, the way the /v0/campaigns and /v0/runs routes decode them.
+func decodeContinuation(t *testing.T, cur Cursor) (string, int) {
+	t.Helper()
+	_, query, _ := strings.Cut(cur.Call, "?")
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatalf("continuation %q: %v", cur.Call, err)
+	}
+	off := 0
+	if c := q.Get("cursor"); c != "" {
+		raw, err := base64.URLEncoding.DecodeString(c)
+		n, ok := strings.CutPrefix(string(raw), "offset:")
+		if err != nil || !ok {
+			t.Fatalf("continuation %q: undecodable cursor", cur.Call)
+		}
+		if off, err = strconv.Atoi(n); err != nil {
+			t.Fatalf("continuation %q: %v", cur.Call, err)
+		}
+	}
+	return q.Get("state"), off
+}
+
+// TestStore_EveryOverflowingStateHasAContinuation (#3862): with TWO states
+// over the scan limit in both in_flight parts, each state carries its own
+// continuation, and following each one through the REAL repository reaches
+// every seeded row exactly once. The running state's last row is reachable
+// ONLY through running's own continuation.
+func TestStore_EveryOverflowingStateHasAContinuation(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	seeded := map[PartKind]map[string][]uuid.UUID{PartCampaigns: {}, PartRuns: {}}
+	for _, st := range []campaign.State{campaign.StatePending, campaign.StateRunning} {
+		for i := 0; i < 3; i++ {
+			c := f.campaign(t, st)
+			seeded[PartCampaigns][string(st)] = append(seeded[PartCampaigns][string(st)], c.ID)
+		}
+	}
+	seeded[PartRuns]["running"] = []uuid.UUID{f.run}
+	for i := 0; i < 3; i++ {
+		seeded[PartRuns]["pending"] = append(seeded[PartRuns]["pending"], f.seedRun(t, "pending"))
+	}
+	for i := 0; i < 2; i++ {
+		seeded[PartRuns]["running"] = append(seeded[PartRuns]["running"], f.seedRun(t, "running"))
+	}
+	b, err := Compose(ctx, f.deps(), Request{Repo: testRepo, ScanLimit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// follow pages a state from offset through the real repository.
+	follow := func(part PartKind, state string, offset int) []uuid.UUID {
+		var ids []uuid.UUID
+		if part == PartCampaigns {
+			rows, err := f.campaigns.ListCampaigns(ctx, campaign.ListCampaignsFilter{Repo: testRepo, State: state, Limit: 100, Offset: offset})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range rows {
+				ids = append(ids, r.ID)
+			}
+			return ids
+		}
+		rows, err := f.runs.ListRuns(ctx, run.ListRunsFilter{Repo: testRepo, State: state, Limit: 100, Offset: offset})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		return ids
+	}
+	for _, kind := range []PartKind{PartCampaigns, PartRuns} {
+		p := partOf(t, b, SectionInFlight, kind)
+		path := map[PartKind]string{PartCampaigns: "/v0/campaigns", PartRuns: "/v0/runs"}[kind]
+		if len(p.InFlight) != 4 || !p.Truncated || len(p.Continuations) != 2 {
+			t.Fatalf("%s part = %d items truncated=%v continuations %+v, want 4 items and 2 continuations", kind, len(p.InFlight), p.Truncated, p.Continuations)
+		}
+		for i, st := range []string{"pending", "running"} {
+			cur := p.Continuations[i]
+			if !strings.HasPrefix(cur.Call, "GET "+path+"?") || !strings.Contains(cur.Call, "state="+st) ||
+				!strings.Contains(cur.Call, "cursor="+url.QueryEscape(encodeOffset(2))) || cur.Offset != 2 {
+				t.Errorf("%s continuation %d = %+v, want %s state=%s at offset 2", kind, i, cur, path, st)
+			}
+		}
+		if p.Next == nil || *p.Next != p.Continuations[0] {
+			t.Errorf("%s next = %+v, want continuations[0]", kind, p.Next)
+		}
+		if !hasDegradation(b, DegradationScanLimit, kind) {
+			t.Errorf("degradations = %+v, want a scan_limit on %s", b.Degradations, kind)
+		}
+		got := map[string][]uuid.UUID{}
+		for _, it := range p.InFlight {
+			got[it.State] = append(got[it.State], it.ID)
+		}
+		for _, cur := range p.Continuations {
+			st, off := decodeContinuation(t, cur)
+			got[st] = append(got[st], follow(kind, st, off)...)
+		}
+		for st, want := range seeded[kind] {
+			seen := map[uuid.UUID]bool{}
+			for _, id := range got[st] {
+				if seen[id] {
+					t.Errorf("%s %s: row %s reached twice", kind, st, id)
+				}
+				seen[id] = true
+			}
+			for _, id := range want {
+				if !seen[id] {
+					t.Errorf("%s %s: seeded row %s unreachable (kept+followed %v)", kind, st, id, got[st])
+				}
+			}
+			if len(got[st]) != len(want) {
+				t.Errorf("%s %s: kept+followed %d rows, want the %d seeded", kind, st, len(got[st]), len(want))
+			}
+		}
 	}
 }
 
