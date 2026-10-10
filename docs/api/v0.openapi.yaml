@@ -12748,17 +12748,38 @@ paths:
         re-parks and republishes at the current head — which is what makes
         re-invoking this endpoint a REAL retry after a failed check re-post.
 
-        **Degraded head read.** If the merge succeeds but the post-merge head
-        cannot be read back, the response is 200 with `new_head_sha` empty and
-        publication SKIPPED — deliberately NOT falling back to the pre-merge
-        head, which would pin the required check to exactly the stale sha this
-        endpoint exists to move off. The warning names re-invocation.
+        **The post-merge head (#4199).** The forge's PR head lags the
+        branch-ref update (read-after-write lag), so after a performed merge
+        the endpoint re-reads the PR head boundedly (an initial read plus up
+        to 5 re-reads, ~10s of backoff) and CLASSIFIES what it saw as
+        `post_merge_head_read`: `converged` (the head is the merge commit),
+        `read_after_write_lag` (every successful read returned the pre-merge
+        head), `concurrent_push` (a head that is neither the pre-merge head
+        nor the merge commit), `unreadable` (no read succeeded) or
+        `read_back` (the merge sha did not decode and a read returned a head
+        that differs from the pre-merge head). The new head is resolved by
+        PROVENANCE: when the merges API decoded the merge commit sha, that
+        sha IS the new head for `converged`, `read_after_write_lag` and
+        `unreadable` — so the check re-post, the `branch_rebased` entry and
+        the merge-candidate verify trigger all anchor on the merge commit and
+        read-after-write lag is never reported as a concurrent push. Only a
+        genuine `concurrent_push` keeps the observed head.
+
+        **Degraded head read — only when the merge sha did not decode.** On
+        the benign undecodable-201 shape the re-read supplies the head, and
+        it is accepted only when it differs from the pre-merge head. If the
+        re-read failed or stayed at the pre-merge head, the response is 200
+        with `new_head_sha` empty and publication SKIPPED — deliberately NOT
+        falling back to the pre-merge head, which would pin the required check
+        to exactly the stale sha this endpoint exists to move off. The warning
+        names re-invocation.
 
         **Merge-candidate verify pass (ADR-090 / E83.33 / #4018).** A base
         merge produces a head no runner gated on the committed tree, so when
         the workflow declares an `executor.verify` command a performed merge's
-        200 also authorizes a runner VERIFY-ONLY pass for the re-read new head
-        (cause `base_advance`): a `stage_merge_candidate_verify_triggered`
+        200 also authorizes a runner VERIFY-ONLY pass for the resolved new head
+        (the decoded merge commit, per the provenance rule above; cause
+        `base_advance`): a `stage_merge_candidate_verify_triggered`
         entry is recorded under the operator's identity and the implement
         stage re-opens. The pass has its OWN per-head idempotency and never
         reads or spends the fix-up budget. The already-up-to-date arm
@@ -12821,13 +12842,39 @@ paths:
                   branch: { type: string }
                   base_ref: { type: string, description: 'The declared base ref that was merged in.' }
                   prior_head_sha: { type: string, description: 'The run branch tip before the advance.' }
-                  new_head_sha: { type: string, description: 'The AUTHORITATIVE post-advance head, from a live PR re-read. Empty when the re-read failed, in which case the check re-post was deliberately skipped.' }
-                  merge_commit_sha: { type: string, description: 'The merge commit the merges API returned. May legitimately be EMPTY on an undecodable 201 body — the merge still happened; use new_head_sha as the authority.' }
+                  new_head_sha: { type: string, description: 'The post-advance head, resolved by PROVENANCE (#4199). When merge_commit_sha decoded it is the authority: new_head_sha equals it unless the bounded post-merge re-read observed a genuine concurrent push (post_merge_head_read concurrent_push), in which case it is the observed head. Only when the merge sha did not decode does the re-read supply the head, accepted only when it differs from prior_head_sha; it is EMPTY when that re-read failed or stayed at the pre-merge head, in which case the check re-post was deliberately skipped.' }
+                  merge_commit_sha: { type: string, description: 'The merge commit the merges API returned — the authority for new_head_sha when it decoded. May legitimately be EMPTY on an undecodable 201 body — the merge still happened; new_head_sha then comes from the bounded post-merge re-read.' }
                   already_up_to_date: { type: boolean, description: 'The branch already contained the base, so no merge was attempted. Still re-parks and republishes.' }
                   reparked_review_stage_id: { type: string, description: 'The re-parked review stage id; omitted on the commit-yourself shape.' }
                   mechanism_note: { type: string, description: 'Constant sentence stating the merge-commit mechanism, shipped on every 200.' }
                   audit_check_republished: { type: boolean, description: 'Whether the fishhawk_audit_complete Check Run re-posted at the new head.' }
-                  audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land; names the reason and the idempotent re-invocation retry.' }
+                  audit_check_republish_warning: { type: string, description: 'Present when the re-post did not land (including when the head could not be resolved, which happens only when the merge sha did not decode); names the reason and the idempotent re-invocation retry.' }
+                  post_merge_head_read:
+                    type: string
+                    enum: [converged, read_after_write_lag, concurrent_push, unreadable, read_back]
+                    description: |
+                      Classification of the bounded post-merge PR head re-read
+                      (#4199), present only when THIS call performed a merge.
+                      `converged`: a read returned the merge commit.
+                      `read_after_write_lag`: every successful read returned
+                      the pre-merge head — the forge lagging the branch-ref
+                      update, NOT a concurrent push. `concurrent_push`: a head
+                      that is neither the pre-merge head nor the merge commit.
+                      `unreadable`: no read succeeded. `read_back`: the merge
+                      sha did not decode and a read returned a head that
+                      differs from the pre-merge head.
+                  post_merge_head_read_note:
+                    type: string
+                    description: |
+                      Present for the degraded classifications
+                      (`read_after_write_lag`, `unreadable`). For
+                      `read_after_write_lag` with a decoded merge sha it names
+                      the pre-merge head, the merge commit and the read count,
+                      and states that this is NOT a concurrent push and that no
+                      fishhawk_vouch_commit is needed — the merge commit is
+                      attributed and anchors both the check and the verify
+                      pass. For `unreadable` it names the last read error and
+                      that post-merge divergence could not be checked.
                   lineage_attribution_warning:
                     type: string
                     description: |
@@ -12835,13 +12882,18 @@ paths:
                       reported-head attribution is INCOMPLETE, so this 200 must
                       NOT be read as a clean recovery — the run stays wedged on
                       the lineage check until the operator acts. Three cases:
-                      (a) a CONCURRENT PUSH made new_head_sha diverge from the
-                      merge commit this call created, so the divergent head was
-                      deliberately NOT attributed (attributing a commit this
-                      invocation did not create would launder a foreign commit
-                      into the ledger); (b) the attribution append failed to
-                      persist; (c) nothing was attributable at all (an
-                      undecodable merge sha AND a failed post-merge re-read).
+                      (a) a CONCURRENT PUSH: after the bounded post-merge
+                      re-read the head is neither the pre-merge head nor the
+                      merge commit this call created
+                      (`post_merge_head_read` `concurrent_push`), so the
+                      divergent head was deliberately NOT attributed
+                      (attributing a commit this invocation did not create
+                      would launder a foreign commit into the ledger); a read
+                      stuck at the pre-merge head is read-after-write lag and
+                      does not warn; (b) the attribution append failed to
+                      persist; (c) nothing was attributable at all (only when
+                      the merge sha did not decode AND the post-merge re-read
+                      failed or stayed at the pre-merge head).
                       In cases (b) and (c) re-invoking this endpoint does NOT
                       repair the attribution — the retry takes the
                       already-contains-base arm, which attributes nothing — so
@@ -12862,8 +12914,10 @@ paths:
                       True when THIS call appended a
                       `stage_merge_candidate_verify_triggered` entry and
                       re-opened the implement stage for a runner verify-only
-                      pass. A performed base merge triggers one for the re-read
-                      new head; the already-up-to-date arm re-triggers only for
+                      pass. A performed base merge triggers one for the
+                      resolved new head (the decoded merge commit unless a
+                      genuine concurrent push was observed, #4199); the
+                      already-up-to-date arm re-triggers only for
                       an `unverified` Fishhawk-written head.
                   merge_candidate_verify_stage_id:
                     type: string

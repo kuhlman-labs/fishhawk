@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // --- E64.23 / #3125: fishhawk_rebase_run_branch ---
@@ -42,8 +43,9 @@ const (
 //
 //   - headSHASeq, when non-empty, returns headSHASeq[min(i, len-1)] on the
 //     i-th GET /pulls. Call 1 = the handler head read, call 2 = the lease
-//     re-check, call 3 = the post-merge authoritative re-read. This drives
-//     both the lease-change case and the post-merge head resolution.
+//     re-check, calls 3+ = the bounded post-merge re-read (#4199: an initial
+//     read plus up to len(backoff) re-reads). This drives both the
+//     lease-change case and the post-merge head classification.
 //   - prStatusSeq mirrors it for status codes, so the post-merge re-read can
 //     be failed independently of the earlier reads (condition 5).
 //   - behindCommits is what the behind-probe compare returns: EMPTY means the
@@ -268,6 +270,9 @@ func seedRebaseRun(t *testing.T, stub *rebaseGitHub, opt rebaseOpts) *rebaseSeed
 		GitHub:       gh,
 		APITokenRepo: tokenRepo,
 	})
+	// #4199: the post-merge head re-read backs off between reads; a lagging or
+	// failing stub must never sleep the ~10s production budget.
+	s.postMergeHeadReadBackoff = testPostMergeHeadReadBackoff()
 
 	stages := []*run.Stage{implStage}
 	var review *run.Stage
@@ -295,6 +300,14 @@ func seedRebaseRun(t *testing.T, stub *rebaseGitHub, opt rebaseOpts) *rebaseSeed
 		s.auditCheckPublisher = pub
 	}
 	return &rebaseSeed{s: s, stub: stub, au: au, rr: rr, creator: creator, runID: runID, review: review, bearer: bearer}
+}
+
+// testPostMergeHeadReadBackoff is the scaled re-read schedule every seeded
+// rebase server uses: the production shape (five re-reads) at millisecond
+// steps.
+func testPostMergeHeadReadBackoff() []time.Duration {
+	d := timescale.D(time.Millisecond)
+	return []time.Duration{d, d, d, d, d}
 }
 
 // cleanRebaseStub is the standard BEHIND stub: the run branch is one commit
@@ -525,6 +538,10 @@ func TestRebaseRunBranch_UndecodableMergeSHAStillPublishesAtLiveHead(t *testing.
 	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseNewHeadSHA {
 		t.Errorf("check publications = %v, want exactly one at the live head %q", got, rebaseNewHeadSHA)
 	}
+	if resp.PostMergeHeadRead != postMergeHeadReadReadBack {
+		t.Errorf("post_merge_head_read = %q, want %q (undecodable merge sha, re-read head differs from the prior head)",
+			resp.PostMergeHeadRead, postMergeHeadReadReadBack)
+	}
 }
 
 // TestRebaseRunBranch_PublishFailsThenReinvokeRepublishesAtHead is the
@@ -606,16 +623,22 @@ func TestRebaseRunBranch_PublishFailsThenReinvokeRepublishesAtHead(t *testing.T)
 }
 
 // TestRebaseRunBranch_PostMergeHeadReadFails_NoPublication is BINDING
-// CONDITION 5: when the merge SUCCEEDS but the post-merge head re-read FAILS,
+// CONDITION 5: when the merge SUCCEEDS but the new head is genuinely UNKNOWN,
 // the handler must NOT fall back to publishing at "no override" — that
 // resolves to the PRE-merge audit-recorded head, which is exactly the
 // staleness this verb exists to remove, and would make the verb cause the bug
 // it fixes. It must skip publication entirely, return 200, and name the
 // re-invocation retry in the warning.
+//
+// Since #4199 the head is unknown only when the merge sha did NOT decode AND
+// every post-merge re-read failed: a decoded merge sha is itself the new head
+// (TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit). So the
+// merges endpoint returns the benign undecodable 201 here.
 func TestRebaseRunBranch_PostMergeHeadReadFails_NoPublication(t *testing.T) {
 	stub := cleanRebaseStub()
-	// PR reads: 1 = handler head, 2 = lease re-check, 3+ = the post-merge
-	// authoritative re-read, which now fails.
+	stub.mergeBody = `{"no_sha_here":true}` // the benign undecodable 201
+	// PR reads: 1 = handler head, 2 = lease re-check, 3+ = the bounded
+	// post-merge re-read, every one of which now fails.
 	stub.prStatusSeq = []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError}
 	sd := seedRebaseRun(t, stub, rebaseOpts{})
 	// DISCRIMINATION, seeded BY CONSTRUCTION: the run carries a PRE-merge
@@ -1464,8 +1487,12 @@ func TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed(t *test
 	if resp.MergeCommitSHA != rebaseNewHeadSHA {
 		t.Fatalf("merge_commit_sha = %q, want the merge this call created %q", resp.MergeCommitSHA, rebaseNewHeadSHA)
 	}
+	// Non-fatal since #4199: a third head must be REPORTED as the new head
+	// (it supersedes the merge commit on the branch), and a classifier that
+	// mistook it for lag would anchor on the merge commit instead — the
+	// warning assertions below must still run to show that.
 	if resp.NewHeadSHA != rebaseRacerSHA {
-		t.Fatalf("new_head_sha = %q, want the raced-in foreign head %q — the race is not seeded",
+		t.Errorf("new_head_sha = %q, want the raced-in foreign head %q (a third head is a concurrent push, not read-after-write lag)",
 			resp.NewHeadSHA, rebaseRacerSHA)
 	}
 
@@ -1493,6 +1520,24 @@ func TestRebaseRunBranch_ConcurrentPushIntoPostMergeRead_IsNotAttributed(t *test
 	if !strings.Contains(resp.LineageAttributionWarning, "fishhawk_vouch_commit") {
 		t.Errorf("lineage_attribution_warning must name fishhawk_vouch_commit as the verb that can admit a legitimate pushed commit: %q",
 			resp.LineageAttributionWarning)
+	}
+	// #4199: a third head (neither the pre-merge head nor the merge commit) is
+	// classified as a GENUINE concurrent push, and today's warning sentence is
+	// shipped byte-identically.
+	if resp.PostMergeHeadRead != postMergeHeadReadConcurrentPush {
+		t.Errorf("post_merge_head_read = %q, want %q", resp.PostMergeHeadRead, postMergeHeadReadConcurrentPush)
+	}
+	wantWarning := "the base merge SUCCEEDED and its merge commit " + rebaseNewHeadSHA +
+		" was attributed, but the post-merge head read back as " + rebaseRacerSHA +
+		", which DIFFERS from it — a concurrent push landed after the merge. That head was deliberately NOT attributed: vouching a commit this invocation did not create would launder a foreign commit into the ADR-035 ledger. Review the pushed commit and, if it is legitimate, admit it with fishhawk_vouch_commit."
+	if resp.LineageAttributionWarning != wantWarning {
+		t.Errorf("lineage_attribution_warning drifted from today's concurrent-push sentence:\n got: %q\nwant: %q",
+			resp.LineageAttributionWarning, wantWarning)
+	}
+	// The racer is still the published head (M is already superseded on the
+	// branch), exactly as before #4199.
+	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseRacerSHA {
+		t.Errorf("check publications = %v, want exactly one at the observed racer head %q", got, rebaseRacerSHA)
 	}
 
 	// (2) THE REAL RECOMPUTE, driven against the actual ledger builder rather
@@ -1757,11 +1802,14 @@ func TestRebaseRunBranch_NoVerifyCommandTriggersNothing(t *testing.T) {
 	}
 }
 
-// TestRebaseRunBranch_UnreadableNewHeadTriggersNothing: when the post-merge
-// re-read fails there is no head to anchor a pass to, so nothing is triggered
-// and the 200 names the re-invoke route.
+// TestRebaseRunBranch_UnreadableNewHeadTriggersNothing: when the merge sha did
+// not decode and every post-merge re-read fails there is no head to anchor a
+// pass to, so nothing is triggered and the 200 names the re-invoke route. (A
+// DECODED merge sha anchors the pass on the merge commit even when the re-read
+// fails, #4199 — so the undecodable 201 is what keeps the head unknown here.)
 func TestRebaseRunBranch_UnreadableNewHeadTriggersNothing(t *testing.T) {
 	stub := cleanRebaseStub()
+	stub.mergeBody = `{"no_sha_here":true}` // the benign undecodable 201
 	stub.prStatusSeq = []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError}
 	sd := seedMCVRebase(t, stub)
 
@@ -1899,5 +1947,245 @@ func TestRebaseRunBranch_MergeCandidatePassCannotStartStill200(t *testing.T) {
 	}
 	if resp.NewHeadSHA != rebaseNewHeadSHA {
 		t.Errorf("new_head_sha = %q, want %q", resp.NewHeadSHA, rebaseNewHeadSHA)
+	}
+}
+
+// --- #4199: the post-merge read-after-write lag ---
+
+// laggingRebaseStub is the BEHIND stub whose post-merge PR reads keep
+// returning the PRE-merge head forever while the merges endpoint decodes the
+// merge commit rebaseNewHeadSHA — the forge read-after-write lag every
+// recorded #4199 incident showed.
+func laggingRebaseStub() *rebaseGitHub {
+	stub := cleanRebaseStub()
+	stub.headSHASeq = []string{rebasePriorHeadSHA}
+	return stub
+}
+
+// branchRebasedPayload decodes the branch_rebased row's #4199 fields.
+type branchRebasedPayload struct {
+	NewHeadSHA               string `json:"new_head_sha"`
+	MergeCommitSHA           string `json:"merge_commit_sha"`
+	PostMergeHeadRead        string `json:"post_merge_head_read"`
+	PostMergeObservedHeadSHA string `json:"post_merge_observed_head_sha"`
+	PostMergeReadAttempts    int    `json:"post_merge_read_attempts"`
+}
+
+func decodeBranchRebased(t *testing.T, au *auditFake) branchRebasedPayload {
+	t.Helper()
+	a := branchRebasedAudit(au)
+	if a == nil {
+		t.Fatal("no branch_rebased audit entry")
+	}
+	var p branchRebasedPayload
+	if err := json.Unmarshal(a.Payload, &p); err != nil {
+		t.Fatalf("decode branch_rebased payload: %v", err)
+	}
+	return p
+}
+
+func prCalls(stub *rebaseGitHub) int {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	return stub.prCallCount
+}
+
+// TestRebaseRunBranch_LaggingPostMergeReadConverges: post-merge reads 1-2
+// return the pre-merge head and read 3 returns the merge commit. The bounded
+// re-read converges, so there is NO concurrent-push warning, and exactly the
+// merge commit is attributed and published.
+func TestRebaseRunBranch_LaggingPostMergeReadConverges(t *testing.T) {
+	stub := cleanRebaseStub()
+	// PR reads: 1 = handler head, 2 = lease re-check, 3-4 = lagging
+	// post-merge reads, 5 = the converged read.
+	stub.headSHASeq = []string{rebasePriorHeadSHA, rebasePriorHeadSHA, rebasePriorHeadSHA, rebasePriorHeadSHA, rebaseNewHeadSHA}
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if resp.PostMergeHeadRead != postMergeHeadReadConverged {
+		t.Errorf("post_merge_head_read = %q, want %q", resp.PostMergeHeadRead, postMergeHeadReadConverged)
+	}
+	if resp.LineageAttributionWarning != "" {
+		t.Errorf("lineage_attribution_warning = %q, want empty — a lagging read that converges is not a concurrent push", resp.LineageAttributionWarning)
+	}
+	if resp.PostMergeHeadReadNote != "" {
+		t.Errorf("post_merge_head_read_note = %q, want empty on convergence", resp.PostMergeHeadReadNote)
+	}
+	if resp.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("new_head_sha = %q, want the merge commit %q", resp.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s]", got, rebaseNewHeadSHA)
+	}
+	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("check publications = %v, want exactly one at %q", got, rebaseNewHeadSHA)
+	}
+	if n := prCalls(stub); n != 5 {
+		t.Errorf("GET /pulls calls = %d, want 5 (head read, lease re-check, two lagging reads, the converged read)", n)
+	}
+}
+
+// TestRebaseRunBranch_PersistentPostMergeLag_ReportsReadAfterWriteLag: the
+// post-merge reads NEVER leave the pre-merge head while the merges endpoint
+// decoded M. The verb must classify read_after_write_lag (not a concurrent
+// push), anchor every downstream surface on M, and never publish at the stale
+// pre-merge head — the seeded pull_request_opened entry at that head makes a
+// stale publication observable.
+func TestRebaseRunBranch_PersistentPostMergeLag_ReportsReadAfterWriteLag(t *testing.T) {
+	sd := seedRebaseRun(t, laggingRebaseStub(), rebaseOpts{})
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if resp.PostMergeHeadRead != postMergeHeadReadReadAfterWriteLag {
+		t.Errorf("post_merge_head_read = %q, want %q", resp.PostMergeHeadRead, postMergeHeadReadReadAfterWriteLag)
+	}
+	for _, want := range []string{"read_after_write_lag", rebaseNewHeadSHA, rebasePriorHeadSHA, "NOT a concurrent push"} {
+		if !strings.Contains(resp.PostMergeHeadReadNote, want) {
+			t.Errorf("post_merge_head_read_note must contain %q: %q", want, resp.PostMergeHeadReadNote)
+		}
+	}
+	if resp.LineageAttributionWarning != "" {
+		t.Errorf("lineage_attribution_warning = %q, want empty — read-after-write lag is NOT a concurrent push", resp.LineageAttributionWarning)
+	}
+	if resp.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("new_head_sha = %q, want the decoded merge commit %q (never the stale pre-merge head)", resp.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	if !resp.AuditCheckRepublished || resp.AuditCheckRepublishWarning != "" {
+		t.Errorf("republished/warning = %v/%q, want true/empty", resp.AuditCheckRepublished, resp.AuditCheckRepublishWarning)
+	}
+	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("check publications = %v, want exactly one at the merge commit %q and none at the pre-merge head %q",
+			got, rebaseNewHeadSHA, rebasePriorHeadSHA)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s]", got, rebaseNewHeadSHA)
+	}
+	p := decodeBranchRebased(t, sd.au)
+	if p.NewHeadSHA != rebaseNewHeadSHA || p.PostMergeHeadRead != postMergeHeadReadReadAfterWriteLag {
+		t.Errorf("branch_rebased new_head_sha/post_merge_head_read = %q/%q, want %q/%q",
+			p.NewHeadSHA, p.PostMergeHeadRead, rebaseNewHeadSHA, postMergeHeadReadReadAfterWriteLag)
+	}
+	if p.PostMergeObservedHeadSHA != rebasePriorHeadSHA {
+		t.Errorf("branch_rebased post_merge_observed_head_sha = %q, want the lagging read %q", p.PostMergeObservedHeadSHA, rebasePriorHeadSHA)
+	}
+	if want := 1 + len(testPostMergeHeadReadBackoff()); p.PostMergeReadAttempts != want {
+		t.Errorf("branch_rebased post_merge_read_attempts = %d, want %d", p.PostMergeReadAttempts, want)
+	}
+}
+
+// TestRebaseRunBranch_PostMergeLagAnchorsMergeCandidateTriggerOnMergeCommit is
+// the point of #4199: under persistent read-after-write lag the ADR-090
+// merge-candidate trigger AND the branch_rebased row must anchor on the merge
+// commit M the merges endpoint decoded. Anchored on the lagging read-back they
+// carry the PRE-merge head, and every performed-merge pass settles head_moved.
+func TestRebaseRunBranch_PostMergeLagAnchorsMergeCandidateTriggerOnMergeCommit(t *testing.T) {
+	sd := seedMCVRebase(t, laggingRebaseStub())
+	impl := crImplementStage(t, sd)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	triggers := mcvTriggerPayloads(t, sd.au)
+	if len(triggers) != 1 {
+		t.Fatalf("stage_merge_candidate_verify_triggered rows = %d, want 1", len(triggers))
+	}
+	if triggers[0].ExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("trigger expected_head_sha = %q, want the merge commit %q (the pre-merge head is %q)",
+			triggers[0].ExpectedHeadSHA, rebaseNewHeadSHA, rebasePriorHeadSHA)
+	}
+	if p := decodeBranchRebased(t, sd.au); p.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("branch_rebased new_head_sha = %q, want the merge commit %q", p.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyStageID != impl.ID.String() {
+		t.Errorf("response triggered/stage = %v/%q, want true/%s", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyStageID, impl.ID)
+	}
+}
+
+// TestRebaseRunBranch_PostMergeReadIsBounded: a post-merge read that never
+// converges stops after exactly one initial read plus len(backoff) re-reads.
+func TestRebaseRunBranch_PostMergeReadIsBounded(t *testing.T) {
+	stub := laggingRebaseStub()
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+
+	decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	// 2 = the handler head read + the lease re-check.
+	if got, want := prCalls(stub), 2+1+len(testPostMergeHeadReadBackoff()); got != want {
+		t.Errorf("GET /pulls calls = %d, want exactly %d", got, want)
+	}
+}
+
+// TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit: with a
+// DECODED merge commit and every post-merge read failing, the merge commit is
+// the head the forge reported creating, so the check is published there and
+// nothing is skipped — the pre-merge head (seeded, so a fallback is
+// observable) is never used.
+func TestRebaseRunBranch_PostMergeReadUnreadable_AnchorsOnMergeCommit(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.prStatusSeq = []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError}
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if resp.PostMergeHeadRead != postMergeHeadReadUnreadable {
+		t.Errorf("post_merge_head_read = %q, want %q", resp.PostMergeHeadRead, postMergeHeadReadUnreadable)
+	}
+	if !strings.Contains(resp.PostMergeHeadReadNote, "divergence could not be checked") {
+		t.Errorf("post_merge_head_read_note must say divergence could not be checked: %q", resp.PostMergeHeadReadNote)
+	}
+	if resp.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("new_head_sha = %q, want the decoded merge commit %q", resp.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("check publications = %v, want exactly one at the merge commit %q", got, rebaseNewHeadSHA)
+	}
+	if resp.LineageAttributionWarning != "" {
+		t.Errorf("lineage_attribution_warning = %q, want empty", resp.LineageAttributionWarning)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s]", got, rebaseNewHeadSHA)
+	}
+}
+
+// TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted: with NO
+// decoded merge sha and every post-merge read stuck at the pre-merge head, the
+// stale read must NOT become the new head: nothing is published, attributed or
+// triggered at the pre-merge head (seeded, so a stale publication is
+// observable), and the warnings name the retry and fishhawk_vouch_commit.
+func TestRebaseRunBranch_UndecodableMergeSHA_StaleReadIsNotAccepted(t *testing.T) {
+	stub := laggingRebaseStub()
+	stub.mergeBody = `{"no_sha_here":true}` // the benign undecodable 201
+	sd := seedMCVRebase(t, stub)
+	crImplementStage(t, sd)
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if resp.NewHeadSHA != "" {
+		t.Errorf("new_head_sha = %q, want empty — a read stuck at the pre-merge head is not the new head", resp.NewHeadSHA)
+	}
+	if resp.PostMergeHeadRead != postMergeHeadReadReadAfterWriteLag {
+		t.Errorf("post_merge_head_read = %q, want %q", resp.PostMergeHeadRead, postMergeHeadReadReadAfterWriteLag)
+	}
+	if pubs := checkPublications(sd.creator); len(pubs) != 0 {
+		t.Errorf("check publications = %v, want NONE (the only readable head is the stale pre-merge %q)", pubs, rebasePriorHeadSHA)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 0 {
+		t.Errorf("attributed shas = %v, want nothing", got)
+	}
+	if n := len(auditEntries(sd.au, CategoryStageMergeCandidateVerifyTriggered)); n != 0 {
+		t.Errorf("trigger rows = %d, want 0 (no pass may be anchored on the pre-merge head)", n)
+	}
+	if !strings.Contains(resp.LineageAttributionWarning, "fishhawk_vouch_commit") {
+		t.Errorf("lineage_attribution_warning must name fishhawk_vouch_commit: %q", resp.LineageAttributionWarning)
+	}
+	if !strings.Contains(resp.AuditCheckRepublishWarning, "read-after-write lag") ||
+		!strings.Contains(resp.AuditCheckRepublishWarning, "fishhawk_rebase_run_branch") {
+		t.Errorf("republish warning must name the lag and the re-invoke retry: %q", resp.AuditCheckRepublishWarning)
+	}
+	if !strings.Contains(resp.PostMergeHeadReadNote, "unresolved") {
+		t.Errorf("post_merge_head_read_note must say the head is unresolved: %q", resp.PostMergeHeadReadNote)
 	}
 }
