@@ -11,10 +11,21 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
 )
 
+// routeRegistrar is the one ServeMux method registerRoutes uses.
+// *http.ServeMux satisfies it, so buildHandler passes the real mux
+// unchanged. The seam exists so the account-isolation route sweep
+// (route_account_sweep_test.go, #4211) can enumerate every registered
+// pattern with a recorder. A route must therefore be registered inside
+// registerRoutes and NOT directly on the mux in buildHandler: a route
+// mounted anywhere else escapes the sweep.
+type routeRegistrar interface {
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+}
+
 // registerRoutes wires every endpoint onto mux. Method-aware patterns
 // require Go 1.22+ ServeMux. Add new routes here as handlers land
 // per docs/api/v0.openapi.yaml.
-func (s *Server) registerRoutes(mux *http.ServeMux) {
+func (s *Server) registerRoutes(mux routeRegistrar) {
 	// Run/stage/concern routes are wrapped with the tiered account-ownership
 	// middleware (ADR-057 / E44.5, #1829): readAccess (GET run/stage/gate
 	// views — ownership only), memberWrite (operator-decision writes), and
