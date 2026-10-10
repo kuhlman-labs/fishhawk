@@ -573,6 +573,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_permissions_declared":              {},
 	"stage_retried":                           {},
 	"stage_superseded_by_merge":               {},
+	"stale_run_swept":                         {}, // #4185: `fishhawkd sweep-stale-runs --apply` transitioned this stale non-terminal top-level run (stalesweep) — INTERNAL, not in issuecomment activityCategories
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},
