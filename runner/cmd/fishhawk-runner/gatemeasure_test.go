@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -296,13 +295,9 @@ func measureEnsureImage(t *testing.T, rt gateiso.Runtime, image string) {
 // measureRepo returns the enclosing repository root and the SHA to measure.
 func measureRepo(t *testing.T) (string, string) {
 	t.Helper()
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: no source path")
-	}
-	top, err := exec.Command("git", "-C", filepath.Dir(self), "rev-parse", "--show-toplevel").Output()
+	top, err := exec.Command("git", "-C", pkgSrcDir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		t.Fatalf("repository root not resolvable from %s: %v", self, err)
+		t.Fatalf("repository root not resolvable from %s: %v", pkgSrcDir, err)
 	}
 	root := strings.TrimSpace(string(top))
 	rev := strings.TrimSpace(os.Getenv(gateMeasureSHAEnvVar))

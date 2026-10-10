@@ -24,7 +24,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -237,14 +236,14 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 }
 
 // buildSiblingBinary compiles the package at pkgRel (relative to this
-// test file's directory) into binDir/name and returns the binary path.
+// package's source dir, pkgSrcDir) into binDir/name and returns the binary
+// path.
 // go.work workspace mode resolves the sibling module from the backend
 // module's test process (precedent: fishhawk-mcp/run_children_test.go
 // building the runner binary in-test).
 func buildSiblingBinary(t *testing.T, binDir, name, pkgRel string) string {
 	t.Helper()
-	_, thisFile, _, _ := runtime.Caller(0)
-	pkgDir := filepath.Join(filepath.Dir(thisFile), pkgRel)
+	pkgDir := filepath.Join(pkgSrcDir, pkgRel)
 	bin := filepath.Join(binDir, name)
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = pkgDir

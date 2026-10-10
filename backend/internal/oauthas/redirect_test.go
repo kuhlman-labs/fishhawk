@@ -3,14 +3,33 @@ package oauthas
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // parseNoLexical parses without the lexical '#' guard, used only to demonstrate
 // that net/url cannot express a bare trailing '#'.
@@ -371,11 +390,7 @@ type cliRedirectFixture struct {
 
 func loadCLIRedirectFixture(t *testing.T) cliRedirectFixture {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "oauth_cli_redirect_uri.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "oauth_cli_redirect_uri.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared fixture: %v", err)

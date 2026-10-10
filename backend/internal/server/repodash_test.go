@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -175,11 +174,7 @@ func dashDecode(t *testing.T, rec *httptest.ResponseRecorder) map[string]json.Ra
 
 func dashGoldenPath(t *testing.T, endpoint string) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "repodash_"+endpoint+".json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "repodash_"+endpoint+".json")
 }
 
 // TestRepoDash_WireGoldens drives each endpoint through the REAL mux over the

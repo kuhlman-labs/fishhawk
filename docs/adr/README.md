@@ -290,6 +290,7 @@ one, never in batches:
 | [ADR-091](091-restart-recovery-redispatches-advisory-review-rounds.md) | Restart recovery re-dispatches orphaned advisory review rounds from a durable round-source descriptor instead of terminating them as failed | `accepted` | [#4171](https://github.com/kuhlman-labs/fishhawk/issues/4171) |
 | [ADR-092](092-serialize-merge-candidate-verify-passes.md) | Serialize merge-candidate verify passes per repository, re-anchor a queued pass at admission, and admit passes through a local-verify group (amends ADR-090) | `accepted` | [#4202](https://github.com/kuhlman-labs/fishhawk/issues/4202) |
 | [ADR-093](093-fishhawk-owned-merge-queue.md) | A Fishhawk-owned merge queue: extend ADR-092's per-base serializer so the queue advances, verifies and MERGES the head of line, provider-agnostic, batch size 1 | `accepted` | [#4224](https://github.com/kuhlman-labs/fishhawk/issues/4224) |
+| [ADR-094](094-resource-keyed-admission.md) | Resource-keyed admission: one admission path for every spawning verb, stages hold a scoped SET of resource groups including a host capacity group, and review rounds admit through provider-account groups that park on quota (amends ADR-087) | `accepted` | [#4239](https://github.com/kuhlman-labs/fishhawk/issues/4239) |
 
 ## Status unknown — needs captain confirmation
 

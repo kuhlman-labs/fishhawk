@@ -1,28 +1,42 @@
 package audit_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/verifier/internal/audit"
 )
 
-// repoRoot resolves the repository root from this test file's own
-// location: verifier/internal/audit/published_export_test.go is three
-// directories below the repo root. This is valid in the committed tree —
-// the only place this test runs (go.work registers ./verifier and
-// scripts/test executes it from the checkout).
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
+// repoRoot resolves the repository root from this package's init-captured
+// source dir: verifier/internal/audit is three directories below the repo
+// root. This is valid in the committed tree — the only place this test runs
+// (go.work registers ./verifier and scripts/test executes it from the
+// checkout).
 func repoRoot(t *testing.T) string {
 	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed to resolve this test file's path")
-	}
-	// dir(file) = verifier/internal/audit -> ../../.. = repo root.
-	return filepath.Join(filepath.Dir(file), "..", "..", "..")
+	// pkgSrcDir = verifier/internal/audit -> ../../.. = repo root.
+	return filepath.Join(pkgSrcDir, "..", "..", "..")
 }
 
 // TestPublishedExportVerifies is the committed-tree done-means test for the

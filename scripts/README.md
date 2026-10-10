@@ -1923,10 +1923,14 @@ cache entries each run; the standard library and module-cache dependencies are
 still shared. A two-path planning experiment against one fresh shared GOCACHE
 added 18 entries for the second path without `-trimpath` and 2 with it. Go's own
 trim evicts only entries unused for 5 days, so the host cache reached 531 GB.
-`-trimpath` is deliberately NOT adopted: about 30 test files anchor fixtures on
-`runtime.Caller(0)`, which it rewrites; the patch-coverage loop's `-coverpkg` set
-differs per diff, so those builds miss regardless of path; and the container
-gate already builds at a fixed `/work` in a per-process volume removed at exit.
+`-trimpath` is not adopted YET. Its original blocker — about 30 test files
+anchoring fixtures on `runtime.Caller(0)`, whose file name `-trimpath` makes
+module-relative — is removed by #4179: every test package now anchors on an
+init-captured `pkgSrcDir`, and `backend/internal/testanchor` fails verify on any
+new file-bound `runtime.Caller`. Adopting `-trimpath` for agent builds is the
+follow-up. Even then, the patch-coverage loop's `-coverpkg` set differs per diff,
+so those builds miss regardless of path; and the container gate already builds
+at a fixed `/work` in a per-process volume removed at exit.
 
 **The trim (`_gocache_trim`).** It reproduces cmd/go's own `DiskCache.Trim`
 (`src/cmd/go/internal/cache/cache.go`): delete the `<2hex>/<hash>-a` / `-d`

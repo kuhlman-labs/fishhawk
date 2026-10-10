@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -23,13 +22,9 @@ import (
 // to render; the dedicated runner-stamped marker (#3945) supersedes the path
 // list.
 func TestIsRunAgentMatchesAcceptanceTreePath(t *testing.T) {
-	// Resolve from this source file, not the working directory: this
-	// package's TestMain moves the process cwd.
-	_, self, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	script := filepath.Join(filepath.Dir(self), "..", "..", "..", "scripts", "is-run-agent")
+	// Resolve from the init-captured package source dir, not the working
+	// directory: this package's TestMain moves the process cwd.
+	script := filepath.Join(pkgSrcDir, "..", "..", "..", "scripts", "is-run-agent")
 	const runID, stageID = "3a8cc5f5-85cd-4664-8b7c-6974739db24e", "123bc991-6f01-4850-8d83-8cc8ac19a3e6"
 	dir := filepath.Join(t.TempDir(), filepath.Base(acceptanceTreePath(runID, stageID)))
 	if err := os.MkdirAll(dir, 0o755); err != nil {

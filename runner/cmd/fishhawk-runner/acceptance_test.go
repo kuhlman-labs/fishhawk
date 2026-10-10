@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -771,10 +770,10 @@ type acceptanceVerdictCorpus struct {
 
 func loadAcceptanceVerdictCorpus(t *testing.T) acceptanceVerdictCorpus {
 	t.Helper()
-	// Anchored to THIS package's SOURCE dir via packageSourceDir (runtime.Caller),
+	// Anchored to THIS package's SOURCE dir via the init-captured pkgSrcDir,
 	// not the cwd: TestMain chdirs the whole package into a temp git repo, so a
 	// cwd-relative testdata path would not resolve.
-	raw, err := os.ReadFile(filepath.Join(packageSourceDir(t), "testdata", "acceptance-verdict-fixtures.json"))
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "testdata", "acceptance-verdict-fixtures.json"))
 	if err != nil {
 		t.Fatalf("read acceptance verdict corpus (run scripts/sync-schemas): %v", err)
 	}
@@ -2657,11 +2656,7 @@ func TestAcceptanceReplay_RecordThenReplayEndToEnd(t *testing.T) {
 	if !strings.Contains(stderr2.String(), `"corpus_size":"4"`) || !strings.Contains(stderr2.String(), `"sampled_out":"3"`) {
 		t.Errorf("corpus_loaded event must report corpus 4 / sampled_out 3:\n%s", stderr2.String())
 	}
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	golden, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "acceptance_replay_verdict.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

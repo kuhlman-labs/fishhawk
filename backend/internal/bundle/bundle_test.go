@@ -6,15 +6,34 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // packLines builds a bundle-shaped *.jsonl.gz from the given lines.
 // Tests use this rather than importing the runner's Pack to keep
@@ -375,19 +394,15 @@ func TestExtractDiff_RoundTripsPatch(t *testing.T) {
 }
 
 // sharedGitDiffRenameFixture reads the SHARED cross-module wire fixture
-// (#2398 binding condition 3), anchored to this test source via
-// runtime.Caller — the same file the runner's
+// (#2398 binding condition 3), anchored on this package's init-captured
+// source dir (pkgSrcDir, #4179) — the same file the runner's
 // TestMakeGitDiffEvent_RenameCarriesOldPath asserts it emits byte-for-byte.
 // Decoding the runner's exact emitted bytes here (rather than a second
 // hand-maintained literal) is what closes the wire seam: a runner
 // serialization change the backend cannot decode fails THIS test.
 func sharedGitDiffRenameFixture(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the shared wire fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared wire fixture %s: %v", path, err)
@@ -1961,11 +1976,7 @@ func TestExtractHeadSHA_FirstNonEmptyUnchangedOnMultiIterationBundle(t *testing.
 // (#2135).
 func sharedGateIsolationGolden(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the shared wire fixture path")
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
 	if err != nil {
 		t.Fatalf("read shared wire fixture: %v", err)
 	}

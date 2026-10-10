@@ -1,0 +1,14 @@
+id: scenario:issue-4235/catch-rate-live-arm-names-sonnet-5-5
+statement: The catch-rate live arm targets claude-sonnet-5-5. Run without the live opt-in, its skip line names claude-sonnet-5-5 as the generator. The offline wiring test in the same package passes, proving the client config and the recorded generator_model are claude-sonnet-5-5 and the judge and quality generator models are still claude-sonnet-4-6.
+verify_hint: 'CLI stdout: `scripts/test single -v -run ''TestPlanReviewCatchRateLive'' ./backend/internal/agenteval/` with FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE unset prints a SKIP line for TestPlanReviewCatchRateLive naming claude-sonnet-5-5 and a PASS line for TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel. The deciding layer for the wiring itself is that offline test; the skip line is the operator-visible surface.'
+steps: 'In the sanctioned checkout (HEAD c4a660c8): cd backend && env -u FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE -u ANTHROPIC_API_KEY go test -count=1 -v -run ''TestPlanReviewCatchRateLive|TestLiveArmsResolveCredentialThroughSharedGate'' ./internal/agenteval/. Then read the wiring test body (literal assertions) and grepped the constants.'
+assertions:
+    expected: SKIP line naming claude-sonnet-5-5 and a PASS for the wiring test
+    observed_at_record: 'TestPlanReviewCatchRateLive printed SKIP: ''set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on claude-sonnet-5-5...''. TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel PASSED. It asserts with string literals that the client Model, the record generator_model and the baseline generator_model are all claude-sonnet-5-5, and that DefaultJudgeModel and DefaultQualityGeneratorModel are both claude-sonnet-4-6. TestLiveArmsResolveCredentialThroughSharedGate PASSED. The constant DefaultCatchRateGeneratorModel="claude-sonnet-5-5" lives in envelopequality.go, which is not a trigger path.'
+    repro_handle: cd <sanctioned checkout>/backend && go test -count=1 -v -run TestPlanReviewCatchRateLive ./internal/agenteval/
+origin:
+    issue: 4235
+    pr: 4238
+    run_id: 3315c896-98d5-4de2-aff2-737518d05983
+    head_sha: c4a660c8047071dbb84852a33a9e1dd6a8db38e1
+    recorded_at: 2026-10-10T17:43:21Z

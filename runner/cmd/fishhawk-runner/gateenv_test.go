@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -427,16 +426,15 @@ func TestRunBoundedGateCommand_ChildDoesNotInheritGoogleCredentials(t *testing.T
 // asserts every set — allow-exact, allow-Go, allow-prefix, deny-exact,
 // deny-prefix — is identical to the runner's own. A single-copy edit fails here.
 //
-// Degrade (binding condition 3): it SKIPS only when go.work itself cannot be
-// found (a vendored or module-cache build with no workspace). If go.work IS
-// found but the peer CLI file cannot be read or a literal block cannot be
-// parsed, it FAILS — an unparseable peer is a detector malfunction, not an
-// environment without a workspace. Both branches print the reason.
+// It FAILS CLOSED when go.work cannot be found from the package source dir
+// (#4179 reversed the earlier binding-condition-3 SKIP degrade): a vendored or
+// module-cache build with no workspace now fails this check instead of
+// silently skipping it, because the cross-file parity it pins requires the
+// full repo tree. If go.work IS found but the peer CLI file cannot be read or a
+// literal block cannot be parsed, it FAILS too — an unparseable peer is a
+// detector malfunction. Every branch prints the reason.
 func TestGateEnvListsMatchCLICopy(t *testing.T) {
-	root, err := findWorkspaceRoot()
-	if err != nil {
-		t.Skipf("go.work not found from the test working directory (%v); skipping the CLI-copy cross-check", err)
-	}
+	root := requireWorkspaceRoot(t, pkgSrcDir)
 	cliPath := filepath.Join(root, "cli", "cmd", "fishhawk", "doctor_verify.go")
 	data, err := os.ReadFile(cliPath) //nolint:gosec // fixed workspace-relative path
 	if err != nil {
@@ -486,19 +484,13 @@ func TestGateEnvListsMatchCLICopy(t *testing.T) {
 	}
 }
 
-// findWorkspaceRoot walks up from THIS test's source file looking for go.work,
-// returning the directory that contains it. It anchors on runtime.Caller rather
-// than os.Getwd() because the runner suite's TestMain chdirs into a throwaway
-// temp dir, so the process working directory is not the source tree. In a
-// vendored or module-cache build the embedded source path does not exist on
-// disk, so the stat walk reaches the filesystem root and returns an error —
-// which the caller renders as a SKIP (no workspace), per binding condition 3.
-func findWorkspaceRoot() (string, error) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", fmt.Errorf("runtime.Caller could not locate the test source file")
-	}
-	start := filepath.Dir(thisFile)
+// findWorkspaceRootFrom walks up from start looking for go.work, returning the
+// directory that contains it, or an error naming start when the walk reaches
+// the filesystem root without finding one. Callers pass pkgSrcDir — the package
+// source dir captured at init, BEFORE the runner suite's TestMain chdirs into a
+// throwaway temp dir — never runtime.Caller, whose file name is module-relative
+// under -trimpath (#4179).
+func findWorkspaceRootFrom(start string) (string, error) {
 	for dir := start; ; {
 		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
 			return dir, nil
@@ -509,6 +501,79 @@ func findWorkspaceRoot() (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// requireWorkspaceRoot resolves the go.work root from start and FAILS CLOSED
+// (t.Fatalf, never t.Skipf) when there is none: every caller is a cross-file
+// parity check over the full repo tree (the CLI gate-env copy, the
+// scripts/test verify-lock and verify-scope contracts), and a skip there would
+// read as a pass (#4179). It returns "" after Fatalf so a recording testing.TB
+// that does not Goexit can observe the branch.
+func requireWorkspaceRoot(t testing.TB, start string) string {
+	t.Helper()
+	root, err := findWorkspaceRootFrom(start)
+	if err != nil {
+		t.Fatalf("workspace root not resolvable (%v): these cross-file parity checks require the full repo tree with its go.work, so a vendored or module-cache build fails them rather than skipping", err)
+		return ""
+	}
+	return root
+}
+
+// recordingTB is a testing.TB whose Helper/Fatalf/Skipf record instead of
+// stopping the goroutine, so a test can assert WHICH terminal branch a helper
+// took. Every other method is promoted from the embedded *testing.T.
+type recordingTB struct {
+	testing.TB
+	fatal, skip bool
+	msg         string
+}
+
+func (r *recordingTB) Helper() {}
+
+func (r *recordingTB) Fatalf(format string, args ...any) {
+	r.fatal = true
+	r.msg = fmt.Sprintf(format, args...)
+}
+
+func (r *recordingTB) Skipf(format string, args ...any) {
+	r.skip = true
+	r.msg = fmt.Sprintf(format, args...)
+}
+
+// TestRequireWorkspaceRootFailsClosedWithoutGoWork pins requireWorkspaceRoot's
+// fail-closed branch (#4179): from a start with no go.work at or above it (a
+// t.TempDir(), the same precondition wirecontract's
+// TestRepoRoot_NoGoWorkFailsClosed relies on) it must Fatalf — NOT Skipf — and
+// return "". The positive arm resolves the real root from pkgSrcDir, which
+// also pins that the init-captured package dir lies inside the workspace.
+func TestRequireWorkspaceRootFailsClosedWithoutGoWork(t *testing.T) {
+	t.Run("no go.work above start fails closed", func(t *testing.T) {
+		start := t.TempDir()
+		rec := &recordingTB{TB: t}
+		got := requireWorkspaceRoot(rec, start)
+		if !rec.fatal || rec.skip {
+			t.Fatalf("requireWorkspaceRoot(%s): fatal=%v skip=%v (%q), want fatal=true skip=false", start, rec.fatal, rec.skip, rec.msg)
+		}
+		if got != "" {
+			t.Errorf("requireWorkspaceRoot returned %q on the fail-closed branch, want \"\"", got)
+		}
+		if !strings.Contains(rec.msg, start) {
+			t.Errorf("failure message %q does not name the start %s", rec.msg, start)
+		}
+	})
+	t.Run("pkgSrcDir resolves the workspace root", func(t *testing.T) {
+		rec := &recordingTB{TB: t}
+		root := requireWorkspaceRoot(rec, pkgSrcDir)
+		if rec.fatal || rec.skip {
+			t.Fatalf("requireWorkspaceRoot(pkgSrcDir=%s): fatal=%v skip=%v (%q), want neither", pkgSrcDir, rec.fatal, rec.skip, rec.msg)
+		}
+		if root == "" {
+			t.Fatal("requireWorkspaceRoot(pkgSrcDir) returned an empty root")
+		}
+		if _, err := os.Stat(filepath.Join(root, "go.work")); err != nil {
+			t.Errorf("resolved root %s carries no go.work: %v", root, err)
+		}
+	})
 }
 
 // parseVarKeys extracts the double-quoted keys from a `var <name> = …`
