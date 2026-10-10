@@ -11864,6 +11864,22 @@ paths:
         `cancel_source` `run_budget_exceeded`, `stage_budget_exceeded` or
         `stage_cancelled`, is written by the budget tripwires and by a pull
         request closed without merge.
+
+        When the run is a decomposed parent, the cancel also cascades to its
+        NON-terminal decomposition children (#4186), synchronously before the
+        200: each is cancelled through the run state machine and gets ONE
+        system-actor `decomposition_child_cancelled` audit row on its own
+        chain (`parent_run_id`, `parent_state`, `reason: parent_cancelled`,
+        `cancel_source`, `from_state`, `implement_stage_id`,
+        `implement_stage_state`, `live_stage`), deduplicated per parent. A
+        child whose implement stage is `dispatched` / `running` is cancelled
+        at the run level anyway (its stage and runner are untouched;
+        `live_stage: true`). Already-terminal children are skipped with no
+        row. The already-cancelled 200 re-runs the cascade, so re-POSTing
+        converges a child a transient error left behind. Best-effort: a
+        cascade failure is logged and never changes the 200. The budget
+        tripwires and a pull request closed without merge cascade the same
+        way with their own `cancel_source`.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
