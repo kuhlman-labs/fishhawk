@@ -1,10 +1,13 @@
 // Package anthropic provides an Anthropic SDK adapter that satisfies
-// server.PlanReviewer. It is constructed in serve.go when
-// FISHHAWKD_ANTHROPIC_API_KEY is set.
+// server.PlanReviewer. Production constructs it in serve.go when
+// FISHHAWKD_ANTHROPIC_API_KEY is set; the operator-run agenteval live arms
+// additionally construct it with Config.AuthToken (an OAuth bearer credential,
+// E83.96 / #4223). The credential contract lives in README.md.
 package anthropic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -13,9 +16,23 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
+// ErrConflictingCredentials is what a Client built with BOTH Config.APIKey and
+// Config.AuthToken returns from Messages, before any network I/O. Exactly one
+// credential may be configured: the two travel in different headers, so a
+// client holding both would present two credentials at once and the operator
+// could not tell which one authenticated the call.
+var ErrConflictingCredentials = errors.New("anthropic: Config.APIKey and Config.AuthToken are both set; configure exactly one credential")
+
 // Config holds the settings needed to create an Anthropic API client.
 type Config struct {
-	APIKey    string
+	APIKey string
+	// AuthToken is an OAuth bearer credential, sent as `Authorization: Bearer
+	// <AuthToken>` via option.WithAuthToken (E83.96 / #4223). It is mutually
+	// exclusive with APIKey: setting both makes the Client fail closed with
+	// ErrConflictingCredentials. No production caller sets it; the
+	// operator-run agenteval live arms do. Which bearer tokens Anthropic's
+	// terms permit for direct API use is the operator's responsibility.
+	AuthToken string
 	Model     string
 	MaxTokens int
 	Timeout   time.Duration
@@ -45,6 +62,10 @@ type Client struct {
 	model     string
 	maxTokens int
 	schema    map[string]any
+	// configErr is a construction-time misconfiguration (today only
+	// ErrConflictingCredentials). NewClient keeps its non-error signature, so
+	// the error rides on the Client and Messages returns it before any I/O.
+	configErr error
 }
 
 // NewClient constructs a Client from cfg. The HTTP timeout is applied at
@@ -55,6 +76,17 @@ type Client struct {
 // A non-empty cfg.BaseURL is applied as a DEFAULT (before opts), so the
 // region-scoped endpoint governs production while a test's explicit
 // option.WithBaseURL still wins.
+//
+// Credential contract (E83.96 / #4223) — exactly one credential, or none:
+//
+//	APIKey   AuthToken  wire                              SDK autoloader
+//	set      empty      X-Api-Key: <APIKey>               ON  (unchanged)
+//	empty    set        Authorization: Bearer <AuthToken> OFF
+//	empty    empty      no credential (#2108)             OFF
+//	set      set        refused: ErrConflictingCredentials, no SDK client, no I/O
+//
+// The AuthToken row never applies option.WithAPIKey: even WithAPIKey("") puts a
+// present-but-empty X-Api-Key header on the wire beside the bearer.
 //
 // Empty-key boundary invariant (#2108): when cfg.APIKey == "" the client
 // appends option.WithoutEnvironmentDefaults(), which makes anthropicsdk.NewClient
@@ -69,18 +101,38 @@ type Client struct {
 // not on the empty explicit key alone. Our explicit option.WithBaseURL(cfg.BaseURL)
 // (always non-empty in that withhold posture) still routes the call, since
 // WithoutEnvironmentDefaults keeps only the base-URL default and our option is
-// applied after it.
+// applied after it. The AuthToken row rides the same guard: a bearer token must
+// not have an ambient ANTHROPIC_API_KEY / profile credential presented beside it.
 func NewClient(cfg Config, opts ...option.RequestOption) *Client {
-	defaults := []option.RequestOption{
-		option.WithAPIKey(cfg.APIKey),
-		option.WithHTTPClient(&http.Client{Timeout: cfg.Timeout}),
+	if cfg.APIKey != "" && cfg.AuthToken != "" {
+		// Fail closed without constructing the SDK client, so no option, no
+		// environment source and no network is consulted.
+		return &Client{
+			model:     cfg.Model,
+			maxTokens: cfg.MaxTokens,
+			schema:    cfg.Schema,
+			configErr: ErrConflictingCredentials,
+		}
+	}
+	var defaults []option.RequestOption
+	if cfg.AuthToken != "" {
+		defaults = []option.RequestOption{
+			option.WithAuthToken(cfg.AuthToken),
+			option.WithHTTPClient(&http.Client{Timeout: cfg.Timeout}),
+		}
+	} else {
+		defaults = []option.RequestOption{
+			option.WithAPIKey(cfg.APIKey),
+			option.WithHTTPClient(&http.Client{Timeout: cfg.Timeout}),
+		}
 	}
 	if cfg.BaseURL != "" {
 		defaults = append(defaults, option.WithBaseURL(cfg.BaseURL))
 	}
 	if cfg.APIKey == "" {
 		// Neutralize every ambient SDK credential source so an empty explicit
-		// key contributes NO credential from the process environment (#2108).
+		// key contributes NO credential from the process environment (#2108),
+		// and so an AuthToken is the only credential on the wire.
 		defaults = append(defaults, option.WithoutEnvironmentDefaults())
 	}
 	allOpts := append(defaults, opts...)
@@ -127,6 +179,11 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // When c.schema is nil the OutputConfig is OMITTED entirely so the response is
 // unconstrained — the caller's decode path is then the only validation.
 func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int, err error) {
+	// A misconfigured client fails closed before any I/O (the SDK client was
+	// never constructed for it).
+	if c.configErr != nil {
+		return "", "", 0, 0, 0, 0, c.configErr
+	}
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),

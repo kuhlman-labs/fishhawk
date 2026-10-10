@@ -42,7 +42,7 @@ and double env-gated.
 > STRUCTURAL CONTAINMENT — every fixture's adversarial text lands inside its
 > envelope in the three reviewed renders, and none of it reaches the implement
 > render. They do **not** prove behavioural resistance, and they do not measure
-> the quality delta. Both live arms SKIP for want of an API key, so #2291
+> the quality delta. Both live arms SKIP for want of a model credential, so #2291
 > acceptance criteria 1, 2 and 4 are UNMEASURED by the change that added this
 > package. **#3187** owns those measurements and the treatment decision they
 > license. See [`docs/compliance/prompt-injection-evidence.md`](../../../docs/compliance/prompt-injection-evidence.md).
@@ -222,8 +222,9 @@ a one-line follow-up in a package outside this change's scope.
 
 ### The live arm
 
-`TestInjectionLive`, gated on `FISHHAWK_AGENTEVAL_INJECTION_LIVE` **and**
-`FISHHAWKD_ANTHROPIC_API_KEY`, calls `RunInjectionLive(ctx, cases, target,
+`TestInjectionLive`, gated on `FISHHAWK_AGENTEVAL_INJECTION_LIVE` **and** a
+model credential (`FISHHAWKD_ANTHROPIC_API_KEY` or
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, exactly one — see § "Running it"), calls `RunInjectionLive(ctx, cases, target,
 judge)` with Anthropic-backed `InjectionTarget` / `InjectionJudge` funcs. The
 loop lives in non-test code so its routing is testable offline with fakes
 (E81.5 / #4013). Per fixture it visits every `LiveRenderKeys` render — the
@@ -814,6 +815,22 @@ keeps the `internal/` import, the default testdata paths and the trigger list
 
 ## Running it
 
+**Live credential (E83.96 / #4223).** Every live arm — the #2245 catch-rate arm,
+the #2291 injection and quality arms, the #3309 severity-calibration and
+retention arms, and the judge calibration — resolves its credential through ONE
+test-only gate, `requireLiveCredential` in `livecredential_test.go`. Set EXACTLY
+ONE of `FISHHAWKD_ANTHROPIC_API_KEY` (sent as `X-Api-Key`) or
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth bearer, sent as
+`Authorization: Bearer` through `anthropic.Config.AuthToken`). Neither set SKIPS
+the arm naming both variables; both set FAILS it as a refusal, because a
+contradictory opt-in is a misconfiguration, not an unmeasured arm. With a token
+the client presents that bearer alone — no `X-Api-Key`, and no ambient
+`ANTHROPIC_*` credential beside it (`backend/internal/anthropic/README.md`).
+`TestLiveArmsResolveCredentialThroughSharedGate` fails if a live arm reads the
+API-key variable directly. The runner's default-deny gate env drops every
+`FISHHAWKD_*` and `FISHHAWK_AGENTEVAL_*` variable, so no in-loop run resolves a
+credential and the arms stay operator-executed. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
+
 ```sh
 # Offline (runs in scripts/test verify; no model call):
 scripts/test single -run 'TestInjection|TestLoadInjection|TestEnvelopeQuality|TestStripBodyEnvelope|TestQualityArm|TestCompareQualityArms|TestJudgeRubric|TestRubric' ./backend/internal/agenteval/
@@ -821,6 +838,9 @@ scripts/test single -run TestBuild_Implement ./backend/internal/prompt/
 
 # Live injection arm (opt-in; makes real model calls):
 FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run TestInjectionLive ./backend/internal/agenteval/
+# ...or authenticate with an OAuth bearer token instead (set exactly one):
+FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_AUTH_TOKEN=... \
   scripts/test single -run TestInjectionLive ./backend/internal/agenteval/
 
 # Live envelope-quality arms (opt-in; makes real model calls):
@@ -844,7 +864,7 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
-The #2291 live tests SKIP with a message naming #3187 and the criteria they
-leave undecided; the #3309 live arms SKIP naming #3309 and
+The #2291 live tests SKIP with a message naming both credential variables, #3187
+and the criteria they leave undecided; the #3309 live arms SKIP naming #3309 and
 `docs/compliance/severity-calibration-evidence.md`. The #2245 live arm SKIPS naming
 `docs/compliance/planreview-catchrate-evidence.md`.

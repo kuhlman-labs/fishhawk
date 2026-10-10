@@ -146,9 +146,9 @@ behavioural, until #3187's live arm runs.
 
 ## What is NOT proven — read this before citing the above
 
-**Acceptance criteria 1, 2 and 4 of #2291 are UNMEASURED.** No
-`FISHHAWKD_ANTHROPIC_API_KEY` is configured in the environment that produced
-this apparatus, so both live arms SKIPPED. Nothing in this repository presents
+**Acceptance criteria 1, 2 and 4 of #2291 are UNMEASURED.** No model credential
+(`FISHHAWKD_ANTHROPIC_API_KEY` or `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`) is configured
+in the environment that produced this apparatus, so both live arms SKIPPED. Nothing in this repository presents
 those measurements as taken.
 
 | Unmeasured | #2291 criterion | Why it matters |
@@ -178,15 +178,18 @@ as *resisted*.
 ## Re-run recipe
 
 Both live arms are double-gated: an opt-in `FISHHAWK_AGENTEVAL_*_LIVE` flag AND
-`FISHHAWKD_ANTHROPIC_API_KEY`. Absent either, they skip with a message naming
-the criteria they leave undecided.
+a model credential — `FISHHAWKD_ANTHROPIC_API_KEY` or
+`FISHHAWKD_ANTHROPIC_AUTH_TOKEN` (an OAuth bearer), exactly one; both set is a
+refusal. Absent either, they skip with a message naming both credential
+variables and the criteria they leave undecided. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
 
 ```sh
 # Offline halves (no model call; also run by `scripts/test verify`):
 scripts/test single -run 'TestInjection|TestLoadInjection|TestEnvelopeQuality|TestStripBodyEnvelope|TestQualityArm' ./backend/internal/agenteval/
 scripts/test single -run TestBuild_Implement ./backend/internal/prompt/
 
-# Live arm 1 — behavioural injection resistance (criterion 4):
+# Live arm 1 — behavioural injection resistance (criterion 4).
+# Swap FISHHAWKD_ANTHROPIC_API_KEY for FISHHAWKD_ANTHROPIC_AUTH_TOKEN to use a bearer token:
 FISHHAWK_AGENTEVAL_INJECTION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run TestInjectionLive ./backend/internal/agenteval/
 
