@@ -50,7 +50,7 @@ func (s *allCaughtSender) Messages(context.Context, string, string) (string, str
 func freshRecord(t *testing.T, conventions string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "evidence.json")
-	_, err := agenteval.RecordCatchRateEvidence(context.Background(), newAllCaughtSender(t), agenteval.DefaultQualityGeneratorModel,
+	_, err := agenteval.RecordCatchRateEvidence(context.Background(), newAllCaughtSender(t), agenteval.DefaultCatchRateGeneratorModel,
 		testCorpus, conventions, path, time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC),
 		agenteval.RecordCatchRateOptions{PinBaseline: true, Reason: "test baseline"})
 	if err != nil {
@@ -252,7 +252,7 @@ func TestRun_PrintFingerprintDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := agenteval.CatchRatePromptFingerprint(cases, conv, agenteval.DefaultQualityGeneratorModel)
+	want, err := agenteval.CatchRatePromptFingerprint(cases, conv, agenteval.DefaultCatchRateGeneratorModel)
 	if err != nil {
 		t.Fatal(err)
 	}
