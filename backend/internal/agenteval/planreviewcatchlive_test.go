@@ -23,8 +23,9 @@ import (
 // walk is docs/compliance/planreview-catchrate-evidence.md.
 //
 // DOUBLE-GATED on FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE plus
-// FISHHAWKD_ANTHROPIC_API_KEY, the posture injectionlive_test.go and
-// severitycalibrationlive_test.go take. Two further knobs:
+// one credential — FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN
+// (exactly one; see livecredential_test.go) — the posture injectionlive_test.go
+// and severitycalibrationlive_test.go take. Two further knobs:
 //
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1          write the evidence record (otherwise a dry run)
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON=<why>  pin this measurement as the baseline (the explicit operator action)
@@ -33,16 +34,12 @@ import (
 
 const planReviewCatchEvidencePath = "testdata/planreview-catchrate/evidence.json"
 
-func planReviewCatchLiveGate(t *testing.T) string {
+func planReviewCatchLiveGate(t *testing.T) liveCredential {
 	t.Helper()
 	if os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE") == "" {
 		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms. Until they run and an operator records the baseline, #2245's two-arm evidence is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
 	}
-	apiKey := os.Getenv("FISHHAWKD_ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		t.Skip("FISHHAWKD_ANTHROPIC_API_KEY unset; skipping the live plan-review catch-rate arms. #2245's two-arm evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
-	}
-	return apiKey
+	return requireLiveCredential(t, "Skipping the live plan-review catch-rate arms. #2245's two-arm evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
 }
 
 // TestPlanReviewCatchRateLive runs both arms against
@@ -54,13 +51,12 @@ func planReviewCatchLiveGate(t *testing.T) string {
 // call, but it is the standing gate's bar, and RecordCatchRateEvidence refuses
 // to write a failing measurement anyway.
 func TestPlanReviewCatchRateLive(t *testing.T) {
-	apiKey := planReviewCatchLiveGate(t)
-	generator := anthropic.NewClient(anthropic.Config{
-		APIKey:    apiKey,
+	cred := planReviewCatchLiveGate(t)
+	generator := anthropic.NewClient(cred.config(anthropic.Config{
 		Model:     DefaultQualityGeneratorModel,
 		MaxTokens: 4096,
 		Timeout:   120 * time.Second,
-	})
+	}))
 	reason := os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON")
 	opts := RecordCatchRateOptions{
 		PinBaseline: reason != "",

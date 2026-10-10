@@ -685,11 +685,12 @@ func TestAwaitChildren_SliceIntegrationReadOnlyOnUncoveredArm(t *testing.T) {
 	}
 }
 
-// TestAwaitChildren_ParentReadsFailClosed pins the best-effort direction of the
-// two parent reads the C3 arm takes (#4165): a failed parent stage list or a
-// parent with no implement stage reads "" (never "succeeded"), and a failed
-// parent GET reads nil authority (undecidable, never "unavailable"). Either
-// way an unreadable parent is never read as authority-less.
+// TestAwaitChildren_ParentReadsFailClosed pins the direction of the two parent
+// reads the C3 arm takes (#4165, #4220): a failed parent stage list or a parent
+// with no implement stage reads "" (never "succeeded"), and the parent GET is a
+// three-way split — a read error returns a non-nil error, an absent
+// slice_integration key on a successful read returns (nil, nil), and a present
+// key is authoritative. A read error is therefore never the absent key.
 func TestAwaitChildren_ParentReadsFailClosed(t *testing.T) {
 	t.Run("stage list error reads empty state", func(t *testing.T) {
 		fb, r := newAwaitResolver(t)
@@ -712,15 +713,43 @@ func TestAwaitChildren_ParentReadsFailClosed(t *testing.T) {
 			t.Errorf("parentImplementStageState = %q, want \"\" with no implement stage", got)
 		}
 	})
-	t.Run("parent GET error reads nil authority", func(t *testing.T) {
+	t.Run("parent GET error returns an error, not an absent key", func(t *testing.T) {
 		fb, r := newAwaitResolver(t)
 		parent := uuid.New()
 		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: false, Reason: "GitHub not configured"})
 		fb.mu.Lock()
 		fb.getStatusByID[parent] = 500
 		fb.mu.Unlock()
-		if got := r.parentSliceIntegration(context.Background(), parent); got != nil {
-			t.Errorf("parentSliceIntegration = %+v, want nil on a read error", got)
+		got, err := r.parentSliceIntegration(context.Background(), parent)
+		if err == nil {
+			t.Fatalf("parentSliceIntegration err = nil (authority %+v), want a non-nil error on a read failure", got)
+		}
+		if got != nil {
+			t.Errorf("parentSliceIntegration authority = %+v, want nil alongside the error", got)
+		}
+	})
+	t.Run("parent GET success without the key returns nil, nil", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedParentSliceIntegration(fb, parent, nil)
+		got, err := r.parentSliceIntegration(context.Background(), parent)
+		if err != nil {
+			t.Fatalf("parentSliceIntegration err = %v, want nil on a successful read with an absent key", err)
+		}
+		if got != nil {
+			t.Errorf("parentSliceIntegration authority = %+v, want nil for an absent key", got)
+		}
+	})
+	t.Run("parent GET success with the key is authoritative", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+		got, err := r.parentSliceIntegration(context.Background(), parent)
+		if err != nil {
+			t.Fatalf("parentSliceIntegration err = %v, want nil", err)
+		}
+		if got == nil || !got.Available {
+			t.Errorf("parentSliceIntegration authority = %+v, want the present key {available:true}", got)
 		}
 	})
 	t.Run("authority available + no record + UNREADABLE parent stage -> integration_pending, not the wedge", func(t *testing.T) {
@@ -740,6 +769,87 @@ func TestAwaitChildren_ParentReadsFailClosed(t *testing.T) {
 			t.Errorf("status = %q message %q, want the ordinary integration_pending (an unreadable parent stage is not the lost-record wedge)", out.Status, out.Message)
 		}
 	})
+}
+
+// seedWedgeWithUnreadableParent builds the #4165 lost-record wedge BY
+// CONSTRUCTION — four succeeded children, the parent's implement stage
+// succeeded, NO slices_integrated record, and a seeded
+// capabilities.slice_integration {available:true} that a failed parent GET
+// makes unreachable (500). Under the pre-#4220 nil-on-error read this snapshot
+// took the C3 inference (!fanInRecorded && parent implement succeeded) and
+// released children_settled.
+func seedWedgeWithUnreadableParent(fb *fakeBackend, parent uuid.UUID) {
+	seedFourSucceeded(fb, parent)
+	seedParentImplementStage(fb, parent, "succeeded")
+	seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+	fb.mu.Lock()
+	fb.getStatusByID[parent] = 500
+	fb.mu.Unlock()
+}
+
+// TestAwaitChildren_ParentGETErrorOnWedgeNeverSettles is the #4220 done-means: a
+// failed read of the parent's capabilities must not be read as an absent key.
+// On the lost-record wedge the wait keeps polling (re-reading the parent each
+// tick) and surfaces the resumable timeout — never children_settled.
+func TestAwaitChildren_ParentGETErrorOnWedgeNeverSettles(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	seedWedgeWithUnreadableParent(fb, parent)
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status == "children_settled" {
+		t.Fatalf("status = children_settled (message %q): a failed parent GET fell back to the C3 inference on the lost-record wedge", out.Message)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout (the wait fails closed on an unreadable parent)", out.Status)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if n := fb.getRunCalledByID[parent]; n < 2 {
+		t.Errorf("parent GET reads = %d, want >= 2 (the arm must re-read on a later tick, not release on the first)", n)
+	}
+}
+
+// TestAwaitChildrenEvaluate_ParentGETErrorHoldsThenRecovers pins the
+// evaluate-level contract directly: an unreadable parent keeps polling
+// (zero output, done=false, NO error — a transient blip must not abort the
+// tool call), and once the read recovers the same snapshot releases the
+// correct #4165 integration_pending naming the integrate-wave recovery.
+func TestAwaitChildrenEvaluate_ParentGETErrorHoldsThenRecovers(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	seedWedgeWithUnreadableParent(fb, parent)
+
+	out, done, err := r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+	if err != nil {
+		t.Fatalf("awaitChildrenEvaluate err = %v, want nil (a failed parent GET holds, it does not abort)", err)
+	}
+	if done {
+		t.Fatalf("awaitChildrenEvaluate released %q (message %q) on an unreadable parent, want done=false", out.Status, out.Message)
+	}
+	if out.Status != "" {
+		t.Errorf("out = %+v, want the zero output while holding", out)
+	}
+
+	fb.mu.Lock()
+	delete(fb.getStatusByID, parent)
+	fb.mu.Unlock()
+
+	out, done, err = r.awaitChildrenEvaluate(context.Background(), parent, time.Now(), false, 600)
+	if err != nil {
+		t.Fatalf("awaitChildrenEvaluate after recovery: %v", err)
+	}
+	if !done || out.Status != "integration_pending" {
+		t.Fatalf("after recovery: done=%v status=%q, want a released integration_pending", done, out.Status)
+	}
+	if want := "/v0/runs/" + parent.String() + "/integrate-wave"; !strings.Contains(out.Message, want) {
+		t.Errorf("message %q must name the recovery %q", out.Message, want)
+	}
 }
 
 // TestAwaitChildrenNoAuthorityOutput_EmptyReason pins the defensive arm for an
@@ -921,6 +1031,27 @@ func TestAwaitChildren_NoIntegrationAuthority_FallsBackToSettled(t *testing.T) {
 		// not_awaiting_children — next_step reads the PARENT's status instead.
 		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
 			t.Errorf("next_step = %+v, want fishhawk_get_run_status on the parent %s", out.NextStep, parent)
+		}
+	})
+	t.Run("capabilities block WITHOUT slice_integration + no record + parent succeeded -> settled via inference", func(t *testing.T) {
+		// #4220: a SUCCESSFUL parent GET whose capabilities block omits the key
+		// is an older backend — undecidable, so the inference applies. It is the
+		// (nil, nil) counterpart to a failed GET, which waits instead.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		seedFourSucceeded(fb, parent)
+		seedParentImplementStage(fb, parent, "succeeded")
+		seedParentSliceIntegration(fb, parent, nil)
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_settled" {
+			t.Fatalf("status = %q, want children_settled via the inference on an absent key", out.Status)
+		}
+		if !strings.Contains(out.Message, "No slices_integrated record exists although") {
+			t.Errorf("message %q must carry the inference text, not a server reason", out.Message)
 		}
 	})
 	t.Run("authority unavailable + parent awaiting_children -> settled with consolidate", func(t *testing.T) {
