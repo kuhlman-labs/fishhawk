@@ -29,6 +29,8 @@ import (
 //   - recordMergeCandidateVerified writes the head-bound result;
 //   - maybeRecoverMergeCandidateVerifyFailure keeps a crashed pass from
 //     wedging its head as permanently in flight;
+//   - refuseMergeCandidatePassToIncapableRunner settles a pass a stale
+//     runner fetched without the merge-candidate-verify capability (#4183);
 //   - mergeCandidateVerifyState is the ONE predicate the merge gate, the
 //     rebase producer and the decomposed-parent hold read (D2, D4);
 //   - routeMergeCandidateFailure applies D6 to a red result.
@@ -499,38 +501,170 @@ func (s *Server) maybeRecoverMergeCandidateVerifyFailure(ctx context.Context, ru
 	if err != nil || stage.Type != run.StageTypeImplement {
 		return false
 	}
-	trigger := s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
-	if trigger == nil {
-		return false
-	}
-	var reviewStageID *uuid.UUID
-	if trigger.ReparkedReviewStageID != "" {
-		rid, perr := uuid.Parse(trigger.ReparkedReviewStageID)
-		if perr != nil {
-			return false
-		}
-		reviewStageID = &rid
-	}
-	if _, err := s.recordMergeCandidateVerified(ctx, runID, stageID, mergeCandidateResultNotExecuted,
-		"runner_failed: "+reason, "", audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+	step, err := s.settleMergeCandidatePassNotExecuted(ctx, runID, stageID, "runner_failed: "+reason, nil)
+	switch step {
+	case mergeCandidateSettleRecordFailed:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate verify recovery: consumption row not persisted — leaving failure path in force",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 		return false
-	}
-	if _, err := run.RestoreFixupStage(ctx, s.cfg.RunRepo, stageID,
-		run.StageState(trigger.PriorState), reviewStageID); err != nil {
+	case mergeCandidateSettleRestoreFailed:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate verify recovery: restore failed — leaving failure path in force",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
 		return false
+	case mergeCandidateSettled:
+		s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_recovered")
+		return true
 	}
-	s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_recovered")
-	return true
+	return false
+}
+
+// mergeCandidateSettleStep is how far settleMergeCandidatePassNotExecuted got.
+// Every step short of mergeCandidateSettled names the FIRST step that did not
+// land; everything before it did.
+type mergeCandidateSettleStep int
+
+const (
+	// mergeCandidateSettleNoLiveTrigger: no live, restorable trigger (none,
+	// unreadable, or an unparseable re-parked review anchor). Nothing written.
+	mergeCandidateSettleNoLiveTrigger mergeCandidateSettleStep = iota
+	// mergeCandidateSettleRecordFailed: the not_executed row did not land.
+	// Nothing written; the trigger is still live.
+	mergeCandidateSettleRecordFailed
+	// mergeCandidateSettleBeforeRestoreFailed: the row landed (the trigger is
+	// consumed) but the caller's beforeRestore step failed, so nothing was
+	// restored.
+	mergeCandidateSettleBeforeRestoreFailed
+	// mergeCandidateSettleRestoreFailed: the row landed and beforeRestore
+	// succeeded, but run.RestoreFixupStage failed.
+	mergeCandidateSettleRestoreFailed
+	// mergeCandidateSettled: the row landed and the pre-pass gate is restored.
+	mergeCandidateSettled
+)
+
+// settleMergeCandidatePassNotExecuted settles the stage's live merge-candidate
+// pass as not_executed WITHOUT a runner verdict, RECORD-FIRST (ADR-090 D8):
+//
+//  1. resolve the live trigger and its restore anchors;
+//  2. append merge_candidate_verified{not_executed, reason}, consuming the
+//     trigger so the head is re-triggerable rather than permanently in flight;
+//  3. only on a successful append, run beforeRestore (nil = none) — the
+//     capability refusal fails the stage here so step 4 has a failed stage
+//     to restore;
+//  4. run.RestoreFixupStage back to the trigger's PriorState, re-parking the
+//     review stage the pass re-parked.
+//
+// The append is FIRST because it is the only step whose failure must leave
+// the stage untouched: a transient audit error never turns a healthy pre-pass
+// stage into a terminal failure, and a live trigger on an un-failed stage is
+// what the D8 reap path recovers. It returns the step reached and that step's
+// error. It does not log or notify; callers do, so each keeps its own lines.
+func (s *Server) settleMergeCandidatePassNotExecuted(ctx context.Context, runID, stageID uuid.UUID,
+	reason string, beforeRestore func() error) (mergeCandidateSettleStep, error) {
+	trigger := s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
+	if trigger == nil {
+		return mergeCandidateSettleNoLiveTrigger, nil
+	}
+	var reviewStageID *uuid.UUID
+	if trigger.ReparkedReviewStageID != "" {
+		rid, perr := uuid.Parse(trigger.ReparkedReviewStageID)
+		if perr != nil {
+			return mergeCandidateSettleNoLiveTrigger, nil
+		}
+		reviewStageID = &rid
+	}
+	if _, err := s.recordMergeCandidateVerified(ctx, runID, stageID, mergeCandidateResultNotExecuted,
+		reason, "", audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+		return mergeCandidateSettleRecordFailed, err
+	}
+	if beforeRestore != nil {
+		if err := beforeRestore(); err != nil {
+			return mergeCandidateSettleBeforeRestoreFailed, err
+		}
+	}
+	if _, err := run.RestoreFixupStage(ctx, s.cfg.RunRepo, stageID,
+		run.StageState(trigger.PriorState), reviewStageID); err != nil {
+		return mergeCandidateSettleRestoreFailed, err
+	}
+	return mergeCandidateSettled, nil
+}
+
+// mergeCandidateReasonRunnerCapabilityMissing leads the not_executed reason
+// (and the stage's failure reason) when the prompt endpoint refuses a
+// merge-candidate pass to a runner that does not advertise
+// capabilityMergeCandidateVerify (#4183). It is also the 409 error code.
+const mergeCandidateReasonRunnerCapabilityMissing = "runner_capability_missing"
+
+// mergeCandidateCapabilityMissingDetail is the human half of the refusal: what
+// happened and the remedy.
+const mergeCandidateCapabilityMissingDetail = "the requesting runner does not advertise the " +
+	capabilityMergeCandidateVerify + " capability, so it was refused the merge-candidate verify pass; " +
+	"rebuild bin/fishhawk-runner, then re-trigger the pass with fishhawk_rebase_run_branch"
+
+// refuseMergeCandidatePassToIncapableRunner settles a live merge-candidate pass
+// a stale runner fetched (#4183). A runner that predates ADR-090 ignores the
+// merge_candidate_verify_* prompt fields and would run a plain implement agent
+// pass on the re-opened stage, so the prompt endpoint builds no prompt and
+// calls this instead. RECORD-FIRST, via settleMergeCandidatePassNotExecuted:
+// merge_candidate_verified{not_executed, runner_capability_missing: ...}, then
+// FailStage C, then RestoreFixupStage to the pre-pass gate.
+//
+// It reports whether the pass was settled. Every arm leaves the caller
+// answering 409, so the runner exits before any agent spawn:
+//
+//   - no live trigger (consumed concurrently): nothing to settle;
+//   - the append fails: NOTHING else runs — no FailStage, no Advance — so the
+//     stage is left as it was and the trigger stays live for the D8 reap path;
+//   - FailStage fails after the append: the trigger is consumed but the stage
+//     is left re-opened; logged, nothing else runs;
+//   - the restore fails after FailStage: the failure path stays in force via
+//     Orchestrator.Advance, mirroring failPullRequestStage for the same pass.
+//
+// A successful settlement never calls Advance, so it cannot self-loop.
+func (s *Server) refuseMergeCandidatePassToIncapableRunner(ctx context.Context, runID, stageID uuid.UUID) bool {
+	reason := mergeCandidateReasonRunnerCapabilityMissing + ": " + mergeCandidateCapabilityMissingDetail
+	step, err := s.settleMergeCandidatePassNotExecuted(ctx, runID, stageID, reason, func() error {
+		_, ferr := run.FailStage(ctx, s.cfg.RunRepo, stageID, run.FailureC, reason)
+		return ferr
+	})
+	attrs := []slog.Attr{
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+	switch step {
+	case mergeCandidateSettled:
+		s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_runner_refused")
+		return true
+	case mergeCandidateSettleNoLiveTrigger:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: stale runner refused, but no live trigger remained to settle", attrs...)
+	case mergeCandidateSettleRecordFailed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: stale runner refused; not_executed row not persisted — stage left as it was, trigger still live for the reap path", attrs...)
+	case mergeCandidateSettleBeforeRestoreFailed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: stale runner refused; trigger consumed but failing the stage failed — stage left re-opened", attrs...)
+	case mergeCandidateSettleRestoreFailed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate verify: stale runner refused; restore failed after the stage was failed — leaving failure path in force", attrs...)
+		if s.cfg.Orchestrator != nil {
+			if _, aerr := s.cfg.Orchestrator.Advance(ctx, runID); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"merge-candidate verify: orchestrator advance after a failed restore failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()))
+			}
+		}
+	}
+	return false
 }
 
 // mergeCandidateState is mergeCandidateVerifyState's answer. Cause is set for a
