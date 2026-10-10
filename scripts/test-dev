@@ -2989,10 +2989,11 @@ if print -r -- "$preview_body" | grep_q 'FISHHAWKD_DATABASE_URL is not set'; the
 else
   fail "cmd_preview should _die on a missing FISHHAWKD_DATABASE_URL"
 fi
-if print -r -- "$preview_body" | grep_q 'could not resolve'; then
-  pass "cmd_preview dies loud on an unresolvable ref (after the direct-fetch retry)"
+# Ref resolution moved into _preview_resolve_ref (E72.52 / #4058; behavior in 15n).
+if typeset -f _preview_resolve_ref | grep_q 'could not resolve'; then
+  pass "_preview_resolve_ref fails loud on an unresolvable ref (after the direct-fetch retry)"
 else
-  fail "cmd_preview should _die when the ref resolves to no commit"
+  fail "_preview_resolve_ref should fail loud when the ref resolves to no commit"
 fi
 if print -r -- "$preview_body" | grep_q '_down_port_fallback'; then
   pass "cmd_preview pre-empts a stale orphan via the port reclaim (_down_port_fallback)"
@@ -3695,6 +3696,381 @@ if print -r -- "$preview_body" | grep_q -F '_die "invalid FISHHAWKD_OAUTH_ISSUER
 else
   fail "cmd_preview should _die on a non-zero _preview_passthrough_env"
 fi
+
+# 15n. Preview ref resolution + bounded fetch (E72.52 / #4058). The acceptance
+# runner's auto_preview hook hung on cmd_preview's UNBOUNDED `git fetch origin`.
+# Hermetic fixture: a NON-bare `origin` with commit A, cloned to `local`, then
+# commit B added DIRECTLY in origin (never pushed — no #3503 receive-pack
+# maintenance race). A PATH `git` shim logs every fetch (with its env pins) and
+# then hangs, fails, or runs the real git per PR15N_FETCH_MODE; any other argv
+# execs the real git. Each resolve runs inside a `$( … 2>&1 )` substitution,
+# which — like the runner's exec.Cmd CombinedOutput — waits for EOF on its
+# pipe, so a descendant holding that pipe would show up as elapsed time.
+pr15n_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-test-pr15n.XXXXXX")"
+pr15n_real_git="$(command -v git)"
+pr15n_stub="${pr15n_dir}/stub"
+pr15n_tmp="${pr15n_dir}/tmp"
+pr15n_log="${pr15n_dir}/fetch.log"
+pr15n_res="${pr15n_dir}/result"
+mkdir -p "$pr15n_stub" "$pr15n_tmp"
+pr15n_g() {
+  "$pr15n_real_git" -c user.name=pr15n -c user.email=pr15n@example.invalid \
+    -c commit.gpgsign=false -c init.defaultBranch=main "$@"
+}
+pr15n_g init -q "${pr15n_dir}/origin"
+pr15n_g -C "${pr15n_dir}/origin" commit -q --allow-empty -m A
+pr15n_A="$(pr15n_g -C "${pr15n_dir}/origin" rev-parse HEAD)"
+pr15n_g clone -q "${pr15n_dir}/origin" "${pr15n_dir}/local"
+# `git fetch` runs auto-maintenance in the FETCHING repo; keep it inert.
+pr15n_g -C "${pr15n_dir}/local" config maintenance.auto false
+pr15n_g -C "${pr15n_dir}/local" config gc.auto 0
+pr15n_g -C "${pr15n_dir}/origin" commit -q --allow-empty -m B
+pr15n_B="$(pr15n_g -C "${pr15n_dir}/origin" rev-parse HEAD)"
+pr15n_absent="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+cat > "${pr15n_stub}/git" <<'STUB'
+#!/bin/sh
+case " $* " in
+  *" fetch "*)
+    printf 'fetch GTP=%s ASKPASS=%s args=%s\n' "${GIT_TERMINAL_PROMPT-}" "${GIT_ASKPASS-}" "$*" >> "$PR15N_FETCH_LOG"
+    case "${PR15N_FETCH_MODE:-real}" in
+      hang)
+        # A wedged credential helper: a grandchild that inherits stdout/stderr
+        # and outlives the TERM, plus the fetch itself blocking.
+        echo "pr15n-shim: hang marker" >&2
+        sleep 12 &
+        exec sleep 12
+        ;;
+      fail)
+        echo "fatal: pr15n-shim fail marker" >&2
+        exit 128
+        ;;
+    esac
+    ;;
+esac
+exec "$PR15N_REAL_GIT" "$@"
+STUB
+chmod +x "${pr15n_stub}/git"
+
+# pr15n_resolve <mode> <ref> [<tmpdir>]: drive _preview_resolve_ref at bound
+# 1s. Sets pr15n_out (combined stdout+stderr), pr15n_rc, pr15n_reply,
+# pr15n_el (elapsed s) and pr15n_fetches (fetch-log line count).
+pr15n_resolve() {
+  local mode="$1" ref="$2" tdir="${3:-$pr15n_tmp}" start=$SECONDS
+  : > "$pr15n_log"
+  rm -f "$pr15n_res"
+  pr15n_out="$(
+    {
+      export PATH="${pr15n_stub}:${PATH}" TMPDIR="$tdir"
+      export PR15N_FETCH_MODE="$mode" PR15N_FETCH_LOG="$pr15n_log" PR15N_REAL_GIT="$pr15n_real_git"
+      REPO_ROOT="${pr15n_dir}/local"
+      rehash
+      pr15n_sub_rc=0
+      _preview_resolve_ref "$ref" 1 || pr15n_sub_rc=$?
+      print -r -- "${pr15n_sub_rc} ${REPLY}" > "$pr15n_res"
+    } 2>&1
+  )"
+  pr15n_el=$(( SECONDS - start ))
+  local res=""
+  res="$(cat "$pr15n_res" 2>/dev/null)" || res=""
+  pr15n_rc="${res%% *}"
+  pr15n_reply="${res#* }"
+  pr15n_fetches="$(grep -c '^fetch ' "$pr15n_log" 2>/dev/null)" || pr15n_fetches=0
+}
+pr15n_leftovers() { print -l -- "$pr15n_tmp"/fishhawk-preview-fetch.*(N) | grep -c . }
+
+# (a) LOCAL FULL SHA, fetch would hang: used directly, no fetch at all.
+pr15n_resolve hang "$pr15n_A"
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_A" && "$pr15n_fetches" == 0 \
+      && "$pr15n_out" == *'skipping git fetch'* ]] && (( pr15n_el < 3 )); then
+  pass "_preview_resolve_ref: a local full SHA resolves with NO git fetch (${pr15n_el}s)"
+else
+  fail "_preview_resolve_ref should resolve a local full SHA without fetching (rc=$pr15n_rc reply=$pr15n_reply fetches=$pr15n_fetches el=${pr15n_el}s out: $pr15n_out)"
+fi
+
+# (b) REQUIRED FETCH HANGS: an absent full SHA fails within the bound, with a
+# named-timeout error carrying the captured fetch output, after EXACTLY ONE
+# fetch (no direct-fetch retry after a timeout) that carried both env pins.
+# GTP=0 is load-bearing: under the runner it turns a /dev/tty credential
+# prompt into a fast failure instead of a wedge.
+pr15n_resolve hang "$pr15n_absent"
+pr15n_line="$(head -n 1 "$pr15n_log" 2>/dev/null)"
+if [[ "$pr15n_rc" == 1 ]] && (( pr15n_el < 8 )); then
+  pass "_preview_resolve_ref: a hanging required fetch fails within the bound (${pr15n_el}s)"
+else
+  fail "_preview_resolve_ref should fail a hanging required fetch within the bound (rc=$pr15n_rc el=${pr15n_el}s out: $pr15n_out)"
+fi
+if [[ "$pr15n_out" == *"error: could not resolve '${pr15n_absent}' locally and git fetch origin timed out after 1s"* \
+      && "$pr15n_out" == *FISHHAWK_PREVIEW_FETCH_TIMEOUT* && "$pr15n_out" == *repo-local* ]]; then
+  pass "_preview_resolve_ref: the timeout error names git fetch origin, the bound, the repo-local remedy and the knob"
+else
+  fail "_preview_resolve_ref timeout error is missing its named parts (out: $pr15n_out)"
+fi
+if [[ "$pr15n_out" == *'git fetch output (last lines):'*'pr15n-shim: hang marker'* ]]; then
+  pass "_preview_resolve_ref: the timeout error carries the captured fetch stderr tail"
+else
+  fail "_preview_resolve_ref timeout error should carry the fetch stderr tail (out: $pr15n_out)"
+fi
+if [[ "$pr15n_fetches" == 1 ]]; then
+  pass "_preview_resolve_ref: no direct-fetch retry after a timeout (exactly one fetch)"
+else
+  fail "_preview_resolve_ref should skip the direct-fetch retry after a timeout (fetches=$pr15n_fetches)"
+fi
+if [[ "$pr15n_line" == *'GTP=0 '* ]]; then
+  pass "_preview_git_fetch pins GIT_TERMINAL_PROMPT=0"
+else
+  fail "_preview_git_fetch should pin GIT_TERMINAL_PROMPT=0 (log: $pr15n_line)"
+fi
+if [[ "$pr15n_line" == *'ASKPASS=/bin/false '* ]]; then
+  pass "_preview_git_fetch pins GIT_ASKPASS=/bin/false"
+else
+  fail "_preview_git_fetch should pin GIT_ASKPASS=/bin/false (log: $pr15n_line)"
+fi
+if (( $(pr15n_leftovers) == 0 )); then
+  pass "_preview_git_fetch removes its captured-output temp file after a timeout"
+else
+  fail "_preview_git_fetch left a fishhawk-preview-fetch.* temp file under TMPDIR"
+fi
+
+# (c) REQUIRED FETCH SUCCEEDS: B is absent locally but in origin.
+pr15n_resolve real "$pr15n_B"
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_B" ]] && (( pr15n_fetches >= 1 )); then
+  pass "_preview_resolve_ref: a non-local full SHA resolves through a real bounded fetch"
+else
+  fail "_preview_resolve_ref should fetch and resolve a non-local SHA (rc=$pr15n_rc reply=$pr15n_reply fetches=$pr15n_fetches out: $pr15n_out)"
+fi
+# Re-create the fixture's stale state for (d)/(e): local's origin/main back on A.
+pr15n_g -C "${pr15n_dir}/local" update-ref refs/remotes/origin/main "$pr15n_A"
+
+# (d) SYMBOLIC REF STAYS FRESH: origin/main is fetched first, so it resolves
+# to origin's moved tip B, not local's stale remote-tracking A.
+pr15n_resolve real origin/main
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_B" ]] && (( pr15n_fetches >= 1 )); then
+  pass "_preview_resolve_ref: a symbolic ref is fetched first and resolves to the fresh tip"
+else
+  fail "_preview_resolve_ref should fetch before resolving a symbolic ref (rc=$pr15n_rc reply=$pr15n_reply want=$pr15n_B fetches=$pr15n_fetches)"
+fi
+pr15n_g -C "${pr15n_dir}/local" update-ref refs/remotes/origin/main "$pr15n_A"
+
+# (e) FAST FETCH FAILURE DEGRADES: the ref still resolves locally.
+pr15n_resolve fail origin/main
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_A" && "$pr15n_out" == *'git fetch origin failed'* ]]; then
+  pass "_preview_resolve_ref: a failed fetch degrades to local resolution with a warning"
+else
+  fail "_preview_resolve_ref should degrade a failed fetch to local resolution (rc=$pr15n_rc reply=$pr15n_reply out: $pr15n_out)"
+fi
+
+# (f) UNRESOLVABLE AFTER RETRY: two fetches (general + direct), then the
+# could-not-resolve error carrying the captured fetch stderr tail.
+pr15n_resolve fail "$pr15n_absent"
+if [[ "$pr15n_rc" == 1 && "$pr15n_out" == *"could not resolve '${pr15n_absent}' to a commit"* && "$pr15n_fetches" == 2 ]]; then
+  pass "_preview_resolve_ref: an unresolvable ref fails after the direct-fetch retry (2 fetches)"
+else
+  fail "_preview_resolve_ref should fail after exactly the general fetch + one direct retry (rc=$pr15n_rc fetches=$pr15n_fetches out: $pr15n_out)"
+fi
+if [[ "$pr15n_out" == *'git fetch output (last lines):'*'fatal: pr15n-shim fail marker'* ]]; then
+  pass "_preview_resolve_ref: the could-not-resolve error carries the captured fetch stderr tail"
+else
+  fail "_preview_resolve_ref could-not-resolve error should carry the fetch stderr tail (out: $pr15n_out)"
+fi
+if (( $(pr15n_leftovers) == 0 )); then
+  pass "_preview_git_fetch removes its captured-output temp file after a failure"
+else
+  fail "_preview_git_fetch left a fishhawk-preview-fetch.* temp file under TMPDIR after a failure"
+fi
+
+# (f2) mktemp unavailable (TMPDIR missing): the fetch still runs, with no
+# captured output, rather than failing on an empty redirect target.
+pr15n_resolve fail "$pr15n_absent" "${pr15n_dir}/no-such-tmp"
+if [[ "$pr15n_rc" == 1 && "$pr15n_fetches" == 2 && "$pr15n_out" == *'git fetch output: (none captured)'* ]]; then
+  pass "_preview_git_fetch degrades to an uncaptured fetch when mktemp fails"
+else
+  fail "_preview_git_fetch should still fetch when mktemp fails (rc=$pr15n_rc fetches=$pr15n_fetches out: $pr15n_out)"
+fi
+
+# (g) _preview_fetch_timeout: default, accepted values, and fail-closed refusals.
+pr15n_v="$(unset FISHHAWK_PREVIEW_FETCH_TIMEOUT; _preview_fetch_timeout)"
+if [[ $? -eq 0 && "$pr15n_v" == 60 ]]; then
+  pass "_preview_fetch_timeout: unset defaults to 60"
+else
+  fail "_preview_fetch_timeout should default to 60 when unset (got: $pr15n_v)"
+fi
+pr15n_v="$(FISHHAWK_PREVIEW_FETCH_TIMEOUT='' _preview_fetch_timeout)"
+if [[ $? -eq 0 && "$pr15n_v" == 60 ]]; then
+  pass "_preview_fetch_timeout: empty defaults to 60"
+else
+  fail "_preview_fetch_timeout should default to 60 when empty (got: $pr15n_v)"
+fi
+pr15n_v="$(FISHHAWK_PREVIEW_FETCH_TIMEOUT=5 _preview_fetch_timeout)"
+if [[ $? -eq 0 && "$pr15n_v" == 5 ]]; then
+  pass "_preview_fetch_timeout: 5 is accepted"
+else
+  fail "_preview_fetch_timeout should accept 5 (got: $pr15n_v)"
+fi
+for pr15n_bad in 0 abc -3 3601; do
+  pr15n_rc=0
+  pr15n_v="$(FISHHAWK_PREVIEW_FETCH_TIMEOUT="$pr15n_bad" _preview_fetch_timeout 2>&1)" || pr15n_rc=$?
+  if [[ "$pr15n_rc" -ne 0 && "$pr15n_v" == *FISHHAWK_PREVIEW_FETCH_TIMEOUT* && "$pr15n_v" == *"'${pr15n_bad}'"* ]]; then
+    pass "_preview_fetch_timeout refuses '${pr15n_bad}' naming the knob"
+  else
+    fail "_preview_fetch_timeout should refuse '${pr15n_bad}' (rc=$pr15n_rc out: $pr15n_v)"
+  fi
+done
+
+# (g2) cmd_preview fails fast on an invalid knob, BEFORE ref resolution and
+# before the FISHHAWKD_DATABASE_URL check. REPO_ROOT points at an empty dir
+# (no .env), so nothing past the knob can run hermetically.
+pr15n_rc=0
+pr15n_out="$(
+  REPO_ROOT="${pr15n_dir}/empty-root"
+  mkdir -p "$REPO_ROOT"
+  unset FISHHAWKD_DATABASE_URL FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK FISHHAWK_PREVIEW_SEED
+  export FISHHAWK_PREVIEW_SHA="$pr15n_A" FISHHAWK_PREVIEW_FETCH_TIMEOUT=abc
+  cmd_preview 2>&1
+)" || pr15n_rc=$?
+if [[ "$pr15n_rc" -ne 0 && "$pr15n_out" == *FISHHAWK_PREVIEW_FETCH_TIMEOUT* \
+      && "$pr15n_out" != *'preview: resolving'* && "$pr15n_out" != *'FISHHAWKD_DATABASE_URL is not set'* ]]; then
+  pass "cmd_preview fails fast on an invalid FISHHAWK_PREVIEW_FETCH_TIMEOUT, before resolution and DB checks"
+else
+  fail "cmd_preview should exit on an invalid FISHHAWK_PREVIEW_FETCH_TIMEOUT before anything else (rc=$pr15n_rc out: $pr15n_out)"
+fi
+
+# (h) _run_with_timeout return contract: own status in time, a distinct 124 on
+# expiry, bounded inside a `$( )` pipe, no temp/marker file left behind.
+pr15n_rc=0; TMPDIR="$pr15n_tmp" _run_with_timeout 1 /dev/null true || pr15n_rc=$?
+if [[ "$pr15n_rc" == 0 ]]; then
+  pass "_run_with_timeout returns 0 for a command that succeeds in time"
+else
+  fail "_run_with_timeout should return 0 for true (rc=$pr15n_rc)"
+fi
+pr15n_rc=0; TMPDIR="$pr15n_tmp" _run_with_timeout 1 /dev/null sh -c 'exit 3' || pr15n_rc=$?
+if [[ "$pr15n_rc" == 3 ]]; then
+  pass "_run_with_timeout returns the command's own status when it fails in time"
+else
+  fail "_run_with_timeout should return 3 for sh -c 'exit 3' (rc=$pr15n_rc)"
+fi
+pr15n_start=$SECONDS
+pr15n_v="$( pr15n_r=0; TMPDIR="$pr15n_tmp" _run_with_timeout 1 /dev/null sleep 12 || pr15n_r=$?; print -r -- "$pr15n_r" )"
+pr15n_el=$(( SECONDS - pr15n_start ))
+if [[ "$pr15n_v" == 124 ]] && (( pr15n_el < 8 )); then
+  pass "_run_with_timeout returns a distinct 124 on expiry (${pr15n_el}s)"
+else
+  fail "_run_with_timeout should return 124 within the bound (rc=$pr15n_v el=${pr15n_el}s)"
+fi
+if [[ -z "$(print -l -- "$pr15n_tmp"/*(N))" ]]; then
+  pass "_run_with_timeout leaves no temp or marker file under TMPDIR"
+else
+  fail "_run_with_timeout left files under TMPDIR: $(print -l -- "$pr15n_tmp"/*(N))"
+fi
+
+# (h2) Expiry is RACE-FREE under repetition: 40 concurrent runs against a
+# hanging command at a 0.2s bound must ALL return 124. Without the watchdog's
+# `trap '' TERM`, the main shell's TERM of the watchdog could land after the
+# watchdog killed the command but before it exited, giving 143 (a plain
+# failure) — ~1 run in 100 under load; the concurrency is the load.
+pr15n_rep="${pr15n_dir}/rep"
+mkdir -p "$pr15n_rep"
+pr15n_pids=()
+for pr15n_i in {1..40}; do
+  ( pr15n_r=0; _run_with_timeout 0.2 /dev/null sleep 5 || pr15n_r=$?; print -r -- "$pr15n_r" > "${pr15n_rep}/${pr15n_i}" ) &
+  pr15n_pids+=($!)
+done
+for pr15n_p in "${pr15n_pids[@]}"; do wait "$pr15n_p" 2>/dev/null; done
+pr15n_n124=0
+pr15n_other=""
+for pr15n_f in "$pr15n_rep"/*(N); do
+  pr15n_s="$(<"$pr15n_f")"
+  if [[ "$pr15n_s" == 124 ]]; then (( ++pr15n_n124 )); else pr15n_other+=" ${pr15n_s}"; fi
+done
+if (( pr15n_n124 == 40 )); then
+  pass "_run_with_timeout returns 124 on EVERY expiry across 40 concurrent runs"
+else
+  fail "_run_with_timeout should return 124 on every expiry (124 x${pr15n_n124}/40, others:${pr15n_other:- none})"
+fi
+
+# (h3) The same race, FORCED: a `kill` wrapper (functions reach subshells)
+# keeps the WATCHDOG alive 0.5s after it delivers its TERM, so the main
+# shell's TERM of the watchdog always lands inside that window. Only the
+# caller's own subshell level is exempt from the delay.
+pr15n_v="$(
+  pr15n_kill_base=$ZSH_SUBSHELL
+  kill() {
+    builtin kill "$@"
+    local r=$?
+    if (( ZSH_SUBSHELL > pr15n_kill_base )); then sleep 0.5; fi
+    return "$r"
+  }
+  for pr15n_i in 1 2 3; do
+    pr15n_r=0
+    _run_with_timeout 0.2 /dev/null sleep 5 || pr15n_r=$?
+    print -rn -- "${pr15n_r} "
+  done
+)"
+if [[ "$pr15n_v" == '124 124 124 ' ]]; then
+  pass "_run_with_timeout returns 124 when its TERM of the watchdog lands after the watchdog fired"
+else
+  fail "_run_with_timeout should return 124 when the watchdog is still exiting (got: $pr15n_v)"
+fi
+
+# (i) cmd_preview wiring: resolution goes through the bounded helper, the raw
+# unbounded fetch is gone, and resolution precedes the prior-preview teardown.
+preview_body="$(typeset -f cmd_preview)"
+if print -r -- "$preview_body" | grep_q '_preview_resolve_ref' && print -r -- "$preview_body" | grep_q '_preview_fetch_timeout'; then
+  pass "cmd_preview resolves its ref via _preview_resolve_ref with the _preview_fetch_timeout bound"
+else
+  fail "cmd_preview should call _preview_resolve_ref and _preview_fetch_timeout"
+fi
+if print -r -- "$preview_body" | grep_q 'fetch origin'; then
+  fail "cmd_preview should carry no raw (unbounded) git fetch origin"
+else
+  pass "cmd_preview carries no raw (unbounded) git fetch origin"
+fi
+pr15n_resolve_ln="$(print -r -- "$preview_body" | grep -n '_preview_resolve_ref' | head -n 1 | cut -d: -f1)"
+pr15n_kill_ln="$(print -r -- "$preview_body" | grep -n '_preview_kill_tracked' | head -n 1 | cut -d: -f1)"
+if [[ -n "$pr15n_resolve_ln" && -n "$pr15n_kill_ln" ]] && (( pr15n_resolve_ln < pr15n_kill_ln )); then
+  pass "cmd_preview resolves the ref BEFORE tearing down the prior preview"
+else
+  fail "cmd_preview should call _preview_resolve_ref before _preview_kill_tracked (resolve ${pr15n_resolve_ln:-none}, kill ${pr15n_kill_ln:-none})"
+fi
+
+# (j) cmd_preview hands the FISHHAWK_PREVIEW_FETCH_TIMEOUT value — not a
+# literal — to the fetch bound: with the knob at 2 and a hanging fetch it
+# fails naming "timed out after 2s", in seconds. Everything before resolution
+# is pure (no .env in the fixture REPO_ROOT, a dummy database URL), and the
+# resolution failure exits before any DB, worktree or build work.
+: > "$pr15n_log"
+pr15n_start=$SECONDS
+pr15n_rc=0
+pr15n_out="$(
+  {
+    export PATH="${pr15n_stub}:${PATH}" TMPDIR="$pr15n_tmp"
+    export PR15N_FETCH_MODE=hang PR15N_FETCH_LOG="$pr15n_log" PR15N_REAL_GIT="$pr15n_real_git"
+    REPO_ROOT="${pr15n_dir}/local"
+    rehash
+    unset FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK FISHHAWK_PREVIEW_SEED
+    export FISHHAWKD_DATABASE_URL='postgres://u:p@127.0.0.1:1/pr15n'
+    export FISHHAWK_PREVIEW_SHA="$pr15n_absent" FISHHAWK_PREVIEW_FETCH_TIMEOUT=2
+    cmd_preview
+  } 2>&1
+)" || pr15n_rc=$?
+pr15n_el=$(( SECONDS - pr15n_start ))
+if [[ "$pr15n_rc" -ne 0 && "$pr15n_out" == *'fetching origin (bounded 2s)'* \
+      && "$pr15n_out" == *'git fetch origin timed out after 2s'* ]] && (( pr15n_el < 10 )); then
+  pass "cmd_preview bounds its fetch by FISHHAWK_PREVIEW_FETCH_TIMEOUT (${pr15n_el}s)"
+else
+  fail "cmd_preview should pass FISHHAWK_PREVIEW_FETCH_TIMEOUT to the fetch bound (rc=$pr15n_rc el=${pr15n_el}s out: $pr15n_out)"
+fi
+
+# (k) An ABBREVIATED SHA is only a prefix (ambiguous, not content-addressed
+# proof), so even when it resolves locally it stays on the fetch path.
+pr15n_resolve fail "${pr15n_A[1,12]}"
+if [[ "$pr15n_rc" == 0 && "$pr15n_reply" == "$pr15n_A" && "$pr15n_fetches" == 1 \
+      && "$pr15n_out" != *'skipping git fetch'* ]]; then
+  pass "_preview_resolve_ref: an abbreviated local SHA still fetches first"
+else
+  fail "_preview_resolve_ref should keep an abbreviated SHA on the fetch path (rc=$pr15n_rc reply=$pr15n_reply fetches=$pr15n_fetches out: $pr15n_out)"
+fi
+unfunction pr15n_g pr15n_resolve pr15n_leftovers 2>/dev/null
+rm -rf "$pr15n_dir"
 
 # 15k. OPTIONAL live containment test (E31.19 / #1577) — gated on a host psql
 # AND a reachable dev Postgres (skips cleanly like the 15g nc block otherwise).

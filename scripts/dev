@@ -1743,27 +1743,54 @@ _scan_operator_worktrees() {
 _SHIM_PROBE_TIMEOUT=5
 
 # Run a command with a wall-clock bound, stdout to <outfile> and stderr
-# discarded. Returns the command's own status when it finished in time, and
-# non-zero on expiry (the command is SIGTERMed) — so a caller that degrades on
-# any non-zero status treats a hang exactly like a failure.
+# discarded. Returns the command's own status when it finished in time, and a
+# DISTINCT 124 on expiry (the command is SIGTERMed; GNU timeout's convention),
+# so a caller can tell a timeout from a failure (_preview_git_fetch, #4058)
+# while a caller that degrades on any non-zero status (_warn_stale_shim) still
+# treats a hang exactly like a failure.
 #
 # zsh has no portable `timeout` (macOS ships neither timeout nor gtimeout), so
 # this is the watchdog form: background the command, background a sleeper that
 # kills it, `wait` on the command, then kill the sleeper. Polling `kill -0`
 # instead would not work — a finished-but-unwaited child is a zombie and still
 # answers signal 0, so the poll would always run the full bound.
+#
+# Expiry is read from the WATCHDOG, not from elapsed $SECONDS (whose integer
+# granularity misclassifies a fast failure near a 1s bound): the watchdog exits
+# 0 only when its `kill -TERM` was delivered; terminating it early while it
+# sleeps yields 143. 124 is reported only when the watchdog fired AND the
+# command's own status is non-zero, so a command that finished exactly at the
+# boundary keeps its own status.
+#
+# The watchdog IGNORES TERM (`trap '' TERM`) before it kills, which is what
+# makes that status race-free. The main shell can only reach its own
+# `kill -TERM "$watch_pid"` after the command has exited; when the watchdog is
+# what killed it, that TERM can land before the watchdog subshell has exited,
+# and without the trap it turned a real expiry into 143 — a plain failure, so
+# _preview_resolve_ref ran a second bounded fetch with the wrong error (#4058
+# review, ~1 run in 100 under load). A TERM that lands while the watchdog still
+# sleeps, or before it sets the trap, kills it before it has signalled anything,
+# so a 143 still means "the command finished on its own".
+#
+# Invariant: neither the command nor the watchdog may inherit the caller's
+# stdout/stderr. An inherited fd held by a surviving descendant (a credential
+# helper the TERM did not reach) would keep a caller's pipe open — the runner's
+# CombinedOutput, a `$( )` substitution — long after the TERM (#4058).
 # Args: <seconds> <outfile> <cmd> [args...]
 _run_with_timeout() {
   local secs="$1"; shift
   local outfile="$1"; shift
   "$@" >"$outfile" 2>/dev/null &
   local cmd_pid=$!
-  ( sleep "$secs"; kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
+  ( sleep "$secs" && trap '' TERM && kill -TERM "$cmd_pid" ) >/dev/null 2>&1 &
   local watch_pid=$!
-  local rc=0
+  local rc=0 watch_rc=0
   wait "$cmd_pid" 2>/dev/null || rc=$?
   kill -TERM "$watch_pid" 2>/dev/null || true
-  wait "$watch_pid" 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || watch_rc=$?
+  if (( watch_rc == 0 && rc != 0 )); then
+    return 124
+  fi
   return "$rc"
 }
 
@@ -4384,6 +4411,156 @@ _preview_seed_apply() {
   rm -f "$tmp" "${tmp}.err"
 }
 
+# Ref resolution for `scripts/dev preview` (E72.52 / #4058). The acceptance
+# runner's auto_preview hook used to hang here: an UNBOUNDED `git fetch origin`
+# wedged on a credential prompt or a stalled remote ate the whole provision
+# budget and held the runner's CombinedOutput pipe open. Now a full-length SHA
+# that is already local is used with NO fetch, and every fetch that remains is
+# wall-clock bounded, non-interactive, announced by a progress line, and
+# detached from the caller's fds. Long-form: scripts/README.md § "Ref
+# resolution and the bounded fetch".
+
+# True only for a full-length hex object name (SHA-1 40 / SHA-256 64). Such a
+# ref is content-addressed: if it resolves locally it IS the commit, so a fetch
+# cannot change the answer. Abbreviated SHAs, branch names and origin/… refs
+# are mutable or ambiguous and stay on the fetch-first path.
+_preview_ref_is_full_sha() {
+  local ref="${1:-}"
+  [[ "$ref" =~ '^[0-9a-f]{40}$' || "$ref" =~ '^[0-9a-f]{64}$' ]]
+}
+
+# The per-fetch wall-clock bound in seconds: FISHHAWK_PREVIEW_FETCH_TIMEOUT
+# (default 60). Echoes the bound; an invalid value (not an integer in
+# 1..3600) prints a usage error naming the knob and returns 1 — fail closed,
+# like FISHHAWK_RELOAD_QUIET_TIMEOUT / FISHHAWK_GOCACHE_TRIM_HOURS. Callers run
+# it in a tested context (#631 / TRAPZERR).
+_preview_fetch_timeout() {
+  local v="${FISHHAWK_PREVIEW_FETCH_TIMEOUT:-}"
+  if [[ -z "$v" ]]; then
+    print -r -- 60
+    return 0
+  fi
+  if [[ "$v" != <-> ]] || (( ${#v} > 4 )) || (( v < 1 || v > 3600 )); then
+    print -u2 "error: FISHHAWK_PREVIEW_FETCH_TIMEOUT must be a positive integer number of seconds (1..3600) (got '${v}')"
+    return 1
+  fi
+  print -r -- $(( v ))
+}
+
+# One bounded, non-interactive `git fetch --quiet origin [<ref>]` in REPO_ROOT.
+# Returns 0 on success, 124 when the bound expired (_run_with_timeout), and
+# another non-zero on failure. Sets the global _PREVIEW_FETCH_TAIL to the last
+# lines of the fetch's combined stdout+stderr (empty when nothing was captured)
+# so the caller's error names what git said.
+#
+# - GIT_TERMINAL_PROMPT=0 + GIT_ASKPASS=/bin/false mirror the runner's
+#   gitops.NonInteractiveEnv(): a credential prompt on /dev/tty becomes a fast
+#   failure instead of a wedge. They do NOT stop a configured credential helper
+#   from running, which is why the wall-clock bound is the second control.
+# - `env` resolves git on PATH (scripts/test-dev's shim intercepts it there).
+# - The `sh -c 'exec "$@" 2>&1'` wrapper folds stderr into the outfile, a
+#   private temp file, so no fd of the fetch or a descendant (git-remote-https,
+#   a credential helper) is the caller's output pipe; background stdin is
+#   /dev/null (non-interactive zsh, no job control).
+# Args: <secs> [<ref>]
+_preview_git_fetch() {
+  local secs="$1"; shift
+  typeset -g _PREVIEW_FETCH_TAIL=""
+  local log="" rc=0
+  if ! log="$(mktemp "${TMPDIR:-/tmp}/fishhawk-preview-fetch.XXXXXX" 2>/dev/null)"; then
+    log=""
+  fi
+  _run_with_timeout "$secs" "${log:-/dev/null}" \
+    sh -c 'exec "$@" 2>&1' sh \
+    env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+    git -C "$REPO_ROOT" fetch --quiet origin "$@" || rc=$?
+  if [[ -n "$log" ]]; then
+    _PREVIEW_FETCH_TAIL="$(tail -n 5 "$log" 2>/dev/null)" || _PREVIEW_FETCH_TAIL=""
+    rm -f "$log"
+  fi
+  return "$rc"
+}
+
+# Print captured `git fetch` output (indented) to stderr under an error line.
+# Arg: <tail> (may be empty).
+_preview_fetch_tail_print() {
+  local tail="${1:-}" line
+  if [[ -z "$tail" ]]; then
+    print -u2 "  git fetch output: (none captured)"
+    return 0
+  fi
+  print -u2 "  git fetch output (last lines):"
+  while IFS= read -r line; do
+    print -u2 -r -- "    ${line}"
+  done <<< "$tail"
+  return 0
+}
+
+# The named-timeout error for a REQUIRED fetch that hit the bound.
+# Args: <ref> <secs> <fetch-label> <tail>
+_preview_fetch_timeout_error() {
+  print -u2 "error: could not resolve '${1}' locally and ${3} timed out after ${2}s (GIT_TERMINAL_PROMPT=0, GIT_ASKPASS=/bin/false) — git is waiting on credentials or the network. The acceptance runner strips global/system git config (GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_SYSTEM=/dev/null), so a credential helper the fetch needs must be configured repo-local; or make the SHA resolvable without a fetch (push the run branch and fetch it into this checkout by hand); or raise FISHHAWK_PREVIEW_FETCH_TIMEOUT; then retry"
+  _preview_fetch_tail_print "${4:-}"
+}
+
+# Resolve <ref> to a full commit SHA in REPLY (return 0), or print `error: …`
+# to stderr and return 1. Never _die's, so scripts/test-dev drives it
+# in-process. Progress lines go to stdout; the result goes in REPLY only.
+#   1. A full-length SHA already local: no fetch at all.
+#   2. Otherwise one bounded `git fetch origin`. A failure or timeout degrades
+#      to local resolution with a warning (the ref may already be local).
+#   3. Still unresolved: after a TIMEOUT fail now (the retry would only hit the
+#      same wedge, so the worst case is one bound, not two); otherwise one
+#      bounded direct `git fetch origin <ref>` (a PR-head SHA need not be
+#      reachable from any fetched branch), then resolve or fail.
+# Args: <ref> <secs>
+_preview_resolve_ref() {
+  local ref="$1" secs="$2"
+  local sha="" frc=0 last_tail=""
+  REPLY=""
+  print "preview: resolving ${ref}..."
+  if _preview_ref_is_full_sha "$ref" \
+    && sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)"; then
+    print "preview: ${ref[1,12]} is already local — skipping git fetch"
+    REPLY="$sha"
+    return 0
+  fi
+
+  print "preview: fetching origin (bounded ${secs}s)..."
+  _preview_git_fetch "$secs" || frc=$?
+  if [[ -n "$_PREVIEW_FETCH_TAIL" ]]; then last_tail="$_PREVIEW_FETCH_TAIL"; fi
+  if (( frc == 124 )); then
+    print "warning: git fetch origin timed out after ${secs}s — resolving ${ref} against local objects only"
+  elif (( frc != 0 )); then
+    print "warning: git fetch origin failed — resolving ${ref} against local objects only"
+  fi
+  if sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)"; then
+    REPLY="$sha"
+    return 0
+  fi
+  if (( frc == 124 )); then
+    _preview_fetch_timeout_error "$ref" "$secs" "git fetch origin" "$last_tail"
+    return 1
+  fi
+
+  print "preview: fetching origin ${ref} (bounded ${secs}s)..."
+  frc=0
+  _preview_git_fetch "$secs" "$ref" || frc=$?
+  if [[ -n "$_PREVIEW_FETCH_TAIL" ]]; then last_tail="$_PREVIEW_FETCH_TAIL"; fi
+  if (( frc == 124 )); then
+    _preview_fetch_timeout_error "$ref" "$secs" "git fetch origin ${ref}" "$last_tail"
+    return 1
+  fi
+  if (( frc == 0 )) \
+    && sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)"; then
+    REPLY="$sha"
+    return 0
+  fi
+  print -u2 "error: could not resolve '${ref}' to a commit (after git fetch origin) — is the run branch pushed?"
+  _preview_fetch_tail_print "$last_tail"
+  return 1
+}
+
 # `scripts/dev preview <sha-or-ref> [--seed <scenario>]` — build and serve the
 # merge candidate, optionally seeding a fixture scenario into it. The
 # positional arg defaults to $FISHHAWK_PREVIEW_SHA so the runner's provisioning
@@ -4433,6 +4610,13 @@ cmd_preview() {
   preview_as_env=("${reply[@]}")
   _preview_as_notice "${FISHHAWKD_OAUTH_ISSUER:-}"
 
+  # The ref-resolution fetch bound (E72.52 / #4058), validated fail-closed
+  # here — before any DB or build work — so an invalid knob fails on its own.
+  local fetch_secs=""
+  if ! fetch_secs="$(_preview_fetch_timeout)"; then
+    exit 1
+  fi
+
   local base_url="${FISHHAWKD_DATABASE_URL:-}"
   if [[ -z "$base_url" ]]; then
     _die "FISHHAWKD_DATABASE_URL is not set — the preview needs it to derive its isolated _preview database"
@@ -4451,22 +4635,18 @@ cmd_preview() {
   role="$(_preview_db_role)"
   password="$(_preview_db_password)"
 
-  # Fetch, then resolve the ref. A PR-head SHA may not be reachable from any
-  # already-fetched branch, so an unresolved ref gets one direct-fetch retry
-  # before failing. Offline fetch degrades with a warning — the ref may
-  # already be local.
-  if ! git -C "${REPO_ROOT}" fetch origin --quiet 2>/dev/null; then
-    print "warning: git fetch origin failed — resolving ${ref} against local objects only"
-  fi
+  # Resolve the ref (E72.52 / #4058). A full-length SHA already in this
+  # checkout — what the acceptance runner passes, having pushed it — is used
+  # with NO fetch. Any fetch still needed (SHA not local, or a symbolic and so
+  # mutable ref) is bounded by FISHHAWK_PREVIEW_FETCH_TIMEOUT, non-interactive,
+  # and detached from this command's output pipe, so a wedged credential
+  # helper or remote can neither eat the runner's provision budget nor hold its
+  # CombinedOutput open. _preview_resolve_ref prints its own error.
   local sha=""
-  if ! sha="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet "${ref}^{commit}")"; then
-    if git -C "${REPO_ROOT}" fetch origin "$ref" --quiet 2>/dev/null; then
-      sha="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet "${ref}^{commit}")" || sha=""
-    fi
+  if ! _preview_resolve_ref "$ref" "$fetch_secs"; then
+    exit 1
   fi
-  if [[ -z "$sha" ]]; then
-    _die "could not resolve '${ref}' to a commit (after git fetch origin) — is the run branch pushed?"
-  fi
+  sha="$REPLY"
   local short_sha
   short_sha="$(git -C "${REPO_ROOT}" rev-parse --short "$sha")"
 
