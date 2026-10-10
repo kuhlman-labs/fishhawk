@@ -3,14 +3,24 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // gateViewNote96Plus is deliberately longer than the compaction levers'
@@ -636,5 +646,195 @@ func TestGetGateView_ConsultsPassThrough(t *testing.T) {
 	}
 	if cs[0].Question != "has this been decided?" {
 		t.Errorf("question = %q, want it uncompacted", cs[0].Question)
+	}
+}
+
+// TestGetGateView_MergeReadinessAndResolutionBasisDecode: both #4086 gate-view
+// additions survive the MCP seam from a backend-shaped body — the
+// merge_readiness block (blockers with details, undetermined) and the settled
+// row's resolution_basis — and an older backend's body leaves both empty.
+func TestGetGateView_MergeReadinessAndResolutionBasisDecode(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"suppressed_relitigations":[],"history_incomplete":false,` +
+		`"settled":[{"id":"` + uuid.NewString() + `","stage_kind":"implement","state":"addressed","severity":"high","category":"correctness",` +
+		`"note":"n","state_reason":"operator evidence: re-ran it","resolution_basis":"operator_evidence"}],` +
+		`"merge_readiness":{"blockers":[{"code":"approval_dismissed","message":"no approval is live",` +
+		`"details":{"dismissing_commit":"cccc","dismissing_cause":"vouch_commit","next_step":"approve_pr"}}],` +
+		`"undetermined":["acceptance staleness: the acceptance history could not be read"]}}`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	mr := decoded.GateView.MergeReadiness
+	if mr == nil || len(mr.Blockers) != 1 || len(mr.Undetermined) != 1 {
+		t.Fatalf("merge_readiness = %+v, want one blocker and one undetermined through the seam", mr)
+	}
+	b := mr.Blockers[0]
+	if b.Code != "approval_dismissed" || b.Message != "no approval is live" ||
+		b.Details["dismissing_cause"] != "vouch_commit" || b.Details["next_step"] != "approve_pr" {
+		t.Errorf("blocker = %+v, want the backend's code/message/details verbatim", b)
+	}
+	if len(decoded.GateView.Settled) != 1 || decoded.GateView.Settled[0].ResolutionBasis != "operator_evidence" {
+		t.Errorf("settled = %+v, want resolution_basis operator_evidence", decoded.GateView.Settled)
+	}
+
+	older := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[{"id":"` + uuid.NewString() +
+		`","stage_kind":"implement","state":"addressed","severity":"low","category":"style","note":"n"}],` +
+		`"suppressed_relitigations":[],"history_incomplete":false}`)
+	srv2, _ := newGateViewBackend(t, http.StatusOK, older)
+	res2 := callGateView(t, srv2, map[string]any{"run_id": runID.String()})
+	out2, _ := json.Marshal(res2.StructuredContent)
+	var decoded2 GetGateViewOutput
+	if uerr := json.Unmarshal(out2, &decoded2); uerr != nil {
+		t.Fatalf("decode older body: %v", uerr)
+	}
+	if decoded2.GateView.MergeReadiness != nil || decoded2.GateView.Settled[0].ResolutionBasis != "" {
+		t.Errorf("older backend: merge_readiness=%+v basis=%q, want nil / empty", decoded2.GateView.MergeReadiness, decoded2.GateView.Settled[0].ResolutionBasis)
+	}
+}
+
+// TestGateViewMergeReadiness_WireShape pins the hand-maintained
+// gateViewMergeReadiness / gateViewMergeBlocker mirrors and the
+// GateViewSettledConcern.ResolutionBasis field against the REAL backend
+// (#4086, the #371 trap): a run with a pull request and a re-opened acceptance
+// stage on the REAL chain, and a concern resolved through the REAL
+// POST /concerns/resolve route. (a) Every key the SERVER emits in the
+// merge_readiness block and its blocker is a mirror field; (b) the block
+// decodes through GetGateView with the acceptance_stale blocker and the
+// no-GitHub-client undetermined reason; (c) the resolved concern decodes as
+// addressed with resolution_basis operator_evidence.
+func TestGateViewMergeReadiness_WireShape(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, row.ID, "https://github.com/x/y/pull/7"); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+	acc, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 2, Type: runpkg.StageTypeAcceptance, ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "acceptance",
+	})
+	if err != nil {
+		t.Fatalf("create acceptance stage: %v", err)
+	}
+	const h1, h2 = "aaaa000000000000000000000000000000000001", "bbbb000000000000000000000000000000000002"
+	for _, e := range []struct {
+		category string
+		payload  string
+	}{
+		{"acceptance_outcome_recorded", `{"verdict":"passed","head_sha":"` + h1 + `"}`},
+		{"acceptance_reopened", `{"head_sha":"` + h2 + `"}`},
+	} {
+		if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID: row.ID, StageID: &acc.ID, Timestamp: time.Now().UTC(), Category: e.category, Payload: json.RawMessage(e.payload),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", e.category, err)
+		}
+	}
+
+	impl, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 1, Type: runpkg.StageTypeImplement, ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "implement",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	raised, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: row.ID, StageID: impl.ID, StageKind: concern.StageKindImplement, ReviewerModel: "m", OriginReviewSequence: 1,
+		Concerns: []concern.RaisedConcern{{Severity: "high", Category: "correctness", Note: "nil deref"}},
+	})
+	if err != nil {
+		t.Fatalf("insert concern: %v", err)
+	}
+	if err := concernRepo.MarkAddressedPending(ctx, []uuid.UUID{raised[0].ID}, "routed by fix-up"); err != nil {
+		t.Fatalf("route concern: %v", err)
+	}
+
+	const bearer = "fhk_merge_readiness_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:stages"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{RunRepo: runRepo, ConcernRepo: concernRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	if res, err := client.ResolveConcerns(ctx, row.ID, []string{raised[0].ID.String()}, "re-ran the reproduction"); err != nil || res.Resolved != 1 {
+		t.Fatalf("ResolveConcerns = %+v, %v; want one resolved", res, err)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String()+"/gate-view", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET gate-view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET gate-view = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["merge_readiness"], &block); err != nil {
+		t.Fatalf("server emitted no merge_readiness block:\n%s", body)
+	}
+	fields := jsonFieldNames(reflect.TypeOf(gateViewMergeReadiness{}))
+	for k := range block {
+		if !fields[k] {
+			t.Errorf("server merge_readiness key %q has no field on the gateViewMergeReadiness mirror (tag drift)", k)
+		}
+	}
+	var blockers []map[string]json.RawMessage
+	_ = json.Unmarshal(block["blockers"], &blockers)
+	if len(blockers) == 0 {
+		t.Fatalf("server emitted no blocker:\n%s", body)
+	}
+	bFields := jsonFieldNames(reflect.TypeOf(gateViewMergeBlocker{}))
+	for k := range blockers[0] {
+		if !bFields[k] {
+			t.Errorf("server blocker key %q has no field on the gateViewMergeBlocker mirror (tag drift)", k)
+		}
+	}
+	var settled []map[string]json.RawMessage
+	_ = json.Unmarshal(top["settled"], &settled)
+	sFields := jsonFieldNames(reflect.TypeOf(GateViewSettledConcern{}))
+	for _, sc := range settled {
+		for k := range sc {
+			if !sFields[k] {
+				t.Errorf("server settled key %q has no field on the GateViewSettledConcern mirror (tag drift)", k)
+			}
+		}
+	}
+
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	mr := gv.MergeReadiness
+	if mr == nil || len(mr.Blockers) != 1 || mr.Blockers[0].Code != "acceptance_stale" {
+		t.Fatalf("merge_readiness = %+v, want the acceptance_stale blocker", mr)
+	}
+	if d := mr.Blockers[0].Details; d["verified_head_sha"] != h1 || d["current_head_sha"] != h2 || d["acceptance_stage_id"] != acc.ID.String() {
+		t.Errorf("acceptance_stale details = %+v, want H1/H2 and the stage id", d)
+	}
+	if len(mr.Undetermined) != 1 || !strings.Contains(mr.Undetermined[0], "no GitHub client") {
+		t.Errorf("undetermined = %v, want the approval check's no-GitHub-client reason", mr.Undetermined)
+	}
+	if len(gv.Settled) != 1 || gv.Settled[0].State != "addressed" || gv.Settled[0].ResolutionBasis != "operator_evidence" {
+		t.Errorf("settled = %+v, want the resolved concern addressed with resolution_basis operator_evidence", gv.Settled)
 	}
 }

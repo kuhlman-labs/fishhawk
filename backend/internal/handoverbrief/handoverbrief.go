@@ -229,6 +229,13 @@ type Part struct {
 	Truncated         bool              `json:"truncated"`
 	OmittedCount      int               `json:"omitted_count"`
 	Next              *Cursor           `json:"next,omitempty"`
+	// Continuations is set on a truncated campaigns / runs part only: such a
+	// part is one list query PER non-terminal state, so it carries one cursor
+	// per state with omitted rows, in state order (inFlightStates). Next always
+	// equals Continuations[0]; a client follows EVERY entry to reach every
+	// omitted row. The digest and workflows parts are each ONE underlying query
+	// and keep only Next.
+	Continuations []Cursor `json:"continuations,omitempty"`
 }
 
 // Section is one of the five brief sections.
@@ -551,12 +558,27 @@ var (
 	runStates      = []string{"pending", "running"}
 )
 
+// isInFlight reports whether kind is a per-state in_flight part.
+func isInFlight(kind PartKind) bool { return kind == PartCampaigns || kind == PartRuns }
+
+// inFlightStates is the ONE state order Compose reads an in_flight part in and
+// Bound orders its continuations by (nil for any other part kind).
+func inFlightStates(kind PartKind) []string {
+	switch kind {
+	case PartCampaigns:
+		return campaignStates
+	case PartRuns:
+		return runStates
+	}
+	return nil
+}
+
 func (c *composer) campaigns(ctx context.Context) Part {
 	if c.deps.InFlight == nil || c.deps.InFlight.campaigns == nil {
 		c.degrade(DegradationCampaignStoreUnconfigured, SectionInFlight, PartCampaigns, "no campaign repository is configured")
 		return unavailablePart(PartCampaigns, DegradationCampaignStoreUnconfigured)
 	}
-	return c.inFlight(ctx, PartCampaigns, campaignStates, DegradationCampaignReadFailed, c.deps.InFlight.Campaigns)
+	return c.inFlight(ctx, PartCampaigns, DegradationCampaignReadFailed, c.deps.InFlight.Campaigns)
 }
 
 func (c *composer) runs(ctx context.Context) Part {
@@ -564,16 +586,18 @@ func (c *composer) runs(ctx context.Context) Part {
 		c.degrade(DegradationRunStoreUnconfigured, SectionInFlight, PartRuns, "no run repository is configured")
 		return unavailablePart(PartRuns, DegradationRunStoreUnconfigured)
 	}
-	return c.inFlight(ctx, PartRuns, runStates, DegradationRunReadFailed, c.deps.InFlight.Runs)
+	return c.inFlight(ctx, PartRuns, DegradationRunReadFailed, c.deps.InFlight.Runs)
 }
 
 type listFn func(ctx context.Context, repo string, accountID *uuid.UUID, state string, limit int) ([]InFlightItem, error)
 
 // inFlight reads each state LIMIT-bounded with the limit+1 probe: the extra
-// row IS the first omitted item, and its offset is the cursor's.
-func (c *composer) inFlight(ctx context.Context, part PartKind, states []string, failKind string, list listFn) Part {
+// row IS the first omitted item, and its offset is the cursor's. EVERY state
+// that overflows gets its own continuation (in state order); Next is the
+// first. OmittedCount counts overflowing states, a lower bound on the rows.
+func (c *composer) inFlight(ctx context.Context, part PartKind, failKind string, list listFn) Part {
 	p := Part{Kind: part, InFlight: []InFlightItem{}, Complete: true}
-	for _, st := range states {
+	for _, st := range inFlightStates(part) {
 		items, err := list(ctx, c.req.Repo, c.req.AccountID, st, c.limit+1)
 		if err != nil {
 			c.degrade(failKind, SectionInFlight, part, fmt.Sprintf("%s state %s: %v", part, st, err))
@@ -583,13 +607,16 @@ func (c *composer) inFlight(ctx context.Context, part PartKind, states []string,
 			items = items[:c.limit]
 			p.Complete, p.Truncated = false, true
 			p.OmittedCount++
-			if p.Next == nil {
-				p.Next = listCursor(c.req.Repo, part, st, c.limit)
-			}
+			p.Continuations = append(p.Continuations, *listCursor(c.req.Repo, part, st, c.limit))
 			c.degrade(DegradationScanLimit, SectionInFlight, part,
 				fmt.Sprintf("%s in state %s: read limit %d reached; follow the part cursor for the rest", part, st, c.limit))
 		}
 		p.InFlight = append(p.InFlight, items...)
+	}
+	if len(p.Continuations) > 0 {
+		// A copy, never &p.Continuations[0], so no later slice edit aliases it.
+		next := p.Continuations[0]
+		p.Next = &next
 	}
 	return p
 }
@@ -744,7 +771,7 @@ func canonical(b Brief) Brief {
 	for i, s := range b.Sections {
 		parts := make([]Part, len(s.Parts))
 		for j, p := range s.Parts {
-			p.Complete, p.Truncated, p.OmittedCount, p.Next = false, false, 0, nil
+			p.Complete, p.Truncated, p.OmittedCount, p.Next, p.Continuations = false, false, 0, nil, nil
 			if p.Items != nil {
 				items := make([]digest.Item, len(p.Items))
 				for k, it := range p.Items {

@@ -150,7 +150,12 @@ type ChildrenStatus struct {
 	// fanInRecorded is true when ANY of the four fan-in audit kinds was read
 	// for the parent. Unexported, so it never reaches the wire: it feeds the
 	// read-side mirror of the server's no-integration-authority stand-down
-	// (integrationAuthorityAbsent, approval condition C3).
+	// (integrationAuthorityAbsent, approval condition C3), and selects the
+	// wording of fanInRecordLostRecovery ("no record exists" vs "the newest
+	// record covers only an earlier wave", #4221). It no longer gates the
+	// lost-record wedge itself: fanInRecordLost keys on coverage
+	// (UnintegratedChildRunIDs), so a lost FINAL record in a multi-wave
+	// fan-out is caught although an earlier record exists.
 	fanInRecorded bool
 
 	// implementStages maps a child run id to the implement Stage read for this

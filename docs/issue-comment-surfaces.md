@@ -171,6 +171,7 @@ Notes:
   `selectAnchorTimeline` (`anchor_template.go`) partitions the recognized rows
   into a **retained** class — gate decisions, `plan_generated`, stage/outcome
   terminals, `fixup_pushed`, `concern_waived` / `concern_deferred`,
+  `concern_resolved_with_evidence` (#4086),
   `scope_amendment_decided`, `acceptance_scenario_retirement_dropped` (#3392)
   — and an **informational** class
   (`informationalTimelineCategories`: `run_dispatched`, `acceptance_dispatched`,
@@ -1767,6 +1768,30 @@ Notes:
   Listed here only so a future reader grepping the audit categories doesn't
   mistake them for comment surfaces.
 
+- The operator-evidence resolution audit kinds (E83.53 / #4086) —
+  `concern_resolved_with_evidence` and its corrective companion
+  `concern_resolve_failed` — have **no dedicated Notifier method**.
+  `concern_resolved_with_evidence` renders **data-drivenly** on the
+  living-anchor / status timeline through `activityCategories` +
+  `renderActivityLine` (`status_template.go`) as "Concern `<id8>` resolved
+  with operator evidence: `<evidence>`" (the verb says RESOLVED, never
+  waived — the concern lands in `addressed`), and its writer
+  (`server/resolve_concerns.go::handleResolveConcerns`,
+  `POST /v0/runs/{run_id}/concerns/resolve`) marks it with
+  `notifyOperatorVisible` once per batch that resolved at least one concern,
+  after every write committed. It is not a new comment surface of its own. The
+  handler is HUMAN-ONLY (any agent subject is refused 403
+  `resolve_requires_human`) and writes the entry with the human's subject
+  (`user` actor kind) and payload `{concern_id, prior_state, evidence,
+  stage_kind, severity, category}` (+ `provenance` when set) BEFORE the
+  `addressed_pending -> addressed` transition — durable-record-first: an
+  append failure fails that item (`audit_append_failed`) with no mutation.
+  When the transition then fails, the `system`-actor `concern_resolve_failed`
+  corrective `{concern_id, intended_state, actual_state, error}` is appended
+  (best-effort); it is **internal only**, deliberately NOT in
+  `activityCategories`: the concern's state did not change, which the thread
+  already shows.
+
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
   method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**
@@ -2721,7 +2746,8 @@ explicit intent marker and a cross-package static gate:
   is unchanged. The writers whose refresh trigger IS a rendered category
   use it — among them the two `acceptance_scenario_retirement_dropped` writers
   (runner-reported + cancel), `fixup_pushed`, `deployment_rollback_initiated`,
-  `pr_merged`, `pr_closed_without_merge` and `run_revived_on_reopen` (#4082).
+  `pr_merged`, `pr_closed_without_merge`, `run_revived_on_reopen` (#4082)
+  and `concern_resolved_with_evidence` (#4086).
 - **`notifyStatusUpdate`'s `source` is a call-site TRANSITION tag**
   (`trace_handler`, `approval_submit`, `scope_parked`, …), never an audit
   category the writer intends the operator to see.

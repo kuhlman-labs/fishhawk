@@ -3436,7 +3436,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// pull_request_target / push workflow runs and makes no PR-state change.
 	// Its own tool, not a vouch or merge mode: a different forge write and a
 	// different audit category. 73 -> 74.
-	const wantToolCount = 74
+	//
+	// #4086 (E83.53) adds exactly ONE tool — fishhawk_resolve_concerns, the thin
+	// wrapper over POST /v0/runs/{run_id}/concerns/resolve. WHEN: concerns
+	// routed by a fix-up carrying operator_evidence are immune to reviewer
+	// auto-resolve, and the operator re-ran the reproduction after the fix-up
+	// landed. ELIGIBILITY: write:stages or write:fixups, addressed_pending
+	// concerns of the run only; the backend refuses EVERY agent token
+	// (resolve_requires_human). Its own tool, not a waive mode: it records
+	// addressed, not waived, under a different audit category. 74 -> 75.
+	const wantToolCount = 75
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3465,6 +3474,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_resolve_concerns (#4086) must likewise be wire-visible: the
+	// 74 -> 75 bump alone would stay green if its registration were dropped and
+	// a DIFFERENT tool added in the same change.
+	var sawResolveConcerns bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_resolve_concerns" {
+			sawResolveConcerns = true
+			break
+		}
+	}
+	if !sawResolveConcerns {
+		t.Error("fishhawk_resolve_concerns is not in the registered tool list — the resolve-with-evidence verb is unreachable")
 	}
 	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
 	// same reason.
@@ -17753,6 +17775,37 @@ func TestGetRunStatus_AcceptanceHeldOnPartialIntegration(t *testing.T) {
 		}
 		if want := "/v0/runs/" + parent.String() + "/integrate-wave"; !strings.Contains(first.Reason, want) {
 			t.Errorf("reason %q must name the recovery %s", first.Reason, want)
+		}
+	})
+
+	t.Run("authority present + PARTIAL (wave-0) record + implement succeeded HOLDS naming integrate-wave, not re-drive", func(t *testing.T) {
+		// #4221: the FINAL slices_integrated of a multi-wave fan-out was lost and
+		// only the wave-0 record (covering a) survives. Every child succeeded,
+		// so no fan-in is coming and b must not be re-driven: the hold names the
+		// integrate-wave recovery and the uncovered child.
+		fb, r, parent, b := setup(t, func(a, _ uuid.UUID) []string { return []string{a.String()} })
+		withSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != acceptanceHeldIntegrationIncompleteState {
+			t.Fatalf("next_actions = %+v, want state %s", out.NextActions, acceptanceHeldIntegrationIncompleteState)
+		}
+		if offersAcceptanceDispatch(out.NextActions) {
+			t.Errorf("next_actions still offers an acceptance dispatch: %+v", out.NextActions.Actions)
+		}
+		first := out.NextActions.Actions[0]
+		if first.Action != "fishhawk_await_children" || first.Params["run_id"] != parent.String() {
+			t.Errorf("first action = %+v, want fishhawk_await_children on the parent", first)
+		}
+		for _, want := range []string{"/v0/runs/" + parent.String() + "/integrate-wave", b.String()} {
+			if !strings.Contains(first.Reason, want) {
+				t.Errorf("reason %q missing %q", first.Reason, want)
+			}
+		}
+		if strings.Contains(first.Reason, "re-drive") {
+			t.Errorf("reason %q must not advise a re-drive: %s already succeeded", first.Reason, b)
 		}
 	})
 

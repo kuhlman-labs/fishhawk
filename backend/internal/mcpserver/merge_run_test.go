@@ -64,7 +64,10 @@ type mergeRunFakeBackend struct {
 	// queue) — a test drives an always-checks-pending backend with it.
 	mergeStickyStatus int
 	mergeErrBody      string
-	mergeResp         MergeRunResult
+	// mergeErrBodies, when set, overrides mergeErrBody per POST index (the
+	// last entry repeats) — a test drives a checks_pending-then-refusal pair.
+	mergeErrBodies []string
+	mergeResp      MergeRunResult
 	// mergeVerdicts records the verdict body of each POST so a test can assert
 	// every re-POST across the wait carries the same verdict (the tool never
 	// skips the POST — endpoint-side idempotence).
@@ -143,9 +146,12 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 		if fb.mergeStickyStatus != 0 {
 			status = fb.mergeStickyStatus
 		}
+		errBody := fb.mergeErrBody
+		if n := len(fb.mergeErrBodies); n > 0 {
+			errBody = fb.mergeErrBodies[min(fb.mergeCalls, n-1)]
+		}
 		fb.mergeCalls++
 		fb.mergeVerdicts = append(fb.mergeVerdicts, body.Verdict)
-		errBody := fb.mergeErrBody
 		resp := fb.mergeResp
 		if status == http.StatusOK {
 			fb.merged = true
@@ -1774,5 +1780,173 @@ func TestIsMergeCandidateRefusal(t *testing.T) {
 		if _, _, ok := isMergeCandidateRefusal(err); ok {
 			t.Errorf("%v mapped to a merge-candidate status, want not", err)
 		}
+	}
+}
+
+// --- #4086: merge-readiness refusals -----------------------------------------
+
+// runReadinessRefusal drives one mergeRun against a backend that answers every
+// POST with the given 409 body, and asserts the shared IMMEDIATE-status
+// contract: no tool error, exactly ONE POST, ZERO terminal-await reads, every
+// flag false and the backend message verbatim.
+func runReadinessRefusal(t *testing.T, code, msg string, details map[string]any) (MergeRunOutput, uuid.UUID) {
+	t.Helper()
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		mergeStickyStatus: http.StatusConflict,
+		mergeErrBody:      mergeCandidateErrBody(code, msg, details),
+		// A pr_merged entry an armed await WOULD resolve on.
+		auditEntries: []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	runID := uuid.New()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a %s 409 must be a status, not a tool error", err, code)
+	}
+	if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged {
+		t.Errorf("flags = %+v, want all false (nothing queued, no verdict)", out)
+	}
+	if out.Message != msg {
+		t.Errorf("message = %q, want the backend message verbatim", out.Message)
+	}
+	fb.mu.Lock()
+	calls, reads := fb.mergeCalls, fb.auditReadCalls
+	fb.mu.Unlock()
+	if calls != 1 || reads != 0 {
+		t.Errorf("POSTs = %d, await reads = %d; want exactly 1 and 0 (immediate, not a timeout)", calls, reads)
+	}
+	return out, runID
+}
+
+// TestMergeRun_ApprovalDismissed_ImmediateStatus pins the MCP twin of D1: the
+// backend's 409 approval_dismissed is an immediate status whose next_action is
+// the approve_pr ritual. Counterfactual: removing the readinessStatuses entry
+// turns the 409 into a tool error → RED.
+func TestMergeRun_ApprovalDismissed_ImmediateStatus(t *testing.T) {
+	const head = "1111111111111111111111111111111111111111"
+	msg := "no approval is live on the pull request and a prior review was dismissed; the current head " + head + " is not covered"
+	out, runID := runReadinessRefusal(t, "approval_dismissed", msg, map[string]any{
+		"pr_url": "https://github.com/x/y/pull/7", "dismissing_commit": head, "approved_commit": "2222", "dismissing_cause": "vouch_commit", "next_step": "approve_pr",
+	})
+	if out.Status != "approval_dismissed" {
+		t.Fatalf("status = %q, want approval_dismissed", out.Status)
+	}
+	if !strings.Contains(out.Message, head) {
+		t.Errorf("message %q does not name the dismissing head", out.Message)
+	}
+	if out.NextAction == nil || out.NextAction.Action != "approve_pr" {
+		t.Fatalf("next_action = %+v, want approve_pr", out.NextAction)
+	}
+	if out.NextAction.Params["run_id"] != runID.String() || out.NextAction.Params["pr_url"] != "https://github.com/x/y/pull/7" {
+		t.Errorf("next_action params = %v, want run_id + pr_url", out.NextAction.Params)
+	}
+	if out.PRURL != "https://github.com/x/y/pull/7" {
+		t.Errorf("pr_url = %q", out.PRURL)
+	}
+}
+
+// TestMergeRun_AcceptanceStale_ImmediateStatus pins the MCP twin of D2: the
+// 409 acceptance_stale is an immediate status whose next_action is
+// details.next_step with the acceptance stage id, falling back to
+// fishhawk_dispatch_stage when an older detail map omits next_step.
+func TestMergeRun_AcceptanceStale_ImmediateStatus(t *testing.T) {
+	stageID := uuid.NewString()
+	for _, tc := range []struct {
+		name     string
+		details  map[string]any
+		wantVerb string
+		consumes string
+	}{
+		{"dispatch", map[string]any{"acceptance_stage_id": stageID, "verified_head_sha": "h1", "current_head_sha": "h2", "next_step": "fishhawk_dispatch_stage"}, "fishhawk_dispatch_stage", consumesNone},
+		{"await", map[string]any{"acceptance_stage_id": stageID, "next_step": "fishhawk_await_stage"}, "fishhawk_await_stage", consumesNone},
+		{"retry", map[string]any{"acceptance_stage_id": stageID, "next_step": "fishhawk_retry_stage"}, "fishhawk_retry_stage", consumesRetryBudget},
+		{"fallback without next_step", map[string]any{"stage_id": stageID}, "fishhawk_dispatch_stage", consumesNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := "the recorded acceptance verdict is stale: it validated head h1, re-opened at head h2"
+			out, runID := runReadinessRefusal(t, "acceptance_stale", msg, tc.details)
+			if out.Status != "acceptance_stale" {
+				t.Fatalf("status = %q, want acceptance_stale", out.Status)
+			}
+			if out.NextAction == nil || out.NextAction.Action != tc.wantVerb {
+				t.Fatalf("next_action = %+v, want %s", out.NextAction, tc.wantVerb)
+			}
+			if out.NextAction.Params["run_id"] != runID.String() || out.NextAction.Params["stage_id"] != stageID {
+				t.Errorf("next_action params = %v, want run_id + stage_id %s", out.NextAction.Params, stageID)
+			}
+			if out.NextAction.Consumes != tc.consumes {
+				t.Errorf("consumes = %q, want %q", out.NextAction.Consumes, tc.consumes)
+			}
+		})
+	}
+}
+
+// TestMergeRun_ReadinessRefusalDuringChecksPendingWait pins that the readiness
+// arm is consulted on EVERY POST: a re-POST during the checks_pending wait
+// that meets acceptance_stale returns at once instead of waiting out the
+// budget as checks_pending.
+func TestMergeRun_ReadinessRefusalDuringChecksPendingWait(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		mergeStickyStatus: http.StatusConflict,
+		mergeErrBodies: []string{
+			mergeCandidateErrBody("merge_checks_pending", "checks pending", map[string]any{"verdict_sequence": 4}),
+			mergeCandidateErrBody("acceptance_stale", "stale", map[string]any{"next_step": "fishhawk_dispatch_stage"}),
+		},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	start := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "acceptance_stale" {
+		t.Fatalf("status = %q, want acceptance_stale on the re-POST", out.Status)
+	}
+	fb.mu.Lock()
+	calls := fb.mergeCalls
+	fb.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("POSTs = %d, want 2 (one checks_pending, one refusal)", calls)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("mergeRun took %s, want an immediate return", elapsed)
+	}
+}
+
+// TestIsMergeReadinessRefusal pins the code→status table, that only a 409
+// maps, and that the merge-candidate and conflict codes are not swallowed.
+func TestIsMergeReadinessRefusal(t *testing.T) {
+	for _, code := range []string{"acceptance_stale", "approval_dismissed"} {
+		if _, got, ok := isMergeReadinessRefusal(&apiError{StatusCode: http.StatusConflict, Code: code}); !ok || got != code {
+			t.Errorf("%s → (%q, %v), want (%q, true)", code, got, ok, code)
+		}
+		if _, _, ok := isMergeReadinessRefusal(&apiError{StatusCode: http.StatusInternalServerError, Code: code}); ok {
+			t.Errorf("%s on a 500 mapped to a status, want a tool error", code)
+		}
+	}
+	for _, err := range []error{
+		&apiError{StatusCode: http.StatusConflict, Code: "merge_base_behind"},
+		&apiError{StatusCode: http.StatusConflict, Code: "acceptance_gate_not_passed"},
+		errors.New("plain"),
+	} {
+		if _, _, ok := isMergeReadinessRefusal(err); ok {
+			t.Errorf("%v mapped to a readiness status, want not", err)
+		}
+	}
+}
+
+// TestMergeReadinessOutput_EmptyMessageFallback pins that a refusal with no
+// message still carries an actionable one naming the clearing verb.
+func TestMergeReadinessOutput_EmptyMessageFallback(t *testing.T) {
+	out := mergeReadinessOutput(&apiError{StatusCode: http.StatusConflict, Code: "approval_dismissed", Details: map[string]any{}},
+		"approval_dismissed", uuid.New(), time.Now())
+	if !strings.Contains(out.Message, "approve_pr") || out.NextAction.Params["pr_url"] != "" {
+		t.Errorf("out = %+v, want a fallback message naming approve_pr and no pr_url param", out)
 	}
 }

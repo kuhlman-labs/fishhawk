@@ -895,6 +895,65 @@ func TestRenderStatusBody_DecisionClassActivity_NotFilteredAsNoise(t *testing.T)
 	}
 }
 
+// TestRenderStatusBody_ConcernResolvedWithEvidence pins the E83.53 / #4086
+// activity line: concern_resolved_with_evidence survives the noise filter (it
+// is an activityCategories member — RendersActivity, which the server's
+// notifyOperatorVisible gate consults, reports it) and renders "Concern <id8>
+// resolved with operator evidence: <evidence>" — RESOLVED, never "waived". Its
+// corrective sibling concern_resolve_failed stays filtered as noise. Each
+// degrade branch falls back field-by-field to the bare verb.
+func TestRenderStatusBody_ConcernResolvedWithEvidence(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	const cid = "1a2b3c4d-0000-4000-8000-000000000001"
+
+	if !issuecomment.RendersActivity("concern_resolved_with_evidence") {
+		t.Error("RendersActivity(concern_resolved_with_evidence) = false, want true")
+	}
+	if issuecomment.RendersActivity("concern_resolve_failed") {
+		t.Error("RendersActivity(concern_resolve_failed) = true, want false (the corrective is not an activity line)")
+	}
+
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "concern_resolved_with_evidence", "user", now.Add(-2*time.Minute),
+			map[string]any{"concern_id": cid, "evidence": "re-ran the reproduction\nat the fix-up head", "prior_state": "addressed_pending"}),
+		auditEntry(runID, 6, "concern_resolve_failed", "system", now.Add(-1*time.Minute),
+			map[string]any{"concern_id": cid, "actual_state": "addressed"}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if want := "Concern 1a2b3c4d resolved with operator evidence: re-ran the reproduction"; !strings.Contains(body, want) {
+		t.Errorf("expected %q in the activity section\n---\n%s", want, body)
+	}
+	if strings.Contains(body, "waived") {
+		t.Errorf("an operator-evidence resolution rendered as a waiver\n---\n%s", body)
+	}
+	if strings.Contains(body, "concern_resolve_failed") || strings.Contains(body, "actual_state") {
+		t.Errorf("the corrective concern_resolve_failed row leaked into the activity section\n---\n%s", body)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload json.RawMessage
+		want    string
+	}{
+		{"no id keeps evidence", json.RawMessage(`{"evidence":"checked"}`), "Concern resolved with operator evidence: checked"},
+		{"no evidence drops clause", json.RawMessage(`{"concern_id":"` + cid + `"}`), "Concern 1a2b3c4d resolved with operator evidence · "},
+		{"short id kept whole", json.RawMessage(`{"concern_id":"abc"}`), "Concern abc resolved with operator evidence · "},
+		{"empty payload bare verb", json.RawMessage(`{}`), "Concern resolved with operator evidence · "},
+		{"malformed json bare verb", json.RawMessage("{not json"), "Concern resolved with operator evidence · "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &audit.Entry{ID: uuid.New(), Sequence: 1, RunID: &runID, Timestamp: now.Add(-1 * time.Minute),
+				Category: "concern_resolved_with_evidence", Payload: tc.payload}
+			body := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{e}, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // acceptance_scenario_retirement_dropped (E72.4 / #3328, rendered #3392).
 // ---------------------------------------------------------------------------

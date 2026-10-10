@@ -61,6 +61,11 @@ Response (gate_view):
   - settled[]                  — waived/deferred/addressed/superseded rows with
                                  state_reason (same reviewer_role /
                                  quote_unverified / severity_clamped_from).
+                                 resolution_basis is 'operator_evidence' on an
+                                 addressed row a human operator resolved with
+                                 fishhawk_resolve_concerns — distinct from a
+                                 reviewer-confirmed addressed row (no basis)
+                                 and from a waiver.
   - suppressed_relitigations[] — settled concerns a reviewer tried to re-raise.
   - history_incomplete + history_gaps[] — set when an audit-derived join could
     not be built (the concerns stay intact; only cross-references may be
@@ -119,6 +124,21 @@ Response (gate_view):
     absence is never ambiguous. An EXPIRED consult is "no answer arrived in
     time", NEVER the role having refused. A historian answer is structured
     fields only and carries no reason prose from another run.
+  - merge_readiness — what fishhawk_merge_run would refuse with NOW instead of
+    queueing a merge that times out, computed by the same checks the merge
+    endpoint runs. blockers[] carries each refusal's code, message and details:
+    acceptance_stale (a fix-up push or operator re-open invalidated the
+    recorded acceptance verdict — details name verified_head_sha,
+    current_head_sha and next_step: fishhawk_dispatch_stage,
+    fishhawk_await_stage or fishhawk_retry_stage) and approval_dismissed (the
+    PR is blocked, no approval is live and a prior review was dismissed —
+    details name approved_commit, dismissing_commit, dismissing_cause
+    vouch_commit | fixup_push | push | unknown, and next_step approve_pr).
+    undetermined[] names each check that could not reach a verdict (the
+    approval check fails OPEN on any forge uncertainty; an acceptance-history
+    read failure is also a merge_readiness history_gaps entry), so an empty
+    blockers[] is not "nothing blocks" while undetermined[] is non-empty.
+    Omitted when the run has no pull request or is failed/cancelled.
 `),
 	}, resolver.getGateView)
 }

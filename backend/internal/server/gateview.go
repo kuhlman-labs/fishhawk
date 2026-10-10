@@ -133,6 +133,87 @@ type gateViewResponse struct {
 	// history_gaps entry and history_incomplete, never a partially-built
 	// block and never a failed request.
 	Consults []gateViewConsult `json:"consults"`
+	// MergeReadiness names what would make POST /v0/runs/{run_id}/merge refuse
+	// fast or queue a merge that never fires (#4086), computed by the SAME
+	// helpers the merge endpoint calls (acceptanceStaleRefusal and
+	// approvalDismissedCheck), so the two surfaces cannot drift. Computed only
+	// by handleGetRunGateView — never by buildGateView, which the attention
+	// scan calls once per run — because the approval half costs forge reads.
+	// Omitted (nil) when the run has no pull request url or is failed /
+	// cancelled (the merge endpoint refuses those with run_not_mergeable
+	// first). See gateViewMergeReadinessFor.
+	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty"`
+}
+
+// gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
+// Blockers carries each determined refusal the merge endpoint would return
+// (acceptance_stale, approval_dismissed) with the endpoint's own message and
+// details. Undetermined names every check that could not reach a verdict — the
+// approval check's fail-open reasons, or an acceptance-history read failure —
+// so an empty Blockers list is never read as "nothing blocks" when a check did
+// not run. Both arrays are always present (possibly empty) when the block is.
+type gateViewMergeReadiness struct {
+	Blockers     []gateViewMergeBlocker `json:"blockers"`
+	Undetermined []string               `json:"undetermined"`
+}
+
+// gateViewMergeBlocker is one merge-readiness blocker: the 409 code the merge
+// endpoint would return, its message verbatim and its details object.
+type gateViewMergeBlocker struct {
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
+}
+
+// gateViewGapMergeReadiness is the history_gaps entry recorded when the
+// merge-readiness block's audit-chain half (the run's stages or its
+// acceptance re-open / outcome history) could not be read.
+const gateViewGapMergeReadiness = "merge_readiness"
+
+// gateViewMergeReadinessFor builds the merge_readiness block (#4086) from
+// slice-1's two merge-endpoint helpers. The acceptance half is the
+// endpoint's FAIL-CLOSED read: here a read failure (of the stages or of the
+// acceptance history) cannot fail the request, so it records the
+// merge_readiness history gap, sets history_incomplete and names the check in
+// Undetermined — never a silent "no blocker". The approval half is FAIL-OPEN
+// exactly as at the endpoint: an undetermined result names its reason.
+func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run, resp *gateViewResponse) *gateViewMergeReadiness {
+	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return nil
+	}
+	if runRow.State == run.StateFailed || runRow.State == run.StateCancelled {
+		return nil
+	}
+	block := &gateViewMergeReadiness{
+		Blockers:     []gateViewMergeBlocker{},
+		Undetermined: []string{},
+	}
+	accUndetermined := func(why string) {
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeReadiness)
+		block.Undetermined = append(block.Undetermined, "acceptance staleness: "+why)
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		accUndetermined("the run's stages could not be read: " + err.Error())
+	} else if stale, serr := s.acceptanceStaleRefusal(ctx, runRow, stages); serr != nil {
+		accUndetermined("the acceptance history could not be read: " + serr.Error())
+	} else if stale != nil {
+		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(stale))
+	}
+
+	approval := s.approvalDismissedCheck(ctx, runRow)
+	switch {
+	case approval.Refusal != nil:
+		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(approval.Refusal))
+	case !approval.Determined:
+		block.Undetermined = append(block.Undetermined, "approval dismissal: "+approval.Undetermined)
+	}
+	return block
+}
+
+func gateViewMergeBlockerOf(r *mergeReadinessRefusal) gateViewMergeBlocker {
+	return gateViewMergeBlocker{Code: r.Code, Message: r.Message, Details: r.Details}
 }
 
 // gateViewCrewMessage is one gate-view crew entry: contract-closed metadata
@@ -393,7 +474,22 @@ type gateViewSettledConcern struct {
 	ReviewerRole        string `json:"reviewer_role,omitempty"`
 	QuoteUnverified     bool   `json:"quote_unverified,omitempty"`
 	SeverityClampedFrom string `json:"severity_clamped_from,omitempty"`
+	// ResolutionBasis distinguishes HOW an `addressed` concern was settled
+	// (#4086). "operator_evidence" when a human operator resolved it with
+	// fishhawk_resolve_concerns (POST /v0/runs/{run_id}/concerns/resolve): the
+	// row's current state_reason carries the resolve verb's "operator
+	// evidence: " prefix AND the chain holds a concern_resolved_with_evidence
+	// entry for it. Omitted for every other settled row — a reviewer-confirmed
+	// `addressed` (including one re-confirmed by a review AFTER an operator
+	// resolution, whose state_reason the review overwrote), a waiver, a
+	// deferral — and when the concern_resolved_with_evidence read failed (that
+	// failure is a history_gaps entry).
+	ResolutionBasis string `json:"resolution_basis,omitempty"`
 }
+
+// gateViewResolutionBasisOperatorEvidence is the settled ledger's
+// resolution_basis for a concern resolved by fishhawk_resolve_concerns.
+const gateViewResolutionBasisOperatorEvidence = "operator_evidence"
 
 // gateViewSuppressedRelitig mirrors concernRelitigationSuppressedPayload on
 // the wire: a re-raise of a settled concern the reviewer would have relitigated,
@@ -446,6 +542,7 @@ var gateViewHistoryCategories = []string{
 	"plan_reviewed",
 	concernRelitigationSuppressedCategory,
 	concernResolutionVetoedCategory,
+	CategoryConcernResolvedWithEvidence,
 }
 
 // scopeGateViewRead is the read scope a non-mcp caller must hold to read the
@@ -547,6 +644,9 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	resp.Precedent = s.gatePrecedentFor(r.Context(), runRow, rows, true)
 	resp.Divergence = s.openDivergenceFor(r.Context(), runRow)
 	resp.CrewMessages = s.gateViewCrewMessagesFor(r.Context(), runID, &resp)
+	// Merge readiness (#4086) HERE and not in buildGateView: the approval half
+	// costs forge reads, and the attention scan calls buildGateView per run.
+	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -721,6 +821,7 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 			ReviewerRole:        c.ReviewerRole,
 			QuoteUnverified:     c.QuoteUnverified,
 			SeverityClampedFrom: c.SeverityClampedFrom,
+			ResolutionBasis:     gateViewResolutionBasis(c, history),
 		})
 	}
 
@@ -997,6 +1098,9 @@ type gateViewHistory struct {
 	resolutions []gateViewReviewResolution
 	suppressed  []gateViewSuppressedRelitig
 	vetoes      []gateViewVeto
+	// evidenceResolved is the set of concern ids carrying a
+	// concern_resolved_with_evidence entry (#4086).
+	evidenceResolved map[string]struct{}
 }
 
 type gateViewVeto struct {
@@ -1139,7 +1243,38 @@ func (s *Server) loadGateViewHistory(ctx context.Context, runID uuid.UUID, resp 
 			payload:   p,
 		})
 	}
+	for _, e := range byCategory[CategoryConcernResolvedWithEvidence] {
+		var p struct {
+			ConcernID string `json:"concern_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			s.warnGateViewPayload(runID, CategoryConcernResolvedWithEvidence, e.Sequence, err)
+			continue
+		}
+		if h.evidenceResolved == nil {
+			h.evidenceResolved = map[string]struct{}{}
+		}
+		h.evidenceResolved[p.ConcernID] = struct{}{}
+	}
 	return h
+}
+
+// gateViewResolutionBasis returns the settled ledger's resolution_basis for c
+// (#4086): operator_evidence only when c is `addressed`, its CURRENT
+// state_reason carries the resolve verb's prefix (so the last transition was
+// the operator resolve, not a later review re-confirmation), and the chain
+// corroborates it with a concern_resolved_with_evidence entry. The intent
+// entry alone is not enough: it is appended BEFORE the transition, so a
+// resolve whose transition failed (concern_resolve_failed) or was later
+// overtaken still has one.
+func gateViewResolutionBasis(c *concern.Concern, h gateViewHistory) string {
+	if c.State != concern.StateAddressed || !strings.HasPrefix(c.StateReason, resolveConcernsReasonPrefix) {
+		return ""
+	}
+	if _, ok := h.evidenceResolved[c.ID.String()]; !ok {
+		return ""
+	}
+	return gateViewResolutionBasisOperatorEvidence
 }
 
 func (s *Server) warnGateViewPayload(runID uuid.UUID, category string, seq int64, err error) {
