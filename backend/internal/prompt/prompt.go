@@ -6830,6 +6830,17 @@ func buildImplementReview(t Trigger) string {
 	// maximizes the cached prefix. No-op when none are declared.
 	writeInjectedDocuments(&b, t)
 
+	// Repository-access posture (#2486): grounded → name the exported tree and
+	// its commit (and disclose any skipped entries); ungrounded → state the
+	// review is diff-only and why. Placed BEFORE the supplemental early-return
+	// (#4160) so the base-rebase re-invoke supplemental pass carries the same
+	// grounding posture as every other review round — the tree at the re-landed
+	// head, or the named reason it runs without one. The full implement review
+	// is byte-identical to the pre-#4160 order: this call and the early-return
+	// block below were adjacent, so moving it across the (skipped) supplemental
+	// branch changes nothing on the false branch.
+	writeReviewRepoAccess(&b, t)
+
 	// Supplemental base-rebase re-invoke framing (#1250). This pass is NOT a
 	// full re-review: the first review already covered the full diff against
 	// the sealed tree. It judges ONLY the ADDITIONAL scope exemptions a
@@ -6847,12 +6858,6 @@ func buildImplementReview(t Trigger) string {
 		writeSupplementalReinvokeReview(&b, t)
 		return b.String()
 	}
-
-	// Repository-access posture (#2486): grounded → name the exported tree and
-	// its commit (and disclose any skipped entries); ungrounded → state the
-	// review is diff-only. Placed after the supplemental early-return so the
-	// exemption-soundness supplemental prompt, which renders no diff, is unchanged.
-	writeReviewRepoAccess(&b, t)
 
 	// Cache-stable prefix ordering (#1725). The stable / per-run-stable content
 	// leads: the verdict schema, review criteria + decision rule, the approved
@@ -7408,6 +7413,12 @@ func buildImplementReview(t Trigger) string {
 // schema. No diff is rendered — the exempted paths are unchanged by
 // definition, so the judgment is plan-vs-reason, exactly the lens the
 // first-attempt review applies to exemptions.
+//
+// The REPOSITORY ACCESS section precedes it (buildImplementReview renders it
+// before the early return, #4160). When the pass is grounded
+// (Trigger.ReviewTreeCommit non-empty) one extra framing sentence tells the
+// reviewer the exported tree is the re-landed head and to read each exempted
+// path in it; the ungrounded render is unchanged.
 func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
 	b.WriteString("### Supplemental review: base-rebase re-invoke scope exemptions\n\n")
 	b.WriteString("This is a SUPPLEMENTAL, bounded review pass — NOT a full re-review. The first review of this " +
@@ -7419,6 +7430,11 @@ func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
 		"exempted with a hollow or incorrect reason is a concern — name it. Judge soundness against the approved " +
 		"plan's scope and approach below and the exemption's stated reason; there is no diff to read because an " +
 		"exempted path is unchanged by definition.\n\n")
+	if t.ReviewTreeCommit != "" {
+		b.WriteString("The exported tree named under REPOSITORY ACCESS is the re-landed head this pass reviews: read " +
+			"each exempted path in it to check the exemption's stated reason against the file as it stands, and " +
+			"cite what you read.\n\n")
+	}
 
 	// The additional exemption delta, rendered by the shared gate-evidence
 	// renderer's ScopeExemptions section. GateEvidence carries ONLY

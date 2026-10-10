@@ -1145,15 +1145,19 @@ so the loop signatures are unchanged.
 - **Grounding.** `allInvocationsGrounded` is evaluated over the STANDARD invocations only, before personas join,
   so a persona's capability can never change the standard prompt. A persona that cannot ground (or a round with
   no exported tree) gets the diff-only clause and no tree. `TestPlanReview_Persona_GroundingIsolation`.
-  Both call sites (`plan.go`, `trace.go`) decide grounding through ONE helper, `groundReview`
+  All three call sites (`runPlanReviews` in `plan.go`; `runImplementReviews` and `runSupplementalReinvokeReview`
+  in `trace.go`, the last since #4160) decide grounding through ONE helper, `groundReview`
   (`review_grounding.go`), which stamps `Trigger.ReviewUngroundedReason` on every degrade (#4066), so the
   ungrounded prompt renders one of two variants: switch-off (`disabled`, naming `FISHHAWKD_REVIEW_GROUNDING`) or
   enabled-but-unavailable with the named reason (`no_working_dir`, `no_ref`, `reviewer_cannot_ground`,
   `ref_unavailable`, `export_failed`). A non-grounding persona on a GROUNDED round is stamped
   `reviewer_cannot_ground`; on an ungrounded round the round's reason carries over
-  (`TestPersona_NonGroundingPersonaNamesReviewerCannotGround`). Residual: `runSupplementalReinvokeReview` is not
-  routed through `groundReview`, so its always-ungrounded prompt can still show the switch-off wording while
-  grounding is enabled.
+  (`TestPersona_NonGroundingPersonaNamesReviewerCannotGround`). The supplemental base-rebase re-invoke pass is
+  grounded against the pushed re-landed head (`pr.HeadSHA`), taken after every early exit, with the
+  `runImplementReviews` cleanup ownership (goroutine defer, synchronous defer, build-error cleanup); its render
+  carries REPOSITORY ACCESS (`buildImplementReview` writes it before the supplemental early return) plus one
+  grounded-only framing sentence (#4160; `TestSupplementalReinvokeReview_*` in `review_grounding_test.go`,
+  `TestBuild_ImplementReview_SupplementalReinvoke_RendersGroundingPosture`).
 - **Implement-path ordering.** Persona resolution sits inside `reviewDispatchMu`, AFTER the #797 duplicate-dispatch
   guard and the standard build, BEFORE `implement_review_started` — a duplicate dispatch reads no remit and writes
   no attribution (`TestImplementReview_Persona_DuplicateDispatchReadsNothing`). `runSupplementalReinvokeReview`
