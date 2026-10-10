@@ -786,7 +786,9 @@
       "path": "docs/adr/087-local-stage-concurrency-groups.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-094"
+      ],
       "applies_to": []
     },
     {
@@ -851,6 +853,17 @@
       "supersedes": [
         "ADR-090",
         "ADR-092"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-094",
+      "title": "Resource-keyed admission: one admission path for every spawning verb, stages hold a scoped SET of resource groups including a host capacity group, and review rounds admit through provider-account groups that park on quota (amends ADR-087)",
+      "path": "docs/adr/094-resource-keyed-admission.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-087"
       ],
       "superseded_by": [],
       "applies_to": []
