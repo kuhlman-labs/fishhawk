@@ -1058,16 +1058,27 @@ func TestAwaitReview_ProgressHeartbeat_NotifyErrorDoesNotFailWait(t *testing.T) 
 }
 
 // TestAwaitReviewProgressMessage pins the pure heartbeat-message helper,
-// including the #1915 terminalInFlight note.
+// including the #1915 terminal-with-review-in-flight note, which names the
+// observed terminal state (#4101).
 func TestAwaitReviewProgressMessage(t *testing.T) {
-	base := awaitReviewProgressMessage("implement", 12*time.Second, false)
-	if base != "await_review: implement review pending; elapsed 12s" {
-		t.Errorf("base message = %q", base)
+	cases := []struct {
+		name          string
+		stage         string
+		elapsed       time.Duration
+		terminalState string
+		want          string
+	}{
+		{"not terminal", "implement", 12 * time.Second, "", "await_review: implement review pending; elapsed 12s"},
+		{"failed", "plan", 3 * time.Second, "failed", "await_review: plan review pending; elapsed 3s; run failed with review still in flight"},
+		{"succeeded", "implement", 7 * time.Second, "succeeded", "await_review: implement review pending; elapsed 7s; run succeeded with review still in flight"},
+		{"cancelled", "plan", 0, "cancelled", "await_review: plan review pending; elapsed 0s; run cancelled with review still in flight"},
 	}
-	tif := awaitReviewProgressMessage("plan", 3*time.Second, true)
-	if !strings.HasPrefix(tif, "await_review: plan review pending; elapsed 3s") ||
-		!strings.Contains(tif, "run terminal with review still in flight") {
-		t.Errorf("terminalInFlight message = %q", tif)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := awaitReviewProgressMessage(tc.stage, tc.elapsed, tc.terminalState); got != tc.want {
+				t.Errorf("message = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1121,7 +1132,7 @@ func TestReviewStatusFor_PollIntervalHint_PendingOnly(t *testing.T) {
 // TestAwaitRunTerminalBackstop_NoReviewInFlight_ResolvesEarly unit-pins the
 // #874 early-resolve arm as refined by #1915: on a terminal run with NO
 // dispatched review in flight (a non-pending status), the backstop resolves
-// the wait immediately and reports terminalInFlight=false. The message names
+// the wait immediately and reports an empty terminal state. The message names
 // the non-progress reason. This is the defensive branch the caller cannot
 // reach through the normal 'pending'-only invocation, so it is exercised
 // directly.
@@ -1132,12 +1143,12 @@ func TestAwaitRunTerminalBackstop_NoReviewInFlight_ResolvesEarly(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	st := &ReviewStatus{Stage: "plan", Status: "none"}
-	out, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "plan", st, time.Now(), false, awaitReviewTimeoutMax)
+	out, done, ts := r.awaitRunTerminalBackstop(context.Background(), runID, "plan", st, time.Now(), false, awaitReviewTimeoutMax)
 	if !done {
 		t.Fatal("backstop should resolve early on a terminal run with no review in flight")
 	}
-	if tif {
-		t.Error("terminalInFlight should be false when no review is in flight")
+	if ts != "" {
+		t.Errorf("terminal state = %q, want empty when no review is in flight", ts)
 	}
 	if !strings.Contains(out.Message, "can no longer progress") {
 		t.Errorf("early-resolve message should explain the review can no longer progress: %q", out.Message)
@@ -1153,9 +1164,10 @@ func TestAwaitRunTerminalBackstop_NoReviewInFlight_ResolvesEarly(t *testing.T) {
 
 // TestAwaitRunTerminalBackstop_InFlightReview_KeepsPolling unit-pins the #1915
 // keep-polling arm: on a terminal run with a review STILL in flight (a pending
-// status), the backstop does NOT resolve — it reports done=false with
-// terminalInFlight=true so the caller keeps polling (the verdict is recorded
-// unguarded and WILL land) and a later timeout can name fishhawk_revive_run.
+// status), the backstop does NOT resolve — it reports done=false with the
+// observed terminal state "failed" so the caller keeps polling (the verdict is
+// recorded unguarded and WILL land) and a later timeout can name
+// fishhawk_revive_run.
 func TestAwaitRunTerminalBackstop_InFlightReview_KeepsPolling(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
@@ -1163,12 +1175,33 @@ func TestAwaitRunTerminalBackstop_InFlightReview_KeepsPolling(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	st := &ReviewStatus{Stage: "implement", Status: "pending"}
-	_, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "implement", st, time.Now(), false, awaitReviewTimeoutMax)
+	_, done, ts := r.awaitRunTerminalBackstop(context.Background(), runID, "implement", st, time.Now(), false, awaitReviewTimeoutMax)
 	if done {
 		t.Fatal("backstop must NOT resolve early while a review is in flight on a terminal run (#1915)")
 	}
-	if !tif {
-		t.Error("terminalInFlight should be true (terminal run + in-flight review)")
+	if ts != "failed" {
+		t.Errorf("terminal state = %q, want failed (terminal run + in-flight review)", ts)
+	}
+}
+
+// TestAwaitRunTerminalBackstop_SucceededRun_InFlightReview_KeepsPolling pins
+// the #4101 succeeded arm of the backstop: a SUCCEEDED run (e.g. a
+// decomposition child whose slice was integrated) with a review still in
+// flight keeps polling exactly like a failed one, and reports the observed
+// state "succeeded" so the timeout message can avoid revive advice.
+func TestAwaitRunTerminalBackstop_SucceededRun_InFlightReview_KeepsPolling(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "succeeded"}
+	r := newResolver(srv, nil)
+
+	st := &ReviewStatus{Stage: "implement", Status: "pending"}
+	_, done, ts := r.awaitRunTerminalBackstop(context.Background(), runID, "implement", st, time.Now(), false, awaitReviewTimeoutMax)
+	if done {
+		t.Fatal("backstop must NOT resolve early while a review is in flight on a succeeded run (#4101)")
+	}
+	if ts != "succeeded" {
+		t.Errorf("terminal state = %q, want succeeded", ts)
 	}
 }
 
@@ -1270,6 +1303,232 @@ func TestAwaitReview_TerminalRun_InFlightReview_TimeoutNamesRevive(t *testing.T)
 	if !strings.Contains(out.Message, "terminal") {
 		t.Errorf("timeout message should explain the run is terminal: %q", out.Message)
 	}
+}
+
+// awaitTerminalInFlightTimeout drives awaitReview on a run already in
+// runState at call time with a plan review in flight, cancelling on the 2nd
+// started query so the wait hits its deadline deterministically (#729), and
+// returns the pending-timeout output. Shared by the #4101 per-state timeout
+// tests.
+func awaitTerminalInFlightTimeout(t *testing.T, runState string) AwaitReviewOutput {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: runState}
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "plan_review_started" && startedQueries.Add(1) == 2 {
+			cancel()
+		}
+	}
+
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "plan",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "pending" {
+		t.Fatalf("Status = %q, want pending on timeout", out.Status)
+	}
+	return out
+}
+
+// assertNoReviveAnywhere fails when the WHOLE marshalled await output — not
+// just the message — names revive in any form (#4101 C2).
+func assertNoReviveAnywhere(t *testing.T, out AwaitReviewOutput) {
+	t.Helper()
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	if strings.Contains(strings.ToLower(string(raw)), "revive") {
+		t.Errorf("await output must not name revive in any form for a non-failed run: %s", raw)
+	}
+}
+
+// TestAwaitReview_SucceededRun_InFlightReview_TimeoutNeverNamesRevive is the
+// #4101 succeeded arm: a SUCCEEDED run (a decomposition child whose slice was
+// integrated while its review is still landing) must NOT be told to call
+// fishhawk_revive_run — run.ReviveRun refuses every non-failed state — and
+// must be told to re-call fishhawk_await_review instead.
+func TestAwaitReview_SucceededRun_InFlightReview_TimeoutNeverNamesRevive(t *testing.T) {
+	out := awaitTerminalInFlightTimeout(t, "succeeded")
+	assertNoReviveAnywhere(t, out)
+	if !strings.Contains(out.Message, "fishhawk_await_review") {
+		t.Errorf("succeeded-run timeout message should tell the operator to re-call fishhawk_await_review: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "SUCCEEDED") || !strings.Contains(out.Message, "nothing needs re-admitting") {
+		t.Errorf("succeeded-run timeout message should say the run succeeded and needs nothing re-admitted: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_CancelledRun_InFlightReview_TimeoutNeverNamesRevive is the
+// #4101 cancelled arm: a CANCELLED run cannot be re-admitted, so the timeout
+// message must not name fishhawk_revive_run and must say the verdict lands as
+// a record only.
+func TestAwaitReview_CancelledRun_InFlightReview_TimeoutNeverNamesRevive(t *testing.T) {
+	out := awaitTerminalInFlightTimeout(t, "cancelled")
+	assertNoReviveAnywhere(t, out)
+	if !strings.Contains(out.Message, "fishhawk_await_review") {
+		t.Errorf("cancelled-run timeout message should tell the operator to re-call fishhawk_await_review: %q", out.Message)
+	}
+	if !strings.Contains(out.Message, "CANCELLED") || !strings.Contains(out.Message, "cannot be re-admitted") {
+		t.Errorf("cancelled-run timeout message should say the run was cancelled and cannot be re-admitted: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_SucceededRun_InFlightReview_KeepsPollingThenResolves pins
+// that the #4101 message change did not change polling: a succeeded run with
+// a review in flight keeps waiting and resolves to the verdict once it lands.
+func TestAwaitReview_SucceededRun_InFlightReview_KeepsPollingThenResolves(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "succeeded"}
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+
+	flipped := false
+	fb.reviewFlip = func(category string) {
+		if category == "implement_review_started" && !flipped {
+			flipped = true
+			payload, _ := json.Marshal(PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			var decoded any
+			_ = json.Unmarshal(payload, &decoded)
+			fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+				ID:       uuid.New().String(),
+				Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+				RunID:    runID.String(),
+				Category: "implement_reviewed",
+				Payload:  decoded,
+			})
+		}
+	}
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "complete" {
+		t.Fatalf("Status = %q, want complete (succeeded run must keep polling while the review is in flight)", out.Status)
+	}
+	if len(out.Reviews) != 1 || out.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews = %+v, want the landed approve verdict", out.Reviews)
+	}
+}
+
+// TestAwaitReview_SucceededMidLoop_TimeoutNeverNamesRevive pins that the
+// IN-LOOP backstop carries the terminal state too (#4101): the run is
+// "running" at call time (so the pre-loop backstop records nothing), flips to
+// succeeded on poll tick 2, and the deadline then fires. Only the in-loop
+// observation can supply the succeeded wording, so dropping its propagation
+// falls back to the generic text and reddens the wording assertion.
+func TestAwaitReview_SucceededMidLoop_TimeoutNeverNamesRevive(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running"}
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// started query #1 is the fast path (run "running"); #2 is poll tick 1;
+	// flip the run to succeeded on #2 so the in-loop backstop of tick 1 sees
+	// it, then cancel on #3 (tick 2) to hit the deadline.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category != "plan_review_started" {
+			return
+		}
+		switch startedQueries.Add(1) {
+		case 2:
+			fb.getRunByID[runID] = Run{ID: runID.String(), State: "succeeded"}
+		case 3:
+			cancel()
+		}
+	}
+
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "plan",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "pending" {
+		t.Fatalf("Status = %q, want pending on timeout", out.Status)
+	}
+	assertNoReviveAnywhere(t, out)
+	if !strings.Contains(out.Message, "SUCCEEDED") {
+		t.Errorf("timeout message should carry the succeeded wording observed by the in-loop backstop: %q", out.Message)
+	}
+}
+
+// TestAwaitReview_SucceededRun_TransientGetRunError_KeepsTerminalState pins
+// the sticky terminal state (#4101): the run is observed succeeded by the
+// pre-loop backstop, then a later tick's GetRun FAILS (the backstop returns
+// ""), and the deadline fires. The observed state must survive the failed
+// read, so the timeout still carries the succeeded wording rather than
+// regressing to the generic message.
+func TestAwaitReview_SucceededRun_TransientGetRunError_KeepsTerminalState(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "succeeded"}
+	seedReviewStartedAudit(fb, runID, "plan_review_started", 1, "gating")
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// started query #1 is the fast path; #2 is poll tick 1 — make GetRun fail
+	// from then on so tick 1's in-loop backstop observes nothing; cancel on #3.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category != "plan_review_started" {
+			return
+		}
+		switch startedQueries.Add(1) {
+		case 2:
+			fb.getStatusByID[runID] = http.StatusInternalServerError
+		case 3:
+			cancel()
+		}
+	}
+
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "plan",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "pending" {
+		t.Fatalf("Status = %q, want pending on timeout", out.Status)
+	}
+	if !strings.Contains(out.Message, "SUCCEEDED") {
+		t.Errorf("a failed GetRun on a later tick must not clear the observed succeeded state: %q", out.Message)
+	}
+	assertNoReviveAnywhere(t, out)
 }
 
 // TestAwaitReview_TerminalRunMidLoop_KeepsPolling pins the IN-LOOP #1915 arm:
@@ -1605,7 +1864,7 @@ func TestReviewRoundStrandFrom_NotStrandedReasonIsTimestampOrdering(t *testing.T
 func TestAwaitPendingTimeoutOutput_VerifiedWordingNamesTimestampOrdering(t *testing.T) {
 	r := &runResolver{}
 	start := time.Now()
-	out := r.awaitPendingTimeoutOutput("implement", 360, start, false, false, 600, &reviewStrand{
+	out := r.awaitPendingTimeoutOutput("implement", 360, start, "", false, 600, &reviewStrand{
 		LandedTerminal: 0, ConfiguredAgents: 2,
 		StartedAt:          start.Add(-10 * time.Minute),
 		DaemonProcessStart: start.Add(-30 * time.Minute),
@@ -1644,7 +1903,7 @@ func TestAwaitPendingTimeoutOutput_VerifiedWordingNamesTimestampOrdering(t *test
 // pending-after-timeout message asserts reviewer liveness (#3395 fix-up).
 func TestAwaitPendingTimeoutOutput_NeutralWordingClaimsNoLiveness(t *testing.T) {
 	r := &runResolver{}
-	out := r.awaitPendingTimeoutOutput("plan", 120, time.Now(), false, false, 600, nil)
+	out := r.awaitPendingTimeoutOutput("plan", 120, time.Now(), "", false, 600, nil)
 	for _, forbidden := range []string{"still running", "is running", "are running", "genuinely"} {
 		if strings.Contains(out.Message, forbidden) {
 			t.Errorf("neutral timeout message asserts unobserved liveness %q: %q", forbidden, out.Message)
@@ -2784,7 +3043,7 @@ func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
 	// The 'verified' fixture carries a REAL boundary: DaemonProcessStart is set
 	// only after reviewRoundStrandFrom reached and passed the /healthz
 	// comparison, so it is the evidence the claim is gated on.
-	verified := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+	verified := r.awaitPendingTimeoutOutput("plan", 360, start, "", false, 600, &reviewStrand{
 		LandedTerminal: 1, ConfiguredAgents: 2,
 		StartedAt:          start.Add(-10 * time.Minute),
 		DaemonProcessStart: start.Add(-30 * time.Minute),
@@ -2803,7 +3062,7 @@ func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
 	// DaemonProcessStart). Claiming "verified" there asserts a check that was
 	// never performed, under a daemon that may well have restarted. It must
 	// fall back to the neutral pre-#2712 wording.
-	unprobed := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+	unprobed := r.awaitPendingTimeoutOutput("plan", 360, start, "", false, 600, &reviewStrand{
 		Reason: "the review round records no configured agent count",
 	})
 	if strings.Contains(unprobed.Message, "verified") {
@@ -2819,7 +3078,7 @@ func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
 		t.Error("Undecidable = true on an early-return verdict")
 	}
 
-	undecidable := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, &reviewStrand{
+	undecidable := r.awaitPendingTimeoutOutput("plan", 360, start, "", false, 600, &reviewStrand{
 		Undecidable: true, Reason: "/healthz was unreachable (dial tcp: connection refused)",
 		LandedTerminal: 1, ConfiguredAgents: 2,
 	})
@@ -2837,7 +3096,7 @@ func TestAwaitPendingTimeoutOutput_NoLivenessClaim(t *testing.T) {
 
 	// No probe verdict at all (the probe itself errored): the message stays
 	// on the pre-#2712 wording rather than claiming either way.
-	none := r.awaitPendingTimeoutOutput("plan", 360, start, false, false, 600, nil)
+	none := r.awaitPendingTimeoutOutput("plan", 360, start, "", false, 600, nil)
 	if none.Status != "pending" {
 		t.Errorf("Status = %q, want pending", none.Status)
 	}

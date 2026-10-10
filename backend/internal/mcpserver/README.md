@@ -2488,6 +2488,12 @@ or the timeout fires. A `pending`-on-timeout result carries the `poll_interval_s
 framing the re-call (or a switch to `get_run_status` polling) as the documented next step and naming
 `FISHHAWKD_PLAN_REVIEW_TIMEOUT`. A 360s synchronous call may still hit a client/transport per-call timeout — acceptable
 precisely because poll-the-handle is the blessed primary path and a cut-short await is a no-op the caller can re-issue.
+A run that is terminal WITH a review still in flight keeps polling (#1915: the verdict is recorded with no run-state
+guard), and its timeout message branches on the observed terminal state (#4101): only a `failed` run is told to call
+`fishhawk_revive_run` (the only state `run.ReviveRun` accepts); a `succeeded` run — e.g. a decomposition child whose
+slice was integrated — is told nothing needs re-admitting and to re-call, and a `cancelled` run that its verdict lands as
+a record only and no operator verb re-admits it (only reopening the PR whose close cancelled it does). Neither of the
+latter two names revive.
 
 **Raising the cap — `long_wait` (#2490).** The default cap is 600s; it rises to 7200s (2h) when EITHER a `progressToken`
 is present OR the caller sets **`long_wait: true`**. A `progressToken` is client-supplied MCP request metadata a

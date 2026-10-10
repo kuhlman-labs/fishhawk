@@ -6190,6 +6190,75 @@ components:
           type: string
           format: date-time
 
+    RunConcernList:
+      type: object
+      description: GET /v0/runs/{run_id}/concerns body (#4101).
+      required: [run_id, state, include_children, count, items]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        state:
+          type: string
+          enum: [open, all]
+          description: The state filter applied (`open` when the query omitted it).
+        include_children: { type: boolean }
+        count:
+          type: integer
+          description: Number of `items`.
+        items:
+          type: array
+          description: Parent rows first, then each decomposition child's rows in `children[]` order. Never null; empty is `[]`.
+          items: { $ref: '#/components/schemas/RunConcernListItem' }
+        children:
+          type: array
+          description: Present only when `include_children=true`; `[]` on a run with no decomposition children.
+          items: { $ref: '#/components/schemas/RunConcernListChild' }
+    RunConcernListItem:
+      type: object
+      required: [id, run_id, stage_id, stage_kind, severity, category, state, origin_review_sequence, has_suggested_patch]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id:
+          $ref: '#/components/schemas/UUID'
+          description: The run that OWNS the concern (the child's id for a child's row).
+        child_run_id:
+          $ref: '#/components/schemas/UUID'
+          description: Set only on a decomposition child's row.
+        slice_index:
+          type: integer
+          description: The child's 0-based slice index; set only on a decomposition child's row whose slice index is known.
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_kind: { type: string, enum: [plan, implement] }
+        severity: { type: string }
+        category: { type: string }
+        state:
+          type: string
+          description: The concern lifecycle state (`raised`, `addressed_pending`, `reopened`, `addressed`, `waived`, `superseded`, `deferred`, `addressed_by_condition`).
+        reviewer_model: { type: string }
+        reviewer_role: { type: string }
+        short_summary:
+          type: string
+          maxLength: 100
+          description: A one-line label derived from the note (whitespace collapsed, at most 100 bytes); omitted when the note is blank.
+        origin_review_sequence:
+          type: integer
+          format: int64
+        has_suggested_patch: { type: boolean }
+        provenance:
+          type: string
+          description: '`server_check` for a server-synthesized concern; omitted for a reviewer-raised one.'
+    RunConcernListChild:
+      type: object
+      required: [run_id, state, item_count]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        slice_index: { type: integer }
+        state:
+          type: string
+          description: The child run's state.
+        item_count:
+          type: integer
+          description: Number of `items` this child contributed under the state filter.
+
     RestartBlockerList:
       type: object
       description: GET /v0/restart-blockers body (E83.30 / #3974).
@@ -23826,6 +23895,81 @@ paths:
           description: |
             Concern or audit store not configured on this deployment.
             Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/concerns:
+    get:
+      operationId: listRunConcerns
+      summary: List a run's review concerns, optionally with its decomposition children's
+      description: |
+        Lists a run's review concerns (#4101) and, with
+        `include_children=true`, those of its decomposition children, so an
+        operator collecting concern ids across a fan-out for
+        `bulkWaiveConcerns` / the defer verb needs ONE call instead of a
+        gate-view read per child. Each item carries the bounded
+        `short_summary` label, never the full reviewer note (that stays on
+        `getRunGateView`). Read-only: no audit row, no state change.
+
+        Children are the runs whose `decomposed_from` is this run — NEVER
+        `parent_run_id`, which also links recovery children, so a recovery
+        child's concerns are never listed. Ordering: the parent's rows in
+        store order (oldest review first), then each child's rows, children
+        ordered by `slice_index` ascending (a missing index last), then
+        creation time, then id.
+
+        Every store read fails CLOSED with `500`, including a SINGLE child's
+        concern read (the message names that child): a partial list would
+        read as "no open concerns on that child", the wrong signal for an
+        operator collecting ids.
+
+        Auth mirrors `getRunGateView`: an ordinary caller must hold the
+        `read:audit` scope (cookie sessions pass), while a run-bound
+        `mcp:run:<uuid>` token may list only its OWN run and may NOT use
+        `include_children` — children are other runs.
+      tags: [stages]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: state
+          in: query
+          schema: { type: string, enum: [open, all], default: open }
+          description: |
+            `open` (default) lists only open concerns (`raised`,
+            `addressed_pending`, `reopened`) — the ones a waive or defer can
+            act on. `all` lists every row, including settled ones.
+        - name: include_children
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            When true, also list the concerns of every decomposition child
+            and return a `children[]` summary (an empty array on a run with
+            no decomposition children). Refused for a run-bound token.
+      responses:
+        '200':
+          description: The concern listing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunConcernList' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID, `state` not `open`/`all`, or `include_children` not a boolean (`details.field` names which).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` — a token missing the `read:audit` scope; or `cross_run_concerns` — a run-bound `mcp:run:<uuid>` token listing a run other than its own, or passing `include_children=true`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: '`internal_error` — a run, concern or decomposition-children read failed. Fail-closed: no partial listing is ever returned.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`concern_store_unconfigured` — the concern or run repository is not configured.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
