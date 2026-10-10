@@ -1085,13 +1085,46 @@ so the loop signatures are unchanged.
   absent or unmappable, `SelectReviewerPersonas` refusal) or `escalation_unevaluable` (a `Match` error, a
   `SelectNamedReviewerPersonas` refusal). It is COUNTED in `configured_agents` and emitted after `*_review_started`,
   so `planreview.Settled` still waits for every standard reviewer; `hasRejection` is untouched; the other source's
-  personas still run. `TestResolveStageReviewerPersonas_FailurePaths`, `TestResolveEscalationPersonas_MatchErrorDegrades`;
+  personas still run. The `escalation_unevaluable` skip is escalation-attached and, under GATING authority, fails
+  the stage at the dispatch site (#3913, next bullet); the `persona_stage_unresolvable` skip never does.
+  `TestResolveStageReviewerPersonas_FailurePaths`, `TestResolveEscalationPersonas_MatchErrorDegrades`;
   through the implement invocation loop, including the two mixed degrades (static degraded while the escalated
   persona runs, and the reverse): `TestPersonaHardening_EscalationUnevaluable_ThroughImplementLoop`,
   `TestPersonaHardening_Mixed_*`. `escalation_unevaluable` is unreachable from a stored spec — `ParseBytes` rejects
   both of its producers (a malformed glob, an undeclared `require.reviewers` name) — so those cases build the
   degraded spec by construction and hand it to the same `resolveParsedReviewPersonaInvocations` the dispatch site
   calls; it remains a defence for a spec that skipped validation.
+- **Escalation-attached persona blocks a gating round ([#3913](https://github.com/kuhlman-labs/fishhawk/issues/3913)).**
+  A persona an escalation attached exists because the change touches a path the workflow marked sensitive, so
+  under GATING authority one that cannot run fails the reviewed stage category-B instead of letting the round
+  settle on the standard reviewers alone. "Cannot run" is `reviewerInvocation.cannotRun()` — `resolveErr != nil`
+  (the persona's provider is not runnable: `reviewer_unavailable`; `agent.optional: true` does NOT exempt it,
+  because an escalation may only raise) or a persona with no prompt (`persona_remit_unavailable`, any remit or
+  `decision_record` detail, or the `escalation_unevaluable` pseudo invocation) — the ONE predicate both loops skip
+  on. "Escalation-attached" (`personaInvocation.escalation`) is set by MEMBERSHIP in the escalation resolution's
+  selected names, not by position, so a persona attached both statically and by a fired escalation (de-duplicated
+  into the static slot) is still tagged; the `escalation_unevaluable` pseudo invocation is tagged too.
+  `persona_stage_unresolvable` stays non-blocking because it is static-source by construction (the reviewed stage
+  could not be located, so the static attachment set is unknown), while an escalation-selected persona still
+  joins the union and is tagged by membership — a deliberate reading of the operator decision the operator may
+  overrule. The block is decided at the TWO dispatch sites that already fail a stage on a gating reject —
+  `runPlanReviews` (via `planReviewGatingFailureReason`) and the trace-upload caller of
+  `runImplementReviewsForTree` (which now RETURNS the failure reason, `""` = not blocked; `runImplementReviews`
+  keeps its bool) — from `escalationPersonaGateBlock`, so the loops' `hasRejection` keeps its verdict-only meaning.
+  Every reviewer still runs first, so the round settles at `configured_agents`. Reason:
+  `plan_review_rejected: escalation_persona_unavailable: persona "<name>" (<reason>: <detail>), ... could not run
+  under gating authority; ...` (implement: the `implement_review_rejected` prefix; the pseudo invocation renders
+  `escalation source (persona_attachment_unresolvable: escalation_unevaluable)`). The `*_rejected` prefix is kept
+  although no reviewer rejected because `handleShipPullRequest` closes a gating-failed implement stage's dangling
+  PR by `strings.HasPrefix(FailureReason, implementReviewGatingRejectPrefix)` (#877). The block WINS over a reject
+  verdict (a fix-up or replan cannot clear it; the reject stays visible in `*_reviewed`). The skip entry carries
+  `escalation_attached: true` (omitempty — absent on every standard, static-only and `persona_stage_unresolvable`
+  skip). Advisory rounds and static-only personas keep the degrade. Residuals: the post-success rounds (fix-up push
+  re-review, consolidated review) ignore the gating return exactly as they ignore a reject; and a remit absent at
+  the run's admission commit is base-pinned (`BaseSourceRunAdmission`), so retrying the stage in the SAME run fails
+  again with the same reason — fail closed until a new run admits a commit carrying the remit. Tests:
+  `escalation_persona_gate_test.go` (plan gating per mode, static-only, advisory, the cross-layer trace upload,
+  the block's sources, reason precedence).
 - **Authority residual (stated, not fixed).** The persona SET is the reviewed stage's, but a round takes ONE
   authority — `resolveStageReviewers`, the FIRST stage of the type — and every invocation shares it. With two
   same-type stages whose `reviewers` blocks differ, a persona attached by the second runs under the first's
@@ -1133,7 +1166,8 @@ so the loop signatures are unchanged.
   error, or an unusable admission commit — reachable only by a direct call, since the remit's own
   `run_base_commit_unrecorded` / `remit_unresolvable` fire first in the loops). The standard reviewers still run; `hasRejection` is
   untouched. A persona whose PROVIDER is unavailable takes the ordinary `reviewer_unavailable` skip stamped with
-  `persona`, and its remit is never read. A persona reviewer that errors records `*_review_failed` with a reason
+  `persona`, and its remit is never read. Exception: an ESCALATION-attached persona that cannot run fails a gating
+  round (#3913, the bullet above); a static-only one never does. A persona reviewer that errors records `*_review_failed` with a reason
   prefixed `persona <name>: `.
 - **Accounting.** `*_review_started.configured_agents` = standard count + persona count, and `personas` lists
   them. Terminal entries are matched by COUNT (`planreview.Settled`), never by provider or provider+persona, so a

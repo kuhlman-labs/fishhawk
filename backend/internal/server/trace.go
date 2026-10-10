@@ -644,9 +644,12 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			// uploaded bundle, so a restart-orphaned round is re-dispatched from
 			// the stored bundle. Only the review call carries it.
 			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace})
-			if s.runImplementReviewsForTree(reviewCtx, runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence) {
+			// The returned reason is the gating failure (#3913): a reject
+			// verdict, a document-injection failure, or an escalation-attached
+			// persona that could not run — each under the
+			// implement_review_rejected prefix #877's PR close keys on.
+			if reason := s.runImplementReviewsForTree(reviewCtx, runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence); reason != "" {
 				cat := run.FailureB
-				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
 					// #968: a failure report FailStage rejected (duplicate /
 					// already-recovered stage) must not advance the run.
@@ -4020,10 +4023,32 @@ var buildImplementReviewPrompt = prompt.Build
 //   - authority is advisory (review runs detached, never blocks)
 //   - all review agents approve (or approve_with_concerns)
 //
+// Under gating authority it ALSO returns true when a persona a FIRED
+// escalation attached cannot run (#3913, escalationPersonaGateBlock); the
+// trace-upload caller of runImplementReviewsForTree then fails the stage with
+// the named reason. The post-success callers (fix-up push re-review,
+// consolidated review) ignore this return, exactly as they ignore a reject.
+//
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
 func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string, gateEvidence *prompt.GateEvidence) bool {
-	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", "", gateEvidence)
+	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", "", gateEvidence) != ""
+}
+
+// implementReviewGatingFailureReason returns the category-B failure reason a
+// gating implement-review round records, or "" when it does not fail the
+// stage. block is escalationPersonaGateBlock's result (#3913); when non-empty
+// it wins over a reject verdict (a fix-up cannot clear it), mirroring
+// planReviewGatingFailureReason. Both keep implementReviewGatingRejectPrefix,
+// which handleShipPullRequest's dangling-PR close matches (#877).
+func implementReviewGatingFailureReason(rejected bool, block string) string {
+	if block != "" {
+		return implementReviewGatingRejectPrefix + ": " + block
+	}
+	if rejected {
+		return implementReviewGatingRejectReason
+	}
+	return ""
 }
 
 // runImplementReviewsForTree is runImplementReviews plus the round's reviewed
@@ -4036,14 +4061,23 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 // trace-time bundle path knows them; every other caller goes through
 // runImplementReviews and records neither, which the ship-side check treats as
 // undecidable (fail-closed to silence).
-func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA, changeID string, gateEvidence *prompt.GateEvidence) bool {
+//
+// It returns the GATING failure reason, "" meaning not blocked (#3913): the
+// reject literal implementReviewGatingRejectReason for a reject verdict or a
+// gating document-injection / required-convention failure, or
+// implementReviewGatingFailureReason's escalation_persona_unavailable reason
+// when an escalation-attached persona could not run. The caller fails the
+// stage with it verbatim; every reason carries
+// implementReviewGatingRejectPrefix. The post-success rounds (fix-up push
+// re-review, consolidated review) ignore it, exactly as for a reject.
+func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA, changeID string, gateEvidence *prompt.GateEvidence) string {
 	// #3400: decide whether this round's gate evidence came from an uploaded
 	// bundle at ENTRY, before any of the allocate-if-nil blocks below
 	// (operator-scope-undelivered, per-slice verify, obligations) can conjure a
 	// non-nil GateEvidence that no bundle produced.
 	bundleDerivedGateEvidence := isBundleDerivedGateEvidence(gateEvidence)
 	if s.cfg.RunRepo == nil {
-		return false
+		return ""
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -4052,7 +4086,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return ""
 	}
 
 	// Diff secrets check (E80.3 / #3760): deterministic, no model call, run
@@ -4077,7 +4111,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
 	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
-		return false
+		return ""
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
@@ -4108,7 +4142,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 				)
 			}
 		}
-		return false
+		return ""
 	}
 
 	// Load the approved plan for the self-review guard (GeneratedBy.Model)
@@ -4120,10 +4154,10 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return ""
 	}
 	if approvedPlan == nil {
-		return false
+		return ""
 	}
 
 	trig := prompt.Trigger{
@@ -4812,7 +4846,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			// A duplicate dispatch: remove the export we just created (#2486) —
 			// no reviewer will run against it on this path.
 			treeCleanup()
-			return false
+			return ""
 		}
 	}
 
@@ -4849,7 +4883,10 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("error", err.Error()),
 		)
 		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
-		return authority == planreview.AuthorityGating
+		if authority == planreview.AuthorityGating {
+			return implementReviewGatingRejectReason
+		}
+		return ""
 	}
 	injected := reviewDocs.Injected
 	trig.InjectedDocuments = injected
@@ -4876,7 +4913,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return ""
 	}
 	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
 
@@ -4960,14 +4997,18 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			defer treeCleanup()
 			s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
 		}()
-		return false
+		return ""
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition. Cleanup is owned by THIS scope
 	// because the loop runs to completion before runImplementReviews returns.
 	defer treeCleanup()
-	return s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
+	rejected := s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
+	// An escalation-attached persona that could not run blocks the gating
+	// round (#3913), decided HERE so the loop's verdict accumulator is
+	// unchanged.
+	return implementReviewGatingFailureReason(rejected, escalationPersonaGateBlock(personaInvs))
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -5536,7 +5577,7 @@ func (r implementReviewInvocationResult) succeeded() bool {
 // under its size-aware budget. It writes NO audit entry.
 func (s *Server) invokeImplementReviewer(ctx context.Context, i int, inv reviewerInvocation, promptText, treeDir string, reviewBudget planreview.ReviewBudget) implementReviewInvocationResult {
 	res := implementReviewInvocationResult{index: i, inv: inv}
-	if inv.resolveErr != nil || (inv.persona != nil && inv.persona.promptText == "") {
+	if inv.cannotRun() {
 		return res
 	}
 	res.ran = true
@@ -5683,7 +5724,7 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 	// hasRejection untouched. implement_review_skipped counts as terminal
 	// (planreview.Settled), so the review-settled gate still resolves.
 	if inv.resolveErr != nil {
-		s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, st.invocations, inv.resolveErr)
+		s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, inv.escalationAttached(), st.invocations, inv.resolveErr)
 		return
 	}
 	// A reviewer persona whose remit could not be resolved, rendered or
