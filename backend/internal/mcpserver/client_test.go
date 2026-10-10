@@ -4523,17 +4523,31 @@ func TestSanitizeHostLabel(t *testing.T) {
 	}
 }
 
-// TestHostDispatchLabel_Seam: the label is the sanitised hostname; a hostname
-// error yields "" (no body, the server's unknown host).
+// TestHostDispatchLabel_Seam: a client whose resolver answers from a persisted
+// host id sends THAT id as the marker's host body, not its hostname (#4212).
 func TestHostDispatchLabel_Seam(t *testing.T) {
-	if got := hostDispatchLabel(func() (string, error) { return "dev box", nil }); got != "dev-box" {
-		t.Errorf("label = %q, want dev-box", got)
+	path := filepath.Join(t.TempDir(), "fishhawk", "host-id")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if got := hostDispatchLabel(func() (string, error) { return "ignored", errors.New("no hostname") }); got != "" {
-		t.Errorf("label on hostname error = %q, want empty", got)
+	if err := os.WriteFile(path, []byte("stable-id\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if got := newAPIClient(config{backendURL: "http://x"}).hostLabel; got != hostDispatchLabel(os.Hostname) {
-		t.Errorf("newAPIClient hostLabel = %q, want the os.Hostname label", got)
+	var gotBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok", hostLabel: func() hostLabelResolution {
+		return resolveHostLabel(testHostLabelDeps("dev box", path))
+	}})
+	if _, err := c.HostDispatchStage(context.Background(), uuid.New(), uuid.New()); err != nil {
+		t.Fatalf("HostDispatchStage: %v", err)
+	}
+	if gotBody != `{"host":"stable-id"}` {
+		t.Errorf("host-dispatch body = %q, want the persisted id {\"host\":\"stable-id\"}", gotBody)
 	}
 }
 
@@ -4558,7 +4572,7 @@ func TestHostDispatchStage_SendsHostBody(t *testing.T) {
 			}))
 			defer ts.Close()
 			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok"})
-			c.hostLabel = tc.label
+			c.hostLabel = fixedHostLabel(tc.label)
 			if _, err := c.HostDispatchStageWithNonce(context.Background(), uuid.New(), uuid.New(), tc.nonce); err != nil {
 				t.Fatalf("HostDispatchStageWithNonce: %v", err)
 			}
@@ -4789,7 +4803,7 @@ func TestConcurrencySlot_ClientCrossBoundary(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	c := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
-	c.hostLabel = "h1"
+	c.hostLabel = fixedHostLabel("h1")
 
 	resA, err := c.HostDispatchStage(ctx, a.RunID, a.ID)
 	if err != nil {

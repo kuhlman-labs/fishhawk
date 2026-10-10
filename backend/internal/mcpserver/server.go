@@ -62,6 +62,12 @@ type config struct {
 	// checkout roots every path-taking input must resolve inside over the HTTP
 	// transport (E66.63 / #3589). Empty over HTTP = fail closed.
 	allowedRoots []string
+
+	// hostLabel resolves this process's host-dispatch host label (#4212).
+	// Config.internal wires the lazy, once-per-process processHostLabel; a
+	// test-built config{} literal leaves it nil, which is no label (the
+	// server's `unknown` host).
+	hostLabel func() hostLabelResolution
 }
 
 // Config is the exported construction input for NewServer. Its two fields
@@ -114,6 +120,7 @@ func (c Config) internal() config {
 		apiToken:      c.APIToken,
 		httpTransport: c.HTTPTransport,
 		allowedRoots:  c.AllowedRoots,
+		hostLabel:     processHostLabel,
 	}
 }
 
