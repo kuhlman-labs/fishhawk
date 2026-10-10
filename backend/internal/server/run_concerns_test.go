@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -22,7 +23,8 @@ import (
 // package fakes, one test per branch of handleListRunConcerns. The handler is
 // invoked directly with an injected identity (the gate-view idiom), because the
 // auth middleware would re-derive identity from the request; the registered
-// route through s.Handler() is exercised by run_concerns_pg_test.go.
+// route through s.Handler() is exercised by run_concerns_pg_test.go and by the
+// cross-account case at the bottom of this file.
 
 // childErrConcernRepo wraps fakeConcernRepo and fails ListByRun for ONE run
 // id only, so a test can prove a single child's read failure fails the whole
@@ -495,5 +497,98 @@ func TestOpenAPI_RunConcernsRouteDocumented(t *testing.T) {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/api/v0.openapi.yaml is missing schema %q", strings.TrimSpace(want))
 		}
+	}
+}
+
+// --- cross-account isolation on the REGISTERED route ----------------------
+
+// TestListRunConcerns_Route_CrossAccount_Forbidden pins the account-ownership
+// wrapper on GET /v0/runs/{run_id}/concerns (ADR-057 / #1829): the route is
+// registered as requireRunAccount(readAccess, handleListRunConcerns), and a
+// bearer token bound to account A reading a run owned by account B is 403
+// account_forbidden, with and without include_children. It drives the
+// REGISTERED route through s.Handler().ServeHTTP with a real bearer the auth
+// middleware resolves (the TestHandler_WrapsRunRoute_EnforcesAccount idiom),
+// never a directly invoked handler, so the wrapper at the registration site is
+// on the path.
+//
+// include_children has NO account check of its own: children are listed by
+// DecomposedFrom under the parent's wrapper decision, so the include_children
+// case pins that the one wrapper also gates the child fan-out.
+//
+// Isolation: both tokens carry read:audit, so insufficient_scope cannot mask
+// the deletion, and the same-account control proves the fixture reaches the
+// handler (200 with both ids) — with the wrapper gone the cross-account token
+// would get that same 200.
+//
+// Counterfactual (run, fix-up for the operator high concern): replacing
+// `s.requireRunAccount(readAccess, s.handleListRunConcerns)` with
+// `s.handleListRunConcerns` at the GET /v0/runs/{run_id}/concerns
+// registration in handlers.go made this test RED on BOTH cases:
+//
+//	--- FAIL: TestListRunConcerns_Route_CrossAccount_Forbidden/include_children
+//	    status = 200, want 403 account_forbidden; body {..."count":2,"items":[
+//	    ...the account-B parent AND child concern ids...]}
+//	--- FAIL: TestListRunConcerns_Route_CrossAccount_Forbidden/parent_only
+//	    status = 200, want 403 account_forbidden; body {..."count":1,"items":[
+//	    ...the account-B parent concern id...]}
+//
+// handlers.go was then restored byte-identically (cmp against the saved copy
+// clean, git diff empty).
+func TestListRunConcerns_Route_CrossAccount_Forbidden(t *testing.T) {
+	const (
+		crossBearer = "fhk_rc_account_a"
+		ownerBearer = "fhk_rc_account_b"
+	)
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	tokens := &multiTokenRepo{byPlain: map[string]*apitoken.Token{
+		crossBearer: {ID: uuid.New(), Subject: "github:op", AccountID: authzAcctA, Scopes: []string{scopeGateViewRead}, PlainText: crossBearer},
+		ownerBearer: {ID: uuid.New(), Subject: "github:op", AccountID: authzAcctB, Scopes: []string{scopeGateViewRead}, PlainText: ownerBearer},
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr, APITokenRepo: tokens})
+
+	parent := seedGateRun(t, repo)
+	child := seedRCDecompChild(t, repo, parent, 0, time.Now().UTC())
+	repo.mu.Lock()
+	repo.runs[parent].AccountID = authzAcctB
+	repo.runs[child].AccountID = authzAcctB
+	repo.mu.Unlock()
+	parentConcern := seedRCConcern(t, cr, parent, "account B parent concern")
+	childConcern := seedRCConcern(t, cr, child, "account B child concern")
+
+	get := func(query, bearer string) *httptest.ResponseRecorder {
+		path := "/v0/runs/" + parent.String() + "/concerns"
+		if query != "" {
+			path += "?" + query
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		return w
+	}
+
+	// Positive control: the owning account's token reaches the handler.
+	owner := decodeRunConcerns(t, get("include_children=true", ownerBearer))
+	if got := rcItemIDs(owner.Items); len(got) != 2 {
+		t.Fatalf("owner items = %v, want parent + child concern (fixture must reach the handler)", got)
+	}
+
+	for name, query := range map[string]string{
+		"parent_only":      "",
+		"include_children": "include_children=true",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := get(query, crossBearer)
+			if w.Code != http.StatusForbidden || !bodyHasCode(w, "account_forbidden") {
+				t.Fatalf("status = %d, want 403 account_forbidden; body %s", w.Code, w.Body.String())
+			}
+			for _, id := range []string{parentConcern.ID.String(), childConcern.ID.String()} {
+				if strings.Contains(w.Body.String(), id) {
+					t.Errorf("403 body leaks concern id %s: %s", id, w.Body.String())
+				}
+			}
+		})
 	}
 }
