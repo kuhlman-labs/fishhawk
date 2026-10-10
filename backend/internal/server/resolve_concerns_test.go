@@ -624,3 +624,82 @@ func TestResolveConcerns_Route_CrossAccount_Forbidden(t *testing.T) {
 	}
 	assertConcernStates(t, cr, map[uuid.UUID]concern.State{ownerRow.ID: concern.StateAddressed})
 }
+
+// resolveRefreshRecorder records each status refresh together with the
+// concern's STORED state at refresh time, so a test can prove the refresh
+// fires only after the batch's writes committed.
+type resolveRefreshRecorder struct {
+	*pageClassRecorder
+	cr        *fakeConcernRepo
+	concernID uuid.UUID
+	seen      []concern.State
+}
+
+func (r *resolveRefreshRecorder) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error {
+	if got, err := r.cr.GetByIDs(ctx, []uuid.UUID{r.concernID}); err == nil {
+		r.seen = append(r.seen, got[0].State)
+	}
+	return r.pageClassRecorder.NotifyStatusUpdateForRun(ctx, runID)
+}
+
+// TestResolveConcerns_StatusRefresh pins the issue-thread wiring (approval
+// condition 3, amendment 53d8b993): a batch that resolved >= 1 concern
+// refreshes the status comment exactly once, AFTER the transition committed
+// (the recorder reads `addressed` at refresh time), so the
+// concern_resolved_with_evidence activity line reaches the thread. An
+// all-failed batch — attempted 1, resolved 0 — and a refused batch refresh
+// nothing. Counterfactuals: deleting the call reddens the resolving arm;
+// gating on the attempted count reddens the all-failed arm.
+func TestResolveConcerns_StatusRefresh(t *testing.T) {
+	t.Run("resolving batch refreshes once after the write", func(t *testing.T) {
+		s, _, cr := resolveServer(t)
+		runID := uuid.New()
+		row := seedResolvableConcern(t, cr, runID, "a")
+		rec := &resolveRefreshRecorder{pageClassRecorder: &pageClassRecorder{}, cr: cr, concernID: row.ID}
+		s.issueNotifier = rec
+
+		w := postResolve(t, s, runID.String(), resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "e"})
+		if w.Code != http.StatusOK || decodeResolve(t, w).Resolved != 1 {
+			t.Fatalf("status = %d, want 200 with one resolved:\n%s", w.Code, w.Body.String())
+		}
+		if len(rec.status) != 1 || rec.status[0] != runID {
+			t.Fatalf("status refreshes = %v, want exactly one for run %s", rec.status, runID)
+		}
+		if len(rec.seen) != 1 || rec.seen[0] != concern.StateAddressed {
+			t.Errorf("concern state at refresh = %v, want [addressed] (refresh after the write)", rec.seen)
+		}
+	})
+
+	t.Run("all-failed batch refreshes nothing", func(t *testing.T) {
+		s, au, cr := resolveServer(t)
+		au.appendErrCategory = CategoryConcernResolvedWithEvidence
+		runID := uuid.New()
+		row := seedResolvableConcern(t, cr, runID, "a")
+		rec := &pageClassRecorder{}
+		s.issueNotifier = rec
+
+		w := postResolve(t, s, runID.String(), resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "e"})
+		if resp := decodeResolve(t, w); w.Code != http.StatusOK || resp.Resolved != 0 || resp.Failed != 1 {
+			t.Fatalf("status = %d resp = %+v, want 200 with one failed item", w.Code, resp)
+		}
+		if len(rec.status) != 0 {
+			t.Errorf("status refreshes = %d, want 0 for a batch that resolved nothing", len(rec.status))
+		}
+	})
+
+	t.Run("refused batch refreshes nothing", func(t *testing.T) {
+		s, _, cr := resolveServer(t)
+		runID := uuid.New()
+		row := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "raised, not routed")
+		rec := &pageClassRecorder{}
+		s.issueNotifier = rec
+
+		w := postResolve(t, s, runID.String(), resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "e"})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		if len(rec.status) != 0 {
+			t.Errorf("status refreshes = %d, want 0 for a refused batch", len(rec.status))
+		}
+	})
+}

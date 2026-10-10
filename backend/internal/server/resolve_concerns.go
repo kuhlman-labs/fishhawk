@@ -119,10 +119,11 @@ type resolveConcernsResponse struct {
 //     then ApplyResolution(addressed). A transition failure appends the
 //     corrective concern_resolve_failed entry and fails that ONE item.
 //
-// It deliberately does NOT refresh the issue-thread status comment: the
-// activity-line rendering for concern_resolved_with_evidence lands with the
-// gate-view slice (issuecomment activityCategories), so a refresh tagged with
-// this category here would render nothing.
+// After the apply loop, when at least one concern was ACTUALLY resolved, it
+// refreshes the issue-thread status comment with notifyOperatorVisible
+// (concern_resolved_with_evidence is an issuecomment activityCategories
+// member), so the thread shows the "resolved with operator evidence" line. An
+// all-failed batch changed no concern state and refreshes nothing.
 func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -299,6 +300,12 @@ func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 		item.StateReason = updated.StateReason
 		resp.Resolved++
 		resp.Results = append(resp.Results, item)
+	}
+	// After every write committed, gated on the RESOLVED count (not the
+	// attempted one): only a batch that changed a concern's state has an
+	// activity line to show.
+	if resp.Resolved > 0 {
+		s.notifyOperatorVisible(r.Context(), runID, CategoryConcernResolvedWithEvidence)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
