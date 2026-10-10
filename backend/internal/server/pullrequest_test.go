@@ -4524,7 +4524,7 @@ func TestShipPullRequest_MergeCandidateVerified_RecordsAndSettles(t *testing.T) 
 	f.startRunning(t, mcvHead)
 	f.s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	pw := promptRequest(t, f.s, f.runID, f.impl.ID, f.priv, "")
+	pw := promptRequestWithCapabilities(t, f.s, f.impl.ID, f.priv, capableRunnerCapabilities)
 	if pw.Code != http.StatusOK {
 		t.Fatalf("prompt status = %d:\n%s", pw.Code, pw.Body.String())
 	}
@@ -4775,6 +4775,7 @@ func TestFailPullRequestStage_MergeCandidateVerifyRecovery(t *testing.T) {
 	t.Run("live trigger", func(t *testing.T) {
 		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
 		f.startRunning(t, mcvHead)
+		runBefore := f.runRow(t).State
 		if w := shipPRRequest(t, f.s, f.runID, f.impl.ID, f.priv, failBody, ""); w.Code != http.StatusOK {
 			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 		}
@@ -4785,9 +4786,20 @@ func TestFailPullRequestStage_MergeCandidateVerifyRecovery(t *testing.T) {
 		if got := f.stageState(t, f.impl.ID); got != run.StageStateAwaitingApproval {
 			t.Errorf("implement state = %q, want awaiting_approval (restored)", got)
 		}
+		if got := f.runRow(t).State; got != runBefore || got == run.StateFailed {
+			t.Errorf("run state = %q, want unchanged %q (a recovered pass skips the failing Advance)", got, runBefore)
+		}
 	})
+	// #4079: a decomposition child's pull_request_failed never carries a
+	// merge-candidate trigger, so it must take the ordinary failure path — the
+	// stage fails AND Orchestrator.Advance fails the run.
 	t.Run("no trigger", func(t *testing.T) {
 		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		parentID := uuid.New()
+		child := f.runRow(t)
+		f.repo.mu.Lock()
+		child.DecomposedFrom = &parentID
+		f.repo.mu.Unlock()
 		f.impl.State = run.StageStateRunning
 		if w := shipPRRequest(t, f.s, f.runID, f.impl.ID, f.priv, failBody, ""); w.Code != http.StatusOK {
 			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
@@ -4797,6 +4809,9 @@ func TestFailPullRequestStage_MergeCandidateVerifyRecovery(t *testing.T) {
 		}
 		if got := f.stageState(t, f.impl.ID); got != run.StageStateFailed {
 			t.Errorf("implement state = %q, want failed (today's path)", got)
+		}
+		if got := f.runRow(t).State; got != run.StateFailed {
+			t.Errorf("run state = %q, want failed (the ordinary failure path's Advance must run)", got)
 		}
 	})
 }

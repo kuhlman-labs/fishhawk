@@ -976,3 +976,459 @@ func TestAwaitChildren_CleanIntegrationNewerThanHeadMissingSettles(t *testing.T)
 		t.Errorf("integration_failure = %+v, want nil once superseded", out.IntegrationFailure)
 	}
 }
+
+// --- #4178: child_failed — a failed slice blocking every remaining child ---
+
+// setChildImplementFailure stamps the seeded implement stage of childID (see
+// seedChildWithSlice) with a failure category and, when non-empty, a failure
+// reason — the fields the child_failed arm reads off the stage on the wire.
+func setChildImplementFailure(fb *fakeBackend, childID uuid.UUID, category, reason string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	stages := fb.stagesByRun[childID]
+	for i := range stages {
+		if stages[i].Type != "implement" {
+			continue
+		}
+		if category != "" {
+			c := category
+			stages[i].FailureCategory = &c
+		}
+		if reason != "" {
+			r := reason
+			stages[i].FailureReason = &r
+		}
+	}
+	fb.stagesByRun[childID] = stages
+}
+
+// TestAwaitChildren_FailedSliceBlocksUndispatchedDependents_ReleasesChildFailed
+// is the issue scenario (campaign 7ae8f7a5 / run #4018): wave-0 slice 0 failed
+// category A while slices 1-4 sit at awaiting_host_dispatch depending on it.
+// MECHANISM: no other arm can fire on this fixture — not every child is
+// terminal (arm 4 is silent), no dependent is covered by an integration record
+// (children_dispatchable is silent) and no fan-in failure exists — so without
+// the child_failed arm the call times out.
+func TestAwaitChildren_FailedSliceBlocksUndispatchedDependents_ReleasesChildFailed(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent := uuid.New()
+	kids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()}
+	stage0 := seedChildWithSlice(fb, kids[0], "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, kids[0], "A", "agent exited non-zero")
+	ids := []string{kids[0].String()}
+	for i := 1; i < len(kids); i++ {
+		seedChildWithSlice(fb, kids[i], "running", "awaiting_host_dispatch", i, []int{0})
+		ids = append(ids, kids[i].String())
+	}
+	seedPlanDecomposed(fb, parent, ids, 0)
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "child_failed" {
+		t.Fatalf("status = %q, want child_failed — a failed wave-0 slice with every dependent parked must release, not wait out the timeout", out.Status)
+	}
+	if out.WaitedSeconds >= 1 {
+		t.Errorf("waited_seconds = %v, want a fast-path release (< 1s)", out.WaitedSeconds)
+	}
+	if len(out.FailedChildRunIDs) != 1 || out.FailedChildRunIDs[0] != kids[0].String() {
+		t.Errorf("failed_child_run_ids = %v, want [%s]", out.FailedChildRunIDs, kids[0])
+	}
+	wantBlocked := ids[1:]
+	if strings.Join(out.BlockedChildRunIDs, ",") != strings.Join(wantBlocked, ",") {
+		t.Errorf("blocked_child_run_ids = %v, want %v (slice order)", out.BlockedChildRunIDs, wantBlocked)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_retry_stage" || out.NextStep.Params["stage_id"] != stage0.String() {
+		t.Errorf("next_step = %+v, want fishhawk_retry_stage {stage_id: %s}", out.NextStep, stage0)
+	}
+	if out.Children == nil {
+		t.Fatal("release carried no ChildrenStatus snapshot")
+	}
+	var got0 *ChildStatus
+	for i := range out.Children.Children {
+		if out.Children.Children[i].RunID == kids[0].String() {
+			got0 = &out.Children.Children[i]
+		}
+	}
+	if got0 == nil || got0.ImplementFailureCategory != "A" {
+		t.Errorf("children[slice0] = %+v, want implement_failure_category A", got0)
+	}
+	for _, want := range []string{kids[0].String(), "category A", "Do NOT cancel the dependents", "re-invoke fishhawk_await_children"} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("message %q missing %q", out.Message, want)
+		}
+	}
+}
+
+// TestAwaitChildren_FailedSliceWithInFlightIndependentSiblingWaits (approval
+// condition C4): an independent sibling still in flight can make progress, so
+// the wait stays armed; once it settles, the parked dependent releases
+// child_failed. MECHANISM: slice 1 is the only child that is neither terminal
+// nor failure-blocked; a predicate that skipped in-flight children would
+// release on the first await.
+func TestAwaitChildren_FailedSliceWithInFlightIndependentSiblingWaits(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, a, "A", "")
+	seedChildWithSlice(fb, b, "running", "running", 1, nil)
+	seedChildWithSlice(fb, c, "running", "awaiting_host_dispatch", 2, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout — an in-flight independent sibling can still progress", out.Status)
+	}
+
+	// The sibling settles: now nothing can progress, so the wait releases.
+	seedChildWithSlice(fb, b, "succeeded", "succeeded", 1, nil)
+	_, out2, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren (sibling settled): %v", err)
+	}
+	if out2.Status != "child_failed" {
+		t.Fatalf("status after the sibling settled = %q, want child_failed", out2.Status)
+	}
+	if len(out2.BlockedChildRunIDs) != 1 || out2.BlockedChildRunIDs[0] != c.String() {
+		t.Errorf("blocked_child_run_ids = %v, want [%s]", out2.BlockedChildRunIDs, c)
+	}
+}
+
+// TestAwaitChildren_FailedSliceTransitiveDependentsRelease: slice 2 depends
+// only on the non-failed slice 1, which depends on the failed slice 0, so the
+// failure blocks slice 2 transitively. MECHANISM: a direct-dependency-only
+// predicate leaves slice 2 unblocked and the call times out.
+func TestAwaitChildren_FailedSliceTransitiveDependentsRelease(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	stageA := seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, a, "C", "")
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, []int{0})
+	seedChildWithSlice(fb, c, "pending", "pending", 2, []int{1})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "child_failed" {
+		t.Fatalf("status = %q, want child_failed (slice 2 is blocked transitively through slice 1)", out.Status)
+	}
+	if strings.Join(out.BlockedChildRunIDs, ",") != b.String()+","+c.String() {
+		t.Errorf("blocked_child_run_ids = %v, want [%s %s]", out.BlockedChildRunIDs, b, c)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_retry_stage" || out.NextStep.Params["stage_id"] != stageA.String() {
+		t.Errorf("next_step = %+v, want fishhawk_retry_stage {stage_id: %s} (category C)", out.NextStep, stageA)
+	}
+}
+
+// TestAwaitChildren_FailedSliceBesideIntegrationWaitingSiblingWaits: slice 2's
+// only dependency (slice 1) SUCCEEDED but is not yet integrated — it becomes
+// dispatchable after the server's between-wave integration, so progress is
+// possible and the wait stays armed. MECHANISM: treating an uncovered (but not
+// failed) dependency as failure-blocking would release child_failed here.
+func TestAwaitChildren_FailedSliceBesideIntegrationWaitingSiblingWaits(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, a, "A", "")
+	seedChildWithSlice(fb, b, "succeeded", "succeeded", 1, nil)
+	seedChildWithSlice(fb, c, "running", "awaiting_host_dispatch", 2, []int{1})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout — slice 2 waits only on the between-wave integration, not on the failure", out.Status)
+	}
+}
+
+// seedChildFailedFixture seeds a parent whose slice 0 child is in runState with
+// its implement stage at stageState (stamped with category/reason), plus one
+// slice-1 dependent parked at awaiting_host_dispatch. Returns the parent, the
+// failed child and its implement stage id.
+func seedChildFailedFixture(t *testing.T, fb *fakeBackend, runState, stageState, category, reason string) (uuid.UUID, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	stageA := seedChildWithSlice(fb, a, runState, stageState, 0, nil)
+	setChildImplementFailure(fb, a, category, reason)
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	return parent, a, stageA
+}
+
+// TestAwaitChildren_ChildFailedNextStepPerCategory pins every next_step mode of
+// the child_failed release, with its pre-filled params. MECHANISM: the
+// fixtures differ only in the failed child's run state and implement stage, so
+// a constant next_step cannot satisfy both the retry/resume rows and the
+// get_run_status rows.
+func TestAwaitChildren_ChildFailedNextStepPerCategory(t *testing.T) {
+	cases := []struct {
+		name       string
+		runState   string
+		stageState string
+		category   string
+		reason     string
+		stagesFail bool
+		wantAction string
+		// wantParam names the param that must carry the expected id: "stage_id"
+		// (the failed stage) or "parent_run_id"/"run_id" (the failed child).
+		wantParam    string
+		wantStageID  bool
+		wantCategory string
+		wantInReason []string
+	}{
+		{name: "category A retries the stage", runState: "failed", stageState: "failed", category: "A",
+			wantAction: "fishhawk_retry_stage", wantParam: "stage_id", wantStageID: true, wantCategory: "A"},
+		{name: "category C retries the stage", runState: "failed", stageState: "failed", category: "C",
+			wantAction: "fishhawk_retry_stage", wantParam: "stage_id", wantStageID: true, wantCategory: "C"},
+		{name: "category D retries the stage", runState: "failed", stageState: "failed", category: "D",
+			wantAction: "fishhawk_retry_stage", wantParam: "stage_id", wantStageID: true, wantCategory: "D"},
+		// The fixture Run carries NO parent_run_id (seedChildWithSlice never sets
+		// one), so the B mapping can only come from the arm's constructed
+		// decomposition-child Run. The reason carries neither the conflict nor
+		// the give-up prefix.
+		{name: "category B resumes the child in place", runState: "failed", stageState: "failed", category: "B",
+			reason:     "scope violation: wrote an undeclared path",
+			wantAction: "fishhawk_resume_run", wantParam: "parent_run_id", wantCategory: "B"},
+		{name: "cancelled run with a cancelled stage reads the child", runState: "cancelled", stageState: "cancelled",
+			wantAction: "fishhawk_get_run_status", wantParam: "run_id",
+			wantInReason: []string{"cancelled", "re-planned or the item restarted"}},
+		{name: "unreadable stage reads the child", runState: "failed", stageState: "failed", category: "A", stagesFail: true,
+			wantAction: "fishhawk_get_run_status", wantParam: "run_id"},
+		// Approval condition C1: a category-B stage carrying the
+		// slice-integration-conflict prefix maps (in the shared table) to a
+		// PARENT-shaped resume with a field-path-pointer param; the give-up
+		// prefix maps to fishhawk_start_run. Neither may surface here.
+		{name: "C1 slice-integration-conflict prefix falls back to get_run_status", runState: "failed", stageState: "failed", category: "B",
+			reason:     sliceIntegrationConflictReasonPrefix + " slice 0 could not merge",
+			wantAction: "fishhawk_get_run_status", wantParam: "run_id", wantCategory: "B"},
+		{name: "C1 slice-integration give-up prefix falls back to get_run_status", runState: "failed", stageState: "failed", category: "B",
+			reason:     sliceIntegrationGiveUpReasonPrefix + " after 5 attempts",
+			wantAction: "fishhawk_get_run_status", wantParam: "run_id", wantCategory: "B"},
+		// Approval condition C2: a CANCELLED run whose implement stage failed
+		// category A must NOT be pointed at fishhawk_retry_stage — the run
+		// cannot be retried. Without the cancelled branch the stage's category
+		// would route it to retry_stage.
+		{name: "C2 cancelled run with a failed category-A stage reads the child", runState: "cancelled", stageState: "failed", category: "A",
+			wantAction: "fishhawk_get_run_status", wantParam: "run_id", wantCategory: "A",
+			wantInReason: []string{"cancelled", "re-planned or the item restarted"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fb, r := newAwaitResolver(t)
+			parent, child, stageID := seedChildFailedFixture(t, fb, c.runState, c.stageState, c.category, c.reason)
+			if c.stagesFail {
+				fb.mu.Lock()
+				fb.stagesStatusByRun[child] = 500
+				fb.mu.Unlock()
+			}
+
+			_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+			if err != nil {
+				t.Fatalf("awaitChildren: %v", err)
+			}
+			if out.Status != "child_failed" {
+				t.Fatalf("status = %q, want child_failed", out.Status)
+			}
+			if out.NextStep == nil {
+				t.Fatal("child_failed release carried no next_step")
+			}
+			if out.NextStep.Action != c.wantAction {
+				t.Fatalf("next_step = %+v, want action %s", out.NextStep, c.wantAction)
+			}
+			want := child.String()
+			if c.wantStageID {
+				want = stageID.String()
+			}
+			if got := out.NextStep.Params[c.wantParam]; got != want {
+				t.Errorf("next_step.params[%s] = %q, want %q (params %v)", c.wantParam, got, want, out.NextStep.Params)
+			}
+			for k, v := range out.NextStep.Params {
+				if strings.Contains(v, "recent_audit[") {
+					t.Errorf("next_step param %s = %q is a field-path pointer — it must never surface on child_failed", k, v)
+				}
+			}
+			for _, w := range c.wantInReason {
+				if !strings.Contains(out.NextStep.Reason, w) {
+					t.Errorf("next_step.reason %q missing %q", out.NextStep.Reason, w)
+				}
+			}
+			if got := failureCategoryOf(out.Children, child.String()); got != c.wantCategory {
+				t.Errorf("children[%s].implement_failure_category = %q, want %q", child, got, c.wantCategory)
+			}
+		})
+	}
+}
+
+// failureCategoryOf returns the implement_failure_category the snapshot
+// carries for runID ("" when absent).
+func failureCategoryOf(cs *ChildrenStatus, runID string) string {
+	if cs == nil {
+		return ""
+	}
+	for _, c := range cs.Children {
+		if c.RunID == runID {
+			return c.ImplementFailureCategory
+		}
+	}
+	return ""
+}
+
+// TestAwaitChildren_AllTerminalWithFailedDependencyStaysChildrenFailed
+// (approval condition C4 / AC3): an all-terminal fan-out keeps releasing the
+// existing children_failed, never child_failed, even when a dependency edge
+// points at the failed slice. MECHANISM: with every child terminal the
+// child_failed arm's non-terminal set is empty; without the len(N) > 0 guard
+// the arm (which runs before arm 4) would release child_failed.
+func TestAwaitChildren_AllTerminalWithFailedDependencyStaysChildrenFailed(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b := uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, a, "A", "")
+	seedChildWithSlice(fb, b, "cancelled", "cancelled", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_failed" {
+		t.Fatalf("status = %q, want children_failed — an all-terminal fan-out stays arm (4)'s release", out.Status)
+	}
+	if strings.Join(out.FailedChildRunIDs, ",") != a.String()+","+b.String() {
+		t.Errorf("failed_child_run_ids = %v, want [%s %s]", out.FailedChildRunIDs, a, b)
+	}
+	if len(out.BlockedChildRunIDs) != 0 {
+		t.Errorf("blocked_child_run_ids = %v, want none on children_failed", out.BlockedChildRunIDs)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != a.String() {
+		t.Errorf("next_step = %+v, want fishhawk_get_run_status on slice 0 (%s)", out.NextStep, a)
+	}
+}
+
+// TestAwaitChildren_FailedSliceBesideDispatchableSiblingReleasesDispatchable is
+// a behavioural pin with NO counterfactual claim: a dispatchable sibling is
+// progress, so children_dispatchable wins. On a well-formed snapshot the two
+// predicates are mutually exclusive (a dispatchable child is undispatched AND
+// covered, so it is never failure-blocked, and its presence falsifies
+// child_failed), so the arm ORDER is not independently verifiable.
+func TestAwaitChildren_FailedSliceBesideDispatchableSiblingReleasesDispatchable(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+	setChildImplementFailure(fb, a, "A", "")
+	seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, nil)
+	seedChildWithSlice(fb, c, "running", "awaiting_host_dispatch", 2, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "children_dispatchable" {
+		t.Fatalf("status = %q, want children_dispatchable — a progressable sibling wins", out.Status)
+	}
+	if len(out.DispatchableChildRunIDs) != 1 || out.DispatchableChildRunIDs[0] != b.String() {
+		t.Errorf("dispatchable = %v, want [%s]", out.DispatchableChildRunIDs, b)
+	}
+}
+
+// TestAwaitChildrenFailureBlockedIsPure exercises the child_failed predicate
+// directly over hand-built snapshots, including every fail-closed case.
+func TestAwaitChildrenFailureBlockedIsPure(t *testing.T) {
+	failed0 := ChildStatus{RunID: "r0", SliceIndex: 0, State: "failed", ImplementStageState: "failed"}
+	parked := func(id string, slice int, deps ...int) ChildStatus {
+		return ChildStatus{RunID: id, SliceIndex: slice, State: "running", ImplementStageState: "awaiting_host_dispatch", DependsOn: deps}
+	}
+	cases := []struct {
+		name        string
+		children    []ChildStatus
+		wantFailed  []string
+		wantBlocked []string
+	}{
+		{
+			name:        "issue scenario releases",
+			children:    []ChildStatus{failed0, parked("r1", 1, 0), parked("r2", 2, 0)},
+			wantFailed:  []string{"r0"},
+			wantBlocked: []string{"r1", "r2"},
+		},
+		{
+			name: "in-flight independent sibling does not release",
+			children: []ChildStatus{failed0, parked("r2", 2, 0),
+				{RunID: "r1", SliceIndex: 1, State: "running", ImplementStageState: "running"}},
+		},
+		{
+			name: "transitive chain releases",
+			children: []ChildStatus{failed0, parked("r1", 1, 0),
+				{RunID: "r2", SliceIndex: 2, State: "pending", ImplementStageState: "pending", DependsOn: []int{1}}},
+			wantFailed:  []string{"r0"},
+			wantBlocked: []string{"r1", "r2"},
+		},
+		{
+			name:        "cancelled failed child releases",
+			children:    []ChildStatus{{RunID: "r0", SliceIndex: 0, State: "cancelled", ImplementStageState: "cancelled"}, parked("r1", 1, 0)},
+			wantFailed:  []string{"r0"},
+			wantBlocked: []string{"r1"},
+		},
+		{
+			// r1 and r2 depend only on each other — never on the failed r0 — so
+			// the cycle must resolve false rather than read as blocked.
+			name:     "dependency cycle beside a failed child does not release",
+			children: []ChildStatus{failed0, parked("r1", 1, 2), parked("r2", 2, 1)},
+		},
+		{
+			name:     "dependency on a not-minted slice does not release",
+			children: []ChildStatus{failed0, parked("r1", 1, 7)},
+		},
+		{
+			name: "unknown-state child with an empty stage does not release",
+			children: []ChildStatus{failed0, parked("r1", 1, 0),
+				{RunID: "r2", SliceIndex: 2, State: "unknown"}},
+		},
+		{
+			// Approval condition C3: the GetRun failed, so the child's run state
+			// is unknown — it fails closed whatever its readable implement
+			// stage says, even awaiting_host_dispatch on the failed slice.
+			name: "C3 unknown-state child with a readable parked stage on the failed slice does not release",
+			children: []ChildStatus{failed0, parked("r1", 1, 0),
+				{RunID: "r2", SliceIndex: 2, State: "unknown", ImplementStageState: "awaiting_host_dispatch", DependsOn: []int{0}}},
+		},
+		{
+			name: "failure-dependent child with an empty stage does not release",
+			children: []ChildStatus{failed0,
+				{RunID: "r1", SliceIndex: 1, State: "running", DependsOn: []int{0}}},
+		},
+		{
+			name: "all terminal does not release (arm 4's territory)",
+			children: []ChildStatus{failed0,
+				{RunID: "r1", SliceIndex: 1, State: "cancelled", ImplementStageState: "cancelled", DependsOn: []int{0}}},
+		},
+		{
+			name: "no failed child does not release",
+			children: []ChildStatus{{RunID: "r0", SliceIndex: 0, State: "succeeded", ImplementStageState: "succeeded"},
+				parked("r1", 1, 0)},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			failed, blocked := awaitChildrenFailureBlocked(&ChildrenStatus{Children: c.children})
+			if strings.Join(failed, ",") != strings.Join(c.wantFailed, ",") ||
+				strings.Join(blocked, ",") != strings.Join(c.wantBlocked, ",") {
+				t.Errorf("awaitChildrenFailureBlocked = (%v, %v), want (%v, %v)", failed, blocked, c.wantFailed, c.wantBlocked)
+			}
+		})
+	}
+}

@@ -1,7 +1,9 @@
 # backend/internal/timescale
 
 Test-support timing multiplier for wall-clock boundary-timeout tests (#1984,
-guarding the #1805 pipe-leak group-kill family).
+guarding the #1805 pipe-leak group-kill family), plus `SpawnGate`, a
+spawn-gated deadline for the same family (#4177). Everything here is test
+support: only `_test.go` files import it.
 
 ## Why
 
@@ -21,6 +23,13 @@ by one factor, so every discrimination ratio (`bound/deadline`, `wedge/bound`,
 `long-grace/bound`) is preserved by construction while the family gains headroom
 on CI-class hardware.
 
+Scaling did **not** fix that 30.31s failure, though (#4177). It recurred in the
+runner's gate container, where `CI` is unset and the factor is therefore `1`,
+under a full `-race` module loop: the raw 300ms deadline still started at call
+time and still raced fork/exec. Scaling widens a margin only where the factor is
+above 1; it cannot separate a deadline whose expiry is the verdict from a spawn
+that must complete first. That separation is `SpawnGate` (below).
+
 ## Contract
 
 - `Factor() int` — the timing multiplier.
@@ -34,6 +43,84 @@ on CI-class hardware.
     `1000` cap keeps `D`'s output far inside `time.Duration`'s int64 range so a
     huge value can never wrap to a misleadingly short or negative duration.
 - `D(base time.Duration) time.Duration` — returns `base * Factor()`.
+
+- `SpawnGate` — see the next section.
+- `WritePidFile(path, pid)` (atomic: write `path+".tmp"`, then `os.Rename`),
+  `ReadPidFile(path) (int, bool)` (`true` only for a positive integer) and
+  `PidFileReady(path) func() bool` — the shared pid-file helpers the fakes and
+  the gate use.
+
+## When scaling is not enough: SpawnGate (#4177, #3587 class)
+
+A boundary-timeout test has two deadline ROLES, and one raw
+`context.WithTimeout` started at call time conflates them:
+
+- the **cheap deadline**, whose expiry IS the verdict under test (the 300ms /
+  200ms deadline that fires the group kill or the WaitDelay path);
+- the **spawn budget**, a must-complete window for the precondition the verdict
+  depends on (the fake CLI has fork/exec'd the grandchild that holds the pipe).
+
+When the cheap deadline also has to cover spawn, a loaded host fires the group
+kill before the grandchild exists, and the test fails 30s later on a symptom
+("grandchild never wrote its pid") that reads as a defect in the control under
+test. This is the #3587 class; `timescale` scaling does not fix it.
+
+`NewSpawnGate(spawnBudget, deadline, ready)` returns a `context.Context` that
+separates them:
+
+- It polls `ready()` immediately and then every unscaled 20ms. Once `ready()`
+  is true it records `ArmedAt()` and arms a **real stdlib**
+  `context.WithTimeout(deadline)`, so the expiry is a genuine
+  `context.DeadlineExceeded`.
+- The spawn budget is generous (`D(10s)` in the fixtures, more than 30x the
+  cheap deadline). It costs nothing on the happy path, because the gate arms
+  the moment the precondition holds. Exhausting it ends the gate with
+  `DeadlineExceeded` (so the code under test unblocks) and flags it.
+- `RequireArmed(t)` returns the arm instant, or fails the test with a
+  `PRECONDITION (#4177)` message naming the spawn budget and host load or a
+  fork/exec failure, and saying it is NOT a defect in the control under test.
+  Call it right after the call under test returns and **before** any
+  behavioral assertion.
+- `Err()` is nil until `Done()` is closed and non-nil once it is: every
+  finishing path sets the error before `close(done)` inside one critical
+  section. A stdlib context derived from a non-stdlib parent reads
+  `parent.Err()` right after `parent.Done()` and panics on nil, so the
+  ordering is load-bearing (`TestSpawnGate_ErrNilUntilDone` goes red under
+  `-race` without it).
+- `Deadline()` reports construction + spawn budget + deadline, a conservative
+  upper bound rather than the instant `Done` fires. The review adapters read
+  only its presence bit, so they add no `cfg.Timeout` overlay.
+- `Stop()` (idempotent; register it with `t.Cleanup`) ends the gate with
+  `context.Canceled` and waits for the watcher goroutine.
+
+How the #1805 fixtures use it (claudecode, codex, procgroup):
+
+- **The fake records the grandchild pid itself, right after
+  `exec.Cmd.Start`, with `WritePidFile`.** `Start` returns only once the child
+  has exec'd, so a recorded pid proves the grandchild exists and holds the
+  inherited stdout (and, in the escape mode, has already left the group). This
+  removes grandchild runtime-init latency from the precondition. The atomic
+  rename is defense in depth against a partial read and has no deterministic
+  counterfactual.
+- **Elapsed bounds are measured from the arm instant**, not from the call, so
+  a slow spawn cannot eat the `D(3s)` / `D(5s)` bound.
+- **Escape arms need grace much larger than the deadline.** `os/exec` starts the
+  `WaitDelay` timer when `Wait` observes the child's exit, and the escape fake
+  exits right after it records the pid, i.e. near the arm instant. The gated
+  deadline must still fire before exit + grace for the trigger to be the
+  deadline. The margin: arm-to-exit latency (armedAt minus the fake's exit)
+  must stay below `escapeGrace() - deadline`. The fixtures use
+  `escapeGrace() = 10 * deadline` (1.8s of margin at factor 1); do not shrink it
+  back toward the deadline. A failing escape case logs armedAt minus the
+  fake's exit.
+- **Margin pin.** Each package has a test (`TestReviewer_PipeLeakToleratesSlowSpawn`,
+  `TestInference_PipeLeakToleratesSlowSpawn`, `TestHarden_ToleratesSlowSpawn`)
+  that runs the same cases with the fake sleeping `D(1s)` before it forks,
+  between the old cheap deadline and the spawn budget. It asserts both
+  inequalities as preconditions and must pass under the gate. Its negative
+  old-shape arm runs the same slow fixture under a plain
+  `context.WithTimeout(cheap deadline)` and asserts the pid is never recorded:
+  the old deadline kills the fake during its pre-spawn sleep.
 
 ## What to scale (and what not to)
 
