@@ -93,6 +93,12 @@ type mergeRunResponse struct {
 //   - 409 when the run is failed or cancelled (terminal-not-succeeded);
 //   - 409 when the acceptance gate does not admit a merge (pending / failed /
 //     settled-outcome-unknown / read error — ADR-049 decision #6);
+//   - 409 acceptance_stale (#4086) when the acceptance stage carries a
+//     stage-scoped acceptance_reopened entry newer than the newest recorded
+//     outcome — the gate above still reads that stale outcome as merge-eligible.
+//     It names the verified and current heads and the re-run verb, and an
+//     audit read error is a 500 with nothing recorded (fail-closed). It runs
+//     BEFORE the GateMerger guard because it needs no merge seam;
 //   - 503 when the merge seam (GateMerger) is unconfigured;
 //   - 409 merge_conflicting when the PR has a merge conflict against its base
 //     (E64.14 / #3109). This guard is BEST-EFFORT and FAIL-OPEN — it refuses
@@ -110,6 +116,12 @@ type mergeRunResponse struct {
 //     passing merge-candidate verify, and 502 merge_candidate_check_failed on
 //     a forge or audit read error once every anchor resolved. See
 //     mergeCandidateGate for the determinability ladder.
+//   - 409 approval_dismissed (#4086), AFTER the merge-candidate gate and
+//     BEFORE the verdict append: GitHub reports mergeable_state=="blocked", no
+//     reviewer's latest review is APPROVED and one is DISMISSED, so the queued
+//     merge would never fire. BEST-EFFORT and FAIL-OPEN like the conflict
+//     guard: every uncertainty (see approvalDismissedCheck) admits and is
+//     logged with its reason. A never-reviewed PR still queues.
 //
 // It deliberately does NOT block on a review stage parked at awaiting_approval:
 // in feature_change that stage settles ON merge via resolveReviewStageOnMerge,
@@ -268,6 +280,24 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stale-acceptance guard (#4086): the acceptance gate above reads the
+	// NEWEST recorded outcome, so after a fix-up push re-opened the stage it
+	// still admits on the stale `passed` verdict and the merge then times out
+	// behind a pending fishhawk_audit_complete. Refuse fast instead, naming
+	// both heads and the re-run verb. Placed BEFORE the GateMerger guard: it
+	// needs no merge seam, and both refusals record nothing. FAIL-CLOSED on an
+	// audit read error (500, nothing recorded), like the acceptance gate.
+	stale, serr := s.acceptanceStaleRefusal(r.Context(), runRow, stages)
+	if serr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"read acceptance re-open history failed", map[string]any{"error": serr.Error()})
+		return
+	}
+	if stale != nil {
+		s.writeMergeReadinessRefusal(w, r, runID, prURL, stale)
+		return
+	}
+
 	// Fail-closed guard: the merge seam must be configured BEFORE any write, so
 	// a merge that can never be dispatched never records a verdict.
 	if s.cfg.GateMerger == nil {
@@ -308,6 +338,24 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	if gate := s.mergeCandidateGate(r.Context(), runRow); !gate.admits() {
 		s.writeMergeCandidateRefusal(w, r, runID, prURL, gate)
 		return
+	}
+
+	// Dismissed-approval precondition (#4086): a vouch commit, fix-up push or
+	// rebase can dismiss the PR's approval, after which GitHub reports the PR
+	// blocked and the queued merge never fires. AFTER the merge-candidate gate
+	// and BEFORE the verdict append, so that merge records no verdict.
+	// BEST-EFFORT / FAIL-OPEN like the conflict guard: every uncertainty admits
+	// and is logged with its reason (see approvalDismissedCheck).
+	approval := s.approvalDismissedCheck(r.Context(), runRow)
+	if approval.Refusal != nil {
+		s.writeMergeReadinessRefusal(w, r, runID, prURL, approval.Refusal)
+		return
+	}
+	if !approval.Determined {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+			"merge: approval-dismissed check undetermined; proceeding (fail open)",
+			slog.String("run_id", runID.String()),
+			slog.String("undetermined", approval.Undetermined))
 	}
 
 	// Idempotence on the ENDPOINT (binding condition 1): an existing
@@ -764,6 +812,18 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 		}
 	}
 	return mergeCandidateGateResult{}
+}
+
+// writeMergeReadinessRefusal renders a merge-readiness blocker (#4086) as a 409
+// carrying run_id, pr_url and the refusal's details.
+func (s *Server) writeMergeReadinessRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, ref *mergeReadinessRefusal) {
+	details := map[string]any{"run_id": runID.String(), "pr_url": prURL}
+	for k, v := range ref.Details {
+		details[k] = v
+	}
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: merge-readiness check refused before verdict",
+		slog.String("run_id", runID.String()), slog.String("code", ref.Code))
+	s.writeError(w, r, http.StatusConflict, ref.Code, ref.Message, details)
 }
 
 // writeMergeCandidateRefusal renders a refused mergeCandidateGate on the
