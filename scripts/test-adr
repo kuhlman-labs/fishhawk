@@ -140,6 +140,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot=$(mktemp -d)
 trap 'rm -rf "$tmproot"' EXIT
 
@@ -307,7 +313,7 @@ expect_only() {
   fi
   local n
   for n in "$@"; do
-    if ! printf '%s\n' "$out" | grep -F -- "[$cls]" | grep -qF -- "$n"; then
+    if ! printf '%s\n' "$out" | grep -F -- "[$cls]" | grep_q -F -- "$n"; then
       fail "$c: no [$cls] line names '$n'; output: $out"; return
     fi
   done
@@ -320,7 +326,7 @@ expect_only() {
 expect_has() {
   if [ "$status" -ne 1 ]; then
     fail "$1: exited $status (expected 1); output: $out"
-  elif ! printf '%s\n' "$out" | grep -F -- "[$2]" | grep -qF -- "$3"; then
+  elif ! printf '%s\n' "$out" | grep -F -- "[$2]" | grep_q -F -- "$3"; then
     fail "$1: no [$2] line names '$3'; output: $out"
   else
     pass "$1"
@@ -331,7 +337,7 @@ expect_has() {
 expect_ok() {
   if [ "$status" -ne 0 ]; then
     fail "$1: exited $status (expected 0); output: $out"
-  elif ! printf '%s\n' "$out" | grep -qF -- "$2"; then
+  elif ! printf '%s\n' "$out" | grep_q -F -- "$2"; then
     fail "$1: output lacks '$2'; output: $out"
   else
     pass "$1"
@@ -460,7 +466,7 @@ echo "not a dir" > "$tmproot/h19-file"
 run_check "$tmproot/h19-file"
 if [ "$status" -ne 2 ]; then
   fail "h19: ADR_DIR as a regular file exited $status (expected 2); output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+elif ! printf '%s\n' "$out" | grep_q 'FAILED'; then
   fail "h19: no FAILED reason printed; output: $out"
 else
   pass "h19: a failed enumeration exits 2 with a reason"
@@ -485,7 +491,7 @@ if [ "$status" -ne 1 ]; then
   fail "h21: --write-index with an invalid record exited $status (expected 1); output: $out"
 elif ! cmp -s "$d/index.json" "$tmproot/h21-index.before"; then
   fail "h21: --write-index rewrote index.json despite refusing; output: $out"
-elif ! printf '%s\n' "$out" | grep -q 'refusing to write'; then
+elif ! printf '%s\n' "$out" | grep_q 'refusing to write'; then
   fail "h21: no refusal reason printed; output: $out"
 else
   pass "h21: --write-index refuses (exit 1) and leaves index.json byte-identical"
@@ -501,9 +507,9 @@ h22out="$(
   _verify_adr_records 2>&1
   printf 'STATUS=%s\n' "$?"
 )"
-if ! printf '%s\n' "$h22out" | grep -q 'STATUS=0'; then
+if ! printf '%s\n' "$h22out" | grep_q 'STATUS=0'; then
   fail "h22: _verify_adr_records did not return 0 with the gate absent; output: $h22out"
-elif ! printf '%s\n' "$h22out" | grep -q 'missing or not executable'; then
+elif ! printf '%s\n' "$h22out" | grep_q 'missing or not executable'; then
   fail "h22: _verify_adr_records printed no skip reason; output: $h22out"
 else
   pass "h22: verify skips the ADR gate with a reason when check-adr is absent"
@@ -557,13 +563,13 @@ run_check "$d"; expect_only "h30d: duplicate path entry" C-index "duplicate entr
 # --- h31: unreadable / unwritable index.json -> exit 2 --------------------------
 d="$(fixture h31)"; rm "$d/index.json"; mkdir "$d/index.json"
 run_check "$d"
-if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep_q 'FAILED'; then
   fail "h31a: index.json unreadable (a directory) exited $status (expected 2 + FAILED); output: $out"
 else
   pass "h31a: a failed index read exits 2 with a reason"
 fi
 run_check --write-index "$d"
-if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep_q 'FAILED'; then
   fail "h31b: --write-index onto an unwritable index exited $status (expected 2 + FAILED); output: $out"
 elif [ -e "$d/index.json.tmp" ]; then
   fail "h31b: --write-index left index.json.tmp behind"

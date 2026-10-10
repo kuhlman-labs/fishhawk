@@ -11,8 +11,9 @@ here for the mechanism, residuals and issue history.
 verify lock" below), then runs, in order: `cmd_lint`, the ARCHITECTURE.md
 doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
 gate, the site IA gate, the ADR record gate, the gate-image pin check
-(`_verify_gate_image_pins`, E51.17), and finally the test loop (scoped, or full
-with the patch-scoped coverage gate folded in). It omits the AGGREGATE
+(`_verify_gate_image_pins`, E51.17), the pipefail grep guard
+(`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), and finally
+the test loop (scoped, or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
 loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
 The legs stay inline in `cmd_verify`: `scripts/test-patch-coverage` (a) and
@@ -782,7 +783,8 @@ what produces the saving (`>>> ./cli (no scoped packages — skipped)`).
 
 **Unchanged in scoped mode**, deliberately: `cmd_lint`, the ARCHITECTURE.md
 doc-line budget, the schema-sync drift check, `_verify_gate_harnesses`, the site
-voice gate and the site IA gate. Those are the agent's fastest lint/format
+voice gate, the site IA gate, the ADR record gate, the gate-image pin check and
+the pipefail grep guard. Those are the agent's fastest lint/format
 feedback, and skipping them would trade a real in-loop signal for a second or
 two. The cost is that a passing first iteration pays those legs twice (once
 scoped, once in the full re-verify) — see the PR notes on #3315 for the measured
@@ -1921,10 +1923,14 @@ cache entries each run; the standard library and module-cache dependencies are
 still shared. A two-path planning experiment against one fresh shared GOCACHE
 added 18 entries for the second path without `-trimpath` and 2 with it. Go's own
 trim evicts only entries unused for 5 days, so the host cache reached 531 GB.
-`-trimpath` is deliberately NOT adopted: about 30 test files anchor fixtures on
-`runtime.Caller(0)`, which it rewrites; the patch-coverage loop's `-coverpkg` set
-differs per diff, so those builds miss regardless of path; and the container
-gate already builds at a fixed `/work` in a per-process volume removed at exit.
+`-trimpath` is not adopted YET. Its original blocker — about 30 test files
+anchoring fixtures on `runtime.Caller(0)`, whose file name `-trimpath` makes
+module-relative — is removed by #4179: every test package now anchors on an
+init-captured `pkgSrcDir`, and `backend/internal/testanchor` fails verify on any
+new file-bound `runtime.Caller`. Adopting `-trimpath` for agent builds is the
+follow-up. Even then, the patch-coverage loop's `-coverpkg` set differs per diff,
+so those builds miss regardless of path; and the container gate already builds
+at a fixed `/work` in a per-process volume removed at exit.
 
 **The trim (`_gocache_trim`).** It reproduces cmd/go's own `DiskCache.Trim`
 (`src/cmd/go/internal/cache/cache.go`): delete the `<2hex>/<hash>-a` / `-d`
@@ -2903,6 +2909,107 @@ reasoned about — each deletion restored byte-identically afterwards:
 pages (proving they still pass it). Both are bash, so neither needs the
 zsh guard `test-dev` carries. Long-form site contract: `site/README.md`.
 
+## Pipefail grep guard ([#4233](https://github.com/kuhlman-labs/fishhawk/issues/4233))
+
+**Mechanism.** `grep -q` exits on its first match and closes the read end of
+its pipe. A writer that still has bytes to write then gets EPIPE/SIGPIPE, and
+`pipefail` turns that into a pipeline FAILURE even though grep MATCHED. Below
+the pipe buffer it never fires; above it a first-line match fails every time
+(measured 20/20 at a haystack of >= 100 KiB on macOS bash 3.2 + `/usr/bin/grep`,
+and >= 160 KiB in the gate image, bash 5.2 + GNU grep 3.8). So
+`if ! printf '%s' "$list" | grep -Fxq -- "$x"` reports a false negative once
+`$list` outgrows the buffer: that is how `scripts/check-site-ia` reported false
+IA violations and flaked verify.
+
+**The rule.** Never pipe into a quiet grep in a script that enables
+`pipefail`. Use one of two forms:
+
+- **A here-string**, `grep -Fxq -- "$x" <<< "$list"`. There is no writer
+  process, so there is nothing to EPIPE. Production scripts
+  (`check-site-ia`, `check-gate-image`, `dev`) use this form.
+- **The pipe-only drain helper** the verify harnesses define, exactly
+  `grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }`.
+  It keeps the read end open and drains stdin after grep decides, so it works
+  whatever the writer is (`typeset -f`, `_usage 2>&1`, a chained grep). It keeps
+  `grep -q`'s exit status, including under `set -e` and inside `if !`.
+  **Pipe-only:** with a terminal on stdin the drain blocks, and with an infinite
+  writer (`yes |`) it never returns. Each of the 13 harnesses defines its own
+  copy; there is no sourced library, because a sourced path adds a resolution
+  failure mode.
+
+Dropping `-q` for `>/dev/null` was rejected. It did not reproduce EPIPE on
+either grep, but that depends on each grep's internal input handling. The two
+forms above are correct by construction.
+
+**`scripts/check-pipefail-grep [SCRIPTS_DIR]`** (default `<repo>/scripts`) is
+the guard. `scripts/test verify` runs it over the committed tree as
+`_verify_pipefail_grep`, right after `_verify_gate_image_pins` and BEFORE the
+`--no-tests` return, so `verify --no-tests` and `--in-gate-image` run it too.
+The leg skips with a printed reason when the script is missing or not
+executable, which keeps fixture ROOTs from running it. The guard scans the
+directory's top-level regular files with a shell glob, so there is no
+failed-walk mode. A file counts as a shell script only when its shebang names
+`sh`, `bash` or `zsh`, and a whole-line comment is never a finding. Each
+finding prints `<path>:<line>: <rule>: <text>`. The rules:
+
+1. **Pipe rule.** This applies in a file that ENABLES PIPEFAIL: any non-comment
+   line containing `pipefail` or `pipe_fail` in any letter case, which covers
+   `set -euo pipefail` and zsh `setopt pipe_fail` / `PIPE_FAIL`. In such a file,
+   a non-comment line matching
+   `(^|[^|])\|[ \t]*(command[ \t]+)?[ef]?grep[ \t]([^|;&]*[ \t])?(-[A-Za-z]*q[A-Za-z]*|--quiet|--silent)([ \t]|$)`
+   is a finding. That is a single `|` (never `||`), then grep, egrep, fgrep or
+   `command grep`, then a quiet flag: `-q`, a cluster holding q, a later `-q`
+   token, `--quiet` or `--silent`.
+2. **Undefined-helper rule.** This applies in ANY shell file. A `grep_q` call in
+   COMMAND POSITION is a finding unless the same file defines the helper (a
+   `grep_q() {` or `function grep_q` line, before or after the call). Command
+   position means line start, or after `|`, `||`, `!`, `&&`, `&`, `;`, `(`,
+   `{`, or one of the keywords `then`, `do`, `if`, `elif`, `else`, `while`,
+   `until`. This rule exists because an undefined helper exits 127, so a negated
+   assertion (`if ! ... | grep_q ...`) would pass vacuously. A substring
+   (`mygrep_q`), an assignment (`x=grep_q`) or a string mention is not a call.
+3. **Reasonless marker.** An allow marker with no reason is itself a finding.
+
+**Allow marker.** A line ending in `# check-pipefail-grep: allow <reason>`, with a
+non-empty reason, is exempt from BOTH rule 1 and rule 2 on that line. Use it for
+a reviewed exception, such as a helper defined in a file this one sources, which
+a text scan cannot see. It covers only its own line.
+
+**Exit codes.** **0** means clean, or that SCRIPTS_DIR is missing (fail-open with a printed
+reason, mirroring `check-site-ia`). **1** means findings, every one reported before
+the single exit. **2** means the awk scan of a file FAILED (fail-closed: an
+unscanned file is not a clean one). The awk uses only `[ \t]` classes, and BSD
+awk and mawk 1.3.4 (the gate image) give identical results.
+
+**Limitations.** The guard is a text scan, not a shell parser. It MISSES a pipe
+at the end of one line with the quiet grep on the next, grep reached through a
+variable, an alias or a wrapper, pipefail enabled only in a sourced file, and a
+script with no shebang. It OVER-FLAGS matching text in a heredoc body, a string
+literal or a trailing `# ...` comment, and it treats any non-comment `pipefail`
+token, `set +o pipefail` included, as enabling. An over-flag takes the allow
+marker. A miss is for review to catch.
+
+**Testing.** `scripts/test-check-pipefail-grep` runs in `_verify_gate_harnesses`.
+It drives the real guard against temp-dir fixtures and asserts each case's exit
+code and named output. G1 is the pipe rule at path:line, and G2 is the same line
+without pipefail (clean). G3 is a comment, G4 is `||` (not a pipe), G5 the
+reasoned marker and G6 the reasonless one. G7 covers every quiet-flag spelling;
+G7n checks that non-quiet greps and a defined helper stay clean. G8 is zsh
+`setopt pipe_fail` / `PIPE_FAIL`. G9 is an undefined helper in each command
+position; G9n checks that non-call mentions stay clean, and G9b that the marker
+covers rule 2. G10 is a definition in either form, before or after the call. G11
+is the missing-dir fail-open, G12 a PATH-stub `awk` exiting 3 (exit 2), G16
+non-shell files skipped, and G17 every finding reported before one exit. G13
+EXECUTES every shipped copy of the helper: it extracts each
+definition, evaluates it in the file's own shell under pipefail, and pipes a
+512 KiB haystack whose first line matches (must return 0, and 1 on a miss).
+G14/G14b pin the `_verify_pipefail_grep` skip and failure propagation, and G15
+drives `cmd_verify --no-tests` with stubbed legs to show the leg runs after the
+gate-image pins and before the early return. The harness is itself a pipefail
+script under the guard, so it builds every seeded line from pieces (`$P` for the
+pipe, `$GQ` for the helper name) and asserts with here-strings. Its header
+records the observed RED of each counterfactual arm.
+
 ## Docs-site IA gate (E12.7 / [#2318](https://github.com/kuhlman-labs/fishhawk/issues/2318))
 
 The Starlight sidebar in `site/astro.config.mjs` is declared **explicitly**
@@ -2969,7 +3076,7 @@ warning lives in the `check-site-ia` script header.
 
 ### Testing
 
-`scripts/test-site-ia` runs eleven cases, one per named behavior: c1 consistent
+`scripts/test-site-ia` runs twelve cases, one per named behavior: c1 consistent
 → exit 0; c2 dangling sidebar slug → exit 1 (slug named); c3 orphaned page →
 exit 1 (path named); c4 both violations reported before one exit; c5 `.mdx`
 resolution ANCHORED by a second `.md` page so `page_count` stays non-zero,
@@ -2978,7 +3085,12 @@ instead of silently satisfying the empty-content fail-open; c6 group-landing
 `<slug>/index.md`; c7 missing content root → exit 0 with reason; c8 missing
 astro config → exit 0 with reason; c9 failed enumeration → exit 2, never a
 clean report; c10 the commented-out-slug parser-limitation pin; c11
-`_verify_site_ia` skips with a reason (return 0) when the gate is absent.
+`_verify_site_ia` skips with a reason (return 0) when the gate is absent; c12
+(#4233) the deterministic pin for both membership directions: about 360 pages
+whose slugs exceed 256 KiB in total, with the match on the FIRST line, so a
+membership test written as `printf "$list" | grep -q` (rather than the
+here-string the gate uses) EPIPEs its writer under `pipefail` and reports a
+false dangling slug or orphan (see "Pipefail grep guard" below).
 
 `scripts/test verify` runs BOTH: `test-site-ia` in `_verify_gate_harnesses`
 (proving the control still works), and `check-site-ia` itself via

@@ -34,6 +34,14 @@
 # the current explicit-literal sidebar in astro.config.mjs is what makes it work.
 # The same limitation is recorded in scripts/README.md's contract for this gate.
 #
+# MEMBERSHIP NEVER GOES THROUGH A PIPE (#4233). Each membership test is a
+# here-string (`grep -Fxq -- "$s" <<< "$list"`), never `printf "$list" | grep -q`:
+# under `pipefail`, `grep -q` exits on its first match and closes the pipe, the
+# writer gets EPIPE/SIGPIPE on its unwritten bytes, and the pipeline FAILS even
+# though grep matched — a false violation once the slug list outgrows the pipe
+# buffer. A here-string has no writer process. test-site-ia case c12 pins both
+# directions with >= 256 KiB lists matched on their first line.
+#
 # EXIT CODES: 0 = consistent (or a documented fail-open), 1 = violations found,
 # 2 = a FAILED page enumeration (distinct from 1 — a failed walk means we do not
 # KNOW what is there, so reporting a clean tree would silently bypass the gate).
@@ -106,7 +114,7 @@ violations=0
 # --- forward: every sidebar slug must resolve to a content page -----------------
 while IFS= read -r s; do
   [ -n "$s" ] || continue
-  if ! printf '%s' "$content_slugs" | grep -Fxq -- "$s"; then
+  if ! grep -Fxq -- "$s" <<< "$content_slugs"; then
     echo "check-site-ia: sidebar slug '$s' resolves to no content page under $CONTENT_ROOT"
     violations=$((violations + 1))
   fi
@@ -127,7 +135,7 @@ while IFS= read -r f; do
     */index) slug="${rel%/index}" ;;
     *) slug="$rel" ;;
   esac
-  if ! printf '%s\n' "$sidebar_slugs" | grep -Fxq -- "$slug"; then
+  if ! grep -Fxq -- "$slug" <<< "$sidebar_slugs"; then
     echo "check-site-ia: content page $f (slug '$slug') is not referenced by the sidebar"
     violations=$((violations + 1))
   fi

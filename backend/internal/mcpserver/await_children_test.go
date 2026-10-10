@@ -1253,6 +1253,82 @@ func TestAwaitChildren_NoIntegrationAuthority_FallsBackToSettled(t *testing.T) {
 	})
 }
 
+// seedTwoWaveLostFinalRecord builds the #4221 wedge BY CONSTRUCTION: a
+// two-wave fan-out (child a at slice 0, child b at slice 1 depending on slice
+// 0), both succeeded, the parent's implement stage succeeded, and only the
+// wave-0 slices_integrated (covering a) survives — the FINAL record covering
+// b was lost. It returns a and b.
+func seedTwoWaveLostFinalRecord(t *testing.T, fb *fakeBackend, parent uuid.UUID) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	a, b := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedChildWithSlice(fb, b, "succeeded", "succeeded", 1, []int{0})
+	seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+	seedSlicesIntegrated(t, fb, parent, "fishhawk/run-"+parent.String(), []string{a.String()})
+	seedParentImplementStage(fb, parent, "succeeded")
+	return a, b
+}
+
+// TestAwaitChildren_LostFinalRecordMultiWave_NamesIntegrateWave is the #4221
+// done-means: in a two-wave fan-out whose FINAL slices_integrated append was
+// lost (only the wave-0 record survives), with authority present and the
+// parent's implement stage succeeded, the verb must name the integrate-wave
+// recovery on the PARENT — not advise re-driving child b, which already
+// succeeded. MECHANISM: the surviving wave-0 record sets fanInRecorded, so the
+// pre-#4221 !fanInRecorded conjunct sent this snapshot to the generic
+// integration_pending arm (next_step on b, "re-drive or resume").
+func TestAwaitChildren_LostFinalRecordMultiWave_NamesIntegrateWave(t *testing.T) {
+	t.Run("authority available -> integrate-wave on the parent", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		_, b := seedTwoWaveLostFinalRecord(t, fb, parent)
+		seedParentSliceIntegration(fb, parent, &runSliceIntegration{Available: true})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" {
+			t.Fatalf("status = %q, want integration_pending", out.Status)
+		}
+		if len(out.UnintegratedChildRunIDs) != 1 || out.UnintegratedChildRunIDs[0] != b.String() {
+			t.Errorf("unintegrated_child_run_ids = %v, want [%s]", out.UnintegratedChildRunIDs, b)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != parent.String() {
+			t.Errorf("next_step = %+v, want fishhawk_get_run_status on the PARENT %s (not the already-succeeded child %s)", out.NextStep, parent, b)
+		}
+		for _, want := range []string{"/v0/runs/" + parent.String() + "/integrate-wave", "409 acceptance_integration_incomplete", "not_awaiting_children", b.String(), "re-invoke fishhawk_await_children", "final"} {
+			if !strings.Contains(out.Message, want) {
+				t.Errorf("message %q missing %q", out.Message, want)
+			}
+		}
+		if strings.Contains(out.Message, "re-drive") {
+			t.Errorf("message %q must not advise a re-drive: child %s already succeeded", out.Message, b)
+		}
+	})
+	t.Run("nil authority (older backend) keeps the generic re-drive arm", func(t *testing.T) {
+		// The generalisation still needs a POSITIVE authority signal: the same
+		// snapshot without capabilities.slice_integration is not the wedge.
+		fb, r := newAwaitResolver(t)
+		parent := uuid.New()
+		_, b := seedTwoWaveLostFinalRecord(t, fb, parent)
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_pending" {
+			t.Fatalf("status = %q, want integration_pending", out.Status)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_run_status" || out.NextStep.Params["run_id"] != b.String() {
+			t.Errorf("next_step = %+v, want the generic arm's fishhawk_get_run_status on the uncovered child %s", out.NextStep, b)
+		}
+		if !strings.Contains(out.Message, "re-drive or resume the uncovered child") || strings.Contains(out.Message, "integrate-wave") {
+			t.Errorf("message %q, want the generic re-drive advice without integrate-wave", out.Message)
+		}
+	})
+}
+
 // TestAwaitChildren_IntegrationFailed_PerCause pins one release per fan-in
 // failure cause (#4080). MECHANISM: every child is succeeded, so without the
 // failure arm the snapshot would release integration_pending — a different

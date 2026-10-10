@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -28,11 +27,7 @@ import (
 // marshals into gate_evidence.gate_isolation (#2135).
 func gateIsolationGolden(t *testing.T, class string) json.RawMessage {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the shared wire fixture path")
-	}
-	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
 	if err != nil {
 		t.Fatalf("read shared wire fixture: %v", err)
 	}

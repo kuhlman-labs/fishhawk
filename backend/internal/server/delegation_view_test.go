@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -33,11 +32,7 @@ import (
 // touch of the projection.
 func committedWorkflowSpec(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", ".fishhawk", "workflows.yaml")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "workflows.yaml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read the committed workflow spec: %v", err)

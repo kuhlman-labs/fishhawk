@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -18,6 +17,25 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization (#4179): `go test` runs the test binary from within the
+// package's source directory (go help testflag), and package-level variables
+// initialize before any test runs, so this holds even if a test later changes
+// the process cwd. Fixtures anchor here, never on runtime.Caller, whose file
+// name is module-relative under -trimpath and so misses every fixture. The
+// repo-wide guard is backend/internal/testanchor.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
 
 // fishhawk_delegation (E76.1 / #3747).
 
@@ -85,11 +103,7 @@ func toolMatrixByAction(m []delegationview.Action) map[string]delegationview.Act
 // projection, which is the strongest available form of "the same body".
 func committedDelegationView(t *testing.T) RepoDelegationResult {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", ".fishhawk", "workflows.yaml")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "workflows.yaml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read the committed workflow spec: %v", err)

@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -296,11 +295,7 @@ func (f *attnFixture) seedAllSixKinds(t *testing.T) {
 // attnGoldenPath resolves the shared wire golden the SPA's tests also read.
 func attnGoldenPath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "attention_list.json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "attention_list.json")
 }
 
 // TestAttention_EndToEnd_AllSixKinds drives the REAL mux (s.Handler(), bearer

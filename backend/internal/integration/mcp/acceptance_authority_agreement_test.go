@@ -224,6 +224,12 @@ func offersAcceptanceDispatchView(na *nextActionsView) bool {
 //     record integrate-wave would write then unwedges all three.
 //   - ARM B (no authority: Orchestrator nil, the identical snapshot): the
 //     server admits, so BOTH MCP surfaces must release.
+//   - ARM C (#4221, authority present): the same snapshot plus a surviving
+//     wave-0 slices_integrated covering only the first child — a multi-wave
+//     fan-out whose FINAL record was lost. The server's wavecoverage gate
+//     refuses 409 acceptance_integration_incomplete, so BOTH MCP surfaces must
+//     hold and name integrate-wave (never a re-drive of the already-succeeded
+//     second child); appending the full record unwedges all three.
 func TestAcceptanceAuthority_ServerAndMCPSurfacesAgree(t *testing.T) {
 	t.Parallel()
 	fx := newFixture(t)
@@ -296,6 +302,87 @@ func TestAcceptanceAuthority_ServerAndMCPSurfacesAgree(t *testing.T) {
 		}
 		if status, code := postOperator(t, ctx, hostDispatchURL, fx.operatorTok); code == "acceptance_integration_incomplete" {
 			t.Errorf("host-dispatch marker after the record = %d %q, want the gate to admit", status, code)
+		}
+	})
+
+	t.Run("C: authority present + wave-0 record only + succeeded parent holds everywhere", func(t *testing.T) {
+		snap := seedAuthoritySnapshot(t, ctx, fx.runRepo, auditRepo)
+		// The surviving between-wave record: it covers only the first child.
+		appendParentAudit(t, ctx, auditRepo, snap.parent.ID, "slices_integrated", map[string]any{
+			"consolidated_branch": "fishhawk/run-" + snap.parent.ID.String(),
+			"child_run_ids":       []string{snap.children[0].String()},
+		})
+		srv := server.New(server.Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      fx.runRepo,
+			AuditRepo:    auditRepo,
+			APITokenRepo: fx.apitokenRepo,
+			Orchestrator: &orchestrator.Orchestrator{Runs: fx.runRepo, Audit: auditRepo, GitHub: authorityOnlyGitHub{}},
+		})
+		url := mountServer(t, srv)
+		session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, url)
+		admissionURL := url + "/v0/stages/" + snap.accStage.ID.String() + "/acceptance-admission"
+		hostDispatchURL := url + "/v0/runs/" + snap.parent.ID.String() + "/stages/" + snap.accStage.ID.String() + "/host-dispatch"
+		integrateWave := "/v0/runs/" + snap.parent.ID.String() + "/integrate-wave"
+		uncovered := snap.children[1].String()
+
+		// (1) The server gate refuses the partial snapshot on both surfaces.
+		if status, code := postOperator(t, ctx, admissionURL, fx.operatorTok); status != http.StatusConflict || code != "acceptance_integration_incomplete" {
+			t.Fatalf("acceptance-admission = %d %q, want 409 acceptance_integration_incomplete", status, code)
+		}
+		if status, code := postOperator(t, ctx, hostDispatchURL, fx.operatorTok); status != http.StatusConflict || code != "acceptance_integration_incomplete" {
+			t.Fatalf("host-dispatch marker = %d %q, want 409 acceptance_integration_incomplete", status, code)
+		}
+
+		// (2) fishhawk_get_run_status HOLDS and names integrate-wave.
+		st := getAuthorityRunStatus(t, ctx, session, snap.parent.ID)
+		if st.NextActions == nil || st.NextActions.State != "acceptance_held_integration_incomplete" {
+			t.Fatalf("next_actions = %+v, want acceptance_held_integration_incomplete (the server refuses 409)", st.NextActions)
+		}
+		if offersAcceptanceDispatchView(st.NextActions) {
+			t.Errorf("next_actions still offers the acceptance dispatch the server refuses: %+v", st.NextActions.Actions)
+		}
+		first := st.NextActions.Actions[0]
+		if first.Action != "fishhawk_await_children" || !strings.Contains(first.Reason, integrateWave) || !strings.Contains(first.Reason, uncovered) {
+			t.Errorf("first action = %+v, want fishhawk_await_children naming %s and the uncovered child %s", first, integrateWave, uncovered)
+		}
+		if strings.Contains(first.Reason, "re-drive") {
+			t.Errorf("hold reason %q must not advise a re-drive: the uncovered child already succeeded", first.Reason)
+		}
+
+		// (3) fishhawk_await_children HOLDS on the PARENT and names
+		// integrate-wave, not a re-drive of the uncovered child.
+		aw := awaitChildrenE2E(t, ctx, session, snap.parent.ID)
+		if aw.Status != "integration_pending" {
+			t.Fatalf("await_children status = %q, want integration_pending (message %q)", aw.Status, aw.Message)
+		}
+		if !strings.Contains(aw.Message, integrateWave) {
+			t.Errorf("await message %q must name the integrate-wave recovery", aw.Message)
+		}
+		if strings.Contains(aw.Message, "re-drive") {
+			t.Errorf("await message %q must not advise a re-drive: the uncovered child already succeeded", aw.Message)
+		}
+		if aw.NextStep == nil || aw.NextStep.Action != "fishhawk_get_run_status" || aw.NextStep.Params["run_id"] != snap.parent.ID.String() {
+			t.Errorf("await next_step = %+v, want fishhawk_get_run_status on the parent (not the uncovered child)", aw.NextStep)
+		}
+
+		// (4) The full record integrate-wave would write unwedges all three.
+		appendParentAudit(t, ctx, auditRepo, snap.parent.ID, "slices_integrated", map[string]any{
+			"consolidated_branch": "fishhawk/run-" + snap.parent.ID.String(),
+			"child_run_ids":       []string{snap.children[0].String(), snap.children[1].String()},
+		})
+		st2 := getAuthorityRunStatus(t, ctx, session, snap.parent.ID)
+		if st2.NextActions == nil || st2.NextActions.State == "acceptance_held_integration_incomplete" || !offersAcceptanceDispatchView(st2.NextActions) {
+			t.Fatalf("next_actions after the full record = %+v, want the acceptance dispatch offered again", st2.NextActions)
+		}
+		if aw2 := awaitChildrenE2E(t, ctx, session, snap.parent.ID); aw2.Status != "children_settled" {
+			t.Errorf("await_children after the full record = %q, want children_settled", aw2.Status)
+		}
+		if status, code := postOperator(t, ctx, admissionURL, fx.operatorTok); code == "acceptance_integration_incomplete" {
+			t.Errorf("acceptance-admission after the full record = %d %q, want the gate to admit", status, code)
+		}
+		if status, code := postOperator(t, ctx, hostDispatchURL, fx.operatorTok); code == "acceptance_integration_incomplete" {
+			t.Errorf("host-dispatch marker after the full record = %d %q, want the gate to admit", status, code)
 		}
 	})
 

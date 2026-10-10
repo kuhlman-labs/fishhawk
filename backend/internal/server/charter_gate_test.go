@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -735,11 +734,7 @@ func TestCharterGate_CampaignSeam_NonGroomingWithoutCharter_Admits(t *testing.T)
 // regex misses an aliased receiver and a multi-line call), keyed by enclosing
 // function, and FAIL-CLOSED on a parse error.
 func TestCharterGate_EveryCreateRunForTriggerCallerIsGated(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed; cannot locate the backend module root")
-	}
-	root := filepath.Join(filepath.Dir(thisFile), "..", "..") // backend/
+	root := filepath.Join(pkgSrcDir, "..", "..") // backend/
 
 	// The gate calls that discharge the obligation. Both arms consume the same
 	// evaluateCharterAdmission core, so either satisfies it.
