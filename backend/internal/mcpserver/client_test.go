@@ -2975,6 +2975,33 @@ func TestRebaseRunBranch_Decodes200WithoutConflictResolution(t *testing.T) {
 	}
 }
 
+// TestRebaseRunBranch_DecodesPostMergeHeadRead pins the hand mirror of the
+// backend's #4199 post-merge read fields, with the tags spelled exactly as
+// the backend's rebaseBranchResponse emits them: a tag renamed on either side
+// decodes to the zero value and this test goes red.
+func TestRebaseRunBranch_DecodesPostMergeHeadRead(t *testing.T) {
+	runID := uuid.New()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","new_head_sha":"bbbb2222","merge_commit_sha":"bbbb2222","mechanism_note":"...",`+
+			`"post_merge_head_read":"read_after_write_lag",`+
+			`"post_merge_head_read_note":"post_merge_head_read=read_after_write_lag: NOT a concurrent push"}`)
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("RebaseRunBranch = %v", err)
+	}
+	if res.PostMergeHeadRead != "read_after_write_lag" {
+		t.Errorf("post_merge_head_read = %q, want read_after_write_lag", res.PostMergeHeadRead)
+	}
+	if !strings.Contains(res.PostMergeHeadReadNote, "NOT a concurrent push") {
+		t.Errorf("post_merge_head_read_note = %q, want the lag note", res.PostMergeHeadReadNote)
+	}
+}
+
 // --- ADR-090 / #4018: the rebase verb's merge-candidate verify fields ---
 
 // TestRebaseRunBranch_DecodesMergeCandidateVerify pins the hand mirror of the

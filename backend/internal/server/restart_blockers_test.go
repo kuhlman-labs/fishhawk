@@ -202,8 +202,10 @@ func TestRestartBlockers_ChildDispatched_NotBlocker(t *testing.T) {
 }
 
 // TestRestartBlockers_TerminalParentChild_NotBlocker: a pending child of a
-// SUCCEEDED / FAILED / CANCELLED decomposition parent can never be dispatched
-// (cancel does not cascade, #4186), so it is not a blocker (#4184). The live
+// SUCCEEDED / FAILED / CANCELLED decomposition parent can never be dispatched,
+// so it is not a blocker (#4184). The #4186 cascade cancels children only on a
+// cancel sink, so a failed / succeeded parent's child, and one orphaned before
+// the reconcile-orphan-children backfill runs, still reach this skip. The live
 // parent arms are the control: the same child under a pending / running parent
 // IS reported. Counterfactuals: forcing the terminal test to false reports the
 // terminal arms; forcing it to true drops the live arms.
