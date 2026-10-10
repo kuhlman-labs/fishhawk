@@ -1,0 +1,14 @@
+id: scenario:issue-4235/check-review-prompt-eval-no-trigger
+statement: 'Running scripts/check-review-prompt-eval against this change''s head (merge base with the run''s base) exits 0 and prints the no-trigger line: no review-prompt path changed since <merge-base>; recorded two-arm evidence not required.'
+verify_hint: 'CLI exit code + stdout: run scripts/check-review-prompt-eval from the checkout root (add --base <base-sha> if origin/main is not fetched); expect exit 0 and stdout containing ''no review-prompt path changed since''. An exit 1 naming a changed path, or the ''running (cd backend && go run ./internal/agenteval/catchrategate)'' line, fails the criterion.'
+steps: 'In the sanctioned checkout /tmp/fishhawk-acceptance-tree-3315c896-... (HEAD c4a660c8, which the preview serves per GET /healthz): ran `scripts/check-review-prompt-eval --base 58a403ce`, then `scripts/check-review-prompt-eval` with no flag. Without the flag the script resolves origin/main itself; the merge base is 58a403ce. Also ran `git diff --stat 58a403ce HEAD`.'
+assertions:
+    expected: exit 0 and stdout containing 'no review-prompt path changed since'
+    observed_at_record: 'Both runs exited 0 and printed: ''check-review-prompt-eval: no review-prompt path changed since 58a403ce9cd93b4b5352ee2e106d0924ff2a4580; recorded two-arm evidence not required''. The diff touches only agenteval/README.md, agenteval/envelopequality.go, agenteval/planreviewcatchlive_test.go and docs/compliance/planreview-catchrate-evidence.md.'
+    repro_handle: cd <sanctioned checkout> && scripts/check-review-prompt-eval --base 58a403ce; echo $?
+origin:
+    issue: 4235
+    pr: 4238
+    run_id: 3315c896-98d5-4de2-aff2-737518d05983
+    head_sha: c4a660c8047071dbb84852a33a9e1dd6a8db38e1
+    recorded_at: 2026-10-10T17:43:21Z
