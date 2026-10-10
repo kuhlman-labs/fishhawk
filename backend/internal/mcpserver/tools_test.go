@@ -3436,7 +3436,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// pull_request_target / push workflow runs and makes no PR-state change.
 	// Its own tool, not a vouch or merge mode: a different forge write and a
 	// different audit category. 73 -> 74.
-	const wantToolCount = 74
+	//
+	// #4086 (E83.53) adds exactly ONE tool — fishhawk_resolve_concerns, the thin
+	// wrapper over POST /v0/runs/{run_id}/concerns/resolve. WHEN: concerns
+	// routed by a fix-up carrying operator_evidence are immune to reviewer
+	// auto-resolve, and the operator re-ran the reproduction after the fix-up
+	// landed. ELIGIBILITY: write:stages or write:fixups, addressed_pending
+	// concerns of the run only; the backend refuses EVERY agent token
+	// (resolve_requires_human). Its own tool, not a waive mode: it records
+	// addressed, not waived, under a different audit category. 74 -> 75.
+	const wantToolCount = 75
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3465,6 +3474,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_resolve_concerns (#4086) must likewise be wire-visible: the
+	// 74 -> 75 bump alone would stay green if its registration were dropped and
+	// a DIFFERENT tool added in the same change.
+	var sawResolveConcerns bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_resolve_concerns" {
+			sawResolveConcerns = true
+			break
+		}
+	}
+	if !sawResolveConcerns {
+		t.Error("fishhawk_resolve_concerns is not in the registered tool list — the resolve-with-evidence verb is unreachable")
 	}
 	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
 	// same reason.
