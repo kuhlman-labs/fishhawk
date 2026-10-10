@@ -60,6 +60,33 @@ func TestMain(m *testing.M) {
 	os.Exit(runTestMain(m))
 }
 
+// pkgSrcDir is this package's SOURCE directory, captured once at package
+// initialization. Every test fixture read off the source tree (testdata/,
+// main.go, the shared repo-root testdata/wire goldens, the go.work walk)
+// anchors here (#4179), for three reasons:
+//   - `go test` runs the test binary from within the package's source
+//     directory (go help testflag), so the process cwd at init IS that dir;
+//   - package-level variables initialize before TestMain runs, so the value is
+//     captured BEFORE runTestMain chdirs the process into a throwaway git repo;
+//   - runtime.Caller is NOT a substitute: under -trimpath it reports a
+//     module-relative file name, so every fixture path derived from it misses.
+//
+// A compiled test binary executed directly from another directory (go test -c,
+// then run elsewhere) would capture the wrong dir; go help testflag states the
+// same requirement for any test reading testdata/.
+var pkgSrcDir = mustGetwd()
+
+// mustGetwd returns os.Getwd() and panics on an error, so an unresolvable
+// package dir fails the test binary closed at init instead of degrading every
+// fixture path to a relative one.
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
 // runTestMain does TestMain's work in a func so its cleanup defer runs
 // before os.Exit (os.Exit skips deferred funcs).
 func runTestMain(m *testing.M) int {
@@ -3022,18 +3049,14 @@ func TestMakeGitDiffEvent_CarriesPatch(t *testing.T) {
 }
 
 // wireGoldenGitDiffRenamePath anchors the SHARED cross-module wire fixture
-// (#2398 binding condition 3) to this test source via runtime.Caller, the
+// (#2398 binding condition 3) to this package's source dir via pkgSrcDir, the
 // same anchor wireGoldenHeldCommitPath uses. The backend's
 // TestExtractDiff_RenameOldPath decodes the IDENTICAL file, so a runner-side
 // serialization change the backend cannot decode fails a test rather than
 // silently passing two hand-maintained literals.
 func wireGoldenGitDiffRenamePath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "git_diff_rename_event.json")
 }
 
 // TestMakeGitDiffEvent_RenameCarriesOldPath is the RUNNER half of the #2398
@@ -15417,18 +15440,14 @@ func withFakePROpenerOnly(t *testing.T) *fakePROpener {
 // byte-identical-literal convention (#2501) that hid THIS bug. #2558 tracks the
 // shared wire package that would make the seam compile-enforced.
 //
-// The path is anchored to THIS test source file via runtime.Caller, NOT to the
-// process cwd: TestMain chdirs every test into a throwaway git repo, so a
-// cwd-relative path would not resolve. runtime.Caller yields
-// <repo>/runner/cmd/fishhawk-runner/main_test.go; three dirs up is the repo
-// root, the same anchor the backend test uses from its own source file.
+// The path is anchored to this package's source dir via pkgSrcDir, NOT to the
+// process cwd at test time: TestMain chdirs every test into a throwaway git
+// repo, so a cwd-relative path would not resolve. pkgSrcDir is
+// <repo>/runner/cmd/fishhawk-runner; three dirs up is the repo root, the same
+// anchor the backend test uses from its own package dir.
 func wireGoldenHeldCommitPath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
 }
 
 // Fixed golden inputs for the held-commit artifact. openHeldCommitPR marshals a
@@ -22960,20 +22979,17 @@ func TestRun_NoDiffCoverage_EmitsNoEvent(t *testing.T) {
 // BYTES are the seam. The struct-level TAG parity these bytes stand in for is
 // now ALSO pinned by backend/internal/wirecontract's TestCrossModuleWireParity.
 //
-// This helper REQUIRES the full repo tree (it resolves the fixture from THIS
-// test's source file, anchored on runtime.Caller because the suite's TestMain
-// chdirs into a throwaway temp dir) and FAILS CLOSED on a read error — a missing
-// fixture must never degrade to a skipped comparison. It trims a single trailing
+// This helper REQUIRES the full repo tree (it resolves the fixture from this
+// package's source dir, anchored on the init-captured pkgSrcDir because the
+// suite's TestMain chdirs into a throwaway temp dir) and FAILS CLOSED on a read
+// error — a missing fixture must never degrade to a skipped comparison. It
+// trims a single trailing
 // newline (operator condition 2) so the fixture is correct whether or not
 // whitespace tooling appends one; the decode is byte-for-byte in every other
 // respect.
 func goldenExemptPromptJSON(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the shared exempt prompt fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "exempt_prompt_fields.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "exempt_prompt_fields.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared exempt prompt fixture %s: %v", path, err)
@@ -24744,7 +24760,7 @@ func TestComputeAndEmitDiff_CommentOnlyWireFixture(t *testing.T) {
 	// this package's TestMain chdirs into a throwaway git repo, so a relative
 	// path would write and read a temp-dir copy and the golden comparison
 	// would be vacuous.
-	golden := filepath.Join(packageSourceDir(t), commentOnlyFixturePath)
+	golden := filepath.Join(pkgSrcDir, commentOnlyFixturePath)
 	if os.Getenv("FISHHAWK_UPDATE_GOLDEN") != "" {
 		if err := os.MkdirAll(filepath.Dir(golden), 0o755); err != nil {
 			t.Fatal(err)
@@ -24777,18 +24793,6 @@ func gitDiffEventPatch(t *testing.T, payload []byte) string {
 		t.Fatalf("decode git_diff payload: %v", err)
 	}
 	return p.Patch
-}
-
-// packageSourceDir returns the directory holding this test's source file, so
-// a fixture path resolves against the repository rather than the process CWD
-// (this package's TestMain chdirs into a throwaway git repo).
-func packageSourceDir(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot locate the package source dir")
-	}
-	return filepath.Dir(file)
 }
 
 // --- Held-commit resume opens a REAL pull request (#2570) ---
@@ -26449,14 +26453,10 @@ func TestRun_MigrationRenumber_ParentCancelledDuringPark_ClassificationUnchanged
 //
 // Counterfactual (run, observed RED): add `res.OK = false` to the branch body.
 func TestFixupObligationsBranch_NeverTouchesStageOutcome(t *testing.T) {
-	// TestMain chdirs into a throwaway git repo, so resolve main.go from this
-	// test file's own compile-time path rather than from the CWD.
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: could not resolve this test file's path")
-	}
+	// TestMain chdirs into a throwaway git repo, so resolve main.go from the
+	// init-captured package source dir rather than from the CWD.
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	file, err := parser.ParseFile(fset, filepath.Join(pkgSrcDir, "main.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
@@ -27936,12 +27936,8 @@ func TestSweepUnreadCounterfactualReport_RemovesTheFileAndDoesNotValidate(t *tes
 //  3. that branch's body contains NO assignment to res.OK / res.FailureCategory
 //     — the evidence-only invariant its two siblings hold.
 func TestCounterfactualChannels_AreExactComplements(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: could not resolve this test file's path")
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	file, err := parser.ParseFile(fset, filepath.Join(pkgSrcDir, "main.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
@@ -27995,12 +27991,8 @@ func TestCounterfactualChannels_AreExactComplements(t *testing.T) {
 // above, which drives the helper and stats the path — this test only proves the
 // branch reaches it.
 func TestFixupBranch_SweepsTheInitialPassSidecar(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: could not resolve this test file's path")
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	file, err := parser.ParseFile(fset, filepath.Join(pkgSrcDir, "main.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
@@ -28353,15 +28345,11 @@ func TestOpenPRAndShipArtifact_FallbackCommitMessageUnchanged(t *testing.T) {
 }
 
 // wireGoldenOrdinaryPath resolves the ORDINARY-path PR artifact fixture, the
-// second half of the cross-module seam (#3012). Anchored to this test source via
-// runtime.Caller for the same reason wireGoldenHeldCommitPath is.
+// second half of the cross-module seam (#3012). Anchored to this package's
+// source dir via pkgSrcDir for the same reason wireGoldenHeldCommitPath is.
 func wireGoldenOrdinaryPath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
-	}
-	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
+	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "ordinary_pr_artifact.json")
 }
 
 // Placeholders substituted for the two artifact values a real git fixture cannot
@@ -30399,12 +30387,8 @@ func hasEventKind(events []agent.Event, kind string) bool {
 // behaviorally above; this proves the branch reaches it and precedes
 // composeGateEvidence in source order.
 func TestImplementBranch_PeeksApprovalConditionResponsesEvidenceOnly(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller: could not resolve this test file's path")
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	file, err := parser.ParseFile(fset, filepath.Join(pkgSrcDir, "main.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
@@ -30461,12 +30445,8 @@ func TestImplementBranch_PeeksApprovalConditionResponsesEvidenceOnly(t *testing.
 // and nowhere earlier. The log helper's own behavior is pinned by
 // TestLogApprovalConditionResponsesCommitted.
 func TestOpenPRAndShipArtifact_LogsApprovalConditionResponsesCommittedAfterCommit(t *testing.T) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller")
-	}
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filepath.Join(filepath.Dir(thisFile), "main.go"), nil, 0)
+	file, err := parser.ParseFile(fset, filepath.Join(pkgSrcDir, "main.go"), nil, 0)
 	if err != nil {
 		t.Fatalf("parse main.go: %v", err)
 	}
@@ -31811,15 +31791,11 @@ func TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults(t *testing
 // and /prompt-render projections EQUAL these bytes; this side decodes the
 // same bytes through upload.FetchedPrompt's json tags and drives them to the
 // agent Invocation — the exempt_prompt_fields.json precedent (#2558). Anchored
-// on runtime.Caller (TestMain chdirs into a temp dir); fails closed on a read
+// on pkgSrcDir (TestMain chdirs into a temp dir); fails closed on a read
 // error.
 func goldenReasoningEffortPromptJSON(t *testing.T) []byte {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed; cannot resolve the shared reasoning-effort prompt fixture path")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "reasoning_effort_prompt.json")
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "reasoning_effort_prompt.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read shared reasoning-effort prompt fixture %s: %v", path, err)

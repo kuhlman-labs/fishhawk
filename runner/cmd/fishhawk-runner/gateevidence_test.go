@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -951,11 +950,7 @@ func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 // gateIsolationGolden reads the shared golden's per-class member bytes.
 func gateIsolationGolden(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller")
-	}
-	raw, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
 	if err != nil {
 		t.Fatalf("read shared golden: %v", err)
 	}
@@ -1228,11 +1223,7 @@ func TestGateIsolationEvidence_DeclaredFieldsRedacted(t *testing.T) {
 // backend's prompt handler emits as gate_container.
 func gateContainerPromptGolden(t *testing.T, member string) *upload.GateContainerConfig {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller")
-	}
-	raw, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
 	if err != nil {
 		t.Fatalf("read shared prompt golden: %v", err)
 	}
