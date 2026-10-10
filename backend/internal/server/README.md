@@ -488,8 +488,9 @@ each visible in `handlers.go`'s route table (the tier of every write route
 encodes the operator's admin-vs-member founder decision, reviewable there):
 `readAccess` (GET run/stage/gate views — ownership only), `memberWrite`
 (operator-decision writes + the runner `ship-*` uploads), `adminWrite`
-(destructive/admin sub-actions: cancel, recover, revive, reset-branch, redrive,
-reap-failure, deployment rollback, signing-key, installation-token, mcp-token).
+(destructive/admin sub-actions, 12 routes: cancel, recover, redrive, revive,
+reset-branch, rebase-branch, reviews/reconcile, reap-failure, signing-key,
+deployment rollback, installation-token, mcp-token).
 
 **`enforceAccount` — two checks.** (1) OWNERSHIP (all tiers): a tenanted run
 (`AccountID != ""`) whose account disagrees with the caller's → `403
@@ -517,8 +518,39 @@ page through `accountVisiblePage` (`audit_export.go`). Both keep untenanted
 with no account) sees everything (the pre-tenancy view). The run-less global
 audit-chain partition is never account-scoped (it has no owning run).
 
+**Route sweep (#4211).** `route_account_sweep_test.go` pins the WIRING of
+every run-scoped route to the wrappers above, present and future, without a
+hand-listed route table. `registerRoutes` takes a one-method `routeRegistrar`
+(`HandleFunc`), which `*http.ServeMux` satisfies, so the test hands it a
+recorder and enumerates every registered pattern carrying a `{run_id}`,
+`{stage_id}` or `{concern_id}` segment, together with the exact wrapped handler
+the mux receives. Two assertions run per route. (1)
+`TestRunScopedRoutes_CrossAccountBearer_Forbidden` drives the full
+`s.Handler()` chain with a bearer bound to account B against a run owned by
+account A. It requires `403` with exactly one `account_forbidden` envelope, a
+run-repository read log equal to the wrapper's own resolution (a further read
+means the handler ran), zero audit appends and zero ERROR log records. It also
+checks that each concrete request routes to its own pattern on a real
+`ServeMux`. (2) `TestRunScopedRoutes_AccessTierPinned` infers each route's tier
+by probing its captured handler with cookie identities and compares it with
+the pinned rule: `GET` → `readAccess`, any other method → `memberWrite`, and
+the `adminWriteRoutes` set → `adminWrite`. Moving a route between tiers turns
+it RED until that set is updated. **No `404` is admitted:** `enforceAccount`
+answers a resolved foreign run with `403 account_forbidden` on every tier, so
+no run-scoped route hides existence at the wrapper; existence-hiding would
+need `enforceAccount` and the sweep changed together. **Opt-outs** go in
+`accountIsolationOptOuts` as a pattern plus a reviewed, non-empty reason; an
+entry naming an unregistered pattern fails, as does a stale `adminWriteRoutes`
+entry. **Floors:** each family (`runs`, `stages`, `concerns`) must enumerate at
+least its pinned count, so a broken enumeration cannot pass vacuously. Floors
+are raised by hand and never lowered silently. A run-scoped pattern outside the
+three families, without a method, or carrying an unknown placeholder fails
+closed. **Residual:** the recorder sees only routes registered inside
+`registerRoutes`; a route mounted on the mux anywhere else escapes the sweep.
+
 **403 codes:** `account_forbidden`, `account_unresolved`, `insufficient_role`.
-The cross-boundary integration matrix is `authz_account_test.go`.
+The cross-boundary integration matrix is `authz_account_test.go` (per-mode
+`enforceAccount` logic) plus `route_account_sweep_test.go` (per-route wiring).
 
 ## Repo-scoped in-workspace visibility (`repovisibility.go`, ADR-057 Amendment A2 / E44.10, #2071)
 
