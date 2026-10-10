@@ -31039,6 +31039,9 @@ func TestResumeKindWireValues(t *testing.T) {
 	if upload.CapabilityMergeCandidateVerify != "merge-candidate-verify" {
 		t.Errorf("CapabilityMergeCandidateVerify = %q", upload.CapabilityMergeCandidateVerify)
 	}
+	if upload.CapabilityChildPushResume != "child-push-resume" {
+		t.Errorf("CapabilityChildPushResume = %q", upload.CapabilityChildPushResume)
+	}
 }
 
 // TestPushResume_PublishesHeldCommitAndOpensPR is the happy path: the served

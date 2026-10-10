@@ -1780,7 +1780,9 @@ const ReachabilityHeader = "X-Fishhawk-Plan-Reachability"
 // declines to serve a push-kind checkpoint AT ALL (not a degraded pr_open,
 // which would open a PR on a branch that was never pushed), and it REFUSES a
 // live merge-candidate verify pass (409 runner_capability_missing) rather than
-// serve it to a runner that would run a plain agent pass instead.
+// serve it to a runner that would run a plain agent pass instead, and it
+// declines a decomposition child's push resume to a runner without
+// CapabilityChildPushResume rather than risk a standalone PR for the slice.
 //
 // WIRE VALUE: byte-identical to the backend's runnerCapabilitiesHeader
 // (backend/internal/server/prompt.go).
@@ -1805,8 +1807,25 @@ const CapabilityPushResume = "push-resume"
 // refused the pass and nothing runs an agent.
 const CapabilityMergeCandidateVerify = "merge-candidate-verify"
 
+// CapabilityChildPushResume is the RunnerCapabilitiesHeader token for the
+// decomposition-child push resume (E55.16 / #3916): this runner's
+// openHeldCommitPR carries the E72.60 / #4079 decomposition-child arm, so a
+// child push resume publishes the slice branch, reports `pushed` and NEVER
+// opens a PR, and every non-push kind is refused for a child. A runner that
+// omits it is served no push resume for a decomposition child at all (the
+// retry is an ordinary agent re-run), because a binary that advertises only
+// CapabilityPushResume may predate that arm and open a standalone PR for the
+// slice branch — the #3910 mechanism.
+//
+// WIRE VALUE: byte-identical to the backend's capabilityChildPushResume
+// (backend/internal/server/prompt.go). A drift is fail-SAFE: every child push
+// resume is declined and the agent re-runs.
+const CapabilityChildPushResume = "child-push-resume"
+
 // runnerCapabilities is the full static token list FetchPrompt advertises.
-var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify}
+// APPEND-ONLY: a new token goes at the end, so the combined header value the
+// tests pin only ever grows.
+var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify, CapabilityChildPushResume}
 
 // RunnerCapabilitiesValue is the RunnerCapabilitiesHeader value this binary
 // sends. Exported so the backend-facing tests and the runner's own seam tests
