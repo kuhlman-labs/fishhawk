@@ -1,0 +1,14 @@
+id: scenario:issue-4185/pending-all-succeeded-reconciled
+statement: A stale top-level run in state pending whose every stage succeeded is transitioned to succeeded by --apply. Its stale_run_swept entry names class stages_settled and transition_path [running, succeeded].
+verify_hint: GET /v0/runs/{run_id} state=succeeded and the stale_run_swept entry payload on GET /v0/runs/{run_id}/audit. Decided in-repo by TestSweepStaleRuns_DryRunThenApply.
+steps: Posture B on the sanctioned checkout @0b022a3d with a throwaway Postgres 14 (unix socket). Ran go test -run SweepStale ./cmd/fishhawkd/ and go test -v ./internal/stalesweep/ ./internal/childcancel/.
+assertions:
+    expected: ""
+    observed_at_record: 'TestSweepStaleRuns_DryRunThenApply PASS. TestApply_TwoStepPendingToSucceeded and TestFind_StagesSettled PASS, as does the C5 precedence row. Package run: 116 PASS, 0 FAIL (sha256:845a0c1cf16fd3deb0a438ad4178ad1f8a1869d45879ae2950f3e682eac31018).'
+    repro_handle: FISHHAWK_TEST_PG_URL=... go test ./backend/internal/stalesweep/ ./backend/cmd/fishhawkd/ -run 'SweepStale|TwoStep|StagesSettled'
+origin:
+    issue: 4185
+    pr: 4216
+    run_id: 19a8b1da-a689-4d6b-b25e-b89769a4ecc3
+    head_sha: 0b022a3dfdc13a95cbcb5a09a2a356c4270243bf
+    recorded_at: 2026-10-10T05:12:58Z
