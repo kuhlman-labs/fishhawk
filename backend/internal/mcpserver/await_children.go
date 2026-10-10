@@ -43,10 +43,15 @@ type AwaitChildrenInput struct {
 //   - "integration_pending"   — every child succeeded but the newest
 //     slices_integrated entry does not cover every child (#4080): the
 //     consolidated branch lacks those slices, so acceptance and review wait.
+//     Also released when the server HAS slice-integration authority, the
+//     parent's implement stage succeeded and NO record exists — the lost
+//     slices_integrated append (#4165) — naming the integrate-wave recovery.
 //   - "children_settled"      — every child succeeded AND the newest
 //     slices_integrated entry covers every child (#4080; before, any terminal
 //     fan-out released this). On a deployment with no slice-integration
-//     authority — no record is ever written — it falls back to the pre-#4080
+//     authority — capabilities.slice_integration.available false, the server
+//     gate's own predicate (#4165); on an older backend inferred from no record
+//     and a succeeded parent implement stage — it falls back to the pre-#4080
 //     all-terminal release (approval condition C3).
 //   - "timeout"               — none of the above within the window. The wait
 //     holds no server state, so re-calling is a safe no-op.
@@ -171,13 +176,27 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               advanced (consolidate would answer 409
                               not_awaiting_children) the message names the real
                               recovery — re-drive or resume the uncovered child.
+                              When the server HAS slice-integration authority,
+                              the parent's implement stage succeeded and NO
+                              slices_integrated record exists, the record was
+                              lost: the server refuses acceptance 409
+                              acceptance_integration_incomplete, next_step is
+                              fishhawk_get_run_status on the parent and the
+                              message names the recovery, POST
+                              /v0/runs/{run_id}/integrate-wave.
   - "children_settled"      — every child succeeded AND the newest
                               slices_integrated record covers every child.
                               next_step is fishhawk_consolidate_slices. On a
                               deployment with no slice-integration authority
-                              (no record is ever written and the parent's
-                              implement stage already succeeded) it falls back
-                              to releasing on an all-succeeded fan-out.
+                              (the run's capabilities.slice_integration says
+                              available false — the server gate's own
+                              predicate; an older backend without it is
+                              inferred from no record + a succeeded parent
+                              implement stage) it falls back to releasing on
+                              an all-succeeded fan-out, with next_step
+                              fishhawk_consolidate_slices only while the
+                              parent's implement stage is awaiting_children and
+                              fishhawk_get_run_status on the parent otherwise.
   - "timeout"               — none of the above within the window. The wait
                               holds no server state, so re-calling is a safe
                               idempotent no-op.
@@ -403,18 +422,90 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 	}
 	if cs.IntegrationPhase != integrationPhaseIntegrated {
 		parentImplementState := r.parentImplementStageState(ctx, parentUUID)
-		if !integrationAuthorityAbsent(cs, parentImplementState) {
-			return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
+		// The server's own slice-integration predicate (#4165), read ONLY here
+		// so every other release pays zero extra reads. nil = undecidable (an
+		// older backend or a failed read) → the C3 inference fallback.
+		authority := r.parentSliceIntegration(ctx, parentUUID)
+		if integrationAuthorityAbsent(cs, parentImplementState, authority) {
+			// C3: the server has no slice-integration authority, so its
+			// acceptance gate stands down and no coverage is required. Fall
+			// back to the pre-#4080 release.
+			return awaitChildrenNoAuthorityOutput(base, parentUUID, cs, parentImplementState, authority), true, nil
 		}
-		// C3: no fan-in record was EVER written although the parent's implement
-		// stage already succeeded — the server had no slice-integration
-		// authority and skipped the fan-in, and its acceptance gate stands down
-		// on exactly that deployment. Fall back to the pre-#4080 release.
-		out := awaitChildrenSettledOutput(base, parentUUID, cs)
-		out.Message += " No slices_integrated record exists although the parent's implement stage already succeeded: this deployment has no slice-integration authority (no GitHub client or no installation id), so no coverage is required."
-		return out, true, nil
+		if fanInRecordLost(cs, parentImplementState, authority) {
+			// #4165: authority present, the parent advanced, and the fan-in
+			// record was lost — the server refuses acceptance and nothing
+			// re-integrates on its own. Hold, and name the recovery.
+			return awaitChildrenFanInRecordLostOutput(base, parentUUID, cs), true, nil
+		}
+		return awaitChildrenIntegrationPendingOutput(base, parentUUID, cs, parentImplementState), true, nil
 	}
 	return awaitChildrenSettledOutput(base, parentUUID, cs), true, nil
+}
+
+// awaitChildrenNoAuthorityOutput builds the C3 children_settled release for a
+// deployment with no slice-integration authority. next_step is CONDITIONAL on
+// the parent's implement stage (run 671e7f41 low (a)):
+// fishhawk_consolidate_slices only while it is awaiting_children (where it
+// graceful-skips the fan-in and resolves the stage); once the stage has left
+// awaiting_children consolidate would answer 409 not_awaiting_children, so the
+// step is fishhawk_get_run_status on the PARENT, whose next_actions own what
+// comes next. The message names the server's own reason when the backend
+// surfaced it (#4165), otherwise the inference it fell back to.
+func awaitChildrenNoAuthorityOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus, parentImplementState string, authority *runSliceIntegration) AwaitChildrenOutput {
+	out := awaitChildrenSettledOutput(base, parentUUID, cs)
+	if parentImplementState == "awaiting_children" {
+		out.NextStep = &SuggestedAction{
+			Action:       "fishhawk_consolidate_slices",
+			Params:       map[string]string{"run_id": parentUUID.String()},
+			Precondition: "every decomposed child succeeded, the server has no slice-integration authority, and the parent's implement stage is awaiting_children",
+			Consumes:     "none",
+			Reason:       "the fan-in graceful-skips without slice-integration authority, and consolidate resolves the parent's awaiting_children implement stage",
+		}
+		out.Message = fmt.Sprintf("all %d children succeeded. Consolidate with fishhawk_consolidate_slices (next_step).", cs.Total)
+	} else {
+		out.NextStep = &SuggestedAction{
+			Action:       "fishhawk_get_run_status",
+			Params:       map[string]string{"run_id": parentUUID.String()},
+			Precondition: "every decomposed child succeeded, the server has no slice-integration authority, and the parent's implement stage is no longer awaiting_children",
+			Consumes:     "none",
+			Reason:       "fishhawk_consolidate_slices would answer 409 not_awaiting_children on an advanced parent; the parent's next_actions name its next move",
+		}
+		out.Message = fmt.Sprintf("all %d children succeeded. Read fishhawk_get_run_status on the parent (next_step) for its next move.", cs.Total)
+	}
+	if authority != nil {
+		reason := authority.Reason
+		if reason == "" {
+			reason = "unspecified"
+		}
+		out.Message += fmt.Sprintf(" The server reports no slice-integration authority for this parent (%s), so its acceptance gate stands down and no slices_integrated coverage is required.", reason)
+		return out
+	}
+	out.Message += " No slices_integrated record exists although the parent's implement stage already succeeded: this deployment has no slice-integration authority (no GitHub client or no installation id), so no coverage is required."
+	return out
+}
+
+// awaitChildrenFanInRecordLostOutput builds the integration_pending release for
+// the #4165 wedge (fanInRecordLost): every child succeeded, the server HAS
+// slice-integration authority, the parent's implement stage already succeeded,
+// and no slices_integrated record exists. It holds — agreeing with the
+// server's 409 acceptance_integration_incomplete — and names the recovery,
+// POST /v0/runs/{run_id}/integrate-wave. next_step is fishhawk_get_run_status
+// on the PARENT (its next_actions carry the same hold and recovery).
+func awaitChildrenFanInRecordLostOutput(base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus) AwaitChildrenOutput {
+	out := base
+	out.Status = "integration_pending"
+	out.UnintegratedChildRunIDs = cs.UnintegratedChildRunIDs
+	out.NextStep = &SuggestedAction{
+		Action:       "fishhawk_get_run_status",
+		Params:       map[string]string{"run_id": parentUUID.String()},
+		Precondition: "every child succeeded and the parent's implement stage succeeded, but no slices_integrated record exists although the server has slice-integration authority",
+		Consumes:     "none",
+		Reason:       "the fan-in record was lost; the server refuses acceptance 409 acceptance_integration_incomplete until POST /v0/runs/" + parentUUID.String() + "/integrate-wave rewrites it",
+	}
+	out.Message = fmt.Sprintf("all %d children succeeded but %s, then re-invoke fishhawk_await_children.",
+		cs.Total, fanInRecordLostRecovery(parentUUID.String()))
+	return out
 }
 
 // awaitChildrenSettledOutput builds the children_settled release.
@@ -520,15 +611,38 @@ func awaitChildrenIntegrationPendingOutput(base AwaitChildrenOutput, parentUUID 
 }
 
 // parentImplementStageState reads the parent's implement stage state for the
-// integration_pending / C3 arms. Best-effort: "" when the stage cannot be
-// resolved, which both arms treat as NOT awaiting_children and NOT succeeded —
-// so an unreadable parent is never read as an authority-less deployment.
+// integration_pending / C3 arms. It selects the NEWEST implement stage by
+// Sequence (newestStageByType) rather than the ambiguity-erroring
+// resolveStage, so a parent with a retried implement stage is not misread as
+// unreadable (#4165). The read is bounded like resolveStage's (5s).
+// Best-effort: "" when the stages cannot be read or there is no implement
+// stage, which both arms treat as NOT awaiting_children and NOT succeeded — so
+// an unreadable parent is never read as an authority-less deployment.
 func (r *runResolver) parentImplementStageState(ctx context.Context, parentUUID uuid.UUID) string {
-	stage, err := r.resolveStage(ctx, parentUUID, "implement", "")
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	stages, err := r.api.ListRunStages(fetchCtx, parentUUID)
 	if err != nil {
 		return ""
 	}
-	return stage.State
+	if impl := newestStageByType(stages, "implement"); impl != nil {
+		return impl.State
+	}
+	return ""
+}
+
+// parentSliceIntegration reads the parent's capabilities.slice_integration —
+// the server gate's own slice-integration predicate (#4165) — with one bounded
+// (5s) single-run GetRun. Best-effort: nil on any read error, which is
+// UNDECIDABLE and takes the C3 inference fallback, never "unavailable".
+func (r *runResolver) parentSliceIntegration(ctx context.Context, parentUUID uuid.UUID) *runSliceIntegration {
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	run, err := r.api.GetRun(fetchCtx, parentUUID)
+	if err != nil {
+		return nil
+	}
+	return sliceIntegrationOf(run)
 }
 
 // childrenStatusForAwait assembles the parent's ChildrenStatus snapshot for the

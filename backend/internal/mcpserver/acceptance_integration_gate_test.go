@@ -78,7 +78,7 @@ func TestOffersAcceptanceDispatch(t *testing.T) {
 // unrelated action survives.
 func TestFoldAcceptanceIntegrationHold_PartialStripsAndPrependsAwait(t *testing.T) {
 	na := acceptancePendingActions("parent-1")
-	foldAcceptanceIntegrationHold("parent-1", partialChildrenStatus(), "succeeded", na)
+	foldAcceptanceIntegrationHold("parent-1", partialChildrenStatus(), "succeeded", nil, na)
 
 	if na.State != acceptanceHeldIntegrationIncompleteState {
 		t.Errorf("state = %q, want %s", na.State, acceptanceHeldIntegrationIncompleteState)
@@ -110,7 +110,7 @@ func TestFoldAcceptanceIntegrationHold_FailureReason(t *testing.T) {
 	cs.IntegrationPhase = integrationPhaseFailed
 	cs.IntegrationFailure = &integrationFailure{Cause: auditCategorySliceHeadMissing, ChildRunID: "child-b", Sequence: 9}
 	na := acceptancePendingActions("p")
-	foldAcceptanceIntegrationHold("p", cs, "succeeded", na)
+	foldAcceptanceIntegrationHold("p", cs, "succeeded", nil, na)
 	if na.State != acceptanceHeldIntegrationIncompleteState {
 		t.Fatalf("state = %q, want held", na.State)
 	}
@@ -120,7 +120,7 @@ func TestFoldAcceptanceIntegrationHold_FailureReason(t *testing.T) {
 	// Running children with no uncovered succeeded child: the generic reason.
 	cs2 := &ChildrenStatus{IntegrationPhase: integrationPhaseRunningChildren, Children: []ChildStatus{{RunID: "x", State: "running"}}, fanInRecorded: true}
 	na2 := acceptancePendingActions("p")
-	foldAcceptanceIntegrationHold("p", cs2, "succeeded", na2)
+	foldAcceptanceIntegrationHold("p", cs2, "succeeded", nil, na2)
 	if r := na2.Actions[0].Reason; !strings.Contains(r, "not every child has succeeded") {
 		t.Errorf("generic reason = %q", r)
 	}
@@ -146,21 +146,29 @@ func TestFoldAcceptanceIntegrationHold_NoOpArms(t *testing.T) {
 		name        string
 		cs          *ChildrenStatus
 		parentState string
+		authority   *runSliceIntegration
 		na          func() *NextActions
 	}{
-		{"integrated", integrated, "succeeded", func() *NextActions { return acceptancePendingActions("p") }},
-		{"nil children status", nil, "succeeded", func() *NextActions { return acceptancePendingActions("p") }},
-		{"zero children", noChildren, "succeeded", func() *NextActions { return acceptancePendingActions("p") }},
-		{"no acceptance dispatch offered", partialChildrenStatus(), "succeeded", func() *NextActions {
+		{"integrated", integrated, "succeeded", nil, func() *NextActions { return acceptancePendingActions("p") }},
+		{"nil children status", nil, "succeeded", nil, func() *NextActions { return acceptancePendingActions("p") }},
+		{"zero children", noChildren, "succeeded", nil, func() *NextActions { return acceptancePendingActions("p") }},
+		{"no acceptance dispatch offered", partialChildrenStatus(), "succeeded", nil, func() *NextActions {
 			return &NextActions{State: "review_pending", Actions: []SuggestedAction{{Action: "fishhawk_await_review"}}}
 		}},
-		{"C3 no integration authority", noAuthority, "succeeded", func() *NextActions { return acceptancePendingActions("p") }},
+		{"C3 no integration authority (inference fallback)", noAuthority, "succeeded", nil, func() *NextActions { return acceptancePendingActions("p") }},
+		// #4165: the server's own predicate says no authority. A PARTIAL record
+		// and a parent still awaiting_children would both keep the hold under
+		// the inference, so only the authority branch makes this a no-op — the
+		// server gate stands down here too.
+		{"C3 authority unavailable with a partial record", partialChildrenStatus(), "awaiting_children",
+			&runSliceIntegration{Available: false, Reason: "GitHub not configured"},
+			func() *NextActions { return acceptancePendingActions("p") }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			na := c.na()
 			before, _ := json.Marshal(na)
-			foldAcceptanceIntegrationHold("p", c.cs, c.parentState, na)
+			foldAcceptanceIntegrationHold("p", c.cs, c.parentState, c.authority, na)
 			after, _ := json.Marshal(na)
 			if string(before) != string(after) {
 				t.Errorf("next_actions changed:\nbefore %s\nafter  %s", before, after)
@@ -168,31 +176,158 @@ func TestFoldAcceptanceIntegrationHold_NoOpArms(t *testing.T) {
 		})
 	}
 	// nil next_actions must not panic.
-	foldAcceptanceIntegrationHold("p", partialChildrenStatus(), "succeeded", nil)
+	foldAcceptanceIntegrationHold("p", partialChildrenStatus(), "succeeded", nil, nil)
 }
 
-// TestIntegrationAuthorityAbsent pins the C3 inference: only NO fan-in record
-// AND a SUCCEEDED parent implement stage read as authority-less. A record of
-// any kind, a parent still awaiting_children, or an UNREADABLE parent stage
-// keeps the hold.
-func TestIntegrationAuthorityAbsent(t *testing.T) {
+// TestFoldAcceptanceIntegrationHold_FanInRecordLost pins the #4165 wedge: the
+// server HAS slice-integration authority, the parent's implement stage
+// succeeded, and NO fan-in record exists (the best-effort slices_integrated
+// append was lost). The server refuses acceptance 409
+// acceptance_integration_incomplete, so the display must HOLD and name the
+// integrate-wave recovery. MECHANISM: this snapshot is exactly the C3
+// inference's positive case, so without the authority signal the fold would
+// no-op; and without the fanInRecordLost reason branch the generic "lacks the
+// slices of" reason would appear instead of integrate-wave.
+func TestFoldAcceptanceIntegrationHold_FanInRecordLost(t *testing.T) {
+	cs := partialChildrenStatus()
+	cs.fanInRecorded = false
+	cs.IntegratedChildRunIDs = nil
+	cs.UnintegratedChildRunIDs = []string{"child-a", "child-b"}
+	na := acceptancePendingActions("parent-1")
+	foldAcceptanceIntegrationHold("parent-1", cs, "succeeded", &runSliceIntegration{Available: true}, na)
+
+	if na.State != acceptanceHeldIntegrationIncompleteState {
+		t.Fatalf("state = %q, want %s", na.State, acceptanceHeldIntegrationIncompleteState)
+	}
+	if offersAcceptanceDispatch(na) {
+		t.Errorf("actions still offer an acceptance dispatch: %+v", na.Actions)
+	}
+	first := na.Actions[0]
+	if first.Action != "fishhawk_await_children" || first.Params["run_id"] != "parent-1" {
+		t.Errorf("first action = %+v, want fishhawk_await_children on the parent", first)
+	}
+	for _, want := range []string{"POST /v0/runs/parent-1/integrate-wave", "acceptance_integration_incomplete", "not_awaiting_children", "slices_integrated append was lost"} {
+		if !strings.Contains(first.Reason, want) {
+			t.Errorf("reason %q missing %q", first.Reason, want)
+		}
+	}
+}
+
+// TestFanInRecordLost pins the wedge predicate's every conjunct: it needs a
+// POSITIVE authority, no record, no failure, and a SUCCEEDED parent.
+func TestFanInRecordLost(t *testing.T) {
+	avail := &runSliceIntegration{Available: true}
+	unavail := &runSliceIntegration{Available: false, Reason: "run has no installation_id"}
 	none := &ChildrenStatus{}
-	recorded := &ChildrenStatus{fanInRecorded: true}
 	cases := []struct {
-		name  string
-		cs    *ChildrenStatus
-		state string
-		want  bool
+		name      string
+		cs        *ChildrenStatus
+		state     string
+		authority *runSliceIntegration
+		want      bool
 	}{
-		{"no record + succeeded", none, "succeeded", true},
-		{"no record + awaiting_children", none, "awaiting_children", false},
-		{"no record + unreadable", none, "", false},
-		{"record + succeeded", recorded, "succeeded", false},
-		{"nil status", nil, "succeeded", false},
+		{"authority available + no record + succeeded", none, "succeeded", avail, true},
+		{"nil authority (older backend)", none, "succeeded", nil, false},
+		{"authority unavailable", none, "succeeded", unavail, false},
+		{"record present", &ChildrenStatus{fanInRecorded: true}, "succeeded", avail, false},
+		{"integration failure recorded", &ChildrenStatus{IntegrationFailure: &integrationFailure{Cause: auditCategorySliceHeadMissing}}, "succeeded", avail, false},
+		{"parent still awaiting_children", none, "awaiting_children", avail, false},
+		{"parent stage unreadable", none, "", avail, false},
+		{"nil status", nil, "succeeded", avail, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := integrationAuthorityAbsent(c.cs, c.state); got != c.want {
+			if got := fanInRecordLost(c.cs, c.state, c.authority); got != c.want {
+				t.Errorf("fanInRecordLost = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestNewestStageByType pins the newest-by-Sequence selection over BOTH slice
+// orderings: older-first catches a first-match regression (it would return the
+// failed seq-2 stage), newer-first catches a last-match one.
+func TestNewestStageByType(t *testing.T) {
+	plan := Stage{ID: "plan", Sequence: 1, Type: "plan", State: "succeeded"}
+	old := Stage{ID: "impl-old", Sequence: 2, Type: "implement", State: "failed"}
+	newer := Stage{ID: "impl-new", Sequence: 4, Type: "implement", State: "succeeded"}
+	for name, stages := range map[string][]Stage{
+		"older first": {plan, old, newer},
+		"newer first": {newer, plan, old},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := newestStageByType(stages, "implement")
+			if got == nil || got.ID != "impl-new" {
+				t.Fatalf("newestStageByType = %+v, want the seq-4 implement stage", got)
+			}
+		})
+	}
+	if got := newestStageByType([]Stage{plan}, "implement"); got != nil {
+		t.Errorf("no implement stage: got %+v, want nil", got)
+	}
+	if got := newestStageByType(nil, "implement"); got != nil {
+		t.Errorf("nil stages: got %+v, want nil", got)
+	}
+}
+
+// TestSliceIntegrationOf pins the nil-safe accessor: a nil run, a run without
+// a capabilities block (a list read), and a block without the key are all
+// UNDECIDABLE (nil); a present key is returned as-is.
+func TestSliceIntegrationOf(t *testing.T) {
+	si := &runSliceIntegration{Available: true}
+	cases := []struct {
+		name string
+		run  *Run
+		want *runSliceIntegration
+	}{
+		{"nil run", nil, nil},
+		{"no capabilities block", &Run{}, nil},
+		{"block without the key", &Run{Capabilities: &runCapabilities{}}, nil},
+		{"key present", &Run{Capabilities: &runCapabilities{SliceIntegration: si}}, si},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sliceIntegrationOf(c.run); got != c.want {
+				t.Errorf("sliceIntegrationOf = %+v, want %+v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestIntegrationAuthorityAbsent pins C3 in both modes. With the server's
+// capabilities.slice_integration present (#4165) the answer is
+// !authority.Available, whatever the record or stage say — the server gate
+// consults neither. With it absent (an older backend) it falls back to the
+// inference: only NO fan-in record AND a SUCCEEDED parent implement stage read
+// as authority-less; a record of any kind, a parent still awaiting_children,
+// or an UNREADABLE parent stage keeps the hold.
+func TestIntegrationAuthorityAbsent(t *testing.T) {
+	none := &ChildrenStatus{}
+	recorded := &ChildrenStatus{fanInRecorded: true}
+	avail := &runSliceIntegration{Available: true}
+	unavail := &runSliceIntegration{Available: false, Reason: "GitHub not configured"}
+	cases := []struct {
+		name      string
+		cs        *ChildrenStatus
+		state     string
+		authority *runSliceIntegration
+		want      bool
+	}{
+		{"no record + succeeded", none, "succeeded", nil, true},
+		{"no record + awaiting_children", none, "awaiting_children", nil, false},
+		{"no record + unreadable", none, "", nil, false},
+		{"record + succeeded", recorded, "succeeded", nil, false},
+		{"nil status", nil, "succeeded", nil, false},
+		// #4165: the server's predicate wins over the inference. The first row
+		// IS the inference's positive case, the second its negative case, so
+		// only the authority branch flips them.
+		{"authority available + no record + succeeded", none, "succeeded", avail, false},
+		{"authority unavailable + record + awaiting_children", recorded, "awaiting_children", unavail, true},
+		{"authority unavailable + nil status", nil, "succeeded", unavail, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := integrationAuthorityAbsent(c.cs, c.state, c.authority); got != c.want {
 				t.Errorf("integrationAuthorityAbsent = %v, want %v", got, c.want)
 			}
 		})
@@ -272,6 +407,54 @@ func TestGateAcceptanceOnIntegration_FailsOpen(t *testing.T) {
 			t.Error("the fan-in walk never ran — the fixture did not reach the error arm")
 		}
 	})
+}
+
+// TestGateAcceptanceOnIntegration_NewestImplementStage pins that the gate reads
+// the parent's NEWEST implement stage by Sequence (#4165). MECHANISM: the
+// older failed implement stage is listed FIRST, so a first-match lookup reads
+// "failed", the nil-authority C3 inference refuses to fire, and the dispatch
+// is held; the newest stage succeeded, so the fallback keeps it.
+func TestGateAcceptanceOnIntegration_NewestImplementStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	stages := []Stage{
+		{ID: "impl-old", Sequence: 2, Type: "implement", State: "failed"},
+		{ID: "impl-new", Sequence: 4, Type: "implement", State: "succeeded"},
+	}
+	na := acceptancePendingActions(parent.String())
+	r.gateAcceptanceOnIntegration(context.Background(), parent, &Run{ID: parent.String()}, stages, na)
+	if na.State != "acceptance_pending" || !offersAcceptanceDispatch(na) {
+		t.Errorf("next_actions = %+v, want acceptance_pending kept (newest implement succeeded, no record, no authority signal)", na)
+	}
+}
+
+// TestGateAcceptanceOnIntegration_KeysOnRunCapabilities pins that the gate
+// passes the run's own capabilities.slice_integration through (#4165): the
+// same no-record + succeeded snapshot HOLDS with authority available and is a
+// no-op without the key.
+func TestGateAcceptanceOnIntegration_KeysOnRunCapabilities(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	stages := []Stage{{ID: "impl", Sequence: 2, Type: "implement", State: "succeeded"}}
+
+	held := acceptancePendingActions(parent.String())
+	run := &Run{ID: parent.String(), Capabilities: &runCapabilities{SliceIntegration: &runSliceIntegration{Available: true}}}
+	r.gateAcceptanceOnIntegration(context.Background(), parent, run, stages, held)
+	if held.State != acceptanceHeldIntegrationIncompleteState || !strings.Contains(held.Actions[0].Reason, "integrate-wave") {
+		t.Errorf("authority present: next_actions = %+v, want held naming integrate-wave", held)
+	}
+
+	kept := acceptancePendingActions(parent.String())
+	r.gateAcceptanceOnIntegration(context.Background(), parent, &Run{ID: parent.String()}, stages, kept)
+	if kept.State != "acceptance_pending" || !offersAcceptanceDispatch(kept) {
+		t.Errorf("no authority signal: next_actions = %+v, want the C3 fallback to keep the dispatch", kept)
+	}
 }
 
 // --- cross-layer: MCP client ↔ real server handlers ↔ Postgres audit chain ---
