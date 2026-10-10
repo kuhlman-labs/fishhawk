@@ -68,6 +68,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 assert_contains() { # <desc> <file> <needle>
   if grep -qF -- "$3" "$2" 2>/dev/null; then pass "$1"; else
     fail "$1 (expected '$3' in $2)"
@@ -277,8 +283,8 @@ i2b_out="$(
   FISHHAWK_VERIFY_PACKAGES=backend/internal/run _parse_verify_args --no-tests 2>&1
   printf 'VP=[%s] NT=%s\n' "$VERIFY_PACKAGES" "$VERIFY_NO_TESTS"
 )"
-if printf '%s' "$i2b_out" | grep -qF 'VP=[] NT=1' \
-   && printf '%s' "$i2b_out" | grep -qF 'ignoring FISHHAWK_VERIFY_PACKAGES'; then
+if printf '%s' "$i2b_out" | grep_q -F 'VP=[] NT=1' \
+   && printf '%s' "$i2b_out" | grep_q -F 'ignoring FISHHAWK_VERIFY_PACKAGES'; then
   pass "i2b: --no-tests ignores the FISHHAWK_VERIFY_PACKAGES fallback with a printed note"
 else
   fail "i2b: env fallback under --no-tests ('$i2b_out')"
@@ -517,8 +523,8 @@ i10a_out="$(
   ( set -e; _verify_gate_image_pins ) 2>&1
   echo "RC=$?"
 )"
-if printf '%s' "$i10a_out" | grep -qF 'RC=0' \
-   && printf '%s' "$i10a_out" | grep -qF 'check-gate-image missing or not executable — skipping'; then
+if printf '%s' "$i10a_out" | grep_q -F 'RC=0' \
+   && printf '%s' "$i10a_out" | grep_q -F 'check-gate-image missing or not executable — skipping'; then
   pass "i10a: a ROOT without scripts/check-gate-image skips with a printed reason"
 else
   fail "i10a: skip branch ('$i10a_out')"
@@ -535,8 +541,8 @@ i10b_out="$(
   ( set -e; _verify_gate_image_pins ) 2>&1
   echo "RC=$?"
 )"
-if printf '%s' "$i10b_out" | grep -qF 'RC=1' \
-   && printf '%s' "$i10b_out" | grep -qF "STUB_PINS_ARGS:--root $PINS1"; then
+if printf '%s' "$i10b_out" | grep_q -F 'RC=1' \
+   && printf '%s' "$i10b_out" | grep_q -F "STUB_PINS_ARGS:--root $PINS1"; then
   pass "i10b: a failing check-gate-image fails the leg, run against --root ROOT"
 else
   fail "i10b: failure propagation ('$i10b_out')"

@@ -549,7 +549,7 @@ _k8s_dump_hook_diagnostics() {
       Running|Completed|Succeeded) continue ;;
     esac
     describe="$(kubectl describe pod "$name" 2>/dev/null || true)"
-    if print -r -- "$describe" | grep -qE 'ImagePullBackOff|ErrImagePull'; then
+    if grep -qE 'ImagePullBackOff|ErrImagePull' <<< "$describe"; then
       img="$(print -r -- "$describe" | grep -E '^[[:space:]]*Image:' | head -1 | sed -E 's/^[[:space:]]*Image:[[:space:]]*//')"
       print -u2 "  pod ${name}: image pull failed (ImagePullBackOff/ErrImagePull) for image ${img:-<unknown>}"
     fi
@@ -3881,7 +3881,7 @@ cmd_k8s_down() {
   local uninstall_out
   if uninstall_out="$(helm uninstall fishhawk 2>&1)"; then
     print "helm release fishhawk uninstalled"
-  elif print -r -- "$uninstall_out" | grep -qi 'not found'; then
+  elif grep -qi 'not found' <<< "$uninstall_out"; then
     print "helm release fishhawk not found (nothing to uninstall)"
   else
     print -u2 "error: helm uninstall fishhawk failed:"

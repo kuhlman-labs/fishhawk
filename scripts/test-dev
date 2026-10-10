@@ -20,6 +20,12 @@ fail() { print "FAIL: $1"; FAIL=$(( FAIL + 1 )) }
 DEV_LIB_ONLY=1 source "${REPO_ROOT}/scripts/dev"
 set +e
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 # Sourcing scripts/dev sets the global REPO_ROOT to this repo. The #1917
 # worktree/sweep fixtures below re-point REPO_ROOT (and cwd) at throwaway git
 # repos to drive the git-backed helpers hermetically; capture the originals so
@@ -64,14 +70,14 @@ _free_high_port() {
 # kind, so pin it POSITIVELY on the stern claims it must KEEP — without this the
 # two kinds are not discriminated and a softening edit to the wrong body passes.
 out="$(_signal_mcp_activation schema_major)"
-if print -r -- "$out" | grep -q 'schema MAJOR'; then
+if print -r -- "$out" | grep_q 'schema MAJOR'; then
   pass "schema_major banner names the schema MAJOR bump"
 else
   fail "schema_major banner should name the schema MAJOR bump (got: $out)"
 fi
-if print -r -- "$out" | grep -q 'ACTION REQUIRED' \
-   && print -r -- "$out" | grep -qi 'loop stays broken' \
-   && print -r -- "$out" | grep -q -- '/mcp'; then
+if print -r -- "$out" | grep_q 'ACTION REQUIRED' \
+   && print -r -- "$out" | grep_q -i 'loop stays broken' \
+   && print -r -- "$out" | grep_q -- '/mcp'; then
   pass "schema_major banner keeps ACTION REQUIRED, 'loop stays broken' and /mcp"
 else
   fail "schema_major banner should keep ACTION REQUIRED, 'loop stays broken' and /mcp (got: $out)"
@@ -84,32 +90,32 @@ fi
 # grep is scoped to the actual stale SENTENCE, not the bare fragment 'will fail'
 # — the correct body legitimately hedges with "If that check fails".
 out="$(_signal_mcp_activation schema_major_shim)"
-if print -r -- "$out" | grep -q 'schema MAJOR'; then
+if print -r -- "$out" | grep_q 'schema MAJOR'; then
   pass "schema_major_shim banner names the schema MAJOR bump"
 else
   fail "schema_major_shim banner should name the schema MAJOR bump (got: $out)"
 fi
-if ! print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+if ! print -r -- "$out" | grep_q 'ACTION REQUIRED'; then
   pass "schema_major_shim banner omits the ACTION REQUIRED nag"
 else
   fail "schema_major_shim banner must not carry ACTION REQUIRED (got: $out)"
 fi
-if ! print -r -- "$out" | grep -qi 'loop stays broken'; then
+if ! print -r -- "$out" | grep_q -i 'loop stays broken'; then
   pass "schema_major_shim banner drops the 'loop stays broken' claim"
 else
   fail "schema_major_shim banner must not claim the loop stays broken (got: $out)"
 fi
-if ! print -r -- "$out" | tr '\n' ' ' | grep -qi 'every fishhawk_start_run will fail'; then
+if ! print -r -- "$out" | tr '\n' ' ' | grep_q -i 'every fishhawk_start_run will fail'; then
   pass "schema_major_shim banner drops the 'every fishhawk_start_run will fail' claim"
 else
   fail "schema_major_shim banner must not claim every fishhawk_start_run will fail (got: $out)"
 fi
-if print -r -- "$out" | grep -q 'spec.valid' && print -r -- "$out" | grep -q 'GitSHA'; then
+if print -r -- "$out" | grep_q 'spec.valid' && print -r -- "$out" | grep_q 'GitSHA'; then
   pass "schema_major_shim banner names the verification (spec.valid / GitSHA)"
 else
   fail "schema_major_shim banner should name spec.valid and GitSHA (got: $out)"
 fi
-if print -r -- "$out" | grep -q -- '--status' && print -r -- "$out" | grep -q -- '/mcp'; then
+if print -r -- "$out" | grep_q -- '--status' && print -r -- "$out" | grep_q -- '/mcp'; then
   pass "schema_major_shim banner names the --status + /mcp fallback"
 else
   fail "schema_major_shim banner should name --status and /mcp (got: $out)"
@@ -117,23 +123,23 @@ fi
 # The hedge token is a fixed LITERAL, reused by the body, this assertion and the
 # #2349 counterfactual: scripts/dev cannot observe the harness-owned shim, so a
 # banner asserting the swap as fact would trade one false claim for another.
-if print -r -- "$out" | grep -q 'SHOULD have hot-swapped' \
-   && ! print -r -- "$out" | grep -qi 'no /mcp needed'; then
+if print -r -- "$out" | grep_q 'SHOULD have hot-swapped' \
+   && ! print -r -- "$out" | grep_q -i 'no /mcp needed'; then
   pass "schema_major_shim banner states the swap as an expectation, not a fact"
 else
   fail "schema_major_shim banner should say 'SHOULD have hot-swapped' and never 'no /mcp needed' (got: $out)"
 fi
 
 out="$(_signal_mcp_activation shim_rebuilt)"
-if [[ "$out" == *fishhawk-mcp-shim* ]] && print -r -- "$out" | grep -q -- '/mcp'; then
+if [[ "$out" == *fishhawk-mcp-shim* ]] && print -r -- "$out" | grep_q -- '/mcp'; then
   pass "shim_rebuilt banner names fishhawk-mcp-shim and /mcp"
 else
   fail "shim_rebuilt banner should name fishhawk-mcp-shim and /mcp (got: $out)"
 fi
 
 out="$(_signal_mcp_activation reconnect)"
-if [[ "$out" == *fishhawk-mcp* ]] && print -r -- "$out" | grep -qi reconnect \
-   && print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+if [[ "$out" == *fishhawk-mcp* ]] && print -r -- "$out" | grep_q -i reconnect \
+   && print -r -- "$out" | grep_q 'ACTION REQUIRED'; then
   pass "reconnect banner keeps the ACTION REQUIRED fishhawk-mcp reconnect text"
 else
   fail "reconnect banner should keep the ACTION REQUIRED fishhawk-mcp reconnect text (got: $out)"
@@ -145,18 +151,18 @@ fi
 # as an accomplished fact — scripts/dev cannot observe the harness-owned shim,
 # so a false "no /mcp needed" is exactly the silent-stale trap this closes.
 out="$(_signal_mcp_activation auto_swap)"
-if print -r -- "$out" | grep -qi 'hot-swap' && print -r -- "$out" | grep -q 'GitSHA' \
-   && ! print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+if print -r -- "$out" | grep_q -i 'hot-swap' && print -r -- "$out" | grep_q 'GitSHA' \
+   && ! print -r -- "$out" | grep_q 'ACTION REQUIRED'; then
   pass "auto_swap note names automatic swap + GitSHA and omits ACTION REQUIRED"
 else
   fail "auto_swap note should name automatic swap + GitSHA and omit ACTION REQUIRED (got: $out)"
 fi
-if print -r -- "$out" | grep -q -- '/mcp' && print -r -- "$out" | grep -q -- '--status'; then
+if print -r -- "$out" | grep_q -- '/mcp' && print -r -- "$out" | grep_q -- '--status'; then
   pass "auto_swap note names the /mcp fallback and the --status diagnostic"
 else
   fail "auto_swap note should name the /mcp fallback and --status (got: $out)"
 fi
-if ! print -r -- "$out" | grep -qi 'no /mcp needed'; then
+if ! print -r -- "$out" | grep_q -i 'no /mcp needed'; then
   pass "auto_swap note does not claim the swap already happened"
 else
   fail "auto_swap note must state the EXPECTATION, not the accomplished fact (got: $out)"
@@ -184,24 +190,24 @@ fi
 
 # 3. cmd_reload core behavior: invokes cmd_down then cmd_up, forwarding flags.
 reload_body="$(typeset -f cmd_reload)"
-if print -r -- "$reload_body" | grep -q cmd_down; then
+if print -r -- "$reload_body" | grep_q cmd_down; then
   pass "cmd_reload invokes cmd_down"
 else
   fail "cmd_reload should invoke cmd_down"
 fi
-if print -r -- "$reload_body" | grep -q cmd_up; then
+if print -r -- "$reload_body" | grep_q cmd_up; then
   pass "cmd_reload invokes cmd_up"
 else
   fail "cmd_reload should invoke cmd_up"
 fi
-if print -r -- "$reload_body" | grep -q '"\$@"'; then
+if print -r -- "$reload_body" | grep_q '"\$@"'; then
   pass "cmd_reload forwards flags (\"\$@\") to cmd_up"
 else
   fail "cmd_reload should forward \"\$@\" to cmd_up"
 fi
 # reload must force a full rebuild (--all) so the empty post-merge
 # origin/main...HEAD diff doesn't silently skip runner/CLI/mcp.
-if print -r -- "$reload_body" | grep -q -- '--all'; then
+if print -r -- "$reload_body" | grep_q -- '--all'; then
   pass "cmd_reload forces a full rebuild (--all)"
 else
   fail "cmd_reload should force --all"
@@ -211,22 +217,22 @@ fi
 # then reload LAST. Body-grep only (mirrors section 3) — a live post-merge mutates
 # git state and the running stack and is not hermetic.
 post_body="$(typeset -f cmd_post_merge)"
-if print -r -- "$post_body" | grep -q -- '--ff-only'; then
+if print -r -- "$post_body" | grep_q -- '--ff-only'; then
   pass "cmd_post_merge pulls main with --ff-only"
 else
   fail "cmd_post_merge should pull --ff-only"
 fi
-if print -r -- "$post_body" | grep -q 'cleanup-merged'; then
+if print -r -- "$post_body" | grep_q 'cleanup-merged'; then
   pass "cmd_post_merge invokes scripts/cleanup-merged"
 else
   fail "cmd_post_merge should invoke cleanup-merged"
 fi
-if print -r -- "$post_body" | grep -q 'gh issue view'; then
+if print -r -- "$post_body" | grep_q 'gh issue view'; then
   pass "cmd_post_merge confirms the optional issue via gh issue view"
 else
   fail "cmd_post_merge should reference gh issue view"
 fi
-if print -r -- "$post_body" | grep -q 'cmd_reload'; then
+if print -r -- "$post_body" | grep_q 'cmd_reload'; then
   pass "cmd_post_merge composes cmd_reload"
 else
   fail "cmd_post_merge should invoke cmd_reload"
@@ -425,8 +431,8 @@ fi
 # Single source: _build_ldflags delegates to scripts/release-ldflags and carries
 # no package-path literal of its own (#4117).
 bl_body="$(typeset -f _build_ldflags)"
-if print -r -- "$bl_body" | grep -q 'RELEASE_LDFLAGS' && [[ "$_RELEASE_LDFLAGS" == */scripts/release-ldflags ]] \
-   && ! print -r -- "$bl_body" | grep -q 'internal/version'; then
+if print -r -- "$bl_body" | grep_q 'RELEASE_LDFLAGS' && [[ "$_RELEASE_LDFLAGS" == */scripts/release-ldflags ]] \
+   && ! print -r -- "$bl_body" | grep_q 'internal/version'; then
   pass "_build_ldflags delegates to scripts/release-ldflags with no internal/version literal"
 else
   fail "_build_ldflags should delegate to scripts/release-ldflags and hold no internal/version literal (single source, #4117)"
@@ -435,12 +441,12 @@ fi
 # 4d. Wiring body-greps: _build_binary must stamp via _build_ldflags, and the
 # k8s image build must pass the sha through the GIT_SHA build arg.
 bb_body="$(typeset -f _build_binary)"
-if print -r -- "$bb_body" | grep -q '_build_ldflags'; then
+if print -r -- "$bb_body" | grep_q '_build_ldflags'; then
   pass "_build_binary applies _build_ldflags to go build"
 else
   fail "_build_binary should pass _build_ldflags output to go build"
 fi
-if print -r -- "$bb_body" | grep -q '_dev_git_sha'; then
+if print -r -- "$bb_body" | grep_q '_dev_git_sha'; then
   pass "_build_binary derives the sha via _dev_git_sha"
 else
   fail "_build_binary should call _dev_git_sha"
@@ -464,7 +470,7 @@ else
   fail "_build_binary should exit non-zero without invoking go when _build_ldflags fails (rc=${fl_rc} out=${fl_out} err=${fl_err})"
 fi
 k8s_body="$(typeset -f cmd_k8s_up)"
-if print -r -- "$k8s_body" | grep -q -- '--build-arg GIT_SHA'; then
+if print -r -- "$k8s_body" | grep_q -- '--build-arg GIT_SHA'; then
   pass "cmd_k8s_up passes --build-arg GIT_SHA to docker build"
 else
   fail "cmd_k8s_up should pass --build-arg GIT_SHA"
@@ -495,7 +501,7 @@ else
 fi
 
 # Assertion B: the fishhawkd go build RUN line derives GOARCH from that ARG.
-if [[ -n "$buildrun_line" ]] && sed -n "${buildrun_line}p" "$dockerfile_path" | grep -q 'GOARCH=${TARGETARCH}'; then
+if [[ -n "$buildrun_line" ]] && sed -n "${buildrun_line}p" "$dockerfile_path" | grep_q 'GOARCH=${TARGETARCH}'; then
   pass "backend/Dockerfile's go build RUN line sets GOARCH=\${TARGETARCH}"
 else
   fail "backend/Dockerfile's go build RUN line should set GOARCH=\${TARGETARCH}"
@@ -505,7 +511,7 @@ fi
 # file (comment lines stripped first, so a comment documenting the old
 # behavior does not trip this) — matched regardless of quoting or spacing,
 # and including a shell-style ${VAR:-amd64} default expression.
-if print -r -- "$dockerfile_no_comments" | grep -qE \
+if print -r -- "$dockerfile_no_comments" | grep_q -E \
      -e 'GOARCH[[:space:]]*=[[:space:]]*"?(amd64|arm64|386|arm|ppc64le|s390x|riscv64)"?\b' \
      -e '\$\{[A-Za-z_][A-Za-z0-9_]*:-[[:space:]]*"?(amd64|arm64|386|arm|ppc64le|s390x|riscv64)"?[[:space:]]*\}'; then
   fail "backend/Dockerfile should not hardcode a GOARCH architecture literal"
@@ -779,7 +785,7 @@ fi
 # 5h. _detect_rebuild_set wiring (ADR-060 / #1922): the shim carries its own
 # trigger glob, and the shared-lib case must NOT short-circuit past the shim.
 drs_body="$(typeset -f _detect_rebuild_set)"
-if print -r -- "$drs_body" | grep -q 'backend/cmd/fishhawk-mcp-shim/\*'; then
+if print -r -- "$drs_body" | grep_q 'backend/cmd/fishhawk-mcp-shim/\*'; then
   pass "_detect_rebuild_set carries the fishhawk-mcp-shim trigger glob"
 else
   fail "_detect_rebuild_set should carry backend/cmd/fishhawk-mcp-shim/* glob"
@@ -791,7 +797,7 @@ fi
 # `case` is first-match-wins: the broad arm marks only fishhawkd, so an mcpserver
 # arm placed after it would never fire and an mcpserver edit would silently skip
 # the fishhawk-mcp rebuild. No runtime test would notice; the ordering grep does.
-if print -r -- "$drs_body" | grep -q 'backend/internal/mcpserver/\*'; then
+if print -r -- "$drs_body" | grep_q 'backend/internal/mcpserver/\*'; then
   pass "_detect_rebuild_set carries the backend/internal/mcpserver/* glob"
 else
   fail "_detect_rebuild_set should carry backend/internal/mcpserver/* glob"
@@ -912,33 +918,33 @@ fi
 # 5i. Build/banner wiring body-greps: _build_binary src_paths, cmd_up's forced
 # --all set, the build loop, and cmd_up's banner-decision call sites all carry
 # the shim.
-if print -r -- "$bb_body" | grep -q 'fishhawk-mcp-shim'; then
+if print -r -- "$bb_body" | grep_q 'fishhawk-mcp-shim'; then
   pass "_build_binary src_paths includes fishhawk-mcp-shim"
 else
   fail "_build_binary src_paths should include fishhawk-mcp-shim"
 fi
 up_body_all="$(typeset -f cmd_up)"
-if print -r -- "$up_body_all" | grep -q 'fishhawk-mcp-shim __all__'; then
+if print -r -- "$up_body_all" | grep_q 'fishhawk-mcp-shim __all__'; then
   pass "cmd_up forced --all set includes fishhawk-mcp-shim"
 else
   fail "cmd_up forced --all set should include fishhawk-mcp-shim __all__"
 fi
-if print -r -- "$up_body_all" | grep -q 'for binary in fishhawkd fishhawk-mcp fishhawk-mcp-shim'; then
+if print -r -- "$up_body_all" | grep_q 'for binary in fishhawkd fishhawk-mcp fishhawk-mcp-shim'; then
   pass "cmd_up build loop iterates fishhawk-mcp-shim"
 else
   fail "cmd_up build loop should iterate fishhawk-mcp-shim"
 fi
-if print -r -- "$up_body_all" | grep -q '_select_mcp_banner'; then
+if print -r -- "$up_body_all" | grep_q '_select_mcp_banner'; then
   pass "cmd_up consults _select_mcp_banner for the activation kind"
 else
   fail "cmd_up should consult _select_mcp_banner"
 fi
-if print -r -- "$up_body_all" | grep -q '_detect_shim_registered'; then
+if print -r -- "$up_body_all" | grep_q '_detect_shim_registered'; then
   pass "cmd_up consults _detect_shim_registered"
 else
   fail "cmd_up should consult _detect_shim_registered"
 fi
-if print -r -- "$up_body_all" | grep -q '_signal_mcp_activation "$mcp_banner_kind"'; then
+if print -r -- "$up_body_all" | grep_q '_signal_mcp_activation "$mcp_banner_kind"'; then
   pass "cmd_up emits the selected banner kind as the last line"
 else
   fail "cmd_up should call _signal_mcp_activation with the selected kind"
@@ -996,17 +1002,17 @@ fi
 # 9. cmd_up readiness gate: body must poll _await_healthz, tail the log, and
 # exit 1 on failure — mirroring the existing cmd_reload body-grep assertions.
 up_body="$(typeset -f cmd_up)"
-if print -r -- "$up_body" | grep -q '_await_healthz'; then
+if print -r -- "$up_body" | grep_q '_await_healthz'; then
   pass "cmd_up gates the spawn on _await_healthz"
 else
   fail "cmd_up should call _await_healthz after spawning fishhawkd"
 fi
-if print -r -- "$up_body" | grep -q 'tail -n 15'; then
+if print -r -- "$up_body" | grep_q 'tail -n 15'; then
   pass "cmd_up tails the log on a failed readiness gate"
 else
   fail "cmd_up should tail the log on readiness-gate failure"
 fi
-if print -r -- "$up_body" | grep -q 'exit 1'; then
+if print -r -- "$up_body" | grep_q 'exit 1'; then
   pass "cmd_up exits non-zero on a failed readiness gate"
 else
   fail "cmd_up should exit 1 on readiness-gate failure"
@@ -1017,7 +1023,7 @@ fi
 # --enable-child-completion-sweeper or a settled decomposed parent stays parked
 # in awaiting_children with no consolidated branch/PR. Body-grep so a future
 # edit that drops the flag fails here.
-if print -r -- "$up_body" | grep -q -- '--enable-child-completion-sweeper'; then
+if print -r -- "$up_body" | grep_q -- '--enable-child-completion-sweeper'; then
   pass "cmd_up serve enables the child-completion sweeper (local fan-in backstop)"
 else
   fail "cmd_up serve should pass --enable-child-completion-sweeper so local decompositions fan in"
@@ -1027,17 +1033,17 @@ fi
 # tail the pod logs, and exit 1 on failure so a future edit can't silently drop
 # the fail-loud guarantee of the Docker-Desktop bring-up.
 k8s_up_body="$(typeset -f cmd_k8s_up)"
-if print -r -- "$k8s_up_body" | grep -q '_await_healthz'; then
+if print -r -- "$k8s_up_body" | grep_q '_await_healthz'; then
   pass "cmd_k8s_up gates the bring-up on _await_healthz"
 else
   fail "cmd_k8s_up should call _await_healthz after the port-forward"
 fi
-if print -r -- "$k8s_up_body" | grep -q 'kubectl logs'; then
+if print -r -- "$k8s_up_body" | grep_q 'kubectl logs'; then
   pass "cmd_k8s_up tails pod logs on a failed readiness gate"
 else
   fail "cmd_k8s_up should tail kubectl logs on readiness-gate failure"
 fi
-if print -r -- "$k8s_up_body" | grep -q 'exit 1'; then
+if print -r -- "$k8s_up_body" | grep_q 'exit 1'; then
   pass "cmd_k8s_up exits non-zero on a failed readiness gate"
 else
   fail "cmd_k8s_up should exit 1 on readiness-gate failure"
@@ -1046,7 +1052,7 @@ fi
 # rather than letting set -e abort before diagnostics run — otherwise a
 # CrashLoopBackOff pod exits with no `kubectl logs` tail. Lock that guard so a
 # future edit can't silently regress the rollout-failure leg of the contract.
-if print -r -- "$k8s_up_body" | grep -q 'if ! kubectl rollout status'; then
+if print -r -- "$k8s_up_body" | grep_q 'if ! kubectl rollout status'; then
   pass "cmd_k8s_up guards the rollout failure and tails diagnostics"
 else
   fail "cmd_k8s_up should wrap kubectl rollout status in an 'if !' failure guard"
@@ -1054,12 +1060,12 @@ fi
 # The jaeger trace-collector forward (dev-only) must be Service-guarded so a
 # jaeger-disabled override is a clean skip, and its pid tracked in its own file
 # so k8s-down can kill exactly that forward.
-if print -r -- "$k8s_up_body" | grep -q 'kubectl get svc fishhawk-jaeger'; then
+if print -r -- "$k8s_up_body" | grep_q 'kubectl get svc fishhawk-jaeger'; then
   pass "cmd_k8s_up guards the jaeger forward on the Service existing"
 else
   fail "cmd_k8s_up should guard the jaeger port-forward on 'kubectl get svc fishhawk-jaeger'"
 fi
-if print -r -- "$k8s_up_body" | grep -q 'K8S_JAEGER_PF_PID_FILE'; then
+if print -r -- "$k8s_up_body" | grep_q 'K8S_JAEGER_PF_PID_FILE'; then
   pass "cmd_k8s_up tracks the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
 else
   fail "cmd_k8s_up should record the jaeger forward pid in K8S_JAEGER_PF_PID_FILE"
@@ -1072,12 +1078,12 @@ fi
 # wrap helm in an `if ! helm upgrade` guard that dumps hook pod state and exits 1,
 # mirroring the rollout and /healthz legs. Body-greps first; deleting the guard
 # reddens these.
-if print -r -- "$k8s_up_body" | grep -q 'if ! helm upgrade'; then
+if print -r -- "$k8s_up_body" | grep_q 'if ! helm upgrade'; then
   pass "cmd_k8s_up guards the helm upgrade failure with an 'if ! helm upgrade' branch"
 else
   fail "cmd_k8s_up should wrap helm upgrade in an 'if ! helm upgrade' failure guard"
 fi
-if print -r -- "$k8s_up_body" | grep -q '_k8s_dump_hook_diagnostics'; then
+if print -r -- "$k8s_up_body" | grep_q '_k8s_dump_hook_diagnostics'; then
   pass "cmd_k8s_up dumps hook pod state on a helm failure"
 else
   fail "cmd_k8s_up should call _k8s_dump_hook_diagnostics on a helm failure"
@@ -1106,10 +1112,10 @@ STUB
   PATH="${kstub}:$PATH"
   diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
   ok=0
-  if ! print -r -- "$diag_err" | grep -q 'ImagePullBackOff'; then
+  if ! print -r -- "$diag_err" | grep_q 'ImagePullBackOff'; then
     print "  (stderr did not name ImagePullBackOff: $diag_err)"; ok=1
   fi
-  if ! print -r -- "$diag_err" | grep -qF -- "$bad_img"; then
+  if ! print -r -- "$diag_err" | grep_q -F -- "$bad_img"; then
     print "  (stderr did not name the offending image $bad_img: $diag_err)"; ok=1
   fi
   rm -rf "$kstub"
@@ -1138,7 +1144,7 @@ STUB
   PATH="${kstub}:$PATH"
   diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
   ok=0
-  if print -r -- "$diag_err" | grep -q 'image pull failed'; then
+  if print -r -- "$diag_err" | grep_q 'image pull failed'; then
     print "  (unexpected pull-failure line with all pods Running: $diag_err)"; ok=1
   fi
   rm -rf "$kstub"
@@ -1171,7 +1177,7 @@ STUB
   PATH="${kstub}:$PATH"
   diag_err="$(_k8s_dump_hook_diagnostics 2>&1 1>/dev/null)"
   ok=0
-  if print -r -- "$diag_err" | grep -q 'image pull failed'; then
+  if print -r -- "$diag_err" | grep_q 'image pull failed'; then
     print "  (invented a pull-failure line for a CrashLoopBackOff pod: $diag_err)"; ok=1
   fi
   # No-abort under set -e even with a failing describe: the `|| true` guards must
@@ -1229,13 +1235,13 @@ STUB
   k8s_rc=$?
   ok=0
   if (( k8s_rc == 0 )); then print "  (cmd_k8s_up returned 0 despite helm failing)"; ok=1; fi
-  if ! print -r -- "$k8s_err" | grep -q 'helm upgrade --install fishhawk failed'; then
+  if ! print -r -- "$k8s_err" | grep_q 'helm upgrade --install fishhawk failed'; then
     print "  (stderr did not name the helm failure: $k8s_err)"; ok=1
   fi
-  if ! print -r -- "$k8s_err" | grep -q 'ImagePullBackOff'; then
+  if ! print -r -- "$k8s_err" | grep_q 'ImagePullBackOff'; then
     print "  (diagnostics did not run — no ImagePullBackOff in stderr: $k8s_err)"; ok=1
   fi
-  if ! print -r -- "$k8s_err" | grep -qF -- "$bad_img"; then
+  if ! print -r -- "$k8s_err" | grep_q -F -- "$bad_img"; then
     print "  (diagnostics did not name the offending image: $k8s_err)"; ok=1
   fi
   rm -rf "$kstub"
@@ -1250,21 +1256,72 @@ fi
 # misreported as 'nothing to uninstall'. Only an absent release ('not found')
 # is a no-op; any other failure exits non-zero.
 k8s_down_body="$(typeset -f cmd_k8s_down)"
-if print -r -- "$k8s_down_body" | grep -q 'not found'; then
+if print -r -- "$k8s_down_body" | grep_q 'not found'; then
   pass "cmd_k8s_down treats an absent release ('not found') as a no-op"
 else
   fail "cmd_k8s_down should special-case the 'not found' release"
 fi
-if print -r -- "$k8s_down_body" | grep -q 'exit 1'; then
+if print -r -- "$k8s_down_body" | grep_q 'exit 1'; then
   pass "cmd_k8s_down exits non-zero on a genuine helm uninstall failure"
 else
   fail "cmd_k8s_down should exit 1 on a non-'not found' helm error"
 fi
 # The jaeger forward (when present) must be torn down alongside the fishhawkd one.
-if print -r -- "$k8s_down_body" | grep -q 'K8S_JAEGER_PF_PID_FILE'; then
+if print -r -- "$k8s_down_body" | grep_q 'K8S_JAEGER_PF_PID_FILE'; then
   pass "cmd_k8s_down kills the tracked jaeger port-forward"
 else
   fail "cmd_k8s_down should kill the jaeger forward via K8S_JAEGER_PF_PID_FILE"
+fi
+
+# 9c-bis (#4233). BEHAVIORAL test of cmd_k8s_down's helm-uninstall classification
+# (9c above only greps the body). #4233 moved the 'not found' test from a
+# `print | grep -q` pipe to a here-string, so each branch is pinned by what it
+# does: a stub helm on PATH returns a chosen status and output. The pid files
+# point into the stub dir, where they do not exist, so no port-forward is
+# touched. Prints `rc=<status>` and then cmd_k8s_down's combined output.
+_k8s_down_with_helm() {  # $1 = stub helm exit status, $2 = stub helm output
+  (
+    hstub="$(mktemp -d)"
+    cat > "${hstub}/helm" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$FAKE_HELM_OUT"
+exit "$FAKE_HELM_RC"
+STUB
+    chmod +x "${hstub}/helm"
+    export PATH="${hstub}:$PATH" FAKE_HELM_RC="$1" FAKE_HELM_OUT="$2"
+    K8S_PF_PID_FILE="${hstub}/absent-pf.pid"
+    K8S_JAEGER_PF_PID_FILE="${hstub}/absent-jaeger-pf.pid"
+    # `|| rc=$?`, not a bare assignment: the expected rc=1 must not fire the
+    # TRAPZERR that sourcing scripts/dev installed (section 10 removes it).
+    k8s_down_rc=0
+    k8s_down_out="$(cmd_k8s_down 2>&1)" || k8s_down_rc=$?
+    rm -rf "$hstub"
+    print -r -- "rc=${k8s_down_rc}"
+    print -r -- "$k8s_down_out"
+  )
+}
+k8s_down_res="$(_k8s_down_with_helm 0 'release "fishhawk" uninstalled')"
+if [[ "${k8s_down_res%%$'\n'*}" == "rc=0" ]] \
+  && print -r -- "$k8s_down_res" | grep_q -Fx 'helm release fishhawk uninstalled'; then
+  pass "cmd_k8s_down: a successful helm uninstall reports the release uninstalled and exits 0"
+else
+  fail "cmd_k8s_down should report a successful uninstall and exit 0; got: $k8s_down_res"
+fi
+k8s_down_res="$(_k8s_down_with_helm 1 'Error: uninstall: Release not loaded: fishhawk: release: Not Found')"
+if [[ "${k8s_down_res%%$'\n'*}" == "rc=0" ]] \
+  && print -r -- "$k8s_down_res" | grep_q -F 'not found (nothing to uninstall)'; then
+  pass "cmd_k8s_down: an absent release ('Not Found', any case) is a no-op exit 0"
+else
+  fail "cmd_k8s_down should treat a 'not found' release as a no-op exit 0; got: $k8s_down_res"
+fi
+k8s_down_res="$(_k8s_down_with_helm 1 'Error: Kubernetes cluster unreachable: connection refused')"
+if [[ "${k8s_down_res%%$'\n'*}" == "rc=1" ]] \
+  && print -r -- "$k8s_down_res" | grep_q -F 'error: helm uninstall fishhawk failed:' \
+  && print -r -- "$k8s_down_res" | grep_q -F 'Kubernetes cluster unreachable' \
+  && ! print -r -- "$k8s_down_res" | grep_q -F 'nothing to uninstall'; then
+  pass "cmd_k8s_down: any other helm failure exits 1 and surfaces the helm output"
+else
+  fail "cmd_k8s_down should exit 1 and surface a non-'not found' helm error; got: $k8s_down_res"
 fi
 
 # 10. ZERR diagnostic trap (#631): installed, reports the ERROR-SITE file:line
@@ -1538,48 +1595,48 @@ rm -rf "$stray_dir"
 # below pins the REUSE CHAIN (the helper itself still consults _port_listeners),
 # so both endpoints AND the link between them stay asserted rather than only the
 # endpoints.
-if print -r -- "$up_body" | grep -q '_preflight_port_free'; then
+if print -r -- "$up_body" | grep_q '_preflight_port_free'; then
   pass "cmd_up runs the pre-spawn port preflight (_preflight_port_free)"
 else
   fail "cmd_up should preflight the port via _preflight_port_free before spawning"
 fi
-if print -r -- "$(typeset -f _preflight_port_free)" | grep -q '_port_listeners'; then
+if print -r -- "$(typeset -f _preflight_port_free)" | grep_q '_port_listeners'; then
   pass "_preflight_port_free reuses _port_listeners (no reimplemented detection)"
 else
   fail "_preflight_port_free should detect listeners via _port_listeners"
 fi
-if print -r -- "$up_body" | grep -q '_verify_listener_identity'; then
+if print -r -- "$up_body" | grep_q '_verify_listener_identity'; then
   pass "cmd_up runs the post-gate listener-identity check"
 else
   fail "cmd_up should call _verify_listener_identity after _await_healthz"
 fi
-if print -r -- "$up_body" | grep -q '_clean_stray_pid_files'; then
+if print -r -- "$up_body" | grep_q '_clean_stray_pid_files'; then
   pass "cmd_up sweeps stray pid files"
 else
   fail "cmd_up should call _clean_stray_pid_files"
 fi
-if print -r -- "$up_body" | grep -q '_clean_stray_nonce_files'; then
+if print -r -- "$up_body" | grep_q '_clean_stray_nonce_files'; then
   pass "cmd_up sweeps stray nonce files"
 else
   fail "cmd_up should call _clean_stray_nonce_files"
 fi
 down_body="$(typeset -f cmd_down)"
-if print -r -- "$down_body" | grep -q '_down_port_fallback'; then
+if print -r -- "$down_body" | grep_q '_down_port_fallback'; then
   pass "cmd_down composes the port fallback (_down_port_fallback)"
 else
   fail "cmd_down should call _down_port_fallback"
 fi
-if print -r -- "$down_body" | grep -q 'exit 1'; then
+if print -r -- "$down_body" | grep_q 'exit 1'; then
   pass "cmd_down exits non-zero when the port fallback refuses success"
 else
   fail "cmd_down should exit 1 on a refused port fallback"
 fi
-if print -r -- "$down_body" | grep -q '_clean_stray_pid_files'; then
+if print -r -- "$down_body" | grep_q '_clean_stray_pid_files'; then
   pass "cmd_down sweeps stray pid files"
 else
   fail "cmd_down should call _clean_stray_pid_files"
 fi
-if print -r -- "$down_body" | grep -q '_clean_stray_nonce_files'; then
+if print -r -- "$down_body" | grep_q '_clean_stray_nonce_files'; then
   pass "cmd_down sweeps stray nonce files"
 else
   fail "cmd_down should call _clean_stray_nonce_files"
@@ -1600,7 +1657,7 @@ if [[ -n "$nonce1" ]]; then
 else
   fail "_generate_start_nonce should emit a non-empty nonce"
 fi
-if print -r -- "$nonce1" | grep -qE '^[0-9a-f]+$'; then
+if print -r -- "$nonce1" | grep_q -E '^[0-9a-f]+$'; then
   pass "_generate_start_nonce emits hex-only output"
 else
   fail "_generate_start_nonce should be hex-only (got: $nonce1)"
@@ -1758,12 +1815,12 @@ rm -f "$nonce_log"
 rm -rf "$nonce_dir"
 
 # 14d. Call-site wiring (#1018) — body-greps in the section-13b style.
-if print -r -- "$up_body" | grep -q '_generate_start_nonce'; then
+if print -r -- "$up_body" | grep_q '_generate_start_nonce'; then
   pass "cmd_up generates a per-spawn start nonce"
 else
   fail "cmd_up should call _generate_start_nonce before the spawn"
 fi
-if print -r -- "$up_body" | grep -q '_verify_healthz_nonce'; then
+if print -r -- "$up_body" | grep_q '_verify_healthz_nonce'; then
   pass "cmd_up verifies the start_nonce round-trip"
 else
   fail "cmd_up should call _verify_healthz_nonce after the readiness gate"
@@ -1775,18 +1832,18 @@ if [[ -n "$await_line" && -n "$nonce_line" ]] && (( await_line < nonce_line )); 
 else
   fail "cmd_up should order _await_healthz before _verify_healthz_nonce (await=$await_line nonce=$nonce_line)"
 fi
-if print -r -- "$up_body" | grep -q '_verify_listener_identity'; then
+if print -r -- "$up_body" | grep_q '_verify_listener_identity'; then
   pass "cmd_up retains the #965 pid-check fallback (_verify_listener_identity)"
 else
   fail "cmd_up should keep _verify_listener_identity as the rc=2 degraded fallback"
 fi
 dpf_body="$(typeset -f _down_port_fallback)"
-if print -r -- "$dpf_body" | grep -q '_nonce_from_healthz_body'; then
+if print -r -- "$dpf_body" | grep_q '_nonce_from_healthz_body'; then
   pass "_down_port_fallback consults the nonce before comm matching"
 else
   fail "_down_port_fallback should call _nonce_from_healthz_body"
 fi
-if print -r -- "$down_body" | grep -qE 'rm -f .*NONCE_FILE'; then
+if print -r -- "$down_body" | grep_q -E 'rm -f .*NONCE_FILE'; then
   pass "cmd_down removes the nonce file on teardown"
 else
   fail "cmd_down should rm the NONCE_FILE"
@@ -2593,7 +2650,7 @@ rm -rf "$q_stub"
 # --- E. body-grep wiring pins ---------------------------------------------------
 q_up="$(typeset -f cmd_k8s_up)"
 q_ident="$(typeset -f _verify_k8s_image_identity)"
-if print -r -- "$q_up" | grep -qF "trap '_k8s_up_cleanup' EXIT"; then
+if print -r -- "$q_up" | grep_q -F "trap '_k8s_up_cleanup' EXIT"; then
   pass "E cmd_k8s_up installs the _k8s_up_cleanup EXIT trap"
 else
   fail "E cmd_k8s_up should install trap '_k8s_up_cleanup' EXIT"
@@ -2613,22 +2670,22 @@ if [[ -n "$q_o_helm" && -n "$q_o_restart" && -n "$q_o_status" ]] && (( q_o_helm 
 else
   fail "E cmd_k8s_up should rollout-restart between helm upgrade and rollout status (helm=${q_o_helm} restart=${q_o_restart} status=${q_o_status})"
 fi
-if print -r -- "$q_up" | grep -A3 'if _k8s_identity_skipped' | grep -q 'warning'; then
+if print -r -- "$q_up" | grep -A3 'if _k8s_identity_skipped' | grep_q 'warning'; then
   pass "E cmd_k8s_up guards the identity call with _k8s_identity_skipped and warns on the skip"
 else
   fail "E cmd_k8s_up should guard _verify_k8s_image_identity with _k8s_identity_skipped + a warning"
 fi
-if print -r -- "$q_up" | grep -q -- '--build-arg GIT_SHA="\$build_sha"' && print -r -- "$q_up" | grep -q '_verify_k8s_image_identity .*"\$build_sha"'; then
+if print -r -- "$q_up" | grep_q -- '--build-arg GIT_SHA="\$build_sha"' && print -r -- "$q_up" | grep_q '_verify_k8s_image_identity .*"\$build_sha"'; then
   pass "E cmd_k8s_up uses ONE build_sha for both the docker build arg and the identity call"
 else
   fail "E cmd_k8s_up should thread \$build_sha into both --build-arg GIT_SHA= and _verify_k8s_image_identity"
 fi
-if print -r -- "$q_up" | grep -q -- '--sort-by=.metadata.creationTimestamp' || print -r -- "$q_ident" | grep -q -- '--sort-by=.metadata.creationTimestamp'; then
+if print -r -- "$q_up" | grep_q -- '--sort-by=.metadata.creationTimestamp' || print -r -- "$q_ident" | grep_q -- '--sort-by=.metadata.creationTimestamp'; then
   pass "E the identity check samples the NEWEST fishhawkd pod (--sort-by creationTimestamp)"
 else
   fail "E _verify_k8s_image_identity should select the newest pod via --sort-by=.metadata.creationTimestamp"
 fi
-if print -r -- "$q_ident" | grep -q 'return 2'; then
+if print -r -- "$q_ident" | grep_q 'return 2'; then
   fail "E _verify_k8s_image_identity must have NO 'return 2' warn-and-continue code"
 else
   pass "E _verify_k8s_image_identity has no rc=2 warn-and-continue path"
@@ -2636,8 +2693,8 @@ fi
 # E the gate resolves the BUILT side through _k8s_local_config_digest (#3530),
 # never a raw `docker image inspect … --format '{{.Id}}'` (which is the OCI
 # index digest on a containerd store — the false-alarm this PR fixes).
-if print -r -- "$q_ident" | grep -q '_k8s_local_config_digest "\$ref"' \
-  && ! print -r -- "$q_ident" | grep -q "docker image inspect"; then
+if print -r -- "$q_ident" | grep_q '_k8s_local_config_digest "\$ref"' \
+  && ! print -r -- "$q_ident" | grep_q "docker image inspect"; then
   pass "E _verify_k8s_image_identity resolves the built side via _k8s_local_config_digest, not 'docker image inspect .Id'"
 else
   fail "E _verify_k8s_image_identity should call _k8s_local_config_digest and carry no 'docker image inspect' (ident=${q_ident})"
@@ -2645,8 +2702,8 @@ fi
 # E the shared-provisioner hop also resolves through _k8s_local_config_digest,
 # never 'docker image inspect <repo>@<digest>' (#3530, same defect one hop over).
 q_resolve="$(typeset -f _k8s_resolve_running_image_id)"
-if print -r -- "$q_resolve" | grep -q '_k8s_local_config_digest "\${repo}@\${digest}"' \
-  && ! print -r -- "$q_resolve" | grep -q "docker image inspect"; then
+if print -r -- "$q_resolve" | grep_q '_k8s_local_config_digest "\${repo}@\${digest}"' \
+  && ! print -r -- "$q_resolve" | grep_q "docker image inspect"; then
   pass "E _k8s_resolve_running_image_id's shared hop resolves via _k8s_local_config_digest, not 'docker image inspect <repo>@<digest>'"
 else
   fail "E _k8s_resolve_running_image_id shared hop should use _k8s_local_config_digest (resolve=${q_resolve})"
@@ -2659,10 +2716,10 @@ unset q_resolve
 # the same kill/rm/exit shape).
 q_ident_leg="$(print -r -- "$q_up" | awk '/_verify_k8s_image_identity/,/^[[:space:]]*fi[[:space:]]*$/')"
 if [[ -n "$q_ident_leg" ]] \
-  && print -r -- "$q_ident_leg" | grep -q 'kill "\$pf_pid"' \
-  && print -r -- "$q_ident_leg" | grep -q 'rm -f "\$K8S_PF_PID_FILE"' \
-  && print -r -- "$q_ident_leg" | grep -q 'exit 1' \
-  && ! print -r -- "$q_ident_leg" | grep -q '_verify_listener_identity'; then
+  && print -r -- "$q_ident_leg" | grep_q 'kill "\$pf_pid"' \
+  && print -r -- "$q_ident_leg" | grep_q 'rm -f "\$K8S_PF_PID_FILE"' \
+  && print -r -- "$q_ident_leg" | grep_q 'exit 1' \
+  && ! print -r -- "$q_ident_leg" | grep_q '_verify_listener_identity'; then
   pass "E cmd_k8s_up's image-identity-failure leg kills the port-forward, removes the pid file and exits 1"
 else
   fail "E the extracted identity-failure leg should kill+rm+exit and never bleed into the listener leg (leg=${q_ident_leg})"
@@ -2846,7 +2903,7 @@ else
   fail "_preview_kill_tracked should return 0 for a missing pid file"
 fi
 kt_body="$(typeset -f _preview_kill_tracked)"
-if print -r -- "$kt_body" | grep -q 'kill -TERM' && print -r -- "$kt_body" | grep -q 'kill -KILL'; then
+if print -r -- "$kt_body" | grep_q 'kill -TERM' && print -r -- "$kt_body" | grep_q 'kill -KILL'; then
   pass "_preview_kill_tracked escalates TERM -> KILL"
 else
   fail "_preview_kill_tracked should carry the TERM -> KILL ladder"
@@ -2868,7 +2925,7 @@ else
   fail "_preview_remove_worktree should return 0 for a missing directory"
 fi
 rw_body="$(typeset -f _preview_remove_worktree)"
-if print -r -- "$rw_body" | grep -q 'worktree remove --force'; then
+if print -r -- "$rw_body" | grep_q 'worktree remove --force'; then
   pass "_preview_remove_worktree uses git worktree remove --force"
 else
   fail "_preview_remove_worktree should call git worktree remove --force"
@@ -2878,42 +2935,42 @@ rm -rf "$pv_dir"
 # 15f. cmd_preview wiring body-greps (section-13b style): detached worktree,
 # GitSHA-stamped build, DB reset, git_sha-gated readiness, fail-loud contract.
 preview_body="$(typeset -f cmd_preview)"
-if print -r -- "$preview_body" | grep -q 'worktree add' && print -r -- "$preview_body" | grep -q -- '--detach'; then
+if print -r -- "$preview_body" | grep_q 'worktree add' && print -r -- "$preview_body" | grep_q -- '--detach'; then
   pass "cmd_preview checks out the merge candidate in a detached worktree"
 else
   fail "cmd_preview should git worktree add --detach"
 fi
-if print -r -- "$preview_body" | grep -q '_build_ldflags'; then
+if print -r -- "$preview_body" | grep_q '_build_ldflags'; then
   pass "cmd_preview stamps the preview build via _build_ldflags"
 else
   fail "cmd_preview should stamp GitSHA via _build_ldflags"
 fi
-if print -r -- "$preview_body" | grep -q '_preview_db_reset'; then
+if print -r -- "$preview_body" | grep_q '_preview_db_reset'; then
   pass "cmd_preview resets the isolated preview database"
 else
   fail "cmd_preview should call _preview_db_reset"
 fi
-if print -r -- "$preview_body" | grep -q '_await_preview_healthz'; then
+if print -r -- "$preview_body" | grep_q '_await_preview_healthz'; then
   pass "cmd_preview gates readiness on the git_sha-verified healthz poll"
 else
   fail "cmd_preview should call _await_preview_healthz"
 fi
-if print -r -- "$preview_body" | grep -q 'migrate up'; then
+if print -r -- "$preview_body" | grep_q 'migrate up'; then
   pass "cmd_preview migrates the preview database with the preview binary"
 else
   fail "cmd_preview should run migrate up against the preview database"
 fi
-if print -r -- "$preview_body" | grep -q 'tail -n 15'; then
+if print -r -- "$preview_body" | grep_q 'tail -n 15'; then
   pass "cmd_preview tails the preview log on a failed readiness gate"
 else
   fail "cmd_preview should tail the log on readiness-gate failure"
 fi
-if print -r -- "$preview_body" | grep -q 'exit 1'; then
+if print -r -- "$preview_body" | grep_q 'exit 1'; then
   pass "cmd_preview exits non-zero on failure"
 else
   fail "cmd_preview should exit 1 on failure"
 fi
-if print -r -- "$preview_body" | grep -q 'FISHHAWK_PREVIEW_SHA'; then
+if print -r -- "$preview_body" | grep_q 'FISHHAWK_PREVIEW_SHA'; then
   pass "cmd_preview defaults its arg to \$FISHHAWK_PREVIEW_SHA (runner-hook bare invocation)"
 else
   fail "cmd_preview should default to FISHHAWK_PREVIEW_SHA"
@@ -2922,50 +2979,50 @@ fi
 # behaviorally covered above, and the DB-reset-failure teardown was validated
 # live): empty ref, missing DB URL, unresolvable ref, port squatter, and
 # teardown-on-failure (worktree removal on the post-worktree failure paths).
-if print -r -- "$preview_body" | grep -q 'no SHA to preview'; then
+if print -r -- "$preview_body" | grep_q 'no SHA to preview'; then
   pass "cmd_preview dies loud when neither arg nor FISHHAWK_PREVIEW_SHA is set"
 else
   fail "cmd_preview should _die on an empty ref"
 fi
-if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL is not set'; then
+if print -r -- "$preview_body" | grep_q 'FISHHAWKD_DATABASE_URL is not set'; then
   pass "cmd_preview dies loud when FISHHAWKD_DATABASE_URL is unset"
 else
   fail "cmd_preview should _die on a missing FISHHAWKD_DATABASE_URL"
 fi
-if print -r -- "$preview_body" | grep -q 'could not resolve'; then
+if print -r -- "$preview_body" | grep_q 'could not resolve'; then
   pass "cmd_preview dies loud on an unresolvable ref (after the direct-fetch retry)"
 else
   fail "cmd_preview should _die when the ref resolves to no commit"
 fi
-if print -r -- "$preview_body" | grep -q '_down_port_fallback'; then
+if print -r -- "$preview_body" | grep_q '_down_port_fallback'; then
   pass "cmd_preview pre-empts a stale orphan via the port reclaim (_down_port_fallback)"
 else
   fail "cmd_preview should compose _down_port_fallback for the preview-port preflight"
 fi
-if print -r -- "$preview_body" | grep -q "run 'scripts/dev preview-down'"; then
+if print -r -- "$preview_body" | grep_q "run 'scripts/dev preview-down'"; then
   pass "cmd_preview retains the foreign-case _die guidance ('run scripts/dev preview-down')"
 else
   fail "cmd_preview should retain the foreign-holder _die message (binding condition 2)"
 fi
-if print -r -- "$preview_body" | grep -q '_preview_remove_worktree'; then
+if print -r -- "$preview_body" | grep_q '_preview_remove_worktree'; then
   pass "cmd_preview removes the preview worktree on its post-worktree failure paths"
 else
   fail "cmd_preview should call _preview_remove_worktree on failure"
 fi
 db_reset_body="$(typeset -f _preview_db_reset)"
-if print -r -- "$db_reset_body" | grep -q 'DROP DATABASE IF EXISTS' && print -r -- "$db_reset_body" | grep -q 'CREATE DATABASE'; then
+if print -r -- "$db_reset_body" | grep_q 'DROP DATABASE IF EXISTS' && print -r -- "$db_reset_body" | grep_q 'CREATE DATABASE'; then
   pass "_preview_db_reset DROP/CREATEs the preview database"
 else
   fail "_preview_db_reset should DROP DATABASE IF EXISTS + CREATE DATABASE"
 fi
 # The preview DB is OWNED by the least-privilege role (#1577) so it can run
 # migrate up in its own database (PG15+ public-schema ownership).
-if print -r -- "$db_reset_body" | grep -q 'OWNER'; then
+if print -r -- "$db_reset_body" | grep_q 'OWNER'; then
   pass "_preview_db_reset CREATEs the preview database OWNED by the preview role"
 else
   fail "_preview_db_reset should carry the OWNER clause"
 fi
-if print -r -- "$db_reset_body" | grep -q 'docker exec fishhawk-postgres'; then
+if print -r -- "$db_reset_body" | grep_q 'docker exec fishhawk-postgres'; then
   pass "_preview_db_reset degrades to psql inside the compose container when the host has none"
 else
   fail "_preview_db_reset should carry the docker-exec psql fallback"
@@ -3135,7 +3192,7 @@ if [[ -n "$sp_seedenv_ln" && -n "$sp_shaenv_ln" && -n "$sp_env_ln" ]] && (( sp_s
 else
   fail "cmd_preview should re-apply both env fallbacks after sourcing .env (seed line ${sp_seedenv_ln:-none}, sha line ${sp_shaenv_ln:-none}, env line ${sp_env_ln:-none})"
 fi
-if grep -F 'usage: scripts/dev <up' "${REPO_ROOT}/scripts/dev" | grep -qF 'preview <sha-or-ref> [--seed <scenario>]'; then
+if grep -F 'usage: scripts/dev <up' "${REPO_ROOT}/scripts/dev" | grep_q -F 'preview <sha-or-ref> [--seed <scenario>]'; then
   pass "scripts/dev top-level usage names preview <sha-or-ref> [--seed <scenario>]"
 else
   fail "scripts/dev top-level usage should name the --seed flag"
@@ -3297,45 +3354,45 @@ rm -rf "$sp_wd"
 # 15i. _preview_role_setup body-greps (E31.19 / #1577): least-privilege role
 # provisioning + dev-DB CONNECT denial. Pins the binding approval conditions.
 role_setup_body="$(typeset -f _preview_role_setup)"
-if print -r -- "$role_setup_body" | grep -q 'CREATE ROLE' \
-   && print -r -- "$role_setup_body" | grep -q 'IF NOT EXISTS' \
-   && print -r -- "$role_setup_body" | grep -q 'pg_roles'; then
+if print -r -- "$role_setup_body" | grep_q 'CREATE ROLE' \
+   && print -r -- "$role_setup_body" | grep_q 'IF NOT EXISTS' \
+   && print -r -- "$role_setup_body" | grep_q 'pg_roles'; then
   pass "_preview_role_setup guards CREATE ROLE with WHEN NOT EXISTS (idempotent)"
 else
   fail "_preview_role_setup should CREATE ROLE only IF NOT EXISTS (pg_roles)"
 fi
-if print -r -- "$role_setup_body" | grep -q 'LOGIN'; then
+if print -r -- "$role_setup_body" | grep_q 'LOGIN'; then
   pass "_preview_role_setup creates a LOGIN role"
 else
   fail "_preview_role_setup should create a LOGIN role"
 fi
 # Binding condition 1: normalize-always via an UNCONDITIONAL ALTER ROLE with the
 # least-privilege NOSUPERUSER/NOCREATEROLE attributes, and NO granted SUPERUSER.
-if print -r -- "$role_setup_body" | grep -q 'ALTER ROLE' \
-   && print -r -- "$role_setup_body" | grep -q 'NOSUPERUSER' \
-   && print -r -- "$role_setup_body" | grep -q 'NOCREATEROLE'; then
+if print -r -- "$role_setup_body" | grep_q 'ALTER ROLE' \
+   && print -r -- "$role_setup_body" | grep_q 'NOSUPERUSER' \
+   && print -r -- "$role_setup_body" | grep_q 'NOCREATEROLE'; then
   pass "_preview_role_setup normalizes via ALTER ROLE … NOSUPERUSER NOCREATEROLE (binding condition 1)"
 else
   fail "_preview_role_setup should ALTER ROLE … NOSUPERUSER NOCREATEROLE"
 fi
-if print -r -- "$role_setup_body" | grep -qE '[[:space:]]SUPERUSER'; then
+if print -r -- "$role_setup_body" | grep_q -E '[[:space:]]SUPERUSER'; then
   fail "_preview_role_setup must NOT grant SUPERUSER"
 else
   pass "_preview_role_setup grants no SUPERUSER attribute"
 fi
 # Binding condition 2: REVOKE CONNECT from PUBLIC *and* explicitly from the role.
-if print -r -- "$role_setup_body" | grep -q 'REVOKE CONNECT ON DATABASE' \
-   && print -r -- "$role_setup_body" | grep -q 'FROM PUBLIC'; then
+if print -r -- "$role_setup_body" | grep_q 'REVOKE CONNECT ON DATABASE' \
+   && print -r -- "$role_setup_body" | grep_q 'FROM PUBLIC'; then
   pass "_preview_role_setup revokes CONNECT on the dev DB FROM PUBLIC"
 else
   fail "_preview_role_setup should REVOKE CONNECT … FROM PUBLIC"
 fi
-if print -r -- "$role_setup_body" | grep -q 'FROM ${role}'; then
+if print -r -- "$role_setup_body" | grep_q 'FROM ${role}'; then
   pass "_preview_role_setup ALSO revokes CONNECT explicitly FROM the role (binding condition 2)"
 else
   fail "_preview_role_setup should REVOKE CONNECT … FROM \${role} in addition to PUBLIC"
 fi
-if print -r -- "$role_setup_body" | grep -q 'docker exec fishhawk-postgres'; then
+if print -r -- "$role_setup_body" | grep_q 'docker exec fishhawk-postgres'; then
   pass "_preview_role_setup degrades to psql inside the compose container when the host has none"
 else
   fail "_preview_role_setup should carry the docker-exec psql fallback"
@@ -3343,30 +3400,30 @@ fi
 
 # 15j. cmd_preview wiring (#1577): role setup precedes db reset; both privileged
 # ops use base_url (operator creds); the branch binary gets preview_url only.
-if print -r -- "$preview_body" | grep -q '_preview_role_setup "$base_url"'; then
+if print -r -- "$preview_body" | grep_q '_preview_role_setup "$base_url"'; then
   pass "cmd_preview provisions the least-privilege role against base_url (operator creds)"
 else
   fail "cmd_preview should call _preview_role_setup with base_url"
 fi
-if print -r -- "$preview_body" | grep -q '_preview_db_reset "$base_url"'; then
+if print -r -- "$preview_body" | grep_q '_preview_db_reset "$base_url"'; then
   pass "cmd_preview resets the preview DB against base_url (operator creds)"
 else
   fail "cmd_preview should call _preview_db_reset with base_url"
 fi
-if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL=$preview_url'; then
+if print -r -- "$preview_body" | grep_q 'FISHHAWKD_DATABASE_URL=$preview_url'; then
   pass "cmd_preview hands the branch binary the least-privilege preview_url"
 else
   fail "cmd_preview should exec migrate/serve with FISHHAWKD_DATABASE_URL=\$preview_url"
 fi
 # base_url (operator superuser creds) must NEVER be spliced into a branch-exec
 # FISHHAWKD_DATABASE_URL — only the privileged role-setup/db-reset ops see it.
-if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL=$base_url'; then
+if print -r -- "$preview_body" | grep_q 'FISHHAWKD_DATABASE_URL=$base_url'; then
   fail "cmd_preview must NOT hand base_url to the branch binary"
 else
   pass "cmd_preview never hands base_url to the branch binary"
 fi
 pd_body="$(typeset -f cmd_preview_down)"
-if print -r -- "$pd_body" | grep -q '_preview_kill_tracked' && print -r -- "$pd_body" | grep -q '_down_port_fallback' && print -r -- "$pd_body" | grep -q '_preview_remove_worktree'; then
+if print -r -- "$pd_body" | grep_q '_preview_kill_tracked' && print -r -- "$pd_body" | grep_q '_down_port_fallback' && print -r -- "$pd_body" | grep_q '_preview_remove_worktree'; then
   pass "cmd_preview_down composes kill + port reclaim + worktree-removal"
 else
   fail "cmd_preview_down should call _preview_kill_tracked, _down_port_fallback, and _preview_remove_worktree"
@@ -3490,17 +3547,17 @@ if [[ "${reply[1]}" == "env" && "${reply[2]}" == "-i" ]]; then
 else
   fail "_preview_branch_env should start with 'env -i' (got: ${reply[1]} ${reply[2]})"
 fi
-if print -r -- "${reply[@]}" | grep -q 'leaked-'; then
+if print -r -- "${reply[@]}" | grep_q 'leaked-'; then
   fail "_preview_branch_env leaked a secret into the branch-exec env: ${reply[*]}"
 else
   pass "_preview_branch_env forwards no runner/.env secret to branch code"
 fi
-if print -r -- "${reply[@]}" | grep -q "PATH=${PATH}"; then
+if print -r -- "${reply[@]}" | grep_q "PATH=${PATH}"; then
   pass "_preview_branch_env preserves PATH so the branch binary can boot"
 else
   fail "_preview_branch_env should preserve PATH"
 fi
-if print -r -- "$preview_body" | grep -q '_preview_branch_env'; then
+if print -r -- "$preview_body" | grep_q '_preview_branch_env'; then
   pass "cmd_preview runs the branch binary through the credential-stripped _preview_branch_env"
 else
   fail "cmd_preview should exec migrate up / serve via _preview_branch_env"
@@ -3534,12 +3591,12 @@ if [[ "$sp15m_exec_out" == *'FISHHAWKD_OAUTH_ISSUER=https://localhost:8443'* && 
 else
   fail "_preview_passthrough_env should forward FISHHAWKD_OAUTH_ISSUER/_REQUIRE_LOOPBACK to the child (got: $sp15m_exec_out)"
 fi
-if print -r -- "$sp15m_exec_out" | grep -q 'leaked-'; then
+if print -r -- "$sp15m_exec_out" | grep_q 'leaked-'; then
   fail "_preview_passthrough_env leaked a non-listed .env value into the branch-exec env: $sp15m_exec_out"
 else
   pass "_preview_passthrough_env forwards no leaked value for a non-listed key"
 fi
-if print -r -- "$sp15m_exec_out" | grep -qE 'FISHHAWKD_OAUTH_CLIENT_SECRET|FISHHAWKD_GITHUB_WEBHOOK_SECRET'; then
+if print -r -- "$sp15m_exec_out" | grep_q -E 'FISHHAWKD_OAUTH_CLIENT_SECRET|FISHHAWKD_GITHUB_WEBHOOK_SECRET'; then
   fail "_preview_passthrough_env should never forward FISHHAWKD_OAUTH_CLIENT_SECRET or FISHHAWKD_GITHUB_WEBHOOK_SECRET by name"
 else
   pass "_preview_passthrough_env forwards no non-listed FISHHAWKD_* key by name"
@@ -3633,7 +3690,7 @@ if [[ -n "$sp15m_env_ln" && -n "$sp15m_passthru_ln" && -n "$sp15m_worktree_ln" ]
 else
   fail "cmd_preview should call _preview_passthrough_env after .env and before worktree add (env line ${sp15m_env_ln:-none}, passthrough line ${sp15m_passthru_ln:-none}, worktree line ${sp15m_worktree_ln:-none})"
 fi
-if print -r -- "$preview_body" | grep -qF '_die "invalid FISHHAWKD_OAUTH_ISSUER for the preview passthrough"'; then
+if print -r -- "$preview_body" | grep_q -F '_die "invalid FISHHAWKD_OAUTH_ISSUER for the preview passthrough"'; then
   pass "cmd_preview _die's on a non-zero _preview_passthrough_env"
 else
   fail "cmd_preview should _die on a non-zero _preview_passthrough_env"
@@ -3754,22 +3811,22 @@ if command -v git >/dev/null 2>&1; then
   )
   if [[ -d "$gitfix/main/.claude/worktrees/wt-merged" ]]; then
     scan_out="$(_scan_operator_worktrees "$gitfix/main/.claude/worktrees" refs/remotes/origin/main)"
-    if print -r -- "$scan_out" | grep -qE "^merged"$'\t'".*/wt-merged$"; then
+    if print -r -- "$scan_out" | grep_q -E "^merged"$'\t'".*/wt-merged$"; then
       pass "_scan_operator_worktrees: merged-clean worktree classifies merged"
     else
       fail "_scan: wt-merged should be merged (got: $scan_out)"
     fi
-    if print -r -- "$scan_out" | grep -qE "^dirty"$'\t'".*/wt-merged-dirty$"; then
+    if print -r -- "$scan_out" | grep_q -E "^dirty"$'\t'".*/wt-merged-dirty$"; then
       pass "_scan_operator_worktrees: dirty merged worktree classifies dirty"
     else
       fail "_scan: wt-merged-dirty should be dirty (got: $scan_out)"
     fi
-    if print -r -- "$scan_out" | grep -qE "^active"$'\t'".*/wt-unmerged$"; then
+    if print -r -- "$scan_out" | grep_q -E "^active"$'\t'".*/wt-unmerged$"; then
       pass "_scan_operator_worktrees: unmerged worktree classifies active"
     else
       fail "_scan: wt-unmerged should be active (got: $scan_out)"
     fi
-    if print -r -- "$scan_out" | grep -qE "^detached"$'\t'".*/wt-detached$"; then
+    if print -r -- "$scan_out" | grep_q -E "^detached"$'\t'".*/wt-detached$"; then
       pass "_scan_operator_worktrees: detached worktree classifies detached"
     else
       fail "_scan: wt-detached should be detached (got: $scan_out)"
@@ -3778,12 +3835,12 @@ if command -v git >/dev/null 2>&1; then
     REPO_ROOT="$gitfix/main"
     warn_out="$(_warn_stale_worktrees 2>&1)"
     REPO_ROOT="$orig_repo_root"
-    if print -r -- "$warn_out" | grep -q "/wt-merged$"; then
+    if print -r -- "$warn_out" | grep_q "/wt-merged$"; then
       pass "_warn_stale_worktrees names the merged-clean worktree"
     else
       fail "_warn_stale_worktrees should name wt-merged (got: $warn_out)"
     fi
-    if print -r -- "$warn_out" | grep -qE "wt-merged-dirty|wt-unmerged|wt-detached"; then
+    if print -r -- "$warn_out" | grep_q -E "wt-merged-dirty|wt-unmerged|wt-detached"; then
       fail "_warn_stale_worktrees should name ONLY merged-clean (got: $warn_out)"
     else
       pass "_warn_stale_worktrees excludes dirty/active/detached worktrees"
@@ -3941,7 +3998,7 @@ echo "  child pid 918273  path /tmp/bin/fishhawk-mcp"
 STUB
 chmod +x "${shim_stub_dir}/stale"
 shim_out="$(_warn_stale_shim "${shim_stub_dir}/stale" 2>&1)"; shim_rc=$?
-if [[ "$shim_out" == *"4242"* ]] && print -r -- "$shim_out" | grep -q -- '/mcp' && (( shim_rc == 0 )); then
+if [[ "$shim_out" == *"4242"* ]] && print -r -- "$shim_out" | grep_q -- '/mcp' && (( shim_rc == 0 )); then
   pass "_warn_stale_shim warns (naming the pid and /mcp) on stale probe output"
 else
   fail "_warn_stale_shim should warn naming the pid and /mcp (out: $shim_out rc: $shim_rc)"
@@ -4077,43 +4134,43 @@ rm -rf "$shim_stub_dir"
 
 # 19. Body-greps: cmd_up -> _warn_stale_worktrees, cmd_sweep wiring, dispatch, usage.
 up_body="$(typeset -f cmd_up)"
-if print -r -- "$up_body" | grep -q '_warn_stale_worktrees'; then
+if print -r -- "$up_body" | grep_q '_warn_stale_worktrees'; then
   pass "cmd_up invokes _warn_stale_worktrees"
 else
   fail "cmd_up should invoke _warn_stale_worktrees"
 fi
-if print -r -- "$up_body" | grep -q '_warn_stale_shim'; then
+if print -r -- "$up_body" | grep_q '_warn_stale_shim'; then
   pass "cmd_up invokes _warn_stale_shim"
 else
   fail "cmd_up should invoke _warn_stale_shim (#2831)"
 fi
-if print -r -- "$up_body" | grep -q 'bin/fishhawk-mcp-shim'; then
+if print -r -- "$up_body" | grep_q 'bin/fishhawk-mcp-shim'; then
   pass "cmd_up points the stale-shim probe at bin/fishhawk-mcp-shim"
 else
   fail "cmd_up should probe \${REPO_ROOT}/bin/fishhawk-mcp-shim"
 fi
 sweep_body="$(typeset -f cmd_sweep)"
-if print -r -- "$sweep_body" | grep -q 'cleanup-merged'; then
+if print -r -- "$sweep_body" | grep_q 'cleanup-merged'; then
   pass "cmd_sweep reuses scripts/cleanup-merged"
 else
   fail "cmd_sweep should compose scripts/cleanup-merged"
 fi
-if print -r -- "$sweep_body" | grep -q 'read -q'; then
+if print -r -- "$sweep_body" | grep_q 'read -q'; then
   pass "cmd_sweep gates removal on read -q"
 else
   fail "cmd_sweep should confirm via read -q"
 fi
-if print -r -- "$sweep_body" | grep -q -- '--yes'; then
+if print -r -- "$sweep_body" | grep_q -- '--yes'; then
   pass "cmd_sweep honors --yes"
 else
   fail "cmd_sweep should parse --yes"
 fi
-if print -r -- "$sweep_body" | grep -q -- '--dry-run'; then
+if print -r -- "$sweep_body" | grep_q -- '--dry-run'; then
   pass "cmd_sweep honors --dry-run"
 else
   fail "cmd_sweep should parse --dry-run"
 fi
-if print -r -- "$sweep_body" | grep -q '_prune_aged_artifacts'; then
+if print -r -- "$sweep_body" | grep_q '_prune_aged_artifacts'; then
   pass "cmd_sweep prunes aged run/tmp litter"
 else
   fail "cmd_sweep should call _prune_aged_artifacts"
@@ -4124,7 +4181,7 @@ else
   fail "sweep should be wired into the dispatch case"
 fi
 usage_body="$(typeset -f _usage)"
-if print -r -- "$usage_body" | grep -q 'sweep'; then
+if print -r -- "$usage_body" | grep_q 'sweep'; then
   pass "sweep documented in _usage"
 else
   fail "_usage should document sweep"
@@ -4157,7 +4214,7 @@ if command -v git >/dev/null 2>&1; then
   # listing-only branch and NEVER reach the read -q prompt. Asserting the
   # message distinguishes it from the read-q EOF-cancel path, which would also
   # remove nothing but prove nothing about the tty guard (#1917 review).
-  if print -r -- "$sweep_noninteractive_out" | grep -q 'non-interactive stdin and no --yes — listing only, nothing removed'; then
+  if print -r -- "$sweep_noninteractive_out" | grep_q 'non-interactive stdin and no --yes — listing only, nothing removed'; then
     pass "cmd_sweep: non-tty stdin takes the listing-only branch (never prompts)"
   else
     fail "cmd_sweep should print the non-interactive listing-only message (got: $sweep_noninteractive_out)"
@@ -4168,7 +4225,7 @@ if command -v git >/dev/null 2>&1; then
   out_root="$(cmd_sweep --dry-run 2>&1)"
   cd "$orig_pwd"
   REPO_ROOT="$orig_repo_root"
-  if print -r -- "$out_root" | grep -q 'operator worktrees to remove: 1'; then
+  if print -r -- "$out_root" | grep_q 'operator worktrees to remove: 1'; then
     pass "cmd_sweep: a merged worktree is a removal candidate from the main checkout"
   else
     fail "cmd_sweep should list the merged worktree as a candidate (got: $out_root)"
@@ -4179,7 +4236,7 @@ if command -v git >/dev/null 2>&1; then
   out_self="$(cmd_sweep --dry-run 2>&1)"
   cd "$orig_pwd"
   REPO_ROOT="$orig_repo_root"
-  if print -r -- "$out_self" | grep -q 'operator worktrees to remove: 0'; then
+  if print -r -- "$out_self" | grep_q 'operator worktrees to remove: 0'; then
     pass "cmd_sweep: never lists the worktree containing \$PWD as a candidate"
   else
     fail "cmd_sweep should self-protect the current worktree (got: $out_self)"
@@ -4289,33 +4346,33 @@ fi
 # shipped config text must terminate TLS, bind loopback-only, and forward to the
 # unchanged fishhawkd. A comment-only touch fails these.
 caddy_text="$(_tls_render_caddyfile 8443 /c/server.pem /c/server.key 127.0.0.1:8080)"
-if print -r -- "$caddy_text" | grep -qE '^:8443 \{'; then
+if print -r -- "$caddy_text" | grep_q -E '^:8443 \{'; then
   pass "rendered Caddyfile uses the bare :8443 site address (host-agnostic)"
 else
   fail "rendered Caddyfile should carry a bare ':8443 {' site address (got: $caddy_text)"
 fi
 # CONDITION 1 (binding assertion): the listener is pinned loopback-only.
-if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*bind 127\.0\.0\.1 ::1$'; then
+if print -r -- "$caddy_text" | grep_q -E '^[[:space:]]*bind 127\.0\.0\.1 ::1$'; then
   pass "rendered Caddyfile binds loopback-only (bind 127.0.0.1 ::1) — condition 1"
 else
   fail "rendered Caddyfile MUST contain 'bind 127.0.0.1 ::1' (condition 1 — got: $caddy_text)"
 fi
-if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*tls /c/server\.pem /c/server\.key$'; then
+if print -r -- "$caddy_text" | grep_q -E '^[[:space:]]*tls /c/server\.pem /c/server\.key$'; then
   pass "rendered Caddyfile terminates TLS with the cert/key pair"
 else
   fail "rendered Caddyfile should carry 'tls <cert> <key>' (got: $caddy_text)"
 fi
-if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8080$'; then
+if print -r -- "$caddy_text" | grep_q -E '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8080$'; then
   pass "rendered Caddyfile reverse-proxies to the plain-http fishhawkd (127.0.0.1:8080)"
 else
   fail "rendered Caddyfile should reverse_proxy to 127.0.0.1:8080 (got: $caddy_text)"
 fi
-if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*auto_https off$'; then
+if print -r -- "$caddy_text" | grep_q -E '^[[:space:]]*auto_https off$'; then
   pass "rendered Caddyfile disables auto_https (no ACME)"
 else
   fail "rendered Caddyfile should carry 'auto_https off' (got: $caddy_text)"
 fi
-if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*admin off$'; then
+if print -r -- "$caddy_text" | grep_q -E '^[[:space:]]*admin off$'; then
   pass "rendered Caddyfile disables the admin endpoint (no :2019 listener)"
 else
   fail "rendered Caddyfile should carry 'admin off' (got: $caddy_text)"
@@ -4615,12 +4672,12 @@ rm -rf "$tls_kill_wd"
 # identity proof stays on plain-http fishhawkd), and BEFORE _signal_mcp_activation.
 tls_up_body="$(typeset -f cmd_up)"
 tls_down_body="$(typeset -f cmd_down)"
-if print -r -- "$tls_up_body" | grep -q '_tls_up'; then
+if print -r -- "$tls_up_body" | grep_q '_tls_up'; then
   pass "cmd_up invokes _tls_up"
 else
   fail "cmd_up should invoke _tls_up"
 fi
-if print -r -- "$tls_up_body" | grep -q '_tls_enabled'; then
+if print -r -- "$tls_up_body" | grep_q '_tls_enabled'; then
   pass "cmd_up guards the TLS leg with _tls_enabled (default off)"
 else
   fail "cmd_up should guard the TLS leg with _tls_enabled"
@@ -4639,12 +4696,12 @@ else
   fail "cmd_up should order _tls_up before _signal_mcp_activation (tls=$tls_up_line mcp=$tls_mcp_line)"
 fi
 # cmd_down calls _tls_down UNCONDITIONALLY (condition 2): no _tls_enabled guard.
-if print -r -- "$tls_down_body" | grep -q '_tls_down'; then
+if print -r -- "$tls_down_body" | grep_q '_tls_down'; then
   pass "cmd_down invokes _tls_down"
 else
   fail "cmd_down should invoke _tls_down"
 fi
-if print -r -- "$tls_down_body" | grep -q '_tls_enabled'; then
+if print -r -- "$tls_down_body" | grep_q '_tls_enabled'; then
   fail "cmd_down must NOT guard _tls_down on _tls_enabled (condition 2 — teardown is unconditional)"
 else
   pass "cmd_down tears down the TLS front end unconditionally (no _tls_enabled guard — condition 2)"
@@ -4808,7 +4865,7 @@ else
   # ephemeral port and verify BOTH URL shapes with curl --cacert. Pins the
   # dual-SAN shape + full chain end to end. Skipped if s_server is unavailable.
   s_server_ok=0
-  if echo | openssl s_server -help >/dev/null 2>&1 || openssl s_server -help 2>&1 | grep -qi 'accept'; then
+  if echo | openssl s_server -help >/dev/null 2>&1 || openssl s_server -help 2>&1 | grep_q -i 'accept'; then
     s_server_ok=1
   fi
   if (( ! s_server_ok )); then
@@ -5323,19 +5380,19 @@ rm -rf "$relay_dn_wd"
 # _relay_down UNCONDITIONALLY (no _relay_enabled guard — condition 2).
 relay_up_body="$(typeset -f cmd_up)"
 relay_down_body="$(typeset -f cmd_down)"
-if print -r -- "$relay_up_body" | grep -q '_relay_up'; then
+if print -r -- "$relay_up_body" | grep_q '_relay_up'; then
   pass "cmd_up invokes _relay_up"
 else
   fail "cmd_up should invoke _relay_up"
 fi
-if print -r -- "$relay_up_body" | grep -q '_relay_enabled'; then
+if print -r -- "$relay_up_body" | grep_q '_relay_enabled'; then
   pass "cmd_up guards the relay leg with _relay_enabled (default off)"
 else
   fail "cmd_up should guard the relay leg with _relay_enabled"
 fi
 # The relay call sits in an `if !` tested context (degrade-not-abort). Grep for
 # the wrapper form 'if ! _relay_up'.
-if print -r -- "$relay_up_body" | grep -Eq 'if[[:space:]]+!\s*_relay_up|if ! _relay_up'; then
+if print -r -- "$relay_up_body" | grep_q -E 'if[[:space:]]+!\s*_relay_up|if ! _relay_up'; then
   pass "cmd_up wraps _relay_up in an 'if !' tested context (degrade-not-abort under set -e)"
 else
   fail "cmd_up should wrap _relay_up in 'if ! _relay_up' (degrade-not-abort)"
@@ -5347,12 +5404,12 @@ if [[ -n "$relay_up_line" && -n "$relay_mcp_line" ]] && (( relay_up_line < relay
 else
   fail "cmd_up should order _relay_up before _signal_mcp_activation (relay=$relay_up_line mcp=$relay_mcp_line)"
 fi
-if print -r -- "$relay_down_body" | grep -q '_relay_down'; then
+if print -r -- "$relay_down_body" | grep_q '_relay_down'; then
   pass "cmd_down invokes _relay_down"
 else
   fail "cmd_down should invoke _relay_down"
 fi
-if print -r -- "$relay_down_body" | grep -q '_relay_enabled'; then
+if print -r -- "$relay_down_body" | grep_q '_relay_enabled'; then
   fail "cmd_down must NOT guard _relay_down on _relay_enabled (condition 2 — teardown is unconditional)"
 else
   pass "cmd_down tears down the relay unconditionally (no _relay_enabled guard — condition 2)"
@@ -5454,7 +5511,7 @@ for good in 1 8080 16686 65535; do
 done
 # It must never EXIT (it is called from an `if !` in a tested context): a _die
 # here would kill cmd_k8s_up's caller instead of returning.
-if ( _k8s_validate_port FISHHAWK_K8S_PF_PORT abc >/dev/null 2>&1; print "returned" ) | grep -q returned; then
+if ( _k8s_validate_port FISHHAWK_K8S_PF_PORT abc >/dev/null 2>&1; print "returned" ) | grep_q returned; then
   pass "_k8s_validate_port returns rather than exiting on a rejection"
 else
   fail "_k8s_validate_port must return non-zero, never exit"
@@ -5497,25 +5554,25 @@ fi
 # '16686:16686' / '4318:4318' goes red here).
 k8s_up_body="$(typeset -f cmd_k8s_up)"
 for lit in '8080:8080' '16686:16686' '4318:4318'; do
-  if print -r -- "$k8s_up_body" | grep -qF -- "$lit"; then
+  if print -r -- "$k8s_up_body" | grep_q -F -- "$lit"; then
     fail "cmd_k8s_up must not hardcode the host-side port mapping '${lit}'"
   else
     pass "cmd_k8s_up no longer hardcodes '${lit}'"
   fi
 done
 for hook in _k8s_pf_port _k8s_jaeger_ui_port _k8s_jaeger_otlp_port _k8s_validate_port _preflight_port_free _k8s_forward_arg _verify_listener_identity K8S_PF_LOG_FILE; do
-  if print -r -- "$k8s_up_body" | grep -qF -- "$hook"; then
+  if print -r -- "$k8s_up_body" | grep_q -F -- "$hook"; then
     pass "cmd_k8s_up wires ${hook}"
   else
     fail "cmd_k8s_up should call/use ${hook}"
   fi
 done
-if print -r -- "$k8s_up_body" | grep -q 'source "\${REPO_ROOT}/\.env"'; then
+if print -r -- "$k8s_up_body" | grep_q 'source "\${REPO_ROOT}/\.env"'; then
   pass "cmd_k8s_up sources .env so the FISHHAWK_K8S_* overrides can live there"
 else
   fail "cmd_k8s_up should source .env before resolving the port overrides"
 fi
-if print -r -- "$k8s_up_body" | grep -q 'oauthCallbackUrl'; then
+if print -r -- "$k8s_up_body" | grep_q 'oauthCallbackUrl'; then
   pass "cmd_k8s_up advises on the values-local oauthCallbackUrl coupling for a non-default port"
 else
   fail "cmd_k8s_up should print the oauthCallbackUrl advisory when the port is not 8080"
@@ -5525,12 +5582,12 @@ fi
 # split — cmd_k8s_up must COMPOSE the decision helper (never inline its own
 # preflight for the jaeger ports), and the helper must carry the skip wording.
 # 19g exercises both behaviorally; these two are the done-means tripwires.
-if print -r -- "$k8s_up_body" | grep -q '_k8s_jaeger_decide'; then
+if print -r -- "$k8s_up_body" | grep_q '_k8s_jaeger_decide'; then
   pass "cmd_k8s_up delegates the jaeger forward decision to _k8s_jaeger_decide"
 else
   fail "cmd_k8s_up should gate the jaeger forward on _k8s_jaeger_decide"
 fi
-if print -r -- "$(typeset -f _k8s_jaeger_decide)" | grep -q 'skipping the jaeger forward'; then
+if print -r -- "$(typeset -f _k8s_jaeger_decide)" | grep_q 'skipping the jaeger forward'; then
   pass "_k8s_jaeger_decide warns and SKIPS rather than aborting (divergent-by-design policy)"
 else
   fail "_k8s_jaeger_decide should warn-and-skip, not abort, when a jaeger port is unusable"
@@ -5539,7 +5596,7 @@ fi
 # _k8s_jaeger_endpoints, which cmd_k8s_up may only reach from the decide
 # success branch. If the literal endpoint text reappeared inline, a refused
 # forward could be advertised as live again.
-if print -r -- "$k8s_up_body" | grep -qF 'jaeger UI at http://localhost:'; then
+if print -r -- "$k8s_up_body" | grep_q -F 'jaeger UI at http://localhost:'; then
   fail "cmd_k8s_up must not inline the jaeger endpoint lines (they belong behind _k8s_jaeger_decide)"
 else
   pass "cmd_k8s_up reports jaeger endpoints only via _k8s_jaeger_endpoints"
@@ -5658,12 +5715,12 @@ fi
 # operator-facing text must be byte-identical to the pre-extraction inline
 # block. Assert the remediation suffix and the degrade warning are passed
 # through verbatim rather than reworded by the helper.
-if print -r -- "$up_body" | grep -qF -- "— run 'scripts/dev down', or kill the pid, then retry"; then
+if print -r -- "$up_body" | grep_q -F -- "— run 'scripts/dev down', or kill the pid, then retry"; then
   pass "cmd_up keeps its byte-identical squatter remediation text"
 else
   fail "cmd_up's squatter remediation text changed during the preflight extraction"
 fi
-if print -r -- "$up_body" | grep -qF -- 'warning: lsof not found — skipping port preflight and listener-identity check (degraded)'; then
+if print -r -- "$up_body" | grep_q -F -- 'warning: lsof not found — skipping port preflight and listener-identity check (degraded)'; then
   pass "cmd_up keeps its byte-identical lsof degrade warning"
 else
   fail "cmd_up's lsof degrade warning changed during the preflight extraction"
@@ -5924,7 +5981,7 @@ fi
 # in ONE statement; cmd_up wires the store BEFORE the serve spawn, in the
 # current shell (not a $(...) subshell that would discard the exports).
 ts_boot_body="$(typeset -f _trace_bucket_bootstrap)"
-if print -r -- "$ts_boot_body" | grep -q 'docker compose --profile init run --rm s3-init' \
+if print -r -- "$ts_boot_body" | grep_q 'docker compose --profile init run --rm s3-init' \
    && grep -q 'docker compose --profile init run --rm s3-init' "${REPO_ROOT}/Makefile"; then
   pass "_trace_bucket_bootstrap runs the same compose command as 'make s3-init'"
 else
@@ -5943,7 +6000,7 @@ ts_up_body="$(typeset -f cmd_up)"
 ts_wire_line="$(print -r -- "$ts_up_body" | grep -n '_wire_trace_store "$start_deps"' | head -n 1 | cut -d: -f1)"
 ts_serve_line="$(print -r -- "$ts_up_body" | grep -n ' serve --enable-child-completion-sweeper' | head -n 1 | cut -d: -f1)"
 if [[ -n "$ts_wire_line" && -n "$ts_serve_line" ]] && (( ts_wire_line < ts_serve_line )) \
-   && ! print -r -- "$ts_up_body" | grep -q '\$(_wire_trace_store'; then
+   && ! print -r -- "$ts_up_body" | grep_q '\$(_wire_trace_store'; then
   pass "cmd_up wires the trace store in the current shell BEFORE the fishhawkd spawn"
 else
   fail "cmd_up should call _wire_trace_store \"\$start_deps\" directly before the serve spawn (wire=${ts_wire_line} serve=${ts_serve_line})"
@@ -6274,7 +6331,7 @@ fi
 # DOUBLES the width; two remove the limit). Body-grep, because the assumption is
 # about the SHIPPED invocation, not about a parser the fixtures already cover.
 lr_scan_body="$(typeset -f _scan_live_runs)"
-if print -r -- "$lr_scan_body" | grep -q -- 'ps -axww -o pid=,args='; then
+if print -r -- "$lr_scan_body" | grep_q -- 'ps -axww -o pid=,args='; then
   pass "LR-i _scan_live_runs invokes 'ps -axww -o pid=,args=' (untruncated argv)"
 else
   fail "LR-i _scan_live_runs should use ps -axww (got: ${lr_scan_body})"
@@ -6284,8 +6341,8 @@ fi
 # deliberate refusal never fires the #631 ZERR trap.
 lr_reload_body="$(typeset -f cmd_reload)"
 lr_pm_body="$(typeset -f cmd_post_merge)"
-if print -r -- "$lr_reload_body" | grep -q 'if ! _refuse_on_live_runs' \
-   && print -r -- "$lr_pm_body" | grep -q 'if ! _refuse_on_live_runs'; then
+if print -r -- "$lr_reload_body" | grep_q 'if ! _refuse_on_live_runs' \
+   && print -r -- "$lr_pm_body" | grep_q 'if ! _refuse_on_live_runs'; then
   pass "LR-j both cmd_reload and cmd_post_merge call _refuse_on_live_runs in a tested context"
 else
   fail "LR-j guard call sites must be 'if ! _refuse_on_live_runs' in both cmd_reload and cmd_post_merge"
@@ -6766,12 +6823,12 @@ rm -rf "$gc_tmp"
 gc_up_body="$(typeset -f cmd_up)"
 gc_sweep_body="$(typeset -f cmd_sweep)"
 gc_pm_body="$(typeset -f cmd_post_merge)"
-if print -r -- "$gc_up_body" | grep -q '_warn_gocache_size || true'; then
+if print -r -- "$gc_up_body" | grep_q '_warn_gocache_size || true'; then
   pass "GC-k cmd_up calls _warn_gocache_size non-fatally"
 else
   fail "GC-k cmd_up should call '_warn_gocache_size || true'"
 fi
-if print -r -- "$gc_sweep_body" | grep -q 'if ! _gocache_trim_guarded' && ! print -r -- "$gc_sweep_body" | grep -q '_gocache_size_kb'; then
+if print -r -- "$gc_sweep_body" | grep_q 'if ! _gocache_trim_guarded' && ! print -r -- "$gc_sweep_body" | grep_q '_gocache_size_kb'; then
   pass "GC-k cmd_sweep calls _gocache_trim_guarded in a tested context and never runs the exact du"
 else
   fail "GC-k cmd_sweep wiring (tested trim call, no _gocache_size_kb)"
@@ -6789,7 +6846,7 @@ else
   fail "GC-k post-merge ordering (guard=${gc_pm_guard} pull=${gc_pm_pull} clean=${gc_pm_clean} maint=${gc_pm_maint} reload=${gc_pm_reload})"
 fi
 if grep -qE '^[[:space:]]*gocache\)[[:space:]]*cmd_gocache' "${orig_repo_root}/scripts/dev" \
-   && _usage 2>&1 | grep -q 'gocache \[--trim\] \[--dry-run\]'; then
+   && _usage 2>&1 | grep_q 'gocache \[--trim\] \[--dry-run\]'; then
   pass "GC-k the gocache) dispatch and its usage line are present"
 else
   fail "GC-k gocache dispatch/usage missing"
@@ -7307,8 +7364,8 @@ done
 # separately callable (approval condition C5, #4077).
 rb_reload_body="$(typeset -f cmd_reload)"
 rb_pm_body="$(typeset -f cmd_post_merge)"
-if print -r -- "$rb_reload_body" | grep -q 'if ! _refuse_on_restart_blockers' \
-   && print -r -- "$rb_pm_body" | grep -q 'if ! _refuse_on_restart_blockers'; then
+if print -r -- "$rb_reload_body" | grep_q 'if ! _refuse_on_restart_blockers' \
+   && print -r -- "$rb_pm_body" | grep_q 'if ! _refuse_on_restart_blockers'; then
   pass "RB-m both cmd_reload and cmd_post_merge call _refuse_on_restart_blockers in a tested context"
 else
   fail "RB-m call sites must be 'if ! _refuse_on_restart_blockers' in cmd_reload and cmd_post_merge"
@@ -7323,7 +7380,7 @@ if [[ -n "$rb_guard_at" && -n "$rb_down_at" && -n "$rb_pm_guard_at" && -n "$rb_p
 else
   fail "RB-m guard ordering (reload guard=${rb_guard_at} down=${rb_down_at}; post-merge guard=${rb_pm_guard_at} git=${rb_pm_git_at})"
 fi
-if typeset -f _fetch_restart_blockers | grep -q -- '--max-time 5'; then
+if typeset -f _fetch_restart_blockers | grep_q -- '--max-time 5'; then
   pass "RB-m _fetch_restart_blockers bounds the GET with curl --max-time 5"
 else
   fail "RB-m _fetch_restart_blockers should pass --max-time 5 to curl"
@@ -7338,8 +7395,8 @@ fi
 
 # RB-m (#4077) the two call sites pass their CONTEXT: reload ignores
 # undispatched_child, post-merge stays strict.
-if print -r -- "$rb_reload_body" | grep -q '_refuse_on_restart_blockers "$force" "" reload' \
-   && print -r -- "$rb_pm_body" | grep -q '_refuse_on_restart_blockers "$pm_force" "" post-merge'; then
+if print -r -- "$rb_reload_body" | grep_q '_refuse_on_restart_blockers "$force" "" reload' \
+   && print -r -- "$rb_pm_body" | grep_q '_refuse_on_restart_blockers "$pm_force" "" post-merge'; then
   pass "RB-m cmd_reload passes the reload context and cmd_post_merge the post-merge context"
 else
   fail "RB-m the guard's context arg should be 'reload' in cmd_reload and 'post-merge' in cmd_post_merge"

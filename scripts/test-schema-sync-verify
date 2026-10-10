@@ -18,6 +18,12 @@ FAIL=0
 pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# grep_q: `grep -q` for the read end of a PIPE (#4233). `grep -q` exits on its
+# first match and closes the pipe; a writer with bytes still unwritten then gets
+# EPIPE/SIGPIPE and `pipefail` fails the pipeline even though grep MATCHED. This
+# drains stdin after grep decides. PIPE-ONLY: with a terminal on stdin it blocks.
+grep_q() { local rc=0; grep -q "$@" || rc=$?; cat >/dev/null; return "$rc"; }
+
 tmproot=$(mktemp -d)
 trap 'rm -rf "$tmproot"' EXIT
 
@@ -70,7 +76,7 @@ ROOT="$tmproot/drift"
 make_repo "$ROOT" 'd="$(cd "$(dirname "$0")/.." && pwd)"; echo drifted > "$d/tracked.txt"'
 drift_out="$( (_verify_schema_sync) 2>&1 )"
 drift_rc=$?
-if [ "$drift_rc" -ne 0 ] && printf '%s' "$drift_out" | grep -q 'scripts/sync-schemas'; then
+if [ "$drift_rc" -ne 0 ] && printf '%s' "$drift_out" | grep_q 'scripts/sync-schemas'; then
   pass "drift: sync-schemas producing a change fails non-zero and names scripts/sync-schemas"
 else
   fail "drift: expected non-zero exit + message naming scripts/sync-schemas (rc=$drift_rc, out='$drift_out')"
@@ -119,7 +125,7 @@ chmod +x "$ROOT/scripts/sync-schemas"
 bare_out="$( (_verify_schema_sync) 2>&1 )"
 bare_rc=$?
 if [ "$bare_rc" -eq 0 ] && [ ! -e "$ROOT/REACHED" ] \
-   && printf '%s' "$bare_out" | grep -q 'not a git work tree'; then
+   && printf '%s' "$bare_out" | grep_q 'not a git work tree'; then
   pass "bare git repo: non-worktree is a clean no-op (return 0, sync-schemas never run)"
 else
   fail "bare git repo: expected 0 no-op that skips sync-schemas (rc=$bare_rc, reached=$([ -e "$ROOT/REACHED" ] && echo yes || echo no), out='$bare_out')"
@@ -131,7 +137,7 @@ fi
 ROOT="$tmproot/drift"   # a real git repo — proves the git-absent guard fires first
 nogit_bin_out="$( PATH="/nonexistent" _verify_schema_sync 2>&1 )"
 nogit_bin_rc=$?
-if [ "$nogit_bin_rc" -eq 0 ] && ! printf '%s' "$nogit_bin_out" | grep -q 'drifted from'; then
+if [ "$nogit_bin_rc" -eq 0 ] && ! printf '%s' "$nogit_bin_out" | grep_q 'drifted from'; then
   pass "git-binary-unavailable: PATH stripped of git is a clean no-op (return 0)"
 else
   fail "git-binary-unavailable: expected 0 no-op with no drift error (rc=$nogit_bin_rc, out='$nogit_bin_out')"
