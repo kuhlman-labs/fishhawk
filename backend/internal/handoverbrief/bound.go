@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 
@@ -37,6 +38,8 @@ var ErrBudgetTooSmall = errors.New("handoverbrief: byte budget below the brief's
 //  4. Every collection cut short carries Truncated, OmittedCount and a Cursor
 //     whose Call names the exact underlying query (the digest section, the
 //     campaigns/runs list, the delegation read) at the first omitted element.
+//     A cut campaigns/runs part carries Continuations instead — one cursor per
+//     state with omitted rows (inFlightContinuations) — with Next the first.
 //
 // BriefHash is copied through untouched: a bounded render reports the hash
 // of the canonical, unbounded brief and is NEVER re-hashed.
@@ -168,20 +171,11 @@ func (bd *bounder) floorKeep() []int {
 	return k
 }
 
-// cursorAt names the underlying query for p's element at index i.
+// cursorAt names the underlying query for p's element at index i. In-flight
+// parts are continued per state by inFlightContinuations instead.
 func (bd *bounder) cursorAt(p Part, i int) *Cursor {
 	repo, to := bd.b.Repo, bd.b.Window.ToSequence
-	switch p.Kind {
-	case PartCampaigns, PartRuns:
-		it := p.InFlight[i]
-		off := 0
-		for _, prev := range p.InFlight[:i] {
-			if prev.State == it.State {
-				off++
-			}
-		}
-		return listCursor(repo, p.Kind, it.State, off)
-	case PartWorkflows:
+	if p.Kind == PartWorkflows {
 		return delegationCursor(repo, delegationSource(bd.b), i)
 	}
 	dsec := map[PartKind]digest.SectionKind{
@@ -189,6 +183,66 @@ func (bd *bounder) cursorAt(p Part, i int) *Cursor {
 		PartUnansweredPages: digest.SectionPages, PartOpenDecisions: digest.SectionOpenDecisions,
 	}[p.Kind]
 	return fromDigestCursor(p.Kind, digest.NewCursor(repo, dsec, p.Items[i].SourceSequence, to))
+}
+
+// inFlightContinuations rebuilds a cut in_flight part's continuations, one per
+// state with omitted rows, in state order (inFlightStates, then any state seen
+// only in the items or the existing continuations, in first-appearance order,
+// so nothing is dropped). Every composition reads each state from offset 0, so
+// a state keeping k of its rows is continued at the ABSOLUTE offset k. A state
+// whose rows the cut leaves untouched keeps its existing continuation — the
+// scan-limit one, or an earlier bound's, including one for a state an earlier
+// bound cut entirely (it has no items left) — which is what lets the MCP tool
+// re-bound a REST-bounded part without losing a state. A part from a pre-
+// continuations fishhawkd (Next only) treats Next as its one continuation.
+// The result is non-empty whenever keep < len(p.InFlight).
+func (bd *bounder) inFlightContinuations(p Part, keep int) []Cursor {
+	order := append([]string{}, inFlightStates(p.Kind)...)
+	seen := map[string]bool{}
+	for _, st := range order {
+		seen[st] = true
+	}
+	note := func(st string) {
+		if !seen[st] {
+			seen[st] = true
+			order = append(order, st)
+		}
+	}
+	total, kept := map[string]int{}, map[string]int{}
+	for i, it := range p.InFlight {
+		total[it.State]++
+		if i < keep {
+			kept[it.State]++
+		}
+		note(it.State)
+	}
+	prior := p.Continuations
+	if len(prior) == 0 && p.Next != nil {
+		prior = []Cursor{*p.Next}
+	}
+	existing := map[string]Cursor{}
+	for _, cur := range prior {
+		st := cursorState(cur)
+		existing[st] = cur
+		note(st)
+	}
+	var out []Cursor
+	for _, st := range order {
+		if kept[st] < total[st] {
+			out = append(out, *listCursor(bd.b.Repo, p.Kind, st, kept[st]))
+		} else if cur, ok := existing[st]; ok {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+// cursorState is the state query parameter of a list cursor's call ("" when
+// the call names none).
+func cursorState(cur Cursor) string {
+	_, query, _ := strings.Cut(cur.Call, "?")
+	q, _ := url.ParseQuery(query)
+	return q.Get("state")
 }
 
 func truncatePart(p Part, n int) Part {
@@ -220,7 +274,13 @@ func (bd *bounder) render(keep []int) (Brief, int, error) {
 		if cut := partLen(p) - keep[c]; cut > 0 {
 			np.Truncated, np.Complete = true, false
 			np.OmittedCount = p.OmittedCount + cut
-			np.Next = bd.cursorAt(p, keep[c])
+			if isInFlight(p.Kind) {
+				np.Continuations = bd.inFlightContinuations(p, keep[c])
+				next := np.Continuations[0]
+				np.Next = &next
+			} else {
+				np.Next = bd.cursorAt(p, keep[c])
+			}
 		}
 		out.Sections[r.sec].Parts[r.part] = np
 	}

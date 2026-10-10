@@ -29,7 +29,7 @@ type HandoverBriefInput struct {
 // share. brief_hash is the hash of the canonical, UNBOUNDED composition and
 // is never recomputed over the bounded body.
 type HandoverBriefOutput struct {
-	Brief *handoverbrief.Brief `json:"brief" jsonschema:"the bounded brief; brief_hash identifies the canonical unbounded composition (the value an offer stamps). When truncated is true, next and each part's next name the continuation — each cursor's call is the exact underlying REST query (digest section, campaigns or runs list, delegation read)"`
+	Brief *handoverbrief.Brief `json:"brief" jsonschema:"the bounded brief; brief_hash identifies the canonical unbounded composition (the value an offer stamps). When truncated is true, next and each part's next name the continuation — each cursor's call is the exact underlying REST query (digest section, campaigns or runs list, delegation read). A campaigns or runs part is one list query per state: follow EVERY entry of its continuations (one per state with omitted rows; next is the first)"`
 }
 
 // handoverBriefOutputSchema is the tool's explicit output schema. It is
@@ -86,7 +86,9 @@ same handoverbrief.Bound the REST route applies; brief_hash is carried through
 unchanged. When truncated is true, next (and each part's next / gaps_next)
 names the continuation — its call field is the exact underlying REST query
 (GET /v0/digest?..., GET /v0/campaigns?..., GET /v0/runs?...) to page the
-remainder.
+remainder. A campaigns or runs part reads one list query PER STATE: follow
+EVERY entry of the part's continuations (one per state with omitted rows;
+next is the first) — next alone reaches only the first state's remainder.
 
 Tool errors: repo missing; negative sequences; validation_failed (400);
 authentication_required (401); insufficient_scope / repo_forbidden (403);
