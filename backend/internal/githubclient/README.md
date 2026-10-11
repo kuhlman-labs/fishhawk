@@ -88,6 +88,14 @@ The two substrings (`"clean status"` vs `"unstable status"`) are disjoint, so ne
 - **A nil parent is NOT an error.** A nil `repository`, `issue`, or `parent` all return `(nil, nil)` — an issue with no sub-issue parent is the normal answer — as does a parent that decodes with `Number <= 0` (a bogus `#0` ref is never returned).
 - **Guards reject before any request** (blank owner/name, `number <= 0`), mirroring `ListSubIssues`' guard style. Sub-issues are repo-scoped, so it uses the installation-token path (no `WithProjectsToken` opt-in) and propagates `doGraphQL`'s `ErrForbidden`/`ErrValidation`/transport errors verbatim.
 
+## Native "blocked by" read — `IssueBlockedBy` (#4028)
+
+`IssueBlockedBy` (`projects.go`) reads an issue's native GitHub issue-dependency relation in ONE GraphQL round trip (`repository(owner,name){ issue(number){ blockedBy(first:100){ totalCount nodes{ number repository{ nameWithOwner } } } } }`) and returns one `BlockingIssueRef{Number, Repository}` per blocking issue, `Repository` being the blocker's `nameWithOwner` verbatim (a blocker can live in another repository; the caller decides same-repo-ness). Its only consumers are the campaign dependency paths of `workmgmt/github`; `ListSubIssues` is unchanged.
+
+- **Fail-closed, unlike `IssueParent`.** The result becomes campaign dependency edges, so every ambiguous shape is an error, never an empty or partial list: a null `repository` or `issue` wraps `ErrNotFound` naming the issue; `totalCount` greater than the nodes returned wraps the exported `ErrRelationTruncated` naming the issue and both counts; a node with `number <= 0` or an empty `nameWithOwner` is an error naming the issue. Only a genuinely empty relation returns `(nil, nil)`.
+- **Errors otherwise propagate.** A GraphQL errors envelope (e.g. a host whose `Issue` type has no `blockedBy` field) is `ErrValidation`; a 403 is `ErrForbidden`. Guards (zero scope, blank owner/name, `number <= 0`) reject before any request.
+- **Token.** Issue dependencies are repo-scoped, so it uses the installation-token path (no `WithProjectsToken` opt-in). Every in-repo test runs against an httptest fake: the field shape and its readability under a live App installation token are NOT exercised in-loop and need an operator walk against the real API.
+
 ## Repository activity listings for user reports (#3771 / E81.1)
 
 `ListIssuesUpdatedSince` and `ListIssueCommentsUpdatedSince` (`userreports.go`) list every issue / issue comment in a repository updated at or after a bound — the transport under the user-report source reader (`workmgmt.UserReportReader`). `gitlabclient.ListIssuesUpdatedAfter` is the GitLab peer and carries the same walk.
