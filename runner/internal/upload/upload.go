@@ -2358,7 +2358,8 @@ type ShipPullRequestArgs struct {
 	// failed category C after a successful agent pass and its last verify_run
 	// head is pinned locally: HeadSHA is that pinned commit, BaseSHA its parent,
 	// and VerifiedTreeSHA is EMPTY (nothing certified the tree). The backend
-	// records it under its own verify_resume_checkpoint category.
+	// records it under its own verify_resume_checkpoint category, and only when
+	// the report newly fails the stage category C.
 	ResumeKind string
 
 	PRTitle string

@@ -2566,6 +2566,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// argument is STRENGTHENED, not weakened: a row still pending after the
 	// settle wait is genuinely undecided rather than merely un-awaited.
 	amendmentsFolded := false
+	// scopeFilesAtAgentExit is the scope size the shipped git_diff was computed
+	// against (#4190). The verify-head pin compares it with the post-gate size,
+	// so a fold at agent exit OR mid-loop (#3434) withholds the pin.
+	scopeFilesAtAgentExit := len(cfg.scopeFiles)
 	if res.OK && stageType == "implement" && !cfg.noPR {
 		res.Events = append(res.Events, awaitPendingScopeAmendmentSettle(ctx, client, cfg, mcpBearerToken, stageType, logSink)...)
 		before := len(cfg.scopeFiles)
@@ -2754,6 +2758,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// clause is the LAST one (TruncateReason keeps the tail), and before the
 	// bundle is packed. FAIL-OPEN: a pin failure never changes the category or
 	// the exit. committedGateFailed is read again by the B/C report below.
+	//
+	// Only the agent pass's OWN change is pinned (verifyHeadNotAgentPass): a
+	// head a fix iteration, the auto-format absorb or a scope-amendment fold
+	// changed differs from the git_diff the trace shipped, so it is not pinned,
+	// and with no pin the B/C report below arms no reverify checkpoint — the
+	// next retry is an ordinary agent pass.
 	committedGateFailed := okBeforeCommittedGates && !res.OK && stageType == "implement" && !cfg.noPR
 	var verifyPin verifyHeadPin
 	verifyPinned := false
@@ -2762,7 +2772,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if repoDir == "" {
 			repoDir = "."
 		}
-		if verifyPin, verifyPinned = pinVerifyHead(ctx, cfg, repoDir, res.Events, logSink); verifyPinned {
+		if why := verifyHeadNotAgentPass(ctx, repoDir, res.Events, len(cfg.scopeFiles) > scopeFilesAtAgentExit); why != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"verify_head_pin_skipped","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
+				cfg.runID, cfg.stageID, why)
+		} else if verifyPin, verifyPinned = pinVerifyHead(ctx, cfg, repoDir, res.Events, logSink); verifyPinned {
 			res.FailureReason += verifyHeadFailureSuffix(verifyPin.headSHA, verifyPin.ref)
 		}
 	}

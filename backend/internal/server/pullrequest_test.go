@@ -4100,6 +4100,67 @@ func TestShipPullRequest_FailedReverifyRecordsVerifyResumeCheckpoint(t *testing.
 	}
 }
 
+// TestShipPullRequest_ReverifyCheckpointOnlyOnNewlyFailedC: a reverify report
+// arms a verify_resume_checkpoint ONLY when it newly fails the stage category
+// C. A stage the trace upload already failed (category B: a policy violation
+// or a gating-review reject) must not be armed by the runner's later C report,
+// or an override retry would be served reverify and publish the REJECTED tree
+// with no re-evaluation. A category-B report, or one whose FailStage errors (a
+// fan-in park refuses it), never arms one either. The running + C row is the
+// positive control.
+func TestShipPullRequest_ReverifyCheckpointOnlyOnNewlyFailedC(t *testing.T) {
+	_, rep := reverifyFailureReportFixture(t)
+	for _, tc := range []struct {
+		name        string
+		seedState   run.StageState
+		seedFailCat run.FailureCategory
+		category    string
+		wantArmed   bool
+	}{
+		{"running_stage_C_report_arms", run.StageStateRunning, "", "C", true},
+		{"already_failed_B_stage_C_report", run.StageStateFailed, run.FailureB, "C", false},
+		{"already_failed_C_stage_C_report", run.StageStateFailed, run.FailureC, "C", false},
+		{"running_stage_B_report", run.StageStateRunning, "", "B", false},
+		{"parked_stage_failstage_errors", run.StageStateAwaitingChildren, "", "C", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"outcome": rep.Outcome, "category": tc.category, "reason": rep.Reason,
+				"branch": rep.Branch, "head_sha": rep.HeadSHA, "base_sha": rep.BaseSHA,
+				"resume_kind": resumeKindReverify,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, sf, _, au, rr := newPRServerWithOrch(t)
+			runRow := rr.seedRun()
+			implStage := rr.seedStage(runRow.ID, 0, tc.seedState)
+			implStage.Type = run.StageTypeImplement
+			implStage.RequiresApproval = true
+			if tc.seedFailCat != "" {
+				cat, reason := tc.seedFailCat, "policy violation: forbidden path"
+				implStage.FailureCategory, implStage.FailureReason = &cat, &reason
+			}
+			priv, _ := sf.issue(t, runRow.ID)
+
+			if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, ""); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			au.mu.Lock()
+			entries := append([]audit.ChainAppendParams(nil), au.appended...)
+			au.mu.Unlock()
+			cps := entriesByCategory(entries, CategoryVerifyResumeCheckpoint)
+			if tc.wantArmed && len(cps) != 1 {
+				t.Fatalf("want exactly one %s entry, got %d", CategoryVerifyResumeCheckpoint, len(cps))
+			}
+			if !tc.wantArmed && len(cps) != 0 {
+				t.Fatalf("a report that did not newly fail the stage category C armed %d %s entries: %+v",
+					len(cps), CategoryVerifyResumeCheckpoint, cps)
+			}
+		})
+	}
+}
+
 // TestShipPullRequest_ReverifyReportDropsSentVerifiedTree: a reverify report
 // that DOES carry a verified_tree_sha still records none — the held tree failed
 // verify, so recording it would let a later verified_tree_discarded row name an

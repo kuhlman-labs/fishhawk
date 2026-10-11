@@ -1707,12 +1707,26 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	if pr.Category == "B" {
 		cat = run.FailureB
 	}
+	// newlyFailedC: THIS report moved the stage to failed category C. Only such
+	// a report may arm a reverify checkpoint (#4190): a stage the trace upload
+	// already failed (a category-B policy violation or a gating-review reject)
+	// must never be served its rejected tree on a later override retry.
+	// FailStage's success alone does NOT prove "newly": a same-state re-apply
+	// is an idempotent no-op that returns nil (run.ValidStageTransition), so
+	// the stage's state as the handler loaded it decides. The runner ships its
+	// trace and awaits the response before sending this report, so a trace-time
+	// failure is already visible at that load. Read before FailStage, which may
+	// update the same *Stage in place.
+	wasFailed := stage.State == run.StageStateFailed
+	newlyFailedC := false
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stage.ID, cat, pr.Reason); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"pull-request failure report: fail stage failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
+	} else {
+		newlyFailedC = cat == run.FailureC && !wasFailed
 	}
 
 	// Fix-up recovery (#788): a push_fixup fix-up re-dispatch whose
@@ -1852,7 +1866,12 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	case resumeKindReverify:
 		// E83.80 / #4190: a verify-failed held commit. Its own category keeps a
 		// reverted backend blind to it, exactly as for the push kind above.
-		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, CategoryVerifyResumeCheckpoint, resumeKindReverify, pr, actorKind, actorSubject)
+		// Recorded ONLY when this report newly failed the stage category C
+		// (newlyFailedC above); an already-failed stage or a FailStage error
+		// records nothing, so the next retry is a full agent re-run.
+		if newlyFailedC {
+			s.recordPushResumeCheckpoint(r.Context(), runID, stageID, CategoryVerifyResumeCheckpoint, resumeKindReverify, pr, actorKind, actorSubject)
+		}
 	case resumeKindPushDiscarded:
 		// A PERMANENT consume-side refusal: the runner declined to publish the
 		// held commit and the recorded verified tree is being thrown away. Audit

@@ -175,3 +175,44 @@ func TestReleaseVerifyHeadRef(t *testing.T) {
 		t.Errorf("missing checkpoint_refs_released:\n%s", logSink.String())
 	}
 }
+
+// TestVerifyHeadNotAgentPass: only a head whose committed tree is the FIRST
+// committed verify's tree, with no scope fold, may be pinned. Two distinct
+// commits sharing one tree (a no-op fix iteration's re-commit) stay pinnable; a
+// changed tree, a fold, or a tree that cannot be resolved (fail CLOSED) is not.
+func TestVerifyHeadNotAgentPass(t *testing.T) {
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "a.go"), "package a\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "agent pass", "--no-verify")
+	agentPass := cprGit(t, repo, "rev-parse", "HEAD")
+	sameTree := cprGit(t, repo, "commit-tree", agentPass+"^{tree}", "-m", "no-op re-commit")
+	mustWrite(t, filepath.Join(repo, "a.go"), "package a\n\n// fix edit\n")
+	runGit("commit", "-am", "fix iteration", "--no-verify")
+	changed := cprGit(t, repo, "rev-parse", "HEAD")
+	if sameTree == agentPass {
+		t.Fatal("fixture: the no-op re-commit must be a DISTINCT commit")
+	}
+	const missing1, missing2 = "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
+
+	cases := []struct {
+		name        string
+		events      []agent.Event
+		scopeFolded bool
+		want        string
+	}{
+		{"single_head", []agent.Event{verifyRunAt(agentPass)}, false, ""},
+		{"no_heads", nil, false, ""},
+		{"distinct_commit_same_tree", []agent.Event{verifyRunAt(agentPass), verifyRunAt(sameTree)}, false, ""},
+		{"tree_changed", []agent.Event{verifyRunAt(agentPass), verifyRunAt(changed)}, false, "tree_changed_after_agent_pass"},
+		{"scope_folded", []agent.Event{verifyRunAt(agentPass)}, true, "scope_amendment_folded"},
+		{"unresolvable_fails_closed", []agent.Event{verifyRunAt(missing1), verifyRunAt(missing2)}, false, "verify_tree_unresolvable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := verifyHeadNotAgentPass(context.Background(), repo, tc.events, tc.scopeFolded); got != tc.want {
+				t.Fatalf("verifyHeadNotAgentPass = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

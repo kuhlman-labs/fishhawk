@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -428,4 +429,185 @@ func TestRun_AgentFailureC_NoCommittedGateReport(t *testing.T) {
 	if _, ok := refTarget(repo, checkpointVerifyRef(verifyFixRunID, verifyFixStageID)); ok {
 		t.Error("a verify head was pinned for an agent failure that never reached the gates")
 	}
+}
+
+// bundleVerifyRunHeads lists every non-empty verify_run head_sha in the shipped
+// bundle, in order.
+func bundleVerifyRunHeads(t *testing.T, events []bundle.Line) []string {
+	t.Helper()
+	var heads []string
+	for _, ev := range events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(ev.Data, &p); err == nil && p.HeadSHA != "" {
+			heads = append(heads, p.HeadSHA)
+		}
+	}
+	return heads
+}
+
+// assertNoReverifyArmed asserts the stage sent exactly one category-C failure
+// report carrying NO checkpoint, left no -verify pin, and logged the pin skip
+// with wantReason.
+func assertNoReverifyArmed(t *testing.T, repo string, fu *fakeUploader, log, wantReason string) {
+	t.Helper()
+	reports := failedReports(fu)
+	if len(reports) != 1 {
+		t.Fatalf("failed /pull-request reports = %d, want exactly 1:\n%s", len(reports), log)
+	}
+	if got := reports[0]; got.Category != "C" || got.ResumeKind != "" || got.HeadSHA != "" || got.BaseSHA != "" || got.Branch != "" {
+		t.Errorf("report = category %q resume_kind %q head %q base %q branch %q, want C with NO checkpoint",
+			got.Category, got.ResumeKind, got.HeadSHA, got.BaseSHA, got.Branch)
+	}
+	if target, ok := refTarget(repo, checkpointVerifyRef(verifyFixRunID, verifyFixStageID)); ok {
+		t.Errorf("verify head pinned at %s for a head that is not the agent pass's change", target)
+	}
+	if strings.Contains(log, `"event":"reverify_checkpoint_armed"`) {
+		t.Errorf("reverify_checkpoint_armed logged:\n%s", log)
+	}
+	if want := `"event":"verify_head_pin_skipped","run_id":"` + verifyFixRunID + `","stage_id":"` + verifyFixStageID + `","reason":"` + wantReason + `"`; !strings.Contains(log, want) {
+		t.Errorf("missing %s:\n%s", want, log)
+	}
+}
+
+// TestRun_FixIterationEditThenVerifyFailureC_ArmsNoCheckpoint reproduces the
+// #4190 review sequence: the first fix iteration EDITS a.go and CREATES fix.go,
+// a later no-op fix iteration turns the reproduced outside failure into
+// category C, so the last verify head carries both files while the trace's only
+// git_diff (re-emitted only on a passing stage) lists a.go alone. The reverify
+// consume ships no trace, so arming that head would publish fix.go with no
+// backend policy evaluation. Nothing is pinned and the C report carries no
+// checkpoint: the next retry is an ordinary agent pass.
+func TestRun_FixIterationEditThenVerifyFailureC_ArmsNoCheckpoint(t *testing.T) {
+	repo := gateFailRepo(t)
+	baseSHA := gitHead(t, repo)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			if idx == 1 { // the first fix iteration; idx 2 is a no-op
+				mustWrite(t, filepath.Join(repo, "pkg", "a", "a.go"), "package a\n\n// agent change\n// fix edit\n")
+				mustWrite(t, filepath.Join(repo, "pkg", "a", "fix.go"), "package a\n\n// created by the fix agent\n")
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+	cmd, _ := formVerifyCmd(t, noopPassOut, 0, noopOutsideOut, 1)
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(cmd, 2)
+	fu.promptResp.ScopeFiles = append(fu.promptResp.ScopeFiles, upload.ScopeFile{Path: "pkg/a/fix.go", Operation: "create"})
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+
+	code, log := runGateFail(t, repo, fu, append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+	}
+
+	// Fixture preconditions: a fix iteration really changed the committed tree
+	// (the first head lacks fix.go, the last carries it) and the shipped git_diff
+	// never names fix.go.
+	events := readBundleEvents(t, bundlePath)
+	heads := bundleVerifyRunHeads(t, events)
+	if len(heads) < 2 {
+		t.Fatalf("fixture: want several verify_run heads, got %v:\n%s", heads, log)
+	}
+	first, last := heads[0], heads[len(heads)-1]
+	if err := exec.Command("git", "-C", repo, "cat-file", "-e", first+":pkg/a/fix.go").Run(); err == nil {
+		t.Fatalf("fixture: the first verify head %s already carries pkg/a/fix.go", first)
+	}
+	if err := exec.Command("git", "-C", repo, "cat-file", "-e", last+":pkg/a/fix.go").Run(); err != nil {
+		t.Fatalf("fixture: the last verify head %s lacks pkg/a/fix.go — no fix iteration edit landed:\n%s", last, log)
+	}
+	sawDiff := false
+	for _, ev := range events {
+		if ev.Kind == "git_diff" {
+			sawDiff = true
+			if strings.Contains(string(ev.Data), "fix.go") {
+				t.Fatalf("fixture: a shipped git_diff names fix.go, so it is not the reproduced shape: %s", ev.Data)
+			}
+		}
+	}
+	if !sawDiff {
+		t.Fatalf("fixture: no git_diff shipped:\n%s", log)
+	}
+
+	assertNoReverifyArmed(t, repo, fu, log, "tree_changed_after_agent_pass")
+}
+
+// singleShotInfraVerify is a verify command whose every run fails with the
+// golangci-lint lock infra signature, so the single-shot committed gate
+// (max_iterations 0) absorbs once and then fails category C
+// (gitops.ErrVerifyInfraFailure) WITHOUT any fix iteration.
+func singleShotInfraVerify(t *testing.T) string {
+	t.Helper()
+	out := "level=error msg=\"" + golangciLintLockSignature + "\"\n"
+	cmd, _ := formVerifyCmd(t, out, 1, out, 1)
+	return cmd
+}
+
+// TestRun_NoFixIterationVerifyFailureC_ArmsCheckpoint is the positive control
+// for the two no-arm rows: with NO fix iteration and no scope fold, a
+// category-C gate failure still pins the head and arms the reverify checkpoint.
+func TestRun_NoFixIterationVerifyFailureC_ArmsCheckpoint(t *testing.T) {
+	repo := gateFailRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(singleShotInfraVerify(t), 0)
+
+	code, log := runGateFail(t, repo, fu, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("fixture: agent invocations = %d, want 1 (no fix iteration)", invoker.callIdx)
+	}
+	pinned, ok := refTarget(repo, checkpointVerifyRef(verifyFixRunID, verifyFixStageID))
+	if !ok {
+		t.Fatalf("verify head not pinned:\n%s", log)
+	}
+	reports := failedReports(fu)
+	if len(reports) != 1 {
+		t.Fatalf("failed /pull-request reports = %d, want exactly 1:\n%s", len(reports), log)
+	}
+	if got := reports[0]; got.Category != "C" || got.ResumeKind != resumeKindReverify || got.HeadSHA != pinned {
+		t.Errorf("report = category %q resume_kind %q head %q, want C reverify at the pin %s:\n%s",
+			got.Category, got.ResumeKind, got.HeadSHA, pinned, log)
+	}
+}
+
+// TestRun_ScopeAmendmentFoldedVerifyFailureC_ArmsNoCheckpoint: the positive
+// control's fixture plus an operator-approved scope amendment folded at agent
+// exit. The fold adds pkg/a/extra.go to the committed tree AFTER the trace's
+// git_diff was computed, so the head is not pinned and no checkpoint is armed.
+// The tree never changes across the gate's runs here, so the fold check alone
+// decides.
+func TestRun_ScopeAmendmentFoldedVerifyFailureC_ArmsNoCheckpoint(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := gateFailRepo(t)
+	mustWrite(t, filepath.Join(repo, "pkg", "a", "extra.go"), "package a\n\n// granted file\n")
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(singleShotInfraVerify(t), 0)
+	fu.amendments = []upload.ScopeAmendment{{
+		ID: "amd-4190", RunID: verifyFixRunID, StageID: verifyFixStageID, Status: "approved",
+		Paths:  []upload.ScopeAmendmentPath{{Path: "pkg/a/extra.go", Operation: "create"}},
+		Reason: "the change needs a helper file",
+	}}
+
+	code, log := runGateFail(t, repo, fu, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+	}
+	if !strings.Contains(log, `"event":"scope_amendments_folded"`) {
+		t.Fatalf("fixture: no scope amendment was folded:\n%s", log)
+	}
+	assertNoReverifyArmed(t, repo, fu, log, "scope_amendment_folded")
 }

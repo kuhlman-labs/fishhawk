@@ -18,7 +18,8 @@ import (
 //
 // A standalone open-PR stage whose committed-tree verify failed category C
 // after a SUCCESSFUL agent pass pins the last verify_run head
-// (verifyheadpin.go) and reports a `reverify` held-commit checkpoint. The next
+// (verifyheadpin.go) — only when that head is the agent pass's own change,
+// verifyHeadNotAgentPass — and reports a `reverify` held-commit checkpoint. The next
 // dispatch is served that checkpoint and, instead of re-running the agent, runs
 // the helpers below over the pinned commit, in this order:
 //

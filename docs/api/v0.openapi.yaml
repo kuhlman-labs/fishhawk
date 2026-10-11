@@ -5716,7 +5716,9 @@ components:
             `verified_tree_discarded` row accounts for the tree. `reverify`
             (E83.80 / #4190): the agent pass succeeded but the committed-tree
             verify gate failed category C; `head_sha` names the runner's pinned
-            verify head and `base_sha` its parent, recorded under the
+            verify head and `base_sha` its parent, recorded (only when the
+            report newly fails the stage category C; an already-failed stage
+            records nothing) under the
             `verify_resume_checkpoint` audit category with no
             `verified_tree_sha` (ignored if sent — the held tree failed
             verify). An unrecognized value records NO checkpoint of any kind

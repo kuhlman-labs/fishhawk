@@ -56,6 +56,62 @@ func lastVerifyRunHead(events []agent.Event) (headSHA, treeSHA string) {
 	return "", ""
 }
 
+// firstVerifyRunHead is lastVerifyRunHead's mirror: the head_sha of the FIRST
+// verify_run event carrying one — the committed gates' commit of the agent
+// pass's own tree, before any fix iteration or absorb rewrote it.
+func firstVerifyRunHead(events []agent.Event) string {
+	for _, ev := range events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(ev.Payload, &p); err == nil && p.HeadSHA != "" {
+			return p.HeadSHA
+		}
+	}
+	return ""
+}
+
+// verifyHeadNotAgentPass returns why the last verify_run head must NOT be
+// pinned, or "" when it may be. Only a head whose change is exactly the
+// git_diff already shipped in the trace may be pinned and armed as a reverify
+// checkpoint: that git_diff is emitted from the agent pass's tree and is
+// re-emitted only on a PASSING stage, and the reverify consume ships no trace,
+// so any edit made after the agent pass would reach the PR without backend
+// policy evaluation or the trace-time implement review. Two ways the head can
+// diverge, both refused:
+//
+//   - scopeFolded: a scope amendment was folded (at agent exit or mid-loop),
+//     so the committed tree carries paths the shipped git_diff omits;
+//   - the last head's tree differs from the FIRST committed verify's tree: a
+//     fix iteration (or the auto-format absorb) changed what is committed.
+//
+// A no-op fix iteration (#4036's flake re-run) leaves the tree byte-identical,
+// so its head is still the agent pass's change and stays pinnable. A tree that
+// cannot be resolved FAILS CLOSED (not pinned). No verify_run head at all
+// returns "" so pinVerifyHead logs its own no_verify_run_head skip.
+func verifyHeadNotAgentPass(ctx context.Context, repoDir string, events []agent.Event, scopeFolded bool) string {
+	if scopeFolded {
+		return "scope_amendment_folded"
+	}
+	first := firstVerifyRunHead(events)
+	last, _ := lastVerifyRunHead(events)
+	if first == "" || last == "" || first == last {
+		return ""
+	}
+	firstTree, ferr := gitRevParseTreeOf(ctx, repoDir, first)
+	lastTree, lerr := gitRevParseTreeOf(ctx, repoDir, last)
+	if ferr != nil || lerr != nil || firstTree == "" || lastTree == "" {
+		return "verify_tree_unresolvable"
+	}
+	if firstTree != lastTree {
+		return "tree_changed_after_agent_pass"
+	}
+	return ""
+}
+
 // verifyHeadPin is what pinVerifyHead pinned: the ref, the verify_run head it
 // points at, that head's parent (the base a reverify checkpoint records) and the
 // tree the verify_run judged.
