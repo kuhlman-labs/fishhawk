@@ -4104,8 +4104,14 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// implement_review_started was appended, and the re-dispatch reviews that
 	// same diff. Only the server-internal re-dispatch marker skips it
 	// (review_round_context.go); every ordinary round runs it.
+	//
+	// An operator re-run (#4219) skips it too, for the same reason — the check
+	// already ran for the round being re-run — but only when its marker
+	// VERIFIES (rerunBypassApplies): a marker naming another stage, another
+	// head or a round that is no longer the run's newest runs the check like
+	// an ordinary round.
 	_, redispatch := reviewRedispatchFrom(ctx)
-	if !redispatch {
+	if !redispatch && !s.rerunBypassApplies(ctx, runID, stageID, headSHA) {
 		_ = s.raiseDiffSecretConcerns(ctx, runID, stageID, diff, headSHA)
 	}
 
@@ -4832,8 +4838,16 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// would otherwise find and suppress. Only the server-internal re-dispatch
 	// marker bypasses it (review_round_context.go) — no request path can carry
 	// that marker, so a retried upload of the same head still dedups.
+	//
+	// An operator re-run (#4219) is a SECOND, distinct same-head path: its
+	// marker (reviewRerun) bypasses the guard only when rerunBypassApplies
+	// re-verifies it HERE, inside reviewDispatchMu — the dispatch's (stage,
+	// head) equal the marker's and the run's newest implement_review_started is
+	// exactly the round being re-run. The first dispatch carrying a marker
+	// emits a newer round before it unlocks, so a second dispatch carrying the
+	// same marker fails the re-verification and dedups like any other.
 	reviewDispatchMu.Lock()
-	if headSHA != "" && s.cfg.AuditRepo != nil && !redispatch {
+	if headSHA != "" && s.cfg.AuditRepo != nil && !redispatch && !s.rerunBypassApplies(ctx, runID, stageID, headSHA) {
 		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
 		if lerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list implement_review_started failed — proceeding with dispatch",
