@@ -100,6 +100,13 @@ type mergeRunResponse struct {
 //     It names the verified and current heads and the re-run verb, and an
 //     audit read error is a 500 with nothing recorded (fail-closed). It runs
 //     BEFORE the GateMerger guard because it needs no merge seam;
+//   - 409 review_coverage_incomplete (#4219) when the run is a decomposed
+//     parent with a succeeded slice no SUCCESSFUL agent review covers (see
+//     reviewCoverageRefusal). It names the uncovered slices and the verb that
+//     clears it (fishhawk_rerun_review, or fishhawk_await_review while a round
+//     is in flight). A read error is a 500 with nothing recorded
+//     (fail-closed). It runs right after acceptance_stale, before the
+//     GateMerger guard;
 //   - 503 when the merge seam (GateMerger) is unconfigured;
 //   - 409 merge_conflicting when the PR has a merge conflict against its base
 //     (E64.14 / #3109). This guard is BEST-EFFORT and FAIL-OPEN — it refuses
@@ -298,6 +305,24 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if stale != nil {
 		s.writeMergeReadinessRefusal(w, r, runID, prURL, stale)
+		return
+	}
+
+	// Review-coverage hold (#4219): a decomposed parent merges only when every
+	// slice is covered by a SUCCESSFUL agent review — the parent's latest
+	// implement-review round carries a verdict, or each succeeded slice's own
+	// latest round does. An infra-failed consolidated round covers nothing.
+	// Same placement and posture as the stale-acceptance guard: before the
+	// GateMerger guard (no merge seam needed), 409 with nothing recorded, and
+	// FAIL-CLOSED on a read error (500, nothing recorded).
+	coverage, cerr := s.reviewCoverageRefusal(r.Context(), runRow)
+	if cerr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"read review coverage failed", map[string]any{"error": cerr.Error()})
+		return
+	}
+	if coverage != nil {
+		s.writeMergeReadinessRefusal(w, r, runID, prURL, coverage)
 		return
 	}
 

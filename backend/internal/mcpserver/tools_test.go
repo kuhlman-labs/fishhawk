@@ -3445,7 +3445,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// concerns of the run only; the backend refuses EVERY agent token
 	// (resolve_requires_human). Its own tool, not a waive mode: it records
 	// addressed, not waived, under a different audit category. 74 -> 75.
-	const wantToolCount = 75
+	//
+	// #4219 (E83.92) adds exactly ONE tool — fishhawk_rerun_review, the thin
+	// wrapper over POST /v0/runs/{run_id}/reviews/rerun. WHEN: a run's latest
+	// implement-review round settled with ZERO verdicts (every reviewer failed
+	// or was skipped), e.g. the decomposed-parent review_coverage_incomplete
+	// hold. ELIGIBILITY: write:runs; the backend refuses run-bound and
+	// delegated operator-agent tokens. Its own tool, not a reconcile mode:
+	// reconcile CLOSES an orphaned round, this DISPATCHES a new one, under a
+	// different audit category. 75 -> 76.
+	const wantToolCount = 76
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3795,6 +3804,22 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawReconcileReviews {
 		t.Error("fishhawk_reconcile_reviews is not registered/visible over ListTools")
+	}
+
+	// fishhawk_rerun_review (#4219) must likewise be wire-visible: it is the
+	// only recovery for the review_coverage_incomplete hold that merge_run,
+	// next_actions and the gate view all name, and the 75 -> 76 bump alone
+	// would stay green if its registration were dropped and a DIFFERENT tool
+	// added in the same change.
+	var sawRerunReview bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_rerun_review" {
+			sawRerunReview = true
+			break
+		}
+	}
+	if !sawRerunReview {
+		t.Error("fishhawk_rerun_review is not registered/visible over ListTools — the review_coverage_incomplete recovery verb is unreachable")
 	}
 
 	// fishhawk_arbitrate_acceptance (#2474) must be wire-visible AND its

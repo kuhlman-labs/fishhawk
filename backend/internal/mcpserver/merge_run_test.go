@@ -2011,3 +2011,43 @@ func TestMergeReadinessOutput_EmptyMessageFallback(t *testing.T) {
 		t.Errorf("out = %+v, want a fallback message naming approve_pr and no pr_url param", out)
 	}
 }
+
+// TestMergeRun_ReviewCoverageIncomplete_ImmediateStatus pins the #4219 arm:
+// the backend's 409 review_coverage_incomplete is an IMMEDIATE status (no
+// poll, no verdict row) whose next_action is details.next_step —
+// fishhawk_rerun_review, or fishhawk_await_review (stage implement) — and a
+// missing or unknown next_step falls back to the read-only await. It NEVER
+// offers the merge.
+func TestMergeRun_ReviewCoverageIncomplete_ImmediateStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		details   map[string]any
+		wantVerb  string
+		wantStage string
+	}{
+		{"rerun", map[string]any{"next_step": "fishhawk_rerun_review"}, "fishhawk_rerun_review", ""},
+		{"await", map[string]any{"next_step": "fishhawk_await_review"}, "fishhawk_await_review", "implement"},
+		{"fallback without next_step", map[string]any{}, "fishhawk_await_review", "implement"},
+		{"unknown next_step", map[string]any{"next_step": "fishhawk_merge_run"}, "fishhawk_await_review", "implement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := "review coverage is incomplete: slice 1 (child c1) of this decomposed parent was never covered by a successful agent review"
+			out, runID := runReadinessRefusal(t, "review_coverage_incomplete", msg, tc.details)
+			if out.Status != "review_coverage_incomplete" {
+				t.Fatalf("status = %q, want review_coverage_incomplete", out.Status)
+			}
+			if out.Message != msg {
+				t.Errorf("message = %q, want the server's verbatim", out.Message)
+			}
+			if out.NextAction == nil || out.NextAction.Action != tc.wantVerb {
+				t.Fatalf("next_action = %+v, want %s", out.NextAction, tc.wantVerb)
+			}
+			if out.NextAction.Params["run_id"] != runID.String() || out.NextAction.Params["stage"] != tc.wantStage {
+				t.Errorf("next_action params = %v, want run_id + stage %q", out.NextAction.Params, tc.wantStage)
+			}
+			if out.MergeQueued || out.NextAction.Consumes != consumesNone {
+				t.Errorf("merge_queued=%v consumes=%q, want false / none", out.MergeQueued, out.NextAction.Consumes)
+			}
+		})
+	}
+}

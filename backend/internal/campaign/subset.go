@@ -146,12 +146,13 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 			// all-children sweep performs (#2120) is now visible/auditable.
 			// childByNumber indexes ALL children (included and excluded), so the
 			// lookup resolves; an unexpectedly-missing target fails closed
-			// (treated as excluded-incomplete) rather than panicking.
+			// (treated as excluded-incomplete) rather than panicking. The
+			// recorded edge keeps the source the provider read it from (#4028).
 			if child, ok := childByNumber[e.To]; ok && child.Complete {
 				if _, seen := seenSatisfied[[2]int{e.From, e.To}]; !seen {
 					seenSatisfied[[2]int{e.From, e.To}] = struct{}{}
 					satisfied = append(satisfied, workmgmt.SatisfiedEdge{
-						From: e.From, To: e.To, State: "closed", StateReason: "completed",
+						From: e.From, To: e.To, State: "closed", StateReason: "completed", Source: e.Source,
 					})
 				}
 				continue

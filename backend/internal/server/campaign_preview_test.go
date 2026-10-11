@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -775,5 +776,168 @@ func TestPreviewCampaign_ExplicitProviderOverridesConventions(t *testing.T) {
 	}
 	if got := previewItemRefs(rep); len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {
 		t.Errorf("items = %v, want the EXPLICIT provider's noEpicDAG set [issue:101 issue:102]", got)
+	}
+}
+
+// --- edge sources and legacy_text warnings (#4028) ---
+
+// TestPreviewCampaign_LegacyTextEdges_Warn is C15's preview half, on BOTH the
+// valid and the dangling path. The dangling row's ONLY legacy edge is a
+// DroppedEdge, so a helper restricted to in-set Edges loses it; the native-only
+// row pins that a native edge never warns. COUNTERFACTUAL VEHICLE: delete the
+// Warnings assignment in handlePreviewCampaign (valid row) or in
+// partialPreviewReport (dangling row).
+func TestPreviewCampaign_LegacyTextEdges_Warn(t *testing.T) {
+	cases := []struct {
+		name         string
+		result       *workmgmt.EpicChildrenResult
+		wantValid    bool
+		wantWarnings []campaignDependencyWarning
+	}{
+		{
+			name:      "valid",
+			result:    legacyWarningResult(),
+			wantValid: true,
+			wantWarnings: []campaignDependencyWarning{{
+				IssueRef: "issue:3", Code: "legacy_text_dependency", Targets: []string{"issue:1", "issue:51"},
+			}},
+		},
+		{
+			name: "dangling_only_legacy_edge_is_dropped",
+			result: &workmgmt.EpicChildrenResult{
+				Children:     []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}},
+				Edges:        []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+				DroppedEdges: []workmgmt.DependsEdge{{From: 2, To: 99, Reason: workmgmt.DropNotChild, Source: workmgmt.DependencySourceLegacyText}},
+			},
+			wantValid: false,
+			wantWarnings: []campaignDependencyWarning{{
+				IssueRef: "issue:2", Code: "legacy_text_dependency", Targets: []string{"issue:99"},
+			}},
+		},
+		{
+			name: "native_only",
+			result: &workmgmt.EpicChildrenResult{
+				Children: []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}},
+				Edges:    []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+			},
+			wantValid: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			registerEpicProvider(t, &fakeEpicProvider{result: tc.result})
+			s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+			w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+			rep := decodePreview(t, w)
+			if rep.Valid != tc.wantValid {
+				t.Fatalf("valid = %v, want %v (body=%s)", rep.Valid, tc.wantValid, w.Body.String())
+			}
+			if tc.wantWarnings == nil {
+				if strings.Contains(w.Body.String(), `"warnings"`) {
+					t.Errorf("native-only preview carries warnings: %s", w.Body.String())
+				}
+				return
+			}
+			if len(rep.Warnings) != len(tc.wantWarnings) {
+				t.Fatalf("warnings = %+v, want %+v", rep.Warnings, tc.wantWarnings)
+			}
+			for i, want := range tc.wantWarnings {
+				got := rep.Warnings[i]
+				if got.IssueRef != want.IssueRef || got.Code != want.Code || !reflect.DeepEqual(got.Targets, want.Targets) {
+					t.Errorf("warning[%d] = %+v, want %+v", i, got, want)
+				}
+				if got.Message == "" {
+					t.Errorf("warning[%d] has no message", i)
+				}
+			}
+		})
+	}
+}
+
+// TestPreviewCampaign_EdgeSources is C16: edges[], dangling[].source and
+// satisfied_dependencies[].source each carry the provider's tag — one native
+// and one legacy_text of each. COUNTERFACTUAL VEHICLE: drop any Source mapping
+// (previewEdges, danglingPreview's appendEdges, satisfiedDependencyPayloads)
+// and its field is omitted.
+func TestPreviewCampaign_EdgeSources(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		registerEpicProvider(t, &fakeEpicProvider{result: legacyWarningResult()})
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+		wantEdges := []campaignPreviewEdge{
+			{From: "issue:2", To: "issue:1", Source: "native"},
+			{From: "issue:3", To: "issue:1", Source: "legacy_text"},
+		}
+		if !reflect.DeepEqual(rep.Edges, wantEdges) {
+			t.Errorf("edges = %+v, want %+v", rep.Edges, wantEdges)
+		}
+		sat := map[int]string{}
+		for _, sd := range rep.SatisfiedDependencies {
+			sat[sd.From] = sd.Source
+		}
+		if sat[2] != "native" || sat[3] != "legacy_text" {
+			t.Errorf("satisfied_dependencies sources = %v, want 2:native 3:legacy_text", sat)
+		}
+	})
+	t.Run("dangling", func(t *testing.T) {
+		registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}, {Number: 3, Title: "c"}},
+			Edges:    []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+			DroppedEdges: []workmgmt.DependsEdge{
+				{From: 2, To: 98, Reason: workmgmt.DropNotChild, Source: workmgmt.DependencySourceNative},
+				{From: 3, To: 99, Reason: workmgmt.DropNotChild, Source: workmgmt.DependencySourceLegacyText},
+			},
+		}})
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+		if rep.Valid {
+			t.Fatal("valid = true, want a dangling report")
+		}
+		got := map[string]string{}
+		for _, d := range rep.Dangling {
+			got[d.From+"->"+d.To] = d.Source
+		}
+		want := map[string]string{"issue:2->issue:98": "native", "issue:3->issue:99": "legacy_text"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("dangling sources = %v, want %v", got, want)
+		}
+		// The partial report still carries the in-set edges with their source.
+		if !reflect.DeepEqual(rep.Edges, []campaignPreviewEdge{{From: "issue:2", To: "issue:1", Source: "native"}}) {
+			t.Errorf("partial-report edges = %+v, want the one native in-set edge", rep.Edges)
+		}
+	})
+	t.Run("no_edges_is_an_empty_array", func(t *testing.T) {
+		registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{{Number: 1, Title: "a"}},
+		}})
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+		if !strings.Contains(w.Body.String(), `"edges":[]`) {
+			t.Errorf("preview with no edges = %s, want \"edges\":[]", w.Body.String())
+		}
+	})
+}
+
+// TestPreviewEdges_KeepsOnlyInSetEdgesSorted pins previewEdges' filter and
+// order directly: an edge with an endpoint outside the resolved children is
+// excluded (it is reported under dangling, not edges), and the rest are sorted
+// by (from, to) issue number regardless of input order.
+func TestPreviewEdges_KeepsOnlyInSetEdgesSorted(t *testing.T) {
+	got := previewEdges(&workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 1}, {Number: 2}, {Number: 3}},
+		Edges: []workmgmt.DependsEdge{
+			{From: 3, To: 2, Source: workmgmt.DependencySourceLegacyText},
+			{From: 3, To: 1, Source: workmgmt.DependencySourceNative},
+			{From: 2, To: 40, Source: workmgmt.DependencySourceNative},
+			{From: 2, To: 1},
+		},
+	})
+	want := []campaignPreviewEdge{
+		{From: "issue:2", To: "issue:1"},
+		{From: "issue:3", To: "issue:1", Source: "native"},
+		{From: "issue:3", To: "issue:2", Source: "legacy_text"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("previewEdges = %+v, want %+v", got, want)
 	}
 }

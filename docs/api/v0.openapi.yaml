@@ -2331,7 +2331,7 @@ components:
             no open concerns.
         derived_status:
           type: string
-          enum: [awaiting_merge, ci_failed]
+          enum: [awaiting_merge, ci_failed, review_coverage_incomplete]
           description: |
             Presentation-only drive-mode status (#1023):
             `awaiting_merge` while a non-terminal drive run with an
@@ -2350,7 +2350,13 @@ components:
             carrying no verdict about the code — so no red verdict
             remains at the latest observed rows. `ci_recovered` is a
             rule value, NOT a `derived_status` (the field goes absent
-            while the remaining required checks conclude). Never a
+            while the remaining required checks conclude).
+            `review_coverage_incomplete` (#4219) is stamped INSTEAD of
+            `awaiting_merge` on a decomposed parent whose review evidence
+            settled with a succeeded slice no successful agent review
+            covers; the merge endpoint refuses the same state, and the
+            drive re-asserts `awaiting_merge` once a review round records a
+            verdict (`POST /v0/runs/{run_id}/reviews/rerun`). Never a
             persisted run state:
             `state` stays `running` while parked here, and the
             transition table in `backend/internal/run/transition.go` is
@@ -2649,20 +2655,29 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         stage_type:
           type: string
-          description: The superseded stage's type (`acceptance` or `review`).
+          description: |
+            The superseded stage's type: `acceptance` or `review` for a parked
+            stage; `implement`, `review` or `acceptance` for a stage the
+            opt-in stranded arm retired (#4222).
         from_state:
           type: string
           description: |
             The state the stage was parked in when the merge made it
             unreachable (`awaiting_host_dispatch` or `awaiting_approval`); for a
-            repaired row, `superseded` (the stage had already moved).
+            stranded stage (#4222), `dispatched`, `running` or (a review /
+            acceptance gate never opened) `pending`; for a repaired row,
+            `superseded` (the stage had already moved).
         reason:
           type: string
-          enum: [merge_observed, operator_reconcile, repair]
+          enum: [merge_observed, operator_reconcile, operator_reconcile_stranded, repair]
           description: |
             What ran the supersession: the merge-observation path swept it, an
-            operator invoked `reconcile-merge`, or a missing audit row was
-            repaired (transitioning nothing).
+            operator invoked `reconcile-merge`, an operator invoked it with
+            `{"supersede_stranded": true}` and the stage was stranded in flight
+            or a never-opened gate (`operator_reconcile_stranded`, #4222; its
+            audit row also carries `last_activity_at` and
+            `idle_threshold_seconds`), or a missing audit row was repaired
+            (transitioning nothing).
 
     RunEscalations:
       type: object
@@ -3155,8 +3170,9 @@ components:
             block adds `crew_consults` when any of its reads failed. The gate
             isolation block adds `gate_isolation_recorded` when its read, or the
             decode of any of its rows, failed. The merge-readiness block adds
-            `merge_readiness` when the run's stages or its acceptance re-open /
-            outcome history could not be read.
+            `merge_readiness` when the run's stages, its acceptance re-open /
+            outcome history or its review-coverage history (#4219) could not
+            be read.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3223,9 +3239,10 @@ components:
           type: array
           items: { $ref: '#/components/schemas/GateViewMergeBlocker' }
           description: |
-            Each determined refusal: `acceptance_stale` and/or
-            `approval_dismissed`, with the merge endpoint's message and details
-            verbatim (see that operation's 409 cases 8 and 9).
+            Each determined refusal: `acceptance_stale`,
+            `review_coverage_incomplete` (#4219) and/or `approval_dismissed`,
+            with the merge endpoint's message and details verbatim (see that
+            operation's 409 cases 8, 10 and 9).
         undetermined:
           type: array
           items: { type: string }
@@ -3233,9 +3250,11 @@ components:
             Each check that could not reach a verdict and why: the approval
             check's fail-open reasons (`approval dismissal: …` — e.g. no GitHub
             client, a read error, a `mergeable_state` other than `blocked`),
-            and an acceptance-history read failure (`acceptance staleness: …`,
-            which also adds the `merge_readiness` `history_gaps` entry). An
-            empty `blockers` is not "nothing blocks" while this is non-empty.
+            an acceptance-history read failure (`acceptance staleness: …`) and
+            a review-coverage read failure (`review coverage: …`, #4219); each
+            history read failure also adds the single `merge_readiness`
+            `history_gaps` entry. An empty `blockers` is not "nothing blocks"
+            while this is non-empty.
 
     GateViewMergeBlocker:
       type: object
@@ -3243,7 +3262,7 @@ components:
       properties:
         code:
           type: string
-          enum: [acceptance_stale, approval_dismissed]
+          enum: [acceptance_stale, review_coverage_incomplete, approval_dismissed]
         message:
           type: string
           description: The merge endpoint's refusal message, verbatim.
@@ -3834,6 +3853,12 @@ components:
             and `merge_pr` (the backend parked the run at `awaiting_merge`;
             the accompanying `detail` states any outstanding advisory
             reviewer rejects or unresolved concerns — #2487).
+            `rerun_review` / `await_review` (#4219) accompany a
+            `review_coverage_incomplete` park: the parent's latest
+            implement-review round settled with no verdict (re-run it with
+            `POST /v0/runs/{run_id}/reviews/rerun`), or a round is in flight
+            or not yet dispatched (await it); the `detail` is the merge
+            endpoint's refusal message.
             `run_implement_stage` / `run_plan_stage` are now ALSO produced
             by the `retry_stage` and `resume_run`/`recover` re-open paths
             on a `local` run (#1271), not only by plan-approve and revise;
@@ -3880,7 +3905,10 @@ components:
         latest observed rows: the parking conclusion was `cancelled`/
         `stale`, a head superseded by a newer push, so the run returns
         to awaiting its remaining checks rather than the `ci_failed`
-        dead end).
+        dead end), `review_coverage_incomplete` (#4219 — stamped instead of
+        `checks_green_awaiting_merge` on a decomposed parent with a
+        succeeded slice no successful agent review covers; detection only,
+        it parks and never advances).
       required: [rule, from, to, ts]
       properties:
         rule:
@@ -4308,8 +4336,50 @@ components:
             $ref: '#/components/schemas/SatisfiedDependency'
         admission_screen:
           $ref: '#/components/schemas/CampaignAdmissionScreen'
+        warnings:
+          type: array
+          description: |
+            One entry per item whose `depends_on` relies on a legacy free-text
+            `Depends on:` line rather than the tracker's native "blocked by"
+            relation (#4028). INFORMATIONAL: the campaign was created and the
+            edge is honoured; a create is never refused on a warning. Like
+            `satisfied_dependencies` this is CREATE-response-only — NOT
+            persisted, so GET/list/status responses and an idempotent replay
+            omit it. Omitted when no edge is `legacy_text`.
+          items:
+            $ref: '#/components/schemas/CampaignDependencyWarning'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CampaignDependencyWarning:
+      type: object
+      description: |
+        One item relying on at least one legacy free-text `Depends on:` line
+        (#4028). Shared by the `POST /v0/campaigns` and
+        `POST /v0/campaigns/preview` responses.
+      required: [issue_ref, code, targets, message]
+      properties:
+        issue_ref:
+          type: string
+          description: The item relying on the legacy line, as `issue:N`.
+          example: "issue:1441"
+        code:
+          type: string
+          enum: [legacy_text_dependency]
+        targets:
+          type: array
+          items: { type: string }
+          description: |
+            The item's dependency targets read from legacy lines — in-set,
+            dangling and satisfied alike — sorted and deduped, rendered as
+            `issue:N` (or `unparsable:<digest>:"<token>"` for an unresolvable
+            target).
+        message:
+          type: string
+          description: |
+            Names the issue, the targets and the remedy: add a native "blocked
+            by" link for each, so the dependency survives once legacy parsing
+            is retired. The line is honoured until then.
 
     CampaignAdmissionScreen:
       type: object
@@ -4390,6 +4460,40 @@ components:
           type: string
           description: The target's observed `state_reason` (e.g. `completed`).
           example: completed
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: |
+            Where the elided edge was read from (#4028): `native` (the
+            tracker's native dependency relation) or `legacy_text` (a
+            line-start `Depends on:` body line). Absent only for a provider
+            that does not tag sources.
+
+    CampaignPreviewEdge:
+      type: object
+      description: |
+        One IN-SET `depends_on` edge in a `CampaignPreview` (#4028): both
+        endpoints are resolved items. It is where a preview names an in-set
+        edge's source; an item's `depends_on` carries only the target ref.
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          description: The depending issue, as `issue:N`.
+          example: "issue:1442"
+        to:
+          type: string
+          description: The in-set dependency target, as `issue:N`.
+          example: "issue:1441"
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: |
+            `native` for an edge read from the tracker's native "blocked by"
+            relation, `legacy_text` for one parsed from a line-start
+            `Depends on:` body line (every such line is read). An edge present
+            in both is ONE edge tagged `native`. Absent only for a provider
+            that does not tag sources.
 
     CampaignPreviewItem:
       type: object
@@ -4454,6 +4558,10 @@ components:
         remedy:
           type: string
           description: One short operator-facing sentence naming what to do about this edge.
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: Where the blocking edge was read from (#4028). Absent only for a provider that does not tag sources.
 
     CampaignPreview:
       type: object
@@ -4461,7 +4569,7 @@ components:
         The `POST /v0/campaigns/preview` report (#3647). It is a REPORT, not a
         campaign: nothing is persisted, so it carries no `id`, `state` or
         timestamps.
-      required: [valid, repo, item_count, items]
+      required: [valid, repo, item_count, items, edges]
       properties:
         valid:
           type: boolean
@@ -4496,6 +4604,21 @@ components:
             valid and the INVALID path, so an operator iterating toward a closed
             set sees the partial graph alongside the blocking edges — `waves`
             may be omitted on an invalid set, `items` and their edges may not.
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPreviewEdge' }
+          description: |
+            The in-set `depends_on` edges with their source (#4028), sorted by
+            (`from`, `to`) issue number. ALWAYS present on both the valid and
+            the invalid path; an empty array when the set has no in-set edge.
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignDependencyWarning' }
+          description: |
+            One entry per item relying on a legacy free-text `Depends on:` line
+            (#4028), the same block the create response carries. Present on
+            both paths; INFORMATIONAL — it never makes the set invalid. Absent
+            when no edge is `legacy_text`.
         satisfied_dependencies:
           type: array
           items: { $ref: '#/components/schemas/SatisfiedDependency' }
@@ -5581,7 +5704,14 @@ components:
             `push_discarded` means a preserved push checkpoint was PERMANENTLY
             refused at consume time: no checkpoint is recorded and a
             `verified_tree_discarded` audit row accounts for the thrown-away
-            tree. An unrecognized value records NO checkpoint of either kind —
+            tree. `reverify` (E83.80 / #4190) means the agent pass succeeded
+            but the committed-tree verify gate failed category C: `head_sha` is
+            the runner's pinned `fishhawk verify wip` commit, `base_sha` its
+            parent, and the handler records them under its own
+            `verify_resume_checkpoint` audit category with NO verified tree
+            (the held tree is the one that failed verify), for the same
+            rollback property as `push`. An unrecognized value records NO
+            checkpoint of any kind —
             not even the legacy `pull_request_failed` one, which carries no kind
             discriminator and would be served as `pr_open` — so the retry fails
             safe to a full agent re-run; it is never a 400 (that would strand
@@ -5770,21 +5900,29 @@ components:
             fixup_pushed audit entry.
         resume_kind:
           type: string
-          enum: [push, push_discarded]
+          enum: [push, push_discarded, reverify]
           description: |
-            Present only on an `outcome: failed` report, and only for the two
-            E45.86 / #3621 kinds — the legacy paths (no checkpoint, or the
-            #2169 `pr_open` one) omit the key entirely so their bodies stay
-            byte-identical. `push`: the gate-verified commit exists on the
-            runner's disk and was NEVER published, so the handler records the
-            coordinates under the `push_resume_checkpoint` audit category and
-            NOT as this entry's `push_checkpoint`. `push_discarded`: a
-            preserved push checkpoint was permanently refused at consume time;
-            no checkpoint is recorded and a `verified_tree_discarded` row
-            accounts for the tree. An unrecognized value records NO checkpoint
-            of either kind (not even the legacy `push_checkpoint`, which has no
-            kind discriminator), so the retry fails safe to a full agent re-run
-            — never a 400.
+            Present only on an `outcome: failed` report, and only for the
+            E45.86 / #3621 and E83.80 / #4190 kinds — the legacy paths (no
+            checkpoint, or the #2169 `pr_open` one) omit the key entirely so
+            their bodies stay byte-identical. `push`: the gate-verified commit
+            exists on the runner's disk and was NEVER published, so the handler
+            records the coordinates under the `push_resume_checkpoint` audit
+            category and NOT as this entry's `push_checkpoint`.
+            `push_discarded`: a preserved push checkpoint was permanently
+            refused at consume time; no checkpoint is recorded and a
+            `verified_tree_discarded` row accounts for the tree. `reverify`
+            (E83.80 / #4190): the agent pass succeeded but the committed-tree
+            verify gate failed category C; `head_sha` names the runner's pinned
+            verify head and `base_sha` its parent, recorded (only when the
+            report newly fails the stage category C; an already-failed stage
+            records nothing) under the
+            `verify_resume_checkpoint` audit category with no
+            `verified_tree_sha` (ignored if sent — the held tree failed
+            verify). An unrecognized value records NO checkpoint of any kind
+            (not even the legacy `push_checkpoint`, which has no kind
+            discriminator), so the retry fails safe to a full agent re-run —
+            never a 400.
         pr_body_fallback_reason:
           type: string
           enum:
@@ -13754,6 +13892,9 @@ paths:
         (`409 acceptance_gate_not_passed`), when the recorded acceptance
         verdict is stale because the acceptance stage was re-opened after it
         (`409 acceptance_stale`, #4086; an audit read error here is
+        `500 internal_error`, fail-closed), when a decomposed parent has a
+        slice no successful agent review covers
+        (`409 review_coverage_incomplete`, #4219; a read error here is
         `500 internal_error`, fail-closed), when the pull request has a merge
         conflict against its base (`409 merge_conflicting`, E64.14 / #3109),
         when the merge-candidate gate refuses (`409 merge_candidate_held`
@@ -13980,16 +14121,36 @@ paths:
             client or installation, an unparseable repo or PR, a read error, a
             merged PR, a `mergeable_state` other than `blocked`, a truncated
             reviews listing) admits the merge. A never-reviewed PR still
-            queues. Re-approve the pull request, then re-invoke. Cases (8) and
-            (9) record NO verdict row and dispatch nothing.
+            queues. Re-approve the pull request, then re-invoke.
+            (10) A decomposed parent's review coverage is incomplete
+            (`review_coverage_incomplete`, #4219): a SUCCEEDED slice child is
+            covered by no successful agent review — neither the parent's
+            latest implement-review round nor the slice's own latest round
+            recorded an `implement_reviewed` verdict (a round whose reviewers
+            all failed or were skipped covers nothing; a reject verdict
+            counts). Not applicable to a non-parent, a child run, an implement
+            stage configuring zero agent reviewers, or a deployment with no
+            reviewer backend wired. `details` carry `{run_id, pr_url,
+            uncovered_slices[] {child_run_id, slice_index, round_sequence,
+            reason: no_review_round | review_round_in_flight |
+            review_round_no_verdict}, parent_round {sequence, configured,
+            terminal, verdicts, in_flight} | null, next_step}` where
+            `next_step` is `fishhawk_rerun_review` (the parent round settled
+            with no verdict — `POST /v0/runs/{run_id}/reviews/rerun`) or
+            `fishhawk_await_review` (the parent round is in flight or not yet
+            dispatched). Checked after case (8) and BEFORE the merge seam, so
+            it is reported even where `merge_seam_unconfigured` would follow.
+            Cases (8), (9) and (10) record NO verdict row and dispatch
+            nothing.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: |
-            `internal_error`: the run's stages, or the acceptance re-open /
-            outcome history the stale-acceptance check reads (#4086), could
-            not be read. FAIL-CLOSED: nothing was recorded and nothing was
+            `internal_error`: the run's stages, the acceptance re-open /
+            outcome history the stale-acceptance check reads (#4086), or the
+            decomposed children / implement-review history the
+            review-coverage check reads (#4219), could not be read. FAIL-CLOSED: nothing was recorded and nothing was
             dispatched; retry once the store is healthy.
           content:
             application/json:
@@ -15284,6 +15445,141 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/reviews/rerun:
+    post:
+      operationId: rerunRunReview
+      summary: Re-run a verdict-less implement-review round
+      description: |
+        Operator re-run of a failed implement-review round (#4219). Re-runs
+        the run's LATEST implement-review round when that round SETTLED WITH
+        ZERO VERDICTS — every configured reviewer failed or was skipped. It is
+        the recovery for the decomposed-parent review-coverage hold
+        (`review_coverage_incomplete` on `POST /v0/runs/{run_id}/merge`): a
+        round with no verdict covers no slice, and no other path dispatches a
+        second review of the SAME head.
+
+        The round is rebuilt from its RECORDED source
+        (`round_origin` / `round_base_sha` / `head_sha` on its
+        `implement_review_started`, #4077): a forge compare of base..head for
+        a `consolidated` or `fixup_push` round, the redacted trace bundle for a
+        `trace` round. It is dispatched through the same rebuild the boot
+        re-dispatch uses. The new round's `implement_review_started` carries
+        `rerun_of` = the re-run round's sequence. The #797 same-head dedup is
+        bypassed by a dedicated marker, re-verified under the review dispatch
+        lock against the run's newest round — distinct from ADR-091 D6's boot
+        re-dispatch. Advisory reviewers then run detached; a recorded verdict
+        clears the review-coverage hold.
+
+        **Refusals, in order, each decided before anything is written.**
+        `409 no_review_round` (no `implement_review_started`);
+        `409 review_round_in_flight` (`details.reason`: `rerun_pending` — a
+        re-run of this run is already in progress in this process;
+        `boot_redispatch_pending` — the round is mid-handoff to a boot
+        re-dispatch; `round_unsettled` — not every configured reviewer has
+        settled, an orphaned round is closed with
+        `POST /v0/runs/{run_id}/reviews/reconcile` first);
+        `409 review_round_has_verdict` (the round recorded an
+        `implement_reviewed`); `409 review_rerun_ineligible`
+        (`details.reason`: `gating_authority`, `reviewer_unwired`,
+        `unknown_round_source`, `superseded_by_fixup`,
+        `implement_stage_terminal`, `advanced_past_review`,
+        `trace_bundle_unavailable` or `forge_compare_unavailable`).
+
+        Otherwise it appends a chained `review_round_rerun_requested` audit
+        row `{stage, stage_id, rerun_of_sequence, configured_agents,
+        landed_before, authority, round_origin, head_sha}` BEFORE
+        dispatching, then rebuilds and dispatches synchronously. A re-run
+        against a provider that is still unavailable records another
+        verdict-less round, which can itself be re-run.
+
+        **Authorization.** OPERATOR-ONLY. Requires an authenticated identity
+        (anonymous → 401) carrying `write:runs`; a run-bound agent token
+        (`mcp:run:<uuid>`) is refused `403 run_token_forbidden` (an implement
+        agent must not re-run its own review) and a delegated operator-agent
+        token `403 operator_agent_forbidden`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The round was re-run; a new round started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, stage, stage_id, rerun_of_sequence, new_round_sequence, configured_agents]
+                properties:
+                  run_id:
+                    $ref: '#/components/schemas/UUID'
+                  stage:
+                    type: string
+                    enum: [implement]
+                  stage_id:
+                    $ref: '#/components/schemas/UUID'
+                  rerun_of_sequence:
+                    type: integer
+                    format: int64
+                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run.
+                  new_round_sequence:
+                    type: integer
+                    format: int64
+                    description: Audit sequence of the NEW `implement_review_started` this call dispatched (its `rerun_of` names `rerun_of_sequence`).
+                  configured_agents:
+                    type: integer
+                    description: Agent reviewers the re-run round was dispatched with.
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_token_forbidden` (a run-bound agent token),
+            `operator_agent_forbidden` (a delegated operator-agent token),
+            `insufficient_scope` (no `write:runs`), or the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `no_review_round`, `review_round_in_flight`,
+            `review_round_has_verdict` or `review_rerun_ineligible` (see the
+            refusal ladder above; `details` carry `run_id`, `round_sequence`
+            and, where named, `reason`). Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `review_rerun_check_failed` (the round's audit history could not
+            be read) or `review_rerun_audit_failed` (the request row could not
+            be appended). FAIL-CLOSED: nothing was dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            `review_rerun_not_started` — the `review_round_rerun_requested`
+            row was recorded but no round started; `details.reason` names the
+            rebuild failure (e.g. `compare_failed`,
+            `trace_bundle_unavailable`, `round_not_started`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_rerun_unconfigured` — the run or audit repositories are
+            not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/runs/{run_id}/stages/{stage_id}/reap-failure:
     post:
       operationId: reapStageFailure
@@ -18936,6 +19232,18 @@ paths:
             named issue set (no-epic `items`-only path). It is a FETCH/transport
             failure only: a malformed `items` ref now answers `422
             campaign_item_ref_invalid` instead (#2176);
+            `native_dependency_read_failed` (#4028) — the tracker's native
+            "blocked by" relation could not be read for an issue on EITHER
+            source (the epic branch through the provider's campaign-only
+            epic-children read, or the `items` branch), so assembly refuses
+            rather than drop an edge. `details.issue_ref` names the issue
+            (omitted when the read could not be attempted at all) and
+            `details.reason` is one of `truncated` (more links than one read
+            returns), `forbidden`, `not_found`, `unsupported` or `read_failed`;
+            the message names the per-reason remedy. On the `items` branch it is
+            classified after the `504` timeout and the `422
+            campaign_item_ref_invalid` arms and before the generic `502
+            issue_set_resolution_failed`;
             `grooming_order_supersession_unreadable` (E54.6 / #2238) — a read
             the currency decision depends on failed. It covers BOTH such reads:
             the SOURCE run's own stages/artifacts/approvals and the supersession
@@ -19109,8 +19417,11 @@ paths:
         '502':
           description: |
             `installation_resolution_failed`, `epic_children_query_failed`,
-            `issue_set_resolution_failed`,
+            `issue_set_resolution_failed`, `native_dependency_read_failed`
+            (#4028; `details.issue_ref` + `details.reason`),
             `grooming_order_supersession_unreadable` — as on `POST /v0/campaigns`.
+            A failed native "blocked by" read is a refusal, never a report built
+            without the edge.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
         '504':
@@ -20807,8 +21118,16 @@ paths:
             held-commit fields for a push-kind checkpoint, and the decline
             appends a `verified_tree_discarded` row with reason
             `runner_child_capability_absent`. It never gates a non-child run.
-            A current runner sends
-            `push-resume,merge-candidate-verify,child-push-resume`.
+            `reverify-resume` (E83.80 / #4190) — this runner's held-commit
+            early return carries the reverify consume arm: it prechecks the
+            held commit, re-runs ONE full-form committed-tree verify over it
+            with no agent, and publishes a re-signed commit on the same parent
+            only on a pass. A request WITHOUT it is served no held-commit
+            fields for a `verify_resume_checkpoint` (reason
+            `runner_capability_absent`; no tree is recorded for this kind, so
+            no `verified_tree_discarded` row is written). A current runner
+            sends
+            `push-resume,merge-candidate-verify,child-push-resume,reverify-resume`.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -21233,7 +21552,7 @@ paths:
                       resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open, push]
+                    enum: [pr_open, push, reverify]
                     description: |
                       DISCRIMINATES which recovery the four held-commit fields
                       above encode (#2169). ABSENT for the legacy #1231
@@ -21278,6 +21597,24 @@ paths:
                       resolution (refused, log-only). Each decline is a total
                       decline: no held-commit fields, so the retry is an
                       ordinary agent re-run.
+
+                      `reverify` (E83.80 / #4190) is the VERIFY-FAILURE resume:
+                      the agent pass succeeded but the committed-tree verify
+                      gate failed category C, and the newest audit entry for
+                      the stage is a `verify_resume_checkpoint`. The held
+                      commit is the runner's pinned verify head (local ref
+                      `refs/fishhawk/checkpoints/<run>/<stage>-verify`), and
+                      `held_commit_base_sha` its parent. The runner re-runs ONE
+                      full-form verify over it with no agent and, on a pass,
+                      publishes a DCO-signed commit with the same tree and
+                      parent through the `push` tail; a precheck miss falls
+                      back to an ordinary agent pass in the same dispatch.
+                      Served with NO `held_commit_verified_tree_sha`, ONLY to a
+                      request carrying `X-Fishhawk-Runner-Capabilities:
+                      reverify-resume` (otherwise declined, reason
+                      `runner_capability_absent`), NEVER to a decomposition
+                      child (declined, reason `child_resume_kind_unsupported`),
+                      and never to a fix-up dispatch.
                   held_commit_verified_tree_sha:
                     type: string
                     description: |
@@ -21286,7 +21623,8 @@ paths:
                       `held_commit_resume_kind: push`, where the commit is not
                       yet on the remote and the runner must re-prove
                       byte-exactly that the local commit's tree IS the verified
-                      one before publishing it. Absent on every other response.
+                      one before publishing it. Absent on every other response,
+                      including `reverify`, whose held tree failed verify.
                   supports_push_resume:
                     type: boolean
                     description: |
@@ -21304,7 +21642,7 @@ paths:
                     description: |
                       The pull-request TITLE the resumed runner opens with
                       (#2570). Served ONLY alongside the held-commit fields
-                      above, on BOTH resume kinds. Resolved in order: the
+                      above, on EVERY resume kind. Resolved in order: the
                       agent-authored title captured at park / checkpoint time
                       and persisted on the park row (or the newest
                       `scope_completeness_parked` audit payload's `pr_title`,
@@ -21704,18 +22042,18 @@ paths:
                     description: The base commit the held commit was built on (#2563); the runner ships it as the pull-request artifact's required `base_sha`. Resolved from the park's persisted base SHA or a legacy park's newest `scope_completeness_parked` audit `base_sha`; present only alongside a true `open_pr_from_held_commit`, and the exempt fields are all omitted when no base SHA resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open, push]
-                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). A decomposition child (E55.16 / #3916) is served `push` only to a request advertising both `push-resume` and `child-push-resume`, and never `pr_open` or the exempt resolution. NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
+                    enum: [pr_open, push, reverify]
+                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). A decomposition child (E55.16 / #3916) is served `push` only to a request advertising both `push-resume` and `child-push-resume`, and never `pr_open` or the exempt resolution. `reverify` (E83.80 / #4190) is the VERIFY-FAILURE resume from a `verify_resume_checkpoint`: the runner re-runs one full verify over its pinned verify head with no agent and publishes only on a pass; it is served with no verified tree, only to a request carrying `X-Fishhawk-Runner-Capabilities: reverify-resume`, and never to a decomposition child or a fix-up. NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
                   held_commit_verified_tree_sha:
                     type: string
-                    description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it.
+                    description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it. Never served with `reverify`, whose held tree failed verify.
                   supports_push_resume:
                     type: boolean
                     description: The BACKEND half of the E45.86 / #3621 capability handshake, `true` on every implement-stage response from a build that understands `held_commit_resume_kind: push`. It describes the build, not a per-run decision.
                   held_commit_pr_title:
                     type: string
                     description: |
-                      The pull-request title the resumed runner opens with (#2570), served only alongside the held-commit fields on both resume kinds. Resolved from the agent-authored title captured at park/checkpoint time (park row, else the newest `scope_completeness_parked` audit `pr_title`), else a Conventional-Commits title synthesized from the run's cached issue context. Absent when neither resolves — the runner then keeps its `chore: fishhawk implement stage <id>` placeholder. Unrecoverable PR text never withholds the resume.
+                      The pull-request title the resumed runner opens with (#2570), served only alongside the held-commit fields on every resume kind. Resolved from the agent-authored title captured at park/checkpoint time (park row, else the newest `scope_completeness_parked` audit `pr_title`), else a Conventional-Commits title synthesized from the run's cached issue context. Absent when neither resolves — the runner then keeps its `chore: fishhawk implement stage <id>` placeholder. Unrecoverable PR text never withholds the resume.
                   held_commit_pr_body:
                     type: string
                     description: |
@@ -26784,14 +27122,15 @@ paths:
         escape hatch records something untrue: reap writes `failed` for work
         never attempted, cancel writes `cancelled` for a change that shipped.
 
-        This verb supersedes exactly the stages a DEFAULT-DENY
+        By default this verb supersedes exactly the stages a DEFAULT-DENY
         `(stage_type, state)` pair table admits — `acceptance` @
         `awaiting_host_dispatch` and `review` @ `awaiting_approval`, no others
         — appends one `stage_superseded_by_merge` audit entry per stage it
-        MOVED, and re-runs completion. A stage in any other non-terminal state
-        (`running`, `dispatched`, `awaiting_children`, the deploy park states,
-        `awaiting_scope_decision`) is left alone and the run stays `running`:
-        that is the #968 invariant, not a gap.
+        MOVED, and re-runs completion. Without the opt-in stranded arm below, a
+        stage in any other non-terminal state (`running`, `dispatched`,
+        `awaiting_children`, the deploy park states, `awaiting_scope_decision`)
+        is left alone and the run stays `running`: that is the #968 invariant,
+        not a gap.
 
         The order is TRANSITION FIRST, THEN AUDIT. The chain is append-only, so
         a row written before a compare-and-swap that then refused would be an
@@ -26814,6 +27153,42 @@ paths:
         `repaired` even though the row is durable — the field claims authorship,
         not existence.
 
+        SETTLE-ONLY ARM (#4222). A merged run whose stages have ALL already
+        succeeded but whose run row is still `pending`/`running` (a legacy run
+        whose completion never re-ran) moves nothing and re-runs completion,
+        answering 200 with two empty lists and the settled `run_state` instead
+        of `reconcile_merge_not_applicable`. Merge evidence is still required,
+        and only `succeeded` stages qualify, so it cannot settle a failed or
+        cancelled run.
+
+        STRANDED ARM (opt-in, #4222). With the request body
+        `{"supersede_stranded": true}` the verb ALSO retires the stages a
+        SEPARATE default-deny table admits: `implement` @ `dispatched` /
+        `running`, and `review` / `acceptance` @ `pending` / `dispatched` /
+        `running` — a legacy run whose PR merged while implement stayed
+        `running` beside a never-opened review gate can otherwise never settle.
+        `plan` and `deploy` stages, `implement` @ `pending` and every other
+        state stay denied. Each move goes through a row-locked repository
+        capability pinned to the classified state, the attempt and the
+        handler's idle cutoff; it is NOT part of the ordinary transition
+        union, so no other caller can reach `running → superseded`. The
+        retired stage's audit row carries `reason: operator_reconcile_stranded`
+        plus `last_activity_at` and `idle_threshold_seconds`.
+
+        LIVENESS GATE (stranded arm only). Before any write, the WHOLE call is
+        refused `409 reconcile_merge_stage_live` when any `dispatched` /
+        `running` candidate shows database-stamped activity (the max of
+        `updated_at`, which every runner heartbeat bumps, and `dispatched_at`)
+        inside a 24-hour idle threshold. The same cutoff is re-checked under
+        each stage's row lock, so a heartbeat landing between the check and the
+        write is refused too. Pending candidates are held by no runner and need
+        no liveness check. The MCP tool additionally probes the host process
+        table for a `runner_kind=local` run before calling this endpoint.
+
+        Without the body (or with `{"supersede_stranded": false}`) the verb is
+        byte-identical to its pre-#4222 behaviour: a stranded stage is left
+        alone.
+
         Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
         blocking stage and reads `recovery: "reconcile-merge"` only when this
         endpoint can actually move it.
@@ -26828,16 +27203,41 @@ paths:
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        description: |
+          OPTIONAL (#4222). An absent, empty or whitespace-only body is the
+          pre-#4222 verb. Otherwise it must be exactly one JSON object carrying
+          only `supersede_stranded`: an unknown field, a wrong type, trailing
+          data or a body over 4 KiB is refused `400 validation_failed` (field
+          `body`) before any read.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                supersede_stranded:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opt into the stranded arm: also retire implement / review /
+                    acceptance stages stranded in `dispatched` / `running` and
+                    review / acceptance gates still `pending` on this
+                    already-merged run, subject to the 24-hour liveness gate.
       responses:
         '200':
           description: |
             What the reconcile did. `superseded` lists the stages THIS
-            invocation moved; `repaired` lists already-superseded stages whose
+            invocation moved — parked stages (`reason: operator_reconcile`) and,
+            under `supersede_stranded`, stranded ones
+            (`reason: operator_reconcile_stranded`); `repaired` lists already-superseded stages whose
             missing audit row THIS invocation restored — a stage whose row a
             concurrent fishhawkd instance wrote is omitted, because the row is
             durable but this invocation did not restore it. Both are empty on an
-            idempotent repeat. `run_state` is the run's state after the completion
-            re-evaluation, so a caller sees whether the run actually settled.
+            idempotent repeat and on the settle-only arm. `run_state` is the
+            run's state after the completion re-evaluation, so a caller sees
+            whether the run actually settled.
           content:
             application/json:
               schema:
@@ -26855,7 +27255,10 @@ paths:
                     type: string
                     description: The run's state after completion was re-evaluated.
         '400':
-          description: '`validation_failed` — malformed run_id.'
+          description: |
+            `validation_failed` — malformed run_id (field `run_id`), or a body
+            that is neither empty nor exactly `{"supersede_stranded": <bool>}`
+            (field `body`). Evaluated before any read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -26894,11 +27297,30 @@ paths:
             change that never shipped.
 
             `reconcile_merge_not_applicable` — the run holds no
-            pair-table-admissible parked stage and no already-superseded stage
-            to repair, so there is nothing for this verb to do. A stage in any
-            other non-terminal state must run, settle or be cancelled.
+            pair-table-admissible parked stage, no already-superseded stage to
+            repair, no stranded candidate (counted only when
+            `supersede_stranded` is set) and is not in the settle-only shape
+            (at least one stage, every stage `succeeded`, run not terminal), so
+            there is nothing for this verb to do. A stage in any other
+            non-terminal state must run, settle or be cancelled — or, for an
+            implement / review / acceptance stage stranded in flight on a merged
+            run, retry with `{"supersede_stranded": true}`.
+            `details.supersede_stranded` echoes the flag.
 
-            Every 409 is evaluated BEFORE any write: no stage moves and no
+            `reconcile_merge_stage_live` — `supersede_stranded` was set and at
+            least one `dispatched` / `running` candidate showed database-stamped
+            activity inside the 24-hour idle threshold, so a runner may still
+            hold it. `details.live_stages[]` names each one (`stage_id`,
+            `stage_type`, `state`, `last_activity_at`) and
+            `details.idle_threshold_seconds` the threshold. Evaluated before any
+            write. Its row-locked twin fires when a stage was touched AFTER that
+            check — `live_stages[].refusal` is then `recently_active`,
+            `state_changed` or `attempt_changed`; that stage and every later
+            stranded candidate are left alone, the repair scan and completion
+            re-run are skipped, and `details.superseded` lists the stages this
+            call had already moved (with their audit rows) before the refusal.
+
+            Every other 409 is evaluated BEFORE any write: no stage moves and no
             audit row is appended.
           content:
             application/json:
@@ -26912,7 +27334,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: '`reconcile_merge_unconfigured` — run/audit repositories not wired.'
+          description: |
+            `reconcile_merge_unconfigured` — run/audit repositories not wired,
+            or `supersede_stranded` was requested and the run repository does
+            not implement the row-locked stranded-supersede capability
+            (`details.missing_capability`). The stranded arm refuses rather than
+            degrade to an ordinary transition.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -26956,6 +27383,22 @@ paths:
         posts can each append; that duplicate is POSSIBLE and HARMLESS, because
         the evidence gate asks only whether AT LEAST ONE qualifying row exists —
         a second row is inert and changes no decision.
+
+        LEGACY RUNS (#4222). A GitHub-family run that carries NO forge
+        credential (no installation reference) reads through the GitHub App's
+        CURRENT installation on the run's own repository, resolved at read
+        time — but only when the run is untenanted or that installation maps to
+        the run's OWN account; otherwise the call is refused
+        `409 record_merge_observation_no_credential` with nothing recorded and
+        no pull request read. A run that carries its own credential never looks
+        the installation up, and `POST /v0/runs/{run_id}/merge`'s observe rung
+        never uses this fallback. A run row with no `pull_request_url` derives
+        one from the `pr_url` of the run's newest (highest-sequence)
+        `pull_request_opened` audit entry — read-time only, never written back
+        to the run row — and that URL is held to the malformed and
+        repo-mismatch refusals exactly like a run-row URL, before any forge
+        read. The observation's `credential_source` and
+        `pull_request_url_source` record which path was taken.
 
         GitLab: the GitLab adapter now populates BOTH the merge commit SHA and
         the merge timestamp (E64.40 / #3151), so a merged GitLab merge request
@@ -27024,6 +27467,25 @@ paths:
                         description: |
                           When Fishhawk read the forge (RFC 3339) — WHEN
                           FISHHAWK LEARNED IT.
+                      credential_source:
+                        type: string
+                        enum: [run, repository_installation]
+                        description: |
+                          The forge credential the read ran under (#4222):
+                          `run` (the run's own installation) or
+                          `repository_installation` (the GitHub App's current
+                          installation on the run's repository, used because
+                          the run carries no credential). Omitted when
+                          `already_recorded` is true.
+                      pull_request_url_source:
+                        type: string
+                        enum: [run_row, pull_request_opened_audit]
+                        description: |
+                          Where `pull_request_url` came from (#4222): the run
+                          row, or the run's newest `pull_request_opened` audit
+                          entry when the run row carries none (never written
+                          back to the run row). Omitted when
+                          `already_recorded` is true.
         '400':
           description: |
             `validation_failed` — malformed run_id.
@@ -27062,9 +27524,20 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            `record_merge_observation_no_pull_request` — the run carries no pull
-            request URL, so it never reached a PR and there is no merge to
-            observe.
+            `record_merge_observation_no_pull_request` — neither the run row
+            nor any `pull_request_opened` audit entry on the run's chain carries
+            a pull request URL, so there is no merge to observe. A failed read
+            of those entries is a 500, never a write.
+
+            `record_merge_observation_no_credential` — the run carries no forge
+            credential and the GitHub App installation on its repository cannot
+            be used (#4222). `details.reason` is `app_not_installed` (install
+            the Fishhawk GitHub App on the repository, then retry),
+            `installation_account_mismatch` (the installation is registered to
+            another account, or to none) or
+            `installation_account_unverifiable` (the installation-to-account
+            mapping could not be read). Fail closed: nothing is recorded and no
+            pull request is read.
 
             `record_merge_observation_pr_not_merged` — the forge reports the
             pull request is NOT merged. This is the guard that stops the verb
@@ -27115,8 +27588,9 @@ paths:
         '502':
           description: |
             `record_merge_observation_forge_unavailable` — the pull request
-            could not be read from the forge, so the merge state is unknown and
-            nothing was recorded.
+            could not be read from the forge, or (for a run carrying no forge
+            credential) the repository's GitHub App installation lookup failed,
+            so the merge state is unknown and nothing was recorded.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

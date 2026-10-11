@@ -318,6 +318,13 @@ import "sort"
 // crash-loop guard: a round already named by one is never re-dispatched again.
 // INTERNAL, actor system, NOT an issue-comment activity category
 // (docs/issue-comment-surfaces.md is untouched).
+// E83.92 / #4219 added review_round_rerun_requested, written by the operator
+// re-run verb POST /v0/runs/{run_id}/reviews/rerun (server/review_rerun.go)
+// synchronously and before any dispatch, once per verdict-less implement-review
+// round an operator re-runs. It names the re-run round's
+// implement_review_started sequence (rerun_of_sequence) and the operator
+// subject. NOT an issue-comment activity category
+// (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -528,6 +535,7 @@ var KnownCategories = map[string]struct{}{
 	"release_published":                       {},
 	"review_head_mismatch":                    {}, // #3655: reviewed tree != pushed tree on a success ship (server/pullrequest.go)
 	"review_round_redispatched":               {}, // #4077: boot re-dispatch of a restart-orphaned advisory review round (server/review_redispatch.go)
+	"review_round_rerun_requested":            {}, // #4219: operator re-run of a verdict-less implement-review round (server/review_rerun.go)
 	"reviewer_capability_unavailable":         {},
 	"run_admitted_applies_to_override":        {},
 	"run_admitted_budget_override":            {},
@@ -591,6 +599,7 @@ var KnownCategories = map[string]struct{}{
 	"upkeep_inflight_pass_completed":          {}, // #3763: the in-flight advisory pass's one summary row on the scan run (sent/already_sent/skips, or a named degrade)
 	"upkeep_report_recorded":                  {}, // #3921: one per ingested upkeep_report artifact
 	"verified_tree_discarded":                 {},
+	"verify_resume_checkpoint":                {}, // E83.80 / #4190: a reverify-kind held-commit checkpoint (server/pullrequest.go); INTERNAL, not an issue-comment activity line
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},
 

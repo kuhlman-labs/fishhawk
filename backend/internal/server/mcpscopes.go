@@ -206,6 +206,7 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_reset_run_branch":   {anyOf: []string{"write:runs"}}, // reset_branch.go handleResetRunBranch
 	"fishhawk_resume_run":         {anyOf: []string{"write:runs"}}, // recover.go handleRecoverRun
 	"fishhawk_reconcile_reviews":  {anyOf: []string{"write:runs"}}, // review_reconcile_http.go handleReconcileRunReviews
+	"fishhawk_rerun_review":       {anyOf: []string{"write:runs"}}, // review_rerun.go handleRerunReview (#4219; also refuses run-bound and operator-agent tokens)
 	"fishhawk_reap_stage":         {anyOf: []string{"write:runs"}}, // reap_failure.go handleReapStageFailure
 	"fishhawk_dispatch_stage":     {anyOf: []string{"write:runs"}}, // host_dispatch.go handleHostDispatchStage
 	"fishhawk_run_stage":          {anyOf: []string{"write:runs"}}, // host_dispatch.go handleHostDispatchStage

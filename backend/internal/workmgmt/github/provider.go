@@ -109,15 +109,65 @@ type Provider struct {
 // GroomingMutator (E54.5 / #2237) reserves the board-WRITE seam on the same
 // terms: implemented here (grooming.go), resolved by nothing in production,
 // and covered by the same MCP-surface guard, extended to the write symbols.
+//
+// CampaignEpicChildrenQuerier (#4028) is the campaign-only epic read that adds
+// the native "blocked by" relation; EpicChildren stays the shared membership
+// read with no native read.
 var (
-	_ workmgmt.Transitioner               = (*Provider)(nil)
-	_ workmgmt.NumberDiscoverer           = (*Provider)(nil)
-	_ workmgmt.EpicChildrenQuerier        = (*Provider)(nil)
-	_ workmgmt.EpicLinker                 = (*Provider)(nil)
-	_ workmgmt.IssueSetDependencyResolver = (*Provider)(nil)
-	_ workmgmt.WorkItemReader             = (*Provider)(nil)
-	_ workmgmt.GroomingMutator            = (*Provider)(nil)
+	_ workmgmt.Transitioner                = (*Provider)(nil)
+	_ workmgmt.NumberDiscoverer            = (*Provider)(nil)
+	_ workmgmt.EpicChildrenQuerier         = (*Provider)(nil)
+	_ workmgmt.CampaignEpicChildrenQuerier = (*Provider)(nil)
+	_ workmgmt.EpicLinker                  = (*Provider)(nil)
+	_ workmgmt.IssueSetDependencyResolver  = (*Provider)(nil)
+	_ workmgmt.WorkItemReader              = (*Provider)(nil)
+	_ workmgmt.GroomingMutator             = (*Provider)(nil)
 )
+
+// blockedByReader is the OPTIONAL native "blocked by" read primitive (#4028),
+// declared as an extension of API rather than a member of it — the labelAdder /
+// issueParentReader pattern — so the many API fakes that only exercise filing,
+// board sync or EpicChildren need no stub for a read they never reach.
+//
+// Only the two CAMPAIGN edge paths consult it: ResolveDependencies and
+// CampaignEpicChildren. On either, an api lacking it FAILS CLOSED with a
+// *workmgmt.NativeDependencyReadError{Reason: NativeReadUnsupported} rather than
+// degrading silently to legacy `Depends on:` lines only — a campaign assembled
+// without the native relation would drop every edge recorded only natively.
+type blockedByReader interface {
+	IssueBlockedBy(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) ([]githubclient.BlockingIssueRef, error)
+}
+
+// Compile-time assertion that the production client satisfies the extension.
+// If Client.IssueBlockedBy's signature drifts, this fails the BUILD rather than
+// letting every production campaign assembly fail closed as unsupported.
+var _ blockedByReader = (*githubclient.Client)(nil)
+
+// errBlockedByUnsupported is the Cause of the NativeReadUnsupported refusal.
+var errBlockedByUnsupported = errors.New(`workmgmt/github: the GitHub API client cannot read the native "blocked by" relation (no IssueBlockedBy)`)
+
+// nativeReadReason maps a failed IssueBlockedBy read onto the reason the
+// campaign refusal names (#4028). Context errors deliberately land on
+// NativeReadFailed: the named-set path checks the context BEFORE it reports a
+// native error, so a deadline there surfaces as IssueSetResolutionTimeout.
+func nativeReadReason(err error) workmgmt.NativeDependencyReadReason {
+	switch {
+	case errors.Is(err, githubclient.ErrRelationTruncated):
+		return workmgmt.NativeReadTruncated
+	case errors.Is(err, forge.ErrForbidden):
+		return workmgmt.NativeReadForbidden
+	case errors.Is(err, forge.ErrNotFound):
+		return workmgmt.NativeReadNotFound
+	default:
+		return workmgmt.NativeReadFailed
+	}
+}
+
+// nativeReadError wraps a failed IssueBlockedBy read of issue number into the
+// typed campaign refusal.
+func nativeReadError(number int, err error) *workmgmt.NativeDependencyReadError {
+	return &workmgmt.NativeDependencyReadError{Issue: number, Reason: nativeReadReason(err), Cause: err}
+}
 
 // New returns a Provider backed by api (in production *githubclient.Client).
 func New(api API) *Provider { return &Provider{api: api} }
@@ -154,10 +204,12 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		return nil, errors.New("workmgmt/github: no installation id available; GitHub Projects filing is run-scoped in v0 — file with a run_id whose run carries an installation, or use a provider that needs no installation token")
 	}
 
-	// GitHub has no native issue-to-issue depends_on relation, so a campaign
-	// dependency edge is persisted as a parsed body marker line (ADR-047 /
-	// #1437) — the only derivable mechanism, mirroring the existing
-	// `Parent epic: #N` body convention. ensureDependsOnMarker is idempotent:
+	// Filing persists a campaign dependency edge as a parsed body marker line
+	// (ADR-047 / #1437), mirroring the existing `Parent epic: #N` body
+	// convention. Campaign assembly also READS GitHub's native "blocked by"
+	// relation (#4028), but filing does not write it yet: the write side moves
+	// in a later phase of #4028, so filing keeps writing the visible line,
+	// which assembly still honours (tagged legacy_text). ensureDependsOnMarker is idempotent:
 	// it appends the marker only when DependsOn is non-empty and no marker is
 	// already present, so re-filing a body that already carries it is a no-op.
 	body := ensureDependsOnMarker(req.Item.Body, req.Item.Relations.DependsOn)
@@ -659,19 +711,27 @@ func (p *Provider) LinkToEpic(ctx context.Context, req workmgmt.EpicLinkRequest)
 const subIssueChildCap = 100
 
 // EpicChildren lists an epic's child issues and returns the depends_on edges
-// among them (ADR-047 / #1437, the campaign DAG source). It resolves the epic
-// reference to a node id, reads the sub-issues connection, parses each child
-// body for the depends_on marker, and builds a DependsEdge for every
-// referenced number that is itself in the children set. A reference to a
-// non-child is kept OUT of Edges (the campaign wave DAG, plan.Waves, is over
-// the epic's own children) but surfaced in DroppedEdges rather than silently
-// discarded, so campaign assembly can fail closed on a dangling/mis-targeted
-// dependency. Children are returned ascending by number and both edge slices
-// are deterministically sorted (by From, then To) so the result is stable.
+// among them (ADR-047 / #1437). It resolves the epic reference to a node id,
+// reads the sub-issues connection, parses EVERY line-start `Depends on:` line
+// of each child body (#4028), and builds a DependsEdge for every referenced
+// number that is itself in the children set. A reference to a non-child is
+// kept OUT of Edges (the campaign wave DAG, plan.Waves, is over the epic's own
+// children) but surfaced in DroppedEdges rather than silently discarded, so a
+// consumer can fail closed on a dangling/mis-targeted dependency. Children are
+// returned ascending by number and both edge slices are deterministically
+// sorted (by From, then To) so the result is stable. Every edge is tagged
+// workmgmt.DependencySourceLegacyText.
+//
+// It is the SHARED membership read (workmgmt.EpicChildrenQuerier): refinement
+// filing resume, rolling-walk adoption and idempotency adoption call it, so it
+// makes NO native "blocked by" read — exactly the forge calls it made before
+// #4028 (IssueNodeID, ListSubIssues, one GetIssue per distinct out-of-set
+// numeric target). Campaign assembly calls CampaignEpicChildren instead, which
+// adds the native relation; a native-read failure therefore cannot reach these
+// non-edge consumers.
 //
 // It validates the target repo + installation (fail closed with File's
-// actionable style). It is the optional workmgmt.EpicChildrenQuerier
-// capability E25.3 calls during campaign assembly.
+// actionable style).
 //
 // The result reports ChildCap = subIssueChildCap (#3714). len(Children) EQUALS
 // the parent's sub-issue totalCount, so the cap needs no extra
@@ -681,6 +741,34 @@ const subIssueChildCap = 100
 // child per returned sub-issue — so a closed child counts toward the cap
 // exactly as GitHub counts it.
 func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	return p.epicChildren(ctx, req, false)
+}
+
+// CampaignEpicChildren is the CAMPAIGN-ONLY epic read
+// (workmgmt.CampaignEpicChildrenQuerier, #4028): the EpicChildren result whose
+// edge set ALSO carries each child's native "blocked by" relation. After
+// ListSubIssues it reads IssueBlockedBy for every child through the same
+// bounded pool ResolveDependencies uses (issueSetFetchConcurrency in flight),
+// then builds edges from the native refs FIRST and the legacy `Depends on:`
+// lines second, so an edge recorded both ways is ONE edge tagged
+// DependencySourceNative.
+//
+// It FAILS CLOSED: an api without the blockedByReader extension returns a
+// *workmgmt.NativeDependencyReadError{Reason: NativeReadUnsupported} before any
+// forge call, and the first child (in ListSubIssues order) whose native read
+// fails returns a *workmgmt.NativeDependencyReadError naming that child and the
+// mapped reason. A partial edge set is never returned. A cross-repository
+// native ref is dropped DropTargetStateUnreadable with no forge read, exactly as
+// a cross-repo `Depends on:` token is.
+func (p *Provider) CampaignEpicChildren(ctx context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	return p.epicChildren(ctx, req, true)
+}
+
+// epicChildren is the one body behind EpicChildren (native=false) and
+// CampaignEpicChildren (native=true). native=false makes no IssueBlockedBy call
+// and consults no blockedByReader, which is what keeps the shared EpicChildren
+// path independent of the native read (#4028).
+func (p *Provider) epicChildren(ctx context.Context, req workmgmt.EpicChildrenRequest, native bool) (*workmgmt.EpicChildrenResult, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/github: provider missing API client")
 	}
@@ -695,6 +783,14 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: epic %q: %w", req.Epic, err)
 	}
+	var reader blockedByReader
+	if native {
+		r, ok := p.api.(blockedByReader)
+		if !ok {
+			return nil, &workmgmt.NativeDependencyReadError{Reason: workmgmt.NativeReadUnsupported, Cause: errBlockedByUnsupported}
+		}
+		reader = r
+	}
 	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 	epicNodeID, err := p.api.IssueNodeID(ctx, scope, repo, number)
 	if err != nil {
@@ -703,6 +799,23 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	subs, err := p.api.ListSubIssues(ctx, scope, epicNodeID)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: list epic #%d children: %w", number, err)
+	}
+
+	// The native relation of every child, indexed like subs. Read only on the
+	// campaign path, with bounded concurrency; the first failure IN CHILD ORDER
+	// fails the whole call, so the returned error is deterministic.
+	nativeRefs := make([][]githubclient.BlockingIssueRef, len(subs))
+	if reader != nil {
+		childNumbers := make([]int, len(subs))
+		for i, s := range subs {
+			childNumbers[i] = s.Number
+		}
+		for i, f := range readBlockedByBounded(ctx, scope, repo, childNumbers, reader) {
+			if f.err != nil {
+				return nil, fmt.Errorf("workmgmt/github: epic #%d: %w", number, f.err)
+			}
+			nativeRefs[i] = f.native
+		}
 	}
 
 	// The sibling set: a depends_on reference is an edge only when it points
@@ -726,9 +839,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	// makes the key DISTINGUISH two DIFFERENT cross-repo tokens (both To=0) while
 	// still collapsing the SAME canonical token repeated — a resolvable numeric
 	// ref carries an empty digest, so its key reduces to (From, To) as before
-	// (#2956).
+	// (#2956). dependencyRefs yields native refs FIRST, so the first occurrence
+	// this keeps for an edge recorded both natively and as text is the native
+	// one (#4028).
 	seenEdge := map[dependsEdgeKey]bool{}
-	for _, s := range subs {
+	for i, s := range subs {
 		children = append(children, workmgmt.EpicChild{
 			Number:   s.Number,
 			Title:    s.Title,
@@ -758,14 +873,14 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			// read by the advisory campaign admission screen.
 			NotRunnable: parseRunnableLabel(s.Labels),
 		})
-		for _, dep := range parseDependsOnMarker(s.Body) {
+		for _, dep := range dependencyRefs(repo, nativeRefs[i], s.Body) {
 			key := dependsEdgeKey{From: s.Number, To: dep.Number, Digest: dep.RawDigest}
 			if seenEdge[key] {
 				continue // duplicate depends_on token: classify once per identity.
 			}
 			seenEdge[key] = true
 			if dep.Resolvable && isChild[dep.Number] {
-				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep.Number})
+				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep.Number, Source: dep.Source})
 				continue
 			}
 			// A depends_on reference that is NOT an in-set fellow child: a typo'd
@@ -782,7 +897,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			}
 			if cls.satisfied {
 				satisfied = append(satisfied, workmgmt.SatisfiedEdge{
-					From: s.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
+					From: s.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason, Source: dep.Source,
 				})
 			} else {
 				dropped = append(dropped, workmgmt.DependsEdge{
@@ -791,6 +906,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 					// the renderer names WHICH token (#2956); both empty on a numeric
 					// dropped edge, keeping its shape unchanged.
 					ToRef: dep.RawDisplay, ToRefDigest: dep.RawDigest,
+					Source: dep.Source,
 				})
 			}
 		}
@@ -957,10 +1073,22 @@ func sortSatisfiedEdges(es []workmgmt.SatisfiedEdge) {
 // campaign source (E48.36 / #2051, the items-without-epic_ref variant). Where
 // EpicChildren derives its sibling set from an epic's sub-issue graph, this is
 // HANDED the exact set (req.Items) and resolves each named issue directly: it
-// parses each ref via parseIssueRef, fetches the issue body via GetIssue, and
-// runs the SAME depends_on marker / autonomy-label / completion helpers
+// parses each ref via parseIssueRef, fetches the issue body via GetIssue and its
+// native "blocked by" relation via IssueBlockedBy (#4028), and runs the SAME
+// depends_on ref builder (dependencyRefs) / autonomy-label / completion helpers
 // EpicChildren uses (no regex duplication), emitting the same
 // *workmgmt.EpicChildrenResult shape campaign.Assemble consumes.
+//
+// Only campaign assembly calls it, so it ALWAYS reads the native relation: an
+// edge's sources are the native refs first, then EVERY line-start legacy
+// `Depends on:` line, an edge recorded both ways is ONE edge tagged
+// DependencySourceNative, and every edge carries its Source. An api without
+// the blockedByReader extension fails closed with a
+// *workmgmt.NativeDependencyReadError{Reason: NativeReadUnsupported} before any
+// forge call, and a failed native read of a named item fails the call with a
+// *workmgmt.NativeDependencyReadError naming that item (subject to the
+// deadline-first rule below). A cross-repository native ref is dropped
+// DropTargetStateUnreadable with no forge read, like a cross-repo marker token.
 //
 // The named set IS the sibling set: a parsed depends_on ref pointing at a
 // member is an Edge; a ref pointing OUTSIDE the named set is CLASSIFIED by
@@ -985,10 +1113,12 @@ func sortSatisfiedEdges(es []workmgmt.SatisfiedEdge) {
 // ratified order time out. The resolution therefore runs in three phases:
 //
 //   - PHASE 1 fetches every named issue with at most issueSetFetchConcurrency
-//     concurrent GetIssue calls;
+//     concurrent workers, each doing GetIssue and then that item's
+//     IssueBlockedBy (#4028);
 //   - PHASE 2 collects the DISTINCT out-of-set depends_on targets in
 //     first-encounter order and fetches them with the same bounded pool,
-//     building the state cache afterwards;
+//     building the state cache afterwards. A target fetch is GetIssue ONLY:
+//     a target's own native relation is never read;
 //   - PHASE 3 classifies SERIALLY, on one goroutine, in request order.
 //
 // NO SHARED MUTABLE STATE crosses a goroutine boundary and there is no mutex: a
@@ -1001,13 +1131,17 @@ func sortSatisfiedEdges(es []workmgmt.SatisfiedEdge) {
 //
 // EpicChildren is deliberately NOT routed through this pool: it reads its
 // sibling set in ONE ListSubIssues call, so it was never the cost, and keeping
-// it serial keeps its output byte-identical.
+// it serial keeps its output byte-identical. CampaignEpicChildren uses the pool
+// for its per-child native read only (readBlockedByBounded), then builds edges
+// serially exactly as EpicChildren does.
 //
 // DEADLINES. Every phase checks the context BEFORE returning any wrapped fetch
 // error and returns *workmgmt.IssueSetResolutionTimeout instead, carrying the
 // honest counts (see issueSetTimeout for the accounting rule). An ORDINARY
 // phase-1 fetch failure with the context alive still returns the wrapped
-// provider error, and deterministically the one FIRST IN REQUEST ORDER. An
+// provider error, and deterministically the one FIRST IN REQUEST ORDER; a
+// failed native read is that item's error, returned so errors.As reaches the
+// *workmgmt.NativeDependencyReadError. An
 // ordinary phase-2 (target) fetch failure is NOT an error at all — it still
 // classifies DropTargetStateUnreadable exactly as the serial path did, so
 // #2953's meaning of "unreadable" is unchanged; only a CONTEXT-TERMINATED
@@ -1052,24 +1186,38 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 		numbers = append(numbers, n)
 	}
 
+	// The native relation is a campaign edge source (#4028): without the
+	// extension the resolution cannot see edges recorded only natively, so it
+	// refuses BEFORE any forge call rather than degrading to legacy-only.
+	reader, ok := p.api.(blockedByReader)
+	if !ok {
+		return nil, &workmgmt.NativeDependencyReadError{Reason: workmgmt.NativeReadUnsupported, Cause: errBlockedByUnsupported}
+	}
+
 	// PHASE 1 — fetch every named issue with bounded concurrency. Workers RETURN
 	// their results over a channel and write nothing shared; the parent places
 	// each into an ordinal-indexed slice after the pool drains, so the whole
 	// resolution has no shared mutable state across goroutines and no mutex
 	// (#3113).
-	fetches := p.fetchIssuesBounded(ctx, scope, repo, numbers)
+	fetches := p.fetchIssuesBounded(ctx, scope, repo, numbers, reader)
 	// Deadline precedence: check the context BEFORE returning any wrapped fetch
 	// error, so a deadline that tripped a forge call surfaces as the typed
 	// timeout with honest counts rather than as `get issue #N: context deadline
 	// exceeded` — which would present a deadline as a provider fault and leave
 	// the server on its generic failure code.
 	if ctx.Err() != nil {
-		return nil, issueSetTimeout(numbers, inSet, fetches, nil, "fetch_items")
+		return nil, issueSetTimeout(repo, numbers, inSet, fetches, nil, "fetch_items")
 	}
 	// Context alive, but a fetch failed: return the error of the item FIRST IN
 	// REQUEST ORDER. The parent walks the ordinal-indexed slice ascending, so
 	// the returned error is deterministic no matter which worker finished first.
 	for _, f := range fetches {
+		var nerr *workmgmt.NativeDependencyReadError
+		if errors.As(f.err, &nerr) {
+			// The issue itself was read; its native relation was not. Name the
+			// native read (not `get issue`) and keep the typed error reachable.
+			return nil, fmt.Errorf("workmgmt/github: %w", f.err)
+		}
 		if f.err != nil {
 			return nil, fmt.Errorf("workmgmt/github: get issue #%d: %w", f.number, f.err)
 		}
@@ -1086,9 +1234,11 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	// (a single-goroutine walk of the phase-1 results in request order), fetch
 	// them with the same bounded pool, and build the state cache SERIALLY in the
 	// parent after the pool drains.
-	targets := outOfSetTargets(inSet, fetches)
+	targets := outOfSetTargets(repo, inSet, fetches)
 	stateCache := map[int]targetState{}
-	targetFetches := p.fetchIssuesBounded(ctx, scope, repo, targets)
+	// nil reader: a target fetch is GetIssue only — a target's own native
+	// relation is not part of this set's edges (#4028).
+	targetFetches := p.fetchIssuesBounded(ctx, scope, repo, targets, nil)
 	for _, tf := range targetFetches {
 		if tf.aborted {
 			// A context-TERMINATED fetch is not evidence of anything: it is never
@@ -1102,7 +1252,7 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 		stateCache[tf.number] = classifyFetchedTarget(tf.issue, tf.err)
 	}
 	if ctx.Err() != nil {
-		return nil, issueSetTimeout(numbers, inSet, fetches, stateCache, "classify_targets")
+		return nil, issueSetTimeout(repo, numbers, inSet, fetches, stateCache, "classify_targets")
 	}
 
 	// PHASE 3 — a SERIAL classification pass on one goroutine over the phase-1
@@ -1116,7 +1266,8 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	// (`Depends on: #1639, #1639`) yields AT MOST ONE edge in whichever slice it
 	// classifies into (#2953 condition 3) — the same (From, To, ToRefDigest) key
 	// EpicChildren applies, so two DISTINCT cross-repo tokens stay two edges while
-	// the same canonical token repeated collapses (#2956).
+	// the same canonical token repeated collapses (#2956). dependencyRefs yields
+	// native refs first, so an edge recorded both ways keeps its native Source.
 	seenEdge := map[dependsEdgeKey]bool{}
 	for _, f := range fetches {
 		issue := f.issue
@@ -1142,14 +1293,14 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			// NotRunnable is the explicit `runnable:no` declaration (#3649).
 			NotRunnable: parseRunnableLabel(issue.Labels),
 		})
-		for _, dep := range parseDependsOnMarker(issue.Body) {
+		for _, dep := range dependencyRefs(repo, f.native, issue.Body) {
 			key := dependsEdgeKey{From: issue.Number, To: dep.Number, Digest: dep.RawDigest}
 			if seenEdge[key] {
 				continue // duplicate depends_on token: classify once per identity.
 			}
 			seenEdge[key] = true
 			if dep.Resolvable && inSet[dep.Number] {
-				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep.Number})
+				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep.Number, Source: dep.Source})
 				continue
 			}
 			// A depends_on reference that is NOT an in-set named issue: a typo'd
@@ -1165,11 +1316,11 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 				// Return the typed timeout rather than GUESSING a classification;
 				// guessing would either invent a satisfied dependency or fabricate
 				// an unreadable one, and both are worse than an honest refusal.
-				return nil, issueSetTimeout(numbers, inSet, fetches, stateCache, "build_result")
+				return nil, issueSetTimeout(repo, numbers, inSet, fetches, stateCache, "build_result")
 			}
 			if cls.satisfied {
 				satisfied = append(satisfied, workmgmt.SatisfiedEdge{
-					From: issue.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason,
+					From: issue.Number, To: dep.Number, State: cls.state, StateReason: cls.stateReason, Source: dep.Source,
 				})
 			} else {
 				dropped = append(dropped, workmgmt.DependsEdge{
@@ -1178,6 +1329,7 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 					// the renderer names WHICH token (#2956); both empty on a numeric
 					// dropped edge, keeping its shape unchanged.
 					ToRef: dep.RawDisplay, ToRefDigest: dep.RawDigest,
+					Source: dep.Source,
 				})
 			}
 		}
@@ -1209,7 +1361,12 @@ type issueFetch struct {
 	ordinal int
 	number  int
 	issue   *githubclient.Issue
-	err     error
+	// native is the item's native "blocked by" relation (#4028), read after a
+	// successful GetIssue when the pool was given a blockedByReader. A failed
+	// native read leaves it nil and sets err to a
+	// *workmgmt.NativeDependencyReadError instead.
+	native []githubclient.BlockingIssueRef
+	err    error
 	// aborted marks a fetch the CONTEXT terminated, as distinct from one the
 	// forge refused. A context-terminated target is never cached and never
 	// counts its item resolved; an ordinary 404/permission error still classifies
@@ -1218,14 +1375,72 @@ type issueFetch struct {
 }
 
 // fetchIssuesBounded fetches numbers with at most issueSetFetchConcurrency
-// concurrent GetIssue calls and returns one issueFetch per input, INDEXED BY
-// REQUEST ORDER regardless of completion order. Every result slot is filled:
-// the feeder never short-circuits on a dead context, because a GetIssue made
-// with an expired context returns promptly with a context error, and filling
-// every slot is what keeps the accounting (and the deterministic
-// first-in-request-order error selection) total rather than dependent on how
-// many results happened to arrive.
-func (p *Provider) fetchIssuesBounded(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, numbers []int) []issueFetch {
+// concurrent workers and returns one issueFetch per input, INDEXED BY REQUEST
+// ORDER regardless of completion order. Every result slot is filled: the feeder
+// never short-circuits on a dead context, because a forge call made with an
+// expired context returns promptly with a context error, and filling every slot
+// is what keeps the accounting (and the deterministic first-in-request-order
+// error selection) total rather than dependent on how many results happened to
+// arrive.
+//
+// native is the withNative switch (#4028, the gitlab withLinks precedent): when
+// non-nil, a worker whose GetIssue succeeded also reads that issue's native
+// "blocked by" relation and carries it on the fetch; a failed native read
+// becomes the fetch's err as a *workmgmt.NativeDependencyReadError. nil — the
+// phase-2 target pass — makes GetIssue the only call.
+func (p *Provider) fetchIssuesBounded(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, numbers []int, native blockedByReader) []issueFetch {
+	return runBounded(numbers, func(i, n int) issueFetch {
+		issue, err := p.api.GetIssue(ctx, scope, repo, n)
+		f := issueFetch{ordinal: i, number: n, issue: issue, err: err}
+		if native != nil && err == nil && issue != nil {
+			refs, nerr := native.IssueBlockedBy(ctx, scope, repo, n)
+			if nerr != nil {
+				f.err = nativeReadError(n, nerr)
+			} else {
+				f.native = refs
+			}
+		}
+		// Context-terminated iff the call FAILED and the failure is (or
+		// happened under) a dead context. The err != nil guard is what keeps a
+		// successful fetch made just before the deadline from being mislabelled
+		// aborted. A native-read error unwraps to its cause, so a
+		// context-terminated native read is aborted on the same rule.
+		f.aborted = fetchAborted(ctx, f.err)
+		return f
+	})
+}
+
+// readBlockedByBounded reads ONLY the native "blocked by" relation of each
+// number (#4028) — CampaignEpicChildren's native-only mode, whose issues
+// ListSubIssues already returned — through the same bounded pool, indexed by
+// request order. A failed read is the fetch's err as a
+// *workmgmt.NativeDependencyReadError naming that issue.
+func readBlockedByBounded(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, numbers []int, native blockedByReader) []issueFetch {
+	return runBounded(numbers, func(i, n int) issueFetch {
+		f := issueFetch{ordinal: i, number: n}
+		refs, err := native.IssueBlockedBy(ctx, scope, repo, n)
+		if err != nil {
+			f.err = nativeReadError(n, err)
+		} else {
+			f.native = refs
+		}
+		f.aborted = fetchAborted(ctx, f.err)
+		return f
+	})
+}
+
+// fetchAborted reports whether a fetch was CONTEXT-terminated: it failed, and
+// the failure is (or happened under) a dead context.
+func fetchAborted(ctx context.Context, err error) bool {
+	return err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil)
+}
+
+// runBounded is the bounded pool both fetch modes share: at most
+// issueSetFetchConcurrency workers call fetch, each worker's ONLY output is the
+// value it returns over a buffered channel, and the parent places each value at
+// its request ordinal after the pool drains — so the pool has no shared mutable
+// state and its output order is request order (#3113).
+func runBounded(numbers []int, fetch func(i, n int) issueFetch) []issueFetch {
 	out := make([]issueFetch, len(numbers))
 	if len(numbers) == 0 {
 		return out
@@ -1244,19 +1459,7 @@ func (p *Provider) fetchIssuesBounded(ctx context.Context, scope forge.Credentia
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				n := numbers[i]
-				issue, err := p.api.GetIssue(ctx, scope, repo, n)
-				results <- issueFetch{
-					ordinal: i,
-					number:  n,
-					issue:   issue,
-					err:     err,
-					// Context-terminated iff the call FAILED and the failure is (or
-					// happened under) a dead context. The err != nil guard is what
-					// keeps a successful fetch made just before the deadline from
-					// being mislabelled aborted.
-					aborted: err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil),
-				}
+				results <- fetch(i, numbers[i])
 			}
 		}()
 	}
@@ -1274,13 +1477,14 @@ func (p *Provider) fetchIssuesBounded(ctx context.Context, scope forge.Credentia
 
 // outOfSetTargets walks the phase-1 results in REQUEST ORDER on a single
 // goroutine and collects the distinct out-of-set depends_on targets that need a
-// forge read, in first-encounter order. It applies the SAME per-item
+// forge read, in first-encounter order. It derives each item's refs through
+// dependencyRefs (native, then every legacy line) and applies the SAME per-item
 // (From, To, ToRefDigest) dedup phase 3 applies, so a token phase 3 will skip is
 // never fetched, and it excludes exactly the refs classifyOutOfSetTarget
 // classifies WITHOUT a forge call: an unresolvable cross-repo/unparseable ref
 // (reducing it to a local number could read an UNRELATED issue and falsely
 // satisfy the edge — #2953 operator condition 2) and a non-positive number.
-func outOfSetTargets(inSet map[int]bool, fetches []issueFetch) []int {
+func outOfSetTargets(repo forge.RepoRef, inSet map[int]bool, fetches []issueFetch) []int {
 	var targets []int
 	seenTarget := map[int]bool{}
 	seenEdge := map[dependsEdgeKey]bool{}
@@ -1288,7 +1492,7 @@ func outOfSetTargets(inSet map[int]bool, fetches []issueFetch) []int {
 		if f.issue == nil {
 			continue
 		}
-		for _, dep := range parseDependsOnMarker(f.issue.Body) {
+		for _, dep := range dependencyRefs(repo, f.native, f.issue.Body) {
 			key := dependsEdgeKey{From: f.issue.Number, To: dep.Number, Digest: dep.RawDigest}
 			if seenEdge[key] {
 				continue
@@ -1335,20 +1539,20 @@ func lookupTargetState(dep dependsOnRef, cache map[int]targetState) (targetState
 
 // issueSetTimeout builds the typed deadline error with the counts, applying ONE
 // uniform accounting rule at whichever phase the deadline hit. An item is FULLY
-// RESOLVED when its own fetch completed AND every out-of-set target it names is
-// classified; an item naming no out-of-set target is fully resolved as soon as
-// its fetch completes. Resolved is the count of such items anywhere in the
-// request order; SuggestedLimit is the length of the longest fully-resolved
-// PREFIX of that order — a value that provably would have fit, because the
-// grooming path takes the top-N by ratified rank and this resolver preserves
-// request order — and 0 (no suggestion) when that prefix is empty. A suggestion
-// is NEVER derived from a non-prefix count.
-func issueSetTimeout(numbers []int, inSet map[int]bool, fetches []issueFetch, cache map[int]targetState, phase string) *workmgmt.IssueSetResolutionTimeout {
+// RESOLVED when its own fetch (issue AND native relation) completed AND every
+// out-of-set target it names is classified; an item naming no out-of-set target
+// is fully resolved as soon as its fetch completes. Resolved is the count of such
+// items anywhere in the request order; SuggestedLimit is the length of the
+// longest fully-resolved PREFIX of that order — a value that provably would have
+// fit, because the grooming path takes the top-N by ratified rank and this
+// resolver preserves request order — and 0 (no suggestion) when that prefix is
+// empty. A suggestion is NEVER derived from a non-prefix count.
+func issueSetTimeout(repo forge.RepoRef, numbers []int, inSet map[int]bool, fetches []issueFetch, cache map[int]targetState, phase string) *workmgmt.IssueSetResolutionTimeout {
 	resolved := 0
 	suggested := 0
 	prefixIntact := true
 	for _, f := range fetches {
-		if itemFullyResolved(f, inSet, cache) {
+		if itemFullyResolved(repo, f, inSet, cache) {
 			resolved++
 			if prefixIntact {
 				suggested++
@@ -1368,12 +1572,13 @@ func issueSetTimeout(numbers []int, inSet map[int]bool, fetches []issueFetch, ca
 // itemFullyResolved is the single accounting predicate (see issueSetTimeout).
 // A nil cache — the phase-1 deadline, where no target has been classified yet —
 // makes every item naming an out-of-set target unresolved, which is exactly
-// true at that phase.
-func itemFullyResolved(f issueFetch, inSet map[int]bool, cache map[int]targetState) bool {
+// true at that phase. It derives refs through dependencyRefs, so a native
+// out-of-set target counts exactly as a legacy one does.
+func itemFullyResolved(repo forge.RepoRef, f issueFetch, inSet map[int]bool, cache map[int]targetState) bool {
 	if f.err != nil || f.issue == nil {
 		return false
 	}
-	for _, dep := range parseDependsOnMarker(f.issue.Body) {
+	for _, dep := range dependencyRefs(repo, f.native, f.issue.Body) {
 		if !needsTargetFetch(dep, inSet) {
 			continue
 		}
@@ -1449,10 +1654,10 @@ func dependsOnRefStripped(ref string) string {
 // groomingMarkerObserved — the two layers must observe the SAME ref set or
 // #2860 reappears as a disagreement about membership.
 //
-// It deliberately does NOT reuse parseDependsOnMarker: that reads only the
-// FIRST marker line and collapses every non-bare-numeric token to
-// dependsOnRef{Resolvable: false}, DISCARDING the token text, so a cross-repo
-// ref could not be compared at all.
+// It deliberately does NOT reuse parseDependsOnMarker: that collapses every
+// non-bare-numeric token to dependsOnRef{Resolvable: false}, keeping only a
+// digest and a sanitized display rather than the normalized token, so a
+// cross-repo ref could not be compared here at all.
 func dependsOnMarkerRefs(body string) []string {
 	var out []string
 	for _, m := range dependsOnMarkerRE.FindAllStringSubmatch(body, -1) {
@@ -1572,6 +1777,49 @@ type dependsOnRef struct {
 	// must never reach a message or log unsanitized).
 	RawDigest  string
 	RawDisplay string
+	// Source is where the ref was read from (#4028): DependencySourceNative for
+	// the native "blocked by" relation, DependencySourceLegacyText for a
+	// `Depends on:` body line. Every edge built from the ref carries it.
+	Source workmgmt.DependencySource
+}
+
+// dependencyRefs is the ONE per-item ref builder every campaign edge path reads
+// (#4028): the item's native "blocked by" refs FIRST, then every legacy
+// `Depends on:` ref in body order. The order is load-bearing — each edge path
+// dedups on (From, To, ToRefDigest) keeping the FIRST occurrence, so an edge
+// recorded both natively and as text is ONE edge tagged
+// DependencySourceNative. A nil native slice (EpicChildren, which makes no
+// native read) yields exactly the legacy refs.
+//
+// A native ref is Resolvable only when its repository nameWithOwner equals the
+// ambient repo (case-insensitive — GitHub owner and repository names are). Any
+// other native ref is UNRESOLVABLE with the canonical token
+// `<nameWithOwner>#<N>`, digested and sanitized by the same helpers a marker
+// token uses, so the classifier drops it DropTargetStateUnreadable WITHOUT a
+// forge call: its Number is not a local issue number, and reading the local
+// issue it would collide with could falsely satisfy the edge (#2953 condition
+// 2, applied to the native source).
+func dependencyRefs(repo forge.RepoRef, native []githubclient.BlockingIssueRef, body string) []dependsOnRef {
+	legacy := parseDependsOnMarker(body)
+	if len(native) == 0 {
+		return legacy
+	}
+	refs := make([]dependsOnRef, 0, len(native)+len(legacy))
+	ambient := repo.Owner + "/" + repo.Name
+	for _, b := range native {
+		if b.Number > 0 && strings.EqualFold(b.Repository, ambient) {
+			refs = append(refs, dependsOnRef{Number: b.Number, Resolvable: true, Source: workmgmt.DependencySourceNative})
+			continue
+		}
+		canon := dependsOnTokenCanonical(b.Repository + "#" + strconv.Itoa(b.Number))
+		refs = append(refs, dependsOnRef{
+			Resolvable: false,
+			RawDigest:  dependsOnTokenDigest(canon),
+			RawDisplay: sanitizeDependsOnToken(canon),
+			Source:     workmgmt.DependencySourceNative,
+		})
+	}
+	return append(refs, legacy...)
 }
 
 // dependsOnTokenCanonical is the single definition of a depends_on token's
@@ -1649,9 +1897,13 @@ func sanitizeDependsOnToken(canonical string) string {
 // built (#2956, operator condition 1).
 const dependsOnDisplayMaxRunes = 64
 
-// parseDependsOnMarker parses the depends_on body marker line into its referenced
-// targets. It reads the FIRST `Depends on:` line and splits the captured list on
-// commas; each NON-EMPTY token becomes a dependsOnRef — a bare `#N`/`N` token is a
+// parseDependsOnMarker parses the depends_on body marker lines into their
+// referenced targets. It reads EVERY line-start `Depends on:` line (#4028 — it
+// used to read only the first, so an appended second line was silently
+// ignored), in body order, and splits each captured list on commas. Mid-line
+// prose (`... Depends on: #1 ...`) is not a marker: the shared, line-anchored
+// dependsOnMarkerRE is unchanged. Each ref is tagged
+// DependencySourceLegacyText. Each NON-EMPTY token becomes a dependsOnRef — a bare `#N`/`N` token is a
 // Resolvable same-repo numeric reference, and every OTHER non-empty token (a
 // cross-repo `owner/repo#N` ref, an owner-qualified ref, or garbage) is carried
 // through UNRESOLVABLE rather than silently dropped, so the classifier fails the
@@ -1661,45 +1913,45 @@ const dependsOnDisplayMaxRunes = 64
 // marker is present. Paired with renderDependsOnMarker as the single source of
 // truth for the marker round trip.
 func parseDependsOnMarker(body string) []dependsOnRef {
-	m := dependsOnMarkerRE.FindStringSubmatch(body)
-	if m == nil {
-		return nil
-	}
 	var refs []dependsOnRef
-	for _, tok := range strings.Split(m[1], ",") {
-		// The canonical form (whitespace-trimmed, pre-sanitization) is the token's
-		// identity (#2956): computed ONCE, it drives both the empty-token skip and
-		// the digest so control-rune stripping / truncation cannot merge two
-		// distinct canonical tokens.
-		canon := dependsOnTokenCanonical(tok)
-		if canon == "" {
-			continue // trailing comma / whitespace: not a reference at all.
+	for _, m := range dependsOnMarkerRE.FindAllStringSubmatch(body, -1) {
+		for _, tok := range strings.Split(m[1], ",") {
+			// The canonical form (whitespace-trimmed, pre-sanitization) is the token's
+			// identity (#2956): computed ONCE, it drives both the empty-token skip and
+			// the digest so control-rune stripping / truncation cannot merge two
+			// distinct canonical tokens.
+			canon := dependsOnTokenCanonical(tok)
+			if canon == "" {
+				continue // trailing comma / whitespace: not a reference at all.
+			}
+			rm := dependsOnRefRE.FindStringSubmatch(tok)
+			if rm == nil {
+				// A non-empty token that is NOT a bare same-repo numeric ref — a
+				// cross-repo `owner/repo#N`, an owner-qualified ref, or garbage. Carry
+				// it through as UNRESOLVABLE, now with an IDENTITY (digest over the
+				// canonical form + sanitized display), so the classifier fails it closed
+				// AND the dropped edge names WHICH token — two distinct cross-repo tokens
+				// no longer collapse to one identity-less `issue:From->issue:0` (#2956).
+				refs = append(refs, dependsOnRef{
+					Resolvable: false,
+					RawDigest:  dependsOnTokenDigest(canon),
+					RawDisplay: sanitizeDependsOnToken(canon),
+					Source:     workmgmt.DependencySourceLegacyText,
+				})
+				continue
+			}
+			n, err := strconv.Atoi(rm[1])
+			if err != nil {
+				refs = append(refs, dependsOnRef{
+					Resolvable: false,
+					RawDigest:  dependsOnTokenDigest(canon),
+					RawDisplay: sanitizeDependsOnToken(canon),
+					Source:     workmgmt.DependencySourceLegacyText,
+				})
+				continue
+			}
+			refs = append(refs, dependsOnRef{Number: n, Resolvable: true, Source: workmgmt.DependencySourceLegacyText})
 		}
-		rm := dependsOnRefRE.FindStringSubmatch(tok)
-		if rm == nil {
-			// A non-empty token that is NOT a bare same-repo numeric ref — a
-			// cross-repo `owner/repo#N`, an owner-qualified ref, or garbage. Carry
-			// it through as UNRESOLVABLE, now with an IDENTITY (digest over the
-			// canonical form + sanitized display), so the classifier fails it closed
-			// AND the dropped edge names WHICH token — two distinct cross-repo tokens
-			// no longer collapse to one identity-less `issue:From->issue:0` (#2956).
-			refs = append(refs, dependsOnRef{
-				Resolvable: false,
-				RawDigest:  dependsOnTokenDigest(canon),
-				RawDisplay: sanitizeDependsOnToken(canon),
-			})
-			continue
-		}
-		n, err := strconv.Atoi(rm[1])
-		if err != nil {
-			refs = append(refs, dependsOnRef{
-				Resolvable: false,
-				RawDigest:  dependsOnTokenDigest(canon),
-				RawDisplay: sanitizeDependsOnToken(canon),
-			})
-			continue
-		}
-		refs = append(refs, dependsOnRef{Number: n, Resolvable: true})
 	}
 	return refs
 }

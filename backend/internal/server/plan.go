@@ -2051,10 +2051,11 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // personas lists the reviewer personas (#3753) counted in configuredAgents, in
 // attachment order; nil when the stage attaches none (payload byte-identical).
 //
-// The round source and the re-dispatch lineage (#4077) are read from ctx
-// (review_round_context.go) rather than passed: the implement dispatchers set
-// the source, the boot re-dispatch sets the lineage, and an absent value leaves
-// its keys omitted.
+// The round source and the re-dispatch lineage (#4077), and the operator
+// re-run lineage (#4219), are read from ctx (review_round_context.go) rather
+// than passed: the implement dispatchers set the source, the boot re-dispatch
+// sets the re-dispatch lineage, the re-run verb sets rerun_of, and an absent
+// value leaves its keys omitted.
 func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, personas []string, headSHA, treeSHA, changeID string) (seq int64, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return 0, false
@@ -2093,6 +2094,14 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 	if rd, ok := reviewRedispatchFrom(ctx); ok {
 		started.RedispatchOf = rd.Of
 		started.RedispatchDepth = rd.Depth
+	}
+	// The operator re-run lineage (#4219) is an IMPLEMENT-round fact: only
+	// the re-run verb sets the marker (withReviewRerun), and it re-runs
+	// implement rounds only, so every other round omits rerun_of.
+	if category == "implement_review_started" {
+		if rr, ok := reviewRerunFrom(ctx); ok {
+			started.RerunOf = rr.Of
+		}
 	}
 	payload, _ := json.Marshal(started)
 	systemKind := audit.ActorKind("system")

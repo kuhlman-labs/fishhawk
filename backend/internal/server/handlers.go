@@ -108,6 +108,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// boot sweep runs, reachable without restarting the daemon. adminWrite
 	// mirrors the sibling recovery verb reap-failure.
 	mux.HandleFunc("POST /v0/runs/{run_id}/reviews/reconcile", s.requireRunAccount(adminWrite, s.handleReconcileRunReviews))
+	// Operator re-run of a failed implement-review round (#4219): re-dispatches
+	// the run's latest round when it settled with zero verdicts. Operator-only,
+	// adminWrite like the sibling reconcile verb.
+	mux.HandleFunc("POST /v0/runs/{run_id}/reviews/rerun", s.requireRunAccount(adminWrite, s.handleRerunReview))
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.requireRunAccount(readAccess, s.handleListRunStages))
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", s.requireRunAccount(readAccess, s.handleGetRunStage))
 	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure", s.requireRunAccount(adminWrite, s.handleReapStageFailure))

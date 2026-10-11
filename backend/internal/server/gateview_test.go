@@ -2310,3 +2310,74 @@ func TestGateView_MergeCandidateQueue(t *testing.T) {
 		})
 	}
 }
+
+// TestGateView_MergeReadiness_ReviewCoverage pins the gate view's #4219 half:
+// the SAME refusal the merge endpoint returns surfaces as a blocker, and a read
+// failure is an Undetermined entry plus ONE merge_readiness history gap (never
+// a silent "no blocker"), even when the acceptance half failed too.
+func TestGateView_MergeReadiness_ReviewCoverage(t *testing.T) {
+	t.Run("blocker", func(t *testing.T) {
+		h := newCoverageHarness(t)
+		c1 := h.d3b1d915(t)
+		var resp gateViewResponse
+		mr := h.s.gateViewMergeReadinessFor(context.Background(), h.parent, &resp)
+		b := mergeBlockerByCode(mr, mergeCodeReviewCoverageIncomplete)
+		if b == nil {
+			t.Fatalf("blockers = %+v, want review_coverage_incomplete", mr.Blockers)
+		}
+		if b.Details["next_step"] != reviewCoverageNextRerun || !strings.Contains(b.Message, c1.String()) {
+			t.Errorf("blocker = %+v, want next_step rerun and the uncovered slice named", b)
+		}
+		if resp.HistoryIncomplete {
+			t.Error("history_incomplete = true on a healthy read")
+		}
+	})
+	t.Run("covered: no blocker", func(t *testing.T) {
+		h := newCoverageHarness(t)
+		h.d3b1d915(t)
+		h.round(h.parentID, 30, 1, "implement_reviewed")
+		var resp gateViewResponse
+		mr := h.s.gateViewMergeReadinessFor(context.Background(), h.parent, &resp)
+		if mergeBlockerByCode(mr, mergeCodeReviewCoverageIncomplete) != nil {
+			t.Errorf("blockers = %+v, want no coverage blocker once a verdict covers the parent", mr.Blockers)
+		}
+	})
+	t.Run("read error: undetermined and history gap", func(t *testing.T) {
+		h := newCoverageHarness(t)
+		c1 := h.d3b1d915(t)
+		h.s.cfg.AuditRepo = runScopedErrAudit{auditFake: h.au, failRun: c1}
+		var resp gateViewResponse
+		mr := h.s.gateViewMergeReadinessFor(context.Background(), h.parent, &resp)
+		if mergeBlockerByCode(mr, mergeCodeReviewCoverageIncomplete) != nil {
+			t.Errorf("blockers = %+v, want no coverage blocker on an unread history", mr.Blockers)
+		}
+		if !undeterminedContains(mr, "review coverage") {
+			t.Errorf("undetermined = %v, want a review coverage entry", mr.Undetermined)
+		}
+		if !resp.HistoryIncomplete || !containsString(resp.HistoryGaps, gateViewGapMergeReadiness) {
+			t.Errorf("history_incomplete=%v gaps=%v, want the merge_readiness gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	})
+	t.Run("both halves fail: one gap", func(t *testing.T) {
+		h := newCoverageHarness(t)
+		h.d3b1d915(t)
+		h.repo.mu.Lock()
+		h.repo.stagesByRun[h.parentID] = acceptanceMergeStages(h.parentID, run.StageStatePending)
+		h.repo.mu.Unlock()
+		h.au.listByCategoryErr = errors.New("audit down")
+		var resp gateViewResponse
+		mr := h.s.gateViewMergeReadinessFor(context.Background(), h.parent, &resp)
+		if !undeterminedContains(mr, "acceptance staleness") || !undeterminedContains(mr, "review coverage") {
+			t.Fatalf("undetermined = %v, want both halves named", mr.Undetermined)
+		}
+		n := 0
+		for _, g := range resp.HistoryGaps {
+			if g == gateViewGapMergeReadiness {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("merge_readiness gaps = %d (%v), want exactly 1", n, resp.HistoryGaps)
+		}
+	})
+}

@@ -1409,6 +1409,9 @@ func TestGetRun_Drive_AcceptanceStates_SurfaceDerivedStatus(t *testing.T) {
 		// E72.11 / #3447: the unshipped-verdict park surfaces as its rule name
 		// with the read_acceptance_audit next_action, never merge_pr.
 		{"verdict_unshipped", drive.RuleAcceptanceVerdictUnshipped, "acceptance_verdict_unshipped", "read_acceptance_audit"},
+		// #4219: the decomposed-parent review-coverage hold surfaces as its
+		// rule name with the rerun_review next_action, never merge_pr.
+		{"review_coverage_incomplete", drive.RuleReviewCoverageIncomplete, "review_coverage_incomplete", "rerun_review"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

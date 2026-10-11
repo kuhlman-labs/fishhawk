@@ -113,6 +113,22 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
+	// review_coverage_incomplete (#4219) is likewise a drive-derived
+	// presentation status decided ahead of the table: a decomposed parent
+	// whose review evidence settled with a slice no SUCCESSFUL agent review
+	// covers. The table's review arms would otherwise offer the merge; this
+	// arm NEVER does — the merge endpoint refuses the same state.
+	if drive != nil && drive.DerivedStatus == stateReviewCoverageIncomplete {
+		na := reviewCoverageIncompleteNextActions(run, drive.NextAction)
+		foldReviewHeadMismatchAdvisory(run, na)
+		foldLiveValidationAdvisory(run, na)
+		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
+		foldProductIssueSuggestion(run, stages, na)
+		foldWorkingDirParams(run, na)
+		foldFailureSignature(run, stages, na)
+		return na
+	}
+
 	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	if drive != nil && drive.NextAction != nil {
@@ -670,7 +686,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			// flag empty and falls back to plain succeeded_pr_open.
 			if acceptanceVerdict == acceptanceVerdictUndecidable {
 				return &NextActions{State: "succeeded_acceptance_undecidable", Actions: mergeRitualActions(run,
-					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided")}
+					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided. "+acceptanceUndecidableCausesClause)}
 			}
 			// E72.12 / #3458: the terminal-run twin of the
 			// acceptance_verdict_unshipped arm. The run reported succeeded with
@@ -1842,7 +1858,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		// text is the only mechanism carrying the ask, so next_actions_test.go
 		// pins its load-bearing claims.
 		return &NextActions{State: "acceptance_undecidable", Actions: mergeRitualActions(run,
-			"the acceptance stage RAN but could not DECIDE one or more acceptance criteria (#2512) — read the undecidable_reason on each row in the acceptance artifact. No criterion FAILED, so this is not a triage and there is nothing to arbitrate; the run is merge-eligible. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided and why you are merging anyway")}
+			"the acceptance stage RAN but could not DECIDE one or more acceptance criteria (#2512) — read the undecidable_reason on each row in the acceptance artifact. No criterion FAILED, so this is not a triage and there is nothing to arbitrate; the run is merge-eligible. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided and why you are merging anyway. "+acceptanceUndecidableCausesClause)}
 	case acceptanceVerdictFailed:
 		// E66.37 / #2474: an operator arbitration bound to THIS verdict discharges
 		// the paged triage, so the server gate reads acceptance_arbitrated and the
@@ -2569,6 +2585,61 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 	}
 }
 
+// stateReviewCoverageIncomplete is the next_actions.state (and the drive
+// derived_status, the drive rule and the merge endpoint's 409 code) for the
+// decomposed-parent review-coverage hold (#4219). The literal is copied, not
+// imported, per the thin local-copy rule; TestReviewCoverageIncompleteLiterals
+// pins it against drive.RuleReviewCoverageIncomplete.
+const stateReviewCoverageIncomplete = "review_coverage_incomplete"
+
+// driveNextActionRerunReview is the server-stamped drive next_action verb for a
+// review_coverage_incomplete hold whose parent round settled with no verdict
+// (backend/internal/server/review_coverage.go); any other verb on the hold
+// means a round is in flight or not yet dispatched.
+const driveNextActionRerunReview = "rerun_review"
+
+// reviewCoverageIncompleteNextActions is the review_coverage_incomplete arm
+// (#4219). It leads with the verb that clears the hold — fishhawk_rerun_review
+// when the drive stamp says the parent round settled with no verdict,
+// fishhawk_await_review otherwise — then the gate view, whose merge_readiness
+// blocker names the uncovered slice(s). It NEVER offers fishhawk_merge_run.
+// The drive Detail (the server's refusal message) is the lead action's reason.
+func reviewCoverageIncompleteNextActions(run *Run, da *RunNextAction) *NextActions {
+	params := map[string]string{"run_id": run.ID}
+	lead := SuggestedAction{
+		Action:       "fishhawk_await_review",
+		Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
+		Precondition: "a decomposed slice is not yet covered by a successful agent review and the parent's implement-review round is in flight or not yet dispatched",
+		Consumes:     consumesNone,
+		Reason:       "await the parent's implement-review round; a round that records a verdict covers every slice and clears the hold",
+	}
+	if da != nil && da.Action == driveNextActionRerunReview {
+		lead = SuggestedAction{
+			Action:       "fishhawk_rerun_review",
+			Params:       params,
+			Precondition: "the parent's latest implement-review round settled with no verdict (every reviewer failed or was skipped) and a slice is not covered by its own review",
+			Consumes:     consumesNone,
+			Reason:       "re-run the failed implement-review round so a successful agent review covers every slice, then await it with fishhawk_await_review",
+		}
+	}
+	if da != nil && da.Detail != "" {
+		lead.Reason = da.Detail
+	}
+	return &NextActions{
+		State: stateReviewCoverageIncomplete,
+		Actions: []SuggestedAction{
+			lead,
+			{
+				Action:       "fishhawk_get_gate_view",
+				Params:       params,
+				Precondition: "always",
+				Consumes:     consumesNone,
+				Reason:       "merge_readiness.blockers names the uncovered slice(s) and each slice's latest review round; the merge stays refused until the hold clears",
+			},
+		},
+	}
+}
+
 // driveNextActionMergePR is the server-stamped drive next_action verb for the
 // awaiting_merge state (backend/internal/server/autodrive.go). The MCP layer
 // translates it to fishhawk_merge_run in driveAction; the literal is copied
@@ -2667,6 +2738,18 @@ const sliceIntegrationConflictReasonPrefix = failuresig.AnchorSliceIntegrationCo
 // second copy exists to drift.
 const sliceIntegrationGiveUpReasonPrefix = failuresig.AnchorSliceIntegrationGiveUp
 
+// acceptanceUndecidableCausesClause closes both acceptance_undecidable reasons
+// (the running-run arm and its succeeded_acceptance_undecidable twin, E72.63 /
+// #4095). The acceptance ingest records an undecidable_causes key on the
+// acceptance_outcome_recorded payload ONLY when it classified a row, so the
+// clause is conditional: it tells the operator what the key means when present,
+// and most undecidable runs carry none.
+const acceptanceUndecidableCausesClause = "When the " + auditCategoryAcceptanceOutcomeRecorded +
+	" entry carries an " + acceptanceUndecidableCausesKey + " key, it names the criteria left undecided for a classified cause: " +
+	acceptanceUndecidableCauseSandboxDeniedDB + " means the acceptance sandbox could not reach a database or " +
+	"container daemon to run the check that decides the criterion, and the committed-tree verify gate already " +
+	"ran those tests against a provisioned database"
+
 // Acceptance audit categories + verdict/disposition vocabulary (E31.9 /
 // ADR-049). These strings are the cross-module seam between the backend, which
 // WRITES the acceptance_outcome_recorded / acceptance_triage_decided audit
@@ -2753,6 +2836,15 @@ const (
 	// backend/internal/plan.AcceptanceVerdictUndecidable (mirrored, not imported
 	// — the #875 compile trap) and is pinned by the literal-table test.
 	acceptanceVerdictUndecidable = "undecidable"
+	// acceptanceUndecidableCausesKey and acceptanceUndecidableCauseSandboxDeniedDB
+	// mirror backend/internal/plan.UndecidableCausesKey and
+	// plan.UndecidableCauseSandboxDeniedDB (E72.63 / #4095) — mirrored, not
+	// imported, the #875 convention. The classifier never reads them: they are
+	// named only in the acceptance_undecidable reasons, through
+	// acceptanceUndecidableCausesClause. Pinned against the plan constants by
+	// TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt.
+	acceptanceUndecidableCausesKey            = "undecidable_causes"
+	acceptanceUndecidableCauseSandboxDeniedDB = "sandbox_denied_db"
 
 	// Auto-routed dispositions (a state transition fired): NOT paged.
 	acceptanceDispositionFixupDispatched = "fixup_dispatched"

@@ -1391,3 +1391,176 @@ func TestIssueParent_ZeroNumberedParentIsNil(t *testing.T) {
 		t.Fatalf("got (%+v, %v), want (nil, nil) for a zero-numbered parent", got, err)
 	}
 }
+
+// TestIssueBlockedBy_HappyPath: the request carries owner/name/number and the
+// page size, selects the blockedBy relation with totalCount, and decodes each
+// blocking issue's number and repository nameWithOwner verbatim (#4028).
+func TestIssueBlockedBy_HappyPath(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueBlockedBy"] = `{"data":{"repository":{"issue":{"blockedBy":{"totalCount":2,"nodes":[` +
+		`{"number":1,"repository":{"nameWithOwner":"o/r"}},` +
+		`{"number":12,"repository":{"nameWithOwner":"other/repo"}}]}}}}}`
+	got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 4028)
+	if err != nil {
+		t.Fatalf("IssueBlockedBy: %v", err)
+	}
+	want := []BlockingIssueRef{{Number: 1, Repository: "o/r"}, {Number: 12, Repository: "other/repo"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("refs = %+v, want %+v", got, want)
+	}
+	vars := pf.gotGraphQLVars["IssueBlockedBy"]
+	if vars["owner"] != "o" || vars["name"] != "r" || vars["number"] != float64(4028) || vars["first"] != float64(issueBlockedByFirst) {
+		t.Errorf("request vars = %+v, want owner=o name=r number=4028 first=%d", vars, issueBlockedByFirst)
+	}
+	q := pf.gotGraphQLQuery["IssueBlockedBy"]
+	for _, sel := range []string{"blockedBy", "totalCount", "nameWithOwner"} {
+		if !strings.Contains(q, sel) {
+			t.Errorf("query %q must select %q", q, sel)
+		}
+	}
+}
+
+// TestIssueBlockedBy_EmptyRelationIsNil: an issue with no "blocked by" relation
+// (totalCount 0, no nodes) returns (nil, nil) — the one empty answer.
+func TestIssueBlockedBy_EmptyRelationIsNil(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueBlockedBy"] = `{"data":{"repository":{"issue":{"blockedBy":{"totalCount":0,"nodes":[]}}}}}`
+	got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 5)
+	if err != nil || got != nil {
+		t.Fatalf("got (%+v, %v), want (nil, nil) for an empty relation", got, err)
+	}
+}
+
+// TestIssueBlockedBy_TruncatedRelationFailsClosed: a connection reporting more
+// members than it returned is ErrRelationTruncated naming the issue and both
+// counts — never the partial list (#4028, C6).
+func TestIssueBlockedBy_TruncatedRelationFailsClosed(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueBlockedBy"] = `{"data":{"repository":{"issue":{"blockedBy":{"totalCount":3,"nodes":[` +
+		`{"number":1,"repository":{"nameWithOwner":"o/r"}},` +
+		`{"number":2,"repository":{"nameWithOwner":"o/r"}}]}}}}}`
+	got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 9)
+	if got != nil {
+		t.Errorf("refs = %+v, want nil on a truncated relation", got)
+	}
+	if !errors.Is(err, ErrRelationTruncated) {
+		t.Fatalf("err = %v, want ErrRelationTruncated", err)
+	}
+	for _, frag := range []string{"o/r#9", "reports 3", "returned 2"} {
+		if !strings.Contains(err.Error(), frag) {
+			t.Errorf("err %q must name %q", err, frag)
+		}
+	}
+}
+
+// TestIssueBlockedBy_NullIssueIsNotFound: a null issue and a null repository are
+// each ErrNotFound naming the issue — unlike IssueParent, a missing issue is
+// never read as "blocked by nothing".
+func TestIssueBlockedBy_NullIssueIsNotFound(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"null_issue", `{"data":{"repository":{"issue":null}}}`},
+		{"null_repository", `{"data":{"repository":null}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newProjectsFake(t)
+			pf.graphqlByOp["IssueBlockedBy"] = tc.body
+			got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 9)
+			if got != nil {
+				t.Errorf("refs = %+v, want nil", got)
+			}
+			if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "o/r#9") {
+				t.Fatalf("err = %v, want ErrNotFound naming o/r#9", err)
+			}
+		})
+	}
+}
+
+// TestIssueBlockedBy_UnidentifiableNodeFailsClosed: a blocking node with number
+// <= 0 or an empty repository nameWithOwner is an error naming the issue, never
+// a bogus "#0" or repository-less ref.
+func TestIssueBlockedBy_UnidentifiableNodeFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		node string
+	}{
+		{"zero_number", `{"number":0,"repository":{"nameWithOwner":"o/r"}}`},
+		{"empty_repository", `{"number":4,"repository":{"nameWithOwner":""}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newProjectsFake(t)
+			pf.graphqlByOp["IssueBlockedBy"] = `{"data":{"repository":{"issue":{"blockedBy":{"totalCount":1,"nodes":[` + tc.node + `]}}}}}`
+			got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 9)
+			if got != nil {
+				t.Errorf("refs = %+v, want nil", got)
+			}
+			if err == nil || !strings.Contains(err.Error(), "unidentifiable dependency") || !strings.Contains(err.Error(), "o/r#9") {
+				t.Fatalf("err = %v, want an unidentifiable-dependency error naming o/r#9", err)
+			}
+		})
+	}
+}
+
+// TestIssueBlockedBy_GraphQLErrorIsValidation: a GraphQL errors envelope (e.g. a
+// host whose Issue type has no blockedBy field) is ErrValidation and nil refs.
+func TestIssueBlockedBy_GraphQLErrorIsValidation(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["IssueBlockedBy"] = `{"errors":[{"message":"Field 'blockedBy' doesn't exist on type 'Issue'"}]}`
+	got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 9)
+	if got != nil {
+		t.Errorf("refs = %+v, want nil", got)
+	}
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+}
+
+// TestIssueBlockedBy_ForbiddenIsForbidden: a 403 from the GraphQL endpoint (an
+// installation token lacking the permission) surfaces as ErrForbidden.
+func TestIssueBlockedBy_ForbiddenIsForbidden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"message":"Resource not accessible by integration"}`)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, Tokens: &stubTokens{token: "ghs_canned"}, HTTP: &http.Client{Timeout: 5 * time.Second}}
+	got, err := c.IssueBlockedBy(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 9)
+	if got != nil {
+		t.Errorf("refs = %+v, want nil", got)
+	}
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+}
+
+// TestIssueBlockedBy_GuardsRejectBadInput: a zero scope, blank owner, blank name
+// and number <= 0 each return an error WITHOUT issuing a request.
+func TestIssueBlockedBy_GuardsRejectBadInput(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scope  forge.CredentialScope
+		owner  string
+		rname  string
+		number int
+		want   string
+	}{
+		{"zero_scope", forge.CredentialScope{}, "o", "r", 5, "credential scope is empty"},
+		{"blank_owner", forge.FromGitHubInstallationID(7), "", "r", 5, "owner and name required"},
+		{"blank_name", forge.FromGitHubInstallationID(7), "o", "", 5, "owner and name required"},
+		{"nonpositive_number", forge.FromGitHubInstallationID(7), "o", "r", 0, "must be > 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, c := newProjectsFake(t)
+			pf.graphqlByOp["IssueBlockedBy"] = `{"data":{"repository":{"issue":{"blockedBy":{"totalCount":0,"nodes":[]}}}}}`
+			_, err := c.IssueBlockedBy(context.Background(), tc.scope, RepoRef{Owner: tc.owner, Name: tc.rname}, tc.number)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+			if got := pf.gotGraphQLReqs["IssueBlockedBy"]; got != 0 {
+				t.Errorf("issued %d requests, want 0 (guard rejects before any request)", got)
+			}
+		})
+	}
+}

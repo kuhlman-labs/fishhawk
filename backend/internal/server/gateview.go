@@ -135,8 +135,9 @@ type gateViewResponse struct {
 	Consults []gateViewConsult `json:"consults"`
 	// MergeReadiness names what would make POST /v0/runs/{run_id}/merge refuse
 	// fast or queue a merge that never fires (#4086), computed by the SAME
-	// helpers the merge endpoint calls (acceptanceStaleRefusal and
-	// approvalDismissedCheck), so the two surfaces cannot drift. Computed only
+	// helpers the merge endpoint calls (acceptanceStaleRefusal,
+	// reviewCoverageRefusal (#4219) and approvalDismissedCheck), so the two
+	// surfaces cannot drift. Computed only
 	// by handleGetRunGateView — never by buildGateView, which the attention
 	// scan calls once per run — because the approval half costs forge reads.
 	// Omitted (nil) when the run has no pull request url or is failed /
@@ -155,10 +156,10 @@ type gateViewResponse struct {
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
 // Blockers carries each determined refusal the merge endpoint would return
-// (acceptance_stale, approval_dismissed) with the endpoint's own message and
-// details. Undetermined names every check that could not reach a verdict — the
-// approval check's fail-open reasons, or an acceptance-history read failure —
-// so an empty Blockers list is never read as "nothing blocks" when a check did
+// (acceptance_stale, review_coverage_incomplete, approval_dismissed) with the
+// endpoint's own message and details. Undetermined names every check that
+// could not reach a verdict — the approval check's fail-open reasons, or an
+// acceptance-history or review-coverage read failure — so an empty Blockers list is never read as "nothing blocks" when a check did
 // not run. Both arrays are always present (possibly empty) when the block is.
 type gateViewMergeReadiness struct {
 	Blockers     []gateViewMergeBlocker `json:"blockers"`
@@ -174,8 +175,9 @@ type gateViewMergeBlocker struct {
 }
 
 // gateViewGapMergeReadiness is the history_gaps entry recorded when the
-// merge-readiness block's audit-chain half (the run's stages or its
-// acceptance re-open / outcome history) could not be read.
+// merge-readiness block's audit-chain half (the run's stages, its acceptance
+// re-open / outcome history, or its review-coverage history) could not be
+// read. Recorded once however many of those reads fail.
 const gateViewGapMergeReadiness = "merge_readiness"
 
 // gateViewGapMergeCandidateQueue names a failed ADR-092 queue read (#4200).
@@ -215,9 +217,17 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 		Blockers:     []gateViewMergeBlocker{},
 		Undetermined: []string{},
 	}
-	accUndetermined := func(why string) {
+	recordGap := func() {
 		resp.HistoryIncomplete = true
+		for _, g := range resp.HistoryGaps {
+			if g == gateViewGapMergeReadiness {
+				return
+			}
+		}
 		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeReadiness)
+	}
+	accUndetermined := func(why string) {
+		recordGap()
 		block.Undetermined = append(block.Undetermined, "acceptance staleness: "+why)
 	}
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
@@ -227,6 +237,16 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 		accUndetermined("the acceptance history could not be read: " + serr.Error())
 	} else if stale != nil {
 		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(stale))
+	}
+
+	// Review-coverage hold (#4219): the merge endpoint's fail-closed read. A
+	// read failure cannot fail this request, so it records the history gap
+	// and names the check in Undetermined instead of a silent "no blocker".
+	if coverage, cerr := s.reviewCoverageRefusal(ctx, runRow); cerr != nil {
+		recordGap()
+		block.Undetermined = append(block.Undetermined, "review coverage: the review history could not be read: "+cerr.Error())
+	} else if coverage != nil {
+		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(coverage))
 	}
 
 	approval := s.approvalDismissedCheck(ctx, runRow)

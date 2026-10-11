@@ -783,7 +783,7 @@ type GateView struct {
 	// Omitted (nil) when the run has no pull request, is failed or cancelled,
 	// or against an older backend. The json tag MUST byte-match the backend's
 	// gateViewResponse or the block silently decodes to nil (the #371 trap).
-	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
+	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, review_coverage_incomplete, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
 	// MergeCandidateQueue mirrors the backend's gate-view merge_candidate_queue
 	// block (ADR-092 / #4200) — the same projection Run.MergeCandidateQueue
 	// carries. Omitted (nil) when the run has no active entry, the queue is
@@ -806,9 +806,9 @@ type gateViewMergeReadiness struct {
 // gateViewMergeBlocker mirrors the backend's gateViewMergeBlocker. Tags MUST
 // byte-match.
 type gateViewMergeBlocker struct {
-	Code    string         `json:"code" jsonschema:"the merge endpoint's 409 code: acceptance_stale or approval_dismissed"`
+	Code    string         `json:"code" jsonschema:"the merge endpoint's 409 code: acceptance_stale, review_coverage_incomplete or approval_dismissed"`
 	Message string         `json:"message" jsonschema:"the merge endpoint's refusal message, naming the heads involved and the verb that clears the blocker"`
-	Details map[string]any `json:"details,omitempty" jsonschema:"the refusal's details object, including next_step (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage for acceptance_stale, approve_pr for approval_dismissed)"`
+	Details map[string]any `json:"details,omitempty" jsonschema:"the refusal's details object, including next_step (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage for acceptance_stale, fishhawk_rerun_review / fishhawk_await_review for review_coverage_incomplete, approve_pr for approval_dismissed)"`
 }
 
 // gateDivergence mirrors the backend's divergenceQuestion
@@ -3519,12 +3519,23 @@ func (c *apiClient) ReconcileRunReviews(ctx context.Context, runID uuid.UUID) (*
 // Wholly EMPTY on the already_recorded no-op arm: that call appended nothing
 // and the backend deliberately zeroes the block so the response cannot claim a
 // row it did not write.
+//
+// CredentialSource and PullRequestURLSource (#4222) say how the observation
+// was reached: credential_source is "run" (the run's own installation) or
+// "repository_installation" (the GitHub App's current installation on the run's
+// repository, resolved because the run carries no credential);
+// pull_request_url_source is "run_row" or "pull_request_opened_audit" (derived
+// from the run's newest pull_request_opened entry because the run row carries
+// no URL). Both are omitempty on the backend, so an older backend or the
+// already_recorded arm decodes them to "".
 type MergeObservationFact struct {
-	PullRequestURL    string `json:"pull_request_url"`
-	PullRequestNumber int    `json:"pull_request_number"`
-	MergeCommitSHA    string `json:"merge_commit_sha"`
-	MergedAt          string `json:"merged_at"`
-	ObservedAt        string `json:"observed_at"`
+	PullRequestURL       string `json:"pull_request_url"`
+	PullRequestNumber    int    `json:"pull_request_number"`
+	MergeCommitSHA       string `json:"merge_commit_sha"`
+	MergedAt             string `json:"merged_at"`
+	ObservedAt           string `json:"observed_at"`
+	CredentialSource     string `json:"credential_source,omitempty"`
+	PullRequestURLSource string `json:"pull_request_url_source,omitempty"`
 }
 
 // RecordMergeObservationResult mirrors the 200 body of
@@ -3552,11 +3563,16 @@ type RecordMergeObservationResult struct {
 // evidence gate needs. Idempotent: a repeat answers already_recorded:true
 // having appended nothing.
 //
+// A run carrying no forge credential reads through the GitHub App's current
+// installation on its own repository, and a run row carrying no PR URL derives
+// one from its newest pull_request_opened entry (#4222); the observation's
+// credential_source / pull_request_url_source record which.
+//
 // 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
 // code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
 // 409 record_merge_observation_{no_pull_request,malformed_pr_url,
-// pr_url_repo_mismatch,pr_not_merged,no_merge_commit,no_merge_timestamp},
-// 502 record_merge_observation_forge_unavailable,
+// pr_url_repo_mismatch,pr_not_merged,no_merge_commit,no_merge_timestamp,
+// no_credential}, 502 record_merge_observation_forge_unavailable,
 // 503 record_merge_observation_unconfigured.
 func (c *apiClient) RecordMergeObservation(ctx context.Context, runID uuid.UUID) (*RecordMergeObservationResult, error) {
 	var res RecordMergeObservationResult
@@ -3598,8 +3614,25 @@ type ReconcileMergeResult struct {
 	RunState   string               `json:"run_state"`
 }
 
-// ReconcileMerge invokes the SETTLE half of the #3083 merge-recovery pair. It
-// takes NO request body — the handler reads only the run_id path value.
+// reconcileMergeRequest mirrors the OPTIONAL body of
+// POST /v0/runs/{run_id}/reconcile-merge
+// (backend/internal/server/merge_supersede.go::reconcileMergeRequest, #4222).
+// HAND-MAINTAINED WIRE MIRROR (#371): the json tag MUST byte-match, and the
+// backend decodes with DisallowUnknownFields, so this struct must carry no
+// other field. Unexported on purpose: it is only ever built by ReconcileMerge.
+type reconcileMergeRequest struct {
+	SupersedeStranded bool `json:"supersede_stranded"`
+}
+
+// ReconcileMerge invokes the SETTLE half of the #3083 merge-recovery pair.
+//
+// supersedeStranded=false sends NO request body, so the call is wire-identical
+// to the pre-#4222 verb. supersedeStranded=true sends exactly
+// {"supersede_stranded":true}, opting into the stranded arm: on an already
+// merged run the backend also retires implement/review/acceptance stages
+// stranded in dispatched/running and review/acceptance gates still pending,
+// refusing the whole call when an in-flight candidate shows database-stamped
+// activity inside its idle threshold.
 //
 // It NEVER re-reads the forge: its evidence gate reads the run's audit CHAIN
 // only, which is exactly why RecordMergeObservation exists and must run first
@@ -3607,12 +3640,21 @@ type ReconcileMergeResult struct {
 // lists.
 //
 // 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
-// code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
-// 409 reconcile_merge_pr_not_merged, 409 reconcile_merge_not_applicable,
+// code verbatim: 400 validation_failed (bad UUID, or a malformed body),
+// 401/403, 404 run_not_found, 409 reconcile_merge_pr_not_merged,
+// 409 reconcile_merge_not_applicable, 409 reconcile_merge_stage_live,
 // 503 reconcile_merge_unconfigured.
-func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID) (*ReconcileMergeResult, error) {
+func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID, supersedeStranded bool) (*ReconcileMergeResult, error) {
+	var body []byte
+	if supersedeStranded {
+		b, err := json.Marshal(reconcileMergeRequest{SupersedeStranded: true})
+		if err != nil {
+			return nil, fmt.Errorf("marshal reconcile-merge body: %w", err)
+		}
+		body = b
+	}
 	var res ReconcileMergeResult
-	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reconcile-merge", nil, &res); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reconcile-merge", body, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -4349,8 +4391,23 @@ type Campaign struct {
 	// map[string]any / json.RawMessage) so the reflection-built output schema
 	// stays an object. CREATE-response-only and never blocking.
 	AdmissionScreen *campaignAdmissionScreen `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen: candidates declared runnable:no, and candidates whose title/body names a path the repo's implement-stage forbidden_paths forbid. Present only on the create response, only when the screen found something; it never blocks or alters the campaign"`
-	CreatedAt       time.Time                `json:"created_at"`
-	UpdatedAt       time.Time                `json:"updated_at"`
+	// Warnings names every item whose depends_on relies on a legacy free-text
+	// `Depends on:` line rather than the tracker's native relation (#4028).
+	// Typed struct so the reflection-built output schema stays an object array.
+	// CREATE-response-only and informational: the campaign was created anyway.
+	Warnings  []campaignDependencyWarning `json:"warnings,omitempty" jsonschema:"one entry per item whose depends_on relies on a legacy free-text 'Depends on:' line instead of a native 'blocked by' link. Informational — the campaign was created and the edge is honoured. Present only on the create response, only when such an item exists"`
+	CreatedAt time.Time                   `json:"created_at"`
+	UpdatedAt time.Time                   `json:"updated_at"`
+}
+
+// campaignDependencyWarning mirrors the backend's campaignDependencyWarning
+// (#4028). Unexported (FIELDS exported for JSON) so it stays off the frozen MCP
+// export surface, like campaignSatisfiedDependency.
+type campaignDependencyWarning struct {
+	IssueRef string   `json:"issue_ref" jsonschema:"the item relying on the legacy line, as issue:N"`
+	Code     string   `json:"code" jsonschema:"always legacy_text_dependency"`
+	Targets  []string `json:"targets" jsonschema:"the item's dependency targets read from legacy 'Depends on:' lines, sorted"`
+	Message  string   `json:"message" jsonschema:"names the issue, its legacy targets and the remedy: add a native 'blocked by' link for each"`
 }
 
 // campaignAdmissionScreen mirrors the backend's campaignAdmissionScreenPayload
@@ -4383,6 +4440,7 @@ type campaignSatisfiedDependency struct {
 	To          int    `json:"to" jsonschema:"the already-completed target issue number the edge was elided against"`
 	State       string `json:"state" jsonschema:"the target's observed issue state (e.g. closed)"`
 	StateReason string `json:"state_reason" jsonschema:"the target's observed state_reason (e.g. completed)"`
+	Source      string `json:"source,omitempty" jsonschema:"where the elided edge was read from: native (the tracker's native dependency relation) or legacy_text (a free-text 'Depends on:' line)"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
@@ -4573,6 +4631,10 @@ type campaignGroomingSource struct {
 //     at all and the remedy names that wiring; a non-empty one means the
 //     resolved id is simply not among them and the remedy names the in-band
 //     `provider` selector plus the durable conventions levers (#3645)
+//   - 502 native_dependency_read_failed (#4028: a native "blocked by" read
+//     failed on either source, so assembly refused rather than drop an edge;
+//     details carry issue_ref, omitted when no issue was read, and reason
+//     truncated | forbidden | not_found | unsupported | read_failed)
 //   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the
 //     server's issue-set budget; details carry resolved / items_total /
 //     budget_seconds and, when one could be proven to fit, a
@@ -4640,6 +4702,16 @@ type CampaignPreviewDangling struct {
 	To     string `json:"to" jsonschema:"the dependency target. issue:N for a resolvable same-repo target; unparsable:<digest>:\"token\" for a cross-repo or unparseable one"`
 	Reason string `json:"reason" jsonschema:"why the edge blocks assembly: not_child | excluded_incomplete | target_closed_incomplete | target_state_unreadable"`
 	Remedy string `json:"remedy" jsonschema:"one short operator-facing sentence naming what to do about this edge"`
+	Source string `json:"source,omitempty" jsonschema:"where the blocking edge was read from: native or legacy_text"`
+}
+
+// campaignPreviewEdge mirrors the backend's campaignPreviewEdge (#4028): one
+// in-set depends_on edge with its source. Unexported (FIELDS exported for JSON)
+// so it stays off the frozen MCP export surface.
+type campaignPreviewEdge struct {
+	From   string `json:"from" jsonschema:"the depending issue, as issue:N"`
+	To     string `json:"to" jsonschema:"the in-set dependency target, as issue:N"`
+	Source string `json:"source,omitempty" jsonschema:"where the edge was read from: native (the tracker's native 'blocked by' relation) or legacy_text (a free-text 'Depends on:' line)"`
 }
 
 // CampaignPreview is the POST /v0/campaigns/preview report — the wire shape
@@ -4653,6 +4725,8 @@ type CampaignPreview struct {
 	WaveCount             *int                          `json:"wave_count,omitempty"`
 	Waves                 [][]string                    `json:"waves,omitempty" jsonschema:"the topological dispatch order: waves[w] holds the issue refs eligible in wave w. Absent when the set is invalid"`
 	Items                 []CampaignPreviewItem         `json:"items" jsonschema:"the resolved items with their in-set depends_on edges. Present on BOTH the valid and the invalid path, so an invalid report still shows the partial graph"`
+	Edges                 []campaignPreviewEdge         `json:"edges" jsonschema:"the in-set depends_on edges with their source (native or legacy_text), sorted. Present on BOTH paths"`
+	Warnings              []campaignDependencyWarning   `json:"warnings,omitempty" jsonschema:"one entry per item whose depends_on relies on a legacy free-text 'Depends on:' line instead of a native 'blocked by' link. Informational — it never makes the set invalid"`
 	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed, so the set assembles rather than failing dangling"`
 	GroomingSource        map[string]any                `json:"grooming_source,omitempty" jsonschema:"provenance of a previewed grooming order, mirroring the campaign create response's block. Absent unless grooming_run_id was passed"`
 	Dangling              []CampaignPreviewDangling     `json:"dangling,omitempty" jsonschema:"the depends_on edges blocking assembly, one entry per edge with its cause and remedy. Empty on a valid preview"`
@@ -4685,7 +4759,8 @@ type CampaignPreview struct {
 //   - 422 repo_not_installed / campaign_item_not_child / campaign_item_ref_invalid
 //   - 501 issue_set_resolution_unsupported / epic_children_unsupported
 //   - 502 installation_resolution_failed / epic_children_query_failed /
-//     issue_set_resolution_failed
+//     issue_set_resolution_failed / native_dependency_read_failed (#4028: a
+//     native "blocked by" read failed; details issue_ref + reason)
 //   - 504 issue_set_resolution_timeout
 //   - 503 campaign_repo_unconfigured
 func (c *apiClient) PreviewCampaign(ctx context.Context, req campaignPreviewRequest) (*CampaignPreview, error) {
