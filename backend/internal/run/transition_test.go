@@ -711,6 +711,131 @@ func TestMergeSupersedable(t *testing.T) {
 	}
 }
 
+// TestStageStrandedMergeSupersedeTransitions pins the stranded merge-supersede
+// table (#4222) in both halves — the classification predicate and the
+// admissibility validator. Exactly eight (stage_type, state) pairs are admitted
+// and only into `superseded`; the discriminating rows are the admitted STATES
+// on the WRONG stage type (plan@running, deploy@running), which a state-only
+// predicate would admit.
+func TestStageStrandedMergeSupersedeTransitions(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType StageType
+		from      StageState
+		want      bool
+	}{
+		// The eight admitted rows.
+		{"implement dispatched", StageTypeImplement, StageStateDispatched, true},
+		{"implement running", StageTypeImplement, StageStateRunning, true},
+		{"review pending", StageTypeReview, StageStatePending, true},
+		{"review dispatched", StageTypeReview, StageStateDispatched, true},
+		{"review running", StageTypeReview, StageStateRunning, true},
+		{"acceptance pending", StageTypeAcceptance, StageStatePending, true},
+		{"acceptance dispatched", StageTypeAcceptance, StageStateDispatched, true},
+		{"acceptance running", StageTypeAcceptance, StageStateRunning, true},
+
+		// Admitted states on the WRONG stage type.
+		{"plan running", StageTypePlan, StageStateRunning, false},
+		{"plan dispatched", StageTypePlan, StageStateDispatched, false},
+		{"plan pending", StageTypePlan, StageStatePending, false},
+		{"deploy running", StageTypeDeploy, StageStateRunning, false},
+		{"deploy pending", StageTypeDeploy, StageStatePending, false},
+
+		// The #968 shape: implement never started.
+		{"implement pending", StageTypeImplement, StageStatePending, false},
+
+		// Every other park and terminal state is denied.
+		{"implement awaiting_approval", StageTypeImplement, StageStateAwaitingApproval, false},
+		{"implement awaiting_children", StageTypeImplement, StageStateAwaitingChildren, false},
+		{"implement awaiting_scope_decision", StageTypeImplement, StageStateAwaitingScopeDecision, false},
+		{"implement awaiting_host_dispatch", StageTypeImplement, StageStateAwaitingHostDispatch, false},
+		{"review awaiting_children", StageTypeReview, StageStateAwaitingChildren, false},
+		{"review awaiting_approval (the parked table's row, not this one)", StageTypeReview, StageStateAwaitingApproval, false},
+		{"acceptance awaiting_host_dispatch (the parked table's row, not this one)", StageTypeAcceptance, StageStateAwaitingHostDispatch, false},
+		{"review succeeded", StageTypeReview, StageStateSucceeded, false},
+		{"implement failed", StageTypeImplement, StageStateFailed, false},
+		{"acceptance superseded", StageTypeAcceptance, StageStateSuperseded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := StrandedMergeSupersedable(tc.stageType, tc.from); got != tc.want {
+				t.Errorf("StrandedMergeSupersedable(%q, %q) = %v, want %v", tc.stageType, tc.from, got, tc.want)
+			}
+			if got := ValidStageStrandedMergeSupersedeTransition(tc.stageType, tc.from, StageStateSuperseded); got != tc.want {
+				t.Errorf("ValidStageStrandedMergeSupersedeTransition(%q, %q, superseded) = %v, want %v",
+					tc.stageType, tc.from, got, tc.want)
+			}
+		})
+	}
+
+	// `to` other than superseded is refused even from an admitted pair.
+	for _, to := range []StageState{
+		StageStateSucceeded, StageStateFailed, StageStateCancelled,
+		StageStatePending, StageStateRunning, StageStateAwaitingApproval,
+	} {
+		if ValidStageStrandedMergeSupersedeTransition(StageTypeImplement, StageStateRunning, to) {
+			t.Errorf("ValidStageStrandedMergeSupersedeTransition(implement, running, %q) = true, want false (the table admits ONE destination)", to)
+		}
+	}
+}
+
+// TestStrandedSupersedeEdgeDoesNotLeak pins that the stranded edge (#4222) is
+// admitted by NO table in transitionStageTx's union: the ordinary machine and
+// every override table, including the PARKED merge-supersede table, refuse
+// running/dispatched/pending → superseded for every stranded row. Only the
+// stranded capability can write it.
+func TestStrandedSupersedeEdgeDoesNotLeak(t *testing.T) {
+	for _, p := range stageStrandedMergeSupersedeTransitions {
+		from, to := p.From, StageStateSuperseded
+		checks := []struct {
+			name string
+			got  bool
+		}{
+			{"ValidStageTransition", ValidStageTransition(from, to)},
+			{"ValidStageRetryTransition", ValidStageRetryTransition(from, to)},
+			{"ValidStageFixupTransition", ValidStageFixupTransition(from, to)},
+			{"ValidStageFixupRecoveryTransition", ValidStageFixupRecoveryTransition(from, to)},
+			{"ValidStageReviseTransition", ValidStageReviseTransition(from, to)},
+			{"ValidStageMergeSupersedeTransition", ValidStageMergeSupersedeTransition(p.StageType, from, to)},
+		}
+		for _, c := range checks {
+			if c.got {
+				t.Errorf("%s for %s@%s → superseded = true, want false — the stranded edge belongs only in stageStrandedMergeSupersedeTransitions (#4222)",
+					c.name, p.StageType, from)
+			}
+		}
+	}
+}
+
+// TestStrandedStageInFlight pins which stranded-candidate states are subject
+// to the capability's idle-cutoff liveness re-check (#4222): only the states a
+// runner may hold.
+func TestStrandedStageInFlight(t *testing.T) {
+	for state, want := range map[StageState]bool{
+		StageStateDispatched: true,
+		StageStateRunning:    true,
+		StageStatePending:    false,
+	} {
+		if got := strandedStageInFlight(state); got != want {
+			t.Errorf("strandedStageInFlight(%q) = %v, want %v", state, got, want)
+		}
+	}
+}
+
+// TestStageRecentlyActiveError_NamesStageAndTimes pins the refusal's message:
+// it names the stage, its state, and both timestamps in UTC.
+func TestStageRecentlyActiveError_NamesStageAndTimes(t *testing.T) {
+	id := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	at := time.Date(2026, 10, 10, 9, 0, 0, 0, time.FixedZone("x", 3600))
+	cutoff := time.Date(2026, 10, 9, 8, 0, 0, 0, time.UTC)
+	msg := StageRecentlyActiveError{StageID: id, State: StageStateRunning, LastActivity: at, IdleCutoff: cutoff}.Error()
+	for _, want := range []string{id.String(), "running", "2026-10-10T08:00:00Z", "2026-10-09T08:00:00Z"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("Error() = %q, want it to contain %q", msg, want)
+		}
+	}
+}
+
 // TestValidStageTransition_SupersededIsTerminalLockdown pins that the ORDINARY
 // transition table does not admit the merge-supersede edge in either direction
 // (#3083): the pair table is the only route in, and `superseded` admits no

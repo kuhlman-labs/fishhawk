@@ -436,6 +436,73 @@ func TestIssueSetResolutionTimeoutUnwrap(t *testing.T) {
 	}
 }
 
+// TestDependencySourceWireValues pins the dependency-source and native-read
+// reason literals (#4028): the server maps them onto its payloads and refusal
+// details verbatim, so a rename here silently changes the wire.
+func TestDependencySourceWireValues(t *testing.T) {
+	for got, want := range map[string]string{
+		string(DependencySourceNative):     "native",
+		string(DependencySourceLegacyText): "legacy_text",
+		string(NativeReadTruncated):        "truncated",
+		string(NativeReadForbidden):        "forbidden",
+		string(NativeReadNotFound):         "not_found",
+		string(NativeReadUnsupported):      "unsupported",
+		string(NativeReadFailed):           "read_failed",
+	} {
+		if got != want {
+			t.Errorf("wire value = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestNativeDependencyReadErrorMessage pins the rendered refusal (#4028): it
+// names the issue and the reason and carries the cause; with Issue 0 (the read
+// could not be attempted at all) it renders NO issue clause, so it never names a
+// bogus "#0".
+func TestNativeDependencyReadErrorMessage(t *testing.T) {
+	withIssue := (&NativeDependencyReadError{Issue: 7, Reason: NativeReadForbidden, Cause: errors.New("403 boom")}).Error()
+	want := `workmgmt: could not read the native "blocked by" dependencies of issue #7 (forbidden): 403 boom`
+	if withIssue != want {
+		t.Fatalf("message = %q, want %q", withIssue, want)
+	}
+	noIssue := (&NativeDependencyReadError{Reason: NativeReadUnsupported, Cause: errors.New("client lacks the read")}).Error()
+	if strings.Contains(noIssue, "#0") || strings.Contains(noIssue, "of issue") {
+		t.Fatalf("an Issue of 0 must render no issue clause, got %q", noIssue)
+	}
+	if !strings.Contains(noIssue, "(unsupported): client lacks the read") {
+		t.Fatalf("message %q must carry the reason and cause", noIssue)
+	}
+	if bare := (&NativeDependencyReadError{Issue: 3, Reason: NativeReadFailed}).Error(); strings.HasSuffix(bare, ": ") || !strings.HasSuffix(bare, "(read_failed)") {
+		t.Fatalf("a nil Cause must render no trailing cause clause, got %q", bare)
+	}
+}
+
+// TestNativeDependencyReadErrorUnwrap: errors.As reaches the issue and reason
+// through a wrap, and errors.Is reaches the cause's sentinel through Unwrap — the
+// two paths the server's 502 arm and a reason mapper each need.
+func TestNativeDependencyReadErrorUnwrap(t *testing.T) {
+	sentinel := errors.New("forbidden sentinel")
+	wrapped := fmt.Errorf("campaign: %w", &NativeDependencyReadError{Issue: 7, Reason: NativeReadForbidden, Cause: fmt.Errorf("read: %w", sentinel)})
+	var ne *NativeDependencyReadError
+	if !errors.As(wrapped, &ne) || ne.Issue != 7 || ne.Reason != NativeReadForbidden {
+		t.Fatalf("errors.As must reach the issue and reason through a wrap, got %+v", ne)
+	}
+	if !errors.Is(wrapped, sentinel) {
+		t.Fatal("errors.Is must reach the cause's sentinel through Unwrap")
+	}
+}
+
+// TestDependsEdgeSourceDoesNotChangeTargetRef: Source is metadata only — the
+// rendered target of an edge is identical whichever source it came from, so
+// tagging edges changes no existing operator rendering (#4028).
+func TestDependsEdgeSourceDoesNotChangeTargetRef(t *testing.T) {
+	native := DependsEdge{From: 2, To: 1, Source: DependencySourceNative}
+	legacy := DependsEdge{From: 2, To: 1, Source: DependencySourceLegacyText}
+	if native.TargetRef() != "issue:1" || legacy.TargetRef() != "issue:1" {
+		t.Fatalf("TargetRef = %q / %q, want issue:1 for both", native.TargetRef(), legacy.TargetRef())
+	}
+}
+
 // TestProviderRequest_NotifyCreated pins the write-ahead hook seam (#4153):
 // it forwards a copy of the created item to OnCreated, and is a no-op for a
 // nil hook or a nil item, so a provider calls it unconditionally.

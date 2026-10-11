@@ -760,7 +760,10 @@ Notes:
   `issuecomment` posts it to the issue thread; the run's sticky status comment
   already reflects the stage's new state through the shared `stageStateIcon`
   glyph. Payload: `{run_id, stage_id, stage_type, from_state, reason}`, where
-  `reason` is `merge_observed` | `operator_reconcile` | `repair`. It is the
+  `reason` is `merge_observed` | `operator_reconcile` |
+  `operator_reconcile_stranded` | `repair`; an `operator_reconcile_stranded` row
+  (reconcile-merge's opt-in `supersede_stranded` arm, #4222) also carries
+  `last_activity_at` and `idle_threshold_seconds`. It is the
   durable record of WHY a run completed around a stage that never executed —
   the honesty the state exists for, since the pre-existing escape hatches
   recorded `failed` (work never attempted) or `cancelled` (a change that
@@ -778,7 +781,10 @@ Notes:
   the merge itself is already announced through the existing `pr_merged` /
   `post_merge_observed` path and the run's sticky status comment. Payload:
   `{run_id, pull_request_url, pull_request_number, merge_commit_sha, merged_at,
-  observed_at, reconciled_after_the_fact}`, appended with `actor_kind` **user**
+  observed_at, reconciled_after_the_fact, credential_source,
+  pull_request_url_source}` (the last two since #4222: `run` |
+  `repository_installation`, and `run_row` | `pull_request_opened_audit`),
+  appended with `actor_kind` **user**
   (or `agent` for an operator-role subject) — an operator-invoked observation,
   never a system one, which is a second signal alongside the category that the
   fact was learned by hand rather than seen live.
@@ -1529,7 +1535,16 @@ Notes:
   implement fix-up) / `retry_dispatched` (class-2 → acceptance-stage reopen);
   and the human-paged `paged` (class-3/class-4) / `rerun_budget_exhausted` (the
   per-run re-run cap of 2 hit) / `fixup_unavailable_paged` (a class-1 fix-up
-  route refused — budget/ceiling/not-applicable) / `retry_unavailable_paged` (a
+  route refused — budget/ceiling/not-applicable, or a deferred release
+  superseded by another pass) / the NON-paging `fixup_deferred_review_in_flight`
+  (E72.58 / #4075: a class-1 fix-up held for an in-flight implement review
+  round; rendered by the generic `renderAcceptanceTriageLine` on anchor edits
+  only, never pinged, never counted as a re-run; additive payload object
+  `fixup_deferral {implement_stage_id, review_round_sequence, concerns}`, and
+  the release's entry adds `released_deferral_sequence`,
+  `routed_review_concern_ids`, and when they apply `held_review_concern_ids`,
+  `review_concern_fold_unmet`, `review_concerns_unavailable`,
+  `superseded_by_fixup_sequence`) / `retry_unavailable_paged` (a
   class-2 reopen refused) / `unsettled_paged` (the acceptance stage was not yet
   settled `succeeded` at ship time) / `externally_unvalidatable_paged` (class 5,
   #1671) / `rollback_offered` (E35.3 / #1600: a class-1/class-4 failed verdict on

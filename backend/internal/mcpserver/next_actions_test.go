@@ -2467,7 +2467,15 @@ func TestLatestAcceptanceSignals(t *testing.T) {
 // disposition / audit-category strings are copied verbatim from
 // backend/internal/server/acceptance.go and MUST match it. A backend rename
 // that is not mirrored here greps to this test.
+// acceptanceDispositionFixupDeferredMirror mirrors the backend's
+// acceptanceDispositionFixupDeferred (E72.58 / #4075). It must NOT be a paged
+// disposition here: the classifier serves it the rerouting poll.
+const acceptanceDispositionFixupDeferredMirror = "fixup_deferred_review_in_flight"
+
 func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
+	if isAcceptancePagedDisposition(acceptanceDispositionFixupDeferredMirror) {
+		t.Errorf("isAcceptancePagedDisposition(%q) = true, want false (a deferral awaits the review, it does not page)", acceptanceDispositionFixupDeferredMirror)
+	}
 	// MUST match backend/internal/server/acceptance.go verbatim.
 	want := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded":  auditCategoryAcceptanceOutcomeRecorded,
@@ -2488,6 +2496,11 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"unsettled_paged":                    acceptanceDispositionUnsettled,
 		"externally_unvalidatable_paged":     acceptanceDispositionUnvalidatable,
 		"rollback_offered":                   acceptanceDispositionRollbackOffered,
+		// E72.58 / #4075: mirrored as a test-local literal — the classifier has
+		// no arm for it and needs none: a deferral is neither paged nor
+		// auto-routed, so it falls to the acceptance_triage_rerouting poll,
+		// which reads as "await the implement review".
+		"fixup_deferred_review_in_flight": acceptanceDispositionFixupDeferredMirror,
 	}
 	expect := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
@@ -2523,6 +2536,9 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		// E35.3 / #1600: the post-deploy rollback offer. A rename with no mirror
 		// would drop the offer into the no-match rerouting poll arm.
 		"rollback_offered": "rollback_offered",
+		// E72.58 / #4075: the non-paging deferral. A rename with no mirror is
+		// harmless to the classifier (it still polls) but this pin names it.
+		"fixup_deferred_review_in_flight": "fixup_deferred_review_in_flight",
 	}
 	for k, wantVal := range expect {
 		if want[k] != wantVal {
@@ -6553,5 +6569,70 @@ func TestNextActions_SkipMarkerWinsOverVerdictPending(t *testing.T) {
 	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, acceptanceSkippedOutOfScopeIn(recent), false, verdict, "", releaseSignals{})
 	if na == nil || na.State != "acceptance_skipped_out_of_scope" {
 		t.Fatalf("state = %+v, want acceptance_skipped_out_of_scope (the skip marker must win over verdict_pending)", na)
+	}
+}
+
+// TestNextActions_ReviewCoverageIncomplete pins the #4219 arm: a drive run
+// whose derived_status is review_coverage_incomplete classifies under that
+// state and leads with the verb that clears the hold — fishhawk_rerun_review
+// when the drive stamp says rerun_review, fishhawk_await_review (stage
+// implement) otherwise — then the gate view. It NEVER offers the merge, even
+// with a clean, complete implement review that the table would otherwise
+// route to fishhawk_merge_run.
+func TestNextActions_ReviewCoverageIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		da       *RunNextAction
+		wantLead string
+	}{
+		{"rerun", &RunNextAction{Action: "rerun_review", Detail: "review coverage is incomplete: slice 1 ... fishhawk_rerun_review"}, "fishhawk_rerun_review"},
+		{"await", &RunNextAction{Action: "await_review"}, "fishhawk_await_review"},
+		{"no drive next action", nil, "fishhawk_await_review"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prURL := "https://github.com/x/y/pull/42"
+			run := naRun("running")
+			run.PullRequestURL = &prURL
+			stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), naStage("review", "awaiting_approval")}
+			drive := &DriveStatus{Drive: true, DerivedStatus: "review_coverage_incomplete", NextAction: tc.da}
+
+			na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false, false, false, "", "", releaseSignals{})
+			if na.State != "review_coverage_incomplete" {
+				t.Fatalf("state = %q, want review_coverage_incomplete", na.State)
+			}
+			if len(na.Actions) == 0 || na.Actions[0].Action != tc.wantLead {
+				t.Fatalf("actions = %+v, want %s first", na.Actions, tc.wantLead)
+			}
+			if na.Actions[0].Params["run_id"] != run.ID {
+				t.Errorf("lead params = %v, want run_id %s", na.Actions[0].Params, run.ID)
+			}
+			if tc.wantLead == "fishhawk_await_review" && na.Actions[0].Params["stage"] != "implement" {
+				t.Errorf("await params = %v, want stage implement", na.Actions[0].Params)
+			}
+			if tc.da != nil && tc.da.Detail != "" && na.Actions[0].Reason != tc.da.Detail {
+				t.Errorf("lead reason = %q, want the drive detail", na.Actions[0].Reason)
+			}
+			findAction(t, na, "fishhawk_get_gate_view")
+			for _, a := range na.Actions {
+				if a.Action == "fishhawk_merge_run" || a.Action == "merge_pr" || a.Action == "approve_pr" || a.Action == "merge_and_file_follow_up" {
+					t.Errorf("merge action %q offered on a review-coverage hold", a.Action)
+				}
+			}
+		})
+	}
+}
+
+// TestReviewCoverageIncompleteLiterals pins the copied literals against the
+// drive rule: the next_actions state and the drive rerun verb byte-match what
+// the server stamps (backend/internal/server/review_coverage.go).
+func TestReviewCoverageIncompleteLiterals(t *testing.T) {
+	if stateReviewCoverageIncomplete != string(drive.RuleReviewCoverageIncomplete) {
+		t.Errorf("stateReviewCoverageIncomplete = %q, want drive.RuleReviewCoverageIncomplete %q", stateReviewCoverageIncomplete, drive.RuleReviewCoverageIncomplete)
+	}
+	if readinessStatuses[stateReviewCoverageIncomplete] != stateReviewCoverageIncomplete {
+		t.Errorf("readinessStatuses[%q] = %q, want the same status", stateReviewCoverageIncomplete, readinessStatuses[stateReviewCoverageIncomplete])
+	}
+	if driveNextActionRerunReview != "rerun_review" {
+		t.Errorf("driveNextActionRerunReview = %q, want rerun_review", driveNextActionRerunReview)
 	}
 }

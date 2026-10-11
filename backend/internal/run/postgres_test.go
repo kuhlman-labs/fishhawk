@@ -4307,3 +4307,269 @@ func TestTransitionStageFromLiveRunTx(t *testing.T) {
 		})
 	}
 }
+
+// strandedSuperseder returns the repo's StrandedStageMergeSuperseder
+// capability (#4222), taken through the constructor's Repository-typed return
+// value so a decorator that erased the capability fails here.
+func strandedSuperseder(t *testing.T, repo run.Repository) run.StrandedStageMergeSuperseder {
+	t.Helper()
+	s, ok := repo.(run.StrandedStageMergeSuperseder)
+	if !ok {
+		t.Fatal("postgres repo does not implement StrandedStageMergeSuperseder")
+	}
+	return s
+}
+
+// seedRunningTypedStage creates a stage of typ and walks it to running,
+// returning the attempt token and the DB-stamped updated_at READ BACK from the
+// row. Every idle cutoff in the stranded-supersede tests is derived from that
+// read-back value, never from time.Now (AGENTS.md cross-clock rule, #3048).
+func seedRunningTypedStage(t *testing.T, repo run.Repository, typ run.StageType) (*run.Stage, string, time.Time) {
+	t.Helper()
+	r := makeRun(t, repo)
+	s := makeTypedStage(t, repo, r.ID, 0, typ)
+	token := dispatchToRunning(t, repo, s.ID)
+	cur, err := repo.GetStage(context.Background(), s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateRunning || token == "" {
+		t.Fatalf("PRECONDITION: stage state=%q token=%q, want running with an attempt token", cur.State, token)
+	}
+	return cur, token, cur.UpdatedAt
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_SupersedesRunningImplement is the
+// positive path (#4222): an implement stage stranded at running, idle as of
+// the cutoff (cutoff == its DB-stamped updated_at, the inclusive boundary),
+// is terminalized as superseded with ended_at stamped and no failure metadata,
+// read back from the COMMITTED row.
+func TestPostgres_SupersedeStrandedStageOnMerge_SupersedesRunningImplement(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, updatedAt := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	got, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateRunning, token, updatedAt)
+	if err != nil {
+		t.Fatalf("SupersedeStrandedStageOnMerge(implement@running, idle): %v", err)
+	}
+	if got.State != run.StageStateSuperseded || got.EndedAt == nil {
+		t.Errorf("returned state=%q ended_at=%v, want superseded with ended_at stamped", got.State, got.EndedAt)
+	}
+	cur, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateSuperseded {
+		t.Errorf("persisted state = %q, want superseded", cur.State)
+	}
+	if cur.EndedAt == nil {
+		t.Error("persisted ended_at is nil: superseded is terminal and completeRun's #968 guard reads it")
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("failure metadata stamped on a supersede: cat=%v reason=%v", cur.FailureCategory, cur.FailureReason)
+	}
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_RefusesStateDrift pins the state
+// pin: the caller classified the stage as dispatched, the locked row is
+// running. implement@dispatched is ALSO a table row and the cutoff is idle, so
+// the state comparison is the only control in the path — deleting it lets the
+// write land. The COMMITTED row is re-read, not just the error identity.
+func TestPostgres_SupersedeStrandedStageOnMerge_RefusesStateDrift(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, updatedAt := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	_, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateDispatched, token, updatedAt)
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError", err)
+	}
+	if sce.Expected != run.StageStateDispatched || sce.Actual != run.StageStateRunning {
+		t.Errorf("StageStateChangedError = %+v, want expected dispatched, actual running", sce)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_RefusesAttemptDrift pins the
+// attempt pin: the state matches but the caller's attempt token names a
+// different dispatch, so the premise belongs to another attempt.
+func TestPostgres_SupersedeStrandedStageOnMerge_RefusesAttemptDrift(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, updatedAt := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	stale := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	staleToken := run.StageAttemptToken(&stale)
+	if staleToken == token {
+		t.Fatalf("PRECONDITION: fabricated token equals the live one: %q", token)
+	}
+	_, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateRunning, staleToken, updatedAt)
+	var ace run.StageAttemptChangedError
+	if !errors.As(err, &ace) {
+		t.Fatalf("error = %v, want StageAttemptChangedError", err)
+	}
+	if ace.Expected != staleToken || ace.Actual != token {
+		t.Errorf("StageAttemptChangedError = %+v, want expected %q actual %q", ace, staleToken, token)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_RefusesUnadmittedType pins the
+// type-aware table at the repository boundary: a PLAN stage at running carries
+// an admitted STATE on the wrong type. State, attempt and liveness all pass,
+// so the table check is the only control in the path.
+func TestPostgres_SupersedeStrandedStageOnMerge_RefusesUnadmittedType(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, updatedAt := seedRunningTypedStage(t, repo, run.StageTypePlan)
+	_, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateRunning, token, updatedAt)
+	var ite run.InvalidTransitionError
+	if !errors.As(err, &ite) {
+		t.Fatalf("error = %v, want InvalidTransitionError (plan@running is not a stranded row)", err)
+	}
+	if ite.Kind != "stage" || ite.From != string(run.StageStateRunning) || ite.To != string(run.StageStateSuperseded) {
+		t.Errorf("InvalidTransitionError = %+v, want {stage running superseded}", ite)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_RefusesActivityAfterCutoff pins
+// the liveness TOCTOU close (#4222, approval condition 3): the caller decided
+// the stage was idle as of the updated_at it READ (cutoff = that value), then
+// a runner heartbeat landed before the write. The heartbeat bumps updated_at
+// through the stages_set_updated_at trigger, and the row-locked re-check
+// refuses. State, attempt and type all pass, so the cutoff comparison is the
+// only control in the path.
+func TestPostgres_SupersedeStrandedStageOnMerge_RefusesActivityAfterCutoff(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, cutoff := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	applied, err := progressStore(t, repo).RecordStageProgress(ctx, s.ID,
+		run.StageProgress{LastEvent: "assistant", ReportedAt: cutoff})
+	if err != nil || !applied {
+		t.Fatalf("PRECONDITION: heartbeat applied=%v err=%v", applied, err)
+	}
+	beat, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if !beat.UpdatedAt.After(cutoff) {
+		t.Fatalf("PRECONDITION: heartbeat did not advance updated_at (%v, cutoff %v); the trigger assumption is broken",
+			beat.UpdatedAt, cutoff)
+	}
+
+	_, err = strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateRunning, token, cutoff)
+	var rae run.StageRecentlyActiveError
+	if !errors.As(err, &rae) {
+		t.Fatalf("error = %v, want StageRecentlyActiveError (a heartbeat after the cutoff must refuse the write)", err)
+	}
+	if rae.StageID != s.ID || rae.State != run.StageStateRunning || !rae.LastActivity.Equal(beat.UpdatedAt) || !rae.IdleCutoff.Equal(cutoff) {
+		t.Errorf("StageRecentlyActiveError = %+v, want stage %s running, last activity %v, cutoff %v",
+			rae, s.ID, beat.UpdatedAt, cutoff)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_ZeroCutoffRefusesInFlight pins
+// the fail-closed default: a caller that passes no idle cutoff cannot retire
+// a dispatched or running stage.
+func TestPostgres_SupersedeStrandedStageOnMerge_ZeroCutoffRefusesInFlight(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, _ := seedRunningTypedStage(t, repo, run.StageTypeAcceptance)
+	_, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStateRunning, token, time.Time{})
+	var rae run.StageRecentlyActiveError
+	if !errors.As(err, &rae) {
+		t.Fatalf("error = %v, want StageRecentlyActiveError (zero cutoff must fail closed)", err)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_PendingGateNotLivenessChecked
+// pins that a never-opened gate (review@pending, the 74e8eade shape) is not
+// subject to the liveness re-check: no runner holds it, so even a zero cutoff
+// admits it.
+func TestPostgres_SupersedeStrandedStageOnMerge_PendingGateNotLivenessChecked(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeTypedStage(t, repo, r.ID, 0, run.StageTypeReview)
+	got, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, s.ID, run.StageStatePending, "", time.Time{})
+	if err != nil {
+		t.Fatalf("SupersedeStrandedStageOnMerge(review@pending): %v", err)
+	}
+	if got.State != run.StageStateSuperseded {
+		t.Errorf("returned state = %q, want superseded", got.State)
+	}
+	cur, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateSuperseded || cur.EndedAt == nil {
+		t.Errorf("persisted state=%q ended_at=%v, want superseded with ended_at", cur.State, cur.EndedAt)
+	}
+}
+
+// TestPostgres_SupersedeStrandedStageOnMerge_NotFound pins the missing-row
+// mapping.
+func TestPostgres_SupersedeStrandedStageOnMerge_NotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	_, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(context.Background(), uuid.New(), run.StageStateRunning, "", time.Time{})
+	if !errors.Is(err, run.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgres_TransitionStageFrom_StillRefusesRunningToSuperseded pins that
+// the stranded edge did not leak into transitionStageTx's union (#4222):
+// every ordinary transition entry point refuses implement running →
+// superseded, and the committed row is still running.
+func TestPostgres_TransitionStageFrom_StillRefusesRunningToSuperseded(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	s, token, _ := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	cas, ok := repo.(run.StageCASTransitioner)
+	if !ok {
+		t.Fatal("postgres repo does not implement StageCASTransitioner")
+	}
+	attempts := []struct {
+		name string
+		call func() error
+	}{
+		{"TransitionStage", func() error {
+			_, err := repo.TransitionStage(ctx, s.ID, run.StageStateSuperseded, nil)
+			return err
+		}},
+		{"TransitionStageFrom", func() error {
+			_, err := cas.TransitionStageFrom(ctx, s.ID, run.StageStateRunning, run.StageStateSuperseded, nil)
+			return err
+		}},
+		{"TransitionStageFromAttempt", func() error {
+			_, err := attemptCAS(t, repo).TransitionStageFromAttempt(ctx, s.ID, run.StageStateRunning, run.StageStateSuperseded, token, nil)
+			return err
+		}},
+	}
+	for _, a := range attempts {
+		var ite run.InvalidTransitionError
+		if err := a.call(); !errors.As(err, &ite) {
+			t.Errorf("%s(implement running → superseded) error = %v, want InvalidTransitionError", a.name, err)
+		}
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
+}

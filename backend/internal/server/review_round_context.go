@@ -1,6 +1,10 @@
 package server
 
-import "context"
+import (
+	"context"
+
+	"github.com/google/uuid"
+)
 
 // Review-round context (#4077). Two facts about a review round ride the
 // dispatch context down to emitReviewStarted, which stamps them on the
@@ -16,6 +20,10 @@ import "context"
 // runImplementReviews / runPlanReviews have well over a hundred test call
 // sites, and the values are written by exactly four production sites (the
 // three implement dispatchers set the source; the boot re-dispatch sets both).
+//
+// A third fact, the operator RE-RUN marker (#4219, reviewRerun below), rides
+// the same way: the re-run verb sets it, and emitReviewStarted stamps its Of as
+// the new round's rerun_of.
 
 // Implement-review round origins (planreview.ReviewStartedPayload.RoundOrigin).
 const (
@@ -81,6 +89,49 @@ func reviewRoundSourceFrom(ctx context.Context) (reviewRoundSource, bool) {
 // not a call to this function.
 func withReviewRedispatch(ctx context.Context, rd reviewRedispatch) context.Context {
 	return context.WithValue(ctx, reviewRedispatchCtxKey{}, rd)
+}
+
+// reviewRerun is the OPERATOR RE-RUN marker (#4219), a second same-head review
+// path DISTINCT from the ADR-091 D6 boot re-dispatch marker above (whose key,
+// setter and reachability guard it does not touch). Of is the audit sequence
+// of the implement_review_started entry of the settled, verdict-less round the
+// operator re-runs; StageID and HeadSHA are that round's stage and reviewed
+// head.
+//
+// The marker is a CLAIM, not a credential: carrying it bypasses nothing by
+// itself. runImplementReviewsForTree honours it only when rerunBypassApplies
+// re-verifies it against the audit chain — the dispatch's (stage, head) equal
+// the marker's AND the run's newest implement_review_started is exactly round
+// Of — and the #797 dedup check re-verifies it INSIDE reviewDispatchMu, so a
+// second dispatch carrying the same marker finds the first's new round newest
+// and dedups as an ordinary round would.
+type reviewRerun struct {
+	Of      int64
+	StageID uuid.UUID
+	HeadSHA string
+}
+
+// reviewRerunCtxKey is unexported for the reason reviewRedispatchCtxKey is: no
+// code outside this package can construct it. Its only setter is withReviewRerun,
+// whose only production caller is handleRerunReview's dispatch
+// (pinned by TestReviewRerunMarker_Reachability).
+type reviewRerunCtxKey struct{}
+
+// withReviewRerun returns ctx carrying the operator re-run marker. Called only
+// by the re-run verb after its refusals (review_rerun.go).
+func withReviewRerun(ctx context.Context, rr reviewRerun) context.Context {
+	return context.WithValue(ctx, reviewRerunCtxKey{}, rr)
+}
+
+// reviewRerunFrom returns the re-run marker ctx carries. ok=false when it
+// carries none, or a marker naming no round (Of <= 0) or no stage: a malformed
+// marker never unlocks anything.
+func reviewRerunFrom(ctx context.Context) (reviewRerun, bool) {
+	rr, ok := ctx.Value(reviewRerunCtxKey{}).(reviewRerun)
+	if !ok || rr.Of <= 0 || rr.StageID == uuid.Nil {
+		return reviewRerun{}, false
+	}
+	return rr, true
 }
 
 // reviewRedispatchFrom returns the re-dispatch marker ctx carries. ok=false

@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -385,6 +386,44 @@ type StageCASTransitioner interface {
 //nolint:revive // the approved #4082 plan names run.RunReopenReviver as the server handler's type assertion; "Run" names the run (not the stage) being reopened.
 type RunReopenReviver interface {
 	ReviveRunOnReopen(ctx context.Context, runID, reviewStageID uuid.UUID) (*Run, *Stage, error)
+}
+
+// StrandedStageMergeSuperseder is an OPTIONAL capability on the concrete
+// postgres repo — the repository half of reconcile-merge's opt-in stranded
+// arm (#4222). SupersedeStrandedStageOnMerge terminalizes ONE stage stranded
+// in flight (or a never-opened gate) on a run whose PR already merged, in its
+// own transaction. Under the LockStageForUpdate row lock and BEFORE any write
+// it refuses, mutating nothing:
+//
+//   - the row's state differs from `from` → StageStateChangedError;
+//   - a non-empty expectedAttempt differs from StageAttemptToken of the row's
+//     dispatched_at → StageAttemptChangedError (an empty one is inert: a
+//     legacy pre-0072 row has no attempt anchor);
+//   - ValidStageStrandedMergeSupersedeTransition(row stage_type, from,
+//     superseded) is false → InvalidTransitionError;
+//   - the row is dispatched/running and its DB-stamped updated_at is AFTER
+//     idleCutoff → StageRecentlyActiveError. This closes the window between
+//     the caller's liveness read and the write: a heartbeat landing in it
+//     bumps updated_at through the stages_set_updated_at trigger and the
+//     write is refused. A zero idleCutoff refuses every in-flight row
+//     (fail-closed). A pending row is not liveness-checked.
+//
+// Otherwise it writes `superseded` with ended_at stamped. A missing row
+// returns ErrNotFound. The edge lives in its own table (transition.go) and is
+// NOT in transitionStageTx's union, so no other repository method can retire
+// a dispatched/running stage as superseded.
+//
+// It decides only WHICH state pair may be written and whether the row was
+// active after the cutoff. Merge evidence, the idle threshold and the opt-in
+// are the caller's decision: the server's reconcile-merge handler is the only
+// caller.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner
+// is — widening Repository would break every manually-written full-interface
+// test fake — and probed with a type assertion by its consumer, which refuses
+// when it is absent.
+type StrandedStageMergeSuperseder interface {
+	SupersedeStrandedStageOnMerge(ctx context.Context, stageID uuid.UUID, from StageState, expectedAttempt string, idleCutoff time.Time) (*Stage, error)
 }
 
 // StageAttemptCASTransitioner is an OPTIONAL capability on the concrete

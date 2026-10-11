@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -56,7 +57,27 @@ type mergeObservation struct {
 	// Timestamp so the row's timestamp and its payload's observed_at are the
 	// SAME instant rather than two clock reads that can disagree.
 	observedAtTime time.Time
+	// CredentialSource names the forge credential the read ran under (E83.95 /
+	// #4222): credentialSourceRun (the run's own InstallationRef /
+	// InstallationID) or credentialSourceRepositoryInstallation (the GitHub
+	// App's CURRENT installation on the run's repository, resolved at read time
+	// because the run carries no credential). omitempty so the already_recorded
+	// no-op's zero observation keeps its wire shape.
+	CredentialSource string `json:"credential_source,omitempty"`
+	// PullRequestURLSource names where PullRequestURL came from:
+	// prURLSourceRunRow, or prURLSourcePullRequestOpened when the run row
+	// carries none and the URL was derived from the run's newest
+	// pull_request_opened entry (never written back to the run row).
+	PullRequestURLSource string `json:"pull_request_url_source,omitempty"`
 }
+
+// The credential_source and pull_request_url_source values (E83.95 / #4222).
+const (
+	credentialSourceRun                    = "run"
+	credentialSourceRepositoryInstallation = "repository_installation"
+	prURLSourceRunRow                      = "run_row"
+	prURLSourcePullRequestOpened           = "pull_request_opened_audit"
+)
 
 // recordMergeObservationResponse reports what the observe verb did. Recorded is
 // the entry this call appended; AlreadyRecorded:true means the chain already
@@ -108,8 +129,17 @@ type recordMergeObservationResponse struct {
 //  2. 503 record_merge_observation_unconfigured — the run/audit repositories are
 //     unwired (the forge reader is resolved later, at rung 7);
 //  3. 404 run_not_found;
-//  4. 409 record_merge_observation_no_pull_request — the run carries no
-//     PullRequestURL, so it never reached a PR and there is nothing to observe;
+//  4. 409 record_merge_observation_no_pull_request — neither the run row nor
+//     any pull_request_opened entry on the run's chain carries a pull request
+//     URL, so there is nothing to observe. When the run row carries none (a
+//     legacy run whose URL was never persisted), the URL is DERIVED from the
+//     pr_url of the run's newest (highest-sequence) pull_request_opened entry
+//     (E83.95 / #4222) — read-time only, never written back to the run row —
+//     and the observation records pull_request_url_source accordingly. A
+//     failed chain read here is a 500 and never a write. The derived URL is
+//     then held to rungs 5 / 5b EXACTLY like a run-row URL, so a
+//     pull_request_opened row naming another repository is still refused
+//     before any forge read;
 //  5. 400 record_merge_observation_malformed_pr_url — the recorded URL is
 //     structurally unresolvable: it names no (repo, number) pair under ANY
 //     forge shape, or the run's own repo field is not owner/name;
@@ -125,6 +155,19 @@ type recordMergeObservationResponse struct {
 //     chain ALREADY carries pr_merged / post_merge_observed /
 //     merge_observation_recorded. A chain-read failure here is a 500 and never a
 //     write — fail closed on unknown evidence;
+//     Rung 6b, the credential (E83.95 / #4222): a GitHub-family run carrying
+//     NO credential (no InstallationRef / InstallationID) with cfg.GitHub
+//     wired resolves the App's CURRENT installation on the run's own
+//     repository (resolveObservationCredential). That fallback is computed
+//     HERE and passed into the shared ladder, never inside it, so the merge
+//     endpoint's observe rung keeps reading under the run's own credential
+//     only. 409 record_merge_observation_no_credential — the App is not
+//     installed on the repository, or (binding approval condition 1) the run
+//     is TENANTED and the resolved installation is not proven to map to the
+//     run's OWN account; it records nothing and makes no pull request read.
+//     502 record_merge_observation_forge_unavailable — the installation lookup
+//     itself failed. A run that carries its own credential never looks the
+//     installation up;
 //  7. 503 record_merge_observation_unconfigured — the per-forge reader could not
 //     be resolved (a github-family run with no cfg.GitHub, or a non-github run
 //     whose ForgeResolver errored or returned nil). A verb that records forge
@@ -194,12 +237,31 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 			"get run failed", map[string]any{"error": gerr.Error()})
 		return
 	}
-	// Rung 4.
+	// Rung 4. A run row with no URL falls back to the chain's newest
+	// pull_request_opened entry (E83.95 / #4222). The derived value rides a
+	// shallow COPY of the run row — the persisted row is never written — so
+	// every later rung, the forge read and the recorded payload see it exactly
+	// as they would a run-row URL.
+	prURLSource := prURLSourceRunRow
 	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
-		s.writeError(w, r, http.StatusConflict, "record_merge_observation_no_pull_request",
-			"this run carries no pull request URL, so there is no merge to observe",
-			map[string]any{"run_id": runID.String()})
-		return
+		derived, derr := s.derivePullRequestURLFromChain(r.Context(), runID)
+		if derr != nil {
+			// Fail CLOSED: an unreadable chain is not "no pull request".
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"read pull_request_opened entries failed",
+				map[string]any{"run_id": runID.String(), internalCauseKey: derr.Error()})
+			return
+		}
+		if derived == "" {
+			s.writeError(w, r, http.StatusConflict, "record_merge_observation_no_pull_request",
+				"neither the run row nor any pull_request_opened entry on the run's audit chain carries a pull request URL, so there is no merge to observe",
+				map[string]any{"run_id": runID.String()})
+			return
+		}
+		derivedRow := *runRow
+		derivedRow.PullRequestURL = &derived
+		runRow = &derivedRow
+		prURLSource = prURLSourcePullRequestOpened
 	}
 	prURL := *runRow.PullRequestURL
 	// Rungs 5 / 5b. Resolve the observation target with the forge-FAMILY-aware
@@ -210,9 +272,10 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 	// forge family is rung 5b's 409. Both refuse BEFORE the forge read, so a
 	// refusal costs no forge request and — like every other rung — leaves ZERO
 	// rows.
-	// The repo ref is deliberately discarded here: observeForgeMerge below
-	// re-resolves the SAME deterministic function and owns the forge read.
-	forgeID, _, prNumber, targetReason := resolveObservationTarget(runRow)
+	// The repo ref is kept only for rung 6b's installation lookup:
+	// observeForgeMergeScoped below re-resolves the SAME deterministic function
+	// and owns the forge read.
+	forgeID, repo, prNumber, targetReason := resolveObservationTarget(runRow)
 	switch targetReason {
 	case obsTargetMalformed:
 		s.writeError(w, r, http.StatusBadRequest, "record_merge_observation_malformed_pr_url",
@@ -259,12 +322,29 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 		})
 		return
 	}
+	// Rung 6b. The credential, computed HERE (binding approval condition 2) and
+	// passed into the shared ladder, so the merge endpoint's observe rung —
+	// which calls observeForgeMerge with the run's own credential — gains no
+	// installation lookup.
+	cred, credReason, credRefusal, credErr := s.resolveObservationCredential(r.Context(), runRow, forgeID, repo)
+	switch credReason {
+	case obsForgeNoCredential:
+		s.writeError(w, r, http.StatusConflict, "record_merge_observation_no_credential",
+			observationNoCredentialMessage(credRefusal),
+			map[string]any{"run_id": runID.String(), "repo": runRow.Repo, "reason": credRefusal})
+		return
+	case obsForgeUnavailable:
+		s.writeError(w, r, http.StatusBadGateway, "record_merge_observation_forge_unavailable",
+			"could not resolve the GitHub App installation on the run's repository, which this run needs because it carries no forge credential; the merge state is unknown and nothing was recorded",
+			map[string]any{"run_id": runID.String(), "repo": runRow.Repo, "error": credErr.Error()})
+		return
+	}
 	// Rungs 7-10 are the FORGE read and the three fact guards. They live in the
-	// shared, side-effect-free observeForgeMerge helper (E45.87 / #3622) so the
-	// merge endpoint's observe-before-dispatch rung runs the IDENTICAL ladder;
-	// the discriminator below reproduces this handler's ten refusal codes and
-	// statuses byte-for-byte.
-	obs, reason, forgeErr := s.observeForgeMerge(r.Context(), runRow)
+	// shared, side-effect-free observeForgeMergeScoped helper (E45.87 / #3622)
+	// so the merge endpoint's observe-before-dispatch rung runs the IDENTICAL
+	// ladder; the discriminator below reproduces this handler's ten refusal
+	// codes and statuses byte-for-byte.
+	obs, reason, forgeErr := s.observeForgeMergeScoped(r.Context(), runRow, cred)
 	switch reason {
 	case obsForgeNoReader:
 		// Rung 7 (reader half).
@@ -295,12 +375,14 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 			"the forge reports this pull request merged but carries no merge timestamp; refusing to record a partial observation that would claim a merge time it does not have",
 			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber})
 		return
-	case obsForgeMalformedTarget, obsForgeMismatchTarget:
+	case obsForgeMalformedTarget, obsForgeMismatchTarget, obsForgeNoCredential:
 		// UNREACHABLE from here: rungs 5 / 5b above already refused every
 		// malformed or mismatched target, and observeForgeMerge re-resolves the
-		// SAME deterministic function over the SAME run row. Kept so the switch
-		// is total and a future reordering fails closed rather than falling
-		// through to the append with a zero observation.
+		// SAME deterministic function over the SAME run row, and
+		// obsForgeNoCredential is produced only by rung 6b, never by the shared
+		// ladder. Kept so the switch is total and a future reordering fails
+		// closed rather than falling through to the append with a zero
+		// observation.
 		s.writeError(w, r, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch",
 			"the run's recorded pull request URL does not name this run's repository on this run's forge family; refusing to confirm a pull request that is not this run's",
 			map[string]any{
@@ -320,6 +402,7 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 	if subject == "" {
 		subject = "anonymous"
 	}
+	obs.PullRequestURLSource = prURLSource
 	if aerr := s.appendMergeObservation(r.Context(), runID, subject, *obs); aerr != nil {
 		// E45.94/#3631: route the raw cause through the internalCauseKey
 		// channel rather than a plain "error" details key. writeError's 5xx
@@ -359,6 +442,12 @@ const (
 	obsForgeNotMerged
 	obsForgeNoMergeCommit
 	obsForgeNoMergeTimestamp
+	// obsForgeNoCredential — the run carries no forge credential and the
+	// repository-installation fallback could not stand in for one (the App is
+	// not installed there, or the installation is not proven to belong to the
+	// run's account). Produced ONLY by resolveObservationCredential (E83.95 /
+	// #4222), never by the shared observeForgeMergeScoped ladder.
+	obsForgeNoCredential
 )
 
 // forgeMergeState renders the reason as the stable snake_case token the merge
@@ -383,6 +472,8 @@ func (r obsForgeReason) forgeMergeState() string {
 		return "merged_without_commit_sha"
 	case obsForgeNoMergeTimestamp:
 		return "merged_without_timestamp"
+	case obsForgeNoCredential:
+		return "no_forge_credential"
 	}
 	return "unknown"
 }
@@ -403,7 +494,22 @@ func (r obsForgeReason) forgeMergeState() string {
 // The returned observation is non-nil ONLY on obsForgeOK. forgeErr is non-nil
 // ONLY on obsForgeUnavailable, carrying the GetPullRequest error verbatim so
 // the observe handler's 502 detail is unchanged.
+//
+// This entry point reads under the run's OWN credential only
+// (runObservationCredential) and is what the merge endpoint's observe rung
+// calls: it never looks up a repository installation (binding approval
+// condition 2 of #4222). The record-merge-observation handler computes its
+// credential — possibly the repository-installation fallback — itself and
+// calls observeForgeMergeScoped directly.
 func (s *Server) observeForgeMerge(ctx context.Context, runRow *run.Run) (obs *mergeObservation, reason obsForgeReason, forgeErr error) {
+	return s.observeForgeMergeScoped(ctx, runRow, runObservationCredential(runRow))
+}
+
+// observeForgeMergeScoped is observeForgeMerge's ladder under a CALLER-supplied
+// credential. It performs no credential resolution of its own: cred.scope is
+// passed to GetPullRequest verbatim and cred.source is stamped on the
+// observation.
+func (s *Server) observeForgeMergeScoped(ctx context.Context, runRow *run.Run, cred observationCredential) (obs *mergeObservation, reason obsForgeReason, forgeErr error) {
 	forgeID, repo, prNumber, targetReason := resolveObservationTarget(runRow)
 	switch targetReason {
 	case obsTargetMalformed:
@@ -415,7 +521,7 @@ func (s *Server) observeForgeMerge(ctx context.Context, runRow *run.Run) (obs *m
 	if readerErr != nil || reader == nil {
 		return nil, obsForgeNoReader, nil
 	}
-	pr, perr := reader.GetPullRequest(ctx, mergeObservationScope(runRow), repo, prNumber)
+	pr, perr := reader.GetPullRequest(ctx, cred.scope, repo, prNumber)
 	if perr != nil {
 		return nil, obsForgeUnavailable, perr
 	}
@@ -441,7 +547,153 @@ func (s *Server) observeForgeMerge(ctx context.Context, runRow *run.Run) (obs *m
 		MergedAt:          pr.MergedAt.UTC().Format(time.RFC3339Nano),
 		ObservedAt:        observedAt.Format(time.RFC3339Nano),
 		observedAtTime:    observedAt,
+		// The ladder reads the URL off the run row it was handed; a caller that
+		// derived it (the observe handler's rung 4) overrides this.
+		CredentialSource:     cred.source,
+		PullRequestURLSource: prURLSourceRunRow,
 	}, obsForgeOK, nil
+}
+
+// observationCredential is the forge credential a merge-observation read runs
+// under, plus the credential_source value naming where it came from.
+type observationCredential struct {
+	scope  forge.CredentialScope
+	source string
+}
+
+// runObservationCredential is the run's OWN credential (mergeObservationScope),
+// possibly the zero scope. It is the only credential the merge endpoint's
+// observe rung ever uses.
+func runObservationCredential(runRow *run.Run) observationCredential {
+	return observationCredential{scope: mergeObservationScope(runRow), source: credentialSourceRun}
+}
+
+// The details.reason values of 409 record_merge_observation_no_credential.
+const (
+	noCredentialAppNotInstalled             = "app_not_installed"
+	noCredentialInstallationAccountMismatch = "installation_account_mismatch"
+	noCredentialInstallationAccountUnproven = "installation_account_unverifiable"
+)
+
+// observationNoCredentialMessage renders the 409's message, naming the remedy
+// for each refusal reason.
+func observationNoCredentialMessage(reason string) string {
+	switch reason {
+	case noCredentialAppNotInstalled:
+		return "this run carries no forge credential and the Fishhawk GitHub App is not installed on the run's repository; install the App on the repository, then retry. Nothing was recorded"
+	case noCredentialInstallationAccountMismatch:
+		return "this run carries no forge credential and the GitHub App installation on the run's repository is not registered to this run's account; refusing to read through another account's installation. Register the installation to the run's account (fishhawkd installation register), then retry. Nothing was recorded"
+	default:
+		return "this run carries no forge credential and the GitHub App installation on the run's repository could not be verified as belonging to this run's account; refusing to read through an installation not proven to be the run's own. Nothing was recorded"
+	}
+}
+
+// resolveObservationCredential computes the credential the observe verb reads
+// under (rung 6b, E83.95 / #4222). It is called by handleRecordMergeObservation
+// ONLY — never from the shared ladder — so the merge endpoint never pays an
+// installation lookup (binding approval condition 2).
+//
+// The ladder, all evaluated BEFORE any pull request read:
+//   - the run's own credential (runObservationCredential) when it is non-zero,
+//     the run is not GitHub-family, or cfg.GitHub is unwired — returned
+//     unchanged with obsForgeOK and NO installation lookup. An unwired
+//     cfg.GitHub keeps today's behaviour: the zero scope passes through and
+//     the reader decides;
+//   - otherwise the GitHub App's CURRENT installation on the run's own
+//     repository, via resolveRepoScope. forge.ErrNotInstalled (a zero scope,
+//     nil error) is obsForgeNoCredential/app_not_installed; any other lookup
+//     error is obsForgeUnavailable carrying it;
+//   - binding approval condition 1 (the account condition): a resolved
+//     installation is used ONLY when the run is untenanted (empty AccountID —
+//     the legacy shape) or the installation maps to the run's OWN account
+//     through the installation→account seam (webhook
+//     InstallationAccountLookup on cfg.WebhookDispatcher). A tenanted run whose
+//     installation maps to another account, or to none, is
+//     installation_account_mismatch; one whose mapping cannot be read (seam
+//     unwired, or a lookup error) is installation_account_unverifiable. Both
+//     are obsForgeNoCredential — fail closed, never read through an
+//     installation not proven to be the run's own.
+//
+// refusal is the 409's details.reason, set only on obsForgeNoCredential; err is
+// set only on obsForgeUnavailable.
+func (s *Server) resolveObservationCredential(ctx context.Context, runRow *run.Run, forgeID string,
+	repo forge.RepoRef) (cred observationCredential, reason obsForgeReason, refusal string, err error) {
+	cred = runObservationCredential(runRow)
+	if !cred.scope.IsZero() || forgeID != observationForgeGitHub || s.cfg.GitHub == nil {
+		return cred, obsForgeOK, "", nil
+	}
+	scope, rerr := s.resolveRepoScope(ctx, repo.Owner, repo.Name)
+	if rerr != nil {
+		return observationCredential{}, obsForgeUnavailable, "",
+			errors.New("resolve the GitHub App installation on " + repo.Owner + "/" + repo.Name + ": " + rerr.Error())
+	}
+	if scope.IsZero() {
+		return observationCredential{}, obsForgeNoCredential, noCredentialAppNotInstalled, nil
+	}
+	if runRow.AccountID != "" {
+		if refusal := s.installationAccountRefusal(ctx, runRow, scope); refusal != "" {
+			return observationCredential{}, obsForgeNoCredential, refusal, nil
+		}
+	}
+	return observationCredential{scope: scope, source: credentialSourceRepositoryInstallation}, obsForgeOK, "", nil
+}
+
+// installationAccountRefusal decides binding approval condition 1 for a
+// TENANTED run: "" when the resolved installation maps to the run's own
+// account, otherwise the refusal reason. Every uncertainty refuses.
+func (s *Server) installationAccountRefusal(ctx context.Context, runRow *run.Run, scope forge.CredentialScope) string {
+	if s.cfg.WebhookDispatcher == nil || s.cfg.WebhookDispatcher.Accounts == nil {
+		return noCredentialInstallationAccountUnproven
+	}
+	instID, ierr := scope.GitHubInstallationID()
+	if ierr != nil {
+		return noCredentialInstallationAccountUnproven
+	}
+	acct, aerr := s.cfg.WebhookDispatcher.Accounts.AccountIDForInstallation(ctx, instID)
+	if aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"record merge observation: installation account lookup failed; refusing the repository-installation fallback",
+			slog.String("run_id", runRow.ID.String()), slog.Int64("installation_id", instID),
+			slog.String("error", aerr.Error()))
+		return noCredentialInstallationAccountUnproven
+	}
+	if acct == "" || !strings.EqualFold(acct, runRow.AccountID) {
+		return noCredentialInstallationAccountMismatch
+	}
+	return ""
+}
+
+// derivePullRequestURLFromChain returns the pr_url of the run's newest
+// (highest-sequence) pull_request_opened entry whose payload carries a
+// non-empty one, or "" when none does (E83.95 / #4222). Every
+// pull_request_opened payload has carried pr_url since #196. A chain-read
+// error is returned so the caller fails closed; an undecodable payload is
+// skipped, never fatal.
+func (s *Server) derivePullRequestURLFromChain(ctx context.Context, runID uuid.UUID) (string, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "pull_request_opened")
+	if err != nil {
+		return "", err
+	}
+	var (
+		best    string
+		bestSeq int64
+		found   bool
+	)
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			PRURL string `json:"pr_url"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil || p.PRURL == "" {
+			continue
+		}
+		if !found || e.Sequence > bestSeq {
+			best, bestSeq, found = p.PRURL, e.Sequence, true
+		}
+	}
+	return best, nil
 }
 
 // appendMergeObservation appends the ONE chained merge_observation_recorded
@@ -462,6 +714,10 @@ func (s *Server) appendMergeObservation(ctx context.Context, runID uuid.UUID, su
 		"merged_at":                 obs.MergedAt,
 		"observed_at":               obs.ObservedAt,
 		"reconciled_after_the_fact": true,
+		// E83.95 / #4222: which credential the read used, and where the URL
+		// came from — additive keys.
+		"credential_source":       obs.CredentialSource,
+		"pull_request_url_source": obs.PullRequestURLSource,
 	})
 	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
@@ -719,7 +975,9 @@ func parsePRURLRepo(prURL string) (forge.RepoRef, bool) {
 // falling back to the GitHub installation id — the same ladder the sibling
 // forge reads in this package use. A run carrying neither yields the zero
 // scope, which the reader rejects; that surfaces as the forge-unavailable rung
-// rather than a silent unauthenticated read.
+// rather than a silent unauthenticated read. (The observe verb alone may
+// replace a zero scope with the repository-installation fallback — see
+// resolveObservationCredential; this function never does.)
 func mergeObservationScope(runRow *run.Run) forge.CredentialScope {
 	if runRow.InstallationRef != nil && *runRow.InstallationRef != "" {
 		return forge.FromRef(*runRow.InstallationRef)

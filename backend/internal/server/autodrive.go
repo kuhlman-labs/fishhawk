@@ -290,6 +290,13 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		if !mergeGateReady(runRow, stages) {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
 				slog.String("run_id", runRow.ID.String()))
+		} else if note, held := s.reviewCoverageObserveNote(ctx, runRow); held {
+			// #4219: the SAME review-coverage predicate the operator merge
+			// endpoint refuses on, translated to observe-only. The delegated arm
+			// never re-runs a review itself; a read error fails closed.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but review coverage is incomplete; observe-only",
+				slog.String("run_id", runRow.ID.String()))
+			return observeOnly(note), nil
 		} else if gate := s.mergeCandidateGate(ctx, runRow); !gate.admits() {
 			// ADR-090 D1/D2/D7 (E83.33 / #4018): the SAME merge-candidate gate the
 			// operator merge endpoint consults, translated to observe-only. A
@@ -339,6 +346,22 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 	}
 
 	return observeOnly("no delegated knob met and state-matched; observe-only"), nil
+}
+
+// reviewCoverageObserveNote reports whether the delegated may_merge arm must
+// hold on the decomposed-parent review-coverage predicate (#4219), with the
+// observe-only note naming the operator's next step. A coverage read error
+// holds too (fail-closed): the delegated arm never merges on an unread hole.
+func (s *Server) reviewCoverageObserveNote(ctx context.Context, runRow *run.Run) (string, bool) {
+	ref, err := s.reviewCoverageRefusal(ctx, runRow)
+	if err != nil {
+		return "review coverage could not be read (fail-closed); observe-only", true
+	}
+	if ref == nil {
+		return "", false
+	}
+	next, _ := ref.Details["next_step"].(string)
+	return "review coverage incomplete: a decomposed slice is not covered by a successful agent review; the operator's next step is " + next + " — the delegated arm never re-runs a review; observe-only", true
 }
 
 // mergeCandidateObserveNote renders a refused merge-candidate gate as the
@@ -774,6 +797,13 @@ func (s *Server) emitCampaignGatePaged(ctx context.Context, runRow *run.Run, id 
 func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, stages []*run.Stage, open []*concern.Concern, rule string) (bool, error) {
 	impl := implementStage(stages)
 	if impl == nil || !fixupEligibleState(impl, stages) {
+		return false, nil
+	}
+	// A class-1 acceptance fix-up deferred for the in-flight implement review
+	// round (E72.58 / #4075) owns the next pass: its release routes ONE pass
+	// carrying the acceptance obligation and these concerns. Routing here
+	// would supersede it and leave the acceptance obligation to a human.
+	if s.acceptanceFixupDeferralPending(ctx, runRow.ID) {
 		return false, nil
 	}
 	var selected []planreview.Concern

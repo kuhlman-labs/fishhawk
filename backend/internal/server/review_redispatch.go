@@ -33,7 +33,10 @@ import (
 // cannot safely re-dispatch, with a reason naming why.
 //
 // The on-demand POST /v0/runs/{run_id}/reviews/reconcile stays TERMINATE-ONLY
-// (review_reconcile_http.go): only the boot sweep re-dispatches.
+// (review_reconcile_http.go): only the boot sweep re-dispatches an ORPHANED
+// round. The operator re-run verb POST /v0/runs/{run_id}/reviews/rerun
+// (review_rerun.go, #4219) is a separate path: it re-runs a SETTLED round with
+// zero verdicts, under its own marker, never the D6 one.
 
 // categoryReviewRoundRedispatched is the audit row the boot sweep appends,
 // synchronously and before any dispatch, for each orphaned round it
@@ -219,43 +222,57 @@ func (s *Server) redispatchEligibility(ctx context.Context, runID uuid.UUID, sta
 		return true, "", nil
 	}
 
+	if slug, err := s.implementRoundRebuildSlug(ctx, runID, stageID, latest.Sequence, payload); err != nil || slug != "" {
+		return false, slug, err
+	}
+	return true, "", nil
+}
+
+// implementRoundRebuildSlug is the implement-round half of redispatchEligibility,
+// shared with the operator re-run verb (#4219, rerunIneligibleSlug) so the two
+// same-head paths refuse a round for the same reasons: unknown_round_source,
+// superseded_by_fixup, implement_stage_terminal / advanced_past_review
+// (implementRoundStageSlug), then trace_bundle_unavailable or
+// forge_compare_unavailable. "" means the round's recorded source can be
+// rebuilt and the stage still wants it; err is non-nil only when a read failed.
+func (s *Server) implementRoundRebuildSlug(ctx context.Context, runID, stageID uuid.UUID, roundSeq int64, payload planreview.ReviewStartedPayload) (string, error) {
 	switch payload.RoundOrigin {
 	case reviewRoundOriginTrace:
 	case reviewRoundOriginFixupPush, reviewRoundOriginConsolidated:
 		// A compare-sourced round is rebuilt as ComparePatch(base, head); a
 		// payload missing either cannot name its input.
 		if payload.RoundBaseSHA == "" || payload.HeadSHA == "" {
-			return false, redispatchSlugUnknownRoundSource, nil
+			return redispatchSlugUnknownRoundSource, nil
 		}
 	default:
 		// Includes every implement round written before #4077 (no origin):
 		// inferring the source from audit context was rejected as fragile.
-		return false, redispatchSlugUnknownRoundSource, nil
+		return redispatchSlugUnknownRoundSource, nil
 	}
-	newer, err := s.stageEntryAfter(ctx, runID, CategoryStageFixupTriggered, stageID, latest.Sequence)
+	newer, err := s.stageEntryAfter(ctx, runID, CategoryStageFixupTriggered, stageID, roundSeq)
 	if err != nil {
-		return false, "", err
+		return "", err
 	}
 	if newer {
-		return false, redispatchSlugSupersededByFixup, nil
+		return redispatchSlugSupersededByFixup, nil
 	}
 	if slug, err := s.implementRoundStageSlug(ctx, runID, stageID); err != nil || slug != "" {
-		return false, slug, err
+		return slug, err
 	}
 	if payload.RoundOrigin == reviewRoundOriginTrace {
 		if s.cfg.TraceStore == nil {
-			return false, redispatchSlugTraceBundleUnavail, nil
+			return redispatchSlugTraceBundleUnavail, nil
 		}
-		return true, "", nil
+		return "", nil
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
-		return false, "", fmt.Errorf("get run %s: %w", runID, err)
+		return "", fmt.Errorf("get run %s: %w", runID, err)
 	}
 	if _, _, _, reason := s.forgeCompareFor(runRow); reason != "" {
-		return false, redispatchSlugForgeCompareUnavail, nil
+		return redispatchSlugForgeCompareUnavail, nil
 	}
-	return true, "", nil
+	return "", nil
 }
 
 // implementRoundStageSlug is redispatchEligibility's stage-state check for an
@@ -633,6 +650,12 @@ func (s *Server) auditEntryAt(ctx context.Context, runID uuid.UUID, category str
 // check are bypassed — both already ran for the orphaned round). The round
 // source is re-stamped so the new round records the same origin and base.
 // Returns "" when it dispatched, else the failure slug.
+//
+// Two callers: the boot re-dispatch goroutine (runOrphanedRoundRedispatch,
+// ctx carrying the ADR-091 D6 marker) and the operator re-run verb
+// (handleRerunReview, #4219, ctx carrying the reviewRerun marker instead —
+// which bypasses the dedup only after rerunBypassApplies re-verifies it).
+// orphanedSeq names the round being re-dispatched or re-run.
 func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, orphanedSeq int64, payload planreview.ReviewStartedPayload) string {
 	orphaned, err := s.auditEntryAt(ctx, runID, "implement_review_started", orphanedSeq)
 	if err != nil || orphaned == nil || orphaned.StageID == nil {

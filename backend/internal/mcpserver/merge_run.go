@@ -87,8 +87,15 @@ type MergeRunInput struct {
 //     acceptance_stale (fishhawk_dispatch_stage / fishhawk_await_stage /
 //     fishhawk_retry_stage with the stage_id), the approve_pr ritual for
 //     approval_dismissed.
+//   - "review_coverage_incomplete" — the #4219 decomposed-parent hold: a
+//     succeeded slice is covered by no SUCCESSFUL agent review (the parent's
+//     latest implement-review round and the slice's own latest round both
+//     recorded zero verdicts). IMMEDIATE, no verdict row; NextAction is
+//     details.next_step — fishhawk_rerun_review when the parent round settled
+//     with no verdict, fishhawk_await_review while it is in flight or not yet
+//     dispatched.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, acceptance_stale, approval_dismissed"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, acceptance_stale, approval_dismissed, review_coverage_incomplete"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -123,7 +130,7 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review"`
 	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness statuses"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
@@ -256,6 +263,15 @@ Statuses:
                      approve_pr ritual. Best-effort: when the forge cannot be
                      read the merge queues as before. A never-reviewed PR still
                      queues.
+  - "review_coverage_incomplete" — a decomposed parent has a succeeded slice
+                     no SUCCESSFUL agent review covers: neither the parent's
+                     latest implement-review round nor the slice's own latest
+                     round recorded a verdict (a round whose reviewers all
+                     failed or were skipped covers nothing). Immediate, no
+                     verdict row; the message names the uncovered slice(s).
+                     next_action names fishhawk_rerun_review (the parent round
+                     settled with no verdict) or fishhawk_await_review (a round
+                     is in flight or not yet dispatched).
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -299,8 +315,8 @@ merge_candidate_verify_failed (ADR-090) are likewise NOT tool errors: each is
 returned IMMEDIATELY as status=behind_base / merge_candidate_unverified /
 merge_candidate_verify_failed with next_action naming the clearing verb.
 
-The backend's 409 acceptance_stale / approval_dismissed (#4086) are likewise
-NOT tool errors: each is returned IMMEDIATELY under the same status name with
+The backend's 409 acceptance_stale / approval_dismissed (#4086) and
+review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
 next_action naming the clearing verb, instead of a timeout.
 `),
 	}, resolver.mergeRun)
@@ -428,11 +444,14 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 }
 
 // readinessStatuses maps the backend's merge-readiness 409 codes (#4086) to the
-// tool's IMMEDIATE statuses. Neither clears by waiting: a stale acceptance
-// verdict needs an acceptance re-run, a dismissed approval needs a re-approval.
+// tool's IMMEDIATE statuses. None clears by waiting out the merge budget: a
+// stale acceptance verdict needs an acceptance re-run, a dismissed approval
+// needs a re-approval, an uncovered slice (#4219) needs a review round that
+// records a verdict.
 var readinessStatuses = map[string]string{
-	"acceptance_stale":   "acceptance_stale",
-	"approval_dismissed": "approval_dismissed",
+	"acceptance_stale":           "acceptance_stale",
+	"approval_dismissed":         "approval_dismissed",
+	"review_coverage_incomplete": "review_coverage_incomplete",
 }
 
 // isMergeReadinessRefusal reports whether err is one of the backend's
@@ -454,12 +473,33 @@ func isMergeReadinessRefusal(err error) (*apiError, string, bool) {
 // so every flag is false, and the server's message is passed through verbatim.
 // approval_dismissed names the approve_pr ritual; acceptance_stale names
 // details.next_step (falling back to fishhawk_dispatch_stage) with the
-// re-opened acceptance stage's id.
+// re-opened acceptance stage's id; review_coverage_incomplete names
+// details.next_step (fishhawk_rerun_review or fishhawk_await_review, falling
+// back to the read-only fishhawk_await_review) with the run id.
 func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start time.Time) MergeRunOutput {
 	prURL, _ := ae.Details["pr_url"].(string)
 	params := map[string]string{"run_id": runID.String()}
 	var next *SuggestedAction
-	if status == "approval_dismissed" {
+	switch status {
+	case "review_coverage_incomplete":
+		verb, _ := ae.Details["next_step"].(string)
+		if verb != "fishhawk_rerun_review" {
+			verb = "fishhawk_await_review"
+		}
+		reason := "await the in-flight (or not yet dispatched) implement-review round on the parent, then re-invoke fishhawk_merge_run"
+		if verb == "fishhawk_rerun_review" {
+			reason = "re-run the parent's failed implement-review round so a successful agent review covers every slice, await its verdict, then re-invoke fishhawk_merge_run"
+		} else {
+			params["stage"] = "implement"
+		}
+		next = &SuggestedAction{
+			Action:       verb,
+			Params:       params,
+			Precondition: "a decomposed slice is not covered by a successful agent review (review_coverage_incomplete)",
+			Consumes:     consumesNone,
+			Reason:       reason,
+		}
+	case "approval_dismissed":
 		if prURL != "" {
 			params["pr_url"] = prURL
 		}
@@ -470,7 +510,7 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 			Consumes:     consumesNone,
 			Reason:       "re-approve the pull request under your own GitHub identity (gh pr review --approve), then re-invoke fishhawk_merge_run",
 		}
-	} else {
+	default:
 		verb, _ := ae.Details["next_step"].(string)
 		if verb == "" {
 			verb = "fishhawk_dispatch_stage"
