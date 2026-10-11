@@ -2657,6 +2657,8 @@ func TestStartCampaign_GroomingUnreadableUnparsableToken_NamesTokenAndExplanatio
 type unparsableE2EGHAPI struct {
 	issues   map[int]*githubclient.Issue
 	getCalls map[int]int
+	// blockedByCalls records IssueBlockedBy calls per number, guarded by mu.
+	blockedByCalls map[int]int
 
 	// mu guards getCalls, the fake's own bookkeeping state. ResolveDependencies
 	// fetches with bounded CONCURRENCY since #3113 (fetchIssuesBounded), so
@@ -2679,6 +2681,33 @@ func (f *unparsableE2EGHAPI) GetIssue(_ context.Context, _ forge.CredentialScope
 		return iss, nil
 	}
 	return nil, fmt.Errorf("githubclient: issue #%d not found", number)
+}
+
+// IssueBlockedBy implements the github provider's optional blockedByReader
+// extension (#4028). ResolveDependencies is a campaign path, so it reads every
+// named item's native "blocked by" relation and fails closed as unsupported on
+// an api without this method. The stub records NO native relation, so every
+// edge stays the marker line's legacy_text edge. It is mutex-guarded like
+// GetIssue because the bounded pool calls it concurrently (#3226).
+func (f *unparsableE2EGHAPI) IssueBlockedBy(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) ([]githubclient.BlockingIssueRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blockedByCalls == nil {
+		f.blockedByCalls = map[int]int{}
+	}
+	f.blockedByCalls[number]++
+	return nil, nil
+}
+
+// blockedBySnapshot returns a copy of blockedByCalls taken under mu.
+func (f *unparsableE2EGHAPI) blockedBySnapshot() map[int]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[int]int, len(f.blockedByCalls))
+	for k, v := range f.blockedByCalls {
+		out[k] = v
+	}
+	return out
 }
 
 // callSnapshot returns a copy of getCalls taken under mu, so callers never
@@ -2773,6 +2802,20 @@ func TestStartCampaign_UnparseableDependsOnToken_ReachesOperatorMessageEndToEnd(
 	}
 	if len(calls) != 3 { // 2032 (in-set), 1639, 42
 		t.Errorf("GetIssue call set = %v, want exactly {2032,1639,42}", calls)
+	}
+	// The native "blocked by" relation is read for the NAMED item only, never
+	// for an out-of-set target (#4028).
+	if native := stub.blockedBySnapshot(); len(native) != 1 || native[2032] != 1 {
+		t.Errorf("IssueBlockedBy calls = %v, want exactly one for the named item 2032", native)
+	}
+	// Every edge the marker line yields is tagged legacy_text (#4028).
+	for _, e := range res.DroppedEdges {
+		if e.Source != workmgmt.DependencySourceLegacyText {
+			t.Errorf("dropped edge %+v Source = %q, want legacy_text", e, e.Source)
+		}
+	}
+	if len(res.DroppedEdges) != 3 {
+		t.Errorf("dropped edges = %+v, want 3 (1639, 42, other/repo#12)", res.DroppedEdges)
 	}
 
 	// Carry the provider-produced result through Assemble (fails closed on the
