@@ -148,6 +148,70 @@ func TestFilterToSubset_IncludedDependsOnExcludedComplete_DroppedSilently(t *tes
 	}
 }
 
+// TestFilterToSubset_ExcludedCompleteSibling_SatisfiedEdgeKeepsSource pins that
+// the SatisfiedEdge FilterToSubset CREATES for an included item's dependency on
+// an excluded, completed sibling carries the source the provider read the edge
+// from (#4028), for BOTH sources — so a hard-coded source cannot pass. Without the
+// copy the field is "" and the operator could not tell a native dependency from a
+// legacy `Depends on:` line on the satisfied_dependencies wire.
+func TestFilterToSubset_ExcludedCompleteSibling_SatisfiedEdgeKeepsSource(t *testing.T) {
+	in := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "done native target", Complete: true},
+			{Number: 101, Title: "done legacy target", Complete: true},
+			{Number: 102, Title: "included"},
+		},
+		Edges: []workmgmt.DependsEdge{
+			{From: 102, To: 100, Source: workmgmt.DependencySourceNative},
+			{From: 102, To: 101, Source: workmgmt.DependencySourceLegacyText},
+		},
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:102"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	want := []workmgmt.SatisfiedEdge{
+		{From: 102, To: 100, State: "closed", StateReason: "completed", Source: workmgmt.DependencySourceNative},
+		{From: 102, To: 101, State: "closed", StateReason: "completed", Source: workmgmt.DependencySourceLegacyText},
+	}
+	if len(res.SatisfiedEdges) != len(want) {
+		t.Fatalf("SatisfiedEdges = %+v, want %+v", res.SatisfiedEdges, want)
+	}
+	for i := range want {
+		if res.SatisfiedEdges[i] != want[i] {
+			t.Errorf("SatisfiedEdges[%d] = %+v, want %+v (source carried)", i, res.SatisfiedEdges[i], want[i])
+		}
+	}
+}
+
+// TestFilterToSubset_PassThroughEdgesKeepSource: an in-set edge and an
+// excluded-incomplete dropped edge are the provider's edge passed through (the
+// latter only re-stamped with a Reason), so each keeps its source untouched
+// (#4028).
+func TestFilterToSubset_PassThroughEdgesKeepSource(t *testing.T) {
+	in := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "in set"},
+			{Number: 101, Title: "excluded, open"},
+			{Number: 102, Title: "included"},
+		},
+		Edges: []workmgmt.DependsEdge{
+			{From: 102, To: 100, Source: workmgmt.DependencySourceNative},
+			{From: 102, To: 101, Source: workmgmt.DependencySourceLegacyText},
+		},
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:100", "issue:102"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	if want := (workmgmt.DependsEdge{From: 102, To: 100, Source: workmgmt.DependencySourceNative}); len(res.Edges) != 1 || res.Edges[0] != want {
+		t.Fatalf("Edges = %+v, want [%+v]", res.Edges, want)
+	}
+	if want := (workmgmt.DependsEdge{From: 102, To: 101, Reason: workmgmt.DropExcludedIncomplete, Source: workmgmt.DependencySourceLegacyText}); len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
+	}
+}
+
 // TestFilterToSubset_CarriesInboundSatisfiedEdgesAtMostOnce pins #2953 condition
 // 3: an inbound SatisfiedEdge (an out-of-EPIC target the provider already elided)
 // is carried through untouched, and FilterToSubset does NOT re-add an edge already

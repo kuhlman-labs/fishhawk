@@ -4427,6 +4427,11 @@ func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
 	if !strings.Contains(gotHeader, CapabilityChildPushResume) {
 		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityChildPushResume)
 	}
+	// #4190: without this token the backend declines every reverify
+	// checkpoint to this runner (an agent re-run).
+	if !strings.Contains(gotHeader, CapabilityReverifyResume) {
+		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityReverifyResume)
+	}
 }
 
 // TestRunnerCapabilityWireValues is the upload-side half of the cross-module
@@ -4434,13 +4439,16 @@ func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
 // literal backend/internal/server's TestResumeKindWireValues pins, and the
 // FULL combined header value is pinned in list order (append-only — #3621's
 // push-resume, then #4183's merge-candidate-verify, then E55.16 / #3916's
-// child-push-resume), matching the capableRunnerCapabilities row of the
-// backend's TestResumeKindWireValues.
+// child-push-resume, then #4190's reverify-resume), matching the
+// capableRunnerCapabilities row of the backend's TestResumeKindWireValues.
 func TestRunnerCapabilityWireValues(t *testing.T) {
 	if CapabilityChildPushResume != "child-push-resume" {
 		t.Errorf("CapabilityChildPushResume = %q, want %q", CapabilityChildPushResume, "child-push-resume")
 	}
-	const want = "push-resume,merge-candidate-verify,child-push-resume"
+	if CapabilityReverifyResume != "reverify-resume" {
+		t.Errorf("CapabilityReverifyResume = %q, want %q", CapabilityReverifyResume, "reverify-resume")
+	}
+	const want = "push-resume,merge-candidate-verify,child-push-resume,reverify-resume"
 	if got := RunnerCapabilitiesValue(); got != want {
 		t.Errorf("RunnerCapabilitiesValue() = %q, want %q", got, want)
 	}
@@ -4499,6 +4507,67 @@ func TestShipPullRequest_FailureBodyOmitsResumeKindOnLegacyPaths(t *testing.T) {
 	}
 	if !strings.Contains(string(withKind), `"resume_kind":"push"`) {
 		t.Fatalf("a push-kind body must carry resume_kind: %s", withKind)
+	}
+}
+
+// TestShipPullRequest_ReverifyFailureBodyMatchesSharedFixture is the RUNNER half
+// of the #4190 reverify failure-report golden: the backend's
+// TestShipPullRequest_FailedReverifyRecordsVerifyResumeCheckpoint posts
+// testdata/wire/reverify_failure_report.json through the real handler, and this
+// test sends the SAME fields through the real ShipPullRequest and asserts the
+// bytes on the wire are JSON-equal to that file. A tag rename, a dropped
+// resume_kind, or a verified tree leaking onto a reverify report reddens it.
+func TestShipPullRequest_ReverifyFailureBodyMatchesSharedFixture(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "reverify_failure_report.json"))
+	if err != nil {
+		t.Fatalf("read shared reverify failure-report golden: %v", err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	field := func(k string) string {
+		v, _ := want[k].(string)
+		return v
+	}
+	if field("resume_kind") != "reverify" {
+		t.Fatalf("golden resume_kind = %q, want reverify (fixture drifted)", field("resume_kind"))
+	}
+
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"transitioned":true}`)
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client(), Backoff: time.Millisecond}
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome:    field("outcome"),
+		Category:   field("category"),
+		Reason:     field("reason"),
+		Branch:     field("branch"),
+		HeadSHA:    field("head_sha"),
+		BaseSHA:    field("base_sha"),
+		ResumeKind: field("resume_kind"),
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(gotBody, &got); err != nil {
+		t.Fatalf("decode sent body %q: %v", gotBody, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sent reverify failure body != shared golden\n got: %s\nwant: %s", gotBody, bytes.TrimSpace(golden))
+	}
+	if _, ok := got["verified_tree_sha"]; ok {
+		t.Fatalf("a reverify failure body must carry no verified_tree_sha: %s", gotBody)
 	}
 }
 

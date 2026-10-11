@@ -502,7 +502,7 @@ The two `501` capability refusals (`epic_children_unsupported`, `issue_set_resol
 
 ### `issue_set_resolution_timeout` and the issue-set client ([#3113](https://github.com/kuhlman-labs/fishhawk/issues/3113))
 
-A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path is unaffected — `EpicChildren` reads the sibling set in one `ListSubIssues` call.
+A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path stays outside this budget, but as of #4028 it is no longer a single `ListSubIssues` call for campaign assembly on GitHub: the campaign-only `CampaignEpicChildren` adds one native "blocked by" GraphQL read per child, bounded at 8 in flight.
 
 **What used to happen.** `CreateCampaign` ran on the shared 30s short `http.Client`, and the server had **no deadline on this path at all** (`server.go` sets `ReadHeaderTimeout` only — no `WriteTimeout`, no `TimeoutHandler`). So the **client** was what gave up, at 29999ms, with a bare transport error carrying no counts. #3113's original Summary diagnosed a *server-side* 30s deadline on issue-set resolution; **that diagnosis was wrong**.
 
@@ -2777,6 +2777,17 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_E2E_ThroughRealServer` drives the tool through the REAL `server.Handler()` over a
   write-refusing `campaign.BaseFake`, so the `CampaignPreview` wire struct is proven against the JSON the server
   EMITS rather than a hand-built approximation, and a handler that tried to persist would 500 rather than pass.
+- **Dependency sources and legacy warnings (#4028).** Both campaign tools surface where each `depends_on` edge came
+  from: `native` (the tracker's native "blocked by" relation, read on the campaign paths) or `legacy_text` (every
+  line-start `Depends on:` body line). `CampaignPreview` gains `edges[]` (`campaignPreviewEdge` `{from,to,source}`,
+  always present) and `warnings[]`; `CampaignPreviewDangling` and `campaignSatisfiedDependency` gain `source`; the
+  start tool's `Campaign` gains create-response-only `warnings[]` (`campaignDependencyWarning`
+  `{issue_ref, code: legacy_text_dependency, targets[], message}`), one per item relying on a legacy line, which
+  never refuses the start. The new types are UNEXPORTED with exported fields, so the export-surface baseline is
+  unchanged. A failed native read reaches both tools as `502 native_dependency_read_failed` with `issue_ref` and
+  `reason` in the details, rendered by the generic `apiError` path (no tool arm). Pinned by
+  `campaign_dependency_sources_test.go`, which reads the tools' structured output back as a JSON map so a dropped
+  json tag fails.
 - **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
   campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
   input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against

@@ -79,7 +79,16 @@ type NumberDiscoverer interface {
 // capability; a provider that does not implement it yields no children.
 //
 // EpicChildren returns the children and the depends_on edges restricted to
-// the sibling (children) set. A child body's reference to an issue that is
+// the sibling (children) set. Its depends_on edges are a provider's SHARED
+// membership read: the github provider derives them from the children's legacy
+// `Depends on:` body lines only (every line-start line, tagged
+// DependencySourceLegacyText) and makes NO native-relation read, because
+// EpicChildren also serves non-edge consumers (refinement filing resume,
+// rolling-walk adoption, idempotency adoption) that a native-read failure must
+// never reach; campaign assembly reads the native relation through the
+// separate CampaignEpicChildrenQuerier instead (#4028). A provider whose only
+// dependency relation IS native (gitlab's is_blocked_by links, #3658) tags its
+// edges DependencySourceNative here. A child body's reference to an issue that is
 // NOT a child of the queried epic is CLASSIFIED by reading its state (#2953):
 // a closed-and-completed cross-epic target is a satisfied dependency
 // (SatisfiedEdges, elided from the DAG), while an open/incomplete/unreadable
@@ -88,6 +97,26 @@ type NumberDiscoverer interface {
 // plan.Waves.
 type EpicChildrenQuerier interface {
 	EpicChildren(ctx context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error)
+}
+
+// CampaignEpicChildrenQuerier is the optional CAMPAIGN-ONLY epic-children
+// capability (#4028): the EpicChildren result PLUS the provider's native
+// dependency relation (GitHub's "blocked by"), merged with the legacy
+// `Depends on:` lines into one edge set in which every edge carries its
+// DependencySource. It is a SEPARATE, separately-named capability rather than a
+// change to EpicChildren because the native read can fail, and a native-read
+// failure must fail campaign assembly loudly (NativeDependencyReadError) while
+// NEVER reaching EpicChildren's non-edge consumers (refinement filing resume,
+// rolling-walk adoption, idempotency adoption). ONLY campaign assembly may call
+// it. The campaign epic branch prefers it over EpicChildren when a provider
+// implements both; a provider that does not implement it (gitlab, whose
+// EpicChildren already reads its native links) is served by EpicChildren.
+//
+// A native-read failure returns an error that errors.As reaches as
+// *NativeDependencyReadError; an edge present in BOTH sources is ONE edge
+// tagged DependencySourceNative.
+type CampaignEpicChildrenQuerier interface {
+	CampaignEpicChildren(ctx context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error)
 }
 
 // EpicChildrenRequest is the resolved input to EpicChildren: the filing
@@ -134,8 +163,13 @@ type EpicLinkRequest struct {
 // of issues that share no epic parent. It is the items-without-epic_ref
 // counterpart to EpicChildrenQuerier — where EpicChildren derives its sibling
 // set from an epic's sub-issue graph, ResolveDependencies is HANDED the exact
-// set of issues (req.Items) and resolves each one's `Depends on: #X` body marker
-// directly, because there is no epic sweep to derive the edge set from. Like
+// set of issues (req.Items) and resolves each one's dependencies directly,
+// because there is no epic sweep to derive the edge set from. Only campaign
+// assembly calls it, so its depends_on edges come from the provider's native
+// relation (GitHub's "blocked by", tagged DependencySourceNative) plus EVERY
+// line-start legacy `Depends on:` body line (tagged DependencySourceLegacyText);
+// an edge in both is one native edge, and a native-read failure fails the call
+// as *NativeDependencyReadError (#4028). Like
 // Transitioner / NumberDiscoverer / EpicChildrenQuerier it is a SEPARATE
 // capability interface rather than folded into Provider, because not every
 // provider can resolve an issue set (jira is interface-only in v0) and widening
@@ -256,6 +290,79 @@ func (e *IssueSetResolutionTimeout) Error() string {
 // Unwrap makes errors.Is(err, context.DeadlineExceeded) hold.
 func (*IssueSetResolutionTimeout) Unwrap() error { return context.DeadlineExceeded }
 
+// DependencySource names where a depends_on edge was read from (#4028), so an
+// operator can tell an edge the tracker records natively from one parsed out of
+// free text that the legacy parser will stop reading once a backfill retires it.
+type DependencySource string
+
+const (
+	// DependencySourceNative marks an edge read from the tracker's native
+	// dependency relation: GitHub's "blocked by" (campaign paths only) or
+	// GitLab's is_blocked_by issue links.
+	DependencySourceNative DependencySource = "native"
+	// DependencySourceLegacyText marks an edge parsed from a free-text
+	// line-start `Depends on:` body line. It is still honoured, and surfaced
+	// as a warning so the item can gain a native link before legacy parsing is
+	// retired.
+	DependencySourceLegacyText DependencySource = "legacy_text"
+)
+
+// NativeDependencyReadReason categorizes why a native dependency-relation read
+// failed (#4028), so the campaign refusal can name a per-reason remedy.
+type NativeDependencyReadReason string
+
+const (
+	// NativeReadTruncated marks a relation that reported more members than
+	// the read returned. A partial relation is never taken as complete.
+	NativeReadTruncated NativeDependencyReadReason = "truncated"
+	// NativeReadForbidden marks a read the forge refused (credential
+	// permissions).
+	NativeReadForbidden NativeDependencyReadReason = "forbidden"
+	// NativeReadNotFound marks an issue (or repository) that could not be
+	// found.
+	NativeReadNotFound NativeDependencyReadReason = "not_found"
+	// NativeReadUnsupported marks a provider whose forge client cannot read
+	// the native relation at all, so the read was never attempted.
+	NativeReadUnsupported NativeDependencyReadReason = "unsupported"
+	// NativeReadFailed marks any other failure (transport, GraphQL
+	// application error, context expiry).
+	NativeReadFailed NativeDependencyReadReason = "read_failed"
+)
+
+// NativeDependencyReadError is the typed fail-closed outcome of a campaign
+// path whose native dependency-relation read failed (#4028). Campaign assembly
+// never degrades to a partial edge set: it refuses, naming the issue whose
+// relation could not be read and why. Issue is the issue number whose read
+// failed, or 0 when the read could not be attempted at all (Reason
+// NativeReadUnsupported). Cause is the underlying error, reachable through
+// Unwrap so errors.Is still matches the forge sentinel it wraps.
+type NativeDependencyReadError struct {
+	Issue  int
+	Reason NativeDependencyReadReason
+	Cause  error
+}
+
+// Error renders the issue (when known), the reason and the cause.
+func (e *NativeDependencyReadError) Error() string {
+	var b strings.Builder
+	b.WriteString(`workmgmt: could not read the native "blocked by" dependencies`)
+	if e.Issue != 0 {
+		b.WriteString(" of issue #")
+		b.WriteString(strconv.Itoa(e.Issue))
+	}
+	b.WriteString(" (")
+	b.WriteString(string(e.Reason))
+	b.WriteString(")")
+	if e.Cause != nil {
+		b.WriteString(": ")
+		b.WriteString(e.Cause.Error())
+	}
+	return b.String()
+}
+
+// Unwrap returns Cause so errors.Is reaches the wrapped forge sentinel.
+func (e *NativeDependencyReadError) Unwrap() error { return e.Cause }
+
 // EpicChildrenResult is the epic-children query output: the epic's child
 // issues and the depends_on edges among them. Children are ordered
 // ascending by number; Edges are deterministically sorted. It is the input
@@ -347,11 +454,15 @@ type ExcludedCandidate struct {
 // numbers; State/StateReason carry the target's OBSERVED issue state
 // ("closed"/"completed") so the elision is auditable — an operator can tell
 // "this dependency is done" from "this dependency was ignored".
+//
+// Source is where the elided edge was read from (#4028); "" only for an edge
+// built by a constructor that predates source tagging.
 type SatisfiedEdge struct {
 	From        int
 	To          int
 	State       string
 	StateReason string
+	Source      DependencySource
 }
 
 // EpicChild is one child issue of an epic: its number, title, autonomy tier,
@@ -461,9 +572,16 @@ const (
 // The one rendering authority for a depends_on target is TargetRef — an
 // unresolvable edge must never render `issue:0`.
 //
+// Source is where the edge was read from (#4028): DependencySourceNative for
+// the tracker's native relation, DependencySourceLegacyText for a line-start
+// `Depends on:` body line. An edge present in both is ONE edge tagged native.
+// It is "" only for an edge built by a constructor that predates source
+// tagging.
+//
 // This type is an in-memory query result only: it carries NO json struct tags
-// and is marshaled into no REST or MCP payload (an edge always reaches the wire
-// as a string rendered through TargetRef). Adding these two fields therefore
+// and is marshaled into no REST or MCP payload (an edge reaches the wire as a
+// string rendered through TargetRef, and any Source a payload carries is mapped
+// onto that payload's own field explicitly). Adding these fields therefore
 // changes no public payload shape (#2956, operator condition 2, verified at
 // implement time).
 type DependsEdge struct {
@@ -472,6 +590,7 @@ type DependsEdge struct {
 	Reason      DropReason
 	ToRef       string
 	ToRefDigest string
+	Source      DependencySource
 }
 
 // targetRefDisplayMaxRunes bounds the rendered display of an unresolvable

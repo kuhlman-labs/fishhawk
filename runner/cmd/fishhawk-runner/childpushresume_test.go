@@ -514,11 +514,13 @@ func TestChildPushResume_ReportFailureRearmsAsPush(t *testing.T) {
 }
 
 // TestPushResume_StandaloneSuccessReleasesCheckpointRefs: the standalone push
-// resume releases the refs once its artifact lands.
+// resume releases the refs once its artifact lands — including the #4190
+// verify-head pin, which every held-commit success path must drop.
 func TestPushResume_StandaloneSuccessReleasesCheckpointRefs(t *testing.T) {
 	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
 	cfg := checkpointResumeCfg(repo)
 	pinBothCheckpointRefs(t, repo, cfg, headSHA)
+	cprGit(t, repo, "update-ref", checkpointVerifyRef(cfg.runID, cfg.stageID), headSHA)
 	withFakePusher(t)
 	withFakePROpenerOnly(t)
 	fu := newFakeUploader(t)
@@ -530,7 +532,7 @@ func TestPushResume_StandaloneSuccessReleasesCheckpointRefs(t *testing.T) {
 	if code := openHeldCommitPR(context.Background(), cfg, headSHA, branch, "base-sha-4079", resumeKindPush, treeSHA, "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("exit = %d\n%s", code, logSink.String())
 	}
-	for _, ref := range []string{checkpointRef(cfg.runID, cfg.stageID), checkpointStashRef(cfg.runID, cfg.stageID)} {
+	for _, ref := range []string{checkpointRef(cfg.runID, cfg.stageID), checkpointStashRef(cfg.runID, cfg.stageID), checkpointVerifyRef(cfg.runID, cfg.stageID)} {
 		if _, ok := refTarget(repo, ref); ok {
 			t.Errorf("checkpoint ref %s survived a successful resume", ref)
 		}

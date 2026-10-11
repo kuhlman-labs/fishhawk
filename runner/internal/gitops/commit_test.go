@@ -7235,3 +7235,65 @@ func TestCommitAndPush_PinnedBase_RevParseFailure_FailsClosed(t *testing.T) {
 		t.Errorf("branch %s pushed despite the failed pinned-base read: %q", branch, out)
 	}
 }
+
+// TestOutOfScopePaths pins the exported read of the #980 post-commit scope
+// assertion (#4190): the reverify resume's precheck and the push path share
+// outOfScopePaths, so they cannot disagree on what "in scope" means. Every row
+// commits a real change set and asserts the returned path LIST, so a body that
+// returned nil would redden the out-of-scope row.
+func TestOutOfScopePaths(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	commit := func(t *testing.T, repo string, files map[string]string) string {
+		t.Helper()
+		for p, body := range files {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(repo, p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, p), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mustGit(t, repo, "add", "-A")
+		mustGit(t, repo, "commit", "-m", "change")
+		return mustGitOut(t, repo, "rev-parse", "HEAD")
+	}
+	ctx := context.Background()
+
+	t.Run("exact in-scope commit -> nil", func(t *testing.T) {
+		repo := initRepo(t)
+		head := commit(t, repo, map[string]string{"README.md": "# changed\n", "pkg/a.go": "package pkg\n"})
+		got, err := OutOfScopePaths(ctx, repo, head, []string{"README.md", "pkg/a.go"})
+		if err != nil || got != nil {
+			t.Errorf("OutOfScopePaths = %v, %v; want nil, nil", got, err)
+		}
+	})
+	t.Run("file under a trailing-slash dir entry is in scope", func(t *testing.T) {
+		repo := initRepo(t)
+		head := commit(t, repo, map[string]string{"corpus/case1/x.json": "{}\n"})
+		got, err := OutOfScopePaths(ctx, repo, head, []string{"corpus/"})
+		if err != nil || got != nil {
+			t.Errorf("OutOfScopePaths = %v, %v; want nil, nil (folded directory)", got, err)
+		}
+	})
+	t.Run("out-of-scope path is listed", func(t *testing.T) {
+		repo := initRepo(t)
+		head := commit(t, repo, map[string]string{"README.md": "# changed\n", "stray.go": "package x\n", "pkg/a.go.bak": "x\n"})
+		got, err := OutOfScopePaths(ctx, repo, head, []string{"README.md", "pkg/a.go"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// pkg/a.go.bak pins the exact-match semantics: a declared regular file
+		// never prefix-matches a sibling.
+		if strings.Join(got, ",") != "pkg/a.go.bak,stray.go" {
+			t.Errorf("OutOfScopePaths = %v, want [pkg/a.go.bak stray.go]", got)
+		}
+	})
+	t.Run("unknown sha errors", func(t *testing.T) {
+		repo := initRepo(t)
+		if got, err := OutOfScopePaths(ctx, repo, strings.Repeat("ab", 20), []string{"README.md"}); err == nil {
+			t.Errorf("OutOfScopePaths on an unknown sha = %v, nil; want an error", got)
+		}
+	})
+}
