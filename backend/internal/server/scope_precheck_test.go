@@ -503,3 +503,60 @@ func hasViolation(p ScopePrecheckPayload, constraint string) bool {
 	}
 	return false
 }
+
+// v2PrecheckAgentPathsSpec is a workflow-v2 feature_change whose implement
+// stage declares ONLY max_files_changed: 45 plus the given extra constraint
+// lines, so with a 3-file scope nothing but the built-in agent_instruction_paths
+// constraint (E80.12 / #3942) can record a violation.
+func v2PrecheckAgentPathsSpec(extra string) []byte {
+	return []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          max_files_changed: 45
+` + extra + `        produces:
+          - artifact: pull_request
+`)
+}
+
+// TestScopePrecheck_AgentInstructionPathsBuiltIn is the plan-gate half of the
+// built-in (E80.12 / #3942): resolveImplementConstraints applies the stage's
+// AgentInstructionPathsRule, so a plan scoping a nested config-dir file is
+// flagged at plan time exactly as the post-implement gate would flag it, and
+// an opted-out stage records nothing.
+func TestScopePrecheck_AgentInstructionPathsBuiltIn(t *testing.T) {
+	scope := []plan.ScopeFile{
+		{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+		{Path: "backend/.claude/skills/x/SKILL.md", Operation: plan.FileOpCreate},
+		{Path: "docs/notes.md", Operation: plan.FileOpModify},
+	}
+
+	t.Run("default-on flags the config-dir file", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, v2PrecheckAgentPathsSpec(""))
+		s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, scopePlanBody(t, scope))
+
+		got := lastScopePrecheckEntry(t, au)
+		if len(got.Violations) != 1 || got.Violations[0].Constraint != "agent_instruction_paths" ||
+			len(got.Violations[0].Files) != 1 || got.Violations[0].Files[0] != "backend/.claude/skills/x/SKILL.md" {
+			t.Fatalf("violations = %+v, want one agent_instruction_paths violation naming the .claude file", got.Violations)
+		}
+		if got.MaxFilesChanged != 45 {
+			t.Errorf("MaxFilesChanged = %d, want 45", got.MaxFilesChanged)
+		}
+	})
+
+	t.Run("enforce false records none", func(t *testing.T) {
+		spec := v2PrecheckAgentPathsSpec("          agent_instruction_paths:\n            enforce: false\n")
+		s, au, runRow := newScopePrecheckServer(t, spec)
+		s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, scopePlanBody(t, scope))
+
+		if got := lastScopePrecheckEntry(t, au); len(got.Violations) != 0 {
+			t.Fatalf("violations = %+v, want none for an opted-out stage", got.Violations)
+		}
+	})
+}

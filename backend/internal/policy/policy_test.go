@@ -1,7 +1,10 @@
 package policy
 
 import (
+	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -171,8 +174,10 @@ func TestMaxFilesChanged_Over(t *testing.T) {
 }
 
 // TestCountedFileCount_OldPathIsInformational mirrors the runner's
-// constraint test: the #2398 OldPath field is INFORMATIONAL to the policy
-// engine. The same diff with and without OldPath populated yields the
+// constraint test: the #2398 OldPath field is INFORMATIONAL to the file
+// count and the path globs (only the built-in agent_instruction_paths check
+// reads it, pinned by TestAgentInstructionPaths_RenameSourceCountsCopySourceDoesNot).
+// The same diff with and without OldPath populated yields the
 // identical CountedFileCount AND the identical Evaluate verdict under a
 // max_files_changed limit set exactly at the row count — a rename stays ONE
 // counted row on its destination Path.
@@ -1101,5 +1106,196 @@ func TestCommentOnly_DoesNotAffectVerificationOrDeferrals(t *testing.T) {
 	}
 	if got := DeferredRequiredOutcomes(c); len(got) != 0 {
 		t.Fatalf("comment-only must defer nothing, got %v", got)
+	}
+}
+
+// agentClassesFixture is the shared agent-instruction-path fixture
+// (testdata/policy/agent-instruction-classes.json, E80.12 / #3942). Its
+// match/no_match probes are driven through Evaluate here, through the review
+// sandbox extractor, and through the runner's evaluator, so a divergence
+// between any of them fails a test.
+type agentClassesFixture struct {
+	// Comment is never read: it exists so DisallowUnknownFields accepts the
+	// fixture's documentary `_comment` key.
+	Comment          string   `json:"_comment"`
+	ConfigDirs       []string `json:"config_dirs"`
+	InstructionFiles []string `json:"instruction_files"`
+	Match            []string `json:"match"`
+	NoMatch          []string `json:"no_match"`
+}
+
+// loadAgentClassesFixture strictly decodes the shared fixture and fails
+// closed on a duplicate key, trailing content, an unknown key, or an empty
+// probe list (which would make the probe test vacuous).
+func loadAgentClassesFixture(t *testing.T) agentClassesFixture {
+	t.Helper()
+	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-classes.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	if err := checkStrictJSON(raw); err != nil {
+		t.Fatalf("%s: %v", p, err)
+	}
+	var f agentClassesFixture
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		t.Fatalf("parse %s: %v", p, err)
+	}
+	if len(f.Match) == 0 || len(f.NoMatch) == 0 {
+		t.Fatalf("%s: match (%d) and no_match (%d) must both be non-empty", p, len(f.Match), len(f.NoMatch))
+	}
+	return f
+}
+
+// enforcedAgentPaths is the resolved default: the built-in enforced with
+// nothing exempt, and NO other constraint configured, so only the
+// agent_instruction_paths check can produce a violation.
+func enforcedAgentPaths(writable ...string) Constraints {
+	return Constraints{AgentInstructionPaths: &AgentInstructionPathsConfig{Writable: writable}}
+}
+
+// TestAgentInstructionPaths_FixtureProbes drives every shared-fixture probe
+// through Evaluate under the enforced default: each match probe is exactly one
+// agent_instruction_paths violation naming that path, each no_match probe is
+// none.
+func TestAgentInstructionPaths_FixtureProbes(t *testing.T) {
+	f := loadAgentClassesFixture(t)
+	for _, p := range f.Match {
+		v := Evaluate(diff(p), enforcedAgentPaths())
+		if len(v) != 1 || v[0].Constraint != "agent_instruction_paths" || !reflect.DeepEqual(v[0].Files, []string{p}) {
+			t.Errorf("match probe %q: got %+v, want one agent_instruction_paths violation naming it", p, v)
+		}
+	}
+	for _, p := range f.NoMatch {
+		if v := Evaluate(diff(p), enforcedAgentPaths()); len(v) != 0 {
+			t.Errorf("no_match probe %q: got %+v, want no violation", p, v)
+		}
+	}
+}
+
+// TestAgentInstructionPaths_DefaultConfigNestedRecasedDir pins the built-in
+// on its own: the Constraints carry ONLY an empty (enforced) config and NO
+// forbidden_paths, so nothing else can flag the nested, re-cased config-dir
+// file. The ordinary file in the same diff is not listed.
+func TestAgentInstructionPaths_DefaultConfigNestedRecasedDir(t *testing.T) {
+	v := Evaluate(diff("backend/a.go", "web/.Claude/commands/x.md"), enforcedAgentPaths())
+	want := []Violation{{
+		Constraint: "agent_instruction_paths",
+		Detail:     "1 agent-instruction path(s) changed; the built-in constraint forbids them unless the stage lists the exact path in agent_instruction_paths.writable",
+		Files:      []string{"web/.Claude/commands/x.md"},
+	}}
+	if !reflect.DeepEqual(v, want) {
+		t.Fatalf("got %+v, want %+v", v, want)
+	}
+}
+
+// TestAgentInstructionPaths_WritableIsExactAndCaseSensitive pins the
+// exemption semantics: an entry exempts only the identical path, never a
+// re-cased spelling or the same basename at another depth.
+func TestAgentInstructionPaths_WritableIsExactAndCaseSensitive(t *testing.T) {
+	c := enforcedAgentPaths("AGENTS.md")
+	if v := Evaluate(diff("AGENTS.md"), c); len(v) != 0 {
+		t.Errorf("writable [AGENTS.md], diff AGENTS.md: got %+v, want no violation", v)
+	}
+	for _, p := range []string{"agents.md", "docs/AGENTS.md", "AGENTS.override.md"} {
+		v := Evaluate(diff(p), c)
+		if len(v) != 1 || !reflect.DeepEqual(v[0].Files, []string{p}) {
+			t.Errorf("writable [AGENTS.md], diff %q: got %+v, want one violation naming it", p, v)
+		}
+	}
+}
+
+// TestAgentInstructionPaths_RenameSourceCountsCopySourceDoesNot pins the
+// OldPath rule: a rename (R) away from an instruction path is a write to it,
+// a copy (C) from one is not. Path is an ordinary file in both rows, so only
+// the OldPath candidate can produce the R-row violation.
+func TestAgentInstructionPaths_RenameSourceCountsCopySourceDoesNot(t *testing.T) {
+	renamed := Diff{ChangedFiles: []ChangedFile{
+		{Path: "docs/notes.md", OldPath: ".claude/settings.json", Status: StatusRenamed},
+	}}
+	v := Evaluate(renamed, enforcedAgentPaths())
+	if len(v) != 1 || !reflect.DeepEqual(v[0].Files, []string{".claude/settings.json"}) {
+		t.Errorf("R row from .claude/settings.json: got %+v, want one violation naming the source", v)
+	}
+	copied := Diff{ChangedFiles: []ChangedFile{
+		{Path: "docs/notes.md", OldPath: ".claude/settings.json", Status: StatusCopied},
+	}}
+	if v := Evaluate(copied, enforcedAgentPaths()); len(v) != 0 {
+		t.Errorf("C row from .claude/settings.json: got %+v, want no violation", v)
+	}
+	// A writable entry exempts a rename source exactly as it does a Path.
+	if v := Evaluate(renamed, enforcedAgentPaths(".claude/settings.json")); len(v) != 0 {
+		t.Errorf("R row with its source writable: got %+v, want no violation", v)
+	}
+}
+
+// TestAgentInstructionPaths_ListsEachPathOnce pins the de-duplication: a path
+// that is both one row's rename source and another row's Path is listed once,
+// in diff order.
+func TestAgentInstructionPaths_ListsEachPathOnce(t *testing.T) {
+	d := Diff{ChangedFiles: []ChangedFile{
+		{Path: "AGENTS.md", Status: StatusAdded},
+		{Path: "docs/AGENTS.md", OldPath: "AGENTS.md", Status: StatusRenamed},
+	}}
+	v := Evaluate(d, enforcedAgentPaths())
+	if len(v) != 1 || !reflect.DeepEqual(v[0].Files, []string{"AGENTS.md", "docs/AGENTS.md"}) {
+		t.Fatalf("got %+v, want one violation naming [AGENTS.md docs/AGENTS.md]", v)
+	}
+}
+
+// TestAgentInstructionPaths_NilConfigIsNoOp pins "nil means not applied": a
+// non-implement stage or an opted-out implement stage resolves to a nil
+// config, and an instruction-path diff then passes.
+func TestAgentInstructionPaths_NilConfigIsNoOp(t *testing.T) {
+	if v := Evaluate(diff("CLAUDE.md", ".agents/skills/x/SKILL.md"), Constraints{}); len(v) != 0 {
+		t.Fatalf("nil config: got %+v, want no violation", v)
+	}
+}
+
+// TestAgentInstructionPaths_EvaluatedLast pins the check's position: it runs
+// after every declared constraint, so a diff violating both forbidden_paths
+// and the built-in lists them in that order.
+func TestAgentInstructionPaths_EvaluatedLast(t *testing.T) {
+	c := enforcedAgentPaths()
+	c.ForbiddenPaths = []string{"secrets/**"}
+	v := Evaluate(diff("secrets/k.pem", "CLAUDE.md"), c)
+	if len(v) != 2 || v[0].Constraint != "forbidden_paths" || v[1].Constraint != "agent_instruction_paths" {
+		t.Fatalf("got %+v, want [forbidden_paths agent_instruction_paths]", v)
+	}
+}
+
+// TestConstraints_AgentInstructionPathsRoundTrip pins the audit wire shape the
+// post-CI re-evaluation decodes: an enforced config with nothing exempt is
+// `{}` (present, so still applied), a writable list round-trips, and nil is
+// omitted so payloads written before the constraint existed decode to nil.
+func TestConstraints_AgentInstructionPathsRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Constraints
+		want string
+	}{
+		{"enforced default", enforcedAgentPaths(), `{"agent_instruction_paths":{}}`},
+		{"writable", enforcedAgentPaths("AGENTS.md"), `{"agent_instruction_paths":{"writable":["AGENTS.md"]}}`},
+		{"not applied", Constraints{}, `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != tc.want {
+				t.Fatalf("marshal = %s, want %s", raw, tc.want)
+			}
+			var back Constraints
+			if err := json.Unmarshal(raw, &back); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(back, tc.in) {
+				t.Fatalf("round trip = %+v, want %+v", back, tc.in)
+			}
+		})
 	}
 }

@@ -726,6 +726,9 @@ func TestIsEmptyConstraints(t *testing.T) {
 	if isEmptyConstraints(policy.Constraints{MaxFilesChanged: 1}) {
 		t.Error("non-empty Constraints flagged as empty")
 	}
+	if isEmptyConstraints(policy.Constraints{AgentInstructionPaths: &policy.AgentInstructionPathsConfig{}}) {
+		t.Error("a Constraints carrying only the enforced agent_instruction_paths built-in flagged as empty")
+	}
 }
 
 // categoryNames is a tiny helper for error messages: list the
@@ -1547,5 +1550,171 @@ func assertNoTestFilesViolation(t *testing.T, payload map[string]any) {
 	}
 	if reason, _ := co["reason"].(string); reason == "" {
 		t.Fatalf("a refusal must carry a closed-set reason code: %v", co)
+	}
+}
+
+// v2AgentPathsSpec renders a workflow-v2 feature_change whose implement stage
+// declares ONLY the given constraints block ("" for no constraints at all), so
+// the built-in agent_instruction_paths constraint (E80.12 / #3942) is the only
+// thing that can fail the stage.
+func v2AgentPathsSpec(constraints string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+` + constraints + `        produces:
+          - artifact: pull_request
+`
+}
+
+// TestShipTrace_PolicyReEval_AgentInstructionPaths is the CROSS-LAYER
+// assertion for the built-in agent-instruction-path constraint (E80.12 /
+// #3942): a cached v2 spec parsed by spec.ParseBytes, resolved through
+// loadStageConstraintsFromCache (Stage.AgentInstructionPathsRule mapped by
+// applyAgentInstructionPolicy), evaluated by policy.Evaluate, persisted as
+// the policy_evaluated audit row, and reflected in the stage state. The
+// default-on arm's spec declares NO constraints, so only the built-in can
+// fail the stage.
+func TestShipTrace_PolicyReEval_AgentInstructionPaths(t *testing.T) {
+	cases := []struct {
+		name         string
+		constraints  string
+		path         string
+		wantPassed   bool
+		wantApplied  *policy.AgentInstructionPathsConfig
+		wantViolFile string
+	}{
+		{
+			name:         "default-on: no constraints declared, nested instruction file fails category B",
+			path:         "backend/internal/AGENTS.md",
+			wantPassed:   false,
+			wantApplied:  &policy.AgentInstructionPathsConfig{},
+			wantViolFile: "backend/internal/AGENTS.md",
+		},
+		{
+			name:        "enforce false opts the stage out",
+			constraints: "        constraints:\n          agent_instruction_paths:\n            enforce: false\n",
+			path:        "backend/internal/AGENTS.md",
+			wantPassed:  true,
+		},
+		{
+			name:        "writable exempts the exact root AGENTS.md",
+			constraints: "        constraints:\n          agent_instruction_paths:\n            writable: [AGENTS.md]\n",
+			path:        "AGENTS.md",
+			wantPassed:  true,
+			wantApplied: &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}},
+		},
+		{
+			name:         "writable is case-sensitive: root agents.md still fails",
+			constraints:  "        constraints:\n          agent_instruction_paths:\n            writable: [AGENTS.md]\n",
+			path:         "agents.md",
+			wantPassed:   false,
+			wantApplied:  &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}},
+			wantViolFile: "agents.md",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []map[string]string{{"path": tc.path, "status": "M"}}
+			s, sf, repo, au := newPolicyTraceServer(t, files)
+			repo.runRow.WorkflowSpec = []byte(v2AgentPathsSpec(tc.constraints))
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, files), "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+
+			pl := decodePolicyPayload(t, au)
+			if pl.SkipReason != "" {
+				t.Fatalf("policy evaluation skipped (%s: %s); the cached v2 spec must resolve", pl.SkipReason, pl.SkipDetail)
+			}
+			if !reflect.DeepEqual(pl.Applied.AgentInstructionPaths, tc.wantApplied) {
+				t.Errorf("applied agent_instruction_paths = %+v, want %+v", pl.Applied.AgentInstructionPaths, tc.wantApplied)
+			}
+			if pl.Passed != tc.wantPassed {
+				t.Errorf("passed = %v, want %v (violations %+v)", pl.Passed, tc.wantPassed, pl.Violations)
+			}
+			if tc.wantPassed {
+				if len(pl.Violations) != 0 {
+					t.Errorf("violations = %+v, want none", pl.Violations)
+				}
+				if repo.stage.State != run.StageStateAwaitingApproval {
+					t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+				}
+				return
+			}
+			if len(pl.Violations) != 1 || pl.Violations[0].Constraint != "agent_instruction_paths" ||
+				!reflect.DeepEqual(pl.Violations[0].Files, []string{tc.wantViolFile}) {
+				t.Errorf("violations = %+v, want one agent_instruction_paths violation naming %q", pl.Violations, tc.wantViolFile)
+			}
+			if repo.stage.State != run.StageStateFailed {
+				t.Errorf("stage state = %q, want failed", repo.stage.State)
+			}
+			if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
+				t.Errorf("FailureCategory = %v, want B", repo.stage.FailureCategory)
+			}
+		})
+	}
+}
+
+// TestShipTrace_PolicyReEval_AgentInstructionPaths_SkipGetsNoBuiltIn pins the
+// narrowed claim (E80.12 / #3942): the built-in is resolved from the cached
+// spec, so a stage whose spec does not resolve is skipped and evaluates
+// nothing, an instruction-path diff included.
+func TestShipTrace_PolicyReEval_AgentInstructionPaths_SkipGetsNoBuiltIn(t *testing.T) {
+	files := []map[string]string{{"path": "AGENTS.md", "status": "M"}}
+	s, sf, repo, au := newPolicyTraceServer(t, files)
+	repo.runRow.WorkflowSpec = nil
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, files), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	pl := decodePolicyPayload(t, au)
+	if pl.SkipReason != policy.SkipSpecUnavailable || pl.Applied.AgentInstructionPaths != nil || !pl.Passed {
+		t.Fatalf("payload = %+v, want a spec_unavailable skip with nothing applied", pl)
+	}
+}
+
+// TestApplyAgentInstructionPolicy pins the ONE spec→policy mapping both the
+// post-implement gate and the plan-gate precheck call: an enforced stage gets
+// a non-nil config with its writable exemptions, an unenforced one (opt-out or
+// non-implement) is left nil — including when c arrived non-nil.
+func TestApplyAgentInstructionPolicy(t *testing.T) {
+	off := false
+	cases := []struct {
+		name  string
+		stage spec.Stage
+		want  *policy.AgentInstructionPathsConfig
+	}{
+		{"implement default", spec.Stage{Type: spec.StageTypeImplement}, &policy.AgentInstructionPathsConfig{}},
+		{"implement writable", spec.Stage{Type: spec.StageTypeImplement, Constraints: []spec.Constraint{
+			{AgentInstructionPaths: &spec.AgentInstructionPathsConstraint{Writable: []string{"AGENTS.md"}}},
+		}}, &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}}},
+		{"implement opt-out", spec.Stage{Type: spec.StageTypeImplement, Constraints: []spec.Constraint{
+			{AgentInstructionPaths: &spec.AgentInstructionPathsConstraint{Enforce: &off}},
+		}}, nil},
+		{"non-implement", spec.Stage{Type: spec.StageTypePlan}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := policy.Constraints{
+				MaxFilesChanged:       7,
+				AgentInstructionPaths: &policy.AgentInstructionPathsConfig{Writable: []string{"stale"}},
+			}
+			applyAgentInstructionPolicy(tc.stage, &c)
+			if !reflect.DeepEqual(c.AgentInstructionPaths, tc.want) {
+				t.Errorf("AgentInstructionPaths = %+v, want %+v", c.AgentInstructionPaths, tc.want)
+			}
+			if c.MaxFilesChanged != 7 {
+				t.Errorf("MaxFilesChanged = %d, want 7 (other constraints untouched)", c.MaxFilesChanged)
+			}
+		})
 	}
 }
