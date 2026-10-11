@@ -24,8 +24,10 @@ import (
 // slot before it moves a GROUPED host-dispatched stage to dispatched; a stage
 // that cannot get one is QUEUED (409 concurrency_slot_queued, stage untouched
 // at awaiting_host_dispatch). The stage reads project the slot state as the
-// `concurrency` block. The slot store's contract (atomicity, FIFO, derived
-// holders, tenancy) is backend/internal/concurrency/README.md.
+// `concurrency` block. An operator can promote a queued waiter to the front
+// of its group (stage_concurrency_promote.go, #4191). The slot store's
+// contract (atomicity, FIFO except a promoted waiter, derived holders,
+// tenancy) is backend/internal/concurrency/README.md.
 
 // Audit categories (registered in audit/categories.go). INTERNAL and
 // best-effort; deliberately NOT issue-thread activity categories.
@@ -35,6 +37,11 @@ const (
 	CategoryStageConcurrencyQueued = "stage_concurrency_queued"
 	// CategoryStageConcurrencyAdmitted is written on every grouped admission.
 	CategoryStageConcurrencyAdmitted = "stage_concurrency_admitted"
+	// CategoryStageConcurrencyPromoted is written when an operator promotes a
+	// queued waiter (#4191, stage_concurrency_promote.go). Unlike the two
+	// above it is NOT best-effort: it is appended inside the promotion
+	// transaction, so a failed append rolls the promotion back.
+	CategoryStageConcurrencyPromoted = "stage_concurrency_promoted"
 )
 
 // Stage-block status values.
@@ -269,6 +276,9 @@ type stageConcurrency struct {
 	// WaiterLive reports a queued row was refreshed within the queue TTL
 	// (false while holding).
 	WaiterLive bool `json:"waiter_live"`
+	// Promoted reports an operator promoted this queued waiter in its current
+	// queue episode (#4191); omitted when false and always while holding.
+	Promoted bool `json:"promoted,omitempty"`
 	// Host and HeldDispatchedAt describe the admission a holding row records
 	// (the host label it was admitted for, and the dispatched_at of the
 	// attempt it admitted). Informational: two sessions on one host share a
@@ -299,6 +309,7 @@ func toStageConcurrency(st concurrency.Status) *stageConcurrency {
 	out.Status = stageConcurrencyStatusQueued
 	out.Position = st.Position
 	out.WaiterLive = st.WaiterLive
+	out.Promoted = st.Promoted
 	return out
 }
 
