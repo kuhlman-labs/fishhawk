@@ -2193,15 +2193,20 @@ Notes:
 - The run-branch base-advance kind — `branch_rebased` (E64.23, #3125) — is an
   **internal, audit-only kind, not its own issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its
-  own category `branch_rebased` by an **operator** actor:
-  `server/rebase_branch.go::handleRebaseRunBranch` calls `AuditRepo.AppendChained`
-  after it advances a run/PR branch onto its declared base — a forge-side MERGE
-  of the base INTO the run branch (REST exposes no rebase primitive), leaving a
-  merge commit. The payload is `{run_id, pr_number, branch, base_ref,
-  prior_head_sha, new_head_sha, merge_commit_sha, already_up_to_date, reason,
-  mechanism_note}` (plus `reparked_review_stage_id` when a review stage was
-  re-parked). Sibling of `branch_reset` above, and like it the handler DOES
-  refresh the sticky status comment afterward
+  own category `branch_rebased` by `server/rebase_branch.go::advanceRunBranch`
+  (via `writeBranchRebasedAudit` → `AuditRepo.AppendChained`) after it advances
+  a run/PR branch onto its declared base — a forge-side MERGE of the base INTO
+  the run branch (REST exposes no rebase primitive), leaving a merge commit. The
+  actor is a parameter: the invoking **operator** when `handleRebaseRunBranch`
+  (`fishhawk_rebase_run_branch`) calls it, and the **system** actor
+  `system:merge-candidate-verify` when the ADR-092 merge-candidate queue
+  auto-advances an admitted PR. The payload is `{run_id, pr_number, branch,
+  base_ref, prior_head_sha, new_head_sha, merge_commit_sha, already_up_to_date,
+  reason, mechanism_note}` (plus `reparked_review_stage_id` when a review stage
+  was re-parked, and `post_merge_head_read`, `post_merge_observed_head_sha`,
+  `post_merge_read_attempts` when the call performed the merge). Sibling of
+  `branch_reset` above, and like it the advance DOES refresh the sticky status
+  comment afterward
   (`notifyStatusUpdate(runID, "branch_rebased")` → the `status_update` surface
   in the table above, same comment id, edits in place), but the
   `branch_rebased` audit kind itself posts nothing. Listed here so a future

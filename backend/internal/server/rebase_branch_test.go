@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2256,5 +2257,265 @@ func TestRebaseRunBranch_CallerCancelDuringPostMergeRead_StillRecordsTheMerge(t 
 	}
 	if p := decodeBranchRebased(t, sd.au); p.NewHeadSHA != rebaseNewHeadSHA {
 		t.Errorf("branch_rebased new_head_sha = %q, want the merge commit %q", p.NewHeadSHA, rebaseNewHeadSHA)
+	}
+}
+
+// --- ADR-092 / #4200: the actor-parameterized advanceRunBranch core ---
+
+// normalizeRebasePayload rewrites the per-seed ids in an appended payload to
+// stable placeholders so a payload can be compared against a golden literal.
+func normalizeRebasePayload(sd *rebaseSeed, raw []byte) string {
+	out := strings.ReplaceAll(string(raw), sd.runID.String(), "<run>")
+	if sd.review != nil {
+		out = strings.ReplaceAll(out, sd.review.ID.String(), "<review>")
+	}
+	return out
+}
+
+// Golden payloads of the OPERATOR verb's branch_rebased and lineage
+// attribution rows on the clean-merge path. Captured against the pre-#4200
+// handler (the inline implementation) and asserted against the extracted core,
+// so the extraction is pinned BYTE-FOR-BYTE on the audit chain, not only on
+// the fields individual tests happen to read.
+const (
+	goldenOperatorBranchRebasedPayload = `{"already_up_to_date":false,"base_ref":"main","branch":"fishhawk/run/rebase-abc","mechanism_note":"fishhawk_rebase_run_branch merges the declared base INTO the run branch server-side, leaving a merge commit; this is not a literal rebase and does not produce linear history.","merge_commit_sha":"bbbb222222222222222222222222222222222222","new_head_sha":"bbbb222222222222222222222222222222222222","post_merge_head_read":"converged","post_merge_observed_head_sha":"bbbb222222222222222222222222222222222222","post_merge_read_attempts":1,"pr_number":77,"prior_head_sha":"aaaa111111111111111111111111111111111111","reason":"advance onto main","reparked_review_stage_id":"<review>","run_id":"<run>"}`
+	goldenOperatorVouchPayload         = `{"reason":"fishhawk_rebase_run_branch advanced fishhawk/run/rebase-abc onto main; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher","run_id":"<run>","vouched_sha":"bbbb222222222222222222222222222222222222"}`
+)
+
+// derefActorKind / derefString render an optional audit actor field for a
+// failure message.
+func derefActorKind(k *audit.ActorKind) string {
+	if k == nil {
+		return "<nil>"
+	}
+	return string(*k)
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
+}
+
+// TestRebaseRunBranch_OperatorAuditPayloadsAreByteIdentical pins the
+// operator verb's branch_rebased and operator_commit_vouched rows — payload
+// bytes AND actor — so moving the writers off *http.Request onto ctx + actor
+// cannot drift what the verb records.
+func TestRebaseRunBranch_OperatorAuditPayloadsAreByteIdentical(t *testing.T) {
+	sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+	w := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "advance onto main", Confirm: true}, withRebaseOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	for _, tc := range []struct {
+		category, golden string
+	}{
+		{CategoryBranchRebased, goldenOperatorBranchRebasedPayload},
+		{CategoryOperatorCommitVouched, goldenOperatorVouchPayload},
+	} {
+		rows := auditEntries(sd.au, tc.category)
+		if len(rows) != 1 {
+			t.Fatalf("%s rows = %d, want 1", tc.category, len(rows))
+		}
+		if got := normalizeRebasePayload(sd, rows[0].Payload); got != tc.golden {
+			t.Errorf("%s payload drifted:\n got  %s\n want %s", tc.category, got, tc.golden)
+		}
+		if rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorUser ||
+			rows[0].ActorSubject == nil || *rows[0].ActorSubject != "github:ops" {
+			t.Errorf("%s actor = %s/%q, want user/github:ops", tc.category,
+				derefActorKind(rows[0].ActorKind), derefString(rows[0].ActorSubject))
+		}
+	}
+}
+
+// TestAdvanceRunBranch_SystemActorRecordsSystemProvenance drives the
+// extracted core the way the ADR-092 merge-candidate queue will — no request,
+// no identity on the context, the SYSTEM actor — and asserts it performs the
+// same base merge as the verb and records it under system provenance:
+// branch_rebased AND the operator_commit_vouched lineage attribution carry
+// actor_kind system / subject system:merge-candidate-verify (never the
+// "anonymous" a context-derived identity would yield), the attribution does
+// not claim an operator authorization, and the REAL ADR-035 ledger recompute
+// admits the merge commit under that actor (so addVouchedSHAs does not filter
+// vouches by actor kind).
+func TestAdvanceRunBranch_SystemActorRecordsSystemProvenance(t *testing.T) {
+	sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+	seedRunHeadEntry(sd.au, sd.runID, "pull_request_opened", rebasePriorHeadSHA, 1)
+
+	out, refusal := sd.s.advanceRunBranch(context.Background(), sd.rr.getRuns[sd.runID],
+		mergeCandidateSystemActor(), "merge-candidate queue admission")
+	if refusal != nil {
+		t.Fatalf("refusal = %+v, want an outcome", refusal)
+	}
+	if !out.MergePerformed || out.AlreadyUpToDate || out.NewHeadSHA != rebaseNewHeadSHA ||
+		out.MergeCommitSHA != rebaseNewHeadSHA || out.PriorHeadSHA != rebasePriorHeadSHA {
+		t.Errorf("outcome = %+v, want a performed merge %s -> %s", out, rebasePriorHeadSHA, rebaseNewHeadSHA)
+	}
+	if out.TailDeadline.IsZero() {
+		t.Error("TailDeadline is zero on a performed merge; the caller's post-merge work would run unbounded on its own context")
+	}
+	if m := sd.stub.merges(); len(m) != 1 || m[0].Base != rebaseBranchName || m[0].Head != rebaseBaseRef {
+		t.Errorf("merge POSTs = %+v, want exactly one merging %s INTO %s", m, rebaseBaseRef, rebaseBranchName)
+	}
+	if out.ReparkedReviewStageID != sd.review.ID.String() {
+		t.Errorf("reparked = %q, want the review gate %s", out.ReparkedReviewStageID, sd.review.ID)
+	}
+	if got := checkPublications(sd.creator); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("check publications = %v, want [%s]", got, rebaseNewHeadSHA)
+	}
+
+	for _, category := range []string{CategoryBranchRebased, CategoryOperatorCommitVouched} {
+		rows := auditEntries(sd.au, category)
+		if len(rows) != 1 {
+			t.Fatalf("%s rows = %d, want 1", category, len(rows))
+		}
+		if rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorSystem {
+			t.Errorf("%s actor_kind = %s, want system", category, derefActorKind(rows[0].ActorKind))
+		}
+		if rows[0].ActorSubject == nil || *rows[0].ActorSubject != mergeCandidateSystemSubject {
+			t.Errorf("%s actor_subject = %q, want %q", category, derefString(rows[0].ActorSubject), mergeCandidateSystemSubject)
+		}
+	}
+	if p := decodeBranchRebased(t, sd.au); p.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("branch_rebased new_head_sha = %q, want %q", p.NewHeadSHA, rebaseNewHeadSHA)
+	}
+	var br map[string]any
+	_ = json.Unmarshal(auditEntries(sd.au, CategoryBranchRebased)[0].Payload, &br)
+	if br["reason"] != "merge-candidate queue admission" {
+		t.Errorf("branch_rebased reason = %v, want the caller's reason", br["reason"])
+	}
+	var vouch map[string]any
+	_ = json.Unmarshal(auditEntries(sd.au, CategoryOperatorCommitVouched)[0].Payload, &vouch)
+	reason, _ := vouch["reason"].(string)
+	if strings.Contains(reason, "operator's authorization") || !strings.Contains(reason, "merge-candidate queue (ADR-092)") {
+		t.Errorf("attribution reason = %q, want the system auto-advance wording, never an operator authorization", reason)
+	}
+	if got := attributedSHAs(sd.au); len(got) != 1 || got[0] != rebaseNewHeadSHA {
+		t.Errorf("attributed shas = %v, want exactly [%s]", got, rebaseNewHeadSHA)
+	}
+
+	// The post-advance world: the branch tip IS the merge commit.
+	sd.stub.mu.Lock()
+	sd.stub.headSHA = rebaseNewHeadSHA
+	sd.stub.headSHASeq = nil
+	sd.stub.behindCommits = []string{rebasePriorHeadSHA, rebaseNewHeadSHA}
+	sd.stub.mu.Unlock()
+	if !sd.s.ReverifyBranchLineage(context.Background(), sd.runID, 77) {
+		t.Fatal("the ADR-035 ledger flagged the system auto-advance merge commit as FOREIGN")
+	}
+}
+
+// TestAdvanceRunBranch_UpToDateAttributesNothing: the already-contains-base
+// arm through the core performs no merge, attributes nothing, sets no tail
+// deadline, and still records branch_rebased under the supplied actor.
+func TestAdvanceRunBranch_UpToDateAttributesNothing(t *testing.T) {
+	sd := seedRebaseRun(t, upToDateRebaseStub(), rebaseOpts{})
+	out, refusal := sd.s.advanceRunBranch(context.Background(), sd.rr.getRuns[sd.runID],
+		mergeCandidateSystemActor(), "")
+	if refusal != nil {
+		t.Fatalf("refusal = %+v, want an outcome", refusal)
+	}
+	if !out.AlreadyUpToDate || out.MergePerformed || !out.TailDeadline.IsZero() || out.NewHeadSHA != rebaseNewHeadSHA {
+		t.Errorf("outcome = %+v, want already-up-to-date at %s with no merge and no tail deadline", out, rebaseNewHeadSHA)
+	}
+	if m := sd.stub.merges(); len(m) != 0 {
+		t.Errorf("merge POSTs = %d, want 0", len(m))
+	}
+	if got := attributedSHAs(sd.au); len(got) != 0 {
+		t.Errorf("attributed shas = %v, want none on the already-contains-base arm", got)
+	}
+	a := branchRebasedAudit(sd.au)
+	if a == nil || a.ActorKind == nil || *a.ActorKind != audit.ActorSystem {
+		t.Error("want one branch_rebased row under the system actor")
+	}
+}
+
+// TestAdvanceRunBranch_MergeRefusalsWriteNothing: a conflicting or failed
+// merge is a TYPED refusal carrying the anchors a caller needs (the PR, the
+// branch, the base and the head the merge was attempted against, plus the
+// merge error), and NOTHING is appended — the core never starts a
+// conflict-resolution pass itself (that 202 arm is the HTTP caller's).
+func TestAdvanceRunBranch_MergeRefusalsWriteNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stub     func() *rebaseGitHub
+		wantKind string
+		conflict bool
+	}{
+		{"conflict", conflictRebaseStub, rebaseAdvanceRefusalConflict, true},
+		{"merge failed", func() *rebaseGitHub {
+			stub := cleanRebaseStub()
+			stub.mergeStatus = http.StatusInternalServerError
+			stub.mergeBody = `{"message":"boom"}`
+			return stub
+		}, rebaseAdvanceRefusalMergeFailed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := seedRebaseRun(t, tc.stub(), rebaseOpts{})
+			out, refusal := sd.s.advanceRunBranch(context.Background(), sd.rr.getRuns[sd.runID],
+				mergeCandidateSystemActor(), "")
+			if out != nil || refusal == nil {
+				t.Fatalf("out=%+v refusal=%+v, want a refusal and no outcome", out, refusal)
+			}
+			if refusal.Kind != tc.wantKind || refusal.PRNumber != 77 || refusal.Branch != rebaseBranchName ||
+				refusal.BaseRef != rebaseBaseRef || refusal.HeadSHA != rebasePriorHeadSHA || refusal.Err == nil {
+				t.Errorf("refusal = %+v, want kind %s anchored on PR 77 %s<-%s at %s with the merge error",
+					refusal, tc.wantKind, rebaseBranchName, rebaseBaseRef, rebasePriorHeadSHA)
+			}
+			if got := errors.Is(refusal.Err, forge.ErrMergeConflict); got != tc.conflict {
+				t.Errorf("errors.Is(err, ErrMergeConflict) = %v, want %v", got, tc.conflict)
+			}
+			assertMergeAttemptedNothingWritten(t, sd)
+			sd.au.mu.Lock()
+			appended := len(sd.au.appended)
+			sd.au.mu.Unlock()
+			if appended != 0 {
+				t.Errorf("audit rows appended = %d, want 0 — a merge refusal writes nothing", appended)
+			}
+		})
+	}
+}
+
+// TestAdvanceRunBranch_RefusesBeforeAnyForgeCall covers the core's own
+// guards, which the HTTP shell never reaches (it answers 503 / always derives
+// a subject first) but a non-request caller can: an unwired server, a nil run
+// and an actor with no subject each refuse not_determinable with ZERO forge
+// calls and nothing appended.
+func TestAdvanceRunBranch_RefusesBeforeAnyForgeCall(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(sd *rebaseSeed) (*run.Run, mergeCandidateActor)
+	}{
+		{"nil run", func(sd *rebaseSeed) (*run.Run, mergeCandidateActor) {
+			return nil, mergeCandidateSystemActor()
+		}},
+		{"no GitHub client", func(sd *rebaseSeed) (*run.Run, mergeCandidateActor) {
+			sd.s.cfg.GitHub = nil
+			return sd.rr.getRuns[sd.runID], mergeCandidateSystemActor()
+		}},
+		{"no actor subject", func(sd *rebaseSeed) (*run.Run, mergeCandidateActor) {
+			return sd.rr.getRuns[sd.runID], mergeCandidateActor{Kind: audit.ActorSystem}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+			runRow, actor := tc.setup(sd)
+			out, refusal := sd.s.advanceRunBranch(context.Background(), runRow, actor, "")
+			if out != nil || refusal == nil || refusal.Kind != rebaseAdvanceRefusalNotDeterminable || refusal.Reason == "" {
+				t.Fatalf("out=%+v refusal=%+v, want a not_determinable refusal with a reason", out, refusal)
+			}
+			if n := prCalls(sd.stub); n != 0 {
+				t.Errorf("GET /pulls calls = %d, want 0 — the guard must refuse before any forge read", n)
+			}
+			assertNoWriteBeforeMerge(t, sd)
+			sd.au.mu.Lock()
+			appended := len(sd.au.appended)
+			sd.au.mu.Unlock()
+			if appended != 0 {
+				t.Errorf("audit rows appended = %d, want 0", appended)
+			}
+		})
 	}
 }
