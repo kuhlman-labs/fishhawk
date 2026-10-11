@@ -313,6 +313,15 @@ func (s *Server) reconcileRunOrphanedReviewsMode(ctx context.Context, runID uuid
 			s.recomputeAndPublishAuditComplete(ctx, runID)
 		}
 	}
+	if allowRedispatch {
+		// Boot only (E72.58 / #4075): release a deferred acceptance fix-up
+		// stranded by the restart — the process died between round settlement
+		// and release, or mid-round and the round was just closed failed
+		// above. A re-dispatched round is still in flight, so this no-ops and
+		// that round's own settle releases. The on-demand reconcile verb stays
+		// terminate-only.
+		s.releaseDeferredAcceptanceFixup(ctx, runID)
+	}
 	return out, nil
 }
 

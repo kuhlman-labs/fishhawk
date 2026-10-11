@@ -5484,6 +5484,14 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 	// reflects the post-close open count in this same pass.
 	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, len(invocations), headSHA)
 
+	// Release a class-1 acceptance fix-up triage deferred for THIS round
+	// (E72.58 / #4075): every invocation has written its terminal entry and
+	// concern states are final, so the deferred pass now carries the round's
+	// routable concerns too. Placed BEFORE recomputeAndPublishAuditComplete so
+	// the republished check reflects the re-opened stages of a routed pass.
+	// One audit list on a run with no deferral.
+	s.releaseDeferredAcceptanceFixup(ctx, runID)
+
 	// The implement review has now written its terminal entries
 	// (implement_reviewed / implement_review_failed). Re-derive and
 	// republish fishhawk_audit_complete so the #947 review-pending presence

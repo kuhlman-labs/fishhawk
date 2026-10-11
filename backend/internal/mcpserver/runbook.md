@@ -752,6 +752,18 @@ non-convergence always lands on the human. A failed post-deploy verdict on a
 release-shaped run records the paged `rollback_offered` instead (see "Post-deploy
 rollback offer" below).
 
+**Deferred class-1 fix-up (E72.58 / #4075).** When a class-1 failure lands while
+the implement review round is still in flight AND the workflow delegates
+`may_route_fixup`, triage records the non-paging `fixup_deferred_review_in_flight`
+and routes nothing. When the round settles (or, after a restart, in the boot
+review sweep) the server routes ONE fix-up pass carrying the acceptance evidence
+plus the round's routable review concerns (only when `convergent_concerns` is
+met; `requirement` / `conventions_override_attempt` concerns are held for you),
+then records `fixup_dispatched` (or a paged variant). While the deferral is
+pending `next_actions` may show `acceptance_triage_rerouting`: read it as
+**await the implement review** — do not route a fix-up yourself, which would
+supersede the deferral and page.
+
 **LOCAL-runner re-open rule.** An auto-routed re-open (`fixup_dispatched` or
 `retry_dispatched`) re-opens the stage server-side but **never spawns the local
 runner** — the same rule as local-drive fixup above, generalized. You MUST

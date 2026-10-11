@@ -1529,7 +1529,16 @@ Notes:
   implement fix-up) / `retry_dispatched` (class-2 → acceptance-stage reopen);
   and the human-paged `paged` (class-3/class-4) / `rerun_budget_exhausted` (the
   per-run re-run cap of 2 hit) / `fixup_unavailable_paged` (a class-1 fix-up
-  route refused — budget/ceiling/not-applicable) / `retry_unavailable_paged` (a
+  route refused — budget/ceiling/not-applicable, or a deferred release
+  superseded by another pass) / the NON-paging `fixup_deferred_review_in_flight`
+  (E72.58 / #4075: a class-1 fix-up held for an in-flight implement review
+  round; rendered by the generic `renderAcceptanceTriageLine` on anchor edits
+  only, never pinged, never counted as a re-run; additive payload object
+  `fixup_deferral {implement_stage_id, review_round_sequence, concerns}`, and
+  the release's entry adds `released_deferral_sequence`,
+  `routed_review_concern_ids`, and when they apply `held_review_concern_ids`,
+  `review_concern_fold_unmet`, `review_concerns_unavailable`,
+  `superseded_by_fixup_sequence`) / `retry_unavailable_paged` (a
   class-2 reopen refused) / `unsettled_paged` (the acceptance stage was not yet
   settled `succeeded` at ship time) / `externally_unvalidatable_paged` (class 5,
   #1671) / `rollback_offered` (E35.3 / #1600: a class-1/class-4 failed verdict on
