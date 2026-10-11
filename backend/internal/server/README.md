@@ -2610,13 +2610,20 @@ settle carries.
   the auto-advance), `merge_candidate_queue_settled` (state + `reason` +
   `from_state`). Best-effort, system actor, written after the store's
   transaction committed; a lost row never unwinds a queue move.
-- **Residual: run-terminal stall.** A LIVE entry whose run fails or is swept
-  (any terminal transition other than cancel, which releases) is NOT released
-  at that transition — there is no single run-terminal seam in this package.
-  It holds the base until the NEXT pump on that base, which drops it
-  `run_terminal` and admits the next held entry. Recovery verb:
+- **Periodic pump.** fishhawkd pumps every base `mergequeue.Store.ActiveBases`
+  reports (a base with a held or live entry) once at boot and then every
+  `MergeCandidateQueuePumpInterval` (1 minute) via
+  `RunMergeCandidateQueuePump` / `PumpMergeCandidateQueues`, started from
+  `backend/cmd/fishhawkd/serve.go`. Each tick reuses `pumpMergeCandidateQueue`,
+  which drops a LIVE entry whose run is terminal (`run_terminal`) and re-claims
+  a stale admission, then admits the next held entry. So a run that fails or
+  is swept by any path other than the REST cancel (which releases at once)
+  holds its base for at most ONE pump tick, and a crash mid-admission
+  self-heals within `mergequeue.AdmissionStaleAfter`. Manual pump:
   `fishhawk_rebase_run_branch` on any held run of that base (its re-enqueue
-  pumps the base).
+  pumps the base). Not covered: a merge that lands without the
+  `pull_request.closed` webhook leaves a `passed` entry live until a pump
+  settles it some other way (#4289).
 - **Tests.** `merge_candidate_queue_test.go` runs the REAL rebase handler,
   `mergequeue.PostgresStore`, Postgres run AND audit repositories over ONE
   pgtest pool with a multi-PR fake GitHub: the end-to-end wave (A live, B
