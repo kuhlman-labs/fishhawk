@@ -5484,6 +5484,44 @@ components:
             `fishhawk_dispatch_stage` admission). A slot waiter that lost its
             admission response claims the admission only when this equals its
             own nonce.
+        promoted:
+          type: boolean
+          description: |
+            Queued only: an operator promoted this waiter in its current queue
+            episode (`POST /v0/stages/{stage_id}/concurrency/promote`, #4191),
+            so it is ordered ahead of every unpromoted waiter. Omitted when
+            false, and always while holding.
+    PromoteQueuedStageRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why this waiter should be admitted ahead of the others; trimmed, then 1..1000 bytes. Recorded on the audit row.
+    PromoteQueuedStageResponse:
+      type: object
+      required: [stage_id, run_id, group, limit, promoted, old_position, new_position, holders]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        group: { type: string, description: The stage's concurrency group key. }
+        limit: { type: integer, minimum: 1, maximum: 64 }
+        promoted:
+          type: boolean
+          description: True when the order changed; false when the stage was already first (nothing written).
+        old_position: { type: integer, minimum: 1, description: 1-based queue position before the promote. }
+        new_position: { type: integer, minimum: 1, description: 1-based queue position after the promote (1). }
+        holders:
+          type: array
+          description: The group's live holders; always a list (`[]` when none). Holders are never preempted.
+          items: { $ref: '#/components/schemas/ConcurrencyHolder' }
+        audit_sequence:
+          type: integer
+          format: int64
+          description: Sequence of the `stage_concurrency_promoted` audit row; omitted on a no-op.
     StageProgress:
       type: object
       description: |
@@ -15978,7 +16016,10 @@ paths:
         ungrouped and unchanged. On the `pending|awaiting_host_dispatch` arm a
         grouped stage is either ADMITTED (the same CAS to `dispatched`, plus a
         `concurrency` block on the 200) or QUEUED FIFO behind the group's live
-        holders: 409 `concurrency_slot_queued`, `Retry-After: 5`, and the stage
+        holders (FIFO except a waiter an operator promoted with
+        `POST /v0/stages/{stage_id}/concurrency/promote`, #4191, which is
+        ordered ahead of every unpromoted waiter): 409
+        `concurrency_slot_queued`, `Retry-After: 5`, and the stage
         is untouched at `awaiting_host_dispatch`. Queued is a 409, not a 2xx, so
         a pre-change client fails closed. A queued caller re-POSTs every
         `poll_interval_seconds` to keep its queue row live; a row not refreshed
@@ -24478,6 +24519,110 @@ paths:
             (`fixup_invalid_model`, #1164 — `details` carry the resolved
             `model`, `model_source`, and `adapter`). Body's `message` explains
             the specific reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/stages/{stage_id}/concurrency/promote:
+    post:
+      operationId: promoteQueuedStage
+      summary: Promote a queued waiter to the front of its concurrency group
+      description: |
+        Operator PROMOTE of a queued waiter in a local stage concurrency group
+        (#4191, ADR-087 `stage_concurrency_slots`), so a stage that unblocks
+        everyone else is admitted next. The stage's queued slot row gets an
+        `order_key` just ahead of every other fresh waiter in the same group
+        and account (the minimum other effective key minus 1 ms, so the newest
+        promote wins); the admit order is `(COALESCE(order_key, enqueued_at),
+        stage_id)`, so every unpromoted waiter stays strict FIFO. `enqueued_at`
+        and `waited_seconds` stay truthful. Holders are NEVER preempted: a
+        promoted waiter is admitted at the next free slot. The promotion lasts
+        for the waiter's current queue episode only (a held→queued episode, a
+        re-key into another group, or a stale restart clears it). The stage's
+        `concurrency` block then reads `promoted: true` and its new `position`.
+
+        This verb acts ONLY on local concurrency-group waiters. It never acts
+        on the ADR-092/093 merge-candidate queue, whose promote is a distinct
+        verb (#4297, audit category `merge_queue_promoted`).
+
+        **Refusals, each decided before anything is written.**
+        `503 concurrency_promote_unconfigured` (no slot store);
+        `401 authentication_required`; `403 run_token_forbidden` (a run-bound
+        agent token, even for its own run); `403 insufficient_scope` (no
+        `write:runs`); `400 validation_failed` (a non-UUID `stage_id`, or a
+        body that is not exactly one `{"reason": string}` object — unknown
+        keys and trailing content are refused — or a reason empty after
+        trimming or over 1000 bytes). Then, inside the store's transaction:
+        `404 stage_not_found`; `409 concurrency_slot_held` (the stage holds
+        its slot); `409 concurrency_slot_not_queued` (no active queued row: it
+        never asked for a slot, or it is no longer `pending` /
+        `awaiting_host_dispatch`); `409 concurrency_waiter_not_live` (the
+        queued row is stale past the 60s queue TTL; re-dispatch the stage to
+        start a live waiter, then promote it); `409 concurrency_slot_changed`
+        (the row moved to another group mid-promote); `500
+        concurrency_promote_failed` (rolled back, nothing changed).
+
+        **Audit.** A promotion appends a chained `stage_concurrency_promoted`
+        row `{stage_id, run_id, group, limit, old_position, new_position,
+        reason, actor}` (actor_kind `user`, or `agent` for a delegated
+        operator-agent token) INSIDE the promotion transaction, so a failed
+        append rolls the promotion back. A stage already first answers 200
+        `promoted: false` and appends nothing.
+
+        **Authorization.** An authenticated identity with `write:runs` in the
+        stage's workspace account. A run-bound agent token is refused; a
+        delegated operator-agent token is admitted (an operational ordering
+        control like dispatch and retry, not an approval), and the audit row
+        records its subject.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoteQueuedStageRequest' }
+      responses:
+        '200':
+          description: The waiter was promoted, or was already first (`promoted:false`, nothing written).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromoteQueuedStageResponse' }
+        '400':
+          description: '`validation_failed` — a non-UUID `stage_id`, a body that is not exactly `{"reason": string}`, or a reason empty after trimming or over 1000 bytes (`details.field`: `stage_id`, `body` or `reason`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_token_forbidden` (a run-bound agent token),
+            `insufficient_scope` (no `write:runs`), or the stage belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`stage_not_found` — no stage with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `concurrency_slot_held`, `concurrency_slot_not_queued`,
+            `concurrency_waiter_not_live` or `concurrency_slot_changed` (see
+            the refusal ladder above; `details.stage_id` names the stage).
+            Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`concurrency_promote_failed` — the promotion (or its audit append) failed and was rolled back; the queue order is unchanged.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`concurrency_promote_unconfigured` — the daemon has no concurrency slot store.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

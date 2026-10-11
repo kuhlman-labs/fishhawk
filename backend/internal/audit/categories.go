@@ -291,6 +291,13 @@ import "sort"
 // stage behind its group's holders, and one admitted row on every grouped
 // admission. Best-effort, actor system, INTERNAL — deliberately NOT
 // issue-comment activity categories (read through GET /v0/runs/{id}/audit).
+// #4191 added stage_concurrency_promoted: server/stage_concurrency_promote.go
+// appends it INSIDE the promotion transaction (an append failure rolls the
+// promotion back) when an operator moves a queued waiter to the front of its
+// group. Actor = the operator subject (user, or agent for a delegated
+// operator-agent token). INTERNAL — NOT an issue-comment activity category,
+// so docs/issue-comment-surfaces.md is untouched. The merge-candidate queue's
+// promote is ADR-093 D7's merge_queue_promoted (#4297), a distinct category.
 // #4012 (E3775.2) added the seven comms categories as FORWARD registrations,
 // the #3921 upkeep precedent: comms_report_recorded, comms_disposition_recorded
 // and comms_apply_window_closed are the comms window family's report, capture
@@ -577,6 +584,7 @@ var KnownCategories = map[string]struct{}{
 	"spend_alert":                             {},
 	"stage_budget_exceeded":                   {},
 	"stage_concurrency_admitted":              {},
+	"stage_concurrency_promoted":              {},
 	"stage_concurrency_queued":                {},
 	"stage_conflict_resolution_failed":        {},
 	"stage_conflict_resolution_triggered":     {},

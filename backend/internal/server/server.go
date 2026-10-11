@@ -1143,6 +1143,14 @@ type Server struct {
 	// releasePublisherOverride exactly.
 	crewConsultSinkOverride crewConsultSink
 
+	// promoteAuditAppendOverride lets the stage-concurrency promote tests
+	// inject an audit-append failure INSIDE the promotion transaction (#4191),
+	// which no real chain yields on demand, to pin that a failed append rolls
+	// the promotion back. Test-only: production is ALWAYS nil, so
+	// (*Server).promoteAuditAppend returns audit.AppendChainedTx. Mirrors
+	// crewConsultSinkOverride.
+	promoteAuditAppendOverride promoteAuditAppender
+
 	// auditCheckPublisher posts the derived fishhawk_audit_complete
 	// state to GitHub as a Check Run on every compute (#231). nil
 	// when ExternalURL or GitHub aren't wired — the in-Fishhawk

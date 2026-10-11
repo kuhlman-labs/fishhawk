@@ -291,6 +291,7 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", s.requireStageAccount(memberWrite, s.handleRetryStage))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", s.requireStageAccount(memberWrite, s.handleAcceptanceAdmission))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", s.requireStageAccount(memberWrite, s.handleFixupStage))
+	mux.HandleFunc("POST /v0/stages/{stage_id}/concurrency/promote", s.requireStageAccount(memberWrite, s.handlePromoteQueuedStage))
 	// #4101: list a run's (and optionally its decomposition children's) concerns.
 	mux.HandleFunc("GET /v0/runs/{run_id}/concerns", s.requireRunAccount(readAccess, s.handleListRunConcerns))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
