@@ -185,6 +185,20 @@ const (
 	// "acceptance_verdict_unshipped" and the audit category of the marker
 	// (the cross-module literal test pins both).
 	RuleAcceptanceVerdictUnshipped Rule = "acceptance_verdict_unshipped"
+	// RuleReviewCoverageIncomplete covers a decomposed parent whose review
+	// evidence is terminal but which has a succeeded slice no SUCCESSFUL agent
+	// review covers (#4219): neither the parent's latest implement-review round
+	// nor the slice's own latest round recorded an implement_reviewed verdict —
+	// the d3b1d915 shape, where an infra-failed consolidated round settled with
+	// zero verdicts. It is stamped INSTEAD of RuleChecksGreenAwaitingMerge and
+	// parks with a rerun_review (or await_review) next action — never the merge
+	// ritual; the merge endpoint refuses the same state with the same code.
+	// Detection only, like RuleCIFailed: it parks and never advances — a
+	// re-run review recording a verdict is the real edge, after which the
+	// observer re-asserts awaiting_merge. This name MUST byte-match the merge
+	// refusal code, the derived_status and the MCP next_actions.state string
+	// "review_coverage_incomplete".
+	RuleReviewCoverageIncomplete Rule = "review_coverage_incomplete"
 	// RuleDeployInitialization covers a deploy-FIRST run's
 	// pending → awaiting_deploy_approval pre-execution park at run
 	// creation (E23.13 / #1429). A deploy stage has no agent or runner, so
@@ -243,6 +257,7 @@ var mechanical = map[Rule]bool{
 	RuleAcceptanceOutcomeUnknown:   true,
 	RuleAcceptanceTriage:           true,
 	RuleAcceptanceVerdictUnshipped: true,
+	RuleReviewCoverageIncomplete:   true,
 	RuleDeployInitialization:       true,
 	RuleChildrenDispatch:           true,
 	RuleGateApproval:               false,

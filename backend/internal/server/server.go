@@ -1957,19 +1957,56 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		// acceptance passes, is skipped, or settles not-validated.
 	}
 	// Idempotent on Recorded (per-(run,stage) ever-recorded) EXCEPT when the
-	// run's latest entry is a CI park (ci_failed or ci_recovered): a run that
+	// run's latest entry is a CI park (ci_failed or ci_recovered) or the
+	// review-coverage hold (#4219, see below): a run that
 	// reached awaiting_merge, then parked ci_failed on a superseded head, must
 	// RE-ASSERT awaiting_merge once the checks go green — delegation's
 	// evalGatesResolvedCIGreen and applyDriveSurfaces' derived_status both key
 	// on the LATEST entry, so a stale checks_green stamp buried under the
 	// ci_failed park would leave the run wedged (#3414). Every OTHER
 	// supersession — in particular fixup_rereview_repark — keeps the #2122
-	// Recorded scoping, so this carve-out is deliberately narrow. The
+	// Recorded scoping, so these carve-outs are deliberately narrow. The
 	// acceptance arms above already dedup on LatestRuleIs, so an
 	// acceptance-declaring run re-stamps on its own after a recovery and needs
 	// no carve-out here.
+	//
+	// Review-coverage hold (#4219), consulted BEFORE that guard so an
+	// already-stamped awaiting_merge parent with an uncovered slice is
+	// re-stamped as held on its next tick. A decomposed parent whose review
+	// evidence settled with no successful verdict covering some slice parks
+	// in review_coverage_incomplete instead of awaiting_merge — the same
+	// predicate the merge endpoint refuses on. Idempotent on LatestRuleIs.
+	// FAIL-CLOSED: a read error skips the advance (the next tick retries),
+	// never falls through to merge_pr. The hold is the second carve-out on the
+	// Recorded guard: once a re-run verdict clears it, awaiting_merge is
+	// re-asserted, because derived_status and delegation key on the LATEST
+	// entry.
+	coverage, cerr := s.reviewCoverageRefusal(ctx, runRow)
+	if cerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"drive: review-coverage read failed; skipping advance (fail-closed)",
+			slog.String("run_id", stage.RunID.String()), slog.String("error", cerr.Error()))
+		return
+	}
+	if coverage != nil {
+		if !s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleReviewCoverageIncomplete) {
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleReviewCoverageIncomplete,
+				From:  "review:awaiting_approval",
+				To:    string(drive.RuleReviewCoverageIncomplete),
+				Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved) + "; a decomposed slice is not covered by a successful agent review",
+				NextAction: &drive.NextAction{
+					Action: reviewCoverageDriveAction(coverage),
+					Detail: coverage.Message,
+					PRURL:  prURL,
+				},
+			})
+		}
+		return
+	}
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) &&
-		!s.ciParkIsLatest(ctx, stage.RunID) {
+		!s.ciParkIsLatest(ctx, stage.RunID) &&
+		!s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleReviewCoverageIncomplete) {
 		return
 	}
 	adv := s.advisoryOutstandingFor(ctx, stage.RunID, roundState.rejects, roundState.verdictsUnreadable)
