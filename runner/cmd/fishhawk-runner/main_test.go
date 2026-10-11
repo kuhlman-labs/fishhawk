@@ -26751,6 +26751,10 @@ func TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials(t *testing.T) {
 	t.Setenv("GOPRIVATE", "example.com/private")
 	// The operator escape hatch.
 	t.Setenv("FISHHAWK_AGENT_ENV_TARGET_THING", "target-thing-value")
+	// An inherited GOFLAGS the -trimpath overlay (#4180) must merge into, not
+	// clobber. A -tags sentinel, not -mod=mod: it is inert for any go command
+	// run() might exec, whereas -mod=mod errors in workspace mode.
+	t.Setenv("GOFLAGS", "-tags=fishhawk_goflags_sentinel")
 
 	// The real claudecode adapter, with only the child binary faked. The Cmd
 	// builder leaves cmd.Env NIL on purpose: the adapter re-seeds cmd.Env from
@@ -26851,6 +26855,13 @@ func TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials(t *testing.T) {
 	}
 	if vals := childEnvValues(childEnv, "FISHHAWK_AGENT_ENV_TARGET_THING"); len(vals) != 0 {
 		t.Errorf("the prefixed passthrough key also reached the child: %v", vals)
+	}
+
+	// (f) The GOFLAGS -trimpath overlay (#4180), at the main.go call site: the
+	// inherited value survives as a verbatim prefix (non-clobbering) and the
+	// flag is appended, in ONE entry (a second GOFLAGS entry would be a defect).
+	if vals := childEnvValues(childEnv, "GOFLAGS"); len(vals) != 1 || vals[0] != "-tags=fishhawk_goflags_sentinel -trimpath" {
+		t.Errorf("GOFLAGS = %q, want exactly [\"-tags=fishhawk_goflags_sentinel -trimpath\"] — the agent spawn must merge -trimpath into the inherited GOFLAGS (#4180)", vals)
 	}
 }
 

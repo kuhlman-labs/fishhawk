@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -2565,5 +2566,51 @@ func TestConflictBaseFetchTarget(t *testing.T) {
 					tc.qualified, r, b, ok, tc.wantRemote, tc.wantBranch, tc.wantOK)
 			}
 		})
+	}
+}
+
+// TestConflictResolutionSpawnMergesTrimpathIntoGOFLAGS (#4180) drives the
+// PRODUCTION conflict-resolution agent seam against a fake agent that dumps its
+// env, and pins that this call site composes its base env through
+// agentenv.Env: an inherited GOFLAGS arrives with -trimpath merged in (one
+// entry, inherited bytes as a verbatim prefix). Sibling of
+// TestConflictResolutionSpawnCarriesRunAgentMarker, which pins the run-agent
+// marker at the same seam.
+func TestConflictResolutionSpawnMergesTrimpathIntoGOFLAGS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake agent is a /bin/sh script")
+	}
+	bin, dump := writeEnvDumpAgent(t)
+	t.Setenv("FISHHAWK_AGENT_BIN", bin)
+	t.Setenv("GOFLAGS", "-tags=fishhawk_conflict_sentinel")
+	promptFile := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(promptFile, []byte("resolve the conflict"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	cfg := config{
+		agent:      "claude-code",
+		runID:      "11111111-2222-3333-4444-conflict0002",
+		stage:      "implement",
+		promptFile: promptFile,
+		workingDir: t.TempDir(),
+		timeout:    30 * time.Second,
+	}
+	_ = productionConflictResolutionAgentInvoker(context.Background(), cfg, io.Discard)
+
+	// A missing dump FAILS: the fake agent never ran, so an absent-GOFLAGS
+	// assertion would be vacuous.
+	data, err := os.ReadFile(dump) //nolint:gosec // test-owned temp path
+	if err != nil {
+		t.Fatalf("the fake agent never wrote its env dump (%v); the spawn under test did not happen", err)
+	}
+	var got []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "GOFLAGS="); ok {
+			got = append(got, v)
+		}
+	}
+	want := []string{"-tags=fishhawk_conflict_sentinel -trimpath"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("child GOFLAGS entries = %q, want exactly %q — the conflict-resolution spawn must compose its env through agentenv.Env (#4180)", got, want)
 	}
 }

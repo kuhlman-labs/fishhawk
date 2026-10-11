@@ -873,11 +873,57 @@ needs, exactly as `acceptenv` re-admits the model keys. An operator who does
 not want a particular one reaching the agent must not export it into the
 runner's environment.
 
+**`GOFLAGS` `-trimpath` overlay (#4180).** `Env` REWRITES exactly one entry:
+the last step merges `-trimpath` into `GOFLAGS` (`withTrimpath`), and every other
+surviving entry stays byte-identical. *Why:* without the flag cmd/go hashes the
+build directory into every workspace-package compile action ID (go1.25.6
+`src/cmd/go/internal/work/exec.go` `buildActionID`), so each per-run lineage
+worktree path recompiles and re-caches packages another worktree at the same
+base already built — the #3901 host-cache growth. The issue's measurement: a
+`-race` test at a second path cost 41 compiles / +60 MB without the flag and 0
+compiles / +0.3 MB with it. Coverage profiles use import paths and are
+unchanged.
+
+- *Merge rules.* The merge never clobbers: an inherited value (the runner's own
+  `GOFLAGS`, or a `FISHHAWK_AGENT_ENV_GOFLAGS` passthrough) is kept as a
+  verbatim prefix and ` -trimpath` is appended only when no field already names
+  the flag (`-trimpath`, `--trimpath`, either with `=value`). A blank value
+  becomes exactly `-trimpath`; no `GOFLAGS` entry yields `GOFLAGS=-trimpath`.
+  Fields are split the way cmd/go splits `GOFLAGS` (`splitGOFLAGS` mirrors
+  go1.25.6 `src/cmd/internal/quoted/quoted.go`), so the text `-trimpath` inside a
+  quoted `-ldflags` value is not mistaken for the flag, and a value with an
+  unterminated leading quote is left untouched so the go command reports the
+  operator's own parse error. Every `GOFLAGS` entry is merged, not just the
+  first, because os/exec uses the LAST value of a duplicated key.
+- *Opt-out.* `-trimpath=false` in the runner's `GOFLAGS` (or
+  `FISHHAWK_AGENT_ENV_GOFLAGS=-trimpath=false`) is honored as-is.
+- *Residual: the go env file.* An env-var `GOFLAGS` shadows a
+  `go env -w GOFLAGS=` value entirely, so a runner env with no `GOFLAGS` hides
+  the file's. Set `GOFLAGS` in the runner env or through the passthrough.
+- *Which spawns it covers.* Every spawn composed through `agentenv.Env`: the
+  plan, implement and review spawns (`main.go`), the verify-fix and base-rebase
+  re-invokes (they copy the `Invocation` by value), and the conflict-resolution
+  pass (`conflictresolve.go`). The acceptance agent composes through `acceptenv`
+  and is NOT covered. An agent-driven `scripts/test single` (or any `go` command
+  the agent runs) DOES inherit `-trimpath`: it runs under the agent's env, and
+  the gate-env projection into a container (`gateiso.containerGoflags`) keeps a
+  bare `-trimpath` flag, dropping only absolute-path-valued ones. The
+  runner-driven committed-tree verify gate does NOT: it composes its env from the
+  runner's own gate env (`gateenv.go`), not `agentenv`, so it builds without the
+  flag unless an operator exports `GOFLAGS` on the runner itself. "`scripts/test`
+  unchanged" therefore describes the gate, not an agent's own `scripts/test` runs.
+
 Pinned by `runner/internal/agentenv/agentenv_test.go` (one behavioral case per
-named branch), `TestAgentEnvNotNarrowerThanGateEnv` (the gate-env lockstep),
-and `TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials` (the
+named branch, including `TestEnv_GOFLAGSTrimpathOverlay`, one subtest per merge
+mode), `runner/internal/agentenv/cachereuse_test.go` (the real go toolchain over
+two directory paths and one isolated `GOCACHE`: `TestEnv_TrimpathSharesCompileEntriesAcrossWorktreePaths`
+and the safety pin `TestEnv_TrimpathDoesNotShareTestResultsAcrossPaths`),
+`TestAgentEnvNotNarrowerThanGateEnv` (the gate-env lockstep),
+`TestRun_ImplementStage_ChildEnvExcludesAmbientCredentials` (the
 cross-boundary end-to-end: main.go wiring → `BaseEnv` → the claudecode adapter's
-seed → a REAL child process that echoes its own environment).
+seed → a REAL child process that echoes its own environment, including the
+merged `GOFLAGS`) and `TestConflictResolutionSpawnMergesTrimpathIntoGOFLAGS`
+(the same through the conflict-resolution call site).
 
 ## PR-open checkpoint resume (E48.46 / #2169)
 
