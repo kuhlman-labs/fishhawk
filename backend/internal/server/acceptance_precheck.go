@@ -116,6 +116,11 @@ const (
 	// unrecognised Rule as a generic `- FINDING <rule>: <detail>` line — so no
 	// per-rule prompt wiring is needed and none is added.
 	acceptanceRuleBlockingCriterionUndecided = plan.RuleBlockingCriterionUndecided
+	// E72.63 (#4095). Like the E68.28 rule above it DELIBERATELY carries no
+	// per-rule payload field: the finding rides Findings into the
+	// plan_acceptance_precheck payload and renders as a generic FINDING line in
+	// the plan-review gate evidence, so no prompt wiring is needed.
+	acceptanceRuleCriterionRequiresDatabase = plan.RuleCriterionRequiresDatabase
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -135,7 +140,10 @@ const (
 // verify_hint, which names no test and no observable surface that decides it.
 // That rule adds NO payload field — it rides the existing Findings array into
 // both the audit payload and the plan-review prompt's gate evidence, where an
-// unrecognised Rule renders as a generic FINDING line.
+// unrecognised Rule renders as a generic FINDING line. Since E72.63 / #4095 the
+// advisory criterion_requires_database rule (a verify_hint naming a
+// database/container-backed check the acceptance sandbox cannot run) rides the
+// same Findings array the same way.
 //
 // Stage-conditional: the pre-check runs ONLY when the run's workflow
 // configures an acceptance stage (resolveAcceptanceStage returns ok). A

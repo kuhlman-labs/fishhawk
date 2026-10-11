@@ -3325,3 +3325,157 @@ func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_IntakeInert(t *te
 			RuleBlockingCriterionUndecided, EvaluateAcceptanceCriteria(planShaped))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.63 / #4095 — criterion_requires_database
+// ---------------------------------------------------------------------------
+
+// databaseHint4094 is a pgtest-only verify_hint in the #4094 shape that names
+// its database dependency, the shape this rule catches at plan time.
+const databaseHint4094 = "Repository-local harness: TestAlertTrigger_Dedup (pgtest-backed)"
+
+// TestDatabaseBackedCriteria is the rule's table. It filters EvaluateAcceptanceCriteria's
+// findings by Rule == criterion_requires_database, so a co-firing
+// criterion_restates_test on the same hint cannot mask an assertion.
+//
+// Each silent row isolates ONE suppressor: the two declared rows carry no
+// surface and no negator (only the declaration exemption clears them), the
+// surface row carries an un-negated marker and no declaration (only the
+// surface check clears it), and the negated row carries no surface and no
+// declaration (only the polarity scan clears it). The env-var row is the only
+// firing row whose sole marker also contains a surface substring
+// ("fishhawk_"), so only the FISHHAWK_TEST_PG_URL mask keeps it firing.
+//
+// COUNTERFACTUALS (run, observed, restored — see the PR notes): (m) the rule
+// body returns an empty slice -> every firing row RED; (n) delete the
+// criterionDeclaresUnevaluable skip -> the two declared rows RED; (o) delete the
+// observable-surface suppression -> the surface row RED; (p) replace
+// anyUnnegatedOccurrence with plain containment -> the negated row RED; delete
+// the FISHHAWK_TEST_PG_URL surface mask -> the env-var row RED.
+func TestDatabaseBackedCriteria(t *testing.T) {
+	declared := func(c *AcceptanceCriterion) {
+		c.SkipExpected = true
+		c.ExpectationBasis = "the committed-tree verify gate runs TestAlertTrigger_Dedup against a runner-provisioned Postgres"
+	}
+	for _, tc := range []struct {
+		name string
+		hint string
+		mut  func(*AcceptanceCriterion)
+		want bool // want a criterion_requires_database finding
+	}{
+		// MUST FIRE.
+		{name: "pgtest-backed harness (#4094 shape)", hint: databaseHint4094, want: true},
+		{name: "_pg_test.go path", hint: "backend/internal/server/foo_pg_test.go", want: true},
+		{name: "testcontainers Postgres", hint: "testcontainers Postgres", want: true},
+		{name: "FISHHAWK_TEST_PG_URL env var", hint: "FISHHAWK_TEST_PG_URL", want: true},
+		{name: "docker run", hint: "docker run postgres", want: true},
+
+		// MUST NOT FIRE.
+		{name: "declared skip_expected with basis", hint: databaseHint4094, mut: declared, want: false},
+		{
+			name: "declared requires_live_validation + skip_expected with basis",
+			hint: databaseHint4094,
+			mut: func(c *AcceptanceCriterion) {
+				declared(c)
+				c.RequiresLiveValidation = true
+			},
+			want: false,
+		},
+		{name: "observable surface named", hint: "GET /v0/runs/{run_id}/audit shows X; also pgtest TestY", want: false},
+		{name: "negated marker", hint: "no database needed, not a pgtest test", want: false},
+		{name: "empty hint", hint: "", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := hintCriterion("c1", tc.hint)
+			if tc.mut != nil {
+				tc.mut(&c)
+			}
+			findings := EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{c}})
+			got := countFindings(findings, RuleCriterionRequiresDatabase, "c1")
+			if tc.want && got != 1 {
+				t.Fatalf("want exactly 1 %s for c1; got %d in %+v", RuleCriterionRequiresDatabase, got, findings)
+			}
+			if !tc.want && got != 0 {
+				t.Fatalf("want NO %s for c1; got %d in %+v", RuleCriterionRequiresDatabase, got, findings)
+			}
+		})
+	}
+}
+
+// The finding's Detail names the runtime cause token and BOTH remedies, and
+// states it is advisory — the contract the plan reviewer reads.
+func TestDatabaseBackedCriteria_DetailNamesCauseAndRemedies(t *testing.T) {
+	findings := DatabaseBackedCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", databaseHint4094)}})
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1", findings)
+	}
+	if findings[0].Rule != "criterion_requires_database" {
+		t.Errorf("Rule = %q, want criterion_requires_database", findings[0].Rule)
+	}
+	for _, want := range []string{
+		UndecidableCauseSandboxDeniedDB,
+		"preview target's ports",
+		"Name the preview surface",
+		"skip_expected: true",
+		"committed-tree verify gate",
+		"never refuses the plan",
+	} {
+		if !strings.Contains(findings[0].Detail, want) {
+			t.Errorf("Detail %q must name %q", findings[0].Detail, want)
+		}
+	}
+}
+
+// DatabaseBackedCriteria returns a NON-NIL empty slice when nothing is flagged,
+// and findings come out in criteria order past an exempt criterion.
+func TestDatabaseBackedCriteria_NonNilAndCriteriaOrder(t *testing.T) {
+	if got := DatabaseBackedCriteria(Verification{}); got == nil || len(got) != 0 {
+		t.Fatalf("want non-nil empty slice; got %#v", got)
+	}
+	got := DatabaseBackedCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		hintCriterion("first", "psql -c 'select 1'"),
+		hintCriterion("middle", "GET /v0/runs/{run_id} returns 200"),
+		hintCriterion("third", "docker exec fishhawk-test-postgres pg_isready"),
+	}})
+	var ids []string
+	for _, f := range got {
+		ids = append(ids, f.CriterionID)
+	}
+	if !slices.Equal(ids, []string{"first", "third"}) {
+		t.Fatalf("flagged ids = %v, want [first third] in criteria order", ids)
+	}
+}
+
+// TestEvaluateAcceptanceCriteria_CarriesRequiresDatabase pins that the SHARED
+// evaluator — the one both the plan gate and refinement intake dispatch
+// through — carries the rule, not only the exported matcher.
+//
+// COUNTERFACTUAL (q): delete the DatabaseBackedCriteria append in
+// EvaluateAcceptanceCriteria -> RED.
+func TestEvaluateAcceptanceCriteria_CarriesRequiresDatabase(t *testing.T) {
+	findings := EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("db1", databaseHint4094)}})
+	f := findingFor(findings, RuleCriterionRequiresDatabase)
+	if f == nil {
+		t.Fatalf("EvaluateAcceptanceCriteria must carry %s for a pgtest-only hint; got %+v", RuleCriterionRequiresDatabase, findings)
+	}
+	if f.CriterionID != "db1" {
+		t.Errorf("CriterionID = %q, want db1", f.CriterionID)
+	}
+	// No cross-rule suppression: the same hint still draws criterion_restates_test.
+	if findingFor(findings, RuleCriterionRestatesTest) == nil {
+		t.Errorf("a pgtest-only hint must ALSO draw %s (the rules do not suppress each other); got %+v",
+			RuleCriterionRestatesTest, findings)
+	}
+}
+
+// The INTAKE shape (refinement.EvaluateDraftCriteria's mapping: no source, no
+// verify_hint) draws no criterion_requires_database — inert by construction,
+// because the rule reads verify_hint alone.
+func TestEvaluateAcceptanceCriteria_RequiresDatabase_IntakeInert(t *testing.T) {
+	const text = "the pgtest-backed dedup test passes against Postgres in docker"
+	intake := Verification{AcceptanceCriteria: []AcceptanceCriterion{{ID: text, Statement: text}}}
+	if f := findingFor(EvaluateAcceptanceCriteria(intake), RuleCriterionRequiresDatabase); f != nil {
+		t.Fatalf("a draft carries no verify_hint, so a database-naming STATEMENT must not fire %s; got %+v",
+			RuleCriterionRequiresDatabase, *f)
+	}
+}

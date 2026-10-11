@@ -1687,3 +1687,79 @@ func TestAcceptancePrecheck_BlockingCriterionUndecided_NegativeTwin(t *testing.T
 		t.Errorf("rendered plan_review prompt must not name the rule for a criterion naming its deciding surface:\n%s", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.63 / #4095 — criterion_requires_database, CROSS-LAYER seam
+// ---------------------------------------------------------------------------
+
+// TestAcceptancePrecheck_CriterionRequiresDatabase is the CROSS-BOUNDARY test for
+// the database-backed-hint advisory: an uploaded plan whose BLOCKING criterion
+// carries a pgtest-only verify_hint must reach the PERSISTED
+// plan_acceptance_precheck payload with a criterion_requires_database finding
+// for that criterion id, and the rendered plan-review gate evidence must carry
+// it as a generic FINDING line (no per-rule prompt wiring, like E68.28).
+//
+// The negative twin is the SAME criterion with skip_expected + an
+// expectation_basis citing the committed-tree verify gate — the declaration
+// remedy the finding names — which must reach neither layer. Without it the
+// positive half would pass for a rule that fired on every pgtest hint.
+//
+// COUNTERFACTUAL (q): delete the DatabaseBackedCriteria append in
+// plan.EvaluateAcceptanceCriteria -> the positive half RED.
+func TestAcceptancePrecheck_CriterionRequiresDatabase(t *testing.T) {
+	const hint = "Repository-local harness: TestAlertTrigger_Dedup (pgtest-backed)"
+
+	t.Run("fires", func(t *testing.T) {
+		s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+		body := acceptancePlanBody(t, []map[string]any{
+			testOnlyCriterion("alert-dedup", "a duplicate alert trigger is suppressed", hint),
+		}, nil)
+
+		result := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+		if result == nil {
+			t.Fatal("want a non-nil pre-check result")
+		}
+		entry := lastAcceptancePrecheckEntry(t, au)
+		f := hasAcceptanceFinding(entry, acceptanceRuleCriterionRequiresDatabase)
+		if f == nil {
+			t.Fatalf("persisted plan_acceptance_precheck payload carries no %s finding; findings = %+v",
+				acceptanceRuleCriterionRequiresDatabase, entry.Findings)
+		}
+		if f.CriterionID != "alert-dedup" {
+			t.Errorf("finding CriterionID = %q, want alert-dedup", f.CriterionID)
+		}
+		if !strings.Contains(f.Detail, plan.UndecidableCauseSandboxDeniedDB) {
+			t.Errorf("persisted Detail must name the %s cause; got %q", plan.UndecidableCauseSandboxDeniedDB, f.Detail)
+		}
+
+		gateEv := planGateEvidence(nil, nil, nil, nil, result)
+		got, err := prompt.Build("plan_review", prompt.Trigger{
+			Repo:             "kuhlman-labs/example",
+			PlanGateEvidence: gateEv,
+		})
+		if err != nil {
+			t.Fatalf("prompt.Build: %v", err)
+		}
+		const wantLine = "- FINDING criterion_requires_database (criterion: alert-dedup): criterion verify_hint names a database- or container-backed check"
+		if !strings.Contains(got, wantLine) {
+			t.Errorf("rendered plan_review prompt missing %q:\n%s", wantLine, got)
+		}
+	})
+
+	t.Run("declared skip is exempt", func(t *testing.T) {
+		s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+		crit := testOnlyCriterion("alert-dedup", "a duplicate alert trigger is suppressed", hint)
+		crit["skip_expected"] = true
+		crit["expectation_basis"] = "the committed-tree verify gate runs TestAlertTrigger_Dedup against a runner-provisioned Postgres"
+		body := acceptancePlanBody(t, []map[string]any{crit}, nil)
+
+		result := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+		if result == nil {
+			t.Fatal("want a non-nil pre-check result")
+		}
+		entry := lastAcceptancePrecheckEntry(t, au)
+		if f := hasAcceptanceFinding(entry, acceptanceRuleCriterionRequiresDatabase); f != nil {
+			t.Fatalf("a declared skip must draw no %s finding; got %+v", acceptanceRuleCriterionRequiresDatabase, *f)
+		}
+	})
+}
