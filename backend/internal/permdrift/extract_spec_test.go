@@ -88,6 +88,10 @@ const (
 	fpKey   = "workflows.feature_change.stages.implement.forbidden_paths"
 	escKey  = `workflows.feature_change.escalations[{"paths":["a/**","b/**"]}]`
 	implKey = "workflows.feature_change.stages.implement"
+	aipKey  = implKey + ".agent_instruction_paths"
+	// aipFP is specDefaults' %FORBIDDEN% value; a row appending an
+	// agent_instruction_paths declaration after it keeps the globs unchanged.
+	aipFP = `[".github/workflows/**", ".fishhawk/**"]`
 )
 
 // TestExtractSpec covers the four workflows.yaml extractors.
@@ -113,6 +117,18 @@ func TestExtractSpec(t *testing.T) {
 		{"forbidden_paths entry added is a narrowing", ExtractSpecForbiddenPaths,
 			specDoc("%FORBIDDEN%", `[".github/workflows/**", ".fishhawk/**", "LICENSE"]`),
 			[]Change{{Key: fpKey + "[LICENSE]", Before: Absent, After: Present, Direction: Narrowed}}},
+		// The built-in agent-instruction-path constraint (E80.12 / #3942) is
+		// keyed from the RESOLVED default rule: the base implement stage
+		// declares nothing yet carries the restriction, so an opt-out is the
+		// restriction vanishing and an exemption is a new grant.
+		{"agent_instruction_paths opt-out is a widening", ExtractSpecForbiddenPaths,
+			specDoc("%FORBIDDEN%", aipFP+"\n          agent_instruction_paths:\n            enforce: false"),
+			[]Change{{Key: aipKey, Before: builtinEnforced, After: Absent, Direction: Widened}}},
+		{"agent_instruction_paths writable exemption added is a widening", ExtractSpecForbiddenPaths,
+			specDoc("%FORBIDDEN%", aipFP+"\n          agent_instruction_paths:\n            writable: [AGENTS.md]"),
+			[]Change{{Key: aipKey + ".writable[AGENTS.md]", Before: Absent, After: Present, Direction: Widened}}},
+		{"agent_instruction_paths enforce true restates the default", ExtractSpecForbiddenPaths,
+			specDoc("%FORBIDDEN%", aipFP+"\n          agent_instruction_paths:\n            enforce: true"), nil},
 		{"escalation max_autonomy raised", ExtractSpecEscalations,
 			specDoc("%ESCALATIONS%", "    escalations:\n      - match:\n          paths: [\"a/**\", \"b/**\"]\n        require:\n          max_autonomy: medium"),
 			[]Change{{Key: escKey + ".max_autonomy", Before: "low", After: "medium", Direction: Widened}}},
@@ -237,6 +253,37 @@ func TestExtractSpecAutonomy(t *testing.T) {
 // TestExtractSpec_ResolvesV2Reuse: a deriving workflow's inherited stage
 // carries the base's forbidden_paths through spec.ParseBytes' `extends`
 // resolution, so a glob removed from the BASE workflow widens BOTH.
+// TestExtractSpecForbiddenPaths_AgentInstructionPathsKeys pins which stages
+// carry the built-in key: only an implement stage the default rule enforces,
+// never the plan stage, and dropping a writable exemption is a narrowing.
+//
+// COUNTERFACTUAL: delete the Restriction emission and the "opt-out is a
+// widening" row of TestExtractSpec goes RED — the base declares nothing and
+// the head declares enforce:false, so neither side would carry an entry.
+func TestExtractSpecForbiddenPaths_AgentInstructionPathsKeys(t *testing.T) {
+	g, err := ExtractSpecForbiddenPaths([]byte(specDoc()))
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	want := Entry{Key: aipKey, Value: builtinEnforced, Rank: PresenceRank, Polarity: Restriction}
+	if got, ok := g[aipKey]; !ok || got != want {
+		t.Errorf("implement entry = %+v (present %v), want %+v", got, ok, want)
+	}
+	if _, ok := g["workflows.feature_change.stages.plan.agent_instruction_paths"]; ok {
+		t.Error("plan stage carries an agent_instruction_paths entry; the built-in is implement-only")
+	}
+
+	withExemption := specDoc("%FORBIDDEN%", aipFP+"\n          agent_instruction_paths:\n            writable: [AGENTS.md, CLAUDE.md]")
+	got := diffSpec(t, ExtractSpecForbiddenPaths, withExemption, specDoc())
+	wantChanges := []Change{
+		{Key: aipKey + ".writable[AGENTS.md]", Before: Present, After: Absent, Direction: Narrowed},
+		{Key: aipKey + ".writable[CLAUDE.md]", Before: Present, After: Absent, Direction: Narrowed},
+	}
+	if !reflect.DeepEqual(got, wantChanges) {
+		t.Fatalf("dropping exemptions =\n  %+v\nwant\n  %+v", got, wantChanges)
+	}
+}
+
 func TestExtractSpec_ResolvesV2Reuse(t *testing.T) {
 	doc := func(fp string) string {
 		return specDoc("%AUTONOMY%", "", "%ESCALATIONS%", "", "%FORBIDDEN%", fp) +

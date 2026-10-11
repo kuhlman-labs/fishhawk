@@ -4989,6 +4989,10 @@ func TestValidate_V2PostHocConstraintOffDiffProducingStage_Rejected(t *testing.T
 		{"allowed_paths", "          allowed_paths: [\"docs/**\"]\n"},
 		{"required_outcomes", "          required_outcomes: [\"ci_green\"]\n"},
 		{"diff_coverage", "          diff_coverage:\n            command: \"make cov\"\n            report_path: \"cov.info\"\n            min_new_line_coverage: 80\n"},
+		// E80.12 / #3942: the built-in's opt-out is a post-hoc kind too, so
+		// on an implement stage producing no pull_request the produced-
+		// artifact rule names it before its own implement-only rule runs.
+		{"agent_instruction_paths", "          agent_instruction_paths:\n            enforce: false\n"},
 	}
 	for _, k := range kinds {
 		t.Run(k.kind, func(t *testing.T) {

@@ -339,10 +339,13 @@ func TestDetect_ParseErrorAndAbsentSides(t *testing.T) {
 	if r := Detect(gha, absentSide, absentSide); !reflect.DeepEqual(r, Result{}) {
 		t.Errorf("both absent = %+v; want zero Result", r)
 	}
-	// A deleted forbidden_paths spec drops its restrictions: widenings.
+	// A deleted forbidden_paths spec drops its restrictions: widenings. Three,
+	// exactly: the two forbidden_paths globs plus the implement stage's
+	// built-in agent_instruction_paths restriction (E80.12 / #3942), which
+	// the stage carries by default without declaring anything.
 	fp := MatchSurfaces(DefaultSurfaces(), ".fishhawk/workflows.yaml")[0]
-	if r := Detect(fp, side(specDoc()), absentSide); len(r.Widened) != 2 {
-		t.Errorf("deleted spec = %+v; want two forbidden_paths widenings", r)
+	if r := Detect(fp, side(specDoc()), absentSide); len(r.Widened) != 3 {
+		t.Errorf("deleted spec = %+v; want two forbidden_paths widenings plus the agent_instruction_paths restriction", r)
 	}
 	if r := Detect(Surface{ID: "x", Kind: "nope"}, side("a"), side("b")); r.Unevaluable != ReasonParseError {
 		t.Errorf("unknown kind = %+v; want parse_error", r)
