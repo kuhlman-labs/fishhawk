@@ -503,7 +503,7 @@ General reading: an `implement` stage **applies** the proposed change. Whether t
 - **Executor branches:** `agent` or `human`.
 - **Produces:** `pull_request` for a code change; nothing, for a stage whose effect is external.
 - **Reviewers:** the `reviewers` block has runtime effect here — the implement-review loop reuses the same config and the same ADR-027 authority semantics as plan review.
-- **Constraints:** the post-hoc diff kinds bind here, and `diff_coverage` is valid on this type only.
+- **Constraints:** the post-hoc diff kinds bind here, and `diff_coverage` and `agent_instruction_paths` are valid on this type only. The built-in [agent-instruction-path constraint](#agent_instruction_paths) is on for every `implement` stage by default.
 
 ### `review` — gate
 
@@ -1019,6 +1019,7 @@ Evaluated **after** the stage runs, against the produced diff. A hit is a catego
 | `allowed_paths` | array of globs | Paths the diff may touch; mutually informative with `forbidden_paths`. |
 | `required_outcomes` | array of enum members | Outcomes that must hold — see below. |
 | `diff_coverage` | object | New-line coverage floor for the diff — see below. |
+| `agent_instruction_paths` | object | Opt-out from the built-in agent-instruction-path constraint, which is on by default — see below. |
 
 #### `required_outcomes`
 
@@ -1081,6 +1082,34 @@ LCOV is the format because it is the one per-line format every major ecosystem c
 
 **Absence of a measurement is a violation, not a pass.** The runner emits evidence whenever the constraint is configured, including the zero-new-lines case — an explicit zero is auditable, whereas silence is indistinguishable from a runner that failed to run. The added-line set is taken merge-base → the committed tree the command ran against, with the merge base pinned to a SHA before that tree is materialized so a `base_ref` naming the branch being committed onto cannot collapse the diff to empty. Two denominator exclusions are deliberate: an added line in a file the report never measured, and an added line the report measured no statement on. `diff_coverage` is valid on an **`implement` stage only** — the implement runner is the layer that measures, and an absent signal on a declared constraint is a violation, so declaring it elsewhere would be a guaranteed false failure. A coverage percentage credits execution, not assertion: a vacuous test still earns diff coverage.
 
+#### `agent_instruction_paths`
+
+Every `implement` stage carries a **built-in** constraint that no spec has to declare (E80.12 / #3942): its diff may not write an **agent-instruction path**. That is a file named `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md` or `CLAUDE.local.md` at any depth, or any path with a `.agents`, `.claude` or `.codex` directory component. Every comparison is case-insensitive, because a case-insensitive filesystem resolves `agents.md` or `.Claude/` to the file a coding-agent CLI loads. The list and the matcher live in one place, `backend/internal/agentpaths`, which the review sandbox also uses to skip these paths. A changed file counts by its path, and a rename (`R` row) also counts by its source path; a copy (`C` row) leaves its source untouched and counts only by its destination. A hit is a category-B failure named `agent_instruction_paths`.
+
+The built-in is **default-on at every major**. The `agent_instruction_paths` key only **relaxes** it, in exactly one of two forms:
+
+```yaml
+constraints:
+  agent_instruction_paths:
+    writable: [AGENTS.md]      # the exact root file stays writable; agents.md and docs/AGENTS.md do not
+
+constraints:
+  agent_instruction_paths:
+    enforce: false             # the built-in is off for this stage
+```
+
+- `writable` exempts **exact, case-sensitive** repo-relative paths. It takes no globs: the schema rejects `*`, `?`, `[`, `]`, `{`, `}`, `!` and a leading `/`. The validator additionally requires each entry to be canonical (`./AGENTS.md` and `docs/../AGENTS.md` are rejected), free of `..`, and itself an agent-instruction path, so an exemption can never reach past the class it relaxes.
+- `enforce: false` turns the built-in off for that stage. `enforce: true` restates the default. `enforce: false` together with `writable` is rejected by the schema as contradictory.
+- The key is valid on an **`implement` stage only**, because the built-in applies nowhere else. Like every post-hoc kind it also needs the `pull_request` artifact, so a non-diff-producing stage gets the [produced-artifact message](#post-hoc-constraints-bind-to-the-produced-artifact) first. A diff-producing stage typed other than `implement` gets `agent_instruction_paths is valid only on an implement stage`. A bad `writable` entry is reported at `/constraints/agent_instruction_paths/writable/<index>`.
+- **v0 and v1 cannot opt out.** Their frozen schemas do not declare the key, so a v0/v1 `implement` stage always carries the built-in, unrelaxed.
+
+Where it is enforced:
+
+- **The post-implement policy gate** (`policy_evaluated`) is the authority. It applies the built-in only when the run's cached spec resolves and names the stage. A run whose spec is unavailable, unparseable, or no longer names the workflow or stage gets a `policy_evaluated` row carrying a `skip_reason` (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, `stage_not_in_spec`) and no built-in protection.
+- **The plan-gate scope precheck** (`plan_scope_precheck`) applies the same rule to the plan's `scope.files`, as an advisory finding.
+- **The runner's in-line check** applies the same default only when it is given `--constraints-file` and `--check-base-ref`, and keys it on the stage type its `--fetch-prompt` response resolves. A local replay without `--fetch-prompt` resolves no stage type, so the runner check stays off there and the backend gate decides.
+- **Permission drift** reads an opt-out or a new `writable` entry as a widening of the stage's restrictions.
+
 ### Post-hoc constraints bind to the produced artifact
 
 Because the type names are general, **constraint validity keys on what a stage PRODUCES, not on its type name.** A stage carrying any post-hoc diff constraint must declare the `pull_request` artifact:
@@ -1118,7 +1147,7 @@ Declare produces: [{artifact: pull_request}] on this stage, or remove the constr
 Two orderings are contracts rather than accidents:
 
 - A **deploy** stage gets its own ADR-038 message (`post-hoc diff constraint is not valid on a deploy stage`), never this one.
-- A stage that does produce `pull_request` but is typed other than `implement` still gets the `diff_coverage is valid only on an implement stage` message.
+- A stage that does produce `pull_request` but is typed other than `implement` still gets the `diff_coverage is valid only on an implement stage` message, and likewise `agent_instruction_paths is valid only on an implement stage`.
 
 > **`fishhawk validate` does NOT report this binding.** This is a stage-BINDING rule (which produced artifact a constraint binds to), and the binding class stays backend-only — the CLI carries no typed decode and no autonomy resolver — so it surfaces **only server-side, at run creation**. `fishhawk validate` DOES now resolve stage references (duplicate ids, `needs`, `inputs[].from_stage`); only the binding class remains asymmetric (E52.13 / #2323).
 
@@ -1602,7 +1631,7 @@ reviewer_personas:
 | `persistence.target` | `originating_issue` \| `fishhawk_audit_log` | closed set |
 | `persistence.mode` | `rendered_comment` \| `canonical` | closed set |
 | `persistence.update_on_change` | `true` \| `false` | republish in place when the artifact is regenerated |
-| Constraint kind | `max_files_changed`, `forbidden_paths`, `allowed_paths`, `required_outcomes`, `diff_coverage`, `allowed_environments`, `change_freeze`, `required_upstream` | object keys; at least one |
+| Constraint kind | `max_files_changed`, `forbidden_paths`, `allowed_paths`, `required_outcomes`, `diff_coverage`, `agent_instruction_paths`, `allowed_environments`, `change_freeze`, `required_upstream` | object keys; at least one |
 | `required_outcomes` items | `tests_added_or_updated`, `ci_green`, `verification_reported` | closed set |
 | `required_upstream` items | `review_merged`, `ci_green` | closed set; deploy-only |
 | `diff_coverage.format` | `lcov` | only member |
@@ -1645,7 +1674,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - A stage producing `plan` declares `schema: standard_v1`.
 - A `deploy` stage uses `executor.delegate`; no other stage type may.
 - The `deployment` artifact and the three pre-flight constraint kinds are deploy-only; the `acceptance` artifact and the `egress` block are acceptance-only.
-- A post-hoc diff constraint requires the `pull_request` artifact; `diff_coverage` additionally requires stage type `implement`.
+- A post-hoc diff constraint requires the `pull_request` artifact; `diff_coverage` and `agent_instruction_paths` additionally require stage type `implement`, and each `agent_instruction_paths.writable` entry must be a canonical, `..`-free agent-instruction path (see [`agent_instruction_paths`](#agent_instruction_paths)).
 - A `deployment` **input** is valid only on an `acceptance` stage, its `from_stage` must name a `deploy` stage whose `allowed_environments` does not include `production`, and the consuming stage must declare an egress allowance (see [Post-deploy acceptance](#post-deploy-acceptance-acceptance-after-deploy)).
 - `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`, `milestone`) may not be `auto`.
 - An `agent_version` range parses as a comparator list.
@@ -1655,7 +1684,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` — and its `decision_record.index`, when declared — is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), the post-deploy acceptance `deployment`-input bindings (E35.1 / #1598), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), the `agent_instruction_paths` implement-only and `writable`-entry rules (E80.12 / #3942), the post-deploy acceptance `deployment`-input bindings (E35.1 / #1598), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 

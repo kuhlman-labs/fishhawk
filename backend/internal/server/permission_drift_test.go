@@ -1815,8 +1815,13 @@ func TestPermissionDrift_ConflictIntersectAbsentBaseBranchSide(t *testing.T) {
 	t.Run("restriction file deleted on the base branch raises its restrictions", func(t *testing.T) {
 		f := conflict(t, "main", both, "", "")
 		rows := f.rows(t)
-		if len(rows) != 2 || rowWithKey(rows, removedKey) == nil || rowWithKey(rows, secretsKey) == nil {
-			t.Errorf("rows = %+v, want both forbidden_paths restrictions raised", rows)
+		// Exactly three: both forbidden_paths globs plus the implement stage's
+		// default-on built-in agent_instruction_paths restriction (E80.12 /
+		// #3942), which the deleted spec carried without declaring it.
+		aipKey := permdrift.CheckKey(permdrift.SurfaceIDForbiddenPaths, driftSpecRef,
+			"workflows.feature_change.stages.implement.agent_instruction_paths", permdrift.Absent)
+		if len(rows) != 3 || rowWithKey(rows, removedKey) == nil || rowWithKey(rows, secretsKey) == nil || rowWithKey(rows, aipKey) == nil {
+			t.Errorf("rows = %+v, want both forbidden_paths restrictions and the agent_instruction_paths restriction raised", rows)
 		}
 	})
 }

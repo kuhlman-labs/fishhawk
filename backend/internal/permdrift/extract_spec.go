@@ -54,10 +54,26 @@ func stagePrefix(wf string, st spec.Stage) string {
 	return "workflows." + wf + ".stages." + st.ID
 }
 
+// builtinEnforced is the Value of a stage's built-in agent-instruction-path
+// presence Restriction.
+const builtinEnforced = "enforced (built-in default)"
+
 // ExtractSpecForbiddenPaths keys every stage constraint's forbidden_paths
 // glob as `workflows.<wf>.stages.<stage>.forbidden_paths[<glob>]`, a presence
 // Restriction keyed by the glob VALUE — so reordering the list is no change,
 // and removing a glob is a widening.
+//
+// It also keys the built-in agent-instruction-path constraint (E80.12 /
+// #3942) from the RESOLVED default rule, spec.Stage.AgentInstructionPathsRule,
+// never from the raw opt-out key — so an implement stage that declares
+// nothing still carries the restriction:
+//
+//   - `...stages.<stage>.agent_instruction_paths`: presence Restriction on
+//     every stage the rule enforces, so an `enforce: false` opt-out (or a
+//     stage's removal) is a widening;
+//   - `...stages.<stage>.agent_instruction_paths.writable[<path>]`: presence
+//     Grant per exempted path, so adding an exemption is a widening and
+//     dropping one a narrowing.
 func ExtractSpecForbiddenPaths(content []byte) (Grants, error) {
 	out := Grants{}
 	s, err := parseSpec(content)
@@ -74,6 +90,13 @@ func ExtractSpecForbiddenPaths(content []byte) (Grants, error) {
 						Rank:     PresenceRank,
 						Polarity: Restriction,
 					})
+				}
+			}
+			if enforced, writable := st.AgentInstructionPathsRule(); enforced {
+				k := stagePrefix(wf, st) + ".agent_instruction_paths"
+				out.Put(Entry{Key: k, Value: builtinEnforced, Rank: PresenceRank, Polarity: Restriction})
+				for _, w := range writable {
+					out.Put(Entry{Key: k + ".writable[" + w + "]", Value: Present, Rank: PresenceRank, Polarity: Grant})
 				}
 			}
 		}

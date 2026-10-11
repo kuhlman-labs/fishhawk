@@ -96,9 +96,10 @@ const (
 // (backend/internal/server/policy_reeval.go). OldPath (#2398) is carried
 // to keep that mirror intact; it is additive and `omitempty`, so a
 // non-rename diff's payload is byte-identical to before the field existed
-// and older audit rows decode to an empty OldPath. It is informational to
-// the policy engine (no check reads it), so re-eval verdicts are
-// unchanged whether or not it round-trips.
+// and older audit rows decode to an empty OldPath. The built-in
+// agent_instruction_paths check (E80.12 / #3942) reads an R row's OldPath,
+// so it MUST round-trip for the post-CI re-eval to reproduce that check's
+// verdict; every other check ignores it.
 type DiffEntry struct {
 	Path    string `json:"path"`
 	Status  Status `json:"status"`
@@ -174,6 +175,14 @@ func EmitEvaluation(
 //
 // Returns nil on success. Passed=true on the payload so downstream
 // gates don't treat the skip as a violation.
+//
+// A skip evaluates NOTHING, the built-in agent_instruction_paths
+// constraint (E80.12 / #3942) included: that constraint is resolved from
+// the stage's cached spec, so it applies only when the spec resolves. A
+// stage skipped as SkipSpecUnavailable, SkipSpecUnparseable,
+// SkipWorkflowNotInSpec or SkipStageNotInSpec gets no built-in protection
+// from this gate, and neither does a SkipNoDiffInBundle stage (there is no
+// diff to check).
 func EmitEvaluationSkipped(
 	ctx context.Context,
 	repo audit.Repository,

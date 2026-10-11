@@ -5,6 +5,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/agentpaths"
 )
 
 // Validate runs the semantic checks that the JSON Schema can't
@@ -54,6 +56,13 @@ import (
 //     pull_request artifact. The stage TYPES are general (plan / implement /
 //     review read as propose / apply / gate, ADR-067 §2), so validity binds to
 //     what a stage produces, not to its name. v0/v1 keep the type-keyed rule.
+//   - agent_instruction_paths binding (E80.12 / #3942): the opt-out from the
+//     built-in agent-instruction-path constraint is valid only on an
+//     implement stage, and each writable entry must be a canonical,
+//     repo-relative agent-instruction path (validateAgentInstructionPaths).
+//     Runs after the produced-artifact rule, alongside the #1888
+//     diff_coverage block. v2-only in practice — no v0/v1 schema declares
+//     the key.
 //   - egress / permissions declaration binding (ADR-050 / #1532; generalized
 //     E53.5 / #2228): BELOW major 2 an `egress` allowance is acceptance-stage-
 //     only (frozen). AT major >= 2 an `egress` allowance (equivalently the
@@ -237,8 +246,8 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		// constraints (allowed_environments, change_freeze,
 		// required_upstream) are valid ONLY on a deploy stage; the
 		// post-hoc diff constraints (max_files_changed, forbidden_paths,
-		// allowed_paths, required_outcomes, diff_coverage) are meaningless
-		// for a delegating deploy. Presence of change_freeze is detected via
+		// allowed_paths, required_outcomes, diff_coverage,
+		// agent_instruction_paths) are meaningless for a delegating deploy. Presence of change_freeze is detected via
 		// the *bool pointer, so `{change_freeze: false}` on a non-deploy
 		// stage is correctly rejected; diff_coverage presence (#1888) is
 		// detected the same way, so it is rejected on a deploy stage
@@ -273,7 +282,10 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		//     message rather than the narrower diff_coverage one.
 		//  3. The #1888 diff_coverage block runs LAST, staying reachable at v2
 		//     for a stage that DOES produce pull_request but is typed other
-		//     than implement.
+		//     than implement. The E80.12 / #3942 agent_instruction_paths block
+		//     (validateAgentInstructionPaths) shares that last position for the
+		//     same reason: its implement-only message is reachable only on a
+		//     diff-producing stage typed other than implement.
 		//
 		// VERSION GATE: the produced-artifact rule fires only at major >= 2.
 		// v0/v1 documents legitimately declare post-hoc constraints on an
@@ -340,6 +352,12 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 						Path:    stagePath(i, dcPath+"/report_path"),
 						Message: err.Error(),
 					}
+				}
+			}
+			if c.AgentInstructionPaths != nil {
+				if err := validateAgentInstructionPaths(stage, major, j, c.AgentInstructionPaths); err != nil {
+					err.Path = stagePath(i, err.Path)
+					return err
 				}
 			}
 		}
@@ -885,6 +903,75 @@ func validateAppliesTo(name string, wf *Workflow) error {
 		}
 	}
 	return nil
+}
+
+// agentInstructionPathsKind is the constraint kind name the E80.12 / #3942
+// rules report under.
+const agentInstructionPathsKind = "agent_instruction_paths"
+
+// validateAgentInstructionPaths enforces the two stage-binding rules the JSON
+// Schema cannot express for a declared agent_instruction_paths opt-out
+// (E80.12 / #3942). It returns a ValidationError whose Path is RELATIVE to the
+// stage (the caller prefixes stagePath), so the reported location is
+// `/constraints/agent_instruction_paths[/writable/<k>]` at v2.
+//
+//  1. The key is valid only on an implement stage. The built-in it relaxes
+//     applies only there (Stage.AgentInstructionPathsRule), so an opt-out on
+//     any other stage would relax nothing and read as a control that does
+//     something.
+//  2. Each writable entry must be an EXACT, canonical repo-relative path that
+//     is itself an agent-instruction path: not absolute, no `..` component,
+//     equal to its own path.Clean, and an agentpaths.IsInstructionPath match.
+//     The schema's pattern already rejects glob metacharacters and a leading
+//     `/`; it cannot express cleanliness, `..` or class membership. An entry
+//     outside the class would exempt nothing and so is a misconfiguration,
+//     and a non-canonical spelling (`./AGENTS.md`) would never equal a diff
+//     path under the case-sensitive exact match the gate applies.
+//
+// Both rules are backend-only, like the other stage-binding rules (#2323):
+// `fishhawk validate` enforces only the schema half.
+func validateAgentInstructionPaths(stage Stage, major, idx int, aip *AgentInstructionPathsConstraint) *ValidationError {
+	base := constraintPath(major, idx, agentInstructionPathsKind)
+	if major < 2 {
+		base += "/" + agentInstructionPathsKind
+	}
+	if stage.Type != StageTypeImplement {
+		return &ValidationError{
+			Path:    base,
+			Message: fmt.Sprintf("agent_instruction_paths is valid only on an implement stage, not a %q stage (#3942): the built-in agent-instruction-path constraint applies only to implement stages, so an opt-out anywhere else relaxes nothing", stage.Type),
+		}
+	}
+	for k, w := range aip.Writable {
+		var reason string
+		switch {
+		case strings.HasPrefix(w, "/"):
+			reason = "must be repo-relative, not absolute"
+		case hasDotDotComponent(w):
+			reason = "must stay inside the repository (no `..` component)"
+		case path.Clean(w) != w:
+			reason = fmt.Sprintf("must be written in canonical form %q", path.Clean(w))
+		case !agentpaths.IsInstructionPath(w):
+			reason = "is not an agent-instruction path (an AGENTS.md / AGENTS.override.md / CLAUDE.md / CLAUDE.local.md file, or a path under .agents / .claude / .codex), so exempting it relaxes nothing"
+		default:
+			continue
+		}
+		return &ValidationError{
+			Path:    base + "/writable/" + strconv.Itoa(k),
+			Message: fmt.Sprintf("agent_instruction_paths.writable entry %q %s (#3942): each entry is an exact, case-sensitive repo-relative path", w, reason),
+		}
+	}
+	return nil
+}
+
+// hasDotDotComponent reports whether a forward-slash path has a `..`
+// component anywhere.
+func hasDotDotComponent(p string) bool {
+	for _, part := range strings.Split(p, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // validRepoRelativePath rejects a path that does not name a location
