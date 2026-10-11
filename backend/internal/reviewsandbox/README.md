@@ -116,7 +116,13 @@ local-only `rev-parse` silently degraded every such review to diff-only.
   and counted (`Stats.Symlinks`) — a symlink could point outside the tree and a
   link misrepresents the commit.
 - **agent-instruction files (C1)**: SKIPPED and counted (`Stats.Instructions`).
-  Enumerated against both CLIs' documented discovery: `AGENTS.md` and
+  The predicate is `agentpaths.IsInstructionPath`
+  ([`backend/internal/agentpaths`](../agentpaths/README.md)), the ONE canonical
+  list the built-in `agent_instruction_paths` constraint also reads (#3942), so
+  the sandbox skip and the implement gate cannot disagree;
+  `TestExtractTar_SkipsSharedFixtureProbes` drives every probe of the shared
+  fixture `testdata/policy/agent-instruction-classes.json` through the
+  extractor. Enumerated against both CLIs' documented discovery: `AGENTS.md` and
   `AGENTS.override.md` (codex — the `.override.` variant is codex's local-only
   override, checked BEFORE `AGENTS.md` at each directory level, so it loads as an
   instruction exactly like `AGENTS.md`; its omission was the reopened C1 bypass

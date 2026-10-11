@@ -1,6 +1,6 @@
 # runner/internal/constraint
 
-Workflow-spec constraint evaluator (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`) — the runner-side copy, giving the agent immediate in-band feedback. `backend/internal/policy/` is the backend-side source of truth, which emits the chained `policy_evaluated` audit entry.
+Workflow-spec constraint evaluator (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`, and the built-in `agent_instruction_paths`) — the runner-side copy, giving the agent immediate in-band feedback. `backend/internal/policy/` is the backend-side source of truth, which emits the chained `policy_evaluated` audit entry.
 
 ## Trace-ingest wiring
 
@@ -16,7 +16,7 @@ Pre-#296 the form was `<base>...HEAD`, which only saw committed state; agents le
 
 ## Rename/copy source capture (#2398)
 
-`git diff --name-status` is a **porcelain** command, so rename detection is **ON by default** (`diff.renames` defaults to true since git 2.9): a moved file is reported as a single `R<score>` record — git does NOT emit a separate `D` + `A` pair, and the source path appears nowhere else in the event. `gitdiff.Parse` therefore records the source in `ChangedFile.OldPath` (populated only for `R`/`C` rows, empty for every ordinary row) and rides it onto the wire as the per-file `old_path` field. `OldPath` is **informational to the constraint engine** — no check function reads it, so `CountedFileCount`, forbidden-paths, and every other evaluator see byte-identical input and a rename stays ONE counted row on its destination `Path`. It exists so the backend's scope-provenance evidence can tell that a declared-deleted path was realized as the source side of a move rather than left untouched (which manufactured a spurious `evidence_conflict` on run 933cd6ee / PR #2397).
+`git diff --name-status` is a **porcelain** command, so rename detection is **ON by default** (`diff.renames` defaults to true since git 2.9): a moved file is reported as a single `R<score>` record — git does NOT emit a separate `D` + `A` pair, and the source path appears nowhere else in the event. `gitdiff.Parse` therefore records the source in `ChangedFile.OldPath` (populated only for `R`/`C` rows, empty for every ordinary row) and rides it onto the wire as the per-file `old_path` field. Exactly **one** check reads `OldPath`: the built-in `agent_instruction_paths` (#3942, below) treats an `R` row's source as a candidate, because a rename moves an instruction file away; a `C` row's source is untouched and never a candidate. `CountedFileCount`, forbidden-paths, and every other evaluator see byte-identical input and a rename stays ONE counted row on its destination `Path`. `OldPath` also exists so the backend's scope-provenance evidence can tell that a declared-deleted path was realized as the source side of a move rather than left untouched (which manufactured a spurious `evidence_conflict` on run 933cd6ee / PR #2397).
 
 ## Patch payload (#585)
 
@@ -57,6 +57,15 @@ The allowlist fails open: an unrecognized source language reads as no-testable-c
 `max_files_changed` counts only files that are NOT generated or vendored: `IsGeneratedPath` exempts sqlc-generated db packages (a `.go` file under a `db/` directory) and vendored dependencies (anything under `vendor/`). `CountedFileCount` returns the un-exempted count, and `checkMaxFiles` compares that (and reports it in the violation `Detail`) against the cap — so a diff of 5 hand-written files plus a regenerated `db/queries.sql.go` counts as 5, not 6.
 
 The db exemption mirrors CI's coverage exclusion (`scripts/check-coverage.py --exclude '/db/'`), narrowed to `.go` files. Only `max_files_changed` is affected — `forbidden_paths`/`allowed_paths` still match the full file set, so a generated file under a forbidden glob is still a violation. No `vendor/` directory exists in the repo today; that branch is forward-looking and exercised only by unit tests.
+
+## Built-in `agent_instruction_paths` (E80.12 / #3942)
+
+Every implement stage forbids writing an agent-instruction path by default: any path with a `.agents`, `.claude` or `.codex` component, or whose basename is `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md` or `CLAUDE.local.md`, at any depth and in any letter case. `agentpaths.go` is the runner twin of `backend/internal/agentpaths` (the module cannot import backend); `TestAgentPathsMatchSharedFixture` pins both lists to the shared fixture `testdata/policy/agent-instruction-classes.json` and the fixture's `match` / `no_match` probes are driven through `Evaluate`. Change the twin, the backend package and the fixture together.
+
+- **Shape.** `Constraints.AgentInstructionPaths` (`*AgentInstructionPaths`, the only json-tagged field: `agent_instruction_paths`) carries `enforce` and `writable`. nil means not applied; `{"enforce": false}` opts the stage out; `writable` lists EXACT, case-sensitive repo-relative paths still writable (`AGENTS.md` exempts only the root file, never `agents.md` or `docs/AGENTS.md`).
+- **Check.** `checkAgentInstructionPaths` runs LAST in `Evaluate` and emits ONE `agent_instruction_paths` violation listing every offending path in diff order. A row's candidates are its `Path` and, on an `R` row only, its `OldPath`.
+- **Default.** `ApplyImplementDefaults(stageType, &c)` sets an empty, enforced config when `stageType == "implement"` and the file declared none; an explicit entry (including an opt-out) is kept. `enforceConstraints` in `runner/cmd/fishhawk-runner/main.go` calls it right after decoding the constraints file, keyed on the stage type the backend RESOLVED in the `--fetch-prompt` response, **never** `cfg.stage` (the `--stage` flag), so how a stage is invoked cannot switch the default on or off (`constraints_builtin_test.go`).
+- **Where it does not fire.** A local replay without `--fetch-prompt` leaves `stageType` empty, so the runner default does not apply there and the backend gate is authoritative. The runner's in-line check runs at all only when BOTH `--constraints-file` and `--check-base-ref` are passed; nothing in this repository passes `--constraints-file` today, so here the backend post-implement policy gate is the operative enforcement.
 
 ## Lockstep with the backend copy
 

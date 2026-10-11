@@ -1,0 +1,59 @@
+{
+  "_comment": "Shared fixture for the ONE agent-instruction-path definition (E80.12 / #3942): backend/internal/agentpaths (the canonical list, read by the review sandbox and the backend policy gate) and its twin runner/internal/constraint/agentpaths.go. Both modules' tests assert their Go lists equal config_dirs and instruction_files, and drive match (must be an instruction path) and no_match (must not) through the sandbox extractor and both constraint evaluators, so any divergence fails a test. Probes cover every dir and basename at the root, nested, and re-cased. Every path here is DATA ONLY: never create a file at one of them.",
+  "config_dirs": [
+    ".agents",
+    ".claude",
+    ".codex"
+  ],
+  "instruction_files": [
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md"
+  ],
+  "match": [
+    ".agents/skills/x/SKILL.md",
+    "backend/.agents/skills/x/SKILL.md",
+    ".Agents/skills/x/SKILL.md",
+    "docs/.AGENTS/skills/x/SKILL.md",
+    ".claude/settings.json",
+    "backend/.claude/skills/x/SKILL.md",
+    ".CLAUDE/settings.json",
+    "web/.Claude/commands/x.md",
+    ".codex/config.toml",
+    "runner/.codex/config.toml",
+    ".CODEX/config.toml",
+    "cli/.Codex/config.toml",
+    "AGENTS.md",
+    "backend/AGENTS.md",
+    "aGENTS.md",
+    "docs/agents.md",
+    "AGENTS.override.md",
+    "backend/internal/AGENTS.override.md",
+    "agents.OVERRIDE.md",
+    "backend/agents.OVERRIDE.md",
+    "CLAUDE.md",
+    "backend/CLAUDE.md",
+    "Claude.md",
+    "docs/claude.md",
+    "CLAUDE.local.md",
+    "web/src/CLAUDE.local.md",
+    "claude.LOCAL.md",
+    "web/claude.LOCAL.md"
+  ],
+  "no_match": [
+    "docs/README.md",
+    "backend/internal/agents/agents.go",
+    "docs/agents-guide.md",
+    "scripts/is-run-agent",
+    "scripts/test-is-run-agent",
+    ".claudeignore",
+    "web/.claudeignore",
+    "backend/.agentsrc/config.json",
+    "docs/my.agents/notes.md",
+    "docs/x.agents.md",
+    "docs/AGENTS.md.bak",
+    "docs/notes-CLAUDE.md",
+    "docs/notes.md"
+  ]
+}

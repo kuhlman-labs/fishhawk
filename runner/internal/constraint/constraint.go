@@ -1,6 +1,7 @@
 // Package constraint evaluates the closed set of workflow-spec
 // constraints (forbidden_paths, allowed_paths, max_files_changed,
-// required_outcomes) against a stage's actual output. Returns a
+// required_outcomes, and the built-in agent_instruction_paths)
+// against a stage's actual output. Returns a
 // list of violations; one or more violations means the stage failed
 // as category-B (constraint / policy violation) per MVP_SPEC §6.
 //
@@ -49,12 +50,14 @@ type ChangedFile struct {
 	// file `git diff --name-status` reports as an R (rename) or C (copy)
 	// row. Populated ONLY for R/C rows and empty for every ordinary row.
 	//
-	// It is INFORMATIONAL to the constraint engine: no check function
-	// reads it. CountedFileCount, forbidden-paths, allowed-paths, and
+	// Exactly ONE check reads it: agent_instruction_paths (#3942) treats
+	// an R row's OldPath as a candidate, because a rename moves an
+	// instruction file away (a C row's source is untouched and is never
+	// a candidate). CountedFileCount, forbidden-paths, allowed-paths, and
 	// every other evaluator see byte-identical input whether or not it is
 	// populated — a rename stays ONE counted row on its destination Path.
-	// It exists so downstream consumers (the backend's scope-provenance
-	// evidence, #2398) can tell that a declared-deleted path was realized
+	// It also lets downstream consumers (the backend's scope-provenance
+	// evidence, #2398) tell that a declared-deleted path was realized
 	// as the source side of a move rather than left untouched, because
 	// porcelain rename detection collapses the delete+create pair into a
 	// single R row that records only the destination.
@@ -122,6 +125,12 @@ type Constraints struct {
 	// The type is the local mirror, not an import: this package is
 	// deliberately dependency-free on the backend's policy package.
 	DiffCoverage *DiffCoverage
+	// AgentInstructionPaths is the built-in agent_instruction_paths
+	// constraint (#3942). nil means not applied; ApplyImplementDefaults
+	// sets an empty (enforced) value for an implement stage. The ONLY
+	// tagged field: the constraints file names it
+	// `agent_instruction_paths`, the workflow-spec key.
+	AgentInstructionPaths *AgentInstructionPaths `json:"agent_instruction_paths,omitempty"`
 }
 
 // DiffCoverage mirrors the spec's `diff_coverage` constraint for the
@@ -176,6 +185,9 @@ func Evaluate(diff Diff, c Constraints) []Violation {
 	}
 	if len(c.RequiredOutcomes) > 0 {
 		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen)...)
+	}
+	if c.AgentInstructionPaths.enforced() {
+		out = append(out, checkAgentInstructionPaths(diff, c.AgentInstructionPaths.Writable)...)
 	}
 
 	return out
