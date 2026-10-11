@@ -754,3 +754,23 @@ func TestKnownCategories_MergeCandidateVerify(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_MergeCandidateQueue pins the four E83.85 / #4200
+// (ADR-092) categories the merge-candidate held-pass queue writes
+// (server/merge_candidate_queue.go): held, admitted, re-anchored and settled.
+// An operator awaiting a hand-off arms fishhawk_await_audit on them, so an
+// unregistered category would make that wait unsatisfiable.
+//
+// Counterfactual: delete any one map entry — this test goes RED.
+func TestKnownCategories_MergeCandidateQueue(t *testing.T) {
+	for _, c := range []string{
+		"merge_candidate_queue_held",
+		"merge_candidate_queue_admitted",
+		"merge_candidate_queue_reanchored",
+		"merge_candidate_queue_settled",
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}

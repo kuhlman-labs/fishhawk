@@ -66,6 +66,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergeoutcome"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -2564,6 +2565,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// marker's slot store. Dropping this line reverts the marker to a bare
 		// CAS (no queue) without touching any other surface.
 		cfg.Concurrency = concurrency.NewPostgresStore(pool)
+		// ADR-092 held-pass queue (#4200): serializes merge-candidate verify
+		// passes per base. Dropping this line reverts to ADR-090's
+		// start-immediately behaviour without touching any other surface.
+		cfg.MergeQueue = mergequeue.NewPostgresStore(pool)
 		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
 		auditRepo, err := newAuditRepository(pool, logger)

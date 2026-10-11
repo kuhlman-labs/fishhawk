@@ -242,6 +242,12 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		stageID = &reviewStage.ID
 	}
 
+	// ADR-092 D4 (#4200): hand the base's merge-candidate line on BEFORE any
+	// review bookkeeping. A forge-side merge (or close) is a fact whatever
+	// the ADR-036 gate below decides, so a held implement review must never
+	// keep the next held pass waiting on a PR that already merged.
+	s.mergeCandidateQueueOnPRResolved(ctx, target.ID, merged)
+
 	if merged {
 		// ADR-036 (#876) implement-review / merge completion gate. When
 		// the run has a review stage AND a configured agent implement
