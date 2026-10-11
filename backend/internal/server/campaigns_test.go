@@ -10393,3 +10393,351 @@ func TestAttendHumanLedDetail_CapsEnumeration(t *testing.T) {
 		t.Errorf("single-item detail = %q, want singular \"1 human-led item remains: issue:1\"", one)
 	}
 }
+
+// --- native "blocked by" reads and legacy_text warnings (#4028) ---
+
+// fakeCampaignEpicProvider implements BOTH EpicChildrenQuerier and the
+// campaign-only CampaignEpicChildrenQuerier, returning DIFFERENT results from
+// each so a test can tell which one the campaign epic branch called.
+type fakeCampaignEpicProvider struct {
+	name           string
+	epicResult     *workmgmt.EpicChildrenResult
+	campaignResult *workmgmt.EpicChildrenResult
+	campaignErr    error
+	epicCalls      int
+	campaignCalls  int
+}
+
+func (f *fakeCampaignEpicProvider) Name() string { return f.name }
+
+func (f *fakeCampaignEpicProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	return &workmgmt.CreatedItem{Provider: f.name}, nil
+}
+
+func (f *fakeCampaignEpicProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.epicCalls++
+	return f.epicResult, nil
+}
+
+func (f *fakeCampaignEpicProvider) CampaignEpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.campaignCalls++
+	if f.campaignErr != nil {
+		return nil, f.campaignErr
+	}
+	return f.campaignResult, nil
+}
+
+func registerCampaignEpicProvider(t *testing.T, p *fakeCampaignEpicProvider) {
+	t.Helper()
+	if p.name == "" {
+		p.name = workmgmt.Default().Provider
+	}
+	workmgmt.Register(p)
+}
+
+// decodeErrorBody decodes a refusal's full error body (code, message, details).
+func decodeErrorBody(t *testing.T, w *httptest.ResponseRecorder) errorBody {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, w.Body.String())
+	}
+	return env.Error
+}
+
+// TestCampaignSource_NativeDependencyReadError_Refuses502Named is C13: a
+// native "blocked by" read failure on ANY campaign source path — the epic
+// branch through CampaignEpicChildren, the epic branch's EpicChildren
+// fallback, and the no-epic items branch — is the SAME 502
+// native_dependency_read_failed on BOTH create and preview, naming the issue
+// and the reason. COUNTERFACTUAL VEHICLE: delete the nativeDependencyReadRefusal
+// call in either branch of resolveCampaignSource and that branch's rows answer
+// epic_children_query_failed / issue_set_resolution_failed with no issue_ref.
+func TestCampaignSource_NativeDependencyReadError_Refuses502Named(t *testing.T) {
+	nativeErr := func(issue int, reason workmgmt.NativeDependencyReadReason) error {
+		return fmt.Errorf("workmgmt/github: resolve issue set: %w", &workmgmt.NativeDependencyReadError{
+			Issue: issue, Reason: reason, Cause: errors.New("upstream said no"),
+		})
+	}
+	sources := []struct {
+		name     string
+		register func(t *testing.T, err error)
+		body     string
+	}{
+		{"epic_campaign_capability", func(t *testing.T, err error) {
+			registerCampaignEpicProvider(t, &fakeCampaignEpicProvider{epicResult: smallDAG(), campaignErr: err})
+		}, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`},
+		{"epic_fallback", func(t *testing.T, err error) {
+			registerEpicProvider(t, &fakeEpicProvider{queryErr: err})
+		}, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`},
+		{"items", func(t *testing.T, err error) {
+			registerIssueSetProvider(t, &fakeIssueSetProvider{resolveErr: err})
+		}, `{"repo":"kuhlman-labs/fishhawk","items":["issue:1","issue:7"]}`},
+	}
+	verbs := []struct {
+		name string
+		post func(t *testing.T, s *Server, body string) *httptest.ResponseRecorder
+	}{
+		{"create", postCampaign},
+		{"preview", postPreview},
+	}
+	for _, src := range sources {
+		for _, verb := range verbs {
+			t.Run(src.name+"/"+verb.name, func(t *testing.T) {
+				src.register(t, nativeErr(7, workmgmt.NativeReadForbidden))
+				repo := newFakeCampaignRepo()
+				s := New(Config{CampaignRepo: repo})
+				w := verb.post(t, s, src.body)
+				if w.Code != http.StatusBadGateway {
+					t.Fatalf("status = %d, want 502 (body=%s)", w.Code, w.Body.String())
+				}
+				eb := decodeErrorBody(t, w)
+				if eb.Code != "native_dependency_read_failed" {
+					t.Fatalf("code = %q, want native_dependency_read_failed (body=%s)", eb.Code, w.Body.String())
+				}
+				if got := eb.Details["issue_ref"]; got != "issue:7" {
+					t.Errorf("details.issue_ref = %v, want issue:7", got)
+				}
+				if got := eb.Details["reason"]; got != "forbidden" {
+					t.Errorf("details.reason = %v, want forbidden", got)
+				}
+				if !strings.Contains(eb.Message, "issue #7") || !strings.Contains(eb.Message, "(forbidden)") {
+					t.Errorf("message = %q, want it to name issue #7 and (forbidden)", eb.Message)
+				}
+				// The raw cause stays in the server log: neither the internal
+				// cause key nor the upstream text reaches the 5xx wire.
+				if _, leaked := eb.Details[internalCauseKey]; leaked {
+					t.Errorf("details carry the internal cause key: %v", eb.Details)
+				}
+				if strings.Contains(w.Body.String(), "upstream said no") {
+					t.Errorf("response leaks the raw cause: %s", w.Body.String())
+				}
+				// A refused create persists nothing.
+				if all, _ := repo.ListCampaigns(context.Background(), campaign.ListCampaignsFilter{Limit: 10}); len(all) != 0 {
+					t.Errorf("campaigns persisted = %d, want 0", len(all))
+				}
+			})
+		}
+	}
+
+	// Issue 0 (the read could not be attempted at all): the reason still
+	// rides details, but no issue_ref is fabricated.
+	t.Run("unsupported_omits_issue_ref", func(t *testing.T) {
+		registerIssueSetProvider(t, &fakeIssueSetProvider{resolveErr: nativeErr(0, workmgmt.NativeReadUnsupported)})
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:1"]}`)
+		eb := decodeErrorBody(t, w)
+		if w.Code != http.StatusBadGateway || eb.Code != "native_dependency_read_failed" {
+			t.Fatalf("status/code = %d/%q, want 502 native_dependency_read_failed (body=%s)", w.Code, eb.Code, w.Body.String())
+		}
+		if _, ok := eb.Details["issue_ref"]; ok {
+			t.Errorf("details.issue_ref present for Issue 0: %v", eb.Details)
+		}
+		if eb.Details["reason"] != "unsupported" {
+			t.Errorf("details.reason = %v, want unsupported", eb.Details["reason"])
+		}
+		if strings.Contains(eb.Message, "issue #") {
+			t.Errorf("message = %q, names an issue for Issue 0", eb.Message)
+		}
+	})
+
+	// The typed timeout keeps precedence over the native arm on the no-epic
+	// branch: a timeout is answered 504 even when a native error is also
+	// wrapped in the chain.
+	t.Run("timeout_keeps_precedence", func(t *testing.T) {
+		timeout := &workmgmt.IssueSetResolutionTimeout{Resolved: 1, Total: 2}
+		registerIssueSetProvider(t, &fakeIssueSetProvider{resolveErr: errors.Join(timeout, nativeErr(7, workmgmt.NativeReadFailed))})
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+		w := postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:1","issue:7"]}`)
+		if w.Code != http.StatusGatewayTimeout {
+			t.Fatalf("status = %d, want 504 (body=%s)", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestNativeDependencyReadRefusal_Classification pins the helper's two
+// defensive arms: an error with no typed native failure is NOT classified
+// (the generic 502 stays), and a reason outside the known set falls back to
+// read_failed rather than shipping an unknown reason with an empty remedy.
+func TestNativeDependencyReadRefusal_Classification(t *testing.T) {
+	if r := nativeDependencyReadRefusal(errors.New("transport down")); r != nil {
+		t.Fatalf("plain error classified as native refusal: %+v", r)
+	}
+	r := nativeDependencyReadRefusal(&workmgmt.NativeDependencyReadError{Issue: 3, Reason: "mystery"})
+	if r == nil {
+		t.Fatal("typed native error not classified")
+	}
+	if r.Details["reason"] != "read_failed" {
+		t.Errorf("unknown reason mapped to %v, want read_failed", r.Details["reason"])
+	}
+	if !strings.Contains(r.Message, "(read_failed): ") || strings.HasSuffix(r.Message, ": ") {
+		t.Errorf("message = %q, want the read_failed remedy", r.Message)
+	}
+	for reason, remedy := range nativeDependencyReadRemedies {
+		got := nativeDependencyReadRefusal(&workmgmt.NativeDependencyReadError{Issue: 3, Reason: reason})
+		if got.Details["reason"] != string(reason) || !strings.HasSuffix(got.Message, remedy) {
+			t.Errorf("reason %q: details=%v message=%q, want its own remedy", reason, got.Details, got.Message)
+		}
+	}
+}
+
+// TestCampaignSource_EpicBranchPrefersCampaignEpicChildren is C14: on the
+// epic branch a provider implementing the campaign-only capability is asked
+// through CampaignEpicChildren (which carries the native edge), not
+// EpicChildren. COUNTERFACTUAL VEHICLE: call querier.EpicChildren
+// unconditionally and the preview collapses to ONE wave with no edge.
+func TestCampaignSource_EpicBranchPrefersCampaignEpicChildren(t *testing.T) {
+	children := []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}}
+	fp := &fakeCampaignEpicProvider{
+		epicResult: &workmgmt.EpicChildrenResult{Children: children},
+		campaignResult: &workmgmt.EpicChildrenResult{
+			Children: children,
+			Edges:    []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+		},
+	}
+	registerCampaignEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	rep := decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if rep.WaveCount == nil || *rep.WaveCount != 2 {
+		t.Fatalf("wave_count = %v, want 2 (the native edge 2->1 must order the waves)", rep.WaveCount)
+	}
+	want := []campaignPreviewEdge{{From: "issue:2", To: "issue:1", Source: "native"}}
+	if !reflect.DeepEqual(rep.Edges, want) {
+		t.Errorf("edges = %+v, want %+v", rep.Edges, want)
+	}
+	if fp.campaignCalls != 1 || fp.epicCalls != 0 {
+		t.Errorf("CampaignEpicChildren calls = %d, EpicChildren calls = %d; want 1 and 0", fp.campaignCalls, fp.epicCalls)
+	}
+
+	// Fallback: a provider with ONLY EpicChildren still assembles.
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	rep = decodePreview(t, postPreview(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if !rep.Valid || rep.WaveCount == nil || *rep.WaveCount != 2 {
+		t.Errorf("EpicChildren-only fallback: valid=%v wave_count=%v, want valid with 2 waves", rep.Valid, rep.WaveCount)
+	}
+}
+
+// legacyWarningResult is a three-item set where #3 relies on a legacy line
+// (an in-set edge 3->1 and a satisfied edge 3->51) while #2's edge 2->1 is
+// native.
+func legacyWarningResult() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}, {Number: 3, Title: "c"}},
+		Edges: []workmgmt.DependsEdge{
+			{From: 2, To: 1, Source: workmgmt.DependencySourceNative},
+			{From: 3, To: 1, Source: workmgmt.DependencySourceLegacyText},
+		},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 2, To: 50, State: "closed", StateReason: "completed", Source: workmgmt.DependencySourceNative},
+			{From: 3, To: 51, State: "closed", StateReason: "completed", Source: workmgmt.DependencySourceLegacyText},
+		},
+	}
+}
+
+// TestCreateCampaign_LegacyTextEdges_Warn is C15's create half: a create whose
+// set relies on a legacy_text edge is still 201 (never refused) and carries ONE
+// warning for the relying item; satisfied_dependencies carry each edge's
+// source. COUNTERFACTUAL VEHICLE: delete the resp.Warnings assignment in
+// handleCreateCampaign and the warnings assertion goes red.
+func TestCreateCampaign_LegacyTextEdges_Warn(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: legacyWarningResult()})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaignWithKey(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`, "legacy-warn-1")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a warning never refuses (body=%s)", w.Code, w.Body.String())
+	}
+	var resp campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly one (issue:3)", resp.Warnings)
+	}
+	got := resp.Warnings[0]
+	if got.IssueRef != "issue:3" || got.Code != "legacy_text_dependency" ||
+		!reflect.DeepEqual(got.Targets, []string{"issue:1", "issue:51"}) {
+		t.Errorf("warning = %+v, want issue:3 legacy_text_dependency targets [issue:1 issue:51]", got)
+	}
+	if !strings.Contains(got.Message, "issue #3") || !strings.Contains(got.Message, `native "blocked by" link`) {
+		t.Errorf("warning message = %q, want it to name issue #3 and the native-link remedy", got.Message)
+	}
+	sources := map[int]string{}
+	for _, sd := range resp.SatisfiedDependencies {
+		sources[sd.From] = sd.Source
+	}
+	if sources[2] != "native" || sources[3] != "legacy_text" {
+		t.Errorf("satisfied_dependencies sources = %v, want 2:native 3:legacy_text", sources)
+	}
+
+	// An idempotent replay carries no warnings (create-response-only, the
+	// satisfied_dependencies precedent).
+	replay := postCampaignWithKey(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`, "legacy-warn-1")
+	if replay.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200", replay.Code)
+	}
+	if strings.Contains(replay.Body.String(), `"warnings"`) {
+		t.Errorf("idempotent replay carries warnings: %s", replay.Body.String())
+	}
+
+	// A native-only set carries no warnings key at all.
+	registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 1, Title: "a"}, {Number: 2, Title: "b"}},
+		Edges:    []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+	}})
+	native := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if native.Code != http.StatusCreated {
+		t.Fatalf("native-only status = %d, want 201 (body=%s)", native.Code, native.Body.String())
+	}
+	if strings.Contains(native.Body.String(), `"warnings"`) {
+		t.Errorf("native-only create carries warnings: %s", native.Body.String())
+	}
+}
+
+// TestLegacyDependencyWarnings_EveryEdgeClass pins the helper's walk over all
+// three edge classes and its dedupe/sort rules directly: a legacy line whose
+// edge dangles (DroppedEdges) or was elided as satisfied still warns, an
+// unresolvable dropped target renders through TargetRef, targets are deduped
+// and sorted, warnings are ordered by issue number, and a native edge never
+// warns.
+func TestLegacyDependencyWarnings_EveryEdgeClass(t *testing.T) {
+	if got := legacyDependencyWarnings(nil); got != nil {
+		t.Errorf("nil result = %+v, want nil", got)
+	}
+	res := &workmgmt.EpicChildrenResult{
+		Edges: []workmgmt.DependsEdge{
+			{From: 9, To: 1, Source: workmgmt.DependencySourceLegacyText},
+			{From: 4, To: 1, Source: workmgmt.DependencySourceNative},
+		},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 9, To: 1, Reason: workmgmt.DropNotChild, Source: workmgmt.DependencySourceLegacyText},
+			{From: 5, To: 0, Reason: workmgmt.DropTargetStateUnreadable, ToRef: "other/repo#12", ToRefDigest: "0123456789abcdef", Source: workmgmt.DependencySourceLegacyText},
+		},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{
+			{From: 9, To: 77, Source: workmgmt.DependencySourceLegacyText},
+			{From: 4, To: 78, Source: workmgmt.DependencySourceNative},
+		},
+	}
+	got := legacyDependencyWarnings(res)
+	if len(got) != 2 {
+		t.Fatalf("warnings = %+v, want two (issue:5, issue:9)", got)
+	}
+	if got[0].IssueRef != "issue:5" || got[1].IssueRef != "issue:9" {
+		t.Errorf("order = %s, %s; want issue:5 then issue:9", got[0].IssueRef, got[1].IssueRef)
+	}
+	if len(got[0].Targets) != 1 || !strings.HasPrefix(got[0].Targets[0], "unparsable:0123456789abcdef:") {
+		t.Errorf("issue:5 targets = %v, want the TargetRef rendering of the unresolvable ref", got[0].Targets)
+	}
+	if !reflect.DeepEqual(got[1].Targets, []string{"issue:1", "issue:77"}) {
+		t.Errorf("issue:9 targets = %v, want deduped sorted [issue:1 issue:77]", got[1].Targets)
+	}
+	nativeOnly := &workmgmt.EpicChildrenResult{
+		Edges:          []workmgmt.DependsEdge{{From: 2, To: 1, Source: workmgmt.DependencySourceNative}},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{{From: 2, To: 3, Source: workmgmt.DependencySourceNative}},
+		DroppedEdges:   []workmgmt.DependsEdge{{From: 2, To: 4, Source: workmgmt.DependencySourceNative}},
+	}
+	if w := legacyDependencyWarnings(nativeOnly); w != nil {
+		t.Errorf("native-only warnings = %+v, want nil", w)
+	}
+}
