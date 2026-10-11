@@ -2892,7 +2892,24 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	var disposition string
 	switch class {
 	case acceptanceClass1:
-		disposition = s.routeAcceptanceClass1(ctx, runID, stage, acc, criteria, criterionIDs, reason)
+		var deferral *acceptanceFixupDeferral
+		var deferReason string
+		disposition, deferral, deferReason = s.routeAcceptanceClass1(ctx, runID, stage, acc, criteria, criterionIDs, reason)
+		if deferral != nil {
+			// E72.58 / #4075: the fix-up waits for the in-flight implement
+			// review round. The entry carries the synthesized acceptance
+			// concerns; releaseDeferredAcceptanceFixup routes ONE pass when the
+			// round settles. Called once after the write to close the race in
+			// which the round settled (and its end-of-round hook found no
+			// deferral yet) between the in-flight read and this append; the
+			// release re-checks liveness, so it no-ops while the round runs.
+			fields := acceptanceTriageFields(runID, stage.ID, artifactID, class,
+				disposition, criterionIDs, acc.FailureMode, prior, deferReason, misses, nil)
+			fields["fixup_deferral"] = deferral
+			s.appendAcceptanceTriageDecided(ctx, runID, stage.ID, fields)
+			s.releaseDeferredAcceptanceFixup(ctx, runID)
+			return disposition
+		}
 	case acceptanceClass2:
 		disposition = s.routeAcceptanceClass2(ctx, runID, stage)
 	case acceptanceClass5:
@@ -2971,13 +2988,21 @@ func buildPlanReviewMisses(acc acceptanceBody, criteria []plan.AcceptanceCriteri
 // disposition: fixup_dispatched on success, fixup_unavailable_paged on ANY
 // routing refusal (implement stage not found, budget/ceiling exhausted, stage
 // not applicable) so the disposition always lands on the human at the cap.
-func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, criteria []plan.AcceptanceCriterion, criterionIDs []string, reason string) string {
+//
+// E72.58 / #4075: when the pass would be admitted, the run delegates
+// route_fixup, and the run's current implement review round is in flight in
+// this process, it routes NOTHING and returns fixup_deferred_review_in_flight
+// with a non-nil deferral (the synthesized concerns + the round anchor) and
+// the reason to record; the caller writes the entry and the round's settle
+// releases it (acceptance_fixup_deferral.go). A spent budget still degrades
+// to fixup_unavailable_paged immediately, so a page is never delayed.
+func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, criteria []plan.AcceptanceCriterion, criterionIDs []string, reason string) (string, *acceptanceFixupDeferral, string) {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"acceptance triage class-1: list stages failed; paging",
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-		return acceptanceDispositionFixupUnavailable
+		return acceptanceDispositionFixupUnavailable, nil, ""
 	}
 	var implement *run.Stage
 	for _, st := range stages {
@@ -2990,7 +3015,7 @@ func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, sta
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"acceptance triage class-1: no implement stage on run; paging",
 			slog.String("run_id", runID.String()))
-		return acceptanceDispositionFixupUnavailable
+		return acceptanceDispositionFixupUnavailable, nil, ""
 	}
 
 	selected := synthesizeAcceptanceConcerns(acc, criteria, criterionIDs, reason)
@@ -3000,26 +3025,16 @@ func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, sta
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"acceptance triage class-1: count fixup passes failed; paging",
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-		return acceptanceDispositionFixupUnavailable
+		return acceptanceDispositionFixupUnavailable, nil, ""
 	}
 
-	acceptanceStageID := stage.ID
-	// The PR-body-unsatisfiable set (#2782) is unused on the acceptance-triage
-	// path — there is no operator tool result to warn on — so it is discarded;
-	// the advisory audit entry is still written inside fixupStageAs.
-	dec, _, ferr := s.fixupStageAs(ctx, Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
-		StageID: implement.ID,
-		Options: run.FixupOptions{
-			PriorPassCount:    priorPasses,
-			MaxPasses:         defaultMaxFixupPasses,
-			HardCeiling:       defaultFixupCeiling,
-			AcceptanceStageID: &acceptanceStageID,
-		},
-		Selected:    selected,
-		PriorPasses: priorPasses,
-		Reason:      reason,
-	})
-	if ferr != nil {
+	if priorPasses < defaultMaxFixupPasses {
+		if deferral, deferReason, ok := s.decideAcceptanceFixupDeferral(ctx, runID, implement.ID, selected); ok {
+			return acceptanceDispositionFixupDeferred, deferral, deferReason
+		}
+	}
+
+	if ferr := s.routeAcceptanceFixupPass(ctx, runID, implement.ID, stage.ID, selected, nil, priorPasses, reason); ferr != nil {
 		// A refusal (ErrFixupBudgetExhausted / ErrFixupCeilingReached /
 		// ErrFixupNotApplicable) or any other error degrades to a paged
 		// disposition — the implement fixup budget therefore ALSO bounds
@@ -3029,7 +3044,38 @@ func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, sta
 			slog.String("run_id", runID.String()),
 			slog.String("implement_stage_id", implement.ID.String()),
 			slog.String("error", ferr.Error()))
-		return acceptanceDispositionFixupUnavailable
+		return acceptanceDispositionFixupUnavailable, nil, ""
+	}
+	return acceptanceDispositionFixupDispatched, nil, ""
+}
+
+// routeAcceptanceFixupPass is the ONE acceptance-mode fixupStageAs call shared
+// by routeAcceptanceClass1's immediate route and releaseDeferredAcceptanceFixup
+// (E72.58 / #4075), so the two cannot drift: the token-less system identity,
+// the implement budget (MaxPasses = defaultMaxFixupPasses, no refund
+// widening) and the triggering acceptance stage re-opened
+// (FixupOptions.AcceptanceStageID). concernIDs are durable review-concern rows
+// folded into the pass (nil on the immediate route); fixupStageAs marks them
+// addressed_pending.
+func (s *Server) routeAcceptanceFixupPass(ctx context.Context, runID, implementStageID, acceptanceStageID uuid.UUID, selected []planreview.Concern, concernIDs []uuid.UUID, priorPasses int, reason string) error {
+	// The PR-body-unsatisfiable set (#2782) is unused on the acceptance-triage
+	// path — there is no operator tool result to warn on — so it is discarded;
+	// the advisory audit entry is still written inside fixupStageAs.
+	dec, _, ferr := s.fixupStageAs(ctx, Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
+		StageID: implementStageID,
+		Options: run.FixupOptions{
+			PriorPassCount:    priorPasses,
+			MaxPasses:         defaultMaxFixupPasses,
+			HardCeiling:       defaultFixupCeiling,
+			AcceptanceStageID: &acceptanceStageID,
+		},
+		Selected:    selected,
+		ConcernIDs:  concernIDs,
+		PriorPasses: priorPasses,
+		Reason:      reason,
+	})
+	if ferr != nil {
+		return ferr
 	}
 	// Read the acceptance-driven decision field (E31.8): the fixup helper
 	// passed AcceptanceStageID through unchanged and re-opened the settled
@@ -3042,7 +3088,7 @@ func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, sta
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_stage_id", acceptanceStageID.String()))
 	}
-	return acceptanceDispositionFixupDispatched
+	return nil
 }
 
 // routeAcceptanceClass2 re-opens the settled acceptance stage (class-2:
@@ -3225,10 +3271,19 @@ func acceptanceTriageDispositionOf(payload []byte) string {
 // rollback_offer payload object only when non-nil (a rollback_offered
 // disposition), so every other disposition's payload is byte-identical.
 func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string, misses []agenteval.PlanReviewMiss, offer *acceptanceRollbackOffer) {
+	s.appendAcceptanceTriageDecided(ctx, runID, stageID, acceptanceTriageFields(runID, stageID, artifactID, class,
+		disposition, criterionIDs, failureMode, priorRoutedPasses, reason, misses, offer))
+}
+
+// acceptanceTriageFields builds the acceptance_triage_decided payload map
+// writeAcceptanceTriageAudit appends. Split out (E72.58 / #4075) so the
+// deferral and its release can add their additive keys (fixup_deferral,
+// released_deferral_sequence, …) to the SAME base map, leaving every existing
+// disposition's payload byte-identical.
+func acceptanceTriageFields(runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string, misses []agenteval.PlanReviewMiss, offer *acceptanceRollbackOffer) map[string]any {
 	if criterionIDs == nil {
 		criterionIDs = []string{}
 	}
-	systemKind := audit.ActorSystem
 	fields := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
@@ -3246,6 +3301,13 @@ func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID 
 	if offer != nil {
 		fields["rollback_offer"] = offer
 	}
+	return fields
+}
+
+// appendAcceptanceTriageDecided appends one acceptance_triage_decided chained
+// entry carrying fields. Best-effort: a failure WARN-logs.
+func (s *Server) appendAcceptanceTriageDecided(ctx context.Context, runID, stageID uuid.UUID, fields map[string]any) {
+	systemKind := audit.ActorSystem
 	payload, _ := json.Marshal(fields)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
