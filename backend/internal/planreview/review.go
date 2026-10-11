@@ -1256,6 +1256,15 @@ type ReviewStartedPayload struct {
 	// caps it so a crash loop cannot re-dispatch forever. 0 (omitted) on an
 	// ordinary round.
 	RedispatchDepth int `json:"redispatch_depth,omitempty"`
+
+	// RerunOf is the audit sequence of the implement_review_started entry of
+	// the round an OPERATOR re-ran through POST /v0/runs/{run_id}/reviews/rerun
+	// (#4219): a settled round whose reviewers all failed or were skipped,
+	// re-dispatched against the same recorded source. Distinct from
+	// RedispatchOf, which only the boot re-dispatch of a restart-orphaned round
+	// stamps. 0 (omitted) on every other round, so an ordinary payload — and
+	// every payload written before #4219 — stays byte-identical and decodes 0.
+	RerunOf int64 `json:"rerun_of,omitempty"`
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with

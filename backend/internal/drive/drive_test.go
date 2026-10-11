@@ -64,6 +64,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleAcceptanceOutcomeUnknown,
 		RuleAcceptanceTriage,
 		RuleAcceptanceVerdictUnshipped,
+		RuleReviewCoverageIncomplete,
 		RuleDeployInitialization,
 		RuleChildrenDispatch,
 	} {
@@ -92,6 +93,11 @@ func TestMechanical_RuleTable(t *testing.T) {
 	// string AND the audit category of the marker it reads.
 	if RuleAcceptanceVerdictUnshipped != "acceptance_verdict_unshipped" {
 		t.Errorf("RuleAcceptanceVerdictUnshipped = %q, want acceptance_verdict_unshipped", RuleAcceptanceVerdictUnshipped)
+	}
+	// #4219: the review-coverage hold is the merge refusal code, the
+	// derived_status and the MCP next_actions.state string.
+	if RuleReviewCoverageIncomplete != "review_coverage_incomplete" {
+		t.Errorf("RuleReviewCoverageIncomplete = %q, want review_coverage_incomplete", RuleReviewCoverageIncomplete)
 	}
 	for _, rule := range []Rule{
 		RuleGateApproval,

@@ -754,7 +754,7 @@ type GateView struct {
 	// Omitted (nil) when the run has no pull request, is failed or cancelled,
 	// or against an older backend. The json tag MUST byte-match the backend's
 	// gateViewResponse or the block silently decodes to nil (the #371 trap).
-	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
+	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, review_coverage_incomplete, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
 }
 
 // gateViewMergeReadiness mirrors the backend's gateViewMergeReadiness
@@ -771,9 +771,9 @@ type gateViewMergeReadiness struct {
 // gateViewMergeBlocker mirrors the backend's gateViewMergeBlocker. Tags MUST
 // byte-match.
 type gateViewMergeBlocker struct {
-	Code    string         `json:"code" jsonschema:"the merge endpoint's 409 code: acceptance_stale or approval_dismissed"`
+	Code    string         `json:"code" jsonschema:"the merge endpoint's 409 code: acceptance_stale, review_coverage_incomplete or approval_dismissed"`
 	Message string         `json:"message" jsonschema:"the merge endpoint's refusal message, naming the heads involved and the verb that clears the blocker"`
-	Details map[string]any `json:"details,omitempty" jsonschema:"the refusal's details object, including next_step (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage for acceptance_stale, approve_pr for approval_dismissed)"`
+	Details map[string]any `json:"details,omitempty" jsonschema:"the refusal's details object, including next_step (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage for acceptance_stale, fishhawk_rerun_review / fishhawk_await_review for review_coverage_incomplete, approve_pr for approval_dismissed)"`
 }
 
 // gateDivergence mirrors the backend's divergenceQuestion

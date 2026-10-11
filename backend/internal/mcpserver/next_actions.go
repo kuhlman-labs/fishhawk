@@ -113,6 +113,22 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
+	// review_coverage_incomplete (#4219) is likewise a drive-derived
+	// presentation status decided ahead of the table: a decomposed parent
+	// whose review evidence settled with a slice no SUCCESSFUL agent review
+	// covers. The table's review arms would otherwise offer the merge; this
+	// arm NEVER does — the merge endpoint refuses the same state.
+	if drive != nil && drive.DerivedStatus == stateReviewCoverageIncomplete {
+		na := reviewCoverageIncompleteNextActions(run, drive.NextAction)
+		foldReviewHeadMismatchAdvisory(run, na)
+		foldLiveValidationAdvisory(run, na)
+		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
+		foldProductIssueSuggestion(run, stages, na)
+		foldWorkingDirParams(run, na)
+		foldFailureSignature(run, stages, na)
+		return na
+	}
+
 	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	if drive != nil && drive.NextAction != nil {
@@ -2566,6 +2582,61 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 		Precondition: "drive-mode (#1023): the backend parked the run on this operator step",
 		Consumes:     consumesNone,
 		Reason:       reason,
+	}
+}
+
+// stateReviewCoverageIncomplete is the next_actions.state (and the drive
+// derived_status, the drive rule and the merge endpoint's 409 code) for the
+// decomposed-parent review-coverage hold (#4219). The literal is copied, not
+// imported, per the thin local-copy rule; TestReviewCoverageIncompleteLiterals
+// pins it against drive.RuleReviewCoverageIncomplete.
+const stateReviewCoverageIncomplete = "review_coverage_incomplete"
+
+// driveNextActionRerunReview is the server-stamped drive next_action verb for a
+// review_coverage_incomplete hold whose parent round settled with no verdict
+// (backend/internal/server/review_coverage.go); any other verb on the hold
+// means a round is in flight or not yet dispatched.
+const driveNextActionRerunReview = "rerun_review"
+
+// reviewCoverageIncompleteNextActions is the review_coverage_incomplete arm
+// (#4219). It leads with the verb that clears the hold — fishhawk_rerun_review
+// when the drive stamp says the parent round settled with no verdict,
+// fishhawk_await_review otherwise — then the gate view, whose merge_readiness
+// blocker names the uncovered slice(s). It NEVER offers fishhawk_merge_run.
+// The drive Detail (the server's refusal message) is the lead action's reason.
+func reviewCoverageIncompleteNextActions(run *Run, da *RunNextAction) *NextActions {
+	params := map[string]string{"run_id": run.ID}
+	lead := SuggestedAction{
+		Action:       "fishhawk_await_review",
+		Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
+		Precondition: "a decomposed slice is not yet covered by a successful agent review and the parent's implement-review round is in flight or not yet dispatched",
+		Consumes:     consumesNone,
+		Reason:       "await the parent's implement-review round; a round that records a verdict covers every slice and clears the hold",
+	}
+	if da != nil && da.Action == driveNextActionRerunReview {
+		lead = SuggestedAction{
+			Action:       "fishhawk_rerun_review",
+			Params:       params,
+			Precondition: "the parent's latest implement-review round settled with no verdict (every reviewer failed or was skipped) and a slice is not covered by its own review",
+			Consumes:     consumesNone,
+			Reason:       "re-run the failed implement-review round so a successful agent review covers every slice, then await it with fishhawk_await_review",
+		}
+	}
+	if da != nil && da.Detail != "" {
+		lead.Reason = da.Detail
+	}
+	return &NextActions{
+		State: stateReviewCoverageIncomplete,
+		Actions: []SuggestedAction{
+			lead,
+			{
+				Action:       "fishhawk_get_gate_view",
+				Params:       params,
+				Precondition: "always",
+				Consumes:     consumesNone,
+				Reason:       "merge_readiness.blockers names the uncovered slice(s) and each slice's latest review round; the merge stays refused until the hold clears",
+			},
+		},
 	}
 }
 
