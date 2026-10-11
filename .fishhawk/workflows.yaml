@@ -380,6 +380,17 @@ workflows:
         produces:
           - artifact: pull_request
         constraints:
+          # The product's built-in agent-instruction constraint (#3942) refuses
+          # `.agents/`, `.claude/`, `.codex/` and the auto-loaded instruction files
+          # (AGENTS.md, AGENTS.override.md, CLAUDE.md, CLAUDE.local.md) at any depth
+          # and in any letter case on every implement stage. This stage relaxes it
+          # for exactly ONE path, the root AGENTS.md (exact case), which the
+          # conventions require updating; the forbidden_paths globs below stay as
+          # defence in depth and because the campaign admission screen and the
+          # forbidden-criterion sweep read only forbidden_paths (dropping them waits
+          # on teaching those surfaces the built-in).
+          agent_instruction_paths:
+            writable: ["AGENTS.md"]
           # Post-hoc diff constraints, checked against the produced pull
           # request. A change larger than this cap fails the stage rather
           # than merging unreviewably wide; if a change is genuinely
