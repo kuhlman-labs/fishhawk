@@ -375,17 +375,33 @@ func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UU
 	}
 }
 
+// mergeCandidateQueueHandOffBudget bounds one PR-resolution hand-off: the
+// settle, the pump and every admission that pump runs. The hand-off runs
+// detached from the caller's cancellation because its caller is usually a
+// webhook delivery, whose request context is cancelled when the forge stops
+// listening (~10s), while one admission's auto-advance alone can spend the
+// bounded post-merge re-read and then its own detached
+// rebasePostMergeTailBudget tail. On a cancelled context the re-anchor, the
+// pass start AND the recovery Unadmit would all fail, leaving the entry live
+// in phase admitted until mergequeue.AdmissionStaleAfter re-claims it. Twice
+// the tail budget leaves the post-advance steps room after a full-length tail.
+const mergeCandidateQueueHandOffBudget = 2 * rebasePostMergeTailBudget
+
 // mergeCandidateQueueOnPRResolved settles the run's active entry when its PR
 // reaches a terminal forge state, then pumps the base (D4): merged → a live
 // entry is merged (it held the line to here) and a held one is dropped
 // pr_merged_externally; closed without merge → dropped pr_closed. A forge-side
 // merge is a fact regardless of review bookkeeping, so the caller runs this
-// before any review gate decides. Idempotent: a redelivery finds no active
-// entry.
+// before any review gate decides. Detached from ctx's cancellation (its
+// values are kept) and bounded by mergeCandidateQueueHandOffBudget, so a
+// webhook sender that disconnects mid-admission cannot strand the next
+// entry. Idempotent: a redelivery finds no active entry.
 func (s *Server) mergeCandidateQueueOnPRResolved(ctx context.Context, runID uuid.UUID, merged bool) {
 	if s.cfg.MergeQueue == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeCandidateQueueHandOffBudget)
+	defer cancel()
 	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,

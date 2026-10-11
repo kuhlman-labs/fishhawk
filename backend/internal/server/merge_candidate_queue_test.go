@@ -50,6 +50,9 @@ type mcqGitHub struct {
 	mergeSHA      map[string]string
 	mergeStatus   map[string]int
 	merges        []rebaseMergeCall
+	// onMerge, when set, runs on every POST /merges (outside the lock)
+	// before the response is written.
+	onMerge func(base string)
 }
 
 func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
@@ -104,7 +107,11 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 				}
 			}
 		}
+		onMerge := g.onMerge
 		g.mu.Unlock()
+		if onMerge != nil {
+			onMerge(call.Base)
+		}
 		if status != 0 {
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(`{"message":"Merge conflict"}`))
@@ -324,6 +331,12 @@ func (f *mcqFixture) verdict(r *mcqRun, result string) {
 // fake PR to the same state first.
 func (f *mcqFixture) closePR(r *mcqRun, merged bool) {
 	f.t.Helper()
+	f.closePRCtx(context.Background(), r, merged)
+}
+
+// closePRCtx is closePR on the webhook request context ctx.
+func (f *mcqFixture) closePRCtx(ctx context.Context, r *mcqRun, merged bool) {
+	f.t.Helper()
 	f.gh.set(func() { f.gh.prs[r.pr].state, f.gh.prs[r.pr].merged = "closed", merged })
 	raw, _ := json.Marshal(map[string]any{
 		"pull_request": map[string]any{
@@ -333,7 +346,7 @@ func (f *mcqFixture) closePR(r *mcqRun, merged bool) {
 		},
 		"sender": map[string]any{"login": "alice"},
 	})
-	f.srv.handlePullRequestClosed(context.Background(), raw)
+	f.srv.handlePullRequestClosed(ctx, raw)
 }
 
 func (f *mcqFixture) requireState(r *mcqRun, state mergequeue.State, reason string) mergequeue.Entry {
@@ -506,6 +519,38 @@ func TestMergeCandidateQueue_HandOffWhileReviewHeld(t *testing.T) {
 	f.requireState(b, mergequeue.StateLive, "")
 	if n := len(f.triggers(b)); n != 1 {
 		t.Fatalf("B triggers = %d, want 1 after the hand-off", n)
+	}
+}
+
+// TestMergeCandidateQueue_HandOffSurvivesWebhookCancellation: the webhook
+// sender disconnects (its request context is cancelled) while the hand-off's
+// admission of B is mid auto-advance. The hand-off is detached from that
+// cancellation, so the re-anchor and the pass start still land: B ends live
+// at the advanced head with exactly one trigger, not stranded in phase
+// admitted until the stale-admission bound.
+func TestMergeCandidateQueue_HandOffSurvivesWebhookCancellation(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.behind(b, "b1", "b2")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.gh.set(func() {
+		f.gh.onMerge = func(base string) {
+			if base == b.branch {
+				cancel()
+			}
+		}
+	})
+	f.closePRCtx(ctx, a, true)
+	if ctx.Err() == nil {
+		t.Fatal("fixture: the webhook context was never cancelled; B's admission did not reach the auto-advance merge")
+	}
+	f.requireState(a, mergequeue.StateMerged, "pr_merged")
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B after a cancelled-webhook hand-off = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("B triggers = %+v, want one for b2", tr)
 	}
 }
 
