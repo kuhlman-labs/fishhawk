@@ -395,6 +395,12 @@ var exportBaseline = []string{
 	// cannot drift into two json-tag sets.
 	"RepoDelegationParams",
 	"RepoDelegationResult",
+	// #4219: fishhawk_rerun_review's I/O and the client mirror of
+	// POST /v0/runs/{run_id}/reviews/rerun. Exported because RerunReviewOutput
+	// embeds RerunReviewResult and the SDK reflects over the whole tree.
+	"RerunReviewInput",
+	"RerunReviewOutput",
+	"RerunReviewResult",
 	// E83.53 / #4086: fishhawk_resolve_concerns' I/O structs and the client
 	// mirrors of POST /v0/runs/{run_id}/concerns/resolve. Exported because
 	// ResolveConcernsOutput embeds ResolveConcernsResult, which embeds

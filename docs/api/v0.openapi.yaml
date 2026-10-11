@@ -2331,7 +2331,7 @@ components:
             no open concerns.
         derived_status:
           type: string
-          enum: [awaiting_merge, ci_failed]
+          enum: [awaiting_merge, ci_failed, review_coverage_incomplete]
           description: |
             Presentation-only drive-mode status (#1023):
             `awaiting_merge` while a non-terminal drive run with an
@@ -2350,7 +2350,13 @@ components:
             carrying no verdict about the code — so no red verdict
             remains at the latest observed rows. `ci_recovered` is a
             rule value, NOT a `derived_status` (the field goes absent
-            while the remaining required checks conclude). Never a
+            while the remaining required checks conclude).
+            `review_coverage_incomplete` (#4219) is stamped INSTEAD of
+            `awaiting_merge` on a decomposed parent whose review evidence
+            settled with a succeeded slice no successful agent review
+            covers; the merge endpoint refuses the same state, and the
+            drive re-asserts `awaiting_merge` once a review round records a
+            verdict (`POST /v0/runs/{run_id}/reviews/rerun`). Never a
             persisted run state:
             `state` stays `running` while parked here, and the
             transition table in `backend/internal/run/transition.go` is
@@ -3101,8 +3107,9 @@ components:
             block adds `crew_consults` when any of its reads failed. The gate
             isolation block adds `gate_isolation_recorded` when its read, or the
             decode of any of its rows, failed. The merge-readiness block adds
-            `merge_readiness` when the run's stages or its acceptance re-open /
-            outcome history could not be read.
+            `merge_readiness` when the run's stages, its acceptance re-open /
+            outcome history or its review-coverage history (#4219) could not
+            be read.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3161,9 +3168,10 @@ components:
           type: array
           items: { $ref: '#/components/schemas/GateViewMergeBlocker' }
           description: |
-            Each determined refusal: `acceptance_stale` and/or
-            `approval_dismissed`, with the merge endpoint's message and details
-            verbatim (see that operation's 409 cases 8 and 9).
+            Each determined refusal: `acceptance_stale`,
+            `review_coverage_incomplete` (#4219) and/or `approval_dismissed`,
+            with the merge endpoint's message and details verbatim (see that
+            operation's 409 cases 8, 10 and 9).
         undetermined:
           type: array
           items: { type: string }
@@ -3171,9 +3179,11 @@ components:
             Each check that could not reach a verdict and why: the approval
             check's fail-open reasons (`approval dismissal: …` — e.g. no GitHub
             client, a read error, a `mergeable_state` other than `blocked`),
-            and an acceptance-history read failure (`acceptance staleness: …`,
-            which also adds the `merge_readiness` `history_gaps` entry). An
-            empty `blockers` is not "nothing blocks" while this is non-empty.
+            an acceptance-history read failure (`acceptance staleness: …`) and
+            a review-coverage read failure (`review coverage: …`, #4219); each
+            history read failure also adds the single `merge_readiness`
+            `history_gaps` entry. An empty `blockers` is not "nothing blocks"
+            while this is non-empty.
 
     GateViewMergeBlocker:
       type: object
@@ -3181,7 +3191,7 @@ components:
       properties:
         code:
           type: string
-          enum: [acceptance_stale, approval_dismissed]
+          enum: [acceptance_stale, review_coverage_incomplete, approval_dismissed]
         message:
           type: string
           description: The merge endpoint's refusal message, verbatim.
@@ -3772,6 +3782,12 @@ components:
             and `merge_pr` (the backend parked the run at `awaiting_merge`;
             the accompanying `detail` states any outstanding advisory
             reviewer rejects or unresolved concerns — #2487).
+            `rerun_review` / `await_review` (#4219) accompany a
+            `review_coverage_incomplete` park: the parent's latest
+            implement-review round settled with no verdict (re-run it with
+            `POST /v0/runs/{run_id}/reviews/rerun`), or a round is in flight
+            or not yet dispatched (await it); the `detail` is the merge
+            endpoint's refusal message.
             `run_implement_stage` / `run_plan_stage` are now ALSO produced
             by the `retry_stage` and `resume_run`/`recover` re-open paths
             on a `local` run (#1271), not only by plan-approve and revise;
@@ -3818,7 +3834,10 @@ components:
         latest observed rows: the parking conclusion was `cancelled`/
         `stale`, a head superseded by a newer push, so the run returns
         to awaiting its remaining checks rather than the `ci_failed`
-        dead end).
+        dead end), `review_coverage_incomplete` (#4219 — stamped instead of
+        `checks_green_awaiting_merge` on a decomposed parent with a
+        succeeded slice no successful agent review covers; detection only,
+        it parks and never advances).
       required: [rule, from, to, ts]
       properties:
         rule:
@@ -13675,6 +13694,9 @@ paths:
         (`409 acceptance_gate_not_passed`), when the recorded acceptance
         verdict is stale because the acceptance stage was re-opened after it
         (`409 acceptance_stale`, #4086; an audit read error here is
+        `500 internal_error`, fail-closed), when a decomposed parent has a
+        slice no successful agent review covers
+        (`409 review_coverage_incomplete`, #4219; a read error here is
         `500 internal_error`, fail-closed), when the pull request has a merge
         conflict against its base (`409 merge_conflicting`, E64.14 / #3109),
         when the merge-candidate gate refuses (`409 merge_base_behind` /
@@ -13885,16 +13907,36 @@ paths:
             client or installation, an unparseable repo or PR, a read error, a
             merged PR, a `mergeable_state` other than `blocked`, a truncated
             reviews listing) admits the merge. A never-reviewed PR still
-            queues. Re-approve the pull request, then re-invoke. Cases (8) and
-            (9) record NO verdict row and dispatch nothing.
+            queues. Re-approve the pull request, then re-invoke.
+            (10) A decomposed parent's review coverage is incomplete
+            (`review_coverage_incomplete`, #4219): a SUCCEEDED slice child is
+            covered by no successful agent review — neither the parent's
+            latest implement-review round nor the slice's own latest round
+            recorded an `implement_reviewed` verdict (a round whose reviewers
+            all failed or were skipped covers nothing; a reject verdict
+            counts). Not applicable to a non-parent, a child run, an implement
+            stage configuring zero agent reviewers, or a deployment with no
+            reviewer backend wired. `details` carry `{run_id, pr_url,
+            uncovered_slices[] {child_run_id, slice_index, round_sequence,
+            reason: no_review_round | review_round_in_flight |
+            review_round_no_verdict}, parent_round {sequence, configured,
+            terminal, verdicts, in_flight} | null, next_step}` where
+            `next_step` is `fishhawk_rerun_review` (the parent round settled
+            with no verdict — `POST /v0/runs/{run_id}/reviews/rerun`) or
+            `fishhawk_await_review` (the parent round is in flight or not yet
+            dispatched). Checked after case (8) and BEFORE the merge seam, so
+            it is reported even where `merge_seam_unconfigured` would follow.
+            Cases (8), (9) and (10) record NO verdict row and dispatch
+            nothing.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: |
-            `internal_error`: the run's stages, or the acceptance re-open /
-            outcome history the stale-acceptance check reads (#4086), could
-            not be read. FAIL-CLOSED: nothing was recorded and nothing was
+            `internal_error`: the run's stages, the acceptance re-open /
+            outcome history the stale-acceptance check reads (#4086), or the
+            decomposed children / implement-review history the
+            review-coverage check reads (#4219), could not be read. FAIL-CLOSED: nothing was recorded and nothing was
             dispatched; retry once the store is healthy.
           content:
             application/json:
@@ -15189,6 +15231,141 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/reviews/rerun:
+    post:
+      operationId: rerunRunReview
+      summary: Re-run a verdict-less implement-review round
+      description: |
+        Operator re-run of a failed implement-review round (#4219). Re-runs
+        the run's LATEST implement-review round when that round SETTLED WITH
+        ZERO VERDICTS — every configured reviewer failed or was skipped. It is
+        the recovery for the decomposed-parent review-coverage hold
+        (`review_coverage_incomplete` on `POST /v0/runs/{run_id}/merge`): a
+        round with no verdict covers no slice, and no other path dispatches a
+        second review of the SAME head.
+
+        The round is rebuilt from its RECORDED source
+        (`round_origin` / `round_base_sha` / `head_sha` on its
+        `implement_review_started`, #4077): a forge compare of base..head for
+        a `consolidated` or `fixup_push` round, the redacted trace bundle for a
+        `trace` round. It is dispatched through the same rebuild the boot
+        re-dispatch uses. The new round's `implement_review_started` carries
+        `rerun_of` = the re-run round's sequence. The #797 same-head dedup is
+        bypassed by a dedicated marker, re-verified under the review dispatch
+        lock against the run's newest round — distinct from ADR-091 D6's boot
+        re-dispatch. Advisory reviewers then run detached; a recorded verdict
+        clears the review-coverage hold.
+
+        **Refusals, in order, each decided before anything is written.**
+        `409 no_review_round` (no `implement_review_started`);
+        `409 review_round_in_flight` (`details.reason`: `rerun_pending` — a
+        re-run of this run is already in progress in this process;
+        `boot_redispatch_pending` — the round is mid-handoff to a boot
+        re-dispatch; `round_unsettled` — not every configured reviewer has
+        settled, an orphaned round is closed with
+        `POST /v0/runs/{run_id}/reviews/reconcile` first);
+        `409 review_round_has_verdict` (the round recorded an
+        `implement_reviewed`); `409 review_rerun_ineligible`
+        (`details.reason`: `gating_authority`, `reviewer_unwired`,
+        `unknown_round_source`, `superseded_by_fixup`,
+        `implement_stage_terminal`, `advanced_past_review`,
+        `trace_bundle_unavailable` or `forge_compare_unavailable`).
+
+        Otherwise it appends a chained `review_round_rerun_requested` audit
+        row `{stage, stage_id, rerun_of_sequence, configured_agents,
+        landed_before, authority, round_origin, head_sha}` BEFORE
+        dispatching, then rebuilds and dispatches synchronously. A re-run
+        against a provider that is still unavailable records another
+        verdict-less round, which can itself be re-run.
+
+        **Authorization.** OPERATOR-ONLY. Requires an authenticated identity
+        (anonymous → 401) carrying `write:runs`; a run-bound agent token
+        (`mcp:run:<uuid>`) is refused `403 run_token_forbidden` (an implement
+        agent must not re-run its own review) and a delegated operator-agent
+        token `403 operator_agent_forbidden`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The round was re-run; a new round started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, stage, stage_id, rerun_of_sequence, new_round_sequence, configured_agents]
+                properties:
+                  run_id:
+                    $ref: '#/components/schemas/UUID'
+                  stage:
+                    type: string
+                    enum: [implement]
+                  stage_id:
+                    $ref: '#/components/schemas/UUID'
+                  rerun_of_sequence:
+                    type: integer
+                    format: int64
+                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run.
+                  new_round_sequence:
+                    type: integer
+                    format: int64
+                    description: Audit sequence of the NEW `implement_review_started` this call dispatched (its `rerun_of` names `rerun_of_sequence`).
+                  configured_agents:
+                    type: integer
+                    description: Agent reviewers the re-run round was dispatched with.
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_token_forbidden` (a run-bound agent token),
+            `operator_agent_forbidden` (a delegated operator-agent token),
+            `insufficient_scope` (no `write:runs`), or the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `no_review_round`, `review_round_in_flight`,
+            `review_round_has_verdict` or `review_rerun_ineligible` (see the
+            refusal ladder above; `details` carry `run_id`, `round_sequence`
+            and, where named, `reason`). Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `review_rerun_check_failed` (the round's audit history could not
+            be read) or `review_rerun_audit_failed` (the request row could not
+            be appended). FAIL-CLOSED: nothing was dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            `review_rerun_not_started` — the `review_round_rerun_requested`
+            row was recorded but no round started; `details.reason` names the
+            rebuild failure (e.g. `compare_failed`,
+            `trace_bundle_unavailable`, `round_not_started`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_rerun_unconfigured` — the run or audit repositories are
+            not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v0/runs/{run_id}/stages/{stage_id}/reap-failure:
     post:
       operationId: reapStageFailure
