@@ -1923,14 +1923,32 @@ cache entries each run; the standard library and module-cache dependencies are
 still shared. A two-path planning experiment against one fresh shared GOCACHE
 added 18 entries for the second path without `-trimpath` and 2 with it. Go's own
 trim evicts only entries unused for 5 days, so the host cache reached 531 GB.
-`-trimpath` is not adopted YET. Its original blocker — about 30 test files
-anchoring fixtures on `runtime.Caller(0)`, whose file name `-trimpath` makes
-module-relative — is removed by #4179: every test package now anchors on an
-init-captured `pkgSrcDir`, and `backend/internal/testanchor` fails verify on any
-new file-bound `runtime.Caller`. Adopting `-trimpath` for agent builds is the
-follow-up. Even then, the patch-coverage loop's `-coverpkg` set differs per diff,
-so those builds miss regardless of path; and the container gate already builds
-at a fixed `/work` in a per-process volume removed at exit.
+`-trimpath` is adopted for runner-spawned agents (#4180). Its original blocker —
+about 30 test files anchoring fixtures on `runtime.Caller(0)`, whose file name
+`-trimpath` makes module-relative — was removed by #4179: every test package now
+anchors on an init-captured `pkgSrcDir`, and `backend/internal/testanchor` fails
+verify on any new file-bound `runtime.Caller`. `runner/internal/agentenv.Env`
+now merges `-trimpath` into the `GOFLAGS` of every agent spawn (plan, implement,
+review, the verify-fix and base-rebase re-invokes, the conflict-resolution
+pass), so N implement stages at one base share compile entries. The acceptance
+agent (`acceptenv`) and the runner-driven committed-tree verify gate do NOT get
+it. An agent's OWN `scripts/test single` / `go test` run does inherit it: it
+runs under the agent's env, and the container projection of the gate env
+(`gateiso.containerGoflags`) keeps a bare `-trimpath`. So "`scripts/test`
+unchanged" holds for the gate and for `scripts/test`'s own logic, not for the
+env an agent runs it under. The patch-coverage loop's `-coverpkg` set differs per
+diff, so those builds miss regardless of path; and the container gate already
+builds at a fixed `/work` in a per-process volume removed at exit.
+`scripts/dev gocache --trim` stays as the backstop for everything `-trimpath`
+does not cover (the verify gate, acceptance, operator builds).
+
+**Scratch and overseer worktrees.** A worktree you create yourself runs no
+`agentenv`, so its builds hash the path as before. Get the same sharing with
+`export GOFLAGS=-trimpath` in the session env, or `go env -w GOFLAGS=-trimpath`
+for a persistent default. An env-var `GOFLAGS` overrides the env-file value
+entirely (`go help environment`), so do not set both expecting a merge. Under
+`-trimpath` recorded file names are module-relative, which matters for delve
+(`runner/README.md` § "Agent builds use -trimpath").
 
 **The trim (`_gocache_trim`).** It reproduces cmd/go's own `DiskCache.Trim`
 (`src/cmd/go/internal/cache/cache.go`): delete the `<2hex>/<hash>-a` / `-d`

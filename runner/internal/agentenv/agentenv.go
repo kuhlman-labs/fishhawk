@@ -32,9 +32,17 @@
 // Invocation/Invoker APIKey via agent.AppendEnvOverride). Both routes use
 // AppendEnvOverride, which strips any same-named entry before appending, so
 // the overlay deterministically wins over anything the base might carry.
+//
+// One entry is REWRITTEN rather than filtered: GOFLAGS gets -trimpath merged
+// in (#4180). Without it the go command hashes the build directory into every
+// workspace-package compile action ID, so each per-run lineage worktree path
+// recompiles — and re-caches — packages another worktree at the same base
+// already built (the #3901 host build-cache growth). Every other surviving
+// entry stays byte-identical.
 package agentenv
 
 import (
+	"errors"
 	"sort"
 	"strings"
 )
@@ -233,9 +241,23 @@ var denyPrefix = []string{"FISHHAWK_", "GOOGLE_", "AWS_", "AZURE_"}
 // denylist — the caller logs them so a misconfigured (or hostile) passthrough
 // is loud, never silent. refused is sorted for determinism.
 //
+// GOFLAGS is the one entry Env REWRITES: -trimpath is merged into its value as
+// the final step (#4180; withTrimpath), so the agent's own go build / go test
+// in a lineage worktree stops hashing the worktree path into compile action
+// IDs and N worktrees at one base share Go build-cache entries. The merge never
+// clobbers: an inherited value (the runner's own GOFLAGS, or a
+// FISHHAWK_AGENT_ENV_GOFLAGS passthrough) is kept verbatim and the flag is
+// appended only when no field already names it, so an explicit
+// -trimpath=false is the operator's opt-out. A value the go command could not
+// parse (an unterminated quote) is left untouched. Residual: an env-var
+// GOFLAGS shadows a `go env -w GOFLAGS=` file value entirely, so a runner env
+// with no GOFLAGS hides the file's; set GOFLAGS in the runner env or through
+// the passthrough instead.
+//
 // The returned slice is always non-nil, including when every entry is dropped:
 // os/exec treats a nil Cmd.Env as inherit-parent-env, the opposite of
-// default-deny.
+// default-deny. The GOFLAGS overlay always yields at least one entry, so the
+// guarantee holds trivially.
 func Env(base []string) (env []string, refused []string) {
 	out := make([]string, 0, len(base))
 	for _, kv := range base {
@@ -271,7 +293,112 @@ func Env(base []string) (env []string, refused []string) {
 	}
 
 	sort.Strings(refused)
-	return out, refused
+	return withTrimpath(out), refused
+}
+
+// trimpathFlag is the go build flag merged into the agent's GOFLAGS.
+const trimpathFlag = "-trimpath"
+
+// withTrimpath merges -trimpath into every GOFLAGS entry of env, in place and
+// keeping each entry's position, and appends GOFLAGS=-trimpath when env has
+// none. Every entry is merged, not just the first: os/exec uses the LAST value
+// of a duplicated key, and an ambient GOFLAGS and a FISHHAWK_AGENT_ENV_GOFLAGS
+// passthrough can both survive composition, so the effective (last) one must
+// carry the flag too.
+func withTrimpath(env []string) []string {
+	const key = "GOFLAGS="
+	found := false
+	for i, kv := range env {
+		if val, ok := strings.CutPrefix(kv, key); ok {
+			env[i] = key + mergeTrimpath(val)
+			found = true
+		}
+	}
+	if !found {
+		env = append(env, key+trimpathFlag)
+	}
+	return env
+}
+
+// mergeTrimpath returns val with -trimpath merged in. A val the go command
+// cannot split (an unterminated quote) comes back unchanged, so the go command
+// reports the operator's own parse error rather than one this package
+// introduced. A val where any field already names the flag comes back
+// unchanged: that covers a repeat (no duplicate) and -trimpath=false (the
+// operator's opt-out is honored). A blank val becomes exactly -trimpath;
+// otherwise the inherited bytes are kept as a verbatim prefix.
+func mergeTrimpath(val string) string {
+	fields, err := splitGOFLAGS(val)
+	if err != nil {
+		return val
+	}
+	for _, f := range fields {
+		if namesTrimpath(f) {
+			return val
+		}
+	}
+	if len(fields) == 0 {
+		return trimpathFlag
+	}
+	return val + " " + trimpathFlag
+}
+
+// splitGOFLAGS splits s into fields exactly as the go command does for GOFLAGS
+// (base.InitGOFLAGS calls quoted.Split): a byte-for-byte mirror of go1.25.6
+// src/cmd/internal/quoted/quoted.go Split. Fields are separated by space, tab,
+// newline or carriage return; a field that STARTS with ' or " runs to the
+// matching quote with no unescaping; an unterminated quote is an error. A
+// strings.Fields split would misread a quoted field holding spaces, which is
+// the difference between "-trimpath" the flag and the text of a -ldflags value.
+func splitGOFLAGS(s string) ([]string, error) {
+	// Split fields allowing '' or "" around elements.
+	// Quotes further inside the string do not count.
+	var f []string
+	for len(s) > 0 {
+		for len(s) > 0 && isSpaceByte(s[0]) {
+			s = s[1:]
+		}
+		if len(s) == 0 {
+			break
+		}
+		// Accepted quoted string. No unescaping inside.
+		if s[0] == '"' || s[0] == '\'' {
+			quote := s[0]
+			s = s[1:]
+			i := 0
+			for i < len(s) && s[i] != quote {
+				i++
+			}
+			if i >= len(s) {
+				return nil, errUnterminatedQuote
+			}
+			f = append(f, s[:i])
+			s = s[i+1:]
+			continue
+		}
+		// Else accept a space-separated field.
+		i := 0
+		for i < len(s) && !isSpaceByte(s[i]) {
+			i++
+		}
+		f = append(f, s[:i])
+		s = s[i:]
+	}
+	return f, nil
+}
+
+var errUnterminatedQuote = errors.New("unterminated quoted string in GOFLAGS")
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// namesTrimpath reports whether a split GOFLAGS field is the -trimpath flag in
+// any spelling the go command accepts: -trimpath, --trimpath, or either with
+// an =value (so -trimpath=false is recognized as the operator's opt-out).
+func namesTrimpath(field string) bool {
+	name := strings.TrimPrefix(strings.TrimPrefix(field, "-"), "-")
+	return name == "trimpath" || strings.HasPrefix(name, "trimpath=")
 }
 
 // Allowed reports whether key survives the default-deny allow-list. It does

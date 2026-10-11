@@ -45,8 +45,10 @@ func TestEnv_DropsMalformedEntries(t *testing.T) {
 	if len(refused) != 0 {
 		t.Errorf("refused = %v, want none", refused)
 	}
-	if !reflect.DeepEqual(env, []string{"PATH=/bin"}) {
-		t.Errorf("Env = %v, want exactly [PATH=/bin] — a malformed entry must be dropped", env)
+	// The trailing GOFLAGS=-trimpath is the always-present overlay (#4180);
+	// the assertion still pins that the malformed entries added nothing else.
+	if !reflect.DeepEqual(env, []string{"PATH=/bin", "GOFLAGS=-trimpath"}) {
+		t.Errorf("Env = %v, want exactly [PATH=/bin GOFLAGS=-trimpath] — a malformed entry must be dropped", env)
 	}
 }
 
@@ -110,13 +112,16 @@ func TestEnv_DropsUnlistedKey(t *testing.T) {
 // allow rung — an exact system essential, a Go toolchain name, and every
 // allowPrefix family — and asserts the entry is reproduced verbatim. One case
 // carries a value CONTAINING '=' so a naive split-and-rejoin regression is
-// caught.
+// caught. GOFLAGS is NOT among them: it is the one entry Env rewrites
+// (#4180), covered by TestEnv_GOFLAGSTrimpathOverlay; the byte-identical claim
+// is every OTHER entry, and the overlay's own appended entry is trimmed off
+// before the comparison.
 func TestEnv_KeepsAllowedEntriesByteIdentical(t *testing.T) {
 	entries := []string{
 		"PATH=/usr/bin:/bin",                 // allowExact
 		"DOCKER_HOST=unix:///var/run/d.sock", // allowExact (docker client)
 		"CI=true",                            // allowExact (timescale auto-5x)
-		"GOFLAGS=-mod=mod",                   // allowGo, value contains '='
+		"GODEBUG=x509sha1=1",                 // allowGo, value contains '='
 		"LC_ALL=en_US.UTF-8",
 		"CGO_ENABLED=1",
 		"XDG_CACHE_HOME=/home/u/.cache",
@@ -133,8 +138,9 @@ func TestEnv_KeepsAllowedEntriesByteIdentical(t *testing.T) {
 	if len(refused) != 0 {
 		t.Errorf("refused = %v, want none", refused)
 	}
-	if !reflect.DeepEqual(env, entries) {
-		t.Errorf("Env = %#v,\nwant byte-identical %#v", env, entries)
+	want := append(append([]string(nil), entries...), "GOFLAGS=-trimpath")
+	if !reflect.DeepEqual(env, want) {
+		t.Errorf("Env = %#v,\nwant byte-identical %#v plus the GOFLAGS overlay", env, entries)
 	}
 }
 
@@ -146,8 +152,8 @@ func TestEnv_PassthroughStripsPrefix(t *testing.T) {
 	if len(refused) != 0 {
 		t.Errorf("refused = %v, want none", refused)
 	}
-	if !reflect.DeepEqual(env, []string{"FOO=bar=baz"}) {
-		t.Errorf("Env = %v, want [FOO=bar=baz]", env)
+	if !reflect.DeepEqual(env, []string{"FOO=bar=baz", "GOFLAGS=-trimpath"}) {
+		t.Errorf("Env = %v, want [FOO=bar=baz GOFLAGS=-trimpath]", env)
 	}
 	if got := envMap(t, env); got[PassthroughPrefix+"FOO"] != "" {
 		t.Error("the prefixed key must not also survive")
@@ -164,8 +170,8 @@ func TestEnv_PassthroughEmptyNameDropped(t *testing.T) {
 	if len(refused) != 0 {
 		t.Errorf("refused = %v, want none — an empty name is malformed, not denied", refused)
 	}
-	if !reflect.DeepEqual(env, []string{"PATH=/bin"}) {
-		t.Errorf("Env = %v, want exactly [PATH=/bin]", env)
+	if !reflect.DeepEqual(env, []string{"PATH=/bin", "GOFLAGS=-trimpath"}) {
+		t.Errorf("Env = %v, want exactly [PATH=/bin GOFLAGS=-trimpath]", env)
 	}
 }
 
@@ -221,14 +227,15 @@ func TestEnv_RefusedSortedDeterministically(t *testing.T) {
 
 // TestEnv_EmptyBaseYieldsNonNilSlice pins the default-deny corner the
 // adapters depend on: os/exec treats a nil Cmd.Env as inherit-parent-env, so
-// an all-dropped composition must still be a non-nil EMPTY slice.
+// an all-dropped composition must still be a non-nil slice. Since #4180 it is
+// exactly the GOFLAGS overlay and nothing the dropped entry carried.
 func TestEnv_EmptyBaseYieldsNonNilSlice(t *testing.T) {
 	env, refused := Env([]string{"GITHUB_TOKEN=x"})
 	if env == nil {
 		t.Fatal("Env returned a nil slice; a nil cmd.Env means inherit-parent-env — the opposite of default-deny")
 	}
-	if len(env) != 0 {
-		t.Errorf("Env = %v, want empty", env)
+	if !reflect.DeepEqual(env, []string{"GOFLAGS=-trimpath"}) {
+		t.Errorf("Env = %v, want exactly [GOFLAGS=-trimpath]", env)
 	}
 	if len(refused) != 0 {
 		t.Errorf("refused = %v, want none", refused)
@@ -306,5 +313,108 @@ func TestEnv_RunAgentMarkerNeverComposed(t *testing.T) {
 	}
 	if !reflect.DeepEqual(refused, []string{name}) {
 		t.Errorf("refused = %v, want [%s] — the passthrough must be refused, never silent", refused, name)
+	}
+}
+
+// goflagsEntries returns every GOFLAGS value in env in order, so an overlay
+// test asserts the COUNT (a duplicate entry is a defect) and the exact bytes.
+func goflagsEntries(env []string) []string {
+	var out []string
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "GOFLAGS="); ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// TestEnv_GOFLAGSTrimpathOverlay (#4180) pins every merge mode of the GOFLAGS
+// overlay, one named subtest each, asserting the composed env's GOFLAGS
+// entries as a count plus byte-exact values. The merge is NON-clobbering (an
+// inherited value is a verbatim prefix), idempotent (a field already naming
+// the flag is left alone, which is also how -trimpath=false opts out), and
+// quote-aware (it splits GOFLAGS the way the go command does, so the TEXT
+// -trimpath inside a quoted -ldflags value is not mistaken for the flag).
+func TestEnv_GOFLAGSTrimpathOverlay(t *testing.T) {
+	tests := []struct {
+		name string
+		base []string
+		want []string
+	}{
+		{"absent appends", []string{"PATH=/bin"}, []string{"-trimpath"}},
+		{"empty value", []string{"GOFLAGS="}, []string{"-trimpath"}},
+		{"whitespace-only value", []string{"GOFLAGS=   \t"}, []string{"-trimpath"}},
+		{"inherited flags kept as prefix", []string{"GOFLAGS=-mod=mod -tags=x"}, []string{"-mod=mod -tags=x -trimpath"}},
+		{"already single dash", []string{"GOFLAGS=-trimpath"}, []string{"-trimpath"}},
+		{"already double dash", []string{"GOFLAGS=--trimpath"}, []string{"--trimpath"}},
+		{"already with =true", []string{"GOFLAGS=-trimpath=true"}, []string{"-trimpath=true"}},
+		{"already among others", []string{"GOFLAGS=-mod=mod -trimpath -tags=x"}, []string{"-mod=mod -trimpath -tags=x"}},
+		{"quoted standalone field", []string{"GOFLAGS='-trimpath'"}, []string{"'-trimpath'"}},
+		{"explicit opt-out is honored", []string{"GOFLAGS=-trimpath=false"}, []string{"-trimpath=false"}},
+		{"flag text inside a quoted value is not the flag", []string{"GOFLAGS='-ldflags=-s -trimpath -w'"}, []string{"'-ldflags=-s -trimpath -w' -trimpath"}},
+		// A field that STARTS with a quote and never closes it is the go
+		// command's parse error; the value must reach it unchanged.
+		{"unterminated quote left untouched", []string{"GOFLAGS='-ldflags=-s -w"}, []string{"'-ldflags=-s -w"}},
+		{"unterminated double quote left untouched", []string{`GOFLAGS="-tags=a`}, []string{`"-tags=a`}},
+		// A quote past the field start is ordinary text to the go command (no
+		// parse error), so this is NOT the unterminated case and is merged.
+		{"quote past field start is plain text", []string{"GOFLAGS=-ldflags='-s"}, []string{"-ldflags='-s -trimpath"}},
+		{
+			"ambient and passthrough are both merged",
+			[]string{"GOFLAGS=-mod=mod", PassthroughPrefix + "GOFLAGS=-tags=y"},
+			[]string{"-mod=mod -trimpath", "-tags=y -trimpath"},
+		},
+		{"passthrough only", []string{PassthroughPrefix + "GOFLAGS=-tags=y"}, []string{"-tags=y -trimpath"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env, refused := Env(tc.base)
+			if len(refused) != 0 {
+				t.Errorf("refused = %v, want none", refused)
+			}
+			if got := goflagsEntries(env); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("GOFLAGS entries = %q, want %q (env %v)", got, tc.want, env)
+			}
+		})
+	}
+}
+
+// TestEnv_GOFLAGSOverlayKeepsPosition pins that an existing GOFLAGS entry is
+// rewritten IN PLACE (neighbours and order untouched) rather than dropped and
+// re-appended.
+func TestEnv_GOFLAGSOverlayKeepsPosition(t *testing.T) {
+	env, _ := Env([]string{"PATH=/bin", "GOFLAGS=-mod=mod", "HOME=/h"})
+	want := []string{"PATH=/bin", "GOFLAGS=-mod=mod -trimpath", "HOME=/h"}
+	if !reflect.DeepEqual(env, want) {
+		t.Errorf("Env = %v, want %v", env, want)
+	}
+}
+
+// TestSplitGOFLAGS pins the go-command-compatible tokenization directly, so a
+// drift from cmd/internal/quoted is named here rather than only surfacing as
+// an overlay subtest.
+func TestSplitGOFLAGS(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    []string
+		wantErr bool
+	}{
+		{"", nil, false},
+		{" \t\r\n ", nil, false},
+		{"-a  -b\t-c", []string{"-a", "-b", "-c"}, false},
+		{`'-ldflags=-s -w' "-tags=a b"`, []string{"-ldflags=-s -w", "-tags=a b"}, false},
+		{`-ldflags='-s -w'`, []string{`-ldflags='-s`, `-w'`}, false}, // a quote past the field start does not count
+		{`'-s`, nil, true},
+		{`"-s`, nil, true},
+	}
+	for _, tc := range tests {
+		got, err := splitGOFLAGS(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("splitGOFLAGS(%q) err = %v, wantErr %v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("splitGOFLAGS(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
