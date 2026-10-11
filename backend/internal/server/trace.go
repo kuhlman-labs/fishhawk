@@ -1289,7 +1289,13 @@ func (*Server) loadStageConstraintsFromCache(runRow *run.Run, stageType string) 
 	}
 	for _, stg := range wf.Stages {
 		if string(stg.Type) == stageType {
-			return mergeConstraints(stg.Constraints), "", "", true
+			c := mergeConstraints(stg.Constraints)
+			// The built-in agent_instruction_paths constraint (E80.12 /
+			// #3942) is applied HERE, on the success path only: it is
+			// resolved from the stage's cached spec, so every skip return
+			// above evaluates nothing, the built-in included.
+			applyAgentInstructionPolicy(stg, &c)
+			return c, "", "", true
 		}
 	}
 	return policy.Constraints{}, policy.SkipStageNotInSpec,
@@ -1338,15 +1344,19 @@ func mergeConstraints(in []spec.Constraint) policy.Constraints {
 	return out
 }
 
+// isEmptyConstraints reports whether c configures no constraint at all. It
+// has no production caller: the post-implement gate evaluates and emits
+// policy_evaluated whatever the constraint set, so there is no
+// "no-constraints" branch for a constraint to be routed down. It is kept,
+// and kept complete over every configurable kind (diff_coverage and the
+// built-in agent_instruction_paths included), as a test helper.
 func isEmptyConstraints(c policy.Constraints) bool {
 	return len(c.ForbiddenPaths) == 0 &&
 		len(c.AllowedPaths) == 0 &&
 		c.MaxFilesChanged == 0 &&
 		len(c.RequiredOutcomes) == 0 &&
-		// A stage whose ONLY constraint is diff_coverage is not
-		// constraint-free; omitting this would route it down the
-		// no-constraints path and never evaluate the gate.
-		c.DiffCoverage == nil
+		c.DiffCoverage == nil &&
+		c.AgentInstructionPaths == nil
 }
 
 // failStageCategoryB transitions the stage to failed with category

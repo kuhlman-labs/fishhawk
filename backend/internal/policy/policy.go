@@ -1,6 +1,7 @@
 // Package policy evaluates the closed set of workflow-spec
 // constraints (forbidden_paths, allowed_paths, max_files_changed,
-// required_outcomes) against a stage's actual output. One or more
+// required_outcomes, diff_coverage, and the built-in
+// agent_instruction_paths) against a stage's actual output. One or more
 // violations means the stage failed as category-B (constraint /
 // policy violation) per MVP_SPEC §6.
 //
@@ -23,6 +24,8 @@ import (
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/agentpaths"
 )
 
 // Status is the per-file change kind. Values mirror the single
@@ -51,13 +54,16 @@ type ChangedFile struct {
 	// R/C rows and empty for every ordinary row (and for older bundles
 	// that predate the wire field, which decode to empty).
 	//
-	// INFORMATIONAL to the policy engine: no check function reads it, so
-	// CountedFileCount, forbidden-paths, allowed-paths, and every other
-	// evaluator see byte-identical input whether or not it is populated —
-	// a rename stays ONE counted row on its destination Path. It exists so
-	// the backend's scope-provenance evidence can map a declared-deleted
-	// path to its rename destination rather than reporting it untouched
-	// (#2398). Mirror of the runner's constraint.ChangedFile.OldPath.
+	// ONE check reads it: the built-in agent_instruction_paths check
+	// (E80.12 / #3942) treats an R row's OldPath as a candidate, because a
+	// rename moves the source away and changes what a CLI discovers there.
+	// A C (copy) row's OldPath is never a candidate (the source is
+	// untouched). Every other evaluator — CountedFileCount, forbidden-paths,
+	// allowed-paths — ignores it, so a rename stays ONE counted row on its
+	// destination Path. It also lets the backend's scope-provenance evidence
+	// map a declared-deleted path to its rename destination rather than
+	// reporting it untouched (#2398). Mirror of the runner's
+	// constraint.ChangedFile.OldPath.
 	OldPath string
 }
 
@@ -201,6 +207,26 @@ type Constraints struct {
 	// json tag round-trips it through the post-CI re-evaluation like its
 	// siblings above.
 	CIGreenUnresolvable bool `json:"ci_green_unresolvable,omitempty"`
+	// AgentInstructionPaths is the built-in agent-instruction-path
+	// constraint (E80.12 / #3942), resolved from the stage's spec by
+	// spec.Stage.AgentInstructionPathsRule. nil means NOT applied (a
+	// non-implement stage, an implement stage that opted out with
+	// enforce: false, or a payload written before the constraint existed);
+	// a non-nil value — `{}` in the audit payload when nothing is exempt —
+	// means enforced. Like its siblings above, the json tag is load-bearing:
+	// the post-CI re-evaluation decodes EvaluationPayload.Applied and
+	// re-emits it, so an untagged field would silently drop the check.
+	AgentInstructionPaths *AgentInstructionPathsConfig `json:"agent_instruction_paths,omitempty"`
+}
+
+// AgentInstructionPathsConfig is the resolved, ENFORCED built-in
+// agent-instruction-path constraint. Writable lists EXACT, case-sensitive
+// repo-relative paths the stage may still write; `AGENTS.md` exempts only the
+// root file, never `agents.md` or `docs/AGENTS.md`. Mirror of the runner's
+// constraint.AgentInstructionPaths (whose Enforce field has no counterpart
+// here: an opted-out stage resolves to a nil config, not a disabled one).
+type AgentInstructionPathsConfig struct {
+	Writable []string `json:"writable,omitempty"`
 }
 
 // DiffCoverageConfig is the stage's declared `diff_coverage` constraint,
@@ -307,8 +333,49 @@ func Evaluate(diff Diff, c Constraints) []Violation {
 	if c.DiffCoverage != nil {
 		out = append(out, checkDiffCoverage(*c.DiffCoverage, c.DiffCoverageSignal)...)
 	}
+	if c.AgentInstructionPaths != nil {
+		out = append(out, checkAgentInstructionPaths(diff, c.AgentInstructionPaths.Writable)...)
+	}
 
 	return out
+}
+
+// checkAgentInstructionPaths flags every changed file that writes an
+// agent-instruction path (agentpaths.IsInstructionPath) not EXACTLY listed in
+// writable, as ONE violation naming the offending paths in diff order. A
+// row's candidates are its Path and, on an R (rename) row only, its OldPath:
+// a rename moves the source away, which changes what a CLI discovers there. A
+// C (copy) row leaves its source untouched, so its OldPath is never a
+// candidate. Mirror of the runner's constraint.checkAgentInstructionPaths;
+// change them together.
+func checkAgentInstructionPaths(diff Diff, writable []string) []Violation {
+	exempt := make(map[string]bool, len(writable))
+	for _, w := range writable {
+		exempt[w] = true
+	}
+	seen := map[string]bool{}
+	var hit []string
+	for _, f := range diff.ChangedFiles {
+		candidates := []string{f.Path}
+		if f.Status == StatusRenamed && f.OldPath != "" {
+			candidates = append(candidates, f.OldPath)
+		}
+		for _, p := range candidates {
+			if seen[p] || exempt[p] || !agentpaths.IsInstructionPath(p) {
+				continue
+			}
+			seen[p] = true
+			hit = append(hit, p)
+		}
+	}
+	if len(hit) == 0 {
+		return nil
+	}
+	return []Violation{{
+		Constraint: "agent_instruction_paths",
+		Detail:     fmt.Sprintf("%d agent-instruction path(s) changed; the built-in constraint forbids them unless the stage lists the exact path in agent_instruction_paths.writable", len(hit)),
+		Files:      hit,
+	}}
 }
 
 // checkDiffCoverage evaluates the declared `diff_coverage` constraint

@@ -73,8 +73,9 @@ type ScopePrecheckPayload struct {
 // Advisory-only and fail-open: a missing/unparseable workflow spec or a
 // run whose workflow has no implement stage produces NO entry and NO
 // block (the upload is never unwound). Only the path/scope-knowable
-// constraints are evaluated — forbidden_paths, allowed_paths, and
-// max_files_changed; required_outcomes is deliberately excluded (see
+// constraints are evaluated — forbidden_paths, allowed_paths,
+// max_files_changed, and the built-in agent_instruction_paths (E80.12 /
+// #3942); required_outcomes is deliberately excluded (see
 // resolveImplementConstraints) because tests_added_or_updated and
 // ci_green have no reliable signal from scope.files at plan time.
 //
@@ -170,7 +171,11 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 // no implement stage.
 //
 // Only the path/scope-knowable constraints survive the flatten:
-// forbidden_paths, allowed_paths, and max_files_changed. RequiredOutcomes
+// forbidden_paths, allowed_paths, and max_files_changed — plus the
+// built-in agent_instruction_paths, applied from the stage's
+// AgentInstructionPathsRule by applyAgentInstructionPolicy, exactly as
+// the post-implement gate applies it, so a plan scoping an
+// agent-instruction path is flagged at the plan gate. RequiredOutcomes
 // is deliberately dropped — at plan time tests_added_or_updated run
 // against scope.files would flag any plan that doesn't enumerate a test
 // file (the implement agent routinely adds tests beyond scope), and
@@ -195,10 +200,29 @@ func (s *Server) resolveImplementConstraints(ctx context.Context, runRow *run.Ru
 	}
 	for _, st := range wf.Stages {
 		if st.Type == spec.StageTypeImplement {
-			return flattenPathConstraints(st.Constraints), st.ID, true
+			c := flattenPathConstraints(st.Constraints)
+			applyAgentInstructionPolicy(st, &c)
+			return c, st.ID, true
 		}
 	}
 	return policy.Constraints{}, "", false
+}
+
+// applyAgentInstructionPolicy maps the stage's resolved built-in
+// agent-instruction-path rule (spec.Stage.AgentInstructionPathsRule,
+// E80.12 / #3942) onto c: an enforced stage gets a non-nil config carrying
+// its exact writable exemptions, and an unenforced one (a non-implement
+// stage, or an implement stage that opted out with enforce: false) is left
+// nil, i.e. not applied. It is the ONE mapping both the post-implement gate
+// (loadStageConstraintsFromCache) and the plan-gate scope precheck
+// (resolveImplementConstraints) call, so the two cannot disagree.
+func applyAgentInstructionPolicy(st spec.Stage, c *policy.Constraints) {
+	enforced, writable := st.AgentInstructionPathsRule()
+	if !enforced {
+		c.AgentInstructionPaths = nil
+		return
+	}
+	c.AgentInstructionPaths = &policy.AgentInstructionPathsConfig{Writable: writable}
 }
 
 // resolveImplementRequiredOutcomes returns the first implement stage's

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -844,5 +845,83 @@ func TestReevaluateCIPolicy_LegacyRowWithoutCommentOnly_UnchangedVerdict(t *test
 	}
 	if strings.Contains(string(raw), "comment_only") {
 		t.Errorf("legacy applied_constraints gained a comment_only key: %s", raw)
+	}
+}
+
+// TestReevaluateCIPolicy_PreservesAgentInstructionPaths pins the post-CI
+// round trip of the built-in agent_instruction_paths constraint (E80.12 /
+// #3942). The re-eval decodes the prior row's Applied, rebuilds the diff from
+// the payload's file list (reconstructPolicyDiff), and re-emits. The config
+// and its exact writable exemption must survive, and so must the R row's
+// old_path: it is the ONLY instruction path in the diff that is not exempt, so
+// if either dropped the re-emitted row would lose the violation and pass.
+func TestReevaluateCIPolicy_PreservesAgentInstructionPaths(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	aip := &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}}
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "AGENTS.md", Status: policy.StatusModified},
+		{Path: "docs/notes.md", OldPath: ".claude/settings.json", Status: policy.StatusRenamed},
+	}}
+	applied := policy.Constraints{RequiredOutcomes: []string{"ci_green"}, AgentInstructionPaths: aip}
+	priorViolations := policy.Evaluate(diff, applied)
+	if len(priorViolations) != 1 || priorViolations[0].Constraint != "agent_instruction_paths" {
+		t.Fatalf("fixture precondition: prior violations = %+v, want one agent_instruction_paths", priorViolations)
+	}
+	entries := make([]policy.DiffEntry, 0, len(diff.ChangedFiles))
+	for _, f := range diff.ChangedFiles {
+		entries = append(entries, policy.DiffEntry(f))
+	}
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType:        "implement",
+		Diff:             entries,
+		Applied:          applied,
+		Violations:       priorViolations,
+		Passed:           false,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if !reflect.DeepEqual(got.Applied.AgentInstructionPaths, aip) {
+		t.Fatalf("Applied.AgentInstructionPaths = %+v after re-eval, want %+v", got.Applied.AgentInstructionPaths, aip)
+	}
+	if !reflect.DeepEqual(got.Violations, priorViolations) {
+		t.Errorf("Violations = %+v, want the identical prior violation %+v", got.Violations, priorViolations)
+	}
+	if got.Passed {
+		t.Error("Passed = true, want false (the rename source is still an un-exempt instruction path)")
+	}
+}
+
+// TestReevaluateCIPolicy_LegacyRowWithoutAgentInstructionPaths_UnchangedVerdict
+// is the rollback/compat half: a row written before the built-in existed has
+// no agent_instruction_paths key, decodes to nil (not applied), and re-evaluates
+// to a pass even though its diff touches an instruction path.
+func TestReevaluateCIPolicy_LegacyRowWithoutAgentInstructionPaths_UnchangedVerdict(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType:        "implement",
+		Diff:             []policy.DiffEntry{{Path: "CLAUDE.md", Status: policy.StatusModified}},
+		Applied:          policy.Constraints{RequiredOutcomes: []string{"ci_green"}},
+		Passed:           true,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if got.Applied.AgentInstructionPaths != nil || len(got.Violations) != 0 || !got.Passed {
+		t.Fatalf("re-eval = %+v, want a pass with nothing applied", got)
 	}
 }

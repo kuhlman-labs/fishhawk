@@ -1,6 +1,6 @@
 # backend/internal/policy
 
-Backend-side source of truth for the closed set of workflow-spec constraints (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`). `Evaluate` runs them against a stage's produced diff; `EmitEvaluation` writes the chained `policy_evaluated` audit entry that compliance exports quote. The runner runs the same checks in-line (`runner/internal/constraint/`) for immediate agent feedback, but its report alone is not auditable — the backend re-evaluates every uploaded trace here.
+Backend-side source of truth for the closed set of workflow-spec constraints (`forbidden_paths`, `allowed_paths`, `max_files_changed`, `required_outcomes`, `diff_coverage`, and the built-in `agent_instruction_paths`). `Evaluate` runs them against a stage's produced diff; `EmitEvaluation` writes the chained `policy_evaluated` audit entry that compliance exports quote. The runner runs the same checks in-line (`runner/internal/constraint/`) for immediate agent feedback, but its report alone is not auditable — the backend re-evaluates every uploaded trace here.
 
 ## `required_outcomes` — the two test-shaped outcomes
 
@@ -82,8 +82,20 @@ Returns **nil** (read as a violation, never a pass) when: the bundle carries no 
 
 `Constraints` is the `applied_constraints` shape of the `policy_evaluated` audit payload (`EvaluationPayload.Applied`). The post-CI re-evaluation (`backend/internal/server/policy_reeval.go`) **decodes the prior payload, mutates only `CIGreen`, and re-emits** — so every signal field must be exported and json-tagged or it is silently dropped on re-eval, turning a satisfied outcome into a violation. `Verification` carries an explicit `json:"verification,omitempty"` tag for exactly this reason; the `omitempty` keeps pre-#1886 audit entries byte-identical.
 
+## Built-in `agent_instruction_paths` (E80.12 / #3942)
+
+The one constraint no spec has to declare. `Constraints.AgentInstructionPaths` is non-nil when the stage's resolved rule (`spec.Stage.AgentInstructionPathsRule`) is enforced — every implement stage, at every workflow major, unless a workflow-v2 stage opts out — and nil when it is not applied. The server maps the rule onto `Constraints` in ONE helper, `applyAgentInstructionPolicy` (`backend/internal/server/scope_precheck.go`), called by both the post-implement gate (`loadStageConstraintsFromCache`) and the plan-gate scope precheck (`resolveImplementConstraints`).
+
+- **Predicate.** `checkAgentInstructionPaths` runs LAST in `Evaluate` and flags every changed file `backend/internal/agentpaths.IsInstructionPath` matches (the `.agents`/`.claude`/`.codex` dirs as any component; `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md` at any depth; all case-insensitive) as ONE violation listing the paths in diff order.
+- **Exemptions are exact.** `Writable` entries are case-sensitive, repo-relative paths, never globs: `AGENTS.md` exempts the root file only, not `agents.md` or `docs/AGENTS.md`.
+- **Renames.** An R row's `OldPath` is a candidate (moving an instruction file away changes what a CLI discovers); a C row's is not (its source is untouched). This is stricter than `forbidden_paths`, which reads only `Path`, and it is why `DiffEntry.OldPath` must round-trip through the post-CI re-eval.
+- **Only when the spec resolves.** The built-in is resolved from the run's cached spec, so the gate applies it only on the success path. A stage skipped as `spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec` or `stage_not_in_spec` gets no built-in protection from this gate, and neither does a `no_diff_in_bundle` stage (there is no diff to check).
+- **Audit shape.** An enforced config with nothing exempt is `"agent_instruction_paths":{}` in `applied_constraints`; a row written before the built-in existed has no key, decodes to nil, and re-evaluates byte-identically.
+- **Runner twin.** `runner/internal/constraint` carries the same check and list (it cannot import backend); the shared fixture `testdata/policy/agent-instruction-classes.json` pins both, and this package's `TestAgentInstructionPaths_FixtureProbes` drives its probes through `Evaluate`.
+
 ## Anchors
 
+- E80.12 / #3942 — the built-in `agent_instruction_paths` constraint and its one canonical list (`backend/internal/agentpaths`).
 - #2660 — the comment-only Go exemption, its plan-gate sibling (`plan_missing_required_tests`), and the runner mirror.
 - #1886 / ADR-059 — substance-aware `verification_reported` (workflow-v1.5).
 - #610 / #601 — the `tests_added_or_updated` heuristic and its docs-only scoping.
