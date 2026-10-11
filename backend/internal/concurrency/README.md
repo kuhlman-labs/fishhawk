@@ -3,8 +3,10 @@
 Slot store for local stage concurrency groups (#3964 / ADR-087 #3968). The
 host-dispatch spawn marker asks `Admit` for a slot before it moves a
 host-dispatched stage to `dispatched`. Read surfaces call `StatusForStages`.
-Table: `stage_concurrency_slots` (migration 0097). The SQL is hand-written
-pgx, with no sqlc (same precedent as `captain/store.go`).
+An operator moves one queued waiter to the front with `Promote` (#4191).
+Table: `stage_concurrency_slots` (migration 0097; `order_key` added by 0102).
+The SQL is hand-written pgx, with no sqlc (same precedent as
+`captain/store.go`).
 
 ## Contract
 
@@ -48,7 +50,10 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
   status carries `Host` + `HeldDispatchedAt` (informational) and
   `AdmissionNonce`, which is what a client that lost an admission response
   uses to tell its own admission from another session's (§ "Admission
-  nonce").
+  nonce"). A queued status carries `Promoted` (its `order_key` is set in this
+  episode); a held status never does. Positions follow the effective key
+  (§ "Ordering and `order_key`").
+- `Promote(ctx, PromoteRequest) (Promotion, error)`: § "Promote".
 
 ## Admit, step by step (one transaction, one pooled connection)
 
@@ -70,6 +75,9 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    key), so a request naming a different group RE-KEYS that row: it moves
    into the new group at the new group's tail and stops counting ahead in the
    old one (§ "Verify group (ADR-092 D3)", approval condition 5 of #4200).
+   A restart also sets `order_key = NULL`: a promotion lasts for its queue
+   episode only. The keep arm leaves `order_key` untouched, and the upsert
+   returns the row's effective key, which step 5 counts ahead from.
 5. Read the holders and the queued-ahead counts.
 6. **Lock miss**: commit the queued row and return `Contended=true`, with a
    position/holders snapshot.
@@ -99,7 +107,7 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    excluded, so the winner may go ahead of it once. Someone is still admitted.
 8. Admit: `run.TransitionStageFromLiveRunTx(... From → dispatched)` (the 0072
    trigger stamps `dispatched_at`), then mark the row `held`, recording the
-   request's admission nonce. The live-run CAS then reads the run's state in
+   request's admission nonce and clearing `order_key`. The live-run CAS then reads the run's state in
    the same transaction (#4035). That read sits AFTER the holders read on
    purpose: B is admitted only once that read sees the previous holder
    settled, so under READ COMMITTED a cancel or failure that committed before
@@ -109,6 +117,109 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
 
 Every time comparison uses the database clock. No Go `time.Now()` value is
 passed into SQL.
+
+## Ordering and `order_key`
+
+Admission is FIFO except for a promoted waiter. A queued row's effective key
+is `COALESCE(order_key, enqueued_at)` and the admit order is
+`(effective key, stage_id)`. `order_key` (0102) is NULL on every row
+`Promote` did not touch, so an unpromoted queue is strict FIFO by
+`enqueued_at` (every `TestAdmit_*` FIFO test is unchanged). `aheadSQL` counts
+rows ahead of the caller's effective key. Its `round_ahead` filter stays on
+`enqueued_at <= round start`, because that filter is about when a row was
+COMMITTED (§ "Admit" step 7), and a promotion never changes that.
+`enqueued_at` is never rewritten by a promotion, so `WaitedSeconds` and the
+queued-for figures stay truthful.
+
+`order_key` is cleared by the episode-restart rule (held -> queued, a re-key
+into another group, a stale restart at the tail) and by the held mark. A
+promotion therefore means "move to the front for the next admission", and it
+ends with the waiter's current episode
+(`TestPromote_EpisodeRestartClearsPromotion`).
+
+**Two promotions: the newest wins.** `Promote` sets `order_key` to the minimum
+effective key over every OTHER fresh waiter minus 1 ms, so promoting C and then
+B orders the queue B, C, A (`TestPromote_NewestPromotionWins`). `timestamptz`
+has microsecond resolution, so the promoted key is strictly first.
+
+## Promote
+
+`Promote(ctx, PromoteRequest{StageID, Record}) (Promotion, error)` moves one
+queued waiter ahead of every other fresh waiter in its group and account.
+`Record` is REQUIRED: a nil `Record` or a nil `StageID` is refused with
+`ErrInvalidRequest` before any SQL runs. `Record` runs inside the promotion
+transaction after the order key is written and before COMMIT, and only when
+the order changed. A non-nil error rolls the whole promotion back. The server
+appends the `stage_concurrency_promoted` audit row through it, so a promotion
+never commits unaudited (`TestPromote_RecordErrorRollsBack` reads the
+committed `order_key` back as NULL).
+
+`Promotion{StageID, RunID, GroupKey, Limit, Changed, OldPosition,
+NewPosition, Holders}`. `Holders` is never nil. A stage already first answers
+`Changed=false` with positions 1/1, writes nothing and does not call `Record`.
+
+Step by step (one transaction, one pooled connection):
+
+1. Unlocked peek: the stage's run and `runs.account_id`, and its slot row's
+   `group_key`. No stage row returns (wrapped) `run.ErrNotFound`. No slot row
+   returns `ErrNotQueued`.
+2. `pg_advisory_xact_lock(lockKey(account, group))`, BLOCKING. It is the same
+   key `Admit` try-locks, so a promote waits for an in-flight admission round
+   to commit (`TestPromote_WaitsForGroupLock`,
+   `TestPromote_RacingAdmitNeverDoubleAdmits`), and an admitter arriving
+   during the promote answers `Contended` (queued, undecided; the slot waiter
+   retries). `Admit` never waits on this lock, so a blocking acquirer cannot
+   deadlock with it.
+3. Lock the stage row (`FOR UPDATE`): every slot-row write for a stage happens
+   under it.
+4. Re-read the slot row `FOR UPDATE` and classify:
+
+   | Condition | Result |
+   |---|---|
+   | no row | `ErrNotQueued` |
+   | `group_key` differs from the peek | `ErrSlotChanged` |
+   | `held` and the stage is `dispatched`/`running` | `ErrSlotHeld` (holders are never preempted) |
+   | `held` otherwise (a previous episode's row not yet re-polled) | `ErrNotQueued` |
+   | `queued` and the stage is not `pending`/`awaiting_host_dispatch` | `ErrNotQueued` |
+   | `queued` but `last_seen_at` past `QueueTTL` | `ErrWaiterNotLive` |
+
+   A stale waiter is refused rather than refreshed: refreshing would let a
+   dead waiter block the group for a `QueueTTL`, and a stale row restarts at
+   the tail on its next poll anyway, which would lose the promotion. The
+   operator re-dispatches it (it re-queues at the tail with a live waiter) and
+   then promotes it.
+5. Holders, and the old position via `aheadSQL`. With nothing ahead, return
+   the no-op.
+6. `UPDATE ... SET order_key = min(other fresh waiters' effective key) - 1 ms
+   WHERE stage_id = $2 AND state = 'queued'`. The "other fresh waiters" are the
+   `aheadSQL` predicate: same group and account, fresh, stage still
+   host-dispatchable. `enqueued_at`, `last_seen_at` and every other row,
+   including every held row, are untouched
+   (`TestPromote_HeldStageRefusedNeverPreempted` and
+   `TestPromote_PromotedWaiterAdmittedNextThenFIFO` compare held rows byte for
+   byte).
+7. The new position via `aheadSQL` (it is 1).
+8. `Record(ctx, tx, promotion)`; an error rolls back.
+
+Every time comparison uses `clock_timestamp()`.
+
+"Never more than `Limit` holders" is enforced by `Admit`'s try-lock and the
+derived holders, not by `Promote`, which never admits anything.
+`TestPromote_StressNeverExceedsLimit` is a regression guard for it.
+
+**Scope: local stage concurrency groups only.** This store never touches the
+ADR-092/093 merge-candidate queue (`backend/internal/mergequeue`, its own
+`fishhawk:mergequeue` lock domain, run-keyed entries). ADR-093 D7 reserves
+`merge_queue_promoted` for that queue's promote, which #4297 ships as a
+separate verb; ADR-092 Q4's "the promote verb (#4191) may move a held pass
+ahead" is fulfilled by that verb, not this one. A verify-only pass already
+re-opened and waiting for a `local-verify:<host>` slot is a stage waiter here
+like any other; a pass still HELD in the merge-candidate queue is not.
+
+**ADR-094 interaction (not implemented).** ADR-094 moves a stage to a set of
+groups with strict per-group FIFO. A single per-row `order_key` would then
+apply in every group of the stage's set; that is carried into the ADR-094
+implementation issues.
 
 ## Verify group (ADR-092 D3)
 
@@ -180,7 +291,8 @@ released by the existing reap machinery (the stage leaves `dispatched`/
 
 A queued row counts as "ahead" only while all of these hold: it is fresh
 (`last_seen_at > now - QueueTTL`), its stage is still `pending`/
-`awaiting_host_dispatch`, and it is in the same group and account.
+`awaiting_host_dispatch`, it is in the same group and account, and its
+effective key (§ "Ordering and `order_key`") sorts before the caller's.
 
 ## Constants
 
@@ -212,12 +324,18 @@ A queued row counts as "ahead" only while all of these hold: it is fresh
   concurrent marker calls need at most N connections only while each one is
   inside `Admit`, and none of them waits on a connection held by another.
 - **Full lock order:** admission mutex (process-local) → group advisory lock →
-  stage row (`FOR UPDATE`) → run row. `Admit` itself never locks a run row: it
-  READS the run's state with a plain `SELECT` on the admit path (#4035), which
-  adds no lock edge.
+  stage row (`FOR UPDATE`) → slot row → run row. `Admit` itself never locks a
+  run row: it READS the run's state with a plain `SELECT` on the admit path
+  (#4035), which adds no lock edge.
   The existing stage-then-run paths (`transitionStage`,
-  `ResumeAwaitingInputAndAppend`) start below the group lock, and no other
-  path takes the group lock, so no cycle is introduced.
+  `ResumeAwaitingInputAndAppend`) start below the group lock. The only other
+  path that takes the group lock is `Promote`, which takes the same order:
+  group lock (BLOCKING) → stage row → slot row → run row (its `Record`
+  callback's audit append locks the run row). `Admit` only try-locks the
+  group, so it never waits on a promote, and no cycle is introduced.
+- **A promote holds one connection while it waits.** The wait is for an
+  in-flight admission transaction (milliseconds) and is bounded by the
+  request context.
 - **The CAS must stay inside the admission transaction.** A CAS on another
   connection blocks on locks the admission transaction holds. The
   counterfactual that routes it through the pool hangs.
@@ -232,7 +350,7 @@ collision only produces a spurious contended/queued answer.
 
 ## Tenancy (approval condition 6)
 
-`Admit` and `StatusForStages` run on the raw pool with **no tenant GUC**,
+`Admit`, `StatusForStages` and `Promote` run on the raw pool with **no tenant GUC**,
 under the runtime role. Today that role is a superuser, which bypasses RLS
 (see 0057's caveat). The table has no `account_id` and no RLS, like
 `repo_acl_entries`. Account scoping is therefore EXPLICIT:
