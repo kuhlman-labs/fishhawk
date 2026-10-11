@@ -3481,12 +3481,23 @@ func (c *apiClient) ReconcileRunReviews(ctx context.Context, runID uuid.UUID) (*
 // Wholly EMPTY on the already_recorded no-op arm: that call appended nothing
 // and the backend deliberately zeroes the block so the response cannot claim a
 // row it did not write.
+//
+// CredentialSource and PullRequestURLSource (#4222) say how the observation
+// was reached: credential_source is "run" (the run's own installation) or
+// "repository_installation" (the GitHub App's current installation on the run's
+// repository, resolved because the run carries no credential);
+// pull_request_url_source is "run_row" or "pull_request_opened_audit" (derived
+// from the run's newest pull_request_opened entry because the run row carries
+// no URL). Both are omitempty on the backend, so an older backend or the
+// already_recorded arm decodes them to "".
 type MergeObservationFact struct {
-	PullRequestURL    string `json:"pull_request_url"`
-	PullRequestNumber int    `json:"pull_request_number"`
-	MergeCommitSHA    string `json:"merge_commit_sha"`
-	MergedAt          string `json:"merged_at"`
-	ObservedAt        string `json:"observed_at"`
+	PullRequestURL       string `json:"pull_request_url"`
+	PullRequestNumber    int    `json:"pull_request_number"`
+	MergeCommitSHA       string `json:"merge_commit_sha"`
+	MergedAt             string `json:"merged_at"`
+	ObservedAt           string `json:"observed_at"`
+	CredentialSource     string `json:"credential_source,omitempty"`
+	PullRequestURLSource string `json:"pull_request_url_source,omitempty"`
 }
 
 // RecordMergeObservationResult mirrors the 200 body of
@@ -3514,11 +3525,16 @@ type RecordMergeObservationResult struct {
 // evidence gate needs. Idempotent: a repeat answers already_recorded:true
 // having appended nothing.
 //
+// A run carrying no forge credential reads through the GitHub App's current
+// installation on its own repository, and a run row carrying no PR URL derives
+// one from its newest pull_request_opened entry (#4222); the observation's
+// credential_source / pull_request_url_source record which.
+//
 // 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
 // code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
 // 409 record_merge_observation_{no_pull_request,malformed_pr_url,
-// pr_url_repo_mismatch,pr_not_merged,no_merge_commit,no_merge_timestamp},
-// 502 record_merge_observation_forge_unavailable,
+// pr_url_repo_mismatch,pr_not_merged,no_merge_commit,no_merge_timestamp,
+// no_credential}, 502 record_merge_observation_forge_unavailable,
 // 503 record_merge_observation_unconfigured.
 func (c *apiClient) RecordMergeObservation(ctx context.Context, runID uuid.UUID) (*RecordMergeObservationResult, error) {
 	var res RecordMergeObservationResult
@@ -3560,8 +3576,25 @@ type ReconcileMergeResult struct {
 	RunState   string               `json:"run_state"`
 }
 
-// ReconcileMerge invokes the SETTLE half of the #3083 merge-recovery pair. It
-// takes NO request body — the handler reads only the run_id path value.
+// reconcileMergeRequest mirrors the OPTIONAL body of
+// POST /v0/runs/{run_id}/reconcile-merge
+// (backend/internal/server/merge_supersede.go::reconcileMergeRequest, #4222).
+// HAND-MAINTAINED WIRE MIRROR (#371): the json tag MUST byte-match, and the
+// backend decodes with DisallowUnknownFields, so this struct must carry no
+// other field. Unexported on purpose: it is only ever built by ReconcileMerge.
+type reconcileMergeRequest struct {
+	SupersedeStranded bool `json:"supersede_stranded"`
+}
+
+// ReconcileMerge invokes the SETTLE half of the #3083 merge-recovery pair.
+//
+// supersedeStranded=false sends NO request body, so the call is wire-identical
+// to the pre-#4222 verb. supersedeStranded=true sends exactly
+// {"supersede_stranded":true}, opting into the stranded arm: on an already
+// merged run the backend also retires implement/review/acceptance stages
+// stranded in dispatched/running and review/acceptance gates still pending,
+// refusing the whole call when an in-flight candidate shows database-stamped
+// activity inside its idle threshold.
 //
 // It NEVER re-reads the forge: its evidence gate reads the run's audit CHAIN
 // only, which is exactly why RecordMergeObservation exists and must run first
@@ -3569,12 +3602,21 @@ type ReconcileMergeResult struct {
 // lists.
 //
 // 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
-// code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
-// 409 reconcile_merge_pr_not_merged, 409 reconcile_merge_not_applicable,
+// code verbatim: 400 validation_failed (bad UUID, or a malformed body),
+// 401/403, 404 run_not_found, 409 reconcile_merge_pr_not_merged,
+// 409 reconcile_merge_not_applicable, 409 reconcile_merge_stage_live,
 // 503 reconcile_merge_unconfigured.
-func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID) (*ReconcileMergeResult, error) {
+func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID, supersedeStranded bool) (*ReconcileMergeResult, error) {
+	var body []byte
+	if supersedeStranded {
+		b, err := json.Marshal(reconcileMergeRequest{SupersedeStranded: true})
+		if err != nil {
+			return nil, fmt.Errorf("marshal reconcile-merge body: %w", err)
+		}
+		body = b
+	}
 	var res ReconcileMergeResult
-	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reconcile-merge", nil, &res); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reconcile-merge", body, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil

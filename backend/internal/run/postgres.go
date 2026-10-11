@@ -850,6 +850,73 @@ func (r *postgresRepo) ReviveRunOnReopen(ctx context.Context, runID, reviewStage
 	return revivedRun, revivedStage, nil
 }
 
+// Compile-time assertion that the concrete postgres repo carries the
+// StrandedStageMergeSuperseder capability (#4222), so reconcile-merge's
+// stranded arm cannot silently degrade to its capability-absent refusal.
+var _ StrandedStageMergeSuperseder = (*postgresRepo)(nil)
+
+// SupersedeStrandedStageOnMerge is the stranded merge-supersede
+// (StrandedStageMergeSuperseder, #4222): in ONE transaction it row-locks the
+// stage and refuses, before any write, on state drift
+// (StageStateChangedError), attempt drift for a non-empty expectedAttempt
+// (StageAttemptChangedError), a (stage_type, from) pair outside
+// stageStrandedMergeSupersedeTransitions (InvalidTransitionError) and, for a
+// dispatched/running row, a DB-stamped updated_at after idleCutoff
+// (StageRecentlyActiveError). Only then does it write `superseded` through the
+// existing UpdateStageState query (failure fields NULL, started_at COALESCEd)
+// with ended_at stamped, mirroring transitionStageTx's terminal stamping.
+//
+// It deliberately does NOT route through transitionStageTx: that union is
+// shared by every ordinary transition caller, and admitting running →
+// superseded there would let any of them retire a live stage.
+func (r *postgresRepo) SupersedeStrandedStageOnMerge(ctx context.Context, stageID uuid.UUID, from StageState, expectedAttempt string, idleCutoff time.Time) (*Stage, error) {
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockStageForUpdate(ctx, stageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		locked := rowToStage(current)
+		if locked.State != from {
+			return StageStateChangedError{StageID: stageID, Expected: from, Actual: locked.State}
+		}
+		if expectedAttempt != "" {
+			if actual := StageAttemptToken(locked.DispatchedAt); actual != expectedAttempt {
+				return StageAttemptChangedError{StageID: stageID, Expected: expectedAttempt, Actual: actual}
+			}
+		}
+		if !ValidStageStrandedMergeSupersedeTransition(locked.Type, from, StageStateSuperseded) {
+			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(StageStateSuperseded)}
+		}
+		// Liveness re-check under the row lock: updated_at is Postgres-stamped
+		// (stages_set_updated_at trigger) on every transition and heartbeat,
+		// so a runner reporting after the caller's liveness read is caught
+		// here. It dominates dispatched_at and started_at, both of which are
+		// stamped by an UPDATE that also bumps it.
+		if strandedStageInFlight(from) && locked.UpdatedAt.After(idleCutoff) {
+			return StageRecentlyActiveError{StageID: stageID, State: from, LastActivity: locked.UpdatedAt, IdleCutoff: idleCutoff}
+		}
+		updated, err := q.UpdateStageState(ctx, rundb.UpdateStageStateParams{
+			ID:      stageID,
+			State:   string(StageStateSuperseded),
+			EndedAt: pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("update stage state: %w", err)
+		}
+		result = rowToStage(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // validateStageCompletion is the completion/FailureCategory pairing rule every
 // stage transition enforces before touching the database.
 func validateStageCompletion(to StageState, completion *StageCompletion) error {
