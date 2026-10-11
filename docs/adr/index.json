@@ -819,7 +819,8 @@
       ],
       "superseded_by": [
         "ADR-092",
-        "ADR-093"
+        "ADR-093",
+        "ADR-096"
       ],
       "applies_to": []
     },
@@ -829,7 +830,9 @@
       "path": "docs/adr/091-restart-recovery-redispatches-advisory-review-rounds.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-095"
+      ],
       "applies_to": []
     },
     {
@@ -865,6 +868,37 @@
       "supersedes": [
         "ADR-087"
       ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-095",
+      "title": "Review-coverage hold for decomposed parents, plus an operator re-run verb with its own same-head dedup bypass marker, distinct from ADR-091 D6's boot-only marker (amends ADR-091)",
+      "path": "docs/adr/095-review-coverage-hold-and-operator-rerun.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-091"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-096",
+      "title": "Merge-candidate verdict transfer across an independent base delta, plus a single verification point for decomposed parents (amends ADR-090)",
+      "path": "docs/adr/096-merge-candidate-verdict-transfer.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-090"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-097",
+      "title": "Operator as orchestrator: the driver delegates evidence work to stateless specialist jobs; the first officer keeps a standing trigger-driven watch the operator cannot silence (amends ADR-089, ADR-040)",
+      "path": "docs/adr/097-operator-as-orchestrator.md",
+      "status": "accepted",
+      "supersedes": [],
       "superseded_by": [],
       "applies_to": []
     }
