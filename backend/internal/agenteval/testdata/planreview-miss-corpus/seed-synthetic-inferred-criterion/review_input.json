@@ -97,7 +97,20 @@
     "not requested",
     "never requested",
     "not asked for",
-    "scope creep"
+    "scope creep",
+    "speculative",
+    "not stated in the issue",
+    "not in the issue",
+    "invented",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported",
+    "unjustified"
+  ],
+  "attribution_phrases": [
+    "paginate",
+    "100 items"
   ],
   "catching_examples": [
     {
@@ -141,6 +154,11 @@
       "severity": "low",
       "category": "coverage",
       "note": "Add a test that GET /widgets paginates correctly at exactly 100 items."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-list-pagination needs a test seeding more than 100 widgets to exercise the next page."
     }
   ]
 }

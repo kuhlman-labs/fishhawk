@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -19,16 +20,33 @@ const (
 	committedCatchConventions = "testdata/planreview-catchrate/representative-conventions.md"
 )
 
-// committedSyntheticCatchCases are the six hand-authored seed cases. Only
-// THESE must carry synthetic:true; a curated production case may join the
-// corpus with synthetic:false.
-var committedSyntheticCatchCases = []string{
-	"seed-synthetic-contradicts-issue",
-	"seed-synthetic-inferred-criterion",
-	"seed-synthetic-restates-approach",
-	"seed-synthetic-untestable-adjective",
-	"seed-synthetic-unwarranted-rate-limit",
-	"seed-synthetic-vacuous-criterion",
+// committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
+// the corpus has carried since E55.4; the derived list below may grow past
+// it, never shrink below it (so the derivation cannot go vacuous).
+const committedSyntheticCatchCaseFloor = 6
+
+// committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
+// seed-synthetic-* directory under the committed corpus, sorted. Only THESE
+// must carry synthetic:true; a curated production case may join the corpus
+// with synthetic:false. A literal list would oblige a test edit with every
+// new seed case.
+func committedSyntheticCatchCases(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(committedCatchCorpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "seed-synthetic-") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	if len(names) < committedSyntheticCatchCaseFloor {
+		t.Fatalf("derived %d seed-synthetic-* cases under %s, want >= %d: the derivation went vacuous", len(names), committedCatchCorpus, committedSyntheticCatchCaseFloor)
+	}
+	return names
 }
 
 // fakeCatchRateSender answers by arm: a user prompt carrying the conventions
@@ -100,9 +118,13 @@ func validCatchInput() map[string]any {
 			"predicted_runtime_minutes":    10,
 			"predicted_runtime_confidence": "medium",
 		},
-		"catch_probes":          []any{"invents a page size", "page size"},
-		"catching_examples":     []any{map[string]any{"category": "acceptance_criteria", "note": "ac-widgets-page invents a page size"}},
-		"non_catching_examples": []any{map[string]any{"category": "security", "note": "the widgets endpoint lacks auth"}},
+		"catch_probes":        []any{"invents a page size", "page size"},
+		"attribution_phrases": []any{"paginates at 100"},
+		"catching_examples":   []any{map[string]any{"category": "acceptance_criteria", "note": "ac-widgets-page invents a page size"}},
+		"non_catching_examples": []any{
+			map[string]any{"category": "security", "note": "the widgets endpoint lacks auth"},
+			map[string]any{"category": "documentation", "note": "ac-widgets-page needs an openapi.yaml example"},
+		},
 	}
 }
 
@@ -142,7 +164,7 @@ func setPlanCriteria(in map[string]any, cs []any) {
 	in["plan"].(map[string]any)["verification"].(map[string]any)["acceptance_criteria"] = cs
 }
 
-// TestLoadPlanReviewCatchCorpus_FailClosed covers every loader mode (a)-(l),
+// TestLoadPlanReviewCatchCorpus_FailClosed covers every loader mode (a)-(q),
 // each against a sibling valid case so the error is about the broken one.
 func TestLoadPlanReviewCatchCorpus_FailClosed(t *testing.T) {
 	tests := []struct {
@@ -182,12 +204,67 @@ func TestLoadPlanReviewCatchCorpus_FailClosed(t *testing.T) {
 			}
 			return in
 		}, "catching_examples[1]"},
+		// (k) under the attribution-AND-probe rule: this example matches the
+		// probe "page size" but names neither the planted id nor the phrase,
+		// so a probe-only (k) would load it.
+		{"(k) catching example matches a probe but names no planted criterion", func(in map[string]any) any {
+			in["catching_examples"] = []any{
+				map[string]any{"category": "acceptance_criteria", "note": "ac-widgets-page invents a page size"},
+				map[string]any{"category": "acceptance_criteria", "note": "one criterion invents a page size"},
+			}
+			return in
+		}, `catching_examples[1] ("one criterion invents a page size") is not a catch under the attribution-AND-probe rule`},
+		{"(k) catching example names the planted criterion but matches no probe", func(in map[string]any) any {
+			in["catching_examples"] = []any{
+				map[string]any{"category": "acceptance_criteria", "note": "ac-widgets-page needs a test"},
+			}
+			return in
+		}, "catching_examples[0]"},
+		// (n): both non-catching examples omit the planted id and the phrase;
+		// (j) still passes on them, which is exactly why (n) is required.
+		{"(n) no non-catching example names the planted criterion", func(in map[string]any) any {
+			in["non_catching_examples"] = []any{
+				map[string]any{"category": "security", "note": "the widgets endpoint lacks auth"},
+				map[string]any{"category": "documentation", "note": "the endpoint needs an openapi.yaml example"},
+			}
+			return in
+		}, "no non_catching_example names a planted criterion id or an attribution phrase"},
+		{"(o) empty attribution_phrases", func(in map[string]any) any { in["attribution_phrases"] = []any{}; return in }, "attribution_phrases must be non-empty"},
+		{"(o) absent attribution_phrases", func(in map[string]any) any { delete(in, "attribution_phrases"); return in }, "attribution_phrases must be non-empty"},
+		{"(o) whitespace attribution phrase", func(in map[string]any) any {
+			in["attribution_phrases"] = []any{"paginates at 100", " "}
+			return in
+		}, "attribution_phrases[1] is empty"},
+		// (p): "GET /widgets" occurs in the planted statement AND in
+		// ac-widgets-auth's, so it would attribute a concern about the auth
+		// criterion to the planted one.
+		{"(p) attribution phrase also occurs in another criterion's statement", func(in map[string]any) any {
+			in["attribution_phrases"] = []any{"paginates at 100", "GET /WIDGETS"}
+			return in
+		}, `attribution phrase "GET /WIDGETS" also occurs in criterion "ac-widgets-auth"'s statement`},
+		{"(p) attribution phrase absent from the planted statement", func(in map[string]any) any {
+			in["attribution_phrases"] = []any{"paginates at 100", "widget count"}
+			return in
+		}, `attribution phrase "widget count" occurs in no planted criterion's statement`},
+		// (q): the planted id is a case-folded substring of the auth
+		// criterion's id, so a concern naming that id would be attributed to
+		// the planted criterion.
+		{"(q) planted id occurs inside another criterion id", func(in map[string]any) any {
+			planCriteria(in)[0].(map[string]any)["id"] = "ac-widgets-page-auth"
+			return in
+		}, `planted criterion id "ac-widgets-page" occurs inside criterion id "ac-widgets-page-auth"`},
 		{"(l) empty catching_examples", func(in map[string]any) any { in["catching_examples"] = []any{}; return in }, "must both be non-empty"},
 		{"(l) empty non_catching_examples", func(in map[string]any) any { in["non_catching_examples"] = []any{}; return in }, "must both be non-empty"},
 		// (m): each probe below matches no non_catching_example and leaves the
 		// catching example matched, so ONLY the shown-text rule refuses it.
 		{"(m) probe is the planted criterion id (a plan value)", func(in map[string]any) any {
 			in["catch_probes"] = []any{"page size", "ac-widgets-page"}
+			// The id-bearing non-catching example would trip (j) first; a
+			// phrase-bearing one keeps (n) satisfied without matching the probe.
+			in["non_catching_examples"] = []any{
+				map[string]any{"category": "security", "note": "the widgets endpoint lacks auth"},
+				map[string]any{"category": "documentation", "note": "the paginates at 100 behaviour needs an openapi.yaml example"},
+			}
 			return in
 		}, `catch probe "ac-widgets-page" occurs in the issue or plan`},
 		{"(m) probe echoes the plan's criterion statement, case-folded", func(in map[string]any) any {
@@ -276,22 +353,25 @@ func TestLoadPlanReviewCatchCorpus_ProductionCaseLegal(t *testing.T) {
 }
 
 // TestLoadPlanReviewCatchCorpus_CommittedCorpus loads the committed corpus:
-// the six named synthetic seeds are present and synthetic:true (and ONLY they
-// are required to be), and every case's examples classify as authored through
-// ClassifyCatch — the same path the measurement scores with.
+// every derived synthetic seed is present and synthetic:true (and ONLY they
+// are required to be), every case's examples classify as authored through
+// ClassifyCatch under the attribution-AND-probe rule — the same path the
+// measurement scores with — and every case carries a non-catching example
+// that names the planted criterion (mode n).
 func TestLoadPlanReviewCatchCorpus_CommittedCorpus(t *testing.T) {
 	cases, err := LoadPlanReviewCatchCorpus(committedCatchCorpus)
 	if err != nil {
 		t.Fatalf("LoadPlanReviewCatchCorpus: %v", err)
 	}
-	if len(cases) < len(committedSyntheticCatchCases) {
-		t.Fatalf("committed corpus loaded %d cases, want >= %d", len(cases), len(committedSyntheticCatchCases))
+	seeds := committedSyntheticCatchCases(t)
+	if len(cases) < len(seeds) {
+		t.Fatalf("committed corpus loaded %d cases, want >= %d", len(cases), len(seeds))
 	}
 	byName := map[string]PlanReviewCatchCase{}
 	for _, c := range cases {
 		byName[c.Name] = c
 	}
-	for _, name := range committedSyntheticCatchCases {
+	for _, name := range seeds {
 		c, ok := byName[name]
 		if !ok {
 			t.Errorf("synthetic seed case %q missing from the committed corpus", name)
@@ -305,25 +385,70 @@ func TestLoadPlanReviewCatchCorpus_CommittedCorpus(t *testing.T) {
 		}
 	}
 	for _, c := range cases {
+		rule := c.CatchRule()
 		for i, ex := range c.Input.CatchingExamples {
-			if got := ClassifyCatch(catchVerdictJSON(t, ex), c.Input.CatchProbes); got != CatchCaught {
+			if got := ClassifyCatch(catchVerdictJSON(t, ex), rule); got != CatchCaught {
 				t.Errorf("case %q catching_examples[%d] classified %q, want caught", c.Name, i, got)
 			}
 		}
+		attributed := false
 		for i, ex := range c.Input.NonCatchingExamples {
-			if got := ClassifyCatch(catchVerdictJSON(t, ex), c.Input.CatchProbes); got != CatchMissed {
+			if got := ClassifyCatch(catchVerdictJSON(t, ex), rule); got != CatchMissed {
 				t.Errorf("case %q non_catching_examples[%d] classified %q, want missed", c.Name, i, got)
 			}
+			if _, ok := matchCatchAttribution(ex.Category, ex.Note, rule); ok {
+				attributed = true
+			}
+		}
+		if !attributed {
+			t.Errorf("case %q has no non_catching_example naming the planted criterion (mode n)", c.Name)
 		}
 	}
+	// The six E55.4 seeds keep their id-free catching example (approval
+	// condition C1): it must classify CAUGHT through a declared attribution
+	// phrase, and each seed also carries an id-bearing non-catching echo.
+	for name, idx := range idFreeSeedCatchingExamples {
+		c, ok := byName[name]
+		if !ok {
+			t.Errorf("seed case %q missing from the committed corpus", name)
+			continue
+		}
+		ex := c.Input.CatchingExamples[idx]
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, ex), c.CatchRule())
+		if trial.Outcome != CatchCaught || trial.Attribution != CatchAttributionPhrase {
+			t.Errorf("seed case %q catching_examples[%d] (%q): outcome %q attribution %q, want caught via %q", name, idx, ex.Note, trial.Outcome, trial.Attribution, CatchAttributionPhrase)
+		}
+		idEcho := false
+		for _, nc := range c.Input.NonCatchingExamples {
+			if _, ok := matchCatchProbe(nc.Category, nc.Note, c.CatchRule().CriterionIDs); ok {
+				idEcho = true
+			}
+		}
+		if !idEcho {
+			t.Errorf("seed case %q has no non_catching_example naming the planted criterion id", name)
+		}
+	}
+}
+
+// idFreeSeedCatchingExamples names, per original E55.4 seed case, the index
+// of its catching example that names no planted criterion id.
+var idFreeSeedCatchingExamples = map[string]int{
+	"seed-synthetic-contradicts-issue":      1,
+	"seed-synthetic-inferred-criterion":     1,
+	"seed-synthetic-restates-approach":      1,
+	"seed-synthetic-untestable-adjective":   1,
+	"seed-synthetic-unwarranted-rate-limit": 1,
+	"seed-synthetic-vacuous-criterion":      1,
 }
 
 // TestCommittedCatchProbes_EchoesScoreMissed pins that ordinary reviewer
 // output which merely ECHOES a case's issue or plan wording — about an
 // unrelated aspect — scores MISSED under the committed probes. The first rows
 // are the reviewer-quoted concerns that the original probes ('edge case',
-// 'approach step', 'soft delete', 'pagination') scored as catches; the
-// per-case row quotes the issue, every plan criterion and every approach step
+// 'approach step', 'soft delete', 'pagination') scored as catches, each
+// prefixed with the case's planted criterion id so the attribution half is
+// satisfied and the PROBE half is what is exercised; the per-case row quotes
+// the issue, every plan criterion (ids included) and every approach step
 // verbatim. A probe matching any of them would inflate both arms toward a
 // ceiling and hide a dilution (E55.4 / #2245 fix-up).
 func TestCommittedCatchProbes_EchoesScoreMissed(t *testing.T) {
@@ -346,8 +471,13 @@ func TestCommittedCatchProbes_EchoesScoreMissed(t *testing.T) {
 		if !ok {
 			t.Fatalf("committed corpus lacks case %q", q.caseName)
 		}
-		if got := ClassifyCatch(catchVerdictJSON(t, q.concern), c.Input.CatchProbes); got != CatchMissed {
-			t.Errorf("case %q: the echo concern %q classified %q, want missed", q.caseName, q.concern.Note, got)
+		concern := q.concern
+		concern.Note = c.Miss.Misses[0].CriterionID + ": " + concern.Note
+		if _, ok := matchCatchAttribution(concern.Category, concern.Note, c.CatchRule()); !ok {
+			t.Fatalf("case %q: fixture premise: the echo concern %q must satisfy the attribution half", q.caseName, concern.Note)
+		}
+		if got := ClassifyCatch(catchVerdictJSON(t, concern), c.CatchRule()); got != CatchMissed {
+			t.Errorf("case %q: the echo concern %q classified %q, want missed", q.caseName, concern.Note, got)
 		}
 	}
 	for _, c := range cases {
@@ -359,7 +489,7 @@ func TestCommittedCatchProbes_EchoesScoreMissed(t *testing.T) {
 			echo = append(echo, step.Description)
 		}
 		concern := CatchExampleConcern{Category: "coverage", Note: strings.Join(echo, "\n")}
-		if got := ClassifyCatch(catchVerdictJSON(t, concern), c.Input.CatchProbes); got != CatchMissed {
+		if got := ClassifyCatch(catchVerdictJSON(t, concern), c.CatchRule()); got != CatchMissed {
 			t.Errorf("case %q: a concern quoting the issue, every criterion and every approach step classified %q, want missed", c.Name, got)
 		}
 	}
@@ -555,34 +685,186 @@ func TestCatchRateArmPrompt_EmptyConventionRefusedOnWithArm(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestClassifyCatch_ThreeStates(t *testing.T) {
-	probes := []string{"ac-list-pagination", "page size"}
+	rule := CatchRule{Probes: []string{"invented", "page size"}, CriterionIDs: []string{"ac-list-pagination"}, AttributionPhrases: []string{"paginates at 100"}}
 	tests := []struct {
 		name string
 		resp string
 		want CatchOutcome
 	}{
 		{"caught via note", `{"verdict":"reject","concerns":[{"severity":"high","category":"acceptance_criteria","note":"ac-list-pagination is invented"}]}`, CatchCaught},
-		{"caught via category", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"page size","note":"unrelated words"}]}`, CatchCaught},
-		{"caught case-folded", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"x","note":"The PAGE SIZE is invented"}]}`, CatchCaught},
-		{"caught inside a fence with prose", "Here you go:\n```json\n{\"verdict\":\"reject\",\"concerns\":[{\"category\":\"c\",\"note\":\"ac-list-pagination\"}]}\n```", CatchCaught},
-		{"caught with an extra convention field", `{"verdict":"approve_with_concerns","concerns":[{"category":"repo_convention","convention":"x","note":"page size"}]}`, CatchCaught},
+		{"caught via category", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"page size","note":"ac-list-pagination: unrelated words"}]}`, CatchCaught},
+		{"caught with the id in the category", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"ac-list-pagination","note":"the page size is made up"}]}`, CatchCaught},
+		{"caught case-folded", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"x","note":"AC-LIST-PAGINATION: The PAGE SIZE is made up"}]}`, CatchCaught},
+		{"caught via an attribution phrase", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"x","note":"'Paginates at 100' is invented"}]}`, CatchCaught},
+		{"caught inside a fence with prose", "Here you go:\n```json\n{\"verdict\":\"reject\",\"concerns\":[{\"category\":\"c\",\"note\":\"ac-list-pagination is invented\"}]}\n```", CatchCaught},
+		{"caught with an extra convention field", `{"verdict":"approve_with_concerns","concerns":[{"category":"repo_convention","convention":"x","note":"ac-list-pagination page size"}]}`, CatchCaught},
 		{"missed: concerns but no probe match", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"docs","note":"document the 401"}]}`, CatchMissed},
+		{"missed: a probe without attribution", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"docs","note":"the page size is invented"}]}`, CatchMissed},
+		{"missed: attribution without a probe", `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"docs","note":"ac-list-pagination needs a doc line"}]}`, CatchMissed},
+		{"missed: the halves in two different concerns", `{"verdict":"approve_with_concerns","concerns":[{"category":"docs","note":"ac-list-pagination needs a doc line"},{"category":"scope","note":"the page size is invented"}]}`, CatchMissed},
 		{"missed: no concerns", `{"verdict":"approve"}`, CatchMissed},
 		{"undecodable: not JSON", "not json", CatchUndecodable},
 		{"undecodable: malformed JSON", `{"verdict":"approve",`, CatchUndecodable},
-		{"undecodable: unknown verdict", `{"verdict":"maybe","concerns":[{"category":"c","note":"ac-list-pagination"}]}`, CatchUndecodable},
-		{"undecodable: no verdict", `{"concerns":[{"category":"c","note":"ac-list-pagination"}]}`, CatchUndecodable},
+		{"undecodable: unknown verdict", `{"verdict":"maybe","concerns":[{"category":"c","note":"ac-list-pagination is invented"}]}`, CatchUndecodable},
+		{"undecodable: no verdict", `{"concerns":[{"category":"c","note":"ac-list-pagination is invented"}]}`, CatchUndecodable},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ClassifyCatch(tc.resp, probes); got != tc.want {
+			if got := ClassifyCatch(tc.resp, rule); got != tc.want {
 				t.Errorf("ClassifyCatch = %q, want %q", got, tc.want)
 			}
 		})
 	}
 	t.Run("an empty probe never matches", func(t *testing.T) {
-		if got := ClassifyCatch(`{"verdict":"approve_with_concerns","concerns":[{"category":"c","note":"anything"}]}`, []string{" "}); got != CatchMissed {
+		empty := CatchRule{Probes: []string{" "}, CriterionIDs: []string{"ac-x"}, AttributionPhrases: []string{"y"}}
+		if got := ClassifyCatch(`{"verdict":"approve_with_concerns","concerns":[{"category":"c","note":"ac-x y anything"}]}`, empty); got != CatchMissed {
 			t.Errorf("ClassifyCatch with an empty probe = %q, want missed", got)
+		}
+	})
+	t.Run("an empty id or phrase never attributes", func(t *testing.T) {
+		empty := CatchRule{Probes: []string{"invented"}, CriterionIDs: []string{""}, AttributionPhrases: []string{"  "}}
+		if got := ClassifyCatch(`{"verdict":"approve_with_concerns","concerns":[{"category":"c","note":"invented"}]}`, empty); got != CatchMissed {
+			t.Errorf("ClassifyCatch with an empty id and phrase = %q, want missed", got)
+		}
+	})
+}
+
+// rawCommittedCatchRule builds a committed case's catch rule straight from
+// its miss.json and review_input.json, bypassing LoadPlanReviewCatchCorpus, so
+// a classifier test reddens on its own assertion rather than on a loader
+// refusal in its setup.
+func rawCommittedCatchRule(t *testing.T, name string) (CatchRule, PlanReviewCatchInput) {
+	t.Helper()
+	var miss PlanReviewMissCase
+	if err := json.Unmarshal(mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "miss.json")), &miss); err != nil {
+		t.Fatal(err)
+	}
+	var in PlanReviewCatchInput
+	if err := json.Unmarshal(mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "review_input.json")), &in); err != nil {
+		t.Fatal(err)
+	}
+	return catchRuleFor(miss, in), in
+}
+
+// originalUntestableProbes is the untestable-adjective case's probe list
+// BEFORE #4253 widened it with the plan-review prompt's own vocabulary.
+var originalUntestableProbes = []string{
+	"untestable", "not testable", "unverifiable", "not verifiable", "not concretely verifiable",
+	"cannot be verified", "no pass/fail", "unmeasurable", "not measurable", "subjective",
+}
+
+// vagueRetryNote is #4253's done-means note: it names the planted id and the
+// widened probe "vague", and none of the original ten probes.
+const vagueRetryNote = "ac-retry-robust is vague: it names no bar an executor could check"
+
+// TestClassifyCatch_WidenedProbeCatchesVagueNote is #4253's done-means: a
+// concern in the plan-review prompt's own vocabulary ("vague") against the
+// COMMITTED untestable-adjective case scores CAUGHT, and none of the ORIGINAL
+// probes could have caught it — only the widened probe does.
+func TestClassifyCatch_WidenedProbeCatchesVagueNote(t *testing.T) {
+	rule, _ := rawCommittedCatchRule(t, "seed-synthetic-untestable-adjective")
+	if probe, ok := matchCatchProbe("acceptance_criteria", vagueRetryNote, originalUntestableProbes); ok {
+		t.Fatalf("fixture premise: the original probe %q already matches %q", probe, vagueRetryNote)
+	}
+	resp := catchVerdictJSON(t, CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: vagueRetryNote})
+	trial := ClassifyCatchTrial(resp, rule)
+	if trial.Outcome != CatchCaught {
+		t.Fatalf("ClassifyCatch(%q) against the committed untestable-adjective case = %q, want caught", vagueRetryNote, trial.Outcome)
+	}
+	if trial.MatchedProbe != "vague" || trial.Attribution != CatchAttributionID {
+		t.Errorf("matched probe %q attribution %q, want %q via %q", trial.MatchedProbe, trial.Attribution, "vague", CatchAttributionID)
+	}
+}
+
+// TestClassifyCatch_RequiresPlantedCriterionID is the attribution half: the
+// same probe-matching note scores MISSED without the planted id (and with no
+// attribution phrase), CAUGHT with it; a concern naming the id with no probe
+// scores MISSED.
+func TestClassifyCatch_RequiresPlantedCriterionID(t *testing.T) {
+	rule, _ := rawCommittedCatchRule(t, "seed-synthetic-untestable-adjective")
+	withoutID := strings.TrimPrefix(vagueRetryNote, "ac-retry-robust ")
+	if _, ok := matchCatchProbe("acceptance_criteria", withoutID, rule.Probes); !ok {
+		t.Fatalf("fixture premise: %q must match a probe", withoutID)
+	}
+	for _, tc := range []struct {
+		name, note string
+		want       CatchOutcome
+	}{
+		{"probe without the id", "this criterion " + withoutID, CatchMissed},
+		{"probe with the id", vagueRetryNote, CatchCaught},
+		{"the id without a probe", "ac-retry-robust overlaps ac-retry-gives-up", CatchMissed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := catchVerdictJSON(t, CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: tc.note})
+			if got := ClassifyCatch(resp, rule); got != tc.want {
+				t.Errorf("ClassifyCatch(%q) = %q, want %q", tc.note, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyCatch_PhraseAttributionCatchesIDFreeExample is approval
+// condition C1: an id-free committed catching example is CAUGHT through a
+// declared attribution phrase, and a concern naming both the id and a phrase
+// is recorded as id-attributed.
+func TestClassifyCatch_PhraseAttributionCatchesIDFreeExample(t *testing.T) {
+	const name = "seed-synthetic-untestable-adjective"
+	rule, in := rawCommittedCatchRule(t, name)
+	ex := in.CatchingExamples[idFreeSeedCatchingExamples[name]]
+	if _, ok := matchCatchProbe(ex.Category, ex.Note, rule.CriterionIDs); ok {
+		t.Fatalf("fixture premise: catching example %q must name no planted id", ex.Note)
+	}
+	trial := ClassifyCatchTrial(catchVerdictJSON(t, ex), rule)
+	if trial.Outcome != CatchCaught || trial.Attribution != CatchAttributionPhrase {
+		t.Fatalf("id-free example %q: outcome %q attribution %q, want caught via %q", ex.Note, trial.Outcome, trial.Attribution, CatchAttributionPhrase)
+	}
+	both := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "c", Note: "ac-retry-robust ('handles edge cases gracefully') is vague"}), rule)
+	if both.Outcome != CatchCaught || both.Attribution != CatchAttributionID {
+		t.Errorf("a concern naming the id and a phrase: outcome %q attribution %q, want caught via %q", both.Outcome, both.Attribution, CatchAttributionID)
+	}
+}
+
+// TestClassifyCatchTrial_RecordsTheTrial pins what each outcome carries for
+// the sidecar: a caught trial its matching concern (severity included), probe
+// and attribution; a missed trial every concern with its near-miss tag; an
+// undecodable trial its raw response and no concerns.
+func TestClassifyCatchTrial_RecordsTheTrial(t *testing.T) {
+	rule := CatchRule{Probes: []string{"invented"}, CriterionIDs: []string{"ac-list-pagination"}, AttributionPhrases: []string{"paginates at 100"}}
+	t.Run("caught", func(t *testing.T) {
+		resp := `{"verdict":"reject","concerns":[{"severity":"low","category":"docs","note":"unrelated"},{"severity":"high","category":"acceptance_criteria","note":"ac-list-pagination is invented"}]}`
+		got := ClassifyCatchTrial(resp, rule)
+		want := CatchTrialConcern{Severity: "high", Category: "acceptance_criteria", Note: "ac-list-pagination is invented"}
+		if got.Outcome != CatchCaught || got.MatchedProbe != "invented" || got.Attribution != CatchAttributionID ||
+			got.ConcernsTotal != 2 || len(got.Concerns) != 1 || got.Concerns[0] != want || got.Response != "" {
+			t.Fatalf("caught trial = %+v", got)
+		}
+	})
+	t.Run("missed with near-miss tags", func(t *testing.T) {
+		resp := `{"verdict":"approve_with_concerns","concerns":[` +
+			`{"severity":"medium","category":"scope","note":"the page size is invented"},` +
+			`{"severity":"low","category":"docs","note":"paginates at 100 needs a doc line"},` +
+			`{"severity":"low","category":"risk","note":"unrelated"}]}`
+		got := ClassifyCatchTrial(resp, rule)
+		wantTags := []string{NearMissProbeWithoutAttribution, NearMissAttributionWithoutProbe, ""}
+		if got.Outcome != CatchMissed || got.ConcernsTotal != 3 || len(got.Concerns) != 3 || got.MatchedProbe != "" || got.Attribution != "" {
+			t.Fatalf("missed trial = %+v", got)
+		}
+		for i, tag := range wantTags {
+			if got.Concerns[i].NearMiss != tag {
+				t.Errorf("concern %d near_miss = %q, want %q", i, got.Concerns[i].NearMiss, tag)
+			}
+		}
+		if got.Concerns[0].Severity != "medium" {
+			t.Errorf("concern severity not carried: %+v", got.Concerns[0])
+		}
+	})
+	t.Run("undecodable", func(t *testing.T) {
+		got := ClassifyCatchTrial("not json at all", rule)
+		if got.Outcome != CatchUndecodable || got.Response != "not json at all" || len(got.Concerns) != 0 {
+			t.Fatalf("undecodable trial = %+v", got)
+		}
+		if got := ClassifyCatchTrial(`{"verdict":"maybe"}`, rule); got.Outcome != CatchUndecodable || got.Response != `{"verdict":"maybe"}` {
+			t.Fatalf("unknown-verdict trial = %+v", got)
 		}
 	})
 }
@@ -614,6 +896,20 @@ func TestRunCatchRateArm_CountsPerCase(t *testing.T) {
 	}
 	if sender.calls != 6 {
 		t.Errorf("sender calls = %d, want 6", sender.calls)
+	}
+	for _, tc := range []struct {
+		r    CatchRateArmReport
+		want CatchOutcome
+	}{{without, CatchCaught}, {with, CatchUndecodable}} {
+		trials := tc.r.Trials[cases[0].Name]
+		if len(trials) != 3 {
+			t.Fatalf("arm %q recorded %d trials, want 3", tc.r.Arm, len(trials))
+		}
+		for i, tr := range trials {
+			if tr.Outcome != tc.want {
+				t.Errorf("arm %q trial %d outcome %q, want %q", tc.r.Arm, i+1, tr.Outcome, tc.want)
+			}
+		}
 	}
 }
 

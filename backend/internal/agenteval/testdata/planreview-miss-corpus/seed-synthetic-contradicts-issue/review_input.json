@@ -97,7 +97,18 @@
     "conflicts with the soft",
     "inconsistent with the issue",
     "opposite of what the issue",
-    "violates the issue"
+    "violates the issue",
+    "mismatch",
+    "diverges",
+    "contrary to",
+    "at odds with",
+    "the issue requires",
+    "the issue says",
+    "the issue states",
+    "requires a soft delete"
+  ],
+  "attribution_phrases": [
+    "removes the widget row"
   ],
   "catching_examples": [
     {
@@ -108,7 +119,7 @@
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "One explicit criterion demands a hard delete, which conflicts with the issue's soft-delete requirement."
+      "note": "One explicit criterion demands a hard delete that removes the widget row, which conflicts with the issue's soft-delete requirement."
     }
   ],
   "non_catching_examples": [
@@ -146,6 +157,11 @@
       "severity": "low",
       "category": "coverage",
       "note": "Add a handler test that DELETE /widgets/{id} removes the widget from GET /widgets."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-delete-hard and ac-delete-returns-204 could share one handler test."
     }
   ]
 }

@@ -2,7 +2,12 @@
 // #2245). It decides from the committed two-arm evidence record alone — no
 // model call, no network — via agenteval.CheckCatchRateEvidence, which
 // recomputes the verdict from the recorded counts and fails closed on an
-// absent, malformed, stale, under-powered or regressed record.
+// absent, malformed, stale, under-powered or regressed record, and on a
+// record whose per-trial sidecar (evidence.trials.json beside it, derived by
+// agenteval.CatchRateTrialsPath — no flag of its own) is absent, malformed,
+// from another recording or count-inconsistent with it. On PASS it prints the
+// sidecar path: a missed trial's concern notes, with their near-miss tags,
+// are read there.
 //
 // It lives under backend/internal/agenteval (not backend/cmd) on purpose: it
 // is a gate over agenteval's own testdata, never a shipped binary, and
@@ -71,7 +76,9 @@ func gate(args []string, stdout, stderr io.Writer) (code int, passed bool) {
 	fs.Usage = func() {
 		_, _ = fmt.Fprintf(stderr, `catchrategate — the offline plan-review catch-rate gate (E55.4 / #2245).
 
-Decides from the committed two-arm evidence record (no model call, no network).
+Decides from the committed two-arm evidence record (no model call, no network)
+and its per-trial sidecar beside it (<evidence stem>.trials.json, e.g.
+evidence.trials.json; derived from --evidence, never a separate flag).
 Exit 0: the evidence passes. Exit 1: the gate fails (reason on stderr). Exit 2: usage.
 Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 
@@ -132,6 +139,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		return 1, false
 	}
 	_, _ = fmt.Fprintln(stdout, report)
+	_, _ = fmt.Fprintln(stdout, "catchrategate: trial sidecar (per-trial concern notes, near-miss tags): "+agenteval.CatchRateTrialsPath(*evidence))
 	_, _ = fmt.Fprintln(stdout, "catchrategate: PASS")
 	return 0, true
 }

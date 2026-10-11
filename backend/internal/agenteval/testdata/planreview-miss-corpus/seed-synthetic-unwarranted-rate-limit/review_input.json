@@ -113,7 +113,20 @@
     "not requested",
     "not asked for",
     "rationale is generic",
-    "generic rationale"
+    "generic rationale",
+    "speculative",
+    "not stated in the issue",
+    "not in the issue",
+    "invented",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported",
+    "unjustified"
+  ],
+  "attribution_phrases": [
+    "429",
+    "requests per minute"
   ],
   "catching_examples": [
     {
@@ -157,6 +170,11 @@
       "severity": "medium",
       "category": "risk",
       "note": "A rate limited tenant could retry in a tight loop; add a Retry-After header."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-archive-rate-limit's test should use a fake clock rather than sleeping for a minute."
     }
   ]
 }
