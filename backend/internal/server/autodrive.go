@@ -776,6 +776,13 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 	if impl == nil || !fixupEligibleState(impl, stages) {
 		return false, nil
 	}
+	// A class-1 acceptance fix-up deferred for the in-flight implement review
+	// round (E72.58 / #4075) owns the next pass: its release routes ONE pass
+	// carrying the acceptance obligation and these concerns. Routing here
+	// would supersede it and leave the acceptance obligation to a human.
+	if s.acceptanceFixupDeferralPending(ctx, runRow.ID) {
+		return false, nil
+	}
 	var selected []planreview.Concern
 	var ids []uuid.UUID
 	for _, c := range open {

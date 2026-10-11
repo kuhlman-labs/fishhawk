@@ -2445,7 +2445,15 @@ func TestLatestAcceptanceSignals(t *testing.T) {
 // disposition / audit-category strings are copied verbatim from
 // backend/internal/server/acceptance.go and MUST match it. A backend rename
 // that is not mirrored here greps to this test.
+// acceptanceDispositionFixupDeferredMirror mirrors the backend's
+// acceptanceDispositionFixupDeferred (E72.58 / #4075). It must NOT be a paged
+// disposition here: the classifier serves it the rerouting poll.
+const acceptanceDispositionFixupDeferredMirror = "fixup_deferred_review_in_flight"
+
 func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
+	if isAcceptancePagedDisposition(acceptanceDispositionFixupDeferredMirror) {
+		t.Errorf("isAcceptancePagedDisposition(%q) = true, want false (a deferral awaits the review, it does not page)", acceptanceDispositionFixupDeferredMirror)
+	}
 	// MUST match backend/internal/server/acceptance.go verbatim.
 	want := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded":  auditCategoryAcceptanceOutcomeRecorded,
@@ -2466,6 +2474,11 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"unsettled_paged":                    acceptanceDispositionUnsettled,
 		"externally_unvalidatable_paged":     acceptanceDispositionUnvalidatable,
 		"rollback_offered":                   acceptanceDispositionRollbackOffered,
+		// E72.58 / #4075: mirrored as a test-local literal — the classifier has
+		// no arm for it and needs none: a deferral is neither paged nor
+		// auto-routed, so it falls to the acceptance_triage_rerouting poll,
+		// which reads as "await the implement review".
+		"fixup_deferred_review_in_flight": acceptanceDispositionFixupDeferredMirror,
 	}
 	expect := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
@@ -2501,6 +2514,9 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		// E35.3 / #1600: the post-deploy rollback offer. A rename with no mirror
 		// would drop the offer into the no-match rerouting poll arm.
 		"rollback_offered": "rollback_offered",
+		// E72.58 / #4075: the non-paging deferral. A rename with no mirror is
+		// harmless to the classifier (it still polls) but this pin names it.
+		"fixup_deferred_review_in_flight": "fixup_deferred_review_in_flight",
 	}
 	for k, wantVal := range expect {
 		if want[k] != wantVal {
