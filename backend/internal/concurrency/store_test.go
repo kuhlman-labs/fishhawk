@@ -837,12 +837,104 @@ VALUES ($1, $2, $3, 1, 'h1', 'held', now(), now() - interval '1 hour')`, settled
 	}
 }
 
+// verifyReq is req for the host verify group (ADR-092 D3).
+func verifyReq(st *run.Stage) Request {
+	r := req(st, DefaultVerifyLimit)
+	r.GroupKey = VerifyGroupKey("h1")
+	return r
+}
+
+func (f *fixture) slotGroup(id uuid.UUID) string {
+	f.t.Helper()
+	var g string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT group_key FROM stage_concurrency_slots WHERE stage_id = $1`, id).Scan(&g); err != nil {
+		f.t.Fatalf("read slot group of %s: %v", id, err)
+	}
+	return g
+}
+
+// TestAdmit_VerifyGroupIndependentOfImplementGroup pins cross-group
+// independence for ADR-092 D3: with local-implement:h1 held AND queued, an
+// Admit for local-verify:h1 is admitted (holders and queue-ahead are
+// group-keyed), and the verify holder is neither counted nor listed in the
+// implement group.
+func TestAdmit_VerifyGroupIndependentOfImplementGroup(t *testing.T) {
+	f := newFixture(t)
+	holder, waiting, pass := f.stage(), f.stage(), f.stage()
+	f.mustAdmit(holder)
+	f.mustQueue(waiting, 1)
+
+	adm, err := f.store.Admit(context.Background(), verifyReq(pass))
+	if err != nil {
+		t.Fatalf("verify Admit: %v", err)
+	}
+	if !adm.Admitted || len(adm.Holders) != 0 {
+		t.Fatalf("verify Admit = admitted:%v position %d holders %v, want admitted with no holders", adm.Admitted, adm.Position, adm.Holders)
+	}
+	if g := f.slotGroup(pass.ID); g != "local-verify:h1" {
+		t.Fatalf("pass slot group = %q, want local-verify:h1", g)
+	}
+	again := f.mustQueue(waiting, 1)
+	if len(again.Holders) != 1 || again.Holders[0].StageID != holder.ID {
+		t.Fatalf("implement queue holders = %+v, want [holder] only", again.Holders)
+	}
+}
+
+// TestAdmit_RekeysQueuedRowIntoNewGroup is approval condition 5 (the ADR-092
+// D3 rollout): a stage QUEUED in local-implement:h1 whose next marker POST
+// resolves to local-verify:h1 (its stage became a merge-candidate pass) is
+// RE-KEYED by Admit — its one row moves into the new group and restarts at
+// that group's TAIL (the episode-restart rule's group_key arm: a fresh
+// enqueued_at and NewlyQueued), so it stops counting ahead in the old group.
+// The verify group is held here so the re-keyed row's standing is observable.
+func TestAdmit_RekeysQueuedRowIntoNewGroup(t *testing.T) {
+	f := newFixture(t)
+	holder, x, behind, verifyHolder := f.stage(), f.stage(), f.stage(), f.stage()
+	f.mustAdmit(holder)
+	first := f.mustQueue(x, 1)
+	f.mustQueue(behind, 2)
+	if adm, err := f.store.Admit(context.Background(), verifyReq(verifyHolder)); err != nil || !adm.Admitted {
+		t.Fatalf("verify holder Admit = %+v, %v, want admitted", adm, err)
+	}
+
+	q, err := f.store.Admit(context.Background(), verifyReq(x))
+	if err != nil {
+		t.Fatalf("re-keying Admit: %v", err)
+	}
+	if q.Admitted || q.Position != 1 || !q.NewlyQueued || !q.EnqueuedAt.After(first.EnqueuedAt) {
+		t.Fatalf("re-keyed admission = admitted:%v position %d newly:%v enqueued %v (was %v), want queued at 1 in the new group, restarted at the tail",
+			q.Admitted, q.Position, q.NewlyQueued, q.EnqueuedAt, first.EnqueuedAt)
+	}
+	if len(q.Holders) != 1 || q.Holders[0].StageID != verifyHolder.ID {
+		t.Fatalf("re-keyed holders = %+v, want [verify holder]", q.Holders)
+	}
+	if g := f.slotGroup(x.ID); g != "local-verify:h1" {
+		t.Fatalf("re-keyed slot group = %q, want local-verify:h1", g)
+	}
+	var rows int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM stage_concurrency_slots WHERE stage_id = $1`, x.ID).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("slot rows for the re-keyed stage = %d (%v), want exactly 1", rows, err)
+	}
+	// The old group no longer counts the re-keyed stage ahead.
+	f.mustQueue(behind, 1)
+}
+
 func TestGroupKeysAndLockDomain(t *testing.T) {
 	if got := DefaultGroupKey("h1"); got != "local-implement:h1" {
 		t.Fatalf("DefaultGroupKey = %q", got)
 	}
 	if got := DefaultGroupKey(""); got != "local-implement:unknown" {
 		t.Fatalf("DefaultGroupKey(\"\") = %q", got)
+	}
+	if got := VerifyGroupKey("h1"); got != "local-verify:h1" {
+		t.Fatalf("VerifyGroupKey = %q", got)
+	}
+	if got := VerifyGroupKey(""); got != "local-verify:unknown" {
+		t.Fatalf("VerifyGroupKey(\"\") = %q", got)
+	}
+	if DefaultVerifyLimit != 1 {
+		t.Fatalf("DefaultVerifyLimit = %d, want 1", DefaultVerifyLimit)
 	}
 	if got := NamedGroupKey("o/r", "deploy-target"); got != "spec:o/r:deploy-target" {
 		t.Fatalf("NamedGroupKey = %q", got)
