@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/failuresig"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -1541,6 +1542,27 @@ func TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt(t *testing.T) {
 		if strings.Contains(reason, "the acceptance stage passed") {
 			t.Errorf("reason reads as a validated pass:\n%s", reason)
 		}
+		// (d) E72.63 / #4095: the reason names the undecidable_causes key and
+		// the sandbox_denied_db cause, spelled from the plan constants the
+		// ingest writes, so a mirror drift reddens here too.
+		for _, want := range []string{
+			plan.UndecidableCausesKey,
+			plan.UndecidableCauseSandboxDeniedDB,
+			"acceptance_outcome_recorded",
+			"committed-tree verify gate already ran those tests",
+		} {
+			if !strings.Contains(reason, want) {
+				t.Errorf("reason does not point the operator at the classified undecidable cause: missing %q (E72.63 / #4095):\n%s", want, reason)
+			}
+		}
+	}
+	if acceptanceUndecidableCausesKey != plan.UndecidableCausesKey {
+		t.Errorf("acceptanceUndecidableCausesKey mirror = %q, want plan.UndecidableCausesKey %q",
+			acceptanceUndecidableCausesKey, plan.UndecidableCausesKey)
+	}
+	if acceptanceUndecidableCauseSandboxDeniedDB != plan.UndecidableCauseSandboxDeniedDB {
+		t.Errorf("acceptanceUndecidableCauseSandboxDeniedDB mirror = %q, want plan.UndecidableCauseSandboxDeniedDB %q",
+			acceptanceUndecidableCauseSandboxDeniedDB, plan.UndecidableCauseSandboxDeniedDB)
 	}
 
 	prURL := "https://github.com/x/y/pull/42"
