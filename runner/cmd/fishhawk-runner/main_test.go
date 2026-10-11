@@ -31033,6 +31033,14 @@ func TestResumeKindWireValues(t *testing.T) {
 	if upload.CapabilityChildPushResume != "child-push-resume" {
 		t.Errorf("CapabilityChildPushResume = %q", upload.CapabilityChildPushResume)
 	}
+	// #4190: the reverify kind and its capability token, the same literals
+	// backend/internal/server's TestResumeKindWireValues pins.
+	if resumeKindReverify != "reverify" {
+		t.Errorf("resumeKindReverify = %q, want %q", resumeKindReverify, "reverify")
+	}
+	if upload.CapabilityReverifyResume != "reverify-resume" {
+		t.Errorf("CapabilityReverifyResume = %q", upload.CapabilityReverifyResume)
+	}
 }
 
 // TestPushResume_PublishesHeldCommitAndOpensPR is the happy path: the served

@@ -911,6 +911,18 @@ type FetchedPrompt struct {
 	// lies), and re-reports the checkpoint on its own failure so a multi-retry
 	// outage never degrades back to a full agent re-run.
 	//
+	// "push" (E45.86 / #3621) is the push-failure resume: the gate-verified
+	// commit exists LOCALLY only, so the runner re-proves its tree against
+	// HeldCommitVerifiedTreeSHA and publishes it before opening the PR.
+	// "reverify" (#4190) is the verify-failure resume, served ONLY to a runner
+	// advertising CapabilityReverifyResume and never to a decomposition child or
+	// a fix-up: HeldCommitSHA is the pinned head of the last verify_run a
+	// committed-tree gate failed category C, HeldCommitBaseSHA its parent, and
+	// NO verified tree is served (nothing certified it). The runner re-runs the
+	// reproducible pre-push gates and one full-form verify over it before it
+	// publishes anything, and falls back to the ordinary agent pass when the
+	// held commit cannot be resumed.
+	//
 	// The wire tag (held_commit_resume_kind) is byte-identical to the backend's
 	// promptResponse.HeldCommitResumeKind — the same cross-module
 	// independent-struct-by-tag convention as the four fields above. omitempty,
@@ -1822,10 +1834,25 @@ const CapabilityMergeCandidateVerify = "merge-candidate-verify"
 // resume is declined and the agent re-runs.
 const CapabilityChildPushResume = "child-push-resume"
 
+// CapabilityReverifyResume is the RunnerCapabilitiesHeader token for the
+// verify-failure resume (#4190): this runner understands
+// held_commit_resume_kind:"reverify" and its consume arm, which re-runs the
+// reproducible pre-push gates and ONE full-form committed-tree verify over the
+// pinned verify-head commit instead of re-running the agent, then publishes a
+// DCO-signed commit of the same tree and parent. A runner that omits it is
+// served no reverify checkpoint at all (runner_capability_absent), so the retry
+// is an ordinary agent re-run. It is advertised ONLY by a binary that carries
+// the consume arm (run()'s reverify intercept and runReverifyResume).
+//
+// WIRE VALUE: byte-identical to the backend's capabilityReverifyResume
+// (backend/internal/server/prompt.go). A drift is fail-SAFE: every reverify
+// checkpoint is declined and the agent re-runs.
+const CapabilityReverifyResume = "reverify-resume"
+
 // runnerCapabilities is the full static token list FetchPrompt advertises.
 // APPEND-ONLY: a new token goes at the end, so the combined header value the
 // tests pin only ever grows.
-var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify, CapabilityChildPushResume}
+var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify, CapabilityChildPushResume, CapabilityReverifyResume}
 
 // RunnerCapabilitiesValue is the RunnerCapabilitiesHeader value this binary
 // sends. Exported so the backend-facing tests and the runner's own seam tests
@@ -2327,6 +2354,11 @@ type ShipPullRequestArgs struct {
 	// checkpoint. "push_discarded" means a preserved push-kind checkpoint was
 	// permanently refused at consume time and its verified tree is being thrown
 	// away, so the backend audits the discard and records NO checkpoint.
+	// "reverify" (#4190) means a standalone open-PR stage's committed-tree verify
+	// failed category C after a successful agent pass and its last verify_run
+	// head is pinned locally: HeadSHA is that pinned commit, BaseSHA its parent,
+	// and VerifiedTreeSHA is EMPTY (nothing certified the tree). The backend
+	// records it under its own verify_resume_checkpoint category.
 	ResumeKind string
 
 	PRTitle string
@@ -2424,10 +2456,11 @@ type pullRequestFailureBody struct {
 
 	// ResumeKind DISCRIMINATES the checkpoint the coordinates above encode
 	// (E45.86 / #3621): "push" (committed locally, never published),
-	// "push_discarded" (a preserved push checkpoint permanently refused), or —
-	// on every legacy path — ABSENT. omitempty plus the runner never setting it
-	// outside the two new kinds is what keeps the pre-push and pr_open bodies
-	// BYTE-IDENTICAL, so an old backend's DisallowUnknownFields decoder never
+	// "push_discarded" (a preserved push checkpoint permanently refused),
+	// "reverify" (#4190: a pinned verify-head commit whose committed-tree verify
+	// failed category C, no verified tree), or — on every legacy path — ABSENT.
+	// omitempty plus the runner never setting it outside the three new kinds is
+	// what keeps the pre-push and pr_open bodies BYTE-IDENTICAL, so an old backend's DisallowUnknownFields decoder never
 	// sees an unknown field and can never 400 a report the stage's recovery
 	// depends on.
 	//

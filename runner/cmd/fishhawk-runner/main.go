@@ -1048,6 +1048,50 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			cfg.runID, cfg.stageID, exemptHeldSHA)
 		exemptOpenPR = false
 	}
+	// REVERIFY RESUME (#4190). A standalone open-PR stage whose committed-tree
+	// verify failed category C after a successful agent pass is served its
+	// pinned verify head as a `reverify` held commit. Instead of re-running the
+	// agent, re-run the reproducible pre-push gates and ONE full-form verify
+	// over that commit (runReverifyResume). reverifyPrecheck decides whether the
+	// commit can be resumed at all; a miss is a FALLBACK — the ordinary agent
+	// pass runs in this same dispatch, and the path taken is logged either way.
+	// A decomposition child is never intercepted: openHeldCommitPR refuses a
+	// non-push kind for a child permanently, before any forge touch.
+	if exemptOpenPR && exemptResumeKind == resumeKindReverify && cfg.decomposedFromRunID == "" {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		held := reverifyHeld{
+			repoDir:           repoDir,
+			verifyCmd:         cfg.verifyCmd,
+			heldSHA:           exemptHeldSHA,
+			baseSHA:           exemptHeldBaseSHA,
+			baseBranch:        resolveImplementBaseRef(cfg),
+			scopeFiles:        cfg.scopeFiles,
+			bindingAssertions: bindingAssertions,
+			scopeExemptions:   operatorExemptions,
+		}
+		// The fresh base fetch authenticates with the stage's push credential
+		// when one can be minted; a mint failure falls back to ambient auth
+		// (the fetch itself then decides).
+		if client != nil && issuedKey != nil {
+			if tok, merr := mintImplementToken(ctx, cfg, client, issuedKey, logSink); merr == nil {
+				held.pushToken = tok
+			}
+		}
+		if tok, detail := reverifyPrecheck(ctx, held); tok != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"held_commit_resume_path","run_id":%q,"stage_id":%q,"path":"fallback_agent_rerun","reason":%q,"detail":%q,"held_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, tok, detail, exemptHeldSHA)
+			exemptOpenPR = false
+		} else {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"held_commit_resume_path","run_id":%q,"stage_id":%q,"path":"reverify","held_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, exemptHeldSHA)
+			return runReverifyResume(ctx, cfg, held, exemptHeldBranch, exemptPRTitle, exemptPRBody, logSink, client, issuedKey)
+		}
+	}
 	if exemptOpenPR {
 		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, exemptHeldVerifiedTreeSHA, exemptPRTitle, exemptPRBody, logSink, client, issuedKey)
 	}
@@ -2569,6 +2613,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// compounding (DECISION c2). It is placed BEFORE EmitStage so the span's
 	// token/model counts include the fix-loop invocations' cost (ADR-030).
 	reinvoked := false
+	// okBeforeCommittedGates snapshots the agent pass's verdict BEFORE the two
+	// committed-tree verify gates below (#4190), so the stage can tell "a gate
+	// turned a successful agent pass into a failure" (pin the verified head,
+	// report B/C to /pull-request) from every earlier failure.
+	okBeforeCommittedGates := res.OK
 	// verifiedTreeSHA is declared in the function-scope var block above (hoisted
 	// for the #1165 apply block). The #960 contract is unchanged: empty when no
 	// gate ran (plan stage, --no-pr, verifyCmd unset, skip). The deterministic
@@ -2691,6 +2740,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		res.Events = append(res.Events, unusedEvents...)
 		if !res.OK && len(unused) > 0 {
 			res.FailureReason = annotateUnusedAmendmentFailure(res.FailureReason, unused)
+		}
+	}
+
+	// VERIFY-HEAD PIN (#4190). When a committed-tree gate above turned a
+	// successful agent pass into a failure, the agent's complete output exists
+	// only as the throwaway `fishhawk verify wip` commit the gate judged — reset
+	// away and reachable from nothing. Pin the LAST verify_run head at
+	// refs/fishhawk/checkpoints/<run>/<stage>-verify and append the clause naming
+	// it to the failure reason, so the SHA reaches the stage's failure audit
+	// (the pull_request_failed reason for B/C, the bundle manifest's
+	// agent_failure_reason for A). Placed after every reason annotation so the
+	// clause is the LAST one (TruncateReason keeps the tail), and before the
+	// bundle is packed. FAIL-OPEN: a pin failure never changes the category or
+	// the exit. committedGateFailed is read again by the B/C report below.
+	committedGateFailed := okBeforeCommittedGates && !res.OK && stageType == "implement" && !cfg.noPR
+	var verifyPin verifyHeadPin
+	verifyPinned := false
+	if committedGateFailed {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		if verifyPin, verifyPinned = pinVerifyHead(ctx, cfg, repoDir, res.Events, logSink); verifyPinned {
+			res.FailureReason += verifyHeadFailureSuffix(verifyPin.headSHA, verifyPin.ref)
 		}
 	}
 
@@ -3313,6 +3386,51 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				acceptanceExpectedHeadSHA, acceptanceVerdictRedacted, retirementDrop, logSink)
 		}
 
+		// COMMITTED-GATE FAILURE REPORT (#4190). A push-gated implement stage
+		// (open-PR, decomposition child, fix-up) whose committed-tree verify gate
+		// failed category B or C used to ship its trace and exit WITHOUT the
+		// /pull-request failure report its forward gate waits on, so the backend
+		// left it `running` until the reaper failed it as "runner exited 1 before
+		// reporting a terminal state" (run e011d2a1). Send it here, with the
+		// gate's real category and reason. Category A is unchanged: the trace
+		// manifest's agent_failed already fails the stage.
+		//
+		// A standalone open-PR stage failing category C with a pinned verify head
+		// additionally carries a `reverify` checkpoint (head = the pinned WIP
+		// commit, base = its parent, branch = the stage's run branch, plus any
+		// agent-authored PR text, footer-free), so the retry re-verifies that
+		// commit instead of re-running the agent. Only against a backend that
+		// advertised supports_push_resume — one that decodes resume_kind at all —
+		// so an older backend never sees the key. A child or a fix-up reports
+		// with NO checkpoint: neither is served reverify.
+		if committedGateFailed && (res.FailureCategory == "B" || res.FailureCategory == "C") &&
+			(willOpenPR || willPushChild || willPushFixup) {
+			var cp *pushCheckpoint
+			if willOpenPR && res.FailureCategory == "C" && verifyPinned && supportsPushResume {
+				routing, rerr := resolveImplementBranchRouting(ctx, cfg, cfg.workingDir, resolveImplementBaseRef(cfg))
+				if rerr == nil && routing.branch != "" {
+					title, body, agentAuthored, _ := prTitleAndBodyParts(cfg, routing.branch, logSink)
+					if !agentAuthored {
+						title, body = "", ""
+					}
+					cp = &pushCheckpoint{
+						branch: routing.branch, headSHA: verifyPin.headSHA, baseSHA: verifyPin.baseSHA, armed: true,
+						resumeKind: resumeKindReverify,
+						prTitle:    title, prBody: body,
+					}
+					_, _ = fmt.Fprintf(logSink,
+						`{"event":"reverify_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"ref":%q}`+"\n",
+						cfg.runID, cfg.stageID, routing.branch, verifyPin.headSHA, verifyPin.baseSHA, verifyPin.ref)
+				}
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"committed_gate_failed","category":%q,"detail":%q}`+"\n",
+				res.FailureCategory, upload.TruncateReason(res.FailureReason, upload.MaxFailureReportReasonBytes))
+			// Best-effort: this path already exits non-zero, so the detached
+			// reaper backstop still engages if the report itself fails.
+			_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, res.FailureReason, cp)
+		}
+
 		// Implement-stage post-processing: commit + push + open PR
 		// + ship the pull_request artifact. (E5.X / #195.) Mirrors
 		// the plan-stage upload chain: same signing key, same
@@ -3549,6 +3667,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
+			// #4190: the work is published, so a verify-head pin an EARLIER
+			// failed attempt left (the reverify fallback, or a retry that re-ran
+			// the agent) is no longer needed. Best-effort; absent is a no-op.
+			releaseRepo := cfg.workingDir
+			if releaseRepo == "" {
+				releaseRepo = "."
+			}
+			releaseVerifyHeadRef(ctx, releaseRepo, cfg.runID, cfg.stageID, logSink)
 		}
 	}
 
@@ -11059,11 +11185,14 @@ func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer
 		// checkpoint is the zero value there), keeping that body byte-identical.
 		args.PRTitle = checkpoint.prTitle
 		args.PRBody = checkpoint.prBody
-		// E45.86 / #3621: emit resume_kind ONLY for the two NEW kinds. The legacy
+		// E45.86 / #3621: emit resume_kind ONLY for the NEW kinds. The legacy
 		// pr_open checkpoint and every pre-push failure emit NO key at all, so
 		// today's report body is BYTE-IDENTICAL and an old backend's
 		// DisallowUnknownFields decoder never sees an unknown field.
-		if checkpoint.resumeKind == resumeKindPush || checkpoint.resumeKind == resumeKindPushDiscarded {
+		// #4190 adds resumeKindReverify (a pinned verify-head commit; no
+		// verified tree is set on that checkpoint).
+		if checkpoint.resumeKind == resumeKindPush || checkpoint.resumeKind == resumeKindPushDiscarded ||
+			checkpoint.resumeKind == resumeKindReverify {
 			args.ResumeKind = checkpoint.resumeKind
 		}
 	}
