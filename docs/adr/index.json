@@ -890,7 +890,9 @@
       "supersedes": [
         "ADR-090"
       ],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-098"
+      ],
       "applies_to": []
     },
     {
@@ -899,6 +901,17 @@
       "path": "docs/adr/097-operator-as-orchestrator.md",
       "status": "accepted",
       "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-098",
+      "title": "Amend ADR-096 D3: split the global surface into verdict-wide and doc-check inputs, add data-read edges, and enable verdict transfer only after a shadow measurement",
+      "path": "docs/adr/098-split-global-surface-shadow-transfer.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-096"
+      ],
       "superseded_by": [],
       "applies_to": []
     }
