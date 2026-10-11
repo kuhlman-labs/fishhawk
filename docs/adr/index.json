@@ -892,6 +892,15 @@
       ],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-097",
+      "title": "Operator as orchestrator: the driver delegates evidence work to stateless specialist jobs; the first officer keeps a standing trigger-driven watch the operator cannot silence (amends ADR-089, ADR-040)",
+      "path": "docs/adr/097-operator-as-orchestrator.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
