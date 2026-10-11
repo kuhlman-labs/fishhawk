@@ -2498,7 +2498,7 @@ func TestReconcileMerge_PostsAndDecodes(t *testing.T) {
 			`"from_state":"superseded","reason":"missing_audit_row"}],"run_state":"succeeded"}`)
 	})
 
-	res, err := c.ReconcileMerge(context.Background(), runID)
+	res, err := c.ReconcileMerge(context.Background(), runID, false)
 	if err != nil {
 		t.Fatalf("ReconcileMerge: %v", err)
 	}
@@ -2511,8 +2511,10 @@ func TestReconcileMerge_PostsAndDecodes(t *testing.T) {
 	if gotAuth != "Bearer tok-test" {
 		t.Errorf("Authorization = %q, want the bearer forwarded", gotAuth)
 	}
+	// supersedeStranded=false must stay wire-identical to the pre-#4222 verb:
+	// no body at all, not even {"supersede_stranded":false}.
 	if len(gotBody) != 0 {
-		t.Errorf("request body = %q, want empty — the endpoint reads only the run_id path value", gotBody)
+		t.Errorf("request body = %q, want empty — supersede_stranded=false sends no body", gotBody)
 	}
 	if res.RunState != "succeeded" {
 		t.Errorf("run_state = %q, want succeeded", res.RunState)
@@ -2536,7 +2538,7 @@ func TestReconcileMerge_ErrorEnvelope(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":{"code":"reconcile_merge_not_applicable","message":"nothing to supersede"}}`)
 	})
 
-	_, err := c.ReconcileMerge(context.Background(), uuid.New())
+	_, err := c.ReconcileMerge(context.Background(), uuid.New(), false)
 	if err == nil {
 		t.Fatal("want an error on a 409")
 	}
@@ -2544,6 +2546,65 @@ func TestReconcileMerge_ErrorEnvelope(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Code != "reconcile_merge_not_applicable" ||
 		ae.StatusCode != http.StatusConflict {
 		t.Fatalf("error = %v, want a typed *apiError reconcile_merge_not_applicable/409", err)
+	}
+}
+
+// TestReconcileMerge_SupersedeStrandedSendsExactBody pins the #4222 opt-in
+// wire shape: supersedeStranded=true sends EXACTLY {"supersede_stranded":true}
+// with a JSON content type. The backend decodes with DisallowUnknownFields, so
+// any extra key would be a 400; the literal is the same one
+// server/merge_supersede_stranded_test.go posts (supersedeStrandedBody), the
+// cross-boundary seam this package cannot import.
+func TestReconcileMerge_SupersedeStrandedSendsExactBody(t *testing.T) {
+	runID := uuid.New()
+	var gotBody []byte
+	var gotContentType string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		gotContentType = r.Header.Get("Content-Type")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`",`+
+			`"superseded":[{"stage_id":"33333333-3333-3333-3333-333333333333","stage_type":"implement",`+
+			`"from_state":"running","reason":"operator_reconcile_stranded"}],"repaired":[],"run_state":"succeeded"}`)
+	})
+
+	res, err := c.ReconcileMerge(context.Background(), runID, true)
+	if err != nil {
+		t.Fatalf("ReconcileMerge: %v", err)
+	}
+	if string(gotBody) != `{"supersede_stranded":true}` {
+		t.Errorf("request body = %q, want exactly {\"supersede_stranded\":true}", gotBody)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", gotContentType)
+	}
+	if len(res.Superseded) != 1 || res.Superseded[0].Reason != "operator_reconcile_stranded" ||
+		res.Superseded[0].FromState != "running" {
+		t.Errorf("superseded = %+v, want the stranded row decoded", res.Superseded)
+	}
+}
+
+// TestRecordMergeObservation_DecodesSourceFields pins the two #4222 provenance
+// fields on the observation mirror: a transposed or misspelled tag would
+// silently decode to "".
+func TestRecordMergeObservation_DecodesSourceFields(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"r","already_recorded":false,"observation":{`+
+			`"pull_request_url":"https://github.com/x/y/pull/224","pull_request_number":224,`+
+			`"merge_commit_sha":"abc","merged_at":"2026-09-20T10:00:00Z","observed_at":"2026-09-23T11:30:00Z",`+
+			`"credential_source":"repository_installation","pull_request_url_source":"pull_request_opened_audit"}}`)
+	})
+
+	res, err := c.RecordMergeObservation(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("RecordMergeObservation: %v", err)
+	}
+	if res.Observation.CredentialSource != "repository_installation" {
+		t.Errorf("credential_source = %q, want repository_installation", res.Observation.CredentialSource)
+	}
+	if res.Observation.PullRequestURLSource != "pull_request_opened_audit" {
+		t.Errorf("pull_request_url_source = %q, want pull_request_opened_audit", res.Observation.PullRequestURLSource)
 	}
 }
 

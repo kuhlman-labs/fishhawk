@@ -2595,20 +2595,29 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         stage_type:
           type: string
-          description: The superseded stage's type (`acceptance` or `review`).
+          description: |
+            The superseded stage's type: `acceptance` or `review` for a parked
+            stage; `implement`, `review` or `acceptance` for a stage the
+            opt-in stranded arm retired (#4222).
         from_state:
           type: string
           description: |
             The state the stage was parked in when the merge made it
             unreachable (`awaiting_host_dispatch` or `awaiting_approval`); for a
-            repaired row, `superseded` (the stage had already moved).
+            stranded stage (#4222), `dispatched`, `running` or (a review /
+            acceptance gate never opened) `pending`; for a repaired row,
+            `superseded` (the stage had already moved).
         reason:
           type: string
-          enum: [merge_observed, operator_reconcile, repair]
+          enum: [merge_observed, operator_reconcile, operator_reconcile_stranded, repair]
           description: |
             What ran the supersession: the merge-observation path swept it, an
-            operator invoked `reconcile-merge`, or a missing audit row was
-            repaired (transitioning nothing).
+            operator invoked `reconcile-merge`, an operator invoked it with
+            `{"supersede_stranded": true}` and the stage was stranded in flight
+            or a never-opened gate (`operator_reconcile_stranded`, #4222; its
+            audit row also carries `last_activity_at` and
+            `idle_threshold_seconds`), or a missing audit row was repaired
+            (transitioning nothing).
 
     RunEscalations:
       type: object
@@ -26689,14 +26698,15 @@ paths:
         escape hatch records something untrue: reap writes `failed` for work
         never attempted, cancel writes `cancelled` for a change that shipped.
 
-        This verb supersedes exactly the stages a DEFAULT-DENY
+        By default this verb supersedes exactly the stages a DEFAULT-DENY
         `(stage_type, state)` pair table admits — `acceptance` @
         `awaiting_host_dispatch` and `review` @ `awaiting_approval`, no others
         — appends one `stage_superseded_by_merge` audit entry per stage it
-        MOVED, and re-runs completion. A stage in any other non-terminal state
-        (`running`, `dispatched`, `awaiting_children`, the deploy park states,
-        `awaiting_scope_decision`) is left alone and the run stays `running`:
-        that is the #968 invariant, not a gap.
+        MOVED, and re-runs completion. Without the opt-in stranded arm below, a
+        stage in any other non-terminal state (`running`, `dispatched`,
+        `awaiting_children`, the deploy park states, `awaiting_scope_decision`)
+        is left alone and the run stays `running`: that is the #968 invariant,
+        not a gap.
 
         The order is TRANSITION FIRST, THEN AUDIT. The chain is append-only, so
         a row written before a compare-and-swap that then refused would be an
@@ -26719,6 +26729,42 @@ paths:
         `repaired` even though the row is durable — the field claims authorship,
         not existence.
 
+        SETTLE-ONLY ARM (#4222). A merged run whose stages have ALL already
+        succeeded but whose run row is still `pending`/`running` (a legacy run
+        whose completion never re-ran) moves nothing and re-runs completion,
+        answering 200 with two empty lists and the settled `run_state` instead
+        of `reconcile_merge_not_applicable`. Merge evidence is still required,
+        and only `succeeded` stages qualify, so it cannot settle a failed or
+        cancelled run.
+
+        STRANDED ARM (opt-in, #4222). With the request body
+        `{"supersede_stranded": true}` the verb ALSO retires the stages a
+        SEPARATE default-deny table admits: `implement` @ `dispatched` /
+        `running`, and `review` / `acceptance` @ `pending` / `dispatched` /
+        `running` — a legacy run whose PR merged while implement stayed
+        `running` beside a never-opened review gate can otherwise never settle.
+        `plan` and `deploy` stages, `implement` @ `pending` and every other
+        state stay denied. Each move goes through a row-locked repository
+        capability pinned to the classified state, the attempt and the
+        handler's idle cutoff; it is NOT part of the ordinary transition
+        union, so no other caller can reach `running → superseded`. The
+        retired stage's audit row carries `reason: operator_reconcile_stranded`
+        plus `last_activity_at` and `idle_threshold_seconds`.
+
+        LIVENESS GATE (stranded arm only). Before any write, the WHOLE call is
+        refused `409 reconcile_merge_stage_live` when any `dispatched` /
+        `running` candidate shows database-stamped activity (the max of
+        `updated_at`, which every runner heartbeat bumps, and `dispatched_at`)
+        inside a 24-hour idle threshold. The same cutoff is re-checked under
+        each stage's row lock, so a heartbeat landing between the check and the
+        write is refused too. Pending candidates are held by no runner and need
+        no liveness check. The MCP tool additionally probes the host process
+        table for a `runner_kind=local` run before calling this endpoint.
+
+        Without the body (or with `{"supersede_stranded": false}`) the verb is
+        byte-identical to its pre-#4222 behaviour: a stranded stage is left
+        alone.
+
         Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
         blocking stage and reads `recovery: "reconcile-merge"` only when this
         endpoint can actually move it.
@@ -26733,16 +26779,41 @@ paths:
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        description: |
+          OPTIONAL (#4222). An absent, empty or whitespace-only body is the
+          pre-#4222 verb. Otherwise it must be exactly one JSON object carrying
+          only `supersede_stranded`: an unknown field, a wrong type, trailing
+          data or a body over 4 KiB is refused `400 validation_failed` (field
+          `body`) before any read.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                supersede_stranded:
+                  type: boolean
+                  default: false
+                  description: |
+                    Opt into the stranded arm: also retire implement / review /
+                    acceptance stages stranded in `dispatched` / `running` and
+                    review / acceptance gates still `pending` on this
+                    already-merged run, subject to the 24-hour liveness gate.
       responses:
         '200':
           description: |
             What the reconcile did. `superseded` lists the stages THIS
-            invocation moved; `repaired` lists already-superseded stages whose
+            invocation moved — parked stages (`reason: operator_reconcile`) and,
+            under `supersede_stranded`, stranded ones
+            (`reason: operator_reconcile_stranded`); `repaired` lists already-superseded stages whose
             missing audit row THIS invocation restored — a stage whose row a
             concurrent fishhawkd instance wrote is omitted, because the row is
             durable but this invocation did not restore it. Both are empty on an
-            idempotent repeat. `run_state` is the run's state after the completion
-            re-evaluation, so a caller sees whether the run actually settled.
+            idempotent repeat and on the settle-only arm. `run_state` is the
+            run's state after the completion re-evaluation, so a caller sees
+            whether the run actually settled.
           content:
             application/json:
               schema:
@@ -26760,7 +26831,10 @@ paths:
                     type: string
                     description: The run's state after completion was re-evaluated.
         '400':
-          description: '`validation_failed` — malformed run_id.'
+          description: |
+            `validation_failed` — malformed run_id (field `run_id`), or a body
+            that is neither empty nor exactly `{"supersede_stranded": <bool>}`
+            (field `body`). Evaluated before any read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -26799,11 +26873,30 @@ paths:
             change that never shipped.
 
             `reconcile_merge_not_applicable` — the run holds no
-            pair-table-admissible parked stage and no already-superseded stage
-            to repair, so there is nothing for this verb to do. A stage in any
-            other non-terminal state must run, settle or be cancelled.
+            pair-table-admissible parked stage, no already-superseded stage to
+            repair, no stranded candidate (counted only when
+            `supersede_stranded` is set) and is not in the settle-only shape
+            (at least one stage, every stage `succeeded`, run not terminal), so
+            there is nothing for this verb to do. A stage in any other
+            non-terminal state must run, settle or be cancelled — or, for an
+            implement / review / acceptance stage stranded in flight on a merged
+            run, retry with `{"supersede_stranded": true}`.
+            `details.supersede_stranded` echoes the flag.
 
-            Every 409 is evaluated BEFORE any write: no stage moves and no
+            `reconcile_merge_stage_live` — `supersede_stranded` was set and at
+            least one `dispatched` / `running` candidate showed database-stamped
+            activity inside the 24-hour idle threshold, so a runner may still
+            hold it. `details.live_stages[]` names each one (`stage_id`,
+            `stage_type`, `state`, `last_activity_at`) and
+            `details.idle_threshold_seconds` the threshold. Evaluated before any
+            write. Its row-locked twin fires when a stage was touched AFTER that
+            check — `live_stages[].refusal` is then `recently_active`,
+            `state_changed` or `attempt_changed`; that stage and every later
+            stranded candidate are left alone, the repair scan and completion
+            re-run are skipped, and `details.superseded` lists the stages this
+            call had already moved (with their audit rows) before the refusal.
+
+            Every other 409 is evaluated BEFORE any write: no stage moves and no
             audit row is appended.
           content:
             application/json:
@@ -26817,7 +26910,12 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: '`reconcile_merge_unconfigured` — run/audit repositories not wired.'
+          description: |
+            `reconcile_merge_unconfigured` — run/audit repositories not wired,
+            or `supersede_stranded` was requested and the run repository does
+            not implement the row-locked stranded-supersede capability
+            (`details.missing_capability`). The stranded arm refuses rather than
+            degrade to an ordinary transition.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -26861,6 +26959,22 @@ paths:
         posts can each append; that duplicate is POSSIBLE and HARMLESS, because
         the evidence gate asks only whether AT LEAST ONE qualifying row exists —
         a second row is inert and changes no decision.
+
+        LEGACY RUNS (#4222). A GitHub-family run that carries NO forge
+        credential (no installation reference) reads through the GitHub App's
+        CURRENT installation on the run's own repository, resolved at read
+        time — but only when the run is untenanted or that installation maps to
+        the run's OWN account; otherwise the call is refused
+        `409 record_merge_observation_no_credential` with nothing recorded and
+        no pull request read. A run that carries its own credential never looks
+        the installation up, and `POST /v0/runs/{run_id}/merge`'s observe rung
+        never uses this fallback. A run row with no `pull_request_url` derives
+        one from the `pr_url` of the run's newest (highest-sequence)
+        `pull_request_opened` audit entry — read-time only, never written back
+        to the run row — and that URL is held to the malformed and
+        repo-mismatch refusals exactly like a run-row URL, before any forge
+        read. The observation's `credential_source` and
+        `pull_request_url_source` record which path was taken.
 
         GitLab: the GitLab adapter now populates BOTH the merge commit SHA and
         the merge timestamp (E64.40 / #3151), so a merged GitLab merge request
@@ -26929,6 +27043,25 @@ paths:
                         description: |
                           When Fishhawk read the forge (RFC 3339) — WHEN
                           FISHHAWK LEARNED IT.
+                      credential_source:
+                        type: string
+                        enum: [run, repository_installation]
+                        description: |
+                          The forge credential the read ran under (#4222):
+                          `run` (the run's own installation) or
+                          `repository_installation` (the GitHub App's current
+                          installation on the run's repository, used because
+                          the run carries no credential). Omitted when
+                          `already_recorded` is true.
+                      pull_request_url_source:
+                        type: string
+                        enum: [run_row, pull_request_opened_audit]
+                        description: |
+                          Where `pull_request_url` came from (#4222): the run
+                          row, or the run's newest `pull_request_opened` audit
+                          entry when the run row carries none (never written
+                          back to the run row). Omitted when
+                          `already_recorded` is true.
         '400':
           description: |
             `validation_failed` — malformed run_id.
@@ -26967,9 +27100,20 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            `record_merge_observation_no_pull_request` — the run carries no pull
-            request URL, so it never reached a PR and there is no merge to
-            observe.
+            `record_merge_observation_no_pull_request` — neither the run row
+            nor any `pull_request_opened` audit entry on the run's chain carries
+            a pull request URL, so there is no merge to observe. A failed read
+            of those entries is a 500, never a write.
+
+            `record_merge_observation_no_credential` — the run carries no forge
+            credential and the GitHub App installation on its repository cannot
+            be used (#4222). `details.reason` is `app_not_installed` (install
+            the Fishhawk GitHub App on the repository, then retry),
+            `installation_account_mismatch` (the installation is registered to
+            another account, or to none) or
+            `installation_account_unverifiable` (the installation-to-account
+            mapping could not be read). Fail closed: nothing is recorded and no
+            pull request is read.
 
             `record_merge_observation_pr_not_merged` — the forge reports the
             pull request is NOT merged. This is the guard that stops the verb
@@ -27020,8 +27164,9 @@ paths:
         '502':
           description: |
             `record_merge_observation_forge_unavailable` — the pull request
-            could not be read from the forge, so the merge state is unknown and
-            nothing was recorded.
+            could not be read from the forge, or (for a run carrying no forge
+            credential) the repository's GitHub App installation lookup failed,
+            so the merge state is unknown and nothing was recorded.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
