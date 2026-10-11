@@ -292,6 +292,7 @@ one, never in batches:
 | [ADR-093](093-fishhawk-owned-merge-queue.md) | A Fishhawk-owned merge queue: extend ADR-092's per-base serializer so the queue advances, verifies and MERGES the head of line, provider-agnostic, batch size 1 | `accepted` | [#4224](https://github.com/kuhlman-labs/fishhawk/issues/4224) |
 | [ADR-094](094-resource-keyed-admission.md) | Resource-keyed admission: one admission path for every spawning verb, stages hold a scoped SET of resource groups including a host capacity group, and review rounds admit through provider-account groups that park on quota (amends ADR-087) | `accepted` | [#4239](https://github.com/kuhlman-labs/fishhawk/issues/4239) |
 | [ADR-095](095-review-coverage-hold-and-operator-rerun.md) | Review-coverage hold for decomposed parents, plus an operator re-run verb with its own same-head dedup bypass marker, distinct from ADR-091 D6's boot-only marker (amends ADR-091) | `accepted` | [#4287](https://github.com/kuhlman-labs/fishhawk/issues/4287) |
+| [ADR-096](096-merge-candidate-verdict-transfer.md) | Merge-candidate verdict transfer across an independent base delta, plus a single verification point for decomposed parents (amends ADR-090) | `accepted` | [#4290](https://github.com/kuhlman-labs/fishhawk/issues/4290) |
 
 ## Status unknown — needs captain confirmation
 

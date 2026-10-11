@@ -819,7 +819,8 @@
       ],
       "superseded_by": [
         "ADR-092",
-        "ADR-093"
+        "ADR-093",
+        "ADR-096"
       ],
       "applies_to": []
     },
@@ -877,6 +878,17 @@
       "status": "accepted",
       "supersedes": [
         "ADR-091"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-096",
+      "title": "Merge-candidate verdict transfer across an independent base delta, plus a single verification point for decomposed parents (amends ADR-090)",
+      "path": "docs/adr/096-merge-candidate-verdict-transfer.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-090"
       ],
       "superseded_by": [],
       "applies_to": []
