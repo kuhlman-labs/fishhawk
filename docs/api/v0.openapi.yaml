@@ -2529,12 +2529,66 @@ components:
             list endpoint omits it — no per-row stage + audit reads) and omitted
             for any run that is not `running` or whose stages are all terminal,
             so an unblocked run keeps a byte-identical response.
+        merge_candidate_queue:
+          $ref: '#/components/schemas/RunMergeCandidateQueue'
+          description: |
+            The run's ACTIVE ADR-092 held-pass queue entry (E83.85 / #4200):
+            whether its merge-candidate verify pass is held behind its base's
+            live pass or live itself. Emitted by `GET /v0/runs/{run_id}` ONLY
+            (one indexed store read; the list endpoint omits it). Omitted when
+            the queue is unwired, the run has no active entry (never queued,
+            or its entry settled), or the store read fails (best-effort — the
+            run read never fails on it).
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunMergeCandidateQueue:
+      type: object
+      description: |
+        One ADR-092 merge-candidate queue entry (E83.85 / #4200), shared by
+        `GET /v0/runs/{run_id}` and the gate view. Merge-candidate verify
+        passes caused by a base advance or a conflict resolution are
+        serialized per (repository, base ref): ONE live pass per base, every
+        other one held FIFO by eligibility time with no runner slot. The line
+        hands off when the live entry's pull request merges, its pass fails
+        (ejected), or its run ends; admission is automatic and re-reads the
+        PR, auto-advances a behind branch and re-anchors before starting the
+        pass for the resulting head.
+      required: [state, repo, base_ref, anchored_head_sha, enqueued_at, note]
+      properties:
+        state:
+          type: string
+          enum: [held, live]
+          description: |
+            `held` — waiting behind the base's live pass (`POST
+            /v0/runs/{run_id}/merge` answers `409 merge_candidate_held`);
+            `live` — this run holds the base's line.
+        phase:
+          type: string
+          description: |
+            A live entry's progress: `admitted`, `verifying`, `passed` (holds
+            the line until its PR merges) or `unverified` (the pass did not
+            execute; the next `rebase-branch` re-triggers it). Omitted while
+            held. An open set: later queue modes add phases.
+        position:
+          type: integer
+          minimum: 1
+          description: "1-based place among the base's held entries; omitted for a live entry."
+        repo: { type: string }
+        base_ref: { type: string, description: The base ref whose queue the entry is in. }
+        anchored_head_sha: { type: string, description: The PR head the pass is anchored to. }
+        anchored_base_sha: { type: string, description: 'The base tip the head was produced against, when known.' }
+        enqueued_at: { type: string, format: date-time, description: 'Eligibility time — the FIFO key.' }
+        admitted_at: { type: string, format: date-time, description: When the entry became live. }
+        live_run_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: "The run holding the base's line (this run when live); omitted when the base has no live entry."
+        eject_reason: { type: string, description: 'Reserved; always omitted on an active entry.' }
+        note: { type: string, description: One sentence naming what happens next. }
 
     RunCompletionBlocked:
       type: object
@@ -3145,6 +3199,14 @@ components:
             partially-built block.
         merge_readiness:
           $ref: '#/components/schemas/GateViewMergeReadiness'
+        merge_candidate_queue:
+          $ref: '#/components/schemas/RunMergeCandidateQueue'
+          description: |
+            The run's active ADR-092 merge-candidate queue entry (#4200) — the
+            same block `GET /v0/runs/{run_id}` carries. Omitted when the run
+            has no active entry or the queue is unwired; omitted with a
+            `merge_candidate_queue` `history_gaps` entry and
+            `history_incomplete=true` when the store read fails.
 
     GateViewMergeReadiness:
       type: object
@@ -5197,9 +5259,14 @@ components:
     HostDispatchRequest:
       description: |
         Optional body of `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`
-        (#3964). `host` is the caller's host label (the MCP sends its
-        sanitised `os.Hostname()`); it keys the default concurrency group
-        `local-implement:<host>`. Absent body or empty `host` → `unknown`. A
+        (#3964). `host` is the caller's host label; it keys the default
+        concurrency group `local-implement:<host>`, and the
+        `local-verify:<host>` group (limit 1) for an ADR-090 merge-candidate
+        verify-only pass (ADR-092 / #4200). The MCP resolves it by a ladder
+        (#4212): `FISHHAWK_HOST_LABEL` when set, else the machine's persisted
+        host-id file (seeded once from the hostname, so the label survives a
+        hostname change), else the sanitised `os.Hostname()`; with none it
+        sends no host. Absent body or empty `host` → `unknown`. A
         client-supplied label, not a security boundary. `admission_nonce` is
         the MCP slot waiter's random per-waiter nonce, sent on every marker
         POST it makes; an ADMISSION records it on the held slot and echoes it,
@@ -5224,7 +5291,7 @@ components:
       type: object
       required: [group, limit, queued_before, waited_seconds]
       properties:
-        group: { type: string, description: 'The group key (`local-implement:<host>` or `spec:<repo>:<name>`).' }
+        group: { type: string, description: 'The group key (`local-implement:<host>`, `local-verify:<host>` for a merge-candidate verify-only pass, or `spec:<repo>:<name>`).' }
         limit: { type: integer, minimum: 1, maximum: 64 }
         queued_before: { type: boolean, description: True when the stage waited in the queue during this episode. }
         waited_seconds: { type: integer, minimum: 0, description: Seconds from enqueue to admission (0 when it did not queue). }
@@ -5255,7 +5322,15 @@ components:
           description: |
             `awaiting_concurrency_slot` — queued (the stage reads
             `awaiting_host_dispatch`); `holding` — admitted and counted.
-        group: { type: string }
+        group:
+          type: string
+          description: |
+            `local-implement:<host>` (the default for a local implement
+            stage), `local-verify:<host>` (limit 1: an implement stage
+            re-opened for an ADR-090 merge-candidate verify-only pass,
+            ADR-092 / #4200 — never a `local-implement` slot), or
+            `spec:<repo>:<name>` (a spec-declared group, which never captures
+            a verify-only pass).
         limit: { type: integer, minimum: 1, maximum: 64 }
         position: { type: integer, minimum: 1, description: 1-based queue position; omitted while holding. }
         holders:
@@ -13189,12 +13264,16 @@ paths:
                       step instead.
                   merge_candidate_verify_state:
                     type: string
-                    enum: [not_required, unverified, in_flight, passed, failed]
+                    enum: [not_required, unverified, in_flight, passed, failed, held]
                     description: |
                       The live head's ADR-090 merge-candidate verify state after
                       this call (E83.33 / #4018). `not_required` when the
                       workflow declares no `executor.verify` command or the head
-                      is not one Fishhawk wrote. Omitted when no pass could be
+                      is not one Fishhawk wrote. `held` (ADR-092 / #4200) when
+                      the pass waits behind its base's live pass: nothing was
+                      started, no trigger was appended, and `GET
+                      /v0/runs/{run_id}`'s `merge_candidate_queue` names its
+                      position; admission is automatic. Omitted when no pass could be
                       anchored (see `merge_candidate_verify_refusal`).
                   merge_candidate_verify_triggered:
                     type: boolean
@@ -13677,9 +13756,10 @@ paths:
         (`409 acceptance_stale`, #4086; an audit read error here is
         `500 internal_error`, fail-closed), when the pull request has a merge
         conflict against its base (`409 merge_conflicting`, E64.14 / #3109),
-        when the merge-candidate gate refuses (`409 merge_base_behind` /
-        `merge_candidate_unverified` / `merge_candidate_verify_failed`, or
-        `502 merge_candidate_check_failed` — ADR-090, below), when the pull
+        when the merge-candidate gate refuses (`409 merge_candidate_held`
+        (ADR-092) / `merge_base_behind` / `merge_candidate_unverified` /
+        `merge_candidate_verify_failed`, or `502 merge_candidate_check_failed`
+        — ADR-090, below), when the pull
         request's approval was dismissed and not re-given
         (`409 approval_dismissed`, #4086, best-effort and fail-open), or
         when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
@@ -13716,6 +13796,11 @@ paths:
 
         1. reads the live pull request; one the forge reports MERGED skips the
            gate, so the already-merged resume above still answers `200`;
+        1a. (ADR-092 / E83.85 / #4200) refuses `409 merge_candidate_held` when
+           the run's merge-candidate queue entry is HELD behind its base's
+           live pass — BEFORE the behind probe, because a held PR is expected
+           to be behind and its admission auto-advances it. A queue read error
+           skips this step (fail-open; steps 2–3 still fail closed);
         2. probes behind-ness with the three-dot compare
            `base=<live PR head>...head=<base ref>` that `rebase-branch` uses —
            ANY commit means the head does not contain the base tip, refused
@@ -13854,6 +13939,16 @@ paths:
             was recorded; otherwise, or when that route was refused, route it
             with `fishhawk_fixup_stage`. Cases (5)–(7) record NO verdict row and
             dispatch nothing.
+            (7a) The run's merge-candidate pass is HELD in its base's ADR-092
+            queue behind the live pass (`merge_candidate_held`, E83.85 /
+            #4200), checked before case (5). `details` carry `{run_id, pr_url,
+            queue_state: "held", queue_position, live_run_id, anchored_head_sha,
+            head_sha, base_ref, next_step: "fishhawk_get_run_status"}`
+            (`live_run_id` omitted when no run holds the line). It clears on
+            its own: when the line frees the queue advances a behind branch,
+            re-anchors and starts the pass — watch `merge_candidate_queue` on
+            `GET /v0/runs/{run_id}`, dispatch and await the pass once admitted,
+            then re-invoke. Records NO verdict row and dispatches nothing.
             (8) The recorded acceptance verdict is STALE (`acceptance_stale`,
             #4086): the run's acceptance stage carries a stage-scoped
             `acceptance_reopened` entry NEWER than the newest

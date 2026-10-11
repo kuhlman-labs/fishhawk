@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -836,5 +837,115 @@ func TestGateViewMergeReadiness_WireShape(t *testing.T) {
 	}
 	if len(gv.Settled) != 1 || gv.Settled[0].State != "addressed" || gv.Settled[0].ResolutionBasis != "operator_evidence" {
 		t.Errorf("settled = %+v, want the resolved concern addressed with resolution_basis operator_evidence", gv.Settled)
+	}
+}
+
+// TestMergeCandidateQueue_WireShape pins the hand-maintained
+// runMergeCandidateQueue mirror against the REAL backend (ADR-092 / #4200,
+// the #371 trap): three runs enqueued on one base through the REAL
+// mergequeue.PostgresStore (A admitted live, B and C held), served by the REAL
+// server. (a) Every key the SERVER emits in the run read's
+// merge_candidate_queue block is a mirror field; (b) C's block decodes through
+// GetRun AND GetGateView as held at position 2 behind A, anchored at its head;
+// (c) it survives into fishhawk_get_run_status's GetRunStatusOutput.Run;
+// (d) the live run decodes as live with its phase. Counterfactual: renaming a
+// mirror tag (e.g. position) fails (a) and (b) → RED.
+func TestMergeCandidateQueue_WireShape(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	queue := mergequeue.NewPostgresStore(pool)
+
+	ids := make([]uuid.UUID, 3)
+	for i, head := range []string{"a1", "b1", "c1"} {
+		row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		ids[i] = row.ID
+		if _, err := queue.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: row.ID, BaseRef: "main", HeadSHA: head}); err != nil {
+			t.Fatalf("enqueue %s: %v", head, err)
+		}
+		if i == 0 {
+			adm, err := queue.AdmitNext(ctx, mergequeue.Base{Repo: "x/y", BaseRef: "main"})
+			if err != nil || !adm.Admitted || adm.Entry.RunID != row.ID {
+				t.Fatalf("admit A = %+v, %v; want A admitted", adm, err)
+			}
+		}
+	}
+	a, c := ids[0], ids[2]
+
+	const bearer = "fhk_merge_queue_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:stages"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: audit.NewPostgresRepository(pool),
+		APITokenRepo: tokRepo, MergeQueue: queue,
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+c.String(), nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET run: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET run = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["merge_candidate_queue"], &block); err != nil {
+		t.Fatalf("server emitted no merge_candidate_queue block:\n%s", body)
+	}
+	fields := jsonFieldNames(reflect.TypeOf(runMergeCandidateQueue{}))
+	for k := range block {
+		if !fields[k] {
+			t.Errorf("server merge_candidate_queue key %q has no field on the runMergeCandidateQueue mirror (tag drift)", k)
+		}
+	}
+
+	check := func(surface string, q *runMergeCandidateQueue) {
+		t.Helper()
+		if q == nil {
+			t.Fatalf("%s: merge_candidate_queue decoded to nil", surface)
+		}
+		if q.State != "held" || q.Position != 2 || q.LiveRunID != a.String() || q.AnchoredHeadSHA != "c1" ||
+			q.BaseRef != "main" || q.Repo != "x/y" || q.EnqueuedAt.IsZero() || q.Note == "" {
+			t.Errorf("%s: merge_candidate_queue = %+v, want held at position 2 behind %s anchored at c1", surface, q, a)
+		}
+	}
+	r, err := client.GetRun(ctx, c)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	check("run", r.MergeCandidateQueue)
+	gv, err := client.GetGateView(ctx, c, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	check("gate view", gv.MergeCandidateQueue)
+
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getRunStatus(ctx, nil, GetRunStatusInput{RunID: c.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	check("get_run_status", out.Run.MergeCandidateQueue)
+
+	live, err := client.GetRun(ctx, a)
+	if err != nil {
+		t.Fatalf("GetRun A: %v", err)
+	}
+	if q := live.MergeCandidateQueue; q == nil || q.State != "live" || q.Phase != string(mergequeue.PhaseAdmitted) ||
+		q.Position != 0 || q.LiveRunID != a.String() || q.AdmittedAt == nil {
+		t.Errorf("A merge_candidate_queue = %+v, want live/admitted with no position", q)
 	}
 }
