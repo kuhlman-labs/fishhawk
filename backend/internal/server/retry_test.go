@@ -1959,6 +1959,29 @@ func TestRetryStage_ResumePending_DoesNotSupersedeConcerns(t *testing.T) {
 	}
 }
 
+// TestRetry_ReverifyCheckpointKeepsImplementConcerns (E83.80 / #4190): a
+// newest verify_resume_checkpoint is a resumable held commit, so the retry
+// keeps the prior round's implement-review concerns raised exactly like a push
+// checkpoint. Without the category in pushCheckpointCategories the walk sees
+// only the checkpoint-less pull_request_failed, the verdict is none, and the
+// concern is superseded. The concern is READ BACK after the handler returns.
+// No tree is recorded for this kind, so no discard row is written either.
+func TestRetry_ReverifyCheckpointKeepsImplementConcerns(t *testing.T) {
+	state, appended := retryWithCheckpointState(t, func(sid uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			retryCheckpointEntry(sid, "pull_request_failed", 7, `{"category":"C","reason":"verify gate failed outside the change"}`),
+			retryCheckpointEntry(sid, CategoryVerifyResumeCheckpoint, 8,
+				`{"resume_kind":"reverify","push_checkpoint":{"branch":"b","head_sha":"h","base_sha":"base"}}`),
+		}
+	})
+	if state != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (a resumable reverify retry must not supersede)", state)
+	}
+	if rows := retryDiscardRows(appended); len(rows) != 0 {
+		t.Errorf("a reverify checkpoint records no tree, so it must write no verified_tree_discarded row, got %+v", rows)
+	}
+}
+
 // TestRetryStage_NoResume_SupersedesAndAuditsTheDiscard is the other half: with
 // the checkpoint SUPERSEDED, the retry is a full agent re-run, so the concerns
 // go with the tree AND exactly one verified_tree_discarded row accounts for it.

@@ -587,6 +587,7 @@ var KnownCategories = map[string]struct{}{
 	"upkeep_inflight_pass_completed":          {}, // #3763: the in-flight advisory pass's one summary row on the scan run (sent/already_sent/skips, or a named degrade)
 	"upkeep_report_recorded":                  {}, // #3921: one per ingested upkeep_report artifact
 	"verified_tree_discarded":                 {},
+	"verify_resume_checkpoint":                {}, // E83.80 / #4190: a reverify-kind held-commit checkpoint (server/pullrequest.go); INTERNAL, not an issue-comment activity line
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},
 

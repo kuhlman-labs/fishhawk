@@ -464,7 +464,12 @@ type promptResponse struct {
 	// the idempotent adopt-then-create OpenPR from the pushed head. The runner
 	// additionally verifies the run branch's remote tip still equals
 	// HeldCommitSHA on that kind, because a checkpointed commit passed no
-	// operator gate the way a park did.
+	// operator gate the way a park did. "push" (E45.86 / #3621) is a
+	// gate-verified commit that exists only locally. "reverify" (E83.80 /
+	// #4190) is a held commit whose tree FAILED the committed verify gate: the
+	// runner re-runs one full verify over it with no agent and publishes only on
+	// a pass. reverify is served only to a runner advertising
+	// capabilityReverifyResume, never to a decomposition child or a fix-up.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_resume_kind) MUST
 	// stay byte-identical to the runner's upload.FetchedPrompt.
@@ -476,7 +481,8 @@ type promptResponse struct {
 	// commit carries (E45.86 / #3621). Served ONLY with HeldCommitResumeKind
 	// "push", where the commit is NOT yet on the remote and the runner must
 	// re-prove byte-exactly that the local commit's tree IS the verified one
-	// before publishing it. Empty on every other response.
+	// before publishing it. Empty on every other response — including
+	// "reverify", whose held tree is the one that failed verify.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_verified_tree_sha)
 	// MUST stay byte-identical to the runner's
@@ -2019,7 +2025,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), true); resume {
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), true); resume {
 			// Held-commit CHECKPOINT resume (#2169 pr_open, E45.86 / #3621 push),
 			// taken ONLY when the exempt resolution above returned false. An
 			// exempt-resolved park always wins: #1231 keeps precedence, and the two
@@ -2804,7 +2810,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), false); resume {
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), false); resume {
 			// Held-commit CHECKPOINT resume, same derivation + same exempt-wins
 			// precedence as the dispatch path so the rendered (SPA-readable) prompt
 			// response stays byte-consistent with it. recordDrop is FALSE here: a
@@ -5261,11 +5267,13 @@ type heldCommitResume struct {
 	prBody  string
 	// resumeKind is the wire discriminator this resolution serves (E45.86 /
 	// #3621): resumeKindPROpen for the #2169 post-push checkpoint and the #1231
-	// exempt path (where the caller leaves it empty on the response), or
-	// resumeKindPush for the pre-push one.
+	// exempt path (where the caller leaves it empty on the response),
+	// resumeKindPush for the pre-push one, or resumeKindReverify (E83.80 /
+	// #4190) for a held commit that failed the committed verify gate.
 	resumeKind string
 	// verifiedTreeSHA is served ONLY with resumeKindPush — the tree the consume
-	// side re-proves the unpublished local commit against.
+	// side re-proves the unpublished local commit against. Never with
+	// resumeKindReverify, whose held tree failed verify.
 	verifiedTreeSHA string
 }
 
@@ -5287,6 +5295,24 @@ const resumeKindPush = "push"
 // checkpoint; it makes the thrown-away verified tree auditable.
 // WIRE VALUE: byte-identical to the runner's resumeKindPushDiscarded.
 const resumeKindPushDiscarded = "push_discarded"
+
+// resumeKindReverify is the held_commit_resume_kind wire value for the
+// VERIFY-FAILURE resume (E83.80 / #4190): the implement agent ran and
+// succeeded, but the committed-tree verify gate failed category C, so the
+// runner pinned the verified-but-failed head (the throwaway `fishhawk verify
+// wip` commit carrying the complete agent output) at a local ref. The retry
+// re-runs ONE full verify over that held commit instead of the whole agent,
+// and on a pass synthesizes a DCO-signed commit on the same parent and
+// publishes it through the push-resume tail.
+//
+// It carries NO verified tree: the held tree is exactly the one that FAILED
+// verify, so serving one would let a consume side skip the re-verify. Recorded
+// under its own category (CategoryVerifyResumeCheckpoint), capability-gated on
+// capabilityReverifyResume, and never served to a decomposition child or a
+// fix-up dispatch.
+//
+// WIRE VALUE: byte-identical to the runner's resumeKindReverify.
+const resumeKindReverify = "reverify"
 
 // runnerCapabilitiesHeader is the request header carrying the RUNNER half of
 // the E45.86 / #3621 capability handshake — a comma-separated token list
@@ -5327,6 +5353,18 @@ const capabilityMergeCandidateVerify = "merge-candidate-verify"
 // is declined and the agent re-runs.
 const capabilityChildPushResume = "child-push-resume"
 
+// capabilityReverifyResume is the runnerCapabilitiesHeader token for the
+// verify-failure resume (E83.80 / #4190): this runner's held-commit early
+// return carries the reverify consume arm (precheck, one full-form committed
+// verify, synthesize on the recorded parent, then the push-resume tail). A
+// runner that does not advertise it is served NO held-commit fields for a
+// reverify checkpoint — the decline is total, never a downgrade to push or
+// pr_open, which would publish a tree that failed verify.
+// WIRE VALUE: byte-identical to the runner's upload.CapabilityReverifyResume.
+// A drift is fail-SAFE: no request advertises it, so every reverify resume is
+// declined and the agent re-runs.
+const capabilityReverifyResume = "reverify-resume"
+
 // runnerAdvertises reports whether the request's capability header carries
 // token. Comma-separated, space-trimmed, CASE-SENSITIVE (the tokens are wire
 // values, not user text). A nil request or an absent header is false, so an
@@ -5352,6 +5390,7 @@ func runnerAdvertises(r *http.Request, token string) bool {
 var pushCheckpointCategories = []string{
 	"pull_request_failed",
 	CategoryPushResumeCheckpoint,
+	CategoryVerifyResumeCheckpoint,
 	"pull_request_opened",
 	CategoryScopeCompletenessParked,
 	CategoryScopeCompletenessExempted,
@@ -5376,6 +5415,20 @@ var pushCheckpointCategories = []string{
 // checkpoint, sending the retry to open a PR on a branch that was never pushed.
 const CategoryPushResumeCheckpoint = "push_resume_checkpoint"
 
+// CategoryVerifyResumeCheckpoint is the audit category a REVERIFY-KIND
+// checkpoint is recorded under (E83.80 / #4190). It is a separate category for
+// the same rollback property as CategoryPushResumeCheckpoint: a backend that
+// predates it never queries it, so a reverted resolver sees only a
+// checkpoint-less pull_request_failed and the retry is a full agent re-run —
+// it can never serve a held commit whose tree FAILED verify as a pr_open or
+// push resume. newestPushCheckpoint derives resumeKindReverify from this
+// category alone.
+//
+// DELIBERATELY NOT in backend/internal/issuecomment's activityCategories, like
+// push_resume_checkpoint: it is a retry hint for the resolver, not an
+// operator-visible event.
+const CategoryVerifyResumeCheckpoint = "verify_resume_checkpoint"
+
 // Verdicts newestPushCheckpoint returns. They double as the `reason` values on
 // the verified_tree_discarded audit row, so they are tokens, not prose.
 const (
@@ -5394,9 +5447,11 @@ const (
 )
 
 // pushCheckpointPayload is the decoded checkpoint plus the kind that carried
-// it. VerifiedTreeSHA is populated for BOTH kinds (the #2169 payload has
-// carried it since it existed) — it is what the verified_tree_discarded audit
-// row names when a retry throws the tree away.
+// it. VerifiedTreeSHA is populated for the pr_open and push kinds (the #2169
+// payload has carried it since it existed) — it is what the
+// verified_tree_discarded audit row names when a retry throws the tree away. A
+// reverify checkpoint records none (its tree failed verify), so a discard of
+// one writes no row.
 type pushCheckpointPayload struct {
 	Branch          string
 	HeadSHA         string
@@ -5407,8 +5462,8 @@ type pushCheckpointPayload struct {
 	ResumeKind      string
 }
 
-// checkpointEnvelope is the JSON shape BOTH carriers use. Sharing it is what
-// keeps the two categories' payloads decodable by one path.
+// checkpointEnvelope is the JSON shape EVERY carrier uses. Sharing it is what
+// keeps the three categories' payloads decodable by one path.
 type checkpointEnvelope struct {
 	PushCheckpoint *struct {
 		Branch          string `json:"branch"`
@@ -5474,7 +5529,8 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 			if newest == nil || e.Sequence > newest.Sequence {
 				newest = e
 			}
-			if (cat == "pull_request_failed" || cat == CategoryPushResumeCheckpoint) &&
+			if (cat == "pull_request_failed" || cat == CategoryPushResumeCheckpoint ||
+				cat == CategoryVerifyResumeCheckpoint) &&
 				(newestCarrier == nil || e.Sequence > newestCarrier.Sequence) {
 				newestCarrier = e
 				newestCarrierCat = cat
@@ -5501,8 +5557,11 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 	}
 	cp := env.PushCheckpoint
 	kind := resumeKindPROpen
-	if newestCarrierCat == CategoryPushResumeCheckpoint {
+	switch newestCarrierCat {
+	case CategoryPushResumeCheckpoint:
 		kind = resumeKindPush
+	case CategoryVerifyResumeCheckpoint:
+		kind = resumeKindReverify
 	}
 	out := pushCheckpointPayload{
 		Branch: cp.Branch, HeadSHA: cp.HeadSHA, BaseSHA: cp.BaseSHA,
@@ -5534,7 +5593,7 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 
 // resolvePushCheckpointResume is the emission GATE for the held-commit
 // CHECKPOINT resume, the sibling of resolveHeldCommitExemption above. It serves
-// two kinds:
+// three kinds:
 //
 //   - resumeKindPROpen (#2169) — the stage committed and PUSHED and then failed
 //     opening the PR or shipping the artifact. The retry re-attempts only the
@@ -5542,6 +5601,10 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 //   - resumeKindPush (E45.86 / #3621) — the stage committed, the gates passed,
 //     and only the PUSH failed. The retry publishes the held commit and then
 //     opens the PR. This kind is CAPABILITY-GATED.
+//   - resumeKindReverify (E83.80 / #4190) — the agent succeeded but the
+//     committed verify gate failed category C. The retry re-runs one full
+//     verify over the pinned head with no agent and publishes only on a pass.
+//     CAPABILITY-GATED like push, standalone-only, and served with no tree.
 //
 // THE CAPABILITY GATE IS A TOTAL DECLINE, NOT A DEGRADE. A runner that did not
 // advertise capabilityPushResume is served NO held-commit fields at all for a
@@ -5563,6 +5626,15 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 // since serving it sends the runner to open a PR from the slice branch. The
 // child token never gates a non-child run.
 //
+// REVERIFY (E83.80 / #4190), a third kind with the same TOTAL-DECLINE shape: a
+// runner that did not advertise capabilityReverifyResume is declined
+// (runner_capability_absent), and a decomposition child is declined
+// unconditionally (child_resume_kind_unsupported) — the runner arms reverify
+// only for a standalone open-PR stage, and its consume arm ends in the
+// standalone PR-open tail. A fix-up is already refused by the `fixup` guard
+// below. A served reverify carries NO verified tree, even when the recorded
+// payload has one: the held tree is the one that FAILED verify.
+//
 // recordDrop selects the DISPATCH path (handleGetStagePrompt, true) over the
 // preview render (handleGetStagePromptRender, false): only a real dispatch may
 // write the decline audit row, so previewing a stage never mutates the chain.
@@ -5573,7 +5645,7 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 // unrecognized kind. The cost of a wrong emission is a PR opened from an
 // unintended head; the cost of a wrong omission is today's agent re-run. Those
 // are not symmetric.
-func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, runnerAdvertisesChildPushResume, recordDrop bool) (heldCommitResume, bool) {
+func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, runnerAdvertisesChildPushResume, runnerAdvertisesReverifyResume, recordDrop bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement {
 		return heldCommitResume{}, false
 	}
@@ -5617,6 +5689,15 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 		}
 		if cp.VerifiedTreeSHA == "" {
 			return decline("verified_tree_missing")
+		}
+	case resumeKindReverify:
+		if !runnerAdvertisesReverifyResume {
+			return decline("runner_capability_absent")
+		}
+		if isChild {
+			// The runner never arms reverify for a child, and its consume arm
+			// ends in the standalone PR-open tail — the #3910 mechanism.
+			return decline("child_resume_kind_unsupported")
 		}
 	default:
 		// A kind this build does not implement is a version anomaly. Refuse

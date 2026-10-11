@@ -111,7 +111,7 @@ type pullRequestBody struct {
 	// handler decodes with DisallowUnknownFields, so an undeclared runner key is
 	// a 400 AFTER the push already failed — the #2562/#2563 stranding shape.
 	//
-	// Three values, and only the two new ones are ever emitted:
+	// Four values, and only the three non-empty ones are ever emitted:
 	//   - ABSENT (the legacy value) — no checkpoint, or the #2169 PR-OPEN one.
 	//     Recorded exactly as before, so every pre-#3621 payload is byte-identical.
 	//   - "push" — the gate-verified commit exists LOCALLY and was never
@@ -123,10 +123,16 @@ type pullRequestBody struct {
 	//   - "push_discarded" — a preserved push checkpoint was PERMANENTLY refused
 	//     at consume time. No checkpoint is recorded; a verified_tree_discarded
 	//     row accounts for the tree being thrown away.
+	//   - "reverify" (E83.80 / #4190) — the agent succeeded but the committed
+	//     verify gate failed category C; the head names the runner's pinned
+	//     `fishhawk verify wip` commit and the base its parent. Recorded under
+	//     its OWN category (CategoryVerifyResumeCheckpoint) for the same
+	//     rollback property as "push", and WITHOUT a verified tree: the held
+	//     tree is the one that failed verify.
 	//
 	// Deliberately NOT enforced in validate(): a 400 there would strand the
 	// implement stage in `running`. An unrecognized value instead records NO
-	// checkpoint of either kind — the retry fails safe to a full agent re-run.
+	// checkpoint of any kind — the retry fails safe to a full agent re-run.
 	// It cannot be laundered onto the legacy pull_request_failed payload, which
 	// carries no kind discriminator and would be served as pr_open.
 	//
@@ -1782,8 +1788,10 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	//
 	// E45.86 / #3621 splits this by kind. A "push" report's coordinates go to a
 	// SEPARATE audit category instead of this payload (see recordPushResume-
-	// Checkpoint), and a "push_discarded" report records no checkpoint at all —
-	// only the verified_tree_discarded accounting row. Both are handled below,
+	// Checkpoint), as do a "reverify" report's (E83.80 / #4190, under
+	// CategoryVerifyResumeCheckpoint), and a "push_discarded" report records no
+	// checkpoint at all — only the verified_tree_discarded accounting row. All
+	// three are handled below,
 	// AFTER this entry is appended, so this payload keeps exactly the shape it
 	// had before #3621 on every legacy path.
 	//
@@ -1793,7 +1801,7 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// the kind from the CATEGORY alone. A deny-list would therefore LAUNDER any
 	// FUTURE/unknown non-empty kind — emitted by a runner NEWER than this
 	// backend — into a pr_open resume, and the prompt-side unknown-kind arm
-	// could never fire to refuse it: it only ever sees pr_open or push. An
+	// could never fire to refuse it: it only ever sees a category-derived kind. An
 	// unrecognized kind records NOTHING here and no checkpoint anywhere, so the
 	// retry fails SAFE to a full agent re-run rather than opening a PR on a
 	// branch whose push this backend cannot vouch for.
@@ -1840,7 +1848,11 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// is strictly NEWER and wins the resolver's newest-wins comparison.
 	switch pr.ResumeKind {
 	case resumeKindPush:
-		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, pr, actorKind, actorSubject)
+		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, CategoryPushResumeCheckpoint, resumeKindPush, pr, actorKind, actorSubject)
+	case resumeKindReverify:
+		// E83.80 / #4190: a verify-failed held commit. Its own category keeps a
+		// reverted backend blind to it, exactly as for the push kind above.
+		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, CategoryVerifyResumeCheckpoint, resumeKindReverify, pr, actorKind, actorSubject)
 	case resumeKindPushDiscarded:
 		// A PERMANENT consume-side refusal: the runner declined to publish the
 		// held commit and the recorded verified tree is being thrown away. Audit
@@ -1864,7 +1876,10 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 }
 
 // recordPushResumeCheckpoint records a PUSH-KIND checkpoint (E45.86 / #3621)
-// under its own audit category rather than on the pull_request_failed payload.
+// — or, with (CategoryVerifyResumeCheckpoint, resumeKindReverify), a
+// REVERIFY-KIND one (E83.80 / #4190) — under its own audit category rather
+// than on the pull_request_failed payload. The push call's payload is
+// byte-identical to its pre-#4190 shape.
 //
 // THE SEPARATE CATEGORY IS THE ROLLBACK PROPERTY. A pre-#3621 backend's
 // resolver walks pull_request_failed and reads push_checkpoint off it; it does
@@ -1878,15 +1893,20 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 // the stage is already failed, and a missing checkpoint degrades to today's
 // agent re-run rather than failing the report the recovery depends on.
 func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID uuid.UUID,
-	pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
+	category, kind string, pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
 	if s.cfg.AuditRepo == nil || pr.Branch == "" || pr.HeadSHA == "" {
 		return
 	}
 	checkpoint := map[string]any{
-		"branch":            pr.Branch,
-		"head_sha":          pr.HeadSHA,
-		"base_sha":          pr.BaseSHA,
-		"verified_tree_sha": pr.VerifiedTreeSHA,
+		"branch":   pr.Branch,
+		"head_sha": pr.HeadSHA,
+		"base_sha": pr.BaseSHA,
+	}
+	// A reverify checkpoint records NO verified tree even when the report
+	// carries one: its held tree FAILED verify, and a recorded tree would be
+	// named as "verified" by any later verified_tree_discarded row.
+	if kind != resumeKindReverify {
+		checkpoint["verified_tree_sha"] = pr.VerifiedTreeSHA
 	}
 	// Same non-empty gating as the #2570 pr_open payload, so the two carriers
 	// decode through one shared envelope.
@@ -1899,7 +1919,7 @@ func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID 
 	payload, err := json.Marshal(map[string]any{
 		"run_id":          runID.String(),
 		"stage_id":        stageID.String(),
-		"resume_kind":     resumeKindPush,
+		"resume_kind":     kind,
 		"push_checkpoint": checkpoint,
 	})
 	if err != nil {
@@ -1910,15 +1930,16 @@ func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID 
 		RunID:        runID,
 		StageID:      &sid,
 		Timestamp:    time.Now().UTC(),
-		Category:     CategoryPushResumeCheckpoint,
+		Category:     category,
 		ActorKind:    &actorKind,
 		ActorSubject: actorSubject,
 		Payload:      payload,
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"pull-request failure report: append push-resume checkpoint failed",
+			"pull-request failure report: append resume checkpoint failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
+			slog.String("category", category),
 			slog.String("error", err.Error()))
 	}
 }

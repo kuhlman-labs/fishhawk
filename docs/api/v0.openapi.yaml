@@ -5506,7 +5506,14 @@ components:
             `push_discarded` means a preserved push checkpoint was PERMANENTLY
             refused at consume time: no checkpoint is recorded and a
             `verified_tree_discarded` audit row accounts for the thrown-away
-            tree. An unrecognized value records NO checkpoint of either kind —
+            tree. `reverify` (E83.80 / #4190) means the agent pass succeeded
+            but the committed-tree verify gate failed category C: `head_sha` is
+            the runner's pinned `fishhawk verify wip` commit, `base_sha` its
+            parent, and the handler records them under its own
+            `verify_resume_checkpoint` audit category with NO verified tree
+            (the held tree is the one that failed verify), for the same
+            rollback property as `push`. An unrecognized value records NO
+            checkpoint of any kind —
             not even the legacy `pull_request_failed` one, which carries no kind
             discriminator and would be served as `pr_open` — so the retry fails
             safe to a full agent re-run; it is never a 400 (that would strand
@@ -5695,21 +5702,27 @@ components:
             fixup_pushed audit entry.
         resume_kind:
           type: string
-          enum: [push, push_discarded]
+          enum: [push, push_discarded, reverify]
           description: |
-            Present only on an `outcome: failed` report, and only for the two
-            E45.86 / #3621 kinds — the legacy paths (no checkpoint, or the
-            #2169 `pr_open` one) omit the key entirely so their bodies stay
-            byte-identical. `push`: the gate-verified commit exists on the
-            runner's disk and was NEVER published, so the handler records the
-            coordinates under the `push_resume_checkpoint` audit category and
-            NOT as this entry's `push_checkpoint`. `push_discarded`: a
-            preserved push checkpoint was permanently refused at consume time;
-            no checkpoint is recorded and a `verified_tree_discarded` row
-            accounts for the tree. An unrecognized value records NO checkpoint
-            of either kind (not even the legacy `push_checkpoint`, which has no
-            kind discriminator), so the retry fails safe to a full agent re-run
-            — never a 400.
+            Present only on an `outcome: failed` report, and only for the
+            E45.86 / #3621 and E83.80 / #4190 kinds — the legacy paths (no
+            checkpoint, or the #2169 `pr_open` one) omit the key entirely so
+            their bodies stay byte-identical. `push`: the gate-verified commit
+            exists on the runner's disk and was NEVER published, so the handler
+            records the coordinates under the `push_resume_checkpoint` audit
+            category and NOT as this entry's `push_checkpoint`.
+            `push_discarded`: a preserved push checkpoint was permanently
+            refused at consume time; no checkpoint is recorded and a
+            `verified_tree_discarded` row accounts for the tree. `reverify`
+            (E83.80 / #4190): the agent pass succeeded but the committed-tree
+            verify gate failed category C; `head_sha` names the runner's pinned
+            verify head and `base_sha` its parent, recorded under the
+            `verify_resume_checkpoint` audit category with no
+            `verified_tree_sha` (ignored if sent — the held tree failed
+            verify). An unrecognized value records NO checkpoint of any kind
+            (not even the legacy `push_checkpoint`, which has no kind
+            discriminator), so the retry fails safe to a full agent re-run —
+            never a 400.
         pr_body_fallback_reason:
           type: string
           enum:
@@ -20712,8 +20725,16 @@ paths:
             held-commit fields for a push-kind checkpoint, and the decline
             appends a `verified_tree_discarded` row with reason
             `runner_child_capability_absent`. It never gates a non-child run.
-            A current runner sends
-            `push-resume,merge-candidate-verify,child-push-resume`.
+            `reverify-resume` (E83.80 / #4190) — this runner's held-commit
+            early return carries the reverify consume arm: it prechecks the
+            held commit, re-runs ONE full-form committed-tree verify over it
+            with no agent, and publishes a re-signed commit on the same parent
+            only on a pass. A request WITHOUT it is served no held-commit
+            fields for a `verify_resume_checkpoint` (reason
+            `runner_capability_absent`; no tree is recorded for this kind, so
+            no `verified_tree_discarded` row is written). A current runner
+            sends
+            `push-resume,merge-candidate-verify,child-push-resume,reverify-resume`.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -21138,7 +21159,7 @@ paths:
                       resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open, push]
+                    enum: [pr_open, push, reverify]
                     description: |
                       DISCRIMINATES which recovery the four held-commit fields
                       above encode (#2169). ABSENT for the legacy #1231
@@ -21183,6 +21204,24 @@ paths:
                       resolution (refused, log-only). Each decline is a total
                       decline: no held-commit fields, so the retry is an
                       ordinary agent re-run.
+
+                      `reverify` (E83.80 / #4190) is the VERIFY-FAILURE resume:
+                      the agent pass succeeded but the committed-tree verify
+                      gate failed category C, and the newest audit entry for
+                      the stage is a `verify_resume_checkpoint`. The held
+                      commit is the runner's pinned verify head (local ref
+                      `refs/fishhawk/checkpoints/<run>/<stage>-verify`), and
+                      `held_commit_base_sha` its parent. The runner re-runs ONE
+                      full-form verify over it with no agent and, on a pass,
+                      publishes a DCO-signed commit with the same tree and
+                      parent through the `push` tail; a precheck miss falls
+                      back to an ordinary agent pass in the same dispatch.
+                      Served with NO `held_commit_verified_tree_sha`, ONLY to a
+                      request carrying `X-Fishhawk-Runner-Capabilities:
+                      reverify-resume` (otherwise declined, reason
+                      `runner_capability_absent`), NEVER to a decomposition
+                      child (declined, reason `child_resume_kind_unsupported`),
+                      and never to a fix-up dispatch.
                   held_commit_verified_tree_sha:
                     type: string
                     description: |
@@ -21191,7 +21230,8 @@ paths:
                       `held_commit_resume_kind: push`, where the commit is not
                       yet on the remote and the runner must re-prove
                       byte-exactly that the local commit's tree IS the verified
-                      one before publishing it. Absent on every other response.
+                      one before publishing it. Absent on every other response,
+                      including `reverify`, whose held tree failed verify.
                   supports_push_resume:
                     type: boolean
                     description: |
@@ -21209,7 +21249,7 @@ paths:
                     description: |
                       The pull-request TITLE the resumed runner opens with
                       (#2570). Served ONLY alongside the held-commit fields
-                      above, on BOTH resume kinds. Resolved in order: the
+                      above, on EVERY resume kind. Resolved in order: the
                       agent-authored title captured at park / checkpoint time
                       and persisted on the park row (or the newest
                       `scope_completeness_parked` audit payload's `pr_title`,
@@ -21609,18 +21649,18 @@ paths:
                     description: The base commit the held commit was built on (#2563); the runner ships it as the pull-request artifact's required `base_sha`. Resolved from the park's persisted base SHA or a legacy park's newest `scope_completeness_parked` audit `base_sha`; present only alongside a true `open_pr_from_held_commit`, and the exempt fields are all omitted when no base SHA resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open, push]
-                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). A decomposition child (E55.16 / #3916) is served `push` only to a request advertising both `push-resume` and `child-push-resume`, and never `pr_open` or the exempt resolution. NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
+                    enum: [pr_open, push, reverify]
+                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). A decomposition child (E55.16 / #3916) is served `push` only to a request advertising both `push-resume` and `child-push-resume`, and never `pr_open` or the exempt resolution. `reverify` (E83.80 / #4190) is the VERIFY-FAILURE resume from a `verify_resume_checkpoint`: the runner re-runs one full verify over its pinned verify head with no agent and publishes only on a pass; it is served with no verified tree, only to a request carrying `X-Fishhawk-Runner-Capabilities: reverify-resume`, and never to a decomposition child or a fix-up. NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
                   held_commit_verified_tree_sha:
                     type: string
-                    description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it.
+                    description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it. Never served with `reverify`, whose held tree failed verify.
                   supports_push_resume:
                     type: boolean
                     description: The BACKEND half of the E45.86 / #3621 capability handshake, `true` on every implement-stage response from a build that understands `held_commit_resume_kind: push`. It describes the build, not a per-run decision.
                   held_commit_pr_title:
                     type: string
                     description: |
-                      The pull-request title the resumed runner opens with (#2570), served only alongside the held-commit fields on both resume kinds. Resolved from the agent-authored title captured at park/checkpoint time (park row, else the newest `scope_completeness_parked` audit `pr_title`), else a Conventional-Commits title synthesized from the run's cached issue context. Absent when neither resolves — the runner then keeps its `chore: fishhawk implement stage <id>` placeholder. Unrecoverable PR text never withholds the resume.
+                      The pull-request title the resumed runner opens with (#2570), served only alongside the held-commit fields on every resume kind. Resolved from the agent-authored title captured at park/checkpoint time (park row, else the newest `scope_completeness_parked` audit `pr_title`), else a Conventional-Commits title synthesized from the run's cached issue context. Absent when neither resolves — the runner then keeps its `chore: fishhawk implement stage <id>` placeholder. Unrecoverable PR text never withholds the resume.
                   held_commit_pr_body:
                     type: string
                     description: |

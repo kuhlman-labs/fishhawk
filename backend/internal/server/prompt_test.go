@@ -387,10 +387,10 @@ func promptRequestWithCapabilities(t *testing.T, s *Server, stageID uuid.UUID, p
 
 // capableRunnerCapabilities is the header value a current runner sends: the
 // full token list in the runner's append-only order (#3621, #4183, E55.16 /
-// #3916). TestResumeKindWireValues pins it against the same literal the
-// runner's upload.TestRunnerCapabilityWireValues pins RunnerCapabilitiesValue()
-// against.
-const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify + "," + capabilityChildPushResume
+// #3916, E83.80 / #4190). TestResumeKindWireValues pins it against the same
+// literal the runner's upload.TestRunnerCapabilityWireValues pins
+// RunnerCapabilitiesValue() against.
+const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify + "," + capabilityChildPushResume + "," + capabilityReverifyResume
 
 // promptRenderRequest exercises the unsigned /prompt-render preview endpoint,
 // the sibling surface of promptRequest's signed /prompt dispatch endpoint.
@@ -10999,7 +10999,7 @@ func TestResolvePushCheckpointResume_NilAuditRepo(t *testing.T) {
 func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	stage.Type = run.StageTypeReview
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false); ok {
 		t.Error("a non-implement stage must never resume")
 	}
 }
@@ -11008,10 +11008,10 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	// Control: the SAME state without the fixup flag DOES resolve, so the RED
 	// below lands on the fixup guard rather than on a broken fixture.
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); !ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false); !ok {
 		t.Fatal("fixture must resolve a checkpoint on a non-fixup dispatch")
 	}
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, true, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, true, true, true, false); ok {
 		t.Error("a fix-up dispatch must re-invoke the agent, never take the resume short-circuit")
 	}
 }
@@ -11019,7 +11019,7 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 // TestResolvePushCheckpointResume_NilStage: the nil guard.
 func TestResolvePushCheckpointResume_NilStage(t *testing.T) {
 	s, runRow, _ := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false, true, true, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false, true, true, true, false); ok {
 		t.Error("a nil stage must never resume")
 	}
 }
@@ -14857,8 +14857,11 @@ func TestResumeKindWireValues(t *testing.T) {
 		{capabilityPushResume, "push-resume", "capabilityPushResume"},
 		{capabilityMergeCandidateVerify, "merge-candidate-verify", "capabilityMergeCandidateVerify"},
 		{capabilityChildPushResume, "child-push-resume", "capabilityChildPushResume"},
-		{capableRunnerCapabilities, "push-resume,merge-candidate-verify,child-push-resume", "capableRunnerCapabilities"},
+		{resumeKindReverify, "reverify", "resumeKindReverify"},
+		{capabilityReverifyResume, "reverify-resume", "capabilityReverifyResume"},
+		{capableRunnerCapabilities, "push-resume,merge-candidate-verify,child-push-resume,reverify-resume", "capableRunnerCapabilities"},
 		{CategoryPushResumeCheckpoint, "push_resume_checkpoint", "CategoryPushResumeCheckpoint"},
+		{CategoryVerifyResumeCheckpoint, "verify_resume_checkpoint", "CategoryVerifyResumeCheckpoint"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
@@ -14899,7 +14902,7 @@ func TestLegacyPROpenResolver_BlindToPushCheckpoint(t *testing.T) {
 	// Control: the NEW resolver DOES find it, so the assertion above is a
 	// statement about the old query rather than about an empty fixture.
 	s, runRow, stage := checkpointGateFixture(t, entries)
-	held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false)
+	held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false)
 	if !ok || held.resumeKind != resumeKindPush {
 		t.Fatalf("the new resolver must serve the push checkpoint, got ok=%t kind=%q", ok, held.resumeKind)
 	}
@@ -14994,7 +14997,7 @@ func TestPushResume_ServedToAdvertisingRunner(t *testing.T) {
 func TestResolvePushCheckpointResume_PROpenUnaffectedByCapability(t *testing.T) {
 	for _, advertises := range []bool{true, false} {
 		s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-		held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, advertises, true, false)
+		held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, advertises, true, true, false)
 		if !ok {
 			t.Fatalf("advertises=%t: the pr_open resume must be unaffected by the capability flag", advertises)
 		}
@@ -15045,7 +15048,7 @@ func TestResolvePushCheckpointResume_PushKindRefusals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, runRow, stage := checkpointGateFixture(t, tc.entries)
-			if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false); ok {
+			if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false); ok {
 				t.Error("must refuse")
 			}
 		})
@@ -15090,7 +15093,7 @@ func TestResolvePushCheckpointResume_ChildPushKindRequiresChildCapability(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			s, runRow, stage := childCheckpointGateFixture(t,
 				[]*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)}, tc.child)
-			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, tc.childToken, false)
+			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, tc.childToken, true, false)
 			if ok != tc.wantServed {
 				t.Fatalf("served = %t (kind %q), want %t", ok, held.resumeKind, tc.wantServed)
 			}
@@ -15121,7 +15124,7 @@ func TestResolvePushCheckpointResume_ChildPROpenDeclined(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, runRow, stage := childCheckpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)}, tc.child)
-			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, false)
+			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false)
 			if ok != tc.wantServed {
 				t.Fatalf("served = %t (kind %q), want %t", ok, held.resumeKind, tc.wantServed)
 			}
@@ -16409,6 +16412,189 @@ func TestPromptCapabilityRefusal_Documented(t *testing.T) {
 		for _, want := range []string{mergeCandidateReasonRunnerCapabilityMissing, capabilityMergeCandidateVerify} {
 			if !strings.Contains(string(raw), want) {
 				t.Errorf("docs/api/%s does not document %q", doc, want)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// REVERIFY resume (E83.80 / #4190): a held commit whose tree FAILED the
+// committed verify gate, recorded under verify_resume_checkpoint and served
+// only to a runner advertising reverify-resume, never to a child or a fix-up,
+// and never with a verified tree.
+// ---------------------------------------------------------------------------
+
+// reverifyCheckpointEntry is a verify_resume_checkpoint audit entry. withTree
+// plants a verified_tree_sha the recorder never writes for this kind, so a
+// served tree is observable rather than vacuously empty.
+func reverifyCheckpointEntry(seq int64, withTree bool) *audit.Entry {
+	tree := ""
+	if withTree {
+		tree = `,"verified_tree_sha":"` + checkpointVerifiedTree + `"`
+	}
+	return scopeDecisionEntryPayload(uuid.Nil, CategoryVerifyResumeCheckpoint, seq, `{
+		"resume_kind":"reverify",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+		`","base_sha":"`+checkpointBaseSHA+`"`+tree+`}}`)
+}
+
+// reverifyPromptAudit seeds a checkpoint-less pull_request_failed followed by a
+// NEWER reverify checkpoint, and hands back the fake for row inspection.
+func reverifyPromptAudit(au **exemptAuditFake, withTree bool) func(uuid.UUID) audit.Repository {
+	return func(sid uuid.UUID) audit.Repository {
+		*au = &exemptAuditFake{}
+		for _, e := range []*audit.Entry{prePushFailedEntry(7), reverifyCheckpointEntry(8, withTree)} {
+			id := sid
+			e.StageID = &id
+			(*au).entries = append((*au).entries, e)
+		}
+		return *au
+	}
+}
+
+func assertNoDiscardRow(t *testing.T, au *exemptAuditFake, why string) {
+	t.Helper()
+	for _, p := range au.appended {
+		if p.Category == "verified_tree_discarded" {
+			t.Errorf("%s: no verified_tree_discarded row may be written, got %s", why, p.Payload)
+		}
+	}
+}
+
+// TestPrompt_ReverifyResumeServedWithCapability: the real /prompt handler
+// serves a reverify checkpoint to a runner advertising every token, with the
+// held coordinates and kind reverify, and WITHOUT the verified tree the payload
+// deliberately carries — the held tree is the one that failed verify.
+func TestPrompt_ReverifyResumeServedWithCapability(t *testing.T) {
+	var au *exemptAuditFake
+	s, _, stageID, priv := exemptPromptFixture(t, nil, reverifyPromptAudit(&au, true))
+	keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv, capableRunnerCapabilities), "/prompt")
+	for key, want := range map[string]string{
+		"open_pr_from_held_commit": `true`,
+		"held_commit_sha":          `"` + checkpointHeadSHA + `"`,
+		"held_commit_branch":       `"` + checkpointBranch + `"`,
+		"held_commit_base_sha":     `"` + checkpointBaseSHA + `"`,
+		"held_commit_resume_kind":  `"reverify"`,
+	} {
+		raw, ok := keys[key]
+		if !ok {
+			t.Errorf("%s must be emitted on a served reverify resume", key)
+			continue
+		}
+		if string(raw) != want {
+			t.Errorf("%s = %s, want %s", key, raw, want)
+		}
+	}
+	if raw, ok := keys["held_commit_verified_tree_sha"]; ok {
+		t.Errorf("a reverify resume must serve NO verified tree (its tree failed verify), got %s", raw)
+	}
+	assertNoDiscardRow(t, au, "a served resume")
+}
+
+// TestPrompt_ReverifyResumeDeclinedWithoutCapability: the header carries EVERY
+// token except reverify-resume and the checkpoint is complete and newest, so
+// the capability check is the only thing that can withhold it. The decline is
+// total — no downgrade to push or pr_open — and, with no tree recorded, writes
+// no discard row.
+func TestPrompt_ReverifyResumeDeclinedWithoutCapability(t *testing.T) {
+	var au *exemptAuditFake
+	s, _, stageID, priv := exemptPromptFixture(t, nil, reverifyPromptAudit(&au, false))
+	caps := capabilityPushResume + "," + capabilityMergeCandidateVerify + "," + capabilityChildPushResume
+	keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv, caps), "/prompt")
+	assertNoResumeEmission(t, keys, "a runner not advertising reverify-resume must be served NO held-commit fields")
+	assertNoDiscardRow(t, au, "a reverify decline with no recorded tree")
+}
+
+// TestPrompt_ReverifyResumeDeclinedForChild: a decomposition child advertising
+// every token is still declined — the runner never arms reverify for a child,
+// and serving one would send it into the standalone PR-open tail.
+func TestPrompt_ReverifyResumeDeclinedForChild(t *testing.T) {
+	var au *exemptAuditFake
+	s, _, stageID, priv := exemptPromptFixtureChild(t, uuid.New(), nil, reverifyPromptAudit(&au, false))
+	keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv, capableRunnerCapabilities), "/prompt")
+	assertNoResumeEmission(t, keys, "a decomposition child must never be served a reverify resume")
+}
+
+// TestPrompt_ReverifyResumeDeclinedOnFixup: a fix-up dispatch must re-invoke
+// the agent, so the resolver refuses a reverify checkpoint for it. The paired
+// non-fix-up call on the IDENTICAL state is served, so the fix-up guard — not
+// an unresumable fixture — is what withholds it.
+func TestPrompt_ReverifyResumeDeclinedOnFixup(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fixup      bool
+		wantServed bool
+	}{
+		{"fixup_declined", true, false},
+		{"ordinary_dispatch_served", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{prePushFailedEntry(7), reverifyCheckpointEntry(8, false)})
+			held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, tc.fixup, true, true, true, false)
+			if ok != tc.wantServed {
+				t.Fatalf("served = %t (kind %q), want %t", ok, held.resumeKind, tc.wantServed)
+			}
+			if ok && (held.resumeKind != resumeKindReverify || held.sha != checkpointHeadSHA ||
+				held.branch != checkpointBranch || held.baseSHA != checkpointBaseSHA || held.verifiedTreeSHA != "") {
+				t.Errorf("held = %+v, want the reverify kind with the recorded coordinates and no tree", held)
+			}
+		})
+	}
+}
+
+// TestPrompt_ReverifyCheckpointIncompleteNotServed: a reverify checkpoint with
+// no base is never served — the runner's precheck parents the re-verified
+// commit on it, and the success ship requires base_sha.
+func TestPrompt_ReverifyCheckpointIncompleteNotServed(t *testing.T) {
+	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{
+		prePushFailedEntry(7),
+		scopeDecisionEntryPayload(uuid.Nil, CategoryVerifyResumeCheckpoint, 8, `{
+			"resume_kind":"reverify",
+			"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+`"}}`),
+	})
+	if held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false); ok {
+		t.Fatalf("an incomplete reverify checkpoint must not be served, got %+v", held)
+	}
+	if _, verdict := s.newestPushCheckpoint(context.Background(), runRow.ID, stage.ID); verdict != checkpointIncomplete {
+		t.Errorf("verdict = %q, want %q", verdict, checkpointIncomplete)
+	}
+}
+
+// TestPrompt_ReverifyCheckpointSupersededByNewerOutcome: a NEWER
+// pull_request_opened invalidates the reverify checkpoint (newest-wins), so the
+// retry never re-verifies a commit whose PR already opened.
+func TestPrompt_ReverifyCheckpointSupersededByNewerOutcome(t *testing.T) {
+	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{
+		prePushFailedEntry(7), reverifyCheckpointEntry(8, false),
+		scopeDecisionEntry(uuid.Nil, "pull_request_opened", 9),
+	})
+	if held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, true, true, false); ok {
+		t.Fatalf("a superseded reverify checkpoint must not be served, got %+v", held)
+	}
+	if _, verdict := s.newestPushCheckpoint(context.Background(), runRow.ID, stage.ID); verdict != checkpointSuperseded {
+		t.Errorf("verdict = %q, want %q", verdict, checkpointSuperseded)
+	}
+}
+
+// TestReverifyResume_Documented pins the reverify contract into the two API
+// documents, so the wire values cannot ship undocumented: the capability token,
+// the resume kind in both enums, and the audit category.
+func TestReverifyResume_Documented(t *testing.T) {
+	for _, rel := range []string{"docs/api/v0.openapi.yaml", "docs/api/v0.md"} {
+		b, err := os.ReadFile(filepath.Join(repoRoot(t), rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		doc := string(b)
+		for _, want := range []string{
+			capabilityReverifyResume,
+			CategoryVerifyResumeCheckpoint,
+			"push, push_discarded, " + resumeKindReverify,
+			"pr_open, push, " + resumeKindReverify,
+			capableRunnerCapabilities,
+		} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("%s must document %q (E83.80 / #4190)", rel, want)
 			}
 		}
 	}
