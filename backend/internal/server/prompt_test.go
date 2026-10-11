@@ -9264,6 +9264,106 @@ func TestGetStagePrompt_Acceptance_PopulatesCriteria(t *testing.T) {
 	}
 }
 
+// TestAcceptancePrompt_RendersDeclaredSkipFromApprovedPlan is the E72.63 /
+// #4095 cross-layer test: a skip_expected criterion seeded into the approved
+// plan ARTIFACT must reach the acceptance-stage prompt with its declaration, its
+// basis and the sandbox-limits section. It crosses artifact store →
+// effective-criteria resolution → prompt render → HTTP response, on both
+// resolution paths (the unamended approved-plan path, and the approval-gate
+// amendment path, where a retirement makes the server hand the renderer
+// AcceptanceCriteriaEffective) and on both surfaces: the SIGNED /prompt the
+// runner fetches and the unsigned /prompt-render the live
+// acceptance-prompt-renders-declared-skip-live criterion drives. The two
+// handlers duplicate trigger construction, so each is asserted. Run 82487694's
+// declared skips were dropped on this path, so the validator reported them
+// undecidable.
+func TestAcceptancePrompt_RendersDeclaredSkipFromApprovedPlan(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		retired bool
+		signed  bool
+	}{
+		{"approved_plan/signed_prompt", false, true},
+		{"approved_plan/prompt_render", false, false},
+		{"effective_criteria/signed_prompt", true, true},
+		{"effective_criteria/prompt_render", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+			ar := s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+			if len(ar.all) != 1 {
+				t.Fatalf("fixture carries %d artifacts, want the one approved plan", len(ar.all))
+			}
+			var p plan.Plan
+			if err := json.Unmarshal(ar.all[0].Content, &p); err != nil {
+				t.Fatalf("decode fixture plan: %v", err)
+			}
+			p.Verification.AcceptanceCriteria = append(p.Verification.AcceptanceCriteria, plan.AcceptanceCriterion{
+				ID: "ac-dedup", Statement: "alert dedup holds across restarts", Source: plan.CriterionSourceExplicit,
+				VerifyHint:       "Repository-local harness: TestAlertTrigger_Dedup",
+				SkipExpected:     true,
+				ExpectationBasis: "the committed-tree verify gate runs the pgtest-backed TestAlertTrigger_Dedup",
+			})
+			content, err := json.Marshal(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ar.all[0].Content = content
+			if tc.retired {
+				seedAcceptanceRetirement(t, s, runID, "")
+			}
+
+			var w *httptest.ResponseRecorder
+			if tc.signed {
+				w = promptRequest(t, s, runID, acceptanceStageID, priv, "")
+			} else {
+				w = promptRenderRequest(t, s, acceptanceStageID)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if tc.retired && !strings.Contains(resp.Prompt, "[ac-list] retired:") {
+				t.Fatalf("the retirement did not reach the prompt, so the effective-criteria path is not exercised\n---\n%s", resp.Prompt)
+			}
+			start := strings.Index(resp.Prompt, "- [ac-dedup] ")
+			if start < 0 {
+				t.Fatalf("acceptance prompt has no block for ac-dedup\n---\n%s", resp.Prompt)
+			}
+			block := resp.Prompt[start:]
+			if end := strings.Index(block, "\n\n"); end >= 0 {
+				block = block[:end]
+			}
+			for _, want := range []string{
+				"  skip_expected: true\n",
+				"  expectation_basis: the committed-tree verify gate runs the pgtest-backed TestAlertTrigger_Dedup",
+			} {
+				if !strings.Contains(block, want) {
+					t.Errorf("ac-dedup block missing %q\n---\n%s", want, block)
+				}
+			}
+			if !strings.Contains(resp.Prompt, "### Declared skips and sandbox limits") {
+				t.Errorf("acceptance prompt missing the sandbox-limits section\n---\n%s", resp.Prompt)
+			}
+			// A drivable criterion on the same path carries no declaration.
+			if cs := strings.Index(resp.Prompt, "- [ac-create] "); cs >= 0 {
+				create := resp.Prompt[cs:]
+				if end := strings.Index(create, "\n- ["); end >= 0 {
+					create = create[:end]
+				}
+				if strings.Contains(create, "skip_expected") {
+					t.Errorf("drivable ac-create renders skip_expected\n---\n%s", create)
+				}
+			} else {
+				t.Errorf("acceptance prompt has no block for ac-create\n---\n%s", resp.Prompt)
+			}
+		})
+	}
+}
+
 // TestGetStagePromptRender_Acceptance_PopulatesCriteria pins the SPA render
 // handler carries the SAME acceptance criteria — the two handlers duplicate
 // trigger construction, so the acceptance branch must land in both (or the SPA

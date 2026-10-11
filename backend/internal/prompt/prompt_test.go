@@ -12623,6 +12623,193 @@ func TestBuild_Acceptance_UndecidableTopLevelVerdictMapping(t *testing.T) {
 	}
 }
 
+// declaredSkipFixtureCriteria returns the E72.63 / #4095 criteria set: X is a
+// declared skip with a basis, L is a declared operator walk
+// (requires_live_validation + skip_expected + basis), Z is a declared skip
+// whose basis is whitespace-only, and Y is drivable.
+func declaredSkipFixtureCriteria() []plan.AcceptanceCriterion {
+	return []plan.AcceptanceCriterion{
+		{ID: "crit-x", Statement: "dedup holds across restarts", Source: plan.CriterionSourceExplicit,
+			VerifyHint: "Repository-local harness: TestFoo", SkipExpected: true,
+			ExpectationBasis: "committed-tree verify gate runs TestFoo"},
+		{ID: "crit-l", Statement: "the forge receives the comment", Source: plan.CriterionSourceExplicit,
+			VerifyHint: "operator walk on a live forge", RequiresLiveValidation: true, SkipExpected: true,
+			ExpectationBasis: "operator walk tracked in the live-validation issue"},
+		{ID: "crit-z", Statement: "a whitespace basis renders no basis line", Source: plan.CriterionSourceInferred,
+			SkipExpected: true, ExpectationBasis: "   "},
+		{ID: "crit-y", Statement: "GET /widgets returns 200", Source: plan.CriterionSourceExplicit,
+			VerifyHint: "GET /widgets returns 200 with the widget list"},
+	}
+}
+
+// acceptanceCriterionBlock slices one criterion's rendered block out of the
+// acceptance prompt: from its "- [<id>]" line to the next criterion line or the
+// blank line that closes the checklist.
+func acceptanceCriterionBlock(t *testing.T, prompt, id string) string {
+	t.Helper()
+	start := strings.Index(prompt, "- ["+id+"] ")
+	if start < 0 {
+		t.Fatalf("acceptance prompt has no block for criterion %q\n---\n%s", id, prompt)
+	}
+	block := prompt[start+len("- ["+id+"] "):]
+	end := len(block)
+	if i := strings.Index(block, "\n- ["); i >= 0 && i < end {
+		end = i
+	}
+	if i := strings.Index(block, "\n\n"); i >= 0 && i < end {
+		end = i
+	}
+	return block[:end]
+}
+
+// TestBuild_Acceptance_RendersDeclaredSkip pins the E72.63 / #4095 criterion
+// rendering: a declared skip carries `skip_expected: true` and its basis, a
+// declared operator walk also carries `requires_live_validation: true`, a
+// whitespace-only basis renders no basis line, and a drivable criterion carries
+// none of the three. Run 82487694's four database-backed criteria were declared
+// skips the validator was never shown, so it tried to decide them and reported
+// them undecidable. Both render paths are covered: the approved plan's
+// criteria and the approval-gate AcceptanceCriteriaEffective set, which feed
+// the same loop. Deleting the skip_expected branch reddens crit-x; rendering it
+// unconditionally reddens crit-y's absence half.
+func TestBuild_Acceptance_RendersDeclaredSkip(t *testing.T) {
+	approvedPlan := acceptanceFixturePlan()
+	approvedPlan.Verification.AcceptanceCriteria = declaredSkipFixtureCriteria()
+	effectivePlan := acceptanceFixturePlan()
+
+	for _, tc := range []struct {
+		name string
+		tr   Trigger
+	}{
+		{"approved_plan", Trigger{Repo: "x/y", ApprovedPlan: approvedPlan}},
+		{"effective_criteria", Trigger{Repo: "x/y", ApprovedPlan: effectivePlan,
+			AcceptanceCriteriaEffective: declaredSkipFixtureCriteria()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Build("acceptance", tc.tr)
+			if err != nil {
+				t.Fatalf("Build(acceptance): %v", err)
+			}
+			x := acceptanceCriterionBlock(t, got, "crit-x")
+			for _, want := range []string{
+				"  skip_expected: true\n",
+				"  expectation_basis: committed-tree verify gate runs TestFoo",
+			} {
+				if !strings.Contains(x, want) {
+					t.Errorf("declared-skip criterion block missing %q\n---\n%s", want, x)
+				}
+			}
+			if strings.Contains(x, "requires_live_validation") {
+				t.Errorf("crit-x is not a live walk but renders requires_live_validation\n---\n%s", x)
+			}
+
+			l := acceptanceCriterionBlock(t, got, "crit-l")
+			for _, want := range []string{
+				"  skip_expected: true\n",
+				"  expectation_basis: operator walk tracked in the live-validation issue",
+				"  requires_live_validation: true",
+			} {
+				if !strings.Contains(l, want) {
+					t.Errorf("declared operator-walk criterion block missing %q\n---\n%s", want, l)
+				}
+			}
+
+			z := acceptanceCriterionBlock(t, got, "crit-z")
+			if !strings.Contains(z, "  skip_expected: true") {
+				t.Errorf("whitespace-basis skip block missing skip_expected\n---\n%s", z)
+			}
+			if strings.Contains(z, "expectation_basis") {
+				t.Errorf("a whitespace-only basis must render no expectation_basis line\n---\n%s", z)
+			}
+
+			y := acceptanceCriterionBlock(t, got, "crit-y")
+			for _, banned := range []string{"skip_expected", "expectation_basis", "requires_live_validation"} {
+				if strings.Contains(y, banned) {
+					t.Errorf("drivable criterion block renders %q\n---\n%s", banned, y)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_Acceptance_SandboxLimitsSection pins the E72.63 / #4095 "###
+// Declared skips and sandbox limits" section: it renders exactly once, AFTER
+// "### When you cannot DECIDE a criterion" (so its backtick tokens stay outside
+// the closed-field-set region —
+// TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator stays green
+// alongside), it carries the declared-skip instruction, the sandbox's EPERM
+// signature and the database/container checks it covers, and the
+// plan.UndecidableCauseSandboxDeniedDB token the ingest classifier matches. It
+// is ABSENT from every non-acceptance render, which is the review-prompt half of
+// the byte-identity claim. Deleting the writeAcceptanceSandboxLimits call
+// leaves this RED on the first assertion.
+func TestBuild_Acceptance_SandboxLimitsSection(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	const section = "### Declared skips and sandbox limits"
+	const undecidable = "### When you cannot DECIDE a criterion"
+	si := strings.Index(got, section)
+	if si < 0 {
+		t.Fatalf("acceptance prompt missing %q section\n---\n%s", section, got)
+	}
+	if n := strings.Count(got, section); n != 1 {
+		t.Errorf("acceptance prompt renders %q %d times, want exactly once", section, n)
+	}
+	if ui := strings.Index(got, undecidable); ui < 0 || ui > si {
+		t.Errorf("%q at %d must render AFTER %q at %d", section, si, undecidable, ui)
+	}
+	body := got[si:]
+	for _, want := range []string{
+		// Rule (i): a declared skip is reported skipped with its basis.
+		"`skip_expected: true`",
+		"REVIEWED skip",
+		"Report it `result`=`skipped` citing that `expectation_basis`",
+		"Never report a declared skip `undecidable`",
+		"`requires_live_validation: true`",
+		// Rule (ii): what the sandbox cannot run, and Posture B does not reach it.
+		"`connect: operation not permitted`",
+		"pgtest",
+		"testcontainers",
+		"`FISHHAWK_TEST_PG_URL`",
+		"`psql`",
+		"`docker`",
+		"Do not attempt such a check",
+		"Posture B, which does not extend to it",
+		"committed-tree verify gate already ran those tests",
+		// Rule (iii): the explicit cause token.
+		"START its `undecidable_reason`",
+		"`" + plan.UndecidableCauseSandboxDeniedDB + ":`",
+		"it never changes the verdict",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sandbox-limits section missing %q\n---\n%s", want, body)
+		}
+	}
+
+	// The token the prompt asks for must be one the ingest classifier names.
+	example := plan.UndecidableCauseSandboxDeniedDB + ": TestFoo needs the pgtest Postgres"
+	if !strings.Contains(body, example) {
+		t.Fatalf("sandbox-limits section missing its worked example %q\n---\n%s", example, body)
+	}
+	if cause := plan.ClassifyUndecidableReason(example); cause != plan.UndecidableCauseSandboxDeniedDB {
+		t.Errorf("ClassifyUndecidableReason(%q) = %q, want %q: the prompt's example reason must classify",
+			example, cause, plan.UndecidableCauseSandboxDeniedDB)
+	}
+
+	// Absent from every non-acceptance render.
+	for _, stage := range []string{"plan", "plan_review", "implement", "implement_review"} {
+		out, err := Build(stage, Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan(), IssueNumber: 1, IssueTitle: "t", IssueBody: "b"})
+		if err != nil {
+			t.Fatalf("Build(%s): %v", stage, err)
+		}
+		if strings.Contains(out, section) || strings.Contains(out, plan.UndecidableCauseSandboxDeniedDB) {
+			t.Errorf("%s render must not carry the sandbox-limits section\n---\n%s", stage, out)
+		}
+	}
+}
+
 // TestBuild_Acceptance_DoesNotMutateApprovedPlan pins the guardrail carried
 // forward from the prior design: the acceptance-prompt paths read the approved
 // plan's verification (criteria, out_of_scope) and an in-place mutation of the
