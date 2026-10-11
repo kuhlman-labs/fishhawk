@@ -828,6 +828,121 @@ func (c *Client) IssueParent(ctx context.Context, scope forge.CredentialScope, r
 	return &IssueParent{Number: p.Number, Title: p.Title}, nil
 }
 
+// issueBlockedByFirst is the page size IssueBlockedBy requests from the
+// `blockedBy` connection. GitHub documents a per-relationship-type cap well
+// under it, but the read does NOT rely on that: a relation larger than one page
+// is detected through totalCount and refused (ErrRelationTruncated), never
+// returned partially (#4028).
+const issueBlockedByFirst = 100
+
+// ErrRelationTruncated marks a dependency-relation read whose connection
+// reported more members (totalCount) than the nodes it returned (#4028). A
+// truncated "blocked by" relation is an ERROR, never a short list: a caller that
+// took the returned nodes as complete would silently drop a dependency edge.
+var ErrRelationTruncated = errors.New("githubclient: dependency relation truncated")
+
+// BlockingIssueRef is one member of an issue's native "blocked by" relation
+// (#4028): the blocking issue's Number and the nameWithOwner ("owner/name") of
+// the repository it lives in, verbatim from GraphQL. Repository is carried
+// rather than assumed, because a blocking issue may live in ANOTHER repository,
+// where Number is not a local issue number; the caller decides same-repo-ness.
+type BlockingIssueRef struct {
+	Number     int
+	Repository string
+}
+
+// IssueBlockedBy reads an issue's native "blocked by" dependency relation in
+// ONE GraphQL round trip (#4028):
+//
+//	query IssueBlockedBy($owner,$name,$number,$first) { repository(owner,name){ issue(number){ blockedBy(first){ totalCount nodes{ number repository{ nameWithOwner } } } } } }
+//
+// It is FAIL-CLOSED, unlike IssueParent (where "no parent" is a normal answer):
+// the caller builds campaign dependency edges from the result, so every
+// ambiguous shape is an error rather than an empty or partial list.
+//
+//   - A null repository or a null issue is an error wrapping ErrNotFound and
+//     naming the issue (a missing issue is not "blocked by nothing").
+//   - totalCount greater than the nodes returned is an error wrapping
+//     ErrRelationTruncated naming the issue and both counts.
+//   - A node with number <= 0 or an empty repository nameWithOwner is an error
+//     naming the issue (a bogus "#0" or repository-less ref is never returned).
+//
+// An issue with no "blocked by" relation returns (nil, nil). It rejects a zero
+// scope, a blank owner/name or a number <= 0 BEFORE issuing any request, like
+// IssueParent. It propagates doGraphQL's ErrForbidden / ErrValidation /
+// transport errors (a GraphQL host without the field answers an errors
+// envelope, so that surfaces as ErrValidation). Issue dependencies are
+// repo-scoped, so it uses the installation token path with no WithProjectsToken
+// opt-in; it has not been exercised against a live installation token.
+func (c *Client) IssueBlockedBy(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int) ([]BlockingIssueRef, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return nil, errors.New("githubclient: issue number must be > 0")
+	}
+	const query = `query IssueBlockedBy($owner: String!, $name: String!, $number: Int!, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      blockedBy(first: $first) {
+        totalCount
+        nodes {
+          number
+          repository { nameWithOwner }
+        }
+      }
+    }
+  }
+}`
+	var data struct {
+		Repository *struct {
+			Issue *struct {
+				BlockedBy struct {
+					TotalCount int `json:"totalCount"`
+					Nodes      []struct {
+						Number     int `json:"number"`
+						Repository struct {
+							NameWithOwner string `json:"nameWithOwner"`
+						} `json:"repository"`
+					} `json:"nodes"`
+				} `json:"blockedBy"`
+			} `json:"issue"`
+		} `json:"repository"`
+	}
+	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
+		"owner":  repo.Owner,
+		"name":   repo.Name,
+		"number": number,
+		"first":  issueBlockedByFirst,
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Repository == nil || data.Repository.Issue == nil {
+		return nil, fmt.Errorf("%w: githubclient: blocked-by read: issue %s/%s#%d not found", ErrNotFound, repo.Owner, repo.Name, number)
+	}
+	rel := data.Repository.Issue.BlockedBy
+	if rel.TotalCount > len(rel.Nodes) {
+		return nil, fmt.Errorf("%w: issue %s/%s#%d reports %d blocked-by issues but the read returned %d",
+			ErrRelationTruncated, repo.Owner, repo.Name, number, rel.TotalCount, len(rel.Nodes))
+	}
+	var refs []BlockingIssueRef
+	for _, n := range rel.Nodes {
+		if n.Number <= 0 || n.Repository.NameWithOwner == "" {
+			return nil, fmt.Errorf("githubclient: blocked-by read: issue %s/%s#%d returned a blocking issue with number %d and repository %q; refusing an unidentifiable dependency",
+				repo.Owner, repo.Name, number, n.Number, n.Repository.NameWithOwner)
+		}
+		refs = append(refs, BlockingIssueRef{Number: n.Number, Repository: n.Repository.NameWithOwner})
+	}
+	return refs, nil
+}
+
 // projectsTokenKey is the unexported context-key type for the
 // request-scoped flag that asks doGraphQL to authenticate with the
 // static projects token (Client.ProjectsToken) instead of the

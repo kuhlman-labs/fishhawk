@@ -85,7 +85,7 @@ func TestResolveDependencies_ThreeIssueDAG(t *testing.T) {
 			{Number: 2, Title: "issue 2", State: "OPEN", Body: "two", URL: "https://gitlab.example/acme/widgets/-/issues/2"},
 			{Number: 3, Title: "issue 3", Autonomy: "high", State: "OPEN", Body: "three", URL: "https://gitlab.example/acme/widgets/-/issues/3"},
 		},
-		Edges: []workmgmt.DependsEdge{{From: 3, To: 1}},
+		Edges: []workmgmt.DependsEdge{{From: 3, To: 1, Source: workmgmt.DependencySourceNative}},
 	}
 	if !reflect.DeepEqual(res, want) {
 		t.Fatalf("result = %+v\nwant     %+v", res, want)
@@ -129,17 +129,17 @@ func TestResolveDependencies_OutOfSetClassification(t *testing.T) {
 		{
 			name:        "open target keeps DropNotChild",
 			setup:       func(api *fakeAPI) { api.issue(9, "opened", "", nil) },
-			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropNotChild}},
+			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropNotChild, Source: workmgmt.DependencySourceNative}},
 		},
 		{
 			name:          "closed target is satisfied with an empty StateReason",
 			setup:         func(api *fakeAPI) { api.issue(9, "closed", "", nil) },
-			wantSatisfied: []workmgmt.SatisfiedEdge{{From: 1, To: 9, State: "closed", StateReason: ""}},
+			wantSatisfied: []workmgmt.SatisfiedEdge{{From: 1, To: 9, State: "closed", StateReason: "", Source: workmgmt.DependencySourceNative}},
 		},
 		{
 			name:        "target fetch error is unreadable, not an error",
 			setup:       func(api *fakeAPI) { api.issueErrs = map[int]error{9: errors.New("403 forbidden")} },
-			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable}},
+			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable, Source: workmgmt.DependencySourceNative}},
 		},
 		{
 			// A CLOSED issue returned alongside an error: without the error
@@ -150,12 +150,12 @@ func TestResolveDependencies_OutOfSetClassification(t *testing.T) {
 				api.issueErrs = map[int]error{9: errors.New("partial read")}
 				api.errWithIssue = map[int]bool{9: true}
 			},
-			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable}},
+			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable, Source: workmgmt.DependencySourceNative}},
 		},
 		{
 			name:        "nil target issue is unreadable",
 			setup:       func(api *fakeAPI) { api.nilIssue = map[int]bool{9: true} },
-			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable}},
+			wantDropped: []workmgmt.DependsEdge{{From: 1, To: 9, Reason: workmgmt.DropTargetStateUnreadable, Source: workmgmt.DependencySourceNative}},
 		},
 	}
 	for _, tc := range tests {
@@ -204,8 +204,8 @@ func TestResolveDependencies_CrossProjectLinkNeverFetched(t *testing.T) {
 		t.Fatalf("dropped = %+v, want exactly one", res.DroppedEdges)
 	}
 	d := res.DroppedEdges[0]
-	if d.From != 1 || d.To != 0 || d.Reason != workmgmt.DropTargetStateUnreadable || d.ToRef != "project:99#5" {
-		t.Errorf("dropped edge = %+v, want From 1, To 0, unreadable, ToRef project:99#5", d)
+	if d.From != 1 || d.To != 0 || d.Reason != workmgmt.DropTargetStateUnreadable || d.ToRef != "project:99#5" || d.Source != workmgmt.DependencySourceNative {
+		t.Errorf("dropped edge = %+v, want From 1, To 0, unreadable, ToRef project:99#5, Source native", d)
 	}
 	if got := d.TargetRef(); strings.HasPrefix(got, "issue:") || !strings.Contains(got, "project:99#5") {
 		t.Errorf("TargetRef = %q, want the foreign identity, never issue:<n>", got)
@@ -368,6 +368,11 @@ func TestEpicChildren_RelatesToWithParentMarker(t *testing.T) {
 	}
 	if got := edgeNums(res.Edges); !reflect.DeepEqual(got, [][2]int{{1, 2}}) {
 		t.Errorf("edges = %v, want [[1 2]]", got)
+	}
+	// Epic mode shares the one edge pipeline, so its is_blocked_by edge is
+	// tagged native too (#4028).
+	if len(res.Edges) == 1 && res.Edges[0].Source != workmgmt.DependencySourceNative {
+		t.Errorf("edge source = %q, want native", res.Edges[0].Source)
 	}
 	if !res.Children[1].Complete || res.Children[1].State != "CLOSED" {
 		t.Errorf("child #2 = %+v, want Complete/CLOSED", res.Children[1])

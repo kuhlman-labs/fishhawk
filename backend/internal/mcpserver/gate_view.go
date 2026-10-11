@@ -130,14 +130,23 @@ Response (gate_view):
     acceptance_stale (a fix-up push or operator re-open invalidated the
     recorded acceptance verdict — details name verified_head_sha,
     current_head_sha and next_step: fishhawk_dispatch_stage,
-    fishhawk_await_stage or fishhawk_retry_stage) and approval_dismissed (the
+    fishhawk_await_stage or fishhawk_retry_stage), approval_dismissed (the
     PR is blocked, no approval is live and a prior review was dismissed —
     details name approved_commit, dismissing_commit, dismissing_cause
-    vouch_commit | fixup_push | push | unknown, and next_step approve_pr).
+    vouch_commit | fixup_push | push | unknown, and next_step approve_pr) and
+    review_coverage_incomplete (a decomposed parent has a succeeded slice no
+    SUCCESSFUL agent review covers: neither the parent's latest
+    implement-review round nor the slice's own latest round recorded a
+    verdict, and a round whose reviewers all failed or were skipped covers
+    nothing — details name uncovered_slices[] (child_run_id, slice_index,
+    round_sequence, reason), parent_round and next_step: fishhawk_rerun_review
+    when the parent round settled with no verdict, fishhawk_await_review while
+    it is in flight or not yet dispatched).
     undetermined[] names each check that could not reach a verdict (the
     approval check fails OPEN on any forge uncertainty; an acceptance-history
-    read failure is also a merge_readiness history_gaps entry), so an empty
-    blockers[] is not "nothing blocks" while undetermined[] is non-empty.
+    or review-coverage read failure is also a merge_readiness history_gaps
+    entry), so an empty blockers[] is not "nothing blocks" while
+    undetermined[] is non-empty.
     Omitted when the run has no pull request or is failed/cancelled.
 `),
 	}, resolver.getGateView)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -158,6 +159,12 @@ type campaignResponse struct {
 	// SatisfiedDependencies (never persisted, so GET/list omit it), omitted
 	// when the screen found nothing. It never blocks or alters the create.
 	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
+	// Warnings names every item whose depends_on relies on a legacy free-text
+	// `Depends on:` line rather than the tracker's native relation (#4028).
+	// CREATE-response-only like SatisfiedDependencies (never persisted, so
+	// GET/list and an idempotent replay omit it), omitted when no edge is
+	// legacy_text. Informational: the create is never refused on a warning.
+	Warnings []campaignDependencyWarning `json:"warnings,omitempty"`
 }
 
 // satisfiedDependencyPayload is one elided-because-already-satisfied depends_on
@@ -170,6 +177,88 @@ type satisfiedDependencyPayload struct {
 	To          int    `json:"to"`
 	State       string `json:"state"`
 	StateReason string `json:"state_reason"`
+	// Source is where the elided edge was read from (#4028): native or
+	// legacy_text. omitempty so an edge from a provider that predates source
+	// tagging keeps its pre-#4028 wire shape.
+	Source string `json:"source,omitempty"`
+}
+
+// legacyTextDependencyWarningCode is the code every campaignDependencyWarning
+// carries (#4028). It is the only warning code today.
+const legacyTextDependencyWarningCode = "legacy_text_dependency"
+
+// campaignDependencyWarning is one item whose depends_on relies on at least one
+// legacy free-text `Depends on:` line (#4028). It is shared by the create and
+// preview responses and mirrors docs/api/v0.openapi.yaml's
+// CampaignDependencyWarning schema. It is INFORMATIONAL: the edge is still
+// honoured, and neither verb refuses on it.
+type campaignDependencyWarning struct {
+	// IssueRef is the item relying on the legacy line, as issue:N.
+	IssueRef string `json:"issue_ref"`
+	// Code is always legacy_text_dependency.
+	Code string `json:"code"`
+	// Targets are the item's legacy_text dependency targets, rendered through
+	// the same authority every other edge rendering uses (TargetRef for a
+	// depends_on edge, issue:N for a satisfied one), sorted and deduped.
+	Targets []string `json:"targets"`
+	// Message names the issue, the targets and the remedy.
+	Message string `json:"message"`
+}
+
+// legacyDependencyWarnings builds one warning per item that relies on a
+// legacy_text depends_on edge (#4028), walking EVERY edge class the provider
+// returned — in-set Edges, DroppedEdges and SatisfiedEdges — so a legacy line
+// whose edge dangles or was elided as satisfied is warned about too. Warnings
+// are sorted by issue number; targets are sorted and deduped. A native edge
+// never warns. Returns nil when no edge is legacy_text, so both responses omit
+// the key.
+func legacyDependencyWarnings(res *workmgmt.EpicChildrenResult) []campaignDependencyWarning {
+	if res == nil {
+		return nil
+	}
+	targetsOf := map[int]map[string]struct{}{}
+	add := func(from int, target string) {
+		if targetsOf[from] == nil {
+			targetsOf[from] = map[string]struct{}{}
+		}
+		targetsOf[from][target] = struct{}{}
+	}
+	for _, edges := range [][]workmgmt.DependsEdge{res.Edges, res.DroppedEdges} {
+		for _, e := range edges {
+			if e.Source == workmgmt.DependencySourceLegacyText {
+				add(e.From, e.TargetRef())
+			}
+		}
+	}
+	for _, e := range res.SatisfiedEdges {
+		if e.Source == workmgmt.DependencySourceLegacyText {
+			add(e.From, "issue:"+strconv.Itoa(e.To))
+		}
+	}
+	if len(targetsOf) == 0 {
+		return nil
+	}
+	froms := make([]int, 0, len(targetsOf))
+	for from := range targetsOf {
+		froms = append(froms, from)
+	}
+	sort.Ints(froms)
+	out := make([]campaignDependencyWarning, 0, len(froms))
+	for _, from := range froms {
+		targets := make([]string, 0, len(targetsOf[from]))
+		for t := range targetsOf[from] {
+			targets = append(targets, t)
+		}
+		sort.Strings(targets)
+		out = append(out, campaignDependencyWarning{
+			IssueRef: "issue:" + strconv.Itoa(from),
+			Code:     legacyTextDependencyWarningCode,
+			Targets:  targets,
+			Message: "issue #" + strconv.Itoa(from) + " depends on " + strings.Join(targets, ", ") +
+				` only through a legacy free-text "Depends on:" line; add a native "blocked by" link for each so the dependency survives once legacy parsing is retired (the line is still honoured until then)`,
+		})
+	}
+	return out
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -888,6 +977,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"elided":      elided,
 		})
 	}
+	// The legacy-dependency warnings (#4028): create-response-only and
+	// informational — the campaign was created regardless. Nil = no item relies
+	// on a legacy `Depends on:` line → no key.
+	resp.Warnings = legacyDependencyWarnings(result)
 	// The admission screen block (#3649): create-response-only, plus one
 	// best-effort audit copy. Nil = nothing found → no key, no audit.
 	if admissionScreen != nil {
@@ -1327,11 +1420,24 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 			}
 		}
 
-		result, err = querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{
+		// Prefer the CAMPAIGN-ONLY capability when the provider has it (#4028):
+		// it is EpicChildren plus the tracker's native "blocked by" relation, and
+		// it fails closed on a native-read failure. EpicChildren stays the
+		// fallback for a provider without it (gitlab already reads its native
+		// links there) and is the method every NON-campaign consumer keeps
+		// calling, so a native-read failure can never reach them.
+		query := querier.EpicChildren
+		if cq, ok := provider.(workmgmt.CampaignEpicChildrenQuerier); ok {
+			query = cq.CampaignEpicChildren
+		}
+		result, err = query(ctx, workmgmt.EpicChildrenRequest{
 			Target: target,
 			Epic:   req.EpicRef,
 		})
 		if err != nil {
+			if refusal := nativeDependencyReadRefusal(err); refusal != nil {
+				return nil, refusal
+			}
 			return nil, &campaignSourceRefusal{
 				Status:  http.StatusBadGateway,
 				Code:    "epic_children_query_failed",
@@ -1400,8 +1506,12 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 		// requestStart (see handleCreateCampaign's opening comment), so the
 		// budget covers the whole span the caller's client timeout measures,
 		// not just the resolver call. The EPIC branch above is deliberately
-		// untouched: EpicChildren reads the sibling set in ONE ListSubIssues
-		// call, so it does not have the per-item round-trip cost this bounds.
+		// untouched: it reads the sibling set in ONE ListSubIssues call plus,
+		// on GitHub's campaign-only CampaignEpicChildren, one native
+		// "blocked by" GraphQL read per child on a pool bounded at 8 in flight
+		// (#4028) — a cheap read per child, NOT the per-item GetIssue plus
+		// out-of-set target sweep this budget exists for. If epic sizes ever
+		// make that tight, this is the deadline to extend to it.
 		budget := s.issueSetResolutionBudget()
 		resolveCtx, cancelResolve := context.WithDeadline(ctx, requestStart.Add(budget))
 		result, err = resolver.ResolveDependencies(resolveCtx, workmgmt.IssueSetRequest{
@@ -1456,6 +1566,13 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 					Details: map[string]any{"items": itemRefs},
 				}
 			}
+			// A failed native "blocked by" read (#4028): classified AFTER the
+			// typed timeout and the invalid-ref arm, BEFORE the generic 502, so
+			// the refusal names the issue and the reason instead of a transport
+			// failure.
+			if refusal := nativeDependencyReadRefusal(err); refusal != nil {
+				return nil, refusal
+			}
 			return nil, &campaignSourceRefusal{
 				Status:  http.StatusBadGateway,
 				Code:    "issue_set_resolution_failed",
@@ -1495,6 +1612,50 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 	}, nil
 }
 
+// nativeDependencyReadRemedies is the per-reason remedy the
+// native_dependency_read_failed refusal names (#4028). Static literals, so the
+// message stays product-owned.
+var nativeDependencyReadRemedies = map[workmgmt.NativeDependencyReadReason]string{
+	workmgmt.NativeReadTruncated:   `the relation reported more links than one read returns, so the edge set cannot be proven complete; remove "blocked by" links from the issue until it has at most 100, then retry`,
+	workmgmt.NativeReadForbidden:   `the forge refused the read; grant the GitHub App installation Issues read permission on the repository, then retry`,
+	workmgmt.NativeReadNotFound:    `the issue or its repository could not be found; check the ref and that the GitHub App can see the repository, then retry`,
+	workmgmt.NativeReadUnsupported: `this deployment's forge client cannot read native "blocked by" links, so the campaign cannot be assembled without dropping edges; report it as a Fishhawk defect`,
+	workmgmt.NativeReadFailed:      `the read failed (transport, a GraphQL error, or a host without issue dependencies); retry, and check the host serves the Issue.blockedBy relation if it persists`,
+}
+
+// nativeDependencyReadRefusal maps a campaign-path native dependency-relation
+// read failure (#4028) onto the SHARED 502 native_dependency_read_failed
+// refusal, or returns nil when err carries no *workmgmt.NativeDependencyReadError.
+// Campaign assembly never degrades to a partial edge set, so the refusal names
+// the issue whose relation could not be read and why. The message is built from
+// the typed fields and static remedies only; the raw cause rides
+// internalCauseKey to the server log, never the 5xx wire.
+func nativeDependencyReadRefusal(err error) *campaignSourceRefusal {
+	var nerr *workmgmt.NativeDependencyReadError
+	if !errors.As(err, &nerr) {
+		return nil
+	}
+	reason := nerr.Reason
+	remedy, ok := nativeDependencyReadRemedies[reason]
+	if !ok {
+		reason = workmgmt.NativeReadFailed
+		remedy = nativeDependencyReadRemedies[workmgmt.NativeReadFailed]
+	}
+	details := map[string]any{"reason": string(reason), internalCauseKey: err.Error()}
+	msg := `could not read the native "blocked by" dependencies`
+	if nerr.Issue > 0 {
+		details["issue_ref"] = "issue:" + strconv.Itoa(nerr.Issue)
+		msg += " of issue #" + strconv.Itoa(nerr.Issue)
+	}
+	msg += " (" + string(reason) + "): " + remedy
+	return &campaignSourceRefusal{
+		Status:  http.StatusBadGateway,
+		Code:    "native_dependency_read_failed",
+		Message: msg,
+		Details: details,
+	}
+}
+
 func satisfiedDependencyPayloads(edges []workmgmt.SatisfiedEdge) []satisfiedDependencyPayload {
 	if len(edges) == 0 {
 		return nil
@@ -1503,6 +1664,7 @@ func satisfiedDependencyPayloads(edges []workmgmt.SatisfiedEdge) []satisfiedDepe
 	for _, e := range edges {
 		out = append(out, satisfiedDependencyPayload{
 			From: e.From, To: e.To, State: e.State, StateReason: e.StateReason,
+			Source: string(e.Source),
 		})
 	}
 	return out

@@ -97,6 +97,7 @@ var adminWriteRoutes = map[string]bool{
 	"POST /v0/runs/{run_id}/reset-branch":                   true,
 	"POST /v0/runs/{run_id}/rebase-branch":                  true,
 	"POST /v0/runs/{run_id}/reviews/reconcile":              true,
+	"POST /v0/runs/{run_id}/reviews/rerun":                  true,
 	"POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure": true,
 	"POST /v0/runs/{run_id}/signing-key":                    true,
 	"POST /v0/runs/{run_id}/deployment/rollback":            true,

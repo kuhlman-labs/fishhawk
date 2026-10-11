@@ -310,6 +310,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRetryStage(srv, resolver)
 	registerReapStage(srv, resolver)
 	registerReconcileReviews(srv, resolver)
+	// #4219: the re-run of a verdict-less implement-review round, adjacent to
+	// the reconcile it follows (reconcile closes an orphaned round; this
+	// re-runs a settled one that recorded no verdict).
+	registerRerunReview(srv, resolver)
 	// The #3083/#3136 merge-recovery PAIR, adjacent on purpose: the
 	// completion_blocked discriminator hands out one verb OR the other, and they
 	// compose in a fixed order (observe, then reconcile). See merge_recovery.go.

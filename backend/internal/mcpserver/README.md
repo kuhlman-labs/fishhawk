@@ -502,7 +502,7 @@ The two `501` capability refusals (`epic_children_unsupported`, `issue_set_resol
 
 ### `issue_set_resolution_timeout` and the issue-set client ([#3113](https://github.com/kuhlman-labs/fishhawk/issues/3113))
 
-A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path is unaffected — `EpicChildren` reads the sibling set in one `ListSubIssues` call.
+A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path stays outside this budget, but as of #4028 it is no longer a single `ListSubIssues` call for campaign assembly on GitHub: the campaign-only `CampaignEpicChildren` adds one native "blocked by" GraphQL read per child, bounded at 8 in flight.
 
 **What used to happen.** `CreateCampaign` ran on the shared 30s short `http.Client`, and the server had **no deadline on this path at all** (`server.go` sets `ReadHeaderTimeout` only — no `WriteTimeout`, no `TimeoutHandler`). So the **client** was what gave up, at 29999ms, with a bare transport error carrying no counts. #3113's original Summary diagnosed a *server-side* 30s deadline on issue-set resolution; **that diagnosis was wrong**.
 
@@ -1920,6 +1920,18 @@ verdict still reads back with its concerns at the gate — and a second call is 
 timestamp against its own boot marker and answers `skip_reason: review_dispatched_by_this_process`, so invoking it
 against a healthy running review changes nothing. Requires `write:runs`; a 404/403 surfaces verbatim.
 
+## Review-coverage hold and the re-run verb (`fishhawk_rerun_review`, [#4219](https://github.com/kuhlman-labs/fishhawk/issues/4219))
+
+A decomposed parent whose consolidated implement-review round FAILED (every reviewer failed or was skipped, zero verdicts) used to read merge-eligible with slices no agent ever reviewed (the d3b1d915 hole). The backend now holds it (`review_coverage_incomplete`, contract: `backend/internal/server/README.md` § "Merge-readiness refusals"), and every MCP surface names the hold without ever offering the merge:
+
+- **`fishhawk_merge_run`** maps the 409 to an IMMEDIATE `status: review_coverage_incomplete` (no verdict row) whose `next_action` is the refusal's `details.next_step`: `fishhawk_rerun_review` when the parent round settled with no verdict, else `fishhawk_await_review` (`stage=implement`) — the read-only fallback for any other value (`mergeReadinessOutput`).
+- **`next_actions`** gains a `review_coverage_incomplete` state, decided ahead of the table from the drive's `derived_status`, that leads with the same verb (keyed on the drive `next_action` `rerun_review`) and then `fishhawk_get_gate_view`; it never offers `fishhawk_merge_run` (`reviewCoverageIncompleteNextActions`).
+- **`fishhawk_get_gate_view`**'s `merge_readiness.blockers[]` carries the hold with `uncovered_slices[]`, `parent_round` and `next_step`; a coverage read failure is an `undetermined` `review coverage: …` line plus the `merge_readiness` history gap.
+
+**The re-run verb.** `fishhawk_rerun_review` (`rerun_review.go`) wraps `POST /v0/runs/{run_id}/reviews/rerun` (contract: `backend/internal/server/README.md` § "Operator re-run"). It re-runs the run's LATEST implement-review round from its recorded source when that round settled with ZERO verdicts, returns `{result{run_id, stage, stage_id, rerun_of_sequence, new_round_sequence, configured_agents}, message, next_action}` with `next_action` = `fishhawk_await_review` (`stage=implement`), and clears the hold once the new round records a verdict. It is distinct from `fishhawk_reconcile_reviews`: reconcile CLOSES an orphaned round by synthesizing the missing terminals; this DISPATCHES a new round for a settled one. Every backend refusal is a tool error carrying the code and `details` verbatim plus a remedy hint (`rerunReviewRefusalHint`): `no_review_round`, `review_round_in_flight` (await it; close a restart-orphaned round with `fishhawk_reconcile_reviews` first), `review_round_has_verdict`, `review_rerun_ineligible` (`details.reason`), and the 502 `review_rerun_not_started`. Operator-only: `write:runs` (scope table `server/mcpscopes.go`), and the backend refuses run-bound and delegated operator-agent tokens. A re-run against a provider that is still unavailable records another verdict-less round (itself re-runnable) until ADR-094 ([#4242](https://github.com/kuhlman-labs/fishhawk/issues/4242)) parks review rounds.
+
+Pinned by `rerun_review_test.go` (wire decode of every field, the run-id fallback, local UUID refusal, every refusal code verbatim with its hint, transport error) and end to end through the real binary and Postgres in `integration/mcp/review_coverage_test.go` (in-flight hold naming `fishhawk_await_review` + `review_round_in_flight` refusal writing nothing; settled hold naming `fishhawk_rerun_review` with no merge verdict; the re-run's compare, request row, `rerun_of` and verdict; the hold clearing to the next merge guard).
+
 ## `push_and_open_pr=false` is per-case, not global (`guardNoPRImplement`)
 
 `push_and_open_pr=false` (the runner's `--no-pr`) is supported on a **standalone** implement stage and refused on the
@@ -2791,6 +2803,17 @@ per-tool contract). Internals not covered there:
   `TestPreviewCampaign_E2E_ThroughRealServer` drives the tool through the REAL `server.Handler()` over a
   write-refusing `campaign.BaseFake`, so the `CampaignPreview` wire struct is proven against the JSON the server
   EMITS rather than a hand-built approximation, and a handler that tried to persist would 500 rather than pass.
+- **Dependency sources and legacy warnings (#4028).** Both campaign tools surface where each `depends_on` edge came
+  from: `native` (the tracker's native "blocked by" relation, read on the campaign paths) or `legacy_text` (every
+  line-start `Depends on:` body line). `CampaignPreview` gains `edges[]` (`campaignPreviewEdge` `{from,to,source}`,
+  always present) and `warnings[]`; `CampaignPreviewDangling` and `campaignSatisfiedDependency` gain `source`; the
+  start tool's `Campaign` gains create-response-only `warnings[]` (`campaignDependencyWarning`
+  `{issue_ref, code: legacy_text_dependency, targets[], message}`), one per item relying on a legacy line, which
+  never refuses the start. The new types are UNEXPORTED with exported fields, so the export-surface baseline is
+  unchanged. A failed native read reaches both tools as `502 native_dependency_read_failed` with `issue_ref` and
+  `reason` in the details, rendered by the generic `apiError` path (no tool arm). Pinned by
+  `campaign_dependency_sources_test.go`, which reads the tools' structured output back as a JSON map so a dropped
+  json tag fails.
 - **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
   campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
   input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against

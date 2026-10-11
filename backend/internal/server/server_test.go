@@ -1999,3 +1999,83 @@ func TestConfiguredIdentityProviderNames_DeterministicOrder(t *testing.T) {
 		}
 	}
 }
+
+// coverageObserverAdvances decodes every run_auto_advanced row appended so far.
+func coverageObserverAdvances(t *testing.T, au *auditFake) []drive.Advance {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []drive.Advance
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("run_auto_advanced payload unmarshal: %v", err)
+		}
+		out = append(out, adv)
+	}
+	return out
+}
+
+// TestObserveParkedReview_ReviewCoverageHold_ThenReassertsAwaitingMerge pins
+// the #4219 drive hold: a drive-enabled decomposed parent whose consolidated
+// round settled with zero verdicts and a never-reviewed slice parks in
+// review_coverage_incomplete with a rerun_review next action — NEVER
+// checks_green_awaiting_merge — and once a re-run verdict lands, the carve-out
+// on the Recorded guard re-asserts awaiting_merge even though an earlier
+// awaiting_merge stamp exists for the stage (the on-deploy re-stamp shape).
+func TestObserveParkedReview_ReviewCoverageHold_ThenReassertsAwaitingMerge(t *testing.T) {
+	h := newCoverageHarness(t)
+	h.d3b1d915(t)
+	h.parent.Drive = true
+	stage := &run.Stage{ID: uuid.New(), RunID: h.parentID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}
+	ctx := context.Background()
+
+	// An awaiting_merge stamp a pre-#4219 daemon recorded for this stage.
+	h.s.drive.Record(ctx, h.parentID, &stage.ID, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge, To: "awaiting_merge",
+		NextAction: &drive.NextAction{Action: "merge_pr"}})
+
+	h.s.ObserveParkedReviewForDrive(ctx, stage, mergePR)
+	advs := coverageObserverAdvances(t, h.au)
+	last := advs[len(advs)-1]
+	if last.Rule != drive.RuleReviewCoverageIncomplete || last.To != "review_coverage_incomplete" {
+		t.Fatalf("latest advance = %+v, want review_coverage_incomplete", last)
+	}
+	if last.NextAction == nil || last.NextAction.Action != "rerun_review" || !strings.Contains(last.NextAction.Detail, "fishhawk_rerun_review") {
+		t.Errorf("next_action = %+v, want rerun_review naming fishhawk_rerun_review", last.NextAction)
+	}
+	// Idempotent: a second tick on the same hold stamps nothing new.
+	h.s.ObserveParkedReviewForDrive(ctx, stage, mergePR)
+	if n := len(coverageObserverAdvances(t, h.au)); n != len(advs) {
+		t.Errorf("advances after a second tick = %d, want %d (LatestRuleIs idempotence)", n, len(advs))
+	}
+
+	// The re-run round records a verdict: the hold clears and awaiting_merge
+	// is re-asserted despite the earlier Recorded stamp.
+	h.round(h.parentID, 40, 1, "implement_reviewed")
+	h.s.ObserveParkedReviewForDrive(ctx, stage, mergePR)
+	advs = coverageObserverAdvances(t, h.au)
+	if last = advs[len(advs)-1]; last.Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("latest advance after the verdict = %+v, want checks_green_awaiting_merge re-asserted", last)
+	}
+}
+
+// TestObserveParkedReview_ReviewCoverageReadError_SkipsAdvance pins the
+// fail-closed observer: a coverage read error stamps nothing (no hold, and
+// above all no awaiting_merge) so the next tick retries.
+func TestObserveParkedReview_ReviewCoverageReadError_SkipsAdvance(t *testing.T) {
+	h := newCoverageHarness(t)
+	c1 := h.d3b1d915(t)
+	h.parent.Drive = true
+	h.s.cfg.AuditRepo = runScopedErrAudit{auditFake: h.au, failRun: c1}
+	stage := &run.Stage{ID: uuid.New(), RunID: h.parentID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), stage, mergePR)
+	for _, a := range coverageObserverAdvances(t, h.au) {
+		if a.Rule == drive.RuleChecksGreenAwaitingMerge || a.Rule == drive.RuleReviewCoverageIncomplete {
+			t.Fatalf("stamped %s on a coverage read error, want no merge-path advance", a.Rule)
+		}
+	}
+}
