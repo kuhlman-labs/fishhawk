@@ -760,7 +760,10 @@ Notes:
   `issuecomment` posts it to the issue thread; the run's sticky status comment
   already reflects the stage's new state through the shared `stageStateIcon`
   glyph. Payload: `{run_id, stage_id, stage_type, from_state, reason}`, where
-  `reason` is `merge_observed` | `operator_reconcile` | `repair`. It is the
+  `reason` is `merge_observed` | `operator_reconcile` |
+  `operator_reconcile_stranded` | `repair`; an `operator_reconcile_stranded` row
+  (reconcile-merge's opt-in `supersede_stranded` arm, #4222) also carries
+  `last_activity_at` and `idle_threshold_seconds`. It is the
   durable record of WHY a run completed around a stage that never executed —
   the honesty the state exists for, since the pre-existing escape hatches
   recorded `failed` (work never attempted) or `cancelled` (a change that
@@ -778,7 +781,10 @@ Notes:
   the merge itself is already announced through the existing `pr_merged` /
   `post_merge_observed` path and the run's sticky status comment. Payload:
   `{run_id, pull_request_url, pull_request_number, merge_commit_sha, merged_at,
-  observed_at, reconciled_after_the_fact}`, appended with `actor_kind` **user**
+  observed_at, reconciled_after_the_fact, credential_source,
+  pull_request_url_source}` (the last two since #4222: `run` |
+  `repository_installation`, and `run_row` | `pull_request_opened_audit`),
+  appended with `actor_kind` **user**
   (or `agent` for an operator-role subject) — an operator-invoked observation,
   never a system one, which is a second signal alongside the category that the
   fact was learned by hand rather than seen live.

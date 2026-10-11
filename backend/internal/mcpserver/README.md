@@ -1652,7 +1652,7 @@ and are not restated here.
 | Verb | Reads the forge? | Settles anything? |
 |---|---|---|
 | `fishhawk_record_merge_observation` | YES — the run's PR, live | NO. It appends one `merge_observation_recorded` row and stops. |
-| `fishhawk_reconcile_merge` | NEVER. Its evidence gate reads the audit CHAIN only | YES — supersedes the merge-parked stages and re-runs completion. |
+| `fishhawk_reconcile_merge` | NEVER. Its evidence gate reads the audit CHAIN only | YES — supersedes the merge-parked stages (and, opt-in, stranded ones) and re-runs completion. |
 
 So a run whose PR genuinely merged but whose merge was never observed is **unreachable by `reconcile-merge` alone**: it
 refuses with `reconcile_merge_pr_not_merged`, and retrying it cannot help. Observe FIRST, then reconcile —
@@ -1666,12 +1666,38 @@ non-MCP reader), because a diagnosis must name something the reader can call.
 - **Idempotent arms are reported honestly.** A repeat `record-merge-observation` answers `already_recorded: true` and the
   `observation` block is **EMPTY** on that arm — the backend deliberately zeroes it so the response cannot claim a row it
   did not write, and the tool preserves that. A repeat `reconcile-merge` returns two empty lists plus the run's current
-  state, rendered as an explicit no-op rather than a false success. Nothing is back-dated: the recorded row carries the
+  state, rendered as an explicit no-op rather than a false success. With two empty lists and a TERMINAL `run_state`
+  the response cannot tell the settle-only arm (#4222: this call settled a run whose stages had all already succeeded)
+  from an idempotent repeat on an already-settled run, so `reconcileMergeMessage` names both rather than claiming
+  either; on a non-terminal state it stays the explicit no-op. Nothing is back-dated: the recorded row carries the
   forge's own `merged_at` **and** this observation's `observed_at`, so a reader sees the gap.
 - **Named refusals reach the caller verbatim.** Both descriptions enumerate them so an agent can branch:
   `record_merge_observation_{no_pull_request, malformed_pr_url, pr_url_repo_mismatch, pr_not_merged, no_merge_commit,
-  no_merge_timestamp, forge_unavailable, unconfigured}` and `reconcile_merge_{pr_not_merged, not_applicable,
-  unconfigured}`. The shared `c.do` envelope decoding is what carries the backend's code through unflattened.
+  no_merge_timestamp, no_credential, forge_unavailable, unconfigured}` and `reconcile_merge_{pr_not_merged,
+  not_applicable, stage_live, unconfigured}` (plus `validation_failed` for a malformed body). The shared `c.do` envelope
+  decoding is what carries the backend's code through unflattened.
+- **Legacy-run provenance (#4222).** `fishhawk_record_merge_observation`'s observation carries `credential_source`
+  (`run` | `repository_installation`) and `pull_request_url_source` (`run_row` | `pull_request_opened_audit`), mirrored
+  on `MergeObservationFact` with `omitempty` tags, and the message names a repository-installation read or a derived
+  URL so the operator sees the read did not rest on the run's own record alone.
+- **`supersede_stranded` (#4222) — opt-in, wire-identical when omitted.** `apiClient.ReconcileMerge(ctx, runID,
+  supersedeStranded)` sends NO body when false (the pre-#4222 call) and exactly `{"supersede_stranded":true}` when true,
+  through the unexported `reconcileMergeRequest` (the backend decodes with `DisallowUnknownFields`, so the struct carries
+  no other field). `TestReconcileMerge_SupersedeStrandedSendsExactBody` pins the literal — the same one
+  `server/merge_supersede_stranded_test.go` posts, the cross-boundary seam this package cannot import.
+- **Host runner-liveness probe before the stranded POST** (`guardStrandedRunnersIdle`). The server's 24h idle gate reads
+  DB-stamped activity, which cannot see a runner alive but wedged past the threshold; this server runs on the host that
+  spawns local runners (ADR-024), so with `supersede_stranded` set it `GetRun`s and, for `runner_kind=local`, lists the
+  stages and runs the shared `r.livenessProbe()` (`pgrep -f "stage-id <uuid>"`) on every `dispatched`/`running`
+  `implement`/`review`/`acceptance` stage (`strandedProbeStageTypes` mirrors the backend's stranded table; `plan`,
+  `deploy` and pending gates are never probed). Any `runnerLive` verdict refuses LOCALLY, naming each live stage, and
+  sends NO reconcile request. A non-local or absent `runner_kind`, an unreadable run or stage list, or an inconclusive
+  probe proceeds with a `warnings[]` entry: the probe is defence in depth and the server-side gate plus its row-locked
+  re-check stay the authority. Without the flag the tool makes no run/stage read and runs no probe. Tests:
+  `TestReconcileMerge_SupersedeStranded_LocalLiveRunnerRefusesWithoutPost` (zero POSTs),
+  `_LocalDeadRunnersPostBody` (probe set is exactly the in-flight implement + acceptance stages),
+  `_NonLocalWarnsWithoutProbe`, `_DegradedProbeWarns`, `TestReconcileMerge_FlagOmittedIsUnchanged`. The message names
+  stranded retirements (`reason: operator_reconcile_stranded`) apart from parked supersessions.
 - **Auth is TWO gates** ([E45.95 / #3635](https://github.com/kuhlman-labs/fishhawk/issues/3635)). Both routes are
   registered `requireRunAccount(memberWrite, ...)` for account ownership, **and both handlers enforce
   `requireWriteScope("write:runs")` as their rung 0** — ahead of the `run_id` parse, so a refused caller learns nothing
