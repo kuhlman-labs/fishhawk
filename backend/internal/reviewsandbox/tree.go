@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/agentpaths"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
 )
 
@@ -374,8 +375,10 @@ func extractTar(r io.Reader, dest string, limits Limits) (Stats, error) {
 		// Agent-instruction skip (C1): never load repository-resident agent
 		// instructions as files the reviewer's CLI would auto-discover. The
 		// reviewer still sees any change to these paths in the DIFF as data to
-		// judge; the tree simply never carries them as instructions.
-		if isAgentInstructionPath(rel) {
+		// judge; the tree simply never carries them as instructions. The
+		// predicate is the ONE canonical definition the built-in
+		// agent_instruction_paths constraint also reads (#3942).
+		if agentpaths.IsInstructionPath(rel) {
 			stats.Instructions++
 			continue
 		}
@@ -445,58 +448,3 @@ func safeRel(name string) (string, error) {
 	}
 	return clean, nil
 }
-
-// isAgentInstructionPath reports whether a cleaned, forward-slash repo-relative
-// path is an agent-instruction file or lives under an agent-config directory,
-// enumerated against both CLIs' documented discovery (see README.md):
-//
-//   - AGENTS.md, AGENTS.override.md — codex auto-discovers BOTH at every
-//     directory level; AGENTS.override.md is codex's local-only override,
-//     checked BEFORE AGENTS.md at each level per codex's documented
-//     instruction-file discovery, so it loads as an instruction exactly like
-//     AGENTS.md and must be skipped too (its omission was the C1 bypass in
-//     #2486's fix-up: a tracked AGENTS.override.md at any depth would otherwise
-//     survive extraction and be auto-discovered from the grounded tree).
-//   - CLAUDE.md, CLAUDE.local.md — claude-code auto-discovers these at every
-//     directory level.
-//   - any component named .claude or .codex — the two CLIs' config/state
-//     directories (settings, commands, agents, skills, config.toml), skipped
-//     wholesale so nothing under them is loaded as instructions.
-//   - any component named .agents — the cross-tool Agent Skills directory
-//     (agentskills.io): codex auto-discovers skills from .agents/skills at
-//     every directory level up to the repository root, so a tracked SKILL.md
-//     there loads as an instruction exactly like AGENTS.md. Skipped wholesale
-//     like .claude/.codex rather than narrowed to .agents/skills, so a future
-//     discovery path under the same directory is closed by default.
-//
-// Every comparison is CASE-INSENSITIVE. The tree is extracted onto the host
-// filesystem, and on a case-insensitive one (macOS APFS by default) a CLI
-// opening `.agents/skills` or `AGENTS.md` resolves to a tracked `.Agents/` or
-// `agents.md`, so an exact-case match would let a re-cased path survive
-// extraction and still load as an instruction.
-func isAgentInstructionPath(rel string) bool {
-	parts := strings.Split(rel, "/")
-	for i, p := range parts {
-		for _, dir := range agentConfigDirs {
-			if strings.EqualFold(p, dir) {
-				return true
-			}
-		}
-		if i == len(parts)-1 {
-			for _, name := range agentInstructionFiles {
-				if strings.EqualFold(p, name) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// agentConfigDirs are the directory components skipped wholesale, and
-// agentInstructionFiles the file basenames skipped at any depth, by
-// isAgentInstructionPath (compared case-insensitively).
-var (
-	agentConfigDirs       = []string{".claude", ".codex", ".agents"}
-	agentInstructionFiles = []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"}
-)

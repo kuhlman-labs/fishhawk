@@ -2343,7 +2343,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				res.FailureCategory = "B"
 				res.FailureReason = diffErr.Error()
 				invokeErr = diffErr
-			} else if evs, demote := enforceConstraints(cfg, *diff); demote != nil {
+			} else if evs, demote := enforceConstraints(cfg, stageType, *diff); demote != nil {
 				res.Events = append(res.Events, evs...)
 				res.OK = false
 				res.FailureCategory = "B"
@@ -4637,7 +4637,14 @@ func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
 //
 // The git_diff event is emitted by computeAndEmitDiff before this
 // runs (see #247); this function returns only policy_event entries.
-func enforceConstraints(cfg config, d constraint.Diff) ([]agent.Event, error) {
+//
+// stageType is the stage type the backend RESOLVED in the --fetch-prompt
+// response, never cfg.stage (#3942): it alone decides whether the
+// built-in agent_instruction_paths default applies
+// (constraint.ApplyImplementDefaults), so how the stage was invoked cannot
+// switch the default on or off. Empty stageType (a local replay without
+// --fetch-prompt) applies no default; the backend gate stays authoritative.
+func enforceConstraints(cfg config, stageType string, d constraint.Diff) ([]agent.Event, error) {
 	raw, err := os.ReadFile(cfg.constraintsFile)
 	if err != nil {
 		return []agent.Event{{
@@ -4652,6 +4659,7 @@ func enforceConstraints(cfg config, d constraint.Diff) ([]agent.Event, error) {
 			Payload: agent.MakePayload(map[string]string{"check": "constraints", "outcome": "config_invalid", "error": err.Error()}),
 		}}, fmt.Errorf("constraints: parse %s: %w", cfg.constraintsFile, err)
 	}
+	constraint.ApplyImplementDefaults(stageType, &c)
 
 	violations := constraint.Evaluate(d, c)
 	if len(violations) == 0 {

@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +194,93 @@ func TestExtractTar_SkipsAgentInstructionFiles(t *testing.T) {
 	}
 	if _, serr := os.Stat(filepath.Join(dest, "main.go")); serr != nil {
 		t.Errorf("ordinary file main.go was not materialized: %v", serr)
+	}
+}
+
+// pkgSrcDir anchors fixture paths on this package's source dir (#4179).
+var pkgSrcDir = mustGetwd()
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
+// loadAgentInstructionProbes reads the match / no_match probes of the shared
+// fixture testdata/policy/agent-instruction-classes.json (#3942) — the same
+// probes the backend policy gate and the runner's constraint twin drive — and
+// fails closed on an unknown key or an empty list so the test cannot pass
+// vacuously. Its strictness (duplicate keys, trailing content) is pinned by
+// backend/internal/agentpaths's own loader.
+func loadAgentInstructionProbes(t *testing.T) (match, noMatch []string) {
+	t.Helper()
+	p := filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "policy", "agent-instruction-classes.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	var f struct {
+		Comment          string   `json:"_comment"`
+		ConfigDirs       []string `json:"config_dirs"`
+		InstructionFiles []string `json:"instruction_files"`
+		Match            []string `json:"match"`
+		NoMatch          []string `json:"no_match"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		t.Fatalf("parse %s: %v", p, err)
+	}
+	if len(f.Match) == 0 || len(f.NoMatch) == 0 {
+		t.Fatalf("%s: match (%d) and no_match (%d) must both be non-empty", p, len(f.Match), len(f.NoMatch))
+	}
+	return f.Match, f.NoMatch
+}
+
+// TestExtractTar_SkipsSharedFixtureProbes pins the C1 skip to the ONE
+// canonical agent-instruction definition (#3942): every match probe of the
+// shared fixture (root, nested and re-cased, for every config dir and
+// instruction basename) is skipped and counted, and every no_match probe
+// lands. The built-in agent_instruction_paths constraint drives the SAME
+// probes through backend/internal/policy and runner/internal/constraint, so
+// the sandbox and either gate cannot diverge without a red test. The probe
+// paths exist only inside this in-memory tar and the test's TempDir.
+func TestExtractTar_SkipsSharedFixtureProbes(t *testing.T) {
+	match, noMatch := loadAgentInstructionProbes(t)
+	var entries []tarEntry
+	for _, p := range match {
+		entries = append(entries, reg(p, "agent instructions: "+p))
+	}
+	for _, p := range noMatch {
+		entries = append(entries, reg(p, "ordinary: "+p))
+	}
+	dest := t.TempDir()
+	stats, err := extractTar(bytes.NewReader(buildTar(t, entries)), dest, DefaultLimits())
+	if err != nil {
+		t.Fatalf("extractTar: %v", err)
+	}
+	if stats.Instructions != len(match) {
+		t.Errorf("stats.Instructions = %d, want %d (one per fixture match probe)", stats.Instructions, len(match))
+	}
+	if stats.Files != len(noMatch) {
+		t.Errorf("stats.Files = %d, want %d (one per fixture no_match probe)", stats.Files, len(noMatch))
+	}
+	for _, p := range match {
+		if _, serr := os.Stat(filepath.Join(dest, p)); !os.IsNotExist(serr) {
+			t.Errorf("match probe %q was materialized (stat err %v)", p, serr)
+		}
+	}
+	for _, p := range noMatch {
+		got, rerr := os.ReadFile(filepath.Join(dest, p))
+		if rerr != nil {
+			t.Errorf("no_match probe %q was not materialized: %v", p, rerr)
+			continue
+		}
+		if string(got) != "ordinary: "+p {
+			t.Errorf("no_match probe %q content = %q", p, got)
+		}
 	}
 }
 
