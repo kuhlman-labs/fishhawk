@@ -257,6 +257,16 @@ type rebaseMergeCandidateFields struct {
 // re-triggers one for an unverified base-advance or conflict-resolution head.
 // The pass re-opens the implement stage but writes nothing to the branch, and
 // a pass that cannot start rides on the 200 as merge_candidate_verify_refusal.
+//
+// THE SPLIT (ADR-092 / #4200). This handler is the HTTP SHELL: auth, the
+// body, confirm, the run read, the refusal → status mapping, the conflict
+// 202/422 arm and the merge-candidate producer. Everything between the run
+// read and the response — the determinability ladder, the behind-probe, the
+// lease re-check, MergeBranch, the bounded post-merge read, the detached tail,
+// the re-park, branch_rebased, the lineage attribution, the republish and the
+// notify — is s.advanceRunBranch, which takes the audit ACTOR as a parameter
+// so the merge-candidate queue can auto-advance an admitted PR under the
+// system actor through the SAME machinery the operator verb uses.
 func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -324,65 +334,255 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	out, refusal := s.advanceRunBranch(r.Context(), runRow, rebaseOperatorActor(r.Context()), reqBody.Reason)
+	if refusal != nil {
+		s.writeRebaseAdvanceRefusal(w, r, runID, refusal)
+		return
+	}
+
+	// The merge-candidate producer below runs on the SAME detached tail the
+	// core used: once THIS call performed the merge, the pass trigger must
+	// not depend on the caller still listening either. Re-deriving the
+	// context at the core's tail deadline keeps the ONE rebasePostMergeTailBudget
+	// bound across the core's tail and this producer.
+	if !out.TailDeadline.IsZero() {
+		tailCtx, cancelTail := context.WithDeadline(context.WithoutCancel(r.Context()), out.TailDeadline)
+		defer cancelTail()
+		r = r.WithContext(tailCtx)
+	}
+
+	// MERGE-CANDIDATE VERIFY (ADR-090 D3), after the shared tail so the
+	// branch_rebased row the state predicate classifies on is already on the
+	// chain and the review gate is already re-parked.
+	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergePerformed)
+
+	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
+		RunID:                      runID.String(),
+		PRNumber:                   out.PRNumber,
+		Branch:                     out.Branch,
+		BaseRef:                    out.BaseRef,
+		PriorHeadSHA:               out.PriorHeadSHA,
+		NewHeadSHA:                 out.NewHeadSHA,
+		MergeCommitSHA:             out.MergeCommitSHA,
+		AlreadyUpToDate:            out.AlreadyUpToDate,
+		ReparkedReviewStageID:      out.ReparkedReviewStageID,
+		MechanismNote:              rebaseMechanismNote,
+		AuditCheckRepublished:      out.AuditCheckRepublished,
+		AuditCheckRepublishWarning: out.AuditCheckRepublishWarning,
+		LineageAttributionWarning:  out.LineageAttributionWarning,
+		PostMergeHeadRead:          out.PostMergeHeadRead,
+		PostMergeHeadReadNote:      out.PostMergeHeadReadNote,
+
+		MergeCandidateVerifyState:     mc.State,
+		MergeCandidateVerifyTriggered: mc.Triggered,
+		MergeCandidateVerifyStageID:   mc.StageID,
+		MergeCandidateVerifyNote:      mc.Note,
+		MergeCandidateVerifyRefusal:   mc.Refusal,
+	})
+}
+
+// writeRebaseAdvanceRefusal maps a typed advanceRunBranch refusal onto the
+// verb's HTTP answers:
+//
+//   - not_determinable → 422 rebase_not_determinable naming the reason;
+//   - conflict → THE 202 TRIGGER ARM (E64.62 / #3202). A conflict is no
+//     longer an outright refusal: under a ceiling of ONE, the implement stage
+//     is re-opened for a bounded, agent-driven conflict-resolution pass that
+//     performs the merge LOCALLY on the run branch and pushes through the App
+//     installation, so the operator never has to push to a branch ADR-035
+//     declares runner-owned. NOTHING is written to the branch by THIS call
+//     either way. When the budget is spent — or no pass can be started at
+//     all — the fail-closed 422 rebase_conflict is today's behaviour, naming
+//     the failed pass and its reason;
+//   - merge_failed → 502 rebase_merge_failed (nothing was written).
+func (s *Server) writeRebaseAdvanceRefusal(w http.ResponseWriter, r *http.Request,
+	runID uuid.UUID, ref *rebaseAdvanceRefusal) {
+	switch ref.Kind {
+	case rebaseAdvanceRefusalConflict:
+		start, refusal := s.startConflictResolutionPass(r, runID, ref.Branch, ref.BaseRef, ref.HeadSHA)
+		if refusal != nil {
+			s.writeRebaseConflictRefusal(w, r, refusal, ref.Branch, ref.BaseRef, ref.Err)
+			return
+		}
+		s.writeJSON(w, r, http.StatusAccepted, rebaseBranchResponse{
+			RunID:                       runID.String(),
+			PRNumber:                    ref.PRNumber,
+			Branch:                      ref.Branch,
+			BaseRef:                     ref.BaseRef,
+			PriorHeadSHA:                ref.HeadSHA,
+			MechanismNote:               rebaseMechanismNote,
+			ConflictResolutionTriggered: true,
+			ConflictResolutionStageID:   start.StageID.String(),
+			ConflictResolutionPass:      start.Pass,
+			ConflictResolutionNote:      conflictResolutionTriggeredNote,
+		})
+	case rebaseAdvanceRefusalMergeFailed:
+		s.writeError(w, r, http.StatusBadGateway, "rebase_merge_failed",
+			"merging the declared base into the run branch failed; nothing was written",
+			map[string]any{"branch": ref.Branch, "base_ref": ref.BaseRef, "error": ref.Err.Error()})
+	default:
+		s.writeRebaseNotDeterminable(w, r, ref.Reason)
+	}
+}
+
+// rebaseOperatorActor is the audit actor of an operator-invoked rebase: the
+// authenticated subject (anonymous when absent) under the user kind.
+func rebaseOperatorActor(ctx context.Context) mergeCandidateActor {
+	subject := IdentityFrom(ctx).Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	return mergeCandidateActor{Kind: audit.ActorUser, Subject: subject}
+}
+
+// Typed advanceRunBranch refusal kinds. Every refusal is classified BEFORE
+// anything is written: not_determinable before any merge, conflict and
+// merge_failed when the merges endpoint itself refuses.
+const (
+	// rebaseAdvanceRefusalNotDeterminable: an anchor could not be resolved
+	// with certainty (installation, repo, PR, head/branch/base, the
+	// behind-probe or the lease re-check), so no merge was attempted.
+	rebaseAdvanceRefusalNotDeterminable = "not_determinable"
+	// rebaseAdvanceRefusalConflict: the base merge CONFLICTED; nothing was
+	// written to the branch.
+	rebaseAdvanceRefusalConflict = "conflict"
+	// rebaseAdvanceRefusalMergeFailed: the merges endpoint failed for a
+	// non-conflict reason; nothing was written to the branch.
+	rebaseAdvanceRefusalMergeFailed = "merge_failed"
+)
+
+// rebaseAdvanceRefusal is a typed advanceRunBranch refusal. Reason is set on
+// not_determinable; PRNumber, Branch, BaseRef, HeadSHA (the live head the
+// merge was attempted against) and Err (the MergeBranch error) are set on
+// conflict and merge_failed, so a caller can start a conflict-resolution pass
+// or name the failure without re-reading the forge.
+type rebaseAdvanceRefusal struct {
+	Kind     string
+	Reason   string
+	PRNumber int
+	Branch   string
+	BaseRef  string
+	HeadSHA  string
+	Err      error
+}
+
+func rebaseNotDeterminable(reason string) *rebaseAdvanceRefusal {
+	return &rebaseAdvanceRefusal{Kind: rebaseAdvanceRefusalNotDeterminable, Reason: reason}
+}
+
+// rebaseAdvanceOutcome is a successful advanceRunBranch: the run branch now
+// contains its declared base, either because THIS call merged it
+// (MergePerformed) or because it already did (AlreadyUpToDate). The fields
+// mirror the 200's rebaseBranchResponse block of the same names.
+type rebaseAdvanceOutcome struct {
+	PRNumber       int
+	Branch         string
+	BaseRef        string
+	PriorHeadSHA   string
+	NewHeadSHA     string
+	MergeCommitSHA string
+	// AlreadyUpToDate: the behind-probe found the base already contained, so
+	// no merge was attempted.
+	AlreadyUpToDate bool
+	// MergePerformed: THIS call merged the base into the run branch.
+	MergePerformed             bool
+	ReparkedReviewStageID      string
+	AuditCheckRepublished      bool
+	AuditCheckRepublishWarning string
+	LineageAttributionWarning  string
+	PostMergeHeadRead          string
+	PostMergeHeadReadNote      string
+	// TailDeadline is the deadline of the detached post-merge tail, set only
+	// when MergePerformed. A caller that does further post-merge work (the
+	// handler's merge-candidate producer) re-derives a detached context at
+	// this SAME deadline, so one rebasePostMergeTailBudget bounds it all.
+	TailDeadline time.Time
+}
+
+// advanceRunBranch is the actor-parameterized core of the rebase verb: it
+// advances runRow's PR branch onto its declared base by a forge-side MERGE OF
+// THE BASE INTO THE RUN BRANCH (see CategoryBranchRebased) and records the
+// advance under actor. handleRebaseRunBranch calls it with the invoking
+// operator; the ADR-092 merge-candidate queue calls it with
+// mergeCandidateSystemActor() to auto-advance an admitted PR that fell
+// behind. reason is recorded on the branch_rebased entry.
+//
+// It returns EITHER an outcome OR a typed refusal, never both. A refusal is
+// always classified BEFORE anything is written (see the refusal kinds); the
+// conflict-resolution 202 arm is the CALLER's decision, so the core never
+// re-opens a stage. ctx bounds every read up to and including the post-merge
+// re-read; once a merge has been performed the tail runs on a context
+// detached from ctx's cancellation (WithoutCancel keeps its values), bounded
+// by rebasePostMergeTailBudget.
+func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
+	actor mergeCandidateActor, reason string) (*rebaseAdvanceOutcome, *rebaseAdvanceRefusal) {
+	// A non-HTTP caller has no 503 in front of it, so the core refuses an
+	// unwired server or a missing run itself rather than panicking.
+	if runRow == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.GitHub == nil {
+		return nil, rebaseNotDeterminable("a base advance requires a run, run + audit repositories and a GitHub client")
+	}
+	// Mirrors startMergeCandidateVerifyPass: every row this core appends is
+	// attributed, so an actor with no subject is refused before any write.
+	if actor.Subject == "" {
+		return nil, rebaseNotDeterminable("no actor was supplied for the base advance")
+	}
+	runID := runRow.ID
+
 	// Determinability ladder. Every unresolvable anchor is a fail-CLOSED
 	// refusal — never a merge on an uncertain read.
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		s.writeRebaseNotDeterminable(w, r, "run has no installation to authorize a GitHub merge")
-		return
+		return nil, rebaseNotDeterminable("run has no installation to authorize a GitHub merge")
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	repo, err := parseRepoOwnerName(runRow.Repo)
 	if err != nil {
-		s.writeRebaseNotDeterminable(w, r, "run repo is unparseable: "+err.Error())
-		return
+		return nil, rebaseNotDeterminable("run repo is unparseable: " + err.Error())
 	}
 	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
 	if prNumber <= 0 {
-		s.writeRebaseNotDeterminable(w, r, "run has no tracked pull request to rebase")
-		return
+		return nil, rebaseNotDeterminable("run has no tracked pull request to rebase")
 	}
-	pr, err := s.cfg.GitHub.GetPullRequest(r.Context(), scope, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
 	if err != nil {
-		s.writeRebaseNotDeterminable(w, r, "resolve live PR head failed: "+err.Error())
-		return
+		return nil, rebaseNotDeterminable("resolve live PR head failed: " + err.Error())
 	}
 	headSHA, branch, baseRef := pr.HeadSHA, pr.HeadRef, pr.BaseRef
 	if headSHA == "" || branch == "" || baseRef == "" {
-		s.writeRebaseNotDeterminable(w, r, "PR returned an empty head sha, branch or base ref")
-		return
+		return nil, rebaseNotDeterminable("PR returned an empty head sha, branch or base ref")
 	}
 
 	// THE BEHIND-PROBE, taken BEFORE any merge. Three-dot compare
 	// base=<live run branch head> ... head=<base ref> returns exactly the
 	// commits the base advanced by that the run branch does not yet contain.
 	// An error fails CLOSED — never a merge on an uncertain read.
-	behind, err := s.cfg.GitHub.CompareCommits(r.Context(), scope, repo, headSHA, baseRef)
+	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, headSHA, baseRef)
 	if err != nil {
-		s.writeRebaseNotDeterminable(w, r, "behind-probe compare failed: "+err.Error())
-		return
+		return nil, rebaseNotDeterminable("behind-probe compare failed: " + err.Error())
 	}
 
-	newHead, mergeSHA := headSHA, ""
-	alreadyUpToDate := len(behind) == 0
-	mergePerformed := false
-	republishWarning := ""
+	out := &rebaseAdvanceOutcome{
+		PRNumber:        prNumber,
+		Branch:          branch,
+		BaseRef:         baseRef,
+		PriorHeadSHA:    headSHA,
+		NewHeadSHA:      headSHA,
+		AlreadyUpToDate: len(behind) == 0,
+	}
 	// postMerge is the classified post-merge head read; nil unless THIS call
 	// performed a merge.
 	var postMerge *postMergeHeadRead
 
-	if !alreadyUpToDate {
+	if !out.AlreadyUpToDate {
 		// LEASE RE-CHECK — the only TOCTOU guard (the merges API has no
 		// compare-and-swap). Re-read the live head and abort if it moved
 		// since the probe, so a racing push is never silently merged over.
-		livePR, lerr := s.cfg.GitHub.GetPullRequest(r.Context(), scope, repo, prNumber)
+		livePR, lerr := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
 		if lerr != nil {
-			s.writeRebaseNotDeterminable(w, r, "lease re-check: re-read live PR head failed: "+lerr.Error())
-			return
+			return nil, rebaseNotDeterminable("lease re-check: re-read live PR head failed: " + lerr.Error())
 		}
 		if livePR.HeadSHA != headSHA {
-			s.writeRebaseNotDeterminable(w, r,
+			return nil, rebaseNotDeterminable(
 				"lease re-check: the live PR head changed since the behind-probe (concurrent push); rebase aborted")
-			return
 		}
 
 		// DIRECTION: the merges API's `base` is the branch that RECEIVES the
@@ -392,75 +592,47 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		// verb — which is why the captured request body is asserted in test.
 		msg := fmt.Sprintf("Advance run branch %s onto %s (fishhawk_rebase_run_branch, run %s)",
 			branch, baseRef, runID.String())
-		sha, merr := s.cfg.GitHub.MergeBranch(r.Context(), scope, repo, branch, baseRef, msg)
+		sha, merr := s.cfg.GitHub.MergeBranch(ctx, scope, repo, branch, baseRef, msg)
 		if merr != nil {
+			kind := rebaseAdvanceRefusalMergeFailed
 			if errors.Is(merr, forge.ErrMergeConflict) {
-				// THE 202 TRIGGER ARM (E64.62 / #3202). A conflict is no
-				// longer an outright refusal: under a ceiling of ONE, the
-				// implement stage is re-opened for a bounded, agent-driven
-				// conflict-resolution pass that performs the merge LOCALLY on
-				// the run branch and pushes through the App installation, so
-				// the operator never has to push to a branch ADR-035 declares
-				// runner-owned. NOTHING is written to the branch by THIS call
-				// either way. When the budget is spent — or no pass can be
-				// started at all — the fail-closed 422 below is today's
-				// behaviour, now naming the failed pass and its reason.
-				start, refusal := s.startConflictResolutionPass(r, runID, branch, baseRef, headSHA)
-				if refusal != nil {
-					s.writeRebaseConflictRefusal(w, r, refusal, branch, baseRef, merr)
-					return
-				}
-				s.writeJSON(w, r, http.StatusAccepted, rebaseBranchResponse{
-					RunID:                       runID.String(),
-					PRNumber:                    prNumber,
-					Branch:                      branch,
-					BaseRef:                     baseRef,
-					PriorHeadSHA:                headSHA,
-					MechanismNote:               rebaseMechanismNote,
-					ConflictResolutionTriggered: true,
-					ConflictResolutionStageID:   start.StageID.String(),
-					ConflictResolutionPass:      start.Pass,
-					ConflictResolutionNote:      conflictResolutionTriggeredNote,
-				})
-				return
+				kind = rebaseAdvanceRefusalConflict
 			}
-			s.writeError(w, r, http.StatusBadGateway, "rebase_merge_failed",
-				"merging the declared base into the run branch failed; nothing was written",
-				map[string]any{"branch": branch, "base_ref": baseRef, "error": merr.Error()})
-			return
+			return nil, &rebaseAdvanceRefusal{Kind: kind, PRNumber: prNumber,
+				Branch: branch, BaseRef: baseRef, HeadSHA: headSHA, Err: merr}
 		}
-		mergePerformed = true
-		mergeSHA = sha
+		out.MergePerformed = true
+		out.MergeCommitSHA = sha
 
 		// THE POST-MERGE HEAD (#4199): a bounded, classified re-read, with the
 		// new head resolved by PROVENANCE rather than taken from one read. The
 		// forge's PR head lags the branch-ref update, so trusting a single
 		// read anchored everything on the PRE-merge head and misreported the
 		// lag as a concurrent push.
-		pm := readPostMergeHead(r.Context(), func(ctx context.Context) (string, error) {
-			p, rerr := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
+		pm := readPostMergeHead(ctx, func(rctx context.Context) (string, error) {
+			p, rerr := s.cfg.GitHub.GetPullRequest(rctx, scope, repo, prNumber)
 			if rerr != nil {
 				return "", rerr
 			}
 			return p.HeadSHA, nil
-		}, headSHA, mergeSHA, s.postMergeHeadReadSchedule())
+		}, headSHA, sha, s.postMergeHeadReadSchedule())
 		postMerge = &pm
-		newHead = resolvePostMergeHead(pm, mergeSHA)
+		out.NewHeadSHA = resolvePostMergeHead(pm, sha)
 		if pm.Outcome == postMergeHeadReadReadAfterWriteLag || pm.Outcome == postMergeHeadReadUnreadable {
 			lastErr := ""
 			if pm.LastErr != nil {
 				lastErr = pm.LastErr.Error()
 			}
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"branch rebase: post-merge PR head read did not converge on the merge commit",
 				slog.String("run_id", runID.String()),
 				slog.String("outcome", pm.Outcome),
 				slog.String("prior_head_sha", headSHA),
-				slog.String("merge_commit_sha", mergeSHA),
+				slog.String("merge_commit_sha", sha),
 				slog.Int("attempts", pm.Attempts),
 				slog.String("last_error", lastErr))
 		}
-		if newHead == "" {
+		if out.NewHeadSHA == "" {
 			// Reachable ONLY when the merge sha did not decode: the merge
 			// ALREADY happened, so a refusal here would misreport a completed
 			// write. Return 200 with a warning instead — and deliberately do
@@ -469,7 +641,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 			// is precisely the staleness this verb exists to remove. Skipping
 			// publication and relying on the idempotent retry is strictly
 			// safer than pinning the required check to a stale head.
-			republishWarning = "the base merge SUCCEEDED, but the resulting head could not be read back (" +
+			out.AuditCheckRepublishWarning = "the base merge SUCCEEDED, but the resulting head could not be read back (" +
 				postMergeHeadUnresolvedReason(pm, headSHA) +
 				"), so the fishhawk_audit_complete check was NOT re-posted — publishing at the pre-merge head would pin the required check to a stale sha. Re-invoke fishhawk_rebase_run_branch to retry the re-post; the branch now contains the base, so the retry short-circuits the merge and publishes at the correct head."
 		}
@@ -485,33 +657,34 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// merge landed — no branch_rebased row and no attribution, the
 	// wedged-FOREIGN state the attribution exists to prevent. WithoutCancel
 	// keeps the identity values; rebasePostMergeTailBudget bounds the tail.
-	// Every call below reads r.Context(), so this one rebind covers them all.
-	// The re-read above stays on the request context, so a departed caller
-	// ends the reads early rather than extending them.
-	if mergePerformed {
-		tailCtx, cancelTail := context.WithTimeout(context.WithoutCancel(r.Context()), rebasePostMergeTailBudget)
+	// Every call below reads ctx, so this one rebind covers them all. The
+	// re-read above stays on the caller's context, so a departed caller ends
+	// the reads early rather than extending them. The deadline is returned on
+	// the outcome so the caller's own post-merge work shares the bound.
+	if out.MergePerformed {
+		out.TailDeadline = time.Now().Add(rebasePostMergeTailBudget)
+		tailCtx, cancelTail := context.WithDeadline(context.WithoutCancel(ctx), out.TailDeadline)
 		defer cancelTail()
-		r = r.WithContext(tailCtx)
+		ctx = tailCtx
 	}
 
 	// --- SHARED TAIL: re-park → audit → attribute → republish → notify ---
 	// Reachable WITHOUT a merge on this invocation, which is what makes the
 	// advertised retry true.
 
-	reparkedID := ""
-	if reparked, rerr := s.reparkReviewGateAfterHeadMove(r.Context(), runID); rerr != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+	if reparked, rerr := s.reparkReviewGateAfterHeadMove(ctx, runID); rerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: re-park review gate failed (best-effort)",
 			slog.String("run_id", runID.String()),
 			slog.String("error", rerr.Error()))
 	} else if reparked != nil {
-		reparkedID = reparked.ID.String()
+		out.ReparkedReviewStageID = reparked.ID.String()
 	}
 
 	// The branch_rebased entry is appended BEFORE the recompute so the
 	// recompute observes it.
-	s.writeBranchRebasedAudit(r, runID, prNumber, branch, baseRef,
-		headSHA, newHead, mergeSHA, alreadyUpToDate, reqBody.Reason, reparkedID, postMerge)
+	s.writeBranchRebasedAudit(ctx, actor, runID, prNumber, branch, baseRef,
+		headSHA, out.NewHeadSHA, out.MergeCommitSHA, out.AlreadyUpToDate, reason, out.ReparkedReviewStageID, postMerge)
 
 	// LINEAGE ATTRIBUTION (E64.23 / #3125). The merge commit this verb
 	// creates is authored by the App installation but appears in NO
@@ -535,53 +708,23 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// meaningful. An incomplete attribution is surfaced on the response as
 	// lineage_attribution_warning, so a 200 is never read as a clean recovery
 	// while the run is still wedged on the lineage check.
-	lineageWarning := ""
-	postMergeOutcome, postMergeNote := "", ""
-	if mergePerformed && postMerge != nil {
-		lineageWarning = s.writeRebaseLineageAttribution(r, runID, branch, baseRef, mergeSHA, newHead, *postMerge)
-		postMergeOutcome = postMerge.Outcome
-		postMergeNote = postMergeHeadReadNote(*postMerge, headSHA, mergeSHA)
+	if out.MergePerformed && postMerge != nil {
+		out.LineageAttributionWarning = s.writeRebaseLineageAttribution(ctx, actor, runID, branch, baseRef,
+			out.MergeCommitSHA, out.NewHeadSHA, *postMerge)
+		out.PostMergeHeadRead = postMerge.Outcome
+		out.PostMergeHeadReadNote = postMergeHeadReadNote(*postMerge, headSHA, out.MergeCommitSHA)
 	}
 
-	republished := false
-	if newHead != "" {
-		var pubErr error
-		republished, pubErr = s.recomputeAndPublishAuditCompleteAtHead(r.Context(), runID, newHead)
+	if out.NewHeadSHA != "" {
+		republished, pubErr := s.recomputeAndPublishAuditCompleteAtHead(ctx, runID, out.NewHeadSHA)
+		out.AuditCheckRepublished = republished
 		if pubErr != nil {
-			republishWarning = "the base advance is recorded and durable, but re-posting the fishhawk_audit_complete check at the new head failed; the required check may be absent from the merge head — re-invoke fishhawk_rebase_run_branch to retry the re-post: " + pubErr.Error()
+			out.AuditCheckRepublishWarning = "the base advance is recorded and durable, but re-posting the fishhawk_audit_complete check at the new head failed; the required check may be absent from the merge head — re-invoke fishhawk_rebase_run_branch to retry the re-post: " + pubErr.Error()
 		}
 	}
 
-	s.notifyStatusUpdate(r.Context(), runID, "branch_rebased")
-
-	// MERGE-CANDIDATE VERIFY (ADR-090 D3), after the shared tail so the
-	// branch_rebased row the state predicate classifies on is already on the
-	// chain and the review gate is already re-parked.
-	mc := s.rebaseMergeCandidateVerify(r, runRow, branch, baseRef, headSHA, newHead, mergePerformed)
-
-	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
-		RunID:                      runID.String(),
-		PRNumber:                   prNumber,
-		Branch:                     branch,
-		BaseRef:                    baseRef,
-		PriorHeadSHA:               headSHA,
-		NewHeadSHA:                 newHead,
-		MergeCommitSHA:             mergeSHA,
-		AlreadyUpToDate:            alreadyUpToDate,
-		ReparkedReviewStageID:      reparkedID,
-		MechanismNote:              rebaseMechanismNote,
-		AuditCheckRepublished:      republished,
-		AuditCheckRepublishWarning: republishWarning,
-		LineageAttributionWarning:  lineageWarning,
-		PostMergeHeadRead:          postMergeOutcome,
-		PostMergeHeadReadNote:      postMergeNote,
-
-		MergeCandidateVerifyState:     mc.State,
-		MergeCandidateVerifyTriggered: mc.Triggered,
-		MergeCandidateVerifyStageID:   mc.StageID,
-		MergeCandidateVerifyNote:      mc.Note,
-		MergeCandidateVerifyRefusal:   mc.Refusal,
-	})
+	s.notifyStatusUpdate(ctx, runID, "branch_rebased")
+	return out, nil
 }
 
 // rebaseMergeCandidateVerify is the rebase verb's merge-candidate producer.
@@ -623,17 +766,12 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 		cause = st.Cause
 	}
 
-	id := IdentityFrom(ctx)
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
-	}
 	start, refusal := s.startMergeCandidateVerifyPass(ctx, runRow.ID, mergeCandidateVerifyParams{
 		Branch:  branch,
 		BaseRef: baseRef,
 		HeadSHA: head,
 		Cause:   cause,
-	}, mergeCandidateActor{Kind: audit.ActorUser, Subject: subject})
+	}, rebaseOperatorActor(ctx))
 	if refusal != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: merge-candidate verify pass could not be started",
@@ -662,21 +800,17 @@ func (s *Server) writeRebaseNotDeterminable(w http.ResponseWriter, r *http.Reque
 // writeBranchRebasedAudit appends the branch_rebased audit entry recording
 // the full action — the prior head, the resolved new head, the merge commit
 // (which may legitimately be empty), whether the branch already contained the
-// base, the operator reason, and the mechanism note — so the advance is
-// auditable. On a performed merge (postMerge non-nil) it also records the
-// post-merge read classification, the last observed head and the read count
-// (#4199). Operator actor (never a silent system action). Best-effort like
-// branch_reset: the write already happened, so an append failure WARNs rather
-// than unwinding the response.
-func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNumber int,
+// base, the reason, and the mechanism note — so the advance is auditable. On
+// a performed merge (postMerge non-nil) it also records the post-merge read
+// classification, the last observed head and the read count (#4199). The
+// entry is attributed to actor: the invoking operator on the verb, the system
+// actor on a merge-candidate queue auto-advance — never an unattributed
+// action. Best-effort like branch_reset: the write already happened, so an
+// append failure WARNs rather than unwinding the advance.
+func (s *Server) writeBranchRebasedAudit(ctx context.Context, actor mergeCandidateActor, runID uuid.UUID, prNumber int,
 	branch, baseRef, priorHeadSHA, newHeadSHA, mergeCommitSHA string,
 	alreadyUpToDate bool, reason, reparkedReviewStageID string, postMerge *postMergeHeadRead) {
-	id := IdentityFrom(r.Context())
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
-	}
-	actorKind := audit.ActorUser
+	actorKind, subject := actor.Kind, actor.Subject
 
 	fields := map[string]any{
 		"run_id":             runID.String(),
@@ -700,7 +834,7 @@ func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNum
 	}
 	payload, _ := json.Marshal(fields)
 
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
 		Timestamp:    time.Now().UTC(),
 		Category:     CategoryBranchRebased,
@@ -708,7 +842,7 @@ func (s *Server) writeBranchRebasedAudit(r *http.Request, runID uuid.UUID, prNum
 		ActorSubject: &subject,
 		Payload:      payload,
 	}); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: append branch_rebased audit entry failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
@@ -764,14 +898,20 @@ const rebaseVouchRequiredNote = " Re-invoking fishhawk_rebase_run_branch will NO
 // on the lineage check. "Load-bearing" and "best-effort with only a Warn log"
 // are contradictory, so the append failure is still non-fatal to the already
 // completed merge but is no longer SILENT.
-func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
+//
+// The entry is attributed to actor. Its reason states the authorization the
+// commit was created under: the operator's for the verb (byte-identical to the
+// pre-#4200 text), the merge-candidate queue's automatic advance for the
+// system actor — a system auto-advance must never claim an operator
+// authorization no operator gave.
+func (s *Server) writeRebaseLineageAttribution(ctx context.Context, actor mergeCandidateActor, runID uuid.UUID,
 	branch, baseRef, mergeCommitSHA, newHeadSHA string, postMerge postMergeHeadRead) string {
 	// Nothing attributable: an undecodable merge sha AND a post-merge re-read
 	// that failed or stayed at the pre-merge head. Re-invocation cannot repair
 	// this — say so rather than advertising a retry that cannot deliver.
 	if mergeCommitSHA == "" && newHeadSHA == "" {
 		warning := "the base merge SUCCEEDED, but NEITHER the merge commit sha nor the post-merge head could be resolved, so NO lineage attribution was recorded; the merge commit is authored by the App installation and carries no head-report entry, so the ADR-035 ledger classifies it as FOREIGN and the run stays wedged." + rebaseVouchRequiredNote
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: no sha available to attribute; run is left un-attributed",
 			slog.String("run_id", runID.String()))
 		return warning
@@ -788,27 +928,27 @@ func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
 		warning = "the base merge SUCCEEDED and its merge commit " + mergeCommitSHA +
 			" was attributed, but the post-merge head read back as " + postMerge.Observed +
 			", which DIFFERS from it — a concurrent push landed after the merge. That head was deliberately NOT attributed: vouching a commit this invocation did not create would launder a foreign commit into the ADR-035 ledger. Review the pushed commit and, if it is legitimate, admit it with fishhawk_vouch_commit."
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: post-merge head diverged from the merge commit; the divergent head was NOT attributed (concurrent push)",
 			slog.String("run_id", runID.String()),
 			slog.String("merge_commit_sha", mergeCommitSHA),
 			slog.String("post_merge_head_sha", postMerge.Observed))
 	}
 
-	id := IdentityFrom(r.Context())
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
+	actorKind, subject := actor.Kind, actor.Subject
+	reason := "fishhawk_rebase_run_branch advanced " + branch + " onto " + baseRef +
+		"; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher"
+	if actorKind == audit.ActorSystem {
+		reason = "the merge-candidate queue (ADR-092) auto-advanced " + branch + " onto " + baseRef +
+			" at admission; this commit was created by the App installation under the system actor (ADR-035 sole writer), not by a foreign pusher"
 	}
-	actorKind := audit.ActorUser
 
 	payload, _ := json.Marshal(map[string]any{
 		"run_id":               runID.String(),
 		lineageVouchedSHAField: sha,
-		"reason": "fishhawk_rebase_run_branch advanced " + branch + " onto " + baseRef +
-			"; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher",
+		"reason":               reason,
 	})
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
 		Timestamp:    time.Now().UTC(),
 		Category:     CategoryOperatorCommitVouched,
@@ -816,7 +956,7 @@ func (s *Server) writeRebaseLineageAttribution(r *http.Request, runID uuid.UUID,
 		ActorSubject: &subject,
 		Payload:      payload,
 	}); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch rebase: append lineage attribution failed; run is left un-attributed",
 			slog.String("run_id", runID.String()),
 			slog.String("sha", sha),
