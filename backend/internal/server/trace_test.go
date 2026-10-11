@@ -2023,7 +2023,7 @@ func TestChildPushFailure_AbsentDiff_FailsCThenResumes(t *testing.T) {
 	}
 
 	// (3) The retry dispatch is served the held commit as a push-kind resume.
-	held, resume := s.resolvePushCheckpointResume(t.Context(), runRow, got, false, true, true, false)
+	held, resume := s.resolvePushCheckpointResume(t.Context(), runRow, got, false, true, true, true, false)
 	if !resume {
 		t.Fatal("resolvePushCheckpointResume: resume = false, want true for the child's push-kind checkpoint")
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -347,5 +349,210 @@ func TestBackstopFixupReReview_RecordsFixupPushRoundSource(t *testing.T) {
 	}
 	if got[0].RedispatchOf != 0 || got[0].RedispatchDepth != 0 {
 		t.Errorf("ordinary fix-up round carries lineage %+v, want none", got[0])
+	}
+}
+
+// --- Operator re-run marker (#4219) -----------------------------------------
+
+// appendRerunTargetRound appends (through the chain, so it sequences after
+// anything already appended) a settled-shape implement_review_started for
+// (stageID, head) and returns its stamped sequence. au must stampSequence.
+func appendRerunTargetRound(t *testing.T, au *auditFake, runID, stageID uuid.UUID, head string) int64 {
+	t.Helper()
+	payload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory, HeadSHA: head, RoundOrigin: reviewRoundOriginTrace})
+	sid := stageID
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &sid, Category: "implement_review_started", Payload: payload,
+	}); err != nil {
+		t.Fatalf("append implement_review_started: %v", err)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	return int64(len(au.appended))
+}
+
+// TestReviewRerunMarker_Helpers pins reviewRerunFrom's fail-closed reads.
+//
+// COUNTERFACTUAL: drop `|| rr.Of <= 0 || rr.StageID == uuid.Nil` → the
+// malformed arms read ok=true → RED.
+func TestReviewRerunMarker_Helpers(t *testing.T) {
+	ctx := context.Background()
+	if _, ok := reviewRerunFrom(ctx); ok {
+		t.Error("bare ctx: reviewRerunFrom ok = true, want false")
+	}
+	want := reviewRerun{Of: 9, StageID: uuid.New(), HeadSHA: "h"}
+	if got, ok := reviewRerunFrom(context.WithoutCancel(withReviewRerun(ctx, want))); !ok || got != want {
+		t.Errorf("rerun marker round-trip = %+v ok=%v, want %+v ok=true", got, ok, want)
+	}
+	for _, bad := range []reviewRerun{{Of: 0, StageID: uuid.New()}, {Of: -1, StageID: uuid.New()}, {Of: 9}} {
+		if got, ok := reviewRerunFrom(withReviewRerun(ctx, bad)); ok {
+			t.Errorf("malformed rerun marker %+v read ok=true (%+v), want false", bad, got)
+		}
+	}
+	// The two markers are distinct: neither reads the other.
+	if _, ok := reviewRedispatchFrom(withReviewRerun(ctx, want)); ok {
+		t.Error("a re-run marker reads as the ADR-091 D6 re-dispatch marker")
+	}
+	if _, ok := reviewRerunFrom(withReviewRedispatch(ctx, reviewRedispatch{Of: 9, Depth: 1})); ok {
+		t.Error("the D6 re-dispatch marker reads as a re-run marker")
+	}
+}
+
+// TestEmitReviewStarted_StampsRerunOf: an implement round carrying a valid
+// re-run marker records rerun_of; a plan round and a malformed marker omit it.
+//
+// COUNTERFACTUAL: drop the `category == "implement_review_started"` gate on
+// the rerun_of stamp → the plan arm carries rerun_of → RED.
+func TestEmitReviewStarted_StampsRerunOf(t *testing.T) {
+	rr := reviewRerun{Of: 12, StageID: uuid.New(), HeadSHA: "h1"}
+	cases := []struct {
+		name, category, want string
+		ctx                  context.Context
+	}{
+		{name: "implement re-run round", category: "implement_review_started", ctx: withReviewRerun(context.Background(), rr),
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","rerun_of":12}`},
+		{name: "implement malformed marker", category: "implement_review_started", ctx: withReviewRerun(context.Background(), reviewRerun{Of: 12}),
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1"}`},
+		{name: "plan round ignores the marker", category: "plan_review_started", ctx: withReviewRerun(context.Background(), rr),
+			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			au := newAuditFake()
+			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+			runID := uuid.New()
+			if _, ok := s.emitReviewStarted(tc.ctx, runID, rr.StageID, tc.category, planreview.AuthorityAdvisory, 1, nil, "h1", "", ""); !ok {
+				t.Fatal("emitReviewStarted ok = false")
+			}
+			if got := startedPayloadsRaw(t, au, runID, tc.category); len(got) != 1 || got[0] != tc.want {
+				t.Errorf("payloads = %v, want [%s]", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunImplementReviewsForTree_RerunMarkerIsNarrow pins the self-verifying
+// re-run bypass of the #797 same-head dedup: a round already exists for
+// (stage, head) at sequence `of`. Every marker that does not name THIS dispatch
+// — none, a stale Of, a wrong head, a wrong stage — dedups (no new round, no
+// reviewer call). The valid marker dispatches ONE round stamped rerun_of; a
+// second dispatch carrying the SAME marker then finds that new round newest and
+// dedups, which is the in-lock re-verification that makes two concurrent
+// re-runs start exactly one round.
+//
+// COUNTERFACTUALS: rerunBypassApplies returning true for any present marker →
+// the stale/wrong arms dispatch → RED; dropping the newest==Of check → the
+// second valid-marker dispatch starts a second round → RED; dropping the
+// `!s.rerunBypassApplies(...)` term from the dedup guard → the valid arm
+// dedups → RED.
+func TestRunImplementReviewsForTree_RerunMarkerIsNarrow(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	au.stampSequence = true
+	const head = "rerun-head"
+	of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, head)
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	traceCtx := withReviewRoundSource(context.Background(), reviewRoundSource{Origin: reviewRoundOriginTrace})
+	reviewerCalls := func() int {
+		reviewer.mu.Lock()
+		defer reviewer.mu.Unlock()
+		return len(reviewer.calls)
+	}
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"no marker", traceCtx},
+		{"stale Of", withReviewRerun(traceCtx, reviewRerun{Of: of - 1, StageID: implStage.ID, HeadSHA: head})},
+		{"wrong head", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "other-head"})},
+		{"wrong stage", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: uuid.New(), HeadSHA: head})},
+	} {
+		s.runImplementReviewsForTree(tc.ctx, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
+		s.waitBackgroundReviews()
+		if got := startedPayloads(t, au, runRow.ID); len(got) != 1 {
+			t.Fatalf("%s: started rounds = %d, want 1 (the same head must dedup)", tc.name, len(got))
+		}
+		if n := reviewerCalls(); n != 0 {
+			t.Fatalf("%s: reviewer invocations = %d, want 0", tc.name, n)
+		}
+	}
+
+	valid := withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: head})
+	s.runImplementReviewsForTree(valid, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
+	s.waitBackgroundReviews()
+	got := startedPayloads(t, au, runRow.ID)
+	if len(got) != 2 {
+		t.Fatalf("started rounds after the valid re-run = %d, want 2", len(got))
+	}
+	if got[1].RerunOf != of || got[1].HeadSHA != head || got[1].RedispatchOf != 0 {
+		t.Errorf("re-run round = %+v, want rerun_of %d, head %q, no D6 lineage", got[1], of, head)
+	}
+	if n := reviewerCalls(); n != 1 {
+		t.Errorf("reviewer invocations after the valid re-run = %d, want 1", n)
+	}
+
+	s.runImplementReviewsForTree(valid, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
+	s.waitBackgroundReviews()
+	if got := startedPayloads(t, au, runRow.ID); len(got) != 2 {
+		t.Fatalf("started rounds after a second dispatch with the same marker = %d, want 2 (the marker is spent once a newer round exists)", len(got))
+	}
+}
+
+// TestRunImplementReviewsForTree_RerunMarkerSkipsDiffSecretsOnlyWhenValid: the
+// re-run round was seeded BY CONSTRUCTION without its secrets check, so a
+// raised row is attributable to THIS dispatch. A valid marker skips the check
+// (the re-run round's own dispatch ran it); a stale marker runs it like an
+// ordinary round (and the round dedups).
+//
+// COUNTERFACTUAL: drop `&& !s.rerunBypassApplies(...)` from the secrets guard
+// → the valid arm raises one row → RED; make rerunBypassApplies ignore Of →
+// the stale arm raises nothing → RED.
+func TestRunImplementReviewsForTree_RerunMarkerSkipsDiffSecretsOnlyWhenValid(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stale    bool
+		wantRows int
+	}{
+		{name: "valid marker skips the check", stale: false, wantRows: 0},
+		{name: "stale marker runs the check", stale: true, wantRows: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+			au.stampSequence = true
+			cr := newFakeConcernRepo()
+			s.cfg.ConcernRepo = cr
+			of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, "secret-head")
+			if tc.stale {
+				of--
+			}
+			ctx := withReviewRerun(withReviewRoundSource(context.Background(), reviewRoundSource{Origin: reviewRoundOriginTrace}),
+				reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "secret-head"})
+			s.runImplementReviewsForTree(ctx, runRow.ID, implStage.ID, keyDiff(), nil, "secret-head", "", "", nil)
+			s.waitBackgroundReviews()
+			if n := len(serverCheckRows(t, cr, runRow.ID)); n != tc.wantRows {
+				t.Errorf("server_check rows = %d, want %d", n, tc.wantRows)
+			}
+		})
+	}
+}
+
+// TestRunImplementReviewsForTree_RerunVerificationReadErrorDedups: an audit
+// read error during the marker's re-verification never unlocks the bypass.
+//
+// COUNTERFACTUAL: make rerunBypassApplies return true on a read error → a
+// second round dispatches → RED.
+func TestRunImplementReviewsForTree_RerunVerificationReadErrorDedups(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	au.stampSequence = true
+	of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, "h")
+	ctx := withReviewRerun(context.Background(), reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "h"})
+	au.mu.Lock()
+	au.listByCategoryErr = errors.New("injected")
+	au.mu.Unlock()
+	if s.rerunBypassApplies(ctx, runRow.ID, implStage.ID, "h") {
+		t.Fatal("rerunBypassApplies = true on an audit read error, want false (fail-closed)")
 	}
 }

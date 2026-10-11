@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +20,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // fakeForgeReader is a full forge.Forge whose GetPullRequest is the only
@@ -1490,5 +1495,533 @@ func TestObserveForgeMerge_Discriminators(t *testing.T) {
 					obs.observedAtTime, obs.ObservedAt)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E83.95 / #4222 gap 1 — the repository-installation credential fallback.
+//
+// Every test here reads through a REAL *githubclient.Client pointed at an
+// httptest GitHub mux (cfg.PRStateReader nil, so prStateReaderFor resolves
+// cfg.GitHub). That is load-bearing for the counterfactuals: with the fallback
+// absent, the real client refuses the zero scope ("credential scope is empty")
+// before issuing any request, which surfaces as the 502 forge-unavailable rung
+// — a fake reader that ignores the scope could not tell the two apart.
+// ---------------------------------------------------------------------------
+
+// ghFallbackMux is the httptest GitHub serving the two reads the fallback
+// performs: GET /repos/x/y/installation and GET /repos/x/y/pulls/{n}. Its hit
+// counters are atomic because the handlers run on the server's goroutines.
+type ghFallbackMux struct {
+	installHits atomic.Int32
+	prHits      atomic.Int32
+	mu          sync.Mutex
+	lastPR      string
+	tokens      *fakeTokenProvider
+	client      *githubclient.Client
+}
+
+// newGHFallbackMux answers /installation with installStatus (the id body on
+// 200) and every pull request read with a merged PR carrying a SHA and a merge
+// timestamp.
+func newGHFallbackMux(t *testing.T, installStatus int, installID int64) *ghFallbackMux {
+	t.Helper()
+	m := &ghFallbackMux{tokens: &fakeTokenProvider{tok: "ghs_test"}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/x/y/installation", func(w http.ResponseWriter, _ *http.Request) {
+		m.installHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(installStatus)
+		if installStatus == http.StatusOK {
+			_, _ = fmt.Fprintf(w, `{"id":%d}`, installID)
+			return
+		}
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	})
+	mux.HandleFunc("GET /repos/x/y/pulls/{num}", func(w http.ResponseWriter, r *http.Request) {
+		m.prHits.Add(1)
+		m.mu.Lock()
+		m.lastPR = r.PathValue("num")
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"node_id":"PR_x","state":"closed","merged":true,` +
+			`"merge_commit_sha":"cafebabe1234","merged_at":"2026-08-30T12:34:56Z"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	m.client = &githubclient.Client{BaseURL: srv.URL, Tokens: m.tokens,
+		HTTP: srv.Client(), AppJWT: func() (string, error) { return "jwt", nil }}
+	return m
+}
+
+func (m *ghFallbackMux) lastPRNumber() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastPR
+}
+
+// newFallbackFixture is an observation fixture whose forge read goes through
+// the real client on mux, plus a credential-LESS run (no InstallationRef, no
+// InstallationID) carrying the x/y #3064 URL — the e57262eb / 3ce12d9f shape.
+func newFallbackFixture(t *testing.T, mux *ghFallbackMux) (*observationFixture, uuid.UUID) {
+	t.Helper()
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.s.cfg.PRStateReader = nil
+	f.s.cfg.GitHub = mux.client
+	id := f.seedObservationRun(t, run.CreateRunParams{Repo: "x/y"}, "https://github.com/x/y/pull/3064")
+	return f, id
+}
+
+// observationPayload decodes the source keys of a merge_observation_recorded row.
+type observationPayload struct {
+	PullRequestURL       string `json:"pull_request_url"`
+	PullRequestNumber    int    `json:"pull_request_number"`
+	CredentialSource     string `json:"credential_source"`
+	PullRequestURLSource string `json:"pull_request_url_source"`
+}
+
+func decodeObservationPayload(t *testing.T, e *audit.Entry) observationPayload {
+	t.Helper()
+	var p observationPayload
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	return p
+}
+
+// errorDetail reads one details key off a refusal envelope.
+func errorDetail(t *testing.T, w *httptest.ResponseRecorder, key string) any {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	return env.Error.Details[key]
+}
+
+// (a) A credential-less run reads through the App's installation on its own
+// repository. COUNTERFACTUAL: delete the resolveRepoScope call (keep the zero
+// scope) and the real client refuses before any request — 502
+// record_merge_observation_forge_unavailable, zero rows — RED on the status.
+func TestRecordMergeObservation_FallsBackToRepositoryInstallation(t *testing.T) {
+	mux := newGHFallbackMux(t, http.StatusOK, 4242)
+	f, id := newFallbackFixture(t, mux)
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := mux.tokens.gotInst; got != 4242 {
+		t.Errorf("installation token minted for %d, want the resolved 4242", got)
+	}
+	if n := mux.installHits.Load(); n != 1 {
+		t.Errorf("installation lookups = %d, want 1", n)
+	}
+	if n := mux.prHits.Load(); n != 1 || mux.lastPRNumber() != "3064" {
+		t.Errorf("pull request reads = %d (last #%s), want 1 of #3064", n, mux.lastPRNumber())
+	}
+	var resp recordMergeObservationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Observation.CredentialSource != credentialSourceRepositoryInstallation {
+		t.Errorf("response credential_source = %q, want %q",
+			resp.Observation.CredentialSource, credentialSourceRepositoryInstallation)
+	}
+	rows := f.observationRowsFor(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	p := decodeObservationPayload(t, rows[0])
+	if p.CredentialSource != "repository_installation" {
+		t.Errorf("payload credential_source = %q, want repository_installation", p.CredentialSource)
+	}
+	if p.PullRequestURLSource != "run_row" {
+		t.Errorf("payload pull_request_url_source = %q, want run_row", p.PullRequestURLSource)
+	}
+}
+
+// (b) App not installed: a NAMED 409 stating the remedy, zero rows, and the
+// pull request is never read. COUNTERFACTUAL: neutralize the scope.IsZero()
+// refusal (fall through with the zero scope) and the real client produces the
+// 502 — RED on the status/code.
+func TestRecordMergeObservation_AppNotInstalledNamesRemedy(t *testing.T) {
+	mux := newGHFallbackMux(t, http.StatusNotFound, 0)
+	f, id := newFallbackFixture(t, mux)
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_no_credential")
+	if got := errorDetail(t, w, "reason"); got != noCredentialAppNotInstalled {
+		t.Errorf("details.reason = %v, want %q", got, noCredentialAppNotInstalled)
+	}
+	if !strings.Contains(w.Body.String(), "install the App on the repository") {
+		t.Errorf("message does not name the remedy:\n%s", w.Body.String())
+	}
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+	}
+	if n := mux.prHits.Load(); n != 0 {
+		t.Errorf("pull request reads = %d, want 0", n)
+	}
+}
+
+// (c) The installation lookup itself failing is the 502 forge-unavailable
+// rung — the merge state is unknown — with zero rows and no PR read.
+func TestRecordMergeObservation_InstallationLookupFailureIs502(t *testing.T) {
+	mux := newGHFallbackMux(t, http.StatusInternalServerError, 0)
+	f, id := newFallbackFixture(t, mux)
+
+	w := f.postObserveID(t, id.String())
+	assertObserveRefusal(t, w, http.StatusBadGateway, "record_merge_observation_forge_unavailable")
+	if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+	}
+	if n := mux.prHits.Load(); n != 0 {
+		t.Errorf("pull request reads = %d, want 0", n)
+	}
+}
+
+// (d) A run carrying its OWN credential never looks the installation up.
+// COUNTERFACTUAL: delete the !cred.scope.IsZero() short-circuit (always
+// resolve) and the installation hit count becomes 1 — RED.
+func TestRecordMergeObservation_RunCredentialSkipsFallback(t *testing.T) {
+	mux := newGHFallbackMux(t, http.StatusOK, 9999)
+	f, _ := newFallbackFixture(t, mux)
+	ref := "4242"
+	id := f.seedObservationRun(t, run.CreateRunParams{Repo: "x/y", InstallationRef: &ref},
+		"https://github.com/x/y/pull/3064")
+
+	w := f.postObserveID(t, id.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if n := mux.installHits.Load(); n != 0 {
+		t.Errorf("installation lookups = %d, want 0 for a run carrying its own credential", n)
+	}
+	if got := mux.tokens.gotInst; got != 4242 {
+		t.Errorf("installation token minted for %d, want the run's own 4242", got)
+	}
+	rows := f.observationRowsFor(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	if p := decodeObservationPayload(t, rows[0]); p.CredentialSource != "run" {
+		t.Errorf("payload credential_source = %q, want run", p.CredentialSource)
+	}
+}
+
+// tenantedRunRepo stamps AccountID onto every GetRun — the TENANTED-run state
+// binding approval condition 1 is about, seeded by construction (the fixture's
+// pg repository mints untenanted runs).
+type tenantedRunRepo struct {
+	run.Repository
+	accountID string
+}
+
+func (r tenantedRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	rr, err := r.Repository.GetRun(ctx, id)
+	if rr != nil {
+		rr.AccountID = r.accountID
+	}
+	return rr, err
+}
+
+// stubInstallationAccounts is the webhook InstallationAccountLookup seam the
+// account condition reads through.
+type stubInstallationAccounts struct {
+	acct    string
+	err     error
+	calls   int
+	gotInst int64
+}
+
+func (s *stubInstallationAccounts) AccountIDForInstallation(_ context.Context, installationID int64) (string, error) {
+	s.calls++
+	s.gotInst = installationID
+	return s.acct, s.err
+}
+
+// TestRecordMergeObservation_FallbackAccountCondition pins binding approval
+// condition 1 (the Captain account condition): the repository installation is
+// used ONLY for an untenanted run (test (a)) or a run whose OWN account the
+// installation maps to. Every other shape is 409
+// record_merge_observation_no_credential with zero rows and ZERO pull request
+// reads. COUNTERFACTUAL for the cross-account row: delete the
+// installationAccountRefusal call and the PR is read (prHits 1, 200) — RED.
+func TestRecordMergeObservation_FallbackAccountCondition(t *testing.T) {
+	const runAccount = "11111111-1111-4111-8111-111111111111"
+	const otherAccount = "22222222-2222-4222-8222-222222222222"
+	cases := []struct {
+		name       string
+		lookup     *stubInstallationAccounts // nil = seam unwired
+		wantStatus int
+		wantReason string
+	}{
+		{name: "cross_account_installation", lookup: &stubInstallationAccounts{acct: otherAccount},
+			wantStatus: http.StatusConflict, wantReason: noCredentialInstallationAccountMismatch},
+		{name: "installation_mapped_to_no_account", lookup: &stubInstallationAccounts{acct: ""},
+			wantStatus: http.StatusConflict, wantReason: noCredentialInstallationAccountMismatch},
+		{name: "account_lookup_errors", lookup: &stubInstallationAccounts{err: errors.New("db down")},
+			wantStatus: http.StatusConflict, wantReason: noCredentialInstallationAccountUnproven},
+		{name: "account_seam_unwired", lookup: nil,
+			wantStatus: http.StatusConflict, wantReason: noCredentialInstallationAccountUnproven},
+		{name: "installation_is_the_runs_own_account", lookup: &stubInstallationAccounts{acct: runAccount},
+			wantStatus: http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := newGHFallbackMux(t, http.StatusOK, 4242)
+			f, id := newFallbackFixture(t, mux)
+			f.s.cfg.RunRepo = tenantedRunRepo{Repository: f.runRepo, accountID: runAccount}
+			if tc.lookup != nil {
+				f.s.cfg.WebhookDispatcher = &webhook.Dispatcher{Accounts: tc.lookup}
+			}
+
+			w := f.postObserveID(t, id.String())
+			if tc.lookup != nil && tc.lookup.gotInst != 4242 {
+				t.Errorf("account lookup for installation %d, want the resolved 4242", tc.lookup.gotInst)
+			}
+			if tc.wantStatus == http.StatusOK {
+				if w.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+				}
+				rows := f.observationRowsFor(t, id)
+				if len(rows) != 1 {
+					t.Fatalf("rows = %d, want exactly 1", len(rows))
+				}
+				if p := decodeObservationPayload(t, rows[0]); p.CredentialSource != "repository_installation" {
+					t.Errorf("payload credential_source = %q, want repository_installation", p.CredentialSource)
+				}
+				return
+			}
+			assertObserveRefusal(t, w, tc.wantStatus, "record_merge_observation_no_credential")
+			if got := errorDetail(t, w, "reason"); got != tc.wantReason {
+				t.Errorf("details.reason = %v, want %q", got, tc.wantReason)
+			}
+			if strings.Contains(w.Body.String(), otherAccount) {
+				t.Errorf("refusal leaks the other account's id:\n%s", w.Body.String())
+			}
+			if n := mux.prHits.Load(); n != 0 {
+				t.Errorf("pull request reads = %d, want 0: an unproven installation must not be read through", n)
+			}
+			if rows := f.observationRowsFor(t, id); len(rows) != 0 {
+				t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+			}
+		})
+	}
+}
+
+// TestMergeRun_ObserveRungNeverLooksUpRepositoryInstallation pins binding
+// approval condition 2: POST /v0/runs/{run_id}/merge's observe rung reads only
+// under the run's OWN credential, so a credential-less run's resume costs ZERO
+// installation lookups (and, with the real client refusing the zero scope,
+// zero pull request reads) — it falls open to the dispatch exactly as before
+// #4222. COUNTERFACTUAL: move the fallback into observeForgeMerge and the
+// installation hit count becomes 1 — RED.
+func TestMergeRun_ObserveRungNeverLooksUpRepositoryInstallation(t *testing.T) {
+	mux := newGHFallbackMux(t, http.StatusOK, 4242)
+
+	t.Run("through the merge endpoint", func(t *testing.T) {
+		merger := &fakeMerger{}
+		s, repo, au := newAutoDriveMergeServer(t, merger)
+		s.cfg.GitHub = mux.client
+		runID := uuid.New()
+		seedObserveMergeRun(t, repo, runID, "https://github.com/x/y/pull/3064")
+		seedMergeVerdict(au, runID, 11) // a RESUME: the rung reads the forge
+
+		before := mux.installHits.Load()
+		w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+		if n := mux.installHits.Load() - before; n != 0 {
+			t.Errorf("installation lookups = %d, want 0 on the merge endpoint (status %d)", n, w.Code)
+		}
+		if rows := mergeObservationRows(au); len(rows) != 0 {
+			t.Errorf("merge_observation_recorded rows = %d, want 0", len(rows))
+		}
+	})
+	t.Run("observe rung", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", GitHub: mux.client})
+		prURL := "https://github.com/x/y/pull/3064"
+		runRow := &run.Run{ID: uuid.New(), Repo: "x/y", PullRequestURL: &prURL}
+		before := mux.installHits.Load()
+		obs, reason, ferr := s.observeForgeMerge(context.Background(), runRow)
+		if n := mux.installHits.Load() - before; n != 0 {
+			t.Errorf("installation lookups = %d, want 0", n)
+		}
+		if reason != obsForgeUnavailable || ferr == nil || obs != nil {
+			t.Errorf("reason = %q err = %v obs = %+v, want forge_unavailable from the zero scope",
+				reason.forgeMergeState(), ferr, obs)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// E83.95 / #4222 gap 3 — deriving the pull request URL from the run's newest
+// pull_request_opened entry when the run row carries none.
+// ---------------------------------------------------------------------------
+
+// newNoURLObservationFixture is the fixture run with NO pull request URL on
+// its row (the 4152c113 / b50f7945 shape).
+func newNoURLObservationFixture(t *testing.T) *observationFixture {
+	t.Helper()
+	base := newSupersedeFixture(t, parkedShape())
+	reader := &fakePRStateReader{pr: mergedPR()}
+	base.s.cfg.PRStateReader = reader
+	return &observationFixture{supersedeFixture: base, reader: reader}
+}
+
+// seedPullRequestOpened appends one pull_request_opened entry with the given
+// raw payload to the fixture run's chain.
+func (f *observationFixture) seedPullRequestOpened(t *testing.T, payload string) {
+	t.Helper()
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     f.runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "pull_request_opened",
+		Payload:   []byte(payload),
+	}); err != nil {
+		t.Fatalf("append pull_request_opened: %v", err)
+	}
+}
+
+// (e) COUNTERFACTUAL: delete the derivation call and rung 4 sees an empty URL
+// — 409 record_merge_observation_no_pull_request — RED on the status.
+func TestRecordMergeObservation_DerivesPRURLFromPullRequestOpened(t *testing.T) {
+	f := newNoURLObservationFixture(t)
+	const derived = "https://github.com/x/y/pull/224"
+	f.seedPullRequestOpened(t, `{"pr_url":"`+derived+`"}`)
+
+	w := f.postObserve(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if f.reader.lastNum != 224 {
+		t.Errorf("forge pr number = %d, want the derived 224", f.reader.lastNum)
+	}
+	rows := f.observationRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	p := decodeObservationPayload(t, rows[0])
+	if p.PullRequestURL != derived || p.PullRequestNumber != 224 {
+		t.Errorf("payload url/number = %q/%d, want %q/224", p.PullRequestURL, p.PullRequestNumber, derived)
+	}
+	if p.PullRequestURLSource != "pull_request_opened_audit" {
+		t.Errorf("payload pull_request_url_source = %q, want pull_request_opened_audit", p.PullRequestURLSource)
+	}
+	// Read-time only: the run row is never written.
+	runRow, err := f.runRepo.GetRun(context.Background(), f.runID)
+	if err != nil {
+		t.Fatalf("re-read run: %v", err)
+	}
+	if runRow.PullRequestURL != nil && *runRow.PullRequestURL != "" {
+		t.Errorf("run row pull_request_url = %q, want it left unwritten", *runRow.PullRequestURL)
+	}
+}
+
+// (f) The NEWEST entry wins. COUNTERFACTUAL: pick the first decodable entry
+// instead and #100 is read — RED.
+func TestRecordMergeObservation_DerivationPicksNewestEntry(t *testing.T) {
+	f := newNoURLObservationFixture(t)
+	f.seedPullRequestOpened(t, `{"pr_url":"https://github.com/x/y/pull/100"}`)
+	f.seedPullRequestOpened(t, `{"pr_url":"https://github.com/x/y/pull/224"}`)
+	f.seedPullRequestOpened(t, `{"branch":"no-url-here"}`) // newer but carries no pr_url
+
+	w := f.postObserve(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if f.reader.lastNum != 224 {
+		t.Errorf("forge pr number = %d, want the newest usable entry's 224", f.reader.lastNum)
+	}
+}
+
+// Entries that carry no usable pr_url (an empty one, an undecodable payload)
+// are skipped, so the run still has no URL: the updated 409.
+func TestRecordMergeObservation_DerivationNoUsableEntry(t *testing.T) {
+	f := newNoURLObservationFixture(t)
+	f.seedPullRequestOpened(t, `{"pr_url":""}`)
+	f.seedPullRequestOpened(t, `{"pr_url":42}`)
+
+	w := f.postObserve(t)
+	assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_no_pull_request")
+	if !strings.Contains(w.Body.String(), "pull_request_opened") {
+		t.Errorf("message does not say the chain was consulted:\n%s", w.Body.String())
+	}
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// (g) A derived URL naming another repository is still refused by rung 5b
+// before any forge read. COUNTERFACTUAL: route the derived URL around
+// resolveObservationTarget and the forge is read — RED on reader.calls.
+func TestRecordMergeObservation_DerivedURLStillRepoChecked(t *testing.T) {
+	f := newNoURLObservationFixture(t)
+	f.seedPullRequestOpened(t, `{"pr_url":"https://github.com/other/repo/pull/9"}`)
+
+	w := f.postObserve(t)
+	assertObserveRefusal(t, w, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch")
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+}
+
+// (h) An unreadable pull_request_opened chain is a 500 and never a write.
+// COUNTERFACTUAL: swallow the read error (treat as no entry) and the answer is
+// the 409 no_pull_request — RED on the status.
+func TestRecordMergeObservation_DerivationChainReadErrorFailsClosed(t *testing.T) {
+	f := newNoURLObservationFixture(t)
+	f.seedPullRequestOpened(t, `{"pr_url":"https://github.com/x/y/pull/224"}`)
+	f.s.cfg.AuditRepo = &msListCategoryErrAudit{
+		Repository: f.audit, failCategory: "pull_request_opened", err: errors.New("chain unreadable"),
+	}
+
+	w := f.postObserve(t)
+	assertObserveRefusal(t, w, http.StatusInternalServerError, "internal_error")
+	f.s.cfg.AuditRepo = f.audit
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// (i) The run row's own URL is preferred over any pull_request_opened entry.
+// COUNTERFACTUAL: derive unconditionally and #224 is read — RED.
+func TestRecordMergeObservation_RunRowURLPreferred(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	f.seedPullRequestOpened(t, `{"pr_url":"https://github.com/x/y/pull/224"}`)
+
+	w := f.postObserve(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if f.reader.lastNum != 3064 {
+		t.Errorf("forge pr number = %d, want the run row's 3064", f.reader.lastNum)
+	}
+	rows := f.observationRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	if p := decodeObservationPayload(t, rows[0]); p.PullRequestURLSource != "run_row" {
+		t.Errorf("payload pull_request_url_source = %q, want run_row", p.PullRequestURLSource)
+	}
+}
+
+// (j) The new reason's stable merge-endpoint token.
+func TestObserveForgeMerge_NoCredentialState(t *testing.T) {
+	if got := obsForgeNoCredential.forgeMergeState(); got != "no_forge_credential" {
+		t.Errorf("forgeMergeState() = %q, want no_forge_credential", got)
 	}
 }

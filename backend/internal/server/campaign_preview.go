@@ -79,6 +79,21 @@ type campaignPreviewDangling struct {
 	// Remedy is one short operator-facing sentence per reason, so a report is
 	// actionable without cross-referencing the create refusal's message.
 	Remedy string `json:"remedy"`
+	// Source is where the blocking edge was read from (#4028): native or
+	// legacy_text. omitempty so an edge from a provider that predates source
+	// tagging keeps its pre-#4028 shape.
+	Source string `json:"source,omitempty"`
+}
+
+// campaignPreviewEdge is one IN-SET depends_on edge in a preview report
+// (#4028): both endpoints are resolved items. It mirrors
+// docs/api/v0.openapi.yaml's CampaignPreviewEdge schema and is the only place a
+// preview names an in-set edge's SOURCE — an item's depends_on carries only the
+// target ref.
+type campaignPreviewEdge struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Source string `json:"source,omitempty"`
 }
 
 // campaignPreviewResponse is the POST /v0/campaigns/preview report. It mirrors
@@ -109,6 +124,14 @@ type campaignPreviewResponse struct {
 	// both paths (operator condition 2): an operator inspecting an invalid set
 	// needs the partial graph, not just the failure.
 	Items []campaignPreviewItem `json:"items"`
+	// Edges are the in-set depends_on edges with their source (#4028): native
+	// or legacy_text. ALWAYS present on both paths, an empty array when the set
+	// has no in-set edge.
+	Edges []campaignPreviewEdge `json:"edges"`
+	// Warnings names every item relying on a legacy `Depends on:` line
+	// (#4028), the same block the create response carries. Informational and
+	// present on both paths; omitted when no edge is legacy_text.
+	Warnings []campaignDependencyWarning `json:"warnings,omitempty"`
 	// SatisfiedDependencies are the depends_on edges elided because their
 	// out-of-set target was already closed-and-completed (#2953), the same
 	// block the create response carries.
@@ -267,9 +290,43 @@ func (s *Server) handlePreviewCampaign(w http.ResponseWriter, r *http.Request) {
 		WaveCount:             &waveCount,
 		Waves:                 assembly.Waves,
 		Items:                 items,
+		Edges:                 previewEdges(source.Result),
+		Warnings:              legacyDependencyWarnings(source.Result),
 		SatisfiedDependencies: satisfiedDependencyPayloads(assembly.SatisfiedDependencies),
 		GroomingSource:        source.Provenance,
 	})
+}
+
+// previewEdges renders the result's IN-SET depends_on edges — those whose BOTH
+// endpoints are resolved items — with their source (#4028), sorted by (from,
+// to) issue number. A dropped edge is reported under dangling instead. Always a
+// non-nil slice so the wire shape is an array, never null.
+func previewEdges(res *workmgmt.EpicChildrenResult) []campaignPreviewEdge {
+	inSet := make(map[int]bool, len(res.Children))
+	for _, c := range res.Children {
+		inSet[c.Number] = true
+	}
+	kept := make([]workmgmt.DependsEdge, 0, len(res.Edges))
+	for _, e := range res.Edges {
+		if inSet[e.From] && inSet[e.To] {
+			kept = append(kept, e)
+		}
+	}
+	sort.SliceStable(kept, func(i, j int) bool {
+		if kept[i].From != kept[j].From {
+			return kept[i].From < kept[j].From
+		}
+		return kept[i].To < kept[j].To
+	})
+	out := make([]campaignPreviewEdge, 0, len(kept))
+	for _, e := range kept {
+		out = append(out, campaignPreviewEdge{
+			From:   "issue:" + strconv.Itoa(e.From),
+			To:     e.TargetRef(),
+			Source: string(e.Source),
+		})
+	}
+	return out
 }
 
 // partialPreviewReport builds the valid:false skeleton for a set that failed to
@@ -309,6 +366,8 @@ func partialPreviewReport(repo, epicRef string, source *campaignSourceResolution
 		EpicRef:               epicRef,
 		ItemCount:             len(res.Children),
 		Items:                 items,
+		Edges:                 previewEdges(res),
+		Warnings:              legacyDependencyWarnings(res),
 		SatisfiedDependencies: satisfiedDependencyPayloads(res.SatisfiedEdges),
 		GroomingSource:        source.Provenance,
 	}
@@ -336,6 +395,7 @@ func danglingPreview(err error) ([]campaignPreviewDangling, []string) {
 				To:     target,
 				Reason: reason,
 				Remedy: remedy,
+				Source: string(e.Source),
 			})
 			if widenable {
 				closure[target] = true

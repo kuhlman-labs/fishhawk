@@ -602,7 +602,13 @@ provider, so a campaign resolving to `gitlab`/`jira` reports the provider-side
 outcome instead. `provider` (optional) selects that provider per call
 (`github_projects` | `gitlab` | `jira`, defaulting to the repo's
 work-management conventions); an unregistered id fails `validation_failed`, and
-a `501 provider_unimplemented` now carries a `remedy` naming the fix.
+a `501 provider_unimplemented` now carries a `remedy` naming the fix. A native
+"blocked by" read that fails on either source fails
+`502 native_dependency_read_failed` (#4028) with `details.issue_ref` naming the
+issue and `details.reason` (`truncated` / `forbidden` / `not_found` /
+`unsupported` / `read_failed`); fix what the reason names — for `forbidden`,
+grant the GitHub App Issues read permission — and retry, since the campaign is
+never assembled without the edge.
 
 **2. The drive-tick loop — `fishhawk_get_campaign_status` is the single status
 surface.** It is reconcile-on-read: each poll settles every terminal item run and
