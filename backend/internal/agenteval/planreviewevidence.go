@@ -20,6 +20,18 @@
 //
 // CheckCatchRateEvidence RECOMPUTES every verdict from the stored counts: the
 // record carries no verdict field to trust.
+//
+// THE TRIAL SIDECAR. Every recording also writes evidence.trials.json beside
+// the record (CatchRateTrialsPath; schema CatchRateTrialsSchema): per arm and
+// case, one entry per trial in sample order — its outcome, the matched probe
+// and attribution kind of a catch, every concern of a miss with its near-miss
+// tag, a response excerpt of an undecodable trial. Every stored string passes
+// through redaction.RedactDefault and then a rune-safe truncation at
+// catchTrialNoteMaxRunes; a trial keeps at most catchTrialMaxConcerns concerns.
+// The two files are written as a pair, sidecar first (a crash between the
+// renames leaves a sidecar the old record does not match, which the gate
+// refuses), and CheckCatchRateEvidence refuses a record whose sidecar is
+// absent, malformed, from another recording or count-inconsistent with it.
 
 package agenteval
 
@@ -38,8 +50,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // CatchRateEvidenceSchema is the evidence record's schema identifier.
@@ -47,6 +61,78 @@ const CatchRateEvidenceSchema = "planreview-catchrate-evidence-v1"
 
 // catchRateRunbook is named in every refusal so the reader knows the remedy.
 const catchRateRunbook = "docs/compliance/planreview-catchrate-evidence.md"
+
+// CatchRateTrialsSchema is the trial sidecar's schema identifier.
+const CatchRateTrialsSchema = "planreview-catchrate-trials-v1"
+
+const (
+	// catchTrialNoteMaxRunes caps every string the sidecar stores (severity,
+	// category, note, matched probe, response excerpt), marker included.
+	catchTrialNoteMaxRunes = 1000
+	// catchTrialMaxConcerns caps the concerns one trial stores, in emitted
+	// order; concerns_total keeps the uncapped count.
+	catchTrialMaxConcerns = 12
+	// catchTrialTruncationMarker ends a truncated string.
+	catchTrialTruncationMarker = " [truncated]"
+)
+
+// CatchRateTrialsPath is the trial sidecar's path for an evidence record: the
+// evidence path's stem plus ".trials.json"
+// (testdata/planreview-catchrate/evidence.trials.json for the committed one).
+func CatchRateTrialsPath(evidencePath string) string {
+	return strings.TrimSuffix(evidencePath, filepath.Ext(evidencePath)) + ".trials.json"
+}
+
+// CatchRateTrialConcern is one stored reviewer concern of a trial.
+type CatchRateTrialConcern struct {
+	Severity string `json:"severity"`
+	Category string `json:"category"`
+	Note     string `json:"note"`
+	// NearMiss is set on a missed trial's concern only:
+	// NearMissProbeWithoutAttribution or NearMissAttributionWithoutProbe.
+	NearMiss string `json:"near_miss,omitempty"`
+}
+
+// CatchRateTrialRecord is one stored trial.
+type CatchRateTrialRecord struct {
+	// Trial is the 1-based sample index within its arm and case.
+	Trial   int          `json:"trial"`
+	Outcome CatchOutcome `json:"outcome"`
+	// MatchedProbe and Attribution ("id" or "phrase") are set on a caught
+	// trial only.
+	MatchedProbe string `json:"matched_probe,omitempty"`
+	Attribution  string `json:"attribution,omitempty"`
+	// Concerns is the matching concern of a caught trial and every concern
+	// (capped at max_concerns_per_trial) of a missed trial.
+	Concerns      []CatchRateTrialConcern `json:"concerns"`
+	ConcernsTotal int                     `json:"concerns_total"`
+	// ResponseExcerpt is set on an undecodable trial only.
+	ResponseExcerpt string `json:"response_excerpt,omitempty"`
+}
+
+// CatchRateTrialsArm is one arm's trials, per case in sample order.
+type CatchRateTrialsArm struct {
+	PerCase map[string][]CatchRateTrialRecord `json:"per_case"`
+}
+
+// CatchRateTrialsArms is both arms' trials.
+type CatchRateTrialsArms struct {
+	WithoutConventions CatchRateTrialsArm `json:"without_conventions"`
+	WithConventions    CatchRateTrialsArm `json:"with_conventions"`
+}
+
+// CatchRateTrials is the committed trial sidecar
+// (testdata/planreview-catchrate/evidence.trials.json). RecordedAt and
+// PromptFingerprint equal the evidence record's, which is how the gate binds
+// the pair.
+type CatchRateTrials struct {
+	Schema              string              `json:"schema"`
+	RecordedAt          string              `json:"recorded_at"`
+	PromptFingerprint   string              `json:"prompt_fingerprint"`
+	NoteMaxRunes        int                 `json:"note_max_runes"`
+	MaxConcernsPerTrial int                 `json:"max_concerns_per_trial"`
+	Arms                CatchRateTrialsArms `json:"arms"`
+}
 
 // ErrCatchRateRegressed marks a refusal whose cause is the REGRESSION rule
 // (the within-run rule or the pinned-baseline rule), as opposed to a shape,
@@ -148,11 +234,13 @@ type RecordCatchRateOptions struct {
 }
 
 // RecordCatchRateEvidence runs both arms against sender (SamplesPerCaseForPower
-// samples per case), judges the measurement, and — only when it passes —
-// writes the evidence record atomically. It returns the rendered report (also
-// on a gate refusal, so the caller can show the numbers) and an error.
+// samples per case), judges the measurement, and — only when it passes and
+// DryRun is off — writes the evidence record AND its trial sidecar
+// (CatchRateTrialsPath) as a pair (writeCatchRateEvidencePair). It returns the
+// rendered report (also on a gate refusal, so the caller can show the numbers)
+// and an error.
 //
-// It REFUSES, leaving evidencePath byte-identical, on: PinBaseline with a
+// It REFUSES, leaving evidencePath and its sidecar byte-identical, on: PinBaseline with a
 // blank Reason; an existing record that is malformed (never silently
 // dropped); no pinned baseline yet without PinBaseline (the first recording
 // must pin — checked BEFORE any model call); a transport or render error; a
@@ -232,10 +320,86 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	if opts.DryRun {
 		return report + "\nDry run: evidence not written.\n", nil
 	}
-	if err := writeCatchRateEvidence(evidencePath, rec); err != nil {
+	trials := buildCatchRateTrials(rec, without, with)
+	if err := writeCatchRateEvidencePair(evidencePath, rec, trials); err != nil {
 		return report, err
 	}
-	return report, nil
+	return report + fmt.Sprintf("\nTrial sidecar written: %s\n", CatchRateTrialsPath(evidencePath)), nil
+}
+
+// buildCatchRateTrials is the sidecar for a judged measurement: the arm
+// reports' trials, redacted and truncated (sanitizeCatchTrialText), concerns
+// capped at catchTrialMaxConcerns.
+func buildCatchRateTrials(rec CatchRateEvidence, without, with CatchRateArmReport) CatchRateTrials {
+	arm := func(r CatchRateArmReport) CatchRateTrialsArm {
+		out := CatchRateTrialsArm{PerCase: make(map[string][]CatchRateTrialRecord, len(r.Trials))}
+		for name, trials := range r.Trials {
+			recs := make([]CatchRateTrialRecord, 0, len(trials))
+			for i, tr := range trials {
+				recs = append(recs, catchRateTrialRecord(i+1, tr))
+			}
+			out.PerCase[name] = recs
+		}
+		return out
+	}
+	return CatchRateTrials{
+		Schema:              CatchRateTrialsSchema,
+		RecordedAt:          rec.RecordedAt,
+		PromptFingerprint:   rec.PromptFingerprint,
+		NoteMaxRunes:        catchTrialNoteMaxRunes,
+		MaxConcernsPerTrial: catchTrialMaxConcerns,
+		Arms:                CatchRateTrialsArms{WithoutConventions: arm(without), WithConventions: arm(with)},
+	}
+}
+
+func catchRateTrialRecord(index int, tr CatchTrial) CatchRateTrialRecord {
+	out := CatchRateTrialRecord{
+		Trial:         index,
+		Outcome:       tr.Outcome,
+		MatchedProbe:  sanitizeCatchTrialText(tr.MatchedProbe),
+		Attribution:   tr.Attribution,
+		Concerns:      make([]CatchRateTrialConcern, 0, min(len(tr.Concerns), catchTrialMaxConcerns)),
+		ConcernsTotal: tr.ConcernsTotal,
+	}
+	for i, c := range tr.Concerns {
+		if i == catchTrialMaxConcerns {
+			break
+		}
+		out.Concerns = append(out.Concerns, CatchRateTrialConcern{
+			Severity: sanitizeCatchTrialText(c.Severity),
+			Category: sanitizeCatchTrialText(c.Category),
+			Note:     sanitizeCatchTrialText(c.Note),
+			NearMiss: c.NearMiss,
+		})
+	}
+	if tr.Outcome == CatchUndecodable {
+		out.ResponseExcerpt = sanitizeCatchTrialText(tr.Response)
+	}
+	return out
+}
+
+// sanitizeCatchTrialText is what every model-derived string goes through
+// before it is committed: redaction.RedactDefault (the notes are model output
+// and land in the repository), then truncateRunes at catchTrialNoteMaxRunes.
+func sanitizeCatchTrialText(s string) string {
+	redacted, _ := redaction.RedactDefault([]byte(s))
+	return truncateRunes(string(redacted), catchTrialNoteMaxRunes)
+}
+
+// truncateRunes returns s when it has at most maxRunes runes; otherwise the
+// first runes of s followed by catchTrialTruncationMarker, maxRunes runes in
+// all. It cuts on rune boundaries (invalid UTF-8 is first replaced with
+// U+FFFD), so the result is always valid UTF-8.
+func truncateRunes(s string, maxRunes int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	keep := maxRunes - utf8.RuneCountInString(catchTrialTruncationMarker)
+	if keep < 0 {
+		keep = 0
+	}
+	return string([]rune(s)[:keep]) + catchTrialTruncationMarker
 }
 
 // readExistingCatchRateEvidence returns nil for an absent file and an error
@@ -272,31 +436,62 @@ func decodeCatchRateEvidence(raw []byte) (*CatchRateEvidence, error) {
 	return &rec, nil
 }
 
-func writeCatchRateEvidence(path string, rec CatchRateEvidence) error {
-	b, err := json.MarshalIndent(rec, "", "  ")
+// writeCatchRateEvidencePair writes the record and its trial sidecar: both are
+// marshalled and staged to temp files in the evidence directory first, then
+// the sidecar is renamed into place, then the record. A failure before the
+// first rename leaves both paths untouched; a crash between the renames leaves
+// a new sidecar beside the OLD record, whose recorded_at and fingerprint it
+// does not match, so CheckCatchRateEvidence refuses the pair (mode 15) — the
+// fail-closed direction.
+func writeCatchRateEvidencePair(path string, rec CatchRateEvidence, trials CatchRateTrials) error {
+	wrap := func(err error) error { return fmt.Errorf("agenteval: write catch-rate evidence: %w", err) }
+	recBytes, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("agenteval: marshal catch-rate evidence: %w", err)
 	}
-	b = append(b, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".catchrate-evidence-*.json")
+	trialBytes, err := json.MarshalIndent(trials, "", "  ")
 	if err != nil {
-		return fmt.Errorf("agenteval: write catch-rate evidence: %w", err)
+		return fmt.Errorf("agenteval: marshal catch-rate trial sidecar: %w", err)
 	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("agenteval: write catch-rate evidence: %w", err)
+	trialsTmp, err := stageCatchRateFile(filepath.Dir(path), ".catchrate-trials-*.json", append(trialBytes, '\n'))
+	if err != nil {
+		return wrap(err)
 	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("agenteval: write catch-rate evidence: %w", err)
+	recTmp, err := stageCatchRateFile(filepath.Dir(path), ".catchrate-evidence-*.json", append(recBytes, '\n'))
+	if err != nil {
+		_ = os.Remove(trialsTmp)
+		return wrap(err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("agenteval: write catch-rate evidence: %w", err)
+	if err := os.Rename(trialsTmp, CatchRateTrialsPath(path)); err != nil {
+		_ = os.Remove(trialsTmp)
+		_ = os.Remove(recTmp)
+		return wrap(err)
+	}
+	if err := os.Rename(recTmp, path); err != nil {
+		_ = os.Remove(recTmp)
+		return wrap(err)
 	}
 	return nil
+}
+
+// stageCatchRateFile writes b to a new temp file in dir and returns its name;
+// on any failure it removes the temp file.
+func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
+	tmp, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 // CheckCatchRateEvidence is the offline gate: it decides from the committed
@@ -319,6 +514,22 @@ func writeCatchRateEvidence(path string, rec CatchRateEvidence) error {
 //	     regression of either arm against it
 //	(11) an unavailable corpus
 //	(12) an unavailable conventions fixture
+//
+// and then, only once the record itself passes every mode above, on its trial
+// sidecar (CatchRateTrialsPath):
+//
+//	(13) an absent sidecar
+//	(14) a malformed sidecar: malformed JSON, an unknown field, trailing
+//	     content, or a wrong schema
+//	(15) a sidecar prompt_fingerprint or recorded_at differing from the
+//	     record's — a sidecar from another recording
+//	(16) per arm, a sidecar case set differing from the record's; per arm and
+//	     case, a trial list whose length differs from the recorded trials,
+//	     whose trial indices are not exactly 1..n, or whose outcome tallies
+//	     differ from the recorded caught / undecodable counts (an outcome
+//	     outside caught|missed|undecodable is a tally mismatch)
+//
+// The success report names the sidecar path.
 func CheckCatchRateEvidence(evidencePath, corpusDir, conventionsPath, generatorModel string) (string, error) {
 	fail := func(format string, args ...any) (string, error) {
 		return "", fmt.Errorf("agenteval: catch-rate evidence %q: "+format+"; see %s", append(append([]any{evidencePath}, args...), catchRateRunbook)...)
@@ -371,7 +582,102 @@ func CheckCatchRateEvidence(evidencePath, corpusDir, conventionsPath, generatorM
 	if err != nil {
 		return report, fmt.Errorf("agenteval: catch-rate evidence %q: %w; see %s", evidencePath, err, catchRateRunbook)
 	}
+	trialsPath := CatchRateTrialsPath(evidencePath)
+	if err := checkCatchRateTrials(trialsPath, rec); err != nil {
+		return fail("trial sidecar %q: %v", trialsPath, err) // (13)-(16)
+	}
+	report += fmt.Sprintf("\nTrial sidecar: %s (per-trial concern notes; a missed trial's concerns carry near_miss tags)\n", trialsPath)
 	return report, nil
+}
+
+// checkCatchRateTrials is modes (13)-(16): the sidecar exists, decodes
+// strictly under its schema, belongs to this recording, and agrees with the
+// record's counts. Each mode-16 sub-check is independent of the others on
+// its own fixture: the case set is compared first (an extra sidecar case
+// fails only it — the later checks walk the RECORD's cases), the indices are
+// checked against the list's own length (a dropped trial fails only the
+// length check) and the tallies count all three outcomes against the list's
+// own length (a duplicated index fails only the index check).
+func checkCatchRateTrials(path string, rec *CatchRateEvidence) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("absent: every recording writes the trial sidecar with the record — commit both files (git add evidence.json evidence.trials.json)") // (13)
+		}
+		return fmt.Errorf("read: %w", err)
+	}
+	var trials CatchRateTrials
+	if err := decodeStrictJSON(raw, &trials); err != nil {
+		return fmt.Errorf("malformed JSON, unknown field or trailing content: %w", err) // (14)
+	}
+	if trials.Schema != CatchRateTrialsSchema {
+		return fmt.Errorf("schema %q is not %q", trials.Schema, CatchRateTrialsSchema) // (14)
+	}
+	if trials.PromptFingerprint != rec.PromptFingerprint {
+		return fmt.Errorf("prompt_fingerprint %s differs from the record's %s: the sidecar is from another recording", trials.PromptFingerprint, rec.PromptFingerprint) // (15)
+	}
+	if trials.RecordedAt != rec.RecordedAt {
+		return fmt.Errorf("recorded_at %q differs from the record's %q: the sidecar is from another recording", trials.RecordedAt, rec.RecordedAt) // (15)
+	}
+	for _, a := range []struct {
+		arm    string
+		counts map[string]CaseCatchCounts
+		trials map[string][]CatchRateTrialRecord
+	}{
+		{ArmWithoutConventions, rec.Arms.WithoutConventions.PerCase, trials.Arms.WithoutConventions.PerCase},
+		{ArmWithConventions, rec.Arms.WithConventions.PerCase, trials.Arms.WithConventions.PerCase},
+	} {
+		if !sameTrialCaseSet(a.counts, a.trials) {
+			return fmt.Errorf("arm %q case set %v differs from the record's %v", a.arm, sortedTrialCaseNames(a.trials), sortedCaseNames(a.counts)) // (16) case set
+		}
+		for _, name := range sortedCaseNames(a.counts) {
+			counts, list := a.counts[name], a.trials[name]
+			if len(list) != counts.Trials {
+				return fmt.Errorf("arm %q case %q lists %d trials, the record %d", a.arm, name, len(list), counts.Trials) // (16) length
+			}
+			for i, tr := range list {
+				if tr.Trial != i+1 {
+					return fmt.Errorf("arm %q case %q entry %d has trial index %d, want %d (indices must be exactly 1..%d in order)", a.arm, name, i, tr.Trial, i+1, len(list)) // (16) indices
+				}
+			}
+			var caught, missed, undecodable int
+			for _, tr := range list {
+				switch tr.Outcome {
+				case CatchCaught:
+					caught++
+				case CatchMissed:
+					missed++
+				case CatchUndecodable:
+					undecodable++
+				}
+			}
+			if caught != counts.Caught || undecodable != counts.Undecodable || caught+missed+undecodable != len(list) {
+				return fmt.Errorf("arm %q case %q outcome tallies (caught %d, missed %d, undecodable %d, of %d) differ from the record (caught %d, undecodable %d)", a.arm, name, caught, missed, undecodable, len(list), counts.Caught, counts.Undecodable) // (16) tallies
+			}
+		}
+	}
+	return nil
+}
+
+func sameTrialCaseSet(counts map[string]CaseCatchCounts, trials map[string][]CatchRateTrialRecord) bool {
+	if len(counts) != len(trials) {
+		return false
+	}
+	for name := range trials {
+		if _, ok := counts[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedTrialCaseNames(m map[string][]CatchRateTrialRecord) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // validateEvidenceArms is the count-invariant check (mode 6), in an order that

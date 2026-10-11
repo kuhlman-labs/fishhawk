@@ -89,6 +89,10 @@
     "instead of an observable",
     "instead of the observable"
   ],
+  "attribution_phrases": [
+    "approach step 2",
+    "was written"
+  ],
   "catching_examples": [
     {
       "severity": "medium",
@@ -98,7 +102,7 @@
     {
       "severity": "medium",
       "category": "independence",
-      "note": "One criterion restates the approach (the step-2 struct field exists); it should assert the response the issue asks for."
+      "note": "One criterion restates the approach (the step-2 struct field was written); it should assert the response the issue asks for."
     }
   ],
   "non_catching_examples": [
@@ -131,6 +135,11 @@
       "severity": "low",
       "category": "coverage",
       "note": "Test that toWidgetResponse populates ArchivedAt for the list endpoint too."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "ac-step-two-done could cite the widgetResponse type by its file path."
     }
   ]
 }
