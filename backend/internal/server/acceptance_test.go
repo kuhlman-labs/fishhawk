@@ -4561,6 +4561,114 @@ func TestAcceptanceCriteriaTally_CountsUndecidable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// E72.63 / #4095: undecidable_causes on acceptance_outcome_recorded.
+// ---------------------------------------------------------------------------
+
+// acceptance4094DBReason is one VERBATIM undecidable_reason from the #4094 run
+// (82487694, acceptance artifact bc3d7587): a pgtest-backed check the
+// acceptance sandbox could not reach.
+const acceptance4094DBReason = "Both named dedup tests need pgtest Postgres, which the sandbox cannot reach. The live preview has no alert sources configured, so it cannot file or dedup an alert. No evidence either way."
+
+// TestShipAcceptance_UndecidableCauses_SandboxDeniedDB crosses the wire →
+// validate → ingest → audit seam and READS BACK the persisted
+// acceptance_outcome_recorded payload. Of four rows, only A (undecidable, a
+// #4094 database reason) is classified: B is undecidable for an unrelated
+// cause, C is skipped with an expectation_basis that names pgtest and the
+// sandbox (a skipped row is never classified), D passed. The verdict,
+// criteria_undecidable and verdict_reported are exactly what they would be
+// without the key, which is the descriptive-only claim.
+func TestShipAcceptance_UndecidableCauses_SandboxDeniedDB(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "A", Result: acceptanceResultUndecidable, UndecidableReason: rawReason(acceptance4094DBReason)},
+		acceptanceCriterionResult{ID: "B", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("the observation does not distinguish the outcomes")},
+		acceptanceCriterionResult{ID: "C", Result: acceptanceResultSkipped, ExpectationBasis: "pgtest Postgres is unreachable in the sandbox"},
+		acceptanceCriterionResult{ID: "D", Result: acceptanceResultPassed},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+
+	want := map[string]any{plan.UndecidableCauseSandboxDeniedDB: []any{"A"}}
+	if got := payload[plan.UndecidableCausesKey]; !reflect.DeepEqual(got, want) {
+		t.Errorf("%s = %#v, want %#v (only the undecidable database row is classified)", plan.UndecidableCausesKey, got, want)
+	}
+	if got := payload["verdict"]; got != acceptanceVerdictUndecidable {
+		t.Errorf("verdict = %v, want undecidable (classification must not change the verdict)", got)
+	}
+	if got := payload["criteria_undecidable"]; got != float64(2) {
+		t.Errorf("criteria_undecidable = %v, want 2 (classification must not change the tally)", got)
+	}
+	if got := payload["verdict_reported"]; got != acceptanceVerdictPassed {
+		t.Errorf("verdict_reported = %v, want passed (the shipped verdict, preserved as evidence)", got)
+	}
+}
+
+// TestShipAcceptance_UndecidableCauses_OmittedWhenUnclassified asserts the key
+// is ABSENT (presence, not emptiness) when no undecidable row is classified, so
+// an unaffected outcome marshals byte-identically to before.
+func TestShipAcceptance_UndecidableCauses_OmittedWhenUnclassified(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedValidatedHead(au, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	body := acceptanceVerdictBytes(t, "passed", "",
+		acceptanceCriterionResult{ID: "B", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("the observation does not distinguish the outcomes")},
+	)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got, present := payload[plan.UndecidableCausesKey]; present {
+		t.Errorf("%s present (= %#v) on an outcome with no classified row; want the key absent", plan.UndecidableCausesKey, got)
+	}
+	// Fixture sanity: the row WAS undecidable, so the absence is the
+	// classifier's answer, not an empty row set.
+	if got := payload["criteria_undecidable"]; got != float64(1) {
+		t.Errorf("criteria_undecidable = %v, want 1", got)
+	}
+}
+
+// TestAcceptanceUndecidableCauses_OnlyUndecidableRows isolates the helper's
+// result guard. Through the handler that guard is MASKED: validate() rejects
+// an undecidable_reason on any non-undecidable row, so such a row never
+// reaches the helper. Here the bad state is seeded BY CONSTRUCTION — skipped,
+// passed and failed rows carrying a database reason — so the guard is the only
+// thing keeping them out. A malformed (non-string) reason classifies as
+// nothing, and ids keep row order.
+func TestAcceptanceUndecidableCauses_OnlyUndecidableRows(t *testing.T) {
+	db := rawReason(acceptance4094DBReason)
+	got := acceptanceUndecidableCauses([]acceptanceCriterionResult{
+		{ID: "u1", Result: acceptanceResultUndecidable, UndecidableReason: db},
+		{ID: "s1", Result: acceptanceResultSkipped, UndecidableReason: db},
+		{ID: "p1", Result: acceptanceResultPassed, UndecidableReason: db},
+		{ID: "f1", Result: acceptanceResultFailed, UndecidableReason: db},
+		{ID: "u2", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("no seam")},
+		{ID: "u3", Result: acceptanceResultUndecidable, UndecidableReason: json.RawMessage(`123`)},
+		{ID: "u4", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("sandbox_denied_db: could not run TestX")},
+	})
+	want := map[string][]string{plan.UndecidableCauseSandboxDeniedDB: {"u1", "u4"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("acceptanceUndecidableCauses = %#v, want %#v", got, want)
+	}
+
+	for name, rows := range map[string][]acceptanceCriterionResult{
+		"no rows":      nil,
+		"unclassified": {{ID: "u2", Result: acceptanceResultUndecidable, UndecidableReason: rawReason("no seam")}},
+	} {
+		if got := acceptanceUndecidableCauses(rows); got != nil {
+			t.Errorf("%s: acceptanceUndecidableCauses = %#v, want nil", name, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // E72.4 / #3328: replayed-scenario rows, the shared replay golden, attribution.
 // ---------------------------------------------------------------------------
 
