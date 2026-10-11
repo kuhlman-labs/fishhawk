@@ -920,6 +920,14 @@ func TestConstraintKindNames(t *testing.T) {
 	if got := (Constraint{ForbiddenPaths: []string{"a"}}).postHocKindName(); got != "forbidden_paths" {
 		t.Errorf("postHocKindName = %q, want forbidden_paths", got)
 	}
+	// agent_instruction_paths (E80.12 / #3942) is the LAST post-hoc case and
+	// pointer-detected, so an `{enforce: false}` opt-out still names it.
+	if got := (Constraint{AgentInstructionPaths: &AgentInstructionPathsConstraint{Enforce: &fls}}).postHocKindName(); got != "agent_instruction_paths" {
+		t.Errorf("postHocKindName = %q, want agent_instruction_paths", got)
+	}
+	if got := (Constraint{DiffCoverage: &DiffCoverageConstraint{}, AgentInstructionPaths: &AgentInstructionPathsConstraint{}}).postHocKindName(); got != "diff_coverage" {
+		t.Errorf("postHocKindName = %q, want diff_coverage ahead of agent_instruction_paths in declaration order", got)
+	}
 }
 
 // --- escalations: the SCHEMA-level rejections (E53.4 / #2227) --------------

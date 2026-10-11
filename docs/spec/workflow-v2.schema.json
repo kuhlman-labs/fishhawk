@@ -777,7 +777,7 @@
     },
     "constraint": {
       "type": "object",
-      "description": "A stage's constraints, as ONE object keyed by constraint kind (E52.6 / #2218). v0 and v1 spell this as a LIST of single-kind objects, each pinned to exactly one key by maxProperties:1; v2 drops maxProperties because an object's keys are naturally unique, so one object states every kind the stage declares and the exactly-one-kind-per-entry rule is gone. minProperties:1 stays, so `constraints: {}` is rejected as a no-op. The v2 object normalizes at parse time to a ONE-ELEMENT list of the legacy representation \u2014 it denotes exactly one constraint value \u2014 so no constraint consumer changed and v0/v1 documents are never re-resolved. Two families: the post-hoc diff constraints (max_files_changed, forbidden_paths, allowed_paths, required_outcomes, diff_coverage) evaluated against a stage's produced diff \u2014 closed set per MVP_SPEC \u00a74.1, valid on a non-deploy stage that ACTUALLY PRODUCES A DIFF \u2014 and the PRE-FLIGHT deploy constraints (allowed_environments, change_freeze, required_upstream; ADR-038 / #925) evaluated BEFORE a delegating deploy stage executes. ADR-038 makes the post-hoc diff constraints meaningless for a delegating deploy and the pre-flight kinds meaningless off a deploy stage; the type<->constraint binding is still enforced semantically by the validator, which reports a v2 violation at /constraints/<kind> rather than at a list index that names nothing the author wrote. AT V2 THE POST-HOC FAMILY ALSO BINDS TO THE PRODUCED-ARTIFACT SET, NOT THE STAGE TYPE NAME (E52.7 / #2219): a stage carrying one of these kinds must declare produces: [{artifact: pull_request}], because the stage types are general (plan/implement/review read as propose/apply/gate, ADR-067 §2) and a workflow on those types may produce no diff at all — a diff constraint there can never be evaluated. An ABSENT or empty produces list reads as 'produces no diff', so omitting produces does not exempt a stage. CONTRAST WITH v0/v1: there the binding stays type-keyed (valid on any non-deploy stage), because v0/v1 documents legitimately declare these constraints on a stage with no produces list; the generalization is licensed only from v2 forward. The violation names the constraint kind and both fixes: declare the artifact, or remove the constraint.",
+      "description": "A stage's constraints, as ONE object keyed by constraint kind (E52.6 / #2218). v0 and v1 spell this as a LIST of single-kind objects, each pinned to exactly one key by maxProperties:1; v2 drops maxProperties because an object's keys are naturally unique, so one object states every kind the stage declares and the exactly-one-kind-per-entry rule is gone. minProperties:1 stays, so `constraints: {}` is rejected as a no-op. The v2 object normalizes at parse time to a ONE-ELEMENT list of the legacy representation \u2014 it denotes exactly one constraint value \u2014 so no constraint consumer changed and v0/v1 documents are never re-resolved. Two families: the post-hoc diff constraints (max_files_changed, forbidden_paths, allowed_paths, required_outcomes, diff_coverage, agent_instruction_paths) evaluated against a stage's produced diff \u2014 closed set per MVP_SPEC \u00a74.1, valid on a non-deploy stage that ACTUALLY PRODUCES A DIFF \u2014 and the PRE-FLIGHT deploy constraints (allowed_environments, change_freeze, required_upstream; ADR-038 / #925) evaluated BEFORE a delegating deploy stage executes. ADR-038 makes the post-hoc diff constraints meaningless for a delegating deploy and the pre-flight kinds meaningless off a deploy stage; the type<->constraint binding is still enforced semantically by the validator, which reports a v2 violation at /constraints/<kind> rather than at a list index that names nothing the author wrote. AT V2 THE POST-HOC FAMILY ALSO BINDS TO THE PRODUCED-ARTIFACT SET, NOT THE STAGE TYPE NAME (E52.7 / #2219): a stage carrying one of these kinds must declare produces: [{artifact: pull_request}], because the stage types are general (plan/implement/review read as propose/apply/gate, ADR-067 §2) and a workflow on those types may produce no diff at all — a diff constraint there can never be evaluated. An ABSENT or empty produces list reads as 'produces no diff', so omitting produces does not exempt a stage. CONTRAST WITH v0/v1: there the binding stays type-keyed (valid on any non-deploy stage), because v0/v1 documents legitimately declare these constraints on a stage with no produces list; the generalization is licensed only from v2 forward. The violation names the constraint kind and both fixes: declare the artifact, or remove the constraint.",
       "additionalProperties": false,
       "minProperties": 1,
       "properties": {
@@ -855,6 +855,40 @@
               "type": "string",
               "minLength": 1,
               "description": "Git ref the stage's diff is taken against, three-dot (merge-base) semantics. Omitted means the run's base branch, resolved by the RUNNER at measurement time (--base-branch > GITHUB_REF_NAME > \"main\"); an empty ref never reaches git — an unresolvable default is reported as a measurement failure with a named reason."
+            }
+          }
+        },
+        "agent_instruction_paths": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "description": "POST-HOC diff constraint (E80.12 / #3942): the per-stage OPT-OUT from the built-in agent-instruction-path constraint. The built-in is ON for every implement stage at every major whether or not this key is declared: it forbids the stage's diff from writing an agent-instruction path, i.e. a file named AGENTS.md, AGENTS.override.md, CLAUDE.md or CLAUDE.local.md at any depth, or any path under a .agents, .claude or .codex directory component, all matched case-insensitively (backend/internal/agentpaths, the same definition the review sandbox skips). This key only RELAXES it, in exactly one of two forms: `enforce: false` turns the built-in off for the stage, and `writable` exempts EXACT, case-sensitive repo-relative paths. The two forms are mutually exclusive. Valid on an implement stage only (and, like every post-hoc kind at v2, on a stage that produces pull_request); each writable entry must be a canonical repo-relative path that is itself an agent-instruction path. Those two rules are enforced by the backend's semantic validator. Declared only by workflow-v2: a v0/v1 document cannot opt out. The built-in applies only when the run's cached spec resolves.",
+          "not": {
+            "required": [
+              "enforce",
+              "writable"
+            ],
+            "properties": {
+              "enforce": {
+                "const": false
+              }
+            }
+          },
+          "properties": {
+            "enforce": {
+              "type": "boolean",
+              "description": "`false` turns the built-in agent-instruction-path constraint off for this stage. `true` restates the default. Cannot be `false` together with `writable`."
+            },
+            "writable": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^/*?\\[\\]{}!][^*?\\[\\]{}!]*$"
+              },
+              "description": "EXACT, case-sensitive repo-relative paths this stage may write although they are agent-instruction paths (e.g. `AGENTS.md` for the root file only). No globs: the pattern rejects the metacharacters * ? [ ] { } ! and a leading `/`; the semantic validator additionally requires each entry to be clean (no `./`, no `..`) and itself an agent-instruction path, so an exemption never reaches past the class it relaxes."
             }
           }
         },

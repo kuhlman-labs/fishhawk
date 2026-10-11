@@ -22,6 +22,7 @@ package spec
 
 import (
 	"encoding/json"
+	"sort"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -1309,8 +1310,11 @@ func IssueEchoPolicyFor(wf Workflow, kind ArtifactKind) IssueEchoPolicy {
 // Two families:
 //
 //   - Post-hoc diff constraints (max_files_changed, forbidden_paths,
-//     allowed_paths, required_outcomes) — evaluated against a stage's
-//     produced diff. The v0 closed set. Valid on a non-deploy stage that
+//     allowed_paths, required_outcomes, diff_coverage,
+//     agent_instruction_paths) — evaluated against a stage's
+//     produced diff. The v0 closed set, plus diff_coverage (v1.6) and the
+//     v2-only agent_instruction_paths opt-out, which Validate further binds
+//     to an implement stage. Valid on a non-deploy stage that
 //     actually PRODUCES a diff: at major >= 2 the binding is keyed on the
 //     stage's produced-artifact set (Stage.producesDiff, E52.7 / #2219), so a
 //     stage declaring no pull_request artifact cannot carry one. Below major 2
@@ -1337,6 +1341,16 @@ type Constraint struct {
 	// (ADR-059 / #1888) — a post-hoc diff kind like the four above, so it
 	// is rejected on a deploy stage by the same isPostHoc binding.
 	DiffCoverage *DiffCoverageConstraint `json:"diff_coverage,omitempty" yaml:"diff_coverage,omitempty"`
+	// AgentInstructionPaths is the workflow-v2 per-stage OPT-OUT from the
+	// built-in agent-instruction-path constraint (E80.12 / #3942). The
+	// built-in is ON for every implement stage at every major whether or not
+	// this key is declared; the key only relaxes it, and Stage.
+	// AgentInstructionPathsRule is the one place that resolves the default.
+	// It is a post-hoc diff kind, so the isPostHoc bindings reject it on a
+	// deploy stage and, at v2, on a stage producing no pull_request; Validate
+	// additionally binds it to an implement stage. v0/v1 schemas do not
+	// declare it, so a v0/v1 document cannot opt out.
+	AgentInstructionPaths *AgentInstructionPathsConstraint `json:"agent_instruction_paths,omitempty" yaml:"agent_instruction_paths,omitempty"`
 	// Pre-flight deploy constraint kinds (ADR-038 / #925). See the type
 	// doc; ChangeFreeze is *bool for presence detection.
 	AllowedEnvironments []string `json:"allowed_environments,omitempty" yaml:"allowed_environments,omitempty"`
@@ -1367,6 +1381,61 @@ type DiffCoverageConstraint struct {
 	BaseRef            string `json:"base_ref,omitempty" yaml:"base_ref,omitempty"`
 }
 
+// AgentInstructionPathsConstraint declares a stage's relaxation of the
+// built-in agent-instruction-path constraint (E80.12 / #3942). The two forms
+// are mutually exclusive (the schema's `not` clause rejects both together):
+//
+//   - Enforce false turns the built-in off for the stage.
+//   - Writable lists EXACT, case-sensitive repo-relative paths the stage may
+//     write even though they are agent-instruction paths. No glob: each
+//     entry must be clean, relative, `..`-free and itself an
+//     agentpaths.IsInstructionPath match (validate.go), so an exemption can
+//     never widen past the class it relaxes.
+//
+// Enforce is a *bool for presence detection, mirroring ChangeFreeze:
+// `{enforce: false}` must read as declared-and-false, not as absent.
+type AgentInstructionPathsConstraint struct {
+	Enforce  *bool    `json:"enforce,omitempty" yaml:"enforce,omitempty"`
+	Writable []string `json:"writable,omitempty" yaml:"writable,omitempty"`
+}
+
+// AgentInstructionPathsRule is the ONE resolution of the built-in
+// agent-instruction-path constraint's default (E80.12 / #3942): an implement
+// stage is enforced unless it opts out. It returns enforced false for a
+// non-implement stage and for an implement stage where any constraint entry
+// declares enforce: false. Otherwise it returns enforced true together with
+// the sorted, de-duplicated union of every entry's writable exemptions (nil
+// when none is declared).
+//
+// Every consumer (the post-implement policy gate, the plan-gate scope
+// precheck, permdrift) reads this method rather than re-deriving the default,
+// so the three cannot disagree about which stages carry the built-in. The
+// rule is major-agnostic: v0/v1 stages are implement-enforced too, and only
+// v2 can declare the key that relaxes it.
+func (s Stage) AgentInstructionPathsRule() (enforced bool, writable []string) {
+	if s.Type != StageTypeImplement {
+		return false, nil
+	}
+	seen := map[string]bool{}
+	for _, c := range s.Constraints {
+		aip := c.AgentInstructionPaths
+		if aip == nil {
+			continue
+		}
+		if aip.Enforce != nil && !*aip.Enforce {
+			return false, nil
+		}
+		for _, w := range aip.Writable {
+			if !seen[w] {
+				seen[w] = true
+				writable = append(writable, w)
+			}
+		}
+	}
+	sort.Strings(writable)
+	return true, writable
+}
+
 // isPreflight reports whether the constraint is one of the pre-flight
 // deploy kinds (allowed_environments, change_freeze, required_upstream).
 // change_freeze presence is detected via the pointer (ChangeFreeze !=
@@ -1377,13 +1446,15 @@ func (c Constraint) isPreflight() bool {
 
 // isPostHoc reports whether the constraint is one of the post-hoc diff
 // kinds (max_files_changed, forbidden_paths, allowed_paths,
-// required_outcomes, diff_coverage). diff_coverage presence is detected
-// via the pointer, so a `{diff_coverage: {...}}` entry on a deploy stage
-// is rejected by the same binding as its four siblings (#1888).
+// required_outcomes, diff_coverage, agent_instruction_paths). diff_coverage
+// and agent_instruction_paths presence is detected via the pointer, so a
+// `{diff_coverage: {...}}` entry on a deploy stage is rejected by the same
+// binding as its four siblings (#1888), and so is an agent_instruction_paths
+// opt-out (E80.12 / #3942).
 func (c Constraint) isPostHoc() bool {
 	return c.MaxFilesChanged != 0 || len(c.ForbiddenPaths) > 0 ||
 		len(c.AllowedPaths) > 0 || len(c.RequiredOutcomes) > 0 ||
-		c.DiffCoverage != nil
+		c.DiffCoverage != nil || c.AgentInstructionPaths != nil
 }
 
 // preflightKindName names the first pre-flight kind this Constraint sets, in
@@ -1445,6 +1516,8 @@ func (c Constraint) postHocKindName() string {
 		return "required_outcomes"
 	case c.DiffCoverage != nil:
 		return "diff_coverage"
+	case c.AgentInstructionPaths != nil:
+		return "agent_instruction_paths"
 	}
 	return ""
 }
