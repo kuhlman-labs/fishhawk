@@ -3979,7 +3979,235 @@ func TestPullRequestFailed_UnknownKindRecordsNoCheckpoint(t *testing.T) {
 				t.Errorf("an unrecognized resume_kind %q must arm no push-kind checkpoint either, got %+v",
 					kind, cps)
 			}
+			if cps := entriesByCategory(entries, CategoryVerifyResumeCheckpoint); len(cps) != 0 {
+				t.Errorf("an unrecognized resume_kind %q must arm no reverify checkpoint either, got %+v",
+					kind, cps)
+			}
 		})
+	}
+}
+
+// reverifyFailureReport is the decoded shared golden
+// testdata/wire/reverify_failure_report.json (E83.80 / #4190): the exact
+// failure body the runner's upload.ShipPullRequest marshals for a standalone
+// open-PR stage whose committed verify gate failed category C. The runner's
+// upload test asserts its marshalled body equals the SAME file.
+type reverifyFailureReport struct {
+	Outcome    string `json:"outcome"`
+	Category   string `json:"category"`
+	Reason     string `json:"reason"`
+	Branch     string `json:"branch"`
+	HeadSHA    string `json:"head_sha"`
+	BaseSHA    string `json:"base_sha"`
+	ResumeKind string `json:"resume_kind"`
+}
+
+// reverifyFailureReportFixture reads the shared golden and fails closed on a
+// read error, a decode error, or any missing coordinate (which would make
+// every assertion below vacuous).
+func reverifyFailureReportFixture(t *testing.T) ([]byte, reverifyFailureReport) {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "testdata", "wire", "reverify_failure_report.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared reverify failure-report fixture %s: %v", path, err)
+	}
+	raw := bytes.TrimSpace(b)
+	var rep reverifyFailureReport
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&rep); err != nil {
+		t.Fatalf("decode shared reverify failure-report fixture: %v", err)
+	}
+	if rep.Outcome != "failed" || rep.Category != "C" || rep.ResumeKind != resumeKindReverify ||
+		rep.Branch == "" || rep.HeadSHA == "" || rep.BaseSHA == "" || rep.Reason == "" {
+		t.Fatalf("shared reverify fixture is not a complete reverify report: %+v", rep)
+	}
+	return raw, rep
+}
+
+// reverifyCarrier decodes a verify_resume_checkpoint row's payload, keeping the
+// raw checkpoint object so a key's ABSENCE is observable.
+type reverifyCarrier struct {
+	ResumeKind     string                     `json:"resume_kind"`
+	PushCheckpoint map[string]json.RawMessage `json:"push_checkpoint"`
+}
+
+func decodeReverifyCarrier(t *testing.T, payload []byte) reverifyCarrier {
+	t.Helper()
+	var c reverifyCarrier
+	if err := json.Unmarshal(payload, &c); err != nil {
+		t.Fatalf("decode verify_resume_checkpoint payload: %v", err)
+	}
+	return c
+}
+
+func checkpointString(t *testing.T, cp map[string]json.RawMessage, key string) string {
+	t.Helper()
+	var v string
+	if raw, ok := cp[key]; ok {
+		if err := json.Unmarshal(raw, &v); err != nil {
+			t.Fatalf("decode checkpoint %s: %v", key, err)
+		}
+	}
+	return v
+}
+
+// TestShipPullRequest_FailedReverifyRecordsVerifyResumeCheckpoint posts the
+// SHARED golden through the real /pull-request handler and reads the committed
+// audit rows back. The body's kind is non-empty, so the legacy empty-kind
+// allow-list writes no push_checkpoint; only the reverify case writes the
+// verify_resume_checkpoint row, and it must be in THAT category (not
+// push_resume_checkpoint, which the resolver would serve as a push kind).
+func TestShipPullRequest_FailedReverifyRecordsVerifyResumeCheckpoint(t *testing.T) {
+	raw, rep := reverifyFailureReportFixture(t)
+	entries := prFailedAllEntries(t, raw)
+
+	failed := entriesByCategory(entries, "pull_request_failed")
+	if len(failed) != 1 {
+		t.Fatalf("want exactly one pull_request_failed entry, got %d", len(failed))
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(failed[0].Payload, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := legacy["push_checkpoint"]; ok {
+		t.Errorf("a reverify report must record NO push_checkpoint on pull_request_failed "+
+			"(a reverted backend would serve it as pr_open), got %s", got)
+	}
+	if cps := entriesByCategory(entries, CategoryPushResumeCheckpoint); len(cps) != 0 {
+		t.Errorf("a reverify report must arm no push-kind checkpoint, got %+v", cps)
+	}
+
+	cps := entriesByCategory(entries, CategoryVerifyResumeCheckpoint)
+	if len(cps) != 1 {
+		t.Fatalf("want exactly one %s entry, got %d (%+v)", CategoryVerifyResumeCheckpoint, len(cps), entries)
+	}
+	carrier := decodeReverifyCarrier(t, cps[0].Payload)
+	if carrier.ResumeKind != resumeKindReverify {
+		t.Errorf("resume_kind = %q, want %q", carrier.ResumeKind, resumeKindReverify)
+	}
+	for key, want := range map[string]string{"branch": rep.Branch, "head_sha": rep.HeadSHA, "base_sha": rep.BaseSHA} {
+		if got := checkpointString(t, carrier.PushCheckpoint, key); got != want {
+			t.Errorf("checkpoint %s = %q, want the reported %q", key, got, want)
+		}
+	}
+	if got, ok := carrier.PushCheckpoint["verified_tree_sha"]; ok {
+		t.Errorf("a reverify checkpoint must record NO verified_tree_sha, got %s", got)
+	}
+	if n := len(entriesByCategory(entries, "verified_tree_discarded")); n != 0 {
+		t.Errorf("a reverify report discards no tree, got %d verified_tree_discarded rows", n)
+	}
+}
+
+// TestShipPullRequest_ReverifyReportDropsSentVerifiedTree: a reverify report
+// that DOES carry a verified_tree_sha still records none — the held tree failed
+// verify, so recording it would let a later verified_tree_discarded row name an
+// unverified tree as verified. The paired push report on the same tree DOES
+// record it, so the drop is kind-specific, not a lost field.
+func TestShipPullRequest_ReverifyReportDropsSentVerifiedTree(t *testing.T) {
+	const tree = "9999999999999999999999999999999999999999"
+	for _, tc := range []struct {
+		kind, category string
+		wantTree       bool
+	}{
+		{resumeKindReverify, CategoryVerifyResumeCheckpoint, false},
+		{resumeKindPush, CategoryPushResumeCheckpoint, true},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			_, rep := reverifyFailureReportFixture(t)
+			body, err := json.Marshal(map[string]any{
+				"outcome": rep.Outcome, "category": rep.Category, "reason": rep.Reason,
+				"branch": rep.Branch, "head_sha": rep.HeadSHA, "base_sha": rep.BaseSHA,
+				"verified_tree_sha": tree, "resume_kind": tc.kind,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cps := entriesByCategory(prFailedAllEntries(t, body), tc.category)
+			if len(cps) != 1 {
+				t.Fatalf("want exactly one %s entry, got %d", tc.category, len(cps))
+			}
+			got := checkpointString(t, decodeReverifyCarrier(t, cps[0].Payload).PushCheckpoint, "verified_tree_sha")
+			if tc.wantTree && got != tree {
+				t.Errorf("a push checkpoint must record the sent tree, got %q", got)
+			}
+			if !tc.wantTree && got != "" {
+				t.Errorf("a reverify checkpoint must record NO verified tree, got %q", got)
+			}
+		})
+	}
+}
+
+// TestReverifyCheckpoint_FailureReportThenPromptServes is the CROSS-BOUNDARY
+// crossing (handler → audit → resolver in ONE Server): a signed POST of the
+// shared golden to /pull-request fails the stage C and records the checkpoint;
+// after the retry walk, a signed GET /prompt advertising reverify-resume is
+// served exactly the reported head/base/branch as kind reverify, with no
+// verified tree.
+func TestReverifyCheckpoint_FailureReportThenPromptServes(t *testing.T) {
+	raw, rep := reverifyFailureReportFixture(t)
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	// stampSequence: the resolver's newest-wins rule compares entry sequences,
+	// which the plain fake leaves zero.
+	au := &auditFake{stampSequence: true}
+
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+	priv, _ := sf.issue(t, runRow.ID)
+
+	if w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, raw, ""); w.Code != http.StatusOK {
+		t.Fatalf("failure report status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStateFailed || got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Fatalf("after the report: state=%q category=%v, want failed C", got.State, got.FailureCategory)
+	}
+
+	// The retry walk an operator's fishhawk_retry_stage + dispatch performs.
+	if _, err := rr.RetryStage(t.Context(), implStage.ID, run.StageStatePending); err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if _, err := rr.TransitionStage(t.Context(), implStage.ID, run.StageStateDispatched, nil); err != nil {
+		t.Fatalf("TransitionStage dispatched: %v", err)
+	}
+
+	pw := promptRequestWithCapabilities(t, s, implStage.ID, priv, capableRunnerCapabilities)
+	if pw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+	}
+	var served promptResponse
+	if err := json.Unmarshal(pw.Body.Bytes(), &served); err != nil {
+		t.Fatal(err)
+	}
+	if !served.OpenPRFromHeldCommit || served.HeldCommitResumeKind != resumeKindReverify ||
+		served.HeldCommitSHA != rep.HeadSHA || served.HeldCommitBaseSHA != rep.BaseSHA ||
+		served.HeldCommitBranch != rep.Branch {
+		t.Fatalf("served held commit = {open:%t kind:%q sha:%q base:%q branch:%q}, want the reported reverify coordinates %+v",
+			served.OpenPRFromHeldCommit, served.HeldCommitResumeKind, served.HeldCommitSHA,
+			served.HeldCommitBaseSHA, served.HeldCommitBranch, rep)
+	}
+	if served.HeldCommitVerifiedTreeSHA != "" {
+		t.Errorf("a reverify resume must serve no verified tree, got %q", served.HeldCommitVerifiedTreeSHA)
 	}
 }
 
