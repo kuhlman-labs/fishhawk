@@ -312,9 +312,11 @@ func (p *Provider) buildResult(ctx context.Context, projectID int, numbers []int
 			URL:         issue.WebURL,
 			NotRunnable: workmgmt.ParseRunnableLabel(issue.Labels),
 		})
+		// Every edge here is read from is_blocked_by issue links — GitLab's
+		// native dependency relation — so each one is tagged native (#4028).
 		for _, dep := range blockedByRefs(projectID, f) {
 			if dep.Local && inSet[dep.Number] {
-				edges = append(edges, workmgmt.DependsEdge{From: f.number, To: dep.Number})
+				edges = append(edges, workmgmt.DependsEdge{From: f.number, To: dep.Number, Source: workmgmt.DependencySourceNative})
 				continue
 			}
 			cls, ok := lookupTargetState(dep, stateCache)
@@ -325,10 +327,10 @@ func (p *Provider) buildResult(ctx context.Context, projectID int, numbers []int
 			}
 			if cls.satisfied {
 				// StateReason is empty: GitLab has no state_reason to carry.
-				satisfied = append(satisfied, workmgmt.SatisfiedEdge{From: f.number, To: dep.Number, State: cls.state})
+				satisfied = append(satisfied, workmgmt.SatisfiedEdge{From: f.number, To: dep.Number, State: cls.state, Source: workmgmt.DependencySourceNative})
 				continue
 			}
-			e := workmgmt.DependsEdge{From: f.number, To: dep.Number, Reason: cls.reason}
+			e := workmgmt.DependsEdge{From: f.number, To: dep.Number, Reason: cls.reason, Source: workmgmt.DependencySourceNative}
 			if !dep.Local {
 				// A cross-project target has no local number: render it by its
 				// own identity (TargetRef), never as issue:<foreign iid>.
