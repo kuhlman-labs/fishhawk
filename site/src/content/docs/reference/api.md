@@ -42,6 +42,15 @@ exactly that commit (409 `merge_candidate_unverified` or
 closed (502 `merge_candidate_check_failed`). Each refusal names the verb that
 clears it; the error-code table in the companion document has the details.
 
+Verify-only passes for a base advance or a conflict resolution are serialized
+per repository base ref (ADR-092): one pass is live per base, and every other
+waits in a held queue without a runner slot until the line frees. While a
+run's pass is held, the merge verb answers 409 `merge_candidate_held` before
+the behind check, naming the run's place in the queue and the run holding the
+line; admission is automatic, so the next step is a status read.
+`GET /v0/runs/{run_id}` and the gate view carry the run's queue entry as
+`merge_candidate_queue` (state, position, the live run and the anchored head).
+
 Review concerns record which reviewer raised them, which the table also does
 not spell out. The concern items on `GET /v0/runs/{run_id}` and the open and
 settled rows of `GET /v0/runs/{run_id}/gate-view` carry `reviewer_role` — a

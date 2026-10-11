@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -222,4 +224,60 @@ func TestCancelRun_SweepsRunBranches(t *testing.T) {
 	if row.Trigger != sweepTriggerCancelled || !reflect.DeepEqual(row.Deleted, []string{sweepConsol, sweepSlice0}) {
 		t.Errorf("run_branches_swept = %+v", row)
 	}
+}
+
+// TestCancelRun_ReleasesMergeCandidateQueue pins the ADR-092 cancel hook
+// (#4200) over the REAL queue store, run and audit repositories on one pgtest
+// pool: cancelling a HELD run drops its entry run_cancelled and leaves the live
+// run holding the line (the next held run moves up to position 1); cancelling
+// the LIVE run drops it run_cancelled and admits the next held run, whose pass
+// starts (live, trigger appended) — before the 200. Counterfactual: deleting
+// the releaseMergeCandidateQueueForRun call in handleCancelRun leaves B held
+// and C held behind a cancelled A → RED on both arms.
+func TestCancelRun_ReleasesMergeCandidateQueue(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	c := f.seed("c", "c0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(c, "c0", "c1")
+	if resp := f.rebase(c); resp.MergeCandidateVerifyState != mergeCandidateStateHeld {
+		t.Fatalf("C rebase state = %q, want held", resp.MergeCandidateVerifyState)
+	}
+
+	// Cancel the HELD run: dropped, the line is untouched, C moves up.
+	if w := cancelRun(t, f.srv, b.id); w.Code != http.StatusOK {
+		t.Fatalf("cancel B = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.waitBranchSweeps()
+	f.requireState(b, mergequeue.StateDropped, mergeCandidateQueueReasonRunCancelled)
+	f.requireState(a, mergequeue.StateLive, "")
+	if st, _ := f.srv.mergeCandidateQueueForRun(context.Background(), c.id); st == nil || st.Position != 1 {
+		t.Fatalf("C queue status after B's cancel = %+v, want held at position 1", st)
+	}
+
+	// Cancel the LIVE run: dropped, and C is admitted before the response.
+	if w := cancelRun(t, f.srv, a.id); w.Code != http.StatusOK {
+		t.Fatalf("cancel A = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.waitBranchSweeps()
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonRunCancelled)
+	if e := f.requireState(c, mergequeue.StateLive, ""); e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("C phase after A's cancel = %q, want verifying", e.Phase)
+	}
+	if tr := f.triggers(c); len(tr) != 1 || tr[0].ExpectedHeadSHA != "c1" {
+		t.Fatalf("C triggers = %+v, want one for c1", tr)
+	}
+	settled := f.rows(a, CategoryMergeCandidateQueueSettled)
+	if len(settled) == 0 {
+		t.Fatal("no merge_candidate_queue_settled row for the cancelled live run")
+	}
+
+	// Idempotent: the already-cancelled re-entry settles nothing new.
+	if w := cancelRun(t, f.srv, a.id); w.Code != http.StatusOK {
+		t.Fatalf("re-cancel A = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.waitBranchSweeps()
+	if n := len(f.rows(a, CategoryMergeCandidateQueueSettled)); n != len(settled) {
+		t.Fatalf("settled rows after re-cancel = %d, want %d", n, len(settled))
+	}
+	f.requireState(c, mergequeue.StateLive, "")
 }

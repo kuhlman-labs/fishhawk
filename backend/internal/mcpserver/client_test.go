@@ -4866,3 +4866,50 @@ func TestConcurrencySlot_ClientCrossBoundary(t *testing.T) {
 		t.Fatalf("stale B envelope concurrency = %+v, want an explicit waiter_live false that releases the wait", swB.Concurrency)
 	}
 }
+
+// TestRunMergeCandidateQueue_DecodesIntoRunStatus is approval condition 2 of
+// #4200: a GET /v0/runs/{id} body carrying merge_candidate_queue {state held,
+// position 2, live_run_id, anchored_head_sha} decodes into
+// Run.MergeCandidateQueue AND survives into fishhawk_get_run_status's
+// GetRunStatusOutput (the bound ladder keeps it: the response is far under
+// budget). A body without the key leaves the mirror nil (the older-backend
+// degrade). Counterfactual: a drifted json tag on runMergeCandidateQueue (or
+// the Run field) decodes the block to nil / a zero field → RED.
+func TestRunMergeCandidateQueue_DecodesIntoRunStatus(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	held, bare := uuid.New(), uuid.New()
+	live := uuid.NewString()
+	fb.getRunByID[held] = Run{ID: held.String(), Repo: "x/y", State: "running"}
+	fb.getRunExtraByID[held] = map[string]any{"merge_candidate_queue": map[string]any{
+		"state": "held", "position": 2, "live_run_id": live, "anchored_head_sha": "c1",
+		"repo": "x/y", "base_ref": "main", "enqueued_at": "2026-10-11T01:00:00Z",
+		"note": "held at position 2",
+	}}
+	fb.getRunByID[bare] = Run{ID: bare.String(), Repo: "x/y", State: "running"}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: held.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	q := out.Run.MergeCandidateQueue
+	if q == nil {
+		t.Fatal("GetRunStatusOutput.Run.MergeCandidateQueue = nil; the block did not survive the decode + bound")
+	}
+	if q.State != "held" || q.Position != 2 || q.LiveRunID != live || q.AnchoredHeadSHA != "c1" ||
+		q.BaseRef != "main" || !q.EnqueuedAt.Equal(time.Date(2026, 10, 11, 1, 0, 0, 0, time.UTC)) {
+		t.Errorf("merge_candidate_queue = %+v, want held/2/%s/c1 on main", q, live)
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), `"merge_candidate_queue":{"state":"held"`) {
+		t.Errorf("marshalled get_run_status output does not carry the block:\n%s", raw)
+	}
+
+	_, out, err = r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: bare.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus (no block): %v", err)
+	}
+	if out.Run.MergeCandidateQueue != nil {
+		t.Errorf("merge_candidate_queue = %+v for a body without the key, want nil", out.Run.MergeCandidateQueue)
+	}
+}

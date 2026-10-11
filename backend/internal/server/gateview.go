@@ -143,6 +143,14 @@ type gateViewResponse struct {
 	// cancelled (the merge endpoint refuses those with run_not_mergeable
 	// first). See gateViewMergeReadinessFor.
 	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty"`
+	// MergeCandidateQueue is the run's ACTIVE ADR-092 held-pass queue entry
+	// (E83.85 / #4200) — the same projection GET /v0/runs/{id} carries
+	// (mergeCandidateQueuePayloadFor), so the gate the operator merges from
+	// shows whether the pass is held (and behind whom) or live. Computed only
+	// by handleGetRunGateView. Omitted (nil) when the queue is unwired or the
+	// run has no active entry; omitted with a merge_candidate_queue
+	// history_gaps entry when the store read fails.
+	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
 }
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
@@ -169,6 +177,25 @@ type gateViewMergeBlocker struct {
 // merge-readiness block's audit-chain half (the run's stages or its
 // acceptance re-open / outcome history) could not be read.
 const gateViewGapMergeReadiness = "merge_readiness"
+
+// gateViewGapMergeCandidateQueue names a failed ADR-092 queue read (#4200).
+const gateViewGapMergeCandidateQueue = "merge_candidate_queue"
+
+// gateViewMergeCandidateQueueFor builds the gate view's merge_candidate_queue
+// block: the run-read projection, or nil plus a history_gaps entry when the
+// store read fails, so an unreadable queue is named rather than read as "not
+// queued".
+func (s *Server) gateViewMergeCandidateQueueFor(ctx context.Context, runID uuid.UUID, resp *gateViewResponse) *runMergeCandidateQueuePayload {
+	block, err := s.mergeCandidateQueuePayloadFor(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.Warn("gate view: read merge-candidate queue entry failed; omitting merge_candidate_queue",
+			"run_id", runID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeCandidateQueue)
+		return nil
+	}
+	return block
+}
 
 // gateViewMergeReadinessFor builds the merge_readiness block (#4086) from
 // slice-1's two merge-endpoint helpers. The acceptance half is the
@@ -647,6 +674,7 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// Merge readiness (#4086) HERE and not in buildGateView: the approval half
 	// costs forge reads, and the attention scan calls buildGateView per run.
 	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
+	resp.MergeCandidateQueue = s.gateViewMergeCandidateQueueFor(r.Context(), runID, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

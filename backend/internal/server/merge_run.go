@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -115,7 +116,9 @@ type mergeRunResponse struct {
 //     merge_candidate_verify_failed when a Fishhawk-written head has no
 //     passing merge-candidate verify, and 502 merge_candidate_check_failed on
 //     a forge or audit read error once every anchor resolved. See
-//     mergeCandidateGate for the determinability ladder.
+//     mergeCandidateGate for the determinability ladder. Inside it, BEFORE the
+//     behind check, 409 merge_candidate_held (ADR-092 / #4200) when the run's
+//     pass is HELD in its base's queue (fail-open on a queue read error).
 //   - 409 approval_dismissed (#4086), AFTER the merge-candidate gate and
 //     BEFORE the verdict append: GitHub reports mergeable_state=="blocked", no
 //     reviewer's latest review is APPROVED and one is DISMISSED, so the queued
@@ -641,14 +644,19 @@ func (s *Server) prMergeConflicting(ctx context.Context, runRow *run.Run) (confl
 	return false, ""
 }
 
-// Merge-candidate gate error codes (ADR-090 / E83.33 / #4018). The three 409s
-// are preconditions an operator clears with a named verb; the 502 is a read
-// failure on a fully wired run and is retryable.
+// Merge-candidate gate error codes (ADR-090 / E83.33 / #4018). The three
+// ADR-090 409s are preconditions an operator clears with a named verb; the
+// ADR-092 merge_candidate_held 409 clears on its own (admission is automatic);
+// the 502 is a read failure on a fully wired run and is retryable.
 const (
 	mergeCodeBaseBehind            = "merge_base_behind"
 	mergeCodeCandidateUnverified   = "merge_candidate_unverified"
 	mergeCodeCandidateVerifyFailed = "merge_candidate_verify_failed"
 	mergeCodeCandidateCheckFailed  = "merge_candidate_check_failed"
+	// mergeCodeCandidateHeld (ADR-092 / E83.85 / #4200): the run's
+	// merge-candidate pass is HELD behind its base's live pass. It clears on
+	// its own (admission is automatic), so the next step is a status read.
+	mergeCodeCandidateHeld = "merge_candidate_held"
 )
 
 // Reasons a merge_candidate_check_failed 502 names, carried under the
@@ -705,6 +713,10 @@ func mergeCandidateCheckFailed(reason string, cause error) mergeCandidateGateRes
 //
 //   - a PR the forge reports Merged ADMITS, so the #3622 already-merged resume
 //     still answers 200 already_merged;
+//   - ADR-092 (#4200): a run whose queue entry is HELD → merge_candidate_held
+//     naming its position, the live run and fishhawk_get_run_status, BEFORE
+//     the behind check (mergeCandidateHeldRefusal; a queue read error skips
+//     this arm);
 //   - D1 (universal, Q5): CompareCommits(base=<live PR head>, head=<base ref>)
 //     returning ANY commit means the head does not contain the base tip →
 //     merge_base_behind naming fishhawk_rebase_run_branch;
@@ -748,6 +760,14 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 	if headSHA == "" || baseRef == "" {
 		return mergeCandidateCheckFailed(mergeCandidateCheckForgeRead,
 			errors.New("the forge returned an empty head sha or base ref"))
+	}
+
+	// ADR-092 (E83.85 / #4200): a HELD pass refuses BEFORE the behind check —
+	// a held PR is expected to be behind (the base moves while it waits), and
+	// its admission auto-advances it, so merge_base_behind would name the
+	// wrong verb. A live entry falls through to today's checks.
+	if held := s.mergeCandidateHeldRefusal(ctx, runRow, headSHA, baseRef); held != nil {
+		return *held
 	}
 
 	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, headSHA, baseRef)
@@ -814,6 +834,46 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 	return mergeCandidateGateResult{}
 }
 
+// mergeCandidateHeldRefusal is the gate's ADR-092 held arm: nil unless the
+// run's queue entry is HELD. A queue read error FAILS OPEN with a WARN — the
+// held arm is an ordering refusal, and the ADR-090 checks that follow (behind,
+// verify state) still fail closed on their own, so an unreadable queue can
+// never admit an unverified or behind candidate.
+func (s *Server) mergeCandidateHeldRefusal(ctx context.Context, runRow *run.Run, headSHA, baseRef string) *mergeCandidateGateResult {
+	st, err := s.mergeCandidateQueueForRun(ctx, runRow.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: merge-candidate queue entry unreadable; skipping the held check (the ADR-090 checks still apply)",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
+		return nil
+	}
+	if st == nil || st.Entry.State != mergequeue.StateHeld {
+		return nil
+	}
+	holder, liveRunID := "no run yet (the next queue event admits it)", ""
+	if st.LiveRunID != nil {
+		liveRunID = st.LiveRunID.String()
+		holder = "run " + liveRunID
+	}
+	details := map[string]any{
+		"queue_state":       string(st.Entry.State),
+		"queue_position":    st.Position,
+		"anchored_head_sha": st.Entry.AnchoredHeadSHA,
+		"head_sha":          headSHA,
+		"base_ref":          baseRef,
+		"next_step":         "fishhawk_get_run_status",
+	}
+	if liveRunID != "" {
+		details["live_run_id"] = liveRunID
+	}
+	return &mergeCandidateGateResult{
+		Code: mergeCodeCandidateHeld,
+		Message: fmt.Sprintf("this run's merge-candidate verify pass is HELD at position %d in the %s queue behind %s, which holds the base's line (ADR-092 D1), so the merge is refused. Admission is automatic: when the line frees the queue advances this branch onto %s if it is behind, re-anchors and starts the pass for the resulting head — there is nothing to invoke. Watch merge_candidate_queue with fishhawk_get_run_status; once admitted, dispatch and await the pass, then re-invoke the merge. No merge verdict was recorded.",
+			st.Position, st.Entry.BaseRef, holder, st.Entry.BaseRef),
+		Details: details,
+	}
+}
+
 // writeMergeReadinessRefusal renders a merge-readiness blocker (#4086) as a 409
 // carrying run_id, pr_url and the refusal's details.
 func (s *Server) writeMergeReadinessRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, ref *mergeReadinessRefusal) {
@@ -829,7 +889,8 @@ func (s *Server) writeMergeReadinessRefusal(w http.ResponseWriter, r *http.Reque
 // writeMergeCandidateRefusal renders a refused mergeCandidateGate on the
 // operator merge endpoint: 502 for merge_candidate_check_failed (the raw cause
 // goes to the log and to a non-allow-listed detail key the 5xx redaction
-// drops), 409 for the three preconditions.
+// drops), 409 for the preconditions (the three ADR-090 codes and the ADR-092
+// merge_candidate_held).
 func (s *Server) writeMergeCandidateRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, gate mergeCandidateGateResult) {
 	details := map[string]any{"run_id": runID.String(), "pr_url": prURL}
 	for k, v := range gate.Details {
