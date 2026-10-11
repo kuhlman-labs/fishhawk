@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared fixture for the twin TestRepoSpecForbidsAgentInstructionPaths tests in runner/internal/constraint and backend/internal/policy: ONE source of truth across the two modules (AGENTS.md's cross-module golden rule). `classes` are path lists; `cases` say, per workflow stage, which classes the stage's forbidden_paths must reject and which must stay writable. root_agents_case_variants has exactly one variant per root-level AGENTS.md glob, flipping only that glob's letter, so deleting any one glob fails the tests.",
+  "_comment": "Shared fixture for the twin TestRepoSpecForbidsAgentInstructionPaths tests in runner/internal/constraint and backend/internal/policy: ONE source of truth across the two modules (AGENTS.md's cross-module golden rule). `classes` are path lists; `cases` say, per implement stage, which classes the stage must refuse and which must stay writable, evaluated through the stage's forbidden_paths plus the product's built-in agent_instruction_paths rule (#3942) and its per-stage relaxation. root_agents_case_variants flips one letter of AGENTS.md each: the feature_change writable exemption is exact and case-sensitive, so every variant must stay refused.",
   "classes": {
     "config_dir_paths": [
       ".agents/skills/x/SKILL.md",

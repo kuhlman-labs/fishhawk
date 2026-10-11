@@ -16,12 +16,17 @@ import (
 // twinRepospecPath is the backend module's copy of this test file.
 var twinRepospecPath = filepath.Join("..", "..", "..", "backend", "internal", "policy", "repospec_test.go")
 
-// loadRepoSpecImplementStages returns the forbidden_paths of every `implement`
-// stage in this repository's own .fishhawk/workflows.yaml, keyed
-// "<workflow>.<stage>". It parses the raw YAML (the runner module has no spec
-// loader); the backend twin reads the same file through spec.ParseBytes, so
-// workflow-v2 reuse resolution is covered there.
-func loadRepoSpecImplementStages(t *testing.T) map[string][]string {
+// repoSpecStage is one implement stage as the runner evaluates it: the
+// Constraints its forbidden_paths and agent_instruction_paths declarations
+// decode to, with ApplyImplementDefaults applied (#3942).
+type repoSpecStage = Constraints
+
+// loadRepoSpecImplementStages returns every `implement` stage in this
+// repository's own .fishhawk/workflows.yaml, keyed "<workflow>.<stage>". It
+// parses the raw YAML (the runner module has no spec loader); the backend
+// twin reads the same file through spec.ParseBytes, so workflow-v2 reuse
+// resolution is covered there.
+func loadRepoSpecImplementStages(t *testing.T) map[string]repoSpecStage {
 	t.Helper()
 	p := filepath.Join("..", "..", "..", ".fishhawk", "workflows.yaml")
 	raw, err := os.ReadFile(p)
@@ -34,7 +39,11 @@ func loadRepoSpecImplementStages(t *testing.T) map[string][]string {
 				ID          string `yaml:"id"`
 				Type        string `yaml:"type"`
 				Constraints struct {
-					ForbiddenPaths []string `yaml:"forbidden_paths"`
+					ForbiddenPaths        []string `yaml:"forbidden_paths"`
+					AgentInstructionPaths *struct {
+						Enforce  *bool    `yaml:"enforce"`
+						Writable []string `yaml:"writable"`
+					} `yaml:"agent_instruction_paths"`
 				} `yaml:"constraints"`
 			} `yaml:"stages"`
 		} `yaml:"workflows"`
@@ -42,37 +51,54 @@ func loadRepoSpecImplementStages(t *testing.T) map[string][]string {
 	if err := yaml.Unmarshal(raw, &spec); err != nil {
 		t.Fatalf("parse %s: %v", p, err)
 	}
-	out := map[string][]string{}
+	out := map[string]repoSpecStage{}
 	for wf, w := range spec.Workflows {
 		for _, st := range w.Stages {
-			if st.Type == "implement" {
-				out[wf+"."+st.ID] = st.Constraints.ForbiddenPaths
+			if st.Type != "implement" {
+				continue
 			}
+			c := Constraints{ForbiddenPaths: st.Constraints.ForbiddenPaths}
+			if a := st.Constraints.AgentInstructionPaths; a != nil {
+				c.AgentInstructionPaths = &AgentInstructionPaths{Enforce: a.Enforce, Writable: a.Writable}
+			}
+			ApplyImplementDefaults(st.Type, &c)
+			out[wf+"."+st.ID] = c
 		}
 	}
 	return out
+}
+
+// repoSpecRefusals names what refuses a change to p on st, through this
+// package's Evaluate: forbidden_paths and the built-in
+// agent_instruction_paths check.
+func repoSpecRefusals(st repoSpecStage, p string) []string {
+	return refusingConstraints(Evaluate(diff(p), st))
 }
 
 // BEGIN agent-path fixture loader — byte-identical in
 // runner/internal/constraint/repospec_test.go and
 // backend/internal/policy/repospec_test.go (the modules cannot import each
 // other). TestAgentPathLoaderParity, present in BOTH modules so a scoped
-// verify of either one runs it, fails on any drift. Only
-// loadRepoSpecImplementStages (how each module parses the spec) differs and
-// sits outside this block.
+// verify of either one runs it, fails on any drift. Only how each module
+// parses the spec (loadRepoSpecImplementStages, repoSpecStage) and evaluates
+// one path against a stage (repoSpecRefusals) differs, and sits outside this
+// block.
 
 // TestRepoSpecForbidsAgentInstructionPaths pins that this repository's own
-// implement stages forbid agent-instruction paths at ANY depth and in ANY
-// letter case through this module's forbidden-paths evaluator. Codex
-// discovers .agents/skills at every directory level, Claude Code discovers
-// nested .claude/, and on a case-insensitive filesystem a CLI opening
-// `.agents` resolves to a tracked `.Agents`, so a root-only or exact-case glob
-// is a bypass. Both stages also forbid the auto-loaded instruction files;
-// feature_change leaves exactly ONE writable (the exact ROOT AGENTS.md, which
-// the conventions require updating), routine_change (no human approval)
-// none. The path table and per-stage expectations are data, in the shared
-// fixture testdata/policy/agent-instruction-paths.json; EVERY implement stage
-// in the spec must have a case there.
+// implement stages refuse agent-instruction paths at ANY depth and in ANY
+// letter case. Since #3942 that protection is the product's built-in
+// agent_instruction_paths constraint (on for every implement stage) plus each
+// stage's declared relaxation, not hand-written forbidden_paths globs, so each
+// path is evaluated through this module's own resolution of both: the
+// stage's forbidden_paths AND its built-in rule. Codex discovers
+// .agents/skills at every directory level, Claude Code discovers nested
+// .claude/, and on a case-insensitive filesystem a CLI opening `.agents`
+// resolves to a tracked `.Agents`, so a root-only or exact-case match is a
+// bypass. feature_change relaxes exactly ONE path (the exact ROOT AGENTS.md,
+// which the conventions require updating), routine_change (no human
+// approval) none. The path table and per-stage expectations are data, in the
+// shared fixture testdata/policy/agent-instruction-paths.json; EVERY
+// implement stage in the spec must have a case there.
 func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	stages := loadRepoSpecImplementStages(t)
 	required := make([]string, 0, len(stages))
@@ -82,19 +108,18 @@ func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	for _, tc := range loadAgentPathCases(t, required) {
 		id := tc.Workflow + "." + tc.Stage
 		t.Run(id, func(t *testing.T) {
-			globs := stages[id]
-			if len(globs) == 0 {
-				t.Fatalf("%s has no forbidden_paths: an implement stage must forbid agent-instruction paths", id)
+			st, ok := stages[id]
+			if !ok {
+				t.Fatalf("%s is not an implement stage in the spec", id)
 			}
-			c := Constraints{ForbiddenPaths: globs}
 			for _, p := range tc.MustForbid {
-				if !hasForbiddenViolation(Evaluate(diff(p), c)) {
-					t.Errorf("%s: %q is NOT forbidden (agent-instruction path admitted)", id, p)
+				if len(repoSpecRefusals(st, p)) == 0 {
+					t.Errorf("%s: %q is NOT refused by forbidden_paths or the built-in agent_instruction_paths rule", id, p)
 				}
 			}
 			for _, p := range tc.MustStayWritable {
-				if v := Evaluate(diff(p), c); len(v) != 0 {
-					t.Errorf("%s: %q must stay writable but is forbidden: %v", id, p, v)
+				if r := repoSpecRefusals(st, p); len(r) != 0 {
+					t.Errorf("%s: %q must stay writable but is refused by %v", id, p, r)
 				}
 			}
 		})
@@ -114,8 +139,8 @@ type agentPathCase struct {
 // vacuous or ambiguous: a duplicate JSON key (encoding/json would silently
 // keep the last one), trailing content, an unknown key (a misspelled
 // must_forbid), an unknown or empty class, an empty must_forbid or
-// must_stay_writable, a duplicate case, or a missing case for any id in
-// required (every implement stage in the spec).
+// must_stay_writable, a duplicate case, a case naming no implement stage, or
+// a missing case for any id in required (every implement stage in the spec).
 func loadAgentPathCases(t *testing.T, required []string) []agentPathCase {
 	t.Helper()
 	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-paths.json")
@@ -157,12 +182,22 @@ func loadAgentPathCases(t *testing.T, required []string) []agentPathCase {
 		}
 		return out
 	}
+	if len(required) == 0 {
+		t.Fatalf("no implement stages found in the spec: the test would be vacuous")
+	}
+	known := map[string]bool{}
+	for _, id := range required {
+		known[id] = true
+	}
 	seen := map[string]bool{}
 	cases := make([]agentPathCase, 0, len(f.Cases))
 	for _, c := range f.Cases {
 		id := c.Workflow + "." + c.Stage
 		if seen[id] {
 			t.Fatalf("%s: duplicate case %s", p, id)
+		}
+		if !known[id] {
+			t.Fatalf("%s: case %s names no implement stage in the spec", p, id)
 		}
 		seen[id] = true
 		cases = append(cases, agentPathCase{
@@ -171,9 +206,6 @@ func loadAgentPathCases(t *testing.T, required []string) []agentPathCase {
 			MustForbid:       expand(id+" must_forbid", c.MustForbid),
 			MustStayWritable: expand(id+" must_stay_writable", c.MustStayWritable),
 		})
-	}
-	if len(required) == 0 {
-		t.Fatalf("no implement stages found in the spec: the test would be vacuous")
 	}
 	for _, id := range required {
 		if !seen[id] {
@@ -233,15 +265,17 @@ func checkStrictJSON(raw []byte) error {
 	return nil
 }
 
-// hasForbiddenViolation reports whether vs carries a forbidden_paths hit, so
-// a violation from any other constraint kind cannot stand in for one.
-func hasForbiddenViolation(vs []Violation) bool {
+// refusingConstraints names the forbidden_paths and agent_instruction_paths
+// violations in vs that carry files, so a violation from any other
+// constraint kind cannot stand in for a refusal.
+func refusingConstraints(vs []Violation) []string {
+	var out []string
 	for _, v := range vs {
-		if v.Constraint == "forbidden_paths" && len(v.Files) > 0 {
-			return true
+		if (v.Constraint == "forbidden_paths" || v.Constraint == "agent_instruction_paths") && len(v.Files) > 0 {
+			out = append(out, v.Constraint)
 		}
 	}
-	return false
+	return out
 }
 
 // END agent-path fixture loader
