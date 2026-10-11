@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -61,11 +64,12 @@ var supersedeRepairMu sync.Mutex
 // living-anchor timeline — NOT a new issue-comment surface.
 const CategoryStageSupersededByMerge = "stage_superseded_by_merge"
 
-// The three reasons a supersession can carry. They are recorded, never
+// The four reasons a supersession can carry. They are recorded, never
 // interpreted by a gate: an operator reading the chain needs to know whether the
-// merge itself swept the stage, an operator invoked the recovery verb, or the
-// entry is a late repair of a sweep whose audit append failed after its
-// transition already committed.
+// merge itself swept the stage, an operator invoked the recovery verb (and
+// whether it opted into retiring a stranded stage), or the entry is a late
+// repair of a sweep whose audit append failed after its transition already
+// committed.
 const (
 	// supersedeReasonMergeObserved — the merge-observation path swept the stage
 	// on the same pass that resolved the review stage.
@@ -73,6 +77,12 @@ const (
 	// supersedeReasonOperatorReconcile — an operator invoked
 	// POST /v0/runs/{run_id}/reconcile-merge on an already-merged run.
 	supersedeReasonOperatorReconcile = "operator_reconcile"
+	// supersedeReasonOperatorReconcileStranded — an operator invoked
+	// reconcile-merge with {"supersede_stranded": true} and the stage was one
+	// stranded in flight (dispatched/running) or a never-opened gate (pending)
+	// on the already-merged run (#4222). Its row also carries last_activity_at
+	// and idle_threshold_seconds.
+	supersedeReasonOperatorReconcileStranded = "operator_reconcile_stranded"
 	// supersedeReasonRepair — the stage was ALREADY `superseded` but carried no
 	// audit row (a sweep whose transition committed and whose append then
 	// failed). The repair transitions nothing; it only restores the record.
@@ -88,6 +98,14 @@ type supersededStage struct {
 	StageType string    `json:"stage_type"`
 	FromState string    `json:"from_state"`
 	Reason    string    `json:"reason"`
+
+	// lastActivityAt and idleThreshold are set ONLY for a stranded
+	// supersession (reason operator_reconcile_stranded, #4222) and are written
+	// into its audit payload as last_activity_at / idle_threshold_seconds, so the
+	// chain records the liveness evidence the retirement rested on. Unexported:
+	// they are audit-only and never reach the response body.
+	lastActivityAt *time.Time
+	idleThreshold  time.Duration
 }
 
 // supersedeParkedStagesOnMerge is THE shared merge-supersede sweep — the one
@@ -222,13 +240,20 @@ func (s *Server) appendStageSupersededAudit(ctx context.Context, runID uuid.UUID
 		return nil
 	}
 	stageID := rec.StageID
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"run_id":     runID.String(),
 		"stage_id":   rec.StageID.String(),
 		"stage_type": rec.StageType,
 		"from_state": rec.FromState,
 		"reason":     rec.Reason,
-	})
+	}
+	if rec.idleThreshold > 0 {
+		fields["idle_threshold_seconds"] = int64(rec.idleThreshold / time.Second)
+	}
+	if rec.lastActivityAt != nil {
+		fields["last_activity_at"] = rec.lastActivityAt.UTC().Format(time.RFC3339Nano)
+	}
+	payload, _ := json.Marshal(fields)
 	actorKind := audit.ActorSystem
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
@@ -267,6 +292,138 @@ type reconcileMergeResponse struct {
 	RunState   string            `json:"run_state"`
 }
 
+// reconcileMergeRequest is the OPTIONAL body of
+// POST /v0/runs/{run_id}/reconcile-merge (#4222). An absent or empty body
+// decodes to the zero value, so a caller that sends nothing gets exactly the
+// pre-#4222 verb.
+type reconcileMergeRequest struct {
+	// SupersedeStranded opts into the stranded arm: on a run whose chain
+	// already carries merge evidence, ALSO retire the stages
+	// run.StrandedMergeSupersedable admits — implement/review/acceptance
+	// stranded in dispatched or running, and review/acceptance gates still
+	// pending — subject to the idle-threshold liveness gate.
+	SupersedeStranded bool `json:"supersede_stranded"`
+}
+
+// maxReconcileMergeBodyBytes caps the optional body. Its only field is a
+// boolean, so a body anywhere near the cap is malformed by construction.
+const maxReconcileMergeBodyBytes = 4 << 10
+
+// strandedStageIdleThreshold is how long a dispatched/running stranded
+// candidate must have shown NO database-stamped activity before the stranded
+// arm may retire it (#4222).
+//
+// Why 24h: every runner heartbeat UPDATEs the stage row (RecordStageProgress),
+// and migration 0001's stages_set_updated_at BEFORE UPDATE trigger bumps
+// updated_at on every such write and on every transition. The phases that send
+// no heartbeat (the verify gate, the acceptance zero-credential posture) are
+// bounded by agent and gate timeouts measured in minutes to an hour, and every
+// re-dispatch resets dispatched_at and updated_at, so no live single attempt is
+// silent for a day. A stage idle that long on a run whose PR already merged is
+// held by no runner.
+//
+// Clock domains: the cutoff is derived from the fishhawkd process clock
+// (s.nowFunc) and compared with Postgres-stamped columns. Skew between the two
+// is unbounded in principle (AGENTS.md, #3048) but only matters at the 24h
+// boundary, and the row-locked re-check in SupersedeStrandedStageOnMerge
+// compares the SAME cutoff against the SAME column, so the gate and the write
+// cannot disagree about one row.
+const strandedStageIdleThreshold = 24 * time.Hour
+
+// strandedCandidate is one stage the stranded arm classified for retirement,
+// pinned to the state it was classified in.
+type strandedCandidate struct {
+	stage        *run.Stage
+	from         run.StageState
+	lastActivity time.Time
+}
+
+// strandedLastActivity is a stage's latest DATABASE-stamped activity: the max
+// of updated_at (stages_set_updated_at trigger, bumped by every transition and
+// every heartbeat) and dispatched_at (migration 0072's trigger, stamped on every
+// transition into dispatched). started_at is deliberately NOT consulted: it is
+// stamped from the Go process clock by the same UPDATE that bumps updated_at, so
+// updated_at dominates it, and mixing it in would put a second clock domain
+// into the comparison.
+func strandedLastActivity(st *run.Stage) time.Time {
+	last := st.UpdatedAt
+	if st.DispatchedAt != nil && st.DispatchedAt.After(last) {
+		last = *st.DispatchedAt
+	}
+	return last
+}
+
+// strandedCandidateInFlight reports whether a stranded candidate state is one a
+// runner may still hold (dispatched or running) and is therefore subject to the
+// liveness gate. A pending gate is held by no runner.
+func strandedCandidateInFlight(state run.StageState) bool {
+	return state == run.StageStateDispatched || state == run.StageStateRunning
+}
+
+// decodeReconcileMergeRequest reads the optional body. A nil, empty or
+// whitespace-only body is the zero request; anything else must be exactly one
+// JSON object carrying only known fields (the reap_failure.go precedent), with
+// no trailing data.
+func decodeReconcileMergeRequest(r *http.Request) (reconcileMergeRequest, error) {
+	var req reconcileMergeRequest
+	if r.Body == nil {
+		return req, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxReconcileMergeBodyBytes+1))
+	if err != nil {
+		return req, fmt.Errorf("read body: %w", err)
+	}
+	if len(body) > maxReconcileMergeBodyBytes {
+		return req, fmt.Errorf("body exceeds %d bytes", maxReconcileMergeBodyBytes)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return req, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return reconcileMergeRequest{}, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return reconcileMergeRequest{}, errors.New("trailing data after the JSON object")
+	}
+	return req, nil
+}
+
+// strandedLiveDetail renders one stage the liveness gate (or the row-locked
+// re-check) found active, for the 409 reconcile_merge_stage_live details.
+func strandedLiveDetail(stageID uuid.UUID, stageType string, state run.StageState, lastActivity time.Time) map[string]any {
+	return map[string]any{
+		"stage_id":         stageID.String(),
+		"stage_type":       stageType,
+		"state":            string(state),
+		"last_activity_at": lastActivity.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+// The three row-locked refusals that STOP the stranded sweep, as recorded in
+// the 409 reconcile_merge_stage_live live_stages[].refusal discriminator. Each
+// is evidence that something touched the stage after the handler's read.
+const (
+	strandedRefusalRecentlyActive = "recently_active" // a heartbeat or transition after the idle cutoff
+	strandedRefusalStateChanged   = "state_changed"   // the stage moved since it was classified
+	strandedRefusalAttemptChanged = "attempt_changed" // the stage was re-dispatched since it was classified
+)
+
+// strandedRefusal is the stage whose row-locked refusal stopped the stranded
+// sweep.
+type strandedRefusal struct {
+	candidate    strandedCandidate
+	lastActivity time.Time
+	reason       string
+}
+
+func (r *strandedRefusal) detail() map[string]any {
+	d := strandedLiveDetail(r.candidate.stage.ID, string(r.candidate.stage.Type), r.candidate.from, r.lastActivity)
+	d["refusal"] = r.reason
+	return d
+}
+
 // handleReconcileMerge implements POST /v0/runs/{run_id}/reconcile-merge
 // (E64.2 / #3083) — the operator recovery for a run whose PR merged while a
 // stage stayed parked, leaving Orchestrator.completeRun's #968 guard correctly
@@ -274,7 +431,18 @@ type reconcileMergeResponse struct {
 // untrue.
 //
 // It supersedes exactly the pair-table-admissible parked stages, re-runs
-// completion, and returns what moved.
+// completion, and returns what moved. Two further arms (#4222):
+//
+//   - STRANDED (opt-in, body {"supersede_stranded": true}): also retire the
+//     stages run.StrandedMergeSupersedable admits — a legacy run whose PR
+//     merged while implement stayed `running` beside a never-opened review gate
+//     can otherwise never settle. Each move goes through the row-locked,
+//     state- and attempt-pinned run.StrandedStageMergeSuperseder capability,
+//     which is deliberately outside the ordinary transition union. Without the
+//     flag such a stage is left alone and the verb is byte-identical to before.
+//   - SETTLE-ONLY: a merged run whose stages ALL already succeeded but whose
+//     run row is still pending/running (a legacy run whose completion never
+//     re-ran) moves nothing and re-runs completion, instead of answering 409.
 //
 // Refusals, ALL evaluated before any write so a refused reconcile leaves ZERO
 // rows and moves ZERO stages:
@@ -292,8 +460,14 @@ type reconcileMergeResponse struct {
 //     reset_branch.go, recover.go), and the OBSERVE half
 //     (handleRecordMergeObservation) enforces the IDENTICAL rung — the
 //     observe/settle pair must not diverge in who may call it (E45.95 / #3635);
-//  1. 400 validation_failed — a non-UUID run_id;
-//  2. 503 reconcile_merge_unconfigured — the run/audit repositories are unwired;
+//  1. 400 validation_failed — a non-UUID run_id (field run_id), or a body that
+//     is neither empty nor exactly {"supersede_stranded": <bool>} (field body:
+//     a wrong type, an unknown field, trailing data, over the size cap);
+//  2. 503 reconcile_merge_unconfigured — the run/audit repositories are
+//     unwired, or supersede_stranded was requested and the run repository does
+//     not implement run.StrandedStageMergeSuperseder (details
+//     missing_capability) — the arm refuses rather than degrading to an
+//     ordinary transition that would apply the move on a stale premise;
 //  3. 404 run_not_found;
 //  4. 409 reconcile_merge_pr_not_merged — the run's PR is not OBSERVABLY merged
 //     (no pr_merged / post_merge_observed / merge_observation_recorded entry on
@@ -301,16 +475,39 @@ type reconcileMergeResponse struct {
 //     appends after a live merged=true forge read, E64.32 / #3136). This is the guard
 //     that stops the verb manufacturing a `succeeded` run for an unmerged
 //     change: without it, an operator could settle a run whose work never
-//     shipped. A chain-read failure is a 500, never a write — fail closed;
+//     shipped. It applies to every arm, the stranded and settle-only arms
+//     included. A chain-read failure is a 500, never a write — fail closed;
 //  5. 409 reconcile_merge_not_applicable — the run holds no pair-table-
-//     admissible parked stage AND no already-superseded stage to repair, so
-//     there is nothing for this verb to do.
+//     admissible parked stage, no already-superseded stage to repair, no
+//     stranded candidate (only counted when supersede_stranded is set) and is
+//     not in the settle-only shape (>= 1 stage, every stage succeeded, run not
+//     terminal), so there is nothing for this verb to do;
+//  6. 409 reconcile_merge_stage_live — supersede_stranded is set and at least
+//     one dispatched/running candidate shows database-stamped activity
+//     (strandedLastActivity) after now - strandedStageIdleThreshold. The WHOLE
+//     call is refused: details.live_stages names each live stage with its
+//     last_activity_at, plus idle_threshold_seconds. Pending candidates need no
+//     liveness check.
+//
+// Rung 6 has a row-locked twin. The handler's idle cutoff is passed into
+// SupersedeStrandedStageOnMerge, which re-reads the stage under its row lock
+// and refuses when a heartbeat landed between this gate and the write
+// (run.StageRecentlyActiveError: updated_at newer than the cutoff), or the
+// stage moved (run.StageStateChangedError) or was re-dispatched
+// (run.StageAttemptChangedError) since the classification. These are the only
+// refusals that can follow a write: the parked sweep and any stranded move
+// earlier in stage-sequence order have committed with their audit rows, so the
+// handler stops the stranded sweep, skips the repair scan and the completion
+// re-run (whatever touched the stage owns its next step) and answers the same
+// 409 reconcile_merge_stage_live, with live_stages[].refusal naming which
+// re-check fired and details.superseded listing what this call already moved.
 //
 // IDEMPOTENT: a second POST finds the stage already `superseded` (not admissible
-// — `superseded` is not a pair-table state), moves nothing, finds its audit row
+// — `superseded` is in neither pair table), moves nothing, finds its audit row
 // present, repairs nothing, and returns 200 with two empty lists. The repair
-// scan EXCLUDES the stages this same invocation moved, so exactly one row per
-// swept stage exists no matter how many times the verb is called.
+// scan EXCLUDES the stages this same invocation moved — parked AND stranded —
+// so exactly one row per swept stage exists no matter how many times the verb
+// is called.
 func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 	// Rung 0. FIRST, before the id parse / unconfigured check / run lookup: a
 	// refused caller must learn nothing about the run.
@@ -324,12 +521,31 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
 	}
+	req, berr := decodeReconcileMergeRequest(r)
+	if berr != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			`reconcile-merge body must be empty or {"supersede_stranded": <bool>}`,
+			map[string]any{"field": "body", "error": berr.Error()})
+		return
+	}
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "reconcile_merge_unconfigured",
 			"merge reconciliation requires run + audit repositories", nil)
 		return
 	}
-	if _, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID); gerr != nil {
+	var strander run.StrandedStageMergeSuperseder
+	if req.SupersedeStranded {
+		sm, ok := s.cfg.RunRepo.(run.StrandedStageMergeSuperseder)
+		if !ok {
+			s.writeError(w, r, http.StatusServiceUnavailable, "reconcile_merge_unconfigured",
+				"supersede_stranded requires a run repository implementing run.StrandedStageMergeSuperseder; this deployment's run repository does not, so no stranded stage can be retired",
+				map[string]any{"missing_capability": "run.StrandedStageMergeSuperseder"})
+			return
+		}
+		strander = sm
+	}
+	runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if gerr != nil {
 		if errors.Is(gerr, run.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "run_not_found",
 				"no run with that id", map[string]any{"run_id": runID.String()})
@@ -361,27 +577,69 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 			"list stages failed", map[string]any{"error": serr.Error()})
 		return
 	}
-	var admissible, alreadySuperseded int
+	var admissible, alreadySuperseded, succeeded, total int
+	var stranded []strandedCandidate
 	for _, st := range stages {
 		if st == nil {
 			continue
 		}
-		if st.State == run.StageStateSuperseded {
-			alreadySuperseded++
-			continue
+		total++
+		if st.State == run.StageStateSucceeded {
+			succeeded++
 		}
-		if run.MergeSupersedable(st.Type, st.State) {
+		switch {
+		case st.State == run.StageStateSuperseded:
+			alreadySuperseded++
+		case run.MergeSupersedable(st.Type, st.State):
 			admissible++
+		case req.SupersedeStranded && run.StrandedMergeSupersedable(st.Type, st.State):
+			// Classified ONLY under the opt-in. Without it a stranded stage
+			// is left exactly where it is (#968), as before #4222.
+			stranded = append(stranded, strandedCandidate{
+				stage: st, from: st.State, lastActivity: strandedLastActivity(st),
+			})
 		}
 	}
+	// The settle-only shape: every stage already succeeded but the run row was
+	// never completed. Guard 4 above already proved the merge, and only
+	// succeeded stages qualify, so this can never settle a failed or cancelled
+	// run.
+	settleOnly := total > 0 && succeeded == total && !runRow.State.IsTerminal()
+
 	// Guard 5. `alreadySuperseded` keeps a repeat POST on the idempotent 200
 	// path rather than a confusing 409 — and it is what makes the repair scan
 	// reachable at all on a run whose sweep already moved everything.
-	if admissible == 0 && alreadySuperseded == 0 {
+	if admissible == 0 && alreadySuperseded == 0 && len(stranded) == 0 && !settleOnly {
 		s.writeError(w, r, http.StatusConflict, "reconcile_merge_not_applicable",
-			"this run holds no merge-supersedable parked stage and no superseded stage to repair; a stage in any other non-terminal state must run, settle or be cancelled",
-			map[string]any{"run_id": runID.String()})
+			`this run holds no merge-supersedable parked stage and no superseded stage to repair; a stage in any other non-terminal state must run, settle or be cancelled — or, for an implement/review/acceptance stage stranded in flight on this merged run, retry with {"supersede_stranded": true}`,
+			map[string]any{"run_id": runID.String(), "supersede_stranded": req.SupersedeStranded})
 		return
+	}
+
+	// Guard 6 — the liveness gate, evaluated for the WHOLE candidate set before
+	// any write. One live in-flight candidate refuses the call.
+	var idleCutoff time.Time
+	if len(stranded) > 0 {
+		idleCutoff = s.nowFunc().Add(-strandedStageIdleThreshold)
+		var live []map[string]any
+		for _, c := range stranded {
+			if !strandedCandidateInFlight(c.from) {
+				continue
+			}
+			if c.lastActivity.After(idleCutoff) {
+				live = append(live, strandedLiveDetail(c.stage.ID, string(c.stage.Type), c.from, c.lastActivity))
+			}
+		}
+		if len(live) > 0 {
+			s.writeError(w, r, http.StatusConflict, "reconcile_merge_stage_live",
+				"a stranded stage showed activity inside the idle threshold, so a runner may still hold it; let it settle, or retry once it has been idle for the full threshold",
+				map[string]any{
+					"run_id":                 runID.String(),
+					"live_stages":            live,
+					"idle_threshold_seconds": int64(strandedStageIdleThreshold / time.Second),
+				})
+			return
+		}
 	}
 
 	// Read the EXISTING supersede rows BEFORE the sweep. The repair scan
@@ -397,9 +655,34 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	moved := s.supersedeParkedStagesOnMerge(r.Context(), runID, nil, supersedeReasonOperatorReconcile)
-	movedIDs := make(map[uuid.UUID]struct{}, len(moved))
+	movedIDs := make(map[uuid.UUID]struct{}, len(moved)+len(stranded))
 	for _, m := range moved {
 		movedIDs[m.StageID] = struct{}{}
+	}
+
+	if len(stranded) > 0 {
+		strandedMoved, refusal := s.supersedeStrandedStagesOnMerge(r.Context(), runID, strander, stranded, idleCutoff)
+		for _, m := range strandedMoved {
+			// The stranded sweep's rows are not in the pre-sweep snapshot
+			// either, so these ids MUST join the exclusion set or the repair
+			// scan below would draw a second row for each.
+			movedIDs[m.StageID] = struct{}{}
+		}
+		moved = append(moved, strandedMoved...)
+		if refusal != nil {
+			if moved == nil {
+				moved = []supersededStage{}
+			}
+			s.writeError(w, r, http.StatusConflict, "reconcile_merge_stage_live",
+				"a stranded stage showed activity, moved or was re-dispatched after the liveness check, so a runner may still hold it; it was not retired and no later stranded stage was either — the stages under details.superseded were retired by this call before the refusal",
+				map[string]any{
+					"run_id":                 runID.String(),
+					"live_stages":            []map[string]any{refusal.detail()},
+					"idle_threshold_seconds": int64(strandedStageIdleThreshold / time.Second),
+					"superseded":             moved,
+				})
+			return
+		}
 	}
 
 	// Repair scan: a stage that is already `superseded` but has no audit row is
@@ -410,7 +693,9 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 
 	// Re-run completion. The sweep made the parked stages terminal, so the
 	// orchestrator's Advance can now route the all-terminal stage set through
-	// completeRun. Best-effort, exactly as the merged path's advance is.
+	// completeRun (walking a still-pending run to running first). Best-effort,
+	// exactly as the merged path's advance is. The settle-only arm reaches
+	// here having moved nothing.
 	s.advanceRunAfterReviewResolve(r.Context(), runID)
 
 	state := ""
@@ -429,6 +714,86 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 		Repaired:   repaired,
 		RunState:   state,
 	})
+}
+
+// supersedeStrandedStagesOnMerge is the stranded sweep of reconcile-merge's
+// opt-in arm (#4222). The handler has already proved merge evidence and passed
+// the liveness gate; this applies each move through the row-locked
+// run.StrandedStageMergeSuperseder, pinned to the state the handler classified,
+// to the attempt (StageAttemptToken of the classified dispatched_at, so a
+// re-dispatch since the read is refused) and to the handler's idleCutoff (so a
+// heartbeat since the read is refused).
+//
+// TRANSITION FIRST, THEN AUDIT, exactly as supersedeParkedStagesOnMerge: a row
+// appended before a refused move would be an immutable record of a retirement
+// that never happened. A failed append leaves a missing row the repair scan
+// restores on a later call; a duplicate-index collision is the benign
+// already-recorded outcome inside appendStageSupersededAudit.
+//
+// A typed row-locked refusal — run.StageRecentlyActiveError,
+// run.StageStateChangedError or run.StageAttemptChangedError — writes no row
+// and STOPS the sweep, returned with the stages already moved: each says the
+// stage was touched after the handler's read, so a runner may hold it, and no
+// later candidate (in particular a pending gate sequenced after it) is retired
+// on that stale premise. Candidates are processed in stage-sequence order
+// (ListStagesForRun's order), so an in-flight implement precedes the gates
+// downstream of it. Any OTHER error is logged, writes no row and the sweep
+// continues, as in supersedeParkedStagesOnMerge; the stage stays where it was
+// for a later call.
+func (s *Server) supersedeStrandedStagesOnMerge(ctx context.Context, runID uuid.UUID, strander run.StrandedStageMergeSuperseder, candidates []strandedCandidate, idleCutoff time.Time) ([]supersededStage, *strandedRefusal) {
+	var moved []supersededStage
+	for _, c := range candidates {
+		if _, err := strander.SupersedeStrandedStageOnMerge(ctx, c.stage.ID, c.from, run.StageAttemptToken(c.stage.DispatchedAt), idleCutoff); err != nil {
+			if refusal := classifyStrandedRefusal(c, err); refusal != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"merge supersede: stranded stage touched after the liveness check; refused (no audit row), stopping the stranded sweep",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", c.stage.ID.String()),
+					slog.String("refusal", refusal.reason),
+					slog.String("idle_cutoff", idleCutoff.UTC().Format(time.RFC3339Nano)),
+					slog.String("error", err.Error()))
+				return moved, refusal
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"merge supersede: stranded stage transition failed (no audit row)",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", c.stage.ID.String()),
+				slog.String("error", err.Error()))
+			continue
+		}
+		last := c.lastActivity
+		rec := supersededStage{
+			StageID:        c.stage.ID,
+			StageType:      string(c.stage.Type),
+			FromState:      string(c.from),
+			Reason:         supersedeReasonOperatorReconcileStranded,
+			lastActivityAt: &last,
+			idleThreshold:  strandedStageIdleThreshold,
+		}
+		// The move committed; a swallowed append failure leaves a MISSING row
+		// the repair scan restores on a later call, never a false one.
+		_ = s.appendStageSupersededAudit(ctx, runID, rec)
+		moved = append(moved, rec)
+	}
+	return moved, nil
+}
+
+// classifyStrandedRefusal maps a typed row-locked refusal to the
+// strandedRefusal that stops the sweep, or nil for any other error.
+func classifyStrandedRefusal(c strandedCandidate, err error) *strandedRefusal {
+	var active run.StageRecentlyActiveError
+	if errors.As(err, &active) {
+		return &strandedRefusal{candidate: c, lastActivity: active.LastActivity, reason: strandedRefusalRecentlyActive}
+	}
+	var sce run.StageStateChangedError
+	if errors.As(err, &sce) {
+		return &strandedRefusal{candidate: c, lastActivity: c.lastActivity, reason: strandedRefusalStateChanged}
+	}
+	var ace run.StageAttemptChangedError
+	if errors.As(err, &ace) {
+		return &strandedRefusal{candidate: c, lastActivity: c.lastActivity, reason: strandedRefusalAttemptChanged}
+	}
+	return nil
 }
 
 // repairMissingSupersedeRows re-appends a stage_superseded_by_merge entry for
