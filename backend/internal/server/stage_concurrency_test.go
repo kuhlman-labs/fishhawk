@@ -866,6 +866,10 @@ func (errStore) StatusForStages(context.Context, []uuid.UUID) (map[uuid.UUID]con
 	return nil, errors.New("db down")
 }
 
+func (errStore) Promote(context.Context, concurrency.PromoteRequest) (concurrency.Promotion, error) {
+	return concurrency.Promotion{}, errors.New("db down")
+}
+
 // TestHostDispatch_StoreErrorFailsClosed: a non-drift admission error answers
 // 500 and leaves the stage parked (nothing spawns on a 5xx), and a status
 // read error omits the block rather than failing the read.

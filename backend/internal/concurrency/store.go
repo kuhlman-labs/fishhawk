@@ -26,6 +26,9 @@ import (
 // (FOR UPDATE) → the run row (only on paths that already take stage-then-run,
 // such as ResumeAwaitingInputAndAppend; Admit itself never locks a run row —
 // on the admit path it READS the run's state with a plain SELECT, #4035).
+// Promote takes the same group lock BLOCKING (pg_advisory_xact_lock) and then
+// the same stage row, slot row and (through its Record callback's audit
+// append) run row, so it follows the one documented order.
 //
 // Tenancy: Admit and StatusForStages run on the raw pool with NO tenant GUC
 // set, under the runtime role (a superuser today, which bypasses RLS). They
@@ -50,6 +53,9 @@ type PostgresStore struct {
 	// afterCAS runs after the dispatched CAS and before the held mark; a
 	// non-nil error aborts (rolls back) the whole admission.
 	afterCAS func(ctx context.Context) error
+	// afterPromotePeek runs between Promote's unlocked peek and its group
+	// lock — the seam the slot-changed test re-keys the row on.
+	afterPromotePeek func(ctx context.Context)
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -81,21 +87,47 @@ WHERE s.group_key = $1 AND s.state = 'held'
   AND ` + liveHolderPredicateQ + `
 ORDER BY s.acquired_at, s.stage_id`
 
-// aheadSQL counts the fresh queued rows ahead of (enqueued_at, stage_id) in
-// one group and account. round_ahead counts only rows enqueued at or before
-// $5 (the caller's round start): a row a contended loser committed during
-// the caller's own round never blocks the lock winner.
+// effectiveKeySQL is a slot row's ordering key: the promote's order_key when
+// set (0102, #4191), else enqueued_at. Every row without a promotion is
+// therefore strict FIFO.
+const effectiveKeySQL = `COALESCE(s.order_key, s.enqueued_at)`
+
+// freshWaiterPredicateQ is what makes a queued row count for anyone: same
+// group and account, fresh within QueueTTL, stage still host-dispatchable.
+var freshWaiterPredicateQ = `s.group_key = $1 AND s.state = 'queued' AND s.stage_id <> $2
+  AND r.account_id IS NOT DISTINCT FROM $3
+  AND s.last_seen_at > clock_timestamp() - ` + queueTTLSQL + `
+  AND st.state IN ('pending', 'awaiting_host_dispatch')`
+
+// aheadSQL counts the fresh queued rows ahead of ($4, stage_id) in one group
+// and account, where $4 is the caller's EFFECTIVE key (effectiveKeySQL).
+// round_ahead counts only rows enqueued at or before $5 (the caller's round
+// start): a row a contended loser committed during the caller's own round
+// never blocks the lock winner. It filters on enqueued_at, not the effective
+// key, because it is about when a row was COMMITTED, which a promotion never
+// changes.
 var aheadSQL = `SELECT
   count(*) FILTER (WHERE s.enqueued_at <= $5) AS round_ahead,
   count(*) AS all_ahead
 FROM stage_concurrency_slots s
 JOIN stages st ON st.id = s.stage_id
 JOIN runs r ON r.id = s.run_id
-WHERE s.group_key = $1 AND s.state = 'queued' AND s.stage_id <> $2
-  AND r.account_id IS NOT DISTINCT FROM $3
-  AND (s.enqueued_at, s.stage_id) < ($4, $2)
-  AND s.last_seen_at > clock_timestamp() - ` + queueTTLSQL + `
-  AND st.state IN ('pending', 'awaiting_host_dispatch')`
+WHERE ` + freshWaiterPredicateQ + `
+  AND (` + effectiveKeySQL + `, s.stage_id) < ($4, $2)`
+
+// promoteKeySQL writes the promoted stage's order key: 1 ms ahead of the
+// minimum effective key over every OTHER fresh waiter (the aheadSQL
+// predicate), so the newest promote wins. enqueued_at, last_seen_at and every
+// other row are untouched.
+var promoteKeySQL = `UPDATE stage_concurrency_slots SET order_key = (
+  SELECT min(` + effectiveKeySQL + `)
+  FROM stage_concurrency_slots s
+  JOIN stages st ON st.id = s.stage_id
+  JOIN runs r ON r.id = s.run_id
+  WHERE ` + freshWaiterPredicateQ + `
+) - interval '1 millisecond'
+WHERE stage_id = $2 AND state = 'queued'
+RETURNING COALESCE(order_key, enqueued_at)`
 
 // validate refuses a malformed Request before any SQL runs.
 func (req Request) validate() error {
@@ -174,7 +206,7 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 	}
 
 	// (4) Queue row with the episode-restart rule, identical on both paths.
-	enqueuedAt, newlyQueued, queuedBefore, err := upsertQueued(ctx, tx, req)
+	enqueuedAt, effectiveKey, newlyQueued, queuedBefore, err := upsertQueued(ctx, tx, req)
 	if err != nil {
 		return Admission{}, err
 	}
@@ -184,7 +216,7 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 		return Admission{}, err
 	}
 	var roundAhead, allAhead int
-	if err := tx.QueryRow(ctx, aheadSQL, req.GroupKey, req.StageID, acct, enqueuedAt, roundStart).Scan(&roundAhead, &allAhead); err != nil {
+	if err := tx.QueryRow(ctx, aheadSQL, req.GroupKey, req.StageID, acct, effectiveKey, roundStart).Scan(&roundAhead, &allAhead); err != nil {
 		return Admission{}, fmt.Errorf("concurrency: count queue ahead: %w", err)
 	}
 	queued := Admission{
@@ -226,7 +258,7 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 	var waited int
 	if err := tx.QueryRow(ctx, `UPDATE stage_concurrency_slots s
 SET state = 'held', acquired_at = clock_timestamp(), held_dispatched_at = st.dispatched_at,
-  admission_nonce = NULLIF($2, '')
+  admission_nonce = NULLIF($2, ''), order_key = NULL
 FROM stages st
 WHERE st.id = s.stage_id AND s.stage_id = $1
 RETURNING GREATEST(0, floor(extract(epoch FROM s.acquired_at - s.enqueued_at)))::int`, req.StageID, req.AdmissionNonce).Scan(&waited); err != nil {
@@ -250,16 +282,18 @@ RETURNING GREATEST(0, floor(extract(epoch FROM s.acquired_at - s.enqueued_at))):
 // lock, so an existing 'held' row is from a PREVIOUS episode. The row
 // restarts at the TAIL (enqueued_at = now) when it was held, queued in a
 // different group, or queued but stale past QueueTTL; otherwise it keeps its
-// enqueued_at. It reports whether this call inserted or restarted the row
-// (newlyQueued) and whether the row was already queued in this episode
-// (queuedBefore).
-func upsertQueued(ctx context.Context, tx pgx.Tx, req Request) (enqueuedAt time.Time, newlyQueued, queuedBefore bool, err error) {
+// enqueued_at. A restart also clears order_key (a promotion lasts for its
+// episode only); the keep arm leaves it untouched. It returns the row's
+// enqueued_at and its effective ordering key, and reports whether this call
+// inserted or restarted the row (newlyQueued) and whether the row was already
+// queued in this episode (queuedBefore).
+func upsertQueued(ctx context.Context, tx pgx.Tx, req Request) (enqueuedAt, effectiveKey time.Time, newlyQueued, queuedBefore bool, err error) {
 	var exists, restart bool
 	err = tx.QueryRow(ctx, `SELECT true,
   state = 'held' OR group_key <> $2 OR last_seen_at <= clock_timestamp() - `+queueTTLSQL+`
 FROM stage_concurrency_slots WHERE stage_id = $1`, req.StageID, req.GroupKey).Scan(&exists, &restart)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, false, fmt.Errorf("concurrency: read slot row: %w", err)
+		return time.Time{}, time.Time{}, false, false, fmt.Errorf("concurrency: read slot row: %w", err)
 	}
 	err = tx.QueryRow(ctx, `INSERT INTO stage_concurrency_slots AS s
   (stage_id, run_id, group_key, slot_limit, host, state, enqueued_at, last_seen_at)
@@ -271,15 +305,16 @@ ON CONFLICT (stage_id) DO UPDATE SET
   host = EXCLUDED.host,
   state = 'queued',
   enqueued_at = CASE WHEN $6 THEN clock_timestamp() ELSE s.enqueued_at END,
+  order_key = CASE WHEN $6 THEN NULL ELSE s.order_key END,
   last_seen_at = clock_timestamp(),
   acquired_at = NULL,
   held_dispatched_at = NULL,
   admission_nonce = NULL
-RETURNING enqueued_at`, req.StageID, req.RunID, req.GroupKey, req.Limit, req.Host, restart).Scan(&enqueuedAt)
+RETURNING enqueued_at, COALESCE(order_key, enqueued_at)`, req.StageID, req.RunID, req.GroupKey, req.Limit, req.Host, restart).Scan(&enqueuedAt, &effectiveKey)
 	if err != nil {
-		return time.Time{}, false, false, fmt.Errorf("concurrency: upsert slot row: %w", err)
+		return time.Time{}, time.Time{}, false, false, fmt.Errorf("concurrency: upsert slot row: %w", err)
 	}
-	return enqueuedAt, !exists || restart, exists && !restart, nil
+	return enqueuedAt, effectiveKey, !exists || restart, exists && !restart, nil
 }
 
 func listHolders(ctx context.Context, q interface {
@@ -315,6 +350,7 @@ func (s *PostgresStore) StatusForStages(ctx context.Context, stageIDs []uuid.UUI
 	rows, err := s.pool.Query(ctx, `SELECT s.stage_id, s.group_key, s.slot_limit, s.host, s.state,
   s.enqueued_at, s.acquired_at, s.held_dispatched_at, COALESCE(s.admission_nonce, ''),
   s.last_seen_at > clock_timestamp() - `+queueTTLSQL+` AS waiter_live,
+  `+effectiveKeySQL+` AS effective_key, s.order_key IS NOT NULL AS promoted,
   r.account_id,
   (s.state = 'queued' AND st.state IN ('pending', 'awaiting_host_dispatch')) AS active_queued,
   (s.state = 'held' AND `+liveHolderPredicateQ+`) AS active_held
@@ -328,6 +364,8 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 	type statusRow struct {
 		stageID      uuid.UUID
 		st           Status
+		effectiveKey time.Time
+		promoted     bool
 		acct         pgtype.UUID
 		activeQueued bool
 		activeHeld   bool
@@ -338,7 +376,7 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 		var state string
 		if err := rows.Scan(&r.stageID, &r.st.GroupKey, &r.st.Limit, &r.st.Host, &state,
 			&r.st.EnqueuedAt, &r.st.AcquiredAt, &r.st.HeldDispatchedAt, &r.st.AdmissionNonce, &r.st.WaiterLive,
-			&r.acct, &r.activeQueued, &r.activeHeld); err != nil {
+			&r.effectiveKey, &r.promoted, &r.acct, &r.activeQueued, &r.activeHeld); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("concurrency: scan status: %w", err)
 		}
@@ -372,15 +410,158 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 		st.Holders = holders
 		if r.activeQueued {
 			var roundAhead, allAhead int
-			if err := s.pool.QueryRow(ctx, aheadSQL, st.GroupKey, r.stageID, r.acct, st.EnqueuedAt, st.EnqueuedAt).Scan(&roundAhead, &allAhead); err != nil {
+			if err := s.pool.QueryRow(ctx, aheadSQL, st.GroupKey, r.stageID, r.acct, r.effectiveKey, st.EnqueuedAt).Scan(&roundAhead, &allAhead); err != nil {
 				return nil, fmt.Errorf("concurrency: status position: %w", err)
 			}
 			st.Position = allAhead + 1
+			st.Promoted = r.promoted
 			st.AcquiredAt, st.HeldDispatchedAt, st.AdmissionNonce = nil, nil, ""
 		} else {
 			st.WaiterLive = false
 		}
 		out[r.stageID] = st
+	}
+	return out, nil
+}
+
+// Promote moves one queued waiter ahead of every other fresh waiter in its
+// group and account (#4191). See README.md § "Promote".
+//
+// One transaction on one pooled connection: an unlocked peek of the stage's
+// account and group, then the group advisory lock taken BLOCKING (Admit only
+// try-locks it, so this cannot deadlock with an admission; an admitter
+// arriving meanwhile answers Contended), then the stage row and the slot row
+// FOR UPDATE. It never writes a held row and never touches enqueued_at. Any
+// error, including one returned by req.Record, rolls the whole promotion
+// back.
+func (s *PostgresStore) Promote(ctx context.Context, req PromoteRequest) (Promotion, error) {
+	switch {
+	case req.StageID == uuid.Nil:
+		return Promotion{}, fmt.Errorf("%w: stage id is required", ErrInvalidRequest)
+	case req.Record == nil:
+		return Promotion{}, fmt.Errorf("%w: a Record callback is required (a promotion never commits unaudited)", ErrInvalidRequest)
+	}
+	var out Promotion
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.promoteTx(ctx, tx, req)
+		return err
+	})
+	if err != nil {
+		return Promotion{}, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) promoteTx(ctx context.Context, tx pgx.Tx, req PromoteRequest) (Promotion, error) {
+	// (1) Unlocked peek: the stage's run and account, and its slot row's group.
+	var runID uuid.UUID
+	var acct pgtype.UUID
+	var peekGroup *string
+	err := tx.QueryRow(ctx, `SELECT st.run_id, r.account_id, s.group_key
+FROM stages st JOIN runs r ON r.id = st.run_id
+LEFT JOIN stage_concurrency_slots s ON s.stage_id = st.id
+WHERE st.id = $1`, req.StageID).Scan(&runID, &acct, &peekGroup)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: %w", req.StageID, run.ErrNotFound)
+	}
+	if err != nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote: read stage: %w", err)
+	}
+	if peekGroup == nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: %w", req.StageID, ErrNotQueued)
+	}
+	var acctPtr *uuid.UUID
+	if acct.Valid {
+		id := uuid.UUID(acct.Bytes)
+		acctPtr = &id
+	}
+	if s.afterPromotePeek != nil {
+		s.afterPromotePeek(ctx)
+	}
+
+	// (2) Group lock, BLOCKING: waits out an in-flight admission round.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey(acctPtr, *peekGroup)); err != nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote: group lock: %w", err)
+	}
+
+	// (3) Stage row lock: every slot-row write for a stage happens under it.
+	var stageState string
+	if err := tx.QueryRow(ctx, `SELECT state FROM stages WHERE id = $1 FOR UPDATE`, req.StageID).Scan(&stageState); err != nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote: lock stage: %w", err)
+	}
+
+	// (4) Locked re-read of the slot row, then classify.
+	var (
+		group, slotState string
+		limit            int
+		enqueuedAt, key  time.Time
+		fresh            bool
+	)
+	err = tx.QueryRow(ctx, `SELECT group_key, state, slot_limit, enqueued_at, COALESCE(order_key, enqueued_at),
+  last_seen_at > clock_timestamp() - `+queueTTLSQL+`
+FROM stage_concurrency_slots WHERE stage_id = $1 FOR UPDATE`, req.StageID).Scan(&group, &slotState, &limit, &enqueuedAt, &key, &fresh)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: %w", req.StageID, ErrNotQueued)
+	}
+	if err != nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote: lock slot row: %w", err)
+	}
+	st := run.StageState(stageState)
+	switch {
+	case group != *peekGroup:
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: group %q became %q: %w", req.StageID, *peekGroup, group, ErrSlotChanged)
+	case SlotState(slotState) == SlotHeld && (st == run.StageStateDispatched || st == run.StageStateRunning):
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: %w", req.StageID, ErrSlotHeld)
+	case SlotState(slotState) == SlotHeld:
+		// A previous episode's held row the stage has not re-polled.
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: held row from a previous episode (stage %s): %w", req.StageID, st, ErrNotQueued)
+	case st != run.StageStatePending && st != run.StageStateAwaitingHostDispatch:
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: stage is %s: %w", req.StageID, st, ErrNotQueued)
+	case !fresh:
+		return Promotion{}, fmt.Errorf("concurrency: promote stage %s: %w", req.StageID, ErrWaiterNotLive)
+	}
+
+	// (5) Holders and the old position.
+	holders, err := listHolders(ctx, tx, group, acct)
+	if err != nil {
+		return Promotion{}, err
+	}
+	position := func(key time.Time) (int, error) {
+		var roundAhead, allAhead int
+		if err := tx.QueryRow(ctx, aheadSQL, group, req.StageID, acct, key, enqueuedAt).Scan(&roundAhead, &allAhead); err != nil {
+			return 0, fmt.Errorf("concurrency: promote: count queue ahead: %w", err)
+		}
+		return allAhead + 1, nil
+	}
+	oldPos, err := position(key)
+	if err != nil {
+		return Promotion{}, err
+	}
+	out := Promotion{
+		StageID: req.StageID, RunID: runID, GroupKey: group, Limit: limit,
+		OldPosition: oldPos, NewPosition: oldPos, Holders: holders,
+	}
+	if oldPos == 1 {
+		return out, nil // already first: write nothing, record nothing
+	}
+
+	// (6) Write the order key just ahead of every other fresh waiter.
+	if err := tx.QueryRow(ctx, promoteKeySQL, group, req.StageID, acct).Scan(&key); err != nil {
+		return Promotion{}, fmt.Errorf("concurrency: promote: write order key: %w", err)
+	}
+
+	// (7) The new position, read back under the same lock.
+	if out.NewPosition, err = position(key); err != nil {
+		return Promotion{}, err
+	}
+	out.Changed = true
+
+	// (8) The caller's record (the audit append) inside this transaction.
+	if req.Record != nil {
+		if err := req.Record(ctx, tx, out); err != nil {
+			return Promotion{}, err
+		}
 	}
 	return out, nil
 }

@@ -2,9 +2,11 @@
 // (#3964 / ADR-087): a host-dispatched stage asks for a slot in a group before
 // its spawn marker transitions it to dispatched, and either is ADMITTED (the
 // stage CAS and the held mark commit in one transaction) or QUEUED FIFO behind
-// the group's live holders. Holding is derived from stage state, so a settled,
-// parked or crashed holder releases without a write here. README.md is the
-// contract.
+// the group's live holders. Admission is FIFO except for a waiter an operator
+// PROMOTED (#4191), which is ordered just ahead of every other fresh waiter for
+// the rest of its queue episode. Holding is derived from stage state, so a
+// settled, parked or crashed holder releases without a write here. README.md
+// is the contract.
 package concurrency
 
 import (
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -62,6 +65,24 @@ const (
 // ErrInvalidRequest is returned (wrapped) for a Request the store refuses
 // before touching the database.
 var ErrInvalidRequest = errors.New("concurrency: invalid admission request")
+
+// Promote refusals (README.md § "Promote"). An unknown stage wraps
+// run.ErrNotFound instead.
+var (
+	// ErrNotQueued: the stage has no active queued slot row (it never asked
+	// for a slot, it holds a previous episode's row, or it is no longer
+	// pending/awaiting_host_dispatch).
+	ErrNotQueued = errors.New("concurrency: stage is not queued in a concurrency group")
+	// ErrSlotHeld: the stage holds its slot. Holders are never preempted.
+	ErrSlotHeld = errors.New("concurrency: stage holds its slot; holders are never preempted")
+	// ErrWaiterNotLive: the stage's queued row is stale past QueueTTL. It
+	// counts for nobody and restarts at the tail on its next poll, which
+	// would lose a promotion, so the operator re-dispatches it first.
+	ErrWaiterNotLive = errors.New("concurrency: queued waiter is not live (stale past QueueTTL)")
+	// ErrSlotChanged: the slot row moved to another group between the
+	// promote's unlocked read and its locked re-read.
+	ErrSlotChanged = errors.New("concurrency: slot row changed group during the promote")
+)
 
 // Request asks for a slot for one host-dispatched stage.
 type Request struct {
@@ -133,12 +154,42 @@ type Status struct {
 	// AdmissionNonce is the nonce the admitting request carried ("" when it
 	// carried none); set only on a held status.
 	AdmissionNonce string
+	// Promoted reports an ACTIVE queued row an operator promoted in its
+	// current queue episode (order_key set); never set on a held status.
+	Promoted bool
+}
+
+// PromoteRequest asks to move one queued waiter to the front of its group.
+type PromoteRequest struct {
+	StageID uuid.UUID
+	// Record is REQUIRED. It runs inside the promotion transaction after the
+	// order key is written and before COMMIT, and only when the order
+	// changed; a non-nil error rolls the whole promotion back. The server
+	// appends the audit row through it, so a promotion never commits
+	// unaudited.
+	Record func(ctx context.Context, tx pgx.Tx, p Promotion) error
+}
+
+// Promotion is Promote's verdict.
+type Promotion struct {
+	StageID  uuid.UUID
+	RunID    uuid.UUID
+	GroupKey string
+	Limit    int
+	// Changed is false when the stage was already first (a no-op: nothing
+	// written, Record not called).
+	Changed     bool
+	OldPosition int
+	NewPosition int
+	// Holders is the group's live holders, never nil.
+	Holders []Holder
 }
 
 // Store is the slot store.
 type Store interface {
 	Admit(ctx context.Context, req Request) (Admission, error)
 	StatusForStages(ctx context.Context, stageIDs []uuid.UUID) (map[uuid.UUID]Status, error)
+	Promote(ctx context.Context, req PromoteRequest) (Promotion, error)
 }
 
 // DefaultGroupKey is the host default group key.

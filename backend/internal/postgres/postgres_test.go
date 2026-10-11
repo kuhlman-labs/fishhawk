@@ -7581,3 +7581,77 @@ VALUES ($1, 'o/r', 'main', 'ejected', 'verify_failed', 'h0', now())`, doomedRun)
 		t.Errorf("runs row after rolling back 0101 = %d, want 1 (untouched)", survivors)
 	}
 }
+
+// TestMigrateDown_StageConcurrencyOrderKeyReversal pins 0102 (#4191): after
+// MigrateUp stage_concurrency_slots carries a nullable TIMESTAMPTZ order_key
+// (NULL by default, so every existing row stays FIFO by enqueued_at); after
+// rolling back through 0102 the column is gone, the schema lands on 0101, the
+// 0097 table and its queued row survive intact; MigrateUp again restores the
+// column.
+func TestMigrateDown_StageConcurrencyOrderKeyReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	orderKeyColumn := func() (n int, typ, nullable string) {
+		t.Helper()
+		err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(max(data_type), ''), COALESCE(max(is_nullable), '')
+FROM information_schema.columns WHERE table_name = 'stage_concurrency_slots' AND column_name = 'order_key'`).Scan(&n, &typ, &nullable)
+		if err != nil {
+			t.Fatalf("read order_key column: %v", err)
+		}
+		return n, typ, nullable
+	}
+	if n, typ, nullable := orderKeyColumn(); n != 1 || typ != "timestamp with time zone" || nullable != "YES" {
+		t.Fatalf("order_key after MigrateUp: count=%d type=%q nullable=%q, want 1 / timestamp with time zone / YES (0102)", n, typ, nullable)
+	}
+
+	var runID, stageID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+VALUES (gen_random_uuid(), $1, 1, 'implement', 'agent', 'claude-code', 'awaiting_host_dispatch') RETURNING id`, runID).Scan(&stageID); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	var orderKey *time.Time
+	if err := pool.QueryRow(ctx, `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state)
+VALUES ($1, $2, 'local-implement:h1', 1, 'queued') RETURNING order_key`, stageID, runID).Scan(&orderKey); err != nil {
+		t.Fatalf("insert slot row after MigrateUp: %v", err)
+	}
+	if orderKey != nil {
+		t.Errorf("order_key of a fresh row = %v, want NULL (FIFO by enqueued_at)", orderKey)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE stage_concurrency_slots SET order_key = enqueued_at - interval '1 millisecond' WHERE stage_id = $1`, stageID); err != nil {
+		t.Fatalf("write order_key: %v", err)
+	}
+
+	downThrough(t, url, "0102")
+
+	if n, _, _ := orderKeyColumn(); n != 0 {
+		t.Errorf("order_key columns after rolling back 0102 = %d, want 0", n)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stage_concurrency_slots WHERE stage_id = $1 AND state = 'queued'`, stageID).Scan(&rows); err != nil {
+		t.Fatalf("read slot row after rollback: %v — the 0097 table must survive", err)
+	}
+	if rows != 1 {
+		t.Errorf("queued slot rows after rolling back 0102 = %d, want 1 (untouched)", rows)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n, _, _ := orderKeyColumn(); n != 1 {
+		t.Errorf("order_key columns after re-applying 0102 = %d, want 1", n)
+	}
+}
