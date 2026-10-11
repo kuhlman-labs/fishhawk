@@ -829,7 +829,9 @@
       "path": "docs/adr/091-restart-recovery-redispatches-advisory-review-rounds.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-095"
+      ],
       "applies_to": []
     },
     {
@@ -864,6 +866,17 @@
       "status": "accepted",
       "supersedes": [
         "ADR-087"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-095",
+      "title": "Review-coverage hold for decomposed parents, plus an operator re-run verb with its own same-head dedup bypass marker, distinct from ADR-091 D6's boot-only marker (amends ADR-091)",
+      "path": "docs/adr/095-review-coverage-hold-and-operator-rerun.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-091"
       ],
       "superseded_by": [],
       "applies_to": []
