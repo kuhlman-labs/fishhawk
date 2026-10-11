@@ -643,6 +643,33 @@ func decodeUndecidableReason(raw json.RawMessage) (present bool, text string, er
 	return true, *decoded, nil
 }
 
+// acceptanceUndecidableCauses classifies every UNDECIDABLE row's
+// undecidable_reason with plan.ClassifyUndecidableReason and groups the
+// classified row ids by cause, in row order. Rows whose result is passed,
+// failed or skipped are never classified, even when their expectation_basis
+// names a database. An absent or non-string reason (validate() already rejects
+// both on an undecidable row, so neither reaches here from the handler)
+// decodes to "" and classifies as nothing. Returns nil when no row is
+// classified, so the caller can omit the payload key entirely.
+func acceptanceUndecidableCauses(rows []acceptanceCriterionResult) map[string][]string {
+	var causes map[string][]string
+	for _, c := range rows {
+		if c.Result != acceptanceResultUndecidable {
+			continue
+		}
+		_, text, _ := decodeUndecidableReason(c.UndecidableReason)
+		cause := plan.ClassifyUndecidableReason(text)
+		if cause == "" {
+			continue
+		}
+		if causes == nil {
+			causes = map[string][]string{}
+		}
+		causes[cause] = append(causes[cause], c.ID)
+	}
+	return causes
+}
+
 // coerceAcceptanceCriteria normalizes the acceptance verdict's criteria field.
 // It returns the flat typed slice, whether a coercion occurred, and an error on
 // any lossy or invalid shape. The twin of the runner coerceAcceptanceCriteria
@@ -1119,6 +1146,10 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 
 	contentHash := sha256Hex(body)
 	passed, failed, skipped, undecidable, total := acceptanceCriteriaTally(acc.normalizedCriteria)
+	// undecidableCauses (E72.63 / #4095) names WHY undecidable rows were left
+	// undecided, over the SAME rows criteria_undecidable tallies (retired rows
+	// included). Descriptive only: nothing below reads it to decide a verdict.
+	undecidableCauses := acceptanceUndecidableCauses(acc.normalizedCriteria)
 
 	// Bind the verdict to the head the acceptance stage ACTUALLY validated
 	// (#1682, binding condition 2): the run's newest recorded head at the
@@ -1376,6 +1407,12 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		// the two pre-spawn bases, which the orchestrator (not this handler) emits.
 		if recordedVerdict == acceptanceVerdictNotValidated && observedBasis != "" {
 			fields[plan.AcceptanceBasisKey] = observedBasis
+		}
+		// undecidable_causes (E72.63 / #4095) maps each classified cause to the
+		// undecidable row ids it explains. Emitted ONLY when a row was
+		// classified, so every other outcome marshals byte-identically to before.
+		if len(undecidableCauses) > 0 {
+			fields[plan.UndecidableCausesKey] = undecidableCauses
 		}
 		// Replay evidence (E72.4 / #3328): the runner-injected cap header copied
 		// VERBATIM plus the scenario-row tallies counted here. Absent body.replay

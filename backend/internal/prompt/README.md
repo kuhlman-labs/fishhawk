@@ -653,6 +653,55 @@ render. Same caveat as the seeded-fixtures block: the test proves the
 instruction renders, not that an LLM validator obeys it; the failure direction
 is a spurious skip, never a silent pass.
 
+## Acceptance-prompt declared skips and sandbox limits (E72.63 / #4095)
+
+Run 82487694 reported four database-backed criteria `undecidable` although the
+planner had declared each one `skip_expected` with an `expectation_basis`: the
+validator was never shown the declaration, and Posture B invited it to run the
+pgtest-backed Go tests their `verify_hint` named, which the network sandbox
+refused with `connect: operation not permitted`. Two changes close that.
+
+- **The criterion block carries the declaration.**
+  `writeAcceptanceCriteriaForAcceptance` renders `skip_expected: true` under a
+  declared skip, `expectation_basis: <basis>` beneath it when the basis is
+  non-blank (a whitespace-only basis renders no line), and
+  `requires_live_validation: true` when set. Both resolution paths feed the
+  same loop, so the approved plan's criteria and the approval-gate
+  `AcceptanceCriteriaEffective` set render alike. A criterion with none of the
+  three set renders byte-identically to before.
+- **`writeAcceptanceSandboxLimits`** renders `### Declared skips and sandbox
+  limits` LAST, after `### When you cannot DECIDE a criterion`, so its backtick
+  tokens stay outside the closed-field-set count region; it adds NO verdict
+  field. It states three rules. (i) A declared skip is a REVIEWED skip: report
+  it `result`=`skipped` citing its basis, unless it was actually decided
+  against the target or a sandbox-runnable check, and never `undecidable`
+  merely because it could not be decided. (ii) The sandbox admits only the
+  target and Fishhawk's own endpoints, so a check that needs a database or
+  container daemon (pgtest/testcontainers-backed Go tests,
+  `FISHHAWK_TEST_PG_URL`, `psql`, `docker`) is not attempted, and Posture B
+  does not extend to it; the committed-tree verify gate already ran those
+  tests. (iii) When such a check is the only way to decide a criterion that is
+  NOT a declared skip, report it `undecidable` and START its
+  `undecidable_reason` with `sandbox_denied_db:`, rendered from
+  `plan.UndecidableCauseSandboxDeniedDB` — the token
+  `plan.ClassifyUndecidableReason` matches when the server ingest records the
+  `undecidable_causes` key on `acceptance_outcome_recorded`.
+
+The section is STATIC renderer text and renders only on the acceptance stage:
+the plan-review and implement-review prompts are byte-unchanged (the
+review-prompt-eval evidence fingerprint is unaffected).
+`TestBuild_Acceptance_RendersDeclaredSkip` pins the per-criterion lines on both
+resolution paths (a declared skip, a declared operator walk, a whitespace-only
+basis, a drivable criterion). `TestBuild_Acceptance_SandboxLimitsSection` pins
+presence-exactly-once, position, every rule's load-bearing phrase, that the
+section's worked example classifies as `sandbox_denied_db`, and ABSENCE from
+every non-acceptance render. The cross-layer
+`server.TestAcceptancePrompt_RendersDeclaredSkipFromApprovedPlan` drives a
+skip-declared criterion from the plan artifact through both the signed
+`/v0/stages/{id}/prompt` response and the unsigned `/prompt-render` one the
+live acceptance criterion drives, on both resolution paths. Same caveat as the blocks above: the tests
+prove the instruction renders, not that an LLM validator obeys it.
+
 ## Fix-up reporting obligations (#2737)
 
 `writeFixupReportObligations` renders the binding "### Reporting obligations

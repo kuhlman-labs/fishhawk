@@ -4542,7 +4542,54 @@ func buildAcceptance(t Trigger) string {
 		"merely-undecided evidence is not caution, it is a wrong verdict that sends a correct " +
 		"change into triage.\n")
 
+	// Declared skips and sandbox limits (E72.63 / #4095). Rendered LAST, after
+	// the undecidable section, so its backtick tokens fall outside the
+	// closed-field-set region the count guard measures, and it adds NO verdict
+	// field: it reuses result=skipped / expectation_basis / undecidable_reason.
+	writeAcceptanceSandboxLimits(&b)
+
 	return b.String()
+}
+
+// writeAcceptanceSandboxLimits renders the "### Declared skips and sandbox
+// limits" section of the acceptance prompt (E72.63 / #4095). Run 82487694
+// reported four database-backed criteria undecidable although the planner had
+// declared each one skip_expected with a basis: the validator was never shown
+// the declaration, and Posture B invited it to run the pgtest-backed Go tests
+// its verify_hint named, which the network sandbox refused with `connect:
+// operation not permitted`. The section states three rules: honour a declared
+// skip; do not attempt a database- or container-backed check, which the
+// sandbox cannot run; and lead an undecidable_reason the sandbox caused with
+// the plan.UndecidableCauseSandboxDeniedDB token, which the server ingest's
+// plan.ClassifyUndecidableReason records under undecidable_causes.
+//
+// STATIC renderer text: no issue-body or verify-output bytes flow through it,
+// and it renders only on the acceptance stage, so the plan-review and
+// implement-review prompts are byte-unchanged.
+func writeAcceptanceSandboxLimits(b *strings.Builder) {
+	b.WriteString("\n### Declared skips and sandbox limits\n\n")
+	b.WriteString("- A criterion marked `skip_expected: true` in the checklist above is a " +
+		"REVIEWED skip: the planner declared it and plan review approved the declaration, with " +
+		"the `expectation_basis` beside it naming where the criterion is actually validated. " +
+		"Report it `result`=`skipped` citing that `expectation_basis`, unless you actually " +
+		"decided it against the target or a check the sandbox can run. Never report a declared " +
+		"skip `undecidable` merely because you could not decide it. A criterion also marked " +
+		"`requires_live_validation: true` is a declared operator walk against a live target " +
+		"the sandbox cannot reach; it is skipped the same way.\n")
+	b.WriteString("- The acceptance network sandbox admits only the target instance and " +
+		"Fishhawk's own endpoints. A repository-local check that needs a database or a " +
+		"container daemon cannot run here and fails with `connect: operation not permitted`: " +
+		"that covers pgtest- or testcontainers-backed Go tests, anything that reads " +
+		"`FISHHAWK_TEST_PG_URL`, `psql`, and `docker` commands. Do not attempt such a check, " +
+		"and do not reach for it under Posture B, which does not extend to it. The " +
+		"committed-tree verify gate already ran those tests against a provisioned database " +
+		"before this stage.\n")
+	b.WriteString("- When such a check is the only way to decide a criterion that is NOT a " +
+		"declared skip, report it `result`=`undecidable` and START its `undecidable_reason` " +
+		"with `" + plan.UndecidableCauseSandboxDeniedDB + ":` followed by the check you could " +
+		"not run, for example `" + plan.UndecidableCauseSandboxDeniedDB + ": TestFoo needs " +
+		"the pgtest Postgres`. Fishhawk records that token as the criterion's undecidable " +
+		"cause; it never changes the verdict.\n")
 }
 
 // writeAcceptanceSeededFixtures renders the "### Seeded fixtures" section of the
@@ -4779,7 +4826,9 @@ func writeAcceptanceOperatorAddedCriteria(b *strings.Builder, t Trigger) {
 // writeAcceptanceCriteriaForAcceptance renders the acceptance validator's
 // binding checklist — one block per criterion carrying id, statement, source
 // (+source_ref/rationale), the effective blocking value (nil->true schema
-// default), verify_hint, and preconditions. verification.out_of_scope renders
+// default), verify_hint, preconditions, and the skip_expected /
+// expectation_basis / requires_live_validation declaration when set (E72.63 /
+// #4095). verification.out_of_scope renders
 // as the explicit not-covered list. A nil plan or an empty criteria set is a
 // loud warning line (the plan_acceptance_precheck gate normally prevents it).
 //
@@ -4837,6 +4886,20 @@ func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, t Trigger) {
 		}
 		for _, pre := range c.Preconditions {
 			fmt.Fprintf(b, "  precondition: %s\n", pre)
+		}
+		// E72.63 / #4095: the planner's reviewed skip declaration. Without
+		// these lines the validator could not tell a declared skip from a
+		// drivable criterion, tried to decide it anyway, and reported it
+		// undecidable (run 82487694). The basis renders only when non-blank,
+		// and only under skip_expected, which is what the schema pairs it with.
+		if c.SkipExpected {
+			b.WriteString("  skip_expected: true\n")
+			if strings.TrimSpace(c.ExpectationBasis) != "" {
+				fmt.Fprintf(b, "  expectation_basis: %s\n", c.ExpectationBasis)
+			}
+		}
+		if c.RequiresLiveValidation {
+			b.WriteString("  requires_live_validation: true\n")
 		}
 	}
 	b.WriteString("\n")

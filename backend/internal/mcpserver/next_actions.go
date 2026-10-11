@@ -686,7 +686,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			// flag empty and falls back to plain succeeded_pr_open.
 			if acceptanceVerdict == acceptanceVerdictUndecidable {
 				return &NextActions{State: "succeeded_acceptance_undecidable", Actions: mergeRitualActions(run,
-					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided")}
+					"the run succeeded with its PR open; the acceptance stage could not DECIDE one or more acceptance criteria (#2512) — no criterion failed, so this is not a triage, and the run is merge-eligible with no arbitration. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided. "+acceptanceUndecidableCausesClause)}
 			}
 			// E72.12 / #3458: the terminal-run twin of the
 			// acceptance_verdict_unshipped arm. The run reported succeeded with
@@ -1858,7 +1858,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		// text is the only mechanism carrying the ask, so next_actions_test.go
 		// pins its load-bearing claims.
 		return &NextActions{State: "acceptance_undecidable", Actions: mergeRitualActions(run,
-			"the acceptance stage RAN but could not DECIDE one or more acceptance criteria (#2512) — read the undecidable_reason on each row in the acceptance artifact. No criterion FAILED, so this is not a triage and there is nothing to arbitrate; the run is merge-eligible. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided and why you are merging anyway")}
+			"the acceptance stage RAN but could not DECIDE one or more acceptance criteria (#2512) — read the undecidable_reason on each row in the acceptance artifact. No criterion FAILED, so this is not a triage and there is nothing to arbitrate; the run is merge-eligible. But it is NOT a validated pass: acknowledge in your merge verdict which criteria went undecided and why you are merging anyway. "+acceptanceUndecidableCausesClause)}
 	case acceptanceVerdictFailed:
 		// E66.37 / #2474: an operator arbitration bound to THIS verdict discharges
 		// the paged triage, so the server gate reads acceptance_arbitrated and the
@@ -2738,6 +2738,18 @@ const sliceIntegrationConflictReasonPrefix = failuresig.AnchorSliceIntegrationCo
 // second copy exists to drift.
 const sliceIntegrationGiveUpReasonPrefix = failuresig.AnchorSliceIntegrationGiveUp
 
+// acceptanceUndecidableCausesClause closes both acceptance_undecidable reasons
+// (the running-run arm and its succeeded_acceptance_undecidable twin, E72.63 /
+// #4095). The acceptance ingest records an undecidable_causes key on the
+// acceptance_outcome_recorded payload ONLY when it classified a row, so the
+// clause is conditional: it tells the operator what the key means when present,
+// and most undecidable runs carry none.
+const acceptanceUndecidableCausesClause = "When the " + auditCategoryAcceptanceOutcomeRecorded +
+	" entry carries an " + acceptanceUndecidableCausesKey + " key, it names the criteria left undecided for a classified cause: " +
+	acceptanceUndecidableCauseSandboxDeniedDB + " means the acceptance sandbox could not reach a database or " +
+	"container daemon to run the check that decides the criterion, and the committed-tree verify gate already " +
+	"ran those tests against a provisioned database"
+
 // Acceptance audit categories + verdict/disposition vocabulary (E31.9 /
 // ADR-049). These strings are the cross-module seam between the backend, which
 // WRITES the acceptance_outcome_recorded / acceptance_triage_decided audit
@@ -2824,6 +2836,15 @@ const (
 	// backend/internal/plan.AcceptanceVerdictUndecidable (mirrored, not imported
 	// — the #875 compile trap) and is pinned by the literal-table test.
 	acceptanceVerdictUndecidable = "undecidable"
+	// acceptanceUndecidableCausesKey and acceptanceUndecidableCauseSandboxDeniedDB
+	// mirror backend/internal/plan.UndecidableCausesKey and
+	// plan.UndecidableCauseSandboxDeniedDB (E72.63 / #4095) — mirrored, not
+	// imported, the #875 convention. The classifier never reads them: they are
+	// named only in the acceptance_undecidable reasons, through
+	// acceptanceUndecidableCausesClause. Pinned against the plan constants by
+	// TestNextActions_AcceptanceUndecidable_AcknowledgementPrompt.
+	acceptanceUndecidableCausesKey            = "undecidable_causes"
+	acceptanceUndecidableCauseSandboxDeniedDB = "sandbox_denied_db"
 
 	// Auto-routed dispositions (a state transition fired): NOT paged.
 	acceptanceDispositionFixupDispatched = "fixup_dispatched"

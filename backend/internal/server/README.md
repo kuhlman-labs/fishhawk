@@ -3061,6 +3061,8 @@ Post-fix-up implement re-review is dispatched from `succeedFixupPushStage`'s pat
 - **`blocking_criterion_undecided` (E68.28 / #3057)** — the sixth advisory rule on the same shared evaluator (`plan.BlockingUndecidedCriteria`, wired into `plan.EvaluateAcceptanceCriteria`; alias const `acceptanceRuleBlockingCriterionUndecided`; rule contract in `docs/spec/plan-standard-v1.md`). Fires per criterion that is effectively BLOCKING, carries a non-empty `source`, and whose `verify_hint` is EMPTY or whitespace-only — it names no deciding test and no observable surface at all. It is the deliberate COMPLEMENT of `criterion_restates_test`, which fires on POSITIVE test-only evidence and is silent on an empty hint: the absence case was unguarded by every other rule in the set. Exempt for a non-blocking criterion, for `skip_expected`-with-basis / `requires_live_validation` (the shared `criterionDeclaresUnevaluable` predicate), and for an EMPTY `source` — the last making it structurally INTAKE-INERT, the way the provenance rules are, since `refinement.EvaluateDraftCriteria` never sets a source or a hint. ADVISORY — it never refuses a plan.
   - **Rendering: DELIBERATELY none.** No payload field and no per-rule prompt wiring were added — the finding rides the existing `Findings` array into both the `plan_acceptance_precheck` audit payload and `prompt.AcceptancePrecheckEvidence`, where `writePlanGateEvidence` renders an unrecognised Rule as a generic `- FINDING <rule> (criterion: <id>): <detail>` line. `TestAcceptancePrecheck_BlockingCriterionUndecided_ReachesAuditAndReviewPrompt` (+ its negative twin) is the cross-layer seam test threading plan artifact → shared evaluator → audit persistence → prompt render.
   - **`all_criteria_skip_expected` is SUPPRESSED under `acceptance_surface: none`** (the evaluator gates it on `!DeclaresNoAcceptanceSurface`), so `all_skip_short_circuit` reads false for a `none` plan even though `AcceptanceSkippableAllSkipWithBasis` may be true. The #3026 "same boolean as the orchestrator short-circuit" invariant is deliberately narrowed to "fires when the short-circuit WOULD run": under `none` the stage is omitted at approval (next section), so the short-circuit never runs on the parent. A run that still carries the stage (a decomposition child, or the two partial states below) short-circuits as before — runtime behaviour is unchanged; only the advisory stops nagging about a ceremony the parent will not perform.
+- **`criterion_requires_database` (E72.63 / #4095)** — the seventh advisory rule on the same shared evaluator (`plan.DatabaseBackedCriteria`, wired into `plan.EvaluateAcceptanceCriteria`; alias const `acceptanceRuleCriterionRequiresDatabase`; rule contract in `docs/spec/plan-standard-v1.md`). Fires per criterion whose `verify_hint` (alone) names a database- or container-backed check — `pgtest`, `testcontainers`, `_pg_test.go`, `FISHHAWK_TEST_PG_URL`, `db-backed`/`database-backed`/`postgres-backed`, `psql`, `docker run`/`exec`/`compose` — and no operator-observable surface. The acceptance network sandbox admits only the preview target's ports, so such a check fails `connect: operation not permitted` and the criterion lands undecidable as `sandbox_denied_db` (the #4094 shape). The detail names both remedies: name the preview surface that decides it, or declare `skip_expected: true` with an `expectation_basis` citing the committed-tree verify gate. Three suppressors: the shared `criterionDeclaresUnevaluable` declaration, a named observable surface (with `FISHHAWK_TEST_PG_URL` masked first, since it contains the `fishhawk_` surface substring and would otherwise clear itself), and a NEGATED marker (polarity-aware via `anyUnnegatedOccurrence`, like `criterion_restates_test`). No cross-rule suppression: a `pgtest`-only hint draws both rules. INTAKE-INERT by construction — drafts carry no `verify_hint`. Residual: a hint naming a plain `foo_test.go` that happens to be pgtest-backed is not detected at plan time; the acceptance prompt's sandbox-limits section covers it at runtime. ADVISORY — it never refuses a plan.
+  - **Rendering: DELIBERATELY none,** exactly like `blocking_criterion_undecided`: no payload field and no per-rule prompt wiring — the finding rides `Findings` into the `plan_acceptance_precheck` payload and renders as a generic `- FINDING criterion_requires_database (criterion: <id>): <detail>` line. `TestAcceptancePrecheck_CriterionRequiresDatabase` (+ its declared-skip twin) is the cross-layer seam test (plan artifact → shared evaluator → audit persistence → prompt render).
 
 ## Acceptance-stage omission at plan approval (`acceptance_omission.go`, E72.1 / #3325)
 
@@ -6417,6 +6419,37 @@ severity-monotone `acceptanceVerdictAtLeast` ladder to `undecidable`, and
   merge-eligible-with-acknowledgement — so the operator-visible change is that an
   unbound run must be acknowledged at the merge gate instead of reading
   "accepted".
+
+**`undecidable_causes` names WHY rows were left undecided (E72.63 / #4095).**
+`handleShipAcceptance` classifies each UNDECIDABLE criterion row's
+`undecidable_reason` with `plan.ClassifyUndecidableReason`
+(`backend/internal/plan/acceptance_cause.go`, helper
+`acceptanceUndecidableCauses`) and records the classified row ids per cause on
+the `acceptance_outcome_recorded` payload as `undecidable_causes`, e.g.
+`{"sandbox_denied_db": ["a", "b"]}`, in row order.
+
+- **Descriptive only.** It never changes the recorded verdict, the severity
+  ladder, the clamp, `verdict_reported`, the tallies or triage routing.
+- **Emitted only when non-empty,** so an outcome with no classified row
+  marshals byte-identically to before; older entries simply lack it and no
+  reader requires it. Presence (not emptiness) is pinned by
+  `TestShipAcceptance_UndecidableCauses_OmittedWhenUnclassified`.
+- **Undecidable rows only** — the same rows `criteria_undecidable` tallies,
+  retired rows included. A passed, failed or skipped row is never classified,
+  even when its `expectation_basis` names a database
+  (`TestShipAcceptance_UndecidableCauses_SandboxDeniedDB`).
+- **One cause today, `sandbox_denied_db`:** the check deciding the criterion
+  needs a database or container daemon the acceptance network sandbox cannot
+  reach. It matches the explicit `sandbox_denied_db` token the acceptance
+  prompt asks the agent to lead the reason with, or — as a heuristic fallback
+  over agent prose — a database/container marker together with a sandbox
+  denial (the `operation not permitted` EPERM text, or the word `sandbox`
+  beside a refusal verb). A reason using `sandbox` only as a LOCATION ("the
+  sandbox checkout lacks the database migration file") does not classify.
+  The accepted false-positive boundary is a reason that also carries a refusal
+  verb for an unrelated cause; that is acceptable because the key is
+  descriptive. Pinned by `TestClassifyUndecidableReason`, whose positive rows
+  are the four verbatim #4094 reasons.
 
 **Both dispatch gates now fail CLOSED on an unresolvable expectation.** The
 verb-side gate (`backend/internal/mcpserver/acceptance_target.go`) refuses with
