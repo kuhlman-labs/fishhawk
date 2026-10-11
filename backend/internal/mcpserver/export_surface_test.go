@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 368 names are tool I/O request/response structs. The MCP
+// The bulk of these 371 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -329,6 +329,13 @@ var exportBaseline = []string{
 	"PreviewIssueInput",
 	"PreviewIssueOutput",
 	"ProductReport",
+	// #4191: fishhawk_promote_queued_stage's I/O and the client mirror of
+	// POST /v0/stages/{stage_id}/concurrency/promote. Exported because
+	// PromoteQueuedStageOutput embeds PromoteQueuedStageResult and the SDK
+	// reflects over the whole tree.
+	"PromoteQueuedStageInput",
+	"PromoteQueuedStageOutput",
+	"PromoteQueuedStageResult",
 	"ReadCrewMessagesInput",
 	"ReadCrewMessagesOutput",
 	"ReapFailureResult",

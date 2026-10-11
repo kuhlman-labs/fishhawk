@@ -309,6 +309,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRebaseRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
 	registerReapStage(srv, resolver)
+	// #4191: the operator promote of a queued local concurrency-group waiter,
+	// beside the stage-control verbs. It never acts on the merge-candidate
+	// queue (#4297 owns that promote).
+	registerPromoteQueuedStage(srv, resolver)
 	registerReconcileReviews(srv, resolver)
 	// #4219: the re-run of a verdict-less implement-review round, adjacent to
 	// the reconcile it follows (reconcile closes an orphaned round; this

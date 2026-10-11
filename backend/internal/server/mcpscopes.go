@@ -212,6 +212,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_run_stage":          {anyOf: []string{"write:runs"}}, // host_dispatch.go handleHostDispatchStage
 	"fishhawk_run_children":       {anyOf: []string{"write:runs"}}, // host_dispatch.go handleHostDispatchStage
 
+	// stage_concurrency_promote.go handlePromoteQueuedStage (#4191). It also
+	// refuses a run-bound token, which carries only mcp:read/write:retries.
+	"fishhawk_promote_queued_stage": {anyOf: []string{"write:runs"}},
+
 	// --- write:stages.
 	"fishhawk_rebase_run_branch":         {anyOf: []string{"write:stages"}}, // rebase_branch.go handleRebaseRunBranch
 	"fishhawk_vouch_commit":              {anyOf: []string{"write:stages"}}, // vouch.go handleVouchCommit
