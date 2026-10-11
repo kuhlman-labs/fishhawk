@@ -374,6 +374,40 @@ func TestAdmitNext_OtherAccountsLiveEntryDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestActiveBases_ListsEveryBaseWithAHeldOrLiveEntry: one row per (account,
+// repo, base ref) with an active entry; a base whose entries are all terminal
+// is not listed, and an empty table answers an empty, non-nil list.
+func TestActiveBases_ListsEveryBaseWithAHeldOrLiveEntry(t *testing.T) {
+	f := newFixture(t)
+	if got, err := f.store.ActiveBases(context.Background()); err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("ActiveBases on an empty table = %v, %v; want an empty non-nil list", got, err)
+	}
+	acct := uuid.New()
+	f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "mq-"+acct.String())
+	live, held, tenanted, settled := f.run(), f.run(), f.run(), f.run()
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, tenanted)
+	f.seed(uuid.New(), live, StateLive, time.Minute)
+	f.seed(uuid.New(), held, StateHeld, 30*time.Second)
+	f.seed(uuid.New(), tenanted, StateHeld, 20*time.Second)
+	gone := f.enqueue(settled, "release", "r1").Entry
+	if _, err := f.store.Settle(context.Background(), gone.ID, StateDropped, "run_terminal"); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	got, err := f.store.ActiveBases(context.Background())
+	if err != nil {
+		t.Fatalf("ActiveBases: %v", err)
+	}
+	want := []Base{mainBase(), {AccountID: acct.String(), Repo: testRepo, BaseRef: "main"}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ActiveBases = %+v, want %+v (one per active base, settled release base absent)", got, want)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.store.ActiveBases(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ActiveBases on a canceled context err = %v, want context.Canceled", err)
+	}
+}
+
 // TestAdmitNext_ConcurrentAdmittersAdmitExactlyOne is plan control (4).
 func TestAdmitNext_ConcurrentAdmittersAdmitExactlyOne(t *testing.T) {
 	f := newFixture(t)

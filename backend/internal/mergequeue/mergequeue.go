@@ -193,6 +193,7 @@ type Store interface {
 	Settle(ctx context.Context, entryID uuid.UUID, state State, reason string) (SettleResult, error)
 	ActiveForRun(ctx context.Context, runID uuid.UUID) (Status, bool, error)
 	ListForBase(ctx context.Context, base Base) ([]Entry, error)
+	ActiveBases(ctx context.Context) ([]Base, error)
 }
 
 // validate refuses a malformed Base before any SQL runs.

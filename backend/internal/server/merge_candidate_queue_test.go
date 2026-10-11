@@ -672,6 +672,76 @@ func (f *mcqFixture) pumpBase(r *mcqRun) {
 	f.srv.pumpMergeCandidateQueue(context.Background(), mergequeue.Base{AccountID: runRow.AccountID, Repo: runRow.Repo, BaseRef: mcqBase})
 }
 
+// TestMergeCandidateQueue_PeriodicPumpReleasesTerminalLiveRun: the live
+// entry's run goes terminal WITHOUT the REST cancel (state set to failed
+// directly, as a stage failure or a sweep does), so no event hook releases the
+// base. ONE periodic sweep — no enqueue, settle or cancel event, no base named
+// by the caller — drops the live entry and admits the held one behind it.
+func TestMergeCandidateQueue_PeriodicPumpReleasesTerminalLiveRun(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.exec(`UPDATE runs SET state = 'failed' WHERE id = $1`, a.id)
+	f.requireState(a, mergequeue.StateLive, "")
+	f.requireState(b, mergequeue.StateHeld, "")
+
+	if n := f.srv.PumpMergeCandidateQueues(context.Background()); n != 1 {
+		t.Fatalf("periodic pump swept %d bases, want 1", n)
+	}
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal)
+	f.requireState(b, mergequeue.StateLive, "")
+	if n := len(f.rows(b, CategoryMergeCandidateQueueAdmitted)); n != 1 {
+		t.Fatalf("B admitted audit rows = %d, want 1", n)
+	}
+	if n := f.srv.PumpMergeCandidateQueues(context.Background()); n != 1 {
+		t.Fatalf("second sweep pumped %d bases, want 1 (B still live)", n)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+}
+
+// TestMergeCandidateQueue_PeriodicPumpListErrorPumpsNothing: an unreadable
+// base list pumps no base (the next tick retries), and an unwired queue
+// sweeps nothing.
+func TestMergeCandidateQueue_PeriodicPumpListErrorPumpsNothing(t *testing.T) {
+	fs := &mcqFaultStore{activeBases: func() ([]mergequeue.Base, error) { return nil, errMCQStore }}
+	srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
+	if n := srv.PumpMergeCandidateQueues(context.Background()); n != 0 {
+		t.Fatalf("sweep on a list error pumped %d bases, want 0", n)
+	}
+	if n := fs.called("AdmitNext"); n != 0 {
+		t.Fatalf("AdmitNext ran %d times after a list error, want 0", n)
+	}
+	if n := New(Config{Addr: "127.0.0.1:0"}).PumpMergeCandidateQueues(context.Background()); n != 0 {
+		t.Fatalf("unwired sweep pumped %d bases, want 0", n)
+	}
+}
+
+// TestMergeCandidateQueue_PeriodicPumpRunsAtBootAndOnTick: the loop sweeps
+// once immediately, again on the ticker, and returns on cancel.
+func TestMergeCandidateQueue_PeriodicPumpRunsAtBootAndOnTick(t *testing.T) {
+	fs := &mcqFaultStore{activeBases: func() ([]mergequeue.Base, error) { return []mergequeue.Base{}, nil }}
+	srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunMergeCandidateQueuePump(ctx, 5*time.Millisecond)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for fs.called("ActiveBases") < 2 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("pump loop swept %d times in 10s, want >= 2 (boot + one tick)", fs.called("ActiveBases"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pump loop did not return after cancel")
+	}
+}
+
 // TestMergeCandidateQueue_FanInNotSerialized: a fan_in pass starts at once
 // even while another entry holds the base.
 func TestMergeCandidateQueue_FanInNotSerialized(t *testing.T) {
@@ -702,6 +772,7 @@ type mcqFaultStore struct {
 	setPhase     func(uuid.UUID, mergequeue.Phase) (mergequeue.Entry, error)
 	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
 	activeForRun func(uuid.UUID) (mergequeue.Status, bool, error)
+	activeBases  func() ([]mergequeue.Base, error)
 }
 
 func (s *mcqFaultStore) record(name string) {
@@ -760,6 +831,14 @@ func (s *mcqFaultStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (merg
 		return s.activeForRun(runID)
 	}
 	return s.Store.ActiveForRun(ctx, runID)
+}
+
+func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, error) {
+	s.record("ActiveBases")
+	if s.activeBases != nil {
+		return s.activeBases()
+	}
+	return s.Store.ActiveBases(ctx)
 }
 
 var errMCQStore = fmt.Errorf("queue store unavailable")

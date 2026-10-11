@@ -249,7 +249,10 @@ Statuses:
                      base's ADR-092 queue behind the pass holding the line.
                      Immediate, no verdict row. It clears ON ITS OWN: when the
                      line frees, the queue advances a behind branch, re-anchors
-                     and starts the pass — nothing to invoke. queue_position,
+                     and starts the pass; a stalled line self-heals on the
+                     periodic pump (about 1 minute), and
+                     fishhawk_rebase_run_branch pumps the base manually.
+                     queue_position,
                      anchored_head_sha and live_run_id carry the entry;
                      next_action names fishhawk_get_run_status (watch
                      merge_candidate_queue), then dispatch/await the pass once

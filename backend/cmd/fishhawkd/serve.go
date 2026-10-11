@@ -3952,6 +3952,16 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("runner_kind", *schedulerRunnerKind))
 	}
 
+	// ADR-092 held-pass queue liveness (#4200): pump every base with a held
+	// or live entry once at boot and then every minute. A pump drops a live
+	// entry whose run went terminal and re-claims a stale admission, so a base
+	// stalled by a path no event hook releases recovers within one tick.
+	if cfg.MergeQueue != nil {
+		go srv.RunMergeCandidateQueuePump(ctx, server.MergeCandidateQueuePumpInterval)
+		logger.Info("merge-candidate queue pump started",
+			slog.Duration("interval", server.MergeCandidateQueuePumpInterval))
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
 

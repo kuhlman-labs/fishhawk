@@ -457,7 +457,7 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		if out.LiveRunID != "" {
 			holder = "run " + out.LiveRunID
 		}
-		out.Note = fmt.Sprintf("held at position %d on %s behind %s (ADR-092): no runner slot is used and admission is automatic when the line frees — the queue advances a behind branch, re-anchors and starts the pass; nothing to invoke", st.Position, e.BaseRef, holder)
+		out.Note = fmt.Sprintf("held at position %d on %s behind %s (ADR-092): no runner slot is used and admission is automatic when the line frees — the queue advances a behind branch, re-anchors and starts the pass; a stalled line self-heals on the periodic pump (about 1 minute), and fishhawk_rebase_run_branch pumps the base manually", st.Position, e.BaseRef, holder)
 		return out, nil
 	}
 	out.Note = "live: this run holds the " + e.BaseRef + " merge-candidate line (ADR-092) until its pull request merges, its pass fails or the run ends; phase " + string(e.Phase)

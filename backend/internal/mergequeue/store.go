@@ -488,3 +488,25 @@ ORDER BY (e.state = 'live') DESC, e.enqueued_at, e.id`, base.Repo, base.BaseRef,
 	}
 	return out, nil
 }
+
+// ActiveBases returns every base with a held or live entry, ordered by
+// (account, repo, base ref). Never nil. It is the periodic pump's sweep list
+// (backend/internal/server/README.md, "Periodic pump"): across every account,
+// like the rest of the store.
+func (s *PostgresStore) ActiveBases(ctx context.Context) ([]Base, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT COALESCE(r.account_id::text, ''), e.repo, e.base_ref`+entryFrom+`
+WHERE e.state IN ('held', 'live')
+ORDER BY 1, 2, 3`)
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: list active bases: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Base, error) {
+		var b Base
+		err := row.Scan(&b.AccountID, &b.Repo, &b.BaseRef)
+		return b, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: scan active bases: %w", err)
+	}
+	return out, nil
+}

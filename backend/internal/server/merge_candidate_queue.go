@@ -213,6 +213,49 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 	return out
 }
 
+// MergeCandidateQueuePumpInterval is the periodic pump's tick: the bound on
+// how long a base stays stalled behind a live entry whose run went terminal
+// through a path that does not release the queue (a failure, a sweep).
+const MergeCandidateQueuePumpInterval = time.Minute
+
+// PumpMergeCandidateQueues pumps every base with a held or live entry once and
+// returns how many bases it pumped. Each pump drops a live entry whose run is
+// terminal and re-claims a stale admission, so this one sweep is the liveness
+// backstop for every hand-off an event hook missed. A list error is logged and
+// pumps nothing; the next tick retries.
+func (s *Server) PumpMergeCandidateQueues(ctx context.Context) int {
+	if s.cfg.MergeQueue == nil {
+		return 0
+	}
+	bases, err := s.cfg.MergeQueue.ActiveBases(ctx)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate queue: listing active bases failed; the next pump tick retries",
+			slog.String("error", err.Error()))
+		return 0
+	}
+	for _, b := range bases {
+		s.pumpMergeCandidateQueue(ctx, b)
+	}
+	return len(bases)
+}
+
+// RunMergeCandidateQueuePump pumps every active base once at boot and then on
+// every interval tick, returning when ctx is cancelled.
+func (s *Server) RunMergeCandidateQueuePump(ctx context.Context, interval time.Duration) {
+	s.PumpMergeCandidateQueues(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.PumpMergeCandidateQueues(ctx)
+		}
+	}
+}
+
 // mergeCandidateQueueRunTerminal reports whether the run is terminal. A read
 // error is NOT terminal: an uncertain read never drops an entry.
 func (s *Server) mergeCandidateQueueRunTerminal(ctx context.Context, runID uuid.UUID) bool {

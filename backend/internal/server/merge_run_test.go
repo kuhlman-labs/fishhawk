@@ -2857,7 +2857,7 @@ func TestMergeRun_MergeCandidate_HeldRefusedBeforeBehind(t *testing.T) {
 		d["next_step"] != "fishhawk_get_run_status" {
 		t.Errorf("details = %v, want held/2/live/anchored0/head/base/fishhawk_get_run_status", d)
 	}
-	for _, want := range []string{"position 2", live.String(), "nothing to invoke", "fishhawk_get_run_status"} {
+	for _, want := range []string{"position 2", live.String(), "self-heals on the periodic pump", "fishhawk_rebase_run_branch pumps the base manually", "fishhawk_get_run_status"} {
 		if !strings.Contains(env.Error.Message, want) {
 			t.Errorf("message missing %q: %q", want, env.Error.Message)
 		}

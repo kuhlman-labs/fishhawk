@@ -868,7 +868,7 @@ func (s *Server) mergeCandidateHeldRefusal(ctx context.Context, runRow *run.Run,
 	}
 	return &mergeCandidateGateResult{
 		Code: mergeCodeCandidateHeld,
-		Message: fmt.Sprintf("this run's merge-candidate verify pass is HELD at position %d in the %s queue behind %s, which holds the base's line (ADR-092 D1), so the merge is refused. Admission is automatic: when the line frees the queue advances this branch onto %s if it is behind, re-anchors and starts the pass for the resulting head — there is nothing to invoke. Watch merge_candidate_queue with fishhawk_get_run_status; once admitted, dispatch and await the pass, then re-invoke the merge. No merge verdict was recorded.",
+		Message: fmt.Sprintf("this run's merge-candidate verify pass is HELD at position %d in the %s queue behind %s, which holds the base's line (ADR-092 D1), so the merge is refused. Admission is automatic: when the line frees the queue advances this branch onto %s if it is behind, re-anchors and starts the pass for the resulting head. A stalled line self-heals on the periodic pump (about 1 minute); fishhawk_rebase_run_branch pumps the base manually. Watch merge_candidate_queue with fishhawk_get_run_status; once admitted, dispatch and await the pass, then re-invoke the merge. No merge verdict was recorded.",
 			st.Position, st.Entry.BaseRef, holder, st.Entry.BaseRef),
 		Details: details,
 	}

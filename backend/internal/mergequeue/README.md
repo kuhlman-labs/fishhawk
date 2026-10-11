@@ -83,6 +83,9 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   when none). Position and live run count the run's OWN account only.
 - **`ListForBase(base)`**: the base's active entries, live first, then held by
   `(enqueued_at, id)`. Never nil. The seed for ADR-093's queue read surface.
+- **`ActiveBases()`**: every base with a held or live entry, one per
+  `(account, repo, base ref)`, ordered by those fields. Never nil. The
+  periodic pump's sweep list; spans every account.
 
 ## Reasons
 
@@ -143,11 +146,10 @@ the BYPASSRLS system context.
 ## Residuals
 
 - The store never observes run or PR state. A `live` entry holds its base
-  until a caller settles it, so a run that goes terminal without a settle
-  STALLS the base. The serializer's contract (ADR-092 D4, #4200 approval
-  condition 4) is to release on the run-terminal transition and to drop a
-  terminal-run live entry when it pumps; until that is wired, recovery is any
-  call that settles the entry (the run's cancel path, or the next pump on that
-  base).
+  until a caller settles it; the serializer drops a terminal-run live entry
+  when it pumps, and fishhawkd pumps every `ActiveBases` base once at boot and
+  then on a 1-minute ticker (`backend/internal/server/README.md`, "Periodic
+  pump"), so for a run that goes terminal without a settle the bound is one
+  pump tick. The run's cancel path releases at once.
 - A `passed` live entry holds the line until its PR merges (ADR-092 D4); an
   operator who never merges stalls the base. ADR-093 merge-on-pass removes it.
