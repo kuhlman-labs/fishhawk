@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
@@ -913,6 +914,15 @@ type Config struct {
 	// bare CAS, no queue, no block). See stage_concurrency.go and
 	// backend/internal/concurrency/README.md.
 	Concurrency concurrency.Store
+
+	// MergeQueue is the ADR-092 held-pass queue (#4200): with it wired, a
+	// base_advance or conflict_resolution merge-candidate verify pass is
+	// serialized per (repository, base ref) — ONE live pass per base, the
+	// rest held FIFO with no runner slot, handed off at merge. Wired from
+	// serve.go next to Concurrency (mergequeue.NewPostgresStore); nil keeps
+	// ADR-090's start-immediately behaviour byte-identical. See
+	// merge_candidate_queue.go and backend/internal/mergequeue/README.md.
+	MergeQueue mergequeue.Store
 
 	// CrewMailbox is the crew-message domain layer (E77.3 / #3737, ADR-081
 	// #3727 D4) behind the five /v0/crew-messages routes: sends and

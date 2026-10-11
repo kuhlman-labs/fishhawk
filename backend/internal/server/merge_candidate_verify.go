@@ -176,10 +176,16 @@ type mergeCandidateVerifyParams struct {
 // when a pass is live for the head (Triggered says whether THIS call appended
 // it), passed/failed when a verdict is already recorded for the head (nothing
 // started), or not_required when no verify command is declared (D4).
+//
+// With the ADR-092 queue wired, State may also be held: the pass waits behind
+// its base's live pass (Position is its 1-based place, LiveRunID the run
+// holding the line) and nothing was started.
 type mergeCandidateVerifyStart struct {
 	State     string
 	StageID   uuid.UUID
 	Triggered bool
+	Position  int
+	LiveRunID *uuid.UUID
 }
 
 // mergeCandidateVerifyRefusal is the negative answer: no pass could be
@@ -202,7 +208,25 @@ type mergeCandidateVerifyRefusal struct {
 //
 // The re-open hands run.FixupStage the pass's OWN counts (0 prior, max 1,
 // ceiling 1), so the fix-up counter is never read or spent.
+//
+// ADR-092 (#4200): with Config.MergeQueue (and a forge) wired, a serialized
+// cause (base_advance, conflict_resolution) is routed through the held-pass
+// queue (serializeMergeCandidateVerifyPass, merge_candidate_queue.go) instead
+// of starting at once; fan_in and an unwired queue take the direct start
+// below unchanged.
 func (s *Server) startMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
+	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+	if s.cfg.MergeQueue != nil && s.cfg.GitHub != nil && s.cfg.RunRepo != nil && s.cfg.AuditRepo != nil &&
+		mergeCandidateQueueSerialized(p.Cause) && p.Branch != "" && p.BaseRef != "" && p.HeadSHA != "" && actor.Subject != "" {
+		return s.serializeMergeCandidateVerifyPass(ctx, runID, p, actor)
+	}
+	return s.beginMergeCandidateVerifyPass(ctx, runID, p, actor)
+}
+
+// beginMergeCandidateVerifyPass is the direct start: the trigger append and
+// the implement-stage re-open (or, for a pending pass, the trigger
+// REPLACEMENT). The queue's admission calls it for the admitted head.
+func (s *Server) beginMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
 	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		return nil, &mergeCandidateVerifyRefusal{Reason: "no run/audit repository is wired, so no merge-candidate verify pass can be authorized"}
@@ -246,6 +270,30 @@ func (s *Server) startMergeCandidateVerifyPass(ctx context.Context, runID uuid.U
 	}
 	if verdict != nil && (verdict.Result == mergeCandidateResultPassed || verdict.Result == mergeCandidateResultFailed) {
 		return &mergeCandidateVerifyStart{State: verdict.Result, StageID: impl.ID}, nil
+	}
+
+	// PENDING REPLACEMENT (ADR-092 D2). A live pass for an OLDER head whose
+	// stage is re-opened but not yet dispatched is superseded in place: the
+	// newest trigger is the live one, so appending a replacement for this
+	// head (carrying the old trigger's restore anchors) re-targets the pass
+	// without a second re-open and keeps the stage's place in its
+	// local-verify group. A dispatched or running pass keeps the refusal
+	// below: its runner already holds the old trigger.
+	if live != nil && (impl.State == run.StageStatePending || impl.State == run.StageStateAwaitingHostDispatch) {
+		replacement := mergeCandidateVerifyTrigger{
+			Branch:                p.Branch,
+			BaseRef:               p.BaseRef,
+			ExpectedHeadSHA:       p.HeadSHA,
+			Cause:                 p.Cause,
+			VerifyCommand:         command,
+			PriorState:            live.payload.PriorState,
+			ReparkedReviewStageID: live.payload.ReparkedReviewStageID,
+		}
+		if err := s.appendMergeCandidateTrigger(ctx, runID, impl.ID, replacement, actor); err != nil {
+			return nil, &mergeCandidateVerifyRefusal{Reason: "recording the replacement merge-candidate verify trigger failed (" + err.Error() + "), so the pending pass still targets " + live.payload.ExpectedHeadSHA}
+		}
+		s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_start")
+		return &mergeCandidateVerifyStart{State: mergeCandidateStateInFlight, StageID: impl.ID, Triggered: true}, nil
 	}
 
 	priorState := impl.State
@@ -472,6 +520,10 @@ func (s *Server) recordMergeCandidateVerified(ctx context.Context, runID, stageI
 		return nil, err
 	}
 	s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_settle")
+	// ADR-092 D4: the verdict moves the run's live queue entry (ejects a red
+	// pass and hands the line on). A duplicate replay returned above, so a
+	// runner retry never re-applies it.
+	s.mergeCandidateQueueOnVerdict(ctx, runID, trigger.ExpectedHeadSHA, result)
 	return &mergeCandidateVerifiedRecord{Trigger: trigger, Result: result}, nil
 }
 

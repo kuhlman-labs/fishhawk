@@ -463,6 +463,10 @@ var KnownCategories = map[string]struct{}{
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
 	"merge_verdict_recorded":                  {},
+	"merge_candidate_queue_admitted":          {}, // E83.85 / #4200 (ADR-092 D1): a held merge-candidate pass was admitted as its base's ONE live pass (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
+	"merge_candidate_queue_held":              {}, // E83.85 / #4200 (ADR-092 D1): a merge-candidate pass was held behind its base's live pass, consuming no runner slot (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
+	"merge_candidate_queue_reanchored":        {}, // E83.85 / #4200 (ADR-092 D2): an active queue entry moved to a new anchored head in place, keeping its place (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
+	"merge_candidate_queue_settled":           {}, // E83.85 / #4200 (ADR-092 D4): a queue entry left the line as merged, ejected or dropped, naming the reason (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_verified":                {}, // E83.33 / #4018 (ADR-090): the result of a runner verify-only merge-candidate pass, bound to EXACTLY one head SHA; CONSUMES its trigger (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},

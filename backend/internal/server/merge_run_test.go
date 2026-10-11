@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -2826,6 +2827,95 @@ func TestMergeRun_AcceptanceStale_GuardPrecedesMergeSeam(t *testing.T) {
 	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
 	if w.Code != http.StatusConflict || decodeMergeErr(t, w).Error.Code != mergeCodeAcceptanceStale {
 		t.Fatalf("status = %d body = %s, want 409 acceptance_stale before the merge-seam guard", w.Code, w.Body.String())
+	}
+}
+
+// mcqGateStore wires a fake ADR-092 queue answering ActiveForRun with st/found/err.
+func (g *mcGateFixture) mcqGateStore(st mergequeue.Status, found bool, err error) {
+	g.s.cfg.MergeQueue = &mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+		return st, found, err
+	}}
+}
+
+// TestMergeRun_MergeCandidate_HeldRefusedBeforeBehind pins the ADR-092 held arm
+// (#4200): a run whose queue entry is HELD — and whose PR is ALSO behind, the
+// expected shape for a held PR — is refused 409 merge_candidate_held naming its
+// position, the live run, the anchored head and fishhawk_get_run_status, and the
+// behind probe never runs. Counterfactual: deleting the held arm in
+// mergeCandidateGate answers merge_base_behind → RED (the fixture is behind, so
+// only the held arm's PLACEMENT before the probe yields merge_candidate_held).
+func TestMergeRun_MergeCandidate_HeldRefusedBeforeBehind(t *testing.T) {
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.gh.behind = 1
+	live := uuid.New()
+	g.mcqGateStore(mcqHeldStatus(g.runID, 2, &live, "anchored0"), true, nil)
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateHeld)
+	d := env.Error.Details
+	if d["queue_state"] != "held" || d["queue_position"] != float64(2) || d["live_run_id"] != live.String() ||
+		d["anchored_head_sha"] != "anchored0" || d["head_sha"] != mcvHead || d["base_ref"] != mcvBaseRef ||
+		d["next_step"] != "fishhawk_get_run_status" {
+		t.Errorf("details = %v, want held/2/live/anchored0/head/base/fishhawk_get_run_status", d)
+	}
+	for _, want := range []string{"position 2", live.String(), "self-heals on the periodic pump", "fishhawk_rebase_run_branch pumps the base manually", "fishhawk_get_run_status"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("message missing %q: %q", want, env.Error.Message)
+		}
+	}
+	if g.gh.compareCalls != 0 {
+		t.Errorf("behind probe ran %d times, want 0 (the held arm precedes it)", g.gh.compareCalls)
+	}
+}
+
+// TestMergeRun_MergeCandidate_HeldWithoutLiveRun: a held entry on a base with
+// no live entry (between hand-offs) still refuses, with no live_run_id key.
+func TestMergeRun_MergeCandidate_HeldWithoutLiveRun(t *testing.T) {
+	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+	g.mcqGateStore(mcqHeldStatus(g.runID, 1, nil, mcvHead), true, nil)
+
+	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateHeld)
+	if _, ok := env.Error.Details["live_run_id"]; ok {
+		t.Errorf("details carry live_run_id with no live entry: %v", env.Error.Details)
+	}
+	if !strings.Contains(env.Error.Message, "no run yet") {
+		t.Errorf("message does not say no run holds the line: %q", env.Error.Message)
+	}
+}
+
+// TestMergeRun_MergeCandidate_QueueNotHeldFallsThrough pins that only HELD
+// refuses: a LIVE entry, no active entry, and an unreadable queue (fail-open)
+// all reach today's ADR-090 checks — behind → merge_base_behind, up to date →
+// admitted. Counterfactual: making the read-error arm refuse (return a gate
+// result instead of nil) turns the error rows into a non-merge_base_behind
+// answer / a refusal → RED; widening the held predicate to any entry turns the
+// live rows into merge_candidate_held → RED.
+func TestMergeRun_MergeCandidate_QueueNotHeldFallsThrough(t *testing.T) {
+	liveSt := mcqHeldStatus(uuid.Nil, 0, nil, mcvHead)
+	liveSt.Entry.State, liveSt.Entry.Phase = mergequeue.StateLive, mergequeue.PhaseVerifying
+	cases := []struct {
+		name   string
+		st     mergequeue.Status
+		found  bool
+		err    error
+		behind int
+	}{
+		{name: "live behind", st: liveSt, found: true, behind: 1},
+		{name: "live up to date", st: liveSt, found: true},
+		{name: "no entry behind", behind: 1},
+		{name: "read error behind", err: errMCQStore, behind: 1},
+		{name: "read error up to date", err: errMCQStore},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newMCGateFixture(t, mcvNoVerifySpecYAML)
+			g.gh.behind = tc.behind
+			g.mcqGateStore(tc.st, tc.found, tc.err)
+			if tc.behind > 0 {
+				g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeBaseBehind)
+				return
+			}
+			g.assertAdmitted(t, g.post(t))
+		})
 	}
 }
 

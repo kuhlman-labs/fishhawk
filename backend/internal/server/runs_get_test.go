@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -3921,4 +3922,97 @@ func TestGetRun_CapabilitiesBlock(t *testing.T) {
 				w.Body.String())
 		}
 	})
+}
+
+// getRunRaw invokes handleGetRun directly and returns the recorder.
+func getRunRaw(t *testing.T, s *Server, runID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	req.SetPathValue("run_id", runID.String())
+	w := httptest.NewRecorder()
+	s.handleGetRun(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET run %s = %d:\n%s", runID, w.Code, w.Body.String())
+	}
+	return w
+}
+
+// runQueueBlock decodes the merge_candidate_queue block and reports whether
+// the KEY was present on the wire (absent and null are both "omitted").
+func runQueueBlock(t *testing.T, w *httptest.ResponseRecorder) (*runMergeCandidateQueuePayload, bool) {
+	t.Helper()
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode run: %v", err)
+	}
+	blob, ok := raw["merge_candidate_queue"]
+	if !ok {
+		return nil, false
+	}
+	var p runMergeCandidateQueuePayload
+	if err := json.Unmarshal(blob, &p); err != nil {
+		t.Fatalf("decode merge_candidate_queue: %v\n%s", err, blob)
+	}
+	return &p, true
+}
+
+// TestGetRun_MergeCandidateQueue pins the ADR-092 run-read block (#4200) over
+// the REAL queue store: a HELD run (C, second behind live A) carries state
+// held, position 2, live_run_id A and its anchored head; the LIVE run carries
+// state live with its phase and no position; a run that was never queued
+// OMITS the key. Counterfactual: deleting the resp.MergeCandidateQueue
+// assignment in handleGetRun → the held/live arms read no block → RED.
+func TestGetRun_MergeCandidateQueue(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	c := f.seed("c", "c0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(c, "c0", "c1")
+	f.rebase(c)
+	never := f.seed("d", "d0", []byte(mcvUndelegatedSpecYAML))
+
+	q, ok := runQueueBlock(t, getRunRaw(t, f.srv, c.id))
+	if !ok {
+		t.Fatal("merge_candidate_queue omitted for a held run")
+	}
+	cEntry := f.entry(c)
+	if q.State != "held" || q.Position != 2 || q.LiveRunID != a.id.String() || q.AnchoredHeadSHA != "c1" ||
+		q.BaseRef != mcqBase || q.Repo != "x/y" || q.Phase != "" || q.AdmittedAt != nil ||
+		!q.EnqueuedAt.Equal(cEntry.EnqueuedAt) {
+		t.Fatalf("C block = %+v, want held pos 2 behind %s at c1 enqueued %s", q, a.id, cEntry.EnqueuedAt)
+	}
+	if !strings.Contains(q.Note, "position 2") || !strings.Contains(q.Note, a.id.String()) {
+		t.Errorf("C note = %q, want it to name position 2 and the live run", q.Note)
+	}
+	if q, _ := runQueueBlock(t, getRunRaw(t, f.srv, b.id)); q == nil || q.Position != 1 {
+		t.Fatalf("B block = %+v, want held at position 1", q)
+	}
+
+	q, ok = runQueueBlock(t, getRunRaw(t, f.srv, a.id))
+	if !ok {
+		t.Fatal("merge_candidate_queue omitted for the live run")
+	}
+	if q.State != "live" || q.Phase != string(mergequeue.PhaseVerifying) || q.Position != 0 ||
+		q.LiveRunID != a.id.String() || q.AdmittedAt == nil || !strings.HasPrefix(q.Note, "live:") {
+		t.Fatalf("A block = %+v, want live/verifying, no position, admitted", q)
+	}
+
+	if q, ok := runQueueBlock(t, getRunRaw(t, f.srv, never.id)); ok {
+		t.Fatalf("never-queued run carries merge_candidate_queue = %+v, want the key omitted", q)
+	}
+}
+
+// TestGetRun_MergeCandidateQueue_ReadErrorOmits pins the best-effort posture:
+// a queue store read error answers 200 with the key OMITTED (the run read
+// never fails on it). Counterfactual: turning the error arm into a 500
+// writeError → RED on the status; assigning the block on error is
+// unobservable (it is nil), so the 200 is the control.
+func TestGetRun_MergeCandidateQueue_ReadErrorOmits(t *testing.T) {
+	f := newMCQFixture(t)
+	_, b := f.wave()
+	f.srv.cfg.MergeQueue = &mcqFaultStore{Store: f.store, activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+		return mergequeue.Status{}, false, errMCQStore
+	}}
+	if q, ok := runQueueBlock(t, getRunRaw(t, f.srv, b.id)); ok {
+		t.Fatalf("merge_candidate_queue = %+v on a store read error, want the key omitted", q)
+	}
 }

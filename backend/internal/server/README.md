@@ -2540,6 +2540,98 @@ never has to push to a branch ADR-035 declares runner-owned.
   behaviourally by seeding deliberately DIFFERENT anchors so the restored
   state discriminates which one was consulted.
 
+## Merge-candidate held-pass queue (`merge_candidate_queue.go`, ADR-092 / E83.85 #4200)
+
+Serializes ADR-090 merge-candidate verify passes per `(repository, base ref)`:
+ONE live pass per base, every other one held FIFO with no runner slot. The
+store is `backend/internal/mergequeue` (its README is the persistence
+contract); this module owns WHEN each store method runs and what reason a
+settle carries.
+
+- **Wiring.** `Config.MergeQueue` (`mergequeue.Store`), set in
+  `cmd/fishhawkd/serve.go` to `mergequeue.NewPostgresStore(pool)` next to
+  `Config.Concurrency`. nil (or no `Config.GitHub`) = serializer OFF:
+  `startMergeCandidateVerifyPass` takes ADR-090's direct start unchanged, so
+  every fake-backed test is unaffected.
+- **Enqueue.** `startMergeCandidateVerifyPass` routes `base_advance` and
+  `conflict_resolution` through `serializeMergeCandidateVerifyPass`: no
+  declared verify command → `not_required`, nothing queued; otherwise Enqueue
+  (new → held at the tail; same base → re-anchored in place) and pump the
+  base, then answer from the run's entry. HELD → start state `held` with its
+  position and the live run (no trigger, no re-open, no slot). Admitted by
+  this pump → the admission's answer. Already live → the pass is started for
+  the new head directly. `fan_in` is NOT serialized (it gates the
+  consolidated review that precedes approval); it still routes through
+  `local-verify:<host>` because routing keys on the live trigger.
+- **Pending replacement (D2).** `beginMergeCandidateVerifyPass` (the direct
+  start): a live trigger for an OLDER head whose implement stage is
+  `pending`/`awaiting_host_dispatch` is replaced by appending a trigger for
+  the new head carrying the old `prior_state`/`reparked_review_stage_id`;
+  no second re-open. A dispatched/running pass keeps the "stage is in state"
+  refusal.
+- **Pump + admission.** `pumpMergeCandidateQueue(base)` loops: a live entry
+  whose run is terminal is dropped `run_terminal`; otherwise `AdmitNext`.
+  `admitMergeCandidateEntry` re-reads the run and PR: run terminal → dropped
+  `run_terminal`; PR merged → dropped `pr_merged_externally`; PR closed →
+  dropped `pr_closed`; behind → `advanceRunBranch` under the system actor
+  (`system:merge-candidate-verify`, so `branch_rebased` + the lineage vouch
+  carry system provenance); conflict → ejected `advance_conflict`
+  (`fishhawk_rebase_run_branch` resolves and re-queues); then re-anchor and
+  act on `mergeCandidateVerifyState`: unverified → start (refusal → ejected
+  `pass_not_startable`), in_flight → phase `verifying`, passed/not_required →
+  phase `passed`, failed → ejected `verify_failed`. A TRANSIENT failure (run
+  or PR unreadable, behind-probe error, non-conflict advance refusal,
+  re-anchor error) `Unadmit`s the entry back to held at its original place
+  and stops the pump. A crash mid-admission is recovered by the store's
+  stale-admission re-claim on the next pump.
+- **Verdict / merge / close hooks (D4).** `recordMergeCandidateVerified`
+  (non-duplicate append) → `mergeCandidateQueueOnVerdict` for the run's LIVE
+  entry anchored at that head: failed → ejected `verify_failed` + pump;
+  passed → phase `passed` (holds the line until merge); not_executed →
+  phase `unverified` (holds the line; the operator's next
+  `fishhawk_rebase_run_branch` re-triggers). `resolveReviewStageOnMerge`
+  calls `mergeCandidateQueueOnPRResolved` FIRST, before the ADR-036
+  implement-review early return (a forge-side merge is a fact regardless of
+  review bookkeeping): merged → live entry `merged` / held entry dropped
+  `pr_merged_externally`; closed → dropped `pr_closed`; settling a live entry
+  pumps its base.
+- **Release + read seams.** `releaseMergeCandidateQueueForRun(ctx, runID,
+  reason)` drops the run's active entry and pumps (the cancel hook passes
+  `run_cancelled`); `mergeCandidateQueueForRun` returns the run's active
+  entry, held position and live run for `GET /v0/runs/{id}`'s
+  `merge_candidate_queue` block (omitted with no entry, a nil store or a read
+  error) and the merge gate's `409 merge_candidate_held` (a HELD run's merge
+  is refused before the behind check, naming its position, the live run and
+  that admission is automatic; next step `fishhawk_get_run_status`).
+- **Audit categories** (INTERNAL — not issue-comment activity; registered in
+  `audit/categories.go`, pinned by `TestKnownCategories_MergeCandidateQueue`):
+  `merge_candidate_queue_held`, `merge_candidate_queue_admitted` (`readmitted`
+  on a stale re-claim), `merge_candidate_queue_reanchored` (`at_admission` on
+  the auto-advance), `merge_candidate_queue_settled` (state + `reason` +
+  `from_state`). Best-effort, system actor, written after the store's
+  transaction committed; a lost row never unwinds a queue move.
+- **Periodic pump.** fishhawkd pumps every base `mergequeue.Store.ActiveBases`
+  reports (a base with a held or live entry) once at boot and then every
+  `MergeCandidateQueuePumpInterval` (1 minute) via
+  `RunMergeCandidateQueuePump` / `PumpMergeCandidateQueues`, started from
+  `backend/cmd/fishhawkd/serve.go`. Each tick reuses `pumpMergeCandidateQueue`,
+  which drops a LIVE entry whose run is terminal (`run_terminal`) and re-claims
+  a stale admission, then admits the next held entry. So a run that fails or
+  is swept by any path other than the REST cancel (which releases at once)
+  holds its base for at most ONE pump tick, and a crash mid-admission
+  self-heals within `mergequeue.AdmissionStaleAfter`. Manual pump:
+  `fishhawk_rebase_run_branch` on any held run of that base (its re-enqueue
+  pumps the base). Not covered: a merge that lands without the
+  `pull_request.closed` webhook leaves a `passed` entry live until a pump
+  settles it some other way (#4289).
+- **Tests.** `merge_candidate_queue_test.go` runs the REAL rebase handler,
+  `mergequeue.PostgresStore`, Postgres run AND audit repositories over ONE
+  pgtest pool with a multi-PR fake GitHub: the end-to-end wave (A live, B
+  held, re-anchor, hand-off on merge with auto-advance under the system
+  actor, B admitted through `local-verify:<host>`), pending replacement, the
+  hand-off under an unsettled implement review, and one test per eject/drop
+  mode.
+
 ## Stage terminal-wait long-poll (#1252, E24.X)
 
 The SDK-independent REST analogue of the scope-amendment `?wait` long-poll, applied to stage settledness so a DETACHED operator-side watcher (a backgrounded shell poll) has ONE authoritative completion signal.

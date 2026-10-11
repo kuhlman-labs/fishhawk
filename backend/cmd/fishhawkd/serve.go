@@ -66,6 +66,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergeoutcome"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -2564,6 +2565,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// marker's slot store. Dropping this line reverts the marker to a bare
 		// CAS (no queue) without touching any other surface.
 		cfg.Concurrency = concurrency.NewPostgresStore(pool)
+		// ADR-092 held-pass queue (#4200): serializes merge-candidate verify
+		// passes per base. Dropping this line reverts to ADR-090's
+		// start-immediately behaviour without touching any other surface.
+		cfg.MergeQueue = mergequeue.NewPostgresStore(pool)
 		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
 		auditRepo, err := newAuditRepository(pool, logger)
@@ -3945,6 +3950,16 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.Duration("interval", *schedulerInterval),
 			slog.String("repos", strings.Join(schedRepos, ",")),
 			slog.String("runner_kind", *schedulerRunnerKind))
+	}
+
+	// ADR-092 held-pass queue liveness (#4200): pump every base with a held
+	// or live entry once at boot and then every minute. A pump drops a live
+	// entry whose run went terminal and re-claims a stale admission, so a base
+	// stalled by a path no event hook releases recovers within one tick.
+	if cfg.MergeQueue != nil {
+		go srv.RunMergeCandidateQueuePump(ctx, server.MergeCandidateQueuePumpInterval)
+		logger.Info("merge-candidate queue pump started",
+			slog.Duration("interval", server.MergeCandidateQueuePumpInterval))
 	}
 
 	errCh := make(chan error, 1)

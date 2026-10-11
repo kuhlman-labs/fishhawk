@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -2222,6 +2223,91 @@ func TestGateView_SettledResolutionBasis(t *testing.T) {
 		if sc.ResolutionBasis != "" {
 			t.Errorf("row %s basis = %q under a failed read, want none", sc.ID, sc.ResolutionBasis)
 		}
+	}
+}
+
+// mcqHeldStatus is a fake ADR-092 queue status: the run HELD at position pos
+// behind live (nil = no live entry), anchored at head.
+func mcqHeldStatus(runID uuid.UUID, pos int, live *uuid.UUID, head string) mergequeue.Status {
+	return mergequeue.Status{
+		Entry: mergequeue.Entry{
+			ID: uuid.New(), RunID: runID, Repo: "x/y", BaseRef: "main", State: mergequeue.StateHeld,
+			EnqueuedAt: time.Date(2026, 10, 11, 1, 0, 0, 0, time.UTC), AnchoredHeadSHA: head,
+		},
+		Position:  pos,
+		LiveRunID: live,
+	}
+}
+
+// TestGateView_MergeCandidateQueue pins the gate view's ADR-092 block (#4200):
+// a HELD run renders state/position/live run/anchored head (the same
+// projection GET /v0/runs/{id} carries); a run with no active entry and an
+// unwired queue omit it; a store read error omits it AND names a
+// merge_candidate_queue history gap. Counterfactual: deleting the
+// resp.MergeCandidateQueue assignment in handleGetRunGateView leaves the held
+// arm's block nil → RED; deleting the gap append leaves the error arm with
+// history_incomplete false → RED.
+func TestGateView_MergeCandidateQueue(t *testing.T) {
+	live := uuid.New()
+	cases := []struct {
+		name    string
+		store   func(runID uuid.UUID) mergequeue.Store
+		wantPos int
+		wantGap bool
+	}{
+		{name: "held renders the block", wantPos: 2, store: func(runID uuid.UUID) mergequeue.Store {
+			return &mcqFaultStore{activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
+				return mcqHeldStatus(id, 2, &live, "h2"), true, nil
+			}}
+		}},
+		{name: "held with no live run", wantPos: 1, store: func(runID uuid.UUID) mergequeue.Store {
+			return &mcqFaultStore{activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
+				return mcqHeldStatus(id, 1, nil, "h2"), true, nil
+			}}
+		}},
+		{name: "no active entry omits it", store: func(uuid.UUID) mergequeue.Store {
+			return &mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+				return mergequeue.Status{}, false, nil
+			}}
+		}},
+		{name: "unwired omits it", store: func(uuid.UUID) mergequeue.Store { return nil }},
+		{name: "read error omits it with a gap", wantGap: true, store: func(uuid.UUID) mergequeue.Store {
+			return &mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+				return mergequeue.Status{}, false, errMCQStore
+			}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, _, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			if st := tc.store(runID); st != nil {
+				s.cfg.MergeQueue = st
+			}
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			gap := slices.Contains(resp.HistoryGaps, gateViewGapMergeCandidateQueue)
+			if gap != tc.wantGap || (tc.wantGap && !resp.HistoryIncomplete) {
+				t.Errorf("merge_candidate_queue gap = %v (incomplete %v), want %v", gap, resp.HistoryIncomplete, tc.wantGap)
+			}
+			if tc.wantPos == 0 {
+				if resp.MergeCandidateQueue != nil {
+					t.Fatalf("merge_candidate_queue = %+v, want omitted", resp.MergeCandidateQueue)
+				}
+				return
+			}
+			q := resp.MergeCandidateQueue
+			if q == nil {
+				t.Fatal("merge_candidate_queue omitted for a held run")
+			}
+			wantLive, wantNote := live.String(), "behind run "+live.String()
+			if tc.wantPos == 1 {
+				wantLive, wantNote = "", "behind no run"
+			}
+			if q.State != "held" || q.Position != tc.wantPos || q.LiveRunID != wantLive ||
+				q.AnchoredHeadSHA != "h2" || q.BaseRef != "main" || q.Phase != "" || !strings.Contains(q.Note, wantNote) {
+				t.Errorf("merge_candidate_queue = %+v, want held pos %d live %q note naming %q at h2", q, tc.wantPos, wantLive, wantNote)
+			}
+		})
 	}
 }
 

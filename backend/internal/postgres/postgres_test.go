@@ -7476,3 +7476,108 @@ func TestMigrateDown_RunsTriggerSourceAlertReversal(t *testing.T) {
 		t.Errorf("alert_incidents tables after rolling back 0100 = %d, want 1 (0099 still applied)", n)
 	}
 }
+
+// TestMigrateDown_MergeCandidateQueueReversal pins 0101 (ADR-092 D1 / #4200):
+// after MigrateUp merge_candidate_queue_entries exists with its partial
+// UNIQUE (run_id) WHERE active index and NO account_id column and no RLS
+// (explicit runs.account_id scoping, like 0097); it accepts a held row and a
+// terminal row beside it, refuses a second ACTIVE row for one run, an
+// unknown state, an ejected/dropped row without a reason, a live row without
+// admitted_at, a settled_at that disagrees with the state and an empty head,
+// and cascades away with its run; after rolling back 0101 the table is gone,
+// the schema lands on 0100, and a runs row survives.
+func TestMigrateDown_MergeCandidateQueueReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var activeIdx, accountCol, rowSec int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM pg_indexes WHERE tablename = 'merge_candidate_queue_entries'
+     AND indexname = 'merge_candidate_queue_entries_active_run_idx'
+     AND indexdef LIKE '%UNIQUE%' AND indexdef LIKE '%(run_id)%' AND indexdef LIKE '%WHERE%'),
+  (SELECT count(*) FROM information_schema.columns WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'account_id'),
+  (SELECT count(*) FROM pg_class WHERE relname = 'merge_candidate_queue_entries' AND relrowsecurity)`).Scan(&activeIdx, &accountCol, &rowSec); err != nil {
+		t.Fatalf("read 0101 schema: %v", err)
+	}
+	if activeIdx != 1 {
+		t.Errorf("partial UNIQUE (run_id) WHERE active index count = %d, want 1 (0101)", activeIdx)
+	}
+	if accountCol != 0 || rowSec != 0 {
+		t.Errorf("merge_candidate_queue_entries account_id columns=%d relrowsecurity=%d, want 0/0 — account scoping is the store's explicit runs.account_id join; adding the column requires an RLS policy too", accountCol, rowSec)
+	}
+
+	seedRun := func() uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&id); err != nil {
+			t.Fatalf("seed run: %v", err)
+		}
+		return id
+	}
+	doomedRun, survivorRun := seedRun(), seedRun()
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha)
+VALUES ($1, 'o/r', 'main', 'held', 'h1')`, doomedRun); err != nil {
+		t.Fatalf("insert held row after MigrateUp: %v — 0101 must make it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, eject_reason, anchored_head_sha, settled_at)
+VALUES ($1, 'o/r', 'main', 'ejected', 'verify_failed', 'h0', now())`, doomedRun); err != nil {
+		t.Fatalf("insert a terminal row beside the active one: %v — only ACTIVE rows are unique per run", err)
+	}
+	for name, sql := range map[string]string{
+		"second active row":   `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha) VALUES ($1, 'o/r', 'release', 'held', 'h2')`,
+		"state queued":        `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, settled_at) VALUES ($1, 'o/r', 'main', 'queued', 'h', now())`,
+		"ejected no reason":   `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, settled_at) VALUES ($1, 'o/r', 'main', 'ejected', 'h', now())`,
+		"dropped empty":       `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, eject_reason, anchored_head_sha, settled_at) VALUES ($1, 'o/r', 'main', 'dropped', '', 'h', now())`,
+		"terminal unsettled":  `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha) VALUES ($1, 'o/r', 'main', 'merged', 'h')`,
+		"held but settled":    `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, settled_at) VALUES ($1, 'o/r', 'main', 'held', 'h', now())`,
+		"live no admitted_at": `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha) VALUES ($1, 'o/r', 'other', 'live', 'h')`,
+		"empty head":          `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, settled_at) VALUES ($1, 'o/r', 'main', 'merged', '', now())`,
+		"empty base ref":      `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, settled_at) VALUES ($1, 'o/r', '', 'merged', 'h', now())`,
+	} {
+		// The active-row probes target the run WITHOUT an active entry, so
+		// each is refused by its own CHECK, never by the unique index.
+		run := doomedRun
+		if name == "live no admitted_at" || name == "held but settled" {
+			run = survivorRun
+		}
+		if _, err := pool.Exec(ctx, sql, run); err == nil {
+			t.Errorf("%s accepted, want a constraint violation", name)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM runs WHERE id = $1`, doomedRun); err != nil {
+		t.Fatalf("delete a run with queue entries: %v — ON DELETE CASCADE must not block it", err)
+	}
+	var entries int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries`).Scan(&entries); err != nil {
+		t.Fatalf("count entries: %v", err)
+	}
+	if entries != 0 {
+		t.Errorf("queue entries after deleting their run = %d, want 0 (cascade)", entries)
+	}
+
+	downThrough(t, url, "0101")
+
+	var tables, survivors int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM information_schema.tables WHERE table_name = 'merge_candidate_queue_entries'),
+  (SELECT count(*) FROM runs WHERE id = $1)`, survivorRun).Scan(&tables, &survivors); err != nil {
+		t.Fatalf("read back after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("merge_candidate_queue_entries tables after rolling back 0101 = %d, want 0", tables)
+	}
+	if survivors != 1 {
+		t.Errorf("runs row after rolling back 0101 = %d, want 1 (untouched)", survivors)
+	}
+}

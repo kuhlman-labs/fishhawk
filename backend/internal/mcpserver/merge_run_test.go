@@ -1726,6 +1726,66 @@ func TestMergeRun_MergeCandidateRefusalsReturnImmediately(t *testing.T) {
 	}
 }
 
+// TestMergeRun_MergeCandidateHeldReturnsImmediately pins the ADR-092 409
+// merge_candidate_held (#4200) as an IMMEDIATE status=merge_candidate_held:
+// one POST, zero terminal-await reads (the await is never armed even though
+// the fake would resolve it to merged), the backend message verbatim,
+// queue_position / anchored_head_sha / live_run_id lifted from the details,
+// and next_action fishhawk_get_run_status (admission is automatic). A detail
+// map with no next_step still falls back to fishhawk_get_run_status.
+// Counterfactual: deleting the merge_candidate_held row from
+// mergeCandidateStatuses surfaces the 409 as a tool error → RED; deleting the
+// held arm in mergeCandidateOutput leaves queue_position 0 → RED.
+func TestMergeRun_MergeCandidateHeldReturnsImmediately(t *testing.T) {
+	live := uuid.NewString()
+	for _, tc := range []struct {
+		name    string
+		details map[string]any
+	}{
+		{"with next_step", map[string]any{"queue_state": "held", "queue_position": 2, "live_run_id": live,
+			"anchored_head_sha": "A2", "head_sha": "H", "base_ref": "main", "next_step": "fishhawk_get_run_status"}},
+		{"older details without next_step", map[string]any{"queue_state": "held", "queue_position": 2, "live_run_id": live,
+			"anchored_head_sha": "A2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := "backend says: held at position 2"
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				mergeStickyStatus: http.StatusConflict,
+				mergeErrBody:      mergeCandidateErrBody("merge_candidate_held", msg, tc.details),
+				auditEntries:      []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+			}
+			r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+			runID := uuid.New()
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+			if err != nil {
+				t.Fatalf("mergeRun: %v — merge_candidate_held must be a status, not a tool error", err)
+			}
+			if out.Status != "merge_candidate_held" || out.Message != msg {
+				t.Fatalf("status/message = %q/%q, want merge_candidate_held with the backend message", out.Status, out.Message)
+			}
+			if out.QueuePosition != 2 || out.AnchoredHeadSHA != "A2" || out.LiveRunID != live {
+				t.Errorf("queue fields = pos %d head %q live %q, want 2/A2/%s", out.QueuePosition, out.AnchoredHeadSHA, out.LiveRunID, live)
+			}
+			if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged {
+				t.Errorf("flags = %+v, want all false", out)
+			}
+			if out.NextAction == nil || out.NextAction.Action != "fishhawk_get_run_status" ||
+				out.NextAction.Params["run_id"] != runID.String() || out.NextAction.Consumes != consumesNone ||
+				!strings.Contains(out.NextAction.Reason, "ADR-092") {
+				t.Fatalf("next_action = %+v, want fishhawk_get_run_status for %s (ADR-092 reason, consumes none)", out.NextAction, runID)
+			}
+			fb.mu.Lock()
+			calls, reads := fb.mergeCalls, fb.auditReadCalls
+			fb.mu.Unlock()
+			if calls != 1 || reads != 0 {
+				t.Errorf("POSTs = %d, await reads = %d; want 1 and 0 (immediate, no await armed)", calls, reads)
+			}
+		})
+	}
+}
+
 // TestMergeRun_MergeCandidateCheckFailedIsToolError pins the 502 as a tool
 // error (a retryable read failure, not a precondition), and that an
 // unrelated 409 code is NOT swallowed as a merge-candidate status.
@@ -1764,6 +1824,7 @@ func TestIsMergeCandidateRefusal(t *testing.T) {
 		"merge_base_behind":             "behind_base",
 		"merge_candidate_unverified":    "merge_candidate_unverified",
 		"merge_candidate_verify_failed": "merge_candidate_verify_failed",
+		"merge_candidate_held":          "merge_candidate_held",
 	} {
 		if _, got, ok := isMergeCandidateRefusal(&apiError{StatusCode: http.StatusConflict, Code: code}); !ok || got != want {
 			t.Errorf("%s → (%q, %v), want (%q, true)", code, got, ok, want)

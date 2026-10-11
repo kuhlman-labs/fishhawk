@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -973,6 +975,252 @@ func TestHostDispatch_OtherAccountHolderNotDisclosed(t *testing.T) {
 	if !sameStageIDs(holderIDs(d.Holders), a.ID) || strings.Contains(raw, b.ID.String()) {
 		t.Fatalf("account-1 details = %s, want holders [A] and no trace of B", raw)
 	}
+}
+
+// ---- ADR-092 D3 (#4200): merge-candidate verify-only passes are admitted
+// through their own per-host group, local-verify:<host> (limit 1).
+
+// appendStageAudit appends one chained audit row bound to the stage.
+func (f *scPG) appendStageAudit(st *run.Stage, category string, payload any) {
+	f.t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		f.t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	kind := audit.ActorSystem
+	stageID := st.ID
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: st.RunID, StageID: &stageID, Timestamp: time.Now().UTC(),
+		Category: category, ActorKind: &kind, Payload: raw,
+	}); err != nil {
+		f.t.Fatalf("append %s: %v", category, err)
+	}
+}
+
+// mcTrigger is a fully populated merge-candidate verify trigger for head.
+func mcTrigger(head string) mergeCandidateVerifyTrigger {
+	return mergeCandidateVerifyTrigger{
+		Branch: "fishhawk/run", BaseRef: "main", ExpectedHeadSHA: head,
+		Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: "scripts/test verify",
+	}
+}
+
+// triggerPass appends a LIVE merge-candidate verify trigger to the stage.
+func (f *scPG) triggerPass(st *run.Stage, head string) {
+	f.t.Helper()
+	f.appendStageAudit(st, CategoryStageMergeCandidateVerifyTriggered, mcTrigger(head))
+}
+
+// slotGroup reads the committed slot row's group key.
+func (f *scPG) slotGroup(id uuid.UUID) string {
+	f.t.Helper()
+	var g string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT group_key FROM stage_concurrency_slots WHERE stage_id = $1`, id).Scan(&g); err != nil {
+		f.t.Fatalf("read slot group of %s: %v", id, err)
+	}
+	return g
+}
+
+// TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup is the
+// issue's core counterfactual: local-implement:h1 (limit 1) is HELD by
+// another run's implement with three implements queued behind it, and a
+// stage carrying a LIVE merge-candidate verify trigger is admitted AT ONCE
+// through local-verify:h1 (limit 1). With the routing branch removed from
+// resolveStageConcurrency the pass resolves to local-implement:h1, whose only
+// slot is held, and the marker answers 409 concurrency_slot_queued at
+// position 4. The pass holds no implement slot: a later implement still sees
+// only the implement holder.
+func TestHostDispatch_MergeCandidatePassAdmittedThroughVerifyGroup(t *testing.T) {
+	f := newSCPG(t, pgStore)
+	holder := f.impl()
+	f.admitted(holder, hostBody("h1"))
+	for i := 1; i <= 3; i++ {
+		if d, _, _ := f.queued(f.impl(), hostBody("h1")); d.Position != i {
+			t.Fatalf("implement %d queued at %d, want %d", i, d.Position, i)
+		}
+	}
+
+	pass := f.impl()
+	f.triggerPass(pass, "aaaa1111")
+	resp := f.admitted(pass, hostBody("h1"))
+	if resp.Concurrency == nil || resp.Concurrency.Group != "local-verify:h1" || resp.Concurrency.Limit != 1 || resp.Concurrency.QueuedBefore {
+		t.Fatalf("pass admission block = %+v, want {local-verify:h1, limit 1, queued_before:false}", resp.Concurrency)
+	}
+	if g := f.slotGroup(pass.ID); g != "local-verify:h1" {
+		t.Fatalf("pass slot row group = %q, want local-verify:h1", g)
+	}
+	if blk := f.blocks(pass)["get"]; blk == nil || blk.Status != "holding" || blk.Group != "local-verify:h1" || blk.Limit != 1 {
+		t.Fatalf("pass stage block = %+v, want holding in local-verify:h1 limit 1", blk)
+	}
+
+	d, _, raw := f.queued(f.impl(), hostBody("h1"))
+	if d.Group != "local-implement:h1" || d.Position != 4 || !sameStageIDs(holderIDs(d.Holders), holder.ID) || strings.Contains(raw, pass.ID.String()) {
+		t.Fatalf("next implement details = %s, want position 4 behind the implement holder only", raw)
+	}
+}
+
+// TestHostDispatch_SecondMergeCandidatePassQueuesInVerifyGroup: a second pass
+// on the host queues behind the first in local-verify:h1 (limit 1), and its
+// 409 holders list names the first pass only — never the implement holder.
+// An absent body lands in local-verify:unknown.
+func TestHostDispatch_SecondMergeCandidatePassQueuesInVerifyGroup(t *testing.T) {
+	f := newSCPG(t, pgStore)
+	impl := f.impl()
+	f.admitted(impl, hostBody("h1"))
+	p1, p2, p3 := f.impl(), f.impl(), f.impl()
+	for _, st := range []*run.Stage{p1, p2, p3} {
+		f.triggerPass(st, "bbbb2222")
+	}
+	f.admitted(p1, hostBody("h1"))
+
+	d, _, raw := f.queued(p2, hostBody("h1"))
+	if d.Group != "local-verify:h1" || d.Limit != 1 || d.Position != 1 || !sameStageIDs(holderIDs(d.Holders), p1.ID) || strings.Contains(raw, impl.ID.String()) {
+		t.Fatalf("second pass details = %s, want queued at 1 in local-verify:h1 behind the first pass only", raw)
+	}
+
+	if resp := f.admitted(p3, ""); resp.Concurrency == nil || resp.Concurrency.Group != "local-verify:unknown" {
+		t.Fatalf("no-body pass admission block = %+v, want local-verify:unknown", resp.Concurrency)
+	}
+}
+
+// TestHostDispatch_NonPassReopensStayInImplementGroup (no regression): an
+// implement stage whose newest re-open is NOT a live merge-candidate pass —
+// a fix-up, a conflict resolution, or a pass already CONSUMED by a later
+// merge_candidate_verified row (the D6 routed fix-up that follows a red pass)
+// — runs an agent and is admitted through local-implement:h1. A verify group
+// held by another pass is irrelevant to it.
+func TestHostDispatch_NonPassReopensStayInImplementGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(f *scPG, st *run.Stage)
+	}{
+		{"fixup", func(f *scPG, st *run.Stage) {
+			f.appendStageAudit(st, CategoryStageFixupTriggered, map[string]any{"pass": 1})
+		}},
+		{"conflict resolution", func(f *scPG, st *run.Stage) {
+			f.appendStageAudit(st, CategoryStageConflictResolutionTriggered, map[string]any{"branch": "fishhawk/run", "base_ref": "main"})
+		}},
+		{"consumed pass then routed fixup", func(f *scPG, st *run.Stage) {
+			f.triggerPass(st, "cccc3333")
+			f.appendStageAudit(st, CategoryMergeCandidateVerified, map[string]any{"result": mergeCandidateResultFailed, "head_sha": "cccc3333"})
+			f.appendStageAudit(st, CategoryStageFixupTriggered, map[string]any{"rule": mergeCandidateDelegatedRule})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSCPG(t, pgStore)
+			other := f.impl()
+			f.triggerPass(other, "dddd4444")
+			f.admitted(other, hostBody("h1"))
+
+			st := f.impl()
+			tc.setup(f, st)
+			resp := f.admitted(st, hostBody("h1"))
+			if resp.Concurrency == nil || resp.Concurrency.Group != "local-implement:h1" || resp.Concurrency.Limit != 1 {
+				t.Fatalf("admission block = %+v, want local-implement:h1 limit 1", resp.Concurrency)
+			}
+			if g := f.slotGroup(st.ID); g != "local-implement:h1" {
+				t.Fatalf("slot row group = %q, want local-implement:h1", g)
+			}
+		})
+	}
+}
+
+// TestHostDispatch_MergeCandidatePassIgnoresDeclaredImplementGroup isolates
+// the ORDERING of the routing branch: with the implement stage declaring
+// concurrency {group: impl, limit: 2}, a full implement is admitted through
+// spec:<repo>:impl while a pass is admitted through local-verify:h1. Placing
+// the pass branch after the declared lookup routes the pass to
+// spec:<repo>:impl (limit 2), which this fixture leaves free.
+func TestHostDispatch_MergeCandidatePassIgnoresDeclaredImplementGroup(t *testing.T) {
+	f := newSCPG(t, pgStore)
+	full, pass := f.impl(), f.impl()
+	for _, st := range []*run.Stage{full, pass} {
+		f.setSpec(st, concurrencySpec("\n          group: impl\n          limit: 2"))
+	}
+	if resp := f.admitted(full, hostBody("h1")); resp.Concurrency.Group != "spec:kuhlman-labs/fishhawk:impl" || resp.Concurrency.Limit != 2 {
+		t.Fatalf("full implement block = %+v, want spec:kuhlman-labs/fishhawk:impl limit 2", resp.Concurrency)
+	}
+	f.triggerPass(pass, "eeee5555")
+	if resp := f.admitted(pass, hostBody("h1")); resp.Concurrency.Group != "local-verify:h1" || resp.Concurrency.Limit != 1 {
+		t.Fatalf("pass block = %+v, want local-verify:h1 limit 1 (the declared implement group must not capture a pass)", resp.Concurrency)
+	}
+}
+
+// triggerReadErrAudit fails every merge-candidate trigger read.
+type triggerReadErrAudit struct{ audit.Repository }
+
+func (a triggerReadErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == CategoryStageMergeCandidateVerifyTriggered {
+		return nil, errors.New("audit read down")
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestHostDispatch_UnreadableTriggerRoutesAsImplement: when the trigger
+// cannot be read (a read error, or a malformed / half-populated payload) the
+// prompt endpoint serves NO pass and the runner runs an ordinary implement,
+// so the marker WARN-logs and admits the stage through local-implement:h1 —
+// and, with local-implement:h1 held, QUEUES it there rather than admitting it
+// through the free verify group.
+func TestHostDispatch_UnreadableTriggerRoutesAsImplement(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(f *scPG, st *run.Stage)
+	}{
+		{"read error", func(f *scPG, st *run.Stage) {
+			f.triggerPass(st, "ffff6666")
+			f.srv.cfg.AuditRepo = triggerReadErrAudit{f.audit}
+		}},
+		{"half-populated payload", func(f *scPG, st *run.Stage) {
+			tr := mcTrigger("")
+			f.appendStageAudit(st, CategoryStageMergeCandidateVerifyTriggered, tr)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSCPG(t, pgStore)
+			var logs bytes.Buffer
+			f.srv.cfg.Logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			holder := f.impl()
+			f.admitted(holder, hostBody("h1"))
+
+			st := f.impl()
+			tc.setup(f, st)
+			d, _, _ := f.queued(st, hostBody("h1"))
+			if d.Group != "local-implement:h1" || !sameStageIDs(holderIDs(d.Holders), holder.ID) {
+				t.Fatalf("details = %+v, want queued in local-implement:h1 behind the implement holder", d)
+			}
+			if !strings.Contains(logs.String(), "merge-candidate verify trigger unreadable") || !strings.Contains(logs.String(), st.ID.String()) {
+				t.Fatalf("no routing WARN naming the stage was logged:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestHostDispatch_MergeCandidateRoutingBoundaries: a non-implement stage is
+// never a pass (the prompt endpoint serves one only for implement), so a plan
+// stage carrying a trigger row stays ungrouped; and with no audit repository
+// wired an implement stage keeps the default implement group.
+func TestHostDispatch_MergeCandidateRoutingBoundaries(t *testing.T) {
+	t.Run("plan stage with a trigger row stays ungrouped", func(t *testing.T) {
+		f := newSCPG(t, pgStore)
+		p := f.stage("kuhlman-labs/fishhawk", run.StageTypePlan)
+		f.triggerPass(p, "abab7777")
+		if resp := f.admitted(p, hostBody("h1")); resp.Concurrency != nil {
+			t.Fatalf("plan admission carries a concurrency block %+v, want ungrouped", resp.Concurrency)
+		}
+		if _, ok := f.slot(p.ID); ok {
+			t.Fatal("ungrouped plan stage wrote a slot row")
+		}
+	})
+	t.Run("nil audit repository keeps the implement group", func(t *testing.T) {
+		f := newSCPG(t, pgStore)
+		st := f.impl()
+		f.srv.cfg.AuditRepo = nil
+		if resp := f.admitted(st, hostBody("h1")); resp.Concurrency == nil || resp.Concurrency.Group != "local-implement:h1" {
+			t.Fatalf("admission block = %+v, want local-implement:h1", resp.Concurrency)
+		}
+	})
 }
 
 // TestOpenAPIDocumentsConcurrency pins the API contract doc to the surface:

@@ -370,8 +370,37 @@ type Run struct {
 	// the backend's runCompletionBlockedPayload or the field silently decodes
 	// to nil — the #371-class hand-maintained-wire-mirror trap.
 	CompletionBlocked *runCompletionBlocked `json:"completion_blocked,omitempty" jsonschema:"the stage stopping a running run from completing (#968 guard) plus whether a reconcile can move it. Omitted when the run is not blocked"`
-	CreatedAt         time.Time             `json:"created_at"`
-	UpdatedAt         time.Time             `json:"updated_at"`
+	// MergeCandidateQueue mirrors the backend runResponse.merge_candidate_queue
+	// (ADR-092 / E83.85 / #4200): the run's ACTIVE held-pass queue entry. The
+	// backend emits it on the SINGLE-run read only (handleGetRun); nil when the
+	// run has no active entry, the queue is unwired or unreadable, or against an
+	// older backend (the mixed-version degrade). The json tags MUST byte-match
+	// the backend's runMergeCandidateQueuePayload or a field silently decodes to
+	// its zero value — the #371-class hand-maintained-wire-mirror trap.
+	MergeCandidateQueue *runMergeCandidateQueue `json:"merge_candidate_queue,omitempty" jsonschema:"the run's active ADR-092 merge-candidate queue entry: state held (waiting behind the base's live pass at position N, using no runner slot; admission is automatic) or live (holding the base's line, with its phase), plus the anchored head. Omitted when the run has no active entry"`
+	CreatedAt           time.Time               `json:"created_at"`
+	UpdatedAt           time.Time               `json:"updated_at"`
+}
+
+// runMergeCandidateQueue mirrors the backend's runMergeCandidateQueuePayload
+// (ADR-092 / #4200), carried on BOTH the run read and the gate view. The json
+// tags MUST byte-match the backend or each field silently decodes to its zero
+// value. Deliberately UNEXPORTED, on the runCompletionBlocked precedent: the
+// package's exported surface is pinned (export_surface_test.go), and nothing
+// outside the package names this type.
+type runMergeCandidateQueue struct {
+	State           string     `json:"state" jsonschema:"held (waiting behind the base's live pass, no runner slot) or live (this run holds the base's merge-candidate line)"`
+	Phase           string     `json:"phase,omitempty" jsonschema:"a live entry's progress: admitted, verifying, passed (holds the line until its PR merges) or unverified (the pass did not execute; re-invoke fishhawk_rebase_run_branch). Omitted while held"`
+	Position        int        `json:"position,omitempty" jsonschema:"1-based place among the base's held entries (FIFO by eligibility time); omitted for a live entry"`
+	Repo            string     `json:"repo"`
+	BaseRef         string     `json:"base_ref" jsonschema:"the base ref whose queue the entry is in"`
+	AnchoredHeadSHA string     `json:"anchored_head_sha" jsonschema:"the PR head the pass is anchored to; admission re-reads the PR, auto-advances a behind branch and re-anchors before starting the pass"`
+	AnchoredBaseSHA string     `json:"anchored_base_sha,omitempty"`
+	EnqueuedAt      time.Time  `json:"enqueued_at" jsonschema:"eligibility time — the FIFO key"`
+	AdmittedAt      *time.Time `json:"admitted_at,omitempty" jsonschema:"when the entry became live"`
+	LiveRunID       string     `json:"live_run_id,omitempty" jsonschema:"the run holding the base's line (this run when live); omitted when the base has no live entry"`
+	EjectReason     string     `json:"eject_reason,omitempty"`
+	Note            string     `json:"note" jsonschema:"what happens next, in one sentence"`
 }
 
 // runCompletionBlocked mirrors the backend's run-status completion_blocked block
@@ -755,6 +784,12 @@ type GateView struct {
 	// or against an older backend. The json tag MUST byte-match the backend's
 	// gateViewResponse or the block silently decodes to nil (the #371 trap).
 	MergeReadiness *gateViewMergeReadiness `json:"merge_readiness,omitempty" jsonschema:"merge-readiness blockers the merge endpoint would refuse with (acceptance_stale, review_coverage_incomplete, approval_dismissed) plus every check that could not reach a verdict; absent when the run has no pull request or is failed/cancelled"`
+	// MergeCandidateQueue mirrors the backend's gate-view merge_candidate_queue
+	// block (ADR-092 / #4200) — the same projection Run.MergeCandidateQueue
+	// carries. Omitted (nil) when the run has no active entry, the queue is
+	// unwired, the read failed (a merge_candidate_queue history_gaps entry), or
+	// against an older backend. The json tag MUST byte-match the backend.
+	MergeCandidateQueue *runMergeCandidateQueue `json:"merge_candidate_queue,omitempty" jsonschema:"the run's active ADR-092 merge-candidate queue entry (held with its position and the live run, or live with its phase); absent when the run has no active entry"`
 }
 
 // gateViewMergeReadiness mirrors the backend's gateViewMergeReadiness
@@ -2134,7 +2169,7 @@ const (
 // bodies.
 type StageConcurrency struct {
 	Status   string `json:"status,omitempty" jsonschema:"awaiting_concurrency_slot (the stage is QUEUED for a local concurrency slot: it stays at awaiting_host_dispatch until a slot frees) or holding (the stage holds a slot). Absent on the host-dispatch admission block"`
-	Group    string `json:"group,omitempty" jsonschema:"the concurrency group: local-implement:<host> by default for a local implement stage, spec:<repo>:<name> for a spec-declared named group"`
+	Group    string `json:"group,omitempty" jsonschema:"the concurrency group: local-implement:<host> by default for a local implement stage, local-verify:<host> (limit 1) for an ADR-090 merge-candidate verify-only pass, spec:<repo>:<name> for a spec-declared named group"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"how many stages the group admits at once"`
 	Position int    `json:"position,omitempty" jsonschema:"1-based queue position while awaiting_concurrency_slot"`
 	// Holders is a list of the live slot holders. Absent or empty means no live
@@ -3259,7 +3294,10 @@ type RebaseBranchResult struct {
 	// head. A pass that cannot start does not fail the rebase.
 
 	// MergeCandidateVerifyState is the live head's state after the call:
-	// not_required, unverified, in_flight, passed or failed.
+	// not_required, unverified, in_flight, passed or failed — or held (ADR-092
+	// / #4200): the pass waits behind its base's live pass, nothing was
+	// started, and fishhawk_get_run_status's merge_candidate_queue shows its
+	// position. Admission is automatic.
 	MergeCandidateVerifyState string `json:"merge_candidate_verify_state,omitempty"`
 	// MergeCandidateVerifyTriggered is true when THIS call started the pass.
 	MergeCandidateVerifyTriggered bool `json:"merge_candidate_verify_triggered,omitempty"`

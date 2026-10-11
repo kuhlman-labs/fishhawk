@@ -78,6 +78,13 @@ type MergeRunInput struct {
 //     (fishhawk_rebase_run_branch, fishhawk_await_stage, fishhawk_fixup_stage).
 //     The gate's 502 merge_candidate_check_failed stays a TOOL ERROR: it is a
 //     retryable read failure, not a precondition.
+//   - "merge_candidate_held" — ADR-092 (E83.85 / #4200): the run's
+//     merge-candidate pass is HELD in its base's queue behind the live pass
+//     (409 merge_candidate_held). IMMEDIATE like the ADR-090 refusals, but it
+//     clears ON ITS OWN — admission is automatic — so NextAction names
+//     fishhawk_get_run_status (watch merge_candidate_queue) rather than a
+//     clearing verb; QueuePosition / AnchoredHeadSHA / LiveRunID carry the
+//     entry.
 //   - "acceptance_stale", "approval_dismissed" — the #4086 merge-readiness
 //     refusals: the recorded acceptance verdict was invalidated by a later
 //     acceptance_reopened (a fix-up push), or GitHub reports the PR blocked with
@@ -95,7 +102,7 @@ type MergeRunInput struct {
 //     with no verdict, fishhawk_await_review while it is in flight or not yet
 //     dispatched.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, acceptance_stale, approval_dismissed, review_coverage_incomplete"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -130,8 +137,13 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review"`
 	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness statuses"`
+	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
+	// merge_candidate_held only (ADR-092 / #4200), from the 409's details.
+	QueuePosition   int    `json:"queue_position,omitempty" jsonschema:"on merge_candidate_held: the run's 1-based place among its base's held merge-candidate passes"`
+	AnchoredHeadSHA string `json:"anchored_head_sha,omitempty" jsonschema:"on merge_candidate_held: the PR head the held pass is anchored to (admission re-reads and may auto-advance it)"`
+	LiveRunID       string `json:"live_run_id,omitempty" jsonschema:"on merge_candidate_held: the run holding the base's merge-candidate line, when one does"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
@@ -240,6 +252,18 @@ Statuses:
                      on the named stage — dispatch it with fishhawk_dispatch_stage
                      on a local runner) or fishhawk_rebase_run_branch (whose
                      already-up-to-date arm triggers the pass).
+  - "merge_candidate_held" — the run's merge-candidate verify pass is HELD in its
+                     base's ADR-092 queue behind the pass holding the line.
+                     Immediate, no verdict row. It clears ON ITS OWN: when the
+                     line frees, the queue advances a behind branch, re-anchors
+                     and starts the pass; a stalled line self-heals on the
+                     periodic pump (about 1 minute), and
+                     fishhawk_rebase_run_branch pumps the base manually.
+                     queue_position,
+                     anchored_head_sha and live_run_id carry the entry;
+                     next_action names fishhawk_get_run_status (watch
+                     merge_candidate_queue), then dispatch/await the pass once
+                     admitted and re-invoke.
   - "merge_candidate_verify_failed" — the merge-candidate verify FAILED for the
                      live head: the declared verify command is red on the
                      combined tree. Immediate, no verdict row. next_action names
@@ -313,7 +337,9 @@ resolve-then-vouch-then-re-merge path.
 The backend's 409 merge_base_behind / merge_candidate_unverified /
 merge_candidate_verify_failed (ADR-090) are likewise NOT tool errors: each is
 returned IMMEDIATELY as status=behind_base / merge_candidate_unverified /
-merge_candidate_verify_failed with next_action naming the clearing verb.
+merge_candidate_verify_failed with next_action naming the clearing verb. So is
+the ADR-092 409 merge_candidate_held (status=merge_candidate_held,
+next_action fishhawk_get_run_status).
 
 The backend's 409 acceptance_stale / approval_dismissed (#4086) and
 review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
@@ -382,6 +408,8 @@ var mergeCandidateStatuses = map[string]string{
 	"merge_base_behind":             "behind_base",
 	"merge_candidate_unverified":    "merge_candidate_unverified",
 	"merge_candidate_verify_failed": "merge_candidate_verify_failed",
+	// ADR-092 (#4200): held behind the base's live pass. Clears on its own.
+	"merge_candidate_held": "merge_candidate_held",
 }
 
 // isMergeCandidateRefusal reports whether err is one of the backend's ADR-090
@@ -413,6 +441,7 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 			"behind_base":                   "fishhawk_rebase_run_branch",
 			"merge_candidate_unverified":    "fishhawk_rebase_run_branch",
 			"merge_candidate_verify_failed": "fishhawk_fixup_stage",
+			"merge_candidate_held":          "fishhawk_get_run_status",
 		}[status]
 	}
 	params := map[string]string{"run_id": runID.String()}
@@ -427,20 +456,32 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 	if strings.TrimSpace(msg) == "" {
 		msg = "the merge-candidate gate (ADR-090) refused the merge; call " + verb + ", then re-invoke fishhawk_merge_run."
 	}
-	return MergeRunOutput{
+	reason := "ADR-090: Fishhawk merges only an up-to-date, verified merge candidate; re-invoke fishhawk_merge_run once this clears"
+	out := MergeRunOutput{
 		Status:        status,
 		PRURL:         prURL,
 		WaitedSeconds: time.Since(start).Seconds(),
 		Note:          mergeRunNote,
 		Message:       msg,
-		NextAction: &SuggestedAction{
-			Action:       verb,
-			Params:       params,
-			Precondition: "the merge-candidate gate refused this run's merge (" + ae.Code + ")",
-			Consumes:     consumes,
-			Reason:       "ADR-090: Fishhawk merges only an up-to-date, verified merge candidate; re-invoke fishhawk_merge_run once this clears",
-		},
 	}
+	if status == "merge_candidate_held" {
+		// ADR-092 (#4200): the held entry, from the 409's details. A JSON
+		// number decodes as float64.
+		if pos, ok := ae.Details["queue_position"].(float64); ok {
+			out.QueuePosition = int(pos)
+		}
+		out.AnchoredHeadSHA, _ = ae.Details["anchored_head_sha"].(string)
+		out.LiveRunID, _ = ae.Details["live_run_id"].(string)
+		reason = "ADR-092: the pass is held behind its base's live pass and is admitted automatically when the line frees; watch merge_candidate_queue, dispatch and await the pass once admitted, then re-invoke fishhawk_merge_run"
+	}
+	out.NextAction = &SuggestedAction{
+		Action:       verb,
+		Params:       params,
+		Precondition: "the merge-candidate gate refused this run's merge (" + ae.Code + ")",
+		Consumes:     consumes,
+		Reason:       reason,
+	}
+	return out
 }
 
 // readinessStatuses maps the backend's merge-readiness 409 codes (#4086) to the

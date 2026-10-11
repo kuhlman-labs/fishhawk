@@ -147,7 +147,17 @@ func validHostLabel(h string) bool {
 // stage type ungrouped (today's behaviour). An absent or unparseable spec
 // falls back to that same default — the restrictive direction — and a parse
 // failure logs a WARN.
+//
+// ADR-092 D3 (#4200): an implement stage carrying a LIVE merge-candidate
+// verify trigger is a verify-only pass (no agent), so it resolves to the host
+// verify group local-verify:<host> at DefaultVerifyLimit BEFORE the declared
+// lookup — a spec-declared implement group or limit never captures a pass,
+// and a pass never queues behind full implements. See
+// isMergeCandidateVerifyPass for the fallback on an unreadable trigger.
 func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, stage *run.Stage, host string) (group string, limit int, grouped bool) {
+	if s.isMergeCandidateVerifyPass(ctx, stage) {
+		return concurrency.VerifyGroupKey(host), concurrency.DefaultVerifyLimit, true
+	}
 	if decl, ok := s.declaredStageConcurrency(ctx, runRow, stage.Type); ok {
 		if decl.Group == "" {
 			return concurrency.DefaultGroupKey(host), decl.EffectiveLimit(), true
@@ -158,6 +168,31 @@ func (s *Server) resolveStageConcurrency(ctx context.Context, runRow *run.Run, s
 		return concurrency.DefaultGroupKey(host), concurrency.DefaultLimit, true
 	}
 	return "", 0, false
+}
+
+// isMergeCandidateVerifyPass reports whether the runner fetching this stage's
+// prompt will be served a merge-candidate verify-only pass: the prompt
+// endpoint serves one exactly when an IMPLEMENT stage has a live (unconsumed)
+// stage_merge_candidate_verify_triggered row. A fix-up or conflict-resolution
+// re-open, and a trigger consumed by a later merge_candidate_verified row,
+// carry no live trigger and stay in local-implement. With no audit repository,
+// or when the trigger cannot be read (a read error, a malformed payload), the
+// prompt endpoint serves NO pass and the runner runs an ordinary implement, so
+// this answers false (WARN-logged) and the stage keeps an implement slot.
+func (s *Server) isMergeCandidateVerifyPass(ctx context.Context, stage *run.Stage) bool {
+	if stage.Type != run.StageTypeImplement || s.cfg.AuditRepo == nil {
+		return false
+	}
+	live, err := s.liveMergeCandidateTrigger(ctx, stage.RunID, stage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"host-dispatch: merge-candidate verify trigger unreadable; routing the stage as an ordinary implement",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	return live != nil
 }
 
 // declaredStageConcurrency returns the spec stage's declared concurrency

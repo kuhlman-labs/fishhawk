@@ -174,8 +174,12 @@ command to run.
 
 Local concurrency slots (#3964 / ADR-087): by default one local IMPLEMENT
 stage runs per host at a time (group local-implement:<host>, limit 1; a
-workflow-v2 stage "concurrency" block overrides it). When the host's slot is
-held, the dispatch is QUEUED, not refused: NO runner is spawned, the stage
+workflow-v2 stage "concurrency" block overrides it). An implement stage
+re-opened for a merge-candidate VERIFY-ONLY pass (ADR-090/ADR-092 D3: a live
+stage_merge_candidate_verify_triggered row, no agent) is admitted through its
+own group local-verify:<host>, limit 1, never behind a queued full implement;
+fix-ups and conflict-resolution re-opens stay in local-implement. When the
+host's slot is held, the dispatch is QUEUED, not refused: NO runner is spawned, the stage
 stays awaiting_host_dispatch, and the result carries concurrency_slot (status
 awaiting_concurrency_slot, position, holders, waiter). This session's slot
 waiter then re-polls every 5s and spawns the runner when a slot frees (for up

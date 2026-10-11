@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
@@ -385,6 +386,82 @@ type runResponse struct {
 	// the state. Pointing at a verb guaranteed to refuse is this issue's own
 	// complaint about merge_run.
 	CompletionBlocked *runCompletionBlockedPayload `json:"completion_blocked,omitempty"`
+	// MergeCandidateQueue is the run's ACTIVE ADR-092 held-pass queue entry
+	// (E83.85 / #4200): whether its merge-candidate verify pass is HELD behind
+	// the base's live pass (with its 1-based position and the run holding the
+	// line) or LIVE (holding the line itself, with its phase), and the head it
+	// is anchored to. Populated by handleGetRun ONLY (one indexed store read,
+	// same best-effort posture as Concerns / CompletionBlocked); omitted when
+	// the queue is unwired, the run has no active entry (never queued, or its
+	// entry settled), or the read fails (warn-logged, never a failed read).
+	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
+}
+
+// runMergeCandidateQueuePayload is the ADR-092 queue entry projection shared by
+// GET /v0/runs/{id} and the gate view (E83.85 / #4200). The MCP mirror
+// (backend/internal/mcpserver/client.go RunMergeCandidateQueue) decodes it; the
+// json tags MUST byte-match or a field silently decodes to its zero value.
+type runMergeCandidateQueuePayload struct {
+	// State is held or live (an entry in a terminal state is never surfaced).
+	State string `json:"state"`
+	// Phase is a live entry's progress: admitted, verifying, passed or
+	// unverified. Omitted while held.
+	Phase string `json:"phase,omitempty"`
+	// Position is the 1-based place among the base's held entries (FIFO by
+	// eligibility time). Omitted (0) for a live entry.
+	Position int    `json:"position,omitempty"`
+	Repo     string `json:"repo"`
+	BaseRef  string `json:"base_ref"`
+	// AnchoredHeadSHA is the PR head the entry's pass is anchored to; the
+	// admission re-reads the PR and re-anchors before starting the pass.
+	AnchoredHeadSHA string     `json:"anchored_head_sha"`
+	AnchoredBaseSHA string     `json:"anchored_base_sha,omitempty"`
+	EnqueuedAt      time.Time  `json:"enqueued_at"`
+	AdmittedAt      *time.Time `json:"admitted_at,omitempty"`
+	// LiveRunID is the run holding the base's line (this run when live).
+	// Omitted when the base has no live entry.
+	LiveRunID   string `json:"live_run_id,omitempty"`
+	EjectReason string `json:"eject_reason,omitempty"`
+	// Note is a constant-shape sentence naming what happens next.
+	Note string `json:"note"`
+}
+
+// mergeCandidateQueuePayloadFor projects the run's active queue entry, or
+// (nil, nil) when the queue is unwired or the run has no active entry. A store
+// read error is returned for the caller's degrade (run read: omit; gate view:
+// omit + a history_gaps entry).
+func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.UUID) (*runMergeCandidateQueuePayload, error) {
+	st, err := s.mergeCandidateQueueForRun(ctx, runID)
+	if err != nil || st == nil {
+		return nil, err
+	}
+	e := st.Entry
+	out := &runMergeCandidateQueuePayload{
+		State:           string(e.State),
+		Phase:           string(e.Phase),
+		Repo:            e.Repo,
+		BaseRef:         e.BaseRef,
+		AnchoredHeadSHA: e.AnchoredHeadSHA,
+		AnchoredBaseSHA: e.AnchoredBaseSHA,
+		EnqueuedAt:      e.EnqueuedAt,
+		AdmittedAt:      e.AdmittedAt,
+		EjectReason:     e.EjectReason,
+	}
+	if st.LiveRunID != nil {
+		out.LiveRunID = st.LiveRunID.String()
+	}
+	if e.State == mergequeue.StateHeld {
+		out.Phase = ""
+		out.Position = st.Position
+		holder := "no run (the next queue event admits it)"
+		if out.LiveRunID != "" {
+			holder = "run " + out.LiveRunID
+		}
+		out.Note = fmt.Sprintf("held at position %d on %s behind %s (ADR-092): no runner slot is used and admission is automatic when the line frees — the queue advances a behind branch, re-anchors and starts the pass; a stalled line self-heals on the periodic pump (about 1 minute), and fishhawk_rebase_run_branch pumps the base manually", st.Position, e.BaseRef, holder)
+		return out, nil
+	}
+	out.Note = "live: this run holds the " + e.BaseRef + " merge-candidate line (ADR-092) until its pull request merges, its pass fails or the run ends; phase " + string(e.Phase)
+	return out, nil
 }
 
 // runCompletionBlockedPayload is the completion-refusal projection on the wire
@@ -2303,6 +2380,15 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// a running run whose stages are all terminal, or when a read fails
 	// (best-effort — warn and omit, never fail the read).
 	resp.CompletionBlocked = s.completionBlockedForRun(r.Context(), got)
+	// Merge-candidate queue surface (ADR-092 / E83.85 / #4200): single-run
+	// read ONLY, best-effort — a store read error warn-logs and omits the
+	// block rather than failing the read.
+	if mcq, qerr := s.mergeCandidateQueuePayloadFor(r.Context(), runID); qerr != nil {
+		s.cfg.Logger.Warn("read merge-candidate queue entry failed; omitting merge_candidate_queue",
+			"run_id", runID.String(), "error", qerr.Error())
+	} else {
+		resp.MergeCandidateQueue = mcq
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -3359,6 +3445,14 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	// The already-cancelled re-entry runs it too, converging a child a
 	// transient error left behind. Best-effort; the body is unchanged.
 	s.cascadeCancelToDecomposedChildren(r.Context(), runID, cancelSourceOperator)
+	// ADR-092 (E83.85 / #4200): a cancelled run never holds a merge-candidate
+	// line. Drop its active queue entry (run_cancelled) and, when it was live,
+	// pump the base so the next held pass is admitted — BEFORE the 200, so a
+	// caller reading the base after the response sees the hand-off. Detached
+	// from the request's cancellation so a client disconnect cannot strand a
+	// half-run admission. Best-effort and idempotent: the already-cancelled
+	// re-entry finds no active entry and does nothing.
+	s.releaseMergeCandidateQueueForRun(context.WithoutCancel(r.Context()), runID, mergeCandidateQueueReasonRunCancelled)
 
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
 

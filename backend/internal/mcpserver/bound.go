@@ -676,6 +676,12 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.live_validation", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_head_mismatch", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
+	// merge_candidate_queue (ADR-092 / #4200) is one constant-shape entry (no
+	// lists): kept through every tier and itemised at the diagnosis skeleton,
+	// where GET /v0/runs/{id} (and the gate view) return it whole.
+	{Path: "run.merge_candidate_queue", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+		return append(restRun(runID), gateView(runID)...)
+	}},
 	// run.precedent is always nil here: getRunStatus hoists it to the top-level
 	// precedent path above, so no tier ever has anything to reduce.
 	{Path: "run.precedent", Tier: tierNever},

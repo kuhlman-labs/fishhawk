@@ -66,7 +66,10 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    when it was `held`, was queued in a different group, or was queued but
    stale past `QueueTTL`. Otherwise it keeps its `enqueued_at`. In every case
    it gets `last_seen_at = now`, and `acquired_at`/`held_dispatched_at`/
-   `admission_nonce` are cleared.
+   `admission_nonce` are cleared. A stage has ONE row (`stage_id` is the
+   key), so a request naming a different group RE-KEYS that row: it moves
+   into the new group at the new group's tail and stops counting ahead in the
+   old one (§ "Verify group (ADR-092 D3)", approval condition 5 of #4200).
 5. Read the holders and the queued-ahead counts.
 6. **Lock miss**: commit the queued row and return `Contended=true`, with a
    position/holders snapshot.
@@ -106,6 +109,34 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
 
 Every time comparison uses the database clock. No Go `time.Now()` value is
 passed into SQL.
+
+## Verify group (ADR-092 D3)
+
+A merge-candidate VERIFY-ONLY pass (ADR-090: an implement stage re-opened by a
+LIVE `stage_merge_candidate_verify_triggered` row) runs no agent, so it does
+not take a `local-implement` slot. The server
+(`backend/internal/server/stage_concurrency.go`, `resolveStageConcurrency`)
+admits it through `VerifyGroupKey(host)` = `local-verify:<host>` at
+`DefaultVerifyLimit`, and decides this BEFORE the spec-declared lookup, so a
+declared implement `group`/`limit` never captures a pass. The rule mirrors
+what the prompt endpoint serves: a pass is served exactly when an implement
+stage has a live (unconsumed) trigger. So:
+
+- a fix-up, a conflict-resolution re-open, and a trigger already consumed by a
+  later `merge_candidate_verified` row stay in `local-implement:<host>`;
+- an unreadable trigger (read error, malformed or half-populated payload, or no
+  audit repository) serves no pass, so the runner runs an ordinary implement
+  and the stage is routed as one (WARN-logged).
+
+The store itself is group-agnostic: holders and queue-ahead are keyed by
+`group_key`, so the two groups never count each other
+(`TestAdmit_VerifyGroupIndependentOfImplementGroup`). Rollout: a stage queued
+in `local-implement:<host>` before its next marker POST resolves to
+`local-verify:<host>` is re-keyed by step 4's restart rule: its single row
+moves to the verify group's tail and leaves the implement queue
+(`TestAdmit_RekeysQueuedRowIntoNewGroup`). The actual verify run still
+serialises against implement-stage verifies on the per-repository verify lock
+(#3315); the group only stops a pass waiting for an agent slot.
 
 ## Admission nonce
 
@@ -158,6 +189,7 @@ A queued row counts as "ahead" only while all of these hold: it is fresh
 | `DefaultGroupPrefix` | `local-implement:` | The default group is per host: `local-implement:<host>`. The MCP client derives `<host>` in `backend/internal/mcpserver/hostlabel.go` (`FISHHAWK_HOST_LABEL` > persisted host-id > hostname, #4212). |
 | `UnknownHost` | `unknown` | The host label used when the client sends none (a pre-change MCP, or an MCP whose `hostlabel.go` ladder resolved nothing). |
 | `DefaultLimit` / `MaxLimit` | 1 / 64 | One local implement per host by default. 64 matches the 0097 CHECK and the spec bound. |
+| `VerifyGroupPrefix` / `DefaultVerifyLimit` | `local-verify:` / 1 | ADR-092 D3 (#4200): a merge-candidate verify-only pass is admitted through `local-verify:<host>`, separate from `local-implement:<host>`. One pass per host at a time, because each pass runs the full verify gate. |
 | `QueueTTL` | 60s | 12× the waiter poll interval, so a live waiter never goes stale. A dead waiter stops blocking the queue within a minute. |
 | `WaiterPollInterval` | 5s | The cadence of the MCP slot waiter. Also the marker's `Retry-After`. |
 | `RunningStaleAfter` | 45m | Runner heartbeats arrive about every 15s, but only during agent invocations, not during the verify gate. 45 minutes outlasts a verify gate. |
