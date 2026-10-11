@@ -188,6 +188,16 @@ corrects the call in-band with no daemon restart. An unregistered id is refused
 400 validation_failed before any forge round-trip. The GitLab work-item provider
 serves both campaign sources (epic_ref and items) since #3658; only a GitLab
 Premium group-epic ref is refused (campaign_epic_ref_group_unsupported).
+
+Dependency sources (#4028). depends_on edges come from the tracker's native
+"blocked by" relation (source native) and from every line-start 'Depends on:'
+body line (source legacy_text); an edge present in both counts once, as native.
+satisfied_dependencies entries carry that source. warnings names each item
+relying on a legacy_text edge, with its targets and the remedy (add a native
+"blocked by" link): it is informational and never refuses the start. A native
+read that fails refuses the start with 502 native_dependency_read_failed,
+naming the issue (details issue_ref) and the reason (truncated, forbidden,
+not_found, unsupported or read_failed) rather than assembling without the edge.
 `),
 	}, resolver.startCampaign)
 }
@@ -241,6 +251,15 @@ campaign_item_not_child, a repo without the GitHub App fails repo_not_installed,
 and a provider that cannot resolve an arbitrary issue set fails
 issue_set_resolution_unsupported. A write tool: needs an operator token with
 write:campaigns scope.
+
+Dependency sources (#4028). edges lists every in-set depends_on edge with its
+source: native (the tracker's "blocked by" relation) or legacy_text (a
+line-start 'Depends on:' body line; every such line is read). dangling and
+satisfied_dependencies entries carry the same source. warnings names each item
+relying on a legacy_text edge and the remedy (add a native "blocked by" link);
+it is informational and never makes the set invalid. A native read that fails
+is a refusal, 502 native_dependency_read_failed naming the issue (details
+issue_ref) and the reason, never a report built without the edge.
 `),
 	}, resolver.previewCampaign)
 }
