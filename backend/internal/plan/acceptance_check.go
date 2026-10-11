@@ -190,6 +190,38 @@ const (
 	// criteria commonly carry no verify_hint. That is the intended signal, not
 	// noise: such a criterion genuinely names nothing that decides it.
 	RuleBlockingCriterionUndecided = "blocking_criterion_undecided"
+	// RuleCriterionRequiresDatabase flags a criterion whose verify_hint names a
+	// DATABASE- or CONTAINER-backed check — a pgtest/testcontainers Postgres
+	// test, a `_pg_test.go` file, FISHHAWK_TEST_PG_URL, psql, a docker
+	// run/exec/compose — and NO operator-observable surface, and which carries
+	// no sanctioned skip declaration (E72.63 / #4095). The acceptance network
+	// sandbox admits only the preview target's ports, so such a check fails
+	// `connect: operation not permitted` and the criterion lands undecidable as
+	// UndecidableCauseSandboxDeniedDB — the #4094 shape, caught at plan time.
+	//
+	// What it is NOT a duplicate of: criterion_restates_test fires on ANY
+	// in-repository Go test evidence and asks for a surface; it is silent on a
+	// psql/docker hint, and its remedy never mentions the declaration. This rule
+	// answers a narrower question — "can the acceptance sandbox run this check
+	// at all?" — and its detail names the declaration remedy, because the
+	// committed-tree verify gate (which DOES reach a runner-provisioned
+	// Postgres) already decides such a test. There is NO cross-rule
+	// suppression: a pgtest-only hint draws one finding from EACH rule.
+	//
+	// EXEMPT: a criterion carrying the sanctioned declaration
+	// criterionDeclaresUnevaluable recognises (the declaration IS the remedy),
+	// and a hint naming an observable surface (the agent probes that instead).
+	// POLARITY-AWARE like criterion_restates_test: a marker inside a negated
+	// disclaimer ("not a pgtest test") is not evidence. INTAKE-INERT by
+	// construction: drafts carry no verify_hint, so no marker can match.
+	//
+	// ADVISORY and never refuses a plan. RESIDUAL, stated honestly: it fires
+	// only on a hint that NAMES a database/container marker — a hint naming a
+	// plain foo_test.go that happens to be pgtest-backed (the exact #4094 hint
+	// shape) is not detected here, because that needs the server to inspect
+	// test sources. The acceptance prompt's sandbox-limits section covers that
+	// shape at runtime.
+	RuleCriterionRequiresDatabase = "criterion_requires_database"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -246,6 +278,13 @@ const (
 //     no deciding test or surface at all (E68.28 / #3057). The ABSENCE case
 //     criterion_restates_test deliberately leaves unguarded. The source conjunct
 //     makes it INTAKE-INERT, like the provenance rules. Advisory only.
+//   - criterion_requires_database — a criterion whose verify_hint names a
+//     database- or container-backed check (pgtest, testcontainers,
+//     FISHHAWK_TEST_PG_URL, psql, docker run/exec/compose) and no observable
+//     surface, so the acceptance sandbox cannot run it and it lands
+//     undecidable as sandbox_denied_db (E72.63 / #4095). Polarity-aware;
+//     exempt for skip_expected-with-basis / requires_live_validation;
+//     intake-inert (drafts carry no verify_hint). Advisory only.
 //   - all_criteria_skip_expected — the plan declares at least one acceptance
 //     criterion and EVERY one is skip_expected-with-basis, so acceptance will
 //     short-circuit to not_validated having verified ZERO criteria (#3026).
@@ -315,6 +354,11 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	restates := TestOnlyCriteria(v)
 	findings = append(findings, restates...)
 	findings = append(findings, noObservableCriterion(v, restates)...)
+
+	// E72.63 (#4095): the database-backed-hint matcher rides the same call, for
+	// the same single-source reason. It reads the same verify_hint field as the
+	// pair above and does not suppress it: a pgtest-only hint draws both.
+	findings = append(findings, DatabaseBackedCriteria(v)...)
 
 	// E68.28 (#3057): the empty-hint absence rule rides the SAME call, for the
 	// same single-source reason — the plan gate and refinement intake get it from
@@ -2170,4 +2214,97 @@ func noObservableCriterion(v Verification, restates []AcceptanceFinding) []Accep
 			"a CLI exit code/stderr/stdout, a rendered prompt, or a persisted audit row — or declare verification.acceptance_surface: none " +
 			"so the acceptance stage is omitted at plan approval instead. Advisory; never refuses the plan.",
 	})
+}
+
+// ---------------------------------------------------------------------------
+// criterion_requires_database (E72.63 / #4095)
+// ---------------------------------------------------------------------------
+
+// databaseBackedHintMarkers are the SUBSTRING markers that name a database- or
+// container-backed check in a verify_hint. Lowercase; matched against the
+// lowered hint with markerOccurrenceOffsets, so "pgtest" matches inside the
+// single token "pgtest-backed" and "_pg_test.go" inside a full path.
+//
+// Every entry names a check that needs a database or a container daemon: the
+// shared pgtest/testcontainers Postgres, a `_pg_test.go` file (the repo's
+// naming for a Postgres-backed test file), the gate-provisioned
+// FISHHAWK_TEST_PG_URL, psql, and docker. A bare "database" or "postgres" is
+// deliberately ABSENT: "the preview database returns the row" or "the Postgres
+// row is visible over GET /v0/..." describes the observable state, not a check
+// the agent must run.
+var databaseBackedHintMarkers = []string{
+	"pgtest", "testcontainers", "_pg_test.go", "fishhawk_test_pg_url",
+	"db-backed", "database-backed", "postgres-backed", "psql",
+	"docker run", "docker exec", "docker compose",
+}
+
+// databaseHintSurfaceMask is the one database marker that ALSO contains an
+// observable-surface substring marker ("fishhawk_", which names a fishhawk_*
+// MCP tool). FISHHAWK_TEST_PG_URL is an environment variable, not a tool, so
+// it is blanked out of the hint before the surface check — otherwise the
+// marker would suppress its own finding and a hint naming only the env var
+// could never fire.
+const databaseHintSurfaceMask = "fishhawk_test_pg_url"
+
+// verifyHintNamesDatabaseBackedCheck reports whether a verify_hint names a
+// database/container-backed check — POLARITY-AWARE, exactly like
+// verifyHintNamesTestOnly's substring arm: an occurrence with a negator within
+// livenessProximityWindow tokens BEFORE it is the hint DENYING the dependency
+// ("no database needed, not a pgtest test"), so it earns nothing. True when at
+// least ONE occurrence is un-negated.
+func verifyHintNamesDatabaseBackedCheck(hint string) bool {
+	lowered := strings.ToLower(hint)
+	return anyUnnegatedOccurrence(lowered, markerOccurrenceOffsets(lowered, databaseBackedHintMarkers))
+}
+
+// criterionRequiresDatabaseDetail is the criterion_requires_database finding's
+// Detail, a const so the audit-payload bytes have one source. It names the
+// runtime cause token and BOTH remedies, so the author is not sent on a
+// two-step.
+const criterionRequiresDatabaseDetail = "criterion verify_hint names a database- or container-backed check (pgtest/testcontainers " +
+	"Postgres, FISHHAWK_TEST_PG_URL, psql, docker) and no operator-observable surface. The acceptance network sandbox admits only " +
+	"the preview target's ports, so that check fails `connect: operation not permitted` and the criterion lands undecidable as " +
+	UndecidableCauseSandboxDeniedDB + ". Name the preview surface that decides it in verify_hint (an HTTP route/response/status " +
+	"code, an MCP tool result / fishhawk_* tool, a CLI exit code/stderr/stdout, a rendered prompt, or a persisted audit row), or " +
+	"declare skip_expected: true with an expectation_basis citing the committed-tree verify gate that runs the test. Advisory; " +
+	"never refuses the plan."
+
+// DatabaseBackedCriteria flags every acceptance criterion whose verify_hint
+// names a database- or container-backed check and NO operator-observable
+// surface, and which carries no sanctioned skip declaration
+// (criterion_requires_database, E72.63 / #4095 — see
+// RuleCriterionRequiresDatabase for what it is and is not).
+//
+// It reads verify_hint ALONE — never the statement, never expectation_basis
+// (a basis citing "the committed-tree verify gate runs the pgtest-backed
+// TestX" is the REMEDY, and is exempt anyway). THREE suppressors, each with
+// its own test row: the sanctioned declaration (criterionDeclaresUnevaluable),
+// a named observable surface (verifyHintNamesObservableSurface, with the
+// FISHHAWK_TEST_PG_URL env var masked so it cannot clear itself), and a
+// negated marker (verifyHintNamesDatabaseBackedCheck). An empty or
+// whitespace-only hint is silent BY CONSTRUCTION — no marker matches it — so
+// there is deliberately no emptiness guard.
+//
+// ADVISORY ONLY. Returns a non-nil empty slice when nothing is flagged;
+// findings come out in criteria order.
+func DatabaseBackedCriteria(v Verification) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	for _, c := range v.AcceptanceCriteria {
+		if criterionDeclaresUnevaluable(c) {
+			continue
+		}
+		if !verifyHintNamesDatabaseBackedCheck(c.VerifyHint) {
+			continue
+		}
+		surfaceHint := strings.ReplaceAll(strings.ToLower(c.VerifyHint), databaseHintSurfaceMask, " ")
+		if verifyHintNamesObservableSurface(surfaceHint) {
+			continue
+		}
+		findings = append(findings, AcceptanceFinding{
+			Rule:        RuleCriterionRequiresDatabase,
+			CriterionID: c.ID,
+			Detail:      criterionRequiresDatabaseDetail,
+		})
+	}
+	return findings
 }
