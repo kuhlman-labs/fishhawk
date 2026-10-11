@@ -4311,8 +4311,23 @@ type Campaign struct {
 	// map[string]any / json.RawMessage) so the reflection-built output schema
 	// stays an object. CREATE-response-only and never blocking.
 	AdmissionScreen *campaignAdmissionScreen `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen: candidates declared runnable:no, and candidates whose title/body names a path the repo's implement-stage forbidden_paths forbid. Present only on the create response, only when the screen found something; it never blocks or alters the campaign"`
-	CreatedAt       time.Time                `json:"created_at"`
-	UpdatedAt       time.Time                `json:"updated_at"`
+	// Warnings names every item whose depends_on relies on a legacy free-text
+	// `Depends on:` line rather than the tracker's native relation (#4028).
+	// Typed struct so the reflection-built output schema stays an object array.
+	// CREATE-response-only and informational: the campaign was created anyway.
+	Warnings  []campaignDependencyWarning `json:"warnings,omitempty" jsonschema:"one entry per item whose depends_on relies on a legacy free-text 'Depends on:' line instead of a native 'blocked by' link. Informational — the campaign was created and the edge is honoured. Present only on the create response, only when such an item exists"`
+	CreatedAt time.Time                   `json:"created_at"`
+	UpdatedAt time.Time                   `json:"updated_at"`
+}
+
+// campaignDependencyWarning mirrors the backend's campaignDependencyWarning
+// (#4028). Unexported (FIELDS exported for JSON) so it stays off the frozen MCP
+// export surface, like campaignSatisfiedDependency.
+type campaignDependencyWarning struct {
+	IssueRef string   `json:"issue_ref" jsonschema:"the item relying on the legacy line, as issue:N"`
+	Code     string   `json:"code" jsonschema:"always legacy_text_dependency"`
+	Targets  []string `json:"targets" jsonschema:"the item's dependency targets read from legacy 'Depends on:' lines, sorted"`
+	Message  string   `json:"message" jsonschema:"names the issue, its legacy targets and the remedy: add a native 'blocked by' link for each"`
 }
 
 // campaignAdmissionScreen mirrors the backend's campaignAdmissionScreenPayload
@@ -4345,6 +4360,7 @@ type campaignSatisfiedDependency struct {
 	To          int    `json:"to" jsonschema:"the already-completed target issue number the edge was elided against"`
 	State       string `json:"state" jsonschema:"the target's observed issue state (e.g. closed)"`
 	StateReason string `json:"state_reason" jsonschema:"the target's observed state_reason (e.g. completed)"`
+	Source      string `json:"source,omitempty" jsonschema:"where the elided edge was read from: native (the tracker's native dependency relation) or legacy_text (a free-text 'Depends on:' line)"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
@@ -4535,6 +4551,10 @@ type campaignGroomingSource struct {
 //     at all and the remedy names that wiring; a non-empty one means the
 //     resolved id is simply not among them and the remedy names the in-band
 //     `provider` selector plus the durable conventions levers (#3645)
+//   - 502 native_dependency_read_failed (#4028: a native "blocked by" read
+//     failed on either source, so assembly refused rather than drop an edge;
+//     details carry issue_ref, omitted when no issue was read, and reason
+//     truncated | forbidden | not_found | unsupported | read_failed)
 //   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the
 //     server's issue-set budget; details carry resolved / items_total /
 //     budget_seconds and, when one could be proven to fit, a
@@ -4602,6 +4622,16 @@ type CampaignPreviewDangling struct {
 	To     string `json:"to" jsonschema:"the dependency target. issue:N for a resolvable same-repo target; unparsable:<digest>:\"token\" for a cross-repo or unparseable one"`
 	Reason string `json:"reason" jsonschema:"why the edge blocks assembly: not_child | excluded_incomplete | target_closed_incomplete | target_state_unreadable"`
 	Remedy string `json:"remedy" jsonschema:"one short operator-facing sentence naming what to do about this edge"`
+	Source string `json:"source,omitempty" jsonschema:"where the blocking edge was read from: native or legacy_text"`
+}
+
+// campaignPreviewEdge mirrors the backend's campaignPreviewEdge (#4028): one
+// in-set depends_on edge with its source. Unexported (FIELDS exported for JSON)
+// so it stays off the frozen MCP export surface.
+type campaignPreviewEdge struct {
+	From   string `json:"from" jsonschema:"the depending issue, as issue:N"`
+	To     string `json:"to" jsonschema:"the in-set dependency target, as issue:N"`
+	Source string `json:"source,omitempty" jsonschema:"where the edge was read from: native (the tracker's native 'blocked by' relation) or legacy_text (a free-text 'Depends on:' line)"`
 }
 
 // CampaignPreview is the POST /v0/campaigns/preview report — the wire shape
@@ -4615,6 +4645,8 @@ type CampaignPreview struct {
 	WaveCount             *int                          `json:"wave_count,omitempty"`
 	Waves                 [][]string                    `json:"waves,omitempty" jsonschema:"the topological dispatch order: waves[w] holds the issue refs eligible in wave w. Absent when the set is invalid"`
 	Items                 []CampaignPreviewItem         `json:"items" jsonschema:"the resolved items with their in-set depends_on edges. Present on BOTH the valid and the invalid path, so an invalid report still shows the partial graph"`
+	Edges                 []campaignPreviewEdge         `json:"edges" jsonschema:"the in-set depends_on edges with their source (native or legacy_text), sorted. Present on BOTH paths"`
+	Warnings              []campaignDependencyWarning   `json:"warnings,omitempty" jsonschema:"one entry per item whose depends_on relies on a legacy free-text 'Depends on:' line instead of a native 'blocked by' link. Informational — it never makes the set invalid"`
 	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed, so the set assembles rather than failing dangling"`
 	GroomingSource        map[string]any                `json:"grooming_source,omitempty" jsonschema:"provenance of a previewed grooming order, mirroring the campaign create response's block. Absent unless grooming_run_id was passed"`
 	Dangling              []CampaignPreviewDangling     `json:"dangling,omitempty" jsonschema:"the depends_on edges blocking assembly, one entry per edge with its cause and remedy. Empty on a valid preview"`
@@ -4647,7 +4679,8 @@ type CampaignPreview struct {
 //   - 422 repo_not_installed / campaign_item_not_child / campaign_item_ref_invalid
 //   - 501 issue_set_resolution_unsupported / epic_children_unsupported
 //   - 502 installation_resolution_failed / epic_children_query_failed /
-//     issue_set_resolution_failed
+//     issue_set_resolution_failed / native_dependency_read_failed (#4028: a
+//     native "blocked by" read failed; details issue_ref + reason)
 //   - 504 issue_set_resolution_timeout
 //   - 503 campaign_repo_unconfigured
 func (c *apiClient) PreviewCampaign(ctx context.Context, req campaignPreviewRequest) (*CampaignPreview, error) {

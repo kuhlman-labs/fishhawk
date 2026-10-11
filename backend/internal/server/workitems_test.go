@@ -2013,7 +2013,12 @@ func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
 	if len(res.Children) != 3 || res.Children[0].Number != 41 || res.Children[2].Number != 4242 {
 		t.Fatalf("children = %+v, want ascending 41,42,4242", res.Children)
 	}
-	wantEdges := []workmgmt.DependsEdge{{From: 4242, To: 41}, {From: 4242, To: 42}}
+	// EpicChildren makes no native read, so every edge it parses from the
+	// stamped marker line is tagged legacy_text (#4028).
+	wantEdges := []workmgmt.DependsEdge{
+		{From: 4242, To: 41, Source: workmgmt.DependencySourceLegacyText},
+		{From: 4242, To: 42, Source: workmgmt.DependencySourceLegacyText},
+	}
 	if len(res.Edges) != len(wantEdges) {
 		t.Fatalf("edges = %+v, want %+v (the #999 non-child reference must be dropped)", res.Edges, wantEdges)
 	}

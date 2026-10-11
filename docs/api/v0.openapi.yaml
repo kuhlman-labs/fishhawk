@@ -4246,8 +4246,50 @@ components:
             $ref: '#/components/schemas/SatisfiedDependency'
         admission_screen:
           $ref: '#/components/schemas/CampaignAdmissionScreen'
+        warnings:
+          type: array
+          description: |
+            One entry per item whose `depends_on` relies on a legacy free-text
+            `Depends on:` line rather than the tracker's native "blocked by"
+            relation (#4028). INFORMATIONAL: the campaign was created and the
+            edge is honoured; a create is never refused on a warning. Like
+            `satisfied_dependencies` this is CREATE-response-only — NOT
+            persisted, so GET/list/status responses and an idempotent replay
+            omit it. Omitted when no edge is `legacy_text`.
+          items:
+            $ref: '#/components/schemas/CampaignDependencyWarning'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CampaignDependencyWarning:
+      type: object
+      description: |
+        One item relying on at least one legacy free-text `Depends on:` line
+        (#4028). Shared by the `POST /v0/campaigns` and
+        `POST /v0/campaigns/preview` responses.
+      required: [issue_ref, code, targets, message]
+      properties:
+        issue_ref:
+          type: string
+          description: The item relying on the legacy line, as `issue:N`.
+          example: "issue:1441"
+        code:
+          type: string
+          enum: [legacy_text_dependency]
+        targets:
+          type: array
+          items: { type: string }
+          description: |
+            The item's dependency targets read from legacy lines — in-set,
+            dangling and satisfied alike — sorted and deduped, rendered as
+            `issue:N` (or `unparsable:<digest>:"<token>"` for an unresolvable
+            target).
+        message:
+          type: string
+          description: |
+            Names the issue, the targets and the remedy: add a native "blocked
+            by" link for each, so the dependency survives once legacy parsing
+            is retired. The line is honoured until then.
 
     CampaignAdmissionScreen:
       type: object
@@ -4328,6 +4370,40 @@ components:
           type: string
           description: The target's observed `state_reason` (e.g. `completed`).
           example: completed
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: |
+            Where the elided edge was read from (#4028): `native` (the
+            tracker's native dependency relation) or `legacy_text` (a
+            line-start `Depends on:` body line). Absent only for a provider
+            that does not tag sources.
+
+    CampaignPreviewEdge:
+      type: object
+      description: |
+        One IN-SET `depends_on` edge in a `CampaignPreview` (#4028): both
+        endpoints are resolved items. It is where a preview names an in-set
+        edge's source; an item's `depends_on` carries only the target ref.
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          description: The depending issue, as `issue:N`.
+          example: "issue:1442"
+        to:
+          type: string
+          description: The in-set dependency target, as `issue:N`.
+          example: "issue:1441"
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: |
+            `native` for an edge read from the tracker's native "blocked by"
+            relation, `legacy_text` for one parsed from a line-start
+            `Depends on:` body line (every such line is read). An edge present
+            in both is ONE edge tagged `native`. Absent only for a provider
+            that does not tag sources.
 
     CampaignPreviewItem:
       type: object
@@ -4392,6 +4468,10 @@ components:
         remedy:
           type: string
           description: One short operator-facing sentence naming what to do about this edge.
+        source:
+          type: string
+          enum: [native, legacy_text]
+          description: Where the blocking edge was read from (#4028). Absent only for a provider that does not tag sources.
 
     CampaignPreview:
       type: object
@@ -4399,7 +4479,7 @@ components:
         The `POST /v0/campaigns/preview` report (#3647). It is a REPORT, not a
         campaign: nothing is persisted, so it carries no `id`, `state` or
         timestamps.
-      required: [valid, repo, item_count, items]
+      required: [valid, repo, item_count, items, edges]
       properties:
         valid:
           type: boolean
@@ -4434,6 +4514,21 @@ components:
             valid and the INVALID path, so an operator iterating toward a closed
             set sees the partial graph alongside the blocking edges — `waves`
             may be omitted on an invalid set, `items` and their edges may not.
+        edges:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPreviewEdge' }
+          description: |
+            The in-set `depends_on` edges with their source (#4028), sorted by
+            (`from`, `to`) issue number. ALWAYS present on both the valid and
+            the invalid path; an empty array when the set has no in-set edge.
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignDependencyWarning' }
+          description: |
+            One entry per item relying on a legacy free-text `Depends on:` line
+            (#4028), the same block the create response carries. Present on
+            both paths; INFORMATIONAL — it never makes the set invalid. Absent
+            when no edge is `legacy_text`.
         satisfied_dependencies:
           type: array
           items: { $ref: '#/components/schemas/SatisfiedDependency' }
@@ -18856,6 +18951,18 @@ paths:
             named issue set (no-epic `items`-only path). It is a FETCH/transport
             failure only: a malformed `items` ref now answers `422
             campaign_item_ref_invalid` instead (#2176);
+            `native_dependency_read_failed` (#4028) — the tracker's native
+            "blocked by" relation could not be read for an issue on EITHER
+            source (the epic branch through the provider's campaign-only
+            epic-children read, or the `items` branch), so assembly refuses
+            rather than drop an edge. `details.issue_ref` names the issue
+            (omitted when the read could not be attempted at all) and
+            `details.reason` is one of `truncated` (more links than one read
+            returns), `forbidden`, `not_found`, `unsupported` or `read_failed`;
+            the message names the per-reason remedy. On the `items` branch it is
+            classified after the `504` timeout and the `422
+            campaign_item_ref_invalid` arms and before the generic `502
+            issue_set_resolution_failed`;
             `grooming_order_supersession_unreadable` (E54.6 / #2238) — a read
             the currency decision depends on failed. It covers BOTH such reads:
             the SOURCE run's own stages/artifacts/approvals and the supersession
@@ -19029,8 +19136,11 @@ paths:
         '502':
           description: |
             `installation_resolution_failed`, `epic_children_query_failed`,
-            `issue_set_resolution_failed`,
+            `issue_set_resolution_failed`, `native_dependency_read_failed`
+            (#4028; `details.issue_ref` + `details.reason`),
             `grooming_order_supersession_unreadable` — as on `POST /v0/campaigns`.
+            A failed native "blocked by" read is a refusal, never a report built
+            without the edge.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
         '504':

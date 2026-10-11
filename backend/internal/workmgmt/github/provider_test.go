@@ -23,6 +23,13 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
+// srcLegacy / srcNative abbreviate the two depends_on edge sources (#4028) in
+// expectations.
+const (
+	srcLegacy = workmgmt.DependencySourceLegacyText
+	srcNative = workmgmt.DependencySourceNative
+)
+
 // stubTokenProvider mints a fixed installation token so the cross-boundary
 // test can distinguish it from the static projects PAT by Authorization
 // header value.
@@ -148,10 +155,63 @@ type fakeAPI struct {
 
 	projectsTokenConfigured bool
 
-	// mu guards the fake's own call-recording state. Only GetIssue is reached
-	// concurrently (by ResolveDependencies' bounded pool, #3113); the other
-	// members are driven from the test goroutine.
+	// blockedBy maps issue number -> the canned native "blocked by" refs
+	// IssueBlockedBy returns (#4028); an absent number has no relation.
+	// blockedByErrs maps a number -> the error IssueBlockedBy returns for THAT
+	// number instead. blockedByWaitCtx makes every IssueBlockedBy block until its
+	// context ends and return the context error (the deadline arm).
+	// blockedByCalls records calls per number.
+	blockedBy        map[int][]githubclient.BlockingIssueRef
+	blockedByErrs    map[int]error
+	blockedByWaitCtx bool
+	blockedByCalls   map[int]int
+
+	// mu guards the fake's own call-recording state. GetIssue and
+	// IssueBlockedBy are reached concurrently (by the bounded pool shared by
+	// ResolveDependencies and CampaignEpicChildren, #3113 / #4028 — the #3226
+	// trap); the other members are driven from the test goroutine.
 	mu sync.Mutex
+}
+
+// IssueBlockedBy implements the optional blockedByReader extension (#4028). It
+// is mutex-guarded because the bounded pool calls it concurrently.
+func (f *fakeAPI) IssueBlockedBy(ctx context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) ([]githubclient.BlockingIssueRef, error) {
+	f.mu.Lock()
+	if f.blockedByCalls == nil {
+		f.blockedByCalls = map[int]int{}
+	}
+	f.blockedByCalls[number]++
+	wait, err, refs := f.blockedByWaitCtx, f.blockedByErrs[number], f.blockedBy[number]
+	f.mu.Unlock()
+	if wait {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
+// blockedByCallTotal returns the total IssueBlockedBy calls and the per-number
+// counts, read under the fake's lock.
+func (f *fakeAPI) blockedByCallTotal() (int, map[int]int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	total := 0
+	out := map[int]int{}
+	for n, c := range f.blockedByCalls {
+		total += c
+		out[n] = c
+	}
+	return total, out
+}
+
+// getIssueCallCount reads one number's GetIssue count under the fake's lock.
+func (f *fakeAPI) getIssueCallCount(number int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getIssueCalls[number]
 }
 
 // fakeAddLabelsCall is one recorded AddIssueLabels dispatch: the issue number
@@ -631,7 +691,7 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	}
 	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → it is
 	// kept out of Edges and surfaced in DroppedEdges (not silently discarded).
-	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
+	want := []workmgmt.DependsEdge{{From: 42, To: 41, Source: srcLegacy}, {From: 43, To: 41, Source: srcLegacy}, {From: 43, To: 42, Source: srcLegacy}}
 	if len(res.Edges) != len(want) {
 		t.Fatalf("edges = %+v, want %+v (#999 must be dropped)", res.Edges, want)
 	}
@@ -643,7 +703,7 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	// The mis-targeted #999 reference lands in DroppedEdges stamped
 	// DropNotChild so assembly can fail closed on it (keeping the "not a fellow
 	// child" wording) rather than the provider silently dropping it.
-	wantDropped := []workmgmt.DependsEdge{{From: 43, To: 999, Reason: workmgmt.DropNotChild}}
+	wantDropped := []workmgmt.DependsEdge{{From: 43, To: 999, Reason: workmgmt.DropNotChild, Source: srcLegacy}}
 	if len(res.DroppedEdges) != len(wantDropped) {
 		t.Fatalf("dropped edges = %+v, want %+v (#999 must be surfaced)", res.DroppedEdges, wantDropped)
 	}
@@ -752,7 +812,7 @@ func TestProvider_EpicChildren_CrossPageDependencyIsEdgeNotDropped(t *testing.T)
 	}
 	// The cross-page dependency is a real edge: 142 -> 41 in Edges, and nothing
 	// dropped — the complete child set makes #41 a recognized sibling of #142.
-	want := []workmgmt.DependsEdge{{From: 142, To: 41}}
+	want := []workmgmt.DependsEdge{{From: 142, To: 41, Source: srcLegacy}}
 	if len(res.Edges) != len(want) || res.Edges[0] != want[0] {
 		t.Fatalf("edges = %+v, want %+v (cross-page dep classified as an edge)", res.Edges, want)
 	}
@@ -867,7 +927,7 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 		if len(res.Children) != 2 || res.Children[0].Number != 100 || res.Children[1].Number != 101 {
 			t.Fatalf("children = %+v, want [100 101] ascending", res.Children)
 		}
-		want := []workmgmt.DependsEdge{{From: 101, To: 100}}
+		want := []workmgmt.DependsEdge{{From: 101, To: 100, Source: srcLegacy}}
 		if len(res.Edges) != 1 || res.Edges[0] != want[0] {
 			t.Fatalf("edges = %+v, want %+v", res.Edges, want)
 		}
@@ -890,12 +950,12 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 			t.Fatalf("ResolveDependencies: %v", err)
 		}
 		// In-set edges 102->100 and 102->101, sorted by (From,To).
-		wantEdges := []workmgmt.DependsEdge{{From: 102, To: 100}, {From: 102, To: 101}}
+		wantEdges := []workmgmt.DependsEdge{{From: 102, To: 100, Source: srcLegacy}, {From: 102, To: 101, Source: srcLegacy}}
 		if len(res.Edges) != len(wantEdges) || res.Edges[0] != wantEdges[0] || res.Edges[1] != wantEdges[1] {
 			t.Fatalf("edges = %+v, want %+v", res.Edges, wantEdges)
 		}
 		// #999 is not in the named set and OPEN -> dropped, stamped DropNotChild.
-		wantDropped := []workmgmt.DependsEdge{{From: 102, To: 999, Reason: workmgmt.DropNotChild}}
+		wantDropped := []workmgmt.DependsEdge{{From: 102, To: 999, Reason: workmgmt.DropNotChild, Source: srcLegacy}}
 		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != wantDropped[0] {
 			t.Fatalf("dropped = %+v, want %+v", res.DroppedEdges, wantDropped)
 		}
@@ -1178,7 +1238,7 @@ func TestResolveDependenciesClosedCompletedTargetSatisfied(t *testing.T) {
 	if len(res.DroppedEdges) != 0 {
 		t.Fatalf("DroppedEdges = %+v, want none (target closed+completed → satisfied)", res.DroppedEdges)
 	}
-	want := workmgmt.SatisfiedEdge{From: 2032, To: 1639, State: "closed", StateReason: "completed"}
+	want := workmgmt.SatisfiedEdge{From: 2032, To: 1639, State: "closed", StateReason: "completed", Source: srcLegacy}
 	if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
 		t.Fatalf("SatisfiedEdges = %+v, want [%+v]", res.SatisfiedEdges, want)
 	}
@@ -1208,7 +1268,7 @@ func TestResolveDependenciesOpenTargetStillRefuses(t *testing.T) {
 	if len(res.SatisfiedEdges) != 0 {
 		t.Fatalf("SatisfiedEdges = %+v, want none (open target is not satisfied)", res.SatisfiedEdges)
 	}
-	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropNotChild}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropNotChild, Source: srcLegacy}
 	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
 		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
 	}
@@ -1225,7 +1285,7 @@ func TestResolveDependenciesClosedNotPlannedRefuses(t *testing.T) {
 	if len(res.SatisfiedEdges) != 0 {
 		t.Fatalf("SatisfiedEdges = %+v, want none (not_planned is not satisfied)", res.SatisfiedEdges)
 	}
-	want := workmgmt.DependsEdge{From: 1642, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete}
+	want := workmgmt.DependsEdge{From: 1642, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete, Source: srcLegacy}
 	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
 		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
 	}
@@ -1257,7 +1317,7 @@ func TestResolveDependenciesUnreadableTargetRefuses(t *testing.T) {
 	if len(res.SatisfiedEdges) != 0 {
 		t.Fatalf("SatisfiedEdges = %+v, want none (unreadable target is never satisfied)", res.SatisfiedEdges)
 	}
-	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable, Source: srcLegacy}
 	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
 		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
 	}
@@ -1284,7 +1344,7 @@ func TestResolveDependenciesNilIssueRefuses(t *testing.T) {
 	if len(res.SatisfiedEdges) != 0 {
 		t.Fatalf("SatisfiedEdges = %+v, want none (nil issue is never satisfied)", res.SatisfiedEdges)
 	}
-	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable}
+	want := workmgmt.DependsEdge{From: 2032, To: 1639, Reason: workmgmt.DropTargetStateUnreadable, Source: srcLegacy}
 	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
 		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
 	}
@@ -1513,21 +1573,21 @@ func TestEpicChildrenOutOfEpicTargetClassification(t *testing.T) {
 		if len(res.DroppedEdges) != 0 {
 			t.Fatalf("DroppedEdges = %+v, want none", res.DroppedEdges)
 		}
-		want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed"}
+		want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed", Source: srcLegacy}
 		if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
 			t.Fatalf("SatisfiedEdges = %+v, want [%+v]", res.SatisfiedEdges, want)
 		}
 	})
 	t.Run("open → DropNotChild", func(t *testing.T) {
 		res := epicChildrenResult(t, 43, 999, "open", "")
-		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropNotChild}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropNotChild, Source: srcLegacy}
 		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
 			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
 		}
 	})
 	t.Run("closed+not_planned → DropTargetClosedIncomplete", func(t *testing.T) {
 		res := epicChildrenResult(t, 43, 999, "closed", "not_planned")
-		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetClosedIncomplete}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetClosedIncomplete, Source: srcLegacy}
 		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
 			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
 		}
@@ -1547,7 +1607,7 @@ func TestEpicChildrenOutOfEpicTargetClassification(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EpicChildren: %v", err)
 		}
-		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable, Source: srcLegacy}
 		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want || len(res.SatisfiedEdges) != 0 {
 			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", res.DroppedEdges, res.SatisfiedEdges, want)
 		}
@@ -1565,7 +1625,7 @@ func TestEpicChildrenOutOfEpicTargetClassification(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EpicChildren: %v", err)
 		}
-		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable}
+		want := workmgmt.DependsEdge{From: 43, To: 999, Reason: workmgmt.DropTargetStateUnreadable, Source: srcLegacy}
 		if len(r2.DroppedEdges) != 1 || r2.DroppedEdges[0] != want || len(r2.SatisfiedEdges) != 0 {
 			t.Fatalf("res dropped=%+v satisfied=%+v, want [%+v] / none", r2.DroppedEdges, r2.SatisfiedEdges, want)
 		}
@@ -1657,7 +1717,7 @@ func TestEpicChildrenDuplicateTokenCollapses(t *testing.T) {
 	res := epicChildrenResultBody(t, 43, "Depends on: #999, #999", map[int]*githubclient.Issue{
 		999: {Number: 999, Title: "done", State: "closed", StateReason: "completed"},
 	})
-	want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed"}
+	want := workmgmt.SatisfiedEdge{From: 43, To: 999, State: "closed", StateReason: "completed", Source: srcLegacy}
 	if got := countSatisfied(res.SatisfiedEdges); got[[2]int{43, 999}] != 1 || len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0] != want {
 		t.Fatalf("SatisfiedEdges = %+v, want exactly one [%+v]", res.SatisfiedEdges, want)
 	}
@@ -1695,8 +1755,8 @@ func TestDependsOnMarker_RoundTrip(t *testing.T) {
 	body := "## Summary\n\nx\n\n" + renderDependsOnMarker([]string{"41", "#42"})
 	refs := parseDependsOnMarker(body)
 	if len(refs) != 2 ||
-		refs[0] != (dependsOnRef{Number: 41, Resolvable: true}) ||
-		refs[1] != (dependsOnRef{Number: 42, Resolvable: true}) {
+		refs[0] != (dependsOnRef{Number: 41, Resolvable: true, Source: srcLegacy}) ||
+		refs[1] != (dependsOnRef{Number: 42, Resolvable: true, Source: srcLegacy}) {
 		t.Errorf("parse round trip = %+v, want two resolvable refs [41 42]", refs)
 	}
 	if parseDependsOnMarker("## Summary\n\nno marker here\n") != nil {
@@ -1712,7 +1772,7 @@ func TestDependsOnMarker_RoundTrip(t *testing.T) {
 	if len(mixed) != 3 {
 		t.Fatalf("parse of mixed marker = %+v, want 3 refs", mixed)
 	}
-	if mixed[0] != (dependsOnRef{Number: 7, Resolvable: true}) {
+	if mixed[0] != (dependsOnRef{Number: 7, Resolvable: true, Source: srcLegacy}) {
 		t.Errorf("mixed[0] = %+v, want resolvable #7", mixed[0])
 	}
 	for i, wantDisplay := range map[int]string{1: "other/repo#1639", 2: "owner/name#3"} {
@@ -2904,10 +2964,10 @@ func TestParseDependsOnMarker_UnresolvableTokenCarriesDigestAndDisplay(t *testin
 	if len(refs) != 3 {
 		t.Fatalf("refs = %+v, want 3 (resolvable 1639, unresolvable cross-repo, resolvable 42)", refs)
 	}
-	if refs[0] != (dependsOnRef{Number: 1639, Resolvable: true}) {
+	if refs[0] != (dependsOnRef{Number: 1639, Resolvable: true, Source: srcLegacy}) {
 		t.Errorf("refs[0] = %+v, want resolvable #1639", refs[0])
 	}
-	if refs[2] != (dependsOnRef{Number: 42, Resolvable: true}) {
+	if refs[2] != (dependsOnRef{Number: 42, Resolvable: true, Source: srcLegacy}) {
 		t.Errorf("refs[2] = %+v, want resolvable #42", refs[2])
 	}
 	if refs[1].Resolvable {
@@ -3227,13 +3287,23 @@ func (a *jitterAPI) GetIssue(ctx context.Context, scope forge.CredentialScope, r
 	return a.fakeAPI.GetIssue(ctx, scope, repo, number)
 }
 
+// IssueBlockedBy jitters the native read the same way (#4028), so the native
+// half of a worker's fetch also completes in a perturbed order.
+func (a *jitterAPI) IssueBlockedBy(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.BlockingIssueRef, error) {
+	time.Sleep(time.Duration(rand.IntN(300)) * time.Microsecond)
+	return a.fakeAPI.IssueBlockedBy(ctx, scope, repo, number)
+}
+
 // jitterFixture is the shared determinism fixture: ten named issues in
 // DESCENDING request order (so request order and the ascending Children order
 // are different, and a phase that leaked completion order into the output would
 // show), carrying one edge of every classification the resolver emits — an
 // in-set edge, a satisfied out-of-set target, an open one, a
 // closed-but-incomplete one, an unreadable one, and an unresolvable cross-repo
-// token.
+// token. Since #4028 it also carries NATIVE "blocked by" refs of three
+// classifications (in-set, satisfied out-of-set, cross-repo) and one edge
+// recorded BOTH natively and as text, so the native half of each worker's
+// fetch and the native-first merge are under the same determinism pin.
 func jitterFixture() *fakeAPI {
 	return &fakeAPI{
 		getIssues: map[int]*githubclient.Issue{
@@ -3243,17 +3313,26 @@ func jitterFixture() *fakeAPI {
 			107: {Number: 107, Title: "one-seven", Body: "Depends on: other/repo#5\n"},
 			106: {Number: 106, Title: "one-six", Body: "Depends on: #902\n"},
 			105: {Number: 105, Title: "one-five", Body: "Depends on: #903\n"},
-			104: {Number: 104, Title: "one-four"},
+			104: {Number: 104, Title: "one-four", Body: "Depends on: #103\n"},
 			103: {Number: 103, Title: "one-three"},
 			102: {Number: 102, Title: "one-two"},
 			101: {Number: 101, Title: "one-one", State: "closed", StateReason: "completed"},
 			900: {Number: 900, State: "closed", StateReason: "completed"},
 			901: {Number: 901, State: "open"},
 			902: {Number: 902, State: "closed", StateReason: "not_planned"},
+			904: {Number: 904, State: "closed", StateReason: "completed"},
 		},
 		// 903 is absent from getIssues, so GetIssue returns a not-found error:
 		// an ORDINARY fetch failure on a TARGET, which still classifies unreadable.
 		getIssueErrs: map[int]error{},
+		blockedBy: map[int][]githubclient.BlockingIssueRef{
+			// 104 -> 103 is recorded natively AND by 104's text line: one native edge.
+			104: {{Number: 103, Repository: "kuhlman-labs/fishhawk"}},
+			// A cross-repository native ref: dropped unreadable with no forge read.
+			103: {{Number: 9, Repository: "other/repo"}},
+			// A native ref to a closed+completed out-of-set issue: satisfied.
+			102: {{Number: 904, Repository: "kuhlman-labs/fishhawk"}},
+		},
 	}
 }
 
@@ -3267,6 +3346,7 @@ func jitterItems() []string {
 // concurrency), so the golden pins the SHAPE without re-deriving a digest by hand.
 func jitterGolden() *workmgmt.EpicChildrenResult {
 	canon := dependsOnTokenCanonical("other/repo#5")
+	nativeCanon := dependsOnTokenCanonical("other/repo#9")
 	return &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
 			// #101 is closed+completed, so State normalizes to "CLOSED" (#3323); the
@@ -3275,7 +3355,7 @@ func jitterGolden() *workmgmt.EpicChildrenResult {
 			{Number: 101, Title: "one-one", Complete: true, State: "CLOSED"},
 			{Number: 102, Title: "one-two"},
 			{Number: 103, Title: "one-three"},
-			{Number: 104, Title: "one-four"},
+			{Number: 104, Title: "one-four", Body: "Depends on: #103\n"},
 			{Number: 105, Title: "one-five", Body: "Depends on: #903\n"},
 			{Number: 106, Title: "one-six", Body: "Depends on: #902\n"},
 			{Number: 107, Title: "one-seven", Body: "Depends on: other/repo#5\n"},
@@ -3283,16 +3363,19 @@ func jitterGolden() *workmgmt.EpicChildrenResult {
 			{Number: 109, Title: "one-nine", Body: "Depends on: #900\n"},
 			{Number: 110, Title: "one-ten", Body: "Depends on: #101\n"},
 		},
-		Edges: []workmgmt.DependsEdge{{From: 110, To: 101}},
+		Edges: []workmgmt.DependsEdge{{From: 104, To: 103, Source: srcNative}, {From: 110, To: 101, Source: srcLegacy}},
 		DroppedEdges: []workmgmt.DependsEdge{
-			{From: 105, To: 903, Reason: workmgmt.DropTargetStateUnreadable},
-			{From: 106, To: 902, Reason: workmgmt.DropTargetClosedIncomplete},
+			{From: 103, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+				ToRef: sanitizeDependsOnToken(nativeCanon), ToRefDigest: dependsOnTokenDigest(nativeCanon), Source: srcNative},
+			{From: 105, To: 903, Reason: workmgmt.DropTargetStateUnreadable, Source: srcLegacy},
+			{From: 106, To: 902, Reason: workmgmt.DropTargetClosedIncomplete, Source: srcLegacy},
 			{From: 107, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
-				ToRef: sanitizeDependsOnToken(canon), ToRefDigest: dependsOnTokenDigest(canon)},
-			{From: 108, To: 901, Reason: workmgmt.DropNotChild},
+				ToRef: sanitizeDependsOnToken(canon), ToRefDigest: dependsOnTokenDigest(canon), Source: srcLegacy},
+			{From: 108, To: 901, Reason: workmgmt.DropNotChild, Source: srcLegacy},
 		},
 		SatisfiedEdges: []workmgmt.SatisfiedEdge{
-			{From: 109, To: 900, State: "closed", StateReason: "completed"},
+			{From: 102, To: 904, State: "closed", StateReason: "completed", Source: srcNative},
+			{From: 109, To: 900, State: "closed", StateReason: "completed", Source: srcLegacy},
 		},
 	}
 }
@@ -3351,12 +3434,12 @@ func epicJitterGolden() *workmgmt.EpicChildrenResult {
 			{Number: 11, Title: "eleven", Body: "Depends on: #900\n"},
 			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
 		},
-		Edges: []workmgmt.DependsEdge{{From: 12, To: 11}},
+		Edges: []workmgmt.DependsEdge{{From: 12, To: 11, Source: srcLegacy}},
 		DroppedEdges: []workmgmt.DependsEdge{
-			{From: 10, To: 901, Reason: workmgmt.DropNotChild},
+			{From: 10, To: 901, Reason: workmgmt.DropNotChild, Source: srcLegacy},
 		},
 		SatisfiedEdges: []workmgmt.SatisfiedEdge{
-			{From: 11, To: 900, State: "closed", StateReason: "completed"},
+			{From: 11, To: 900, State: "closed", StateReason: "completed", Source: srcLegacy},
 		},
 		// The provider-declared hard child cap rides every EpicChildren result
 		// (#3714). Naming the CONSTANT rather than the literal 100 keeps this
@@ -3804,7 +3887,7 @@ func TestFetchIssuesBoundedAbortedRequiresError(t *testing.T) {
 	}}
 	api.getIssueErrs = map[int]error{901: context.Canceled}
 	got := New(api).fetchIssuesBounded(ctx, forge.FromGitHubInstallationID(99),
-		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, []int{900, 901})
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, []int{900, 901}, nil)
 	if len(got) != 2 {
 		t.Fatalf("want one result per input, got %d", len(got))
 	}
@@ -3830,7 +3913,7 @@ func TestFetchIssuesBoundedIndexesByRequestOrder(t *testing.T) {
 	}
 	got := New(&jitterAPI{fakeAPI: &fakeAPI{getIssues: issues}}).fetchIssuesBounded(
 		context.Background(), forge.FromGitHubInstallationID(99),
-		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, nums)
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, nums, nil)
 	for i, f := range got {
 		if f.ordinal != i || f.number != nums[i] || f.issue == nil {
 			t.Fatalf("slot %d: got %+v, want ordinal %d number %d", i, f, i, nums[i])
@@ -4181,5 +4264,610 @@ func TestProvider_LinkToEpic_FailsClosed(t *testing.T) {
 				t.Errorf("API reached (node lookup #%d, sub child %q) before the refusal", tc.api.nodeIDNumber, tc.api.subChild)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #4028: native "blocked by" reads on the CAMPAIGN paths, every legacy
+// `Depends on:` line, and the Source tag on every edge.
+// ---------------------------------------------------------------------------
+
+// sameRepo is the nameWithOwner of the ambient repo every request below targets.
+const sameRepo = "kuhlman-labs/fishhawk"
+
+// epicReq builds an EpicChildrenRequest for epic #7 on the ambient repo.
+func epicReq() workmgmt.EpicChildrenRequest {
+	return workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#7",
+	}
+}
+
+// subIssuesFrom renders the fixture's named issues as the sub-issues an epic
+// returns, in the given order, so ONE fixture drives both campaign paths.
+func subIssuesFrom(issues map[int]*githubclient.Issue, order ...int) []githubclient.SubIssue {
+	subs := make([]githubclient.SubIssue, 0, len(order))
+	for _, n := range order {
+		iss := issues[n]
+		subs = append(subs, githubclient.SubIssue{Number: n, Title: iss.Title, Body: iss.Body, State: strings.ToUpper(iss.State)})
+	}
+	return subs
+}
+
+// campaignPath is one campaign edge path driven over the same fixture.
+type campaignPath struct {
+	name string
+	run  func(api API, items ...int) (*workmgmt.EpicChildrenResult, error)
+}
+
+// campaignPaths are the two campaign edge paths (#4028): the named-set
+// ResolveDependencies and the epic CampaignEpicChildren (whose children are the
+// fixture's named issues, in the order given).
+func campaignPaths(issues map[int]*githubclient.Issue) []campaignPath {
+	return []campaignPath{
+		{"ResolveDependencies", func(api API, items ...int) (*workmgmt.EpicChildrenResult, error) {
+			refs := make([]string, len(items))
+			for i, n := range items {
+				refs[i] = strconv.Itoa(n)
+			}
+			return New(api).ResolveDependencies(context.Background(), resolveReq(refs...))
+		}},
+		{"CampaignEpicChildren", func(api API, items ...int) (*workmgmt.EpicChildrenResult, error) {
+			if f, ok := api.(*fakeAPI); ok {
+				f.parentNode = "EPIC_NODE"
+				f.listSubResults = subIssuesFrom(issues, items...)
+			}
+			return New(api).CampaignEpicChildren(context.Background(), epicReq())
+		}},
+	}
+}
+
+// wantNativeReadError asserts err reaches a *workmgmt.NativeDependencyReadError
+// with the given issue and reason.
+func wantNativeReadError(t *testing.T, err error, issue int, reason workmgmt.NativeDependencyReadReason) *workmgmt.NativeDependencyReadError {
+	t.Helper()
+	var nerr *workmgmt.NativeDependencyReadError
+	if !errors.As(err, &nerr) {
+		t.Fatalf("want *workmgmt.NativeDependencyReadError, got %T: %v", err, err)
+	}
+	if nerr.Issue != issue || nerr.Reason != reason {
+		t.Fatalf("NativeDependencyReadError = {Issue:%d Reason:%q}, want {Issue:%d Reason:%q} (%v)", nerr.Issue, nerr.Reason, issue, reason, err)
+	}
+	return nerr
+}
+
+// C1. TestProvider_ResolveDependencies_NativeBlockedByYieldsEdge: #2 carries no
+// `Depends on:` line, so its native "blocked by" #1 is the ONLY source of 2->1.
+// COUNTERFACTUAL: deleting the IssueBlockedBy call in fetchIssuesBounded's
+// worker (or making dependencyRefs ignore the native slice) yields Edges == [].
+func TestProvider_ResolveDependencies_NativeBlockedByYieldsEdge(t *testing.T) {
+	api := &fakeAPI{
+		getIssues: map[int]*githubclient.Issue{
+			1: {Number: 1, Title: "root", Body: "no deps", State: "open"},
+			2: {Number: 2, Title: "leaf", Body: "## Summary\n\nno marker\n", State: "open"},
+		},
+		blockedBy: map[int][]githubclient.BlockingIssueRef{2: {{Number: 1, Repository: sameRepo}}},
+	}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("1", "2"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	want := []workmgmt.DependsEdge{{From: 2, To: 1, Source: srcNative}}
+	if len(res.Edges) != 1 || res.Edges[0] != want[0] {
+		t.Fatalf("edges = %+v, want %+v (the native relation is the only source of 2->1)", res.Edges, want)
+	}
+	if len(res.DroppedEdges) != 0 || len(res.SatisfiedEdges) != 0 {
+		t.Fatalf("dropped=%+v satisfied=%+v, want none", res.DroppedEdges, res.SatisfiedEdges)
+	}
+}
+
+// TestProvider_ResolveDependencies_NativeReadOnlyForNamedItems: the native
+// relation is read once per NAMED item and never for a phase-2 out-of-set
+// TARGET (#4028). #1's legacy line names out-of-set #900; #900 is fetched
+// (GetIssue) to classify it, but its own "blocked by" is not read.
+// COUNTERFACTUAL: passing the reader to the phase-2 fetchIssuesBounded call
+// records an IssueBlockedBy(900).
+func TestProvider_ResolveDependencies_NativeReadOnlyForNamedItems(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		1:   {Number: 1, Body: "Depends on: #900\n", State: "open"},
+		2:   {Number: 2, State: "open"},
+		900: {Number: 900, State: "closed", StateReason: "completed"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("1", "2"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.SatisfiedEdges) != 1 || res.SatisfiedEdges[0].To != 900 {
+		t.Fatalf("satisfied = %+v, want the one 1->900 satisfied edge", res.SatisfiedEdges)
+	}
+	if got := api.getIssueCallCount(900); got != 1 {
+		t.Fatalf("GetIssue(900) = %d calls, want 1 (the phase-2 target read)", got)
+	}
+	total, calls := api.blockedByCallTotal()
+	if total != 2 || calls[1] != 1 || calls[2] != 1 {
+		t.Fatalf("IssueBlockedBy calls = %v (total %d), want exactly one each for named #1 and #2 and none for target #900", calls, total)
+	}
+}
+
+// C2. TestProvider_CampaignEpicChildren_NativeBlockedByYieldsEdge: the epic
+// campaign path's native read. COUNTERFACTUAL: deleting the
+// readBlockedByBounded call in epicChildren's native branch yields Edges == [].
+func TestProvider_CampaignEpicChildren_NativeBlockedByYieldsEdge(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 1, Title: "root", Body: "no deps", State: "OPEN"},
+			{Number: 2, Title: "leaf", Body: "no marker", State: "OPEN"},
+		},
+		blockedBy: map[int][]githubclient.BlockingIssueRef{2: {{Number: 1, Repository: sameRepo}}},
+	}
+	res, err := New(api).CampaignEpicChildren(context.Background(), epicReq())
+	if err != nil {
+		t.Fatalf("CampaignEpicChildren: %v", err)
+	}
+	want := workmgmt.DependsEdge{From: 2, To: 1, Source: srcNative}
+	if len(res.Edges) != 1 || res.Edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", res.Edges, want)
+	}
+	if len(res.Children) != 2 || res.ChildCap != subIssueChildCap {
+		t.Fatalf("children=%+v childCap=%d, want both children and the sub-issue cap", res.Children, res.ChildCap)
+	}
+	if total, calls := api.blockedByCallTotal(); total != 2 || calls[1] != 1 || calls[2] != 1 {
+		t.Fatalf("IssueBlockedBy calls = %v, want one per child", calls)
+	}
+}
+
+// C3. TestProvider_LegacyDependsOn_EveryLineRead: #3's body carries TWO
+// line-start `Depends on:` lines; the SECOND is the only source of 3->2.
+// COUNTERFACTUAL: reverting parseDependsOnMarker to FindStringSubmatch (first
+// line only) loses 3->2 on every path.
+func TestProvider_LegacyDependsOn_EveryLineRead(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		1: {Number: 1, Title: "a", State: "open"},
+		2: {Number: 2, Title: "b", State: "open"},
+		3: {Number: 3, Title: "c", Body: "Summary\n\nDepends on: #1\n\nmore text\nDepends on: #2", State: "open"},
+	}
+	want := []workmgmt.DependsEdge{{From: 3, To: 1, Source: srcLegacy}, {From: 3, To: 2, Source: srcLegacy}}
+	paths := append(campaignPaths(issues), campaignPath{"EpicChildren", func(api API, items ...int) (*workmgmt.EpicChildrenResult, error) {
+		f := api.(*fakeAPI)
+		f.parentNode = "EPIC_NODE"
+		f.listSubResults = subIssuesFrom(issues, items...)
+		return New(api).EpicChildren(context.Background(), epicReq())
+	}})
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			res, err := path.run(&fakeAPI{getIssues: issues}, 1, 2, 3)
+			if err != nil {
+				t.Fatalf("%s: %v", path.name, err)
+			}
+			if len(res.Edges) != len(want) || res.Edges[0] != want[0] || res.Edges[1] != want[1] {
+				t.Fatalf("edges = %+v, want %+v (every line-start marker line is read)", res.Edges, want)
+			}
+		})
+	}
+}
+
+// C3 companion. TestProvider_LegacyDependsOn_MidLineProseIgnored: `Depends on:`
+// in the MIDDLE of a line is prose, not a marker — no edge and no target read.
+// COUNTERFACTUAL: removing the `^` anchor from dependsOnMarkerRE makes #1 an
+// out-of-set target: GetIssue(1) is called and a dropped edge appears.
+func TestProvider_LegacyDependsOn_MidLineProseIgnored(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		1: {Number: 1, State: "open"},
+		3: {Number: 3, Title: "c", Body: "This mentions Depends on: #1 in prose", State: "open"},
+	}
+	for _, path := range campaignPaths(issues) {
+		t.Run(path.name, func(t *testing.T) {
+			api := &fakeAPI{getIssues: issues}
+			res, err := path.run(api, 3)
+			if err != nil {
+				t.Fatalf("%s: %v", path.name, err)
+			}
+			if len(res.Edges)+len(res.DroppedEdges)+len(res.SatisfiedEdges) != 0 {
+				t.Fatalf("edges=%+v dropped=%+v satisfied=%+v, want none (mid-line prose is not a marker)", res.Edges, res.DroppedEdges, res.SatisfiedEdges)
+			}
+			if got := api.getIssueCallCount(1); got != 0 {
+				t.Fatalf("GetIssue(1) = %d calls, want 0", got)
+			}
+		})
+	}
+}
+
+// C4. TestProvider_NativeAndLegacySameEdge_OneNativeEdge: #2 records 2->1 BOTH
+// natively and as a `Depends on:` line — exactly ONE edge, tagged native.
+// COUNTERFACTUALS: swapping dependencyRefs to legacy-first tags the edge
+// legacy_text; removing the seenEdge check yields two edges.
+func TestProvider_NativeAndLegacySameEdge_OneNativeEdge(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		1: {Number: 1, Title: "a", State: "open"},
+		2: {Number: 2, Title: "b", Body: "Depends on: #1\n", State: "open"},
+	}
+	for _, path := range campaignPaths(issues) {
+		t.Run(path.name, func(t *testing.T) {
+			api := &fakeAPI{getIssues: issues, blockedBy: map[int][]githubclient.BlockingIssueRef{2: {{Number: 1, Repository: sameRepo}}}}
+			res, err := path.run(api, 1, 2)
+			if err != nil {
+				t.Fatalf("%s: %v", path.name, err)
+			}
+			want := workmgmt.DependsEdge{From: 2, To: 1, Source: srcNative}
+			if len(res.Edges) != 1 || res.Edges[0] != want {
+				t.Fatalf("edges = %+v, want exactly [%+v]", res.Edges, want)
+			}
+		})
+	}
+}
+
+// C5. TestProvider_CrossRepoNativeBlockedBy_DropsUnreadable: a native ref into
+// ANOTHER repository fails closed as target_state_unreadable with NO forge
+// read. BY CONSTRUCTION the local issue #12 is closed+completed, so if the
+// same-repo comparison were deleted the ref would be read locally and wrongly
+// classified SATISFIED. COUNTERFACTUAL: deleting the nameWithOwner comparison
+// in dependencyRefs makes SatisfiedEdges non-empty and calls GetIssue(12).
+func TestProvider_CrossRepoNativeBlockedBy_DropsUnreadable(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		2:  {Number: 2, Title: "b", State: "open"},
+		12: {Number: 12, State: "closed", StateReason: "completed"},
+	}
+	canon := dependsOnTokenCanonical("other/repo#12")
+	want := workmgmt.DependsEdge{
+		From: 2, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+		ToRef: "other/repo#12", ToRefDigest: dependsOnTokenDigest(canon), Source: srcNative,
+	}
+	for _, path := range campaignPaths(issues) {
+		t.Run(path.name, func(t *testing.T) {
+			api := &fakeAPI{getIssues: issues, blockedBy: map[int][]githubclient.BlockingIssueRef{2: {{Number: 12, Repository: "other/repo"}}}}
+			res, err := path.run(api, 2)
+			if err != nil {
+				t.Fatalf("%s: %v", path.name, err)
+			}
+			if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+				t.Fatalf("dropped = %+v, want [%+v]", res.DroppedEdges, want)
+			}
+			if !isHex16(res.DroppedEdges[0].ToRefDigest) {
+				t.Fatalf("ToRefDigest = %q, want 16 hex chars", res.DroppedEdges[0].ToRefDigest)
+			}
+			if len(res.SatisfiedEdges) != 0 || len(res.Edges) != 0 {
+				t.Fatalf("satisfied=%+v edges=%+v, want none (a cross-repo ref is never read locally)", res.SatisfiedEdges, res.Edges)
+			}
+			if got := api.getIssueCallCount(12); got != 0 {
+				t.Fatalf("GetIssue(12) = %d calls, want 0", got)
+			}
+		})
+	}
+}
+
+// C5 positive companion: the same-repo comparison is CASE-INSENSITIVE, so a
+// native ref whose nameWithOwner differs from the target only in letter case is
+// an in-set edge. COUNTERFACTUAL: comparing with == drops it unreadable.
+func TestProvider_SameRepoNativeBlockedBy_CaseInsensitive(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		1: {Number: 1, Title: "a", State: "open"},
+		2: {Number: 2, Title: "b", State: "open"},
+	}
+	for _, path := range campaignPaths(issues) {
+		t.Run(path.name, func(t *testing.T) {
+			api := &fakeAPI{getIssues: issues, blockedBy: map[int][]githubclient.BlockingIssueRef{2: {{Number: 1, Repository: "Kuhlman-Labs/Fishhawk"}}}}
+			res, err := path.run(api, 1, 2)
+			if err != nil {
+				t.Fatalf("%s: %v", path.name, err)
+			}
+			want := workmgmt.DependsEdge{From: 2, To: 1, Source: srcNative}
+			if len(res.Edges) != 1 || res.Edges[0] != want || len(res.DroppedEdges) != 0 {
+				t.Fatalf("edges=%+v dropped=%+v, want the one in-set edge %+v", res.Edges, res.DroppedEdges, want)
+			}
+		})
+	}
+}
+
+// C7. TestProvider_NativeReadReasons: each native-read failure maps onto its
+// named reason, carrying the failing issue and the cause (errors.Is reaches the
+// forge sentinel through Unwrap). COUNTERFACTUAL: making nativeReadReason
+// return NativeReadFailed always reddens the first three rows.
+func TestProvider_NativeReadReasons(t *testing.T) {
+	issues := map[int]*githubclient.Issue{
+		1: {Number: 1, Title: "a", State: "open"},
+		2: {Number: 2, Title: "b", State: "open"},
+	}
+	plain := errors.New("transport reset")
+	rows := []struct {
+		name   string
+		err    error
+		reason workmgmt.NativeDependencyReadReason
+	}{
+		{"truncated", fmt.Errorf("blocked-by read: %w", githubclient.ErrRelationTruncated), workmgmt.NativeReadTruncated},
+		{"forbidden", fmt.Errorf("graphql: %w", githubclient.ErrForbidden), workmgmt.NativeReadForbidden},
+		{"not_found", fmt.Errorf("blocked-by read: %w", githubclient.ErrNotFound), workmgmt.NativeReadNotFound},
+		{"read_failed", plain, workmgmt.NativeReadFailed},
+	}
+	for _, row := range rows {
+		for _, path := range campaignPaths(issues) {
+			t.Run(row.name+"/"+path.name, func(t *testing.T) {
+				api := &fakeAPI{getIssues: issues, blockedByErrs: map[int]error{2: row.err}}
+				res, err := path.run(api, 1, 2)
+				if res != nil {
+					t.Fatalf("result = %+v, want nil on a failed native read", res)
+				}
+				nerr := wantNativeReadError(t, err, 2, row.reason)
+				if !errors.Is(err, row.err) || nerr.Cause != row.err {
+					t.Fatalf("cause not reachable: err=%v cause=%v", err, nerr.Cause)
+				}
+			})
+		}
+	}
+}
+
+// C8. TestProvider_ResolveDependencies_NativeReadErrorFailsClosed: both named
+// items' GetIssue succeeds and #2's native read is forbidden with the context
+// alive — the resolution fails closed naming #2, rather than returning a result
+// built without #2's native relation. COUNTERFACTUAL: a worker that ignored the
+// native error returns a valid result with a nil error.
+func TestProvider_ResolveDependencies_NativeReadErrorFailsClosed(t *testing.T) {
+	api := &fakeAPI{
+		getIssues: map[int]*githubclient.Issue{
+			1: {Number: 1, State: "open"},
+			2: {Number: 2, State: "open"},
+		},
+		blockedByErrs: map[int]error{2: githubclient.ErrForbidden},
+	}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("1", "2"))
+	if res != nil {
+		t.Fatalf("result = %+v, want nil", res)
+	}
+	wantNativeReadError(t, err, 2, workmgmt.NativeReadForbidden)
+	if !errors.Is(err, githubclient.ErrForbidden) {
+		t.Fatalf("errors.Is(err, ErrForbidden) must hold, got %v", err)
+	}
+	// The message names the native read, not the issue fetch that succeeded.
+	if strings.Contains(err.Error(), "get issue") || !strings.Contains(err.Error(), `native "blocked by"`) || !strings.Contains(err.Error(), "#2") {
+		t.Fatalf("message = %q, want it to name issue #2's native read", err.Error())
+	}
+}
+
+// TestProvider_ResolveDependencies_NativeReadErrorFirstInRequestOrder: with two
+// named items' native reads failing, the returned error names the item FIRST IN
+// REQUEST ORDER (descending input, so it is not the lowest number).
+func TestProvider_ResolveDependencies_NativeReadErrorFirstInRequestOrder(t *testing.T) {
+	api := &jitterAPI{fakeAPI: &fakeAPI{
+		getIssues:     map[int]*githubclient.Issue{10: {Number: 10}, 20: {Number: 20}},
+		blockedByErrs: map[int]error{10: githubclient.ErrNotFound, 20: githubclient.ErrForbidden},
+	}}
+	for i := 0; i < 25; i++ {
+		_, err := New(api).ResolveDependencies(context.Background(), resolveReq("20", "10"))
+		wantNativeReadError(t, err, 20, workmgmt.NativeReadForbidden)
+	}
+}
+
+// TestProvider_ResolveDependencies_GetIssueErrorSkipsNativeRead: an item whose
+// GetIssue failed is not native-read, so its fetch error is reported as the
+// issue fetch failure it is — a native error never masks it. COUNTERFACTUAL:
+// dropping the `err == nil` guard on the worker's native read makes #1's
+// forbidden native error replace the get-issue error.
+func TestProvider_ResolveDependencies_GetIssueErrorSkipsNativeRead(t *testing.T) {
+	api := &fakeAPI{
+		getIssueErrs:  map[int]error{1: errors.New("boom-get")},
+		blockedByErrs: map[int]error{1: githubclient.ErrForbidden},
+	}
+	_, err := New(api).ResolveDependencies(context.Background(), resolveReq("1"))
+	var nerr *workmgmt.NativeDependencyReadError
+	if err == nil || errors.As(err, &nerr) || !strings.Contains(err.Error(), "get issue #1: boom-get") {
+		t.Fatalf("err = %v, want the get-issue error (not a native read error)", err)
+	}
+	if total, _ := api.blockedByCallTotal(); total != 0 {
+		t.Fatalf("IssueBlockedBy called %d times, want 0 for an item whose fetch failed", total)
+	}
+}
+
+// TestProvider_ResolveDependencies_NilIssueSkipsNativeRead: an item the forge
+// returned no issue for is not native-read; it still fails closed as `no issue
+// returned`. COUNTERFACTUAL: dropping the `issue != nil` guard records an
+// IssueBlockedBy(100).
+func TestProvider_ResolveDependencies_NilIssueSkipsNativeRead(t *testing.T) {
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{100: nil}}
+	_, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+	if err == nil || !strings.Contains(err.Error(), "get issue #100: no issue returned") {
+		t.Fatalf("want the no-issue-returned refusal, got %v", err)
+	}
+	if total, _ := api.blockedByCallTotal(); total != 0 {
+		t.Fatalf("IssueBlockedBy called %d times, want 0 for a nil issue", total)
+	}
+}
+
+// C8 deadline arm. TestProvider_ResolveDependencies_NativeReadDeadline: every
+// native read blocks until the resolution's deadline. The deadline-first rule
+// holds for the native half too: the result is the typed
+// IssueSetResolutionTimeout with honest counts, NOT a NativeDependencyReadError.
+// COUNTERFACTUAL: moving the phase-1 ctx check after the error loop returns the
+// native read_failed error instead.
+func TestProvider_ResolveDependencies_NativeReadDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(100*time.Millisecond))
+	defer cancel()
+	api := &fakeAPI{
+		getIssues:        map[int]*githubclient.Issue{1: {Number: 1}, 2: {Number: 2}},
+		blockedByWaitCtx: true,
+	}
+	_, err := New(api).ResolveDependencies(ctx, resolveReq("1", "2"))
+	var nerr *workmgmt.NativeDependencyReadError
+	if errors.As(err, &nerr) {
+		t.Fatalf("a deadline surfaced as a native read error: %v", err)
+	}
+	wantTimeout(t, err, 0, 2, 0, "fetch_items")
+}
+
+// C9. TestProvider_CampaignEpicChildren_NativeReadErrorFailsClosed: a child's
+// failed native read fails the epic campaign path naming that child.
+// COUNTERFACTUAL: an epicChildren that skipped a failed child's native refs
+// returns a result with a nil error.
+func TestProvider_CampaignEpicChildren_NativeReadErrorFailsClosed(t *testing.T) {
+	api := nativeFailingEpicFake()
+	res, err := New(api).CampaignEpicChildren(context.Background(), epicReq())
+	if res != nil {
+		t.Fatalf("result = %+v, want nil", res)
+	}
+	// Children come back in ListSubIssues order 2, 1; BOTH native reads fail,
+	// and the error names the FIRST IN CHILD ORDER (#2), not the lowest number.
+	wantNativeReadError(t, err, 2, workmgmt.NativeReadFailed)
+	if !strings.Contains(err.Error(), "epic #7") {
+		t.Fatalf("message = %q, want it to name the epic", err.Error())
+	}
+}
+
+// nativeFailingEpicFake is an epic whose EVERY child's native read fails, with
+// one legacy edge between the children — the shared fixture of C9 and C10.
+func nativeFailingEpicFake() *fakeAPI {
+	return &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 2, Title: "b", Body: "Depends on: #1\n", State: "OPEN"},
+			{Number: 1, Title: "a", State: "OPEN"},
+		},
+		blockedByErrs: map[int]error{1: errors.New("native boom one"), 2: errors.New("native boom two")},
+	}
+}
+
+// C10. TestProvider_EpicChildren_MakesNoNativeRead_SucceedsWhenNativeFails: the
+// SAME fake as C9 (every native read fails). EpicChildren is the single method
+// refinement filing resume (server/refinement_file.go, refinement/filing.go),
+// rolling-walk adoption (server/live_validation_filing.go) and idempotency
+// adoption (server/workitems.go) call, so it must succeed with the children and
+// the legacy edges and make ZERO native reads. COUNTERFACTUAL: routing
+// EpicChildren through epicChildren(ctx, req, true) fails it with a non-zero
+// call count.
+func TestProvider_EpicChildren_MakesNoNativeRead_SucceedsWhenNativeFails(t *testing.T) {
+	api := nativeFailingEpicFake()
+	res, err := New(api).EpicChildren(context.Background(), epicReq())
+	if err != nil {
+		t.Fatalf("EpicChildren: %v (a native-read failure must never reach the shared path)", err)
+	}
+	if len(res.Children) != 2 {
+		t.Fatalf("children = %+v, want both", res.Children)
+	}
+	want := workmgmt.DependsEdge{From: 2, To: 1, Source: srcLegacy}
+	if len(res.Edges) != 1 || res.Edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", res.Edges, want)
+	}
+	if total, _ := api.blockedByCallTotal(); total != 0 {
+		t.Fatalf("IssueBlockedBy called %d times by EpicChildren, want 0", total)
+	}
+}
+
+// noBlockedByAPI wraps a working fake behind exactly API's method set, so the
+// optional blockedByReader extension is ABSENT while every API call still
+// works (#4028).
+type noBlockedByAPI struct{ API }
+
+// C11. TestProvider_CampaignPaths_AbsentBlockedByReader_Unsupported: an api
+// without IssueBlockedBy fails BOTH campaign paths closed as unsupported (Issue
+// 0, before any forge call), while EpicChildren still succeeds. COUNTERFACTUAL:
+// degrading the absence branch to legacy-only returns a result with a nil
+// error.
+func TestProvider_CampaignPaths_AbsentBlockedByReader_Unsupported(t *testing.T) {
+	inner := &fakeAPI{
+		parentNode:     "EPIC_NODE",
+		getIssues:      map[int]*githubclient.Issue{1: {Number: 1}, 2: {Number: 2, Body: "Depends on: #1\n"}},
+		listSubResults: []githubclient.SubIssue{{Number: 1}, {Number: 2, Body: "Depends on: #1\n"}},
+	}
+	api := noBlockedByAPI{API: inner}
+
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("1", "2"))
+	if res != nil {
+		t.Fatalf("ResolveDependencies result = %+v, want nil", res)
+	}
+	wantNativeReadError(t, err, 0, workmgmt.NativeReadUnsupported)
+	if got := inner.getIssueCallCount(1) + inner.getIssueCallCount(2); got != 0 {
+		t.Fatalf("GetIssue called %d times, want 0 (refused before any forge call)", got)
+	}
+
+	res, err = New(api).CampaignEpicChildren(context.Background(), epicReq())
+	if res != nil {
+		t.Fatalf("CampaignEpicChildren result = %+v, want nil", res)
+	}
+	wantNativeReadError(t, err, 0, workmgmt.NativeReadUnsupported)
+	if inner.listSubParent != "" {
+		t.Fatalf("ListSubIssues reached (%q), want the refusal before any forge call", inner.listSubParent)
+	}
+
+	ec, err := New(api).EpicChildren(context.Background(), epicReq())
+	if err != nil {
+		t.Fatalf("EpicChildren: %v (the shared path needs no native read)", err)
+	}
+	if len(ec.Edges) != 1 || ec.Edges[0] != (workmgmt.DependsEdge{From: 2, To: 1, Source: srcLegacy}) {
+		t.Fatalf("EpicChildren edges = %+v, want the one legacy edge", ec.Edges)
+	}
+}
+
+// TestFetchIssuesBoundedNativeErrorTypedAndAborted: at the helper, a native
+// read the CONTEXT terminated is the fetch's error as a typed
+// NativeDependencyReadError AND marked aborted on the same rule a
+// context-terminated GetIssue is, while a successful fetch carries its native
+// refs.
+func TestFetchIssuesBoundedNativeErrorTypedAndAborted(t *testing.T) {
+	api := &fakeAPI{
+		getIssues:     map[int]*githubclient.Issue{1: {Number: 1}, 2: {Number: 2}},
+		blockedBy:     map[int][]githubclient.BlockingIssueRef{1: {{Number: 5, Repository: sameRepo}}},
+		blockedByErrs: map[int]error{2: context.Canceled},
+	}
+	got := New(api).fetchIssuesBounded(context.Background(), forge.FromGitHubInstallationID(99),
+		forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}, []int{1, 2}, api)
+	if got[0].err != nil || got[0].aborted || len(got[0].native) != 1 || got[0].native[0].Number != 5 {
+		t.Fatalf("slot 0 = %+v, want a successful fetch carrying native ref #5", got[0])
+	}
+	var nerr *workmgmt.NativeDependencyReadError
+	if !errors.As(got[1].err, &nerr) || nerr.Issue != 2 || !got[1].aborted {
+		t.Fatalf("slot 1 = %+v, want an aborted fetch whose err is a NativeDependencyReadError for #2", got[1])
+	}
+}
+
+// TestCampaignEpicChildrenByteIdenticalUnderJitter is the epic campaign path's
+// determinism pin (#4028): its per-child native reads run in the bounded pool,
+// so 50 jittered repetitions must marshal identically to a hand-written golden.
+func TestCampaignEpicChildrenByteIdenticalUnderJitter(t *testing.T) {
+	newFake := func() *fakeAPI {
+		return &fakeAPI{
+			parentNode: "EPIC_NODE",
+			listSubResults: []githubclient.SubIssue{
+				{Number: 13, Title: "thirteen"},
+				{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+				{Number: 11, Title: "eleven"},
+				{Number: 10, Title: "ten"},
+			},
+			getIssues: map[int]*githubclient.Issue{900: {Number: 900, State: "closed", StateReason: "completed"}},
+			blockedBy: map[int][]githubclient.BlockingIssueRef{
+				13: {{Number: 12, Repository: sameRepo}},
+				12: {{Number: 11, Repository: sameRepo}},
+				11: {{Number: 900, Repository: sameRepo}},
+				10: {{Number: 3, Repository: "other/repo"}},
+			},
+		}
+	}
+	canon := dependsOnTokenCanonical("other/repo#3")
+	golden := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 10, Title: "ten"},
+			{Number: 11, Title: "eleven"},
+			{Number: 12, Title: "twelve", Body: "Depends on: #11\n"},
+			{Number: 13, Title: "thirteen"},
+		},
+		Edges: []workmgmt.DependsEdge{{From: 12, To: 11, Source: srcNative}, {From: 13, To: 12, Source: srcNative}},
+		DroppedEdges: []workmgmt.DependsEdge{{From: 10, To: 0, Reason: workmgmt.DropTargetStateUnreadable,
+			ToRef: sanitizeDependsOnToken(canon), ToRefDigest: dependsOnTokenDigest(canon), Source: srcNative}},
+		SatisfiedEdges: []workmgmt.SatisfiedEdge{{From: 11, To: 900, State: "closed", StateReason: "completed", Source: srcNative}},
+		ChildCap:       subIssueChildCap,
+	}
+	want, err := json.Marshal(golden)
+	if err != nil {
+		t.Fatalf("marshal golden: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		res, err := New(&jitterAPI{fakeAPI: newFake()}).CampaignEpicChildren(context.Background(), epicReq())
+		if err != nil {
+			t.Fatalf("rep %d: CampaignEpicChildren: %v", i, err)
+		}
+		got, merr := json.Marshal(res)
+		if merr != nil {
+			t.Fatalf("rep %d: marshal: %v", i, merr)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("rep %d differs from golden:\n got %s\nwant %s", i, got, want)
+		}
 	}
 }
