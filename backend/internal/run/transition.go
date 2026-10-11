@@ -559,9 +559,11 @@ type stageMergeSupersedePair struct {
 // implement stage swept to `superseded` would let Orchestrator.completeRun
 // stamp the run `succeeded` having never planned or implemented it —
 // defeating exactly the invariant the #968 completion guard protects. The
-// guard passes `superseded` because it is terminal, so this table is the
-// ONLY thing standing between a merge and a fabricated success. Adding a
-// row here is therefore a decision about run integrity, not a convenience.
+// guard passes `superseded` because it is terminal, so on the ordinary
+// transition path this table is the ONLY thing standing between a merge and a
+// fabricated success (the opt-in stranded arm is gated by its own table,
+// stageStrandedMergeSupersedeTransitions, below). Adding a row here is
+// therefore a decision about run integrity, not a convenience.
 var stageMergeSupersedeTransitions = []stageMergeSupersedePair{
 	{StageType: StageTypeAcceptance, From: StageStateAwaitingHostDispatch},
 	{StageType: StageTypeReview, From: StageStateAwaitingApproval},
@@ -600,6 +602,98 @@ func ValidStageMergeSupersedeTransition(stageType StageType, from, to StageState
 		return false
 	}
 	return MergeSupersedable(stageType, from)
+}
+
+// stageStrandedMergeSupersedeTransitions is the DEFAULT-DENY table of the
+// (stage_type, state) pairs the OPT-IN stranded arm of reconcile-merge may
+// terminalize as `superseded` (#4222). It is a SEPARATE table from
+// stageMergeSupersedeTransitions: those rows are parked gates any merge
+// dissolves, while these are stages STRANDED IN FLIGHT (dispatched/running) or
+// gates that never opened (pending) on a run whose PR already merged — a legacy
+// shape no runner will ever settle, e.g. implement@running beside
+// review@pending, where superseding the implement stage alone would make
+// Advance dispatch the stale review gate.
+//
+// Reachable ONLY through StrandedStageMergeSuperseder
+// (postgresRepo.SupersedeStrandedStageOnMerge), whose single caller is the
+// operator verb `reconcile-merge` with `supersede_stranded: true`, AFTER the
+// handler has found merge evidence on the run's chain and its idle-threshold
+// liveness gate passed; the capability re-checks liveness against the
+// handler's idle cutoff under the row lock. It is deliberately NOT in
+// transitionStageTx's union (postgres.go), so TransitionStage,
+// TransitionStageFrom and TransitionStageFromAttempt keep refusing running →
+// superseded: no ordinary transition caller can retire a live stage.
+//
+// plan and deploy stages, implement@pending (the #968 work-never-done shape)
+// and every park state other than these rows are denied. Adding a row is a
+// decision about run integrity: `superseded` is terminal, so completeRun's
+// #968 guard passes it.
+var stageStrandedMergeSupersedeTransitions = []stageMergeSupersedePair{
+	{StageType: StageTypeImplement, From: StageStateDispatched},
+	{StageType: StageTypeImplement, From: StageStateRunning},
+	{StageType: StageTypeReview, From: StageStatePending},
+	{StageType: StageTypeReview, From: StageStateDispatched},
+	{StageType: StageTypeReview, From: StageStateRunning},
+	{StageType: StageTypeAcceptance, From: StageStatePending},
+	{StageType: StageTypeAcceptance, From: StageStateDispatched},
+	{StageType: StageTypeAcceptance, From: StageStateRunning},
+}
+
+// StrandedMergeSupersedable reports whether a stage of stageType currently in
+// `from` is one the stranded merge-supersede table admits. It is the
+// classification half the reconcile-merge handler consults (only when the
+// operator opted in); ValidStageStrandedMergeSupersedeTransition is the
+// admissibility half enforced under the row lock. The stageType comparison is
+// load-bearing for the same reason it is in MergeSupersedable: without it a
+// running PLAN stage would be admitted under implement's state.
+func StrandedMergeSupersedable(stageType StageType, from StageState) bool {
+	for _, p := range stageStrandedMergeSupersedeTransitions {
+		if p.StageType == stageType && p.From == from {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidStageStrandedMergeSupersedeTransition reports whether a stage of
+// stageType may move from→to via the stranded merge-supersede capability.
+// True ONLY when `to` is StageStateSuperseded AND (stageType, from) is a row
+// of stageStrandedMergeSupersedeTransitions.
+func ValidStageStrandedMergeSupersedeTransition(stageType StageType, from, to StageState) bool {
+	if to != StageStateSuperseded {
+		return false
+	}
+	return StrandedMergeSupersedable(stageType, from)
+}
+
+// strandedStageInFlight reports whether a stranded-supersede candidate state
+// is one a runner may still hold (dispatched or running) and is therefore
+// subject to the idle-cutoff liveness re-check. A pending gate is held by no
+// runner; a pending stage that was dispatched since the caller's read fails
+// the state pin instead.
+func strandedStageInFlight(from StageState) bool {
+	return from == StageStateDispatched || from == StageStateRunning
+}
+
+// StageRecentlyActiveError is returned by
+// StrandedStageMergeSuperseder.SupersedeStrandedStageOnMerge when the
+// row-locked stage is in flight (dispatched/running) and its DB-stamped
+// updated_at — bumped by every transition and every runner heartbeat through
+// the stages_set_updated_at trigger — is NEWER than the caller's idle cutoff:
+// the stage showed activity after the caller's liveness read, so a runner may
+// still hold it (#4222). The refusal is evaluated under the row lock before
+// any write and mutates nothing. The reconcile-merge handler maps it to the
+// same 409 reconcile_merge_stage_live its pre-write gate answers.
+type StageRecentlyActiveError struct {
+	StageID      uuid.UUID
+	State        StageState
+	LastActivity time.Time
+	IdleCutoff   time.Time
+}
+
+func (e StageRecentlyActiveError) Error() string {
+	return fmt.Sprintf("stage %s (%s) was active at %s, after the idle cutoff %s; a runner may still hold it",
+		e.StageID, e.State, e.LastActivity.UTC().Format(time.RFC3339Nano), e.IdleCutoff.UTC().Format(time.RFC3339Nano))
 }
 
 // InvalidTransitionError describes a refused state transition.
