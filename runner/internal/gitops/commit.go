@@ -1328,9 +1328,40 @@ func (m scopeMatcher) matches(path string) bool {
 // naming each violating path; callers invoke it BEFORE the push so a
 // violation leaves origin untouched.
 func (p *Pusher) assertCommitInScope(ctx context.Context, repoDir, headSHA string, scopeFiles []string) error {
+	violations, err := outOfScopePaths(ctx, p, repoDir, headSHA, scopeFiles)
+	if err != nil {
+		return err
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("%w: commit %s contains %d path(s) outside the declared scope.files: %s",
+			ErrCommitOutOfScope, headSHA, len(violations), strings.Join(violations, ", "))
+	}
+	return nil
+}
+
+// OutOfScopePaths returns, in diff-tree order, every path the commit at headSHA
+// changed relative to its parent that does NOT match the declared scope set —
+// nil when the commit is entirely in scope. It is the exported read of the
+// post-commit scope assertion (#980): the SAME diff-tree enumeration and the
+// SAME newScopeMatcher assertCommitInScope uses (both call outOfScopePaths), so
+// a caller re-checking a commit it did not make — the reverify resume's held
+// commit (#4190) — and the push path can never disagree on what "in scope"
+// means. A diff-tree failure (an unknown sha) is an error, never an empty set.
+//
+// Package-level (not a *Pusher method) like MissingScopeFiles: the caller has
+// no *Pusher in scope.
+func OutOfScopePaths(ctx context.Context, repoDir, headSHA string, scopeFiles []string) ([]string, error) {
+	return outOfScopePaths(ctx, &Pusher{}, repoDir, headSHA, scopeFiles)
+}
+
+// outOfScopePaths is the shared body of assertCommitInScope and
+// OutOfScopePaths. `git diff-tree -r -z --no-commit-id --name-only <sha>` — the
+// commit is always parented, so diff-tree lists its changes against that
+// parent; -z yields NUL-separated unquoted paths, immune to core.quotePath.
+func outOfScopePaths(ctx context.Context, p *Pusher, repoDir, headSHA string, scopeFiles []string) ([]string, error) {
 	out, err := p.runOut(ctx, repoDir, "diff-tree", "-r", "-z", "--no-commit-id", "--name-only", headSHA)
 	if err != nil {
-		return fmt.Errorf("gitops: diff-tree %s: %w", headSHA, err)
+		return nil, fmt.Errorf("gitops: diff-tree %s: %w", headSHA, err)
 	}
 	matcher := newScopeMatcher(scopeFiles)
 	var violations []string
@@ -1342,11 +1373,7 @@ func (p *Pusher) assertCommitInScope(ctx context.Context, repoDir, headSHA strin
 			violations = append(violations, path)
 		}
 	}
-	if len(violations) > 0 {
-		return fmt.Errorf("%w: commit %s contains %d path(s) outside the declared scope.files: %s",
-			ErrCommitOutOfScope, headSHA, len(violations), strings.Join(violations, ", "))
-	}
-	return nil
+	return violations, nil
 }
 
 // MissingScopeFiles enforces the pre-push scope-completeness (shortfall) gate

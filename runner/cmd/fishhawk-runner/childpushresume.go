@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -23,8 +22,10 @@ import (
 //
 // The ref namespace is refs/fishhawk/checkpoints/<run_id>/<stage_id> (the held,
 // gate-verified commit a push-kind checkpoint resumes from) plus the same path
-// with a "-stash" suffix (the stash commit holding stranded edits). Both are
-// LOCAL-ONLY: they are never pushed and are invisible to branch-based tooling.
+// with a "-stash" suffix (the stash commit holding stranded edits) and, since
+// #4190, a "-verify" suffix (the head of the last verify_run a committed-tree
+// gate failed, verifyheadpin.go). All are LOCAL-ONLY: they are never pushed and
+// are invisible to branch-based tooling.
 // They exist so git gc (which prunes only unreachable objects), a stash drop by
 // another session, or a worktree teardown cannot orphan the work. refs/fishhawk/*
 // is shared by every worktree of the repository (only refs/worktree/, refs/bisect/
@@ -75,13 +76,25 @@ func pinCheckpointRef(ctx context.Context, repoDir, ref, sha string) error {
 	return nil
 }
 
-// releaseCheckpointRefs deletes both checkpoint refs of a stage once its work is
-// published. Best-effort and log-only: a stale ref costs one retained commit,
-// never a wrong outcome, so a failure never changes the caller's result. Only
-// refs that existed are named on the checkpoint_refs_released line.
+// releaseCheckpointRefs deletes every checkpoint ref of a stage once its work is
+// published: the held-commit pin, the stash pin, and the #4190 verify-head pin
+// (checkpointVerifyRef), so every held-commit success path drops all three.
+// Best-effort and log-only: a stale ref costs one retained commit, never a wrong
+// outcome, so a failure never changes the caller's result. Only refs that
+// existed are named on the checkpoint_refs_released line.
 func releaseCheckpointRefs(ctx context.Context, repoDir, runID, stageID string, logSink io.Writer) {
+	releaseRefs(ctx, repoDir, runID, stageID, []string{
+		checkpointRef(runID, stageID),
+		checkpointStashRef(runID, stageID),
+		checkpointVerifyRef(runID, stageID),
+	}, logSink)
+}
+
+// releaseRefs is releaseCheckpointRefs' body over an explicit ref list, shared
+// with releaseVerifyHeadRef.
+func releaseRefs(ctx context.Context, repoDir, runID, stageID string, refs []string, logSink io.Writer) {
 	var released []string
-	for _, ref := range []string{checkpointRef(runID, stageID), checkpointStashRef(runID, stageID)} {
+	for _, ref := range refs {
 		if exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "--verify", "--quiet", ref).Run() != nil {
 			continue // absent: nothing to release
 		}
@@ -114,6 +127,9 @@ func releaseCheckpointRefs(ctx context.Context, repoDir, runID, stageID string, 
 //
 // The result is RE-PROVED before it is returned: the new commit's tree must
 // equal verifiedTreeSHA and its parent must equal the HEAD it was parented on.
+// Since #4190 the commit itself is built by synthesizeCommitOnParent, with HEAD
+// as the explicit parent; the preconditions are checked here first so their
+// refusal order (tree, message, HEAD) is unchanged.
 func synthesizeVerifiedCommit(ctx context.Context, repoDir, verifiedTreeSHA, commitMessage, authorName, authorEmail string) (commitSHA, parentSHA string, err error) {
 	if verifiedTreeSHA == "" {
 		return "", "", errors.New("synthesize: no verified tree")
@@ -121,43 +137,13 @@ func synthesizeVerifiedCommit(ctx context.Context, repoDir, verifiedTreeSHA, com
 	if strings.TrimSpace(commitMessage) == "" {
 		return "", "", errors.New("synthesize: empty commit message")
 	}
-	if authorName == "" {
-		authorName = gitops.DefaultAuthorName
-	}
-	if authorEmail == "" {
-		authorEmail = gitops.DefaultAuthorEmail
-	}
 	parentSHA, err = gitRevParseIn(ctx, repoDir, "HEAD^{commit}")
 	if err != nil || parentSHA == "" {
 		return "", "", fmt.Errorf("synthesize: resolve HEAD: %v", err)
 	}
-
-	trailer := exec.CommandContext(ctx, "git", "-C", repoDir, "interpret-trailers",
-		"--if-exists", "addIfDifferent", "--trailer", "Signed-off-by: "+authorName+" <"+authorEmail+">")
-	trailer.Stdin = strings.NewReader(strings.TrimRight(commitMessage, "\n") + "\n")
-	msg, err := trailer.Output()
+	commitSHA, err = synthesizeCommitOnParent(ctx, repoDir, verifiedTreeSHA, parentSHA, commitMessage, authorName, authorEmail)
 	if err != nil {
-		return "", "", fmt.Errorf("synthesize: add Signed-off-by trailer: %w", err)
-	}
-
-	commit := exec.CommandContext(ctx, "git", "-C", repoDir, "commit-tree", verifiedTreeSHA, "-p", parentSHA)
-	commit.Stdin = strings.NewReader(string(msg))
-	commit.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME="+authorName, "GIT_AUTHOR_EMAIL="+authorEmail,
-		"GIT_COMMITTER_NAME="+authorName, "GIT_COMMITTER_EMAIL="+authorEmail)
-	var stderr strings.Builder
-	commit.Stderr = &stderr
-	out, err := commit.Output()
-	if err != nil {
-		return "", "", fmt.Errorf("synthesize: git commit-tree %s: %w (%s)", verifiedTreeSHA, err, strings.TrimSpace(stderr.String()))
-	}
-	commitSHA = strings.TrimSpace(string(out))
-
-	if tree, terr := gitRevParseIn(ctx, repoDir, commitSHA+"^{tree}"); terr != nil || tree != verifiedTreeSHA {
-		return "", "", fmt.Errorf("synthesize: commit %s tree %q != verified tree %q (err %v)", commitSHA, tree, verifiedTreeSHA, terr)
-	}
-	if parent, perr := gitRevParseIn(ctx, repoDir, commitSHA+"^"); perr != nil || parent != parentSHA {
-		return "", "", fmt.Errorf("synthesize: commit %s parent %q != HEAD %q (err %v)", commitSHA, parent, parentSHA, perr)
+		return "", "", err
 	}
 	return commitSHA, parentSHA, nil
 }
