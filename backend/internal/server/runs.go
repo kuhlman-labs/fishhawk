@@ -2975,7 +2975,9 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	// Acceptance-gate presentation statuses (E31.17 / #1568): when the latest
 	// stamp is an acceptance-gate rule and the PR is open, the derived status
 	// is the rule name itself — acceptance_pending / acceptance_settled_outcome_unknown
-	// / acceptance_triage / acceptance_verdict_unshipped (E72.11 / #3447).
+	// / acceptance_triage / acceptance_verdict_unshipped (E72.11 / #3447), and
+	// the decomposed-parent review-coverage hold review_coverage_incomplete
+	// (#4219).
 	// next_action already carried through generically above (await_acceptance /
 	// read_acceptance_audit / read_acceptance_triage).
 	// Keying off the LATEST entry means a later checks_green_awaiting_merge
@@ -2985,7 +2987,8 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 		case drive.RuleAcceptancePending,
 			drive.RuleAcceptanceOutcomeUnknown,
 			drive.RuleAcceptanceTriage,
-			drive.RuleAcceptanceVerdictUnshipped:
+			drive.RuleAcceptanceVerdictUnshipped,
+			drive.RuleReviewCoverageIncomplete:
 			resp.DerivedStatus = string(latest.Rule)
 		}
 	}

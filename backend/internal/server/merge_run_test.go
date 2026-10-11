@@ -2828,3 +2828,73 @@ func TestMergeRun_AcceptanceStale_GuardPrecedesMergeSeam(t *testing.T) {
 		t.Fatalf("status = %d body = %s, want 409 acceptance_stale before the merge-seam guard", w.Code, w.Body.String())
 	}
 }
+
+// TestMergeRun_ReviewCoverageIncomplete_409NoWrite pins the #4219 hold on the
+// operator merge endpoint: the d3b1d915 shape refuses 409
+// review_coverage_incomplete naming slice 1 and fishhawk_rerun_review, with the
+// merger NOT called and ZERO merge_verdict_recorded rows read back after the
+// call (committed state, not error identity).
+func TestMergeRun_ReviewCoverageIncomplete_409NoWrite(t *testing.T) {
+	h := newCoverageHarness(t)
+	c1 := h.d3b1d915(t)
+
+	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	for _, want := range []string{`"code":"review_coverage_incomplete"`, c1.String(), `"next_step":"fishhawk_rerun_review"`, `"uncovered_slices"`} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("body missing %s:\n%s", want, w.Body.String())
+		}
+	}
+	if h.merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", h.merger.called)
+	}
+	if rows := mergeVerdictRows(h.au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 0", len(rows))
+	}
+}
+
+// TestMergeRun_ReviewCoverageReadError_500NoWrite pins the fail-closed read:
+// an audit read error is a 500 with nothing recorded and no dispatch.
+func TestMergeRun_ReviewCoverageReadError_500NoWrite(t *testing.T) {
+	h := newCoverageHarness(t)
+	c1 := h.d3b1d915(t)
+	h.s.cfg.AuditRepo = runScopedErrAudit{auditFake: h.au, failRun: c1}
+
+	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "read review coverage failed") {
+		t.Fatalf("status = %d, want 500 read review coverage failed:\n%s", w.Code, w.Body.String())
+	}
+	if h.merger.called != 0 || len(mergeVerdictRows(h.au)) != 0 {
+		t.Errorf("merger called %d, verdict rows %d, want 0 and 0", h.merger.called, len(mergeVerdictRows(h.au)))
+	}
+}
+
+// TestMergeRun_ReviewCoverageHold_BeforeMergeSeamGuard pins the placement: the
+// hold needs no merge seam, so an unconfigured GateMerger still refuses 409
+// review_coverage_incomplete rather than 503.
+func TestMergeRun_ReviewCoverageHold_BeforeMergeSeamGuard(t *testing.T) {
+	h := newCoverageHarness(t)
+	h.d3b1d915(t)
+	h.s.cfg.GateMerger = nil
+	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "review_coverage_incomplete") {
+		t.Fatalf("status = %d, want 409 review_coverage_incomplete before the seam guard:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestMergeRun_ReviewCoverageCovered_Proceeds pins that a covered parent (a
+// re-run round recorded a verdict) merges normally.
+func TestMergeRun_ReviewCoverageCovered_Proceeds(t *testing.T) {
+	h := newCoverageHarness(t)
+	h.d3b1d915(t)
+	h.round(h.parentID, 30, 1, "implement_reviewed")
+	w := postMergeRun(t, h.s, h.parentID, mergeRunRequest{Verdict: "lgtm"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if h.merger.called != 1 || len(mergeVerdictRows(h.au)) != 1 {
+		t.Errorf("merger called %d, verdict rows %d, want 1 and 1", h.merger.called, len(mergeVerdictRows(h.au)))
+	}
+}

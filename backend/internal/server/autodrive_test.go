@@ -3312,3 +3312,57 @@ func TestMergeCandidateObserveNote(t *testing.T) {
 		}
 	}
 }
+
+// TestAutoDriveRunGate_Merge_ReviewCoverageHold_ObserveOnly pins the delegated
+// may_merge arm's #4219 hold: a decomposed parent whose failed consolidated
+// round left a slice with no successful agent review is observe-only, and the
+// merger is never called. A coverage read error holds too (fail-closed).
+func TestAutoDriveRunGate_Merge_ReviewCoverageHold_ObserveOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readErr bool
+		want    string
+	}{
+		{"uncovered slice", false, "review coverage incomplete"},
+		{"read error", true, "review coverage could not be read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := newAutoDriveServer(t)
+			s.cfg.PlanReviewers = singleReviewerSet{&fakePlanReviewer{}}
+			runID, stages := startAutoDriveRun(t, s, repo)
+			stages[0].State = run.StageStateSucceeded
+			stages[1].State = run.StageStateSucceeded
+			if _, err := repo.TransitionRun(context.Background(), runID, run.StateRunning); err != nil {
+				t.Fatalf("TransitionRun -> running: %v", err)
+			}
+			if _, err := repo.SetRunPullRequestURL(context.Background(), runID, "https://github.com/x/y/pull/7"); err != nil {
+				t.Fatalf("SetRunPullRequestURL: %v", err)
+			}
+			seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
+			child := uuid.New()
+			idx := 0
+			repo.mu.Lock()
+			repo.runs[child] = &run.Run{ID: child, State: run.StateSucceeded, DecomposedFrom: &runID, SliceIndex: &idx}
+			repo.mu.Unlock()
+			started, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+			seedReviewEntry(t, au, runID, 6, "implement_review_started", json.RawMessage(started))
+			seedReviewEntry(t, au, runID, 7, "implement_review_failed", map[string]any{})
+			seedReviewEntry(t, au, runID, 8, "implement_review_failed", map[string]any{})
+			if tc.readErr {
+				au.listByCategoryErrCategory = "implement_review_skipped"
+			}
+
+			merger := &fakeMerger{}
+			out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
+			if err != nil {
+				t.Fatalf("AutoDriveRunGate: %v", err)
+			}
+			if out.Acted || merger.called != 0 {
+				t.Fatalf("outcome = %+v, merger called %d, want observe-only with no merge", out, merger.called)
+			}
+			if !strings.Contains(out.Note, tc.want) {
+				t.Errorf("note = %q, want it to contain %q", out.Note, tc.want)
+			}
+		})
+	}
+}
