@@ -3454,7 +3454,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// delegated operator-agent tokens. Its own tool, not a reconcile mode:
 	// reconcile CLOSES an orphaned round, this DISPATCHES a new one, under a
 	// different audit category. 75 -> 76.
-	const wantToolCount = 76
+	//
+	// #4191 (E83.81) adds exactly ONE tool — fishhawk_promote_queued_stage,
+	// the thin wrapper over POST /v0/stages/{stage_id}/concurrency/promote.
+	// WHEN: a stage queued for a LOCAL concurrency slot should be admitted
+	// next, ahead of the waiters queued before it (a fix that unblocks them).
+	// ELIGIBILITY: write:runs; the backend refuses a run-bound token, a
+	// holding stage (holders are never preempted), an unqueued stage and a
+	// stale waiter. Its own tool, not a merge-queue mode: the merge-candidate
+	// queue's promote is #4297's verb, with a different key, lock domain and
+	// audit category. 76 -> 77.
+	const wantToolCount = 77
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3820,6 +3830,34 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawRerunReview {
 		t.Error("fishhawk_rerun_review is not registered/visible over ListTools — the review_coverage_incomplete recovery verb is unreachable")
+	}
+
+	// fishhawk_promote_queued_stage (#4191) must likewise be wire-visible, and
+	// its description must lead with WHEN and state the eligibility that keeps
+	// it off the merge-candidate queue: the 76 -> 77 bump alone would stay
+	// green if its registration were dropped and a DIFFERENT tool added in the
+	// same change.
+	var promoteDesc string
+	var sawPromote bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_promote_queued_stage" {
+			sawPromote = true
+			promoteDesc = tool.Description
+			break
+		}
+	}
+	if !sawPromote {
+		t.Error("fishhawk_promote_queued_stage is not registered/visible over ListTools — an operator cannot reorder a local concurrency queue")
+	}
+	if sawPromote {
+		if !strings.HasPrefix(promoteDesc, "Use this when") {
+			t.Errorf("fishhawk_promote_queued_stage description must lead with WHEN; got %q", promoteDesc[:min(len(promoteDesc), 80)])
+		}
+		for _, want := range []string{"ELIGIBILITY", "#4297", "never preempted", "concurrency_waiter_not_live", "fishhawk_await_stage"} {
+			if !strings.Contains(promoteDesc, want) {
+				t.Errorf("fishhawk_promote_queued_stage description is missing %q", want)
+			}
+		}
 	}
 
 	// fishhawk_arbitrate_acceptance (#2474) must be wire-visible AND its

@@ -2172,6 +2172,10 @@ type StageConcurrency struct {
 	Group    string `json:"group,omitempty" jsonschema:"the concurrency group: local-implement:<host> by default for a local implement stage, local-verify:<host> (limit 1) for an ADR-090 merge-candidate verify-only pass, spec:<repo>:<name> for a spec-declared named group"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"how many stages the group admits at once"`
 	Position int    `json:"position,omitempty" jsonschema:"1-based queue position while awaiting_concurrency_slot"`
+	// Promoted mirrors the stage block's promoted flag (#4191): an operator
+	// promoted this queued waiter (fishhawk_promote_queued_stage), so its
+	// position reflects that order rather than enqueue order.
+	Promoted bool `json:"promoted,omitempty" jsonschema:"while awaiting_concurrency_slot: true when an operator promoted this waiter to the front of its group (fishhawk_promote_queued_stage) for its current queue episode; absent otherwise"`
 	// Holders is a list of the live slot holders. Absent or empty means no live
 	// holder: the stage is queued behind earlier waiters, or another admission
 	// held the group lock at that instant.
