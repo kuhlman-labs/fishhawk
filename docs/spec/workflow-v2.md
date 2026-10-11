@@ -676,6 +676,7 @@ The optional per-stage `concurrency` block (#3964 / ADR-087) places a stage in a
 
 - **The shipped default needs no declaration.** Every host-dispatched (`runner_kind: local`) `implement` stage is in the host group `local-implement:<host>` with limit 1, so two local implement stages on one host never run at once. Every other stage type is in **no group** unless it declares one. `<host>` is the label the dispatching client sends; a client that sends none lands in `local-implement:unknown`.
 - **One group per stage.** A stage that omits `group` joins the host default group with the declared `limit` — the way to widen or narrow it. A stage that names a `group` is in that group **instead of** the host default group.
+- **Merge-candidate verify-only passes (ADR-092 D3, #4200).** Under ADR-092, a stage carrying a live merge-candidate verify-only pass is admitted through `local-verify:<host>` (limit 1) regardless of a declared group.
 - **`group`** names a **repository-scoped** group: two stages naming the same group in the same repository share its slots across runs, and the same name in another repository is a different group. It matches `^[a-z0-9][a-z0-9._-]{0,62}$` (lowercase alphanumerics plus `.`, `_`, `-`; at most 63 characters).
 - **`limit`** is an integer `1`–`64`; absent means `1`. When stages of one group declare different limits, the **admitting** stage's `limit` governs.
 - An empty `concurrency: {}` is an authoring error (the schema requires at least one of `group`, `limit`).

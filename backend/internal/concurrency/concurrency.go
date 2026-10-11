@@ -28,6 +28,12 @@ const (
 	UnknownHost = "unknown"
 	// DefaultLimit is the default group's slot count.
 	DefaultLimit = 1
+	// VerifyGroupPrefix prefixes the per-host group a merge-candidate
+	// verify-only pass joins (ADR-092 D3 / #4200): "local-verify:<host>". A
+	// pass runs no agent, so it never waits behind a queued full implement.
+	VerifyGroupPrefix = "local-verify:"
+	// DefaultVerifyLimit is the verify group's slot count.
+	DefaultVerifyLimit = 1
 	// MaxLimit bounds a declared limit (matches the 0097 CHECK).
 	MaxLimit = 64
 	// QueueTTL is how long a queued row stays live without a refresh. A row
@@ -141,6 +147,15 @@ func DefaultGroupKey(host string) string {
 		host = UnknownHost
 	}
 	return DefaultGroupPrefix + host
+}
+
+// VerifyGroupKey is the host verify group key a merge-candidate verify-only
+// pass is admitted through (ADR-092 D3).
+func VerifyGroupKey(host string) string {
+	if host == "" {
+		host = UnknownHost
+	}
+	return VerifyGroupPrefix + host
 }
 
 // NamedGroupKey is a spec-declared group key, scoped to its repository.
