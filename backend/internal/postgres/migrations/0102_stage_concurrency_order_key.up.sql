@@ -1,0 +1,17 @@
+-- 0102: stage_concurrency_slots.order_key — the operator promote's ordering
+-- key (#4191, E83.81). backend/internal/concurrency is the only reader and
+-- writer; its README is the contract.
+--
+-- NULL means the row is ordered FIFO by enqueued_at. Only
+-- concurrency.Store.Promote sets it, to just ahead of every other fresh
+-- waiter in the same group and account. The effective admit order is
+-- (COALESCE(order_key, enqueued_at), stage_id), so every row without a
+-- promotion keeps strict FIFO. The episode-restart rule (held -> queued, a
+-- re-key into another group, a stale restart at the tail) and the held mark
+-- clear it: a promotion lasts for the waiter's current queue episode only.
+-- enqueued_at is never rewritten by a promotion, so waited_seconds and the
+-- same-round rule (which filters on enqueued_at) stay truthful.
+--
+-- No index: the table holds one row per waiting/holding stage per host, and
+-- every ahead read already joins stages and runs.
+ALTER TABLE stage_concurrency_slots ADD COLUMN order_key TIMESTAMPTZ NULL;
