@@ -16699,3 +16699,232 @@ func TestReverifyResume_Documented(t *testing.T) {
 		}
 	}
 }
+
+// --- runner-executed counterfactuals (E85.3 / #4143) ---
+
+// counterfactualFixturePlan is an approved plan declaring the three
+// counterfactuals the SHARED golden testdata/wire/counterfactual_spec.json
+// pins, in that order: a replace-form entry, a patch-form entry and a
+// replace-form DELETION (an empty replacement). withDecomposition adds a
+// two-slice decomposition whose slice 0 resolves, so a fan-out child of this
+// plan is served 200.
+func counterfactualFixturePlan(withDecomposition bool) *plan.Plan {
+	replaceTrue, deletion := "return true", ""
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "plan declaring counterfactuals",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "backend/internal/plan/validate.go", Operation: plan.FileOpModify},
+		}},
+		Counterfactuals: []plan.Counterfactual{
+			{
+				ControlPath: "backend/internal/plan/validate.go",
+				Mutation:    plan.CounterfactualMutation{Find: "return ok", Replace: &replaceTrue},
+				Tests:       plan.CounterfactualTests{Run: "^TestValidate_Counterfactuals$", Package: "./backend/internal/plan"},
+				Expect:      plan.CounterfactualExpectRed,
+			},
+			{
+				ControlPath: "backend/internal/server/prompt.go",
+				Mutation: plan.CounterfactualMutation{Patch: "--- a/backend/internal/server/prompt.go\n" +
+					"+++ b/backend/internal/server/prompt.go\n" +
+					"@@ -10,1 +10,1 @@\n" +
+					"-\tif runRow.DecomposedFrom != nil || mergeCandidate != nil {\n" +
+					"+\tif false {\n"},
+				Tests:  plan.CounterfactualTests{Run: "^TestPromptResponse_CarriesCounterfactuals$", Package: "./backend/internal/server"},
+				Expect: plan.CounterfactualExpectRed,
+			},
+			{
+				ControlPath: "runner/internal/upload/upload.go",
+				Mutation:    plan.CounterfactualMutation{Find: "defer cancel()", Replace: &deletion},
+				Tests:       plan.CounterfactualTests{Run: "TestFetchPrompt", Package: "./runner/internal/upload/..."},
+				Expect:      plan.CounterfactualExpectRed,
+			},
+		},
+	}
+	if withDecomposition {
+		p.Decomposition = &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/plan/validate.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B", ScopeHint: "B", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/plan/plan.go", Operation: plan.FileOpModify}}}},
+			},
+		}
+	}
+	return p
+}
+
+// counterfactualPromptFixture shapes one counterfactual prompt-serve case.
+type counterfactualPromptFixture struct {
+	// stageType is the served stage's type.
+	stageType run.StageType
+	// approvedPlan is the run's plan artifact; nil seeds no plan at all.
+	approvedPlan *plan.Plan
+	// child serves a decomposition fan-out child (slice 0) whose PARENT run
+	// holds approvedPlan, instead of the run that holds it.
+	child bool
+	// entries seeds the served run's audit chain.
+	entries func(runID, stageID uuid.UUID) []*audit.Entry
+}
+
+// counterfactualPromptBodies serves the fixture's stage through BOTH prompt
+// endpoints — the signed runner /prompt (advertising every capability) and the
+// SPA /prompt-render preview — and returns both raw bodies keyed by endpoint.
+func counterfactualPromptBodies(t *testing.T, fx counterfactualPromptFixture) map[string]string {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	planRunID := uuid.New()
+	planStageID := uuid.New()
+	servedRunID := planRunID
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		planRunID: {{ID: planStageID, RunID: planRunID, Type: run.StageTypePlan}},
+	}
+	// A readable workflow spec: the plan-stage prompt fails closed without one.
+	spec := reasoningEffortSpecYAML(false)
+	rr.getRuns[planRunID] = &run.Run{ID: planRunID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, WorkflowSpec: spec}
+	if fx.approvedPlan != nil {
+		planBytes, err := json.Marshal(fx.approvedPlan)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+	}
+	if fx.child {
+		servedRunID = uuid.New()
+		idx := 0
+		rr.getRuns[servedRunID] = &run.Run{
+			ID: servedRunID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, WorkflowSpec: spec,
+			ParentRunID: &planRunID, DecomposedFrom: &planRunID, SliceIndex: &idx,
+		}
+	}
+	servedStageID := planStageID
+	if fx.stageType != run.StageTypePlan {
+		servedStageID = uuid.New()
+		rr.getStages[servedStageID] = &run.Stage{ID: servedStageID, RunID: servedRunID, Type: fx.stageType}
+	} else {
+		rr.getStages[planStageID] = &run.Stage{ID: planStageID, RunID: planRunID, Type: run.StageTypePlan}
+	}
+	var entries []*audit.Entry
+	if fx.entries != nil {
+		entries = fx.entries(servedRunID, servedStageID)
+	}
+	priv, _ := sf.issue(t, servedRunID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{servedRunID: entries}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	out := map[string]string{}
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"/prompt":        promptRequestWithCapabilities(t, s, servedStageID, priv, capableRunnerCapabilities),
+		"/prompt-render": promptRenderRequest(t, s, servedStageID),
+	} {
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200:\n%s", name, w.Code, w.Body.String())
+		}
+		out[name] = w.Body.String()
+	}
+	return out
+}
+
+// goldenCounterfactualSpecJSON reads the CROSS-MODULE GOLDEN FIXTURE for the
+// implement prompt-response's counterfactuals member (E85.3 / #4143) from the
+// SINGLE shared file testdata/wire/counterfactual_spec.json. The runner's
+// upload_test decodes the SAME bytes into upload.FetchedPrompt, so a tag drift
+// on either side reddens one of the two. Fails closed on a read error.
+func goldenCounterfactualSpecJSON(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "testdata", "wire", "counterfactual_spec.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared counterfactual spec fixture %s: %v", path, err)
+	}
+	return strings.TrimSuffix(string(b), "\n")
+}
+
+// TestPromptResponse_CarriesCounterfactuals is the EMIT half of the E85.3 /
+// #4143 prompt wire seam: an implement stage of a run whose approved plan
+// declares counterfactuals serves them, flattened and in plan order, on BOTH
+// prompt endpoints, byte-equal to the shared golden. Every non-serving shape
+// omits the key — the plan stage, a run with no approved plan, a decomposition
+// child whose resolved (parent) plan DOES declare entries, and a
+// merge-candidate verify-only pass on a run whose plan declares entries.
+func TestPromptResponse_CarriesCounterfactuals(t *testing.T) {
+	t.Run("implement stage serves the golden on both endpoints", func(t *testing.T) {
+		want := goldenCounterfactualSpecJSON(t)
+		bodies := counterfactualPromptBodies(t, counterfactualPromptFixture{
+			stageType: run.StageTypeImplement, approvedPlan: counterfactualFixturePlan(false),
+		})
+		for name, body := range bodies {
+			if got := projectPromptKeys(t, body, "counterfactuals"); got != want {
+				t.Errorf("%s: counterfactuals drifted from the shared golden:\n got %s\nwant %s", name, got, want)
+			}
+		}
+	})
+
+	omitted := []struct {
+		name string
+		fx   counterfactualPromptFixture
+	}{
+		{"plan stage", counterfactualPromptFixture{
+			stageType: run.StageTypePlan, approvedPlan: counterfactualFixturePlan(false)}},
+		{"no approved plan", counterfactualPromptFixture{stageType: run.StageTypeImplement}},
+		{"plan declares none", counterfactualPromptFixture{
+			stageType: run.StageTypeImplement,
+			approvedPlan: func() *plan.Plan {
+				p := counterfactualFixturePlan(false)
+				p.Counterfactuals = nil
+				return p
+			}()}},
+		{"decomposition child of a declaring plan", counterfactualPromptFixture{
+			stageType: run.StageTypeImplement, approvedPlan: counterfactualFixturePlan(true), child: true}},
+		{"merge-candidate verify-only pass", counterfactualPromptFixture{
+			stageType: run.StageTypeImplement, approvedPlan: counterfactualFixturePlan(false),
+			entries: func(runID, stageID uuid.UUID) []*audit.Entry {
+				return []*audit.Entry{mergeCandidateTriggerEntry(runID, stageID, 1, "head1")}
+			}}},
+	}
+	for _, tc := range omitted {
+		t.Run(tc.name+" omits the key", func(t *testing.T) {
+			for name, body := range counterfactualPromptBodies(t, tc.fx) {
+				var all map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(body), &all); err != nil {
+					t.Fatalf("%s: decode: %v", name, err)
+				}
+				if v, ok := all["counterfactuals"]; ok {
+					t.Errorf("%s: counterfactuals = %s, want the key omitted", name, v)
+				}
+			}
+		})
+	}
+}
+
+// TestCounterfactualSpecsForPrompt_NilReplaceReadsAsEmpty pins the defensive
+// read of a replace-form entry with no replacement: an approved plan cannot
+// carry one (plan validation refuses find without replace), but the flattener
+// must not dereference a nil pointer if one ever reached it.
+func TestCounterfactualSpecsForPrompt_NilReplaceReadsAsEmpty(t *testing.T) {
+	p := &plan.Plan{Counterfactuals: []plan.Counterfactual{{
+		ControlPath: "a/b.go",
+		Mutation:    plan.CounterfactualMutation{Find: "x"},
+		Tests:       plan.CounterfactualTests{Run: "TestX", Package: "./a"},
+		Expect:      plan.CounterfactualExpectRed,
+	}}}
+	got := counterfactualSpecsForPrompt(p, &run.Run{ID: uuid.New()}, nil)
+	want := []counterfactualSpec{{
+		Index: 0, ControlPath: "a/b.go", MutationKind: counterfactualMutationReplace,
+		Find: "x", Replace: "", TestRun: "TestX", TestPackage: "./a", Expect: "red",
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("specs = %#v, want %#v", got, want)
+	}
+}
