@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -253,7 +254,9 @@ type rebaseMergeCandidateFields struct {
 //
 // After the shared tail a 200 also authorizes the ADR-090 merge-candidate
 // verify pass (rebaseMergeCandidateVerify): a performed merge triggers a
-// verify-only pass for the resolved new head, and an already-up-to-date call
+// verify-only pass for the resolved new head — unless, in ENFORCE transfer
+// mode, the prior head's passed verdict transfers to it (ADR-096, E87.2 /
+// #4293) — and an already-up-to-date call
 // re-triggers one for an unverified base-advance or conflict-resolution head.
 // The pass re-opens the implement stage but writes nothing to the branch, and
 // a pass that cannot start rides on the 200 as merge_candidate_verify_refusal.
@@ -733,7 +736,11 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 //     base_advance): the decoded merge sha, or the observed head on a genuine
 //     concurrent push (#4199). Only when the merge sha did not decode AND the
 //     post-merge re-read returned no new head is nothing anchored; the retry
-//     then takes the already-up-to-date arm below.
+//     then takes the already-up-to-date arm below. In ENFORCE transfer mode
+//     (E87.2 / #4293) the decision runs first: a transferred verdict answers
+//     passed and starts NO pass; a refusal is recorded and the pass runs. In
+//     SHADOW mode the pass runs as above and the would-be decision is
+//     classified asynchronously after it.
 //   - An ALREADY-UP-TO-DATE invocation reads mergeCandidateVerifyState for
 //     the live head and re-triggers only when it is unverified (a
 //     conflict-resolution push, or a base advance whose pass never reported
@@ -748,6 +755,26 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 		return rebaseMergeCandidateFields{Refusal: mergeCandidateUnreadableHeadNote}
 	}
 	head, cause := newHead, mergeCandidateCauseBaseAdvance
+	if mergePerformed {
+		// ADR-096 verdict transfer (E87.2 / #4293). ONLY a performed merge
+		// with a resolved new head reaches here; the already-up-to-date arm
+		// below never classifies.
+		req := mergeCandidateTransferRequest{Run: runRow, PriorHead: priorHead, NewHead: newHead,
+			MergePerformed: true, Cause: mergeCandidateCauseBaseAdvance}
+		if s.mergeCandidateTransferMode() == MergeCandidateTransferEnforce {
+			pctx, cancel, transferred := s.rebaseMergeCandidateTransferEnforce(ctx, req)
+			defer cancel()
+			ctx = pctx
+			if transferred {
+				return rebaseMergeCandidateFields{State: mergeCandidateStatePassed,
+					Note: mergeCandidateVerdictTransferredNote(priorHead, newHead)}
+			}
+		}
+		// SHADOW: the pass below runs exactly as without transfer, and the
+		// would-be decision is classified ASYNC after it (a no-op outside
+		// shadow).
+		defer s.scheduleMergeCandidateTransferShadow(req)
+	}
 	if !mergePerformed {
 		head = priorHead
 		st, err := s.mergeCandidateVerifyState(ctx, runRow, head)
@@ -786,6 +813,82 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 		out.Note = mergeCandidateVerifyTriggeredNote
 	}
 	return out
+}
+
+// rebaseTransferWriteReserve is what the rebase verb's enforce-mode
+// classification leaves of its own detached context for the transferred or
+// refused row append.
+const rebaseTransferWriteReserve = 15 * time.Second
+
+// mergeCandidateVerdictTransferredNote is the 200's merge_candidate_verify_note
+// on a transfer. It names only the two Fishhawk-resolved SHAs; no classifier
+// text reaches the response.
+func mergeCandidateVerdictTransferredNote(fromHead, toHead string) string {
+	return "the passed merge-candidate verdict of " + fromHead + " TRANSFERRED to " + toHead +
+		" across an independent clean base advance (ADR-096); no verify pass was started. The merge_candidate_verdict_transferred audit row records the decision."
+}
+
+// rebaseMergeCandidateTransferEnforce is the rebase verb's ENFORCE arm. The
+// decision and its row append run on a context DETACHED from the caller and
+// bounded by rebasePostMergeTailBudget, which is the OUTER bound that wins:
+// the classification sub-budget inside it is min(the configured transfer
+// Deadline, 30s by default; rebasePostMergeTailBudget minus
+// rebaseTransferWriteReserve), so basedelta's own 5-minute DefaultDeadline is
+// never reached. On a transfer the run's active queue entry is re-anchored
+// to the new head on a FRESH detached context. It returns that fresh context
+// (also bounded by rebasePostMergeTailBudget) for the caller's pass start on
+// a refusal, so the classification time never starves the pass start; the
+// caller runs the returned cancel.
+func (s *Server) rebaseMergeCandidateTransferEnforce(ctx context.Context, req mergeCandidateTransferRequest) (context.Context, context.CancelFunc, bool) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rebasePostMergeTailBudget)
+	req.Reserve = rebaseTransferWriteReserve
+	transferred, _ := s.mergeCandidateTransferEnforce(dctx, req)
+	cancel()
+	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), rebasePostMergeTailBudget)
+	if transferred {
+		s.reanchorMergeCandidateQueueOnTransfer(pctx, req.Run.ID, req.NewHead)
+	}
+	return pctx, pcancel, transferred
+}
+
+// reanchorMergeCandidateQueueOnTransfer moves the run's ACTIVE queue entry
+// (held or live) to the transferred head in place, keeping its state, phase
+// and place; a live entry is also set to phase passed (it holds the line
+// until merge, ADR-092 D4). It writes merge_candidate_queue_reanchored with
+// verdict_transferred:true. Best-effort: a failure only logs, and the next
+// admission re-anchors to the live PR head and reads the transferred verdict
+// there.
+func (s *Server) reanchorMergeCandidateQueueOnTransfer(ctx context.Context, runID uuid.UUID, head string) {
+	if s.cfg.MergeQueue == nil {
+		return
+	}
+	warn := func(msg string, err error) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg,
+			slog.String("run_id", runID.String()), slog.String("head_sha", head), slog.String("error", err.Error()))
+	}
+	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil {
+		warn("merge-candidate queue: transfer re-anchor could not read the run's entry", err)
+		return
+	}
+	if !found {
+		return
+	}
+	e := st.Entry
+	if e.AnchoredHeadSHA != head {
+		re, err := s.cfg.MergeQueue.Reanchor(ctx, e.ID, head, "")
+		if err != nil {
+			warn("merge-candidate queue: transfer re-anchor failed; the next admission re-anchors", err)
+			return
+		}
+		e = re
+	}
+	if e.State == mergequeue.StateLive {
+		s.setMergeCandidateQueuePhase(ctx, e, mergequeue.PhasePassed)
+		e.Phase = mergequeue.PhasePassed
+	}
+	s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueReanchored, e,
+		map[string]any{"verdict_transferred": true})
 }
 
 // writeRebaseNotDeterminable is the fail-CLOSED refusal: a 422 carrying the

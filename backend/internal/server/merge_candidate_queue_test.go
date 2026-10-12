@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
@@ -54,6 +55,10 @@ type mcqGitHub struct {
 	// onMerge, when set, runs on every POST /merges (outside the lock)
 	// before the response is written.
 	onMerge func(base string)
+	// mergeFn, when set, runs FIRST on every POST /merges (outside the lock)
+	// and, when it returns a sha, makes that the merge commit for the base —
+	// the e2e transfer tests create a real `git merge --no-ff` commit here.
+	mergeFn func(base string) string
 }
 
 func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
@@ -97,6 +102,14 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		raw, _ := io.ReadAll(r.Body)
 		var call rebaseMergeCall
 		_ = json.Unmarshal(raw, &call)
+		g.mu.Lock()
+		mergeFn := g.mergeFn
+		g.mu.Unlock()
+		if mergeFn != nil {
+			if sha := mergeFn(call.Base); sha != "" {
+				g.set(func() { g.mergeSHA[call.Base] = sha })
+			}
+		}
 		g.mu.Lock()
 		g.merges = append(g.merges, call)
 		status := g.mergeStatus[call.Base]
@@ -1186,5 +1199,243 @@ func TestMergeCandidateQueue_EnqueueErrorRefuses(t *testing.T) {
 	}
 	if n := len(f.triggers(a)); n != 0 {
 		t.Fatalf("run has %d triggers after a failed enqueue, want 0", n)
+	}
+}
+
+// --- E87.2 / #4293: ADR-096 verdict transfer through the queue ---
+
+// transfer switches the fixture's server to mode with classifier cls and a
+// faked inputs seam (the e2e test exercises the real one).
+func (f *mcqFixture) transfer(mode MergeCandidateTransferMode, cls *fakeTransferClassifier) {
+	f.srv.cfg.MergeCandidateTransfer = MergeCandidateTransferConfig{Mode: mode, Classifier: cls}
+	f.srv.transferInputs = func(context.Context, string, string, string, string) (*mergeCandidateTransferInputs, error) {
+		return &mergeCandidateTransferInputs{
+			Delta: basedelta.DeltaInputs{FromBase: mctFromBase, ToBase: mctToBase,
+				DeltaPaths: []string{"b/b.go"}, PRPaths: []string{"a/a.go"}},
+			Workspaces: []string{"/ws/base", "/ws/candidate"},
+		}, nil
+	}
+}
+
+// passedAt binds r to a working dir and records a passed verdict for head
+// (a base-advance head the run's rebase already classified), so head is a
+// transfer SOURCE.
+func (f *mcqFixture) passedAt(r *mcqRun, head string) {
+	f.t.Helper()
+	f.exec(`UPDATE runs SET working_dir = $1 WHERE id = $2`, mctWorkDir, r.id)
+	raw, _ := json.Marshal(mergeCandidateVerifiedPayload{HeadSHA: head, Cause: mergeCandidateCauseBaseAdvance,
+		VerifyCommand: mcvCommand, Result: mergeCandidateResultPassed, OutputUntrusted: true})
+	kind, subject := audit.ActorSystem, "runner"
+	stageID := r.impl.ID
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: r.id, StageID: &stageID, Timestamp: time.Now().UTC(), Category: CategoryMergeCandidateVerified,
+		ActorKind: &kind, ActorSubject: &subject, Payload: raw,
+	}); err != nil {
+		f.t.Fatalf("seed passed verdict: %v", err)
+	}
+}
+
+func (f *mcqFixture) transferPayloads(r *mcqRun, category string) []mergeCandidateTransferPayload {
+	f.t.Helper()
+	var out []mergeCandidateTransferPayload
+	for _, e := range f.rows(r, category) {
+		var p mergeCandidateTransferPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			f.t.Fatalf("decode %s: %v", category, err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// handOff seeds the held-B wave with b1 passed, switches transfer on, then
+// A's pass passes and A merges while the base moved again, so B's admission
+// auto-advances b1 → b2.
+func (f *mcqFixture) handOff(mode MergeCandidateTransferMode, cls *fakeTransferClassifier) (a, b *mcqRun) {
+	f.t.Helper()
+	a, b = f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(mode, cls)
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	f.closePR(a, true)
+	return a, b
+}
+
+// TestMergeCandidateQueue_AdmissionTransferGoesStraightToPassed: the
+// head-of-line admission's auto-advance of a PASSED head across an
+// independent delta transfers the verdict: phase passed, no trigger, the
+// implement stage untouched.
+func TestMergeCandidateQueue_AdmissionTransferGoesStraightToPassed(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := independentClassifier()
+	_, b := f.handOff(MergeCandidateTransferEnforce, cls)
+
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("B entry = head %q phase %q, want b2 passed", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 0 {
+		t.Fatalf("B triggers = %+v, want none (the verdict transferred)", tr)
+	}
+	if st := f.stageState(b.impl.ID); st != run.StageStateSucceeded {
+		t.Errorf("B implement = %s, want succeeded (not re-opened)", st)
+	}
+	rows := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferred)
+	if len(rows) != 1 || rows[0].FromHead != "b1" || rows[0].ToHead != "b2" {
+		t.Fatalf("B transferred rows = %+v, want one b1 → b2", rows)
+	}
+	if cls.count() != 1 {
+		t.Errorf("classifier calls = %d, want 1", cls.count())
+	}
+}
+
+// TestMergeCandidateQueue_HeldEntryReanchoredKeepsTransferredVerdict: an
+// operator rebase of a HELD passed head transfers; the entry stays held, now
+// anchored at the transferred head; once the line frees, admission reads
+// passed and starts no pass.
+func TestMergeCandidateQueue_HeldEntryReanchoredKeepsTransferredVerdict(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	held := f.requireState(b, mergequeue.StateHeld, "")
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferEnforce, independentClassifier())
+
+	f.behind(b, "b1", "b2")
+	if resp := f.rebase(b); resp.MergeCandidateVerifyState != mergeCandidateStatePassed || resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("B rebase = state %q triggered %v, want passed/false", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	e := f.requireState(b, mergequeue.StateHeld, "")
+	if e.ID != held.ID || !e.EnqueuedAt.Equal(held.EnqueuedAt) || e.AnchoredHeadSHA != "b2" {
+		t.Fatalf("B entry = %+v, want the same held row (same place) anchored at b2", e)
+	}
+	var transferredReanchor bool
+	for _, row := range f.rows(b, CategoryMergeCandidateQueueReanchored) {
+		var p map[string]any
+		_ = json.Unmarshal(row.Payload, &p)
+		if p["verdict_transferred"] == true && p["anchored_head_sha"] == "b2" {
+			transferredReanchor = true
+		}
+	}
+	if !transferredReanchor {
+		t.Error("no merge_candidate_queue_reanchored row with verdict_transferred:true at b2")
+	}
+
+	f.verdict(a, mergeCandidateResultPassed)
+	f.closePR(a, true)
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("B after hand-off = head %q phase %q, want b2 passed", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 0 {
+		t.Fatalf("B triggers = %+v, want none", tr)
+	}
+	if st := f.stageState(b.impl.ID); st != run.StageStateSucceeded {
+		t.Errorf("B implement = %s, want succeeded", st)
+	}
+}
+
+// TestMergeCandidateQueue_LiveEntryTransferKeepsPassed: an operator rebase of
+// the LIVE entry's passed head transfers; the entry is re-anchored in place
+// and stays phase passed, with no new pass.
+func TestMergeCandidateQueue_LiveEntryTransferKeepsPassed(t *testing.T) {
+	f := newMCQFixture(t)
+	a, _ := f.wave()
+	f.verdict(a, mergeCandidateResultPassed)
+	f.exec(`UPDATE runs SET working_dir = $1 WHERE id = $2`, mctWorkDir, a.id)
+	f.transfer(MergeCandidateTransferEnforce, independentClassifier())
+
+	f.behind(a, "a1", "a2")
+	if resp := f.rebase(a); resp.MergeCandidateVerifyState != mergeCandidateStatePassed {
+		t.Fatalf("A rebase state = %q, want passed", resp.MergeCandidateVerifyState)
+	}
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "a2" || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("A entry = head %q phase %q, want a2 passed", e.AnchoredHeadSHA, e.Phase)
+	}
+	if n := len(f.triggers(a)); n != 1 {
+		t.Errorf("A triggers = %d, want still 1 (no pass for a2)", n)
+	}
+}
+
+// TestMergeCandidateQueue_ShadowAdmissionStillStartsPass: in shadow the
+// admission's pass starts exactly as without transfer, and the would-be
+// decision lands asynchronously as a shadow row.
+func TestMergeCandidateQueue_ShadowAdmissionStillStartsPass(t *testing.T) {
+	f := newMCQFixture(t)
+	_, b := f.handOff(MergeCandidateTransferShadow, independentClassifier())
+
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B entry = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("B triggers = %+v, want one for b2", tr)
+	}
+	f.srv.waitMergeCandidateTransferShadows()
+	sh := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferShadow)
+	if len(sh) != 1 || sh[0].WouldTransfer == nil || !*sh[0].WouldTransfer || sh[0].FromHead != "b1" || sh[0].ToHead != "b2" {
+		t.Fatalf("B shadow rows = %+v, want one would_transfer b1 → b2", sh)
+	}
+	if n := len(f.rows(b, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Errorf("B transferred rows = %d in shadow, want 0", n)
+	}
+}
+
+// TestMergeCandidateQueue_AdmissionClassifierPastSubBudgetStillStartsPass
+// (approval condition S2): a classifier that blocks past its sub-budget is
+// undecidable:deadline_exceeded — a recorded refusal — and the pass still
+// starts; the entry is not stranded in phase admitted.
+func TestMergeCandidateQueue_AdmissionClassifierPastSubBudgetStillStartsPass(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := &fakeTransferClassifier{block: true}
+	a, b := f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferEnforce, cls)
+	f.srv.cfg.MergeCandidateTransfer.Deadline = timescale.D(50 * time.Millisecond)
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	f.closePR(a, true)
+
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B entry = head %q phase %q, want b2 verifying (not stranded)", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("B triggers = %+v, want one for b2", tr)
+	}
+	rows := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferRefused)
+	if len(rows) != 1 || rows[0].ReasonCode != transferReasonDeadlineExceeded {
+		t.Fatalf("B refused rows = %+v, want one undecidable:deadline_exceeded", rows)
+	}
+}
+
+// TestMergeCandidateQueue_AdmissionSubBudgetLeavesHandOffReserve (approval
+// condition S2): even with a transfer Deadline far past the hand-off budget,
+// the classification gets at most the hand-off budget minus the 60s reserve.
+func TestMergeCandidateQueue_AdmissionSubBudgetLeavesHandOffReserve(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := independentClassifier()
+	a, b := f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferEnforce, cls)
+	f.srv.cfg.MergeCandidateTransfer.Deadline = 10 * time.Minute
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	f.closePR(a, true)
+
+	if cls.count() != 1 {
+		t.Fatalf("classifier calls = %d, want 1", cls.count())
+	}
+	if limit := mergeCandidateQueueHandOffBudget - mergeCandidateTransferHandOffReserve; cls.deadline <= 0 || cls.deadline > limit {
+		t.Errorf("classifier sub-budget = %s, want (0, %s]", cls.deadline, limit)
+	}
+}
+
+// appendSystemRow appends one run-level system row to the chain.
+func (f *mcqFixture) appendSystemRow(r *mcqRun, category string, payload any) {
+	f.t.Helper()
+	raw, _ := json.Marshal(payload)
+	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
+	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: r.id, Timestamp: time.Now().UTC(), Category: category,
+		ActorKind: &kind, ActorSubject: &subject, Payload: raw,
+	}); err != nil {
+		f.t.Fatalf("append %s: %v", category, err)
 	}
 }
