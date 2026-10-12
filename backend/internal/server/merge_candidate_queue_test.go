@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // The ADR-092 (#4200) serializer, end to end: the REAL rebase handler, the
@@ -698,6 +699,103 @@ func TestMergeCandidateQueue_PeriodicPumpReleasesTerminalLiveRun(t *testing.T) {
 	f.requireState(b, mergequeue.StateLive, "")
 }
 
+// TestMergeCandidateQueue_PeriodicPumpReclaimsStaleAdmission: a server that
+// crashed mid-admission leaves a live entry in phase admitted with no admission
+// work done. The periodic pump leaves a FRESH admission alone (its admitting
+// pump may still be working) and RE-CLAIMS one older than
+// mergequeue.AdmissionStaleAfter, running the full admission: auto-advance,
+// re-anchor, pass trigger, and an admitted audit row with readmitted:true.
+//
+// The crashed-admission state is built by driving the STORE directly
+// (Enqueue + AdmitNext, no server admission), never through the stale predicate
+// under test. The backdate runs in the DB clock domain (clock_timestamp()) and
+// the before/after admitted_at values are both read back from the DB, so no Go
+// time.Now() value is compared against a DB stamp (#3048).
+// Counterfactuals: replacing AdmitNext's stale predicate with `false` → the
+// stale arm leaves A live/admitted at a0 (RED); replacing it with
+// `phase = 'admitted'` (no age bound) → the fresh arm's first pump re-claims and
+// triggers at once (RED).
+func TestMergeCandidateQueue_PeriodicPumpReclaimsStaleAdmission(t *testing.T) {
+	f := newMCQFixture(t)
+	ctx := context.Background()
+	a := f.seed("a", "a0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(a, "a0", "a1")
+
+	res, err := f.store.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: a.id, BaseRef: mcqBase, HeadSHA: "a0"})
+	if err != nil {
+		t.Fatalf("store enqueue: %v", err)
+	}
+	adm, err := f.store.AdmitNext(ctx, res.Entry.Base())
+	if err != nil || !adm.Admitted || adm.Readmitted || adm.Entry == nil {
+		t.Fatalf("store AdmitNext = %+v / %v, want a first (not re-) admission", adm, err)
+	}
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != mergequeue.PhaseAdmitted || e.AnchoredHeadSHA != "a0" {
+		t.Fatalf("seeded entry = phase %q head %q, want admitted at a0", e.Phase, e.AnchoredHeadSHA)
+	}
+
+	// FRESH: the pump finds a live, non-stale admission and does nothing.
+	if n := f.srv.PumpMergeCandidateQueues(ctx); n != 1 {
+		t.Fatalf("fresh-arm pump swept %d bases, want 1", n)
+	}
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != mergequeue.PhaseAdmitted || e.AnchoredHeadSHA != "a0" {
+		t.Fatalf("fresh admission after pump = phase %q head %q, want untouched admitted at a0", e.Phase, e.AnchoredHeadSHA)
+	}
+	if n := len(f.gh.mergeCalls()); n != 0 {
+		t.Fatalf("fresh admission made %d merge calls, want 0", n)
+	}
+	if n := len(f.triggers(a)); n != 0 {
+		t.Fatalf("fresh admission wrote %d triggers, want 0", n)
+	}
+	if n := len(f.rows(a, CategoryMergeCandidateQueueAdmitted)); n != 0 {
+		t.Fatalf("fresh admission wrote %d admitted rows, want 0", n)
+	}
+
+	// STALE: backdate admitted_at past the bound in the DB clock domain and
+	// capture the backdated stamp from the same statement.
+	var backdated time.Time
+	if err := f.pool.QueryRow(ctx,
+		`UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() - make_interval(secs => $2)
+		   WHERE id = $1 RETURNING admitted_at`,
+		adm.Entry.ID, (mergequeue.AdmissionStaleAfter + time.Minute).Seconds()).Scan(&backdated); err != nil {
+		t.Fatalf("backdate admitted_at: %v", err)
+	}
+	if n := f.srv.PumpMergeCandidateQueues(ctx); n != 1 {
+		t.Fatalf("stale-arm pump swept %d bases, want 1", n)
+	}
+
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != mergequeue.PhaseVerifying || e.AnchoredHeadSHA != "a1" {
+		t.Fatalf("re-claimed entry = phase %q head %q, want verifying at a1", e.Phase, e.AnchoredHeadSHA)
+	}
+	calls := f.gh.mergeCalls()
+	if len(calls) != 1 || calls[0].Base != a.branch || calls[0].Head != mcqBase {
+		t.Fatalf("auto-advance merge calls = %+v, want exactly one into %q from %q", calls, a.branch, mcqBase)
+	}
+	if tr := f.triggers(a); len(tr) != 1 || tr[0].ExpectedHeadSHA != "a1" || tr[0].Cause != mergeCandidateCauseBaseAdvance {
+		t.Fatalf("A triggers = %+v, want exactly one base_advance trigger for a1", tr)
+	}
+	if st := f.stageState(a.impl.ID); st != run.StageStatePending {
+		t.Fatalf("A implement = %s, want pending (re-opened by the re-claimed admission)", st)
+	}
+	admitted := f.rows(a, CategoryMergeCandidateQueueAdmitted)
+	if len(admitted) != 1 {
+		t.Fatalf("admitted rows = %d, want exactly 1", len(admitted))
+	}
+	var payload struct {
+		Readmitted bool `json:"readmitted"`
+	}
+	if err := json.Unmarshal(admitted[0].Payload, &payload); err != nil || !payload.Readmitted {
+		t.Fatalf("admitted row payload = %s (decode err %v), want readmitted:true", admitted[0].Payload, err)
+	}
+	var reclaimed time.Time
+	if err := f.pool.QueryRow(ctx, `SELECT admitted_at FROM merge_candidate_queue_entries WHERE id = $1`,
+		adm.Entry.ID).Scan(&reclaimed); err != nil {
+		t.Fatalf("read admitted_at: %v", err)
+	}
+	if !reclaimed.After(backdated) {
+		t.Fatalf("admitted_at after re-claim = %s, want later than the backdated %s", reclaimed, backdated)
+	}
+}
+
 // TestMergeCandidateQueue_PeriodicPumpListErrorPumpsNothing: an unreadable
 // base list pumps no base (the next tick retries), and an unwired queue
 // sweeps nothing.
@@ -715,8 +813,51 @@ func TestMergeCandidateQueue_PeriodicPumpListErrorPumpsNothing(t *testing.T) {
 	}
 }
 
+// TestMergeCandidateQueue_PeriodicPumpSweepsOnceAtBootBeforeAnyTick pins the
+// loop's BOOT sweep. The interval is an hour, so no tick can fire inside the
+// test: the only thing that can reach ActiveBases is the sweep before the
+// ticker. Counterfactual: deleting the `s.PumpMergeCandidateQueues(ctx)` that
+// opens RunMergeCandidateQueuePump → `swept` never receives and the test fails
+// at its deadline with "no boot sweep". The exact count also catches a doubled
+// boot sweep. TestMergeCandidateQueue_PeriodicPumpRunsAtBootAndOnTick cannot
+// pin this: its 5ms ticker makes its >= 2 wait satisfiable by two ticks alone.
+func TestMergeCandidateQueue_PeriodicPumpSweepsOnceAtBootBeforeAnyTick(t *testing.T) {
+	swept := make(chan struct{}, 1)
+	fs := &mcqFaultStore{activeBases: func() ([]mergequeue.Base, error) {
+		select {
+		case swept <- struct{}{}:
+		default:
+		}
+		return []mergequeue.Base{}, nil
+	}}
+	srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.RunMergeCandidateQueuePump(ctx, time.Hour)
+	}()
+	select {
+	case <-swept:
+	case <-time.After(timescale.D(10 * time.Second)):
+		cancel()
+		t.Fatalf("no boot sweep: ActiveBases ran %d times before any tick (interval 1h), want 1", fs.called("ActiveBases"))
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("pump loop did not return after cancel")
+	}
+	if n := fs.called("ActiveBases"); n != 1 {
+		t.Fatalf("ActiveBases ran %d times with a 1h interval, want exactly 1 (the boot sweep)", n)
+	}
+}
+
 // TestMergeCandidateQueue_PeriodicPumpRunsAtBootAndOnTick: the loop sweeps
-// once immediately, again on the ticker, and returns on cancel.
+// once immediately, again on the ticker, and returns on cancel. This is the
+// TICK pin: with a 5ms ticker its >= 2 wait is satisfied by ticks alone, so the
+// boot arm is pinned by ..._PeriodicPumpSweepsOnceAtBootBeforeAnyTick.
 func TestMergeCandidateQueue_PeriodicPumpRunsAtBootAndOnTick(t *testing.T) {
 	fs := &mcqFaultStore{activeBases: func() ([]mergequeue.Base, error) { return []mergequeue.Base{}, nil }}
 	srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
