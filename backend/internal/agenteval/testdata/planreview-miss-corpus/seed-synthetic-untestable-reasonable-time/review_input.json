@@ -105,11 +105,16 @@
     "ill-defined",
     "cannot decide",
     "can't decide",
-    "undecidable"
+    "undecidable",
+    "no executor can decide"
   ],
   "attribution_phrases": [
     "reasonable time",
     "large tenant's widgets"
+  ],
+  "defect_phrases": [
+    "reasonable time",
+    "exporting a large tenant"
   ],
   "catching_examples": [
     {
@@ -126,6 +131,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "The 'completes in a reasonable time' criterion is subjective and unmeasurable; replace it with a timed check on a seeded 50,000-widget tenant."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-export-timely says only 'completes in a reasonable time', which no executor can decide pass or fail. The issue gives concrete figures: tenants of up to 50,000 widgets, a 60 s gateway cut-off, and an export that must finish 'well inside' that. Resolve by restating the criterion with a measurable bound tied to the issue's numbers, for example a 50,000-widget tenant exporting in a stated number of seconds, or an explicit statement that the bound is the issue's 60 s limit with a stated margin."
     }
   ],
   "non_catching_examples": [
@@ -157,6 +167,11 @@
     {
       "category": "risk",
       "note": "Exporting a large tenant's widgets runs one query with no time limit and no bound on buffered rows; the flush interval is ambiguous, so the mismatch with the 60 s gateway is unquantified."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "The verification test strategy covers header, row count, comma quoting and tenant isolation, but nothing exercises the issue's large-tenant requirement behind ac-export-timely (50,000 widgets, 60 s gateway limit). The Risks section also asserts that streaming keeps memory flat, with no test or measurement behind it. Add a handler test with a large seeded tenant, around 50,000 rows, that checks the row count and a time bound. It could also check that output is flushed incrementally rather than buffered."
     }
   ]
 }

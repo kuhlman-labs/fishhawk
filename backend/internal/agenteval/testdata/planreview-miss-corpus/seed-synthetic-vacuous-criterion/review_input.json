@@ -83,6 +83,10 @@
     "either logs",
     "or does not log"
   ],
+  "defect_phrases": [
+    "either logs a warning",
+    "skipped row"
+  ],
   "catching_examples": [
     {
       "severity": "medium",
