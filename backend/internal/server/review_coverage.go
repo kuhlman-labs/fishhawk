@@ -141,7 +141,8 @@ func (s *Server) reviewCoverageRefusal(ctx context.Context, runRow *run.Run) (*m
 	if s.defaultPlanReviewer() == nil {
 		return nil, nil
 	}
-	if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg == nil || cfg.AgentCount() == 0 {
+	cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
+	if cfg == nil || cfg.AgentCount() == 0 {
 		return nil, nil
 	}
 	children, err := s.listAllDecomposedChildren(ctx, runRow.ID)
@@ -199,7 +200,9 @@ func (s *Server) reviewCoverageRefusal(ctx context.Context, runRow *run.Run) (*m
 		return nil, nil
 	}
 
-	nextStep, how := reviewCoverageNextStep(parent)
+	prOpen := runRow.PullRequestURL != nil && *runRow.PullRequestURL != ""
+	gating := planreview.ResolveAuthority(*cfg) == planreview.AuthorityGating
+	nextStep, how := reviewCoverageNextStep(parent, prOpen, gating)
 	var parentRound any
 	if parent.Started {
 		parentRound = map[string]any{
@@ -224,17 +227,29 @@ func (s *Server) reviewCoverageRefusal(ctx context.Context, runRow *run.Run) (*m
 
 // reviewCoverageNextStep names the verb that clears the hold from the parent
 // round's state, plus the sentence the refusal message uses. A settled parent
-// round with no verdict is re-runnable; an in-flight one is awaited; a parent
-// with no round yet is awaiting its consolidated review (the re-run verb
-// refuses no_review_round there).
-func reviewCoverageNextStep(parent implementRoundCoverage) (string, string) {
+// round with no verdict is re-runnable; an in-flight one is awaited.
+//
+// A parent with NO round (#4282) is awaited until its consolidated PR opens —
+// the orchestrator dispatches the consolidated round then. Once the PR is open
+// and still no round exists, the dispatch may have failed (a forge compare
+// error, or no forge wired), and nothing re-fires it: the re-run verb starts
+// the first consolidated round, so next_step is fishhawk_rerun_review. A GATING
+// parent is the exception (approval condition C5): the verb refuses it
+// gating_authority, so next_step stays fishhawk_await_review and the sentence
+// names fishhawk_fixup_stage as the remedy when the dispatch failed, rather
+// than bouncing the operator between two surfaces.
+func reviewCoverageNextStep(parent implementRoundCoverage, prOpen, gating bool) (string, string) {
 	switch {
 	case parent.inFlight():
 		return reviewCoverageNextAwait, fmt.Sprintf("The parent's implement-review round %d is still in flight: await it with fishhawk_await_review", parent.Sequence)
 	case parent.Started:
 		return reviewCoverageNextRerun, fmt.Sprintf("The parent's latest implement-review round %d settled with no verdict: re-run it with fishhawk_rerun_review (POST /v0/runs/{run_id}/reviews/rerun)", parent.Sequence)
+	case !prOpen:
+		return reviewCoverageNextAwait, "No implement-review round has been dispatched on the parent yet and its consolidated PR is not open: await the consolidated review with fishhawk_await_review"
+	case gating:
+		return reviewCoverageNextAwait, "No implement-review round has been dispatched on the parent although its consolidated PR is open. Its implement reviewers are gating, which fishhawk_rerun_review refuses (gating_authority): await the consolidated review with fishhawk_await_review, or, if the consolidated dispatch failed, route fishhawk_fixup_stage on the parent implement stage, whose pushed head dispatches the review"
 	}
-	return reviewCoverageNextAwait, "No implement-review round has been dispatched on the parent yet: await the consolidated review with fishhawk_await_review"
+	return reviewCoverageNextRerun, "No implement-review round has been dispatched on the parent although its consolidated PR is open: start its first consolidated round with fishhawk_rerun_review (POST /v0/runs/{run_id}/reviews/rerun), which dedups against a dispatch already under way and reports a fan-in verify hold or an unwired forge compare"
 }
 
 // sliceOrderKey orders children by slice index, unindexed children last, ties
@@ -254,8 +269,9 @@ func pluralWas(n int) string {
 }
 
 // reviewCoverageDriveAction maps a review_coverage_incomplete refusal to the
-// drive next_action verb: rerun_review when the parent round is re-runnable,
-// await_review otherwise. Never merge_pr.
+// drive next_action verb: rerun_review when next_step names the re-run verb (a
+// re-runnable parent round, or a parent whose first consolidated round it can
+// start, #4282), await_review otherwise. Never merge_pr.
 func reviewCoverageDriveAction(ref *mergeReadinessRefusal) string {
 	if ref != nil && ref.Details["next_step"] == reviewCoverageNextRerun {
 		return "rerun_review"
