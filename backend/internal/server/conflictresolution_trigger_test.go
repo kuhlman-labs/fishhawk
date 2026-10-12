@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -449,5 +451,343 @@ func TestOpenReviewStageFor(t *testing.T) {
 	sd.rr.stagesByRunID = nil
 	if got := sd.s.openReviewStageFor(t.Context(), sd.runID); got != nil {
 		t.Errorf("openReviewStageFor = %+v, want nil when the stage list is unreadable", got)
+	}
+}
+
+// --- #4304: the re-open preconditions are PRE-FLIGHTED before the budget ---
+
+// crSeedAcceptance turns the shared seed into the feature_change shape: the
+// review stage is pending behind an acceptance stage (Sequence 3) in the given
+// state, which is what holds the review gate closed.
+func crSeedAcceptance(sd *rebaseSeed, state run.StageState) *run.Stage {
+	sd.review.State = run.StageStatePending
+	acc := &run.Stage{ID: uuid.New(), RunID: sd.runID, Type: run.StageTypeAcceptance,
+		State: state, Sequence: 3}
+	sd.rr.getStages[acc.ID] = acc
+	sd.rr.stagesByRunID[sd.runID] = append(sd.rr.stagesByRunID[sd.runID], acc)
+	return acc
+}
+
+// crFixupSentinelText lists the run fix-up sentinel prefixes and the fix-up
+// budget wording a conflict-arm reason must never carry (C6): the reason is
+// about the CONFLICT-RESOLUTION budget, and a spent fix-up budget is a
+// different, untouched counter.
+var crFixupSentinelText = []string{
+	"fixup not applicable", "fixup ceiling reached", "fixup budget exhausted", "fix-up budget",
+}
+
+const crReinvoke = "re-invoke fishhawk_rebase_run_branch"
+
+// TestStartConflictResolutionPass_PreflightRefusalSpendsNoBudget is the #4304
+// defect: a re-open precondition the arm never pre-checked used to be found by
+// run.FixupStage AFTER the trigger was appended, spending the ceiling-of-one
+// slot on a pass that could never run. Each row asserts COMMITTED STATE — no
+// trigger entry, no TransitionStage call, stage states unchanged — and the
+// named precondition and remedy in the reason.
+func TestStartConflictResolutionPass_PreflightRefusalSpendsNoBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		opts   rebaseOpts
+		mutate func(sd *rebaseSeed)
+		want   []string
+		reject []string
+		// reinvokeOnce: the row is clearable, so the reason names the re-invoke
+		// instruction EXACTLY once (C1); every other row must not name it.
+		reinvokeOnce bool
+		// readFailure: the row is the unknown-applicability arm, not a sentinel.
+		readFailure bool
+	}{
+		{
+			name:   "acceptance awaiting_host_dispatch",
+			mutate: func(sd *rebaseSeed) { crSeedAcceptance(sd, run.StageStateAwaitingHostDispatch) },
+			want:   []string{"must settle first", "fishhawk_dispatch_stage", "awaiting_host_dispatch"},
+			reject: []string{"route the fix-up"}, reinvokeOnce: true,
+		},
+		{
+			name:   "acceptance pending",
+			mutate: func(sd *rebaseSeed) { crSeedAcceptance(sd, run.StageStatePending) },
+			want:   []string{"must settle first", "fishhawk_dispatch_stage"},
+			reject: []string{"route the fix-up"}, reinvokeOnce: true,
+		},
+		{
+			name:   "acceptance dispatched (in flight)",
+			mutate: func(sd *rebaseSeed) { crSeedAcceptance(sd, run.StageStateDispatched) },
+			want:   []string{"already in flight", "Wait for acceptance to settle"},
+			reject: []string{"route the fix-up", "fishhawk_dispatch_stage"}, reinvokeOnce: true,
+		},
+		{
+			name: "terminal run",
+			mutate: func(sd *rebaseSeed) {
+				sd.rr.getRuns[sd.runID].State = run.StateCancelled
+			},
+			want: []string{"already terminal", "cancelled"},
+		},
+		{
+			name:   "review already resolved",
+			mutate: func(sd *rebaseSeed) { sd.review.State = run.StageStateSucceeded },
+			want:   []string{"already resolved"},
+		},
+		{
+			name:   "review pending without acceptance",
+			mutate: func(sd *rebaseSeed) { sd.review.State = run.StageStatePending },
+			want:   []string{"review gate has not opened yet", "review stage state \"pending\""},
+		},
+		{
+			name: "no review stage",
+			opts: rebaseOpts{noReviewStage: true},
+			want: []string{"no review stage at all"},
+		},
+		{
+			name: "pre-flight read failure",
+			mutate: func(sd *rebaseSeed) {
+				sd.rr.runErr = errors.New("injected pre-flight run read failure")
+			},
+			want:        []string{"could not be confirmed", "injected pre-flight run read failure", "BEFORE spending"},
+			readFailure: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := seedRebaseRun(t, cleanRebaseStub(), tc.opts)
+			impl := crImplementStage(t, sd)
+			if tc.mutate != nil {
+				tc.mutate(sd)
+			}
+			implBefore := impl.State
+			var reviewBefore run.StageState
+			if sd.review != nil {
+				reviewBefore = sd.review.State
+			}
+
+			start, refusal := sd.s.startConflictResolutionPass(crOperatorRequest(), sd.runID,
+				rebaseBranchName, rebaseBaseRef, rebasePriorHeadSHA)
+			if start != nil {
+				t.Fatalf("start = %+v, want a pre-flight refusal", start)
+			}
+			if refusal == nil {
+				t.Fatal("refusal = nil, want a pre-flight refusal")
+			}
+			if refusal.BudgetSpent {
+				t.Errorf("refusal = %+v, want a cannot-start refusal, not the ceiling arm", refusal)
+			}
+			if !refusal.Preflight {
+				t.Errorf("refusal = %+v, want it marked as a pre-flight refusal", refusal)
+			}
+
+			// COMMITTED STATE: nothing written, nothing moved.
+			if n := len(crTriggerEntries(sd.au)); n != 0 {
+				t.Errorf("stage_conflict_resolution_triggered entries = %d, want 0 — the pre-flight must refuse BEFORE the budget is spent", n)
+			}
+			if n := len(sd.rr.transitionStageCalls); n != 0 {
+				t.Errorf("TransitionStage calls = %d, want 0: %+v", n, sd.rr.transitionStageCalls)
+			}
+			if impl.State != implBefore {
+				t.Errorf("implement stage state = %q, want %q (unchanged)", impl.State, implBefore)
+			}
+			if sd.review != nil && sd.review.State != reviewBefore {
+				t.Errorf("review stage state = %q, want %q (unchanged)", sd.review.State, reviewBefore)
+			}
+
+			// The reason names the precondition and its remedy.
+			reason := refusal.Reason
+			if !strings.Contains(reason, "NO conflict-resolution budget was spent") {
+				t.Errorf("reason must state that no budget was spent:\n%s", reason)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(reason, w) {
+					t.Errorf("reason missing %q:\n%s", w, reason)
+				}
+			}
+			for _, r := range tc.reject {
+				if strings.Contains(reason, r) {
+					t.Errorf("reason must not contain %q:\n%s", r, reason)
+				}
+			}
+			// C6: never read as a fix-up refusal or a spent fix-up budget.
+			for _, r := range crFixupSentinelText {
+				if strings.Contains(reason, r) {
+					t.Errorf("reason carries fix-up wording %q (C6):\n%s", r, reason)
+				}
+			}
+			// C1: the re-invoke instruction appears ONLY on the clearable rows,
+			// and exactly once there.
+			n := strings.Count(reason, crReinvoke)
+			if tc.reinvokeOnce && n != 1 {
+				t.Errorf("clearable row names %q %d times, want exactly 1:\n%s", crReinvoke, n, reason)
+			}
+			if !tc.reinvokeOnce && n != 0 {
+				t.Errorf("non-clearable row names %q %d times, want 0 (a remedy the operator cannot take):\n%s", crReinvoke, n, reason)
+			}
+
+			// C2: the shipped 422 still names the vouch route, as the FALLBACK.
+			msg := refusal.message()
+			if !strings.Contains(msg, "fishhawk_vouch_commit") {
+				t.Errorf("message must still name the fallback route:\n%s", msg)
+			}
+			if !strings.Contains(msg, "If the precondition cannot be cleared: Resolve the conflict") {
+				t.Errorf("message must word the vouch route as the FALLBACK (C2):\n%s", msg)
+			}
+			if tc.readFailure && strings.Contains(reason, "NO conflict-resolution budget was spent;") {
+				t.Errorf("a read failure must not be framed as an unmet precondition:\n%s", reason)
+			}
+		})
+	}
+}
+
+// TestConflictResolutionPreflightRefusal_BoundSentinels covers the bound arm
+// of the mapper, which the arm itself cannot reach (its budget-spent check uses
+// the same count): it must still say no budget was spent and must not carry
+// the fix-up wording of the embedded error (C6).
+func TestConflictResolutionPreflightRefusal_BoundSentinels(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("%w: 1 of 1 fix-up passes already used (hard ceiling; 0 delivered-nothing refund credit)", run.ErrFixupCeilingReached),
+		fmt.Errorf("%w: 1 of 1 fix-up passes already used", run.ErrFixupBudgetExhausted),
+	} {
+		ref := conflictResolutionPreflightRefusal(err)
+		if ref.BudgetSpent || !ref.Preflight {
+			t.Errorf("refusal = %+v, want a pre-flight cannot-start refusal", ref)
+		}
+		if !strings.Contains(ref.Reason, "NO conflict-resolution budget was spent") {
+			t.Errorf("reason must state that no budget was spent:\n%s", ref.Reason)
+		}
+		for _, r := range append([]string{"fix-up passes"}, crFixupSentinelText...) {
+			if strings.Contains(ref.Reason, r) {
+				t.Errorf("reason carries fix-up wording %q (C6):\n%s", r, ref.Reason)
+			}
+		}
+	}
+}
+
+// TestStripFixupSentinel pins the C6 prefix strip for each sentinel, and that
+// an error with no sentinel prefix passes through unchanged.
+func TestStripFixupSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("%w: run x is already terminal", run.ErrFixupNotApplicable), "run x is already terminal"},
+		{fmt.Errorf("%w: 1 of 1 used", run.ErrFixupCeilingReached), "1 of 1 used"},
+		{fmt.Errorf("%w: 1 of 1 used", run.ErrFixupBudgetExhausted), "1 of 1 used"},
+		{errors.New("FixupStage: get run: boom"), "FixupStage: get run: boom"},
+	} {
+		if got := stripFixupSentinel(tc.err); got != tc.want {
+			t.Errorf("stripFixupSentinel(%q) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestStartConflictResolutionPass_ReinvokeAfterAcceptanceSettlesStartsPassOne
+// proves the refusal really did spend nothing: once acceptance settles and the
+// review gate parks, the SAME stage gets pass 1 — not the budget-spent 422.
+func TestStartConflictResolutionPass_ReinvokeAfterAcceptanceSettlesStartsPassOne(t *testing.T) {
+	sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+	impl := crImplementStage(t, sd)
+	acc := crSeedAcceptance(sd, run.StageStateAwaitingHostDispatch)
+
+	if start, refusal := sd.s.startConflictResolutionPass(crOperatorRequest(), sd.runID,
+		rebaseBranchName, rebaseBaseRef, rebasePriorHeadSHA); start != nil || refusal == nil {
+		t.Fatalf("first call: start=%+v refusal=%+v, want a pre-flight refusal", start, refusal)
+	}
+
+	acc.State = run.StageStateSucceeded
+	sd.review.State = run.StageStateAwaitingApproval
+
+	start, refusal := sd.s.startConflictResolutionPass(crOperatorRequest(), sd.runID,
+		rebaseBranchName, rebaseBaseRef, rebasePriorHeadSHA)
+	if refusal != nil {
+		t.Fatalf("re-invoke refusal = %+v, want pass 1", refusal)
+	}
+	if start.Pass != 1 {
+		t.Errorf("pass = %d, want 1 — the refused call must not have spent the slot", start.Pass)
+	}
+	if n := len(crTriggerEntries(sd.au)); n != 1 {
+		t.Errorf("stage_conflict_resolution_triggered entries = %d, want 1", n)
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending", impl.State)
+	}
+}
+
+// crPostTriggerRunRepo wraps the seed's run repository and runs afterTrigger
+// once, on the first GetRun after the conflict-resolution trigger has been
+// appended. That is FixupStage's own admission read — the window between the
+// pre-flight and the re-open the #4304 residual contract names.
+type crPostTriggerRunRepo struct {
+	*promptRunRepo
+	au           *auditFake
+	afterTrigger func()
+	fired        bool
+}
+
+func (r *crPostTriggerRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if !r.fired && len(crTriggerEntries(r.au)) > 0 {
+		r.fired = true
+		r.afterTrigger()
+	}
+	return r.promptRunRepo.GetRun(ctx, id)
+}
+
+// TestStartConflictResolutionPass_ResidualsAfterPreflightSpendTheSlot pins the
+// HONEST residual (C3, C4): the pre-flight passes, then FixupStage's own
+// admission — which re-reads AFTER the append — refuses or fails. The slot is
+// spent loudly: exactly ONE trigger entry and the "budget is now SPENT" reason.
+func TestStartConflictResolutionPass_ResidualsAfterPreflightSpendTheSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flip func(sd *rebaseSeed, acc *run.Stage)
+		want string
+	}{
+		{
+			// C3: a concurrent writer re-opens acceptance between the
+			// pre-flight and the re-open.
+			name: "acceptance flips to awaiting_host_dispatch",
+			flip: func(sd *rebaseSeed, acc *run.Stage) {
+				acc.State = run.StageStateAwaitingHostDispatch
+				sd.review.State = run.StageStatePending
+			},
+			want: "must settle first",
+		},
+		{
+			// C4: a repository READ fails inside FixupStage's own admission.
+			name: "FixupStage's own run read fails",
+			flip: func(sd *rebaseSeed, _ *run.Stage) {
+				sd.rr.runErr = errors.New("injected second-admission read failure")
+			},
+			want: "injected second-admission read failure",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := seedRebaseRun(t, cleanRebaseStub(), rebaseOpts{})
+			impl := crImplementStage(t, sd)
+			acc := crSeedAcceptance(sd, run.StageStateSucceeded)
+			sd.review.State = run.StageStateAwaitingApproval
+			sd.s.cfg.RunRepo = &crPostTriggerRunRepo{promptRunRepo: sd.rr, au: sd.au,
+				afterTrigger: func() { tc.flip(sd, acc) }}
+
+			start, refusal := sd.s.startConflictResolutionPass(crOperatorRequest(), sd.runID,
+				rebaseBranchName, rebaseBaseRef, rebasePriorHeadSHA)
+			if start != nil || refusal == nil {
+				t.Fatalf("start=%+v refusal=%+v, want the spent-slot refusal", start, refusal)
+			}
+			if refusal.Preflight {
+				t.Errorf("refusal = %+v, want the post-append residual, not a pre-flight refusal", refusal)
+			}
+			if !strings.Contains(refusal.Reason, "budget is now SPENT") {
+				t.Errorf("reason must state the slot is spent:\n%s", refusal.Reason)
+			}
+			if !strings.Contains(refusal.Reason, tc.want) {
+				t.Errorf("reason missing %q:\n%s", tc.want, refusal.Reason)
+			}
+			for _, r := range crFixupSentinelText[:3] {
+				if strings.Contains(refusal.Reason, r) {
+					t.Errorf("reason carries the fix-up sentinel %q (C6):\n%s", r, refusal.Reason)
+				}
+			}
+			if n := len(crTriggerEntries(sd.au)); n != 1 {
+				t.Errorf("stage_conflict_resolution_triggered entries = %d, want exactly 1 (the residual spends the slot)", n)
+			}
+			if impl.State != run.StageStateSucceeded {
+				t.Errorf("implement stage state = %q, want succeeded (never re-opened)", impl.State)
+			}
+		})
 	}
 }
