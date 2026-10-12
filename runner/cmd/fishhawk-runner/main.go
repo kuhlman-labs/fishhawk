@@ -5598,9 +5598,10 @@ func verifyFailureExcerpt(out string) string {
 //
 //     2b. on a SCOPED pass, immediately re-verifies the SAME committed SHA with
 //     the FULL form and adopts its outcome and output. A passing iteration
-//     therefore always ends on a complete verify, the #960 verified tree is the
-//     FULL form's, and a break in a package the scope did not name cannot slip
-//     past the gate. An EMPTY package set skips the pre-pass and runs the full
+//     therefore ends on a complete verify, the #960 verified tree is the FULL
+//     form's, and a break in a package the scope did not name cannot slip
+//     past the gate — the one exception is step 7's outside-only absorb
+//     (#4229). An EMPTY package set skips the pre-pass and runs the full
 //     form exactly once, as before #3315;
 //
 //  3. on PASS: undoes the throwaway commit (git reset --soft HEAD~1, which
@@ -5627,6 +5628,20 @@ func verifyFailureExcerpt(out string) string {
 //     verify_summary detail), a reproduced outside failure is category C
 //     (verify_failure_outside_change), and a failure inside the change refunds
 //     the iteration. Helpers and the relation rules live in verifyfailures.go.
+//
+//  7. OUTSIDE-ONLY FLAKE ABSORPTION at exhaustion (#4229, ruling (b)): when the
+//     deciding verify is the (c2) full form and every failing package lies
+//     outside the change (plan scope AND scripts/test's attested changed
+//     dirs), the attest — gated by a fresh per-(c2) nonce — reports passing
+//     patch coverage and TEST-class module failures, and no absorbed test or
+//     package failed earlier in this pass, the iteration is repeated ONCE
+//     (`iter--; continue`, once per runner pass): re-stage, re-commit, refuse
+//     unless the tree is identical, then ONE scoped verify of the outside
+//     packages. An exact "passed" from an executed gate makes that tree the
+//     verified tree and emits verify_flake_absorbed; anything else is
+//     refused and the stage ends with today's terminal failure byte-for-byte
+//     (the re-run is not counted in attempts). Every refusal of a candidate
+//     emits verify_flake_absorb_refused. Helpers live in verifyabsorb.go.
 //
 // Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
 // with runVerifyGateCommitted (#816):
@@ -5747,18 +5762,57 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		flakeFailures    verifyFailures // the failure the no-op fix agent was given (the flaky test on a pass)
 		outsideChange    bool           // the flake re-run reproduced a failure entirely outside the change → category C
 		outsideFailures  verifyFailures // the reproduced failure, for the category-C reason
+
+		// Outside-only flake absorption at exhaustion (#4229, verifyabsorb.go).
+		decidingNonce    string           // the absorb nonce injected into the deciding (c2) full verify; "" for any other verify
+		failureHistory   []verifyFailures // every FAILED verify of this pass, for the recurred refusal
+		flakeAbsorbSpent bool             // the once-per-pass absorb was already admitted
+		absorbPending    *flakeAbsorbPlan // the admitted absorb the NEXT iteration re-runs, scoped
+		absorbed         *flakeAbsorbPlan // the absorb whose scoped re-run passed
+		absorbRefusal    string           // why a candidate absorb was refused
 	)
 
+	// refuseAbsorb settles a refused absorb re-run back onto the failed full
+	// verify it was admitted for: lastOutput and form are restored and nothing
+	// else is set, so the stage ends with today's terminal failure
+	// byte-for-byte (the re-run is never counted in attempts).
+	refuseAbsorb := func(p *flakeAbsorbPlan, iteration int, reason string) {
+		lastOutput = p.output
+		form = verifyFormFull
+		absorbRefusal = reason
+		res.Events = append(res.Events, logVerifyFlakeAbsorbRefused(logSink, *cfg, iteration, reason, parseVerifyFailures(p.output)))
+	}
+
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
+		// An admitted absorb (step 7) re-runs THIS iteration once, scoped.
+		// Every plumbing failure on it is a refusal, never a skip or a pass.
+		absorbing := absorbPending
+		absorbPending = nil
+		if absorbing != nil && flakeAbsorbBeforeRerunFn != nil {
+			flakeAbsorbBeforeRerunFn()
+		}
+
 		// (a) Stage scope-only and make a throwaway commit so the verify
 		// command sees the drift-excluded committed tree, not the working tree.
 		if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles); err != nil {
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = fmt.Errorf("verify-fix: stage scoped: %w", err)
 			break
 		}
 		committed, err := commitVerifyWIP(ctx, *cfg, repoDir)
 		if err != nil {
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = err
+			break
+		}
+		if !committed && absorbing != nil {
+			refuseAbsorb(absorbing, iter+1, absorbRefusedTreeChanged)
 			break
 		}
 		if !committed {
@@ -5781,6 +5835,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				fatalErr = rerr
 				break
 			}
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = err
 			break
 		}
@@ -5794,7 +5852,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// unresolvable tree leaves curTree empty, which disables detection —
 		// the pre-#4036 behaviour, never a failure.
 		curTree, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
-		if isNoopFixIteration(failedTree, curTree, fixedSinceVerify) {
+		if absorbing == nil && isNoopFixIteration(failedTree, curTree, fixedSinceVerify) {
 			given := parseVerifyFailures(failedOutput)
 			relation := verifyFailureScopeRelation(given, scopePkgs)
 			admitted := relation == verifyRelationOutside && !flakeRerunSpent
@@ -5814,16 +5872,43 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// an empty id leaves each payload byte-identical.
 		changeID := gitPatchIDForCommit(ctx, repoDir, headSHA)
 
-		// (c) Verify against the committed tree. With a scope set in force this
-		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
-		// the authority.
-		form = verifyFormName(scopePkgs)
-		res.Events = append(res.Events, hostProbe.sample(ctx)...)
-		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
-		res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
-		attempts++
-		lastOutput = out
-		logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+		// The absorb re-run must judge EXACTLY the tree whose full verify
+		// failed (#960: the verified tree is the observed one).
+		if absorbing != nil && (curTree == "" || curTree != absorbing.tree) {
+			if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+				fatalErr = rerr
+				break
+			}
+			refuseAbsorb(absorbing, iter+1, absorbRefusedTreeChanged)
+			break
+		}
+
+		var (
+			ev      agent.Event
+			out     string
+			outcome string
+			disp    gateDisposition
+		)
+		decidingNonce = ""
+		if absorbing != nil {
+			// The absorb re-run (step 7): SCOPED to the outside packages
+			// only — no host-load sample, no (c2), not counted in attempts,
+			// and lastOutput/form keep the failed full verify's.
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, absorbing.dirs)
+			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormScoped, outcome)
+		} else {
+			// (c) Verify against the committed tree. With a scope set in force this
+			// is the SCOPED form — a fast pre-pass over the touched packages, NOT
+			// the authority.
+			form = verifyFormName(scopePkgs)
+			res.Events = append(res.Events, hostProbe.sample(ctx)...)
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+			attempts++
+			lastOutput = out
+			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+		}
 
 		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
 		// proves only the named packages; a change can break a test in a package
@@ -5834,7 +5919,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// all deliberate:
 		//
 		//   - the #960 verified tree is captured only after the FULL form
-		//     passed, so the pushed tree is always the fully-verified one;
+		//     passed, so the pushed tree is the fully-verified one (except
+		//     step 7's outside-only absorb, #4229, whose tree passed one
+		//     scoped re-run of the untouched failing packages instead);
 		//   - a green-scoped / red-full pair is an ORDINARY iteration failure:
 		//     with budget remaining the agent is re-invoked with the FULL
 		//     output, without it the stage demotes exactly as before. The break
@@ -5847,13 +5934,23 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// failed would buy nothing. The empty-set case never enters here at all
 		// — the scoped call above WAS the full form, so re-running it would
 		// double every iteration's cost for no added coverage.
-		if len(scopePkgs) > 0 && outcome == "passed" {
+		//
+		// Each (c2) run carries a FRESH absorb nonce (#4229): scripts/test
+		// prints its attest only with it, and only this full form can decide
+		// an absorb at exhaustion. Any other verify leaves decidingNonce "".
+		if absorbing == nil && len(scopePkgs) > 0 && outcome == "passed" {
 			form = verifyFormFull
 			res.Events = append(res.Events, hostProbe.sample(ctx)...)
-			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+			nonce := newVerifyAbsorbNonce()
+			var nonceEnv []string
+			if nonce != "" {
+				nonceEnv = []string{verifyAbsorbNonceEnvVar + "=" + nonce}
+			}
+			fev, fout, foutcome, fdisp := runVerifyCommittedTreeEnv(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil, nonceEnv...)
 			res.Events = append(res.Events, stampVerifyRunChangeID(fev, changeID))
 			out, outcome, disp = fout, foutcome, fdisp
 			lastOutput = fout
+			decidingNonce = nonce
 			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
 		}
 
@@ -5886,6 +5983,29 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			fatalErr = fmt.Errorf("%w: committed-tree verify passed for %s but its verified tree could not be resolved: %v",
 				gitops.ErrPushedTreeNotVerified, headSHA, treeErr)
 			break
+		}
+
+		// The absorb re-run's result is settled HERE and only here (#4229),
+		// before the disposition / lock / infra / auto-format branches, so it
+		// can spend neither flakeRetried nor a lock re-run. Absorbed only on
+		// an exact "passed" from an executed gate.
+		if absorbing != nil {
+			if outcome == "passed" && disp == gateExecuted {
+				passed = true
+				absorbed = absorbing
+				res.Events = append(res.Events, logVerifyFlakeAbsorbed(logSink, *cfg, iter+1, *absorbing))
+				break
+			}
+			verifiedTreeSHA = ""
+			refuseAbsorb(absorbing, iter+1, absorbRerunRefusal(outcome, disp, out))
+			break
+		}
+
+		// Every failed verify of this pass, for the recurred refusal (#4229);
+		// the exhaustion decision below reads only the EARLIER ones.
+		priorFailures := failureHistory
+		if outcome == "failed" {
+			failureHistory = append(failureHistory, parseVerifyFailures(out))
 		}
 
 		if outcome != "failed" {
@@ -6109,7 +6229,26 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		}
 
 		if iter == cfg.verifyMaxIterations {
-			// Budget exhausted — terminal demotion, no re-invoke.
+			// Budget exhausted — terminal demotion, no re-invoke, unless the
+			// failure is an outside-only flake the absorb admits (step 7).
+			in := flakeAbsorbInput{
+				output: out, form: form, disp: disp, nonce: decidingNonce,
+				scopePkgs: scopePkgs, earlier: priorFailures, spent: flakeAbsorbSpent, tree: curTree,
+			}
+			if verifyFailureScopeRelation(parseVerifyFailures(out), scopePkgs) == verifyRelationOutside {
+				in.modules, in.modErr = workspaceModuleMap(ctx, repoDir, headSHA)
+			}
+			if plan, reason, candidate := decideFlakeAbsorb(in); candidate {
+				if reason != "" {
+					absorbRefusal = reason
+					res.Events = append(res.Events, logVerifyFlakeAbsorbRefused(logSink, *cfg, iter+1, reason, parseVerifyFailures(out)))
+					break
+				}
+				flakeAbsorbSpent = true
+				absorbPending = &plan
+				iter--
+				continue
+			}
 			break
 		}
 
@@ -6259,6 +6398,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		"iterations":     attempts,
 		"max_iterations": cfg.verifyMaxIterations,
 	}
+	if absorbRefusal != "" {
+		summary["absorb_refused"] = absorbRefusal
+	}
 	switch {
 	case fatalErr != nil:
 		summary["outcome"] = "failed"
@@ -6288,6 +6430,14 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			// review) says the earlier failure did not reproduce.
 			summary["detail"] = verifyFlakeRerunDetail(flakeFailures)
 			summary["flaky_tests"] = append([]string{}, flakeFailures.tests...)
+		}
+		if absorbed != nil {
+			// An absorbed outside-only flake (#4229): outcome=passed, but the
+			// detail says the tree did NOT pass the full test loop.
+			summary["detail"] = verifyFlakeAbsorbedDetail(*absorbed)
+			summary["absorbed_tests"] = nonNilStrings(absorbed.tests)
+			summary["absorbed_packages"] = nonNilStrings(absorbed.dirs)
+			summary["patch_coverage"] = absorbed.patchCoverage
 		}
 	}
 	res.Events = append(res.Events, agent.Event{
@@ -7125,7 +7275,9 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 //
 // The scoped form is NOT authoritative: runVerifyFixLoop re-verifies the same
 // committed SHA with the FULL form before reporting success, and it is that
-// full run's tree that supplies the #960 pre-push verified tree.
+// full run's tree that supplies the #960 pre-push verified tree — except for
+// an outside-only flake absorbed at exhaustion (#4229), whose verified tree
+// is the failed full run's tree after one passing scoped re-run.
 //
 // The FOURTH value is the gate disposition (#3448) — the out-of-band channel
 // the two classifying gate sites read instead of matching a literal in the
@@ -7145,7 +7297,20 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // precise site without breaking the rest of the push path.
 var materializeGateCheckoutFn = materializeGateCheckout
 
+// flakeAbsorbBeforeRerunFn is runVerifyFixLoop's absorb test seam (#4229): nil
+// in production; a test sets it to run at the top of the absorb iteration,
+// before the re-stage and re-commit (e.g. to change the tree under it).
+var flakeAbsorbBeforeRerunFn func()
+
 func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
+	return runVerifyCommittedTreeEnv(ctx, verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+}
+
+// runVerifyCommittedTreeEnv is runVerifyCommittedTree plus extra runner-chosen
+// "KEY=VALUE" entries appended after the scope and lock entries (#4229: the
+// absorb nonce on the deciding full-form verify). runVerifyCommittedTree
+// delegates here with none, so every existing caller is unchanged.
+func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string, extra ...string) (agent.Event, string, string, gateDisposition) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
 	// here only degrades the audit stamp, never the invariant.
@@ -7177,6 +7342,7 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	if gateIsolation.selection(ctx).Path != gateiso.PathContainer {
 		extraEnv = verifyLockPathEnv(extraEnv, repoDir)
 	}
+	extraEnv = append(extraEnv, extra...)
 
 	start := time.Now()
 	// withDecidingGate marks this as a VERIFY gate: its outcome decides the
