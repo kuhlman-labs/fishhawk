@@ -141,27 +141,33 @@ func mustCompileNamedSchema(path, resourceName string) *jsonschema.Schema {
 	return s
 }
 
-// Validate validates plan bytes against the standard_v1 schema plus ONE
-// semantic rule, the delivery / remaining_scope coupling (checkDelivery,
-// E83.52 / #4085). The returned error is *ParseError (malformed JSON),
-// *SchemaError (schema violation) or *SemanticError (the delivery rule). Use
-// errors.As to distinguish.
+// Validate validates plan bytes against the standard_v1 schema plus TWO
+// semantic rules: the delivery / remaining_scope coupling (checkDelivery,
+// E83.52 / #4085) and the counterfactuals rules (checkCounterfactuals, E85.3 /
+// #4143). The returned error is *ParseError (malformed JSON), *SchemaError
+// (schema violation, or a counterfactuals rule) or *SemanticError (the
+// delivery rule). Use errors.As to distinguish.
 //
-// The delivery rule lives here, not only in semanticCheck, because the
-// plan-upload path (handleShipPlan) validates through Validate and never
-// reaches plan.Parse: without it a remaining_scope paired with an absent or
-// full delivery, or a whitespace-only one, shipped 201. No other semanticCheck
-// rule runs here. Parse does NOT call Validate — it calls validateSchema and
-// then semanticCheck, which runs checkDelivery in its existing position — so
-// Parse's behaviour, including which error it reports first, is unchanged.
+// Both rules live here, not only in semanticCheck, because the plan-upload
+// path (handleShipPlan) validates through Validate and never reaches
+// plan.Parse: without the delivery leg a remaining_scope paired with an absent
+// or full delivery, or a whitespace-only one, shipped 201, and without the
+// counterfactuals leg a ninth entry or a `_test.go` control_path would reach
+// the implement runner. No other semanticCheck rule runs here. Parse does NOT
+// call Validate — it calls validateSchema and then semanticCheck, which runs
+// checkDelivery and checkCounterfactuals in their own positions — so Parse's
+// behaviour, including which error it reports first, is unchanged.
 //
 // The runner (E5.4) validates through its own module's schema-only copy, so a
-// plan breaking the delivery rule passes the runner and is refused at upload.
+// plan breaking either rule passes the runner and is refused at upload.
 func Validate(data []byte) error {
 	if err := validateSchema(data); err != nil {
 		return err
 	}
-	return checkDeliveryBytes(data)
+	if err := checkDeliveryBytes(data); err != nil {
+		return err
+	}
+	return checkCounterfactualsBytes(data)
 }
 
 // validateSchema is the schema-only leg of Validate: malformed JSON is a
@@ -495,6 +501,12 @@ func semanticCheck(p *Plan) error {
 	if err := checkDelivery(p); err != nil {
 		return err
 	}
+	// counterfactuals rules (E85.3 / #4143). Valid on any plan, so they precede
+	// the decomposition early return; a decomposed plan's entries are not
+	// executed and draw a Warnings advisory instead.
+	if err := checkCounterfactuals(p.Counterfactuals); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -753,6 +765,136 @@ func checkDeliveryBytes(data []byte) error {
 	return checkDelivery(&Plan{Delivery: d.Delivery, RemainingScope: d.RemainingScope})
 }
 
+// checkCounterfactuals enforces the counterfactuals rules the schema cannot
+// express (E85.3 / #4143). The schema deliberately carries no maxItems and no
+// oneOf: the runner derives every plan stage's structured-output schema from
+// it, and a keyword outside that derivation's supported subset silently
+// degrades structured output (#1741). So the cap and the exactly-one-form rule
+// live here. Every violation is a *SchemaError whose Violations name the
+// offending member by JSON Pointer, at most one per member, all collected so
+// the planner sees every broken field in one round trip:
+//   - more than MaxCounterfactuals entries (/counterfactuals);
+//   - control_path whitespace-only, absolute, containing a backslash or a `..`
+//     segment, or naming a `_test.go` file (a test-side control cannot be
+//     shown load-bearing by its own tests going RED, #3107);
+//   - a mutation with both forms or neither, find without replace, replace
+//     without find, or replace equal to find (a no-op mutation);
+//   - tests.run whitespace-only;
+//   - tests.package absolute or containing a `..` segment.
+//
+// semanticCheck runs it for plan.Parse; checkCounterfactualsBytes runs it for
+// Validate (the plan-upload path). An empty or absent list is a no-op.
+func checkCounterfactuals(cfs []Counterfactual) error {
+	var vs []SchemaViolation
+	if len(cfs) > MaxCounterfactuals {
+		vs = append(vs, SchemaViolation{
+			Path:    "/counterfactuals",
+			Message: fmt.Sprintf("%d entries declared; at most %d are allowed — keep the counterfactuals for the controls whose deletion matters most", len(cfs), MaxCounterfactuals),
+		})
+	}
+	for i, cf := range cfs {
+		at := fmt.Sprintf("/counterfactuals/%d", i)
+		if msg := counterfactualControlPathProblem(cf.ControlPath); msg != "" {
+			vs = append(vs, SchemaViolation{Path: at + "/control_path", Message: msg})
+		}
+		if path, msg := counterfactualMutationProblem(cf.Mutation); msg != "" {
+			vs = append(vs, SchemaViolation{Path: at + "/mutation" + path, Message: msg})
+		}
+		if strings.TrimSpace(cf.Tests.Run) == "" {
+			vs = append(vs, SchemaViolation{Path: at + "/tests/run", Message: "tests.run must be a non-blank go test -run selector"})
+		}
+		if msg := counterfactualPackageProblem(cf.Tests.Package); msg != "" {
+			vs = append(vs, SchemaViolation{Path: at + "/tests/package", Message: msg})
+		}
+	}
+	if len(vs) == 0 {
+		return nil
+	}
+	return &SchemaError{Path: vs[0].Path, Message: vs[0].Message, Violations: vs}
+}
+
+// counterfactualControlPathProblem returns why control_path is unacceptable, or
+// "" when it is a repo-relative production file path. The path is trimmed
+// BEFORE every check, as the runner's executor trims it, so padding cannot
+// slip a `_test.go` control (or an absolute path) past a suffix or prefix test.
+func counterfactualControlPathProblem(p string) string {
+	p = strings.TrimSpace(p)
+	switch {
+	case p == "":
+		return "control_path must be a non-blank repo-relative path"
+	case strings.HasPrefix(p, "/"):
+		return fmt.Sprintf("control_path %q is absolute; name the control by its repo-relative path", p)
+	case strings.Contains(p, `\`):
+		return fmt.Sprintf("control_path %q contains a backslash; use forward slashes", p)
+	case hasDotDotSegment(p):
+		return fmt.Sprintf("control_path %q contains a `..` segment; name the control by its repo-relative path", p)
+	case strings.HasSuffix(p, "_test.go"):
+		return fmt.Sprintf("control_path %q names a test file; a test-side control cannot be shown load-bearing by its own tests going RED — name the production control the tests pin", p)
+	}
+	return ""
+}
+
+// counterfactualMutationProblem returns the JSON Pointer suffix (relative to
+// the mutation) and the reason a mutation is malformed, or ("", "") when it
+// declares exactly one well-formed form.
+func counterfactualMutationProblem(m CounterfactualMutation) (string, string) {
+	hasReplaceForm := m.Find != "" || m.Replace != nil
+	switch {
+	case m.Patch != "" && hasReplaceForm:
+		return "", "mutation declares both find/replace and patch; declare exactly one form"
+	case m.Patch == "" && !hasReplaceForm:
+		return "", "mutation declares no form; declare find + replace, or patch"
+	case m.Patch != "":
+		return "", ""
+	case m.Replace == nil:
+		return "/replace", "mutation.find without mutation.replace; set replace (an empty replace deletes the match)"
+	case m.Find == "":
+		return "/find", "mutation.replace without mutation.find; set the exact text to replace"
+	case m.Replace != nil && *m.Replace == m.Find:
+		return "/replace", "mutation.replace equals mutation.find, so the mutation changes nothing"
+	}
+	return "", ""
+}
+
+// counterfactualPackageProblem returns why tests.package is unacceptable, or ""
+// when it is a repo-relative package path. A trailing `/...` is a wildcard, not
+// a `..` segment.
+func counterfactualPackageProblem(p string) string {
+	switch {
+	case strings.HasPrefix(p, "/"):
+		return fmt.Sprintf("tests.package %q is absolute; use a repo-relative package path such as ./backend/internal/plan", p)
+	case hasDotDotSegment(p):
+		return fmt.Sprintf("tests.package %q contains a `..` segment; use a repo-relative package path such as ./backend/internal/plan", p)
+	}
+	return ""
+}
+
+// hasDotDotSegment reports whether a slash-separated path has a segment that is
+// exactly "..". A `...` package wildcard is not one.
+func hasDotDotSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// checkCounterfactualsBytes is Validate's counterfactuals leg: it decodes ONLY
+// counterfactuals from schema-valid bytes and delegates to checkCounterfactuals,
+// the same function plan.Parse runs, so the two paths cannot disagree.
+// Schema-valid bytes cannot fail this decode, so a decode failure is returned
+// as a *ParseError — fail closed, not a skip.
+func checkCounterfactualsBytes(data []byte) error {
+	var d struct {
+		Counterfactuals []Counterfactual `json:"counterfactuals"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return &ParseError{Msg: "counterfactuals check: " + err.Error(), Cause: err}
+	}
+	return checkCounterfactuals(d.Counterfactuals)
+}
+
 // Warnings returns advisory strings for a successfully-parsed Plan.
 // These are soft checks — the plan is valid but the caller may want
 // to surface the messages in review UI or logs. Emits a warning when:
@@ -764,7 +906,10 @@ func checkDeliveryBytes(data []byte) error {
 //   - counterfactual_mechanism_missing (E68.28 / #3057) — test_strategy names a
 //     control deletion and a RED outcome but states no MECHANISM, i.e. no
 //     fixture state that makes the deletion observable. One warning per
-//     offending sentence, capped.
+//     offending sentence, capped;
+//   - counterfactuals_not_executed_for_decomposition (E85.3 / #4143) — the plan
+//     declares counterfactuals AND decomposition.sub_plans; v0 delivers
+//     counterfactuals to non-child implement stages only, so none will run.
 func Warnings(p *Plan) []string {
 	var warns []string
 
@@ -820,8 +965,24 @@ func Warnings(p *Plan) []string {
 	// order is unperturbed.
 	warns = append(warns, counterfactualMechanismWarnings(strategy)...)
 
+	// E85.3 (#4143): rides after the mechanism advisory for the same reason —
+	// every earlier warning keeps its position.
+	if len(p.Counterfactuals) > 0 && p.Decomposition != nil && len(p.Decomposition.SubPlans) > 0 {
+		warns = append(warns, fmt.Sprintf(
+			"plan declares %d counterfactual(s) and decomposition.sub_plans; counterfactuals are executed only for a non-decomposed implement stage, "+
+				"so none of these will run — move each into the plan of the slice that owns its control_path (%s; advisory)",
+			len(p.Counterfactuals), RuleCounterfactualsNotExecutedForDecomposition,
+		))
+	}
+
 	return warns
 }
+
+// RuleCounterfactualsNotExecutedForDecomposition names the advisory
+// plan.Warnings rule that flags a decomposed plan declaring counterfactuals
+// (E85.3 / #4143): v0 delivers counterfactuals to non-child implement stages
+// only, so a decomposed plan's entries never execute.
+const RuleCounterfactualsNotExecutedForDecomposition = "counterfactuals_not_executed_for_decomposition"
 
 // RuleCounterfactualMechanismMissing names the advisory plan.Warnings rule that
 // flags a counterfactual claim in verification.test_strategy which states no
@@ -1061,7 +1222,8 @@ func checkAcceptanceSurfaceNone(v Verification) error {
 //
 // checkAcceptanceSurfaceNone runs inside semanticCheck, which only plan.Parse
 // reaches — and handleShipPlan validates through plan.Validate (the schema
-// plus only the delivery rule, never checkAcceptanceSurfaceNone), so
+// plus only the delivery and counterfactuals rules, never
+// checkAcceptanceSurfaceNone), so
 // without this a plan declaring verification.acceptance_surface: none beside
 // a drivable criterion is stored, reaches the gate, and approval deletes the
 // run's acceptance stage. The ship path must NOT call plan.Parse wholesale
@@ -1069,7 +1231,8 @@ func checkAcceptanceSurfaceNone(v Verification) error {
 // semanticCheck over_cap ⇒ split_proposal coupling cannot reject a monolith
 // before the count-derived gate sees it; see the cap-gate comment in
 // handleShipPlan), so this is the ONE semantic rule the ship path enforces
-// directly (the delivery rule reaches it through Validate). It decodes ONLY `verification` from the raw
+// directly (the delivery and counterfactuals rules reach it through
+// Validate). It decodes ONLY `verification` from the raw
 // bytes (no DisallowUnknownFields, no other semanticCheck rule) and delegates
 // to the same guard plan.Parse runs, so the two paths cannot disagree.
 //

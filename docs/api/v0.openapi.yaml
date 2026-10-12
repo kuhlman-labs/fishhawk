@@ -21301,6 +21301,54 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  counterfactuals:
+                    type: array
+                    description: |
+                      The approved plan's runner-executed counterfactuals
+                      (E85.3 / #4143), one entry per plan `counterfactuals`
+                      item in plan order, served ONLY on an implement stage
+                      whose run has an approved plan declaring entries, is not
+                      a decomposition child, and is not an ADR-090
+                      merge-candidate verify-only pass. Absent everywhere
+                      else. After the committed-tree verify gate passes, the
+                      runner applies each mutation in a scratch clone of the
+                      verified head, runs the named Go tests, and records one
+                      `counterfactual_observed` observation per entry in the
+                      signed trace bundle's `gate_evidence`.
+                    items:
+                      type: object
+                      required: [index, control_path, mutation_kind, replace, test_run, test_package, expect]
+                      properties:
+                        index:
+                          type: integer
+                          minimum: 0
+                          description: Position of the entry in the plan's `counterfactuals` array; every observation carries it back as the join key.
+                        control_path:
+                          type: string
+                          description: Repo-relative production file the mutation targets.
+                        mutation_kind:
+                          type: string
+                          enum: [replace, patch]
+                          description: "`replace` carries `find` + `replace`; `patch` carries `patch`."
+                        find:
+                          type: string
+                          description: Exact text to replace (replace form only).
+                        replace:
+                          type: string
+                          description: Replacement text; always present, empty for the patch form and for a replace-form deletion of the match.
+                        patch:
+                          type: string
+                          description: Unified diff confined to `control_path` (patch form only).
+                        test_run:
+                          type: string
+                          description: The `go test -run` selector.
+                        test_package:
+                          type: string
+                          description: Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`.
+                        expect:
+                          type: string
+                          enum: [red]
+                          description: The named tests must fail with the control mutated.
                   scope_constraint:
                     type: object
                     description: |
@@ -21949,6 +21997,54 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  counterfactuals:
+                    type: array
+                    description: |
+                      The approved plan's runner-executed counterfactuals
+                      (E85.3 / #4143), one entry per plan `counterfactuals`
+                      item in plan order, served ONLY on an implement stage
+                      whose run has an approved plan declaring entries, is not
+                      a decomposition child, and is not an ADR-090
+                      merge-candidate verify-only pass. Absent everywhere
+                      else. After the committed-tree verify gate passes, the
+                      runner applies each mutation in a scratch clone of the
+                      verified head, runs the named Go tests, and records one
+                      `counterfactual_observed` observation per entry in the
+                      signed trace bundle's `gate_evidence`.
+                    items:
+                      type: object
+                      required: [index, control_path, mutation_kind, replace, test_run, test_package, expect]
+                      properties:
+                        index:
+                          type: integer
+                          minimum: 0
+                          description: Position of the entry in the plan's `counterfactuals` array; every observation carries it back as the join key.
+                        control_path:
+                          type: string
+                          description: Repo-relative production file the mutation targets.
+                        mutation_kind:
+                          type: string
+                          enum: [replace, patch]
+                          description: "`replace` carries `find` + `replace`; `patch` carries `patch`."
+                        find:
+                          type: string
+                          description: Exact text to replace (replace form only).
+                        replace:
+                          type: string
+                          description: Replacement text; always present, empty for the patch form and for a replace-form deletion of the match.
+                        patch:
+                          type: string
+                          description: Unified diff confined to `control_path` (patch form only).
+                        test_run:
+                          type: string
+                          description: The `go test -run` selector.
+                        test_package:
+                          type: string
+                          description: Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`.
+                        expect:
+                          type: string
+                          enum: [red]
+                          description: The named tests must fail with the control mutated.
                   scope_constraint:
                     type: object
                     description: |

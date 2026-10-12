@@ -2124,3 +2124,68 @@ func TestExtractGateEvidence_IsolationOnlyCarriesNoVerdict(t *testing.T) {
 		t.Errorf("isolation-only evidence decoded a gate verdict: %+v", ge)
 	}
 }
+
+// TestExtractGateEvidence_CounterfactualObservationsSharedGolden is the
+// BACKEND half of the E85.3 / #4143 observation wire seam: the shared golden
+// testdata/wire/counterfactual_observation.json — the bytes the runner's
+// composeGateEvidence marshals — is itself a valid gate_evidence payload, and
+// decodes through ExtractGateEvidence into CounterfactualObservationEvidence
+// with every observed verdict preserved (the timeout stays timeout, the error
+// keeps its reason), then re-encodes to the SAME bytes (a dropped or renamed
+// field would lose bytes on the round trip).
+func TestExtractGateEvidence_CounterfactualObservationsSharedGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "counterfactual_observation.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	golden := strings.TrimSuffix(string(raw), "\n")
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, golden))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	want := []struct {
+		index             int
+		observed, reason  string
+		baseline, mutHash string
+	}{
+		{0, "green", "", "green", "5d41402abc4b2a76b9719d911017c592ae2b6c8e1f4a7d0c3b6e9f2a5d8c1b4e"},
+		{1, "red", "", "green", "9e107d9d372bb6826bd81d3542a419d6c4e7f1a0b3d6c9e2f5a8b1d4e7c0f3a6"},
+		{2, "timeout", "", "green", "e4d909c290d0fb1ca068ffaddf22cbd0b7c2e5f8a1d4c7b0e3f6a9c2d5b8e1f4"},
+		{3, "error", "build_failed", "green", "c3fcd3d76192e4007dfb496cca67e13b7d0a3c6f9e2b5d8a1c4f7e0b3d6a9c2f"},
+	}
+	obs := ge.CounterfactualObservations
+	if len(obs) != len(want) {
+		t.Fatalf("observations = %d, want %d", len(obs), len(want))
+	}
+	for i, w := range want {
+		o := obs[i]
+		if o.Index != w.index || o.Observed != w.observed || o.Reason != w.reason || o.Baseline != w.baseline || o.MutationSHA256 != w.mutHash {
+			t.Errorf("observation %d = %+v, want index %d observed %q reason %q baseline %q mutation %q",
+				i, o, w.index, w.observed, w.reason, w.baseline, w.mutHash)
+		}
+		if o.HeadSHA != "3f9a1c7e5b2d8046a1f3c9e7b5d2a8f6c4e1b9d7" || o.TreeSHA != "a7c4e1f9b6d3a0c8e5f2b9d6a3c0e7f4b1d8a5c2" || o.TimeoutSeconds != 300 || o.DurationMS == 0 {
+			t.Errorf("observation %d identity/bounds = %+v", i, o)
+		}
+	}
+	reencoded, err := json.Marshal(struct {
+		CounterfactualObservations []CounterfactualObservationEvidence `json:"counterfactual_observations"`
+	}{obs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reencoded) != golden {
+		t.Fatalf("re-encode drifted from the shared golden:\n got %s\nwant %s", reencoded, golden)
+	}
+}
+
+// TestExtractGateEvidence_NoCounterfactualObservationsIsNil: an older bundle's
+// gate_evidence (no counterfactual_observations key) decodes to a nil list.
+func TestExtractGateEvidence_NoCounterfactualObservationsIsNil(t *testing.T) {
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ge.CounterfactualObservations != nil {
+		t.Errorf("CounterfactualObservations = %+v, want nil", ge.CounterfactualObservations)
+	}
+}
