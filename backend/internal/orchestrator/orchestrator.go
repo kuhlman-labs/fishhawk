@@ -1653,10 +1653,21 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 // slice_integration_conflict audit payload. Detail is the human-display
 // message (stable "slice integration conflict: ..." prefix); the resume
 // target is the structured fields, never parsed from Detail.
+//
+// BaseSHA, ConflictingBasePaths, BaseAttribution and CompareTruncated are the
+// best-effort attribution of the conflict to base paths (ADR-096 D4 / #4294):
+// the base tip the pass integrated against, the files both the base delta and
+// the slice delta touch (sorted, never nil), how that was decided
+// (paths_overlap | no_base_overlap | unavailable:<reason>), and whether a
+// compare was truncated. They never change routing.
 type SliceConflict struct {
-	SliceIndex int
-	ChildRunID uuid.UUID
-	Detail     string
+	SliceIndex           int
+	ChildRunID           uuid.UUID
+	Detail               string
+	BaseSHA              string
+	ConflictingBasePaths []string
+	BaseAttribution      string
+	CompareTruncated     bool
 }
 
 // ErrSliceHeadMissing is the sentinel a *SliceHeadMissingError matches under
@@ -1744,6 +1755,11 @@ func (o *Orchestrator) SliceIntegrationUnavailable(parent *run.Run) string {
 // implement stage category-B recoverable); a clean run emits a
 // slices_integrated audit and returns (nil, nil).
 //
+// When the consolidated branch already exists and a succeeded slice is still
+// pending, the resolved base tip is folded in BEFORE the slice merges
+// (ADR-096 D4 / #4294, fanin_basetip.go), so the consolidated head is built on
+// the current base tip.
+//
 // Graceful-skip (nil, nil — same posture as maybeOpenConsolidatedPR /
 // fireDispatch) when GitHub/installation isn't wired or there are zero
 // succeeded children: the CLI/dev posture must never regress.
@@ -1823,12 +1839,55 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	// when absent. CreateRef's 422 "already exists" no-op makes a
 	// re-entrant settle (sweeper + event-driven race) safe.
 	consolidated := consolidatedBranch(parent.ID)
-	if _, cexists, err := o.GitHub.GetBranchSHA(ctx, scope, repo, consolidated); err != nil {
+	integrationCommitSHAs := make([]string, 0, len(succeeded)+1)
+	fold := baseFoldRecord{baseRef: base, baseSHA: baseSHA, outcome: baseFoldNotAttempted}
+	consolidatedTip, cexists, err := o.GitHub.GetBranchSHA(ctx, scope, repo, consolidated)
+	if err != nil {
 		return nil, fmt.Errorf("resolve consolidated branch %q: %w", consolidated, err)
-	} else if !cexists {
+	}
+	if !cexists {
 		if err := o.GitHub.CreateRef(ctx, scope, repo, consolidated, baseSHA); err != nil {
 			return nil, fmt.Errorf("create consolidated branch %q: %w", consolidated, err)
 		}
+		fold.outcome = baseFoldCreatedAtTip
+	} else if pending := pendingSlices(succeeded, o.integratedChildRunIDs(ctx, parent.ID)); len(pending) > 0 {
+		// Base fold (ADR-096 D4 / #4294): the branch pre-exists (an earlier
+		// wave boundary or a partial pass created it, possibly on an older
+		// base) and a slice is pending, so merge the base tip in BEFORE the
+		// pending slices — the final head is then built on the current tip.
+		// A pass with no pending slice never folds: it must not move a head
+		// the D5 merge-candidate pass may already have verified.
+		outcome, foldSHA, ferr := o.foldBaseTip(ctx, scope, repo, consolidated, base, baseSHA)
+		if ferr != nil {
+			// A non-conflict forge failure parks the parent BEFORE any slice
+			// merge; the next pass retries (every step is idempotent).
+			return nil, fmt.Errorf("fold base %s@%s into %q: %w", base, shortSHA(baseSHA), consolidated, ferr)
+		}
+		switch outcome {
+		case baseFoldMerged:
+			integrationCommitSHAs = append(integrationCommitSHAs, foldSHA)
+			o.emitBaseFoldRecorded(ctx, parent.ID, foldSHA, consolidated, base, baseSHA)
+		case baseFoldConflict:
+			// An already-integrated slice conflicts with the new base. Degrade
+			// to the pre-fold behaviour: skip the fold and integrate the
+			// pending slices on the old base; the merge-time rebase /
+			// conflict-resolution path owns it. Routing it to
+			// slice_integration_conflict would re-drive a child, which cannot
+			// remove content already merged here.
+			integrated := make([]*run.Run, 0, len(succeeded)-len(pending))
+			for _, c := range succeeded {
+				if !containsRun(pending, c) {
+					integrated = append(integrated, c)
+				}
+			}
+			fold.conflict = o.attributeFoldConflict(ctx, scope, repo, parent.ID, consolidatedTip, baseSHA, integrated, o.sliceScopeFiles(ctx, parent.ID))
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: base fold conflicted; integrating pending slices on the existing consolidated base",
+				slog.String("parent_run_id", parent.ID.String()),
+				slog.String("consolidated_branch", consolidated),
+				slog.String("base_sha", baseSHA),
+				slog.String("base_attribution", fold.conflict.attribution))
+		}
+		fold.outcome = outcome
 	}
 
 	// Merge each succeeded slice in ascending order. A 204 (already merged)
@@ -1837,7 +1896,6 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	// them for the ADR-035 lineage guard (#1459); a 204 returns "" and is
 	// skipped — the SHA was recorded on the original 201 pass.
 	childIDs := make([]string, 0, len(succeeded))
-	integrationCommitSHAs := make([]string, 0, len(succeeded))
 	for _, c := range succeeded {
 		head := sliceBranch(parent.ID, *c.SliceIndex)
 		msg := fmt.Sprintf("Integrate slice %d (run %s) into %s", *c.SliceIndex, shortRunID(c.ID), consolidated)
@@ -1856,13 +1914,23 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 				o.emitIntegrationCommitRecorded(ctx, parent.ID, mergeSHA, *c.SliceIndex, c.ID.String(), consolidated)
 			}
 		case errors.Is(err, forge.ErrMergeConflict):
-			detail := fmt.Sprintf("slice integration conflict: slice %d (child run %s) could not merge onto %s",
-				*c.SliceIndex, c.ID, consolidated)
+			// Best-effort attribution to base paths (ADR-096 D4); it never
+			// changes routing — the conflict still names this slice.
+			attr := o.attributeSliceConflict(ctx, scope, repo, baseSHA, head, o.sliceScopeFiles(ctx, parent.ID)[*c.SliceIndex])
 			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: slice integration conflict",
 				slog.String("parent_run_id", parent.ID.String()),
 				slog.String("conflicting_child_run_id", c.ID.String()),
-				slog.Int("conflicting_slice_index", *c.SliceIndex))
-			return &SliceConflict{SliceIndex: *c.SliceIndex, ChildRunID: c.ID, Detail: detail}, nil
+				slog.Int("conflicting_slice_index", *c.SliceIndex),
+				slog.String("base_attribution", attr.attribution))
+			return &SliceConflict{
+				SliceIndex:           *c.SliceIndex,
+				ChildRunID:           c.ID,
+				Detail:               sliceConflictDetail(*c.SliceIndex, c.ID, consolidated, attr.paths),
+				BaseSHA:              baseSHA,
+				ConflictingBasePaths: attr.paths,
+				BaseAttribution:      attr.attribution,
+				CompareTruncated:     attr.compareTruncated,
+			}, nil
 		case errors.Is(err, forge.ErrNotFound) && o.sliceHeadAbsent(ctx, scope, repo, head):
 			// #4079: the merge endpoint 404s when the base OR the head is
 			// missing. The consolidated base was created or confirmed just
@@ -1882,7 +1950,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		}
 	}
 
-	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated, integrationCommitSHAs)
+	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated, integrationCommitSHAs, fold)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated decomposed slices",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("consolidated_branch", consolidated),
@@ -1972,18 +2040,31 @@ func SliceBranch(parentID uuid.UUID, sliceIndex int) string {
 // at a later report boundary (#1459). The existing child_run_ids /
 // consolidated_branch / slice_count fields are unchanged so downstream
 // consumers (children_status, consolidatedBranchFromAudit) are unaffected.
-func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string, integrationCommitSHAs []string) {
+//
+// fold adds the ADR-096 D4 (#4294) base fields additively: base_ref, base_sha,
+// base_fold_outcome (created_at_tip | merged | already_contained | conflict |
+// not_attempted) and, on a conflict outcome, base_fold_conflict with the
+// attributed slice and base paths. A merged fold's SHA leads
+// integration_commit_shas.
+func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string, integrationCommitSHAs []string, fold baseFoldRecord) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping slices_integrated entry",
 			slog.String("parent_run_id", parentRunID.String()))
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"child_run_ids":           childIDs,
 		"consolidated_branch":     consolidatedBranch,
 		"slice_count":             len(childIDs),
 		"integration_commit_shas": integrationCommitSHAs,
-	})
+		"base_ref":                fold.baseRef,
+		"base_sha":                fold.baseSHA,
+		"base_fold_outcome":       fold.outcome,
+	}
+	if fold.conflict != nil {
+		fields["base_fold_conflict"] = fold.conflict.payload()
+	}
+	payload, err := json.Marshal(fields)
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal slices_integrated payload failed",
 			slog.String("error", err.Error()))
@@ -2050,16 +2131,28 @@ func (o *Orchestrator) emitIntegrationCommitRecorded(ctx context.Context, parent
 // conflicting_slice_index + conflicting_child_run_id — so the next_actions
 // arm sources the resume target from this entry rather than parsing the
 // stage's free-form failure reason. Best-effort.
+//
+// base_sha, conflicting_base_paths (always an array), base_attribution and
+// compare_truncated carry the best-effort base attribution (ADR-096 D4 /
+// #4294); they are informational and never the resume target.
 func (o *Orchestrator) emitSliceIntegrationConflict(ctx context.Context, parentRunID, stageID uuid.UUID, conflict *SliceConflict) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping slice_integration_conflict entry",
 			slog.String("parent_run_id", parentRunID.String()))
 		return
 	}
+	basePaths := conflict.ConflictingBasePaths
+	if basePaths == nil {
+		basePaths = []string{}
+	}
 	payload, err := json.Marshal(map[string]any{
 		"parent_stage_id":          stageID.String(),
 		"conflicting_slice_index":  conflict.SliceIndex,
 		"conflicting_child_run_id": conflict.ChildRunID.String(),
+		"base_sha":                 conflict.BaseSHA,
+		"conflicting_base_paths":   basePaths,
+		"base_attribution":         conflict.BaseAttribution,
+		"compare_truncated":        conflict.CompareTruncated,
 	})
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal slice_integration_conflict payload failed",
