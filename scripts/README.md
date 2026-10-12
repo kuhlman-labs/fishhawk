@@ -340,6 +340,74 @@ list exits 1 with a printed reason. That is not the patch gate
 red-lining verify (it never does); it is the test loop being unable to
 run at all, which must never read as green.
 
+### Flake-absorption attest ([#4229](https://github.com/kuhlman-labs/fishhawk/issues/4229))
+
+The runner's outside-only flake absorption (`runner/cmd/fishhawk-runner/README.md`)
+needs two facts about a FAILED full-form verify that only `scripts/test`
+can vouch for: did the change's lines pass patch coverage, and did every
+failed module fail in TESTS. `scripts/test` reports them on one line,
+gated by a per-invocation nonce.
+
+**Nonce.** The runner sets a fresh 128-bit `FISHHAWK_VERIFY_ABSORB_NONCE`
+(32 lowercase hex) on each full-form verify. At the very top of
+`scripts/test`, before any child process runs, the value is captured
+into the shell-local `VERIFY_ABSORB_NONCE` and the exported variable is
+`unset`, so no child (lint, the gate harnesses, a `go test` binary)
+inherits it and test output cannot forge the line. An ambient exported
+`VERIFY_ABSORB_NONCE` is unset first, because assigning to an exported
+name keeps the export. A value of the wrong shape is discarded with a
+one-line note, and no attest is printed. This runs on the
+`FISHHAWK_TEST_LIB_ONLY` source path too.
+
+**Nonce mode.** Only with a valid nonce, `cmd_test_with_patch_coverage`
+also tees each module's `go test` output (stderr folded; `pipefail`
+keeps go test's status) to a per-ordinal log under a `_covlog_mktemp`
+dir. It also records each instrumented module's EXPECTED profile path.
+A failed mktemp degrades every failed module's class to `unclassified`
+and never stops the loop. Without a nonce the loop is unchanged.
+
+**The line.** On a FAILED loop only, `_emit_absorb_attest` prints exactly
+one line on stderr, BEFORE the failed-module summary, then the summary
+and `exit 1` run as before:
+
+```
+fishhawk-verify-absorb-attest <nonce> patch_coverage=<pass|fail|unavailable> failed_modules=<mod>:<class>,... changed_dirs=<dir>,...
+```
+
+The shared golden `testdata/wire/verify_absorb_attest.txt` is the
+cross-boundary contract. `scripts/test-patch-coverage` (h3) reproduces
+it byte-for-byte from a real `go test` run, and the runner's parser
+reads the same file.
+
+| Field | Values | Rule |
+|---|---|---|
+| `patch_coverage` | `unavailable` | no module was instrumented, or any expected profile is missing, empty or lacks go's `mode:` header (check-coverage.py's denominator rule would otherwise silently DROP that module's lines and report a pass), or check-coverage.py printed any `SKIP:` line other than the `--diff-min-statements` floor (it exits 0 on a skip, so its stderr is captured to a FILE and scanned) |
+| | `fail` | `_verify_patch_coverage` exited non-zero: below the threshold, or a fail-closed integrity branch (snapshot digest mismatch, profiles deleted) |
+| | `pass` | `_verify_patch_coverage` exited 0 with no non-floor `SKIP:` |
+| `failed_modules` | `<mod>:build` | the module's log carries go's `[build failed]` or `[setup failed]` marker |
+| | `<mod>:other` | no `FAIL<TAB>` package line at all: a module-level error (go.mod, toolchain) where no package ran |
+| | `<mod>:tests` | otherwise |
+| | `<mod>:unclassified` | no log (the nonce-mode log dir could not be created) |
+| | `undecodable` | any failed module name the encoding cannot carry |
+| `changed_dirs` | `<dir>,...` | the repo-relative dirs of the changed NON-TEST packages, from `_patch_cov_changed_modules`: "outside" is decided from the DIFF, not the plan scope |
+| | `undecodable` | the whole-module `./...` fallback (an undecodable changed path), a pattern that is not `.` or `./<dir>`, a dir the encoding cannot carry, or an empty set |
+
+Module and dir names are normalised (no leading `./`, no trailing `/`).
+A name carrying whitespace, a control character, `,`, `:` or `=` cannot
+be carried. The runner must treat every `unavailable`, `undecodable`
+and non-`tests` class as a refusal; a literal dir or module named
+`undecodable` is therefore refused too, which is the fail-closed
+direction.
+
+`patch_coverage` comes from the failed run's own profiles and adds no
+test run. On go1.25.6 `go test -coverprofile` still writes the merged
+profile when a package in the module FAILED, including the failed
+binary's own blocks, so the verdict can OVER-count rather than
+under-count. The full ADR-090 merge-candidate verify is the backstop.
+No attest is printed by the plain `cmd_test` path (no changed non-test
+Go package, or a coverage-loop degrade), by the scoped form, or by a
+passing loop. The runner reads its absence as unavailable.
+
 ### Fail-open contract
 
 Every shell-side git/go/jq call runs in a TESTED context (`if !`,
@@ -405,7 +473,9 @@ gate subprocess env is a default-deny allow-list
 (`runner/cmd/fishhawk-runner/gateenv.go` admits only PATH/HOME/locale
 essentials plus the `GO*`/`CGO_*`/`LC_*` prefixes), so no `FISHHAWK_*`
 var reaches `scripts/test verify` in-loop and an agent cannot switch the
-gate off.
+gate off. The runner's own injected `FISHHAWK_VERIFY_ABSORB_NONCE`
+(#4229) cannot switch it off either: it only adds the attest line to a
+loop that has already failed (§ "Flake-absorption attest").
 
 ### Testing
 
@@ -554,10 +624,12 @@ failed:` plus one `  - <module>` line per failure, printed by the shared
 `_report_failed_modules`), then `exit 1`. M counts the modules the loop
 RAN, so a scoped loop's skipped modules are not counted. A passing run
 costs exactly what it did; a failing one now also runs the remaining
-modules. Only `coverage` CLASSIFIES each failure as BUILD vs TEST. In the
-full verify a failed patch-coverage loop exits BEFORE
-`_verify_patch_coverage`: the verdict is already red, a failed module's
-profile is partial, and the summary stays the last thing printed. The
+modules. Only `coverage` CLASSIFIES each failure as BUILD vs TEST, plus
+the verify loop in nonce mode (§ "Flake-absorption attest", #4229). In
+the full verify a failed patch-coverage loop exits BEFORE
+`_verify_patch_coverage` gates anything: the verdict is already red and
+the summary stays the last thing printed. In nonce mode the attest line
+(which reads the surviving profiles) is printed just before it. The
 fail-closed paths are unchanged (`NO_MODULES_MSG` on an unavailable or
 empty module list, the scoped loop's ran-nothing refusal, the #2124
 snapshot emit/digest ordering ahead of the loop), as is every

@@ -794,6 +794,23 @@ func TestVerifyEnvDenied_VerifyControlVariables(t *testing.T) {
 	}
 }
 
+// TestVerifyEnvDenied_AbsorbNonce pins the #4229 flake-absorption nonce deny
+// entry BY NAME: an ambient value must never reach a verify child.
+func TestVerifyEnvDenied_AbsorbNonce(t *testing.T) {
+	const k = "FISHHAWK_VERIFY_ABSORB_NONCE"
+	if !verifyEnvDenied(k) {
+		t.Errorf("verifyEnvDenied(%q) = false — the absorb-nonce deny entry is missing from the CLI copy", k)
+	}
+	if verifyEnvAllowed(k) {
+		t.Errorf("verifyEnvAllowed(%q) = true — the allow-list was widened to admit the absorb nonce", k)
+	}
+	for _, kv := range sanitizeVerifyEnv([]string{k + "=0123456789abcdef0123456789abcdef", "PATH=/usr/bin"}) {
+		if strings.HasPrefix(kv, k+"=") {
+			t.Errorf("sanitizeVerifyEnv admitted the ambient absorb nonce: %q", kv)
+		}
+	}
+}
+
 // TestVerifyEnvDenied_RunAgentMarker pins the run-agent marker (#3945) BY NAME
 // on the CLI side, in the TestVerifyEnvDenied_VerifyControlVariables style: the
 // deny predicate, the allow predicate and the sanitize-drop are asserted

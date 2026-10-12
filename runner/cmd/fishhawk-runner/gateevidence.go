@@ -145,6 +145,77 @@ type gateEvidencePayload struct {
 	// CLAIM), every entry here is the runner's own execution record. Absent
 	// (the byte-identical default) when the stage executed no counterfactual.
 	CounterfactualObservations []counterfactualObservationEvidence `json:"counterfactual_observations,omitempty"`
+	// FlakeAbsorbed records an outside-only verify flake absorbed at the
+	// verify-fix loop's terminal failure (#4229): the tree passed on one
+	// scoped re-run of the untouched failing packages, NOT on the full test
+	// loop. Folded from the LAST verify_flake_absorbed event, every string
+	// pre-redacted. Absent (the byte-identical default) when nothing was
+	// absorbed. The json tag MUST stay identical to the backend's
+	// bundle.GateEvidence.FlakeAbsorbed, which feeds the verify_flake_absorbed
+	// audit row.
+	FlakeAbsorbed *flakeAbsorbedEvidence `json:"flake_absorbed,omitempty"`
+}
+
+// verifyFlakeAbsorbedEvent is the trace event kind the verify-fix loop emits
+// when it absorbs an outside-only flake at exhaustion (#4229), and the kind
+// composeGateEvidence folds into gate_evidence.flake_absorbed.
+const verifyFlakeAbsorbedEvent = "verify_flake_absorbed"
+
+// flakeAbsorbedEvidence is the FLAT record of one absorbed outside-only verify
+// flake (#4229). Iteration is the verify-fix iteration that absorbed it;
+// TreeSHA the tree whose full verify failed and whose scoped re-run passed (the
+// verified tree); Packages the failing import paths and PackageDirs their
+// repo-relative dirs (the scoped re-run's --packages set); Tests the failing
+// test names the full run's output named; FailedModules the modules
+// scripts/test's attest named as failed; PatchCoverage the attest's
+// patch-coverage verdict over the failed full run's profiles.
+//
+// Tests are names parsed from go test output, so every string is redacted
+// before it reaches the signed bundle (composeGateEvidence).
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// FlakeAbsorbedEvidence, paired ModeExact in backend/internal/wirecontract and
+// pinned from both modules by testdata/wire/verify_flake_absorbed_evidence.json.
+type flakeAbsorbedEvidence struct {
+	Iteration     int      `json:"iteration"`
+	TreeSHA       string   `json:"tree_sha"`
+	Packages      []string `json:"packages"`
+	PackageDirs   []string `json:"package_dirs"`
+	Tests         []string `json:"tests"`
+	FailedModules []string `json:"failed_modules"`
+	PatchCoverage string   `json:"patch_coverage"`
+}
+
+// flakeAbsorbedEvent builds the verify_flake_absorbed trace event. Its payload
+// IS the evidence struct, so the emitter and composeGateEvidence's fold share
+// one shape.
+func flakeAbsorbedEvent(ev flakeAbsorbedEvidence) agent.Event {
+	return agent.Event{
+		Kind:    verifyFlakeAbsorbedEvent,
+		Payload: agent.MakePayload(ev),
+	}
+}
+
+// redactFlakeAbsorbed returns ev with every string field and list entry run
+// through redactEvidenceText.
+func redactFlakeAbsorbed(ev flakeAbsorbedEvidence) flakeAbsorbedEvidence {
+	list := func(in []string) []string {
+		if in == nil {
+			return nil
+		}
+		out := make([]string, len(in))
+		for i, s := range in {
+			out[i] = redactEvidenceText(s)
+		}
+		return out
+	}
+	ev.TreeSHA = redactEvidenceText(ev.TreeSHA)
+	ev.Packages = list(ev.Packages)
+	ev.PackageDirs = list(ev.PackageDirs)
+	ev.Tests = list(ev.Tests)
+	ev.FailedModules = list(ev.FailedModules)
+	ev.PatchCoverage = redactEvidenceText(ev.PatchCoverage)
+	return ev
 }
 
 // counterfactualObservationEvidence is the FLAT record of one executed
@@ -617,6 +688,16 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, records .
 			}
 		case "verify_infra_flake_retry":
 			payload.FlakeRetries++
+		case verifyFlakeAbsorbedEvent:
+			// Last-write-wins. Not a gate on its own: the absorbing loop
+			// always emits verify_run + verify_summary beside it, so it
+			// is deliberately absent from the gateRan kinds above.
+			var w flakeAbsorbedEvidence
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			fa := redactFlakeAbsorbed(w)
+			payload.FlakeAbsorbed = &fa
 		case "policy_event":
 			var w struct {
 				Check                 string              `json:"check"`

@@ -204,13 +204,15 @@ Both values are injected **after** sanitization, through `runBoundedGateArgv`'s 
 
 Consequences, all deliberate:
 
-- the **#960 verified tree is the FULL form's** — captured only after the full run passed — so the tree that gets pushed is always the fully-verified one. A green-scoped / red-full iteration returns *no* verified tree at all;
+- the **#960 verified tree is the FULL form's** — captured only after the full run passed — so the tree that gets pushed is the fully-verified one — with the ONE #4229 exception below. A green-scoped / red-full iteration returns *no* verified tree at all;
 - a green-scoped / red-full pair is an **ordinary iteration failure**: with budget remaining the agent is re-invoked with the FULL output; with the budget exhausted the stage demotes to category A exactly as before #3315. A break in a package the scope did not name is still caught **before push**, never deferred to CI;
 - both absorbs (the #972/#2645 infra-flake retry, the #3316 auto-format absorb) evaluate whichever form produced the failure, because the outcome and output have been replaced;
 - an **EMPTY** package set skips the pre-pass entirely, so a non-Go change pays exactly one full verify per iteration — what it paid before;
 - a tolerant infra `skipped` outcome does **not** trigger the full re-verify: it is not a pass, and re-running the full form over gate plumbing that just failed buys nothing.
 
 `runVerifyGateCommitted` (the `max_iterations == 0` single-shot gate) and the #960 strict pre-push re-verify are **always full-form** and never carry the packages variable.
+
+**The one exception: outside-only flake absorption ([#4229](https://github.com/kuhlman-labs/fishhawk/issues/4229)).** By maintainer ruling, a tree whose FULL verify failed at the fix budget's terminal failure ONLY in packages outside the change (outside the plan scope AND the diff's changed packages), with `scripts/test`'s nonce-gated attest reporting passing patch coverage and test-class module failures, becomes the verified tree after ONE passing scoped re-run of those packages. That tree has NOT passed the full test loop; every touched package passed in the failed full run, and the full ADR-090 merge-candidate verify still runs before merge. Contract, refusal reasons and residuals: `cmd/fishhawk-runner/README.md` § "Outside-only flake absorption at exhaustion".
 
 **Cost, honestly.** An iteration whose scoped form passes pays scoped + full instead of one full, and because the scoped form keeps lint, the doc-line budget, schema-sync, the gate harnesses and both site gates unchanged, those legs are paid twice. The trade is deliberate: iterations 2..N of a fix loop — which is where the long stages come from — pay only the scoped cost. Measured intervals are in the #3315 PR notes. The natural follow-up, deliberately not done here, is letting the scoped form skip the legs the full form will repeat; that would remove the agent's fastest lint feedback.
 
