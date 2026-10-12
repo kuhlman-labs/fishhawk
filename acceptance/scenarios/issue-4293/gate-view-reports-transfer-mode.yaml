@@ -1,0 +1,14 @@
+id: scenario:issue-4293/gate-view-reports-transfer-mode
+statement: GET /v0/runs/{run_id}/gate-view returns 200 and its body carries a merge_candidate_verdict block whose transfer_mode is `shadow` under fishhawkd's default configuration, with shadow and false_transfers arrays present (empty on a run with no base advance).
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/gate-view on any run in the preview; read merge_candidate_verdict.transfer_mode and the two arrays.'
+steps: 'POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} gave run c60ced0a-3d31-4dd4-99dc-eca64a45a2b0; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over ''{}'' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature; GET /v0/runs/{run}/gate-view with the bearer. Cross-check: POST /mcp tools/call fishhawk_get_gate_view {run_id}'
+assertions:
+    expected: 200, transfer_mode shadow, with empty shadow and false_transfers arrays
+    observed_at_record: 200; merge_candidate_verdict = {"transfer_mode":"shadow","shadow":[],"false_transfers":[]}; the MCP tool returned the identical block
+    repro_handle: GET /v0/runs/{run}/gate-view
+origin:
+    issue: 4293
+    pr: 0
+    run_id: e16e6c42-9ef2-4113-bceb-3bbfbf579d8e
+    head_sha: 841a69c45ef1369b7b4dbfc4ef7d7a220d57c13f
+    recorded_at: 2026-10-12T17:03:54Z
