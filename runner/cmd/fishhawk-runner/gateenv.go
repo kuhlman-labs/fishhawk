@@ -163,6 +163,14 @@ var gateEnvAllowPrefix = []string{"CGO_", "LC_"}
 // agent, can never reach the verify gate, where scripts/test-is-run-agent and
 // TestIsRunAgentMatchesAcceptanceTreePath run and where a reached marker would
 // flip their "operator" cases once scripts/is-run-agent reads it (#3947).
+//
+// verifyAbsorbNonceEnvVar (FISHHAWK_VERIFY_ABSORB_NONCE, #4229) is the
+// per-invocation nonce that gates scripts/test's flake-absorption attest. The
+// runner injects it through extraEnv on the deciding full-form verify only;
+// this entry (redundant with default-deny, like the three above) keeps an
+// ambient value from ever reaching a scoped verify, the absorb re-run, or any
+// other gate child, where a known value would let printed output forge the
+// attest.
 var gateEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN": {},
 	"FISHHAWK_GITLAB_TOKEN": {},
@@ -175,6 +183,7 @@ var gateEnvDeny = map[string]struct{}{
 	verifyLockOwnerEnvVar:   {},
 	verifyLockPathEnvVar:    {},
 	agent.RunAgentEnvVar:    {},
+	verifyAbsorbNonceEnvVar: {},
 }
 
 // gateEnvDenyPrefix lists key prefixes dropped unconditionally — the
