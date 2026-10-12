@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -261,12 +263,13 @@ func TestMergeCandidateVerify_RedactsAndBoundsTail(t *testing.T) {
 	}
 }
 
-// TestMergeCandidateTail_RedactsBeforeTheCut: a secret straddling the bound is
-// redacted on the whole output first, so no half of it survives the cut.
-func TestMergeCandidateTail_RedactsBeforeTheCut(t *testing.T) {
+// TestMergeCandidateEvidence_RedactsBeforeTheCut: a secret straddling the
+// tail bound is redacted on the whole output first, so no half of it survives
+// the cut.
+func TestMergeCandidateEvidence_RedactsBeforeTheCut(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("Z9y8X7w6V5", 4)[:36]
 	pad := strings.Repeat("x", upload.MaxMergeCandidateOutputTailBytes-20)
-	got := mergeCandidateTail(secret + pad)
+	got := mergeCandidateEvidence(secret+pad, mergeCandidateFailed).tail
 	if strings.Contains(got, secret[18:]) {
 		t.Errorf("the surviving half of a cut secret shipped: %q", got[:40])
 	}
@@ -446,5 +449,189 @@ func TestRun_MergeCandidateVerifyRoutesBeforeLineage(t *testing.T) {
 	}
 	if lines := logLines(stderr.String(), "merge_candidate_verify_reported"); len(lines) != 1 {
 		t.Errorf("merge_candidate_verify_reported lines = %d, want 1", len(lines))
+	}
+}
+
+// --- #4250: failure evidence from the WHOLE output ---
+
+// withMCVVerifyOutput stubs the verify seam to return out with the given
+// gate outcome.
+func withMCVVerifyOutput(t *testing.T, out, outcome string) {
+	t.Helper()
+	orig := mergeCandidateVerifyFn
+	mergeCandidateVerifyFn = func(context.Context, string, string, string, time.Duration, []string) (agent.Event, string, string, gateDisposition) {
+		return agent.Event{}, out, outcome, gateExecuted
+	}
+	t.Cleanup(func() { mergeCandidateVerifyFn = orig })
+}
+
+// mcvEarlyFailOutput is shaped like `scripts/test verify`: an EARLY module's
+// FAIL block, then ~100 KB of later-module ok lines, then the module summary.
+func mcvEarlyFailOutput(assertion string) string {
+	var b strings.Builder
+	b.WriteString(">>> ./backend\n")
+	b.WriteString("--- FAIL: TestEarlyThing (0.01s)\n")
+	b.WriteString("    " + assertion + "\n")
+	b.WriteString("FAIL\n")
+	b.WriteString("FAIL\tgithub.com/x/backend/internal/early\t0.5s\n")
+	for b.Len() < 100*1024 {
+		b.WriteString("ok  \tgithub.com/x/runner/internal/later\t0.1s\n")
+	}
+	b.WriteString("scripts/test: 1 of 8 modules failed:\n  - ./backend\n")
+	return b.String()
+}
+
+// TestMergeCandidateVerify_FailuresNameEarlyFailureUnderLateOkLines is the
+// #4250 done-means: an early module's FAIL scrolls out of the 4 KiB tail, and
+// the SINGLE shipped report still names the failing test, its assertion line
+// and its package in MergeCandidateFailures, and in the parsed summary.
+func TestMergeCandidateVerify_FailuresNameEarlyFailureUnderLateOkLines(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	withMCVVerifyOutput(t, mcvEarlyFailOutput("early_test.go:42: want 1, got 2"), "failed")
+	_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"})
+	if ship.MergeCandidateResult != mergeCandidateFailed {
+		t.Fatalf("result = %q (%s), want failed", ship.MergeCandidateResult, ship.MergeCandidateReason)
+	}
+	// Precondition: the fixture reproduces the incident.
+	if strings.Contains(ship.MergeCandidateOutputTail, "TestEarlyThing") ||
+		!strings.HasSuffix(ship.MergeCandidateOutputTail, "  - ./backend\n") {
+		t.Fatalf("precondition: the 4 KiB tail must exclude the early FAIL and end with the module summary")
+	}
+	for _, want := range []string{"--- FAIL: TestEarlyThing", "early_test.go:42: want 1, got 2", "FAIL\tgithub.com/x/backend/internal/early"} {
+		if !strings.Contains(ship.MergeCandidateFailures, want) {
+			t.Errorf("MergeCandidateFailures missing %q:\n%s", want, ship.MergeCandidateFailures)
+		}
+	}
+	if n := len(ship.MergeCandidateFailures); n > upload.MaxMergeCandidateFailuresBytes {
+		t.Errorf("MergeCandidateFailures = %d bytes, over %d", n, upload.MaxMergeCandidateFailuresBytes)
+	}
+	want := &upload.MergeCandidateFailureSummary{
+		Packages: []string{"github.com/x/backend/internal/early"}, Tests: []string{"TestEarlyThing"},
+	}
+	if !reflect.DeepEqual(ship.MergeCandidateFailureSummary, want) {
+		t.Errorf("summary = %+v, want %+v", ship.MergeCandidateFailureSummary, want)
+	}
+}
+
+// TestMergeCandidateVerify_BuildFailedKeepsCompilerError is approval condition
+// C1: a package fails `[build failed]` and its multi-line compiler error sits
+// FAR above the FAIL line (parallel builds); the shipped excerpt retains the
+// compiler error lines and the summary lists the package as build-failed.
+func TestMergeCandidateVerify_BuildFailedKeepsCompilerError(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	compile1 := "internal/early/early.go:12:2: undefined: frobnicate"
+	compile2 := "internal/early/early.go:13:9: cannot use x (variable of type int) as string value in return statement"
+	out := ">>> ./backend\n" +
+		"# github.com/x/backend/internal/early\n" + compile1 + "\n" + compile2 + "\n" +
+		strings.Repeat("ok  \tgithub.com/x/backend/internal/other\t0.1s\n", 200) +
+		"FAIL\tgithub.com/x/backend/internal/early [build failed]\n" +
+		strings.Repeat("ok  \tgithub.com/x/runner/internal/later\t0.1s\n", 200) +
+		"scripts/test: 1 of 8 modules failed:\n  - ./backend\n"
+	withMCVVerifyOutput(t, out, "failed")
+	_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"})
+	for _, want := range []string{compile1, compile2, "FAIL\tgithub.com/x/backend/internal/early [build failed]"} {
+		if !strings.Contains(ship.MergeCandidateFailures, want) {
+			t.Errorf("MergeCandidateFailures missing %q:\n%s", want, ship.MergeCandidateFailures)
+		}
+	}
+	if s := ship.MergeCandidateFailureSummary; s == nil || !reflect.DeepEqual(s.BuildFailed, []string{"github.com/x/backend/internal/early"}) {
+		t.Errorf("summary = %+v, want build_failed naming the package", s)
+	}
+}
+
+// TestMergeCandidateVerify_FailuresPerMode: a passed pass ships no failure
+// evidence even when its output carries a FAIL-shaped line; a failed pass
+// whose output has no signal line ships none either, with the tail unchanged.
+func TestMergeCandidateVerify_FailuresPerMode(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	req := mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}
+
+	t.Run("passed ships none", func(t *testing.T) {
+		withMCVVerifyOutput(t, "--- FAIL: TestLooksRed (0.00s)\nFAIL\tm/x\t0.1s\nok\n", "passed")
+		_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd), req)
+		if ship.MergeCandidateResult != mergeCandidatePassed {
+			t.Fatalf("result = %q", ship.MergeCandidateResult)
+		}
+		if ship.MergeCandidateFailures != "" || ship.MergeCandidateFailureSummary != nil {
+			t.Errorf("a passed pass shipped failure evidence: %q / %+v", ship.MergeCandidateFailures, ship.MergeCandidateFailureSummary)
+		}
+	})
+	t.Run("failed without a signal line ships none", func(t *testing.T) {
+		out := "scripts/test: schema-sync drift: backend/internal/spec/schemas/workflow-v2.schema.json differs\n"
+		withMCVVerifyOutput(t, out, "failed")
+		_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd), req)
+		if ship.MergeCandidateResult != mergeCandidateFailed {
+			t.Fatalf("result = %q", ship.MergeCandidateResult)
+		}
+		if ship.MergeCandidateFailures != "" || ship.MergeCandidateFailureSummary != nil {
+			t.Errorf("no-signal failure shipped evidence: %q / %+v", ship.MergeCandidateFailures, ship.MergeCandidateFailureSummary)
+		}
+		if ship.MergeCandidateOutputTail != out {
+			t.Errorf("tail = %q, want the whole short output", ship.MergeCandidateOutputTail)
+		}
+	})
+}
+
+// TestMergeCandidateVerify_FailuresAreRedacted: a token on the assertion line —
+// inside the excerpt's context window — never ships in MergeCandidateFailures
+// or the summary; only redaction-before-extraction removes it.
+func TestMergeCandidateVerify_FailuresAreRedacted(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	secret := "ghp_" + strings.Repeat("M1n2B3v4C5", 4)[:36]
+	withMCVVerifyOutput(t, mcvEarlyFailOutput("early_test.go:42: token="+secret+" rejected"), "failed")
+	_, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"})
+	if !strings.Contains(ship.MergeCandidateFailures, "early_test.go:42: token=") {
+		t.Fatalf("precondition: the assertion line must be inside the excerpt:\n%s", ship.MergeCandidateFailures)
+	}
+	if strings.Contains(ship.MergeCandidateFailures, secret) {
+		t.Errorf("the shipped failures excerpt carries the secret")
+	}
+}
+
+// TestMergeCandidateEvidence_SummaryTestsAreRedacted: a token carried in a
+// `t.Run` subtest NAME lands in the summary's Tests list, so the summary must be
+// parsed over the REDACTED output, never the raw one.
+func TestMergeCandidateEvidence_SummaryTestsAreRedacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("K1j2H3g4F5", 4)[:36]
+	out := "--- FAIL: TestLogin/" + secret + " (0.00s)\n    login_test.go:7: rejected\n" +
+		"FAIL\tgithub.com/x/backend/internal/login\t0.1s\n"
+	if red, _ := redactString(out); strings.Contains(red, secret) {
+		t.Fatalf("precondition: the default redaction patterns must match the fixture token")
+	}
+	ev := mergeCandidateEvidence(out, mergeCandidateFailed)
+	if ev.summary == nil || len(ev.summary.Tests) != 1 || !strings.HasPrefix(ev.summary.Tests[0], "TestLogin/") {
+		t.Fatalf("precondition: the summary must name the subtest, got %+v", ev.summary)
+	}
+	for _, name := range ev.summary.Tests {
+		if strings.Contains(name, secret) {
+			t.Errorf("summary test name %q carries the raw token", name)
+		}
+	}
+}
+
+// TestMergeCandidateEvidence_SummarySurvivesTheBudget is approval condition
+// C2: when the failure blocks overrun the 8 KiB excerpt, a LATER failing
+// package is omitted from the excerpt but still named by the summary, which is
+// parsed over the WHOLE redacted output.
+func TestMergeCandidateEvidence_SummarySurvivesTheBudget(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "--- FAIL: TestBulk%03d/%s (0.00s)\n    bulk_test.go:%d: want ok\n", i, strings.Repeat("case_", 20), i)
+	}
+	b.WriteString("FAIL\tgithub.com/x/backend/internal/bulk\t0.5s\n")
+	b.WriteString("FAIL\tgithub.com/x/runner/internal/late\t0.2s\n")
+	ev := mergeCandidateEvidence(b.String(), mergeCandidateFailed)
+	if strings.Contains(ev.failures, "internal/late") {
+		t.Fatalf("precondition: the late package must be past the excerpt budget")
+	}
+	if !strings.Contains(ev.failures, "omitted over the") {
+		t.Errorf("an overrun excerpt must end with the omitted marker")
+	}
+	if ev.summary == nil || !reflect.DeepEqual(ev.summary.Packages,
+		[]string{"github.com/x/backend/internal/bulk", "github.com/x/runner/internal/late"}) || !ev.summary.Lossy {
+		t.Errorf("summary = %+v, want both packages named and lossy (200 tests > the 10-entry cap)", ev.summary)
 	}
 }
