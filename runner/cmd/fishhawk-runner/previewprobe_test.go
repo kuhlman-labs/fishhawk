@@ -537,10 +537,40 @@ func TestAcceptanceTargetGate_TeardownFailureLoggedNonFatal(t *testing.T) {
 	if teardown == nil {
 		t.Fatal("teardown must be returned")
 	}
-	teardown()
+	if o := teardown(); o != previewReleaseFailed {
+		t.Errorf("teardown outcome = %q, want %q", o, previewReleaseFailed)
+	}
 	if !strings.Contains(log.String(), `"event":"acceptance_preview_teardown_failed"`) ||
 		!strings.Contains(log.String(), "teardown-went-wrong") {
 		t.Errorf("missing acceptance_preview_teardown_failed with output tail: %s", log.String())
+	}
+}
+
+// TestAcceptanceTargetGate_TeardownIsIdempotent (#4308): the caller both
+// releases the preview synchronously after the agent exits AND keeps the
+// deferred fallback, so the returned closure must fork the teardown command
+// at most once and report the same outcome on every call.
+func TestAcceptanceTargetGate_TeardownIsIdempotent(t *testing.T) {
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	gcfg := fastGateConfig()
+	gcfg.provisionCmd = "true"
+	marker := markerPath(t)
+	gcfg.teardownCmd = "echo torn >> " + marker
+	var log strings.Builder
+	teardown, reason, detail := acceptanceTargetGate(context.Background(), gcfg, []string{hostOf(ts)}, testExpectedSHA, "run-1", &log)
+	if reason != "" {
+		t.Fatalf("reason = %q (%s), want proceed", reason, detail)
+	}
+	first, second := teardown(), teardown()
+	if first != previewReleaseOK || second != previewReleaseOK {
+		t.Errorf("outcomes = %q, %q; want %q both times", first, second, previewReleaseOK)
+	}
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("teardown did not run: %v", err)
+	}
+	if n := strings.Count(string(b), "torn\n"); n != 1 {
+		t.Errorf("teardown command ran %d times across two calls, want 1", n)
 	}
 }
 
@@ -567,7 +597,9 @@ func TestAcceptanceTargetGate_TeardownRunsAfterContextCancel(t *testing.T) {
 		t.Fatal("teardown must be returned")
 	}
 	cancel() // the stage is cancelled BEFORE the deferred teardown fires
-	teardown()
+	if o := teardown(); o != previewReleaseOK {
+		t.Errorf("teardown outcome = %q, want %q", o, previewReleaseOK)
+	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("teardown did not run after the runner ctx was cancelled (marker missing: %v); log:\n%s", err, log.String())
 	}
@@ -594,7 +626,9 @@ func TestAcceptanceTargetGate_TeardownStillBoundedByTimeout(t *testing.T) {
 		t.Fatalf("reason = %q (%s), want proceed", reason, detail)
 	}
 	cancel()
-	teardown()
+	if o := teardown(); o != previewReleaseTimedOut {
+		t.Errorf("teardown outcome = %q, want %q", o, previewReleaseTimedOut)
+	}
 	if !strings.Contains(log.String(), `"event":"acceptance_preview_teardown_failed"`) ||
 		!strings.Contains(log.String(), "timed out after") {
 		t.Errorf("missing acceptance_preview_teardown_failed{timed out after}: %s", log.String())
