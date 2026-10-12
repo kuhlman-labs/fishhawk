@@ -11,15 +11,18 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -73,6 +76,81 @@ func cfEvidence(t *testing.T, obs ...json.RawMessage) string {
 	return string(b)
 }
 
+// cfObservationAt returns golden observation 0 re-keyed to index i with the
+// given observed value (and no reason) — a well-formed observation the
+// closed-vocabulary rules admit.
+func cfObservationAt(t *testing.T, i int, observed string) json.RawMessage {
+	t.Helper()
+	return cfObservationEdit(t, func(o *bundle.CounterfactualObservationEvidence) {
+		o.Index, o.Observed, o.Reason = i, observed, ""
+	})
+}
+
+// cfObservationEdit returns golden observation 0 with edit applied.
+func cfObservationEdit(t *testing.T, edit func(*bundle.CounterfactualObservationEvidence)) json.RawMessage {
+	t.Helper()
+	var o bundle.CounterfactualObservationEvidence
+	if err := json.Unmarshal(cfGoldenObservations(t)[0], &o); err != nil {
+		t.Fatalf("decode golden observation: %v", err)
+	}
+	edit(&o)
+	b, err := json.Marshal(o)
+	if err != nil {
+		t.Fatalf("marshal observation: %v", err)
+	}
+	return b
+}
+
+// cfSeedPlanArtifact stores a standard_v1 plan artifact on planStageID
+// declaring n counterfactuals — all the ingest's membership read needs.
+func cfSeedPlanArtifact(t *testing.T, arts artifact.Repository, planStageID uuid.UUID, n int) {
+	t.Helper()
+	cfs := make([]map[string]any, n)
+	for i := range cfs {
+		cfs[i] = map[string]any{
+			"control_path": "a/b.go",
+			"mutation":     map[string]any{"find": "x", "replace": "y"},
+			"tests":        map[string]any{"run": "^TestX$", "package": "./a"},
+			"expect":       "red",
+		}
+	}
+	content, err := json.Marshal(map[string]any{"counterfactuals": cfs})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	v := "standard_v1"
+	if _, err := arts.Create(context.Background(), artifact.CreateParams{
+		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &v,
+		Content: content, ContentHash: sha256Hex(content),
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+}
+
+// cfPlanRunRepo is the run-store half of the ingest's approved-plan read for
+// direct recorder calls: ListStagesForRun names one plan stage (or none, or
+// fails) and GetRun ends the parent walk. Nothing else is reachable from
+// recordCounterfactualObservations.
+type cfPlanRunRepo struct {
+	run.Repository
+	planStageID uuid.UUID
+	listErr     error
+}
+
+func (r *cfPlanRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	if r.planStageID == uuid.Nil {
+		return nil, nil
+	}
+	return []*run.Stage{{ID: r.planStageID, RunID: runID, Type: run.StageTypePlan}}, nil
+}
+
+func (r *cfPlanRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	return &run.Run{ID: id}, nil
+}
+
 // cfBundle packs a raw trace bundle whose gate_evidence carries obs.
 func cfBundle(t *testing.T, obs ...json.RawMessage) []byte {
 	t.Helper()
@@ -121,9 +199,10 @@ func newCFTraceServer(t *testing.T) (*Server, *signingFake, *auditFake, *fakeCon
 
 // TestCounterfactualObserved_PGTraceToGateViewAndWaive is the CROSS-BOUNDARY
 // test: a raw trace bundle carrying the shared golden's four observations
-// travels the REAL handleShipTrace (registered route, signature verified) into
-// REAL Postgres audit + concern stores, then out through the gate view and the
-// waive handler. It asserts on STORED rows: four system-actor, stage-anchored
+// (plus a green one at index 4, which the stored approved plan does not
+// declare) travels the REAL handleShipTrace (registered route, signature
+// verified) into REAL Postgres audit + concern + artifact stores, then out
+// through the gate view and the waive handler. It asserts on STORED rows: four system-actor, stage-anchored
 // counterfactual_observed rows preserving each observed value, and exactly one
 // control_unpinned concern whose stored provenance is server_check and whose
 // origin sequence is the green row's chain sequence.
@@ -131,6 +210,8 @@ func newCFTraceServer(t *testing.T) (*Server, *signingFake, *auditFake, *fakeCon
 // COUNTERFACTUALS: (1) delete the recordCounterfactualObservations call in
 // trace.go → zero rows → RED. (2) delete the `obs.Observed == green` guard →
 // the red, timeout and error observations also mint concerns (4, not 1) → RED.
+// (2b) make declaredCounterfactualCount return known=false → the undeclared
+// green at index 4 is recorded and raises → 5 rows, 2 concerns → RED.
 // (3) delete the Provenance stamp in raiseControlUnpinnedConcern → the run-bound
 // mcp:run: token (which passes ordinary waive auth on its OWN run) waives the
 // row: the read-back state is waived, not raised → RED.
@@ -140,14 +221,16 @@ func TestCounterfactualObserved_PGTraceToGateViewAndWaive(t *testing.T) {
 	runs := run.NewPostgresRepository(pool)
 	au := audit.NewPostgresRepository(pool)
 	cr := concern.NewPostgresRepository(pool)
+	arts := artifact.NewPostgresRepository(pool)
 	sf := newSigningFake()
 	s := New(Config{
-		Addr:        "127.0.0.1:0",
-		RunRepo:     runs,
-		AuditRepo:   au,
-		ConcernRepo: cr,
-		SigningRepo: sf,
-		TraceStore:  newTraceStoreFake(),
+		Addr:         "127.0.0.1:0",
+		RunRepo:      runs,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+		ArtifactRepo: arts,
+		SigningRepo:  sf,
+		TraceStore:   newTraceStoreFake(),
 	})
 	rn, err := runs.CreateRun(ctx, run.CreateRunParams{
 		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: run.TriggerCLI,
@@ -155,15 +238,25 @@ func TestCounterfactualObserved_PGTraceToGateViewAndWaive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	// The approved plan the ingest reads index membership from: it declares
+	// the golden's four counterfactuals, so index 4 below is undeclared.
+	planStage, err := runs.CreateStage(ctx, run.CreateStageParams{
+		RunID: rn.ID, Sequence: 1, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create plan stage: %v", err)
+	}
+	cfSeedPlanArtifact(t, arts, planStage.ID, 4)
 	st, err := runs.CreateStage(ctx, run.CreateStageParams{
-		RunID: rn.ID, Sequence: 1, Type: run.StageTypeImplement,
+		RunID: rn.ID, Sequence: 2, Type: run.StageTypeImplement,
 		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
 	})
 	if err != nil {
 		t.Fatalf("create stage: %v", err)
 	}
 	priv, _ := sf.issue(t, rn.ID)
-	body := cfBundle(t, cfGoldenObservations(t)...)
+	body := cfBundle(t, append(cfGoldenObservations(t), cfObservationAt(t, 4, "green"))...)
 
 	if w := shipRequest(t, s, rn.ID, st.ID, "raw", priv, body, ""); w.Code != http.StatusAccepted {
 		t.Fatalf("ship status = %d, want 202:\n%s", w.Code, w.Body.String())
@@ -175,7 +268,7 @@ func TestCounterfactualObserved_PGTraceToGateViewAndWaive(t *testing.T) {
 		t.Fatalf("list counterfactual_observed: %v", err)
 	}
 	if len(entries) != 4 {
-		t.Fatalf("stored counterfactual_observed rows = %d, want 4", len(entries))
+		t.Fatalf("stored counterfactual_observed rows = %d, want 4 (the undeclared index 4 is rejected against the stored plan)", len(entries))
 	}
 	var greenSeq int64
 	wantObserved := []string{"green", "red", "timeout", "error"}
@@ -435,7 +528,8 @@ func TestCounterfactualObserved_NonGreenRaisesNothing(t *testing.T) {
 // (stage_id, content_hash, index) skip → 8 rows → RED), and a second bundle
 // with a different content hash re-observing the same green records its rows
 // but raises no second concern (COUNTERFACTUAL: delete the check_key dedup → 2
-// concerns → RED). Another stage's green is a distinct concern.
+// concerns → RED). Another stage's green is a distinct concern, and one bundle
+// repeating an index records it once.
 func TestCounterfactualObserved_RePostAndReobservationDeduplicated(t *testing.T) {
 	s, sf, au, cr := newCFTraceServer(t)
 	runID, stageID := uuid.New(), uuid.New()
@@ -470,6 +564,19 @@ func TestCounterfactualObserved_RePostAndReobservationDeduplicated(t *testing.T)
 	}
 	if n := len(controlUnpinnedRows(t, cr, runID)); n != 2 {
 		t.Fatalf("concerns after another stage's green = %d, want 2 (dedup is stage-scoped)", n)
+	}
+
+	// One raw bundle repeating an index records it ONCE (concern 46e2c40c):
+	// the bundle's index is the join key. COUNTERFACTUAL: delete
+	// `recorded[obs.Index] = true` after the append → both copies append (8
+	// rows, not 7) → RED. The repeated observation is red, so the check_key
+	// concern dedup cannot mask the second append.
+	before := len(cfRows(au))
+	if w := shipRequest(t, s, runID, uuid.New(), "raw", priv, cfBundle(t, obs[1], obs[1]), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("repeated-index bundle status = %d", w.Code)
+	}
+	if n := len(cfRows(au)) - before; n != 1 {
+		t.Fatalf("rows from one bundle repeating index 1 = %d, want 1 (intra-bundle dedup)", n)
 	}
 }
 
@@ -614,6 +721,207 @@ func TestCounterfactualObserved_NilStoresAreSafe(t *testing.T) {
 	s.cfg.AuditRepo = nil
 	// Must not panic.
 	s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", cfBundle(t, cfGoldenObservations(t)[0]))
+}
+
+// --- ingest admission (fix-up A) ---------------------------------------------
+
+// TestCounterfactualOutcomes_MatchSharedFixture pins the backend's closed
+// vocabulary against testdata/wire/counterfactual_outcomes.json, which the
+// runner's tests pin its cfOutcome* / cfReason* constants against too.
+// COUNTERFACTUAL: add or drop a value in counterfactualObservedValues,
+// counterfactualBaselineValues or counterfactualReasonValues → RED.
+func TestCounterfactualOutcomes_MatchSharedFixture(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "counterfactual_outcomes.json"))
+	if err != nil {
+		t.Fatalf("read shared fixture: %v", err)
+	}
+	var f struct {
+		Observed []string `json:"observed"`
+		Baseline []string `json:"baseline"`
+		Reason   []string `json:"reason"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+	for name, pair := range map[string][2][]string{
+		"observed": {f.Observed, counterfactualObservedValues},
+		"baseline": {f.Baseline, counterfactualBaselineValues},
+		"reason":   {f.Reason, counterfactualReasonValues},
+	} {
+		if len(pair[0]) == 0 || !slices.Equal(pair[0], pair[1]) {
+			t.Errorf("%s vocabulary = %v, shared fixture = %v", name, pair[1], pair[0])
+		}
+	}
+}
+
+// cfAdmitCase records one bundle of [valid, bad] observations through the
+// recorder on a minimal-config server (index membership unknown, so only the
+// rule under test can refuse bad) and returns the stored rows plus the
+// admission's rejections for the same input.
+func cfAdmitCase(t *testing.T, bad json.RawMessage) ([]audit.ChainAppendParams, []error) {
+	t.Helper()
+	s, _, au, _ := newCFTraceServer(t)
+	valid := cfGoldenObservations(t)[1]
+	s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", cfBundle(t, valid, bad))
+	var decoded []bundle.CounterfactualObservationEvidence
+	for _, raw := range []json.RawMessage{valid, bad} {
+		var o bundle.CounterfactualObservationEvidence
+		if err := json.Unmarshal(raw, &o); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		decoded = append(decoded, o)
+	}
+	_, rejected := admitCounterfactualObservations(decoded, 0, false)
+	return cfRows(au), rejected
+}
+
+// cfWantRejected asserts exactly the valid observation was stored and the bad
+// one was refused with want.
+func cfWantRejected(t *testing.T, rows []audit.ChainAppendParams, rejected []error, want error) {
+	t.Helper()
+	if len(rows) != 1 {
+		t.Fatalf("stored rows = %d, want 1 (only the valid observation)", len(rows))
+	}
+	if len(rejected) != 1 || !errors.Is(rejected[0], want) {
+		t.Fatalf("rejections = %v, want exactly one wrapping %q", rejected, want)
+	}
+}
+
+// TestCounterfactualObserved_UnknownObservedRejected. COUNTERFACTUAL: delete
+// the counterfactualObservedValues case in admitCounterfactualObservations →
+// "purple" is stored (2 rows) and nothing is rejected → RED.
+func TestCounterfactualObserved_UnknownObservedRejected(t *testing.T) {
+	rows, rejected := cfAdmitCase(t, cfObservationEdit(t, func(o *bundle.CounterfactualObservationEvidence) { o.Index, o.Observed = 2, "purple" }))
+	cfWantRejected(t, rows, rejected, errCounterfactualObservedUnknown)
+}
+
+// TestCounterfactualObserved_UnknownBaselineRejected. COUNTERFACTUAL: delete
+// the counterfactualBaselineValues case → "maybe" is stored → RED.
+func TestCounterfactualObserved_UnknownBaselineRejected(t *testing.T) {
+	rows, rejected := cfAdmitCase(t, cfObservationEdit(t, func(o *bundle.CounterfactualObservationEvidence) { o.Index, o.Baseline = 2, "maybe" }))
+	cfWantRejected(t, rows, rejected, errCounterfactualBaselineUnknown)
+}
+
+// TestCounterfactualObserved_UnknownReasonRejected. COUNTERFACTUAL: delete the
+// counterfactualReasonValues case → "made_up" is stored → RED. An EMPTY reason
+// (red and green carry none) stays admitted: the valid observation has one.
+func TestCounterfactualObserved_UnknownReasonRejected(t *testing.T) {
+	rows, rejected := cfAdmitCase(t, cfObservationEdit(t, func(o *bundle.CounterfactualObservationEvidence) {
+		o.Index, o.Observed, o.Reason = 2, "error", "made_up"
+	}))
+	cfWantRejected(t, rows, rejected, errCounterfactualReasonUnknown)
+}
+
+// TestCounterfactualObserved_RejectedReasonQuoteTruncated: a 4 KiB unknown
+// reason is quoted in its rejection error cut to 1 KiB plus the marker, so a
+// hostile reason cannot balloon the WARN log. COUNTERFACTUAL: make
+// quoteCounterfactualValue return v unchanged → the error carries the whole
+// 4 KiB and no marker → RED.
+func TestCounterfactualObserved_RejectedReasonQuoteTruncated(t *testing.T) {
+	long := strings.Repeat("é", 2048) // 4096 bytes of two-byte runes
+	_, rejected := admitCounterfactualObservations([]bundle.CounterfactualObservationEvidence{{
+		Index: 0, Baseline: "green", Observed: "error", Reason: long,
+	}}, 0, false)
+	if len(rejected) != 1 || !errors.Is(rejected[0], errCounterfactualReasonUnknown) {
+		t.Fatalf("rejections = %v, want one errCounterfactualReasonUnknown", rejected)
+	}
+	msg := rejected[0].Error()
+	if !strings.Contains(msg, counterfactualTruncatedMarker) || strings.Contains(msg, long) {
+		t.Fatalf("rejection quotes the reason untruncated (%d bytes): %.120s…", len(msg), msg)
+	}
+	if got := quoteCounterfactualValue(long); len(got) > counterfactualReasonQuoteMaxBytes+len(counterfactualTruncatedMarker) || !utf8.ValidString(got) {
+		t.Fatalf("quoted reason = %d bytes (valid UTF-8 %v), want ≤ %d + marker", len(got), utf8.ValidString(got), counterfactualReasonQuoteMaxBytes)
+	}
+	if got := quoteCounterfactualValue("build_failed"); got != "build_failed" {
+		t.Fatalf("a short value is quoted as %q, want it verbatim", got)
+	}
+}
+
+// TestCounterfactualObserved_CountCapped: a bundle of nine distinct-index
+// observations records the first plan.MaxCounterfactuals (8) and refuses the
+// tail with errCounterfactualTooMany. Minimal config, so no plan membership
+// read can mask the cap. COUNTERFACTUAL: delete the `len(obs) >
+// plan.MaxCounterfactuals` block → 9 rows → RED.
+func TestCounterfactualObserved_CountCapped(t *testing.T) {
+	s, _, au, _ := newCFTraceServer(t)
+	var raws []json.RawMessage
+	var decoded []bundle.CounterfactualObservationEvidence
+	for i := range plan.MaxCounterfactuals + 1 {
+		raw := cfObservationAt(t, i, "red")
+		raws = append(raws, raw)
+		var o bundle.CounterfactualObservationEvidence
+		_ = json.Unmarshal(raw, &o)
+		decoded = append(decoded, o)
+	}
+	s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", cfBundle(t, raws...))
+	if n := len(cfRows(au)); n != plan.MaxCounterfactuals {
+		t.Fatalf("rows = %d, want %d (the cap)", n, plan.MaxCounterfactuals)
+	}
+	admitted, rejected := admitCounterfactualObservations(decoded, 0, false)
+	if len(admitted) != plan.MaxCounterfactuals || len(rejected) != 1 || !errors.Is(rejected[0], errCounterfactualTooMany) {
+		t.Fatalf("admitted %d, rejected %v; want %d and one errCounterfactualTooMany", len(admitted), rejected, plan.MaxCounterfactuals)
+	}
+}
+
+// TestCounterfactualObserved_IndexMustBeDeclared reads membership from the
+// run's approved plan (declaring 2): indexes 0 and 1 are recorded, 3 is
+// refused; a wired run with NO approved plan declares none; a failed plan read
+// records nothing. COUNTERFACTUALS: delete the `known && o.Index >= declared`
+// clause → index 3 is stored (3 rows) → RED; make a nil plan return known=false
+// → the no-plan arm stores rows → RED; on the read error, fall through instead
+// of returning → the error arm stores rows → RED.
+func TestCounterfactualObserved_IndexMustBeDeclared(t *testing.T) {
+	newServer := func(t *testing.T, rr *cfPlanRunRepo, declared int) (*Server, *auditFake) {
+		t.Helper()
+		s, _, au, _ := newCFTraceServer(t)
+		arts := newFakeArtifactRepo()
+		if rr.planStageID != uuid.Nil {
+			cfSeedPlanArtifact(t, arts, rr.planStageID, declared)
+		}
+		s.cfg.RunRepo, s.cfg.ArtifactRepo = rr, arts
+		return s, au
+	}
+	body := cfBundle(t, cfObservationAt(t, 0, "red"), cfObservationAt(t, 1, "red"), cfObservationAt(t, 3, "green"))
+
+	t.Run("declared", func(t *testing.T) {
+		s, au := newServer(t, &cfPlanRunRepo{planStageID: uuid.New()}, 2)
+		s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", body)
+		rows := cfRows(au)
+		if len(rows) != 2 {
+			t.Fatalf("rows = %d, want 2 (index 3 is undeclared)", len(rows))
+		}
+		for _, r := range rows {
+			var p counterfactualObservedPayload
+			_ = json.Unmarshal(r.Payload, &p)
+			if p.Index > 1 {
+				t.Fatalf("stored undeclared index %d", p.Index)
+			}
+		}
+		_, rejected := admitCounterfactualObservations([]bundle.CounterfactualObservationEvidence{{Index: 3, Baseline: "green", Observed: "green"}}, 2, true)
+		if len(rejected) != 1 || !errors.Is(rejected[0], errCounterfactualIndexUndeclared) {
+			t.Fatalf("rejections = %v, want errCounterfactualIndexUndeclared", rejected)
+		}
+	})
+	t.Run("no approved plan", func(t *testing.T) {
+		s, au := newServer(t, &cfPlanRunRepo{}, 0)
+		s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", body)
+		if n := len(cfRows(au)); n != 0 {
+			t.Fatalf("rows = %d, want 0 (a run with no approved plan declares no counterfactual)", n)
+		}
+	})
+	t.Run("plan read error", func(t *testing.T) {
+		s, au := newServer(t, &cfPlanRunRepo{planStageID: uuid.New(), listErr: errors.New("run store outage")}, 2)
+		s.recordCounterfactualObservations(context.Background(), uuid.New(), uuid.New(), "h", body)
+		if n := len(cfRows(au)); n != 0 {
+			t.Fatalf("rows = %d, want 0 (an undecidable membership records nothing)", n)
+		}
+	})
+	t.Run("negative index without a plan read", func(t *testing.T) {
+		_, rejected := admitCounterfactualObservations([]bundle.CounterfactualObservationEvidence{{Index: -1, Baseline: "green", Observed: "red"}}, 0, false)
+		if len(rejected) != 1 || !errors.Is(rejected[0], errCounterfactualIndexUndeclared) {
+			t.Fatalf("rejections = %v, want errCounterfactualIndexUndeclared for index -1", rejected)
+		}
+	})
 }
 
 func TestControlUnpinnedNote(t *testing.T) {

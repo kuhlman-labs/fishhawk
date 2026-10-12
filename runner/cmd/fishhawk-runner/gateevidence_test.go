@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1293,6 +1294,128 @@ func TestRun_DeclaredGateContainerReachesGateEvidence(t *testing.T) {
 	}
 }
 
+// TestRun_PlanCounterfactualReachesGateEvidence (fix-up B, concern bfd4c997)
+// drives the REAL run() for an implement pass and a fix-up pass: one delivered
+// spec (mutate mod/reg.go's seeding so TestGet fails), a passing committed-tree
+// verify gate (VerifyCommand "true"), and the RAW bundle shipped to the backend
+// must carry gate_evidence.counterfactual_observations[0] observed RED — not
+// error/no_verified_tree — at the committed-tree gate's verified head. The
+// phase runs BEFORE the push (its observations ride the signed bundle), so the
+// pushed commit's SHA does not exist yet; what binds the observation to the
+// push is that its head IS the gate's verify_run head and its tree IS the tree
+// the push commits (the scope files over HEAD, captured at CommitAndPush).
+// COUNTERFACTUALS: delete the runPlanCounterfactuals call in run() → no
+// member → RED; pass "" for verifiedTreeSHA → error/no_verified_tree → RED.
+// Not t.Parallel: it uses t.Setenv.
+func TestRun_PlanCounterfactualReachesGateEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fixup bool
+	}{{"implement", false}, {"fixup", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{gateImageEnvVar, deploymentProfileEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+				t.Setenv(k, "")
+			}
+			t.Setenv(gateIsolationModeEnvVar, "clone")
+			repo := verifyFixBaseRepo(t)
+			mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+			mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+			withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}})
+			implementEnv(t, "kuhlman-labs/fishhawk", "main")
+			fu := newFakeUploader(t)
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:       verifyFixStageID,
+				StageType:     "implement",
+				Prompt:        "implement",
+				PromptHash:    "h",
+				VerifyCommand: "true",
+				ScopeFiles:    []upload.ScopeFile{{Path: "mod/reg.go", Operation: "create"}, {Path: "mod/reg_test.go", Operation: "create"}},
+				Counterfactuals: []upload.CounterfactualSpec{{
+					Index: 0, ControlPath: "mod/reg.go", MutationKind: upload.CounterfactualMutationReplace,
+					Find: `registry["x"] = 42`, Replace: `registry["x"] = 41`,
+					TestRun: "^TestGet$", TestPackage: "./mod", Expect: "red",
+				}},
+			}
+			const fixupBranch = "fishhawk/run-11111111/stage-22222222"
+			if tc.fixup {
+				fu.promptResp.Fixup = true
+				fu.promptResp.FixupBranch = fixupBranch
+			}
+			withFakeUploader(t, fu)
+			var pushedTree string
+			fp := &fakePusher{onCommit: func(args gitops.CommitAndPushArgs) {
+				pushedTree = scopeTreeOverHead(t, args.RepoDir, "mod/reg.go", "mod/reg_test.go")
+			}}
+			withFakeGitOps(t, fp, &fakePROpener{})
+
+			bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+			var stderr strings.Builder
+			if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+			}
+			if fp.gotArgs == nil || pushedTree == "" {
+				t.Fatalf("CommitAndPush was not reached:\n%s", stderr.String())
+			}
+			if tc.fixup && fp.gotArgs.Branch != fixupBranch {
+				t.Fatalf("pushed branch = %q, want the fix-up branch %q (the fix-up path was not taken)", fp.gotArgs.Branch, fixupBranch)
+			}
+			var rawBundle []byte
+			for _, c := range fu.gotShipCalls {
+				if c.Variant == "raw" {
+					rawBundle = c.Bundle
+				}
+			}
+			if rawBundle == nil {
+				t.Fatalf("no raw bundle shipped:\n%s", stderr.String())
+			}
+			p, raw := gateEvidencePayloadFromBundle(t, rawBundle)
+			if len(p.CounterfactualObservations) != 1 {
+				t.Fatalf("counterfactual_observations = %d, want 1:\n%s", len(p.CounterfactualObservations), raw)
+			}
+			o := p.CounterfactualObservations[0]
+			if o.Observed != cfOutcomeRed || o.Reason != "" || o.Baseline != cfOutcomeGreen {
+				t.Fatalf("observation = %s/%s (baseline %s), want red with a green baseline", o.Observed, o.Reason, o.Baseline)
+			}
+			_, events, _, err := openBundleForTest(rawBundle)
+			if err != nil {
+				t.Fatalf("open bundle: %v", err)
+			}
+			if gateHead := lastBundleVerifyRunHead(t, events); o.HeadSHA == "" || o.HeadSHA != gateHead {
+				t.Fatalf("observation head = %q, want the committed-tree gate's verify_run head %q", o.HeadSHA, gateHead)
+			}
+			if o.TreeSHA != pushedTree {
+				t.Fatalf("observation tree = %q, want the pushed tree %q", o.TreeSHA, pushedTree)
+			}
+			if got := strings.TrimSpace(gitIn(t, repo, nil, "rev-parse", o.HeadSHA+"^{tree}")); got != pushedTree {
+				t.Fatalf("observation head %s carries tree %s, want the pushed tree %s", o.HeadSHA, got, pushedTree)
+			}
+		})
+	}
+}
+
+// scopeTreeOverHead is the tree a scope-only commit of paths over HEAD would
+// carry — what CommitAndPush pushes — computed in a throwaway index so the
+// checkout under test is not touched.
+func scopeTreeOverHead(t *testing.T, repo string, paths ...string) string {
+	t.Helper()
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(t.TempDir(), "index")}
+	gitIn(t, repo, env, "read-tree", "HEAD")
+	gitIn(t, repo, env, append([]string{"add", "--"}, paths...)...)
+	return strings.TrimSpace(gitIn(t, repo, env, "write-tree"))
+}
+
+func gitIn(t *testing.T, dir string, env []string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return string(out)
+}
+
 // counterfactualGoldenObservations are the four fixed observations the SHARED
 // golden testdata/wire/counterfactual_observation.json pins (E85.3 / #4143):
 // one green, one red, one timeout and one error/build_failed, all off the same
@@ -1381,7 +1504,7 @@ func TestCounterfactualObservedEvent_CarriesRunStageAndObservation(t *testing.T)
 }
 
 // TestComposeGateEvidence_CounterfactualObservationsCapped: 20 observations
-// compose to the first gateEvidenceCounterfactualCap (16), in spec order, so
+// compose to the first gateEvidenceCounterfactualCap (8), in spec order, so
 // an over-long slice cannot grow the signed bundle's evidence without bound.
 func TestComposeGateEvidence_CounterfactualObservationsCapped(t *testing.T) {
 	obs := make([]counterfactualObservationEvidence, 20)
@@ -1390,8 +1513,8 @@ func TestComposeGateEvidence_CounterfactualObservationsCapped(t *testing.T) {
 			Baseline: "green", Observed: "red", TimeoutSeconds: 300}
 	}
 	p := decodeEvidence(t, composeGateEvidence(nil, 1, runnerCounterfactualObservations(obs)))
-	if len(p.CounterfactualObservations) != gateEvidenceCounterfactualCap || gateEvidenceCounterfactualCap != 16 {
-		t.Fatalf("observations = %d (cap %d), want 16", len(p.CounterfactualObservations), gateEvidenceCounterfactualCap)
+	if len(p.CounterfactualObservations) != gateEvidenceCounterfactualCap || gateEvidenceCounterfactualCap != 8 {
+		t.Fatalf("observations = %d (cap %d), want 8", len(p.CounterfactualObservations), gateEvidenceCounterfactualCap)
 	}
 	for i, o := range p.CounterfactualObservations {
 		if o.Index != i {
@@ -1412,7 +1535,7 @@ func TestComposeGateEvidence_CounterfactualOnlyStreamIsEvidence(t *testing.T) {
 }
 
 // TestCounterfactualObservations_StreamEventCannotShadow: the member comes ONLY
-// from the runner's own observations (the gate_isolation precedent). Sixteen
+// from the runner's own observations (the gate_isolation precedent). Eight
 // forged counterfactual_observed events AHEAD of the runner's own — enough to
 // fill the cap if the stream were folded — neither displace the genuine GREEN
 // observation nor appear beside it, a forged event alone supplies no member,

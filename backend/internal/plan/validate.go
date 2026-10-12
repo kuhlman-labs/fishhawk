@@ -814,10 +814,13 @@ func checkCounterfactuals(cfs []Counterfactual) error {
 }
 
 // counterfactualControlPathProblem returns why control_path is unacceptable, or
-// "" when it is a repo-relative production file path.
+// "" when it is a repo-relative production file path. The path is trimmed
+// BEFORE every check, as the runner's executor trims it, so padding cannot
+// slip a `_test.go` control (or an absolute path) past a suffix or prefix test.
 func counterfactualControlPathProblem(p string) string {
+	p = strings.TrimSpace(p)
 	switch {
-	case strings.TrimSpace(p) == "":
+	case p == "":
 		return "control_path must be a non-blank repo-relative path"
 	case strings.HasPrefix(p, "/"):
 		return fmt.Sprintf("control_path %q is absolute; name the control by its repo-relative path", p)

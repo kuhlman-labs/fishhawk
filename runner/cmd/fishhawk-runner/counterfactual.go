@@ -145,6 +145,16 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 	if len(specs) == 0 {
 		return nil, nil
 	}
+	// The plan and the backend ingest both cap counterfactuals at
+	// gateEvidenceCounterfactualCap (8); a longer delivery is never executed
+	// past it, so the phase cannot spend budget on observations nothing keeps.
+	if len(specs) > gateEvidenceCounterfactualCap {
+		logEvent(logSink, "counterfactual_specs_truncated", map[string]string{
+			"run_id": cfg.runID, "stage_id": cfg.stageID,
+			"delivered": fmt.Sprint(len(specs)), "executed": fmt.Sprint(gateEvidenceCounterfactualCap),
+		})
+		specs = specs[:gateEvidenceCounterfactualCap]
+	}
 	head, tree := lastVerifyRunHead(events)
 	if verifiedTreeSHA == "" || tree != verifiedTreeSHA {
 		head, tree = "", ""
@@ -229,6 +239,10 @@ func (x *counterfactualExecutor) baseObservation(s upload.CounterfactualSpec, he
 // file and lint cache. The caller restores clone afterwards.
 func (x *counterfactualExecutor) executeCounterfactual(ctx context.Context, clone, scratch, headSHA, treeSHA string, s upload.CounterfactualSpec) counterfactualObservationEvidence {
 	start := x.now()
+	// Trim control_path ONCE, before every check below (validation, the C2
+	// walk, C6, the patch confinement and the mutation itself), as the
+	// backend's plan validation does.
+	s.ControlPath = strings.TrimSpace(s.ControlPath)
 	o := x.baseObservation(s, headSHA, treeSHA)
 	finish := func(observed, reason string) counterfactualObservationEvidence {
 		o.Observed, o.Reason = observed, reason
@@ -279,10 +293,12 @@ func (x *counterfactualExecutor) executeCounterfactual(ctx context.Context, clon
 
 // validCounterfactualSpec re-validates a delivered spec (the backend validated
 // the plan, but the runner never trusts the wire): a contained relative
-// control path, exactly one well-formed mutation form, a non-blank selector
-// and package, and expect == red.
+// control path (trimmed first, so padding cannot hide a `_test.go` suffix),
+// exactly one well-formed mutation form, a non-blank selector and package,
+// and expect == red.
 func validCounterfactualSpec(s upload.CounterfactualSpec) bool {
-	if !containedRelPath(s.ControlPath) || strings.HasSuffix(s.ControlPath, "_test.go") {
+	control := strings.TrimSpace(s.ControlPath)
+	if !containedRelPath(control) || strings.HasSuffix(control, "_test.go") {
 		return false
 	}
 	if strings.TrimSpace(s.TestRun) == "" || strings.TrimSpace(s.TestPackage) == "" || s.Expect != "red" {
@@ -311,11 +327,26 @@ func containedRelPath(p string) bool {
 	return true
 }
 
-// containedControlFile is binding condition C2: it Lstats EVERY component of
-// rel under clone, refusing any symlink component, a non-directory
-// intermediate, or a non-regular leaf, and then requires the EvalSymlinks
-// result to stay inside the clone. It returns the absolute control path.
+// containedControlFile is binding condition C2, two independent layers: the
+// component walk (lstatControlComponents) and the resolved-path containment
+// (controlResolvesInsideClone). Either refusing refuses. It returns the
+// absolute control path.
 func containedControlFile(clone, rel string) (string, error) {
+	abs, err := lstatControlComponents(clone, rel)
+	if err != nil {
+		return "", err
+	}
+	if err := controlResolvesInsideClone(clone, abs); err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
+// lstatControlComponents Lstats EVERY component of rel under clone, refusing
+// any symlink component (even one resolving inside the clone), a
+// non-directory intermediate, or a non-regular leaf. It returns the absolute
+// (lexical) control path.
+func lstatControlComponents(clone, rel string) (string, error) {
 	parts := strings.Split(filepath.Clean(filepath.FromSlash(rel)), string(filepath.Separator))
 	cur := clone
 	for i, p := range parts {
@@ -338,19 +369,26 @@ func containedControlFile(clone, rel string) (string, error) {
 			return "", fmt.Errorf("control path %q is not a regular file", rel)
 		}
 	}
+	return cur, nil
+}
+
+// controlResolvesInsideClone requires abs's EvalSymlinks result to stay
+// inside clone's (so a clone root reached through a symlink, as /var ->
+// /private/var is on macOS, still matches).
+func controlResolvesInsideClone(clone, abs string) error {
 	realClone, err := filepath.EvalSymlinks(clone)
 	if err != nil {
-		return "", err
+		return err
 	}
-	real, err := filepath.EvalSymlinks(cur)
+	real, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return "", err
+		return err
 	}
 	r, err := filepath.Rel(realClone, real)
 	if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) || filepath.IsAbs(r) {
-		return "", fmt.Errorf("control path %q resolves outside the clone", rel)
+		return fmt.Errorf("control path %q resolves outside the clone", abs)
 	}
-	return cur, nil
+	return nil
 }
 
 // resolveCounterfactualPackage maps tests.package onto a run directory and a

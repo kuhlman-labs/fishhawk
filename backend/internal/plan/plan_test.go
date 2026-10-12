@@ -3324,6 +3324,11 @@ func TestValidate_Counterfactuals_SemanticRules(t *testing.T) {
 		{"dotdot control_path", set("control_path", "backend/../../x.go"), "/counterfactuals/0/control_path", "`..` segment"},
 		{"backslash control_path", set("control_path", `backend\internal\plan\validate.go`), "/counterfactuals/0/control_path", "backslash"},
 		{"test-file control_path", set("control_path", "backend/internal/plan/plan_test.go"), "/counterfactuals/0/control_path", "names a test file"},
+		// Trimmed before every check (fix-up E): with the TrimSpace in
+		// counterfactualControlPathProblem deleted, the trailing space defeats
+		// the `_test.go` suffix test and no other rule fires, so both calls
+		// return nil.
+		{"padded test-file control_path", set("control_path", " backend/internal/plan/plan_test.go "), "/counterfactuals/0/control_path", "names a test file"},
 		{"neither form", mut(map[string]any{}), "/counterfactuals/0/mutation", "no form"},
 		{"both forms", mut(map[string]any{"find": "a", "replace": "b", "patch": "p"}), "/counterfactuals/0/mutation", "both"},
 		{"find without replace", mut(map[string]any{"find": "a"}), "/counterfactuals/0/mutation/replace", "without mutation.replace"},

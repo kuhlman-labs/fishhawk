@@ -671,6 +671,11 @@ func TestValidCounterfactualSpec(t *testing.T) {
 		"unknown kind": mut(func(s *upload.CounterfactualSpec) { s.MutationKind = "sed" }),
 		"empty patch":  patchSpec(0, "a.go", " "),
 		"patch+find":   mut(func(s *upload.CounterfactualSpec) { s.MutationKind = upload.CounterfactualMutationPatch; s.Patch = "p" }),
+
+		// Trimmed before every check (fix-up E): with the TrimSpace in
+		// validCounterfactualSpec deleted, the trailing space defeats the
+		// `_test.go` suffix test and nothing else refuses it.
+		"padded test file": mut(func(s *upload.CounterfactualSpec) { s.ControlPath = " a/b_test.go " }),
 	}
 	for name, s := range bad {
 		if validCounterfactualSpec(s) {
@@ -836,5 +841,231 @@ func TestCounterfactual_InvalidSpecRunsNothing(t *testing.T) {
 	wantObs(t, runCF(t, x, repo, head, tree, s)[0], cfOutcomeError, cfReasonInvalidSpec)
 	if p.tests != 0 {
 		t.Fatalf("an invalid spec ran go test %d times", p.tests)
+	}
+}
+
+// --- fix-up pass 2 (C, D, E, F, G, A) -----------------------------------------
+
+// TestCounterfactual_SymlinkedPackageDirRefused (C): a symlinked intermediate
+// directory COMMITTED before the phase, pointing outside the clone at a
+// BUILDABLE package with a passing test (tests.package ./linkdir), is refused
+// error/invalid_spec before anything runs. The outside package compiles and
+// its test passes through the symlink, so with C2 deleted go list, the
+// baseline and the mutated run would all execute against the OUTSIDE files —
+// the downstream os.Root would still refuse the write, so the discriminating
+// assertions are baseline=skipped and ZERO go test runs, plus the outside
+// target byte-unchanged. COUNTERFACTUAL: make containedControlFile return
+// (path, nil) → the baseline runs (green) → RED.
+func TestCounterfactual_SymlinkedPackageDirRefused(t *testing.T) {
+	t.Parallel()
+	repo, _, _ := newCFFixture(t)
+	outDir := t.TempDir()
+	const outsideCtl = "package linkdir\n\n// X is the control.\nfunc X(n int) bool { return n > 0 }\n"
+	const outsideTest = "package linkdir\n\nimport \"testing\"\n\nfunc TestX(t *testing.T) {\n\tif X(0) || !X(1) {\n\t\tt.Fatal(\"X\")\n\t}\n}\n"
+	if err := os.WriteFile(filepath.Join(outDir, "ctl.go"), []byte(outsideCtl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "ctl_test.go"), []byte(outsideTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outDir, filepath.Join(repo, "linkdir")); err != nil {
+		t.Fatal(err)
+	}
+	cfGit(t, repo, "add", "-A")
+	cfGit(t, repo, "commit", "-q", "-m", "symlinked package dir")
+	head := cfGit(t, repo, "rev-parse", "HEAD")
+	tree := cfGit(t, repo, "rev-parse", "HEAD^{tree}")
+
+	// The fixture is live: the outside package builds and passes on its own.
+	if out, code, disp := runBoundedGateArgvDisposed(context.Background(), []string{"go", "test", "-count=1", "./linkdir"}, repo, t.TempDir(), time.Minute); code != 0 || disp != gateExecuted {
+		t.Fatalf("fixture precondition: go test ./linkdir through the symlink = exit %d disp %v, want a pass:\n%s", code, disp, out)
+	}
+
+	x := newTestCFExecutor(t, repo)
+	p := &lockProbe{lockPath: x.lockPath}
+	x.exec = p.exec
+	s := replaceSpec(0, "linkdir/ctl.go", "return n > 0", "return true", "^TestX$")
+	s.TestPackage = "./linkdir"
+	o := runCF(t, x, repo, head, tree, s)[0]
+	wantObs(t, o, cfOutcomeError, cfReasonInvalidSpec)
+	if o.Baseline != cfOutcomeSkipped || p.tests != 0 {
+		t.Fatalf("baseline=%q go test runs=%d; want skipped and 0 (nothing may run through the symlink)", o.Baseline, p.tests)
+	}
+	if got, _ := os.ReadFile(filepath.Join(outDir, "ctl.go")); string(got) != outsideCtl {
+		t.Fatalf("outside target modified: %q", got)
+	}
+}
+
+// TestLstatControlComponents_RefusesInsideSymlink (C2, walk layer alone): an
+// intermediate symlink pointing INSIDE the clone passes the EvalSymlinks
+// containment, so only the component walk refuses it. COUNTERFACTUAL: make
+// lstatControlComponents return the joined path without Lstat-ing → the walk
+// accepts and containedControlFile returns nil → RED.
+func TestLstatControlComponents_RefusesInsideSymlink(t *testing.T) {
+	t.Parallel()
+	clone := t.TempDir()
+	if err := os.Mkdir(filepath.Join(clone, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clone, "real", "ctl.go"), []byte("package real\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(clone, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlResolvesInsideClone(clone, filepath.Join(clone, "alias", "ctl.go")); err != nil {
+		t.Fatalf("fixture precondition: the inside symlink must pass containment, got %v", err)
+	}
+	if _, err := lstatControlComponents(clone, "alias/ctl.go"); err == nil {
+		t.Fatal("lstatControlComponents accepted a symlink component")
+	}
+	if _, err := containedControlFile(clone, "alias/ctl.go"); err == nil {
+		t.Fatal("containedControlFile accepted a symlink component")
+	}
+	if _, err := lstatControlComponents(clone, "real/ctl.go"); err != nil {
+		t.Fatalf("a real path must pass the walk: %v", err)
+	}
+}
+
+// TestControlResolvesInsideClone_RefusesEscape (C2, containment layer alone):
+// called directly, so the walk that would refuse the symlink first is
+// bypassed — an escaping intermediate symlink is refused by the EvalSymlinks
+// containment itself. COUNTERFACTUAL: make controlResolvesInsideClone return
+// nil → RED.
+func TestControlResolvesInsideClone_RefusesEscape(t *testing.T) {
+	t.Parallel()
+	clone, outDir := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(outDir, "ctl.go"), []byte(cfOutsideCtlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outDir, filepath.Join(clone, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlResolvesInsideClone(clone, filepath.Join(clone, "sub", "ctl.go")); err == nil {
+		t.Fatal("controlResolvesInsideClone accepted a path resolving outside the clone")
+	}
+	if err := os.WriteFile(filepath.Join(clone, "in.go"), []byte("package in\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := controlResolvesInsideClone(clone, filepath.Join(clone, "in.go")); err != nil {
+		t.Fatalf("a contained path must pass: %v", err)
+	}
+}
+
+// cfHostSentinel is a host env var the gate's default-deny allow-list does
+// not carry.
+const cfHostSentinel = "FISHHAWK_CF_HOST_SENTINEL"
+
+// TestCounterfactual_HostEnvNotInherited (D): a sentinel set in the runner's
+// own env is ABSENT from the counterfactual go test env. The committed
+// TestEnvClean fails when it sees the sentinel, so a leak turns the baseline
+// RED (error/baseline_not_green) instead of green-then-red. COUNTERFACTUAL:
+// replace sanitizedGateEnv() with os.Environ() in runBoundedGateArgvDisposed →
+// baseline red → RED. Not t.Parallel: it uses t.Setenv.
+func TestCounterfactual_HostEnvNotInherited(t *testing.T) {
+	t.Setenv(cfHostSentinel, "leaked")
+	repo, _, _ := newCFFixture(t)
+	envTest := "package cf\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestEnvClean(t *testing.T) {\n" +
+		"\tif v, ok := os.LookupEnv(\"" + cfHostSentinel + "\"); ok {\n\t\tt.Fatalf(\"host env leaked into the counterfactual run: %q\", v)\n\t}\n" +
+		"\tif Allowed(0) {\n\t\tt.Fatal(\"Allowed(0) must be false\")\n\t}\n}\n"
+	if err := os.WriteFile(filepath.Join(repo, "env_test.go"), []byte(envTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfGit(t, repo, "add", "-A")
+	cfGit(t, repo, "commit", "-q", "-m", "env test")
+	head := cfGit(t, repo, "rev-parse", "HEAD")
+	tree := cfGit(t, repo, "rev-parse", "HEAD^{tree}")
+	o := runCF(t, newTestCFExecutor(t, repo), repo, head, tree, replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestEnvClean$"))[0]
+	if o.Baseline != cfOutcomeGreen {
+		t.Fatalf("baseline = %q (observed %q/%q), want green: the host sentinel reached the counterfactual go test env", o.Baseline, o.Observed, o.Reason)
+	}
+	wantObs(t, o, cfOutcomeRed, "")
+}
+
+// TestCounterfactual_PaddedControlPathTrimmed (E, executor side): a padded
+// " ctl.go " is trimmed before every check and executes like "ctl.go".
+// COUNTERFACTUAL: delete the TrimSpace at the top of executeCounterfactual →
+// the C2 walk Lstats "<clone>/ ctl.go", which does not exist →
+// error/invalid_spec, not red → RED.
+func TestCounterfactual_PaddedControlPathTrimmed(t *testing.T) {
+	t.Parallel()
+	repo, head, tree := newCFFixture(t)
+	o := runCF(t, newTestCFExecutor(t, repo), repo, head, tree, replaceSpec(0, " ctl.go ", pinnedFind, "return true", "^TestAllowed$"))[0]
+	wantObs(t, o, cfOutcomeRed, "")
+}
+
+// TestCounterfactualBoundsPinned (F): the per-run timeout and the C4 lock
+// re-acquire gap are named constants with pinned values, and the production
+// executor uses them. COUNTERFACTUAL: change either constant, or wire a
+// literal into newCounterfactualExecutor → RED.
+func TestCounterfactualBoundsPinned(t *testing.T) {
+	t.Parallel()
+	if counterfactualRunTimeout != 5*time.Minute {
+		t.Errorf("counterfactualRunTimeout = %v, want 5m (runner/README.md § Plan-declared counterfactuals)", counterfactualRunTimeout)
+	}
+	if counterfactualLockReacquireDelay != 5*time.Second {
+		t.Errorf("counterfactualLockReacquireDelay = %v, want 5s (C4; scripts/README.md § The verify lock)", counterfactualLockReacquireDelay)
+	}
+	x := newCounterfactualExecutor(context.Background(), t.TempDir())
+	if x.runTimeout != counterfactualRunTimeout || x.reacquireDelay != counterfactualLockReacquireDelay {
+		t.Errorf("executor bounds = (%v, %v), want the named constants", x.runTimeout, x.reacquireDelay)
+	}
+}
+
+// TestRunPlanCounterfactuals_CapsAtEight (G): a delivery of nine specs
+// executes and records only the first eight, matching the plan and backend
+// ingest cap. COUNTERFACTUAL: delete the cap block in runPlanCounterfactuals →
+// 9 observations → RED; raise gateEvidenceCounterfactualCap → RED.
+func TestRunPlanCounterfactuals_CapsAtEight(t *testing.T) {
+	t.Parallel()
+	if gateEvidenceCounterfactualCap != 8 {
+		t.Fatalf("gateEvidenceCounterfactualCap = %d, want 8 (plan.MaxCounterfactuals, the backend ingest cap)", gateEvidenceCounterfactualCap)
+	}
+	specs := make([]upload.CounterfactualSpec, 9)
+	for i := range specs {
+		specs[i] = replaceSpec(i, "ctl.go", pinnedFind, "return true", "^TestAllowed$")
+	}
+	// No verified tree: every executed spec records no_verified_tree, cheaply.
+	evs, obs := runPlanCounterfactuals(context.Background(), config{runID: "r", stageID: "s"}, t.TempDir(), nil, "", specs, io.Discard)
+	if len(obs) != 8 || len(evs) != 8 {
+		t.Fatalf("observations=%d events=%d, want 8 each", len(obs), len(evs))
+	}
+	if obs[7].Index != 7 {
+		t.Fatalf("last kept observation has index %d, want 7 (spec order)", obs[7].Index)
+	}
+}
+
+// TestCounterfactualOutcomes_MatchSharedFixture (A, runner side): the
+// cfOutcome* / cfReason* constants equal the closed vocabulary in
+// testdata/wire/counterfactual_outcomes.json, which the backend ingest's
+// admission sets are pinned against too. COUNTERFACTUAL: rename any constant's
+// value → RED. Residual: a NEW constant must be added to the lists below.
+func TestCounterfactualOutcomes_MatchSharedFixture(t *testing.T) {
+	t.Parallel()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "counterfactual_outcomes.json"))
+	if err != nil {
+		t.Fatalf("read shared fixture: %v", err)
+	}
+	var f struct {
+		Observed []string `json:"observed"`
+		Baseline []string `json:"baseline"`
+		Reason   []string `json:"reason"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+	observed := []string{cfOutcomeRed, cfOutcomeGreen, cfOutcomeTimeout, cfOutcomeError}
+	baseline := []string{cfOutcomeGreen, cfOutcomeRed, cfOutcomeTimeout, cfOutcomeError, cfOutcomeSkipped}
+	reason := []string{
+		cfReasonInvalidSpec, cfReasonNoVerifiedTree, cfReasonCloneFailed, cfReasonRestoreFailed,
+		cfReasonControlNotBuilt, cfReasonMutationNotApplied, cfReasonMutationAmbiguous,
+		cfReasonMutationOutside, cfReasonBaselineNotGreen, cfReasonBuildFailed,
+		cfReasonNoTestsMatched, cfReasonTestCommandFailed, cfReasonGateRefused,
+		cfReasonGateUnavailable, cfReasonLockUnavailable, cfReasonPhaseBudget,
+	}
+	for name, pair := range map[string][2][]string{"observed": {f.Observed, observed}, "baseline": {f.Baseline, baseline}, "reason": {f.Reason, reason}} {
+		if len(pair[0]) == 0 || strings.Join(pair[0], ",") != strings.Join(pair[1], ",") {
+			t.Errorf("%s: runner constants %v, shared fixture %v", name, pair[1], pair[0])
+		}
 	}
 }

@@ -46,12 +46,11 @@ const (
 const diffCoverageMaxUncovered = 10
 
 // gateEvidenceCounterfactualCap bounds the counterfactual_observations member
-// (E85.3 / #4143). The plan caps declared counterfactuals at 8
-// (plan.MaxCounterfactuals) and the runner emits exactly one observation per
-// delivered entry, so 16 is headroom for that contract, not a working limit:
-// it exists so an over-long observation slice cannot grow the signed bundle's
-// evidence without bound.
-const gateEvidenceCounterfactualCap = 16
+// AND the specs runPlanCounterfactuals executes (E85.3 / #4143). It equals the
+// plan's cap (plan.MaxCounterfactuals) and the backend ingest's, so an
+// over-long delivery is neither executed past it nor able to grow the signed
+// bundle's evidence beyond what the backend records.
+const gateEvidenceCounterfactualCap = 8
 
 // gateEvidencePayload is the body of a gate_evidence event in the
 // bundle. The json tags MUST stay identical to the backend's
