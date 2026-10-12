@@ -5621,3 +5621,227 @@ func TestFetchPrompt_CounterfactualsAbsentDecodesNil(t *testing.T) {
 		t.Errorf("Counterfactuals = %#v, want nil when the key is absent", got.Counterfactuals)
 	}
 }
+
+// ---- Specialist jobs (E85.9 / #4300) ----
+
+func readSpecialistJobGolden(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "specialist_job.json"))
+	if err != nil {
+		t.Fatalf("read specialist_job golden: %v", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatalf("decode specialist_job golden: %v", err)
+	}
+	return doc
+}
+
+// roundTripStrict decodes raw into v with DisallowUnknownFields, re-encodes it
+// and requires semantic JSON equality with raw: a golden key the runner struct
+// does not carry, or a tag that drops or renames a member, fails here.
+func roundTripStrict(t *testing.T, name string, raw json.RawMessage, v any) {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		t.Fatalf("%s: strict decode: %v", name, err)
+	}
+	back, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("%s: re-encode: %v", name, err)
+	}
+	var want, got any
+	if err := json.Unmarshal(raw, &want); err != nil {
+		t.Fatalf("%s: decode golden: %v", name, err)
+	}
+	if err := json.Unmarshal(back, &got); err != nil {
+		t.Fatalf("%s: decode re-encoded: %v", name, err)
+	}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("%s: round trip drifted\n golden: %s\nre-encoded: %s", name, raw, back)
+	}
+}
+
+// TestSpecialistJobGoldenRoundTrip pins the runner's upload structs to the
+// shared golden every module reads (the backend ParseCompletions the same
+// completions): the job read, the admission answer, and every completion.
+func TestSpecialistJobGoldenRoundTrip(t *testing.T) {
+	doc := readSpecialistJobGolden(t)
+	var job SpecialistJob
+	roundTripStrict(t, "job", doc["job"], &job)
+	if strings.Contains(string(doc["job"]), "execution_nonce") {
+		t.Fatalf("the golden job read must never carry execution_nonce (approval condition C1)")
+	}
+	if job.JobID == "" || job.Kind == "" || len(job.Inputs) == 0 || job.Subject.HeadSHA == "" {
+		t.Fatalf("golden job decoded empty members: %+v", job)
+	}
+	var adm SpecialistJobAdmission
+	roundTripStrict(t, "admission", doc["admission"], &adm)
+	if !adm.Admitted || adm.ExecutionNonce == "" || adm.Job.JobID != job.JobID {
+		t.Fatalf("golden admission decoded wrong: %+v", adm)
+	}
+	var completions map[string]json.RawMessage
+	if err := json.Unmarshal(doc["completions"], &completions); err != nil {
+		t.Fatalf("decode completions: %v", err)
+	}
+	for _, kind := range []string{"counterfactual_battery", "fanin_build", "overlap_scan", "plan_crosscheck", "inventory", "inconclusive"} {
+		raw, ok := completions[kind]
+		if !ok {
+			t.Fatalf("golden is missing the %s completion", kind)
+		}
+		var c SpecialistJobCompletion
+		roundTripStrict(t, "completion "+kind, raw, &c)
+		if c.ExecutionNonce != adm.ExecutionNonce {
+			t.Errorf("completion %s nonce %q, want the golden admission nonce %q", kind, c.ExecutionNonce, adm.ExecutionNonce)
+		}
+	}
+}
+
+type specialistJobRecorded struct {
+	method, path, auth, body string
+}
+
+// specialistJobServer answers every request with status/body and records it.
+func specialistJobServer(t *testing.T, statuses []int, body string) (*httptest.Server, *[]specialistJobRecorded) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []specialistJobRecorded
+	i := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		got = append(got, specialistJobRecorded{r.Method, r.URL.Path, r.Header.Get("Authorization"), string(b)})
+		status := statuses[len(statuses)-1]
+		if i < len(statuses) {
+			status = statuses[i]
+		}
+		i++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &got
+}
+
+func specialistJobClient(srv *httptest.Server) *Client {
+	return &Client{
+		BaseURL: srv.URL, HTTP: srv.Client(), MaxRetries: 2, Backoff: time.Millisecond,
+		TerminalMaxRetries: 2, TerminalBackoff: time.Millisecond, TerminalBackoffCap: time.Millisecond,
+	}
+}
+
+func TestSpecialistJobMethods_PathMethodAndBearer(t *testing.T) {
+	doc := readSpecialistJobGolden(t)
+	const jobID = "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f"
+	cases := []struct {
+		name, method, path, body string
+		call                     func(c *Client) error
+	}{
+		{"fetch", http.MethodGet, "/v0/specialist-jobs/" + jobID, string(doc["job"]), func(c *Client) error {
+			j, err := c.FetchSpecialistJob(context.Background(), "tok-1", jobID)
+			if err == nil && j.JobID != jobID {
+				return fmt.Errorf("job id %q", j.JobID)
+			}
+			return err
+		}},
+		{"admit", http.MethodPost, "/v0/specialist-jobs/" + jobID + "/admission", string(doc["admission"]), func(c *Client) error {
+			a, err := c.AdmitSpecialistJob(context.Background(), "tok-1", jobID, SpecialistJobAdmissionRequest{Host: "h", Nonce: "n"})
+			if err == nil && !a.Admitted {
+				return errors.New("not admitted")
+			}
+			return err
+		}},
+		{"complete", http.MethodPost, "/v0/specialist-jobs/" + jobID + "/result", string(doc["job"]), func(c *Client) error {
+			_, err := c.ShipSpecialistJobCompletion(context.Background(), "tok-1", jobID,
+				SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"})
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := specialistJobServer(t, []int{http.StatusOK}, tc.body)
+			if err := tc.call(specialistJobClient(srv)); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if len(*got) != 1 {
+				t.Fatalf("requests = %d, want 1", len(*got))
+			}
+			r := (*got)[0]
+			if r.method != tc.method || r.path != tc.path || r.auth != "Bearer tok-1" {
+				t.Fatalf("request = %+v, want %s %s with the bearer", r, tc.method, tc.path)
+			}
+		})
+	}
+}
+
+func TestSpecialistJobMethods_StatusMapping(t *testing.T) {
+	const jobID = "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f"
+	cases := []struct {
+		name     string
+		statuses []int
+		body     string
+		want     error
+		requests int
+	}{
+		{"404 not found", []int{http.StatusNotFound}, `{}`, ErrSpecialistJobNotFound, 1},
+		{"409 conflict carries the code", []int{http.StatusConflict}, `{"error":{"code":"specialist_job_already_running","message":"x"}}`, ErrSpecialistJobConflict, 1},
+		{"400 is permanent", []int{http.StatusBadRequest}, `{"error":{"code":"validation_failed"}}`, ErrSpecialistJobRejected, 1},
+		{"413 is permanent", []int{http.StatusRequestEntityTooLarge}, `{}`, ErrSpecialistJobRejected, 1},
+		{"5xx retries then exhausts", []int{http.StatusBadGateway}, `{}`, nil, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := specialistJobServer(t, tc.statuses, tc.body)
+			_, err := specialistJobClient(srv).AdmitSpecialistJob(context.Background(), "tok", jobID, SpecialistJobAdmissionRequest{Host: "h", Nonce: "n"})
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if tc.want == nil && !strings.Contains(err.Error(), "exhausted retries") {
+				t.Fatalf("err = %v, want exhausted retries", err)
+			}
+			if strings.Contains(tc.body, "already_running") && !strings.Contains(err.Error(), "specialist_job_already_running") {
+				t.Fatalf("conflict error %v does not carry the code", err)
+			}
+			if len(*got) != tc.requests {
+				t.Fatalf("requests = %d, want %d", len(*got), tc.requests)
+			}
+		})
+	}
+}
+
+func TestSpecialistJobMethods_RetryThenSucceed(t *testing.T) {
+	doc := readSpecialistJobGolden(t)
+	srv, got := specialistJobServer(t, []int{http.StatusServiceUnavailable, http.StatusOK}, string(doc["job"]))
+	j, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", "job-1",
+		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"})
+	if err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	if j.JobID == "" || len(*got) != 2 {
+		t.Fatalf("job=%+v requests=%d, want a decoded job after 2 requests", j, len(*got))
+	}
+	var sent map[string]any
+	if err := json.Unmarshal([]byte((*got)[1].body), &sent); err != nil || sent["reason"] != "timeout" || sent["execution_nonce"] != "n" {
+		t.Fatalf("shipped body = %s (%v)", (*got)[1].body, err)
+	}
+}
+
+func TestSpecialistJobMethods_RefuseMissingTokenOrJob(t *testing.T) {
+	srv, got := specialistJobServer(t, []int{http.StatusOK}, `{}`)
+	c := specialistJobClient(srv)
+	if _, err := c.FetchSpecialistJob(context.Background(), "", "job"); err == nil || !strings.Contains(err.Error(), "bearer token required") {
+		t.Fatalf("empty token: %v", err)
+	}
+	if _, err := c.FetchSpecialistJob(context.Background(), "tok", ""); err == nil || !strings.Contains(err.Error(), "job id required") {
+		t.Fatalf("empty job id: %v", err)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("a refused call reached the network: %d requests", len(*got))
+	}
+}

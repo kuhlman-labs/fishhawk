@@ -158,6 +158,14 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/crew-messages/{sequence}/respond", s.handleRespondCrewMessage)
 	mux.HandleFunc("POST /v0/crew-messages/{sequence}/escalation-decision", s.handleDecideCrewEscalation)
 	mux.HandleFunc("POST /v0/crew-messages/{sequence}/convert-to-concern", s.handleConvertCrewFindingToConcern)
+	// Specialist jobs (ADR-097 D2/D6, E85.9 / #4300): not run-scoped (the
+	// subject may be a run, a campaign or a head SHA), so each handler scopes
+	// by the caller's account through the store. The result route writes only
+	// specialist_jobs and the audit chain. specialist_job.go.
+	mux.HandleFunc("POST /v0/specialist-jobs", s.handleRequestSpecialistJob)
+	mux.HandleFunc("GET /v0/specialist-jobs/{job_id}", s.handleGetSpecialistJob)
+	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/admission", s.handleAdmitSpecialistJob)
+	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/result", s.handleSpecialistJobResult)
 	// Handover brief (E76.4 / #3767): composed on demand from the digest,
 	// captain record, campaign/run reads and the cached-spec delegation view;
 	// never writes.
