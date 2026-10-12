@@ -25,8 +25,9 @@ product.
 
 The unit is the **repository**. The human who commands a repository is its
 **captain**. The agents that do the work are its **crew**: planner, implementer,
-reviewers, acceptance, the operator agent as first officer, and the roles that
-keep a product running after the merge. The captain decides how much the crew may
+reviewers, acceptance, the operator that drives runs and campaigns, the first
+officer that keeps a read-only watch over them, and the roles that keep a product
+running after the merge. The captain decides how much the crew may
 decide and where; the crew advises, disagrees on the record, and escalates what it
 may not settle. An organization is a fleet of such repositories, each with its own
 captain — the enterprise case is the same model repeated, not a different product.
@@ -59,15 +60,16 @@ The full crew, each ready in the sense of the done-means below:
 |---|---|---|
 | Planner, implementer, reviewers | The plan → implement → review loop reaches a governed merge on a repo that is not this one | shipped |
 | Acceptance | A running instance is validated against the plan's criteria | shipped; E72 #3324 |
-| First officer (operator agent) | Drives runs and campaigns within delegation and pages the captain with a distilled hand-off | shipped |
+| Operator | Drives runs and campaigns within delegation and pages the captain with a distilled hand-off | shipped |
+| First officer | Keeps a standing, read-only watch over runs and the host — plan cross-checks, counterfactual batteries, overlap scans, premise checks, host health — and raises evidence-backed findings the captain dispositions | E85 #4141 (ADR-089, ADR-097) |
 | Groomer | Keeps the backlog decision-ready against this charter | E54 #2232 |
 | Product manager | Proposes direction and release briefs for the captain to ratify | E71 #3240 |
 | Release manager | Cuts an evidence-backed release the captain approves | E33 #1583 |
 | Ops | Verifies a deploy and turns an alert into a governed incident issue | E35 #1585 |
 | Architect | Checks plans against the in-repo decision record | E78 #3699 |
 | Historian | Reads the chain back: precedent at the gate, digests, handover briefs | E75 #3696 |
-| Chief engineer | Files and runs routine upkeep (dependencies, flakes, deprecations) at high autonomy | E79 #3700 |
-| Security officer | Reviews declared sensitive paths with a threat-model lens and watches advisories | E80 #3701 |
+| Upkeep | Files and runs routine upkeep (dependencies, flakes, deprecations) at high autonomy | E79 #3700 |
+| Security | Reviews declared sensitive paths with a threat-model lens and watches advisories | E80 #3701 |
 | Comms | Turns user feedback into charter-anchored draft issues | E81 #3702 |
 
 Alpha is tracked by E73 #3694 (ADR-080 #3693). The previous
