@@ -2383,6 +2383,37 @@ type ShipPullRequestArgs struct {
 	MergeCandidateResult     string
 	MergeCandidateReason     string
 	MergeCandidateOutputTail string
+	// MergeCandidateFailures is the failure-signal excerpt of a non-passed
+	// pass (#4250): every go-test failure-signal line with its context,
+	// extracted from the WHOLE redacted output, so an early module's FAIL that
+	// scrolled out of the tail still ships. The caller REDACTS it;
+	// ShipPullRequest bounds it to its HEAD (MaxMergeCandidateFailuresBytes).
+	// MergeCandidateFailureSummary is the parsed failing package / test /
+	// build-failed names over the same whole output (#4250 approval condition
+	// C2), so a consumer never re-parses the excerpt and the names survive its
+	// budget. Both are empty on a passed pass and omitted from the body when
+	// empty, so a passing report stays decodable by an older fishhawkd.
+	MergeCandidateFailures       string
+	MergeCandidateFailureSummary *MergeCandidateFailureSummary
+}
+
+// MergeCandidateFailureSummary is the structured failing-name summary of a
+// non-passed merge-candidate pass (#4250 approval condition C2): the failing
+// package import paths, the `--- FAIL:` test names and the packages whose FAIL
+// line carried `[build failed]`/`[setup failed]`, each deduplicated in order
+// of appearance and capped (10 entries, 200 bytes each), with Lossy set when
+// any cap dropped or cut an entry. The names are runner-parsed from REDACTED,
+// UNTRUSTED verify output.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's mergeCandidateFailureSummary (backend/internal/server/pullrequest.go);
+// the merge_candidate_failure_summary pair in backend/internal/wirecontract
+// pins them.
+type MergeCandidateFailureSummary struct {
+	Packages    []string `json:"packages,omitempty"`
+	Tests       []string `json:"tests,omitempty"`
+	BuildFailed []string `json:"build_failed,omitempty"`
+	Lossy       bool     `json:"lossy"`
 }
 
 // OutcomeMergeCandidateVerified is the report outcome of a verify-only
@@ -2395,11 +2426,14 @@ const OutcomeMergeCandidateVerified = "merge_candidate_verified"
 // (backend/internal/server/merge_candidate_verify.go), which re-bounds it
 // server-side; keeping the runner's bound equal means the stored tail is
 // exactly what was shipped. MaxMergeCandidateReasonBytes bounds the reason.
-// Both keep the merge_candidate_verified body far under
-// MaxPullRequestReportBytes.
+// MaxMergeCandidateFailuresBytes bounds the failure-signal excerpt (#4250) and
+// MIRRORS the backend's mergeCandidateFailuresMax the same way. Together with
+// the summary (at most 3 lists x 10 entries x 200 bytes) they keep the
+// merge_candidate_verified body under MaxPullRequestReportBytes.
 const (
 	MaxMergeCandidateOutputTailBytes = 4096
 	MaxMergeCandidateReasonBytes     = 1024
+	MaxMergeCandidateFailuresBytes   = 8192
 )
 
 // pullRequestMergeCandidateBody is the wire shape for
@@ -2416,6 +2450,11 @@ type pullRequestMergeCandidateBody struct {
 	MergeCandidateResult     string `json:"merge_candidate_result"`
 	MergeCandidateReason     string `json:"merge_candidate_reason,omitempty"`
 	MergeCandidateOutputTail string `json:"merge_candidate_output_tail,omitempty"`
+	// MergeCandidateFailures / MergeCandidateFailureSummary (#4250) are
+	// omitempty: a passed pass ships neither, so its body stays byte-identical
+	// and decodes on a fishhawkd that predates them.
+	MergeCandidateFailures       string                        `json:"merge_candidate_failures,omitempty"`
+	MergeCandidateFailureSummary *MergeCandidateFailureSummary `json:"merge_candidate_failure_summary,omitempty"`
 }
 
 // boundMergeCandidateTail keeps the LAST max bytes of s (the end of verify
@@ -2425,6 +2464,15 @@ func boundMergeCandidateTail(s string, max int) string {
 		return s
 	}
 	return strings.ToValidUTF8(s[len(s)-max:], "")
+}
+
+// boundMergeCandidateFailures keeps the FIRST max bytes of s — the excerpt
+// lists the earliest failures first — re-validated as UTF-8 after the cut.
+func boundMergeCandidateFailures(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -3260,21 +3308,24 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		body = marshalled
 	case OutcomeMergeCandidateVerified:
 		// Merge-candidate verify report (ADR-090 D3): the verified head plus
-		// the result. The reason keeps its HEAD (it names the cause first) and
-		// the output its TAIL (the end names the failure); both are bounded so
-		// the body stays far under MaxPullRequestReportBytes whatever the
-		// verify command printed.
+		// the result. The reason keeps its HEAD (it names the cause first),
+		// the output its TAIL (the end names the failure) and the failure
+		// excerpt its HEAD (the earliest failures first, #4250); all are
+		// bounded so the body stays under MaxPullRequestReportBytes whatever
+		// the verify command printed.
 		reason := args.MergeCandidateReason
 		if len(reason) > MaxMergeCandidateReasonBytes {
 			reason = strings.ToValidUTF8(reason[:MaxMergeCandidateReasonBytes], "")
 		}
 		marshalled, err := json.Marshal(pullRequestMergeCandidateBody{
-			Outcome:                  args.Outcome,
-			Branch:                   args.Branch,
-			HeadSHA:                  args.HeadSHA,
-			MergeCandidateResult:     args.MergeCandidateResult,
-			MergeCandidateReason:     reason,
-			MergeCandidateOutputTail: boundMergeCandidateTail(args.MergeCandidateOutputTail, MaxMergeCandidateOutputTailBytes),
+			Outcome:                      args.Outcome,
+			Branch:                       args.Branch,
+			HeadSHA:                      args.HeadSHA,
+			MergeCandidateResult:         args.MergeCandidateResult,
+			MergeCandidateReason:         reason,
+			MergeCandidateOutputTail:     boundMergeCandidateTail(args.MergeCandidateOutputTail, MaxMergeCandidateOutputTailBytes),
+			MergeCandidateFailures:       boundMergeCandidateFailures(args.MergeCandidateFailures, MaxMergeCandidateFailuresBytes),
+			MergeCandidateFailureSummary: args.MergeCandidateFailureSummary,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal merge-candidate verify body: %w", err)

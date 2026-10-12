@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -649,6 +651,66 @@ func TestRecordMergeCandidateVerified(t *testing.T) {
 		_ = json.Unmarshal(auditEntries(f.au, CategoryMergeCandidateVerified)[0].Payload, &p)
 		if len(p.OutputTail) > mergeCandidateOutputTailMax || !strings.HasSuffix(p.OutputTail, "END") {
 			t.Errorf("tail len = %d (suffix END=%v), want <= %d keeping the end", len(p.OutputTail), strings.HasSuffix(p.OutputTail, "END"), mergeCandidateOutputTailMax)
+		}
+	})
+	// #4250: the failure evidence, read back from the STORED row.
+	recordEvidence := func(t *testing.T, ev mergeCandidateOutputEvidence) (mergeCandidateVerifiedPayload, map[string]json.RawMessage) {
+		t.Helper()
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.seedTrigger(mcvHead)
+		if _, err := f.s.recordMergeCandidateVerifiedEvidence(ctx, f.runID, f.impl.ID, mergeCandidateResultFailed, "", ev, audit.ActorAgent, "runner"); err != nil {
+			t.Fatal(err)
+		}
+		row := auditEntries(f.au, CategoryMergeCandidateVerified)[0].Payload
+		var p mergeCandidateVerifiedPayload
+		var keys map[string]json.RawMessage
+		_ = json.Unmarshal(row, &p)
+		_ = json.Unmarshal(row, &keys)
+		return p, keys
+	}
+	t.Run("failures are re-bounded server-side keeping the head", func(t *testing.T) {
+		long := "START" + strings.Repeat("f", mergeCandidateFailuresMax-6) + "\u20ac" + strings.Repeat("z", 2*mergeCandidateFailuresMax)
+		p, _ := recordEvidence(t, mergeCandidateOutputEvidence{Failures: long})
+		if len(p.Failures) > mergeCandidateFailuresMax || !strings.HasPrefix(p.Failures, "START") {
+			t.Errorf("failures len = %d, want <= %d keeping the head", len(p.Failures), mergeCandidateFailuresMax)
+		}
+		if !utf8.ValidString(p.Failures) || strings.Contains(p.Failures, "z") || !p.OutputUntrusted {
+			t.Errorf("failures must be valid UTF-8 cut at the head bound under output_untrusted (untrusted=%v)", p.OutputUntrusted)
+		}
+	})
+	t.Run("the summary is stored and re-bounded server-side", func(t *testing.T) {
+		in := &mergeCandidateFailureSummary{Packages: []string{"m/a"}, Tests: []string{"TestA"}, BuildFailed: []string{"m/a"}}
+		p, _ := recordEvidence(t, mergeCandidateOutputEvidence{Summary: in})
+		if !reflect.DeepEqual(p.FailureSummary, in) {
+			t.Errorf("stored summary = %+v, want %+v as shipped", p.FailureSummary, in)
+		}
+
+		many := make([]string, 3*mergeCandidateSummaryMaxEntries)
+		for i := range many {
+			many[i] = fmt.Sprintf("m/p%02d", i)
+		}
+		p, _ = recordEvidence(t, mergeCandidateOutputEvidence{Summary: &mergeCandidateFailureSummary{Packages: many}})
+		if s := p.FailureSummary; s == nil || len(s.Packages) != mergeCandidateSummaryMaxEntries || s.Packages[0] != "m/p00" || !s.Lossy {
+			t.Errorf("over-long list: stored %+v, want the first %d entries and lossy", s, mergeCandidateSummaryMaxEntries)
+		}
+
+		longName := "Test" + strings.Repeat("N", 2*mergeCandidateSummaryMaxEntryBytes)
+		p, _ = recordEvidence(t, mergeCandidateOutputEvidence{Summary: &mergeCandidateFailureSummary{Tests: []string{longName}}})
+		if s := p.FailureSummary; s == nil || len(s.Tests) != 1 || len(s.Tests[0]) != mergeCandidateSummaryMaxEntryBytes || !s.Lossy {
+			t.Errorf("over-long entry: stored %+v, want it cut to %d bytes and lossy", s, mergeCandidateSummaryMaxEntryBytes)
+		}
+	})
+	t.Run("no evidence stores neither key", func(t *testing.T) {
+		for name, ev := range map[string]mergeCandidateOutputEvidence{
+			"absent":        {},
+			"empty summary": {Summary: &mergeCandidateFailureSummary{Lossy: true}},
+		} {
+			_, keys := recordEvidence(t, ev)
+			for _, k := range []string{"failures", "failure_summary"} {
+				if _, ok := keys[k]; ok {
+					t.Errorf("%s: stored row carries %q, want it absent", name, k)
+				}
+			}
 		}
 	})
 }
