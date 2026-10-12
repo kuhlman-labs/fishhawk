@@ -94,7 +94,18 @@
     "no pass/fail",
     "unmeasurable",
     "not measurable",
-    "subjective"
+    "subjective",
+    "vague",
+    "no observable",
+    "not observable",
+    "ill-defined",
+    "cannot decide",
+    "can't decide",
+    "undecidable"
+  ],
+  "attribution_phrases": [
+    "gracefully",
+    "retry handling is robust"
   ],
   "catching_examples": [
     {
@@ -105,7 +116,7 @@
     {
       "severity": "medium",
       "category": "testability",
-      "note": "One criterion is a subjective adjective an executor cannot decide; replace it with a named, observable outcome."
+      "note": "One criterion ('handles edge cases gracefully') is a subjective adjective an executor cannot decide; replace it with a named, observable outcome."
     }
   ],
   "non_catching_examples": [
@@ -138,6 +149,15 @@
       "severity": "low",
       "category": "coverage",
       "note": "Add a test for the edge case of a 5xx on the 5th retry followed by a 200."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-retry-robust overlaps ac-retry-gives-up; one test could exercise both."
+    },
+    {
+      "category": "coverage",
+      "note": "Retry handling is robust only if the backoff timer is injectable; the sleep in approach step 1 is unjustified in tests and diverges from the clock interface."
     }
   ]
 }

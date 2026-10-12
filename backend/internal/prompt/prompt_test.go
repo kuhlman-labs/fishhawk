@@ -6381,6 +6381,103 @@ func TestBuild_PlanReview_AcceptanceChecklistItems(t *testing.T) {
 	}
 }
 
+// planReviewCriterionLine returns the single plan-review prompt line that
+// starts with prefix, failing the test when it is absent or repeated.
+func planReviewCriterionLine(t *testing.T, got, prefix string) string {
+	t.Helper()
+	var hits []string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			hits = append(hits, line)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("plan_review prompt has %d lines starting %q, want exactly 1", len(hits), prefix)
+	}
+	return hits[0]
+}
+
+// TestBuild_PlanReview_IssueFidelityCriterion pins criterion 8a (#4253 / #4254
+// fold-in): a criterion citing the issue must require what the issue requires,
+// rendered directly after criterion 8 so 9-13 keep their numbers. The wording
+// is asserted as a literal so deleting or rewording the sentence turns this RED.
+func TestBuild_PlanReview_IssueFidelityCriterion(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := planReviewCriterionLine(t, got, "8a. **Issue fidelity**")
+	for _, want := range []string{
+		"each criterion that cites the issue (source explicit / source_ref) must require what the issue requires",
+		"a criterion that conflicts with the issue text — e.g. the issue says soft-delete, the criterion requires row removal — flags",
+		"category `correctness`, naming both the issue's requirement and the criterion's.",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("criterion 8a line missing %q:\n%s", want, line)
+		}
+	}
+	coverage := mustIndex(t, got, "\n8. **Coverage**")
+	fidelity := mustIndex(t, got, "\n8a. **Issue fidelity**")
+	warrant := mustIndex(t, got, "\n9. **Warrant of inferred criteria**")
+	if !strictlyIncreasing(coverage, fidelity, warrant) {
+		t.Errorf("coverage=%d fidelity=%d warrant=%d; want criterion 8a between 8 and 9", coverage, fidelity, warrant)
+	}
+	if fidelity < mustIndex(t, got, PlanReviewSplitMarker) {
+		t.Errorf("criterion 8a renders inside the cached prefix; every plan-review criterion follows PlanReviewSplitMarker")
+	}
+}
+
+// TestBuild_PlanReview_InferredCriterionWarrantClause pins the tightened
+// criterion 9 (#4253 / #4254 fold-in): a specific value the issue never states
+// flags unless the plan cites where it is required, and sibling code is
+// precedent, not a requirement. Both halves sit on criterion 9's own line.
+func TestBuild_PlanReview_InferredCriterionWarrantClause(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := planReviewCriterionLine(t, got, "9. **Warrant of inferred criteria**")
+	for _, want := range []string{
+		"An inferred criterion that introduces a specific value, limit or behavior the issue never states (a page size, timeout, rate, status code) flags unless the plan cites where that value is REQUIRED;",
+		"similar code elsewhere is precedent, not a requirement.",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("criterion 9 line missing %q:\n%s", want, line)
+		}
+	}
+}
+
+// TestBuild_PlanReview_CriterionIDInNote pins the closing sentence of the
+// acceptance-criteria block (#4253 / #4254 fold-in): a concern about a specific
+// criterion names its id in the note. It renders after the last numbered
+// criterion and before the verdict decision rule, and only on plan review — the
+// shared requiredNoteInstruction (and so the implement-review render) is left
+// unchanged.
+func TestBuild_PlanReview_CriterionIDInNote(t *testing.T) {
+	const want = "Every concern about a specific acceptance criterion names that criterion's id (e.g. `ac-delete-hard`) in its `note`."
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if n := strings.Count(got, want); n != 1 {
+		t.Fatalf("plan_review prompt carries the criterion-id instruction %d times, want exactly 1", n)
+	}
+	last := mustIndex(t, got, "13. **Declared operator walks**")
+	idRule := mustIndex(t, got, want)
+	verdictRule := mustIndex(t, got, "### Verdict decision rule")
+	if !strictlyIncreasing(last, idRule, verdictRule) {
+		t.Errorf("last-criterion=%d id-rule=%d verdict-rule=%d; want the id rule after criterion 13 and before the verdict decision rule",
+			last, idRule, verdictRule)
+	}
+	impl, err := Build("implement_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan(), Diff: "- M pkg/bar/bar.go\n"})
+	if err != nil {
+		t.Fatalf("Build implement_review: %v", err)
+	}
+	if strings.Contains(impl, want) {
+		t.Errorf("implement_review prompt carries the plan-review criterion-id instruction; it must stay plan-review only")
+	}
+}
+
 // planWithLiveValidationCriterion returns fixturePlan carrying ONE criterion
 // with all three acceptance-criterion markers set (#2978): the shape a
 // diff-only reviewer previously read as an unverified blocking criterion.
@@ -6658,7 +6755,13 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// FISHHAWKD_REVIEW_GROUNDING): like the #2486 block it extends, the
 	// sentence is in the current (trimmed) prompt AND would be in the
 	// untrimmed version, so the baseline moves with it (7441 + 214).
-	const preTrimBaselineLen = 7655
+	//
+	// #4253 (the #4254 plan-review prompt fix folded in) raised it by the 711
+	// bytes criterion 8a (issue fidelity), criterion 9's warrant clause and the
+	// criterion-id-in-note sentence add: like the checklist they extend, all
+	// three are in the current (trimmed) prompt AND would be in the untrimmed
+	// version, so the baseline moves with them (7655 + 711).
+	const preTrimBaselineLen = 8366
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -19574,7 +19677,11 @@ func TestBuild_NonPlanStages_OmitHistorianGuidance(t *testing.T) {
 // writers. They are the AC7 oracle: with no convention selected and no
 // conventions file modified, both review prompts must render byte-for-byte as
 // they did before E55.3. Regenerate ONLY for a deliberate, separately-argued
-// change to a review prompt, and say so.
+// change to a review prompt, and say so. The plan_review golden was regenerated
+// once, by #4253 (the #4254 plan-review prompt fix folded in): criterion 8a,
+// criterion 9's warrant clause and the criterion-id-in-note sentence are
+// standard-criteria bytes, not conventions bytes, and the anti-vacuity markers
+// below still fail a golden carrying any conventions section.
 var reviewConventionsAbsentGoldens = map[string]string{
 	"plan_review":      "testdata/review_conventions_absent_plan_review.golden",
 	"implement_review": "testdata/review_conventions_absent_implement_review.golden",
@@ -19853,6 +19960,35 @@ func TestBuildReview_ReviewConventions_FramingOnceBeforeFirstBody(t *testing.T) 
 				if !strings.Contains(ReviewConventionsFraming, cat) {
 					t.Errorf("framing does not name category %s", cat)
 				}
+			}
+		})
+	}
+}
+
+// TestBuildReview_ReviewConventions_CriteriaApplyBeforeConventions pins the
+// framing's closing sentence (#4253 / #4254 fold-in), asserted as a LITERAL on
+// the rendered prompt — the test above compares against the constant itself, so
+// it cannot notice the sentence being deleted. The sentence targets the
+// with-conventions catch-rate gap: a plan satisfying every convention can still
+// fail an earlier criterion.
+func TestBuildReview_ReviewConventions_CriteriaApplyBeforeConventions(t *testing.T) {
+	const want = "Apply every review criterion above — issue fidelity and inferred-criterion warrant included — " +
+		"before and independently of these conventions; a plan that satisfies every convention can still fail an " +
+		"earlier criterion."
+	for _, stageType := range []string{"plan_review", "implement_review"} {
+		t.Run(stageType, func(t *testing.T) {
+			tr := reviewConventionsAbsentFixture(stageType)
+			tr.ReviewConventions = []ReviewConvention{reviewConventionFixture("first", "low", "Rule one.")}
+			got := buildOrFatal(t, stageType, tr)
+			if n := strings.Count(got, want); n != 1 {
+				t.Fatalf("criteria-first sentence rendered %d times, want exactly 1", n)
+			}
+			heading := mustIndex(t, got, "### "+ReviewConventionsHeading)
+			sentence := mustIndex(t, got, want)
+			body := mustIndex(t, got, "Rule one.")
+			if !strictlyIncreasing(heading, sentence, body) {
+				t.Errorf("heading=%d sentence=%d body=%d; want the sentence inside the framing, before the first convention body",
+					heading, sentence, body)
 			}
 		})
 	}

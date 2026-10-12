@@ -1231,6 +1231,12 @@ type Server struct {
 	// transferInputs overrides the transfer inputs resolver (tests); nil is
 	// defaultMergeCandidateTransferInputs.
 	transferInputs mergeCandidateTransferInputsFunc
+	// bgMergeQueuePump tracks the periodic merge-candidate queue pump loop
+	// (RunMergeCandidateQueuePump, #4303). Shutdown drains it alongside
+	// bgRefinementFiling, bounded by the shutdown context, so an admission
+	// the loop claimed before SIGTERM finishes inside the drain window rather
+	// than being cut at process exit.
+	bgMergeQueuePump sync.WaitGroup
 
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session
@@ -1593,10 +1599,12 @@ func (s *Server) Start() error {
 // ShutdownTimeout from the parent context. After the HTTP server
 // drains, it also waits for any detached advisory review goroutines
 // (#584), any detached grooming apply (E54.77 / #3232), any detached
-// proposal-report apply (bgReportApply: the upkeep apply, #3924) and any
-// detached refinement filing (bgRefinementFiling, #4153) to finish,
-// bounded by the same shutdown context so a hung reviewer or a wedged
-// forge can't block shutdown past the deadline.
+// proposal-report apply (bgReportApply: the upkeep apply, #3924), any
+// detached refinement filing (bgRefinementFiling, #4153) and the periodic
+// merge-candidate queue pump with any admission it is running
+// (bgMergeQueuePump, #4303) to finish, bounded by the same shutdown context
+// so a hung reviewer or a wedged forge can't block shutdown past the
+// deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
@@ -1613,6 +1621,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.bgUpkeepInflight.Wait()
 		s.bgBranchSweeps.Wait()
 		s.bgRefinementFiling.Wait()
+		s.bgMergeQueuePump.Wait()
 		close(done)
 	}()
 	select {

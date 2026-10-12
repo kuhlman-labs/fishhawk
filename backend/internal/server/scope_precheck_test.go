@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -559,4 +561,123 @@ func TestScopePrecheck_AgentInstructionPathsBuiltIn(t *testing.T) {
 			t.Fatalf("violations = %+v, want none for an opted-out stage", got.Violations)
 		}
 	})
+}
+
+// v2PrecheckTwoImplementSpec is a workflow-v2 feature_change with TWO
+// implement stages: the first caps max_files_changed at 45 and the second at
+// 10, each followed by its given extra constraint lines (#4311).
+func v2PrecheckTwoImplementSpec(firstExtra, secondExtra string) []byte {
+	return []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement_a
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          max_files_changed: 45
+` + firstExtra + `        produces:
+          - artifact: pull_request
+      - id: implement_b
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          max_files_changed: 10
+` + secondExtra + `        produces:
+          - artifact: pull_request
+`)
+}
+
+// TestScopePrecheck_AgentInstructionPaths_StrictestAcrossImplementStages pins
+// the plan-gate fold (#4311): a plan does not say which implement stage writes
+// which file, so the precheck flags a path iff SOME implement stage's
+// post-implement gate would flag it — enforced when any stage enforces, with
+// writable the intersection of the ENFORCING stages' lists. The other path
+// constraints stay first-of-type (MaxFilesChanged == 45, not 10).
+func TestScopePrecheck_AgentInstructionPaths_StrictestAcrossImplementStages(t *testing.T) {
+	const (
+		optOut   = "          agent_instruction_paths:\n            enforce: false\n"
+		wAgents  = "          agent_instruction_paths:\n            writable: [AGENTS.md]\n"
+		wAgentsC = "          agent_instruction_paths:\n            writable: [AGENTS.md, CLAUDE.md]\n"
+	)
+	scope := []plan.ScopeFile{
+		{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+		{Path: "AGENTS.md", Operation: plan.FileOpModify},
+		{Path: "CLAUDE.md", Operation: plan.FileOpModify},
+		{Path: "backend/.claude/skills/x/SKILL.md", Operation: plan.FileOpCreate},
+	}
+	cases := []struct {
+		name      string
+		first     string
+		second    string
+		wantFiles []string // nil = no agent_instruction_paths violation
+	}{
+		{"P1 stage 1 opt-out, stage 2 writable AGENTS.md", optOut, wAgents,
+			[]string{"CLAUDE.md", "backend/.claude/skills/x/SKILL.md"}},
+		{"P2 stage 1 writable AGENTS.md, stage 2 default", wAgents, "",
+			[]string{"AGENTS.md", "CLAUDE.md", "backend/.claude/skills/x/SKILL.md"}},
+		{"P3 intersection of the enforcing stages' writable lists", wAgentsC, wAgents,
+			[]string{"CLAUDE.md", "backend/.claude/skills/x/SKILL.md"}},
+		{"P4 both stages opted out", optOut, optOut, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, runRow := newScopePrecheckServer(t, v2PrecheckTwoImplementSpec(tc.first, tc.second))
+			s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, scopePlanBody(t, scope))
+
+			got := lastScopePrecheckEntry(t, au)
+			if got.MaxFilesChanged != 45 {
+				t.Errorf("MaxFilesChanged = %d, want 45 (first-of-type)", got.MaxFilesChanged)
+			}
+			if tc.wantFiles == nil {
+				if len(got.Violations) != 0 {
+					t.Fatalf("violations = %+v, want none", got.Violations)
+				}
+				return
+			}
+			if len(got.Violations) != 1 || got.Violations[0].Constraint != "agent_instruction_paths" ||
+				!reflect.DeepEqual(got.Violations[0].Files, tc.wantFiles) {
+				t.Fatalf("violations = %+v, want one agent_instruction_paths violation naming %v", got.Violations, tc.wantFiles)
+			}
+		})
+	}
+}
+
+// TestStrictestAgentInstructionPolicy is the pure table over the fold helper.
+func TestStrictestAgentInstructionPolicy(t *testing.T) {
+	off := false
+	impl := func(cs ...spec.Constraint) spec.Stage {
+		return spec.Stage{Type: spec.StageTypeImplement, Constraints: cs}
+	}
+	optOut := spec.Constraint{AgentInstructionPaths: &spec.AgentInstructionPathsConstraint{Enforce: &off}}
+	writable := func(p ...string) spec.Constraint {
+		return spec.Constraint{AgentInstructionPaths: &spec.AgentInstructionPathsConstraint{Writable: p}}
+	}
+	cases := []struct {
+		name   string
+		stages []spec.Stage
+		want   *policy.AgentInstructionPathsConfig
+	}{
+		{"no stages", nil, nil},
+		{"none enforcing", []spec.Stage{impl(optOut), impl(optOut)}, nil},
+		{"one enforcing keeps its list", []spec.Stage{impl(optOut), impl(writable("CLAUDE.md", "AGENTS.md"))},
+			&policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md", "CLAUDE.md"}}},
+		{"default enforcing stage", []spec.Stage{impl()}, &policy.AgentInstructionPathsConfig{}},
+		{"disjoint lists intersect to none", []spec.Stage{impl(writable("AGENTS.md")), impl(writable("CLAUDE.md"))},
+			&policy.AgentInstructionPathsConfig{}},
+		{"intersection is sorted and order-stable", []spec.Stage{
+			impl(writable("c/CLAUDE.md", "AGENTS.md", "b/AGENTS.md")),
+			impl(writable("b/AGENTS.md", "c/CLAUDE.md", "AGENTS.md")),
+			impl(optOut),
+		}, &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md", "b/AGENTS.md", "c/CLAUDE.md"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strictestAgentInstructionPolicy(tc.stages); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("strictestAgentInstructionPolicy = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
 }

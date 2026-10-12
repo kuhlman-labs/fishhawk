@@ -2894,6 +2894,62 @@ hanging fetch failing `timed out after 2s` (the knob, not a literal, reaches
 the bound); and an abbreviated local SHA still fetching first. Every control was deleted → RED → restored
 (record in the PR notes for #4058).
 
+### Preview lock ([#4308](https://github.com/kuhlman-labs/fishhawk/issues/4308))
+
+`preview` and `preview-down` share ONE fixed worktree
+(`.fishhawk/cache/preview-worktree`) and pid file. When the local-acceptance
+slot freed before the previous holder's `preview-down` had finished, the next
+`preview` built in a tree that was being deleted under it (`go: cannot load
+module backend listed in go.work`). The runner now tears down before its
+first terminal egress (`runner/README.md`); this lock is the belt.
+
+- **Mechanism.** `_preview_lock_acquire <lockfile> <secs>` takes a kernel
+  fcntl lock with `zsystem flock` (zsh/system) on
+  `.fishhawk/cache/preview.lock` (`PREVIEW_LOCK_FILE`, gitignored), holding
+  the fd in `_PREVIEW_LOCK_FD` until the process exits. Not a pid file: the
+  kernel releases the lock when the holder exits or is SIGKILLed, so a dead
+  holder never wedges it, and a disowned child keeps nothing (fcntl locks are
+  not inherited across fork; the fd is close-on-exec). The lock file is only
+  `: >>`-touched BEFORE acquisition: per zshmodules any later redirection to
+  it in the holding shell releases the lock, so the advisory holder pid goes
+  to a sibling `preview.lock.owner`. That value is diagnostic only: an
+  empty, unparsable or dead pid prints `unknown`.
+- **What is held, and for how long.** `cmd_preview` acquires after ref
+  resolution (a bounded fetch never holds it) and before the
+  deterministic-restart teardown, and holds it across worktree add, build,
+  role/DB setup, migrate, spawn, readiness and seed. `cmd_preview_down`
+  acquires before it touches the pid file or the worktree.
+- **The knob.** `FISHHAWK_PREVIEW_LOCK_TIMEOUT` (default 240, 1..3600;
+  `_preview_lock_timeout`). An invalid value fails closed naming the knob,
+  validated before any work. Both verbs load `.env` first
+  (`_preview_load_env`). That matters for `preview-down` in particular: the
+  runner launches it as the teardown hook under its sanitized gate env, which
+  does not carry the variable, so an `.env`-only value reaches the runner's
+  teardown only through that load.
+- **Fail closed vs fail open.** A contended acquire prints `preview: waiting
+  for the preview lock (<file>, held by pid N)…`, and a timeout is an error
+  naming the lock file, the holder and the knob (exit 1), because proceeding
+  would reproduce the race. An unloadable zsh/system, no flock support, an
+  unopenable lock file or any other flock failure prints a warning and
+  proceeds without the lock, like the ps/lsof-absent degrades, because the
+  runner-side ordering is the primary control.
+
+`scripts/test-dev` §15o pins: the `_preview_lock_timeout` table; mutual
+exclusion between SEPARATE processes (a zsh fcntl lock is re-entrant within
+its holder), with the contended acquire gated on the holder's `.owner` and
+then timing out with rc 1 naming the file, the pid and the knob; `unknown` for
+an empty, stale or absent `.owner`; dead-holder recovery for both an exited
+holder with a disowned child and a SIGKILLed holder; each fail-open branch;
+`cmd_preview_down` failing closed on an `.env`-only invalid knob with the
+variable absent from the process env; and the done-means race. In the race, the
+REAL `cmd_preview_down` (A) is mid-removal through a `git` shim that waits,
+bounded, until B has either added its tree or announced it is waiting for the
+lock. Meanwhile the REAL `cmd_preview` (B) runs with stubbed heavy helpers, all
+paths derived under a `.env`-less fixture `REPO_ROOT`. B must exit 0 with
+`backend/go.mod` and `bin/fishhawkd` intact. Body greps check that each verb
+locks before `_preview_kill_tracked`. Every control was deleted → RED →
+restored (record in the PR notes for #4308).
+
 ### Testing
 
 `scripts/test-dev` §15l pins: the `_preview_parse_args` table (bare ref,
@@ -3534,15 +3590,17 @@ base with `--base` (default `origin/main`), it requires
 `(cd backend && go run ./internal/agenteval/catchrategate)` to exit 0.
 That command decides from the committed evidence record alone (no model
 call, no network) and fails closed on an absent, malformed, stale,
-under-powered or regressed record; its twelve modes, the pinned baseline
-and the evidence schema are in `backend/internal/agenteval/README.md` §
+under-powered or regressed record, or one whose per-trial sidecar
+(`evidence.trials.json`) is absent, malformed, from another recording or
+count-inconsistent with it; its sixteen modes, the pinned baseline, the
+evidence schema and the sidecar are in `backend/internal/agenteval/README.md` §
 "Plan-review catch-rate gate". Recording the evidence is an operator step:
 `docs/compliance/planreview-catchrate-evidence.md`.
 
-**Until an operator records and pins the first baseline, the check fails
-on EVERY change that touches a trigger path**, including the branch that
-introduced it. That is the design: conventions already shipped in #2244
-without evidence.
+**A baseline is pinned (first on 2026-10-10) and is re-pinned when the
+instrument changes: while the record is stale, the check fails on EVERY
+change that touches a trigger path**, including the branch that changed the
+instrument. That is the design, not a defect.
 
 ### Trigger paths and the change set
 
@@ -3554,7 +3612,7 @@ without evidence.
 | `backend/internal/agenteval/planreviewevidence.go` | that file only (record, fingerprint, check) |
 | `backend/internal/agenteval/catchrategate/` | every path under it (the gate command) |
 | `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the corpus) |
-| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`) |
+| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`, its trial sidecar `evidence.trials.json`) |
 
 A trigger ending in `/` is a directory at a component boundary
 (`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);
@@ -3615,10 +3673,10 @@ hermetic harness, `scripts/test-review-prompt-eval`, runs in verify
 
 Add this job under `jobs:` in `.github/workflows/ci.yml`. It runs on every
 pull request and is a fast no-op when no trigger path changed. List
-`review-prompt-eval` in `ci-pass.needs` to make it required, but only AFTER
-the first baseline is recorded: before that it fails every PR touching a
-trigger path by design, so install it un-required (advisory) first if you
-want it visible sooner. The base ref goes through `env:`, not an inline
+`review-prompt-eval` in `ci-pass.needs` to make it required once the pinned
+record is current: while it is stale it fails every PR touching a trigger
+path by design, so install it un-required (advisory) first if you want it
+visible sooner. The base ref goes through `env:`, not an inline
 `${{ }}` in `run:`, so no expression is interpolated into the shell.
 
 ```yaml

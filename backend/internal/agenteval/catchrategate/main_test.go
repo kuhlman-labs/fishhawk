@@ -18,8 +18,9 @@ const (
 	testConventions = "../testdata/planreview-catchrate/representative-conventions.md"
 )
 
-// allCaughtSender answers every call with a verdict whose concern matches
-// every committed case's first probe.
+// allCaughtSender answers every call with a verdict whose ONE concern names
+// every committed case's planted criterion id(s) and first probe, so it
+// satisfies both halves of every case's catch rule.
 type allCaughtSender struct{ response string }
 
 func newAllCaughtSender(t *testing.T) *allCaughtSender {
@@ -28,12 +29,13 @@ func newAllCaughtSender(t *testing.T) *allCaughtSender {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var probes []string
+	var terms []string
 	for _, c := range cases {
-		probes = append(probes, c.Input.CatchProbes[0])
+		terms = append(terms, c.CatchRule().CriterionIDs...)
+		terms = append(terms, c.Input.CatchProbes[0])
 	}
 	b, err := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{
-		map[string]any{"severity": "medium", "category": "acceptance_criteria", "note": strings.Join(probes, "; ")},
+		map[string]any{"severity": "medium", "category": "acceptance_criteria", "note": strings.Join(terms, "; ")},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -71,12 +73,38 @@ func TestRun_PassesOnFreshRecord(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"catchrategate: PASS", "MORE than 0.10 below", "at least 136 trials", "Pinned baseline"} {
+	for _, want := range []string{"catchrategate: PASS", "MORE than 0.10 below", "at least 136 trials", "Pinned baseline",
+		"catchrategate: trial sidecar (per-trial concern notes, near-miss tags): " + agenteval.CatchRateTrialsPath(path)} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, stdout)
 		}
 	}
 	assertRuleLine(t, stdout)
+}
+
+// TestRun_FailsWithoutTheTrialSidecar is the cross-boundary pin: a pair
+// recorded through the real RecordCatchRateEvidence passes the real CLI, and
+// the same record with its sidecar removed exits 1 naming the sidecar.
+func TestRun_FailsWithoutTheTrialSidecar(t *testing.T) {
+	path := freshRecord(t, testConventions)
+	sidecar := agenteval.CatchRateTrialsPath(path)
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("the recording wrote no sidecar at %s: %v", sidecar, err)
+	}
+	if code, _, stderr := runGate("--evidence", path, "--corpus", testCorpus, "--conventions", testConventions); code != 0 {
+		t.Fatalf("premise: the fresh pair passes; exit %d, stderr:\n%s", code, stderr)
+	}
+	if err := os.Remove(sidecar); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runGate("--evidence", path, "--corpus", testCorpus, "--conventions", testConventions)
+	if code != 1 || !strings.Contains(stderr, "trial sidecar") || !strings.Contains(stderr, sidecar) || !strings.Contains(stderr, "absent") {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the absent sidecar %s", code, stderr, sidecar)
+	}
+	if strings.Contains(stdout, "catchrategate: PASS") {
+		t.Fatalf("stdout reports a PASS:\n%s", stdout)
+	}
+	assertRuleLine(t, stderr)
 }
 
 func TestRun_FailsOnStaleRecord(t *testing.T) {

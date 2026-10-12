@@ -347,8 +347,9 @@ func schemaErrorFrom(verr *jsonschema.ValidationError) *SchemaError {
 		loc = []string{""}
 	}
 	return &SchemaError{
-		Path:    "/" + joinPointer(loc),
-		Message: kindMessage(leaf),
+		Path:     "/" + joinPointer(loc),
+		Message:  kindMessage(leaf),
+		leafKind: leaf.ErrorKind,
 	}
 }
 

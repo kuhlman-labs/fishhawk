@@ -2616,6 +2616,23 @@ settle carries.
   re-anchor error) `Unadmit`s the entry back to held at its original place
   and stops the pump. A crash mid-admission is recovered by the store's
   stale-admission re-claim on the next pump.
+- **Admission context (#4303).** Each admitted entry (its `admitted` row and
+  `admitMergeCandidateEntry`) runs on `mergeCandidateAdmissionContext`:
+  detached from the caller's cancellation and bounded by a FRESH
+  `mergeCandidateQueueHandOffBudget`, on every trigger path (periodic pump,
+  webhook PR-resolution hook, verdict and cancel hooks, a rebase's
+  serialize). So neither a departed webhook sender nor fishhawkd's shutdown
+  signal can cut the re-anchor, the pass start or the recovery `Unadmit` and
+  strand an entry live in phase `admitted`. The caller ctx gates only the
+  TOP-LEVEL `AdmitNext` (and the live-entry check): a cancelled pump claims no
+  new entry. An admission that settles its entry pumps the base again on its
+  own detached context, so a nested chain's admissions keep running after a
+  shutdown signal until `Server.Shutdown`'s drain closes (a cut admission is
+  re-claimed after `mergequeue.AdmissionStaleAfter`). A webhook hand-off chain
+  is therefore no longer bounded as a whole: each admission is, and the chain
+  is bounded by its number of held entries (and
+  `mergeCandidateQueueMaxAdmissions` per pump). `mergeCandidateQueueOnPRResolved`
+  keeps its own detached, budgeted context for its entry read and settle.
 - **Verdict / merge / close hooks (D4).** `recordMergeCandidateVerified`
   (non-duplicate append) → `mergeCandidateQueueOnVerdict` for the run's LIVE
   entry anchored at that head: failed → ejected `verify_failed` + pump;
@@ -2646,7 +2663,17 @@ settle carries.
   reports (a base with a held or live entry) once at boot and then every
   `MergeCandidateQueuePumpInterval` (1 minute) via
   `RunMergeCandidateQueuePump` / `PumpMergeCandidateQueues`, started from
-  `backend/cmd/fishhawkd/serve.go`. Each tick reuses `pumpMergeCandidateQueue`,
+  `backend/cmd/fishhawkd/serve.go`. The signal ctx it runs on gates only the
+  ticker and NEW admissions; an admission the loop already claimed runs
+  detached to completion. The loop joins `Server.bgMergeQueuePump`, so
+  `Server.Shutdown` drains it (and the admission it is running) bounded by
+  `Config.ShutdownTimeout` (default 15s, not the 120s admission budget): an
+  admission whose tail outlasts the drain window is still cut at process
+  exit, as on the webhook/cancel paths `http.Shutdown` drains under the same
+  timeout. Boot-window residual: the `Add` runs inside the goroutine serve.go
+  launches, so a SIGTERM landing between the `go` and that `Add` lets
+  Shutdown miss the loop (no drain, not a panic: `Wait` at zero returns at
+  once), the exposure the other bg groups share. Each tick reuses `pumpMergeCandidateQueue`,
   which drops a LIVE entry whose run is terminal (`run_terminal`) and re-claims
   a stale admission, then admits the next held entry. So a run that fails or
   is swept by any path other than the REST cancel (which releases at once)
@@ -2662,7 +2689,17 @@ settle carries.
   held, re-anchor, hand-off on merge with auto-advance under the system
   actor, B admitted through `local-verify:<host>`), pending replacement, the
   hand-off under an unsettled implement review, and one test per eject/drop
-  mode.
+  mode. #4303 adds: the periodic pump's admission surviving a cancelled signal
+  ctx (`PeriodicPumpSurvivesSignalCancellation`), a strictly later deadline
+  per chained admission (`AdmissionBudgetIsPerEntry`), a cancelled pump
+  admitting nothing (`CancelledPumpAdmitsNothingNew`), Shutdown draining the
+  loop and staying bounded (`TestShutdown_DrainsMergeCandidateQueuePump`,
+  `TestShutdown_MergeCandidateQueuePumpDrainBoundedByDeadline`, each taking
+  the `entered` handoff so the loop's `Add` happens-before `Shutdown`), and
+  `AdmissionBranches` (already failed / in_flight / passed at admission, an
+  unresolved post-merge head, a re-anchor error, no installation, and a
+  pending-replacement trigger-append failure, which TODAY ejects
+  `pass_not_startable`).
 
 ## Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 
@@ -2746,7 +2783,7 @@ At a CLEAN base advance Fishhawk performed (the rebase verb's performed forge me
 
 Evaluates the uploaded plan's `scope.files` against the run's implement-stage path constraints using the **same `backend/internal/policy` matcher as the post-implement gate**, so the plan-time verdict equals the verdict the implement stage would produce.
 
-- `resolveImplementConstraints` mirrors `resolveStageReviewers`' spec read (parses `runs.workflow_spec`, finds the first implement stage) and flattens its `[]spec.Constraint` into a single `policy.Constraints` — keeping ONLY the scope-knowable constraints `forbidden_paths` / `allowed_paths` / `max_files_changed`, plus the built-in `agent_instruction_paths` (E80.12 / #3942) that `applyAgentInstructionPolicy` maps from the stage's `AgentInstructionPathsRule`, so a plan scoping an agent-instruction path is flagged here exactly as the post-implement gate would flag it (and not at all for an opted-out stage).
+- `resolveImplementConstraints` mirrors `resolveStageReviewers`' spec read (parses `runs.workflow_spec`, finds the first implement stage) and flattens its `[]spec.Constraint` into a single `policy.Constraints` — keeping ONLY the scope-knowable constraints `forbidden_paths` / `allowed_paths` / `max_files_changed`, plus the built-in `agent_instruction_paths` (E80.12 / #3942), which `strictestAgentInstructionPolicy` folds STRICTEST across EVERY implement stage's `AgentInstructionPathsRule` (#4311), so a plan scoping an agent-instruction path is flagged here whenever some implement stage's post-implement gate would flag it (and not at all when every implement stage opts out). The three path kinds stay read from the first implement stage (#4345).
 - `required_outcomes` is deliberately dropped (`tests_added_or_updated` would false-flag any plan not enumerating a `_test.go`, and `ci_green` has no pre-implement signal).
 - Writes a `plan_scope_precheck` audit entry (payload `ScopePrecheckPayload{workflow_id, implement_stage_id, violations, scanned_files}`) **even on a clean scope** (empty `violations`) so a reader distinguishes "checked and clean" from "never checked".
 - Advisory + fail-open throughout: a missing/unparseable spec or a workflow with no implement stage writes no entry and never blocks/unwinds the upload (matching `runPlanReviews`' degradation contract).
@@ -4515,7 +4552,8 @@ The backend's source-of-truth constraint evaluation on trace upload (E3.13): it 
 - **nil is a violation, not a pass.** The helper returns nil on `bundle.ErrNoGateEvidence`, on any extract error, and when the evidence carries neither a summary nor a verify run — and the `verification_reported` required outcome treats nil as a violation (fail-closed). Contrast `ci_green`, whose nil signal *defers* to branch protection.
 - **Diff-coverage signal derivation (#1888 / ADR-059).** `reEvaluatePolicy` also sets `constraints.DiffCoverageSignal` from `diffCoverageSignalFromBundle`, which reads the `diff_coverage` record out of that SAME `gate_evidence` event, while `mergeConstraints` supplies `constraints.DiffCoverage` (the DECLARATION) from the cached spec. Both are nil-safe: a stage that did not declare the constraint never enters the evaluation branch. nil is likewise a violation, not a pass — the runner emits a measured-with-zero signal rather than nothing when there is nothing to measure, so absence unambiguously means the runner never ran.
 - **`resolveDiffCoverageConfig` (prompt.go)** serves the declaration to the runner as `promptResponse.diff_coverage`, at BOTH construction sites. It mirrors `resolveVerifyConfig`'s parse + stage-lookup shape and fails open to nil on every degradation (nil spec, parse failure, missing workflow, missing stage). That is safe because it is SYMMETRIC: the same spec lookup drives the backend's own constraint load, so a spec the backend cannot read yields neither a measurement request nor a gate. When a stage declares the constraint twice the most RESTRICTIVE threshold wins, matching `mergeConstraints`, so the runner measures against the same threshold the backend enforces. The stage-type surfaces cannot diverge either: only the implement runner measures, so the spec validator rejects `diff_coverage` on every other stage type (#1888) — otherwise a declaration on, say, an acceptance stage would reach evaluation with no signal, and a nil signal is a violation, i.e. a guaranteed false RED.
-- **Built-in `agent_instruction_paths` (E80.12 / #3942).** On its success path `loadStageConstraintsFromCache` calls `applyAgentInstructionPolicy` (`scope_precheck.go`, the ONE spec→policy mapping the plan-gate precheck shares), so every implement stage is evaluated against the built-in agent-instruction-path constraint unless its v2 spec opts out — even a stage declaring no constraints at all. The built-in is resolved from the cached spec, so it applies ONLY when that spec resolves: every `emitPolicySkipped` path (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, `stage_not_in_spec`, `no_diff_in_bundle`) evaluates nothing, the built-in included. Cross-layer pin: `TestShipTrace_PolicyReEval_AgentInstructionPaths`; post-CI round trip: `TestReevaluateCIPolicy_PreservesAgentInstructionPaths`.
+- **Built-in `agent_instruction_paths` (E80.12 / #3942).** On its success path `loadStageConstraintsFromCache` calls `applyAgentInstructionPolicy` (`scope_precheck.go`, the ONE spec→policy mapping the plan-gate precheck shares), so every implement stage is evaluated against the built-in agent-instruction-path constraint unless its v2 spec opts out — even a stage declaring no constraints at all. The built-in is resolved from the cached spec, so it applies ONLY when that spec yields the workflow: every `emitPolicySkipped` path (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, a NON-implement `stage_not_in_spec`, `no_diff_in_bundle`) evaluates nothing, the built-in included. Cross-layer pin: `TestShipTrace_PolicyReEval_AgentInstructionPaths`; post-CI round trip: `TestReevaluateCIPolicy_PreservesAgentInstructionPaths`.
+- **Per evaluated stage, fail-closed (#4311).** `agentInstructionStage` resolves the rule from the EVALUATED run stage's own spec stage via `specStageForRunStage` (type ordinal), so a stage-1 `enforce: false` or broad `writable` never covers a second implement stage. Unlike that helper's other callers it FAILS CLOSED for an implement stage: a `ListStagesForRun` error, a stage absent from the rows, an ordinal past the spec, or a workflow with no implement stage yields the built-in enforced with no `writable` list, and an implement stage is evaluated instead of skipped as `stage_not_in_spec` (so `passed` can be false where a skip row once read `passed=true`). A non-implement stage short-circuits without the list read. The precheck (`resolveImplementConstraints`) folds the rule STRICTEST across implement stages via `strictestAgentInstructionPolicy`: enforced if any stage enforces, `writable` the intersection of the enforcing stages' lists. Every other post-hoc constraint (`mergeConstraints`, `flattenPathConstraints`, `resolveImplementRequiredOutcomes`) stays FIRST-OF-TYPE, a documented limitation (#4345). Pins: `TestShipTrace_PolicyReEval_AgentInstructionPaths_PerImplementStage`, `TestLoadStageConstraintsFromCache_AgentInstructionPaths_FailClosed`, `TestScopePrecheck_AgentInstructionPaths_StrictestAcrossImplementStages`, `TestStrictestAgentInstructionPolicy`.
 - The `bundle` import stays on this side of the seam: `backend/internal/policy` never imports it. Outcome semantics and the audit round-trip invariant live in `backend/internal/policy/README.md`.
 
 ## Plan-stage terminal settle is shared across artifact siblings (`grooming_report.go` / `plan.go`, E54.29 / #2837)

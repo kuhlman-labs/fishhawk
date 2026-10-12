@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000004253",
+  "artifact_id": "00000000-0000-0000-0001-000000004253",
+  "triage_sequence": 106,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed explicit criterion contradicts the issue text it cites (bad criterion)",
+  "decided_at": "2026-10-11T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-upload-large-accepted",
+      "statement": "Uploading a 20 MB PDF to POST /widgets/{id}/attachments returns HTTP 201.",
+      "source": "explicit",
+      "source_ref": "example-org/widgets-service#107",
+      "observed": "the 20 MB upload returned HTTP 413, as the issue's 10 MB cap requires; the criterion failed",
+      "expected": "HTTP 201 for a 20 MB upload",
+      "steps_taken": "POST /widgets/w1/attachments with a generated 20 MB PDF, read the status code",
+      "expectation_basis": "criterion ac-upload-large-accepted",
+      "repro_handle": "curl -s -o /dev/null -w '%{http_code}' -F file=@20mb.pdf $TARGET/widgets/w1/attachments",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

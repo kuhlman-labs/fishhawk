@@ -18,7 +18,8 @@ Agent-evaluation harness. Two families live here:
 - **Plan-review catch-rate gate (E55.4 / #2245)** — a two-arm measurement of
   whether the E55.3 / #2244 review-conventions section dilutes the plan
   reviewer's catch rate on the plan-review-miss corpus, a committed evidence
-  record with a PINNED baseline, and the offline `catchrategate` command. See
+  record with a PINNED baseline and a per-trial sidecar of the reviewer's
+  concerns, and the offline `catchrategate` command. See
   [Plan-review catch-rate gate](#plan-review-catch-rate-gate-e554--2245).
 
 ---
@@ -545,11 +546,11 @@ cannot answer.
 
 | File | Owns |
 |---|---|
-| `planreviewcatch.go` | the catch corpus loader, the two arms, `ClassifyCatch`, `RunCatchRateArm`, `CompareCatchRateArms`, the tolerance and the power floor |
-| `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
+| `planreviewcatch.go` | the catch corpus loader, the two arms, the attribution-AND-probe catch rule (`ClassifyCatch`, `ClassifyCatchTrial`), `RunCatchRateArm`, `CompareCatchRateArms`, the tolerance and the power floor |
+| `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, the trial sidecar, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`) |
 | `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
-| `testdata/planreview-catchrate/` | the representative conventions fixture and the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) |
+| `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
 
 ### Generator model
 
@@ -574,23 +575,31 @@ switch that line in the same PR as its new evidence; a `recorded generator
 model ... is not the gate's model ...: re-measure` failure right after such a
 change means the gate line is stale, not the measurement.
 
-### Baseline status: RECORDED 2026-10-10
+### Baseline status: first pinned 2026-10-10; re-pin required by E55.18 / #4253
 
-`testdata/planreview-catchrate/evidence.json` holds the first pinned baseline
-(2026-10-10, `claude-sonnet-5-5`: without conventions 80/138, with conventions
-83/138, PASS). The offline tests prove the APPARATUS is correct (the arms
-differ only by the conventions section, the loader refuses non-discriminating
-probes, every evidence mode fails closed); they prove NOTHING about whether
-conventions dilute the reviewer, because nothing in-loop calls a model: the
-runner denies `ANTHROPIC_API_KEY` to gate subprocesses
-(`runner/cmd/fishhawk-runner/gateenv.go` `gateEnvDeny`). Only the recorded
-evidence speaks to dilution, and only for the six committed planted-defect
-shapes. When the record goes stale, `catchrategate` exits 1 and the standing
-check fails closed on the next review-prompt change until an operator
-re-measures. Run-book:
+The first pinned baseline was recorded on 2026-10-10 (`claude-sonnet-5-5`,
+six cases under the `planreview-catch-v2` probe-only rule: without
+conventions 80/138, with conventions 83/138, PASS). E55.18 / #4253 changed
+the catch rule (`planreview-catch-v3`, attribution-AND-probe), added six cases
+and introduced the trial sidecar, so that record is STALE and NOT COMPARABLE:
+`catchrategate` fails until an operator re-records with a `PIN_REASON` and
+commits the record and its sidecar together. The CURRENT pinned baseline is
+whatever `evidence.json` carries — read its `baseline.pinned_at` and
+`baseline.reason`; the run-book's results table lists every recording.
+
+The offline tests prove the APPARATUS is correct (the arms differ only by the
+conventions section, the loader refuses non-discriminating probes and
+unattributable examples, every evidence and sidecar mode fails closed); they
+prove NOTHING about whether conventions dilute the reviewer, because nothing
+in-loop calls a model: the runner denies `ANTHROPIC_API_KEY` to gate
+subprocesses (`runner/cmd/fishhawk-runner/gateenv.go` `gateEnvDeny`). Only the
+recorded evidence speaks to dilution, and only for the committed
+planted-defect shapes. When the record goes stale, `catchrategate` exits 1 and
+the standing check fails closed on the next review-prompt change until an
+operator re-measures. Run-book:
 [`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md).
 
-### Corpus authoring: `review_input.json` and the probe matcher
+### Corpus authoring: `review_input.json` and the catch rule
 
 Every case under `testdata/planreview-miss-corpus/<case>/` needs a
 hand-curated `review_input.json` beside its `miss.json`:
@@ -601,50 +610,159 @@ hand-curated `review_input.json` beside its `miss.json`:
   "issue_body": "…",
   "plan": { "plan_version": "standard_v1", "…": "a COMPLETE plan plan.Parse accepts" },
   "catch_probes": ["contradicts the issue", "another phrase only a catching concern uses"],
-  "catching_examples": [{"category": "acceptance_criteria", "note": "…"}],
-  "non_catching_examples": [{"category": "security", "note": "…"}]
+  "attribution_phrases": ["a substring of the planted criterion's statement only"],
+  "catching_examples": [{"severity": "high", "category": "acceptance_criteria", "note": "ac-planted-id contradicts the issue: …"}],
+  "non_catching_examples": [{"severity": "low", "category": "coverage", "note": "ac-planted-id needs a test for …"}]
 }
 ```
 
-**The matcher (`matchCatchProbe`, pinned in `catchRuleVersion`).** A concern
-catches the planted defect when some probe occurs as a CASE-FOLDED
-(`strings.ToLower`) SUBSTRING of the concern's `note` OR its `category`. This
-mirrors `severitycalibration.go`'s `matchLabelledConcern` in matching over both
-fields; it is a plain substring test, not a token-overlap score, because a
-probe names one planted defect. The loader's discrimination checks use the SAME
-function: a probe matching any `non_catching_examples` entry, or a
-`catching_examples` entry matching no probe, is refused at load time. Changing
-the matcher's meaning requires a `catchRuleVersion` bump, which changes the
-evidence fingerprint and forces a re-measurement.
+**The catch rule (`matchCatchConcern`, pinned in `catchRuleVersion` =
+`planreview-catch-v3`).** A trial is CAUGHT only when ONE emitted concern
+satisfies BOTH halves:
 
-**A probe never occurs in what the reviewer is shown (mode m,
-`planreview-catch-v2`).** The loader refuses a probe that occurs, case-folded,
-in the issue title, the issue body, or any key or value of the plan —
-including the planted criterion's own id and statement. A reviewer quotes that
-text in ordinary concerns about UNRELATED aspects ("Test the edge case where
-cancellation interrupts backoff"; "Approach step 4 must also update
-docs/api.md"); a probe drawn from it scores such a concern as a catch,
-inflating both arms toward a ceiling that hides a dilution. Probes are
-therefore defect-naming phrases only a concern flagging the planted defect
-uses (`contradicts the issue`, `not warranted`, `untestable`, `vacuous`,
-`restates the approach`). Author `non_catching_examples` that ECHO the issue
-and plan wording so mode (j) pins that they score missed;
+- **Attribution** (`matchCatchAttribution`): the concern's `note` or
+  `category` contains, case-folded, a planted criterion id (every
+  `criterion_id` in the case's `miss.json`) or one of the case's declared
+  `attribution_phrases`. The id is checked first, so a concern naming both
+  counts as id-attributed.
+- **Probe** (`matchCatchProbe`): the SAME concern's `note` or `category`
+  contains some `catch_probes` entry as a case-folded
+  (`strings.ToLower`) substring. This mirrors `severitycalibration.go`'s
+  `matchLabelledConcern` in matching over both fields; it is a plain
+  substring test, not a token-overlap score.
+
+Neither half alone catches, and the halves must meet in one concern: an
+attributed concern in one place and a probe-matching concern about another
+criterion elsewhere in the verdict is a MISS. A caught trial records which
+half attributed it (`attribution: "id"` or `"phrase"`), so the share of
+catches that named the id is countable before #4254 adds an id-naming
+instruction to the prompt. A missed trial's concerns carry a
+near-miss tag: `probe_without_attribution` (a probe matched but the concern
+named neither the id nor a phrase — the reviewer may have flagged the defect
+without saying which criterion it meant) or `attribution_without_probe` (the
+concern named the planted criterion but matched no probe — a probe-set gap,
+or a concern about another aspect of it). Changing the rule's meaning requires
+a `catchRuleVersion` bump, which changes the evidence fingerprint and forces a
+re-measurement.
+
+**Prompt-vocabulary probes are safe ONLY because of the same-concern
+attribution requirement.** The probe sets include the plan-review prompt's
+own vocabulary and the generic words a reviewer uses for every defect of a
+class (`vague`, `no observable`, `untestable`, `not warranted`,
+`not stated in the issue`, …). A reviewer uses those
+words in concerns about ANY criterion, so as probes alone they would score a
+concern about a different, genuinely vague criterion as a catch of the
+planted one and inflate both arms toward a ceiling. Requiring the same
+concern to name the planted criterion is what keeps them discriminating.
+Remove the attribution half and these probes must go with it.
+
+**A generic objection word is never a probe on its own (#4253 fix-up).**
+Attribution does not save a word a reviewer uses to object to ANY aspect of
+the planted criterion: "the 20 MB PDF fixture has a content-type mismatch"
+names the planted criterion and is not a catch. So `mismatch`, `diverges`,
+`unjustified`, `ambiguous`, `unsupported`, `contrary to`, `at odds with`,
+`copied from`, `borrowed`, `should be rejected`, `no bound`, `no threshold`,
+`no time limit`, `not concrete`, `the issue says`/`states`/`requires`/
+`specifies`, `invented`, `speculative` and `not in the issue` are not
+probes; where the defect needs one, it is paired with a case-specific token
+(`at odds with the issue`, `at odds with the 10`, `unsupported by the issue`,
+`copied from audit_events`, `cap is invented`, `speculative timeout`,
+`rate limit is not in the issue`). A restated-approach probe names the
+restating criterion (`restates the approach`, `criterion restates`), never a
+bare `restates step` or `not an outcome`. An attribution phrase is the
+planted criterion's OWN wording, never a token the issue or an approach step
+also uses (`504`, `duplicate_name`) nor a reference to the approach step the
+criterion cites (`approach step 2`) or a bare verb (`paginate`): a concern
+about that step or that verb is not, by naming it, about the planted
+criterion (`TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute`
+pins five such replica notes, each also a declared `non_catching_example`, as
+unattributed). Every case carries a
+`non_catching_example` naming the planted criterion together with a generic
+objection word, and `TestCommittedCatchProbes_GenericObjectionsScoreMissed`
+scores each case's id and every declared phrase, joined with every word in
+that list, as missed: re-adding one of them as a probe fails it.
+
+**Residuals, stated.** (1) A concern that names the planted id AND carries a
+probe that is about a DIFFERENT criterion in the same note still scores
+CAUGHT; same-concern scoping narrows attribution error, it does not eliminate
+it. (2) A reviewer that describes the planted criterion without its id or any
+declared phrase scores MISSED; the sidecar's `probe_without_attribution`
+count makes that cost visible, and a high count is the trigger for an
+LLM-judge classifier (not built). Declare phrases generously within the
+uniqueness rule to keep this small.
+
+**A probe never occurs in what the reviewer is shown (mode m).** The loader
+refuses a probe that occurs, case-folded, in the issue title, the issue body,
+or any key or value of the plan — including the planted criterion's own id
+and statement. A reviewer quotes that text in ordinary concerns about
+UNRELATED aspects ("Test the edge case where cancellation interrupts
+backoff"; "Approach step 4 must also update docs/api.md"); a probe drawn from
+it scores such a concern as a catch. Probes are therefore defect-naming
+phrases (`contradicts the issue`, `not warranted`, `untestable`, `vacuous`,
+`restates the approach`). Note that plan KEYS count: `assumption` is unusable
+because `risks_and_assumptions` contains it. Author `non_catching_examples`
+that ECHO the issue and plan wording so mode (j) pins that they score missed;
 `TestCommittedCatchProbes_EchoesScoreMissed` additionally scores a concern
-quoting each case's issue, criteria and approach verbatim as missed, and
+quoting each case's issue, every criterion (id included) and every approach
+step verbatim as missed, and
 `TestCommittedCatchProbes_AbsentFromConventionsFixture` keeps every probe out
-of the conventions fixture, which only the with arm shows.
+of the conventions fixture, which only the with arm shows (it says "status
+code", for example, so no probe may).
+
+**An attribution phrase names the planted criterion and nothing else (mode
+p).** Each phrase must occur, case-folded, in a planted criterion's
+`statement` and in NO other criterion's statement in that case's plan (the
+rationale, approach and issue do not count). A phrase that also occurs in a
+sibling criterion would attribute a concern about the sibling to the planted
+one. Pick the statement's distinguishing number or wording (`20 mb`,
+`already uses`, `reasonable time`), not a word the criteria share (`400`
+when a sibling criterion also expects 400).
 
 `LoadPlanReviewCatchCorpus` fails closed (an error naming the case) on: (a) an
 absent corpus dir, (b) zero cases, (c) a missing `review_input.json`, (d)
-malformed JSON, an unknown field, or trailing content after the JSON value, (e) an empty `issue_title`/`issue_body`,
-(f) a plan `plan.Parse` rejects, (g) a plan lacking the miss criterion id —
-the defect must be IN the reviewed plan, (h) a criterion statement differing
-from `miss.json`, (i) empty or blank probes, (j) a probe matching a
-non-catching example, (k) a catching example matching no probe, (l) empty
-example lists, (m) a probe occurring in the issue or plan text. `synthetic` is NOT required: the six `seed-synthetic-*` cases
-carry `synthetic: true`, and a curated production case (`synthetic: false`
-with a `review_input.json`) is legal. A distilled plan-review-miss case
-committed WITHOUT a `review_input.json` fails mode (c) in verify.
+malformed JSON, an unknown field, or trailing content after the JSON value,
+(e) an empty `issue_title`/`issue_body`, (f) a plan `plan.Parse` rejects, (g)
+a plan lacking the miss criterion id — the defect must be IN the reviewed
+plan, (h) a criterion statement differing from `miss.json`, (i) empty or
+blank probes, (j) a probe matching a non-catching example — probe half only,
+regardless of attribution, so the probe set discriminates on its own, (k) a
+catching example that is not a catch under the full rule (no attribution, or
+no probe), (l) empty example lists, (m) a probe occurring in the issue or plan
+text, (n) no non-catching example carrying the attribution half (the planted
+id or a phrase) — without one, (j) would pass on concerns the attribution
+half already rejects and prove nothing about the probes on concerns that DO
+name the planted criterion, (o) empty or blank `attribution_phrases`, (p) a
+phrase absent from every planted statement or present in another criterion's
+statement (the error names the case and the phrase), (q) a planted criterion
+id occurring, case-folded, inside another criterion id of the plan (a concern
+naming `ac-x-extended` would otherwise be attributed to `ac-x`).
+
+`synthetic` is NOT required: every `seed-synthetic-*` case carries
+`synthetic: true`, and a curated production case (`synthetic: false` with a
+`review_input.json`) is legal. A distilled plan-review-miss case committed
+WITHOUT a `review_input.json` fails mode (c) in verify. The tests derive the
+seed list from the `seed-synthetic-*` directories (with a floor, so the
+derivation cannot go vacuous), so a new seed case needs no test edit — but it
+DOES oblige the README minimal record below (one `per_case` entry per case,
+both arms and the baseline) and, because the case set changed, a re-pin of
+the recorded baseline.
+
+**Authoring a case.** Per case: `case.md` (SYNTHETIC provenance, the planted
+defect, the plan-review criterion it violates), `miss.json` (`synthetic:
+true`, class 3, disposition `paged`, unique placeholder run/artifact ids and
+`triage_sequence`, one miss whose `statement` is byte-identical to the plan
+criterion) and `review_input.json`. The loader enforces only modes (a)-(q);
+the E55.18 / #4253 seeds also follow a stricter convention worth keeping: at
+least two catching examples naming the planted id, one id-free catching
+example attributed by a phrase, and at least four non-catching examples
+including one that names the planted id or a phrase and matches no probe. The corpus carries two kinds of shape per weak
+class: the original E55.4 seeds, whose defect is stated outright (a
+criterion inverting the issue, the prompt's own example adjective, a generic
+rationale), and the E55.18 / #4253 mid-difficulty seeds, whose defect is not
+(a plausible number on the wrong side of the issue's limit, a status code the
+plan uses correctly elsewhere, a rationale citing real sibling code, an
+untestable phrasing without the prompt's literal examples "robust", "clean",
+"handles edge cases").
 
 ### The arms
 
@@ -656,8 +774,10 @@ size cap and delimiter-line neutralization, the same call `repodoc.Resolve`
 makes — and rendered through `repodoc.ToPromptDocument`).
 `TestCatchRateArms_DifferOnlyInConventionsSection` pins that the arms differ
 ONLY by that section. A trial is caught / missed / undecodable
-(`ClassifyCatch`); an UNDECODABLE verdict counts as a MISS in the rate and is
-reported separately, so an arm cannot look better by emitting garbage.
+(`ClassifyCatchTrial`, under the catch rule above); an UNDECODABLE verdict
+counts as a MISS in the rate and is reported separately, so an arm cannot
+look better by emitting garbage. `RunCatchRateArm` keeps every trial's
+classification, in sample order, for the trial sidecar.
 
 ### The rule, the tolerance and the power floor
 
@@ -673,9 +793,9 @@ reported separately, so an arm cannot look better by emitting garbage.
   REFUSED, never passed — raise the samples, do not widen the tolerance.
   `TestMinCatchRateTrialsPerArm_DerivedFromTolerance` fails if the two drift.
 - **READ THE FLOOR HONESTLY.** The 136-trial floor bounds MODEL-SAMPLING NOISE
-  ONLY. The corpus size — six synthetic planted-defect shapes — not the trial
-  count, bounds what the gate can detect: a dilution that spares these six
-  shapes is invisible to it, however many trials are taken.
+  ONLY. The corpus — the committed synthetic planted-defect shapes — not the
+  trial count, bounds what the gate can detect: a dilution that spares every
+  committed shape is invisible to it, however many trials are taken.
 
 ### The pinned baseline (not rolling)
 
@@ -718,7 +838,9 @@ ILLUSTRATIVE — NOT A MEASUREMENT — and the fingerprint is a placeholder.
 against the code and the committed corpus, so adding a corpus case obliges
 updating it. Any test fixture that writes a regression record starts from
 such a complete record (built by `RecordCatchRateEvidence` against the real
-corpus), so it fails for the regression reason, not a shape reason.
+corpus), so it fails for the regression reason, not a shape reason. The
+minimal record is the evidence alone: the gate also requires its trial
+sidecar (below), which a recording writes beside it.
 
 <!-- BEGIN minimal-catchrate-evidence -->
 ```json
@@ -729,26 +851,38 @@ corpus), so it fails for the regression reason, not a shape reason.
   "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
-  "samples_per_case": 23,
+  "samples_per_case": 12,
   "arms": {
     "without_conventions": {
       "per_case": {
-        "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+        "seed-synthetic-contradicts-issue": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-contradicts-numeric-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-contradicts-status-code": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-criterion": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-sibling-retention": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-sibling-timeout": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-restates-approach": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-adjective": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-reasonable-time": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-user-friendly": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-unwarranted-rate-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-vacuous-criterion": {"trials": 12, "caught": 10, "undecodable": 0}
       }
     },
     "with_conventions": {
       "per_case": {
-        "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 19, "undecodable": 1},
-        "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
-        "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+        "seed-synthetic-contradicts-issue": {"trials": 12, "caught": 9, "undecodable": 1},
+        "seed-synthetic-contradicts-numeric-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-contradicts-status-code": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-criterion": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-sibling-retention": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-inferred-sibling-timeout": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-restates-approach": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-adjective": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-reasonable-time": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-untestable-user-friendly": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-unwarranted-rate-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+        "seed-synthetic-vacuous-criterion": {"trials": 12, "caught": 10, "undecodable": 0}
       }
     }
   },
@@ -757,26 +891,38 @@ corpus), so it fails for the regression reason, not a shape reason.
     "reason": "first measurement",
     "generator_model": "claude-sonnet-5-5",
     "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "samples_per_case": 23,
+    "samples_per_case": 12,
     "arms": {
       "without_conventions": {
         "per_case": {
-          "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+          "seed-synthetic-contradicts-issue": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-contradicts-numeric-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-contradicts-status-code": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-criterion": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-retention": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-timeout": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-reasonable-time": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-user-friendly": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 12, "caught": 10, "undecodable": 0}
         }
       },
       "with_conventions": {
         "per_case": {
-          "seed-synthetic-contradicts-issue": {"trials": 23, "caught": 19, "undecodable": 1},
-          "seed-synthetic-inferred-criterion": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-restates-approach": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-untestable-adjective": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-unwarranted-rate-limit": {"trials": 23, "caught": 20, "undecodable": 0},
-          "seed-synthetic-vacuous-criterion": {"trials": 23, "caught": 20, "undecodable": 0}
+          "seed-synthetic-contradicts-issue": {"trials": 12, "caught": 9, "undecodable": 1},
+          "seed-synthetic-contradicts-numeric-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-contradicts-status-code": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-criterion": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-retention": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-timeout": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-reasonable-time": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-untestable-user-friendly": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 12, "caught": 10, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 12, "caught": 10, "undecodable": 0}
         }
       }
     }
@@ -795,6 +941,64 @@ matcher change without a `catchRuleVersion` bump leaves the record fresh;
 `planreviewcatch.go` is a trigger path of `scripts/check-review-prompt-eval`,
 so such a change still runs the gate.
 
+### The trial sidecar (`planreview-catchrate-trials-v1`)
+
+Every recording writes `evidence.trials.json` beside `evidence.json`
+(`CatchRateTrialsPath`: the evidence path's stem plus `.trials.json`). It is
+what to READ after a recording: the counts say how often the reviewer caught
+each planted defect; the sidecar says what it wrote when it did not.
+
+```json
+{
+  "schema": "planreview-catchrate-trials-v1",
+  "recorded_at": "… equal to evidence.json's",
+  "prompt_fingerprint": "… equal to evidence.json's",
+  "note_max_runes": 1000,
+  "max_concerns_per_trial": 12,
+  "arms": {
+    "without_conventions": {"per_case": {"<case>": [
+      {"trial": 1, "outcome": "caught", "matched_probe": "vague", "attribution": "id",
+       "concerns": [{"severity": "medium", "category": "testability", "note": "…"}], "concerns_total": 3},
+      {"trial": 2, "outcome": "missed",
+       "concerns": [{"severity": "low", "category": "coverage", "note": "…", "near_miss": "probe_without_attribution"}], "concerns_total": 1},
+      {"trial": 3, "outcome": "undecodable", "concerns": [], "concerns_total": 0, "response_excerpt": "…"}
+    ]}},
+    "with_conventions": {"per_case": {"…": []}}
+  }
+}
+```
+
+- **Per trial, in sample order (1-based `trial`).** A caught trial stores the
+  matching concern, its `matched_probe` and its `attribution` (`id` or
+  `phrase`); a missed trial stores every concern, each with its `near_miss`
+  tag when it matched one half only; an undecodable trial stores a
+  `response_excerpt`. Every concern records `severity`, `category` and
+  `note`. `concerns_total` is the uncapped count.
+- **Redaction and truncation.** Every stored model-derived string (severity,
+  category, note, matched probe, response excerpt) passes through
+  `redaction.RedactDefault` — the notes are model output committed to the
+  repository — and then a rune-safe truncation to `note_max_runes` (1000)
+  runes, the ` [truncated]` marker included, so a cut never splits a
+  multi-byte rune. A trial keeps at most `max_concerns_per_trial` (12)
+  concerns, in emitted order.
+- **Write order.** `RecordCatchRateEvidence` writes the pair only for a
+  passing, non-dry-run measurement: both files are staged to temp files in
+  the evidence directory, the sidecar is renamed into place first, then the
+  record. A refused or dry-run measurement leaves BOTH paths byte-identical; a
+  crash between the renames leaves a new sidecar beside the OLD record, which
+  mode (15) refuses — the fail-closed direction.
+- **Commit both.** `git add evidence.json evidence.trials.json` is the only
+  recording path; a record committed without its sidecar fails mode (13).
+- **Not a fingerprint input.** The sidecar is bound to its record by
+  `recorded_at` and `prompt_fingerprint` (mode 15) and by its tallies (mode
+  16); it does not change what the fingerprint covers.
+- **Persona arms are a follow-up, not built here.** The sidecar and the
+  catch rule are keyed by the two conventions arms and anchored on the
+  planted criterion's id or statement. A persona arm (#4313 / #4314) needs an
+  ARM-KEYED record (arms beyond `without_conventions` / `with_conventions`)
+  and anchors that are not criterion ids (a persona's findings need not be
+  about an acceptance criterion at all); neither exists yet.
+
 ### `CheckCatchRateEvidence` fail-closed modes
 
 It RECOMPUTES the verdict from the counts (the record has no verdict field to
@@ -809,14 +1013,26 @@ or the two arms disagreeing on the case set or per-case trial weights, (7) a
 case set differing from the corpus, (8) an under-powered arm, (9) a within-run
 regression, (10) a missing, malformed or non-comparable baseline or a
 regression against it, (11) an unavailable corpus, (12) an unavailable
-conventions fixture. Each mode has its own row in
+conventions fixture. Then, on the trial sidecar, and only after (1)-(12) pass
+so each earlier fixture still fails for its own reason: (13) an absent
+sidecar (the message names the two-file commit), (14) a malformed sidecar —
+malformed JSON, an unknown field, trailing content or a wrong schema, (15) a
+sidecar `prompt_fingerprint` or `recorded_at` differing from the record's —
+a sidecar from another recording, (16) per arm, a sidecar case set differing
+from the record's; per arm and case, a trial list whose length differs from
+the recorded trials, trial indices not exactly 1..n in order, or outcome
+tallies differing from the recorded caught/undecodable counts. Each mode, and
+each of the four (16) sub-checks, has its own row in
 `TestCheckCatchRateEvidence_FailClosed`.
 
 ### The gate command, and why it lives here
 
 `catchrategate` (package `main` under `backend/internal/agenteval/catchrategate`)
 wraps `CheckCatchRateEvidence`: exit 0 pass (report on stdout, including the
-rule in words), 1 gate failure (reason on stderr), 2 usage error. EVERY
+rule in words and the trial sidecar's path, where the missed-trial notes
+are), 1 gate failure (reason on stderr), 2 usage error. The sidecar path is
+derived from the evidence path (`agenteval.CatchRateTrialsPath`), so there is
+no separate flag. EVERY
 outcome — pass, regression, absent, stale or malformed evidence, an
 unavailable corpus or fixture, a usage error, `--print-fingerprint` — ends
 with the rule line (`agenteval.CatchRateRule`: the 0.10 tolerance, the

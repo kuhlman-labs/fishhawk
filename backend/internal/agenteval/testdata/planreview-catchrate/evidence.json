@@ -1,42 +1,72 @@
 {
   "schema": "planreview-catchrate-evidence-v1",
-  "recorded_at": "2026-10-10T18:33:25Z",
+  "recorded_at": "2026-10-12T12:44:59Z",
   "generator_model": "claude-sonnet-5-5",
-  "prompt_fingerprint": "sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f",
+  "prompt_fingerprint": "sha256:344b9a192a0740939ded46f8b61ba4694e41656cf1b90c6a6fb13a099fca2995",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
-  "samples_per_case": 23,
+  "samples_per_case": 12,
   "arms": {
     "without_conventions": {
       "per_case": {
         "seed-synthetic-contradicts-issue": {
-          "trials": 23,
+          "trials": 12,
+          "caught": 4,
+          "undecodable": 0
+        },
+        "seed-synthetic-contradicts-numeric-limit": {
+          "trials": 12,
+          "caught": 10,
+          "undecodable": 0
+        },
+        "seed-synthetic-contradicts-status-code": {
+          "trials": 12,
           "caught": 9,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
-          "trials": 23,
+          "trials": 12,
+          "caught": 0,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-sibling-retention": {
+          "trials": 12,
           "caught": 4,
           "undecodable": 0
         },
+        "seed-synthetic-inferred-sibling-timeout": {
+          "trials": 12,
+          "caught": 0,
+          "undecodable": 1
+        },
         "seed-synthetic-restates-approach": {
-          "trials": 23,
-          "caught": 23,
+          "trials": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-untestable-adjective": {
-          "trials": 23,
-          "caught": 2,
+          "trials": 12,
+          "caught": 12,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-reasonable-time": {
+          "trials": 12,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-user-friendly": {
+          "trials": 12,
+          "caught": 12,
           "undecodable": 0
         },
         "seed-synthetic-unwarranted-rate-limit": {
-          "trials": 23,
-          "caught": 19,
+          "trials": 12,
+          "caught": 2,
           "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
-          "trials": 23,
-          "caught": 23,
+          "trials": 12,
+          "caught": 12,
           "undecodable": 0
         }
       }
@@ -44,75 +74,135 @@
     "with_conventions": {
       "per_case": {
         "seed-synthetic-contradicts-issue": {
-          "trials": 23,
-          "caught": 10,
+          "trials": 12,
+          "caught": 6,
+          "undecodable": 0
+        },
+        "seed-synthetic-contradicts-numeric-limit": {
+          "trials": 12,
+          "caught": 9,
+          "undecodable": 0
+        },
+        "seed-synthetic-contradicts-status-code": {
+          "trials": 12,
+          "caught": 6,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
-          "trials": 23,
-          "caught": 3,
+          "trials": 12,
+          "caught": 1,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-sibling-retention": {
+          "trials": 12,
+          "caught": 1,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-sibling-timeout": {
+          "trials": 12,
+          "caught": 0,
           "undecodable": 0
         },
         "seed-synthetic-restates-approach": {
-          "trials": 23,
-          "caught": 23,
+          "trials": 12,
+          "caught": 12,
           "undecodable": 0
         },
         "seed-synthetic-untestable-adjective": {
-          "trials": 23,
-          "caught": 7,
+          "trials": 12,
+          "caught": 12,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-reasonable-time": {
+          "trials": 12,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-user-friendly": {
+          "trials": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-unwarranted-rate-limit": {
-          "trials": 23,
-          "caught": 17,
+          "trials": 12,
+          "caught": 1,
           "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
-          "trials": 23,
-          "caught": 23,
+          "trials": 12,
+          "caught": 12,
           "undecodable": 0
         }
       }
     }
   },
   "baseline": {
-    "pinned_at": "2026-10-10T18:33:25Z",
-    "reason": "first measurement, claude-sonnet-5-5 per #4235; E55.4 baseline (#2245)",
+    "pinned_at": "2026-10-12T12:44:59Z",
+    "reason": "#4253 + #4254 fold-in (1e64e907): catch rule v3, twelve-case corpus, issue-fidelity criterion 8a, criterion-9 warrant clause, criterion id in notes, conventions-after-criteria framing; the 2026-10-10 baseline is not comparable",
     "generator_model": "claude-sonnet-5-5",
-    "prompt_fingerprint": "sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f",
-    "samples_per_case": 23,
+    "prompt_fingerprint": "sha256:344b9a192a0740939ded46f8b61ba4694e41656cf1b90c6a6fb13a099fca2995",
+    "samples_per_case": 12,
     "arms": {
       "without_conventions": {
         "per_case": {
           "seed-synthetic-contradicts-issue": {
-            "trials": 23,
+            "trials": 12,
+            "caught": 4,
+            "undecodable": 0
+          },
+          "seed-synthetic-contradicts-numeric-limit": {
+            "trials": 12,
+            "caught": 10,
+            "undecodable": 0
+          },
+          "seed-synthetic-contradicts-status-code": {
+            "trials": 12,
             "caught": 9,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
-            "trials": 23,
+            "trials": 12,
+            "caught": 0,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-sibling-retention": {
+            "trials": 12,
             "caught": 4,
             "undecodable": 0
           },
+          "seed-synthetic-inferred-sibling-timeout": {
+            "trials": 12,
+            "caught": 0,
+            "undecodable": 1
+          },
           "seed-synthetic-restates-approach": {
-            "trials": 23,
-            "caught": 23,
+            "trials": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-untestable-adjective": {
-            "trials": 23,
-            "caught": 2,
+            "trials": 12,
+            "caught": 12,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-reasonable-time": {
+            "trials": 12,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-user-friendly": {
+            "trials": 12,
+            "caught": 12,
             "undecodable": 0
           },
           "seed-synthetic-unwarranted-rate-limit": {
-            "trials": 23,
-            "caught": 19,
+            "trials": 12,
+            "caught": 2,
             "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {
-            "trials": 23,
-            "caught": 23,
+            "trials": 12,
+            "caught": 12,
             "undecodable": 0
           }
         }
@@ -120,33 +210,63 @@
       "with_conventions": {
         "per_case": {
           "seed-synthetic-contradicts-issue": {
-            "trials": 23,
-            "caught": 10,
+            "trials": 12,
+            "caught": 6,
+            "undecodable": 0
+          },
+          "seed-synthetic-contradicts-numeric-limit": {
+            "trials": 12,
+            "caught": 9,
+            "undecodable": 0
+          },
+          "seed-synthetic-contradicts-status-code": {
+            "trials": 12,
+            "caught": 6,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
-            "trials": 23,
-            "caught": 3,
+            "trials": 12,
+            "caught": 1,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-sibling-retention": {
+            "trials": 12,
+            "caught": 1,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-sibling-timeout": {
+            "trials": 12,
+            "caught": 0,
             "undecodable": 0
           },
           "seed-synthetic-restates-approach": {
-            "trials": 23,
-            "caught": 23,
+            "trials": 12,
+            "caught": 12,
             "undecodable": 0
           },
           "seed-synthetic-untestable-adjective": {
-            "trials": 23,
-            "caught": 7,
+            "trials": 12,
+            "caught": 12,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-reasonable-time": {
+            "trials": 12,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-user-friendly": {
+            "trials": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-unwarranted-rate-limit": {
-            "trials": 23,
-            "caught": 17,
+            "trials": 12,
+            "caught": 1,
             "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {
-            "trials": 23,
-            "caught": 23,
+            "trials": 12,
+            "caught": 12,
             "undecodable": 0
           }
         }

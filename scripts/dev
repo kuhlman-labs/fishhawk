@@ -25,6 +25,12 @@ BIN="${REPO_ROOT}/bin/fishhawkd"
 # probe would then correctly reject).
 PREVIEW_PID_FILE="${REPO_ROOT}/.fishhawk/preview.pid"
 PREVIEW_WORKTREE="${REPO_ROOT}/.fishhawk/cache/preview-worktree"
+# Shared-slot preview lock (#4308): `preview` and `preview-down` serialize on a
+# kernel fcntl lock on this file (zsystem flock), so a provision never races an
+# in-flight teardown's removal of the shared fixed PREVIEW_WORKTREE above.
+# Beside the worktree under the already-gitignored cache; the advisory holder
+# pid goes to "${PREVIEW_LOCK_FILE}.owner", never into the lock file itself.
+PREVIEW_LOCK_FILE="${REPO_ROOT}/.fishhawk/cache/preview.lock"
 PREVIEW_LOG_FILE="${LOG_DIR}/fishhawkd-preview.log"
 
 # Opt-in local TLS front end (E66.28 / #2453): a loopback-only reverse proxy
@@ -4447,6 +4453,102 @@ _preview_fetch_timeout() {
   print -r -- $(( v ))
 }
 
+# Source .env (when present) for the preview verbs, the same posture as cmd_up.
+# Shared by cmd_preview and cmd_preview_down (#4308): the runner launches the
+# teardown hook under its sanitized gate env, which carries no FISHHAWK_PREVIEW_*
+# knob, so an .env-only FISHHAWK_PREVIEW_LOCK_TIMEOUT reaches preview-down only
+# through this.
+_preview_load_env() {
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  else
+    print "warning: .env not found — using current shell environment"
+  fi
+}
+
+# The preview-lock wait bound in seconds: FISHHAWK_PREVIEW_LOCK_TIMEOUT
+# (default 240, under the runner's 300s FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS
+# hook budget). Echoes the bound; an invalid value (not an integer in 1..3600)
+# prints a usage error naming the knob and returns 1 — fail closed, like
+# _preview_fetch_timeout. Callers run it in a tested context (#631 / TRAPZERR).
+_preview_lock_timeout() {
+  local v="${FISHHAWK_PREVIEW_LOCK_TIMEOUT:-}"
+  if [[ -z "$v" ]]; then
+    print -r -- 240
+    return 0
+  fi
+  if [[ "$v" != <-> ]] || (( ${#v} > 4 )) || (( v < 1 || v > 3600 )); then
+    print -u2 "error: FISHHAWK_PREVIEW_LOCK_TIMEOUT must be a positive integer number of seconds (1..3600) (got '${v}')"
+    return 1
+  fi
+  print -r -- $(( v ))
+}
+
+# The advisory holder pid recorded in <owner_file>, or 'unknown' when the file
+# is absent or empty, holds no pid, or names a process that no longer runs. The
+# .owner file is diagnostic only (the kernel lock is the authority), so a stale
+# or torn value must never trip set -u/-e.
+_preview_lock_owner() {
+  local f="$1" v=""
+  if [[ -r "$f" ]]; then
+    IFS= read -r v < "$f" 2>/dev/null || true
+  fi
+  v="${v//[[:space:]]/}"
+  if [[ "$v" == <-> ]] && kill -0 "$v" 2>/dev/null; then
+    print -r -- "$v"
+  else
+    print -r -- unknown
+  fi
+}
+
+# _preview_lock_acquire <lockfile> <secs> — take the shared-slot preview lock
+# (#4308): a kernel fcntl lock via `zsystem flock`, held on the fd in the global
+# _PREVIEW_LOCK_FD until this process EXITS (the kernel releases it then, so a
+# crashed or SIGKILLed holder never wedges it, and a disowned child — which
+# inherits no fcntl lock, and whose copy of the fd is closed on exec — keeps
+# none). The lock file is only `: >>`-touched BEFORE acquisition: any later
+# redirection to it in this shell would release the lock. A free lock returns
+# 0 at once; a contended one prints a wait line naming the holder and waits up
+# to <secs>. Returns 1 on timeout (fail CLOSED: proceeding would reproduce the
+# race). An unloadable zsh/system, no flock support, or a lock file that cannot
+# be opened/locked prints a warning and returns 0 (fail OPEN, like the
+# ps/lsof-absent degrades — the runner's teardown-before-egress ordering is the
+# primary control).
+_preview_lock_acquire() {
+  local lockfile="$1" secs="$2" rc=0
+  local owner_file="${lockfile}.owner"
+  if ! zmodload zsh/system 2>/dev/null || ! zsystem supports flock 2>/dev/null; then
+    print -u2 "warning: preview: zsh/system flock is unavailable — proceeding WITHOUT the preview lock (${lockfile})"
+    return 0
+  fi
+  if ! mkdir -p "${lockfile:h}" 2>/dev/null || ! : >> "$lockfile" 2>/dev/null; then
+    print -u2 "warning: preview: cannot open the preview lock ${lockfile} — proceeding WITHOUT it"
+    return 0
+  fi
+  typeset -g _PREVIEW_LOCK_FD
+  # A short first attempt tells a free lock from a contended one, so only a
+  # contended acquire prints the wait line (status 2 = timed out).
+  zsystem flock -t 0.1 -f _PREVIEW_LOCK_FD "$lockfile" 2>/dev/null || rc=$?
+  if (( rc == 2 )); then
+    print -u2 "preview: waiting for the preview lock (${lockfile}, held by pid $(_preview_lock_owner "$owner_file"))…"
+    rc=0
+    zsystem flock -t "$secs" -f _PREVIEW_LOCK_FD "$lockfile" 2>/dev/null || rc=$?
+    if (( rc == 2 )); then
+      print -u2 "error: timed out after ${secs}s waiting for the preview lock ${lockfile} (held by pid $(_preview_lock_owner "$owner_file")) — another scripts/dev preview / preview-down is still running; let it finish (or stop that pid) and retry, or raise FISHHAWK_PREVIEW_LOCK_TIMEOUT"
+      return 1
+    fi
+  fi
+  if (( rc != 0 )); then
+    print -u2 "warning: preview: could not lock ${lockfile} (zsystem flock exit ${rc}) — proceeding WITHOUT the preview lock"
+    return 0
+  fi
+  print -r -- "${sysparams[pid]}" > "$owner_file" 2>/dev/null || true
+  return 0
+}
+
 # One bounded, non-interactive `git fetch --quiet origin [<ref>]` in REPO_ROOT.
 # Returns 0 on success, 124 when the bound expired (_run_with_timeout), and
 # another non-zero on failure. Sets the global _PREVIEW_FETCH_TAIL to the last
@@ -4579,14 +4681,7 @@ cmd_preview() {
 
   # Environment (same posture as cmd_up): FISHHAWKD_DATABASE_URL and the
   # FISHHAWK_PREVIEW_* overrides may live only in .env.
-  if [[ -f "${REPO_ROOT}/.env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/.env"
-    set +a
-  else
-    print "warning: .env not found — using current shell environment"
-  fi
+  _preview_load_env
 
   # Re-apply the env fallbacks now that .env has landed (the parser ran
   # before it, so an .env-only FISHHAWK_PREVIEW_SHA / _SEED is honored here).
@@ -4614,6 +4709,11 @@ cmd_preview() {
   # here — before any DB or build work — so an invalid knob fails on its own.
   local fetch_secs=""
   if ! fetch_secs="$(_preview_fetch_timeout)"; then
+    exit 1
+  fi
+  # The shared-slot lock bound (#4308), validated fail-closed alongside it.
+  local lock_secs=""
+  if ! lock_secs="$(_preview_lock_timeout)"; then
     exit 1
   fi
 
@@ -4649,6 +4749,16 @@ cmd_preview() {
   sha="$REPLY"
   local short_sha
   short_sha="$(git -C "${REPO_ROOT}" rev-parse --short "$sha")"
+
+  # Serialize on the shared-slot preview lock (#4308) BEFORE touching the
+  # shared pid file / worktree, and AFTER ref resolution so a bounded fetch
+  # never holds it: an in-flight `preview-down` (the previous acceptance's
+  # teardown) finishes removing PREVIEW_WORKTREE before this provision starts.
+  # Held until this process exits — across worktree add, build, role/DB setup,
+  # migrate, spawn, readiness and seed.
+  if ! _preview_lock_acquire "$PREVIEW_LOCK_FILE" "$lock_secs"; then
+    exit 1
+  fi
 
   # Deterministic restart: tear down any prior preview (tracked pid + worktree)
   # before this one — the runner hook re-provisions per acceptance stage.
@@ -4776,7 +4886,18 @@ cmd_preview() {
 # `scripts/dev preview-down` — TERM→KILL the tracked preview daemon, remove
 # the preview worktree (and the binary inside it), drop the pid file. The
 # preview database is left in place; the next preview start DROP/CREATEs it.
+# Serialized with `preview` on the shared-slot lock (#4308); .env is loaded
+# first so an .env-only FISHHAWK_PREVIEW_LOCK_TIMEOUT applies on the runner's
+# teardown path, whose sanitized env does not carry it.
 cmd_preview_down() {
+  _preview_load_env
+  local lock_secs=""
+  if ! lock_secs="$(_preview_lock_timeout)"; then
+    exit 1
+  fi
+  if ! _preview_lock_acquire "$PREVIEW_LOCK_FILE" "$lock_secs"; then
+    exit 1
+  fi
   _preview_kill_tracked "$PREVIEW_PID_FILE"
   # Reclaim an orphaned preview port (#1675): a cancelled/failed run can leave
   # the preview fishhawkd LISTENing on the port with its pid file already gone,
