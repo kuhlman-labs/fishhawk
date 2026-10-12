@@ -101,10 +101,29 @@
     "contrary to the issue",
     "at odds with the issue",
     "requires a soft delete",
-    "at odds with the soft"
+    "at odds with the soft",
+    "requires the opposite",
+    "says the opposite",
+    "yet contradicts",
+    "yet conflicts",
+    "but contradicts",
+    "directly contradicts",
+    "contradicts both the issue",
+    "conflicts directly with",
+    "contradicts the originating issue",
+    "contradicts that issue",
+    "contradict the issue",
+    "conflict with the issue",
+    "nothing in the issue permits",
+    "contradict the stated requirement"
   ],
   "attribution_phrases": [
     "removes the widget row"
+  ],
+  "defect_phrases": [
+    "soft delete",
+    "removes the widget row",
+    "deleted_at"
   ],
   "catching_examples": [
     {
@@ -116,6 +135,11 @@
       "severity": "high",
       "category": "acceptance_criteria",
       "note": "One explicit criterion demands a hard delete that removes the widget row, which conflicts with the issue's soft-delete requirement."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "Criterion ac-delete-hard (source explicit, example-org/widgets-service#106, blocking) requires that DELETE /widgets/{id} removes the widget row from the database. The issue requires the opposite: DELETE sets deleted_at and KEEPS the row, and says 'Do not physically remove rows.' The plan's approach (soft delete via deleted_at) matches the issue and so contradicts this criterion; as written, a correct implementation would fail it. Resolve by replacing it with a criterion that the row still exists with deleted_at set after DELETE."
     }
   ],
   "non_catching_examples": [
@@ -162,6 +186,11 @@
     {
       "category": "scope",
       "note": "Code that removes the widget row elsewhere (the admin purge) is unjustified to keep; the mismatch with the new deleted_at filter is ambiguous."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "No acceptance criterion verifies the central behavior the issue and summary promise: that after DELETE the row is retained with deleted_at populated. Once ac-delete-hard is corrected, a criterion such as 'after DELETE /widgets/{id}, the widgets row still exists and deleted_at is non-null' should be added. The plan's test strategy already includes a store test for this, but no criterion captures it."
     }
   ]
 }

@@ -123,13 +123,15 @@ const (
 	// matchCatchProbe changes meaning: it is folded into the evidence
 	// fingerprint, so a bump makes a recorded measurement stale instead of
 	// silently re-scoring it under new rules.
-	catchRuleVersion = "planreview-catch-v3: a trial is caught when the response decodes (extract first '{'..last '}', " +
+	catchRuleVersion = "planreview-catch-v4: a trial is caught when the response decodes (extract first '{'..last '}', " +
 		"verdict one of approve|approve_with_concerns|reject) and ONE concern satisfies both halves: its note OR category " +
 		"contains a planted criterion id (miss.json criterion_id) or a declared attribution phrase, AND its note OR " +
 		"category contains some catch probe, each as a case-folded (strings.ToLower) substring; an undecodable response " +
 		"is a miss counted in trials; no probe occurs case-folded in the case's issue title, issue body or plan text " +
 		"(loader mode m); each attribution phrase occurs case-folded in a planted criterion's statement and in no other " +
-		"criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q)"
+		"criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q); " +
+		"each case declares at least one non-blank defect phrase occurring case-folded in its issue or plan text (loader mode r); " +
+		"v4 widens the per-case probes with the plan-review prompt's own vocabulary (#4355)"
 )
 
 // The two attribution kinds a caught trial records: which half of the
@@ -202,7 +204,15 @@ type PlanReviewCatchInput struct {
 	// planted criterion's statement and in no other criterion's statement
 	// (loader mode p): the id-free way a concern can name the planted
 	// criterion for the ATTRIBUTION half of the rule.
-	AttributionPhrases  []string              `json:"attribution_phrases"`
+	AttributionPhrases []string `json:"attribution_phrases"`
+	// DefectPhrases are the case-SPECIFIC content of the planted defect (its
+	// domain nouns, values and wording), each occurring case-folded in the
+	// case's own issue or plan (loader mode r). They are never matched against
+	// a concern: the prompt-leak self-check fails when one occurs in the
+	// static plan-review prompt, which would show every reviewer the planted
+	// answer (#4355). Class-level vocabulary the prompt legitimately teaches
+	// ("was written", "robust", "vague") is not a defect phrase.
+	DefectPhrases       []string              `json:"defect_phrases"`
 	CatchingExamples    []CatchExampleConcern `json:"catching_examples"`
 	NonCatchingExamples []CatchExampleConcern `json:"non_catching_examples"`
 }
@@ -282,6 +292,12 @@ func catchRuleFor(m PlanReviewMissCase, in PlanReviewCatchInput) CatchRule {
 //	(q) a planted criterion id occurring (case-folded) inside another
 //	    criterion id of the plan — a concern naming that other id would carry
 //	    the planted id as a substring and be attributed to it
+//	(r) empty defect_phrases, an empty/whitespace defect phrase, or a defect
+//	    phrase absent (case-folded) from the issue title, the issue body and
+//	    every key and value of the plan — a declared phrase must really be
+//	    this case's content, or the prompt-leak self-check that reads it
+//	    proves nothing (#4355). It applies to every case, including cases
+//	    added after it (#4313)
 //
 // Mode (d) includes trailing content after the JSON value: a second object
 // or garbage appended to a valid review_input.json is refused, not ignored.
@@ -420,6 +436,18 @@ func loadPlanReviewCatchCase(dir string, m NamedPlanReviewMissCase) (PlanReviewC
 	shown, err := catchShownText(in)
 	if err != nil {
 		return fail("review_input.json: plan: %w", err)
+	}
+	if len(in.DefectPhrases) == 0 {
+		return fail("review_input.json: defect_phrases must be non-empty — the prompt-leak self-check cannot tell whether the plan-review prompt shows this case's planted defect") // (r)
+	}
+	for i, phrase := range in.DefectPhrases {
+		lp := strings.ToLower(strings.TrimSpace(phrase))
+		if lp == "" {
+			return fail("review_input.json: defect_phrases[%d] is empty — an empty phrase occurs in every prompt", i) // (r)
+		}
+		if !strings.Contains(shown, lp) {
+			return fail("defect phrase %q occurs in neither the issue nor the plan: a defect phrase must be this case's own content", phrase) // (r)
+		}
 	}
 	for _, probe := range in.CatchProbes {
 		if strings.Contains(shown, strings.ToLower(strings.TrimSpace(probe))) {

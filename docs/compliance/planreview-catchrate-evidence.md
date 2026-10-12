@@ -6,7 +6,7 @@ reviewer's catch rate. Sibling of
 [`severity-calibration-evidence.md`](severity-calibration-evidence.md), and it
 ships with the same honest residual.
 
-## Baseline status: first pinned 2026-10-10; re-pin required by #4253
+## Baseline status: re-pinned 2026-10-12; re-pin required by #4355
 
 The first baseline was recorded and pinned on 2026-10-10 on
 `claude-sonnet-5-5` (row in the results table at the bottom;
@@ -14,10 +14,14 @@ The first baseline was recorded and pinned on 2026-10-10 on
 over six cases under the probe-only `planreview-catch-v2` rule. E55.18 /
 #4253 changed the catch rule (`planreview-catch-v3`: one concern must name
 the planted criterion AND match a probe), grew the corpus to twelve cases and
-added the trial sidecar, so that record is stale and its baseline is not
-comparable: the next recording must RE-PIN (Step 2) and commit the record
-with its sidecar (Step 3). The current pinned baseline is whatever
-`evidence.json` carries; the results table lists every recording.
+added the trial sidecar; the 2026-10-12 recording re-pinned for it and the
+#4254 prompt fold-in. E55.22 / #4355 bumps the catch rule to
+`planreview-catch-v4` (prompt-vocabulary probes, loader mode r) and replaces
+the plan-review prompt's corpus-echoing examples, so that record is stale and
+its baseline is not comparable: the next recording must RE-PIN (Step 2) and
+commit the record with its sidecar (Step 3), on the #4355 branch before it
+merges. The current pinned baseline is whatever `evidence.json` carries; the
+results table lists every recording.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -117,6 +121,31 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 
 Land that recording commit on the #4253 run branch before merge.
 
+**Evaluate a probe change for free first.** Before any recording, run the
+offline re-score: it re-classifies the committed sidecar under the CURRENT
+corpus and catch rule with no model call, so a probe change shows its effect
+on the last recording before you pay for the next one (a per-arm lower
+bound, in-sample, never a PASS, never written; long-form:
+`backend/internal/agenteval/README.md` § "The offline re-score"):
+
+```sh
+(cd backend && go run ./internal/agenteval/catchrategate --rescore)
+```
+
+**The #4355 recording is a re-pin too.** Catch rule v4 changes the
+fingerprint and the prompt examples changed, so the 2026-10-12 baseline is
+not comparable:
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4355: catch rule v4 (prompt-vocabulary probes) and corpus-disjoint prompt examples; the v3 baseline is not comparable' \
+  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+That recording is the ONLY out-of-sample measurement of v4: the re-score
+below tuned the v4 probes on the same sidecar it reports.
+
 Cost: each measurement is two arms of `ceil(136 / cases) x cases` plan-review
 calls — 2 x 144 with the twelve committed cases (12 samples per case) —
 against
@@ -192,7 +221,8 @@ jq -r '.arms | to_entries[] | .key as $arm | [.value.per_case[][] | select(.outc
   persists, consider an LLM-judge classifier.
 - Many `attribution_without_probe` concerns mean the reviewer named the
   planted criterion in words no probe covers: read the notes and widen the
-  probes if they flag the planted defect.
+  probes if they flag the planted defect, then check the widened set with
+  `catchrategate --rescore` before re-recording.
 - Either change edits a `review_input.json`, so the record goes stale and
   must be re-measured. The case set is unchanged, so the baseline stays
   comparable; re-pinning is an explicit choice there, not forced.
@@ -203,8 +233,71 @@ arms — caught in every trial, or in at most one (with 12 samples per case,
 `<= 2/23` thresholds) — no longer discriminates. Explain each such case in
 the recording PR, or file a follow-up for a harder variant.
 
+## Offline re-score: catch rule v3 → v4 (2026-10-12 sidecar, #4355)
+
+Re-score of the committed sidecar
+(`backend/internal/agenteval/testdata/planreview-catchrate/evidence.trials.json`,
+`recorded_at` 2026-10-12T12:44:59Z, `prompt_fingerprint`
+`sha256:344b9a192a0740939ded46f8b61ba4694e41656cf1b90c6a6fb13a099fca2995`,
+`claude-sonnet-5-5`) under `planreview-catch-v4`, produced by
+`catchrategate --rescore`. No model call; nothing recorded or pinned.
+
+- **Each arm's figure is a LOWER BOUND** (stored notes are cut at 1000 runes,
+  at most 12 concerns are stored per trial, and a caught trial stores only its
+  matching concern; no stored concern was cut, so 0 lower-bound trials). **The
+  arm delta is NOT a bound.**
+- **The v4 rates are IN-SAMPLE**: the v4 probes were tuned on this sidecar.
+  The operator's v4 recording (Step 2) is the only out-of-sample measurement.
+- **The corpus is at ceiling (#4361).** v4 equals the attribution-only rate
+  in both arms (within 0.03): once a concern names the planted criterion, the
+  probe half rejects almost nothing. The gate still compares arms, but the
+  probes no longer separate a catch from an attributed miss on this corpus.
+
+| Arm | v3 recorded | v4 re-scored | Attribution-only | Gained / lost | Undecodable |
+|---|---|---|---|---|---|
+| without conventions | 87/144 (0.604) | 143/144 (0.993) | 143/144 (0.993) | +56 / -0 | 1 |
+| with conventions | 82/144 (0.569) | 144/144 (1.000) | 144/144 (1.000) | +62 / -0 | 0 |
+| delta (without - with) | +0.035 | -0.007 (not a bound) | | | |
+
+| Case | Without: v3 → v4 (attribution-only) | With: v3 → v4 (attribution-only) |
+|---|---|---|
+| contradicts-issue | 4 → 12 (12) | 6 → 12 (12) |
+| contradicts-numeric-limit | 10 → 12 (12) | 9 → 12 (12) |
+| contradicts-status-code | 9 → 12 (12) | 6 → 12 (12) |
+| inferred-criterion | 0 → 12 (12) | 1 → 12 (12) |
+| inferred-sibling-retention | 4 → 12 (12) | 1 → 12 (12) |
+| inferred-sibling-timeout | 0 → 11 (11; 1 undecodable) | 0 → 12 (12) |
+| restates-approach | 11 → 12 (12) | 12 → 12 (12) |
+| untestable-adjective | 12 → 12 (12) | 12 → 12 (12) |
+| untestable-reasonable-time | 11 → 12 (12) | 11 → 12 (12) |
+| untestable-user-friendly | 12 → 12 (12) | 11 → 12 (12) |
+| unwarranted-rate-limit | 2 → 12 (12) | 1 → 12 (12) |
+| vacuous-criterion | 12 → 12 (12) | 12 → 12 (12) |
+
+**Every remaining attributed miss, judged.** Under v4 no decodable trial
+carrying an attributed concern stays missed in either arm; the one uncaught
+trial (without conventions, inferred-sibling-timeout) is undecodable. The
+last attributed misses tuned in were each read and judged a REAL catch, so
+each got a probe: contradicts-status-code without trial 6 ("would contradict
+the stated requirement") and with trial 3 ("Nothing in the issue permits
+400"); restates-approach without trial 1 ("is a restatement of approach step
+2"); untestable-reasonable-time without trial 7 and with trial 12, and
+untestable-user-friendly with trial 2 ("no executor can decide"). The
+attributed concerns that are about the WRONG defect (a missing test, a
+scope or implementability gap, an unnamed limit) were left unmatched, and one
+per affected case is now a verbatim `non_catching_example`
+(contradicts-issue, contradicts-numeric-limit, contradicts-status-code, the
+three inferred-* cases, untestable-reasonable-time, unwarranted-rate-limit).
+No difference between the arms comes from the matcher: both arms reach their
+attribution-only ceiling, and the 1-trial gap is the undecodable response.
+No bare class label (`issue fidelity`, `warrant check`) was needed: it was
+never the sole matcher of a real catch. The with arm is re-primed with
+"issue fidelity" by `ReviewConventionsFraming`, which is one more reason not
+to use it as a probe.
+
 ## Results
 
 | Recorded at | Generator model | Without conventions | With conventions | Delta | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|
 | 2026-10-10T18:33:25Z | `claude-sonnet-5-5` | 80/138 (0.580) | 83/138 (0.601) | -0.022 | pinned (first measurement, #4235) | PASS |
+| 2026-10-12T12:44:59Z | `claude-sonnet-5-5` | 87/144 (0.604) | 82/144 (0.569) | +0.035 | re-pinned (#4253 + #4254 fold-in; the 2026-10-10 baseline is not comparable) | PASS |
