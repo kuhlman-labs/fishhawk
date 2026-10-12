@@ -143,6 +143,11 @@
       "minLength": 1,
       "maxLength": 2000,
       "description": "Optional (E83.52 / #4085). The short statement of what the triggering issue still needs after this delivery. REQUIRED when delivery is partial (enforced by the root if/then) and INVALID otherwise (plan.Parse rejects a remaining_scope paired with an absent or full delivery, and a whitespace-only one, which minLength:1 admits). Posted on the issue at merge and shown to the approver in the PARTIAL DELIVERY advisory."
+    },
+    "counterfactuals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/counterfactual" },
+      "description": "Optional (E85.3 / #4143). Structured counterfactuals the implement runner EXECUTES after the committed-tree verify gate passes: for each entry it applies the mutation to control_path in a scratch clone of the verified head, runs the named Go tests, and records whether they went RED. The runner's observation (red | green | timeout | error) reaches the review gate as a counterfactual_observed audit row; a GREEN observation (the tests still pass with the control mutated, so nothing pins it) raises a server_check control_unpinned concern only a human can clear. Declare one entry per production control the change adds or tightens whose deletion a named test should catch. At most 8 entries (enforced semantically by plan.Validate and plan.Parse, not by the schema). Not executed for a plan carrying decomposition.sub_plans (the plan draws an advisory instead). Additive-optional within standard_v1 (no major bump)."
     }
   },
 
@@ -528,6 +533,68 @@
           "type": "string",
           "minLength": 1,
           "description": "ONE line naming the direction the plan sets. Rendered as the lead of the plan-gate advisory."
+        }
+      }
+    },
+
+    "counterfactual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control_path", "mutation", "tests", "expect"],
+      "description": "One runner-executed counterfactual (E85.3 / #4143): mutate the production control at control_path and expect the named tests to go RED. plan.Validate and plan.Parse reject a control_path that is whitespace-only, absolute, contains a `..` segment or a backslash, or names a `_test.go` file (a test-side control cannot be shown load-bearing by its own tests going RED — name the production control).",
+      "properties": {
+        "control_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path of the production file holding the control. The mutation is confined to this file."
+        },
+        "mutation": { "$ref": "#/$defs/counterfactual-mutation" },
+        "tests": { "$ref": "#/$defs/counterfactual-tests" },
+        "expect": {
+          "type": "string",
+          "enum": ["red"],
+          "description": "The expected outcome of the mutated test run. Only `red` is defined: the named tests must FAIL with the control mutated."
+        }
+      }
+    },
+
+    "counterfactual-mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How to mutate control_path. Exactly ONE form: find + replace (the runner replaces the single occurrence of find with replace; zero or several occurrences record an error, not a result), or patch (a unified diff applied with git apply, touching only control_path). The exactly-one-form rule is enforced semantically by plan.Validate and plan.Parse, not by the schema: find without replace, replace without find, replace equal to find, both forms, and neither form are all rejected.",
+      "properties": {
+        "find": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The exact text to replace in control_path. Must occur exactly once in the verified head's copy of the file."
+        },
+        "replace": {
+          "type": "string",
+          "description": "The replacement text. May be empty, which deletes the match. Must differ from find."
+        },
+        "patch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A unified diff applied with git apply. Every hunk must touch control_path only; a binary, mode-change, create, delete, rename or copy entry records an error."
+        }
+      }
+    },
+
+    "counterfactual-tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run", "package"],
+      "description": "The Go tests the runner executes (`go test -json -count=1 -run <run> <package>`), once on the unmutated verified head (the baseline, which must pass) and once with the mutation applied.",
+      "properties": {
+        "run": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The go test -run selector (a regular expression over test names), e.g. `^TestValidate_Counterfactuals$`. Must match at least one test, or the runner records an error."
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`. Must not be absolute or contain a `..` segment."
         }
       }
     }

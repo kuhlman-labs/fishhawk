@@ -71,7 +71,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "irreducible": { "rationale": "...", "atomicity_basis": "..." },
   "new_architectural_decision": { "rationale": "...", "related_adrs": ["..."], "decision_summary": "..." },
   "delivery": "full|partial",
-  "remaining_scope": "..."
+  "remaining_scope": "...",
+  "counterfactuals": [ { "control_path": "...", "mutation": { "find": "...", "replace": "..." }, "tests": { "run": "...", "package": "..." }, "expect": "red" } ]
 }
 ```
 
@@ -271,7 +272,7 @@ Plans that include expensive test gates must allocate wall-clock time for them i
 
 Expensive gates are: `-count >= 50`, or `-race` combined with `./...` (full-repo). These are reserved for the final iteration. The advisory heuristic in `plan.Warnings` surfaces a warning when an expensive gate appears in `test_strategy` but `predicted_runtime_minutes` is below 20, flagging plans where the runtime budget is implausibly short for the stated verification approach.
 
-**`plan.Warnings` advisory `counterfactual_mechanism_missing` (E68.28 / #3057).** A second advisory reads `test_strategy`: a sentence that makes a COUNTERFACTUAL CLAIM — it names a control deletion (`delete`/`remove`/`comment out`/`stub out`/`mutate`/`with the control absent`/`counterfactual`) AND a RED outcome (`red`/`reddens`/`fail*`, matched on whole tokens so `required` and `predicted` never count) — while stating no MECHANISM in that sentence or the immediately following one draws one warning quoting a bounded (≤160-rune, rune-safe) excerpt. A mechanism is any of `because`/`since`/`so that`/`otherwise`/`fixture`/`isolat`/`only guard`/`only thing in the path`/`would produce`/`observable`/`setup`/`seed*`. The remedy the warning names is a SETUP obligation, because in every reported instance the defect was in the fixture's setup and not its assertion: state the fixture state that makes the deletion observable — what the test would produce if the control were absent — or construct an isolating case. At most 5 warnings, then one `(N more … suppressed)` tail, so the `plan_warnings` payload stays bounded. ADVISORY: `plan.Warnings` never refuses a plan. Residual, stated rather than glossed: the detector is LEXICAL and therefore evadable by construction — a hollow `because` clause clears it. The plan prompt's Counterfactual attainability rule clause (5) is the prevention; this warning is the reviewer's prompt to trace one.
+**`plan.Warnings` advisory `counterfactual_mechanism_missing` (E68.28 / #3057).** A second advisory reads `test_strategy`: a sentence that makes a COUNTERFACTUAL CLAIM — it names a control deletion (`delete`/`remove`/`comment out`/`stub out`/`mutate`/`with the control absent`/`counterfactual`) AND a RED outcome (`red`/`reddens`/`fail*`, matched on whole tokens so `required` and `predicted` never count) — while stating no MECHANISM in that sentence or the immediately following one draws one warning quoting a bounded (≤160-rune, rune-safe) excerpt. A mechanism is any of `because`/`since`/`so that`/`otherwise`/`fixture`/`isolat`/`only guard`/`only thing in the path`/`would produce`/`observable`/`setup`/`seed*`. The remedy the warning names is a SETUP obligation, because in every reported instance the defect was in the fixture's setup and not its assertion: state the fixture state that makes the deletion observable — what the test would produce if the control were absent — or construct an isolating case. At most 5 warnings, then one `(N more … suppressed)` tail, so the `plan_warnings` payload stays bounded. ADVISORY: `plan.Warnings` never refuses a plan. Residual, stated rather than glossed: the detector is LEXICAL and therefore evadable by construction — a hollow `because` clause clears it. The plan prompt's Counterfactual attainability rule clause (5) is the prevention; this warning is the reviewer's prompt to trace one. The structured, runner-EXECUTED form of the same obligation is the top-level `counterfactuals` array (E85.3 / #4143).
 
 ### Runtime prediction
 
@@ -543,6 +544,35 @@ The optional pair a planner sets to declare a **partial delivery** (E83.52 / #40
 
 Named residuals: (a) a later fix-up or operator PR-body edit that reintroduces `Closes #N` is not re-checked before merge; (b) on GitLab the merge-time comment posts while the ship-time guard is GitHub-only; (c) an agent-authored commit message carrying a closing keyword is not rewritten (the implement prompt forbids it). A full or legacy plan is unaffected on every surface and still closes its issue. Additive-optional within `standard_v1.x` (no `x-intended-required`).
 
+### `counterfactuals`
+
+The optional array of **runner-executed counterfactuals** (E85.3 / #4143). Each entry names a production control the change adds or tightens, a mutation that disables it, and the Go tests that should go RED when it is disabled. Unlike the prose counterfactual record in `verification.test_strategy` (and the implement agent's self-reported sidecar), the runner EXECUTES each entry and the review gate reads the runner's observation, not a claim.
+
+```json
+{
+  "counterfactuals": [
+    {
+      "control_path": "backend/internal/plan/validate.go",
+      "mutation": { "find": "len(cfs) > MaxCounterfactuals", "replace": "false" },
+      "tests": { "run": "^TestValidate_Counterfactuals_CapEnforced$", "package": "./backend/internal/plan" },
+      "expect": "red"
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `control_path` | yes | Repo-relative path of the production file holding the control. The mutation is confined to this file. Not a `_test.go` file: a test-side control cannot be shown load-bearing by its own tests going RED (#3107). |
+| `mutation` | yes | Exactly one form. `find` + `replace`: replace the single occurrence of `find` with `replace` (an empty `replace` deletes the match; `replace` must differ from `find`). `patch`: a unified diff applied with `git apply`, touching only `control_path`. |
+| `tests.run` | yes | The `go test -run` selector. Must match at least one test. |
+| `tests.package` | yes | Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`. |
+| `expect` | yes | `red`, the only defined value: the named tests must FAIL with the control mutated. |
+
+**Execution.** After the implement (or fix-up) pass's committed-tree verify gate passes, the runner executes each entry sequentially against a scratch clone of the verified head (never the run's worktree): an unmutated baseline `go test -json -count=1 -run <run> <package>`, which must pass, then the same run with the mutation applied, then a restore. Each `go test` run holds the per-repository verify lock for its own duration and is bounded (5 minutes per run, 20 minutes for the whole phase). The observation is classified from the `go test -json` event stream and the exec disposition, never from free text: `red` (a test failed with the control mutated), `green` (every matched test still passed), `timeout`, or `error` with a closed-vocabulary reason (for example `baseline_not_green`, `build_failed`, `no_tests_matched`, `mutation_not_applied`, `mutation_ambiguous`) — so an environment failure can never read as RED. Each observation rides the runner-signed trace bundle (`gate_evidence.counterfactual_observations`) and becomes one `counterfactual_observed` audit row. A **`green`** observation raises one `server_check`-provenance implement concern with category `control_unpinned`: it is gate-visible, only a human can waive or defer it, and while it is open delegated (autonomy-tier) approve/merge settlement cannot fire. `red` passes silently; `timeout` and `error` are recorded and raise nothing.
+
+At most `plan.MaxCounterfactuals` (8) entries. The cap and the exactly-one-form rule are semantic (see "Validation rules beyond the schema"), not schema keywords: the runner derives every plan stage's structured-output schema from this one, and a `maxItems` or `oneOf` would reach that derivation (#1741). Entries are delivered only to a non-decomposed implement stage: a plan that also carries `decomposition.sub_plans` draws a `counterfactuals_not_executed_for_decomposition` `plan_warnings` advisory and its entries never run (declare them in the plan of the slice that owns the control). Additive-optional within `standard_v1.x` (no `x-intended-required`); a plan that omits it validates, warns and executes exactly as before.
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -559,6 +589,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `irreducible` is **mutually exclusive** with `split_proposal`: a plan carrying both returns `*SemanticError` (a plan cannot both decline and propose a split). And an `irreducible` whose `rationale` is blank/whitespace-only — which the schema's `minLength: 1` admits (a single space) — returns `*SemanticError`: an unjustified declaration is exactly the bare flag the design refuses (semantic check `checkIrreducible` in the plan package, #2412). `irreducible` adds **no** cap-aware logic to the semantic validator (it still has no view of the resolved cap), so no under-cap plan changes behaviour; the cap-aware relaxation lives at the server gate (`overCapSplitRejection`).
 - `new_architectural_decision` rejects whitespace-only values the schema's `minLength: 1` admits: a blank `rationale`, a blank `decision_summary`, or a blank `related_adrs` entry each returns `*SemanticError` naming the exact field path (`new_architectural_decision.rationale`, `.decision_summary`, `.related_adrs[i]`) (semantic check `checkNewArchitecturalDecision` in the plan package, E78.4 / #3748). `NewArchitecturalDecision.Declared()` applies the same three rules, so the advisory and the renders agree with the validator. No cap-aware or cross-field coupling.
 - `delivery` / `remaining_scope` (E83.52 / #4085): the schema's root `if`/`then` requires `remaining_scope` when `delivery` is `partial`, which the runner's schema-only `Validate` already enforces. The semantic check `checkDelivery` adds the two rules the schema does not express: a `partial` delivery with a whitespace-only `remaining_scope` (which `minLength: 1` admits) and a non-empty `remaining_scope` paired with an absent or `full` delivery each return `*SemanticError` naming `remaining_scope`. The backend runs `checkDelivery` from BOTH `plan.Parse` (`semanticCheck`) and `plan.Validate` (the plan-upload path, which never reaches `Parse`); the runner's copy does not, so such a plan passes the runner and is refused at upload.
+- `counterfactuals` (E85.3 / #4143): the semantic check `checkCounterfactuals` enforces what the schema deliberately does not express (a `maxItems` or `oneOf` would reach the derived structured-output schema, #1741). Each violation is a `*SchemaError` whose `Violations` name the member by JSON Pointer (at most one per member, all collected): more than 8 entries (`/counterfactuals`); a `control_path` that is whitespace-only, absolute, contains a backslash or a `..` segment, or ends in `_test.go` (`/counterfactuals/<i>/control_path`); a `mutation` with both forms or neither (`…/mutation`), `find` without `replace` or `replace` equal to `find` (`…/mutation/replace`), `replace` without `find` (`…/mutation/find`); a whitespace-only `tests.run` (`…/tests/run`); a `tests.package` that is absolute or contains a `..` segment (`…/tests/package`; a `/...` wildcard is not one). Like `checkDelivery`, it runs from BOTH `plan.Parse` and `plan.Validate`; the runner's schema-only copy does not run it, so such a plan passes the runner and is refused at upload.
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

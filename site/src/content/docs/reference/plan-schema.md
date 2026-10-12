@@ -48,6 +48,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 | `new_architectural_decision` | `new-architectural-decision` | optional |  | Optional (E78.4 / #3748). The planner's declaration that this plan sets NEW ARCHITECTURAL DIRECTION — PRESENCE of this object is the declaration, the same idiom as irreducible. Declare it when the plan introduces a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or departs from a cited ADR. Do NOT declare it for routine work inside existing decisions, which is most plans. It is surfaced to the captain as one plan_warnings advisory naming the decision summary, the rationale and the related ADRs, and the captain decides whether the direction needs an ADR. It gates nothing: unlike irreducible, no enforcement path reads it. Additive-optional within standard_v1 (no major bump). |
 | `delivery` | string | optional | enum: `full`, `partial` | Optional (E83.52 / #4085). Absent means full. `partial` declares that the approved plan deliberately delivers only a slice of the triggering issue's scope (part of its done-means is left for a later run). For a partial plan the PR references the issue with `Refs #N` instead of `Closes #N`, so merging it does not close the issue; Fishhawk posts remaining_scope on the issue at merge; and the plan gate surfaces the declaration to the approver as a PARTIAL DELIVERY plan_warnings advisory. Omit it for a full delivery, which is the normal case. Additive-optional within standard_v1 (no major bump). |
 | `remaining_scope` | string | optional | minLength: `1`; maxLength: `2000` | Optional (E83.52 / #4085). The short statement of what the triggering issue still needs after this delivery. REQUIRED when delivery is partial (enforced by the root if/then) and INVALID otherwise (plan.Parse rejects a remaining_scope paired with an absent or full delivery, and a whitespace-only one, which minLength:1 admits). Posted on the issue at merge and shown to the approver in the PARTIAL DELIVERY advisory. |
+| `counterfactuals` | array of `counterfactual` | optional |  | Optional (E85.3 / #4143). Structured counterfactuals the implement runner EXECUTES after the committed-tree verify gate passes: for each entry it applies the mutation to control_path in a scratch clone of the verified head, runs the named Go tests, and records whether they went RED. The runner's observation (red \| green \| timeout \| error) reaches the review gate as a counterfactual_observed audit row; a GREEN observation (the tests still pass with the control mutated, so nothing pins it) raises a server_check control_unpinned concern only a human can clear. Declare one entry per production control the change adds or tightens whose deletion a named test should catch. At most 8 entries (enforced semantically by plan.Validate and plan.Parse, not by the schema). Not executed for a plan carrying decomposition.sub_plans (the plan draws an advisory instead). Additive-optional within standard_v1 (no major bump). |
 
 #### standard_v1 — definitions
 
@@ -178,5 +179,35 @@ A planner's new-architectural-decision declaration (E78.4 / #3748). Read only by
 | `rationale` | string | required | minLength: `1` | Why this plan sets new architectural direction rather than working inside existing decisions. Surfaced to the captain in the plan-gate advisory. |
 | `related_adrs` | array of string | required |  | ADR identifiers this direction relates to or departs from (e.g. 'ADR-082' or '#3728'). An EMPTY array is valid and means no existing ADR covers the direction. |
 | `decision_summary` | string | required | minLength: `1` | ONE line naming the direction the plan sets. Rendered as the lead of the plan-gate advisory. |
+
+##### `counterfactual`
+
+One runner-executed counterfactual (E85.3 / #4143): mutate the production control at control_path and expect the named tests to go RED. plan.Validate and plan.Parse reject a control_path that is whitespace-only, absolute, contains a `..` segment or a backslash, or names a `_test.go` file (a test-side control cannot be shown load-bearing by its own tests going RED — name the production control).
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `control_path` | string | required | minLength: `1` | Repo-relative path of the production file holding the control. The mutation is confined to this file. |
+| `mutation` | `counterfactual-mutation` | required |  |  |
+| `tests` | `counterfactual-tests` | required |  |  |
+| `expect` | string | required | enum: `red` | The expected outcome of the mutated test run. Only `red` is defined: the named tests must FAIL with the control mutated. |
+
+##### `counterfactual-mutation`
+
+How to mutate control_path. Exactly ONE form: find + replace (the runner replaces the single occurrence of find with replace; zero or several occurrences record an error, not a result), or patch (a unified diff applied with git apply, touching only control_path). The exactly-one-form rule is enforced semantically by plan.Validate and plan.Parse, not by the schema: find without replace, replace without find, replace equal to find, both forms, and neither form are all rejected.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `find` | string | optional | minLength: `1` | The exact text to replace in control_path. Must occur exactly once in the verified head's copy of the file. |
+| `replace` | string | optional |  | The replacement text. May be empty, which deletes the match. Must differ from find. |
+| `patch` | string | optional | minLength: `1` | A unified diff applied with git apply. Every hunk must touch control_path only; a binary, mode-change, create, delete, rename or copy entry records an error. |
+
+##### `counterfactual-tests`
+
+The Go tests the runner executes (`go test -json -count=1 -run <run> <package>`), once on the unmutated verified head (the baseline, which must pass) and once with the mutation applied.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `run` | string | required | minLength: `1` | The go test -run selector (a regular expression over test names), e.g. `^TestValidate_Counterfactuals$`. Must match at least one test, or the runner records an error. |
+| `package` | string | required | minLength: `1` | Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`. Must not be absolute or contain a `..` segment. |
 
 <!-- END GENERATED plan-schema -->
