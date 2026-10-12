@@ -15209,8 +15209,10 @@ paths:
 
         **Decision-required parks the operator, not a 500.** When the
         delegated `route_fixup` arm cannot dispatch because the fix-up budget
-        is spent (`fixup_budget_exhausted`) or the hard ceiling is reached
-        (`fixup_ceiling_reached`), the outcome is a `decision_required:true`
+        is spent (`fixup_budget_exhausted`), the hard ceiling is reached
+        (`fixup_ceiling_reached`), or the open concerns cannot all be listed in
+        the fix-up prompt's concern block (`fixup_concerns_overflow`, #4284 —
+        refused before the transition), the outcome is a `decision_required:true`
         200 naming `decision_state` (E48.41 / #2091) — the driver STOPS and
         hands the gate to the operator with real next moves. This is a
         well-defined, EXPECTED gate state, distinct from a genuine dispatch
@@ -15257,7 +15259,7 @@ paths:
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
-                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381).' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381).' }
                   reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -24542,6 +24544,22 @@ paths:
         Otherwise merge with a follow-up, or start a fresh run. The operator
         still owns the merge.
 
+        **Every routed concern reaches the agent (#4284).** The fix-up prompt
+        lists the routed concerns in one 12000-byte concern block
+        (acceptance-derived failures in their own block of the same size):
+        operator concerns FIRST and in full, then every other concern with its
+        summary line (under its `(concern <id>)` tag when the trigger's
+        `concern_ids` pair with its concerns); a long note body is trimmed with
+        an explicit per-concern marker, never dropped. A set whose minimum
+        render (every summary line, operator concerns in full) cannot fit is
+        REFUSED with 422 `fixup_concerns_overflow` BEFORE the transition — no
+        pass is spent, no `stage_fixup_triggered` entry is written, no operator
+        concern is minted, and no concern is marked `addressed_pending`.
+        Acceptance-derived concerns are exempt, and an acceptance-triage pass is
+        never refused. An admitted pass whose note bodies were trimmed records
+        `concern_bodies_truncated: true` and `truncated_concern_ids` (a
+        conservative superset) on its `stage_fixup_triggered` entry.
+
         **Delivered-nothing refund (#967 / #1957 / #3085).** A fix-up pass
         that landed NOTHING on the PR branch is refunded against the NORMAL
         budget, so the next trigger is admitted WITHOUT
@@ -24710,9 +24728,11 @@ paths:
                     NOT raise `fixup_not_applicable`). At least one of
                     `concern_ids`, `concerns`, or `operator_concern` is required.
                     A whitespace-only value, or one whose byte length exceeds
-                    4000 (the renderer's per-section cap), is rejected (400
-                    `validation_failed`, `field: operator_concern`) rather than
-                    silently dropped or truncated. The raw text is recorded on
+                    4000 (kept within the fix-up prompt's 12000-byte concern
+                    block, where an operator concern renders first and is never
+                    trimmed, #4284), is rejected (400 `validation_failed`,
+                    `field: operator_concern`) rather than silently dropped or
+                    truncated. The raw text is recorded on
                     the `stage_fixup_triggered` audit entry as `operator_concern`.
                     Since #2623 the instruction is ALSO minted as a DURABLE
                     concern tracked to closure exactly like an id-routed one: it
@@ -24819,8 +24839,15 @@ paths:
             a late CI/SAST finding, #1068/#1044); or the resolved `implement_model`
             override is not in the deployment's per-adapter allow-list
             (`fixup_invalid_model`, #1164 — `details` carry the resolved
-            `model`, `model_source`, and `adapter`). Body's `message` explains
-            the specific reason.
+            `model`, `model_source`, and `adapter`); or the routed concerns
+            cannot all be listed within the fix-up prompt's 12000-byte concern
+            block even with every note cut to its summary line and operator
+            concerns in full (`fixup_concerns_overflow`, #4284 — refused before
+            the transition, so nothing is spent or marked; `details` carry
+            `bytes`, `max_bytes`, `overflow_bytes`, `concern_count`,
+            `concern_ids` (the routed ids, at most 50) and `remedy`: shorten
+            `operator_concern`, split the concerns across passes, or route fewer
+            `concern_ids`). Body's `message` explains the specific reason.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

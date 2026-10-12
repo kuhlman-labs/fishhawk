@@ -2759,6 +2759,12 @@ type fixupRequest struct {
 //   - 422 fixup_invalid_model (the resolved implement_model override is not in
 //     the deployment's per-adapter allow-list; details carry the resolved
 //     model, source, and adapter)
+//   - 422 fixup_concerns_overflow (#4284: the routed concerns cannot all be
+//     listed within the fix-up prompt's 12000-byte concern block even with
+//     every note cut to its summary line and operator concerns in full;
+//     refused before the transition, so nothing is spent or marked; details
+//     carry bytes, max_bytes, overflow_bytes, concern_count, concern_ids and
+//     remedy)
 //
 // allowCreate declares net-new files this pass will create (#823), folded
 // into the effective scope.files for that dispatch only; an invalid entry

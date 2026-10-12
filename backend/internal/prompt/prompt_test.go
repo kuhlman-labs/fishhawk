@@ -3771,13 +3771,17 @@ func TestBuild_Implement_FixupConcerns_Empty_Absent(t *testing.T) {
 	}
 }
 
+// TestBuild_Implement_FixupConcerns_Truncated is the inverted pre-#4284 cap
+// test. The 3990-byte concern used to fill the 4000-byte block and the 2nd and
+// 3rd concerns were DROPPED behind a tail marker; now the block budget is
+// MaxFixupConcernBytes and the renderer never drops a concern, so all three
+// render, the first in full, and the old tail marker is gone.
 func TestBuild_Implement_FixupConcerns_Truncated(t *testing.T) {
-	// One concern just under the cap, then more that must be dropped with a
-	// truncation marker so a pathological concern set can't blow the prompt.
+	first := strings.Repeat("x", 3990)
 	concerns := []FixupConcern{
-		{Text: strings.Repeat("x", 3990)},
-		{Text: "this concern should be truncated"},
-		{Text: "so should this one"},
+		{Text: first},
+		{Text: "this concern used to be truncated"},
+		{Text: "so did this one"},
 	}
 	got, err := Build("implement", Trigger{
 		Repo:          "o/r",
@@ -3787,11 +3791,16 @@ func TestBuild_Implement_FixupConcerns_Truncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "...[remaining concerns truncated]") {
-		t.Errorf("expected truncation marker for oversized concern set:\n%s", got)
+	for _, c := range concerns {
+		if !strings.Contains(got, "\n- "+c.Text+"\n") {
+			t.Errorf("concern %.40q must render in full on its own list line:\n%s", c.Text, got)
+		}
 	}
-	if strings.Contains(got, "so should this one") {
-		t.Errorf("concerns past the byte cap should be dropped:\n%s", got)
+	if strings.Contains(got, "remaining concerns truncated") {
+		t.Errorf("the pre-#4284 tail-drop marker must be gone:\n%s", got)
+	}
+	if !strings.Contains(got, "This pass routes 3 concern(s)") {
+		t.Errorf("framing must state the routed concern count:\n%s", got)
 	}
 }
 
@@ -3890,15 +3899,16 @@ func TestBuild_Implement_FixupConcerns_AcceptanceDerived_Quarantined(t *testing.
 	}
 }
 
-// TestBuild_Implement_FixupConcerns_AcceptanceDerived_Truncated pins the
-// acceptance-block byte cap (#1613): an oversized acceptance-derived concern set
-// is dropped past maxFixupConcernBytes with the acceptance-specific truncation
-// marker, so a pathological validator payload can't blow the prompt.
+// TestBuild_Implement_FixupConcerns_AcceptanceDerived_Truncated is the
+// inverted pre-#4284 acceptance-block cap test: the 2nd and 3rd acceptance
+// failures used to be dropped past the 4000-byte cap. They now render inside
+// the one envelope, quote-prefixed, and the 3990-byte first failure in full.
 func TestBuild_Implement_FixupConcerns_AcceptanceDerived_Truncated(t *testing.T) {
+	first := strings.Repeat("x", 3990)
 	concerns := []FixupConcern{
-		{Text: strings.Repeat("x", 3990), AcceptanceDerived: true},
-		{Text: "this acceptance failure should be truncated", AcceptanceDerived: true},
-		{Text: "so should this one", AcceptanceDerived: true},
+		{Text: first, AcceptanceDerived: true},
+		{Text: "this acceptance failure used to be truncated", AcceptanceDerived: true},
+		{Text: "so did this one", AcceptanceDerived: true},
 	}
 	got, err := Build("implement", Trigger{
 		Repo:          "o/r",
@@ -3908,11 +3918,19 @@ func TestBuild_Implement_FixupConcerns_AcceptanceDerived_Truncated(t *testing.T)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "...[remaining acceptance failures truncated]") {
-		t.Errorf("expected acceptance truncation marker for oversized set:\n%s", got)
+	beginIdx := strings.Index(got, "<<<BEGIN UNTRUSTED ACCEPTANCE FAILURE>>>")
+	endIdx := strings.Index(got, "<<<END UNTRUSTED ACCEPTANCE FAILURE>>>")
+	if beginIdx < 0 || endIdx < beginIdx {
+		t.Fatalf("expected one acceptance envelope, got begin=%d end=%d", beginIdx, endIdx)
 	}
-	if strings.Contains(got, "so should this one") {
-		t.Errorf("acceptance concerns past the byte cap should be dropped:\n%s", got)
+	envelope := got[beginIdx:endIdx]
+	for _, c := range concerns {
+		if !strings.Contains(envelope, "\n| "+c.Text+"\n") {
+			t.Errorf("acceptance failure %.40q must render in full, quote-prefixed, inside the envelope:\n%s", c.Text, envelope)
+		}
+	}
+	if strings.Contains(got, "remaining acceptance failures truncated") {
+		t.Errorf("the pre-#4284 acceptance tail-drop marker must be gone:\n%s", got)
 	}
 }
 
