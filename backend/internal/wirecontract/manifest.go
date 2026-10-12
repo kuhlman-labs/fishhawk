@@ -72,7 +72,8 @@ const (
 	uploadFile             = "runner/internal/upload/upload.go"
 	scenarioFile           = "runner/internal/scenario/scenario.go"
 	// runnerGateEvidenceGo / bundleGo hold the gate_isolation evidence pair
-	// (#2135); only that flat struct carries the marker in either file.
+	// (#2135) and the counterfactual observation pair (#4143); only those flat
+	// structs carry the marker in either file.
 	runnerGateEvidenceGo = "runner/cmd/fishhawk-runner/gateevidence.go"
 	bundleGo             = "backend/internal/bundle/bundle.go"
 )
@@ -262,6 +263,28 @@ func SeedManifest() Manifest {
 				Name: "gate_isolation_evidence", Anchor: "#2135",
 				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "gateIsolationEvidence"},
 				Consumer: Endpoint{File: bundleGo, Type: "GateIsolationEvidence"},
+				Mode:     ModeExact,
+			},
+			{
+				// The approved plan's runner-executed counterfactuals (E85.3 /
+				// #4143), flattened onto the implement prompt response.
+				// ModeExact: a flat leaf the runner decodes field-for-field;
+				// the bytes are ALSO pinned by the shared golden
+				// testdata/wire/counterfactual_spec.json.
+				Name: "counterfactual_spec", Anchor: "#4143",
+				Emitter:  Endpoint{File: promptFile, Type: "counterfactualSpec"},
+				Consumer: Endpoint{File: uploadFile, Type: "CounterfactualSpec"},
+				Mode:     ModeExact,
+			},
+			{
+				// The runner's observation of one executed counterfactual
+				// (E85.3 / #4143), folded into gate_evidence and decoded by the
+				// backend for the counterfactual_observed audit row. ModeExact:
+				// both sides are flat leaves; the bytes are ALSO pinned by the
+				// shared golden testdata/wire/counterfactual_observation.json.
+				Name: "counterfactual_observation_evidence", Anchor: "#4143",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "counterfactualObservationEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "CounterfactualObservationEvidence"},
 				Mode:     ModeExact,
 			},
 		},

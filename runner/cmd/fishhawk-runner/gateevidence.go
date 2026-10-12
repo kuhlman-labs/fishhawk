@@ -45,6 +45,14 @@ const (
 // uncovered must not push 400 paths into the review prompt.
 const diffCoverageMaxUncovered = 10
 
+// gateEvidenceCounterfactualCap bounds the counterfactual_observations member
+// (E85.3 / #4143). The plan caps declared counterfactuals at 8
+// (plan.MaxCounterfactuals) and the runner emits exactly one observation per
+// delivered entry, so 16 is headroom for that contract, not a working limit:
+// it exists so a stream that somehow carries more events cannot grow the
+// signed bundle's evidence without bound.
+const gateEvidenceCounterfactualCap = 16
+
 // gateEvidencePayload is the body of a gate_evidence event in the
 // bundle. The json tags MUST stay identical to the backend's
 // bundle.ExtractGateEvidence mirror structs — this is the
@@ -129,6 +137,68 @@ type gateEvidencePayload struct {
 	// (gateIsolationEvidenceFor) — never folded from a stream event. Absent
 	// (the byte-identical default) when no gate reached the exec seam.
 	GateIsolation *gateIsolationEvidence `json:"gate_isolation,omitempty"`
+	// CounterfactualObservations records the RUNNER-OBSERVED outcome of each
+	// plan-declared counterfactual (E85.3 / #4143), folded from the
+	// counterfactual_observed events in emission order and capped at
+	// gateEvidenceCounterfactualCap. Unlike FixupCounterfactuals (an agent
+	// CLAIM), every entry here is the runner's own execution record. Absent
+	// (the byte-identical default) when the stage executed no counterfactual.
+	CounterfactualObservations []counterfactualObservationEvidence `json:"counterfactual_observations,omitempty"`
+}
+
+// counterfactualObservationEvidence is the FLAT record of one executed
+// plan-declared counterfactual (E85.3 / #4143). Index joins it to the plan's
+// counterfactuals array; ControlPath / TestRun / TestPackage echo the
+// approved plan's entry; HeadSHA / TreeSHA name the verified head the scratch
+// clone was materialized at (empty when no verified tree existed). Baseline is
+// the unmutated run's outcome (green | red | timeout | error | skipped) and
+// Observed the entry's verdict (red | green | timeout | error); Reason is a
+// closed-enum cause, empty for red and green. DurationMS is the entry's
+// wall-clock time and TimeoutSeconds the per-run bound it ran under.
+// MutationSHA256 is the lowercase hex SHA-256 identifying the applied
+// mutation, so a later battery (#4300) can tell two observations of one
+// mutation from two different mutations; it is empty when no mutation was
+// applied (an invalid spec, or a failure before the mutation step).
+//
+// There is deliberately NO output text and NO test name: go test output and
+// test names are agent-authored strings, so they never cross the upload
+// boundary. Every string here is either an approved-plan echo, a git object
+// id, or a closed vocabulary.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// CounterfactualObservationEvidence, paired ModeExact in
+// backend/internal/wirecontract and pinned from both modules by
+// testdata/wire/counterfactual_observation.json.
+type counterfactualObservationEvidence struct {
+	Index          int    `json:"index"`
+	ControlPath    string `json:"control_path"`
+	TestRun        string `json:"test_run"`
+	TestPackage    string `json:"test_package"`
+	HeadSHA        string `json:"head_sha,omitempty"`
+	TreeSHA        string `json:"tree_sha,omitempty"`
+	Baseline       string `json:"baseline"`
+	Observed       string `json:"observed"`
+	Reason         string `json:"reason,omitempty"`
+	DurationMS     int64  `json:"duration_ms"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MutationSHA256 string `json:"mutation_sha256,omitempty"`
+}
+
+// counterfactualObservedEvent builds the counterfactual_observed trace event
+// for one executed counterfactual (E85.3 / #4143). The counterfactual phase
+// emits exactly one per delivered spec; composeGateEvidence folds them into
+// gate_evidence.counterfactual_observations. The observation rides under one
+// `observation` key, already in the gate_evidence wire shape, so the fold
+// decodes it byte-for-byte.
+func counterfactualObservedEvent(cfg config, obs counterfactualObservationEvidence) agent.Event {
+	return agent.Event{
+		Kind: "counterfactual_observed",
+		Payload: agent.MakePayload(map[string]any{
+			"run_id":      cfg.runID,
+			"stage_id":    cfg.stageID,
+			"observation": obs,
+		}),
+	}
 }
 
 // gateIsolationEvidence is the FLAT, pre-redacted digest of a recorded
@@ -454,7 +524,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation
 	gateRan := iso != nil
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses", "counterfactual_observed":
 			gateRan = true
 		}
 	}
@@ -605,6 +675,17 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation
 			}
 			dc := w
 			payload.DiffCoverage = &dc
+		case "counterfactual_observed":
+			var w struct {
+				Observation *counterfactualObservationEvidence `json:"observation"`
+			}
+			if json.Unmarshal(e.Payload, &w) != nil || w.Observation == nil {
+				continue
+			}
+			if len(payload.CounterfactualObservations) >= gateEvidenceCounterfactualCap {
+				continue
+			}
+			payload.CounterfactualObservations = append(payload.CounterfactualObservations, *w.Observation)
 		case "git_diff":
 			var w struct {
 				NumFiles int `json:"num_files"`
