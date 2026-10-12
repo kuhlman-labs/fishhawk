@@ -29,7 +29,10 @@ import (
 //   - pumpMergeCandidateQueue admits the base's next held entry when nothing is
 //     live, re-reads its PR, auto-advances a behind branch through
 //     advanceRunBranch under the system actor, re-anchors, and starts the pass
-//     for the resulting head (admitMergeCandidateEntry). Each admitted entry
+//     for the resulting head (admitMergeCandidateEntry) — unless, in ENFORCE
+//     transfer mode, the auto-advance transferred the prior head's passed
+//     verdict (E87.2 / #4293), in which case the entry goes straight to phase
+//     passed with no pass. Each admitted entry
 //     runs detached from its caller's cancellation under its own
 //     mergeCandidateQueueHandOffBudget (#4303); AdmitNext stays on the caller
 //     ctx, so a cancelled pump claims no new entry.
@@ -300,7 +303,10 @@ func (s *Server) mergeCandidateQueueRunTerminal(ctx context.Context, runID uuid.
 // admitMergeCandidateEntry runs one admission (ADR-092 D2): re-read the PR,
 // drop it when the run is terminal or the PR is merged/closed, auto-advance a
 // behind branch under the system actor, re-anchor to the resulting head, then
-// act on that head's verify state. It reports whether the entry was settled
+// act on that head's verify state. When the auto-advance PERFORMED a merge,
+// the ADR-096 verdict transfer runs first: enforce may transfer the prior
+// head's passed verdict (the head then reads passed and no pass starts),
+// shadow classifies async after the pass start. It reports whether the entry was settled
 // (so the pump admits the next). A TRANSIENT failure (an unreadable run or PR,
 // an undeterminable advance, a failed merge) returns the entry to held at its
 // original place and stops the pump; a conflict ejects. ctx is the admission
@@ -367,6 +373,9 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 	if err != nil {
 		return unadmit("the behind-probe failed: " + err.Error())
 	}
+	// transfer is the ADR-096 clean-advance request, set only when THIS
+	// admission performed the auto-advance (E87.2 / #4293).
+	var transfer *mergeCandidateTransferRequest
 	if len(behind) > 0 {
 		adv, ref := s.advanceRunBranch(ctx, runRow, mergeCandidateSystemActor(),
 			"merge-candidate queue admission (ADR-092): the branch fell behind "+e.BaseRef+" while held")
@@ -384,7 +393,19 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 		if adv.NewHeadSHA == "" {
 			return unadmit("the auto-advance merged but its resulting head could not be read back")
 		}
+		if adv.MergePerformed {
+			// Clean only when the new head IS the merge commit; a concurrent
+			// push the post-merge re-read observed is not_clean_advance.
+			transfer = &mergeCandidateTransferRequest{Run: runRow, PriorHead: head, NewHead: adv.NewHeadSHA,
+				MergePerformed: adv.MergeCommitSHA != "" && adv.NewHeadSHA == adv.MergeCommitSHA,
+				Cause:          mergeCandidateCauseBaseAdvance}
+		}
 		head = adv.NewHeadSHA
+	}
+	if transfer != nil {
+		// SHADOW classifies ASYNC, after the pass start below, never on this
+		// hand-off path (a no-op outside shadow).
+		defer s.scheduleMergeCandidateTransferShadow(*transfer)
 	}
 	if head != e.AnchoredHeadSHA {
 		re, err := s.cfg.MergeQueue.Reanchor(ctx, e.ID, head, "")
@@ -393,6 +414,18 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 		}
 		e = re
 		s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueReanchored, e, map[string]any{"at_admission": true})
+	}
+
+	if transfer != nil {
+		// ENFORCE decides BEFORE the verify-state read: a durable transferred
+		// row makes that read answer passed, so the switch below sets phase
+		// passed and starts no pass, trigger or slot. The classification gets
+		// only a SUB-budget of ctx that leaves mergeCandidateTransferHandOffReserve
+		// for the reads, the pass start and Unadmit; a spent sub-budget is
+		// undecidable:deadline_exceeded, a refusal, so the pass still starts.
+		req := *transfer
+		req.Reserve = mergeCandidateTransferHandOffReserve
+		s.mergeCandidateTransferEnforce(ctx, req)
 	}
 
 	st, err := s.mergeCandidateVerifyState(ctx, runRow, head)

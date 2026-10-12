@@ -92,6 +92,36 @@ Option B.
 - Two same-head bypass paths now exist: D6 boot (internal) and D2 re-run (operator). Each has its own marker, guard and audit. Any future change that lets either marker be set from an unintended path violates this ADR.
 - Implementation: #4219 (PR #4279). Follow-ups: #4282 (dead-end recovery, test gaps) and #4242 (quota parking).
 
+## Amendment 1 (2026-10-12): first consolidated round via the re-run verb (#4282)
+
+**Accepted (2026-10-12), ratified by the Captain.** Amends D5 residual 3; D1–D4 and the other D5 residuals are unchanged.
+
+**Context.** D5's third residual reads: "If the parent has no `implement_review_started` at all, the verb refuses `no_review_round`, and only a fix-up clears the hold … Tracked in #4282."
+
+#4282 (PR #4365) closes that residual. The fix-up-only path burned a fix-up slot and a full implement re-run just to start a review round that had never begun.
+
+**Decision.** The D2 re-run verb gains a **first-round path**. It applies to a decomposed parent that has NO `implement_review_started` row and an OPEN consolidated PR. On that path the verb starts the parent's FIRST consolidated round. It reuses `DispatchConsolidatedReview`'s round body (extracted as `runConsolidatedReviewRound`, byte-preserving), so the round behaves exactly like one the fan-in would have started. That includes the ADR-090 D5 fan-in verify hold.
+
+- **Refusals happen before any write (409).** They cover:
+  - a child run, or a parent with no children;
+  - reviewers unwired, or no agent reviewers;
+  - gating authority, where the message names `fishhawk_fixup_stage` and the next step stays `await_review`;
+  - the consolidated PR not open;
+  - no implement stage.
+- **A failed start returns 502, with nothing dispatched.** The reasons are:
+  - `compare_failed`;
+  - `round_not_started`;
+  - `fanin_verify_held`, which carries `details.merge_candidate_state`. Its hint is to await when the merge-candidate pass is in flight, or to route a fix-up on the parent implement stage when the pass FAILED.
+- **Audit.** `review_round_rerun_requested` gains an additive `first_round: true` field. No new category.
+- **Unchanged.** D2 (same-head bypass marker), D3 (marker separation from ADR-091 D6), D4 (audit order) and the other D5 residuals are unchanged.
+
+**D5 residual 3, as amended.** "If the parent has no `implement_review_started` and its consolidated PR is open, the re-run verb starts the first consolidated round (Amendment 1). If the PR is closed, or the parent is not decomposed, the verb refuses, and only a fix-up clears the hold."
+
+**Consequences.**
+- The common dead end (the consolidated dispatch never started: compare failed, or the forge was unwired) now has a one-verb recovery and costs no fix-up slot.
+- Re-running the permission-drift check on this path can re-append `permission_narrowing_noticed`, and can re-raise addressed or unkeyed drift findings. That matches the existing fan-in re-entry semantics, and is documented in `backend/internal/server/README.md`.
+- Implementation: #4282 (PR #4365).
+
 ## Relations
 
 Amends ADR-091 (#4171) D6. Related: ADR-094 (#4239), ADR-041, #4219, #4165, #797.

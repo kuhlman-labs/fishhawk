@@ -4296,7 +4296,11 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 // concern's Provenance == planreview.ConcernProvenanceAcceptance), so the
 // prompt renderer routes acceptance-synthesized concerns (ADR-050 / E31.8 /
 // #1613) through the untrusted-DATA quarantine envelope while operator/reviewer
-// concerns (empty Provenance) render on the unchanged trusted path.
+// concerns (empty Provenance) render on the unchanged trusted path. Since
+// #4284 the entry's `concern_ids` are paired with its `concerns` by
+// fixupPromptConcerns (only when the two lengths match), so each concern
+// renders under its durable id, and an operator-category concern carries
+// Operator — the renderer lists it first and never trims it.
 //
 // Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
 // trigger (the common, non-fix-up case), or on any error — best-effort, same
@@ -4325,7 +4329,8 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 			continue
 		}
 		var payload struct {
-			Concerns []planreview.Concern `json:"concerns"`
+			Concerns   []planreview.Concern `json:"concerns"`
+			ConcernIDs []string             `json:"concern_ids"`
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: unmarshal stage_fixup_triggered payload failed",
@@ -4338,13 +4343,7 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		if len(payload.Concerns) == 0 {
 			continue
 		}
-		rendered = make([]prompt.FixupConcern, 0, len(payload.Concerns))
-		for _, c := range payload.Concerns {
-			rendered = append(rendered, prompt.FixupConcern{
-				Text:              fixupConcernLine(c),
-				AcceptanceDerived: c.Provenance == planreview.ConcernProvenanceAcceptance,
-			})
-		}
+		rendered = fixupPromptConcerns(payload.Concerns, payload.ConcernIDs)
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: loaded fix-up concerns into implement prompt",
 			slog.String("run_id", runID.String()),
@@ -4354,6 +4353,42 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered
 	}
 	return nil
+}
+
+// fixupPromptConcerns maps a fix-up pass's routed concerns onto the prompt
+// renderer's shape (#4284). It is the ONE mapping both the prompt-serve
+// resolver (resolveFixupConcerns) and the route-time fit check (fixupRouteFit)
+// use, so the bytes the route measures are the bytes the agent is served.
+//
+//   - Text is fixupConcernLine(c); AcceptanceDerived is the acceptance
+//     provenance, which routes the concern into the untrusted envelope.
+//   - Operator marks an operator-authored concern (category "operator", never
+//     acceptance-derived): the renderer lists it first and never trims it.
+//   - ID is ids[i] ONLY when len(ids) == len(concerns) — the same pairing rule
+//     resolveRoutedFixupConcerns documents. writeFixupAudit writes both arrays
+//     from the same selection-order slices, so an aligned pair is exact; on a
+//     length mismatch (the deferred-acceptance release, a degraded operator-
+//     concern mint, the positional path) every ID stays empty and the concern
+//     renders id-less rather than under a misattributed id.
+//
+// The input order is preserved: the operator-first partition happens inside
+// the renderer, after this pairing, so concern_ids alignment never moves.
+func fixupPromptConcerns(concerns []planreview.Concern, ids []string) []prompt.FixupConcern {
+	aligned := len(ids) == len(concerns)
+	out := make([]prompt.FixupConcern, 0, len(concerns))
+	for i, c := range concerns {
+		acceptance := c.Provenance == planreview.ConcernProvenanceAcceptance
+		fc := prompt.FixupConcern{
+			Text:              fixupConcernLine(c),
+			AcceptanceDerived: acceptance,
+			Operator:          c.Category == operatorConcernCategory && !acceptance,
+		}
+		if aligned {
+			fc.ID = ids[i]
+		}
+		out = append(out, fc)
+	}
+	return out
 }
 
 // fixupConcernLine renders one routed concern for the fix-up prompt's binding

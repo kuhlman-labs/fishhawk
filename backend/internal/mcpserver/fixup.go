@@ -276,6 +276,16 @@ the absolute cap is 6 triggered passes (the base 3-pass ceiling plus 3
 credits); both 422s report remaining_ceiling_slots so you can size the next
 pass before spending it.
 
+Every routed concern reaches the agent (#4284). The fix-up prompt lists the
+routed concerns in one 12000-byte concern block (acceptance failures in their
+own block of the same size): operator concerns FIRST and in full, then every
+other concern under its concern id with its summary line; a long note body is
+trimmed with an explicit per-concern marker, never dropped. A set that cannot
+be listed even at that minimum is refused with fixup_concerns_overflow
+(below) before anything is spent; an admitted pass whose note bodies were
+trimmed records concern_bodies_truncated + truncated_concern_ids on its
+stage_fixup_triggered entry.
+
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
@@ -301,6 +311,14 @@ Returns a tool error on:
   - fixup_invalid_model (the resolved implement_model override is not in the
     deployment's per-adapter allow-list, 422; choose an allowed model or
     widen the allow-list)
+  - fixup_concerns_overflow (422, #4284: the routed concerns cannot all be
+    listed within the fix-up prompt's 12000-byte concern block even with
+    every note cut to its summary line and operator concerns in full. Refused
+    BEFORE the transition: no pass spent, no audit entry, no operator concern
+    minted, no concern marked addressed_pending. The details carry bytes,
+    max_bytes, overflow_bytes, concern_count, concern_ids and remedy. Remedy:
+    shorten operator_concern, split the concerns across more than one fix-up
+    pass, or route fewer concern_ids)
 `),
 	}, resolver.fixupStage)
 }

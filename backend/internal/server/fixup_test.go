@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -4662,4 +4663,367 @@ func TestFixupStage_RepoConventionConcernRoutes_PositionalPath(t *testing.T) {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
+}
+
+// --- route-time concern fit (#4284) ------------------------------------------
+
+// overBudgetNote returns a single-line note of exactly n bytes, distinct per i.
+func overBudgetNote(i, n int) string {
+	head := fmt.Sprintf("concern %02d: ", i)
+	return head + strings.Repeat("x", n-len(head))
+}
+
+// seedOverflowConcernRows seeds count raised implement-review concern rows
+// whose notes are n-byte single lines, returning them and their ids.
+func seedOverflowConcernRows(t *testing.T, cr *fakeConcernRepo, stage *run.Stage, count, n int) ([]*concern.Concern, []string) {
+	t.Helper()
+	rows := make([]*concern.Concern, 0, count)
+	ids := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, int64(100+i), overBudgetNote(i, n))
+		rows = append(rows, c)
+		ids = append(ids, c.ID.String())
+	}
+	return rows, ids
+}
+
+// TestFixupStage_ConcernsOverflowRefusedBeforeTransition (#4284): 40 routed
+// concerns whose 450-byte single-line notes cannot all be listed in the fix-up
+// prompt's 12000-byte concern block even at their summary lines, plus a
+// 3500-byte operator_concern (C7). The route is refused 422
+// fixup_concerns_overflow with the bytes / max_bytes / overflow_bytes /
+// concern_count / concern_ids / remedy details, and — the control's real
+// effect — NOTHING was committed: the stage is still at its gate, no
+// stage_fixup_triggered entry exists, every routed row is still `raised`, and
+// no operator concern was minted.
+//
+// Counterfactual: delete the fixupRouteFit refusal in fixupStageAs and the
+// committed-state reads go RED (200, a trigger entry, addressed_pending rows,
+// a minted operator row) — the renderer itself never refuses, so nothing
+// downstream masks it.
+func TestFixupStage_ConcernsOverflowRefusedBeforeTransition(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	rows, ids := seedOverflowConcernRows(t, cr, stage, 40, 450)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:      ids,
+		OperatorConcern: strings.Repeat("o", 3500),
+		Reason:          "route everything",
+	})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if code != "fixup_concerns_overflow" {
+		t.Fatalf("code = %q, want fixup_concerns_overflow", code)
+	}
+	bytesN, _ := details["bytes"].(float64)
+	maxN, _ := details["max_bytes"].(float64)
+	overN, _ := details["overflow_bytes"].(float64)
+	if maxN != float64(prompt.MaxFixupConcernBytes) {
+		t.Errorf("max_bytes = %v, want %d", details["max_bytes"], prompt.MaxFixupConcernBytes)
+	}
+	if bytesN <= maxN || overN != bytesN-maxN {
+		t.Errorf("bytes = %v, overflow_bytes = %v: want bytes > max_bytes and overflow = bytes - max_bytes", bytesN, overN)
+	}
+	if details["concern_count"] != float64(41) {
+		t.Errorf("concern_count = %v, want 41 (40 routed + the operator concern)", details["concern_count"])
+	}
+	gotIDs, _ := details["concern_ids"].([]any)
+	if len(gotIDs) != maxOverflowDetailConcernIDs && len(gotIDs) != len(ids) {
+		t.Errorf("concern_ids len = %d, want the %d routed ids (bounded at %d)", len(gotIDs), len(ids), maxOverflowDetailConcernIDs)
+	}
+	if len(gotIDs) > 0 && gotIDs[0] != ids[0] {
+		t.Errorf("concern_ids[0] = %v, want %s", gotIDs[0], ids[0])
+	}
+	if details["remedy"] != fixupConcernsOverflowRemedy {
+		t.Errorf("remedy = %v, want %q", details["remedy"], fixupConcernsOverflowRemedy)
+	}
+
+	// Committed state, read AFTER the call.
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (refused before the transition)", stage.State)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d stage_fixup_triggered entries appended, want 0", n)
+	}
+	for i, r := range rows {
+		if r.State != concern.StateRaised {
+			t.Errorf("row %d state = %q, want raised (an unseen concern must never be marked addressed_pending)", i, r.State)
+		}
+	}
+	if minted := operatorConcernRows(cr); len(minted) != 0 {
+		t.Errorf("operator concern rows = %d, want 0 (no mint on refusal)", len(minted))
+	}
+}
+
+// TestFixupStage_ConcernsOverflowDetailIDsBounded pins the bounded concern_ids
+// echo on the refusal (#4284 C3): 60 routed ids report 50 ids and the full
+// concern_count.
+func TestFixupStage_ConcernsOverflowDetailIDsBounded(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	_, ids := seedOverflowConcernRows(t, cr, stage, 60, 450)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: ids})
+	code, details := decodeErrorDetails(t, w.Body.Bytes())
+	if w.Code != http.StatusUnprocessableEntity || code != "fixup_concerns_overflow" {
+		t.Fatalf("status = %d code = %q, want 422 fixup_concerns_overflow", w.Code, code)
+	}
+	gotIDs, _ := details["concern_ids"].([]any)
+	if len(gotIDs) != maxOverflowDetailConcernIDs {
+		t.Errorf("concern_ids len = %d, want %d (bounded)", len(gotIDs), maxOverflowDetailConcernIDs)
+	}
+	if details["concern_count"] != float64(60) {
+		t.Errorf("concern_count = %v, want 60", details["concern_count"])
+	}
+}
+
+// TestFixupStage_OverBudgetNotesStillRoute (#4284): 6 concerns with 3000-byte
+// notes plus a 3500-byte operator_concern exceed the 12000-byte block in full,
+// but every summary line plus the operator concern in full fits — so the pass
+// is ADMITTED (200), all 7 ids (6 routed + the minted operator concern) are
+// marked addressed_pending, and the trigger entry records
+// concern_bodies_truncated with the 6 trimmed reviewer ids (C4), never the
+// operator concern's.
+func TestFixupStage_OverBudgetNotesStillRoute(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	rows, ids := seedOverflowConcernRows(t, cr, stage, 6, 3000)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:      ids,
+		OperatorConcern: strings.Repeat("o", 3500),
+		Reason:          "route all six plus the steer",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	for i, r := range rows {
+		if r.State != concern.StateAddressedPending {
+			t.Errorf("row %d state = %q, want addressed_pending", i, r.State)
+		}
+	}
+	minted := operatorConcernRows(cr)
+	if len(minted) != 1 || minted[0].State != concern.StateAddressedPending {
+		t.Fatalf("minted operator concern = %v, want one addressed_pending row", minted)
+	}
+
+	payload := latestFixupTriggeredPayload(t, au)
+	if routed := payloadStrings(t, payload, "concern_ids"); len(routed) != 7 {
+		t.Errorf("concern_ids = %v, want 7", routed)
+	}
+	if payload["concern_bodies_truncated"] != true {
+		t.Errorf("concern_bodies_truncated = %v, want true", payload["concern_bodies_truncated"])
+	}
+	truncated := payloadStrings(t, payload, "truncated_concern_ids")
+	if strings.Join(truncated, ",") != strings.Join(ids, ",") {
+		t.Errorf("truncated_concern_ids = %v, want the 6 reviewer ids %v", truncated, ids)
+	}
+	for _, id := range truncated {
+		if id == minted[0].ID.String() {
+			t.Errorf("truncated_concern_ids names the operator concern %s, which is never trimmed", id)
+		}
+	}
+}
+
+// TestFixupStage_FittingPassOmitsTruncationKeys (#4284 C4): a pass whose
+// concerns render in full records neither truncation key, keeping the
+// pre-#4284 payload shape.
+func TestFixupStage_FittingPassOmitsTruncationKeys(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	_, ids := seedOverflowConcernRows(t, cr, stage, 2, 200)
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: ids}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	for _, k := range []string{"concern_bodies_truncated", "truncated_concern_ids"} {
+		if _, ok := payload[k]; ok {
+			t.Errorf("payload carries %s on a fitting pass: %v", k, payload[k])
+		}
+	}
+}
+
+// TestFixupStage_OperatorConcernCapWithinRendererBudget pins the cap
+// relationship (#4284): an operator concern is never trimmed, so the 400 cap on
+// operator_concern must stay within the renderer's per-block budget or a lone
+// maximum-size operator concern could be refused at route time.
+func TestFixupStage_OperatorConcernCapWithinRendererBudget(t *testing.T) {
+	if maxOperatorConcernBytes > prompt.MaxFixupConcernBytes {
+		t.Fatalf("maxOperatorConcernBytes = %d exceeds prompt.MaxFixupConcernBytes = %d", maxOperatorConcernBytes, prompt.MaxFixupConcernBytes)
+	}
+	enforced, _ := fixupRouteFit([]planreview.Concern{{
+		Severity: operatorConcernSeverity,
+		Category: operatorConcernCategory,
+		Note:     strings.Repeat("o", maxOperatorConcernBytes),
+	}})
+	if !enforced.Fits {
+		t.Fatalf("a lone maximum-size operator concern does not fit: %+v", enforced)
+	}
+}
+
+// TestFixupTruncatedConcernIDs covers the id attribution rule (#4284 C4):
+// exact by position when the routed ids align with the concerns; every
+// caller-routed id (a superset) when they do not and a reviewer concern was
+// trimmed; none when only acceptance / operator concerns were trimmed; nil
+// when nothing was trimmed.
+func TestFixupTruncatedConcernIDs(t *testing.T) {
+	a, b, op := uuid.New(), uuid.New(), uuid.New()
+	reviewer := planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}
+	acceptance := planreview.Concern{Severity: planreview.SeverityHigh, Category: "acceptance", Note: "n", Provenance: planreview.ConcernProvenanceAcceptance}
+	operator := planreview.Concern{Severity: operatorConcernSeverity, Category: operatorConcernCategory, Note: "n"}
+	trimmed := func(idx ...int) prompt.FixupConcernFit {
+		return prompt.FixupConcernFit{BodiesTruncated: len(idx) > 0, TruncatedIndexes: idx}
+	}
+
+	if got := fixupTruncatedConcernIDs(trimmed(), []planreview.Concern{reviewer}, []uuid.UUID{a}, []uuid.UUID{a}); got != nil {
+		t.Errorf("nothing trimmed: got %v, want nil", got)
+	}
+	got := fixupTruncatedConcernIDs(trimmed(1), []planreview.Concern{reviewer, reviewer, operator}, []uuid.UUID{a, b, op}, []uuid.UUID{a, b})
+	if strings.Join(got, ",") != b.String() {
+		t.Errorf("aligned: got %v, want [%s]", got, b)
+	}
+	// Unaligned (the deferred-acceptance release shape): acceptance first, then
+	// review concerns whose ids cannot be paired by position.
+	got = fixupTruncatedConcernIDs(trimmed(0, 2), []planreview.Concern{acceptance, reviewer, reviewer}, []uuid.UUID{a, b}, []uuid.UUID{a, b})
+	if strings.Join(got, ",") != a.String()+","+b.String() {
+		t.Errorf("unaligned reviewer trimmed: got %v, want every caller id", got)
+	}
+	got = fixupTruncatedConcernIDs(trimmed(0), []planreview.Concern{acceptance, reviewer}, []uuid.UUID{a}, []uuid.UUID{a})
+	if got == nil || len(got) != 0 {
+		t.Errorf("unaligned acceptance-only trimmed: got %v, want empty", got)
+	}
+}
+
+// TestRouteAcceptanceFixupPass_AcceptanceOnlyOverBudgetStillDispatches (#4284
+// C9): acceptance triage must not newly page. 40 acceptance-derived failures
+// whose minimum render overflows the acceptance block still route — the
+// acceptance block is exempt from the route-time refusal and the no-drop
+// renderer lists every failure.
+//
+// Counterfactual: measure acceptance concerns in fixupRouteFit's enforced fit
+// and routeAcceptanceFixupPass receives fixup_concerns_overflow → RED.
+func TestRouteAcceptanceFixupPass_AcceptanceOnlyOverBudgetStillDispatches(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, _ := newAcceptanceTriageServer(t)
+	selected := make([]planreview.Concern, 0, 40)
+	for i := 0; i < 40; i++ {
+		selected = append(selected, planreview.Concern{
+			Severity:   planreview.SeverityHigh,
+			Category:   "acceptance",
+			Note:       overBudgetNote(i, 450),
+			Provenance: planreview.ConcernProvenanceAcceptance,
+		})
+	}
+	if _, full := fixupRouteFit(selected); full.Fits {
+		t.Fatalf("fixture does not overflow the acceptance block: %+v", full)
+	}
+
+	if err := s.routeAcceptanceFixupPass(context.Background(), runID, implementStageID, acceptanceStageID, selected, nil, 0, "acceptance failed"); err != nil {
+		t.Fatalf("routeAcceptanceFixupPass = %v, want nil (acceptance concerns are exempt)", err)
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending (dispatched)", got)
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["concern_bodies_truncated"] != true {
+		t.Errorf("concern_bodies_truncated = %v, want true", payload["concern_bodies_truncated"])
+	}
+}
+
+// TestRouteAcceptanceFixupPass_TrustedOverflowExemptOnAcceptancePass (#4284
+// C9): the deferred-acceptance release folds review concerns into the
+// acceptance pass. Even when those overflow the trusted block, an acceptance
+// triage pass (AcceptanceStageID set) is never refused — it must not page.
+//
+// Counterfactual: drop the AcceptanceStageID exemption from fixupStageAs and
+// this returns fixup_concerns_overflow → RED.
+func TestRouteAcceptanceFixupPass_TrustedOverflowExemptOnAcceptancePass(t *testing.T) {
+	s, rr, _, _, _, runID, implementStageID, _, acceptanceStageID, _ := newAcceptanceTriageServer(t)
+	selected := []planreview.Concern{{
+		Severity: planreview.SeverityHigh, Category: "acceptance", Note: "criterion failed",
+		Provenance: planreview.ConcernProvenanceAcceptance,
+	}}
+	ids := make([]uuid.UUID, 0, 40)
+	for i := 0; i < 40; i++ {
+		selected = append(selected, planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: overBudgetNote(i, 450)})
+		ids = append(ids, uuid.New())
+	}
+	if enforced, _ := fixupRouteFit(selected); enforced.Fits {
+		t.Fatalf("fixture does not overflow the trusted block: %+v", enforced)
+	}
+
+	if err := s.routeAcceptanceFixupPass(context.Background(), runID, implementStageID, acceptanceStageID, selected, ids, 0, "release"); err != nil {
+		t.Fatalf("routeAcceptanceFixupPass = %v, want nil (an acceptance triage pass is never refused)", err)
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending (dispatched)", got)
+	}
+}
+
+// TestFixupRouteFit_AcceptanceExemptFromEnforcedFit isolates the provenance
+// half of the #4284 C9 exemption: an acceptance-only set that overflows its
+// block is measured by the full fit (so a trim is recorded) but NOT by the
+// enforced fit the refusal reads.
+func TestFixupRouteFit_AcceptanceExemptFromEnforcedFit(t *testing.T) {
+	var selected []planreview.Concern
+	for i := 0; i < 40; i++ {
+		selected = append(selected, planreview.Concern{
+			Severity: planreview.SeverityHigh, Category: "acceptance", Note: overBudgetNote(i, 450),
+			Provenance: planreview.ConcernProvenanceAcceptance,
+		})
+	}
+	enforced, full := fixupRouteFit(selected)
+	if full.Fits {
+		t.Fatalf("fixture does not overflow the acceptance block: %+v", full)
+	}
+	if !enforced.Fits || enforced.ConcernCount != 0 {
+		t.Errorf("enforced fit = %+v, want Fits over zero trusted concerns (acceptance-derived concerns are exempt)", enforced)
+	}
+}
+
+// TestFixupStage_RouteFitAssumesIDPlaceholder (#4284): the route-time fit
+// stamps prompt.FixupConcernIDPlaceholder on every concern, because the routed
+// ids render at serve time (and the operator concern's is minted after the
+// transition). The fixture is the smallest concern count whose minimum render
+// fits WITHOUT ids but overflows WITH 36-byte ids — so routing it by
+// concern_ids (which renders every id) must be refused.
+//
+// Counterfactual: drop the placeholder in fixupRouteFit and this set is
+// admitted (200) — and would be served past the budget.
+func TestFixupStage_RouteFitAssumesIDPlaceholder(t *testing.T) {
+	n := 0
+	for count := 1; count <= 60; count++ {
+		var withID, idless []prompt.FixupConcern
+		for i := 0; i < count; i++ {
+			text := fixupConcernLine(planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: overBudgetNote(i, 450)})
+			idless = append(idless, prompt.FixupConcern{Text: text})
+			withID = append(withID, prompt.FixupConcern{Text: text, ID: prompt.FixupConcernIDPlaceholder})
+		}
+		if prompt.FixupConcernsFit(idless).Fits && !prompt.FixupConcernsFit(withID).Fits {
+			n = count
+			break
+		}
+	}
+	if n == 0 {
+		t.Fatal("no concern count fits id-less but overflows with ids; the fixture cannot isolate the placeholder")
+	}
+
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	rows, ids := seedOverflowConcernRows(t, cr, stage, n, 450)
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: ids})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d with %d concerns, want 422 (the ids would push the served block past the budget):\n%s", w.Code, n, w.Body.String())
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d stage_fixup_triggered entries appended, want 0", n)
+	}
+	for i, r := range rows {
+		if r.State != concern.StateRaised {
+			t.Errorf("row %d state = %q, want raised", i, r.State)
+		}
+	}
 }

@@ -7033,6 +7033,46 @@ func TestChildCompletionAdvancer_TranslatesSliceHeadMissing(t *testing.T) {
 	})
 }
 
+// TestServe_MergeCandidateTransferMode pins the E87.2 / #4293 switch: unset is
+// shadow (ADR-098 D3), off and enforce resolve with the real classifier, and
+// an unknown value REFUSES startup naming the value and the allowed set.
+//
+// The bogus invocation carries bootstrapAbortFlag, so with the validation
+// deleted startup still aborts at the LATER --review-resolution check rather
+// than booting a listener; the log assertion is then what goes RED.
+func TestServe_MergeCandidateTransferMode(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", "")
+		v := envOr("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", defaultMergeCandidateTransferMode)
+		cfg, err := resolveMergeCandidateTransferConfig(v)
+		if err != nil || cfg.Mode != server.MergeCandidateTransferShadow || cfg.Classifier == nil {
+			t.Fatalf("unset = %+v, %v; want shadow with a classifier", cfg, err)
+		}
+	})
+	for _, mode := range []server.MergeCandidateTransferMode{server.MergeCandidateTransferOff, server.MergeCandidateTransferEnforce} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg, err := resolveMergeCandidateTransferConfig(string(mode))
+			if err != nil || cfg.Mode != mode || cfg.Classifier == nil {
+				t.Fatalf("%s = %+v, %v", mode, cfg, err)
+			}
+		})
+	}
+	t.Run("bogus", func(t *testing.T) {
+		if _, err := resolveMergeCandidateTransferConfig("bogus"); err == nil {
+			t.Fatal("bogus resolved")
+		}
+		code, log := serveWithProfile(t, "-merge-candidate-transfer", "bogus", bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		for _, want := range []string{"invalid merge-candidate transfer configuration", `\"bogus\"`, "off, shadow, enforce"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("log does not name %q:\n%s", want, log)
+			}
+		}
+	})
+}
+
 // TestToChildcompletionConflict pins the ONE orchestrator → childcompletion
 // SliceConflict copy (ADR-096 D4 / #4294): every field, the base attribution
 // included, crosses the bridge, and nil maps to nil. A field the helper drops
