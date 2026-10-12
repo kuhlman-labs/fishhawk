@@ -66,13 +66,17 @@ Every go command runs with `cmd.Dir` = workspace, `procgroup.Harden` (a timeout 
 | `go` exits non-zero | error with stderr tail | `TestGoListLoader_NonZeroExit` |
 | malformed `go list` / `go work edit` output; bad use entry | error | `TestGoListLoader_MalformedOutput`, `TestGoListLoader_MalformedWorkEdit` |
 | package `Error`, `DepsErrors`, `Incomplete`, no module, dir outside workspace, zero packages | error | `TestGoListLoader_PackageFailureFields`, `TestGoListLoader_ZeroPackages` |
+| a go.work module with no host-listed package (all files build-excluded, or none) beside a listing one | `module <m>: go list reported no packages for it` | `TestGoListLoader_ModuleWithNoListedPackages` |
+| context done between `go list` and a module's go/parser pass | error wrapping the ctx error | `TestBuildGraph_ContextDoneBeforeParse` |
 | host-excluded file importing a non-package workspace path; unparsable file | error | `TestGoListLoader_UnresolvedImportInExcludedFile`, `TestGoListLoader_UnparsableFile` |
 | wedged `go` | error at `Timeout` | `TestGoListLoader_Timeout` |
 | inherited `GOWORK` / `GOTOOLCHAIN` | ignored / refused locally | `TestGoListLoader_GOWORKPinned`, `TestGoListLoader_ToolchainMismatchFailsLocal` |
 
+The `go work edit -json <abs go.work>` call is pinned twice: the explicit file argument and the env `GOWORK`. Either alone keeps it on the checkout's go.work, so the env pin there is deliberately redundant and `TestGoListLoader_GOWORKPinned` goes RED only when BOTH are removed (or when the `go list` env pin is).
+
 ## Global surface set
 
-`GlobalSurface` (`surface.go`) is the ADR-096 D3 set. Patterns are doublestar, matched against the whole path (root-anchored: `testdata/**` does not match `backend/internal/x/testdata/y.json`). `TestGlobalSurfaceMatchesREADME` keeps this table and the var in sync both ways.
+`GlobalSurface` (`surface.go`) is the ADR-096 D3 set. Patterns are doublestar, matched against the whole path (root-anchored: `testdata/**` does not match `backend/internal/x/testdata/y.json`). `TestGlobalSurfaceMatchesREADME` keeps this table and the var in sync both ways; `TestGlobalSurfaceKeepsADR096D3Floor` hard-codes the ADR-096 D3 enumeration (the first fifteen rows), so a floor pattern cannot be dropped from the var and this table together.
 
 | Pattern | Leg / rationale |
 |---|---|
@@ -130,7 +134,7 @@ Throughput cost, accepted as conservative ("fail closed means verify"): a delta 
 
 ## Adding a verify leg
 
-`verifylegs_test.go` parses `scripts/test`. Every non-blank, non-comment line of `cmd_verify` and `_verify_gate_harnesses` must be a call of a leg registered in `realLegTable` or an exact allow-listed plumbing line; leg tokens are word-anchored (`_acquire_verify_lock` never yields `_verify_lock`). Each registered `_verify_*` body's `$ROOT/scripts/<x>` / `$SCRIPTS_DIR/<x>` invocations must equal its row's `scripts`. Each row's inputs are matched against the repository: a `global` input must match at least one file and every match must satisfy `MatchGlobal`; a `goReach` input (compile/lint/test consumption only) may match only `.go` files. `TestSchemaSyncDestinationsAreGlobal` requires every `scripts/sync-schemas` mirror destination to be global. Floors (>= 8 legs incl. `cmd_lint` + `_verify_gate_harnesses`, >= 12 harnesses, >= 10 sync destinations) turn a parser collapse RED.
+`verifylegs_test.go` parses `scripts/test`. Every non-blank, non-comment line of `cmd_verify` and `_verify_gate_harnesses` must be a call of a leg registered in `realLegTable` or an exact allow-listed plumbing line; leg tokens are word-anchored (`xcmd_lint` never yields `cmd_lint`, `my_verify_lock` never `_verify_lock`; `TestLegTokenWordAnchored`). Each registered `_verify_*` body's `$ROOT/scripts/<x>` / `$SCRIPTS_DIR/<x>` invocations must equal its row's `scripts`. Each row's inputs are matched against the repository: a `global` input must match at least one file and every match must satisfy `MatchGlobal`; a `goReach` input (compile/lint/test consumption only) may match only `.go` files. `TestSchemaSyncDestinationsAreGlobal` requires every `scripts/sync-schemas` mirror destination to be global. Floors (>= 8 legs incl. `cmd_lint` + `_verify_gate_harnesses`, >= 12 harnesses, >= 10 sync destinations) turn a parser collapse RED.
 
 So: a new leg, harness, inline script call or mirror RED-lines verify until it is registered and its inputs are covered by `GlobalSurface` (bump `SurfaceVersion` and add the README row).
 

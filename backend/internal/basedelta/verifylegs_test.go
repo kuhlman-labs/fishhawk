@@ -556,11 +556,20 @@ func TestCheckVerifyLegs_Synthetic(t *testing.T) {
 
 func TestLegTokenWordAnchored(t *testing.T) {
 	t.Parallel()
-	var toks []string
-	for _, m := range legToken.FindAllStringSubmatch(`if ! _acquire_verify_lock; then x="$(cmd_test_scoped)" $VERIFY_NO_TESTS`, -1) {
-		toks = append(toks, m[1])
-	}
-	if strings.Join(toks, ",") != "_acquire_verify_lock,cmd_test_scoped" {
-		t.Fatalf("tokens = %v", toks)
+	for line, want := range map[string]string{
+		`if ! _acquire_verify_lock; then x="$(cmd_test_scoped)" $VERIFY_NO_TESTS`: "_acquire_verify_lock,cmd_test_scoped",
+		// An unanchored extractor pulls the leg-shaped tokens cmd_lint and
+		// _verify_lock out of these words.
+		`xcmd_lint`:           "",
+		`acquire_verify_lock`: "",
+		`run xcmd_lint && my_verify_lock; cmd_lint`: "cmd_lint",
+	} {
+		var toks []string
+		for _, m := range legToken.FindAllStringSubmatch(line, -1) {
+			toks = append(toks, m[1])
+		}
+		if got := strings.Join(toks, ","); got != want {
+			t.Errorf("tokens of %q = %q, want %q", line, got, want)
+		}
 	}
 }

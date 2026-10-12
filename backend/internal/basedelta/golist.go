@@ -52,7 +52,8 @@ const stderrTail = 512
 // It fails closed on a non-zero exit, malformed output, any listed package
 // carrying Error, DepsErrors or Incomplete, a package directory outside the
 // workspace, an import naming a workspace-module path that is no package, an
-// unparsable .go file, or zero packages when a go.work or go.mod exists.
+// unparsable .go file, zero packages when a go.work or go.mod exists, or a
+// go.work module go list reports no package for.
 type GoListLoader struct {
 	// GoBin is the go binary; empty resolves "go" on PATH.
 	GoBin string

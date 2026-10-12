@@ -2,6 +2,7 @@ package basedelta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,14 +201,34 @@ func TestGoListLoader_UnparsableFile(t *testing.T) {
 	}
 }
 
-// fakeGo writes an executable stand-in for the go binary.
+// fakeGoProbe is the argument fakeGo's readiness probe passes; the stand-in
+// exits 0 on it before running its body.
+const fakeGoProbe = "__fakego_probe__"
+
+// fakeGo writes an executable stand-in for the go binary. Writing an
+// executable while parallel tests fork is the ETXTBSY race (golang/go#22315):
+// a child forked during os.WriteFile inherits the write fd until its own exec,
+// and exec'ing the script meanwhile fails "text file busy". This process's fd
+// is closed once WriteFile returns, so one successful probe exec proves no
+// writer remains and none can reappear.
 func fakeGo(t *testing.T, body string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "go")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+	script := "#!/bin/sh\n[ \"$1\" = " + fakeGoProbe + " ] && exit 0\n" + body + "\n"
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return p
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
+	for {
+		err := exec.Command(p, fakeGoProbe).Run()
+		if err == nil {
+			return p
+		}
+		if !errors.Is(err, syscall.ETXTBSY) || time.Now().After(deadline) {
+			t.Fatalf("fakeGo probe %s: %v", p, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func goModOnly(t *testing.T) string {
@@ -308,6 +330,58 @@ func TestGoListLoader_ZeroPackages(t *testing.T) {
 	})
 	if _, err := (&GoListLoader{Env: emptyModCache(t)}).Load(context.Background(), root); err == nil || !strings.Contains(err.Error(), "zero packages") {
 		t.Fatalf("Load err = %v, want zero packages", err)
+	}
+}
+
+// A multi-module go.work where one module has no host-listed package fails
+// closed naming it, while the other module lists normally: m2's only .go file
+// is //go:build ignore (or it has none), so go list reports nothing for it and
+// the go/parser pass has no module path to derive m2's import paths from.
+func TestGoListLoader_ModuleWithNoListedPackages(t *testing.T) {
+	t.Parallel()
+	requireGo(t)
+	for name, m2 := range map[string]map[string]string{
+		"all_build_excluded": {"m2/z/z.go": "//go:build ignore\n\npackage z\n\nimport _ \"example.com/m1/a\"\n"},
+		"no_go_files":        {"m2/notes.txt": "data\n"},
+	} {
+		tree := map[string]string{
+			"go.work":   twoModuleWork,
+			"m1/go.mod": "module example.com/m1\n\ngo 1.25.0\n",
+			"m1/a/a.go": "package a\n",
+			"m2/go.mod": "module example.com/m2\n\ngo 1.25.0\n",
+		}
+		for k, v := range m2 {
+			tree[k] = v
+		}
+		root := t.TempDir()
+		writeTree(t, root, tree)
+		const want = "module m2: go list reported no packages for it"
+		if _, err := (&GoListLoader{Env: emptyModCache(t)}).Load(context.Background(), root); err == nil || err.Error() != want {
+			t.Errorf("%s: Load err = %v, want %q", name, err, want)
+		}
+	}
+}
+
+// buildGraph checks the context before each module's go/parser pass, so a
+// deadline expiring after go list returned still fails closed.
+func TestBuildGraph_ContextDoneBeforeParse(t *testing.T) {
+	t.Parallel()
+	root, err := filepath.EvalSymlinks(goModOnly(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := []goListPackage{{
+		ImportPath: "example.com/r/a",
+		Dir:        filepath.Join(root, "a"),
+		Module:     &struct{ Path, Dir string }{Path: "example.com/r", Dir: root},
+	}}
+	if g, err := buildGraph(context.Background(), root, []string{"."}, listed); err != nil || g.Len() != 1 {
+		t.Fatalf("live ctx: buildGraph = %v, %v; want one package", g, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := buildGraph(ctx, root, []string{"."}, listed); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled ctx: buildGraph err = %v, want context.Canceled", err)
 	}
 }
 

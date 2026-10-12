@@ -59,6 +59,49 @@ func TestMatchGlobal_RootAnchored(t *testing.T) {
 	}
 }
 
+// adr096D3Floor is ADR-096 D3 as #4292 enumerates it, hard-coded here and
+// NOT read from GlobalSurface or README.md, so dropping a pattern from both
+// the var and the README still fails. Each pattern carries paths it must keep
+// global.
+var adr096D3Floor = []struct {
+	pattern string
+	samples []string
+}{
+	{"go.work", []string{"go.work"}},
+	{"**/go.mod", []string{"go.mod", "backend/go.mod", "a/b/go.mod"}},
+	{"**/go.sum", []string{"go.sum", "backend/go.sum"}},
+	{"scripts/**", []string{"scripts/test", "scripts/lib/x.sh"}},
+	{".golangci.yml", []string{".golangci.yml"}},
+	{"deploy/gate-image/**", []string{"deploy/gate-image/Dockerfile"}},
+	{".fishhawk/**", []string{".fishhawk/workflows.yaml", ".fishhawk/x/y.yaml"}},
+	{"docs/spec/**", []string{"docs/spec/workflow-v2.schema.json"}},
+	{"docs/api/**", []string{"docs/api/v0.openapi.yaml"}},
+	{"site/**", []string{"site/astro.config.mjs", "site/src/content/docs/reference/cli.md"}},
+	{"docs/adr/**", []string{"docs/adr/index.json"}},
+	{"docs/ARCHITECTURE.md", []string{"docs/ARCHITECTURE.md"}},
+	{"backend/internal/postgres/migrations/**", []string{"backend/internal/postgres/migrations/0001_init.up.sql"}},
+	{"backend/internal/audit/categories.go", []string{"backend/internal/audit/categories.go"}},
+	{"testdata/**", []string{"testdata/wire/restart_blockers.json", "testdata/policy/agent-instruction-paths.json"}},
+}
+
+func TestGlobalSurfaceKeepsADR096D3Floor(t *testing.T) {
+	t.Parallel()
+	in := map[string]bool{}
+	for _, p := range GlobalSurface {
+		in[p] = true
+	}
+	for _, f := range adr096D3Floor {
+		if !in[f.pattern] {
+			t.Errorf("ADR-096 D3 floor pattern %q is missing from GlobalSurface; the floor shrinks only through an ADR amendment", f.pattern)
+		}
+		for _, s := range f.samples {
+			if _, ok := MatchGlobal(s); !ok {
+				t.Errorf("%s (ADR-096 D3 floor %q) is not global", s, f.pattern)
+			}
+		}
+	}
+}
+
 // The README's set table is the documentation the var points at; the two
 // must list the same patterns.
 func TestGlobalSurfaceMatchesREADME(t *testing.T) {
