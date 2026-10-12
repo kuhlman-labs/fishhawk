@@ -272,6 +272,12 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		// evidence appends nothing.
 		s.recordGateIsolation(r.Context(), runID, stageID, contentHash, body)
 
+		// Runner-observed counterfactuals (E85.3 / #4143). Same placement and
+		// rationale as the isolation record: once per stage bundle, on the chain
+		// before any stage failure. A GREEN observation raises a server_check
+		// control_unpinned concern. Best-effort; absent evidence appends nothing.
+		s.recordCounterfactualObservations(r.Context(), runID, stageID, contentHash, body)
+
 		// Per-run budget tripwire (ADR-030 / #653). After the bundle's cost
 		// is rolled into the run total, check it against the operator's
 		// per-run ceilings. On breach the run is HALTED (cancelled) and we

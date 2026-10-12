@@ -412,6 +412,7 @@ var KnownCategories = map[string]struct{}{
 	"consolidated_pr_opened":                  {},
 	"consolidated_review_diff_truncated":      {},
 	"cost_recorded":                           {},
+	"counterfactual_observed":                 {}, // E85.3 / #4143: one runner-executed plan-declared counterfactual, recorded at raw trace upload from the signed bundle (server/counterfactual_observed.go) — INTERNAL, a GREEN one raises a server_check control_unpinned concern
 	"crew_finding_convert_failed":             {},
 	"crew_finding_converted":                  {},
 	"crew_message_delivered":                  {},
