@@ -156,7 +156,9 @@ committed `order_key` back as NULL).
 
 `Promotion{StageID, RunID, GroupKey, Limit, Changed, OldPosition,
 NewPosition, Holders}`. `Holders` is never nil. A stage already first answers
-`Changed=false` with positions 1/1, writes nothing and does not call `Record`.
+`Changed=false` with positions 1/1, writes nothing and does not call `Record`;
+so does a stage whose last competitor ahead vanished between the position read
+and the write (step 6).
 
 Step by step (one transaction, one pooled connection):
 
@@ -190,14 +192,32 @@ Step by step (one transaction, one pooled connection):
    then promotes it.
 5. Holders, and the old position via `aheadSQL`. With nothing ahead, return
    the no-op.
-6. `UPDATE ... SET order_key = min(other fresh waiters' effective key) - 1 ms
-   WHERE stage_id = $2 AND state = 'queued'`. The "other fresh waiters" are the
-   `aheadSQL` predicate: same group and account, fresh, stage still
-   host-dispatchable. `enqueued_at`, `last_seen_at` and every other row,
-   including every held row, are untouched
-   (`TestPromote_HeldStageRefusedNeverPreempted` and
+6. `WITH others AS (SELECT min(effective key), bool_or(strictly ahead of the
+   caller) ...) UPDATE ... SET order_key = others.k - 1 ms WHERE stage_id = $2
+   AND state = 'queued' AND others.ahead` (`promoteKeySQL`). The "other fresh
+   waiters" are the `aheadSQL` predicate: same group and account, fresh, stage
+   still host-dispatchable, scoped to the caller's account by the statement
+   itself (`TestPromote_OrderKeyIgnoresOtherAccountsWaiters` pins the exact
+   committed key against another account's earlier waiter under the same group
+   key). `enqueued_at`, `last_seen_at` and every other row, including every
+   held row, are untouched (`TestPromote_HeldStageRefusedNeverPreempted` and
    `TestPromote_PromotedWaiterAdmittedNextThenFIFO` compare held rows byte for
    byte).
+
+   The write is GUARDED on a fresh waiter still being strictly ahead of the
+   caller's own effective key (#4312). Step 5's read is an earlier statement,
+   and a competitor can go stale or be cancelled (its stage and run rows are
+   not under the group lock) before step 6 writes. `min` and the ahead flag
+   come from ONE aggregate over ONE scan of the predicate, so they agree on
+   each row's `clock_timestamp()` freshness. When the guard fails the `UPDATE`
+   matches no row (`pgx.ErrNoRows`) and the waiter gets the same answer as an
+   already-first one: `Changed=false`, positions 1/1, nothing written, `Record`
+   not called. Reading no row as that no-op is sound only because step 4
+   holds the slot row `FOR UPDATE` and has classified it as queued.
+   `TestPromote_CompetitorGoneBeforeWriteIsNoop` empties the ahead set at the
+   `afterPromotePosition` seam (competitor cancelled, competitor gone stale,
+   competitor ahead cancelled with one behind remaining) and reads the
+   committed rows back.
 7. The new position via `aheadSQL` (it is 1).
 8. `Record(ctx, tx, promotion)`; an error rolls back.
 
