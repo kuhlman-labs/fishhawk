@@ -11,6 +11,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1012,6 +1015,100 @@ func TestServeGo_WiresMergeReconcilerPollHelpers(t *testing.T) {
 			t.Errorf("serve.go does not call %s; %s", want.call, want.consequence)
 		}
 	}
+}
+
+// TestServeGo_StartsMergeCandidateQueuePump pins the ADR-092 held-pass queue's
+// liveness wiring (#4302, M3): runServe must START the periodic pump, in its own
+// goroutine, as `go srv.RunMergeCandidateQueuePump(ctx,
+// server.MergeCandidateQueuePumpInterval)` inside `if cfg.MergeQueue != nil`.
+// Without it the queue loses its boot sweep and its one-tick liveness bound — a
+// base stalled behind a terminal live run waits for a manual rebase — and no
+// server-package test can see it, because the loop itself is exercised directly.
+//
+// It walks the PARSED runServe body rather than grepping text, so the
+// explanatory comment above the call cannot satisfy it, a synchronous (non-go)
+// call cannot satisfy it, and neither can the statement moved into an uncalled
+// helper (M3c) or out from under the MergeQueue guard.
+func TestServeGo_StartsMergeCandidateQueuePump(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+
+	var found bool
+	var stack []ast.Node
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if gs, ok := n.(*ast.GoStmt); ok && isMergeQueuePumpGo(gs) && guardedByMergeQueueNonNil(stack, gs) {
+			found = true
+		}
+		stack = append(stack, n)
+		return true
+	})
+	if !found {
+		t.Error("runServe has no `go srv.RunMergeCandidateQueuePump(ctx, server.MergeCandidateQueuePumpInterval)` " +
+			"inside `if cfg.MergeQueue != nil`; the held-pass queue would lose its boot sweep and its one-tick liveness bound")
+	}
+}
+
+// isMergeQueuePumpGo reports whether gs is `go srv.RunMergeCandidateQueuePump(
+// <ctx>, server.MergeCandidateQueuePumpInterval)`.
+func isMergeQueuePumpGo(gs *ast.GoStmt) bool {
+	sel, ok := gs.Call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "RunMergeCandidateQueuePump" || len(gs.Call.Args) != 2 {
+		return false
+	}
+	if recv, ok := sel.X.(*ast.Ident); !ok || recv.Name != "srv" {
+		return false
+	}
+	interval, ok := gs.Call.Args[1].(*ast.SelectorExpr)
+	if !ok || interval.Sel.Name != "MergeCandidateQueuePumpInterval" {
+		return false
+	}
+	pkg, ok := interval.X.(*ast.Ident)
+	return ok && pkg.Name == "server"
+}
+
+// guardedByMergeQueueNonNil reports whether the nearest IfStmt enclosing gs (gs
+// inside its Body) has the condition `cfg.MergeQueue != nil`. stack is gs's
+// ancestors, outermost first.
+func guardedByMergeQueueNonNil(stack []ast.Node, gs *ast.GoStmt) bool {
+	for i := len(stack) - 1; i >= 0; i-- {
+		ifs, ok := stack[i].(*ast.IfStmt)
+		if !ok {
+			continue
+		}
+		if gs.Pos() < ifs.Body.Pos() || gs.End() > ifs.Body.End() {
+			continue // gs sits in this if's init/cond/else, not its guarded body
+		}
+		cond, ok := ifs.Cond.(*ast.BinaryExpr)
+		if !ok || cond.Op != token.NEQ {
+			return false
+		}
+		x, ok := cond.X.(*ast.SelectorExpr)
+		if !ok || x.Sel.Name != "MergeQueue" {
+			return false
+		}
+		if base, ok := x.X.(*ast.Ident); !ok || base.Name != "cfg" {
+			return false
+		}
+		y, ok := cond.Y.(*ast.Ident)
+		return ok && y.Name == "nil"
+	}
+	return false
 }
 
 // TestGithubAutoMerger_FailsClosed asserts the merger refuses — before any
