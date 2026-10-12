@@ -1,0 +1,171 @@
+{
+  "issue_title": "Validate widget names on create",
+  "issue_body": "Widgets are being created with blank names and names full of punctuation, which breaks exports.\n\n`POST /widgets` must reject a name that is empty, longer than 64 characters, or contains a character outside letters, digits, space, `_` and `-`. A rejected name returns HTTP 422 with `{\"error\": {\"code\": \"invalid_name\", \"message\": ...}}`. The message should tell the user what to fix.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/112",
+      "id": "example-org/widgets-service#112"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Validate widget names on POST /widgets and return an invalid_name error for a rejected name.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/validate.go",
+          "operation": "create"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add validateWidgetName in internal/api/validate.go checking emptiness, a 64-character maximum and the allowed character set [A-Za-z0-9 _-]."
+      },
+      {
+        "step": 2,
+        "description": "Call validateWidgetName in the POST /widgets handler before CreateWidget and return HTTP 422 with code invalid_name and a message on failure."
+      },
+      {
+        "step": 3,
+        "description": "Write one message per failed rule, worded for the person who submitted the form."
+      },
+      {
+        "step": 4,
+        "description": "Document the invalid_name error and the allowed characters in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Table-driven handler tests in widgets_test.go: each invalid-name shape asserts 422 and the invalid_name code, and a valid name asserts 201.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-name-empty-422",
+          "statement": "POST /widgets with an empty name returns HTTP 422 with error code invalid_name.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#112"
+        },
+        {
+          "id": "ac-name-too-long-422",
+          "statement": "POST /widgets with a 65-character name returns HTTP 422 with error code invalid_name.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#112"
+        },
+        {
+          "id": "ac-name-bad-chars-422",
+          "statement": "POST /widgets with the name \"gizmo!\" returns HTTP 422 with error code invalid_name.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#112"
+        },
+        {
+          "id": "ac-name-valid-201",
+          "statement": "POST /widgets with the name \"gizmo-2\" returns HTTP 201.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#112"
+        },
+        {
+          "id": "ac-name-message-friendly",
+          "statement": "Validation error messages are clear and user-friendly.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#112"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Existing widgets with now-invalid names are left as they are; only creation is validated."
+    ],
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "untestable",
+    "not testable",
+    "unverifiable",
+    "not verifiable",
+    "not concretely verifiable",
+    "cannot be verified",
+    "no pass/fail",
+    "unmeasurable",
+    "not measurable",
+    "subjective",
+    "vague",
+    "ambiguous",
+    "no observable",
+    "not observable",
+    "no concrete",
+    "not concrete",
+    "ill-defined",
+    "cannot decide",
+    "can't decide",
+    "undecidable",
+    "matter of taste",
+    "matter of opinion",
+    "in the eye of",
+    "no assertable"
+  ],
+  "attribution_phrases": [
+    "user-friendly",
+    "messages are clear"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-name-message-friendly is not concretely verifiable: 'clear and user-friendly' gives no pass/fail condition; require each message to name the failed rule, e.g. 'name must be at most 64 characters'."
+    },
+    {
+      "severity": "medium",
+      "category": "testability",
+      "note": "ac-name-message-friendly is subjective; an executor cannot decide whether a message qualifies."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion that messages are clear and user-friendly is vague; state what each message must contain."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers a name of exactly 64 characters, the longest one accepted."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "The same name rules should apply to PATCH /widgets/{id}; the plan changes only POST."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "api/openapi.yaml should list the invalid_name error with an example message."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-name-message-friendly could be checked in the same table-driven test as ac-name-empty-422."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "A user-friendly message that echoes the submitted name back should escape it before it is logged."
+    }
+  ]
+}

@@ -3530,8 +3530,10 @@ base with `--base` (default `origin/main`), it requires
 `(cd backend && go run ./internal/agenteval/catchrategate)` to exit 0.
 That command decides from the committed evidence record alone (no model
 call, no network) and fails closed on an absent, malformed, stale,
-under-powered or regressed record; its twelve modes, the pinned baseline
-and the evidence schema are in `backend/internal/agenteval/README.md` §
+under-powered or regressed record, or one whose per-trial sidecar
+(`evidence.trials.json`) is absent, malformed, from another recording or
+count-inconsistent with it; its sixteen modes, the pinned baseline, the
+evidence schema and the sidecar are in `backend/internal/agenteval/README.md` §
 "Plan-review catch-rate gate". Recording the evidence is an operator step:
 `docs/compliance/planreview-catchrate-evidence.md`.
 
@@ -3550,7 +3552,7 @@ without evidence.
 | `backend/internal/agenteval/planreviewevidence.go` | that file only (record, fingerprint, check) |
 | `backend/internal/agenteval/catchrategate/` | every path under it (the gate command) |
 | `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the corpus) |
-| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`) |
+| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`, its trial sidecar `evidence.trials.json`) |
 
 A trigger ending in `/` is a directory at a component boundary
 (`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);

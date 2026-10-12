@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000004255",
+  "artifact_id": "00000000-0000-0000-0001-000000004255",
+  "triage_sequence": 108,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is inferred-source or unresolvable against the plan (bad/ambiguous criterion)",
+  "decided_at": "2026-10-11T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-quote-pricing-timeout",
+      "statement": "When pricing-service takes longer than 30 seconds to respond, POST /quotes returns HTTP 504 within 31 seconds.",
+      "source": "inferred",
+      "rationale": "Inferred from internal/clients/inventory.go, which sets a 30 s timeout on its upstream calls; the pricing client should behave the same.",
+      "observed": "with pricing-service delayed 40 s, POST /quotes returned HTTP 502 after 40 s",
+      "expected": "HTTP 504 within 31 seconds",
+      "steps_taken": "pointed pricing-service at a stub that sleeps 40 s, POST /quotes, timed the response",
+      "expectation_basis": "criterion ac-quote-pricing-timeout",
+      "repro_handle": "curl -s -o /dev/null -w '%{http_code} %{time_total}' -d '{\"sku\":\"S1\",\"quantity\":2}' $TARGET/quotes",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

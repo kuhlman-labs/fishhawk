@@ -1,0 +1,167 @@
+{
+  "issue_title": "Export a tenant's widgets as CSV",
+  "issue_body": "Operators copy widget lists by hand into spreadsheets.\n\nAdd `GET /widgets/export` returning `text/csv` with the header `id,name,created_at` and one row per widget owned by the authenticated tenant. Large tenants have up to 50,000 widgets, and the API gateway cuts requests off at 60 s, so the export must finish well inside that for them.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/111",
+      "id": "example-org/widgets-service#111"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Add a tenant-scoped streaming CSV export of widgets.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/export.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/export_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add IterWidgetsByTenant to internal/store/widgets.go, a cursor over the tenant's widgets ordered by id."
+      },
+      {
+        "step": 2,
+        "description": "Add the GET /widgets/export handler: set Content-Type text/csv, write the header row, and stream one row per widget through encoding/csv, flushing every 1,000 rows."
+      },
+      {
+        "step": 3,
+        "description": "Resolve the tenant from the bearer token exactly as GET /widgets does."
+      },
+      {
+        "step": 4,
+        "description": "Document GET /widgets/export and its text/csv response in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests in export_test.go against the in-memory store: the header and row count for a small tenant, quoting of a name with a comma, and tenant isolation.",
+      "rollback_plan": "Revert the PR. The change is additive; no data migration needs reversing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-export-header",
+          "statement": "GET /widgets/export returns Content-Type text/csv and a first line of id,name,created_at.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#111"
+        },
+        {
+          "id": "ac-export-rows",
+          "statement": "GET /widgets/export for a tenant with 3 widgets returns exactly 3 data rows, one per widget.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#111"
+        },
+        {
+          "id": "ac-export-tenant-scoped",
+          "statement": "GET /widgets/export as tenant A never includes a widget owned by tenant B.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#111"
+        },
+        {
+          "id": "ac-export-timely",
+          "statement": "Exporting a large tenant's widgets completes in a reasonable time.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#111"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Streaming keeps memory flat regardless of the tenant's widget count."
+    ],
+    "predicted_runtime_minutes": 35,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "untestable",
+    "not testable",
+    "unverifiable",
+    "not verifiable",
+    "not concretely verifiable",
+    "cannot be verified",
+    "no pass/fail",
+    "unmeasurable",
+    "not measurable",
+    "no measurable",
+    "subjective",
+    "vague",
+    "ambiguous",
+    "no observable",
+    "not observable",
+    "no concrete",
+    "not concrete",
+    "ill-defined",
+    "cannot decide",
+    "can't decide",
+    "undecidable",
+    "no threshold",
+    "no bound",
+    "no time limit",
+    "unquantified",
+    "not quantified"
+  ],
+  "attribution_phrases": [
+    "reasonable time",
+    "large tenant's widgets"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-export-timely is not concretely verifiable: 'a reasonable time' gives no bound an executor could check; state the tenant size and the limit, e.g. 50,000 widgets within 10 s."
+    },
+    {
+      "severity": "medium",
+      "category": "testability",
+      "note": "ac-export-timely is vague: it sets no threshold, so pass/fail cannot be decided."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The 'completes in a reasonable time' criterion is subjective and unmeasurable; replace it with a timed check on a seeded 50,000-widget tenant."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Holding one database cursor open for a 50,000-row export ties up a pooled connection for the whole request."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers a widget name containing a double quote, which encoding/csv must escape."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Set Content-Disposition so browsers download the export as a file."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-export-timely's test should seed 50,000 widgets in a benchmark rather than the unit suite."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "The README should say that a large tenant's widgets export as a stream, so clients should not buffer the response."
+    }
+  ]
+}

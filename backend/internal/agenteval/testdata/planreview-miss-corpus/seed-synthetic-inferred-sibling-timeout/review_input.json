@@ -1,0 +1,164 @@
+{
+  "issue_title": "Price widget order quotes through pricing-service",
+  "issue_body": "Quotes are priced from a stale local table.\n\n`POST /quotes` (body `{\"sku\": ..., \"quantity\": ...}`) must fetch the unit price from pricing-service `GET /prices/{sku}` and return `{\"total\": quantity * unit_price}`. When pricing-service answers with a non-2xx status, `POST /quotes` returns HTTP 502. A request without a valid bearer token returns 401.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/109",
+      "id": "example-org/widgets-service#109"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Fetch quote unit prices from pricing-service through a new client, mapping upstream failures to gateway errors.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/clients/pricing.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/clients/pricing_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/quotes.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/quotes_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a pricing client in internal/clients/pricing.go exposing UnitPrice(ctx, sku) over GET /prices/{sku}."
+      },
+      {
+        "step": 2,
+        "description": "Construct the pricing client with a 30 s http.Client timeout, matching the inventory client, and map a timeout to HTTP 504."
+      },
+      {
+        "step": 3,
+        "description": "In the POST /quotes handler, call UnitPrice and return {\"total\": quantity * unit_price}; map a non-2xx from pricing-service to HTTP 502."
+      },
+      {
+        "step": 4,
+        "description": "Keep the existing bearer-token check on POST /quotes."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Client tests against an httptest pricing-service: a 200 decodes the price, a 500 surfaces an upstream error, a delayed response surfaces a timeout. Handler tests assert the total, the 502 mapping and the 401.",
+      "rollback_plan": "Revert the PR; quotes fall back to the local price table.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-quote-uses-price",
+          "statement": "POST /quotes for SKU S and quantity Q returns a total equal to Q times the unit price pricing-service returns for S.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#109"
+        },
+        {
+          "id": "ac-quote-pricing-error-502",
+          "statement": "When pricing-service returns HTTP 500, POST /quotes returns HTTP 502.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#109"
+        },
+        {
+          "id": "ac-quote-pricing-timeout",
+          "statement": "When pricing-service takes longer than 30 seconds to respond, POST /quotes returns HTTP 504 within 31 seconds.",
+          "source": "inferred",
+          "rationale": "Inferred from internal/clients/inventory.go, which sets a 30 s timeout on its upstream calls; the pricing client should behave the same."
+        },
+        {
+          "id": "ac-quote-requires-auth",
+          "statement": "POST /quotes without a valid bearer token returns HTTP 401.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#109"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The inventory client's 30 s timeout suits pricing-service as well."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "not warranted",
+    "unwarranted",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not requested",
+    "never requested",
+    "not asked for",
+    "issue says nothing",
+    "issue is silent",
+    "scope creep",
+    "speculative",
+    "not stated in the issue",
+    "not in the issue",
+    "invented",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported",
+    "unjustified",
+    "borrowed",
+    "copied from",
+    "carried over from"
+  ],
+  "attribution_phrases": [
+    "30 seconds",
+    "504"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-quote-pricing-timeout is not warranted: the issue never asks for a timeout or a 504, and the 30 s is borrowed from the inventory client."
+    },
+    {
+      "severity": "medium",
+      "category": "warrant",
+      "note": "ac-quote-pricing-timeout invents a 504 contract; a sibling client's setting gives it no basis in the issue."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The inferred 504 criterion is speculative: the issue states no timeout, and the inventory client's value is not a requirement for quotes."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers pricing-service returning a malformed JSON body."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "A quote for many SKUs would make one pricing call per SKU; consider batching later."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the 502 response for POST /quotes in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-quote-pricing-timeout's test should use an httptest server that blocks on a channel rather than sleeping 30 seconds."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "A 504 path holds the request goroutine for the full client window; make sure the server write timeout is longer."
+    }
+  ]
+}
