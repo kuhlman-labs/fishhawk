@@ -1,6 +1,6 @@
 # basedelta
 
-ADR-096 slice 1 (E87.1 / #4292): the base-delta independence classifier. A PR head H verified green against base B may merge onto B' (main advanced) WITHOUT a fresh verify pass only when the base delta B..B' cannot interact with the PR. `Classifier.Classify` decides that from path lists plus Go import graphs. **Unconsumed**: nothing imports this package yet; slice 2 wires it into the merge path.
+ADR-096 slice 1 (E87.1 / #4292): the base-delta independence classifier. A PR head H verified green against base B may merge onto B' (main advanced) WITHOUT a fresh verify pass only when the base delta B..B' cannot interact with the PR. `Classifier.Classify` decides that from path lists plus Go import graphs. Slice 2 (E87.2 / #4293) reads its inputs with `GitDelta` and materializes its workspaces with `MaterializeTree` (see "Git inputs"); the server's merge-candidate verdict transfer (`backend/internal/server/merge_candidate_transfer.go`) is the consumer.
 
 ## Contract
 
@@ -8,7 +8,7 @@ ADR-096 slice 1 (E87.1 / #4292): the base-delta independence classifier. A PR he
 
 - Paths are repo-relative, slash-separated and **canonical**: `path.Clean(p) == p`. `./docs/ARCHITECTURE.md`, `a//b`, `x/` are refused (approval condition C8), so a non-canonical spelling cannot slip past the anchored global-surface match.
 - Callers pass **both sides of a rename** (`git diff --no-renames`): the classifier sees only path lists.
-- Callers pass the B' **and** H workspaces. The reach rule runs over the UNION of their graphs (see below).
+- Callers pass the B' **and** merge-candidate H' workspaces. The reach rule runs over the UNION of their graphs (see below).
 - `Reason` is single-line and at most 256 bytes. Fail closed means verify: only `independent` lets a merge skip the pass.
 - `SurfaceVersion` versions `GlobalSurface` + `SharedArtifactDirs`; bump it on any change so a recorded verdict names its set.
 
@@ -38,9 +38,39 @@ ADR-096 slice 1 (E87.1 / #4292): the base-delta independence classifier. A PR he
 - A `.go` file in a package directory → that package.
 - Any other path (non-Go, or a `.go` file outside every package, e.g. under `testdata/`) → **every** ancestor directory, its own first, that is a package directory in ANY loaded graph (approval condition C3). Nearest-only would miss a directory that is a package in H but plain data under a package in B'. No ancestor: a `.go` path is `unmapped_go_path` (undecidable); a non-Go path is inert.
 
-## Why the graph is the union of B' and H
+## Why the graph is the union of B' and H'
 
-The issue specified "the workspace at B'". B' alone cannot see an import edge the PR itself adds (PR makes q import a; delta changes a): the B' graph has no q → a edge, so the closures look disjoint. The classifier therefore takes a list of workspaces and unions their graphs; the caller passes B' and H. A brand-new PR package is not missed even with B' alone, because its `.go` paths are unmapped there (undecidable). Accepted by the operator as a conservative refinement of ADR-096 and recorded here rather than in a new ADR (ADR-098 / #4316 leaves this slice on the current conservative D3 set).
+The issue specified "the workspace at B'". B' alone cannot see an import edge the PR itself adds (PR makes q import a; delta changes a): the B' graph has no q → a edge, so the closures look disjoint. The classifier therefore takes a list of workspaces and unions their graphs. Slice 1 named the PR head H as the second workspace; slice 2 passes the merge candidate H' (H merged with B') instead, because H' contains every import edge the PR adds, which is the only reason H was asked for. An edge that exists only in H because the delta removed its target is gone from H' — see the residual on removed packages. A brand-new PR package is not missed even with B' alone, because its `.go` paths are unmapped there (undecidable). Accepted by the operator as a conservative refinement of ADR-096 and recorded here rather than in a new ADR (ADR-098 / #4316 leaves this slice on the current conservative D3 set).
+
+## Git inputs (`GitDelta`, `MaterializeTree`; E87.2 / #4293)
+
+`GitDelta(ctx, repoDir, candidate, priorHead, rootHead) (DeltaInputs{FromBase, ToBase, DeltaPaths, PRPaths}, error)` reads the classifier's path inputs for the merge commit a clean base advance produced, from the run's LOCAL checkout (no fetch). `rootHead` is the head whose RECORDED pass anchors a transfer chain (the prior head itself when its verdict was recorded), so a chain of individually-independent advances is re-judged as one cumulative delta against the base the real pass verified.
+
+1. Every id must be a full lowercase 40- or 64-hex object id; anything else (`HEAD`, an abbreviation, `-x`) is refused before any git child runs.
+2. `rev-list --parents -n 1 <candidate>`: exactly two parents, parent 1 == `priorHead`. `ToBase` (B') = parent 2.
+3. `merge-base --is-ancestor <rootHead> <priorHead>`.
+4. `merge-base --all <rootHead> <ToBase>`: exactly one base; `FromBase` = that base. Criss-cross history (two bases) is refused, never "take the first".
+5. `DeltaPaths` = `diff -z --no-renames --no-ext-diff --no-textconv --no-relative --no-color --name-only FromBase ToBase`; `PRPaths` = the same from `FromBase` to `rootHead`. `--no-renames` gives both sides of a rename (the classifier contract above). `--no-ext-diff`/`--no-textconv` are defence in depth only: `--name-only` runs no diff driver, so their removal is unobservable (declared, not tested).
+
+`MaterializeTree(ctx, repoDir, commit, dest)` writes a commit's tracked tree into an empty `dest` from `ls-tree -r -z --full-tree` plus `cat-file --batch`, writing the bytes itself. Unlike `git archive` (`reviewsandbox.ExportTree`) it IGNORES `export-ignore` and KEEPS symlinks, runs no filter/textconv driver, and never touches the repository's index or work tree.
+
+That is the #4293 approval condition (incomplete-graph fail-closed): an archive export drops an `export-ignore`d package, and a dropped package that imports both changed packages makes them look disjoint (`TestMaterializeTree_ExportIgnoredDependentNeverIndependent` shows the archive export classifying such a fixture `independent` and the materialized trees classifying it `reach_overlap:c`).
+
+Regular files are created `O_EXCL` and symlinks only after the last file, so a case-folding collision fails instead of overwriting a file or writing through a symlink. A tree entry that is not a regular file or symlink (a submodule gitlink) or a path with an empty, `.`, `..` or `.git` component makes the workspace incomplete or unsafe: refused, never classified.
+
+Every git child is `git -C <repoDir>`, local-only, `procgroup.Harden`ed under `DefaultGitTimeout` (30s) per child, with the env scrubbed to `reviewsandbox.BaseAllow` (no inherited `GIT_DIR`, `GIT_INDEX_FILE` or credential) plus `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_NO_REPLACE_OBJECTS=1` (a local `refs/replace` cannot forge parents) and `GIT_OPTIONAL_LOCKS=0`. A failure wraps a typed sentinel; `InputsErrorCode` maps it to a closed code:
+
+| Sentinel | Code | Test |
+|---|---|---|
+| caller context deadline | `deadline_exceeded` | `TestGitDelta_ContextDeadline` |
+| `ErrInvalidObjectID` | `invalid_object_id` | `TestGitDelta_NonSHAInputsRefused` |
+| `ErrUnexpectedParents` (single parent, octopus, parent 1 != prior head) | `unexpected_parents` | `TestGitDelta_UnexpectedParents` |
+| `ErrNotAncestor` | `not_ancestor` | `TestGitDelta_RootNotAncestor` |
+| `ErrAmbiguousMergeBase` | `ambiguous_merge_base` | `TestGitDelta_AmbiguousMergeBase` |
+| `ErrNoMergeBase` | `no_merge_base` | `TestGitDelta_NoMergeBase` |
+| `ErrIncompleteTree` (gitlink, non-file mode, case-fold collision) | `incomplete_tree` | `TestMaterializeTree_SubmoduleIncomplete`, `TestMaterializeTree_CaseFoldFileCollisionFails`, `TestMaterializeTree_CaseFoldSymlinkNeverEscapes` |
+| `ErrUnsafeTreePath` | `unsafe_tree_path` | `TestCheckTreePath`, `TestParseLsTree_Refusals` |
+| `ErrGit` (non-zero exit, timeout, malformed output; single-line stderr tail of at most 256 bytes) | `git` | `TestGitDelta_GitFailureNamesBoundedStderr`, `TestMaterializeTree_GitFailure` |
 
 ## Loader (`GoListLoader`)
 
@@ -145,4 +175,7 @@ So: a new leg, harness, inline script call or mirror RED-lines verify until it i
 - A CUSTOM build tag is visible (the go/parser pass ignores constraints), but a file excluded by name convention (`_x.go`, `.x.go`) or under `testdata`/`vendor` is not a package file, matching `go`'s own rules.
 - Go tests reading OTHER packages' source as data (`wirecontract`'s go/ast parity scan, the `agentpaths`/`constraint` twins, `testanchor`'s repo-wide scan, the audit category-emission scan) are invisible to the import graph. Most check a per-file property, which cannot interact across sides; the pairwise ones force each side to edit both members, so reach overlaps. A red main traced to one is a D3/reach coverage bug per ADR-096.
 - ADR-096's stated residuals (DB runtime coupling, reflection / `go:linkname`, global state) stand.
+- A delta that REMOVES a package the PR imports makes H' fail `go list` (the import no longer resolves), so the verdict is `undecidable:load:…`, not `reach_overlap`. Fail closed and deliberate: either way the pass runs.
+- The case-folding guards (`O_EXCL`, symlinks last) are exercised only on a case-insensitive filesystem (macOS dev hosts); on a case-sensitive host the colliding entries are distinct files and both tests assert that nothing is lost or written outside `dest`.
+- `MaterializeTree` writes a symlink's target verbatim, so a symlink may point outside the workspace. `go list ./...` and the loader's go/parser walk do not follow directory symlinks, and the loader refuses a package directory outside the workspace.
 - `GOPROXY=off` means a host whose module cache lacks a HOST-platform dependency gets `undecidable` (verify), never a fetch. The runner gate's cache holds every host-platform module because the verify test loop builds the same workspace in the same environment; non-host-platform modules are never needed (C1). `TestGoListLoader_RealRepository` fails if the real workspace does not load.
