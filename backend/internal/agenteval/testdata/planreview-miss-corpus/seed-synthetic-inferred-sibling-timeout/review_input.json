@@ -107,15 +107,14 @@
     "not grounded",
     "ungrounded",
     "no basis in the issue",
-    "unsupported",
-    "unjustified",
-    "borrowed",
-    "copied from",
-    "carried over from"
+    "unsupported by the issue",
+    "borrowed from the inventory",
+    "copied from the inventory",
+    "carried over from the inventory"
   ],
   "attribution_phrases": [
     "30 seconds",
-    "504"
+    "31 seconds"
   ],
   "catching_examples": [
     {
@@ -131,7 +130,7 @@
     {
       "severity": "medium",
       "category": "acceptance_criteria",
-      "note": "The inferred 504 criterion is speculative: the issue states no timeout, and the inventory client's value is not a requirement for quotes."
+      "note": "The inferred criterion that POST /quotes returns 504 within 31 seconds is speculative: the issue states no timeout, and the inventory client's value is not a requirement for quotes."
     }
   ],
   "non_catching_examples": [
@@ -159,6 +158,14 @@
       "severity": "medium",
       "category": "risk",
       "note": "A 504 path holds the request goroutine for the full client window; make sure the server write timeout is longer."
+    },
+    {
+      "category": "risk",
+      "note": "The 30 seconds wait holds a request goroutine; a server write timeout copied from the payments service would diverge from it, and the mismatch is unjustified."
+    },
+    {
+      "category": "scope",
+      "note": "Approach step 2 maps a timeout to HTTP 504, which is unsupported by the shared error middleware and unjustified without a retry; register the code there."
     }
   ]
 }

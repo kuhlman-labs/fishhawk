@@ -150,6 +150,7 @@ hand-edited one fails mode (16).
 (cd backend && go run ./internal/agenteval/catchrategate)
 cd backend/internal/agenteval/testdata/planreview-catchrate
 git add evidence.json evidence.trials.json
+git commit -s -m "Record plan-review catch-rate evidence and trial sidecar"
 ```
 
 `catchrategate` exits 0 with the rendered report when the record passes, and

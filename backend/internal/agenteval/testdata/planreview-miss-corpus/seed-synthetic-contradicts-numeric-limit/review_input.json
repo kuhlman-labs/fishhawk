@@ -96,28 +96,14 @@
     "conflicts with the 10",
     "inconsistent with the issue",
     "violates the issue",
-    "exceeds the issue",
-    "exceeds the 10",
-    "above the 10",
-    "over the 10",
-    "beyond the 10",
-    "the issue caps",
-    "issue's 10 mb",
-    "issue's 10mb",
-    "the issue requires",
-    "the issue says",
-    "the issue states",
-    "should be rejected",
-    "must be rejected",
     "should return 413",
     "must return 413",
     "should be 413",
     "instead of 413",
     "rather than 413",
-    "mismatch",
-    "diverges",
-    "contrary to",
-    "at odds with"
+    "contrary to the issue",
+    "at odds with the issue",
+    "at odds with the 10"
   ],
   "attribution_phrases": [
     "20 mb",
@@ -170,6 +156,10 @@
       "severity": "low",
       "category": "scope",
       "note": "The configured upload limit should be read from the service config, not hard-coded in the handler."
+    },
+    {
+      "category": "coverage",
+      "note": "The 20 MB PDF fixture is unjustified bloat at odds with the repo's binary-fixture limit; the issue says nothing about fixtures, so generate it at run time."
     }
   ]
 }

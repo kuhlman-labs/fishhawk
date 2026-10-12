@@ -889,7 +889,8 @@ func (s *trialScriptSender) Messages(_ context.Context, _, userText string) (str
 // newCyclingTrialSender: n%3==0 a caught verdict (one high-severity concern
 // naming every case's id and first probe); n%3==1 a missed verdict whose
 // concerns are, in order, a probe-without-attribution concern for the
-// untestable-adjective case carrying a fabricated token, an
+// untestable-adjective case carrying a fabricated token in its severity,
+// category and note, an
 // attribution-without-probe concern naming every planted id, the wide-rune
 // note, and filler past the concern cap; n%3==2 an undecodable response
 // carrying the token.
@@ -909,7 +910,7 @@ func newCyclingTrialSender(t *testing.T) *trialScriptSender {
 	}
 	caught := verdict(map[string]any{"severity": "high", "category": "acceptance_criteria", "note": allCaseCatchNote(t)})
 	missedConcerns := []map[string]any{
-		{"severity": "medium", "category": "testability", "note": "this criterion is vague; token " + fabricatedCatchToken},
+		{"severity": "medium " + fabricatedCatchToken, "category": "testability " + fabricatedCatchToken, "note": "this criterion is vague; token " + fabricatedCatchToken},
 		{"severity": "low", "category": "documentation", "note": strings.Join(ids, ", ") + " need a doc line"},
 		{"severity": "low", "category": "coverage", "note": wideRuneNote},
 	}
@@ -1055,9 +1056,62 @@ func TestRecordCatchRateEvidence_WritesTrialSidecar(t *testing.T) {
 	}
 }
 
+// TestRecordCatchRateEvidence_SidecarRecordsPhraseAttribution (#4326 b): a
+// trial caught through an attribution PHRASE — its one concern names every
+// case's first attribution phrase and first probe and NO planted id — reaches
+// the committed sidecar as attribution "phrase", never rewritten to "id", so
+// the id-attributed share the run-book's jq reads is not inflated.
+func TestRecordCatchRateEvidence_SidecarRecordsPhraseAttribution(t *testing.T) {
+	cases, _ := loadCommittedCatch(t)
+	terms := make([]string, 0, 2*len(cases))
+	for _, c := range cases {
+		terms = append(terms, c.Input.AttributionPhrases[0], c.Input.CatchProbes[0])
+	}
+	note := "the plan's criteria are defective: " + strings.Join(terms, "; ")
+	for _, c := range cases {
+		if _, attribution, ok := matchCatchConcern("acceptance_criteria", note, c.CatchRule()); !ok || attribution != CatchAttributionPhrase {
+			t.Fatalf("case %q: fixture premise: the note must catch via a phrase, got caught=%v attribution %q", c.Name, ok, attribution)
+		}
+	}
+	b, err := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{
+		map[string]any{"severity": "high", "category": "acceptance_criteria", "note": note},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &trialScriptSender{calls: map[string]int{}, script: func(int) string { return string(b) }}
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	if _, err := record(t, sender, path, catchT0, pin("phrase-attribution fixture")); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	tr := readCatchTrials(t, path)
+	caught := 0
+	for arm, perCase := range map[string]map[string][]CatchRateTrialRecord{
+		ArmWithoutConventions: tr.Arms.WithoutConventions.PerCase,
+		ArmWithConventions:    tr.Arms.WithConventions.PerCase,
+	} {
+		for name, list := range perCase {
+			for _, r := range list {
+				if r.Outcome != CatchCaught || r.Attribution != CatchAttributionPhrase {
+					t.Fatalf("arm %q case %q trial %d: outcome %q attribution %q, want caught via %q", arm, name, r.Trial, r.Outcome, r.Attribution, CatchAttributionPhrase)
+				}
+				caught++
+			}
+		}
+	}
+	if caught == 0 {
+		t.Fatal("the sidecar recorded no caught trial")
+	}
+	if !bytes.Contains(mustRead(t, CatchRateTrialsPath(path)), []byte(`"attribution": "phrase"`)) {
+		t.Error(`the committed sidecar bytes carry no "attribution": "phrase"`)
+	}
+}
+
 // TestRecordCatchRateEvidence_TrialSidecarRedacts: a fabricated GitHub token
-// in a missed concern's note and in an undecodable response is committed as
-// the redaction marker, never verbatim.
+// in a missed concern's note, category and severity and in an undecodable
+// response is committed as the redaction marker, never verbatim — every
+// model-derived field, so a refactor that bypasses sanitizeCatchTrialText for
+// one of them fails here.
 func TestRecordCatchRateEvidence_TrialSidecarRedacts(t *testing.T) {
 	_, _, raw := recordCyclingSidecar(t)
 	if bytes.Contains(raw, []byte(fabricatedCatchToken)) {
@@ -1067,19 +1121,28 @@ func TestRecordCatchRateEvidence_TrialSidecarRedacts(t *testing.T) {
 	if err := decodeStrictJSON(raw, &tr); err != nil {
 		t.Fatal(err)
 	}
-	var notes, excerpts int
+	const marker = "[REDACTED:github-pat-classic]"
+	var notes, categories, severities, excerpts int
 	for _, list := range tr.Arms.WithoutConventions.PerCase {
 		for _, r := range list {
-			if r.Outcome == CatchMissed && strings.Contains(r.Concerns[0].Note, "[REDACTED:github-pat-classic]") {
-				notes++
+			if r.Outcome == CatchMissed {
+				if strings.Contains(r.Concerns[0].Note, marker) {
+					notes++
+				}
+				if strings.Contains(r.Concerns[0].Category, marker) {
+					categories++
+				}
+				if strings.Contains(r.Concerns[0].Severity, marker) {
+					severities++
+				}
 			}
-			if r.Outcome == CatchUndecodable && strings.Contains(r.ResponseExcerpt, "[REDACTED:github-pat-classic]") {
+			if r.Outcome == CatchUndecodable && strings.Contains(r.ResponseExcerpt, marker) {
 				excerpts++
 			}
 		}
 	}
-	if notes == 0 || excerpts == 0 {
-		t.Fatalf("redaction markers: %d in missed notes, %d in response excerpts; want both > 0", notes, excerpts)
+	if notes == 0 || categories == 0 || severities == 0 || excerpts == 0 {
+		t.Fatalf("redaction markers: %d in missed notes, %d in missed categories, %d in missed severities, %d in response excerpts; want all > 0", notes, categories, severities, excerpts)
 	}
 }
 

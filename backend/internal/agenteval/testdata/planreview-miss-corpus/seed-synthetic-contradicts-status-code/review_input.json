@@ -100,10 +100,6 @@
     "conflicts with the issue",
     "inconsistent with the issue",
     "violates the issue",
-    "the issue requires",
-    "the issue says",
-    "the issue states",
-    "the issue specifies",
     "the issue asks for 409",
     "should be 409",
     "must be 409",
@@ -114,14 +110,12 @@
     "409 rather than 400",
     "instead of 409",
     "rather than 409",
-    "mismatch",
-    "diverges",
-    "contrary to",
-    "at odds with"
+    "contrary to the issue",
+    "at odds with the issue",
+    "specifies 409"
   ],
   "attribution_phrases": [
-    "already uses",
-    "duplicate_name"
+    "already uses"
   ],
   "catching_examples": [
     {
@@ -165,6 +159,10 @@
       "severity": "low",
       "category": "scope",
       "note": "Renaming a widget via PATCH /widgets/{id} can also produce a duplicate; the plan changes only POST."
+    },
+    {
+      "category": "risk",
+      "note": "Detecting a name another widget already uses by a string compare is unjustified when the unique index enforces it; the issue says names compare case-insensitively, so a collation mismatch could diverge from the index."
     }
   ]
 }

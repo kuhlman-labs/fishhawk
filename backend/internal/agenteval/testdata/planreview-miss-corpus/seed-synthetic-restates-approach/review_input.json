@@ -140,6 +140,10 @@
       "severity": "low",
       "category": "documentation",
       "note": "ac-step-two-done could cite the widgetResponse type by its file path."
+    },
+    {
+      "category": "scope",
+      "note": "Approach step 2's json tag diverges from the camelCase used elsewhere; the mismatch is unjustified and the issue says nothing about tags."
     }
   ]
 }

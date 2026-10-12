@@ -648,13 +648,30 @@ re-measurement.
 **Prompt-vocabulary probes are safe ONLY because of the same-concern
 attribution requirement.** The probe sets include the plan-review prompt's
 own vocabulary and the generic words a reviewer uses for every defect of a
-class (`vague`, `ambiguous`, `no observable`, `speculative`, `invented`,
-`not stated in the issue`, `mismatch`, `diverges`, …). A reviewer uses those
+class (`vague`, `no observable`, `speculative`, `invented`,
+`not stated in the issue`, …). A reviewer uses those
 words in concerns about ANY criterion, so as probes alone they would score a
 concern about a different, genuinely vague criterion as a catch of the
 planted one and inflate both arms toward a ceiling. Requiring the same
 concern to name the planted criterion is what keeps them discriminating.
 Remove the attribution half and these probes must go with it.
+
+**A generic objection word is never a probe on its own (#4253 fix-up).**
+Attribution does not save a word a reviewer uses to object to ANY aspect of
+the planted criterion: "the 20 MB PDF fixture has a content-type mismatch"
+names the planted criterion and is not a catch. So `mismatch`, `diverges`,
+`unjustified`, `ambiguous`, `unsupported`, `contrary to`, `at odds with`,
+`copied from`, `borrowed`, `should be rejected`, `no bound`, `no threshold`,
+`no time limit`, `not concrete` and `the issue says`/`states`/`requires`/
+`specifies` are not probes; where the defect needs one, it is paired with
+a case-specific token (`at odds with the issue`, `at odds with the 10`,
+`unsupported by the issue`, `copied from audit_events`). Short attribution
+phrases that the issue or an approach step also uses (`504`,
+`duplicate_name`) are not declared. Every case carries a
+`non_catching_example` naming the planted criterion together with a generic
+objection word, and `TestCommittedCatchProbes_GenericObjectionsScoreMissed`
+scores each case's id and every declared phrase, joined with every word in
+that list, as missed: re-adding one of them as a probe fails it.
 
 **Residuals, stated.** (1) A concern that names the planted id AND carries a
 probe that is about a DIFFERENT criterion in the same note still scores

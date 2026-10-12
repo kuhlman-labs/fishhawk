@@ -98,14 +98,10 @@
     "inconsistent with the issue",
     "opposite of what the issue",
     "violates the issue",
-    "mismatch",
-    "diverges",
-    "contrary to",
-    "at odds with",
-    "the issue requires",
-    "the issue says",
-    "the issue states",
-    "requires a soft delete"
+    "contrary to the issue",
+    "at odds with the issue",
+    "requires a soft delete",
+    "at odds with the soft"
   ],
   "attribution_phrases": [
     "removes the widget row"
@@ -162,6 +158,10 @@
       "severity": "low",
       "category": "coverage",
       "note": "ac-delete-hard and ac-delete-returns-204 could share one handler test."
+    },
+    {
+      "category": "scope",
+      "note": "Code that removes the widget row elsewhere (the admin purge) is unjustified to keep; the mismatch with the new deleted_at filter is ambiguous."
     }
   ]
 }

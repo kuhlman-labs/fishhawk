@@ -98,23 +98,14 @@
     "no pass/fail",
     "unmeasurable",
     "not measurable",
-    "no measurable",
     "subjective",
     "vague",
-    "ambiguous",
     "no observable",
     "not observable",
-    "no concrete",
-    "not concrete",
     "ill-defined",
     "cannot decide",
     "can't decide",
-    "undecidable",
-    "no threshold",
-    "no bound",
-    "no time limit",
-    "unquantified",
-    "not quantified"
+    "undecidable"
   ],
   "attribution_phrases": [
     "reasonable time",
@@ -162,6 +153,10 @@
       "severity": "low",
       "category": "documentation",
       "note": "The README should say that a large tenant's widgets export as a stream, so clients should not buffer the response."
+    },
+    {
+      "category": "risk",
+      "note": "Exporting a large tenant's widgets runs one query with no time limit and no bound on buffered rows; the flush interval is ambiguous, so the mismatch with the 60 s gateway is unquantified."
     }
   ]
 }

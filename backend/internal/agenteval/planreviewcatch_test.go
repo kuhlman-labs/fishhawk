@@ -21,9 +21,11 @@ const (
 )
 
 // committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
-// the corpus has carried since E55.4; the derived list below may grow past
-// it, never shrink below it (so the derivation cannot go vacuous).
-const committedSyntheticCatchCaseFloor = 6
+// the corpus has carried since E55.18 / #4253 (six E55.4 seeds plus six
+// mid-difficulty cases); the derived list below may grow past it, never
+// shrink below it (so the derivation cannot go vacuous and a deleted case
+// cannot pass silently).
+const committedSyntheticCatchCaseFloor = 12
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
@@ -491,6 +493,57 @@ func TestCommittedCatchProbes_EchoesScoreMissed(t *testing.T) {
 		concern := CatchExampleConcern{Category: "coverage", Note: strings.Join(echo, "\n")}
 		if got := ClassifyCatch(catchVerdictJSON(t, concern), c.CatchRule()); got != CatchMissed {
 			t.Errorf("case %q: a concern quoting the issue, every criterion and every approach step classified %q, want missed", c.Name, got)
+		}
+	}
+}
+
+// genericObjectionWords are words a reviewer uses to object to ANY aspect of
+// a criterion. None may be a catch probe on its own (#4253 fix-up): a concern
+// naming the planted criterion with one of them is not, by that word, a catch.
+var genericObjectionWords = []string{
+	"mismatch", "diverges", "unjustified", "ambiguous", "unsupported",
+	"contrary to", "at odds with", "copied from", "borrowed", "carried over from",
+	"should be rejected", "must be rejected", "no bound", "no threshold",
+	"no time limit", "no concrete", "not concrete", "unquantified", "no measurable",
+	"the issue says", "the issue states", "the issue requires", "the issue specifies",
+}
+
+// TestCommittedCatchProbes_GenericObjectionsScoreMissed pins that the
+// attribution half does not turn a generic objection into a catch: for every
+// case, its planted id and EVERY declared attribution phrase, each joined with
+// every genericObjectionWords entry in one concern, score MISSED; and every
+// case carries a non_catching_example that names the planted criterion with a
+// generic objection word, which also scores MISSED.
+func TestCommittedCatchProbes_GenericObjectionsScoreMissed(t *testing.T) {
+	cases, _ := loadCommittedCatch(t)
+	objection := strings.Join(genericObjectionWords, "; ")
+	for _, c := range cases {
+		rule := c.CatchRule()
+		anchors := append(append([]string{}, rule.CriterionIDs...), rule.AttributionPhrases...)
+		for _, anchor := range anchors {
+			concern := CatchExampleConcern{Category: "risk", Note: anchor + ": " + objection}
+			if _, ok := matchCatchAttribution(concern.Category, concern.Note, rule); !ok {
+				t.Fatalf("case %q: fixture premise: a concern naming %q must satisfy the attribution half", c.Name, anchor)
+			}
+			if trial := ClassifyCatchTrial(catchVerdictJSON(t, concern), rule); trial.Outcome != CatchMissed {
+				t.Errorf("case %q: %q joined with the generic objection words classified %q (probe %q), want missed", c.Name, anchor, trial.Outcome, trial.MatchedProbe)
+			}
+		}
+		pinned := false
+		for _, ex := range c.Input.NonCatchingExamples {
+			if _, ok := matchCatchAttribution(ex.Category, ex.Note, rule); !ok {
+				continue
+			}
+			if _, ok := matchCatchProbe(ex.Category, ex.Note, genericObjectionWords); !ok {
+				continue
+			}
+			if got := ClassifyCatch(catchVerdictJSON(t, ex), rule); got != CatchMissed {
+				t.Errorf("case %q: generic-objection example %q classified %q, want missed", c.Name, ex.Note, got)
+			}
+			pinned = true
+		}
+		if !pinned {
+			t.Errorf("case %q has no non_catching_example naming the planted criterion with a generic objection word", c.Name)
 		}
 	}
 }

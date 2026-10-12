@@ -105,8 +105,7 @@
     "not grounded",
     "ungrounded",
     "no basis in the issue",
-    "unsupported",
-    "unjustified"
+    "unsupported by the issue"
   ],
   "attribution_phrases": [
     "paginate",
@@ -159,6 +158,10 @@
       "severity": "low",
       "category": "coverage",
       "note": "ac-list-pagination needs a test seeding more than 100 widgets to exercise the next page."
+    },
+    {
+      "category": "risk",
+      "note": "Offset-based logic to paginate at 100 items is unsupported by the tenant_id index and unjustified for large tenants; a keyset cursor avoids the mismatch."
     }
   ]
 }

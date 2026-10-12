@@ -111,11 +111,11 @@
     "not grounded",
     "ungrounded",
     "no basis in the issue",
-    "unsupported",
-    "unjustified",
-    "borrowed",
-    "copied from",
-    "carried over from"
+    "unsupported by the issue",
+    "borrowed from audit_events",
+    "copied from audit_events",
+    "copied from the audit_events",
+    "carried over from audit_events"
   ],
   "attribution_phrases": [
     "90 days",
@@ -163,6 +163,10 @@
       "severity": "medium",
       "category": "risk",
       "note": "Rows older than 90 days should be deleted in batches so the purge does not hold long locks on a large table."
+    },
+    {
+      "category": "risk",
+      "note": "Deleting rows older than 90 days in one statement is unjustified on a large table: the batch size copied from the importer job is unsupported by an index on viewed_at, a mismatch with the purge's lock budget."
     }
   ]
 }

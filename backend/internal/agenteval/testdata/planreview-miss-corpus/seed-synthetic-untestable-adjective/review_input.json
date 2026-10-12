@@ -96,11 +96,8 @@
     "not measurable",
     "subjective",
     "vague",
-    "ambiguous",
     "no observable",
     "not observable",
-    "no concrete",
-    "not concrete",
     "ill-defined",
     "cannot decide",
     "can't decide",
@@ -157,6 +154,10 @@
       "severity": "low",
       "category": "coverage",
       "note": "ac-retry-robust overlaps ac-retry-gives-up; one test could exercise both."
+    },
+    {
+      "category": "coverage",
+      "note": "Retry handling is robust only if the backoff timer is injectable; the sleep in approach step 1 is unjustified in tests and diverges from the clock interface."
     }
   ]
 }

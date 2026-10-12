@@ -125,6 +125,10 @@
       "severity": "low",
       "category": "documentation",
       "note": "ac-import-log-or-not should be listed beside ac-import-warn-fields for readability."
+    },
+    {
+      "category": "documentation",
+      "note": "The wording 'either logs a warning' diverges from the WARN level name in the issue; the mismatch is unjustified."
     }
   ]
 }

@@ -106,11 +106,8 @@
     "not measurable",
     "subjective",
     "vague",
-    "ambiguous",
     "no observable",
     "not observable",
-    "no concrete",
-    "not concrete",
     "ill-defined",
     "cannot decide",
     "can't decide",
@@ -166,6 +163,10 @@
       "severity": "low",
       "category": "risk",
       "note": "A user-friendly message that echoes the submitted name back should escape it before it is logged."
+    },
+    {
+      "category": "risk",
+      "note": "A user-friendly message that echoes an ambiguous character back has no concrete escaping rule; the mismatch with the log encoder is unjustified."
     }
   ]
 }
