@@ -949,3 +949,158 @@ func TestMergeCandidateQueue_WireShape(t *testing.T) {
 		t.Errorf("A merge_candidate_queue = %+v, want live/admitted with no position", q)
 	}
 }
+
+// mcvWireSpecYAML declares an implement verify command, so the backend's
+// merge-candidate verify state classifies a base-advance head.
+const mcvWireSpecYAML = `version: "0.5"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test verify"
+            timeout: "5m"
+        produces:
+          - artifact: pull_request
+`
+
+// TestMergeCandidateVerdict_WireShape pins the hand-maintained
+// gateViewMergeCandidateVerdict mirror against the REAL backend (E87.2 /
+// #4293, approval criterion 5890f97c; the #371 trap). An ENFORCE-mode server
+// over Postgres carries a base-advance head whose verdict was TRANSFERRED, a
+// refused transfer and a shadow would_transfer whose pass failed. (a) Every
+// key the SERVER emits in the block, its last_transfer_refusal and its shadow
+// entries is a mirror field; (b) GetGateView and the fishhawk_get_gate_view
+// handler decode source transferred with transferred_from = the prior head,
+// the refusal's reason_code, and the false transfer. Counterfactual: renaming
+// a mirror tag (e.g. transferred_from) fails (a) and (b) → RED.
+func TestMergeCandidateVerdict_WireShape(t *testing.T) {
+	const (
+		root   = "3333333333333333333333333333333333333333"
+		head   = "1111111111111111111111111111111111111111"
+		other  = "2222222222222222222222222222222222222222"
+		bearer = "fhk_merge_candidate_verdict_e2e"
+	)
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec: []byte(mcvWireSpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	seed := func(category string, payload map[string]any) {
+		t.Helper()
+		raw, _ := json.Marshal(payload)
+		kind := audit.ActorSystem
+		if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID: row.ID, Timestamp: time.Now().UTC(), Category: category, ActorKind: &kind, Payload: raw,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", category, err)
+		}
+	}
+	seed(server.CategoryBranchRebased, map[string]any{"new_head_sha": head, "merge_commit_sha": head})
+	seed(server.CategoryMergeCandidateVerdictTransferred, map[string]any{
+		"from_head": root, "to_head": head, "root_head": root, "reason": "independent",
+		"reason_code": "independent", "reason_untrusted": true, "mode": "enforce"})
+	seed(server.CategoryMergeCandidateVerdictTransferRefused, map[string]any{
+		"from_head": root, "to_head": other, "reason": "reach_overlap", "reason_code": "reach_overlap",
+		"reason_detail": "a", "reason_untrusted": true, "mode": "enforce"})
+	seed(server.CategoryMergeCandidateVerdictTransferShadow, map[string]any{
+		"from_head": root, "to_head": other, "reason_code": "independent", "reason_untrusted": true,
+		"would_transfer": true, "duration_ms": 7, "mode": "shadow"})
+	seed(server.CategoryMergeCandidateVerified, map[string]any{"head_sha": other, "result": "failed"})
+
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo:           tokRepo,
+		MergeCandidateTransfer: server.MergeCandidateTransferConfig{Mode: server.MergeCandidateTransferEnforce},
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String()+"/gate-view", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET gate-view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET gate-view = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["merge_candidate_verdict"], &block); err != nil {
+		t.Fatalf("server emitted no merge_candidate_verdict block:\n%s", body)
+	}
+	var refusal map[string]json.RawMessage
+	var shadows []map[string]json.RawMessage
+	if json.Unmarshal(block["last_transfer_refusal"], &refusal) != nil || json.Unmarshal(block["shadow"], &shadows) != nil || len(shadows) != 1 {
+		t.Fatalf("block lacks last_transfer_refusal or one shadow entry: %s", top["merge_candidate_verdict"])
+	}
+	for _, c := range []struct {
+		name string
+		keys map[string]json.RawMessage
+		typ  reflect.Type
+	}{
+		{"merge_candidate_verdict", block, reflect.TypeOf(gateViewMergeCandidateVerdict{})},
+		{"last_transfer_refusal", refusal, reflect.TypeOf(gateViewTransferRefusal{})},
+		{"shadow[]", shadows[0], reflect.TypeOf(gateViewTransferShadow{})},
+	} {
+		fields := jsonFieldNames(c.typ)
+		for k := range c.keys {
+			if !fields[k] {
+				t.Errorf("server %s key %q has no field on the %s mirror (tag drift)", c.name, k, c.typ.Name())
+			}
+		}
+	}
+
+	check := func(surface string, v *gateViewMergeCandidateVerdict) {
+		t.Helper()
+		if v == nil {
+			t.Fatalf("%s: merge_candidate_verdict decoded to nil", surface)
+		}
+		if v.TransferMode != "enforce" || v.HeadSHA != head || v.State != "passed" || v.Cause != "base_advance" ||
+			v.Source != "transferred" || v.TransferredFrom != root || v.RootHead != root {
+			t.Errorf("%s: block = %+v, want %s passed, source transferred from %s", surface, v, head, root)
+		}
+		if r := v.LastTransferRefusal; r == nil || r.ReasonCode != "reach_overlap" || r.ReasonDetail != "a" ||
+			!r.ReasonUntrusted || r.ToHead != other || r.Sequence == 0 {
+			t.Errorf("%s: last_transfer_refusal = %+v, want reach_overlap for %s", surface, r, other)
+		}
+		if len(v.Shadow) != 1 || !v.Shadow[0].WouldTransfer || v.Shadow[0].PassResult != "failed" ||
+			!v.Shadow[0].FalseTransfer || v.Shadow[0].DurationMS != 7 || len(v.FalseTransfers) != 1 || v.FalseTransfers[0] != other {
+			t.Errorf("%s: shadow = %+v, false_transfers = %v; want one false transfer to %s", surface, v.Shadow, v.FalseTransfers, other)
+		}
+	}
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	check("client", gv.MergeCandidateVerdict)
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getGateView(ctx, nil, GetGateViewInput{RunID: row.ID.String()})
+	if err != nil {
+		t.Fatalf("getGateView: %v", err)
+	}
+	check("fishhawk_get_gate_view", out.GateView.MergeCandidateVerdict)
+}
