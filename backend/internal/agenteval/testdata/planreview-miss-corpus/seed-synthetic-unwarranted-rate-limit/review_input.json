@@ -144,7 +144,8 @@
   ],
   "defect_phrases": [
     "requests per minute",
-    "write endpoints should be rate limited"
+    "write endpoints should be rate limited",
+    "rate limit"
   ],
   "catching_examples": [
     {

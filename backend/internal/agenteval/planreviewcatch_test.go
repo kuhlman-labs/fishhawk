@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -748,23 +749,52 @@ func TestCatchCorpus_NotLeakedIntoPlanReviewPrompt(t *testing.T) {
 // only if it also occurs in the neutral without-arm render. A probe only the
 // with arm is shown would let a with-arm concern echo it and inflate that arm
 // alone, masking a dilution. "issue fidelity" would pass: criterion 8a's
-// heading renders in both arms.
+// heading renders in both arms. The synthetic rows prove the predicate can
+// fire (a framing-only probe) and does not over-fire (a both-arms probe).
 func TestCommittedCatchProbes_NotShownOnlyInTheWithArm(t *testing.T) {
-	cases, conv := loadCommittedCatch(t)
+	committed, conv := loadCommittedCatch(t)
 	renders := neutralArmRenders(t, conv)
-	without := strings.ToLower(renders[ArmWithoutConventions])
-	with := strings.ToLower(renders[ArmWithConventions])
 	if !strings.Contains(renders[ArmWithConventions], prompt.ReviewConventionsFraming) {
 		t.Fatal("fixture premise: the neutral with-arm render lacks ReviewConventionsFraming")
 	}
+	synthetic := func(probe string) []PlanReviewCatchCase {
+		return []PlanReviewCatchCase{{Name: "synthetic", Input: PlanReviewCatchInput{CatchProbes: []string{probe}}}}
+	}
+	for _, tc := range []struct {
+		name  string
+		cases []PlanReviewCatchCase
+		want  []string
+	}{
+		{"committed corpus", committed, nil},
+		{"synthetic framing-only probe", synthetic("inferred-criterion warrant"), []string{`case "synthetic": catch probe "inferred-criterion warrant"`}},
+		{"synthetic probe rendered in both arms", synthetic("issue fidelity"), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := withArmOnlyCatchProbes(tc.cases, renders)
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Errorf("with-arm-only probes = %q, want %q: a with-arm concern echoing such a probe would inflate that arm alone", got, tc.want)
+			}
+		})
+	}
+}
+
+// withArmOnlyCatchProbes lists every catch probe of cases that occurs,
+// case-folded, in the with-conventions render but not the without-conventions
+// render — the asymmetry TestCommittedCatchProbes_NotShownOnlyInTheWithArm
+// forbids.
+func withArmOnlyCatchProbes(cases []PlanReviewCatchCase, renders map[string]string) []string {
+	without := strings.ToLower(renders[ArmWithoutConventions])
+	with := strings.ToLower(renders[ArmWithConventions])
+	var out []string
 	for _, c := range cases {
 		for _, probe := range c.Input.CatchProbes {
 			lp := strings.ToLower(strings.TrimSpace(probe))
 			if strings.Contains(with, lp) && !strings.Contains(without, lp) {
-				t.Errorf("case %q: catch probe %q occurs only in the with-conventions arm's prompt: a with-arm concern echoing it would inflate that arm alone", c.Name, probe)
+				out = append(out, fmt.Sprintf("case %q: catch probe %q", c.Name, probe))
 			}
 		}
 	}
+	return out
 }
 
 // catchRuleV4AddedProbes is, per case, the catch probes catch rule v4 added

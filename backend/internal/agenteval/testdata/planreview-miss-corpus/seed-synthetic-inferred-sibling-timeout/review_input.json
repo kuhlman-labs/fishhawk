@@ -135,7 +135,8 @@
   "defect_phrases": [
     "inventory.go",
     "30 seconds",
-    "pricing-service"
+    "pricing-service",
+    "timeout"
   ],
   "catching_examples": [
     {

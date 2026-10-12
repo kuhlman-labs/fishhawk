@@ -758,6 +758,8 @@ fixture): a probe may occur in the with-arm render of a neutral,
 corpus-disjoint trigger only if it also occurs in the without-arm render.
 `inferred-criterion warrant` (framing only) would fail it; `issue fidelity`
 and `precedent, not a` pass, because criteria 8a and 9 render in both arms.
+The test's synthetic table rows pin both outcomes, so the check is shown able
+to fire.
 
 **The plan-review prompt never shows a case's planted defect (mode r and the
 prompt-leak self-check, #4355).** Every case declares `defect_phrases`: the
@@ -780,7 +782,17 @@ acceptance-criteria block rendered, so the check is not vacuous), and the
 neutral trigger's own text carries no needle (so a hit is static prompt
 bytes). It is why the criterion 8a, criterion-id and criterion-9 examples are
 corpus-disjoint. Residual: it catches only what is declared; mode (r)'s
-grounding keeps a declared phrase honest, not complete.
+grounding keeps a declared phrase honest, not complete. The pre-#4355
+criterion-9 list `(a page size, timeout, rate, status code)` stayed GREEN
+under the check until `page size` (`seed-synthetic-inferred-criterion`),
+`timeout` (`seed-synthetic-inferred-sibling-timeout`) and `rate limit`
+(`seed-synthetic-unwarranted-rate-limit`) were declared. Counterfactual,
+run: with them declared, restoring that list goes RED in both arms on
+`page size` and `timeout`, and the clean prompt stays green. `rate limit`
+does not match the old list's bare `rate`. It guards only a `rate limit`
+phrasing. A bare `rate` is not declarable, because it occurs inside ordinary
+words such as `generate`. `status code` is deliberately undeclared: the
+conventions fixture says it, so the with arm would always go RED.
 
 **An attribution phrase names the planted criterion and nothing else (mode
 p).** Each phrase must occur, case-folded, in a planted criterion's
@@ -1172,6 +1184,11 @@ for a recording, to see what a probe or rule change makes of the last one:
   `caught|missed|undecodable`, or an unavailable corpus. A sidecar case absent
   from the corpus (unscored) or a corpus case absent from the sidecar (not
   recorded) is reported, not fatal.
+- **Smoke-read in verify, fingerprint unchecked.**
+  `TestRescoreCatchRateTrials_CommittedSidecar` and `TestRun_RescoreDefaults`
+  re-score the committed evidence pair without checking its fingerprint, so a
+  sidecar schema change or a corpus change renaming every case reddens
+  `scripts/test verify` until the operator re-records the pair.
 - **An arm table.** It iterates arms from a table and returns every
   re-scored trial with its near-miss tags, so a later named arm
   (#4313 / #4314) and a per-trial classifier (#4350) can reuse it.

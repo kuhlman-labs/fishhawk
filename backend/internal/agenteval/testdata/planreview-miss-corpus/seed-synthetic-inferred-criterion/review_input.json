@@ -132,7 +132,8 @@
   ],
   "defect_phrases": [
     "next_cursor",
-    "paginates at 100"
+    "paginates at 100",
+    "page size"
   ],
   "catching_examples": [
     {
