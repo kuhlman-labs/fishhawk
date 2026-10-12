@@ -66,6 +66,48 @@ func TestRerunReview_PassesThrough(t *testing.T) {
 	}
 }
 
+// TestRerunReview_FirstConsolidatedRound (#4282): a 200 with
+// rerun_of_sequence 0 is the backend's first-round path — a decomposed parent
+// whose consolidated dispatch never started a round. The message names the
+// parent's FIRST consolidated round and the new round sequence, never a
+// re-run of "round 0", and next_action stays fishhawk_await_review on the
+// implement stage.
+//
+// COUNTERFACTUAL: drop the RerunOfSequence == 0 branch in rerunReview → the
+// message reads "re-ran implement-review round 0 as round 12" → RED on both
+// the "FIRST consolidated" and the no-"round 0" assertions.
+func TestRerunReview_FirstConsolidatedRound(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.NewString()
+	stub := &rerunReviewStub{body: `{"run_id":"` + runID.String() + `","stage":"implement","stage_id":"` + stageID +
+		`","rerun_of_sequence":0,"new_round_sequence":12,"configured_agents":2}`}
+	r := stub.resolver(t)
+
+	_, out, err := r.rerunReview(context.Background(), nil, RerunReviewInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("rerunReview: %v", err)
+	}
+	want := RerunReviewResult{RunID: runID.String(), Stage: "implement", StageID: stageID, RerunOfSequence: 0, NewRoundSequence: 12, ConfiguredAgents: 2}
+	if out.Result != want {
+		t.Errorf("result = %+v, want %+v", out.Result, want)
+	}
+	for _, s := range []string{"FIRST consolidated implement-review round", "as round 12", "2 configured reviewer", "fishhawk_await_review"} {
+		if !strings.Contains(out.Message, s) {
+			t.Errorf("message missing %q: %q", s, out.Message)
+		}
+	}
+	if strings.Contains(out.Message, "round 0") {
+		t.Errorf("message = %q, want no claim that a round 0 was re-run", out.Message)
+	}
+	na := out.NextAction
+	if na == nil || na.Action != "fishhawk_await_review" || na.Params["run_id"] != runID.String() || na.Params["stage"] != "implement" {
+		t.Fatalf("next_action = %+v, want fishhawk_await_review{run_id, stage=implement}", na)
+	}
+	if !strings.Contains(na.Precondition, "first consolidated") {
+		t.Errorf("next_action.precondition = %q, want the first-round precondition", na.Precondition)
+	}
+}
+
 // TestRerunReview_EmptyRunIDFallsBackToInput: a body without run_id (an older
 // or partial response) still reports the requested run, so next_action never
 // carries an empty run_id.
@@ -114,8 +156,11 @@ func TestRerunReview_RefusalsSurfaceVerbatimWithHint(t *testing.T) {
 		{http.StatusConflict, "no_review_round", "", "nothing to re-run"},
 		{http.StatusConflict, "review_round_in_flight", `"reason":"round_unsettled"`, "fishhawk_reconcile_reviews"},
 		{http.StatusConflict, "review_round_has_verdict", `"verdicts":1`, "needs no re-run"},
-		{http.StatusConflict, "review_rerun_ineligible", `"reason":"gating_authority"`, "details.reason names why"},
+		{http.StatusConflict, "review_rerun_ineligible", `"reason":"gating_authority"`, "fishhawk_fixup_stage on the parent implement stage"},
 		{http.StatusBadGateway, "review_rerun_not_started", `"reason":"forge_compare_unavailable"`, "call fishhawk_rerun_review again"},
+		// The first-round fan-in hold (#4282): details.merge_candidate_state
+		// passes through verbatim and the hint names the await / fix-up remedy.
+		{http.StatusBadGateway, "review_rerun_not_started", `"merge_candidate_state":"failed","reason":"fanin_verify_held"`, "except fanin_verify_held"},
 		{http.StatusForbidden, "operator_agent_forbidden", "", ""},
 		{http.StatusNotFound, "run_not_found", "", ""},
 	}

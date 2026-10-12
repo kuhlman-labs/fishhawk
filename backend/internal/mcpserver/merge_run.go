@@ -99,8 +99,11 @@ type MergeRunInput struct {
 //     latest implement-review round and the slice's own latest round both
 //     recorded zero verdicts). IMMEDIATE, no verdict row; NextAction is
 //     details.next_step — fishhawk_rerun_review when the parent round settled
-//     with no verdict, fishhawk_await_review while it is in flight or not yet
-//     dispatched.
+//     with no verdict or the parent has no round and its consolidated PR is
+//     open (the verb starts the first consolidated round, #4282);
+//     fishhawk_await_review while a round is in flight, before the PR opens,
+//     or for a gating parent with no round (whose message names
+//     fishhawk_fixup_stage).
 type MergeRunOutput struct {
 	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
@@ -294,8 +297,12 @@ Statuses:
                      failed or were skipped covers nothing). Immediate, no
                      verdict row; the message names the uncovered slice(s).
                      next_action names fishhawk_rerun_review (the parent round
-                     settled with no verdict) or fishhawk_await_review (a round
-                     is in flight or not yet dispatched).
+                     settled with no verdict, or the parent has no round and
+                     its consolidated PR is open — the verb then starts the
+                     parent's first consolidated round) or
+                     fishhawk_await_review (a round is in flight, the PR is not
+                     open yet, or a gating parent has no round — the message
+                     then names fishhawk_fixup_stage).
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -529,7 +536,7 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 		}
 		reason := "await the in-flight (or not yet dispatched) implement-review round on the parent, then re-invoke fishhawk_merge_run"
 		if verb == "fishhawk_rerun_review" {
-			reason = "re-run the parent's failed implement-review round so a successful agent review covers every slice, await its verdict, then re-invoke fishhawk_merge_run"
+			reason = "re-run the parent's failed implement-review round (or start its first consolidated round when none was dispatched) so a successful agent review covers every slice, await its verdict, then re-invoke fishhawk_merge_run"
 		} else {
 			params["stage"] = "implement"
 		}
