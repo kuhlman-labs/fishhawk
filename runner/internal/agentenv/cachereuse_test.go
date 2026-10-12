@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These two tests drive the REAL go toolchain against an isolated GOCACHE to
@@ -60,6 +61,24 @@ func writeModule(t *testing.T, dir string, files map[string]string) {
 	files["go.mod"] = "module example.com/p\n\ngo 1.21\n"
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// backdate sets the mtime of every file directly in dir to when. cmd/go does
+// not cache a test result when a file the test opened was modified within its
+// modTimeCutoff (2s) of the run, and a fast gate finishes the first
+// `go test` inside that window, so a freshly written fixture would fail the
+// positive control on timing rather than on caching being off.
+func backdate(t *testing.T, dir string, when time.Time) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.Chtimes(filepath.Join(dir, e.Name()), when, when); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -213,6 +232,8 @@ func TestFixture(t *testing.T) {
 	dirA, dirB := filepath.Join(root, "a"), filepath.Join(root, "b")
 	writeModule(t, dirA, map[string]string{"p.go": "package p\n", "p_test.go": testSrc, "fixture.txt": "good\n"})
 	writeModule(t, dirB, map[string]string{"p.go": "package p\n", "p_test.go": testSrc, "fixture.txt": "bad\n"})
+	backdate(t, dirA, time.Now().Add(-2*time.Hour))
+	backdate(t, dirB, time.Now().Add(-time.Hour))
 
 	outA, err := runGo(t, goBin, dirA, env, "test", ".")
 	if err != nil {

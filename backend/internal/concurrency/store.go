@@ -56,6 +56,10 @@ type PostgresStore struct {
 	// afterPromotePeek runs between Promote's unlocked peek and its group
 	// lock — the seam the slot-changed test re-keys the row on.
 	afterPromotePeek func(ctx context.Context)
+	// afterPromotePosition runs between Promote's old-position read and its
+	// order-key write, only on the path that decided to write — the seam the
+	// emptied-competitor test cancels or stales a competitor on (#4312).
+	afterPromotePosition func(ctx context.Context)
 }
 
 var _ Store = (*PostgresStore)(nil)
@@ -119,14 +123,28 @@ WHERE ` + freshWaiterPredicateQ + `
 // minimum effective key over every OTHER fresh waiter (the aheadSQL
 // predicate), so the newest promote wins. enqueued_at, last_seen_at and every
 // other row are untouched.
-var promoteKeySQL = `UPDATE stage_concurrency_slots SET order_key = (
-  SELECT min(` + effectiveKeySQL + `)
+//
+// The write is GUARDED on a waiter still being strictly ahead of the caller's
+// own effective key ($4), evaluated in this same statement (#4312). The
+// old-position read is an EARLIER statement, and the competitor set can shrink
+// in between: a waiter goes stale (clock_timestamp freshness) or is cancelled
+// (its stage and run rows are not under the group lock). Unguarded, an emptied
+// set made min() NULL and wrote a NULL order_key that was still audited as a
+// promotion; with only a waiter BEHIND left, it wrote a key later than the
+// caller's own. min and the ahead flag come from ONE aggregate over ONE scan,
+// so they agree on each row's clock_timestamp() freshness. bool_or over zero
+// rows is NULL, which fails the guard too. A failed guard matches no row.
+var promoteKeySQL = `WITH others AS (
+  SELECT min(` + effectiveKeySQL + `) AS k,
+    bool_or((` + effectiveKeySQL + `, s.stage_id) < ($4, $2)) AS ahead
   FROM stage_concurrency_slots s
   JOIN stages st ON st.id = s.stage_id
   JOIN runs r ON r.id = s.run_id
   WHERE ` + freshWaiterPredicateQ + `
-) - interval '1 millisecond'
-WHERE stage_id = $2 AND state = 'queued'
+)
+UPDATE stage_concurrency_slots SET order_key = others.k - interval '1 millisecond'
+FROM others
+WHERE stage_id = $2 AND state = 'queued' AND others.ahead
 RETURNING COALESCE(order_key, enqueued_at)`
 
 // validate refuses a malformed Request before any SQL runs.
@@ -546,8 +564,24 @@ FROM stage_concurrency_slots WHERE stage_id = $1 FOR UPDATE`, req.StageID).Scan(
 		return out, nil // already first: write nothing, record nothing
 	}
 
-	// (6) Write the order key just ahead of every other fresh waiter.
-	if err := tx.QueryRow(ctx, promoteKeySQL, group, req.StageID, acct).Scan(&key); err != nil {
+	if s.afterPromotePosition != nil {
+		s.afterPromotePosition(ctx)
+	}
+
+	// (6) Write the order key just ahead of every other fresh waiter, guarded
+	// in the statement on a waiter still being ahead (promoteKeySQL, #4312).
+	// pgx.ErrNoRows means the guard failed: the last competitor ahead went
+	// stale or was cancelled since step (5), so nobody is ahead at the write
+	// instant and this is the same answer as the oldPos == 1 path above —
+	// nothing written, Record not called. That reading is sound ONLY because
+	// step (4) holds this stage's slot row FOR UPDATE and has already
+	// classified it as queued, so the UPDATE cannot miss for any other reason.
+	// A change that drops or weakens that lock would turn a vanished or held
+	// row into a false Changed=false 1/1 answer.
+	if err := tx.QueryRow(ctx, promoteKeySQL, group, req.StageID, acct, key).Scan(&key); errors.Is(err, pgx.ErrNoRows) {
+		out.OldPosition, out.NewPosition = 1, 1
+		return out, nil
+	} else if err != nil {
 		return Promotion{}, fmt.Errorf("concurrency: promote: write order key: %w", err)
 	}
 

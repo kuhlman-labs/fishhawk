@@ -246,6 +246,8 @@ The operator verb for routing one or more *advisory* implement-review concerns (
 
 It refuses with `ErrFixupNotApplicable` (non-implement stage / wrong state / no recorded concerns → 422 `fixup_not_applicable`) or `ErrFixupBudgetExhausted` (the NORMAL bounded pass count is spent → 422 `fixup_budget_exhausted`).
 
+**`FixupApplicable` is the side-effect-free pre-flight (#4304).** `FixupStage` is split into a read-only ADMISSION (`admitFixup`: the stage type, the terminal-run guard, the implement-state switch with the review-gate classification below, the ceiling-credit clamp, the ceiling and budget bounds, and in acceptance mode the acceptance-stage type check) and its unchanged MUTATION sequence (review re-park, acceptance re-open, implement re-open LAST). `FixupApplicable(ctx, repo, stageID, opts) error` runs only the admission: it never calls `TransitionStage`, it returns nil exactly when `FixupStage` would admit the same call against the same state, and a refusal carries the same sentinel with a byte-identical message (any other error is a read failure: applicability UNKNOWN). Because both run the same `admitFixup`, the two cannot drift. A later `FixupStage` can still refuse or fail if state changes in between, a read fails in its own admission, or a write fails. Its caller is the rebase verb's conflict-resolution arm, which must spend a durable ceiling-of-one budget BEFORE the re-open (`backend/internal/server/README.md` § "Bounded conflict-resolution pass"). One ordering change rode the split: the acceptance-mode acceptance-stage type check now runs in the admission, BEFORE the review re-park, so a wrong-type `AcceptanceStageID` refuses with no stage moved; it used to re-park the review to `pending` first (`TestFixupStage_AcceptanceModeWrongTypeRefusesBeforeRepark`).
+
 **The `fixup_not_applicable` refusal names the REMEDY, not only the unmet precondition (#3116).** `findOpenReviewStage` admits a review stage at `awaiting_approval` ALONE, so in a workflow that orders acceptance BEFORE review (the shipped `feature_change` shape) a succeeded implement stage sits with its review stage still `pending` — a normal, transient window in which the generic "the review gate is not open" sentence told the operator nothing actionable. The blocker is now CLASSIFIED into four branches, each with its own test in `fixup_test.go` asserting the shipped text (the sentinel and the 422 code are unchanged on every branch):
 
 | Branch | Condition | What the message says |
@@ -273,11 +275,12 @@ It refuses with `ErrFixupNotApplicable` (non-implement stage / wrong state / no 
 
 `AcceptanceIsDispatchable` is the one exported owner of that split. It replaced `run.acceptanceIsDispatchable` (#3116) and `auditcomplete.acceptanceAwaitsRedispatch` (#3190/#3224), which were byte-identical copies the compiler could not keep in step.
 
-The four consumers, each composing the renderer with its own tail clause:
+The consumers, each composing the renderer with its own tail clause:
 
 | Consumer | Surface | Tail says |
 |---|---|---|
-| `run/fixup.go` `findOpenReviewStage` | the `fixup_not_applicable` refusal | ", then route the fix-up — the fix-up budget is not consumed by waiting" |
+| `run/fixup.go` `findOpenReviewStage` | the `fixup_not_applicable` refusal | ", then route the fix-up — the fix-up budget is not consumed by waiting" (`fixupAcceptanceBlockerTail`, the default when `FixupOptions.AcceptanceBlockerTail` is empty) |
+| `server/conflictresolution_trigger.go` `startConflictResolutionPass` (via `FixupOptions.AcceptanceBlockerTail`, #4304) | the `rebase_conflict` pre-flight refusal | ", then re-invoke fishhawk_rebase_run_branch — waiting spends no conflict-resolution budget" |
 | `auditcomplete.stageNotTerminalDetail` | the `fishhawk_audit_complete` `stage_not_terminal` detail | " — this check clears on its own once acceptance settles." |
 | `mcpserver/merge_run.go` `acceptanceBlockerAdvisoryFor` | the `timeout` / `checks_pending` merge checkpoints | " — the queued merge cannot fire until the acceptance stage settles and the fishhawk_audit_complete check clears." |
 | `mcpserver/next_actions.go` `foldAcceptanceRedispatchAdvisory` | the merge-ritual arms of the next_actions block | the same merge tail |

@@ -3751,6 +3751,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 		if strings.Contains(tool.Description, "This first slice does not") {
 			t.Errorf("fishhawk_rebase_run_branch description still claims the pre-#3202 fail-closed-only behaviour:\n%s", tool.Description)
 		}
+		// #4304: an unmet re-open precondition is refused BEFORE the budget is
+		// touched. A description silent on it would leave the operator
+		// believing every conflict 422 spent the ceiling-of-one slot, and so
+		// reaching for resolve-push-vouch when a re-invoke would start a pass.
+		if !strings.Contains(tool.Description, "spends NO budget") {
+			t.Errorf("fishhawk_rebase_run_branch description must state that a pre-flight refusal spends NO budget:\n%s", tool.Description)
+		}
+		if !strings.Contains(tool.Description, "a repository read fails") {
+			t.Errorf("fishhawk_rebase_run_branch description must name the read-failure residual:\n%s", tool.Description)
+		}
 	}
 	if !sawRebase {
 		t.Error("fishhawk_rebase_run_branch is not registered/visible over ListTools")
