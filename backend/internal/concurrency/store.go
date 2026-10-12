@@ -69,8 +69,16 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
 }
 
+// JobHeartbeatTTL bounds a RUNNING specialist job's heartbeat (ADR-097 D6,
+// #4300): a job counts as a holder of its admission group only while its
+// runner re-POSTs admission within this window (every 15s), so a crashed job
+// stops blocking local-verify within it. README.md § "Specialist-job holders
+// (ADR-097 D6)".
+const JobHeartbeatTTL = 2 * time.Minute
+
 // Interval literals built from the Go constants (integers, never input).
 var (
+	jobHeartbeatTTLSQL   = fmt.Sprintf("interval '%d seconds'", int(JobHeartbeatTTL/time.Second))
 	queueTTLSQL          = fmt.Sprintf("interval '%d seconds'", int(QueueTTL/time.Second))
 	runningStaleSQL      = fmt.Sprintf("interval '%d seconds'", int(RunningStaleAfter/time.Second))
 	dispatchedStaleSQL   = fmt.Sprintf("interval '%d seconds'", int(DispatchedStaleAfter/time.Second))
@@ -90,6 +98,24 @@ WHERE s.group_key = $1 AND s.state = 'held'
   AND r.account_id IS NOT DISTINCT FROM $2
   AND ` + liveHolderPredicateQ + `
 ORDER BY s.acquired_at, s.stage_id`
+
+// jobHoldersSQL counts the live specialist-job holders of one group in one
+// account (ADR-097 D6): running jobs admitted into the group whose heartbeat
+// is fresh within JobHeartbeatTTL. A stale running job releases without a
+// write here, like a stage holder past its backstop.
+var jobHoldersSQL = `SELECT count(*) FROM specialist_jobs
+WHERE admission_group = $1 AND state = 'running'
+  AND account_id IS NOT DISTINCT FROM $2
+  AND last_seen_at > clock_timestamp() - ` + jobHeartbeatTTLSQL
+
+// freshStageWaitersSQL counts every fresh queued stage row of one group in one
+// account (the freshWaiterPredicateQ rows; no stage is excluded, so $2 is the
+// nil UUID).
+var freshStageWaitersSQL = `SELECT count(*)
+FROM stage_concurrency_slots s
+JOIN stages st ON st.id = s.stage_id
+JOIN runs r ON r.id = s.run_id
+WHERE ` + freshWaiterPredicateQ
 
 // effectiveKeySQL is a slot row's ordering key: the promote's order_key when
 // set (0102, #4191), else enqueued_at. Every row without a promotion is
@@ -250,8 +276,17 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 		return queued, nil
 	}
 
+	// Live specialist-job holders count against the same limit (ADR-097 D6):
+	// a merge-candidate verify pass never runs beside a live job. Zero
+	// whenever no job is running in the group, so stage-only groups are
+	// unchanged.
+	jobHolders, err := countJobHolders(ctx, tx, req.GroupKey, acct)
+	if err != nil {
+		return Admission{}, err
+	}
+
 	// (6) Decide under the group lock.
-	admit := len(holders)+roundAhead < req.Limit
+	admit := len(holders)+jobHolders+roundAhead < req.Limit
 	if s.afterDecision != nil {
 		s.afterDecision(ctx, admit)
 	}
@@ -353,6 +388,67 @@ func listHolders(ctx context.Context, q interface {
 	// pgx.CollectRows returns a non-nil empty slice on zero rows, so an empty
 	// holders list renders as [] (TestAdmit_EmptyHoldersRenderAsList pins it).
 	return holders, nil
+}
+
+func countJobHolders(ctx context.Context, tx pgx.Tx, group string, acct pgtype.UUID) (int, error) {
+	var n int
+	if err := tx.QueryRow(ctx, jobHoldersSQL, group, acct).Scan(&n); err != nil {
+		return 0, fmt.Errorf("concurrency: count job holders: %w", err)
+	}
+	return n, nil
+}
+
+func pgAccount(acct *uuid.UUID) pgtype.UUID {
+	if acct == nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: *acct, Valid: true}
+}
+
+// TryGroupLockTx try-locks one group's advisory lock in one account inside
+// the caller's transaction (ADR-097 D6). It uses the SAME key Admit takes, so
+// a specialist-job admission and a stage admission of one group contend on
+// one lock. It never waits; the lock is released at the caller's COMMIT or
+// ROLLBACK. A nil acct is the untenanted scope.
+func TryGroupLockTx(ctx context.Context, tx pgx.Tx, acct *uuid.UUID, group string) (bool, error) {
+	var hit bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, lockKey(acct, group)).Scan(&hit); err != nil {
+		return false, fmt.Errorf("concurrency: try group lock: %w", err)
+	}
+	return hit, nil
+}
+
+// Occupancy is one group's occupancy in one account, as a specialist-job
+// admission reads it under the group lock.
+type Occupancy struct {
+	// StageHolders counts the live stage holders (the Admit holders list).
+	StageHolders int
+	// FreshStageWaiters counts the queued stage rows fresh within QueueTTL
+	// whose stage is still host-dispatchable. A job yields to them.
+	FreshStageWaiters int
+	// JobHolders counts the running specialist jobs fresh within
+	// JobHeartbeatTTL.
+	JobHolders int
+}
+
+// GroupOccupancyTx reads one group's occupancy in one account inside the
+// caller's transaction (ADR-097 D6). It is meaningful as a decision input
+// only while the caller holds TryGroupLockTx for the same group and account.
+func GroupOccupancyTx(ctx context.Context, tx pgx.Tx, acct *uuid.UUID, group string) (Occupancy, error) {
+	a := pgAccount(acct)
+	holders, err := listHolders(ctx, tx, group, a)
+	if err != nil {
+		return Occupancy{}, err
+	}
+	var waiters int
+	if err := tx.QueryRow(ctx, freshStageWaitersSQL, group, uuid.Nil, a).Scan(&waiters); err != nil {
+		return Occupancy{}, fmt.Errorf("concurrency: count fresh stage waiters: %w", err)
+	}
+	jobs, err := countJobHolders(ctx, tx, group, a)
+	if err != nil {
+		return Occupancy{}, err
+	}
+	return Occupancy{StageHolders: len(holders), FreshStageWaiters: waiters, JobHolders: jobs}, nil
 }
 
 // StatusForStages returns the ACTIVE slot state of each listed stage that has
