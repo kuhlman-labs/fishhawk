@@ -1,0 +1,178 @@
+{
+  "issue_title": "Record widget view events and expose a view count",
+  "issue_body": "Product wants to know which widgets operators actually open.\n\nOn every `GET /widgets/{id}` that returns 200, insert a `widget_views` row carrying the widget id, the tenant id and `viewed_at`. Add `GET /widgets/{id}/views` returning `{\"count\": N}`, the number of recorded views of that widget. A widget owned by another tenant returns 404 on both routes.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/110",
+      "id": "example-org/widgets-service#110"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Record a widget_views row per successful widget read and add a per-widget view-count endpoint.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/store/migrations/0016_widget_views.sql",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/widget_views.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/jobs/purge.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0016 creating widget_views (id, widget_id, tenant_id, viewed_at) with an index on widget_id, and a down migration."
+      },
+      {
+        "step": 2,
+        "description": "After GET /widgets/{id} resolves a widget, insert a widget_views row via RecordView in internal/store/widget_views.go."
+      },
+      {
+        "step": 3,
+        "description": "Add GET /widgets/{id}/views returning {\"count\": N} from CountViews, with the same tenant check as GET /widgets/{id}."
+      },
+      {
+        "step": 4,
+        "description": "Register widget_views with the nightly purge job in internal/jobs/purge.go using a 90-day cutoff, as audit_events has."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests: a GET inserts exactly one row, a 404 GET inserts none, the count endpoint returns the inserted count, and another tenant's widget returns 404. A purge job test runs with a fake clock.",
+      "rollback_plan": "Revert the PR and run the 0016 down migration; recorded views are dropped.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-views-recorded",
+          "statement": "Each GET /widgets/{id} that returns 200 inserts exactly one widget_views row carrying the widget id, tenant id and viewed_at.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#110"
+        },
+        {
+          "id": "ac-views-count",
+          "statement": "GET /widgets/{id}/views returns {\"count\": N} where N is the number of widget_views rows for that widget.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#110"
+        },
+        {
+          "id": "ac-views-tenant-scoped",
+          "statement": "GET /widgets/{id}/views for a widget owned by another tenant returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#110"
+        },
+        {
+          "id": "ac-views-purged-after-90-days",
+          "statement": "widget_views rows older than 90 days are deleted by the nightly purge job.",
+          "source": "inferred",
+          "rationale": "Inferred from the audit_events table, whose nightly purge job keeps 90 days; view events should follow the same retention."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Event tables in this service share the audit_events retention."
+    ],
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "not warranted",
+    "unwarranted",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not requested",
+    "never requested",
+    "not asked for",
+    "issue says nothing",
+    "issue is silent",
+    "scope creep",
+    "not stated in the issue",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported by the issue",
+    "borrowed from audit_events",
+    "copied from audit_events",
+    "copied from the audit_events",
+    "carried over from audit_events",
+    "invented retention",
+    "speculative retention",
+    "retention is invented",
+    "retention is speculative",
+    "retention is not in the issue",
+    "retention period is not in the issue",
+    "purge is invented",
+    "purge is speculative",
+    "purge is not in the issue"
+  ],
+  "attribution_phrases": [
+    "90 days",
+    "deleted by the nightly purge"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-views-purged-after-90-days is not warranted: the issue never asks for a retention period, and the 90 days are borrowed from audit_events."
+    },
+    {
+      "severity": "medium",
+      "category": "warrant",
+      "note": "ac-views-purged-after-90-days is speculative scope creep: there is no basis in the issue for deleting view events at all."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The inferred purge of view rows older than 90 days is not stated in the issue; it is copied from the audit_events job and would silently shrink the view count."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Inserting a row on every GET adds a write to a read path; consider buffering the inserts."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test asserts that a 404 GET for another tenant's widget records no view."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document GET /widgets/{id}/views and its 404 in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-views-purged-after-90-days needs a test that seeds a row 91 days old and runs the purge job with a fake clock."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Rows older than 90 days should be deleted in batches so the purge does not hold long locks on a large table."
+    },
+    {
+      "category": "risk",
+      "note": "Deleting rows older than 90 days in one statement is unjustified on a large table: the batch size copied from the importer job is unsupported by an index on viewed_at, a mismatch with the purge's lock budget."
+    }
+  ]
+}

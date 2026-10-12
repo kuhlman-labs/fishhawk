@@ -113,7 +113,25 @@
     "not requested",
     "not asked for",
     "rationale is generic",
-    "generic rationale"
+    "generic rationale",
+    "not stated in the issue",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported by the issue",
+    "invented rate limit",
+    "speculative rate limit",
+    "rate limit is invented",
+    "rate limit is speculative",
+    "rate limit is not in the issue",
+    "throttling is speculative",
+    "throttling is not in the issue",
+    "429 is invented",
+    "429 is speculative"
+  ],
+  "attribution_phrases": [
+    "429",
+    "requests per minute"
   ],
   "catching_examples": [
     {
@@ -157,6 +175,15 @@
       "severity": "medium",
       "category": "risk",
       "note": "A rate limited tenant could retry in a tight loop; add a Retry-After header."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-archive-rate-limit's test should use a fake clock rather than sleeping for a minute."
+    },
+    {
+      "category": "documentation",
+      "note": "The 429 response body diverges from the error envelope used for 404/409; the mismatch is unjustified."
     }
   ]
 }

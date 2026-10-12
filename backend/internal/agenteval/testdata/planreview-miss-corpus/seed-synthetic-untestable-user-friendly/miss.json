@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000004258",
+  "artifact_id": "00000000-0000-0000-0001-000000004258",
+  "triage_sequence": 111,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is not concretely verifiable (bad/ambiguous criterion)",
+  "decided_at": "2026-10-11T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-name-message-friendly",
+      "statement": "Validation error messages are clear and user-friendly.",
+      "source": "explicit",
+      "source_ref": "example-org/widgets-service#112",
+      "observed": "the executor could not decide pass/fail: the criterion names no message content to assert",
+      "expected": "an observable pass/fail condition",
+      "steps_taken": "read the criterion; found no message text or property to assert",
+      "expectation_basis": "criterion ac-name-message-friendly",
+      "repro_handle": "n/a: the criterion names no observable message property",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

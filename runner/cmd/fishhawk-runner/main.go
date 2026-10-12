@@ -1370,6 +1370,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// bundle sites further down see the compiled set. nil on every other
 	// stage, which keeps their redaction byte-identical.
 	var acceptanceKnown *redaction.KnownValues
+	// releaseAcceptancePreview is the acceptance preview teardown, assigned
+	// inside the block below when a teardown command is configured and called
+	// SYNCHRONOUSLY after the agent invocation loop, before the first terminal
+	// egress (#4308). nil on every other stage and whenever no teardown runs.
+	var releaseAcceptancePreview func() string
 	if stageType == "acceptance" {
 		tmpDir, err := os.MkdirTemp("", "fishhawk-acceptance-*")
 		if err != nil {
@@ -1456,8 +1461,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// (no build identifier, or no expectation from an older backend)
 		// warns and proceeds; no declared hosts skips the gate. The
 		// teardown hook is deferred IMMEDIATELY so it runs on every
-		// post-provision return — the failure paths right below AND the
-		// happy path after the verdict ships (binding approval condition).
+		// post-provision return before the spawn — the failure paths right
+		// below and the cancel path — and is ALSO released synchronously
+		// (releaseAcceptancePreview) once the agent exits and BEFORE the
+		// trace / transcript / verdict ship: any of those can settle the
+		// stage and free the shared local-acceptance slot, so the next
+		// acceptance's provision would otherwise race this one's removal of
+		// the shared fixed preview worktree (#4308). The teardown is
+		// idempotent, so the defer is a no-op after the release.
 		// The probe dials direct from the runner process, not through the
 		// egress proxy — the proxy contains the agent, not the runner.
 		// A relative FISHHAWK_ACCEPTANCE_PREVIEW_CMD must resolve against
@@ -1471,6 +1482,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			ctx, gcfg, egressTargetHosts, acceptanceExpectedHeadSHA, cfg.runID, logSink)
 		if gateTeardown != nil {
 			defer gateTeardown()
+			releaseAcceptancePreview = gateTeardown
 		}
 		if gateFailReason != "" {
 			_, _ = fmt.Fprintf(logSink,
@@ -2438,6 +2450,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// events. No-op (nil) on every non-apply dispatch.
 	if len(fixupApplyEvents) > 0 {
 		res.Events = append(res.Events, fixupApplyEvents...)
+	}
+
+	// Release the acceptance preview (#4308) NOW: after the agent loop (so
+	// no self-retry can still be driving the preview) and BEFORE the first
+	// terminal egress below — uploadTrace (whose agent_failed manifest
+	// settles a failed stage), ShipAcceptanceTranscript, ShipAcceptance and
+	// every post-invoke reportTerminalRunnerFailure. Each can settle the
+	// stage and free the shared local-acceptance slot, and the next queued
+	// acceptance's `scripts/dev preview` must find the shared preview path
+	// already clean. Nothing after this point needs the preview: verdict
+	// capture, transcript capture and scenario persistence read the per-run
+	// acceptance tree, not the shared slot. The teardown is hard-bounded
+	// (runPreviewCommand) and idempotent, so the deferred fallback above is
+	// then a no-op.
+	if releaseAcceptancePreview != nil {
+		outcome := releaseAcceptancePreview()
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":%q,"run_id":%q,"stage_id":%q,"outcome":%q}`+"\n",
+			acceptanceEventPreviewReleased, cfg.runID, cfg.stageID, outcome)
 	}
 
 	// Acceptance verdict capture + validation (E31.7 / #1535). On a

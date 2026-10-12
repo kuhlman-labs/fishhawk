@@ -79,6 +79,10 @@
     "holds for every implementation",
     "can never fail"
   ],
+  "attribution_phrases": [
+    "either logs",
+    "or does not log"
+  ],
   "catching_examples": [
     {
       "severity": "medium",
@@ -88,7 +92,7 @@
     {
       "severity": "medium",
       "category": "falsifiability",
-      "note": "One criterion is a tautology that can never fail; replace it with one that fails when no warning is logged."
+      "note": "One criterion ('either logs or does not log') is a tautology that can never fail; replace it with one that fails when no warning is logged."
     }
   ],
   "non_catching_examples": [
@@ -116,6 +120,15 @@
       "severity": "low",
       "category": "documentation",
       "note": "Logging behaviour should be specified in the importer README, including event=skipped_row."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "ac-import-log-or-not should be listed beside ac-import-warn-fields for readability."
+    },
+    {
+      "category": "documentation",
+      "note": "The wording 'either logs a warning' diverges from the WARN level name in the issue; the mismatch is unjustified."
     }
   ]
 }
