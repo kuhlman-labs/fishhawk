@@ -6481,9 +6481,12 @@ dispatch gates warned-and-proceeded.
 
 `resolveConsolidatedFanInHeadSHA` supplies the missing head from the parent's own
 `integration_commit_recorded` entries (`lineageIntegrationCommitCategory`, #1806):
-the fan-in emits one per "Integrate slice N" merge the instant it is created, and
-each such merge commit becomes the consolidated branch tip, so the
-highest-SEQUENCE `merge_sha` IS the consolidated head. Ordering is by sequence,
+the fan-in emits one per "Integrate slice N" merge the instant it is created, plus
+one `kind: base_fold` row for the base-tip fold merge (ADR-096 D4 / #4294) that a
+pass with a pending slice writes into a pre-existing consolidated branch BEFORE
+its slice merges, and each such merge commit becomes the consolidated branch tip,
+so the highest-SEQUENCE `merge_sha` IS the consolidated head (the fold row is
+appended before the pass's slice rows, so the last slice merge stays newest). Ordering is by sequence,
 not timestamp — the fan-in writes these within one pass, and the dispatch-anchored
 caller compares against a sequence anchor.
 
