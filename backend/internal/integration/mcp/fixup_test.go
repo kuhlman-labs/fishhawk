@@ -3828,3 +3828,194 @@ func TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy(t *testing.T) {
 		t.Errorf("refusal does not name the same remedy the surfaces do: %s", refusal)
 	}
 }
+
+// fixupConcernNote returns a distinct single-line note of exactly n bytes.
+func fixupConcernNote(i, n int) string {
+	head := fmt.Sprintf("routed concern %02d: ", i)
+	return head + strings.Repeat("y", n-len(head))
+}
+
+// newConcernFixupServer wires a backend over real Postgres with the durable
+// concern store, parks an implement stage at its gate, and seeds count raised
+// implement-review concerns with n-byte single-line notes.
+func newConcernFixupServer(t *testing.T, ctx context.Context, fx *e2eFixture, count, n int) (*httptest.Server, audit.Repository, concern.Repository, *runpkg.Stage, []*concern.Concern) {
+	t.Helper()
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	raised := make([]concern.RaisedConcern, 0, count)
+	for i := 0; i < count; i++ {
+		raised = append(raised, concern.RaisedConcern{Severity: "medium", Category: "scope", Note: fixupConcernNote(i, n)})
+	}
+	rows, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                fx.runID,
+		StageID:              stage.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 1,
+		Concerns:             raised,
+	})
+	if err != nil || len(rows) != count {
+		t.Fatalf("InsertRaised: rows=%d err=%v", len(rows), err)
+	}
+	return httpSrv, auditRepo, concernRepo, stage, rows
+}
+
+// TestE2E_Fixup_EveryRoutedConcernReachesPrompt is the #4284 done-means fixture
+// across MCP tool → handler → audit payload → resolver → renderer: 6 concerns
+// with 3000-byte notes plus a 3500-byte operator_concern (with
+// operator_evidence) are routed through the REAL fishhawk-mcp binary, and the
+// served prompt's "### Fix-up concerns" block names ALL 7 concern ids (the
+// minted operator id read back from the trigger payload), each id beside its
+// summary line, and the operator_concern in full. Before #4284 the shared
+// 4000-byte block dropped every concern after the operator's.
+func TestE2E_Fixup_EveryRoutedConcernReachesPrompt(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	httpSrv, auditRepo, _, stage, rows := newConcernFixupServer(t, ctx, fx, 6, 3000)
+
+	ids := make([]any, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID.String())
+	}
+	operatorConcern := "OPERATOR LIVENESS STEER: " + strings.Repeat("z", 3500-len("OPERATOR LIVENESS STEER: "))
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":          stage.ID.String(),
+			"concern_ids":       ids,
+			"operator_concern":  operatorConcern,
+			"operator_evidence": "operator reproduced the liveness hang locally",
+			"reason":            "route every concern",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d (err %v), want 1", len(entries), err)
+	}
+	var payload struct {
+		ConcernIDs             []string `json:"concern_ids"`
+		OperatorConcernID      string   `json:"operator_concern_id"`
+		ConcernBodiesTruncated bool     `json:"concern_bodies_truncated"`
+		TruncatedConcernIDs    []string `json:"truncated_concern_ids"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode trigger payload: %v", err)
+	}
+	if len(payload.ConcernIDs) != 7 || payload.OperatorConcernID == "" || payload.ConcernIDs[6] != payload.OperatorConcernID {
+		t.Fatalf("trigger concern_ids = %v operator_concern_id = %q, want 6 routed + the minted operator id last", payload.ConcernIDs, payload.OperatorConcernID)
+	}
+	if !payload.ConcernBodiesTruncated || len(payload.TruncatedConcernIDs) != 6 {
+		t.Errorf("concern_bodies_truncated = %v truncated_concern_ids = %v, want true and the 6 reviewer ids", payload.ConcernBodiesTruncated, payload.TruncatedConcernIDs)
+	}
+
+	rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
+	start := strings.Index(rendered, "### Fix-up concerns")
+	if start < 0 {
+		t.Fatalf("rendered prompt has no ### Fix-up concerns block:\n%s", rendered)
+	}
+	block := rendered[start:]
+	if end := strings.Index(block[len("### Fix-up concerns"):], "\n### "); end >= 0 {
+		block = block[:len("### Fix-up concerns")+end]
+	}
+	for i, r := range rows {
+		want := "(concern " + r.ID.String() + ") [medium/scope] " + fixupConcernNote(i, 3000)[:300]
+		if !strings.Contains(block, want) {
+			t.Errorf("fix-up block missing concern %d's id + summary line %q", i, want[:80])
+		}
+	}
+	wantOperator := "(concern " + payload.OperatorConcernID + ") [high/operator] " + operatorConcern + "\n"
+	if !strings.Contains(block, wantOperator) {
+		t.Errorf("fix-up block missing the minted operator concern id or its full text")
+	}
+	if strings.Contains(block, "remaining concerns truncated") {
+		t.Errorf("fix-up block still carries the pre-#4284 tail-drop marker")
+	}
+}
+
+// TestE2E_Fixup_ConcernsOverflowRefused (#4284): 40 routed concerns whose
+// summary lines alone exceed the fix-up prompt's concern block are refused
+// through the REAL fishhawk-mcp binary with a tool error naming
+// fixup_concerns_overflow, and every seeded row is still `raised` — a concern
+// the agent would not see is never marked addressed_pending.
+func TestE2E_Fixup_ConcernsOverflowRefused(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	httpSrv, auditRepo, concernRepo, stage, rows := newConcernFixupServer(t, ctx, fx, 40, 450)
+
+	ids := make([]any, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID.String())
+	}
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":    stage.ID.String(),
+			"concern_ids": ids,
+			"reason":      "route all forty",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("over-budget fix-up unexpectedly succeeded; want fixup_concerns_overflow")
+	}
+	if body := toolContentString(t, result); !strings.Contains(body, "fixup_concerns_overflow") {
+		t.Errorf("tool error missing fixup_concerns_overflow: %s", body)
+	}
+
+	after, err := concernRepo.ListByRun(ctx, fx.runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(after) != len(rows) {
+		t.Fatalf("concern rows = %d, want %d (no operator concern minted)", len(after), len(rows))
+	}
+	for _, r := range after {
+		if r.State != concern.StateRaised {
+			t.Errorf("concern %s state = %q, want raised", r.ID, r.State)
+		}
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil || len(entries) != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d (err %v), want 0", len(entries), err)
+	}
+}

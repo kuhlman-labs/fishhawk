@@ -709,6 +709,46 @@ func TestAutoDriveRunGate_RouteFixupCeilingReached(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_RouteFixupConcernsOverflow (#4284 C5): when the open
+// concerns the delegated route_fixup arm would route cannot all be listed in
+// the fix-up prompt's concern block, fixupStageAs refuses before the transition
+// and the actor returns decision_required fixup_concerns_overflow (nil error) —
+// mirroring the #2091 arms — rather than the generic dispatch-failed error. No
+// trigger entry is appended and no concern is marked addressed_pending.
+//
+// Counterfactual: delete the errors.As overflow arm in autodrive.go and the
+// outcome is the generic dispatch-failed error → RED.
+func TestAutoDriveRunGate_RouteFixupConcernsOverflow(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	var seeded []*concern.Concern
+	for i := 0; i < 40; i++ {
+		seeded = append(seeded, seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "medium", "scope", overBudgetNote(i, 450)))
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v, want a nil error with a decision_required outcome", err)
+	}
+	if !out.DecisionRequired || out.DecisionState != "fixup_concerns_overflow" {
+		t.Fatalf("outcome = %+v, want DecisionRequired with DecisionState=fixup_concerns_overflow", out)
+	}
+	if out.Acted || out.Paged || out.Action != delegation.ActionRouteFixup {
+		t.Errorf("outcome = %+v, want a non-acted, non-paged route_fixup decision", out)
+	}
+	if !strings.Contains(out.Note, fixupConcernsOverflowRemedy) {
+		t.Errorf("Note = %q, want it to name the remedy", out.Note)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries appended, want 0 (refused before the transition)", n, CategoryStageFixupTriggered)
+	}
+	for i, c := range seeded {
+		if c.State != concern.StateRaised {
+			t.Errorf("concern %d state = %q, want raised", i, c.State)
+		}
+	}
+}
+
 // TestAutoDriveRunGate_RouteFixupGenuineErrorPropagates pins the untouched
 // fail-loud path: a NON-sentinel autoFixup failure (here a repo TransitionStage
 // error, a genuine dispatch failure) still bubbles as the raw NON-NIL error —

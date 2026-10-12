@@ -5487,6 +5487,75 @@ func TestResolveFixupConcerns(t *testing.T) {
 			t.Errorf("got %v, want nil (malformed payload)", rendered)
 		}
 	})
+
+	// #4284: concern_ids pair with concerns by position, only when the two
+	// lengths match, and an operator-category concern carries Operator.
+	withOperator := append(append([]planreview.Concern(nil), concerns...),
+		planreview.Concern{Severity: operatorConcernSeverity, Category: operatorConcernCategory, Note: "operator steer"})
+
+	t.Run("length-matched concern_ids are stamped in order", func(t *testing.T) {
+		ids := []string{uuid.NewString(), uuid.NewString(), uuid.NewString()}
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithIDs(runID, stageID, withOperator, ids)}},
+		}})
+		rendered := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if len(rendered) != 3 {
+			t.Fatalf("rendered len = %d, want 3: %v", len(rendered), rendered)
+		}
+		for i, c := range rendered {
+			if c.ID != ids[i] {
+				t.Errorf("rendered[%d].ID = %q, want %q", i, c.ID, ids[i])
+			}
+		}
+		if rendered[0].Operator || rendered[1].Operator {
+			t.Errorf("reviewer concerns carry Operator: %+v", rendered[:2])
+		}
+		if !rendered[2].Operator {
+			t.Errorf("rendered[2].Operator = false, want true (category %q)", operatorConcernCategory)
+		}
+	})
+
+	t.Run("mismatched concern_ids length stamps no ids", func(t *testing.T) {
+		ids := []string{uuid.NewString(), uuid.NewString()} // 2 ids, 3 concerns
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithIDs(runID, stageID, withOperator, ids)}},
+		}})
+		rendered := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if len(rendered) != 3 {
+			t.Fatalf("rendered len = %d, want 3: %v", len(rendered), rendered)
+		}
+		for i, c := range rendered {
+			if c.ID != "" {
+				t.Errorf("rendered[%d].ID = %q, want empty (a misattributed id is worse than none)", i, c.ID)
+			}
+		}
+	})
+
+	t.Run("acceptance provenance is never Operator", func(t *testing.T) {
+		acc := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: operatorConcernCategory, Note: "x", Provenance: planreview.ConcernProvenanceAcceptance}}
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithIDs(runID, stageID, acc, nil)}},
+		}})
+		rendered := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if len(rendered) != 1 || rendered[0].Operator || !rendered[0].AcceptanceDerived {
+			t.Errorf("rendered = %+v, want one AcceptanceDerived, non-Operator concern", rendered)
+		}
+	})
+}
+
+// makeFixupEntryWithIDs is makeFixupEntry plus the routed concern_ids
+// writeFixupAudit records alongside the concerns (#4284 id pairing).
+func makeFixupEntryWithIDs(runID, stageID uuid.UUID, concerns []planreview.Concern, ids []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":     stageID.String(),
+		"concern_ids":  ids,
+		"concerns":     concerns,
+		"reason":       "operator routed concerns back",
+		"pass_ordinal": 1,
+	})
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
 }
 
 // makeFixupEntryWithAllowCreate builds a stage_fixup_triggered audit entry
