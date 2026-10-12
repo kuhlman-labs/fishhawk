@@ -240,6 +240,17 @@ func SeedManifest() Manifest {
 				EmitterOnlyUnchecked: true,
 			},
 			{
+				// The merge-candidate report's nested failing-name summary
+				// (#4250). ModeExact: the runner marshals it and the backend
+				// decodes it under DisallowUnknownFields and re-stores it with
+				// the same tags, so the nested tags (which ship_merge_candidate
+				// does not reach) must match including options.
+				Name: "merge_candidate_failure_summary", Anchor: "#4250",
+				Emitter:  Endpoint{File: uploadFile, Type: "MergeCandidateFailureSummary"},
+				Consumer: Endpoint{File: pullRequestGo, Type: "mergeCandidateFailureSummary"},
+				Mode:     ModeExact,
+			},
+			{
 				// The runner's terminal-failure self-report (#3598). ModeExact:
 				// the guard compares json TAGS (names + options), not Go types,
 				// so the server's json.RawMessage expected_state/expected_attempt

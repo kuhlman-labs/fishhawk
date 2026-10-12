@@ -5325,6 +5325,88 @@ func TestShipPullRequest_MergeCandidateVerifiedBody(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_MergeCandidateFailuresBody pins the #4250 additions: a
+// failed report carries merge_candidate_failures (bounded to its HEAD, valid
+// UTF-8) and merge_candidate_failure_summary; a report without them omits both
+// keys, so a passed report from a new runner still decodes on an older
+// fishhawkd (approval condition C5). The httptest server captures the real
+// request body, so the bound is observed byte-for-byte.
+func TestShipPullRequest_MergeCandidateFailuresBody(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stage_id":"s","outcome":"merge_candidate_verified"}`))
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	ship := func(args ShipPullRequestArgs) map[string]any {
+		t.Helper()
+		args.RunID, args.StageID, args.PrivateKey = "r", "s", priv
+		args.Outcome = OutcomeMergeCandidateVerified
+		args.Branch, args.HeadSHA = "b", "h"
+		if _, err := c.ShipPullRequest(context.Background(), args); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	got := ship(ShipPullRequestArgs{
+		MergeCandidateResult:   "failed",
+		MergeCandidateFailures: "--- FAIL: TestEarlyThing (0.01s)\n    early_test.go:42: want 1, got 2\n",
+		MergeCandidateFailureSummary: &MergeCandidateFailureSummary{
+			Packages: []string{"example.com/m/early"}, Tests: []string{"TestEarlyThing"},
+		},
+	})
+	if f, _ := got["merge_candidate_failures"].(string); !strings.Contains(f, "--- FAIL: TestEarlyThing") {
+		t.Errorf("merge_candidate_failures = %q, want the excerpt", f)
+	}
+	wantSummary := map[string]any{"packages": []any{"example.com/m/early"}, "tests": []any{"TestEarlyThing"}, "lossy": false}
+	if !reflect.DeepEqual(got["merge_candidate_failure_summary"], wantSummary) {
+		t.Errorf("merge_candidate_failure_summary = %v, want %v", got["merge_candidate_failure_summary"], wantSummary)
+	}
+
+	// Bound: the excerpt keeps its FIRST bytes and is re-validated as UTF-8 —
+	// a 3-byte rune straddles the cut.
+	failures := "START-OF-FAILURES" + strings.Repeat("f", MaxMergeCandidateFailuresBytes-18) + "€" + strings.Repeat("z", 3*MaxMergeCandidateFailuresBytes)
+	got = ship(ShipPullRequestArgs{MergeCandidateResult: "failed", MergeCandidateFailures: failures})
+	gotF, _ := got["merge_candidate_failures"].(string)
+	if len(gotF) > MaxMergeCandidateFailuresBytes || !strings.HasPrefix(gotF, "START-OF-FAILURES") {
+		t.Errorf("failures len = %d (prefix kept %v), want <= %d keeping the start", len(gotF), strings.HasPrefix(gotF, "START-OF-FAILURES"), MaxMergeCandidateFailuresBytes)
+	}
+	if !utf8.ValidString(gotF) || strings.Contains(gotF, "z") {
+		t.Errorf("failures must be valid UTF-8 cut at the head bound, got suffix %q", gotF[len(gotF)-8:])
+	}
+	if len(raw) > MaxPullRequestReportBytes {
+		t.Errorf("body = %d bytes, over MaxPullRequestReportBytes", len(raw))
+	}
+
+	// Absent: neither key ships when empty (omitempty — C5 version skew).
+	got = ship(ShipPullRequestArgs{MergeCandidateResult: "passed"})
+	for _, absent := range []string{"merge_candidate_failures", "merge_candidate_failure_summary"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("passed body carries %s, want it omitted", absent)
+		}
+	}
+}
+
+// TestMergeCandidateFailuresBoundMirrorsBackend pins the runner-side excerpt
+// bound to the backend's mergeCandidateFailuresMax
+// (backend/internal/server/merge_candidate_verify.go): update both together.
+func TestMergeCandidateFailuresBoundMirrorsBackend(t *testing.T) {
+	if MaxMergeCandidateFailuresBytes != 8192 {
+		t.Fatalf("MaxMergeCandidateFailuresBytes = %d; it mirrors backend mergeCandidateFailuresMax (8192) — update both", MaxMergeCandidateFailuresBytes)
+	}
+}
+
 // TestMergeCandidateTailBoundsMirrorBackend pins the runner-side tail bound to
 // the backend's mergeCandidateOutputTailMax
 // (backend/internal/server/merge_candidate_verify.go): update both together.
