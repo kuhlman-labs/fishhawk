@@ -29,7 +29,10 @@ import (
 //   - pumpMergeCandidateQueue admits the base's next held entry when nothing is
 //     live, re-reads its PR, auto-advances a behind branch through
 //     advanceRunBranch under the system actor, re-anchors, and starts the pass
-//     for the resulting head (admitMergeCandidateEntry).
+//     for the resulting head (admitMergeCandidateEntry). Each admitted entry
+//     runs detached from its caller's cancellation under its own
+//     mergeCandidateQueueHandOffBudget (#4303); AdmitNext stays on the caller
+//     ctx, so a cancelled pump claims no new entry.
 //   - mergeCandidateQueueOnVerdict (from recordMergeCandidateVerified): a red
 //     pass EJECTS and hands the line on; passed holds it until merge (D4);
 //     not_executed holds it in phase unverified.
@@ -177,6 +180,15 @@ func (s *Server) applyMergeCandidateStartToEntry(ctx context.Context, e mergeque
 // is dropped run_terminal. It returns what happened to each run it admitted.
 // Concurrent pumps are safe: AdmitNext is atomic under the per-base advisory
 // lock, and the admission work is owned by the pump that admitted the entry.
+//
+// ctx gates AdmitNext and the live-entry check: a cancelled ctx claims no new
+// entry. Once AdmitNext has claimed one, its admission (the admitted row and
+// admitMergeCandidateEntry) runs on mergeCandidateAdmissionContext, detached
+// from ctx's cancellation and bounded by a FRESH
+// mergeCandidateQueueHandOffBudget (#4303). A shutdown signal or a departed
+// webhook sender therefore cannot cut the re-anchor, the pass start or the
+// recovery Unadmit and strand the entry live in phase admitted until
+// mergequeue.AdmissionStaleAfter.
 func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Base) map[uuid.UUID]mergeCandidateAdmitResult {
 	out := map[uuid.UUID]mergeCandidateAdmitResult{}
 	if s.cfg.MergeQueue == nil {
@@ -202,15 +214,26 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 			}
 			return out
 		}
-		s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueAdmitted, *adm.Entry,
+		actx, cancel := mergeCandidateAdmissionContext(ctx)
+		s.writeMergeCandidateQueueAudit(actx, CategoryMergeCandidateQueueAdmitted, *adm.Entry,
 			map[string]any{"readmitted": adm.Readmitted})
-		res, settled := s.admitMergeCandidateEntry(ctx, *adm.Entry)
+		res, settled := s.admitMergeCandidateEntry(actx, *adm.Entry)
+		cancel()
 		out[adm.Entry.RunID] = res
 		if !settled {
 			return out
 		}
 	}
 	return out
+}
+
+// mergeCandidateAdmissionContext is the context ONE admission runs on:
+// detached from ctx's cancellation (WithoutCancel keeps its values and drops
+// its deadline) and bounded by a fresh mergeCandidateQueueHandOffBudget. An
+// admission nested inside another (a settle's pump) gets its own budget rather
+// than inheriting what is left of its parent's.
+func mergeCandidateAdmissionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), mergeCandidateQueueHandOffBudget)
 }
 
 // MergeCandidateQueuePumpInterval is the periodic pump's tick: the bound on
@@ -241,8 +264,16 @@ func (s *Server) PumpMergeCandidateQueues(ctx context.Context) int {
 }
 
 // RunMergeCandidateQueuePump pumps every active base once at boot and then on
-// every interval tick, returning when ctx is cancelled.
+// every interval tick, returning when ctx is cancelled. ctx (fishhawkd's
+// signal context) gates only the ticker and NEW admissions: an admission the
+// loop already claimed runs detached to completion (pumpMergeCandidateQueue).
+// The loop joins bgMergeQueuePump, so Server.Shutdown drains it, bounded by
+// the shutdown context (#4303). The Add runs inside the goroutine serve.go
+// launches, so a shutdown landing before it is not drained (the boot-window
+// residual the other bg groups share); Wait at zero returns at once.
 func (s *Server) RunMergeCandidateQueuePump(ctx context.Context, interval time.Duration) {
+	s.bgMergeQueuePump.Add(1)
+	defer s.bgMergeQueuePump.Done()
 	s.PumpMergeCandidateQueues(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -272,7 +303,10 @@ func (s *Server) mergeCandidateQueueRunTerminal(ctx context.Context, runID uuid.
 // act on that head's verify state. It reports whether the entry was settled
 // (so the pump admits the next). A TRANSIENT failure (an unreadable run or PR,
 // an undeterminable advance, a failed merge) returns the entry to held at its
-// original place and stops the pump; a conflict ejects.
+// original place and stops the pump; a conflict ejects. ctx is the admission
+// context pumpMergeCandidateQueue derived (mergeCandidateAdmissionContext):
+// already detached from the pump caller's cancellation, so every step here,
+// the recovery Unadmit included, runs to completion or to its own budget.
 func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entry) (mergeCandidateAdmitResult, bool) {
 	unadmit := func(why string) (mergeCandidateAdmitResult, bool) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -418,16 +452,28 @@ func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UU
 	}
 }
 
-// mergeCandidateQueueHandOffBudget bounds one PR-resolution hand-off: the
-// settle, the pump and every admission that pump runs. The hand-off runs
-// detached from the caller's cancellation because its caller is usually a
-// webhook delivery, whose request context is cancelled when the forge stops
-// listening (~10s), while one admission's auto-advance alone can spend the
+// mergeCandidateQueueHandOffBudget bounds ONE admission: every entry
+// pumpMergeCandidateQueue admits gets a fresh budget, on every trigger path
+// (the periodic pump, the webhook PR-resolution hook, the verdict and cancel
+// hooks, a rebase's serialize). Separately it bounds the PR-resolution hook's
+// own entry read and settle. An admission runs detached from its caller's
+// cancellation because one admission's auto-advance alone can spend the
 // bounded post-merge re-read and then its own detached
-// rebasePostMergeTailBudget tail. On a cancelled context the re-anchor, the
-// pass start AND the recovery Unadmit would all fail, leaving the entry live
-// in phase admitted until mergequeue.AdmissionStaleAfter re-claims it. Twice
-// the tail budget leaves the post-advance steps room after a full-length tail.
+// rebasePostMergeTailBudget tail, while its caller may be a webhook delivery
+// (cancelled when the forge stops listening, ~10s) or fishhawkd's signal
+// context (cancelled at shutdown, #4303). On a cancelled context the
+// re-anchor, the pass start AND the recovery Unadmit would all fail, leaving
+// the entry live in phase admitted until mergequeue.AdmissionStaleAfter
+// re-claims it. Twice the tail budget leaves the post-advance steps room after
+// a full-length tail.
+//
+// What the caller ctx still gates is only the TOP-LEVEL AdmitNext. An
+// admission that settles its entry (eject/drop) pumps the base again on its
+// own detached context, so a nested chain's admissions keep running after a
+// shutdown signal until Server.Shutdown's drain closes. A chain (one webhook
+// hand-off that ejects entry after entry) is therefore no longer bounded as a
+// whole: each admission is, and the chain is bounded by the number of held
+// entries (and mergeCandidateQueueMaxAdmissions per pump).
 const mergeCandidateQueueHandOffBudget = 2 * rebasePostMergeTailBudget
 
 // mergeCandidateQueueOnPRResolved settles the run's active entry when its PR
@@ -435,10 +481,12 @@ const mergeCandidateQueueHandOffBudget = 2 * rebasePostMergeTailBudget
 // entry is merged (it held the line to here) and a held one is dropped
 // pr_merged_externally; closed without merge → dropped pr_closed. A forge-side
 // merge is a fact regardless of review bookkeeping, so the caller runs this
-// before any review gate decides. Detached from ctx's cancellation (its
-// values are kept) and bounded by mergeCandidateQueueHandOffBudget, so a
-// webhook sender that disconnects mid-admission cannot strand the next
-// entry. Idempotent: a redelivery finds no active entry.
+// before any review gate decides. The hook's own entry read and settle run
+// detached from ctx's cancellation (its values are kept) and bounded by
+// mergeCandidateQueueHandOffBudget, so a webhook sender that disconnects
+// cannot stop the hand-off; every admission the settle's pump runs carries its
+// own fresh budget (mergeCandidateAdmissionContext), so a long chain is not
+// cut by this hook's deadline. Idempotent: a redelivery finds no active entry.
 func (s *Server) mergeCandidateQueueOnPRResolved(ctx context.Context, runID uuid.UUID, merged bool) {
 	if s.cfg.MergeQueue == nil {
 		return

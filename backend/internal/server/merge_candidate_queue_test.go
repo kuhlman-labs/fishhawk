@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,7 +43,9 @@ type mcqPR struct {
 // mcqGitHub serves several PRs: GET /pulls/{n} answers each PR's live state;
 // the behind-probe (compare/{head}...{base}) answers behind[head]; POST
 // /merges merges into the named branch, moving that PR's head to
-// mergeSHA[branch] (or answers mergeStatus[branch], e.g. 409 conflict).
+// mergeSHA[branch] (or answers mergeStatus[branch], e.g. 409 conflict). An
+// empty mergeSHA[branch] answers a merge with no sha and leaves the PR head at
+// its pre-merge value, so every post-merge re-read lags.
 type mcqGitHub struct {
 	mu            sync.Mutex
 	prs           map[int]*mcqPR
@@ -101,7 +104,7 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		g.merges = append(g.merges, call)
 		status := g.mergeStatus[call.Base]
 		sha := g.mergeSHA[call.Base]
-		if status == 0 {
+		if status == 0 && sha != "" {
 			for _, pr := range g.prs {
 				if pr.branch == call.Base {
 					pr.head = sha
@@ -127,8 +130,10 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 	return &githubclient.Client{
 		BaseURL: srv.URL,
 		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
-		HTTP:    &http.Client{Timeout: 5 * time.Second},
-		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+		// Scaled, so a merge request a test deliberately holds open (the
+		// Shutdown drain tests) is never cut by the client's own timeout.
+		HTTP:   &http.Client{Timeout: timescale.D(30 * time.Second)},
+		AppJWT: func() (string, error) { return "ghs_jwt", nil },
 	}
 }
 
@@ -666,11 +671,75 @@ func TestMergeCandidateQueue_DroppedModes(t *testing.T) {
 
 func (f *mcqFixture) pumpBase(r *mcqRun) {
 	f.t.Helper()
+	f.pumpBaseCtx(context.Background(), r)
+}
+
+// pumpBaseCtx pumps r's base on ctx and returns the pump's per-run answers.
+func (f *mcqFixture) pumpBaseCtx(ctx context.Context, r *mcqRun) map[uuid.UUID]mergeCandidateAdmitResult {
+	f.t.Helper()
 	runRow, err := f.repo.GetRun(context.Background(), r.id)
 	if err != nil {
 		f.t.Fatalf("get run: %v", err)
 	}
-	f.srv.pumpMergeCandidateQueue(context.Background(), mergequeue.Base{AccountID: runRow.AccountID, Repo: runRow.Repo, BaseRef: mcqBase})
+	return f.srv.pumpMergeCandidateQueue(ctx, mergequeue.Base{AccountID: runRow.AccountID, Repo: runRow.Repo, BaseRef: mcqBase})
+}
+
+// freeLine settles a's live entry merged through the STORE alone (no hook, no
+// pump), so the base's line is free and its held entries wait for a pump.
+func (f *mcqFixture) freeLine(a *mcqRun) {
+	f.t.Helper()
+	if _, err := f.store.Settle(context.Background(), f.entry(a).ID, mergequeue.StateMerged, "pr_merged"); err != nil {
+		f.t.Fatalf("settle A through the store: %v", err)
+	}
+}
+
+// handOff frees a's line and pumps the base directly, returning b's admission
+// answer from the pump's map (the refusal wording never reaches a queue or
+// audit row, so the map is the only place to read it).
+func (f *mcqFixture) handOff(a, b *mcqRun) mergeCandidateAdmitResult {
+	f.t.Helper()
+	f.freeLine(a)
+	out := f.pumpBaseCtx(context.Background(), b)
+	res, ok := out[b.id]
+	if !ok {
+		f.t.Fatalf("the pump did not admit B: %+v", out)
+	}
+	return res
+}
+
+// mergesInto counts the fake's merge calls into r's branch.
+func (f *mcqFixture) mergesInto(r *mcqRun) int {
+	n := 0
+	for _, c := range f.gh.mergeCalls() {
+		if c.Base == r.branch {
+			n++
+		}
+	}
+	return n
+}
+
+// seedTrigger appends a merge-candidate verify trigger for r's implement
+// stage at head BY CONSTRUCTION: no queue hook runs and no stage is re-opened.
+func (f *mcqFixture) seedTrigger(r *mcqRun, head string) {
+	f.t.Helper()
+	if err := f.srv.appendMergeCandidateTrigger(context.Background(), r.id, r.impl.ID, mergeCandidateVerifyTrigger{
+		Branch: r.branch, BaseRef: mcqBase, ExpectedHeadSHA: head, Cause: mergeCandidateCauseBaseAdvance,
+		VerifyCommand: "scripts/test verify", PriorState: string(run.StageStateSucceeded),
+	}, mergeCandidateSystemActor()); err != nil {
+		f.t.Fatalf("seed trigger at %s: %v", head, err)
+	}
+}
+
+// waveABC is wave plus a third run C held behind B.
+func (f *mcqFixture) waveABC() (a, b, c *mcqRun) {
+	f.t.Helper()
+	a, b = f.wave()
+	c = f.seed("c", "c0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(c, "c0", "c1")
+	if resp := f.rebase(c); resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyTriggered {
+		f.t.Fatalf("C rebase verify state = %q triggered=%v, want held, not triggered", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	return a, b, c
 }
 
 // TestMergeCandidateQueue_PeriodicPumpReleasesTerminalLiveRun: the live
@@ -902,24 +971,39 @@ func TestMergeCandidateQueue_FanInNotSerialized(t *testing.T) {
 }
 
 // mcqFaultStore wraps a mergequeue.Store (nil for a pure fake) and lets a test
-// override any method, recording which ones ran. An override left nil falls
-// through to the wrapped store.
+// override any method, recording every call with the context it ran on. An
+// override left nil falls through to the wrapped store.
 type mcqFaultStore struct {
 	mergequeue.Store
 	mu           sync.Mutex
-	calls        []string
+	calls        []mcqCall
 	enqueue      func(mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error)
 	admitNext    func(mergequeue.Base) (mergequeue.Admission, error)
+	unadmit      func(uuid.UUID) (mergequeue.Entry, error)
 	setPhase     func(uuid.UUID, mergequeue.Phase) (mergequeue.Entry, error)
+	reanchor     func(uuid.UUID, string, string) (mergequeue.Entry, error)
 	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
 	activeForRun func(uuid.UUID) (mergequeue.Status, bool, error)
 	activeBases  func() ([]mergequeue.Base, error)
 }
 
-func (s *mcqFaultStore) record(name string) {
+// mcqCall is one recorded store call: the method, the id it named (the entry
+// id, the run id for ActiveForRun, uuid.Nil otherwise), when it ran and its
+// context's deadline (hasDeadline false: the context carried none).
+type mcqCall struct {
+	method      string
+	id          uuid.UUID
+	at          time.Time
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (s *mcqFaultStore) record(ctx context.Context, name string, id uuid.UUID) {
+	deadline, ok := ctx.Deadline()
+	c := mcqCall{method: name, id: id, at: time.Now(), deadline: deadline, hasDeadline: ok}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, name)
+	s.calls = append(s.calls, c)
 }
 
 func (s *mcqFaultStore) called(name string) int {
@@ -927,15 +1011,44 @@ func (s *mcqFaultStore) called(name string) int {
 	defer s.mu.Unlock()
 	n := 0
 	for _, c := range s.calls {
-		if c == name {
+		if c.method == name {
 			n++
 		}
 	}
 	return n
 }
 
+// names is the recorded method sequence, for failure messages.
+func (s *mcqFaultStore) names() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.calls))
+	for _, c := range s.calls {
+		out = append(out, c.method)
+	}
+	return out
+}
+
+// onlyCall returns the single recorded call of method naming id, failing the
+// test unless there is exactly one.
+func (s *mcqFaultStore) onlyCall(t *testing.T, method string, id uuid.UUID) mcqCall {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var hits []mcqCall
+	for _, c := range s.calls {
+		if c.method == method && c.id == id {
+			hits = append(hits, c)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("%s calls naming %s = %d, want exactly 1", method, id, len(hits))
+	}
+	return hits[0]
+}
+
 func (s *mcqFaultStore) Enqueue(ctx context.Context, req mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
-	s.record("Enqueue")
+	s.record(ctx, "Enqueue", uuid.Nil)
 	if s.enqueue != nil {
 		return s.enqueue(req)
 	}
@@ -943,15 +1056,31 @@ func (s *mcqFaultStore) Enqueue(ctx context.Context, req mergequeue.EnqueueReque
 }
 
 func (s *mcqFaultStore) AdmitNext(ctx context.Context, base mergequeue.Base) (mergequeue.Admission, error) {
-	s.record("AdmitNext")
+	s.record(ctx, "AdmitNext", uuid.Nil)
 	if s.admitNext != nil {
 		return s.admitNext(base)
 	}
 	return s.Store.AdmitNext(ctx, base)
 }
 
+func (s *mcqFaultStore) Unadmit(ctx context.Context, id uuid.UUID) (mergequeue.Entry, error) {
+	s.record(ctx, "Unadmit", id)
+	if s.unadmit != nil {
+		return s.unadmit(id)
+	}
+	return s.Store.Unadmit(ctx, id)
+}
+
+func (s *mcqFaultStore) Reanchor(ctx context.Context, id uuid.UUID, headSHA, baseSHA string) (mergequeue.Entry, error) {
+	s.record(ctx, "Reanchor", id)
+	if s.reanchor != nil {
+		return s.reanchor(id, headSHA, baseSHA)
+	}
+	return s.Store.Reanchor(ctx, id, headSHA, baseSHA)
+}
+
 func (s *mcqFaultStore) SetPhase(ctx context.Context, id uuid.UUID, phase mergequeue.Phase) (mergequeue.Entry, error) {
-	s.record("SetPhase")
+	s.record(ctx, "SetPhase", id)
 	if s.setPhase != nil {
 		return s.setPhase(id, phase)
 	}
@@ -959,7 +1088,7 @@ func (s *mcqFaultStore) SetPhase(ctx context.Context, id uuid.UUID, phase mergeq
 }
 
 func (s *mcqFaultStore) Settle(ctx context.Context, id uuid.UUID, state mergequeue.State, reason string) (mergequeue.SettleResult, error) {
-	s.record("Settle")
+	s.record(ctx, "Settle", id)
 	if s.settle != nil {
 		return s.settle(id, state, reason)
 	}
@@ -967,7 +1096,7 @@ func (s *mcqFaultStore) Settle(ctx context.Context, id uuid.UUID, state mergeque
 }
 
 func (s *mcqFaultStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (mergequeue.Status, bool, error) {
-	s.record("ActiveForRun")
+	s.record(ctx, "ActiveForRun", runID)
 	if s.activeForRun != nil {
 		return s.activeForRun(runID)
 	}
@@ -975,7 +1104,7 @@ func (s *mcqFaultStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (merg
 }
 
 func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, error) {
-	s.record("ActiveBases")
+	s.record(ctx, "ActiveBases", uuid.Nil)
 	if s.activeBases != nil {
 		return s.activeBases()
 	}
@@ -983,6 +1112,22 @@ func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, err
 }
 
 var errMCQStore = fmt.Errorf("queue store unavailable")
+
+// mcqFailTriggerAudit wraps an audit.Repository and, while armed, fails every
+// merge-candidate verify TRIGGER append; every other category falls through.
+type mcqFailTriggerAudit struct {
+	audit.Repository
+	armed atomic.Bool
+}
+
+func (a *mcqFailTriggerAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if a.armed.Load() && p.Category == CategoryStageMergeCandidateVerifyTriggered {
+		return nil, errMCQTriggerAppend
+	}
+	return a.Repository.AppendChained(ctx, p)
+}
+
+var errMCQTriggerAppend = fmt.Errorf("trigger append unavailable")
 
 // TestMergeCandidateQueue_UnwiredIsNoOp: with Config.MergeQueue nil every
 // hook is a no-op and the read seam answers (nil, nil).
@@ -1097,7 +1242,7 @@ func TestMergeCandidateQueue_WriteFailuresAreBestEffort(t *testing.T) {
 		srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
 		srv.releaseMergeCandidateQueueForRun(ctx, live.RunID, mergeCandidateQueueReasonRunCancelled)
 		if fs.called("Settle") != 1 || fs.called("AdmitNext") != 0 {
-			t.Fatalf("calls = %v, want one Settle and no pump", fs.calls)
+			t.Fatalf("calls = %v, want one Settle and no pump", fs.names())
 		}
 	})
 
@@ -1135,7 +1280,7 @@ func TestMergeCandidateQueue_WriteFailuresAreBestEffort(t *testing.T) {
 			t.Fatal("a failed pass start must report the entry settled")
 		}
 		if fs.called("Settle") != 1 || fs.called("AdmitNext") != 1 {
-			t.Fatalf("calls = %v, want one Settle then one pump", fs.calls)
+			t.Fatalf("calls = %v, want one Settle then one pump", fs.names())
 		}
 	})
 
@@ -1187,4 +1332,423 @@ func TestMergeCandidateQueue_EnqueueErrorRefuses(t *testing.T) {
 	if n := len(f.triggers(a)); n != 0 {
 		t.Fatalf("run has %d triggers after a failed enqueue, want 0", n)
 	}
+}
+
+// TestMergeCandidateQueue_PeriodicPumpSurvivesSignalCancellation (#4303): the
+// periodic pump runs on fishhawkd's signal context, and SIGINT/SIGTERM cancels
+// it while B's admission is mid auto-advance (the fake's merge into B's branch
+// cancels it: AdmitNext has already committed B live in phase admitted at b1,
+// and Reanchor has not run). The admission is detached from that cancellation
+// with its own budget, so the re-anchor and the pass start still land: B ends
+// live and verifying at b2 with one trigger, not stranded in phase admitted.
+// Counterfactual: handing admitMergeCandidateEntry the caller ctx instead of
+// the admission ctx fails the merge request, the re-anchor and the recovery
+// Unadmit, leaving B admitted at b1 with no trigger, and leaves SetPhase with
+// no deadline.
+func TestMergeCandidateQueue_PeriodicPumpSurvivesSignalCancellation(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.exec(`UPDATE runs SET state = 'failed' WHERE id = $1`, a.id)
+	f.behind(b, "b1", "b2")
+	fs := &mcqFaultStore{Store: f.store}
+	f.srv.cfg.MergeQueue = fs
+	bEntry := f.entry(b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.gh.set(func() {
+		f.gh.onMerge = func(base string) {
+			if base == b.branch {
+				cancel()
+			}
+		}
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.srv.RunMergeCandidateQueuePump(ctx, time.Hour)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(30 * time.Second)):
+		t.Fatal("the pump loop did not return after its signal context was cancelled")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("fixture: the signal context was never cancelled; B's admission did not reach the auto-advance merge")
+	}
+
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal)
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B after a signal-cancelled pump = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" || tr[0].Cause != mergeCandidateCauseBaseAdvance {
+		t.Fatalf("B triggers = %+v, want exactly one base_advance trigger for b2", tr)
+	}
+	if st := f.stageState(b.impl.ID); st != run.StageStatePending {
+		t.Fatalf("B implement = %s, want pending (re-opened by the admission)", st)
+	}
+	c := fs.onlyCall(t, "SetPhase", bEntry.ID)
+	if !c.hasDeadline || c.deadline.After(c.at.Add(mergeCandidateQueueHandOffBudget)) {
+		t.Fatalf("B SetPhase ran with deadline %v (has=%v) at %v, want a deadline within mergeCandidateQueueHandOffBudget (the signal context carries none)",
+			c.deadline, c.hasDeadline, c.at)
+	}
+}
+
+// TestMergeCandidateQueue_AdmissionBudgetIsPerEntry: one webhook hand-off
+// chains admissions (A merges, B's admission ejects it on a pre-recorded
+// failed verdict, the nested pump admits C and starts C's pass). Each admitted
+// entry gets its OWN fresh budget, so the deadlines A's hook settle, B's
+// admission settle and C's admission SetPhase ran under strictly increase.
+// Counterfactuals: running the admission on the caller ctx, or wrapping the
+// budget per BASE in PumpMergeCandidateQueues instead, leaves all three on the
+// hook's one deadline (D_A == D_B).
+func TestMergeCandidateQueue_AdmissionBudgetIsPerEntry(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, c := f.waveABC()
+	f.seedTrigger(b, "b1")
+	f.verdict(b, mergeCandidateResultFailed)
+	f.requireState(b, mergequeue.StateHeld, "") // the verdict hook leaves a HELD entry alone
+	aID, bID, cID := f.entry(a).ID, f.entry(b).ID, f.entry(c).ID
+	fs := &mcqFaultStore{Store: f.store}
+	f.srv.cfg.MergeQueue = fs
+
+	f.closePR(a, true)
+
+	f.requireState(a, mergequeue.StateMerged, "pr_merged")
+	f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+	if e := f.requireState(c, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "c1" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("C after the chain = head %q phase %q, want c1 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(c); len(tr) != 1 || tr[0].ExpectedHeadSHA != "c1" {
+		t.Fatalf("C triggers = %+v, want one for c1", tr)
+	}
+	dA := fs.onlyCall(t, "Settle", aID)
+	dB := fs.onlyCall(t, "Settle", bID)
+	dC := fs.onlyCall(t, "SetPhase", cID)
+	for name, d := range map[string]mcqCall{"A settle": dA, "B settle": dB, "C set phase": dC} {
+		if !d.hasDeadline {
+			t.Fatalf("%s ran with no deadline, want a bounded context", name)
+		}
+	}
+	if !dA.deadline.Before(dB.deadline) || !dB.deadline.Before(dC.deadline) {
+		t.Fatalf("deadlines A settle %v, B settle %v, C set phase %v: want strictly increasing (a fresh budget per admitted entry)",
+			dA.deadline, dB.deadline, dC.deadline)
+	}
+}
+
+// TestMergeCandidateQueue_CancelledPumpAdmitsNothingNew: the caller ctx still
+// gates AdmitNext. A pump on an already-cancelled context with the line free
+// and B held claims nothing: B stays held at its place, no admitted row, no
+// merge. Counterfactual: detaching the WHOLE pump loop (AdmitNext included)
+// admits and auto-advances B.
+func TestMergeCandidateQueue_CancelledPumpAdmitsNothingNew(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.behind(b, "b1", "b2") // an admission WOULD merge into B's branch
+	held := f.entry(b)
+	f.freeLine(a)
+	merges := f.mergesInto(b)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if out := f.pumpBaseCtx(ctx, b); len(out) != 0 {
+		t.Fatalf("a cancelled pump answered %+v, want nothing admitted", out)
+	}
+
+	if e := f.requireState(b, mergequeue.StateHeld, ""); !e.EnqueuedAt.Equal(held.EnqueuedAt) || e.AnchoredHeadSHA != "b1" {
+		t.Fatalf("B after a cancelled pump = enqueued_at %v head %q, want %v at b1", e.EnqueuedAt, e.AnchoredHeadSHA, held.EnqueuedAt)
+	}
+	if n := len(f.rows(b, CategoryMergeCandidateQueueAdmitted)); n != 0 {
+		t.Fatalf("B admitted rows = %d after a cancelled pump, want 0", n)
+	}
+	if n := f.mergesInto(b) - merges; n != 0 {
+		t.Fatalf("a cancelled pump made %d merge calls into B's branch, want 0", n)
+	}
+}
+
+// blockedPumpAdmission starts the periodic pump loop over a wave whose live
+// run A failed and whose held B is behind b1->b2, with the fake's merge into
+// B's branch held open. It returns once B's admission is INSIDE that merge:
+// the loop's bgMergeQueuePump.Add precedes the request whose handler closes
+// entered, so the Add happens-before any Shutdown the caller makes next.
+// release unblocks the merge (idempotent, and run in t.Cleanup together with
+// a bounded wait for the loop, so a failing test never wedges httptest Close
+// or the pool); cancel is the loop's signal context; done closes when the
+// loop returns.
+func (f *mcqFixture) blockedPumpAdmission(shutdownTimeout time.Duration) (b *mcqRun, cancel context.CancelFunc, release func(), done <-chan struct{}) {
+	f.t.Helper()
+	a, b := f.wave()
+	f.exec(`UPDATE runs SET state = 'failed' WHERE id = $1`, a.id)
+	f.behind(b, "b1", "b2")
+	f.srv.cfg.ShutdownTimeout = shutdownTimeout
+
+	entered, released := make(chan struct{}), make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	release = func() { releaseOnce.Do(func() { close(released) }) }
+	f.gh.set(func() {
+		f.gh.onMerge = func(base string) {
+			if base == b.branch {
+				enterOnce.Do(func() { close(entered) })
+				<-released
+			}
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		f.srv.RunMergeCandidateQueuePump(ctx, time.Hour)
+	}()
+	f.t.Cleanup(func() {
+		release()
+		cancel()
+		select {
+		case <-loopDone:
+		case <-time.After(timescale.D(30 * time.Second)):
+		}
+	})
+	select {
+	case <-entered:
+	case <-time.After(timescale.D(30 * time.Second)):
+		f.t.Fatal("fixture: B's admission never reached the auto-advance merge")
+	}
+	return b, cancel, release, loopDone
+}
+
+// TestShutdown_DrainsMergeCandidateQueuePump: Shutdown WAITS for the periodic
+// pump's in-flight admission (it has not returned while the merge is held),
+// and the admission, detached from the cancelled signal context, completes
+// inside the drain: B ends live and verifying at b2. Counterfactual: deleting
+// the bgMergeQueuePump Wait (or its Add/Done) returns Shutdown at once.
+func TestShutdown_DrainsMergeCandidateQueuePump(t *testing.T) {
+	f := newMCQFixture(t)
+	b, cancel, release, done := f.blockedPumpAdmission(timescale.D(30 * time.Second))
+	cancel() // the SIGINT/SIGTERM stand-in
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- f.srv.Shutdown(context.Background()) }()
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned while the pump admission was in flight — it did not drain the merge-candidate queue pump")
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	release()
+	select {
+	case <-shutdownDone:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("Shutdown did not return after the pump admission finished")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("Shutdown returned before the pump loop exited")
+	}
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B after the drained admission = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("B triggers = %+v, want one for b2", tr)
+	}
+}
+
+// TestShutdown_MergeCandidateQueuePumpDrainBoundedByDeadline: a wedged pump
+// admission cannot hold Shutdown past its deadline. Shutdown returns while the
+// admission is STILL blocked (the loop has not exited), and once released the
+// loop exits. Counterfactual: a synchronous bgMergeQueuePump.Wait outside the
+// shutdown-context select holds Shutdown until release.
+func TestShutdown_MergeCandidateQueuePumpDrainBoundedByDeadline(t *testing.T) {
+	f := newMCQFixture(t)
+	_, cancel, release, done := f.blockedPumpAdmission(timescale.D(200 * time.Millisecond))
+	cancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- f.srv.Shutdown(context.Background()) }()
+	select {
+	case <-shutdownDone:
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("Shutdown was held past its deadline by a wedged pump admission")
+	}
+	select {
+	case <-done:
+		t.Fatal("fixture: the pump loop exited before release, so Shutdown's return proves nothing about the bound")
+	default:
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("the pump loop did not exit after its admission was released")
+	}
+}
+
+// TestMergeCandidateQueue_AdmissionBranches: one behavioural test per
+// admitMergeCandidateEntry branch the other tests do not reach. Each frees
+// A's line through the store and pumps the base directly, so B's answer is
+// read from the pump's map; every verdict is read back from committed queue,
+// trigger and stage rows.
+func TestMergeCandidateQueue_AdmissionBranches(t *testing.T) {
+	t.Run("a: already failed at admission ejects verify_failed", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.seedTrigger(b, "b1")
+		f.verdict(b, mergeCandidateResultFailed)
+		merges := f.mergesInto(b)
+		res := f.handOff(a, b)
+		f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+		if res.refusal == nil || !strings.Contains(res.refusal.Reason, "already has a failed merge-candidate verdict") {
+			t.Fatalf("B answer = %+v, want the already-failed refusal", res)
+		}
+		if n := len(f.triggers(b)); n != 1 {
+			t.Fatalf("B triggers = %d, want 1 (the seeded one; no new trigger)", n)
+		}
+		if n := f.mergesInto(b) - merges; n != 0 {
+			t.Fatalf("B admission made %d merge calls, want 0", n)
+		}
+	})
+
+	t.Run("b: in_flight at admission holds the line verifying", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.seedTrigger(b, "b1")
+		res := f.handOff(a, b)
+		if e := f.requireState(b, mergequeue.StateLive, ""); e.Phase != mergequeue.PhaseVerifying || e.AnchoredHeadSHA != "b1" {
+			t.Fatalf("B entry = phase %q head %q, want verifying at b1", e.Phase, e.AnchoredHeadSHA)
+		}
+		if res.start == nil || res.start.State != mergeCandidateStateInFlight || res.start.StageID != b.impl.ID {
+			t.Fatalf("B answer = %+v, want in_flight on its implement stage", res)
+		}
+		if n := len(f.triggers(b)); n != 1 {
+			t.Fatalf("B triggers = %d, want 1 (no new trigger)", n)
+		}
+		if st := f.stageState(b.impl.ID); st != run.StageStateSucceeded {
+			t.Fatalf("B implement = %s, want succeeded (not re-opened)", st)
+		}
+	})
+
+	t.Run("c: passed at admission holds the line passed", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.seedTrigger(b, "b1")
+		f.verdict(b, mergeCandidateResultPassed)
+		res := f.handOff(a, b)
+		if e := f.requireState(b, mergequeue.StateLive, ""); e.Phase != mergequeue.PhasePassed {
+			t.Fatalf("B phase = %q, want passed", e.Phase)
+		}
+		if res.start == nil || res.start.State != mergeCandidateStatePassed {
+			t.Fatalf("B answer = %+v, want passed", res)
+		}
+		if n := len(f.triggers(b)); n != 1 {
+			t.Fatalf("B triggers = %d, want 1 (no new trigger)", n)
+		}
+	})
+
+	t.Run("d: unresolved head after a merge returns to held", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		// The merge answers no sha and the PR head stays at the pre-merge b1
+		// for every post-merge re-read (the fixture's millisecond re-read
+		// schedule, postMergeHeadReadBackoff, keeps that short).
+		f.gh.set(func() {
+			f.gh.behind["b1"] = []string{"base-x"}
+			f.gh.mergeSHA[b.branch] = ""
+		})
+		fs := &mcqFaultStore{Store: f.store}
+		f.srv.cfg.MergeQueue = fs
+		held := f.entry(b)
+		merges := f.mergesInto(b)
+		res := f.handOff(a, b)
+		if res.refusal == nil || !strings.Contains(res.refusal.Reason, "resulting head could not be read back") {
+			t.Fatalf("B answer = %+v, want the unresolved-head refusal", res)
+		}
+		if e := f.requireState(b, mergequeue.StateHeld, ""); !e.EnqueuedAt.Equal(held.EnqueuedAt) || e.AnchoredHeadSHA != "b1" {
+			t.Fatalf("B = enqueued_at %v head %q, want held at its place (%v) at b1", e.EnqueuedAt, e.AnchoredHeadSHA, held.EnqueuedAt)
+		}
+		if n := f.mergesInto(b) - merges; n != 1 {
+			t.Fatalf("B admission made %d merge calls, want exactly 1", n)
+		}
+		if n := fs.called("Reanchor"); n != 0 {
+			t.Fatalf("Reanchor ran %d times on an unresolved head, want 0", n)
+		}
+		if n := fs.called("Unadmit"); n != 1 {
+			t.Fatalf("Unadmit ran %d times, want 1", n)
+		}
+		if n := len(f.triggers(b)); n != 0 {
+			t.Fatalf("B triggers = %d, want 0", n)
+		}
+	})
+
+	t.Run("e: re-anchor error returns to held", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.behind(b, "b1", "b2")
+		fs := &mcqFaultStore{Store: f.store,
+			reanchor: func(uuid.UUID, string, string) (mergequeue.Entry, error) { return mergequeue.Entry{}, errMCQStore },
+		}
+		f.srv.cfg.MergeQueue = fs
+		held := f.entry(b)
+		res := f.handOff(a, b)
+		if res.refusal == nil || !strings.Contains(res.refusal.Reason, "re-anchoring the entry failed") {
+			t.Fatalf("B answer = %+v, want the re-anchor refusal", res)
+		}
+		if e := f.requireState(b, mergequeue.StateHeld, ""); !e.EnqueuedAt.Equal(held.EnqueuedAt) {
+			t.Fatalf("B enqueued_at moved %v -> %v, want kept", held.EnqueuedAt, e.EnqueuedAt)
+		}
+		if fs.called("Reanchor") != 1 || fs.called("Unadmit") != 1 {
+			t.Fatalf("calls = %v, want one Reanchor and one Unadmit", fs.names())
+		}
+		if n := len(f.triggers(b)); n != 0 {
+			t.Fatalf("B triggers = %d, want 0", n)
+		}
+	})
+
+	t.Run("f: no installation returns to held", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.exec(`UPDATE runs SET installation_id = NULL WHERE id = $1`, b.id)
+		fs := &mcqFaultStore{Store: f.store}
+		f.srv.cfg.MergeQueue = fs
+		held := f.entry(b)
+		merges := f.mergesInto(b)
+		res := f.handOff(a, b)
+		if res.refusal == nil || !strings.Contains(res.refusal.Reason, "no installation") {
+			t.Fatalf("B answer = %+v, want the no-installation refusal", res)
+		}
+		if e := f.requireState(b, mergequeue.StateHeld, ""); !e.EnqueuedAt.Equal(held.EnqueuedAt) {
+			t.Fatalf("B enqueued_at moved %v -> %v, want kept", held.EnqueuedAt, e.EnqueuedAt)
+		}
+		if n := fs.called("Unadmit"); n != 1 {
+			t.Fatalf("Unadmit ran %d times, want 1", n)
+		}
+		if n := f.mergesInto(b) - merges; n != 0 {
+			t.Fatalf("B admission made %d merge calls with no installation, want 0", n)
+		}
+		if n := len(f.triggers(b)); n != 0 {
+			t.Fatalf("B triggers = %d, want 0", n)
+		}
+	})
+
+	// g pins TODAY's behaviour: a transient replacement-trigger append failure
+	// at admission ejects pass_not_startable (an Unadmit might be friendlier).
+	// The settled row persists only the reason code; the detailed refusal is
+	// read from the pump's map.
+	t.Run("g: pending-replacement trigger append failure ejects pass_not_startable", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.seedTrigger(b, "b0")
+		f.setStage(b.impl.ID, run.StageStatePending)
+		fa := &mcqFailTriggerAudit{Repository: f.audit}
+		f.srv.cfg.AuditRepo = fa
+		fa.armed.Store(true)
+		res := f.handOff(a, b)
+		f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonPassNotStartable)
+		if res.refusal == nil || !strings.Contains(res.refusal.Reason, "recording the replacement merge-candidate verify trigger failed") {
+			t.Fatalf("B answer = %+v, want the replacement-trigger refusal", res)
+		}
+		if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b0" {
+			t.Fatalf("B triggers = %+v, want still the one seeded at b0", tr)
+		}
+		if st := f.stageState(b.impl.ID); st != run.StageStatePending {
+			t.Fatalf("B implement = %s, want still pending", st)
+		}
+	})
 }
