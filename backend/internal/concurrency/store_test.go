@@ -947,3 +947,112 @@ func TestGroupKeysAndLockDomain(t *testing.T) {
 		t.Fatal("lock key is not deterministic")
 	}
 }
+
+// seedRunningJob inserts a RUNNING specialist job admitted into group with a
+// fresh heartbeat (DB clock), by construction: no specialistjob store call.
+func (f *fixture) seedRunningJob(group string) uuid.UUID {
+	f.t.Helper()
+	var id uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `INSERT INTO specialist_jobs
+  (kind, state, requester_seat, requester_actor_kind, requester_subject, inputs, admission_group, host,
+   execution_nonce, started_at, requested_sequence)
+VALUES ('inventory', 'running', 'operator', 'user', 'github:captain', '{}', $1, 'h1', 'n1', clock_timestamp(), 1)
+RETURNING id`, group).Scan(&id); err != nil {
+		f.t.Fatalf("seed running job: %v", err)
+	}
+	return id
+}
+
+// TestAdmit_VerifyGroupCountsRunningSpecialistJob (ADR-097 D6): the ONLY
+// thing in local-verify:h1 is a running job with a fresh heartbeat (no stage
+// holder, no waiter), and a verify stage queues behind it.
+func TestAdmit_VerifyGroupCountsRunningSpecialistJob(t *testing.T) {
+	f := newFixture(t)
+	f.seedRunningJob(VerifyGroupKey("h1"))
+	pass := f.stage()
+	adm, err := f.store.Admit(context.Background(), verifyReq(pass))
+	if err != nil {
+		t.Fatalf("verify Admit: %v", err)
+	}
+	if adm.Admitted {
+		t.Fatalf("verify Admit admitted beside a live specialist job, want queued")
+	}
+	if len(adm.Holders) != 0 {
+		t.Fatalf("holders = %+v, want stage-only (none)", adm.Holders)
+	}
+	if s := f.stageState(pass.ID); s != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("stage state = %s, want awaiting_host_dispatch", s)
+	}
+}
+
+// TestAdmit_StaleSpecialistJobReleases: a running job whose heartbeat is
+// older than JobHeartbeatTTL (seeded on the DB clock, #3048) stops counting.
+func TestAdmit_StaleSpecialistJobReleases(t *testing.T) {
+	f := newFixture(t)
+	id := f.seedRunningJob(VerifyGroupKey("h1"))
+	f.exec(`UPDATE specialist_jobs SET last_seen_at = clock_timestamp() - make_interval(secs => $2) - interval '30 seconds' WHERE id = $1`,
+		id, JobHeartbeatTTL.Seconds())
+	pass := f.stage()
+	adm, err := f.store.Admit(context.Background(), verifyReq(pass))
+	if err != nil {
+		t.Fatalf("verify Admit: %v", err)
+	}
+	if !adm.Admitted {
+		t.Fatalf("verify Admit queued at %d behind a STALE job, want admitted", adm.Position)
+	}
+}
+
+// TestAdmit_ImplementGroupIgnoresJobs: a running job in local-verify:h1 never
+// occupies local-implement:h1.
+func TestAdmit_ImplementGroupIgnoresJobs(t *testing.T) {
+	f := newFixture(t)
+	f.seedRunningJob(VerifyGroupKey("h1"))
+	f.mustAdmit(f.stage())
+}
+
+// TestGroupOccupancyTx pins the exported tx helpers: the occupancy counts
+// stage holders, fresh stage waiters and live job holders per group, and
+// TryGroupLockTx contends on the SAME key Admit takes.
+func TestGroupOccupancyTx(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	holder, waiter := f.stage(), f.stage()
+	if a, err := f.store.Admit(ctx, verifyReq(holder)); err != nil || !a.Admitted {
+		t.Fatalf("holder Admit = %+v, %v", a, err)
+	}
+	if a, err := f.store.Admit(ctx, verifyReq(waiter)); err != nil || a.Admitted {
+		t.Fatalf("waiter Admit = %+v, %v", a, err)
+	}
+	f.seedRunningJob(VerifyGroupKey("h1"))
+	f.seedRunningJob(testGroup)
+
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	hit, err := TryGroupLockTx(ctx, tx, nil, VerifyGroupKey("h1"))
+	if err != nil || !hit {
+		t.Fatalf("TryGroupLockTx = %v, %v", hit, err)
+	}
+	occ, err := GroupOccupancyTx(ctx, tx, nil, VerifyGroupKey("h1"))
+	if err != nil {
+		t.Fatalf("GroupOccupancyTx: %v", err)
+	}
+	if occ != (Occupancy{StageHolders: 1, FreshStageWaiters: 1, JobHolders: 1}) {
+		t.Fatalf("occupancy = %+v, want 1/1/1", occ)
+	}
+	other := uuid.New()
+	if occ, err := GroupOccupancyTx(ctx, tx, &other, VerifyGroupKey("h1")); err != nil || occ != (Occupancy{}) {
+		t.Fatalf("other-account occupancy = %+v, %v, want zero", occ, err)
+	}
+	// The held job lock makes a stage admission of the same group contended.
+	late := f.stage()
+	adm, err := f.store.Admit(ctx, verifyReq(late))
+	if err != nil {
+		t.Fatalf("late Admit: %v", err)
+	}
+	if !adm.Contended {
+		t.Fatalf("stage Admit while TryGroupLockTx holds the group = %+v, want contended", adm)
+	}
+}
