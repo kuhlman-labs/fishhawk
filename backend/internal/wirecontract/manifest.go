@@ -76,6 +76,12 @@ const (
 	// structs carry the marker in either file.
 	runnerGateEvidenceGo = "runner/cmd/fishhawk-runner/gateevidence.go"
 	bundleGo             = "backend/internal/bundle/bundle.go"
+	// specialistJobGo holds the backend's specialist-job HTTP shapes and
+	// specialistJobPkgGo the completion envelope the runner ships (E85.9 /
+	// #4300). The latter carries no marker (it is slice 0's contract file);
+	// the manifest row is what guards it.
+	specialistJobGo    = "backend/internal/server/specialist_job.go"
+	specialistJobPkgGo = "backend/internal/specialistjob/specialistjob.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -298,6 +304,43 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: bundleGo, Type: "CounterfactualObservationEvidence"},
 				Mode:     ModeExact,
 			},
+			{
+				// The specialist-job read (E85.9 / #4300): fishhawkd emits it on
+				// GET/POST /v0/specialist-jobs, the runner's specialist-job
+				// subcommand decodes it. ModeSubset with every name decoded today;
+				// the nested requester/subject members and the bytes are pinned
+				// by testdata/wire/specialist_job.json, which both modules decode.
+				Name: "specialist_job", Anchor: "#4300",
+				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobResponse"},
+				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJob"},
+				Mode:     ModeSubset,
+			},
+			{
+				// The admission body the runner POSTs (and re-POSTs as its
+				// heartbeat). ModeExact: a flat leaf both ways.
+				Name: "specialist_job_admission_request", Anchor: "#4300",
+				Emitter:  Endpoint{File: uploadFile, Type: "SpecialistJobAdmissionRequest"},
+				Consumer: Endpoint{File: specialistJobGo, Type: "specialistJobAdmissionRequest"},
+				Mode:     ModeExact,
+			},
+			{
+				// The admission answer. ModeSubset; the nested job member is the
+				// specialist_job pair above.
+				Name: "specialist_job_admission", Anchor: "#4300",
+				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobAdmissionResponse"},
+				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJobAdmission"},
+				Mode:     ModeSubset,
+			},
+			{
+				// The runner's completion envelope, decoded by
+				// specialistjob.ParseCompletion. ModeExact on the envelope (options
+				// included); per-kind evidence rides as raw JSON and is pinned by
+				// the shared golden testdata/wire/specialist_job.json.
+				Name: "specialist_job_completion", Anchor: "#4300",
+				Emitter:  Endpoint{File: uploadFile, Type: "SpecialistJobCompletion"},
+				Consumer: Endpoint{File: specialistJobPkgGo, Type: "Completion"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			promptFile,
@@ -311,6 +354,8 @@ func SeedManifest() Manifest {
 			scenarioFile,
 			runnerGateEvidenceGo,
 			bundleGo,
+			specialistJobGo,
+			specialistJobPkgGo,
 		},
 		UnpairedExemptions: []Endpoint{
 			// ShipPlanArgs carries the marker on its Reachability field, but the
