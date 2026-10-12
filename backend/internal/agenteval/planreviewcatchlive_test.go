@@ -12,23 +12,24 @@ import (
 
 // The LIVE two-arm plan-review catch-rate measurement (E55.4 / #2245).
 //
-// IT SKIPS IN EVERY IN-LOOP RUN, AND THAT IS THE HONEST STATE OF THE
-// MEASUREMENT. This change ships the measurement APPARATUS and the offline
-// gate (planreviewcatch_test.go, planreviewevidence_test.go, catchrategate),
-// not a measured baseline: the runner sanitizes gate-subprocess environments
-// through a default-deny allow-list that names ANTHROPIC_API_KEY on
-// gateEnvDeny (runner/cmd/fishhawk-runner/gateenv.go), so no in-loop test can
-// obtain a model credential. Until an operator records the first baseline,
-// testdata/planreview-catchrate/evidence.json does not exist and the standing
-// check fails closed on every review-prompt change, by design. The operator
-// walk is docs/compliance/planreview-catchrate-evidence.md.
+// IT SKIPS IN EVERY IN-LOOP RUN: the runner sanitizes gate-subprocess
+// environments through a default-deny allow-list that names ANTHROPIC_API_KEY
+// on gateEnvDeny (runner/cmd/fishhawk-runner/gateenv.go), so no in-loop test
+// can obtain a model credential, and every recording is operator-executed.
+// The committed testdata/planreview-catchrate/evidence.json and its per-trial
+// sidecar evidence.trials.json (agenteval.CatchRateTrialsPath) are written
+// together by a recording run; a change to the corpus, the conventions
+// fixture, the rendered plan-review prompt or the catch rule makes the
+// committed pair STALE, and the standing check fails closed on a review-prompt
+// change until an operator re-records it. The operator walk is
+// docs/compliance/planreview-catchrate-evidence.md.
 //
 // DOUBLE-GATED on FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE plus
 // one credential — FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN
 // (exactly one; see livecredential_test.go) — the posture injectionlive_test.go
 // and severitycalibrationlive_test.go take. Two further knobs:
 //
-//	FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1          write the evidence record (otherwise a dry run)
+//	FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1          write the evidence record and its trial sidecar (otherwise a dry run)
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON=<why>  pin this measurement as the baseline (the explicit operator action)
 //
 // Every function it calls is offline-tested with fake senders. The arms run on
@@ -140,7 +141,11 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 		t.Errorf("baseline generator_model = %q, want %q", rec.Baseline.GeneratorModel, "claude-sonnet-5-5")
 	}
 
-	// (iii) the record passes the offline gate keyed to the catch-rate constant.
+	// (iii) the record passes the offline gate keyed to the catch-rate
+	// constant, and the seam wrote its trial sidecar beside it.
+	if _, err := os.Stat(CatchRateTrialsPath(path)); err != nil {
+		t.Errorf("the live seam wrote no trial sidecar at %s: %v", CatchRateTrialsPath(path), err)
+	}
 	if _, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, DefaultCatchRateGeneratorModel); err != nil {
 		t.Errorf("CheckCatchRateEvidence on the recorded evidence: %v", err)
 	}

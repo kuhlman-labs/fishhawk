@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000004256",
+  "artifact_id": "00000000-0000-0000-0001-000000004256",
+  "triage_sequence": 109,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is inferred-source or unresolvable against the plan (bad/ambiguous criterion)",
+  "decided_at": "2026-10-11T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-views-purged-after-90-days",
+      "statement": "widget_views rows older than 90 days are deleted by the nightly purge job.",
+      "source": "inferred",
+      "rationale": "Inferred from the audit_events table, whose nightly purge job keeps 90 days; view events should follow the same retention.",
+      "observed": "a widget_views row seeded 91 days old was still present after the nightly purge job ran",
+      "expected": "the 91-day-old widget_views row deleted",
+      "steps_taken": "inserted a widget_views row with viewed_at = now() - 91 days, ran the purge job, counted the row",
+      "expectation_basis": "criterion ac-views-purged-after-90-days",
+      "repro_handle": "psql -c \"SELECT count(*) FROM widget_views WHERE viewed_at < now() - interval '90 days'\"",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

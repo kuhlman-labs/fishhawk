@@ -1,0 +1,165 @@
+{
+  "issue_title": "Accept file attachments on widgets",
+  "issue_body": "Support staff need to attach spec sheets and photos to a widget.\n\nAdd `POST /widgets/{id}/attachments` (multipart field `file`) that stores the file and returns HTTP 201, and `GET /widgets/{id}/attachments` listing a widget's attachments. Uploads are capped at 10 MB: an upload larger than 10 MB is rejected with HTTP 413 Payload Too Large and nothing is stored. A widget owned by another tenant returns 404.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/107",
+      "id": "example-org/widgets-service#107"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Add tenant-scoped widget attachment upload and list endpoints with an upload size limit.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/attachments.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/attachments_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/attachments.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/migrations/0014_widget_attachments.sql",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0014 creating widget_attachments (id, widget_id, tenant_id, filename, content_type, size_bytes, blob_key, created_at), with a down migration."
+      },
+      {
+        "step": 2,
+        "description": "Add the POST /widgets/{id}/attachments handler: resolve the tenant, wrap the body in http.MaxBytesReader at the configured upload limit, map *http.MaxBytesError to HTTP 413, and store the file in the blob store."
+      },
+      {
+        "step": 3,
+        "description": "Add the GET /widgets/{id}/attachments handler listing the widget's attachments (id, filename, size_bytes, created_at)."
+      },
+      {
+        "step": 4,
+        "description": "Return 404 for a widget id that does not belong to the caller's tenant, on both routes."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests in attachments_test.go against an in-memory blob store with generated files of the sizes the criteria name: a stored upload is listed, an oversize upload stores nothing, and another tenant's widget returns 404.",
+      "rollback_plan": "Revert the PR and run the 0014 down migration; stored blobs are orphaned and can be deleted by key prefix.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-upload-stored",
+          "statement": "Uploading a 1 MB PNG to POST /widgets/{id}/attachments returns HTTP 201, and GET /widgets/{id}/attachments then lists it.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#107"
+        },
+        {
+          "id": "ac-upload-large-accepted",
+          "statement": "Uploading a 20 MB PDF to POST /widgets/{id}/attachments returns HTTP 201.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#107"
+        },
+        {
+          "id": "ac-upload-oversize-413",
+          "statement": "Uploading a 30 MB file to POST /widgets/{id}/attachments returns HTTP 413 and stores nothing.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#107"
+        },
+        {
+          "id": "ac-upload-tenant-scoped",
+          "statement": "POST /widgets/{id}/attachments for a widget owned by another tenant returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#107"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The blob store accepts objects of any size the handler admits."
+    ],
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "contradicts the issue",
+    "contradicts issue",
+    "contradicts the 10",
+    "conflicts with the issue",
+    "conflicts with the 10",
+    "inconsistent with the issue",
+    "violates the issue",
+    "should return 413",
+    "must return 413",
+    "should be 413",
+    "instead of 413",
+    "rather than 413",
+    "contrary to the issue",
+    "at odds with the issue",
+    "at odds with the 10"
+  ],
+  "attribution_phrases": [
+    "20 mb",
+    "20 mb pdf"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-large-accepted contradicts the issue: uploads are capped at 10 MB with 413 above it, so a 20 MB upload must be rejected, not accepted."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-upload-large-accepted expects 201 for a 20 MB file, which exceeds the issue's cap; it should return 413."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion accepting a 20 MB PDF is at odds with the issue's 10 MB limit; flip it to expect 413."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test uploads a file of exactly 10 MB to pin the boundary."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Buffering a whole multipart body in memory per request could exhaust memory under concurrent uploads; stream to the blob store instead."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "api/openapi.yaml should document the 413 response and the multipart field name."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-upload-large-accepted should also assert the stored attachment's checksum equals the uploaded bytes."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "The 20 MB PDF test should generate its fixture at run time rather than commit a binary."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The configured upload limit should be read from the service config, not hard-coded in the handler."
+    },
+    {
+      "category": "coverage",
+      "note": "The 20 MB PDF fixture is unjustified bloat at odds with the repo's binary-fixture limit; the issue says nothing about fixtures, so generate it at run time."
+    }
+  ]
+}

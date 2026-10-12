@@ -97,7 +97,29 @@
     "not requested",
     "never requested",
     "not asked for",
-    "scope creep"
+    "scope creep",
+    "not stated in the issue",
+    "not grounded",
+    "ungrounded",
+    "no basis in the issue",
+    "unsupported by the issue",
+    "invented page size",
+    "invented cap",
+    "page size is invented",
+    "cap is invented",
+    "pagination is invented",
+    "speculative page size",
+    "speculative cap",
+    "page size is speculative",
+    "cap is speculative",
+    "pagination is speculative",
+    "page size is not in the issue",
+    "cap is not in the issue",
+    "pagination is not in the issue"
+  ],
+  "attribution_phrases": [
+    "paginates at 100",
+    "100 items"
   ],
   "catching_examples": [
     {
@@ -108,7 +130,7 @@
     {
       "severity": "medium",
       "category": "warrant",
-      "note": "Pagination is scope creep the issue does not ask for; the paginate-at-100 criterion should be dropped or sourced."
+      "note": "Pagination is scope creep the issue does not ask for; the criterion that GET /widgets paginates at 100 items should be dropped or sourced."
     }
   ],
   "non_catching_examples": [
@@ -141,6 +163,30 @@
       "severity": "low",
       "category": "coverage",
       "note": "Add a test that GET /widgets paginates correctly at exactly 100 items."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-list-pagination needs a test seeding more than 100 widgets to exercise the next page."
+    },
+    {
+      "category": "risk",
+      "note": "Offset-based logic to paginate at 100 items is unsupported by the tenant_id index and unjustified for large tenants; a keyset cursor avoids the mismatch."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Do not hand-roll a paginate helper; an invented cursor scheme duplicates ListPage."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The paginate call should use the shared cursor; a speculative offset scheme will drift."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "…paginate via the existing helper; a new one is not in the issue's style guide."
     }
   ]
 }

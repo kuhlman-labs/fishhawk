@@ -3590,15 +3590,17 @@ base with `--base` (default `origin/main`), it requires
 `(cd backend && go run ./internal/agenteval/catchrategate)` to exit 0.
 That command decides from the committed evidence record alone (no model
 call, no network) and fails closed on an absent, malformed, stale,
-under-powered or regressed record; its twelve modes, the pinned baseline
-and the evidence schema are in `backend/internal/agenteval/README.md` §
+under-powered or regressed record, or one whose per-trial sidecar
+(`evidence.trials.json`) is absent, malformed, from another recording or
+count-inconsistent with it; its sixteen modes, the pinned baseline, the
+evidence schema and the sidecar are in `backend/internal/agenteval/README.md` §
 "Plan-review catch-rate gate". Recording the evidence is an operator step:
 `docs/compliance/planreview-catchrate-evidence.md`.
 
-**Until an operator records and pins the first baseline, the check fails
-on EVERY change that touches a trigger path**, including the branch that
-introduced it. That is the design: conventions already shipped in #2244
-without evidence.
+**A baseline is pinned (first on 2026-10-10) and is re-pinned when the
+instrument changes: while the record is stale, the check fails on EVERY
+change that touches a trigger path**, including the branch that changed the
+instrument. That is the design, not a defect.
 
 ### Trigger paths and the change set
 
@@ -3610,7 +3612,7 @@ without evidence.
 | `backend/internal/agenteval/planreviewevidence.go` | that file only (record, fingerprint, check) |
 | `backend/internal/agenteval/catchrategate/` | every path under it (the gate command) |
 | `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the corpus) |
-| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`) |
+| `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`, its trial sidecar `evidence.trials.json`) |
 
 A trigger ending in `/` is a directory at a component boundary
 (`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);
@@ -3671,10 +3673,10 @@ hermetic harness, `scripts/test-review-prompt-eval`, runs in verify
 
 Add this job under `jobs:` in `.github/workflows/ci.yml`. It runs on every
 pull request and is a fast no-op when no trigger path changed. List
-`review-prompt-eval` in `ci-pass.needs` to make it required, but only AFTER
-the first baseline is recorded: before that it fails every PR touching a
-trigger path by design, so install it un-required (advisory) first if you
-want it visible sooner. The base ref goes through `env:`, not an inline
+`review-prompt-eval` in `ci-pass.needs` to make it required once the pinned
+record is current: while it is stale it fails every PR touching a trigger
+path by design, so install it un-required (advisory) first if you want it
+visible sooner. The base ref goes through `env:`, not an inline
 `${{ }}` in `run:`, so no expression is interpolated into the shell.
 
 ```yaml

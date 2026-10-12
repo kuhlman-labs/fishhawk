@@ -12,9 +12,10 @@
 # model call, no network — and fails closed on an absent, malformed, stale,
 # under-powered or regressed record (backend/internal/agenteval/README.md §
 # "Plan-review catch-rate gate"). Recording the evidence is an operator step:
-# docs/compliance/planreview-catchrate-evidence.md. Until an operator records
-# and pins the first baseline, this check FAILS on every change that touches a
-# trigger path. That is the design, not a defect.
+# docs/compliance/planreview-catchrate-evidence.md. A baseline is pinned (first
+# on 2026-10-10) and is re-pinned when the instrument changes: while the record
+# is stale, this check FAILS on every change that touches a trigger path. That
+# is the design, not a defect.
 #
 # It runs OUTSIDE `scripts/test verify` on purpose. The evidence can only be
 # produced by the live two-arm measurement, which needs a model credential and
