@@ -777,7 +777,9 @@
       "path": "docs/adr/080-solo-captain-alpha.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-099"
+      ],
       "applies_to": []
     },
     {
@@ -911,6 +913,17 @@
       "status": "accepted",
       "supersedes": [
         "ADR-096"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-099",
+      "title": "Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles",
+      "path": "docs/adr/099-crew-role-naming.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-080"
       ],
       "superseded_by": [],
       "applies_to": []
