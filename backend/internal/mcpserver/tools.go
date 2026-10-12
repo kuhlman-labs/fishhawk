@@ -4156,12 +4156,23 @@ SUCCESSFUL pass writes conflict_resolution_pushed, which consumes it just as
 surely — either terminal outcome settles the pass, so a later ordinary
 fix-up on that stage is never served the completed instruction.
 
+The implement stage's RE-OPEN PRECONDITIONS (a live run, a review gate
+parked at awaiting_approval, a settled acceptance stage) are checked BEFORE
+the budget is touched (#4304). A refusal there is the rebase_conflict 422
+naming the precondition, and it spends NO budget: clear the precondition
+(e.g. dispatch or await the acceptance stage), then re-invoke this verb;
+resolve-push-vouch is the fallback when it cannot be cleared. The slot can
+still be spent after that check, loudly, in three residual cases: a
+precondition changes mid-call, a repository read fails inside the re-open's
+own admission, or the re-open's stage write fails.
+
 FAIL-CLOSED once the budget is spent, or whenever no pass can be started at
 all (no implement stage, an unresolvable branch/base/head anchor, an
-unreadable budget count, a failed trigger append, a failed stage re-open):
-the call is refused with today's rebase_conflict 422, naming the FAILED
-pass, its refusal reason and the fallback route — resolve in a worktree,
-push, then fishhawk_vouch_commit. Because the conflict arm otherwise
+unreadable budget count, an unmet re-open precondition, a failed trigger
+append, or one of the residual re-open failures above, which spends the
+slot): the call is refused with today's rebase_conflict 422, naming the
+FAILED pass, its refusal reason and the fallback route — resolve in a
+worktree, push, then fishhawk_vouch_commit. Because the conflict arm otherwise
 returns 202, that refusal is normally observable on the NEXT invocation.
 Every uncertain anchor is likewise fail-closed (rebase_not_determinable)
 rather than merged on a guess.

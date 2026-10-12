@@ -109,7 +109,24 @@ type FixupOptions struct {
 	//     pending so the sequential orchestrator walk re-runs acceptance
 	//     against a fresh preview after the code change re-reviews.
 	AcceptanceStageID *uuid.UUID
+
+	// AcceptanceBlockerTail, when non-empty, REPLACES the remedy tail of the
+	// acceptance-blocker refusal (the review gate has not opened because a
+	// non-terminal acceptance stage runs ahead of it, #3116) — the clause
+	// AcceptanceBlockerAdvisory appends after "let it settle" / "Wait for
+	// acceptance to settle". Empty selects fixupAcceptanceBlockerTail, so
+	// every caller that does not set it gets a BYTE-IDENTICAL refusal. A
+	// caller that is not routing a fix-up (the rebase verb's conflict arm,
+	// #4304) sets it so the refusal names ITS remedy rather than "route the
+	// fix-up". Only the acceptance-blocker branches read it: every other
+	// refusal keeps its wording.
+	AcceptanceBlockerTail string
 }
+
+// fixupAcceptanceBlockerTail is the default remedy tail of the
+// acceptance-blocker refusal, used when FixupOptions.AcceptanceBlockerTail is
+// empty.
+const fixupAcceptanceBlockerTail = ", then route the fix-up — the fix-up budget is not consumed by waiting"
 
 // FixupDecision summarizes what FixupStage did, for the audit trail
 // and the handler's response.
@@ -200,6 +217,11 @@ type FixupDecision struct {
 //   - otherwise admit, marking the decision Forced when the override
 //     carried it past the normal budget (PriorPassCount >= MaxPasses).
 //
+// Every refusal above (and the acceptance-mode acceptance-stage type check)
+// is decided by admitFixup, a read-only ADMISSION phase that FixupApplicable
+// shares (#4304), so a refused call moves no stage and the pre-flight cannot
+// drift from this verb.
+//
 // On success the implement stage moves to pending via the existing
 // TransitionStage repo verb (the fix-up edge is admitted by
 // ValidStageFixupTransition); on the push_and_open_pr flow the review
@@ -222,6 +244,128 @@ type FixupDecision struct {
 // log, which run does not depend on); FixupStage owns only the
 // state-machine and bound decisions.
 func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts FixupOptions) (*FixupDecision, error) {
+	adm, err := admitFixup(ctx, repo, stageID, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Partial-failure ordering (#780 + E31.8): re-park the review stage
+	// FIRST, re-open the acceptance stage SECOND, and re-open the implement
+	// stage LAST, so a mid-sequence failure never strands a pending implement
+	// stage without its downstream gates re-armed. On the commit-yourself
+	// flow reviewToRepark is nil and the re-park is skipped; outside
+	// acceptance mode the acceptance re-open is skipped.
+	reviewToRepark := adm.reviewToRepark
+	if reviewToRepark != nil {
+		reparked, err := repo.TransitionStage(ctx, reviewToRepark.ID, StageStatePending, nil)
+		if err != nil {
+			return nil, fmt.Errorf("FixupStage: re-park review %s → pending: %w", reviewToRepark.State, err)
+		}
+		reviewToRepark = reparked
+	}
+
+	var reopenedAcceptance *Stage
+	if acc := adm.acceptance; acc != nil {
+		// Re-open the settled acceptance stage (succeeded → pending, admitted
+		// by stageFixupTransitions) so the orchestrator re-runs acceptance
+		// against a fresh preview. A non-succeeded acceptance stage needs no
+		// re-open — leave it as-is. Its type was already checked by the
+		// admission, BEFORE the review re-park above (#4304).
+		if acc.State == StageStateSucceeded {
+			ra, err := repo.TransitionStage(ctx, acc.ID, StageStatePending, nil)
+			if err != nil {
+				return nil, fmt.Errorf("FixupStage: re-open acceptance succeeded → pending: %w", err)
+			}
+			reopenedAcceptance = ra
+		} else {
+			reopenedAcceptance = acc
+		}
+	}
+
+	updated, err := repo.TransitionStage(ctx, stageID, StageStatePending, nil)
+	if err != nil {
+		return nil, fmt.Errorf("FixupStage: %s → pending: %w", adm.priorState, err)
+	}
+
+	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Ceiling slots surviving this admission (#3335), measured against the
+	// credited effective count: HardCeiling - (effective + 1), floored at 0.
+	remainingCeiling := opts.HardCeiling - (opts.PriorPassCount - adm.credit + 1)
+	if remainingCeiling < 0 {
+		remainingCeiling = 0
+	}
+
+	return &FixupDecision{
+		PriorState:            adm.priorState,
+		Stage:                 updated,
+		ReparkedReview:        reviewToRepark,
+		ReopenedAcceptance:    reopenedAcceptance,
+		RemainingBudget:       remaining,
+		RemainingCeilingSlots: remainingCeiling,
+		Forced:                adm.forced,
+	}, nil
+}
+
+// FixupApplicable reports whether FixupStage would ADMIT the same call,
+// without performing it (#4304).
+//
+//  1. It is side-effect-free: it only READS the repository and never calls
+//     TransitionStage, so a refused or admitted answer moves no stage.
+//  2. It returns nil exactly when FixupStage would admit the same call
+//     against the same repository state, because both run the same
+//     admitFixup. The answer can still go stale: a concurrent state change
+//     between this call and FixupStage, a repository READ failure inside
+//     FixupStage's own admission, or a write error in FixupStage's mutation
+//     phase can each make the later FixupStage refuse or fail.
+//  3. A refusal carries the same sentinel (ErrFixupNotApplicable,
+//     ErrFixupCeilingReached, ErrFixupBudgetExhausted) and the byte-identical
+//     message FixupStage returns. Any other error is a wrapped repository
+//     read failure: applicability is then UNKNOWN, not refused.
+//  4. The intended caller is one that must spend a durable budget BEFORE the
+//     re-open — the rebase verb's conflict-resolution arm, which appends its
+//     ceiling-of-one trigger ahead of FixupStage and so pre-flights the
+//     re-open with this to refuse a deterministic precondition without
+//     spending the slot.
+func FixupApplicable(ctx context.Context, repo Repository, stageID uuid.UUID, opts FixupOptions) error {
+	_, err := admitFixup(ctx, repo, stageID, opts)
+	return err
+}
+
+// fixupAdmission is everything admitFixup decided, carried into FixupStage's
+// mutation phase so the mutation re-derives nothing.
+type fixupAdmission struct {
+	// stage is the implement stage being re-opened.
+	stage *Stage
+	// priorState is the implement stage state before the re-open.
+	priorState StageState
+	// reviewToRepark is the review stage to re-park to pending, or nil.
+	reviewToRepark *Stage
+	// acceptance is the acceptance stage in acceptance mode (type already
+	// checked), or nil outside it.
+	acceptance *Stage
+	// credit is CeilingRefundedPasses clamped into [0, PriorPassCount].
+	credit int
+	// forced reports the admission ran past MaxPasses on the override.
+	forced bool
+}
+
+// admitFixup is FixupStage's ADMISSION phase: every refusal FixupStage can
+// reach before its first mutation, performed with reads only and NO
+// TransitionStage call (#4304). FixupStage and FixupApplicable both call it,
+// so the pre-flight and the real re-open cannot drift.
+//
+// Order: the stage type; the terminal-run guard; the implement-state switch
+// (locating the review stage to re-park, with the #3116 acceptance-blocker
+// classification outside acceptance mode); the ceiling-credit clamp; the
+// ceiling and budget bounds; and, in acceptance mode, the acceptance-stage
+// type check. That last check used to run AFTER the review re-park, so a
+// wrong-type acceptance id re-parked the review to pending on a refused call;
+// it now refuses before any stage moves.
+func admitFixup(ctx context.Context, repo Repository, stageID uuid.UUID, opts FixupOptions) (*fixupAdmission, error) {
 	stage, err := repo.GetStage(ctx, stageID)
 	if err != nil {
 		return nil, fmt.Errorf("FixupStage: get stage: %w", err)
@@ -259,7 +403,7 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			// stage has normally already succeeded, so locate it tolerantly
 			// (awaiting_approval OR succeeded re-parks to pending; an
 			// already-pending review or a run with no review stage yields
-			// nil — proceed without a re-park, the acceptance re-open below
+			// nil — proceed without a re-park, the acceptance re-open
 			// still forces re-validation).
 			review, err := findReviewStageForAcceptanceReopen(ctx, repo, stage.RunID)
 			if err != nil {
@@ -269,7 +413,11 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		} else {
 			// push_and_open_pr flow: applicable only while the run's review
 			// stage is still open at its gate.
-			review, err := findOpenReviewStage(ctx, repo, stage.RunID)
+			tail := opts.AcceptanceBlockerTail
+			if tail == "" {
+				tail = fixupAcceptanceBlockerTail
+			}
+			review, err := findOpenReviewStage(ctx, repo, stage.RunID, tail)
 			if err != nil {
 				return nil, err
 			}
@@ -310,28 +458,18 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 		return nil, fmt.Errorf("%w: %d of %d fix-up passes already used",
 			ErrFixupBudgetExhausted, opts.PriorPassCount, opts.MaxPasses)
 	}
-	// Admitted. The pass is forced only when the override carried it past
-	// the normal budget (the ceiling check above already guaranteed
-	// headroom).
-	forced := opts.PriorPassCount >= opts.MaxPasses
 
-	priorState := stage.State
-
-	// Partial-failure ordering (#780 + E31.8): re-park the review stage
-	// FIRST, re-open the acceptance stage SECOND, and re-open the implement
-	// stage LAST, so a mid-sequence failure never strands a pending implement
-	// stage without its downstream gates re-armed. On the commit-yourself
-	// flow reviewToRepark is nil and the re-park is skipped; outside
-	// acceptance mode the acceptance re-open is skipped.
-	if reviewToRepark != nil {
-		reparked, err := repo.TransitionStage(ctx, reviewToRepark.ID, StageStatePending, nil)
-		if err != nil {
-			return nil, fmt.Errorf("FixupStage: re-park review %s → pending: %w", reviewToRepark.State, err)
-		}
-		reviewToRepark = reparked
+	adm := &fixupAdmission{
+		stage:          stage,
+		priorState:     stage.State,
+		reviewToRepark: reviewToRepark,
+		credit:         credit,
+		// Admitted. The pass is forced only when the override carried it
+		// past the normal budget (the ceiling check above already
+		// guaranteed headroom).
+		forced: opts.PriorPassCount >= opts.MaxPasses,
 	}
 
-	var reopenedAcceptance *Stage
 	if acceptanceMode {
 		acc, err := repo.GetStage(ctx, *opts.AcceptanceStageID)
 		if err != nil {
@@ -341,47 +479,9 @@ func FixupStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			return nil, fmt.Errorf("%w: acceptance stage %s is type %q, not acceptance",
 				ErrFixupNotApplicable, acc.ID, acc.Type)
 		}
-		// Re-open the settled acceptance stage (succeeded → pending, admitted
-		// by stageFixupTransitions) so the orchestrator re-runs acceptance
-		// against a fresh preview. A non-succeeded acceptance stage needs no
-		// re-open — leave it as-is.
-		if acc.State == StageStateSucceeded {
-			ra, err := repo.TransitionStage(ctx, acc.ID, StageStatePending, nil)
-			if err != nil {
-				return nil, fmt.Errorf("FixupStage: re-open acceptance succeeded → pending: %w", err)
-			}
-			reopenedAcceptance = ra
-		} else {
-			reopenedAcceptance = acc
-		}
+		adm.acceptance = acc
 	}
-
-	updated, err := repo.TransitionStage(ctx, stageID, StageStatePending, nil)
-	if err != nil {
-		return nil, fmt.Errorf("FixupStage: %s → pending: %w", priorState, err)
-	}
-
-	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	// Ceiling slots surviving this admission (#3335), measured against the
-	// credited effective count: HardCeiling - (effective + 1), floored at 0.
-	remainingCeiling := opts.HardCeiling - (opts.PriorPassCount - credit + 1)
-	if remainingCeiling < 0 {
-		remainingCeiling = 0
-	}
-
-	return &FixupDecision{
-		PriorState:            priorState,
-		Stage:                 updated,
-		ReparkedReview:        reviewToRepark,
-		ReopenedAcceptance:    reopenedAcceptance,
-		RemainingBudget:       remaining,
-		RemainingCeilingSlots: remainingCeiling,
-		Forced:                forced,
-	}, nil
+	return adm, nil
 }
 
 // ErrFixupRecoveryNotApplicable is returned by RestoreFixupStage when
@@ -512,7 +612,11 @@ func RestoreFixupStage(ctx context.Context, repo Repository, implementStageID uu
 // can still dispatch acceptance or must simply wait for the in-flight one:
 // naming a remedy the operator cannot take is the very defect #3116 exists
 // to stop, and it would be reproduced here by a single acceptance sentence.
-func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID) (*Stage, error) {
+//
+// acceptanceBlockerTail is the remedy clause appended to the acceptance
+// branch's sentence: fixupAcceptanceBlockerTail for a fix-up, or the caller's
+// FixupOptions.AcceptanceBlockerTail (#4304). The other branches ignore it.
+func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID, acceptanceBlockerTail string) (*Stage, error) {
 	stages, err := repo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("FixupStage: list stages for run: %w", err)
@@ -558,8 +662,7 @@ func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID) 
 		// explicitly and renders the state unquoted).
 		return nil, fmt.Errorf("%w: implement stage succeeded but the review gate has not opened yet: %s",
 			ErrFixupNotApplicable,
-			AcceptanceBlockerAdvisory("", acc.State, false,
-				", then route the fix-up — the fix-up budget is not consumed by waiting"))
+			AcceptanceBlockerAdvisory("", acc.State, false, acceptanceBlockerTail))
 	}
 
 	// (b) The review stage is not open and no acceptance stage is holding it:
