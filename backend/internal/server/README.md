@@ -2616,6 +2616,23 @@ settle carries.
   re-anchor error) `Unadmit`s the entry back to held at its original place
   and stops the pump. A crash mid-admission is recovered by the store's
   stale-admission re-claim on the next pump.
+- **Admission context (#4303).** Each admitted entry (its `admitted` row and
+  `admitMergeCandidateEntry`) runs on `mergeCandidateAdmissionContext`:
+  detached from the caller's cancellation and bounded by a FRESH
+  `mergeCandidateQueueHandOffBudget`, on every trigger path (periodic pump,
+  webhook PR-resolution hook, verdict and cancel hooks, a rebase's
+  serialize). So neither a departed webhook sender nor fishhawkd's shutdown
+  signal can cut the re-anchor, the pass start or the recovery `Unadmit` and
+  strand an entry live in phase `admitted`. The caller ctx gates only the
+  TOP-LEVEL `AdmitNext` (and the live-entry check): a cancelled pump claims no
+  new entry. An admission that settles its entry pumps the base again on its
+  own detached context, so a nested chain's admissions keep running after a
+  shutdown signal until `Server.Shutdown`'s drain closes (a cut admission is
+  re-claimed after `mergequeue.AdmissionStaleAfter`). A webhook hand-off chain
+  is therefore no longer bounded as a whole: each admission is, and the chain
+  is bounded by its number of held entries (and
+  `mergeCandidateQueueMaxAdmissions` per pump). `mergeCandidateQueueOnPRResolved`
+  keeps its own detached, budgeted context for its entry read and settle.
 - **Verdict / merge / close hooks (D4).** `recordMergeCandidateVerified`
   (non-duplicate append) → `mergeCandidateQueueOnVerdict` for the run's LIVE
   entry anchored at that head: failed → ejected `verify_failed` + pump;
@@ -2646,7 +2663,17 @@ settle carries.
   reports (a base with a held or live entry) once at boot and then every
   `MergeCandidateQueuePumpInterval` (1 minute) via
   `RunMergeCandidateQueuePump` / `PumpMergeCandidateQueues`, started from
-  `backend/cmd/fishhawkd/serve.go`. Each tick reuses `pumpMergeCandidateQueue`,
+  `backend/cmd/fishhawkd/serve.go`. The signal ctx it runs on gates only the
+  ticker and NEW admissions; an admission the loop already claimed runs
+  detached to completion. The loop joins `Server.bgMergeQueuePump`, so
+  `Server.Shutdown` drains it (and the admission it is running) bounded by
+  `Config.ShutdownTimeout` (default 15s, not the 120s admission budget): an
+  admission whose tail outlasts the drain window is still cut at process
+  exit, as on the webhook/cancel paths `http.Shutdown` drains under the same
+  timeout. Boot-window residual: the `Add` runs inside the goroutine serve.go
+  launches, so a SIGTERM landing between the `go` and that `Add` lets
+  Shutdown miss the loop (no drain, not a panic: `Wait` at zero returns at
+  once), the exposure the other bg groups share. Each tick reuses `pumpMergeCandidateQueue`,
   which drops a LIVE entry whose run is terminal (`run_terminal`) and re-claims
   a stale admission, then admits the next held entry. So a run that fails or
   is swept by any path other than the REST cancel (which releases at once)
@@ -2662,7 +2689,17 @@ settle carries.
   held, re-anchor, hand-off on merge with auto-advance under the system
   actor, B admitted through `local-verify:<host>`), pending replacement, the
   hand-off under an unsettled implement review, and one test per eject/drop
-  mode.
+  mode. #4303 adds: the periodic pump's admission surviving a cancelled signal
+  ctx (`PeriodicPumpSurvivesSignalCancellation`), a strictly later deadline
+  per chained admission (`AdmissionBudgetIsPerEntry`), a cancelled pump
+  admitting nothing (`CancelledPumpAdmitsNothingNew`), Shutdown draining the
+  loop and staying bounded (`TestShutdown_DrainsMergeCandidateQueuePump`,
+  `TestShutdown_MergeCandidateQueuePumpDrainBoundedByDeadline`, each taking
+  the `entered` handoff so the loop's `Add` happens-before `Shutdown`), and
+  `AdmissionBranches` (already failed / in_flight / passed at admission, an
+  unresolved post-merge head, a re-anchor error, no installation, and a
+  pending-replacement trigger-append failure, which TODAY ejects
+  `pass_not_startable`).
 
 ## Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 

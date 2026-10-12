@@ -582,6 +582,11 @@ type fakeUploader struct {
 	// is last-wins), so the bound-then-re-bound sequence is observable.
 	acceptanceLimitBytes int
 	acceptanceBodies     [][]byte
+	// beforeShip, when non-nil, runs at the TOP of ShipTrace (kind "trace")
+	// and ShipAcceptance (kind "acceptance"), before any recording or error
+	// return, so a test can observe host state at the instant of each
+	// terminal egress (#4308: the preview teardown must already be done).
+	beforeShip func(kind string)
 	// Progress-report seam (#2541): records every ReportStageProgress call,
 	// guarded by a mutex because the tee POSTs from an async goroutine.
 	progressMu      sync.Mutex
@@ -749,6 +754,9 @@ func (f *fakeUploader) FetchPrompt(_ context.Context, args upload.FetchPromptArg
 }
 
 func (f *fakeUploader) ShipTrace(_ context.Context, args upload.ShipArgs) (*upload.ShipResult, error) {
+	if f.beforeShip != nil {
+		f.beforeShip("trace")
+	}
 	a := args
 	f.gotShipCalls = append(f.gotShipCalls, a)
 	if f.gotShipArgs == nil {
@@ -791,6 +799,9 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 // Records the args (body + signing key) so tests can assert the runner
 // shipped the redacted verdict with the issued run key.
 func (f *fakeUploader) ShipAcceptance(_ context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error) {
+	if f.beforeShip != nil {
+		f.beforeShip("acceptance")
+	}
 	a := args
 	f.gotAcceptanceArgs = &a
 	f.acceptanceBodies = append(f.acceptanceBodies, append([]byte(nil), args.Body...))
