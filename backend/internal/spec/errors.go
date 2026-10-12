@@ -1,6 +1,10 @@
 package spec
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+)
 
 // YAMLError is returned when the input is not parseable as YAML or is
 // empty. The Cause is the underlying yaml package error, useful for
@@ -31,6 +35,13 @@ func (e *YAMLError) Unwrap() error { return e.Cause }
 type SchemaError struct {
 	Path    string
 	Message string
+
+	// leafKind is the schema keyword kind of the deepest failing leaf
+	// (e.g. *kind.Not, *kind.Pattern), recorded by schemaErrorFrom so a
+	// test can pin WHICH rule rejected a document, not just where (#4311 /
+	// f8ae15a1). It is nil on every hand-built SchemaError (v2removed,
+	// v2reuse, version routing) and is not part of Error().
+	leafKind jsonschema.ErrorKind
 }
 
 func (e *SchemaError) Error() string {

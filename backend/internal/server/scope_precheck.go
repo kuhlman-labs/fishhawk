@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -171,11 +172,13 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 // no implement stage.
 //
 // Only the path/scope-knowable constraints survive the flatten:
-// forbidden_paths, allowed_paths, and max_files_changed — plus the
-// built-in agent_instruction_paths, applied from the stage's
-// AgentInstructionPathsRule by applyAgentInstructionPolicy, exactly as
-// the post-implement gate applies it, so a plan scoping an
-// agent-instruction path is flagged at the plan gate. RequiredOutcomes
+// forbidden_paths, allowed_paths, and max_files_changed — read from the
+// FIRST implement stage (a documented limitation; keyed per stage by #4345),
+// whose ID is also the one returned — plus the built-in
+// agent_instruction_paths, folded STRICTEST across every implement stage by
+// strictestAgentInstructionPolicy (#4311), so a plan scoping an
+// agent-instruction path is flagged at the plan gate whenever some implement
+// stage's post-implement gate would flag it. RequiredOutcomes
 // is deliberately dropped — at plan time tests_added_or_updated run
 // against scope.files would flag any plan that doesn't enumerate a test
 // file (the implement agent routinely adds tests beyond scope), and
@@ -198,14 +201,67 @@ func (s *Server) resolveImplementConstraints(ctx context.Context, runRow *run.Ru
 	if !ok {
 		return policy.Constraints{}, "", false
 	}
+	var implStages []spec.Stage
 	for _, st := range wf.Stages {
 		if st.Type == spec.StageTypeImplement {
-			c := flattenPathConstraints(st.Constraints)
-			applyAgentInstructionPolicy(st, &c)
-			return c, st.ID, true
+			implStages = append(implStages, st)
 		}
 	}
-	return policy.Constraints{}, "", false
+	if len(implStages) == 0 {
+		return policy.Constraints{}, "", false
+	}
+	first := implStages[0]
+	c := flattenPathConstraints(first.Constraints)
+	c.AgentInstructionPaths = strictestAgentInstructionPolicy(implStages)
+	return c, first.ID, true
+}
+
+// strictestAgentInstructionPolicy folds the built-in agent_instruction_paths
+// rule across every implement stage into the STRICTEST one (#4311). A plan
+// does not say which implement stage writes which file, so the advisory
+// flags path p iff SOME implement stage's post-implement gate would flag it:
+// enforced when any stage enforces, with Writable the sorted INTERSECTION of
+// the ENFORCING stages' lists (nil when that intersection is empty, so the
+// default shape stays {}). An opted-out stage flags nothing, so it narrows
+// nothing: counting it as an empty list would flag paths no gate flags.
+// Returns nil when no implement stage enforces. Each stage is mapped through
+// applyAgentInstructionPolicy, so the one spec->policy mapping stays the only
+// one.
+func strictestAgentInstructionPolicy(stages []spec.Stage) *policy.AgentInstructionPathsConfig {
+	var (
+		enforcing int
+		common    map[string]bool
+	)
+	for _, st := range stages {
+		var c policy.Constraints
+		applyAgentInstructionPolicy(st, &c)
+		if c.AgentInstructionPaths == nil {
+			continue
+		}
+		enforcing++
+		w := map[string]bool{}
+		for _, p := range c.AgentInstructionPaths.Writable {
+			w[p] = true
+		}
+		if common == nil {
+			common = w
+			continue
+		}
+		for p := range common {
+			if !w[p] {
+				delete(common, p)
+			}
+		}
+	}
+	if enforcing == 0 {
+		return nil
+	}
+	out := &policy.AgentInstructionPathsConfig{}
+	for p := range common {
+		out.Writable = append(out.Writable, p)
+	}
+	sort.Strings(out.Writable)
+	return out
 }
 
 // applyAgentInstructionPolicy maps the stage's resolved built-in
@@ -213,9 +269,11 @@ func (s *Server) resolveImplementConstraints(ctx context.Context, runRow *run.Ru
 // E80.12 / #3942) onto c: an enforced stage gets a non-nil config carrying
 // its exact writable exemptions, and an unenforced one (a non-implement
 // stage, or an implement stage that opted out with enforce: false) is left
-// nil, i.e. not applied. It is the ONE mapping both the post-implement gate
-// (loadStageConstraintsFromCache) and the plan-gate scope precheck
-// (resolveImplementConstraints) call, so the two cannot disagree.
+// nil, i.e. not applied. It is the ONE mapping both gates call, so the two
+// cannot disagree: the post-implement gate (loadStageConstraintsFromCache)
+// per EVALUATED stage, and the plan-gate scope precheck
+// (resolveImplementConstraints) per implement stage, folded strictest by
+// strictestAgentInstructionPolicy (#4311).
 func applyAgentInstructionPolicy(st spec.Stage, c *policy.Constraints) {
 	enforced, writable := st.AgentInstructionPathsRule()
 	if !enforced {

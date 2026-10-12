@@ -60,6 +60,11 @@ type policyRunRepo struct {
 	stage       *run.Stage
 	runRow      *run.Run
 	transitions []approvalTransition
+	// siblings are the run's OTHER stage rows, returned by ListStagesForRun
+	// after stage so the per-stage agent_instruction_paths resolution (#4311)
+	// sees a realistic multi-row run. listErr, when set, fails that read.
+	siblings []*run.Stage
+	listErr  error
 }
 
 func newPolicyRunRepo(stage *run.Stage, runRow *run.Run) *policyRunRepo {
@@ -121,7 +126,10 @@ func (r *policyRunRepo) CreateStage(context.Context, run.CreateStageParams) (*ru
 	return nil, errors.New("not used")
 }
 func (r *policyRunRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, errors.New("not used")
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	return append([]*run.Stage{r.stage}, r.siblings...), nil
 }
 func (r *policyRunRepo) ListStagesAwaitingApproval(context.Context) ([]*run.Stage, error) {
 	return nil, errors.New("not used")
@@ -1717,4 +1725,265 @@ func TestApplyAgentInstructionPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Stage-body constraint fragments for the per-implement-stage fixtures (#4311).
+const (
+	aipOptOut         = "        constraints:\n          agent_instruction_paths:\n            enforce: false\n"
+	aipWritableAgents = "        constraints:\n          agent_instruction_paths:\n            writable: [AGENTS.md]\n"
+)
+
+// v2TwoImplementSpec is a workflow-v2 feature_change with TWO implement stages,
+// both producing pull_request, carrying the given constraint fragments.
+func v2TwoImplementSpec(first, second string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement_a
+        type: implement
+        executor:
+          agent: claude-code
+` + first + `        produces:
+          - artifact: pull_request
+      - id: implement_b
+        type: implement
+        executor:
+          agent: claude-code
+` + second + `        produces:
+          - artifact: pull_request
+`
+}
+
+// v2PlanOnlySpec is a workflow-v2 feature_change declaring NO implement stage.
+const v2PlanOnlySpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// TestShipTrace_PolicyReEval_AgentInstructionPaths_PerImplementStage is the
+// CROSS-LAYER pin for #4311: with two implement stages, the built-in is
+// resolved from the EVALUATED run stage's own spec stage (type ordinal), so
+// one stage's opt-out or broad writable list never covers the other's diff.
+// Driven bundle -> reEvaluatePolicy -> loadStageConstraintsFromCache ->
+// policy.Evaluate -> the policy_evaluated row -> stage state.
+func TestShipTrace_PolicyReEval_AgentInstructionPaths_PerImplementStage(t *testing.T) {
+	cases := []struct {
+		name         string
+		first        string
+		second       string
+		evalSecond   bool // the trace belongs to the run row at Sequence 1
+		path         string
+		wantPassed   bool
+		wantApplied  *policy.AgentInstructionPathsConfig
+		wantViolFile string
+	}{
+		{
+			name:         "(a) stage 1 opt-out does not cover stage 2's CLAUDE.md",
+			first:        aipOptOut,
+			second:       aipWritableAgents,
+			evalSecond:   true,
+			path:         "CLAUDE.md",
+			wantApplied:  &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}},
+			wantViolFile: "CLAUDE.md",
+		},
+		{
+			name:        "(b) stage 2's own writable exempts its AGENTS.md",
+			first:       aipOptOut,
+			second:      aipWritableAgents,
+			evalSecond:  true,
+			path:        "AGENTS.md",
+			wantPassed:  true,
+			wantApplied: &policy.AgentInstructionPathsConfig{Writable: []string{"AGENTS.md"}},
+		},
+		{
+			name:       "(c) stage 1 keeps its own opt-out",
+			first:      aipOptOut,
+			second:     aipWritableAgents,
+			evalSecond: false,
+			path:       "CLAUDE.md",
+			wantPassed: true,
+		},
+		{
+			name:         "(d) stage 1's broad writable does not cover stage 2's AGENTS.md",
+			first:        aipWritableAgents,
+			second:       "",
+			evalSecond:   true,
+			path:         "AGENTS.md",
+			wantApplied:  &policy.AgentInstructionPathsConfig{},
+			wantViolFile: "AGENTS.md",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []map[string]string{{"path": tc.path, "status": "M"}}
+			s, sf, repo, au := newPolicyTraceServer(t, files)
+			repo.runRow.WorkflowSpec = []byte(v2TwoImplementSpec(tc.first, tc.second))
+			sibling := &run.Stage{ID: uuid.New(), RunID: repo.runRow.ID, Type: run.StageTypeImplement}
+			if tc.evalSecond {
+				sibling.Sequence, repo.stage.Sequence = 0, 1
+			} else {
+				repo.stage.Sequence, sibling.Sequence = 0, 1
+			}
+			repo.siblings = []*run.Stage{sibling}
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, files), "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			pl := decodePolicyPayload(t, au)
+			if pl.SkipReason != "" {
+				t.Fatalf("policy evaluation skipped (%s: %s); the cached v2 spec must resolve", pl.SkipReason, pl.SkipDetail)
+			}
+			if !reflect.DeepEqual(pl.Applied.AgentInstructionPaths, tc.wantApplied) {
+				t.Errorf("applied agent_instruction_paths = %+v, want %+v", pl.Applied.AgentInstructionPaths, tc.wantApplied)
+			}
+			if pl.Passed != tc.wantPassed {
+				t.Errorf("passed = %v, want %v (violations %+v)", pl.Passed, tc.wantPassed, pl.Violations)
+			}
+			if tc.wantPassed {
+				if len(pl.Violations) != 0 {
+					t.Errorf("violations = %+v, want none", pl.Violations)
+				}
+				if repo.stage.State != run.StageStateAwaitingApproval {
+					t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+				}
+				return
+			}
+			if len(pl.Violations) != 1 || pl.Violations[0].Constraint != "agent_instruction_paths" ||
+				!reflect.DeepEqual(pl.Violations[0].Files, []string{tc.wantViolFile}) {
+				t.Errorf("violations = %+v, want one agent_instruction_paths violation naming %q", pl.Violations, tc.wantViolFile)
+			}
+			if repo.stage.State != run.StageStateFailed {
+				t.Errorf("stage state = %q, want failed", repo.stage.State)
+			}
+			if repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
+				t.Errorf("FailureCategory = %v, want B", repo.stage.FailureCategory)
+			}
+		})
+	}
+}
+
+// TestLoadStageConstraintsFromCache_AgentInstructionPaths_FailClosed pins one
+// arm per way the evaluated implement stage can fail to map to its own spec
+// stage (#4311): each FAILS CLOSED to the built-in enforced with no writable
+// list. Every fixture's only implement spec stage declares enforce: false, so a
+// fail-OPEN fallback (nil) and a first-of-type fallback (the opt-out, nil) are
+// both distinguishable from the fail-closed &{}.
+func TestLoadStageConstraintsFromCache_AgentInstructionPaths_FailClosed(t *testing.T) {
+	enforcedNoWritable := &policy.AgentInstructionPathsConfig{}
+	optOutSpec := []byte(v2AgentPathsSpec(aipOptOut))
+
+	t.Run("m1 list stages error", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = optOutSpec
+		repo.listErr = errors.New("db down")
+		c, reason, detail, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, repo.stage)
+		if !ok || reason != "" {
+			t.Fatalf("ok=%v reason=%q detail=%q, want an evaluation", ok, reason, detail)
+		}
+		if !reflect.DeepEqual(c.AgentInstructionPaths, enforcedNoWritable) {
+			t.Errorf("AgentInstructionPaths = %+v, want %+v (fail closed)", c.AgentInstructionPaths, enforcedNoWritable)
+		}
+	})
+
+	t.Run("m2 evaluated stage absent from the run's rows", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = optOutSpec
+		// The listed rows carry only repo.stage; the evaluated row is another.
+		evaluated := &run.Stage{ID: uuid.New(), RunID: repo.runRow.ID, Type: run.StageTypeImplement}
+		c, reason, detail, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, evaluated)
+		if !ok || reason != "" {
+			t.Fatalf("ok=%v reason=%q detail=%q, want an evaluation", ok, reason, detail)
+		}
+		if !reflect.DeepEqual(c.AgentInstructionPaths, enforcedNoWritable) {
+			t.Errorf("AgentInstructionPaths = %+v, want %+v (fail closed)", c.AgentInstructionPaths, enforcedNoWritable)
+		}
+	})
+
+	t.Run("m3 type ordinal past the spec's implement stages", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = optOutSpec
+		repo.stage.Sequence = 1
+		repo.siblings = []*run.Stage{{ID: uuid.New(), RunID: repo.runRow.ID, Type: run.StageTypeImplement, Sequence: 0}}
+		c, reason, detail, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, repo.stage)
+		if !ok || reason != "" {
+			t.Fatalf("ok=%v reason=%q detail=%q, want an evaluation", ok, reason, detail)
+		}
+		if !reflect.DeepEqual(c.AgentInstructionPaths, enforcedNoWritable) {
+			t.Errorf("AgentInstructionPaths = %+v, want %+v (fail closed)", c.AgentInstructionPaths, enforcedNoWritable)
+		}
+	})
+
+	t.Run("m4 implement type absent from the spec is evaluated, not skipped", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = []byte(v2PlanOnlySpec)
+		c, reason, detail, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, repo.stage)
+		if !ok || reason != "" {
+			t.Fatalf("ok=%v reason=%q detail=%q, want an evaluation (no stage_not_in_spec skip)", ok, reason, detail)
+		}
+		if want := (policy.Constraints{AgentInstructionPaths: enforcedNoWritable}); !reflect.DeepEqual(c, want) {
+			t.Errorf("constraints = %+v, want the built-in alone %+v", c, want)
+		}
+	})
+
+	t.Run("m4 through shipRequest: AGENTS.md fails category B with no skip reason", func(t *testing.T) {
+		files := []map[string]string{{"path": "AGENTS.md", "status": "M"}}
+		s, sf, repo, au := newPolicyTraceServer(t, files)
+		repo.runRow.WorkflowSpec = []byte(v2PlanOnlySpec)
+		priv, _ := sf.issue(t, repo.runRow.ID)
+
+		w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, makeTestBundle(t, files), "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		pl := decodePolicyPayload(t, au)
+		if pl.SkipReason != "" || pl.Passed {
+			t.Fatalf("payload skip_reason=%q passed=%v, want an evaluated failure", pl.SkipReason, pl.Passed)
+		}
+		if !reflect.DeepEqual(pl.Applied.AgentInstructionPaths, enforcedNoWritable) {
+			t.Errorf("applied agent_instruction_paths = %+v, want %+v", pl.Applied.AgentInstructionPaths, enforcedNoWritable)
+		}
+		if len(pl.Violations) != 1 || pl.Violations[0].Constraint != "agent_instruction_paths" ||
+			!reflect.DeepEqual(pl.Violations[0].Files, []string{"AGENTS.md"}) {
+			t.Errorf("violations = %+v, want one agent_instruction_paths violation naming AGENTS.md", pl.Violations)
+		}
+		if repo.stage.State != run.StageStateFailed ||
+			repo.stage.FailureCategory == nil || *repo.stage.FailureCategory != run.FailureB {
+			t.Errorf("stage state = %q category = %v, want failed / B", repo.stage.State, repo.stage.FailureCategory)
+		}
+	})
+
+	t.Run("g1 non-implement type absent from the spec still skips", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = []byte(v2AgentPathsSpec(""))
+		repo.stage.Type = run.StageTypeAcceptance
+		_, reason, _, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, repo.stage)
+		if ok || reason != policy.SkipStageNotInSpec {
+			t.Fatalf("ok=%v reason=%q, want a stage_not_in_spec skip", ok, reason)
+		}
+	})
+
+	t.Run("g2 non-implement stage never gets the built-in, even on a list error", func(t *testing.T) {
+		s, _, repo, _ := newPolicyTraceServer(t, nil)
+		repo.runRow.WorkflowSpec = []byte(v2PlanOnlySpec)
+		repo.stage.Type = run.StageTypePlan
+		repo.listErr = errors.New("db down")
+		c, reason, detail, ok := s.loadStageConstraintsFromCache(context.Background(), repo.runRow, repo.stage)
+		if !ok || reason != "" {
+			t.Fatalf("ok=%v reason=%q detail=%q, want an evaluation", ok, reason, detail)
+		}
+		if c.AgentInstructionPaths != nil {
+			t.Errorf("AgentInstructionPaths = %+v, want nil for a plan stage", c.AgentInstructionPaths)
+		}
+	})
 }
