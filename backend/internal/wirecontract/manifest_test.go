@@ -475,3 +475,47 @@ func TestSeedManifest_RegistersGateIsolationEvidencePair(t *testing.T) {
 		}
 	}
 }
+
+// TestSeedManifest_RegistersVerifyFlakeAbsorbedEvidencePair pins the #4229
+// registration: the runner's flat flakeAbsorbedEvidence is paired EXACT with
+// bundle.FlakeAbsorbedEvidence, resolving to the tree_sha, tests and
+// patch_coverage fields on both sides — so dropping the row or a field fails
+// here rather than leaving the audit row's source unguarded.
+func TestSeedManifest_RegistersVerifyFlakeAbsorbedEvidencePair(t *testing.T) {
+	m := SeedManifest()
+	var pair *Pair
+	for i := range m.Pairs {
+		if m.Pairs[i].Name == "verify_flake_absorbed_evidence" {
+			pair = &m.Pairs[i]
+		}
+	}
+	if pair == nil {
+		t.Fatal("seed manifest has no verify_flake_absorbed_evidence pair")
+	}
+	if pair.Mode != ModeExact {
+		t.Errorf("verify_flake_absorbed_evidence mode = %v, want ModeExact", pair.Mode)
+	}
+	if pair.Emitter != (Endpoint{File: runnerGateEvidenceGo, Type: "flakeAbsorbedEvidence"}) ||
+		pair.Consumer != (Endpoint{File: bundleGo, Type: "FlakeAbsorbedEvidence"}) {
+		t.Errorf("verify_flake_absorbed_evidence endpoints = %+v -> %+v", pair.Emitter, pair.Consumer)
+	}
+	root, err := RepoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	for _, ep := range []Endpoint{pair.Emitter, pair.Consumer} {
+		fields, err := ExtractStruct(filepath.Join(root, filepath.FromSlash(ep.File)), ep.Type)
+		if err != nil {
+			t.Fatalf("extract %s.%s: %v", ep.File, ep.Type, err)
+		}
+		names := map[string]bool{}
+		for _, f := range fields {
+			names[f.JSONName] = true
+		}
+		for _, want := range []string{"tree_sha", "tests", "patch_coverage"} {
+			if !names[want] {
+				t.Errorf("%s.%s carries no %s wire field: %+v", ep.File, ep.Type, want, fields)
+			}
+		}
+	}
+}

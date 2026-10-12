@@ -2189,3 +2189,61 @@ func TestExtractGateEvidence_NoCounterfactualObservationsIsNil(t *testing.T) {
 		t.Errorf("CounterfactualObservations = %+v, want nil", ge.CounterfactualObservations)
 	}
 }
+
+// TestGateEvidence_DecodesFlakeAbsorbedGolden is the BACKEND half of the #4229
+// verify_flake_absorbed_evidence seam: the shared golden
+// testdata/wire/verify_flake_absorbed_evidence.json — the bytes the runner's
+// composeGateEvidence marshals — decodes through ExtractGateEvidence into
+// FlakeAbsorbedEvidence with every field the runner wrote, and re-encodes to
+// the SAME bytes (a dropped or renamed field would lose bytes on the trip).
+func TestGateEvidence_DecodesFlakeAbsorbedGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "verify_flake_absorbed_evidence.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	golden := strings.TrimSuffix(string(raw), "\n")
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, golden))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	fa := ge.FlakeAbsorbed
+	if fa == nil {
+		t.Fatal("FlakeAbsorbed = nil, want the golden member")
+	}
+	want := FlakeAbsorbedEvidence{
+		Iteration: 2,
+		TreeSHA:   "c1e8a4f7b2d9e6a3c0f5b8d1e4a7c2f9b6d3e0a5",
+		Packages: []string{
+			"github.com/kuhlman-labs/fishhawk/backend/internal/run",
+			"github.com/kuhlman-labs/fishhawk/runner/internal/upload",
+		},
+		PackageDirs:   []string{"backend/internal/run", "runner/internal/upload"},
+		Tests:         []string{"TestDispatchLiveness_HeartbeatWindow", "TestShipTrace_TerminalEgressBudget"},
+		FailedModules: []string{"backend", "runner"},
+		PatchCoverage: "pass",
+	}
+	if fmt.Sprintf("%+v", *fa) != fmt.Sprintf("%+v", want) {
+		t.Fatalf("FlakeAbsorbed = %+v\nwant %+v", *fa, want)
+	}
+	reencoded, err := json.Marshal(struct {
+		FlakeAbsorbed *FlakeAbsorbedEvidence `json:"flake_absorbed"`
+	}{fa})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reencoded) != golden {
+		t.Fatalf("re-encode drifted from the shared golden:\n got %s\nwant %s", reencoded, golden)
+	}
+}
+
+// TestExtractGateEvidence_NoFlakeAbsorbedIsNil: an older bundle's
+// gate_evidence (no flake_absorbed key) decodes to a nil member.
+func TestExtractGateEvidence_NoFlakeAbsorbedIsNil(t *testing.T) {
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ge.FlakeAbsorbed != nil {
+		t.Errorf("FlakeAbsorbed = %+v, want nil", ge.FlakeAbsorbed)
+	}
+}
