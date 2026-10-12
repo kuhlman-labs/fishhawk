@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -314,16 +317,23 @@ func TestValidate_AgentInstructionPaths_DirectBranches(t *testing.T) {
 // SchemaError, never a ValidationError, because the shipped canonical schema
 // (and therefore both mirrors) answers first.
 func TestSchema_AgentInstructionPaths_Rejected(t *testing.T) {
+	const aip = "/workflows/wf/stages/0/constraints/agent_instruction_paths"
+	// wantKind is a zero value of the jsonschema/v6 keyword kind the deepest
+	// leaf must carry, compared by dynamic type: it pins WHICH rule rejected
+	// the row (f8ae15a1), so a row rejected by some other keyword at the same
+	// location fails instead of passing for the wrong reason.
 	cases := []struct {
-		name string
-		doc  []byte
+		name     string
+		doc      []byte
+		wantPath string
+		wantKind jsonschema.ErrorKind
 	}{
 		// enforce:false and writable are each valid alone; only the `not`
 		// clause rejects the pair.
-		{"enforce false together with writable", aipV2Doc("implement", "            enforce: false\n            writable: [AGENTS.md]\n", aipProducesPR)},
-		{"glob metacharacter in writable", aipV2Doc("implement", "            writable: [\"**/AGENTS.md\"]\n", aipProducesPR)},
-		{"brace glob in writable", aipV2Doc("implement", "            writable: [\"{AGENTS,CLAUDE}.md\"]\n", aipProducesPR)},
-		{"leading slash in writable", aipV2Doc("implement", "            writable: [/AGENTS.md]\n", aipProducesPR)},
+		{"enforce false together with writable", aipV2Doc("implement", "            enforce: false\n            writable: [AGENTS.md]\n", aipProducesPR), aip, &kind.Not{}},
+		{"glob metacharacter in writable", aipV2Doc("implement", "            writable: [\"**/AGENTS.md\"]\n", aipProducesPR), aip + "/writable/0", &kind.Pattern{}},
+		{"brace glob in writable", aipV2Doc("implement", "            writable: [\"{AGENTS,CLAUDE}.md\"]\n", aipProducesPR), aip + "/writable/0", &kind.Pattern{}},
+		{"leading slash in writable", aipV2Doc("implement", "            writable: [/AGENTS.md]\n", aipProducesPR), aip + "/writable/0", &kind.Pattern{}},
 		{"empty object", []byte(`version: "2"
 workflows:
   wf:
@@ -336,9 +346,9 @@ workflows:
           agent_instruction_paths: {}
         produces:
           - artifact: pull_request
-`)},
-		{"empty writable list", aipV2Doc("implement", "            writable: []\n", aipProducesPR)},
-		{"unknown member", aipV2Doc("implement", "            readable: [AGENTS.md]\n", aipProducesPR)},
+`), aip, &kind.MinProperties{}},
+		{"empty writable list", aipV2Doc("implement", "            writable: []\n", aipProducesPR), aip + "/writable", &kind.MinItems{}},
+		{"unknown member", aipV2Doc("implement", "            readable: [AGENTS.md]\n", aipProducesPR), aip, &kind.AdditionalProperties{}},
 		{"v1 document declaring the key", []byte(`version: "1.6"
 workflows:
   feature_change:
@@ -352,7 +362,7 @@ workflows:
               enforce: false
         produces:
           - artifact: pull_request
-`)},
+`), "/workflows/feature_change/stages/0/constraints/0", &kind.AdditionalProperties{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -361,8 +371,12 @@ workflows:
 			if !errors.As(err, &se) {
 				t.Fatalf("err = %T (%v), want *SchemaError", err, err)
 			}
-			if !strings.Contains(se.Path, "/constraints") {
-				t.Errorf("SchemaError.Path = %q, want it under /constraints", se.Path)
+			if se.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q", se.Path, tc.wantPath)
+			}
+			gotKind := spec.SchemaErrorLeafKind(se)
+			if reflect.TypeOf(gotKind) != reflect.TypeOf(tc.wantKind) {
+				t.Errorf("SchemaError leaf kind = %T (%v), want %T", gotKind, se, tc.wantKind)
 			}
 		})
 	}

@@ -1087,7 +1087,7 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 
 	// Constraints: load from the cached spec on the run row (#283).
 	// Failures are categorized so the audit signals the right cause.
-	constraints, skipReason, skipDetail, ok := s.loadStageConstraintsFromCache(runRow, stageType)
+	constraints, skipReason, skipDetail, ok := s.loadStageConstraintsFromCache(ctx, runRow, stage)
 	if !ok {
 		logger.LogAttrs(ctx, slog.LevelWarn, "policy: load constraints skipped",
 			slog.String("run_id", runID.String()),
@@ -1268,14 +1268,26 @@ func (s *Server) emitPolicySkipped(ctx context.Context, runID, stageID uuid.UUID
 // can't yield constraints — the caller emits a skip audit with the
 // reason and treats the stage as policy-pass.
 //
+// The built-in agent_instruction_paths rule (E80.12 / #3942) is resolved
+// from the EVALUATED stage's own spec stage (agentInstructionStage, #4311),
+// so a relaxation declared on one implement stage never covers another.
+// Every other post-hoc constraint is still read from the FIRST spec stage
+// of the evaluated type — a documented limitation (docs/spec/workflow-v2.md)
+// whose follow-up is #4345. An IMPLEMENT stage whose type is absent from the
+// resolved workflow is evaluated against the built-in alone rather than
+// skipped as stage_not_in_spec; only the three spec-level skips (no cached
+// spec, unparseable, workflow absent) evaluate nothing, the built-in
+// included.
+//
 // Pre-#283 this called GitHub directly using `runRow.WorkflowSHA` as
 // the contents-API `ref`, but that's a blob SHA, not a commit / branch
 // ref — GitHub returned 404, the function errored, and the trace
 // handler skipped the audit emission, leaving the SPA's <PolicySection>
 // stuck on "pending."
-func (*Server) loadStageConstraintsFromCache(runRow *run.Run, stageType string) (
+func (s *Server) loadStageConstraintsFromCache(ctx context.Context, runRow *run.Run, stage *run.Stage) (
 	policy.Constraints, policy.SkipReason, string, bool,
 ) {
+	stageType := string(stage.Type)
 	if len(runRow.WorkflowSpec) == 0 {
 		// Legacy row created before #283's migration, or a CLI / UI
 		// flow that didn't fetch a spec. No constraints to evaluate
@@ -1295,17 +1307,65 @@ func (*Server) loadStageConstraintsFromCache(runRow *run.Run, stageType string) 
 	}
 	for _, stg := range wf.Stages {
 		if string(stg.Type) == stageType {
+			// FIRST-OF-TYPE for every other post-hoc constraint: a later
+			// same-type stage's declaration validates but is not read here
+			// (documented limitation; keyed per stage by #4345).
 			c := mergeConstraints(stg.Constraints)
-			// The built-in agent_instruction_paths constraint (E80.12 /
-			// #3942) is applied HERE, on the success path only: it is
-			// resolved from the stage's cached spec, so every skip return
-			// above evaluates nothing, the built-in included.
-			applyAgentInstructionPolicy(stg, &c)
+			applyAgentInstructionPolicy(s.agentInstructionStage(ctx, wf, runRow, stage), &c)
 			return c, "", "", true
 		}
 	}
+	if stage.Type == run.StageTypeImplement {
+		// No spec stage of this type at all (#4311): never skip an
+		// implement stage — evaluate it against the built-in alone,
+		// through the same fail-closed fallback.
+		var c policy.Constraints
+		applyAgentInstructionPolicy(s.agentInstructionStage(ctx, wf, runRow, stage), &c)
+		return c, "", "", true
+	}
 	return policy.Constraints{}, policy.SkipStageNotInSpec,
 		fmt.Sprintf("stage_type %q not in workflow %q", stageType, runRow.WorkflowID), false
+}
+
+// agentInstructionStage returns the spec stage whose built-in
+// agent_instruction_paths rule binds the EVALUATED run stage (#4311): its own
+// spec stage by type ordinal (specStageForRunStage), so the k-th implement
+// row reads the k-th implement spec stage's opt-out or writable list and
+// never the first one's.
+//
+// A non-implement stage short-circuits to a constraint-free stage of its own
+// type (the rule is implement-only, so it resolves to not-enforced) without
+// listing the run's stages.
+//
+// For an implement stage it FAILS CLOSED, unlike specStageForRunStage's other
+// callers: on a list error, a stage absent from the rows, an ordinal past the
+// workflow's implement stages, or no implement spec stage at all, it WARN-logs
+// and returns a constraint-free implement stage, which AgentInstructionPathsRule
+// resolves to enforced with no writable list. A missed budget ceiling is a gap,
+// but a missed instruction-path guard is the leak #4311 closes. The fallback
+// goes through the one rule method so the default lives in one place.
+func (s *Server) agentInstructionStage(ctx context.Context, wf spec.Workflow, runRow *run.Run, stage *run.Stage) spec.Stage {
+	if stage.Type != run.StageTypeImplement {
+		return spec.Stage{Type: spec.StageType(stage.Type)}
+	}
+	failClosed := func(reason string) spec.Stage {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"policy: evaluated stage has no resolvable spec stage — agent_instruction_paths enforced with no writable list",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("stage_type", string(stage.Type)),
+			slog.String("reason", reason))
+		return spec.Stage{Type: spec.StageTypeImplement}
+	}
+	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		return failClosed("list stages failed: " + err.Error())
+	}
+	def, ok := specStageForRunStage(wf, rows, stage)
+	if !ok {
+		return failClosed("stage absent from the run's rows, or no implement spec stage at its type ordinal")
+	}
+	return def
 }
 
 // mergeConstraints folds the spec's []spec.Constraint (each entry a
