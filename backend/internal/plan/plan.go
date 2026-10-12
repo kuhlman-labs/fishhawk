@@ -167,6 +167,58 @@ type Plan struct {
 	// whitespace-only value and any value paired with an absent or full
 	// Delivery. Additive-optional within standard_v1.
 	RemainingScope string `json:"remaining_scope,omitempty"`
+	// Counterfactuals are the plan's optional runner-executed counterfactuals
+	// (E85.3 / #4143): for each entry the implement runner mutates ControlPath
+	// in a scratch clone of the verified head, runs the named Go tests, and
+	// records whether they went RED. checkCounterfactuals, run by both
+	// semanticCheck (Parse) and Validate (the plan-upload path), enforces the
+	// rules the schema cannot express, including the MaxCounterfactuals cap (the
+	// schema carries no maxItems: an unsupported keyword would reach every plan
+	// stage's structured-output schema). Additive-optional within standard_v1;
+	// the field must exist on the struct because plan.Parse strict-decodes with
+	// DisallowUnknownFields. JSON tags mirror the counterfactual $def.
+	Counterfactuals []Counterfactual `json:"counterfactuals,omitempty"`
+}
+
+// MaxCounterfactuals is the most entries Plan.Counterfactuals may carry (E85.3
+// / #4143). It bounds the runner's counterfactual phase (each entry is a
+// baseline plus a mutated go test run). Enforced by checkCounterfactuals, not
+// by a schema maxItems.
+const MaxCounterfactuals = 8
+
+// CounterfactualExpectRed is the only defined Counterfactual.Expect value: the
+// named tests must FAIL with the control mutated.
+const CounterfactualExpectRed = "red"
+
+// Counterfactual is one entry in Plan.Counterfactuals (E85.3 / #4143): mutate
+// the production control at ControlPath and expect Tests to go RED. Every
+// member is required by the schema, so none carries omitempty and a
+// re-marshalled plan keeps them all. JSON tags mirror the counterfactual $def.
+type Counterfactual struct {
+	ControlPath string                 `json:"control_path"`
+	Mutation    CounterfactualMutation `json:"mutation"`
+	Tests       CounterfactualTests    `json:"tests"`
+	Expect      string                 `json:"expect"`
+}
+
+// CounterfactualMutation is how a Counterfactual mutates its control: exactly
+// one of Find+Replace or Patch (enforced by checkCounterfactuals). Replace is a
+// pointer so an ABSENT replace (a malformed find-only mutation) is
+// distinguishable from an EMPTY one (a deletion of the match); a non-nil
+// pointer to "" survives omitempty, so a re-marshalled deletion keeps its key.
+// JSON tags mirror the counterfactual-mutation $def.
+type CounterfactualMutation struct {
+	Find    string  `json:"find,omitempty"`
+	Replace *string `json:"replace,omitempty"`
+	Patch   string  `json:"patch,omitempty"`
+}
+
+// CounterfactualTests names the Go tests a Counterfactual runs: Run is the go
+// test -run selector and Package the repo-relative package path. JSON tags
+// mirror the counterfactual-tests $def.
+type CounterfactualTests struct {
+	Run     string `json:"run"`
+	Package string `json:"package"`
 }
 
 // Delivery values for Plan.Delivery (E83.52 / #4085). An absent delivery is a
