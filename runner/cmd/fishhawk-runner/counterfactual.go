@@ -11,6 +11,22 @@ package main
 // runPlanCounterfactuals wraps the observations into trace events, and
 // gate_evidence folds the observations it RETURNS, never a stream event.
 //
+// A spec RUNS UNTRUSTED REPOSITORY CODE in the clone (its baseline and mutated
+// `go test`), and the clone's `.git` lives inside that writable tree, so a
+// malicious baseline can append to <clone>/.git/config or plant
+// <clone>/.git/info/attributes. HOST git run against a poisoned clone is a
+// container-to-host escape: a relative core.worktree redirects a
+// `git checkout`/`clean` out of the mount, and a filter.<x>.smudge/clean plus a
+// "* filter=<x>" attribute runs a planted command on the host (gitops.HardeningArgs
+// neutralizes hooks and fsmonitor, but not those). Two defenses close it (H1):
+// each spec gets a FRESH clone — the phase re-materializes from the trusted
+// lineage worktree between specs with os.RemoveAll + MaterializeClone instead
+// of restoring the used clone with git, so spec N+1 never touches spec N's
+// clone with git; and the one git call that must run after untrusted execution,
+// the patch-form `git apply`, runs through cfGitApply under a runner-held
+// GIT_DIR OUTSIDE the clone with the clone's config and attributes pinned off,
+// refusing unless <clone>/.git is the runner's own directory.
+//
 // Classification reads the `go test -json` (test2json) action stream and the
 // gate exec disposition, never free text, and an unmutated baseline must be
 // GREEN before the mutated run counts — so an environment failure can never
@@ -19,6 +35,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,6 +45,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -35,6 +53,7 @@ import (
 	"golang.org/x/mod/modfile"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -174,10 +193,15 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 }
 
 // runCounterfactualPhase executes specs strictly sequentially and returns
-// exactly one observation per spec, in spec order. It materializes ONE scratch
-// clone at headSHA (never repoDir), restores it between specs, and removes it
-// at the end. A failed restore poisons the clone, so every later spec records
-// error/restore_failed instead of running on a mutated tree.
+// exactly one observation per spec, in spec order. Each spec runs against a
+// FRESH clone of headSHA (never repoDir's working tree): the phase materializes
+// one, executes a spec, then — because that spec ran untrusted repository code
+// in the clone and may have poisoned its <clone>/.git — re-materializes a clean
+// clone from the trusted lineage worktree for the NEXT spec (os.RemoveAll +
+// x.materialize), never restoring the used clone with host git (H1). A
+// re-materialize that fails leaves no clean tree for the remaining specs, so
+// they record error/restore_failed instead of running on a stale or poisoned
+// one. The last clone is removed with the parent at the end.
 func runCounterfactualPhase(ctx context.Context, x *counterfactualExecutor, repoDir, headSHA, treeSHA string, specs []upload.CounterfactualSpec) []counterfactualObservationEvidence {
 	out := make([]counterfactualObservationEvidence, 0, len(specs))
 	all := func(observed, reason string) []counterfactualObservationEvidence {
@@ -201,18 +225,25 @@ func runCounterfactualPhase(ctx context.Context, x *counterfactualExecutor, repo
 		return all(cfOutcomeError, cfReasonCloneFailed)
 	}
 	phaseStart := x.now()
-	restoreBroken := false
-	for _, s := range specs {
+	cloneBroken := false
+	for i, s := range specs {
 		o := x.baseObservation(s, headSHA, treeSHA)
 		switch {
-		case restoreBroken:
+		case cloneBroken:
 			o.Observed, o.Reason = cfOutcomeError, cfReasonRestoreFailed
 		case x.now().Sub(phaseStart) >= x.phaseBudget:
 			o.Observed, o.Reason = cfOutcomeTimeout, cfReasonPhaseBudget
 		default:
 			o = x.executeCounterfactual(ctx, clone, parent, headSHA, treeSHA, s)
-			if err := restoreCounterfactualClone(ctx, clone, headSHA); err != nil {
-				restoreBroken = true
+			if i < len(specs)-1 {
+				// Discard the (possibly poisoned) clone with a pure-filesystem
+				// RemoveAll — never host git, which a planted core.worktree or
+				// filter would subvert — and clone afresh from the trusted
+				// source for the next spec.
+				_ = os.RemoveAll(clone)
+				if clone, err = x.materialize(ctx, repoDir, headSHA, parent); err != nil {
+					cloneBroken = true
+				}
 			}
 		}
 		out = append(out, o)
@@ -374,7 +405,12 @@ func lstatControlComponents(clone, rel string) (string, error) {
 
 // controlResolvesInsideClone requires abs's EvalSymlinks result to stay
 // inside clone's (so a clone root reached through a symlink, as /var ->
-// /private/var is on macOS, still matches).
+// /private/var is on macOS, still matches). This is DEFENSE IN DEPTH behind
+// lstatControlComponents: that walk already refused every symlink component,
+// so by the time this runs a control resolving outside the clone is reachable
+// only in a walk->EvalSymlinks TOCTOU window (a component swapped to a symlink
+// between the two calls); the os.Root the find/replace mutation goes through is
+// the authority that closes that window on the write itself.
 func controlResolvesInsideClone(clone, abs string) error {
 	realClone, err := filepath.EvalSymlinks(clone)
 	if err != nil {
@@ -640,6 +676,17 @@ func applyCounterfactualMutation(ctx context.Context, clone, scratch string, s u
 	case upload.CounterfactualMutationReplace:
 		return replaceInControlFile(clone, s)
 	case upload.CounterfactualMutationPatch:
+		// The patch form is the ONE mutation path that runs host git after the
+		// baseline executed untrusted repository code in the clone. It runs
+		// through cfGitApply under a runner-held GIT_DIR outside the clone
+		// (gitDir, a sibling of the clone under scratch) so neither
+		// <clone>/.git/config nor <clone>/.git/info/attributes is read: a
+		// planted core.worktree cannot redirect the write out of the clone and
+		// a planted filter cannot run on the host (H1).
+		gitDir := filepath.Join(scratch, "cf-gitdir")
+		if err := os.MkdirAll(gitDir, 0o700); err != nil {
+			return "", cfReasonMutationNotApplied
+		}
 		pf, err := os.CreateTemp(scratch, "counterfactual-*.patch")
 		if err != nil {
 			return "", cfReasonMutationNotApplied
@@ -650,14 +697,14 @@ func applyCounterfactualMutation(ctx context.Context, clone, scratch string, s u
 		if werr != nil || cerr != nil {
 			return "", cfReasonMutationNotApplied
 		}
-		stat, err := gitOut(ctx, clone, "apply", "--numstat", "--summary", patchPath)
+		stat, err := cfGitApply(ctx, clone, gitDir, "apply", "--numstat", "--summary", patchPath)
 		if err != nil {
 			return "", cfReasonMutationNotApplied
 		}
 		if reason := checkPatchConfinedToControl(stat, s.ControlPath); reason != "" {
 			return "", reason
 		}
-		if err := gitRun(ctx, clone, "apply", patchPath); err != nil {
+		if _, err := cfGitApply(ctx, clone, gitDir, "apply", patchPath); err != nil {
 			return "", cfReasonMutationNotApplied
 		}
 		return counterfactualMutationSHA256(s), ""
@@ -730,21 +777,57 @@ func checkPatchConfinedToControl(stat, control string) string {
 	return ""
 }
 
-// restoreCounterfactualClone puts clone back to a clean checkout of headSHA
-// and PROVES it: a non-empty `git status --porcelain` afterwards is an error.
-func restoreCounterfactualClone(ctx context.Context, clone, headSHA string) error {
-	if err := gitRun(ctx, clone, "checkout", "--force", headSHA, "--", "."); err != nil {
-		return err
+// cfGitApply runs a `git apply` against clone's WORK TREE after the baseline
+// has executed untrusted repository code there, reading NONE of the clone's
+// own git metadata (H1). git discovers no repository from the clone because
+// GIT_DIR is pinned to a runner-held directory OUTSIDE the mount (gitDir,
+// created empty — `git apply` needs no repository state there); GIT_WORK_TREE
+// anchors path resolution at the clone; and GIT_CONFIG_NOSYSTEM /
+// GIT_CONFIG_GLOBAL=/dev/null / GIT_ATTR_NOSYSTEM pin off every config and
+// attribute source git would otherwise still consult. A baseline that appended
+// a relative core.worktree, or planted a filter.<x>.smudge/clean plus a
+// "* filter=<x>" line in <clone>/.git/info/attributes, therefore cannot
+// redirect the write out of the clone or run a command on the host.
+// gitops.HardeningArgs is layered on as `-c` overrides for defense in depth.
+// It refuses unless <clone>/.git is the runner's own real directory.
+func cfGitApply(ctx context.Context, clone, gitDir string, args ...string) (string, error) {
+	if err := cloneGitDirOwned(clone); err != nil {
+		return "", err
 	}
-	if err := gitRun(ctx, clone, "clean", "-fdx"); err != nil {
-		return err
+	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
+	cmd.Dir = clone
+	cmd.Env = append(os.Environ(),
+		"GIT_DIR="+gitDir,
+		"GIT_WORK_TREE="+clone,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_ATTR_NOSYSTEM=1",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.String(), fmt.Errorf("git %s: %w: %s",
+			strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	st, err := gitOut(ctx, clone, "status", "--porcelain")
+	return stdout.String(), nil
+}
+
+// cloneGitDirOwned refuses unless <clone>/.git is a real directory the runner
+// itself materialized — not a symlink or gitfile a baseline could have swapped
+// in to redirect git back at the host's repository. The isolated GIT_DIR in
+// cfGitApply already means git never discovers <clone>/.git, so this is a
+// fail-closed guard against the clone's metadata being tampered with, not the
+// primary containment.
+func cloneGitDirOwned(clone string) error {
+	fi, err := os.Lstat(filepath.Join(clone, ".git"))
 	if err != nil {
 		return err
 	}
-	if st != "" {
-		return fmt.Errorf("clone not clean after restore: %s", st)
+	if fi.Mode()&fs.ModeSymlink != 0 || !fi.IsDir() {
+		return fmt.Errorf("clone %q .git is not the runner's own directory", clone)
 	}
 	return nil
 }

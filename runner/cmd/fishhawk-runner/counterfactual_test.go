@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -400,6 +401,125 @@ func TestCounterfactual_BaselinePlantedSymlinkRefused(t *testing.T) {
 	}
 }
 
+// cfPoisonGitDir writes the two container-to-host-escape payloads into
+// <dir>/.git, standing in for untrusted repository code the real baseline runs
+// in the writable checkout: (a) a RELATIVE core.worktree pointing at victimDir
+// (so a host `git checkout`/`clean` would write into — and clean untracked
+// files out of — victimDir), and (b) a filter.<x>.smudge/clean plus a
+// "* filter=<x>" line in .git/info/attributes whose command touches marker (so
+// host git reading the clone's attributes would run it).
+func cfPoisonGitDir(t *testing.T, dir, victimDir, marker string) {
+	t.Helper()
+	gitDir := filepath.Join(dir, ".git")
+	rel, err := filepath.Rel(gitDir, victimDir)
+	if err != nil {
+		t.Fatalf("rel worktree: %v", err)
+	}
+	cfg, err := os.OpenFile(filepath.Join(gitDir, "config"), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open clone config: %v", err)
+	}
+	fmt.Fprintf(cfg, "\n[core]\n\tworktree = %s\n", rel)
+	fmt.Fprintf(cfg, "[filter \"x\"]\n\tsmudge = touch %s\n\tclean = touch %s\n", marker, marker)
+	if err := cfg.Close(); err != nil {
+		t.Fatalf("close clone config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "info"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "info", "attributes"), []byte("* filter=x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCounterfactual_BaselineGitMetadataEscapeContained (H1): a baseline that
+// poisons <clone>/.git with a relative core.worktree pointing at a victim dir
+// and a filter + info/attributes whose command touches a marker must not let
+// host git escape the clone, for BOTH the replace and the patch form. The
+// phase re-clones from the trusted lineage worktree between specs instead of
+// restoring the used clone with git, and the patch-form `git apply` runs under
+// an isolated GIT_DIR — so the victim stays byte-identical, keeps its untracked
+// file, and the marker is never created. COUNTERFACTUAL: restore the clone in
+// place (the pre-H1 `git checkout --force <head> -- . && git clean -fdx`) or
+// apply the patch with plain in-clone gitOut/gitRun → the checkout writes the
+// head tree into the victim, `git clean -fdx` deletes its untracked file, and
+// the filter runs `touch <marker>` on the host → RED.
+func TestCounterfactual_BaselineGitMetadataEscapeContained(t *testing.T) {
+	t.Parallel()
+	repo, head, tree := newCFFixture(t)
+	victimDir := t.TempDir()
+	victimFile := filepath.Join(victimDir, "keep.txt")
+	const victimBody = "do not touch\n"
+	if err := os.WriteFile(victimFile, []byte(victimBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "MARKER")
+	textPatch := cfStagedPatch(t, repo, func() {
+		_ = os.WriteFile(filepath.Join(repo, "ctl.go"), []byte(strings.Replace(cfFixtureFiles["ctl.go"], pinnedFind, "return true", 1)), 0o644)
+	})
+
+	x := newTestCFExecutor(t, repo)
+	var n int
+	x.exec = func(ctx context.Context, argv []string, dir, lc string, to time.Duration) (string, int, gateDisposition) {
+		if argv[1] == "list" {
+			return runBoundedGateArgvDisposed(ctx, argv, dir, lc, to)
+		}
+		cfPoisonGitDir(t, dir, victimDir, marker)
+		n++
+		if n%2 == 1 { // baseline is green, the mutated run red
+			return `{"Action":"pass","Package":"example.com/cf","Test":"TestAllowed"}` + "\n", 0, gateExecuted
+		}
+		return `{"Action":"fail","Package":"example.com/cf","Test":"TestAllowed"}` + "\n", 1, gateExecuted
+	}
+	obs := runCF(t, x, repo, head, tree,
+		replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestAllowed$"),
+		patchSpec(1, "ctl.go", textPatch))
+
+	// The containment properties are asserted FIRST, so a counterfactual that
+	// lets host git escape the clone reddens here (on the security claim) rather
+	// than on an incidental downstream observed-outcome difference.
+	entries, err := os.ReadDir(victimDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "keep.txt" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("victim dir changed: entries=%v, want [keep.txt] (host git escaped the clone via core.worktree)", names)
+	}
+	if got, _ := os.ReadFile(victimFile); string(got) != victimBody {
+		t.Fatalf("victim file modified through core.worktree: %q", got)
+	}
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatalf("filter marker was created on the host (lstat err = %v)", err)
+	}
+
+	wantObs(t, obs[0], cfOutcomeRed, "")
+	wantObs(t, obs[1], cfOutcomeRed, "")
+}
+
+// TestCFGitApply_RefusesForeignGitDir pins cloneGitDirOwned inside cfGitApply:
+// a clone whose .git is a symlink — which a baseline could swap in to point
+// host git back at the primary repository — is refused before any git runs.
+// COUNTERFACTUAL: drop the cloneGitDirOwned call in cfGitApply → `git apply
+// --numstat` on the valid patch succeeds (err == nil) → RED.
+func TestCFGitApply_RefusesForeignGitDir(t *testing.T) {
+	t.Parallel()
+	clone, gitDir := t.TempDir(), t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(clone, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	patch := filepath.Join(t.TempDir(), "p.patch")
+	if err := os.WriteFile(patch, []byte("--- a/ctl.go\n+++ b/ctl.go\n@@ -1 +1 @@\n-package cf\n+package cf2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfGitApply(context.Background(), clone, gitDir, "apply", "--numstat", patch); err == nil || !strings.Contains(err.Error(), "not the runner's own") {
+		t.Fatalf("cfGitApply on a symlinked .git = %v, want the ownership refusal", err)
+	}
+}
+
 // TestReplaceInControlFile_RootRefusesEscape isolates the os.Root half of the
 // mutation boundary: with NO component walk in front of it, a find/replace
 // whose intermediate directory is a symlink out of the clone still neither
@@ -773,20 +893,24 @@ func TestCounterfactual_RestoreFailurePoisonsRemainingSpecs(t *testing.T) {
 	t.Parallel()
 	repo, head, tree := newCFFixture(t)
 	x := newTestCFExecutor(t, repo)
-	// The first spec's control path is invalid, so it runs nothing — but the
-	// clone it would restore is removed underneath the phase, so the restore
-	// fails and every later spec must record restore_failed, not run.
+	// Clone-per-spec: the first spec runs on a fresh clone, then the phase
+	// re-materializes a clean clone for the next spec. Here the re-materialize
+	// fails, so there is no clean tree for spec 1 and it records restore_failed
+	// rather than running on a stale one. COUNTERFACTUAL: drop the cloneBroken
+	// arm in runCounterfactualPhase → spec 1 runs on the stale clone → GREEN,
+	// not restore_failed → RED.
+	var n int
 	x.materialize = func(ctx context.Context, repoDir, headSHA, parent string) (string, error) {
-		wt, err := materializeGateCheckout(ctx, repoDir, headSHA, parent)
-		if err == nil {
-			_ = os.RemoveAll(filepath.Join(wt, ".git"))
+		n++
+		if n >= 2 {
+			return "", os.ErrNotExist
 		}
-		return wt, err
+		return materializeGateCheckout(ctx, repoDir, headSHA, parent)
 	}
 	obs := runCF(t, x, repo, head, tree,
-		replaceSpec(0, "../x.go", "a", "b", "^TestAllowed$"),
+		replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestAllowed$"),
 		replaceSpec(1, "ctl.go", pinnedFind, "return true", "^TestAllowed$"))
-	wantObs(t, obs[0], cfOutcomeError, cfReasonInvalidSpec)
+	wantObs(t, obs[0], cfOutcomeRed, "")
 	wantObs(t, obs[1], cfOutcomeError, cfReasonRestoreFailed)
 }
 
