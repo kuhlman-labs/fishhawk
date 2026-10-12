@@ -8630,27 +8630,32 @@ const liveValidationCriterionAnnotation = " requires_live_validation: true (DECL
 
 // issueFidelityCriterion is plan-review criterion 8a (#4253 / #4254 fold-in):
 // a criterion citing the issue must require what the issue requires. The
-// catch-rate eval's contradicts-* cases (soft-delete vs row removal, a numeric
-// limit, a status code) are this defect.
+// plan-review catch-rate eval plants this defect, so its example must stay
+// CORPUS-DISJOINT (#4355): a domain, values and wording that occur in no
+// planreview-miss-corpus case, or the prompt shows the reviewer the planted
+// answer. The agenteval prompt-leak self-check pins that.
 const issueFidelityCriterion = "8a. **Issue fidelity**: each criterion that cites the issue (source explicit / " +
 	"source_ref) must require what the issue requires; a criterion that conflicts with the issue text — e.g. the " +
-	"issue says soft-delete, the criterion requires row removal — flags, category `correctness`, naming both the " +
-	"issue's requirement and the criterion's.\n"
+	"issue says invoice amounts use banker's rounding, the criterion requires truncation — flags, category " +
+	"`correctness`, naming both the issue's requirement and the criterion's.\n"
 
 // inferredCriterionWarrantClause tightens plan-review criterion 9 (#4253 /
 // #4254 fold-in): a specific value borrowed from sibling code is precedent,
 // not a requirement, so an inferred criterion carrying one flags unless the
-// plan cites where the value is required.
+// plan cites where the value is required. Its value kinds stay corpus-disjoint
+// for the same reason as issueFidelityCriterion's example (#4355).
 const inferredCriterionWarrantClause = " An inferred criterion that introduces a specific value, limit or " +
-	"behavior the issue never states (a page size, timeout, rate, status code) flags unless the plan cites where " +
-	"that value is REQUIRED; similar code elsewhere is precedent, not a requirement."
+	"behavior the issue never states (a cache TTL, thumbnail width, jitter fraction, replica quorum) flags unless " +
+	"the plan cites where that value is REQUIRED; similar code elsewhere is precedent, not a requirement."
 
 // criterionIDInNoteInstruction closes the plan-review acceptance-criteria
 // block (#4253 / #4254 fold-in): a concern about one criterion names that
 // criterion's id, so the operator, the fix-up agent and the catch-rate eval can
-// attribute it without matching the criterion's prose.
+// attribute it without matching the criterion's prose. The example id is
+// corpus-disjoint, and deliberately not `ac-`-shaped, for the same reason as
+// issueFidelityCriterion's example (#4355).
 const criterionIDInNoteInstruction = "Every concern about a specific acceptance criterion names that criterion's " +
-	"id (e.g. `ac-delete-hard`) in its `note`.\n\n"
+	"id (e.g. `invoice-rounding-mode`) in its `note`.\n\n"
 
 // liveValidationChecklistItem is review-criteria item 13 in the plan-review
 // prompt (#2978): it tells the reviewer that a requires_live_validation
