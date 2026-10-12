@@ -3962,6 +3962,10 @@ func runQueueBlock(t *testing.T, w *httptest.ResponseRecorder) (*runMergeCandida
 // state live with its phase and no position; a run that was never queued
 // OMITS the key. Counterfactual: deleting the resp.MergeCandidateQueue
 // assignment in handleGetRun → the held/live arms read no block → RED.
+// Counterfactual M8 (#4302): reverting the held-note Sprintf in runs.go to the
+// pre-ddc363e7 text ending "; nothing to invoke" → the held run's note loses
+// both remedy tokens and gains the forbidden one → RED. The same tokens
+// merge_run_test.go pins for the 409 message, so both surfaces agree.
 func TestGetRun_MergeCandidateQueue(t *testing.T) {
 	f := newMCQFixture(t)
 	a, b := f.wave()
@@ -3982,6 +3986,14 @@ func TestGetRun_MergeCandidateQueue(t *testing.T) {
 	}
 	if !strings.Contains(q.Note, "position 2") || !strings.Contains(q.Note, a.id.String()) {
 		t.Errorf("C note = %q, want it to name position 2 and the live run", q.Note)
+	}
+	for _, want := range []string{"self-heals on the periodic pump", "fishhawk_rebase_run_branch pumps the base manually"} {
+		if !strings.Contains(q.Note, want) {
+			t.Errorf("C note = %q, want the held remedy %q", q.Note, want)
+		}
+	}
+	if strings.Contains(q.Note, "nothing to invoke") {
+		t.Errorf("C note = %q, must not say there is nothing to invoke (a stalled line has a remedy)", q.Note)
 	}
 	if q, _ := runQueueBlock(t, getRunRaw(t, f.srv, b.id)); q == nil || q.Position != 1 {
 		t.Fatalf("B block = %+v, want held at position 1", q)

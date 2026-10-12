@@ -40,6 +40,10 @@ pin, never a silent skip. The runner's committed-tree implement verify gate runs
 `scripts/test verify`, so gofmt/golangci-lint defects fail in-loop rather than
 red-lining the PR in CI after the agent is terminal (#1064).
 
+### Leg registration: the base-delta global surface (ADR-096 D3 / [#4292](https://github.com/kuhlman-labs/fishhawk/issues/4292))
+
+`backend/internal/basedelta/verifylegs_test.go` parses this script's `cmd_verify` and `_verify_gate_harnesses` bodies and `scripts/sync-schemas`' destinations. Every code line there must be a registered leg call or an exact allow-listed plumbing line, each `_verify_*` leg's `$ROOT/scripts/<x>` calls must match its row, and every input a leg reads as data must match `basedelta.GlobalSurface`. Adding a leg, a harness, an inline script call, a plumbing line or a sync mirror therefore fails verify until the table (and, for a new input, `GlobalSurface` plus its README row) is updated. Contract: `backend/internal/basedelta/README.md` § "Adding a verify leg".
+
 ### Schema-sync drift check (`_verify_schema_sync`)
 
 `scripts/test verify` re-runs `scripts/sync-schemas` between lint and the test

@@ -2430,6 +2430,37 @@ type ShipPullRequestArgs struct {
 	MergeCandidateResult     string
 	MergeCandidateReason     string
 	MergeCandidateOutputTail string
+	// MergeCandidateFailures is the failure-signal excerpt of a non-passed
+	// pass (#4250): every go-test failure-signal line with its context,
+	// extracted from the WHOLE redacted output, so an early module's FAIL that
+	// scrolled out of the tail still ships. The caller REDACTS it;
+	// ShipPullRequest bounds it to its HEAD (MaxMergeCandidateFailuresBytes).
+	// MergeCandidateFailureSummary is the parsed failing package / test /
+	// build-failed names over the same whole output (#4250 approval condition
+	// C2), so a consumer never re-parses the excerpt and the names survive its
+	// budget. Both are empty on a passed pass and omitted from the body when
+	// empty, so a passing report stays decodable by an older fishhawkd.
+	MergeCandidateFailures       string
+	MergeCandidateFailureSummary *MergeCandidateFailureSummary
+}
+
+// MergeCandidateFailureSummary is the structured failing-name summary of a
+// non-passed merge-candidate pass (#4250 approval condition C2): the failing
+// package import paths, the `--- FAIL:` test names and the packages whose FAIL
+// line carried `[build failed]`/`[setup failed]`, each deduplicated in order
+// of appearance and capped (10 entries, 200 bytes each), with Lossy set when
+// any cap dropped or cut an entry. The names are runner-parsed from REDACTED,
+// UNTRUSTED verify output.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// backend's mergeCandidateFailureSummary (backend/internal/server/pullrequest.go);
+// the merge_candidate_failure_summary pair in backend/internal/wirecontract
+// pins them.
+type MergeCandidateFailureSummary struct {
+	Packages    []string `json:"packages,omitempty"`
+	Tests       []string `json:"tests,omitempty"`
+	BuildFailed []string `json:"build_failed,omitempty"`
+	Lossy       bool     `json:"lossy"`
 }
 
 // OutcomeMergeCandidateVerified is the report outcome of a verify-only
@@ -2442,11 +2473,15 @@ const OutcomeMergeCandidateVerified = "merge_candidate_verified"
 // (backend/internal/server/merge_candidate_verify.go), which re-bounds it
 // server-side; keeping the runner's bound equal means the stored tail is
 // exactly what was shipped. MaxMergeCandidateReasonBytes bounds the reason.
-// Both keep the merge_candidate_verified body far under
-// MaxPullRequestReportBytes.
+// MaxMergeCandidateFailuresBytes bounds the failure-signal excerpt (#4250) and
+// MIRRORS the backend's mergeCandidateFailuresMax the same way. These are RAW
+// bounds: JSON escaping can expand a field up to six-fold, so ShipPullRequest
+// also budgets the MARSHALLED body against MaxPullRequestReportBytes
+// (shrinkMergeCandidateBodyFields).
 const (
 	MaxMergeCandidateOutputTailBytes = 4096
 	MaxMergeCandidateReasonBytes     = 1024
+	MaxMergeCandidateFailuresBytes   = 8192
 )
 
 // pullRequestMergeCandidateBody is the wire shape for
@@ -2463,6 +2498,11 @@ type pullRequestMergeCandidateBody struct {
 	MergeCandidateResult     string `json:"merge_candidate_result"`
 	MergeCandidateReason     string `json:"merge_candidate_reason,omitempty"`
 	MergeCandidateOutputTail string `json:"merge_candidate_output_tail,omitempty"`
+	// MergeCandidateFailures / MergeCandidateFailureSummary (#4250) are
+	// omitempty: a passed pass ships neither, so its body stays byte-identical
+	// and decodes on a fishhawkd that predates them.
+	MergeCandidateFailures       string                        `json:"merge_candidate_failures,omitempty"`
+	MergeCandidateFailureSummary *MergeCandidateFailureSummary `json:"merge_candidate_failure_summary,omitempty"`
 }
 
 // boundMergeCandidateTail keeps the LAST max bytes of s (the end of verify
@@ -2472,6 +2512,90 @@ func boundMergeCandidateTail(s string, max int) string {
 		return s
 	}
 	return strings.ToValidUTF8(s[len(s)-max:], "")
+}
+
+// boundMergeCandidateFailures keeps the FIRST max bytes of s — the excerpt
+// lists the earliest failures first — re-validated as UTF-8 after the cut.
+func boundMergeCandidateFailures(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
+}
+
+// shrinkMergeCandidateBodyFields is the merge-candidate sibling of
+// shrinkFailureBodyFields (#4250): it shrinks the report in place until its
+// MARSHALLED form fits maxBytes, returning false only when even the
+// emptied-field envelope does not fit. The ladder yields the least valuable
+// field first, each text field keeping its largest fitting cut measured as
+// marshalled bytes (shrinkMergeCandidateText):
+//
+//  1. the failure excerpt, keeping its HEAD (the earliest failures);
+//  2. the output tail, keeping its TAIL (the end of the verify output);
+//  3. the summary's tests, then build_failed, then packages lists, each drop
+//     marking the summary lossy (the caller's summary is copied, never
+//     mutated);
+//  4. the reason, keeping its HEAD.
+//
+// The verdict fields (outcome, branch, head SHA, result) are never touched.
+func shrinkMergeCandidateBodyFields(body *pullRequestMergeCandidateBody, maxBytes int) bool {
+	fits := func() bool {
+		over, ok := marshalOverflow(body, maxBytes)
+		return ok && over <= 0
+	}
+	if fits() {
+		return true
+	}
+	if shrinkMergeCandidateText(&body.MergeCandidateFailures, boundMergeCandidateFailures, fits) {
+		return true
+	}
+	if shrinkMergeCandidateText(&body.MergeCandidateOutputTail, boundMergeCandidateTail, fits) {
+		return true
+	}
+	if s := body.MergeCandidateFailureSummary; s != nil {
+		summary := *s
+		body.MergeCandidateFailureSummary = &summary
+		for _, list := range []*[]string{&summary.Tests, &summary.BuildFailed, &summary.Packages} {
+			if len(*list) == 0 {
+				continue
+			}
+			*list = nil
+			summary.Lossy = true
+			if fits() {
+				return true
+			}
+		}
+	}
+	if shrinkMergeCandidateText(&body.MergeCandidateReason, boundMergeCandidateFailures, fits) {
+		return true
+	}
+	return fits()
+}
+
+// shrinkMergeCandidateText cuts *field to the LARGEST length n for which
+// fits() holds with *field = cut(original, n), found by binary search (the
+// marshalled size is non-decreasing in n, and escape expansion is too
+// non-uniform to predict from raw lengths). It reports whether the body now
+// fits; when even the empty field does not fit it leaves *field empty and
+// reports false so the caller moves to the next rung.
+func shrinkMergeCandidateText(field *string, cut func(string, int) string, fits func() bool) bool {
+	original := *field
+	*field = ""
+	if original == "" || !fits() {
+		return false
+	}
+	lo, hi := 0, len(original) // fits at lo, does not fit at hi
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		*field = cut(original, mid)
+		if fits() {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	*field = cut(original, lo)
+	return true
 }
 
 // pullRequestFailureBody is the failure-report wire shape ShipPullRequest
@@ -3307,22 +3431,33 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		body = marshalled
 	case OutcomeMergeCandidateVerified:
 		// Merge-candidate verify report (ADR-090 D3): the verified head plus
-		// the result. The reason keeps its HEAD (it names the cause first) and
-		// the output its TAIL (the end names the failure); both are bounded so
-		// the body stays far under MaxPullRequestReportBytes whatever the
-		// verify command printed.
+		// the result. The reason keeps its HEAD (it names the cause first),
+		// the output its TAIL (the end names the failure) and the failure
+		// excerpt its HEAD (the earliest failures first, #4250); all are
+		// raw-bounded, then the marshalled body is budgeted below so it stays
+		// under MaxPullRequestReportBytes whatever the verify command printed.
 		reason := args.MergeCandidateReason
 		if len(reason) > MaxMergeCandidateReasonBytes {
 			reason = strings.ToValidUTF8(reason[:MaxMergeCandidateReasonBytes], "")
 		}
-		marshalled, err := json.Marshal(pullRequestMergeCandidateBody{
-			Outcome:                  args.Outcome,
-			Branch:                   args.Branch,
-			HeadSHA:                  args.HeadSHA,
-			MergeCandidateResult:     args.MergeCandidateResult,
-			MergeCandidateReason:     reason,
-			MergeCandidateOutputTail: boundMergeCandidateTail(args.MergeCandidateOutputTail, MaxMergeCandidateOutputTailBytes),
-		})
+		mc := pullRequestMergeCandidateBody{
+			Outcome:                      args.Outcome,
+			Branch:                       args.Branch,
+			HeadSHA:                      args.HeadSHA,
+			MergeCandidateResult:         args.MergeCandidateResult,
+			MergeCandidateReason:         reason,
+			MergeCandidateOutputTail:     boundMergeCandidateTail(args.MergeCandidateOutputTail, MaxMergeCandidateOutputTailBytes),
+			MergeCandidateFailures:       boundMergeCandidateFailures(args.MergeCandidateFailures, MaxMergeCandidateFailuresBytes),
+			MergeCandidateFailureSummary: args.MergeCandidateFailureSummary,
+		}
+		// Budget the MARSHALLED bytes, not the raw field lengths (#4250, the
+		// #2570 rule): JSON escapes `<`, `>`, `&` and control bytes to six
+		// bytes each, so the raw bounds above can still encode past the
+		// backend's cap and a 413 would lose the verdict. A false return means
+		// even the emptied envelope is over; ship it anyway, as the failure
+		// report does.
+		_ = shrinkMergeCandidateBodyFields(&mc, MaxPullRequestReportBytes)
+		marshalled, err := json.Marshal(mc)
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal merge-candidate verify body: %w", err)
 		}

@@ -2502,7 +2502,36 @@ never has to push to a branch ADR-035 declares runner-owned.
   `failed` stage. So the payload is made COMPLETE before any mutation:
   `PriorState` and the review stage to re-park (`openReviewStageFor`) are
   derived here, mirroring `run.FixupStage`'s own non-acceptance-mode
-  selection, rather than read out of the decision afterwards.
+  selection, rather than read out of the decision afterwards. Append-then-
+  reopen no longer spends the slot on a DETERMINISTIC re-open refusal: those
+  are pre-flighted (next bullet). A slot is still spent, loudly, in three
+  residual cases after the pre-flight passes: a precondition CHANGES between
+  the pre-flight and the re-open (a concurrent writer); a repository READ
+  fails inside `run.FixupStage`'s own admission, which re-reads after the
+  append; or a `TransitionStage` WRITE fails in its mutation phase.
+- **Re-open preconditions are PRE-FLIGHTED (#4304).** `startConflictResolutionPass`
+  calls `run.FixupApplicable` — `run.FixupStage`'s own read-only admission —
+  AFTER the budget-spent check (so at the ceiling the 422 still names the
+  failed pass) and the implement-state check, and BEFORE the trigger append.
+  Both it and the later `run.FixupStage` take ONE `reopenOpts`, so the
+  pre-flight predicts exactly the call it guards. A terminal run, a review
+  gate not parked at `awaiting_approval`, an unsettled acceptance stage (the
+  `feature_change` shape, where acceptance runs ahead of review), or no review
+  stage is refused HERE with nothing written: no trigger entry, no budget
+  slot, no stage moved. `conflictResolutionPreflightRefusal` builds the reason
+  — "…so NO conflict-resolution budget was spent; <precondition>" — with the
+  run fix-up sentinel prefix stripped (`stripFixupSentinel`), so it never reads
+  as a fix-up refusal. Only the acceptance rows, whose precondition the
+  operator CAN clear, carry a re-invoke instruction: `reopenOpts` sets
+  `AcceptanceBlockerTail` to `conflictResolutionAcceptanceBlockerTail`
+  (", then re-invoke fishhawk_rebase_run_branch — waiting spends no
+  conflict-resolution budget") in place of the fix-up's "then route the
+  fix-up". The terminal-run, review-resolved and no-review-stage rows carry
+  their own remedy and no re-invoke. A pre-flight READ failure refuses too
+  ("could not be confirmed"): the ceiling-of-one slot is never spent on an
+  uncertain state. On every pre-flight refusal `message()` words the
+  resolve-push-vouch route as the FALLBACK ("If the precondition cannot be
+  cleared: …"); the 422 code, error code and `details` keys are unchanged.
 - **`run.FixupStage` owns the state-machine edge** (implement → pending, plus
   the review re-park on the push_and_open_pr flow) and the terminal-run guard.
   The pass counts handed to it are the CONFLICT-RESOLUTION counts, never the
@@ -2512,7 +2541,10 @@ never has to push to a branch ADR-035 declares runner-owned.
   no run/audit repository; an unresolvable branch / base ref / head anchor; no
   implement stage; an unreadable budget count (a listing error must never read
   as zero, which the caller treats as headroom); an implement stage not parked
-  at its review gate; a failed trigger append; a failed stage re-open. The
+  at its review gate; an unmet or unconfirmable re-open precondition (the
+  pre-flight above, which spends nothing); a failed trigger append; and a
+  re-open that fails AFTER the append (the three residuals above, which spend
+  the slot and say so: "the ceiling-of-one budget is now SPENT"). The
   ceiling arm is distinct: it names the FAILED pass and the runner's own
   refusal reason, read from the newest same-stage
   `stage_conflict_resolution_failed` entry, degrading to the count alone when

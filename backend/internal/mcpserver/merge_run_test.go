@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -37,6 +38,61 @@ func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run) error
 }
 
 // --- fishhawk_merge_run (E48.7 / #1954) ---
+
+// TestMergeRun_ToolDescriptionNamesHeldRemedy pins (#4302, M9) that the
+// WIRE-VISIBLE fishhawk_merge_run description tells an operator agent how a
+// merge_candidate_held run clears: the periodic pump self-heals a stalled line
+// and fishhawk_rebase_run_branch pumps the base manually — and does NOT say
+// there is "nothing to invoke". Counterfactual: reverting the
+// merge_candidate_held paragraph in merge_run.go to "... and starts the pass —
+// nothing to invoke." → both remedy phrases vanish and the forbidden one
+// appears → RED. The description hard-wraps mid-phrase, so whitespace is
+// normalized before matching.
+func TestMergeRun_ToolDescriptionNamesHeldRemedy(t *testing.T) {
+	ctx := context.Background()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "fishhawk", Version: "test"}, nil)
+	registerMergeRun(srv, nil)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer func() { _ = serverSession.Close() }()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer func() { _ = clientSession.Close() }()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var raw string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_merge_run" {
+			raw = tool.Description
+		}
+	}
+	if raw == "" {
+		t.Fatal("fishhawk_merge_run is not wire-visible")
+	}
+	desc := strings.Join(strings.Fields(raw), " ")
+	for _, want := range []string{
+		"merge_candidate_held",
+		"a stalled line self-heals on the periodic pump",
+		"fishhawk_rebase_run_branch pumps the base manually",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_merge_run description missing %q:\n%s", want, desc)
+		}
+	}
+	if strings.Contains(desc, "nothing to invoke") {
+		t.Errorf("fishhawk_merge_run description says %q; a stalled held line has a remedy:\n%s", "nothing to invoke", desc)
+	}
+}
 
 // mergeRunFakeBackend is a self-contained backend stub for the merge_run
 // tool. It serves the three endpoints the tool touches — GET /v0/runs/{id}

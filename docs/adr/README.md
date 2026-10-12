@@ -295,6 +295,7 @@ one, never in batches:
 | [ADR-096](096-merge-candidate-verdict-transfer.md) | Merge-candidate verdict transfer across an independent base delta, plus a single verification point for decomposed parents (amends ADR-090) | `accepted` | [#4290](https://github.com/kuhlman-labs/fishhawk/issues/4290) |
 | [ADR-097](097-operator-as-orchestrator.md) | Operator as orchestrator: the driver delegates evidence work to stateless specialist jobs; the first officer keeps a standing trigger-driven watch the operator cannot silence (amends ADR-089, ADR-040) | `accepted` | [#4299](https://github.com/kuhlman-labs/fishhawk/issues/4299) |
 | [ADR-098](098-split-global-surface-shadow-transfer.md) | Amend ADR-096 D3: split the global surface into verdict-wide and doc-check inputs, add data-read edges, and enable verdict transfer only after a shadow measurement | `accepted` | [#4316](https://github.com/kuhlman-labs/fishhawk/issues/4316) |
+| [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
 
 ## Status unknown — needs captain confirmation
 

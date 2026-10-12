@@ -15,7 +15,7 @@ Coding agents are now capable enough that the bottleneck has shifted from "can t
 
 Fishhawk is the **governed, auditable workflow that sits above coding agents**. It is agent-agnostic, tool-agnostic, and opinionated about *process*. It is not a coding agent. It is the layer that turns a collection of agent invocations into a governed, auditable crew that one person can command.
 
-The unit is the **repository**. The human who commands it is the **captain**; the agents are the **crew** — planner, implementer, reviewers, acceptance, the operator agent as first officer, and the roles that keep a product running after the merge (product, release, ops, architecture, upkeep, security, feedback). The captain decides how much the crew may decide and where; the crew advises, disagrees on the record, and escalates what it may not settle. Standing orders, decisions, and the precedent of past gate calls live in the repository and on the audit chain, so a new captain inherits how the repository is run.
+The unit is the **repository**. The human who commands it is the **captain**; the agents are the **crew** — planner, implementer, reviewers, acceptance, the operator that drives runs and campaigns, the first officer that keeps a read-only watch over them, and the roles that keep a product running after the merge (product, release, ops, architecture, upkeep, security, feedback). The captain decides how much the crew may decide and where; the crew advises, disagrees on the record, and escalates what it may not settle. Standing orders, decisions, and the precedent of past gate calls live in the repository and on the audit chain, so a new captain inherits how the repository is run.
 
 ### What Fishhawk is
 

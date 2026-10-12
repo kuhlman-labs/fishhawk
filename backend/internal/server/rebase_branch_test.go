@@ -1055,6 +1055,133 @@ func TestRebaseRunBranch_ConflictNoPassStartableFailsClosed(t *testing.T) {
 	assertMergeAttemptedNothingWritten(t, sd)
 }
 
+// postRebaseBranchRoute drives the SHIPPED route — s.Handler() on an
+// httptest.Server, with the seed's real operator bearer — so the request
+// crosses the auth middleware, the handler, the conflict arm and its
+// run.FixupApplicable pre-flight. It returns the status and the body.
+func postRebaseBranchRoute(t *testing.T, sd *rebaseSeed) (int, string) {
+	t.Helper()
+	srv := httptest.NewServer(sd.s.Handler())
+	defer srv.Close()
+	raw, _ := json.Marshal(rebaseBranchRequest{Confirm: true})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL+"/v0/runs/"+sd.runID.String()+"/rebase-branch", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+sd.bearer)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// TestRebaseRunBranch_ConflictAcceptanceUnsettledSpendsNoBudget is #4304 end
+// to end. In the feature_change shape the review gate is held closed by an
+// acceptance stage that has not settled; the conflict arm used to append its
+// ceiling-of-one trigger and only THEN learn the re-open was refused, so no
+// pass could ever run. Now the 422 names the acceptance precondition, nothing
+// is written, and once acceptance settles a re-invocation gets pass 1.
+func TestRebaseRunBranch_ConflictAcceptanceUnsettledSpendsNoBudget(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+	impl := crImplementStage(t, sd)
+	acc := crSeedAcceptance(sd, run.StageStateAwaitingHostDispatch)
+
+	code, body := postRebaseBranchRoute(t, sd)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", code, body)
+	}
+	var errBody struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &errBody); err != nil {
+		t.Fatalf("decode 422 body: %v\n%s", err, body)
+	}
+	if errBody.Error.Code != "rebase_conflict" {
+		t.Errorf("error code = %q, want rebase_conflict", errBody.Error.Code)
+	}
+	for _, want := range []string{
+		"acceptance stage", "must settle first", "re-invoke fishhawk_rebase_run_branch",
+		"NO conflict-resolution budget was spent", "If the precondition cannot be cleared",
+	} {
+		if !strings.Contains(errBody.Error.Message, want) {
+			t.Errorf("422 message missing %q:\n%s", want, errBody.Error.Message)
+		}
+	}
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Fatalf("trigger entries = %d, want 0 — the refused call must spend no budget", n)
+	}
+	assertMergeAttemptedNothingWritten(t, sd)
+
+	// Acceptance settles and the review gate parks; the operator re-invokes.
+	// C5: drop the per-call head sequence, so the second call reads the same
+	// run-branch head the first did and the trigger's anchor is assertable.
+	acc.State = run.StageStateSucceeded
+	sd.review.State = run.StageStateAwaitingApproval
+	sd.stub.mu.Lock()
+	sd.stub.headSHASeq = nil
+	sd.stub.mu.Unlock()
+
+	code, body = postRebaseBranchRoute(t, sd)
+	if code != http.StatusAccepted {
+		t.Fatalf("re-invoke status = %d, want 202:\n%s", code, body)
+	}
+	var got rebaseBranchResponse
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode 202 body: %v\n%s", err, body)
+	}
+	if !got.ConflictResolutionTriggered || got.ConflictResolutionPass != 1 {
+		t.Errorf("202 body = %+v, want conflict_resolution_triggered with pass 1", got)
+	}
+	entries := auditEntries(sd.au, CategoryStageConflictResolutionTriggered)
+	if len(entries) != 1 {
+		t.Fatalf("trigger entries = %d, want exactly 1", len(entries))
+	}
+	var trig conflictResolutionTrigger
+	if err := json.Unmarshal(entries[0].Payload, &trig); err != nil {
+		t.Fatalf("decode trigger: %v", err)
+	}
+	if trig.ExpectedHeadSHA != rebasePriorHeadSHA || trig.Pass != 1 {
+		t.Errorf("trigger = %+v, want expected_head_sha %s and pass 1", trig, rebasePriorHeadSHA)
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending (re-opened for pass 1)", impl.State)
+	}
+}
+
+// TestRebaseRunBranch_ConflictTerminalRunSpendsNoBudget: a terminal run's
+// stages can never be re-opened, so the conflict arm refuses BEFORE the
+// trigger is recorded, without a re-invoke instruction the operator cannot act
+// on (C1).
+func TestRebaseRunBranch_ConflictTerminalRunSpendsNoBudget(t *testing.T) {
+	sd := seedRebaseRun(t, conflictRebaseStub(), rebaseOpts{})
+	sd.rr.getRuns[sd.runID].State = run.StateCancelled
+
+	code, body := postRebaseBranchRoute(t, sd)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", code, body)
+	}
+	for _, want := range []string{"rebase_conflict", "already terminal", "NO conflict-resolution budget was spent", "fishhawk_vouch_commit"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("422 body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "re-invoke fishhawk_rebase_run_branch") {
+		t.Errorf("a terminal run must not be told to re-invoke:\n%s", body)
+	}
+	if n := len(auditEntries(sd.au, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Errorf("trigger entries = %d, want 0", n)
+	}
+	assertMergeAttemptedNothingWritten(t, sd)
+}
+
 // TestRebaseRunBranch_SuccessfulResolutionFallsIntoSharedTail: once the pass
 // has pushed its merge commit the run branch CONTAINS the base, so re-invoking
 // the verb takes the behind-probe short-circuit and still runs the shared

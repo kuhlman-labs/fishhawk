@@ -101,12 +101,16 @@ var fetchMergeCandidateTip = gitops.FetchBaseTip
 var mergeCandidateVerifyFn = runVerifyCommittedTree
 
 // mergeCandidateOutcome is the pass's report: the result, a reason for a
-// non-pass, and the redacted, bounded output tail.
+// non-pass, the redacted, bounded output tail and — for a non-passed result —
+// the redacted failure-signal excerpt and its parsed failing-name summary
+// (#4250).
 type mergeCandidateOutcome struct {
-	HeadSHA    string
-	Result     string
-	Reason     string
-	OutputTail string
+	HeadSHA        string
+	Result         string
+	Reason         string
+	OutputTail     string
+	Failures       string
+	FailureSummary *upload.MergeCandidateFailureSummary
 }
 
 // runMergeCandidateVerifyStage is the runner's whole merge-candidate verify
@@ -125,15 +129,17 @@ func runMergeCandidateVerifyStage(ctx context.Context, cfg config, req mergeCand
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeCandidateReportTimeout)
 	defer cancel()
 	if _, err := client.ShipPullRequest(reportCtx, upload.ShipPullRequestArgs{
-		RunID:                    cfg.runID,
-		StageID:                  cfg.stageID,
-		PrivateKey:               issued.PrivateKey,
-		Outcome:                  upload.OutcomeMergeCandidateVerified,
-		Branch:                   req.Branch,
-		HeadSHA:                  res.HeadSHA,
-		MergeCandidateResult:     res.Result,
-		MergeCandidateReason:     res.Reason,
-		MergeCandidateOutputTail: res.OutputTail,
+		RunID:                        cfg.runID,
+		StageID:                      cfg.stageID,
+		PrivateKey:                   issued.PrivateKey,
+		Outcome:                      upload.OutcomeMergeCandidateVerified,
+		Branch:                       req.Branch,
+		HeadSHA:                      res.HeadSHA,
+		MergeCandidateResult:         res.Result,
+		MergeCandidateReason:         res.Reason,
+		MergeCandidateOutputTail:     res.OutputTail,
+		MergeCandidateFailures:       res.Failures,
+		MergeCandidateFailureSummary: res.FailureSummary,
 	}); err != nil {
 		logEvent(logSink, "merge_candidate_verify_report_failed", map[string]string{"error": err.Error()})
 		return exitFailure
@@ -188,10 +194,11 @@ func mergeCandidateVerify(ctx context.Context, cfg config, req mergeCandidateVer
 	// FULL form: a nil scope set leaves FISHHAWK_VERIFY_PACKAGES absent. The
 	// merge candidate is the combined tree, so no package narrowing applies.
 	_, out, outcome, disp := mergeCandidateVerifyFn(ctx, cfg.verifyCmd, dispatchDir, tip, timeout, nil)
-	tail := mergeCandidateTail(out)
 
 	result, reason := classifyMergeCandidateVerify(outcome, disp, out)
-	return mergeCandidateOutcome{HeadSHA: tip, Result: result, Reason: reason, OutputTail: tail}
+	ev := mergeCandidateEvidence(out, result)
+	return mergeCandidateOutcome{HeadSHA: tip, Result: result, Reason: reason,
+		OutputTail: ev.tail, Failures: ev.failures, FailureSummary: ev.summary}
 }
 
 // classifyMergeCandidateVerify maps the gate's (outcome, disposition) to the
@@ -219,13 +226,48 @@ func classifyMergeCandidateVerify(outcome string, disp gateDisposition, out stri
 	}
 }
 
-// mergeCandidateTail redacts the whole verify output and THEN keeps its last
-// upload.MaxMergeCandidateOutputTailBytes bytes. Redacting before the cut
-// matters: a secret split by the cut would no longer match its pattern and its
-// surviving half would ship. The committed-gate output is truncated but not
-// redacted on the ordinary ship path, so the pass redacts it explicitly.
-func mergeCandidateTail(out string) string {
+// mergeCandidateOutputEvidence is what mergeCandidateEvidence derives from one
+// verify output.
+type mergeCandidateOutputEvidence struct {
+	tail     string
+	failures string
+	summary  *upload.MergeCandidateFailureSummary
+}
+
+// mergeCandidateEvidence redacts the WHOLE verify output ONCE and derives
+// everything the report ships from that one redacted copy:
+//
+//   - tail: its last upload.MaxMergeCandidateOutputTailBytes bytes;
+//   - failures (#4250): failureSignalExcerpt over the WHOLE redacted output,
+//     bounded to upload.MaxMergeCandidateFailuresBytes, so a FAIL in an early
+//     module (backend runs first) that scrolled out of the tail still ships;
+//   - summary (#4250 approval condition C2): parseVerifyFailures over the same
+//     whole redacted output, nil when it names nothing.
+//
+// failures and summary are computed for a NON-passed result only: a passed
+// pass ships neither, so its body is unchanged. Redacting before every cut
+// matters: a secret split by a cut, or by the excerpt's line selection, would
+// no longer match its pattern and its surviving half would ship. The
+// committed-gate output is truncated but not redacted on the ordinary ship
+// path, so the pass redacts it explicitly.
+func mergeCandidateEvidence(out, result string) mergeCandidateOutputEvidence {
 	redacted, _ := redactString(out)
+	ev := mergeCandidateOutputEvidence{tail: mergeCandidateTailOf(redacted)}
+	if result == mergeCandidatePassed {
+		return ev
+	}
+	ev.failures = failureSignalExcerpt(redacted, upload.MaxMergeCandidateFailuresBytes)
+	if f := parseVerifyFailures(redacted); len(f.pkgs) > 0 || len(f.tests) > 0 || len(f.buildFailed) > 0 {
+		ev.summary = &upload.MergeCandidateFailureSummary{
+			Packages: f.pkgs, Tests: f.tests, BuildFailed: f.buildFailed, Lossy: f.lossy,
+		}
+	}
+	return ev
+}
+
+// mergeCandidateTailOf keeps the last upload.MaxMergeCandidateOutputTailBytes
+// bytes of an ALREADY-redacted output, re-validated as UTF-8 after the cut.
+func mergeCandidateTailOf(redacted string) string {
 	if len(redacted) <= upload.MaxMergeCandidateOutputTailBytes {
 		return redacted
 	}

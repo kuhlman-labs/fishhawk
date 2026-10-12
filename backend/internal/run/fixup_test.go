@@ -18,6 +18,27 @@ import (
 type fixupRepo struct {
 	*memRepo
 	runStates map[uuid.UUID]run.State
+	// transitions counts every TransitionStage call, so a test asserts
+	// FixupApplicable's side-effect freedom by COUNTING writes rather than
+	// inferring it from read-back state (#4304).
+	transitions int
+}
+
+// TransitionStage counts the call, then delegates to memRepo.
+func (r *fixupRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.transitions++
+	return r.memRepo.TransitionStage(ctx, id, to, c)
+}
+
+// stageStates snapshots every stage's state in the repo, keyed by id.
+func (r *fixupRepo) stageStates() map[uuid.UUID]run.StageState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[uuid.UUID]run.StageState, len(r.stages))
+	for id, st := range r.stages {
+		out[id] = st.State
+	}
+	return out
 }
 
 func newFixupRepo(s ...*run.Stage) *fixupRepo {
@@ -968,5 +989,219 @@ func TestFixupStage_OpenReviewGateStillAdmitsWithUnsettledAcceptance(t *testing.
 	// Outside acceptance mode the acceptance stage is untouched.
 	if cur, _ := repo.GetStage(ctx, acc.ID); cur.State != run.StageStatePending {
 		t.Errorf("acceptance state = %q, want unchanged (pending)", cur.State)
+	}
+}
+
+// --- #4304: FixupApplicable, the side-effect-free admission pre-flight ---
+
+// fixupMirrorCase builds one FRESH fixture per call, so the FixupApplicable
+// answer and the FixupStage answer are each taken against an identical,
+// untouched repository.
+type fixupMirrorCase struct {
+	name  string
+	build func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions)
+	// wantErr is the sentinel a refusal row must carry; nil marks an admit row.
+	wantErr error
+}
+
+func fixupMirrorCases() []fixupMirrorCase {
+	classic := run.FixupOptions{MaxPasses: 1, HardCeiling: 3}
+	withAcceptance := func(implState, reviewState, accState run.StageState) func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+		return func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+			repo, impl, _, _ := implementReviewAcceptance(t, implState, reviewState, accState)
+			return repo, impl.ID, classic
+		}
+	}
+	return []fixupMirrorCase{
+		{name: "non-implement stage", wantErr: run.ErrFixupNotApplicable,
+			build: func(*testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				stage := newStage(run.StageStateAwaitingApproval) // a plan stage
+				return newFixupRepo(stage), stage.ID, classic
+			}},
+		{name: "terminal run", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+				repo.setRunState(impl.RunID, run.StateSucceeded)
+				return repo, impl.ID, classic
+			}},
+		{name: "implement in a wrong state", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl := implementStage(t, run.StageStateRunning)
+				return repo, impl.ID, classic
+			}},
+		{name: "review already resolved", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStateSucceeded)
+				return repo, impl.ID, classic
+			}},
+		{name: "no review stage", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl := implementStage(t, run.StageStateSucceeded)
+				return repo, impl.ID, classic
+			}},
+		{name: "review pending without acceptance", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStatePending)
+				return repo, impl.ID, classic
+			}},
+		{name: "acceptance pending (dispatchable)", wantErr: run.ErrFixupNotApplicable,
+			build: withAcceptance(run.StageStateSucceeded, run.StageStatePending, run.StageStatePending)},
+		{name: "acceptance awaiting_host_dispatch (dispatchable)", wantErr: run.ErrFixupNotApplicable,
+			build: withAcceptance(run.StageStateSucceeded, run.StageStatePending, run.StageStateAwaitingHostDispatch)},
+		{name: "acceptance dispatched (in flight)", wantErr: run.ErrFixupNotApplicable,
+			build: withAcceptance(run.StageStateSucceeded, run.StageStatePending, run.StageStateDispatched)},
+		{name: "ceiling reached", wantErr: run.ErrFixupCeilingReached,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+				return repo, impl.ID, run.FixupOptions{PriorPassCount: 3, MaxPasses: 1, HardCeiling: 3, ForceAdditionalPass: true}
+			}},
+		{name: "budget exhausted", wantErr: run.ErrFixupBudgetExhausted,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+				return repo, impl.ID, run.FixupOptions{PriorPassCount: 1, MaxPasses: 1, HardCeiling: 3}
+			}},
+		{name: "acceptance mode, acceptance id names a non-acceptance stage", wantErr: run.ErrFixupNotApplicable,
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, review, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateSucceeded, run.StageStateSucceeded)
+				return repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &review.ID}
+			}},
+		// Admit rows.
+		{name: "admit: implement awaiting_approval",
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+				return repo, impl.ID, classic
+			}},
+		{name: "admit: succeeded with an open review gate",
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+				return repo, impl.ID, classic
+			}},
+		{name: "admit: acceptance mode with succeeded review and acceptance",
+			build: func(t *testing.T) (*fixupRepo, uuid.UUID, run.FixupOptions) {
+				repo, impl, _, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateSucceeded, run.StageStateSucceeded)
+				return repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID}
+			}},
+	}
+}
+
+// TestFixupApplicable_MirrorsFixupStage pins the pre-flight contract (#4304):
+// on every refusal mode FixupApplicable returns the SAME sentinel and the
+// byte-identical message FixupStage returns on an identical fixture, and on
+// every row — refusal or admit — it performs ZERO TransitionStage calls and
+// leaves every stage state as seeded. On an admit row a following FixupStage
+// must still admit (a pre-flight that moved a stage would make it refuse).
+func TestFixupApplicable_MirrorsFixupStage(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range fixupMirrorCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, stageID, opts := tc.build(t)
+			before := repo.stageStates()
+
+			gotErr := run.FixupApplicable(ctx, repo, stageID, opts)
+
+			if repo.transitions != 0 {
+				t.Errorf("FixupApplicable made %d TransitionStage calls, want 0 (it must be side-effect-free)", repo.transitions)
+			}
+			after := repo.stageStates()
+			for id, st := range before {
+				if after[id] != st {
+					t.Errorf("stage %s state = %q after FixupApplicable, want %q (unchanged)", id, after[id], st)
+				}
+			}
+
+			if tc.wantErr == nil {
+				if gotErr != nil {
+					t.Fatalf("FixupApplicable = %v, want nil on an admit row", gotErr)
+				}
+				if _, err := run.FixupStage(ctx, repo, stageID, opts); err != nil {
+					t.Errorf("FixupStage after an admitting FixupApplicable = %v, want admit", err)
+				}
+				return
+			}
+
+			if !errors.Is(gotErr, tc.wantErr) {
+				t.Fatalf("FixupApplicable = %v, want sentinel %v", gotErr, tc.wantErr)
+			}
+			freshRepo, freshID, freshOpts := tc.build(t)
+			if _, freshErr := run.FixupStage(ctx, freshRepo, freshID, freshOpts); !errors.Is(freshErr, tc.wantErr) {
+				t.Fatalf("FixupStage on a fresh fixture = %v, want sentinel %v", freshErr, tc.wantErr)
+			}
+			// Byte parity is compared on the SAME repository (proven untouched
+			// above): some refusals name a run or stage id, and a fresh
+			// fixture mints new ones.
+			_, stageErr := run.FixupStage(ctx, repo, stageID, opts)
+			if gotErr.Error() != stageErr.Error() {
+				t.Errorf("message drift:\nFixupApplicable: %s\nFixupStage:      %s", gotErr, stageErr)
+			}
+		})
+	}
+}
+
+// TestFixupApplicable_ReadFailureIsNotASentinel: a repository read failure is
+// UNKNOWN applicability, never a refusal — the caller must be able to tell
+// the two apart.
+func TestFixupApplicable_ReadFailureIsNotASentinel(t *testing.T) {
+	repo := newFixupRepo()
+	err := run.FixupApplicable(context.Background(), repo, uuid.New(), run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if err == nil {
+		t.Fatal("FixupApplicable on an unknown stage = nil, want a read error")
+	}
+	if !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("err = %v, want the wrapped read failure (ErrNotFound)", err)
+	}
+	for _, sentinel := range []error{run.ErrFixupNotApplicable, run.ErrFixupCeilingReached, run.ErrFixupBudgetExhausted} {
+		if errors.Is(err, sentinel) {
+			t.Errorf("a read failure carries refusal sentinel %v: %v", sentinel, err)
+		}
+	}
+}
+
+// TestFixupStage_AcceptanceBlockerTailOverride: a supplied
+// AcceptanceBlockerTail REPLACES the route-the-fix-up remedy on the
+// acceptance-blocker refusal (both the dispatchable and in-flight shapes),
+// and an empty one keeps today's byte-identical default.
+func TestFixupStage_AcceptanceBlockerTailOverride(t *testing.T) {
+	const tail = ", then do the caller-specific thing — tail-override-marker"
+	ctx := context.Background()
+	for _, accState := range []run.StageState{run.StageStateAwaitingHostDispatch, run.StageStateDispatched} {
+		t.Run(string(accState), func(t *testing.T) {
+			repo, impl, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, accState)
+			_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AcceptanceBlockerTail: tail})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+			}
+			if !strings.HasSuffix(err.Error(), tail) {
+				t.Errorf("refusal does not end with the supplied tail:\n%s", err)
+			}
+			if strings.Contains(err.Error(), "route the fix-up") {
+				t.Errorf("the supplied tail must REPLACE the fix-up remedy:\n%s", err)
+			}
+
+			repo2, impl2, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, accState)
+			_, def := run.FixupStage(ctx, repo2, impl2.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+			if !strings.HasSuffix(def.Error(), ", then route the fix-up — the fix-up budget is not consumed by waiting") {
+				t.Errorf("an empty tail must keep the byte-identical default:\n%s", def)
+			}
+		})
+	}
+}
+
+// TestFixupStage_AcceptanceModeWrongTypeRefusesBeforeRepark pins the moved
+// acceptance-stage type check (#4304): it now runs in the admission, BEFORE
+// the review re-park, so a wrong-type acceptance id refuses with no stage
+// moved. Before the split the review was re-parked to pending first.
+func TestFixupStage_AcceptanceModeWrongTypeRefusesBeforeRepark(t *testing.T) {
+	repo, impl, review, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateSucceeded, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &review.ID})
+	if !errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("err = %v, want ErrFixupNotApplicable", err)
+	}
+	if cur, _ := repo.GetStage(ctx, review.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("review state = %q, want succeeded (no re-park on a refused call)", cur.State)
+	}
+	if repo.transitions != 0 {
+		t.Errorf("TransitionStage calls = %d, want 0 on a refused call", repo.transitions)
 	}
 }

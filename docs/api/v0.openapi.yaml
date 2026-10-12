@@ -5819,6 +5819,51 @@ components:
             shipping and the server re-bounds it; it is recorded on the audit
             row with `output_untrusted: true`, is rendered only as framed data,
             and is NEVER embedded in a routed fix-up concern (ADR-090 D6).
+        merge_candidate_failures:
+          type: string
+          description: |
+            `merge_candidate_verified` only, non-passed results only (#4250):
+            the failure-signal excerpt — every go-test failure-signal line
+            (`--- FAIL:`, `FAIL<TAB><pkg>`, `panic:`, `WARNING: DATA RACE`, and
+            a column-0 `<file>.go:<line>:<col>:` compiler/vet diagnostic) with
+            2 lines of context before and 4 after, extracted from the WHOLE
+            output rather than its tail, so an early module's failure that
+            scrolled out of `merge_candidate_output_tail` is still named. A
+            closing marker counts signal lines omitted over the budget.
+            UNTRUSTED, like the tail: runner-redacted, bounded to its first
+            8 KiB, re-bounded server-side, recorded on the audit row as
+            `failures` with `output_untrusted: true`, and NEVER embedded in a
+            routed fix-up concern (ADR-090 D6). Omitted when empty; a fishhawkd
+            that predates the field rejects it (400, unknown field), so deploy
+            fishhawkd first.
+        merge_candidate_failure_summary:
+          type: object
+          additionalProperties: false
+          description: |
+            `merge_candidate_verified` only, non-passed results only (#4250):
+            the failing names the runner parsed from the WHOLE redacted output,
+            so a consumer never re-parses `merge_candidate_failures` and the
+            names survive its byte budget. Each list is deduplicated in order
+            of appearance and capped at 10 entries of at most 200 bytes; the
+            server re-bounds it and records it on the audit row as
+            `failure_summary` with `output_untrusted: true` (the names are
+            parsed from untrusted output). Omitted when nothing was parsed.
+          properties:
+            packages:
+              type: array
+              items: { type: string }
+              description: 'Failing package import paths (`FAIL<TAB><pkg>` lines).'
+            tests:
+              type: array
+              items: { type: string }
+              description: 'Failing test names (`--- FAIL: <name>`, subtests included).'
+            build_failed:
+              type: array
+              items: { type: string }
+              description: 'Packages whose FAIL line carried `[build failed]` or `[setup failed]`.'
+            lossy:
+              type: boolean
+              description: 'True when any list dropped an entry past the cap or cut one at the byte cap.'
         scenario_ids:
           type: array
           items: { type: string }
