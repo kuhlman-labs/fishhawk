@@ -3098,17 +3098,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// Plan-declared counterfactuals (E85.3 / #4143): on an implement
 		// (or fix-up) pass whose committed-tree verify gate passed, execute
 		// every delivered spec against a scratch clone of the verified head
-		// and record exactly one counterfactual_observed event per spec
-		// BEFORE the fold, so the observations ride gate_evidence. The
+		// and record exactly one observation per spec BEFORE the fold. The
+		// observations ride gate_evidence as a PARAMETER, like the isolation
+		// record — never folded from the stream — and their
+		// counterfactual_observed events go to the trace only. The
 		// merge-candidate verify-only pass is routed off long before here.
+		var cfObservations []counterfactualObservationEvidence
 		if stageType == "implement" && res.OK && len(planCounterfactuals) > 0 {
 			repoDir := cfg.workingDir
 			if repoDir == "" {
 				repoDir = "."
 			}
-			res.Events = append(res.Events, runPlanCounterfactuals(ctx, cfg, repoDir, res.Events, verifiedTreeSHA, planCounterfactuals, logSink)...)
+			var cfEvents []agent.Event
+			cfEvents, cfObservations = runPlanCounterfactuals(ctx, cfg, repoDir, res.Events, verifiedTreeSHA, planCounterfactuals, logSink)
+			res.Events = append(res.Events, cfEvents...)
 		}
-		if ev := composeGateEvidence(res.Events, len(scopePaths(cfg.scopeFiles)), gateIsolationEvidenceFor(gateIsolation)); ev != nil {
+		if ev := composeGateEvidence(res.Events, len(scopePaths(cfg.scopeFiles)), gateIsolationEvidenceFor(gateIsolation), runnerCounterfactualObservations(cfObservations)); ev != nil {
 			res.Events = append(res.Events, *ev)
 		}
 

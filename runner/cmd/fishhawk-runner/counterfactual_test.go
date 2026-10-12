@@ -329,6 +329,116 @@ func TestCounterfactual_SymlinkControlRefused(t *testing.T) {
 	}
 }
 
+// The committed sub/ctl.go and the OUTSIDE file share the mutation anchor and
+// the patch preimage, so a mutation that followed a planted symlink would land
+// on the outside file; their package clauses differ so any write is visible.
+const (
+	cfSubCtlBody     = "package sub\n\n// X is the control.\nfunc X(n int) bool { return n > 0 }\n"
+	cfOutsideCtlBody = "package outside\n\n// X is the control.\nfunc X(n int) bool { return n > 0 }\n"
+	cfSubPatch       = "--- a/sub/ctl.go\n+++ b/sub/ctl.go\n@@ -4 +4 @@\n-func X(n int) bool { return n > 0 }\n+func X(n int) bool { return true }\n"
+)
+
+// TestCounterfactual_BaselinePlantedSymlinkRefused (fix-up of the C2 review
+// finding): the baseline executes repository code, which on the container
+// path can rewrite the writable checkout. Here the "baseline" replaces the
+// control's intermediate directory with a symlink to an outside directory
+// AFTER the pre-run C2 walk passed; the mutation boundary must refuse it for
+// both mutation forms (invalid_spec, so the re-walk — not git apply's own
+// beyond-symlink refusal — is what fired), run no mutated test, and leave the
+// outside target byte-identical through the mutation AND the restore.
+func TestCounterfactual_BaselinePlantedSymlinkRefused(t *testing.T) {
+	t.Parallel()
+	repo, _, _ := newCFFixture(t)
+	if err := os.Mkdir(filepath.Join(repo, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "sub", "ctl.go"), []byte(cfSubCtlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfGit(t, repo, "add", "-A")
+	cfGit(t, repo, "commit", "-q", "-m", "sub")
+	head := cfGit(t, repo, "rev-parse", "HEAD")
+	tree := cfGit(t, repo, "rev-parse", "HEAD^{tree}")
+	outDir := t.TempDir()
+	outside := filepath.Join(outDir, "ctl.go")
+	if err := os.WriteFile(outside, []byte(cfOutsideCtlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	x := newTestCFExecutor(t, repo)
+	var tests int
+	x.exec = func(ctx context.Context, argv []string, dir, lc string, to time.Duration) (string, int, gateDisposition) {
+		if argv[1] == "list" {
+			return runBoundedGateArgvDisposed(ctx, argv, dir, lc, to)
+		}
+		tests++
+		sub := filepath.Join(dir, "sub")
+		if err := os.RemoveAll(sub); err != nil {
+			t.Errorf("remove %s: %v", sub, err)
+		}
+		if err := os.Symlink(outDir, sub); err != nil {
+			t.Errorf("plant symlink: %v", err)
+		}
+		return `{"Action":"pass","Package":"example.com/cf/sub","Test":"TestX"}` + "\n", 0, gateExecuted
+	}
+	replace := replaceSpec(0, "sub/ctl.go", "return n > 0", "return true", "^TestX$")
+	replace.TestPackage = "./sub"
+	patch := patchSpec(1, "sub/ctl.go", cfSubPatch)
+	patch.TestRun, patch.TestPackage = "^TestX$", "./sub"
+	obs := runCF(t, x, repo, head, tree, replace, patch)
+	for _, o := range obs {
+		wantObs(t, o, cfOutcomeError, cfReasonInvalidSpec)
+		if o.Baseline != cfOutcomeGreen || o.MutationSHA256 != "" {
+			t.Fatalf("spec %d: baseline=%q mutation_sha256=%q, want green and empty", o.Index, o.Baseline, o.MutationSHA256)
+		}
+	}
+	if tests != 2 {
+		t.Fatalf("go test ran %d times, want 2 (the baselines only, no mutated run)", tests)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != cfOutsideCtlBody {
+		t.Fatalf("outside target was modified through the planted symlink: %q", got)
+	}
+}
+
+// TestReplaceInControlFile_RootRefusesEscape isolates the os.Root half of the
+// mutation boundary: with NO component walk in front of it, a find/replace
+// whose intermediate directory is a symlink out of the clone still neither
+// reads nor writes the outside file.
+func TestReplaceInControlFile_RootRefusesEscape(t *testing.T) {
+	t.Parallel()
+	clone, outDir := t.TempDir(), t.TempDir()
+	outside := filepath.Join(outDir, "ctl.go")
+	if err := os.WriteFile(outside, []byte(cfOutsideCtlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outDir, filepath.Join(clone, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	s := replaceSpec(0, "sub/ctl.go", "return n > 0", "return true", "^TestX$")
+	if sum, reason := replaceInControlFile(clone, s); sum != "" || reason != cfReasonInvalidSpec {
+		t.Fatalf("replaceInControlFile through an escaping symlink = (%q, %q), want (\"\", %q)", sum, reason, cfReasonInvalidSpec)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != cfOutsideCtlBody {
+		t.Fatalf("outside target was modified: %q", got)
+	}
+	// The same helper does mutate a contained file.
+	if err := os.Remove(filepath.Join(clone, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(clone, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clone, "sub", "ctl.go"), []byte(cfSubCtlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if sum, reason := replaceInControlFile(clone, s); len(sum) != 64 || reason != "" {
+		t.Fatalf("contained replace = (%q, %q)", sum, reason)
+	}
+	if got, _ := os.ReadFile(filepath.Join(clone, "sub", "ctl.go")); !strings.Contains(string(got), "return true") {
+		t.Fatalf("contained replace did not write: %q", got)
+	}
+}
+
 func TestContainedControlFile_EvalSymlinksEscape(t *testing.T) {
 	t.Parallel()
 	// The Lstat walk refuses symlink components; this pins the second line,
@@ -677,12 +787,12 @@ func TestCounterfactual_RestoreFailurePoisonsRemainingSpecs(t *testing.T) {
 
 func TestRunPlanCounterfactuals_NoSpecsNoEvents(t *testing.T) {
 	t.Parallel()
-	if evs := runPlanCounterfactuals(context.Background(), config{}, t.TempDir(), nil, "t", nil, io.Discard); evs != nil {
-		t.Fatalf("zero specs produced %d events", len(evs))
+	if evs, obs := runPlanCounterfactuals(context.Background(), config{}, t.TempDir(), nil, "t", nil, io.Discard); evs != nil || obs != nil {
+		t.Fatalf("zero specs produced %d events, %d observations", len(evs), len(obs))
 	}
 }
 
-func TestRunPlanCounterfactuals_EventsFoldIntoGateEvidence(t *testing.T) {
+func TestRunPlanCounterfactuals_ObservationsComposeIntoGateEvidence(t *testing.T) {
 	t.Parallel()
 	repo, head, tree := newCFFixture(t)
 	cfg := config{runID: "r", stageID: "s"}
@@ -690,9 +800,9 @@ func TestRunPlanCounterfactuals_EventsFoldIntoGateEvidence(t *testing.T) {
 	spec := replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestAllowed$")
 
 	// A verify_run whose tree is NOT the verified tree is not a target.
-	evs := runPlanCounterfactuals(context.Background(), cfg, repo, []agent.Event{verifyRun}, "someothertree", []upload.CounterfactualSpec{spec}, io.Discard)
-	if len(evs) != 1 || evs[0].Kind != "counterfactual_observed" {
-		t.Fatalf("events = %+v", evs)
+	evs, obs := runPlanCounterfactuals(context.Background(), cfg, repo, []agent.Event{verifyRun}, "someothertree", []upload.CounterfactualSpec{spec}, io.Discard)
+	if len(evs) != 1 || evs[0].Kind != "counterfactual_observed" || len(obs) != 1 {
+		t.Fatalf("events = %+v, observations = %+v", evs, obs)
 	}
 	var w struct {
 		Observation counterfactualObservationEvidence `json:"observation"`
@@ -702,8 +812,8 @@ func TestRunPlanCounterfactuals_EventsFoldIntoGateEvidence(t *testing.T) {
 	}
 	wantObs(t, w.Observation, cfOutcomeError, cfReasonNoVerifiedTree)
 
-	evs = runPlanCounterfactuals(context.Background(), cfg, repo, []agent.Event{verifyRun}, tree, []upload.CounterfactualSpec{spec}, io.Discard)
-	ge := composeGateEvidence(evs, 1)
+	evs, obs = runPlanCounterfactuals(context.Background(), cfg, repo, []agent.Event{verifyRun}, tree, []upload.CounterfactualSpec{spec}, io.Discard)
+	ge := composeGateEvidence(append([]agent.Event{verifyRun}, evs...), 1, runnerCounterfactualObservations(obs))
 	if ge == nil {
 		t.Fatal("no gate_evidence composed")
 	}

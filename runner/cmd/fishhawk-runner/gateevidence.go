@@ -49,8 +49,8 @@ const diffCoverageMaxUncovered = 10
 // (E85.3 / #4143). The plan caps declared counterfactuals at 8
 // (plan.MaxCounterfactuals) and the runner emits exactly one observation per
 // delivered entry, so 16 is headroom for that contract, not a working limit:
-// it exists so a stream that somehow carries more events cannot grow the
-// signed bundle's evidence without bound.
+// it exists so an over-long observation slice cannot grow the signed bundle's
+// evidence without bound.
 const gateEvidenceCounterfactualCap = 16
 
 // gateEvidencePayload is the body of a gate_evidence event in the
@@ -138,8 +138,10 @@ type gateEvidencePayload struct {
 	// (the byte-identical default) when no gate reached the exec seam.
 	GateIsolation *gateIsolationEvidence `json:"gate_isolation,omitempty"`
 	// CounterfactualObservations records the RUNNER-OBSERVED outcome of each
-	// plan-declared counterfactual (E85.3 / #4143), folded from the
-	// counterfactual_observed events in emission order and capped at
+	// plan-declared counterfactual (E85.3 / #4143), taken in spec order from
+	// the observations runPlanCounterfactuals RETURNED (passed to
+	// composeGateEvidence as runnerCounterfactualObservations) — never folded
+	// from a stream event, the gate_isolation precedent — and capped at
 	// gateEvidenceCounterfactualCap. Unlike FixupCounterfactuals (an agent
 	// CLAIM), every entry here is the runner's own execution record. Absent
 	// (the byte-identical default) when the stage executed no counterfactual.
@@ -184,12 +186,27 @@ type counterfactualObservationEvidence struct {
 	MutationSHA256 string `json:"mutation_sha256,omitempty"`
 }
 
+// gateEvidenceRecord is a runner-owned record composeGateEvidence takes beside
+// the event stream: *gateIsolationEvidence or runnerCounterfactualObservations.
+// The marker method keeps any other type (and so any stream-derived value) out.
+type gateEvidenceRecord interface{ gateEvidenceRecord() }
+
+func (*gateIsolationEvidence) gateEvidenceRecord() {}
+
+// runnerCounterfactualObservations wraps the observations runPlanCounterfactuals
+// returned so composeGateEvidence can take them as a runner-owned record.
+type runnerCounterfactualObservations []counterfactualObservationEvidence
+
+func (runnerCounterfactualObservations) gateEvidenceRecord() {}
+
 // counterfactualObservedEvent builds the counterfactual_observed trace event
 // for one executed counterfactual (E85.3 / #4143). The counterfactual phase
-// emits exactly one per delivered spec; composeGateEvidence folds them into
-// gate_evidence.counterfactual_observations. The observation rides under one
-// `observation` key, already in the gate_evidence wire shape, so the fold
-// decodes it byte-for-byte.
+// emits exactly one per delivered spec. It is a TRACE record only:
+// gate_evidence.counterfactual_observations is built from the observations the
+// phase returned, never from an event of this kind, so a forged
+// counterfactual_observed line in the agent's stream cannot shadow or displace
+// a genuine observation. The observation rides under one `observation` key, in
+// the gate_evidence wire shape.
 func counterfactualObservedEvent(cfg config, obs counterfactualObservationEvidence) agent.Event {
 	return agent.Event{
 		Kind: "counterfactual_observed",
@@ -511,20 +528,35 @@ type policyViolationEvidence struct {
 // best-effort: the evidence is advisory prompt context, never a gate
 // itself.
 //
-// isolation is the runner's OWN recorded selection digest
-// (gateIsolationEvidenceFor; at most one, nil when no gate reached the
-// seam). It is the ONLY source of the gate_isolation member: a
-// `gate_isolation`-kind event in the stream is not folded and does not
-// count as a gate having run (#2135).
-func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation ...*gateIsolationEvidence) *agent.Event {
+// records are the runner's OWN records — never stream events:
+//   - *gateIsolationEvidence: the recorded selection digest
+//     (gateIsolationEvidenceFor; nil when no gate reached the seam). It is the
+//     ONLY source of the gate_isolation member: a `gate_isolation`-kind event
+//     in the stream is not folded and does not count as a gate having run
+//     (#2135).
+//   - runnerCounterfactualObservations: the plan-declared counterfactual
+//     observations runPlanCounterfactuals returned (E85.3 / #4143). They are
+//     the ONLY source of the counterfactual_observations member, on the same
+//     rule: a counterfactual_observed-kind event in the stream is not folded
+//     and does not count as a gate having run, so a forged one can neither
+//     fill the cap ahead of a genuine GREEN nor supply the member on its own.
+func composeGateEvidence(events []agent.Event, declaredScopeCount int, records ...gateEvidenceRecord) *agent.Event {
 	var iso *gateIsolationEvidence
-	if len(isolation) > 0 {
-		iso = isolation[0]
+	var observations []counterfactualObservationEvidence
+	for _, r := range records {
+		switch v := r.(type) {
+		case *gateIsolationEvidence:
+			if v != nil {
+				iso = v
+			}
+		case runnerCounterfactualObservations:
+			observations = v
+		}
 	}
-	gateRan := iso != nil
+	gateRan := iso != nil || len(observations) > 0
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses", "counterfactual_observed":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses":
 			gateRan = true
 		}
 	}
@@ -535,6 +567,12 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation
 	payload := gateEvidencePayload{
 		ScopeFacts:    &scopeFactsEvidence{DeclaredFiles: declaredScopeCount},
 		GateIsolation: iso,
+	}
+	if len(observations) > gateEvidenceCounterfactualCap {
+		observations = observations[:gateEvidenceCounterfactualCap]
+	}
+	if len(observations) > 0 {
+		payload.CounterfactualObservations = append([]counterfactualObservationEvidence(nil), observations...)
 	}
 
 	for _, e := range events {
@@ -675,17 +713,6 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation
 			}
 			dc := w
 			payload.DiffCoverage = &dc
-		case "counterfactual_observed":
-			var w struct {
-				Observation *counterfactualObservationEvidence `json:"observation"`
-			}
-			if json.Unmarshal(e.Payload, &w) != nil || w.Observation == nil {
-				continue
-			}
-			if len(payload.CounterfactualObservations) >= gateEvidenceCounterfactualCap {
-				continue
-			}
-			payload.CounterfactualObservations = append(payload.CounterfactualObservations, *w.Observation)
 		case "git_diff":
 			var w struct {
 				NumFiles int `json:"num_files"`

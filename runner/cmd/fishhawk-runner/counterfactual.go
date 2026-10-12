@@ -8,7 +8,8 @@ package main
 // one counterfactual_observed event per delivered spec. The per-spec execution
 // (executeCounterfactual) returns a typed observation with no agent.Event or
 // trace dependency, so a later battery (#4300) can call it directly; only
-// runPlanCounterfactuals wraps the observations into trace events.
+// runPlanCounterfactuals wraps the observations into trace events, and
+// gate_evidence folds the observations it RETURNS, never a stream event.
 //
 // Classification reads the `go test -json` (test2json) action stream and the
 // gate exec disposition, never free text, and an unmutated baseline must be
@@ -131,13 +132,18 @@ func newCounterfactualExecutor(ctx context.Context, repoDir string) *counterfact
 
 // runPlanCounterfactuals is the main.go entry point: it executes every
 // delivered spec against a scratch clone of the verified head and returns
-// exactly one counterfactual_observed event per spec (none for zero specs, so
-// gate_evidence stays byte-identical). The verified head is the LAST
-// verify_run head whose tree equals verifiedTreeSHA — the tree the PR head
-// carries; when there is none every spec records error/no_verified_tree.
-func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, events []agent.Event, verifiedTreeSHA string, specs []upload.CounterfactualSpec, logSink io.Writer) []agent.Event {
+// exactly one observation per spec plus its counterfactual_observed trace
+// event (none for zero specs, so gate_evidence stays byte-identical). The
+// caller hands the OBSERVATIONS to composeGateEvidence as a runner-owned
+// runnerCounterfactualObservations record; the events are trace-only, so a
+// counterfactual_observed line in the agent's stream can neither shadow nor
+// displace them (the gate_isolation precedent).
+// The verified head is the LAST verify_run head whose tree equals
+// verifiedTreeSHA — the tree the PR head carries; when there is none every
+// spec records error/no_verified_tree.
+func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, events []agent.Event, verifiedTreeSHA string, specs []upload.CounterfactualSpec, logSink io.Writer) ([]agent.Event, []counterfactualObservationEvidence) {
 	if len(specs) == 0 {
-		return nil
+		return nil, nil
 	}
 	head, tree := lastVerifyRunHead(events)
 	if verifiedTreeSHA == "" || tree != verifiedTreeSHA {
@@ -154,7 +160,7 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 		})
 		out = append(out, counterfactualObservedEvent(cfg, o))
 	}
-	return out
+	return out, obs
 }
 
 // runCounterfactualPhase executes specs strictly sequentially and returns
@@ -233,9 +239,10 @@ func (x *counterfactualExecutor) executeCounterfactual(ctx context.Context, clon
 		return finish(cfOutcomeError, cfReasonInvalidSpec)
 	}
 	// C2: every component of control_path must be a real (non-symlink)
-	// directory/file inside the clone before anything reads or writes it.
-	controlAbs, err := containedControlFile(clone, s.ControlPath)
-	if err != nil {
+	// directory/file inside the clone before anything runs. The baseline below
+	// executes repository code, so applyCounterfactualMutation re-walks it at
+	// the mutation boundary too.
+	if _, err := containedControlFile(clone, s.ControlPath); err != nil {
 		return finish(cfOutcomeError, cfReasonInvalidSpec)
 	}
 	runDir, pkgArg, err := resolveCounterfactualPackage(clone, s.TestPackage)
@@ -260,7 +267,7 @@ func (x *counterfactualExecutor) executeCounterfactual(ctx context.Context, clon
 		return finish(cfOutcomeError, cfReasonBaselineNotGreen)
 	}
 
-	sum, reason := applyCounterfactualMutation(ctx, clone, controlAbs, scratch, s)
+	sum, reason := applyCounterfactualMutation(ctx, clone, scratch, s)
 	if reason != "" {
 		return finish(cfOutcomeError, reason)
 	}
@@ -579,28 +586,21 @@ func counterfactualMutationSHA256(s upload.CounterfactualSpec) string {
 // its SHA-256, or a closed reason. find/replace requires EXACTLY one
 // occurrence of find in the control file. A patch must touch only the
 // control path as a plain text modification (C3).
-func applyCounterfactualMutation(ctx context.Context, clone, controlAbs, scratch string, s upload.CounterfactualSpec) (string, string) {
+//
+// C2 holds HERE, at the mutation boundary, not only before the baseline: the
+// baseline ran the repository's own test code, which (through the container
+// path's writable checkout mount) may have replaced the control or an
+// intermediate directory with a symlink out of the clone. The component walk
+// is therefore repeated immediately before anything reads or writes, and the
+// find/replace I/O goes through an os.Root on the clone, so a component
+// swapped after the walk still cannot redirect it to a host file.
+func applyCounterfactualMutation(ctx context.Context, clone, scratch string, s upload.CounterfactualSpec) (string, string) {
+	if _, err := containedControlFile(clone, s.ControlPath); err != nil {
+		return "", cfReasonInvalidSpec
+	}
 	switch s.MutationKind {
 	case upload.CounterfactualMutationReplace:
-		fi, err := os.Lstat(controlAbs)
-		if err != nil || !fi.Mode().IsRegular() {
-			return "", cfReasonInvalidSpec
-		}
-		data, err := os.ReadFile(controlAbs)
-		if err != nil {
-			return "", cfReasonMutationNotApplied
-		}
-		switch n := strings.Count(string(data), s.Find); {
-		case n == 0:
-			return "", cfReasonMutationNotApplied
-		case n > 1:
-			return "", cfReasonMutationAmbiguous
-		}
-		mutated := strings.Replace(string(data), s.Find, s.Replace, 1)
-		if err := os.WriteFile(controlAbs, []byte(mutated), fi.Mode().Perm()); err != nil {
-			return "", cfReasonMutationNotApplied
-		}
-		return counterfactualMutationSHA256(s), ""
+		return replaceInControlFile(clone, s)
 	case upload.CounterfactualMutationPatch:
 		pf, err := os.CreateTemp(scratch, "counterfactual-*.patch")
 		if err != nil {
@@ -625,6 +625,38 @@ func applyCounterfactualMutation(ctx context.Context, clone, controlAbs, scratch
 		return counterfactualMutationSHA256(s), ""
 	}
 	return "", cfReasonInvalidSpec
+}
+
+// replaceInControlFile performs the find/replace form through an os.Root
+// opened on clone: every component is resolved inside the root, and one that
+// resolves outside it (a symlink planted after the C2 walk) fails the read or
+// the write rather than following it to a host file.
+func replaceInControlFile(clone string, s upload.CounterfactualSpec) (string, string) {
+	root, err := os.OpenRoot(clone)
+	if err != nil {
+		return "", cfReasonMutationNotApplied
+	}
+	defer func() { _ = root.Close() }()
+	rel := filepath.FromSlash(s.ControlPath)
+	fi, err := root.Lstat(rel)
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", cfReasonInvalidSpec
+	}
+	data, err := root.ReadFile(rel)
+	if err != nil {
+		return "", cfReasonMutationNotApplied
+	}
+	switch n := strings.Count(string(data), s.Find); {
+	case n == 0:
+		return "", cfReasonMutationNotApplied
+	case n > 1:
+		return "", cfReasonMutationAmbiguous
+	}
+	mutated := strings.Replace(string(data), s.Find, s.Replace, 1)
+	if err := root.WriteFile(rel, []byte(mutated), fi.Mode().Perm()); err != nil {
+		return "", cfReasonMutationNotApplied
+	}
+	return counterfactualMutationSHA256(s), ""
 }
 
 // checkPatchConfinedToControl reads `git apply --numstat --summary` output

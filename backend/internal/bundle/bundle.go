@@ -393,8 +393,8 @@ type GateEvidence struct {
 	// no verify run or summary.
 	GateIsolation *GateIsolationEvidence `json:"gate_isolation,omitempty"`
 	// CounterfactualObservations carries the RUNNER-OBSERVED outcome of each
-	// plan-declared counterfactual (E85.3 / #4143), in emission order and
-	// capped by the runner at 16 entries. Each entry is the runner's own
+	// plan-declared counterfactual (E85.3 / #4143), in spec order and capped
+	// by the runner at 16 entries. Each entry is the runner's own
 	// execution record — distinct from FixupCounterfactuals, which is an agent
 	// CLAIM. Nil (the byte-identical default) on an older bundle or a stage
 	// that executed no counterfactual. The json tag MUST stay identical to the

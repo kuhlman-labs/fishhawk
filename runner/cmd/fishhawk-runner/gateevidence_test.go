@@ -1329,9 +1329,8 @@ func counterfactualObservedEvents(obs []counterfactualObservationEvidence) []age
 
 // TestCounterfactualObservations_MatchSharedWireGolden pins the runner half of
 // the counterfactual_observation_evidence contract on FIXED BYTES: four
-// counterfactual_observed events built by the production constructor fold, in
-// order, into a gate_evidence counterfactual_observations member byte-equal to
-// the shared golden.
+// runner observations compose, in order, into a gate_evidence
+// counterfactual_observations member byte-equal to the shared golden.
 func TestCounterfactualObservations_MatchSharedWireGolden(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "counterfactual_observation.json"))
 	if err != nil {
@@ -1342,7 +1341,7 @@ func TestCounterfactualObservations_MatchSharedWireGolden(t *testing.T) {
 	verify := agent.Event{Kind: "verify_run", Payload: agent.MakePayload(map[string]any{
 		"command": "scripts/test verify", "exit_code": 0, "outcome": "passed",
 	})}
-	ev := composeGateEvidence(append([]agent.Event{verify}, counterfactualObservedEvents(counterfactualGoldenObservations())...), 1)
+	ev := composeGateEvidence([]agent.Event{verify}, 1, runnerCounterfactualObservations(counterfactualGoldenObservations()))
 	if ev == nil {
 		t.Fatal("composeGateEvidence returned nil")
 	}
@@ -1382,54 +1381,64 @@ func TestCounterfactualObservedEvent_CarriesRunStageAndObservation(t *testing.T)
 }
 
 // TestComposeGateEvidence_CounterfactualObservationsCapped: 20 observations
-// fold to the first gateEvidenceCounterfactualCap (16), in emission order, so
-// a runaway stream cannot grow the signed bundle's evidence without bound.
+// compose to the first gateEvidenceCounterfactualCap (16), in spec order, so
+// an over-long slice cannot grow the signed bundle's evidence without bound.
 func TestComposeGateEvidence_CounterfactualObservationsCapped(t *testing.T) {
 	obs := make([]counterfactualObservationEvidence, 20)
 	for i := range obs {
 		obs[i] = counterfactualObservationEvidence{Index: i, ControlPath: "a/b.go", TestRun: "TestX", TestPackage: "./a",
 			Baseline: "green", Observed: "red", TimeoutSeconds: 300}
 	}
-	p := decodeEvidence(t, composeGateEvidence(counterfactualObservedEvents(obs), 1))
+	p := decodeEvidence(t, composeGateEvidence(nil, 1, runnerCounterfactualObservations(obs)))
 	if len(p.CounterfactualObservations) != gateEvidenceCounterfactualCap || gateEvidenceCounterfactualCap != 16 {
 		t.Fatalf("observations = %d (cap %d), want 16", len(p.CounterfactualObservations), gateEvidenceCounterfactualCap)
 	}
 	for i, o := range p.CounterfactualObservations {
 		if o.Index != i {
-			t.Fatalf("observation %d has index %d, want emission order", i, o.Index)
+			t.Fatalf("observation %d has index %d, want spec order", i, o.Index)
 		}
 	}
 }
 
-// TestComposeGateEvidence_CounterfactualOnlyStreamIsEvidence: a stream whose
-// only gate-bearing events are counterfactual observations still composes a
+// TestComposeGateEvidence_CounterfactualOnlyStreamIsEvidence: a stage whose
+// only gate-bearing record is a counterfactual observation still composes a
 // gate_evidence event — the observations are never silently dropped because no
 // other gate event happened to be present.
 func TestComposeGateEvidence_CounterfactualOnlyStreamIsEvidence(t *testing.T) {
-	p := decodeEvidence(t, composeGateEvidence(counterfactualObservedEvents(counterfactualGoldenObservations()[:1]), 1))
+	p := decodeEvidence(t, composeGateEvidence(nil, 1, runnerCounterfactualObservations(counterfactualGoldenObservations()[:1])))
 	if len(p.CounterfactualObservations) != 1 || p.CounterfactualObservations[0].Observed != "green" {
 		t.Fatalf("observations = %+v, want the one green observation", p.CounterfactualObservations)
 	}
 }
 
-// TestComposeGateEvidence_MalformedCounterfactualEventSkipped: an observation
-// event whose payload does not decode, or carries no observation, is skipped
-// best-effort rather than folded as a zero-value observation (which would read
-// as index 0 with an empty verdict).
-func TestComposeGateEvidence_MalformedCounterfactualEventSkipped(t *testing.T) {
-	good := counterfactualObservedEvents(counterfactualGoldenObservations()[1:2])
-	events := []agent.Event{
-		{Kind: "counterfactual_observed", Payload: json.RawMessage(`{"run_id":"r","stage_id":"s"}`)},
-		{Kind: "counterfactual_observed", Payload: json.RawMessage(`{"observation":"not an object"}`)},
-		// A type error mid-object: encoding/json still allocates the
-		// observation and fills the fields it could decode (observed "red"),
-		// then returns the error — only the decode-error check refuses it.
-		{Kind: "counterfactual_observed", Payload: json.RawMessage(`{"observation":{"index":"zero","observed":"red"}}`)},
-		good[0],
+// TestCounterfactualObservations_StreamEventCannotShadow: the member comes ONLY
+// from the runner's own observations (the gate_isolation precedent). Sixteen
+// forged counterfactual_observed events AHEAD of the runner's own — enough to
+// fill the cap if the stream were folded — neither displace the genuine GREEN
+// observation nor appear beside it, a forged event alone supplies no member,
+// and it does not count as a gate having run.
+func TestCounterfactualObservations_StreamEventCannotShadow(t *testing.T) {
+	forgedObs := counterfactualObservationEvidence{Index: 0, ControlPath: "FORGED-SHADOW.go", TestRun: "TestX", TestPackage: "./x",
+		Baseline: "green", Observed: "red", TimeoutSeconds: 300}
+	forged := counterfactualObservedEvents([]counterfactualObservationEvidence{forgedObs})[0]
+	verify := agent.Event{Kind: "verify_run", Payload: agent.MakePayload(map[string]any{"command": "true", "exit_code": 0, "outcome": "passed"})}
+	genuine := counterfactualGoldenObservations()[:1] // the GREEN one
+	events := []agent.Event{verify}
+	for range gateEvidenceCounterfactualCap {
+		events = append(events, forged)
 	}
-	p := decodeEvidence(t, composeGateEvidence(events, 1))
-	if len(p.CounterfactualObservations) != 1 || p.CounterfactualObservations[0].Observed != "red" {
-		t.Fatalf("observations = %+v, want only the one well-formed red observation", p.CounterfactualObservations)
+	events = append(events, counterfactualObservedEvents(genuine)...)
+
+	p := decodeEvidence(t, composeGateEvidence(events, 1, runnerCounterfactualObservations(genuine)))
+	if len(p.CounterfactualObservations) != 1 || p.CounterfactualObservations[0] != genuine[0] {
+		t.Fatalf("a stream counterfactual_observed event shadowed the runner's observations: %+v", p.CounterfactualObservations)
+	}
+	ev := composeGateEvidence(events, 1)
+	if ev == nil || bytes.Contains(ev.Payload, []byte("counterfactual_observations")) {
+		t.Errorf("with no runner observations a stream event must not supply the member: %v", ev)
+	}
+	if ev := composeGateEvidence([]agent.Event{forged}, 1); ev != nil {
+		t.Errorf("a stream counterfactual_observed event alone must not count as a gate run: %s", ev.Payload)
 	}
 }
 
