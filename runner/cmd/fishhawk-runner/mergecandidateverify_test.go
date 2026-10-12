@@ -591,6 +591,27 @@ func TestMergeCandidateVerify_FailuresAreRedacted(t *testing.T) {
 	}
 }
 
+// TestMergeCandidateEvidence_SummaryTestsAreRedacted: a token carried in a
+// `t.Run` subtest NAME lands in the summary's Tests list, so the summary must be
+// parsed over the REDACTED output, never the raw one.
+func TestMergeCandidateEvidence_SummaryTestsAreRedacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("K1j2H3g4F5", 4)[:36]
+	out := "--- FAIL: TestLogin/" + secret + " (0.00s)\n    login_test.go:7: rejected\n" +
+		"FAIL\tgithub.com/x/backend/internal/login\t0.1s\n"
+	if red, _ := redactString(out); strings.Contains(red, secret) {
+		t.Fatalf("precondition: the default redaction patterns must match the fixture token")
+	}
+	ev := mergeCandidateEvidence(out, mergeCandidateFailed)
+	if ev.summary == nil || len(ev.summary.Tests) != 1 || !strings.HasPrefix(ev.summary.Tests[0], "TestLogin/") {
+		t.Fatalf("precondition: the summary must name the subtest, got %+v", ev.summary)
+	}
+	for _, name := range ev.summary.Tests {
+		if strings.Contains(name, secret) {
+			t.Errorf("summary test name %q carries the raw token", name)
+		}
+	}
+}
+
 // TestMergeCandidateEvidence_SummarySurvivesTheBudget is approval condition
 // C2: when the failure blocks overrun the 8 KiB excerpt, a LATER failing
 // package is omitted from the excerpt but still named by the summary, which is

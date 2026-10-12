@@ -685,6 +685,14 @@ func TestRecordMergeCandidateVerified(t *testing.T) {
 			t.Errorf("stored summary = %+v, want %+v as shipped", p.FailureSummary, in)
 		}
 
+		// A runner-reported lossy flag survives the re-bound even when the
+		// server itself cuts nothing.
+		lossyIn := &mergeCandidateFailureSummary{Packages: []string{"m/a"}, Tests: []string{"TestA"}, Lossy: true}
+		p, _ = recordEvidence(t, mergeCandidateOutputEvidence{Summary: lossyIn})
+		if s := p.FailureSummary; s == nil || !s.Lossy || !reflect.DeepEqual(s, lossyIn) {
+			t.Errorf("runner-lossy summary: stored %+v, want %+v (lossy kept)", s, lossyIn)
+		}
+
 		many := make([]string, 3*mergeCandidateSummaryMaxEntries)
 		for i := range many {
 			many[i] = fmt.Sprintf("m/p%02d", i)

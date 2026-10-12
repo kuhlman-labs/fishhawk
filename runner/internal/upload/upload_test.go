@@ -5398,6 +5398,131 @@ func TestShipPullRequest_MergeCandidateFailuresBody(t *testing.T) {
 	}
 }
 
+// TestShipPullRequest_MergeCandidateEscapedBodyFitsCap pins the #4250
+// post-marshal budget: an excerpt + tail made of JSON-escapable bytes (`<`
+// and `\x01` encode to six bytes each) encodes far past
+// MaxPullRequestReportBytes under the raw bounds alone, so without the shrink
+// the backend 413s and the verdict is lost. The shipped body must fit the cap
+// and still carry the verdict, with the excerpt yielding first (its HEAD kept)
+// and the tail untouched.
+func TestShipPullRequest_MergeCandidateEscapedBodyFitsCap(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		if len(raw) > MaxPullRequestReportBytes {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stage_id":"s","outcome":"merge_candidate_verified"}`))
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	failures := "HEAD" + strings.Repeat("<", MaxMergeCandidateFailuresBytes)
+	tail := strings.Repeat("\x01", MaxMergeCandidateOutputTailBytes)
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: OutcomeMergeCandidateVerified, Branch: "b", HeadSHA: "h",
+		MergeCandidateResult:   "failed",
+		MergeCandidateFailures: failures, MergeCandidateOutputTail: tail,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v (the verdict did not ship)", err)
+	}
+	if len(raw) > MaxPullRequestReportBytes {
+		t.Fatalf("body = %d bytes, over MaxPullRequestReportBytes (%d)", len(raw), MaxPullRequestReportBytes)
+	}
+	var got pullRequestMergeCandidateBody
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MergeCandidateResult != "failed" || got.HeadSHA != "h" {
+		t.Errorf("verdict = %q head = %q, want failed/h", got.MergeCandidateResult, got.HeadSHA)
+	}
+	if !strings.HasPrefix(got.MergeCandidateFailures, "HEAD<") {
+		t.Errorf("excerpt lost its head: %.16q", got.MergeCandidateFailures)
+	}
+	if got.MergeCandidateOutputTail != tail {
+		t.Errorf("tail len = %d, want %d untouched (the excerpt yields first)", len(got.MergeCandidateOutputTail), len(tail))
+	}
+}
+
+// TestShrinkMergeCandidateBodyFields_Ladder pins the rungs past the excerpt:
+// the tail yields next, then the summary's tests / build_failed / packages
+// lists drop (lossy, the caller's summary untouched), then the reason; an
+// envelope over the cap on its own reports false.
+func TestShrinkMergeCandidateBodyFields_Ladder(t *testing.T) {
+	esc := func(n int) string { return strings.Repeat("<", n) }
+	names := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = esc(200)
+		}
+		return out
+	}
+	size := func(b *pullRequestMergeCandidateBody) int {
+		m, err := json.Marshal(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(m)
+	}
+	const capBytes = MaxPullRequestReportBytes
+
+	t.Run("tail yields after the excerpt, keeping its end", func(t *testing.T) {
+		b := &pullRequestMergeCandidateBody{MergeCandidateFailures: esc(8192), MergeCandidateOutputTail: esc(8192) + "END"}
+		if !shrinkMergeCandidateBodyFields(b, capBytes) || size(b) > capBytes {
+			t.Fatalf("fits = false or size %d > %d", size(b), capBytes)
+		}
+		if b.MergeCandidateFailures != "" || !strings.HasSuffix(b.MergeCandidateOutputTail, "<END") {
+			t.Errorf("excerpt len %d (want emptied), tail suffix kept = %v", len(b.MergeCandidateFailures), strings.HasSuffix(b.MergeCandidateOutputTail, "<END"))
+		}
+	})
+	t.Run("summary lists drop in order, lossy, caller copy untouched", func(t *testing.T) {
+		in := &MergeCandidateFailureSummary{Packages: []string{"m/a"}, BuildFailed: names(10), Tests: names(40)}
+		b := &pullRequestMergeCandidateBody{MergeCandidateFailureSummary: in}
+		if !shrinkMergeCandidateBodyFields(b, capBytes) || size(b) > capBytes {
+			t.Fatalf("fits = false or size %d > %d", size(b), capBytes)
+		}
+		s := b.MergeCandidateFailureSummary
+		if s.Tests != nil || len(s.BuildFailed) != 10 || len(s.Packages) != 1 || !s.Lossy {
+			t.Errorf("summary = tests %d build_failed %d packages %d lossy %v, want only tests dropped, lossy", len(s.Tests), len(s.BuildFailed), len(s.Packages), s.Lossy)
+		}
+		if len(in.Tests) != 40 || in.Lossy {
+			t.Errorf("caller summary mutated: tests %d lossy %v", len(in.Tests), in.Lossy)
+		}
+
+		b = &pullRequestMergeCandidateBody{MergeCandidateFailureSummary: &MergeCandidateFailureSummary{Packages: names(40), BuildFailed: names(40)}}
+		if !shrinkMergeCandidateBodyFields(b, capBytes) || size(b) > capBytes {
+			t.Fatalf("fits = false or size %d > %d", size(b), capBytes)
+		}
+		if s := b.MergeCandidateFailureSummary; s.BuildFailed != nil || s.Packages != nil || !s.Lossy {
+			t.Errorf("summary = %+v, want build_failed and packages dropped, lossy", s)
+		}
+	})
+	t.Run("reason yields last, keeping its head", func(t *testing.T) {
+		b := &pullRequestMergeCandidateBody{MergeCandidateReason: "CAUSE" + esc(capBytes)}
+		if !shrinkMergeCandidateBodyFields(b, capBytes) || size(b) > capBytes {
+			t.Fatalf("fits = false or size %d > %d", size(b), capBytes)
+		}
+		if !strings.HasPrefix(b.MergeCandidateReason, "CAUSE<") {
+			t.Errorf("reason lost its head: %.16q", b.MergeCandidateReason)
+		}
+	})
+	t.Run("an over-cap envelope reports false", func(t *testing.T) {
+		b := &pullRequestMergeCandidateBody{Branch: esc(capBytes), MergeCandidateReason: "r"}
+		if shrinkMergeCandidateBodyFields(b, capBytes) {
+			t.Fatal("fits = true, want false for an unshrinkable envelope")
+		}
+		if b.MergeCandidateReason != "" || b.Branch != esc(capBytes) {
+			t.Errorf("reason %q (want emptied), branch touched = %v", b.MergeCandidateReason, b.Branch != esc(capBytes))
+		}
+	})
+}
+
 // TestMergeCandidateFailuresBoundMirrorsBackend pins the runner-side excerpt
 // bound to the backend's mergeCandidateFailuresMax
 // (backend/internal/server/merge_candidate_verify.go): update both together.
