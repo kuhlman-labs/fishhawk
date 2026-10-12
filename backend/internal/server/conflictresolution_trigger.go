@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +43,23 @@ const conflictResolutionTriggeredNote = "The base merge CONFLICTED, so NOTHING w
 // operator who reads one and not the other must not learn a different answer.
 const conflictResolutionRoute = "Resolve the conflict in a worktree, push, then admit the pushed head with fishhawk_vouch_commit. (fishhawk_reset_run_branch is the sibling verb for a FOREIGN COMMIT pushed ON TOP of the run's commits — a different problem.)"
 
+// conflictResolutionAcceptanceBlockerTail is the remedy clause the conflict
+// arm hands run.FixupOptions.AcceptanceBlockerTail (#4304). When the re-open
+// pre-flight refuses because a non-terminal acceptance stage is holding the
+// review gate closed, the acceptance-blocker sentence ends with THIS instead
+// of the fix-up's "then route the fix-up" — the operator here is waiting to
+// re-invoke the rebase verb, not routing a fix-up. It is the ONLY re-invoke
+// instruction in a pre-flight refusal, so the rows whose precondition the
+// operator cannot clear (terminal run, review already resolved, no review
+// stage) never name it.
+const conflictResolutionAcceptanceBlockerTail = ", then re-invoke fishhawk_rebase_run_branch — waiting spends no conflict-resolution budget"
+
+// conflictResolutionPreflightFallback prefixes conflictResolutionRoute on a
+// pre-flight refusal (#4304), so the 422 presents resolve-push-vouch as the
+// FALLBACK for a precondition that cannot be cleared rather than as an equal
+// first choice beside clearing it and re-invoking.
+const conflictResolutionPreflightFallback = "If the precondition cannot be cleared: "
+
 // conflictResolutionStart is what a SUCCESSFULLY started pass reports back to
 // the rebase handler: the re-opened implement stage and which pass ordinal
 // this was.
@@ -52,12 +71,15 @@ type conflictResolutionStart struct {
 // conflictResolutionRefusal is the negative result: no pass could be started,
 // and WHY. Reason is always populated. BudgetSpent distinguishes the
 // ceiling arm — the one that must name the FAILED pass and its refusal reason
-// — from every "no pass is startable at all" arm.
+// — from every "no pass is startable at all" arm. Preflight marks a refusal
+// from the re-open pre-flight (#4304), whose 422 words the vouch route as the
+// fallback.
 type conflictResolutionRefusal struct {
 	Reason       string
 	BudgetSpent  bool
 	FailedPass   int
 	FailedReason string
+	Preflight    bool
 }
 
 // startConflictResolutionPass is the rebase verb's 202 arm (E64.62 / #3202).
@@ -88,6 +110,21 @@ type conflictResolutionRefusal struct {
 // any mutation: PriorState and the review stage to re-park are derived here
 // (mirroring run.FixupStage's own non-acceptance-mode selection) rather than
 // read out of the FixupStage decision afterwards.
+//
+// The re-open's DETERMINISTIC refusals are PRE-FLIGHTED (#4304). Before the
+// append, run.FixupApplicable runs FixupStage's own read-only admission with
+// the same options the re-open will use, so a terminal run, a review gate
+// that is not parked, an unsettled acceptance stage, or a wrong stage state or
+// type refuses HERE, with nothing written and no budget slot spent. A
+// pre-flight read failure refuses too: the slot is never spent on an
+// uncertain state. What can still spend the slot is the window after the
+// pre-flight, because FixupStage re-reads and then writes after the append.
+// Three residuals remain, each loud and each costing one slot:
+//
+//   - a precondition CHANGES between the pre-flight and the re-open (a
+//     concurrent writer), so FixupStage's own admission refuses;
+//   - a repository READ fails inside FixupStage's own admission;
+//   - a TransitionStage WRITE fails in FixupStage's mutation phase.
 func (s *Server) startConflictResolutionPass(r *http.Request, runID uuid.UUID,
 	branch, baseRef, headSHA string) (*conflictResolutionStart, *conflictResolutionRefusal) {
 	ctx := r.Context()
@@ -123,6 +160,32 @@ func (s *Server) startConflictResolutionPass(r *http.Request, runID uuid.UUID,
 		return nil, &conflictResolutionRefusal{Reason: fmt.Sprintf(
 			"the implement stage is in state %q; only a stage parked at its review gate (succeeded or awaiting_approval) can be re-opened for a conflict-resolution pass", priorState)}
 	}
+
+	// The re-open options are built ONCE and handed to both the pre-flight
+	// and the re-open below, so the pre-flight predicts exactly the call it
+	// guards. The pass counts are the CONFLICT-RESOLUTION counts, never the
+	// fix-up ones, so neither call can read or spend the fix-up budget.
+	reopenOpts := run.FixupOptions{
+		PriorPassCount:        prior,
+		MaxPasses:             conflictResolutionCeiling,
+		HardCeiling:           conflictResolutionCeiling,
+		AcceptanceBlockerTail: conflictResolutionAcceptanceBlockerTail,
+	}
+
+	// PRE-FLIGHT (#4304). run.FixupApplicable is FixupStage's read-only
+	// admission: a precondition the re-open would refuse is refused HERE,
+	// BEFORE the trigger is appended, so it spends no budget slot. It sits
+	// after the budget-spent check, so at the ceiling the 422 still names the
+	// failed pass.
+	if err := run.FixupApplicable(ctx, s.cfg.RunRepo, impl.ID, reopenOpts); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"conflict resolution: the implement stage's re-open preconditions are unmet; refused before recording the trigger, no budget spent",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", impl.ID.String()),
+			slog.String("error", err.Error()))
+		return nil, conflictResolutionPreflightRefusal(err)
+	}
+
 	reviewStageID := ""
 	if priorState == run.StageStateSucceeded {
 		// push_and_open_pr flow: the human gate is a SEPARATE review stage that
@@ -150,25 +213,69 @@ func (s *Server) startConflictResolutionPass(r *http.Request, runID uuid.UUID,
 
 	// RE-OPEN. run.FixupStage owns the state-machine edge (implement →
 	// pending, plus the review re-park on the push_and_open_pr flow) and the
-	// terminal-run guard. The pass counts we hand it are the CONFLICT-
-	// RESOLUTION counts, never the fix-up ones, so this call can neither read
-	// nor spend the fix-up budget.
-	if _, err := run.FixupStage(ctx, s.cfg.RunRepo, impl.ID, run.FixupOptions{
-		PriorPassCount: prior,
-		MaxPasses:      conflictResolutionCeiling,
-		HardCeiling:    conflictResolutionCeiling,
-	}); err != nil {
+	// terminal-run guard, with the same reopenOpts the pre-flight admitted.
+	// An error here is one of the three residuals in the ORDERING comment
+	// above (a precondition changed since the pre-flight, a read failure in
+	// FixupStage's own admission, or a write failure): the trigger is already
+	// recorded, so the slot is spent, loudly.
+	if _, err := run.FixupStage(ctx, s.cfg.RunRepo, impl.ID, reopenOpts); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"conflict resolution: re-opening the implement stage failed; the trigger is recorded and the budget slot is spent",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", impl.ID.String()),
 			slog.String("error", err.Error()))
-		return nil, &conflictResolutionRefusal{Reason: "re-opening the implement stage for the conflict-resolution pass failed (" + err.Error() +
-			"); the trigger is recorded, so the ceiling-of-one budget is now SPENT and no pass will run"}
+		return nil, &conflictResolutionRefusal{Reason: "re-opening the implement stage for the conflict-resolution pass failed AFTER the trigger was recorded (" +
+			stripFixupSentinel(err) +
+			"); the ceiling-of-one budget is now SPENT and no pass will run, so a re-invocation takes the budget-spent refusal"}
 	}
 
 	s.notifyStatusUpdate(ctx, runID, CategoryStageConflictResolutionTriggered)
 	return &conflictResolutionStart{StageID: impl.ID, Pass: pass}, nil
+}
+
+// conflictResolutionPreflightRefusal maps a run.FixupApplicable error to the
+// pre-flight refusal (#4304). Every arm says NO budget was spent, because the
+// pre-flight runs before the trigger is appended.
+//
+//   - ErrFixupNotApplicable: the precondition FixupStage would refuse, with
+//     the sentinel prefix stripped so the reason does not read as a fix-up
+//     refusal. Only the acceptance-blocker rows carry a re-invoke instruction,
+//     and they get it from conflictResolutionAcceptanceBlockerTail; the rows
+//     the operator cannot clear (terminal run, review resolved, no review
+//     stage) carry their own remedy and no re-invoke.
+//   - ErrFixupCeilingReached / ErrFixupBudgetExhausted: the bound arm. The
+//     budget-spent check above uses the same count, so today this is
+//     unreachable; it is mapped without the fix-up wording rather than left
+//     to the read-failure arm.
+//   - anything else: a repository read failure, so applicability is UNKNOWN
+//     and the ceiling-of-one slot is not spent on it.
+func conflictResolutionPreflightRefusal(err error) *conflictResolutionRefusal {
+	const unmet = "the implement stage cannot be re-opened for a conflict-resolution pass, so NO conflict-resolution budget was spent; "
+	switch {
+	case errors.Is(err, run.ErrFixupNotApplicable):
+		return &conflictResolutionRefusal{Preflight: true, Reason: unmet + stripFixupSentinel(err)}
+	case errors.Is(err, run.ErrFixupCeilingReached), errors.Is(err, run.ErrFixupBudgetExhausted):
+		return &conflictResolutionRefusal{Preflight: true, Reason: unmet +
+			fmt.Sprintf("the ceiling-of-%d conflict-resolution bound refused the re-open", conflictResolutionCeiling)}
+	default:
+		return &conflictResolutionRefusal{Preflight: true, Reason: "the implement stage's re-open preconditions could not be confirmed (" +
+			err.Error() + "); refusing BEFORE spending the ceiling-of-one budget on an uncertain state, so NO conflict-resolution budget was spent"}
+	}
+}
+
+// stripFixupSentinel renders a run fix-up error without its leading sentinel
+// ("fixup not applicable: ", "fixup ceiling reached: ", "fixup budget
+// exhausted: "), so a conflict-arm reason that embeds it does not read as a
+// fix-up refusal or a spent fix-up budget. An error without a sentinel prefix
+// is returned unchanged.
+func stripFixupSentinel(err error) string {
+	msg := err.Error()
+	for _, sentinel := range []error{run.ErrFixupNotApplicable, run.ErrFixupCeilingReached, run.ErrFixupBudgetExhausted} {
+		if trimmed, ok := strings.CutPrefix(msg, sentinel.Error()+": "); ok {
+			return trimmed
+		}
+	}
+	return msg
 }
 
 // conflictResolutionBudgetSpent builds the ceiling refusal. It reads the
@@ -205,11 +312,16 @@ func (s *Server) conflictResolutionBudgetSpent(ctx context.Context, runID, stage
 // message renders the refusal into the sentence shipped on the 422. The
 // budget-spent arm names the failed pass, its refusal reason and the
 // resolve-push-vouch route; every other arm names why no pass was startable
-// and the same route.
+// and the same route — worded as the FALLBACK on a pre-flight refusal, whose
+// first remedy is clearing the precondition (#4304).
 func (ref *conflictResolutionRefusal) message() string {
 	if !ref.BudgetSpent {
+		route := conflictResolutionRoute
+		if ref.Preflight {
+			route = conflictResolutionPreflightFallback + route
+		}
 		return "the run branch conflicts with the advanced base; the merge was REFUSED and NOTHING was written (no merge commit, no audit entry, no check re-post). No conflict-resolution pass could be started: " +
-			ref.Reason + ". " + conflictResolutionRoute
+			ref.Reason + ". " + route
 	}
 	msg := fmt.Sprintf("the run branch conflicts with the advanced base; the merge was REFUSED and NOTHING was written (no merge commit, no audit entry, no check re-post). Conflict-resolution pass %d already ran and was REFUSED", ref.FailedPass)
 	if ref.FailedReason != "" {
