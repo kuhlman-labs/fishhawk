@@ -1136,7 +1136,8 @@ func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
 // (orchestrator.IntegrateSlices → emitSlicesIntegrated) and asserts this
 // helper's key set equals the emitter's, so a hand-seeded fixture can never
 // disagree with production bytes (#2660's wire-fixture lesson applied to the
-// audit decode).
+// audit decode). The base_* keys are the ADR-096 D4 (#4294) base-fold fields,
+// seeded as a pass that created the consolidated branch at the base tip.
 func slicesIntegratedPayload(t *testing.T, consolidatedBranch string, childRunIDs []string) json.RawMessage {
 	t.Helper()
 	if childRunIDs == nil {
@@ -1147,6 +1148,9 @@ func slicesIntegratedPayload(t *testing.T, consolidatedBranch string, childRunID
 		"consolidated_branch":     consolidatedBranch,
 		"slice_count":             len(childRunIDs),
 		"integration_commit_shas": []string{},
+		"base_ref":                "main",
+		"base_sha":                "basesha",
+		"base_fold_outcome":       "created_at_tip",
 	})
 	if err != nil {
 		t.Fatalf("marshal slices_integrated payload: %v", err)
