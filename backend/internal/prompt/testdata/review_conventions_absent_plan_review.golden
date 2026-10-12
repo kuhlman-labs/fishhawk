@@ -133,14 +133,14 @@ Record a concern for each gap found:
 When the plan carries verification.acceptance_criteria, also assess:
 
 8. **Coverage**: the criteria cover every behavioral claim the issue and summary make; flag any behavior the change promises that no criterion verifies.
-8a. **Issue fidelity**: each criterion that cites the issue (source explicit / source_ref) must require what the issue requires; a criterion that conflicts with the issue text — e.g. the issue says soft-delete, the criterion requires row removal — flags, category `correctness`, naming both the issue's requirement and the criterion's.
-9. **Warrant of inferred criteria**: each inferred criterion's rationale is actually warranted by the issue or repository context, not invented. An inferred criterion that introduces a specific value, limit or behavior the issue never states (a page size, timeout, rate, status code) flags unless the plan cites where that value is REQUIRED; similar code elsewhere is precedent, not a requirement.
+8a. **Issue fidelity**: each criterion that cites the issue (source explicit / source_ref) must require what the issue requires; a criterion that conflicts with the issue text — e.g. the issue says invoice amounts use banker's rounding, the criterion requires truncation — flags, category `correctness`, naming both the issue's requirement and the criterion's.
+9. **Warrant of inferred criteria**: each inferred criterion's rationale is actually warranted by the issue or repository context, not invented. An inferred criterion that introduces a specific value, limit or behavior the issue never states (a cache TTL, thumbnail width, jitter fraction, replica quorum) flags unless the plan cites where that value is REQUIRED; similar code elsewhere is precedent, not a requirement.
 10. **Testability**: each criterion is concretely verifiable — an executor could decide pass/fail; vague adjectives ("robust", "clean", "handles edge cases") flag.
 11. **Independence**: criteria state observable outcomes, not restatements of the approach steps (a criterion that merely says 'the code in step N was written' flags).
 12. **Falsifiability**: each criterion can concretely FAIL — a vacuously-true criterion (one no implementation could violate) flags.
 13. **Declared operator walks**: a criterion marked `requires_live_validation` (paired with `skip_expected` + `expectation_basis`) is a DECLARED operator-validation walk, not a coverage gap — the acceptance sandbox is default-deny and provably cannot reach a live forge, cluster, or deployed target, and the marking is what files the tracked walk. The absence of a verification step deciding such a criterion is NOT a defect and MUST NOT be recorded as a coverage concern. These ARE still defects — flag them: (a) a criterion that needs a live target but carries no `requires_live_validation` marker (the plan gate reports this as the `missing_live_validation_marker` finding); (b) a marked criterion whose `verify_hint` names no executable walk, so the operator cannot actually perform it; (c) a marker used to dodge a check the sandbox COULD perform.
 
-Every concern about a specific acceptance criterion names that criterion's id (e.g. `ac-delete-hard`) in its `note`.
+Every concern about a specific acceptance criterion names that criterion's id (e.g. `invoice-rounding-mode`) in its `note`.
 
 ### Verdict decision rule
 
