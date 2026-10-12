@@ -3537,10 +3537,10 @@ evidence schema and the sidecar are in `backend/internal/agenteval/README.md` §
 "Plan-review catch-rate gate". Recording the evidence is an operator step:
 `docs/compliance/planreview-catchrate-evidence.md`.
 
-**Until an operator records and pins the first baseline, the check fails
-on EVERY change that touches a trigger path**, including the branch that
-introduced it. That is the design: conventions already shipped in #2244
-without evidence.
+**A baseline is pinned (first on 2026-10-10) and is re-pinned when the
+instrument changes: while the record is stale, the check fails on EVERY
+change that touches a trigger path**, including the branch that changed the
+instrument. That is the design, not a defect.
 
 ### Trigger paths and the change set
 
@@ -3613,10 +3613,10 @@ hermetic harness, `scripts/test-review-prompt-eval`, runs in verify
 
 Add this job under `jobs:` in `.github/workflows/ci.yml`. It runs on every
 pull request and is a fast no-op when no trigger path changed. List
-`review-prompt-eval` in `ci-pass.needs` to make it required, but only AFTER
-the first baseline is recorded: before that it fails every PR touching a
-trigger path by design, so install it un-required (advisory) first if you
-want it visible sooner. The base ref goes through `env:`, not an inline
+`review-prompt-eval` in `ci-pass.needs` to make it required once the pinned
+record is current: while it is stale it fails every PR touching a trigger
+path by design, so install it un-required (advisory) first if you want it
+visible sooner. The base ref goes through `env:`, not an inline
 `${{ }}` in `run:`, so no expression is interpolated into the shell.
 
 ```yaml
