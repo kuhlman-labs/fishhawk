@@ -222,6 +222,16 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_retrigger_ci":              {anyOf: []string{"write:stages"}}, // retrigger_ci.go handleRetriggerCI (E83.49 / #4082)
 	"fishhawk_decide_scope_amendment":    {anyOf: []string{"write:stages"}}, // scope_amendment.go handleDecideScopeAmendment
 	"fishhawk_decide_scope_completeness": {anyOf: []string{"write:stages"}}, // scope_completeness.go handleDecideScopeCompleteness
+	// specialist_job.go handleRequestSpecialistJob (E85.9 / #4300). The
+	// handler ALSO refuses a run-bound token that carries write:stages
+	// (specialist_job_requester_not_a_seat), so runBoundSubjectOK stays false.
+	"fishhawk_request_specialist_job": {anyOf: []string{"write:stages"}},
+
+	// --- read:runs. specialist_job.go handleGetSpecialistJob (E85.9 /
+	// #4300) is the one read that enforces read:runs rather than
+	// authentication alone, so this entry mirrors it instead of joining the
+	// authenticated-only reads above.
+	"fishhawk_get_specialist_job": {anyOf: []string{"read:runs"}},
 
 	// --- any-of pairs. These are the entries the fhm_ non-regression turns
 	// on: retry.go and revive.go accept `write:stages OR write:retries`, and a
