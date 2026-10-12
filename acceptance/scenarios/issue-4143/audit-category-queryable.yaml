@@ -1,0 +1,14 @@
+id: scenario:issue-4143/audit-category-queryable
+statement: 'The counterfactual_observed audit category is registered: GET /v0/runs/{run_id}/audit?category=counterfactual_observed on the preview returns 200 with an items array, where an unregistered category returns 400.'
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=counterfactual_observed returns 200 (compare: ?category=not_a_real_category returns 400)'
+steps: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} returned run 7c3d6056-d5c5-4ea4-9e46-19da0e833042. Sent GET /v0/runs/{run}/audit?category=counterfactual_observed, then the control GET /v0/runs/{run}/audit?category=not_a_real_category.
+assertions:
+    expected: 200 with an items array; an unregistered category returns 400
+    observed_at_record: counterfactual_observed returned 200 {"items":[],"next_cursor":""}. The control returned 400 validation_failed 'category is not a known audit category'.
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run_id>/audit?category=counterfactual_observed'
+origin:
+    issue: 4143
+    pr: 0
+    run_id: 1f4c218c-76fa-4055-b332-6defb38ef7e1
+    head_sha: 3a27e2be620a1d668c68dba4b02fcf9c1ddb9933
+    recorded_at: 2026-10-12T15:39:57Z

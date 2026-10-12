@@ -1716,7 +1716,12 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the E83.52 / #4085 top-level
+// no validation behavior — most recently the E85.3 / #4143 top-level
+// counterfactuals array and its counterfactual / counterfactual-mutation /
+// counterfactual-tests $defs (runner-executed counterfactuals; the 8-entry cap
+// and the exactly-one-mutation-form rule are semantic, because maxItems and
+// oneOf would reach the derived structured-output schema). Before that: the
+// E83.52 / #4085 top-level
 // delivery / remaining_scope pair and the root if/then requiring
 // remaining_scope when delivery is partial (the planner's declaration that a
 // plan delivers only a slice of its triggering issue, so the PR references the
@@ -1751,7 +1756,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "55782c088a988977f15f32d1370aa8a398304bdea359f092a36dabddd6ba2b6d"
+	const wantHash = "131f1571ec463868332a5d93a616a8b1ef36224cad4d6d1361a61f8d47244d6b"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -3149,7 +3154,8 @@ func TestParse_RemainingScopeWithoutPartial_Rejected(t *testing.T) {
 // delivery rule into Validate did not change Parse's behaviour: Parse runs the
 // schema-only leg and then semanticCheck, where the duplicate-criterion check
 // precedes checkDelivery, so a plan breaking BOTH still reports the duplicate
-// id first. Validate, which runs only the delivery rule, reports the mismatch.
+// id first. Validate, which runs only the delivery and counterfactuals rules,
+// reports the mismatch.
 func TestParse_DeliveryRule_ErrorPrecedenceUnchanged(t *testing.T) {
 	crit := map[string]any{"id": "dup", "statement": "the thing works", "source": "explicit", "source_ref": "#4085"}
 	data := marshalFixture(t, planfixture.Valid(func(m map[string]any) {
@@ -3187,5 +3193,273 @@ func TestPlan_IsPartialDelivery_TruthTable(t *testing.T) {
 				t.Errorf("IsPartialDelivery() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- counterfactuals (E85.3 / #4143) ---
+
+// validCounterfactual returns one well-formed find/replace counterfactual entry.
+// Each call returns a fresh map so a test can mutate it freely.
+func validCounterfactual() map[string]any {
+	return map[string]any{
+		"control_path": "backend/internal/plan/validate.go",
+		"mutation":     map[string]any{"find": "len(cfs) > MaxCounterfactuals", "replace": "false"},
+		"tests":        map[string]any{"run": "^TestValidate_Counterfactuals_SemanticRules$", "package": "./backend/internal/plan"},
+		"expect":       "red",
+	}
+}
+
+// counterfactualPlan returns a valid plan fixture carrying the given
+// counterfactual entries.
+func counterfactualPlan(t *testing.T, entries ...map[string]any) []byte {
+	t.Helper()
+	list := make([]any, len(entries))
+	for i, e := range entries {
+		list[i] = e
+	}
+	return marshalFixture(t, planfixture.Valid(func(m map[string]any) {
+		m["counterfactuals"] = list
+	}))
+}
+
+// TestValidate_Counterfactuals_Accepted pins the accepted shapes through BOTH
+// Validate (the upload path) and Parse: a find/replace entry, a patch entry,
+// and an empty replace (a deletion of the match), with a `/...` package
+// wildcard that is not a `..` segment. Parse round-trips every leaf, and the
+// empty replace stays distinguishable from an absent one and survives a
+// re-marshal of the typed Plan.
+func TestValidate_Counterfactuals_Accepted(t *testing.T) {
+	deletion := validCounterfactual()
+	deletion["mutation"] = map[string]any{"find": "if len(cfs) > MaxCounterfactuals {", "replace": ""}
+	deletion["tests"] = map[string]any{"run": "TestValidate_Counterfactuals", "package": "./backend/internal/plan/..."}
+	patch := validCounterfactual()
+	patch["mutation"] = map[string]any{"patch": "--- a/backend/internal/plan/validate.go\n+++ b/backend/internal/plan/validate.go\n"}
+	data := counterfactualPlan(t, validCounterfactual(), patch, deletion)
+
+	if err := plan.Validate(data); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	p, err := plan.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := len(p.Counterfactuals); got != 3 {
+		t.Fatalf("len(Counterfactuals) = %d, want 3", got)
+	}
+	first := p.Counterfactuals[0]
+	if first.ControlPath != "backend/internal/plan/validate.go" || first.Expect != plan.CounterfactualExpectRed ||
+		first.Tests.Run != "^TestValidate_Counterfactuals_SemanticRules$" || first.Tests.Package != "./backend/internal/plan" {
+		t.Errorf("Counterfactuals[0] = %+v, want the fixture's leaves", first)
+	}
+	if first.Mutation.Find != "len(cfs) > MaxCounterfactuals" || first.Mutation.Replace == nil || *first.Mutation.Replace != "false" || first.Mutation.Patch != "" {
+		t.Errorf("Counterfactuals[0].Mutation = %+v, want the find/replace form", first.Mutation)
+	}
+	if m := p.Counterfactuals[1].Mutation; m.Patch == "" || m.Find != "" || m.Replace != nil {
+		t.Errorf("Counterfactuals[1].Mutation = %+v, want the patch form only", m)
+	}
+	del := p.Counterfactuals[2].Mutation
+	if del.Replace == nil || *del.Replace != "" {
+		t.Fatalf("Counterfactuals[2].Mutation.Replace = %v, want a non-nil empty string (a deletion)", del.Replace)
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+	if !strings.Contains(string(out), `"replace":""`) {
+		t.Errorf("re-marshalled plan dropped the empty replace: %s", out)
+	}
+	if _, err := plan.Parse(out); err != nil {
+		t.Errorf("re-marshalled plan no longer parses: %v", err)
+	}
+}
+
+// TestValidate_Counterfactuals_UnknownMemberRejected pins additionalProperties:
+// false on each counterfactual $def: an otherwise-valid entry carrying an extra
+// member is a *SchemaError located inside /counterfactuals/0, so a typo'd key
+// is refused rather than silently ignored by the runner.
+func TestValidate_Counterfactuals_UnknownMemberRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(map[string]any)
+		want string
+	}{
+		{"entry", func(e map[string]any) { e["extra"] = "x" }, "/counterfactuals/0"},
+		{"mutation", func(e map[string]any) { e["mutation"].(map[string]any)["extra"] = "x" }, "/counterfactuals/0/mutation"},
+		{"tests", func(e map[string]any) { e["tests"].(map[string]any)["extra"] = "x" }, "/counterfactuals/0/tests"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := validCounterfactual()
+			tc.edit(e)
+			var serr *plan.SchemaError
+			if err := plan.Validate(counterfactualPlan(t, e)); !errors.As(err, &serr) {
+				t.Fatalf("Validate err = %v, want *SchemaError", err)
+			}
+			if serr.Path != tc.want {
+				t.Errorf("SchemaError.Path = %q, want %q (%v)", serr.Path, tc.want, serr)
+			}
+		})
+	}
+}
+
+// TestValidate_Counterfactuals_SemanticRules pins every checkCounterfactuals
+// branch on BOTH Validate (the upload path) and Parse. Each fixture is
+// schema-valid and violates exactly ONE rule, so deleting that rule's branch
+// makes both calls return nil.
+func TestValidate_Counterfactuals_SemanticRules(t *testing.T) {
+	set := func(key string, v any) func(map[string]any) {
+		return func(e map[string]any) { e[key] = v }
+	}
+	mut := func(m map[string]any) func(map[string]any) { return set("mutation", m) }
+	tests := func(run, pkg string) func(map[string]any) {
+		return set("tests", map[string]any{"run": run, "package": pkg})
+	}
+	for _, tc := range []struct {
+		name     string
+		edit     func(map[string]any)
+		wantPath string
+		wantMsg  string
+	}{
+		{"whitespace control_path", set("control_path", "   "), "/counterfactuals/0/control_path", "non-blank"},
+		{"absolute control_path", set("control_path", "/etc/passwd"), "/counterfactuals/0/control_path", "absolute"},
+		{"dotdot control_path", set("control_path", "backend/../../x.go"), "/counterfactuals/0/control_path", "`..` segment"},
+		{"backslash control_path", set("control_path", `backend\internal\plan\validate.go`), "/counterfactuals/0/control_path", "backslash"},
+		{"test-file control_path", set("control_path", "backend/internal/plan/plan_test.go"), "/counterfactuals/0/control_path", "names a test file"},
+		// Trimmed before every check (fix-up E): with the TrimSpace in
+		// counterfactualControlPathProblem deleted, the trailing space defeats
+		// the `_test.go` suffix test and no other rule fires, so both calls
+		// return nil.
+		{"padded test-file control_path", set("control_path", " backend/internal/plan/plan_test.go "), "/counterfactuals/0/control_path", "names a test file"},
+		{"neither form", mut(map[string]any{}), "/counterfactuals/0/mutation", "no form"},
+		{"both forms", mut(map[string]any{"find": "a", "replace": "b", "patch": "p"}), "/counterfactuals/0/mutation", "both"},
+		{"find without replace", mut(map[string]any{"find": "a"}), "/counterfactuals/0/mutation/replace", "without mutation.replace"},
+		{"replace without find", mut(map[string]any{"replace": "b"}), "/counterfactuals/0/mutation/find", "without mutation.find"},
+		{"replace equals find", mut(map[string]any{"find": "a", "replace": "a"}), "/counterfactuals/0/mutation/replace", "changes nothing"},
+		{"whitespace run", tests(" \t", "./backend/internal/plan"), "/counterfactuals/0/tests/run", "non-blank"},
+		{"absolute package", tests("TestX", "/backend/internal/plan"), "/counterfactuals/0/tests/package", "absolute"},
+		{"dotdot package", tests("TestX", "./backend/../cli"), "/counterfactuals/0/tests/package", "`..` segment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := validCounterfactual()
+			tc.edit(e)
+			assertCounterfactualRejected(t, counterfactualPlan(t, e), tc.wantPath, tc.wantMsg)
+		})
+	}
+}
+
+// TestValidate_Counterfactuals_CapEnforced pins the MaxCounterfactuals cap
+// (operator condition C1): the schema carries no maxItems, so nine otherwise
+// valid entries are refused by checkCounterfactuals on BOTH paths with a
+// *SchemaError naming /counterfactuals, while exactly eight are accepted.
+func TestValidate_Counterfactuals_CapEnforced(t *testing.T) {
+	entries := func(n int) []map[string]any {
+		out := make([]map[string]any, n)
+		for i := range out {
+			out[i] = validCounterfactual()
+		}
+		return out
+	}
+	atCap := counterfactualPlan(t, entries(plan.MaxCounterfactuals)...)
+	if err := plan.Validate(atCap); err != nil {
+		t.Errorf("Validate(%d entries) = %v, want nil", plan.MaxCounterfactuals, err)
+	}
+	if _, err := plan.Parse(atCap); err != nil {
+		t.Errorf("Parse(%d entries) = %v, want nil", plan.MaxCounterfactuals, err)
+	}
+	assertCounterfactualRejected(t, counterfactualPlan(t, entries(plan.MaxCounterfactuals+1)...), "/counterfactuals", "at most 8")
+}
+
+// TestValidate_CounterfactualsRuleOnUploadPath pins that Validate — the
+// plan-upload path, which never reaches Parse — runs the counterfactuals rules
+// itself: a `_test.go` control_path is refused by Validate. Deleting only the
+// checkCounterfactualsBytes call from Validate leaves Parse refusing it and
+// Validate returning nil.
+func TestValidate_CounterfactualsRuleOnUploadPath(t *testing.T) {
+	e := validCounterfactual()
+	e["control_path"] = "backend/internal/plan/plan_test.go"
+	var serr *plan.SchemaError
+	if err := plan.Validate(counterfactualPlan(t, e)); !errors.As(err, &serr) {
+		t.Fatalf("Validate err = %v, want *SchemaError (the upload path must refuse a test-file control)", err)
+	}
+	if serr.Path != "/counterfactuals/0/control_path" {
+		t.Errorf("SchemaError.Path = %q, want /counterfactuals/0/control_path", serr.Path)
+	}
+}
+
+// TestValidate_Counterfactuals_CollectsEveryViolation pins that one rejection
+// names every broken member across entries, so the planner fixes them in one
+// round trip.
+func TestValidate_Counterfactuals_CollectsEveryViolation(t *testing.T) {
+	bad0 := validCounterfactual()
+	bad0["control_path"] = "/abs.go"
+	bad0["tests"] = map[string]any{"run": " ", "package": "./x"}
+	bad1 := validCounterfactual()
+	bad1["mutation"] = map[string]any{"find": "a"}
+	var serr *plan.SchemaError
+	if err := plan.Validate(counterfactualPlan(t, bad0, validCounterfactual(), bad1)); !errors.As(err, &serr) {
+		t.Fatalf("Validate err = %v, want *SchemaError", err)
+	}
+	var got []string
+	for _, v := range serr.Violations {
+		got = append(got, v.Path)
+	}
+	want := []string{"/counterfactuals/0/control_path", "/counterfactuals/0/tests/run", "/counterfactuals/2/mutation/replace"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("violation paths = %v, want %v", got, want)
+	}
+}
+
+// assertCounterfactualRejected asserts both Validate and Parse refuse data with
+// a *SchemaError whose primary violation is at wantPath and whose message
+// contains wantMsg.
+func assertCounterfactualRejected(t *testing.T, data []byte, wantPath, wantMsg string) {
+	t.Helper()
+	for name, run := range map[string]func() error{
+		"Validate": func() error { return plan.Validate(data) },
+		"Parse":    func() error { _, err := plan.Parse(data); return err },
+	} {
+		var serr *plan.SchemaError
+		if err := run(); !errors.As(err, &serr) {
+			t.Errorf("%s: err = %v, want *SchemaError", name, err)
+			continue
+		}
+		if serr.Path != wantPath {
+			t.Errorf("%s: SchemaError.Path = %q, want %q (%v)", name, serr.Path, wantPath, serr)
+		}
+		if !strings.Contains(serr.Message, wantMsg) {
+			t.Errorf("%s: SchemaError.Message = %q, want it to contain %q", name, serr.Message, wantMsg)
+		}
+	}
+}
+
+// TestWarnings_CounterfactualsOnDecomposedPlan pins the
+// counterfactuals_not_executed_for_decomposition advisory: it fires for a
+// decomposed plan declaring counterfactuals, and for neither a non-decomposed
+// plan declaring them nor a decomposed plan declaring none.
+func TestWarnings_CounterfactualsOnDecomposedPlan(t *testing.T) {
+	withCF := func(m map[string]any) { m["counterfactuals"] = []any{validCounterfactual()} }
+	parse := func(m map[string]any) *plan.Plan {
+		t.Helper()
+		p, err := plan.Parse(marshalFixture(t, m))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		return p
+	}
+	has := func(p *plan.Plan) bool {
+		for _, w := range plan.Warnings(p) {
+			if strings.Contains(w, plan.RuleCounterfactualsNotExecutedForDecomposition) {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(parse(planfixture.Decomposed(withCF))) {
+		t.Errorf("decomposed plan with counterfactuals: want a %s advisory", plan.RuleCounterfactualsNotExecutedForDecomposition)
+	}
+	if has(parse(planfixture.Valid(withCF))) {
+		t.Errorf("non-decomposed plan with counterfactuals: want no %s advisory", plan.RuleCounterfactualsNotExecutedForDecomposition)
+	}
+	if has(parse(planfixture.Decomposed())) {
+		t.Errorf("decomposed plan without counterfactuals: want no %s advisory", plan.RuleCounterfactualsNotExecutedForDecomposition)
 	}
 }

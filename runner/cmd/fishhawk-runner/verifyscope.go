@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -197,14 +198,32 @@ func verifyLockOwnerEnv(env []string) []string {
 // (still a lock, just an uncontended one) — the pre-#2134 behaviour, never a
 // gate failure. The injection is a contention guard, not a correctness gate.
 func verifyLockPathEnv(env []string, repoDir string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), verifyLockPathResolveTimeout)
-	defer cancel()
-	common, err := gitOut(ctx, repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil || common == "" {
+	lock, err := verifyLockPathFor(context.Background(), repoDir)
+	if err != nil {
 		return env
 	}
 	out := dropEnvKey(env, verifyLockPathEnvVar)
-	return append(out, verifyLockPathEnvVar+"="+strings.TrimRight(common, "/")+"/"+verifyLockFileName)
+	return append(out, verifyLockPathEnvVar+"="+lock)
+}
+
+// verifyLockPathFor resolves the PRIMARY repository's verify lock path,
+// `<git-common-dir>/fishhawk-verify.lock`, for repoDir (the primary checkout
+// or any linked worktree of it), bounded by verifyLockPathResolveTimeout. It
+// is the ONE derivation both the injected FISHHAWK_VERIFY_LOCK_PATH
+// (verifyLockPathEnv) and the runner's own Go-side lock holder (the
+// counterfactual phase, E85.3 / #4143) use, so the two can never key
+// different files. An error means the common dir could not be resolved.
+func verifyLockPathFor(ctx context.Context, repoDir string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, verifyLockPathResolveTimeout)
+	defer cancel()
+	common, err := gitOut(ctx, repoDir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	if common == "" {
+		return "", errors.New("git rev-parse --git-common-dir returned nothing")
+	}
+	return strings.TrimRight(common, "/") + "/" + verifyLockFileName, nil
 }
 
 // dropEnvKey returns a copy of env with every "key=…" entry removed. It always

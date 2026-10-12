@@ -466,12 +466,22 @@ func (s *Server) emitChildrenSettled(ctx context.Context, parentRunID, parentSta
 // emitSliceIntegrationConflict writes a slice_integration_conflict audit entry
 // whose payload is byte-identical to childcompletion.emitSliceIntegrationConflict's
 // — the structured conflicting_slice_index + conflicting_child_run_id the
-// next_actions arm reads back as the resume target. Best-effort.
+// next_actions arm reads back as the resume target, plus the ADR-096 D4 /
+// #4294 base attribution (base_sha, conflicting_base_paths — always an array
+// —, base_attribution, compare_truncated). Best-effort.
 func (s *Server) emitSliceIntegrationConflict(ctx context.Context, parentRunID, parentStageID uuid.UUID, conflict *orchestrator.SliceConflict) {
+	basePaths := conflict.ConflictingBasePaths
+	if basePaths == nil {
+		basePaths = []string{}
+	}
 	payload, err := json.Marshal(map[string]any{
 		"parent_stage_id":          parentStageID.String(),
 		"conflicting_slice_index":  conflict.SliceIndex,
 		"conflicting_child_run_id": conflict.ChildRunID.String(),
+		"base_sha":                 conflict.BaseSHA,
+		"conflicting_base_paths":   basePaths,
+		"base_attribution":         conflict.BaseAttribution,
+		"compare_truncated":        conflict.CompareTruncated,
 	})
 	if err != nil {
 		s.logConsolidateWarn(ctx, "marshal slice_integration_conflict payload failed", parentRunID, err)

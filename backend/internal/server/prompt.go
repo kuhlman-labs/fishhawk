@@ -156,6 +156,22 @@ type promptResponse struct {
 	// the parent's declared assertions. The wire tags (type/path/literal)
 	// match the runner's upload.BindingAssertion decoder.
 	BindingAssertions []bindingAssertion `json:"binding_assertions,omitempty"`
+	// Counterfactuals is the approved plan's runner-executed counterfactual
+	// list (E85.3 / #4143), flattened one counterfactualSpec per plan entry in
+	// plan order. Served ONLY on an implement stage whose run has an approved
+	// plan declaring entries, is NOT a decomposition child (v0 executes the
+	// parent plan's entries on non-child implement stages only), and is not an
+	// ADR-090 merge-candidate verify-only pass (counterfactualSpecsForPrompt).
+	// Absent (the byte-identical default) everywhere else. The runner executes
+	// each entry after the committed-tree verify gate passes and records one
+	// counterfactual_observed event per entry.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the element tags MUST stay byte-identical to
+	// the runner's upload.CounterfactualSpec (runner/internal/upload/upload.go)
+	// — the counterfactual_spec ModeExact pair in backend/internal/wirecontract,
+	// plus the shared golden testdata/wire/counterfactual_spec.json. A tag drift
+	// silently drops the specs and the runner records no observation.
+	Counterfactuals []counterfactualSpec `json:"counterfactuals,omitempty"`
 	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot account's
 	// git commit identity, resolved from the App (slug + bot user-id) and
 	// echoed so the runner attributes App-backed commits to the App's bot
@@ -551,6 +567,81 @@ type promptScopeConstraint struct {
 type scopeExemption struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
+}
+
+// Counterfactual mutation kinds carried on counterfactualSpec.MutationKind.
+const (
+	counterfactualMutationReplace = "replace"
+	counterfactualMutationPatch   = "patch"
+)
+
+// counterfactualSpec is one approved-plan counterfactual (E85.3 / #4143),
+// FLATTENED for the runner: Index is the entry's position in the plan's
+// counterfactuals array (the join key every observation carries back),
+// MutationKind discriminates the two mutation forms ("replace" carries Find +
+// Replace, "patch" carries Patch), TestRun / TestPackage are the plan's
+// tests.run / tests.package. Replace has NO omitempty: an empty replacement is
+// a legal deletion of the match, so the key is always present and the runner
+// never has to tell an absent replacement from an empty one.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names AND options) MUST stay
+// byte-identical to the runner's upload.CounterfactualSpec
+// (runner/internal/upload/upload.go) — the counterfactual_spec ModeExact pair
+// in backend/internal/wirecontract, plus the shared golden
+// testdata/wire/counterfactual_spec.json both modules' tests read.
+type counterfactualSpec struct {
+	Index        int    `json:"index"`
+	ControlPath  string `json:"control_path"`
+	MutationKind string `json:"mutation_kind"`
+	Find         string `json:"find,omitempty"`
+	Replace      string `json:"replace"`
+	Patch        string `json:"patch,omitempty"`
+	TestRun      string `json:"test_run"`
+	TestPackage  string `json:"test_package"`
+	Expect       string `json:"expect"`
+}
+
+// counterfactualSpecsForPrompt flattens the approved plan's counterfactuals
+// into the implement prompt-response's wire shape (E85.3 / #4143). It returns
+// nil — the key omitted — when there is no approved plan or it declares no
+// entries, when the run is a decomposition child (v0 does not execute
+// counterfactuals on a fan-out slice; plan.Warnings advises the planner of
+// that), and when the dispatch is an ADR-090 merge-candidate verify-only pass,
+// which runs no agent and no counterfactual phase.
+//
+// A Patch-bearing entry is the patch form; anything else is the replace form.
+// plan.Validate / plan.Parse already enforced exactly-one-form, so the replace
+// form's nil Replace cannot reach here from an approved plan; it is read as an
+// empty replacement rather than dereferenced.
+func counterfactualSpecsForPrompt(approvedPlan *plan.Plan, runRow *run.Run, mergeCandidate *mergeCandidateVerifyTrigger) []counterfactualSpec {
+	if approvedPlan == nil || len(approvedPlan.Counterfactuals) == 0 {
+		return nil
+	}
+	if runRow.DecomposedFrom != nil || mergeCandidate != nil {
+		return nil
+	}
+	out := make([]counterfactualSpec, 0, len(approvedPlan.Counterfactuals))
+	for i, c := range approvedPlan.Counterfactuals {
+		spec := counterfactualSpec{
+			Index:       i,
+			ControlPath: c.ControlPath,
+			TestRun:     c.Tests.Run,
+			TestPackage: c.Tests.Package,
+			Expect:      c.Expect,
+		}
+		if c.Mutation.Patch != "" {
+			spec.MutationKind = counterfactualMutationPatch
+			spec.Patch = c.Mutation.Patch
+		} else {
+			spec.MutationKind = counterfactualMutationReplace
+			spec.Find = c.Mutation.Find
+			if c.Mutation.Replace != nil {
+				spec.Replace = *c.Mutation.Replace
+			}
+		}
+		out = append(out, spec)
+	}
+	return out
 }
 
 // acceptanceCriterionEntry is one effective acceptance criterion served to
@@ -1502,6 +1593,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
 	var bindingAssertions []bindingAssertion
+	var counterfactuals []counterfactualSpec
 	var scopeExemptions []scopeExemption
 	var fixup bool
 	var fixupBranch string
@@ -1593,6 +1685,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// declaration. Resolved across the decomposition fan-out boundary so
 		// children inherit the parent's assertions exactly as they inherit
 		// add_scope_files / ApprovalConditions.
+		// Runner-executed counterfactuals (E85.3 / #4143): echo the approved
+		// plan's entries for the runner's post-verify counterfactual phase.
+		// Never on a decomposition child or a merge-candidate verify-only pass
+		// (mergeCandidate is resolved at the capability gate above).
+		counterfactuals = counterfactualSpecsForPrompt(approvedPlan, runRow, mergeCandidate)
 		if approvedPlan != nil {
 			bindingAssertions = s.resolveApprovalBindingAssertions(r.Context(), runRow)
 			// Operator scope exemptions (#1229): echo the recovery run's
@@ -1971,6 +2068,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		StageAttempt:         run.StageAttemptToken(stage.DispatchedAt),
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
+		Counterfactuals:      counterfactuals,
 		ScopeExemptions:      scopeExemptions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
@@ -2358,6 +2456,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
 	var bindingAssertions []bindingAssertion
+	var counterfactuals []counterfactualSpec
 	var scopeExemptions []scopeExemption
 	var fixup bool
 	var fixupBranch string
@@ -2508,6 +2607,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// CONSUMED trigger (a later merge_candidate_verified row), so an ordinary
 		// fix-up that follows the pass takes the unchanged fix-up path.
 		mergeCandidate = s.resolveMergeCandidateVerifyTrigger(r.Context(), runRow.ID, stage.ID)
+		// Runner-executed counterfactuals (E85.3 / #4143): the same derivation
+		// as the dispatch path, read AFTER the merge-candidate resolution so a
+		// verify-only pass renders none.
+		counterfactuals = counterfactualSpecsForPrompt(approvedPlan, runRow, mergeCandidate)
 		if mergeCandidate == nil {
 			conflictResolution = s.resolveConflictResolutionTrigger(r.Context(), runRow.ID, stage.ID)
 		}
@@ -2763,6 +2866,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		StageAttempt:         run.StageAttemptToken(stage.DispatchedAt),
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
+		Counterfactuals:      counterfactuals,
 		ScopeExemptions:      scopeExemptions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
