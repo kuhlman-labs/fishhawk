@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -106,13 +107,129 @@ const (
 	operatorConcernSeverity planreview.ConcernSeverity = planreview.SeverityHigh
 )
 
-// maxOperatorConcernBytes caps the free-text operator_concern (#1311). It
-// matches the renderer's per-section cap (maxFixupConcernBytes in
-// backend/internal/prompt/prompt.go) so an over-length operator instruction
-// fails LOUD (400) here rather than being SILENTLY truncated by the renderer
-// downstream — a binding instruction must never be cut without the operator
-// knowing.
+// maxOperatorConcernBytes caps the free-text operator_concern (#1311) so an
+// over-length operator instruction fails LOUD (400) here. It used to equal the
+// renderer's single shared 4000-byte block cap, which let a maximum-size
+// operator_concern fill the block and silently push every routed concern off
+// it (#4284 / #4354). The renderer budget is now prompt.MaxFixupConcernBytes
+// (12000) and an operator concern is never trimmed, so this cap only has to
+// stay AT MOST that budget: a lone operator concern then always fits, and one
+// sharing the block with reviewer concerns is either admitted (their bodies
+// trimmed, never dropped) or refused before the transition with 422
+// fixup_concerns_overflow. TestFixupStage_OperatorConcernCapWithinRendererBudget
+// pins the relationship.
 const maxOperatorConcernBytes = 4000
+
+// fixupConcernsOverflowRemedy is the remedy every fixup_concerns_overflow
+// refusal names (#4284 C3).
+const fixupConcernsOverflowRemedy = "shorten operator_concern, split the concerns across more than one fix-up pass, or route fewer concern_ids"
+
+// maxOverflowDetailConcernIDs bounds the concern_ids echoed on a
+// fixup_concerns_overflow refusal's details (#4284 C3); concern_count still
+// reports the full routed count.
+const maxOverflowDetailConcernIDs = 50
+
+// fixupConcernsOverflowError is fixupStageAs' refusal when a pass's routed
+// concerns cannot be listed within the fix-up prompt's per-block budget even
+// at their minimum render — every summary line plus operator concerns in full
+// (#4284). It is returned BEFORE run.FixupStage, so the refusal leaves the
+// stage state, the pass budget, the audit log (no stage_fixup_triggered, no
+// minted operator concern) and every routed concern row untouched. The HTTP
+// handler maps it to 422 fixup_concerns_overflow; the auto-drive route_fixup
+// arm maps it to a decision_required outcome.
+type fixupConcernsOverflowError struct {
+	RequiredBytes int
+	MaxBytes      int
+	OverflowBytes int
+	ConcernCount  int
+	// ConcernIDs are the caller-routed concern ids (the operator concern is
+	// not minted on a refusal, so it has none).
+	ConcernIDs []string
+}
+
+func (e *fixupConcernsOverflowError) Error() string {
+	return fmt.Sprintf("the %d routed fix-up concern(s) need %d bytes of the fix-up prompt's %d-byte concern block even with every note cut to its summary line and operator concerns in full (%d bytes over); the pass was NOT routed and no budget was spent: %s",
+		e.ConcernCount, e.RequiredBytes, e.MaxBytes, e.OverflowBytes, fixupConcernsOverflowRemedy)
+}
+
+// details is the 422 fixup_concerns_overflow details map, keyed like the
+// sibling binding-channel refusals (bytes / max_bytes / overflow_bytes).
+func (e *fixupConcernsOverflowError) details() map[string]any {
+	ids := e.ConcernIDs
+	if len(ids) > maxOverflowDetailConcernIDs {
+		ids = ids[:maxOverflowDetailConcernIDs]
+	}
+	if ids == nil {
+		ids = []string{}
+	}
+	return map[string]any{
+		"bytes":          e.RequiredBytes,
+		"max_bytes":      e.MaxBytes,
+		"overflow_bytes": e.OverflowBytes,
+		"concern_count":  e.ConcernCount,
+		"concern_ids":    ids,
+		"remedy":         fixupConcernsOverflowRemedy,
+	}
+}
+
+// fixupRouteFit is the route-time measurement of a pass's concern set (#4284),
+// rendered by the SAME prompt code the agent is later served
+// (prompt.FixupConcernsFit over fixupPromptConcerns). Every concern carries
+// prompt.FixupConcernIDPlaceholder: the operator concern's id is minted only
+// after the transition, and a rendered block never shrinks as an id grows, so
+// a set that fits here fits at serve time with its real (or absent) ids.
+//
+//   - enforced measures the TRUSTED block only (non-acceptance concerns); it is
+//     the refusal input. Acceptance-derived concerns are exempt (#4284 C9): an
+//     acceptance triage pass must not newly page, and the no-drop renderer
+//     lists every acceptance failure even past the budget.
+//   - full measures both blocks; its TruncatedIndexes (into selected) feed the
+//     concern_bodies_truncated / truncated_concern_ids record on an admitted
+//     pass. Because the placeholder is the longest id the serve-time render
+//     can carry, the trimmed set it reports is a conservative superset.
+func fixupRouteFit(selected []planreview.Concern) (enforced, full prompt.FixupConcernFit) {
+	all := fixupPromptConcerns(selected, nil)
+	trusted := make([]prompt.FixupConcern, 0, len(all))
+	for i := range all {
+		all[i].ID = prompt.FixupConcernIDPlaceholder
+		if !all[i].AcceptanceDerived {
+			trusted = append(trusted, all[i])
+		}
+	}
+	return prompt.FixupConcernsFit(trusted), prompt.FixupConcernsFit(all)
+}
+
+// fixupTruncatedConcernIDs names the routed concern ids whose note body the
+// route-time fit trimmed (#4284 C4). When the routed ids pair with the
+// concerns by position (the rule fixupPromptConcerns applies at serve time)
+// the trimmed indexes map exactly. Otherwise the ids cannot be attributed by
+// position, so when any trimmed concern is a non-acceptance, non-operator one
+// — the only kind a caller-routed id can name — every caller-routed id is
+// listed: a superset, never an omission. The minted operator id is excluded
+// there because an operator concern is never trimmed.
+func fixupTruncatedConcernIDs(fit prompt.FixupConcernFit, selected []planreview.Concern, routedIDs, callerIDs []uuid.UUID) []string {
+	if !fit.BodiesTruncated {
+		return nil
+	}
+	out := []string{}
+	if len(routedIDs) == len(selected) {
+		for _, i := range fit.TruncatedIndexes {
+			out = append(out, routedIDs[i].String())
+		}
+		return out
+	}
+	for _, i := range fit.TruncatedIndexes {
+		c := selected[i]
+		if c.Provenance == planreview.ConcernProvenanceAcceptance || c.Category == operatorConcernCategory {
+			continue
+		}
+		for _, id := range callerIDs {
+			out = append(out, id.String())
+		}
+		break
+	}
+	return out
+}
 
 // fixupRequest is the JSON body of POST /v0/stages/{stage_id}/fixup.
 // ConcernIDs is the PRIMARY addressing scheme (#964): the stable
@@ -151,7 +268,10 @@ type fixupRequest struct {
 	// id-routed one: it is marked addressed_pending, threaded into the re-review's
 	// delta-verification section, and surfaces as an OPEN concern at the gate if
 	// the agent does not address it. The mint is best-effort — a nil store or an
-	// insert failure degrades to the pre-#2623 untracked delivery.
+	// insert failure degrades to the pre-#2623 untracked delivery. Since #4284
+	// the fix-up prompt lists it FIRST and in full, never trimmed; a pass whose
+	// concerns cannot all be listed within the concern block is refused (422
+	// fixup_concerns_overflow) before anything is minted or spent.
 	OperatorConcern string `json:"operator_concern"`
 	// OperatorEvidence declares that the OPERATOR executed a reproduction of
 	// the concern(s) this pass routes back (E48.103 / #2551). Its meaning is
@@ -693,6 +813,15 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 				err.Error(), nil)
 			return
 		}
+		// #4284: the routed concerns cannot be listed within the fix-up
+		// prompt's concern block even at their minimum render. Refused BEFORE
+		// the transition, so nothing was committed; ordered before the 500.
+		var overflow *fixupConcernsOverflowError
+		if errors.As(err, &overflow) {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_concerns_overflow",
+				err.Error(), overflow.details())
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"fixup failed", map[string]any{"error": err.Error()})
 		return
@@ -787,9 +916,10 @@ type fixupActionParams struct {
 }
 
 // fixupStageAs performs the gate-action core of POST /v0/stages/{id}/fixup
-// under the given identity: run.FixupStage, the stage_fixup_triggered audit
-// write, the durable-concern addressed_pending marking, the orchestrator
-// handoff, the drive re-park stamp, and the status notify. It is
+// under the given identity: the route-time concern fit check (#4284),
+// run.FixupStage, the stage_fixup_triggered audit write, the durable-concern
+// addressed_pending marking, the orchestrator handoff, the drive re-park
+// stamp, and the status notify. It is
 // identity-parameterised so the HTTP handler and the in-process campaign
 // auto-driver (E25.6 / ADR-047) drive the identical path and stamp identical
 // audit. run.FixupStage's sentinel errors are returned verbatim for the
@@ -803,6 +933,27 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// auto-driver, which reaches this method directly (#1445).
 	if !identityHasGateScope(id, "write:stages", "write:fixups") {
 		return nil, nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
+	}
+	// Route-time concern fit (#4284), BEFORE the transition: a pass whose
+	// concerns cannot all be listed in the fix-up prompt is refused here, so it
+	// spends no budget, writes no audit entry, mints no operator concern, and
+	// marks no concern addressed_pending — a concern the agent would not see
+	// can never be recorded as routed. An acceptance triage pass
+	// (AcceptanceStageID set) is EXEMPT (#4284 C9): it must not newly page, and
+	// the no-drop renderer lists every concern even past the budget.
+	enforcedFit, fullFit := fixupRouteFit(p.Selected)
+	if !enforcedFit.Fits && p.Options.AcceptanceStageID == nil {
+		ids := make([]string, 0, len(p.ConcernIDs))
+		for _, cid := range p.ConcernIDs {
+			ids = append(ids, cid.String())
+		}
+		return nil, nil, &fixupConcernsOverflowError{
+			RequiredBytes: enforcedFit.RequiredBytes,
+			MaxBytes:      enforcedFit.MaxBytes,
+			OverflowBytes: enforcedFit.OverflowBytes,
+			ConcernCount:  enforcedFit.ConcernCount,
+			ConcernIDs:    ids,
+		}
 	}
 	dec, err := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
 	if err != nil {
@@ -832,7 +983,8 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// (now including any minted operator-concern id) rides `concern_ids`; the
 	// minted id is ALSO recorded on its own `operator_concern_id` key so the
 	// gate-view fixups[] join attributes the pass to the operator concern.
-	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence)
+	truncatedIDs := fixupTruncatedConcernIDs(fullFit, p.Selected, routedIDs, p.ConcernIDs)
+	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence, fullFit.BodiesTruncated, truncatedIDs)
 
 	// PR-body-unsatisfiable signal (#2782): a routed instruction that names the
 	// PR body cannot take effect — a fix-up pass has no mechanism to write the
@@ -1515,9 +1667,13 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // so the gate-view fixups[] join attributes the routing pass to the operator
 // concern; the synthetic concern the prompt renderer reads back still rides the
 // `concerns` field. The mint is best-effort, so operatorConcernID is uuid.Nil
-// (and the key omitted) when the mint degraded. Best-effort: the transition is
-// already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string) {
+// (and the key omitted) when the mint degraded. When bodiesTruncated is true
+// the route-time fit (#4284) trimmed at least one concern's note body in the
+// fix-up prompt, and the payload records `concern_bodies_truncated: true` plus
+// `truncated_concern_ids` (a conservative superset — see
+// fixupTruncatedConcernIDs); both keys are omitted otherwise. Best-effort: the
+// transition is already committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -1628,6 +1784,18 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 	// refuse a reviewer `confirmed` on the concerns this pass routed.
 	if operatorEvidence != "" {
 		fields["operator_evidence"] = operatorEvidence
+	}
+	// #4284 C4: an ADMITTED pass whose concern note bodies the prompt trims.
+	// Recorded only when a body was trimmed, so every other payload stays
+	// byte-identical. truncated_concern_ids is a conservative superset (the
+	// route-time fit renders with the longest id the serve-time render can
+	// carry) and may be empty when the trimmed concerns carry no id.
+	if bodiesTruncated {
+		if truncatedConcernIDs == nil {
+			truncatedConcernIDs = []string{}
+		}
+		fields["concern_bodies_truncated"] = true
+		fields["truncated_concern_ids"] = truncatedConcernIDs
 	}
 
 	payload, _ := json.Marshal(fields)

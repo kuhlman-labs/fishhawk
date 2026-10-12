@@ -254,6 +254,20 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 					Note:             ferr.Error(),
 				}, nil
 			}
+			// The open concerns cannot all be listed in the fix-up prompt's
+			// concern block (#4284 C5): fixupStageAs refused BEFORE the
+			// transition, so nothing was spent. Same well-defined gate state as
+			// the #2091 arms above — the operator splits the concerns across
+			// passes, or waives / defers some — not a dispatch failure.
+			var overflow *fixupConcernsOverflowError
+			if errors.As(ferr, &overflow) {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    "fixup_concerns_overflow",
+					Action:           delegation.ActionRouteFixup,
+					Note:             ferr.Error(),
+				}, nil
+			}
 			return AutoDriveOutcome{Action: delegation.ActionRouteFixup, Note: "fixup dispatch failed"}, ferr
 		}
 		if dispatched {
