@@ -171,7 +171,7 @@ The v0 REST API exposes **168 operations** across the paths below, generated fro
 | `GET` | `/v0/runs/{run_id}/stages` | List stages for a run |
 | `GET` | `/v0/runs/{run_id}/stages/{stage_id}` | Read one stage by its (run, stage) handle, with optional terminal-wait long-poll |
 | `POST` | `/v0/runs/{run_id}/reviews/reconcile` | Terminate a review round orphaned by a fishhawkd restart |
-| `POST` | `/v0/runs/{run_id}/reviews/rerun` | Re-run a verdict-less implement-review round |
+| `POST` | `/v0/runs/{run_id}/reviews/rerun` | Re-run a verdict-less implement-review round, or start a decomposed parent's first one |
 | `POST` | `/v0/runs/{run_id}/stages/{stage_id}/reap-failure` | Report a runner failure so a stranded 'dispatched' or 'running' stage fails |
 | `POST` | `/v0/runs/{run_id}/stages/{stage_id}/host-dispatch` | Mark a host-local spawn attempt so a parked stage becomes 'dispatched' |
 | `POST` | `/v0/runs/{run_id}/stages/{stage_id}/progress` | Record a stage's mid-execution progress heartbeat |
