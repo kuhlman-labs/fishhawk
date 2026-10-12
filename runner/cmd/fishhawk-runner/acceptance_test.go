@@ -18,7 +18,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1915,7 +1917,9 @@ func TestRun_AcceptanceStage_NoTargetHosts_SkipsProbe(t *testing.T) {
 // TestRun_AcceptanceStage_TargetVerified_SpawnsAndTearsDownAfterVerdict:
 // the happy path — the target serves the expected head SHA, the gate logs
 // acceptance_target_verified, the agent runs, the verdict ships, and the
-// deferred teardown has run by the time run() returns.
+// teardown has run by the time run() returns. WHEN it runs relative to the
+// terminal egress (#4308: after the agent, before the trace/verdict ship) is
+// pinned by TestRun_AcceptanceStage_TeardownCompletesBeforeTerminalEgress.
 func TestRun_AcceptanceStage_TargetVerified_SpawnsAndTearsDownAfterVerdict(t *testing.T) {
 	_, fu, args := acceptanceStageSetup(t)
 	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
@@ -1946,6 +1950,281 @@ func TestRun_AcceptanceStage_TargetVerified_SpawnsAndTearsDownAfterVerdict(t *te
 	}
 	if invoker.callIdx != 1 {
 		t.Errorf("agent invoked %d times, want 1", invoker.callIdx)
+	}
+}
+
+// --- #4308: the preview teardown completes before the first terminal egress --
+
+// tornLines counts the `torn` lines a `echo torn >> marker` teardown appended:
+// 0 when the marker is absent.
+func tornLines(t *testing.T, marker string) int {
+	t.Helper()
+	b, err := os.ReadFile(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read teardown marker: %v", err)
+	}
+	return strings.Count(string(b), "torn\n")
+}
+
+// markerAtShip installs a beforeShip hook recording, per terminal egress call,
+// whether the teardown marker existed at that instant ("trace:true", ...).
+func markerAtShip(fu *fakeUploader, marker string) *[]string {
+	seen := &[]string{}
+	fu.beforeShip = func(kind string) {
+		_, err := os.Stat(marker)
+		*seen = append(*seen, fmt.Sprintf("%s:%t", kind, err == nil))
+	}
+	return seen
+}
+
+// releasedOutcome returns the outcome of the acceptance_preview_released
+// runner-log event, or "" when it was not logged.
+func releasedOutcome(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, `"event":"`+acceptanceEventPreviewReleased+`"`) {
+			continue
+		}
+		var ev struct {
+			Outcome string `json:"outcome"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) == nil {
+			return ev.Outcome
+		}
+	}
+	return ""
+}
+
+// TestRun_AcceptanceStage_TeardownCompletesBeforeTerminalEgress (#4308): on the
+// verified-target happy path the preview teardown has COMPLETED by the instant
+// of the first trace ship and of the verdict ship — either can settle the stage
+// and free the shared local-acceptance slot, so the next acceptance's provision
+// must find the shared preview path already clean. With only the deferred
+// teardown the marker is absent at both ship calls.
+func TestRun_AcceptanceStage_TeardownCompletesBeforeTerminalEgress(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewTeardownCmdEnv, "echo torn >> "+marker)
+	seen := markerAtShip(fu, marker)
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if len(*seen) == 0 || (*seen)[0] != "trace:true" {
+		t.Errorf("teardown must complete before the FIRST trace ship; ship calls saw marker: %v", *seen)
+	}
+	if !slices.Contains(*seen, "acceptance:true") || slices.Contains(*seen, "acceptance:false") {
+		t.Errorf("teardown must complete before the verdict ship; ship calls saw marker: %v", *seen)
+	}
+	if o := releasedOutcome(stderr.String()); o != previewReleaseOK {
+		t.Errorf("acceptance_preview_released outcome = %q, want %q:\n%s", o, previewReleaseOK, stderr.String())
+	}
+}
+
+// TestRun_AcceptanceStage_AgentFailure_TeardownCompletesBeforeTraceShip
+// (#4308): on an agent failure the trace upload ALONE settles the stage (its
+// agent_failed manifest), so the release must precede it, not just the
+// verdict ship.
+func TestRun_AcceptanceStage_AgentFailure_TeardownCompletesBeforeTraceShip(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewTeardownCmdEnv, "echo torn >> "+marker)
+	seen := markerAtShip(fu, marker)
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:              false,
+		FailureCategory: "A",
+		FailureReason:   "agent crashed",
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if len(fu.gotShipCalls) == 0 {
+		t.Fatalf("the trace must still ship on an agent failure:\n%s", stderr.String())
+	}
+	if len(*seen) == 0 || (*seen)[0] != "trace:true" {
+		t.Errorf("teardown must complete before the trace ship that settles the failed stage; ship calls saw marker: %v", *seen)
+	}
+	if o := releasedOutcome(stderr.String()); o != previewReleaseOK {
+		t.Errorf("acceptance_preview_released outcome = %q, want %q:\n%s", o, previewReleaseOK, stderr.String())
+	}
+}
+
+// TestRun_AcceptanceStage_TeardownRunsExactlyOnce (#4308): the synchronous
+// release plus the retained deferred fallback fork the teardown command ONCE —
+// the closure is idempotent.
+func TestRun_AcceptanceStage_TeardownRunsExactlyOnce(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewTeardownCmdEnv, "echo torn >> "+marker)
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if n := tornLines(t, marker); n != 1 {
+		t.Errorf("teardown ran %d times, want exactly 1 (explicit release + deferred fallback must not double-fork)", n)
+	}
+}
+
+// shrinkPreviewWaitDelay sets previewCommandWaitDelay for one test, restored
+// on cleanup (run() tests are never parallel: they t.Setenv).
+func shrinkPreviewWaitDelay(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := previewCommandWaitDelay
+	previewCommandWaitDelay = d
+	t.Cleanup(func() { previewCommandWaitDelay = orig })
+}
+
+// sleeperPid reads the pid a teardown fixture wrote with `echo $! > file`, and
+// registers a cleanup SIGKILL so a surviving sleeper never outlives the test.
+func sleeperPid(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("teardown fixture wrote no sleeper pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("bad sleeper pid %q: %v", b, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	return pid
+}
+
+// TestRun_AcceptanceStage_TeardownPipeHolder_BoundedByWaitDelay (#4308 C1): the
+// teardown now gates the verdict, so a teardown that exits but leaves a
+// backgrounded grandchild holding its output pipe must NOT hold the release
+// until that grandchild exits. WaitDelay closes the pipe: the release returns
+// within timeout+WaitDelay (outcome failed — the hook left a pipe holder), and
+// the verdict still ships. Without WaitDelay the release blocks for the
+// sleeper's whole lifetime.
+func TestRun_AcceptanceStage_TeardownPipeHolder_BoundedByWaitDelay(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	waitDelay := scaledD(300 * time.Millisecond)
+	timeout := scaledD(5 * time.Second)
+	sleeper := scaledD(30 * time.Second)
+	shrinkPreviewWaitDelay(t, waitDelay)
+	t.Setenv(previewProvisionTimeoutSecsEnv, strconv.Itoa(int(timeout/time.Second)))
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "sleeper.pid")
+	t.Setenv(previewTeardownCmdEnv, fmt.Sprintf("sleep %d & echo $! > %s; echo torn",
+		int(sleeper/time.Second), pidFile))
+	var agentDone, traceAt time.Time
+	fu.beforeShip = func(kind string) {
+		if kind == "trace" && traceAt.IsZero() {
+			traceAt = time.Now()
+		}
+	}
+	invoker := &fakeInvoker{
+		canned:   agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)},
+		onInvoke: func(int, agent.Invocation) { agentDone = time.Now() },
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	sleeperPid(t, pidFile)
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("the verdict must still ship after a pipe-holding teardown")
+	}
+	if agentDone.IsZero() || traceAt.IsZero() {
+		t.Fatalf("missing stamps (agentDone=%v traceAt=%v)", agentDone, traceAt)
+	}
+	if el, bound := traceAt.Sub(agentDone), timeout+waitDelay; el >= bound {
+		t.Errorf("release held the trace ship %s after the agent exited, want < timeout+WaitDelay = %s (sleeper lives %s)", el, bound, sleeper)
+	}
+	if o := releasedOutcome(stderr.String()); o != previewReleaseFailed {
+		t.Errorf("acceptance_preview_released outcome = %q, want %q (hook left a pipe holder):\n%s", o, previewReleaseFailed, stderr.String())
+	}
+}
+
+// TestRun_AcceptanceStage_TeardownWedged_GroupKilledAtTimeout (#4308 C1): a
+// teardown that never exits (it waits on a backgrounded sleeper) is SIGKILLed
+// as a PROCESS GROUP at its timeout — the sleeper grandchild dies with the
+// shell, the release returns within timeout+WaitDelay with outcome timed_out,
+// and the verdict still ships. Killing only the shell would leave the sleeper
+// alive.
+func TestRun_AcceptanceStage_TeardownWedged_GroupKilledAtTimeout(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	waitDelay := scaledD(300 * time.Millisecond)
+	timeout := scaledD(1 * time.Second)
+	sleeper := scaledD(30 * time.Second)
+	shrinkPreviewWaitDelay(t, waitDelay)
+	t.Setenv(previewProvisionTimeoutSecsEnv, strconv.Itoa(int(timeout/time.Second)))
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "sleeper.pid")
+	t.Setenv(previewTeardownCmdEnv, fmt.Sprintf("sleep %d & echo $! > %s; wait",
+		int(sleeper/time.Second), pidFile))
+	var agentDone, traceAt time.Time
+	fu.beforeShip = func(kind string) {
+		if kind == "trace" && traceAt.IsZero() {
+			traceAt = time.Now()
+		}
+	}
+	invoker := &fakeInvoker{
+		canned:   agent.Result{OK: true, StructuredOutput: []byte(passedVerdict)},
+		onInvoke: func(int, agent.Invocation) { agentDone = time.Now() },
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	pid := sleeperPid(t, pidFile)
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("the verdict must still ship after a timed-out teardown")
+	}
+	if el, bound := traceAt.Sub(agentDone), timeout+waitDelay+scaledD(2*time.Second); el >= bound {
+		t.Errorf("release held the trace ship %s after the agent exited, want < %s", el, bound)
+	}
+	if o := releasedOutcome(stderr.String()); o != previewReleaseTimedOut {
+		t.Errorf("acceptance_preview_released outcome = %q, want %q:\n%s", o, previewReleaseTimedOut, stderr.String())
+	}
+	// The sleeper shares the hook's process group: the group SIGKILL must
+	// have reached it. Poll briefly — a killed orphan is reaped by init
+	// asynchronously and answers kill(pid, 0) until it is.
+	deadline := time.Now().Add(scaledD(3 * time.Second))
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("sleeper grandchild %d still alive after the teardown timed out: the process group was not killed", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

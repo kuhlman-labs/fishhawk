@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -42,15 +45,26 @@ import (
  *               (#3091); unverifiable (the target answered but exposes no
  *               build identifier) still warns and proceeds.
  *   teardown  — FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD runs best-effort
- *               via defer at the call site, so it covers BOTH the
- *               after-the-verdict-ships happy path and every
- *               post-provision failure return. It runs DETACHED from the
+ *               and at most ONCE (sync.Once). On the spawn path the call site
+ *               runs it SYNCHRONOUSLY as soon as the agent exits and BEFORE
+ *               the runner's first terminal egress (trace, transcript,
+ *               verdict), logging acceptance_preview_released{outcome}: any
+ *               terminal egress can settle the stage and free the shared
+ *               local-acceptance slot, and the next acceptance's provision
+ *               must not race this one's removal of the shared fixed preview
+ *               worktree (#4308). A defer at the call site stays as the
+ *               fallback for every pre-spawn failure return and the cancel
+ *               path. It runs DETACHED from the
  *               runner's cancellation (context.WithoutCancel) but still
  *               bounded by the provision timeout (#3394): exec.CommandContext
  *               refuses to Start on an already-done context, so a stage
  *               cancelled or killed mid-validation (the SIGTERM chain from the
  *               MCP verb) would otherwise have its teardown refused and leak
- *               the preview instance on the target port. The residual is a
+ *               the preview instance on the target port. Because it now gates
+ *               the verdict, runPreviewCommand hard-bounds it: the hook runs
+ *               in its own process group, SIGKILLed as a group on timeout,
+ *               and WaitDelay stops a pipe-holding grandchild from holding
+ *               the output read past the bound. The residual is a
  *               SIGKILL of the runner process itself, which no defer survives
  *               — covered by `scripts/dev preview`'s pre-provision port
  *               reclaim on the NEXT provision. A teardown failure logs an
@@ -87,6 +101,16 @@ const (
 	defaultPreviewPollInterval       = 2 * time.Second
 	defaultPreviewQuickPollInterval  = 500 * time.Millisecond
 	defaultPreviewQuickProbeAttempts = 3
+)
+
+// acceptanceEventPreviewReleased is the RUNNER-LOG event (not an audit
+// category) main.go emits after the synchronous post-agent teardown (#4308),
+// carrying one of the previewRelease* outcomes.
+const (
+	acceptanceEventPreviewReleased = "acceptance_preview_released"
+	previewReleaseOK               = "ok"
+	previewReleaseFailed           = "failed"
+	previewReleaseTimedOut         = "timed_out"
 )
 
 // probeOutcome is the four-way classification of a target-identity probe.
@@ -290,6 +314,18 @@ func envSeconds(name string, def time.Duration) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// previewCommandWaitDelay bounds how long runPreviewCommand waits for the
+// hook's output pipe to close after the hook exits or is killed (exec.Cmd
+// WaitDelay). Without it a backgrounded grandchild that inherited the pipe
+// (a wedged `scripts/dev` child) holds CombinedOutput open indefinitely —
+// even past the timeout, because once the shell has exited there is nothing
+// left for the context to cancel. A var only so tests can shrink it.
+var previewCommandWaitDelay = 5 * time.Second
+
+// errPreviewCommandTimedOut marks a runPreviewCommand error as the command's
+// own timeout, so the teardown can report outcome timed_out (#4308).
+var errPreviewCommandTimedOut = errors.New("timed out")
+
 // runPreviewCommand executes an operator hook via `sh -c` in dir (the
 // operator's dispatch working_dir) with a CREDENTIAL-STRIPPED env plus
 // FISHHAWK_PREVIEW_SHA / FISHHAWK_PREVIEW_TARGET_HOST. When dir is "" the
@@ -309,6 +345,15 @@ func envSeconds(name string, def time.Duration) time.Duration {
 // verify gates) applies the default-deny allow-list, so those secrets never
 // reach the hook or the branch binary it spawns while PATH/HOME/GO* survive
 // for the Go build.
+//
+// The command is HARD-bounded (#4308, where the teardown came to gate the
+// verdict ship): Setpgid puts the hook in its own process group and Cancel
+// SIGKILLs the whole group on timeout, so a `scripts/dev` grandchild dies with
+// the shell, and WaitDelay closes the output pipe a surviving pipe-holder
+// still has open. A hook that exits 0 but leaves such a holder therefore
+// returns exec.ErrWaitDelay (a failure) after previewCommandWaitDelay instead
+// of blocking until the holder exits. The worst case is timeout +
+// previewCommandWaitDelay.
 func runPreviewCommand(ctx context.Context, command, expectedSHA, host, dir string, timeout time.Duration) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -318,12 +363,20 @@ func runPreviewCommand(ctx context.Context, command, expectedSHA, host, dir stri
 		"FISHHAWK_PREVIEW_SHA="+expectedSHA,
 		"FISHHAWK_PREVIEW_TARGET_HOST="+host,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	cmd.WaitDelay = previewCommandWaitDelay
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return nil
 	}
 	if cctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("timed out after %s: output tail: %s", timeout, outputTail(out))
+		return fmt.Errorf("%w after %s: output tail: %s", errPreviewCommandTimedOut, timeout, outputTail(out))
 	}
 	return fmt.Errorf("%v: output tail: %s", err, outputTail(out))
 }
@@ -342,12 +395,16 @@ func outputTail(out []byte) string {
 // acceptanceTargetGate runs provision → readiness → identity gate for the
 // acceptance stage's first declared egress target host. Returns:
 //
-//	teardown   — non-nil when a teardown command must run; the CALLER
-//	             defers it immediately, so it covers both the
-//	             after-the-verdict-ships happy path and EVERY
-//	             post-provision failure return (binding condition of the
-//	             approved plan). Best-effort: failures are logged
-//	             (acceptance_preview_teardown_failed), never propagated.
+//	teardown   — non-nil when a teardown command must run. It is
+//	             IDEMPOTENT (the body runs at most once) and returns the
+//	             outcome (previewRelease*: ok | failed | timed_out). The
+//	             CALLER defers it immediately, so it covers EVERY
+//	             post-provision failure return and the cancel path, AND
+//	             calls it synchronously once the agent exits, before the
+//	             first terminal egress (#4308): the shared slot must free
+//	             only after the shared preview path is clean. Best-effort:
+//	             failures are logged (acceptance_preview_teardown_failed),
+//	             never propagated.
 //	failReason — "" to proceed with the spawn; otherwise one of the
 //	             acceptanceReason* constants, failed category-C pre-spawn
 //	             by the caller with failDetail.
@@ -359,7 +416,7 @@ func outputTail(out []byte) string {
 // (#3091): with no expectation the target's identity cannot be verified
 // against anything, so proceeding would validate whatever build answers at
 // the shared slot and record a verdict bound to no tree.
-func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHosts []string, expectedSHA, runID string, logSink io.Writer) (teardown func(), failReason, failDetail string) {
+func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHosts []string, expectedSHA, runID string, logSink io.Writer) (teardown func() string, failReason, failDetail string) {
 	if len(targetHosts) == 0 {
 		return nil, "", ""
 	}
@@ -393,21 +450,14 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 	}
 
 	if gcfg.teardownCmd != "" {
-		teardown = func() {
-			// DETACHED from the runner's cancellation, deliberately (#3394): the
-			// defer runs AFTER a cancelled stage's ctx is already done, and
-			// exec.CommandContext returns ctx.Err() from Start on a done context
-			// — so under the parent ctx the teardown never even forks and the
-			// provisioned instance leaks on exactly the cancel path. The
-			// provision timeout still bounds it (runPreviewCommand re-wraps in
-			// WithTimeout), so a hung teardown cannot stall runner exit
-			// indefinitely. Do NOT collapse this back to ctx: the teardown must
-			// outlive the cancellation that triggered it.
-			if err := runPreviewCommand(context.WithoutCancel(ctx), gcfg.teardownCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout); err != nil {
-				_, _ = fmt.Fprintf(logSink,
-					`{"event":"acceptance_preview_teardown_failed","run_id":%q,"host":%q,"detail":%q}`+"\n",
-					runID, host, err.Error())
-			}
+		// sync.Once (#4308): the caller both defers the teardown (fallback)
+		// and calls it synchronously after the agent exits, so without the
+		// guard the happy path would fork `scripts/dev preview-down` twice.
+		var once sync.Once
+		outcome := ""
+		teardown = func() string {
+			once.Do(func() { outcome = runTeardown(ctx, gcfg, expectedSHA, host, runID, logSink) })
+			return outcome
 		}
 	}
 
@@ -440,6 +490,34 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 	default:
 		return teardown, acceptanceReasonTargetUnreach, res.detail
 	}
+}
+
+// runTeardown runs the operator's teardown hook once and maps the result to
+// a previewRelease* outcome: ok on success, timed_out when the hook hit its
+// own bound, failed otherwise (including exec.ErrWaitDelay, a hook that
+// exited but left its output pipe held). Any failure is logged
+// acceptance_preview_teardown_failed and never propagated.
+func runTeardown(ctx context.Context, gcfg previewGateConfig, expectedSHA, host, runID string, logSink io.Writer) string {
+	// DETACHED from the runner's cancellation, deliberately (#3394): the
+	// defer runs AFTER a cancelled stage's ctx is already done, and
+	// exec.CommandContext returns ctx.Err() from Start on a done context
+	// — so under the parent ctx the teardown never even forks and the
+	// provisioned instance leaks on exactly the cancel path. The
+	// provision timeout still bounds it (runPreviewCommand re-wraps in
+	// WithTimeout), so a hung teardown cannot stall runner exit
+	// indefinitely. Do NOT collapse this back to ctx: the teardown must
+	// outlive the cancellation that triggered it.
+	err := runPreviewCommand(context.WithoutCancel(ctx), gcfg.teardownCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout)
+	if err == nil {
+		return previewReleaseOK
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"acceptance_preview_teardown_failed","run_id":%q,"host":%q,"detail":%q}`+"\n",
+		runID, host, err.Error())
+	if errors.Is(err, errPreviewCommandTimedOut) {
+		return previewReleaseTimedOut
+	}
+	return previewReleaseFailed
 }
 
 // awaitTargetReady polls probeTargetIdentity until verified or the budget

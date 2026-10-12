@@ -3111,7 +3111,8 @@ fi
 # flag fails on usage alone (line-order via grep -n on the function body).
 preview_body="$(typeset -f cmd_preview)"
 sp_parse_ln="$(print -r -- "$preview_body" | grep -n '_preview_parse_args' | head -n 1 | cut -d: -f1)"
-sp_env_ln="$(print -r -- "$preview_body" | grep -n 'source "${REPO_ROOT}/.env"' | head -n 1 | cut -d: -f1)"
+# .env lands through the shared _preview_load_env helper since #4308.
+sp_env_ln="$(print -r -- "$preview_body" | grep -n '_preview_load_env' | head -n 1 | cut -d: -f1)"
 if [[ -n "$sp_parse_ln" && -n "$sp_env_ln" ]] && (( sp_parse_ln < sp_env_ln )); then
   pass "cmd_preview parses argv (_preview_parse_args) BEFORE sourcing .env"
 else
@@ -3682,7 +3683,8 @@ if [[ "$sp15m_serve_line" == *'"${reply[@]}"'* && "$sp15m_serve_line" == *'FISHH
 else
   fail "cmd_preview serve line should retain \${reply[@]} and FISHHAWKD_ADDR=\$paddr (got: $sp15m_serve_line)"
 fi
-sp15m_env_ln="$(print -r -- "$preview_body" | grep -n 'source "${REPO_ROOT}/.env"' | head -n 1 | cut -d: -f1)"
+# .env lands through the shared _preview_load_env helper since #4308.
+sp15m_env_ln="$(print -r -- "$preview_body" | grep -n '_preview_load_env' | head -n 1 | cut -d: -f1)"
 sp15m_passthru_ln="$(print -r -- "$preview_body" | grep -n '_preview_passthrough_env' | head -n 1 | cut -d: -f1)"
 sp15m_worktree_ln="$(print -r -- "$preview_body" | grep -n 'git -C "${REPO_ROOT}" worktree add' | head -n 1 | cut -d: -f1)"
 if [[ -n "$sp15m_env_ln" && -n "$sp15m_passthru_ln" && -n "$sp15m_worktree_ln" ]] \
@@ -4071,6 +4073,280 @@ else
 fi
 unfunction pr15n_g pr15n_resolve pr15n_leftovers 2>/dev/null
 rm -rf "$pr15n_dir"
+
+# 15o. Shared-slot preview lock (#4308). The next acceptance's `scripts/dev
+# preview` raced the previous holder's `preview-down`, which was still removing
+# the shared fixed preview worktree. Every contender below is a SEPARATE process
+# (a background job or a `$( … )` substitution) — a zsh fcntl lock is
+# re-entrant within the process that holds it, so an acquire in the holding
+# shell would prove nothing. Each leg gets its own tempdir.
+pl_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-test-pl.XXXXXX")"
+# pl_wait_for <path> <tenths>: poll (bounded) until <path> exists.
+pl_wait_for() {
+  local f="$1" n="$2" i=0
+  while [[ ! -e "$f" ]] && (( i < n )); do sleep 0.1; (( ++i )); done
+  [[ -e "$f" ]]
+}
+
+# (a) FISHHAWK_PREVIEW_LOCK_TIMEOUT: unset → 240, a valid value echoes, and
+# every invalid value fails closed naming the knob.
+pl_rc=0; pl_out="$(unset FISHHAWK_PREVIEW_LOCK_TIMEOUT; _preview_lock_timeout 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == 240 ]]; then
+  pass "_preview_lock_timeout: unset defaults to 240"
+else
+  fail "_preview_lock_timeout unset should echo 240 (rc=$pl_rc out=$pl_out)"
+fi
+pl_rc=0; pl_out="$(FISHHAWK_PREVIEW_LOCK_TIMEOUT=5 _preview_lock_timeout 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == 5 ]]; then
+  pass "_preview_lock_timeout: 5 echoes 5"
+else
+  fail "_preview_lock_timeout=5 should echo 5 (rc=$pl_rc out=$pl_out)"
+fi
+for pl_bad in abc 0 3601 -1; do
+  pl_rc=0; pl_out="$(FISHHAWK_PREVIEW_LOCK_TIMEOUT="$pl_bad" _preview_lock_timeout 2>&1)" || pl_rc=$?
+  if [[ "$pl_rc" == 1 && "$pl_out" == *FISHHAWK_PREVIEW_LOCK_TIMEOUT* ]]; then
+    pass "_preview_lock_timeout: '${pl_bad}' fails closed naming the knob"
+  else
+    fail "_preview_lock_timeout '${pl_bad}' should return 1 naming the knob (rc=$pl_rc out=$pl_out)"
+  fi
+done
+
+# (b) Mutual exclusion: a background holder takes the lock and keeps it until a
+# release file appears. The contended acquire (gated on the holder's .owner, so
+# the pid assertion reads a written value) times out at 1s with rc 1, naming the
+# lock file and the holder pid; once the holder is released it succeeds.
+pl_lk="${pl_dir}/b/preview.lock"
+pl_rel="${pl_dir}/b.release"
+( _preview_lock_acquire "$pl_lk" 5 >/dev/null 2>&1 || exit 9; pl_wait_for "$pl_rel" 300 ) &
+pl_holder=$!
+if pl_wait_for "${pl_lk}.owner" 100; then
+  pl_rc=0; pl_out="$(_preview_lock_acquire "$pl_lk" 1 2>&1)" || pl_rc=$?
+  if [[ "$pl_rc" == 1 && "$pl_out" == *"$pl_lk"* && "$pl_out" == *"held by pid ${pl_holder}"* \
+        && "$pl_out" == *'waiting for the preview lock'* && "$pl_out" == *FISHHAWK_PREVIEW_LOCK_TIMEOUT* ]]; then
+    pass "_preview_lock_acquire: a held lock times out (rc 1) naming the lock file, holder pid and knob"
+  else
+    fail "_preview_lock_acquire should refuse a held lock at its bound (rc=$pl_rc holder=$pl_holder out: $pl_out)"
+  fi
+else
+  fail "_preview_lock_acquire holder never wrote ${pl_lk}.owner"
+fi
+: > "$pl_rel"
+wait "$pl_holder" 2>/dev/null || true
+pl_rc=0; pl_out="$(_preview_lock_acquire "$pl_lk" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" != *waiting* ]]; then
+  pass "_preview_lock_acquire: a released lock is acquired at once"
+else
+  fail "_preview_lock_acquire should take a released lock (rc=$pl_rc out: $pl_out)"
+fi
+
+# (b2) .owner is advisory (C4): an empty or stale (dead-pid) value prints
+# 'unknown' and never trips set -u/-e.
+: > "${pl_dir}/empty.owner"
+print -r -- 999999999 > "${pl_dir}/stale.owner"
+pl_rc=0; pl_out="$(set -eu; print -r -- "$(_preview_lock_owner "${pl_dir}/empty.owner")/$(_preview_lock_owner "${pl_dir}/stale.owner")/$(_preview_lock_owner "${pl_dir}/absent.owner")")" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == unknown/unknown/unknown ]]; then
+  pass "_preview_lock_owner: empty, stale and absent .owner print 'unknown'"
+else
+  fail "_preview_lock_owner should print 'unknown' for empty/stale/absent (rc=$pl_rc out=$pl_out)"
+fi
+
+# (c) Dead-holder recovery: a holder that spawns a disowned `sleep` grandchild
+# and then exits — or is SIGKILLed — leaves the lock immediately acquirable
+# (the kernel drops a process's fcntl locks at exit; the child inherits none).
+pl_lk="${pl_dir}/c/preview.lock"
+( _preview_lock_acquire "$pl_lk" 5 >/dev/null 2>&1; sleep 30 & print -r -- $! > "${pl_dir}/c.sleeper"; disown ) &
+wait $! 2>/dev/null || true
+pl_rc=0; pl_out="$(_preview_lock_acquire "$pl_lk" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 ]]; then
+  pass "_preview_lock_acquire: an exited holder's disowned child keeps no lock"
+else
+  fail "_preview_lock_acquire should take a lock whose holder exited (rc=$pl_rc out: $pl_out)"
+fi
+kill "$(cat "${pl_dir}/c.sleeper" 2>/dev/null)" 2>/dev/null || true
+# The holder must still BE the lock owner when killed: its sleep is a waited
+# background child, never an exec'd last command (an exec would close the
+# close-on-exec lock fd and release the lock before the SIGKILL).
+( _preview_lock_acquire "$pl_lk" 5 >/dev/null 2>&1; sleep 30 & print -r -- $! > "${pl_dir}/c.sleeper2"; : > "${pl_dir}/c.held"; wait ) &
+pl_holder=$!
+if pl_wait_for "${pl_dir}/c.held" 100; then
+  kill -KILL "$pl_holder" 2>/dev/null
+  wait "$pl_holder" 2>/dev/null || true
+  pl_rc=0; pl_out="$(_preview_lock_acquire "$pl_lk" 1 2>&1)" || pl_rc=$?
+  if [[ "$pl_rc" == 0 ]]; then
+    pass "_preview_lock_acquire: a SIGKILLed holder leaves the lock acquirable"
+  else
+    fail "_preview_lock_acquire should take a lock whose holder was SIGKILLed (rc=$pl_rc out: $pl_out)"
+  fi
+else
+  fail "_preview_lock_acquire SIGKILL-leg holder never acquired"
+fi
+kill "$(cat "${pl_dir}/c.sleeper2" 2>/dev/null)" 2>/dev/null || true
+
+# (d) Fail OPEN when the lock is unsupported or unopenable: each degrade prints
+# a warning and returns 0 (the runner-side ordering is the primary control).
+pl_rc=0; pl_out="$(zmodload() { return 1 }; _preview_lock_acquire "${pl_dir}/d1/preview.lock" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == *'WITHOUT the preview lock'* ]]; then
+  pass "_preview_lock_acquire: an unloadable zsh/system fails open with a warning"
+else
+  fail "_preview_lock_acquire should fail open when zsh/system is unloadable (rc=$pl_rc out: $pl_out)"
+fi
+pl_rc=0; pl_out="$(zsystem() { if [[ "$1" == supports ]]; then return 1; fi; builtin zsystem "$@"; }; _preview_lock_acquire "${pl_dir}/d2/preview.lock" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == *'WITHOUT the preview lock'* ]]; then
+  pass "_preview_lock_acquire: no flock support fails open with a warning"
+else
+  fail "_preview_lock_acquire should fail open without flock support (rc=$pl_rc out: $pl_out)"
+fi
+: > "${pl_dir}/d3file"
+pl_rc=0; pl_out="$(_preview_lock_acquire "${pl_dir}/d3file/preview.lock" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == *'cannot open the preview lock'* ]]; then
+  pass "_preview_lock_acquire: an unopenable lock file fails open with a warning"
+else
+  fail "_preview_lock_acquire should fail open on an unopenable lock file (rc=$pl_rc out: $pl_out)"
+fi
+pl_rc=0; pl_out="$(zsystem() { if [[ "$1" == flock ]]; then return 1; fi; builtin zsystem "$@"; }; _preview_lock_acquire "${pl_dir}/d4/preview.lock" 1 2>&1)" || pl_rc=$?
+if [[ "$pl_rc" == 0 && "$pl_out" == *'zsystem flock exit 1'* ]]; then
+  pass "_preview_lock_acquire: a non-timeout flock failure fails open with a warning"
+else
+  fail "_preview_lock_acquire should fail open on a non-timeout flock failure (rc=$pl_rc out: $pl_out)"
+fi
+
+# (e) Knob reach (C5): cmd_preview_down loads .env BEFORE validating
+# FISHHAWK_PREVIEW_LOCK_TIMEOUT, so an .env-only invalid value fails it closed
+# even with the variable absent from the process env (the runner's sanitized
+# gate env never carries it).
+pl_root="${pl_dir}/e"
+mkdir -p "$pl_root"
+print -r -- 'FISHHAWK_PREVIEW_LOCK_TIMEOUT=abc' > "${pl_root}/.env"
+pl_rc=0; pl_out="$(
+  {
+    unset FISHHAWK_PREVIEW_LOCK_TIMEOUT
+    REPO_ROOT="$pl_root"
+    PREVIEW_PID_FILE="${REPO_ROOT}/.fishhawk/preview.pid"
+    PREVIEW_WORKTREE="${REPO_ROOT}/.fishhawk/cache/preview-worktree"
+    PREVIEW_LOCK_FILE="${REPO_ROOT}/.fishhawk/cache/preview.lock"
+    _down_port_fallback() { return 0 }
+    cmd_preview_down
+  } 2>&1
+)" || pl_rc=$?
+if [[ "$pl_rc" == 1 && "$pl_out" == *FISHHAWK_PREVIEW_LOCK_TIMEOUT* && "$pl_out" == *"'abc'"* ]]; then
+  pass "cmd_preview_down honors an .env-only FISHHAWK_PREVIEW_LOCK_TIMEOUT (fails closed on 'abc')"
+else
+  fail "cmd_preview_down should load .env before validating FISHHAWK_PREVIEW_LOCK_TIMEOUT (rc=$pl_rc out: $pl_out)"
+fi
+
+# (f) Done-means race over the REAL cmd_preview_down (A) and cmd_preview (B),
+# each in its own background process, isolated from the operator's .env:
+# REPO_ROOT is re-pointed at a .env-less fixture and every preview path is
+# derived under it. A PATH `git` shim makes A's `worktree remove` (only when its
+# env carries PL_SLOW_REMOVE=1) touch a `removing` marker, then wait — bounded —
+# until B has either reached its `worktree add` (`added` marker) or announced it
+# is waiting for the lock, and only then rm -rf the worktree. With the lock B
+# waits, so A's removal lands on A's own tree; without it B's freshly added tree
+# is what A deletes. A PATH `go` shim fails like the #4308 incident when
+# backend/go.mod is gone and otherwise writes an executable bin/fishhawkd stub.
+pl_root="${pl_dir}/f/root"
+pl_stub="${pl_dir}/f/stub"
+pl_mk="${pl_dir}/f/markers"
+mkdir -p "$pl_root" "$pl_stub" "$pl_mk"
+cat > "${pl_stub}/git" <<'STUB'
+#!/bin/sh
+prev=""; last=""
+for a in "$@"; do prev="$last"; last="$a"; done
+case " $* " in
+  *" rev-parse --short "*) printf '%s\n' "$(printf '%s' "$last" | cut -c1-7)" ;;
+  *" worktree remove "*)
+    if [ "${PL_SLOW_REMOVE:-}" = 1 ]; then
+      : > "$PL_MARKERS/removing"
+      i=0
+      while [ ! -e "$PL_MARKERS/added" ] && [ "$i" -lt 300 ]; do
+        if grep -q 'waiting for the preview lock' "$PL_MARKERS/b.log" 2>/dev/null; then break; fi
+        sleep 0.1; i=$((i + 1))
+      done
+    fi
+    rm -rf "$last" ;;
+  *" worktree add "*)
+    mkdir -p "$prev/backend" && : > "$prev/backend/go.mod" && : > "$PL_MARKERS/added" ;;
+esac
+exit 0
+STUB
+cat > "${pl_stub}/go" <<'STUB'
+#!/bin/sh
+if [ ! -f backend/go.mod ]; then
+  echo "go: cannot load module backend listed in go.work file: open backend/go.mod: no such file or directory" >&2
+  exit 1
+fi
+mkdir -p bin && printf '#!/bin/sh\nexit 0\n' > bin/fishhawkd && chmod +x bin/fishhawkd
+STUB
+chmod +x "${pl_stub}/git" "${pl_stub}/go"
+# pl_iso: the shared isolation for A and B (C3) — fixture REPO_ROOT, paths
+# derived under it, no operator OAuth/seed passthrough, a dummy database URL and
+# an explicit lock bound.
+pl_iso() {
+  export PATH="${pl_stub}:${PATH}" PL_MARKERS="$pl_mk"
+  rehash
+  REPO_ROOT="$pl_root"
+  PREVIEW_PID_FILE="${REPO_ROOT}/.fishhawk/preview.pid"
+  PREVIEW_WORKTREE="${REPO_ROOT}/.fishhawk/cache/preview-worktree"
+  PREVIEW_LOCK_FILE="${REPO_ROOT}/.fishhawk/cache/preview.lock"
+  LOG_DIR="${REPO_ROOT}/logs"
+  PREVIEW_LOG_FILE="${LOG_DIR}/fishhawkd-preview.log"
+  unset FISHHAWKD_OAUTH_ISSUER FISHHAWKD_OAUTH_RESOURCE FISHHAWKD_OAUTH_REQUIRE_LOOPBACK FISHHAWK_PREVIEW_SEED
+  export FISHHAWKD_DATABASE_URL='postgres://u:p@127.0.0.1:1/pl'
+  export FISHHAWK_PREVIEW_LOCK_TIMEOUT=60
+  _down_port_fallback() { return 0 }
+}
+# The prior preview's tree, which A tears down.
+mkdir -p "${pl_root}/.fishhawk/cache/preview-worktree/backend"
+: > "${pl_root}/.fishhawk/cache/preview-worktree/backend/go.mod"
+( pl_iso; export PL_SLOW_REMOVE=1; cmd_preview_down ) > "${pl_mk}/a.log" 2>&1 &
+pl_a=$!
+pl_b=""
+if pl_wait_for "${pl_mk}/removing" 100; then
+  (
+    pl_iso
+    _preview_resolve_ref() { REPLY=0123456789abcdef0123456789abcdef01234567; return 0 }
+    _build_ldflags() { return 0 }
+    _preview_role_setup() { return 0 }
+    _preview_db_reset() { return 0 }
+    _await_preview_healthz() { return 0 }
+    cmd_preview 0123456789abcdef0123456789abcdef01234567
+  ) > "${pl_mk}/b.log" 2>&1 &
+  pl_b=$!
+else
+  fail "race harness: A never reached its worktree removal (a.log: $(cat "${pl_mk}/a.log" 2>/dev/null))"
+fi
+pl_a_rc=0; wait "$pl_a" || pl_a_rc=$?
+pl_b_rc=0
+if [[ -n "$pl_b" ]]; then wait "$pl_b" || pl_b_rc=$?; fi
+pl_wt="${pl_root}/.fishhawk/cache/preview-worktree"
+if [[ -n "$pl_b" && "$pl_b_rc" == 0 && -f "${pl_wt}/backend/go.mod" && -x "${pl_wt}/bin/fishhawkd" ]]; then
+  pass "preview lock: B's provision waits out A's in-flight preview-down and its tree survives"
+else
+  fail "preview lock: B's tree must survive A's removal (a_rc=$pl_a_rc b_rc=$pl_b_rc go.mod=$([[ -f ${pl_wt}/backend/go.mod ]] && print y || print n) bin=$([[ -x ${pl_wt}/bin/fishhawkd ]] && print y || print n) a.log: $(cat "${pl_mk}/a.log" 2>/dev/null) b.log: $(cat "${pl_mk}/b.log" 2>/dev/null))"
+fi
+pl_pid_live="$(cat "${pl_root}/.fishhawk/preview.pid" 2>/dev/null)" || pl_pid_live=""
+if [[ -n "$pl_pid_live" ]]; then kill "$pl_pid_live" 2>/dev/null || true; fi
+
+# (g) Wiring: each verb takes the lock BEFORE it touches the shared pid file /
+# worktree (the first _preview_kill_tracked).
+pl_body="$(typeset -f cmd_preview)"
+pl_lock_ln="$(print -r -- "$pl_body" | grep -n '_preview_lock_acquire' | head -n 1 | cut -d: -f1)"
+pl_kill_ln="$(print -r -- "$pl_body" | grep -n '_preview_kill_tracked' | head -n 1 | cut -d: -f1)"
+if [[ -n "$pl_lock_ln" && -n "$pl_kill_ln" ]] && (( pl_lock_ln < pl_kill_ln )); then
+  pass "cmd_preview takes the preview lock before its deterministic-restart teardown"
+else
+  fail "cmd_preview should call _preview_lock_acquire before _preview_kill_tracked (lock ${pl_lock_ln:-none}, kill ${pl_kill_ln:-none})"
+fi
+pl_body="$(typeset -f cmd_preview_down)"
+pl_lock_ln="$(print -r -- "$pl_body" | grep -n '_preview_lock_acquire' | head -n 1 | cut -d: -f1)"
+pl_kill_ln="$(print -r -- "$pl_body" | grep -n '_preview_kill_tracked' | head -n 1 | cut -d: -f1)"
+if [[ -n "$pl_lock_ln" && -n "$pl_kill_ln" ]] && (( pl_lock_ln < pl_kill_ln )); then
+  pass "cmd_preview_down takes the preview lock before _preview_kill_tracked"
+else
+  fail "cmd_preview_down should call _preview_lock_acquire before _preview_kill_tracked (lock ${pl_lock_ln:-none}, kill ${pl_kill_ln:-none})"
+fi
+unfunction pl_wait_for pl_iso 2>/dev/null
+rm -rf "$pl_dir"
 
 # 15k. OPTIONAL live containment test (E31.19 / #1577) — gated on a host psql
 # AND a reachable dev Postgres (skips cleanly like the 15g nc block otherwise).

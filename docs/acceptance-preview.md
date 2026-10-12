@@ -15,11 +15,11 @@ Both hooks run via `sh -c` in the operator's dispatch `working_dir` — the chec
 | Env var | Role | When it runs |
 |---|---|---|
 | `FISHHAWK_ACCEPTANCE_PREVIEW_CMD` | **provision** — build and serve the merge candidate | once, before the identity gate |
-| `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` | **teardown** — stop and remove the preview instance | deferred; on **every** post-provision return |
+| `FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD` | **teardown** — stop and remove the preview instance | synchronously **after the agent exits, before the trace/verdict ship**; deferred as the fallback on every other post-provision return (#4308) |
 
-The teardown hook is deferred the moment it is configured, so it runs on the happy path (after the verdict ships) **and** on every pre-spawn failure that occurs after provisioning began (readiness timeout, stale/unreachable target, any gate failure) **and** on a stage cancelled or killed mid-validation (the SIGTERM chain from the MCP verb). It is best-effort: a non-zero teardown exit logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
+Once the agent has spawned, the runner runs the teardown hook **synchronously as soon as the agent exits** — after every self-retry, and **before the first terminal egress** (the trace upload, the transcript and the verdict ship) — and logs `acceptance_preview_released` with its `outcome` ([#4308](https://github.com/kuhlman-labs/fishhawk/issues/4308)). Any terminal egress can settle the stage, which frees the shared local-acceptance concurrency slot; the next queued acceptance's `scripts/dev preview` must find the shared fixed preview worktree already removed, not mid-removal (`go: cannot load module backend listed in go.work` was the symptom). The hook is also deferred the moment it is configured, so it still runs on every pre-spawn failure that occurs after provisioning began (readiness timeout, stale/unreachable target, any gate failure) **and** on a stage cancelled or killed mid-validation (the SIGTERM chain from the MCP verb); it is idempotent, so on the spawn path the defer is a no-op. It is best-effort: a non-zero teardown exit logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
 
-The teardown is **detached from the runner's cancellation** and **bounded by `FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`** ([#3394](https://github.com/kuhlman-labs/fishhawk/issues/3394)). The deferred closure runs *after* a cancelled stage's context is already done, and `exec.CommandContext` refuses to start a process on a done context — so a teardown bound to the runner context was refused before it forked and the preview leaked on exactly the cancel path. It now runs under `context.WithoutCancel` re-wrapped in the provision timeout, so it outlives the cancellation that triggered it without being able to stall runner exit indefinitely. The residual is a `SIGKILL` of the runner process itself, which no defer survives; the next `scripts/dev preview` reclaims the port (below).
+The teardown is **detached from the runner's cancellation** and **bounded by `FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`** ([#3394](https://github.com/kuhlman-labs/fishhawk/issues/3394)). The deferred closure runs *after* a cancelled stage's context is already done, and `exec.CommandContext` refuses to start a process on a done context — so a teardown bound to the runner context was refused before it forked and the preview leaked on exactly the cancel path. It now runs under `context.WithoutCancel` re-wrapped in the provision timeout, so it outlives the cancellation that triggered it without being able to stall runner exit indefinitely. Because the teardown now gates the verdict ship, it is **hard-bounded** (#4308): the hook runs in its own process group, SIGKILLed as a group at the timeout, and a 5s `WaitDelay` closes the output pipe a backgrounded grandchild still holds — so the worst case is the timeout plus 5s, never "until that grandchild exits" (a hook that exits but leaves such a holder is reported `failed`). The residual is a `SIGKILL` of the runner process itself, which no defer survives; the next `scripts/dev preview` reclaims the port (below).
 
 ### `auto_preview`: the loop-side entry point to the same contract (E68.43 / [#3321](https://github.com/kuhlman-labs/fishhawk/issues/3321))
 
@@ -78,6 +78,7 @@ Without a provision command the gate is single-shot against a fixed instance: on
 | stage cancelled after provision (SIGTERM chain, mid-validation) | runner exits `130` with `runner_cancelled`; **teardown runs** — it is detached from the runner's cancellation and bounded by the provision timeout (#3394) |
 | declared target, backend sent NO expected head SHA | stage fails pre-spawn, category C, reason `acceptance_expected_head_unresolved`; **no provision command runs** and no teardown is returned |
 | teardown exits non-zero | logged `acceptance_preview_teardown_failed`; **stage outcome unchanged** |
+| teardown wedged (never exits, or leaves a pipe-holding child) | process group SIGKILLed at `FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS` / output pipe closed after 5s; `acceptance_preview_released` carries `outcome:"timed_out"` / `"failed"`; the trace and verdict still ship; **stage outcome unchanged** (#4308) |
 
 A category-C failure is a pre-spawn infrastructure failure: the acceptance agent never runs, and no verdict ships.
 
@@ -89,6 +90,10 @@ Two controls already hold, so a preview that outlived its run (a `SIGKILL`ed run
 - **The identity gate fails closed on a SHA mismatch.** A squatter serving a different `git_sha` (or a `-dirty` one) is classified `stale` and the stage fails pre-spawn, category C, `acceptance_target_stale` (`TestAcceptanceTargetGate_Stale`), never validated.
 
 Both are on the `scripts/dev` / runner-gate side; there is no separate reclaim step in the verb.
+
+### Shared-slot lock (#4308)
+
+`scripts/dev preview` and `scripts/dev preview-down` share one fixed preview worktree (`.fishhawk/cache/preview-worktree`), so they serialize on a kernel fcntl lock (`zsystem flock`) on `.fishhawk/cache/preview.lock`. A provision takes it after ref resolution and before its deterministic-restart teardown and holds it to exit; a teardown takes it before it touches the pid file or the worktree. A contended acquire prints `preview: waiting for the preview lock (<file>, held by pid N)…` and waits up to `FISHHAWK_PREVIEW_LOCK_TIMEOUT` seconds (default 240, `.env` honored by both verbs); a timeout **fails closed** (exit 1). An unsupported or unopenable lock **fails open** with a warning — the runner's teardown-before-egress ordering above is the primary control. Long-form: `scripts/README.md` § "Preview lock (#4308)".
 
 ## Event vocabulary
 
@@ -103,6 +108,7 @@ The runner logs these JSON events (one per line) to its log sink:
 | `acceptance_target_stale` | target serves a different (or `-dirty`) build (pre-spawn category-C fail) |
 | `acceptance_target_unreachable` | no scheme reached the target, or it never became ready (pre-spawn category-C fail) |
 | `acceptance_expected_head_unresolved` | a target is declared but the backend resolved no merge-candidate head, so identity cannot be verified against anything (pre-spawn category-C fail, before provisioning) |
+| `acceptance_preview_released` | the post-agent synchronous teardown finished, before the first terminal egress (#4308); carries `stage_id` and `outcome` (`ok` \| `failed` \| `timed_out`). A runner-log line, not an audit category |
 | `acceptance_preview_teardown_failed` | teardown hook non-zero exit (advisory; outcome unchanged) |
 | `acceptance_preview_teardown_missing` | **advisory**: a provision command is configured but no teardown command is — the provisioned instance will not be torn down |
 | `acceptance_tree_provisioned` | the merge-candidate checkout was created; carries `path` + `head_sha` (see below) |
@@ -257,6 +263,6 @@ Contract the image must satisfy for the runner's identity probe to reach `verifi
 - That `git_sha` is the built commit — a ≥7-character prefix of `FISHHAWK_PREVIEW_SHA` — and is **not** `-dirty`. Build from a clean checkout of the exact SHA so the stamp is the committed identity.
 - The service listens on the port named in `FISHHAWK_PREVIEW_TARGET_HOST` (here `8090`, matching the first declared `egress.target_hosts` entry).
 
-Flow at run time: the runner runs the provision command (`docker compose … up -d --build`) with `FISHHAWK_PREVIEW_SHA` in its env → polls `http://<host>:8090/healthz` every 2s → reads `git_sha`, matches it against `FISHHAWK_PREVIEW_SHA` → `verified` → spawns the acceptance agent → after the verdict ships, the deferred teardown (`docker compose … down -v`) removes the containers and volumes.
+Flow at run time: the runner runs the provision command (`docker compose … up -d --build`) with `FISHHAWK_PREVIEW_SHA` in its env → polls `http://<host>:8090/healthz` every 2s → reads `git_sha`, matches it against `FISHHAWK_PREVIEW_SHA` → `verified` → spawns the acceptance agent → after the agent exits and before the verdict ships, the teardown (`docker compose … down -v`) removes the containers and volumes.
 
 `down -v` removes the named project's volumes so no preview state persists between runs; `-p fishhawk-preview` isolates the project name so teardown targets exactly what provision created.
