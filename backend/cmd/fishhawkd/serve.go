@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
@@ -2038,6 +2039,9 @@ func runServe(args []string, logSink io.Writer) int {
 	alertReplayWindow := fs.String("alert-replay-window",
 		envOr("FISHHAWKD_ALERT_REPLAY_WINDOW", alerttrigger.DefaultReplayWindow.String()),
 		"timestamp tolerance of the alert ingress: a request signed further than this from the server clock, in either direction, is refused 401 alert_replayed. A Go duration in (0, 15m]; default 5m. An unparseable or out-of-range value fails startup.")
+	mergeCandidateTransfer := fs.String("merge-candidate-transfer",
+		envOr("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", defaultMergeCandidateTransferMode),
+		"ADR-096 merge-candidate verdict transfer across an independent clean base advance (E87.2 / #4293): off | shadow | enforce; default shadow (ADR-098 D3). shadow never skips a pass and records the would-be decision; enforce transfers a passed verdict and skips the pass; off computes nothing. Any other value fails startup. Needs git and go on fishhawkd's PATH, or every decision is undecidable (fail closed). Contract: backend/README.md.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2305,6 +2309,15 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// Merge-candidate verdict transfer (E87.2 / #4293). Resolved before
+	// anything dials a database: a typo must refuse startup, never fall back
+	// to a mode the operator did not choose.
+	transferCfg, err := resolveMergeCandidateTransferConfig(*mergeCandidateTransfer)
+	if err != nil {
+		logger.Error("invalid merge-candidate transfer configuration", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
 	// unrecognized tier rather than silently defaulting — a typo must not
 	// under-gate the mint endpoint.
@@ -2409,6 +2422,9 @@ func runServe(args []string, logSink io.Writer) int {
 
 	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
 	cfg.DivergenceConfig = divergenceConfig
+	// server.New logs the boot attribution: a WARN naming a non-shadow mode
+	// and, outside off, a WARN per missing git / go binary.
+	cfg.MergeCandidateTransfer = transferCfg
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -4101,11 +4117,28 @@ func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunI
 	if err != nil || conflict == nil {
 		return nil, translateSliceHeadMissing(err)
 	}
+	return toChildcompletionConflict(conflict), nil
+}
+
+// toChildcompletionConflict converts the orchestrator's *SliceConflict into
+// childcompletion's identical type, field for field — including the ADR-096 D4
+// / #4294 base attribution. It is the ONE copy both adapter integration methods
+// (IntegrateSlices, IntegrateCompletedWave) route through, so the
+// slice_integration_conflict payload the sweeper writes cannot drift from the
+// orchestrator's by a field one method forgot. nil maps to nil.
+func toChildcompletionConflict(c *orchestrator.SliceConflict) *childcompletion.SliceConflict {
+	if c == nil {
+		return nil
+	}
 	return &childcompletion.SliceConflict{
-		SliceIndex: conflict.SliceIndex,
-		ChildRunID: conflict.ChildRunID,
-		Detail:     conflict.Detail,
-	}, nil
+		SliceIndex:           c.SliceIndex,
+		ChildRunID:           c.ChildRunID,
+		Detail:               c.Detail,
+		BaseSHA:              c.BaseSHA,
+		ConflictingBasePaths: c.ConflictingBasePaths,
+		BaseAttribution:      c.BaseAttribution,
+		CompareTruncated:     c.CompareTruncated,
+	}
 }
 
 // translateSliceHeadMissing converts an orchestrator *SliceHeadMissingError
@@ -4141,11 +4174,7 @@ func (a childCompletionAdvancer) IntegrateCompletedWave(ctx context.Context, par
 	if err != nil || conflict == nil {
 		return integrated, nil, translateSliceHeadMissing(err)
 	}
-	return integrated, &childcompletion.SliceConflict{
-		SliceIndex: conflict.SliceIndex,
-		ChildRunID: conflict.ChildRunID,
-		Detail:     conflict.Detail,
-	}, nil
+	return integrated, toChildcompletionConflict(conflict), nil
 }
 
 // DispatchChildren satisfies childcompletion.ChildDispatcher by
@@ -4398,6 +4427,26 @@ func (g githubScheduleSpecSource) FetchSpec(ctx context.Context, repo string) ([
 // the span in which a captured request is replayable before the 24h nonce is
 // the only defence left, and no sane sender clock needs more skew than this.
 const maxAlertReplayWindow = 15 * time.Minute
+
+// defaultMergeCandidateTransferMode is fishhawkd's verdict-transfer default:
+// shadow (ADR-098 D3). server.Config's zero value is off, so only the daemon
+// defaults to shadow; enforce is the captain's act.
+const defaultMergeCandidateTransferMode = string(server.MergeCandidateTransferShadow)
+
+// resolveMergeCandidateTransferConfig validates --merge-candidate-transfer /
+// FISHHAWKD_MERGE_CANDIDATE_TRANSFER and wires the real classifier (go list
+// over the materialized B' and H' workspaces). Any value outside
+// off|shadow|enforce is an error naming the value and the allowed set.
+func resolveMergeCandidateTransferConfig(mode string) (server.MergeCandidateTransferConfig, error) {
+	m, err := server.ParseMergeCandidateTransferMode(mode)
+	if err != nil {
+		return server.MergeCandidateTransferConfig{}, fmt.Errorf("--merge-candidate-transfer / FISHHAWKD_MERGE_CANDIDATE_TRANSFER: %w", err)
+	}
+	return server.MergeCandidateTransferConfig{
+		Mode:       m,
+		Classifier: &basedelta.Classifier{Loader: &basedelta.GoListLoader{}},
+	}, nil
+}
 
 // alertTriggerConfig is the resolved alert-ingress configuration
 // (E35.4 / #1601). The zero value — no sources — is the ingress OFF.

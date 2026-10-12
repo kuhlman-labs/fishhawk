@@ -697,6 +697,20 @@ type FetchedPrompt struct {
 	// round-trips approve-request → audit payload → prompt-response →
 	// this decoder unchanged.
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
+	// Counterfactuals is the approved plan's runner-executed counterfactual
+	// list (E85.3 / #4143), one CounterfactualSpec per plan entry in plan
+	// order, served by the backend on an implement stage only when the run's
+	// approved plan declares entries, the run is not a decomposition child and
+	// the dispatch is not a merge-candidate verify-only pass. The runner
+	// executes each entry after the committed-tree verify gate passes and
+	// records one counterfactual_observed event per entry. Empty (the
+	// byte-identical default) everywhere else.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the element tags are byte-identical to the
+	// backend's counterfactualSpec (backend/internal/server/prompt.go) — the
+	// counterfactual_spec ModeExact pair in backend/internal/wirecontract,
+	// plus the shared golden testdata/wire/counterfactual_spec.json.
+	Counterfactuals []CounterfactualSpec `json:"counterfactuals,omitempty"`
 	// ScopeExemptions is the operator-declared exempt_scope_files list
 	// (#1229), echoed by the backend on implement stages only when the run's
 	// recovery (resume_run exempt_scope_files) recorded operator-justified
@@ -1106,6 +1120,39 @@ type BindingAssertion struct {
 	Type    string `json:"type"`
 	Path    string `json:"path"`
 	Literal string `json:"literal"`
+}
+
+// Counterfactual mutation kinds carried on CounterfactualSpec.MutationKind.
+const (
+	CounterfactualMutationReplace = "replace"
+	CounterfactualMutationPatch   = "patch"
+)
+
+// CounterfactualSpec is one entry in FetchedPrompt.Counterfactuals (E85.3 /
+// #4143): an approved-plan counterfactual FLATTENED by the backend. Index is
+// the entry's position in the plan's counterfactuals array — the join key the
+// runner's observation carries back. MutationKind is "replace" (Find is
+// replaced by Replace; an empty Replace deletes the match) or "patch" (Patch
+// is a unified diff confined to ControlPath). TestRun is the go test -run
+// selector and TestPackage the repo-relative package path. Expect is "red".
+// The backend validated the plan, but the runner re-validates every entry
+// before executing it.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names AND options) MUST stay
+// byte-identical to the backend's counterfactualSpec
+// (backend/internal/server/prompt.go) — the counterfactual_spec ModeExact pair
+// in backend/internal/wirecontract, plus the shared golden
+// testdata/wire/counterfactual_spec.json both modules' tests read.
+type CounterfactualSpec struct {
+	Index        int    `json:"index"`
+	ControlPath  string `json:"control_path"`
+	MutationKind string `json:"mutation_kind"`
+	Find         string `json:"find,omitempty"`
+	Replace      string `json:"replace"`
+	Patch        string `json:"patch,omitempty"`
+	TestRun      string `json:"test_run"`
+	TestPackage  string `json:"test_package"`
+	Expect       string `json:"expect"`
 }
 
 // ScopeExemption is one entry in FetchedPrompt.ScopeExemptions: an

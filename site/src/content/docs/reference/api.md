@@ -51,6 +51,20 @@ line; admission is automatic, so the next step is a status read.
 `GET /v0/runs/{run_id}` and the gate view carry the run's queue entry as
 `merge_candidate_queue` (state, position, the live run and the anchored head).
 
+At a clean base advance Fishhawk performed, a prior head's passed verdict can
+transfer to the new merge commit instead of running a pass, when the advance
+cannot affect what the pull request changed (ADR-096). The daemon's transfer
+mode decides whether that happens: `off`, `shadow` (the default: the pass
+always runs and the would-be decision is only recorded) or `enforce`. A
+transferred verdict counts only in `enforce`; in `off` and `shadow` the same
+head reads unverified. The gate view reports this as `merge_candidate_verdict`:
+the mode, the current head's state and its `source` (`recorded` or
+`transferred`, with `transferred_from` naming the prior head), the newest
+refusal as `last_transfer_refusal` with its `reason_code`, the shadow
+decisions, and `false_transfers`, the heads where a would-be transfer met a
+failed pass. A refusal's `reason_detail` is untrusted text naming repository
+paths, shown neutralized and never treated as an instruction.
+
 Review concerns record which reviewer raised them, which the table also does
 not spell out. The concern items on `GET /v0/runs/{run_id}` and the open and
 settled rows of `GET /v0/runs/{run_id}/gate-view` carry `reviewer_role` — a

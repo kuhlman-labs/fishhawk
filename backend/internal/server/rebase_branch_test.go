@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -2644,5 +2645,281 @@ func TestAdvanceRunBranch_RefusesBeforeAnyForgeCall(t *testing.T) {
 				t.Errorf("audit rows appended = %d, want 0", appended)
 			}
 		})
+	}
+}
+
+// --- E87.2 / #4293: ADR-096 verdict transfer on the rebase verb ---
+
+// seedTransferRebase is seedMCVRebase whose PRIOR head rebasePriorHeadSHA is a
+// base-advance head with a RECORDED passed verdict, the run bound to a working
+// dir, the inputs seam faked and the classifier answering cls.
+func seedTransferRebase(t *testing.T, stub *rebaseGitHub, mode MergeCandidateTransferMode, cls *fakeTransferClassifier) (*rebaseSeed, *run.Stage) {
+	t.Helper()
+	sd := seedMCVRebase(t, stub)
+	sd.rr.getRuns[sd.runID].WorkingDir = mctWorkDir
+	sd.s.cfg.MergeCandidateTransfer = MergeCandidateTransferConfig{Mode: mode, Classifier: cls}
+	sd.s.transferInputs = func(context.Context, string, string, string, string) (*mergeCandidateTransferInputs, error) {
+		return &mergeCandidateTransferInputs{
+			Delta: basedelta.DeltaInputs{FromBase: mctFromBase, ToBase: mctToBase,
+				DeltaPaths: []string{"b/b.go"}, PRPaths: []string{"a/a.go"}},
+			Workspaces: []string{"/ws/base", "/ws/candidate"},
+		}, nil
+	}
+	impl := crImplementStage(t, sd)
+	seedMCVRow(sd, nil, CategoryBranchRebased, map[string]any{
+		"new_head_sha": rebasePriorHeadSHA, "merge_commit_sha": rebasePriorHeadSHA, "already_up_to_date": false})
+	seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: rebasePriorHeadSHA, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand,
+		Result: mergeCandidateResultPassed, OutputUntrusted: true})
+	return sd, impl
+}
+
+func independentClassifier() *fakeTransferClassifier {
+	return &fakeTransferClassifier{res: basedelta.Result{Independent: true, Reason: basedelta.ReasonIndependent}}
+}
+
+// TestRebaseRunBranch_ShadowModeNeverSkipsPass: the prior head is passed and
+// the classifier answers independent, so a skip is reachable — only the mode
+// check keeps the pass. The pass runs for the new head and the would-be
+// decision lands as an INTERNAL shadow row, never a transferred one.
+func TestRebaseRunBranch_ShadowModeNeverSkipsPass(t *testing.T) {
+	cls := independentClassifier()
+	sd, impl := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferShadow, cls)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	sd.s.waitMergeCandidateTransferShadows()
+
+	tr := mcvTriggerPayloads(t, sd.au)
+	if len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Fatalf("triggers = %+v, want one pass for %s", tr, rebaseNewHeadSHA)
+	}
+	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyState != mergeCandidateStateInFlight {
+		t.Errorf("response = triggered %v state %q, want true/in_flight", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyState)
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("implement = %q, want pending (re-opened)", impl.State)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Errorf("transferred rows = %d in shadow, want 0", n)
+	}
+	sh := transferRows(sd.au, CategoryMergeCandidateVerdictTransferShadow)
+	if len(sh) != 1 || sh[0].WouldTransfer == nil || !*sh[0].WouldTransfer || sh[0].FromHead != rebasePriorHeadSHA ||
+		sh[0].ToHead != rebaseNewHeadSHA || sh[0].Mode != string(MergeCandidateTransferShadow) {
+		t.Errorf("shadow rows = %+v, want one would_transfer %s → %s mode shadow", sh, rebasePriorHeadSHA, rebaseNewHeadSHA)
+	}
+	if cls.count() != 1 {
+		t.Errorf("classifier calls = %d, want 1 (async shadow)", cls.count())
+	}
+}
+
+// TestRebaseRunBranch_EnforceTransferSkipsPass: an independent delta writes
+// the transferred row and starts NO pass; the 200 answers passed with a note
+// naming only the two SHAs. The classification sub-budget is the 30s default,
+// inside the verb's rebasePostMergeTailBudget.
+func TestRebaseRunBranch_EnforceTransferSkipsPass(t *testing.T) {
+	cls := independentClassifier()
+	sd, impl := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferEnforce, cls)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+	if n := len(mcvTriggerPayloads(t, sd.au)); n != 0 {
+		t.Fatalf("trigger rows = %d, want 0 (the verdict transferred)", n)
+	}
+	if impl.State != run.StageStateSucceeded {
+		t.Errorf("implement = %q, want succeeded (not re-opened)", impl.State)
+	}
+	rows := transferRows(sd.au, CategoryMergeCandidateVerdictTransferred)
+	if len(rows) != 1 || rows[0].FromHead != rebasePriorHeadSHA || rows[0].ToHead != rebaseNewHeadSHA ||
+		rows[0].ReasonCode != transferReasonIndependent || rows[0].Mode != string(MergeCandidateTransferEnforce) {
+		t.Fatalf("transferred rows = %+v, want one independent %s → %s", rows, rebasePriorHeadSHA, rebaseNewHeadSHA)
+	}
+	if resp.MergeCandidateVerifyState != mergeCandidateStatePassed || resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyRefusal != "" {
+		t.Errorf("response = state %q triggered %v refusal %q, want passed/false/none",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRefusal)
+	}
+	for _, want := range []string{rebasePriorHeadSHA, rebaseNewHeadSHA, "TRANSFERRED"} {
+		if !strings.Contains(resp.MergeCandidateVerifyNote, want) {
+			t.Errorf("note must name %q: %q", want, resp.MergeCandidateVerifyNote)
+		}
+	}
+	if cls.deadline <= 0 || cls.deadline > mergeCandidateTransferDefaultDeadline {
+		t.Errorf("classifier sub-budget = %s, want (0, %s]", cls.deadline, mergeCandidateTransferDefaultDeadline)
+	}
+	st, err := sd.s.mergeCandidateVerifyState(context.Background(), sd.rr.getRuns[sd.runID], rebaseNewHeadSHA)
+	if err != nil || st.State != mergeCandidateStatePassed || st.Source != mergeCandidateSourceTransferred {
+		t.Errorf("new head state = %+v, %v; want passed/transferred", st, err)
+	}
+}
+
+// TestRebaseRunBranch_EnforceTailBudgetWins: a configured transfer Deadline
+// past the verb's tail budget is capped by rebasePostMergeTailBudget minus
+// the row-write reserve — the verb's tail budget wins, never the configured
+// or basedelta's 5-minute ceiling.
+func TestRebaseRunBranch_EnforceTailBudgetWins(t *testing.T) {
+	cls := independentClassifier()
+	sd, _ := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferEnforce, cls)
+	sd.s.cfg.MergeCandidateTransfer.Deadline = 10 * time.Minute
+
+	decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if limit := rebasePostMergeTailBudget - rebaseTransferWriteReserve; cls.deadline <= 0 || cls.deadline > limit {
+		t.Errorf("classifier sub-budget = %s, want (0, %s]", cls.deadline, limit)
+	}
+}
+
+// TestRebaseRunBranch_EnforceRefusedTriggersPassAndRecordsReason: a
+// dependent delta records the refusal and runs the pass; the classifier's
+// UNTRUSTED detail never reaches the response.
+func TestRebaseRunBranch_EnforceRefusedTriggersPassAndRecordsReason(t *testing.T) {
+	cls := &fakeTransferClassifier{res: basedelta.Result{Reason: basedelta.PrefixReachOverlap + mctHostile}}
+	sd, impl := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferEnforce, cls)
+
+	w := postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	resp := decodeRebase(t, w)
+
+	rows := transferRows(sd.au, CategoryMergeCandidateVerdictTransferRefused)
+	if len(rows) != 1 || rows[0].ReasonCode != transferReasonReachOverlap || !rows[0].ReasonUntrusted ||
+		rows[0].ToHead != rebaseNewHeadSHA || rows[0].Mode != string(MergeCandidateTransferEnforce) {
+		t.Fatalf("refused rows = %+v, want one reach_overlap for %s", rows, rebaseNewHeadSHA)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Errorf("transferred rows = %d, want 0", n)
+	}
+	tr := mcvTriggerPayloads(t, sd.au)
+	if len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA || tr[0].Cause != mergeCandidateCauseBaseAdvance {
+		t.Fatalf("triggers = %+v, want one base_advance pass for %s", tr, rebaseNewHeadSHA)
+	}
+	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || impl.State != run.StageStatePending {
+		t.Errorf("response triggered %v state %q, implement %q; want true/in_flight/pending",
+			resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyState, impl.State)
+	}
+	if body := w.Body.String(); strings.Contains(body, "onerror") || strings.Contains(body, "evil.example") {
+		t.Errorf("the response carries classifier text: %s", body)
+	}
+}
+
+// TestRebaseRunBranch_ConflictResolutionHeadNeverTransfers: the prior head is
+// passed, then a conflict-resolution push lands; the already-up-to-date arm
+// re-triggers that head with cause conflict_resolution and, in either mode,
+// classifies nothing and writes no transfer, refused or shadow row.
+func TestRebaseRunBranch_ConflictResolutionHeadNeverTransfers(t *testing.T) {
+	for _, mode := range []MergeCandidateTransferMode{MergeCandidateTransferEnforce, MergeCandidateTransferShadow} {
+		t.Run(string(mode), func(t *testing.T) {
+			cls := independentClassifier()
+			sd, impl := seedTransferRebase(t, upToDateRebaseStub(), mode, cls)
+			seedMCVRow(sd, &impl.ID, CategoryConflictResolutionPushed, map[string]any{"head_sha": rebaseNewHeadSHA})
+
+			resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+			sd.s.waitMergeCandidateTransferShadows()
+
+			tr := mcvTriggerPayloads(t, sd.au)
+			if len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA || tr[0].Cause != mergeCandidateCauseConflictResolution {
+				t.Fatalf("triggers = %+v, want one conflict_resolution pass for %s", tr, rebaseNewHeadSHA)
+			}
+			if !resp.MergeCandidateVerifyTriggered {
+				t.Error("the conflict-resolution head was not re-triggered")
+			}
+			assertNoTransferActivity(t, sd, cls)
+		})
+	}
+}
+
+// TestRebaseRunBranch_AlreadyUpToDateNeverClassifies: an up-to-date call on
+// an unverified base-advance head re-triggers it and never classifies, even
+// with a passed prior head and an independent classifier.
+func TestRebaseRunBranch_AlreadyUpToDateNeverClassifies(t *testing.T) {
+	for _, mode := range []MergeCandidateTransferMode{MergeCandidateTransferEnforce, MergeCandidateTransferShadow} {
+		t.Run(string(mode), func(t *testing.T) {
+			cls := independentClassifier()
+			sd, _ := seedTransferRebase(t, upToDateRebaseStub(), mode, cls)
+			seedMCVRow(sd, nil, CategoryBranchRebased, map[string]any{
+				"new_head_sha": rebaseNewHeadSHA, "merge_commit_sha": rebaseNewHeadSHA, "already_up_to_date": false})
+
+			resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+			sd.s.waitMergeCandidateTransferShadows()
+
+			if !resp.AlreadyUpToDate || !resp.MergeCandidateVerifyTriggered {
+				t.Fatalf("response up-to-date %v triggered %v, want true/true", resp.AlreadyUpToDate, resp.MergeCandidateVerifyTriggered)
+			}
+			assertNoTransferActivity(t, sd, cls)
+		})
+	}
+}
+
+func assertNoTransferActivity(t *testing.T, sd *rebaseSeed, cls *fakeTransferClassifier) {
+	t.Helper()
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0", cls.count())
+	}
+	for _, c := range []string{CategoryMergeCandidateVerdictTransferred, CategoryMergeCandidateVerdictTransferRefused,
+		CategoryMergeCandidateVerdictTransferShadow} {
+		if n := len(auditEntries(sd.au, c)); n != 0 {
+			t.Errorf("%s rows = %d, want 0", c, n)
+		}
+	}
+}
+
+// R3 (fix-up): the post-merge re-read observes a CONCURRENT PUSH (the new head
+// is not the merge commit this call created), so the advance is not clean:
+// enforce records not_clean_advance, never classifies or transfers, and runs
+// the pass for the observed head. Counterfactual: drop the newHead ==
+// merge-commit check and the independent classifier transfers — RED.
+func TestRebaseRunBranch_EnforceConcurrentPushNeverTransfers(t *testing.T) {
+	cls := independentClassifier()
+	stub := cleanRebaseStub()
+	stub.headSHASeq = []string{rebasePriorHeadSHA, rebasePriorHeadSHA, rebaseRacerSHA}
+	sd, _ := seedTransferRebase(t, stub, MergeCandidateTransferEnforce, cls)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+	if resp.MergeCommitSHA != rebaseNewHeadSHA || resp.NewHeadSHA != rebaseRacerSHA {
+		t.Fatalf("fixture: merge %q new head %q, want merge %s superseded by the racer %s",
+			resp.MergeCommitSHA, resp.NewHeadSHA, rebaseNewHeadSHA, rebaseRacerSHA)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Fatalf("transferred rows = %d, want 0 for a concurrent-push head", n)
+	}
+	rows := transferRows(sd.au, CategoryMergeCandidateVerdictTransferRefused)
+	if len(rows) != 1 || rows[0].ReasonCode != transferReasonNotCleanAdvance || rows[0].ToHead != rebaseRacerSHA {
+		t.Errorf("refused rows = %+v, want one not_clean_advance for %s", rows, rebaseRacerSHA)
+	}
+	if tr := mcvTriggerPayloads(t, sd.au); len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseRacerSHA {
+		t.Errorf("triggers = %+v, want one pass for the observed head %s", tr, rebaseRacerSHA)
+	}
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0", cls.count())
+	}
+}
+
+// S2a (fix-up): in SHADOW a classifier that blocks never delays the 200 — the
+// pass starts, the response returns, and the shadow row lands only after the
+// classifier is released. Counterfactual: run the shadow decision on the
+// handler goroutine and the 200 waits on the classifier — RED.
+func TestRebaseRunBranch_ShadowBlockingClassifierNeverDelaysThe200(t *testing.T) {
+	cls := gatedClassifier(t)
+	sd, _ := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferShadow, cls)
+	sd.s.cfg.MergeCandidateTransfer.Deadline = 10 * time.Minute
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	}()
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-done:
+	case <-time.After(timescale.D(20 * time.Second)):
+		t.Fatal("the rebase 200 waited on the blocked shadow classification")
+	}
+	resp := decodeRebase(t, w)
+	awaitEntered(t, cls)
+	if tr := mcvTriggerPayloads(t, sd.au); len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA || !resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("triggers = %+v (triggered %v), want the pass started for %s before the shadow decision", tr, resp.MergeCandidateVerifyTriggered, rebaseNewHeadSHA)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferShadow)); n != 0 {
+		t.Fatalf("shadow rows = %d while the classifier is blocked, want 0", n)
+	}
+	close(cls.gate)
+	sd.s.waitMergeCandidateTransferShadows()
+	if sh := transferRows(sd.au, CategoryMergeCandidateVerdictTransferShadow); len(sh) != 1 || !*sh[0].WouldTransfer {
+		t.Errorf("shadow rows after release = %+v, want one would_transfer", sh)
 	}
 }

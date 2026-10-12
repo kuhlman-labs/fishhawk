@@ -1416,15 +1416,34 @@ Notes:
   parent's children have all succeeded and their per-slice branches are
   merged onto the consolidated branch in ascending slice-index order.
   `slices_integrated` (payload `{child_run_ids, consolidated_branch,
-  slice_count}`) records a clean fan-in — every slice merged — and is
-  consumed by E24.7. `slice_integration_conflict` (payload
-  `{parent_stage_id, conflicting_slice_index, conflicting_child_run_id}`)
+  slice_count, integration_commit_shas, base_ref, base_sha,
+  base_fold_outcome, base_fold_conflict?}`) records a clean fan-in — every
+  slice merged — and is consumed by E24.7. The `base_*` fields (ADR-096 D4 /
+  #4294) record the base tip the pass integrated against and whether it was
+  folded into a pre-existing consolidated branch before the pending slices
+  (`base_fold_outcome`: `created_at_tip` | `merged` | `already_contained` |
+  `conflict` | `not_attempted`); on `conflict` the fold was skipped and
+  `base_fold_conflict` `{conflicting_slice_index?, conflicting_child_run_id?,
+  conflicting_base_paths, base_attribution, compare_truncated}` attributes it
+  to an already-integrated slice. `slice_integration_conflict` (payload
+  `{parent_stage_id, conflicting_slice_index, conflicting_child_run_id,
+  base_sha, conflicting_base_paths, base_attribution, compare_truncated}`)
   records a merge conflict (HTTP 409) that failed the parent implement
   (awaiting_children) stage category-B RECOVERABLE; its STRUCTURED payload
   is the machine resume target the `next_actions`
   `slices_integration_conflict` arm reads back (the
   `conflicting_child_run_id`), never parsing the stage's free-form failure
-  reason. Both follow the `children_settled` / `consolidated_pr_opened`
+  reason. The four base keys are a best-effort, ROUTING-NEUTRAL attribution of
+  the conflict to base paths: `conflicting_base_paths` (always an array) is
+  the files main touched since its merge-base with the slice intersected with
+  the files on the slice branch since its merge-base with main (bounded by the
+  child's sub-plan scope when declared; that slice side over-attributes for a
+  later-wave slice whose branch carries earlier slices' files),
+  `base_attribution` is `paths_overlap` | `no_base_overlap` |
+  `unavailable:<reason>`, and `compare_truncated` marks an incomplete compare
+  (never reported as `no_base_overlap`). Every emitter — the orchestrator's
+  event-driven settle, the child-completion sweeper (both its settling and its
+  between-wave arm) and the consolidate verb — writes the same keys. Both follow the `children_settled` / `consolidated_pr_opened`
   precedent: best-effort (a nil `Audit` or append failure logs at WARN and
   never unwinds the settle). The MCP `fishhawk_get_run_status`
   `children_status` block (#1147) also reads these kinds to classify the
@@ -1806,6 +1825,32 @@ Notes:
   (best-effort); it is **internal only**, deliberately NOT in
   `activityCategories`: the concern's state did not change, which the thread
   already shows.
+
+- The merge-candidate verdict-transfer audit kinds (E87.2 / #4293, ADR-096
+  D1/D2/D5, ADR-098 D3) — `merge_candidate_verdict_transferred`,
+  `merge_candidate_verdict_transfer_refused` and the ADVISORY
+  `merge_candidate_verdict_false_transfer` — have **no dedicated Notifier
+  method**. They render **data-drivenly** on the living-anchor / status
+  timeline through `activityCategories` + `renderActivityLine`
+  (`status_template.go`), and their writers in
+  `server/merge_candidate_transfer.go` mark each with `notifyOperatorVisible`
+  after the append. Lines: "Merge-candidate verdict transferred from
+  <from7> to <to7> (<reason_code> base advance; no verify pass)";
+  "Merge-candidate verdict transfer refused for <to7> (<reason_code>); the
+  verify pass runs — detail `` `<detail>` ``"; "Advisory: FALSE verdict
+  transfer — shadow would have transferred <from7> to <to7> (<reason_code>),
+  but its verify pass failed". Heads render only when hex (else "an unknown
+  head") and the reason code only in its closed `[a-z_]+(:[a-z_]+)?` shape
+  (else `unknown`). The refusal's `reason_detail` is UNTRUSTED (classifier
+  text naming repository paths): it renders ONLY through
+  `issuecomment.NeutralizeUntrustedInline` — which extends notifier.go's
+  `sanitizeSubjectForCodeSpan` with fullwidth `< > & [ ] @`, a defanged `://`
+  and `www.`, and a byte cap — inside ONE single-backtick code span, so HTML,
+  links, autolinks and @-mentions in it are inert. No line mentions an actor,
+  so none @-mentions anyone. The INTERNAL shadow row
+  `merge_candidate_verdict_transfer_shadow` is DELIBERATELY not registered.
+  `merge_candidate_verdict_false_transfer` never blocks a gate and is not a
+  server_check concern.
 
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier

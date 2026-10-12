@@ -871,7 +871,7 @@ loser fails category-B behind a misleading scope-drift framing (#2645).
 - **Kind**: `runner` when `FISHHAWK_VERIFY_LOCK_OWNER=runner` is in the
   environment, `shell` otherwise. The runner appends that marker to the gate env
   AFTER sanitization, so an ambient value never reaches the gate subprocess.
-- Taken by `verify` ONLY. `test` / `coverage` / `lint` / `single` are unaffected,
+- Among `scripts/test` subcommands, taken by `verify` ONLY (the runner's Go-side counterfactual holder below is the one other taker). `test` / `coverage` / `lint` / `single` are unaffected,
   so the escape hatch the refusal names stays always available.
 
 Semantics, by the kind of the invocation MEETING a live holder:
@@ -904,6 +904,26 @@ knobs: the runner's gate env is a default-deny allow-list and `FISHHAWK_` is not
 an allowed prefix, so an ambient value never reaches the gate subprocess.
 `FISHHAWK_VERIFY_LOCK_PATH` is the one lock variable the runner DOES set — by
 its own post-sanitization injection only, never inherited (see "Override").
+
+- **Counterfactual holder** (E85.3 / #4143): the runner itself takes this lock
+  in Go, as a `<pid>:runner` holder (`<pid>` = the `fishhawk-runner` process),
+  while it executes a plan-declared counterfactual
+  (`runner/cmd/fishhawk-runner/counterfactual.go`). It is a protocol-compatible
+  SUBSET: the same atomic `symlink(2)` on the same path (`verifyLockPathFor`,
+  the one derivation `FISHHAWK_VERIFY_LOCK_PATH` also uses), a bounded wait
+  (600 s at a 2 s poll), NO prune and NO steal, and a release that removes the
+  link only while it still names this holder. It is held for ONE `go test` run
+  (at most 5 minutes), never across a counterfactual or the phase, and after
+  each release the runner waits at least 5 seconds before taking it again, so a
+  polling `scripts/test` runner invocation can claim it in between. **Shell
+  refusal window**: while a counterfactual run holds it, a shell
+  `scripts/test verify` meets a live `runner` holder and refuses immediately
+  (use `scripts/test single`), and a runner-marked verify waits and, past its
+  budget, refuses (runner meets runner). **Crashed-runner residual**: the Go side
+  never prunes, so a link left by a runner that died mid-run (a dead `<pid>`)
+  costs the next counterfactual the full 600 s wait, recorded as
+  `error/verify_lock_unavailable`, until any `scripts/test` invocation prunes the
+  dead holder.
 
 ### The prune is SERIALISED, not merely narrowed
 

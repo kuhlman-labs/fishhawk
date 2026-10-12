@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/alerttrigger"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -7030,4 +7031,220 @@ func TestChildCompletionAdvancer_TranslatesSliceHeadMissing(t *testing.T) {
 			t.Errorf("translateSliceHeadMissing(nil) = %v, want nil", got)
 		}
 	})
+}
+
+// TestServe_MergeCandidateTransferMode pins the E87.2 / #4293 switch: unset is
+// shadow (ADR-098 D3), off and enforce resolve with the real classifier, and
+// an unknown value REFUSES startup naming the value and the allowed set.
+//
+// The bogus invocation carries bootstrapAbortFlag, so with the validation
+// deleted startup still aborts at the LATER --review-resolution check rather
+// than booting a listener; the log assertion is then what goes RED.
+func TestServe_MergeCandidateTransferMode(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", "")
+		v := envOr("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", defaultMergeCandidateTransferMode)
+		cfg, err := resolveMergeCandidateTransferConfig(v)
+		if err != nil || cfg.Mode != server.MergeCandidateTransferShadow || cfg.Classifier == nil {
+			t.Fatalf("unset = %+v, %v; want shadow with a classifier", cfg, err)
+		}
+	})
+	for _, mode := range []server.MergeCandidateTransferMode{server.MergeCandidateTransferOff, server.MergeCandidateTransferEnforce} {
+		t.Run(string(mode), func(t *testing.T) {
+			cfg, err := resolveMergeCandidateTransferConfig(string(mode))
+			if err != nil || cfg.Mode != mode || cfg.Classifier == nil {
+				t.Fatalf("%s = %+v, %v", mode, cfg, err)
+			}
+		})
+	}
+	t.Run("bogus", func(t *testing.T) {
+		if _, err := resolveMergeCandidateTransferConfig("bogus"); err == nil {
+			t.Fatal("bogus resolved")
+		}
+		code, log := serveWithProfile(t, "-merge-candidate-transfer", "bogus", bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		for _, want := range []string{"invalid merge-candidate transfer configuration", `\"bogus\"`, "off, shadow, enforce"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("log does not name %q:\n%s", want, log)
+			}
+		}
+	})
+}
+
+// TestToChildcompletionConflict pins the ONE orchestrator → childcompletion
+// SliceConflict copy (ADR-096 D4 / #4294): every field, the base attribution
+// included, crosses the bridge, and nil maps to nil. A field the helper drops
+// would silently vanish from the sweeper's slice_integration_conflict payload.
+func TestToChildcompletionConflict(t *testing.T) {
+	childID := uuid.New()
+	in := &orchestrator.SliceConflict{
+		SliceIndex:           4,
+		ChildRunID:           childID,
+		Detail:               "slice integration conflict: slice 4; conflicting base paths: a.go, b.go",
+		BaseSHA:              "basesha",
+		ConflictingBasePaths: []string{"a.go", "b.go"},
+		BaseAttribution:      "paths_overlap",
+		CompareTruncated:     true,
+	}
+	got := toChildcompletionConflict(in)
+	want := &childcompletion.SliceConflict{
+		SliceIndex:           4,
+		ChildRunID:           childID,
+		Detail:               in.Detail,
+		BaseSHA:              "basesha",
+		ConflictingBasePaths: []string{"a.go", "b.go"},
+		BaseAttribution:      "paths_overlap",
+		CompareTruncated:     true,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("toChildcompletionConflict = %+v, want %+v", got, want)
+	}
+	// Field-count tripwire: a new orchestrator.SliceConflict field must be
+	// copied here AND asserted above, or this fails naming the drift.
+	if a, b := reflect.TypeOf(orchestrator.SliceConflict{}).NumField(), reflect.TypeOf(childcompletion.SliceConflict{}).NumField(); a != b {
+		t.Errorf("orchestrator.SliceConflict has %d fields, childcompletion.SliceConflict %d: extend both and toChildcompletionConflict together", a, b)
+	}
+	if toChildcompletionConflict(nil) != nil {
+		t.Error("toChildcompletionConflict(nil) != nil")
+	}
+}
+
+// TestChildCompletionAdvancer_ConflictCarriesBaseAttribution drives BOTH
+// adapter integration methods against a real *orchestrator.Orchestrator whose
+// slice-0 merge conflicts, and asserts the childcompletion conflict each
+// returns carries the orchestrator's base attribution — i.e. both route the
+// conflict through toChildcompletionConflict rather than a hand copy.
+func TestChildCompletionAdvancer_ConflictCarriesBaseAttribution(t *testing.T) {
+	parentID := uuid.New()
+	planStageID := uuid.New()
+	inst := int64(7)
+	parent := &runpkg.Run{ID: parentID, Repo: "acme/widgets", InstallationID: &inst}
+	zero, one := 0, 1
+	child0 := &runpkg.Run{ID: uuid.New(), State: runpkg.StateSucceeded, SliceIndex: &zero}
+	child1 := &runpkg.Run{ID: uuid.New(), State: runpkg.StateRunning, SliceIndex: &one}
+	planJSON, err := json.Marshal(map[string]any{
+		"decomposition": map[string]any{
+			"rationale": "two slices",
+			"sub_plans": []map[string]any{
+				{"title": "s0", "scope_hint": "a", "predicted_runtime_minutes": 1, "predicted_runtime_confidence": "low"},
+				{"title": "s1", "scope_hint": "b", "predicted_runtime_minutes": 1, "predicted_runtime_confidence": "low", "depends_on": []int{0}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	o := &orchestrator.Orchestrator{
+		Runs: &conflictAdapterRuns{
+			parent:   parent,
+			children: []*runpkg.Run{child0, child1},
+			stages:   []*runpkg.Stage{{ID: planStageID, RunID: parentID, Type: runpkg.StageTypePlan}},
+		},
+		Artifacts: &conflictAdapterArtifacts{arts: []*artifact.Artifact{{
+			ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planJSON,
+		}}},
+		GitHub: &conflictAdapterGitHub{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	a := childCompletionAdvancer{o: o}
+	ctx := context.Background()
+
+	check := func(t *testing.T, c *childcompletion.SliceConflict) {
+		t.Helper()
+		if c == nil {
+			t.Fatal("conflict = nil, want slice 0's conflict")
+		}
+		if c.SliceIndex != 0 || c.ChildRunID != child0.ID {
+			t.Errorf("conflict names slice %d child %s, want slice 0 child %s", c.SliceIndex, c.ChildRunID, child0.ID)
+		}
+		if c.BaseSHA != "basesha" || c.BaseAttribution != "paths_overlap" || !c.CompareTruncated {
+			t.Errorf("base attribution = (%q, %q, truncated=%v), want (basesha, paths_overlap, true)", c.BaseSHA, c.BaseAttribution, c.CompareTruncated)
+		}
+		if !reflect.DeepEqual(c.ConflictingBasePaths, []string{"y.go"}) {
+			t.Errorf("ConflictingBasePaths = %v, want [y.go]", c.ConflictingBasePaths)
+		}
+	}
+	t.Run("IntegrateSlices", func(t *testing.T) {
+		c, err := a.IntegrateSlices(ctx, parentID)
+		if err != nil {
+			t.Fatalf("IntegrateSlices: %v", err)
+		}
+		check(t, c)
+	})
+	t.Run("IntegrateCompletedWave", func(t *testing.T) {
+		integrated, c, err := a.IntegrateCompletedWave(ctx, parentID)
+		if err != nil {
+			t.Fatalf("IntegrateCompletedWave: %v", err)
+		}
+		if integrated {
+			t.Error("integrated = true on a conflict")
+		}
+		check(t, c)
+	})
+}
+
+// conflictAdapterRuns is the run.Repository slice the adapter test drives;
+// any other method panics on the nil embedded interface.
+type conflictAdapterRuns struct {
+	runpkg.Repository
+	parent   *runpkg.Run
+	children []*runpkg.Run
+	stages   []*runpkg.Stage
+}
+
+func (r *conflictAdapterRuns) GetRun(context.Context, uuid.UUID) (*runpkg.Run, error) {
+	return r.parent, nil
+}
+
+func (r *conflictAdapterRuns) ListRuns(_ context.Context, f runpkg.ListRunsFilter) ([]*runpkg.Run, error) {
+	if f.Offset > 0 {
+		return nil, nil
+	}
+	return r.children, nil
+}
+
+func (r *conflictAdapterRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*runpkg.Stage, error) {
+	return r.stages, nil
+}
+
+type conflictAdapterArtifacts struct {
+	artifact.Repository
+	arts []*artifact.Artifact
+}
+
+func (a *conflictAdapterArtifacts) ListForStage(context.Context, uuid.UUID) ([]*artifact.Artifact, error) {
+	return a.arts, nil
+}
+
+// conflictAdapterGitHub resolves main to "basesha", reports the consolidated
+// branch absent, conflicts every slice merge, and answers the attribution
+// compares: main since the slice touched {x.go, y.go} (truncated), the slice
+// touched {y.go, z.go}.
+type conflictAdapterGitHub struct {
+	orchestrator.GitHubAPI
+}
+
+func (g *conflictAdapterGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, branch string) (string, bool, error) {
+	if branch == "main" {
+		return "basesha", true, nil
+	}
+	return "", false, nil
+}
+
+func (g *conflictAdapterGitHub) CreateRef(context.Context, forge.CredentialScope, forge.RepoRef, string, string) error {
+	return nil
+}
+
+func (g *conflictAdapterGitHub) MergeBranch(context.Context, forge.CredentialScope, forge.RepoRef, string, string, string) (string, error) {
+	return "", forge.ErrMergeConflict
+}
+
+func (g *conflictAdapterGitHub) ComparePatch(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, base, _ string) (*forge.ComparePatchResult, error) {
+	if base == "basesha" {
+		return &forge.ComparePatchResult{Files: []forge.ComparePatchFile{{Path: "y.go"}, {Path: "z.go"}}}, nil
+	}
+	return &forge.ComparePatchResult{Files: []forge.ComparePatchFile{{Path: "x.go"}, {Path: "y.go"}}, Truncated: true}, nil
 }

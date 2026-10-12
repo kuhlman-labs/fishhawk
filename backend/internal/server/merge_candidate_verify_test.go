@@ -1285,3 +1285,67 @@ func TestRefuseMergeCandidatePassToIncapableRunner_NoLiveTrigger(t *testing.T) {
 		t.Errorf("implement state = %q, want dispatched (nothing to settle)", got)
 	}
 }
+
+// --- E87.2 / #4293: transferred verdicts (approval condition C1) ----------
+
+// TestNewestMergeCandidateVerdict_IncludesTransfers: in enforce the newest row
+// by chain sequence wins ACROSS the recorded and transferred categories; in
+// off/shadow a transferred row is ignored (the rollback contract).
+func TestNewestMergeCandidateVerdict_IncludesTransfers(t *testing.T) {
+	transfer := func(f *mcvFixture) {
+		f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{
+			FromHead: mcvOtherHead, ToHead: mcvHead, RootHead: "", ReasonCode: transferReasonIndependent})
+	}
+	ctx := context.Background()
+
+	f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+	f.s.cfg.MergeCandidateTransfer.Mode = MergeCandidateTransferEnforce
+	f.seedVerdict(mcvHead, mergeCandidateResultFailed)
+	transfer(f)
+	v, err := f.s.newestMergeCandidateVerdict(ctx, f.runID, mcvHead)
+	if err != nil || v == nil || v.Result != mergeCandidateResultPassed || v.Source != mergeCandidateSourceTransferred ||
+		v.TransferredFrom != mcvOtherHead || v.RootHead != mcvOtherHead {
+		t.Fatalf("transfer newest: verdict = %+v err=%v, want passed/transferred from %s (root defaults to from_head)", v, err, mcvOtherHead)
+	}
+	f.seedVerdict(mcvHead, mergeCandidateResultFailed)
+	if v, _ := f.s.newestMergeCandidateVerdict(ctx, f.runID, mcvHead); v == nil || v.Result != mergeCandidateResultFailed || v.Source != mergeCandidateSourceRecorded {
+		t.Fatalf("recorded newest: verdict = %+v, want the later recorded failed", v)
+	}
+	// A malformed or other-head transfer row is skipped.
+	f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, map[string]any{"to_head": mcvHead})
+	f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{FromHead: mcvHead, ToHead: mcvOtherHead})
+	if v, _ := f.s.newestMergeCandidateVerdict(ctx, f.runID, mcvHead); v == nil || v.Source != mergeCandidateSourceRecorded {
+		t.Fatalf("malformed transfer rows changed the verdict: %+v", v)
+	}
+
+	for _, mode := range []MergeCandidateTransferMode{MergeCandidateTransferShadow, MergeCandidateTransferOff, ""} {
+		g := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		g.s.cfg.MergeCandidateTransfer.Mode = mode
+		transfer(g)
+		g.au.listByCategoryErrCategory = CategoryMergeCandidateVerdictTransferred
+		if v, err := g.s.newestMergeCandidateVerdict(ctx, g.runID, mcvHead); err != nil || v != nil {
+			t.Errorf("mode %q: verdict = %+v err=%v, want nil (a transferred row is ignored and not even read)", mode, v, err)
+		}
+	}
+}
+
+func TestMergeCandidateVerifyState_TransferredSource(t *testing.T) {
+	f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+	f.s.cfg.MergeCandidateTransfer.Mode = MergeCandidateTransferEnforce
+	f.seedRebased(mcvHead, mcvHead, false)
+	f.seedRebased(mcvOtherHead, mcvOtherHead, false)
+	f.seedTrigger(mcvOtherHead)
+	f.seedVerdict(mcvOtherHead, mergeCandidateResultPassed)
+	f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{
+		FromHead: mcvOtherHead, ToHead: mcvHead, RootHead: "9999999999999999999999999999999999999999", ReasonCode: transferReasonIndependent})
+	st, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), mcvHead)
+	want := mergeCandidateState{State: mergeCandidateStatePassed, Cause: mergeCandidateCauseBaseAdvance,
+		Source: mergeCandidateSourceTransferred, TransferredFrom: mcvOtherHead, RootHead: "9999999999999999999999999999999999999999"}
+	if err != nil || st != want {
+		t.Errorf("state = %+v err=%v\nwant  %+v", st, err, want)
+	}
+	rec, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), mcvOtherHead)
+	if err != nil || rec.State != mergeCandidateStatePassed || rec.Source != mergeCandidateSourceRecorded || rec.TransferredFrom != "" {
+		t.Errorf("recorded state = %+v err=%v, want passed/recorded", rec, err)
+	}
+}

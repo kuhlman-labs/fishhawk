@@ -44,10 +44,19 @@ type Advancer interface {
 // two so childcompletion need not import orchestrator. The resume target
 // is the structured fields (persisted in the slice_integration_conflict
 // audit payload), never parsed from Detail.
+//
+// BaseSHA, ConflictingBasePaths, BaseAttribution and CompareTruncated mirror
+// the orchestrator's best-effort attribution of the conflict to base paths
+// (ADR-096 D4 / #4294) and are persisted on the slice_integration_conflict
+// payload; they never change routing.
 type SliceConflict struct {
-	SliceIndex int
-	ChildRunID uuid.UUID
-	Detail     string
+	SliceIndex           int
+	ChildRunID           uuid.UUID
+	Detail               string
+	BaseSHA              string
+	ConflictingBasePaths []string
+	BaseAttribution      string
+	CompareTruncated     bool
 }
 
 // ErrSliceHeadMissing is the sentinel a *SliceHeadMissingError matches under
@@ -768,13 +777,24 @@ func (s *Sweeper) emitChildrenSettled(ctx context.Context, parentRunID, parentSt
 // (#1142). The payload carries the STRUCTURED conflict provenance —
 // conflicting_slice_index + conflicting_child_run_id — so the next_actions
 // arm sources the resume target from this entry rather than parsing the
-// stage's free-form failure reason. Best-effort, mirroring
+// stage's free-form failure reason. It also carries the ADR-096 D4 / #4294
+// base attribution (base_sha, conflicting_base_paths — always an array —,
+// base_attribution, compare_truncated), key-for-key the payload the
+// orchestrator and the consolidate verb write. Best-effort, mirroring
 // emitChildrenSettled.
 func (s *Sweeper) emitSliceIntegrationConflict(ctx context.Context, parentRunID, parentStageID uuid.UUID, conflict *SliceConflict) {
+	basePaths := conflict.ConflictingBasePaths
+	if basePaths == nil {
+		basePaths = []string{}
+	}
 	payload, err := json.Marshal(map[string]any{
 		"parent_stage_id":          parentStageID.String(),
 		"conflicting_slice_index":  conflict.SliceIndex,
 		"conflicting_child_run_id": conflict.ChildRunID.String(),
+		"base_sha":                 conflict.BaseSHA,
+		"conflicting_base_paths":   basePaths,
+		"base_attribution":         conflict.BaseAttribution,
+		"compare_truncated":        conflict.CompareTruncated,
 	})
 	if err != nil {
 		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: marshal slice_integration_conflict payload",

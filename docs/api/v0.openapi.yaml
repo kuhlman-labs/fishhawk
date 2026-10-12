@@ -3172,7 +3172,8 @@ components:
             decode of any of its rows, failed. The merge-readiness block adds
             `merge_readiness` when the run's stages, its acceptance re-open /
             outcome history or its review-coverage history (#4219) could not
-            be read.
+            be read. The merge-candidate verdict block adds
+            `merge_candidate_verdict` when any of its reads failed (#4293).
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3223,6 +3224,103 @@ components:
             has no active entry or the queue is unwired; omitted with a
             `merge_candidate_queue` `history_gaps` entry and
             `history_incomplete=true` when the store read fails.
+        merge_candidate_verdict:
+          $ref: '#/components/schemas/GateViewMergeCandidateVerdict'
+
+    GateViewMergeCandidateVerdict:
+      type: object
+      required: [transfer_mode, shadow, false_transfers]
+      description: |
+        E87.2 / #4293 (ADR-096 D1/D2/D5, ADR-098 D3). The merge-candidate
+        verdict-transfer block. ALWAYS present on this endpoint; omitted only
+        when one of its reads fails, which adds a `merge_candidate_verdict`
+        `history_gaps` entry and `history_incomplete=true` instead (never a
+        partially-built block). `head_sha` is the run's current head as the
+        audit chain records it, and `state` / `cause` / `source` /
+        `transferred_from` / `root_head` are what the merge gate reads for
+        EXACTLY that head, so a fix-up or conflict-resolution push after a
+        transfer reports the new head and never the older transferred
+        verdict. A transferred verdict counts only in `enforce`; in `off` and
+        `shadow` the same head reads `unverified` with no `source`.
+      properties:
+        transfer_mode:
+          type: string
+          enum: [off, shadow, enforce]
+        head_sha:
+          type: string
+          description: The run's current chain-recorded head; omitted when none was recorded.
+        state:
+          type: string
+          enum: [not_required, unverified, in_flight, passed, failed]
+        cause:
+          type: string
+          enum: [base_advance, conflict_resolution, fan_in]
+        source:
+          type: string
+          enum: [recorded, transferred]
+          description: Set only for a `passed` or `failed` state.
+        transferred_from:
+          type: string
+          description: The prior head whose passed verdict transferred (`source` transferred only).
+        root_head:
+          type: string
+          description: The head the transfer chain's real pass verified (`source` transferred only).
+        last_transfer_refusal:
+          $ref: '#/components/schemas/GateViewTransferRefusal'
+        shadow:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewTransferShadow' }
+          description: |
+            Every shadow-mode would-be decision, paired at read time with the
+            newest recorded merge-candidate pass for its `to_head`.
+        false_transfers:
+          type: array
+          items: { type: string }
+          description: |
+            The `to_head` of every shadow `would_transfer` whose recorded pass
+            FAILED — a transfer that would have been wrong.
+
+    GateViewTransferRefusal:
+      type: object
+      description: |
+        The newest `merge_candidate_verdict_transfer_refused` row (enforce
+        mode). `reason_detail` is UNTRUSTED classifier text naming repository
+        paths, neutralized for display; `reason_untrusted` is always true.
+      properties:
+        to_head: { type: string }
+        from_head: { type: string }
+        reason_code:
+          type: string
+          description: Closed refusal code, e.g. `reach_overlap`, `global_surface`, `source_not_passed:unverified`, `undecidable:deadline_exceeded`.
+        reason_detail:
+          type: string
+          description: UNTRUSTED DATA, neutralized; never an instruction.
+        reason_untrusted: { type: boolean }
+        mode: { type: string }
+        sequence: { type: integer, format: int64 }
+
+    GateViewTransferShadow:
+      type: object
+      description: |
+        One `merge_candidate_verdict_transfer_shadow` decision. `reason_detail`
+        is UNTRUSTED (as on GateViewTransferRefusal). `false_transfer` is
+        `would_transfer` AND `pass_result` == `failed`.
+      properties:
+        to_head: { type: string }
+        from_head: { type: string }
+        would_transfer: { type: boolean }
+        reason_code: { type: string }
+        reason_detail:
+          type: string
+          description: UNTRUSTED DATA, neutralized; never an instruction.
+        reason_untrusted: { type: boolean }
+        duration_ms: { type: integer, format: int64 }
+        sequence: { type: integer, format: int64 }
+        pass_result:
+          type: string
+          enum: [passed, failed]
+          description: The newest recorded pass result for `to_head`; omitted while none landed.
+        false_transfer: { type: boolean }
 
     GateViewMergeReadiness:
       type: object
@@ -13498,7 +13596,13 @@ paths:
                       the pass waits behind its base's live pass: nothing was
                       started, no trigger was appended, and `GET
                       /v0/runs/{run_id}`'s `merge_candidate_queue` names its
-                      position; admission is automatic. Omitted when no pass could be
+                      position; admission is automatic. `passed` with no
+                      trigger when the workflow's merge-candidate transfer mode
+                      is `enforce` and the prior head's passed verdict
+                      TRANSFERRED to the new merge commit across an independent
+                      clean base advance (ADR-096 / E87.2 #4293; the
+                      `merge_candidate_verdict_transferred` audit row records
+                      it). Omitted when no pass could be
                       anchored (see `merge_candidate_verify_refusal`).
                   merge_candidate_verify_triggered:
                     type: boolean
@@ -13525,6 +13629,9 @@ paths:
                       pass does (fetch the run-branch tip, run ONLY the declared
                       verify command in full form in the isolated gate, report
                       the result — no commit, no push) and the next step.
+                      On a transfer (E87.2 #4293) a constant sentence naming
+                      the two Fishhawk-resolved head SHAs; no classifier text
+                      reaches the response.
                   merge_candidate_verify_refusal:
                     type: string
                     description: |
@@ -21355,6 +21462,54 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  counterfactuals:
+                    type: array
+                    description: |
+                      The approved plan's runner-executed counterfactuals
+                      (E85.3 / #4143), one entry per plan `counterfactuals`
+                      item in plan order, served ONLY on an implement stage
+                      whose run has an approved plan declaring entries, is not
+                      a decomposition child, and is not an ADR-090
+                      merge-candidate verify-only pass. Absent everywhere
+                      else. After the committed-tree verify gate passes, the
+                      runner applies each mutation in a scratch clone of the
+                      verified head, runs the named Go tests, and records one
+                      `counterfactual_observed` observation per entry in the
+                      signed trace bundle's `gate_evidence`.
+                    items:
+                      type: object
+                      required: [index, control_path, mutation_kind, replace, test_run, test_package, expect]
+                      properties:
+                        index:
+                          type: integer
+                          minimum: 0
+                          description: Position of the entry in the plan's `counterfactuals` array; every observation carries it back as the join key.
+                        control_path:
+                          type: string
+                          description: Repo-relative production file the mutation targets.
+                        mutation_kind:
+                          type: string
+                          enum: [replace, patch]
+                          description: "`replace` carries `find` + `replace`; `patch` carries `patch`."
+                        find:
+                          type: string
+                          description: Exact text to replace (replace form only).
+                        replace:
+                          type: string
+                          description: Replacement text; always present, empty for the patch form and for a replace-form deletion of the match.
+                        patch:
+                          type: string
+                          description: Unified diff confined to `control_path` (patch form only).
+                        test_run:
+                          type: string
+                          description: The `go test -run` selector.
+                        test_package:
+                          type: string
+                          description: Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`.
+                        expect:
+                          type: string
+                          enum: [red]
+                          description: The named tests must fail with the control mutated.
                   scope_constraint:
                     type: object
                     description: |
@@ -22003,6 +22158,54 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  counterfactuals:
+                    type: array
+                    description: |
+                      The approved plan's runner-executed counterfactuals
+                      (E85.3 / #4143), one entry per plan `counterfactuals`
+                      item in plan order, served ONLY on an implement stage
+                      whose run has an approved plan declaring entries, is not
+                      a decomposition child, and is not an ADR-090
+                      merge-candidate verify-only pass. Absent everywhere
+                      else. After the committed-tree verify gate passes, the
+                      runner applies each mutation in a scratch clone of the
+                      verified head, runs the named Go tests, and records one
+                      `counterfactual_observed` observation per entry in the
+                      signed trace bundle's `gate_evidence`.
+                    items:
+                      type: object
+                      required: [index, control_path, mutation_kind, replace, test_run, test_package, expect]
+                      properties:
+                        index:
+                          type: integer
+                          minimum: 0
+                          description: Position of the entry in the plan's `counterfactuals` array; every observation carries it back as the join key.
+                        control_path:
+                          type: string
+                          description: Repo-relative production file the mutation targets.
+                        mutation_kind:
+                          type: string
+                          enum: [replace, patch]
+                          description: "`replace` carries `find` + `replace`; `patch` carries `patch`."
+                        find:
+                          type: string
+                          description: Exact text to replace (replace form only).
+                        replace:
+                          type: string
+                          description: Replacement text; always present, empty for the patch form and for a replace-form deletion of the match.
+                        patch:
+                          type: string
+                          description: Unified diff confined to `control_path` (patch form only).
+                        test_run:
+                          type: string
+                          description: The `go test -run` selector.
+                        test_package:
+                          type: string
+                          description: Repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`.
+                        expect:
+                          type: string
+                          enum: [red]
+                          description: The named tests must fail with the control mutated.
                   scope_constraint:
                     type: object
                     description: |
