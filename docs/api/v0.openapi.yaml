@@ -3952,11 +3952,15 @@ components:
             the accompanying `detail` states any outstanding advisory
             reviewer rejects or unresolved concerns — #2487).
             `rerun_review` / `await_review` (#4219) accompany a
-            `review_coverage_incomplete` park: the parent's latest
-            implement-review round settled with no verdict (re-run it with
-            `POST /v0/runs/{run_id}/reviews/rerun`), or a round is in flight
-            or not yet dispatched (await it); the `detail` is the merge
-            endpoint's refusal message.
+            `review_coverage_incomplete` park: `rerun_review` when the
+            parent's latest implement-review round settled with no verdict
+            (re-run it with `POST /v0/runs/{run_id}/reviews/rerun`) or the
+            parent has NO round and its consolidated PR is open (the same
+            endpoint starts its first consolidated round, #4282);
+            `await_review` while a round is in flight, before the
+            consolidated PR opens, or for a gating parent with no round
+            (whose `detail` names `fishhawk_fixup_stage`); the `detail` is
+            the merge endpoint's refusal message.
             `run_implement_stage` / `run_plan_stage` are now ALSO produced
             by the `retry_stage` and `resume_run`/`recover` re-open paths
             on a `local` run (#1271), not only by plan-approve and revise;
@@ -14326,9 +14330,14 @@ paths:
             review_round_no_verdict}, parent_round {sequence, configured,
             terminal, verdicts, in_flight} | null, next_step}` where
             `next_step` is `fishhawk_rerun_review` (the parent round settled
-            with no verdict — `POST /v0/runs/{run_id}/reviews/rerun`) or
-            `fishhawk_await_review` (the parent round is in flight or not yet
-            dispatched). Checked after case (8) and BEFORE the merge seam, so
+            with no verdict, or the parent has NO round and its consolidated
+            PR is open, so the endpoint starts its first consolidated round,
+            #4282 — `POST /v0/runs/{run_id}/reviews/rerun`) or
+            `fishhawk_await_review` (a round is in flight, the consolidated PR
+            is not open yet, or a gating parent has no round — its message
+            then names `fishhawk_fixup_stage`, because the re-run endpoint
+            refuses it `gating_authority`). Checked after case (8) and BEFORE
+            the merge seam, so
             it is reported even where `merge_seam_unconfigured` would follow.
             Cases (8), (9) and (10) record NO verdict row and dispatch
             nothing.
@@ -15638,7 +15647,7 @@ paths:
   /v0/runs/{run_id}/reviews/rerun:
     post:
       operationId: rerunRunReview
-      summary: Re-run a verdict-less implement-review round
+      summary: Re-run a verdict-less implement-review round, or start a decomposed parent's first one
       description: |
         Operator re-run of a failed implement-review round (#4219). Re-runs
         the run's LATEST implement-review round when that round SETTLED WITH
@@ -15660,8 +15669,37 @@ paths:
         re-dispatch. Advisory reviewers then run detached; a recorded verdict
         clears the review-coverage hold.
 
+        **First consolidated round (#4282).** A DECOMPOSED PARENT
+        (`decomposed_from` null, at least one decomposed child) with NO
+        `implement_review_started` — its consolidated dispatch never started
+        a round because the forge compare failed or no forge was wired — has
+        nothing to re-run, and nothing re-fires that dispatch. On such a
+        parent this endpoint starts the FIRST consolidated round instead. Its
+        own refusals, each a `409 review_rerun_ineligible` decided before
+        anything is written (`details.reason`): `reviewer_unwired`;
+        `no_agent_reviewers` (the implement stage configures zero agent
+        reviewers); `gating_authority` (a gating round runs its reviewers
+        synchronously — the message names `fishhawk_fixup_stage` on the
+        parent implement stage, whose pushed head dispatches the re-review);
+        `consolidated_review_not_due` (the consolidated PR is not open yet,
+        or the parent has no implement stage — the orchestrator dispatches
+        the round when the PR opens); `implement_stage_terminal` /
+        `advanced_past_review`; `forge_compare_unavailable`. An eligible
+        parent gets `review_round_rerun_requested` with
+        `rerun_of_sequence: 0` and `first_round: true` (no `head_sha`), then
+        the same round body the orchestrator's consolidated dispatch runs —
+        permission-drift check, forge compare of the default ref (`main`
+        unless configured) against the consolidated branch, the ADR-090 D5
+        fan-in verify hold, the truncation signal, the reviewers — runs
+        SYNCHRONOUSLY. The new round carries `round_origin: consolidated`
+        and NO `rerun_of`; it carries no re-run marker, so a concurrent
+        orchestrator dispatch of the same head dedups on #797 and at most one
+        round starts. The 200 carries `rerun_of_sequence: 0`; a recorded
+        request that started no round is `502 review_rerun_not_started`.
+
         **Refusals, in order, each decided before anything is written.**
-        `409 no_review_round` (no `implement_review_started`);
+        `409 no_review_round` (no `implement_review_started` and not a
+        decomposed parent — a parent takes the first-round path above);
         `409 review_round_in_flight` (`details.reason`: `rerun_pending` — a
         re-run of this run is already in progress in this process;
         `boot_redispatch_pending` — the round is mid-handoff to a boot
@@ -15692,7 +15730,7 @@ paths:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
       responses:
         '200':
-          description: The round was re-run; a new round started.
+          description: The round was re-run (or, with `rerun_of_sequence` 0, a decomposed parent's first consolidated round was started); a new round started.
           content:
             application/json:
               schema:
@@ -15709,11 +15747,11 @@ paths:
                   rerun_of_sequence:
                     type: integer
                     format: int64
-                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run.
+                    description: Audit sequence of the verdict-less `implement_review_started` that was re-run; `0` when this call started a decomposed parent's FIRST consolidated round (#4282 — no earlier round existed).
                   new_round_sequence:
                     type: integer
                     format: int64
-                    description: Audit sequence of the NEW `implement_review_started` this call dispatched (its `rerun_of` names `rerun_of_sequence`).
+                    description: Audit sequence of the NEW `implement_review_started` this call dispatched (its `rerun_of` names `rerun_of_sequence`; a first consolidated round carries no `rerun_of`).
                   configured_agents:
                     type: integer
                     description: Agent reviewers the re-run round was dispatched with.
@@ -15742,7 +15780,13 @@ paths:
             `no_review_round`, `review_round_in_flight`,
             `review_round_has_verdict` or `review_rerun_ineligible` (see the
             refusal ladder above; `details` carry `run_id`, `round_sequence`
-            and, where named, `reason`). Nothing was written.
+            and, where named, `reason`). On the first-round path (#4282)
+            `review_rerun_ineligible` carries `details.reason`
+            `reviewer_unwired`, `no_agent_reviewers`, `gating_authority`,
+            `consolidated_review_not_due`, `implement_stage_terminal`,
+            `advanced_past_review` or `forge_compare_unavailable`, plus
+            `stage_id` once the parent implement stage resolved. Nothing was
+            written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15759,7 +15803,17 @@ paths:
             `review_rerun_not_started` — the `review_round_rerun_requested`
             row was recorded but no round started; `details.reason` names the
             rebuild failure (e.g. `compare_failed`,
-            `trace_bundle_unavailable`, `round_not_started`).
+            `trace_bundle_unavailable`, `round_not_started`). On the
+            first-round path (#4282) `details.reason` is `compare_failed`
+            (the forge compare failed again), `round_not_started`, or
+            `fanin_verify_held` — the ADR-090 D5 fan-in hold held the round;
+            `details.merge_candidate_state` names the consolidated head's
+            merge-candidate verify state (`unreadable` when the re-read
+            failed), and the message says to await a pass in flight (this
+            call may have just STARTED it under the system actor, so that 502
+            is not write-free; its report dispatches the round) or to route
+            `fishhawk_fixup_stage` on the parent implement stage when the pass
+            failed. `details` also carry `stage_id`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

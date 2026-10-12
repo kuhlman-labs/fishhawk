@@ -156,6 +156,14 @@ var redactableDetailKeys = map[string]struct{}{
 	// wired refusal keeps its actionable half stripped by the 5xx default-deny
 	// redactor and the operator is handed the same un-actionable body as before.
 	"remedy": {},
+	// merge_candidate_state: the consolidated head's ADR-090 merge-candidate
+	// verify state a 502 review_rerun_not_started (reason fanin_verify_held)
+	// names (#4282, approval condition C4). Its value is a CLOSED,
+	// product-owned enum (not_required / unverified / in_flight / passed /
+	// failed, or the static literal `unreadable`) — never derived from an
+	// error or a third-party response — so it satisfies the membership rule
+	// above on the `state` / `failed_ordinal` precedent.
+	"merge_candidate_state": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of

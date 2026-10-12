@@ -294,18 +294,61 @@ func TestReviewCoverage_CancelledChildExcluded(t *testing.T) {
 	}
 }
 
-func TestReviewCoverage_NoParentRound_AwaitWithNullParentRound(t *testing.T) {
-	h := newCoverageHarness(t)
-	h.addChild(t, 0, run.StateSucceeded)
-	ref := h.refusal(t)
-	if ref == nil {
-		t.Fatal("refusal = nil, want a hold: no round covers the slice")
+// TestReviewCoverage_NoParentRound_RerunOncePROpen pins the no-round next_step
+// (#4282). The harness parent is GATING (fanInVerifySpec: 1 agent, 0 human)
+// with its consolidated PR open; the advisory arms swap in
+// specRedispatchAdvisory (1 agent, 1 human). Before the PR opens the
+// orchestrator has not dispatched the consolidated round yet, so the hold
+// awaits; once it is open with no round, an advisory parent's next_step is the
+// re-run verb, which starts the first consolidated round. A gating parent keeps
+// await and names fishhawk_fixup_stage, because the verb refuses it (approval
+// condition C5).
+//
+// COUNTERFACTUALS: revert the no-round case to always-await → the advisory
+// PR-open arm RED; delete the gating case → the gating arm reads rerun → RED;
+// delete the PR-open case → the advisory no-PR arm reads rerun → RED.
+func TestReviewCoverage_NoParentRound_RerunOncePROpen(t *testing.T) {
+	cases := []struct {
+		name       string
+		advisory   bool
+		prOpen     bool
+		wantNext   string
+		wantAction string
+		wantInMsg  []string
+	}{
+		{"advisory parent, PR open", true, true, reviewCoverageNextRerun, "rerun_review", []string{"fishhawk_rerun_review", "first consolidated round"}},
+		{"advisory parent, PR not open", true, false, reviewCoverageNextAwait, "await_review", []string{"fishhawk_await_review", "not open"}},
+		{"gating parent, PR open", false, true, reviewCoverageNextAwait, "await_review", []string{"fishhawk_await_review", "fishhawk_fixup_stage", "gating_authority"}},
 	}
-	if ref.Details["next_step"] != reviewCoverageNextAwait {
-		t.Errorf("next_step = %v, want %s (the re-run verb refuses no_review_round)", ref.Details["next_step"], reviewCoverageNextAwait)
-	}
-	if ref.Details["parent_round"] != nil {
-		t.Errorf("parent_round = %v, want nil", ref.Details["parent_round"])
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCoverageHarness(t)
+			h.addChild(t, 0, run.StateSucceeded)
+			if tc.advisory {
+				h.parent.WorkflowSpec = specRedispatchAdvisory
+			}
+			if !tc.prOpen {
+				h.parent.PullRequestURL = nil
+			}
+			ref := h.refusal(t)
+			if ref == nil {
+				t.Fatal("refusal = nil, want a hold: no round covers the slice")
+			}
+			if ref.Details["next_step"] != tc.wantNext {
+				t.Errorf("next_step = %v, want %s", ref.Details["next_step"], tc.wantNext)
+			}
+			if ref.Details["parent_round"] != nil {
+				t.Errorf("parent_round = %v, want nil", ref.Details["parent_round"])
+			}
+			for _, s := range tc.wantInMsg {
+				if !strings.Contains(ref.Message, s) {
+					t.Errorf("message does not name %q:\n%s", s, ref.Message)
+				}
+			}
+			if got := reviewCoverageDriveAction(ref); got != tc.wantAction {
+				t.Errorf("drive action = %q, want %s", got, tc.wantAction)
+			}
+		})
 	}
 }
 

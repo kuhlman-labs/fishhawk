@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupattempt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -3610,7 +3611,9 @@ const concernNoteTruncationMarker = " […truncated; read the review's full free
 // and runImplementReviews' own started-key guard dedups a re-fire across
 // the sweeper/event-driven double-advance. The review runs on a detached,
 // shutdown-tracked goroutine so the orchestrator's Advance (and the request
-// that drove it) never blocks on the compare fetch or the reviewer LLMs.
+// that drove it) never blocks on the compare fetch or the reviewer LLMs. That
+// goroutine's body is runConsolidatedReviewRound, which the operator re-run
+// verb's first-round path (#4282) also runs, synchronously.
 func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string) {
 	if s.cfg.RunRepo == nil {
 		return
@@ -3639,19 +3642,13 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 		return
 	}
 
-	var implStage *run.Stage
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, parentRunID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: list stages failed",
 			slog.String("run_id", parentRunID.String()), slog.String("error", err.Error()))
 		return
 	}
-	for _, st := range stages {
-		if st.Type == run.StageTypeImplement {
-			implStage = st
-			break
-		}
-	}
+	implStage := consolidatedImplementStage(stages)
 	if implStage == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: parent has no implement stage — skipping",
 			slog.String("run_id", parentRunID.String()))
@@ -3672,65 +3669,104 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 	}
 
 	stageID := implStage.ID
-	// Permission-drift check over the consolidated change (E80.4 / #3761): the
-	// run that merges is the parent, so its base → consolidated head is the
-	// cumulative delta the children's `pushed` reports are not checked for. It
-	// runs first inside this review goroutine (not a goroutine of its own), so
-	// it never contends with the review's compare.
-	driftReq := permissionDriftRequest{
-		RunID: parentRunID, StageID: stageID, Base: base, Head: head,
-		Trigger: permissionDriftTriggerConsolidated,
-	}
 	reviewCtx := context.WithoutCancel(ctx)
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
-		if s.permissionDriftRunnable(reviewCtx, driftReq) {
-			s.runPermissionDriftCheck(reviewCtx, driftReq)
-		}
-		cmp, cerr := comparer.ComparePatch(reviewCtx, scope, repo, base, head)
-		if cerr != nil {
-			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",
-				slog.String("run_id", parentRunID.String()),
-				slog.String("base", base), slog.String("head", head),
-				slog.String("error", cerr.Error()))
-			return
-		}
-		// ADR-090 D5 (#4018): hold the gating review until the consolidated
-		// fan-in head carries a passed merge-candidate verify, triggering the
-		// verify-only pass when it has none. Consulted only once the compare has
-		// resolved the head, and before anything this round records, so a held
-		// round leaves no review trace. A parent with no declared verify command
-		// (D4) is never held. Release is the pass's report re-walking the review
-		// stage back into this function (fanin_verify.go).
-		if s.holdConsolidatedReviewForFanInVerify(reviewCtx, runRow, base, head, cmp.HeadSHA) {
-			return
-		}
-		if cmp.Truncated {
-			// Surface loudly + emit a durable degradation signal: the review
-			// is about to run on a partial diff (the consolidated fan-out's
-			// large-diff case the #1060 amendment calls out). Still dispatch
-			// — a partial review beats none — but the gap is now auditable.
-			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: diff truncated by GitHub — review will under-review",
-				slog.String("run_id", parentRunID.String()),
-				slog.String("reason", cmp.TruncationReason),
-				slog.Int("changed_files", len(cmp.Files)))
-			s.emitConsolidatedReviewTruncated(reviewCtx, parentRunID, stageID, cmp.TruncationReason, len(cmp.Files))
-		}
-		diff := consolidatedReviewDiff(cmp)
-		// The returned gating-reject signal is intentionally ignored: the
-		// parent implement stage is already succeeded, so there is no
-		// terminal transition to fail to category-B. Gating is enforced by
-		// the drive gate (which parks until this round dispatches) plus the
-		// operator reading the verdicts and routing a fix-up. The
-		// implement_review_started/_reviewed round and any concerns attach
-		// to the parent implement stage regardless of authority.
-		//
-		// The round source (#4077) records the compare base so a
-		// restart-orphaned round is re-dispatched as ComparePatch(base, head).
-		srcCtx := withReviewRoundSource(reviewCtx, reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base})
-		s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
+		// The outcome is discarded: this dispatch is best-effort and the
+		// round body logs its own refusals. The operator re-run verb's
+		// first-round path (#4282) is the caller that reads it.
+		_, _ = s.runConsolidatedReviewRound(reviewCtx, runRow, stageID, base, head, comparer, scope, repo)
 	}()
+}
+
+// consolidatedImplementStage returns the decomposed parent's implement stage —
+// the first implement-type stage in stages, the awaiting_children→succeeded
+// stage the consolidated round attaches to — or nil when it has none. Shared by
+// DispatchConsolidatedReview and the re-run verb's first-round path (#4282).
+func consolidatedImplementStage(stages []*run.Stage) *run.Stage {
+	for _, st := range stages {
+		if st.Type == run.StageTypeImplement {
+			return st
+		}
+	}
+	return nil
+}
+
+// Outcome slugs runConsolidatedReviewRound returns when it did NOT reach
+// runImplementReviews. compare_failed reuses the re-dispatch slug.
+const consolidatedRoundSlugFanInVerifyHeld = "fanin_verify_held"
+
+// runConsolidatedReviewRound is the body of a decomposed parent's consolidated
+// implement-review round (#1060), run under ctx: the permission-drift check,
+// ComparePatch(base, head), the ADR-090 D5 fan-in hold, the truncation signal,
+// then runImplementReviews under the consolidated round source. It spawns no
+// goroutine of its own. DispatchConsolidatedReview runs it on its detached,
+// shutdown-tracked goroutine and discards the outcome; the operator re-run
+// verb's first-round path (handleRerunReview, #4282) runs it synchronously and
+// reads it.
+//
+// Returns ("", head) when it reached runImplementReviews — which may itself
+// still dedup (#797) or skip — compare_failed when the compare errored, or
+// fanin_verify_held when the D5 hold held the round; head is the compare's
+// resolved head SHA ("" on a compare failure).
+func (s *Server) runConsolidatedReviewRound(ctx context.Context, runRow *run.Run, stageID uuid.UUID, base, head string, comparer patchComparer, scope forge.CredentialScope, repo forge.RepoRef) (string, string) {
+	parentRunID := runRow.ID
+	// Permission-drift check over the consolidated change (E80.4 / #3761): the
+	// run that merges is the parent, so its base → consolidated head is the
+	// cumulative delta the children's `pushed` reports are not checked for. It
+	// runs first inside this review round (not a goroutine of its own), so it
+	// never contends with the review's compare.
+	driftReq := permissionDriftRequest{
+		RunID: parentRunID, StageID: stageID, Base: base, Head: head,
+		Trigger: permissionDriftTriggerConsolidated,
+	}
+	if s.permissionDriftRunnable(ctx, driftReq) {
+		s.runPermissionDriftCheck(ctx, driftReq)
+	}
+	cmp, cerr := comparer.ComparePatch(ctx, scope, repo, base, head)
+	if cerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",
+			slog.String("run_id", parentRunID.String()),
+			slog.String("base", base), slog.String("head", head),
+			slog.String("error", cerr.Error()))
+		return redispatchSlugCompareFailed, ""
+	}
+	// ADR-090 D5 (#4018): hold the gating review until the consolidated
+	// fan-in head carries a passed merge-candidate verify, triggering the
+	// verify-only pass when it has none. Consulted only once the compare has
+	// resolved the head, and before anything this round records, so a held
+	// round leaves no review trace. A parent with no declared verify command
+	// (D4) is never held. Release is the pass's report re-walking the review
+	// stage back into DispatchConsolidatedReview (fanin_verify.go).
+	if s.holdConsolidatedReviewForFanInVerify(ctx, runRow, base, head, cmp.HeadSHA) {
+		return consolidatedRoundSlugFanInVerifyHeld, cmp.HeadSHA
+	}
+	if cmp.Truncated {
+		// Surface loudly + emit a durable degradation signal: the review
+		// is about to run on a partial diff (the consolidated fan-out's
+		// large-diff case the #1060 amendment calls out). Still dispatch
+		// — a partial review beats none — but the gap is now auditable.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "consolidated review: diff truncated by GitHub — review will under-review",
+			slog.String("run_id", parentRunID.String()),
+			slog.String("reason", cmp.TruncationReason),
+			slog.Int("changed_files", len(cmp.Files)))
+		s.emitConsolidatedReviewTruncated(ctx, parentRunID, stageID, cmp.TruncationReason, len(cmp.Files))
+	}
+	diff := consolidatedReviewDiff(cmp)
+	// The returned gating-reject signal is intentionally ignored: the
+	// parent implement stage is already succeeded, so there is no
+	// terminal transition to fail to category-B. Gating is enforced by
+	// the drive gate (which parks until this round dispatches) plus the
+	// operator reading the verdicts and routing a fix-up. The
+	// implement_review_started/_reviewed round and any concerns attach
+	// to the parent implement stage regardless of authority.
+	//
+	// The round source (#4077) records the compare base so a
+	// restart-orphaned round is re-dispatched as ComparePatch(base, head).
+	srcCtx := withReviewRoundSource(ctx, reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base})
+	s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
+	return "", cmp.HeadSHA
 }
 
 // maybeBackstopFixupReReview dispatches the post-fix-up implement re-review

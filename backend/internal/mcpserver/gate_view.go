@@ -140,8 +140,12 @@ Response (gate_view):
     verdict, and a round whose reviewers all failed or were skipped covers
     nothing — details name uncovered_slices[] (child_run_id, slice_index,
     round_sequence, reason), parent_round and next_step: fishhawk_rerun_review
-    when the parent round settled with no verdict, fishhawk_await_review while
-    it is in flight or not yet dispatched).
+    when the parent round settled with no verdict, or when the parent has NO
+    round and its consolidated PR is open (the verb then starts the parent's
+    first consolidated round); fishhawk_await_review while a round is in
+    flight, before the consolidated PR opens, or for a gating parent with no
+    round (the message then names fishhawk_fixup_stage on the parent
+    implement stage).
     undetermined[] names each check that could not reach a verdict (the
     approval check fails OPEN on any forge uncertainty; an acceptance-history
     or review-coverage read failure is also a merge_readiness history_gaps
