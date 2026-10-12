@@ -924,6 +924,12 @@ type Config struct {
 	// merge_candidate_queue.go and backend/internal/mergequeue/README.md.
 	MergeQueue mergequeue.Store
 
+	// MergeCandidateTransfer is the ADR-096 verdict-transfer switch (E87.2 /
+	// #4293): off | shadow | enforce plus the classifier. The ZERO VALUE is
+	// off, so an in-process server is unchanged; fishhawkd defaults shadow
+	// (ADR-098 D3). See merge_candidate_transfer.go.
+	MergeCandidateTransfer MergeCandidateTransferConfig
+
 	// CrewMailbox is the crew-message domain layer (E77.3 / #3737, ADR-081
 	// #3727 D4) behind the five /v0/crew-messages routes: sends and
 	// dispositions append to the chain through it, and reads go through
@@ -1215,6 +1221,17 @@ type Server struct {
 	// bgBranchSweeps, bounded by the shutdown context.
 	bgRefinementFiling sync.WaitGroup
 
+	// bgTransferShadows tracks the DETACHED shadow verdict-transfer decisions
+	// (E87.2 / #4293); tests wait on it. Shutdown deliberately does not: a
+	// lost shadow row is a measurement gap, never a skipped pass.
+	bgTransferShadows sync.WaitGroup
+	// transferSem is the one-slot classification semaphore bounding the host
+	// load shadow decisions add (two tree materializations + two go list).
+	transferSem chan struct{}
+	// transferInputs overrides the transfer inputs resolver (tests); nil is
+	// defaultMergeCandidateTransferInputs.
+	transferInputs mergeCandidateTransferInputsFunc
+
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session
 	// GET's filing block. Zero value ready.
@@ -1385,7 +1402,8 @@ func New(cfg Config) *Server {
 		cfg.ReviewBudget = planreview.DefaultReviewBudget
 	}
 
-	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}}
+	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}, transferSem: make(chan struct{}, 1)}
+	s.logMergeCandidateTransferStartup()
 	if s.nowFunc == nil {
 		s.nowFunc = time.Now
 	}

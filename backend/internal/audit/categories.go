@@ -619,6 +619,16 @@ var KnownCategories = map[string]struct{}{
 	// the issue, and is its dedup key (server/partial_delivery_merge.go).
 	"partial_delivery_closing_reference_neutralized": {},
 	"partial_delivery_remaining_scope_posted":        {},
+
+	// E87.2 / #4293 (ADR-096 D1/D2/D5, ADR-098 D3): merge-candidate verdict
+	// transfer across a clean base advance (server/merge_candidate_transfer.go).
+	// transferred / transfer_refused / false_transfer are issue-comment activity
+	// surfaces; false_transfer is ADVISORY and never blocks a gate; shadow is
+	// INTERNAL, not an issue-comment surface.
+	"merge_candidate_verdict_false_transfer":   {},
+	"merge_candidate_verdict_transfer_refused": {},
+	"merge_candidate_verdict_transfer_shadow":  {},
+	"merge_candidate_verdict_transferred":      {},
 }
 
 // knownCategoryList is the sorted slice form of KnownCategories, computed
