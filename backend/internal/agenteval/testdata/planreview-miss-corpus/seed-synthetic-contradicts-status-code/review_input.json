@@ -1,0 +1,170 @@
+{
+  "issue_title": "Reject duplicate widget names within a tenant",
+  "issue_body": "Two widgets of the same tenant can currently share a name, which breaks the name-based lookups support uses.\n\n`POST /widgets` with a name another widget of the same tenant already has must return `409 Conflict` with error code `duplicate_name`. Names are compared case-insensitively. Different tenants may reuse a name. An empty name keeps returning `400` with error code `invalid_name`.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/widgets-service/issues/108",
+      "id": "example-org/widgets-service#108"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-11T09:00:00Z"
+    },
+    "summary": "Enforce per-tenant unique widget names with a unique index and a duplicate_name API error.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/widgets_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/widgets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/migrations/0015_widgets_unique_name.sql",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0015 creating a unique index on widgets (tenant_id, lower(name)), with a down migration dropping it."
+      },
+      {
+        "step": 2,
+        "description": "In CreateWidget, detect the unique violation (pgcode 23505) and return store.ErrDuplicateName."
+      },
+      {
+        "step": 3,
+        "description": "In the POST /widgets handler, map store.ErrDuplicateName to an API error with code duplicate_name and HTTP 400, matching the validation errors."
+      },
+      {
+        "step": 4,
+        "description": "Keep the existing empty-name check returning 400 with code invalid_name."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Store test: a second CreateWidget with the same tenant and a differently-cased name returns ErrDuplicateName. Handler tests: the duplicate, cross-tenant and empty-name cases each assert the status code and the error code.",
+      "rollback_plan": "Revert the PR and run the 0015 down migration to drop the index.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-create-unique-201",
+          "statement": "POST /widgets with a name no other widget of the tenant uses returns HTTP 201.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#108"
+        },
+        {
+          "id": "ac-create-duplicate-400",
+          "statement": "POST /widgets with a name another widget of the same tenant already uses returns HTTP 400 with error code duplicate_name.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#108"
+        },
+        {
+          "id": "ac-create-case-insensitive",
+          "statement": "POST /widgets with the name \"Gizmo\" when the tenant has a widget named \"gizmo\" is refused like any duplicate.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#108"
+        },
+        {
+          "id": "ac-create-other-tenant-ok",
+          "statement": "POST /widgets with a name only another tenant uses returns HTTP 201.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#108"
+        },
+        {
+          "id": "ac-create-empty-name-400",
+          "statement": "POST /widgets with an empty name returns HTTP 400 with error code invalid_name.",
+          "source": "explicit",
+          "source_ref": "example-org/widgets-service#108"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "No tenant holds duplicate names today; the index creation fails otherwise and must be preceded by a data fix."
+    ],
+    "predicted_runtime_minutes": 35,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "contradicts the issue",
+    "contradicts issue",
+    "conflicts with the issue",
+    "inconsistent with the issue",
+    "violates the issue",
+    "the issue requires",
+    "the issue says",
+    "the issue states",
+    "the issue specifies",
+    "the issue asks for 409",
+    "should be 409",
+    "must be 409",
+    "should return 409",
+    "must return 409",
+    "expects 409",
+    "409, not 400",
+    "409 rather than 400",
+    "instead of 409",
+    "rather than 409",
+    "mismatch",
+    "diverges",
+    "contrary to",
+    "at odds with"
+  ],
+  "attribution_phrases": [
+    "already uses",
+    "duplicate_name"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-create-duplicate-400 contradicts the issue: a duplicate name must return 409 Conflict, not 400."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-create-duplicate-400 expects HTTP 400, but the issue specifies 409 for a duplicate name; approach step 3 maps the wrong code too."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion for a name another widget already uses expects 400 with duplicate_name, which is at odds with the issue's 409 Conflict."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test covers two concurrent creates racing on the same name; the unique index decides, so assert the loser's response."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Building the unique index on a large widgets table locks writes; create it concurrently."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the duplicate_name error code in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-create-duplicate-400 should also assert the response body carries the existing widget's id."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Renaming a widget via PATCH /widgets/{id} can also produce a duplicate; the plan changes only POST."
+    }
+  ]
+}
