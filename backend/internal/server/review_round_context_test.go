@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // Review-round context (#4077, slice 1): the round source and the re-dispatch
@@ -432,24 +435,35 @@ func TestEmitReviewStarted_StampsRerunOf(t *testing.T) {
 }
 
 // TestRunImplementReviewsForTree_RerunMarkerIsNarrow pins the self-verifying
-// re-run bypass of the #797 same-head dedup: a round already exists for
-// (stage, head) at sequence `of`. Every marker that does not name THIS dispatch
-// — none, a stale Of, a wrong head, a wrong stage — dedups (no new round, no
-// reviewer call). The valid marker dispatches ONE round stamped rerun_of; a
-// second dispatch carrying the SAME marker then finds that new round newest and
-// dedups, which is the in-lock re-verification that makes two concurrent
-// re-runs start exactly one round.
+// re-run bypass of the #797 same-head dedup: TWO rounds already exist for
+// (stage, head) — an older one and the target at sequence `of`. Every marker
+// that does not name THIS dispatch — none, a stale Of, a wrong head, a wrong
+// stage — dedups (no new round, no reviewer call). The valid marker dispatches
+// ONE round stamped rerun_of; a second dispatch carrying the SAME marker then
+// finds that new round newest and dedups, which is the in-lock re-verification
+// that makes two sequential re-runs start exactly one round (the concurrent
+// shape is TestRunImplementReviewsForTree_RerunMarkerConcurrentDispatchStartsOneRound).
 //
-// COUNTERFACTUALS: rerunBypassApplies returning true for any present marker →
-// the stale/wrong arms dispatch → RED; dropping the newest==Of check → the
-// second valid-marker dispatch starts a second round → RED; dropping the
-// `!s.rerunBypassApplies(...)` term from the dedup guard → the valid arm
-// dedups → RED.
+// The stale arm's Of is the OLDER seeded round: a real, positive sequence, so
+// reviewRerunFrom reads the marker ok (asserted as a fixture precondition on
+// every marker arm) and its stage and head equal the dispatch's — the
+// `newest.Sequence != rr.Of` conjunct is the only thing that rejects it. (An
+// `of-1` Of on a fresh fake is 0, which reviewRerunFrom rejects before the
+// newest==Of comparison is ever reached, so it could not pin that conjunct.)
+//
+// COUNTERFACTUALS (fixture mechanism: the arm's marker reads ok and names the
+// dispatch's stage and head, so the deleted conjunct is the only rejection):
+// drop `newest.Sequence != rr.Of` from rerunBypassApplies → the stale arm's
+// in-lock re-verification passes, it bypasses the dedup and starts a third
+// round → RED; rerunBypassApplies returning true for any present marker → the
+// stale/wrong arms dispatch → RED; dropping the `!s.rerunBypassApplies(...)`
+// term from the dedup guard → the valid arm dedups → RED.
 func TestRunImplementReviewsForTree_RerunMarkerIsNarrow(t *testing.T) {
 	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
 	au.stampSequence = true
 	const head = "rerun-head"
+	older := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, head)
 	of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, head)
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
 	traceCtx := withReviewRoundSource(context.Background(), reviewRoundSource{Origin: reviewRoundOriginTrace})
@@ -460,18 +474,22 @@ func TestRunImplementReviewsForTree_RerunMarkerIsNarrow(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name string
-		ctx  context.Context
+		name   string
+		ctx    context.Context
+		marker bool
 	}{
-		{"no marker", traceCtx},
-		{"stale Of", withReviewRerun(traceCtx, reviewRerun{Of: of - 1, StageID: implStage.ID, HeadSHA: head})},
-		{"wrong head", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "other-head"})},
-		{"wrong stage", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: uuid.New(), HeadSHA: head})},
+		{"no marker", traceCtx, false},
+		{"stale Of", withReviewRerun(traceCtx, reviewRerun{Of: older, StageID: implStage.ID, HeadSHA: head}), true},
+		{"wrong head", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "other-head"}), true},
+		{"wrong stage", withReviewRerun(traceCtx, reviewRerun{Of: of, StageID: uuid.New(), HeadSHA: head}), true},
 	} {
+		if _, ok := reviewRerunFrom(tc.ctx); ok != tc.marker {
+			t.Fatalf("%s: fixture precondition: reviewRerunFrom ok = %v, want %v (a marker arm must not regress to a malformed marker the helper rejects first)", tc.name, ok, tc.marker)
+		}
 		s.runImplementReviewsForTree(tc.ctx, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
 		s.waitBackgroundReviews()
-		if got := startedPayloads(t, au, runRow.ID); len(got) != 1 {
-			t.Fatalf("%s: started rounds = %d, want 1 (the same head must dedup)", tc.name, len(got))
+		if got := startedPayloads(t, au, runRow.ID); len(got) != 2 {
+			t.Fatalf("%s: started rounds = %d, want 2 (the same head must dedup)", tc.name, len(got))
 		}
 		if n := reviewerCalls(); n != 0 {
 			t.Fatalf("%s: reviewer invocations = %d, want 0", tc.name, n)
@@ -482,11 +500,11 @@ func TestRunImplementReviewsForTree_RerunMarkerIsNarrow(t *testing.T) {
 	s.runImplementReviewsForTree(valid, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
 	s.waitBackgroundReviews()
 	got := startedPayloads(t, au, runRow.ID)
-	if len(got) != 2 {
-		t.Fatalf("started rounds after the valid re-run = %d, want 2", len(got))
+	if len(got) != 3 {
+		t.Fatalf("started rounds after the valid re-run = %d, want 3", len(got))
 	}
-	if got[1].RerunOf != of || got[1].HeadSHA != head || got[1].RedispatchOf != 0 {
-		t.Errorf("re-run round = %+v, want rerun_of %d, head %q, no D6 lineage", got[1], of, head)
+	if got[2].RerunOf != of || got[2].HeadSHA != head || got[2].RedispatchOf != 0 {
+		t.Errorf("re-run round = %+v, want rerun_of %d, head %q, no D6 lineage", got[2], of, head)
 	}
 	if n := reviewerCalls(); n != 1 {
 		t.Errorf("reviewer invocations after the valid re-run = %d, want 1", n)
@@ -494,28 +512,55 @@ func TestRunImplementReviewsForTree_RerunMarkerIsNarrow(t *testing.T) {
 
 	s.runImplementReviewsForTree(valid, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
 	s.waitBackgroundReviews()
-	if got := startedPayloads(t, au, runRow.ID); len(got) != 2 {
-		t.Fatalf("started rounds after a second dispatch with the same marker = %d, want 2 (the marker is spent once a newer round exists)", len(got))
+	if got := startedPayloads(t, au, runRow.ID); len(got) != 3 {
+		t.Fatalf("started rounds after a second dispatch with the same marker = %d, want 3 (the marker is spent once a newer round exists)", len(got))
 	}
 }
 
 // TestRunImplementReviewsForTree_RerunMarkerSkipsDiffSecretsOnlyWhenValid: the
 // re-run round was seeded BY CONSTRUCTION without its secrets check, so a
 // raised row is attributable to THIS dispatch. A valid marker skips the check
-// (the re-run round's own dispatch ran it); a stale marker runs it like an
-// ordinary round (and the round dedups).
+// (the re-run round's own dispatch ran it); every marker that fails
+// re-verification runs it like an ordinary round. Each failing arm's marker
+// reads ok (asserted as a fixture precondition) and names the dispatch's own
+// stage and head, so exactly ONE rerunBypassApplies conjunct rejects it:
 //
-// COUNTERFACTUAL: drop `&& !s.rerunBypassApplies(...)` from the secrets guard
-// → the valid arm raises one row → RED; make rerunBypassApplies ignore Of →
-// the stale arm raises nothing → RED.
+//   - stale Of: two rounds on (stage, head), Of = the OLDER one — only
+//     `newest.Sequence != rr.Of` rejects (CF28b);
+//   - newest round on another stage: the round at Of was recorded on another
+//     stage with the same head — only `*newest.StageID != stageID` rejects
+//     (CF29);
+//   - newest round on another head: the round at Of is on this stage but
+//     another head — only `p.HeadSHA == headSHA` rejects (CF30).
+//
+// COUNTERFACTUALS: drop `&& !s.rerunBypassApplies(...)` from the secrets guard
+// → the valid arm raises one row → RED; drop `newest.Sequence != rr.Of` → the
+// stale arm raises nothing → RED; drop `|| *newest.StageID != stageID` → the
+// another-stage arm raises nothing → RED; `return p.HeadSHA == headSHA` →
+// `return true` → the another-head arm raises nothing → RED.
 func TestRunImplementReviewsForTree_RerunMarkerSkipsDiffSecretsOnlyWhenValid(t *testing.T) {
+	const head = "secret-head"
 	for _, tc := range []struct {
-		name     string
-		stale    bool
+		name string
+		// seed appends the arm's implement_review_started rounds and returns
+		// the marker's Of.
+		seed     func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) int64
 		wantRows int
 	}{
-		{name: "valid marker skips the check", stale: false, wantRows: 0},
-		{name: "stale marker runs the check", stale: true, wantRows: 1},
+		{name: "valid marker skips the check", wantRows: 0, seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) int64 {
+			return appendRerunTargetRound(t, au, runID, stageID, head)
+		}},
+		{name: "stale Of runs the check", wantRows: 1, seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) int64 {
+			older := appendRerunTargetRound(t, au, runID, stageID, head)
+			appendRerunTargetRound(t, au, runID, stageID, head)
+			return older
+		}},
+		{name: "newest round on another stage runs the check", wantRows: 1, seed: func(t *testing.T, au *auditFake, runID, _ uuid.UUID) int64 {
+			return appendRerunTargetRound(t, au, runID, uuid.New(), head)
+		}},
+		{name: "newest round on another head runs the check", wantRows: 1, seed: func(t *testing.T, au *auditFake, runID, stageID uuid.UUID) int64 {
+			return appendRerunTargetRound(t, au, runID, stageID, "other-head")
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
@@ -523,18 +568,219 @@ func TestRunImplementReviewsForTree_RerunMarkerSkipsDiffSecretsOnlyWhenValid(t *
 			au.stampSequence = true
 			cr := newFakeConcernRepo()
 			s.cfg.ConcernRepo = cr
-			of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, "secret-head")
-			if tc.stale {
-				of--
-			}
+			of := tc.seed(t, au, runRow.ID, implStage.ID)
 			ctx := withReviewRerun(withReviewRoundSource(context.Background(), reviewRoundSource{Origin: reviewRoundOriginTrace}),
-				reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: "secret-head"})
-			s.runImplementReviewsForTree(ctx, runRow.ID, implStage.ID, keyDiff(), nil, "secret-head", "", "", nil)
+				reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: head})
+			if _, ok := reviewRerunFrom(ctx); !ok {
+				t.Fatalf("fixture precondition: reviewRerunFrom ok = false for Of %d (the arm must carry a well-formed marker)", of)
+			}
+			s.runImplementReviewsForTree(ctx, runRow.ID, implStage.ID, keyDiff(), nil, head, "", "", nil)
 			s.waitBackgroundReviews()
 			if n := len(serverCheckRows(t, cr, runRow.ID)); n != tc.wantRows {
 				t.Errorf("server_check rows = %d, want %d", n, tc.wantRows)
 			}
 		})
+	}
+}
+
+// TestRerunBypassApplies_EachConjunctBinds is the conjunct table for
+// rerunBypassApplies (#4282). The dispatch is always (stage S, head "h"). Each
+// false arm is built so that exactly ONE conjunct rejects — every other one
+// passes on that fixture — so deleting that conjunct flips the arm to true.
+// Two of them (the newest round's stage, the newest round's head) are
+// unreachable through handleRerunReview, which builds the marker from the
+// newest round itself; this table is where they bind.
+//
+// COUNTERFACTUALS (each mutates the BODY of rerunBypassApplies): drop
+// `newest.Sequence != rr.Of` → "stale Of" true → RED; drop
+// `|| *newest.StageID != stageID` → "newest round on another stage" true →
+// RED; `return p.HeadSHA == headSHA` → `return true` → "newest round on another
+// head" true → RED; drop `rr.StageID != stageID` → "marker stage != dispatch
+// stage" true → RED; drop `rr.HeadSHA != headSHA` → "marker head != dispatch
+// head" true → RED; return false unconditionally → "valid" false → RED.
+func TestRerunBypassApplies_EachConjunctBinds(t *testing.T) {
+	const head = "h"
+	stageS := uuid.New()
+	stageT := uuid.New()
+	type round struct {
+		stage uuid.UUID
+		head  string
+	}
+	for _, tc := range []struct {
+		name string
+		// rounds are appended in order; Of is the sequence of rounds[ofIdx].
+		rounds []round
+		ofIdx  int
+		// noMarker dispatches with no re-run marker at all.
+		noMarker    bool
+		markerStage uuid.UUID
+		markerHead  string
+		want        bool
+	}{
+		{name: "valid", rounds: []round{{stageS, head}}, ofIdx: 0, markerStage: stageS, markerHead: head, want: true},
+		{name: "stale Of (a real older round)", rounds: []round{{stageS, head}, {stageS, head}}, ofIdx: 0, markerStage: stageS, markerHead: head},
+		{name: "newest round on another stage", rounds: []round{{stageT, head}}, ofIdx: 0, markerStage: stageS, markerHead: head},
+		{name: "newest round on another head", rounds: []round{{stageS, "other-head"}}, ofIdx: 0, markerStage: stageS, markerHead: head},
+		{name: "marker stage != dispatch stage", rounds: []round{{stageS, head}}, ofIdx: 0, markerStage: stageT, markerHead: head},
+		{name: "marker head != dispatch head", rounds: []round{{stageS, head}}, ofIdx: 0, markerStage: stageS, markerHead: "other-head"},
+		{name: "no marker", rounds: []round{{stageS, head}}, ofIdx: 0, noMarker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			au := newAuditFake()
+			au.stampSequence = true
+			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+			runID := uuid.New()
+			var seqs []int64
+			for _, r := range tc.rounds {
+				seqs = append(seqs, appendRerunTargetRound(t, au, runID, r.stage, r.head))
+			}
+			ctx := context.Background()
+			if !tc.noMarker {
+				ctx = withReviewRerun(ctx, reviewRerun{Of: seqs[tc.ofIdx], StageID: tc.markerStage, HeadSHA: tc.markerHead})
+				if _, ok := reviewRerunFrom(ctx); !ok {
+					t.Fatalf("fixture precondition: reviewRerunFrom ok = false (the arm must carry a well-formed marker)")
+				}
+			}
+			if got := s.rerunBypassApplies(ctx, runID, stageS, head); got != tc.want {
+				t.Errorf("rerunBypassApplies = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// rendezvousAuditRepo wraps the fixture's auditFake and HOLDS the first two
+// ListForRunByCategory reads of category until both have arrived, so two
+// concurrent dispatches observe the chain at the same point. Every later read
+// passes straight through. A held read is released when the second arrives,
+// on timeout (so correct code can never deadlock here) and at t.Cleanup. The
+// hook never holds the fake's mutex while it waits, and never touches t: the
+// test reads bothArrived as a precondition instead. bothArrived closes ONLY
+// when the second read arrives while the first is still held — a second read
+// that comes after the first timed out (the two were serialised, e.g. both
+// behind reviewDispatchMu) leaves it open, so a timeout-release fails the
+// precondition rather than passing it vacuously.
+type rendezvousAuditRepo struct {
+	*auditFake
+	category string
+	timeout  time.Duration
+
+	mu          sync.Mutex
+	arrived     int
+	timedOut    bool          // the first held read gave up waiting
+	bothArrived chan struct{} // closed when the second read meets the held first
+	release     chan struct{} // closed once: both arrived, timeout or cleanup
+	releaseOnce sync.Once
+}
+
+func newRendezvousAuditRepo(t *testing.T, au *auditFake, category string) *rendezvousAuditRepo {
+	r := &rendezvousAuditRepo{
+		auditFake:   au,
+		category:    category,
+		timeout:     timescale.D(5 * time.Second),
+		bothArrived: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	t.Cleanup(r.open)
+	return r
+}
+
+func (r *rendezvousAuditRepo) open() { r.releaseOnce.Do(func() { close(r.release) }) }
+
+func (r *rendezvousAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == r.category {
+		r.mu.Lock()
+		r.arrived++
+		n := r.arrived
+		r.mu.Unlock()
+		switch n {
+		case 1:
+			select {
+			case <-r.release:
+			case <-time.After(r.timeout):
+				r.mu.Lock()
+				r.timedOut = true
+				r.mu.Unlock()
+				r.open()
+			}
+		case 2:
+			r.mu.Lock()
+			met := !r.timedOut
+			r.mu.Unlock()
+			if met {
+				close(r.bothArrived)
+			}
+			r.open()
+		}
+	}
+	return r.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestRunImplementReviewsForTree_RerunMarkerConcurrentDispatchStartsOneRound
+// pins the IN-LOCK re-verification of the re-run marker (#4282, CF34)
+// deterministically: two dispatches carrying the SAME valid marker run
+// concurrently and exactly one round starts.
+//
+// Fixture mechanism: each goroutine's FIRST implement_review_started read is
+// its entry-time rerunBypassApplies (the diff-secrets check, OUTSIDE
+// reviewDispatchMu — nothing earlier in runImplementReviewsForTree reads that
+// category). The rendezvous holds those two reads until both arrive, so both
+// entry-time verifications observe the target round as newest BEFORE either
+// goroutine emits; both therefore reach reviewDispatchMu believing the bypass
+// applies, and only the re-verification INSIDE the lock — where the second
+// holder finds the first's new round newest — keeps the second from starting
+// a round. That both reads met is asserted as a PRECONDITION: a rendezvous
+// that released on timeout proves nothing and fails the test.
+//
+// COUNTERFACTUALS: replace the in-lock `s.rerunBypassApplies(...)` with the
+// value computed at the entry-time secrets check → both goroutines carry
+// bypass=true into the lock and both emit → 2 new rounds → RED; drop the
+// in-lock `!s.rerunBypassApplies(...)` term (always dedup) → 0 new rounds →
+// RED.
+func TestRunImplementReviewsForTree_RerunMarkerConcurrentDispatchStartsOneRound(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	au.stampSequence = true
+	const head = "concurrent-head"
+	of := appendRerunTargetRound(t, au, runRow.ID, implStage.ID, head)
+	rv := newRendezvousAuditRepo(t, au, "implement_review_started")
+	s.cfg.AuditRepo = rv
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	ctx := withReviewRerun(withReviewRoundSource(context.Background(), reviewRoundSource{Origin: reviewRoundOriginTrace}),
+		reviewRerun{Of: of, StageID: implStage.ID, HeadSHA: head})
+	if _, ok := reviewRerunFrom(ctx); !ok {
+		t.Fatal("fixture precondition: reviewRerunFrom ok = false (the marker must be well-formed)")
+	}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.runImplementReviewsForTree(ctx, runRow.ID, implStage.ID, diff, nil, head, "", "", nil)
+		}()
+	}
+	wg.Wait()
+	s.waitBackgroundReviews()
+
+	select {
+	case <-rv.bothArrived:
+	default:
+		t.Fatalf("precondition: the two entry-time implement_review_started reads did not meet within %s — the rendezvous released on timeout, so the two dispatches were not concurrent at the entry-time verification and this run proves nothing", rv.timeout)
+	}
+
+	got := startedPayloads(t, au, runRow.ID)
+	if len(got) != 2 {
+		t.Fatalf("started rounds = %d, want 2 (the target plus exactly ONE re-run round)", len(got))
+	}
+	if got[1].RerunOf != of || got[1].HeadSHA != head {
+		t.Errorf("re-run round = %+v, want rerun_of %d, head %q", got[1], of, head)
+	}
+	reviewer.mu.Lock()
+	calls := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("reviewer invocations = %d, want 1", calls)
 	}
 }
 
