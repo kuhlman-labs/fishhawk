@@ -171,6 +171,12 @@ type mergeCandidateVerifiedPayload struct {
 	Failures        string                        `json:"failures,omitempty"`
 	FailureSummary  *mergeCandidateFailureSummary `json:"failure_summary,omitempty"`
 	OutputUntrusted bool                          `json:"output_untrusted"`
+
+	// Source, TransferredFrom and RootHead are READ-side annotations
+	// newestMergeCandidateVerdict sets; they are never stored on this row.
+	Source          string `json:"-"`
+	TransferredFrom string `json:"-"`
+	RootHead        string `json:"-"`
 }
 
 // mergeCandidateOutputEvidence is the untrusted verify-output evidence one
@@ -563,6 +569,13 @@ func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID
 		return nil, err
 	}
 	s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_settle")
+	// E87.2 / #4293 (approval condition C2): a red pass for a head a shadow
+	// decision would have transferred to is a FALSE TRANSFER, recorded as an
+	// advisory row. The shadow writer runs the same check, so either arrival
+	// order is caught.
+	if result == mergeCandidateResultFailed {
+		s.detectMergeCandidateFalseTransfers(ctx, runID, trigger.ExpectedHeadSHA)
+	}
 	// ADR-092 D4: the verdict moves the run's live queue entry (ejects a red
 	// pass and hands the line on). A duplicate replay returned above, so a
 	// runner retry never re-applies it.
@@ -808,11 +821,25 @@ func (s *Server) refuseMergeCandidatePassToIncapableRunner(ctx context.Context, 
 // mergeCandidateState is mergeCandidateVerifyState's answer. Cause is set for a
 // classified head; StageID names the implement stage carrying a live trigger
 // when State is in_flight.
+//
+// Source (E87.2 / #4293) says how a passed state was reached: recorded (a
+// runner pass for exactly this head) or transferred (an enforce-mode
+// merge_candidate_verdict_transferred row), in which case TransferredFrom and
+// RootHead name the prior head and the chain's recorded root.
 type mergeCandidateState struct {
-	State   string
-	Cause   string
-	StageID uuid.UUID
+	State           string
+	Cause           string
+	StageID         uuid.UUID
+	Source          string
+	TransferredFrom string
+	RootHead        string
 }
+
+// Verdict sources mergeCandidateState.Source reports.
+const (
+	mergeCandidateSourceRecorded    = "recorded"
+	mergeCandidateSourceTransferred = "transferred"
+)
 
 // mergeCandidateRunnerGatedCategories carry head_sha reports of heads the
 // runner already gated on the committed tree (implement PR open, fix-up push,
@@ -862,7 +889,8 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 		return mergeCandidateState{}, err
 	}
 	if verdict != nil && (verdict.Result == mergeCandidateResultPassed || verdict.Result == mergeCandidateResultFailed) {
-		return mergeCandidateState{State: verdict.Result, Cause: cause}, nil
+		return mergeCandidateState{State: verdict.Result, Cause: cause, Source: verdict.Source,
+			TransferredFrom: verdict.TransferredFrom, RootHead: verdict.RootHead}, nil
 	}
 	stageID, live, err := s.liveMergeCandidateTriggerForHead(ctx, runRow.ID, headSHA)
 	if err != nil {
@@ -948,20 +976,55 @@ func (s *Server) chainReportsHead(ctx context.Context, runID uuid.UUID, category
 	return false, nil
 }
 
-// newestMergeCandidateVerdict returns the newest merge_candidate_verified row
-// for EXACTLY headSHA (any stage), or nil.
+// newestMergeCandidateVerdict returns the newest verdict for EXACTLY headSHA
+// (any stage), or nil: a merge_candidate_verified row (Source recorded) or —
+// ONLY in enforce mode (E87.2 / #4293, approval condition C1) — a
+// merge_candidate_verdict_transferred row whose to_head is the head, read as
+// a passed verdict with Source transferred. Newest is by chain sequence across
+// both categories. In off and shadow a transferred row is IGNORED, so
+// switching enforce → off/shadow revokes every transfer already written (the
+// rollback contract); the merge gate, the queue, the fan-in hold and the
+// rebase up-to-date arm all read through here. A read error on EITHER
+// category is returned (fail closed).
 func (s *Server) newestMergeCandidateVerdict(ctx context.Context, runID uuid.UUID, headSHA string) (*mergeCandidateVerifiedPayload, error) {
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeCandidateVerified)
 	if err != nil {
 		return nil, err
 	}
 	var newest *mergeCandidateVerifiedPayload
+	var newestSeq int64
 	for _, e := range entries {
 		var p mergeCandidateVerifiedPayload
 		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != headSHA {
 			continue
 		}
-		newest = &p
+		p.Source = mergeCandidateSourceRecorded
+		newest, newestSeq = &p, e.Sequence
+	}
+	if s.mergeCandidateTransferMode() != MergeCandidateTransferEnforce {
+		return newest, nil
+	}
+	transfers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeCandidateVerdictTransferred)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range transfers {
+		var t mergeCandidateTransferPayload
+		if json.Unmarshal(e.Payload, &t) != nil || t.ToHead != headSHA || t.FromHead == "" {
+			continue
+		}
+		if newest != nil && e.Sequence < newestSeq {
+			continue
+		}
+		root := t.RootHead
+		if root == "" {
+			root = t.FromHead
+		}
+		newest = &mergeCandidateVerifiedPayload{
+			HeadSHA: headSHA, Cause: mergeCandidateCauseBaseAdvance, Result: mergeCandidateResultPassed,
+			Source: mergeCandidateSourceTransferred, TransferredFrom: t.FromHead, RootHead: root,
+		}
+		newestSeq = e.Sequence
 	}
 	return newest, nil
 }
