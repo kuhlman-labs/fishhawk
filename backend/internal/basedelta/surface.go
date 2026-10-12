@@ -50,6 +50,7 @@ var GlobalSurface = []string{
 	"backend/internal/plan/schemas/**",
 	"backend/internal/spec/schemas/**",
 	"backend/internal/crewmessage/schemas/**",
+	"backend/internal/specialistjob/schemas/**",
 	"backend/internal/operatorrole/schemas/**",
 	"backend/internal/workmgmt/schemas/**",
 	"backend/internal/operatorrole/defaults/**",
