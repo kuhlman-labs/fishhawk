@@ -1,0 +1,141 @@
+{
+  "persona": "architect",
+  "kind": "superseded_reliance",
+  "expect": "catch",
+  "issue_title": "Add a fishhawk_export_audit MCP tool",
+  "issue_body": "Operators want to export a run's audit chain from their MCP client as JSONL for offline review. Add an MCP tool, fishhawk_export_audit, that streams the chain for one run id.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94002",
+      "id": "kuhlman-labs/fishhawk#94002"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-12T09:00:00Z"
+    },
+    "summary": "Add the fishhawk_export_audit MCP tool streaming a run's audit chain as JSONL.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/mcpserver/export_audit.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/mcpserver/export_audit_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/mcpserver/tools.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/cmd/fishhawk-mcp/main.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add the export handler reading the run's audit chain page by page and writing one JSON object per line."
+      },
+      {
+        "step": 2,
+        "description": "Register the tool with the stdio server only, in backend/cmd/fishhawk-mcp, because ADR-033 decided MCP is stdio-only; do not add it to any other transport."
+      },
+      {
+        "step": 3,
+        "description": "Add handler tests for a missing run, an empty chain and a multi-page chain."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests against a fake audit reader.",
+      "rollback_plan": "Revert the PR; the tool is additive.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-export-streams-chain",
+          "statement": "fishhawk_export_audit for a run returns its audit chain as JSONL, one entry per line, in sequence order.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94002"
+        },
+        {
+          "id": "ac-export-missing-run",
+          "statement": "fishhawk_export_audit for an unknown run id returns a named not-found error.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94002"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-033",
+      "status": "accepted",
+      "superseded_by": [
+        "ADR-076"
+      ]
+    },
+    {
+      "id": "ADR-076",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "stdio server only",
+    "do not add it to any other transport"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 2
+  },
+  "catch_probes": [
+    "supersed",
+    "ADR-076",
+    "successor",
+    "no longer governs"
+  ],
+  "attribution_phrases": [
+    "stdio server only",
+    "ADR-033"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 keeps the tool on the stdio server only because of ADR-033, but the index marks ADR-033 superseded by ADR-076 (MCP over HTTP served by fishhawkd); ADR-076's text is not shown here. Register the tool on the HTTP endpoint too."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Registering on the stdio server only follows ADR-033, which ADR-076 supersedes; the plan should follow the successor."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2: restricting the tool to one transport is unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 edits backend/cmd/fishhawk-mcp, which the ADR-060 shim supervises; confirm the shim needs no change."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-export-streams-chain does not cap the export size."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Step 2 has no test proving the tool is absent from other transports."
+    }
+  ]
+}

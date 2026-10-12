@@ -1,0 +1,156 @@
+{
+  "persona": "architect",
+  "kind": "undeclared_direction",
+  "expect": "catch",
+  "issue_title": "Let an operator pause a run and resume it after a fishhawkd restart",
+  "issue_body": "An operator who needs to restart fishhawkd mid-run today must cancel and restart the run. Add pause and resume: a paused run holds its place, survives a fishhawkd restart, and resumes where it stopped.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94003",
+      "id": "kuhlman-labs/fishhawk#94003"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-12T09:00:00Z"
+    },
+    "summary": "Add run pause and resume persisted across fishhawkd restarts, with the runner draining its stage before the pause takes effect.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/postgres/migrations/0103_run_pause_state.up.sql",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/postgres/migrations/0103_run_pause_state.down.sql",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/run/queries.sql",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/db/queries.sql.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/pause.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/mcpserver/pause_run.go",
+          "operation": "create"
+        },
+        {
+          "path": "runner/cmd/fishhawk-runner/pause.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add fishhawk_pause_run and fishhawk_resume_run MCP verbs that record the operator's request."
+      },
+      {
+        "step": 2,
+        "description": "Add a run_pause_state table with the states requested, draining, paused and resuming: fishhawkd writes requested and resuming, and fishhawk-runner polls the row and drives draining to paused once its stage checkpoint is written."
+      },
+      {
+        "step": 3,
+        "description": "On boot, fishhawkd re-reads every paused run and leaves it parked until an operator resumes it."
+      },
+      {
+        "step": 4,
+        "description": "Add the sqlc queries for the pause row and regenerate run/db."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Store tests for each transition, a runner test driving the drain against a fake backend, and a restart test re-reading a paused run.",
+      "rollback_plan": "Revert the PR and apply the migration's down step.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-pause-survives-restart",
+          "statement": "A run paused before a fishhawkd restart is still paused after it and resumes on fishhawk_resume_run.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94003"
+        },
+        {
+          "id": "ac-pause-drains-stage",
+          "statement": "fishhawk_pause_run on a run with a live stage waits for the stage checkpoint before reporting paused.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94003"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-002",
+      "status": "accepted",
+      "superseded_by": []
+    },
+    {
+      "id": "ADR-013",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "run_pause_state",
+    "fishhawk-runner polls the row"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 2
+  },
+  "catch_probes": [
+    "undeclared",
+    "not declared",
+    "new_architectural_decision",
+    "new architectural decision",
+    "architectural direction",
+    "new direction"
+  ],
+  "attribution_phrases": [
+    "run_pause_state"
+  ],
+  "catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2 adds a new persisted state machine shared by fishhawkd and fishhawk-runner; that is new architectural direction, yet new_architectural_decision is empty. Closest records: ADR-002, ADR-013."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "run_pause_state is a cross-component persisted state machine the plan has not declared; add a new_architectural_decision naming it."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2: the four state names are ambiguous."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2's table should be created through the migration tool ADR-006 chose."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-pause-drains-stage does not say how long the drain may take."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Step 2's run_pause_state rows have no cleanup path once a run ends."
+    }
+  ]
+}

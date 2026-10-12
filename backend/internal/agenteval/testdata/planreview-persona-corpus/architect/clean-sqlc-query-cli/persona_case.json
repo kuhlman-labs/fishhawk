@@ -1,0 +1,135 @@
+{
+  "persona": "architect",
+  "kind": "clean_area",
+  "expect": "clean",
+  "issue_title": "List runs that have been idle for more than a day",
+  "issue_body": "Add a way to list runs with no stage activity in the last 24 hours, from the API and the CLI, so operators can find stuck runs.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94005",
+      "id": "kuhlman-labs/fishhawk#94005"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-12T09:00:00Z"
+    },
+    "summary": "Add a ListIdleRuns sqlc query, an idle_since filter on GET /v0/runs, and a fishhawk runs idle CLI subcommand.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/run/queries.sql",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/db/queries.sql.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/postgres.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/runs.go",
+          "operation": "modify"
+        },
+        {
+          "path": "cli/cmd/fishhawk/runs_idle.go",
+          "operation": "create"
+        },
+        {
+          "path": "cli/cmd/fishhawk/runs_idle_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "docs/api/v0.openapi.yaml",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/api/v0.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a ListIdleRuns query to run/queries.sql selecting runs whose latest stage update is older than a cutoff, and regenerate run/db with sqlc."
+      },
+      {
+        "step": 2,
+        "description": "Expose it from the run repository and add an idle_since filter to the existing GET /v0/runs route."
+      },
+      {
+        "step": 3,
+        "description": "Add a fishhawk runs idle CLI subcommand calling GET /v0/runs?idle_since=24h and printing one row per run."
+      },
+      {
+        "step": 4,
+        "description": "Document idle_since in docs/api/v0.openapi.yaml and docs/api/v0.md."
+      }
+    ],
+    "verification": {
+      "test_strategy": "A store test seeding fresh and idle runs, a handler test for the filter, and a CLI test against a fake API.",
+      "rollback_plan": "Revert the PR; the query, filter and subcommand are additive.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-idle-filter",
+          "statement": "GET /v0/runs?idle_since=24h returns only runs whose latest stage update is older than 24 hours.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94005"
+        },
+        {
+          "id": "ac-idle-cli",
+          "statement": "fishhawk runs idle prints one row per idle run.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94005"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-002",
+      "status": "accepted",
+      "superseded_by": []
+    },
+    {
+      "id": "ADR-013",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "ListIdleRuns"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "The ListIdleRuns query conflicts with ADR-002."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 3 adds a CLI subcommand under cli/**, which ADR-013 governs."
+    }
+  ],
+  "benign_examples": [
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-idle-cli does not say how runs are sorted."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "No index supports the ListIdleRuns cutoff scan."
+    }
+  ],
+  "min_matched_records": 2
+}
