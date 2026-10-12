@@ -392,6 +392,45 @@ type GateEvidence struct {
 	// HOW gates ran, never a gate verdict: an isolation-only payload carries
 	// no verify run or summary.
 	GateIsolation *GateIsolationEvidence `json:"gate_isolation,omitempty"`
+	// CounterfactualObservations carries the RUNNER-OBSERVED outcome of each
+	// plan-declared counterfactual (E85.3 / #4143), in emission order and
+	// capped by the runner at 16 entries. Each entry is the runner's own
+	// execution record — distinct from FixupCounterfactuals, which is an agent
+	// CLAIM. Nil (the byte-identical default) on an older bundle or a stage
+	// that executed no counterfactual. The json tag MUST stay identical to the
+	// runner's composer.
+	CounterfactualObservations []CounterfactualObservationEvidence `json:"counterfactual_observations,omitempty"`
+}
+
+// CounterfactualObservationEvidence is the flat record of one executed
+// plan-declared counterfactual (E85.3 / #4143): Index joins it to the approved
+// plan's counterfactuals array; ControlPath / TestRun / TestPackage echo that
+// entry; HeadSHA / TreeSHA name the verified head the runner's scratch clone
+// was materialized at (empty when no verified tree existed); Baseline is the
+// unmutated run's outcome (green | red | timeout | error | skipped); Observed
+// is the verdict (red | green | timeout | error); Reason is a closed-enum
+// cause, empty for red and green; DurationMS is the entry's wall-clock time
+// and TimeoutSeconds the per-run bound; MutationSHA256 is the lowercase hex
+// SHA-256 identifying the applied mutation (#4300), empty when none was
+// applied. No go test output or test name is carried.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's
+// counterfactualObservationEvidence (runner/cmd/fishhawk-runner/gateevidence.go),
+// paired ModeExact in backend/internal/wirecontract and pinned from both
+// modules by testdata/wire/counterfactual_observation.json.
+type CounterfactualObservationEvidence struct {
+	Index          int    `json:"index"`
+	ControlPath    string `json:"control_path"`
+	TestRun        string `json:"test_run"`
+	TestPackage    string `json:"test_package"`
+	HeadSHA        string `json:"head_sha,omitempty"`
+	TreeSHA        string `json:"tree_sha,omitempty"`
+	Baseline       string `json:"baseline"`
+	Observed       string `json:"observed"`
+	Reason         string `json:"reason,omitempty"`
+	DurationMS     int64  `json:"duration_ms"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MutationSHA256 string `json:"mutation_sha256,omitempty"`
 }
 
 // GateIsolationEvidence is the flat gate-isolation record (#2135): Path is the

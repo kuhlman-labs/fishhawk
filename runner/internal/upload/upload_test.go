@@ -5333,3 +5333,84 @@ func TestMergeCandidateTailBoundsMirrorBackend(t *testing.T) {
 		t.Fatalf("MaxMergeCandidateOutputTailBytes = %d; it mirrors backend mergeCandidateOutputTailMax (4096) — update both", MaxMergeCandidateOutputTailBytes)
 	}
 }
+
+// TestFetchPrompt_DecodesCounterfactualSharedGolden pins the DECODE side of the
+// counterfactual_spec contract (E85.3 / #4143): the SHARED golden
+// testdata/wire/counterfactual_spec.json — the bytes the backend's
+// TestPromptResponse_CarriesCounterfactuals asserts both prompt endpoints emit
+// — served as the prompt body decodes into FetchedPrompt.Counterfactuals with
+// every leaf preserved, including the patch form's and the deletion's empty
+// replace, and re-marshals BYTE-EQUAL to the golden. A tag rename here loses
+// the field on decode; a rename on the backend reddens its emit test against
+// the same bytes.
+func TestFetchPrompt_DecodesCounterfactualSharedGolden(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "counterfactual_spec.json"))
+	if err != nil {
+		t.Fatalf("read shared counterfactual spec golden: %v", err)
+	}
+	golden := bytes.TrimSuffix(b, []byte("\n"))
+	var member struct {
+		Counterfactuals json.RawMessage `json:"counterfactuals"`
+	}
+	if err := json.Unmarshal(golden, &member); err != nil || len(member.Counterfactuals) == 0 {
+		t.Fatalf("decode shared golden: %v (counterfactuals %d bytes)", err, len(member.Counterfactuals))
+	}
+
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h","counterfactuals":` + string(member.Counterfactuals) + `}`
+	got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	want := []CounterfactualSpec{
+		{
+			Index: 0, ControlPath: "backend/internal/plan/validate.go", MutationKind: CounterfactualMutationReplace,
+			Find: "return ok", Replace: "return true",
+			TestRun: "^TestValidate_Counterfactuals$", TestPackage: "./backend/internal/plan", Expect: "red",
+		},
+		{
+			Index: 1, ControlPath: "backend/internal/server/prompt.go", MutationKind: CounterfactualMutationPatch,
+			Patch: "--- a/backend/internal/server/prompt.go\n" +
+				"+++ b/backend/internal/server/prompt.go\n" +
+				"@@ -10,1 +10,1 @@\n" +
+				"-\tif runRow.DecomposedFrom != nil || mergeCandidate != nil {\n" +
+				"+\tif false {\n",
+			TestRun: "^TestPromptResponse_CarriesCounterfactuals$", TestPackage: "./backend/internal/server", Expect: "red",
+		},
+		{
+			Index: 2, ControlPath: "runner/internal/upload/upload.go", MutationKind: CounterfactualMutationReplace,
+			Find: "defer cancel()", Replace: "",
+			TestRun: "TestFetchPrompt", TestPackage: "./runner/internal/upload/...", Expect: "red",
+		},
+	}
+	if !reflect.DeepEqual(got.Counterfactuals, want) {
+		t.Fatalf("Counterfactuals = %#v\nwant %#v", got.Counterfactuals, want)
+	}
+	reencoded, err := json.Marshal(struct {
+		Counterfactuals []CounterfactualSpec `json:"counterfactuals"`
+	}{got.Counterfactuals})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reencoded, golden) {
+		t.Fatalf("re-marshal drifted from the shared golden:\n got %s\nwant %s", reencoded, golden)
+	}
+}
+
+// TestFetchPrompt_CounterfactualsAbsentDecodesNil pins the back-compat path: a
+// prompt response without the key (every non-implement stage, and an implement
+// stage whose approved plan declares none) decodes to a nil list, so the
+// runner's counterfactual phase has nothing to execute.
+func TestFetchPrompt_CounterfactualsAbsentDecodesNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h"}`
+	got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.Counterfactuals != nil {
+		t.Errorf("Counterfactuals = %#v, want nil when the key is absent", got.Counterfactuals)
+	}
+}
