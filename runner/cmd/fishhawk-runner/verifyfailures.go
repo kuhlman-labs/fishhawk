@@ -107,6 +107,11 @@ type verifyFailures struct {
 	// names a scope dir). verifyFailureScopeRelation never answers outside
 	// from a lossy list.
 	pkgsLossy bool
+	// lossy is set when ANY of the three lists lost information (an entry
+	// dropped past the entry cap or cut at the byte cap) — a superset of
+	// pkgsLossy. Only the merge-candidate failure summary reads it (#4250);
+	// verifyFailureScopeRelation keeps reading pkgsLossy alone.
+	lossy bool
 }
 
 // parseVerifyFailures extracts the failing test names and package import
@@ -140,15 +145,20 @@ func parseVerifyFailures(out string) verifyFailures {
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		if m := parseTestFailRe.FindStringSubmatch(line); m != nil {
-			add(&f.tests, seenT, m[1])
+			if add(&f.tests, seenT, m[1]) {
+				f.lossy = true
+			}
 			continue
 		}
 		if m := parsePkgFailRe.FindStringSubmatch(line); m != nil {
 			if add(&f.pkgs, seenP, m[1]) {
 				f.pkgsLossy = true
+				f.lossy = true
 			}
 			if strings.Contains(m[2], "[build failed]") || strings.Contains(m[2], "[setup failed]") {
-				add(&f.buildFailed, seenB, m[1])
+				if add(&f.buildFailed, seenB, m[1]) {
+					f.lossy = true
+				}
 			}
 		}
 	}
@@ -232,6 +242,14 @@ func capSignalLine(line string) (rendered string, kept int) {
 // can report an exact elided count), the number of signal lines kept, and the
 // number omitted over budget.
 func retainFailureSignalLines(region string, budget int) (block string, retainedSrcBytes, kept, omitted int) {
+	return retainSignalLines(region, budget, isFailureSignalLine)
+}
+
+// retainSignalLines is retainFailureSignalLines over an arbitrary signal
+// predicate. retainFailureSignalLines passes isFailureSignalLine, so the
+// verify-fix prompt's #4036 selection is byte-identical; failureSignalExcerpt
+// passes the wider isMergeCandidateSignalLine.
+func retainSignalLines(region string, budget int, isSignal func(string) bool) (block string, retainedSrcBytes, kept, omitted int) {
 	lines := strings.SplitAfter(region, "\n")
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
@@ -254,7 +272,7 @@ func retainFailureSignalLines(region string, budget int) (block string, retained
 	var signals []int
 	full := false
 	for i, raw := range lines {
-		if !isFailureSignalLine(strings.TrimSuffix(raw, "\n")) {
+		if !isSignal(strings.TrimSuffix(raw, "\n")) {
 			continue
 		}
 		p := render(raw)
@@ -309,6 +327,70 @@ context:
 		retainedSrcBytes += picked[i].srcBytes
 	}
 	return b.String(), retainedSrcBytes, len(signals), omitted
+}
+
+// compileErrorLineRe matches a Go compiler / vet diagnostic at column 0:
+// `<path>.go:<line>:<col>: <message>`. A `t.Log`/`t.Error` assertion line is
+// indented and carries no column (`    x_test.go:42: msg`), so it never
+// matches and stays CONTEXT.
+var compileErrorLineRe = regexp.MustCompile(`^\S+\.go:\d+:\d+: `)
+
+// isMergeCandidateSignalLine is the merge-candidate excerpt's signal set: the
+// shared go-test set (isFailureSignalLine) plus a column-0 compiler / vet
+// diagnostic. go test prints a `[build failed]` package's compiler errors
+// where the BUILD finished, which under a parallel `go test ./...` can be far
+// above that package's `FAIL<TAB><pkg> [build failed]` line, outside its
+// 2-line context window (#4250 approval condition C1). The wider set is used
+// ONLY by failureSignalExcerpt; the verify-fix prompt keeps the #4036 set. A
+// golangci-lint diagnostic shares the format and is retained too — on a
+// failed merge-candidate pass it names a real failure.
+func isMergeCandidateSignalLine(line string) bool {
+	return isFailureSignalLine(line) || compileErrorLineRe.MatchString(strings.TrimSuffix(line, "\r"))
+}
+
+// failureSignalExcerptMarker renders the trusted-shape line that closes an
+// excerpt whose signal lines did not all fit.
+func failureSignalExcerptMarker(omitted, budget int) string {
+	return fmt.Sprintf("[... %d more failure-signal line(s) omitted over the %d-byte budget ...]\n", omitted, budget)
+}
+
+// failureSignalExcerpt extracts, from the WHOLE (already-redacted) verify
+// output, every failure-signal line plus its context, within budget bytes
+// (#4250). The signal set is the shared go-test set — `--- FAIL:`,
+// `FAIL<TAB><pkg>`, `panic:`, `WARNING: DATA RACE` — widened by a column-0
+// compiler/vet diagnostic (isMergeCandidateSignalLine), each with
+// verifyFixSignalContextBefore (2) lines of context before and
+// verifyFixSignalContextAfter (4) after, which captures the
+// `<file>_test.go:NN:` assertion lines go test prints immediately after a
+// non-verbose `--- FAIL:` line. Selection is retainSignalLines (#4036):
+// signals in order until the budget is spent, then context.
+//
+// When signal lines did not all fit, the excerpt ends with a marker naming how
+// many were omitted. The marker's worst case (every signal line omitted) is
+// RESERVED out of the budget before selection, and retainSignalLines' block
+// never exceeds what it was given (it reserves one worst-case separator per
+// kept signal line), so the result is always <= budget; it fills the budget
+// exactly only when every reserved separator is rendered. The omitted count
+// is an upper bound: an omitted signal line that falls inside a kept line's
+// context window is still shown, as context.
+//
+// It returns "" when the output carries no signal line.
+func failureSignalExcerpt(out string, budget int) string {
+	signals := 0
+	for _, line := range strings.Split(out, "\n") {
+		if isMergeCandidateSignalLine(line) {
+			signals++
+		}
+	}
+	room := budget - len(failureSignalExcerptMarker(signals, budget))
+	if room <= 0 {
+		return ""
+	}
+	block, _, _, omitted := retainSignalLines(out, room, isMergeCandidateSignalLine)
+	if omitted == 0 {
+		return block
+	}
+	return block + failureSignalExcerptMarker(omitted, budget)
 }
 
 // renderFailureList renders parsed tests and packages as `A, B (p1, p2)` for a

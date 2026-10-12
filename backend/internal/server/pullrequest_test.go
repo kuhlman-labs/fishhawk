@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -4717,13 +4718,41 @@ func (f *mcvShipFixture) startRunning(t *testing.T, head string) {
 
 // mcvReportBody is the EXACT key set the runner's
 // upload.pullRequestMergeCandidateBody marshals (the ship_merge_candidate
-// wirecontract pair pins the tags on both sides).
+// wirecontract pair pins the tags on both sides), for a report carrying no
+// #4250 failure evidence — the shape an older runner, or a passed pass, ships.
 func mcvReportBody(head, result, reason, tail string) []byte {
 	b, _ := json.Marshal(map[string]any{
 		"outcome": outcomeMergeCandidateVerified, "branch": mcvBranch, "head_sha": head,
 		"merge_candidate_result": result, "merge_candidate_reason": reason,
 		"merge_candidate_output_tail": tail,
 	})
+	return b
+}
+
+// mcvFailureEvidence is the #4250 failure evidence a failed report carries.
+type mcvFailureEvidence struct {
+	Failures string
+	Summary  *mergeCandidateFailureSummary
+}
+
+// mcvReportBodyWithFailures is mcvReportBody plus the #4250 keys
+// (merge_candidate_failures and merge_candidate_failure_summary), each sent
+// only when set, exactly as the runner's omitempty tags marshal them. It is
+// the failures-capable builder a later slice calls without editing this file
+// (#4250 approval condition C6).
+func mcvReportBodyWithFailures(head, result, reason, tail string, ev mcvFailureEvidence) []byte {
+	body := map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": mcvBranch, "head_sha": head,
+		"merge_candidate_result": result, "merge_candidate_reason": reason,
+		"merge_candidate_output_tail": tail,
+	}
+	if ev.Failures != "" {
+		body["merge_candidate_failures"] = ev.Failures
+	}
+	if ev.Summary != nil {
+		body["merge_candidate_failure_summary"] = ev.Summary
+	}
+	b, _ := json.Marshal(body)
 	return b
 }
 
@@ -4863,6 +4892,67 @@ func TestShipPullRequest_MergeCandidateVerified_RecordsAndSettles(t *testing.T) 
 	}
 }
 
+// TestShipPullRequest_MergeCandidateVerified_RecordsFailures (#4250): a failed
+// report's failure excerpt and summary cross the real mux and are READ BACK
+// from the committed merge_candidate_verified row under output_untrusted; a
+// report without them (an older runner) records neither key.
+func TestShipPullRequest_MergeCandidateVerified_RecordsFailures(t *testing.T) {
+	t.Run("failed report records failures and the summary", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		summary := &mergeCandidateFailureSummary{
+			Packages: []string{"github.com/x/backend/internal/early"}, Tests: []string{"TestEarlyThing"},
+		}
+		w, _ := f.ship(t, mcvReportBodyWithFailures(mcvHead, "failed", "verify_failed", "scripts/test: 1 of 8 modules failed", mcvFailureEvidence{
+			Failures: "--- FAIL: TestEarlyThing (0.01s)\n    early_test.go:42: want 1, got 2\n",
+			Summary:  summary,
+		}))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		rows := mcvVerdictRows(f.au)
+		if len(rows) != 1 {
+			t.Fatalf("merge_candidate_verified rows = %d, want 1", len(rows))
+		}
+		if !strings.Contains(rows[0].Failures, "--- FAIL: TestEarlyThing") || !rows[0].OutputUntrusted {
+			t.Errorf("stored failures = %q (untrusted=%v), want the excerpt under output_untrusted", rows[0].Failures, rows[0].OutputUntrusted)
+		}
+		if !reflect.DeepEqual(rows[0].FailureSummary, summary) {
+			t.Errorf("stored failure_summary = %+v, want %+v", rows[0].FailureSummary, summary)
+		}
+	})
+	t.Run("an older runner's body records neither key", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		if w, _ := f.ship(t, mcvReportBody(mcvHead, "failed", "", "FAIL")); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		row := auditEntries(f.au, CategoryMergeCandidateVerified)
+		if len(row) != 1 {
+			t.Fatalf("rows = %d, want 1", len(row))
+		}
+		var keys map[string]json.RawMessage
+		_ = json.Unmarshal(row[0].Payload, &keys)
+		for _, k := range []string{"failures", "failure_summary"} {
+			if _, ok := keys[k]; ok {
+				t.Errorf("stored row carries %q for a body without it", k)
+			}
+		}
+	})
+	t.Run("an unknown key inside the summary is a 400", func(t *testing.T) {
+		f := newMCVShipFixture(t, mcvUndelegatedSpecYAML)
+		f.startRunning(t, mcvHead)
+		body := []byte(`{"outcome":"merge_candidate_verified","branch":"` + mcvBranch + `","head_sha":"` + mcvHead +
+			`","merge_candidate_result":"failed","merge_candidate_failure_summary":{"packages":["m/a"],"suites":["x"]}}`)
+		if w, _ := f.ship(t, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (DisallowUnknownFields reaches the nested summary)", w.Code)
+		}
+		if n := len(mcvVerdictRows(f.au)); n != 0 {
+			t.Errorf("rows = %d, want 0", n)
+		}
+	})
+}
+
 // TestShipPullRequest_MergeCandidateVerified_IsIdempotent: a runner retry
 // after a 5xx appends no second row and settles nothing again.
 func TestShipPullRequest_MergeCandidateVerified_IsIdempotent(t *testing.T) {
@@ -4977,7 +5067,10 @@ func TestShipPullRequest_MergeCandidateVerified_FailedRoutesPerD6(t *testing.T) 
 	t.Run("delegated", func(t *testing.T) {
 		f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
 		f.startRunning(t, mcvHead)
-		w, resp := f.ship(t, mcvReportBody(mcvHead, "failed", "", "FAIL "+mcvSentinel))
+		w, resp := f.ship(t, mcvReportBodyWithFailures(mcvHead, "failed", "", "FAIL "+mcvSentinel, mcvFailureEvidence{
+			Failures: "--- FAIL: TestSentinelFailure (0.00s)\n    x_test.go:1: " + mcvSentinel + "\n",
+			Summary:  &mergeCandidateFailureSummary{Tests: []string{"TestSentinelFailure"}},
+		}))
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 		}
@@ -4988,8 +5081,8 @@ func TestShipPullRequest_MergeCandidateVerified_FailedRoutesPerD6(t *testing.T) 
 		if len(rows) != 1 {
 			t.Fatalf("stage_fixup_triggered rows = %d, want 1", len(rows))
 		}
-		if strings.Contains(string(rows[0].Payload), mcvSentinel) {
-			t.Error("routed fix-up carries the untrusted output tail")
+		if p := string(rows[0].Payload); strings.Contains(p, mcvSentinel) || strings.Contains(p, "TestSentinelFailure") {
+			t.Error("routed fix-up carries the untrusted output tail, failures or summary (ADR-090 D6)")
 		}
 	})
 	t.Run("passed routes nothing", func(t *testing.T) {

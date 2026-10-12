@@ -854,3 +854,131 @@ func TestRunVerifyFixLoop_NoopOverflowingFailureListIsNotAdmitted(t *testing.T) 
 		t.Errorf("fix invokes = %d, want 1", inv.callIdx)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #4250 — the merge-candidate failure-signal excerpt.
+// ---------------------------------------------------------------------------
+
+// TestFailureSignalExcerpt_KeepsSignalsWithContext: every signal line is kept
+// in order with its trailing context (the non-verbose `--- FAIL:` assertion
+// lines), and an output with no signal line yields "".
+func TestFailureSignalExcerpt_KeepsSignalsWithContext(t *testing.T) {
+	out := "ok  \tm/a\t0.1s\n" +
+		"--- FAIL: TestOne (0.01s)\n" +
+		"    one_test.go:10: want 1, got 2\n" +
+		"FAIL\n" +
+		"FAIL\tm/one\t0.2s\n" +
+		strings.Repeat("ok  \tm/filler\t0.1s\n", 20) +
+		"panic: boom\n" +
+		"goroutine 1 [running]:\n"
+	got := failureSignalExcerpt(out, upload.MaxMergeCandidateFailuresBytes)
+	order := []string{"--- FAIL: TestOne", "one_test.go:10: want 1, got 2", "FAIL\tm/one\t0.2s", "...\n", "panic: boom", "goroutine 1 [running]:"}
+	at := 0
+	for _, w := range order {
+		i := strings.Index(got[at:], w)
+		if i < 0 {
+			t.Fatalf("excerpt missing %q after offset %d:\n%s", w, at, got)
+		}
+		at += i + len(w)
+	}
+	if strings.Contains(got, "omitted over the") {
+		t.Errorf("an excerpt that fits must carry no omitted marker:\n%s", got)
+	}
+	if got := failureSignalExcerpt(strings.Repeat("ok  \tm/a\t0.1s\n", 50)+"lint: 3 issues\n", 4096); got != "" {
+		t.Errorf("no signal line: excerpt = %q, want empty", got)
+	}
+}
+
+// TestFailureSignalExcerpt_BudgetFillsExactly is approval condition C7: the
+// fixture's signal windows are DISJOINT (a signal every 8 lines, windows of 2
+// before + 4 after), the 1-byte context lines fill the remainder exactly, and
+// the context pass's last line lands as an isolated before-context fragment,
+// so EVERY separator retainSignalLines reserved (one per kept signal) is
+// rendered; the omitted count has as many digits as the signal total the
+// marker allowance was sized for — the result fills the budget EXACTLY.
+// Without the marker allowance the result overruns it.
+func TestFailureSignalExcerpt_BudgetFillsExactly(t *testing.T) {
+	const budget, signals = 2048, 200
+	var b strings.Builder
+	b.WriteString("\n\n")
+	for i := 0; i < signals; i++ {
+		fmt.Fprintf(&b, "--- FAIL: Test%04d (0.00s)\n", i) // 27 bytes rendered
+		b.WriteString("\n\n\n\n\n\n\n")                    // 7 one-byte context lines
+	}
+	got := failureSignalExcerpt(b.String(), budget)
+	if len(got) > budget {
+		t.Fatalf("excerpt = %d bytes, over the %d-byte budget", len(got), budget)
+	}
+	if len(got) != budget {
+		t.Errorf("excerpt = %d bytes, want exactly %d (disjoint windows, every reserved separator rendered)", len(got), budget)
+	}
+	kept := strings.Count(got, "--- FAIL: ")
+	want := failureSignalExcerptMarker(signals-kept, budget)
+	if !strings.HasSuffix(got, want) {
+		t.Errorf("excerpt must end with %q; tail %q", want, got[len(got)-90:])
+	}
+	if seps := strings.Count(got, verifyFixSignalSeparator); seps != kept {
+		t.Errorf("rendered separators = %d, want %d (every reserved separator rendered)", seps, kept)
+	}
+}
+
+// TestFailureSignalExcerpt_TinyBudgets: a budget too small for the marker
+// allowance yields ""; one with room for the marker but not for any signal
+// line yields the marker alone.
+func TestFailureSignalExcerpt_TinyBudgets(t *testing.T) {
+	out := "--- FAIL: " + strings.Repeat("T", 500) + "\n"
+	if got := failureSignalExcerpt(out, 10); got != "" {
+		t.Errorf("budget under the marker allowance: excerpt = %q, want empty", got)
+	}
+	budget := len(failureSignalExcerptMarker(1, 200)) + 50
+	got := failureSignalExcerpt(out, budget)
+	if got != failureSignalExcerptMarker(1, budget) {
+		t.Errorf("no signal fits: excerpt = %q, want the marker alone", got)
+	}
+}
+
+// TestFailureSignalExcerpt_CompileErrorIsASignal is approval condition C1 at
+// the helper: a column-0 compiler diagnostic far above its package's
+// `[build failed]` line is retained by the excerpt — while the #4036
+// verify-fix selection (retainFailureSignalLines) is unchanged and does NOT
+// treat it as a signal.
+func TestFailureSignalExcerpt_CompileErrorIsASignal(t *testing.T) {
+	compileErr := "internal/early/early.go:12:2: undefined: frobnicate"
+	region := "# m/early\n" + compileErr + "\n" +
+		strings.Repeat("ok  \tm/filler\t0.1s\n", 30) +
+		"FAIL\tm/early [build failed]\n"
+	if got := failureSignalExcerpt(region, 4096); !strings.Contains(got, compileErr) || !strings.Contains(got, "# m/early") {
+		t.Errorf("excerpt dropped the compiler diagnostic (or its header):\n%s", got)
+	}
+	if block, _, _, _ := retainFailureSignalLines(region, 4096); strings.Contains(block, compileErr) {
+		t.Errorf("retainFailureSignalLines (#4036) now keeps a compiler line — the verify-fix selection changed:\n%s", block)
+	}
+	if isMergeCandidateSignalLine("    early_test.go:42: want 1, got 2") {
+		t.Error("an indented t.Log assertion line must stay context, not a signal")
+	}
+}
+
+// TestParseVerifyFailures_LossyCoversEveryList: lossy is set when ANY list
+// overflows (the merge-candidate summary reads it), while pkgsLossy — what
+// verifyFailureScopeRelation reads — still tracks packages alone.
+func TestParseVerifyFailures_LossyCoversEveryList(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i <= verifyFailureParseMaxEntries; i++ {
+		fmt.Fprintf(&b, "--- FAIL: TestN%d (0.00s)\n", i)
+	}
+	b.WriteString("FAIL\tm/a\t0.1s\n")
+	f := parseVerifyFailures(b.String())
+	if !f.lossy || f.pkgsLossy {
+		t.Errorf("tests overflow: lossy=%v pkgsLossy=%v, want true/false", f.lossy, f.pkgsLossy)
+	}
+	if f := parseVerifyFailures("--- FAIL: TestA (0.00s)\nFAIL\tm/a\t0.1s\n"); f.lossy {
+		t.Error("a complete parse must not be lossy")
+	}
+	var bb strings.Builder
+	for i := 0; i <= verifyFailureParseMaxEntries; i++ {
+		fmt.Fprintf(&bb, "FAIL\tm/p%d [build failed]\n", i)
+	}
+	if f := parseVerifyFailures(bb.String()); !f.lossy || !f.pkgsLossy {
+		t.Errorf("packages overflow: lossy=%v pkgsLossy=%v, want true/true", f.lossy, f.pkgsLossy)
+	}
+}
