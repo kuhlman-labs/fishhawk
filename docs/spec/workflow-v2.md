@@ -1021,6 +1021,8 @@ Evaluated **after** the stage runs, against the produced diff. A hit is a catego
 | `diff_coverage` | object | New-line coverage floor for the diff — see below. |
 | `agent_instruction_paths` | object | Opt-out from the built-in agent-instruction-path constraint, which is on by default — see below. |
 
+**Known limitation: the backend gates read these from the FIRST stage of the evaluated type.** `max_files_changed`, `forbidden_paths`, `allowed_paths`, `required_outcomes` and `diff_coverage` are read by the post-implement gate (and, for the path kinds, the plan-gate precheck) from the first spec stage whose type matches. In a workflow with two stages of one type, the later stage's declaration validates but is not read. `agent_instruction_paths` is the exception: it is resolved per evaluated stage (see [below](#agent_instruction_paths)). Keying the rest per stage is #4345.
+
 #### `required_outcomes`
 
 | Member | Satisfied when |
@@ -1105,8 +1107,8 @@ constraints:
 
 Where it is enforced:
 
-- **The post-implement policy gate** (`policy_evaluated`) is the authority. It applies the built-in only when the run's cached spec resolves and names the stage. A run whose spec is unavailable, unparseable, or no longer names the workflow or stage gets a `policy_evaluated` row carrying a `skip_reason` (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, `stage_not_in_spec`) and no built-in protection.
-- **The plan-gate scope precheck** (`plan_scope_precheck`) applies the same rule to the plan's `scope.files`, as an advisory finding.
+- **The post-implement policy gate** (`policy_evaluated`) is the authority. It resolves the rule from the evaluated stage's OWN spec stage, by type ordinal: the k-th `implement` run stage reads the k-th `implement` spec stage, so one stage's `enforce: false` or `writable` list never covers another stage's diff (#4311). When the evaluated stage cannot be resolved (its stage rows cannot be read, it is absent from them, its ordinal is past the workflow's `implement` stages, or the workflow declares no `implement` stage at all), it **fails closed**: the built-in is enforced with no `writable` list, and the stage is evaluated, never skipped as `stage_not_in_spec`. Only a run whose spec is unavailable, unparseable, or no longer names the workflow gets a `policy_evaluated` row carrying a `skip_reason` (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`) and no built-in protection.
+- **The plan-gate scope precheck** (`plan_scope_precheck`) applies the same rule to the plan's `scope.files`, as an advisory finding, folded to the STRICTEST rule across every `implement` stage: a plan does not say which stage writes which file, so it flags a path when SOME stage's gate would. That is: the built-in is enforced when any `implement` stage enforces it, and `writable` is the intersection of the enforcing stages' lists. An opted-out stage flags nothing, so it does not narrow the intersection.
 - **The runner's in-line check** applies the same default only when it is given `--constraints-file` and `--check-base-ref`, and keys it on the stage type its `--fetch-prompt` response resolves. A local replay without `--fetch-prompt` resolves no stage type, so the runner check stays off there and the backend gate decides.
 - **Permission drift** reads an opt-out or a new `writable` entry as a widening of the stage's restrictions.
 
