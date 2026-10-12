@@ -551,6 +551,117 @@ func TestStatusForStages_PromotedAndPositions(t *testing.T) {
 	}
 }
 
+// TestPromote_CompetitorGoneBeforeWriteIsNoop is #4312: the last competitor
+// ahead of C goes stale or is cancelled AFTER Promote read C's old position
+// (2) and BEFORE it writes the order key. The guarded write must match no row,
+// so the answer is the already-first no-op: Changed=false 1/1, nothing written,
+// Record not called, and committed state agrees (C not promoted).
+func TestPromote_CompetitorGoneBeforeWriteIsNoop(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		withD   bool // a third waiter D queued BEHIND C
+		mutateA func(f *fixture, a uuid.UUID)
+	}{
+		{"only competitor cancelled", false, func(f *fixture, a uuid.UUID) { f.to(a, run.StageStateCancelled) }},
+		{"only competitor went stale", false, func(f *fixture, a uuid.UUID) { f.staleQueued(a) }},
+		{"competitor ahead cancelled, one behind remains", true, func(f *fixture, a uuid.UUID) { f.to(a, run.StageStateCancelled) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			h, a, c := f.stage(), f.stage(), f.stage()
+			waiters := []*run.Stage{a, c}
+			var d *run.Stage
+			if tc.withD {
+				d = f.stage()
+				waiters = append(waiters, d)
+			}
+			f.queueBehindHolder(h, waiters...)
+
+			ps := NewPostgresStore(f.pool)
+			fired := false
+			ps.afterPromotePosition = func(context.Context) {
+				fired = true
+				tc.mutateA(f, a.ID)
+			}
+			rec := &recorder{}
+			p, err := ps.Promote(context.Background(), PromoteRequest{StageID: c.ID, Record: rec.record})
+			if !fired {
+				t.Fatal("fixture: the afterPromotePosition seam never ran, so the competitor never left")
+			}
+			if err != nil {
+				t.Fatalf("Promote err = %v, want the already-first no-op", err)
+			}
+			if p.Changed || p.OldPosition != 1 || p.NewPosition != 1 || p.Holders == nil {
+				t.Fatalf("Promote = %+v, want an unchanged 1 -> 1 with non-nil holders", p)
+			}
+			if rec.count() != 0 {
+				t.Fatalf("Record calls = %d, want 0 (nothing was promoted)", rec.count())
+			}
+			if k := f.orderKey(c.ID); k != nil {
+				t.Fatalf("C committed order_key = %v, want NULL (nothing written)", k)
+			}
+			ids := []uuid.UUID{c.ID}
+			if d != nil {
+				ids = append(ids, d.ID)
+			}
+			st := f.positions(ids...)
+			if got := st[c.ID]; got.State != SlotQueued || got.Position != 1 || got.Promoted {
+				t.Fatalf("C status = %+v, want queued at 1, not promoted", got)
+			}
+			if d != nil {
+				if got := st[d.ID]; got.State != SlotQueued || got.Position != 2 || got.Promoted {
+					t.Fatalf("D status = %+v, want queued at 2, not promoted", got)
+				}
+				if k := f.orderKey(d.ID); k != nil {
+					t.Fatalf("D committed order_key = %v, want NULL", k)
+				}
+			}
+		})
+	}
+}
+
+// TestPromote_OrderKeyIgnoresOtherAccountsWaiters pins promoteKeySQL's
+// account filter on its own (#4312): another account's waiter under the SAME
+// group key, enqueued before everything else, must not set the promoted key.
+// Positions cannot tell (C is first in its own scope either way), so the
+// committed order_key is compared to A's committed enqueued_at INSIDE the
+// database; no Go-side time value enters either comparison.
+func TestPromote_OrderKeyIgnoresOtherAccountsWaiters(t *testing.T) {
+	f := newFixture(t)
+	acct := uuid.New()
+	f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "cc-"+acct.String())
+	h, a, c, h2, d := f.stage(), f.stage(), f.stage(), f.stage(), f.stage()
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id IN ($2, $3)`, acct, h2.RunID, d.RunID)
+	// Account 2 first, so D has the earliest waiter key in the group.
+	f.mustAdmit(h2)
+	f.mustQueue(d, 1)
+	f.queueBehindHolder(h, a, c)
+	f.mustPromote(c.ID, 2)
+
+	dbBool := func(sql string, args ...any) bool {
+		t.Helper()
+		var ok bool
+		if err := f.pool.QueryRow(context.Background(), sql, args...).Scan(&ok); err != nil {
+			t.Fatalf("query %q: %v", sql, err)
+		}
+		return ok
+	}
+	if !dbBool(`SELECT d.enqueued_at < a.enqueued_at FROM stage_concurrency_slots d, stage_concurrency_slots a
+WHERE d.stage_id = $1 AND a.stage_id = $2`, d.ID, a.ID) {
+		t.Fatal("fixture: D must be enqueued before A so the account filter is the only thing keeping its key out")
+	}
+	if !dbBool(`SELECT c.order_key = a.enqueued_at - interval '1 millisecond' FROM stage_concurrency_slots c, stage_concurrency_slots a
+WHERE c.stage_id = $1 AND a.stage_id = $2`, c.ID, a.ID) {
+		t.Fatalf("C committed order_key is not A.enqueued_at - 1ms (another account's waiter leaked into the minimum)")
+	}
+	if k := f.orderKey(d.ID); k != nil {
+		t.Fatalf("account-2 D order_key = %v, want NULL (never touched)", k)
+	}
+	if got := f.positions(d.ID)[d.ID]; got.Position != 1 || got.Promoted {
+		t.Fatalf("D status = %+v, want position 1 in its own queue, not promoted", got)
+	}
+}
+
 // faultTracer cancels the context of the nth (1-based) statement whose SQL
 // contains match, so exactly that statement fails before it is sent.
 type faultTracer struct {
@@ -614,7 +725,7 @@ func TestPromoteAndAdmit_StatementFailureRollsBack(t *testing.T) {
 		{"lock slot row", "FROM stage_concurrency_slots WHERE stage_id = $1 FOR UPDATE", 1},
 		{"list holders", "ORDER BY s.acquired_at, s.stage_id", 1},
 		{"old position", "round_ahead", 1},
-		{"write order key", "SET order_key = (", 1},
+		{"write order key", "WITH others AS", 1},
 		{"new position", "round_ahead", 2},
 	} {
 		t.Run("promote/"+tc.name, func(t *testing.T) {
