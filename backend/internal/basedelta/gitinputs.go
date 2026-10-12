@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -41,8 +43,13 @@ var (
 	// ErrNoMergeBase: the root head and B' share no history.
 	ErrNoMergeBase = errors.New("basedelta: no merge base")
 	// ErrIncompleteTree: the commit's tree holds an entry that cannot be
-	// materialized (a submodule gitlink), so a workspace would be incomplete.
+	// materialized (a submodule gitlink, an entry whose parent is a symlink),
+	// or exceeds the materialize limits, so a workspace would be incomplete.
 	ErrIncompleteTree = errors.New("basedelta: tree cannot be materialized completely")
+	// ErrSymlinkEscape: a tree symlink resolves outside the repository (an
+	// absolute target, a .. above the root, or a loop), so what it aliases
+	// cannot be classified.
+	ErrSymlinkEscape = errors.New("basedelta: symlink resolves outside the repository")
 	// ErrUnsafeTreePath: a tree entry's path is empty, absolute, has a ., ..
 	// or empty component, or names .git.
 	ErrUnsafeTreePath = errors.New("basedelta: unsafe tree path")
@@ -54,7 +61,7 @@ var (
 // InputsErrorCode maps a GitDelta / MaterializeTree error to a closed reason
 // code: deadline_exceeded (the caller's context deadline), invalid_object_id,
 // unexpected_parents, not_ancestor, ambiguous_merge_base, no_merge_base,
-// incomplete_tree, unsafe_tree_path, git, or unknown.
+// incomplete_tree, unsafe_tree_path, symlink_escape, git, or unknown.
 func InputsErrorCode(err error) string {
 	switch {
 	case err == nil:
@@ -75,6 +82,8 @@ func InputsErrorCode(err error) string {
 		return "incomplete_tree"
 	case errors.Is(err, ErrUnsafeTreePath):
 		return "unsafe_tree_path"
+	case errors.Is(err, ErrSymlinkEscape):
+		return "symlink_escape"
 	case errors.Is(err, ErrGit):
 		return "git"
 	}
@@ -89,7 +98,10 @@ type DeltaInputs struct {
 	ToBase string
 	// DeltaPaths are FromBase..ToBase, both sides of a rename.
 	DeltaPaths []string
-	// PRPaths are FromBase..rootHead, both sides of a rename.
+	// PRPaths are the de-duplicated union of FromBase..rootHead and
+	// ToBase..candidate, both sides of a rename: the second diff carries an
+	// edit made only in the merge commit and any commit between rootHead and
+	// the prior head.
 	PRPaths []string
 }
 
@@ -109,8 +121,9 @@ type gitRunner func(ctx context.Context, repoDir string, args ...string) ([]byte
 //  3. `merge-base --is-ancestor rootHead priorHead` (ErrNotAncestor).
 //  4. `merge-base --all rootHead ToBase` must yield exactly one base
 //     (ErrAmbiguousMergeBase, ErrNoMergeBase); FromBase is that base.
-//  5. DeltaPaths = FromBase..ToBase, PRPaths = FromBase..rootHead, both via
-//     `diff -z --no-renames --name-only`, so a rename reports both sides.
+//  5. DeltaPaths = FromBase..ToBase; PRPaths = the de-duplicated union of
+//     FromBase..rootHead and ToBase..candidate; all via `diff -z
+//     --no-renames --name-only`, so a rename reports both sides.
 func GitDelta(ctx context.Context, repoDir, candidate, priorHead, rootHead string) (DeltaInputs, error) {
 	return gitDelta(ctx, runGit, repoDir, candidate, priorHead, rootHead)
 }
@@ -174,7 +187,97 @@ func gitDelta(ctx context.Context, git gitRunner, repoDir, candidate, priorHead,
 	if err != nil {
 		return DeltaInputs{}, err
 	}
-	return DeltaInputs{FromBase: fromBase, ToBase: toBase, DeltaPaths: delta, PRPaths: pr}, nil
+	merged, err := diffNames(ctx, git, repoDir, toBase, candidate)
+	if err != nil {
+		return DeltaInputs{}, err
+	}
+	return DeltaInputs{FromBase: fromBase, ToBase: toBase, DeltaPaths: delta, PRPaths: appendUnique(pr, merged...)}, nil
+}
+
+// appendUnique appends each of add not already in list, keeping order.
+func appendUnique(list []string, add ...string) []string {
+	seen := make(map[string]bool, len(list)+len(add))
+	for _, p := range list {
+		seen[p] = true
+	}
+	for _, p := range add {
+		if !seen[p] {
+			seen[p] = true
+			list = append(list, p)
+		}
+	}
+	return list
+}
+
+// maxLinkHops bounds symlink resolution; a longer chain is a loop.
+const maxLinkHops = 40
+
+// ExpandSymlinkAliases extends in.DeltaPaths and in.PRPaths with every
+// symlink, from any of trees (link path -> target, as MaterializeTreeLinks
+// returns), whose fully resolved target equals or contains one of their
+// paths: a change to the target is a change to the link's path too, which the
+// classifier sees only as a path. Resolution is chained and component-wise
+// within each tree; a link resolving outside the repository is
+// ErrSymlinkEscape, so the verdict is undecidable rather than independent.
+func ExpandSymlinkAliases(in DeltaInputs, trees ...map[string]string) (DeltaInputs, error) {
+	type alias struct{ link, target string }
+	var aliases []alias
+	for _, links := range trees {
+		for link := range links {
+			target, err := resolveTreePath(links, link)
+			if err != nil {
+				return DeltaInputs{}, err
+			}
+			aliases = append(aliases, alias{link: link, target: target})
+		}
+	}
+	expand := func(paths []string) []string {
+		var add []string
+		for _, a := range aliases {
+			for _, p := range paths {
+				if a.target == "" || p == a.target || strings.HasPrefix(p, a.target+"/") {
+					add = append(add, a.link)
+					break
+				}
+			}
+		}
+		return appendUnique(paths, add...)
+	}
+	in.DeltaPaths = expand(in.DeltaPaths)
+	in.PRPaths = expand(in.PRPaths)
+	return in, nil
+}
+
+// resolveTreePath resolves p ("" is the repository root) through the tree's
+// symlinks one component at a time, as the filesystem would.
+func resolveTreePath(links map[string]string, p string) (string, error) {
+	pending := strings.Split(p, "/")
+	var done []string
+	hops := 0
+	for len(pending) > 0 {
+		c := pending[0]
+		pending = pending[1:]
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(done) == 0 {
+				return "", fmt.Errorf("%w: %q", ErrSymlinkEscape, boundTail(p))
+			}
+			done = done[:len(done)-1]
+			continue
+		}
+		target, isLink := links[path.Join(append(done, c)...)]
+		if !isLink {
+			done = append(done, c)
+			continue
+		}
+		if hops++; hops > maxLinkHops || target == "" || strings.HasPrefix(target, "/") {
+			return "", fmt.Errorf("%w: %q", ErrSymlinkEscape, boundTail(p))
+		}
+		pending = append(strings.Split(target, "/"), pending...)
+	}
+	return strings.Join(done, "/"), nil
 }
 
 // diffNames lists the paths changed between two commits. --no-renames makes a
@@ -197,32 +300,55 @@ func diffNames(ctx context.Context, git gitRunner, repoDir, from, to string) ([]
 }
 
 // MaterializeTree writes the tracked tree of commit into dest (an existing,
-// empty directory) from the LOCAL repository at repoDir. It reads `ls-tree -r`
-// and `cat-file --batch` and writes the bytes itself, so — unlike `git
+// empty directory) from the LOCAL repository at repoDir. It reads `ls-tree -r
+// -l` and `cat-file --batch` and writes the bytes itself, so — unlike `git
 // archive` (reviewsandbox.ExportTree) — it ignores export-ignore and keeps
 // symlinks, runs no filter/textconv driver, and never touches the
-// repository's index or work tree. Symlinks are created after every regular
-// file, and files are created O_EXCL, so no write can pass through a symlink
-// (a case-folding collision fails instead). A submodule gitlink makes the tree
-// incomplete (ErrIncompleteTree); a hostile path is refused
-// (ErrUnsafeTreePath). Either way the workspace must not be classified.
+// repository's index or work tree.
+//
+// Containment: every write goes through an os.Root on dest; before each
+// directory or entry is created, every existing parent component is Lstat'ed
+// and a symlink one is refused (ErrIncompleteTree), so nothing is ever
+// created THROUGH a link, even on a case-folding filesystem where `a/x`
+// resolves through a symlink `A`. Symlinks are created after every regular
+// file and files are created O_EXCL, so a case-folding collision fails.
+//
+// Bound: the entry count and the total blob bytes (symlink blobs included)
+// are checked against reviewsandbox.DefaultLimits BEFORE anything is
+// written; an oversized tree is ErrIncompleteTree. A submodule gitlink is
+// ErrIncompleteTree and a hostile path ErrUnsafeTreePath. Any of these means
+// the workspace must not be classified.
 func MaterializeTree(ctx context.Context, repoDir, commit, dest string) error {
+	_, err := MaterializeTreeLinks(ctx, repoDir, commit, dest)
+	return err
+}
+
+// MaterializeTreeLinks is MaterializeTree that also returns the tree's
+// symlinks (path -> target), the input ExpandSymlinkAliases reads.
+func MaterializeTreeLinks(ctx context.Context, repoDir, commit, dest string) (map[string]string, error) {
+	return materializeTree(ctx, repoDir, commit, dest, reviewsandbox.DefaultLimits())
+}
+
+func materializeTree(ctx context.Context, repoDir, commit, dest string, limits reviewsandbox.Limits) (map[string]string, error) {
 	if !isFullObjectID(commit) {
-		return fmt.Errorf("%w: commit %q", ErrInvalidObjectID, boundTail(commit))
+		return nil, fmt.Errorf("%w: commit %q", ErrInvalidObjectID, boundTail(commit))
 	}
 	if repoDir == "" {
-		return fmt.Errorf("%w: empty repository dir", ErrGit)
+		return nil, fmt.Errorf("%w: empty repository dir", ErrGit)
 	}
-	out, err := runGit(ctx, repoDir, "ls-tree", "-r", "-z", "--full-tree", commit)
+	out, err := runGit(ctx, repoDir, "ls-tree", "-r", "-z", "-l", "--full-tree", commit)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	entries, err := parseLsTree(out)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if err := checkTreeLimits(entries, limits); err != nil {
+		return nil, err
 	}
 	if len(entries) == 0 {
-		return nil
+		return nil, nil
 	}
 	var stdin strings.Builder
 	for _, e := range entries {
@@ -238,12 +364,12 @@ func MaterializeTree(ctx context.Context, repoDir, commit, dest string) error {
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("%w: cat-file: %w", ErrGit, err)
+		return nil, fmt.Errorf("%w: cat-file: %w", ErrGit, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%w: cat-file: %w", ErrGit, err)
+		return nil, fmt.Errorf("%w: cat-file: %w", ErrGit, err)
 	}
-	werr := writeBatch(bufio.NewReader(stdout), entries, dest)
+	links, werr := writeBatch(bufio.NewReader(stdout), entries, dest)
 	if werr != nil {
 		cancel()
 	}
@@ -251,14 +377,42 @@ func MaterializeTree(ctx context.Context, repoDir, commit, dest string) error {
 	if err := cmd.Wait(); err != nil && werr == nil {
 		werr = gitError(ctx, cctx, []string{"cat-file"}, err, stderr)
 	}
-	return werr
+	if werr != nil {
+		return nil, werr
+	}
+	return links, nil
 }
 
 type treeEntry struct {
 	mode, oid, path string
+	size            int64
 }
 
-// parseLsTree decodes `ls-tree -r -z` records ("<mode> <type> <oid>\t<path>").
+// checkTreeLimits refuses a tree whose entry count or total blob bytes
+// (symlink blobs included) exceeds limits, before anything is written.
+func checkTreeLimits(entries []treeEntry, limits reviewsandbox.Limits) error {
+	d := reviewsandbox.DefaultLimits()
+	if limits.MaxFiles <= 0 {
+		limits.MaxFiles = d.MaxFiles
+	}
+	if limits.MaxBytes <= 0 {
+		limits.MaxBytes = d.MaxBytes
+	}
+	if len(entries) > limits.MaxFiles {
+		return fmt.Errorf("%w: %d entries exceed the limit of %d", ErrIncompleteTree, len(entries), limits.MaxFiles)
+	}
+	var total int64
+	for _, e := range entries {
+		total += e.size
+		if total > limits.MaxBytes {
+			return fmt.Errorf("%w: blob bytes exceed the limit of %d", ErrIncompleteTree, limits.MaxBytes)
+		}
+	}
+	return nil
+}
+
+// parseLsTree decodes `ls-tree -r -l -z` records
+// ("<mode> <type> <oid> <size>\t<path>").
 func parseLsTree(out []byte) ([]treeEntry, error) {
 	var entries []treeEntry
 	for _, rec := range strings.Split(string(out), "\x00") {
@@ -267,7 +421,7 @@ func parseLsTree(out []byte) ([]treeEntry, error) {
 		}
 		meta, p, ok := strings.Cut(rec, "\t")
 		f := strings.Fields(meta)
-		if !ok || len(f) != 3 {
+		if !ok || len(f) != 4 {
 			return nil, fmt.Errorf("%w: ls-tree: malformed record %q", ErrGit, boundTail(rec))
 		}
 		if err := checkTreePath(p); err != nil {
@@ -280,7 +434,11 @@ func parseLsTree(out []byte) ([]treeEntry, error) {
 		case !isFullObjectID(f[2]):
 			return nil, fmt.Errorf("%w: ls-tree: malformed oid %q", ErrGit, boundTail(f[2]))
 		}
-		entries = append(entries, treeEntry{mode: f[0], oid: f[2], path: p})
+		size, err := strconv.ParseInt(f[3], 10, 64)
+		if err != nil || size < 0 {
+			return nil, fmt.Errorf("%w: ls-tree: bad size %q", ErrGit, boundTail(f[3]))
+		}
+		entries = append(entries, treeEntry{mode: f[0], oid: f[2], path: p, size: size})
 	}
 	return entries, nil
 }
@@ -299,57 +457,93 @@ func checkTreePath(p string) error {
 }
 
 // writeBatch reads one `cat-file --batch` record per entry, in order, writing
-// regular files immediately and symlinks after the last file.
-func writeBatch(r *bufio.Reader, entries []treeEntry, dest string) error {
-	type link struct{ target, path string }
-	var links []link
+// regular files immediately and symlinks after the last file, every write
+// through an os.Root on dest. It returns the symlinks (path -> target).
+func writeBatch(r *bufio.Reader, entries []treeEntry, dest string) (map[string]string, error) {
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return nil, fmt.Errorf("basedelta: materialize: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	links := map[string]string{}
+	var order []string
 	for _, e := range entries {
 		header, err := r.ReadString('\n')
 		if err != nil {
-			return fmt.Errorf("%w: cat-file: truncated output at %q", ErrGit, boundTail(e.path))
+			return nil, fmt.Errorf("%w: cat-file: truncated output at %q", ErrGit, boundTail(e.path))
 		}
 		f := strings.Fields(header)
 		if len(f) != 3 || f[0] != e.oid || f[1] != "blob" {
-			return fmt.Errorf("%w: cat-file: unexpected header %q for %q", ErrGit, boundTail(header), boundTail(e.path))
+			return nil, fmt.Errorf("%w: cat-file: unexpected header %q for %q", ErrGit, boundTail(header), boundTail(e.path))
 		}
 		size, err := strconv.ParseInt(f[2], 10, 64)
 		if err != nil || size < 0 {
-			return fmt.Errorf("%w: cat-file: bad size %q", ErrGit, boundTail(f[2]))
+			return nil, fmt.Errorf("%w: cat-file: bad size %q", ErrGit, boundTail(f[2]))
 		}
-		full := filepath.Join(dest, filepath.FromSlash(e.path))
 		if e.mode == "120000" {
 			var target bytes.Buffer
 			if _, err := io.CopyN(&target, r, size); err != nil {
-				return fmt.Errorf("%w: cat-file: %w", ErrGit, err)
+				return nil, fmt.Errorf("%w: cat-file: %w", ErrGit, err)
 			}
-			links = append(links, link{target: target.String(), path: full})
-		} else if err := writeBlob(r, size, full, e.mode == "100755"); err != nil {
-			return err
+			links[e.path] = target.String()
+			order = append(order, e.path)
+		} else if err := writeBlob(root, r, size, e.path, e.mode == "100755"); err != nil {
+			return nil, err
 		}
 		if b, err := r.ReadByte(); err != nil || b != '\n' {
-			return fmt.Errorf("%w: cat-file: missing record terminator after %q", ErrGit, boundTail(e.path))
+			return nil, fmt.Errorf("%w: cat-file: missing record terminator after %q", ErrGit, boundTail(e.path))
 		}
 	}
-	for _, l := range links {
-		if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
-			return fmt.Errorf("basedelta: materialize: %w", err)
+	for _, p := range order {
+		if err := mkdirParents(root, p); err != nil {
+			return nil, err
 		}
-		if err := os.Symlink(l.target, l.path); err != nil {
-			return fmt.Errorf("%w: %w", ErrIncompleteTree, err)
+		if err := root.Symlink(links[p], filepath.FromSlash(p)); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrIncompleteTree, err)
+		}
+	}
+	return links, nil
+}
+
+// mkdirParents creates rel's parent directories inside root one component at
+// a time. Each component is Lstat'ed first: a symlink is refused
+// (ErrIncompleteTree), so no directory and no entry is ever created through a
+// link — not one planted in dest, and not one a case-folding filesystem
+// aliases (`a` resolving to a symlink `A`).
+func mkdirParents(root *os.Root, rel string) error {
+	dir := path.Dir(rel)
+	if dir == "." {
+		return nil
+	}
+	cur := ""
+	for _, c := range strings.Split(dir, "/") {
+		cur = path.Join(cur, c)
+		fi, err := root.Lstat(filepath.FromSlash(cur))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if err := root.Mkdir(filepath.FromSlash(cur), 0o755); err != nil {
+				return fmt.Errorf("basedelta: materialize: %w", err)
+			}
+		case err != nil:
+			return fmt.Errorf("basedelta: materialize: %w", err)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return fmt.Errorf("%w: parent %q of %q is a symlink", ErrIncompleteTree, boundTail(cur), boundTail(rel))
+		case !fi.IsDir():
+			return fmt.Errorf("basedelta: materialize: parent %q of %q is not a directory", boundTail(cur), boundTail(rel))
 		}
 	}
 	return nil
 }
 
-func writeBlob(r io.Reader, size int64, full string, executable bool) error {
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		return fmt.Errorf("basedelta: materialize: %w", err)
+func writeBlob(root *os.Root, r io.Reader, size int64, rel string, executable bool) error {
+	if err := mkdirParents(root, rel); err != nil {
+		return err
 	}
 	perm := os.FileMode(0o644)
 	if executable {
 		perm = 0o755
 	}
-	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	f, err := root.OpenFile(filepath.FromSlash(rel), os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrIncompleteTree, err)
 	}
@@ -358,7 +552,7 @@ func writeBlob(r io.Reader, size int64, full string, executable bool) error {
 		cerr = err
 	}
 	if cerr != nil {
-		return fmt.Errorf("basedelta: materialize %s: %w", full, cerr)
+		return fmt.Errorf("basedelta: materialize %s: %w", rel, cerr)
 	}
 	return nil
 }

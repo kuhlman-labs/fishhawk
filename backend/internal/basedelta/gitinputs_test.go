@@ -488,11 +488,14 @@ func TestParseLsTree_Refusals(t *testing.T) {
 		want error
 	}{
 		"malformed":  {"garbage", ErrGit},
-		"tree mode":  {"040000 tree " + oid + "\tdir", ErrIncompleteTree},
-		"short oid":  {"100644 blob abc\tf", ErrGit},
-		"unsafe":     {"100644 blob " + oid + "\t../f", ErrUnsafeTreePath},
-		"gitlink":    {"160000 commit " + oid + "\tsub", ErrIncompleteTree},
-		"other mode": {"100664 blob " + oid + "\tf", ErrIncompleteTree},
+		"no size":    {"100644 blob " + oid + "\tf", ErrGit},
+		"tree mode":  {"040000 tree " + oid + " -\tdir", ErrIncompleteTree},
+		"short oid":  {"100644 blob abc 3\tf", ErrGit},
+		"unsafe":     {"100644 blob " + oid + " 3\t../f", ErrUnsafeTreePath},
+		"gitlink":    {"160000 commit " + oid + " -\tsub", ErrIncompleteTree},
+		"other mode": {"100664 blob " + oid + " 3\tf", ErrIncompleteTree},
+		"bad size":   {"100644 blob " + oid + " x\tf", ErrGit},
+		"neg size":   {"100644 blob " + oid + " -1\tf", ErrGit},
 	} {
 		if _, err := parseLsTree([]byte(tc.rec + "\x00")); !errors.Is(err, tc.want) {
 			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
@@ -628,6 +631,10 @@ func TestGitDelta_SeamFailures(t *testing.T) {
 			answers: map[string][]fakeAnswer{"rev-list": {parents}, "merge-base --is-ancestor": {ok}, "merge-base --all": {base}, "diff": {{out: "b/b.go\x00"}, gitFail}},
 			want:    ErrGit,
 		},
+		"merge diff failure": {
+			answers: map[string][]fakeAnswer{"rev-list": {parents}, "merge-base --is-ancestor": {ok}, "merge-base --all": {base}, "diff": {{out: "b/b.go\x00"}, {out: "a/a.go\x00"}, gitFail}},
+			want:    ErrGit,
+		},
 	} {
 		_, err := gitDelta(context.Background(), fakeGit(t, tc.answers), t.TempDir(), cand, prior, prior)
 		if !errors.Is(err, tc.want) {
@@ -663,7 +670,7 @@ func TestWriteBatch_Refusals(t *testing.T) {
 		"missing terminator": {file, oid + " blob 3\nabcX", ErrGit},
 		"missing final byte": {link, oid + " blob 3\nabc", ErrGit},
 	} {
-		err := writeBatch(bufio.NewReader(strings.NewReader(tc.out)), []treeEntry{tc.entry}, t.TempDir())
+		_, err := writeBatch(bufio.NewReader(strings.NewReader(tc.out)), []treeEntry{tc.entry}, t.TempDir())
 		if !errors.Is(err, tc.want) {
 			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
 		}
@@ -680,7 +687,7 @@ func TestWriteBatch_ParentIsAFile(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dest, "f"), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		err := writeBatch(bufio.NewReader(strings.NewReader(oid+" blob 3\nabc\n")), []treeEntry{{mode: mode, oid: oid, path: "f/x"}}, dest)
+		_, err := writeBatch(bufio.NewReader(strings.NewReader(oid+" blob 3\nabc\n")), []treeEntry{{mode: mode, oid: oid, path: "f/x"}}, dest)
 		if err == nil || errors.Is(err, ErrGit) || !strings.Contains(err.Error(), "materialize") {
 			t.Errorf("mode %s: err = %v, want a materialize error", mode, err)
 		}
@@ -700,5 +707,315 @@ func TestMaterializeTree_EmptyTreeAndRepoDir(t *testing.T) {
 	}
 	if err := MaterializeTree(context.Background(), "", sha, dest); !errors.Is(err, ErrGit) {
 		t.Fatalf("empty repo dir err = %v, want ErrGit", err)
+	}
+}
+
+// hashBlob writes body as a blob and returns its oid.
+func (r *gitRepo) hashBlob(body string) string {
+	r.t.Helper()
+	cmd := exec.Command("git", "-C", r.dir, "hash-object", "-w", "--stdin")
+	cmd.Stdin = strings.NewReader(body)
+	out, err := cmd.Output()
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// mkTree writes a tree from `ls-tree`-format records with `git mktree`, which
+// checks nothing about case, so a case-folding pair can be built anywhere.
+func (r *gitRepo) mkTree(records ...string) string {
+	r.t.Helper()
+	cmd := exec.Command("git", "-C", r.dir, "mktree")
+	cmd.Stdin = strings.NewReader(strings.Join(records, "\n") + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// caseInsensitive reports whether dir's filesystem folds case.
+func caseInsensitive(t *testing.T, dir string) bool {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "CaseProbe"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Stat(filepath.Join(dir, "caseprobe"))
+	_ = os.Remove(filepath.Join(dir, "CaseProbe"))
+	return err == nil
+}
+
+// R1 (fix-up): two symlinks `A` -> outside and `a/child`. On a case-folding
+// filesystem `a` resolves to the link `A`, so a parent created or resolved
+// through it would land `child` OUTSIDE dest. The parent Lstat walk refuses it
+// as ErrIncompleteTree. Counterfactual: without the walk os.Root still
+// refuses the escape, but with a different error, so the ErrIncompleteTree
+// assertion goes RED.
+func TestMaterializeTree_CaseFoldTwoSymlinksNeverEscape(t *testing.T) {
+	t.Parallel()
+	dest := t.TempDir()
+	if !caseInsensitive(t, dest) {
+		t.Skipf("the filesystem under %s is case-sensitive: `a` cannot alias `A`, so the case-fold escape is unreachable here", dest)
+	}
+	r := newGitRepo(t)
+	outside := t.TempDir()
+	sub := r.mkTree("120000 blob " + r.hashBlob("x") + "\tchild")
+	tree := r.mkTree("120000 blob "+r.hashBlob(outside)+"\tA", "040000 tree "+sub+"\ta")
+	sha := r.git("commit-tree", "-m", "case fold links", tree)
+
+	err := MaterializeTree(context.Background(), r.dir, sha, dest)
+	if ents, rerr := os.ReadDir(outside); rerr != nil || len(ents) != 0 {
+		t.Fatalf("outside dir = %v (%v): a write passed through the symlink A (MaterializeTree err %v)", ents, rerr, err)
+	}
+	if !errors.Is(err, ErrIncompleteTree) {
+		t.Fatalf("err = %v, want ErrIncompleteTree (a symlink parent component)", err)
+	}
+}
+
+// R1 (fix-up), on ANY filesystem: a symlink component planted in dest (here
+// `L` -> the in-dest dir `real`) is never resolved by a directory or entry
+// creation, for a file and a symlink alike. Counterfactual: without the parent
+// Lstat walk, os.Root follows the in-root link and writes real/x — RED.
+func TestWriteBatch_PlantedSymlinkParentNeverResolved(t *testing.T) {
+	t.Parallel()
+	oid := strings.Repeat("a", 40)
+	for _, mode := range []string{"100644", "120000"} {
+		dest := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dest, "real"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("real", filepath.Join(dest, "L")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := writeBatch(bufio.NewReader(strings.NewReader(oid+" blob 3\nabc\n")),
+			[]treeEntry{{mode: mode, oid: oid, path: "L/sub/x"}}, dest)
+		if !errors.Is(err, ErrIncompleteTree) {
+			t.Errorf("mode %s: err = %v, want ErrIncompleteTree", mode, err)
+		}
+		if ents, rerr := os.ReadDir(filepath.Join(dest, "real")); rerr != nil || len(ents) != 0 {
+			t.Errorf("mode %s: real/ = %v (%v), want empty: a write resolved through the planted link L", mode, ents, rerr)
+		}
+	}
+}
+
+// R2 (fix-up): the entry count and the total blob bytes, symlink blobs
+// included, are bounded BEFORE anything is written. Counterfactual: drop the
+// checkTreeLimits call and the oversized trees materialize — RED.
+func TestMaterializeTree_LimitsRefuseBeforeWriting(t *testing.T) {
+	t.Parallel()
+	r := newGitRepo(t)
+	target := strings.Repeat("t", 100)
+	tree := r.mkTree(
+		"100644 blob "+r.hashBlob("one\n")+"\tf1",
+		"100644 blob "+r.hashBlob("two\n")+"\tf2",
+		"120000 blob "+r.hashBlob(target)+"\tlink",
+	)
+	sha := r.git("commit-tree", "-m", "limits", tree)
+	const total = 4 + 4 + 100
+	for name, tc := range map[string]struct {
+		limits reviewsandbox.Limits
+		refuse bool
+	}{
+		"count over":             {reviewsandbox.Limits{MaxFiles: 2, MaxBytes: 1 << 20}, true},
+		"bytes over via symlink": {reviewsandbox.Limits{MaxFiles: 10, MaxBytes: total - 1}, true},
+		"exactly at both":        {reviewsandbox.Limits{MaxFiles: 3, MaxBytes: total}, false},
+		"zero is the default":    {reviewsandbox.Limits{}, false},
+	} {
+		dest := t.TempDir()
+		_, err := materializeTree(context.Background(), r.dir, sha, dest, tc.limits)
+		ents, rerr := os.ReadDir(dest)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if tc.refuse {
+			if !errors.Is(err, ErrIncompleteTree) || len(ents) != 0 {
+				t.Errorf("%s: err = %v, dest = %v; want ErrIncompleteTree with nothing written", name, err, ents)
+			}
+			continue
+		}
+		if err != nil || len(ents) != 3 {
+			t.Errorf("%s: err = %v, dest = %v; want all three entries", name, err, ents)
+		}
+	}
+}
+
+// F3 (fix-up): a local refs/replace of B' must not change the delta.
+// Counterfactual: drop GIT_NO_REPLACE_OBJECTS=1 from gitEnv and the delta is
+// read from the replacement's tree — RED.
+func TestGitDelta_IgnoresReplaceRefs(t *testing.T) {
+	t.Parallel()
+	r := newGitRepo(t)
+	a := r.advance(map[string]string{"b/b.go": "package b\n\nconst Y = 2\n"})
+	r.git("checkout", "-q", "-b", "side", a.base)
+	forged := r.commit("forged", map[string]string{"z.txt": "z\n"})
+	r.git("checkout", "-q", "pr")
+	r.git("replace", a.bPrime, forged)
+
+	got, err := GitDelta(context.Background(), r.dir, a.candidate, a.head, a.head)
+	if err != nil {
+		t.Fatalf("GitDelta: %v", err)
+	}
+	if !reflect.DeepEqual(got.DeltaPaths, []string{"b/b.go"}) || got.FromBase != a.base {
+		t.Fatalf("GitDelta under a replace ref = %+v, want the real delta [b/b.go] from %s", got, a.base)
+	}
+}
+
+// F3 (fix-up): repoDir a SUBDIRECTORY of the work tree, with diff.relative
+// set, still yields complete, root-relative inputs. Counterfactuals: drop
+// --no-relative from diffNames, or --full-tree from the ls-tree, — RED.
+func TestGitInputs_SubdirRepoDirIsRootRelativeAndComplete(t *testing.T) {
+	t.Parallel()
+	r := newGitRepo(t)
+	a := r.advance(map[string]string{"b/b.go": "package b\n\nconst Y = 2\n"})
+	r.git("config", "diff.relative", "true")
+	sub := filepath.Join(r.dir, "a")
+
+	got, err := GitDelta(context.Background(), sub, a.candidate, a.head, a.head)
+	if err != nil {
+		t.Fatalf("GitDelta: %v", err)
+	}
+	if !reflect.DeepEqual(got.DeltaPaths, []string{"b/b.go"}) || !reflect.DeepEqual(got.PRPaths, []string{"a/a.go"}) {
+		t.Fatalf("GitDelta from a subdirectory = %+v, want delta [b/b.go] pr [a/a.go]", got)
+	}
+	dest := t.TempDir()
+	if err := MaterializeTree(context.Background(), sub, a.candidate, dest); err != nil {
+		t.Fatalf("MaterializeTree: %v", err)
+	}
+	for _, p := range []string{"a/a.go", "b/b.go"} {
+		if _, err := os.Stat(filepath.Join(dest, filepath.FromSlash(p))); err != nil {
+			t.Errorf("materialized tree lacks %s: %v", p, err)
+		}
+	}
+}
+
+// prUnionFixture: base (a, b, q importing b), the PR edits a, main edits b.
+// edit applies the extra q edit (in the merge commit, or in a plain commit
+// after the root head); the classifier must see q and answer NOT independent.
+func classifyPRUnion(t *testing.T, edit string) {
+	t.Helper()
+	requireGo(t)
+	r := newGitRepo(t)
+	base := map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.25.0\n",
+		"a/a.go": "package a\n",
+		"b/b.go": "package b\n",
+		"q/q.go": "package q\n\nimport _ \"example.com/m/b\"\n",
+	}
+	r.commit("base", base)
+	r.git("checkout", "-q", "-b", "pr")
+	root := r.commit("pr", map[string]string{"a/a.go": "package a\n\nconst X = 1\n"})
+	prior := root
+	qEdit := map[string]string{"q/q.go": "package q\n\nimport _ \"example.com/m/b\"\n\nconst Q = 1\n"}
+	if edit == "between" {
+		prior = r.commit("plain", qEdit)
+	}
+	r.git("checkout", "-q", "main")
+	bPrime := r.commit("advance", map[string]string{"b/b.go": "package b\n\nconst Y = 2\n"})
+	r.git("checkout", "-q", "pr")
+	var cand string
+	if edit == "merge" {
+		r.git("merge", "-q", "--no-ff", "--no-commit", "main")
+		cand = r.commit("merge main with an extra edit", qEdit)
+	} else {
+		cand = r.merge("main")
+	}
+
+	in, err := GitDelta(context.Background(), r.dir, cand, prior, root)
+	if err != nil {
+		t.Fatalf("GitDelta: %v", err)
+	}
+	if !reflect.DeepEqual(in.PRPaths, []string{"a/a.go", "q/q.go"}) {
+		t.Errorf("PRPaths = %v, want [a/a.go q/q.go] (the union with ToBase..candidate)", in.PRPaths)
+	}
+	var trees []string
+	for _, sha := range []string{bPrime, cand} {
+		dest := t.TempDir()
+		if err := MaterializeTree(context.Background(), r.dir, sha, dest); err != nil {
+			t.Fatalf("MaterializeTree(%s): %v", sha, err)
+		}
+		trees = append(trees, dest)
+	}
+	res := (&Classifier{Loader: &GoListLoader{Env: emptyModCache(t)}}).Classify(context.Background(),
+		Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: trees})
+	if res.Independent {
+		t.Fatalf("Classify = %+v, want NOT independent (q imports the advanced b)", res)
+	}
+}
+
+// F2 (fix-up): an edit made only in the merge commit. Counterfactual: PRPaths
+// = FromBase..rootHead alone misses q and classifies independent — RED.
+func TestGitDelta_PRPathsIncludeMergeCommitEdit(t *testing.T) {
+	t.Parallel()
+	classifyPRUnion(t, "merge")
+}
+
+// F2 (fix-up): a plain commit between the root head and the prior head.
+// Counterfactual as above — RED.
+func TestGitDelta_PRPathsIncludeCommitAfterRoot(t *testing.T) {
+	t.Parallel()
+	classifyPRUnion(t, "between")
+}
+
+// F1 (fix-up): a link whose resolved target is, or contains, a changed path
+// joins that path list; resolution is chained and an escape is undecidable.
+func TestExpandSymlinkAliases(t *testing.T) {
+	t.Parallel()
+	links := map[string]string{
+		"p/impl.go": "../shared/impl.txt",
+		"chain.go":  "p/impl.go",
+		"vendored":  "./shared",
+		"self":      ".",
+		"other.go":  "x/y.go",
+	}
+	got, err := ExpandSymlinkAliases(DeltaInputs{DeltaPaths: []string{"shared/impl.txt"}, PRPaths: []string{"q/q.go"}}, links)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"shared/impl.txt", "chain.go", "p/impl.go", "self", "vendored"}; !sameSet(got.DeltaPaths, want) {
+		t.Errorf("DeltaPaths = %v, want %v", got.DeltaPaths, want)
+	}
+	if want := []string{"q/q.go", "self"}; !sameSet(got.PRPaths, want) {
+		t.Errorf("PRPaths = %v, want %v (only the root alias contains q/q.go)", got.PRPaths, want)
+	}
+	for name, l := range map[string]map[string]string{
+		"absolute":   {"x": "/etc/passwd"},
+		"above root": {"d/x": "../../y"},
+		"loop":       {"a": "b", "b": "a"},
+		"empty":      {"x": ""},
+	} {
+		if _, err := ExpandSymlinkAliases(DeltaInputs{DeltaPaths: []string{"q"}, PRPaths: []string{"r"}}, l); !errors.Is(err, ErrSymlinkEscape) || InputsErrorCode(err) != "symlink_escape" {
+			t.Errorf("%s: err = %v, want ErrSymlinkEscape", name, err)
+		}
+	}
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, x := range a {
+		seen[x]++
+	}
+	for _, x := range b {
+		seen[x]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestMaterializeTreeLinks_ReturnsLinks(t *testing.T) {
+	t.Parallel()
+	r := newGitRepo(t)
+	tree := r.mkTree("100644 blob "+r.hashBlob("package p\n")+"\tf.go", "120000 blob "+r.hashBlob("f.go")+"\tl.go")
+	sha := r.git("commit-tree", "-m", "links", tree)
+	links, err := MaterializeTreeLinks(context.Background(), r.dir, sha, t.TempDir())
+	if err != nil || !reflect.DeepEqual(links, map[string]string{"l.go": "f.go"}) {
+		t.Fatalf("links = %v, %v; want {l.go: f.go}", links, err)
 	}
 }

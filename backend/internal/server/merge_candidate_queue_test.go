@@ -2003,3 +2003,88 @@ func (f *mcqFixture) appendSystemRow(r *mcqRun, category string, payload any) {
 		f.t.Fatalf("append %s: %v", category, err)
 	}
 }
+
+// S2a (fix-up): in SHADOW a classifier that blocks never delays the admission
+// hand-off — the entry goes live and its pass starts while the shadow
+// classification is still blocked, and the shadow row lands only after the
+// release. Counterfactual: classify on the admission goroutine and the pump
+// waits on the classifier — RED.
+func TestMergeCandidateQueue_ShadowBlockingClassifierNeverDelaysAdmission(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := gatedClassifier(t)
+	a, b := f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferShadow, cls)
+	f.srv.cfg.MergeCandidateTransfer.Deadline = 10 * time.Minute
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	runRow, err := f.repo.GetRun(context.Background(), b.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.freeLine(a)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.srv.pumpMergeCandidateQueue(context.Background(), mergequeue.Base{AccountID: runRow.AccountID, Repo: runRow.Repo, BaseRef: mcqBase})
+	}()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(20 * time.Second)):
+		t.Fatal("the admission hand-off waited on the blocked shadow classification")
+	}
+	awaitEntered(t, cls)
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B entry = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("B triggers = %+v, want the pass started for b2 before the shadow decision", tr)
+	}
+	if n := len(f.rows(b, CategoryMergeCandidateVerdictTransferShadow)); n != 0 {
+		t.Fatalf("B shadow rows = %d while the classifier is blocked, want 0", n)
+	}
+	close(cls.gate)
+	f.srv.waitMergeCandidateTransferShadows()
+	if sh := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferShadow); len(sh) != 1 || !*sh[0].WouldTransfer {
+		t.Errorf("B shadow rows after release = %+v, want one would_transfer", sh)
+	}
+}
+
+// R3 (fix-up), admission arm: the auto-advance's post-merge re-read observes a
+// concurrent push, so enforce records not_clean_advance and runs the pass for
+// the observed head instead of transferring. Counterfactual: drop the
+// new-head == merge-commit check and the verdict transfers — RED.
+func TestMergeCandidateQueue_AdmissionConcurrentPushNeverTransfers(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := independentClassifier()
+	a, b := f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferEnforce, cls)
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	f.gh.set(func() {
+		f.gh.onMerge = func(base string) {
+			if base == b.branch {
+				f.gh.set(func() { f.gh.prs[b.pr].head = "b2-racer" })
+			}
+		}
+	})
+	f.closePR(a, true)
+
+	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2-racer" || e.Phase != mergequeue.PhaseVerifying {
+		t.Fatalf("B entry = head %q phase %q, want b2-racer verifying", e.AnchoredHeadSHA, e.Phase)
+	}
+	if n := len(f.rows(b, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Fatalf("B transferred rows = %d, want 0 for a concurrent-push head", n)
+	}
+	if rows := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferRefused); len(rows) != 1 || rows[0].ReasonCode != transferReasonNotCleanAdvance {
+		t.Errorf("B refused rows = %+v, want one not_clean_advance", rows)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2-racer" {
+		t.Errorf("B triggers = %+v, want one for b2-racer", tr)
+	}
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0", cls.count())
+	}
+}

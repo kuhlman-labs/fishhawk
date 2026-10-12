@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // --- E87.2 / #4293: merge-candidate verdict transfer (ADR-096 D1/D2/D5) ---
@@ -36,7 +37,8 @@ const (
 )
 
 // fakeTransferClassifier counts calls and answers res, or blocks until its
-// context is done when block is set.
+// context is done when block is set. When gate is set it signals entered
+// (buffered, non-blocking) and holds until gate closes or its context ends.
 type fakeTransferClassifier struct {
 	mu       sync.Mutex
 	calls    int
@@ -44,6 +46,8 @@ type fakeTransferClassifier struct {
 	block    bool
 	deadline time.Duration
 	input    basedelta.Input
+	gate     chan struct{}
+	entered  chan struct{}
 }
 
 func (c *fakeTransferClassifier) Classify(ctx context.Context, in basedelta.Input) basedelta.Result {
@@ -54,6 +58,17 @@ func (c *fakeTransferClassifier) Classify(ctx context.Context, in basedelta.Inpu
 		c.deadline = time.Until(dl)
 	}
 	c.mu.Unlock()
+	if c.gate != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.gate:
+		case <-ctx.Done():
+			return basedelta.Result{Reason: "undecidable:context"}
+		}
+	}
 	if c.block {
 		<-ctx.Done()
 		return basedelta.Result{Reason: "undecidable:context"}
@@ -781,4 +796,184 @@ func TestDefaultTransferInputs_ExportIgnoredDependentNeverIndependent(t *testing
 	if !errors.Is(err, basedelta.ErrUnexpectedParents) {
 		t.Errorf("single-parent candidate err = %v, want ErrUnexpectedParents", err)
 	}
+}
+
+// gatedClassifier answers independent once gate closes; the test closes it in
+// a cleanup so no shadow goroutine outlives the test.
+func gatedClassifier(t *testing.T) *fakeTransferClassifier {
+	t.Helper()
+	cls := independentClassifier()
+	cls.gate, cls.entered = make(chan struct{}), make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case <-cls.gate:
+		default:
+			close(cls.gate)
+		}
+	})
+	return cls
+}
+
+// awaitEntered waits until cls is classifying.
+func awaitEntered(t *testing.T, cls *fakeTransferClassifier) {
+	t.Helper()
+	select {
+	case <-cls.entered:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("the shadow classification never started")
+	}
+}
+
+// S2b (fix-up): the default classification sub-budget is pinned at or below
+// the 30s the approval condition allows.
+func TestMergeCandidateTransferDefaultDeadlineAtMost30s(t *testing.T) {
+	if mergeCandidateTransferDefaultDeadline <= 0 || mergeCandidateTransferDefaultDeadline > 30*time.Second {
+		t.Fatalf("mergeCandidateTransferDefaultDeadline = %s, want (0, 30s] (approval condition S2)", mergeCandidateTransferDefaultDeadline)
+	}
+	f := newMCTFixture(t, MergeCandidateTransferEnforce)
+	if budget, ok := f.s.mergeCandidateTransferSubBudget(context.Background(), 0); !ok || budget != mergeCandidateTransferDefaultDeadline {
+		t.Errorf("unconfigured sub-budget = %s/%v, want the %s default", budget, ok, mergeCandidateTransferDefaultDeadline)
+	}
+}
+
+// C2a (fix-up): a FAILED verdict on head X and a would_transfer shadow row on
+// head Y != X never pair, at either detect site. Order 1: the verdict lands
+// first and the shadow writer checks Y (pins the verdict-head match).
+// Order 2: the shadow lands first and the verdict writer checks X (pins the
+// shadow-head match). Counterfactual: drop either match and that order
+// records a false transfer — RED.
+func TestFalseTransfer_OtherHeadNeverPairs(t *testing.T) {
+	t.Run("verdict on X then shadow on Y", func(t *testing.T) {
+		f := newMCTFixture(t, MergeCandidateTransferShadow)
+		f.seedTrigger(mcvOtherHead)
+		f.seedVerdict(mcvOtherHead, mergeCandidateResultFailed)
+		f.s.scheduleMergeCandidateTransferShadow(f.req(t))
+		f.s.waitMergeCandidateTransferShadows()
+		if sh := transferRows(f.au, CategoryMergeCandidateVerdictTransferShadow); len(sh) != 1 || !*sh[0].WouldTransfer || sh[0].ToHead != mctNewHead {
+			t.Fatalf("fixture: shadow rows = %+v, want one would_transfer for %s", sh, mctNewHead)
+		}
+		if rows := falseTransferRows(f.au); len(rows) != 0 {
+			t.Errorf("false-transfer rows = %+v, want none (the failed verdict is for %s, not %s)", rows, mcvOtherHead, mctNewHead)
+		}
+	})
+	t.Run("shadow on Y then verdict on X", func(t *testing.T) {
+		f := newMCTFixture(t, MergeCandidateTransferShadow)
+		f.appendRow(nil, CategoryMergeCandidateVerdictTransferShadow, mergeCandidateTransferPayload{
+			FromHead: mcvHead, ToHead: mctNewHead, ReasonCode: transferReasonIndependent, WouldTransfer: ptrBool(true)})
+		f.seedTrigger(mcvOtherHead)
+		if _, err := f.s.recordMergeCandidateVerified(context.Background(), f.runID, f.impl.ID,
+			mergeCandidateResultFailed, "", "", audit.ActorSystem, "runner"); err != nil {
+			t.Fatal(err)
+		}
+		if rows := falseTransferRows(f.au); len(rows) != 0 {
+			t.Errorf("false-transfer rows = %+v, want none (the shadow is for %s, the failed verdict for %s)", rows, mctNewHead, mcvOtherHead)
+		}
+	})
+}
+
+// C2b (fix-up): a false transfer logs at WARN naming the heads and fires the
+// operator-visible status refresh. Counterfactuals: log below WARN, or drop
+// the notify — RED.
+func TestFalseTransfer_WarnsAndNotifiesOperator(t *testing.T) {
+	f := newMCTFixture(t, MergeCandidateTransferShadow)
+	var buf bytes.Buffer
+	f.s.cfg.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	rec := &pageClassRecorder{}
+	f.s.issueNotifier = rec
+	f.seedVerdict(mctNewHead, mergeCandidateResultFailed)
+	f.appendRow(nil, CategoryMergeCandidateVerdictTransferShadow, mergeCandidateTransferPayload{
+		FromHead: mcvHead, ToHead: mctNewHead, ReasonCode: transferReasonIndependent, WouldTransfer: ptrBool(true)})
+
+	f.s.detectMergeCandidateFalseTransfers(context.Background(), f.runID, mctNewHead)
+
+	if n := len(falseTransferRows(f.au)); n != 1 {
+		t.Fatalf("false-transfer rows = %d, want 1", n)
+	}
+	var warned bool
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		if msg, _ := m["msg"].(string); strings.Contains(msg, "FALSE TRANSFER") {
+			warned = m["level"] == "WARN" && m["to_head"] == mctNewHead && m["from_head"] == mcvHead && m["run_id"] == f.runID.String()
+		}
+	}
+	if !warned {
+		t.Errorf("want one WARN FALSE TRANSFER line naming run, to_head and from_head; log:\n%s", buf.String())
+	}
+	if len(rec.status) != 1 || rec.status[0] != f.runID {
+		t.Errorf("operator-visible status refreshes = %v, want exactly one for run %s", rec.status, f.runID)
+	}
+}
+
+// F1 (fix-up): p/impl.go is a symlink to ../shared/impl.txt; the base delta
+// edits ONLY the target and the PR edits q, which imports p. The resolver
+// adds the link path to the delta, so the classifier sees p changed and
+// answers reach_overlap. Counterfactual: no alias expansion leaves the delta
+// at shared/impl.txt (no package), which classifies independent — RED.
+func TestDefaultTransferInputs_SymlinkAliasNeverIndependent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH")
+	}
+	repo := t.TempDir()
+	mctGit(t, repo, "init", "-q")
+	mctWrite(t, repo, map[string]string{
+		"go.mod":          "module example.com/m\n\ngo 1.21\n",
+		"p/p.go":          "package p\n\nconst P = 1\n",
+		"shared/impl.txt": "package p\n\nconst Impl = 1\n",
+		"q/q.go":          "package q\n\nimport \"example.com/m/p\"\n\nconst Q = p.P\n",
+	})
+	if err := os.Symlink("../shared/impl.txt", filepath.Join(repo, "p", "impl.go")); err != nil {
+		t.Fatal(err)
+	}
+	mctGit(t, repo, "add", "-A")
+	mctGit(t, repo, "commit", "-q", "-m", "base")
+	mctGit(t, repo, "checkout", "-q", "-b", "pr")
+	mctWrite(t, repo, map[string]string{"q/q.go": "package q\n\nimport \"example.com/m/p\"\n\nconst Q = p.P + 1\n"})
+	mctGit(t, repo, "commit", "-q", "-am", "pr")
+	head := mctGit(t, repo, "rev-parse", "HEAD")
+	mctGit(t, repo, "checkout", "-q", "main")
+	mctWrite(t, repo, map[string]string{"shared/impl.txt": "package p\n\nconst Impl = 2\n"})
+	mctGit(t, repo, "commit", "-q", "-am", "advance")
+	mctGit(t, repo, "checkout", "-q", "pr")
+	mctGit(t, repo, "merge", "-q", "--no-ff", "-m", "merge main", "main")
+	candidate := mctGit(t, repo, "rev-parse", "HEAD")
+
+	in, err := defaultMergeCandidateTransferInputs(context.Background(), repo, candidate, head, head)
+	if err != nil {
+		t.Fatalf("inputs: %v", err)
+	}
+	defer in.Cleanup()
+	if fmt.Sprint(in.Delta.DeltaPaths) != "[shared/impl.txt p/impl.go]" {
+		t.Errorf("DeltaPaths = %v, want the target and its link [shared/impl.txt p/impl.go]", in.Delta.DeltaPaths)
+	}
+	res := (&basedelta.Classifier{Loader: &basedelta.GoListLoader{}}).Classify(context.Background(), basedelta.Input{
+		DeltaPaths: in.Delta.DeltaPaths, PRPaths: in.Delta.PRPaths, Workspaces: in.Workspaces})
+	if res.Independent {
+		t.Fatalf("classified %+v; a delta editing p's symlinked source must NOT be independent of a PR on q", res)
+	}
+
+	// A link escaping the repository makes the inputs undecidable.
+	if err := os.Symlink("/etc/hosts", filepath.Join(repo, "escape.go")); err != nil {
+		t.Fatal(err)
+	}
+	mctGit(t, repo, "add", "escape.go")
+	mctGit(t, repo, "commit", "-q", "-m", "escape")
+	escHead := mctGit(t, repo, "rev-parse", "HEAD")
+	mctGit(t, repo, "checkout", "-q", "main")
+	mctWrite(t, repo, map[string]string{"shared/impl.txt": "package p\n\nconst Impl = 3\n"})
+	mctGit(t, repo, "commit", "-q", "-am", "advance 2")
+	mctGit(t, repo, "checkout", "-q", "pr")
+	mctGit(t, repo, "merge", "-q", "--no-ff", "-m", "merge main 2", "main")
+	escCand := mctGit(t, repo, "rev-parse", "HEAD")
+	if _, err := defaultMergeCandidateTransferInputs(context.Background(), repo, escCand, escHead, escHead); !errors.Is(err, basedelta.ErrSymlinkEscape) {
+		t.Errorf("escaping link err = %v, want ErrSymlinkEscape", err)
+	}
+	f := newMCTFixture(t, MergeCandidateTransferEnforce)
+	f.inputsErr = fmt.Errorf("wrapped: %w", basedelta.ErrSymlinkEscape)
+	assertTransferCode(t, f.decide(t), transferReasonIncompleteExport, f.cls.count(), 0)
 }

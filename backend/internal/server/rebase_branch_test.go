@@ -2857,3 +2857,69 @@ func assertNoTransferActivity(t *testing.T, sd *rebaseSeed, cls *fakeTransferCla
 		}
 	}
 }
+
+// R3 (fix-up): the post-merge re-read observes a CONCURRENT PUSH (the new head
+// is not the merge commit this call created), so the advance is not clean:
+// enforce records not_clean_advance, never classifies or transfers, and runs
+// the pass for the observed head. Counterfactual: drop the newHead ==
+// merge-commit check and the independent classifier transfers — RED.
+func TestRebaseRunBranch_EnforceConcurrentPushNeverTransfers(t *testing.T) {
+	cls := independentClassifier()
+	stub := cleanRebaseStub()
+	stub.headSHASeq = []string{rebasePriorHeadSHA, rebasePriorHeadSHA, rebaseRacerSHA}
+	sd, _ := seedTransferRebase(t, stub, MergeCandidateTransferEnforce, cls)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+	if resp.MergeCommitSHA != rebaseNewHeadSHA || resp.NewHeadSHA != rebaseRacerSHA {
+		t.Fatalf("fixture: merge %q new head %q, want merge %s superseded by the racer %s",
+			resp.MergeCommitSHA, resp.NewHeadSHA, rebaseNewHeadSHA, rebaseRacerSHA)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Fatalf("transferred rows = %d, want 0 for a concurrent-push head", n)
+	}
+	rows := transferRows(sd.au, CategoryMergeCandidateVerdictTransferRefused)
+	if len(rows) != 1 || rows[0].ReasonCode != transferReasonNotCleanAdvance || rows[0].ToHead != rebaseRacerSHA {
+		t.Errorf("refused rows = %+v, want one not_clean_advance for %s", rows, rebaseRacerSHA)
+	}
+	if tr := mcvTriggerPayloads(t, sd.au); len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseRacerSHA {
+		t.Errorf("triggers = %+v, want one pass for the observed head %s", tr, rebaseRacerSHA)
+	}
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0", cls.count())
+	}
+}
+
+// S2a (fix-up): in SHADOW a classifier that blocks never delays the 200 — the
+// pass starts, the response returns, and the shadow row lands only after the
+// classifier is released. Counterfactual: run the shadow decision on the
+// handler goroutine and the 200 waits on the classifier — RED.
+func TestRebaseRunBranch_ShadowBlockingClassifierNeverDelaysThe200(t *testing.T) {
+	cls := gatedClassifier(t)
+	sd, _ := seedTransferRebase(t, cleanRebaseStub(), MergeCandidateTransferShadow, cls)
+	sd.s.cfg.MergeCandidateTransfer.Deadline = 10 * time.Minute
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	}()
+	var w *httptest.ResponseRecorder
+	select {
+	case w = <-done:
+	case <-time.After(timescale.D(20 * time.Second)):
+		t.Fatal("the rebase 200 waited on the blocked shadow classification")
+	}
+	resp := decodeRebase(t, w)
+	awaitEntered(t, cls)
+	if tr := mcvTriggerPayloads(t, sd.au); len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA || !resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("triggers = %+v (triggered %v), want the pass started for %s before the shadow decision", tr, resp.MergeCandidateVerifyTriggered, rebaseNewHeadSHA)
+	}
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferShadow)); n != 0 {
+		t.Fatalf("shadow rows = %d while the classifier is blocked, want 0", n)
+	}
+	close(cls.gate)
+	sd.s.waitMergeCandidateTransferShadows()
+	if sh := transferRows(sd.au, CategoryMergeCandidateVerdictTransferShadow); len(sh) != 1 || !*sh[0].WouldTransfer {
+		t.Errorf("shadow rows after release = %+v, want one would_transfer", sh)
+	}
+}

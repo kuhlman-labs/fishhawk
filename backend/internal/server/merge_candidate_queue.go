@@ -394,8 +394,11 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 			return unadmit("the auto-advance merged but its resulting head could not be read back")
 		}
 		if adv.MergePerformed {
+			// Clean only when the new head IS the merge commit; a concurrent
+			// push the post-merge re-read observed is not_clean_advance.
 			transfer = &mergeCandidateTransferRequest{Run: runRow, PriorHead: head, NewHead: adv.NewHeadSHA,
-				MergePerformed: true, Cause: mergeCandidateCauseBaseAdvance}
+				MergePerformed: adv.MergeCommitSHA != "" && adv.NewHeadSHA == adv.MergeCommitSHA,
+				Cause:          mergeCandidateCauseBaseAdvance}
 		}
 		head = adv.NewHeadSHA
 	}

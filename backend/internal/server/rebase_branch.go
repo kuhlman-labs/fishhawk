@@ -357,7 +357,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// MERGE-CANDIDATE VERIFY (ADR-090 D3), after the shared tail so the
 	// branch_rebased row the state predicate classifies on is already on the
 	// chain and the review gate is already re-parked.
-	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergePerformed)
+	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergeCommitSHA, out.MergePerformed)
 
 	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
 		RunID:                      runID.String(),
@@ -738,7 +738,9 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 //     post-merge re-read returned no new head is nothing anchored; the retry
 //     then takes the already-up-to-date arm below. In ENFORCE transfer mode
 //     (E87.2 / #4293) the decision runs first: a transferred verdict answers
-//     passed and starts NO pass; a refusal is recorded and the pass runs. In
+//     passed and starts NO pass; a refusal is recorded and the pass runs. A
+//     new head that is not the decoded merge commit (a concurrent push) is
+//     never a clean advance: it is refused as not_clean_advance. In
 //     SHADOW mode the pass runs as above and the would-be decision is
 //     classified asynchronously after it.
 //   - An ALREADY-UP-TO-DATE invocation reads mergeCandidateVerifyState for
@@ -749,7 +751,7 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 // The actor is the OPERATOR who invoked the verb. Nothing here fails the
 // rebase: a refusal is carried on the 200.
 func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
-	branch, baseRef, priorHead, newHead string, mergePerformed bool) rebaseMergeCandidateFields {
+	branch, baseRef, priorHead, newHead, mergeCommit string, mergePerformed bool) rebaseMergeCandidateFields {
 	ctx := r.Context()
 	if mergePerformed && newHead == "" {
 		return rebaseMergeCandidateFields{Refusal: mergeCandidateUnreadableHeadNote}
@@ -758,9 +760,13 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 	if mergePerformed {
 		// ADR-096 verdict transfer (E87.2 / #4293). ONLY a performed merge
 		// with a resolved new head reaches here; the already-up-to-date arm
-		// below never classifies.
+		// below never classifies. The advance is CLEAN only when the new head
+		// IS the merge commit this call created: a post-merge re-read that
+		// observed a concurrent push (newHead != mergeCommit) is refused as
+		// not_clean_advance and the pass runs for that head.
+		clean := mergeCommit != "" && newHead == mergeCommit
 		req := mergeCandidateTransferRequest{Run: runRow, PriorHead: priorHead, NewHead: newHead,
-			MergePerformed: true, Cause: mergeCandidateCauseBaseAdvance}
+			MergePerformed: clean, Cause: mergeCandidateCauseBaseAdvance}
 		if s.mergeCandidateTransferMode() == MergeCandidateTransferEnforce {
 			pctx, cancel, transferred := s.rebaseMergeCandidateTransferEnforce(ctx, req)
 			defer cancel()

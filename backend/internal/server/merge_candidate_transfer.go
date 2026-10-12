@@ -28,8 +28,8 @@ import (
 //
 //   - decideMergeCandidateTransfer runs the precondition ladder, resolves the
 //     transfer chain's ROOT head, reads the inputs (basedelta.GitDelta plus
-//     two basedelta.MaterializeTree workspaces, B' and H') and calls the
-//     classifier on a bounded SUB-budget;
+//     two basedelta.MaterializeTreeLinks workspaces, B' and H', with symlink
+//     aliases expanded) and calls the classifier on a bounded SUB-budget;
 //   - mergeCandidateTransferEnforce writes the decision in enforce mode:
 //     merge_candidate_verdict_transferred (the caller skips the pass) or
 //     merge_candidate_verdict_transfer_refused (the caller runs the pass);
@@ -280,7 +280,8 @@ func (s *Server) mergeCandidateTransferSubBudget(ctx context.Context, reserve ti
 //  3. the prior head's state read fails → source_unreadable; is not passed →
 //     source_not_passed:<state>;
 //  4. no working dir → no_working_dir;
-//  5. inputs: deadline → undecidable:deadline_exceeded; an incomplete tree →
+//  5. inputs: deadline → undecidable:deadline_exceeded; an incomplete tree
+//     or a symlink resolving outside the repository →
 //     undecidable:incomplete_export; any other → inputs:<sentinel code>;
 //  6. the classifier's own code (independent, global_surface,
 //     shared_artifact, reach_overlap, undecidable), or
@@ -344,7 +345,8 @@ func (s *Server) decideMergeCandidateTransfer(ctx context.Context, req mergeCand
 		switch {
 		case cctx.Err() != nil || errors.Is(err, context.DeadlineExceeded):
 			return finish(transferReasonDeadlineExceeded, "")
-		case errors.Is(err, basedelta.ErrIncompleteTree), errors.Is(err, basedelta.ErrUnsafeTreePath):
+		case errors.Is(err, basedelta.ErrIncompleteTree), errors.Is(err, basedelta.ErrUnsafeTreePath),
+			errors.Is(err, basedelta.ErrSymlinkEscape):
 			return finish(transferReasonIncompleteExport, err.Error())
 		case errors.Is(err, errTransferWorkspace):
 			return finish(transferReasonInputs+"workspace", err.Error())
@@ -427,7 +429,10 @@ func boundTransferDetail(s string) string {
 // defaultMergeCandidateTransferInputs reads the delta from the run's LOCAL
 // checkout, then materializes B' and H' with basedelta.MaterializeTree —
 // never `git archive`, so export-ignore cannot hide a package and symlinks are
-// kept (approval condition S0/S2). A first GitDelta failure that is a plain
+// kept (approval condition S0/S2). Every symlink of either tree whose resolved
+// target is, or contains, a delta or PR path then joins that list
+// (basedelta.ExpandSymlinkAliases), so an edit to a link's target is seen at
+// the link's path too. A first GitDelta failure that is a plain
 // git error gets one fetch-on-miss of the candidate (reviewsandbox.ExportTree,
 // whose export is discarded unread) and one retry: a forge-made merge commit
 // is not in the checkout until fetched.
@@ -448,17 +453,24 @@ func defaultMergeCandidateTransferInputs(ctx context.Context, workingDir, candid
 	}
 	cleanup := func() { _ = os.RemoveAll(root) }
 	var spaces []string
+	var links []map[string]string
 	for _, c := range []struct{ name, commit string }{{"base", delta.ToBase}, {"candidate", candidate}} {
 		dir := filepath.Join(root, c.name)
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("%w: %w", errTransferWorkspace, err)
 		}
-		if err := basedelta.MaterializeTree(ctx, workingDir, c.commit, dir); err != nil {
+		l, err := basedelta.MaterializeTreeLinks(ctx, workingDir, c.commit, dir)
+		if err != nil {
 			cleanup()
 			return nil, err
 		}
 		spaces = append(spaces, dir)
+		links = append(links, l)
+	}
+	if delta, err = basedelta.ExpandSymlinkAliases(delta, links...); err != nil {
+		cleanup()
+		return nil, err
 	}
 	return &mergeCandidateTransferInputs{Delta: delta, Workspaces: spaces, Cleanup: cleanup}, nil
 }
