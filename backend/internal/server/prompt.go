@@ -1697,6 +1697,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// fix-up prompt shows the agent the change it is amending. Sourced
 			// from the stage's newest redacted trace bundle (repo code only).
 			trigger.FixupPriorDiff, trigger.FixupPriorDiffFiles = s.resolveFixupPriorDiff(r.Context(), runRow.ID, stage.ID)
+			// The failed merge-candidate pass this fix-up answers (E86.8 /
+			// #4250): its recorded evidence, rendered enveloped as untrusted
+			// verify output. Nil (no section) when the fix-up answers none.
+			trigger.MergeCandidateFailure = s.resolveMergeCandidateFixupEvidence(r.Context(), runRow.ID, stage.ID)
 			// Emit the fix-up routing flag (#784): point the runner at the
 			// stage's existing PR branch so it takes the RebaseFromRemote
 			// same-branch path instead of `checkout -b <existing branch>`.
@@ -2522,6 +2526,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// derivation to the dispatch path so the rendered view matches the
 			// runner-facing prompt byte-for-byte.
 			trigger.FixupPriorDiff, trigger.FixupPriorDiffFiles = s.resolveFixupPriorDiff(r.Context(), runRow.ID, stage.ID)
+			// The failed merge-candidate pass's evidence (E86.8 / #4250), the
+			// same derivation as the dispatch path.
+			trigger.MergeCandidateFailure = s.resolveMergeCandidateFixupEvidence(r.Context(), runRow.ID, stage.ID)
 			// Emit the fix-up routing flag (#784) so the rendered prompt view
 			// and the runner-facing response stay byte-consistent. The SPA path
 			// is read-only and never drives a commit; the same derivation keeps
