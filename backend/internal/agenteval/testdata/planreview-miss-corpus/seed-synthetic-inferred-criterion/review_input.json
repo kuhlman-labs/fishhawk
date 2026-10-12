@@ -115,11 +115,24 @@
     "pagination is speculative",
     "page size is not in the issue",
     "cap is not in the issue",
-    "pagination is not in the issue"
+    "pagination is not in the issue",
+    "precedent, not a",
+    "precedent rather than",
+    "precedent and not",
+    "precedent is not a",
+    "precedent, which is not",
+    "cites no place",
+    "cites nowhere",
+    "does not cite where",
+    "fails the warrant"
   ],
   "attribution_phrases": [
     "paginates at 100",
     "100 items"
+  ],
+  "defect_phrases": [
+    "next_cursor",
+    "paginates at 100"
   ],
   "catching_examples": [
     {
@@ -131,6 +144,11 @@
       "severity": "medium",
       "category": "warrant",
       "note": "Pagination is scope creep the issue does not ask for; the criterion that GET /widgets paginates at 100 items should be dropped or sourced."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-list-pagination is inferred and introduces a specific value, a 100-item page size, that the issue never states. The issue asks only for `{\"items\": [...]}`. The plan's only support is that the sibling list endpoints use 100, which is precedent, not a requirement. The criterion is also marked blocking: true. Resolve by citing where 100 is required (a shared constant or documented API standard), or by dropping the criterion or making it non-blocking."
     }
   ],
   "non_catching_examples": [
@@ -187,6 +205,11 @@
       "severity": "low",
       "category": "scope",
       "note": "…paginate via the existing helper; a new one is not in the issue's style guide."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "ac-list-pagination has no verification. The test strategy covers tenant isolation, the 401 case and the response shape. It has no test for the 100-item cap, for next_cursor presence or absence, or for following a cursor across pages. The criterion also does not define cursor semantics, so 'paginates at 100 items' is hard to decide pass/fail. Resolve by adding a handler test that seeds more than 100 widgets for one tenant and asserts a 100-item first page, a next_cursor, and a second page with no overlap or gaps. Also state the expected cursor behaviour in the criterion."
     }
   ]
 }

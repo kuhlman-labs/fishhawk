@@ -107,6 +107,9 @@
     "gracefully",
     "retry handling is robust"
   ],
+  "defect_phrases": [
+    "webhook retry handling"
+  ],
   "catching_examples": [
     {
       "severity": "medium",

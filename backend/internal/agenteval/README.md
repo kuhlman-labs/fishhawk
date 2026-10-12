@@ -548,7 +548,8 @@ cannot answer.
 |---|---|
 | `planreviewcatch.go` | the catch corpus loader, the two arms, the attribution-AND-probe catch rule (`ClassifyCatch`, `ClassifyCatchTrial`), `RunCatchRateArm`, `CompareCatchRateArms`, the tolerance and the power floor |
 | `planreviewevidence.go` | the evidence record, its fingerprint, the pinned baseline, the trial sidecar, `RecordCatchRateEvidence`, `CheckCatchRateEvidence` |
-| `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`) |
+| `planreviewrescore.go` | the offline re-score of a recorded trial sidecar under the CURRENT corpus and catch rule (`RescoreCatchRateTrials`, `CatchRateRescore.Render`): a diagnostic per-arm lower bound that never writes (E55.22 / #4355) |
+| `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`), and its `--rescore` diagnostic |
 | `planreviewcatchlive_test.go` | the double-gated live measurement (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
 
@@ -575,15 +576,20 @@ switch that line in the same PR as its new evidence; a `recorded generator
 model ... is not the gate's model ...: re-measure` failure right after such a
 change means the gate line is stale, not the measurement.
 
-### Baseline status: first pinned 2026-10-10; re-pin required by E55.18 / #4253
+### Baseline status: re-pinned 2026-10-12; re-pin required by E55.22 / #4355
 
 The first pinned baseline was recorded on 2026-10-10 (`claude-sonnet-5-5`,
 six cases under the `planreview-catch-v2` probe-only rule: without
 conventions 80/138, with conventions 83/138, PASS). E55.18 / #4253 changed
 the catch rule (`planreview-catch-v3`, attribution-AND-probe), added six cases
-and introduced the trial sidecar, so that record is STALE and NOT COMPARABLE:
-`catchrategate` fails until an operator re-records with a `PIN_REASON` and
-commits the record and its sidecar together. The CURRENT pinned baseline is
+and introduced the trial sidecar; the 2026-10-12 recording re-pinned for it
+and the #4254 prompt fold-in (without 87/144, with 82/144, PASS). E55.22 /
+#4355 bumps the catch rule to `planreview-catch-v4` and replaces the
+plan-review prompt's corpus-echoing examples, so that record is STALE and its
+baseline NOT COMPARABLE: `catchrategate` fails until an operator re-records
+with a `PIN_REASON` and commits the record and its sidecar together (the
+offline re-score below previews what v4 makes of the 2026-10-12 sidecar). The
+CURRENT pinned baseline is
 whatever `evidence.json` carries — read its `baseline.pinned_at` and
 `baseline.reason`; the run-book's results table lists every recording.
 
@@ -611,13 +617,14 @@ hand-curated `review_input.json` beside its `miss.json`:
   "plan": { "plan_version": "standard_v1", "…": "a COMPLETE plan plan.Parse accepts" },
   "catch_probes": ["contradicts the issue", "another phrase only a catching concern uses"],
   "attribution_phrases": ["a substring of the planted criterion's statement only"],
+  "defect_phrases": ["the planted defect's own domain wording or value, as the issue or plan states it"],
   "catching_examples": [{"severity": "high", "category": "acceptance_criteria", "note": "ac-planted-id contradicts the issue: …"}],
   "non_catching_examples": [{"severity": "low", "category": "coverage", "note": "ac-planted-id needs a test for …"}]
 }
 ```
 
 **The catch rule (`matchCatchConcern`, pinned in `catchRuleVersion` =
-`planreview-catch-v3`).** A trial is CAUGHT only when ONE emitted concern
+`planreview-catch-v4`).** A trial is CAUGHT only when ONE emitted concern
 satisfies BOTH halves:
 
 - **Attribution** (`matchCatchAttribution`): the concern's `note` or
@@ -655,6 +662,43 @@ concern about a different, genuinely vague criterion as a catch of the
 planted one and inflate both arms toward a ceiling. Requiring the same
 concern to name the planted criterion is what keeps them discriminating.
 Remove the attribution half and these probes must go with it.
+
+**Catch rule v4: the prompt's own vocabulary (E55.22 / #4355).** Under v3,
+the 2026-10-12 sidecar's misses were almost all `attribution_without_probe`:
+the reviewer named the planted criterion and described the defect in the
+plan-review prompt's own words (criterion 8a "requires what the issue
+requires", criterion 9 "precedent, not a requirement" and "cites where that
+value is REQUIRED", criterion 10 "an executor could decide pass/fail",
+criterion 11 "restatements of the approach steps"), which no v3 probe
+covered. v4 adds those phrasings, POLARITY-BEARING and multi-word by
+preference: `requires the opposite`, `yet contradicts`, `contradict the
+issue` (contradicts-*); `precedent, not a`, `precedent rather than`,
+`cites no place`, `fails the warrant` (inferred-* and the rate-limit case);
+`is generic`, `generic preference` (rate limit); `no executor can decide`
+(untestable-reasonable-time, untestable-user-friendly);
+`restatement of approach` (restates-approach). The per-case list is
+`catchRuleV4AddedProbes` in `planreviewcatch_test.go`. A bare CLASS LABEL
+(`issue fidelity`, `warrant check`) is added only where the per-case re-score
+shows it is the sole matcher of a real catch; on the 2026-10-12 sidecar it
+never is, so v4 adds none. That matters because `ReviewConventionsFraming`
+(`backend/internal/prompt/prompt.go`, "Apply every review criterion above —
+issue fidelity and inferred-criterion warrant included") RE-PRIMES
+"issue fidelity" in the with arm only: with-arm concerns open with
+"Issue fidelity:" more often, so that label as a probe would lean toward the
+with arm. Each added catching example is a verbatim sidecar concern that
+scores MISSED under the v3 probes and CAUGHT under v4
+(`TestCatchRuleV4_NewCatchingExamplesMissUnderV3`, which reconstructs v3 as
+the case's probes minus the v4 additions and checks the pre-v4 examples still
+catch under it); each added non-catching example is a verbatim sidecar
+concern that names the planted criterion about the WRONG defect (a missing
+test, a scope gap: "ac-archive-rate-limit is blocking, but no approach step
+and no file in scope.files implements rate limiting…") and must stay a miss
+(mode j). **Polarity residual, stated:** a probe is a substring, not a
+parse, so a concern that names the planted criterion and NEGATES a probe
+("ac-x does not contradict the issue", "the rationale is not generic") still
+scores CAUGHT. The polarity-bearing phrasing narrows that; it does not
+eliminate it. v4's rates are also IN-SAMPLE for this probe set, which was
+tuned on the same sidecar (see the offline re-score below).
 
 **A generic objection word is never a probe on its own (#4253 fix-up).**
 Attribution does not save a word a reviewer uses to object to ANY aspect of
@@ -708,6 +752,35 @@ step verbatim as missed, and
 `TestCommittedCatchProbes_AbsentFromConventionsFixture` keeps every probe out
 of the conventions fixture, which only the with arm shows (it says "status
 code", for example, so no probe may).
+`TestCommittedCatchProbes_NotShownOnlyInTheWithArm` widens that to the WHOLE
+with-arm-only section (the heading, `ReviewConventionsFraming` and the
+fixture): a probe may occur in the with-arm render of a neutral,
+corpus-disjoint trigger only if it also occurs in the without-arm render.
+`inferred-criterion warrant` (framing only) would fail it; `issue fidelity`
+and `precedent, not a` pass, because criteria 8a and 9 render in both arms.
+
+**The plan-review prompt never shows a case's planted defect (mode r and the
+prompt-leak self-check, #4355).** Every case declares `defect_phrases`: the
+case-SPECIFIC content of the planted defect — domain nouns, values and
+wording from the planted criterion or the issue requirement it violates
+(`soft delete`, `removes the widget row`, `20 mb pdf`, `next_cursor`,
+`audit_events`, `inventory.go`) — never the class-level vocabulary the prompt
+legitimately teaches (`was written`, `robust`, `vague`). Choose them BEFORE
+reading the prompt: a phrase that turns out to occur in it is a leak to
+report and fix in `prompt.go`, never a phrase to drop.
+`TestCatchCorpus_NotLeakedIntoPlanReviewPrompt` renders a neutral trigger (a
+lighthouse lamp log, criterion id `lamp-rotation-recorded`) through
+`CatchRateArmPrompt` in BOTH arms, plus the generator system prompt, and
+fails naming the case, the needle and the surface when any case's planted
+criterion id or defect phrase occurs in them. Both sides are normalized
+(lower-case, `-` to a space, whitespace runs collapsed), so the declared
+`soft delete` matches prompt text reading `soft-delete`. Premises, asserted:
+the render carries criterion 8a and the criterion-id-in-note sentence (the
+acceptance-criteria block rendered, so the check is not vacuous), and the
+neutral trigger's own text carries no needle (so a hit is static prompt
+bytes). It is why the criterion 8a, criterion-id and criterion-9 examples are
+corpus-disjoint. Residual: it catches only what is declared; mode (r)'s
+grounding keeps a declared phrase honest, not complete.
 
 **An attribution phrase names the planted criterion and nothing else (mode
 p).** Each phrase must occur, case-folded, in a planted criterion's
@@ -735,7 +808,11 @@ name the planted criterion, (o) empty or blank `attribution_phrases`, (p) a
 phrase absent from every planted statement or present in another criterion's
 statement (the error names the case and the phrase), (q) a planted criterion
 id occurring, case-folded, inside another criterion id of the plan (a concern
-naming `ac-x-extended` would otherwise be attributed to `ac-x`).
+naming `ac-x-extended` would otherwise be attributed to `ac-x`), (r) empty or
+blank `defect_phrases`, or a defect phrase absent, case-folded, from the
+issue title, issue body and every plan key and value — a declared phrase must
+be the case's own content (#4355). Mode (r) applies to every case, including
+the cases persona arms add later (#4313).
 
 `synthetic` is NOT required: every `seed-synthetic-*` case carries
 `synthetic: true`, and a curated production case (`synthetic: false` with a
@@ -751,7 +828,7 @@ the recorded baseline.
 defect, the plan-review criterion it violates), `miss.json` (`synthetic:
 true`, class 3, disposition `paged`, unique placeholder run/artifact ids and
 `triage_sequence`, one miss whose `statement` is byte-identical to the plan
-criterion) and `review_input.json`. The loader enforces only modes (a)-(q);
+criterion) and `review_input.json`. The loader enforces only modes (a)-(r);
 the E55.18 / #4253 seeds also follow a stricter convention worth keeping: at
 least two catching examples naming the planted id, one id-free catching
 example attributed by a phrase, and at least four non-catching examples
@@ -1040,7 +1117,10 @@ pinned-baseline rule, the 136-trial floor and its derivation), on stdout for
 a pass and on stderr otherwise, so `--print-fingerprint`'s stdout stays the
 bare digest.
 `--print-fingerprint` prints the current fingerprint so an operator can confirm
-staleness against the record's `prompt_fingerprint`. Defaults resolve to the
+staleness against the record's `prompt_fingerprint`. `--rescore` runs the
+offline re-score below (exit 0, report on stdout, the rule line on stderr,
+never `catchrategate: PASS`; exit 1 when it cannot re-score); it is mutually
+exclusive with `--print-fingerprint` (exit 2). Defaults resolve to the
 committed testdata paths under the backend module root, found by walking up
 from the working directory. It makes no model call and opens no network.
 
@@ -1052,6 +1132,53 @@ agenteval's OWN testdata, never shipped, and is only ever `go run` by
 keeps the `internal/` import, the default testdata paths and the trigger list
 (`backend/internal/agenteval/catchrategate/`) in one place, and keeps
 `backend/cmd/` to binaries an operator or user runs directly.
+
+### The offline re-score (`--rescore`, E55.22 / #4355)
+
+`RescoreCatchRateTrials` (`planreviewrescore.go`) reads a recorded
+`evidence.trials.json` and re-classifies every stored trial under the
+CURRENT corpus (loaded by `LoadPlanReviewCatchCorpus`, so every loader mode
+applies) and the current catch rule, with no model call. Run it before paying
+for a recording, to see what a probe or rule change makes of the last one:
+
+```sh
+(cd backend && go run ./internal/agenteval/catchrategate --rescore)
+```
+
+- **One classifier.** A decodable trial's stored concerns are re-wrapped as a
+  verdict and passed to `ClassifyCatchTrial`, so outcome, matched probe,
+  attribution and near-miss tags come from the measurement's own code. An
+  undecodable trial stays undecodable; its `response_excerpt` is never
+  re-parsed.
+- **A per-arm LOWER BOUND.** Notes are truncated at `note_max_runes`, at most
+  `max_concerns_per_trial` concerns are stored, and a caught trial stores only
+  its matching concern. Matching is a substring test, so missing text can
+  only remove a match: each arm's re-scored rate can under-count, never
+  over-count. The ARM DELTA is not a bound (the arms' under-counts need not
+  be equal). Trials whose stored record is incomplete are counted as
+  lower-bound trials.
+- **Attribution-only beside the rate.** The report prints, per arm, the share
+  of decodable trials in which some stored concern names the planted
+  criterion whatever its probe: the ceiling any probe set can reach on those
+  concerns. A re-scored rate within 0.03 of it is flagged AT CEILING (#4361):
+  the probe half then rejects almost nothing the attribution half accepts.
+- **In-sample.** A re-scored rate is in-sample for any probe set tuned on the
+  same sidecar (v4's was); only a fresh recording measures out of sample.
+- **Never writes, never a verdict.** It writes nothing, and
+  `CheckCatchRateEvidence` never reads it; `scripts/check-review-prompt-eval`
+  runs `catchrategate` with no flags, so the re-score cannot stand in for a
+  recording. It fails closed on an absent sidecar, malformed JSON, an unknown
+  field or trailing content, a wrong schema, an outcome outside
+  `caught|missed|undecodable`, or an unavailable corpus. A sidecar case absent
+  from the corpus (unscored) or a corpus case absent from the sidecar (not
+  recorded) is reported, not fatal.
+- **An arm table.** It iterates arms from a table and returns every
+  re-scored trial with its near-miss tags, so a later named arm
+  (#4313 / #4314) and a per-trial classifier (#4350) can reuse it.
+
+The v3 → v4 re-score of the 2026-10-12 sidecar, per case and arm, is recorded
+in [`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md)
+§ "Offline re-score: catch rule v3 → v4".
 
 ---
 
@@ -1097,8 +1224,9 @@ FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run 'TestSeverityCalibrationLive|TestAdversarialRetentionLive' ./backend/internal/agenteval/
 
 # Offline plan-review catch-rate harness + evidence gate (no model call):
-scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestClassifyCatch|TestRunCatchRateArm|TestCompareCatchRateArms|TestMinCatchRateTrials|TestCheckCatchRateEvidence|TestRecordCatchRateEvidence|TestREADMEMinimalCatchRateEvidence' ./backend/internal/agenteval/
+scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestCatchCorpus|TestCommittedCatch|TestCatchRuleV4|TestRescoreCatchRateTrials|TestClassifyCatch|TestRunCatchRateArm|TestCompareCatchRateArms|TestMinCatchRateTrials|TestCheckCatchRateEvidence|TestRecordCatchRateEvidence|TestREADMEMinimalCatchRateEvidence' ./backend/internal/agenteval/
 (cd backend && go run ./internal/agenteval/catchrategate)
+(cd backend && go run ./internal/agenteval/catchrategate --rescore)   # diagnostic lower bound, never a PASS
 
 # Live plan-review catch-rate arms (opt-in; makes real model calls; dry run unless RECORD=1):
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \

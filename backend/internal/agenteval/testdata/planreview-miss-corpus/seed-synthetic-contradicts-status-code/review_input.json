@@ -112,10 +112,28 @@
     "rather than 409",
     "contrary to the issue",
     "at odds with the issue",
-    "specifies 409"
+    "specifies 409",
+    "requires the opposite",
+    "says the opposite",
+    "yet contradicts",
+    "yet conflicts",
+    "but contradicts",
+    "directly contradicts",
+    "contradicts both the issue",
+    "conflicts directly with",
+    "contradicts the originating issue",
+    "contradicts that issue",
+    "contradict the issue",
+    "conflict with the issue",
+    "nothing in the issue permits",
+    "contradict the stated requirement"
   ],
   "attribution_phrases": [
     "already uses"
+  ],
+  "defect_phrases": [
+    "duplicate_name",
+    "409 conflict"
   ],
   "catching_examples": [
     {
@@ -132,6 +150,11 @@
       "severity": "high",
       "category": "acceptance_criteria",
       "note": "The criterion for a name another widget already uses expects 400 with duplicate_name, which is at odds with the issue's 409 Conflict."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-create-duplicate-400 requires HTTP 400 with error code duplicate_name, but the issue explicitly requires `409 Conflict` with error code `duplicate_name`. The criterion cites example-org/widgets-service#108 as an explicit source yet contradicts it. Plan step 3 repeats the mistake by mapping store.ErrDuplicateName to HTTP 400 'matching the validation errors'. Resolve by changing the criterion and step 3 to HTTP 409 and asserting 409 in the handler test."
     }
   ],
   "non_catching_examples": [
@@ -163,6 +186,11 @@
     {
       "category": "risk",
       "note": "Detecting a name another widget already uses by a string compare is unjustified when the unique index enforces it; the issue says names compare case-insensitively, so a collation mismatch could diverge from the index."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "The handler tests cover duplicate, cross-tenant and empty-name cases. The plan does not say whether they run against a real database or a mocked store. Criteria ac-create-duplicate-400 and ac-create-case-insensitive depend on the real unique index on (tenant_id, lower(name)) and on pgcode 23505 mapping. They are only exercised end-to-end if at least one test goes from the HTTP handler through the real store to the database. The plan should state this. Also, ac-create-unique-201 (the plain success case) has no test listed in the strategy."
     }
   ]
 }
