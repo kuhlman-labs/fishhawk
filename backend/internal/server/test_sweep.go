@@ -199,6 +199,16 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 		Generator:     testSweepGeneratorSyncSchemas,
 	},
 	{
+		// specialist-job-*.schema.json case arm (ADR-097 D2 / #4300): backend
+		// only — fishhawkd validates both the request and the runner's
+		// completion; the runner's structs are pinned by the wirecontract
+		// manifest and the shared golden, not an embedded copy.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/specialist-job-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/specialistjob/schemas/specialist-job-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
 		// grooming-report-*.schema.json case arm: backend only.
 		Rule:          testSweepRuleGeneratedSurface,
 		TriggerGlob:   "docs/spec/grooming-report-v1.schema.json",

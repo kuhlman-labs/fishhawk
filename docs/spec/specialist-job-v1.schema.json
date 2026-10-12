@@ -1,0 +1,1696 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/specialist-job-v1.schema.json",
+  "title": "Fishhawk specialist job (specialist-job-v1)",
+  "description": "The ADR-097 D2/D6 specialist-job contract (#4300): the request a seat files, the completion the runner ships, and the typed result fishhawkd composes. A standalone contract with its own Go package (backend/internal/specialistjob); it is not the plan schema and never reaches the structured-output derivation. Every object closes with additionalProperties:false and every list and string is bounded. Inputs are closed per kind and carry no free-form shell. SCHEMA-ONLY VALIDATION IS NOT SUFFICIENT: the repo-relative path rules, the counterfactual control_path rules, the exactly-one mutation form rule, the duplicate-member refusal and the completion/job kind cross-check are enforced ONLY by specialistjob.ParseRequest / ParseCompletion. The root validates any one of the three documents; consumers validate against the specific $def.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/completion"
+    },
+    {
+      "$ref": "#/$defs/result"
+    }
+  ],
+  "$defs": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "counterfactual_battery",
+        "fanin_build",
+        "overlap_scan",
+        "plan_crosscheck",
+        "inventory",
+        "draft"
+      ],
+      "description": "The closed specialist-job kind set (ADR-097 D2). draft is rendered in-process by fishhawkd at request time; every other kind is executed by `fishhawk-runner specialist-job` in a fresh scratch clone."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "inconclusive"
+      ],
+      "description": "The job verdict. fail means the observed evidence contradicts an expectation the requester declared; inconclusive means the executor could not decide (timeout, error, unresolvable SHA, unregistered kind)."
+    },
+    "seat": {
+      "type": "string",
+      "enum": [
+        "operator",
+        "first_officer"
+      ],
+      "description": "The requesting seat (ADR-089). fishhawkd derives it from the authenticated identity; it is never read from a request body."
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "A full 40-hex lowercase git commit SHA."
+    },
+    "repo-path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "A repo-relative, forward-slash path. The Go layer (specialistjob.ParseRequest) additionally refuses an absolute path, a `..` segment, a backslash and a leading `-` with ErrInvalidRepoPath; the schema alone does not."
+    },
+    "package-path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "A repo-relative Go package path, e.g. `./backend/internal/plan` or `./backend/internal/plan/...`. The Go layer additionally refuses an absolute path, a `..` segment and a leading `-` (flag injection into go test / go list) with ErrInvalidPackagePath."
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What the job is about. At least one member. The request def's if/then arms require head_sha for every kind except draft.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The run the job is about. When set, both audit rows land on that run's chain."
+        },
+        "campaign_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The campaign the job is about."
+        },
+        "head_sha": {
+          "$ref": "#/$defs/sha",
+          "description": "The commit the job executes against. Required for every runner-executed kind; optional for draft."
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+          "description": "owner/name of the repository the subject belongs to."
+        }
+      },
+      "minProperties": 1
+    },
+    "run-ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A run named by its id plus the commit range its diff spans (base_sha..head_sha).",
+      "required": [
+        "run_id",
+        "head_sha",
+        "base_sha"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "base_sha": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "battery-mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One counterfactual: the exact field set of plan-standard-v1 $defs.counterfactual (pinned by TestBatteryMutationShapeMatchesPlanCounterfactual) with bounds added. Executed by the E85.3 counterfactual executor.",
+      "required": [
+        "control_path",
+        "mutation",
+        "tests",
+        "expect"
+      ],
+      "properties": {
+        "control_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Repo-relative path of the production file holding the control. Same rules as plan-standard-v1 counterfactual.control_path: the Go layer refuses whitespace-only, absolute, `..`, backslash and `_test.go` with ErrInvalidControlPath."
+        },
+        "mutation": {
+          "$ref": "#/$defs/battery-mutation-form"
+        },
+        "tests": {
+          "$ref": "#/$defs/battery-tests"
+        },
+        "expect": {
+          "type": "string",
+          "enum": [
+            "red"
+          ],
+          "description": "Only `red` is defined: the named tests must FAIL with the control mutated."
+        }
+      }
+    },
+    "battery-mutation-form": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly ONE form: find + replace, or patch. The exactly-one-form rule is enforced by the Go layer (ErrInvalidMutationForm), not the schema: both forms, neither, find without replace, replace without find and replace equal to find are refused.",
+      "properties": {
+        "find": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "replace": {
+          "type": "string",
+          "maxLength": 8192
+        },
+        "patch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        }
+      }
+    },
+    "battery-tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The Go tests the executor runs (`go test -json -count=1 -run <run> <package>`), on the unmutated head (the baseline, which must pass) and with the mutation applied.",
+      "required": [
+        "run",
+        "package"
+      ],
+      "properties": {
+        "run": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "The go test -run selector."
+        },
+        "package": {
+          "$ref": "#/$defs/package-path"
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly one structured probe. No free-form shell: every probe is a closed, runner-observed check.",
+      "properties": {
+        "path_exists": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Passes when the path exists at subject.head_sha.",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/repo-path"
+            }
+          }
+        },
+        "file_contains": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Passes when the file exists at subject.head_sha and contains the literal (a byte substring, not a pattern).",
+          "required": [
+            "path",
+            "literal"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/repo-path"
+            },
+            "literal": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        },
+        "go_test": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Passes when the named tests pass at subject.head_sha, run in their own freshly materialized scratch clone through the gate exec seam under the verify lock.",
+          "required": [
+            "tests"
+          ],
+          "properties": {
+            "tests": {
+              "$ref": "#/$defs/battery-tests"
+            }
+          }
+        }
+      },
+      "minProperties": 1,
+      "maxProperties": 1
+    },
+    "probe-question": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A structured question: a probe plus its expected outcome.",
+      "required": [
+        "id",
+        "question",
+        "probe",
+        "expect"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9_-]*$",
+          "description": "Stable id the evidence keys its observation by."
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "The human-readable question the probe answers. Recorded, never executed."
+        },
+        "probe": {
+          "$ref": "#/$defs/probe"
+        },
+        "expect": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail"
+          ],
+          "description": "The expected probe outcome: pass when the proposition holds (the path exists, the file contains the literal, the tests pass), fail when it must not."
+        }
+      }
+    },
+    "inputs-counterfactual_battery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "counterfactual_battery inputs: at least one mutation or probe.",
+      "properties": {
+        "mutations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/battery-mutation"
+          }
+        },
+        "probes": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/probe-question"
+          },
+          "description": "Missing-control probes."
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "mutations"
+          ],
+          "properties": {
+            "mutations": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "required": [
+            "probes"
+          ],
+          "properties": {
+            "probes": {
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    },
+    "inputs-plan_crosscheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "plan_crosscheck inputs: at least one question or focus file.",
+      "properties": {
+        "questions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/probe-question"
+          }
+        },
+        "focus_files": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "expect"
+            ],
+            "properties": {
+              "path": {
+                "$ref": "#/$defs/repo-path"
+              },
+              "expect": {
+                "type": "string",
+                "enum": [
+                  "present",
+                  "absent"
+                ]
+              }
+            }
+          }
+        },
+        "compare_runs": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/run-ref"
+          },
+          "description": "Runs whose diff is intersected with the focus files."
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "questions"
+          ],
+          "properties": {
+            "questions": {
+              "minItems": 1
+            }
+          }
+        },
+        {
+          "required": [
+            "focus_files"
+          ],
+          "properties": {
+            "focus_files": {
+              "minItems": 1
+            }
+          }
+        }
+      ]
+    },
+    "inputs-overlap_scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "overlap_scan inputs.",
+      "required": [
+        "runs"
+      ],
+      "properties": {
+        "runs": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/run-ref"
+          }
+        },
+        "watch_paths": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "A path.Match glob over repo-relative changed paths."
+          }
+        }
+      }
+    },
+    "inputs-fanin_build": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "fanin_build inputs: slices merged in order onto subject.head_sha in a scratch clone, then the packages tested.",
+      "required": [
+        "slices",
+        "packages"
+      ],
+      "properties": {
+        "slices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "head_sha"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._/-]*$"
+              },
+              "head_sha": {
+                "$ref": "#/$defs/sha"
+              }
+            }
+          }
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/package-path"
+          }
+        }
+      }
+    },
+    "inputs-inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "inventory inputs.",
+      "required": [
+        "command",
+        "args"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "enum": [
+            "git_log",
+            "ls_files",
+            "go_list"
+          ],
+          "description": "A closed command id; the runner maps it to a fixed argv. No free-form shell."
+        },
+        "args": {
+          "type": "object",
+          "description": "Per-command arguments, selected by command via the if/then arms."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "git_log"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "args": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "max_count"
+                ],
+                "properties": {
+                  "paths": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "$ref": "#/$defs/repo-path"
+                    }
+                  },
+                  "max_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "ls_files"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "args": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "max_entries"
+                ],
+                "properties": {
+                  "pathspec": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "$ref": "#/$defs/repo-path"
+                    }
+                  },
+                  "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2000
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "go_list"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "args": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "packages"
+                ],
+                "properties": {
+                  "packages": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": {
+                      "$ref": "#/$defs/package-path"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "inputs-draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "draft inputs: rendered by specialistjob.RenderDraft into a deterministic markdown skeleton. Model-free.",
+      "required": [
+        "document_kind",
+        "title"
+      ],
+      "properties": {
+        "document_kind": {
+          "type": "string",
+          "enum": [
+            "adr",
+            "issue"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "brief": {
+          "type": "string",
+          "maxLength": 8192
+        },
+        "outline": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "heading"
+            ],
+            "properties": {
+              "heading": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 8192
+              }
+            }
+          }
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /v0/specialist-jobs body. There is deliberately NO requester member: the requester is derived server-side from the authenticated identity, so a body naming one is refused by additionalProperties:false.",
+      "required": [
+        "schema_version",
+        "kind",
+        "subject",
+        "inputs"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "specialist-job-v1"
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "subject": {
+          "$ref": "#/$defs/subject"
+        },
+        "inputs": {
+          "type": "object",
+          "description": "Per-kind inputs, selected by kind via the if/then arms."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "counterfactual_battery"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-counterfactual_battery"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "fanin_build"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-fanin_build"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "overlap_scan"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-overlap_scan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "plan_crosscheck"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-plan_crosscheck"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "inventory"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-inventory"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "draft"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/inputs-draft"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "counterfactual_battery",
+                  "fanin_build",
+                  "overlap_scan",
+                  "plan_crosscheck",
+                  "inventory"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "subject": {
+                "required": [
+                  "head_sha"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "probe-evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "observed",
+        "expected",
+        "matched"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9_-]*$"
+        },
+        "observed": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "error"
+          ]
+        },
+        "expected": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "matched": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "A snake_case reason token from the executor's closed vocabulary (for a battery mutation, the E85.3 counterfactual reason set). Empty is expressed by omitting the member."
+        }
+      }
+    },
+    "evidence-counterfactual_battery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-mutation red/green observation (E85.3 vocabulary) plus the mutation diff hash, and per-probe observations.",
+      "required": [
+        "mutations",
+        "probes"
+      ],
+      "properties": {
+        "mutations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "control_path",
+              "observed",
+              "baseline",
+              "mutation_sha256"
+            ],
+            "properties": {
+              "control_path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "observed": {
+                "type": "string",
+                "enum": [
+                  "red",
+                  "green",
+                  "timeout",
+                  "error"
+                ]
+              },
+              "baseline": {
+                "type": "string",
+                "enum": [
+                  "red",
+                  "green",
+                  "timeout",
+                  "error",
+                  "skipped"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$",
+                "description": "A snake_case reason token from the executor's closed vocabulary (for a battery mutation, the E85.3 counterfactual reason set). Empty is expressed by omitting the member."
+              },
+              "mutation_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "probes": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/probe-evidence"
+          }
+        }
+      }
+    },
+    "evidence-overlap_scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs",
+        "overlaps",
+        "watch_hits"
+      ],
+      "properties": {
+        "runs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "run_id",
+              "resolved",
+              "changed_files",
+              "truncated"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "resolved": {
+                "type": "boolean"
+              },
+              "changed_files": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "overlaps": {
+          "type": "array",
+          "maxItems": 120,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "run_a",
+              "run_b",
+              "paths",
+              "truncated"
+            ],
+            "properties": {
+              "run_a": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "run_b": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "paths": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "watch_hits": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "run_id",
+              "watch_path",
+              "paths"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "watch_path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "paths": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "evidence-fanin_build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slices",
+        "packages"
+      ],
+      "properties": {
+        "slices": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "head_sha",
+              "outcome",
+              "conflict_paths"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "head_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "merged",
+                  "conflict",
+                  "error"
+                ]
+              },
+              "conflict_paths": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            }
+          }
+        },
+        "packages": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "package",
+              "outcome"
+            ],
+            "properties": {
+              "package": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "pass",
+                  "fail",
+                  "timeout",
+                  "error",
+                  "skipped"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_]*$",
+                "description": "A snake_case reason token from the executor's closed vocabulary (for a battery mutation, the E85.3 counterfactual reason set). Empty is expressed by omitting the member."
+              }
+            }
+          }
+        }
+      }
+    },
+    "evidence-plan_crosscheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "questions",
+        "focus_files",
+        "compare_runs"
+      ],
+      "properties": {
+        "questions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/probe-evidence"
+          }
+        },
+        "focus_files": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "expect",
+              "observed",
+              "matched",
+              "touched_by"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "expect": {
+                "type": "string",
+                "enum": [
+                  "present",
+                  "absent"
+                ]
+              },
+              "observed": {
+                "type": "string",
+                "enum": [
+                  "present",
+                  "absent",
+                  "error"
+                ]
+              },
+              "matched": {
+                "type": "boolean"
+              },
+              "touched_by": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "compare_runs": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "run_id",
+              "resolved",
+              "overlap_paths"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "resolved": {
+                "type": "boolean"
+              },
+              "overlap_paths": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "evidence-inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "lines",
+        "truncated",
+        "exit_code"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "enum": [
+            "git_log",
+            "ls_files",
+            "go_list"
+          ]
+        },
+        "lines": {
+          "type": "array",
+          "maxItems": 2000,
+          "items": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "exit_code": {
+          "type": "integer"
+        }
+      }
+    },
+    "evidence-draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32768
+        }
+      }
+    },
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /v0/specialist-jobs/{job_id}/result body, written by the runner. evidence may be absent ONLY on verdict inconclusive with a reason. specialistjob.ParseCompletion additionally refuses a kind that differs from the stored job's kind (ErrKindMismatch).",
+      "required": [
+        "schema_version",
+        "execution_nonce",
+        "kind",
+        "verdict",
+        "duration_ms"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "specialist-job-v1"
+        },
+        "execution_nonce": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "kind_not_executable",
+            "not_runnable",
+            "admission_timeout",
+            "materialize_failed",
+            "unresolvable_sha",
+            "execution_error",
+            "timeout",
+            "probe_error",
+            "inputs_invalid"
+          ],
+          "description": "Closed reason vocabulary. Required when evidence is absent."
+        },
+        "evidence": {
+          "type": "object",
+          "description": "Per-kind evidence, selected by kind via the if/then arms."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "counterfactual_battery"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-counterfactual_battery"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "fanin_build"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-fanin_build"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "overlap_scan"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-overlap_scan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "plan_crosscheck"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-plan_crosscheck"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "inventory"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-inventory"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "draft"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-draft"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "evidence"
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "verdict": {
+                "const": "inconclusive"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "requester": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Server-derived from the authenticated identity; never read from a request body.",
+      "required": [
+        "seat",
+        "actor_kind",
+        "subject"
+      ],
+      "properties": {
+        "seat": {
+          "$ref": "#/$defs/seat"
+        },
+        "actor_kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-z][a-z_]*$",
+          "description": "The authenticated identity's actor kind (a delegated operator-agent token is `agent`)."
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The authenticated identity's subject."
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The server-composed typed result: the completion's verdict and evidence joined with the job's stored requester, subject and charge. Never accepted from a client.",
+      "required": [
+        "job_id",
+        "kind",
+        "requester",
+        "subject",
+        "verdict",
+        "charged_to",
+        "duration_ms"
+      ],
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "requester": {
+          "$ref": "#/$defs/requester"
+        },
+        "subject": {
+          "$ref": "#/$defs/subject"
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "kind_not_executable",
+            "not_runnable",
+            "admission_timeout",
+            "materialize_failed",
+            "unresolvable_sha",
+            "execution_error",
+            "timeout",
+            "probe_error",
+            "inputs_invalid"
+          ]
+        },
+        "evidence": {
+          "type": "object"
+        },
+        "charged_to": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The seat (and identity subject) the job's cost is charged to: the requester's.",
+          "required": [
+            "seat",
+            "subject"
+          ],
+          "properties": {
+            "seat": {
+              "$ref": "#/$defs/seat"
+            },
+            "subject": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "counterfactual_battery"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-counterfactual_battery"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "fanin_build"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-fanin_build"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "overlap_scan"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-overlap_scan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "plan_crosscheck"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-plan_crosscheck"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "inventory"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-inventory"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "draft"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "$ref": "#/$defs/evidence-draft"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "required": [
+                "evidence"
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "verdict": {
+                "const": "inconclusive"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
