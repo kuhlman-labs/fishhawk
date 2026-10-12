@@ -62,7 +62,9 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -91,8 +93,26 @@ const (
 	// both halves.
 	CatchMissed CatchOutcome = "missed"
 	// CatchUndecodable means the response carried no decodable verdict. Scored
-	// as a MISS; reported separately.
+	// as a MISS on a catch case and as a FALSE ALARM on a clean case (the
+	// fail-safe direction in both); reported separately.
 	CatchUndecodable CatchOutcome = "undecodable"
+	// CatchFalseAlarm means a CLEAN rule's verdict decoded and some concern
+	// satisfied the rule's category predicate (catch rule v5, #4313).
+	CatchFalseAlarm CatchOutcome = "false_alarm"
+	// CatchNoFalseAlarm means a CLEAN rule's verdict decoded and no concern
+	// satisfied the category predicate.
+	CatchNoFalseAlarm CatchOutcome = "no_false_alarm"
+)
+
+// The two expectation classes a case belongs to (catch rule v5, #4313). An
+// empty Expect on recorded counts is a catch case (every v4 case).
+const (
+	// CatchExpectCatch is a case with a planted defect the reviewer should
+	// catch: scored caught / missed / undecodable.
+	CatchExpectCatch = "catch"
+	// CatchExpectClean is a conforming case with nothing to catch: scored
+	// false_alarm / no_false_alarm / undecodable.
+	CatchExpectClean = "clean"
 )
 
 const (
@@ -123,7 +143,7 @@ const (
 	// matchCatchProbe changes meaning: it is folded into the evidence
 	// fingerprint, so a bump makes a recorded measurement stale instead of
 	// silently re-scoring it under new rules.
-	catchRuleVersion = "planreview-catch-v4: a trial is caught when the response decodes (extract first '{'..last '}', " +
+	catchRuleVersion = "planreview-catch-v5: a trial is caught when the response decodes (extract first '{'..last '}', " +
 		"verdict one of approve|approve_with_concerns|reject) and ONE concern satisfies both halves: its note OR category " +
 		"contains a planted criterion id (miss.json criterion_id) or a declared attribution phrase, AND its note OR " +
 		"category contains some catch probe, each as a case-folded (strings.ToLower) substring; an undecodable response " +
@@ -131,7 +151,13 @@ const (
 		"(loader mode m); each attribution phrase occurs case-folded in a planted criterion's statement and in no other " +
 		"criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q); " +
 		"each case declares at least one non-blank defect phrase occurring case-folded in its issue or plan text (loader mode r); " +
-		"v4 widens the per-case probes with the plan-review prompt's own vocabulary (#4355)"
+		"v4 widens the per-case probes with the plan-review prompt's own vocabulary (#4355); " +
+		"v5 adds three per-rule options (#4313): a category predicate (the matching concern's trimmed, case-folded " +
+		"category must equal the rule's category), an approach-step anchor (attribution kind step: a word-bounded " +
+		"'step N' in the note, not followed by a digit, checked after the criterion id and before the attribution " +
+		"phrases), and a clean kind (a decoded trial is false_alarm when any concern satisfies the category predicate, " +
+		"no_false_alarm otherwise; an undecodable trial counts toward the false-alarm rate); a rule declaring none of " +
+		"them classifies exactly as v4"
 )
 
 // The two attribution kinds a caught trial records: which half of the
@@ -144,6 +170,10 @@ const (
 	// CatchAttributionPhrase means the matching concern named no planted id
 	// but carried one of the case's declared attribution_phrases.
 	CatchAttributionPhrase = "phrase"
+	// CatchAttributionStep means the matching concern named no planted id but
+	// named the rule's anchored approach step ("step N", word-bounded; catch
+	// rule v5). It is checked after the id and before the phrases.
+	CatchAttributionStep = "step"
 )
 
 // The near-miss tags a missed trial's concerns carry.
@@ -233,11 +263,25 @@ type PlanReviewCatchCase struct {
 }
 
 // CatchRule is the per-case input to the catch classifier: the probe half
-// (Probes) and the attribution half (CriterionIDs, AttributionPhrases).
+// (Probes) and the attribution half (CriterionIDs, AnchorStep,
+// AttributionPhrases), plus catch rule v5's per-rule options (#4313). A rule
+// whose Category is empty, AnchorStep is 0 and Clean is false classifies
+// exactly as v4 (TestCatchRuleV5_InertOnV4Rules).
 type CatchRule struct {
 	Probes             []string
 	CriterionIDs       []string
 	AttributionPhrases []string
+	// Category, when non-empty, is the category predicate: a concern counts
+	// (as a catch, or as a clean case's false alarm) only when its trimmed
+	// category equals Category case-insensitively. Empty = no predicate.
+	Category string
+	// AnchorStep, when > 0, attributes a concern whose note names the anchored
+	// approach step ("step N", word-bounded; CatchAttributionStep).
+	AnchorStep int
+	// Clean marks a clean case: a decoded trial is CatchFalseAlarm when any
+	// concern satisfies the category predicate, CatchNoFalseAlarm otherwise.
+	// The probe and attribution halves are not consulted.
+	Clean bool
 }
 
 // CatchRule returns the case's catch rule: its probes, its planted criterion
@@ -507,12 +551,16 @@ func catchShownText(in PlanReviewCatchInput) (string, error) {
 	return strings.ToLower(strings.Join(parts, "\n")), nil
 }
 
-// matchCatchConcern is THE catch matcher, shared by ClassifyCatchTrial and the
-// loader's mode (k): ONE concern catches only when it satisfies the
-// attribution half (matchCatchAttribution) AND the probe half
+// matchCatchConcern is THE catch matcher, shared by classifyCatchConcerns and
+// the loaders' mode (k): ONE concern catches only when it satisfies the
+// category predicate (matchCatchCategory; always true for a rule without a
+// Category), the attribution half (matchCatchAttribution) AND the probe half
 // (matchCatchProbe). It returns the matched probe and the attribution kind.
 // Changing its meaning requires a catchRuleVersion bump.
 func matchCatchConcern(category, note string, rule CatchRule) (probe, attribution string, ok bool) {
+	if !matchCatchCategory(category, rule) {
+		return "", "", false
+	}
 	attribution, attributed := matchCatchAttribution(category, note, rule)
 	if !attributed {
 		return "", "", false
@@ -524,19 +572,53 @@ func matchCatchConcern(category, note string, rule CatchRule) (probe, attributio
 	return probe, attribution, true
 }
 
+// matchCatchCategory is catch rule v5's category predicate: true when the rule
+// declares no Category, else when the concern's trimmed category equals it
+// case-insensitively. Changing its meaning requires a catchRuleVersion bump.
+func matchCatchCategory(category string, rule CatchRule) bool {
+	want := strings.TrimSpace(rule.Category)
+	if want == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(category), want)
+}
+
 // matchCatchAttribution is the attribution half of the rule: CatchAttributionID
 // when some planted criterion id occurs as a case-folded substring of the
-// concern's note or category, else CatchAttributionPhrase when some declared
-// attribution phrase does. The id is checked first, so the recorded share of
-// id-attributed catches counts every catch that named the id.
+// concern's note or category, else CatchAttributionStep when the rule anchors
+// an approach step and the note names it (matchCatchStep), else
+// CatchAttributionPhrase when some declared attribution phrase occurs. The id
+// is checked first, so the recorded share of id-attributed catches counts
+// every catch that named the id.
 func matchCatchAttribution(category, note string, rule CatchRule) (string, bool) {
 	if _, ok := matchCatchProbe(category, note, rule.CriterionIDs); ok {
 		return CatchAttributionID, true
+	}
+	if rule.AnchorStep > 0 && matchCatchStep(note, rule.AnchorStep) {
+		return CatchAttributionStep, true
 	}
 	if _, ok := matchCatchProbe(category, note, rule.AttributionPhrases); ok {
 		return CatchAttributionPhrase, true
 	}
 	return "", false
+}
+
+// catchStepRe finds "step" as a whole word followed by whitespace and a
+// number. The number is captured whole, so "step 31" yields 31 and never
+// attributes step 3.
+var catchStepRe = regexp.MustCompile(`(?i)\bstep\s+(\d+)`)
+
+// matchCatchStep reports whether note names approach step n as a word-bounded
+// "step N" ("step 3", "Step 3:", "approach step 3"); "step 31", "step 13" and
+// "substep 3" do not name step 3. Changing its meaning requires a
+// catchRuleVersion bump.
+func matchCatchStep(note string, n int) bool {
+	for _, m := range catchStepRe.FindAllStringSubmatch(note, -1) {
+		if v, err := strconv.Atoi(m[1]); err == nil && v == n {
+			return true
+		}
+	}
+	return false
 }
 
 // matchCatchProbe is the case-folded substring test both halves use, and the
@@ -649,12 +731,18 @@ type planReviewEmittedVerdict struct {
 // CatchTrialConcern is one decoded reviewer concern of a trial. NearMiss is
 // set only on a MISSED trial's concerns (NearMissProbeWithoutAttribution,
 // NearMissAttributionWithoutProbe, or empty when the concern matched neither
-// half).
+// half). SeverityClampedFrom, QuoteUnverified and DocumentRef are set only by
+// the persona arm (ClassifyPersonaTrial), which stores each concern AFTER the
+// production persona-ingest controls: Severity is then the post-control
+// severity, SeverityClampedFrom the severity a control lowered it from.
 type CatchTrialConcern struct {
-	Severity string
-	Category string
-	Note     string
-	NearMiss string
+	Severity            string
+	SeverityClampedFrom string
+	QuoteUnverified     bool
+	DocumentRef         string
+	Category            string
+	Note                string
+	NearMiss            string
 }
 
 // CatchTrial is the classification of one reviewer response, with what the
@@ -684,11 +772,9 @@ func ClassifyCatch(responseText string, rule CatchRule) CatchOutcome {
 
 // ClassifyCatchTrial classifies one reviewer response against a case's catch
 // rule: CatchUndecodable when no verdict decodes (no JSON object, malformed
-// JSON, or a verdict outside approve|approve_with_concerns|reject);
-// CatchCaught when ONE concern satisfies both the attribution half and the
-// probe half (matchCatchConcern) — the first such concern is the trial's
-// matching concern; CatchMissed otherwise, including a decoded verdict whose
-// concerns match only one half each, with every concern near-miss tagged.
+// JSON, or a verdict outside approve|approve_with_concerns|reject); otherwise
+// the decoded concerns go to classifyCatchConcerns, the ONE matcher every arm
+// uses.
 func ClassifyCatchTrial(responseText string, rule CatchRule) CatchTrial {
 	var v planReviewEmittedVerdict
 	if err := json.Unmarshal([]byte(extractJSONObject(responseText)), &v); err != nil {
@@ -699,19 +785,55 @@ func ClassifyCatchTrial(responseText string, rule CatchRule) CatchTrial {
 	default:
 		return CatchTrial{Outcome: CatchUndecodable, Response: responseText}
 	}
+	concerns := make([]CatchTrialConcern, 0, len(v.Concerns))
 	for _, c := range v.Concerns {
+		concerns = append(concerns, CatchTrialConcern{Severity: c.Severity, Category: c.Category, Note: c.Note})
+	}
+	return classifyCatchConcerns(concerns, len(v.Concerns), rule)
+}
+
+// classifyCatchConcerns classifies one DECODED verdict's concerns (total is
+// the number the verdict carried) against rule. It is the ONE matcher every
+// arm uses — the conventions arms through ClassifyCatchTrial, the persona arm
+// through ClassifyPersonaTrial, and the rescore over recorded sidecar
+// concerns:
+//
+//   - a CLEAN rule: CatchFalseAlarm when some concern satisfies the category
+//     predicate (matchCatchCategory), with every such concern kept;
+//     CatchNoFalseAlarm otherwise, with every concern kept;
+//   - a catch rule: CatchCaught when ONE concern satisfies the category
+//     predicate, the attribution half and the probe half (matchCatchConcern)
+//     — the first such concern is the trial's matching concern; CatchMissed
+//     otherwise, with every concern near-miss tagged.
+//
+// A concern's stored fields other than NearMiss are copied through unchanged.
+func classifyCatchConcerns(concerns []CatchTrialConcern, total int, rule CatchRule) CatchTrial {
+	if rule.Clean {
+		var alarms []CatchTrialConcern
+		for _, c := range concerns {
+			if matchCatchCategory(c.Category, rule) {
+				alarms = append(alarms, c)
+			}
+		}
+		if len(alarms) > 0 {
+			return CatchTrial{Outcome: CatchFalseAlarm, Concerns: alarms, ConcernsTotal: total}
+		}
+		return CatchTrial{Outcome: CatchNoFalseAlarm, Concerns: append([]CatchTrialConcern{}, concerns...), ConcernsTotal: total}
+	}
+	for _, c := range concerns {
 		if probe, attribution, ok := matchCatchConcern(c.Category, c.Note, rule); ok {
+			c.NearMiss = ""
 			return CatchTrial{
 				Outcome:       CatchCaught,
 				MatchedProbe:  probe,
 				Attribution:   attribution,
-				Concerns:      []CatchTrialConcern{{Severity: c.Severity, Category: c.Category, Note: c.Note}},
-				ConcernsTotal: len(v.Concerns),
+				Concerns:      []CatchTrialConcern{c},
+				ConcernsTotal: total,
 			}
 		}
 	}
-	trial := CatchTrial{Outcome: CatchMissed, Concerns: make([]CatchTrialConcern, 0, len(v.Concerns)), ConcernsTotal: len(v.Concerns)}
-	for _, c := range v.Concerns {
+	trial := CatchTrial{Outcome: CatchMissed, Concerns: make([]CatchTrialConcern, 0, len(concerns)), ConcernsTotal: total}
+	for _, c := range concerns {
 		_, probed := matchCatchProbe(c.Category, c.Note, rule.Probes)
 		_, attributed := matchCatchAttribution(c.Category, c.Note, rule)
 		var tag string
@@ -721,26 +843,54 @@ func ClassifyCatchTrial(responseText string, rule CatchRule) CatchTrial {
 		case attributed && !probed:
 			tag = NearMissAttributionWithoutProbe
 		}
-		trial.Concerns = append(trial.Concerns, CatchTrialConcern{Severity: c.Severity, Category: c.Category, Note: c.Note, NearMiss: tag})
+		c.NearMiss = tag
+		trial.Concerns = append(trial.Concerns, c)
 	}
 	return trial
 }
 
 // CaseCatchCounts is one case's counts in one arm. Undecodable trials are
 // counted in Trials and are never Caught, so Caught+Undecodable <= Trials.
+// Expect is the case's expectation class (CatchExpectCatch or
+// CatchExpectClean; empty = catch, so a v4 record re-encodes byte-identically)
+// and FalseAlarms counts a CLEAN case's false-alarm trials; both are omitted
+// when zero.
 type CaseCatchCounts struct {
-	Trials      int `json:"trials"`
-	Caught      int `json:"caught"`
-	Undecodable int `json:"undecodable"`
+	Expect      string `json:"expect,omitempty"`
+	Trials      int    `json:"trials"`
+	Caught      int    `json:"caught"`
+	FalseAlarms int    `json:"false_alarms,omitempty"`
+	Undecodable int    `json:"undecodable"`
 }
 
-// validate is the per-case count invariant.
+// IsClean reports whether the counts belong to a clean case.
+func (c CaseCatchCounts) IsClean() bool { return c.Expect == CatchExpectClean }
+
+// validate is the per-case count invariant: no negative count, a known
+// Expect, no false alarms on a catch case, no catch on a clean case, and
+// caught+undecodable (catch) or false_alarms+undecodable (clean) at most
+// trials.
 func (c CaseCatchCounts) validate() error {
-	if c.Trials < 0 || c.Caught < 0 || c.Undecodable < 0 {
-		return fmt.Errorf("negative count (trials %d, caught %d, undecodable %d)", c.Trials, c.Caught, c.Undecodable)
+	if c.Trials < 0 || c.Caught < 0 || c.Undecodable < 0 || c.FalseAlarms < 0 {
+		return fmt.Errorf("negative count (trials %d, caught %d, false_alarms %d, undecodable %d)", c.Trials, c.Caught, c.FalseAlarms, c.Undecodable)
 	}
-	if c.Caught+c.Undecodable > c.Trials {
-		return fmt.Errorf("caught %d + undecodable %d exceeds trials %d", c.Caught, c.Undecodable, c.Trials)
+	switch c.Expect {
+	case "", CatchExpectCatch:
+		if c.FalseAlarms != 0 {
+			return fmt.Errorf("false_alarms %d on a catch case: only a clean case records false alarms", c.FalseAlarms)
+		}
+		if c.Caught+c.Undecodable > c.Trials {
+			return fmt.Errorf("caught %d + undecodable %d exceeds trials %d", c.Caught, c.Undecodable, c.Trials)
+		}
+	case CatchExpectClean:
+		if c.Caught != 0 {
+			return fmt.Errorf("caught %d on a clean case: a clean case has nothing to catch", c.Caught)
+		}
+		if c.FalseAlarms+c.Undecodable > c.Trials {
+			return fmt.Errorf("false_alarms %d + undecodable %d exceeds trials %d", c.FalseAlarms, c.Undecodable, c.Trials)
+		}
+	default:
+		return fmt.Errorf("unknown expect %q (want %q or %q)", c.Expect, CatchExpectCatch, CatchExpectClean)
 	}
 	return nil
 }
