@@ -1078,6 +1078,13 @@ invocation of the existing in-process loops — `runPlanReviews` / `runPlanRevie
 `runImplementReviewsForTree` / `runImplementReviewInvocations` (`trace.go`) — carried on `reviewerInvocation.persona`,
 so the loop signatures are unchanged.
 
+The PURE half — the remit framing, the persona prompt render (`personaprompt.Build`), the quote-document set, the
+change-path union and the quote-verification + severity-cap ingest controls (`personaprompt.ApplyConcernControls`)
+— lives in `backend/internal/personaprompt` (#4313; contract: its `README.md`), shared with the agenteval persona
+catch arm. This package keeps the forge reads, the build-then-attribute order, every degrade detail, the WARN logs
+(driven from the returned results), the ingest-marker scrub and the `reviewer_role` stamp; the wrappers
+`personaRemitFraming`, `reviewChangePaths` and `personaPromptDocuments` delegate with their original signatures.
+
 - **Per-invocation prompt; standard prompt byte-identical.** The standard prompt is built exactly as before. AFTER
   it, `buildPersonaPrompts` builds each persona's OWN prompt from a VALUE COPY of the round's `prompt.Trigger` with
   the remit appended to a CLONED `InjectedDocuments` slice, so nothing it writes can reach the standard prompt.
