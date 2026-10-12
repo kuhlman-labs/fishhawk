@@ -2502,7 +2502,36 @@ never has to push to a branch ADR-035 declares runner-owned.
   `failed` stage. So the payload is made COMPLETE before any mutation:
   `PriorState` and the review stage to re-park (`openReviewStageFor`) are
   derived here, mirroring `run.FixupStage`'s own non-acceptance-mode
-  selection, rather than read out of the decision afterwards.
+  selection, rather than read out of the decision afterwards. Append-then-
+  reopen no longer spends the slot on a DETERMINISTIC re-open refusal: those
+  are pre-flighted (next bullet). A slot is still spent, loudly, in three
+  residual cases after the pre-flight passes: a precondition CHANGES between
+  the pre-flight and the re-open (a concurrent writer); a repository READ
+  fails inside `run.FixupStage`'s own admission, which re-reads after the
+  append; or a `TransitionStage` WRITE fails in its mutation phase.
+- **Re-open preconditions are PRE-FLIGHTED (#4304).** `startConflictResolutionPass`
+  calls `run.FixupApplicable` — `run.FixupStage`'s own read-only admission —
+  AFTER the budget-spent check (so at the ceiling the 422 still names the
+  failed pass) and the implement-state check, and BEFORE the trigger append.
+  Both it and the later `run.FixupStage` take ONE `reopenOpts`, so the
+  pre-flight predicts exactly the call it guards. A terminal run, a review
+  gate not parked at `awaiting_approval`, an unsettled acceptance stage (the
+  `feature_change` shape, where acceptance runs ahead of review), or no review
+  stage is refused HERE with nothing written: no trigger entry, no budget
+  slot, no stage moved. `conflictResolutionPreflightRefusal` builds the reason
+  — "…so NO conflict-resolution budget was spent; <precondition>" — with the
+  run fix-up sentinel prefix stripped (`stripFixupSentinel`), so it never reads
+  as a fix-up refusal. Only the acceptance rows, whose precondition the
+  operator CAN clear, carry a re-invoke instruction: `reopenOpts` sets
+  `AcceptanceBlockerTail` to `conflictResolutionAcceptanceBlockerTail`
+  (", then re-invoke fishhawk_rebase_run_branch — waiting spends no
+  conflict-resolution budget") in place of the fix-up's "then route the
+  fix-up". The terminal-run, review-resolved and no-review-stage rows carry
+  their own remedy and no re-invoke. A pre-flight READ failure refuses too
+  ("could not be confirmed"): the ceiling-of-one slot is never spent on an
+  uncertain state. On every pre-flight refusal `message()` words the
+  resolve-push-vouch route as the FALLBACK ("If the precondition cannot be
+  cleared: …"); the 422 code, error code and `details` keys are unchanged.
 - **`run.FixupStage` owns the state-machine edge** (implement → pending, plus
   the review re-park on the push_and_open_pr flow) and the terminal-run guard.
   The pass counts handed to it are the CONFLICT-RESOLUTION counts, never the
@@ -2512,7 +2541,10 @@ never has to push to a branch ADR-035 declares runner-owned.
   no run/audit repository; an unresolvable branch / base ref / head anchor; no
   implement stage; an unreadable budget count (a listing error must never read
   as zero, which the caller treats as headroom); an implement stage not parked
-  at its review gate; a failed trigger append; a failed stage re-open. The
+  at its review gate; an unmet or unconfirmable re-open precondition (the
+  pre-flight above, which spends nothing); a failed trigger append; and a
+  re-open that fails AFTER the append (the three residuals above, which spend
+  the slot and say so: "the ceiling-of-one budget is now SPENT"). The
   ceiling arm is distinct: it names the FAILED pass and the runner's own
   refusal reason, read from the newest same-stage
   `stage_conflict_resolution_failed` entry, degrading to the count alone when
@@ -2699,7 +2731,7 @@ A verify failure after a SUCCESSFUL implement agent pass used to discard the age
 
 Evaluates the uploaded plan's `scope.files` against the run's implement-stage path constraints using the **same `backend/internal/policy` matcher as the post-implement gate**, so the plan-time verdict equals the verdict the implement stage would produce.
 
-- `resolveImplementConstraints` mirrors `resolveStageReviewers`' spec read (parses `runs.workflow_spec`, finds the first implement stage) and flattens its `[]spec.Constraint` into a single `policy.Constraints` — keeping ONLY the scope-knowable constraints `forbidden_paths` / `allowed_paths` / `max_files_changed`, plus the built-in `agent_instruction_paths` (E80.12 / #3942) that `applyAgentInstructionPolicy` maps from the stage's `AgentInstructionPathsRule`, so a plan scoping an agent-instruction path is flagged here exactly as the post-implement gate would flag it (and not at all for an opted-out stage).
+- `resolveImplementConstraints` mirrors `resolveStageReviewers`' spec read (parses `runs.workflow_spec`, finds the first implement stage) and flattens its `[]spec.Constraint` into a single `policy.Constraints` — keeping ONLY the scope-knowable constraints `forbidden_paths` / `allowed_paths` / `max_files_changed`, plus the built-in `agent_instruction_paths` (E80.12 / #3942), which `strictestAgentInstructionPolicy` folds STRICTEST across EVERY implement stage's `AgentInstructionPathsRule` (#4311), so a plan scoping an agent-instruction path is flagged here whenever some implement stage's post-implement gate would flag it (and not at all when every implement stage opts out). The three path kinds stay read from the first implement stage (#4345).
 - `required_outcomes` is deliberately dropped (`tests_added_or_updated` would false-flag any plan not enumerating a `_test.go`, and `ci_green` has no pre-implement signal).
 - Writes a `plan_scope_precheck` audit entry (payload `ScopePrecheckPayload{workflow_id, implement_stage_id, violations, scanned_files}`) **even on a clean scope** (empty `violations`) so a reader distinguishes "checked and clean" from "never checked".
 - Advisory + fail-open throughout: a missing/unparseable spec or a workflow with no implement stage writes no entry and never blocks/unwinds the upload (matching `runPlanReviews`' degradation contract).
@@ -4467,7 +4499,8 @@ The backend's source-of-truth constraint evaluation on trace upload (E3.13): it 
 - **nil is a violation, not a pass.** The helper returns nil on `bundle.ErrNoGateEvidence`, on any extract error, and when the evidence carries neither a summary nor a verify run — and the `verification_reported` required outcome treats nil as a violation (fail-closed). Contrast `ci_green`, whose nil signal *defers* to branch protection.
 - **Diff-coverage signal derivation (#1888 / ADR-059).** `reEvaluatePolicy` also sets `constraints.DiffCoverageSignal` from `diffCoverageSignalFromBundle`, which reads the `diff_coverage` record out of that SAME `gate_evidence` event, while `mergeConstraints` supplies `constraints.DiffCoverage` (the DECLARATION) from the cached spec. Both are nil-safe: a stage that did not declare the constraint never enters the evaluation branch. nil is likewise a violation, not a pass — the runner emits a measured-with-zero signal rather than nothing when there is nothing to measure, so absence unambiguously means the runner never ran.
 - **`resolveDiffCoverageConfig` (prompt.go)** serves the declaration to the runner as `promptResponse.diff_coverage`, at BOTH construction sites. It mirrors `resolveVerifyConfig`'s parse + stage-lookup shape and fails open to nil on every degradation (nil spec, parse failure, missing workflow, missing stage). That is safe because it is SYMMETRIC: the same spec lookup drives the backend's own constraint load, so a spec the backend cannot read yields neither a measurement request nor a gate. When a stage declares the constraint twice the most RESTRICTIVE threshold wins, matching `mergeConstraints`, so the runner measures against the same threshold the backend enforces. The stage-type surfaces cannot diverge either: only the implement runner measures, so the spec validator rejects `diff_coverage` on every other stage type (#1888) — otherwise a declaration on, say, an acceptance stage would reach evaluation with no signal, and a nil signal is a violation, i.e. a guaranteed false RED.
-- **Built-in `agent_instruction_paths` (E80.12 / #3942).** On its success path `loadStageConstraintsFromCache` calls `applyAgentInstructionPolicy` (`scope_precheck.go`, the ONE spec→policy mapping the plan-gate precheck shares), so every implement stage is evaluated against the built-in agent-instruction-path constraint unless its v2 spec opts out — even a stage declaring no constraints at all. The built-in is resolved from the cached spec, so it applies ONLY when that spec resolves: every `emitPolicySkipped` path (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, `stage_not_in_spec`, `no_diff_in_bundle`) evaluates nothing, the built-in included. Cross-layer pin: `TestShipTrace_PolicyReEval_AgentInstructionPaths`; post-CI round trip: `TestReevaluateCIPolicy_PreservesAgentInstructionPaths`.
+- **Built-in `agent_instruction_paths` (E80.12 / #3942).** On its success path `loadStageConstraintsFromCache` calls `applyAgentInstructionPolicy` (`scope_precheck.go`, the ONE spec→policy mapping the plan-gate precheck shares), so every implement stage is evaluated against the built-in agent-instruction-path constraint unless its v2 spec opts out — even a stage declaring no constraints at all. The built-in is resolved from the cached spec, so it applies ONLY when that spec yields the workflow: every `emitPolicySkipped` path (`spec_unavailable`, `spec_unparseable`, `workflow_not_in_spec`, a NON-implement `stage_not_in_spec`, `no_diff_in_bundle`) evaluates nothing, the built-in included. Cross-layer pin: `TestShipTrace_PolicyReEval_AgentInstructionPaths`; post-CI round trip: `TestReevaluateCIPolicy_PreservesAgentInstructionPaths`.
+- **Per evaluated stage, fail-closed (#4311).** `agentInstructionStage` resolves the rule from the EVALUATED run stage's own spec stage via `specStageForRunStage` (type ordinal), so a stage-1 `enforce: false` or broad `writable` never covers a second implement stage. Unlike that helper's other callers it FAILS CLOSED for an implement stage: a `ListStagesForRun` error, a stage absent from the rows, an ordinal past the spec, or a workflow with no implement stage yields the built-in enforced with no `writable` list, and an implement stage is evaluated instead of skipped as `stage_not_in_spec` (so `passed` can be false where a skip row once read `passed=true`). A non-implement stage short-circuits without the list read. The precheck (`resolveImplementConstraints`) folds the rule STRICTEST across implement stages via `strictestAgentInstructionPolicy`: enforced if any stage enforces, `writable` the intersection of the enforcing stages' lists. Every other post-hoc constraint (`mergeConstraints`, `flattenPathConstraints`, `resolveImplementRequiredOutcomes`) stays FIRST-OF-TYPE, a documented limitation (#4345). Pins: `TestShipTrace_PolicyReEval_AgentInstructionPaths_PerImplementStage`, `TestLoadStageConstraintsFromCache_AgentInstructionPaths_FailClosed`, `TestScopePrecheck_AgentInstructionPaths_StrictestAcrossImplementStages`, `TestStrictestAgentInstructionPolicy`.
 - The `bundle` import stays on this side of the seam: `backend/internal/policy` never imports it. Outcome semantics and the audit round-trip invariant live in `backend/internal/policy/README.md`.
 
 ## Plan-stage terminal settle is shared across artifact siblings (`grooming_report.go` / `plan.go`, E54.29 / #2837)

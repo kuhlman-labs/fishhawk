@@ -178,11 +178,13 @@ func EmitEvaluation(
 //
 // A skip evaluates NOTHING, the built-in agent_instruction_paths
 // constraint (E80.12 / #3942) included: that constraint is resolved from
-// the stage's cached spec, so it applies only when the spec resolves. A
-// stage skipped as SkipSpecUnavailable, SkipSpecUnparseable,
-// SkipWorkflowNotInSpec or SkipStageNotInSpec gets no built-in protection
-// from this gate, and neither does a SkipNoDiffInBundle stage (there is no
-// diff to check).
+// the stage's cached spec, so it applies only when the spec yields the
+// workflow. A stage skipped as SkipSpecUnavailable, SkipSpecUnparseable or
+// SkipWorkflowNotInSpec gets no built-in protection from this gate, and
+// neither does a SkipNoDiffInBundle stage (there is no diff to check).
+// SkipStageNotInSpec is reached only by a NON-implement stage: an implement
+// stage whose type the workflow does not declare is evaluated against the
+// built-in alone instead of skipped (#4311), so it never lands here.
 func EmitEvaluationSkipped(
 	ctx context.Context,
 	repo audit.Repository,

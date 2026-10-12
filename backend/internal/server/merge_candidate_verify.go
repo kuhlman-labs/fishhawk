@@ -79,6 +79,22 @@ const (
 // reporter cannot grow the audit chain.
 const mergeCandidateOutputTailMax = 4096
 
+// mergeCandidateFailuresMax bounds the stored failure-signal excerpt (#4250),
+// keeping its HEAD (the earliest failures first). The runner already redacts
+// and bounds it to the same 8 KiB; the server re-bounds so a misbehaving
+// reporter cannot grow the audit chain.
+const mergeCandidateFailuresMax = 8192
+
+// The stored failure summary's bounds (#4250): entries per list and bytes per
+// entry. They MIRROR the runner parser's caps (verifyFailureParseMaxEntries /
+// verifyFailureParseMaxEntryBytes), so a well-behaved report is stored as
+// shipped; the server re-bounds so a misbehaving reporter cannot grow the
+// chain, and sets lossy when it cut anything.
+const (
+	mergeCandidateSummaryMaxEntries    = 10
+	mergeCandidateSummaryMaxEntryBytes = 200
+)
+
 // mergeCandidateSystemSubject is the in-process identity a non-request write
 // (the fan-in hold's trigger) and the D6 routed fix-up act under.
 const mergeCandidateSystemSubject = "system:merge-candidate-verify"
@@ -139,17 +155,31 @@ func validMergeCandidateResult(r string) bool {
 }
 
 // mergeCandidateVerifiedPayload is the merge_candidate_verified row. The
-// output tail is runner-redacted and server-bounded, and it is UNTRUSTED:
-// output_untrusted is always true so every reader frames it as data.
+// output tail, the failure-signal excerpt (failures) and the failing-name
+// summary (failure_summary, #4250) are runner-redacted and server-bounded, and
+// they are UNTRUSTED: output_untrusted is always true so every reader frames
+// them as data. failures and failure_summary are absent on a passed pass and
+// on a report from a runner that predates them.
 type mergeCandidateVerifiedPayload struct {
-	HeadSHA         string `json:"head_sha"`
-	Cause           string `json:"cause"`
-	VerifyCommand   string `json:"verify_command"`
-	Result          string `json:"result"`
-	Reason          string `json:"reason,omitempty"`
-	TriggerSequence int64  `json:"trigger_sequence"`
-	OutputTail      string `json:"output_tail,omitempty"`
-	OutputUntrusted bool   `json:"output_untrusted"`
+	HeadSHA         string                        `json:"head_sha"`
+	Cause           string                        `json:"cause"`
+	VerifyCommand   string                        `json:"verify_command"`
+	Result          string                        `json:"result"`
+	Reason          string                        `json:"reason,omitempty"`
+	TriggerSequence int64                         `json:"trigger_sequence"`
+	OutputTail      string                        `json:"output_tail,omitempty"`
+	Failures        string                        `json:"failures,omitempty"`
+	FailureSummary  *mergeCandidateFailureSummary `json:"failure_summary,omitempty"`
+	OutputUntrusted bool                          `json:"output_untrusted"`
+}
+
+// mergeCandidateOutputEvidence is the untrusted verify-output evidence one
+// merge_candidate_verified row records: the tail, and (#4250) the
+// failure-signal excerpt and the failing-name summary.
+type mergeCandidateOutputEvidence struct {
+	Tail     string
+	Failures string
+	Summary  *mergeCandidateFailureSummary
 }
 
 // mergeCandidateActor is the audit actor a trigger records. Request-bound
@@ -453,12 +483,23 @@ type mergeCandidateVerifiedRecord struct {
 }
 
 // recordMergeCandidateVerified appends the merge_candidate_verified row for the
-// stage's live trigger, consuming it. It refuses an out-of-set result and a
-// stage with no live trigger, and it is idempotent per (stage, trigger
-// sequence): a runner retry after a 5xx finds the trigger already consumed by
-// a row naming the same trigger sequence and appends nothing.
+// stage's live trigger, consuming it, recording only an output tail. It is
+// recordMergeCandidateVerifiedEvidence with no failure evidence — the shape
+// every non-report producer (a crashed pass, an incapable runner) writes.
 func (s *Server) recordMergeCandidateVerified(ctx context.Context, runID, stageID uuid.UUID,
 	result, reason, outputTail string, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
+	return s.recordMergeCandidateVerifiedEvidence(ctx, runID, stageID, result, reason,
+		mergeCandidateOutputEvidence{Tail: outputTail}, actorKind, actorSubject)
+}
+
+// recordMergeCandidateVerifiedEvidence appends the merge_candidate_verified
+// row for the stage's live trigger, consuming it. It refuses an out-of-set
+// result and a stage with no live trigger, and it is idempotent per (stage,
+// trigger sequence): a runner retry after a 5xx finds the trigger already
+// consumed by a row naming the same trigger sequence and appends nothing. Every
+// piece of the untrusted evidence is re-bounded before it is stored.
+func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID, stageID uuid.UUID,
+	result, reason string, ev mergeCandidateOutputEvidence, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
 	if !validMergeCandidateResult(result) {
 		return nil, errMergeCandidateInvalidResult
 	}
@@ -497,7 +538,9 @@ func (s *Server) recordMergeCandidateVerified(ctx context.Context, runID, stageI
 		Result:          result,
 		Reason:          reason,
 		TriggerSequence: newest.Sequence,
-		OutputTail:      boundMergeCandidateTail(outputTail),
+		OutputTail:      boundMergeCandidateTail(ev.Tail),
+		Failures:        boundMergeCandidateFailures(ev.Failures),
+		FailureSummary:  boundMergeCandidateFailureSummary(ev.Summary),
 		OutputUntrusted: true,
 	})
 	if err != nil {
@@ -535,6 +578,49 @@ func boundMergeCandidateTail(tail string) string {
 		return tail
 	}
 	return strings.ToValidUTF8(tail[len(tail)-mergeCandidateOutputTailMax:], "")
+}
+
+// boundMergeCandidateFailures keeps the FIRST mergeCandidateFailuresMax bytes
+// of the failure-signal excerpt (its earliest failures), re-validated as
+// UTF-8 after the cut.
+func boundMergeCandidateFailures(failures string) string {
+	if len(failures) <= mergeCandidateFailuresMax {
+		return failures
+	}
+	return strings.ToValidUTF8(failures[:mergeCandidateFailuresMax], "")
+}
+
+// boundMergeCandidateFailureSummary re-bounds a reported failure summary: each
+// list keeps its first mergeCandidateSummaryMaxEntries entries, each cut to
+// mergeCandidateSummaryMaxEntryBytes (valid UTF-8), and lossy is set when
+// anything was dropped or cut. A nil or all-empty summary stores nothing.
+func boundMergeCandidateFailureSummary(in *mergeCandidateFailureSummary) *mergeCandidateFailureSummary {
+	if in == nil || (len(in.Packages) == 0 && len(in.Tests) == 0 && len(in.BuildFailed) == 0) {
+		return nil
+	}
+	out := &mergeCandidateFailureSummary{Lossy: in.Lossy}
+	bound := func(list []string) []string {
+		if len(list) > mergeCandidateSummaryMaxEntries {
+			list = list[:mergeCandidateSummaryMaxEntries]
+			out.Lossy = true
+		}
+		kept := make([]string, 0, len(list))
+		for _, v := range list {
+			if len(v) > mergeCandidateSummaryMaxEntryBytes {
+				v = strings.ToValidUTF8(v[:mergeCandidateSummaryMaxEntryBytes], "")
+				out.Lossy = true
+			}
+			kept = append(kept, v)
+		}
+		if len(kept) == 0 {
+			return nil
+		}
+		return kept
+	}
+	out.Packages = bound(in.Packages)
+	out.Tests = bound(in.Tests)
+	out.BuildFailed = bound(in.BuildFailed)
+	return out
 }
 
 // maybeRecoverMergeCandidateVerifyFailure handles a runner `failed` report for

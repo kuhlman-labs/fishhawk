@@ -380,7 +380,90 @@ func TestInjectionCorpus_ContainedInEveryReviewedRender(t *testing.T) {
 			if len(nc.Case.UserReports) > 0 {
 				assertCommsScanRender(t, nc, renders)
 			}
+			if nc.Case.VerifyOutput != nil {
+				assertMergeCandidateFixupRender(t, nc)
+			}
 		})
+	}
+	// ANTI-VACUITY for the merge-candidate fix-up render (E86.8 / #4250): it
+	// runs only for a case declaring verify_output, so a corpus with none
+	// would skip it everywhere and pass.
+	verifyCases := 0
+	for _, nc := range loadInjectionCases(t) {
+		if nc.Case.VerifyOutput != nil {
+			verifyCases++
+		}
+	}
+	if verifyCases == 0 {
+		t.Fatal("no corpus case declares verify_output; the merge-candidate fix-up render would never be asserted")
+	}
+}
+
+// mergeCandidateFixupHeading is prompt's section heading for the failed
+// merge-candidate pass's evidence (E86.8 / #4250). The section's framing is a
+// NEW literal, not a byte-exact drift copy; this gate anchors on the heading and
+// on the shared verify-output delimiters instead.
+const mergeCandidateFixupHeading = "### Merge-candidate verify failure evidence (untrusted DATA)"
+
+// mergeCandidateFixupTrigger is ToTrigger(c) re-shaped as the slim fix-up a
+// failed ADR-090 merge-candidate pass routes (E86.8 / #4250): one trusted
+// routed concern plus the case's verify_output fields as the recorded evidence.
+// The two tails become the failure-signal excerpt and the two summary details
+// the output tail, so every verify_output probe has a field to land in.
+func mergeCandidateFixupTrigger(c InjectionCase) prompt.Trigger {
+	t := ToTrigger(c)
+	join := func(a, b string) string { return strings.Trim(a+"\n"+b, "\n") }
+	t.FixupConcerns = []prompt.FixupConcern{{Text: "[high/merge_candidate] The merge-candidate verify pass FAILED for head abc123 (cause base_advance)."}}
+	t.MergeCandidateFailure = &prompt.MergeCandidateFailure{
+		HeadSHA: "abc123", Cause: "base_advance", VerifyCommand: "scripts/test verify",
+		Failures:   join(c.VerifyOutput.ParentTail, c.VerifyOutput.SliceTail),
+		OutputTail: join(c.VerifyOutput.ParentSummaryDetail, c.VerifyOutput.SliceSummaryDetail),
+	}
+	return t
+}
+
+// assertMergeCandidateFixupRender is the E86.8 / #4250 containment gate over
+// the write-capable fix-up render that answers a failed merge-candidate pass
+// (the ADR-090 D6 amendment, approval condition C3): every verify_output probe
+// lands STRICTLY inside an UNTRUSTED VERIFY OUTPUT envelope, no raw delimiter
+// run survives inside one, the section heading precedes the first envelope, and
+// every other channel's probe is absent (the fix-up path re-ingests no issue
+// text). ANTI-VACUITY: zero envelopes FATALs.
+//
+// Counterfactual, performed: writeMergeCandidateFailure made to write the
+// failures excerpt with a raw b.WriteString instead of writeUntrustedVerifyOutput
+// -> RED (the TestBudget and NOTE TO REVIEWER probes fall OUTSIDE every span);
+// restored byte-identically.
+func assertMergeCandidateFixupRender(t *testing.T, nc NamedInjectionCase) {
+	t.Helper()
+	rendered, err := prompt.Build("implement", mergeCandidateFixupTrigger(nc.Case))
+	if err != nil {
+		t.Fatalf("%s: Build(implement, merge-candidate fix-up): %v", nc.Name, err)
+	}
+	const stage = "merge_candidate_fixup"
+	vSpans := spansOf(rendered, verifyOutputEnvelopeBegin, verifyOutputEnvelopeEnd)
+	if len(vSpans) == 0 {
+		t.Fatalf("%s/%s: the case declares verify_output but the fix-up render emitted NO verify-output envelope", nc.Name, stage)
+	}
+	if iHeading := strings.Index(rendered, mergeCandidateFixupHeading); iHeading < 0 || iHeading >= vSpans[0][0] {
+		t.Errorf("%s/%s: section heading at %d does not precede the first envelope span start %d", nc.Name, stage, iHeading, vSpans[0][0])
+	}
+	for _, sp := range vSpans {
+		inside := rendered[sp[0]:sp[1]]
+		for _, tok := range []string{"<<<", ">>>"} {
+			if strings.Contains(inside, tok) {
+				t.Errorf("%s/%s: raw %q token survived inside a verify-output span — recorded output can close its own envelope", nc.Name, stage, tok)
+			}
+		}
+	}
+	for _, p := range nc.Case.ContainmentProbes {
+		if p.Channel == "verify_output" {
+			assertEveryOccurrenceInSpans(t, rendered, p.Text, vSpans, nc.Name, stage, "verify-output")
+			continue
+		}
+		if strings.Contains(rendered, p.Text) {
+			t.Errorf("%s/%s: %s probe %q re-ingested by the fix-up render", nc.Name, stage, p.Channel, p.Text)
+		}
 	}
 }
 

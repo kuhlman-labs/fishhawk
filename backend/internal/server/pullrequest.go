@@ -296,16 +296,45 @@ type pullRequestBody struct {
 	// verify output's tail. branch/head_sha carry the verified run-branch tip;
 	// there is no base_sha and no PR (the pass pushed nothing). The tail is
 	// runner-redacted, re-bounded server-side and UNTRUSTED: it is recorded as
-	// data and never reaches a routed fix-up. Declared here (with omitempty) so
-	// the DisallowUnknownFields decoder accepts the body; absent on every other
-	// variant.
+	// data and is never embedded in a routed fix-up CONCERN (ADR-090 D6).
+	// Declared here (with omitempty) so the DisallowUnknownFields decoder
+	// accepts the body; absent on every other variant.
+	//
+	// MergeCandidateFailures and MergeCandidateFailureSummary (#4250) carry a
+	// non-passed pass's failure evidence from the WHOLE output: the
+	// failure-signal excerpt (every go-test failure-signal line with context,
+	// runner-redacted, head-bounded, re-bounded server-side, UNTRUSTED) and the
+	// parsed failing package / test / build-failed names. Both are recorded on
+	// the merge_candidate_verified row (failures / failure_summary) under the
+	// same output_untrusted framing; an older runner omits both.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
 	// runner's upload.pullRequestMergeCandidateBody (the ship_merge_candidate
 	// pair in backend/internal/wirecontract).
-	MergeCandidateResult     string `json:"merge_candidate_result,omitempty"`
-	MergeCandidateReason     string `json:"merge_candidate_reason,omitempty"`
-	MergeCandidateOutputTail string `json:"merge_candidate_output_tail,omitempty"`
+	MergeCandidateResult         string                        `json:"merge_candidate_result,omitempty"`
+	MergeCandidateReason         string                        `json:"merge_candidate_reason,omitempty"`
+	MergeCandidateOutputTail     string                        `json:"merge_candidate_output_tail,omitempty"`
+	MergeCandidateFailures       string                        `json:"merge_candidate_failures,omitempty"`
+	MergeCandidateFailureSummary *mergeCandidateFailureSummary `json:"merge_candidate_failure_summary,omitempty"`
+}
+
+// mergeCandidateFailureSummary is the structured failing-name summary of a
+// non-passed merge-candidate pass (#4250 approval condition C2): failing
+// package import paths, `--- FAIL:` test names, and the packages whose FAIL
+// line carried `[build failed]`/`[setup failed]`, parsed by the runner over
+// the WHOLE redacted output so the names survive the excerpt's byte budget.
+// Lossy is set when any list dropped or cut an entry. Runner-parsed from
+// UNTRUSTED output, re-bounded server-side (boundMergeCandidateFailureSummary)
+// and stored as the merge_candidate_verified row's failure_summary.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// runner's upload.MergeCandidateFailureSummary (the
+// merge_candidate_failure_summary pair in backend/internal/wirecontract).
+type mergeCandidateFailureSummary struct {
+	Packages    []string `json:"packages,omitempty"`
+	Tests       []string `json:"tests,omitempty"`
+	BuildFailed []string `json:"build_failed,omitempty"`
+	Lossy       bool     `json:"lossy"`
 }
 
 // Acceptance-stage scenario-corpus report outcomes (E72.4 / #3328).
@@ -2235,7 +2264,11 @@ func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *ht
 	if actorSubject != nil && *actorSubject != "" {
 		subject = *actorSubject
 	}
-	rec, err := s.recordMergeCandidateVerified(ctx, runID, stageID, result, reason, pr.MergeCandidateOutputTail, actorKind, subject)
+	rec, err := s.recordMergeCandidateVerifiedEvidence(ctx, runID, stageID, result, reason, mergeCandidateOutputEvidence{
+		Tail:     pr.MergeCandidateOutputTail,
+		Failures: pr.MergeCandidateFailures,
+		Summary:  pr.MergeCandidateFailureSummary,
+	}, actorKind, subject)
 	if err != nil {
 		if errors.Is(err, errMergeCandidateNoLiveTrigger) || errors.Is(err, errMergeCandidateTriggerPayload) {
 			s.writeError(w, r, http.StatusConflict, "merge_candidate_verify_not_live",

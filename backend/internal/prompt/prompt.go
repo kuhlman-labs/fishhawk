@@ -820,6 +820,14 @@ type Trigger struct {
 	// acceptance verdict. Empty/nil for a normal (non-fix-up) implement
 	// dispatch, in which case the section is omitted.
 	FixupConcerns []FixupConcern
+	// MergeCandidateFailure is the recorded evidence of the FAILED ADR-090
+	// merge-candidate verify pass this fix-up answers (E86.8 / #4250),
+	// server-resolved by resolveMergeCandidateFixupEvidence. FIX-UP ONLY:
+	// buildImplementFixup renders it after the fix-up concerns, its untrusted
+	// halves inside the #3192 UNTRUSTED VERIFY OUTPUT envelope; no other
+	// builder renders it. Nil (or carrying no untrusted evidence) renders
+	// nothing, keeping every other fix-up prompt byte-identical.
+	MergeCandidateFailure *MergeCandidateFailure
 	// FixupReportObligations carries the REPORTING obligations detected among
 	// this fix-up's routed instructions (#2737). When non-empty (and the
 	// run/stage ids are populated), buildImplementFixup renders a binding
@@ -4220,6 +4228,10 @@ func buildImplementFixup(t Trigger) string {
 
 	// The binding fix-up concerns — the whole reason this pass exists.
 	writeFixupConcerns(&b, t)
+
+	// The failed merge-candidate pass's recorded evidence (E86.8 / #4250),
+	// enveloped as untrusted verify output; nothing when absent.
+	writeMergeCandidateFailure(&b, t.MergeCandidateFailure)
 
 	// Tight scoping instruction: the smallest-change posture is the point of
 	// this slim prompt, so state it explicitly rather than relying on the
