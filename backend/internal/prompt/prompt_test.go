@@ -6418,7 +6418,9 @@ func planReviewCriterionLine(t *testing.T, got, prefix string) string {
 // TestBuild_PlanReview_IssueFidelityCriterion pins criterion 8a (#4253 / #4254
 // fold-in): a criterion citing the issue must require what the issue requires,
 // rendered directly after criterion 8 so 9-13 keep their numbers. The wording
-// is asserted as a literal so deleting or rewording the sentence turns this RED.
+// is asserted as a literal so deleting or rewording the sentence turns this RED,
+// including a revert of the corpus-disjoint example (#4355) to one echoing a
+// catch-rate corpus case.
 func TestBuild_PlanReview_IssueFidelityCriterion(t *testing.T) {
 	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
 	if err != nil {
@@ -6427,7 +6429,7 @@ func TestBuild_PlanReview_IssueFidelityCriterion(t *testing.T) {
 	line := planReviewCriterionLine(t, got, "8a. **Issue fidelity**")
 	for _, want := range []string{
 		"each criterion that cites the issue (source explicit / source_ref) must require what the issue requires",
-		"a criterion that conflicts with the issue text — e.g. the issue says soft-delete, the criterion requires row removal — flags",
+		"a criterion that conflicts with the issue text — e.g. the issue says invoice amounts use banker's rounding, the criterion requires truncation — flags",
 		"category `correctness`, naming both the issue's requirement and the criterion's.",
 	} {
 		if !strings.Contains(line, want) {
@@ -6448,7 +6450,8 @@ func TestBuild_PlanReview_IssueFidelityCriterion(t *testing.T) {
 // TestBuild_PlanReview_InferredCriterionWarrantClause pins the tightened
 // criterion 9 (#4253 / #4254 fold-in): a specific value the issue never states
 // flags unless the plan cites where it is required, and sibling code is
-// precedent, not a requirement. Both halves sit on criterion 9's own line.
+// precedent, not a requirement. Both halves sit on criterion 9's own line. The
+// value kinds are the corpus-disjoint list (#4355).
 func TestBuild_PlanReview_InferredCriterionWarrantClause(t *testing.T) {
 	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
 	if err != nil {
@@ -6456,7 +6459,7 @@ func TestBuild_PlanReview_InferredCriterionWarrantClause(t *testing.T) {
 	}
 	line := planReviewCriterionLine(t, got, "9. **Warrant of inferred criteria**")
 	for _, want := range []string{
-		"An inferred criterion that introduces a specific value, limit or behavior the issue never states (a page size, timeout, rate, status code) flags unless the plan cites where that value is REQUIRED;",
+		"An inferred criterion that introduces a specific value, limit or behavior the issue never states (a cache TTL, thumbnail width, jitter fraction, replica quorum) flags unless the plan cites where that value is REQUIRED;",
 		"similar code elsewhere is precedent, not a requirement.",
 	} {
 		if !strings.Contains(line, want) {
@@ -6470,9 +6473,9 @@ func TestBuild_PlanReview_InferredCriterionWarrantClause(t *testing.T) {
 // criterion names its id in the note. It renders after the last numbered
 // criterion and before the verdict decision rule, and only on plan review — the
 // shared requiredNoteInstruction (and so the implement-review render) is left
-// unchanged.
+// unchanged. The example id is the corpus-disjoint one (#4355).
 func TestBuild_PlanReview_CriterionIDInNote(t *testing.T) {
-	const want = "Every concern about a specific acceptance criterion names that criterion's id (e.g. `ac-delete-hard`) in its `note`."
+	const want = "Every concern about a specific acceptance criterion names that criterion's id (e.g. `invoice-rounding-mode`) in its `note`."
 	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -19696,10 +19699,14 @@ func TestBuild_NonPlanStages_OmitHistorianGuidance(t *testing.T) {
 // conventions file modified, both review prompts must render byte-for-byte as
 // they did before E55.3. Regenerate ONLY for a deliberate, separately-argued
 // change to a review prompt, and say so. The plan_review golden was regenerated
-// once, by #4253 (the #4254 plan-review prompt fix folded in): criterion 8a,
-// criterion 9's warrant clause and the criterion-id-in-note sentence are
-// standard-criteria bytes, not conventions bytes, and the anti-vacuity markers
-// below still fail a golden carrying any conventions section.
+// twice, both times for standard-criteria bytes, not conventions bytes, and the
+// anti-vacuity markers below still fail a golden carrying any conventions
+// section: first by #4253 (the #4254 plan-review prompt fix folded in), which
+// added criterion 8a, criterion 9's warrant clause and the criterion-id-in-note
+// sentence; then by #4355, which hand-edited those three lines' examples (8a's
+// conflict example, criterion 9's value kinds, the example criterion id) to
+// corpus-disjoint values so the plan-review catch-rate eval does not show the
+// reviewer its own planted defects.
 var reviewConventionsAbsentGoldens = map[string]string{
 	"plan_review":      "testdata/review_conventions_absent_plan_review.golden",
 	"implement_review": "testdata/review_conventions_absent_implement_review.golden",

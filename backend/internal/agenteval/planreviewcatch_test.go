@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
@@ -122,6 +124,7 @@ func validCatchInput() map[string]any {
 		},
 		"catch_probes":        []any{"invents a page size", "page size"},
 		"attribution_phrases": []any{"paginates at 100"},
+		"defect_phrases":      []any{"100 items"},
 		"catching_examples":   []any{map[string]any{"category": "acceptance_criteria", "note": "ac-widgets-page invents a page size"}},
 		"non_catching_examples": []any{
 			map[string]any{"category": "security", "note": "the widgets endpoint lacks auth"},
@@ -166,7 +169,7 @@ func setPlanCriteria(in map[string]any, cs []any) {
 	in["plan"].(map[string]any)["verification"].(map[string]any)["acceptance_criteria"] = cs
 }
 
-// TestLoadPlanReviewCatchCorpus_FailClosed covers every loader mode (a)-(q),
+// TestLoadPlanReviewCatchCorpus_FailClosed covers every loader mode (a)-(r),
 // each against a sibling valid case so the error is about the broken one.
 func TestLoadPlanReviewCatchCorpus_FailClosed(t *testing.T) {
 	tests := []struct {
@@ -255,6 +258,18 @@ func TestLoadPlanReviewCatchCorpus_FailClosed(t *testing.T) {
 			planCriteria(in)[0].(map[string]any)["id"] = "ac-widgets-page-auth"
 			return in
 		}, `planted criterion id "ac-widgets-page" occurs inside criterion id "ac-widgets-page-auth"`},
+		{"(r) empty defect_phrases", func(in map[string]any) any { in["defect_phrases"] = []any{}; return in }, "defect_phrases must be non-empty"},
+		{"(r) absent defect_phrases", func(in map[string]any) any { delete(in, "defect_phrases"); return in }, "defect_phrases must be non-empty"},
+		{"(r) whitespace defect phrase", func(in map[string]any) any {
+			in["defect_phrases"] = []any{"100 items", " \t"}
+			return in
+		}, "defect_phrases[1] is empty"},
+		// (r) grounding: "zeppelin manifest" occurs nowhere in the fixture's
+		// issue or plan, so it is not this case's content.
+		{"(r) defect phrase absent from the issue and plan", func(in map[string]any) any {
+			in["defect_phrases"] = []any{"100 items", "zeppelin manifest"}
+			return in
+		}, `defect phrase "zeppelin manifest" occurs in neither the issue nor the plan`},
 		{"(l) empty catching_examples", func(in map[string]any) any { in["catching_examples"] = []any{}; return in }, "must both be non-empty"},
 		{"(l) empty non_catching_examples", func(in map[string]any) any { in["non_catching_examples"] = []any{}; return in }, "must both be non-empty"},
 		// (m): each probe below matches no non_catching_example and leaves the
@@ -603,6 +618,273 @@ func TestCommittedCatchProbes_AbsentFromConventionsFixture(t *testing.T) {
 		for _, probe := range c.Input.CatchProbes {
 			if strings.Contains(conv, strings.ToLower(strings.TrimSpace(probe))) {
 				t.Errorf("case %q: catch probe %q occurs in the representative conventions fixture", c.Name, probe)
+			}
+		}
+	}
+}
+
+// neutralLeakPlan is a minimal valid standard_v1 plan in a domain no corpus
+// case touches (a lighthouse lamp log), with one criterion whose id is not
+// `ac-`-shaped. The prompt-leak self-check renders it so every byte a needle
+// could match is static prompt text, not this trigger.
+const neutralLeakPlan = `{
+  "plan_version": "standard_v1",
+  "ticket_reference": {"type": "github_issue", "url": "https://github.com/example-org/harbor-lights/issues/7", "id": "example-org/harbor-lights#7"},
+  "generated_by": {"agent": "claude-code", "model": "fixture", "timestamp": "2026-10-01T00:00:00Z"},
+  "summary": "Record each turn of the lighthouse lamp.",
+  "scope": {"files": [{"path": "internal/lamp/rotation.go", "operation": "modify"}]},
+  "approach": [{"step": 1, "description": "Append a rotation record on every lamp turn."}],
+  "verification": {
+    "test_strategy": "Unit test of the rotation recorder.",
+    "rollback_plan": "Revert the change.",
+    "acceptance_criteria": [{"id": "lamp-rotation-recorded", "statement": "Each lamp turn appends one rotation record.", "source": "explicit"}]
+  },
+  "predicted_runtime_minutes": 5,
+  "predicted_runtime_confidence": "medium"
+}`
+
+// neutralLeakCase is the corpus-disjoint trigger the prompt-leak and
+// probe-symmetry self-checks render through CatchRateArmPrompt.
+func neutralLeakCase(t *testing.T) PlanReviewCatchCase {
+	t.Helper()
+	p, err := plan.Parse([]byte(neutralLeakPlan))
+	if err != nil {
+		t.Fatalf("fixture premise: the neutral plan must parse: %v", err)
+	}
+	return PlanReviewCatchCase{
+		Name: "neutral-leak-check",
+		Input: PlanReviewCatchInput{
+			IssueTitle: "Log lighthouse lamp rotations",
+			IssueBody:  "The harbor office wants a record of every turn the lighthouse lamp makes.",
+			Plan:       json.RawMessage(neutralLeakPlan),
+		},
+		Plan: p,
+	}
+}
+
+// normalizeLeakText case-folds s, maps '-' to ' ' and collapses whitespace
+// runs, so a needle declared "soft delete" matches prompt text reading
+// "soft-delete" or "Soft  Delete".
+func normalizeLeakText(s string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ToLower(s), "-", " ")), " ")
+}
+
+// neutralArmRenders renders the neutral trigger in both arms and asserts the
+// anti-vacuity premise: the acceptance-criteria block (criterion 8a and the
+// criterion-id-in-note instruction) rendered in each.
+func neutralArmRenders(t *testing.T, conv prompt.ReviewConvention) map[string]string {
+	t.Helper()
+	neutral := neutralLeakCase(t)
+	out := map[string]string{}
+	for _, arm := range []string{ArmWithoutConventions, ArmWithConventions} {
+		rendered, err := CatchRateArmPrompt(neutral, conv, arm)
+		if err != nil {
+			t.Fatalf("neutral %s render: %v", arm, err)
+		}
+		for _, premise := range []string{"8a. **Issue fidelity**", "Every concern about a specific acceptance criterion names that criterion's"} {
+			if !strings.Contains(rendered, premise) {
+				t.Fatalf("fixture premise: the neutral %s render lacks %q: the acceptance-criteria block did not render, so the check would be vacuous", arm, premise)
+			}
+		}
+		out[arm] = rendered
+	}
+	return out
+}
+
+// TestCatchCorpus_NotLeakedIntoPlanReviewPrompt is the prompt-leak self-check
+// (#4355): no case's planted criterion id and no declared defect phrase occurs
+// in the static plan-review prompt — the neutral trigger rendered through
+// CatchRateArmPrompt in BOTH arms — or in the generator system prompt. A hit
+// means every reviewer is shown the planted answer, in every case's render.
+// The neutral trigger's own text provably carries no needle (asserted), so a
+// hit comes from static prompt bytes. Both sides are normalized
+// (normalizeLeakText).
+func TestCatchCorpus_NotLeakedIntoPlanReviewPrompt(t *testing.T) {
+	cases, conv := loadCommittedCatch(t)
+	renders := neutralArmRenders(t, conv)
+	surfaces := []struct{ name, text string }{
+		{ArmWithoutConventions + " plan-review render", normalizeLeakText(renders[ArmWithoutConventions])},
+		{ArmWithConventions + " plan-review render", normalizeLeakText(renders[ArmWithConventions])},
+		{"generator system prompt", normalizeLeakText(planReviewCatchGeneratorSystemPrompt)},
+	}
+	shown, err := catchShownText(neutralLeakCase(t).Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shown = normalizeLeakText(shown)
+	needles := 0
+	for _, c := range cases {
+		var ns []struct{ kind, needle string }
+		for _, m := range c.Miss.Misses {
+			ns = append(ns, struct{ kind, needle string }{"planted criterion id", m.CriterionID})
+		}
+		for _, p := range c.Input.DefectPhrases {
+			ns = append(ns, struct{ kind, needle string }{"defect phrase", p})
+		}
+		for _, n := range ns {
+			norm := normalizeLeakText(n.needle)
+			if norm == "" {
+				t.Fatalf("case %q: %s %q normalizes to empty", c.Name, n.kind, n.needle)
+			}
+			needles++
+			if strings.Contains(shown, norm) {
+				t.Fatalf("fixture premise: the neutral trigger's own text carries case %q's %s %q", c.Name, n.kind, n.needle)
+			}
+			for _, s := range surfaces {
+				if strings.Contains(s.text, norm) {
+					t.Errorf("case %q: %s %q occurs in the %s: the prompt shows every reviewer this case's planted defect", c.Name, n.kind, n.needle, s.name)
+				}
+			}
+		}
+	}
+	if needles == 0 {
+		t.Fatal("no needles: the leak check is vacuous")
+	}
+}
+
+// TestCommittedCatchProbes_NotShownOnlyInTheWithArm widens
+// TestCommittedCatchProbes_AbsentFromConventionsFixture to the WHOLE
+// with-arm-only conventions section (its heading, ReviewConventionsFraming and
+// the fixture): a committed probe may occur in the neutral with-arm render
+// only if it also occurs in the neutral without-arm render. A probe only the
+// with arm is shown would let a with-arm concern echo it and inflate that arm
+// alone, masking a dilution. "issue fidelity" would pass: criterion 8a's
+// heading renders in both arms. The synthetic rows prove the predicate can
+// fire (a framing-only probe) and does not over-fire (a both-arms probe).
+func TestCommittedCatchProbes_NotShownOnlyInTheWithArm(t *testing.T) {
+	committed, conv := loadCommittedCatch(t)
+	renders := neutralArmRenders(t, conv)
+	if !strings.Contains(renders[ArmWithConventions], prompt.ReviewConventionsFraming) {
+		t.Fatal("fixture premise: the neutral with-arm render lacks ReviewConventionsFraming")
+	}
+	synthetic := func(probe string) []PlanReviewCatchCase {
+		return []PlanReviewCatchCase{{Name: "synthetic", Input: PlanReviewCatchInput{CatchProbes: []string{probe}}}}
+	}
+	for _, tc := range []struct {
+		name  string
+		cases []PlanReviewCatchCase
+		want  []string
+	}{
+		{"committed corpus", committed, nil},
+		{"synthetic framing-only probe", synthetic("inferred-criterion warrant"), []string{`case "synthetic": catch probe "inferred-criterion warrant"`}},
+		{"synthetic probe rendered in both arms", synthetic("issue fidelity"), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := withArmOnlyCatchProbes(tc.cases, renders)
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Errorf("with-arm-only probes = %q, want %q: a with-arm concern echoing such a probe would inflate that arm alone", got, tc.want)
+			}
+		})
+	}
+}
+
+// withArmOnlyCatchProbes lists every catch probe of cases that occurs,
+// case-folded, in the with-conventions render but not the without-conventions
+// render — the asymmetry TestCommittedCatchProbes_NotShownOnlyInTheWithArm
+// forbids.
+func withArmOnlyCatchProbes(cases []PlanReviewCatchCase, renders map[string]string) []string {
+	without := strings.ToLower(renders[ArmWithoutConventions])
+	with := strings.ToLower(renders[ArmWithConventions])
+	var out []string
+	for _, c := range cases {
+		for _, probe := range c.Input.CatchProbes {
+			lp := strings.ToLower(strings.TrimSpace(probe))
+			if strings.Contains(with, lp) && !strings.Contains(without, lp) {
+				out = append(out, fmt.Sprintf("case %q: catch probe %q", c.Name, probe))
+			}
+		}
+	}
+	return out
+}
+
+// catchRuleV4AddedProbes is, per case, the catch probes catch rule v4 added
+// (#4355): the plan-review prompt's own vocabulary that the committed
+// 2026-10-12 sidecar's attribution_without_probe misses used.
+var catchRuleV4AddedProbes = map[string][]string{
+	"seed-synthetic-contradicts-issue":          catchRuleV4ContradictsProbes,
+	"seed-synthetic-contradicts-numeric-limit":  catchRuleV4ContradictsProbes,
+	"seed-synthetic-contradicts-status-code":    catchRuleV4ContradictsProbes,
+	"seed-synthetic-inferred-criterion":         catchRuleV4InferredProbes,
+	"seed-synthetic-inferred-sibling-retention": catchRuleV4InferredProbes,
+	"seed-synthetic-inferred-sibling-timeout":   catchRuleV4InferredProbes,
+	"seed-synthetic-restates-approach":          {"restatement of approach", "restatement of the approach"},
+	"seed-synthetic-untestable-reasonable-time": {"no executor can decide"},
+	"seed-synthetic-untestable-user-friendly":   {"no executor can decide"},
+	"seed-synthetic-unwarranted-rate-limit": {
+		"is generic", "is a generic", "generic assumption", "generic preference", "general preference",
+		"fails the warrant", "cites no place", "does not cite where", "precedent, not a",
+	},
+}
+
+var catchRuleV4ContradictsProbes = []string{
+	"requires the opposite", "says the opposite", "yet contradicts", "yet conflicts", "but contradicts",
+	"directly contradicts", "contradicts both the issue", "conflicts directly with", "contradicts the originating issue",
+	"contradicts that issue", "contradict the issue", "conflict with the issue", "nothing in the issue permits",
+	"contradict the stated requirement",
+}
+
+var catchRuleV4InferredProbes = []string{
+	"precedent, not a", "precedent rather than", "precedent and not", "precedent is not a", "precedent, which is not",
+	"cites no place", "cites nowhere", "does not cite where", "fails the warrant",
+}
+
+// catchRuleV4FirstCatchingExample is, per case, the index of the first
+// catching example v4 appended: each one a verbatim committed-sidecar
+// attribution_without_probe concern.
+var catchRuleV4FirstCatchingExample = map[string]int{
+	"seed-synthetic-contradicts-issue":          2,
+	"seed-synthetic-contradicts-numeric-limit":  3,
+	"seed-synthetic-contradicts-status-code":    3,
+	"seed-synthetic-inferred-criterion":         2,
+	"seed-synthetic-inferred-sibling-retention": 3,
+	"seed-synthetic-inferred-sibling-timeout":   3,
+	"seed-synthetic-restates-approach":          2,
+	"seed-synthetic-untestable-reasonable-time": 3,
+	"seed-synthetic-untestable-user-friendly":   3,
+	"seed-synthetic-unwarranted-rate-limit":     2,
+}
+
+// TestCatchRuleV4_NewCatchingExamplesMissUnderV3 is #4355's done-means: every
+// catching example v4 appended scores MISSED under the v3 probes (the case's
+// probes without catchRuleV4AddedProbes) and CAUGHT under v4, while every
+// pre-v4 example still scores CAUGHT under v3 — which proves the v3
+// reconstruction matches the pre-v4 corpus.
+func TestCatchRuleV4_NewCatchingExamplesMissUnderV3(t *testing.T) {
+	if len(catchRuleV4AddedProbes) != len(catchRuleV4FirstCatchingExample) {
+		t.Fatalf("catchRuleV4AddedProbes names %d cases, catchRuleV4FirstCatchingExample %d: the tables drifted", len(catchRuleV4AddedProbes), len(catchRuleV4FirstCatchingExample))
+	}
+	for name, added := range catchRuleV4AddedProbes {
+		first, ok := catchRuleV4FirstCatchingExample[name]
+		if !ok {
+			t.Errorf("case %q has v4 probes but no first v4 catching example", name)
+			continue
+		}
+		v4, in := rawCommittedCatchRule(t, name)
+		isAdded := map[string]bool{}
+		for _, p := range added {
+			isAdded[p] = true
+		}
+		v3 := v4
+		v3.Probes = nil
+		for _, p := range v4.Probes {
+			if !isAdded[p] {
+				v3.Probes = append(v3.Probes, p)
+			}
+		}
+		if len(v3.Probes)+len(added) != len(v4.Probes) {
+			t.Errorf("case %q: premise: every v4-added probe must be in catch_probes exactly once (v3 %d + added %d != v4 %d)", name, len(v3.Probes), len(added), len(v4.Probes))
+		}
+		if first >= len(in.CatchingExamples) {
+			t.Errorf("case %q: no v4 catching example (first index %d, %d examples)", name, first, len(in.CatchingExamples))
+		}
+		for i, ex := range in.CatchingExamples {
+			resp := catchVerdictJSON(t, ex)
+			underV3, underV4 := ClassifyCatch(resp, v3), ClassifyCatch(resp, v4)
+			switch {
+			case i >= first && (underV3 != CatchMissed || underV4 != CatchCaught):
+				t.Errorf("case %q v4 catching_examples[%d]: v3 %q, v4 %q; want missed under v3 and caught under v4", name, i, underV3, underV4)
+			case i < first && underV3 != CatchCaught:
+				t.Errorf("case %q pre-v4 catching_examples[%d]: v3 %q, want caught (the v3 reconstruction does not match the pre-v4 corpus)", name, i, underV3)
 			}
 		}
 	}

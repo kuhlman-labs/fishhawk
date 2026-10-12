@@ -117,11 +117,26 @@
     "speculative 504",
     "504 is invented",
     "504 is speculative",
-    "504 is not in the issue"
+    "504 is not in the issue",
+    "precedent, not a",
+    "precedent rather than",
+    "precedent and not",
+    "precedent is not a",
+    "precedent, which is not",
+    "cites no place",
+    "cites nowhere",
+    "does not cite where",
+    "fails the warrant"
   ],
   "attribution_phrases": [
     "30 seconds",
     "31 seconds"
+  ],
+  "defect_phrases": [
+    "inventory.go",
+    "30 seconds",
+    "pricing-service",
+    "timeout"
   ],
   "catching_examples": [
     {
@@ -138,6 +153,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "The inferred criterion that POST /quotes returns 504 within 31 seconds is speculative: the issue never asks for a timeout, and the inventory client's value is not a requirement for quotes."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-quote-pricing-timeout is an inferred, blocking criterion that introduces a 30 s timeout and an HTTP 504 status. The issue states neither. Its only warrant is that internal/clients/inventory.go uses a 30 s timeout, which is precedent, not a requirement. Resolve it by citing where 30 s and 504 are required, or by marking the criterion non-blocking or dropping it. A 30 s wait on a user-facing quote request is also a questionable default to adopt by analogy."
     }
   ],
   "non_catching_examples": [
@@ -173,6 +193,11 @@
     {
       "category": "scope",
       "note": "Approach step 2 maps a timeout to HTTP 504, which is unsupported by the shared error middleware and unjustified without a retry; register the code there."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "The test strategy for ac-quote-pricing-timeout says only that a delayed response surfaces a timeout. A real 30 s delay would make the suite slow and flaky, and the 31 s bound leaves 1 s of slack. The plan does not say the client timeout is injectable (for example a constructor parameter or option) so tests can use a short timeout. Resolve by stating how the timeout is made configurable in tests and how the 504 mapping is asserted at the handler level, not only in the client."
     }
   ]
 }

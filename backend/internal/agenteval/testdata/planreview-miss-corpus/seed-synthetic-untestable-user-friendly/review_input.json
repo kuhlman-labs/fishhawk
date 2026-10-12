@@ -115,9 +115,14 @@
     "matter of taste",
     "matter of opinion",
     "in the eye of",
-    "no assertable"
+    "no assertable",
+    "no executor can decide"
   ],
   "attribution_phrases": [
+    "user-friendly",
+    "messages are clear"
+  ],
+  "defect_phrases": [
     "user-friendly",
     "messages are clear"
   ],
@@ -136,6 +141,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "The criterion that messages are clear and user-friendly is vague; state what each message must contain."
+    },
+    {
+      "severity": "medium",
+      "category": "testability",
+      "note": "ac-name-message-friendly says validation messages are \"clear and user-friendly\". No executor can decide pass or fail on those adjectives, and an implementation would be hard-pressed to violate them. The issue's actual requirement is that the message \"should tell the user what to fix\". Resolve by restating the criterion as an observable outcome, for example that each rejection message names the rule that failed (empty, over 64 characters, or disallowed characters) and states the allowed form. The handler tests can then assert on message content."
     }
   ],
   "non_catching_examples": [
