@@ -2593,14 +2593,18 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 const stateReviewCoverageIncomplete = "review_coverage_incomplete"
 
 // driveNextActionRerunReview is the server-stamped drive next_action verb for a
-// review_coverage_incomplete hold whose parent round settled with no verdict
+// review_coverage_incomplete hold whose parent round settled with no verdict,
+// or whose parent has no round and an open consolidated PR, so the verb starts
+// its first consolidated round (#4282)
 // (backend/internal/server/review_coverage.go); any other verb on the hold
-// means a round is in flight or not yet dispatched.
+// means a round is in flight, the consolidated PR is not open yet, or a gating
+// parent has no round.
 const driveNextActionRerunReview = "rerun_review"
 
 // reviewCoverageIncompleteNextActions is the review_coverage_incomplete arm
 // (#4219). It leads with the verb that clears the hold — fishhawk_rerun_review
-// when the drive stamp says the parent round settled with no verdict,
+// when the drive stamp says the parent round settled with no verdict or the
+// parent has no round and an open consolidated PR (#4282),
 // fishhawk_await_review otherwise — then the gate view, whose merge_readiness
 // blocker names the uncovered slice(s). It NEVER offers fishhawk_merge_run.
 // The drive Detail (the server's refusal message) is the lead action's reason.
@@ -2609,7 +2613,7 @@ func reviewCoverageIncompleteNextActions(run *Run, da *RunNextAction) *NextActio
 	lead := SuggestedAction{
 		Action:       "fishhawk_await_review",
 		Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
-		Precondition: "a decomposed slice is not yet covered by a successful agent review and the parent's implement-review round is in flight or not yet dispatched",
+		Precondition: "a decomposed slice is not yet covered by a successful agent review and the parent's implement-review round is in flight or not yet dispatched (the consolidated PR is not open yet, or a gating parent has no round — the hold's message then names fishhawk_fixup_stage)",
 		Consumes:     consumesNone,
 		Reason:       "await the parent's implement-review round; a round that records a verdict covers every slice and clears the hold",
 	}
@@ -2617,9 +2621,9 @@ func reviewCoverageIncompleteNextActions(run *Run, da *RunNextAction) *NextActio
 		lead = SuggestedAction{
 			Action:       "fishhawk_rerun_review",
 			Params:       params,
-			Precondition: "the parent's latest implement-review round settled with no verdict (every reviewer failed or was skipped) and a slice is not covered by its own review",
+			Precondition: "the parent's latest implement-review round settled with no verdict (every reviewer failed or was skipped), or no round was dispatched on the parent although its consolidated PR is open, and a slice is not covered by its own review",
 			Consumes:     consumesNone,
-			Reason:       "re-run the failed implement-review round so a successful agent review covers every slice, then await it with fishhawk_await_review",
+			Reason:       "re-run the failed implement-review round (or start the parent's first consolidated round) so a successful agent review covers every slice, then await it with fishhawk_await_review",
 		}
 	}
 	if da != nil && da.Detail != "" {

@@ -105,6 +105,15 @@ func withReviewRedispatch(ctx context.Context, rd reviewRedispatch) context.Cont
 // Of — and the #797 dedup check re-verifies it INSIDE reviewDispatchMu, so a
 // second dispatch carrying the same marker finds the first's new round newest
 // and dedups as an ordinary round would.
+//
+// That single-round guarantee is PROCESS-LOCAL (#4282): the in-lock
+// re-verification is serialised by reviewDispatchMu and concurrent POSTs by
+// claimRerun's pendingReruns set, and both live in this fishhawkd's memory.
+// Two fishhawkd replicas each holding the same marker can both observe round
+// Of newest under their own lock and each start a round for it — the same
+// single-replica limitation as the ADR-091 D6 boot re-dispatch path.
+// TestRunImplementReviewsForTree_RerunMarkerConcurrentDispatchStartsOneRound
+// pins the in-process half.
 type reviewRerun struct {
 	Of      int64
 	StageID uuid.UUID

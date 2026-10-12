@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -244,6 +245,18 @@ var activityCategories = map[string]struct{}{
 	// concern_resolve_failed is DELIBERATELY not registered: the concern's
 	// state did not change, which the thread already shows.
 	"concern_resolved_with_evidence": {},
+	// Merge-candidate verdict transfer (E87.2 / #4293, ADR-096 D5). System-actor
+	// audit kinds with NO dedicated Notifier method: server/
+	// merge_candidate_transfer.go marks each with notifyOperatorVisible. An
+	// enforce-mode transfer SKIPS a verify pass and a refusal names why it ran,
+	// so both are governance facts; the false-transfer row is the ADVISORY that
+	// a shadow decision would have transferred a verdict whose pass went red.
+	// The INTERNAL shadow row is DELIBERATELY not registered. The refusal and
+	// false-transfer detail is UNTRUSTED and renders only through
+	// NeutralizeUntrustedInline inside a code span.
+	"merge_candidate_verdict_transferred":      {},
+	"merge_candidate_verdict_transfer_refused": {},
+	"merge_candidate_verdict_false_transfer":   {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -352,6 +365,12 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderPartialDeliveryNeutralizedLine(e.Payload)
 	case "partial_delivery_remaining_scope_posted":
 		return "Partial delivery: remaining scope posted on the issue"
+	case "merge_candidate_verdict_transferred":
+		return renderVerdictTransferredLine(e.Payload)
+	case "merge_candidate_verdict_transfer_refused":
+		return renderVerdictTransferRefusedLine(e.Payload)
+	case "merge_candidate_verdict_false_transfer":
+		return renderVerdictFalseTransferLine(e.Payload)
 	case "run_revived_on_reopen":
 		if actor == "" {
 			return "PR reopened; the run was revived to its review gate"
@@ -464,6 +483,154 @@ func renderPartialDeliveryNeutralizedLine(payload json.RawMessage) string {
 		return verb
 	}
 	return fmt.Sprintf("Partial delivery: closing reference rewritten to `Refs #%d`", p.IssueNumber)
+}
+
+// verdictTransferRow is the subset of a merge-candidate verdict-transfer row
+// (server/merge_candidate_transfer.go) the activity lines read. reason_detail
+// is UNTRUSTED (it names repository paths).
+type verdictTransferRow struct {
+	FromHead     string `json:"from_head"`
+	ToHead       string `json:"to_head"`
+	ReasonCode   string `json:"reason_code"`
+	ReasonDetail string `json:"reason_detail"`
+}
+
+func decodeVerdictTransferRow(payload json.RawMessage) verdictTransferRow {
+	var p verdictTransferRow
+	if len(payload) > 0 {
+		_ = json.Unmarshal(payload, &p)
+	}
+	return p
+}
+
+// transferShortHead renders a head as its 7-hex prefix, or "an unknown head"
+// when the stored value is not hex: only a validated SHA reaches the line.
+func transferShortHead(sha string) string {
+	if len(sha) < 7 {
+		return "an unknown head"
+	}
+	for _, c := range sha {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "an unknown head"
+		}
+	}
+	return sha[:7]
+}
+
+// transferClosedCode passes a reason code of the closed shape
+// [a-z_]+(:[a-z_]+)? and answers "unknown" for anything else, so only the
+// detail is ever untrusted text.
+func transferClosedCode(code string) string {
+	if code == "" || len(code) > 64 {
+		return "unknown"
+	}
+	colons := 0
+	for i, c := range code {
+		switch {
+		case c == '_' || (c >= 'a' && c <= 'z'):
+		case c == ':' && i > 0 && i < len(code)-1 && colons == 0:
+			colons++
+		default:
+			return "unknown"
+		}
+	}
+	return code
+}
+
+// transferDetailMaxBytes bounds a rendered reason_detail.
+const transferDetailMaxBytes = 160
+
+// renderVerdictTransferredLine: "Merge-candidate verdict transferred from
+// <from7> to <to7> (independent base advance; no verify pass)".
+func renderVerdictTransferredLine(payload json.RawMessage) string {
+	p := decodeVerdictTransferRow(payload)
+	return fmt.Sprintf("Merge-candidate verdict transferred from %s to %s (%s base advance; no verify pass)",
+		transferShortHead(p.FromHead), transferShortHead(p.ToHead), transferClosedCode(p.ReasonCode))
+}
+
+// renderVerdictTransferRefusedLine names the closed reason code in plain text
+// and the UNTRUSTED detail neutralized inside ONE single-backtick code span,
+// so markdown, HTML, links, autolinks and @-mentions in it are inert.
+func renderVerdictTransferRefusedLine(payload json.RawMessage) string {
+	p := decodeVerdictTransferRow(payload)
+	line := fmt.Sprintf("Merge-candidate verdict transfer refused for %s (%s); the verify pass runs",
+		transferShortHead(p.ToHead), transferClosedCode(p.ReasonCode))
+	if d := NeutralizeUntrustedInline(p.ReasonDetail, transferDetailMaxBytes); d != "" {
+		line += " — detail `" + d + "`"
+	}
+	return line
+}
+
+// renderVerdictFalseTransferLine is the ADVISORY false-transfer line.
+func renderVerdictFalseTransferLine(payload json.RawMessage) string {
+	p := decodeVerdictTransferRow(payload)
+	return fmt.Sprintf("Advisory: FALSE verdict transfer — shadow would have transferred %s to %s (%s), but its verify pass failed",
+		transferShortHead(p.FromHead), transferShortHead(p.ToHead), transferClosedCode(p.ReasonCode))
+}
+
+// NeutralizeUntrustedInline makes untrusted text inert for single-line
+// display, in a code span on the comment surface and as plain JSON on the
+// gate view (E87.2 / #4293). It EXTENDS notifier.go's code-span sanitizer
+// rather than adding a third neutralizer: the markup runes are first mapped to
+// fullwidth look-alikes (< > & [ ] and @ → U+FF20, so no tag, entity, link or
+// @-mention survives even OUTSIDE a span), sanitizeSubjectForCodeSpan then
+// applies its backtick → ' and drop-control-characters (newlines included)
+// rules window by window, URL schemes ("://") and "www." are defanged so
+// nothing autolinks, and the result is capped at maxBytes on a rune boundary.
+// Pure, deterministic and idempotent.
+func NeutralizeUntrustedInline(s string, maxBytes int) string {
+	var mapped []rune
+	for _, r := range s {
+		switch r {
+		case '<':
+			r = '\uFF1C'
+		case '>':
+			r = '\uFF1E'
+		case '&':
+			r = '\uFF06'
+		case '[':
+			r = '\uFF3B'
+		case ']':
+			r = '\uFF3D'
+		case '@':
+			r = '\uFF20'
+		}
+		mapped = append(mapped, r)
+	}
+	var b strings.Builder
+	for i := 0; i < len(mapped); i += maxRenderedSubjectRunes {
+		b.WriteString(sanitizeSubjectForCodeSpan(string(mapped[i:min(i+maxRenderedSubjectRunes, len(mapped))])))
+	}
+	out := strings.ReplaceAll(b.String(), "://", ":\uFF0F\uFF0F")
+	out = defangWWW(out)
+	if maxBytes >= 0 && len(out) > maxBytes {
+		cut := maxBytes
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		out = out[:cut]
+	}
+	return out
+}
+
+// defangWWW replaces the "." of every case-insensitive "www." with a
+// fullwidth full stop so GitHub does not autolink it.
+func defangWWW(s string) string {
+	lower := strings.ToLower(s)
+	var b strings.Builder
+	last := 0
+	for {
+		i := strings.Index(lower[last:], "www.")
+		if i < 0 {
+			break
+		}
+		i += last
+		b.WriteString(s[last : i+3])
+		b.WriteRune('\uFF0E')
+		last = i + 4
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // renderModelResolvedLine renders a model_resolved activity row (#1013):

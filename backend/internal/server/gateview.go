@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -152,6 +153,15 @@ type gateViewResponse struct {
 	// run has no active entry; omitted with a merge_candidate_queue
 	// history_gaps entry when the store read fails.
 	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
+	// MergeCandidateVerdict is the ADR-096 verdict-transfer block (E87.2 /
+	// #4293, ADR-098 D3): the transfer mode, the merge-candidate verdict of the
+	// run's CURRENT head (newest Fishhawk-recorded head on the chain) with its
+	// source (recorded | transferred), the newest refused transfer and the
+	// shadow decisions paired at read time with the real pass outcome. ALWAYS
+	// PRESENT on handleGetRunGateView; omitted only when a read fails, which
+	// records a merge_candidate_verdict history_gaps entry instead. Computed
+	// only by handleGetRunGateView. See gateViewMergeCandidateVerdictFor.
+	MergeCandidateVerdict *gateViewMergeCandidateVerdict `json:"merge_candidate_verdict,omitempty"`
 }
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
@@ -182,6 +192,230 @@ const gateViewGapMergeReadiness = "merge_readiness"
 
 // gateViewGapMergeCandidateQueue names a failed ADR-092 queue read (#4200).
 const gateViewGapMergeCandidateQueue = "merge_candidate_queue"
+
+// gateViewGapMergeCandidateVerdict names a failed merge_candidate_verdict
+// read (E87.2 / #4293).
+const gateViewGapMergeCandidateVerdict = "merge_candidate_verdict"
+
+// gateViewMergeCandidateVerdict is the gate view's merge_candidate_verdict
+// block (E87.2 / #4293, ADR-096 D1/D2/D5 under ADR-098 D3).
+//
+// HeadSHA is the run's CURRENT head as the chain records it
+// (gateViewCurrentHead), and State / Cause / Source / TransferredFrom /
+// RootHead are mergeCandidateVerifyState for EXACTLY that head — the
+// predicate the merge gate reads — so a fix-up or conflict-resolution push
+// landing after a transferred base-advance head reports the NEW head's state,
+// never the older transferred verdict. Source is set only for a passed or
+// failed state; outside enforce a transferred row is ignored there (the
+// rollback contract), so the block never shows source transferred in off or
+// shadow. Shadow and FalseTransfers are always present (possibly empty).
+type gateViewMergeCandidateVerdict struct {
+	TransferMode        string                   `json:"transfer_mode"`
+	HeadSHA             string                   `json:"head_sha,omitempty"`
+	State               string                   `json:"state,omitempty"`
+	Cause               string                   `json:"cause,omitempty"`
+	Source              string                   `json:"source,omitempty"`
+	TransferredFrom     string                   `json:"transferred_from,omitempty"`
+	RootHead            string                   `json:"root_head,omitempty"`
+	LastTransferRefusal *gateViewTransferRefusal `json:"last_transfer_refusal,omitempty"`
+	Shadow              []gateViewTransferShadow `json:"shadow"`
+	// FalseTransfers names the to_head of every shadow would_transfer whose
+	// newest recorded pass FAILED — the named finding.
+	FalseTransfers []string `json:"false_transfers"`
+}
+
+// gateViewTransferRefusal is the newest merge_candidate_verdict_transfer_refused
+// row. ReasonDetail is UNTRUSTED (classifier text naming repository paths),
+// neutralized by issuecomment.NeutralizeUntrustedInline; ReasonUntrusted is
+// always true.
+type gateViewTransferRefusal struct {
+	ToHead          string `json:"to_head"`
+	FromHead        string `json:"from_head"`
+	ReasonCode      string `json:"reason_code"`
+	ReasonDetail    string `json:"reason_detail,omitempty"`
+	ReasonUntrusted bool   `json:"reason_untrusted"`
+	Mode            string `json:"mode,omitempty"`
+	Sequence        int64  `json:"sequence"`
+}
+
+// gateViewTransferShadow is one shadow decision paired with the newest
+// RECORDED merge_candidate_verified result for its to_head (PassResult, empty
+// while none landed). FalseTransfer = WouldTransfer && PassResult == failed.
+// ReasonDetail is UNTRUSTED and neutralized like gateViewTransferRefusal's.
+type gateViewTransferShadow struct {
+	ToHead          string `json:"to_head"`
+	FromHead        string `json:"from_head"`
+	WouldTransfer   bool   `json:"would_transfer"`
+	ReasonCode      string `json:"reason_code"`
+	ReasonDetail    string `json:"reason_detail,omitempty"`
+	ReasonUntrusted bool   `json:"reason_untrusted"`
+	DurationMS      int64  `json:"duration_ms"`
+	Sequence        int64  `json:"sequence"`
+	PassResult      string `json:"pass_result,omitempty"`
+	FalseTransfer   bool   `json:"false_transfer"`
+}
+
+// gateViewTransferReasonCodeMax bounds a rendered reason_code. Codes are a
+// closed Fishhawk-written enum; the bound and the neutralizer are defence in
+// depth against a hand-written chain row.
+const gateViewTransferReasonCodeMax = 64
+
+// gateViewMergeCandidateVerdictFor builds the merge_candidate_verdict block.
+// Any read failure (no audit repository, the head read, the verify-state read,
+// or the refused / shadow / verified category reads) returns nil plus a
+// merge_candidate_verdict history_gaps entry: the block is never built from a
+// partial read, and an unreadable state is never shown as "unverified".
+// Pairing is computed here, at read time, from durable rows, so it has no
+// write race with the async shadow append.
+func (s *Server) gateViewMergeCandidateVerdictFor(ctx context.Context, runRow *run.Run, resp *gateViewResponse) *gateViewMergeCandidateVerdict {
+	gap := func(err error) *gateViewMergeCandidateVerdict {
+		s.cfg.Logger.Warn("gate view: merge-candidate verdict read failed; omitting merge_candidate_verdict",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeCandidateVerdict)
+		return nil
+	}
+	if s.cfg.AuditRepo == nil {
+		return gap(errors.New("no audit repository is wired"))
+	}
+	block := &gateViewMergeCandidateVerdict{
+		TransferMode:   string(s.mergeCandidateTransferMode()),
+		Shadow:         []gateViewTransferShadow{},
+		FalseTransfers: []string{},
+	}
+	head, err := s.gateViewCurrentHead(ctx, runRow.ID)
+	if err != nil {
+		return gap(err)
+	}
+	if head != "" {
+		st, err := s.mergeCandidateVerifyState(ctx, runRow, head)
+		if err != nil {
+			return gap(err)
+		}
+		block.HeadSHA, block.State, block.Cause = head, st.State, st.Cause
+		if st.State == mergeCandidateStatePassed || st.State == mergeCandidateStateFailed {
+			block.Source, block.TransferredFrom, block.RootHead = st.Source, st.TransferredFrom, st.RootHead
+		}
+	}
+
+	refused, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryMergeCandidateVerdictTransferRefused)
+	if err != nil {
+		return gap(err)
+	}
+	for i := len(refused) - 1; i >= 0; i-- {
+		var p mergeCandidateTransferPayload
+		if json.Unmarshal(refused[i].Payload, &p) != nil {
+			continue
+		}
+		block.LastTransferRefusal = &gateViewTransferRefusal{
+			ToHead: p.ToHead, FromHead: p.FromHead,
+			ReasonCode:      neutralizeTransferReasonCode(p.ReasonCode),
+			ReasonDetail:    issuecomment.NeutralizeUntrustedInline(p.ReasonDetail, mergeCandidateTransferDetailMax),
+			ReasonUntrusted: true,
+			Mode:            p.Mode,
+			Sequence:        refused[i].Sequence,
+		}
+		break
+	}
+
+	shadows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryMergeCandidateVerdictTransferShadow)
+	if err != nil {
+		return gap(err)
+	}
+	if len(shadows) == 0 {
+		return block
+	}
+	verified, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryMergeCandidateVerified)
+	if err != nil {
+		return gap(err)
+	}
+	passResult := map[string]string{}
+	for _, e := range verified {
+		var p mergeCandidateVerifiedPayload
+		if json.Unmarshal(e.Payload, &p) == nil && p.HeadSHA != "" {
+			passResult[p.HeadSHA] = p.Result
+		}
+	}
+	listed := map[string]bool{}
+	for _, e := range shadows {
+		var p mergeCandidateTransferPayload
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		would := p.WouldTransfer != nil && *p.WouldTransfer
+		entry := gateViewTransferShadow{
+			ToHead: p.ToHead, FromHead: p.FromHead, WouldTransfer: would,
+			ReasonCode:      neutralizeTransferReasonCode(p.ReasonCode),
+			ReasonDetail:    issuecomment.NeutralizeUntrustedInline(p.ReasonDetail, mergeCandidateTransferDetailMax),
+			ReasonUntrusted: true,
+			DurationMS:      p.DurationMS,
+			Sequence:        e.Sequence,
+			PassResult:      passResult[p.ToHead],
+		}
+		entry.FalseTransfer = would && entry.PassResult == mergeCandidateResultFailed
+		if entry.FalseTransfer && !listed[p.ToHead] {
+			listed[p.ToHead] = true
+			block.FalseTransfers = append(block.FalseTransfers, p.ToHead)
+		}
+		block.Shadow = append(block.Shadow, entry)
+	}
+	return block
+}
+
+// neutralizeTransferReasonCode renders a stored reason_code inert and bounded.
+func neutralizeTransferReasonCode(code string) string {
+	return issuecomment.NeutralizeUntrustedInline(code, gateViewTransferReasonCodeMax)
+}
+
+// gateViewCurrentHeadSources are the chain rows that record a new run head,
+// with the payload field naming it. A performed branch_rebased names
+// new_head_sha (merge_commit_sha as a fallback); an already-up-to-date one
+// moves no head and is skipped.
+var gateViewCurrentHeadSources = []struct{ category, field string }{
+	{"pull_request_opened", "head_sha"},
+	{"child_pushed", "head_sha"},
+	{"fixup_pushed", "head_sha"},
+	{"acceptance_scenarios_pushed", "head_sha"},
+	{CategoryConflictResolutionPushed, "head_sha"},
+	{CategoryOperatorCommitVouched, "vouched_sha"},
+	{CategoryBranchRebased, "new_head_sha"},
+}
+
+// gateViewCurrentHead returns the run's newest recorded head: the head named
+// by the highest-sequence row across gateViewCurrentHeadSources, or "" when
+// the chain records none. A read error is returned (the caller records a gap).
+// A push Fishhawk did not record (an out-of-band operator push the operator
+// never vouched) is not seen; the merge gate itself reads the forge head.
+func (s *Server) gateViewCurrentHead(ctx context.Context, runID uuid.UUID) (string, error) {
+	var head string
+	var best int64 = -1
+	for _, src := range gateViewCurrentHeadSources {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, src.category)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range entries {
+			var p map[string]any
+			if json.Unmarshal(e.Payload, &p) != nil {
+				continue
+			}
+			if src.category == CategoryBranchRebased {
+				if up, _ := p["already_up_to_date"].(bool); up {
+					continue
+				}
+			}
+			sha, _ := p[src.field].(string)
+			if sha == "" && src.category == CategoryBranchRebased {
+				sha, _ = p["merge_commit_sha"].(string)
+			}
+			if sha == "" || e.Sequence < best {
+				continue
+			}
+			head, best = sha, e.Sequence
+		}
+	}
+	return head, nil
+}
 
 // gateViewMergeCandidateQueueFor builds the gate view's merge_candidate_queue
 // block: the run-read projection, or nil plus a history_gaps entry when the
@@ -695,6 +929,7 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// costs forge reads, and the attention scan calls buildGateView per run.
 	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
 	resp.MergeCandidateQueue = s.gateViewMergeCandidateQueueFor(r.Context(), runID, &resp)
+	resp.MergeCandidateVerdict = s.gateViewMergeCandidateVerdictFor(r.Context(), runRow, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

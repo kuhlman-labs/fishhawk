@@ -1826,6 +1826,32 @@ Notes:
   `activityCategories`: the concern's state did not change, which the thread
   already shows.
 
+- The merge-candidate verdict-transfer audit kinds (E87.2 / #4293, ADR-096
+  D1/D2/D5, ADR-098 D3) — `merge_candidate_verdict_transferred`,
+  `merge_candidate_verdict_transfer_refused` and the ADVISORY
+  `merge_candidate_verdict_false_transfer` — have **no dedicated Notifier
+  method**. They render **data-drivenly** on the living-anchor / status
+  timeline through `activityCategories` + `renderActivityLine`
+  (`status_template.go`), and their writers in
+  `server/merge_candidate_transfer.go` mark each with `notifyOperatorVisible`
+  after the append. Lines: "Merge-candidate verdict transferred from
+  <from7> to <to7> (<reason_code> base advance; no verify pass)";
+  "Merge-candidate verdict transfer refused for <to7> (<reason_code>); the
+  verify pass runs — detail `` `<detail>` ``"; "Advisory: FALSE verdict
+  transfer — shadow would have transferred <from7> to <to7> (<reason_code>),
+  but its verify pass failed". Heads render only when hex (else "an unknown
+  head") and the reason code only in its closed `[a-z_]+(:[a-z_]+)?` shape
+  (else `unknown`). The refusal's `reason_detail` is UNTRUSTED (classifier
+  text naming repository paths): it renders ONLY through
+  `issuecomment.NeutralizeUntrustedInline` — which extends notifier.go's
+  `sanitizeSubjectForCodeSpan` with fullwidth `< > & [ ] @`, a defanged `://`
+  and `www.`, and a byte cap — inside ONE single-backtick code span, so HTML,
+  links, autolinks and @-mentions in it are inert. No line mentions an actor,
+  so none @-mentions anyone. The INTERNAL shadow row
+  `merge_candidate_verdict_transfer_shadow` is DELIBERATELY not registered.
+  `merge_candidate_verdict_false_transfer` never blocks a gate and is not a
+  server_check concern.
+
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
   method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**

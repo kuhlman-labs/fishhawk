@@ -13,8 +13,12 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // Operator re-run of a failed implement-review round (#4219).
@@ -33,6 +37,16 @@ import (
 // re-dispatch: it carries its own marker (reviewRerun), never the D6 marker,
 // and the marker bypasses the dedup only after rerunBypassApplies re-verifies
 // it inside reviewDispatchMu.
+//
+// FIRST ROUND (#4282). A decomposed parent whose consolidated dispatch never
+// started a round (the forge compare failed, or was not wired when the
+// orchestrator fired DispatchConsolidatedReview) is held by the coverage hold
+// with nothing to re-run, and nothing re-fires that dispatch. On such a parent
+// — once its consolidated PR is open — the verb starts the FIRST consolidated
+// round instead: it runs the same round body (runConsolidatedReviewRound)
+// synchronously. That round carries NO re-run marker: it is a first dispatch of
+// its head, so the #797 same-head dedup under reviewDispatchMu is what keeps it
+// single against a concurrent orchestrator dispatch.
 
 // categoryReviewRoundRerunRequested is the audit row the re-run verb appends,
 // synchronously and before any dispatch, for each round it re-runs.
@@ -55,6 +69,19 @@ const (
 	rerunInFlightUnsettled     = "round_unsettled"
 )
 
+// First-round refusal reasons (#4282), carried in details.reason of a 409
+// review_rerun_ineligible. The rest of the first-round ladder reuses the
+// re-dispatch slugs (reviewer_unwired, gating_authority,
+// implement_stage_terminal, advanced_past_review, forge_compare_unavailable).
+const (
+	rerunSlugNoAgentReviewers = "no_agent_reviewers"
+	rerunSlugConsolidatedDue  = "consolidated_review_not_due"
+)
+
+// rerunMergeCandidateUnreadable is details.merge_candidate_state on a
+// fanin_verify_held 502 whose state could not be re-read.
+const rerunMergeCandidateUnreadable = "unreadable"
+
 // reviewRoundRerunRequestedPayload is the review_round_rerun_requested audit
 // payload. RerunOfSequence names the re-run round's implement_review_started.
 type reviewRoundRerunRequestedPayload struct {
@@ -66,6 +93,10 @@ type reviewRoundRerunRequestedPayload struct {
 	Authority        planreview.AuthorityMode `json:"authority"`
 	RoundOrigin      string                   `json:"round_origin,omitempty"`
 	HeadSHA          string                   `json:"head_sha,omitempty"`
+	// FirstRound marks a request that started a decomposed parent's FIRST
+	// consolidated round (#4282): RerunOfSequence is then 0 and HeadSHA is
+	// absent (the compare resolves it after the row is recorded).
+	FirstRound bool `json:"first_round,omitempty"`
 }
 
 // rerunReviewResponse is the 200 body of POST /v0/runs/{run_id}/reviews/rerun.
@@ -166,10 +197,13 @@ func (s *Server) rerunIneligibleSlug(ctx context.Context, runID uuid.UUID, lates
 }
 
 // handleRerunReview re-runs the run's latest implement-review round when that
-// round settled with ZERO verdicts (#4219). Refusals, in order, each decided
+// round settled with ZERO verdicts (#4219), or starts a decomposed parent's
+// FIRST consolidated round when it has none (#4282, rerunFirstConsolidatedRound,
+// whose own ladder is documented there). Refusals, in order, each decided
 // before anything is written:
 //
-//	409 no_review_round          — the run has no implement_review_started.
+//	409 no_review_round          — the run has no implement_review_started and
+//	                               is not a decomposed parent.
 //	409 review_round_in_flight   — a re-run of this run is pending in this
 //	                               process, the round is mid-handoff to a boot
 //	                               re-dispatch, or not every configured
@@ -230,7 +264,8 @@ func (s *Server) handleRerunReview(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
 	}
-	if _, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
 		if dberr.IsUnavailable(err) {
 			s.writeDBUnavailable(w, r)
 			return
@@ -261,9 +296,7 @@ func (s *Server) handleRerunReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		s.writeError(w, r, http.StatusConflict, rerunCodeNoReviewRound,
-			"this run has no implement-review round to re-run",
-			map[string]any{"run_id": runID.String()})
+		s.rerunFirstConsolidatedRound(w, r, id, runRow, stage)
 		return
 	}
 	round := map[string]any{"run_id": runID.String(), "round_sequence": latest.Sequence}
@@ -366,6 +399,235 @@ func (s *Server) handleRerunReview(w http.ResponseWriter, r *http.Request) {
 		NewRoundSequence: newSeq,
 		ConfiguredAgents: payload.ConfiguredAgents,
 	})
+}
+
+// firstRoundTarget is what the first-round ladder resolved for a decomposed
+// parent that passed it: the parent implement stage the round attaches to, the
+// configured agent count, and the forge compare to source the diff through.
+type firstRoundTarget struct {
+	implStage *run.Stage
+	agents    int
+	comparer  patchComparer
+	scope     forge.CredentialScope
+	repo      forge.RepoRef
+}
+
+// firstRoundIneligibleSlug is the first-round path's eligibility ladder (#4282)
+// for a decomposed parent with no implement round. Each rung is decided before
+// any write, in this order:
+//
+//   - reviewer_unwired: no reviewer backend is wired.
+//   - no_agent_reviewers: the implement stage configures zero agent reviewers.
+//     It precedes the authority rung because zero agents resolve to
+//     AuthorityGateless, and that rung refuses only AuthorityGating.
+//   - gating_authority: a gating round runs its reviewers synchronously and
+//     transitions the stage on a reject, behind the operator's back (the same
+//     reason rerunIneligibleSlug refuses a gating round). The remedy is a
+//     fix-up on the parent implement stage, whose pushed head dispatches the
+//     re-review.
+//   - consolidated_review_not_due: the parent has no implement stage or its
+//     consolidated PR is not open yet. The orchestrator dispatches the
+//     consolidated round when the PR opens.
+//   - implement_stage_terminal / advanced_past_review: implementRoundStageSlug
+//     on the parent implement stage, the boot re-dispatch's stage check.
+//   - forge_compare_unavailable: forgeCompareFor names a reason.
+//
+// "" means the round may start; err is non-nil only when a read failed.
+func (s *Server) firstRoundIneligibleSlug(ctx context.Context, runRow *run.Run) (firstRoundTarget, string, error) {
+	var t firstRoundTarget
+	if s.defaultPlanReviewer() == nil {
+		return t, redispatchSlugReviewerUnwired, nil
+	}
+	authority := planreview.AuthorityGateless
+	if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
+		t.agents = cfg.AgentCount()
+		authority = planreview.ResolveAuthority(*cfg)
+	}
+	if t.agents == 0 {
+		return t, rerunSlugNoAgentReviewers, nil
+	}
+	if authority == planreview.AuthorityGating {
+		return t, redispatchSlugGatingAuthority, nil
+	}
+	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return t, rerunSlugConsolidatedDue, nil
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		return t, "", fmt.Errorf("list stages for run %s: %w", runRow.ID, err)
+	}
+	t.implStage = consolidatedImplementStage(stages)
+	if t.implStage == nil {
+		return t, rerunSlugConsolidatedDue, nil
+	}
+	if slug, err := s.implementRoundStageSlug(ctx, runRow.ID, t.implStage.ID); err != nil || slug != "" {
+		return t, slug, err
+	}
+	var reason string
+	t.comparer, t.scope, t.repo, reason = s.forgeCompareFor(runRow)
+	if reason != "" {
+		return t, redispatchSlugForgeCompareUnavail, nil
+	}
+	return t, "", nil
+}
+
+// firstRoundRefusalHint is the sentence a first-round 409 appends after its
+// reason.
+func firstRoundRefusalHint(slug string) string {
+	switch slug {
+	case redispatchSlugGatingAuthority:
+		return "the parent's implement reviewers are gating, and a gating round runs its reviewers synchronously and transitions the stage on a reject, so this verb does not start one. Route fishhawk_fixup_stage on the parent implement stage: the fix-up's pushed head dispatches the re-review"
+	case rerunSlugConsolidatedDue:
+		return "the consolidated PR is not open yet (or the parent has no implement stage); the orchestrator dispatches the consolidated round when the PR opens, so await it with fishhawk_await_review"
+	case rerunSlugNoAgentReviewers:
+		return "the implement stage configures no agent reviewers, so there is no round to start"
+	case redispatchSlugReviewerUnwired:
+		return "no reviewer backend is wired on this deployment"
+	case redispatchSlugForgeCompareUnavail:
+		return "the forge compare that sources the consolidated diff is not wired for this run"
+	}
+	return "the parent implement stage no longer wants a review round"
+}
+
+// rerunFirstConsolidatedRound is handleRerunReview's FIRST-ROUND path (#4282):
+// the run has no implement_review_started. Not a decomposed parent (a child
+// run, or a run with no decomposed children) → the unchanged 409
+// no_review_round. Otherwise firstRoundIneligibleSlug's ladder answers 409
+// review_rerun_ineligible before any write.
+//
+// An eligible parent gets review_round_rerun_requested (rerun_of_sequence 0,
+// first_round true, authority advisory, round_origin consolidated) appended
+// chained, then runConsolidatedReviewRound runs SYNCHRONOUSLY on a context
+// detached from the request, over the same base and branch the orchestrator's
+// consolidated trigger uses (orchestrator.go: DefaultRef, else "main"; the
+// consolidated branch). The permission-drift check re-runs with it, under the
+// fan-in re-entry semantics every consolidated re-dispatch already has. The
+// latest implement round is then re-read: one present → 200 with
+// rerun_of_sequence 0 and its sequence (a concurrent orchestrator dispatch of
+// the same head dedups on #797, so at most one exists); none → 502
+// review_rerun_not_started with details.reason compare_failed,
+// fanin_verify_held (plus details.merge_candidate_state; the hold may itself
+// have STARTED a merge-candidate verify pass, so that 502 is not write-free) or
+// round_not_started.
+func (s *Server) rerunFirstConsolidatedRound(w http.ResponseWriter, r *http.Request, id Identity, runRow *run.Run, stage orphanedReviewStageKind) {
+	ctx := r.Context()
+	runID := runRow.ID
+	details := map[string]any{"run_id": runID.String()}
+	checkFailed := func(err error) {
+		s.writeError(w, r, http.StatusInternalServerError, rerunCodeCheckFailed,
+			"could not read this run's implement-review state; nothing was started",
+			map[string]any{internalCauseKey: err.Error()})
+	}
+	noRound := func() {
+		s.writeError(w, r, http.StatusConflict, rerunCodeNoReviewRound,
+			"this run has no implement-review round to re-run", details)
+	}
+	if runRow.DecomposedFrom != nil {
+		noRound()
+		return
+	}
+	children, err := s.listAllDecomposedChildren(ctx, runID)
+	if err != nil {
+		checkFailed(err)
+		return
+	}
+	if len(children) == 0 {
+		noRound()
+		return
+	}
+	target, slug, err := s.firstRoundIneligibleSlug(ctx, runRow)
+	if err != nil {
+		checkFailed(err)
+		return
+	}
+	if slug != "" {
+		details["reason"] = slug
+		if target.implStage != nil {
+			details["stage_id"] = target.implStage.ID.String()
+		}
+		s.writeError(w, r, http.StatusConflict, rerunCodeIneligible,
+			"no implement-review round has been dispatched on this decomposed parent and its first consolidated round cannot be started: "+slug+" — "+firstRoundRefusalHint(slug), details)
+		return
+	}
+	stageID := target.implStage.ID
+	body, _ := json.Marshal(reviewRoundRerunRequestedPayload{
+		Stage:            stage.label,
+		StageID:          stageID.String(),
+		RerunOfSequence:  0,
+		ConfiguredAgents: target.agents,
+		Authority:        planreview.AuthorityAdvisory,
+		RoundOrigin:      reviewRoundOriginConsolidated,
+		FirstRound:       true,
+	})
+	actorKind := actorKindForSubject(id.Subject)
+	subject := id.Subject
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     categoryReviewRoundRerunRequested,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      body,
+	}); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, rerunCodeAuditFailed,
+			"could not record the review re-run request; nothing was started",
+			map[string]any{internalCauseKey: err.Error()})
+		return
+	}
+
+	base := "main"
+	if s.cfg.Orchestrator != nil && s.cfg.Orchestrator.DefaultRef != "" {
+		base = s.cfg.Orchestrator.DefaultRef
+	}
+	// Detached from the request so a client disconnect mid-compare cannot
+	// cancel a round the audit row already announced.
+	failSlug, headSHA := s.runConsolidatedReviewRound(context.WithoutCancel(ctx), runRow, stageID, base,
+		orchestrator.ConsolidatedBranch(runID), target.comparer, target.scope, target.repo)
+
+	latest, _, ok, err := s.latestReviewStarted(ctx, runID, stage)
+	if err != nil {
+		checkFailed(err)
+		return
+	}
+	if ok {
+		s.writeJSON(w, r, http.StatusOK, rerunReviewResponse{
+			RunID:            runID.String(),
+			Stage:            stage.label,
+			StageID:          stageID.String(),
+			RerunOfSequence:  0,
+			NewRoundSequence: latest.Sequence,
+			ConfiguredAgents: target.agents,
+		})
+		return
+	}
+	if failSlug == "" {
+		failSlug = redispatchSlugRoundNotStarted
+	}
+	details["reason"] = failSlug
+	details["stage_id"] = stageID.String()
+	msg := "the first consolidated round was recorded but started no round: " + failSlug
+	if failSlug == consolidatedRoundSlugFanInVerifyHeld {
+		state := rerunMergeCandidateUnreadable
+		if st, serr := s.mergeCandidateVerifyState(ctx, runRow, headSHA); serr == nil {
+			state = st.State
+		}
+		details["merge_candidate_state"] = state
+		msg += " — " + fanInHeldHint(state)
+	}
+	s.writeError(w, r, http.StatusBadGateway, rerunCodeNotStarted, msg, details)
+}
+
+// fanInHeldHint is the remedy a fanin_verify_held 502 names, by the consolidated
+// head's merge-candidate state (ADR-090 D5).
+func fanInHeldHint(state string) string {
+	switch state {
+	case mergeCandidateStateFailed:
+		return "the consolidated head's merge-candidate verify FAILED; route fishhawk_fixup_stage on the parent implement stage (details.stage_id): the fix-up's pushed head is runner-gated and dispatches the review"
+	case mergeCandidateStateInFlight:
+		return "a merge-candidate verify pass is in flight for the consolidated head (this call may have just started it); await it: its report dispatches the round"
+	}
+	return "the merge-candidate verify state is " + state + ", so the fan-in hold could neither start nor confirm a pass; read the fishhawkd log for the hold's reason"
 }
 
 // countReviewVerdictsAfter counts the run's implement_reviewed entries
