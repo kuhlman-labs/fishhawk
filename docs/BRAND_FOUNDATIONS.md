@@ -79,7 +79,9 @@ Four convictions that should shape every brand expression:
 
 ### Product vocabulary
 
-Inside the product and in copy: **captain** (the human who commands a repository), **crew** (the agent roles), **first officer** (the operator agent), **bridge** (where the captain decides), **log** (the audit chain), **standing orders** (charter and workflow spec). Generic nautical words only — no references to any film, TV, or game franchise, in copy, imagery, or product names.
+Inside the product and in copy: **captain** (the human who commands a repository), **crew** (the agent roles), **operator** (the agent that drives runs and campaigns), **first officer** (the read-only crew seat that watches over them and raises evidence-backed findings), **bridge** (where the captain decides), **log** (the audit chain), **standing orders** (charter and workflow spec). Generic nautical words only — no references to any film, TV, or game franchise, in copy, imagery, or product names.
+
+**Role naming rule.** Nautical titles are reserved for **command and oversight**: the **captain** (decides) and the **first officer** (oversees), plus the framing nouns (crew, bridge, log, standing orders). Every **working** crew role takes a plain functional name that says what it does — planner, implementer, reviewer, acceptance, operator, groomer, product manager, release manager, ops, architect, historian, security, upkeep, comms. Identifiers in code, the API, and the workflow spec always use the functional lowercase name (`first_officer`, `security`, `upkeep`). Do not theme a working role (no boatswain, purser, quartermaster): the metaphor earns its place where it explains authority, and costs clarity everywhere else.
 
 ### Positioning against incumbents
 
