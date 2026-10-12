@@ -1,0 +1,14 @@
+id: scenario:issue-4253/fingerprint-rekeyed
+statement: Running the catchrategate command with --print-fingerprint on the merged tree exits 0 and prints a sha256 prompt fingerprint different from sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f (the 2026-10-10 baseline's), because the catch rule and the corpus changed.
+verify_hint: 'CLI: from backend/, `go run ./internal/agenteval/catchrategate --print-fingerprint` — observe exit code 0 and the stdout digest; compare with the literal above.'
+steps: 'Posture B, as verify_hint names a repository-local CLI. The checkout is /tmp/fishhawk-acceptance-tree-375d55fa-df6c-4116-8c08-6942b9b6ffb9-d0424c6a-0c3a-4770-b771-177fc520688d at HEAD 6bc6d170, which matches the preview''s GET /healthz git_sha 6bc6d170, and its tree is clean. Ran: cd backend && go run ./internal/agenteval/catchrategate --print-fingerprint, and recorded the exit code and stdout.'
+assertions:
+    expected: exit 0 and a sha256 digest different from sha256:3175d4c69482d07f52ddeec6147b7967e5c2b5af3fb280d34742cc67b5e1c79f
+    observed_at_record: 'Exit 0. The first stdout line is sha256:e443cd50ef0fc33f1a2d37156b527a03615ad400613c1f15eca97191123e7db0 and the second line is the rule text. This differs from the 2026-10-10 baseline sha256:3175d4c6...c79f. Running catchrategate without the flag also confirms the change: it reports that the committed evidence.json is STALE (recorded 3175d4c6... != current e443cd50...).'
+    repro_handle: cd backend && go run ./internal/agenteval/catchrategate --print-fingerprint; echo $?
+origin:
+    issue: 4253
+    pr: 0
+    run_id: 375d55fa-df6c-4116-8c08-6942b9b6ffb9
+    head_sha: 6bc6d170faafbaa660e3c821c12d3ad402fc0f25
+    recorded_at: 2026-10-12T01:18:33Z
