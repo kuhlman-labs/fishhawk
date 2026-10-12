@@ -9,6 +9,15 @@
 // sidecar path: a missed trial's concern notes, with their near-miss tags,
 // are read there.
 //
+// --rescore is a DIAGNOSTIC, not a gate verdict (E55.22 / #4355): it
+// re-classifies the sidecar derived from --evidence under the CURRENT --corpus
+// and catch rule via agenteval.RescoreCatchRateTrials, with no model call, and
+// prints the report — per arm and case, recorded vs re-scored catches beside
+// the attribution-only rate. The re-score is a per-arm LOWER BOUND (stored
+// notes are truncated, concerns capped, and a caught trial keeps only its
+// matching concern), it never writes evidence, and it never prints PASS, so a
+// probe change can be evaluated with it before paying for a recording.
+//
 // It lives under backend/internal/agenteval (not backend/cmd) on purpose: it
 // is a gate over agenteval's own testdata, never a shipped binary, and
 // scripts/check-review-prompt-eval runs it with `go run` from the backend
@@ -18,12 +27,16 @@
 //
 //	(cd backend && go run ./internal/agenteval/catchrategate)
 //	(cd backend && go run ./internal/agenteval/catchrategate --print-fingerprint)
+//	(cd backend && go run ./internal/agenteval/catchrategate --rescore)
 //
-// Exit codes: 0 the evidence passes (report on stdout), 1 the gate fails
-// (reason on stderr), 2 usage error. Every outcome ends with the rule line
+// Exit codes: 0 the evidence passes (report on stdout), or --print-fingerprint
+// / --rescore succeeded; 1 the gate fails (reason on stderr), or the re-score
+// or fingerprint cannot be computed; 2 usage error (including --rescore with
+// --print-fingerprint). Every outcome ends with the rule line
 // (agenteval.CatchRateRule: the 0.10 tolerance, the 136-trial floor and its
 // derivation) — on stdout for a pass, on stderr otherwise (so
-// --print-fingerprint's stdout stays the bare digest).
+// --print-fingerprint's stdout stays the bare digest and --rescore's stdout is
+// never mistaken for a pass).
 package main
 
 import (
@@ -73,6 +86,7 @@ func gate(args []string, stdout, stderr io.Writer) (code int, passed bool) {
 	corpus := fs.String("corpus", "", "plan-review-miss corpus dir (default: the committed "+defaultCorpusRel+")")
 	conventions := fs.String("conventions", "", "representative conventions fixture (default: the committed "+defaultConventionsRel+")")
 	printFingerprint := fs.Bool("print-fingerprint", false, "print the CURRENT prompt fingerprint and exit 0 (compare with the record's prompt_fingerprint to confirm staleness)")
+	rescore := fs.Bool("rescore", false, "re-score the trial sidecar derived from --evidence under the CURRENT --corpus and catch rule and print the report (a diagnostic per-arm LOWER BOUND, never a PASS; never writes evidence); exits 0")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintf(stderr, `catchrategate — the offline plan-review catch-rate gate (E55.4 / #2245).
 
@@ -80,6 +94,13 @@ Decides from the committed two-arm evidence record (no model call, no network)
 and its per-trial sidecar beside it (<evidence stem>.trials.json, e.g.
 evidence.trials.json; derived from --evidence, never a separate flag).
 Exit 0: the evidence passes. Exit 1: the gate fails (reason on stderr). Exit 2: usage.
+
+--rescore is a diagnostic, not a gate verdict: it re-classifies the recorded
+trial sidecar under the CURRENT corpus and catch rule with no model call and
+prints recorded vs re-scored catches (a per-arm LOWER BOUND) beside the
+attribution-only rate. It never writes evidence and never prints PASS: use it
+to evaluate a probe change before paying for a recording. It cannot be
+combined with --print-fingerprint.
 Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 
 `)
@@ -90,6 +111,11 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 	}
 	if fs.NArg() > 0 {
 		_, _ = fmt.Fprintf(stderr, "catchrategate: unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return 2, false
+	}
+	if *rescore && *printFingerprint {
+		_, _ = fmt.Fprintln(stderr, "catchrategate: --rescore and --print-fingerprint are mutually exclusive")
 		fs.Usage()
 		return 2, false
 	}
@@ -127,6 +153,18 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 			return 1, false
 		}
 		_, _ = fmt.Fprintln(stdout, fp)
+		return 0, false
+	}
+
+	if *rescore {
+		res, err := agenteval.RescoreCatchRateTrials(agenteval.CatchRateTrialsPath(*evidence), *corpus)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "catchrategate: rescore: %v\n", err)
+			return 1, false
+		}
+		// Never passed: the report is a diagnostic, so the rule line goes to
+		// stderr and no PASS line is printed.
+		_, _ = fmt.Fprint(stdout, res.Render())
 		return 0, false
 	}
 
