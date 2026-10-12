@@ -104,10 +104,7 @@
     "issue says nothing",
     "issue is silent",
     "scope creep",
-    "speculative",
     "not stated in the issue",
-    "not in the issue",
-    "invented",
     "not grounded",
     "ungrounded",
     "no basis in the issue",
@@ -115,7 +112,16 @@
     "borrowed from audit_events",
     "copied from audit_events",
     "copied from the audit_events",
-    "carried over from audit_events"
+    "carried over from audit_events",
+    "invented retention",
+    "speculative retention",
+    "retention is invented",
+    "retention is speculative",
+    "retention is not in the issue",
+    "retention period is not in the issue",
+    "purge is invented",
+    "purge is speculative",
+    "purge is not in the issue"
   ],
   "attribution_phrases": [
     "90 days",

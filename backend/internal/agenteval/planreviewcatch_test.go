@@ -506,6 +506,7 @@ var genericObjectionWords = []string{
 	"should be rejected", "must be rejected", "no bound", "no threshold",
 	"no time limit", "no concrete", "not concrete", "unquantified", "no measurable",
 	"the issue says", "the issue states", "the issue requires", "the issue specifies",
+	"invented", "speculative", "not in the issue",
 }
 
 // TestCommittedCatchProbes_GenericObjectionsScoreMissed pins that the
@@ -544,6 +545,49 @@ func TestCommittedCatchProbes_GenericObjectionsScoreMissed(t *testing.T) {
 		}
 		if !pinned {
 			t.Errorf("case %q has no non_catching_example naming the planted criterion with a generic objection word", c.Name)
+		}
+	}
+}
+
+// spuriousApproachAndVerbNotes are the operator's spurious-catch replica
+// notes (#4253 second fix-up) that name the approach step a criterion cites,
+// or a bare verb of its statement, about a DIFFERENT aspect. Each is declared
+// verbatim as a non_catching_example of its case.
+var spuriousApproachAndVerbNotes = []struct{ caseName, note string }{
+	{"seed-synthetic-restates-approach", "Approach step 2 restates step 1's migration ordering; fold them into one step."},
+	{"seed-synthetic-restates-approach", "In approach step 2 the handler is not an outcome-bearing component; split the write path…"},
+	{"seed-synthetic-inferred-criterion", "Do not hand-roll a paginate helper; an invented cursor scheme duplicates ListPage."},
+	{"seed-synthetic-inferred-criterion", "The paginate call should use the shared cursor; a speculative offset scheme will drift."},
+	{"seed-synthetic-inferred-criterion", "…paginate via the existing helper; a new one is not in the issue's style guide."},
+}
+
+// TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute pins that
+// an attribution phrase is the planted criterion's own wording: a concern
+// about the approach step it cites ("approach step 2") or naming a bare verb
+// of it ("paginate") is not attributed to the planted criterion. Each note is
+// also a declared non_catching_example, so the two cannot drift.
+func TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute(t *testing.T) {
+	cases, _ := loadCommittedCatch(t)
+	byName := map[string]PlanReviewCatchCase{}
+	for _, c := range cases {
+		byName[c.Name] = c
+	}
+	for _, s := range spuriousApproachAndVerbNotes {
+		c, ok := byName[s.caseName]
+		if !ok {
+			t.Fatalf("committed corpus lacks case %q", s.caseName)
+		}
+		declared := false
+		for _, ex := range c.Input.NonCatchingExamples {
+			if ex.Note == s.note {
+				declared = true
+			}
+		}
+		if !declared {
+			t.Errorf("case %q does not declare %q verbatim as a non_catching_example", s.caseName, s.note)
+		}
+		if got, ok := matchCatchAttribution("scope", s.note, c.CatchRule()); ok {
+			t.Errorf("case %q: %q is attributed (%s) to the planted criterion, want unattributed", s.caseName, s.note, got)
 		}
 	}
 }

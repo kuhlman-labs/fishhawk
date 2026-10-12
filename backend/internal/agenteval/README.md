@@ -648,7 +648,7 @@ re-measurement.
 **Prompt-vocabulary probes are safe ONLY because of the same-concern
 attribution requirement.** The probe sets include the plan-review prompt's
 own vocabulary and the generic words a reviewer uses for every defect of a
-class (`vague`, `no observable`, `speculative`, `invented`,
+class (`vague`, `no observable`, `untestable`, `not warranted`,
 `not stated in the issue`, …). A reviewer uses those
 words in concerns about ANY criterion, so as probes alone they would score a
 concern about a different, genuinely vague criterion as a catch of the
@@ -662,12 +662,21 @@ the planted criterion: "the 20 MB PDF fixture has a content-type mismatch"
 names the planted criterion and is not a catch. So `mismatch`, `diverges`,
 `unjustified`, `ambiguous`, `unsupported`, `contrary to`, `at odds with`,
 `copied from`, `borrowed`, `should be rejected`, `no bound`, `no threshold`,
-`no time limit`, `not concrete` and `the issue says`/`states`/`requires`/
-`specifies` are not probes; where the defect needs one, it is paired with
-a case-specific token (`at odds with the issue`, `at odds with the 10`,
-`unsupported by the issue`, `copied from audit_events`). Short attribution
-phrases that the issue or an approach step also uses (`504`,
-`duplicate_name`) are not declared. Every case carries a
+`no time limit`, `not concrete`, `the issue says`/`states`/`requires`/
+`specifies`, `invented`, `speculative` and `not in the issue` are not
+probes; where the defect needs one, it is paired with a case-specific token
+(`at odds with the issue`, `at odds with the 10`, `unsupported by the issue`,
+`copied from audit_events`, `cap is invented`, `speculative timeout`,
+`rate limit is not in the issue`). A restated-approach probe names the
+restating criterion (`restates the approach`, `criterion restates`), never a
+bare `restates step` or `not an outcome`. An attribution phrase is the
+planted criterion's OWN wording, never a token the issue or an approach step
+also uses (`504`, `duplicate_name`) nor a reference to the approach step the
+criterion cites (`approach step 2`) or a bare verb (`paginate`): a concern
+about that step or that verb is not, by naming it, about the planted
+criterion (`TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute`
+pins five such replica notes, each also a declared `non_catching_example`, as
+unattributed). Every case carries a
 `non_catching_example` naming the planted criterion together with a generic
 objection word, and `TestCommittedCatchProbes_GenericObjectionsScoreMissed`
 scores each case's id and every declared phrase, joined with every word in

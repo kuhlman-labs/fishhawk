@@ -20,7 +20,7 @@
 // the same note or category). A probe never occurs in the issue or plan the
 // reviewer is shown (loader mode m), so a concern that merely ECHOES that
 // wording scores missed; the attribution half additionally keeps a probe that
-// is the plan-review prompt's OWN vocabulary (vague, speculative, ...) from
+// is the plan-review prompt's OWN vocabulary (vague, untestable, ...) from
 // scoring a concern about a DIFFERENT criterion as a catch. Neither half alone
 // catches, and the two must meet in one concern. An UNDECODABLE verdict counts
 // as a MISS in the rate and is reported separately — excluding it from the

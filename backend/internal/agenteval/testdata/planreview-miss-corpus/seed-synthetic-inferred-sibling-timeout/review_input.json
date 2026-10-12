@@ -100,17 +100,24 @@
     "issue says nothing",
     "issue is silent",
     "scope creep",
-    "speculative",
     "not stated in the issue",
-    "not in the issue",
-    "invented",
     "not grounded",
     "ungrounded",
     "no basis in the issue",
     "unsupported by the issue",
     "borrowed from the inventory",
     "copied from the inventory",
-    "carried over from the inventory"
+    "carried over from the inventory",
+    "invented timeout",
+    "speculative timeout",
+    "timeout is invented",
+    "timeout is speculative",
+    "timeout is not in the issue",
+    "invented 504",
+    "speculative 504",
+    "504 is invented",
+    "504 is speculative",
+    "504 is not in the issue"
   ],
   "attribution_phrases": [
     "30 seconds",
@@ -130,7 +137,7 @@
     {
       "severity": "medium",
       "category": "acceptance_criteria",
-      "note": "The inferred criterion that POST /quotes returns 504 within 31 seconds is speculative: the issue states no timeout, and the inventory client's value is not a requirement for quotes."
+      "note": "The inferred criterion that POST /quotes returns 504 within 31 seconds is speculative: the issue never asks for a timeout, and the inventory client's value is not a requirement for quotes."
     }
   ],
   "non_catching_examples": [
