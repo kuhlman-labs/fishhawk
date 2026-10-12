@@ -1582,3 +1582,135 @@ func TestComposeGateEvidence_NoCounterfactualEventsByteIdentical(t *testing.T) {
 		t.Fatalf("payload = %s\nwant %s", ev.Payload, want)
 	}
 }
+
+// flakeAbsorbedGolden is the evidence the shared golden
+// testdata/wire/verify_flake_absorbed_evidence.json pins (#4229). The
+// backend's bundle_test decodes the same file.
+func flakeAbsorbedGolden() flakeAbsorbedEvidence {
+	return flakeAbsorbedEvidence{
+		Iteration: 2,
+		TreeSHA:   "c1e8a4f7b2d9e6a3c0f5b8d1e4a7c2f9b6d3e0a5",
+		Packages: []string{
+			"github.com/kuhlman-labs/fishhawk/backend/internal/run",
+			"github.com/kuhlman-labs/fishhawk/runner/internal/upload",
+		},
+		PackageDirs:   []string{"backend/internal/run", "runner/internal/upload"},
+		Tests:         []string{"TestDispatchLiveness_HeartbeatWindow", "TestShipTrace_TerminalEgressBudget"},
+		FailedModules: []string{"backend", "runner"},
+		PatchCoverage: "pass",
+	}
+}
+
+// TestFlakeAbsorbedEvidence_MarshalsSharedGolden pins the runner half of the
+// verify_flake_absorbed_evidence contract on FIXED BYTES: an event built by the
+// production constructor folds, through composeGateEvidence, into a
+// gate_evidence flake_absorbed member byte-equal to the shared golden.
+func TestFlakeAbsorbedEvidence_MarshalsSharedGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "verify_flake_absorbed_evidence.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	want := bytes.TrimSuffix(raw, []byte("\n"))
+
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "", "", 0, "ok", "passed"),
+		flakeAbsorbedEvent(flakeAbsorbedGolden()),
+	}
+	ev := composeGateEvidence(events, 1)
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil")
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(ev.Payload, &all); err != nil {
+		t.Fatalf("decode gate_evidence: %v", err)
+	}
+	got, err := json.Marshal(map[string]json.RawMessage{"flake_absorbed": all["flake_absorbed"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("flake_absorbed drifted from the shared golden:\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestFlakeAbsorbedEvent_PayloadIsEvidence pins the constructor: the
+// verify_flake_absorbed kind, and a payload that decodes back to the evidence
+// struct it was built from.
+func TestFlakeAbsorbedEvent_PayloadIsEvidence(t *testing.T) {
+	ev := flakeAbsorbedEvent(flakeAbsorbedGolden())
+	if ev.Kind != "verify_flake_absorbed" {
+		t.Fatalf("kind = %q, want verify_flake_absorbed", ev.Kind)
+	}
+	var got flakeAbsorbedEvidence
+	if err := json.Unmarshal(ev.Payload, &got); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", flakeAbsorbedGolden()) {
+		t.Fatalf("payload = %+v, want %+v", got, flakeAbsorbedGolden())
+	}
+}
+
+// TestComposeGateEvidence_FoldsFlakeAbsorbed: the LAST verify_flake_absorbed
+// event folds into gate_evidence.flake_absorbed, and every string entry is
+// redacted — a token-shaped test name never reaches the signed bundle.
+func TestComposeGateEvidence_FoldsFlakeAbsorbed(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("q", 36)
+	earlier := flakeAbsorbedGolden()
+	earlier.Iteration = 1
+	earlier.Tests = []string{"TestEarlier"}
+	last := flakeAbsorbedGolden()
+	last.Tests = []string{"TestLeaks_" + secret, "TestClean"}
+	last.PackageDirs = []string{"pkg/" + secret}
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "", "", 1, "FAIL", "failed"),
+		flakeAbsorbedEvent(earlier),
+		verifyRunEvent("scripts/test verify", "", "", 0, "ok", "passed"),
+		flakeAbsorbedEvent(last),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 1))
+	fa := p.FlakeAbsorbed
+	if fa == nil {
+		t.Fatal("flake_absorbed missing")
+	}
+	if fa.Iteration != 2 || fa.TreeSHA != last.TreeSHA || fa.PatchCoverage != "pass" ||
+		len(fa.Packages) != 2 || len(fa.FailedModules) != 2 {
+		t.Errorf("flake_absorbed = %+v, want the LAST event's fields", fa)
+	}
+	if len(fa.Tests) != 2 || fa.Tests[1] != "TestClean" {
+		t.Fatalf("tests = %q, want the last event's two names", fa.Tests)
+	}
+	for _, s := range append(append([]string(nil), fa.Tests...), fa.PackageDirs...) {
+		if strings.Contains(s, secret) {
+			t.Errorf("unredacted token in flake_absorbed entry %q", s)
+		}
+	}
+	if !strings.Contains(fa.Tests[0], "[REDACTED:github-pat-classic]") ||
+		!strings.Contains(fa.PackageDirs[0], "[REDACTED:github-pat-classic]") {
+		t.Errorf("entries not redacted: tests=%q dirs=%q", fa.Tests, fa.PackageDirs)
+	}
+}
+
+// TestComposeGateEvidence_FlakeAbsorbedAloneIsNotAGate: a verify_flake_absorbed
+// event with no verify_run / verify_summary beside it produces no gate_evidence
+// at all — it is a fold source, never a gate on its own.
+func TestComposeGateEvidence_FlakeAbsorbedAloneIsNotAGate(t *testing.T) {
+	if ev := composeGateEvidence([]agent.Event{flakeAbsorbedEvent(flakeAbsorbedGolden())}, 1); ev != nil {
+		t.Fatalf("lone verify_flake_absorbed composed gate_evidence %s, want nil", ev.Payload)
+	}
+}
+
+// TestComposeGateEvidence_NoFlakeAbsorbedField: without the event the payload
+// carries no flake_absorbed key, and an undecodable one is skipped.
+func TestComposeGateEvidence_NoFlakeAbsorbedField(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test verify", "", "", 0, "ok", "passed"),
+		{Kind: "verify_flake_absorbed", Payload: json.RawMessage(`{"iteration":"not-an-int"}`)},
+	}
+	ev := composeGateEvidence(events, 1)
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil")
+	}
+	if strings.Contains(string(ev.Payload), "flake_absorbed") {
+		t.Fatalf("payload carries flake_absorbed without a decodable event: %s", ev.Payload)
+	}
+}
