@@ -4101,11 +4101,28 @@ func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunI
 	if err != nil || conflict == nil {
 		return nil, translateSliceHeadMissing(err)
 	}
+	return toChildcompletionConflict(conflict), nil
+}
+
+// toChildcompletionConflict converts the orchestrator's *SliceConflict into
+// childcompletion's identical type, field for field — including the ADR-096 D4
+// / #4294 base attribution. It is the ONE copy both adapter integration methods
+// (IntegrateSlices, IntegrateCompletedWave) route through, so the
+// slice_integration_conflict payload the sweeper writes cannot drift from the
+// orchestrator's by a field one method forgot. nil maps to nil.
+func toChildcompletionConflict(c *orchestrator.SliceConflict) *childcompletion.SliceConflict {
+	if c == nil {
+		return nil
+	}
 	return &childcompletion.SliceConflict{
-		SliceIndex: conflict.SliceIndex,
-		ChildRunID: conflict.ChildRunID,
-		Detail:     conflict.Detail,
-	}, nil
+		SliceIndex:           c.SliceIndex,
+		ChildRunID:           c.ChildRunID,
+		Detail:               c.Detail,
+		BaseSHA:              c.BaseSHA,
+		ConflictingBasePaths: c.ConflictingBasePaths,
+		BaseAttribution:      c.BaseAttribution,
+		CompareTruncated:     c.CompareTruncated,
+	}
 }
 
 // translateSliceHeadMissing converts an orchestrator *SliceHeadMissingError
@@ -4141,11 +4158,7 @@ func (a childCompletionAdvancer) IntegrateCompletedWave(ctx context.Context, par
 	if err != nil || conflict == nil {
 		return integrated, nil, translateSliceHeadMissing(err)
 	}
-	return integrated, &childcompletion.SliceConflict{
-		SliceIndex: conflict.SliceIndex,
-		ChildRunID: conflict.ChildRunID,
-		Detail:     conflict.Detail,
-	}, nil
+	return integrated, toChildcompletionConflict(conflict), nil
 }
 
 // DispatchChildren satisfies childcompletion.ChildDispatcher by

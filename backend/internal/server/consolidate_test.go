@@ -35,6 +35,13 @@ type consolidateGitHub struct {
 	conflictOnHeadSuffix string // a MergeBranch head with this suffix returns ErrMergeConflict
 	mergeErr             error  // non-nil => every MergeBranch returns it (non-conflict error)
 	prURL                string
+
+	// ComparePatch answers for the orchestrator's best-effort conflict
+	// attribution (ADR-096 D4 / #4294): baseDeltaFiles for a compare whose
+	// HEAD is the base tip ("basesha" — main since the slice's merge-base),
+	// sliceDeltaFiles for one whose BASE is it (the slice since main).
+	baseDeltaFiles  []string
+	sliceDeltaFiles []string
 }
 
 func newConsolidateGitHub() *consolidateGitHub {
@@ -86,6 +93,20 @@ func (g *consolidateGitHub) DispatchWorkflow(context.Context, forge.CredentialSc
 
 func (g *consolidateGitHub) EnableAutoMerge(context.Context, forge.CredentialScope, githubclient.RepoRef, int, githubclient.MergeMethod) error {
 	return nil
+}
+
+func (g *consolidateGitHub) ComparePatch(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, base, head string) (*forge.ComparePatchResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	files := g.sliceDeltaFiles
+	if head == g.branchSHAs["main"] {
+		files = g.baseDeltaFiles
+	}
+	out := &forge.ComparePatchResult{}
+	for _, f := range files {
+		out.Files = append(out.Files, forge.ComparePatchFile{Path: f})
+	}
+	return out, nil
 }
 
 func (g *consolidateGitHub) mergeCount() int {
@@ -481,6 +502,8 @@ func TestConsolidateRun_502ThenRetry_RecordsPullRequestArtifact(t *testing.T) {
 func TestConsolidateRun_SliceConflict(t *testing.T) {
 	gh := newConsolidateGitHub()
 	gh.conflictOnHeadSuffix = "/slice-1"
+	gh.baseDeltaFiles = []string{"c.go", "d.go"}
+	gh.sliceDeltaFiles = []string{"b.go", "c.go"}
 	f := seedConsolidateFixture(t, gh, true, []childSpec{
 		{sliceIndex: 0, state: run.StateSucceeded},
 		{sliceIndex: 1, state: run.StateSucceeded},
@@ -530,6 +553,66 @@ func TestConsolidateRun_SliceConflict(t *testing.T) {
 	}
 	if got, want := conflictAudit["conflicting_child_run_id"], resp.ConflictingChildRunID; got != want {
 		t.Errorf("conflict conflicting_child_run_id = %v, want %q (the response's conflicting child)", got, want)
+	}
+	// ADR-096 D4 / #4294: the consolidate verb's emitter carries the same
+	// base-attribution keys as the orchestrator's and the sweeper's.
+	if got := conflictAudit["base_sha"]; got != "basesha" {
+		t.Errorf("conflict base_sha = %v, want basesha", got)
+	}
+	if got, ok := conflictAudit["conflicting_base_paths"].([]any); !ok || len(got) != 1 || got[0] != "c.go" {
+		t.Errorf("conflict conflicting_base_paths = %#v, want [c.go]", conflictAudit["conflicting_base_paths"])
+	}
+	if got := conflictAudit["base_attribution"]; got != "paths_overlap" {
+		t.Errorf("conflict base_attribution = %v, want paths_overlap", got)
+	}
+	if got, ok := conflictAudit["compare_truncated"].(bool); !ok || got {
+		t.Errorf("conflict compare_truncated = %#v, want false", conflictAudit["compare_truncated"])
+	}
+	if detail := resp.Detail; !strings.HasPrefix(detail, "slice integration conflict: ") || !strings.HasSuffix(detail, "; conflicting base paths: c.go") {
+		t.Errorf("detail = %q, want the stable prefix and the attributed base path", detail)
+	}
+}
+
+// TestEmitSliceIntegrationConflict_NilBasePathsEmitsEmptyArray isolates the nil
+// guard in Server.emitSliceIntegrationConflict: the orchestrator's attribution
+// never returns nil paths, so only a direct call with a nil
+// ConflictingBasePaths reaches it. The payload must carry [] (never null).
+func TestEmitSliceIntegrationConflict_NilBasePathsEmitsEmptyArray(t *testing.T) {
+	au := newAuditCompleteAuditFake()
+	s := New(Config{AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+	s.emitSliceIntegrationConflict(context.Background(), runID, stageID, &orchestrator.SliceConflict{SliceIndex: 0, ChildRunID: uuid.New()})
+	entries, err := au.ListForRunByCategory(context.Background(), runID, "slice_integration_conflict")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("slice_integration_conflict entries = %d (err %v), want 1", len(entries), err)
+	}
+	if !strings.Contains(string(entries[0].Payload), `"conflicting_base_paths":[]`) {
+		t.Errorf("payload = %s, want conflicting_base_paths:[] (never null)", entries[0].Payload)
+	}
+}
+
+// TestConsolidateRun_SliceConflictUnattributedEmitsEmptyPaths pins the
+// unattributed end-to-end shape: a conflict with no overlapping base path
+// persists conflicting_base_paths as [] with base_attribution no_base_overlap.
+func TestConsolidateRun_SliceConflictUnattributedEmitsEmptyPaths(t *testing.T) {
+	gh := newConsolidateGitHub()
+	gh.conflictOnHeadSuffix = "/slice-0"
+	gh.baseDeltaFiles = []string{"d.go"}
+	gh.sliceDeltaFiles = []string{"b.go"}
+	f := seedConsolidateFixture(t, gh, true, []childSpec{{sliceIndex: 0, state: run.StateSucceeded}})
+
+	if w := postConsolidate(t, f.s, f.parent.ID, withAuth); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	entries, err := f.au.ListForRunByCategory(context.Background(), f.parent.ID, "slice_integration_conflict")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("slice_integration_conflict entries = %d (err %v), want 1", len(entries), err)
+	}
+	if !strings.Contains(string(entries[0].Payload), `"conflicting_base_paths":[]`) {
+		t.Errorf("payload = %s, want conflicting_base_paths:[] (never null)", entries[0].Payload)
+	}
+	if !strings.Contains(string(entries[0].Payload), `"base_attribution":"no_base_overlap"`) {
+		t.Errorf("payload = %s, want base_attribution no_base_overlap", entries[0].Payload)
 	}
 }
 

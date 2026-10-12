@@ -552,7 +552,10 @@ func TestTick_Integrate_ConflictFailsParentBNoAdvance(t *testing.T) {
 	au := &fakeAudit{}
 	ad := &recordingAdvancer{}
 	integ := &recordingIntegrator{
-		conflict: &SliceConflict{SliceIndex: 2, ChildRunID: conflictChild, Detail: "slice integration conflict: slice 2"},
+		conflict: &SliceConflict{
+			SliceIndex: 2, ChildRunID: conflictChild, Detail: "slice integration conflict: slice 2",
+			BaseSHA: "basesha", ConflictingBasePaths: []string{"y.go"}, BaseAttribution: "paths_overlap", CompareTruncated: true,
+		},
 	}
 	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
 
@@ -596,6 +599,72 @@ func TestTick_Integrate_ConflictFailsParentBNoAdvance(t *testing.T) {
 	if p["conflicting_child_run_id"] != conflictChild.String() {
 		t.Errorf("conflicting_child_run_id = %v, want %q", p["conflicting_child_run_id"], conflictChild.String())
 	}
+	assertBaseAttributionPayload(t, p, "basesha", []string{"y.go"}, "paths_overlap", true)
+}
+
+// assertBaseAttributionPayload pins the ADR-096 D4 / #4294 base-attribution
+// keys on a slice_integration_conflict payload: base_sha, conflicting_base_paths
+// (always a JSON array, never null), base_attribution and compare_truncated —
+// the keys the orchestrator and the consolidate verb write for the same event.
+func assertBaseAttributionPayload(t *testing.T, p map[string]any, wantSHA string, wantPaths []string, wantAttribution string, wantTruncated bool) {
+	t.Helper()
+	if p["base_sha"] != wantSHA {
+		t.Errorf("base_sha = %v, want %q", p["base_sha"], wantSHA)
+	}
+	raw, ok := p["conflicting_base_paths"].([]any)
+	if !ok {
+		t.Fatalf("conflicting_base_paths = %#v, want a JSON array", p["conflicting_base_paths"])
+	}
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, _ := v.(string)
+		got = append(got, s)
+	}
+	if strings.Join(got, ",") != strings.Join(wantPaths, ",") {
+		t.Errorf("conflicting_base_paths = %v, want %v", got, wantPaths)
+	}
+	if p["base_attribution"] != wantAttribution {
+		t.Errorf("base_attribution = %v, want %q", p["base_attribution"], wantAttribution)
+	}
+	if p["compare_truncated"] != wantTruncated {
+		t.Errorf("compare_truncated = %v, want %v", p["compare_truncated"], wantTruncated)
+	}
+}
+
+// TestTick_Integrate_ConflictNilBasePathsEmitsEmptyArray pins the nil guard in
+// emitSliceIntegrationConflict: a SliceConflict carrying no attribution (an
+// older Integrator, or attribution never ran) still persists
+// conflicting_base_paths as [] — never null — so a reader can range it
+// without a presence check.
+func TestTick_Integrate_ConflictNilBasePathsEmitsEmptyArray(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	au := &fakeAudit{}
+	integ := &recordingIntegrator{
+		conflict: &SliceConflict{SliceIndex: 0, ChildRunID: uuid.New(), Detail: "slice integration conflict: slice 0"},
+	}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: &recordingAdvancer{}, Integrate: integ, Logger: slog.Default()}
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "slice_integration_conflict" {
+			continue
+		}
+		if !strings.Contains(string(e.Payload), `"conflicting_base_paths":[]`) {
+			t.Fatalf("payload = %s, want conflicting_base_paths:[] (never null)", e.Payload)
+		}
+		return
+	}
+	t.Fatalf("no slice_integration_conflict audit; have %v", au.appended)
 }
 
 func TestTick_Integrate_ErrorParksParentNoTransition(t *testing.T) {
@@ -1098,7 +1167,10 @@ func TestSweeper_WaveIntegrationConflictEmitsOnceAndParksParent(t *testing.T) {
 	_, parentStage, rs := midFanOutParent()
 	au := &fakeAudit{}
 	childRun := uuid.New()
-	wi := &recordingWaveIntegrator{conflict: &SliceConflict{SliceIndex: 1, ChildRunID: childRun, Detail: "slice integration conflict: slice 1"}}
+	wi := &recordingWaveIntegrator{conflict: &SliceConflict{
+		SliceIndex: 1, ChildRunID: childRun, Detail: "slice integration conflict: slice 1",
+		BaseSHA: "basesha2", ConflictingBasePaths: []string{"a.go", "c.go"}, BaseAttribution: "paths_overlap",
+	}}
 	s := &Sweeper{Runs: rs, Audit: au, Advance: &recordingAdvancer{}, WaveIntegrate: wi, Logger: slog.Default()}
 
 	for i := 0; i < 3; i++ {
@@ -1134,6 +1206,7 @@ func TestSweeper_WaveIntegrationConflictEmitsOnceAndParksParent(t *testing.T) {
 	if payload["parent_stage_id"] != parentStage.ID.String() {
 		t.Errorf("parent_stage_id = %v, want %s", payload["parent_stage_id"], parentStage.ID)
 	}
+	assertBaseAttributionPayload(t, payload, "basesha2", []string{"a.go", "c.go"}, "paths_overlap", false)
 }
 
 // TestSweeper_WaveIntegrationDistinctConflictEmitsAgain discriminates the dedupe
