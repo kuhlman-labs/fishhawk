@@ -1,0 +1,1 @@
+fishhawk-verify-absorb-attest 0123456789abcdef0123456789abcdef patch_coverage=pass failed_modules=moda:tests changed_dirs=moda/a

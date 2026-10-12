@@ -1676,6 +1676,406 @@ fi
 modules() { printf './backend\n./cli\n'; }
 
 # ---------------------------------------------------------------------------
+# (h1)-(h10) flake-absorption attest (#4229). scripts/test captures and unsets
+#     FISHHAWK_VERIFY_ABSORB_NONCE before any child runs; a FAILED patch-coverage
+#     loop in nonce mode prints ONE `fishhawk-verify-absorb-attest` line before
+#     the failed-module summary. The runner absorbs nothing unless that line
+#     carries its nonce and says pass / tests-only / no failing changed dir, so
+#     every arm below pins a value the runner's trust rests on.
+# ---------------------------------------------------------------------------
+ABSORB_NONCE=0123456789abcdef0123456789abcdef
+ABSORB_GOLDEN="$REPO_ROOT/testdata/wire/verify_absorb_attest.txt"
+
+# (h1) the nonce is captured into the shell-local and NEITHER name reaches a
+#      child's environment — including an AMBIENT exported VERIFY_ABSORB_NONCE,
+#      whose export attribute would otherwise survive the assignment.
+#      Counterfactuals: delete `unset FISHHAWK_VERIFY_ABSORB_NONCE` (the child
+#      inherits it) or the pre-assignment `unset VERIFY_ABSORB_NONCE` (the
+#      child inherits the nonce under the local name) -> RED.
+( export FISHHAWK_VERIFY_ABSORB_NONCE="$ABSORB_NONCE" VERIFY_ABSORB_NONCE=ambient
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+  printf 'LOCAL=%s\n' "$VERIFY_ABSORB_NONCE"
+  env ) > "$tmproot/h1.env" 2>&1
+if grep -qx "LOCAL=$ABSORB_NONCE" "$tmproot/h1.env" \
+   && ! grep -q -E '^(FISHHAWK_)?VERIFY_ABSORB_NONCE=' "$tmproot/h1.env"; then
+  pass "(h1) the absorb nonce is captured into the shell-local and reaches no child env (ambient local name dropped too)"
+else
+  fail "(h1) nonce capture/unset ('$(grep -i absorb "$tmproot/h1.env")')"
+fi
+
+# (h2) a malformed nonce is discarded with a note, so no attest can be printed.
+#      One row per shape rule: 31 chars (length check) and 32 chars carrying a
+#      non-lowercase-hex byte (charset check). Counterfactual: delete the length
+#      `if`, or the charset `case`, -> that row keeps the nonce -> RED.
+h2_ok=1 h2_detail=""
+for bad in 0123456789abcdef0123456789abcde 0123456789ABCDEF0123456789abcdef 0123456789abcdef0123456789abcdeg; do
+  ( export FISHHAWK_VERIFY_ABSORB_NONCE="$bad"
+    FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+    printf 'LOCAL=%s\n' "$VERIFY_ABSORB_NONCE" ) > "$tmproot/h2.out" 2>&1
+  if ! grep -qx 'LOCAL=' "$tmproot/h2.out" \
+     || ! grep -q 'ignoring FISHHAWK_VERIFY_ABSORB_NONCE' "$tmproot/h2.out"; then
+    h2_ok=0
+    h2_detail="$h2_detail [$bad: $(tr '\n' ' ' < "$tmproot/h2.out")]"
+  fi
+done
+if [ "$h2_ok" = "1" ]; then
+  pass "(h2) a 31-char, uppercase or non-hex nonce is ignored with a note"
+else
+  fail "(h2) malformed nonce kept:$h2_detail"
+fi
+
+# Fixture for (h4)-(h10): a real git repo whose feature branch adds an 8-line
+# p/p.go to each of moda and modb (so the REAL snapshot emit + check-coverage.py
+# decide), and a stub `go` that writes per-module profiles and failures on
+# demand. Lists are module basenames:
+#   AGO_FULL / AGO_PARTIAL / AGO_SMALL / AGO_NOMODE — write a profile with all 8
+#     changed lines covered / 2 of 8 covered / only lines 1-3 in any block (under
+#     the 5-statement floor) / no `mode:` header. Any other module writes none.
+#   AGO_TESTFAIL / AGO_BUILDFAIL / AGO_OTHERFAIL — fail with a `FAIL<TAB>` package
+#     line / go's `[build failed]` marker / a module-level error (no FAIL line).
+abin="$tmproot/absorbbin"
+aroot="$tmproot/absorb_repo"
+rm -rf "$abin" "$aroot"
+mkdir -p "$abin" "$aroot/moda/p" "$aroot/modb/p" "$aroot/modc/q"
+cat > "$abin/go" <<'EOF'
+#!/usr/bin/env bash
+base="$(basename "$PWD")"
+prof=""
+for a in "$@"; do
+  case "$a" in -coverprofile=*) prof="${a#-coverprofile=}" ;; esac
+done
+in_list() { case " $1 " in *" $base "*) return 0 ;; esac; return 1; }
+if [ -n "$prof" ]; then
+  if in_list "${AGO_FULL:-}" || in_list "${AGO_PARTIAL:-}" || in_list "${AGO_SMALL:-}"; then
+    printf 'mode: atomic\n' > "$prof"
+    last=8
+    if in_list "${AGO_SMALL:-}"; then last=3; fi
+    n=1
+    while [ "$n" -le "$last" ]; do
+      c=1
+      if in_list "${AGO_PARTIAL:-}" && [ "$n" -gt 2 ]; then c=0; fi
+      printf 'github.com/kuhlman-labs/fishhawk/%s/p/p.go:%d.1,%d.40 1 %d\n' "$base" "$n" "$n" "$c" >> "$prof"
+      n=$((n + 1))
+    done
+  elif in_list "${AGO_NOMODE:-}"; then
+    printf 'github.com/kuhlman-labs/fishhawk/%s/p/p.go:1.1,1.40 1 1\n' "$base" > "$prof"
+  fi
+fi
+if in_list "${AGO_BUILDFAIL:-}"; then
+  printf 'FAIL\tgithub.com/kuhlman-labs/fishhawk/%s/q [build failed]\n' "$base"; exit 1
+fi
+if in_list "${AGO_TESTFAIL:-}"; then
+  printf -- '--- FAIL: TestFlake\nFAIL\tgithub.com/kuhlman-labs/fishhawk/%s/q\t0.1s\n' "$base"; exit 1
+fi
+if in_list "${AGO_OTHERFAIL:-}"; then
+  printf 'go: errors parsing go.mod:\n'; exit 1
+fi
+printf 'ok\tgithub.com/kuhlman-labs/fishhawk/%s/p\t0.1s\n' "$base"
+EOF
+chmod +x "$abin/go"
+git init -q -b main "$aroot"
+git -C "$aroot" config user.email test@example.com
+git -C "$aroot" config user.name test
+printf 'package q\n' > "$aroot/modc/q/q.go"
+git -C "$aroot" add -A
+git -C "$aroot" commit -q -m base
+git -C "$aroot" checkout -q -b feature
+for mm in moda modb; do
+  printf 'package p\n\nfunc F(n int) int {\n\tif n > 0 {\n\t\treturn n\n\t}\n\treturn -n\n}\n' > "$aroot/$mm/p/p.go"
+done
+git -C "$aroot" add -A
+git -C "$aroot" commit -q -m feature
+
+# a_run <mods> [modules...]: drive the REAL cmd_test_with_patch_coverage (real
+# snapshot emit, real _verify_patch_coverage, real check-coverage.py) in a
+# `set -euo pipefail` subshell in nonce mode. Sets $out, $rc and $attest (the
+# attest lines, if any).
+a_run() {
+  local amods="$1"
+  shift
+  local amodules
+  amodules="$(printf './%s\n' "$@")"
+  out="$( cd "$aroot" || exit 99
+          set -euo pipefail
+          ROOT="$aroot"
+          PATH="$abin:$PATH"
+          TMPDIR="$tmproot"
+          export PATH TMPDIR
+          VERIFY_ABSORB_NONCE="$ABSORB_NONCE"
+          modules() { printf '%s\n' "$amodules"; }
+          _arm_container_lease() { :; }
+          cmd_test_with_patch_coverage "$amods" main 2>&1 )"
+  rc=$?
+  printf '%s\n' "$out" > "$tmproot/a_run.out"
+  attest="$(grep '^fishhawk-verify-absorb-attest ' "$tmproot/a_run.out")"
+}
+export AGO_FULL="" AGO_PARTIAL="" AGO_SMALL="" AGO_NOMODE="" AGO_TESTFAIL="" AGO_BUILDFAIL="" AGO_OTHERFAIL=""
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+
+# (h4) MECHANISM: two changed modules, moda's profile present and 100% covered,
+#      modb's expected profile ABSENT -> `unavailable`. Counterfactual: delete
+#      the expected-profile header loop -> check-coverage.py's denominator rule
+#      drops modb's lines (they fall inside no block), 8/8 passes -> `pass` -> RED.
+AGO_FULL="moda" AGO_TESTFAIL="modc"
+a_run "$(printf 'moda\t./p\nmodb\t./p\n')" moda modb modc
+if [ "$rc" -ne 0 ] \
+   && [ "$attest" = "fishhawk-verify-absorb-attest $ABSORB_NONCE patch_coverage=unavailable failed_modules=modc:tests changed_dirs=moda/p,modb/p" ]; then
+  pass "(h4) a touched module whose expected profile is missing renders patch_coverage=unavailable, never pass"
+else
+  fail "(h4) missing-profile verdict (rc=$rc attest='$attest' out='$out')"
+fi
+
+# (h4b) a profile present but WITHOUT go's `mode:` header -> `unavailable`.
+AGO_FULL="moda" AGO_NOMODE="modb" AGO_TESTFAIL="modc"
+a_run "$(printf 'moda\t./p\nmodb\t./p\n')" moda modb modc
+case "$attest" in
+  *" patch_coverage=unavailable "*) pass "(h4b) a header-less profile renders patch_coverage=unavailable" ;;
+  *) fail "(h4b) header-less profile verdict (rc=$rc attest='$attest')" ;;
+esac
+AGO_NOMODE=""
+
+# (h4c) NO module instrumented (mods names a module the loop never runs) ->
+#      `unavailable`. Counterfactual: delete the empty-array guard -> the
+#      `"${expected_profiles[@]}"` expansion aborts under `set -u` in bash 3.2 and
+#      the verdict renders empty -> RED.
+AGO_FULL="" AGO_TESTFAIL="modc"
+a_run "$(printf 'modz\t./p\n')" modc
+case "$attest" in
+  *" patch_coverage=unavailable failed_modules=modc:tests changed_dirs=modz/p") pass "(h4c) no instrumented module renders patch_coverage=unavailable" ;;
+  *) fail "(h4c) no-instrumented-module verdict (rc=$rc attest='$attest' out='$out')" ;;
+esac
+
+# (h5) under 85% on >= 5 changed statements (2 of 8) -> `fail`.
+#      Counterfactual: make the non-zero gate branch echo `pass` -> RED.
+AGO_FULL="" AGO_PARTIAL="moda" AGO_TESTFAIL="modc"
+a_run "$(printf 'moda\t./p\n')" moda modc
+if [ "$rc" -ne 0 ] \
+   && [ "$attest" = "fishhawk-verify-absorb-attest $ABSORB_NONCE patch_coverage=fail failed_modules=modc:tests changed_dirs=moda/p" ]; then
+  pass "(h5) patch coverage below the threshold renders patch_coverage=fail"
+else
+  fail "(h5) below-threshold verdict (rc=$rc attest='$attest' out='$out')"
+fi
+AGO_PARTIAL=""
+
+# (h5b) the --diff-min-statements FLOOR is the one SKIP that still reads as a
+#      pass (only 3 coverable changed statements). Counterfactual: delete the
+#      floor `case` arm -> the floor SKIP renders `unavailable` -> RED.
+AGO_SMALL="moda" AGO_TESTFAIL="modc"
+a_run "$(printf 'moda\t./p\n')" moda modc
+case "$attest" in
+  *" patch_coverage=pass "*) pass "(h5b) the 5-statement floor SKIP still renders patch_coverage=pass" ;;
+  *) fail "(h5b) floor verdict (rc=$rc attest='$attest' out='$out')" ;;
+esac
+AGO_SMALL=""
+
+# (h5c) APPROVAL CONDITION C2: check-coverage.py exits 0 on its SKIPs, so a
+#      skip-snapshot (the change set could not be computed) must render
+#      `unavailable`, never `pass`. Counterfactual: delete the `SKIP:*` arm of
+#      the stderr scan -> rc 0 reads as `pass` -> RED.
+AGO_FULL="moda" AGO_TESTFAIL="modc"
+out="$( cd "$aroot" || exit 99
+        set -euo pipefail
+        ROOT="$aroot"; PATH="$abin:$PATH"; TMPDIR="$tmproot"; export PATH TMPDIR
+        VERIFY_ABSORB_NONCE="$ABSORB_NONCE"
+        modules() { printf './moda\n./modc\n'; }
+        _arm_container_lease() { :; }
+        _patch_cov_emit_snapshot() { printf '{"schema":1,"skip":"harness: no merge base"}' > "$2"; }
+        cmd_test_with_patch_coverage "$(printf 'moda\t./p\n')" main 2>&1 )"; rc=$?
+printf '%s\n' "$out" > "$tmproot/h5c.out"
+attest="$(grep '^fishhawk-verify-absorb-attest ' "$tmproot/h5c.out")"
+case "$attest" in
+  *" patch_coverage=unavailable "*) pass "(h5c) a check-coverage.py SKIP (skip-snapshot, exit 0) renders patch_coverage=unavailable (C2)" ;;
+  *) fail "(h5c) skip-snapshot verdict (rc=$rc attest='$attest' out='$out')" ;;
+esac
+
+# (h6) failed-module classification, one module per class, in loop order.
+#      Counterfactuals: delete the `[build failed]` grep -> moda renders `tests`
+#      -> RED; delete the no-`FAIL<TAB>`-line check -> modb renders `tests` -> RED.
+AGO_FULL="moda" AGO_TESTFAIL="modc" AGO_BUILDFAIL="moda" AGO_OTHERFAIL="modb"
+a_run "$(printf 'moda\t./p\n')" moda modb modc
+case "$attest" in
+  *" failed_modules=moda:build,modb:other,modc:tests changed_dirs=moda/p") pass "(h6) failed modules classify as build / other / tests from their tee'd logs" ;;
+  *) fail "(h6) classification (rc=$rc attest='$attest' out='$out')" ;;
+esac
+AGO_BUILDFAIL="" AGO_OTHERFAIL=""
+
+# (h6b) a failed module with NO log (the nonce-mode log dir could not be made)
+#       renders `unclassified`, and the loop still runs and reports every module.
+AGO_FULL="moda" AGO_TESTFAIL="modc"
+out="$( cd "$aroot" || exit 99
+        set -euo pipefail
+        ROOT="$aroot"; PATH="$abin:$PATH"; TMPDIR="$tmproot"; export PATH TMPDIR
+        VERIFY_ABSORB_NONCE="$ABSORB_NONCE"
+        modules() { printf './moda\n./modc\n'; }
+        _arm_container_lease() { :; }
+        _covlog_mktemp() { return 1; }
+        cmd_test_with_patch_coverage "$(printf 'moda\t./p\n')" main 2>&1 )"; rc=$?
+printf '%s\n' "$out" > "$tmproot/h6b.out"
+attest="$(grep '^fishhawk-verify-absorb-attest ' "$tmproot/h6b.out")"
+if [ "$rc" -ne 0 ] && grep -qxF -- '  - ./modc' "$tmproot/h6b.out" \
+   && grep -q 'absorb attest will report failed modules unclassified' "$tmproot/h6b.out"; then
+  case "$attest" in
+    *" failed_modules=modc:unclassified "*) pass "(h6b) no per-module log dir degrades the class to unclassified, never tests" ;;
+    *) fail "(h6b) unclassified degrade (attest='$attest')" ;;
+  esac
+else
+  fail "(h6b) log-dir degrade (rc=$rc out='$out')"
+fi
+
+# (h7) NO nonce -> no attest, no tee (no per-module log dir is created), and the
+#      same summary shape as today.
+AGO_FULL="moda" AGO_TESTFAIL="modc"
+out="$( cd "$aroot" || exit 99
+        set -euo pipefail
+        ROOT="$aroot"; PATH="$abin:$PATH"; TMPDIR="$tmproot"; export PATH TMPDIR
+        VERIFY_ABSORB_NONCE=""
+        modules() { printf './moda\n./modc\n'; }
+        _arm_container_lease() { :; }
+        _covlog_mktemp() { echo "COVLOG_MKTEMP_CALLED"; return 1; }
+        cmd_test_with_patch_coverage "$(printf 'moda\t./p\n')" main 2>&1 )"; rc=$?
+printf '%s\n' "$out" > "$tmproot/h7.out"
+if [ "$rc" -ne 0 ] \
+   && ! grep -q 'fishhawk-verify-absorb-attest' "$tmproot/h7.out" \
+   && ! grep -q 'COVLOG_MKTEMP_CALLED' "$tmproot/h7.out" \
+   && grep -q 'scripts/test: 1 of 2 modules failed:' "$tmproot/h7.out" \
+   && grep -qxF -- '  - ./modc' "$tmproot/h7.out"; then
+  pass "(h7) without a nonce: no attest, no tee, today's summary"
+else
+  fail "(h7) no-nonce shape (rc=$rc out='$out')"
+fi
+
+# (h8) APPROVAL CONDITION C1: changed_dirs is taken from the DIFF's bucketing.
+#      The whole-module `./...` fallback (an undecodable changed path) cannot
+#      name its dirs -> `undecodable`, and so does a dir the encoding cannot
+#      carry. Counterfactual: delete the `*...*` arm -> `moda/...` -> RED.
+h8_ok=1 h8_detail=""
+for row in "$(printf 'moda\t./...')|undecodable" \
+           "$(printf 'moda\t.,./x/y\nmodb\t./p')|moda,moda/x/y,modb/p" \
+           "$(printf 'moda\t./a b')|undecodable" \
+           "$(printf 'moda\t./a:b')|undecodable" \
+           "$(printf 'moda\tp')|undecodable" \
+           "|undecodable"; do
+  got="$(_absorb_changed_dirs "${row%|*}")"
+  if [ "$got" != "${row##*|}" ]; then
+    h8_ok=0
+    h8_detail="$h8_detail [${row%|*} -> '$got', want '${row##*|}']"
+  fi
+done
+if [ "$h8_ok" = "1" ]; then
+  pass "(h8) changed_dirs: repo-relative dirs from the bucketing; ./..., a non-./ pattern or an unencodable dir -> undecodable (C1)"
+else
+  fail "(h8) changed_dirs rendering:$h8_detail"
+fi
+
+# (h9) a failed module name the encoding cannot carry renders
+#      `failed_modules=undecodable`. Counterfactual: delete the token check in
+#      _emit_absorb_attest -> `mod a:tests` leaks into the line -> RED.
+h9_attest="$( failed=("./mod a" "./modc") failed_logs=("" "")
+              expected_profiles=()
+              VERIFY_ABSORB_NONCE="$ABSORB_NONCE"
+              _emit_absorb_attest main "$(printf 'modc\t./q\n')" 2>&1 )"
+if [ "$h9_attest" = "fishhawk-verify-absorb-attest $ABSORB_NONCE patch_coverage=unavailable failed_modules=undecodable changed_dirs=modc/q" ]; then
+  pass "(h9) a failed module with a space renders failed_modules=undecodable"
+else
+  fail "(h9) undecodable failed module ('$h9_attest')"
+fi
+
+# (h10) WIRING: the attest is printed ONLY on the failed-loop path, and BEFORE
+#       the module summary. An all-green nonce-mode loop prints none.
+AGO_FULL="moda" AGO_TESTFAIL=""
+a_run "$(printf 'moda\t./p\n')" moda modc
+if [ "$rc" -eq 0 ] && [ -z "$attest" ]; then
+  pass "(h10) a passing nonce-mode loop prints no attest"
+else
+  fail "(h10) passing-loop attest (rc=$rc attest='$attest')"
+fi
+
+# (h3) the shared golden is the cross-boundary contract (#4229): a REAL go test
+#       run in which the changed package passes while a sibling package in the
+#       SAME module fails must print exactly the golden line. This also pins that
+#       go test writes the -coverprofile for a module whose sibling package FAILED
+#       (patch_coverage=pass from the surviving profile), and that the attest
+#       precedes the failed-module summary.
+if ! command -v go >/dev/null 2>&1; then
+  echo "SKIP: (h3) go toolchain absent — real-go absorb attest golden not run"
+else
+  groot="$tmproot/absorb_real"
+  rm -rf "$groot"
+  mkdir -p "$groot/moda/a" "$groot/moda/b"
+  git init -q -b main "$groot"
+  git -C "$groot" config user.email test@example.com
+  git -C "$groot" config user.name test
+  printf 'module github.com/kuhlman-labs/fishhawk/moda\n\ngo 1.21\n' > "$groot/moda/go.mod"
+  printf 'package a\n' > "$groot/moda/a/a.go"
+  printf 'package b\n\nfunc B() int { return 1 }\n' > "$groot/moda/b/b.go"
+  cat > "$groot/moda/b/b_test.go" <<'EOF'
+package b
+
+import "testing"
+
+func TestFlake(t *testing.T) {
+	if B() == 1 {
+		t.Fatal("simulated flake in an untouched package")
+	}
+}
+EOF
+  git -C "$groot" add -A
+  git -C "$groot" commit -q -m base
+  git -C "$groot" checkout -q -b feature
+  cat > "$groot/moda/a/a.go" <<'EOF'
+package a
+
+func Classify(n int) string {
+	if n < 0 {
+		return "neg"
+	}
+	if n == 0 {
+		return "zero"
+	}
+	return "pos"
+}
+EOF
+  cat > "$groot/moda/a/a_test.go" <<'EOF'
+package a
+
+import "testing"
+
+func TestClassify(t *testing.T) {
+	for in, want := range map[int]string{-1: "neg", 0: "zero", 1: "pos"} {
+		if got := Classify(in); got != want {
+			t.Fatalf("Classify(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+EOF
+  git -C "$groot" add -A
+  git -C "$groot" commit -q -m feature
+  ( cd "$groot" || exit 99
+    set -euo pipefail
+    ROOT="$groot"; TMPDIR="$tmproot"; GOWORK=off; GOFLAGS=
+    export TMPDIR GOWORK GOFLAGS
+    VERIFY_ABSORB_NONCE="$ABSORB_NONCE"
+    modules() { printf './moda\n'; }
+    _arm_container_lease() { :; }
+    cmd_test_with_patch_coverage "$(printf 'moda\t./a\n')" main ) > "$tmproot/h3.out" 2>&1
+  rc=$?
+  golden="$(cat "$ABSORB_GOLDEN" 2>/dev/null)"
+  attest="$(grep '^fishhawk-verify-absorb-attest ' "$tmproot/h3.out")"
+  n_attest="$(grep -c '^fishhawk-verify-absorb-attest ' "$tmproot/h3.out")"
+  attest_ln="$(grep -n '^fishhawk-verify-absorb-attest ' "$tmproot/h3.out" | head -1 | cut -d: -f1)"
+  summary_ln="$(grep -n '^scripts/test: 1 of 1 modules failed:' "$tmproot/h3.out" | head -1 | cut -d: -f1)"
+  if [ "$rc" -ne 0 ] && [ "$n_attest" = "1" ] && [ -n "$golden" ] && [ "$attest" = "$golden" ] \
+     && grep -q $'^FAIL\tgithub.com/kuhlman-labs/fishhawk/moda/b' "$tmproot/h3.out" \
+     && [ -n "$attest_ln" ] && [ -n "$summary_ln" ] && [ "$attest_ln" -lt "$summary_ln" ]; then
+    pass "(h3) real go: a sibling-package failure prints exactly the shared golden attest, before the summary"
+  else
+    fail "(h3) real-go golden (rc=$rc n=$n_attest attest='$attest' golden='$golden' attest_ln=$attest_ln summary_ln=$summary_ln out='$(tail -20 "$tmproot/h3.out")')"
+  fi
+fi
+unset AGO_FULL AGO_PARTIAL AGO_SMALL AGO_NOMODE AGO_TESTFAIL AGO_BUILDFAIL AGO_OTHERFAIL
+
+# ---------------------------------------------------------------------------
 # (h) parse-clean.
 # ---------------------------------------------------------------------------
 if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
