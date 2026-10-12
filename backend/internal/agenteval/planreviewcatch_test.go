@@ -1591,3 +1591,258 @@ func TestCatchRateArmReport_RateWithNoTrials(t *testing.T) {
 		t.Fatalf("Rate() with no trials = %v, want 0 (not NaN)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Catch rule v5 (#4313): category predicate, step anchor, clean kind.
+// ---------------------------------------------------------------------------
+
+// TestCatchRule_CategoryPredicate: under a rule declaring Category, a concern
+// naming the anchor and a probe in ANOTHER category is missed, and the same
+// note in the declared category (trimmed, case-folded) is caught.
+func TestCatchRule_CategoryPredicate(t *testing.T) {
+	rule := CatchRule{Probes: []string{"second admission path"}, AnchorStep: 3, Category: "decision_record"}
+	note := "step 3 opens a second admission path beside the recorded one"
+	tests := []struct {
+		category string
+		want     CatchOutcome
+	}{
+		{"acceptance_criteria", CatchMissed},
+		{"decision_record", CatchCaught},
+		{"  Decision_Record ", CatchCaught},
+		{"decision_record_extra", CatchMissed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.category, func(t *testing.T) {
+			resp := catchVerdictJSON(t, CatchExampleConcern{Severity: "medium", Category: tc.category, Note: note})
+			if got := ClassifyCatch(resp, rule); got != tc.want {
+				t.Errorf("ClassifyCatch(category %q) = %q, want %q", tc.category, got, tc.want)
+			}
+		})
+	}
+	t.Run("an empty Category is no predicate", func(t *testing.T) {
+		noPred := rule
+		noPred.Category = ""
+		resp := catchVerdictJSON(t, CatchExampleConcern{Category: "acceptance_criteria", Note: note})
+		if got := ClassifyCatch(resp, noPred); got != CatchCaught {
+			t.Errorf("ClassifyCatch without a category predicate = %q, want caught", got)
+		}
+	})
+}
+
+// TestCatchRule_StepAnchorWordBounded: AnchorStep 3 attributes "step 3",
+// "Step 3:" and "approach step 3" (CatchAttributionStep), never "step 31",
+// "step 13" or "substep 3".
+func TestCatchRule_StepAnchorWordBounded(t *testing.T) {
+	rule := CatchRule{Probes: []string{"bypasses"}, AnchorStep: 3}
+	tests := []struct {
+		note string
+		want CatchOutcome
+	}{
+		{"step 3 bypasses the admission path", CatchCaught},
+		{"Step 3: bypasses the admission path", CatchCaught},
+		{"approach step 3 bypasses it", CatchCaught},
+		{"STEP\t3 bypasses it", CatchCaught},
+		{"step 31 bypasses it", CatchMissed},
+		{"step 13 bypasses it", CatchMissed},
+		{"substep 3 bypasses it", CatchMissed},
+		{"step three bypasses it", CatchMissed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "c", Note: tc.note}), rule)
+			if trial.Outcome != tc.want {
+				t.Fatalf("ClassifyCatchTrial(%q) = %q, want %q", tc.note, trial.Outcome, tc.want)
+			}
+			if tc.want == CatchCaught && trial.Attribution != CatchAttributionStep {
+				t.Errorf("attribution = %q, want %q", trial.Attribution, CatchAttributionStep)
+			}
+		})
+	}
+	t.Run("the id is checked before the step", func(t *testing.T) {
+		r := rule
+		r.CriterionIDs = []string{"ac-one-path"}
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "c", Note: "step 3 / ac-one-path bypasses it"}), r)
+		if trial.Attribution != CatchAttributionID {
+			t.Errorf("attribution = %q, want %q", trial.Attribution, CatchAttributionID)
+		}
+	})
+	t.Run("the step is checked before the phrases", func(t *testing.T) {
+		r := rule
+		r.AttributionPhrases = []string{"semaphore"}
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "c", Note: "step 3's semaphore bypasses it"}), r)
+		if trial.Attribution != CatchAttributionStep {
+			t.Errorf("attribution = %q, want %q", trial.Attribution, CatchAttributionStep)
+		}
+	})
+	t.Run("AnchorStep 0 attributes no step", func(t *testing.T) {
+		r := CatchRule{Probes: []string{"bypasses"}}
+		if got := ClassifyCatch(catchVerdictJSON(t, CatchExampleConcern{Category: "c", Note: "step 0 bypasses it"}), r); got != CatchMissed {
+			t.Errorf("ClassifyCatch with no anchor = %q, want missed", got)
+		}
+	})
+}
+
+// TestClassifyCatchTrial_CleanRule: a clean rule classifies false_alarm on a
+// concern in the predicate's category, no_false_alarm otherwise, and keeps
+// undecodable for malformed JSON.
+func TestClassifyCatchTrial_CleanRule(t *testing.T) {
+	rule := CatchRule{Clean: true, Category: "decision_record"}
+	tests := []struct {
+		name       string
+		resp       string
+		want       CatchOutcome
+		wantStored int
+	}{
+		{"decision_record concern", catchVerdictJSON(t, CatchExampleConcern{Category: "decision_record", Note: "conflicts with ADR-013"}), CatchFalseAlarm, 1},
+		{"acceptance_criteria concern", catchVerdictJSON(t, CatchExampleConcern{Category: "acceptance_criteria", Note: "ac-x is vague"}), CatchNoFalseAlarm, 1},
+		{"mixed: only the alarm is kept", catchVerdictJSON(t,
+			CatchExampleConcern{Category: "scope", Note: "a"}, CatchExampleConcern{Category: "Decision_Record", Note: "b"}), CatchFalseAlarm, 1},
+		{"no concerns", `{"verdict":"approve"}`, CatchNoFalseAlarm, 0},
+		{"malformed JSON", `{"verdict":"approve",`, CatchUndecodable, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trial := ClassifyCatchTrial(tc.resp, rule)
+			if trial.Outcome != tc.want {
+				t.Fatalf("outcome = %q, want %q", trial.Outcome, tc.want)
+			}
+			if len(trial.Concerns) != tc.wantStored {
+				t.Errorf("stored %d concerns, want %d: %+v", len(trial.Concerns), tc.wantStored, trial.Concerns)
+			}
+			if trial.MatchedProbe != "" || trial.Attribution != "" {
+				t.Errorf("a clean trial records no probe/attribution, got %q/%q", trial.MatchedProbe, trial.Attribution)
+			}
+		})
+	}
+}
+
+// v4ReferenceClassify is the PRE-SPLIT v4 classifier, transcribed from the
+// v4 ClassifyCatchTrial body: an id, else a phrase, as the attribution half;
+// the probe half; both in one concern; no category, step or clean option.
+func v4ReferenceClassify(concerns []CatchExampleConcern, rule CatchRule) (CatchOutcome, string, string) {
+	for _, c := range concerns {
+		attr := ""
+		if _, ok := matchCatchProbe(c.Category, c.Note, rule.CriterionIDs); ok {
+			attr = CatchAttributionID
+		} else if _, ok := matchCatchProbe(c.Category, c.Note, rule.AttributionPhrases); ok {
+			attr = CatchAttributionPhrase
+		}
+		if attr == "" {
+			continue
+		}
+		if probe, ok := matchCatchProbe(c.Category, c.Note, rule.Probes); ok {
+			return CatchCaught, probe, attr
+		}
+	}
+	return CatchMissed, "", ""
+}
+
+// TestCatchRuleV5_InertOnV4Rules: every committed miss-corpus catching and
+// non-catching example — alone, and all of a case's examples in one verdict —
+// classifies identically through classifyCatchConcerns (via
+// ClassifyCatchTrial) and the pre-split v4 path.
+func TestCatchRuleV5_InertOnV4Rules(t *testing.T) {
+	cases, err := LoadPlanReviewCatchCorpus(committedCatchCorpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compared := 0
+	for _, c := range cases {
+		rule := c.CatchRule()
+		if rule.Category != "" || rule.AnchorStep != 0 || rule.Clean {
+			t.Fatalf("case %q: a v4 rule declares a v5 option: %+v", c.Name, rule)
+		}
+		var all []CatchExampleConcern
+		all = append(all, c.Input.NonCatchingExamples...)
+		all = append(all, c.Input.CatchingExamples...)
+		sets := [][]CatchExampleConcern{all}
+		for _, ex := range all {
+			sets = append(sets, []CatchExampleConcern{ex})
+		}
+		for _, set := range sets {
+			wantOutcome, wantProbe, wantAttr := v4ReferenceClassify(set, rule)
+			got := ClassifyCatchTrial(catchVerdictJSON(t, set...), rule)
+			if got.Outcome != wantOutcome || got.MatchedProbe != wantProbe || got.Attribution != wantAttr {
+				t.Errorf("case %q %+v: v5 = (%s, %q, %q), v4 = (%s, %q, %q)", c.Name, set,
+					got.Outcome, got.MatchedProbe, got.Attribution, wantOutcome, wantProbe, wantAttr)
+			}
+			compared++
+		}
+	}
+	if compared < 2*len(cases) {
+		t.Fatalf("compared only %d example sets over %d cases: the inertness check is vacuous", compared, len(cases))
+	}
+}
+
+// TestClassifyCatchConcerns_CopiesStoredFields: the shared matcher copies a
+// concern's persona-control fields through to the trial.
+func TestClassifyCatchConcerns_CopiesStoredFields(t *testing.T) {
+	c := CatchTrialConcern{Severity: "low", SeverityClampedFrom: "medium", QuoteUnverified: true, DocumentRef: "docs/x.md", Category: "decision_record", Note: "step 2 bypasses it", NearMiss: "stale"}
+	caught := classifyCatchConcerns([]CatchTrialConcern{c}, 1, CatchRule{Probes: []string{"bypasses"}, AnchorStep: 2})
+	want := c
+	want.NearMiss = ""
+	if caught.Outcome != CatchCaught || len(caught.Concerns) != 1 || caught.Concerns[0] != want {
+		t.Errorf("caught trial = %+v, want one concern %+v", caught, want)
+	}
+	missed := classifyCatchConcerns([]CatchTrialConcern{c}, 1, CatchRule{Probes: []string{"nothing"}, AnchorStep: 2})
+	want.NearMiss = NearMissAttributionWithoutProbe
+	if missed.Outcome != CatchMissed || len(missed.Concerns) != 1 || missed.Concerns[0] != want {
+		t.Errorf("missed trial = %+v, want one concern %+v", missed, want)
+	}
+}
+
+func TestCaseCatchCounts_Validate(t *testing.T) {
+	tests := []struct {
+		name   string
+		counts CaseCatchCounts
+		want   string
+	}{
+		{"legacy catch case", CaseCatchCounts{Trials: 10, Caught: 6, Undecodable: 4}, ""},
+		{"explicit catch case", CaseCatchCounts{Expect: CatchExpectCatch, Trials: 10, Caught: 6}, ""},
+		{"clean case", CaseCatchCounts{Expect: CatchExpectClean, Trials: 10, FalseAlarms: 6, Undecodable: 4}, ""},
+		{"negative false alarms", CaseCatchCounts{Expect: CatchExpectClean, Trials: 10, FalseAlarms: -1}, "negative count"},
+		{"false alarms on a catch case", CaseCatchCounts{Trials: 10, Caught: 1, FalseAlarms: 1}, "false_alarms 1 on a catch case"},
+		{"caught on a clean case", CaseCatchCounts{Expect: CatchExpectClean, Trials: 10, Caught: 1}, "caught 1 on a clean case"},
+		{"false alarms + undecodable over trials", CaseCatchCounts{Expect: CatchExpectClean, Trials: 10, FalseAlarms: 6, Undecodable: 5}, "false_alarms 6 + undecodable 5 exceeds trials 10"},
+		{"caught + undecodable over trials", CaseCatchCounts{Trials: 10, Caught: 6, Undecodable: 5}, "caught 6 + undecodable 5 exceeds trials 10"},
+		{"unknown expect", CaseCatchCounts{Expect: "maybe", Trials: 1}, `unknown expect "maybe"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.counts.validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("validate() = %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
+	if !(CaseCatchCounts{Expect: CatchExpectClean}).IsClean() || (CaseCatchCounts{}).IsClean() {
+		t.Error("IsClean misreports the expectation class")
+	}
+}
+
+// TestCaseCatchCounts_V4EncodingUnchanged: a catch case's counts encode with
+// no expect and no false_alarms key, so a v4 record re-encodes
+// byte-identically.
+func TestCaseCatchCounts_V4EncodingUnchanged(t *testing.T) {
+	b, err := json.Marshal(CaseCatchCounts{Trials: 3, Caught: 1, Undecodable: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(b), `{"trials":3,"caught":1,"undecodable":1}`; got != want {
+		t.Errorf("encoding = %s, want %s", got, want)
+	}
+}
+
+func TestCatchRuleVersion_V5(t *testing.T) {
+	for _, want := range []string{"planreview-catch-v5:", "category predicate", "approach-step anchor", "clean kind", "classifies exactly as v4"} {
+		if !strings.Contains(catchRuleVersion, want) {
+			t.Errorf("catchRuleVersion lacks %q", want)
+		}
+	}
+}
