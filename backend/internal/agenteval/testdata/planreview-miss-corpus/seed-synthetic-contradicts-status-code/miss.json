@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000004254",
+  "artifact_id": "00000000-0000-0000-0001-000000004254",
+  "triage_sequence": 107,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed explicit criterion contradicts the issue text it cites (bad criterion)",
+  "decided_at": "2026-10-11T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-create-duplicate-400",
+      "statement": "POST /widgets with a name another widget of the same tenant already uses returns HTTP 400 with error code duplicate_name.",
+      "source": "explicit",
+      "source_ref": "example-org/widgets-service#108",
+      "observed": "the duplicate create returned HTTP 409 with error code duplicate_name, as the issue requires; the criterion failed",
+      "expected": "HTTP 400 with error code duplicate_name",
+      "steps_taken": "POST /widgets name=gizmo twice as the same tenant, read the second status code and error code",
+      "expectation_basis": "criterion ac-create-duplicate-400",
+      "repro_handle": "curl -s -w '%{http_code}' -d '{\"name\":\"gizmo\"}' $TARGET/widgets",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

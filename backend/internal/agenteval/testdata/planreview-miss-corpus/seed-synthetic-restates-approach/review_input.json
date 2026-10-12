@@ -82,12 +82,15 @@
     "restates the approach",
     "restates approach",
     "restates an approach",
-    "restates step",
     "restating the approach",
-    "not an observable",
-    "not an outcome",
+    "criterion restates",
+    "restates the implementation",
     "instead of an observable",
     "instead of the observable"
+  ],
+  "attribution_phrases": [
+    "has an ArchivedAt field",
+    "was written"
   ],
   "catching_examples": [
     {
@@ -98,7 +101,7 @@
     {
       "severity": "medium",
       "category": "independence",
-      "note": "One criterion restates the approach (the step-2 struct field exists); it should assert the response the issue asks for."
+      "note": "One criterion restates the approach (the step-2 struct field was written); it should assert the response the issue asks for."
     }
   ],
   "non_catching_examples": [
@@ -131,6 +134,29 @@
       "severity": "low",
       "category": "coverage",
       "note": "Test that toWidgetResponse populates ArchivedAt for the list endpoint too."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "ac-step-two-done could cite the widgetResponse type by its file path."
+    },
+    {
+      "category": "scope",
+      "note": "Approach step 2's json tag diverges from the camelCase used elsewhere; the mismatch is unjustified and the issue says nothing about tags."
+    },
+    {
+      "category": "scope",
+      "note": "widgetResponse has an ArchivedAt field whose json tag diverges from the camelCase used elsewhere; the mismatch is unjustified and the issue says nothing about tags."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Approach step 2 restates step 1's migration ordering; fold them into one step."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "In approach step 2 the handler is not an outcome-bearing component; split the write path…"
     }
   ]
 }

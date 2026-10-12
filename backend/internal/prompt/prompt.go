@@ -1339,7 +1339,9 @@ const ReviewConventionsFraming = "The conventions below are SUPPLEMENTAL review 
 	"verbatim. A concern derived from a convention MUST use category `repo_convention`, MUST set `convention` to " +
 	"that convention's name, and MUST quote the rule it applies verbatim (the grounded-citation criterion above " +
 	"applies). Severity caps are enforced by the server when your verdict is ingested: a `repo_convention` concern " +
-	"above its convention's cap is lowered to the cap.\n\n"
+	"above its convention's cap is lowered to the cap. Apply every review criterion above — issue fidelity and " +
+	"inferred-criterion warrant included — before and independently of these conventions; a plan that satisfies " +
+	"every convention can still fail an earlier criterion.\n\n"
 
 // GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
 // the digested, machine-verified results of the stage's deterministic
@@ -6507,8 +6509,13 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("When the plan carries verification.acceptance_criteria, also assess:\n\n")
 	b.WriteString("8. **Coverage**: the criteria cover every behavioral claim the issue and summary make; " +
 		"flag any behavior the change promises that no criterion verifies.\n")
+	// 8a (#4253 / #4254 fold-in): numbered 8a, not 9, so criterion 9 and the
+	// "criterion 13" reference in liveValidationVerdictClause keep their
+	// numbers. Issue fidelity is the defect class the catch-rate eval's
+	// contradicts-* cases plant.
+	b.WriteString(issueFidelityCriterion)
 	b.WriteString("9. **Warrant of inferred criteria**: each inferred criterion's rationale is actually warranted " +
-		"by the issue or repository context, not invented.\n")
+		"by the issue or repository context, not invented." + inferredCriterionWarrantClause + "\n")
 	b.WriteString("10. **Testability**: each criterion is concretely verifiable — an executor could decide pass/fail; " +
 		"vague adjectives (\"robust\", \"clean\", \"handles edge cases\") flag.\n")
 	b.WriteString("11. **Independence**: criteria state observable outcomes, not restatements of the approach steps " +
@@ -6520,6 +6527,7 @@ func buildPlanReview(t Trigger) string {
 	// requires_live_validation marking MEANS — five identical rejects read a
 	// correctly-flagged live-target criterion as an unverified one.
 	b.WriteString(liveValidationChecklistItem)
+	b.WriteString(criterionIDInNoteInstruction)
 
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
@@ -8619,6 +8627,30 @@ func relatedADRsText(ids []string) string {
 const liveValidationCriterionAnnotation = " requires_live_validation: true (DECLARED OPERATOR WALK — the sandbox cannot " +
 	"stand up this target; a tracked operator-validation walk is auto-filed on plan approval, so this is NOT a " +
 	"coverage defect)"
+
+// issueFidelityCriterion is plan-review criterion 8a (#4253 / #4254 fold-in):
+// a criterion citing the issue must require what the issue requires. The
+// catch-rate eval's contradicts-* cases (soft-delete vs row removal, a numeric
+// limit, a status code) are this defect.
+const issueFidelityCriterion = "8a. **Issue fidelity**: each criterion that cites the issue (source explicit / " +
+	"source_ref) must require what the issue requires; a criterion that conflicts with the issue text — e.g. the " +
+	"issue says soft-delete, the criterion requires row removal — flags, category `correctness`, naming both the " +
+	"issue's requirement and the criterion's.\n"
+
+// inferredCriterionWarrantClause tightens plan-review criterion 9 (#4253 /
+// #4254 fold-in): a specific value borrowed from sibling code is precedent,
+// not a requirement, so an inferred criterion carrying one flags unless the
+// plan cites where the value is required.
+const inferredCriterionWarrantClause = " An inferred criterion that introduces a specific value, limit or " +
+	"behavior the issue never states (a page size, timeout, rate, status code) flags unless the plan cites where " +
+	"that value is REQUIRED; similar code elsewhere is precedent, not a requirement."
+
+// criterionIDInNoteInstruction closes the plan-review acceptance-criteria
+// block (#4253 / #4254 fold-in): a concern about one criterion names that
+// criterion's id, so the operator, the fix-up agent and the catch-rate eval can
+// attribute it without matching the criterion's prose.
+const criterionIDInNoteInstruction = "Every concern about a specific acceptance criterion names that criterion's " +
+	"id (e.g. `ac-delete-hard`) in its `note`.\n\n"
 
 // liveValidationChecklistItem is review-criteria item 13 in the plan-review
 // prompt (#2978): it tells the reviewer that a requires_live_validation

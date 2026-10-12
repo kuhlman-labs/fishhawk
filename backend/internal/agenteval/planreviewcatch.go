@@ -11,15 +11,26 @@
 // the REAL repodoc path — so the two arms differ ONLY by the conventions
 // section (TestCatchRateArms_DifferOnlyInConventionsSection pins that).
 //
-// A trial is CAUGHT when any emitted concern matches any case probe
-// (matchCatchProbe: case-folded substring over the concern's note AND
-// category). A probe never occurs in the issue or plan the reviewer is shown
-// (loader mode m), so a concern that merely ECHOES that wording about an
-// unrelated aspect scores missed rather than inflating both arms toward a
-// ceiling that would hide a dilution. An UNDECODABLE verdict counts as a MISS
-// in the rate and is reported separately — excluding it from the denominator
-// would let an arm that stops emitting parseable verdicts look better, not
-// worse.
+// A trial is CAUGHT only when ONE emitted concern satisfies BOTH halves of the
+// rule (matchCatchConcern): the ATTRIBUTION half — the concern's note or
+// category names a planted criterion id from the case's miss.json, or one of
+// the case's declared attribution_phrases (each occurring in the planted
+// criterion's statement and in no other criterion's, loader mode p) — AND the
+// PROBE half (matchCatchProbe: some catch probe as a case-folded substring of
+// the same note or category). A probe never occurs in the issue or plan the
+// reviewer is shown (loader mode m), so a concern that merely ECHOES that
+// wording scores missed; the attribution half additionally keeps a probe that
+// is the plan-review prompt's OWN vocabulary (vague, untestable, ...) from
+// scoring a concern about a DIFFERENT criterion as a catch. Neither half alone
+// catches, and the two must meet in one concern. An UNDECODABLE verdict counts
+// as a MISS in the rate and is reported separately — excluding it from the
+// denominator would let an arm that stops emitting parseable verdicts look
+// better, not worse.
+//
+// RunCatchRateArm also keeps one CatchTrial per sample (the decoded concerns,
+// the matched probe and attribution of a catch, a near-miss tag per concern of
+// a miss, the raw response of an undecodable trial) so the recorder can commit
+// the per-trial sidecar beside the evidence (planreviewevidence.go).
 //
 // The regression rule (CompareCatchRateArms): the with-conventions catch rate
 // may be at most DefaultCatchRateRegressionTolerance below the
@@ -30,8 +41,9 @@
 // widening the bar.
 //
 // READ THE FLOOR HONESTLY: the trial floor bounds MODEL-SAMPLING noise only.
-// The corpus — six synthetic planted-defect shapes — bounds what the gate can
-// detect; a dilution that spares these six shapes is invisible to it.
+// The corpus — the committed synthetic planted-defect shapes — bounds what the
+// gate can detect; a dilution that spares every committed shape is invisible
+// to it.
 //
 // The live measurement and the committed evidence record are NOT in this file
 // (planreviewevidence.go + the double-gated live test own them); everything
@@ -72,9 +84,11 @@ const (
 type CatchOutcome string
 
 const (
-	// CatchCaught means the verdict decoded and some concern matched a probe.
+	// CatchCaught means the verdict decoded and one concern satisfied both the
+	// attribution half and the probe half of the rule.
 	CatchCaught CatchOutcome = "caught"
-	// CatchMissed means the verdict decoded and no concern matched any probe.
+	// CatchMissed means the verdict decoded and no single concern satisfied
+	// both halves.
 	CatchMissed CatchOutcome = "missed"
 	// CatchUndecodable means the response carried no decodable verdict. Scored
 	// as a MISS; reported separately.
@@ -105,13 +119,41 @@ const (
 	MinCatchRateTrialsPerArm = 136
 
 	// catchRuleVersion names the catch-classification semantics. Bump it
-	// whenever ClassifyCatch or matchCatchProbe changes meaning: it is
-	// folded into the evidence fingerprint, so a bump makes a recorded
-	// measurement stale instead of silently re-scoring it under new rules.
-	catchRuleVersion = "planreview-catch-v2: a trial is caught when the response decodes (extract first '{'..last '}', " +
-		"verdict one of approve|approve_with_concerns|reject) and some concern's note OR category contains some " +
-		"catch probe as a case-folded (strings.ToLower) substring; an undecodable response is a miss counted in trials; " +
-		"no probe occurs case-folded in the case's issue title, issue body or plan text (loader mode m)"
+	// whenever ClassifyCatch, matchCatchConcern, matchCatchAttribution or
+	// matchCatchProbe changes meaning: it is folded into the evidence
+	// fingerprint, so a bump makes a recorded measurement stale instead of
+	// silently re-scoring it under new rules.
+	catchRuleVersion = "planreview-catch-v3: a trial is caught when the response decodes (extract first '{'..last '}', " +
+		"verdict one of approve|approve_with_concerns|reject) and ONE concern satisfies both halves: its note OR category " +
+		"contains a planted criterion id (miss.json criterion_id) or a declared attribution phrase, AND its note OR " +
+		"category contains some catch probe, each as a case-folded (strings.ToLower) substring; an undecodable response " +
+		"is a miss counted in trials; no probe occurs case-folded in the case's issue title, issue body or plan text " +
+		"(loader mode m); each attribution phrase occurs case-folded in a planted criterion's statement and in no other " +
+		"criterion's statement (loader mode p); no planted id is a case-folded substring of another criterion id (loader mode q)"
+)
+
+// The two attribution kinds a caught trial records: which half of the
+// attribution rule named the planted criterion.
+const (
+	// CatchAttributionID means the matching concern named a planted
+	// criterion id. It is checked first, so a concern naming both the id and
+	// a phrase counts as id-attributed.
+	CatchAttributionID = "id"
+	// CatchAttributionPhrase means the matching concern named no planted id
+	// but carried one of the case's declared attribution_phrases.
+	CatchAttributionPhrase = "phrase"
+)
+
+// The near-miss tags a missed trial's concerns carry.
+const (
+	// NearMissProbeWithoutAttribution tags a concern that matched a catch
+	// probe but named neither a planted criterion id nor an attribution
+	// phrase — a reviewer that may have flagged the defect without saying
+	// WHICH criterion it meant.
+	NearMissProbeWithoutAttribution = "probe_without_attribution"
+	// NearMissAttributionWithoutProbe tags a concern that named the planted
+	// criterion (by id or phrase) but matched no catch probe.
+	NearMissAttributionWithoutProbe = "attribution_without_probe"
 )
 
 // representativeConventionName / representativeConventionPath /
@@ -151,9 +193,16 @@ type PlanReviewCatchInput struct {
 	// Plan is a COMPLETE standard_v1 plan object (validated by plan.Parse)
 	// whose verification.acceptance_criteria carries the miss criterion.
 	Plan json.RawMessage `json:"plan"`
-	// CatchProbes are case-folded substrings; a concern whose note or
-	// category contains any of them catches the planted defect.
-	CatchProbes         []string              `json:"catch_probes"`
+	// CatchProbes are case-folded substrings: the PROBE half of the rule. A
+	// concern whose note or category contains one of them AND names the
+	// planted criterion (AttributionPhrases or a miss criterion id) catches
+	// the planted defect.
+	CatchProbes []string `json:"catch_probes"`
+	// AttributionPhrases are case-folded substrings, each occurring in a
+	// planted criterion's statement and in no other criterion's statement
+	// (loader mode p): the id-free way a concern can name the planted
+	// criterion for the ATTRIBUTION half of the rule.
+	AttributionPhrases  []string              `json:"attribution_phrases"`
 	CatchingExamples    []CatchExampleConcern `json:"catching_examples"`
 	NonCatchingExamples []CatchExampleConcern `json:"non_catching_examples"`
 }
@@ -173,6 +222,28 @@ type PlanReviewCatchCase struct {
 	ReviewInputRaw []byte
 }
 
+// CatchRule is the per-case input to the catch classifier: the probe half
+// (Probes) and the attribution half (CriterionIDs, AttributionPhrases).
+type CatchRule struct {
+	Probes             []string
+	CriterionIDs       []string
+	AttributionPhrases []string
+}
+
+// CatchRule returns the case's catch rule: its probes, its planted criterion
+// ids (every miss.json criterion_id) and its declared attribution phrases.
+func (c PlanReviewCatchCase) CatchRule() CatchRule {
+	return catchRuleFor(c.Miss, c.Input)
+}
+
+func catchRuleFor(m PlanReviewMissCase, in PlanReviewCatchInput) CatchRule {
+	ids := make([]string, 0, len(m.Misses))
+	for _, miss := range m.Misses {
+		ids = append(ids, miss.CriterionID)
+	}
+	return CatchRule{Probes: in.CatchProbes, CriterionIDs: ids, AttributionPhrases: in.AttributionPhrases}
+}
+
 // LoadPlanReviewCatchCorpus loads every case under dir. It reuses
 // LoadPlanReviewMissCorpus for miss.json and then reads each case's
 // review_input.json, FAILING CLOSED with an error naming the case on:
@@ -190,12 +261,27 @@ type PlanReviewCatchCase struct {
 //	(i) empty catch_probes, or an empty/whitespace probe (which would match
 //	    every concern)
 //	(j) a probe matching any non_catching_example — checked with
-//	    matchCatchProbe, the runtime matcher itself
-//	(k) a catching_example matching no probe
+//	    matchCatchProbe, the runtime probe half itself, regardless of
+//	    attribution, so the probe set discriminates on its own
+//	(k) a catching_example that does not classify CAUGHT under the full rule
+//	    (matchCatchConcern): it names neither a planted criterion id nor an
+//	    attribution phrase, or it matches no probe
 //	(l) empty catching_examples or non_catching_examples
 //	(m) a probe occurring (case-folded) in the issue title, the issue body or
 //	    any key or value of the plan — text the reviewer is SHOWN, so a
 //	    concern echoing it about an unrelated aspect would score as a catch
+//	(n) no non_catching_example carrying the attribution half (a planted id
+//	    or an attribution phrase) — without one, (j) passes on concerns the
+//	    attribution half already rejects and proves nothing about the probes
+//	    on concerns that DO name the planted criterion
+//	(o) empty attribution_phrases, or an empty/whitespace phrase (which would
+//	    attribute every concern)
+//	(p) an attribution phrase absent (case-folded) from every planted
+//	    criterion's statement, or occurring in a non-planted criterion's
+//	    statement — it would attribute a concern about another criterion
+//	(q) a planted criterion id occurring (case-folded) inside another
+//	    criterion id of the plan — a concern naming that other id would carry
+//	    the planted id as a substring and be attributed to it
 //
 // Mode (d) includes trailing content after the JSON value: a second object
 // or garbage appended to a valid review_input.json is refused, not ignored.
@@ -274,18 +360,62 @@ func loadPlanReviewCatchCase(dir string, m NamedPlanReviewMissCase) (PlanReviewC
 			return fail("review_input.json: catch_probes[%d] is empty — an empty probe matches every concern", i) // (i)
 		}
 	}
+	if len(in.AttributionPhrases) == 0 {
+		return fail("review_input.json: attribution_phrases must be non-empty — an id-free concern naming the planted criterion could never be attributed") // (o)
+	}
+	for i, phrase := range in.AttributionPhrases {
+		if strings.TrimSpace(phrase) == "" {
+			return fail("review_input.json: attribution_phrases[%d] is empty — an empty phrase attributes every concern", i) // (o)
+		}
+	}
+	planted := make(map[string]bool, len(m.Case.Misses))
+	for _, miss := range m.Case.Misses {
+		planted[miss.CriterionID] = true
+	}
+	for _, phrase := range in.AttributionPhrases {
+		lp := strings.ToLower(strings.TrimSpace(phrase))
+		inPlanted := false
+		for _, ac := range p.Verification.AcceptanceCriteria {
+			if !strings.Contains(strings.ToLower(ac.Statement), lp) {
+				continue
+			}
+			if !planted[ac.ID] {
+				return fail("attribution phrase %q also occurs in criterion %q's statement: it would attribute a concern about that criterion to the planted one", phrase, ac.ID) // (p)
+			}
+			inPlanted = true
+		}
+		if !inPlanted {
+			return fail("attribution phrase %q occurs in no planted criterion's statement: it does not name the planted criterion", phrase) // (p)
+		}
+	}
+	for id := range planted {
+		lid := strings.ToLower(id)
+		for _, ac := range p.Verification.AcceptanceCriteria {
+			if ac.ID != id && strings.Contains(strings.ToLower(ac.ID), lid) {
+				return fail("planted criterion id %q occurs inside criterion id %q: a concern naming %q would be attributed to the planted criterion", id, ac.ID, ac.ID) // (q)
+			}
+		}
+	}
 	if len(in.CatchingExamples) == 0 || len(in.NonCatchingExamples) == 0 {
 		return fail("review_input.json: catching_examples and non_catching_examples must both be non-empty — the probes' discrimination is unproven otherwise") // (l)
 	}
+	rule := catchRuleFor(m.Case, in)
+	attributedNonCatching := false
 	for i, ex := range in.NonCatchingExamples {
 		if probe, ok := matchCatchProbe(ex.Category, ex.Note, in.CatchProbes); ok {
 			return fail("catch probe %q matches non_catching_examples[%d] (%q): the probe does not discriminate", probe, i, ex.Note) // (j)
 		}
+		if _, ok := matchCatchAttribution(ex.Category, ex.Note, rule); ok {
+			attributedNonCatching = true
+		}
 	}
 	for i, ex := range in.CatchingExamples {
-		if _, ok := matchCatchProbe(ex.Category, ex.Note, in.CatchProbes); !ok {
-			return fail("catching_examples[%d] (%q) matches no catch probe", i, ex.Note) // (k)
+		if _, _, ok := matchCatchConcern(ex.Category, ex.Note, rule); !ok {
+			return fail("catching_examples[%d] (%q) is not a catch under the attribution-AND-probe rule: one concern must name a planted criterion id or an attribution phrase AND match a catch probe", i, ex.Note) // (k)
 		}
+	}
+	if !attributedNonCatching {
+		return fail("no non_catching_example names a planted criterion id or an attribution phrase: the probes' discrimination on concerns that DO name the planted criterion is unproven") // (n)
 	}
 	shown, err := catchShownText(in)
 	if err != nil {
@@ -349,9 +479,41 @@ func catchShownText(in PlanReviewCatchInput) (string, error) {
 	return strings.ToLower(strings.Join(parts, "\n")), nil
 }
 
-// matchCatchProbe is THE catch matcher, shared by ClassifyCatch and the
-// loader's discrimination checks (modes j/k): it returns the first probe that
-// occurs as a case-folded (strings.ToLower) substring of the concern's note or
+// matchCatchConcern is THE catch matcher, shared by ClassifyCatchTrial and the
+// loader's mode (k): ONE concern catches only when it satisfies the
+// attribution half (matchCatchAttribution) AND the probe half
+// (matchCatchProbe). It returns the matched probe and the attribution kind.
+// Changing its meaning requires a catchRuleVersion bump.
+func matchCatchConcern(category, note string, rule CatchRule) (probe, attribution string, ok bool) {
+	attribution, attributed := matchCatchAttribution(category, note, rule)
+	if !attributed {
+		return "", "", false
+	}
+	probe, probed := matchCatchProbe(category, note, rule.Probes)
+	if !probed {
+		return "", "", false
+	}
+	return probe, attribution, true
+}
+
+// matchCatchAttribution is the attribution half of the rule: CatchAttributionID
+// when some planted criterion id occurs as a case-folded substring of the
+// concern's note or category, else CatchAttributionPhrase when some declared
+// attribution phrase does. The id is checked first, so the recorded share of
+// id-attributed catches counts every catch that named the id.
+func matchCatchAttribution(category, note string, rule CatchRule) (string, bool) {
+	if _, ok := matchCatchProbe(category, note, rule.CriterionIDs); ok {
+		return CatchAttributionID, true
+	}
+	if _, ok := matchCatchProbe(category, note, rule.AttributionPhrases); ok {
+		return CatchAttributionPhrase, true
+	}
+	return "", false
+}
+
+// matchCatchProbe is the case-folded substring test both halves use, and the
+// probe half on its own (loader mode j): it returns the first term that occurs
+// as a case-folded (strings.ToLower) substring of the concern's note or
 // category. It mirrors severitycalibration.go's matchLabelledConcern in
 // matching over BOTH fields, but is a plain substring test rather than a
 // token-overlap score: a probe names the planted defect, not a labelled
@@ -450,32 +612,90 @@ func CatchRateArmPrompt(c PlanReviewCatchCase, conv prompt.ReviewConvention, arm
 type planReviewEmittedVerdict struct {
 	Verdict  string `json:"verdict"`
 	Concerns []struct {
+		Severity string `json:"severity"`
 		Category string `json:"category"`
 		Note     string `json:"note"`
 	} `json:"concerns"`
 }
 
-// ClassifyCatch classifies one reviewer response against a case's probes:
-// CatchUndecodable when no verdict decodes (no JSON object, malformed JSON,
-// or a verdict outside approve|approve_with_concerns|reject); CatchCaught when
-// some concern matches some probe (matchCatchProbe); CatchMissed otherwise —
-// including a decoded verdict whose concerns match nothing.
-func ClassifyCatch(responseText string, probes []string) CatchOutcome {
+// CatchTrialConcern is one decoded reviewer concern of a trial. NearMiss is
+// set only on a MISSED trial's concerns (NearMissProbeWithoutAttribution,
+// NearMissAttributionWithoutProbe, or empty when the concern matched neither
+// half).
+type CatchTrialConcern struct {
+	Severity string
+	Category string
+	Note     string
+	NearMiss string
+}
+
+// CatchTrial is the classification of one reviewer response, with what the
+// trial sidecar records about it.
+type CatchTrial struct {
+	Outcome CatchOutcome
+	// MatchedProbe and Attribution are set only on a CAUGHT trial: the probe
+	// the matching concern carried and which attribution half named the
+	// planted criterion (CatchAttributionID or CatchAttributionPhrase).
+	MatchedProbe string
+	Attribution  string
+	// Concerns is the matching concern of a CAUGHT trial, every decoded
+	// concern (near-miss tagged) of a MISSED trial, and empty for an
+	// UNDECODABLE trial.
+	Concerns []CatchTrialConcern
+	// ConcernsTotal is the number of concerns the verdict carried.
+	ConcernsTotal int
+	// Response is the raw response text of an UNDECODABLE trial only.
+	Response string
+}
+
+// ClassifyCatch classifies one reviewer response against a case's catch rule;
+// it is ClassifyCatchTrial's outcome.
+func ClassifyCatch(responseText string, rule CatchRule) CatchOutcome {
+	return ClassifyCatchTrial(responseText, rule).Outcome
+}
+
+// ClassifyCatchTrial classifies one reviewer response against a case's catch
+// rule: CatchUndecodable when no verdict decodes (no JSON object, malformed
+// JSON, or a verdict outside approve|approve_with_concerns|reject);
+// CatchCaught when ONE concern satisfies both the attribution half and the
+// probe half (matchCatchConcern) — the first such concern is the trial's
+// matching concern; CatchMissed otherwise, including a decoded verdict whose
+// concerns match only one half each, with every concern near-miss tagged.
+func ClassifyCatchTrial(responseText string, rule CatchRule) CatchTrial {
 	var v planReviewEmittedVerdict
 	if err := json.Unmarshal([]byte(extractJSONObject(responseText)), &v); err != nil {
-		return CatchUndecodable
+		return CatchTrial{Outcome: CatchUndecodable, Response: responseText}
 	}
 	switch v.Verdict {
 	case "approve", "approve_with_concerns", "reject":
 	default:
-		return CatchUndecodable
+		return CatchTrial{Outcome: CatchUndecodable, Response: responseText}
 	}
 	for _, c := range v.Concerns {
-		if _, ok := matchCatchProbe(c.Category, c.Note, probes); ok {
-			return CatchCaught
+		if probe, attribution, ok := matchCatchConcern(c.Category, c.Note, rule); ok {
+			return CatchTrial{
+				Outcome:       CatchCaught,
+				MatchedProbe:  probe,
+				Attribution:   attribution,
+				Concerns:      []CatchTrialConcern{{Severity: c.Severity, Category: c.Category, Note: c.Note}},
+				ConcernsTotal: len(v.Concerns),
+			}
 		}
 	}
-	return CatchMissed
+	trial := CatchTrial{Outcome: CatchMissed, Concerns: make([]CatchTrialConcern, 0, len(v.Concerns)), ConcernsTotal: len(v.Concerns)}
+	for _, c := range v.Concerns {
+		_, probed := matchCatchProbe(c.Category, c.Note, rule.Probes)
+		_, attributed := matchCatchAttribution(c.Category, c.Note, rule)
+		var tag string
+		switch {
+		case probed && !attributed:
+			tag = NearMissProbeWithoutAttribution
+		case attributed && !probed:
+			tag = NearMissAttributionWithoutProbe
+		}
+		trial.Concerns = append(trial.Concerns, CatchTrialConcern{Severity: c.Severity, Category: c.Category, Note: c.Note, NearMiss: tag})
+	}
+	return trial
 }
 
 // CaseCatchCounts is one case's counts in one arm. Undecodable trials are
@@ -503,6 +723,10 @@ type CatchRateArmReport struct {
 	SamplesPerCase int
 	// PerCase maps case name to that case's counts.
 	PerCase map[string]CaseCatchCounts
+	// Trials maps case name to that case's classified trials, in sample
+	// order; its outcome tallies equal PerCase. Nil on a report built from
+	// recorded counts alone (judgeCatchRate), which never reads it.
+	Trials map[string][]CatchTrial
 }
 
 // Totals sums the per-case counts.
@@ -539,7 +763,8 @@ func SamplesPerCaseForPower(nCases int) int {
 // closed: no cases, samples < 1, a nil sender, an unknown arm, a render error
 // or a transport error returns the ZERO report and an error — a partial arm
 // would be a silently-biased comparison. An undecodable response is NOT an
-// error: it is a trial, scored as a miss and counted in Undecodable.
+// error: it is a trial, scored as a miss and counted in Undecodable. Every
+// trial's classification is kept in Trials, in sample order.
 func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanReviewCatchCase, conv prompt.ReviewConvention, arm string, samples int) (CatchRateArmReport, error) {
 	if len(cases) == 0 {
 		return CatchRateArmReport{}, fmt.Errorf("agenteval: catch arm %q: no cases", arm)
@@ -550,27 +775,36 @@ func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanRevi
 	if sender == nil {
 		return CatchRateArmReport{}, fmt.Errorf("agenteval: catch arm %q: sender is required", arm)
 	}
-	report := CatchRateArmReport{Arm: arm, SamplesPerCase: samples, PerCase: make(map[string]CaseCatchCounts, len(cases))}
+	report := CatchRateArmReport{
+		Arm: arm, SamplesPerCase: samples,
+		PerCase: make(map[string]CaseCatchCounts, len(cases)),
+		Trials:  make(map[string][]CatchTrial, len(cases)),
+	}
 	for _, c := range cases {
 		promptText, err := CatchRateArmPrompt(c, conv, arm)
 		if err != nil {
 			return CatchRateArmReport{}, err
 		}
+		rule := c.CatchRule()
 		var counts CaseCatchCounts
+		trials := make([]CatchTrial, 0, samples)
 		for i := 0; i < samples; i++ {
 			responseText, _, _, _, _, _, err := sender.Messages(ctx, planReviewCatchGeneratorSystemPrompt, promptText)
 			if err != nil {
 				return CatchRateArmReport{}, fmt.Errorf("agenteval: catch arm %q case %q sample %d: generate: %w", arm, c.Name, i+1, err)
 			}
 			counts.Trials++
-			switch ClassifyCatch(responseText, c.Input.CatchProbes) {
+			trial := ClassifyCatchTrial(responseText, rule)
+			switch trial.Outcome {
 			case CatchCaught:
 				counts.Caught++
 			case CatchUndecodable:
 				counts.Undecodable++
 			}
+			trials = append(trials, trial)
 		}
 		report.PerCase[c.Name] = counts
+		report.Trials[c.Name] = trials
 	}
 	return report, nil
 }
