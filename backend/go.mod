@@ -4,11 +4,11 @@ go 1.25.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.78.0
-	github.com/aws/aws-sdk-go-v2 v1.47.1
+	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0
-	github.com/aws/smithy-go v1.28.2
+	github.com/aws/smithy-go v1.28.5
 	github.com/bmatcuk/doublestar/v4 v4.10.2
 	github.com/containerd/errdefs v1.0.0
 	github.com/golang-migrate/migrate/v4 v4.19.1
