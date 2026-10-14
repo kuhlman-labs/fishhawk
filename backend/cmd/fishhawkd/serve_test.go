@@ -7248,3 +7248,56 @@ func (g *conflictAdapterGitHub) ComparePatch(_ context.Context, _ forge.Credenti
 	}
 	return &forge.ComparePatchResult{Files: []forge.ComparePatchFile{{Path: "x.go"}, {Path: "y.go"}}, Truncated: true}, nil
 }
+
+// TestServeGo_WiresSpecialistJobStore pins approval condition C5 (E85.9 /
+// #4300): runServe must assign `cfg.SpecialistJobs = specialistjob.NewStore(
+// pool)`. Without it every /v0/specialist-jobs route answers 503
+// specialist_jobs_unconfigured and no server-package test can see it, because
+// those tests construct the Config themselves. It walks the PARSED runServe
+// body, so a comment naming the call cannot satisfy it.
+func TestServeGo_WiresSpecialistJobStore(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	var found bool
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		lhs, ok := as.Lhs[0].(*ast.SelectorExpr)
+		if !ok || lhs.Sel.Name != "SpecialistJobs" {
+			return true
+		}
+		if x, ok := lhs.X.(*ast.Ident); !ok || x.Name != "cfg" {
+			return true
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "NewStore" {
+			return true
+		}
+		if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "specialistjob" {
+			found = true
+		}
+		return true
+	})
+	if !found {
+		t.Error("runServe does not assign `cfg.SpecialistJobs = specialistjob.NewStore(pool)`; " +
+			"every /v0/specialist-jobs route would answer 503 specialist_jobs_unconfigured")
+	}
+}

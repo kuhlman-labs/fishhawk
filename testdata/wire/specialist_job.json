@@ -1,0 +1,231 @@
+{
+  "_comment": "Shared cross-module golden for the specialist-job wire contract (E85.9 / #4300). job is a GET /v0/specialist-jobs/{job_id} body (server specialistJobResponse -> runner upload.SpecialistJob; never execution_nonce). admission is a POST .../admission answer. completions holds one valid POST .../result body per runner-executed kind plus an inconclusive-with-reason one (runner upload.SpecialistJobCompletion -> specialistjob.Completion). Backend tests ParseCompletion every entry; runner tests round-trip every entry through the upload structs with DisallowUnknownFields.",
+  "job": {
+    "job_id": "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f",
+    "kind": "overlap_scan",
+    "state": "running",
+    "requester": {
+      "seat": "operator",
+      "actor_kind": "user",
+      "subject": "github:operator"
+    },
+    "subject": {
+      "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+      "head_sha": "1111111111111111111111111111111111111111"
+    },
+    "inputs": {
+      "runs": [
+        {
+          "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+          "head_sha": "1111111111111111111111111111111111111111",
+          "base_sha": "2222222222222222222222222222222222222222"
+        },
+        {
+          "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c02",
+          "head_sha": "2222222222222222222222222222222222222222",
+          "base_sha": "1111111111111111111111111111111111111111"
+        }
+      ],
+      "watch_paths": [
+        "backend/internal/*/store.go"
+      ]
+    },
+    "admission_group": "local-verify:golden-host",
+    "host": "golden-host",
+    "requested_sequence": 7,
+    "requested_at": "2026-10-12T19:00:00Z",
+    "last_seen_at": "2026-10-12T19:00:05Z",
+    "started_at": "2026-10-12T19:00:05Z",
+    "stale": false
+  },
+  "admission": {
+    "admitted": true,
+    "execution_nonce": "golden-execution-nonce",
+    "position": 0,
+    "contended": false,
+    "taken_over": false,
+    "job": {
+      "job_id": "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f",
+      "kind": "overlap_scan",
+      "state": "running",
+      "requester": {
+        "seat": "operator",
+        "actor_kind": "user",
+        "subject": "github:operator"
+      },
+      "subject": {
+        "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+        "head_sha": "1111111111111111111111111111111111111111"
+      },
+      "inputs": {
+        "runs": [
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+            "head_sha": "1111111111111111111111111111111111111111",
+            "base_sha": "2222222222222222222222222222222222222222"
+          },
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c02",
+            "head_sha": "2222222222222222222222222222222222222222",
+            "base_sha": "1111111111111111111111111111111111111111"
+          }
+        ],
+        "watch_paths": [
+          "backend/internal/*/store.go"
+        ]
+      },
+      "admission_group": "local-verify:golden-host",
+      "host": "golden-host",
+      "requested_sequence": 7,
+      "requested_at": "2026-10-12T19:00:00Z",
+      "last_seen_at": "2026-10-12T19:00:05Z",
+      "started_at": "2026-10-12T19:00:05Z",
+      "stale": false
+    }
+  },
+  "completions": {
+    "counterfactual_battery": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "counterfactual_battery",
+      "verdict": "pass",
+      "evidence": {
+        "mutations": [
+          {
+            "control_path": "backend/internal/x/x.go",
+            "observed": "red",
+            "baseline": "green",
+            "mutation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "probes": [
+          {
+            "id": "p1",
+            "observed": "pass",
+            "expected": "pass",
+            "matched": true
+          }
+        ]
+      },
+      "duration_ms": 1234
+    },
+    "fanin_build": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "fanin_build",
+      "verdict": "pass",
+      "evidence": {
+        "slices": [
+          {
+            "name": "slice-1",
+            "head_sha": "1111111111111111111111111111111111111111",
+            "outcome": "merged",
+            "conflict_paths": []
+          }
+        ],
+        "packages": [
+          {
+            "package": "./backend/internal/x/...",
+            "outcome": "pass"
+          }
+        ]
+      },
+      "duration_ms": 1234
+    },
+    "overlap_scan": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "overlap_scan",
+      "verdict": "fail",
+      "evidence": {
+        "runs": [
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+            "resolved": true,
+            "changed_files": [
+              "a.go",
+              "b.go"
+            ],
+            "truncated": false
+          },
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c02",
+            "resolved": true,
+            "changed_files": [
+              "b.go"
+            ],
+            "truncated": false
+          }
+        ],
+        "overlaps": [
+          {
+            "run_a": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+            "run_b": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c02",
+            "paths": [
+              "b.go"
+            ],
+            "truncated": false
+          }
+        ],
+        "watch_hits": []
+      },
+      "duration_ms": 1234
+    },
+    "plan_crosscheck": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "plan_crosscheck",
+      "verdict": "pass",
+      "evidence": {
+        "questions": [
+          {
+            "id": "q1",
+            "observed": "pass",
+            "expected": "pass",
+            "matched": true
+          }
+        ],
+        "focus_files": [
+          {
+            "path": "backend/x.go",
+            "expect": "present",
+            "observed": "present",
+            "matched": true,
+            "touched_by": []
+          }
+        ],
+        "compare_runs": [
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+            "resolved": true,
+            "overlap_paths": []
+          }
+        ]
+      },
+      "duration_ms": 1234
+    },
+    "inventory": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "inventory",
+      "verdict": "pass",
+      "evidence": {
+        "command": "git_log",
+        "lines": [
+          "1111111111111111111111111111111111111111\tfirst commit"
+        ],
+        "truncated": false,
+        "exit_code": 0
+      },
+      "duration_ms": 1234
+    },
+    "inconclusive": {
+      "schema_version": "specialist-job-v1",
+      "execution_nonce": "golden-execution-nonce",
+      "kind": "fanin_build",
+      "verdict": "inconclusive",
+      "reason": "unresolvable_sha",
+      "duration_ms": 1234
+    }
+  }
+}

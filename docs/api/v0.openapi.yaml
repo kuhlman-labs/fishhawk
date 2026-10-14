@@ -680,6 +680,54 @@ components:
           enum: [event_excluded, not_completed, succeeded]
           description: Why a skipped run was not re-run.
         error: { type: string, description: "GitHub's error for a failed re-run request." }
+    SpecialistJob:
+      type: object
+      description: |
+        One specialist job (ADR-097 D2, E85.9 / #4300). Never carries the
+        execution nonce.
+      required: [job_id, kind, state, requester, subject, inputs, requested_sequence, requested_at, last_seen_at, stale]
+      properties:
+        job_id: { type: string, format: uuid }
+        kind: { type: string, enum: [counterfactual_battery, fanin_build, overlap_scan, plan_crosscheck, inventory, draft] }
+        state: { type: string, enum: [queued, running, completed] }
+        requester:
+          type: object
+          required: [seat, actor_kind, subject]
+          properties:
+            seat: { type: string, enum: [operator, first_officer] }
+            actor_kind: { type: string }
+            subject: { type: string }
+        subject:
+          type: object
+          properties:
+            run_id: { type: string, format: uuid }
+            campaign_id: { type: string, format: uuid }
+            head_sha: { type: string }
+            repo: { type: string }
+        inputs: { type: object, description: "The request's per-kind inputs, as recorded." }
+        admission_group: { type: string, description: 'local-verify:<host>, once an admission was attempted.' }
+        host: { type: string }
+        verdict: { type: string, enum: [pass, fail, inconclusive] }
+        result: { type: object, description: 'The server-composed specialist-job-v1 $defs.result, once completed.' }
+        requested_sequence: { type: integer, format: int64 }
+        completed_sequence: { type: integer, format: int64 }
+        requested_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        stale:
+          type: boolean
+          description: Advisory — queued and unseen past the queue TTL, or running and unseen past JobHeartbeatTTL.
+    SpecialistJobAdmission:
+      type: object
+      required: [admitted, position, contended, taken_over, job]
+      properties:
+        admitted: { type: boolean }
+        execution_nonce: { type: string, description: "The caller's own nonce, echoed only when admitted." }
+        position: { type: integer, description: '1-based queue standing when not admitted; 0 when admitted.' }
+        contended: { type: boolean, description: 'The group lock was held by another admission, so this call queued without deciding.' }
+        taken_over: { type: boolean, description: "This admission replaced a stale running job's nonce." }
+        job: { $ref: '#/components/schemas/SpecialistJob' }
     Error:
       type: object
       required: [error]
@@ -13476,6 +13524,28 @@ paths:
         refuses the head `409 merge_candidate_unverified` until a `passed`
         result is recorded for it.
 
+        **Verify-only re-run of a FAILED head (#4391).** With
+        `rerun_failed_verify: true` and a non-blank `reason` (REQUIRED: 400
+        `validation_failed`, `field: reason` otherwise — checked after the 503
+        guard and before the run lookup), the already-up-to-date arm re-runs
+        ONLY the verify of a live head whose recorded verdict is `failed`, with
+        no agent. When the implement stage is parked at its review gate
+        (`succeeded` or `awaiting_approval`) it appends an operator
+        `merge_candidate_verified` row (`result: not_executed`, `reason:
+        "operator_rerun: <reason>"`, `voids_sequence` = the failed row's
+        sequence, `trigger_sequence` copied from it) that VOIDS the failed
+        verdict — ADR-090 already reads `not_executed` as re-triggerable — and
+        then starts a fresh pass through the unchanged start path (direct for
+        `fan_in`, the ADR-092 queue for `base_advance`/`conflict_resolution`,
+        so it may answer `held`). The 200 carries
+        `merge_candidate_verify_rerun: true`. When the stage is NOT at its gate
+        (e.g. a queued D6 fix-up left it `pending`) the call is refused on
+        `merge_candidate_verify_refusal` having written no verdict and no
+        trigger (the `branch_rebased` row still lands), naming
+        `fishhawk_dispatch_stage` for the queued fix-up. On any other head
+        state, or on a call that PERFORMS a merge (the new head gets its own
+        pass), the flag has no effect and `merge_candidate_verify_note` says so.
+
         **Sibling endpoint.** `POST /v0/runs/{run_id}/reset-branch` is the
         right verb for a FOREIGN COMMIT pushed ON TOP of the run's commits — a
         different problem. Both refusals cross-link the other.
@@ -13511,8 +13581,17 @@ paths:
                 reason:
                   type: string
                   description: |
-                    Optional operator rationale, recorded on the
-                    `branch_rebased` audit entry.
+                    Operator rationale, recorded on the `branch_rebased` audit
+                    entry. Optional, EXCEPT with `rerun_failed_verify`, where a
+                    non-blank value is required and is also recorded on the
+                    void row as the attestation that the failure was not the
+                    change's.
+                rerun_failed_verify:
+                  type: boolean
+                  description: |
+                    #4391: re-run ONLY the verify of a FAILED merge-candidate
+                    head (see the operation description). Requires a non-blank
+                    `reason`. Default false.
       responses:
         '200':
           description: |
@@ -13614,7 +13693,9 @@ paths:
                       resolved new head (the decoded merge commit unless a
                       genuine concurrent push was observed, #4199); the
                       already-up-to-date arm re-triggers only for
-                      an `unverified` Fishhawk-written head.
+                      an `unverified` Fishhawk-written head — or, with
+                      `rerun_failed_verify`, a `failed` head whose verdict
+                      this call voided (#4391).
                   merge_candidate_verify_stage_id:
                     type: string
                     description: |
@@ -13638,7 +13719,19 @@ paths:
                       Why no pass could be started, or why the head's state
                       could not be read. The rebase itself still answers 200;
                       `POST /v0/runs/{run_id}/merge` then refuses
-                      `409 merge_candidate_unverified`.
+                      `409 merge_candidate_unverified`. With
+                      `rerun_failed_verify` it also names a refused re-run
+                      (the implement stage not at its gate, or the void append
+                      failing — nothing voided, nothing triggered), or a void
+                      that landed whose pass then could not start (the head is
+                      left `unverified`; re-invoke without the flag).
+                  merge_candidate_verify_rerun:
+                    type: boolean
+                    description: |
+                      True ONLY when THIS call voided a failed merge-candidate
+                      verdict for a `rerun_failed_verify` request (#4391); the
+                      fields above report the pass that followed (`in_flight`,
+                      or `held` behind the base's live pass).
         '202':
           description: |
             The base merge CONFLICTED and a bounded, agent-driven
@@ -13683,8 +13776,9 @@ paths:
                       invocation fails closed).
         '400':
           description: |
-            Malformed body or `confirm` not `true`. Body's `error` is
-            `validation_failed` or `confirmation_required`.
+            Malformed body, `confirm` not `true`, or `rerun_failed_verify`
+            with a blank `reason` (#4391, `details.field: reason`). Body's
+            `error` is `validation_failed` or `confirmation_required`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14269,10 +14363,15 @@ paths:
             (7) The merge-candidate verify FAILED for the live head
             (`merge_candidate_verify_failed`, ADR-090 D2/D6). `details` carry
             `{run_id, pr_url, head_sha, cause, verify_state: "failed",
-            next_step: "fishhawk_fixup_stage"}`. When the workflow delegates
+            next_step: "fishhawk_fixup_stage", rerun_step:
+            "fishhawk_rebase_run_branch"}`. When the workflow delegates
             fix-up routing one bounded fix-up was already routed when the result
             was recorded; otherwise, or when that route was refused, route it
-            with `fishhawk_fixup_stage`. Cases (5)–(7) record NO verdict row and
+            with `fishhawk_fixup_stage`. When the failure was infrastructure
+            rather than the change, `rerun_step` names the agent-free
+            alternative: `rebase-branch` with `rerun_failed_verify: true` and a
+            reason voids the failed verdict and re-runs only the verify (#4391).
+            Cases (5)–(7) record NO verdict row and
             dispatch nothing.
             (7a) The run's merge-candidate pass is HELD in its base's ADR-092
             queue behind the live pass (`merge_candidate_held`, E83.85 /
@@ -18485,6 +18584,295 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/specialist-jobs:
+    post:
+      operationId: requestSpecialistJob
+      summary: Request a specialist job
+      description: |
+        ADR-097 D2/D6 (E85.9 / #4300). The body is a `specialist-job-v1`
+        `$defs.request` (`docs/spec/specialist-job-v1.md`): a closed `kind`,
+        a `subject` (run, campaign, head SHA, repo) and bounded per-kind
+        `inputs`. The body is validated by `specialistjob.ParseRequest`
+        (duplicate-member walk, schema, strict decode, semantic rules).
+
+        **Requester.** Derived from the authenticated identity and NEVER read
+        from the body (the closed request def refuses a `requester` member):
+        `seat: operator`, `actor_kind` from the token subject (an
+        operator-agent token is `agent`, every other identity `user`),
+        `subject` = the identity subject.
+
+        **Draft** is rendered in-process as text only (a deterministic
+        template render, no model) and answers `201` with `state: completed`;
+        it writes nothing beyond its two audit rows. Every other kind answers
+        `201` `state: queued` for the `fishhawk-runner specialist-job`
+        subcommand to admit and execute. Both write
+        `specialist_job_requested` (and draft also `specialist_job_completed`)
+        to the subject run's chain, or the account's global chain when the
+        subject names no run.
+
+        **Auth.** `write:stages` from a seat identity. A run-bound
+        (`mcp:run:<uuid>`) token is refused
+        `specialist_job_requester_not_a_seat` even when it carries
+        `write:stages`.
+      tags: [runs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: 'specialist-job-v1 $defs.request (docs/spec/specialist-job-v1.schema.json).' }
+      responses:
+        '201':
+          description: The job, queued (runner kinds) or completed (draft).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SpecialistJob' }
+        '400':
+          description: |
+            `validation_failed` — the body failed `ParseRequest` (`details.path` names the schema location for a schema violation; `details.error` the named rule otherwise), or the draft could not be rendered within its bound.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (no `write:stages`) or `specialist_job_requester_not_a_seat` (a run-bound token).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `run_not_found` — the subject run is not in the caller's account; `campaign_not_found` — the subject campaign is not in the caller's account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `request_too_large` — the body exceeds 64 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the store call failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `specialist_jobs_unconfigured` — no specialist-job store on this instance; `service_unavailable` — the campaign account probe failed (fail closed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/specialist-jobs/{job_id}:
+    get:
+      operationId: getSpecialistJob
+      summary: Read one specialist job
+      description: |
+        The job's state, requester, subject, inputs, admission group, verdict
+        and composed `result`, plus a derived advisory `stale` flag. NEVER
+        returns the execution nonce (it is the running runner's capability to
+        ship the result). Auth: `read:runs`; the job's own account only.
+      tags: [runs]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SpecialistJob' }
+        '400':
+          description: |
+            `validation_failed` — `job_id` is not a UUID.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — no `read:runs`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `specialist_job_not_found` — no job with that id in the caller's account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the store call failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `specialist_jobs_unconfigured` — no specialist-job store on this instance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/specialist-jobs/{job_id}/admission:
+    post:
+      operationId: admitSpecialistJob
+      summary: Admit, heartbeat or take over a specialist job
+      description: |
+        Admits a queued runner-executed job through the
+        `local-verify:<host>` concurrency group (never an implement slot):
+        admitted only when the group's live stage holders plus live job
+        holders are below the verify limit, no fresh verify-stage waiter
+        exists (a job yields to merge-candidate passes) and no older fresh
+        queued job is ahead. Otherwise it stays queued (`admitted: false`,
+        `position`). A re-POST with the SAME nonce while running is the
+        heartbeat; a DIFFERENT nonce is refused while the heartbeat is fresh
+        and, once it is stale past `JobHeartbeatTTL`, the job is TAKEN OVER
+        under the new nonce (`taken_over: true`, a
+        `specialist_job_taken_over` audit entry). Auth: `write:stages`.
+      tags: [runs]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [host, nonce]
+              properties:
+                host: { type: string, minLength: 1, maxLength: 253, description: 'The runner host label; the group is local-verify:<host>.' }
+                nonce: { type: string, minLength: 1, maxLength: 128, description: "The runner's execution nonce." }
+      responses:
+        '200':
+          description: The admission decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SpecialistJobAdmission' }
+        '400':
+          description: |
+            `validation_failed` — `job_id` is not a UUID, or the body is not `{host, nonce}` within bounds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — no `write:stages`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `specialist_job_not_found` — no job with that id in the caller's account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `specialist_job_not_admissible` — a draft or completed job; `specialist_job_already_running` — running under another nonce with a live heartbeat.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `request_too_large` — the body exceeds 4 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the store call failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `specialist_jobs_unconfigured` — no specialist-job store on this instance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/specialist-jobs/{job_id}/result:
+    post:
+      operationId: completeSpecialistJob
+      summary: Ship a specialist job's completion
+      description: |
+        The runner's `specialist-job-v1` `$defs.completion`, validated by
+        `specialistjob.ParseCompletion` against the STORED job kind. Records
+        `specialist_job_completed` (verdict, reason, evidence, requester from
+        the job row, `charged_to`, `provenance: bearer` — shipped under the
+        forwarded operator bearer, not runner-signed) and sets the job
+        completed in one transaction. Writes ONLY `specialist_jobs` and the
+        audit chain, never a run or stage row. Auth: `write:stages`.
+      tags: [runs]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: 'specialist-job-v1 $defs.completion (docs/spec/specialist-job-v1.schema.json).' }
+      responses:
+        '200':
+          description: The completed job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SpecialistJob' }
+        '400':
+          description: |
+            `validation_failed` — `job_id` is not a UUID, or the completion failed `ParseCompletion` (`details.reason: kind_mismatch` when its kind is not the job's).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — no `write:stages`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `specialist_job_not_found` — no job with that id in the caller's account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `specialist_job_not_running` — the job is queued or already completed; `specialist_job_nonce_mismatch` — the execution nonce is not the running job's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `request_too_large` — the body exceeds 256 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the store call failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `specialist_jobs_unconfigured` — no specialist-job store on this instance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/audit/export:
     get:
       operationId: exportAudit
@@ -21698,6 +22086,22 @@ paths:
                       (older backend, or backend-side resolution failure)
                       means the runner proceeds with checkout only, skipping
                       the comparison.
+                  fixup_policy_increment:
+                    type: boolean
+                    description: |
+                      True ONLY on a decomposed PARENT's fix-up (#4391), the
+                      parent analogue of #765's per-child increment base. The
+                      runner then measures both `git_diff` emitters against the
+                      consolidated tip it fetched for the pass (a no-fetch
+                      merge-base; on failure it falls back to the cumulative
+                      diff against the base), so the in-band constraint check
+                      and the backend's `reEvaluatePolicy` see only the
+                      fix-up's own increment rather than the whole fan-out.
+                      Derived from the same predicate as the consolidated
+                      `fixup_branch`. Absent on an ordinary run's fix-up, a
+                      decomposed child's fix-up, a non-fix-up dispatch and a
+                      verify-only merge-candidate pass (and on a probe error),
+                      which keeps the cumulative diff.
                   egress_target_hosts:
                     type: array
                     items: { type: string }
@@ -22333,6 +22737,9 @@ paths:
                   fixup_expected_head_sha:
                     type: string
                     description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                  fixup_policy_increment:
+                    type: boolean
+                    description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
                   egress_target_hosts:
                     type: array
                     items: { type: string }

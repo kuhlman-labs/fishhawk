@@ -75,7 +75,8 @@ var realLegTable = legTable{
 		"_verify_schema_sync": {scripts: []string{"sync-schemas"}, inputs: []legInput{
 			g("docs/spec/**"),
 			g("backend/internal/plan/schemas/**"), g("backend/internal/spec/schemas/**"),
-			g("backend/internal/crewmessage/schemas/**"), g("backend/internal/operatorrole/schemas/**"),
+			g("backend/internal/crewmessage/schemas/**"), g("backend/internal/specialistjob/schemas/**"),
+			g("backend/internal/operatorrole/schemas/**"),
 			g("backend/internal/workmgmt/schemas/**"), g("backend/internal/operatorrole/defaults/**"),
 			g("backend/internal/workmgmt/defaults/**"), g("backend/internal/spec/presets/**"),
 			g("cli/internal/spec/schemas/**"), g("cli/internal/spec/presets/**"), g("runner/internal/plan/schemas/**"),

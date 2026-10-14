@@ -748,7 +748,8 @@ func mergeCandidateCheckFailed(reason string, cause error) mergeCandidateGateRes
 //   - D2/D4: mergeCandidateVerifyState for exactly the live head —
 //     unverified / in_flight → merge_candidate_unverified, failed →
 //     merge_candidate_verify_failed naming fishhawk_fixup_stage (D6: a
-//     delegated route was already attempted when the result was recorded),
+//     delegated route was already attempted when the result was recorded)
+//     and, as rerun_step, the verify-only re-run (#4391),
 //     passed / not_required → admit.
 func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeCandidateGateResult {
 	warnUngated := func(why string) mergeCandidateGateResult {
@@ -846,13 +847,16 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 	case mergeCandidateStateFailed:
 		return mergeCandidateGateResult{
 			Code: mergeCodeCandidateVerifyFailed,
-			Message: fmt.Sprintf("the merge-candidate verify pass FAILED for head %s (cause %s): the declared verify command is red on the combined tree, so the merge is refused (ADR-090 D2/D6). %s No merge verdict was recorded.",
-				headSHA, st.Cause, mergeCandidateFixupRoute),
+			Message: fmt.Sprintf("the merge-candidate verify pass FAILED for head %s (cause %s): the declared verify command is red on the combined tree, so the merge is refused (ADR-090 D2/D6). %s %s No merge verdict was recorded.",
+				headSHA, st.Cause, mergeCandidateFixupRoute, mergeCandidateRerunHint),
 			Details: map[string]any{
 				"head_sha":     headSHA,
 				"cause":        st.Cause,
 				"verify_state": st.State,
 				"next_step":    "fishhawk_fixup_stage",
+				// #4391: the agent-free alternative when the failure was
+				// infrastructure rather than the change.
+				"rerun_step": "fishhawk_rebase_run_branch",
 			},
 		}
 	}

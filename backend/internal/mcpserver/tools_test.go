@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -45,6 +46,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -3464,7 +3466,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// stale waiter. Its own tool, not a merge-queue mode: the merge-candidate
 	// queue's promote is #4297's verb, with a different key, lock domain and
 	// audit category. 76 -> 77.
-	const wantToolCount = 77
+	//
+	// #4300 (E85.9, ADR-097 D2/D6) adds exactly TWO tools —
+	// fishhawk_request_specialist_job (POST /v0/specialist-jobs plus a
+	// DETACHED fishhawk-runner specialist-job spawn for every runner kind) and
+	// fishhawk_get_specialist_job (GET /v0/specialist-jobs/{job_id} with a
+	// bounded wait). WHEN: the operator wants typed, runner-observed evidence
+	// (a counterfactual battery, fan-in build, overlap scan, plan cross-check,
+	// inventory) or a deterministic draft without opening a run. ELIGIBILITY:
+	// request needs write:stages from a seat (a run-bound token is refused
+	// specialist_job_requester_not_a_seat); get needs read:runs. Their own
+	// tools, not run verbs: a job has no stage, writes no run or stage row,
+	// and is admitted through local-verify:<host>. 77 -> 79.
+	const wantToolCount = 79
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3493,6 +3507,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_request_specialist_job / fishhawk_get_specialist_job (#4300)
+	// must likewise be wire-visible: the 77 -> 79 bump alone would stay green
+	// if either registration were dropped and a DIFFERENT tool added.
+	for _, name := range []string{"fishhawk_request_specialist_job", "fishhawk_get_specialist_job"} {
+		var saw bool
+		for _, tool := range res.Tools {
+			if tool.Name == name {
+				saw = true
+				break
+			}
+		}
+		if !saw {
+			t.Errorf("%s is not in the registered tool list — the specialist-job surface is unreachable", name)
+		}
 	}
 	// fishhawk_resolve_concerns (#4086) must likewise be wire-visible: the
 	// 74 -> 75 bump alone would stay green if its registration were dropped and
@@ -17933,6 +17962,738 @@ func TestGetRunStatus_AcceptanceGate_NonDecomposed_NoFanInRead(t *testing.T) {
 	for _, cat := range []string{"slices_integrated", "slice_head_missing", "slice_integration_failed", "slice_integration_conflict"} {
 		if n := fb.perRunAuditCategoryReads[cat]; n != 0 {
 			t.Errorf("%s reads = %d, want 0 for a non-decomposed run (C1: probe plan_decomposed first)", cat, n)
+		}
+	}
+}
+
+// --- fishhawk_request_specialist_job / fishhawk_get_specialist_job (E85.9 / #4300) ---
+
+// specialistJobFakeBackend serves POST /v0/specialist-jobs and
+// GET /v0/specialist-jobs/{job_id}. posts records every POST body; gets
+// replays the scripted GET bodies in order (the last repeats).
+type specialistJobFakeBackend struct {
+	mu        sync.Mutex
+	postBody  string
+	postCode  int
+	posts     []map[string]any
+	gets      []string
+	getCalls  int
+	getAuthOK bool
+}
+
+func newSpecialistJobFakeBackend(t *testing.T, postCode int, postBody string, gets ...string) (*specialistJobFakeBackend, *httptest.Server) {
+	t.Helper()
+	fb := &specialistJobFakeBackend{postCode: postCode, postBody: postBody, gets: gets}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/specialist-jobs", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.posts = append(fb.posts, body)
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fb.postCode)
+		_, _ = w.Write([]byte(fb.postBody))
+	})
+	mux.HandleFunc("GET /v0/specialist-jobs/{job_id}", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		i := fb.getCalls
+		fb.getCalls++
+		fb.getAuthOK = r.Header.Get("Authorization") == "Bearer tok-test"
+		body := fb.gets[min(i, len(fb.gets)-1)]
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return fb, srv
+}
+
+func (fb *specialistJobFakeBackend) postCount() int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return len(fb.posts)
+}
+
+func specialistJobBody(id, kind, state string, stale bool) string {
+	out := fmt.Sprintf(`{"job_id":%q,"kind":%q,"state":%q,"requester":{"seat":"operator","actor_kind":"user","subject":"captain:mcp"},
+		"subject":{"head_sha":"0123456789abcdef0123456789abcdef01234567"},"inputs":{"runs":[]},"requested_sequence":7,
+		"requested_at":"2026-10-12T10:00:00Z","last_seen_at":"2026-10-12T10:00:00Z","stale":%t`, id, kind, state, stale)
+	if state == "completed" {
+		out += `,"verdict":"pass","completed_sequence":9,"result":{"verdict":"pass","evidence":{"text":"# T"}}`
+	}
+	return out + "}"
+}
+
+// specialistJobSpawnRecorder records every spawn the request tool makes.
+type specialistJobSpawnRecorder struct {
+	binary string
+	argv   []string
+	env    []string
+	jobID  string
+	calls  int
+	err    error
+}
+
+func (s *specialistJobSpawnRecorder) spawn(binary string, argv, env []string, jobID string) (string, error) {
+	s.calls++
+	s.binary, s.argv, s.env, s.jobID = binary, argv, env, jobID
+	if s.err != nil {
+		return "", s.err
+	}
+	return "/tmp/fake-specialist-job.log", nil
+}
+
+// failRunnerResolution makes resolveRunnerBinary's sibling and PATH rungs
+// fail, so only an explicit runner_binary / FISHHAWK_RUNNER_BIN resolves.
+func failRunnerResolution(t *testing.T) {
+	t.Helper()
+	origLook, origExe := runStageLookPath, runStageExecutable
+	runStageLookPath = func(string) (string, error) { return "", errors.New("not on PATH") }
+	runStageExecutable = func() (string, error) { return "", errors.New("no executable") }
+	t.Cleanup(func() { runStageLookPath, runStageExecutable = origLook, origExe })
+}
+
+func overlapInputs() map[string]any {
+	return map[string]any{"runs": []any{
+		map[string]any{"run_id": uuid.NewString(), "head_sha": strings.Repeat("a", 40), "base_sha": strings.Repeat("b", 40)},
+		map[string]any{"run_id": uuid.NewString(), "head_sha": strings.Repeat("c", 40), "base_sha": strings.Repeat("b", 40)},
+	}}
+}
+
+// TestRequestSpecialistJob_SpawnsDetachedForRunnerKinds: a runner-executed
+// kind POSTs the request (schema_version stamped, NO requester member) and
+// spawns `fishhawk-runner specialist-job` with the job id, backend URL,
+// absolute working dir and this process's host label, FISHHAWK_API_TOKEN in
+// env, and a next_step naming fishhawk_get_specialist_job.
+func TestRequestSpecialistJob_SpawnsDetachedForRunnerKinds(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(jobID, "overlap_scan", "queued", false))
+	r := &runResolver{
+		api: newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test",
+			hostLabel: func() hostLabelResolution { return hostLabelResolution{Label: "box-1"} }}),
+		getenv: envFuncFromMap(nil),
+	}
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+	wd := t.TempDir()
+	subject := SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}
+
+	_, out, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: subject, Inputs: overlapInputs(), WorkingDir: wd, RunnerBinary: "/opt/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("requestSpecialistJob: %v", err)
+	}
+	if fb.postCount() != 1 {
+		t.Fatalf("POSTs = %d, want 1", fb.postCount())
+	}
+	post := fb.posts[0]
+	if post["schema_version"] != "specialist-job-v1" || post["kind"] != "overlap_scan" {
+		t.Errorf("POST body = %v, want schema_version specialist-job-v1 + kind overlap_scan", post)
+	}
+	if _, has := post["requester"]; has {
+		t.Errorf("POST body carries a requester member: %v (the server derives it)", post)
+	}
+	if rec.calls != 1 || rec.binary != "/opt/fishhawk-runner" || rec.jobID != jobID {
+		t.Fatalf("spawn = %d calls binary %q job %q, want 1 call of /opt/fishhawk-runner for %s", rec.calls, rec.binary, rec.jobID, jobID)
+	}
+	wantArgv := []string{"specialist-job", "--job-id", jobID, "--backend-url", srv.URL, "--working-dir", wd, "--host", "box-1"}
+	if !reflect.DeepEqual(rec.argv, wantArgv) {
+		t.Errorf("argv = %q, want %q", rec.argv, wantArgv)
+	}
+	var sawToken bool
+	for _, kv := range rec.env {
+		if kv == "FISHHAWK_API_TOKEN=tok-test" {
+			sawToken = true
+		}
+	}
+	if !sawToken {
+		t.Error("spawn env does not carry FISHHAWK_API_TOKEN=tok-test")
+	}
+	if !out.Spawned || out.LogPath != "/tmp/fake-specialist-job.log" || out.Job.JobID != jobID || out.Job.State != "queued" {
+		t.Errorf("out = %+v, want spawned queued job %s with the log path", out, jobID)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_specialist_job" ||
+		out.NextStep.Params["job_id"] != jobID || out.NextStep.Params["wait_seconds"] != "300" {
+		t.Errorf("next_step = %+v, want fishhawk_get_specialist_job{job_id, wait_seconds:300}", out.NextStep)
+	}
+}
+
+// TestRequestSpecialistJob_EmptyHostLabelIsUnknown: a host-less MCP process
+// passes --host unknown, the label the server substitutes for an empty host,
+// so the job lands in the same local-verify group as this host's stages.
+func TestRequestSpecialistJob_EmptyHostLabelIsUnknown(t *testing.T) {
+	_, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(uuid.NewString(), "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+	if _, _, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, Inputs: overlapInputs(),
+		WorkingDir: t.TempDir(), RunnerBinary: "/opt/fishhawk-runner",
+	}); err != nil {
+		t.Fatalf("requestSpecialistJob: %v", err)
+	}
+	if n := len(rec.argv); n < 2 || rec.argv[n-2] != "--host" || rec.argv[n-1] != "unknown" {
+		t.Errorf("argv = %q, want a trailing --host unknown", rec.argv)
+	}
+}
+
+// TestRequestSpecialistJob_DraftNeverSpawns: a draft answers completed and
+// spawns nothing — and it needs neither a working_dir nor a runner binary, so
+// the request succeeds on a host where no runner resolves.
+func TestRequestSpecialistJob_DraftNeverSpawns(t *testing.T) {
+	failRunnerResolution(t)
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(jobID, "draft", "completed", false))
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+
+	_, out, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "draft", Subject: SpecialistJobSubject{Repo: "x/y"},
+		Inputs: map[string]any{"document_kind": "adr", "title": "T"},
+	})
+	if err != nil {
+		t.Fatalf("draft request: %v (a draft must not need a runner binary)", err)
+	}
+	if fb.postCount() != 1 || rec.calls != 0 || out.Spawned {
+		t.Errorf("POSTs=%d spawns=%d spawned=%v, want 1 POST and no spawn", fb.postCount(), rec.calls, out.Spawned)
+	}
+	if out.Job.State != "completed" || out.NextStep != nil || len(out.Warnings) != 0 {
+		t.Errorf("out = %+v, want the completed job with no next_step and no warnings", out)
+	}
+}
+
+// TestRequestSpecialistJob_SpawnFalse: spawn=false creates the job queued,
+// spawns nothing, and names the command to run it.
+func TestRequestSpecialistJob_SpawnFalse(t *testing.T) {
+	failRunnerResolution(t)
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(jobID, "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+
+	_, out, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, Inputs: overlapInputs(),
+		Spawn: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("spawn=false request: %v", err)
+	}
+	if fb.postCount() != 1 || rec.calls != 0 || out.Spawned {
+		t.Errorf("POSTs=%d spawns=%d spawned=%v, want 1 POST and no spawn", fb.postCount(), rec.calls, out.Spawned)
+	}
+	if len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "fishhawk-runner specialist-job --job-id "+jobID) {
+		t.Errorf("warnings = %q, want the manual runner command for %s", out.Warnings, jobID)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_get_specialist_job" {
+		t.Errorf("next_step = %+v, want fishhawk_get_specialist_job", out.NextStep)
+	}
+}
+
+// TestRequestSpecialistJob_RefusalLeavesNoOrphanJob pins approval condition
+// C6: every pre-spawn refusal fires BEFORE the POST, so it creates no job row.
+// The spawn=false arm isolates the early confinePath (no later resolution
+// re-confines on that path).
+func TestRequestSpecialistJob_RefusalLeavesNoOrphanJob(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	cases := []struct {
+		name    string
+		r       func(srv *httptest.Server) *runResolver
+		in      RequestSpecialistJobInput
+		wantErr string
+	}{
+		{
+			name: "working_dir outside the allowed roots (spawn)",
+			r: func(srv *httptest.Server) *runResolver {
+				r := newResolver(srv, nil)
+				r.httpTransport, r.allowedRoots = true, []string{root}
+				return r
+			},
+			in:      RequestSpecialistJobInput{WorkingDir: outside, RunnerBinary: "/opt/fishhawk-runner"},
+			wantErr: pathOutsideAllowedRootsCode,
+		},
+		{
+			name: "working_dir outside the allowed roots (spawn=false)",
+			r: func(srv *httptest.Server) *runResolver {
+				r := newResolver(srv, nil)
+				r.httpTransport, r.allowedRoots = true, []string{root}
+				return r
+			},
+			in:      RequestSpecialistJobInput{WorkingDir: outside, Spawn: boolPtr(false)},
+			wantErr: pathOutsideAllowedRootsCode,
+		},
+		{
+			name: "working_dir omitted over HTTP",
+			r: func(srv *httptest.Server) *runResolver {
+				r := newResolver(srv, nil)
+				r.httpTransport, r.allowedRoots = true, []string{root}
+				return r
+			},
+			in:      RequestSpecialistJobInput{RunnerBinary: "/opt/fishhawk-runner"},
+			wantErr: "working_dir is required",
+		},
+		{
+			name:    "runner binary unresolvable",
+			r:       func(srv *httptest.Server) *runResolver { return newResolver(srv, nil) },
+			in:      RequestSpecialistJobInput{WorkingDir: root},
+			wantErr: "fishhawk-runner not on PATH",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			failRunnerResolution(t)
+			fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(uuid.NewString(), "overlap_scan", "queued", false))
+			r := tc.r(srv)
+			rec := &specialistJobSpawnRecorder{}
+			r.specialistJobSpawn = rec.spawn
+			in := tc.in
+			in.Kind, in.Subject, in.Inputs = "overlap_scan", SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, overlapInputs()
+
+			_, _, err := r.requestSpecialistJob(context.Background(), nil, in)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want one naming %q", err, tc.wantErr)
+			}
+			if fb.postCount() != 0 || rec.calls != 0 {
+				t.Errorf("POSTs=%d spawns=%d after a refusal, want 0 and 0 (no orphan job row)", fb.postCount(), rec.calls)
+			}
+		})
+	}
+}
+
+// TestRequestSpecialistJob_RejectsEmptyKind: no POST without a kind. spawn
+// is false so the kind check is the ONLY refusal in the path (no working_dir
+// or runner resolution runs).
+func TestRequestSpecialistJob_RejectsEmptyKind(t *testing.T) {
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(uuid.NewString(), "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+	if _, _, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{Kind: "  ", Spawn: boolPtr(false)}); err == nil ||
+		!strings.Contains(err.Error(), "kind is required") {
+		t.Fatalf("err = %v, want kind is required", err)
+	}
+	if fb.postCount() != 0 || rec.calls != 0 {
+		t.Errorf("POSTs = %d spawns = %d, want 0 and 0", fb.postCount(), rec.calls)
+	}
+}
+
+// TestRequestSpecialistJob_BackendRefusalSurfaced: a backend 400 reaches the
+// caller with its code, and nothing spawns.
+func TestRequestSpecialistJob_BackendRefusalSurfaced(t *testing.T) {
+	_, srv := newSpecialistJobFakeBackend(t, http.StatusBadRequest,
+		`{"error":{"code":"validation_failed","message":"specialist-job request is invalid","details":{"path":"/inputs/bogus"}}}`)
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+	_, _, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, Inputs: map[string]any{"bogus": 1},
+		WorkingDir: t.TempDir(), RunnerBinary: "/opt/fishhawk-runner",
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation_failed") {
+		t.Fatalf("err = %v, want validation_failed surfaced", err)
+	}
+	if rec.calls != 0 {
+		t.Errorf("spawns = %d after a refused POST, want 0", rec.calls)
+	}
+}
+
+// TestRequestSpecialistJob_SpawnFailureReportedNotReturned: once the POST
+// succeeded the job row exists, so a spawn failure is reported as a warning
+// carrying the handle and the command, not returned as an error that would
+// lose the job id.
+func TestRequestSpecialistJob_SpawnFailureReportedNotReturned(t *testing.T) {
+	jobID := uuid.NewString()
+	_, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(jobID, "inventory", "queued", false))
+	r := newResolver(srv, nil)
+	rec := &specialistJobSpawnRecorder{err: errors.New("exec format error")}
+	r.specialistJobSpawn = rec.spawn
+	_, out, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "inventory", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)},
+		Inputs: map[string]any{"command": "ls_files", "args": map[string]any{"max_entries": 10}}, WorkingDir: t.TempDir(), RunnerBinary: "/opt/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want the spawn failure reported in warnings", err)
+	}
+	if out.Spawned || out.Job.JobID != jobID || len(out.Warnings) != 1 ||
+		!strings.Contains(out.Warnings[0], "exec format error") || !strings.Contains(out.Warnings[0], "--job-id "+jobID) {
+		t.Errorf("out = %+v, want spawned=false and one warning naming the error and the command", out)
+	}
+	if out.NextStep == nil {
+		t.Error("next_step absent; the job is still live and waitable")
+	}
+}
+
+// TestSpawnSpecialistJobDetached runs the real detached spawn against a
+// stand-in command: the child's output lands in an owner-only log file, and a
+// start failure removes the log and returns an error.
+func TestSpawnSpecialistJobDetached(t *testing.T) {
+	origCmd := runStageCommand
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", `echo "argv:$*" "token:$FISHHAWK_API_TOKEN"`, "sh", strings.Join(args, " "))
+	}
+	jobID := uuid.NewString()
+	logPath, err := spawnSpecialistJobDetached("/ignored", []string{"specialist-job", "--job-id", jobID},
+		[]string{"FISHHAWK_API_TOKEN=tok-x", "PATH=" + os.Getenv("PATH")}, jobID)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(logPath) })
+	if !strings.Contains(filepath.Base(logPath), jobID) {
+		t.Errorf("log path %q does not name the job", logPath)
+	}
+	fi, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("log mode = %v, want 0600", fi.Mode().Perm())
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(logPath)
+		if got = string(b); strings.Contains(got, "token:tok-x") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(got, "argv:specialist-job --job-id "+jobID) || !strings.Contains(got, "token:tok-x") {
+		t.Errorf("log = %q, want the child's argv and env token", got)
+	}
+
+	runStageCommand = func(string, ...string) *exec.Cmd { return exec.Command(filepath.Join(t.TempDir(), "absent-binary")) }
+	failID := uuid.NewString()
+	if lp, err := spawnSpecialistJobDetached("/ignored", nil, nil, failID); err == nil || lp != "" {
+		t.Fatalf("spawn of a missing binary = (%q, %v), want an error and no log path", lp, err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "fishhawk-specialist-job-"+failID+"-*.log"))
+	if len(matches) != 0 {
+		t.Errorf("a failed start left logs behind: %v", matches)
+	}
+}
+
+// TestGetSpecialistJob_WaitsUntilCompleted: the tool re-reads until the job
+// completes and returns the typed result.
+func TestGetSpecialistJob_WaitsUntilCompleted(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}",
+		specialistJobBody(jobID, "overlap_scan", "queued", false),
+		specialistJobBody(jobID, "overlap_scan", "running", false),
+		specialistJobBody(jobID, "overlap_scan", "completed", false))
+	r := newResolver(srv, nil)
+	r.specialistJobPollInterval = time.Millisecond
+
+	_, out, err := r.getSpecialistJob(context.Background(), nil, GetSpecialistJobInput{JobID: jobID, WaitSeconds: 30})
+	if err != nil {
+		t.Fatalf("getSpecialistJob: %v", err)
+	}
+	if !out.Completed || out.TimedOut || out.Job.Verdict != "pass" || out.Job.Result["verdict"] != "pass" || out.NextStep != nil {
+		t.Errorf("out = %+v, want completed with verdict pass and no next_step", out)
+	}
+	if fb.getCalls != 3 || !fb.getAuthOK {
+		t.Errorf("GETs = %d (bearer ok %v), want 3 bearer-authenticated reads", fb.getCalls, fb.getAuthOK)
+	}
+}
+
+// TestGetSpecialistJob_WaitDeadline: a job that never completes returns at
+// the deadline with timed_out and a next_step to wait again.
+func TestGetSpecialistJob_WaitDeadline(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", specialistJobBody(jobID, "overlap_scan", "running", false))
+	r := newResolver(srv, nil)
+	r.specialistJobPollInterval = 50 * time.Millisecond
+
+	start := time.Now()
+	_, out, err := r.getSpecialistJob(context.Background(), nil, GetSpecialistJobInput{JobID: jobID, WaitSeconds: 1})
+	if err != nil {
+		t.Fatalf("getSpecialistJob: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Errorf("returned after %v, before the 1s wait elapsed", elapsed)
+	}
+	if out.Completed || !out.TimedOut || out.NextStep == nil || out.NextStep.Params["job_id"] != jobID {
+		t.Errorf("out = %+v, want timed_out with a next_step for %s", out, jobID)
+	}
+	if fb.getCalls < 2 {
+		t.Errorf("GETs = %d, want the job re-read while waiting", fb.getCalls)
+	}
+}
+
+// TestGetSpecialistJob_ZeroWaitReadsOnce: wait_seconds 0 is one read, not a
+// timeout, and still hands back the wait step for a live job.
+func TestGetSpecialistJob_ZeroWaitReadsOnce(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", specialistJobBody(jobID, "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	_, out, err := r.getSpecialistJob(context.Background(), nil, GetSpecialistJobInput{JobID: jobID})
+	if err != nil {
+		t.Fatalf("getSpecialistJob: %v", err)
+	}
+	if fb.getCalls != 1 || out.TimedOut || out.Completed || out.NextStep == nil {
+		t.Errorf("GETs=%d out=%+v, want one read, not timed out, with a next_step", fb.getCalls, out)
+	}
+}
+
+// TestGetSpecialistJob_StaleReturnsImmediately: a stale job (its runner is
+// gone) ends the wait at once instead of holding the full wait_seconds.
+func TestGetSpecialistJob_StaleReturnsImmediately(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", specialistJobBody(jobID, "overlap_scan", "running", true))
+	r := newResolver(srv, nil)
+	r.specialistJobPollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, out, err := r.getSpecialistJob(ctx, nil, GetSpecialistJobInput{JobID: jobID, WaitSeconds: 300})
+	if err != nil {
+		t.Fatalf("getSpecialistJob: %v (a stale job must end the wait)", err)
+	}
+	if !out.Stale || out.Completed || out.NextStep != nil || fb.getCalls != 1 {
+		t.Errorf("GETs=%d out=%+v, want one read returning stale with no next_step", fb.getCalls, out)
+	}
+}
+
+// TestGetSpecialistJob_InputRefusals: a bad job_id or an out-of-range wait is
+// refused before any read.
+func TestGetSpecialistJob_InputRefusals(t *testing.T) {
+	jobID := uuid.NewString()
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", specialistJobBody(jobID, "draft", "completed", false))
+	r := newResolver(srv, nil)
+	for _, in := range []GetSpecialistJobInput{
+		{JobID: "not-a-uuid"},
+		{JobID: jobID, WaitSeconds: 301},
+		{JobID: jobID, WaitSeconds: -1},
+	} {
+		if _, _, err := r.getSpecialistJob(context.Background(), nil, in); err == nil {
+			t.Errorf("input %+v accepted, want a refusal", in)
+		}
+	}
+	if fb.getCalls != 0 {
+		t.Errorf("GETs = %d, want 0 (refused before the read)", fb.getCalls)
+	}
+}
+
+// TestGetSpecialistJob_BackendErrorAndCancel: a backend 404 is surfaced, and
+// a cancelled context ends a wait.
+func TestGetSpecialistJob_BackendErrorAndCancel(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/specialist-jobs/{job_id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"specialist_job_not_found","message":"no specialist job with that id"}}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	r := newResolver(srv, nil)
+	if _, _, err := r.getSpecialistJob(context.Background(), nil, GetSpecialistJobInput{JobID: uuid.NewString()}); err == nil ||
+		!strings.Contains(err.Error(), "specialist_job_not_found") {
+		t.Fatalf("err = %v, want specialist_job_not_found", err)
+	}
+
+	jobID := uuid.NewString()
+	_, live := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", specialistJobBody(jobID, "overlap_scan", "running", false))
+	r = newResolver(live, nil)
+	r.specialistJobPollInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	if _, _, err := r.getSpecialistJob(ctx, nil, GetSpecialistJobInput{JobID: jobID, WaitSeconds: 300}); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestSpecialistJobTools_EndToEndThroughRealServer is the cross-boundary test:
+// both MCP tools, called through the SDK (so the output schema is validated —
+// the #371 reflection trap), against the REAL fishhawkd handlers over a
+// migrated pgtest schema. A draft completes in-process with the token's
+// subject as requester; a runner kind with spawn=false is created queued and
+// read back through fishhawk_get_specialist_job.
+func TestSpecialistJobTools_EndToEndThroughRealServer(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	const bearer = "fhk_specialist_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "captain:mcp", Scopes: []string{"write:stages", "read:runs"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		AuditRepo: audit.NewPostgresRepository(pool), APITokenRepo: tokRepo,
+		SpecialistJobs: specialistjob.NewStore(pool),
+	})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer}), getenv: envFuncFromMap(nil)}
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "fishhawk", Version: "test"}, nil)
+	registerRequestSpecialistJob(mcpSrv, r)
+	registerGetSpecialistJob(mcpSrv, r)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := mcpSrv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil).Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	call := func(name string, args map[string]any, out any) {
+		t.Helper()
+		res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if res.IsError {
+			t.Fatalf("%s returned an error result: %+v", name, res.Content)
+		}
+		raw, _ := json.Marshal(res.StructuredContent)
+		if err := json.Unmarshal(raw, out); err != nil {
+			t.Fatalf("%s structured content %s: %v", name, raw, err)
+		}
+	}
+
+	var draft RequestSpecialistJobOutput
+	call("fishhawk_request_specialist_job", map[string]any{
+		"kind": "draft", "subject": map[string]any{"repo": "kuhlman-labs/fishhawk"},
+		"inputs": map[string]any{"document_kind": "adr", "title": "Specialist jobs", "brief": "Why."},
+	}, &draft)
+	if draft.Job.State != "completed" || draft.Spawned || draft.Job.Requester.Subject != "captain:mcp" ||
+		draft.Job.Requester.Seat != "operator" || draft.Job.Verdict != "pass" {
+		t.Fatalf("draft = %+v, want completed, unspawned, requested by captain:mcp as operator", draft)
+	}
+	evidence, _ := draft.Job.Result["evidence"].(map[string]any)
+	if text, _ := evidence["text"].(string); !strings.Contains(text, "# Specialist jobs") || !strings.Contains(text, "Decision") {
+		t.Errorf("draft text = %q, want the title and the ADR sections", text)
+	}
+
+	var queued RequestSpecialistJobOutput
+	head := strings.Repeat("d", 40)
+	call("fishhawk_request_specialist_job", map[string]any{
+		"kind": "overlap_scan", "subject": map[string]any{"head_sha": head}, "inputs": overlapInputs(), "spawn": false,
+	}, &queued)
+	if queued.Job.State != "queued" || queued.Spawned || queued.Job.Subject.HeadSHA != head || queued.NextStep == nil {
+		t.Fatalf("queued = %+v, want a queued unspawned job with a next_step", queued)
+	}
+
+	var got GetSpecialistJobOutput
+	call("fishhawk_get_specialist_job", map[string]any{"job_id": queued.Job.JobID}, &got)
+	if got.Job.JobID != queued.Job.JobID || got.Job.State != "queued" || got.Completed || got.Stale ||
+		got.Job.Requester.Subject != "captain:mcp" || got.Job.RequestedSequence == 0 {
+		t.Errorf("get = %+v, want the queued job with its requester and requested_sequence", got)
+	}
+	if runs, _ := got.Job.Inputs["runs"].([]any); len(runs) != 2 {
+		t.Errorf("inputs = %v, want the two recorded runs", got.Job.Inputs)
+	}
+}
+
+// TestRequestSpecialistJob_OmittedInputsSendEmptyObject: an omitted inputs
+// member is sent as {} (the schema's object type), never JSON null, so the
+// server's per-kind schema arm — not a type error — decides the request.
+func TestRequestSpecialistJob_OmittedInputsSendEmptyObject(t *testing.T) {
+	fb, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(uuid.NewString(), "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	if _, _, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, Spawn: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("requestSpecialistJob: %v", err)
+	}
+	if fb.postCount() != 1 {
+		t.Fatalf("POSTs = %d, want 1", fb.postCount())
+	}
+	if in, ok := fb.posts[0]["inputs"].(map[string]any); !ok || len(in) != 0 {
+		t.Errorf("POST inputs = %#v, want an empty object", fb.posts[0]["inputs"])
+	}
+}
+
+// TestRebaseRunBranchTool_RerunFailedVerify pins the #4391 tool hop: the
+// handler forwards rerun_failed_verify to the backend, and with the flag set a
+// blank (or whitespace) reason is refused LOCALLY — the backend is never
+// called, so the refusal is not the backend's 400 echoed back.
+func TestRebaseRunBranchTool_RerunFailedVerify(t *testing.T) {
+	runID := uuid.New()
+	var calls atomic.Int32
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		got = map[string]any{}
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","merge_candidate_verify_rerun":true}`)
+	}))
+	t.Cleanup(srv.Close)
+	r := newResolver(srv, nil)
+
+	for _, reason := range []string{"", "   "} {
+		_, _, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+			RunID: runID.String(), Confirm: true, RerunFailedVerify: true, Reason: reason,
+		})
+		if err == nil || !strings.Contains(err.Error(), "reason is required with rerun_failed_verify") {
+			t.Fatalf("blank reason %q: err = %v, want the local reason refusal", reason, err)
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("backend calls after blank-reason refusals = %d, want 0 (refused before the HTTP hop)", n)
+	}
+
+	_, out, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+		RunID: runID.String(), Confirm: true, RerunFailedVerify: true, Reason: "gate host starved",
+	})
+	if err != nil {
+		t.Fatalf("rebaseRunBranch: %v", err)
+	}
+	if got["rerun_failed_verify"] != true || got["reason"] != "gate host starved" {
+		t.Errorf("forwarded body = %v, want rerun_failed_verify:true and the reason", got)
+	}
+	if !out.Result.MergeCandidateVerifyRerun {
+		t.Error("merge_candidate_verify_rerun not surfaced on the tool output")
+	}
+
+	// The flag off with a blank reason is today's call: forwarded, no refusal.
+	if _, _, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+		RunID: runID.String(), Confirm: true,
+	}); err != nil {
+		t.Fatalf("flag off, blank reason: %v, want forwarded", err)
+	}
+	if _, present := got["rerun_failed_verify"]; present {
+		t.Errorf("flag off still sent rerun_failed_verify: %v", got)
+	}
+}
+
+// TestRebaseRunBranchTool_DescribesVerifyRerun pins the #4391 paragraph on
+// the wire-visible description: the flag, its required reason, the void row
+// and the refusal beside a queued fix-up.
+func TestRebaseRunBranchTool_DescribesVerifyRerun(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	registerRebaseRunBranch(srv, &runResolver{})
+	st, ct := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	ss, err := srv.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Tools) != 1 {
+		t.Fatalf("tools = %d, want 1", len(res.Tools))
+	}
+	desc := res.Tools[0].Description
+	for _, want := range []string{"rerun_failed_verify", "REQUIRED", "not_executed", "operator_rerun", "fishhawk_dispatch_stage", "merge_candidate_verify_rerun"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("description must name %q:\n%s", want, desc)
 		}
 	}
 }

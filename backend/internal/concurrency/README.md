@@ -5,6 +5,8 @@ host-dispatch spawn marker asks `Admit` for a slot before it moves a
 host-dispatched stage to `dispatched`. Read surfaces call `StatusForStages`.
 An operator moves one queued waiter to the front with `Promote` (#4191).
 Table: `stage_concurrency_slots` (migration 0097; `order_key` added by 0102).
+It also READS `specialist_jobs` (0103) to count running specialist jobs as
+holders (§ "Specialist-job holders (ADR-097 D6)").
 The SQL is hand-written pgx, with no sqlc (same precedent as
 `captain/store.go`).
 
@@ -269,6 +271,43 @@ moves to the verify group's tail and leaves the implement queue
 serialises against implement-stage verifies on the per-repository verify lock
 (#3315); the group only stops a pass waiting for an agent slot.
 
+## Specialist-job holders (ADR-097 D6)
+
+A runner-executed specialist job (`backend/internal/specialistjob`, table
+`specialist_jobs`, migration 0103, #4300) is admitted through
+`local-verify:<host>`, never an implement slot. The coupling is store-only;
+the `Store` interface is unchanged:
+
+- `TryGroupLockTx(ctx, tx, acct, group)` try-locks the SAME
+  `lockKey(account, group)` `Admit` takes, so a job admission and a stage
+  admission of one group contend on one advisory lock. It never waits.
+- `GroupOccupancyTx(ctx, tx, acct, group)` returns `Occupancy{StageHolders,
+  FreshStageWaiters, JobHolders}`, read under that lock. `specialistjob.AdmitJob`
+  admits a job only when `StageHolders + JobHolders < DefaultVerifyLimit`,
+  `FreshStageWaiters == 0` (a job yields to merge-candidate passes) and no
+  fresh queued job of the group and account is older.
+- `admitTx` counts `jobHoldersSQL` in its decision:
+  `len(holders) + jobHolders + roundAhead < Limit`. A job holder is a
+  `specialist_jobs` row with `state = 'running'`, the group's
+  `admission_group`, the stage's account (`IS NOT DISTINCT FROM`) and
+  `last_seen_at > clock_timestamp() - JobHeartbeatTTL`. A merge-candidate
+  verify pass therefore never runs beside a live job
+  (`TestAdmit_VerifyGroupCountsRunningSpecialistJob`). A running job
+  heartbeats by re-POSTing admission every 15s, so a crashed job stops
+  counting within `JobHeartbeatTTL` (`TestAdmit_StaleSpecialistJobReleases`);
+  a job never occupies `local-implement:<host>`
+  (`TestAdmit_ImplementGroupIgnoresJobs`).
+- `Admission.Holders` and `Status.Holders` stay STAGE-only. Job holders are
+  not listed anywhere in this package's verdicts.
+
+**Rollback order (approval condition C9).** Every `local-verify` admission
+runs `jobHoldersSQL`, so the table must outlive the binary that reads it:
+revert the fishhawkd binary FIRST, then migrate 0103 down. Migrating down
+under a binary that carries this section makes every `local-verify`
+admission fail (`relation "specialist_jobs" does not exist`) until the
+binary is reverted. `local-implement` and spec groups also run the count
+and fail the same way.
+
 ## Admission nonce
 
 A slot waiter sends a random nonce (one per waiter) on every marker POST;
@@ -322,6 +361,7 @@ effective key (§ "Ordering and `order_key`") sorts before the caller's.
 | `UnknownHost` | `unknown` | The host label used when the client sends none (a pre-change MCP, or an MCP whose `hostlabel.go` ladder resolved nothing). |
 | `DefaultLimit` / `MaxLimit` | 1 / 64 | One local implement per host by default. 64 matches the 0097 CHECK and the spec bound. |
 | `VerifyGroupPrefix` / `DefaultVerifyLimit` | `local-verify:` / 1 | ADR-092 D3 (#4200): a merge-candidate verify-only pass is admitted through `local-verify:<host>`, separate from `local-implement:<host>`. One pass per host at a time, because each pass runs the full verify gate. |
+| `JobHeartbeatTTL` | 2m | A running specialist job counts as a `local-verify` holder only while its runner re-POSTs admission (every 15s) within this window, so a crashed job blocks verify passes for at most about two minutes, not its whole runtime. |
 | `QueueTTL` | 60s | 12× the waiter poll interval, so a live waiter never goes stale. A dead waiter stops blocking the queue within a minute. |
 | `WaiterPollInterval` | 5s | The cadence of the MCP slot waiter. Also the marker's `Retry-After`. |
 | `RunningStaleAfter` | 45m | Runner heartbeats arrive about every 15s, but only during agent invocations, not during the verify gate. 45 minutes outlasts a verify gate. |
@@ -391,6 +431,12 @@ under-count holders.
 ## Residuals
 
 - The host key is a client-supplied label, not a security boundary.
+- The per-stage concurrency block and `StatusForStages` do not list specialist
+  job holders (ADR-094 D7, #4243): a verify pass queued behind a running job
+  shows no holder.
+- A job runner that stalls past `JobHeartbeatTTL` and then heartbeats again
+  under its own nonce refreshes its row without re-deciding, so it can
+  briefly run beside a verify pass admitted while it was stale.
 - Stages already dispatched before deploy hold no row and are not counted.
 - A bypass dispatch is not counted, by design. One example is the prompt-fetch
   liveness flip on a direct `bin/fishhawk-runner` run.

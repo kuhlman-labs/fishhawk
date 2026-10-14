@@ -7655,3 +7655,85 @@ VALUES ($1, $2, 'local-implement:h1', 1, 'queued') RETURNING order_key`, stageID
 		t.Errorf("order_key columns after re-applying 0102 = %d, want 1", n)
 	}
 }
+
+// TestMigrateDown_SpecialistJobsReversal pins 0103 (ADR-097 D2/D6 / #4300):
+// after MigrateUp specialist_jobs exists with its admission index and NO RLS
+// (explicit account scoping in the store, like 0097/0101); it accepts a
+// queued row and refuses an unknown kind/state/seat/verdict, an empty
+// requester, a completed row without its completion and a running row
+// without started_at or a nonce; after rolling back 0103 the table is gone,
+// the schema lands on 0102 and a runs row survives.
+func TestMigrateDown_SpecialistJobsReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var idx, rowSec int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM pg_indexes WHERE tablename = 'specialist_jobs' AND indexname = 'specialist_jobs_admission_idx'),
+  (SELECT count(*) FROM pg_class WHERE relname = 'specialist_jobs' AND relrowsecurity)`).Scan(&idx, &rowSec); err != nil {
+		t.Fatalf("read 0103 schema: %v", err)
+	}
+	if idx != 1 || rowSec != 0 {
+		t.Errorf("admission index=%d relrowsecurity=%d, want 1/0 (0103: explicit account scoping, no RLS)", idx, rowSec)
+	}
+
+	const cols = `(kind, state, requester_seat, requester_actor_kind, requester_subject, inputs, requested_sequence`
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+`) VALUES ('inventory', 'queued', 'operator', 'user', 's', '{}', 1)`); err != nil {
+		t.Fatalf("insert queued row after MigrateUp: %v — 0103 must make it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+`, started_at, execution_nonce)
+VALUES ('fanin_build', 'running', 'first_officer', 'agent', 's', '{}', 2, now(), 'n')`); err != nil {
+		t.Fatalf("insert running row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+`, verdict, result, completed_at)
+VALUES ('draft', 'completed', 'operator', 'user', 's', '{}', 3, 'pass', '{}', now())`); err != nil {
+		t.Fatalf("insert completed row: %v", err)
+	}
+	for name, sql := range map[string]string{
+		"unknown kind":        `INSERT INTO specialist_jobs ` + cols + `) VALUES ('shell', 'queued', 'operator', 'user', 's', '{}', 1)`,
+		"unknown state":       `INSERT INTO specialist_jobs ` + cols + `) VALUES ('inventory', 'waiting', 'operator', 'user', 's', '{}', 1)`,
+		"unknown seat":        `INSERT INTO specialist_jobs ` + cols + `) VALUES ('inventory', 'queued', 'captain', 'user', 's', '{}', 1)`,
+		"empty actor kind":    `INSERT INTO specialist_jobs ` + cols + `) VALUES ('inventory', 'queued', 'operator', '', 's', '{}', 1)`,
+		"empty subject":       `INSERT INTO specialist_jobs ` + cols + `) VALUES ('inventory', 'queued', 'operator', 'user', '', '{}', 1)`,
+		"unknown verdict":     `INSERT INTO specialist_jobs ` + cols + `, verdict, result, completed_at) VALUES ('draft', 'completed', 'operator', 'user', 's', '{}', 1, 'maybe', '{}', now())`,
+		"completed no result": `INSERT INTO specialist_jobs ` + cols + `, verdict, completed_at) VALUES ('draft', 'completed', 'operator', 'user', 's', '{}', 1, 'pass', now())`,
+		"queued with verdict": `INSERT INTO specialist_jobs ` + cols + `, verdict, result, completed_at) VALUES ('draft', 'queued', 'operator', 'user', 's', '{}', 1, 'pass', '{}', now())`,
+		"running no nonce":    `INSERT INTO specialist_jobs ` + cols + `, started_at) VALUES ('inventory', 'running', 'operator', 'user', 's', '{}', 1, now())`,
+		"running no start":    `INSERT INTO specialist_jobs ` + cols + `, execution_nonce) VALUES ('inventory', 'running', 'operator', 'user', 's', '{}', 1, 'n')`,
+		"no inputs":           `INSERT INTO specialist_jobs (kind, state, requester_seat, requester_actor_kind, requester_subject, requested_sequence) VALUES ('inventory', 'queued', 'operator', 'user', 's', 1)`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err == nil {
+			t.Errorf("%s accepted, want a constraint violation", name)
+		}
+	}
+
+	var survivor uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&survivor); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	downThrough(t, url, "0103")
+
+	var tables, survivors int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM information_schema.tables WHERE table_name = 'specialist_jobs'),
+  (SELECT count(*) FROM runs WHERE id = $1)`, survivor).Scan(&tables, &survivors); err != nil {
+		t.Fatalf("read back after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("specialist_jobs tables after rolling back 0103 = %d, want 0", tables)
+	}
+	if survivors != 1 {
+		t.Errorf("runs row after rolling back 0103 = %d, want 1 (untouched)", survivors)
+	}
+}

@@ -91,6 +91,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	slapkg "github.com/kuhlman-labs/fishhawk/backend/internal/sla"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -2581,6 +2582,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// marker's slot store. Dropping this line reverts the marker to a bare
 		// CAS (no queue) without touching any other surface.
 		cfg.Concurrency = concurrency.NewPostgresStore(pool)
+		// ADR-097 D2/D6 specialist jobs (#4300): the /v0/specialist-jobs
+		// store. Dropping this line answers those routes 503 and changes no
+		// other surface.
+		cfg.SpecialistJobs = specialistjob.NewStore(pool)
 		// ADR-092 held-pass queue (#4200): serializes merge-candidate verify
 		// passes per base. Dropping this line reverts to ADR-090's
 		// start-immediately behaviour without touching any other surface.

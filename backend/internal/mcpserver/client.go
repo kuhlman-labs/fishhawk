@@ -3253,9 +3253,13 @@ func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason 
 // (`backend/internal/server/rebase_branch.go::rebaseBranchRequest`).
 // Confirm MUST be true — the advance moves the PR head (leaving a merge
 // commit), so the backend refuses a missing/false confirm with 400.
+//
+// RerunFailedVerify (#4391) asks for a verify-only re-run of a FAILED
+// merge-candidate head; the backend requires a non-blank Reason with it.
 type rebaseBranchRequest struct {
-	Reason  string `json:"reason,omitempty"`
-	Confirm bool   `json:"confirm"`
+	Reason            string `json:"reason,omitempty"`
+	Confirm           bool   `json:"confirm"`
+	RerunFailedVerify bool   `json:"rerun_failed_verify,omitempty"`
 }
 
 // RebaseBranchResult mirrors the backend's rebase-branch 200 body: the
@@ -3367,6 +3371,10 @@ type RebaseBranchResult struct {
 	MergeCandidateVerifyNote string `json:"merge_candidate_verify_note,omitempty"`
 	// MergeCandidateVerifyRefusal names why no pass could be started.
 	MergeCandidateVerifyRefusal string `json:"merge_candidate_verify_refusal,omitempty"`
+	// MergeCandidateVerifyRerun is true ONLY when THIS call voided a failed
+	// merge-candidate verdict for a rerun_failed_verify request (#4391); the
+	// fields above report the pass that follows (in_flight, or held).
+	MergeCandidateVerifyRerun bool `json:"merge_candidate_verify_rerun,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the
@@ -3392,8 +3400,12 @@ type RebaseBranchResult struct {
 //   - 502 rebase_merge_failed (the merge itself failed for a non-conflict
 //     reason; nothing was written)
 //   - 503 rebase_unconfigured
-func (c *apiClient) RebaseRunBranch(ctx context.Context, runID uuid.UUID, reason string) (*RebaseBranchResult, error) {
-	body, err := json.Marshal(rebaseBranchRequest{Reason: reason, Confirm: true})
+//
+// rerunFailedVerify (#4391) sends rerun_failed_verify:true: on the
+// already-up-to-date arm a FAILED head's verdict is voided and a fresh
+// verify-only pass started; a blank reason with it is a 400 validation_failed.
+func (c *apiClient) RebaseRunBranch(ctx context.Context, runID uuid.UUID, reason string, rerunFailedVerify bool) (*RebaseBranchResult, error) {
+	body, err := json.Marshal(rebaseBranchRequest{Reason: reason, Confirm: true, RerunFailedVerify: rerunFailedVerify})
 	if err != nil {
 		return nil, fmt.Errorf("marshal rebase-branch: %w", err)
 	}
@@ -6650,6 +6662,98 @@ func (c *apiClient) BulkWaiveConcerns(ctx context.Context, runID uuid.UUID, conc
 	}
 	var out BulkWaiveResult
 	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/concerns/waive", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SpecialistJobSubject mirrors specialist-job-v1 $defs.subject (E85.9 /
+// #4300): what a job is about. At least one member; head_sha is required for
+// every runner-executed kind.
+type SpecialistJobSubject struct {
+	RunID      string `json:"run_id,omitempty" jsonschema:"the run the job is about; when set, both audit rows land on that run's chain"`
+	CampaignID string `json:"campaign_id,omitempty" jsonschema:"the campaign the job is about"`
+	HeadSHA    string `json:"head_sha,omitempty" jsonschema:"the 40-hex commit the job executes against; required for every kind except draft"`
+	Repo       string `json:"repo,omitempty" jsonschema:"owner/name of the repository the subject belongs to"`
+}
+
+// SpecialistJobRequester mirrors specialistjob.Requester: the seat and
+// identity the server DERIVED from the authenticated caller. It is never
+// read from a request body.
+type SpecialistJobRequester struct {
+	Seat      string `json:"seat" jsonschema:"operator or first_officer"`
+	ActorKind string `json:"actor_kind" jsonschema:"the requesting identity's actor kind (user, or agent for a delegated operator-agent token)"`
+	Subject   string `json:"subject" jsonschema:"the requesting identity's token subject"`
+}
+
+// SpecialistJob mirrors the backend's specialistJobResponse
+// (backend/internal/server/specialist_job.go): the job read shape of every
+// /v0/specialist-jobs route. Every json tag MUST byte-match or the field
+// decodes to its zero value silently. The backend never returns the
+// execution nonce, so neither does this mirror.
+type SpecialistJob struct {
+	JobID             string                 `json:"job_id" jsonschema:"the specialist job UUID"`
+	Kind              string                 `json:"kind" jsonschema:"counterfactual_battery, fanin_build, overlap_scan, plan_crosscheck, inventory or draft"`
+	State             string                 `json:"state" jsonschema:"queued, running or completed"`
+	Requester         SpecialistJobRequester `json:"requester" jsonschema:"the server-derived requester"`
+	Subject           SpecialistJobSubject   `json:"subject"`
+	Inputs            map[string]any         `json:"inputs,omitempty" jsonschema:"the per-kind inputs, as recorded"`
+	AdmissionGroup    string                 `json:"admission_group,omitempty" jsonschema:"the local-verify:<host> concurrency group the runner was admitted through"`
+	Host              string                 `json:"host,omitempty" jsonschema:"the admitting host label"`
+	Verdict           string                 `json:"verdict,omitempty" jsonschema:"pass, fail or inconclusive; present once completed"`
+	Result            map[string]any         `json:"result,omitempty" jsonschema:"the server-composed typed result (specialist-job-v1 $defs.result); present once completed"`
+	RequestedSequence int64                  `json:"requested_sequence" jsonschema:"audit sequence of the specialist_job_requested entry"`
+	CompletedSequence *int64                 `json:"completed_sequence,omitempty" jsonschema:"audit sequence of the specialist_job_completed entry"`
+	RequestedAt       string                 `json:"requested_at"`
+	LastSeenAt        string                 `json:"last_seen_at" jsonschema:"the last admission poll or heartbeat"`
+	StartedAt         string                 `json:"started_at,omitempty"`
+	CompletedAt       string                 `json:"completed_at,omitempty"`
+	Stale             bool                   `json:"stale" jsonschema:"true when a queued job's runner stopped polling admission, or a running job's runner stopped heartbeating — the runner is likely gone"`
+}
+
+// specialistJobRequestBody is the POST /v0/specialist-jobs body
+// (specialist-job-v1 $defs.request). It carries NO requester: the server
+// derives it from the bearer, and the closed schema refuses one.
+type specialistJobRequestBody struct {
+	SchemaVersion string               `json:"schema_version"`
+	Kind          string               `json:"kind"`
+	Subject       SpecialistJobSubject `json:"subject"`
+	Inputs        map[string]any       `json:"inputs"`
+}
+
+// specialistJobSchemaVersion is the request contract the MCP tool speaks.
+const specialistJobSchemaVersion = "specialist-job-v1"
+
+// RequestSpecialistJob creates a specialist job via `POST /v0/specialist-jobs`
+// (E85.9 / #4300). A draft answers 201 already completed; every other kind
+// answers 201 queued, awaiting a runner. 4xx/5xx surfaces:
+//   - 400 validation_failed (schema location or a named semantic rule)
+//   - 403 insufficient_scope (write:stages) / specialist_job_requester_not_a_seat
+//   - 404 run_not_found / campaign_not_found (subject not in your account)
+//   - 413 request_too_large (64 KiB cap)
+//   - 503 specialist_jobs_unconfigured
+func (c *apiClient) RequestSpecialistJob(ctx context.Context, kind string, subject SpecialistJobSubject, inputs map[string]any) (*SpecialistJob, error) {
+	if inputs == nil {
+		inputs = map[string]any{}
+	}
+	body, err := json.Marshal(specialistJobRequestBody{
+		SchemaVersion: specialistJobSchemaVersion, Kind: kind, Subject: subject, Inputs: inputs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal specialist job request: %w", err)
+	}
+	var out SpecialistJob
+	if err := c.do(ctx, http.MethodPost, "/v0/specialist-jobs", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetSpecialistJob reads one job via `GET /v0/specialist-jobs/{job_id}`
+// (read:runs; a job in another account is 404 specialist_job_not_found).
+func (c *apiClient) GetSpecialistJob(ctx context.Context, jobID uuid.UUID) (*SpecialistJob, error) {
+	var out SpecialistJob
+	if err := c.do(ctx, http.MethodGet, "/v0/specialist-jobs/"+jobID.String(), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

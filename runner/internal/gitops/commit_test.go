@@ -6508,26 +6508,22 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name string
-		env  []string
-		// inherited seeds the PARENT environment (os.Environ) with these
-		// entries via t.Setenv before the capture (#4393/#4394).
-		inherited []string
+		name    string
+		env     []string
+		inherit bool
 	}{
-		{"nil caller env", nil, nil},
-		{"non-empty caller env", callerEnv, nil},
-		// The runner's gate env can already carry the GIT_CONFIG_* triple a
-		// caller passes, so os.Environ() holds an identical entry BEFORE the
-		// pins. A first-occurrence lookup finds that inherited copy and
-		// false-REDs; the ordering check reads the LAST occurrence, which is
-		// the one git honours (#4393/#4394). t.Setenv makes this test and its
-		// subtests non-parallel by construction.
-		{"caller env also inherited", callerEnv, callerEnv},
+		{"nil caller env", nil, false},
+		{"non-empty caller env", callerEnv, false},
+		// The gate container's safe.directory pin (#4393) puts
+		// GIT_CONFIG_COUNT=1 in os.Environ(), duplicating a caller entry
+		// verbatim (#4394). Not parallel: it uses t.Setenv.
+		{"non-empty caller env, inherited duplicate", callerEnv, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, kv := range tc.inherited {
-				k, v, _ := strings.Cut(kv, "=")
-				t.Setenv(k, v)
+			if tc.inherit {
+				t.Setenv("GIT_CONFIG_COUNT", "1")
+				t.Setenv("GIT_CONFIG_KEY_0", "safe.directory")
+				t.Setenv("GIT_CONFIG_VALUE_0", "/work")
 			}
 			cmd := capture(func(p *Pusher) {
 				_, _ = p.runOutEnv(context.Background(), dir, tc.env, "version")
@@ -6543,9 +6539,16 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 			// The caller's entries must come AFTER the pins so a caller (or
 			// authedRemoteOp) keeps the last word, and the pins must come
 			// after os.Environ() so an inherited GIT_TERMINAL_PROMPT=1 loses.
-			// Positions are the LAST occurrence: exec resolves a duplicated key
-			// to its last entry, and an inherited copy of a caller entry sits
-			// in os.Environ() ahead of the pins (#4393/#4394).
+			// Positions are LAST occurrences: an inherited duplicate of an
+			// entry sits earlier, in the os.Environ() prefix (#4393/#4394).
+			lastIndex := func(s []string, v string) int {
+				for i := len(s) - 1; i >= 0; i-- {
+					if s[i] == v {
+						return i
+					}
+				}
+				return -1
+			}
 			lastPin := -1
 			for _, pin := range NonInteractiveEnv() {
 				if i := lastIndex(cmd.Env, pin); i > lastPin {
@@ -6570,16 +6573,6 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 			}
 		}
 	})
-}
-
-// lastIndex returns the index of the LAST element of s equal to v, or -1.
-func lastIndex(s []string, v string) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == v {
-			return i
-		}
-	}
-	return -1
 }
 
 // TestRunOutEnv_NoCredential_FailsFastNotPrompt is the DONE-MEANS test for the
