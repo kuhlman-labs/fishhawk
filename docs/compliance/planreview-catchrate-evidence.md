@@ -123,7 +123,49 @@ through a routed fix-up before merge rather than cutting it (the corpus
 checks require every kind). Cost: 6 cases x 10 samples = 60 persona-prompt
 calls (each prompt ~60 KB: index, remit and plan-review prompt). At 10 samples
 a case's rate has a wide sampling interval; a case at a bound is a candidate
-for rework, not a verdict.
+for rework, not a verdict. The default is now 30 samples per case (10 proved
+too noisy, #4314).
+
+**The security arms (E80.17 / #4314).** Calibrate every security catch case
+at 30 samples to the 30–80% band BEFORE #4314's recording; any out-of-band
+case is reworked through a routed fix-up first (the merge is held for both):
+
+```sh
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
+  scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security_portability FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
+  scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+```
+
+Cost: 10 cases x 30 = 300 implement-review persona calls for `security`, 4 x
+30 = 120 for `security_portability`. Read three things in the table beyond the
+band:
+
+- **The false-alarm rate counts EVERY concern on a clean diff.** A security
+  clean case has no category predicate (the remit reserves no concern
+  category), so the standard-criteria concerns the persona also raises
+  (correctness, verification, scope) count as false alarms beside the
+  security ones. Read the rate beside the "False alarms by category" block,
+  never alone. The recording commits the same split per clean case as
+  `false_alarm_partition` (`security_lens` / `other_category` trials) in the
+  evidence and a per-trial `alarm_partition` tag in the sidecar, so a later
+  decision to reserve a security category in the remit is made from
+  committed data.
+- **Absent-control concerns.** The sidecar marks each concern asserting a
+  control is absent (`absent_control`, from `markers.json`); the recording
+  report counts them per case. A generic one (no repository marker) is
+  surfaced, not refused.
+- **Portability findings.** A `security_portability` concern naming a
+  repository-specific marker (`markers.json` `repo_specific_markers`: this
+  repository's own controls, every one documented in
+  `docs/review/security-conventions.md` and absent from the remit and from
+  every clean case) is about a control the remit-only reviewer was never
+  shown. The dry run FAILS on one and the recording REFUSES it
+  (`ErrPortabilityRepoSpecificFinding`; both files untouched, dry run
+  included). Read the concern in the report: rework the remit (if it leaked a
+  repository assumption) or the case; never delete the marker to pass.
 
 ## Step 2 — run the arms
 
@@ -213,7 +255,23 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 #4314 records separately, after #4313 has merged. Its security arms change
 the arm table, so an ordinary recording over the #4313 baseline is refused as
 not comparable: #4314's recording is a re-pin of its own, with its own
-`PIN_REASON`.
+`PIN_REASON`, made on the #4314 branch after its calibration (Step 1b) and
+before it merges (the merge is HELD for it; until it lands `catchrategate`
+and `scripts/check-review-prompt-eval` fail on that branch naming the
+missing `security` and `security_portability` arms, by design):
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4314: security and security_portability join the arm table; the #4313 baseline is not comparable' \
+  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+A recording in which any `security_portability` concern names a
+repository-specific marker is refused (Step 1b, "Portability findings"). The
+security arms' judged false-alarm rate counts every concern on a clean diff,
+standard-criteria concerns included: read it beside the report's "Persona
+diagnostics" partition and the committed `false_alarm_partition`.
 
 Commit the v2 pair (Step 3); `catchrategate` then decodes it, and the stale
 message on any later change names the arm whose fingerprint moved. An ADR
@@ -224,8 +282,10 @@ Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
 calls — 2 x 144 with the twelve committed cases (12 samples per case) — and
 the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
 of its catch and clean classes clears the 136 floor with 138), about 564
-calls for the #4313 recording (#4314's security arms bill to its own
-recording), against
+calls for the #4313 recording; #4314's recording adds the security arm, 10 x
+34 = 340 implement-review persona calls (34 samples per case, so its six catch
+and four clean cases each clear the floor), and the portability arm, 4 x 34 =
+136, against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
@@ -390,6 +450,10 @@ alarm (clean cases).
 | Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10-14 | `claude-sonnet-5-5` | 133/144 (0.924) | 130/144 (0.903) | 106/138 (0.768) | 32/138 (0.232) | — | pinned (#4313: arm-keyed v2, catch rule v5; v1 not comparable) | PASS (delta +0.021) |
+
+The #4314 re-pin recording adds a row whose "Other arms" column names
+`security` catch and false alarm (with its security_lens / other_category
+split) and `security_portability` false alarm; pending the operator.
 
 ### Calibration dry runs
 
