@@ -23,7 +23,7 @@ import (
 // and docs/adr/** read from the checkout (personaTestRepoRoot). Their
 // assertions are invariants — envelopes, byte identity, premises, a
 // min_matched_records floor — so a routine ADR landing does not redden verify,
-// while a genuine premise break (ADR-033 losing superseded_by, ADR-094's index
+// while a genuine premise break (ADR-091 losing superseded_by, ADR-006's index
 // entry truncated away) does. Selection stats are logged, never pinned.
 const committedPersonaCorpus = "testdata/planreview-persona-corpus/architect"
 

@@ -396,3 +396,4 @@ alarm (clean cases).
 | Run at | Arm | Samples per case | Out-of-band catch cases | Table |
 |---|---|---|---|---|
 | 2026-10-13 | `architect` | 10 | adr033 + adr094 above band (10/10); reworked, re-calibration pending operator | routed fix-up concern (head `84ce5e13`) |
+| 2026-10-14 | `architect` | 10 | adr033 + adr094 10/10 after rewording; replaced by adr006-production-migrate-down and adr091-merge-without-review-coverage (body-only conflicts), re-calibration pending operator | routed fix-up concern (head `f7549511`) |

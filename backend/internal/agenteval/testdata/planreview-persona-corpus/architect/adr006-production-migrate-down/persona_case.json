@@ -1,0 +1,147 @@
+{
+  "persona": "architect",
+  "kind": "accepted_conflict",
+  "expect": "catch",
+  "issue_title": "Let operators tag runs with free-form labels",
+  "issue_body": "Operators group runs by campaign and incident by hand. Add a labels column to runs, accept labels on start, return them on every run read, and make sure a bad release of this change can be backed out quickly.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94003",
+      "id": "kuhlman-labs/fishhawk#94003"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Add a labels column to runs through a new migration, thread it through the run queries and response, and back a failed release out automatically.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/db/migrations/0104_add_run_labels.up.sql",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/db/migrations/0104_add_run_labels.down.sql",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/run/queries.sql",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/runs.go",
+          "operation": "modify"
+        },
+        {
+          "path": "deploy/scripts/release-deploy.sh",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0104_add_run_labels: the up file adds a nullable text[] labels column to runs, and the down file drops it."
+      },
+      {
+        "step": 2,
+        "description": "Thread labels through the run queries and the run response, and accept them on run start."
+      },
+      {
+        "step": 3,
+        "description": "If the post-deploy health check fails, the deploy job runs the migrate CLI's down step for this release's migrations against the production database, then redeploys the previous image."
+      },
+      {
+        "step": 4,
+        "description": "Add tests: the migration applies and drops cleanly on the test database, and the run response carries labels."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Migration tests on the shared test Postgres plus handler tests for labels on start and read; a script test that a failing health check triggers the back-out path.",
+      "rollback_plan": "Automatic in the deploy job (step 3).",
+      "acceptance_criteria": [
+        {
+          "id": "ac-labels-returned",
+          "statement": "A run started with labels returns the same labels on every run read.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94003"
+        },
+        {
+          "id": "ac-release-backed-out",
+          "statement": "A release whose post-deploy check fails is backed out without operator action.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94003"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-006",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "down step for this release's migrations",
+    "redeploys the previous image"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 3
+  },
+  "catch_probes": [
+    "adr-006",
+    "forward-only",
+    "revert migration",
+    "roll forward"
+  ],
+  "attribution_phrases": [
+    "down step",
+    "production database"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 3 runs the migrate CLI's down step against the production database. ADR-006 (applies to backend/internal/db/migrations/**) makes production rollback forward-only: down files are for local dev, and a bad schema change is undone by a revert migration. Replace the back-out with a revert migration."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Running down migrations against the production database conflicts with ADR-006; production schema changes roll forward."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 3: production rollback under ADR-006 is forward-only, not a down migration."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 3: the back-out trigger is unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 3 redeploys the previous image from the deploy job; ADR-073 makes the Helm chart the single deployment substrate, so confirm the job goes through the chart."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-labels-returned does not cap how many labels a run may carry."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The down step in step 3 has no test of its own in scope."
+    }
+  ]
+}

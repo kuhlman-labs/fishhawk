@@ -75,8 +75,8 @@ func TestCalibrationBandFor_InclusiveBounds(t *testing.T) {
 // cases across two runs, and a clean case's false-alarm rate with band n/a.
 func TestCalibrate_BandVerdicts(t *testing.T) {
 	const (
-		admission  = "adr094-second-admission-path"
-		superseded = "adr033-superseded-mcp-transport"
+		admission  = "adr006-production-migrate-down"
+		superseded = "adr091-merge-without-review-coverage"
 		undeclared = "undeclared-cross-component-direction"
 		cleanSQLC  = "clean-sqlc-query-cli"
 	)

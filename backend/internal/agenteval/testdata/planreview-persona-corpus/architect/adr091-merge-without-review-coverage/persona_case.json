@@ -1,0 +1,137 @@
+{
+  "persona": "architect",
+  "kind": "superseded_reliance",
+  "expect": "catch",
+  "issue_title": "A reviewer outage leaves decomposed parents unmergeable",
+  "issue_body": "When the consolidated implement review of a decomposed parent fails on infrastructure (a reviewer OOM-killed, a provider out of quota), the parent never becomes mergeable and the operator re-drives it by hand. Make the merge endpoint stop waiting on a reviewer outage.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94004",
+      "id": "kuhlman-labs/fishhawk#94004"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Stop a failed consolidated review round from blocking a decomposed parent's merge.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/server/merge.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/merge_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/consolidated.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Expose the consolidated round's settled time from run/consolidated.go beside its outcome."
+      },
+      {
+        "step": 2,
+        "description": "In the merge endpoint, treat a decomposed parent as merge-eligible once its consolidated review round has settled, whatever the round's outcome, so a reviewer outage cannot block the fan-in."
+      },
+      {
+        "step": 3,
+        "description": "Add merge endpoint tests for a parent whose round passed, failed and is still running."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Merge endpoint tests over a fake run store for each round state.",
+      "rollback_plan": "Revert the PR.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-failed-round-mergeable",
+          "statement": "A decomposed parent whose consolidated round failed on infrastructure is accepted by the merge endpoint.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94004"
+        },
+        {
+          "id": "ac-running-round-refused",
+          "statement": "A decomposed parent whose consolidated round is still running is refused with a named error.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94004"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 35,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-091",
+      "status": "accepted",
+      "superseded_by": [
+        "ADR-095"
+      ]
+    },
+    {
+      "id": "ADR-095",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "whatever the round's outcome",
+    "a reviewer outage cannot block the fan-in"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 2
+  },
+  "catch_probes": [
+    "adr-095",
+    "review-coverage",
+    "review coverage",
+    "covered by a successful review"
+  ],
+  "attribution_phrases": [
+    "whatever the round's outcome",
+    "reviewer outage"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "decision_record",
+      "note": "Step 2 makes a decomposed parent merge-eligible whatever the round's outcome. That is the behaviour before ADR-095, which supersedes ADR-091 with a review-coverage hold: a parent merges only when every slice is covered by a successful review, and a failed round covers nothing. ADR-095's text is not shown here; recover through a re-run instead."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Letting a reviewer outage clear the merge follows ADR-091, which the index marks superseded by ADR-095 (review coverage for decomposed parents)."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2: the merge-eligibility change is unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 changes when the merge endpoint accepts a parent; ADR-090 requires an up-to-date head for a Fishhawk-dispatched merge, so confirm the head check still runs first."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-running-round-refused does not name the error."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Step 2 edits the merge endpoint without a test for a parent with no round at all."
+    }
+  ]
+}

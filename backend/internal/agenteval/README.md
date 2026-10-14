@@ -975,11 +975,13 @@ are logged, not pinned, so a routine ADR landing does not redden verify.
 **Finding: the decision record is index-only today.** `docs/adr/index.json`
 (~31 KB) nearly fills the 32 KB `repodoc.DefaultMaxBytes` budget the index and
 included records share (`backend/internal/decisionrecord/README.md` § "Byte
-budget"), so `Assemble` includes ZERO full records, and ADR-094, ADR-033 and
-ADR-076 carry empty `applies_to` and are never matched. The ADR-conflict cases
-are therefore catchable only from index titles and supersession metadata. The
-arm measures what ships. Operator follow-ups: raise the cap or slim the index,
-and populate `applies_to` on the admission and MCP records.
+budget"), so `Assemble` includes ZERO full records: ADR-006 is matched by the
+migration case's scope but dropped (2,569 bytes against the 1,474 the index
+leaves), and ADR-091 and ADR-095 carry empty `applies_to` and are never
+matched. Both ADR-conflict cases plant a conflict stated in a record BODY, so
+the persona has only index titles and supersession metadata to find it from.
+The arm measures what ships. Operator follow-ups: raise the cap or slim the
+index, and populate `applies_to` on the merge-path records.
 
 **ADR churn stales the architect arm.** Its fingerprint covers the rendered
 persona prompt, which embeds the real index, so an ADR landing stales THAT arm
@@ -1079,8 +1081,8 @@ sidecar (below), which a recording writes beside it.
       "samples_per_case": 46,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
-          "adr033-superseded-mcp-transport": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
-          "adr094-second-admission-path": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+          "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+          "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
           "clean-sqlc-query-cli": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
           "clean-workflow-v2-optional-field": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
           "declared-cross-component-direction": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
@@ -1137,8 +1139,8 @@ sidecar (below), which a recording writes beside it.
         "samples_per_case": 46,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
-            "adr033-superseded-mcp-transport": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
-            "adr094-second-admission-path": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+            "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+            "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
             "clean-sqlc-query-cli": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
             "clean-workflow-v2-optional-field": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
             "declared-cross-component-direction": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
