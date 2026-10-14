@@ -44,7 +44,7 @@
       },
       {
         "step": 2,
-        "description": "Register the tool with the stdio server only, in backend/cmd/fishhawk-mcp, because ADR-033 decided MCP is stdio-only; do not add it to any other transport."
+        "description": "Register the tool in backend/cmd/fishhawk-mcp's stdio tool table beside the other export verbs (transport per ADR-033), and wire its handler into the existing registry."
       },
       {
         "step": 3,
@@ -87,8 +87,8 @@
     }
   ],
   "defect_phrases": [
-    "stdio server only",
-    "do not add it to any other transport"
+    "stdio tool table",
+    "transport per ADR-033"
   ],
   "anchor": {
     "kind": "approach_step",
@@ -101,26 +101,26 @@
     "no longer governs"
   ],
   "attribution_phrases": [
-    "stdio server only",
+    "stdio tool table",
     "ADR-033"
   ],
   "catching_examples": [
     {
       "severity": "medium",
       "category": "decision_record",
-      "note": "Step 2 keeps the tool on the stdio server only because of ADR-033, but the index marks ADR-033 superseded by ADR-076 (MCP over HTTP served by fishhawkd); ADR-076's text is not shown here. Register the tool on the HTTP endpoint too."
+      "note": "Step 2 picks the transport per ADR-033 and registers the tool in the stdio tool table, but the index marks ADR-033 superseded by ADR-076 (MCP over HTTP served by fishhawkd); ADR-076's text is not shown here. Register the tool on the HTTP endpoint too."
     },
     {
       "severity": "low",
       "category": "decision_record",
-      "note": "Registering on the stdio server only follows ADR-033, which ADR-076 supersedes; the plan should follow the successor."
+      "note": "Registering in the stdio tool table follows ADR-033, which ADR-076 supersedes; the plan should follow the successor."
     }
   ],
   "non_catching_examples": [
     {
       "severity": "low",
       "category": "decision_record",
-      "note": "Step 2: restricting the tool to one transport is unjustified."
+      "note": "Step 2: registering the tool in one binary's table is unjustified."
     },
     {
       "severity": "medium",
@@ -135,7 +135,7 @@
     {
       "severity": "low",
       "category": "scope",
-      "note": "Step 2 has no test proving the tool is absent from other transports."
+      "note": "Step 2 has no test proving the tool is listed in the stdio tool table."
     }
   ]
 }

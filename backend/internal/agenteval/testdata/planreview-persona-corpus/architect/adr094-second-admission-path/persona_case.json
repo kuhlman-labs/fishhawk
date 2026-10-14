@@ -48,7 +48,7 @@
       },
       {
         "step": 3,
-        "description": "Spawn the acceptance-only runner behind a per-verb semaphore of capacity 2 held in the verb handler, so a re-run starts at once instead of waiting behind queued implement stages."
+        "description": "Run the acceptance-only runner from the verb handler through a small bounded worker pool (capacity 2) owned by the handler, and return the stage handle."
       },
       {
         "step": 4,
@@ -56,7 +56,7 @@
       }
     ],
     "verification": {
-      "test_strategy": "Handler tests for the refusal and the recorded verdict with a fake runner spawner, plus a test that two concurrent re-runs both start while an implement stage is queued.",
+      "test_strategy": "Handler tests for the refusal and the recorded verdict with a fake runner spawner, plus a test that the pool runs at most two re-runs at a time.",
       "rollback_plan": "Revert the PR; the verb is additive.",
       "acceptance_criteria": [
         {
@@ -87,8 +87,8 @@
     }
   ],
   "defect_phrases": [
-    "per-verb semaphore",
-    "instead of waiting behind queued implement stages"
+    "bounded worker pool",
+    "owned by the handler"
   ],
   "anchor": {
     "kind": "approach_step",
@@ -102,24 +102,24 @@
     "spawning verb"
   ],
   "attribution_phrases": [
-    "per-verb semaphore",
+    "worker pool",
     "acceptance-only runner"
   ],
   "catching_examples": [
     {
       "severity": "medium",
       "category": "decision_record",
-      "note": "Step 3 spawns the runner behind a per-verb semaphore: a second admission path beside resource-keyed admission, which the index records as one admission path for every spawning verb (ADR-094). Route the spawn through the shared admission instead."
+      "note": "Step 3 runs the runner through a worker pool owned by the handler: a second admission path beside resource-keyed admission, which the index records as one admission path for every spawning verb (ADR-094). Route the spawn through the shared admission instead."
     },
     {
       "severity": "low",
       "category": "decision_record",
-      "note": "The per-verb semaphore lets this verb's runner skip the queue every other spawning verb waits in; ADR-094's text is not shown, but its index entry makes admission one path. Needs the shared path or an amending ADR."
+      "note": "The handler's worker pool gives this verb its own concurrency control; ADR-094's text is not shown, but its index entry makes admission one path for every spawning verb. Needs the shared path or an amending ADR."
     },
     {
       "severity": "low",
       "category": "decision_record",
-      "note": "Step 3: a re-run that starts at once instead of waiting behind queued stages bypasses resource-keyed admission."
+      "note": "Step 3: a capacity-2 pool private to one verb sidesteps resource-keyed admission."
     }
   ],
   "non_catching_examples": [
@@ -131,7 +131,7 @@
     {
       "severity": "medium",
       "category": "decision_record",
-      "note": "Step 3 holds the per-verb semaphore inside the MCP process, which the ADR-060 shim may restart mid-request; keep the counter outside the process."
+      "note": "Step 3 holds the worker pool inside the MCP process, which the ADR-060 shim may restart mid-request; keep the pool state outside the process."
     },
     {
       "severity": "low",
@@ -141,7 +141,7 @@
     {
       "severity": "low",
       "category": "scope",
-      "note": "The per-verb semaphore in step 3 has no dedicated test file in scope."
+      "note": "The worker pool in step 3 has no dedicated test file in scope."
     }
   ]
 }

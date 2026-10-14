@@ -10,16 +10,21 @@ holding fails verify.
 ## What it represents
 
 The issue asks for `fishhawk_export_audit`, a new MCP tool. The plan's approach
-step 2 registers it "with the stdio server only ... because ADR-033 decided MCP
-is stdio-only; do not add it to any other transport".
+step 2 registers it "in backend/cmd/fishhawk-mcp's stdio tool table beside the
+other export verbs (transport per ADR-033)". The reliance is incidental: the
+step states no rationale and no prohibition, so a reviewer has to check
+ADR-033's status in the index to see it (reworked 2026-10-13 after the
+calibration dry run caught the original wording 10/10: it named ADR-033 as the
+reason and forbade every other transport).
 
 ## The planted defect
 
 - Kind: `superseded_reliance`, expect `catch`, anchored at approach step 2.
 - The defect: reliance on ADR-033, which the index lists as superseded by
   ADR-076 ("MCP over HTTP served by fishhawkd ... supersedes ADR-033's loopback
-  gate"). The plan follows the superseded record where the successor decides
-  differently.
+  gate"). The tool is registered in the stdio binary's tool table only, so it
+  is reachable over stdio alone: the plan follows the superseded record where
+  the successor decides differently.
 
 ## Remit item
 
@@ -46,5 +51,5 @@ in the rendered index (approval condition C1).
 ## Scoring
 
 Catch rule v5 under the architect's `decision_record` category predicate, after
-the production persona-ingest controls. `supersed`, `ADR-076`, `successor`, `no longer governs`; attribution by `step 2`, `stdio server only` or `ADR-033`. `persona_case.json` carries
+the production persona-ingest controls. `supersed`, `ADR-076`, `successor`, `no longer governs`; attribution by `step 2`, `stdio tool table` or `ADR-033`. `persona_case.json` carries
 the hand-written examples the loader classifies to prove the rule discriminates.

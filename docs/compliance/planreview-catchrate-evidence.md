@@ -27,12 +27,15 @@ results table lists every recording.
 
 **E78.11 / #4313 makes the record arm-keyed** (`planreview-catchrate-evidence-v2`
 plus `planreview-catchrate-trials-v2`, catch rule `planreview-catch-v5`). The
-committed pair stays the legacy v1 pair until ONE shared re-pin recording of
-every arm, made after #4313 AND #4314 (which registers its security arms in
-the same arm table) have both merged (Step 2, "The shared #4313/#4314 re-pin
-recording"). Until then `catchrategate` refuses the v1 record naming that
-recording, and `scripts/check-review-prompt-eval` fails on every trigger-path
-change: by design, and outside `scripts/test verify`.
+committed pair stays the legacy v1 pair until the #4313 re-pin recording.
+Recording sequence (Captain ruling 2026-10-12): #4313 is recorded and merged
+FIRST, on its own re-pin; #4314 (which registers its security arms in the
+same arm table) records separately after it (Step 2, "The #4313 re-pin
+recording, then #4314's"). Until the #4313 recording lands `catchrategate`
+refuses the v1 record (its refusal text, written before the ruling, still
+names a shared #4313/#4314 recording; the #4313 re-pin is what clears it),
+and `scripts/check-review-prompt-eval` fails on every trigger-path change: by
+design, and outside `scripts/test verify`.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -102,7 +105,7 @@ scripts/test single -run 'Persona' ./backend/internal/agenteval/
 
 ## Step 1b — calibrate a new arm's cases (dry run, never written)
 
-Before the shared recording, check that each catch case of a NEW arm is of
+Before the arm's re-pin recording, check that each catch case of a NEW arm is of
 mid difficulty: caught in 30%–80% of trials (both bounds inclusive). A case
 at 0% or 100% cannot show a regression in one direction. The dry run never
 writes evidence; clean cases report their false-alarm rate with band `n/a`.
@@ -192,19 +195,25 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 That recording is the ONLY out-of-sample measurement of v4: the re-score
 below tuned the v4 probes on the same sidecar it reports.
 
-**The shared #4313/#4314 re-pin recording.** After #4313 and #4314 have both
-merged, ONE recording measures every arm of the arm table (the two
-conventions arms, the architect arm, and #4314's security arms) and pins the
-first v2 baseline. The existing v1 record is a non-comparable baseline: a
-non-pinning recording over it is refused (both files stay byte-identical), a
-pin replaces it, and a dry run proceeds.
+**The #4313 re-pin recording, then #4314's.** Captain ruling 2026-10-12:
+#4313 is recorded and merged FIRST, on its own re-pin. That recording, made
+on the #4313 branch before it merges, measures every arm the arm table
+registers at that point (the two conventions arms and the architect arm) and
+pins the first v2 baseline. The existing v1 record is a non-comparable
+baseline: a non-pinning recording over it is refused (both files stay
+byte-identical), a pin replaces it, and a dry run proceeds.
 
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
-  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4313 + #4314: arm-keyed v2 record (catch rule v5, architect and security persona arms); the v1 baseline is not comparable' \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4313: arm-keyed v2 record (catch rule v5, architect persona arm); the v1 baseline is not comparable' \
   scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
+
+#4314 records separately, after #4313 has merged. Its security arms change
+the arm table, so an ordinary recording over the #4313 baseline is refused as
+not comparable: #4314's recording is a re-pin of its own, with its own
+`PIN_REASON`.
 
 Commit the v2 pair (Step 3); `catchrategate` then decodes it, and the stale
 message on any later change names the arm whose fingerprint moved. An ADR
@@ -215,7 +224,8 @@ Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
 calls — 2 x 144 with the twelve committed cases (12 samples per case) — and
 the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
 of its catch and clean classes clears the 136 floor with 138), about 564
-calls before #4314's rows, against
+calls for the #4313 recording (#4314's security arms bill to its own
+recording), against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
@@ -373,16 +383,16 @@ to use it as a probe.
 
 ### Arm-keyed results (E78.11 / #4313 on)
 
-Pending the shared #4313/#4314 re-pin recording; one row per recording,
+Pending the #4313 re-pin recording (#4314 records separately after it); one row per recording,
 naming every arm. The architect columns are catch (catch cases) and false
 alarm (clean cases).
 
 | Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | pending the shared #4313/#4314 re-pin | not yet recorded |
+| — | — | — | — | — | — | — | pending the #4313 re-pin | not yet recorded |
 
 ### Calibration dry runs
 
 | Run at | Arm | Samples per case | Out-of-band catch cases | Table |
 |---|---|---|---|---|
-| — | `architect` | 10 | pending the operator run on the #4313 PR branch | PR comment |
+| 2026-10-13 | `architect` | 10 | adr033 + adr094 above band (10/10); reworked, re-calibration pending operator | routed fix-up concern (head `84ce5e13`) |

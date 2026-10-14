@@ -608,10 +608,11 @@ whatever `evidence.json` carries — read its `baseline.pinned_at` and
 
 **E78.11 / #4313 makes the record arm-keyed (`planreview-catchrate-evidence-v2`)
 and bumps the rule to `planreview-catch-v5`.** The committed pair stays a
-legacy v1 pair until the operator's ONE shared re-pin recording after #4313
-and #4314 both merge (#4314 registers its security arms in the same arm
-table): until then `catchrategate` refuses the v1 record naming that
-recording, and `scripts/check-review-prompt-eval` fails on every trigger-path
+legacy v1 pair until the operator's #4313 re-pin recording: #4313 is recorded
+and merged FIRST on its own re-pin, and #4314 (which registers its security
+arms in the same arm table) records separately after it (Captain ruling
+2026-10-12). Until then `catchrategate` refuses the v1 record (its refusal
+text still names a shared #4313/#4314 recording), and `scripts/check-review-prompt-eval` fails on every trigger-path
 change. That check runs outside `scripts/test verify`, so merge-time verify is
 unaffected; no verify test pins the committed fingerprint or a committed PASS.
 

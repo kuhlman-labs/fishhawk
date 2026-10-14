@@ -10,16 +10,20 @@ holding fails verify.
 ## What it represents
 
 The issue asks for `fishhawk_rerun_acceptance`, a new MCP verb that spawns a
-runner for just the acceptance stage. The plan's approach step 3 spawns that
-runner "behind a per-verb semaphore of capacity 2 held in the verb handler, so
-a re-run starts at once instead of waiting behind queued implement stages".
+runner for just the acceptance stage. The plan's approach step 3 runs that
+runner "from the verb handler through a small bounded worker pool (capacity 2)
+owned by the handler". The step reads as a mundane implementation detail: it
+names no queue, wait, admission or latency benefit, and neither does the test
+strategy (reworked 2026-10-13 after the calibration dry run caught the original
+wording 10/10: it said the semaphore let a re-run start "at once instead of
+waiting behind queued implement stages").
 
 ## The planted defect
 
 - Kind: `accepted_conflict`, expect `catch`, anchored at approach step 3.
 - The defect: a second admission path for a spawning verb. ADR-094 (accepted)
-  decides "one admission path for every spawning verb"; the per-verb semaphore
-  lets this verb's runner start outside it.
+  decides "one admission path for every spawning verb"; the handler-owned
+  worker pool gives this spawning verb its own concurrency control outside it.
 - The case NEVER names ADR-094 (asserted by
   `TestPersonaCatchCorpus_GoverningPremisesHold`): the persona has to connect
   the step to the index entry itself.
@@ -48,5 +52,5 @@ in the rendered index (approval condition C1).
 ## Scoring
 
 Catch rule v5 under the architect's `decision_record` category predicate, after
-the production persona-ingest controls. `admission`, `ADR-094`, `resource-keyed`, `resource group`, `spawning verb`; attribution by `step 3`, `per-verb semaphore` or `acceptance-only runner`. `persona_case.json` carries
+the production persona-ingest controls. `admission`, `ADR-094`, `resource-keyed`, `resource group`, `spawning verb`; attribution by `step 3`, `worker pool` or `acceptance-only runner`. `persona_case.json` carries
 the hand-written examples the loader classifies to prove the rule discriminates.
