@@ -5,7 +5,7 @@ status: accepted
 date: 2026-06-12
 issue: https://github.com/kuhlman-labs/fishhawk/issues/997
 supersedes: []
-superseded_by: []
+superseded_by: ["ADR-101"]
 applies_to: ["docs/spec/operator-role.schema.json", ".fishhawk/operator.yaml"]
 ---
 
