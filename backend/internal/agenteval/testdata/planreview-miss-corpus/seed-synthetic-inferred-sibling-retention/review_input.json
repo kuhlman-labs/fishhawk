@@ -121,11 +121,25 @@
     "retention period is not in the issue",
     "purge is invented",
     "purge is speculative",
-    "purge is not in the issue"
+    "purge is not in the issue",
+    "precedent, not a",
+    "precedent rather than",
+    "precedent and not",
+    "precedent is not a",
+    "precedent, which is not",
+    "cites no place",
+    "cites nowhere",
+    "does not cite where",
+    "fails the warrant"
   ],
   "attribution_phrases": [
     "90 days",
     "deleted by the nightly purge"
+  ],
+  "defect_phrases": [
+    "audit_events",
+    "90 days",
+    "nightly purge"
   ],
   "catching_examples": [
     {
@@ -142,6 +156,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "The inferred purge of view rows older than 90 days is not stated in the issue; it is copied from the audit_events job and would silently shrink the view count."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-views-purged-after-90-days is an inferred, blocking criterion that introduces a 90-day retention value the issue never states. Its only support is that audit_events keeps 90 days, which is precedent rather than a requirement, and the plan cites nothing that requires it. Resolve by citing where 90 days is required, or by dropping the purge step (step 4, internal/jobs/purge.go) and criterion, or by making the criterion non-blocking pending product confirmation."
     }
   ],
   "non_catching_examples": [
@@ -173,6 +192,11 @@
     {
       "category": "risk",
       "note": "Deleting rows older than 90 days in one statement is unjustified on a large table: the batch size copied from the importer job is unsupported by an index on viewed_at, a mismatch with the purge's lock budget."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "Step 4 and the test strategy call for a purge job test with a fake clock, but no purge test file (e.g. internal/jobs/purge_test.go) is in scope.files. Only internal/jobs/purge.go is listed as modified. The test that verifies ac-views-purged-after-90-days therefore has no declared home. Add the purge test file to scope.files with the correct create/modify operation. Whether a test file already exists cannot be verified in this diff-only review."
     }
   ]
 }

@@ -212,7 +212,10 @@ func TestRun_PrintsTheRuleOnEveryOutcome(t *testing.T) {
 		{"infrastructure: conventions unavailable", []string{"--evidence", fresh, "--corpus", testCorpus, "--conventions", filepath.Join(dir, "none.md")}, 1, false},
 		{"infrastructure: print-fingerprint corpus unavailable", []string{"--print-fingerprint", "--evidence", "x", "--corpus", filepath.Join(dir, "no-corpus"), "--conventions", testConventions}, 1, false},
 		{"usage error", []string{"--no-such-flag"}, 2, false},
+		{"usage error: rescore with print-fingerprint", []string{"--rescore", "--print-fingerprint", "--evidence", fresh, "--corpus", testCorpus}, 2, false},
 		{"print-fingerprint", []string{"--print-fingerprint", "--evidence", "x", "--corpus", testCorpus, "--conventions", testConventions}, 0, false},
+		{"rescore", []string{"--rescore", "--evidence", fresh, "--corpus", testCorpus}, 0, false},
+		{"rescore: absent sidecar", []string{"--rescore", "--evidence", filepath.Join(dir, "none.json"), "--corpus", testCorpus}, 1, false},
 		{"pass", []string{"--evidence", fresh, "--corpus", testCorpus, "--conventions", testConventions}, 0, true},
 	}
 	for _, tc := range tests {
@@ -262,7 +265,7 @@ func TestRun_EvidenceWithTrailingContentFails(t *testing.T) {
 }
 
 func TestRun_UsageErrors(t *testing.T) {
-	for _, args := range [][]string{{"--no-such-flag"}, {"positional"}} {
+	for _, args := range [][]string{{"--no-such-flag"}, {"positional"}, {"--rescore", "--print-fingerprint"}} {
 		if code, _, stderr := runGate(args...); code != 2 {
 			t.Errorf("args %v: exit %d, want 2 (stderr %s)", args, code, stderr)
 		}
@@ -335,5 +338,92 @@ func TestFindBackendRoot(t *testing.T) {
 	}
 	if isBackendModule(filepath.Join(other, "go.mod")) {
 		t.Fatal("a go.mod for another module was taken as the backend's")
+	}
+}
+
+// TestRun_RescorePrintsReportAndNeverWrites drives --rescore end to end over a
+// pair recorded through the real RecordCatchRateEvidence: exit 0 with the
+// re-score report on stdout, never a PASS (the rule line goes to stderr), and
+// the evidence record, its sidecar and their directory left byte-identical.
+func TestRun_RescorePrintsReportAndNeverWrites(t *testing.T) {
+	path := freshRecord(t, testConventions)
+	sidecar := agenteval.CatchRateTrialsPath(path)
+	snapshot := func() map[string]string {
+		entries, err := os.ReadDir(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := map[string]string{}
+		for _, e := range entries {
+			b, err := os.ReadFile(filepath.Join(filepath.Dir(path), e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files[e.Name()] = string(b)
+		}
+		return files
+	}
+	before := snapshot()
+	if _, ok := before[filepath.Base(sidecar)]; !ok || len(before) != 2 {
+		t.Fatalf("premise: the recording wrote exactly the record and its sidecar, got %d files", len(before))
+	}
+	code, stdout, stderr := runGate("--rescore", "--evidence", path, "--corpus", testCorpus)
+	if code != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+	for _, want := range []string{"OFFLINE RE-SCORE", "lower bound", "attribution-only", "Sidecar: " + sidecar, "without_conventions: recorded "} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "catchrategate: PASS") || strings.Contains(stdout, "catchrategate: rule:") {
+		t.Errorf("stdout carries a PASS or the rule line:\n%s", stdout)
+	}
+	assertRuleLine(t, stderr)
+	after := snapshot()
+	if len(after) != len(before) {
+		t.Fatalf("the re-score changed the evidence directory: %d files before, %d after", len(before), len(after))
+	}
+	for name, b := range before {
+		if after[name] != b {
+			t.Errorf("the re-score modified %s", name)
+		}
+	}
+}
+
+// TestRun_RescoreDefaults resolves the committed sidecar and corpus from the
+// package directory.
+func TestRun_RescoreDefaults(t *testing.T) {
+	code, stdout, stderr := runGate("--rescore")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "OFFLINE RE-SCORE") || !strings.Contains(stdout, filepath.Join("testdata", "planreview-catchrate", "evidence.trials.json")) {
+		t.Errorf("stdout does not re-score the committed sidecar:\n%s", stdout)
+	}
+	assertRuleLine(t, stderr)
+}
+
+func TestRun_RescoreFailsOnAbsentSidecar(t *testing.T) {
+	evidence := filepath.Join(t.TempDir(), "evidence.json")
+	code, stdout, stderr := runGate("--rescore", "--evidence", evidence, "--corpus", testCorpus)
+	if code != 1 || !strings.Contains(stderr, agenteval.CatchRateTrialsPath(evidence)) || !strings.Contains(stderr, "absent") {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the absent sidecar %s", code, stderr, agenteval.CatchRateTrialsPath(evidence))
+	}
+	if stdout != "" {
+		t.Errorf("a failed re-score printed to stdout:\n%s", stdout)
+	}
+	assertRuleLine(t, stderr)
+}
+
+// TestRun_RescoreWithPrintFingerprintIsUsage: the two modes are exclusive;
+// neither runs.
+func TestRun_RescoreWithPrintFingerprintIsUsage(t *testing.T) {
+	code, stdout, stderr := runGate("--rescore", "--print-fingerprint", "--evidence", "x", "--corpus", testCorpus, "--conventions", testConventions)
+	if code != 2 || !strings.Contains(stderr, "--rescore and --print-fingerprint are mutually exclusive") {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 2 naming the exclusivity", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("a usage error printed to stdout:\n%s", stdout)
 	}
 }

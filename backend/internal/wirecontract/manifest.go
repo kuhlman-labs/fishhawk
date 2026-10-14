@@ -341,6 +341,18 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: specialistJobPkgGo, Type: "Completion"},
 				Mode:     ModeExact,
 			},
+			{
+				// The runner's record of an outside-only verify flake absorbed
+				// at the verify-fix loop's terminal failure (#4229), folded into
+				// gate_evidence and decoded by the backend for the
+				// verify_flake_absorbed audit row. ModeExact: both sides are
+				// flat leaves; the bytes are ALSO pinned by the shared golden
+				// testdata/wire/verify_flake_absorbed_evidence.json.
+				Name: "verify_flake_absorbed_evidence", Anchor: "#4229",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "flakeAbsorbedEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "FlakeAbsorbedEvidence"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			promptFile,

@@ -3253,9 +3253,13 @@ func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason 
 // (`backend/internal/server/rebase_branch.go::rebaseBranchRequest`).
 // Confirm MUST be true — the advance moves the PR head (leaving a merge
 // commit), so the backend refuses a missing/false confirm with 400.
+//
+// RerunFailedVerify (#4391) asks for a verify-only re-run of a FAILED
+// merge-candidate head; the backend requires a non-blank Reason with it.
 type rebaseBranchRequest struct {
-	Reason  string `json:"reason,omitempty"`
-	Confirm bool   `json:"confirm"`
+	Reason            string `json:"reason,omitempty"`
+	Confirm           bool   `json:"confirm"`
+	RerunFailedVerify bool   `json:"rerun_failed_verify,omitempty"`
 }
 
 // RebaseBranchResult mirrors the backend's rebase-branch 200 body: the
@@ -3367,6 +3371,10 @@ type RebaseBranchResult struct {
 	MergeCandidateVerifyNote string `json:"merge_candidate_verify_note,omitempty"`
 	// MergeCandidateVerifyRefusal names why no pass could be started.
 	MergeCandidateVerifyRefusal string `json:"merge_candidate_verify_refusal,omitempty"`
+	// MergeCandidateVerifyRerun is true ONLY when THIS call voided a failed
+	// merge-candidate verdict for a rerun_failed_verify request (#4391); the
+	// fields above report the pass that follows (in_flight, or held).
+	MergeCandidateVerifyRerun bool `json:"merge_candidate_verify_rerun,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the
@@ -3392,8 +3400,12 @@ type RebaseBranchResult struct {
 //   - 502 rebase_merge_failed (the merge itself failed for a non-conflict
 //     reason; nothing was written)
 //   - 503 rebase_unconfigured
-func (c *apiClient) RebaseRunBranch(ctx context.Context, runID uuid.UUID, reason string) (*RebaseBranchResult, error) {
-	body, err := json.Marshal(rebaseBranchRequest{Reason: reason, Confirm: true})
+//
+// rerunFailedVerify (#4391) sends rerun_failed_verify:true: on the
+// already-up-to-date arm a FAILED head's verdict is voided and a fresh
+// verify-only pass started; a blank reason with it is a 400 validation_failed.
+func (c *apiClient) RebaseRunBranch(ctx context.Context, runID uuid.UUID, reason string, rerunFailedVerify bool) (*RebaseBranchResult, error) {
+	body, err := json.Marshal(rebaseBranchRequest{Reason: reason, Confirm: true, RerunFailedVerify: rerunFailedVerify})
 	if err != nil {
 		return nil, fmt.Errorf("marshal rebase-branch: %w", err)
 	}

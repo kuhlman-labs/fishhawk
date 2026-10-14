@@ -127,11 +127,25 @@
     "throttling is speculative",
     "throttling is not in the issue",
     "429 is invented",
-    "429 is speculative"
+    "429 is speculative",
+    "is generic",
+    "is a generic",
+    "generic assumption",
+    "generic preference",
+    "general preference",
+    "fails the warrant",
+    "cites no place",
+    "does not cite where",
+    "precedent, not a"
   ],
   "attribution_phrases": [
     "429",
     "requests per minute"
+  ],
+  "defect_phrases": [
+    "requests per minute",
+    "write endpoints should be rate limited",
+    "rate limit"
   ],
   "catching_examples": [
     {
@@ -143,6 +157,11 @@
       "severity": "medium",
       "category": "warrant",
       "note": "The 429-after-10-requests criterion invents a rate limit no step implements and the issue never asked for."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-archive-rate-limit is an inferred, blocking criterion that introduces a specific limit (429 after 10 requests per minute per tenant) that the issue never states. Its rationale, 'write endpoints should be rate limited', is generic, and the plan cites no place where this value is required. Remove the criterion, or cite the repository requirement for this limit and mark it non-blocking."
     }
   ],
   "non_catching_examples": [
@@ -184,6 +203,11 @@
     {
       "category": "documentation",
       "note": "The 429 response body diverges from the error envelope used for 404/409; the mismatch is unjustified."
+    },
+    {
+      "severity": "high",
+      "category": "scope",
+      "note": "ac-archive-rate-limit is blocking, but no approach step and no file in scope.files implements rate limiting (no middleware, config or limiter file). The criterion cannot be met by the plan as written, so the executor either fails a blocking criterion or expands scope unplanned. Resolve by removing the criterion, or by adding the limiter implementation and its files to the plan along with a source that requires it."
     }
   ]
 }

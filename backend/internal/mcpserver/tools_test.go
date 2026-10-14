@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -18606,5 +18607,93 @@ func TestRequestSpecialistJob_OmittedInputsSendEmptyObject(t *testing.T) {
 	}
 	if in, ok := fb.posts[0]["inputs"].(map[string]any); !ok || len(in) != 0 {
 		t.Errorf("POST inputs = %#v, want an empty object", fb.posts[0]["inputs"])
+	}
+}
+
+// TestRebaseRunBranchTool_RerunFailedVerify pins the #4391 tool hop: the
+// handler forwards rerun_failed_verify to the backend, and with the flag set a
+// blank (or whitespace) reason is refused LOCALLY — the backend is never
+// called, so the refusal is not the backend's 400 echoed back.
+func TestRebaseRunBranchTool_RerunFailedVerify(t *testing.T) {
+	runID := uuid.New()
+	var calls atomic.Int32
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		got = map[string]any{}
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","merge_candidate_verify_rerun":true}`)
+	}))
+	t.Cleanup(srv.Close)
+	r := newResolver(srv, nil)
+
+	for _, reason := range []string{"", "   "} {
+		_, _, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+			RunID: runID.String(), Confirm: true, RerunFailedVerify: true, Reason: reason,
+		})
+		if err == nil || !strings.Contains(err.Error(), "reason is required with rerun_failed_verify") {
+			t.Fatalf("blank reason %q: err = %v, want the local reason refusal", reason, err)
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("backend calls after blank-reason refusals = %d, want 0 (refused before the HTTP hop)", n)
+	}
+
+	_, out, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+		RunID: runID.String(), Confirm: true, RerunFailedVerify: true, Reason: "gate host starved",
+	})
+	if err != nil {
+		t.Fatalf("rebaseRunBranch: %v", err)
+	}
+	if got["rerun_failed_verify"] != true || got["reason"] != "gate host starved" {
+		t.Errorf("forwarded body = %v, want rerun_failed_verify:true and the reason", got)
+	}
+	if !out.Result.MergeCandidateVerifyRerun {
+		t.Error("merge_candidate_verify_rerun not surfaced on the tool output")
+	}
+
+	// The flag off with a blank reason is today's call: forwarded, no refusal.
+	if _, _, err := r.rebaseRunBranch(context.Background(), nil, RebaseRunBranchInput{
+		RunID: runID.String(), Confirm: true,
+	}); err != nil {
+		t.Fatalf("flag off, blank reason: %v, want forwarded", err)
+	}
+	if _, present := got["rerun_failed_verify"]; present {
+		t.Errorf("flag off still sent rerun_failed_verify: %v", got)
+	}
+}
+
+// TestRebaseRunBranchTool_DescribesVerifyRerun pins the #4391 paragraph on
+// the wire-visible description: the flag, its required reason, the void row
+// and the refusal beside a queued fix-up.
+func TestRebaseRunBranchTool_DescribesVerifyRerun(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	registerRebaseRunBranch(srv, &runResolver{})
+	st, ct := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	ss, err := srv.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Tools) != 1 {
+		t.Fatalf("tools = %d, want 1", len(res.Tools))
+	}
+	desc := res.Tools[0].Description
+	for _, want := range []string{"rerun_failed_verify", "REQUIRED", "not_executed", "operator_rerun", "fishhawk_dispatch_stage", "merge_candidate_verify_rerun"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("description must name %q:\n%s", want, desc)
+		}
 	}
 }

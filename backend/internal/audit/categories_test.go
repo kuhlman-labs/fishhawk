@@ -774,3 +774,16 @@ func TestKnownCategories_MergeCandidateQueue(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_VerifyFlakeAbsorbed pins the #4229 category the trace
+// handler appends at raw upload when the runner absorbed an outside-only verify
+// flake (server/verify_flake_absorbed.go). An unregistered category would
+// redden TestKnownCategoriesCoversEmittedCategories and make a
+// fishhawk_await_audit wait armed on it unsatisfiable.
+//
+// Counterfactual: delete the map entry — this test goes RED.
+func TestKnownCategories_VerifyFlakeAbsorbed(t *testing.T) {
+	if !IsKnownCategory("verify_flake_absorbed") {
+		t.Fatal("verify_flake_absorbed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

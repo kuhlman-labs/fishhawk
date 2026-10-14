@@ -671,7 +671,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -761,6 +761,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.commitAuthorEmail = commitAuthorEmail
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
+		cfg.fixupPolicyIncrement = promptFixupPolicyIncrement
 		exemptOpenPR = openPRFromHeldCommit
 		exemptHeldSHA = heldCommitSHA
 		exemptHeldBranch = heldCommitBranch
@@ -1905,6 +1906,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
 			cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, preAgentRef)
+		// Decomposed-parent fix-up policy increment (#4391): the consolidated
+		// head carries every child's fan-in commit, so a policy diff measured
+		// against the base branch counts the whole fan-out. Record the tip this
+		// pass just checked out as the increment base BEFORE the deterministic
+		// apply attempt (which takes cfg by value) and the agent, so both
+		// git_diff emitters (resolvePolicyBaseRef / resolveStageDiffBase) bound
+		// the fix-up's own increment — the parent analogue of #765.
+		if cfg.fixupPolicyIncrement {
+			cfg.fixupIncrementBaseSHA = tipSHA
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_policy_increment_base","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA)
+		}
 
 		// Near-deterministic fix-up apply (#1165): when the backend served an
 		// apply-list (every routed concern carried a suggested_patch) AND a
@@ -4031,16 +4045,18 @@ type reasoningEffort struct {
 // and its source rung; zero-valued when the spec declares none.
 // gateContainer (E51.3 / #2136) is the stage's effective workflow-v2
 // gate_container as the backend resolved it; nil when none is declared.
+// fixupPolicyIncrement (#4391) is true only on a decomposed parent's fix-up:
+// run() then bounds the policy diff to the fix-up's increment.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -4055,20 +4071,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -4294,11 +4310,25 @@ func classifyErr(err error) string {
 // (#765). In that case we measure against origin/<shared-branch> so each
 // child's constraints bound only its own increment.
 //
+// A decomposed PARENT's fix-up (#4391) is the parent analogue: its
+// consolidated head carries every child's fan-in commit, so diffing against
+// main sums the whole fan-out and fails an over-cap decomposed change's
+// max_files_changed on ANY fix-up. When run() recorded the consolidated tip
+// the pass checked out (cfg.fixupIncrementBaseSHA, set only when the backend
+// served fixup_policy_increment), that bare SHA is returned FIRST as the
+// git_diff base_ref label, and resolveStageDiffBase measures against it.
+//
 // Fallback-safe by construction: anything that isn't a subsequent
-// decomposition child — including a subsequent child whose
+// decomposition child or a parent fix-up — including a subsequent child whose
 // remote-tracking ref is unexpectedly absent — returns cfg.checkBaseRef
 // unchanged, preserving the prior behavior exactly.
 func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) string {
+	if cfg.fixupIncrementBaseSHA != "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"policy_base_decomposed_parent_fixup","stage_id":%q,"base_ref":%q,"cumulative_base_ref":%q}`+"\n",
+			cfg.stageID, cfg.fixupIncrementBaseSHA, cfg.checkBaseRef)
+		return cfg.fixupIncrementBaseSHA
+	}
 	if cfg.decomposedFromRunID == "" {
 		return cfg.checkBaseRef
 	}
@@ -4437,9 +4467,34 @@ func resolveDiffBaseRef(ctx context.Context, baseRef, repoDir, stageID string, l
 // not a commit in this repository), it logs diff_base_pin_unresolved and
 // delegates to resolveDiffBaseRef — today's re-anchor chain — rather than
 // blocking the diff. An UNPINNED stage (fix-ups, every advance / wave-base
-// skip, the held-commit resume) delegates directly, so fix-ups keep the #1975
-// re-anchor byte-identically.
+// skip, the held-commit resume) delegates directly, so an ordinary or
+// decomposed-child fix-up keeps the #1975 re-anchor byte-identically.
+//
+// A decomposed PARENT's fix-up (#4391) takes a FIRST arm: when run() recorded
+// the consolidated tip the pass checked out (cfg.fixupIncrementBaseSHA), the
+// staged index is measured against merge-base(tip, HEAD) with NO fetch — HEAD
+// descends from the tip, so that is the tip itself — and one
+// diff_base_fixup_increment line records it. On a merge-base error it logs
+// diff_base_fixup_increment_unresolved naming BOTH the SHA and the cumulative
+// base it falls back to, then delegates to resolveDiffBaseRef against
+// cfg.checkBaseRef (NOT baseRef, which is the bare SHA here and would be
+// fetched as a branch): the cumulative chain, today's behaviour, which fails
+// toward enforcement rather than toward a smaller diff.
 func resolveStageDiffBase(ctx context.Context, cfg config, baseRef, repoDir string, logSink io.Writer) string {
+	if cfg.fixupIncrementBaseSHA != "" {
+		mb, err := (&gitdiff.Runner{}).MergeBase(ctx, cfg.fixupIncrementBaseSHA, repoDir)
+		if err != nil {
+			cumulative := resolveDiffBaseRef(ctx, cfg.checkBaseRef, repoDir, cfg.stageID, logSink)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"diff_base_fixup_increment_unresolved","stage_id":%q,"base_ref":%q,"base_sha":%q,"cumulative_base_ref":%q,"measured_against":%q,"detail":%q}`+"\n",
+				cfg.stageID, baseRef, cfg.fixupIncrementBaseSHA, cfg.checkBaseRef, cumulative, err.Error())
+			return cumulative
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"diff_base_fixup_increment","stage_id":%q,"base_ref":%q,"base_sha":%q,"merge_base":%q}`+"\n",
+			cfg.stageID, baseRef, cfg.fixupIncrementBaseSHA, mb)
+		return mb
+	}
 	if cfg.pinnedBaseSHA == "" {
 		return resolveDiffBaseRef(ctx, baseRef, repoDir, cfg.stageID, logSink)
 	}
@@ -4465,7 +4520,9 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// Resolve the effective policy-diff base ref once. For a subsequent
 	// decomposition child this is origin/<shared-branch> so each child's
 	// constraints bound its own increment, not the cumulative fan-out
-	// (#765); for everything else it is cfg.checkBaseRef unchanged.
+	// (#765); for a decomposed parent's fix-up it is the bare consolidated
+	// tip SHA the pass checked out (#4391); for everything else it is
+	// cfg.checkBaseRef unchanged.
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
 	// Anchor the diff to the run's fork point (3-dot) — the stage's pinned base
@@ -5604,9 +5661,10 @@ func verifyFailureExcerpt(out string) string {
 //
 //     2b. on a SCOPED pass, immediately re-verifies the SAME committed SHA with
 //     the FULL form and adopts its outcome and output. A passing iteration
-//     therefore always ends on a complete verify, the #960 verified tree is the
-//     FULL form's, and a break in a package the scope did not name cannot slip
-//     past the gate. An EMPTY package set skips the pre-pass and runs the full
+//     therefore ends on a complete verify, the #960 verified tree is the FULL
+//     form's, and a break in a package the scope did not name cannot slip
+//     past the gate — the one exception is step 7's outside-only absorb
+//     (#4229). An EMPTY package set skips the pre-pass and runs the full
 //     form exactly once, as before #3315;
 //
 //  3. on PASS: undoes the throwaway commit (git reset --soft HEAD~1, which
@@ -5633,6 +5691,20 @@ func verifyFailureExcerpt(out string) string {
 //     verify_summary detail), a reproduced outside failure is category C
 //     (verify_failure_outside_change), and a failure inside the change refunds
 //     the iteration. Helpers and the relation rules live in verifyfailures.go.
+//
+//  7. OUTSIDE-ONLY FLAKE ABSORPTION at exhaustion (#4229, ruling (b)): when the
+//     deciding verify is the (c2) full form and every failing package lies
+//     outside the change (plan scope AND scripts/test's attested changed
+//     dirs), the attest — gated by a fresh per-(c2) nonce — reports passing
+//     patch coverage and TEST-class module failures, and no absorbed test or
+//     package failed earlier in this pass, the iteration is repeated ONCE
+//     (`iter--; continue`, once per runner pass): re-stage, re-commit, refuse
+//     unless the tree is identical, then ONE scoped verify of the outside
+//     packages. An exact "passed" from an executed gate makes that tree the
+//     verified tree and emits verify_flake_absorbed; anything else is
+//     refused and the stage ends with today's terminal failure byte-for-byte
+//     (the re-run is not counted in attempts). Every refusal of a candidate
+//     emits verify_flake_absorb_refused. Helpers live in verifyabsorb.go.
 //
 // Failure handling splits on WHERE HEAD is when the failing op runs, symmetric
 // with runVerifyGateCommitted (#816):
@@ -5753,18 +5825,57 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		flakeFailures    verifyFailures // the failure the no-op fix agent was given (the flaky test on a pass)
 		outsideChange    bool           // the flake re-run reproduced a failure entirely outside the change → category C
 		outsideFailures  verifyFailures // the reproduced failure, for the category-C reason
+
+		// Outside-only flake absorption at exhaustion (#4229, verifyabsorb.go).
+		decidingNonce    string           // the absorb nonce injected into the deciding (c2) full verify; "" for any other verify
+		failureHistory   []verifyFailures // every FAILED verify of this pass, for the recurred refusal
+		flakeAbsorbSpent bool             // the once-per-pass absorb was already admitted
+		absorbPending    *flakeAbsorbPlan // the admitted absorb the NEXT iteration re-runs, scoped
+		absorbed         *flakeAbsorbPlan // the absorb whose scoped re-run passed
+		absorbRefusal    string           // why a candidate absorb was refused
 	)
 
+	// refuseAbsorb settles a refused absorb re-run back onto the failed full
+	// verify it was admitted for: lastOutput and form are restored and nothing
+	// else is set, so the stage ends with today's terminal failure
+	// byte-for-byte (the re-run is never counted in attempts).
+	refuseAbsorb := func(p *flakeAbsorbPlan, iteration int, reason string) {
+		lastOutput = p.output
+		form = verifyFormFull
+		absorbRefusal = reason
+		res.Events = append(res.Events, logVerifyFlakeAbsorbRefused(logSink, *cfg, iteration, reason, parseVerifyFailures(p.output)))
+	}
+
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
+		// An admitted absorb (step 7) re-runs THIS iteration once, scoped.
+		// Every plumbing failure on it is a refusal, never a skip or a pass.
+		absorbing := absorbPending
+		absorbPending = nil
+		if absorbing != nil && flakeAbsorbBeforeRerunFn != nil {
+			flakeAbsorbBeforeRerunFn()
+		}
+
 		// (a) Stage scope-only and make a throwaway commit so the verify
 		// command sees the drift-excluded committed tree, not the working tree.
 		if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopeFiles); err != nil {
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = fmt.Errorf("verify-fix: stage scoped: %w", err)
 			break
 		}
 		committed, err := commitVerifyWIP(ctx, *cfg, repoDir)
 		if err != nil {
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = err
+			break
+		}
+		if !committed && absorbing != nil {
+			refuseAbsorb(absorbing, iter+1, absorbRefusedTreeChanged)
 			break
 		}
 		if !committed {
@@ -5787,6 +5898,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				fatalErr = rerr
 				break
 			}
+			if absorbing != nil {
+				refuseAbsorb(absorbing, iter+1, absorbRefusedRerunNotExecuted)
+				break
+			}
 			lastIterErr = err
 			break
 		}
@@ -5800,7 +5915,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// unresolvable tree leaves curTree empty, which disables detection —
 		// the pre-#4036 behaviour, never a failure.
 		curTree, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
-		if isNoopFixIteration(failedTree, curTree, fixedSinceVerify) {
+		if absorbing == nil && isNoopFixIteration(failedTree, curTree, fixedSinceVerify) {
 			given := parseVerifyFailures(failedOutput)
 			relation := verifyFailureScopeRelation(given, scopePkgs)
 			admitted := relation == verifyRelationOutside && !flakeRerunSpent
@@ -5820,16 +5935,43 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// an empty id leaves each payload byte-identical.
 		changeID := gitPatchIDForCommit(ctx, repoDir, headSHA)
 
-		// (c) Verify against the committed tree. With a scope set in force this
-		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
-		// the authority.
-		form = verifyFormName(scopePkgs)
-		res.Events = append(res.Events, hostProbe.sample(ctx)...)
-		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
-		res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
-		attempts++
-		lastOutput = out
-		logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+		// The absorb re-run must judge EXACTLY the tree whose full verify
+		// failed (#960: the verified tree is the observed one).
+		if absorbing != nil && (curTree == "" || curTree != absorbing.tree) {
+			if rerr := gitResetSoftHEAD1(ctx, repoDir); rerr != nil {
+				fatalErr = rerr
+				break
+			}
+			refuseAbsorb(absorbing, iter+1, absorbRefusedTreeChanged)
+			break
+		}
+
+		var (
+			ev      agent.Event
+			out     string
+			outcome string
+			disp    gateDisposition
+		)
+		decidingNonce = ""
+		if absorbing != nil {
+			// The absorb re-run (step 7): SCOPED to the outside packages
+			// only — no host-load sample, no (c2), not counted in attempts,
+			// and lastOutput/form keep the failed full verify's.
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, absorbing.dirs)
+			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+			logVerifyFormOutcome(logSink, *cfg, iter+1, verifyFormScoped, outcome)
+		} else {
+			// (c) Verify against the committed tree. With a scope set in force this
+			// is the SCOPED form — a fast pre-pass over the touched packages, NOT
+			// the authority.
+			form = verifyFormName(scopePkgs)
+			res.Events = append(res.Events, hostProbe.sample(ctx)...)
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+			res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
+			attempts++
+			lastOutput = out
+			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
+		}
 
 		// (c2) FULL re-verify on the passing iteration (#3315). A scoped pass
 		// proves only the named packages; a change can break a test in a package
@@ -5840,7 +5982,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// all deliberate:
 		//
 		//   - the #960 verified tree is captured only after the FULL form
-		//     passed, so the pushed tree is always the fully-verified one;
+		//     passed, so the pushed tree is the fully-verified one (except
+		//     step 7's outside-only absorb, #4229, whose tree passed one
+		//     scoped re-run of the untouched failing packages instead);
 		//   - a green-scoped / red-full pair is an ORDINARY iteration failure:
 		//     with budget remaining the agent is re-invoked with the FULL
 		//     output, without it the stage demotes exactly as before. The break
@@ -5853,13 +5997,23 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// failed would buy nothing. The empty-set case never enters here at all
 		// — the scoped call above WAS the full form, so re-running it would
 		// double every iteration's cost for no added coverage.
-		if len(scopePkgs) > 0 && outcome == "passed" {
+		//
+		// Each (c2) run carries a FRESH absorb nonce (#4229): scripts/test
+		// prints its attest only with it, and only this full form can decide
+		// an absorb at exhaustion. Any other verify leaves decidingNonce "".
+		if absorbing == nil && len(scopePkgs) > 0 && outcome == "passed" {
 			form = verifyFormFull
 			res.Events = append(res.Events, hostProbe.sample(ctx)...)
-			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+			nonce := newVerifyAbsorbNonce()
+			var nonceEnv []string
+			if nonce != "" {
+				nonceEnv = []string{verifyAbsorbNonceEnvVar + "=" + nonce}
+			}
+			fev, fout, foutcome, fdisp := runVerifyCommittedTreeEnv(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil, nonceEnv...)
 			res.Events = append(res.Events, stampVerifyRunChangeID(fev, changeID))
 			out, outcome, disp = fout, foutcome, fdisp
 			lastOutput = fout
+			decidingNonce = nonce
 			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
 		}
 
@@ -5892,6 +6046,29 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			fatalErr = fmt.Errorf("%w: committed-tree verify passed for %s but its verified tree could not be resolved: %v",
 				gitops.ErrPushedTreeNotVerified, headSHA, treeErr)
 			break
+		}
+
+		// The absorb re-run's result is settled HERE and only here (#4229),
+		// before the disposition / lock / infra / auto-format branches, so it
+		// can spend neither flakeRetried nor a lock re-run. Absorbed only on
+		// an exact "passed" from an executed gate.
+		if absorbing != nil {
+			if outcome == "passed" && disp == gateExecuted {
+				passed = true
+				absorbed = absorbing
+				res.Events = append(res.Events, logVerifyFlakeAbsorbed(logSink, *cfg, iter+1, *absorbing))
+				break
+			}
+			verifiedTreeSHA = ""
+			refuseAbsorb(absorbing, iter+1, absorbRerunRefusal(outcome, disp, out))
+			break
+		}
+
+		// Every failed verify of this pass, for the recurred refusal (#4229);
+		// the exhaustion decision below reads only the EARLIER ones.
+		priorFailures := failureHistory
+		if outcome == "failed" {
+			failureHistory = append(failureHistory, parseVerifyFailures(out))
 		}
 
 		if outcome != "failed" {
@@ -6115,7 +6292,26 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		}
 
 		if iter == cfg.verifyMaxIterations {
-			// Budget exhausted — terminal demotion, no re-invoke.
+			// Budget exhausted — terminal demotion, no re-invoke, unless the
+			// failure is an outside-only flake the absorb admits (step 7).
+			in := flakeAbsorbInput{
+				output: out, form: form, disp: disp, nonce: decidingNonce,
+				scopePkgs: scopePkgs, earlier: priorFailures, spent: flakeAbsorbSpent, tree: curTree,
+			}
+			if verifyFailureScopeRelation(parseVerifyFailures(out), scopePkgs) == verifyRelationOutside {
+				in.modules, in.modErr = workspaceModuleMap(ctx, repoDir, headSHA)
+			}
+			if plan, reason, candidate := decideFlakeAbsorb(in); candidate {
+				if reason != "" {
+					absorbRefusal = reason
+					res.Events = append(res.Events, logVerifyFlakeAbsorbRefused(logSink, *cfg, iter+1, reason, parseVerifyFailures(out)))
+					break
+				}
+				flakeAbsorbSpent = true
+				absorbPending = &plan
+				iter--
+				continue
+			}
 			break
 		}
 
@@ -6265,6 +6461,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		"iterations":     attempts,
 		"max_iterations": cfg.verifyMaxIterations,
 	}
+	if absorbRefusal != "" {
+		summary["absorb_refused"] = absorbRefusal
+	}
 	switch {
 	case fatalErr != nil:
 		summary["outcome"] = "failed"
@@ -6294,6 +6493,14 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			// review) says the earlier failure did not reproduce.
 			summary["detail"] = verifyFlakeRerunDetail(flakeFailures)
 			summary["flaky_tests"] = append([]string{}, flakeFailures.tests...)
+		}
+		if absorbed != nil {
+			// An absorbed outside-only flake (#4229): outcome=passed, but the
+			// detail says the tree did NOT pass the full test loop.
+			summary["detail"] = verifyFlakeAbsorbedDetail(*absorbed)
+			summary["absorbed_tests"] = nonNilStrings(absorbed.tests)
+			summary["absorbed_packages"] = nonNilStrings(absorbed.dirs)
+			summary["patch_coverage"] = absorbed.patchCoverage
 		}
 	}
 	res.Events = append(res.Events, agent.Event{
@@ -7131,7 +7338,9 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 //
 // The scoped form is NOT authoritative: runVerifyFixLoop re-verifies the same
 // committed SHA with the FULL form before reporting success, and it is that
-// full run's tree that supplies the #960 pre-push verified tree.
+// full run's tree that supplies the #960 pre-push verified tree — except for
+// an outside-only flake absorbed at exhaustion (#4229), whose verified tree
+// is the failed full run's tree after one passing scoped re-run.
 //
 // The FOURTH value is the gate disposition (#3448) — the out-of-band channel
 // the two classifying gate sites read instead of matching a literal in the
@@ -7151,7 +7360,20 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // precise site without breaking the rest of the push path.
 var materializeGateCheckoutFn = materializeGateCheckout
 
+// flakeAbsorbBeforeRerunFn is runVerifyFixLoop's absorb test seam (#4229): nil
+// in production; a test sets it to run at the top of the absorb iteration,
+// before the re-stage and re-commit (e.g. to change the tree under it).
+var flakeAbsorbBeforeRerunFn func()
+
 func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
+	return runVerifyCommittedTreeEnv(ctx, verifyCmd, repoDir, headSHA, timeout, scopePkgs)
+}
+
+// runVerifyCommittedTreeEnv is runVerifyCommittedTree plus extra runner-chosen
+// "KEY=VALUE" entries appended after the scope and lock entries (#4229: the
+// absorb nonce on the deciding full-form verify). runVerifyCommittedTree
+// delegates here with none, so every existing caller is unchanged.
+func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string, extra ...string) (agent.Event, string, string, gateDisposition) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
 	// here only degrades the audit stamp, never the invariant.
@@ -7183,6 +7405,7 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	if gateIsolation.selection(ctx).Path != gateiso.PathContainer {
 		extraEnv = verifyLockPathEnv(extraEnv, repoDir)
 	}
+	extraEnv = append(extraEnv, extra...)
 
 	start := time.Now()
 	// withDecidingGate marks this as a VERIFY gate: its outcome decides the

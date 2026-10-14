@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -69,6 +70,9 @@ type ContainerSpec struct {
 	UID int
 	GID int
 	// Env is the in-container environment (ContainerEnv), passed via -e.
+	// BuildArgv composes the /work safe.directory pin (#4390) onto it, after
+	// any GIT_CONFIG_* pairs already present, and refuses a malformed or
+	// incomplete GIT_CONFIG_COUNT/KEY_n/VALUE_n set (ErrContainerSpec).
 	Env []string
 	// Argv is the gate command executed after `--entrypoint ''` resets the
 	// image's ENTRYPOINT.
@@ -353,7 +357,9 @@ func (r Runtime) BindEndpointEnv(base []string, dockerConfigDir string) ([]strin
 //	  ( -v gocache:/gocache -v gomodcache:/gomodcache -v lintcache:/lintcache
 //	  | -v gomodcache:/gomodcache -v <cache-volume>:/gatecache )
 //	  [-v passwdfile:/etc/passwd:ro]
-//	  [-v <service-volume>:<target>:ro…] -e K=V… --entrypoint '' <image> <argv…>
+//	  [-v <service-volume>:<target>:ro…] -e K=V…
+//	  -e GIT_CONFIG_COUNT=<n+1> -e GIT_CONFIG_KEY_<n>=safe.directory
+//	  -e GIT_CONFIG_VALUE_<n>=/work --entrypoint '' <image> <argv…>
 //
 // The first alternative is the bind form (CacheVolume empty); the second the
 // volume form, whose cache mount is read-write.
@@ -401,6 +407,10 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 			return nil, err
 		}
 	}
+	env, err := withGitSafeDirectory(s.Env, MountWork)
+	if err != nil {
+		return nil, err
+	}
 	argv := append([]string{bin}, endpoint...)
 	argv = append(argv, "run", "--rm", "--name", s.Name,
 		"--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
@@ -427,7 +437,7 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 	for _, m := range s.ServiceMounts {
 		argv = append(argv, "-v", m.Volume+":"+m.Target+":ro")
 	}
-	for _, kv := range s.Env {
+	for _, kv := range env {
 		argv = append(argv, "-e", kv)
 	}
 	argv = append(argv, "--entrypoint", "", s.Image)
@@ -579,6 +589,62 @@ func WithServiceEnv(env, serviceEnv []string) []string {
 		out = dropThenAppend(out, kv)
 	}
 	return out
+}
+
+// gitEnvValue returns the value of the LAST key= entry in env (the runtime CLI
+// gives the last -e for a key precedence). An entry with an empty value counts
+// as present: git accepts an empty GIT_CONFIG_VALUE_n.
+func gitEnvValue(env []string, key string) (string, bool) {
+	var val string
+	var found bool
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			val, found = v, true
+		}
+	}
+	return val, found
+}
+
+// withGitSafeDirectory returns env with dir declared a git safe.directory
+// through command-scope config: GIT_CONFIG_COUNT is raised by one and the new
+// GIT_CONFIG_KEY_n=safe.directory / GIT_CONFIG_VALUE_n=dir pair is appended
+// after the pairs already present, never over them. It never mutates env.
+//
+// Docker Desktop 4.95 presents a bind-mount root as uid 0, so git refuses /work
+// as "detected dubious ownership" for the non-root gate user and Go VCS
+// stamping fails every typecheck (#4390). Command scope is protected
+// configuration (git-config(1) SCOPES), the only scope safe.directory honours
+// besides the system and global files, so the pin survives the
+// GIT_CONFIG_GLOBAL/SYSTEM=/dev/null pins (#3102). The exact dir value is
+// deliberately narrower than scripts/test --in-gate-image's `*`.
+// -buildvcs=false is rejected: it would silently degrade scripts/test's
+// git-dependent legs.
+//
+// An existing GIT_CONFIG_COUNT that is not a decimal count of the
+// GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n pairs present is refused
+// (ErrContainerSpec) rather than repaired. A stale pair at index n or beyond is
+// overwritten, so the safe.directory entry always wins its own index.
+func withGitSafeDirectory(env []string, dir string) ([]string, error) {
+	n := 0
+	if v, ok := gitEnvValue(env, "GIT_CONFIG_COUNT"); ok {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || v == "" || strings.Trim(v, "0123456789") != "" || parsed > len(env) {
+			return nil, fmt.Errorf("%w: GIT_CONFIG_COUNT=%q is not a decimal count of the GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n pairs present", ErrContainerSpec, v)
+		}
+		n = parsed
+	}
+	for i := 0; i < n; i++ {
+		for _, prefix := range []string{"GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"} {
+			if _, ok := gitEnvValue(env, prefix+strconv.Itoa(i)); !ok {
+				return nil, fmt.Errorf("%w: GIT_CONFIG_COUNT=%d but %s%d is unset", ErrContainerSpec, n, prefix, i)
+			}
+		}
+	}
+	out := append([]string(nil), env...)
+	out = dropThenAppend(out, "GIT_CONFIG_COUNT="+strconv.Itoa(n+1))
+	out = dropThenAppend(out, "GIT_CONFIG_KEY_"+strconv.Itoa(n)+"=safe.directory")
+	out = dropThenAppend(out, "GIT_CONFIG_VALUE_"+strconv.Itoa(n)+"="+dir)
+	return out, nil
 }
 
 func dropThenAppend(env []string, kv string) []string {

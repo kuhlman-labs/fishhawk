@@ -401,6 +401,36 @@ type GateEvidence struct {
 	// that executed no counterfactual. The json tag MUST stay identical to the
 	// runner's composer.
 	CounterfactualObservations []CounterfactualObservationEvidence `json:"counterfactual_observations,omitempty"`
+	// FlakeAbsorbed records an outside-only verify flake the runner absorbed
+	// at the verify-fix loop's terminal failure (#4229): the tree passed one
+	// scoped re-run of the untouched failing packages, not the full test
+	// loop. Nil (the byte-identical default) on an older bundle or when
+	// nothing was absorbed; an older fishhawkd ignores the member. It feeds
+	// the stage-scoped verify_flake_absorbed audit row. The json tag MUST
+	// stay identical to the runner's composer.
+	FlakeAbsorbed *FlakeAbsorbedEvidence `json:"flake_absorbed,omitempty"`
+}
+
+// FlakeAbsorbedEvidence is the flat record of one absorbed outside-only verify
+// flake (#4229): Iteration is the verify-fix iteration that absorbed it;
+// TreeSHA the verified tree (its full verify failed, its scoped re-run
+// passed); Packages the failing import paths and PackageDirs their
+// repo-relative dirs; Tests the failing test names; FailedModules the modules
+// scripts/test attested as failed; PatchCoverage the attested patch-coverage
+// verdict. Every string is pre-redacted by the runner.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's flakeAbsorbedEvidence
+// (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
+// backend/internal/wirecontract and pinned from both modules by
+// testdata/wire/verify_flake_absorbed_evidence.json.
+type FlakeAbsorbedEvidence struct {
+	Iteration     int      `json:"iteration"`
+	TreeSHA       string   `json:"tree_sha"`
+	Packages      []string `json:"packages"`
+	PackageDirs   []string `json:"package_dirs"`
+	Tests         []string `json:"tests"`
+	FailedModules []string `json:"failed_modules"`
+	PatchCoverage string   `json:"patch_coverage"`
 }
 
 // CounterfactualObservationEvidence is the flat record of one executed

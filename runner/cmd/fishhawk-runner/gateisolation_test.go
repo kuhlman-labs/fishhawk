@@ -671,6 +671,96 @@ func TestRunGateInContainer_ArgvAndTimeoutKill(t *testing.T) {
 	}
 }
 
+// TestRunGateInContainer_GitSafeDirectoryPinned (#4390): the checkout mounted
+// at /work is declared a git safe.directory through command-scope config on
+// every container exec (runner extraEnv → gateiso.ContainerEnv → BuildArgv →
+// the exec-seam argv), composed after any GIT_CONFIG pairs the caller already
+// set; a malformed GIT_CONFIG_COUNT is refused as gateUnavailable and the
+// runtime CLI is never reached. Deleting the withGitSafeDirectory call in
+// BuildArgv turns all three subtests red.
+func TestRunGateInContainer_GitSafeDirectoryPinned(t *testing.T) {
+	run := func(t *testing.T, fail bool, extra ...string) (*[][]string, string, int, gateDisposition, string) {
+		t.Helper()
+		dir := t.TempDir()
+		installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+		calls := captureHostExec(t, fail, 0)
+		scriptAuxExec(t, nil)
+		out, code, disp := runBoundedGateArgvDisposed(context.Background(), []string{"sh", "-c", "true"}, dir,
+			filepath.Join(t.TempDir(), "lc"), time.Minute, extra...)
+		return calls, out, code, disp, dir
+	}
+	wantEnv := func(t *testing.T, argv []string, want map[string]string) {
+		t.Helper()
+		for key, wantVal := range want {
+			if got, ok := lastEnvValue(argv, key); !ok || got != wantVal {
+				t.Errorf("%s = %q (present %v), want %q: %q", key, got, ok, wantVal, argv)
+			}
+		}
+		// The pin renders before --entrypoint, with each key exactly once.
+		entry := -1
+		for i, a := range argv {
+			if a == "--entrypoint" {
+				entry = i
+			}
+		}
+		for key := range want {
+			n := 0
+			for i := 0; i+1 < entry; i++ {
+				if argv[i] == "-e" && strings.HasPrefix(argv[i+1], key+"=") {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s rendered %d times before --entrypoint, want 1: %q", key, n, argv)
+			}
+		}
+	}
+
+	t.Run("default", func(t *testing.T) {
+		calls, _, code, disp, dir := run(t, false)
+		if code != 0 || disp != gateExecuted || len(*calls) != 1 {
+			t.Fatalf("(code, disp, calls) = (%d, %s, %d), want one executed run", code, disp, len(*calls))
+		}
+		argv := (*calls)[0]
+		wantEnv(t, argv, map[string]string{
+			"GIT_CONFIG_COUNT":   "1",
+			"GIT_CONFIG_KEY_0":   "safe.directory",
+			"GIT_CONFIG_VALUE_0": gateiso.MountWork,
+		})
+		// The pinned value names the directory the checkout is mounted at.
+		if !argvHasPair(argv, "-v", dir+":"+gateiso.MountWork) {
+			t.Errorf("checkout not mounted at %s: %q", gateiso.MountWork, argv)
+		}
+	})
+
+	t.Run("composes", func(t *testing.T) {
+		calls, _, code, disp, _ := run(t, false, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.abbrev", "GIT_CONFIG_VALUE_0=12")
+		if code != 0 || disp != gateExecuted || len(*calls) != 1 {
+			t.Fatalf("(code, disp, calls) = (%d, %s, %d), want one executed run", code, disp, len(*calls))
+		}
+		wantEnv(t, (*calls)[0], map[string]string{
+			"GIT_CONFIG_COUNT":   "2",
+			"GIT_CONFIG_KEY_0":   "core.abbrev",
+			"GIT_CONFIG_VALUE_0": "12",
+			"GIT_CONFIG_KEY_1":   "safe.directory",
+			"GIT_CONFIG_VALUE_1": gateiso.MountWork,
+		})
+	})
+
+	t.Run("malformed count refused", func(t *testing.T) {
+		calls, out, code, disp, _ := run(t, true, "GIT_CONFIG_COUNT=bogus")
+		if code != -1 || disp != gateUnavailable {
+			t.Fatalf("(code, disp) = (%d, %s), want (-1, unavailable)", code, disp)
+		}
+		if !strings.HasPrefix(out, "gate container: ") || !strings.Contains(out, "GIT_CONFIG_COUNT") {
+			t.Errorf("output = %q, want a `gate container: ` lead naming GIT_CONFIG_COUNT", out)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("runtime CLI reached with %q", *calls)
+		}
+	})
+}
+
 // TestRunGateInContainer_TimedOutSeamIsTimedOutDisposition (#3383): when the
 // host-exec seam reports the runner's own deadline expired, the container
 // path maps it to gateTimedOut (never gateExecuted) AND still issues the

@@ -463,6 +463,12 @@ var verifyEnvAllowPrefix = []string{"CGO_", "LC_"}
 // marker can never reach a verify child, where scripts/test-is-run-agent would
 // read it once scripts/is-run-agent consults the marker (#3947).
 // TestVerifyEnvDenied_RunAgentMarker pins it BY NAME on this side.
+//
+// FISHHAWK_VERIFY_ABSORB_NONCE gates scripts/test's flake-absorption attest
+// (#4229; the runner copy spells it verifyAbsorbNonceEnvVar). Only the runner
+// injects it, on its deciding full-form verify; the entry keeps an ambient
+// value out of every verify child. TestVerifyEnvDenied_AbsorbNonce pins it BY
+// NAME on this side.
 var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN":      {},
 	"FISHHAWK_GITLAB_TOKEN":      {},
@@ -475,6 +481,8 @@ var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_VERIFY_LOCK_OWNER": {},
 	"FISHHAWK_VERIFY_LOCK_PATH":  {},
 	"FISHHAWK_RUN_AGENT":         {},
+
+	"FISHHAWK_VERIFY_ABSORB_NONCE": {},
 }
 
 // verifyEnvDenyPrefix lists key prefixes dropped unconditionally — the

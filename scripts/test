@@ -58,6 +58,33 @@
 # covered here — they have their own conventions per docs/.
 set -euo pipefail
 
+# Verify flake-absorption attest nonce (#4229). The runner sets a fresh 128-bit
+# FISHHAWK_VERIFY_ABSORB_NONCE on each full-form verify; a FAILED patch-coverage
+# loop then prints one `fishhawk-verify-absorb-attest <nonce> ...` line
+# (_emit_absorb_attest) and the runner trusts only a line carrying ITS nonce. It
+# is captured into a shell-local and UNSET here, before anything else runs (the
+# `dirname` below is already a child), so no child — lint, the gate harnesses, a
+# go test binary — can read it and print a forged attest. The pre-unset of the
+# local name drops an AMBIENT exported VERIFY_ABSORB_NONCE: assigning to an
+# already-exported name keeps the export attribute and would hand the nonce to
+# every child. A value that is not exactly 32 lowercase hex characters is
+# discarded with a one-line note, so no attest is printed. Long form:
+# scripts/README.md § "Flake-absorption attest".
+unset VERIFY_ABSORB_NONCE
+VERIFY_ABSORB_NONCE="${FISHHAWK_VERIFY_ABSORB_NONCE:-}"
+unset FISHHAWK_VERIFY_ABSORB_NONCE
+if [ -n "$VERIFY_ABSORB_NONCE" ]; then
+  case "$VERIFY_ABSORB_NONCE" in
+    *[!0123456789abcdef]*) VERIFY_ABSORB_NONCE="" ;;
+  esac
+  if [ "${#VERIFY_ABSORB_NONCE}" -ne 32 ]; then
+    VERIFY_ABSORB_NONCE=""
+  fi
+  if [ -z "$VERIFY_ABSORB_NONCE" ]; then
+    echo "scripts/test: ignoring FISHHAWK_VERIFY_ABSORB_NONCE (not 32 lowercase hex characters) — no absorb attest will be printed" >&2
+  fi
+fi
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -896,7 +923,8 @@ cmd_test_scoped() {
 # `cmd_test` and the verify loops aggregate the same way since #4036 (the
 # runner's fix loop needs every module's failures in ONE iteration; a passing
 # run costs the same, a failing one also runs the remaining modules). Only this
-# loop CLASSIFIES each failure as BUILD vs TESTS.
+# loop CLASSIFIES each failure as BUILD vs TESTS, apart from the verify loop's
+# nonce-mode absorb attest (#4229, _absorb_classify_log).
 cmd_coverage() {
   local mlist m classify=0 idx=0 cov_rc=0
   # Fail CLOSED on an unavailable or empty module list, exactly as cmd_test does.
@@ -1272,8 +1300,10 @@ _patch_cov_emit_snapshot() {
 #
 # Like cmd_test, every module runs even when an earlier one fails (#4036), and a
 # failed loop prints the module summary and EXITS 1 here — BEFORE
-# _verify_patch_coverage. The verdict is already red, a failed module's profile
-# is partial, and the summary stays the last thing a reader sees.
+# _verify_patch_coverage. The verdict is already red and the summary stays the
+# last thing a reader sees. The one exception is nonce mode (#4229, below): the
+# absorb attest computes the patch-coverage verdict from the failed run's
+# surviving profiles and prints it on one line just before the summary.
 cmd_test_with_patch_coverage() {
   local mods="$1" base="$2" mlist
   # Re-enumerate defensively: bucketing enumerated the modules earlier, but if
@@ -1315,8 +1345,22 @@ cmd_test_with_patch_coverage() {
   # only as a human-readable SUFFIX for provenance, where a collision is
   # harmless. `(( ++cov_idx ))` is pre-increment: post-increment returns the old
   # value, and `(( 0 ))` is false, which aborts under `set -e`.
-  local m mm pp pkgs slug cov_idx=0 ran=0
-  local failed=()
+  #
+  # NONCE MODE (#4229): only when the runner handed a valid absorb nonce, each
+  # module's output is ALSO tee'd (stderr folded, as cmd_coverage does) to a
+  # per-ordinal log so a failed module can be classified, and a failed loop
+  # prints the absorb attest before the summary. `failed_logs` runs parallel to
+  # `failed`; `expected_profiles` names the profile every instrumented module
+  # SHOULD have written. Without a nonce the loop runs exactly as before.
+  local m mm pp pkgs slug log cov_idx=0 ran=0 tee_logs=0
+  local failed=() failed_logs=() expected_profiles=()
+  if [ -n "$VERIFY_ABSORB_NONCE" ]; then
+    if _covlog_mktemp; then
+      tee_logs=1
+    else
+      echo "scripts/test: could not create the per-module log dir — the absorb attest will report failed modules unclassified" >&2
+    fi
+  fi
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     ran=$((ran + 1))
@@ -1324,23 +1368,202 @@ cmd_test_with_patch_coverage() {
     while IFS=$'\t' read -r mm pp; do
       if [ "${mm#./}" = "${m#./}" ]; then pkgs="$pp"; fi
     done <<< "$mods"
+    log=""
+    if [ "$tee_logs" = "1" ]; then log="$COVLOG_DIR/$ran.log"; fi
     if [ -n "$pkgs" ]; then
       (( ++cov_idx ))
       slug="$(printf '%s' "${m#./}" | tr '/' '_')"
-      if ! (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
+      expected_profiles+=("$PATCHCOV_DIR/$cov_idx-$slug.out")
+      if [ -n "$log" ]; then
+        # `pipefail` keeps go test's status (tee exits 0).
+        if ! (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
+          -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...) 2>&1 | tee "$log"; then
+          failed+=("$m"); failed_logs+=("$log")
+        fi
+      elif ! (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -covermode=atomic \
         -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...); then
-        failed+=("$m")
+        failed+=("$m"); failed_logs+=("")
       fi
     else
-      if ! (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT"); then
-        failed+=("$m")
+      if [ -n "$log" ]; then
+        if ! (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT") 2>&1 | tee "$log"; then
+          failed+=("$m"); failed_logs+=("$log")
+        fi
+      elif ! (cd "$m" && go test -race -p "$TEST_P" ./... -timeout "$TEST_TIMEOUT"); then
+        failed+=("$m"); failed_logs+=("")
       fi
     fi
   done <<< "$mlist"
   if [ "${#failed[@]}" -gt 0 ]; then
+    if [ -n "$VERIFY_ABSORB_NONCE" ]; then
+      _emit_absorb_attest "$base" "$mods"
+    fi
     _report_failed_modules "$ran" "${failed[@]}"
     exit 1
   fi
+}
+
+# --------------------------------------------------------------------------
+# Flake-absorption attest (#4229)
+#
+# On a FAILED patch-coverage loop in nonce mode, _emit_absorb_attest prints ONE
+# line on stderr, before the failed-module summary:
+#
+#   fishhawk-verify-absorb-attest <nonce> patch_coverage=<pass|fail|unavailable> failed_modules=<mod>:<tests|build|other|unclassified>,... changed_dirs=<dir>,...
+#
+# It is the trusted half of the runner's outside-only flake absorption: the
+# runner re-runs an untouched failing package once, scoped, ONLY when this line
+# (carrying its own nonce) says the change's lines pass patch coverage from the
+# failed run's own profiles, every failed module failed in TESTS, and no failing
+# package sits in changed_dirs. Every value below that cannot be decided renders
+# the fail-closed token (`unavailable` / `undecodable`), which the runner refuses.
+# It reads the CALLER's `failed`, `failed_logs` and `expected_profiles` arrays
+# (bash dynamic scope). Long form: scripts/README.md § "Flake-absorption attest".
+# --------------------------------------------------------------------------
+
+# _absorb_norm_dir <dir>: a module/package dir without a leading `./` or a
+# trailing `/` — the repo-relative form the runner maps import paths to.
+_absorb_norm_dir() {
+  local d="$1"
+  d="${d#./}"
+  d="${d%/}"
+  printf '%s' "$d"
+}
+
+# _absorb_attest_token_ok <token>: true when <token> can sit inside the attest's
+# space-separated fields, comma-joined lists and `mod:class` pairs. Whitespace,
+# control characters, `,`, `:` and `=` (and the empty token) cannot.
+_absorb_attest_token_ok() {
+  case "$1" in
+    ""|*[[:space:][:cntrl:],:=]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _absorb_classify_log <log>: one failed module's class, from its tee'd log.
+# File greps only — never a pipe into a quiet grep (#4233). `build`: go test's
+# own `[build failed]` / `[setup failed]` marker. `other`: no `FAIL<TAB>` package
+# line at all, i.e. a module-level error (go.mod, toolchain) where no package
+# ran. `tests`: otherwise. `unclassified`: no log (no nonce-mode log dir).
+_absorb_classify_log() {
+  local log="$1"
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    echo unclassified
+    return 0
+  fi
+  if grep -q -e '\[build failed\]' -e '\[setup failed\]' "$log" 2>/dev/null; then
+    echo build
+    return 0
+  fi
+  if ! grep -q $'^FAIL\t' "$log" 2>/dev/null; then
+    echo other
+    return 0
+  fi
+  echo tests
+}
+
+# _absorb_changed_dirs <mods>: the comma-joined repo-relative dirs of the changed
+# non-test packages, from _patch_cov_changed_modules' `<module>\t./pkg,...`
+# lines (approval condition C1: "outside" is decided from the DIFF). The
+# whole-module `./...` fallback (an undecodable changed path), any pattern that is
+# not `.` or `./<dir>`, a dir the encoding cannot carry, or an empty set renders
+# `undecodable`.
+_absorb_changed_dirs() {
+  local mods="$1" mm pp m p rest dir out="" bad=0
+  while IFS=$'\t' read -r mm pp; do
+    if [ -z "$mm" ] && [ -z "$pp" ]; then continue; fi
+    m="$(_absorb_norm_dir "$mm")"
+    rest="$pp,"
+    while [ -n "$rest" ]; do
+      p="${rest%%,*}"
+      rest="${rest#*,}"
+      case "$p" in
+        .) dir="$m" ;;
+        *...*) bad=1; continue ;;
+        ./*)
+          p="${p#./}"
+          if [ "$m" = "." ]; then dir="$p"; else dir="$m/$p"; fi
+          ;;
+        *) bad=1; continue ;;
+      esac
+      dir="$(_absorb_norm_dir "$dir")"
+      if ! _absorb_attest_token_ok "$dir"; then bad=1; continue; fi
+      if [ -z "$out" ]; then out="$dir"; else out="$out,$dir"; fi
+    done
+  done <<< "$mods"
+  if [ "$bad" = "1" ] || [ -z "$out" ]; then
+    echo undecodable
+  else
+    echo "$out"
+  fi
+}
+
+# _absorb_patch_coverage_verdict <base>: pass|fail|unavailable for the change's
+# lines, from the profiles the FAILED loop left behind. `unavailable` (fail
+# CLOSED) when no module was instrumented, or any expected profile is missing,
+# empty or lacks its `mode:` header — check-coverage.py's denominator rule would
+# otherwise silently drop that module's lines and report a pass. Otherwise the
+# exact _verify_patch_coverage computation (snapshot digest included) decides:
+# non-zero → `fail`. check-coverage.py exits 0 on its SKIPs too, so its stderr is
+# captured to a FILE and any `SKIP:` line other than the --diff-min-statements
+# floor renders `unavailable` (approval condition C2): "could not compute" must
+# never read as a pass. The capture files avoid the `.out` suffix the profile
+# glob consumes.
+_absorb_patch_coverage_verdict() {
+  local base="$1" p first line gout gerr skipped=0
+  if [ "${#expected_profiles[@]}" -eq 0 ]; then
+    echo unavailable
+    return 0
+  fi
+  for p in "${expected_profiles[@]}"; do
+    # One read covers missing, empty and header-less alike: each leaves
+    # `first` without the `mode:` prefix go test writes on line 1.
+    first=""
+    { IFS= read -r first < "$p"; } 2>/dev/null || true
+    case "$first" in
+      mode:*) ;;
+      *) echo unavailable; return 0 ;;
+    esac
+  done
+  gout="$PATCHCOV_DIR/absorb-gate-stdout.log"
+  gerr="$PATCHCOV_DIR/absorb-gate-stderr.log"
+  if ! _verify_patch_coverage "$base" >"$gout" 2>"$gerr"; then
+    echo fail
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "SKIP: only "*" new statements (< --diff-min-statements "*) ;;
+      SKIP:*) skipped=1 ;;
+    esac
+  done < "$gerr"
+  if [ "$skipped" = "1" ]; then
+    echo unavailable
+    return 0
+  fi
+  echo pass
+}
+
+# _emit_absorb_attest <base> <mods>: print the attest line (see above). Called
+# only on the failed-loop path with a nonce set.
+_emit_absorb_attest() {
+  local base="$1" mods="$2" i=0 m class fm="" fm_bad=0 verdict dirs
+  if [ "${#failed[@]}" -eq 0 ]; then fm_bad=1; fi
+  while [ "$i" -lt "${#failed[@]}" ]; do
+    m="$(_absorb_norm_dir "${failed[$i]}")"
+    class="$(_absorb_classify_log "${failed_logs[$i]:-}")"
+    (( ++i ))
+    if ! _absorb_attest_token_ok "$m"; then
+      fm_bad=1
+      continue
+    fi
+    if [ -z "$fm" ]; then fm="$m:$class"; else fm="$fm,$m:$class"; fi
+  done
+  if [ "$fm_bad" = "1" ]; then fm="undecodable"; fi
+  dirs="$(_absorb_changed_dirs "$mods")"
+  verdict="$(_absorb_patch_coverage_verdict "$base")"
+  printf 'fishhawk-verify-absorb-attest %s patch_coverage=%s failed_modules=%s changed_dirs=%s\n' \
+    "$VERIFY_ABSORB_NONCE" "$verdict" "$fm" "$dirs" >&2
 }
 
 # _verify_patch_coverage: run the diff-scoped gate over the profiles the loop

@@ -103,11 +103,30 @@
     "rather than 413",
     "contrary to the issue",
     "at odds with the issue",
-    "at odds with the 10"
+    "at odds with the 10",
+    "requires the opposite",
+    "says the opposite",
+    "yet contradicts",
+    "yet conflicts",
+    "but contradicts",
+    "directly contradicts",
+    "contradicts both the issue",
+    "conflicts directly with",
+    "contradicts the originating issue",
+    "contradicts that issue",
+    "contradict the issue",
+    "conflict with the issue",
+    "nothing in the issue permits",
+    "contradict the stated requirement"
   ],
   "attribution_phrases": [
     "20 mb",
     "20 mb pdf"
+  ],
+  "defect_phrases": [
+    "20 mb pdf",
+    "10 mb",
+    "payload too large"
   ],
   "catching_examples": [
     {
@@ -124,6 +143,11 @@
       "severity": "high",
       "category": "acceptance_criteria",
       "note": "The criterion accepting a 20 MB PDF is at odds with the issue's 10 MB limit; flip it to expect 413."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "Criterion ac-upload-large-accepted requires a 20 MB PDF upload to return HTTP 201. The issue (example-org/widgets-service#107) says uploads are capped at 10 MB and anything larger is rejected with 413 and nothing stored, so the criterion directly contradicts it. Because it is blocking, an implementation faithful to the issue would fail it. The criterion would need to be removed or changed to a size at or under 10 MB. If a higher limit is really wanted, the issue's cap needs a documented change first."
     }
   ],
   "non_catching_examples": [
@@ -160,6 +184,11 @@
     {
       "category": "coverage",
       "note": "The 20 MB PDF fixture is unjustified bloat at odds with the repo's binary-fixture limit; the issue says nothing about fixtures, so generate it at run time."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "No criterion or test checks the boundary the issue names: exactly 10 MB accepted and just over 10 MB rejected with 413. The 1 MB, 20 MB and 30 MB cases leave the actual cap unconstrained. Add boundary criteria and matching handler tests in attachments_test.go. The oversize test should also assert that no blob and no widget_attachments row exist after the 413, since 'stores nothing' is part of the requirement and relies on how MaxBytesReader interacts with multipart parsing."
     }
   ]
 }

@@ -86,11 +86,17 @@
     "criterion restates",
     "restates the implementation",
     "instead of an observable",
-    "instead of the observable"
+    "instead of the observable",
+    "restatement of approach",
+    "restatement of the approach"
   ],
   "attribution_phrases": [
     "has an ArchivedAt field",
     "was written"
+  ],
+  "defect_phrases": [
+    "archivedat field",
+    "widgetresponse"
   ],
   "catching_examples": [
     {
@@ -102,6 +108,11 @@
       "severity": "medium",
       "category": "independence",
       "note": "One criterion restates the approach (the step-2 struct field was written); it should assert the response the issue asks for."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-step-two-done is a restatement of approach step 2 (\"widgetResponse has an ArchivedAt field\"), not an observable outcome. It also passes if the field exists but is never populated or serialized. Its rationale (\"Step 2 is the load-bearing change\") is not drawn from the issue. It should be replaced by, or reworded into, a behavioral criterion, for example that GET /widgets/{id} for an archived widget returns a non-null RFC 3339 archived_at. It should not stay as a blocking criterion."
     }
   ],
   "non_catching_examples": [
