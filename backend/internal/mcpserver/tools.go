@@ -101,6 +101,16 @@ type runResolver struct {
 	// branch in the package. The name keeps its drive_ prefix deliberately — a
 	// rename would churn drive_run.go and its tests for no behavioural gain.
 	driveProbeRunnerLiveness func(ctx context.Context, stageID string) runnerLivenessVerdict
+
+	// specialistJobSpawn is the injectable detached-spawn seam for
+	// fishhawk_request_specialist_job (E85.9 / #4300). Nil uses the real
+	// spawnSpecialistJobDetached; tests inject a recorder.
+	specialistJobSpawn specialistJobSpawnFunc
+
+	// specialistJobPollInterval is fishhawk_get_specialist_job's poll
+	// cadence. Zero falls back to defaultSpecialistJobPollInterval; tests
+	// inject a sub-millisecond value.
+	specialistJobPollInterval time.Duration
 }
 
 // resolveWorkingDir is the single shared working_dir resolver every
@@ -373,6 +383,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerHandoverBrief(srv, resolver)
 	registerDelegationConfirm(srv, resolver)
 	registerListSchedules(srv, resolver)
+	// E85.9 / #4300 (ADR-097 D2/D6): the specialist-job request (with its
+	// detached runner spawn) and its read/wait, adjacent on purpose.
+	registerRequestSpecialistJob(srv, resolver)
+	registerGetSpecialistJob(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All

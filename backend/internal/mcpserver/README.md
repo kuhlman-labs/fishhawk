@@ -52,10 +52,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 371 identifiers, not 3
+## Exported surface: why 381 identifiers, not 3
 
-The package presents **371** exported top-level identifiers, but only the three
-above are intended entry points. The other 368 are the tool I/O
+The package presents **381** exported top-level identifiers, but only the three
+above are intended entry points. The other 378 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -1564,6 +1564,20 @@ Returns the recorded declaration (`run_id`, `vouched_sha`, `reason`) on success,
 - **Audit.** One `ci_retriggered` entry (internal; payload `pr_url`, `head_sha`, `rerun` ids, `skipped`, `failed`) when at least one re-run was accepted; none when nothing was eligible or every re-run failed.
 
 Returns `run_id`, `pr_url`, `head_sha` and the `rerun` / `skipped` / `failed` lists (always present, never null). Its I/O types are UNEXPORTED (the `fishhawk_delegation_confirm` precedent), so it adds nothing to the pinned export surface.
+
+## Specialist jobs (`fishhawk_request_specialist_job` + `fishhawk_get_specialist_job`, [E85.9 / #4300](https://github.com/kuhlman-labs/fishhawk/issues/4300))
+
+`specialist_job.go` wraps the ADR-097 D2/D6 `/v0/specialist-jobs` surface (store, admission, HTTP and audit contract: `backend/internal/specialistjob/README.md`; field reference: `docs/spec/specialist-job-v1.md`; runner subcommand: `runner/README.md` § "Specialist jobs").
+
+- **`fishhawk_request_specialist_job`** POSTs `/v0/specialist-jobs` with `{schema_version: specialist-job-v1, kind, subject, inputs}` and NO requester member (the server derives the requester from the bearer; the closed request schema refuses one). Scope row: `write:stages` (`server/mcpscopes.go`); the handler also refuses a run-bound token (`specialist_job_requester_not_a_seat`).
+  - **Pre-POST refusals (approval condition C6).** `working_dir` is confined (`confinePath`, then the transport-conditional `resolveWorkingDir`) and the runner binary resolved (`resolveRunnerBinary`) BEFORE the POST, so a refusal creates no job row. Pinned by `TestRequestSpecialistJob_RefusalLeavesNoOrphanJob` (outside root with and without spawn, omitted over HTTP, unresolvable binary — each asserts zero POSTs and zero spawns).
+  - **`draft`** is rendered server-side and answers already `completed`: no spawn, and neither a `working_dir` nor a runner binary is required (`TestRequestSpecialistJob_DraftNeverSpawns` runs it with the runner unresolvable).
+  - **Every other kind** answers `queued`. With `spawn` true (the default) the tool spawns `fishhawk-runner specialist-job --job-id <id> --backend-url <url> --working-dir <abs> --host <label>` DETACHED (`spawnSpecialistJobDetached`): its own process group (`runStageSetProcessGroup`), output to an owner-only `fishhawk-specialist-job-<id>-<ns>.log` under `os.TempDir()`, a reaper goroutine, `FISHHAWK_API_TOKEN` in env. `--host` is this process's host label (`processHostLabel`), or `unknown` when it has none — the label the server substitutes for an empty host, so the job contends in the same `local-verify:<host>` group as this host's verify stages. Unlike `spawnRunnerStageDetached` it uses no run/stage registry and reports no failure: a job has no stage, and a dead runner shows as `stale` on the read.
+  - **A spawn failure after the POST is a warning, not an error**: the job row already exists, so the result keeps the handle and names the command to run (`TestRequestSpecialistJob_SpawnFailureReportedNotReturned`). `spawn: false` creates the job queued and names the same command.
+  - Returns `job`, `spawned`, `log_path` and a `next_step` naming `fishhawk_get_specialist_job` with `wait_seconds: 300` (absent for a completed draft).
+- **`fishhawk_get_specialist_job`** reads `GET /v0/specialist-jobs/{job_id}` (scope row: `read:runs`, the handler's own scope). `wait_seconds` (0..300, refused outside) re-reads every 2s until the job is `completed`, the server marks it `stale` (a queued runner stopped polling, or a running runner stopped heartbeating), or the wait elapses (`timed_out`, with a `next_step` to wait again). A stale job ends the wait at once. It writes nothing.
+- **Mirrors.** `SpecialistJob` / `SpecialistJobRequester` / `SpecialistJobSubject` (`client.go`) mirror the server's `specialistJobResponse`; `inputs` and `result` are `map[string]any` (objects on the wire; the #371 trap). The job read never carries the execution nonce. `TestSpecialistJobTools_EndToEndThroughRealServer` calls both tools through the SDK (output-schema validation) against the real handlers over pgtest.
+- **Provenance.** A result is `bearer`-provenance evidence (the runner ships it under the operator bearer), not a runner-signed gate verdict; it is not ADR-089 D4 blocking-grade until #4363.
 
 ## Run-branch base advance (`fishhawk_rebase_run_branch`)
 

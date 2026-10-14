@@ -142,6 +142,7 @@ The `go work edit -json <abs go.work>` call is pinned twice: the explicit file a
 | `backend/internal/plan/schemas/**` | sync-schemas mirror |
 | `backend/internal/spec/schemas/**` | sync-schemas mirror |
 | `backend/internal/crewmessage/schemas/**` | sync-schemas mirror |
+| `backend/internal/specialistjob/schemas/**` | sync-schemas mirror |
 | `backend/internal/operatorrole/schemas/**` | sync-schemas mirror |
 | `backend/internal/workmgmt/schemas/**` | sync-schemas mirror |
 | `backend/internal/operatorrole/defaults/**` | sync-schemas mirror |

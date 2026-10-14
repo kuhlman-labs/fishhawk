@@ -27,6 +27,17 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       # backend/internal/server sweep registries in the same change.
       cp "$schema" "$REPO_ROOT/backend/internal/crewmessage/schemas/$base"
       ;;
+    specialist-job-*.schema.json)
+      # The ADR-097 D2 (#4300) specialist-job contract is BACKEND-OWNED and
+      # gets exactly ONE mirror: fishhawkd validates the request and the
+      # runner's completion against it (backend/internal/specialistjob). The
+      # runner WRITES a completion but does not embed the schema -- its typed
+      # structs are pinned to the backend's by the wirecontract manifest and
+      # the shared testdata/wire/specialist_job.json golden -- and the CLI has
+      # no validation path for it, so a second mirror would be dead weight
+      # the schema-sync gate then has to police (same split as crew-message).
+      cp "$schema" "$REPO_ROOT/backend/internal/specialistjob/schemas/$base"
+      ;;
     grooming-report-*.schema.json)
       # The plan-stage grooming_report SIBLING schema (#2235) is embedded
       # into the backend plan validator only: the runner WRITES the report

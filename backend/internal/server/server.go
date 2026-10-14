@@ -915,6 +915,13 @@ type Config struct {
 	// backend/internal/concurrency/README.md.
 	Concurrency concurrency.Store
 
+	// SpecialistJobs is the ADR-097 D2/D6 specialist-job store (E85.9 /
+	// #4300) behind the /v0/specialist-jobs routes. Wired from serve.go next
+	// to Concurrency (specialistjob.NewStore); nil answers every route 503
+	// specialist_jobs_unconfigured and changes no other surface. See
+	// specialist_job.go and backend/internal/specialistjob/README.md.
+	SpecialistJobs SpecialistJobStore
+
 	// MergeQueue is the ADR-092 held-pass queue (#4200): with it wired, a
 	// base_advance or conflict_resolution merge-candidate verify pass is
 	// serialized per (repository, base ref) — ONE live pass per base, the

@@ -4391,3 +4391,239 @@ func (c *Client) RunState(ctx context.Context, runID string) (string, error) {
 		return "", statusError("get run", resp)
 	}
 }
+
+// ---- Specialist jobs (ADR-097 D2/D6, E85.9 / #4300) ----
+//
+// The `fishhawk-runner specialist-job` subcommand's three backend calls. They
+// authenticate on the caller-supplied operator bearer (the token fishhawk-mcp
+// forwards as FISHHAWK_API_TOKEN), never a run-bound token or a signing key:
+// a specialist job is not a run stage. Fetch and admission ride the SHORT
+// (blip) retry budget; the completion is the job's settling upload and rides
+// the TERMINAL-EGRESS budget. The job-side transport allow-list (the runner's
+// specialistJobTransport) is what confines a job to exactly these routes.
+
+// Specialist-job refusals. Each is returned wrapped; assert with errors.Is.
+var (
+	// ErrSpecialistJobNotFound: 404 — no job with that id in the bearer's
+	// account.
+	ErrSpecialistJobNotFound = errors.New("upload: specialist job not found")
+	// ErrSpecialistJobConflict: 409 — specialist_job_not_admissible,
+	// specialist_job_already_running, specialist_job_not_running or
+	// specialist_job_nonce_mismatch; the wrapped message carries the code.
+	// A 409 specialist_job_not_running on a completion RETRY (after a
+	// transport error) is ambiguous — the first attempt may have landed — so
+	// the caller re-reads the job to tell the two apart.
+	ErrSpecialistJobConflict = errors.New("upload: specialist job conflict")
+	// ErrSpecialistJobRejected: a permanent 4xx (400 validation_failed, 401,
+	// 403, 413 request_too_large) — retrying the same bytes cannot succeed.
+	ErrSpecialistJobRejected = errors.New("upload: specialist job request rejected")
+)
+
+// SpecialistJobRequester is the server-derived requesting identity.
+type SpecialistJobRequester struct {
+	Seat      string `json:"seat"`
+	ActorKind string `json:"actor_kind"`
+	Subject   string `json:"subject"`
+}
+
+// SpecialistJobSubject is what a job is about.
+type SpecialistJobSubject struct {
+	RunID      string `json:"run_id,omitempty"`
+	CampaignID string `json:"campaign_id,omitempty"`
+	HeadSHA    string `json:"head_sha,omitempty"`
+	Repo       string `json:"repo,omitempty"`
+}
+
+// SpecialistJob is the job read shape. Inputs stays raw so each kind
+// executor owns its typed decode. It never carries the execution nonce: the
+// runner holds its own.
+//
+// CROSS-MODULE WIRE CONTRACT: decodes the backend's specialistJobResponse
+// (backend/internal/server/specialist_job.go); pinned by the
+// backend/internal/wirecontract manifest and testdata/wire/specialist_job.json.
+type SpecialistJob struct {
+	JobID             string                 `json:"job_id"`
+	Kind              string                 `json:"kind"`
+	State             string                 `json:"state"`
+	Requester         SpecialistJobRequester `json:"requester"`
+	Subject           SpecialistJobSubject   `json:"subject"`
+	Inputs            json.RawMessage        `json:"inputs"`
+	AdmissionGroup    string                 `json:"admission_group,omitempty"`
+	Host              string                 `json:"host,omitempty"`
+	Verdict           string                 `json:"verdict,omitempty"`
+	Result            json.RawMessage        `json:"result,omitempty"`
+	RequestedSequence int64                  `json:"requested_sequence"`
+	CompletedSequence *int64                 `json:"completed_sequence,omitempty"`
+	RequestedAt       time.Time              `json:"requested_at"`
+	LastSeenAt        time.Time              `json:"last_seen_at"`
+	StartedAt         *time.Time             `json:"started_at,omitempty"`
+	CompletedAt       *time.Time             `json:"completed_at,omitempty"`
+	Stale             bool                   `json:"stale"`
+}
+
+// SpecialistJobAdmissionRequest is the POST .../admission body. Re-POSTing
+// the same nonce while admitted is the heartbeat.
+//
+// CROSS-MODULE WIRE CONTRACT: decoded by the backend's
+// specialistJobAdmissionRequest (backend/internal/server/specialist_job.go).
+type SpecialistJobAdmissionRequest struct {
+	Host  string `json:"host"`
+	Nonce string `json:"nonce"`
+}
+
+// SpecialistJobAdmission is the POST .../admission answer.
+//
+// CROSS-MODULE WIRE CONTRACT: decodes the backend's
+// specialistJobAdmissionResponse (backend/internal/server/specialist_job.go).
+type SpecialistJobAdmission struct {
+	Admitted       bool          `json:"admitted"`
+	ExecutionNonce string        `json:"execution_nonce,omitempty"`
+	Position       int           `json:"position"`
+	Contended      bool          `json:"contended"`
+	TakenOver      bool          `json:"taken_over"`
+	Job            SpecialistJob `json:"job"`
+}
+
+// SpecialistJobCompletion is the POST .../result body. Evidence stays raw:
+// the kind executor marshals its typed evidence into it.
+//
+// CROSS-MODULE WIRE CONTRACT: decoded by the backend's specialistjob.Completion
+// (backend/internal/specialistjob/specialistjob.go); ModeExact in the
+// backend/internal/wirecontract manifest, bytes pinned by
+// testdata/wire/specialist_job.json.
+type SpecialistJobCompletion struct {
+	SchemaVersion  string          `json:"schema_version"`
+	ExecutionNonce string          `json:"execution_nonce"`
+	Kind           string          `json:"kind"`
+	Verdict        string          `json:"verdict"`
+	Reason         string          `json:"reason,omitempty"`
+	Evidence       json.RawMessage `json:"evidence,omitempty"`
+	DurationMS     int64           `json:"duration_ms"`
+}
+
+func (c *Client) specialistJobEndpoint(jobID, suffix string) string {
+	return c.BaseURL + "/v0/specialist-jobs/" + url.PathEscape(jobID) + suffix
+}
+
+// FetchSpecialistJob reads GET /v0/specialist-jobs/{job_id}.
+func (c *Client) FetchSpecialistJob(ctx context.Context, token, jobID string) (*SpecialistJob, error) {
+	var out SpecialistJob
+	if err := c.doSpecialistJob(ctx, "fetch specialist job", http.MethodGet,
+		c.specialistJobEndpoint(jobID, ""), token, jobID, nil, false, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// AdmitSpecialistJob POSTs .../admission: a fresh admission, a same-nonce
+// heartbeat, or a stale takeover. A queued answer (Admitted false) is not an
+// error.
+func (c *Client) AdmitSpecialistJob(ctx context.Context, token, jobID string, in SpecialistJobAdmissionRequest) (*SpecialistJobAdmission, error) {
+	raw, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("upload: marshal specialist-job admission: %w", err)
+	}
+	var out SpecialistJobAdmission
+	if err := c.doSpecialistJob(ctx, "admit specialist job", http.MethodPost,
+		c.specialistJobEndpoint(jobID, "/admission"), token, jobID, raw, false, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ShipSpecialistJobCompletion POSTs .../result on the terminal-egress budget
+// and returns the completed job.
+func (c *Client) ShipSpecialistJobCompletion(ctx context.Context, token, jobID string, completion SpecialistJobCompletion) (*SpecialistJob, error) {
+	raw, err := json.Marshal(completion)
+	if err != nil {
+		return nil, fmt.Errorf("upload: marshal specialist-job completion: %w", err)
+	}
+	var out SpecialistJob
+	if err := c.doSpecialistJob(ctx, "ship specialist-job completion", http.MethodPost,
+		c.specialistJobEndpoint(jobID, "/result"), token, jobID, raw, true, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// doSpecialistJob is the shared bearer-authenticated round trip: network
+// errors and 5xx retry (blip budget, or the terminal-egress budget when
+// terminal), 2xx decodes into out, 404/409 map to their sentinels and every
+// other status is permanent.
+func (c *Client) doSpecialistJob(ctx context.Context, op, method, endpoint, token, jobID string, body []byte, terminal bool, out any) error {
+	switch {
+	case token == "":
+		return fmt.Errorf("upload: %s: bearer token required", op)
+	case jobID == "":
+		return fmt.Errorf("upload: %s: job id required", op)
+	}
+	maxRetries, backoff := c.retryPolicy()
+	var backoffCap time.Duration
+	if terminal {
+		maxRetries, backoff, backoffCap = c.terminalRetryPolicy()
+		var cancel context.CancelFunc
+		ctx, cancel = c.settlingEgressContext(ctx)
+		defer cancel()
+	}
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("upload: %s: %w (last error: %v)", op, ctx.Err(), lastErr)
+			case <-time.After(backoff):
+			}
+			backoff = capBackoff(backoff, backoffCap)
+		}
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
+		if err != nil {
+			return fmt.Errorf("upload: build %s request: %w", op, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/json")
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: %s: %w", op, err)
+			continue
+		}
+		switch {
+		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+			err := json.NewDecoder(resp.Body).Decode(out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return fmt.Errorf("upload: decode %s response: %w", op, err)
+			}
+			if terminal {
+				c.endTerminalEgressPhase()
+			}
+			return nil
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return fmt.Errorf("%w: %s", ErrSpecialistJobNotFound, jobID)
+		case resp.StatusCode == http.StatusConflict:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			code, ok := errorEnvelopeCode(detail)
+			if !ok {
+				code = detail
+			}
+			return fmt.Errorf("%w: %s", ErrSpecialistJobConflict, code)
+		case resp.StatusCode >= 500:
+			lastErr = statusError(op, resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			err := statusError(op, resp)
+			_ = resp.Body.Close()
+			return fmt.Errorf("%w: %v", ErrSpecialistJobRejected, err)
+		}
+	}
+	return fmt.Errorf("upload: %s exhausted retries: %w", op, lastErr)
+}

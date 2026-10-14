@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 371 names are tool I/O request/response structs. The MCP
+// The bulk of these 381 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -214,6 +214,10 @@ var exportBaseline = []string{
 	"GetPlanOutput",
 	"GetRunStatusInput",
 	"GetRunStatusOutput",
+	// E85.9 / #4300: fishhawk_get_specialist_job's I/O, exported for the
+	// SDK's jsonschema reflection like every DTO.
+	"GetSpecialistJobInput",
+	"GetSpecialistJobOutput",
 	// E54.77 / #3232: the typed grooming_apply_status block on
 	// fishhawk_get_run_status, exported for the SDK's jsonschema reflection
 	// like every DTO.
@@ -402,6 +406,9 @@ var exportBaseline = []string{
 	// cannot drift into two json-tag sets.
 	"RepoDelegationParams",
 	"RepoDelegationResult",
+	// E85.9 / #4300: fishhawk_request_specialist_job's I/O.
+	"RequestSpecialistJobInput",
+	"RequestSpecialistJobOutput",
 	// #4219: fishhawk_rerun_review's I/O and the client mirror of
 	// POST /v0/runs/{run_id}/reviews/rerun. Exported because RerunReviewOutput
 	// embeds RerunReviewResult and the SDK reflects over the whole tree.
@@ -478,6 +485,13 @@ var exportBaseline = []string{
 	"SecurityFinding",
 	"SendCrewMessageInput",
 	"SessionGuidance",
+	// E85.9 / #4300: the client mirrors of the /v0/specialist-jobs job read
+	// shape (server specialistJobResponse). Exported because both specialist
+	// tools' outputs embed SpecialistJob, which embeds the requester and
+	// subject, and the SDK reflects over the whole tree.
+	"SpecialistJob",
+	"SpecialistJobRequester",
+	"SpecialistJobSubject",
 	"Stage",
 	"StageConcurrency",
 	"StageExecutor",

@@ -350,6 +350,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		_, _ = fmt.Fprintf(os.Stdout, "%s\n", out)
 		return exitOK
 	}
+	// specialist-job subcommand (ADR-097 D2/D6, E85.9 / #4300): executes one
+	// requested specialist job in a scratch clone and ships its typed
+	// completion. Its own flag set; it is not a run stage.
+	if len(args) > 0 && args[0] == "specialist-job" {
+		return runSpecialistJob(args[1:], logSink)
+	}
 
 	cfg, err := parseFlags(args, logSink)
 	if err != nil {
