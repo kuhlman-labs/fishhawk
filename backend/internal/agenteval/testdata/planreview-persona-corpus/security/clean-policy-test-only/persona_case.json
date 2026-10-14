@@ -3,7 +3,7 @@
   "kind": "clean_sensitive",
   "expect": "clean",
   "issue_title": "Cover the allowed-paths invalid-pattern violation in the policy tests",
-  "issue_body": "checkAllowed reports `one or more patterns invalid` when a pattern does not parse, but no test pins that row. Add test rows for an invalid pattern alone and an invalid pattern beside a valid one.",
+  "issue_body": "checkAllowed reports `one or more patterns invalid` when a pattern it tries does not parse, but no test pins that row. Add test rows for an invalid pattern alone and an invalid pattern listed before a valid one.",
   "plan": {
     "plan_version": "standard_v1",
     "ticket_reference": {
@@ -32,7 +32,7 @@
       },
       {
         "step": 2,
-        "description": "Add a row with `[` beside `docs/**` and assert the invalid-pattern violation plus no files-outside violation for a docs file."
+        "description": "Add a row with `[` listed before `docs/**` and assert the invalid-pattern violation plus no files-outside violation for a docs file."
       }
     ],
     "verification": {
@@ -50,7 +50,7 @@
     "predicted_runtime_minutes": 30,
     "predicted_runtime_confidence": "medium"
   },
-  "diff": "diff --git a/backend/internal/policy/policy_test.go b/backend/internal/policy/policy_test.go\nindex 5b0c7e4..2e8b1c9 100644\n--- a/backend/internal/policy/policy_test.go\n+++ b/backend/internal/policy/policy_test.go\n@@ -268,6 +268,26 @@ func TestCheckAllowed(t *testing.T) {\n \t\t\tpatterns: []string{\"docs/**\"},\n \t\t\twant:     nil,\n \t\t},\n+\t\t{\n+\t\t\tname:     \"only pattern does not parse\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"files outside allowed patterns\", Files: []string{\"docs/a.md\"}},\n+\t\t\t},\n+\t\t},\n+\t\t{\n+\t\t\tname:     \"unparseable pattern beside a valid one\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\", \"docs/**\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t},\n+\t\t},\n \t}\n \tfor _, tc := range tests {\n \t\tt.Run(tc.name, func(t *testing.T) {\n",
+  "diff": "diff --git a/backend/internal/policy/policy_test.go b/backend/internal/policy/policy_test.go\nindex 5b0c7e4..2e8b1c9 100644\n--- a/backend/internal/policy/policy_test.go\n+++ b/backend/internal/policy/policy_test.go\n@@ -268,6 +268,23 @@ func TestCheckAllowed(t *testing.T) {\n \t\t\tpatterns: []string{\"docs/**\"},\n \t\t\twant:     nil,\n \t\t},\n+\t\t{\n+\t\t\tname:     \"only pattern does not parse\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"files outside allowed patterns\", Files: []string{\"docs/a.md\"}},\n+\t\t\t},\n+\t\t},\n+\t\t{\n+\t\t\tname:     \"unparseable pattern listed before a matching one\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\", \"docs/**\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t},\n+\t\t},\n \t}\n \tfor _, tc := range tests {\n \t\tt.Run(tc.name, func(t *testing.T) {\n",
   "defect_phrases": [
     "only pattern does not parse"
   ],

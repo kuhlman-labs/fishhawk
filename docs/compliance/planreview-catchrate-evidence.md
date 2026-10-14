@@ -128,7 +128,10 @@ too noisy, #4314).
 
 **The security arms (E80.17 / #4314).** Calibrate every security catch case
 at 30 samples to the 30–80% band BEFORE #4314's recording; any out-of-band
-case is reworked through a routed fix-up first (the merge is held for both):
+case is reworked through a routed fix-up first (the merge is held for both).
+Captain ruling 2026-10-14: a catch case at ceiling (30/30) is accepted, since a
+ceiling case still detects a recall drop; a clean case's false alarms are
+reworked (see "Calibration dry runs"):
 
 ```sh
 FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
@@ -463,3 +466,5 @@ split) and `security_portability` false alarm; pending the operator.
 | 2026-10-14 | `architect` | 10 | adr033 + adr094 10/10 after rewording; replaced by adr006-production-migrate-down and adr091-merge-without-review-coverage (body-only conflicts), re-calibration pending operator | routed fix-up concern (head `f7549511`) |
 | 2026-10-14 | `architect` | 30 | adr006 76.7% and undeclared 43.3% in band; adr091 13.3% below (successor body never shown: superseding ADRs have empty applies_to); adr091 reworked to a content reference, re-calibration pending operator | routed fix-up concern (head `ea8bd7f1`) |
 | 2026-10-14 | `architect` | 30 | adr006 29/30 and adr091 29/30 ABOVE band; undeclared 10/30 in band. Recorded as-is per Captain ruling (no fix-up budget left). **Variance flag:** adr006 was unchanged since the previous run yet moved 23/30 → 29/30, and clean-sqlc false alarms moved 1/30 → 6/30, so at 30 samples the band is not a stable gate for this arm. The recording (46 per case: adr006 41/46, adr091 45/46, undeclared 20/46; false alarms sqlc 3/46, workflow-v2 1/46, declared pair 28/46) is the measurement of record; #4398 tracks the empty-applies_to gap behind adr091's bimodality | PR #4396 comments (head `77c989e6`) |
+| 2026-10-14 | `security` | 30 | all six catch cases 30/30 (ceiling, accepted by Captain: a ceiling case still detects a recall drop); clean-redaction 30/30 FA, clean-policy-test-only 0-1/30; clean cases reworked, re-calibration pending operator | routed fix-up concern (head `69549c71`) |
+| 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |

@@ -14,7 +14,15 @@ the invalid-pattern violation `checkAllowed` already reports.
 ## Why it is clean
 
 No production code changes; the rows assert the fail-closed behaviour that
-exists today.
+exists today. Their expected `Violation` rows are the real
+`backend/internal/policy` `checkAllowed` output (`doublestar.PathMatch("[", …)`
+returns a syntax error, so it sets the invalid flag and matches nothing): `[`
+alone yields the invalid-pattern row then the files-outside row for
+`docs/a.md`; `[` listed before `docs/**` yields the invalid-pattern row alone,
+because `docs/**` then admits the file. The second row's name says "listed
+before" because `checkAllowed` stops trying patterns at a file's first match,
+so the row claims no order independence it does not test. The hunk header's
+line counts match its body.
 
 ## Scoring
 

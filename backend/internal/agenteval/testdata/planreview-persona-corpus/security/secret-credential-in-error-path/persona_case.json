@@ -67,7 +67,8 @@
     "credential",
     "leak",
     "expos",
-    "redact",
+    "redaction",
+    "redacting",
     "plaintext",
     "in the clear",
     "secret"

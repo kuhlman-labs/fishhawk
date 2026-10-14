@@ -2,10 +2,13 @@ package agenteval
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // Fixtures: every sidecar below is RECORDED (recordCyclingSidecar /
@@ -137,13 +140,6 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 					continue
 				}
 				for j, cc := range rt.Rescored.Concerns {
-					// A stored note the sidecar REDACTED is not the text the
-					// recording classified: the redaction marker itself can hit
-					// a probe (the security corpus's "redact"), so its near-miss
-					// tag is not reproducible from the stored text.
-					if strings.Contains(st.Concerns[j].Note, "[REDACTED:") {
-						continue
-					}
 					if cc.NearMiss != st.Concerns[j].NearMiss {
 						t.Errorf("arm %q case %q trial %d concern %d: near_miss %q, stored %q", a.arm, c.Case, st.Trial, j, cc.NearMiss, st.Concerns[j].NearMiss)
 					}
@@ -179,6 +175,70 @@ func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 	}
 	if w := rescoreCaseOf(t, r, ArmWithConventions, name); w.Gained != 0 || w.Lost != 0 {
 		t.Errorf("the untouched with arm changed: +%d/-%d", w.Gained, w.Lost)
+	}
+}
+
+// TestRescoreCatchRateTrials_RedactionMarkerNeverCatches: the sidecar stores
+// every note through sanitizeCatchTrialText, so a credential-shaped string in
+// a concern reaches the re-score as a "[REDACTED:<rule>]" marker the
+// recording never classified. No security catch probe may match that marker:
+// an attributed, otherwise non-catching stored note re-scores as missed, not
+// as a catch manufactured by the redaction (#4314 review: the bare "redact"
+// probe did exactly that).
+func TestRescoreCatchRateTrials_RedactionMarkerNeverCatches(t *testing.T) {
+	const name = "secret-credential-in-error-path"
+	secCases, _ := loadCommittedSecurity(t)
+	var sc SecurityCatchCase
+	for _, c := range secCases {
+		if c.Name == name {
+			sc = c
+		}
+	}
+	if sc.Name == "" {
+		t.Fatalf("no committed security case %q", name)
+	}
+	rule := sc.CatchRule()
+	// The header is assembled at run time so this source carries no
+	// credential-shaped literal of its own.
+	raw := fmt.Sprintf("%s: the test should send %s: Bearer %s", rule.AttributionPhrases[0], "Authorization", "example")
+	note := sanitizeCatchTrialText(raw)
+	if !strings.Contains(note, "[REDACTED:authorization-bearer]") || strings.Contains(note, "Bearer example") {
+		t.Fatalf("premise: the sidecar sanitizer stores %q, want the bearer header redacted", note)
+	}
+	if probe, ok := matchCatchProbe("correctness", raw, rule.Probes); ok {
+		t.Fatalf("premise: the unredacted note matches probe %q; it must be a non-catching note", probe)
+	}
+
+	path, _, _ := recordCyclingSidecar(t)
+	tr := readCatchTrials(t, path)
+	list := tr.Arms[ArmSecurity].PerCase[name]
+	i := firstTrialWith(t, list, CatchMissed)
+	list[i].Concerns = []CatchRateTrialConcern{{Severity: "low", Category: "correctness", Note: note}}
+	list[i].ConcernsTotal = 1
+	writeCatchTrials(t, path, tr)
+
+	c := rescoreCaseOf(t, rescoreOf(t, path), ArmSecurity, name)
+	got := c.TrialRecords[i]
+	if !got.Attributed {
+		t.Fatalf("premise: the stored note %q does not attribute to %v", note, rule.AttributionPhrases)
+	}
+	if got.Rescored.Outcome != CatchMissed || got.Rescored.MatchedProbe != "" || c.Gained != 0 {
+		t.Errorf("redacted note %q re-scored %s (probe %q), case gained %d; want missed, no probe, nothing gained", note, got.Rescored.Outcome, got.Rescored.MatchedProbe, c.Gained)
+	}
+
+	// Every security catch case, every default redaction marker: no probe
+	// matches the marker beside an attributing phrase.
+	for _, sc := range secCases {
+		if sc.Expect() != CatchExpectCatch {
+			continue
+		}
+		r := sc.CatchRule()
+		for _, p := range redaction.DefaultPatterns {
+			stored := r.AttributionPhrases[0] + " carries [REDACTED:" + p.Name + "]"
+			if probe, ok := matchCatchProbe("correctness", stored, r.Probes); ok {
+				t.Errorf("case %q: catch probe %q matches the sidecar's %s redaction marker; a re-score would manufacture a catch", sc.Name, probe, p.Name)
+			}
+		}
 	}
 }
 
