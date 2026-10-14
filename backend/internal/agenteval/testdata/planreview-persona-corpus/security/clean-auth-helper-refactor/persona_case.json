@@ -1,0 +1,74 @@
+{
+  "persona": "security",
+  "kind": "clean_sensitive",
+  "expect": "clean",
+  "issue_title": "Fold the duplicated login case-folding in membership resolution",
+  "issue_body": "selfPairs and derivePairs each lower-case the forge login inline before building membership keys. Extract one helper so the two call sites cannot drift.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94107",
+      "id": "kuhlman-labs/fishhawk#94107"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Extract a foldLogin helper in the membership resolver and use it from both call sites.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/auth/membership.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/auth/membership_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add foldLogin(login string) string in membership.go returning strings.ToLower(login), and call it from selfPairs and derivePairs in place of the inline strings.ToLower."
+      },
+      {
+        "step": 2,
+        "description": "Add a membership test asserting selfPairs and derivePairs produce the same keys for a mixed-case login as before."
+      }
+    ],
+    "verification": {
+      "test_strategy": "The auth package tests, including the new mixed-case login test.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-one-fold",
+          "statement": "Both membership key builders fold the login through one helper.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94107"
+        },
+        {
+          "id": "ac-keys-unchanged",
+          "statement": "Membership keys for a mixed-case login are unchanged.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94107"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/auth/membership.go b/backend/internal/auth/membership.go\nindex 6a3e1d0..b7c4f25 100644\n--- a/backend/internal/auth/membership.go\n+++ b/backend/internal/auth/membership.go\n@@ -295,8 +295,13 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider, accessToken string, profile GitHubProfile) ([]uuid.UUID, error) {\n \n+// foldLogin is the one case-folding of a forge login before it keys a\n+// membership lookup.\n+func foldLogin(login string) string { return strings.ToLower(login) }\n+\n func selfPairs(login string) []MembershipKey {\n-\tl := strings.ToLower(login)\n+\tl := foldLogin(login)\n \treturn []MembershipKey{{Kind: \"user\", Ref: l}}\n }\n \n@@ -362,7 +367,7 @@ func (r *forgeMembershipResolver) evalAutoJoin(ctx context.Context, provider, login string, grants []MemberGrant, haveGrant map[uuid.UUID]bool, pairs []MembershipKey) (map[uuid.UUID]bool, error) {\n func (r *forgeMembershipResolver) derivePairs(provider, login string, liveKeys []string) []MembershipKey {\n-\tl := strings.ToLower(login)\n+\tl := foldLogin(login)\n \tpairs := selfPairs(l)\n \tfor _, k := range liveKeys {\n \t\tpairs = append(pairs, MembershipKey{Kind: \"org\", Ref: strings.ToLower(k)})\ndiff --git a/backend/internal/auth/membership_test.go b/backend/internal/auth/membership_test.go\nindex 0c9b2e7..4d1a8f3 100644\n--- a/backend/internal/auth/membership_test.go\n+++ b/backend/internal/auth/membership_test.go\n@@ -420,3 +420,15 @@ func TestDerivePairs_OrgKeys(t *testing.T) {\n \t}\n }\n+\n+func TestMembershipKeys_MixedCaseLoginFolds(t *testing.T) {\n+\twant := []MembershipKey{{Kind: \"user\", Ref: \"octocat\"}}\n+\tif got := selfPairs(\"OctoCat\"); !reflect.DeepEqual(got, want) {\n+\t\tt.Errorf(\"selfPairs = %v, want %v\", got, want)\n+\t}\n+\tr := &forgeMembershipResolver{}\n+\tgot := r.derivePairs(\"github\", \"OctoCat\", nil)\n+\tif !reflect.DeepEqual(got, want) {\n+\t\tt.Errorf(\"derivePairs = %v, want %v\", got, want)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "foldLogin"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "membership.go: foldLogin could weaken account isolation if a forge treats logins case-sensitively."
+    }
+  ]
+}
