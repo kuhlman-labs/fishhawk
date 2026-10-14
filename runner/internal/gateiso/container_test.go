@@ -70,6 +70,7 @@ func TestBuildArgv_Golden(t *testing.T) {
 	mounts := []string{
 		"-v", m.checkout + ":/work", "-v", m.gocache + ":/gocache", "-v", m.gomod + ":/gomodcache", "-v", m.lint + ":/lintcache",
 		"-e", "GOFLAGS=-mod=mod", "-e", "GOPROXY=off",
+		"-e", "GIT_CONFIG_COUNT=1", "-e", "GIT_CONFIG_KEY_0=safe.directory", "-e", "GIT_CONFIG_VALUE_0=/work",
 		"--entrypoint", "", "docker.io/alpine/git:v2.47.2", "/bin/sh", "-c", "scripts/test verify",
 	}
 	t.Run("docker", func(t *testing.T) {
@@ -829,6 +830,7 @@ func TestBuildArgv_CacheVolumeGolden(t *testing.T) {
 	mounts := []string{
 		"-v", m.checkout + ":/work", "-v", m.gomod + ":/gomodcache", "-v", testCacheVolume + ":/gatecache",
 		"-e", "GOFLAGS=-mod=mod", "-e", "GOPROXY=off",
+		"-e", "GIT_CONFIG_COUNT=1", "-e", "GIT_CONFIG_KEY_0=safe.directory", "-e", "GIT_CONFIG_VALUE_0=/work",
 		"--entrypoint", "", "docker.io/alpine/git:v2.47.2", "/bin/sh", "-c", "scripts/test verify",
 	}
 	for _, tc := range []struct {
@@ -940,5 +942,152 @@ func TestBuildArgv_CacheVolumeIncompleteSpec(t *testing.T) {
 	}
 	if got, err := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true}).BuildArgv(policy); err != nil || got == nil {
 		t.Errorf("volume form without cache binds refused: %q, %v", got, err)
+	}
+}
+
+// envTokens returns the K=V values of every `-e` token in argv, in order.
+func envTokens(argv []string) []string {
+	var out []string
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-e" {
+			out = append(out, argv[i+1])
+		}
+	}
+	return out
+}
+
+// TestBuildArgv_PinsGitSafeDirectoryForWork pins #4390: whatever the runtime
+// and mount form, an Env with no GIT_CONFIG_* entry gains exactly one
+// COUNT=1 / KEY_0=safe.directory / VALUE_0=/work triple before --entrypoint, and
+// the caller's Env slice is not mutated.
+func TestBuildArgv_PinsGitSafeDirectoryForWork(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	for _, tc := range []struct {
+		name string
+		spec ContainerSpec
+	}{
+		{"bind docker", specFor(m, Runtime{Kind: KindDocker, Safe: true})},
+		{"bind podman rootless", specFor(m, Runtime{Kind: KindPodman, Safe: true, Rootless: true})},
+		{"volume docker", volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true})},
+		{"volume podman rootless", volumeSpecFor(m, Runtime{Kind: KindPodman, Safe: true, Rootless: true})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := append([]string(nil), tc.spec.Env...)
+			got, err := tc.spec.BuildArgv(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := idx(got, "--entrypoint")
+			if entry < 0 {
+				t.Fatalf("no --entrypoint in %q", got)
+			}
+			env := envTokens(got[:entry])
+			for _, want := range []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=" + MountWork} {
+				n := 0
+				for _, kv := range env {
+					if kv == want {
+						n++
+					}
+				}
+				if n != 1 {
+					t.Errorf("%q appears %d times before --entrypoint, want 1: %q", want, n, got)
+				}
+			}
+			if !reflect.DeepEqual(tc.spec.Env, before) {
+				t.Errorf("BuildArgv mutated spec.Env: %q, was %q", tc.spec.Env, before)
+			}
+		})
+	}
+}
+
+// lastEnvArg returns the value of the LAST `-e key=` token in argv (the
+// runtime CLI gives the last -e for a key precedence) and how many times the
+// key appears.
+func lastEnvArg(argv []string, key string) (string, int) {
+	var val string
+	n := 0
+	for _, kv := range envTokens(argv) {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			val, n = v, n+1
+		}
+	}
+	return val, n
+}
+
+// TestBuildArgv_GitSafeDirectoryComposesWithExistingCount: an Env already
+// carrying GIT_CONFIG pairs keeps them byte-identical and the safe.directory
+// entry lands after them, at the index the count names. A stale pair at that
+// index is overwritten, and an empty VALUE counts as present.
+func TestBuildArgv_GitSafeDirectoryComposesWithExistingCount(t *testing.T) {
+	m := newMounts(t)
+	spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	spec.Env = []string{
+		"GOFLAGS=-mod=mod",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.abbrev", "GIT_CONFIG_VALUE_0=12",
+		"GIT_CONFIG_KEY_1=http.x.extraheader", "GIT_CONFIG_VALUE_1=",
+		"GIT_CONFIG_KEY_2=stale", "GIT_CONFIG_VALUE_2=stale",
+	}
+	before := append([]string(nil), spec.Env...)
+	got, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"GIT_CONFIG_COUNT":   "3",
+		"GIT_CONFIG_KEY_0":   "core.abbrev",
+		"GIT_CONFIG_VALUE_0": "12",
+		"GIT_CONFIG_KEY_1":   "http.x.extraheader",
+		"GIT_CONFIG_VALUE_1": "",
+		"GIT_CONFIG_KEY_2":   "safe.directory",
+		"GIT_CONFIG_VALUE_2": MountWork,
+		"GOFLAGS":            "-mod=mod",
+	} {
+		val, n := lastEnvArg(got, key)
+		if n != 1 || val != want {
+			t.Errorf("%s = %q (x%d), want %q (x1): %q", key, val, n, want, got)
+		}
+	}
+	if !reflect.DeepEqual(spec.Env, before) {
+		t.Errorf("BuildArgv mutated spec.Env: %q, was %q", spec.Env, before)
+	}
+}
+
+// TestBuildArgv_GitSafeDirectoryRefusesMalformedConfig: a GIT_CONFIG_COUNT that
+// is not a decimal count of the pairs present, or that names a pair that is
+// absent, is refused as ErrContainerSpec with NO argv, naming the variable.
+func TestBuildArgv_GitSafeDirectoryRefusesMalformedConfig(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	pair0 := []string{"GIT_CONFIG_KEY_0=core.abbrev", "GIT_CONFIG_VALUE_0=12"}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"non-numeric count", []string{"GIT_CONFIG_COUNT=abc"}, "GIT_CONFIG_COUNT"},
+		{"negative count", []string{"GIT_CONFIG_COUNT=-1"}, "GIT_CONFIG_COUNT"},
+		{"plus-signed count", append([]string{"GIT_CONFIG_COUNT=+1"}, pair0...), "GIT_CONFIG_COUNT"},
+		{"space-padded count", append([]string{"GIT_CONFIG_COUNT= 1"}, pair0...), "GIT_CONFIG_COUNT"},
+		{"empty count", []string{"GIT_CONFIG_COUNT="}, "GIT_CONFIG_COUNT"},
+		{"overflowing count", []string{"GIT_CONFIG_COUNT=99999999999999999999"}, "GIT_CONFIG_COUNT"},
+		{"missing key", []string{"GIT_CONFIG_COUNT=2", "GIT_CONFIG_KEY_0=core.abbrev", "GIT_CONFIG_VALUE_0=12", "GIT_CONFIG_VALUE_1=x"}, "GIT_CONFIG_KEY_1"},
+		{"missing value", []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.abbrev"}, "GIT_CONFIG_VALUE_0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+			spec.Env = tc.env
+			got, err := spec.BuildArgv(policy)
+			if !errors.Is(err, ErrContainerSpec) {
+				t.Fatalf("err = %v, want ErrContainerSpec", err)
+			}
+			if got != nil {
+				t.Fatalf("argv = %q, want nil", got)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err %q does not name %s", err, tc.want)
+			}
+		})
 	}
 }
