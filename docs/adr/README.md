@@ -328,6 +328,7 @@ count it is an operator decision.
 | [ADR-097](097-operator-as-orchestrator.md) | Operator as orchestrator: the driver delegates evidence work to stateless specialist jobs; the first officer keeps a standing trigger-driven watch the operator cannot silence (amends ADR-089, ADR-040) | `accepted` | [#4299](https://github.com/kuhlman-labs/fishhawk/issues/4299) |
 | [ADR-098](098-split-global-surface-shadow-transfer.md) | Amend ADR-096 D3: split the global surface into verdict-wide and doc-check inputs, add data-read edges, and enable verdict transfer only after a shadow measurement | `accepted` | [#4316](https://github.com/kuhlman-labs/fishhawk/issues/4316) |
 | [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
+| [ADR-100](100-adaptive-bounded-concurrency.md) | Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1) | `accepted` | [#4403](https://github.com/kuhlman-labs/fishhawk/issues/4403) |
 
 ## Status unknown — needs captain confirmation
 
