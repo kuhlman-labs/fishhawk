@@ -14,13 +14,24 @@ import (
 )
 
 const (
-	testCorpus      = "../testdata/planreview-miss-corpus"
-	testConventions = "../testdata/planreview-catchrate/representative-conventions.md"
+	testCorpus        = "../testdata/planreview-miss-corpus"
+	testConventions   = "../testdata/planreview-catchrate/representative-conventions.md"
+	testPersonaCorpus = "../testdata/planreview-persona-corpus/architect"
+	testRepoRoot      = "../../../.."
 )
+
+// testInputs is the committed arm-table inputs with the given conventions
+// fixture.
+func testInputs(conventions string) agenteval.CatchRateInputs {
+	return agenteval.CatchRateInputs{CorpusDir: testCorpus, ConventionsPath: conventions, PersonaCorpusDir: testPersonaCorpus, RepoRoot: testRepoRoot}
+}
 
 // allCaughtSender answers every call with a verdict whose ONE concern names
 // every committed case's planted criterion id(s) and first probe, so it
-// satisfies both halves of every case's catch rule.
+// satisfies both halves of every conventions case's catch rule. The architect
+// arm gets the same answer: an acceptance_criteria concern, so its catch
+// cases are missed (the decision_record category predicate) and its clean
+// cases raise no false alarm — a passing first pin either way.
 type allCaughtSender struct{ response string }
 
 func newAllCaughtSender(t *testing.T) *allCaughtSender {
@@ -53,7 +64,7 @@ func freshRecord(t *testing.T, conventions string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "evidence.json")
 	_, err := agenteval.RecordCatchRateEvidence(context.Background(), newAllCaughtSender(t), agenteval.DefaultCatchRateGeneratorModel,
-		testCorpus, conventions, path, time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC),
+		testInputs(conventions), path, time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC),
 		agenteval.RecordCatchRateOptions{PinBaseline: true, Reason: "test baseline"})
 	if err != nil {
 		t.Fatalf("record: %v", err)
@@ -135,9 +146,9 @@ func TestRun_FailsOnRegressedRecordWithReport(t *testing.T) {
 	if err := json.Unmarshal(raw, &rec); err != nil {
 		t.Fatal(err)
 	}
-	for name, c := range rec.Arms.WithConventions.PerCase {
+	for name, c := range rec.Arms[agenteval.ArmWithConventions].PerCase {
 		c.Caught = 0
-		rec.Arms.WithConventions.PerCase[name] = c
+		rec.Arms[agenteval.ArmWithConventions].PerCase[name] = c
 	}
 	b, _ := json.Marshal(rec)
 	if err := os.WriteFile(path, b, 0o644); err != nil {
@@ -166,6 +177,9 @@ func assertRuleLine(t *testing.T, out string) {
 		if strings.HasPrefix(line, "catchrategate: rule:") {
 			if !strings.Contains(line, "0.10") || !strings.Contains(line, "136") {
 				t.Errorf("rule line lacks the 0.10 tolerance or the 136-trial minimum: %q", line)
+			}
+			if !strings.Contains(out, "catchrategate: per-arm rule:") || !strings.Contains(out, "false-alarm rate") || !strings.Contains(out, "architect") {
+				t.Errorf("output carries no per-arm rule line naming the false-alarm rate and the architect arm:\n%s", out)
 			}
 			return
 		}
@@ -275,15 +289,7 @@ func TestRun_UsageErrors(t *testing.T) {
 // TestRun_PrintFingerprintDefaults resolves the committed default paths from
 // the package directory and prints the same digest the library computes.
 func TestRun_PrintFingerprintDefaults(t *testing.T) {
-	cases, err := agenteval.LoadPlanReviewCatchCorpus(testCorpus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conv, err := agenteval.LoadRepresentativeConventions(testConventions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := agenteval.CatchRatePromptFingerprint(cases, conv, agenteval.DefaultCatchRateGeneratorModel)
+	want, err := agenteval.CatchRatePromptFingerprint(testInputs(testConventions), agenteval.DefaultCatchRateGeneratorModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +377,8 @@ func TestRun_RescorePrintsReportAndNeverWrites(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
 	}
-	for _, want := range []string{"OFFLINE RE-SCORE", "lower bound", "attribution-only", "Sidecar: " + sidecar, "without_conventions: recorded "} {
+	for _, want := range []string{"OFFLINE RE-SCORE", "lower bound", "attribution-only", "Sidecar: " + sidecar, "without_conventions: recorded ",
+		"architect: recorded ", "architect clean cases: recorded "} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout lacks %q:\n%s", want, stdout)
 		}
@@ -425,5 +432,45 @@ func TestRun_RescoreWithPrintFingerprintIsUsage(t *testing.T) {
 	}
 	if stdout != "" {
 		t.Errorf("a usage error printed to stdout:\n%s", stdout)
+	}
+}
+
+// TestRun_FailsOnLegacyV1Record: a legacy planreview-catchrate-evidence-v1
+// record (the committed pair until the shared re-pin) exits 1 naming the
+// shared #4313/#4314 re-recording, with the rule line on stderr.
+func TestRun_FailsOnLegacyV1Record(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	if err := os.WriteFile(path, []byte(`{"schema":"planreview-catchrate-evidence-v1","arms":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runGate("--evidence", path)
+	if code != 1 || !strings.Contains(stderr, "legacy planreview-catchrate-evidence-v1") || !strings.Contains(stderr, "#4313/#4314 re-pin recording") {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the legacy record and the shared re-recording", code, stderr)
+	}
+	if strings.Contains(stdout, "catchrategate: PASS") {
+		t.Fatalf("stdout reports a PASS:\n%s", stdout)
+	}
+	assertRuleLine(t, stderr)
+}
+
+// TestRun_PersonaFlags: --persona-corpus and --repo-root reach the arm table —
+// an absent persona corpus or a checkout root without the architect documents
+// fails the gate closed, naming the persona corpus.
+func TestRun_PersonaFlags(t *testing.T) {
+	fresh := freshRecord(t, testConventions)
+	if code, _, stderr := runGate("--evidence", fresh, "--persona-corpus", testPersonaCorpus, "--repo-root", testRepoRoot); code != 0 {
+		t.Fatalf("premise: explicit persona flags pass; exit %d, stderr:\n%s", code, stderr)
+	}
+	for name, args := range map[string][]string{
+		"absent persona corpus":      {"--persona-corpus", filepath.Join(t.TempDir(), "none")},
+		"repo root without the ADRs": {"--repo-root", t.TempDir()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, _, stderr := runGate(append([]string{"--evidence", fresh}, args...)...)
+			if code != 1 || !strings.Contains(stderr, "persona corpus unavailable") {
+				t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the persona corpus", code, stderr)
+			}
+			assertRuleLine(t, stderr)
+		})
 	}
 }

@@ -17,7 +17,7 @@ const committedCatchEvidence = "testdata/planreview-catchrate/evidence.json"
 
 func rescoreOf(t *testing.T, evidencePath string) CatchRateRescore {
 	t.Helper()
-	r, err := RescoreCatchRateTrials(CatchRateTrialsPath(evidencePath), committedCatchCorpus)
+	r, err := RescoreCatchRateTrials(CatchRateTrialsPath(evidencePath), committedCatchInputs())
 	if err != nil {
 		t.Fatalf("RescoreCatchRateTrials: %v", err)
 	}
@@ -88,8 +88,8 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 	path, rec, _ := recordCyclingSidecar(t)
 	stored := readCatchTrials(t, path)
 	r := rescoreOf(t, path)
-	if len(r.Arms) != 2 || r.Arms[0].Arm != ArmWithoutConventions || r.Arms[1].Arm != ArmWithConventions {
-		t.Fatalf("arms = %+v, want the arm table order [%s %s]", r.Arms, ArmWithoutConventions, ArmWithConventions)
+	if len(r.Arms) != 3 || r.Arms[0].Arm != ArmWithoutConventions || r.Arms[1].Arm != ArmWithConventions || r.Arms[2].Arm != ArmArchitect {
+		t.Fatalf("arms = %+v, want the arm table order [%s %s %s]", r.Arms, ArmWithoutConventions, ArmWithConventions, ArmArchitect)
 	}
 	if r.RecordedAt != rec.RecordedAt || r.PromptFingerprint != rec.PromptFingerprint || !strings.HasPrefix(catchRuleVersion, r.CatchRule+":") {
 		t.Errorf("re-score envelope = %q / %q / %q; want the sidecar's recorded_at and fingerprint and the catch rule label", r.RecordedAt, r.PromptFingerprint, r.CatchRule)
@@ -99,8 +99,9 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 		counts map[string]CaseCatchCounts
 		trials map[string][]CatchRateTrialRecord
 	}{
-		{ArmWithoutConventions, rec.Arms.WithoutConventions.PerCase, stored.Arms.WithoutConventions.PerCase},
-		{ArmWithConventions, rec.Arms.WithConventions.PerCase, stored.Arms.WithConventions.PerCase},
+		{ArmWithoutConventions, rec.Arms[ArmWithoutConventions].PerCase, stored.Arms[ArmWithoutConventions].PerCase},
+		{ArmWithConventions, rec.Arms[ArmWithConventions].PerCase, stored.Arms[ArmWithConventions].PerCase},
+		{ArmArchitect, rec.Arms[ArmArchitect].PerCase, stored.Arms[ArmArchitect].PerCase},
 	} {
 		arm := rescoreArmOf(t, r, a.arm)
 		if len(arm.Unscored) != 0 || len(arm.NotRecorded) != 0 || len(arm.PerCase) != len(a.counts) {
@@ -108,10 +109,10 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 		}
 		for _, c := range arm.PerCase {
 			want := a.counts[c.Case]
-			if c.Trials != want.Trials || c.RecordedCaught != want.Caught || c.Undecodable != want.Undecodable {
+			if c.Trials != want.Trials || c.RecordedCaught != want.Caught || c.RecordedFalseAlarms != want.FalseAlarms || c.Undecodable != want.Undecodable {
 				t.Errorf("arm %q case %q: recorded %+v, evidence %+v", a.arm, c.Case, c.CatchRescoreCounts, want)
 			}
-			if c.RescoredCaught != c.RecordedCaught || c.Gained != 0 || c.Lost != 0 {
+			if c.RescoredCaught != c.RecordedCaught || c.RescoredFalseAlarms != c.RecordedFalseAlarms || c.Gained != 0 || c.Lost != 0 {
 				t.Errorf("arm %q case %q: re-scored %d vs recorded %d, +%d/-%d; want identical", a.arm, c.Case, c.RescoredCaught, c.RecordedCaught, c.Gained, c.Lost)
 			}
 			for i, rt := range c.TrialRecords {
@@ -145,8 +146,8 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 	path, _, _ := recordCyclingSidecar(t)
 	tr := readCatchTrials(t, path)
-	name := sortedTrialCaseNames(tr.Arms.WithoutConventions.PerCase)[0]
-	list := tr.Arms.WithoutConventions.PerCase[name]
+	name := sortedTrialCaseNames(tr.Arms[ArmWithoutConventions].PerCase)[0]
+	list := tr.Arms[ArmWithoutConventions].PerCase[name]
 	i := firstTrialWith(t, list, CatchMissed)
 	list[i].Concerns = []CatchRateTrialConcern{catchingStoredConcern(t, name)}
 	list[i].ConcernsTotal = 1
@@ -172,8 +173,8 @@ func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 func TestRescoreCatchRateTrials_LosesACatchTheRuleNoLongerHolds(t *testing.T) {
 	path, _, _ := recordCyclingSidecar(t)
 	tr := readCatchTrials(t, path)
-	name := sortedTrialCaseNames(tr.Arms.WithConventions.PerCase)[0]
-	list := tr.Arms.WithConventions.PerCase[name]
+	name := sortedTrialCaseNames(tr.Arms[ArmWithConventions].PerCase)[0]
+	list := tr.Arms[ArmWithConventions].PerCase[name]
 	i := firstTrialWith(t, list, CatchCaught)
 	list[i].Concerns = []CatchRateTrialConcern{{Severity: "low", Category: "observability", Note: "the handler logs nothing on success"}}
 	writeCatchTrials(t, path, tr)
@@ -193,8 +194,8 @@ func TestRescoreCatchRateTrials_LosesACatchTheRuleNoLongerHolds(t *testing.T) {
 func TestRescoreCatchRateTrials_UndecodableStaysUndecodable(t *testing.T) {
 	path, _, _ := recordCyclingSidecar(t)
 	tr := readCatchTrials(t, path)
-	name := sortedTrialCaseNames(tr.Arms.WithoutConventions.PerCase)[0]
-	list := tr.Arms.WithoutConventions.PerCase[name]
+	name := sortedTrialCaseNames(tr.Arms[ArmWithoutConventions].PerCase)[0]
+	list := tr.Arms[ArmWithoutConventions].PerCase[name]
 	i := firstTrialWith(t, list, CatchUndecodable)
 	concern := catchingStoredConcern(t, name)
 	excerpt := catchVerdictJSON(t, CatchExampleConcern{Severity: concern.Severity, Category: concern.Category, Note: concern.Note})
@@ -219,12 +220,12 @@ func TestRescoreCatchRateTrials_UndecodableStaysUndecodable(t *testing.T) {
 func TestRescoreCatchRateTrials_CountsLowerBoundTrials(t *testing.T) {
 	path, _, _ := recordCyclingSidecar(t)
 	base := readCatchTrials(t, path)
-	name := sortedTrialCaseNames(base.Arms.WithoutConventions.PerCase)[0]
+	name := sortedTrialCaseNames(base.Arms[ArmWithoutConventions].PerCase)[0]
 	// The recorded missed trials store 12 of 18 concerns, one of them a
 	// truncated wide-rune note: make each one COMPLETE (its first two stored
 	// concerns, neither truncated, concerns_total 2) so each row below is
 	// incomplete in exactly one way.
-	for _, list := range [][]CatchRateTrialRecord{base.Arms.WithoutConventions.PerCase[name]} {
+	for _, list := range [][]CatchRateTrialRecord{base.Arms[ArmWithoutConventions].PerCase[name]} {
 		for i := range list {
 			if list[i].Outcome == CatchMissed {
 				list[i].Concerns = append([]CatchRateTrialConcern(nil), list[i].Concerns[:2]...)
@@ -256,7 +257,7 @@ func TestRescoreCatchRateTrials_CountsLowerBoundTrials(t *testing.T) {
 			if err := json.Unmarshal(raw, &tr); err != nil {
 				t.Fatal(err)
 			}
-			list := tr.Arms.WithoutConventions.PerCase[name]
+			list := tr.Arms[ArmWithoutConventions].PerCase[name]
 			i := firstTrialWith(t, list, tc.outcome)
 			tc.mutate(&list[i])
 			writeCatchTrials(t, path, tr)
@@ -277,8 +278,8 @@ func TestRescoreCatchRateTrials_CountsLowerBoundTrials(t *testing.T) {
 func TestRescoreCatchRateTrials_AttributionOnlyRate(t *testing.T) {
 	path, _, _ := recordCyclingSidecar(t)
 	tr := readCatchTrials(t, path)
-	name := sortedTrialCaseNames(tr.Arms.WithoutConventions.PerCase)[0]
-	list := tr.Arms.WithoutConventions.PerCase[name]
+	name := sortedTrialCaseNames(tr.Arms[ArmWithoutConventions].PerCase)[0]
+	list := tr.Arms[ArmWithoutConventions].PerCase[name]
 	i := firstTrialWith(t, list, CatchMissed)
 	list[i].Concerns = []CatchRateTrialConcern{{Severity: "low", Category: "scope", Note: "filler concern"}}
 	writeCatchTrials(t, path, tr)
@@ -311,14 +312,17 @@ func TestRescoreCatchRateTrials_ReportsUnscoredAndUnrecordedCases(t *testing.T) 
 	t.Run("one case renamed", func(t *testing.T) {
 		path, _, _ := recordCyclingSidecar(t)
 		tr := readCatchTrials(t, path)
-		orig := lastTrialCase(tr.Arms.WithoutConventions.PerCase)
-		for _, m := range []map[string][]CatchRateTrialRecord{tr.Arms.WithoutConventions.PerCase, tr.Arms.WithConventions.PerCase} {
+		orig := lastTrialCase(tr.Arms[ArmWithoutConventions].PerCase)
+		for _, m := range []map[string][]CatchRateTrialRecord{tr.Arms[ArmWithoutConventions].PerCase, tr.Arms[ArmWithConventions].PerCase} {
 			m[unknown] = m[orig]
 			delete(m, orig)
 		}
 		writeCatchTrials(t, path, tr)
 		r := rescoreOf(t, path)
 		for _, a := range r.Arms {
+			if a.Arm == ArmArchitect {
+				continue // the architect arm is untouched by this fixture
+			}
 			if len(a.Unscored) != 1 || a.Unscored[0] != unknown || len(a.NotRecorded) != 1 || a.NotRecorded[0] != orig {
 				t.Errorf("arm %q: unscored %v, not recorded %v; want [%s] and [%s]", a.Arm, a.Unscored, a.NotRecorded, unknown, orig)
 			}
@@ -338,13 +342,24 @@ func TestRescoreCatchRateTrials_ReportsUnscoredAndUnrecordedCases(t *testing.T) 
 	t.Run("no case scored", func(t *testing.T) {
 		path, _, _ := recordCyclingSidecar(t)
 		tr := readCatchTrials(t, path)
-		orig := lastTrialCase(tr.Arms.WithoutConventions.PerCase)
-		one := map[string][]CatchRateTrialRecord{unknown: tr.Arms.WithoutConventions.PerCase[orig]}
-		tr.Arms.WithoutConventions.PerCase, tr.Arms.WithConventions.PerCase = one, one
+		orig := lastTrialCase(tr.Arms[ArmWithoutConventions].PerCase)
+		one := map[string][]CatchRateTrialRecord{unknown: tr.Arms[ArmWithoutConventions].PerCase[orig]}
+		tr.Arms[ArmWithoutConventions] = CatchRateTrialsArm{PerCase: one}
+		tr.Arms[ArmWithConventions] = CatchRateTrialsArm{PerCase: one}
+		delete(tr.Arms, ArmArchitect)
 		writeCatchTrials(t, path, tr)
 		r := rescoreOf(t, path)
 		cases, _ := loadCommittedCatch(t)
+		if a := rescoreArmOf(t, r, ArmArchitect); a.Recorded || len(a.PerCase) != 0 || len(a.NotRecorded) != len(loadCommittedPersona(t)) {
+			t.Errorf("architect arm absent from the sidecar: recorded %v, %d scored, not recorded %v; want NOT RECORDED", a.Recorded, len(a.PerCase), a.NotRecorded)
+		}
+		if out := r.Render(); !strings.Contains(out, ArmArchitect+": NOT RECORDED (the sidecar carries no such arm)") {
+			t.Errorf("Render does not report the architect arm NOT RECORDED:\n%s", out)
+		}
 		for _, a := range r.Arms {
+			if a.Arm == ArmArchitect {
+				continue
+			}
 			if len(a.PerCase) != 0 || len(a.NotRecorded) != len(cases) || a.Pooled().Trials != 0 {
 				t.Errorf("arm %q: %d scored, %d not recorded, %d trials; want 0, %d, 0", a.Arm, len(a.PerCase), len(a.NotRecorded), a.Pooled().Trials, len(cases))
 			}
@@ -353,6 +368,18 @@ func TestRescoreCatchRateTrials_ReportsUnscoredAndUnrecordedCases(t *testing.T) 
 			t.Errorf("Render of a sidecar with no scored case:\n%s", out)
 		}
 	})
+}
+
+// cleanPersonaCaseName is a committed clean persona case.
+func cleanPersonaCaseName(t *testing.T) string {
+	t.Helper()
+	for _, c := range loadCommittedPersona(t) {
+		if c.Expect() == CatchExpectClean {
+			return c.Name
+		}
+	}
+	t.Fatal("the committed persona corpus has no clean case")
+	return ""
 }
 
 // TestRescoreCatchRateTrials_FailClosed: one row per fail-closed mode, each
@@ -385,34 +412,41 @@ func TestRescoreCatchRateTrials_FailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bogus := func(arm *CatchRateTrialsArm, name string) {
+	bogus := func(arm CatchRateTrialsArm, name string) {
 		list := arm.PerCase[name]
 		list[0].Outcome = "bogus"
 	}
 	for _, tc := range []struct {
-		name, trials, corpus, want string
+		name, trials string
+		in           CatchRateInputs
+		want         string
 	}{
-		{"absent sidecar", filepath.Join(dir, "none.trials.json"), committedCatchCorpus, "absent: nothing to re-score"},
-		{"unreadable sidecar (a directory)", t.TempDir(), committedCatchCorpus, "read:"},
-		{"malformed JSON", write("malformed.json", []byte("{not json")), committedCatchCorpus, "malformed JSON"},
-		{"unknown field", write("unknown.json", extra), committedCatchCorpus, `unknown field "extra"`},
-		{"trailing content", write("trailing.json", append(append([]byte{}, raw...), "{}\n"...)), committedCatchCorpus, "trailing content"},
-		{"wrong schema", mutated("schema.json", func(tr *CatchRateTrials) { tr.Schema = "planreview-catchrate-trials-v0" }), committedCatchCorpus,
+		{"absent sidecar", filepath.Join(dir, "none.trials.json"), committedCatchInputs(), "absent: nothing to re-score"},
+		{"unreadable sidecar (a directory)", t.TempDir(), committedCatchInputs(), "read:"},
+		{"malformed JSON", write("malformed.json", []byte("{not json")), committedCatchInputs(), "malformed JSON"},
+		{"unknown field", write("unknown.json", extra), committedCatchInputs(), `unknown field "extra"`},
+		{"trailing content", write("trailing.json", append(append([]byte{}, raw...), "{}\n"...)), committedCatchInputs(), "trailing content"},
+		{"wrong schema", mutated("schema.json", func(tr *CatchRateTrials) { tr.Schema = "planreview-catchrate-trials-v0" }), committedCatchInputs(),
 			`schema "planreview-catchrate-trials-v0" is not "` + CatchRateTrialsSchema + `"`},
+		{"a catch-class outcome on a clean case", mutated("clean-caught.json", func(tr *CatchRateTrials) {
+			m := tr.Arms[ArmArchitect].PerCase
+			name := cleanPersonaCaseName(t)
+			m[name][0].Outcome = CatchCaught
+		}), committedCatchInputs(), `outcome "caught" is not one of false_alarm|no_false_alarm|undecodable`},
 		{"unknown outcome in a scored case", mutated("bogus.json", func(tr *CatchRateTrials) {
-			bogus(&tr.Arms.WithConventions, lastTrialCase(tr.Arms.WithConventions.PerCase))
-		}), committedCatchCorpus, `outcome "bogus" is not one of caught|missed|undecodable`},
+			bogus(tr.Arms[ArmWithConventions], lastTrialCase(tr.Arms[ArmWithConventions].PerCase))
+		}), committedCatchInputs(), `outcome "bogus" is not one of caught|missed|undecodable`},
 		{"unknown outcome in an unscored case", mutated("bogus-unscored.json", func(tr *CatchRateTrials) {
-			m := tr.Arms.WithoutConventions.PerCase
+			m := tr.Arms[ArmWithoutConventions].PerCase
 			orig := lastTrialCase(m)
 			m["seed-synthetic-not-in-the-corpus"] = m[orig]
 			delete(m, orig)
-			bogus(&tr.Arms.WithoutConventions, "seed-synthetic-not-in-the-corpus")
-		}), committedCatchCorpus, `(not in the current corpus): trial 1 outcome "bogus"`},
-		{"corpus unavailable", CatchRateTrialsPath(path), filepath.Join(dir, "no-corpus"), "corpus unavailable"},
+			bogus(tr.Arms[ArmWithoutConventions], "seed-synthetic-not-in-the-corpus")
+		}), committedCatchInputs(), `(not in the current corpus): trial 1 outcome "bogus"`},
+		{"corpus unavailable", CatchRateTrialsPath(path), catchInputs(filepath.Join(dir, "no-corpus"), committedCatchConventions), "corpus unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, err := RescoreCatchRateTrials(tc.trials, tc.corpus)
+			r, err := RescoreCatchRateTrials(tc.trials, tc.in)
 			if err == nil {
 				t.Fatalf("re-scored %+v, want an error naming %q", r.Arms, tc.want)
 			}
@@ -448,7 +482,7 @@ func TestRescoreCatchRateTrials_RenderStatesLowerBound(t *testing.T) {
 			t.Errorf("Render lacks %q:\n%s", want, out)
 		}
 	}
-	for _, name := range sortedTrialCaseNames(tr.Arms.WithoutConventions.PerCase) {
+	for _, name := range sortedTrialCaseNames(tr.Arms[ArmWithoutConventions].PerCase) {
 		if !strings.Contains(out, "\n  "+name+": without_conventions ") {
 			t.Errorf("Render has no case line for %q:\n%s", name, out)
 		}
@@ -463,7 +497,7 @@ func TestRescoreCatchRateTrials_RenderStatesLowerBound(t *testing.T) {
 // (#4361); the margin is inclusive and exact.
 func TestRescoreCatchRateTrials_RenderFlagsTheCeiling(t *testing.T) {
 	out := rescoreOf(t, freshCatchEvidence(t)).Render()
-	if n := strings.Count(out, "AT CEILING"); n != 2 {
+	if n := strings.Count(out, "AT CEILING"); n != 3 {
 		t.Errorf("an all-caught sidecar is flagged at ceiling %d times, want once per arm:\n%s", n, out)
 	}
 	for _, tc := range []struct {
@@ -473,6 +507,9 @@ func TestRescoreCatchRateTrials_RenderFlagsTheCeiling(t *testing.T) {
 		{CatchRescoreCounts{Trials: 100, Attributed: 13, RescoredCaught: 10}, true},
 		{CatchRescoreCounts{Trials: 100, Attributed: 14, RescoredCaught: 10}, false},
 		{CatchRescoreCounts{Trials: 0}, false},
+		{CatchRescoreCounts{Trials: 100, Attributed: 0, RescoredCaught: 0}, false},
+		{CatchRescoreCounts{Trials: 200, CleanTrials: 100, Attributed: 13, RescoredCaught: 10}, true},
+		{CatchRescoreCounts{Trials: 200, CleanTrials: 100, Attributed: 14, RescoredCaught: 10}, false},
 	} {
 		if got := atCatchCeiling(tc.p); got != tc.want {
 			t.Errorf("atCatchCeiling(%+v) = %v, want %v", tc.p, got, tc.want)
@@ -485,20 +522,22 @@ func TestRescoreCatchRateTrials_RenderFlagsTheCeiling(t *testing.T) {
 // recorded tallies equal the committed record's. It asserts no rate, so it
 // stays true across a re-recording.
 func TestRescoreCatchRateTrials_CommittedSidecar(t *testing.T) {
-	r, err := RescoreCatchRateTrials(CatchRateTrialsPath(committedCatchEvidence), committedCatchCorpus)
+	r, err := RescoreCatchRateTrials(CatchRateTrialsPath(committedCatchEvidence), committedCatchInputs())
 	if err != nil {
 		t.Fatalf("the committed sidecar does not re-score: %v", err)
 	}
+	// A LOOSE decode: the committed pair is v1 until the shared #4313/#4314
+	// re-pin recording, v2 after it; both carry arms.<name>.per_case.
 	var rec CatchRateEvidence
-	if err := decodeStrictJSON(mustRead(t, committedCatchEvidence), &rec); err != nil {
+	if err := json.Unmarshal(mustRead(t, committedCatchEvidence), &rec); err != nil {
 		t.Fatal(err)
 	}
 	for _, a := range []struct {
 		arm    string
 		counts map[string]CaseCatchCounts
 	}{
-		{ArmWithoutConventions, rec.Arms.WithoutConventions.PerCase},
-		{ArmWithConventions, rec.Arms.WithConventions.PerCase},
+		{ArmWithoutConventions, rec.Arms[ArmWithoutConventions].PerCase},
+		{ArmWithConventions, rec.Arms[ArmWithConventions].PerCase},
 	} {
 		arm := rescoreArmOf(t, r, a.arm)
 		if len(arm.PerCase) == 0 {

@@ -6510,11 +6510,25 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		env  []string
+		// inherited seeds the PARENT environment (os.Environ) with these
+		// entries via t.Setenv before the capture (#4393/#4394).
+		inherited []string
 	}{
-		{"nil caller env", nil},
-		{"non-empty caller env", callerEnv},
+		{"nil caller env", nil, nil},
+		{"non-empty caller env", callerEnv, nil},
+		// The runner's gate env can already carry the GIT_CONFIG_* triple a
+		// caller passes, so os.Environ() holds an identical entry BEFORE the
+		// pins. A first-occurrence lookup finds that inherited copy and
+		// false-REDs; the ordering check reads the LAST occurrence, which is
+		// the one git honours (#4393/#4394). t.Setenv makes this test and its
+		// subtests non-parallel by construction.
+		{"caller env also inherited", callerEnv, callerEnv},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			for _, kv := range tc.inherited {
+				k, v, _ := strings.Cut(kv, "=")
+				t.Setenv(k, v)
+			}
 			cmd := capture(func(p *Pusher) {
 				_, _ = p.runOutEnv(context.Background(), dir, tc.env, "version")
 			})
@@ -6529,14 +6543,17 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 			// The caller's entries must come AFTER the pins so a caller (or
 			// authedRemoteOp) keeps the last word, and the pins must come
 			// after os.Environ() so an inherited GIT_TERMINAL_PROMPT=1 loses.
+			// Positions are the LAST occurrence: exec resolves a duplicated key
+			// to its last entry, and an inherited copy of a caller entry sits
+			// in os.Environ() ahead of the pins (#4393/#4394).
 			lastPin := -1
 			for _, pin := range NonInteractiveEnv() {
-				if i := slices.Index(cmd.Env, pin); i > lastPin {
+				if i := lastIndex(cmd.Env, pin); i > lastPin {
 					lastPin = i
 				}
 			}
 			for _, e := range tc.env {
-				if i := slices.Index(cmd.Env, e); i < lastPin {
+				if i := lastIndex(cmd.Env, e); i < lastPin {
 					t.Errorf("caller env %q is at %d, before the last pin at %d; caller entries must win", e, i, lastPin)
 				}
 			}
@@ -6553,6 +6570,16 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 			}
 		}
 	})
+}
+
+// lastIndex returns the index of the LAST element of s equal to v, or -1.
+func lastIndex(s []string, v string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == v {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestRunOutEnv_NoCredential_FailsFastNotPrompt is the DONE-MEANS test for the
