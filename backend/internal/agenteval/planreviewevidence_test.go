@@ -5,15 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/personaprompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
@@ -26,24 +29,91 @@ import (
 // the record's shape.
 // ---------------------------------------------------------------------------
 
-// scriptedCatchSender answers the first caught[arm] calls of each arm with a
-// verdict whose ONE concern names every committed case's planted criterion
-// id(s) and first probe — so it satisfies both halves of every case's catch
-// rule — and every later call with a concern-free verdict.
+// scriptedCatchSender answers the first caught[arm] calls of each
+// conventions arm with a verdict whose ONE concern names every committed
+// case's planted criterion id(s) and first probe — so it satisfies both
+// halves of every case's catch rule — and every later call with a
+// concern-free verdict. The architect arm is routed on the persona remit
+// heading (catchArmOf) and answered PER CASE (the rendered persona prompt
+// identifies the case, committedPersonaScript): its first caught[architect]
+// catch-case calls get the case's first catching example, every later one a
+// concern-free verdict; its first falseAlarms clean-case calls get the case's
+// first false-alarm example, every later one a concern-free verdict. So every
+// seeded count exists BY CONSTRUCTION.
 type scriptedCatchSender struct {
-	caught map[string]int
-	note   string
-	err    error
-	calls  map[string]int
+	caught      map[string]int
+	falseAlarms int
+	note        string
+	err         error
+	calls       map[string]int
+	cleanCalls  int
+	persona     map[string]personaScriptCase
 }
 
 func newScriptedCatchSender(t *testing.T, withoutCaught, withCaught int) *scriptedCatchSender {
 	t.Helper()
 	return &scriptedCatchSender{
-		caught: map[string]int{ArmWithoutConventions: withoutCaught, ArmWithConventions: withCaught},
-		note:   allCaseCatchNote(t),
-		calls:  map[string]int{},
+		caught:  map[string]int{ArmWithoutConventions: withoutCaught, ArmWithConventions: withCaught, ArmArchitect: math.MaxInt},
+		note:    allCaseCatchNote(t),
+		calls:   map[string]int{},
+		persona: committedPersonaScript(t),
 	}
+}
+
+// personaScriptCase is what the scripted sender answers for one persona case.
+type personaScriptCase struct {
+	name       string
+	clean      bool
+	catching   string // a verdict carrying the case's first catching example
+	falseAlarm string // a verdict carrying the case's first false-alarm example
+}
+
+var (
+	personaScriptOnce sync.Once
+	personaScript     map[string]personaScriptCase
+	personaScriptErr  error
+)
+
+// committedPersonaScript maps each committed persona case's RENDERED persona
+// prompt to its scripted answers. Computed once per test process.
+func committedPersonaScript(t *testing.T) map[string]personaScriptCase {
+	t.Helper()
+	personaScriptOnce.Do(func() {
+		cases, err := LoadPersonaCatchCorpus(committedPersonaCorpus, personaTestRepoRoot, ArmArchitect)
+		if err != nil {
+			personaScriptErr = err
+			return
+		}
+		personaScript = make(map[string]personaScriptCase, len(cases))
+		for _, c := range cases {
+			r, err := PersonaArmPrompt(c, personaTestRepoRoot)
+			if err != nil {
+				personaScriptErr = err
+				return
+			}
+			sc := personaScriptCase{name: c.Name, clean: c.Expect() == CatchExpectClean}
+			if sc.clean {
+				ex := c.Input.FalseAlarmExamples[0]
+				sc.falseAlarm = personaVerdictJSON(ex.Category, ex.Note)
+			} else {
+				ex := c.Input.CatchingExamples[0]
+				sc.catching = personaVerdictJSON(ex.Category, ex.Note)
+			}
+			personaScript[r.Prompt] = sc
+		}
+	})
+	if personaScriptErr != nil {
+		t.Fatalf("committed persona script: %v", personaScriptErr)
+	}
+	return personaScript
+}
+
+// personaVerdictJSON is a persona verdict with ONE medium concern.
+func personaVerdictJSON(category, note string) string {
+	b, _ := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{
+		map[string]any{"severity": "medium", "category": category, "note": note},
+	}})
+	return string(b)
 }
 
 // allCaseCatchNote is one concern note naming every committed case's planted
@@ -59,8 +129,13 @@ func allCaseCatchNote(t *testing.T) string {
 	return "the plan's criteria are defective: " + strings.Join(terms, "; ")
 }
 
-// catchArmOf is the arm a fake sender's user prompt belongs to.
+// catchArmOf is the arm a fake sender's user prompt belongs to: the persona
+// remit heading routes to the architect arm, the conventions heading to the
+// with-conventions arm.
 func catchArmOf(userText string) string {
+	if strings.Contains(userText, personaprompt.Framing(ArmArchitect).Heading) {
+		return ArmArchitect
+	}
 	if strings.Contains(userText, "### "+prompt.ReviewConventionsHeading) {
 		return ArmWithConventions
 	}
@@ -71,9 +146,26 @@ func (s *scriptedCatchSender) Messages(_ context.Context, _, userText string) (s
 	if s.err != nil {
 		return "", "", 0, 0, 0, 0, s.err
 	}
-	arm := ArmWithoutConventions
-	if strings.Contains(userText, "### "+prompt.ReviewConventionsHeading) {
-		arm = ArmWithConventions
+	arm := catchArmOf(userText)
+	if arm == ArmArchitect {
+		sc, ok := s.persona[userText]
+		if !ok {
+			return "", "", 0, 0, 0, 0, errors.New("scripted sender: an architect prompt matching no committed persona case")
+		}
+		if sc.clean {
+			n := s.cleanCalls
+			s.cleanCalls++
+			if n < s.falseAlarms {
+				return sc.falseAlarm, "fake-model", 0, 0, 0, 0, nil
+			}
+			return `{"verdict":"approve","concerns":[]}`, "fake-model", 0, 0, 0, 0, nil
+		}
+		n := s.calls[arm]
+		s.calls[arm]++
+		if n < s.caught[arm] {
+			return sc.catching, "fake-model", 0, 0, 0, 0, nil
+		}
+		return `{"verdict":"approve","concerns":[]}`, "fake-model", 0, 0, 0, 0, nil
 	}
 	n := s.calls[arm]
 	s.calls[arm]++
@@ -87,7 +179,32 @@ func (s *scriptedCatchSender) Messages(_ context.Context, _, userText string) (s
 }
 
 func (s *scriptedCatchSender) total() int {
-	return s.calls[ArmWithoutConventions] + s.calls[ArmWithConventions]
+	return s.calls[ArmWithoutConventions] + s.calls[ArmWithConventions] + s.calls[ArmArchitect] + s.cleanCalls
+}
+
+// catchInputs is the committed arm-table inputs with the conventions arms'
+// corpus and fixture replaced.
+func catchInputs(corpus, conventions string) CatchRateInputs {
+	in := committedCatchInputs()
+	in.CorpusDir, in.ConventionsPath = corpus, conventions
+	return in
+}
+
+// setArmSamples sets one arm's samples_per_case.
+func setArmSamples(arms CatchRateEvidenceArms, name string, n int) {
+	a := arms[name]
+	a.SamplesPerCase = n
+	arms[name] = a
+}
+
+// committedCatchInputs is the committed arm-table inputs.
+func committedCatchInputs() CatchRateInputs {
+	return CatchRateInputs{
+		CorpusDir:        committedCatchCorpus,
+		ConventionsPath:  committedCatchConventions,
+		PersonaCorpusDir: committedPersonaCorpus,
+		RepoRoot:         personaTestRepoRoot,
+	}
 }
 
 const testCatchModel = "fixture-generator-model"
@@ -109,7 +226,7 @@ var catchT0 = time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 
 func record(t *testing.T, sender MessageSender, path string, now time.Time, opts RecordCatchRateOptions) (string, error) {
 	t.Helper()
-	return RecordCatchRateEvidence(context.Background(), sender, testCatchModel, committedCatchCorpus, committedCatchConventions, path, now, opts)
+	return RecordCatchRateEvidence(context.Background(), sender, testCatchModel, committedCatchInputs(), path, now, opts)
 }
 
 func pin(reason string) RecordCatchRateOptions {
@@ -250,7 +367,7 @@ func copyCatchCorpus(t *testing.T) string {
 
 func TestCheckCatchRateEvidence_PassesOnFreshRecord(t *testing.T) {
 	path := freshCatchEvidence(t)
-	report, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, testCatchModel)
+	report, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel)
 	if err != nil {
 		t.Fatalf("CheckCatchRateEvidence on a fresh record: %v", err)
 	}
@@ -285,7 +402,7 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 		trialsRaw    func(raw []byte) []byte
 		deleteTrials bool
 	}{
-		{name: "(1) absent evidence file", path: func(dir string) string { return filepath.Join(dir, "nope.json") }, want: "absent: no two-arm measurement"},
+		{name: "(1) absent evidence file", path: func(dir string) string { return filepath.Join(dir, "nope.json") }, want: "absent: no arm-keyed measurement"},
 		{name: "(2) malformed JSON", raw: func([]byte) []byte { return []byte("{") }, want: "malformed JSON"},
 		{name: "(2) a second object after a valid record", raw: func(raw []byte) []byte {
 			return append(append([]byte{}, raw...), `{"schema":"planreview-catchrate-evidence-v1"}`...)
@@ -304,21 +421,21 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 		{name: "(4) generator model mismatch", model: "another-model", want: "generator model"},
 		{name: "(5) tolerance differs", mutate: func(r *CatchRateEvidence) { r.Tolerance = 0.2 }, want: "tolerance"},
 		{name: "(5) min trials differs", mutate: func(r *CatchRateEvidence) { r.MinTrialsPerArm = 100 }, want: "min_trials_per_arm"},
-		{name: "(6) samples_per_case below 1", mutate: func(r *CatchRateEvidence) { r.SamplesPerCase = 0 }, want: "must be >= 1"},
+		{name: "(6) samples_per_case below 1", mutate: func(r *CatchRateEvidence) { setArmSamples(r.Arms, ArmWithoutConventions, 0) }, want: "must be >= 1"},
 		{name: "(6) negative count", mutate: func(r *CatchRateEvidence) {
-			m := r.Arms.WithConventions.PerCase
+			m := r.Arms[ArmWithConventions].PerCase
 			c := m[firstCase(m)]
 			c.Undecodable = -1
 			m[firstCase(m)] = c
 		}, want: "inconsistent counts in arm"},
 		{name: "(6) caught+undecodable > trials, every count in bounds, totals >= 136", mutate: func(r *CatchRateEvidence) {
-			m := r.Arms.WithoutConventions.PerCase
+			m := r.Arms[ArmWithoutConventions].PerCase
 			c := m[firstCase(m)]
 			c.Caught, c.Undecodable = c.Trials-3, 5 // each <= trials; the sum is not
 			m[firstCase(m)] = c
 		}, want: "inconsistent counts in arm"},
 		{name: "(6) per-case trials != samples_per_case, arms agree, totals >= 136", mutate: func(r *CatchRateEvidence) {
-			for _, m := range []map[string]CaseCatchCounts{r.Arms.WithoutConventions.PerCase, r.Arms.WithConventions.PerCase} {
+			for _, m := range []map[string]CaseCatchCounts{r.Arms[ArmWithoutConventions].PerCase, r.Arms[ArmWithConventions].PerCase} {
 				names := sortedCaseNames(m)
 				a, b := m[names[0]], m[names[1]]
 				a.Trials, a.Caught = samples-1, samples-1
@@ -327,14 +444,14 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 			}
 		}, want: "not samples_per_case"},
 		{name: "(6) arms disagree on the case set: with arm lacks a case", mutate: func(r *CatchRateEvidence) {
-			m := r.Arms.WithConventions.PerCase
+			m := r.Arms[ArmWithConventions].PerCase
 			delete(m, firstCase(m))
 		}, want: "disagree on the case set"},
 		{name: "(6) arms disagree on the case set: with arm carries an extra case, totals >= 136", mutate: func(r *CatchRateEvidence) {
-			r.Arms.WithConventions.PerCase["zz-not-in-without-arm"] = CaseCatchCounts{Trials: samples, Caught: samples}
+			r.Arms[ArmWithConventions].PerCase["zz-not-in-without-arm"] = CaseCatchCounts{Trials: samples, Caught: samples}
 		}, want: "disagree on the case set"},
 		{name: "(6) arms disagree on per-case trial weights, totals >= 136", mutate: func(r *CatchRateEvidence) {
-			m := r.Arms.WithoutConventions.PerCase
+			m := r.Arms[ArmWithoutConventions].PerCase
 			names := sortedCaseNames(m)
 			a, b := m[names[0]], m[names[1]]
 			a.Trials, a.Caught = samples-1, samples-1
@@ -343,15 +460,16 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 		}, want: "trial weight"},
 		{name: "(7) case set differs from the corpus (baseline agrees)", mutate: func(r *CatchRateEvidence) {
 			for _, m := range []map[string]CaseCatchCounts{
-				r.Arms.WithoutConventions.PerCase, r.Arms.WithConventions.PerCase,
-				r.Baseline.Arms.WithoutConventions.PerCase, r.Baseline.Arms.WithConventions.PerCase,
+				r.Arms[ArmWithoutConventions].PerCase, r.Arms[ArmWithConventions].PerCase,
+				r.Baseline.Arms[ArmWithoutConventions].PerCase, r.Baseline.Arms[ArmWithConventions].PerCase,
 			} {
 				renameCase(m, firstCase(m), "zz-retired-case")
 			}
 		}, want: "differs from the current corpus"},
 		{name: "(8) under-powered arms", mutate: func(r *CatchRateEvidence) {
-			r.SamplesPerCase = 1
-			for _, m := range []map[string]CaseCatchCounts{r.Arms.WithoutConventions.PerCase, r.Arms.WithConventions.PerCase} {
+			setArmSamples(r.Arms, ArmWithoutConventions, 1)
+			setArmSamples(r.Arms, ArmWithConventions, 1)
+			for _, m := range []map[string]CaseCatchCounts{r.Arms[ArmWithoutConventions].PerCase, r.Arms[ArmWithConventions].PerCase} {
 				for name := range m {
 					m[name] = CaseCatchCounts{Trials: 1, Caught: 1}
 				}
@@ -360,35 +478,36 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 		{name: "(9) within-run regression, recomputed from counts (baseline agrees)", mutate: func(r *CatchRateEvidence) {
 			// 0.30 below the without arm; the baseline's with arm is moved to
 			// match, so only the within-run rule can refuse it.
-			setCaught(r.Arms.WithConventions.PerCase, int(math.Round(0.7*float64(samples))))
-			setCaught(r.Baseline.Arms.WithConventions.PerCase, int(math.Round(0.7*float64(samples))))
+			setCaught(r.Arms[ArmWithConventions].PerCase, int(math.Round(0.7*float64(samples))))
+			setCaught(r.Baseline.Arms[ArmWithConventions].PerCase, int(math.Round(0.7*float64(samples))))
 		}, want: "below the without-conventions arm", regressed: true},
 		{name: "(10) missing baseline", mutate: func(r *CatchRateEvidence) { r.Baseline = nil }, want: "no pinned baseline"},
 		{name: "(10) baseline without a reason", mutate: func(r *CatchRateEvidence) { r.Baseline.Reason = " " }, want: "no reason"},
 		{name: "(10) baseline without a timestamp", mutate: func(r *CatchRateEvidence) { r.Baseline.PinnedAt = "yesterday" }, want: "RFC 3339"},
 		{name: "(10) baseline with inconsistent counts", mutate: func(r *CatchRateEvidence) {
-			m := r.Baseline.Arms.WithoutConventions.PerCase
+			m := r.Baseline.Arms[ArmWithoutConventions].PerCase
 			c := m[firstCase(m)]
 			c.Caught = c.Trials + 1
 			m[firstCase(m)] = c
 		}, want: "pinned baseline: inconsistent counts"},
 		{name: "(10) baseline from another generator model", mutate: func(r *CatchRateEvidence) { r.Baseline.GeneratorModel = "another-model" }, want: "not comparable"},
 		{name: "(10) baseline from another corpus", mutate: func(r *CatchRateEvidence) {
-			for _, m := range []map[string]CaseCatchCounts{r.Baseline.Arms.WithoutConventions.PerCase, r.Baseline.Arms.WithConventions.PerCase} {
+			for _, m := range []map[string]CaseCatchCounts{r.Baseline.Arms[ArmWithoutConventions].PerCase, r.Baseline.Arms[ArmWithConventions].PerCase} {
 				renameCase(m, firstCase(m), "zz-retired-case")
 			}
 		}, want: "corpus changed"},
 		{name: "(10) baseline with another samples_per_case", mutate: func(r *CatchRateEvidence) {
-			r.Baseline.SamplesPerCase = samples + 1
-			for _, m := range []map[string]CaseCatchCounts{r.Baseline.Arms.WithoutConventions.PerCase, r.Baseline.Arms.WithConventions.PerCase} {
+			setArmSamples(r.Baseline.Arms, ArmWithoutConventions, samples+1)
+			setArmSamples(r.Baseline.Arms, ArmWithConventions, samples+1)
+			for _, m := range []map[string]CaseCatchCounts{r.Baseline.Arms[ArmWithoutConventions].PerCase, r.Baseline.Arms[ArmWithConventions].PerCase} {
 				for name := range m {
 					m[name] = CaseCatchCounts{Trials: samples + 1, Caught: samples + 1}
 				}
 			}
 		}, want: "samples_per_case changed"},
 		{name: "(10) both arms equal but 0.17 below the pinned baseline", mutate: func(r *CatchRateEvidence) {
-			setCaught(r.Arms.WithoutConventions.PerCase, int(math.Round(0.83*float64(samples))))
-			setCaught(r.Arms.WithConventions.PerCase, int(math.Round(0.83*float64(samples))))
+			setCaught(r.Arms[ArmWithoutConventions].PerCase, int(math.Round(0.83*float64(samples))))
+			setCaught(r.Arms[ArmWithConventions].PerCase, int(math.Round(0.83*float64(samples))))
 		}, want: "against the pinned baseline", regressed: true},
 		{name: "(11) corpus unavailable", corpus: "testdata/no-such-corpus", want: "corpus unavailable"},
 		{name: "(12) conventions fixture unavailable", conventions: "testdata/planreview-catchrate/no-such.md", want: "conventions fixture unavailable"},
@@ -413,7 +532,7 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 		}, want: "recorded_at"},
 		// (16): each row trips ONE sub-check (approval condition C3).
 		{name: "(16) list length: a missed trial dropped", trials: func(t *testing.T, tr *CatchRateTrials) {
-			m := tr.Arms.WithoutConventions.PerCase
+			m := tr.Arms[ArmWithoutConventions].PerCase
 			name := lastTrialCase(m)
 			list := m[name]
 			if list[len(list)-1].Outcome != CatchMissed {
@@ -422,18 +541,18 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 			m[name] = list[:len(list)-1]
 		}, want: "trials, the record"},
 		{name: "(16) trial indices: a duplicated index", trials: func(_ *testing.T, tr *CatchRateTrials) {
-			list := tr.Arms.WithConventions.PerCase[sortedTrialCaseNames(tr.Arms.WithConventions.PerCase)[0]]
+			list := tr.Arms[ArmWithConventions].PerCase[sortedTrialCaseNames(tr.Arms[ArmWithConventions].PerCase)[0]]
 			list[1].Trial = list[0].Trial
 		}, want: "trial index 1, want 2"},
 		{name: "(16) outcome tallies: a caught trial flipped to missed", trials: func(t *testing.T, tr *CatchRateTrials) {
-			list := tr.Arms.WithoutConventions.PerCase[sortedTrialCaseNames(tr.Arms.WithoutConventions.PerCase)[0]]
+			list := tr.Arms[ArmWithoutConventions].PerCase[sortedTrialCaseNames(tr.Arms[ArmWithoutConventions].PerCase)[0]]
 			if list[0].Outcome != CatchCaught {
 				t.Fatalf("fixture premise: the first trial must be caught, got %q", list[0].Outcome)
 			}
 			list[0].Outcome = CatchMissed
 		}, want: "outcome tallies"},
 		{name: "(16) outcome tallies: an unknown outcome", trials: func(t *testing.T, tr *CatchRateTrials) {
-			m := tr.Arms.WithConventions.PerCase
+			m := tr.Arms[ArmWithConventions].PerCase
 			list := m[lastTrialCase(m)]
 			if list[len(list)-1].Outcome != CatchMissed {
 				t.Fatalf("fixture premise: the last trial must be missed, got %q", list[len(list)-1].Outcome)
@@ -441,7 +560,7 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 			list[len(list)-1].Outcome = "maybe"
 		}, want: "outcome tallies"},
 		{name: "(16) case set: an extra case in one arm", trials: func(_ *testing.T, tr *CatchRateTrials) {
-			tr.Arms.WithoutConventions.PerCase["zz-not-recorded"] = []CatchRateTrialRecord{{Trial: 1, Outcome: CatchMissed, Concerns: []CatchRateTrialConcern{}}}
+			tr.Arms[ArmWithoutConventions].PerCase["zz-not-recorded"] = []CatchRateTrialRecord{{Trial: 1, Outcome: CatchMissed, Concerns: []CatchRateTrialConcern{}}}
 		}, want: "case set"},
 	}
 	if trials < MinCatchRateTrialsPerArm {
@@ -453,7 +572,7 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 			var path string
 			if sidecarRow {
 				path = freshMixedCatchEvidence(t)
-				if _, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, testCatchModel); err != nil {
+				if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
 					t.Fatalf("fixture premise: the unperturbed mixed pair passes: %v", err)
 				}
 			} else {
@@ -497,7 +616,7 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 			if tc.model != "" {
 				model = tc.model
 			}
-			_, err := CheckCatchRateEvidence(path, corpus, conv, model)
+			_, err := CheckCatchRateEvidence(path, catchInputs(corpus, conv), model)
 			if err == nil {
 				t.Fatalf("CheckCatchRateEvidence passed; want a refusal naming %q", tc.want)
 			}
@@ -529,13 +648,13 @@ func TestCheckCatchRateEvidence_StaleFingerprint(t *testing.T) {
 	}
 	path := filepath.Join(dir, "evidence.json")
 	all := committedCatchTrials(t)
-	if _, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, committedCatchCorpus, convPath, path, catchT0, pin("baseline")); err != nil {
+	if _, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, catchInputs(committedCatchCorpus, convPath), path, catchT0, pin("baseline")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CheckCatchRateEvidence(path, committedCatchCorpus, convPath, testCatchModel); err != nil {
+	if _, err := CheckCatchRateEvidence(path, catchInputs(committedCatchCorpus, convPath), testCatchModel); err != nil {
 		t.Fatalf("premise: the record is fresh against its own conventions: %v", err)
 	}
-	_, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, testCatchModel)
+	_, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel)
 	if err == nil || !strings.Contains(err.Error(), "STALE") {
 		t.Fatalf("err = %v, want a STALE fingerprint refusal", err)
 	}
@@ -633,10 +752,10 @@ func TestRecordCatchRateEvidence_CarriesBaselineForward(t *testing.T) {
 	if rec.RecordedAt != catchT0.Add(time.Hour).Format(time.RFC3339) {
 		t.Errorf("recorded_at = %q", rec.RecordedAt)
 	}
-	if _, caught := pooledCounts(rec.Arms.WithConventions.PerCase); caught != k {
+	if _, caught := pooledCounts(rec.Arms[ArmWithConventions].PerCase); caught != k {
 		t.Errorf("with-arm caught = %d, want %d", caught, k)
 	}
-	if _, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, testCatchModel); err != nil {
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
 		t.Errorf("the carried-forward record does not pass the gate: %v", err)
 	}
 }
@@ -656,7 +775,7 @@ func TestRecordCatchRateEvidence_PinMovesBaselineWithReasonAndTimestamp(t *testi
 	if b.Reason != "model refresh" || b.PinnedAt != later.Format(time.RFC3339) {
 		t.Fatalf("baseline = %+v, want reason %q pinned at %s", b, "model refresh", later.Format(time.RFC3339))
 	}
-	if _, caught := pooledCounts(b.Arms.WithoutConventions.PerCase); caught != k {
+	if _, caught := pooledCounts(b.Arms[ArmWithoutConventions].PerCase); caught != k {
 		t.Errorf("pinned without-arm caught = %d, want %d", caught, k)
 	}
 }
@@ -754,19 +873,19 @@ func TestRecordCatchRateEvidence_FailClosed(t *testing.T) {
 		}
 	})
 	t.Run("empty generator model", func(t *testing.T) {
-		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), " ", committedCatchCorpus, committedCatchConventions, filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
+		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), " ", catchInputs(committedCatchCorpus, committedCatchConventions), filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
 		if err == nil || !strings.Contains(err.Error(), "generator model") {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("corpus unavailable", func(t *testing.T) {
-		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, "testdata/no-such-corpus", committedCatchConventions, filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
+		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, catchInputs("testdata/no-such-corpus", committedCatchConventions), filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
 		if err == nil || !strings.Contains(err.Error(), "absent") {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("conventions unavailable", func(t *testing.T) {
-		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, committedCatchCorpus, "testdata/no-such.md", filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
+		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, catchInputs(committedCatchCorpus, "testdata/no-such.md"), filepath.Join(t.TempDir(), "e.json"), catchT0, pin("x"))
 		if err == nil || !strings.Contains(err.Error(), "absent") {
 			t.Fatalf("err = %v", err)
 		}
@@ -807,21 +926,21 @@ func TestRecordCatchRateEvidence_NonComparableBaselineNeedsRePin(t *testing.T) {
 	}
 	n := len(loaded)
 	all := SamplesPerCaseForPower(n) * n
-	_, err = RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, corpus, committedCatchConventions, path, catchT0, RecordCatchRateOptions{})
+	_, err = RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, catchInputs(corpus, committedCatchConventions), path, catchT0, RecordCatchRateOptions{})
 	if err == nil || !strings.Contains(err.Error(), "not comparable") || !strings.Contains(err.Error(), "corpus changed") {
 		t.Fatalf("err = %v, want a non-comparable-baseline refusal", err)
 	}
 	if !bytes.Equal(mustRead(t, path), before) {
 		t.Fatal("the refusal changed the evidence file")
 	}
-	report, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, corpus, committedCatchConventions, path, catchT0, pin("corpus retired a case"))
+	report, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, catchInputs(corpus, committedCatchConventions), path, catchT0, pin("corpus retired a case"))
 	if err != nil {
 		t.Fatalf("re-pin after a corpus change: %v", err)
 	}
 	if !strings.Contains(report, "not comparable") || !strings.Contains(report, "the pin replaces it") {
 		t.Errorf("report does not explain the replaced baseline:\n%s", report)
 	}
-	if got := readCatchEvidence(t, path).Baseline.SamplesPerCase; got != SamplesPerCaseForPower(n) {
+	if got := readCatchEvidence(t, path).Baseline.Arms[ArmWithoutConventions].SamplesPerCase; got != SamplesPerCaseForPower(n) {
 		t.Errorf("re-pinned baseline samples_per_case = %d", got)
 	}
 }
@@ -1000,8 +1119,8 @@ func TestRecordCatchRateEvidence_WritesTrialSidecar(t *testing.T) {
 		counts map[string]CaseCatchCounts
 		trials map[string][]CatchRateTrialRecord
 	}{
-		{ArmWithoutConventions, rec.Arms.WithoutConventions.PerCase, tr.Arms.WithoutConventions.PerCase},
-		{ArmWithConventions, rec.Arms.WithConventions.PerCase, tr.Arms.WithConventions.PerCase},
+		{ArmWithoutConventions, rec.Arms[ArmWithoutConventions].PerCase, tr.Arms[ArmWithoutConventions].PerCase},
+		{ArmWithConventions, rec.Arms[ArmWithConventions].PerCase, tr.Arms[ArmWithConventions].PerCase},
 	} {
 		if !reflect.DeepEqual(sortedTrialCaseNames(a.trials), sortedCaseNames(a.counts)) {
 			t.Fatalf("arm %q sidecar cases %v, record cases %v", a.arm, sortedTrialCaseNames(a.trials), sortedCaseNames(a.counts))
@@ -1047,7 +1166,7 @@ func TestRecordCatchRateEvidence_WritesTrialSidecar(t *testing.T) {
 			}
 		}
 	}
-	report, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, testCatchModel)
+	report, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel)
 	if err != nil {
 		t.Fatalf("CheckCatchRateEvidence on the recorded pair: %v", err)
 	}
@@ -1087,8 +1206,8 @@ func TestRecordCatchRateEvidence_SidecarRecordsPhraseAttribution(t *testing.T) {
 	tr := readCatchTrials(t, path)
 	caught := 0
 	for arm, perCase := range map[string]map[string][]CatchRateTrialRecord{
-		ArmWithoutConventions: tr.Arms.WithoutConventions.PerCase,
-		ArmWithConventions:    tr.Arms.WithConventions.PerCase,
+		ArmWithoutConventions: tr.Arms[ArmWithoutConventions].PerCase,
+		ArmWithConventions:    tr.Arms[ArmWithConventions].PerCase,
 	} {
 		for name, list := range perCase {
 			for _, r := range list {
@@ -1123,7 +1242,7 @@ func TestRecordCatchRateEvidence_TrialSidecarRedacts(t *testing.T) {
 	}
 	const marker = "[REDACTED:github-pat-classic]"
 	var notes, categories, severities, excerpts int
-	for _, list := range tr.Arms.WithoutConventions.PerCase {
+	for _, list := range tr.Arms[ArmWithoutConventions].PerCase {
 		for _, r := range list {
 			if r.Outcome == CatchMissed {
 				if strings.Contains(r.Concerns[0].Note, marker) {
@@ -1158,7 +1277,7 @@ func TestRecordCatchRateEvidence_TrialSidecarTruncatesRuneSafely(t *testing.T) {
 	}
 	want := string([]rune(wideRuneNote)[:tr.NoteMaxRunes-utf8.RuneCountInString(catchTrialTruncationMarker)]) + catchTrialTruncationMarker
 	checked := 0
-	for _, list := range tr.Arms.WithConventions.PerCase {
+	for _, list := range tr.Arms[ArmWithConventions].PerCase {
 		for _, r := range list {
 			if r.Outcome != CatchMissed {
 				continue
@@ -1200,7 +1319,7 @@ func TestRecordCatchRateEvidence_TrialSidecarCapsConcerns(t *testing.T) {
 	if err := decodeStrictJSON(raw, &tr); err != nil {
 		t.Fatal(err)
 	}
-	for _, list := range tr.Arms.WithoutConventions.PerCase {
+	for _, list := range tr.Arms[ArmWithoutConventions].PerCase {
 		for _, r := range list {
 			if r.Outcome != CatchMissed {
 				continue
@@ -1248,40 +1367,48 @@ func TestRecordCatchRateEvidence_SidecarWriteFailureLeavesNoPair(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCatchRatePromptFingerprint_Deterministic(t *testing.T) {
-	cases, conv := loadCommittedCatch(t)
-	a, err := CatchRatePromptFingerprint(cases, conv, testCatchModel)
+	a, err := CatchRatePromptFingerprint(committedCatchInputs(), testCatchModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reversed := make([]PlanReviewCatchCase, len(cases))
-	for i, c := range cases {
-		reversed[len(cases)-1-i] = c
-	}
-	b, err := CatchRatePromptFingerprint(reversed, conv, testCatchModel)
+	b, err := CatchRatePromptFingerprint(committedCatchInputs(), testCatchModel)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a != b || !strings.HasPrefix(a, "sha256:") || len(a) != len("sha256:")+64 {
 		t.Fatalf("fingerprints %q / %q: want equal sha256 digests", a, b)
 	}
+	// The per-arm fingerprint is case-order independent.
+	cases, conv := loadCommittedCatch(t)
+	reversed := make([]PlanReviewCatchCase, len(cases))
+	for i, c := range cases {
+		reversed[len(cases)-1-i] = c
+	}
+	x, err := conventionsArmFingerprint(cases, conv, ArmWithConventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := conventionsArmFingerprint(reversed, conv, ArmWithConventions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x != y {
+		t.Fatalf("arm fingerprint depends on case order: %q / %q", x, y)
+	}
 }
 
 func TestCatchRatePromptFingerprint_Sensitive(t *testing.T) {
-	cases, conv := loadCommittedCatch(t)
-	base, err := CatchRatePromptFingerprint(cases, conv, testCatchModel)
+	base, err := CatchRatePromptFingerprint(committedCatchInputs(), testCatchModel)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
+	cases, _ := loadCommittedCatch(t)
 
 	convBytes := mustRead(t, committedCatchConventions)
 	convBytes[len(convBytes)-2] ^= 0x01
 	convPath := filepath.Join(dir, "conv.md")
 	if err := os.WriteFile(convPath, convBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	conv2, err := LoadRepresentativeConventions(convPath)
-	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -1290,24 +1417,31 @@ func TestCatchRatePromptFingerprint_Sensitive(t *testing.T) {
 	if err := os.WriteFile(inputPath, append(mustRead(t, inputPath), '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cases2, err := LoadPlanReviewCatchCorpus(corpus)
-	if err != nil {
+	fewer := copyCatchCorpus(t)
+	if err := os.RemoveAll(filepath.Join(fewer, committedSyntheticCatchCases(t)[0])); err != nil {
+		t.Fatal(err)
+	}
+	persona := copyPersonaRepo(t)
+	remit := filepath.Join(persona.RepoRoot, filepath.FromSlash(personaArchitectRemitPath))
+	rb := mustRead(t, remit)
+	rb[len(rb)-2] ^= 0x01
+	if err := os.WriteFile(remit, rb, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, tc := range []struct {
 		name  string
-		cases []PlanReviewCatchCase
-		conv  prompt.ReviewConvention
+		in    CatchRateInputs
 		model string
 	}{
-		{"conventions (one byte)", cases, conv2, testCatchModel},
-		{"corpus review input (one byte)", cases2, conv, testCatchModel},
-		{"generator model", cases, conv, testCatchModel + "x"},
-		{"case set", cases[1:], conv, testCatchModel},
+		{"conventions (one byte)", catchInputs(committedCatchCorpus, convPath), testCatchModel},
+		{"corpus review input (one byte)", catchInputs(corpus, committedCatchConventions), testCatchModel},
+		{"generator model", committedCatchInputs(), testCatchModel + "x"},
+		{"case set", catchInputs(fewer, committedCatchConventions), testCatchModel},
+		{"architect remit (one byte)", persona, testCatchModel},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := CatchRatePromptFingerprint(tc.cases, tc.conv, tc.model)
+			got, err := CatchRatePromptFingerprint(tc.in, tc.model)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1320,9 +1454,56 @@ func TestCatchRatePromptFingerprint_Sensitive(t *testing.T) {
 
 func TestCatchRatePromptFingerprint_RenderErrorPropagates(t *testing.T) {
 	cases, _ := loadCommittedCatch(t)
-	if _, err := CatchRatePromptFingerprint(cases, prompt.ReviewConvention{}, testCatchModel); err == nil {
+	if _, err := conventionsArmFingerprint(cases, prompt.ReviewConvention{}, ArmWithConventions); err == nil {
 		t.Fatal("fingerprint over an empty convention succeeded; want the with-arm render error")
 	}
+	in := committedCatchInputs()
+	in.PersonaCorpusDir = "testdata/no-such-persona-corpus"
+	if _, err := CatchRatePromptFingerprint(in, testCatchModel); err == nil || !strings.Contains(err.Error(), "persona corpus unavailable") {
+		t.Fatalf("err = %v, want the persona corpus refusal", err)
+	}
+	cases2 := loadCommittedPersona(t)
+	broken := func(PersonaCatchCase, string) (PersonaArmRender, error) {
+		return PersonaArmRender{}, errors.New("render down")
+	}
+	if _, err := personaArmFingerprint(cases2, personaTestRepoRoot, broken); err == nil || !strings.Contains(err.Error(), "render down") {
+		t.Fatalf("err = %v, want the persona render error", err)
+	}
+	if _, err := catchRateArmTableWith(committedCatchInputs(), broken); err == nil || !strings.Contains(err.Error(), "render down") {
+		t.Fatalf("err = %v, want the arm table to propagate the persona render error", err)
+	}
+}
+
+// copyPersonaRepo copies the documents the architect arm reads (docs/review
+// and docs/adr) into a temp checkout root and returns the committed inputs
+// pointed at it.
+func copyPersonaRepo(t *testing.T) CatchRateInputs {
+	t.Helper()
+	root := t.TempDir()
+	for _, rel := range []string{"docs/review", "docs/adr"} {
+		src := filepath.Join(personaTestRepoRoot, filepath.FromSlash(rel))
+		err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			r, _ := filepath.Rel(src, p)
+			target := filepath.Join(root, filepath.FromSlash(rel), r)
+			if d.IsDir() {
+				return os.MkdirAll(target, 0o755)
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(target, b, 0o644)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	in := committedCatchInputs()
+	in.RepoRoot = root
+	return in
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,12 +1511,15 @@ func TestCatchRatePromptFingerprint_RenderErrorPropagates(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestREADMEMinimalCatchRateEvidenceIsValid pins the README's documented
-// minimal record to the code: it decodes strictly, carries the schema, the
-// current tolerance and floor, a per_case entry for EVERY committed case and
-// a pinned baseline, and passes every count invariant and both rules — so the
-// documented shape cannot drift from what CheckCatchRateEvidence accepts
-// (only the fingerprint is a placeholder). Adding a corpus case obliges a
-// README update.
+// minimal record to the code. A v2 block must decode strictly, carry the
+// schema, the current tolerance and floor, every arm of the arm table with a
+// per_case entry for EVERY committed case of that arm and a pinned baseline,
+// and pass every count invariant and every rule — so the documented shape
+// cannot drift from what CheckCatchRateEvidence accepts (only the
+// fingerprints are placeholders). A LEGACY v1 block (the README before the
+// #4313 docs slice rewrites it) must be recognised by the version-dispatching
+// reader as legacy — never accepted, never mistaken for a malformed v2 record.
+// Adding a corpus case obliges a README update.
 func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	readme := string(mustRead(t, "README.md"))
 	const begin, end = "<!-- BEGIN minimal-catchrate-evidence -->", "<!-- END minimal-catchrate-evidence -->"
@@ -1348,18 +1532,30 @@ func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	block = strings.TrimPrefix(block, "```json")
 	block = strings.TrimSuffix(block, "```")
 	rec, err := decodeCatchRateEvidence([]byte(block))
+	if errors.Is(err, errLegacyCatchRateEvidence) {
+		t.Logf("README minimal record is the LEGACY %s shape: recognised as legacy; the #4313 docs slice rewrites it as a v2 record", catchRateEvidenceSchemaV1)
+		return
+	}
 	if err != nil {
 		t.Fatalf("README minimal record: %v", err)
 	}
 	if rec.Tolerance != DefaultCatchRateRegressionTolerance || rec.MinTrialsPerArm != MinCatchRateTrialsPerArm {
 		t.Fatalf("README minimal record carries tolerance %v / min trials %d, not the current rule", rec.Tolerance, rec.MinTrialsPerArm)
 	}
-	if err := validateEvidenceArms(rec.SamplesPerCase, rec.Arms); err != nil {
+	if err := validateEvidenceArms(rec.Arms); err != nil {
 		t.Fatalf("README minimal record: %v", err)
 	}
-	cases, _ := loadCommittedCatch(t)
-	if missing, extra := caseSetDiff(rec.Arms.WithoutConventions.PerCase, cases); len(missing)+len(extra) > 0 {
-		t.Fatalf("README minimal record case set differs from the committed corpus (missing %v, unknown %v)", missing, extra)
+	rows, err := catchRateArmTable(committedCatchInputs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkArmSet(rec.Arms, rows); err != nil {
+		t.Fatalf("README minimal record: %v", err)
+	}
+	for _, row := range rows {
+		if err := checkArmCases(rec.Arms[row.name].PerCase, row); err != nil {
+			t.Fatalf("README minimal record: %v", err)
+		}
 	}
 	if rec.Baseline == nil {
 		t.Fatal("README minimal record carries no pinned baseline")
@@ -1370,4 +1566,375 @@ func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	if _, err := judgeCatchRate(*rec, rec.Baseline, false); err != nil {
 		t.Fatalf("README minimal record does not pass the rule: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Arm-keyed v2 (E78.11 / #4313): the per-arm modes.
+// ---------------------------------------------------------------------------
+
+// personaCaseNames returns the first committed catch and clean persona case.
+func personaCaseNames(t *testing.T) (catchCase, cleanCase string) {
+	t.Helper()
+	for _, c := range loadCommittedPersona(t) {
+		if c.Expect() == CatchExpectClean && cleanCase == "" {
+			cleanCase = c.Name
+		}
+		if c.Expect() == CatchExpectCatch && catchCase == "" {
+			catchCase = c.Name
+		}
+	}
+	if catchCase == "" || cleanCase == "" {
+		t.Fatal("the committed persona corpus lacks a catch or a clean case")
+	}
+	return catchCase, cleanCase
+}
+
+func setCounts(arms CatchRateEvidenceArms, arm, name string, f func(*CaseCatchCounts)) {
+	c := arms[arm].PerCase[name]
+	f(&c)
+	arms[arm].PerCase[name] = c
+}
+
+// TestCheckCatchRateEvidence_PerArmModes is one row per new v2 mode, each on
+// a fresh all-arm record with one perturbation.
+func TestCheckCatchRateEvidence_PerArmModes(t *testing.T) {
+	catchCase, cleanCase := personaCaseNames(t)
+	for _, tc := range []struct {
+		name      string
+		mutate    func(r *CatchRateEvidence)
+		raw       func([]byte) []byte
+		trials    func(t *testing.T, tr *CatchRateTrials)
+		want      string
+		regressed bool
+	}{
+		{name: "(3b) a legacy v1 record names the shared re-recording", raw: func([]byte) []byte {
+			return []byte(`{"schema":"planreview-catchrate-evidence-v1","samples_per_case":12,"arms":{}}`)
+		}, want: "#4313/#4314 re-pin recording"},
+		{name: "(6b) false_alarms on a catch case", mutate: func(r *CatchRateEvidence) {
+			setCounts(r.Arms, ArmArchitect, catchCase, func(c *CaseCatchCounts) { c.Caught, c.FalseAlarms = c.Trials-1, 1 })
+		}, want: "on a catch case"},
+		{name: "(6b) caught on a clean case", mutate: func(r *CatchRateEvidence) {
+			setCounts(r.Arms, ArmArchitect, cleanCase, func(c *CaseCatchCounts) { c.Caught = 1 })
+		}, want: "on a clean case"},
+		{name: "(6b) an expect differing from the corpus", mutate: func(r *CatchRateEvidence) {
+			setCounts(r.Arms, ArmArchitect, cleanCase, func(c *CaseCatchCounts) { c.Expect = CatchExpectCatch })
+		}, want: `records expect "catch", the corpus "clean"`},
+		{name: "(7b) a missing architect arm", mutate: func(r *CatchRateEvidence) { delete(r.Arms, ArmArchitect) }, want: `arm "architect" is missing`},
+		{name: "(7b) an unknown arm", mutate: func(r *CatchRateEvidence) { r.Arms["security"] = r.Arms[ArmArchitect] }, want: `unknown arm "security"`},
+		{name: "(7b) an arm kind differing from the arm table", mutate: func(r *CatchRateEvidence) {
+			a := r.Arms[ArmArchitect]
+			a.Kind = CatchRateArmKindConventions
+			r.Arms[ArmArchitect] = a
+		}, want: `kind "conventions" is not the arm table's "persona"`},
+		{name: "(7) an architect case set differing from the corpus", mutate: func(r *CatchRateEvidence) {
+			for _, m := range []map[string]CaseCatchCounts{r.Arms[ArmArchitect].PerCase, r.Baseline.Arms[ArmArchitect].PerCase} {
+				renameCase(m, cleanCase, "zz-retired-persona-case")
+			}
+		}, want: `arm "architect" case set differs from the current corpus`},
+		{name: "(10d) an arm set differing from the baseline's", mutate: func(r *CatchRateEvidence) {
+			delete(r.Baseline.Arms, ArmArchitect)
+		}, want: "arm set changed"},
+		{name: "(10) an architect samples_per_case differing from the baseline's", mutate: func(r *CatchRateEvidence) {
+			b := r.Baseline.Arms[ArmArchitect]
+			b.SamplesPerCase++
+			for name, c := range b.PerCase {
+				c.Trials++
+				if c.IsClean() {
+					c.FalseAlarms = 0
+				} else {
+					c.Caught = c.Trials
+				}
+				b.PerCase[name] = c
+			}
+			r.Baseline.Arms[ArmArchitect] = b
+		}, want: `arm "architect" samples_per_case changed`},
+		{name: "(10b) an architect catch-rate drop", mutate: func(r *CatchRateEvidence) {
+			for name, c := range r.Arms[ArmArchitect].PerCase {
+				if !c.IsClean() {
+					c.Caught = c.Trials - 6 // 18 of 138 fewer: 0.130 below the pinned 1.000
+					r.Arms[ArmArchitect].PerCase[name] = c
+				}
+			}
+		}, want: "architect catch rate", regressed: true},
+		{name: "(16b) a clean case's sidecar tally mismatch", trials: func(t *testing.T, tr *CatchRateTrials) {
+			list := tr.Arms[ArmArchitect].PerCase[cleanCase]
+			if list[0].Outcome != CatchNoFalseAlarm {
+				t.Fatalf("fixture premise: the first clean trial is no_false_alarm, got %q", list[0].Outcome)
+			}
+			list[0].Outcome = CatchFalseAlarm
+		}, want: "outcome tallies"},
+		// EVERY trial of the clean case relabelled missed: the catch-class sum
+		// (caught+missed+undecodable) then equals the list length, so only the
+		// clean-class tally refuses it.
+		{name: "(16b) a catch-class outcome on a clean case's sidecar", trials: func(_ *testing.T, tr *CatchRateTrials) {
+			for i := range tr.Arms[ArmArchitect].PerCase[cleanCase] {
+				tr.Arms[ArmArchitect].PerCase[cleanCase][i].Outcome = CatchMissed
+			}
+		}, want: "outcome tallies"},
+		{name: "(16) a sidecar arm set differing from the record's", trials: func(_ *testing.T, tr *CatchRateTrials) {
+			delete(tr.Arms, ArmArchitect)
+		}, want: "arm set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := freshCatchEvidence(t)
+			if tc.mutate != nil {
+				rec := readCatchEvidence(t, path)
+				tc.mutate(&rec)
+				writeCatchEvidence(t, path, rec)
+			}
+			if tc.raw != nil {
+				if err := os.WriteFile(path, tc.raw(mustRead(t, path)), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.trials != nil {
+				tr := readCatchTrials(t, path)
+				tc.trials(t, &tr)
+				writeCatchTrials(t, path, tr)
+			}
+			_, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a refusal naming %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), catchRateRunbook) {
+				t.Errorf("err = %v, want it to name the run-book", err)
+			}
+			if got := errors.Is(err, ErrCatchRateRegressed); got != tc.regressed {
+				t.Errorf("errors.Is(err, ErrCatchRateRegressed) = %v, want %v (err %v)", got, tc.regressed, err)
+			}
+		})
+	}
+}
+
+// TestCheckCatchRateEvidence_PerArmStaleness is mode (4b): a record taken
+// against a checkout copy, then ONE byte of the copied architect remit edited.
+// The gate fails STALE naming the architect arm only — the conventions arms
+// are fresh.
+func TestCheckCatchRateEvidence_PerArmStaleness(t *testing.T) {
+	in := copyPersonaRepo(t)
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	all := committedCatchTrials(t)
+	sender := newScriptedCatchSender(t, all, all)
+	sender.persona = personaScriptFor(t, in.RepoRoot)
+	if _, err := RecordCatchRateEvidence(context.Background(), sender, testCatchModel, in, path, catchT0, pin("baseline")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckCatchRateEvidence(path, in, testCatchModel); err != nil {
+		t.Fatalf("premise: the record is fresh against its own checkout: %v", err)
+	}
+	remit := filepath.Join(in.RepoRoot, filepath.FromSlash(personaArchitectRemitPath))
+	b := mustRead(t, remit)
+	b[len(b)-2] ^= 0x01
+	if err := os.WriteFile(remit, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := CheckCatchRateEvidence(path, in, testCatchModel)
+	if err == nil || !strings.Contains(err.Error(), "STALE arm(s) architect:") {
+		t.Fatalf("err = %v, want a STALE refusal naming ONLY the architect arm", err)
+	}
+}
+
+// personaScriptFor is committedPersonaScript over another checkout root (the
+// rendered prompts differ only by that checkout's documents).
+func personaScriptFor(t *testing.T, repoRoot string) map[string]personaScriptCase {
+	t.Helper()
+	out := map[string]personaScriptCase{}
+	for _, c := range loadCommittedPersona(t) {
+		r, err := PersonaArmPrompt(c, repoRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := personaScriptCase{name: c.Name, clean: c.Expect() == CatchExpectClean}
+		if sc.clean {
+			sc.falseAlarm = personaVerdictJSON(c.Input.FalseAlarmExamples[0].Category, c.Input.FalseAlarmExamples[0].Note)
+		} else {
+			sc.catching = personaVerdictJSON(c.Input.CatchingExamples[0].Category, c.Input.CatchingExamples[0].Note)
+		}
+		out[r.Prompt] = sc
+	}
+	return out
+}
+
+// TestRecordCatchRateEvidence_FalseAlarmRiseRegresses is mode (10c): pin with
+// zero false alarms, then re-record with 16 of the 138 clean trials
+// false-alarming (0.116 above the pinned 0.000). The recording is REFUSED for
+// the regression reason and the files stay byte-identical.
+func TestRecordCatchRateEvidence_FalseAlarmRiseRegresses(t *testing.T) {
+	path := freshCatchEvidence(t)
+	before, beforeTrials := mustRead(t, path), mustRead(t, CatchRateTrialsPath(path))
+	all := committedCatchTrials(t)
+	sender := newScriptedCatchSender(t, all, all)
+	sender.falseAlarms = 16
+	report, err := record(t, sender, path, catchT0.Add(time.Hour), RecordCatchRateOptions{})
+	if err == nil || !errors.Is(err, ErrCatchRateRegressed) || !strings.Contains(err.Error(), "architect false-alarm rate") {
+		t.Fatalf("err = %v, want a false-alarm-rate regression of the architect arm", err)
+	}
+	if !strings.Contains(report, "false alarm 16/138") {
+		t.Errorf("report does not carry the measured false alarms:\n%s", report)
+	}
+	if !bytes.Equal(mustRead(t, path), before) || !bytes.Equal(mustRead(t, CatchRateTrialsPath(path)), beforeTrials) {
+		t.Fatal("a refused recording changed the evidence pair")
+	}
+	t.Run("a rise of at most the tolerance passes", func(t *testing.T) {
+		sender := newScriptedCatchSender(t, all, all)
+		sender.falseAlarms = 13 // 13/138 = 0.094
+		if _, err := record(t, sender, path, catchT0.Add(2*time.Hour), RecordCatchRateOptions{}); err != nil {
+			t.Fatalf("a 0.094 false-alarm rise was refused: %v", err)
+		}
+	})
+}
+
+// judgeFixture is a record with a powered conventions pair (12 x 12, all
+// caught) and an architect arm of nCatch catch cases and nClean clean cases
+// at samples each, with the given pooled caught / false alarms spread over
+// the cases.
+func judgeFixture(samples, nCatch, nClean, caught, alarms int) CatchRateEvidence {
+	conv := func() CatchRateEvidenceArm {
+		pc := map[string]CaseCatchCounts{}
+		for i := 0; i < 12; i++ {
+			pc[fmt.Sprintf("c%02d", i)] = CaseCatchCounts{Trials: 12, Caught: 12}
+		}
+		return CatchRateEvidenceArm{Kind: CatchRateArmKindConventions, SamplesPerCase: 12, PerCase: pc}
+	}
+	arch := CatchRateEvidenceArm{Kind: CatchRateArmKindPersona, SamplesPerCase: samples, PerCase: map[string]CaseCatchCounts{}}
+	for i := 0; i < nCatch; i++ {
+		n := min(caught, samples)
+		caught -= n
+		arch.PerCase[fmt.Sprintf("k%02d", i)] = CaseCatchCounts{Expect: CatchExpectCatch, Trials: samples, Caught: n}
+	}
+	for i := 0; i < nClean; i++ {
+		n := min(alarms, samples)
+		alarms -= n
+		arch.PerCase[fmt.Sprintf("z%02d", i)] = CaseCatchCounts{Expect: CatchExpectClean, Trials: samples, FalseAlarms: n}
+	}
+	return CatchRateEvidence{
+		GeneratorModel: testCatchModel,
+		Arms:           CatchRateEvidenceArms{ArmWithoutConventions: conv(), ArmWithConventions: conv(), ArmArchitect: arch},
+	}
+}
+
+func baselineOf(rec CatchRateEvidence) *CatchRateBaseline {
+	return &CatchRateBaseline{PinnedAt: "2026-10-07T00:00:00Z", Reason: "fixture", GeneratorModel: rec.GeneratorModel, Arms: cloneEvidenceArms(rec.Arms)}
+}
+
+// TestJudgeCatchRate_PerArmBaselineBoundary is mode (10b) at the boundary:
+// an architect catch-rate drop of EXACTLY 0.10 passes, one trial more fails;
+// the same for a false-alarm rise. Exact rationals over 3 x 50 trials.
+func TestJudgeCatchRate_PerArmBaselineBoundary(t *testing.T) {
+	ref := baselineOf(judgeFixture(50, 3, 3, 150, 0))
+	for _, tc := range []struct {
+		name           string
+		caught, alarms int
+		want           string
+	}{
+		{"catch drop exactly 0.10", 135, 0, ""},
+		{"catch drop above 0.10", 134, 0, "architect catch rate"},
+		{"false-alarm rise exactly 0.10", 150, 15, ""},
+		{"false-alarm rise above 0.10", 150, 16, "architect false-alarm rate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := judgeCatchRate(judgeFixture(50, 3, 3, tc.caught, tc.alarms), ref, false)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("judgeCatchRate: %v", err)
+				}
+				return
+			}
+			if err == nil || !errors.Is(err, ErrCatchRateRegressed) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a regression naming %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestJudgeCatchRate_UnderPoweredClass is mode (8b): the catch class clears
+// the floor (3 x 50 = 150) but the clean class does not (1 x 50); the
+// measurement is refused naming the clean class.
+func TestJudgeCatchRate_UnderPoweredClass(t *testing.T) {
+	_, err := judgeCatchRate(judgeFixture(50, 3, 1, 150, 0), nil, false)
+	if err == nil || !strings.Contains(err.Error(), `catch arm "architect" clean class is under-powered: 50 trials < 136`) {
+		t.Fatalf("err = %v, want the clean class refused as under-powered", err)
+	}
+	if _, err := judgeCatchRate(judgeFixture(50, 3, 3, 150, 0), nil, false); err != nil {
+		t.Fatalf("premise: both classes powered passes: %v", err)
+	}
+}
+
+// TestRecordCatchRateEvidence_V1ExistingRequiresPin: over a legacy v1 record a
+// non-pinning recording is refused before any model call with both files
+// byte-identical (read back after the call); a dry run proceeds and writes
+// nothing; a pin replaces the pair with a v2 one.
+func TestRecordCatchRateEvidence_V1ExistingRequiresPin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence.json")
+	legacy := []byte(`{"schema":"planreview-catchrate-evidence-v1","samples_per_case":12,"arms":{"without_conventions":{"per_case":{}},"with_conventions":{"per_case":{}}}}` + "\n")
+	legacyTrials := []byte(`{"schema":"planreview-catchrate-trials-v1"}` + "\n")
+	if err := os.WriteFile(path, legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(CatchRateTrialsPath(path), legacyTrials, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	all := committedCatchTrials(t)
+	sender := newScriptedCatchSender(t, all, all)
+	_, err := record(t, sender, path, catchT0, RecordCatchRateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "legacy planreview-catchrate-evidence-v1") || !strings.Contains(err.Error(), "must pin") {
+		t.Fatalf("err = %v, want the legacy record to require a pin", err)
+	}
+	if sender.total() != 0 {
+		t.Errorf("%d model calls were made before the refusal", sender.total())
+	}
+	if !bytes.Equal(mustRead(t, path), legacy) || !bytes.Equal(mustRead(t, CatchRateTrialsPath(path)), legacyTrials) {
+		t.Fatal("the refusal changed the legacy pair")
+	}
+	report, err := record(t, newScriptedCatchSender(t, all, all), path, catchT0, RecordCatchRateOptions{DryRun: true})
+	if err != nil || !strings.Contains(report, "legacy") || !strings.Contains(report, "Dry run") {
+		t.Fatalf("dry run over a legacy record: err %v, report:\n%s", err, report)
+	}
+	if !bytes.Equal(mustRead(t, path), legacy) {
+		t.Fatal("a dry run changed the legacy record")
+	}
+	report, err = record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("shared #4313/#4314 re-pin"))
+	if err != nil {
+		t.Fatalf("pin over a legacy record: %v", err)
+	}
+	if !strings.Contains(report, "the pin replaces it") {
+		t.Errorf("report does not explain the replaced legacy record:\n%s", report)
+	}
+	if rec := readCatchEvidence(t, path); rec.Schema != CatchRateEvidenceSchema || rec.Baseline == nil || len(rec.Arms) != 3 {
+		t.Fatalf("pinned record = schema %q, baseline %v, %d arms; want a v2 record with three arms and a baseline", rec.Schema, rec.Baseline != nil, len(rec.Arms))
+	}
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
+		t.Fatalf("the pinned v2 pair does not pass the gate: %v", err)
+	}
+}
+
+// TestCatchRuleV5_CommittedSidecarRescoresUnchanged: catch rule v5 is inert on
+// the conventions arms' v4 rules — re-scoring the committed sidecar gains and
+// loses nothing in either conventions arm. Holds for the v1 pair and for the
+// v2 pair the shared recording writes.
+func TestCatchRuleV5_CommittedSidecarRescoresUnchanged(t *testing.T) {
+	r, err := RescoreCatchRateTrials(CatchRateTrialsPath(committedCatchEvidence), committedCatchInputs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, arm := range []string{ArmWithoutConventions, ArmWithConventions} {
+		a := rescoreArmOf(t, r, arm)
+		p := a.Pooled()
+		if p.Trials == 0 {
+			t.Fatalf("arm %q re-scored no trials", arm)
+		}
+		if p.Gained != 0 || p.Lost != 0 || p.RescoredCaught != p.RecordedCaught {
+			t.Errorf("arm %q under catch rule v5: +%d gained / -%d lost (recorded %d, re-scored %d); want identical", arm, p.Gained, p.Lost, p.RecordedCaught, p.RescoredCaught)
+		}
+	}
+}
+
+// pooledCounts sums trials and caught.
+func pooledCounts(perCase map[string]CaseCatchCounts) (trials, caught int) {
+	for _, c := range perCase {
+		trials += c.Trials
+		caught += c.Caught
+	}
+	return trials, caught
 }

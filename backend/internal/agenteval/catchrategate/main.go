@@ -1,5 +1,6 @@
 // Command catchrategate is the OFFLINE plan-review catch-rate gate (E55.4 /
-// #2245). It decides from the committed two-arm evidence record alone — no
+// #2245; arm-keyed v2, E78.11 / #4313). It decides from the committed
+// arm-keyed evidence record alone — no
 // model call, no network — via agenteval.CheckCatchRateEvidence, which
 // recomputes the verdict from the recorded counts and fails closed on an
 // absent, malformed, stale, under-powered or regressed record, and on a
@@ -9,11 +10,18 @@
 // sidecar path: a missed trial's concern notes, with their near-miss tags,
 // are read there.
 //
+// The arm table (agenteval) reads --corpus and --conventions (the conventions
+// arms) and --persona-corpus plus --repo-root (the architect persona arm,
+// whose remit and decision-record index are read from the checkout at
+// --repo-root). A legacy v1 record is refused naming the shared #4313/#4314
+// re-pin recording.
+//
 // --rescore is a DIAGNOSTIC, not a gate verdict (E55.22 / #4355): it
-// re-classifies the sidecar derived from --evidence under the CURRENT --corpus
-// and catch rule via agenteval.RescoreCatchRateTrials, with no model call, and
-// prints the report — per arm and case, recorded vs re-scored catches beside
-// the attribution-only rate. The re-score is a per-arm LOWER BOUND (stored
+// re-classifies the sidecar derived from --evidence under the CURRENT arm
+// table and catch rule via agenteval.RescoreCatchRateTrials, with no model
+// call, and prints the report — per arm and case, recorded vs re-scored
+// catches beside the attribution-only rate, a clean case's false alarms, and
+// an arm the sidecar lacks as NOT RECORDED. The re-score is a per-arm LOWER BOUND (stored
 // notes are truncated, concerns capped, and a caught trial keeps only its
 // matching concern), it never writes evidence, and it never prints PASS, so a
 // probe change can be evaluated with it before paying for a recording.
@@ -36,7 +44,9 @@
 // (agenteval.CatchRateRule: the 0.10 tolerance, the 136-trial floor and its
 // derivation) — on stdout for a pass, on stderr otherwise (so
 // --print-fingerprint's stdout stays the bare digest and --rescore's stdout is
-// never mistaken for a pass).
+// never mistaken for a pass). The rule is per arm: the within-run rule for the
+// conventions pair, then every arm's catch-rate drop and false-alarm-rate rise
+// against the same arm of the pinned baseline.
 package main
 
 import (
@@ -59,6 +69,7 @@ const (
 	defaultEvidenceRel    = "internal/agenteval/testdata/planreview-catchrate/evidence.json"
 	defaultCorpusRel      = "internal/agenteval/testdata/planreview-miss-corpus"
 	defaultConventionsRel = "internal/agenteval/testdata/planreview-catchrate/representative-conventions.md"
+	defaultPersonaRel     = "internal/agenteval/testdata/planreview-persona-corpus/architect"
 )
 
 func main() {
@@ -75,6 +86,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ruleOut = stdout
 	}
 	_, _ = fmt.Fprintln(ruleOut, "catchrategate: "+agenteval.CatchRateRule())
+	_, _ = fmt.Fprintln(ruleOut, "catchrategate: "+agenteval.CatchRateArmRule())
 	return code
 }
 
@@ -85,18 +97,24 @@ func gate(args []string, stdout, stderr io.Writer) (code int, passed bool) {
 	evidence := fs.String("evidence", "", "evidence record (default: the committed "+defaultEvidenceRel+" under the backend module root)")
 	corpus := fs.String("corpus", "", "plan-review-miss corpus dir (default: the committed "+defaultCorpusRel+")")
 	conventions := fs.String("conventions", "", "representative conventions fixture (default: the committed "+defaultConventionsRel+")")
+	personaCorpus := fs.String("persona-corpus", "", "architect persona corpus dir (default: the committed "+defaultPersonaRel+")")
+	repoRoot := fs.String("repo-root", "", "checkout root the persona arm reads docs/review/architect-remit.md and docs/adr/ from (default: the parent of the backend module root)")
 	printFingerprint := fs.Bool("print-fingerprint", false, "print the CURRENT prompt fingerprint and exit 0 (compare with the record's prompt_fingerprint to confirm staleness)")
 	rescore := fs.Bool("rescore", false, "re-score the trial sidecar derived from --evidence under the CURRENT --corpus and catch rule and print the report (a diagnostic per-arm LOWER BOUND, never a PASS; never writes evidence); exits 0")
 	fs.Usage = func() {
 		_, _ = fmt.Fprintf(stderr, `catchrategate — the offline plan-review catch-rate gate (E55.4 / #2245).
 
-Decides from the committed two-arm evidence record (no model call, no network)
+Decides from the committed arm-keyed evidence record (no model call, no network)
 and its per-trial sidecar beside it (<evidence stem>.trials.json, e.g.
 evidence.trials.json; derived from --evidence, never a separate flag).
 Exit 0: the evidence passes. Exit 1: the gate fails (reason on stderr). Exit 2: usage.
 
+The arms: without_conventions and with_conventions (--corpus, --conventions)
+and architect (--persona-corpus, documents read under --repo-root). A legacy
+v1 record is refused: re-record every arm in the shared #4313/#4314 re-pin.
+
 --rescore is a diagnostic, not a gate verdict: it re-classifies the recorded
-trial sidecar under the CURRENT corpus and catch rule with no model call and
+trial sidecar under the CURRENT arm table and catch rule with no model call and
 prints recorded vs re-scored catches (a per-arm LOWER BOUND) beside the
 attribution-only rate. It never writes evidence and never prints PASS: use it
 to evaluate a probe change before paying for a recording. It cannot be
@@ -119,7 +137,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		fs.Usage()
 		return 2, false
 	}
-	if *evidence == "" || *corpus == "" || *conventions == "" {
+	if *evidence == "" || *corpus == "" || *conventions == "" || *personaCorpus == "" || *repoRoot == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
@@ -133,21 +151,14 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		defaultTo(evidence, filepath.Join(root, defaultEvidenceRel))
 		defaultTo(corpus, filepath.Join(root, defaultCorpusRel))
 		defaultTo(conventions, filepath.Join(root, defaultConventionsRel))
+		defaultTo(personaCorpus, filepath.Join(root, defaultPersonaRel))
+		defaultTo(repoRoot, filepath.Dir(root))
 	}
+	inputs := agenteval.CatchRateInputs{CorpusDir: *corpus, ConventionsPath: *conventions, PersonaCorpusDir: *personaCorpus, RepoRoot: *repoRoot}
 	model := agenteval.DefaultCatchRateGeneratorModel
 
 	if *printFingerprint {
-		cases, err := agenteval.LoadPlanReviewCatchCorpus(*corpus)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1, false
-		}
-		conv, err := agenteval.LoadRepresentativeConventions(*conventions)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
-			return 1, false
-		}
-		fp, err := agenteval.CatchRatePromptFingerprint(cases, conv, model)
+		fp, err := agenteval.CatchRatePromptFingerprint(inputs, model)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
 			return 1, false
@@ -157,7 +168,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 	}
 
 	if *rescore {
-		res, err := agenteval.RescoreCatchRateTrials(agenteval.CatchRateTrialsPath(*evidence), *corpus)
+		res, err := agenteval.RescoreCatchRateTrials(agenteval.CatchRateTrialsPath(*evidence), inputs)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: rescore: %v\n", err)
 			return 1, false
@@ -168,7 +179,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		return 0, false
 	}
 
-	report, err := agenteval.CheckCatchRateEvidence(*evidence, *corpus, *conventions, model)
+	report, err := agenteval.CheckCatchRateEvidence(*evidence, inputs, model)
 	if err != nil {
 		if report != "" {
 			_, _ = fmt.Fprintln(stderr, report)
@@ -199,7 +210,7 @@ func findBackendRoot(dir string) (string, error) {
 			}
 		}
 		if parent := filepath.Dir(d); parent == d {
-			return "", fmt.Errorf("cannot locate the backend module root (a go.mod declaring %s) from %s: run inside the checkout or pass --evidence, --corpus and --conventions", backendModulePath, dir)
+			return "", fmt.Errorf("cannot locate the backend module root (a go.mod declaring %s) from %s: run inside the checkout or pass --evidence, --corpus, --conventions, --persona-corpus and --repo-root", backendModulePath, dir)
 		}
 	}
 }
