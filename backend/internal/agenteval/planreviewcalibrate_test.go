@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -242,7 +243,7 @@ func TestCalibrate_FailsClosed(t *testing.T) {
 		samples int
 		want    string
 	}{
-		{"unknown arm", newCalibrationSender(t, nil), committedCatchInputs(), "security", 1, `no such arm in the arm table (known: architect, with_conventions, without_conventions)`},
+		{"unknown arm", newCalibrationSender(t, nil), committedCatchInputs(), "zz_no_such_arm", 1, `no such arm in the arm table (known: architect, security, security_portability, with_conventions, without_conventions)`},
 		{"samples zero", newCalibrationSender(t, nil), badInputs, ArmArchitect, 0, "samples must be >= 1, got 0"},
 		{"samples negative", newCalibrationSender(t, nil), badInputs, ArmArchitect, -1, "samples must be >= 1, got -1"},
 		{"nil sender", nil, badInputs, ArmArchitect, 1, "sender is required"},
@@ -281,5 +282,96 @@ func TestCalibrate_RefusesMissingCase(t *testing.T) {
 				t.Errorf("calibration = %+v, want the zero value", cal)
 			}
 		})
+	}
+}
+
+// portabilityMarkerVerdict is a persona verdict whose ONE concern names the
+// repository-specific marker gateenv.go and asserts it is absent.
+const portabilityMarkerVerdict = `{"verdict":"approve_with_concerns","concerns":[{"severity":"medium","category":"security","note":"The change does not add the new variable to gateenv.go's allow-list."}]}`
+
+// TestCalibrateCatchRateArm_PortabilityFindings (#4314, CF9): the scripted
+// sender answers ONE security_portability clean-case call with a concern
+// naming the repository-specific marker gateenv.go; the calibration lists
+// exactly that finding and the Markdown its block. The same answer on the
+// security arm (which IS shown the convention) is not a portability finding.
+func TestCalibrateCatchRateArm_PortabilityFindings(t *testing.T) {
+	for _, arm := range []string{ArmSecurityPortability, ArmSecurity} {
+		t.Run(arm, func(t *testing.T) {
+			sender := newScriptedCatchSender(t, 0, 0)
+			var hit string
+			sender.secOverride = func(a string, sc personaScriptCase, call int) (string, bool) {
+				if a == arm && sc.clean && hit == "" {
+					hit = sc.name
+					return portabilityMarkerVerdict, true
+				}
+				return "", false
+			}
+			cal, err := CalibrateCatchRateArm(context.Background(), sender, committedCatchInputs(), arm, 1)
+			if err != nil {
+				t.Fatalf("CalibrateCatchRateArm: %v", err)
+			}
+			if arm == ArmSecurity {
+				if len(cal.PortabilityFindings) != 0 || strings.Contains(cal.Markdown(), "Portability findings") {
+					t.Fatalf("security arm reported portability findings %+v", cal.PortabilityFindings)
+				}
+				return
+			}
+			want := []CatchRatePortabilityFinding{{Case: hit, Trial: 1, Marker: "gateenv.go"}}
+			if !reflect.DeepEqual(cal.PortabilityFindings, want) {
+				t.Fatalf("PortabilityFindings = %+v, want %+v", cal.PortabilityFindings, want)
+			}
+			md := cal.Markdown()
+			if !strings.Contains(md, "Portability findings") || !strings.Contains(md, `"gateenv.go"`) {
+				t.Errorf("Markdown lacks the portability block:\n%s", md)
+			}
+		})
+	}
+}
+
+// TestCalibrateCatchRateArm_SecurityLensAndAlarmCategories (#4314): the
+// security calibration carries each defect case's lens (and a Lens column)
+// and each false-alarming clean case's concerns by normalized category (and
+// the block); the architect table carries neither.
+func TestCalibrateCatchRateArm_SecurityLensAndAlarmCategories(t *testing.T) {
+	sender := newScriptedCatchSender(t, 0, 0)
+	sender.secOverride = func(a string, sc personaScriptCase, call int) (string, bool) {
+		if sc.clean {
+			return `{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"Correctness","note":"a standard-criteria nit"},{"severity":"medium","category":"secret custody","note":"a security nit"}]}`, true
+		}
+		return "", false
+	}
+	cal, err := CalibrateCatchRateArm(context.Background(), sender, committedCatchInputs(), ArmSecurity, 1)
+	if err != nil {
+		t.Fatalf("CalibrateCatchRateArm: %v", err)
+	}
+	secCases, _ := loadCommittedSecurity(t)
+	lens := map[string]string{}
+	for _, c := range secCases {
+		lens[c.Name] = c.Lens()
+	}
+	for _, cc := range cal.Cases {
+		if cc.Lens != lens[cc.Case] {
+			t.Errorf("case %s lens = %q, want %q", cc.Case, cc.Lens, lens[cc.Case])
+		}
+		if cc.Expect == CatchExpectClean {
+			if want := map[string]int{"correctness": 1, "secret_custody": 1}; !reflect.DeepEqual(cc.AlarmCategories, want) {
+				t.Errorf("clean case %s AlarmCategories = %v, want %v", cc.Case, cc.AlarmCategories, want)
+			}
+		} else if cc.AlarmCategories != nil {
+			t.Errorf("catch case %s AlarmCategories = %v, want nil", cc.Case, cc.AlarmCategories)
+		}
+	}
+	md := cal.Markdown()
+	for _, want := range []string{"| Case | Expect | Lens | Trials |", "| " + SecurityLensAuthnAuthz + " |", "False alarms by category", "correctness 1, secret_custody 1"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("security Markdown lacks %q:\n%s", want, md)
+		}
+	}
+	arch, err := CalibrateCatchRateArm(context.Background(), newCalibrationSender(t, nil), committedCatchInputs(), ArmArchitect, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if md := arch.Markdown(); strings.Contains(md, "Lens") || strings.Contains(md, "False alarms by category") || strings.Contains(md, "Portability findings") {
+		t.Errorf("the architect table carries a security block:\n%s", md)
 	}
 }
