@@ -31,7 +31,7 @@ import (
 //
 // These cross gateiso → the runner wiring (runBoundedGateArgv,
 // runVerifyCommittedTree, runVerifyFixLoop) → a REAL container runtime and
-// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o), (p) skips with
+// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o), (p), (q) skips with
 // the detected reason when no safe runtime or the image is unavailable, and
 // increments dockerFixturesRan at its END so main_test.go's TestMain
 // sentinel (approval condition 3) turns an all-skipped run on a docker host
@@ -1585,6 +1585,135 @@ func TestGateContainer_PublicPullIgnoresBlockingCredsStore(t *testing.T) {
 	st.cleanup()
 	if _, err := os.Stat(minted); !os.IsNotExist(err) {
 		t.Errorf("cleanup left the runner-owned docker config %s: %v", minted, err)
+	}
+	dockerFixturesRan++
+}
+
+// (q) TestGateContainer_SafeDirectoryOverRootOwnedMountPoint (#4390): the
+// checkout mounted at /work is a git safe directory even when the runtime
+// presents the /work root as another uid, so git (and Go VCS stamping) works
+// instead of failing "detected dubious ownership".
+//
+// Docker Desktop 4.95 presents every bind-mount ROOT as uid 0. To reproduce
+// that on any runtime, the fixture nests the bind: /work itself is no bind at
+// all, so the daemon creates the mount point root-owned, while /work/.git is
+// the test uid's repository. The argv is the PRODUCTION BuildArgv line with
+// two rewrites only: the `<checkout>:/work` -v value becomes
+// `<repo>/.git:/work/.git`, and the gate argv becomes the probe script. A
+// PRECONDITION arm (the same argv without the GIT_CONFIG pairs) must print
+// `detected dubious ownership` or the fixture skips naming why; the PINNED arm
+// (the argv as production renders it) must then see a usable work tree.
+func TestGateContainer_SafeDirectoryOverRootOwnedMountPoint(t *testing.T) {
+	rt, image := requireGateImage(t)
+	st := liveContainerState(t, rt, image)
+	repo, _ := gateRepoWithCommit(t)
+	base := t.TempDir()
+	mk := func(name string) string {
+		p := filepath.Join(base, name)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	checkout := mk("checkout")
+	spec := gateiso.ContainerSpec{
+		Runtime: rt, Image: image, Name: gateiso.NewContainerName(),
+		Checkout: checkout, GoCache: mk("gocache"), GoModCache: mk("gomodcache"), LintCache: mk("lintcache"),
+		Env:  gateiso.ContainerEnv(sanitizedGateEnv(), nil),
+		Argv: []string{"/bin/sh", "-c", "true"},
+		UID:  os.Getuid(), GID: os.Getgid(),
+	}
+	production, err := spec.BuildArgv(gateiso.MountPolicy{Permitted: []string{base, repo}, DaemonSocket: rt.SocketPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	script := `echo owner=$(stat -c %u ` + gateiso.MountWork + `); inside=$(git rev-parse --is-inside-work-tree 2>&1); echo "inside=$inside"; git status --porcelain >/dev/null 2>&1 && echo status=ok`
+	checkoutMount := checkout + ":" + gateiso.MountWork
+	nestedMount := filepath.Join(repo, ".git") + ":" + gateiso.MountWork + "/.git"
+	var rewritten []string
+	mounted := false
+	for i := 0; i < len(production); i++ {
+		if production[i] == "-v" && i+1 < len(production) && production[i+1] == checkoutMount {
+			rewritten = append(rewritten, "-v", nestedMount)
+			mounted = true
+			i++
+			continue
+		}
+		rewritten = append(rewritten, production[i])
+		if production[i] == "--entrypoint" && i+2 < len(production) {
+			rewritten = append(rewritten, production[i+1], production[i+2], "/bin/sh", "-c", script)
+			break
+		}
+	}
+	if !mounted {
+		t.Fatalf("no -v %s in the production argv: %q", checkoutMount, production)
+	}
+	// withoutGitConfig is the production argv minus every GIT_CONFIG_COUNT /
+	// KEY_n / VALUE_n pair (GIT_CONFIG_GLOBAL / SYSTEM stay).
+	var withoutGitConfig []string
+	for i := 0; i < len(rewritten); i++ {
+		if rewritten[i] == "-e" && i+1 < len(rewritten) {
+			kv := rewritten[i+1]
+			if strings.HasPrefix(kv, "GIT_CONFIG_COUNT=") || strings.HasPrefix(kv, "GIT_CONFIG_KEY_") || strings.HasPrefix(kv, "GIT_CONFIG_VALUE_") {
+				i++
+				continue
+			}
+		}
+		withoutGitConfig = append(withoutGitConfig, rewritten[i])
+	}
+
+	dockerCfg, err := st.gateDockerConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliEnv, err := rt.BindEndpointEnv(os.Environ(), dockerCfg.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// exec runs one arm under a fresh container name.
+	exec1 := func(argv []string) string {
+		t.Helper()
+		argv = slices.Clone(argv)
+		if n := slices.Index(argv, "--name"); n >= 0 && n+1 < len(argv) {
+			argv[n+1] = gateiso.NewContainerName()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+		cmd.Env = cliEnv
+		out, _ := cmd.CombinedOutput()
+		return string(out)
+	}
+
+	pre := exec1(withoutGitConfig)
+	if !strings.Contains(pre, "detected dubious ownership") {
+		if outputField(pre, "inside") == "true" {
+			t.Skipf("the runtime presents the /work mount point as the runner's uid (owner=%s): the #4390 condition cannot be reproduced here", outputField(pre, "owner"))
+		}
+		t.Fatalf("precondition arm (no GIT_CONFIG pin) neither reproduced `dubious ownership` nor saw a usable tree:\n%s", pre)
+	}
+
+	// The production env must pair the safe.directory key with the /work value.
+	pinned := false
+	for n := 0; n < 16 && !pinned; n++ {
+		if key, ok := lastEnvValue(rewritten, "GIT_CONFIG_KEY_"+strconv.Itoa(n)); ok && key == "safe.directory" {
+			val, _ := lastEnvValue(rewritten, "GIT_CONFIG_VALUE_"+strconv.Itoa(n))
+			if val != gateiso.MountWork {
+				t.Fatalf("GIT_CONFIG_KEY_%d=safe.directory is paired with value %q, want %s", n, val, gateiso.MountWork)
+			}
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Fatalf("production argv carries no GIT_CONFIG_KEY_n=safe.directory: %q", rewritten)
+	}
+	got := exec1(rewritten)
+	if strings.Contains(got, "dubious") {
+		t.Errorf("pinned arm still hit dubious ownership:\n%s", got)
+	}
+	if outputField(got, "inside") != "true" || outputField(got, "status") != "ok" {
+		t.Errorf("pinned arm: inside=%q status=%q, want inside=true status=ok:\n%s", outputField(got, "inside"), outputField(got, "status"), got)
 	}
 	dockerFixturesRan++
 }
