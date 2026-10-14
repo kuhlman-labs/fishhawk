@@ -809,6 +809,19 @@ type FetchedPrompt struct {
 	// (older backend, or backend-side resolution failure) means the runner
 	// skips the comparison and proceeds with checkout only.
 	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
+	// FixupPolicyIncrement is true ONLY on a decomposed PARENT's fix-up
+	// (#4391), the parent analogue of #765's per-child increment base: the
+	// runner measures both git_diff emitters against the consolidated tip it
+	// fetched for the pass (cfg.fixupIncrementBaseSHA) instead of the base
+	// branch, so max_files_changed — in-band and in the backend's policy
+	// re-evaluation — bounds the fix-up's own increment rather than the whole
+	// fan-out. False/absent everywhere else (and from an older backend), which
+	// keeps today's cumulative diff.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (fixup_policy_increment) MUST
+	// stay byte-identical to the backend's promptResponse.FixupPolicyIncrement
+	// (backend/internal/server/prompt.go).
+	FixupPolicyIncrement bool `json:"fixup_policy_increment,omitempty"`
 	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
 	// reviewer-emitted unified diff per routed concern, in routing order.
 	// Non-empty ONLY on a fix-up dispatch whose routed concerns EVERY carry a
