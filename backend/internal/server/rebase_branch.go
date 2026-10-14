@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,9 +46,18 @@ const rebaseMechanismNote = "fishhawk_rebase_run_branch merges the declared base
 // merge commit and dismissing head-bound approvals), so it is never
 // silent/auto: a missing or false confirm returns 400. Reason is an
 // operator note recorded on the audit entry.
+//
+// RerunFailedVerify (#4391) asks for a verify-only RE-RUN of a FAILED
+// merge-candidate head: on the already-up-to-date arm, with the implement
+// stage parked at its review gate, the failed verdict is voided by an operator
+// merge_candidate_verified{not_executed} row and a fresh pass is started
+// through the unchanged start path. Reason is REQUIRED with it (400
+// validation_failed otherwise): it is the operator's recorded attestation that
+// the failure was not the change's.
 type rebaseBranchRequest struct {
-	Reason  string `json:"reason"`
-	Confirm bool   `json:"confirm"`
+	Reason            string `json:"reason"`
+	Confirm           bool   `json:"confirm"`
+	RerunFailedVerify bool   `json:"rerun_failed_verify"`
 }
 
 // rebaseBranchResponse summarizes a successful base advance.
@@ -166,6 +176,11 @@ type rebaseBranchResponse struct {
 	// MergeCandidateVerifyRefusal names why no pass could be started or why
 	// the head's state could not be read.
 	MergeCandidateVerifyRefusal string `json:"merge_candidate_verify_refusal,omitempty"`
+	// MergeCandidateVerifyRerun is true ONLY when THIS call voided a failed
+	// merge-candidate verdict for a rerun_failed_verify request (#4391). The
+	// pass that follows is reported by the fields above (in_flight, or held
+	// behind the base's live pass).
+	MergeCandidateVerifyRerun bool `json:"merge_candidate_verify_rerun,omitempty"`
 }
 
 // mergeCandidateVerifyTriggeredNote is the constant sentence shipped whenever
@@ -185,6 +200,15 @@ type rebaseMergeCandidateFields struct {
 	StageID   string
 	Note      string
 	Refusal   string
+	// Rerun: THIS call voided a failed verdict (#4391).
+	Rerun bool
+}
+
+// rebaseRerunRequest is the operator's rerun_failed_verify ask (#4391),
+// threaded into the merge-candidate producer.
+type rebaseRerunRequest struct {
+	Requested bool
+	Reason    string
 }
 
 // handleRebaseRunBranch implements POST /v0/runs/{run_id}/rebase-branch.
@@ -324,6 +348,16 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "confirm"})
 		return
 	}
+	// #4391: a verify re-run voids a recorded failed verdict, so the reason is
+	// the operator's attestation that the failure was not the change's. It is
+	// checked after the 503 guard and BEFORE the run lookup, so a blank one
+	// reads nothing and writes nothing.
+	if reqBody.RerunFailedVerify && strings.TrimSpace(reqBody.Reason) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"rerun_failed_verify voids a recorded failed merge-candidate verdict, so a non-blank reason is required: state why the failure was not the change's (for example, an infrastructure failure)",
+			map[string]any{"field": "reason"})
+		return
+	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
 	if err != nil {
@@ -357,7 +391,8 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// MERGE-CANDIDATE VERIFY (ADR-090 D3), after the shared tail so the
 	// branch_rebased row the state predicate classifies on is already on the
 	// chain and the review gate is already re-parked.
-	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergeCommitSHA, out.MergePerformed)
+	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergeCommitSHA, out.MergePerformed,
+		rebaseRerunRequest{Requested: reqBody.RerunFailedVerify, Reason: reqBody.Reason})
 
 	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
 		RunID:                      runID.String(),
@@ -381,6 +416,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		MergeCandidateVerifyStageID:   mc.StageID,
 		MergeCandidateVerifyNote:      mc.Note,
 		MergeCandidateVerifyRefusal:   mc.Refusal,
+		MergeCandidateVerifyRerun:     mc.Rerun,
 	})
 }
 
@@ -747,12 +783,29 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 //     the live head and re-triggers only when it is unverified (a
 //     conflict-resolution push, or a base advance whose pass never reported
 //     a verdict); passed, failed, in_flight and not_required start nothing.
+//     The one exception is an operator rerun_failed_verify on a FAILED head
+//     (#4391, rebaseRerunFailedMergeCandidateVerify): the failed verdict is
+//     voided and a fresh pass started.
+//
+// rerun_failed_verify on any other state, or on a PERFORMED merge (whose new
+// head gets its own pass), changes nothing; the note says it had no effect.
 //
 // The actor is the OPERATOR who invoked the verb. Nothing here fails the
 // rebase: a refusal is carried on the 200.
 func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
-	branch, baseRef, priorHead, newHead, mergeCommit string, mergePerformed bool) rebaseMergeCandidateFields {
+	branch, baseRef, priorHead, newHead, mergeCommit string, mergePerformed bool,
+	rerun rebaseRerunRequest) (out rebaseMergeCandidateFields) {
 	ctx := r.Context()
+	// rerunAttempted: the head was failed and the re-run arm decided (voided,
+	// or refused with its own reason), so no no-effect note is due.
+	rerunAttempted := false
+	if rerun.Requested {
+		defer func() {
+			if !rerunAttempted {
+				out.Note = joinRebaseNote(out.Note, rerunNoEffectNote(mergePerformed, out.State))
+			}
+		}()
+	}
 	if mergePerformed && newHead == "" {
 		return rebaseMergeCandidateFields{Refusal: mergeCandidateUnreadableHeadNote}
 	}
@@ -788,6 +841,10 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 			return rebaseMergeCandidateFields{Refusal: "the merge-candidate verify state of " + head +
 				" could not be read (" + err.Error() + "), so no pass was triggered; re-invoke fishhawk_rebase_run_branch to retry"}
 		}
+		if rerun.Requested && st.State == mergeCandidateStateFailed {
+			rerunAttempted = true
+			return s.rebaseRerunFailedMergeCandidateVerify(ctx, runRow, branch, baseRef, head, st.Cause, rerun.Reason)
+		}
 		if st.State != mergeCandidateStateUnverified {
 			out := rebaseMergeCandidateFields{State: st.State}
 			if st.State == mergeCandidateStateInFlight {
@@ -813,12 +870,95 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 			slog.String("reason", refusal.Reason))
 		return rebaseMergeCandidateFields{State: mergeCandidateStateUnverified, Refusal: refusal.Reason}
 	}
-	out := rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered}
+	out = rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered}
 	if start.State == mergeCandidateStateInFlight {
 		out.StageID = start.StageID.String()
 		out.Note = mergeCandidateVerifyTriggeredNote
 	}
 	return out
+}
+
+// rebaseRerunFailedMergeCandidateVerify is the operator's verify-only re-run
+// of a FAILED merge-candidate head (#4391), reached only on the
+// already-up-to-date arm with rerun_failed_verify set. In order:
+//
+//  1. PRE-CHECK that the implement stage is parked at its review gate
+//     (succeeded or awaiting_approval). Otherwise refuse, naming the stage,
+//     its state and the path, having written NO verdict and NO trigger (the
+//     shared tail's branch_rebased row already stands). This is what refuses
+//     beside a queued fix-up: the D6 auto-route leaves the stage pending, and
+//     without the pre-check the void would land and the start then refuse.
+//  2. voidFailedMergeCandidateVerdict appends the operator's
+//     merge_candidate_verified{not_executed} row. Its error is a refusal with
+//     nothing triggered and the verdict still failed.
+//  3. startMergeCandidateVerifyPass, UNCHANGED: direct for fan_in, the
+//     ADR-092 queue for base_advance and conflict_resolution, so a re-run
+//     behind another run's live pass is held, never started out of turn.
+//
+// The pre-check is TOCTOU: a stage that leaves its gate between 1 and 3 leaves
+// the head voided (unverified) with no pass — a coherent state the merge gate
+// already routes back to this verb, never a stuck one.
+func (s *Server) rebaseRerunFailedMergeCandidateVerify(ctx context.Context, runRow *run.Run,
+	branch, baseRef, head, cause, reason string) rebaseMergeCandidateFields {
+	impl := s.findImplementStage(ctx, runRow.ID)
+	if impl == nil {
+		return rebaseMergeCandidateFields{State: mergeCandidateStateFailed,
+			Refusal: "rerun_failed_verify refused: the run has no implement stage to re-open, so the failed merge-candidate verdict for " + head + " was NOT voided and no pass was started"}
+	}
+	if impl.State != run.StageStateSucceeded && impl.State != run.StageStateAwaitingApproval {
+		return rebaseMergeCandidateFields{State: mergeCandidateStateFailed, Refusal: mergeCandidateRerunNotAtGateRefusal(impl, head)}
+	}
+	actor := rebaseOperatorActor(ctx)
+	if err := s.voidFailedMergeCandidateVerdict(ctx, runRow.ID, head, actor, reason); err != nil {
+		return rebaseMergeCandidateFields{State: mergeCandidateStateFailed,
+			Refusal: "rerun_failed_verify refused: voiding the failed merge-candidate verdict for " + head + " failed (" + err.Error() +
+				"), so no pass was started and the head's verdict is still failed; re-invoke fishhawk_rebase_run_branch with rerun_failed_verify:true to retry"}
+	}
+	start, refusal := s.startMergeCandidateVerifyPass(ctx, runRow.ID, mergeCandidateVerifyParams{
+		Branch: branch, BaseRef: baseRef, HeadSHA: head, Cause: cause,
+	}, actor)
+	if refusal != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch rebase: verify re-run voided the failed verdict but its pass could not be started",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("head_sha", head),
+			slog.String("reason", refusal.Reason))
+		return rebaseMergeCandidateFields{State: mergeCandidateStateUnverified, Rerun: true,
+			Refusal: refusal.Reason + "; the failed verdict WAS voided, so the head is now unverified — re-invoke fishhawk_rebase_run_branch (no flag needed) to start its pass"}
+	}
+	out := rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered, Rerun: true}
+	if start.State == mergeCandidateStateInFlight {
+		out.StageID = start.StageID.String()
+		out.Note = mergeCandidateVerifyTriggeredNote
+	}
+	return out
+}
+
+// mergeCandidateRerunNotAtGateRefusal is the pre-check refusal: the implement
+// stage is not parked at its review gate, so nothing was voided.
+func mergeCandidateRerunNotAtGateRefusal(impl *run.Stage, head string) string {
+	return fmt.Sprintf("rerun_failed_verify refused: implement stage %s is in state %q, not parked at its review gate (succeeded or awaiting_approval), so the failed merge-candidate verdict for %s was NOT voided and no pass was started. "+
+		"If a fix-up is queued on it (the ADR-090 D6 auto-route leaves the stage pending), dispatch that fix-up with fishhawk_dispatch_stage — a decomposed parent's fix-up is policy-checked on its own increment, and a pass that changes nothing returns the stage to its gate with its fix-up budget refunded; otherwise wait for the stage to settle at its gate. "+
+		"Then re-invoke fishhawk_rebase_run_branch with rerun_failed_verify:true.", impl.ID, impl.State, head)
+}
+
+// rerunNoEffectNote says why rerun_failed_verify changed nothing on this call.
+func rerunNoEffectNote(mergePerformed bool, state string) string {
+	if mergePerformed {
+		return "rerun_failed_verify had no effect: this call performed a base merge, so the new head gets its own merge-candidate pass."
+	}
+	if state == "" {
+		state = "undecided"
+	}
+	return "rerun_failed_verify had no effect: the live head's merge-candidate state is " + state + ", not failed, so there was no failed verdict to void."
+}
+
+// joinRebaseNote appends a sentence to a (possibly empty) note.
+func joinRebaseNote(note, sentence string) string {
+	if note == "" {
+		return sentence
+	}
+	return note + " " + sentence
 }
 
 // rebaseTransferWriteReserve is what the rebase verb's enforce-mode

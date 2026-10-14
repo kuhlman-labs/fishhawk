@@ -13476,6 +13476,28 @@ paths:
         refuses the head `409 merge_candidate_unverified` until a `passed`
         result is recorded for it.
 
+        **Verify-only re-run of a FAILED head (#4391).** With
+        `rerun_failed_verify: true` and a non-blank `reason` (REQUIRED: 400
+        `validation_failed`, `field: reason` otherwise — checked after the 503
+        guard and before the run lookup), the already-up-to-date arm re-runs
+        ONLY the verify of a live head whose recorded verdict is `failed`, with
+        no agent. When the implement stage is parked at its review gate
+        (`succeeded` or `awaiting_approval`) it appends an operator
+        `merge_candidate_verified` row (`result: not_executed`, `reason:
+        "operator_rerun: <reason>"`, `voids_sequence` = the failed row's
+        sequence, `trigger_sequence` copied from it) that VOIDS the failed
+        verdict — ADR-090 already reads `not_executed` as re-triggerable — and
+        then starts a fresh pass through the unchanged start path (direct for
+        `fan_in`, the ADR-092 queue for `base_advance`/`conflict_resolution`,
+        so it may answer `held`). The 200 carries
+        `merge_candidate_verify_rerun: true`. When the stage is NOT at its gate
+        (e.g. a queued D6 fix-up left it `pending`) the call is refused on
+        `merge_candidate_verify_refusal` having written no verdict and no
+        trigger (the `branch_rebased` row still lands), naming
+        `fishhawk_dispatch_stage` for the queued fix-up. On any other head
+        state, or on a call that PERFORMS a merge (the new head gets its own
+        pass), the flag has no effect and `merge_candidate_verify_note` says so.
+
         **Sibling endpoint.** `POST /v0/runs/{run_id}/reset-branch` is the
         right verb for a FOREIGN COMMIT pushed ON TOP of the run's commits — a
         different problem. Both refusals cross-link the other.
@@ -13511,8 +13533,17 @@ paths:
                 reason:
                   type: string
                   description: |
-                    Optional operator rationale, recorded on the
-                    `branch_rebased` audit entry.
+                    Operator rationale, recorded on the `branch_rebased` audit
+                    entry. Optional, EXCEPT with `rerun_failed_verify`, where a
+                    non-blank value is required and is also recorded on the
+                    void row as the attestation that the failure was not the
+                    change's.
+                rerun_failed_verify:
+                  type: boolean
+                  description: |
+                    #4391: re-run ONLY the verify of a FAILED merge-candidate
+                    head (see the operation description). Requires a non-blank
+                    `reason`. Default false.
       responses:
         '200':
           description: |
@@ -13614,7 +13645,9 @@ paths:
                       resolved new head (the decoded merge commit unless a
                       genuine concurrent push was observed, #4199); the
                       already-up-to-date arm re-triggers only for
-                      an `unverified` Fishhawk-written head.
+                      an `unverified` Fishhawk-written head — or, with
+                      `rerun_failed_verify`, a `failed` head whose verdict
+                      this call voided (#4391).
                   merge_candidate_verify_stage_id:
                     type: string
                     description: |
@@ -13638,7 +13671,19 @@ paths:
                       Why no pass could be started, or why the head's state
                       could not be read. The rebase itself still answers 200;
                       `POST /v0/runs/{run_id}/merge` then refuses
-                      `409 merge_candidate_unverified`.
+                      `409 merge_candidate_unverified`. With
+                      `rerun_failed_verify` it also names a refused re-run
+                      (the implement stage not at its gate, or the void append
+                      failing — nothing voided, nothing triggered), or a void
+                      that landed whose pass then could not start (the head is
+                      left `unverified`; re-invoke without the flag).
+                  merge_candidate_verify_rerun:
+                    type: boolean
+                    description: |
+                      True ONLY when THIS call voided a failed merge-candidate
+                      verdict for a `rerun_failed_verify` request (#4391); the
+                      fields above report the pass that followed (`in_flight`,
+                      or `held` behind the base's live pass).
         '202':
           description: |
             The base merge CONFLICTED and a bounded, agent-driven
@@ -13683,8 +13728,9 @@ paths:
                       invocation fails closed).
         '400':
           description: |
-            Malformed body or `confirm` not `true`. Body's `error` is
-            `validation_failed` or `confirmation_required`.
+            Malformed body, `confirm` not `true`, or `rerun_failed_verify`
+            with a blank `reason` (#4391, `details.field: reason`). Body's
+            `error` is `validation_failed` or `confirmation_required`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14269,10 +14315,15 @@ paths:
             (7) The merge-candidate verify FAILED for the live head
             (`merge_candidate_verify_failed`, ADR-090 D2/D6). `details` carry
             `{run_id, pr_url, head_sha, cause, verify_state: "failed",
-            next_step: "fishhawk_fixup_stage"}`. When the workflow delegates
+            next_step: "fishhawk_fixup_stage", rerun_step:
+            "fishhawk_rebase_run_branch"}`. When the workflow delegates
             fix-up routing one bounded fix-up was already routed when the result
             was recorded; otherwise, or when that route was refused, route it
-            with `fishhawk_fixup_stage`. Cases (5)–(7) record NO verdict row and
+            with `fishhawk_fixup_stage`. When the failure was infrastructure
+            rather than the change, `rerun_step` names the agent-free
+            alternative: `rebase-branch` with `rerun_failed_verify: true` and a
+            reason voids the failed verdict and re-runs only the verify (#4391).
+            Cases (5)–(7) record NO verdict row and
             dispatch nothing.
             (7a) The run's merge-candidate pass is HELD in its base's ADR-092
             queue behind the live pass (`merge_candidate_held`, E83.85 /
@@ -21698,6 +21749,22 @@ paths:
                       (older backend, or backend-side resolution failure)
                       means the runner proceeds with checkout only, skipping
                       the comparison.
+                  fixup_policy_increment:
+                    type: boolean
+                    description: |
+                      True ONLY on a decomposed PARENT's fix-up (#4391), the
+                      parent analogue of #765's per-child increment base. The
+                      runner then measures both `git_diff` emitters against the
+                      consolidated tip it fetched for the pass (a no-fetch
+                      merge-base; on failure it falls back to the cumulative
+                      diff against the base), so the in-band constraint check
+                      and the backend's `reEvaluatePolicy` see only the
+                      fix-up's own increment rather than the whole fan-out.
+                      Derived from the same predicate as the consolidated
+                      `fixup_branch`. Absent on an ordinary run's fix-up, a
+                      decomposed child's fix-up, a non-fix-up dispatch and a
+                      verify-only merge-candidate pass (and on a probe error),
+                      which keeps the cumulative diff.
                   egress_target_hosts:
                     type: array
                     items: { type: string }
@@ -22333,6 +22400,9 @@ paths:
                   fixup_expected_head_sha:
                     type: string
                     description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                  fixup_policy_increment:
+                    type: boolean
+                    description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
                   egress_target_hosts:
                     type: array
                     items: { type: string }
