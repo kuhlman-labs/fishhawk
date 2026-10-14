@@ -3675,24 +3675,30 @@ checkout that predates it, exit 127) stops instead of proceeding.
 
 `scripts/check-review-prompt-eval [--base <ref>] [--always]` is the
 STANDING, path-triggered check that a change to the plan-review prompt
-carries passing recorded two-arm catch-rate evidence: does the E55.3 /
+carries passing recorded arm-keyed catch-rate evidence: does the E55.3 /
 #2244 review-conventions section dilute the plan reviewer's catch rate on
-the plan-review-miss corpus? When a trigger path changed since the merge
+the plan-review-miss corpus (the two conventions arms), and does the
+architect reviewer persona catch ADR conflicts without false alarms (the
+E78.11 / #4313 architect arm)? When a trigger path changed since the merge
 base with `--base` (default `origin/main`), it requires
 `(cd backend && go run ./internal/agenteval/catchrategate)` to exit 0.
 That command decides from the committed evidence record alone (no model
 call, no network) and fails closed on an absent, malformed, stale,
 under-powered or regressed record, or one whose per-trial sidecar
 (`evidence.trials.json`) is absent, malformed, from another recording or
-count-inconsistent with it; its sixteen modes, the pinned baseline, the
-evidence schema and the sidecar are in `backend/internal/agenteval/README.md` §
+count-inconsistent with it; its fail-closed modes (the sixteen v1 modes plus
+the arm-keyed ones), the per-arm pinned baseline, the v2 evidence schema and
+the sidecar are in `backend/internal/agenteval/README.md` §
 "Plan-review catch-rate gate". Recording the evidence is an operator step:
 `docs/compliance/planreview-catchrate-evidence.md`.
 
 **A baseline is pinned (first on 2026-10-10) and is re-pinned when the
 instrument changes: while the record is stale, the check fails on EVERY
 change that touches a trigger path**, including the branch that changed the
-instrument. That is the design, not a defect.
+instrument. That is the design, not a defect. Since E78.11 / #4313 the gate
+reads an arm-keyed `planreview-catchrate-evidence-v2` record and REFUSES the
+committed legacy v1 pair, naming the shared #4313/#4314 re-pin recording, so
+the check fails on every trigger-path change until that recording lands.
 
 ### Trigger paths and the change set
 
@@ -3700,11 +3706,17 @@ instrument. That is the design, not a defect.
 |---|---|
 | `backend/internal/prompt/` | every path under it (the plan-review prompt itself) |
 | `backend/internal/repodoc/` | every path under it (the conventions render path) |
-| `backend/internal/agenteval/planreviewcatch.go` | that file only (arms, `ClassifyCatch`, tolerance, floor) |
-| `backend/internal/agenteval/planreviewevidence.go` | that file only (record, fingerprint, check) |
+| `backend/internal/personaprompt/` | every path under it (the production persona prompt builder the architect arm renders through) |
+| `backend/internal/agenteval/planreviewcatch.go` | that file only (conventions arms, catch rule v5, tolerance, floor) |
+| `backend/internal/agenteval/planreviewevidence.go` | that file only (arm table, record, fingerprints, check) |
+| `backend/internal/agenteval/planreviewpersona.go` | that file only (the architect arm: declaration, document fetcher, persona-case loader, classifier) |
+| `backend/internal/agenteval/planreviewcalibrate.go` | that file only (the calibration dry run) |
+| `backend/internal/agenteval/planreviewrescore.go` | that file only (the offline re-score) |
 | `backend/internal/agenteval/catchrategate/` | every path under it (the gate command) |
-| `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the corpus) |
+| `backend/internal/agenteval/testdata/planreview-miss-corpus/` | every path under it (the conventions arms' corpus) |
+| `backend/internal/agenteval/testdata/planreview-persona-corpus/` | every path under it (the persona arms' corpus) |
 | `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`, its trial sidecar `evidence.trials.json`) |
+| `docs/review/architect-remit.md` | that file only (the architect remit, rendered into every architect-arm prompt) |
 
 A trigger ending in `/` is a directory at a component boundary
 (`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);
@@ -3737,7 +3749,7 @@ why the job below sets `fetch-depth: 0`.
 
 ### Why it runs OUTSIDE `scripts/test verify`
 
-The evidence can only be produced by the LIVE two-arm measurement, which
+The evidence can only be produced by the LIVE all-arm measurement, which
 needs a model credential and network. The runner's gate env denies the key
 (`gateEnvDeny` in `runner/cmd/fishhawk-runner/gateenv.go`) and the
 container gate path has no network, so an implement agent cannot refresh a
@@ -3754,9 +3766,11 @@ hermetic harness, `scripts/test-review-prompt-eval`, runs in verify
 - **The trigger list is not the whole prompt dependency graph.**
   `prompt.Build` imports `backend/internal/plan` (and
   `backend/internal/securityscan`); a change there that alters the rendered
-  plan-review prompt does not trigger the check. The record's fingerprint
-  covers the rendered arm prompts, so the next triggered run, or
-  `--always`, fails that record as stale.
+  plan-review prompt does not trigger the check. Likewise `docs/adr/` is not
+  a trigger, yet the architect arm embeds `docs/adr/index.json`, so an ADR
+  landing moves its rendered prompt. The record's per-arm fingerprints cover
+  the rendered arm prompts, so the next triggered run, or `--always`, fails
+  that record as stale, naming the arm.
 - **The matcher's Go source is not fingerprinted.** A `ClassifyCatch` change
   without a `catchRuleVersion` bump leaves the record fresh;
   `planreviewcatch.go` is a trigger path, so the gate still runs on it.
@@ -3789,7 +3803,7 @@ visible sooner. The base ref goes through `env:`, not an inline
           cache: true
           cache-dependency-path: '**/go.sum'
 
-      - name: Require recorded two-arm evidence for a review-prompt change
+      - name: Require recorded arm-keyed evidence for a review-prompt change
         env:
           BASE_REF: ${{ github.base_ref }}
         run: scripts/check-review-prompt-eval --base "origin/$BASE_REF"
@@ -3803,16 +3817,18 @@ runs (`bash`, `git`, `mktemp`, `rm`) plus, where a case wants one, a stub
 `go` that records its cwd and argv and exits as told. No network, no
 Docker, no model, never the real `go`; `origin/main` is seeded with
 `git update-ref`, not a push into a bare repo, so no detached
-`git maintenance` child outlives a fixture (AGENTS.md Traps, #3503). 37
+`git maintenance` child outlives a fixture (AGENTS.md Traps, #3503). 52
 assertions: c1 no trigger → 0, gate not run; c2 committed trigger change +
 passing gate → 0, gate run from `backend/` as
 `run ./internal/agenteval/catchrategate`; c3 failing gate → 1 naming the
 run-book; c4 untracked trigger file triggers; c5 unresolvable `--base` → 2;
 c6 trigger change with `go` absent → exactly 2; c7 `--always` with no
 trigger runs the gate; c8 not a git repo → 2; c9 a non-trigger agenteval
-sibling (`injection.go`) → 0; c10 each of the seven triggers, changed
-alone, triggers; c11 four near misses (directory boundary, test file,
-`.orig`, `catchrategate.go`) do not; c12 an unstaged edit, c13 a deletion
+sibling (`injection.go`) → 0; c10 each of the thirteen trigger families,
+changed alone, triggers; c11 nine near misses (directory boundaries
+`prompts/` and `personaprompts/`, test files, `.orig` files,
+`catchrategate.go`, a `planreview-persona-corpus.md` sibling, another remit)
+do not; c12 an unstaged edit, c13 a deletion
 and c14 a move out of a trigger path trigger; c15 a C-quotable path (an
 embedded tab) under a trigger dir triggers; c16 a base with no shared
 history → 2; c17/c18 a failing `git diff` / `git ls-files` → 2; c19 each of
@@ -3821,7 +3837,9 @@ the two temp files failing → 2; c20 no `backend/` → 2; c21–c24 usage
 c25 the `--base=<ref>` form; c26 run from a subdirectory; c27 the verify
 WIRING (the real `_verify_gate_harnesses`, sourced lib-only against a
 fixture ROOT whose only harness is a failing stub of this one, runs it and
-fails).
+fails); c28 a new persona-corpus case, committed or untracked, triggers; c29
+an architect-remit edit triggers, and a failing gate then fails the check
+naming the run-book.
 
 Counterfactuals (each run by mutating a branch BODY, never deleting a
 referenced declaration): every exit-2 guard replaced with a fall-through to
@@ -3831,6 +3849,7 @@ directory near misses, a prefix file match reddens `.orig`, dropping
 `--no-renames` reddens c14, dropping the untracked listing reddens c4,
 newline enumeration reddens c15, ignoring `--always` reddens c7, swallowing
 the gate's exit reddens c3, and removing `test-review-prompt-eval` from the
-`_verify_gate_harnesses` list reddens c27. The mktemp and flag-shaped-base
+`_verify_gate_harnesses` list reddens c27, and removing the six E78.11 /
+#4313 persona trigger entries reddens their c10 rows, c28 and c29. The mktemp and flag-shaped-base
 guards stay exit 2 under deletion (a downstream redirect or ref-resolution
 failure also exits 2), so c19 and c23 assert the guard's own message.

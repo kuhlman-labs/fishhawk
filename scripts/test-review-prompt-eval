@@ -107,7 +107,9 @@ mk_repo() {
   mkdir -p "$d/backend/internal/prompt" "$d/backend/internal/repodoc" \
     "$d/backend/internal/agenteval/catchrategate" \
     "$d/backend/internal/agenteval/testdata/planreview-miss-corpus/seed" \
-    "$d/backend/internal/agenteval/testdata/planreview-catchrate"
+    "$d/backend/internal/agenteval/testdata/planreview-persona-corpus/architect/seed" \
+    "$d/backend/internal/agenteval/testdata/planreview-catchrate" \
+    "$d/backend/internal/personaprompt" "$d/docs/review"
   echo base > "$d/README.md"
   echo base > "$d/backend/go.mod"
   echo base > "$d/backend/internal/prompt/prompt.go"
@@ -118,6 +120,9 @@ mk_repo() {
   echo base > "$d/backend/internal/agenteval/catchrategate/main.go"
   echo base > "$d/backend/internal/agenteval/testdata/planreview-miss-corpus/seed/miss.json"
   echo base > "$d/backend/internal/agenteval/testdata/planreview-catchrate/representative-conventions.md"
+  echo base > "$d/backend/internal/agenteval/testdata/planreview-persona-corpus/architect/seed/persona_case.json"
+  echo base > "$d/backend/internal/personaprompt/personaprompt.go"
+  echo base > "$d/docs/review/architect-remit.md"
   "${G[@]}" -C "$d" add -A
   "${G[@]}" -C "$d" commit -q -m base
   "${G[@]}" -C "$d" update-ref refs/remotes/origin/main HEAD
@@ -219,7 +224,13 @@ for t in \
   backend/internal/agenteval/planreviewevidence.go \
   backend/internal/agenteval/catchrategate/main.go \
   backend/internal/agenteval/testdata/planreview-miss-corpus/seed/miss.json \
-  backend/internal/agenteval/testdata/planreview-catchrate/representative-conventions.md; do
+  backend/internal/agenteval/testdata/planreview-catchrate/representative-conventions.md \
+  backend/internal/personaprompt/personaprompt.go \
+  backend/internal/agenteval/planreviewpersona.go \
+  backend/internal/agenteval/planreviewcalibrate.go \
+  backend/internal/agenteval/planreviewrescore.go \
+  backend/internal/agenteval/testdata/planreview-persona-corpus/architect/seed/persona_case.json \
+  docs/review/architect-remit.md; do
   new_repo; commit_change "$repo" "$t"
   run_check "$repo" "$WITHGO" 0
   expect "c10 trigger $t" 0 "$t" invoked
@@ -231,7 +242,12 @@ for t in \
   backend/internal/prompts/x.go \
   backend/internal/agenteval/planreviewcatch_test.go \
   backend/internal/agenteval/planreviewcatch.go.orig \
-  backend/internal/agenteval/catchrategate.go; do
+  backend/internal/agenteval/catchrategate.go \
+  backend/internal/personaprompts/x.go \
+  backend/internal/agenteval/planreviewpersona_test.go \
+  backend/internal/agenteval/testdata/planreview-persona-corpus.md \
+  docs/review/security-remit.md \
+  docs/review/architect-remit.md.orig; do
   new_repo; commit_change "$repo" "$t"
   run_check "$repo" "$WITHGO" 0
   expect "c11 near miss $t" 0 "no review-prompt path changed since" not
@@ -336,6 +352,23 @@ else
   ran=no; [ -e "$c27/ran" ] && ran=yes
   fail "c27 verify wiring (ran=$ran out=$c27out)"
 fi
+
+# c28 — a NEW case under the persona corpus (E78.11 / #4313: the architect
+# arm's cases) triggers, committed or untracked.
+new_repo; commit_change "$repo" backend/internal/agenteval/testdata/planreview-persona-corpus/architect/new-case/case.md
+run_check "$repo" "$WITHGO" 0
+expect "c28 persona corpus case" 0 "planreview-persona-corpus/architect/new-case/case.md" invoked
+new_repo; echo new > "$repo/backend/internal/agenteval/testdata/planreview-persona-corpus/architect/seed/case.md"
+run_check "$repo" "$WITHGO" 0
+expect "c28 untracked persona corpus file" 0 "planreview-persona-corpus/architect/seed/case.md" invoked
+
+# c29 — an edit to the architect remit (rendered into every architect-arm
+# prompt) triggers, and a failing gate fails the check naming the run-book.
+new_repo; commit_change "$repo" docs/review/architect-remit.md
+run_check "$repo" "$WITHGO" 0
+expect "c29 architect remit edit" 0 "docs/review/architect-remit.md" invoked
+run_check "$repo" "$WITHGO" 1
+expect "c29 architect remit edit, gate fails" 1 "docs/compliance/planreview-catchrate-evidence.md" invoked
 
 echo
 echo "test-review-prompt-eval: $PASS passed, $FAIL failed"

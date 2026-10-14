@@ -1,8 +1,10 @@
 # Plan-review catch-rate evidence (E55.4 / #2245)
 
-Operator run-book for the LIVE two-arm measurement that decides whether the
+Operator run-book for the LIVE arm-keyed measurement that decides whether the
 E55.3 / #2244 repository review-conventions section dilutes the plan
-reviewer's catch rate. Sibling of
+reviewer's catch rate (the two conventions arms) and, since E78.11 / #4313,
+whether the architect reviewer persona catches plans that conflict with a
+recorded decision and stays quiet on conforming ones (the `architect` arm). Sibling of
 [`severity-calibration-evidence.md`](severity-calibration-evidence.md), and it
 ships with the same honest residual.
 
@@ -22,6 +24,15 @@ its baseline is not comparable: the next recording must RE-PIN (Step 2) and
 commit the record with its sidecar (Step 3), on the #4355 branch before it
 merges. The current pinned baseline is whatever `evidence.json` carries; the
 results table lists every recording.
+
+**E78.11 / #4313 makes the record arm-keyed** (`planreview-catchrate-evidence-v2`
+plus `planreview-catchrate-trials-v2`, catch rule `planreview-catch-v5`). The
+committed pair stays the legacy v1 pair until ONE shared re-pin recording of
+every arm, made after #4313 AND #4314 (which registers its security arms in
+the same arm table) have both merged (Step 2, "The shared #4313/#4314 re-pin
+recording"). Until then `catchrategate` refuses the v1 record naming that
+recording, and `scripts/check-review-prompt-eval` fails on every trigger-path
+change: by design, and outside `scripts/test verify`.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -32,8 +43,9 @@ is the operator's recording:
 - They prove **nothing** about whether conventions dilute the reviewer; only
   the recorded evidence speaks to that, and only for the committed
   planted-defect shapes.
-- The gate command (`catchrategate`) passes on the committed record until the
-  record goes stale (a prompt, corpus, fixture, model or catch-rule change),
+- The gate command (`catchrategate`) passes on a current committed record
+  (not the legacy v1 pair: see the #4313 paragraph above) until the record
+  goes stale (a prompt, corpus, fixture, model or catch-rule change),
   after which `scripts/check-review-prompt-eval` **fails closed on the next
   review-prompt change** until an operator re-measures.
 
@@ -48,8 +60,10 @@ model credential. The measurement is operator-executed and operator-paid.
 | Rule | Fails when |
 |---|---|
 | within-run | the with-conventions catch rate is MORE than 0.10 below the without-conventions rate of the SAME measurement (exactly 0.10 passes) |
-| pinned baseline | either arm's catch rate is MORE than 0.10 below the SAME arm of the PINNED baseline |
-| power floor | either arm has fewer than 136 trials — REFUSED, never passed |
+| pinned baseline, catch | any arm's catch rate is MORE than 0.10 below the SAME arm of the PINNED baseline |
+| pinned baseline, false alarm | any arm's false-alarm rate (`(false_alarms + undecodable) / clean trials`) is MORE than 0.10 above the SAME arm of the PINNED baseline |
+| power floor | any arm has fewer than 136 trials in an expectation class it has (catch, clean) — REFUSED, never passed |
+| comparability | the arm set, the generator model, or any arm's case set, expectation classes or samples per case differs from the baseline — refused unless the recording re-pins |
 
 The baseline is PINNED, not rolling: a recording is never judged only against
 the previous one, so a series of in-tolerance drops cannot erode the
@@ -75,6 +89,38 @@ attribution-AND-probe catch rule and the loader's fail-closed modes:
 `backend/internal/agenteval/README.md` § "Corpus authoring"). The corpus
 holds twelve cases as of #4253 (`seed-synthetic-*`, two or more per weak
 class).
+
+The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`,
+six SYNTHETIC cases: three catch, three clean) loads against the REAL
+`docs/review/architect-remit.md` and `docs/adr/index.json` of the checkout;
+its schema and fail-closed loader modes are in the agenteval README §
+"The arms":
+
+```sh
+scripts/test single -run 'Persona' ./backend/internal/agenteval/
+```
+
+## Step 1b — calibrate a new arm's cases (dry run, never written)
+
+Before the shared recording, check that each catch case of a NEW arm is of
+mid difficulty: caught in 30%–80% of trials (both bounds inclusive). A case
+at 0% or 100% cannot show a regression in one direction. The dry run never
+writes evidence; clean cases report their false-alarm rate with band `n/a`.
+
+```sh
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=architect FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=10 \
+  scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+```
+
+Run it on the PR branch (the implement agent cannot call the model) and post
+the logged markdown table as a PR comment (a fix-up pass cannot edit the PR
+body). The test FAILS when any catch case is out of band: rework that case
+through a routed fix-up before merge rather than cutting it (the corpus
+checks require every kind). Cost: 6 cases x 10 samples = 60 persona-prompt
+calls (each prompt ~60 KB: index, remit and plan-review prompt). At 10 samples
+a case's rate has a wide sampling interval; a case at a bound is a candidate
+for rework, not a verdict.
 
 ## Step 2 — run the arms
 
@@ -146,13 +192,35 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 That recording is the ONLY out-of-sample measurement of v4: the re-score
 below tuned the v4 probes on the same sidecar it reports.
 
-Cost: each measurement is two arms of `ceil(136 / cases) x cases` plan-review
-calls — 2 x 144 with the twelve committed cases (12 samples per case) —
-against
+**The shared #4313/#4314 re-pin recording.** After #4313 and #4314 have both
+merged, ONE recording measures every arm of the arm table (the two
+conventions arms, the architect arm, and #4314's security arms) and pins the
+first v2 baseline. The existing v1 record is a non-comparable baseline: a
+non-pinning recording over it is refused (both files stay byte-identical), a
+pin replaces it, and a dry run proceeds.
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4313 + #4314: arm-keyed v2 record (catch rule v5, architect and security persona arms); the v1 baseline is not comparable' \
+  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+Commit the v2 pair (Step 3); `catchrategate` then decodes it, and the stale
+message on any later change names the arm whose fingerprint moved. An ADR
+landing stales the architect arm (its prompt embeds `docs/adr/index.json`)
+even though `docs/adr/` is not a trigger path.
+
+Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
+calls — 2 x 144 with the twelve committed cases (12 samples per case) — and
+the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
+of its catch and clean classes clears the 136 floor with 138), about 564
+calls before #4314's rows, against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
-roughly $10-20 per recording. Sampling cannot be pinned (`anthropic.Config`
+roughly $10-20 per recording for the two conventions arms; the architect
+arm's ~60 KB prompts add materially to that (not estimated here). Sampling cannot be pinned (`anthropic.Config`
 has no temperature knob); the power floor is the answer to run-to-run
 variance.
 
@@ -188,12 +256,13 @@ Every outcome, pass or fail (absent, stale or malformed evidence and an
 unavailable corpus included), ends with the rule line naming the 0.10
 tolerance, the pinned-baseline rule and the 136-trials-per-arm floor. It
 recomputes the verdict from the counts and refuses an absent, malformed,
-stale, under-powered or regressed record, or an absent, malformed, foreign or
-count-inconsistent sidecar (the sixteen modes:
+stale, under-powered or regressed record, a legacy v1 record, or an absent, malformed, foreign or
+count-inconsistent sidecar (the sixteen v1 modes plus the arm-keyed ones:
 `backend/internal/agenteval/README.md` §
 "`CheckCatchRateEvidence` fail-closed modes"). A record goes STALE when the
-corpus, the conventions fixture, the rendered plan-review prompt, the
-generator model or the catch rule changes; `--print-fingerprint` prints the
+corpus, the conventions fixture, the persona corpus, the architect remit or
+decision record (`docs/adr/`), the rendered plan-review or persona prompt, the
+generator model or the catch rule changes — the message names the stale arm; `--print-fingerprint` prints the
 current fingerprint to compare with the record's `prompt_fingerprint`.
 Re-measure on staleness — never hand-edit the record or the sidecar.
 
@@ -301,3 +370,19 @@ to use it as a probe.
 |---|---|---|---|---|---|---|
 | 2026-10-10T18:33:25Z | `claude-sonnet-5-5` | 80/138 (0.580) | 83/138 (0.601) | -0.022 | pinned (first measurement, #4235) | PASS |
 | 2026-10-12T12:44:59Z | `claude-sonnet-5-5` | 87/144 (0.604) | 82/144 (0.569) | +0.035 | re-pinned (#4253 + #4254 fold-in; the 2026-10-10 baseline is not comparable) | PASS |
+
+### Arm-keyed results (E78.11 / #4313 on)
+
+Pending the shared #4313/#4314 re-pin recording; one row per recording,
+naming every arm. The architect columns are catch (catch cases) and false
+alarm (clean cases).
+
+| Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| — | — | — | — | — | — | — | pending the shared #4313/#4314 re-pin | not yet recorded |
+
+### Calibration dry runs
+
+| Run at | Arm | Samples per case | Out-of-band catch cases | Table |
+|---|---|---|---|---|
+| — | `architect` | 10 | pending the operator run on the #4313 PR branch | PR comment |
