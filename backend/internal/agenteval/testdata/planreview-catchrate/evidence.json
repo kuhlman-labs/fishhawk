@@ -1,13 +1,61 @@
 {
-  "schema": "planreview-catchrate-evidence-v1",
-  "recorded_at": "2026-10-12T18:41:04Z",
+  "schema": "planreview-catchrate-evidence-v2",
+  "recorded_at": "2026-10-14T14:15:06Z",
   "generator_model": "claude-sonnet-5-5",
-  "prompt_fingerprint": "sha256:ac111eda1fe167854e777abef1d8cdf1257dd9ed916d5d416288941af7253d5c",
+  "prompt_fingerprint": "sha256:ab7ecf8b3a69219a216a4fe4130a78ed9a433d3a57d534c1175be9b254ad6295",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
-  "samples_per_case": 12,
   "arms": {
-    "without_conventions": {
+    "architect": {
+      "kind": "persona",
+      "samples_per_case": 46,
+      "prompt_fingerprint": "sha256:7869b39db19d7bc91488f4b3f7cceef6680e7c349ab815ecb4383f67d7e5b2cd",
+      "per_case": {
+        "adr006-production-migrate-down": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 41,
+          "undecodable": 0
+        },
+        "adr091-merge-without-review-coverage": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 45,
+          "undecodable": 0
+        },
+        "clean-sqlc-query-cli": {
+          "expect": "clean",
+          "trials": 46,
+          "caught": 0,
+          "false_alarms": 3,
+          "undecodable": 0
+        },
+        "clean-workflow-v2-optional-field": {
+          "expect": "clean",
+          "trials": 46,
+          "caught": 0,
+          "false_alarms": 1,
+          "undecodable": 0
+        },
+        "declared-cross-component-direction": {
+          "expect": "clean",
+          "trials": 46,
+          "caught": 0,
+          "false_alarms": 28,
+          "undecodable": 0
+        },
+        "undeclared-cross-component-direction": {
+          "expect": "catch",
+          "trials": 46,
+          "caught": 20,
+          "undecodable": 0
+        }
+      }
+    },
+    "with_conventions": {
+      "kind": "conventions",
+      "samples_per_case": 12,
+      "prompt_fingerprint": "sha256:24cf1dab33111c85b561b71921ac1a558d6d1a3e9bc8cf128cf08f6e40f0288a",
       "per_case": {
         "seed-synthetic-contradicts-issue": {
           "trials": 12,
@@ -16,12 +64,12 @@
         },
         "seed-synthetic-contradicts-numeric-limit": {
           "trials": 12,
-          "caught": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-contradicts-status-code": {
           "trials": 12,
-          "caught": 11,
+          "caught": 5,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
@@ -31,7 +79,7 @@
         },
         "seed-synthetic-inferred-sibling-retention": {
           "trials": 12,
-          "caught": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-inferred-sibling-timeout": {
@@ -51,7 +99,7 @@
         },
         "seed-synthetic-untestable-reasonable-time": {
           "trials": 12,
-          "caught": 12,
+          "caught": 9,
           "undecodable": 0
         },
         "seed-synthetic-untestable-user-friendly": {
@@ -61,8 +109,8 @@
         },
         "seed-synthetic-unwarranted-rate-limit": {
           "trials": 12,
-          "caught": 11,
-          "undecodable": 1
+          "caught": 10,
+          "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
           "trials": 12,
@@ -71,7 +119,10 @@
         }
       }
     },
-    "with_conventions": {
+    "without_conventions": {
+      "kind": "conventions",
+      "samples_per_case": 12,
+      "prompt_fingerprint": "sha256:917096d14abb7393da8679aa57780dcf39b420fb3d60dbc4b4e051f55fb83d22",
       "per_case": {
         "seed-synthetic-contradicts-issue": {
           "trials": 12,
@@ -80,12 +131,12 @@
         },
         "seed-synthetic-contradicts-numeric-limit": {
           "trials": 12,
-          "caught": 11,
+          "caught": 8,
           "undecodable": 0
         },
         "seed-synthetic-contradicts-status-code": {
           "trials": 12,
-          "caught": 9,
+          "caught": 8,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
@@ -95,12 +146,12 @@
         },
         "seed-synthetic-inferred-sibling-retention": {
           "trials": 12,
-          "caught": 11,
+          "caught": 10,
           "undecodable": 0
         },
         "seed-synthetic-inferred-sibling-timeout": {
           "trials": 12,
-          "caught": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-restates-approach": {
@@ -137,13 +188,61 @@
     }
   },
   "baseline": {
-    "pinned_at": "2026-10-12T18:41:04Z",
-    "reason": "#4355 (c0bbb98f): catch rule v4 (prompt-vocabulary probes, judged non_catching_examples), corpus-disjoint plan-review examples and warrant list, leak self-check; the v3 baseline (604e729e) is not comparable",
+    "pinned_at": "2026-10-14T14:15:06Z",
+    "reason": "#4313: arm-keyed v2 record (catch rule v5, architect persona arm); the v1 baseline is not comparable",
     "generator_model": "claude-sonnet-5-5",
-    "prompt_fingerprint": "sha256:ac111eda1fe167854e777abef1d8cdf1257dd9ed916d5d416288941af7253d5c",
-    "samples_per_case": 12,
+    "prompt_fingerprint": "sha256:ab7ecf8b3a69219a216a4fe4130a78ed9a433d3a57d534c1175be9b254ad6295",
     "arms": {
-      "without_conventions": {
+      "architect": {
+        "kind": "persona",
+        "samples_per_case": 46,
+        "prompt_fingerprint": "sha256:7869b39db19d7bc91488f4b3f7cceef6680e7c349ab815ecb4383f67d7e5b2cd",
+        "per_case": {
+          "adr006-production-migrate-down": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 41,
+            "undecodable": 0
+          },
+          "adr091-merge-without-review-coverage": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 45,
+            "undecodable": 0
+          },
+          "clean-sqlc-query-cli": {
+            "expect": "clean",
+            "trials": 46,
+            "caught": 0,
+            "false_alarms": 3,
+            "undecodable": 0
+          },
+          "clean-workflow-v2-optional-field": {
+            "expect": "clean",
+            "trials": 46,
+            "caught": 0,
+            "false_alarms": 1,
+            "undecodable": 0
+          },
+          "declared-cross-component-direction": {
+            "expect": "clean",
+            "trials": 46,
+            "caught": 0,
+            "false_alarms": 28,
+            "undecodable": 0
+          },
+          "undeclared-cross-component-direction": {
+            "expect": "catch",
+            "trials": 46,
+            "caught": 20,
+            "undecodable": 0
+          }
+        }
+      },
+      "with_conventions": {
+        "kind": "conventions",
+        "samples_per_case": 12,
+        "prompt_fingerprint": "sha256:24cf1dab33111c85b561b71921ac1a558d6d1a3e9bc8cf128cf08f6e40f0288a",
         "per_case": {
           "seed-synthetic-contradicts-issue": {
             "trials": 12,
@@ -152,12 +251,12 @@
           },
           "seed-synthetic-contradicts-numeric-limit": {
             "trials": 12,
-            "caught": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-contradicts-status-code": {
             "trials": 12,
-            "caught": 11,
+            "caught": 5,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
@@ -167,7 +266,7 @@
           },
           "seed-synthetic-inferred-sibling-retention": {
             "trials": 12,
-            "caught": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-inferred-sibling-timeout": {
@@ -187,7 +286,7 @@
           },
           "seed-synthetic-untestable-reasonable-time": {
             "trials": 12,
-            "caught": 12,
+            "caught": 9,
             "undecodable": 0
           },
           "seed-synthetic-untestable-user-friendly": {
@@ -197,8 +296,8 @@
           },
           "seed-synthetic-unwarranted-rate-limit": {
             "trials": 12,
-            "caught": 11,
-            "undecodable": 1
+            "caught": 10,
+            "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {
             "trials": 12,
@@ -207,7 +306,10 @@
           }
         }
       },
-      "with_conventions": {
+      "without_conventions": {
+        "kind": "conventions",
+        "samples_per_case": 12,
+        "prompt_fingerprint": "sha256:917096d14abb7393da8679aa57780dcf39b420fb3d60dbc4b4e051f55fb83d22",
         "per_case": {
           "seed-synthetic-contradicts-issue": {
             "trials": 12,
@@ -216,12 +318,12 @@
           },
           "seed-synthetic-contradicts-numeric-limit": {
             "trials": 12,
-            "caught": 11,
+            "caught": 8,
             "undecodable": 0
           },
           "seed-synthetic-contradicts-status-code": {
             "trials": 12,
-            "caught": 9,
+            "caught": 8,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
@@ -231,12 +333,12 @@
           },
           "seed-synthetic-inferred-sibling-retention": {
             "trials": 12,
-            "caught": 11,
+            "caught": 10,
             "undecodable": 0
           },
           "seed-synthetic-inferred-sibling-timeout": {
             "trials": 12,
-            "caught": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-restates-approach": {

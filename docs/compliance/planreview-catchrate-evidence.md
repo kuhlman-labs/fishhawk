@@ -389,7 +389,7 @@ alarm (clean cases).
 
 | Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | pending the #4313 re-pin | not yet recorded |
+| 2026-10-14 | `claude-sonnet-5-5` | 133/144 (0.924) | 130/144 (0.903) | 106/138 (0.768) | 32/138 (0.232) | — | pinned (#4313: arm-keyed v2, catch rule v5; v1 not comparable) | PASS (delta +0.021) |
 
 ### Calibration dry runs
 
@@ -398,3 +398,4 @@ alarm (clean cases).
 | 2026-10-13 | `architect` | 10 | adr033 + adr094 above band (10/10); reworked, re-calibration pending operator | routed fix-up concern (head `84ce5e13`) |
 | 2026-10-14 | `architect` | 10 | adr033 + adr094 10/10 after rewording; replaced by adr006-production-migrate-down and adr091-merge-without-review-coverage (body-only conflicts), re-calibration pending operator | routed fix-up concern (head `f7549511`) |
 | 2026-10-14 | `architect` | 30 | adr006 76.7% and undeclared 43.3% in band; adr091 13.3% below (successor body never shown: superseding ADRs have empty applies_to); adr091 reworked to a content reference, re-calibration pending operator | routed fix-up concern (head `ea8bd7f1`) |
+| 2026-10-14 | `architect` | 30 | adr006 29/30 and adr091 29/30 ABOVE band; undeclared 10/30 in band. Recorded as-is per Captain ruling (no fix-up budget left). **Variance flag:** adr006 was unchanged since the previous run yet moved 23/30 → 29/30, and clean-sqlc false alarms moved 1/30 → 6/30, so at 30 samples the band is not a stable gate for this arm. The recording (46 per case: adr006 41/46, adr091 45/46, undeclared 20/46; false alarms sqlc 3/46, workflow-v2 1/46, declared pair 28/46) is the measurement of record; #4398 tracks the empty-applies_to gap behind adr091's bimodality | PR #4396 comments (head `77c989e6`) |
