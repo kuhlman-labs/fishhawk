@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # check-review-prompt-eval: the STANDING, path-triggered check that a change to
-# the plan-review prompt carries PASSING recorded two-arm catch-rate evidence
-# (E55.4 / #2245).
+# the plan-review prompt carries PASSING recorded arm-keyed catch-rate evidence
+# (E55.4 / #2245; arm-keyed since E78.11 / #4313: the two conventions arms plus
+# the architect persona arm).
 #
 # When any review-prompt path (TRIGGERS below) changed since the merge base with
 # BASE, it requires the OFFLINE gate command
@@ -18,7 +19,7 @@
 # is the design, not a defect.
 #
 # It runs OUTSIDE `scripts/test verify` on purpose. The evidence can only be
-# produced by the live two-arm measurement, which needs a model credential and
+# produced by the live all-arm measurement, which needs a model credential and
 # network the runner's gate denies (the key is on gateEnvDeny); an implement
 # agent that cannot measure must not be red-lined by a stale record it cannot
 # refresh. Only its hermetic harness, scripts/test-review-prompt-eval, runs
@@ -44,11 +45,14 @@
 # backend/internal/prompt/); any other trigger matches that exact path only.
 #
 # RESIDUAL: the trigger list names the paths that own the plan-review prompt,
-# the conventions render, the catch harness and its fixtures. A change ELSEWHERE
-# that still alters the rendered prompt (prompt.Build imports
-# backend/internal/plan) does not trigger this check; the record's fingerprint
-# covers the rendered arm prompts, so the next triggered run, or `--always`,
-# fails that record as stale.
+# the conventions render, the persona prompt builder (backend/internal/personaprompt/)
+# and the architect remit it renders, the catch harness (the persona arm, the
+# calibration dry run, the re-score) and its fixtures. A change ELSEWHERE that
+# still alters a rendered prompt (prompt.Build imports backend/internal/plan; the
+# architect arm embeds docs/adr/index.json, so an ADR landing moves it) does not
+# trigger this check; the record's per-arm fingerprints cover the rendered arm
+# prompts, so the next triggered run, or `--always`, fails that record as stale,
+# naming the arm.
 #
 # EXIT CODES:
 #   0  no trigger path changed (printed reason), or the gate passed;
@@ -67,11 +71,17 @@ PROG="check-review-prompt-eval"
 TRIGGERS=(
   backend/internal/prompt/
   backend/internal/repodoc/
+  backend/internal/personaprompt/
   backend/internal/agenteval/planreviewcatch.go
   backend/internal/agenteval/planreviewevidence.go
+  backend/internal/agenteval/planreviewpersona.go
+  backend/internal/agenteval/planreviewcalibrate.go
+  backend/internal/agenteval/planreviewrescore.go
   backend/internal/agenteval/catchrategate/
   backend/internal/agenteval/testdata/planreview-miss-corpus/
+  backend/internal/agenteval/testdata/planreview-persona-corpus/
   backend/internal/agenteval/testdata/planreview-catchrate/
+  docs/review/architect-remit.md
 )
 
 GATE_PKG="./internal/agenteval/catchrategate"
@@ -84,7 +94,7 @@ usage() {
   printf '%s\n' \
     'Usage: scripts/check-review-prompt-eval [--base <ref>] [--always]' \
     '' \
-    'Requires passing recorded two-arm plan-review catch-rate evidence when a' \
+    'Requires passing recorded arm-keyed plan-review catch-rate evidence when a' \
     'review-prompt path changed since the merge base with <ref> (default' \
     'origin/main). Exit 0: not triggered, or the gate passed. Exit 1: the gate' \
     'failed. Exit 2: the check could not decide (never a skip).' \
@@ -168,7 +178,7 @@ else
   done
 
   if [ -z "$hits" ]; then
-    echo "$PROG: no review-prompt path changed since $merge_base; recorded two-arm evidence not required"
+    echo "$PROG: no review-prompt path changed since $merge_base; recorded arm-keyed evidence not required"
     exit 0
   fi
   echo "$PROG: review-prompt path(s) changed since $merge_base:"
@@ -182,8 +192,8 @@ command -v go >/dev/null 2>&1 ||
 
 echo "$PROG: running (cd backend && go run $GATE_PKG)"
 if (cd "$ROOT/backend" && go run "$GATE_PKG"); then
-  echo "$PROG: PASS — the recorded two-arm catch-rate evidence passes"
+  echo "$PROG: PASS — the recorded arm-keyed catch-rate evidence passes"
   exit 0
 fi
-echo "$PROG: FAIL — the recorded two-arm plan-review catch-rate evidence does not pass for this change; record it per $RUNBOOK" >&2
+echo "$PROG: FAIL — the recorded arm-keyed plan-review catch-rate evidence does not pass for this change; record it per $RUNBOOK" >&2
 exit 1

@@ -7,9 +7,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/personaprompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
 
 // Persona concern ingest (ADR-084 D3 / rule 3 / E55.10 / #3755). A reviewer
@@ -44,26 +43,6 @@ func (inv reviewerInvocation) reviewerRole() string {
 	return concern.ReviewerRoleStandard
 }
 
-// personaQuotedDocuments maps the documents injected into a persona prompt to
-// the set VerifyQuotedPassages checks quotes against. Text is the exact
-// delimiter-bracketed document text the reviewer was shown
-// (repodoc.InjectedContent) — never the server's framing; a block carrying no
-// delimiter pair (a withheld notice) contributes an empty Text, which
-// verification reports as document_text_unavailable.
-func personaQuotedDocuments(docs []prompt.InjectedDocument) []planreview.QuotedDocument {
-	out := make([]planreview.QuotedDocument, 0, len(docs))
-	for _, d := range docs {
-		text, _ := repodoc.InjectedContent(d)
-		out = append(out, planreview.QuotedDocument{
-			Path:        d.Path,
-			Commit:      d.Commit,
-			ContentHash: d.ContentHash,
-			Text:        text,
-		})
-	}
-	return out
-}
-
 // applyPersonaConcernControls runs the persona concern-ingest controls on ONE
 // successful verdict, in place (every planreview helper copies v.Concerns
 // before its first write, so the reviewer adapter's own slice is never
@@ -95,8 +74,11 @@ func (s *Server) applyPersonaConcernControls(ctx context.Context, site string, r
 	}
 	var clampedFrom planreview.Verdict
 	if p := inv.persona; p != nil {
-		qr := planreview.VerifyQuotedPassages(v, personaQuotedDocuments(p.quoteDocs))
-		for _, d := range qr.Demoted {
+		// The two persona-only controls run in personaprompt (shared with the
+		// agenteval persona arm, #4313); the WARN logs are driven from the
+		// results it returns.
+		ctl := personaprompt.ApplyConcernControls(v, p.quoteDocs, p.severityCap)
+		for _, d := range ctl.Quote.Demoted {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, site+": persona quoted passage unverified — concern demoted to low",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
@@ -107,8 +89,7 @@ func (s *Server) applyPersonaConcernControls(ctx context.Context, site string, r
 				slog.String("to", string(d.To)),
 			)
 		}
-		cr := planreview.ClampPersonaSeverities(v, planreview.ConcernSeverity(p.severityCap))
-		for _, c := range cr.Clamped {
+		for _, c := range ctl.Clamp.Clamped {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, site+": persona concern severity clamped to the remit's severity_cap",
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
@@ -118,10 +99,7 @@ func (s *Server) applyPersonaConcernControls(ctx context.Context, site string, r
 				slog.String("to", string(c.To)),
 			)
 		}
-		clampedFrom = qr.VerdictClampedFrom
-		if clampedFrom == "" {
-			clampedFrom = cr.VerdictClampedFrom
-		}
+		clampedFrom = ctl.VerdictClampedFrom
 		if clampedFrom != "" {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, site+": persona verdict downgraded at ingest",
 				slog.String("run_id", runID.String()),

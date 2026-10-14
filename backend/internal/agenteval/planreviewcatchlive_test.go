@@ -10,7 +10,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 )
 
-// The LIVE two-arm plan-review catch-rate measurement (E55.4 / #2245).
+// The LIVE plan-review catch-rate measurement (E55.4 / #2245): EVERY arm of
+// the evidence arm table — the two conventions arms and the architect persona
+// arm (E78.11 / #4313) — in ONE recording.
 //
 // IT SKIPS IN EVERY IN-LOOP RUN: the runner sanitizes gate-subprocess
 // environments through a default-deny allow-list that names ANTHROPIC_API_KEY
@@ -19,7 +21,8 @@ import (
 // The committed testdata/planreview-catchrate/evidence.json and its per-trial
 // sidecar evidence.trials.json (agenteval.CatchRateTrialsPath) are written
 // together by a recording run; a change to the corpus, the conventions
-// fixture, the rendered plan-review prompt or the catch rule makes the
+// fixture, the persona corpus, the architect remit or decision record, the
+// rendered plan-review or persona prompt, or the catch rule makes the
 // committed pair STALE, and the standing check fails closed on a review-prompt
 // change until an operator re-records it. The operator walk is
 // docs/compliance/planreview-catchrate-evidence.md.
@@ -43,9 +46,9 @@ const planReviewCatchEvidencePath = "testdata/planreview-catchrate/evidence.json
 func planReviewCatchLiveGate(t *testing.T) liveCredential {
 	t.Helper()
 	if os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE") == "" {
-		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's two-arm evidence is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
+		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's arm-keyed evidence (both conventions arms and the #4313 architect arm) is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
 	}
-	return requireLiveCredential(t, "Skipping the live plan-review catch-rate arms. #2245's two-arm evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
+	return requireLiveCredential(t, "Skipping the live plan-review catch-rate arms. #2245's arm-keyed evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
 }
 
 // planReviewCatchGeneratorConfig is the generator's client config, minus the
@@ -65,12 +68,12 @@ func planReviewCatchGeneratorConfig() anthropic.Config {
 func recordPlanReviewCatchLive(ctx context.Context, newGenerator func(anthropic.Config) MessageSender, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
 	cfg := planReviewCatchGeneratorConfig()
 	return RecordCatchRateEvidence(ctx, newGenerator(cfg), cfg.Model,
-		committedCatchCorpus, committedCatchConventions, evidencePath, now, opts)
+		committedCatchInputs(), evidencePath, now, opts)
 }
 
-// TestPlanReviewCatchRateLive runs both arms against
-// DefaultCatchRateGeneratorModel (ONE generator config for both arms, so a
-// model difference cannot confound the conventions effect) and judges the
+// TestPlanReviewCatchRateLive runs every arm against
+// DefaultCatchRateGeneratorModel (ONE generator config for every arm, so a
+// model difference cannot confound the conventions or persona effect) and judges the
 // measurement with the SAME rule the offline gate applies. It FAILS — it does
 // not warn — on a within-run regression, a regression against the pinned
 // baseline, or an under-powered measurement: the tolerance is a judgement
@@ -100,7 +103,11 @@ func TestPlanReviewCatchRateLive(t *testing.T) {
 // config-capturing fake sender and a real write to a temp dir. The scripted
 // sender ignores the model, so the only thing that can fail it is the model
 // value it observes. Expectations are string LITERALS, never the constant
-// compared against itself.
+// compared against itself. It is also the end-to-end cross-layer check of
+// #4313: ALL arms are recorded through the one seam — the scripted sender
+// routes the architect arm on the persona remit heading — so corpus →
+// personaprompt → repodoc/decisionrecord → prompt → classifier → evidence →
+// gate runs in every verify.
 func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	all := committedCatchTrials(t)
 	path := filepath.Join(t.TempDir(), "evidence.json")
@@ -146,8 +153,24 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	if _, err := os.Stat(CatchRateTrialsPath(path)); err != nil {
 		t.Errorf("the live seam wrote no trial sidecar at %s: %v", CatchRateTrialsPath(path), err)
 	}
-	if _, err := CheckCatchRateEvidence(path, committedCatchCorpus, committedCatchConventions, DefaultCatchRateGeneratorModel); err != nil {
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), DefaultCatchRateGeneratorModel); err != nil {
 		t.Errorf("CheckCatchRateEvidence on the recorded evidence: %v", err)
+	}
+	// (iii-b) every arm of the arm table was recorded, the architect arm as a
+	// persona arm whose trials the scripted sender answered per case.
+	for arm, kind := range map[string]string{"without_conventions": "conventions", "with_conventions": "conventions", "architect": "persona"} {
+		a, ok := rec.Arms[arm]
+		if !ok {
+			t.Errorf("the recording carries no %q arm", arm)
+			continue
+		}
+		if a.Kind != kind {
+			t.Errorf("arm %q kind = %q, want %q", arm, a.Kind, kind)
+		}
+	}
+	arch := pooledClassCounts(rec.Arms["architect"].PerCase)
+	if arch.catchTrials == 0 || arch.caught != arch.catchTrials || arch.cleanTrials == 0 || arch.alarms != 0 {
+		t.Errorf("architect arm counts = %+v, want every catch trial caught and no clean-case alarm", arch)
 	}
 
 	// (iv) the constant, and the defaults it must NOT have moved.

@@ -1,0 +1,136 @@
+{
+  "persona": "architect",
+  "kind": "clean_area",
+  "expect": "clean",
+  "issue_title": "Let a workflow-v2 stage carry an optional display name",
+  "issue_body": "Stage ids are terse slugs. Add an optional display_name string to workflow-v2 stages. Absent means unchanged behaviour; when present it must be non-blank. Specs without it keep validating.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94006",
+      "id": "kuhlman-labs/fishhawk#94006"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-12T09:00:00Z"
+    },
+    "summary": "Add an optional display_name to workflow-v2 stages: schema, mirrors, parse validation and docs.",
+    "scope": {
+      "files": [
+        {
+          "path": "docs/spec/workflow-v2.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/schemas/workflow-v2.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "cli/internal/spec/schemas/workflow-v2.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/parse.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/parse_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/spec/workflow-v2.md",
+          "operation": "modify"
+        },
+        {
+          "path": "site/src/content/docs/reference/workflow-spec.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add display_name (type string, minLength 1) as an optional property of a workflow-v2 stage in docs/spec/workflow-v2.schema.json; the required list is unchanged."
+      },
+      {
+        "step": 2,
+        "description": "Run scripts/sync-schemas to mirror the schema into backend/internal/spec/schemas and cli/internal/spec/schemas."
+      },
+      {
+        "step": 3,
+        "description": "Reject a whitespace-only display_name in backend/internal/spec/parse.go and carry the value on the parsed stage."
+      },
+      {
+        "step": 4,
+        "description": "Document the field in docs/spec/workflow-v2.md and regenerate the site reference with scripts/gen-site-reference."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Parse tests for an absent, a valid and a whitespace-only display_name; the schema-sync and site-reference drift checks run in verify.",
+      "rollback_plan": "Revert the PR; the field is additive-optional within workflow-v2.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-display-name-optional",
+          "statement": "A workflow-v2 spec without display_name validates exactly as before.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94006"
+        },
+        {
+          "id": "ac-display-name-blank-rejected",
+          "statement": "A workflow-v2 stage whose display_name is whitespace-only is rejected with an error naming the stage.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94006"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-013",
+      "status": "accepted",
+      "superseded_by": []
+    },
+    {
+      "id": "ADR-046",
+      "status": "accepted",
+      "superseded_by": []
+    },
+    {
+      "id": "ADR-067",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "display_name"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Adding display_name departs from ADR-067's consolidated grammar."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2 mirrors the schema into backend/internal/spec, which ADR-046 governs."
+    }
+  ],
+  "benign_examples": [
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-display-name-blank-rejected does not name the error text."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The Web UI does not show display_name yet."
+    }
+  ],
+  "min_matched_records": 3
+}
