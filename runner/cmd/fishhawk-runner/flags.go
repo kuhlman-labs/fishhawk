@@ -211,6 +211,21 @@ type config struct {
 	// normal implement stage.
 	fixup       bool
 	fixupBranch string
+
+	// fixupPolicyIncrement is set at runtime (not a flag) from the fetched
+	// prompt's fixup_policy_increment (#4391): true ONLY on a decomposed
+	// PARENT's fix-up, whose consolidated head already carries every child's
+	// fan-in commit. run() then records fixupIncrementBaseSHA below.
+	fixupPolicyIncrement bool
+
+	// fixupIncrementBaseSHA is set at runtime (not a flag) by run()'s fix-up
+	// block when fixupPolicyIncrement is true (#4391): the consolidated tip
+	// checkoutFixupBase fetched (verified against fixup_expected_head_sha when
+	// advertised). resolvePolicyBaseRef returns it as the git_diff base_ref
+	// label and resolveStageDiffBase merge-bases against it with NO fetch, so
+	// both git_diff emitters measure only the fix-up's own increment — the
+	// parent analogue of #765. Empty everywhere else.
+	fixupIncrementBaseSHA string
 }
 
 // parseFlags reads args and populates a config. Returns a usage

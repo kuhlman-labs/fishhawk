@@ -206,6 +206,27 @@ type promptResponse struct {
 	// when resolution fails (WARN-and-proceed) — the runner then skips the
 	// SHA comparison rather than blocking the pass.
 	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
+	// FixupPolicyIncrement is true ONLY on a decomposed PARENT's fix-up serve
+	// (#4391) — the parent analogue of #765's per-child increment base. A
+	// parent fix-up commits onto the consolidated head, which already carries
+	// every child's fan-in commit, so a policy diff measured against the base
+	// branch counts the WHOLE fan-out and fails max_files_changed on an
+	// over-cap decomposed change no matter how small the fix-up is. With the
+	// flag set the runner measures both git_diff emitters against the
+	// consolidated tip it fetched for the pass, so the in-band
+	// enforceConstraints and the backend's reEvaluatePolicy (which reads the
+	// bundle's last git_diff) see only the fix-up's own increment. Derived
+	// from the SAME predicate as fixupBranchForRun's consolidated branch
+	// (isDecomposedParentRun), so the two can never disagree. Omitted on an
+	// ordinary run's fix-up, a decomposed CHILD's fix-up, a non-fix-up
+	// implement dispatch and a verify-only merge-candidate pass; a probe error
+	// also omits it, keeping today's cumulative diff.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (fixup_policy_increment) MUST
+	// stay byte-identical to the runner's upload.FetchedPrompt
+	// (runner/internal/upload/upload.go). A tag drift silently restores the
+	// cumulative diff and the parent fix-up fails category B again.
+	FixupPolicyIncrement bool `json:"fixup_policy_increment,omitempty"`
 	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
 	// reviewer-emitted unified diff per routed concern, in routing order.
 	// Populated ONLY when Fixup is true AND every routed concern carries a
@@ -737,10 +758,21 @@ func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
 // (#1246) and an ordinary run on its per-stage branch. On a probe error, fall
 // back to fixupBranchFor — never widen an ordinary run onto a shared branch.
 func (s *Server) fixupBranchForRun(ctx context.Context, runRow *run.Run, stage *run.Stage) string {
-	if runRow.DecomposedFrom == nil && s.hasDecomposedChildren(ctx, runRow.ID) {
+	if s.isDecomposedParentRun(ctx, runRow) {
 		return orchestrator.ConsolidatedBranch(runRow.ID)
 	}
 	return fixupBranchFor(runRow, stage)
+}
+
+// isDecomposedParentRun reports whether the run is a decomposed PARENT — not
+// itself a child (DecomposedFrom == nil) and WITH minted children. It is the
+// ONE predicate behind both the consolidated fix-up branch (fixupBranchForRun)
+// and the fixup_policy_increment flag (#4391), so a parent fix-up can never be
+// routed onto the consolidated head while measuring its policy diff
+// cumulatively, or vice versa. A probe error reads false (the conservative
+// per-stage branch and today's cumulative policy diff).
+func (s *Server) isDecomposedParentRun(ctx context.Context, runRow *run.Run) bool {
+	return runRow.DecomposedFrom == nil && s.hasDecomposedChildren(ctx, runRow.ID)
 }
 
 // hasDecomposedChildren reports whether the run has minted decomposition
@@ -1598,6 +1630,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
+	var fixupPolicyIncrement bool
 	var fixupApplyPatches []fixupApplyPatch
 	var conflictResolution *conflictResolutionTrigger
 	if stage.Type == run.StageTypeImplement {
@@ -1803,6 +1836,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// same-branch path instead of `checkout -b <existing branch>`.
 			fixup = true
 			fixupBranch = s.fixupBranchForRun(r.Context(), runRow, stage)
+			// A decomposed parent's fix-up measures its policy diff against the
+			// consolidated tip it checks out, not the base branch (#4391), so the
+			// cumulative fan-out cannot fail the fix-up's max_files_changed.
+			fixupPolicyIncrement = s.isDecomposedParentRun(r.Context(), runRow)
 			// Advertise the run's recorded head so the runner can verify the
 			// fetched PR-branch tip before invoking the agent (#967).
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
@@ -2075,6 +2112,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
+		FixupPolicyIncrement: fixupPolicyIncrement,
 		FixupApplyPatches:    fixupApplyPatches,
 	}
 	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
@@ -2461,6 +2499,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
+	var fixupPolicyIncrement bool
 	var fixupApplyPatches []fixupApplyPatch
 	var conflictResolution *conflictResolutionTrigger
 	var mergeCandidate *mergeCandidateVerifyTrigger
@@ -2638,6 +2677,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// the displayed and dispatched responses identical.
 			fixup = true
 			fixupBranch = s.fixupBranchForRun(r.Context(), runRow, stage)
+			fixupPolicyIncrement = s.isDecomposedParentRun(r.Context(), runRow)
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 			// Near-deterministic apply-list (#1165): serve the routed concerns'
 			// suggested_patches ONLY when every routed concern carries one, so the
@@ -2873,6 +2913,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
+		FixupPolicyIncrement: fixupPolicyIncrement,
 		FixupApplyPatches:    fixupApplyPatches,
 	}
 	// Conflict-resolution instruction (#3202). Served as a UNIT: the resolver
@@ -4707,7 +4748,11 @@ func (s *Server) resolveFixupApplyPatches(ctx context.Context, runID, stageID uu
 // pickRedactedTraceHash + TraceStore.Get + bundle.ExtractDiff seam the
 // implement-review prompt consumes (server/trace.go). Injected into the slim
 // fix-up prompt so the fresh fix-up agent sees the change it is amending without
-// cold-re-exploring the repo.
+// cold-re-exploring the repo. On a decomposed parent whose newest bundle came
+// from an earlier parent fix-up, that bundle's diff is the earlier fix-up's
+// INCREMENT over the consolidated head, not the whole fan-in diff, because the
+// runner measures a parent fix-up's git_diff from the tip it checked out
+// (fixup_policy_increment, #4391).
 //
 // Both return values are populated together on the success path — the changed-
 // file list (the second value, trigger.FixupPriorDiffFiles) is ALWAYS returned

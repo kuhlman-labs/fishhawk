@@ -33,7 +33,9 @@ import (
 //     runner fetched without the merge-candidate-verify capability (#4183);
 //   - mergeCandidateVerifyState is the ONE predicate the merge gate, the
 //     rebase producer and the decomposed-parent hold read (D2, D4);
-//   - routeMergeCandidateFailure applies D6 to a red result.
+//   - routeMergeCandidateFailure applies D6 to a red result;
+//   - voidFailedMergeCandidateVerdict voids a failed head's verdict for the
+//     operator's verify-only re-run (#4391), making it re-triggerable.
 
 // CategoryStageMergeCandidateVerifyTriggered is the durable trigger that
 // re-opens the implement stage for a verify-only merge-candidate pass (ADR-090
@@ -171,6 +173,11 @@ type mergeCandidateVerifiedPayload struct {
 	Failures        string                        `json:"failures,omitempty"`
 	FailureSummary  *mergeCandidateFailureSummary `json:"failure_summary,omitempty"`
 	OutputUntrusted bool                          `json:"output_untrusted"`
+	// VoidsSequence is set ONLY on an operator re-run's void row (#4391): the
+	// chain sequence of the failed merge_candidate_verified row it voids. The
+	// void row is itself a not_executed verdict, so every ADR-090 reader
+	// already treats the head as re-triggerable without consulting it.
+	VoidsSequence int64 `json:"voids_sequence,omitempty"`
 
 	// Source, TransferredFrom and RootHead are READ-side annotations
 	// newestMergeCandidateVerdict sets; they are never stored on this row.
@@ -1119,6 +1126,91 @@ func (s *Server) routeMergeCandidateFailure(ctx context.Context, runRow *run.Run
 		return false, "the delegated fix-up route was refused (" + err.Error() + "). " + mergeCandidateFixupRoute
 	}
 	return true, ""
+}
+
+// mergeCandidateRerunReasonPrefix leads the reason of an operator re-run's
+// void row (#4391), ahead of the operator's own attestation.
+const mergeCandidateRerunReasonPrefix = "operator_rerun: "
+
+// mergeCandidateRerunHint names the verify-only re-run of a FAILED head
+// (#4391). The merge gate's merge_candidate_verify_failed arm carries it so an
+// operator who judges the failure infrastructure rather than the change learns
+// the agent-free route alongside the fix-up route.
+const mergeCandidateRerunHint = "If the failure was infrastructure rather than the change, re-run ONLY the verify with fishhawk_rebase_run_branch rerun_failed_verify:true and a reason: it voids the failed verdict and starts a fresh verify-only pass for the same head, with no agent."
+
+// errMergeCandidateVoidNotFailed is voidFailedMergeCandidateVerdict's refusal
+// when the head's newest recorded verdict is not a failed one.
+var errMergeCandidateVoidNotFailed = errors.New("the head's newest recorded merge-candidate verdict is not failed, so there is nothing to void")
+
+// voidFailedMergeCandidateVerdict voids the newest recorded verdict for
+// EXACTLY headSHA when, and only when, it is `failed` (#4391): it appends ONE
+// merge_candidate_verified row on the failed row's stage, under actor,
+// carrying the failed row's head, cause, command and trigger_sequence with
+// result not_executed, reason "operator_rerun: <reason>" and voids_sequence =
+// the failed row's chain sequence. ADR-090 reads not_executed as
+// re-triggerable, so the merge gate, the fan-in hold, the queue admission and
+// the gate view all see the head as unverified with no reader change.
+//
+// Copying trigger_sequence is what keeps a late runner replay of the ORIGINAL
+// failed report from re-binding: recordMergeCandidateVerifiedEvidence finds
+// the trigger consumed by a row naming the same trigger sequence and answers
+// Duplicate, appending nothing.
+//
+// It deliberately calls neither mergeCandidateQueueOnVerdict (the failed
+// verdict already ejected the run's queue entry) nor
+// detectMergeCandidateFalseTransfers (a void is not a red pass). Any read or
+// append error is returned with nothing written.
+func (s *Server) voidFailedMergeCandidateVerdict(ctx context.Context, runID uuid.UUID, headSHA string,
+	actor mergeCandidateActor, reason string) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("no audit repository is wired")
+	}
+	if actor.Subject == "" {
+		return errors.New("no actor was supplied for the void row")
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeCandidateVerified)
+	if err != nil {
+		return err
+	}
+	var failed *audit.Entry
+	var payload mergeCandidateVerifiedPayload
+	for _, e := range entries {
+		var p mergeCandidateVerifiedPayload
+		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != headSHA {
+			continue
+		}
+		failed, payload = e, p
+	}
+	if failed == nil || payload.Result != mergeCandidateResultFailed {
+		return errMergeCandidateVoidNotFailed
+	}
+	if failed.StageID == nil {
+		return errors.New("the failed merge-candidate verdict carries no stage, so it cannot be voided on its stage")
+	}
+	raw, err := json.Marshal(mergeCandidateVerifiedPayload{
+		HeadSHA:         payload.HeadSHA,
+		Cause:           payload.Cause,
+		VerifyCommand:   payload.VerifyCommand,
+		Result:          mergeCandidateResultNotExecuted,
+		Reason:          mergeCandidateRerunReasonPrefix + reason,
+		TriggerSequence: payload.TriggerSequence,
+		VoidsSequence:   failed.Sequence,
+		OutputUntrusted: true,
+	})
+	if err != nil {
+		return err
+	}
+	kind, subject := actor.Kind, actor.Subject
+	_, err = s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      failed.StageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryMergeCandidateVerified,
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      raw,
+	})
+	return err
 }
 
 // mergeCandidateConcernNote renders the routed concern from TRUSTED fields
