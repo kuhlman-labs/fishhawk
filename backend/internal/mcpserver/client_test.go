@@ -2988,7 +2988,7 @@ func TestRebaseRunBranch_Decodes202ConflictResolution(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
-	res, err := c.RebaseRunBranch(context.Background(), runID, "conflict")
+	res, err := c.RebaseRunBranch(context.Background(), runID, "conflict", false)
 	if err != nil {
 		t.Fatalf("RebaseRunBranch on a 202 = %v, want nil (202 is not an error)", err)
 	}
@@ -3023,7 +3023,7 @@ func TestRebaseRunBranch_Decodes200WithoutConflictResolution(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
-	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	res, err := c.RebaseRunBranch(context.Background(), runID, "", false)
 	if err != nil {
 		t.Fatalf("RebaseRunBranch = %v", err)
 	}
@@ -3051,7 +3051,7 @@ func TestRebaseRunBranch_DecodesPostMergeHeadRead(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
-	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	res, err := c.RebaseRunBranch(context.Background(), runID, "", false)
 	if err != nil {
 		t.Fatalf("RebaseRunBranch = %v", err)
 	}
@@ -3084,7 +3084,7 @@ func TestRebaseRunBranch_DecodesMergeCandidateVerify(t *testing.T) {
 	defer ts.Close()
 
 	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
-	res, err := c.RebaseRunBranch(context.Background(), runID, "")
+	res, err := c.RebaseRunBranch(context.Background(), runID, "", false)
 	if err != nil {
 		t.Fatalf("RebaseRunBranch = %v", err)
 	}
@@ -3102,6 +3102,47 @@ func TestRebaseRunBranch_DecodesMergeCandidateVerify(t *testing.T) {
 	}
 	if res.MergeCandidateVerifyRefusal != "none" {
 		t.Errorf("merge_candidate_verify_refusal = %q, want none", res.MergeCandidateVerifyRefusal)
+	}
+}
+
+// TestRebaseRunBranch_SendsRerunFailedVerify pins the #4391 wire hop: the
+// rerun flag reaches the backend under the exact key rerun_failed_verify
+// (absent when false, so an older backend sees today's body), and the
+// response's merge_candidate_verify_rerun decodes.
+func TestRebaseRunBranch_SendsRerunFailedVerify(t *testing.T) {
+	for _, rerun := range []bool{true, false} {
+		t.Run(fmt.Sprintf("rerun=%v", rerun), func(t *testing.T) {
+			runID := uuid.New()
+			var got map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &got)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","already_up_to_date":true,"mechanism_note":"...",`+
+					`"merge_candidate_verify_state":"in_flight","merge_candidate_verify_triggered":true,`+
+					`"merge_candidate_verify_rerun":true}`)
+			}))
+			defer ts.Close()
+
+			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+			res, err := c.RebaseRunBranch(context.Background(), runID, "infra flake", rerun)
+			if err != nil {
+				t.Fatalf("RebaseRunBranch = %v", err)
+			}
+			v, present := got["rerun_failed_verify"]
+			if rerun && v != true {
+				t.Errorf("request rerun_failed_verify = %v (present=%v), want true; body %v", v, present, got)
+			}
+			if !rerun && present {
+				t.Errorf("request carries rerun_failed_verify=%v with the flag off; want it absent", v)
+			}
+			if got["reason"] != "infra flake" || got["confirm"] != true {
+				t.Errorf("request reason/confirm = %v/%v, want the reason and confirm=true", got["reason"], got["confirm"])
+			}
+			if !res.MergeCandidateVerifyRerun {
+				t.Error("merge_candidate_verify_rerun = false, want true (decoded from the response)")
+			}
+		})
 	}
 }
 

@@ -4072,9 +4072,10 @@ func (r *runResolver) resetRunBranch(ctx context.Context, _ *mcp.CallToolRequest
 // MUST be true — the advance moves the PR head and leaves a merge commit, so
 // it is never silent/auto.
 type RebaseRunBranchInput struct {
-	RunID   string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch is being advanced onto its declared base"`
-	Reason  string `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the branch_rebased audit entry"`
-	Confirm bool   `json:"confirm" jsonschema:"MUST be true to proceed — this merges the declared base into the run branch, leaving a merge commit and moving the PR head; a missing/false confirm is refused"`
+	RunID             string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch is being advanced onto its declared base"`
+	Reason            string `json:"reason,omitempty" jsonschema:"operator rationale, recorded on the branch_rebased audit entry; REQUIRED (non-blank) with rerun_failed_verify, where it is recorded on the void row as the attestation that the failure was not the change's"`
+	Confirm           bool   `json:"confirm" jsonschema:"MUST be true to proceed — this merges the declared base into the run branch, leaving a merge commit and moving the PR head; a missing/false confirm is refused"`
+	RerunFailedVerify bool   `json:"rerun_failed_verify,omitempty" jsonschema:"#4391: re-run ONLY the verify of a FAILED merge-candidate head, with no agent. On the already-up-to-date arm, with the implement stage parked at its review gate, voids the failed verdict (an operator merge_candidate_verified not_executed row) and starts a fresh verify-only pass (or holds it behind the base's live pass). Refused beside a queued fix-up. Requires a non-blank reason. No effect on any other head state or on a performed merge."`
 }
 
 // RebaseRunBranchOutput surfaces the base-advance summary: the prior and new
@@ -4181,6 +4182,23 @@ Sibling verb: fishhawk_reset_run_branch is the right verb for a FOREIGN
 COMMIT pushed ON TOP of the run's commits — a different problem. This one
 is for a BASE ADVANCE.
 
+VERIFY-ONLY RE-RUN of a FAILED head (#4391): pass rerun_failed_verify:true
+with a non-blank reason (the reason is REQUIRED — it is recorded as your
+attestation that the failure was infrastructure, not the change). On the
+already-up-to-date arm, when the live head's merge-candidate verdict is
+failed and the implement stage is parked at its review gate (succeeded or
+awaiting_approval), the call appends an operator
+merge_candidate_verified{result not_executed, reason "operator_rerun: ..."}
+row that VOIDS the failed verdict, then starts a fresh verify-only pass for
+the same head through the ordinary start path (held behind another run's
+live pass on the same base when the ADR-092 queue is wired). The 200
+carries merge_candidate_verify_rerun=true. It is REFUSED — nothing voided,
+nothing triggered — when the implement stage is not at its gate, e.g. a
+queued fix-up (the ADR-090 D6 auto-route leaves the stage pending): dispatch
+that fix-up with fishhawk_dispatch_stage first, then re-run. On any other
+head state, or on a call that performs a base merge, the flag has no effect
+and merge_candidate_verify_note says so.
+
 Idempotent retry: if the CHECK RE-POST fails, re-invoke this verb. The
 branch now contains the base, so the behind-probe short-circuits the merge
 and the call re-posts the check at the correct head. That retry does NOT
@@ -4190,8 +4208,11 @@ fishhawk_vouch_commit, run that instead.
 
 Inputs:
   - run_id  : the run whose branch to advance.
-  - reason  : optional operator note, recorded on the audit entry.
+  - reason  : operator note, recorded on the audit entry (REQUIRED with
+              rerun_failed_verify).
   - confirm : MUST be true (confirmation_required otherwise).
+  - rerun_failed_verify : optional; the verify-only re-run of a failed head
+              described above.
 
 Returns the advance summary (prior_head_sha, new_head_sha,
 merge_commit_sha, already_up_to_date, mechanism_note,
@@ -4201,6 +4222,8 @@ conflict_resolution_stage_id, conflict_resolution_pass,
 conflict_resolution_note) on a 202. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - confirmation_required (confirm not true, 400)
+  - rerun_failed_verify with a blank reason (caught before the HTTP hop;
+    the backend answers 400 validation_failed field reason)
   - run_token_forbidden (a run-bound agent token, 403)
   - insufficient_scope (no write:stages, 403)
   - run_not_found (404)
@@ -4227,7 +4250,12 @@ func (r *runResolver) rebaseRunBranch(ctx context.Context, _ *mcp.CallToolReques
 	if !in.Confirm {
 		return nil, RebaseRunBranchOutput{}, fmt.Errorf("confirm must be true: fishhawk_rebase_run_branch merges the declared base INTO the run branch, leaving a merge commit and moving the PR head")
 	}
-	res, err := r.api.RebaseRunBranch(ctx, runID, in.Reason)
+	// Mirrors the backend's 400 (#4391): the reason is the operator's recorded
+	// attestation that the failed verify was not the change's.
+	if in.RerunFailedVerify && strings.TrimSpace(in.Reason) == "" {
+		return nil, RebaseRunBranchOutput{}, fmt.Errorf("reason is required with rerun_failed_verify: it voids a recorded failed merge-candidate verdict, so state why the failure was not the change's")
+	}
+	res, err := r.api.RebaseRunBranch(ctx, runID, in.Reason, in.RerunFailedVerify)
 	if err != nil {
 		return nil, RebaseRunBranchOutput{}, fmt.Errorf("rebase run branch: %w", err)
 	}

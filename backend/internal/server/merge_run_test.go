@@ -2507,8 +2507,8 @@ func TestMergeRun_MergeCandidate_InFlightRefused(t *testing.T) {
 
 // TestMergeRun_MergeCandidate_FailedRefused pins D6 at the merge gate: a
 // failed verdict is refused 409 merge_candidate_verify_failed naming
-// fishhawk_fixup_stage on BOTH the not-delegated workflow and a delegated one
-// whose fix-up budget is spent — and the gate itself routes NOTHING (zero
+// fishhawk_fixup_stage (and, as rerun_step, the #4391 verify re-run) on BOTH
+// the not-delegated workflow and a delegated one whose fix-up budget is spent — and the gate itself routes NOTHING (zero
 // stage_fixup_triggered appended by the merge call). Counterfactual: mapping
 // failed to admit → RED.
 func TestMergeRun_MergeCandidate_FailedRefused(t *testing.T) {
@@ -2534,6 +2534,13 @@ func TestMergeRun_MergeCandidate_FailedRefused(t *testing.T) {
 			}
 			if env.Error.Details["next_step"] != "fishhawk_fixup_stage" {
 				t.Errorf("details.next_step = %v, want fishhawk_fixup_stage", env.Error.Details["next_step"])
+			}
+			// #4391: the agent-free verify re-run is named alongside.
+			if !strings.Contains(env.Error.Message, "rerun_failed_verify") || !strings.Contains(env.Error.Message, "fishhawk_rebase_run_branch") {
+				t.Errorf("message does not name the verify re-run: %q", env.Error.Message)
+			}
+			if env.Error.Details["rerun_step"] != "fishhawk_rebase_run_branch" {
+				t.Errorf("details.rerun_step = %v, want fishhawk_rebase_run_branch", env.Error.Details["rerun_step"])
 			}
 			if n := len(auditEntries(g.au, CategoryStageFixupTriggered)); n != 0 {
 				t.Errorf("stage_fixup_triggered rows appended = %d, want 0 (the merge gate never routes)", n)
