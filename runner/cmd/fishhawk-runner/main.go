@@ -665,7 +665,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -755,6 +755,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.commitAuthorEmail = commitAuthorEmail
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
+		cfg.fixupPolicyIncrement = promptFixupPolicyIncrement
 		exemptOpenPR = openPRFromHeldCommit
 		exemptHeldSHA = heldCommitSHA
 		exemptHeldBranch = heldCommitBranch
@@ -1899,6 +1900,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
 			cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, preAgentRef)
+		// Decomposed-parent fix-up policy increment (#4391): the consolidated
+		// head carries every child's fan-in commit, so a policy diff measured
+		// against the base branch counts the whole fan-out. Record the tip this
+		// pass just checked out as the increment base BEFORE the deterministic
+		// apply attempt (which takes cfg by value) and the agent, so both
+		// git_diff emitters (resolvePolicyBaseRef / resolveStageDiffBase) bound
+		// the fix-up's own increment — the parent analogue of #765.
+		if cfg.fixupPolicyIncrement {
+			cfg.fixupIncrementBaseSHA = tipSHA
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_policy_increment_base","run_id":%q,"stage_id":%q,"branch":%q,"base_sha":%q}`+"\n",
+				cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA)
+		}
 
 		// Near-deterministic fix-up apply (#1165): when the backend served an
 		// apply-list (every routed concern carried a suggested_patch) AND a
@@ -4025,16 +4039,18 @@ type reasoningEffort struct {
 // and its source rung; zero-valued when the spec declares none.
 // gateContainer (E51.3 / #2136) is the stage's effective workflow-v2
 // gate_container as the backend resolved it; nil when none is declared.
+// fixupPolicyIncrement (#4391) is true only on a decomposed parent's fix-up:
+// run() then bounds the policy diff to the fix-up's increment.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -4049,20 +4065,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -4288,11 +4304,25 @@ func classifyErr(err error) string {
 // (#765). In that case we measure against origin/<shared-branch> so each
 // child's constraints bound only its own increment.
 //
+// A decomposed PARENT's fix-up (#4391) is the parent analogue: its
+// consolidated head carries every child's fan-in commit, so diffing against
+// main sums the whole fan-out and fails an over-cap decomposed change's
+// max_files_changed on ANY fix-up. When run() recorded the consolidated tip
+// the pass checked out (cfg.fixupIncrementBaseSHA, set only when the backend
+// served fixup_policy_increment), that bare SHA is returned FIRST as the
+// git_diff base_ref label, and resolveStageDiffBase measures against it.
+//
 // Fallback-safe by construction: anything that isn't a subsequent
-// decomposition child — including a subsequent child whose
+// decomposition child or a parent fix-up — including a subsequent child whose
 // remote-tracking ref is unexpectedly absent — returns cfg.checkBaseRef
 // unchanged, preserving the prior behavior exactly.
 func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) string {
+	if cfg.fixupIncrementBaseSHA != "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"policy_base_decomposed_parent_fixup","stage_id":%q,"base_ref":%q,"cumulative_base_ref":%q}`+"\n",
+			cfg.stageID, cfg.fixupIncrementBaseSHA, cfg.checkBaseRef)
+		return cfg.fixupIncrementBaseSHA
+	}
 	if cfg.decomposedFromRunID == "" {
 		return cfg.checkBaseRef
 	}
@@ -4431,9 +4461,34 @@ func resolveDiffBaseRef(ctx context.Context, baseRef, repoDir, stageID string, l
 // not a commit in this repository), it logs diff_base_pin_unresolved and
 // delegates to resolveDiffBaseRef — today's re-anchor chain — rather than
 // blocking the diff. An UNPINNED stage (fix-ups, every advance / wave-base
-// skip, the held-commit resume) delegates directly, so fix-ups keep the #1975
-// re-anchor byte-identically.
+// skip, the held-commit resume) delegates directly, so an ordinary or
+// decomposed-child fix-up keeps the #1975 re-anchor byte-identically.
+//
+// A decomposed PARENT's fix-up (#4391) takes a FIRST arm: when run() recorded
+// the consolidated tip the pass checked out (cfg.fixupIncrementBaseSHA), the
+// staged index is measured against merge-base(tip, HEAD) with NO fetch — HEAD
+// descends from the tip, so that is the tip itself — and one
+// diff_base_fixup_increment line records it. On a merge-base error it logs
+// diff_base_fixup_increment_unresolved naming BOTH the SHA and the cumulative
+// base it falls back to, then delegates to resolveDiffBaseRef against
+// cfg.checkBaseRef (NOT baseRef, which is the bare SHA here and would be
+// fetched as a branch): the cumulative chain, today's behaviour, which fails
+// toward enforcement rather than toward a smaller diff.
 func resolveStageDiffBase(ctx context.Context, cfg config, baseRef, repoDir string, logSink io.Writer) string {
+	if cfg.fixupIncrementBaseSHA != "" {
+		mb, err := (&gitdiff.Runner{}).MergeBase(ctx, cfg.fixupIncrementBaseSHA, repoDir)
+		if err != nil {
+			cumulative := resolveDiffBaseRef(ctx, cfg.checkBaseRef, repoDir, cfg.stageID, logSink)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"diff_base_fixup_increment_unresolved","stage_id":%q,"base_ref":%q,"base_sha":%q,"cumulative_base_ref":%q,"measured_against":%q,"detail":%q}`+"\n",
+				cfg.stageID, baseRef, cfg.fixupIncrementBaseSHA, cfg.checkBaseRef, cumulative, err.Error())
+			return cumulative
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"diff_base_fixup_increment","stage_id":%q,"base_ref":%q,"base_sha":%q,"merge_base":%q}`+"\n",
+			cfg.stageID, baseRef, cfg.fixupIncrementBaseSHA, mb)
+		return mb
+	}
 	if cfg.pinnedBaseSHA == "" {
 		return resolveDiffBaseRef(ctx, baseRef, repoDir, cfg.stageID, logSink)
 	}
@@ -4459,7 +4514,9 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// Resolve the effective policy-diff base ref once. For a subsequent
 	// decomposition child this is origin/<shared-branch> so each child's
 	// constraints bound its own increment, not the cumulative fan-out
-	// (#765); for everything else it is cfg.checkBaseRef unchanged.
+	// (#765); for a decomposed parent's fix-up it is the bare consolidated
+	// tip SHA the pass checked out (#4391); for everything else it is
+	// cfg.checkBaseRef unchanged.
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
 	// Anchor the diff to the run's fork point (3-dot) — the stage's pinned base

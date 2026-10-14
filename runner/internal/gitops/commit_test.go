@@ -6508,13 +6508,23 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name string
-		env  []string
+		name    string
+		env     []string
+		inherit bool
 	}{
-		{"nil caller env", nil},
-		{"non-empty caller env", callerEnv},
+		{"nil caller env", nil, false},
+		{"non-empty caller env", callerEnv, false},
+		// The gate container's safe.directory pin (#4393) puts
+		// GIT_CONFIG_COUNT=1 in os.Environ(), duplicating a caller entry
+		// verbatim (#4394). Not parallel: it uses t.Setenv.
+		{"non-empty caller env, inherited duplicate", callerEnv, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.inherit {
+				t.Setenv("GIT_CONFIG_COUNT", "1")
+				t.Setenv("GIT_CONFIG_KEY_0", "safe.directory")
+				t.Setenv("GIT_CONFIG_VALUE_0", "/work")
+			}
 			cmd := capture(func(p *Pusher) {
 				_, _ = p.runOutEnv(context.Background(), dir, tc.env, "version")
 			})
@@ -6529,14 +6539,24 @@ func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
 			// The caller's entries must come AFTER the pins so a caller (or
 			// authedRemoteOp) keeps the last word, and the pins must come
 			// after os.Environ() so an inherited GIT_TERMINAL_PROMPT=1 loses.
+			// Positions are LAST occurrences: an inherited duplicate of an
+			// entry sits earlier, in the os.Environ() prefix (#4393/#4394).
+			lastIndex := func(s []string, v string) int {
+				for i := len(s) - 1; i >= 0; i-- {
+					if s[i] == v {
+						return i
+					}
+				}
+				return -1
+			}
 			lastPin := -1
 			for _, pin := range NonInteractiveEnv() {
-				if i := slices.Index(cmd.Env, pin); i > lastPin {
+				if i := lastIndex(cmd.Env, pin); i > lastPin {
 					lastPin = i
 				}
 			}
 			for _, e := range tc.env {
-				if i := slices.Index(cmd.Env, e); i < lastPin {
+				if i := lastIndex(cmd.Env, e); i < lastPin {
 					t.Errorf("caller env %q is at %d, before the last pin at %d; caller entries must win", e, i, lastPin)
 				}
 			}
