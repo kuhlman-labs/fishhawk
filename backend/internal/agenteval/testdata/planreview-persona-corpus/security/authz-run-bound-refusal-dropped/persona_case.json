@@ -1,0 +1,121 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "authn_authz",
+  "issue_title": "Fold the acceptance-arbitration preamble into a reusable guard",
+  "issue_body": "handleAcceptanceArbitration opens with a hand-rolled block of identity and permission checks before it parses the run id. The merge and vouch handlers carry near-copies of it, and the next approval-class handler will need the same block. Extract it into one helper on Server, adopt it in the arbitration handler first, and keep the status codes and error codes the handler returns today.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94101",
+      "id": "kuhlman-labs/fishhawk#94101"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Extract the arbitration handler's opening checks into a Server helper and call it from the handler.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/server/acceptance_arbitration.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add requireOperatorScope(w, r, id, scope) on *Server in acceptance_arbitration.go. It writes 401 authentication_required for an anonymous identity and 403 insufficient_scope (with required_scope) when the identity lacks the scope, and reports whether the caller may proceed."
+      },
+      {
+        "step": 2,
+        "description": "Replace the handler's opening checks with one call to requireOperatorScope(w, r, id, \"write:approvals\")."
+      },
+      {
+        "step": 3,
+        "description": "Keep the existing arbitration handler tests green; they exercise the anonymous and missing-scope responses."
+      }
+    ],
+    "verification": {
+      "test_strategy": "The existing acceptance arbitration handler tests cover the anonymous and missing-scope responses; run the server package tests.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-preamble-shared",
+          "statement": "The arbitration handler's opening checks live in one reusable Server helper.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94101"
+        },
+        {
+          "id": "ac-responses-kept",
+          "statement": "The arbitration handler's anonymous and missing-scope responses are unchanged.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94101"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/server/acceptance_arbitration.go b/backend/internal/server/acceptance_arbitration.go\nindex 4c1d2e7..9a0b3f5 100644\n--- a/backend/internal/server/acceptance_arbitration.go\n+++ b/backend/internal/server/acceptance_arbitration.go\n@@ -144,30 +144,9 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Request) {\n \tid := IdentityFrom(r.Context())\n-\tif id.IsAnonymous() {\n-\t\ts.writeError(w, r, http.StatusUnauthorized, \"authentication_required\",\n-\t\t\t\"an authenticated token is required\", nil)\n-\t\treturn\n-\t}\n-\tif _, ok := runBoundTokenRunID(id); ok {\n-\t\ts.writeError(w, r, http.StatusForbidden, \"run_token_forbidden\",\n-\t\t\t\"this token may not arbitrate an acceptance triage; discharging a failed acceptance verdict is an operator action\",\n-\t\t\tnil)\n-\t\treturn\n-\t}\n-\t// write:approvals enforced UNCONDITIONALLY (no cookie-session bypass): the\n-\t// arbitration is an approval-class override of a failed verdict that makes\n-\t// the run merge-eligible.\n-\tif !hasScope(id, \"write:approvals\") {\n-\t\ts.writeError(w, r, http.StatusForbidden, \"insufficient_scope\",\n-\t\t\t\"token is missing required scope: write:approvals\",\n-\t\t\tmap[string]any{\"required_scope\": \"write:approvals\"})\n-\t\treturn\n-\t}\n+\tif !s.requireOperatorScope(w, r, id, \"write:approvals\") {\n+\t\treturn\n+\t}\n \n \trunID, err := uuid.Parse(r.PathValue(\"run_id\"))\n \tif err != nil {\n@@ -338,3 +317,21 @@ func (s *Server) handleAcceptanceArbitration(w http.ResponseWriter, r *http.Request) {\n \t}\n \ts.writeJSON(w, http.StatusOK, resp)\n }\n+\n+// requireOperatorScope is the shared opening of an approval-class operator\n+// handler: an authenticated identity holding scope. It writes the refusal\n+// and returns false when the caller may not proceed.\n+func (s *Server) requireOperatorScope(w http.ResponseWriter, r *http.Request, id Identity, scope string) bool {\n+\tif id.IsAnonymous() {\n+\t\ts.writeError(w, r, http.StatusUnauthorized, \"authentication_required\",\n+\t\t\t\"an authenticated token is required\", nil)\n+\t\treturn false\n+\t}\n+\tif !hasScope(id, scope) {\n+\t\ts.writeError(w, r, http.StatusForbidden, \"insufficient_scope\",\n+\t\t\t\"token is missing required scope: \"+scope,\n+\t\t\tmap[string]any{\"required_scope\": scope})\n+\t\treturn false\n+\t}\n+\treturn true\n+}\n",
+  "defect_phrases": [
+    "requireOperatorScope"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "backend/internal/server/acceptance_arbitration.go"
+  },
+  "catch_probes": [
+    "run-bound",
+    "run bound",
+    "mcp:run",
+    "agent token",
+    "agent's token",
+    "agent's own token",
+    "run token",
+    "run-scoped",
+    "bound to a run",
+    "bound to its run"
+  ],
+  "attribution_phrases": [
+    "acceptance_arbitration"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "acceptance_arbitration.go: requireOperatorScope drops the run-bound token refusal. An agent's mcp:run token that also holds write:approvals can now arbitrate its own failed acceptance verdict and make its run merge-eligible. Restore the runBoundTokenRunID check inside the helper."
+    },
+    {
+      "severity": "medium",
+      "category": "authz",
+      "note": "In acceptance_arbitration.go the new helper no longer refuses an agent token bound to a run, so the run_token_forbidden response is gone."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "acceptance_arbitration.go: requireOperatorScope takes id as a parameter but could read IdentityFrom(r.Context()) itself."
+    },
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "acceptance_arbitration.go: the scope refusal should name the caller's subject in the audit trail."
+    },
+    {
+      "severity": "low",
+      "category": "verification",
+      "note": "No new test pins requireOperatorScope's insufficient_scope response."
+    },
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "acceptance_arbitration.go: this is a security risk and the change is insecure; harden it."
+    }
+  ]
+}
