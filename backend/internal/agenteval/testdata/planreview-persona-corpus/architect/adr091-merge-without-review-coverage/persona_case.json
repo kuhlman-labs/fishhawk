@@ -40,7 +40,7 @@
       },
       {
         "step": 2,
-        "description": "In the merge endpoint, treat a decomposed parent as merge-eligible once its consolidated review round has settled, whatever the round's outcome, so a reviewer outage cannot block the fan-in."
+        "description": "In the merge endpoint, treat a decomposed parent as merge-eligible once its consolidated review round has settled, whatever the round's outcome, following the restart-recovery rule that advisory review rounds never hold up a merge."
       },
       {
         "step": 3,
@@ -84,7 +84,7 @@
   ],
   "defect_phrases": [
     "whatever the round's outcome",
-    "a reviewer outage cannot block the fan-in"
+    "advisory review rounds never hold up a merge"
   ],
   "anchor": {
     "kind": "approach_step",
@@ -98,7 +98,8 @@
   ],
   "attribution_phrases": [
     "whatever the round's outcome",
-    "reviewer outage"
+    "restart-recovery rule",
+    "never hold up a merge"
   ],
   "catching_examples": [
     {
@@ -109,7 +110,7 @@
     {
       "severity": "medium",
       "category": "decision_record",
-      "note": "Letting a reviewer outage clear the merge follows ADR-091, which the index marks superseded by ADR-095 (review coverage for decomposed parents)."
+      "note": "The restart-recovery rule that advisory review rounds never hold up a merge is ADR-091, which the index marks superseded by ADR-095 (review coverage for decomposed parents)."
     }
   ],
   "non_catching_examples": [
@@ -117,6 +118,11 @@
       "severity": "low",
       "category": "decision_record",
       "note": "Step 2: the merge-eligibility change is unjustified."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "The restart-recovery rule step 2 follows is ADR-091; cite it in the plan."
     },
     {
       "severity": "medium",

@@ -12,17 +12,29 @@ holding fails verify.
 The issue reports that a reviewer outage leaves a decomposed parent
 unmergeable. The plan's approach step 2 makes the merge endpoint "treat a
 decomposed parent as merge-eligible once its consolidated review round has
-settled, whatever the round's outcome, so a reviewer outage cannot block the
-fan-in". That is the behaviour before ADR-095. The plan cites neither record.
+settled, whatever the round's outcome, following the restart-recovery rule
+that advisory review rounds never hold up a merge". That is the behaviour
+before ADR-095. The plan cites neither record by id; it refers to the
+superseded decision by its CONTENT, in the words of ADR-091's index title
+("Restart recovery re-dispatches orphaned advisory review rounds ...").
 Added 2026-10-14, replacing `adr033-superseded-mcp-transport` after the
 calibration dry run caught that case 10/10 even after rewording. The conflict
 is stated in ADR-095's body (D1).
 
+Reworked 2026-10-14 after a 30-sample calibration dry run caught the first
+wording 4/30 (13.3%, below the 30-80% band): the step then gave no handle
+connecting its behaviour to ADR-091, and the persona never sees ADR-095's
+body. The content reference is that handle: a reviewer who checks the index
+can map "restart-recovery ... advisory review rounds" to ADR-091, see it is
+superseded by ADR-095, and read ADR-095's title. Re-calibration is pending the
+operator.
+
 ## The planted defect
 
 - Kind: `superseded_reliance`, expect `catch`, anchored at approach step 2.
-- The defect: reliance on the pre-ADR-095 merge path. ADR-091 is superseded
-  by ADR-095, whose D1 says a decomposed parent is merge-eligible only when
+- The defect: reliance on the pre-ADR-095 merge path, carried by a content
+  reference to the superseded decision (ADR-091's restart-recovery rule for
+  advisory review rounds), never by its id. ADR-091 is superseded by ADR-095, whose D1 says a decomposed parent is merge-eligible only when
   every slice's code is covered by a successful agent review, and a round
   that settled `failed` or `skipped` covers nothing.
 
@@ -57,6 +69,7 @@ in the rendered index (approval condition C1).
 Catch rule v5 under the architect's `decision_record` category predicate, after
 the production persona-ingest controls. Probes `adr-095`, `review-coverage`,
 `review coverage`, `covered by a successful review`; attribution by `step 2`,
-`whatever the round's outcome` or `reviewer outage`. `persona_case.json`
+`whatever the round's outcome`, `restart-recovery rule` or `never hold up a
+merge`. `persona_case.json`
 carries the hand-written examples the loader classifies to prove the rule
 discriminates.
