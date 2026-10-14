@@ -400,7 +400,8 @@ probed under a bound and fail fast as `container_credentials_blocked`.
   ( -v <gocache>:/gocache -v <gomodcache>:/gomodcache -v <lintcache>:/lintcache
   | -v <gomodcache>:/gomodcache -v fishhawk-gate-cache-<run>-<stage>-<hex>:/gatecache )
   [-v <passwdfile>:/etc/passwd:ro] [-v fishhawk-gate-svc-<hex>:/pgsock:ro]
-  -e K=V … --entrypoint '' <image> <argv…>
+  -e K=V … -e GIT_CONFIG_COUNT=<n+1> -e GIT_CONFIG_KEY_<n>=safe.directory
+  -e GIT_CONFIG_VALUE_<n>=/work --entrypoint '' <image> <argv…>
 ```
 
 The first cache alternative is the BIND form (`ContainerSpec.CacheVolume`
@@ -456,6 +457,30 @@ binds.
   `TestBuildArgv_CacheVolumeStillGuardsCheckout`). No socket, no `/run`,
   no host cache is ever a bind source. These additions are the scoped
   exceptions ADR-063's #2137 and #3967 addenda record.
+- **`/work` is a git safe directory (#4390).** Docker Desktop 4.95 presents a
+  bind-mount ROOT as uid 0, so git run as the non-root gate user refused
+  `/work` with `fatal: detected dubious ownership`, and Go VCS stamping
+  (`error obtaining VCS status: exit status 128`) failed every lint typecheck
+  in a container verify. `BuildArgv` therefore declares `/work` a
+  `safe.directory` through COMMAND-scope config on every exec: it appends
+  `GIT_CONFIG_COUNT=<n+1>`, `GIT_CONFIG_KEY_<n>=safe.directory` and
+  `GIT_CONFIG_VALUE_<n>=/work` to the rendered env. Command scope is protected
+  configuration (git-config(1) SCOPES, the only scope `safe.directory` honours
+  besides the system and global files), so the pin survives the
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null` pins (#3102). It COMPOSES:
+  the entry lands after any `GIT_CONFIG_KEY_n`/`VALUE_n` pairs already in the
+  env and never overwrites them (a stale pair at its own index is replaced);
+  an existing `GIT_CONFIG_COUNT` that is not a decimal count of the pairs
+  present, or that names a pair that is absent, is REFUSED as
+  `ErrContainerSpec` with no argv, which `runGateInContainer` maps to
+  `gateUnavailable` (category C), never a tree verdict. The value is the exact
+  `/work`, deliberately narrower than `scripts/test --in-gate-image`'s `*`.
+  `-buildvcs=false` is rejected as the fix: it would hide the symptom for `go
+  build` and silently degrade `scripts/test`'s git-dependent legs. Pinned by
+  the `BuildArgv` goldens, `TestBuildArgv_PinsGitSafeDirectoryForWork`,
+  `TestBuildArgv_GitSafeDirectoryComposesWithExistingCount`,
+  `TestBuildArgv_GitSafeDirectoryRefusesMalformedConfig`, the runner-seam
+  `TestRunGateInContainer_GitSafeDirectoryPinned` and the live fixture (q).
 - **`--entrypoint ''` precedes the image and the full argv follows it**
   (approval condition 1 of #2134): an image whose `ENTRYPOINT` is `git`
   (`docker.io/alpine/git`, the pinned e2e image) cannot swallow or reinterpret
@@ -504,7 +529,10 @@ drop-then-append (the bind-form `/gocache` / `/lintcache` are not mounted
 there). A provisioned service's env (`PostgresService.GateEnv`, the
 `FISHHAWK_TEST_PG_URL` pin) is applied after ALL of that by `WithServiceEnv`,
 so neither the sanitized env nor extras can redirect the DSN
-(`TestContainerEnv_ServiceEnvWinsOverExtras`).
+(`TestContainerEnv_ServiceEnvWinsOverExtras`). None of these functions emits a
+`GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` entry: `ContainerSpec.BuildArgv` composes
+the `/work` `safe.directory` pin onto whatever env it is handed, last (§ "The
+container path", **`/work` is a git safe directory**).
 The RUNNER's own inherited environment goes to the runtime CLI (it needs
 `PATH`) with the endpoint and the config BOUND (`BindEndpointEnv`:
 `DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `CONTAINER_CONNECTION` /
@@ -1309,7 +1337,7 @@ every host — no runtime skip, no refused-state theater.
 
 | Fixture | Proves |
 |---|---|
-| (a) `TestGateContainer_PrimaryGitUnreachable` | the verify gate's clone has its `.git` INSIDE `/work`; the primary's absolute path is unreachable; a planted hook + ref never reach the primary; `FISHHAWK_VERIFY_LOCK_PATH` is not injected on the container path |
+| (a) `TestGateContainer_PrimaryGitUnreachable` | the verify gate's clone has its `.git` INSIDE `/work`; the primary's absolute path is unreachable; a planted hook + ref never reach the primary; `FISHHAWK_VERIFY_LOCK_PATH` is not injected on the container path. When git refuses `/work` as dubious ownership (#4390) the plant script also prints `mkdir: can't create directory '/hooks'`, because the empty `$(git rev-parse --git-dir)` substitution makes `plantCmd` target `/hooks` at the filesystem root |
 | (b) `TestGateContainer_NoNetwork` | external `wget` and `wget` to a LIVE host-loopback listener both fail; no `eth*` interface (Docker Desktop's VM kernel lists tunnel pseudo-devices, so the assertion is eth-absence, not "only lo"). The listener SERVES HTTP (200 `ok`) and a host-side `http.Get` positive control must succeed BEFORE the container exec (#3448 note 3), so `loopback=failed` discriminates on `--network=none`, not on a dead listener |
 | (c) `TestGateContainer_HostFSUnreadable` | a marker outside the four mounts is unreadable; the host-exec control reads it |
 | (d) `TestGateContainer_NoDaemonSocket` | no docker/podman socket node inside; no socket under the mounts; the RUNTIME-side argv carries no socket token; a checkout with a planted unix socket is refused BEFORE the real seam |
@@ -1321,6 +1349,7 @@ every host — no runtime skip, no refused-state theater.
 | (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=true, rolbypassrls=true` (#4050), `CREATE DATABASE` works, `CREATE ROLE` prints its `CREATE ROLE` command tag, `COPY … TO PROGRAM`, `GRANT pg_execute_server_program TO CURRENT_USER`, `CREATE ROLE … SUPERUSER` and `ALTER ROLE postgres` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
 | (o) `TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses` | `FISHHAWK_GATE_CACHE=process` (#3967): state A's exec 1 prints the runner uid, `GOCACHE=/gatecache/gocache` and WRITES a marker into it (the prepare helper's ownership, live); A's exec 2 finds the marker (warm within a process); state B — a second runner process, a different run/stage — mounts a different volume and finds nothing (fresh across processes); the positive control C (cache off) does NOT see its own exec-1 marker, so warm discriminates on the volume; A's gate argv mounts `/gatecache` BY NAME (a volume that `BelongsTo` A's run/stage, never an absolute path) beside `--network=none`; a host-side `volume inspect` shows the `org.fishhawk.gate-cache` label before `A.cleanup()` and fails after it |
 | (p) `TestGateContainer_PublicPullIgnoresBlockingCredsStore` | #4046, docker only: with the inherited `DOCKER_CONFIG` naming a `credsStore` whose helper never answers, the PRECONDITION is that a direct `docker pull` under it, in its own process group, has NOT completed within 15s and did invoke the helper (then the group is killed; a completed pull FAILS the fixture as non-discriminating); `DetectRuntime` under the same config stays SAFE with zero helper calls; a declared tag-only image (always pulled) then passes the gate, the pull ran under the runner-owned config, the helper was never invoked, and `cleanup()` removes the minted dir |
+| (q) `TestGateContainer_SafeDirectoryOverRootOwnedMountPoint` | #4390: with `/work` NOT a bind (so the daemon creates the mount point root-owned on every runtime, reproducing Docker Desktop's uid-0 bind root) and `/work/.git` the test uid's repository, the PRECONDITION arm (the production argv minus every `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` pair) prints `detected dubious ownership`, else the fixture skips naming that the runtime presents the mount point as the runner's uid; the PINNED arm (the argv as `BuildArgv` renders it, carrying `GIT_CONFIG_KEY_n=safe.directory` paired with `GIT_CONFIG_VALUE_n=/work`) prints `inside=true` and `status=ok` with no `dubious` line |
 | (n) `TestGateContainer_SelfHostPgtestSuite` | OPT-IN (`FISHHAWK_GATE_SELFHOST_IMAGE`, the built `fishhawk-gate` image; counts toward the sentinel only when opted in and run): the REAL `pgtest` suite of the committed HEAD runs in the gate image over the socket DSN — pgx + golang-migrate, template bootstrap, per-test databases — exit 0, the PASS line, no `--- SKIP` |
 | (measure) `TestGateMeasure_ThreeWayFullVerify` (`gatemeasure_test.go`) | OPT-IN (`FISHHAWK_GATE_MEASURE_IMAGE`), NEVER counted toward the sentinel: the three-way full-verify walk of § "Persistent cache volume"; its pure helpers run in-loop via `TestGateMeasureHelpers` |
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
