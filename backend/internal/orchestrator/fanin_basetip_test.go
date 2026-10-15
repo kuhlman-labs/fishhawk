@@ -179,7 +179,7 @@ func stringsFromAny(t *testing.T, v any) []string {
 }
 
 // (1) The core mode: a pre-existing consolidated branch on an old base plus a
-// pending slice folds the base tip in FIRST.
+// pending slice folds the base tip in LAST (#4343), after the slice merges.
 func TestIntegrateSlices_FoldsBaseTipIntoExistingConsolidated(t *testing.T) {
 	f := newFoldFixture(t, 2)
 	f.integrateEarlierWave(t, 0)
@@ -190,24 +190,27 @@ func TestIntegrateSlices_FoldsBaseTipIntoExistingConsolidated(t *testing.T) {
 	}
 
 	f.gh.mu.Lock()
-	first := f.gh.mergeCalls[0]
+	last := f.gh.mergeCalls[len(f.gh.mergeCalls)-1]
 	f.gh.mu.Unlock()
-	if first.Base != f.consolidated || first.Head != "basesha2" {
-		t.Fatalf("mergeCalls[0] = {%s, %s}, want {%s, basesha2} (the fold must come first)", first.Base, first.Head, f.consolidated)
+	if last.Base != f.consolidated || last.Head != "basesha2" {
+		t.Fatalf("last merge call = {%s, %s}, want {%s, basesha2} (the fold must come last)", last.Base, last.Head, f.consolidated)
 	}
-	if !strings.Contains(first.Msg, "onto main@basesha2 ") || !strings.Contains(first.Msg, "ADR-096 D4") {
-		t.Errorf("fold commit message = %q, want it to name main@basesha2 and ADR-096 D4", first.Msg)
+	if !strings.Contains(last.Msg, "onto main@basesha2 ") || !strings.Contains(last.Msg, "after integrating slices (ADR-096 D4)") {
+		t.Errorf("fold commit message = %q, want it to name main@basesha2 and 'after integrating slices (ADR-096 D4)'", last.Msg)
 	}
 	heads := f.mergeHeads()
-	if fi, si := indexOf(heads, "basesha2"), indexOf(heads, f.slice(1)); si < 0 || fi > si {
-		t.Errorf("merge heads = %v, want the fold strictly before the slice-1 merge", heads)
+	if fi, si := indexOf(heads, "basesha2"), indexOf(heads, f.slice(1)); si < 0 || fi < si {
+		t.Errorf("merge heads = %v, want the fold strictly after the slice-1 merge", heads)
 	}
 
 	rows := integrationCommitRecords(t, f.au)[rowsBefore:]
 	if len(rows) != 2 {
-		t.Fatalf("new integration_commit_recorded rows = %v, want [fold, slice 1]", rows)
+		t.Fatalf("new integration_commit_recorded rows = %v, want [slice 1, fold]", rows)
 	}
-	fold := rows[0]
+	if rows[0]["merge_sha"] != "mergesha-"+f.slice(1) {
+		t.Errorf("first new row = %v, want the slice-1 merge", rows[0])
+	}
+	fold := rows[1]
 	if fold["kind"] != "base_fold" || fold["base_sha"] != "basesha2" || fold["merge_sha"] != "mergesha-basesha2" ||
 		fold["base_ref"] != "main" || fold["consolidated_branch"] != f.consolidated {
 		t.Errorf("fold row = %v, want kind base_fold, base_sha basesha2, merge_sha mergesha-basesha2", fold)
@@ -215,16 +218,16 @@ func TestIntegrateSlices_FoldsBaseTipIntoExistingConsolidated(t *testing.T) {
 	if _, ok := fold["slice_index"]; ok {
 		t.Errorf("fold row carries slice_index: %v", fold)
 	}
-	if newest := rows[len(rows)-1]; newest["merge_sha"] != "mergesha-"+f.slice(1) {
-		t.Errorf("newest integration_commit_recorded = %v, want the slice-1 merge (consolidated-tip invariant)", newest)
+	if newest := rows[len(rows)-1]; newest["merge_sha"] != "mergesha-basesha2" {
+		t.Errorf("newest integration_commit_recorded = %v, want the fold (consolidated-tip invariant)", newest)
 	}
 
 	p := auditPayload(t, f.au, "slices_integrated")
 	if p["base_sha"] != "basesha2" || p["base_ref"] != "main" || p["base_fold_outcome"] != "merged" {
 		t.Errorf("slices_integrated base fields = %v/%v/%v, want basesha2/main/merged", p["base_sha"], p["base_ref"], p["base_fold_outcome"])
 	}
-	if got, want := integrationSHAsFromPayload(p), []string{"mergesha-basesha2", "mergesha-" + f.slice(1)}; !reflect.DeepEqual(got, want) {
-		t.Errorf("integration_commit_shas = %v, want %v (fold sha first)", got, want)
+	if got, want := integrationSHAsFromPayload(p), []string{"mergesha-" + f.slice(1), "mergesha-basesha2"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("integration_commit_shas = %v, want %v (fold sha last)", got, want)
 	}
 	if _, ok := p["base_fold_conflict"]; ok {
 		t.Errorf("base_fold_conflict present on a merged fold: %v", p)
@@ -280,8 +283,8 @@ func TestIntegrateSlices_FoldsWhenIntegratedRecordUnreadable(t *testing.T) {
 	if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
 		t.Fatalf("IntegrateSlices: conflict=%+v err=%v", conflict, err)
 	}
-	if heads := f.mergeHeads(); len(heads) == 0 || heads[0] != "basesha2" {
-		t.Errorf("merge heads = %v, want the fold first on an unreadable record", heads)
+	if heads := f.mergeHeads(); len(heads) == 0 || heads[len(heads)-1] != "basesha2" {
+		t.Errorf("merge heads = %v, want the fold last on an unreadable record", heads)
 	}
 }
 
@@ -296,8 +299,8 @@ func TestIntegrateSlices_FoldAlreadyContained(t *testing.T) {
 		t.Fatalf("IntegrateSlices: conflict=%+v err=%v", conflict, err)
 	}
 	heads := f.mergeHeads()
-	if len(heads) == 0 || heads[0] != "basesha2" {
-		t.Fatalf("merge heads = %v, want the fold attempted first", heads)
+	if len(heads) == 0 || heads[len(heads)-1] != "basesha2" {
+		t.Fatalf("merge heads = %v, want the fold attempted last", heads)
 	}
 	if indexOf(heads, f.slice(1)) < 0 {
 		t.Errorf("merge heads = %v, want slice 1 still merged", heads)
@@ -316,7 +319,8 @@ func TestIntegrateSlices_FoldAlreadyContained(t *testing.T) {
 }
 
 // (5) A fold conflict degrades: no error, the pending slice still integrates
-// on the old base, and the conflict is attributed on slices_integrated.
+// on the old base, and the conflict is attributed on slices_integrated — here
+// to slice 0, the lowest integrated slice overlapping the base delta.
 func TestIntegrateSlices_FoldConflictDegradesWithAttribution(t *testing.T) {
 	f := newFoldFixture(t, 2)
 	f.integrateEarlierWave(t, 0)
@@ -356,23 +360,46 @@ func TestIntegrateSlices_FoldConflictDegradesWithAttribution(t *testing.T) {
 	}
 }
 
-// (6) A non-conflict forge error on the fold parks before any slice merge.
+// (6) A non-conflict forge error on the fold parks AFTER the slice merges: the
+// slice-1 merge is durable as its integration_commit_recorded row, no
+// slices_integrated is written, and the next pass re-runs the slice merges as
+// 204 no-ops and retries the fold.
 func TestIntegrateSlices_FoldForgeErrorParks(t *testing.T) {
 	f := newFoldFixture(t, 2)
 	f.integrateEarlierWave(t, 0)
 	boom := errors.New("github 500")
 	f.gh.mergeErrByHead = map[string]error{"basesha2": boom}
 	recordsBefore := slicesIntegratedCount(f.au)
+	rowsBefore := len(integrationCommitRecords(t, f.au))
 
 	conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID)
 	if !errors.Is(err, boom) || conflict != nil {
 		t.Fatalf("IntegrateSlices: conflict=%+v err=%v, want a wrapped %v", conflict, err, boom)
 	}
-	if heads := f.mergeHeads(); !reflect.DeepEqual(heads, []string{"basesha2"}) {
-		t.Errorf("merge heads = %v, want only the fold attempt (zero slice merges)", heads)
+	if heads := f.mergeHeads(); !reflect.DeepEqual(heads, []string{f.slice(0), f.slice(1), "basesha2"}) {
+		t.Errorf("merge heads = %v, want [slice 0, slice 1, fold]", heads)
+	}
+	if rows := integrationCommitRecords(t, f.au)[rowsBefore:]; len(rows) != 1 || rows[0]["merge_sha"] != "mergesha-"+f.slice(1) {
+		t.Errorf("new integration_commit_recorded rows = %v, want only the durable slice-1 merge", rows)
 	}
 	if got := slicesIntegratedCount(f.au); got != recordsBefore {
 		t.Errorf("slices_integrated records = %d, want %d (none on a park)", got, recordsBefore)
+	}
+
+	// The retry: slice 1 is now on the branch (204) and the forge recovered.
+	f.gh.mu.Lock()
+	delete(f.gh.mergeErrByHead, "basesha2")
+	f.gh.mergeEmptyByHead[f.slice(1)] = true
+	f.gh.mergeCalls = nil
+	f.gh.mu.Unlock()
+	if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
+		t.Fatalf("retry IntegrateSlices: conflict=%+v err=%v", conflict, err)
+	}
+	if heads := f.mergeHeads(); len(heads) == 0 || heads[len(heads)-1] != "basesha2" {
+		t.Errorf("retry merge heads = %v, want the fold retried last", heads)
+	}
+	if p := auditPayload(t, f.au, "slices_integrated"); p["base_fold_outcome"] != "merged" {
+		t.Errorf("retry base_fold_outcome = %v, want merged", p["base_fold_outcome"])
 	}
 }
 
@@ -692,8 +719,8 @@ func TestIntegrateSlices_FoldAuditBestEffort(t *testing.T) {
 		if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
 			t.Fatalf("IntegrateSlices: conflict=%+v err=%v", conflict, err)
 		}
-		if heads := f.mergeHeads(); len(heads) == 0 || heads[0] != "basesha2" {
-			t.Errorf("merge heads = %v, want the fold first", heads)
+		if heads := f.mergeHeads(); len(heads) == 0 || heads[len(heads)-1] != "basesha2" {
+			t.Errorf("merge heads = %v, want the fold last", heads)
 		}
 	})
 	t.Run("append fails", func(t *testing.T) {
@@ -703,10 +730,156 @@ func TestIntegrateSlices_FoldAuditBestEffort(t *testing.T) {
 		if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
 			t.Fatalf("IntegrateSlices: conflict=%+v err=%v", conflict, err)
 		}
-		if heads := f.mergeHeads(); len(heads) != 3 || heads[0] != "basesha2" || heads[2] != f.slice(1) {
-			t.Errorf("merge heads = %v, want [fold, slice 0, slice 1]", heads)
+		if heads := f.mergeHeads(); len(heads) != 3 || heads[1] != f.slice(1) || heads[2] != "basesha2" {
+			t.Errorf("merge heads = %v, want [slice 0, slice 1, fold]", heads)
 		}
 	})
+}
+
+// orderedConflictGitHub models a TEXTUAL conflict between a slice head and a
+// base sha that is independent of merge order (#4343): whichever of the two is
+// merged SECOND onto the consolidated branch answers ErrMergeConflict, the
+// first merges cleanly. Unlike the head-keyed mergeErrByHead stub it is
+// order-sensitive by construction, so a fold-first integrateSlices fails the
+// slice merge and a fold-last one fails the fold.
+type orderedConflictGitHub struct {
+	*compareStubGitHub
+	sliceHead, baseSHA string
+	landed             map[string]bool
+}
+
+func (g *orderedConflictGitHub) MergeBranch(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, base, head, msg string) (string, error) {
+	if head == g.sliceHead || head == g.baseSHA {
+		other := g.baseSHA
+		if head == g.baseSHA {
+			other = g.sliceHead
+		}
+		if g.landed[other] {
+			g.mu.Lock()
+			g.mergeCalls = append(g.mergeCalls, mergeBranchCall{Base: base, Head: head, Msg: msg})
+			g.mu.Unlock()
+			return "", forge.ErrMergeConflict
+		}
+	}
+	sha, err := g.compareStubGitHub.MergeBranch(ctx, scope, repo, base, head, msg)
+	if err == nil {
+		g.landed[head] = true
+	}
+	return sha, err
+}
+
+// The #4343 done-means at the orchestrator: main advances (basesha2) with a
+// change that conflicts with PENDING slice 1 (both touch c.go); slice 0 is
+// clean. Fold-last merges slice 1 onto the tip it was built on and the
+// conflict lands on the fold, which degrades — no SliceConflict, no
+// slice_integration_conflict — and is attributed to slice 1.
+func TestIntegrateSlices_MainConflictWithPendingSliceDegradesToFoldConflict(t *testing.T) {
+	f := newFoldFixture(t, 2)
+	f.integrateEarlierWave(t, 0)
+	f.o.GitHub = &orderedConflictGitHub{compareStubGitHub: f.gh, sliceHead: f.slice(1), baseSHA: "basesha2", landed: map[string]bool{}}
+	f.gh.files[comparePair{"consha", "basesha2"}] = []string{"c.go"}
+	f.gh.files[comparePair{"basesha2", f.slice(0)}] = []string{"a.go"}
+	f.gh.files[comparePair{"basesha2", f.slice(1)}] = []string{"c.go"}
+	rowsBefore := len(integrationCommitRecords(t, f.au))
+
+	conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID)
+	if err != nil || conflict != nil {
+		t.Fatalf("IntegrateSlices: conflict=%+v err=%v, want nil/nil (the slice-vs-main conflict degrades to a fold conflict)", conflict, err)
+	}
+	if rows := integrationCommitRecords(t, f.au)[rowsBefore:]; len(rows) != 1 || rows[0]["merge_sha"] != "mergesha-"+f.slice(1) {
+		t.Errorf("new integration_commit_recorded rows = %v, want only the slice-1 merge (no fold row)", rows)
+	}
+	f.au.mu.Lock()
+	for _, e := range f.au.appended {
+		if e.Category == "slice_integration_conflict" {
+			t.Errorf("a slice_integration_conflict row was written: %s", e.Payload)
+		}
+	}
+	f.au.mu.Unlock()
+	p := auditPayload(t, f.au, "slices_integrated")
+	if p["base_fold_outcome"] != "conflict" {
+		t.Fatalf("base_fold_outcome = %v, want conflict", p["base_fold_outcome"])
+	}
+	bfc, ok := p["base_fold_conflict"].(map[string]any)
+	if !ok {
+		t.Fatalf("base_fold_conflict = %#v, want an object", p["base_fold_conflict"])
+	}
+	if idx, _ := bfc["conflicting_slice_index"].(float64); int(idx) != 1 || bfc["conflicting_child_run_id"] != f.children[1].ID.String() {
+		t.Errorf("base_fold_conflict slice = %v/%v, want 1/%s", bfc["conflicting_slice_index"], bfc["conflicting_child_run_id"], f.children[1].ID)
+	}
+	if got := stringsFromAny(t, bfc["conflicting_base_paths"]); !reflect.DeepEqual(got, []string{"c.go"}) || bfc["base_attribution"] != "paths_overlap" {
+		t.Errorf("conflicting_base_paths/base_attribution = %v/%v, want [c.go]/paths_overlap", got, bfc["base_attribution"])
+	}
+}
+
+// C2: a pass whose fan-out has not settled integrates its pending slice but
+// never folds (deferred_children_in_flight); the settled pass that integrates
+// the last slice folds.
+func TestIntegrateSlices_NoFoldWhileChildrenInFlight(t *testing.T) {
+	f := newFoldFixture(t, 3)
+	f.integrateEarlierWave(t, 0)
+	f.children[2].State = run.StateRunning
+
+	if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
+		t.Fatalf("IntegrateSlices: conflict=%+v err=%v", conflict, err)
+	}
+	heads := f.mergeHeads()
+	if indexOf(heads, f.slice(1)) < 0 {
+		t.Errorf("merge heads = %v, want the pending slice 1 merged", heads)
+	}
+	if indexOf(heads, "basesha2") >= 0 {
+		t.Errorf("merge heads = %v, want NO fold while slice 2 is in flight", heads)
+	}
+	p := auditPayload(t, f.au, "slices_integrated")
+	if p["base_fold_outcome"] != "deferred_children_in_flight" {
+		t.Errorf("base_fold_outcome = %v, want deferred_children_in_flight", p["base_fold_outcome"])
+	}
+
+	// Slice 2 lands: the settled pass integrates it and then folds.
+	f.children[2].State = run.StateSucceeded
+	f.gh.mu.Lock()
+	f.gh.mergeEmptyByHead[f.slice(1)] = true
+	f.gh.mergeCalls = nil
+	f.gh.mu.Unlock()
+	if conflict, err := f.o.IntegrateSlices(context.Background(), f.parent.ID); err != nil || conflict != nil {
+		t.Fatalf("settled IntegrateSlices: conflict=%+v err=%v", conflict, err)
+	}
+	if heads := f.mergeHeads(); len(heads) == 0 || heads[len(heads)-1] != "basesha2" || indexOf(heads, f.slice(2)) < 0 {
+		t.Errorf("settled merge heads = %v, want slice 2 merged and the fold last", heads)
+	}
+	if p := auditPayload(t, f.au, "slices_integrated"); p["base_fold_outcome"] != "merged" {
+		t.Errorf("settled base_fold_outcome = %v, want merged", p["base_fold_outcome"])
+	}
+}
+
+// C2: fanOutSettled is true only when EVERY child succeeded.
+func TestFanOutSettled(t *testing.T) {
+	mk := func(states ...run.State) []*run.Run {
+		out := make([]*run.Run, 0, len(states))
+		for _, s := range states {
+			out = append(out, &run.Run{ID: uuid.New(), State: s})
+		}
+		return out
+	}
+	cases := []struct {
+		name     string
+		children []*run.Run
+		want     bool
+	}{
+		{"all succeeded", mk(run.StateSucceeded, run.StateSucceeded), true},
+		{"one running", mk(run.StateSucceeded, run.StateRunning), false},
+		{"one pending", mk(run.StatePending, run.StateSucceeded), false},
+		{"one failed", mk(run.StateSucceeded, run.StateFailed), false},
+		{"one cancelled", mk(run.StateCancelled, run.StateSucceeded), false},
+		{"empty (vacuous)", mk(), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fanOutSettled(tc.children); got != tc.want {
+				t.Errorf("fanOutSettled = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestShortSHA(t *testing.T) {

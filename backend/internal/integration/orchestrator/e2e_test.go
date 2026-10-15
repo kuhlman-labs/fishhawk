@@ -66,11 +66,73 @@ func (a advancerAdapter) IntegrateSlices(ctx context.Context, parentRunID uuid.U
 	if err != nil || conflict == nil {
 		return nil, err
 	}
+	return sliceConflictToChildcompletion(conflict), nil
+}
+
+// sliceConflictToChildcompletion copies EVERY field of the orchestrator's
+// SliceConflict into childcompletion's identical type (#4294 C7 / #4343), so
+// the e2e sweeper sees the same base attribution production's serve.go adapter
+// passes. TestAdvancerAdapterSliceConflictCopy_CarriesEveryField pins it: a
+// field added to orchestrator.SliceConflict without extending this copy goes
+// RED.
+func sliceConflictToChildcompletion(c *orchestrator.SliceConflict) *childcompletion.SliceConflict {
 	return &childcompletion.SliceConflict{
-		SliceIndex: conflict.SliceIndex,
-		ChildRunID: conflict.ChildRunID,
-		Detail:     conflict.Detail,
-	}, nil
+		SliceIndex:           c.SliceIndex,
+		ChildRunID:           c.ChildRunID,
+		Detail:               c.Detail,
+		BaseSHA:              c.BaseSHA,
+		ConflictingBasePaths: c.ConflictingBasePaths,
+		BaseAttribution:      c.BaseAttribution,
+		CompareTruncated:     c.CompareTruncated,
+	}
+}
+
+// TestAdvancerAdapterSliceConflictCopy_CarriesEveryField fills every exported
+// field of orchestrator.SliceConflict with a distinct non-zero value by
+// reflection, converts it, and asserts childcompletion.SliceConflict carries a
+// same-named field holding a DeepEqual value. A field kind the filler does not
+// know fails the test, so a new field cannot pass vacuously as a zero value.
+func TestAdvancerAdapterSliceConflictCopy_CarriesEveryField(t *testing.T) {
+	var src orchestrator.SliceConflict
+	sv := reflect.ValueOf(&src).Elem()
+	st := sv.Type()
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		fv := sv.Field(i)
+		switch {
+		case f.Type == reflect.TypeOf(uuid.UUID{}):
+			fv.Set(reflect.ValueOf(uuid.New()))
+		case f.Type.Kind() == reflect.Int:
+			fv.SetInt(int64(i + 7))
+		case f.Type.Kind() == reflect.String:
+			fv.SetString("value-of-" + f.Name)
+		case f.Type.Kind() == reflect.Bool:
+			fv.SetBool(true)
+		case f.Type.Kind() == reflect.Slice && f.Type.Elem().Kind() == reflect.String:
+			fv.Set(reflect.ValueOf([]string{f.Name + "-a", f.Name + "-b"}))
+		default:
+			t.Fatalf("orchestrator.SliceConflict.%s has kind %s the filler does not know; extend the filler AND sliceConflictToChildcompletion", f.Name, f.Type)
+		}
+	}
+
+	dst := reflect.ValueOf(sliceConflictToChildcompletion(&src)).Elem()
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		got := dst.FieldByName(f.Name)
+		if !got.IsValid() {
+			t.Errorf("childcompletion.SliceConflict has no field %s", f.Name)
+			continue
+		}
+		if want := sv.Field(i).Interface(); !reflect.DeepEqual(got.Interface(), want) {
+			t.Errorf("SliceConflict.%s copied as %#v, want %#v: sliceConflictToChildcompletion drops it", f.Name, got.Interface(), want)
+		}
+	}
 }
 
 // decomposedPlanContent builds a valid standard_v1 plan JSON with two

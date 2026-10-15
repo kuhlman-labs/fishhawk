@@ -492,14 +492,19 @@ func TestFanInOnBaseTip_SinglePassMerge(t *testing.T) {
 	}
 }
 
-// TestFanInOnBaseTip_MainConflictNamesSlice is done-means 5. B1 and slice 1
-// both touch c.go; slice 0 does not. Slice 1 merges cleanly onto B0 + slice 0,
-// so absent the fold no conflict surfaces at fan-in. With the fold, the final
-// pass, driven through POST /v0/runs/{id}/consolidate, folds B1 cleanly and
-// slice 1's own merge conflicts: the parent implement stage fails category B
-// with the stable prefix and the slice_integration_conflict row names slice 1,
-// child 1 and the base path c.go.
-func TestFanInOnBaseTip_MainConflictNamesSlice(t *testing.T) {
+// TestFanInOnBaseTip_MainConflictRoutesToConflictResolution is the #4343
+// done-means (it replaces #4294's done-means 5, which pinned the unroutable
+// category-B failure). B1 and pending slice 1 both touch c.go; slice 0 does
+// not. The final pass, driven through POST /v0/runs/{id}/consolidate, merges
+// slice 1 onto the consolidated tip it was built on (clean) and only THEN folds
+// B1, which conflicts: the fold degrades, so the parent integrates, its
+// implement stage is NOT failed, the head is clean on the slices' own base
+// (S0 + S1, no B1), no slice_integration_conflict row exists, and
+// slices_integrated attributes the fold conflict to slice 1 / c.go. At merge
+// time POST /v0/runs/{id}/rebase-branch then meets the same conflict and
+// answers 202 conflict_resolution_triggered — the bounded #3202 agent pass —
+// without writing the branch, so the operator resolves nothing by hand.
+func TestFanInOnBaseTip_MainConflictRoutesToConflictResolution(t *testing.T) {
 	h := newBaseTipHarness(t, run.StageStateAwaitingChildren)
 	h.integrateFirstWave()
 	h.advanceMainAndFinishSlice1("c.go", "c.go")
@@ -510,46 +515,78 @@ func TestFanInOnBaseTip_MainConflictNamesSlice(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	resp := decodeConsolidate(t, w)
-	if resp.Outcome != "slice_conflict" {
-		t.Fatalf("outcome = %q, want slice_conflict: slice 1's conflict with main did not surface at fan-in", resp.Outcome)
+	if resp := decodeConsolidate(t, w); resp.Outcome != "integrated" {
+		t.Fatalf("outcome = %q (%s), want integrated: the slice-vs-main conflict was not routed to the fold", resp.Outcome, resp.Detail)
 	}
-	if resp.ConflictingSliceIndex == nil || *resp.ConflictingSliceIndex != 1 || resp.ConflictingChildRunID != h.child1.ID.String() {
-		t.Errorf("response names slice %v child %q, want slice 1 child %s", resp.ConflictingSliceIndex, resp.ConflictingChildRunID, h.child1.ID)
-	}
-	if !h.graph.isAncestor("B1", h.graph.tip(h.consolidated)) {
-		t.Error("the base fold did not land B1 on the consolidated branch before the slice merge")
-	}
-
 	st, err := h.rr.GetStage(context.Background(), h.impl.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.State != run.StageStateFailed || st.FailureCategory == nil || *st.FailureCategory != run.FailureB {
-		t.Errorf("parent implement = %q / %v, want failed category B", st.State, st.FailureCategory)
+	if st.State == run.StageStateFailed {
+		t.Fatalf("parent implement = failed / %v (%v), want not failed", st.FailureCategory, st.FailureReason)
 	}
-	if st.FailureReason == nil || !strings.HasPrefix(*st.FailureReason, "slice integration conflict") {
-		t.Errorf("failure reason = %v, want the stable 'slice integration conflict' prefix", st.FailureReason)
+	head := h.graph.tip(h.consolidated)
+	if !h.graph.isAncestor("S0", head) || !h.graph.isAncestor("S1", head) {
+		t.Errorf("consolidated head %s is missing a slice", head)
+	}
+	if h.graph.isAncestor("B1", head) {
+		t.Errorf("consolidated head %s contains B1: the conflicting fold was not skipped", head)
+	}
+	if n := len(auditEntries(h.au, "slice_integration_conflict")); n != 0 {
+		t.Errorf("slice_integration_conflict rows = %d, want 0", n)
 	}
 
-	entries := auditEntries(h.au, "slice_integration_conflict")
-	if len(entries) != 1 {
-		t.Fatalf("slice_integration_conflict rows = %d, want 1", len(entries))
+	si := auditEntries(h.au, "slices_integrated")
+	if len(si) == 0 {
+		t.Fatal("no slices_integrated row")
 	}
 	var p struct {
-		SliceIndex      int      `json:"conflicting_slice_index"`
-		ChildRunID      string   `json:"conflicting_child_run_id"`
-		BaseSHA         string   `json:"base_sha"`
-		BasePaths       []string `json:"conflicting_base_paths"`
-		BaseAttribution string   `json:"base_attribution"`
+		BaseSHA     string `json:"base_sha"`
+		FoldOutcome string `json:"base_fold_outcome"`
+		Conflict    *struct {
+			SliceIndex      *int     `json:"conflicting_slice_index"`
+			ChildRunID      string   `json:"conflicting_child_run_id"`
+			BasePaths       []string `json:"conflicting_base_paths"`
+			BaseAttribution string   `json:"base_attribution"`
+		} `json:"base_fold_conflict"`
 	}
-	if err := json.Unmarshal(entries[0].Payload, &p); err != nil {
+	if err := json.Unmarshal(si[len(si)-1].Payload, &p); err != nil {
 		t.Fatal(err)
 	}
-	if p.SliceIndex != 1 || p.ChildRunID != h.child1.ID.String() {
-		t.Errorf("conflict names slice %d child %s, want slice 1 child %s", p.SliceIndex, p.ChildRunID, h.child1.ID)
+	if p.FoldOutcome != "conflict" || p.BaseSHA != "B1" || p.Conflict == nil {
+		t.Fatalf("slices_integrated = %+v, want base_fold_outcome conflict at B1 with base_fold_conflict", p)
 	}
-	if p.BaseSHA != "B1" || len(p.BasePaths) != 1 || p.BasePaths[0] != "c.go" || p.BaseAttribution != "paths_overlap" {
-		t.Errorf("attribution = (%q, %v, %q), want (B1, [c.go], paths_overlap)", p.BaseSHA, p.BasePaths, p.BaseAttribution)
+	c := p.Conflict
+	if c.SliceIndex == nil || *c.SliceIndex != 1 || c.ChildRunID != h.child1.ID.String() ||
+		len(c.BasePaths) != 1 || c.BasePaths[0] != "c.go" || c.BaseAttribution != "paths_overlap" {
+		t.Errorf("base_fold_conflict = (%v, %q, %v, %q), want (1, %s, [c.go], paths_overlap)", c.SliceIndex, c.ChildRunID, c.BasePaths, c.BaseAttribution, h.child1.ID)
+	}
+
+	// Merge time: the PR (head = consolidated, base = main) is behind main and
+	// conflicts with it. The rebase verb starts the conflict-resolution pass.
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	h.rr.mu.Lock()
+	h.parent.PullRequestURL = &prURL
+	h.rr.mu.Unlock()
+	h.graph.mu.Lock()
+	h.graph.prNumber, h.graph.prHead, h.graph.prBase = 9, h.consolidated, "main"
+	h.graph.mu.Unlock()
+
+	rw := postRebaseBranch(t, h.s, h.parent.ID, rebaseBranchRequest{Confirm: true}, withRebaseOperator)
+	if rw.Code != http.StatusAccepted {
+		t.Fatalf("rebase-branch status = %d, want 202:\n%s", rw.Code, rw.Body.String())
+	}
+	var rb rebaseBranchResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &rb); err != nil {
+		t.Fatal(err)
+	}
+	if !rb.ConflictResolutionTriggered {
+		t.Errorf("rebase-branch response = %s, want conflict_resolution_triggered true", rw.Body.String())
+	}
+	if n := len(crTriggerEntries(h.au)); n != 1 {
+		t.Errorf("stage_conflict_resolution_triggered rows = %d, want exactly 1", n)
+	}
+	if tip := h.graph.tip(h.consolidated); tip != head {
+		t.Errorf("consolidated tip moved %s -> %s: the rebase verb wrote the branch instead of handing the conflict to the agent pass", head, tip)
 	}
 }

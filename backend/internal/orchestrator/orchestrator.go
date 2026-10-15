@@ -1831,6 +1831,14 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 // message (stable "slice integration conflict: ..." prefix); the resume
 // target is the structured fields, never parsed from Detail.
 //
+// Because the base tip is folded in AFTER the slice merges (#4343), a slice
+// merge meets only the consolidated tip its slice was built on plus the
+// slices merged before it in this pass, so a SliceConflict is a slice-vs-slice
+// conflict, or a consolidated branch CREATED at a newer base tip than a
+// wave-0 slice was built on. A slice-vs-main conflict on a pre-existing
+// consolidated branch is a base-fold conflict instead (slices_integrated
+// base_fold_conflict), never a SliceConflict.
+//
 // BaseSHA, ConflictingBasePaths, BaseAttribution and CompareTruncated are the
 // best-effort attribution of the conflict to base paths (ADR-096 D4 / #4294):
 // the base tip the pass integrated against, the files both the base delta and
@@ -1932,10 +1940,17 @@ func (o *Orchestrator) SliceIntegrationUnavailable(parent *run.Run) string {
 // implement stage category-B recoverable); a clean run emits a
 // slices_integrated audit and returns (nil, nil).
 //
-// When the consolidated branch already exists and a succeeded slice is still
-// pending, the resolved base tip is folded in BEFORE the slice merges
-// (ADR-096 D4 / #4294, fanin_basetip.go), so the consolidated head is built on
-// the current base tip.
+// When the consolidated branch already exists, a succeeded slice was pending
+// and the fan-out has settled (every child succeeded), the resolved base tip
+// is folded in AFTER the slice merges (ADR-096 D4 / #4294, fold-last since
+// #4343, fanin_basetip.go), so the consolidated head is built on the current
+// base tip. Folding last means every pending slice merges onto the
+// consolidated tip it was built on, so a slice-vs-main conflict surfaces as a
+// base-fold conflict: the fold is skipped, the head stays clean on the slices'
+// own base, slices_integrated.base_fold_conflict attributes it, and the
+// merge-time rebase verb's conflict-resolution pass (#3202 / #4304) resolves
+// it. A pass whose fan-out has not settled records deferred_children_in_flight
+// and does not fold.
 //
 // Graceful-skip (nil, nil — same posture as maybeOpenConsolidatedPR /
 // fireDispatch) when GitHub/installation isn't wired or there are zero
@@ -2014,7 +2029,10 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 
 	// Ensure the consolidated branch exists, creating it from the base sha
 	// when absent. CreateRef's 422 "already exists" no-op makes a
-	// re-entrant settle (sweeper + event-driven race) safe.
+	// re-entrant settle (sweeper + event-driven race) safe. The pending set
+	// is read BEFORE any merge: the fold below folds only a pass that
+	// integrates something new, and this pass's own slice merges must not
+	// make its slices look already covered.
 	consolidated := consolidatedBranch(parent.ID)
 	integrationCommitSHAs := make([]string, 0, len(succeeded)+1)
 	fold := baseFoldRecord{baseRef: base, baseSHA: baseSHA, outcome: baseFoldNotAttempted}
@@ -2022,49 +2040,14 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	if err != nil {
 		return nil, fmt.Errorf("resolve consolidated branch %q: %w", consolidated, err)
 	}
+	var pending []*run.Run
 	if !cexists {
 		if err := o.GitHub.CreateRef(ctx, scope, repo, consolidated, baseSHA); err != nil {
 			return nil, fmt.Errorf("create consolidated branch %q: %w", consolidated, err)
 		}
 		fold.outcome = baseFoldCreatedAtTip
-	} else if pending := pendingSlices(succeeded, o.integratedChildRunIDs(ctx, parent.ID)); len(pending) > 0 {
-		// Base fold (ADR-096 D4 / #4294): the branch pre-exists (an earlier
-		// wave boundary or a partial pass created it, possibly on an older
-		// base) and a slice is pending, so merge the base tip in BEFORE the
-		// pending slices — the final head is then built on the current tip.
-		// A pass with no pending slice never folds: it must not move a head
-		// the D5 merge-candidate pass may already have verified.
-		outcome, foldSHA, ferr := o.foldBaseTip(ctx, scope, repo, consolidated, base, baseSHA)
-		if ferr != nil {
-			// A non-conflict forge failure parks the parent BEFORE any slice
-			// merge; the next pass retries (every step is idempotent).
-			return nil, fmt.Errorf("fold base %s@%s into %q: %w", base, shortSHA(baseSHA), consolidated, ferr)
-		}
-		switch outcome {
-		case baseFoldMerged:
-			integrationCommitSHAs = append(integrationCommitSHAs, foldSHA)
-			o.emitBaseFoldRecorded(ctx, parent.ID, foldSHA, consolidated, base, baseSHA)
-		case baseFoldConflict:
-			// An already-integrated slice conflicts with the new base. Degrade
-			// to the pre-fold behaviour: skip the fold and integrate the
-			// pending slices on the old base; the merge-time rebase /
-			// conflict-resolution path owns it. Routing it to
-			// slice_integration_conflict would re-drive a child, which cannot
-			// remove content already merged here.
-			integrated := make([]*run.Run, 0, len(succeeded)-len(pending))
-			for _, c := range succeeded {
-				if !containsRun(pending, c) {
-					integrated = append(integrated, c)
-				}
-			}
-			fold.conflict = o.attributeFoldConflict(ctx, scope, repo, parent.ID, consolidatedTip, baseSHA, integrated, o.sliceScopeFiles(ctx, parent.ID))
-			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: base fold conflicted; integrating pending slices on the existing consolidated base",
-				slog.String("parent_run_id", parent.ID.String()),
-				slog.String("consolidated_branch", consolidated),
-				slog.String("base_sha", baseSHA),
-				slog.String("base_attribution", fold.conflict.attribution))
-		}
-		fold.outcome = outcome
+	} else {
+		pending = pendingSlices(succeeded, o.integratedChildRunIDs(ctx, parent.ID))
 	}
 
 	// Merge each succeeded slice in ascending order. A 204 (already merged)
@@ -2124,6 +2107,52 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 			return nil, &SliceHeadMissingError{SliceIndex: *c.SliceIndex, ChildRunID: c.ID, Branch: head}
 		default:
 			return nil, fmt.Errorf("merge slice %d (child %s) onto %s: %w", *c.SliceIndex, c.ID, consolidated, err)
+		}
+	}
+
+	// Base fold (ADR-096 D4 / #4294, fold-last since #4343): the branch
+	// pre-exists (an earlier wave boundary or a partial pass created it,
+	// possibly on an older base) and this pass integrated a pending slice, so
+	// merge the base tip in AFTER the slices. Every pending slice then merged
+	// onto the consolidated tip it was built on, and a slice-vs-main conflict
+	// surfaces HERE as a fold conflict rather than as an unroutable
+	// slice_integration_conflict. A pass with no pending slice never folds: it
+	// must not move a head the D5 merge-candidate pass may already have
+	// verified. A pass whose fan-out has not settled (a child that is not
+	// succeeded) never folds either: that child was built on the pre-fold tip
+	// and may yet be integrated or re-driven onto it.
+	if cexists && len(pending) > 0 {
+		if !fanOutSettled(children) {
+			fold.outcome = baseFoldDeferredInFlight
+		} else {
+			outcome, foldSHA, ferr := o.foldBaseTip(ctx, scope, repo, consolidated, base, baseSHA)
+			if ferr != nil {
+				// A non-conflict forge failure parks the parent. The slice merge
+				// commits are already durable as integration_commit_recorded
+				// rows; slices_integrated is not written, so the next pass
+				// re-runs the slice merges as 204 no-ops and retries the fold.
+				return nil, fmt.Errorf("fold base %s@%s into %q: %w", base, shortSHA(baseSHA), consolidated, ferr)
+			}
+			switch outcome {
+			case baseFoldMerged:
+				// Appended LAST, so the newest integration_commit_recorded row
+				// (and the last integration_commit_shas entry) is the tip.
+				integrationCommitSHAs = append(integrationCommitSHAs, foldSHA)
+				o.emitBaseFoldRecorded(ctx, parent.ID, foldSHA, consolidated, base, baseSHA)
+			case baseFoldConflict:
+				// A slice (pending or earlier) conflicts with the new base.
+				// Degrade: skip the fold and keep the clean head on the slices'
+				// own base; the merge-time rebase verb's conflict-resolution
+				// pass (#3202 / #4304) owns it. Every succeeded slice is now
+				// integrated, so attribution spans all of them.
+				fold.conflict = o.attributeFoldConflict(ctx, scope, repo, parent.ID, consolidatedTip, baseSHA, succeeded, o.sliceScopeFiles(ctx, parent.ID))
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: base fold conflicted; keeping the consolidated head on its existing base",
+					slog.String("parent_run_id", parent.ID.String()),
+					slog.String("consolidated_branch", consolidated),
+					slog.String("base_sha", baseSHA),
+					slog.String("base_attribution", fold.conflict.attribution))
+			}
+			fold.outcome = outcome
 		}
 	}
 
@@ -2220,8 +2249,9 @@ func SliceBranch(parentID uuid.UUID, sliceIndex int) string {
 //
 // fold adds the ADR-096 D4 (#4294) base fields additively: base_ref, base_sha,
 // base_fold_outcome (created_at_tip | merged | already_contained | conflict |
-// not_attempted) and, on a conflict outcome, base_fold_conflict with the
-// attributed slice and base paths. A merged fold's SHA leads
+// deferred_children_in_flight | not_attempted) and, on a conflict outcome,
+// base_fold_conflict with the attributed slice and base paths. The fold runs
+// after the slice merges (#4343), so a merged fold's SHA trails
 // integration_commit_shas.
 func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string, integrationCommitSHAs []string, fold baseFoldRecord) {
 	if o.Audit == nil {
