@@ -174,6 +174,188 @@ type gateViewResponse struct {
 	// no completed job; omitted with a specialist_jobs history_gaps entry when
 	// the run's account id is unparseable or the read fails.
 	SpecialistJobs []gateViewSpecialistJob `json:"specialist_jobs,omitempty"`
+	// FanInConflict is a decomposed parent's UNRESOLVED fan-in conflict
+	// (#4343): its base attribution and the remedy that actually works.
+	// Run-level — the stage_kind filter does not apply. Computed only by
+	// handleGetRunGateView. Omitted (nil) when the run has no unresolved
+	// conflict or no AuditRepo; omitted with a fan_in history_gaps entry when
+	// a read or a payload decode fails. See fanInConflictForRun.
+	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty"`
+}
+
+// gateViewFanInConflict is the gate view's fan_in_conflict block (#4343).
+// Kind is base_fold_conflict (the consolidated head is clean but behind
+// base_ref: the base-tip fold conflicted with an integrated slice) or
+// slice_conflict (a slice failed to merge into the consolidated branch and
+// failed the parent implement stage category B). The slice, child and base
+// fields are the system-written attribution from the slices_integrated
+// base_fold_conflict member or the slice_integration_conflict payload;
+// ConflictingBasePaths is always an array. Remedy names the verb that resolves
+// the kind.
+type gateViewFanInConflict struct {
+	Kind                  string   `json:"kind"`
+	Sequence              int64    `json:"sequence"`
+	ConflictingSliceIndex *int     `json:"conflicting_slice_index,omitempty"`
+	ConflictingChildRunID string   `json:"conflicting_child_run_id,omitempty"`
+	BaseRef               string   `json:"base_ref,omitempty"`
+	BaseSHA               string   `json:"base_sha,omitempty"`
+	BaseAttribution       string   `json:"base_attribution,omitempty"`
+	ConflictingBasePaths  []string `json:"conflicting_base_paths"`
+	CompareTruncated      bool     `json:"compare_truncated"`
+	Remedy                string   `json:"remedy"`
+}
+
+const (
+	// gateViewGapFanIn names a failed fan_in_conflict read or decode (#4343).
+	gateViewGapFanIn = "fan_in"
+
+	fanInConflictKindBaseFold = "base_fold_conflict"
+	fanInConflictKindSlice    = "slice_conflict"
+
+	// fanInBaseAttributionMeaning explains base_attribution in both remedies.
+	fanInBaseAttributionMeaning = "base_attribution reads: paths_overlap = the attributed slice and the base delta share conflicting_base_paths; no_base_overlap = complete compares share no path (a slice-vs-slice conflict); unavailable:<reason> = attribution could not be decided (compare_unsupported, compare_failed or compare_truncated)."
+
+	fanInRemedyBaseFold = "The consolidated head is clean but behind base_ref: the base-tip fold conflicted with an integrated slice. No manual resolution is needed. At merge, call fishhawk_rebase_run_branch: on this conflict it authorizes the bounded conflict-resolution pass (ceiling 1, #3202 / #4304), an agent that merges the base into the branch and pushes the result. " + fanInBaseAttributionMeaning
+
+	fanInRemedySlice = "A slice failed to merge into the consolidated branch, so the parent implement stage failed category B. The conflicting child SUCCEEDED, so fishhawk_resume_run refuses it (recovery_not_eligible). Restart instead: fishhawk_start_campaign_item_run for a campaign item, otherwise fishhawk_start_run. Carry the conflicting paths into the new plan gate so they land in one slice. " + fanInBaseAttributionMeaning
+)
+
+// fanInSlicesIntegratedPayload is the subset of the orchestrator's
+// slices_integrated payload the fan_in_conflict block reads.
+type fanInSlicesIntegratedPayload struct {
+	BaseRef          string                    `json:"base_ref"`
+	BaseSHA          string                    `json:"base_sha"`
+	BaseFoldOutcome  string                    `json:"base_fold_outcome"`
+	BaseFoldConflict *fanInConflictAttribution `json:"base_fold_conflict"`
+}
+
+// fanInConflictAttribution is the attribution member shared by
+// slices_integrated.base_fold_conflict and the slice_integration_conflict
+// payload.
+type fanInConflictAttribution struct {
+	ConflictingSliceIndex *int     `json:"conflicting_slice_index"`
+	ConflictingChildRunID string   `json:"conflicting_child_run_id"`
+	BaseSHA               string   `json:"base_sha"`
+	ConflictingBasePaths  []string `json:"conflicting_base_paths"`
+	BaseAttribution       string   `json:"base_attribution"`
+	CompareTruncated      bool     `json:"compare_truncated"`
+}
+
+// fanInConflictForRun builds the fan_in_conflict block (#4343) from the run's
+// slices_integrated and slice_integration_conflict rows. Selection:
+//
+//   - a slice_integration_conflict newer than the newest slices_integrated (or
+//     with none present) -> kind slice_conflict. A slices_integrated row is
+//     written only by a clean pass, so a newer one means every slice merged.
+//   - otherwise the newest slices_integrated whose base_fold_outcome is
+//     conflict -> kind base_fold_conflict, UNTIL it is actually superseded
+//     (#4343 approval condition C1): by a newer slices_integrated whose fold
+//     landed (merged or created_at_tip), by a newer branch_rebased or
+//     conflict_resolution_pushed, or by the run's PR merging. A newer
+//     not_attempted or deferred_children_in_flight row does NOT supersede it:
+//     a no-op pass (a repeated consolidate or /integrate-wave) writes one
+//     without folding, so the head is still behind.
+//   - otherwise -> nil.
+//
+// No AuditRepo -> nil, no gap. A list error or an undecodable payload -> nil
+// plus a fan_in history_gaps entry, never a block built from a partial read.
+func (s *Server) fanInConflictForRun(ctx context.Context, runID uuid.UUID, resp *gateViewResponse) *gateViewFanInConflict {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	gap := func(what string, err error) *gateViewFanInConflict {
+		s.cfg.Logger.Warn("gate-view: "+what+"; omitting fan_in_conflict block",
+			"run_id", runID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapFanIn)
+		return nil
+	}
+	integrated, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "slices_integrated")
+	if err != nil {
+		return gap("list slices_integrated failed", err)
+	}
+	conflicts, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "slice_integration_conflict")
+	if err != nil {
+		return gap("list slice_integration_conflict failed", err)
+	}
+	if len(integrated) == 0 && len(conflicts) == 0 {
+		return nil
+	}
+
+	// ListForRunByCategory is sequence-ascending, so the last row is the newest.
+	if n := len(conflicts); n > 0 {
+		sc := conflicts[n-1]
+		if len(integrated) == 0 || sc.Sequence > integrated[len(integrated)-1].Sequence {
+			var p fanInConflictAttribution
+			if uerr := json.Unmarshal(sc.Payload, &p); uerr != nil {
+				return gap("decode slice_integration_conflict payload failed", uerr)
+			}
+			return newFanInConflictBlock(fanInConflictKindSlice, sc.Sequence, "", p.BaseSHA, &p, fanInRemedySlice)
+		}
+	}
+
+	// Decode every slices_integrated row: the conflict row and each newer row
+	// that may supersede it are all read, so a row that does not decode could
+	// be either and the block is not built around it.
+	payloads := make([]fanInSlicesIntegratedPayload, len(integrated))
+	for i, e := range integrated {
+		if uerr := json.Unmarshal(e.Payload, &payloads[i]); uerr != nil {
+			return gap("decode slices_integrated payload failed", uerr)
+		}
+	}
+	idx := -1
+	for i := len(payloads) - 1; i >= 0; i-- {
+		if payloads[i].BaseFoldOutcome == "conflict" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	conflictSeq := integrated[idx].Sequence
+	for i := idx + 1; i < len(payloads); i++ {
+		if o := payloads[i].BaseFoldOutcome; o == "merged" || o == "created_at_tip" {
+			return nil
+		}
+	}
+	for _, category := range []string{CategoryBranchRebased, CategoryConflictResolutionPushed} {
+		rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
+		if lerr != nil {
+			return gap("list "+category+" failed", lerr)
+		}
+		if n := len(rows); n > 0 && rows[n-1].Sequence > conflictSeq {
+			return nil
+		}
+	}
+	merged, err := s.runPRObservablyMerged(ctx, runID)
+	if err != nil {
+		return gap("read pr merged state failed", err)
+	}
+	if merged {
+		return nil
+	}
+	p := payloads[idx]
+	return newFanInConflictBlock(fanInConflictKindBaseFold, conflictSeq, p.BaseRef, p.BaseSHA, p.BaseFoldConflict, fanInRemedyBaseFold)
+}
+
+// newFanInConflictBlock assembles the block from an attribution member (nil
+// when the row carried none) with conflicting_base_paths always an array.
+func newFanInConflictBlock(kind string, seq int64, baseRef, baseSHA string, a *fanInConflictAttribution, remedy string) *gateViewFanInConflict {
+	b := &gateViewFanInConflict{
+		Kind: kind, Sequence: seq, BaseRef: baseRef, BaseSHA: baseSHA,
+		ConflictingBasePaths: []string{}, Remedy: remedy,
+	}
+	if a != nil {
+		b.ConflictingSliceIndex = a.ConflictingSliceIndex
+		b.ConflictingChildRunID = a.ConflictingChildRunID
+		b.BaseAttribution = a.BaseAttribution
+		b.CompareTruncated = a.CompareTruncated
+		if a.ConflictingBasePaths != nil {
+			b.ConflictingBasePaths = a.ConflictingBasePaths
+		}
+	}
+	return b
 }
 
 // gateViewSpecialistJob is one completed specialist job in the gate view's
@@ -966,6 +1148,9 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// HERE and not in buildGateView (approval condition C2, #4363): the
 	// attention scan must not pay the extra read.
 	resp.SpecialistJobs = s.gateViewSpecialistJobsFor(r.Context(), runRow, &resp)
+	// HERE and not in buildGateView: up to six category reads, which the
+	// attention scan must not pay per run.
+	resp.FanInConflict = s.fanInConflictForRun(r.Context(), runID, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

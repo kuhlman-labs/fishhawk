@@ -1420,12 +1420,17 @@ Notes:
   base_fold_outcome, base_fold_conflict?}`) records a clean fan-in — every
   slice merged — and is consumed by E24.7. The `base_*` fields (ADR-096 D4 /
   #4294) record the base tip the pass integrated against and whether it was
-  folded into a pre-existing consolidated branch before the pending slices
-  (`base_fold_outcome`: `created_at_tip` | `merged` | `already_contained` |
-  `conflict` | `not_attempted`); on `conflict` the fold was skipped and
+  folded into a pre-existing consolidated branch after the pending slices
+  merged (#4343) (`base_fold_outcome`: `created_at_tip` | `merged` |
+  `already_contained` | `conflict` | `deferred_children_in_flight` |
+  `not_attempted`; `deferred_children_in_flight` means a child had not
+  succeeded, so the pass did not fold); on `conflict` the fold was skipped,
+  the head stays on the slices' own base for the merge-time
+  `fishhawk_rebase_run_branch` conflict-resolution pass, and
   `base_fold_conflict` `{conflicting_slice_index?, conflicting_child_run_id?,
   conflicting_base_paths, base_attribution, compare_truncated}` attributes it
-  to an already-integrated slice. `slice_integration_conflict` (payload
+  to an integrated slice (a slice-vs-main conflict lands here, not on
+  `slice_integration_conflict`). `slice_integration_conflict` (payload
   `{parent_stage_id, conflicting_slice_index, conflicting_child_run_id,
   base_sha, conflicting_base_paths, base_attribution, compare_truncated}`)
   records a merge conflict (HTTP 409) that failed the parent implement

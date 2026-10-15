@@ -75,16 +75,16 @@ The failure-signature registry is that memory, shipped as product behaviour. It 
 
 ### slice_integration_conflict — Slice integration conflict during fan-in
 
-**What it means.** A decomposed parent's fan-in could not merge one slice branch onto the consolidated branch. The consolidated branch already holds the earlier slices, so the parent is not the thing to re-drive.
+**What it means.** A decomposed parent's fan-in could not merge one slice branch onto the consolidated branch: a slice-vs-slice conflict, or a consolidated branch created at a newer base tip than a wave-0 slice was built on. A slice-vs-main conflict no longer lands here: the base tip folds in after the slices, so it surfaces as a base-fold conflict (`fishhawk_get_gate_view` `fan_in_conflict` kind `base_fold_conflict`) that the merge-time `fishhawk_rebase_run_branch` conflict-resolution pass resolves with no manual step.
 
 **How it is recognized.** The parent implement stage's failure reason carries the fan-in's `slice integration conflict` prefix.
 
 **Recovery playbook.**
-1. Read `conflicting_child_run_id` from the newest `slice_integration_conflict` audit entry's structured payload — never parse it out of the reason string.
-2. `fishhawk_resume_run` pointed at **that child's** run id, to re-drive only the conflicting slice in place.
-3. Do NOT point resume at the parent: it replans from scratch and discards the succeeded sibling slices.
+1. Read `fishhawk_get_gate_view`'s `fan_in_conflict` block (kind `slice_conflict`), or the newest `slice_integration_conflict` audit entry's structured payload, for the conflicting slice, child, `conflicting_base_paths` and `base_attribution` — never parse the reason string.
+2. Do NOT `fishhawk_resume_run` the conflicting child: its implement SUCCEEDED, so the backend refuses it (`recovery_not_eligible`).
+3. Restart: `fishhawk_start_campaign_item_run` for a campaign item, otherwise `fishhawk_start_run`. Re-state the prior approval conditions and keep the conflicting paths in one slice at the new plan gate.
 
-**Provenance.** [ADR-041 / #1142](https://github.com/kuhlman-labs/fishhawk/issues/1142).
+**Provenance.** [ADR-041 / #1142](https://github.com/kuhlman-labs/fishhawk/issues/1142); remedy re-routed to a restart by [#4343](https://github.com/kuhlman-labs/fishhawk/issues/4343).
 
 ### lineage_lock_contention — Lineage lock contention
 

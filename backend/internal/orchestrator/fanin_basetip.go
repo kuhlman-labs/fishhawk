@@ -7,10 +7,30 @@ package orchestrator
 // (IntegrateCompletedWave, /integrate-wave) or a partial pass had created it, a
 // later pass merged the remaining slices onto that OLD base, so the final head
 // lagged main and the ADR-090 D5 fan-in merge-candidate pass verified a head
-// the merge gate then refused as behind. The base fold below closes that: on a pass that has a
-// PENDING slice and finds the consolidated branch already present, the freshly
-// resolved base tip SHA is merged into the consolidated branch BEFORE the
-// pending slices, so the final head is built on the current tip.
+// the merge gate then refused as behind. The base fold below closes that: on a
+// pass that has a PENDING slice, finds the consolidated branch already present
+// and sees the fan-out SETTLED (every child succeeded), the freshly resolved
+// base tip SHA is merged into the consolidated branch AFTER the pending slices,
+// so the final head is built on the current tip.
+//
+// Fold-last (#4343). Folding BEFORE the pending slices (the #4294 order) made
+// each pending slice merge onto main content it was never built on, so a slice
+// that touched the same hunk as the base advance failed its own merge as a
+// slice_integration_conflict, and the only remedy named (re-drive the child)
+// cannot work on a child whose implement succeeded. Folding AFTER means every
+// pending slice merges onto the consolidated tip it was built on, so a
+// slice-vs-main conflict surfaces as a fold conflict instead: the fold is
+// skipped, the head stays clean on the slices' own base, and the merge-time
+// rebase verb's bounded conflict-resolution pass (#3202 / #4304) owns it. A
+// textual conflict is symmetric in which side merges second, so the order moves
+// the conflict to the fold rather than removing it.
+//
+// Settled-only (#4343 approval condition C2). A pass whose fan-out has a child
+// that is not succeeded (pending, running, failed, cancelled) records
+// deferred_children_in_flight and does not fold: that child was built on the
+// pre-fold tip, and a failed one may be re-driven onto it, so folding under it
+// would put main content in front of a slice that never saw it — exactly the
+// unroutable slice-vs-main conflict.
 //
 // Conflict attribution is a best-effort heuristic layered on top. GitHub's 409
 // names no paths, so "conflicting base paths" are the files the base delta and
@@ -46,10 +66,19 @@ const (
 	// baseFoldAlreadyContained: the forge answered 204 — the consolidated
 	// branch already contains the base tip.
 	baseFoldAlreadyContained = "already_contained"
-	// baseFoldConflict: an already-integrated slice conflicts with the new
-	// base. The fold is skipped and the pending slices integrate on the old
-	// base; the merge-time rebase / conflict-resolution path owns it.
+	// baseFoldConflict: an integrated slice (one merged by an earlier pass or
+	// by this one) conflicts with the new base. The fold is skipped and the
+	// head stays clean on the slices' own base; the merge-time rebase verb's
+	// conflict-resolution pass (#3202 / #4304) owns it.
 	baseFoldConflict = "conflict"
+	// baseFoldDeferredInFlight: a slice was pending but the fan-out has not
+	// settled — some child is not succeeded — so the pass integrated the
+	// pending slices and did NOT fold. A mid-fan-out pass never folds: a
+	// sibling still in flight was built on the pre-fold tip and would
+	// otherwise meet main content it never saw at its own merge, which is
+	// exactly the unroutable slice-vs-main conflict (#4343). The settled pass
+	// that integrates the last slice folds.
+	baseFoldDeferredInFlight = "deferred_children_in_flight"
 	// baseFoldNotAttempted: the branch pre-existed but no slice was pending,
 	// so the pass must not move a possibly-verified head.
 	baseFoldNotAttempted = "not_attempted"
@@ -137,13 +166,29 @@ func pendingSlices(succeeded []*run.Run, integratedIDs []string) []*run.Run {
 	return out
 }
 
+// fanOutSettled reports whether every decomposed child SUCCEEDED (#4343
+// approval condition C2). A pending, running, failed or cancelled child
+// defers the base fold: a failed child may be re-driven onto its pre-fold
+// tip, so main is never folded under it. An empty set is vacuously settled;
+// integrateSlices never reaches the fold with one (no succeeded child skips
+// the pass).
+func fanOutSettled(children []*run.Run) bool {
+	for _, c := range children {
+		if c.State != run.StateSucceeded {
+			return false
+		}
+	}
+	return true
+}
+
 // foldBaseTip merges the resolved base tip SHA into the consolidated branch.
 // The head is the SHA, not the branch name, so the fold pins exactly the tip
 // the pass read. Returns baseFoldMerged with the merge SHA on a 201,
 // baseFoldAlreadyContained on a 204, baseFoldConflict on a 409, and a non-nil
-// error on any other forge failure (the caller parks before any slice merge).
+// error on any other forge failure (the caller parks after the slice merges,
+// without writing slices_integrated, so the next pass retries the fold).
 func (o *Orchestrator) foldBaseTip(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, consolidated, baseRef, baseSHA string) (string, string, error) {
-	msg := fmt.Sprintf("Advance %s onto %s@%s before integrating slices (ADR-096 D4)", consolidated, baseRef, shortSHA(baseSHA))
+	msg := fmt.Sprintf("Advance %s onto %s@%s after integrating slices (ADR-096 D4)", consolidated, baseRef, shortSHA(baseSHA))
 	mergeSHA, err := o.GitHub.MergeBranch(ctx, scope, repo, consolidated, baseSHA, msg)
 	switch {
 	case err == nil && mergeSHA != "":
@@ -264,10 +309,20 @@ func (o *Orchestrator) attributeSliceConflict(ctx context.Context, scope forge.C
 }
 
 // attributeFoldConflict attributes a base-fold conflict to the LOWEST-index
-// already-integrated slice whose files (ComparePatch(baseSHA, sliceHead),
+// integrated slice whose files (ComparePatch(baseSHA, sliceHead),
 // scope-bounded) overlap the base delta since the consolidated branch's
-// merge-base with main (ComparePatch(consolidatedTip, baseSHA)). Unattributed
-// (no slice index) when none overlaps or attribution is unavailable.
+// merge-base with main (ComparePatch(consolidatedTip, baseSHA)). The fold runs
+// after the slice merges (#4343), so integrated is EVERY succeeded slice — the
+// ones this pass just merged included, since a just-merged pending slice is
+// the usual source of a slice-vs-main conflict. Unattributed (no slice index)
+// when none overlaps or attribution is unavailable.
+//
+// consolidatedTip is deliberately the PRE-slice-merge tip the pass read before
+// merging (#4343 approval condition C4), not the post-merge head: the slice
+// merges add no main commits, so the consolidated branch's merge-base with
+// main, and therefore the three-dot base delta ComparePatch(consolidatedTip,
+// baseSHA) reports, is unchanged by them. Re-reading the tip would cost a
+// forge call and change nothing.
 func (o *Orchestrator) attributeFoldConflict(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, parentID uuid.UUID, consolidatedTip, baseSHA string, integrated []*run.Run, sliceScopes map[int]map[string]struct{}) *foldConflictAttribution {
 	cmp, ok := o.GitHub.(compareFilesReader)
 	if !ok {
@@ -359,8 +414,9 @@ func sliceConflictDetail(sliceIndex int, childRunID uuid.UUID, consolidated stri
 // fold merge commit (kind base_fold). It carries merge_sha like every slice
 // row — the only field the lineage ledger, auditcomplete, the consolidated
 // fan-in head reader and permission drift decode — but no slice_index or
-// child_run_id. It is appended before the pass's slice rows, so the newest row
-// stays the consolidated tip. Best-effort, mirroring
+// child_run_id. It is appended AFTER the pass's slice rows (the fold runs last,
+// #4343), so it IS the newest row and the consolidated tip. Best-effort,
+// mirroring
 // emitIntegrationCommitRecorded.
 func (o *Orchestrator) emitBaseFoldRecorded(ctx context.Context, parentRunID uuid.UUID, mergeSHA, consolidatedBranch, baseRef, baseSHA string) {
 	if o.Audit == nil {
@@ -407,14 +463,4 @@ func (f *foldConflictAttribution) payload() map[string]any {
 		m["conflicting_child_run_id"] = f.childRunID
 	}
 	return m
-}
-
-// containsRun reports whether runs holds a run with r's id.
-func containsRun(runs []*run.Run, r *run.Run) bool {
-	for _, x := range runs {
-		if x.ID == r.ID {
-			return true
-		}
-	}
-	return false
 }

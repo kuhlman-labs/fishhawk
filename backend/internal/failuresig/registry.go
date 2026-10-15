@@ -104,11 +104,11 @@ func Registry() []Signature {
 		{
 			ID:    "slice_integration_conflict",
 			Title: "Slice integration conflict during fan-in",
-			Means: "A decomposed parent's fan-in could not merge one slice branch onto the consolidated branch. The consolidated branch already holds the earlier slices, so the parent is not the thing to re-drive.",
+			Means: "A decomposed parent's fan-in could not merge one slice branch onto the consolidated branch: a slice-vs-slice conflict, or a consolidated branch created at a newer base tip than a wave-0 slice was built on. A slice-vs-main conflict no longer lands here: it surfaces as a base-fold conflict the merge-time rebase resolves.",
 			Playbook: []string{
-				"read conflicting_child_run_id from the newest slice_integration_conflict audit entry's structured payload — never parse it out of the reason string",
-				"fishhawk_resume_run pointed at THAT CHILD's run id to re-drive only the conflicting slice in place",
-				"do NOT point resume at the parent: it replans from scratch and discards the succeeded sibling slices",
+				"read fishhawk_get_gate_view's fan_in_conflict block (or the newest slice_integration_conflict audit payload) for the conflicting slice, child, conflicting_base_paths and base_attribution — never parse the reason string",
+				"do NOT resume the conflicting child: its implement SUCCEEDED, so the backend refuses an in-place re-drive (recovery_not_eligible)",
+				"restart: fishhawk_start_campaign_item_run for a campaign item, otherwise fishhawk_start_run; re-state the prior approval conditions and keep the conflicting paths in one slice at the new plan gate",
 			},
 			match: func(ev Evidence) bool { return cites(ev.FailureReason, AnchorSliceIntegrationConflict) },
 		},

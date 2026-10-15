@@ -1341,6 +1341,7 @@ func TestAwaitChildren_IntegrationFailed_PerCause(t *testing.T) {
 		payload   func(kids []uuid.UUID) any
 		wantChild func(kids []uuid.UUID) string
 		wantInMsg []string
+		wantNotIn []string
 	}
 	cases := []tc{
 		{
@@ -1359,7 +1360,8 @@ func TestAwaitChildren_IntegrationFailed_PerCause(t *testing.T) {
 				return sliceIntegrationConflictPayload{ConflictingChildRunID: kids[1].String(), ConflictingSliceIndex: intPtr(1)}
 			},
 			wantChild: func(kids []uuid.UUID) string { return kids[1].String() },
-			wantInMsg: []string{"slice 1", "merge conflict", "re-drive the conflicting child"},
+			wantInMsg: []string{"slice 1", "merge conflict", "fishhawk_start_run", "fishhawk_start_campaign_item_run", "fan_in_conflict", "drive the new run"},
+			wantNotIn: []string{"re-drive the conflicting child", "re-invoke fishhawk_await_children"},
 		},
 		{
 			name:     "slice_integration_failed names the cause",
@@ -1403,6 +1405,11 @@ func TestAwaitChildren_IntegrationFailed_PerCause(t *testing.T) {
 			for _, want := range append(c.wantInMsg, c.wantChild(kids)) {
 				if !strings.Contains(out.Message, want) {
 					t.Errorf("message %q missing %q", out.Message, want)
+				}
+			}
+			for _, banned := range c.wantNotIn {
+				if strings.Contains(out.Message, banned) {
+					t.Errorf("message %q must not carry %q", out.Message, banned)
 				}
 			}
 			if out.Children == nil || out.Children.IntegrationFailure == nil {

@@ -256,3 +256,28 @@ func TestAnchorsAreNonEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestSliceIntegrationConflictPlaybookNamesRestart pins the #4343 remedy: the
+// conflicting child always SUCCEEDED, and the backend refuses to re-drive a
+// succeeded child (recovery_not_eligible), so the playbook must name the
+// restart and the gate view's fan_in_conflict block and must NOT route the
+// operator to fishhawk_resume_run.
+func TestSliceIntegrationConflictPlaybookNamesRestart(t *testing.T) {
+	var playbook string
+	for _, sig := range Registry() {
+		if sig.ID == "slice_integration_conflict" {
+			playbook = strings.Join(sig.Playbook, "\n")
+		}
+	}
+	if playbook == "" {
+		t.Fatal("no slice_integration_conflict signature in the registry")
+	}
+	for _, want := range []string{"fishhawk_start_run", "fishhawk_start_campaign_item_run", "fan_in_conflict", "recovery_not_eligible"} {
+		if !strings.Contains(playbook, want) {
+			t.Errorf("playbook = %q, want it to name %q", playbook, want)
+		}
+	}
+	if strings.Contains(playbook, "fishhawk_resume_run") {
+		t.Errorf("playbook = %q routes to fishhawk_resume_run, which the backend refuses for the succeeded conflicting child", playbook)
+	}
+}

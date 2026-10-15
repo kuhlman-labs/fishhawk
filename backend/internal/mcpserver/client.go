@@ -833,6 +833,31 @@ type GateView struct {
 	// against an older backend. The json tags MUST byte-match the backend's
 	// gateViewSpecialistJob; TestGateViewSpecialistJobs_WireShape pins them.
 	SpecialistJobs []GateViewSpecialistJob `json:"specialist_jobs,omitempty" jsonschema:"the run's completed specialist jobs (display-only): job_id, kind, verdict, provenance (runner_attested | bearer), blocking_eligible (true only for runner_attested) and completed_sequence; absent when there are none or the read failed (a specialist_jobs history_gaps entry)"`
+	// FanInConflict mirrors the backend's gate-view fan_in_conflict block
+	// (#4343): a decomposed parent's UNRESOLVED fan-in conflict, its base
+	// attribution and the remedy that works. Omitted (nil) when the run has
+	// none, when the read failed (a fan_in history_gaps entry), or against an
+	// older backend. The json tags MUST byte-match the backend's
+	// gateViewFanInConflict; TestFanInConflict_WireShape pins them against a
+	// REAL server.
+	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty" jsonschema:"a decomposed parent's unresolved fan-in conflict: kind base_fold_conflict (the consolidated head is clean but behind base_ref; at merge fishhawk_rebase_run_branch starts the bounded conflict-resolution pass, no manual resolution) or slice_conflict (a slice failed to merge and failed implement category B; restart with fishhawk_start_run or fishhawk_start_campaign_item_run, never fishhawk_resume_run on the succeeded child), with the attributed slice, child and conflicting_base_paths and the remedy; absent when there is none or the read failed (a fan_in history_gaps entry)"`
+}
+
+// gateViewFanInConflict mirrors the backend's gateViewFanInConflict
+// (backend/internal/server/gateview.go, #4343). UNEXPORTED, like
+// gateViewMergeCandidateVerdict, so the package's export baseline is
+// unchanged. The json tags MUST byte-match the backend.
+type gateViewFanInConflict struct {
+	Kind                  string   `json:"kind" jsonschema:"base_fold_conflict or slice_conflict"`
+	Sequence              int64    `json:"sequence" jsonschema:"audit sequence of the slices_integrated (base_fold_conflict) or slice_integration_conflict (slice_conflict) row"`
+	ConflictingSliceIndex *int     `json:"conflicting_slice_index,omitempty" jsonschema:"the attributed slice; absent when unattributed"`
+	ConflictingChildRunID string   `json:"conflicting_child_run_id,omitempty" jsonschema:"the attributed slice's child run id; absent when unattributed"`
+	BaseRef               string   `json:"base_ref,omitempty" jsonschema:"the base branch the fold targeted (base_fold_conflict only)"`
+	BaseSHA               string   `json:"base_sha,omitempty" jsonschema:"the base tip the pass integrated against"`
+	BaseAttribution       string   `json:"base_attribution,omitempty" jsonschema:"paths_overlap, no_base_overlap, or unavailable:<reason> (compare_unsupported, compare_failed or compare_truncated)"`
+	ConflictingBasePaths  []string `json:"conflicting_base_paths" jsonschema:"files both the attributed slice and the base delta touched; always an array"`
+	CompareTruncated      bool     `json:"compare_truncated" jsonschema:"true when a forge compare was truncated, so the attribution may be incomplete"`
+	Remedy                string   `json:"remedy" jsonschema:"the verb that resolves this kind, and what base_attribution means"`
 }
 
 // GateViewSpecialistJob mirrors the backend's gateViewSpecialistJob
