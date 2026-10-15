@@ -1,0 +1,13 @@
+id: scenario:issue-4399/typical-scope-repo-local-check
+statement: On the merge candidate checkout, `scripts/test single -run 'TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies' ./backend/internal/decisionrecord/` and `scripts/test single -run 'TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona' ./backend/internal/agenteval/` both pass, showing ADR-006 and ADR-002 (migration scope) and ADR-067 and ADR-046 (workflow-v2 scope) reach the persona render in full against the shipped docs/adr index.
+steps: 'In the sanctioned checkout /tmp/fishhawk-acceptance-tree-879e100d-95a1-43ce-8bd3-2170e8274141-c1e17eb5-5a34-4a0b-827e-0c3000089894 (HEAD a5ff8b1e = preview git_sha) ran exactly: scripts/test single -count=1 -v -run ''TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies'' ./backend/internal/decisionrecord/ and scripts/test single -count=1 -v -run ''TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona'' ./backend/internal/agenteval/ (-count=1 -v added to defeat the test cache and show the logs).'
+assertions:
+    expected: both named tests pass on the merge candidate
+    observed_at_record: 'Both exit 0. decisionrecord: PASS for both subtests, with migration included [ADR-006 ADR-002] and workflow-v2 included [ADR-013 ADR-067 ADR-046], nothing dropped, against the shipped index (31341 bytes, not truncated). agenteval: --- PASS TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona.'
+    repro_handle: scripts/test single -run 'TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies' ./backend/internal/decisionrecord/
+origin:
+    issue: 4399
+    pr: 4449
+    run_id: 879e100d-95a1-43ce-8bd3-2170e8274141
+    head_sha: a5ff8b1ee3584ec0eff58bf03f6f885c4f850a7a
+    recorded_at: 2026-10-15T10:37:27Z

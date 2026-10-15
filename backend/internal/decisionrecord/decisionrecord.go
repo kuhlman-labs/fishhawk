@@ -8,8 +8,9 @@
 // repodoc can fetch a named file but cannot list a directory, so the index is
 // the entry point: it is fetched at the run's admission commit, parsed
 // STRICTLY (ParseIndex), and the records whose applies_to matches the change's
-// paths are selected and ranked (Select). Assemble then fits the index plus
-// the FULL text of as many ranked matches as the injection cap allows.
+// paths are selected and ranked (Select). Assemble then shapes the index under
+// its own per-document cap and fits the FULL text of as many ranked matches as
+// a separate record budget allows, so the index cannot starve the records.
 //
 // The package reads through repodoc and renders through repodoc's framing, so
 // base-ref pinning, content hashing, delimiter neutralization and attribution

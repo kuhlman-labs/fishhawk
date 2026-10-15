@@ -18,7 +18,7 @@ dependency.
 |---|---|
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
 | `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede them (transitively), ranked. |
-| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, and fit the index plus whole records into the cap. Returns a `*Selection`. |
+| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index under its own cap, and fit whole records into a separate record budget. Returns a `*Selection`. |
 | `Selection.PromptDocuments(grounded)` | The index, then each included record, as `prompt.InjectedDocument`s. |
 | `Selection.Attribution()` | The `repodoc.InjectionSet` for the selection: its documents plus, when anything was dropped, one selection-level truncation. A caller injecting other documents in the same prompt (the persona remit) merges this into ONE `repodoc.AttributeSet` call. |
 
@@ -76,39 +76,69 @@ scope union diff at implement review.
 
 ## Byte budget (`Assemble`)
 
-**Cap domain.** The budget is the resolver's effective cap,
-`repodoc.Resolver.CapBytes()` (`DefaultMaxBytes` = 32768 unless overridden).
-**`cap_bytes` counts the index's rendered bytes plus the selected records'
-rendered bytes** — `repodoc.Document.RenderedBytes`, the shown body between the
+**Two budgets (#4399).** The index and the records are budgeted SEPARATELY,
+each at the resolver's effective cap, `repodoc.Resolver.CapBytes()`
+(`DefaultMaxBytes` = 32768 unless overridden), so the index's size can never
+starve the record bodies. Before #4399 one budget counted both, and the
+shipped index alone (~31 KiB) left no room for any record: the architect
+persona reviewed from index titles only.
+
+- **Index** — shaped under its own per-document cap, the resolver's cap
+  (shrink-to-fit, below). Its own `document_injected` (and, when cut, its
+  per-document `document_truncated`) carry its `cap_bytes` and
+  `rendered_bytes`; that `cap_bytes` is the cap it was actually cut under, so
+  it equals the resolver's cap only when the index fit whole.
+- **Records** — fitted, whole and in rank order, against a separate **record
+  budget** = the resolver's cap. `Selection.CapBytes` is that record budget and
+  `Selection.IncludedBytes` the sum of the INCLUDED RECORDS' rendered bytes
+  (the index excluded), always `<= CapBytes`; the selection-level
+  `document_truncated`'s `cap_bytes` / `included_bytes` carry exactly those two
+  values.
+
+Bytes are `repodoc.Document.RenderedBytes`, the shown body between the
 delimiters, recorded as `rendered_bytes` on each `document_injected`. **The
 persona remit and all fixed system framing (headings, preambles, trust notes,
-the data clause, Source lines, the dropped-records notice) are OUTSIDE it**: the
-remit is its own repodoc document under its own cap. `Selection.IncludedBytes`
-is that sum and is always `<= CapBytes`.
+the data clause, Source lines, the dropped-records notice) are OUTSIDE both
+budgets**: the remit is its own repodoc document under its own cap. The
+decision-record injection is therefore at most twice the cap (index <= cap,
+records <= cap), in the persona prompt only.
 
-1. **The index is always included.** Shaped under the cap; when its rendered
-   size (including repodoc's truncation marker, which is appended AFTER the
-   cut) exceeds the cap, it is reshaped under a cap reduced by the overflow.
+1. **The index is always included.** Shaped under its own cap; when its
+   rendered size (including repodoc's truncation marker, which is appended
+   AFTER the cut) exceeds the cap, it is reshaped under a cap reduced by the
+   overflow.
    The loop is bounded (`maxIndexShrinkSteps`), the cap is clamped at zero and
    never negative, and an index that does not fit even at a zero-byte cut (a
    budget smaller than the marker) fails the assembly (`ErrUnresolvable`).
 2. **Each match, in rank order,** is fetched at the SAME commit and shaped
    under a cap **at least its raw size** — so what is measured is its
    UNTRUNCATED rendered size, never a size under the shrunk budget — and is
-   included only if that fits the remaining budget.
+   included only if that fits what remains of the record budget. The index
+   draws nothing from it (`TestAssemble_IndexNearCapDoesNotStarveRecords`).
 3. **Strict prefix.** The first match that does not fit, and EVERY lower-ranked
    match, is dropped, even if a smaller lower-ranked record would fit: a
    lower-ranked record is never shown while a higher-ranked one is hidden.
    Records below the first drop are never fetched.
 4. **A record is never shown truncated.** One whose own untruncated size
-   exceeds the remaining budget — including one larger than the whole cap — is
-   dropped and named (`TestAssemble_OversizedRecordDroppedNeverTruncated`).
+   exceeds the remaining record budget — including one larger than the whole
+   budget — is dropped and named
+   (`TestAssemble_OversizedRecordDroppedNeverTruncated`).
+
+**Typical scopes reach record bodies.** `minTypicalRecordBodies` (2) is the
+floor `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` holds on the
+SHIPPED `docs/adr` at the production cap: a migration scope must show ADR-006
+and ADR-002 in full, a workflow-v2 schema-change scope ADR-067 and ADR-046. It
+reddens when a governing record's body grows past the record budget or its
+`applies_to` stops matching; the remedy is to narrow `applies_to`, split the
+record, or raise the cap.
 
 Dropped matches are named twice: in the index framing (a loud `NOT INCLUDED
-because of the injection cap` list of id, path, status) and in one
+because of the injection cap` list of id, path, status, stating the record
+budget and that the index is capped separately) and in one
 `document_truncated` entry of the selection shape (`selection:
 "decision_record"`, `path` = index path, `commit`, `cap_bytes`,
-`included_bytes`, `dropped: [{id, path, status, rank}]`, `dropped_count`),
+`included_bytes` — the record budget and the included records' bytes —
+`dropped: [{id, path, status, rank}]`, `dropped_count`),
 written before any `document_injected` of the set (repodoc `AttributeSet`).
 
 ## Pinning
@@ -169,9 +199,11 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | supersession cycle | walk terminates, each record once | `TestSelect_SupersessionCycleTerminates` |
 | diamond (two selected predecessors, one successor) | successor selected once, `Via` holds both | `TestSelect_FollowsSupersessionToSuccessors` |
 | successor of an unselected record | not selected | `TestSelect_FollowsSupersessionToSuccessors` |
-| matches exceed the budget | strict prefix included, rest dropped and named | `TestAssemble_FitsTheCap`, `TestAssemble_StrictPrefix` |
-| record larger than the remaining budget / the cap | dropped whole, never truncated | `TestAssemble_OversizedRecordDroppedNeverTruncated` |
-| raw index over the cap | index shown truncated within the cap; every match dropped | `TestAssemble_IndexOverCap` |
+| matches exceed the record budget | strict prefix included, rest dropped and named | `TestAssemble_FitsTheCap`, `TestAssemble_StrictPrefix` |
+| record larger than the remaining record budget / the whole budget | dropped whole, never truncated | `TestAssemble_OversizedRecordDroppedNeverTruncated` |
+| raw index over the cap | index shown truncated within its own cap; records still shown under the record budget | `TestAssemble_IndexOverCap` |
+| index fills >= 95% of the cap | every record that fits the record budget still shown | `TestAssemble_IndexNearCapDoesNotStarveRecords` |
+| shipped index, typical scope, production cap | at least `minTypicalRecordBodies` governing bodies shown in full | `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` |
 | cap smaller than the marker | `ErrUnresolvable` (zero-cap guard) | `TestAssemble_CapSmallerThanMarker_FailsClosed` |
 | branch ref handed as the commit | `repodoc.ErrUnpinnedBaseRef`, zero fetches | `TestAssemble_BasePinning` |
 | index missing / fetch error / malformed / listed record missing / record fetch error / no resolver | typed error, no selection | `TestAssemble_FailureModes` |
@@ -181,10 +213,12 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 ## Residuals
 
 - **Index size.** `docs/adr/index.json` is 31,341 bytes for 93 records
-  (measured 2026-10-15), so nearly all of the 32 KiB budget goes to the index
-  before any record. At roughly 97 records the index alone exceeds the cap: it
-  is shown truncated (loudly) and no record fits. A compact index rendering or
-  a separate record budget is #4399's scope, not this package's today.
+  (measured 2026-10-15), about 1.4 KiB under its own 32 KiB cap. Roughly four
+  more records and the index itself is shown truncated (loudly), cutting its
+  newest entries; the records are no longer affected, since #4399 gave them a
+  separate budget. A compact index rendering stays out of scope: it would need
+  a repodoc derived-document attribution contract (the rendered bytes would no
+  longer be the fetched file's).
 - **Grounding reads the head.** Records not injected are reachable only through
   read-only grounding, which reads the REVIEW TREE (the change's head), not the
   admission commit; injection is base-pinned, grounding is not. The index
@@ -194,9 +228,8 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
   the index is injected regardless.
 - **Successor following changes no current selection.** No superseded record in
   the shipped index declares `applies_to`, so no successor is reached from
-  today's index; following takes effect as records gain globs. Even then the
-  ~31 KB index leaves little of the 32 KiB cap for any body, so the budget
-  split in #4399 still decides what is shown.
+  today's index; following takes effect as records gain globs. A followed
+  successor competes for the record budget like any other match.
 - **The shrink step bound is defense-in-depth.** The cap strictly decreases to
   the zero-cap guard, so the step bound is unreachable on any fixture;
   removing it was run and stays green.
