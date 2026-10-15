@@ -65,11 +65,37 @@ func (r approverPrincipalRow) agentKind() bool {
 type approverPrincipalLoader func(ctx context.Context, dbURL, repo string, since time.Time) ([]approverPrincipalRow, error)
 
 // membersGate is one approval gate of the spec that declares a non-empty
-// approvals.members list.
+// approvals.members list. EnforcedAt names where members is enforced:
+// enforcedAtMerge for a review stage that settles on PR merge (checked
+// against forge identities when the PR merges, #4132), enforcedAtApprovalRow
+// otherwise (checked against each approval_submitted principal, #4116).
 type membersGate struct {
-	Workflow string
-	Stage    string
-	Members  []string
+	Workflow   string
+	Stage      string
+	Members    []string
+	EnforcedAt string
+}
+
+// Where a members gate is enforced.
+const (
+	enforcedAtApprovalRow = "approval_row"
+	enforcedAtMerge       = "merge"
+)
+
+// stageSettlesOnMerge reports whether st is a review stage that settles on PR
+// merge — a review stage declaring a pull_request input, mirroring the
+// server's specStageDeclaresPullRequestInput. Its members gate is checked at
+// merge time against forge identities, never against approval_submitted rows.
+func stageSettlesOnMerge(st spec.Stage) bool {
+	if st.Type != spec.StageTypeReview {
+		return false
+	}
+	for _, in := range st.Inputs {
+		if in.Source == spec.InputSourcePullRequest || in.Artifact == string(spec.ArtifactPullRequest) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g membersGate) name() string { return g.Workflow + "/" + g.Stage }
@@ -81,7 +107,9 @@ func (g membersGate) name() string { return g.Workflow + "/" + g.Stage }
 //	    [--repo owner/name] [--forge github|gitlab]
 //
 // It evaluates every principal that recorded an approve in the window against
-// every members-declaring approval gate of the spec, through the same
+// every members-declaring APPROVAL-ROW gate of the spec (an enforced_at=merge
+// review gate is listed but checked against forge identities at merge, #4132),
+// through the same
 // identity.SubjectListed the gate runs, and exits 1 when any human principal
 // would be refused (0 when none would, 2 on a usage error).
 func runApproverMembers(args []string, logSink io.Writer) int {
@@ -160,10 +188,10 @@ func runApproverMembersWith(args []string, out, logSink io.Writer, load approver
 	_, _ = fmt.Fprintf(out, "approver-members spec=%s since=%s (%s) repo=%s forge=%s members_gates=%d\n",
 		*specPath, lower.UTC().Format(time.RFC3339), bound, repoLabel, *forge, len(gates))
 	for _, g := range gates {
-		_, _ = fmt.Fprintf(out, "gate %s members=[%s]\n", g.name(), strings.Join(g.Members, ","))
+		_, _ = fmt.Fprintf(out, "gate %s members=[%s] enforced_at=%s\n", g.name(), strings.Join(g.Members, ","), g.EnforcedAt)
 	}
-	_, _ = fmt.Fprintln(out, "note: merge-settled review gates (resolveReviewStageOnMerge) record no approval row and are not members-checked; they are not part of this inventory")
-	_, _ = fmt.Fprintln(out, "note: each principal is evaluated against EVERY members gate above, whichever gate its approvals were recorded at")
+	_, _ = fmt.Fprintln(out, "note: enforced_at=merge gates (resolveReviewStageOnMerge) are members-checked when the PR merges, against the forge-read merger and (GitHub) the latest-APPROVED reviewers (#4132); those forge identities are not approval_submitted rows, so the principal verdicts below do not evaluate those gates, and a refused merge is a merge_settle_members_refused audit row")
+	_, _ = fmt.Fprintln(out, "note: each principal is evaluated against EVERY approval-row members gate above, whichever gate its approvals were recorded at")
 	_, _ = fmt.Fprintln(out, "note: audit_entries is row-level secured; a role without BYPASSRLS (and not a superuser) sees only account-unscoped rows, so a short inventory may be incomplete")
 
 	rows, err := load(context.Background(), *dbURL, *repo, lower)
@@ -194,7 +222,11 @@ func collectMembersGates(s *spec.Spec) []membersGate {
 				if g.Type != spec.GateTypeApproval || g.Approvals == nil || len(g.Approvals.Members) == 0 {
 					continue
 				}
-				out = append(out, membersGate{Workflow: wf, Stage: st.ID, Members: append([]string(nil), g.Approvals.Members...)})
+				enforcedAt := enforcedAtApprovalRow
+				if stageSettlesOnMerge(st) {
+					enforcedAt = enforcedAtMerge
+				}
+				out = append(out, membersGate{Workflow: wf, Stage: st.ID, Members: append([]string(nil), g.Approvals.Members...), EnforcedAt: enforcedAt})
 			}
 		}
 	}
@@ -210,7 +242,9 @@ type principalTally struct {
 
 // writeApproverMembersReport prints one line per principal and the summary
 // line, and returns the number of HUMAN principals refused by at least one
-// members gate (the exit-code driver). Agent-kind principals are reported
+// approval-row members gate (the exit-code driver). An enforced_at=merge gate
+// is never evaluated against a principal: an approval_submitted principal
+// cannot reach it (#4132). Agent-kind principals are reported
 // agent_never_counted: they are refused at a members gate too (a non-delegated
 // agent submission's 200 became a 403), so their rows are summed into
 // agent_rows_now_refused, but they never count toward a quorum and so stay
@@ -244,6 +278,9 @@ func writeApproverMembersReport(out io.Writer, rows []approverPrincipalRow, gate
 		var refusing []string
 		seen := map[string]bool{}
 		for _, g := range gates {
+			if g.EnforcedAt != enforcedAtApprovalRow {
+				continue
+			}
 			if !identity.SubjectListed(g.Members, t.subject, forge) && !seen[g.name()] {
 				seen[g.name()] = true
 				refusing = append(refusing, g.name())
