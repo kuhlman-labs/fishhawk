@@ -595,6 +595,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_conflict_resolution_triggered":     {},
 	"stage_merge_candidate_verify_triggered":  {}, // E83.33 / #4018 (ADR-090): the durable trigger that re-opens the implement stage for a verify-only merge-candidate pass; never reads or spends the fix-up budget (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_recovered":                   {},
+	"stage_fixup_superseded":                  {}, // E86.54 / #4391: the operator's in-place supersession of a queued, never-dispatched ADR-090 D6 fix-up by a verify-only re-run; inert unless a conversion trigger names its fix-up trigger (server/merge_candidate_rerun.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},
 	"stage_permissions_declared":              {},
