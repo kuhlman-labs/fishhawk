@@ -110,7 +110,14 @@ func withMCVVerifyCounter(t *testing.T) *mcvVerifyCounter {
 // report (failing the test unless EXACTLY one ShipPullRequest call was made).
 func runMCV(t *testing.T, cfg config, req mergeCandidateVerifyRequest) (int, upload.ShipPullRequestArgs) {
 	t.Helper()
-	installGateState(t, nil)
+	return runMCVWithState(t, cfg, req, nil)
+}
+
+// runMCVWithState is runMCV with st installed as the gate isolation state
+// (nil = the unconfigured host exec runMCV uses).
+func runMCVWithState(t *testing.T, cfg config, req mergeCandidateVerifyRequest, st *gateIsolationState) (int, upload.ShipPullRequestArgs) {
+	t.Helper()
+	installGateState(t, st)
 	client := &crFakeUpload{}
 	code := runMergeCandidateVerifyStage(context.Background(), cfg, req, client,
 		&upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
@@ -633,5 +640,56 @@ func TestMergeCandidateEvidence_SummarySurvivesTheBudget(t *testing.T) {
 	if ev.summary == nil || !reflect.DeepEqual(ev.summary.Packages,
 		[]string{"github.com/x/backend/internal/bulk", "github.com/x/runner/internal/late"}) || !ev.summary.Lossy {
 		t.Errorf("summary = %+v, want both packages named and lossy (200 tests > the 10-entry cap)", ev.summary)
+	}
+}
+
+// TestMergeCandidateVerify_ContainerWorkTreePreflightIsNotExecuted drives the
+// REAL chain — runMergeCandidateVerifyStage → mergeCandidateVerify →
+// runVerifyCommittedTree → runBoundedGateArgvDisposed → runGateInContainer —
+// against the dispatch clone of a real origin, on the container path with
+// both runtime seams scripted (#4392). When git cannot see /work (the run
+// df957692 shape: the preflight exits 128 for dubious ownership) the gate
+// never runs and the pass reports a re-triggerable not_executed /
+// verify_gate_unavailable, never failed / verify_failed. The gate_red arm is
+// the control: with a healthy preflight the same fixture's red gate reports
+// failed / verify_failed, so the first arm is not vacuous. Dropping
+// withGitWorkTreeRequired at runVerifyCommittedTreeEnv's seam call turns the
+// preflight_fails arm red (the gate's exit 1 is an executed red).
+func TestMergeCandidateVerify_ContainerWorkTreePreflightIsNotExecuted(t *testing.T) {
+	dispatch, tipA, _, _ := mcvRepo(t)
+	redGate := func(label string, n int) (string, int, bool) {
+		if label == "gate_run" {
+			return "fatal: /work is not a git work tree\n", 1, false
+		}
+		return serviceHappyPath(label, n)
+	}
+	for _, tc := range []struct {
+		name       string
+		preflight  func(int) (string, int, bool)
+		wantResult string
+		wantReason string
+		wantRuns   int
+	}{
+		{name: "preflight_fails", preflight: func(int) (string, int, bool) {
+			return "fatal: detected dubious ownership in repository at '/work'\n", 128, false
+		}, wantResult: mergeCandidateNotExecuted, wantReason: mcReasonGateUnavailable, wantRuns: 0},
+		{name: "gate_red", wantResult: mergeCandidateFailed, wantReason: "verify_failed", wantRuns: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+			g := scriptGateExec(t, redGate)
+			g.preflight = tc.preflight
+			code, ship := runMCVWithState(t, mcvCfg(dispatch, mcvVerifyCmd),
+				mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: tipA, Cause: "base_advance"}, st)
+			if code != exitOK {
+				t.Errorf("exit = %d, want exitOK", code)
+			}
+			if ship.MergeCandidateResult != tc.wantResult || ship.MergeCandidateReason != tc.wantReason {
+				t.Errorf("result/reason = %q/%q, want %s/%s", ship.MergeCandidateResult, ship.MergeCandidateReason, tc.wantResult, tc.wantReason)
+			}
+			if g.counts["worktree_preflight"] != 1 || g.counts["gate_run"] != tc.wantRuns {
+				t.Errorf("preflight runs = %d, gate runs = %d, want 1 / %d: %q", g.counts["worktree_preflight"], g.counts["gate_run"], tc.wantRuns, g.order)
+			}
+		})
 	}
 }

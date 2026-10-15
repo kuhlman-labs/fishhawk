@@ -5097,6 +5097,38 @@ func TestShipPullRequest_MergeCandidateVerified_FailedRoutesPerD6(t *testing.T) 
 	})
 }
 
+// TestShipPullRequest_MergeCandidateVerified_GateUnavailableRoutesNothing
+// (#4392): a pass whose verify gate never ran — the runner's container
+// work-tree preflight failed, so it reports not_executed /
+// verify_gate_unavailable — records that verdict, settles the implement stage
+// out of `running` and routes NO fix-up, even under a workflow that DELEGATES
+// fix-up routing with a fresh budget (the shape that would route a failed
+// report). Widening the D6 branch in pullrequest.go from `failed` to every
+// non-passed result routes one fix-up here and turns this red.
+func TestShipPullRequest_MergeCandidateVerified_GateUnavailableRoutesNothing(t *testing.T) {
+	f := newMCVShipFixture(t, mcvDelegatedV0SpecYAML)
+	f.startRunning(t, mcvHead)
+	const reason = "verify_gate_unavailable"
+	w, resp := f.ship(t, mcvReportBody(mcvHead, mergeCandidateResultNotExecuted, reason,
+		"gate container: work tree preflight: git cannot see a usable work tree at /work (exit 128): fatal: detected dubious ownership in repository at '/work'"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp.Result != mergeCandidateResultNotExecuted || resp.FixupRouted || resp.FixupRefusal != "" {
+		t.Errorf("response = %+v, want not_executed with no routed fix-up and no refusal", resp)
+	}
+	if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+		t.Errorf("stage_fixup_triggered rows = %d, want 0 (an unavailable gate is no verdict on the tree)", n)
+	}
+	rows := mcvVerdictRows(f.au)
+	if len(rows) != 1 || rows[0].Result != mergeCandidateResultNotExecuted || rows[0].Reason != reason || rows[0].HeadSHA != mcvHead {
+		t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed / %s row", rows, reason)
+	}
+	if got := f.stageState(t, f.impl.ID); got == run.StageStateRunning {
+		t.Errorf("implement state = %q, want settled out of running", got)
+	}
+}
+
 // TestShipPullRequest_MergeCandidateVerified_RefusalArms: a report with no
 // live trigger is a 409 that records nothing and leaves the stage running; a
 // trigger read error is a retryable 500 that records nothing; a non-implement

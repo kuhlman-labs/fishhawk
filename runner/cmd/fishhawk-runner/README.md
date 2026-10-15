@@ -400,10 +400,10 @@ A verify-only pass for a head no runner gated on the committed tree (a base merg
 - **Capability-gated (#4183).** The pass is served ONLY to a runner that advertises `merge-candidate-verify` in `X-Fishhawk-Runner-Capabilities` (`upload.CapabilityMergeCandidateVerify`). An older runner, which would ignore these fields and run a plain implement agent pass on the re-opened stage, is refused `409 runner_capability_missing` before any prompt is built; the backend settles the pass `not_executed` (record-first) and restores the pre-pass gate. `FetchPrompt` does not retry a 409 and `run()` exits `exitFailure` before any agent spawn (`TestFetchPrompt_ConflictIsTerminal`, `TestRun_FetchPrompt_FetchFailure`). Deploy note: rebuild `bin/fishhawk-runner` together with fishhawkd, or every pass is refused until it is rebuilt.
 - **Routing.** `run()` takes the pass immediately after the conflict-resolution branch: after `gateIsolation.declare` and the verify-cfg fallback (it needs both), BEFORE the lineage-worktree block and `pinBase`. #3973's declared-base seeding and `cfg.pinnedBaseSHA` are never reached, no agent is spawned, and `CommitAndPush` / `PushCommittedBranch` are never called.
 - **The pass.** Fetch the run-branch tip into `refs/remotes/origin/<branch>` (`fetchMergeCandidateTip` = `gitops.FetchBaseTip`; no checkout or worktree moves). A tip other than the expected head reports `not_executed` (`head_moved`) WITHOUT running verify — a verdict binds to exactly one SHA. Otherwise `runVerifyCommittedTree` runs the declared command in its FULL form (nil scope set, so `FISHHAWK_VERIFY_PACKAGES` is absent) in the ADR-063 isolated gate, with the usual verify-lock owner env.
-- **Classification.** exit 0 → `passed`; a red tree → `failed`. Every outcome that never judged the tree is `not_executed`, never `failed` (a `failed` row is head-bound and routes a fix-up): no verify command, a non-work-tree dispatch dir, a fetch error, gate `refused` / `unavailable` / `timed_out`, a tolerant `skipped`, and verify-lock contention (`isVerifyLockContended`).
+- **Classification.** exit 0 → `passed`; a red tree → `failed`. Every outcome that never judged the tree is `not_executed`, never `failed` (a `failed` row is head-bound and routes a fix-up): no verify command, a non-work-tree dispatch dir, a fetch error, gate `refused` / `unavailable` / `timed_out`, a tolerant `skipped`, and verify-lock contention (`isVerifyLockContended`). `unavailable` includes a failed container work-tree preflight ([#4392](https://github.com/kuhlman-labs/fishhawk/issues/4392)): git in the gate image could not see the runner-made clone at `/work` (the run df957692 `detected dubious ownership` shape), so the pass reports `not_executed` / `verify_gate_unavailable`, re-triggerable, instead of `failed` / `verify_failed` with an auto-routed fix-up.
 - **Report.** Exactly ONE `ShipPullRequest(Outcome: merge_candidate_verified)` per pass on a detached 2-minute context. The output tail is `redactString`ed over the WHOLE output first and then cut to the last `upload.MaxMergeCandidateOutputTailBytes` (4 KiB), so a secret straddling the cut never ships half-matched; a fetch error is redacted before it becomes the reason. Those are RAW bounds, and JSON escapes `<`, `>`, `&` and control bytes to six bytes each, so `ShipPullRequest` also budgets the MARSHALLED body against `upload.MaxPullRequestReportBytes` (`shrinkMergeCandidateBodyFields`, #4250): the failure excerpt yields first (head kept), then the tail (end kept), then the summary's `tests` / `build_failed` / `packages` lists (dropped, `lossy=true`), then the reason. The verdict fields are never touched, so an escape-heavy output cannot 413 the report and lose the verdict. Exit is `exitOK` after a delivered report (red or green — the verdict is the backend's to act on) and `exitFailure` only when the report itself fails.
 - **Failure evidence ([#4250](https://github.com/kuhlman-labs/fishhawk/issues/4250)).** The 4 KiB tail alone loses an EARLY module's FAIL (`scripts/test verify` runs backend first), so for every NON-passed result `mergeCandidateEvidence` also ships, from the SAME once-redacted whole output: `MergeCandidateFailures` = `failureSignalExcerpt` (`verifyfailures.go`) — every failure-signal line with 2 lines of context before and 4 after (which carries the non-verbose `<file>_test.go:NN:` assertion lines), selected by the #4036 `retainSignalLines` primitive under an 8 KiB budget (`upload.MaxMergeCandidateFailuresBytes`, mirrored by the backend's `mergeCandidateFailuresMax`), closed by an `[... N more failure-signal line(s) omitted ...]` marker whose worst case is reserved out of the budget; `upload.ShipPullRequest` bounds it to its HEAD (earliest failures first). And `MergeCandidateFailureSummary` = `parseVerifyFailures` over the WHOLE output (`packages` / `tests` / `build_failed` / `lossy`, each list capped at 10 x 200 bytes), so the failing names survive the excerpt budget. The excerpt's signal set is the shared go-test set (`--- FAIL:`, `FAIL<TAB><pkg>`, `panic:`, `WARNING: DATA RACE`) WIDENED by a column-0 compiler/vet diagnostic (`<path>.go:<line>:<col>: `, `isMergeCandidateSignalLine`), because a `[build failed]` package's compiler errors print where its build finished, which under a parallel `go test ./...` can be far above its FAIL line (approval condition C1); the verify-fix prompt keeps the #4036 set byte-identically (`retainFailureSignalLines` passes `isFailureSignalLine`). A golangci-lint diagnostic shares that format and is retained too. A passed pass ships neither field; both are `omitempty`. Residuals: a compiler error is retained only in the `<file>.go:<line>:<col>:` form (a column-less or non-`.go` diagnostic is not a signal and survives only as context); the omitted count is an upper bound (an omitted signal inside a kept line's context window is still shown). **Deploy order:** fishhawkd decodes the report with `DisallowUnknownFields`, so reload fishhawkd BEFORE a runner built from this tree ships a FAILED report — an older fishhawkd 400s the undeclared `merge_candidate_failures` / `merge_candidate_failure_summary` keys and the pass goes unreported (a passed report omits both and decodes either way).
-- **Tests** (`mergecandidateverify_test.go`): the done-means fixture (branches `a` and `b` each add a `0096_*.sql` migration and verify `passed` alone; their merge verifies `failed`), the moved-head zero-invocation pin, the full-form env, the write-nothing check (HEAD, refs, worktree list and status byte-identical; no pusher call), redaction + bound, the #4250 failure evidence (an early FAIL scrolled out of the tail still named by `MergeCandidateFailures` and the summary, a `[build failed]` compiler error far above its FAIL line retained, passed / no-signal arms ship none, a token on the assertion line redacted, a token in a `t.Run` subtest name redacted from the summary's `tests`, the summary naming a package past the excerpt budget), every `not_executed` arm, and a `run()`-level routing test that proves the agent is never invoked and lineage provisioning is never reached.
+- **Tests** (`mergecandidateverify_test.go`): the done-means fixture (branches `a` and `b` each add a `0096_*.sql` migration and verify `passed` alone; their merge verifies `failed`), the moved-head zero-invocation pin, the full-form env, the write-nothing check (HEAD, refs, worktree list and status byte-identical; no pusher call), redaction + bound, the #4250 failure evidence (an early FAIL scrolled out of the tail still named by `MergeCandidateFailures` and the summary, a `[build failed]` compiler error far above its FAIL line retained, passed / no-signal arms ship none, a token on the assertion line redacted, a token in a `t.Run` subtest name redacted from the summary's `tests`, the summary naming a package past the excerpt budget), every `not_executed` arm, a `run()`-level routing test that proves the agent is never invoked and lineage provisioning is never reached, and `TestMergeCandidateVerify_ContainerWorkTreePreflightIsNotExecuted` (the real pass → `runVerifyCommittedTree` → `runGateInContainer` chain on the container path with both runtime seams scripted: a preflight exiting 128 reports `not_executed` / `verify_gate_unavailable` with no gate run, while the control arm's healthy preflight and red gate report `failed` / `verify_failed`). The backend half, that a `not_executed` report routes no fix-up even under a delegating workflow, is `TestShipPullRequest_MergeCandidateVerified_GateUnavailableRoutesNothing` (`backend/internal/server/pullrequest_test.go`).
 
 ## Policy/review diff base anchoring (#1294 / #1801 / #1975)
 
@@ -561,7 +561,9 @@ entry or cache mode fails startup like a bad mode —
   (`gateiso.ForbidSocketMounts` — a refused source returns `-1` with no exec
   AND no seed, so `go mod download` never runs against a checkout the
   container would not have been given;
-  `TestRunGateInContainer_MountGuardPrecedesSeed`); THEN a host-side
+  `TestRunGateInContainer_MountGuardPrecedesSeed`); THEN, for a verify gate
+  only, the work-tree preflight (see "Verify-gate work-tree preflight" below);
+  THEN a host-side
   module-cache seed (the host `GOMODCACHE` is a `file://` proxy source, never
   a mount) run under the SANITIZED gate env — never `os.Environ()`, so no
   runner credential reaches the `go mod download` — with `GOTOOLCHAIN=local`,
@@ -688,6 +690,61 @@ credentials" (the contract and the residuals live there):
   context-less blocking config works on a context-based Docker Desktop
   install, and asserts a logging fake of the platform default helper is
   never called).
+
+**Verify-gate work-tree preflight ([#4392](https://github.com/kuhlman-labs/fishhawk/issues/4392)).**
+`runVerifyCommittedTreeEnv` marks its gate `withGitWorkTreeRequired` (beside
+`withDecidingGate`), because its checkout is always a runner-materialized
+independent clone and so a full git work tree. On the container path a marked
+gate runs `gitWorkTreePreflight` right after the mount guard accepts the argv
+and BEFORE the module-cache seed, the gate service and the gate run:
+
+- **What runs.** `git rev-parse --is-inside-work-tree` in a container built
+  from the gate's OWN `ContainerSpec` (same `--user`, `/work` mount, caches,
+  passwd file and env, including the #4390 `safe.directory` pin), with only a
+  fresh `--name`, the preflight argv and NO service mounts (the service volume
+  does not exist yet, and `-v name:…` on a missing named volume would make the
+  daemon auto-create it). It goes through `execGateAuxArgvFn` under the bound
+  CLI env and its own `gateWorkTreePreflightTimeout` (5 minutes, outside the
+  gate timeout, covering a cold pull), so `execBoundedHostArgvFn` still
+  carries exactly the gate's `run` and its kill. A `-1` result removes the
+  PREFLIGHT container with `rm -f` through the same aux seam.
+- **Verdict.** Only exit 0 with a final non-empty output line of `true`
+  proceeds (`lastNonEmptyLine` tolerates cold-pull chatter). Exit 126/127 (the
+  gate image cannot invoke or find git) SKIPS the preflight, so a git-less
+  image keeps its pre-#4392 behaviour and the gate's own verdict stands.
+  Everything else — 128 (`not a git repository`, `detected dubious
+  ownership`), 125 (a runtime error), exit 0 printing `false`, `-1` (timeout
+  or cancellation) — returns `gate container: work tree preflight: git cannot
+  see a usable work tree at /work (exit N): <tail>` as `gateUnavailable`:
+  category C at the implement gates (`verify_gate_unavailable`, never the fix
+  agent) and `not_executed` / `verify_gate_unavailable` for a merge-candidate
+  pass. Never `gateTimedOut` (the gate never ran) and never
+  `gateCheckoutRefused` (the clone is runner-made; no tree content creates or
+  hides its `.git`). Each preflight logs one runner log line
+  `{"event":"gate_worktree_preflight","result":"ok|skipped_no_git|unavailable","exit_code":N,"preflight_ms":N}`
+  (a stderr line, not an audit category).
+- **Why only verify gates.** The auto-format absorb runs the container gate
+  against the LINEAGE worktree, whose `.git` is a gitdir FILE pointing outside
+  the `/work` bind mount, so an unconditional preflight would make every
+  container-path absorb `gateUnavailable`. Unmarked execs (the absorb,
+  diff coverage, counterfactuals, every direct `runBoundedGateCommand`
+  caller) run no preflight and are byte-unchanged.
+- **Trust posture (#3448).** A tree-declared `gate_container` image controls
+  its own git, so a hostile image can fail the preflight on purpose. That only
+  steers the exec to `gateUnavailable` (category C / `not_executed`): it never
+  produces a pass and never routes a fix-up.
+- **Tests.** `TestRunGateInContainer_WorkTreePreflightFailureIsUnavailable`,
+  `TestRunGateInContainer_WorkTreePreflightArms` (one row per result,
+  including the timed-out preflight's `rm -f`),
+  `TestRunGateInContainer_WorkTreePreflightMirrorsGateSpec` (a sentinel extra
+  proves the preflight inherits the gate's env, since `BuildArgv` re-adds the
+  `safe.directory` pin even to a nil env),
+  `TestRunGateInContainer_UnmarkedGateRunsNoPreflight`,
+  `TestRunVerifyCommittedTree_ContainerWorkTreePreflight`, and the
+  docker-gated live fixture (r) `TestGateContainer_WorkTreePreflight` (real git
+  in the pinned image sees the verify clone, and an empty checkout fails with
+  git's own `not a git repository` before a marker-writing gate command runs,
+  while the unmarked control writes the marker).
 
 ### Gate-env allow-list
 
