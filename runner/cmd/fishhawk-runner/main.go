@@ -2976,6 +2976,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// The body lives in a helper so a unit test can drive it and assert the
 		// file is GONE, not merely that a sweep call is textually present.
 		sweepUnreadCounterfactualReport(cfg, logSink)
+		// Commit-message claims cross-check (#4337): PEEK the fix-up commit
+		// message and report each Item/Finding/Concern paragraph whose named
+		// files or tests this pass's git_diff touches none of. EVIDENCE ONLY,
+		// like its siblings above.
+		emitFixupCommitClaims(cfg, &res, logSink)
 	}
 
 	// Initial-implement counterfactual self-report (#2929). The EXACT complement
@@ -10270,7 +10275,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// HEAD here is the fix-up branch tip (checkoutFixupBase moved onto it and
 		// the agent commits nothing), so it is the base tip; a rev-parse failure
 		// degrades to an empty base component rather than blocking the commit.
-		baseTipSHA, rpErr := gitRevParseHEAD(ctx, repoDir)
+		baseTipSHA, rpErr := fixupBaseTipHead(ctx, repoDir)
 		if rpErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_base_tip_unresolved","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
@@ -10930,7 +10935,18 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		if baseFetchArmedRef != "" {
 			armedRef = baseFetchArmedRef
 		}
-		return fmt.Errorf("commit+push: %w%s", err, checkpointFailureSuffix(armedRef, stashRef))
+		// #4337: a fix-up pass whose CommitAndPush created its local commit and
+		// THEN failed (the incident: the pushed-tree re-verify, category B)
+		// leaves that commit unreachable. Pin it and name it LAST in the reason:
+		// upload.TruncateReason keeps head+tail, so a trailing clause survives an
+		// over-long verify-output reason. Skipped when a #3621 checkpoint above
+		// already pinned the commit. With nothing pinned the reason is
+		// byte-identical.
+		strandedClause := ""
+		if isFixup && armedRef == "" {
+			strandedClause = pinStrandedFixupCommit(ctx, cfg, logSink, repoDir, fixupBaseTipSHA)
+		}
+		return fmt.Errorf("commit+push: %w%s%s", err, checkpointFailureSuffix(armedRef, stashRef), strandedClause)
 	}
 	// #3400: the commit now exists, so this is the ONE point where the
 	// approval-condition responses the pre-pack peek captured from the
