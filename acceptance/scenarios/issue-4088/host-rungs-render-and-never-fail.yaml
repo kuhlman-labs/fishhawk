@@ -1,0 +1,14 @@
+id: scenario:issue-4088/host-rungs-render-and-never-fail
+statement: A `fishhawk doctor` run renders the rung labels `checkout location`, `golangci-lint pin`, `go toolchain pin`, `host load` and `orphaned shells`, and none of those five lines ends in `fail`; `fishhawk doctor --spec-only` renders none of them.
+verify_hint: 'CLI stdout of `fishhawk doctor --working-dir <fixture>` and of the same with `--spec-only`: grep each of the five labels and check the status column.'
+steps: Ran fishhawk doctor --working-dir against fixtures fx1 (Dockerfile pin v0.0.1 with go.work go 1.26), fx2 (go.work go 1.1) and chk (a repo with a workflow spec). Grepped the five labels and their status columns. Then ran fishhawk doctor --spec-only --working-dir /tmp/fh4088/fx1 and counted the five labels in its output.
+assertions:
+    expected: All five labels render, none ends in fail, and --spec-only renders none of them
+    observed_at_record: In the full runs all five rendered. checkout location was ok, golangci-lint pin was warn or ok-skipped, go toolchain pin was ok or warn, host load was 'load 6.83 on 14 cores (0.5x) ok', and orphaned shells was 'skipped — ps unavailable … ok'. None ended in fail. --spec-only rendered only the workflow spec, charter and execution-path rungs, and the grep count for the five labels was 0.
+    repro_handle: fishhawk doctor --working-dir /tmp/fh4088/fx1; fishhawk doctor --spec-only --working-dir /tmp/fh4088/fx1
+origin:
+    issue: 4088
+    pr: 4472
+    run_id: f074973c-062a-4dbb-bd07-b62d15019666
+    head_sha: 2d6307e3e91fdf1e1b0642fde21e9e3aa959c966
+    recorded_at: 2026-10-15T21:47:26Z
