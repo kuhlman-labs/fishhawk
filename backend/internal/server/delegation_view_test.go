@@ -306,8 +306,13 @@ func TestDelegationView_FeatureChangeEscalationIsSurfaced(t *testing.T) {
 		t.Error("feature_change must surface the tier's page list as must_page_human")
 	}
 
-	if len(fc.Escalations) != 1 {
-		t.Fatalf("feature_change has %d escalations in the decoded body, want 1", len(fc.Escalations))
+	// Two escalations: the autonomy clamp (which also attaches the security
+	// persona) and a persona-only entry for further security-sensitive paths.
+	if len(fc.Escalations) != 2 {
+		t.Fatalf("feature_change has %d escalations in the decoded body, want 2", len(fc.Escalations))
+	}
+	if p := fc.Escalations[1]; p.MaxAutonomy != "" || p.Approvals != nil || len(p.CeilingMatrix) != 0 {
+		t.Errorf("escalations[1] = %+v, want a persona-only entry raising no autonomy ceiling and no approvals", p)
 	}
 	e := fc.Escalations[0]
 	if !reflect.DeepEqual(e.Match.Paths, featureChangeEscalationPaths) {
