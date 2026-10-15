@@ -31,16 +31,19 @@ import (
 // both the lookup filter and the side effects.
 type prEventsRunRepo struct {
 	run.Repository
-	mu          sync.Mutex
-	listURLs    []string
-	listResult  []*run.Run
-	listErr     error
-	stages      map[uuid.UUID][]*run.Stage
-	stagesErr   error
-	transitions []prEventsTransition
-	transErr    error
-	curState    map[uuid.UUID]run.StageState // models the same-state no-op
-	runStates   map[uuid.UUID]run.State      // terminal run state recorded by TransitionRun
+	mu         sync.Mutex
+	listURLs   []string
+	listResult []*run.Run
+	listErr    error
+	stages     map[uuid.UUID][]*run.Stage
+	stagesErr  error
+	// stagesErrOnce, when set, is returned by the NEXT ListStagesForRun call
+	// only and then cleared — a transient stage-list read failure (#4132 C1).
+	stagesErrOnce error
+	transitions   []prEventsTransition
+	transErr      error
+	curState      map[uuid.UUID]run.StageState // models the same-state no-op
+	runStates     map[uuid.UUID]run.State      // terminal run state recorded by TransitionRun
 
 	// exactURLResult, when non-nil, models the indexed, non-recency-windowed
 	// PullRequestURL DB filter: a ListRuns call carrying f.PullRequestURL
@@ -142,6 +145,11 @@ func (r *prEventsRunRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*
 	defer r.mu.Unlock()
 	if r.stagesErr != nil {
 		return nil, r.stagesErr
+	}
+	if r.stagesErrOnce != nil {
+		err := r.stagesErrOnce
+		r.stagesErrOnce = nil
+		return nil, err
 	}
 	src := r.stages[id]
 	out := make([]*run.Stage, len(src))
@@ -2427,4 +2435,182 @@ func TestPullRequestClosed_NotMerged_RecordsStatesAtClose(t *testing.T) {
 			t.Errorf("states at close = (%v, %v), want (running, \"\")", runState, reviewState)
 		}
 	})
+}
+
+// --- approvals.members at the merge-settled review gate (E39.17 / #4132) ---
+
+// membersMergeFixture seeds a GitHub run whose cached spec declares members
+// [github:kuhlman-labs] on its merge-settled review gate, with an
+// implement stage succeeded and the review stage parked at awaiting_approval,
+// and wires cfg.GitHub to a members stub.
+func membersMergeFixture(t *testing.T, gh *membersGitHubStub) (*Server, *prEventsRunRepo, *prEventsAuditRepo, *run.Run, uuid.UUID) {
+	t.Helper()
+	target := mmGitHubRun(membersSpecYAML(t, `["github:kuhlman-labs"]`))
+	reviewStageID := uuid.New()
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{target},
+		stages: map[uuid.UUID][]*run.Stage{
+			target.ID: {
+				{ID: uuid.New(), RunID: target.ID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: target.ID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newMembersGitHubClient(t, gh)})
+	return s, rr, ar, target, reviewStageID
+}
+
+func membersMergedPayload(merger string) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  mmGitHubPRURL,
+			"number":    42,
+			"merged":    true,
+			"merged_by": map[string]any{"login": merger},
+			"head":      map[string]any{"sha": "headsha"},
+			"base":      map[string]any{"sha": "basesha"},
+		},
+		"sender": map[string]any{"login": merger},
+	})
+	return payload
+}
+
+// TestResolveReviewStageOnMerge_MembersWebhookUnlistedHeld drives a raw
+// pull_request.closed (merged) payload through the real handler: the forge
+// reports a bot merger and only an unlisted APPROVED reviewer, so the merge is
+// HELD — the review stage stays parked, no pr_merged / post_merge_observed
+// row, one refusal row.
+//
+// Counterfactual (CF1): make the call site `false && !s.mergeSettledMembersAdmit(...)`
+// — the merged arm falls through to succeeded + pr_merged and this goes RED.
+func TestResolveReviewStageOnMerge_MembersWebhookUnlistedHeld(t *testing.T) {
+	gh := &membersGitHubStub{mmGitHub: mmGitHub{merger: "fishhawk-dev[bot]", reviews: []mmReview{{"alice", "APPROVED"}}}}
+	s, rr, ar, target, reviewStageID := membersMergeFixture(t, gh)
+
+	s.handlePullRequestClosed(context.Background(), membersMergedPayload("fishhawk-dev[bot]"))
+
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %s, want awaiting_approval (held)", got)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none", rr.transitions)
+	}
+	if row := findCategory(ar.appended, CategoryPRMerged); row != nil {
+		t.Errorf("pr_merged written on a members hold; categories %v", auditCategories(ar.appended))
+	}
+	if row := findCategory(ar.appended, CategoryPostMergeObserved); row != nil {
+		t.Errorf("post_merge_observed written on a members hold")
+	}
+	rows := refusalRows(t, ar.appended)
+	if len(rows) != 1 || rows[0]["reason"] != membersHoldNoListedIdentity {
+		t.Fatalf("refusal rows = %+v, want one no_listed_identity row", rows)
+	}
+}
+
+// TestResolveReviewStageOnMerge_MembersWebhookListedResolves: the same merge
+// with a listed APPROVED reviewer resolves the stage and writes pr_merged.
+func TestResolveReviewStageOnMerge_MembersWebhookListedResolves(t *testing.T) {
+	gh := &membersGitHubStub{mmGitHub: mmGitHub{merger: "fishhawk-dev[bot]", reviews: []mmReview{{"kuhlman-labs", "APPROVED"}}}}
+	s, rr, ar, target, reviewStageID := membersMergeFixture(t, gh)
+
+	s.handlePullRequestClosed(context.Background(), membersMergedPayload("fishhawk-dev[bot]"))
+
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateSucceeded {
+		t.Errorf("review stage = %s, want succeeded", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("missing pr_merged; categories %v", auditCategories(ar.appended))
+	}
+	if rows := refusalRows(t, ar.appended); len(rows) != 0 {
+		t.Errorf("refusal rows = %+v, want none", rows)
+	}
+}
+
+// TestResolveReviewStageOnMerge_MembersPollHeldThenListedResolves: the
+// reconciler poll holds on an unlisted-only listing; once the forge gains a
+// listed APPROVED review the next poll resolves the parked stage, with exactly
+// one refusal row recorded across both polls.
+func TestResolveReviewStageOnMerge_MembersPollHeldThenListedResolves(t *testing.T) {
+	gh := &membersGitHubStub{mmGitHub: mmGitHub{merger: "fishhawk-dev[bot]", reviews: []mmReview{{"alice", "APPROVED"}}}}
+	s, rr, ar, target, reviewStageID := membersMergeFixture(t, gh)
+
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Fatalf("after poll 1 review stage = %s, want awaiting_approval (held)", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) != nil {
+		t.Fatalf("pr_merged written by the held poll")
+	}
+
+	gh.setReviews([]mmReview{{"alice", "APPROVED"}, {"kuhlman-labs", "APPROVED"}})
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateSucceeded {
+		t.Errorf("after poll 2 review stage = %s, want succeeded", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("missing pr_merged after the listed approval")
+	}
+	if rows := refusalRows(t, ar.appended); len(rows) != 1 {
+		t.Errorf("refusal rows = %d, want exactly 1", len(rows))
+	}
+}
+
+// TestResolveReviewStageOnMerge_StageLookupFailureHoldsMerge pins approval
+// condition C1 (#4132): a transient review-stage LOOKUP FAILURE on a merge
+// must never settle it without members evaluation. The first
+// ListStagesForRun errors: no pr_merged row, the stage stays parked, and the
+// no-review-stage tail never runs. The retry with an unlisted-only identity
+// set records the members hold; a retry with a listed identity resolves.
+//
+// Counterfactual: restore the nil-on-error lookup (findReviewStage) in
+// resolveReviewStageOnMerge — the failed first call takes the
+// no-review-stage tail, pr_merged lands, and the first-call assertions go
+// RED.
+func TestResolveReviewStageOnMerge_StageLookupFailureHoldsMerge(t *testing.T) {
+	gh := &membersGitHubStub{mmGitHub: mmGitHub{merger: "fishhawk-dev[bot]", reviews: []mmReview{{"alice", "APPROVED"}}}}
+	s, rr, ar, target, reviewStageID := membersMergeFixture(t, gh)
+	rr.stagesErrOnce = errors.New("transient stage list failure")
+
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) != nil {
+		t.Fatalf("pr_merged written after a failed stage lookup; categories %v", auditCategories(ar.appended))
+	}
+	if findCategory(ar.appended, CategoryPostMergeObserved) != nil {
+		t.Fatalf("post_merge_observed written after a failed stage lookup (no-review-stage tail ran)")
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Fatalf("after the failed lookup review stage = %s, want awaiting_approval", got)
+	}
+	if len(rr.transitions) != 0 {
+		t.Fatalf("transitions after the failed lookup = %+v, want none", rr.transitions)
+	}
+
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	rows := refusalRows(t, ar.appended)
+	if len(rows) != 1 || rows[0]["reason"] != membersHoldNoListedIdentity {
+		t.Fatalf("after the unlisted retry refusal rows = %+v, want one no_listed_identity row", rows)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Fatalf("after the unlisted retry review stage = %s, want awaiting_approval", got)
+	}
+
+	gh.setReviews([]mmReview{{"kuhlman-labs", "APPROVED"}})
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll 3: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateSucceeded {
+		t.Errorf("after the listed retry review stage = %s, want succeeded", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("missing pr_merged after the listed retry")
+	}
 }

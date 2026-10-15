@@ -2,10 +2,12 @@ package specialistjob
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -359,6 +361,16 @@ func TestStore_CreateCompletedDraft(t *testing.T) {
 	if *job.CompletedSequence != got[1].sequence {
 		t.Errorf("completed_sequence = %d, want %d", *job.CompletedSequence, got[1].sequence)
 	}
+	if job.Provenance != ProvenanceBearer || got[1].payload["provenance"] != ProvenanceBearer || got[1].payload["blocking_eligible"] != false {
+		t.Errorf("draft provenance = %q, payload %v/%v, want bearer and not blocking-eligible",
+			job.Provenance, got[1].payload["provenance"], got[1].payload["blocking_eligible"])
+	}
+	if _, ok := got[1].payload["attested_by"]; ok {
+		t.Errorf("draft payload carries attested_by: %v", got[1].payload)
+	}
+	if row := f.attestation(job.ID); row.provenance == nil || *row.provenance != ProvenanceBearer {
+		t.Errorf("draft row provenance = %s, want bearer", deref(row.provenance))
+	}
 }
 
 func TestStore_CompleteRefusesNotRunning(t *testing.T) {
@@ -462,7 +474,7 @@ func TestAdmitJob_RefusesDraftAndCompleted(t *testing.T) {
 	}
 	// A draft row seeded back to queued by construction isolates the draft
 	// refusal from the completed refusal.
-	f.exec(`UPDATE specialist_jobs SET state = 'queued', verdict = NULL, result = NULL, completed_at = NULL WHERE id = $1`, draft.ID)
+	f.exec(`UPDATE specialist_jobs SET state = 'queued', verdict = NULL, result = NULL, completed_at = NULL, provenance = NULL WHERE id = $1`, draft.ID)
 	if _, err := f.admit(nil, draft.ID, "n1"); !errors.Is(err, ErrNotAdmissible) {
 		t.Fatalf("AdmitJob(draft) = %v, want ErrNotAdmissible", err)
 	}
@@ -659,5 +671,407 @@ func TestStore_GetForeignAccountNotFound(t *testing.T) {
 	}
 	if _, err := f.store.Complete(context.Background(), CompleteParams{AccountID: &mine, JobID: job.ID, Completion: completion(t, KindInventory, "n")}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Complete(foreign) = %v, want ErrNotFound", err)
+	}
+}
+
+// --- Result attestation (E85.15 / #4363) ---
+
+const attesterA, attesterB = "specialist-runner/a", "specialist-runner/b"
+
+func (f *storeFixture) admitAs(acct *uuid.UUID, id uuid.UUID, nonce, attester string) *Admission {
+	f.t.Helper()
+	a, err := f.store.AdmitJob(context.Background(), AdmitParams{
+		AccountID: acct, JobID: id, Host: "h1", Nonce: nonce, Attester: attester,
+		Actor: Actor{Kind: audit.ActorSystem, Subject: attester},
+	})
+	if err != nil {
+		f.t.Fatalf("AdmitJob(%q): %v", attester, err)
+	}
+	if !a.Admitted {
+		f.t.Fatalf("AdmitJob(%q) = queued, want admitted", attester)
+	}
+	return a
+}
+
+// completionBody returns a completion's raw bytes and the Completion parsed
+// from exactly those bytes, as the result handler does.
+func completionBody(t *testing.T, k Kind, nonce string) ([]byte, *Completion) {
+	t.Helper()
+	doc := completionDoc(k, "pass", validEvidence(k))
+	doc["execution_nonce"] = nonce
+	raw := mustJSON(t, doc)
+	c, err := ParseCompletion(raw, k)
+	if err != nil {
+		t.Fatalf("ParseCompletion: %v", err)
+	}
+	return raw, c
+}
+
+func signed(priv ed25519.PrivateKey, jobID uuid.UUID, body []byte, caller string) *ResultAttestation {
+	return &ResultAttestation{Signature: ed25519.Sign(priv, ResultMessage(jobID, body)), Body: body, CallerSubject: caller}
+}
+
+// deref renders a nullable column for a failure message.
+func deref(s *string) string {
+	if s == nil {
+		return "NULL"
+	}
+	return *s
+}
+
+type attestationRow struct {
+	publicKey  []byte
+	subject    *string
+	expiresAt  *time.Time
+	provenance *string
+	state      string
+}
+
+// attestation reads the row's committed attestation columns back.
+func (f *storeFixture) attestation(id uuid.UUID) attestationRow {
+	f.t.Helper()
+	var r attestationRow
+	if err := f.pool.QueryRow(context.Background(), `SELECT attestation_public_key, attestation_subject, attestation_expires_at, provenance, state
+FROM specialist_jobs WHERE id = $1`, id).Scan(&r.publicKey, &r.subject, &r.expiresAt, &r.provenance, &r.state); err != nil {
+		f.t.Fatalf("read attestation columns: %v", err)
+	}
+	return r
+}
+
+// completedEntry returns the run chain's single specialist_job_completed
+// entry, failing unless there is exactly one.
+func (f *storeFixture) completedEntry(runID uuid.UUID) auditRow {
+	f.t.Helper()
+	var out []auditRow
+	for _, e := range f.entries(&runID) {
+		if e.category == CategoryCompleted {
+			out = append(out, e)
+		}
+	}
+	if len(out) != 1 {
+		f.t.Fatalf("completed entries = %+v, want exactly one", out)
+	}
+	return out[0]
+}
+
+// assertRefusedUnwritten asserts a refused completion left the job running,
+// with no provenance and no completed entry.
+func (f *storeFixture) assertRefusedUnwritten(runID, jobID uuid.UUID) {
+	f.t.Helper()
+	row := f.attestation(jobID)
+	if row.state != string(StateRunning) || row.provenance != nil {
+		f.t.Fatalf("row after refusal: state %s provenance %s, want running and NULL", row.state, deref(row.provenance))
+	}
+	for _, e := range f.entries(&runID) {
+		if e.category == CategoryCompleted {
+			f.t.Fatalf("refused completion wrote %s: %+v", CategoryCompleted, e)
+		}
+	}
+}
+
+// The done-means control: an unsigned result records bearer, read back from
+// committed state, even on a job whose admission minted a key.
+func TestStore_CompleteUnderBearerRecordsBearerProvenance(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	f.admitAs(nil, job.ID, "n1", attesterA)
+	_, c := completionBody(t, KindInventory, "n1")
+	done, err := f.store.Complete(context.Background(), CompleteParams{JobID: job.ID, Completion: c, Actor: Actor{Kind: audit.ActorUser, Subject: "github:captain"}})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if row := f.attestation(job.ID); row.provenance == nil || *row.provenance != ProvenanceBearer {
+		t.Fatalf("committed provenance = %s, want bearer", deref(row.provenance))
+	}
+	e := f.completedEntry(runID)
+	if e.payload["provenance"] != ProvenanceBearer || e.payload["blocking_eligible"] != false {
+		t.Fatalf("payload provenance/blocking_eligible = %v/%v, want bearer/false", e.payload["provenance"], e.payload["blocking_eligible"])
+	}
+	if _, ok := e.payload["attested_by"]; ok {
+		t.Errorf("bearer payload carries attested_by: %v", e.payload)
+	}
+	if done.Provenance != ProvenanceBearer || BlockingEligible(done.Provenance) {
+		t.Errorf("returned provenance = %q, want bearer", done.Provenance)
+	}
+}
+
+func TestStore_AttestedCompletionRecordsRunnerAttested(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	adm := f.admitAs(nil, job.ID, "n1", attesterA)
+	body, c := completionBody(t, KindInventory, "n1")
+	actor := Actor{Kind: audit.ActorSystem, Subject: attesterA}
+	done, err := f.store.Complete(context.Background(), CompleteParams{
+		JobID: job.ID, Completion: c, Actor: actor, Attestation: signed(adm.AttestationKey, job.ID, body, attesterA),
+	})
+	if err != nil {
+		t.Fatalf("Complete(attested): %v", err)
+	}
+	if row := f.attestation(job.ID); row.provenance == nil || *row.provenance != ProvenanceRunnerAttested {
+		t.Fatalf("committed provenance = %s, want runner_attested", deref(row.provenance))
+	}
+	if done.Provenance != ProvenanceRunnerAttested {
+		t.Errorf("returned provenance = %q, want runner_attested", done.Provenance)
+	}
+	e := f.completedEntry(runID)
+	if e.payload["provenance"] != ProvenanceRunnerAttested || e.payload["blocking_eligible"] != true || e.payload["attested_by"] != attesterA {
+		t.Fatalf("payload provenance/blocking_eligible/attested_by = %v/%v/%v, want runner_attested/true/%s",
+			e.payload["provenance"], e.payload["blocking_eligible"], e.payload["attested_by"], attesterA)
+	}
+	if e.actorKind != string(audit.ActorSystem) || e.actorSubject != attesterA {
+		t.Errorf("entry actor = %s/%s, want the passed actor system/%s", e.actorKind, e.actorSubject, attesterA)
+	}
+}
+
+// Replay cannot pin consumption (ErrNotRunning masks it), so this reads the
+// column.
+func TestStore_AttestedCompletionConsumesKey(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	adm := f.admitAs(nil, job.ID, "n1", attesterA)
+	body, c := completionBody(t, KindInventory, "n1")
+	if _, err := f.store.Complete(context.Background(), CompleteParams{
+		JobID: job.ID, Completion: c, Attestation: signed(adm.AttestationKey, job.ID, body, attesterA),
+	}); err != nil {
+		t.Fatalf("Complete(attested): %v", err)
+	}
+	row := f.attestation(job.ID)
+	if row.publicKey != nil || row.expiresAt != nil {
+		t.Fatalf("after an attested completion: public key %x expires %v, want both NULL (key consumed)", row.publicKey, row.expiresAt)
+	}
+}
+
+func TestStore_CompleteRefusesExpiredAttestation(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	adm := f.admitAs(nil, job.ID, "n1", attesterA)
+	// Expired on the DATABASE clock.
+	f.exec(`UPDATE specialist_jobs SET attestation_expires_at = clock_timestamp() - interval '1 minute' WHERE id = $1`, job.ID)
+	body, c := completionBody(t, KindInventory, "n1")
+	_, err := f.store.Complete(context.Background(), CompleteParams{
+		JobID: job.ID, Completion: c, Attestation: signed(adm.AttestationKey, job.ID, body, attesterA),
+	})
+	wantReason(t, err, ReasonAttestationExpired)
+	f.assertRefusedUnwritten(runID, job.ID)
+}
+
+func TestStore_CompleteRefusesTamperedBody(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	adm := f.admitAs(nil, job.ID, "n1", attesterA)
+	body, c := completionBody(t, KindInventory, "n1")
+	att := signed(adm.AttestationKey, job.ID, body, attesterA)
+	att.Body = append([]byte(nil), body...)
+	att.Body[len(att.Body)-2] ^= 0x01
+	_, err := f.store.Complete(context.Background(), CompleteParams{JobID: job.ID, Completion: c, Attestation: att})
+	wantReason(t, err, ReasonSignatureInvalid)
+	f.assertRefusedUnwritten(runID, job.ID)
+}
+
+func TestStore_CompleteRefusesForeignSubject(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	adm := f.admitAs(nil, job.ID, "n1", attesterA)
+	body, c := completionBody(t, KindInventory, "n1")
+	_, err := f.store.Complete(context.Background(), CompleteParams{
+		JobID: job.ID, Completion: c, Attestation: signed(adm.AttestationKey, job.ID, body, attesterB),
+	})
+	wantReason(t, err, ReasonSubjectMismatch)
+	f.assertRefusedUnwritten(runID, job.ID)
+}
+
+func TestAdmitJob_AttesterGetsKeyBearerDoesNot(t *testing.T) {
+	f := newStoreFixture(t)
+	attested := f.create(nil, KindInventory, "")
+	adm := f.admitAs(nil, attested.ID, "n1", attesterA)
+	if len(adm.AttestationKey) != ed25519.PrivateKeySize || adm.AttestationExpiresAt == nil {
+		t.Fatalf("attester admission key len %d expires %v, want a %d-byte key and an expiry", len(adm.AttestationKey), adm.AttestationExpiresAt, ed25519.PrivateKeySize)
+	}
+	row := f.attestation(attested.ID)
+	wantPub := adm.AttestationKey.Public().(ed25519.PublicKey)
+	if len(row.publicKey) != ed25519.PublicKeySize || !wantPub.Equal(ed25519.PublicKey(row.publicKey)) {
+		t.Fatalf("stored public key %x, want the delivered key's public half %x", row.publicKey, wantPub)
+	}
+	if row.subject == nil || *row.subject != attesterA || row.expiresAt == nil || !row.expiresAt.Equal(*adm.AttestationExpiresAt) {
+		t.Fatalf("stored subject/expiry = %s/%v, want %s/%v", deref(row.subject), row.expiresAt, attesterA, adm.AttestationExpiresAt)
+	}
+	if !adm.Job.AttestationLive || adm.Job.AttestationSubject != attesterA {
+		t.Errorf("admitted job attestation live %v subject %q, want live under %s", adm.Job.AttestationLive, adm.Job.AttestationSubject, attesterA)
+	}
+
+	// Free the local-verify slot the attested job holds.
+	if _, err := f.store.Complete(context.Background(), CompleteParams{JobID: attested.ID, Completion: completion(t, KindInventory, "n1")}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	bearer := f.create(nil, KindInventory, "")
+	badm := f.admitAs(nil, bearer.ID, "n2", "")
+	if badm.AttestationKey != nil || badm.AttestationExpiresAt != nil {
+		t.Fatalf("bearer admission delivered a key: %d bytes, expires %v", len(badm.AttestationKey), badm.AttestationExpiresAt)
+	}
+	if row := f.attestation(bearer.ID); row.publicKey != nil || row.subject != nil || row.expiresAt != nil {
+		t.Fatalf("bearer admission stored attestation %x/%s/%v, want all NULL", row.publicKey, deref(row.subject), row.expiresAt)
+	}
+}
+
+func TestAdmitJob_QueuedAttesterGetsNoKey(t *testing.T) {
+	f := newStoreFixture(t)
+	if a := f.admitStage(f.verifyStage()); !a.Admitted {
+		t.Fatalf("verify stage not admitted: %+v", a)
+	}
+	job := f.create(nil, KindInventory, "")
+	q, err := f.store.AdmitJob(context.Background(), AdmitParams{JobID: job.ID, Host: "h1", Nonce: "n1", Attester: attesterA})
+	if err != nil || q.Admitted {
+		t.Fatalf("AdmitJob = %+v, %v; want queued", q, err)
+	}
+	if q.AttestationKey != nil {
+		t.Fatalf("queued answer delivered a key")
+	}
+	if row := f.attestation(job.ID); row.publicKey != nil || row.subject != nil {
+		t.Fatalf("queued job stored attestation %x/%s, want none", row.publicKey, deref(row.subject))
+	}
+}
+
+// Every expiry compared here is DB-stamped (seeded relative to
+// clock_timestamp() and refreshed by the store on the same clock).
+func TestAdmitJob_HeartbeatRefreshesOnlyForMintingAttester(t *testing.T) {
+	f := newStoreFixture(t)
+	job := f.create(nil, KindInventory, "")
+	f.admitAs(nil, job.ID, "n1", attesterA)
+	// Pull the expiry well inside AttestationTTL so a refresh is visible.
+	reset := func() *time.Time {
+		f.exec(`UPDATE specialist_jobs SET attestation_expires_at = clock_timestamp() + interval '1 minute' WHERE id = $1`, job.ID)
+		return f.attestation(job.ID).expiresAt
+	}
+	beat := func(attester string) *Admission {
+		t.Helper()
+		a := f.admitAs(nil, job.ID, "n1", attester)
+		if a.AttestationKey != nil || a.AttestationExpiresAt != nil {
+			t.Fatalf("heartbeat by %q re-delivered the key", attester)
+		}
+		return a
+	}
+	for _, other := range []string{attesterB, ""} {
+		before := reset()
+		beat(other)
+		if after := f.attestation(job.ID).expiresAt; after == nil || !after.Equal(*before) {
+			t.Fatalf("heartbeat by %q moved the expiry %v -> %v, want unchanged", other, before, after)
+		}
+	}
+	before := reset()
+	beat(attesterA)
+	if after := f.attestation(job.ID).expiresAt; after == nil || !after.After(*before) {
+		t.Fatalf("minting attester's heartbeat expiry %v -> %v, want advanced", before, after)
+	}
+
+	// Isolated by construction: a key whose stored subject is empty is never
+	// refreshed by a bearer heartbeat (the non-empty-attester clause is the
+	// only check that refuses it).
+	f.exec(`UPDATE specialist_jobs SET attestation_subject = '' WHERE id = $1`, job.ID)
+	before = reset()
+	beat("")
+	if after := f.attestation(job.ID).expiresAt; after == nil || !after.Equal(*before) {
+		t.Fatalf("bearer heartbeat on an empty-subject key moved the expiry %v -> %v", before, after)
+	}
+
+	// Isolated by construction: no key present, so the minting subject's
+	// heartbeat must not arm an expiry.
+	f.exec(`UPDATE specialist_jobs SET attestation_subject = $2, attestation_public_key = NULL WHERE id = $1`, job.ID, attesterA)
+	before = reset()
+	beat(attesterA)
+	if after := f.attestation(job.ID).expiresAt; after == nil || !after.Equal(*before) {
+		t.Fatalf("heartbeat with no key present moved the expiry %v -> %v", before, after)
+	}
+}
+
+func TestAdmitJob_TakeoverInvalidatesPreviousAttestationKey(t *testing.T) {
+	f := newStoreFixture(t)
+	runID := f.newRun(nil)
+	job := f.create(nil, KindInventory, runID.String())
+	ka := f.admitAs(nil, job.ID, "n1", attesterA).AttestationKey
+	f.seedStale(job.ID)
+	took := f.admitAs(nil, job.ID, "n2", "")
+	if !took.TakenOver {
+		t.Fatalf("takeover = %+v, want taken over", took)
+	}
+	if row := f.attestation(job.ID); row.publicKey != nil || row.subject != nil || row.expiresAt != nil {
+		t.Fatalf("after a bearer takeover the attestation is %x/%s/%v, want all NULL", row.publicKey, deref(row.subject), row.expiresAt)
+	}
+	// Were the previous key left in place, KA would still verify (same
+	// subject A) and this would land runner_attested.
+	body, c := completionBody(t, KindInventory, "n2")
+	_, err := f.store.Complete(context.Background(), CompleteParams{JobID: job.ID, Completion: c, Attestation: signed(ka, job.ID, body, attesterA)})
+	wantReason(t, err, ReasonNoAttestationKey)
+	f.assertRefusedUnwritten(runID, job.ID)
+}
+
+func TestStore_LegacyCompletedRowReadsBearer(t *testing.T) {
+	f := newStoreFixture(t)
+	job := f.create(nil, KindInventory, "")
+	if got, err := f.store.Get(context.Background(), nil, job.ID); err != nil || got.Provenance != "" {
+		t.Fatalf("queued job provenance = %q (%v), want empty", got.Provenance, err)
+	}
+	f.mustAdmit(nil, job.ID, "n1")
+	if _, err := f.store.Complete(context.Background(), CompleteParams{JobID: job.ID, Completion: completion(t, KindInventory, "n1")}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	// A pre-0104 completion: provenance NULL.
+	f.exec(`UPDATE specialist_jobs SET provenance = NULL WHERE id = $1`, job.ID)
+	got, err := f.store.Get(context.Background(), nil, job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Provenance != ProvenanceBearer || BlockingEligible(got.Provenance) {
+		t.Fatalf("legacy completed provenance = %q, want bearer", got.Provenance)
+	}
+}
+
+func TestStore_ListCompletedForRun(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := context.Background()
+	acct, other := f.account(), f.account()
+	runID, otherRun := f.newRun(&acct), f.newRun(&acct)
+	complete := func(job *Job, nonce string) {
+		t.Helper()
+		f.mustAdmit(&acct, job.ID, nonce)
+		if _, err := f.store.Complete(ctx, CompleteParams{AccountID: &acct, JobID: job.ID, Completion: completion(t, KindInventory, nonce)}); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+	}
+	first, second := f.create(&acct, KindInventory, runID.String()), f.create(&acct, KindInventory, runID.String())
+	complete(second, "s") // completes first, so it sorts first
+	complete(first, "f")
+	queued := f.create(&acct, KindInventory, runID.String())
+	elsewhere := f.create(&acct, KindInventory, otherRun.String())
+	complete(elsewhere, "e")
+	foreign := f.create(&acct, KindInventory, runID.String())
+	complete(foreign, "x")
+	f.exec(`UPDATE specialist_jobs SET account_id = $2 WHERE id = $1`, foreign.ID, other)
+
+	got, err := f.store.ListCompletedForRun(ctx, &acct, runID)
+	if err != nil {
+		t.Fatalf("ListCompletedForRun: %v", err)
+	}
+	var ids []uuid.UUID
+	for _, j := range got {
+		ids = append(ids, j.ID)
+		if j.State != StateCompleted || j.Provenance != ProvenanceBearer {
+			t.Errorf("listed job %s state %s provenance %q, want completed bearer", j.ID, j.State, j.Provenance)
+		}
+	}
+	if want := []uuid.UUID{second.ID, first.ID}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("listed = %v, want %v (completed_sequence order; queued %s, other-run %s and foreign %s excluded)",
+			ids, want, queued.ID, elsewhere.ID, foreign.ID)
+	}
+	if got, err := f.store.ListCompletedForRun(ctx, nil, runID); err != nil || len(got) != 0 {
+		t.Fatalf("ListCompletedForRun(untenanted) = %d jobs (%v), want 0", len(got), err)
+	}
+	if got, err := f.store.ListCompletedForRun(ctx, &other, runID); err != nil || len(got) != 1 || got[0].ID != foreign.ID {
+		t.Fatalf("ListCompletedForRun(other account) = %v (%v), want only its own job", got, err)
 	}
 }

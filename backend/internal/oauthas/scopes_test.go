@@ -388,3 +388,23 @@ func TestRegistrationAuthority_ZeroValueCannotPin(t *testing.T) {
 		t.Fatal("OperatorAuthoredRegistration cannot pin a pre-registration-only scope; the operator escape hatch is gone")
 	}
 }
+
+// TestSupportedScopes_ExcludeSpecialistJobAttestScope pins #4363: the OAuth
+// vocabulary must not carry the specialist-job attestation scope, so no OAuth
+// grant (and no ParseScope) can produce a runner attester. The string literal
+// is used so oauthas gains no dependency on specialistjob (and through it
+// pgx).
+func TestSupportedScopes_ExcludeSpecialistJobAttestScope(t *testing.T) {
+	t.Parallel()
+	const attest = "attest:specialist-jobs"
+	for _, list := range [][]string{SupportedScopes, DefaultScopes} {
+		for _, s := range list {
+			if s == attest {
+				t.Fatalf("scope list %v carries %s", list, attest)
+			}
+		}
+	}
+	if IsSupportedScope(attest) {
+		t.Fatalf("IsSupportedScope(%q) = true, want false", attest)
+	}
+}

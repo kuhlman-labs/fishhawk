@@ -77,6 +77,15 @@ func drFixtureRecords() []drRecord {
 	}
 }
 
+// drLinkedRecord is one fixture record with supersession links set. The
+// shared drFixtureRecords keep empty links.
+func drLinkedRecord(id, title, path, status string, supersedes, supersededBy []string, applies ...string) drRecord {
+	if applies == nil {
+		applies = []string{}
+	}
+	return drRecord{ID: id, Title: title, Path: path, Status: status, Supersedes: supersedes, SupersededBy: supersededBy, AppliesTo: applies}
+}
+
 // drIndexJSON renders records as an adr-index-v1 document.
 func drIndexJSON(t *testing.T, records []drRecord) string {
 	t.Helper()
@@ -273,6 +282,62 @@ func TestDecisionRecordPersona_PlanReview_SelectsAndAttributes(t *testing.T) {
 	}
 }
 
+// (D1b, E86.58 / #4398) SUPERSESSION FOLLOWING, end to end, on its OWN
+// two-record index (the shared drFixtureRecords set is untouched): P governs
+// the audit package and is superseded by S, whose own applies_to is EMPTY. The
+// plan touches only the audit package, so S reaches the persona prompt only
+// because the selection follows P's supersession link — the index data, the
+// Select/Assemble walk, the persona prompt builder and the document_injected
+// attribution are all crossed.
+//
+// Counterfactual (run): replace `out, err := followSuccessors(idx, direct)`
+// with `out, err := direct, error(nil)` in decisionrecord.Select — S's body,
+// heading and path are absent: RED.
+func TestDecisionRecordPersona_PlanReview_FollowsSupersessionToSuccessor(t *testing.T) {
+	const (
+		pPath = "docs/adr/201-audit-registry-v1.md"
+		sPath = "docs/adr/202-audit-registry-v2.md"
+		pBody = "DR-PREDECESSOR SENTINEL: audit categories were registered by hand."
+		sBody = "DR-SUCCESSOR SENTINEL: audit categories are registered in one table."
+	)
+	std, persona := approvingFake(), approvingFake()
+	p := newPersonaPlanRun(t, personaSpec(drSpecOpts("plan")), std, persona)
+	p.fetcher.mu.Lock()
+	p.fetcher.files[drIndexPath] = drIndexJSON(t, []drRecord{
+		drLinkedRecord("ADR-201", "Audit registry v1", pPath, "superseded", []string{}, []string{"ADR-202"}, "backend/internal/audit/**"),
+		drLinkedRecord("ADR-202", "Audit registry v2", sPath, "accepted", []string{"ADR-201"}, []string{}),
+	})
+	p.fetcher.files[pPath] = pBody
+	p.fetcher.files[sPath] = sBody
+	p.fetcher.mu.Unlock()
+	p.planBody = drPlanBody(t, drChangePath)
+	if p.review(t) {
+		t.Fatal("approving reviewers must not gate")
+	}
+
+	perCalls := reviewerCalls(persona)
+	if len(perCalls) != 1 {
+		t.Fatalf("persona calls = %d, want 1", len(perCalls))
+	}
+	pp := perCalls[0]
+	for _, want := range []string{
+		sBody, pBody,
+		"Decision record ADR-202 — status: accepted",
+		"selected because it supersedes ADR-201",
+		"and 1 more were selected because they supersede a selected record",
+	} {
+		if !strings.Contains(pp, want) {
+			t.Errorf("persona prompt missing %q", want)
+		}
+	}
+	if sAt, pAt := strings.Index(pp, sBody), strings.Index(pp, pBody); sAt < 0 || pAt < 0 || sAt > pAt {
+		t.Errorf("render order: successor at %d, predecessor at %d; want the successor first", sAt, pAt)
+	}
+	if got, want := injectedPaths(documentEntries(t, p.au)), []string{pPath, sPath, drIndexPath, personaRemitPath}; !slices.Equal(got, want) {
+		t.Errorf("document_injected paths = %v, want %v (the successor attributed in the ONE set)", got, want)
+	}
+}
+
 // (D2) IMPLEMENT REVIEW: the audit path appears ONLY in the diff (the
 // approved plan's scope is backend/internal/foo/foo.go), so R-audit is
 // selected only because changePaths carries the diff half.
@@ -337,11 +402,15 @@ func TestDecisionRecordPersona_ImplementReview_ReadsAdmissionCommitNotBranch(t *
 	}
 }
 
-// (D4) OVER CAP: a resolver cap that fits the index and R-audit but not the
-// 1500-byte R-unknown. The sum of rendered_bytes over the set's index+record
-// document_injected entries stays within the cap, R-unknown is never shown,
-// and ONE selection-level document_truncated (selection decision_record)
-// names it with its rank — written BEFORE any document_injected.
+// (D4) OVER CAP: R-unknown is padded past the WHOLE cap, so it cannot fit the
+// record budget whatever the index's size — the drop is attributable to the
+// record budget by construction. The record budget is the resolver's cap
+// applied to the included records alone (the index is capped separately), so
+// the sum of rendered_bytes over the RECORD document_injected entries stays
+// within it, R-unknown is never shown, and ONE selection-level
+// document_truncated (selection decision_record) names it with its rank —
+// written BEFORE any document_injected — with cap_bytes the record budget and
+// included_bytes R-audit's rendered bytes alone.
 //
 // Counterfactual: the budget check itself lives in decisionrecord.Assemble
 // (pinned there); here, replacing AttributeSet with Attribute over the
@@ -349,9 +418,9 @@ func TestDecisionRecordPersona_ImplementReview_ReadsAdmissionCommitNotBranch(t *
 func TestDecisionRecordPersona_OverCap_DropsAndRecordsSelection(t *testing.T) {
 	std, persona := approvingFake(), approvingFake()
 	p := newDRPlanRun(t, std, persona)
-	bigUnknown := drUnknownBody + strings.Repeat(" padding", 200)
-	p.fetcher.files[drUnknownPath] = bigUnknown
 	capBytes := len(p.fetcher.files[drIndexPath]) + len(drAuditBody) + 200
+	bigUnknown := drUnknownBody + strings.Repeat("x", capBytes)
+	p.fetcher.files[drUnknownPath] = bigUnknown
 	p.s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: p.fetcher, MaxBytes: capBytes}
 	p.review(t)
 
@@ -374,6 +443,9 @@ func TestDecisionRecordPersona_OverCap_DropsAndRecordsSelection(t *testing.T) {
 	if sel["selection"] != "decision_record" || sel["path"] != drIndexPath || sel["dropped_count"] != float64(1) || sel["cap_bytes"] != float64(capBytes) {
 		t.Errorf("selection truncation = %v", sel)
 	}
+	if sel["included_bytes"] != float64(len(drAuditBody)) {
+		t.Errorf("included_bytes = %v, want R-audit's rendered bytes %d alone (the index is capped separately)", sel["included_bytes"], len(drAuditBody))
+	}
 	dropped, _ := sel["dropped"].([]any)
 	if len(dropped) != 1 || dropped[0].(map[string]any)["id"] != "ADR-104" || dropped[0].(map[string]any)["rank"] != float64(2) {
 		t.Errorf("dropped = %v, want ADR-104 at rank 2", sel["dropped"])
@@ -387,15 +459,63 @@ func TestDecisionRecordPersona_OverCap_DropsAndRecordsSelection(t *testing.T) {
 		if e.payload["injection_set_id"] != sel["injection_set_id"] {
 			t.Errorf("entry %v is not in the selection's injection set", e.payload)
 		}
-		if e.payload["path"] != personaRemitPath {
+		if e.payload["path"] != personaRemitPath && e.payload["path"] != drIndexPath {
 			sum += int(e.payload["rendered_bytes"].(float64))
 		}
 	}
 	if sum > capBytes {
-		t.Errorf("index+records rendered_bytes = %d, exceeds the cap %d", sum, capBytes)
+		t.Errorf("records' rendered_bytes = %d, exceeds the record budget %d", sum, capBytes)
 	}
 	if got := injectedPaths(entries); !slices.Equal(got, []string{drAuditPath, drIndexPath, personaRemitPath}) {
 		t.Errorf("document_injected paths = %v", got)
+	}
+}
+
+// (D4b, #4399) INDEX NEAR CAP: the resolver cap is the index's size plus 32
+// bytes, so the index fits whole but a budget SHARED with it would leave only
+// 32 bytes — less than either R-audit or R-unknown. The records have their own
+// budget (the same cap), which holds both, so through the real server path
+// (buildPersonaPrompt → resolvePersonaDecisionRecord → decisionrecord.Assemble
+// → personaprompt.Build → repodoc.AttributeSet → the reviewer) both bodies
+// reach the persona prompt, both are attributed, and no selection-level
+// document_truncated is written.
+func TestDecisionRecordPersona_IndexNearCap_RecordsStillShown(t *testing.T) {
+	std, persona := approvingFake(), approvingFake()
+	p := newDRPlanRun(t, std, persona)
+	const sharedRemainder = 32
+	capBytes := len(p.fetcher.files[drIndexPath]) + sharedRemainder
+	if len(drAuditBody) <= sharedRemainder || len(drUnknownBody) <= sharedRemainder || len(drAuditBody)+len(drUnknownBody) > capBytes {
+		t.Fatalf("premise: each record must exceed the %d-byte shared remainder and both must fit the %d-byte cap", sharedRemainder, capBytes)
+	}
+	p.s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: p.fetcher, MaxBytes: capBytes}
+	if p.review(t) {
+		t.Fatal("approving reviewers must not gate")
+	}
+
+	perCalls := reviewerCalls(persona)
+	if len(perCalls) != 1 {
+		t.Fatalf("persona calls = %d, want 1", len(perCalls))
+	}
+	for _, want := range []string{drAuditBody, drUnknownBody} {
+		if !strings.Contains(perCalls[0], want) {
+			t.Errorf("persona prompt missing %q: the index starved the record budget", want)
+		}
+	}
+	if strings.Contains(perCalls[0], "NOT INCLUDED because of the injection cap") {
+		t.Error("the persona prompt carries a dropped-records notice; nothing should be dropped")
+	}
+
+	entries := documentEntries(t, p.au)
+	if got, want := injectedPaths(entries), []string{drAuditPath, drUnknownPath, drIndexPath, personaRemitPath}; !slices.Equal(got, want) {
+		t.Errorf("document_injected paths = %v, want %v", got, want)
+	}
+	for _, e := range entries {
+		if e.category == "document_truncated" && e.payload["selection"] != nil {
+			t.Errorf("selection document_truncated written: %v", e.payload)
+		}
+		if e.category == "document_injected" && e.payload["path"] == drIndexPath && e.payload["truncated"] != false {
+			t.Errorf("premise: the index entry %v is truncated; it must fit whole", e.payload)
+		}
 	}
 }
 

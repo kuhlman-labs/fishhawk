@@ -583,8 +583,9 @@ learn about conventions or charters.
 
 ## Budgeted selections (`backend/internal/decisionrecord`, E78.5 / #3756)
 
-The decision-record consumer injects an index plus a ranked selection of whole
-records under ONE byte budget (the resolver's `CapBytes()`). It is the first
+The decision-record consumer injects an index under its own per-document cap
+plus a ranked selection of whole records under a SEPARATE record budget (each
+the resolver's `CapBytes()`, #4399). It is the first
 consumer of `Fetch`/`Document`, `AttributeSet` and the selection shape of
 `document_truncated`; repodoc still carries no consumer vocabulary — the
 selection's name, ids and statuses are opaque strings to it. Contract:

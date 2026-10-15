@@ -181,6 +181,11 @@ type rebaseBranchResponse struct {
 	// pass that follows is reported by the fields above (in_flight, or held
 	// behind the base's live pass).
 	MergeCandidateVerifyRerun bool `json:"merge_candidate_verify_rerun,omitempty"`
+	// MergeCandidateFixupSuperseded is true ONLY when THIS call converted a
+	// queued, never-dispatched ADR-090 D6 fix-up in place into the verify-only
+	// pass (E86.54 / #4391): the implement stage kept its place and the
+	// superseded fix-up pass is refunded.
+	MergeCandidateFixupSuperseded bool `json:"merge_candidate_fixup_superseded,omitempty"`
 }
 
 // mergeCandidateVerifyTriggeredNote is the constant sentence shipped whenever
@@ -202,6 +207,8 @@ type rebaseMergeCandidateFields struct {
 	Refusal   string
 	// Rerun: THIS call voided a failed verdict (#4391).
 	Rerun bool
+	// FixupSuperseded: THIS call converted a queued D6 fix-up in place.
+	FixupSuperseded bool
 }
 
 // rebaseRerunRequest is the operator's rerun_failed_verify ask (#4391),
@@ -417,6 +424,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 		MergeCandidateVerifyNote:      mc.Note,
 		MergeCandidateVerifyRefusal:   mc.Refusal,
 		MergeCandidateVerifyRerun:     mc.Rerun,
+		MergeCandidateFixupSuperseded: mc.FixupSuperseded,
 	})
 }
 
@@ -882,12 +890,13 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 // of a FAILED merge-candidate head (#4391), reached only on the
 // already-up-to-date arm with rerun_failed_verify set. In order:
 //
-//  1. PRE-CHECK that the implement stage is parked at its review gate
-//     (succeeded or awaiting_approval). Otherwise refuse, naming the stage,
-//     its state and the path, having written NO verdict and NO trigger (the
-//     shared tail's branch_rebased row already stands). This is what refuses
-//     beside a queued fix-up: the D6 auto-route leaves the stage pending, and
-//     without the pre-check the void would land and the start then refuse.
+//  1. PRE-CHECK the implement stage's state. At its review gate (succeeded
+//     or awaiting_approval) the steps below run. Pending or
+//     awaiting_host_dispatch (a queued ADR-090 D6 fix-up, E86.54) goes to
+//     rerunQueuedMergeCandidateFixup, which converts the fix-up in place
+//     under the stage's admission fence. Any other state refuses, naming the
+//     stage, its state and the path, having written NO verdict and NO
+//     trigger (the shared tail's branch_rebased row already stands).
 //  2. voidFailedMergeCandidateVerdict appends the operator's
 //     merge_candidate_verified{not_executed} row. Its error is a refusal with
 //     nothing triggered and the verdict still failed.
@@ -905,7 +914,11 @@ func (s *Server) rebaseRerunFailedMergeCandidateVerify(ctx context.Context, runR
 		return rebaseMergeCandidateFields{State: mergeCandidateStateFailed,
 			Refusal: "rerun_failed_verify refused: the run has no implement stage to re-open, so the failed merge-candidate verdict for " + head + " was NOT voided and no pass was started"}
 	}
-	if impl.State != run.StageStateSucceeded && impl.State != run.StageStateAwaitingApproval {
+	switch impl.State {
+	case run.StageStateSucceeded, run.StageStateAwaitingApproval:
+	case run.StageStatePending, run.StageStateAwaitingHostDispatch:
+		return s.rerunQueuedMergeCandidateFixup(ctx, runRow, impl, branch, baseRef, head, cause, reason)
+	default:
 		return rebaseMergeCandidateFields{State: mergeCandidateStateFailed, Refusal: mergeCandidateRerunNotAtGateRefusal(impl, head)}
 	}
 	actor := rebaseOperatorActor(ctx)
@@ -935,10 +948,11 @@ func (s *Server) rebaseRerunFailedMergeCandidateVerify(ctx context.Context, runR
 }
 
 // mergeCandidateRerunNotAtGateRefusal is the pre-check refusal: the implement
-// stage is not parked at its review gate, so nothing was voided.
+// stage is neither parked at its review gate nor holding a queued fix-up, so
+// nothing was voided.
 func mergeCandidateRerunNotAtGateRefusal(impl *run.Stage, head string) string {
-	return fmt.Sprintf("rerun_failed_verify refused: implement stage %s is in state %q, not parked at its review gate (succeeded or awaiting_approval), so the failed merge-candidate verdict for %s was NOT voided and no pass was started. "+
-		"If a fix-up is queued on it (the ADR-090 D6 auto-route leaves the stage pending), dispatch that fix-up with fishhawk_dispatch_stage — a decomposed parent's fix-up is policy-checked on its own increment, and a pass that changes nothing returns the stage to its gate with its fix-up budget refunded; otherwise wait for the stage to settle at its gate. "+
+	return fmt.Sprintf("rerun_failed_verify refused: implement stage %s is in state %q, so the failed merge-candidate verdict for %s was NOT voided and no pass was started. "+
+		"A re-run applies at the review gate (succeeded or awaiting_approval) or to a queued, never-dispatched ADR-090 D6 merge-candidate fix-up (pending or awaiting_host_dispatch), which it supersedes in place; otherwise wait for the stage to settle. "+
 		"Then re-invoke fishhawk_rebase_run_branch with rerun_failed_verify:true.", impl.ID, impl.State, head)
 }
 

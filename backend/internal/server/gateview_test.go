@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 // gateViewLongNote is deliberately longer than the MCP compaction levers'
@@ -523,6 +524,106 @@ func TestGateView_FixupJoin(t *testing.T) {
 	}
 	if fx[2].Outcome != "pending" {
 		t.Errorf("fixup[2] outcome = %q, want pending", fx[2].Outcome)
+	}
+}
+
+// TestGateView_FixupOutcomeSuperseded (R5, E86.54 / #4391): a concern-bearing
+// fix-up trigger a CONFIRMED stage_fixup_superseded marker names reads
+// "superseded"; an inert marker (no conversion trigger names it) followed by
+// a dispatch reads pending, and followed by a push reads pushed; and an older
+// pending trigger does not pick up a later trigger's supersession, because
+// the outcome is keyed to that exact trigger sequence. An outcome sequenced
+// BEFORE the marker still wins. MECHANISM (CF): dropping the confirmation
+// (reading every marker as a supersession) turns the inert-then-dispatch
+// trigger into "superseded"; keying on the stage alone turns the older
+// trigger "superseded"; dropping the before-marker check turns the
+// outcome-before-marker trigger "superseded".
+func TestGateView_FixupOutcomeSuperseded(t *testing.T) {
+	seedMarker := func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, seq, tSeq int64) {
+		seedHeadEntry(au, runID, stageID, CategoryStageFixupSuperseded, seq, map[string]any{
+			"trigger_sequence": tSeq, "superseded_by": fixupSupersededByVerifyRerun, "reason": mergeCandidateRerunReasonPrefix + "infra"})
+	}
+	seedConversion := func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, seq, tSeq int64) {
+		seedHeadEntry(au, runID, stageID, CategoryStageMergeCandidateVerifyTriggered, seq, map[string]any{
+			"expected_head_sha": "h", "supersedes_fixup_trigger_sequence": tSeq})
+	}
+	cases := []struct {
+		name string
+		seed func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string)
+		want []string
+	}{
+		{"confirmed", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedConversion(au, runID, stageID, 22, 20)
+		}, []string{"superseded"}},
+		{"inert then dispatch", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedHeadEntry(au, runID, stageID, CategoryStageConcurrencyAdmitted, 22, map[string]any{"group": "local-implement:h1"})
+		}, []string{"pending"}},
+		{"inert then push", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedHeadEntry(au, runID, stageID, "fixup_pushed", 22, map[string]any{"head_sha": "deadbeef", "apply_path": "agent"})
+		}, []string{"pushed"}},
+		{"older pending trigger", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "older"})
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 30, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 31, 30)
+			seedConversion(au, runID, stageID, 32, 30)
+		}, []string{"pending", "superseded"}},
+		{"outcome before marker wins", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedHeadEntry(au, runID, stageID, "fixup_no_changes", 21, map[string]any{})
+			seedMarker(au, runID, stageID, 22, 20)
+			seedConversion(au, runID, stageID, 23, 20)
+		}, []string{"no_changes"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, cr := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stageID := uuid.New()
+			c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
+			tc.seed(au, runID, &stageID, c.ID.String())
+
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if len(resp.Open) != 1 {
+				t.Fatalf("Open = %d, want 1", len(resp.Open))
+			}
+			fx := resp.Open[0].Fixups
+			var got []string
+			for _, f := range fx {
+				got = append(got, f.Outcome)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("fix-up outcomes = %v, want %v", got, tc.want)
+			}
+			if resp.HistoryIncomplete {
+				t.Errorf("history_incomplete with gaps %v, want a complete history", resp.HistoryGaps)
+			}
+		})
+	}
+	// A read gap on either new category leaves a confirmed supersession
+	// pending (never a false superseded) and names the gap.
+	for _, gap := range []string{CategoryStageFixupSuperseded, CategoryStageMergeCandidateVerifyTriggered} {
+		t.Run("read gap "+gap, func(t *testing.T) {
+			s, repo, au, cr := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stageID := uuid.New()
+			c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
+			cases[0].seed(au, runID, &stageID, c.ID.String())
+			au.listByCategoryErrCategory = gap
+
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if len(resp.Open) != 1 || len(resp.Open[0].Fixups) != 1 || resp.Open[0].Fixups[0].Outcome != "pending" {
+				t.Fatalf("open = %+v, want one fix-up reading pending under a %s read gap", resp.Open, gap)
+			}
+			if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gap) {
+				t.Errorf("history_incomplete = %v, gaps = %v; want a %s gap", resp.HistoryIncomplete, resp.HistoryGaps, gap)
+			}
+		})
 	}
 }
 
@@ -2662,4 +2763,140 @@ func TestGateView_MergeCandidateVerdictReadFailureRecordsGap(t *testing.T) {
 			t.Errorf("block = %+v, gaps = %v; want no block and a gap", resp.MergeCandidateVerdict, resp.HistoryGaps)
 		}
 	})
+}
+
+// --- E85.15 (#4363): the display-only specialist_jobs block ---
+
+// gvSJStore fakes ListCompletedForRun for the gate view; every other method
+// is the nil embedded interface (the gate view must not call one).
+type gvSJStore struct {
+	SpecialistJobStore
+	jobs  []*specialistjob.Job
+	err   error
+	calls int
+	acct  *uuid.UUID
+	runID uuid.UUID
+}
+
+func (f *gvSJStore) ListCompletedForRun(_ context.Context, acct *uuid.UUID, runID uuid.UUID) ([]*specialistjob.Job, error) {
+	f.calls++
+	f.acct, f.runID = acct, runID
+	return f.jobs, f.err
+}
+
+func gvSJJob(kind specialistjob.Kind, verdict specialistjob.Verdict, provenance string, seq int64) *specialistjob.Job {
+	return &specialistjob.Job{ID: uuid.New(), Kind: kind, State: specialistjob.StateCompleted, Verdict: verdict,
+		Provenance: provenance, CompletedSequence: &seq,
+		Result: json.RawMessage(`{"reason":"untrusted job-authored reason text must never reach the gate view"}`)}
+}
+
+func TestGateView_SpecialistJobsBlock(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	acct := uuid.New()
+	repo.mu.Lock()
+	repo.runs[runID].AccountID = acct.String()
+	repo.mu.Unlock()
+	a := gvSJJob(specialistjob.KindFaninBuild, specialistjob.VerdictPass, specialistjob.ProvenanceRunnerAttested, 7)
+	b := gvSJJob(specialistjob.KindInventory, specialistjob.VerdictFail, specialistjob.ProvenanceBearer, 9)
+	store := &gvSJStore{jobs: []*specialistjob.Job{a, b}}
+	s.cfg.SpecialistJobs = store
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if store.calls != 1 || store.runID != runID || store.acct == nil || *store.acct != acct {
+		t.Fatalf("ListCompletedForRun calls=%d run=%s acct=%v, want once for the run's account %s", store.calls, store.runID, store.acct, acct)
+	}
+	want := []gateViewSpecialistJob{
+		{JobID: a.ID.String(), Kind: "fanin_build", Verdict: "pass", Provenance: "runner_attested", BlockingEligible: true, CompletedSequence: 7},
+		{JobID: b.ID.String(), Kind: "inventory", Verdict: "fail", Provenance: "bearer", BlockingEligible: false, CompletedSequence: 9},
+	}
+	if !slices.Equal(resp.SpecialistJobs, want) {
+		t.Fatalf("specialist_jobs = %+v, want %+v", resp.SpecialistJobs, want)
+	}
+	if resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Fatalf("history gaps = %v, want none", resp.HistoryGaps)
+	}
+	// Member names on the wire (enum and id members only).
+	var raw struct {
+		SpecialistJobs []map[string]any `json:"specialist_jobs"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	var keys []string
+	for k := range raw.SpecialistJobs[0] {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	if wantKeys := []string{"blocking_eligible", "completed_sequence", "job_id", "kind", "provenance", "verdict"}; !slices.Equal(keys, wantKeys) {
+		t.Fatalf("specialist_jobs members = %v, want %v", keys, wantKeys)
+	}
+	if strings.Contains(w.Body.String(), "untrusted job-authored") {
+		t.Fatalf("job-authored text reached the gate view: %s", w.Body.String())
+	}
+}
+
+func TestGateView_SpecialistJobsReadFailureIsHistoryGap(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindPlan, "m", 1, "high", "correctness", "note", "")
+	s.cfg.SpecialistJobs = &gvSJStore{err: errors.New("db down")}
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if resp.SpecialistJobs != nil || strings.Contains(w.Body.String(), `"specialist_jobs":`) {
+		t.Fatalf("a failed read rendered a specialist_jobs block: %s", w.Body.String())
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapSpecialistJobs) {
+		t.Fatalf("history gaps = %v (incomplete=%v), want %q", resp.HistoryGaps, resp.HistoryIncomplete, gateViewGapSpecialistJobs)
+	}
+	if len(resp.Open) != 1 {
+		t.Fatalf("open concerns = %d, want the rest of the view intact", len(resp.Open))
+	}
+}
+
+func TestGateView_SpecialistJobsNonUUIDRunAccountIsGap(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	repo.mu.Lock()
+	repo.runs[runID].AccountID = "not-a-uuid"
+	repo.mu.Unlock()
+	store := &gvSJStore{}
+	s.cfg.SpecialistJobs = store
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if store.calls != 0 || resp.SpecialistJobs != nil {
+		t.Fatalf("unparseable run account: calls=%d block=%v, want no read and no block", store.calls, resp.SpecialistJobs)
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapSpecialistJobs) {
+		t.Fatalf("history gaps = %v, want %q", resp.HistoryGaps, gateViewGapSpecialistJobs)
+	}
+}
+
+func TestGateView_SpecialistJobsOmittedWhenUnwired(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if resp.SpecialistJobs != nil || strings.Contains(w.Body.String(), `"specialist_jobs":`) {
+		t.Fatalf("unwired store rendered a specialist_jobs block: %s", w.Body.String())
+	}
+	if resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Fatalf("unwired store recorded gaps %v", resp.HistoryGaps)
+	}
+}
+
+// Approval condition C2: the block is attached by handleGetRunGateView, never
+// by buildGateView, which the attention scan calls once per run.
+func TestBuildGateView_DoesNotReadSpecialistJobs(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	store := &gvSJStore{jobs: []*specialistjob.Job{gvSJJob(specialistjob.KindInventory, specialistjob.VerdictPass, specialistjob.ProvenanceBearer, 1)}}
+	s.cfg.SpecialistJobs = store
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list concerns: %v", err)
+	}
+	resp := s.buildGateView(context.Background(), runID, "", rows)
+	if store.calls != 0 || resp.SpecialistJobs != nil {
+		t.Fatalf("buildGateView read specialist jobs (calls=%d)", store.calls)
+	}
 }

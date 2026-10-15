@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -861,5 +862,100 @@ func TestParseGitLabMRIID(t *testing.T) {
 		if !ok || got != want {
 			t.Errorf("parseGitLabMRIID(%q) = %d,%v want %d", in, got, ok, want)
 		}
+	}
+}
+
+// --- approvals.members at the merge-settled review gate (E39.17 / #4132) ---
+
+// gitLabMembersFixture seeds a GitLab run (gitlab:5, group/project, MR 7)
+// whose cached spec declares members [gitlab:alice] on its merge-settled
+// review gate, and resolves the gitlab family to a real *forgegitlab.Forge
+// over an httptest MR read naming mergeUser.
+func gitLabMembersFixture(t *testing.T, mergeUser string) (*Server, *prEventsRunRepo, *prEventsAuditRepo, *run.Run, uuid.UUID) {
+	t.Helper()
+	target := mmGitLabRun(membersSpecYAML(t, `["gitlab:alice"]`))
+	reviewStageID := uuid.New()
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{target},
+		stages: map[uuid.UUID][]*run.Stage{
+			target.ID: {{ID: reviewStageID, RunID: target.ID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	f := newMembersGitLabForge(t, &membersGitLabStub{mmGitLab: mmGitLab{body: gitLabMRReadBody(mergeUser, "")}})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar,
+		ForgeResolver: func(string) (forge.Forge, error) { return f, nil }})
+	return s, rr, ar, target, reviewStageID
+}
+
+// gitLabMembersHookBody is a Merge Request Hook "merge" payload for MR 7 of
+// group/project, sent by webhookUser.
+func gitLabMembersHookBody(webhookUser string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"object_kind": "merge_request",
+		"user": {"username": %q},
+		"project": {"id": 5, "path_with_namespace": "group/project"},
+		"object_attributes": {"iid": 7, "action": "merge", "url": %q, "last_commit": {"id": "cafef00d"}}
+	}`, webhookUser, mmGitLabPRURL))
+}
+
+// TestGitLabMergeRequest_MembersUnlistedMergerHeld: the webhook sender and the
+// MR read's merge_user are both bob, unlisted against [gitlab:alice], so the
+// merge is HELD with one refusal row and no pr_merged.
+func TestGitLabMergeRequest_MembersUnlistedMergerHeld(t *testing.T) {
+	s, rr, ar, target, reviewStageID := gitLabMembersFixture(t, "bob")
+	if err := s.handleGitLabMergeRequest(context.Background(), gitLabMembersHookBody("bob")); err != nil {
+		t.Fatalf("handleGitLabMergeRequest: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %s, want awaiting_approval (held)", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) != nil {
+		t.Errorf("pr_merged written on a members hold; categories %v", auditCategories(ar.appended))
+	}
+	rows := refusalRows(t, ar.appended)
+	if len(rows) != 1 || rows[0]["reason"] != membersHoldNoListedIdentity || rows[0]["merger"] != "gitlab:bob" {
+		t.Fatalf("refusal rows = %+v, want one no_listed_identity row naming gitlab:bob", rows)
+	}
+}
+
+// TestGitLabMergeRequest_MembersListedMergerResolves: a listed forge merger
+// resolves the stage and writes pr_merged.
+func TestGitLabMergeRequest_MembersListedMergerResolves(t *testing.T) {
+	s, rr, ar, target, reviewStageID := gitLabMembersFixture(t, "alice")
+	if err := s.handleGitLabMergeRequest(context.Background(), gitLabMembersHookBody("alice")); err != nil {
+		t.Fatalf("handleGitLabMergeRequest: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateSucceeded {
+		t.Errorf("review stage = %s, want succeeded", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("missing pr_merged; categories %v", auditCategories(ar.appended))
+	}
+	if rows := refusalRows(t, ar.appended); len(rows) != 0 {
+		t.Errorf("refusal rows = %+v, want none", rows)
+	}
+}
+
+// TestGitLabMergeRequest_MembersPollResolvesFromForgeMerger is the R2
+// regression: the reconciler poll carries the SYSTEM actor (never an
+// identity), so the merger must come from the forge — the real GitLab adapter
+// decodes merge_user alice, listed, and the stage resolves.
+//
+// Counterfactual (CF8): `merger = pr.MergedBy` -> `merger = ""` leaves the
+// poll with no merger, holds identity_unavailable, and this goes RED.
+func TestGitLabMergeRequest_MembersPollResolvesFromForgeMerger(t *testing.T) {
+	s, rr, ar, target, reviewStageID := gitLabMembersFixture(t, "alice")
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitLabPRURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateSucceeded {
+		t.Errorf("review stage = %s, want succeeded (forge-read merger listed)", got)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("missing pr_merged; categories %v", auditCategories(ar.appended))
+	}
+	if rows := refusalRows(t, ar.appended); len(rows) != 0 {
+		t.Errorf("refusal rows = %+v, want none", rows)
 	}
 }

@@ -71,9 +71,11 @@ const (
 	reapFailureGo          = "backend/internal/server/reap_failure.go"
 	uploadFile             = "runner/internal/upload/upload.go"
 	scenarioFile           = "runner/internal/scenario/scenario.go"
-	// runnerGateEvidenceGo / bundleGo hold the gate_isolation evidence pair
-	// (#2135) and the counterfactual observation pair (#4143); only those flat
-	// structs carry the marker in either file.
+	// runnerGateEvidenceGo / bundleGo hold the gate_evidence member pairs: the
+	// gate_isolation evidence (#2135), the counterfactual observation (#4143),
+	// the absorbed verify flake (#4229) and the fix-up commit-message claims
+	// wrapper and leaf (#4337). Only those structs carry the marker in either
+	// file.
 	runnerGateEvidenceGo = "runner/cmd/fishhawk-runner/gateevidence.go"
 	bundleGo             = "backend/internal/bundle/bundle.go"
 	// specialistJobGo holds the backend's specialist-job HTTP shapes and
@@ -307,13 +309,23 @@ func SeedManifest() Manifest {
 			{
 				// The specialist-job read (E85.9 / #4300): fishhawkd emits it on
 				// GET/POST /v0/specialist-jobs, the runner's specialist-job
-				// subcommand decodes it. ModeSubset with every name decoded today;
-				// the nested requester/subject members and the bytes are pinned
-				// by testdata/wire/specialist_job.json, which both modules decode.
+				// subcommand decodes it. ModeSubset; the nested requester/subject
+				// members and the bytes are pinned by
+				// testdata/wire/specialist_job.json, which both modules decode.
 				Name: "specialist_job", Anchor: "#4300",
 				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobResponse"},
 				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJob"},
 				Mode:     ModeSubset,
+				AllowedEmitterOnly: []Allowance{
+					{
+						JSONName: "provenance",
+						Reason:   "result provenance (E85.15 / #4363 slice 1) emitted on the read; the runner's upload.SpecialistJob decodes it in #4363 slice 3",
+					},
+					{
+						JSONName: "blocking_eligible",
+						Reason:   "ADR-089 D4 blocking eligibility (E85.15 / #4363 slice 1) emitted on the read; the runner's upload.SpecialistJob decodes it in #4363 slice 3",
+					},
+				},
 			},
 			{
 				// The admission body the runner POSTs (and re-POSTs as its
@@ -330,6 +342,16 @@ func SeedManifest() Manifest {
 				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobAdmissionResponse"},
 				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJobAdmission"},
 				Mode:     ModeSubset,
+				AllowedEmitterOnly: []Allowance{
+					{
+						JSONName: "attestation_key",
+						Reason:   "job-scoped attestation key delivered once at an attester's admission (E85.15 / #4363 slice 1); the runner's upload.SpecialistJobAdmission decodes it in #4363 slice 3",
+					},
+					{
+						JSONName: "attestation_expires_at",
+						Reason:   "attestation key expiry delivered with the key (E85.15 / #4363 slice 1); the runner's upload.SpecialistJobAdmission decodes it in #4363 slice 3",
+					},
+				},
 			},
 			{
 				// The runner's completion envelope, decoded by
@@ -351,6 +373,23 @@ func SeedManifest() Manifest {
 				Name: "verify_flake_absorbed_evidence", Anchor: "#4229",
 				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "flakeAbsorbedEvidence"},
 				Consumer: Endpoint{File: bundleGo, Type: "FlakeAbsorbedEvidence"},
+				Mode:     ModeExact,
+			},
+			{
+				// The fix-up commit-message claims cross-check (#4337), folded
+				// into gate_evidence and decoded by the backend for the
+				// implement-review render. ModeExact on the wrapper and the leaf;
+				// the bytes are ALSO pinned by the shared golden
+				// testdata/wire/fixup_commit_claims.json.
+				Name: "fixup_commit_claims_evidence", Anchor: "#4337",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "fixupCommitClaimsEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "FixupCommitClaimsEvidence"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "fixup_commit_claim_evidence", Anchor: "#4337",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "fixupCommitClaimEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "FixupCommitClaimEvidence"},
 				Mode:     ModeExact,
 			},
 		},

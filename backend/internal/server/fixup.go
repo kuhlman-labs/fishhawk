@@ -613,17 +613,18 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delivered-nothing refund (#967 + #1957 + #3085): a fix-up pass that landed
-	// NOTHING on the PR branch is refunded against the NORMAL budget — it
-	// consumed a stage_fixup_triggered entry but changed nothing. The decision
-	// is ONE unioned per-window evaluation in fixupRefundedPasses, NOT a sum of
-	// independent counters: each stage_fixup_triggered entry opens a window and
-	// the chokepoint asks a single question per window — does it hold at least
-	// one delivered-nothing signal (fixup_no_changes; a dispatch_reaper_failed
-	// with failure_category C; a stage_fixup_recovered with
-	// source_failure_category C or A) and NO fixup_pushed entry? A window
-	// refunds AT MOST ONCE however many signals of however many kinds land in
-	// it, and the PUSH VETO applies uniformly across all four shapes — a pass
+	// Delivered-nothing refund (#967 + #1957 + #3085 + #4391): a fix-up pass
+	// that landed NOTHING on the PR branch is refunded against the NORMAL budget
+	// — it consumed a stage_fixup_triggered entry but changed nothing. The
+	// decision is ONE unioned per-window evaluation in fixupRefundedPasses, NOT a
+	// sum of independent counters: each stage_fixup_triggered entry opens a
+	// window and the chokepoint asks a single question per window — does it hold
+	// at least one delivered-nothing signal (fixup_no_changes; a
+	// dispatch_reaper_failed with failure_category C; a stage_fixup_recovered
+	// with source_failure_category C or A; a confirmed stage_fixup_superseded)
+	// and NO fixup_pushed entry? A window refunds AT MOST ONCE however many
+	// signals of however many kinds land in it, and the PUSH VETO applies
+	// uniformly across all five shapes — a pass
 	// that pushed delivered something and consumes budget regardless of how it
 	// later died (the deliberate category-C correction, see the chokepoint's doc
 	// comment). Category B (policy) still consumes a pass.
@@ -1433,7 +1434,7 @@ func (s *Server) countFixupPasses(ctx context.Context, runID, stageID uuid.UUID)
 // DELIVERED-NOTHING signal and NO fixup_pushed entry? A window refunds AT MOST
 // ONCE regardless of how many signals of how many kinds land inside it.
 //
-// Four signal shapes qualify, unioned:
+// Five signal shapes qualify, unioned:
 //
 //   - fixup_no_changes (#967) — the re-dispatch ran and produced NO commit. Not
 //     a crash: the agent ran, it just delivered nothing. (This signal carries no
@@ -1449,6 +1450,14 @@ func (s *Server) countFixupPasses(ctx context.Context, runID, stageID uuid.UUID)
 //     harness-death arm: the fix-up agent's harness died (a 400, a zero-token
 //     hang) having pushed nothing. Under the delivered-nothing invariant this is
 //     exactly the #1957 shape with a different cause, so it refunds too. A crash.
+//   - a CONFIRMED stage_fixup_superseded marker (E86.54 / #4391) — the operator's
+//     verify-only re-run superseded a queued, never-dispatched ADR-090 D6 fix-up
+//     in place, so the pass never ran at all. Not a crash. A marker counts ONLY
+//     when confirmedFixupSupersessions confirms it (a conversion trigger naming
+//     its fix-up trigger follows it); an inert marker, followed by a dispatch,
+//     push or settle instead, is never a supersession. The conversion-trigger
+//     read happens only when at least one marker exists, so a run that never
+//     superseded a fix-up pays one extra read, not two.
 //
 // Category B (policy) still CONSUMES a pass: a policy failure is a real verdict
 // on delivered work, not a delivery failure.
@@ -1484,8 +1493,9 @@ func (s *Server) countFixupPasses(ctx context.Context, runID, stageID uuid.UUID)
 //
 // crashedWithoutPush counts the refunding windows whose delivered-nothing signal
 // was a DEATH (category A or category C). A window that refunded only on
-// fixup_no_changes is deliberately EXCLUDED — that pass did not crash, the agent
-// ran and produced nothing. It is surfaced on the 422 fixup_budget_exhausted
+// fixup_no_changes or a confirmed supersession is deliberately EXCLUDED — that
+// pass did not crash: the agent ran and produced nothing, or the pass never ran
+// at all. It is surfaced on the 422 fixup_budget_exhausted
 // details so an operator reaching for force_additional_pass can see whether they
 // are overriding a real limit or a crash.
 func (s *Server) fixupRefundedPasses(ctx context.Context, runID, stageID uuid.UUID) (int, int, error) {
@@ -1562,6 +1572,26 @@ func (s *Server) fixupRefundedPasses(ctx context.Context, runID, stageID uuid.UU
 		}
 		if p.SourceFailureCategory == string(run.FailureC) || p.SourceFailureCategory == string(run.FailureA) {
 			signals = append(signals, deliveredNothingSignal{seq: e.Sequence, crash: true})
+		}
+	}
+
+	// E86.54 / #4391: a confirmed in-place supersession of a queued D6 fix-up.
+	// Not a crash: the pass never ran. The conversion triggers are read only
+	// when a marker exists; both reads are fail-closed like the others.
+	markers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupSuperseded)
+	if err != nil {
+		return 0, 0, fmt.Errorf("list %s audit entries: %w", CategoryStageFixupSuperseded, err)
+	}
+	if len(markers) > 0 {
+		conversions, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageMergeCandidateVerifyTriggered)
+		if err != nil {
+			return 0, 0, fmt.Errorf("list %s audit entries: %w", CategoryStageMergeCandidateVerifyTriggered, err)
+		}
+		for key, markerSeq := range confirmedFixupSupersessions(markers, conversions) {
+			if key.StageID != stageID {
+				continue
+			}
+			signals = append(signals, deliveredNothingSignal{seq: markerSeq, crash: false})
 		}
 	}
 

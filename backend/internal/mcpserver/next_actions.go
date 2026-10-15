@@ -108,6 +108,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -124,6 +125,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -149,9 +151,51 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldLiveValidationAdvisory(run, na)
 	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
+	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
+}
+
+// foldMergeCandidateRerunAlternative APPENDS fishhawk_rebase_run_branch
+// rerun_failed_verify:true as an ALTERNATIVE — never the default, never
+// prepended — when the run read carries the advisory merge_candidate_rerun
+// block (E86.54 / #4391) and the run is non-terminal. The backend builds that
+// block from the verb's own eligibility predicate, so the action is never one
+// the verb would refuse up front; whether the failure was infrastructure is the
+// operator's judgement, which is why it is an alternative and carries a reason
+// placeholder. De-duplicated: an action already carrying rerun_failed_verify
+// is left alone. A no-op (na unchanged) without the block, on a terminal run,
+// or with a nil na.
+func foldMergeCandidateRerunAlternative(run *Run, na *NextActions) {
+	if na == nil || run == nil || run.MergeCandidateRerun == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] == "true" {
+			return
+		}
+	}
+	rr := run.MergeCandidateRerun
+	reason := "the newest merge-candidate verdict for " + rr.HeadSHA + " FAILED (sequence " + strconv.FormatInt(rr.FailedSequence, 10) +
+		"); when that failure was infrastructure, not the change, this voids it and starts a verify-only pass instead of spending a fix-up"
+	if rr.QueuedFixupSequence > 0 {
+		reason = "the newest merge-candidate verdict for " + rr.HeadSHA + " FAILED (sequence " + strconv.FormatInt(rr.FailedSequence, 10) +
+			") and its ADR-090 D6 fix-up (sequence " + strconv.FormatInt(rr.QueuedFixupSequence, 10) + ", stage " + rr.QueuedFixupStageID +
+			") is queued, never dispatched; when that failure was infrastructure, not the change, this supersedes the fix-up IN PLACE with a verify-only pass and refunds its fix-up pass (the stage keeps its place)"
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action: "fishhawk_rebase_run_branch",
+		Params: map[string]string{
+			"run_id":              run.ID,
+			"confirm":             "true",
+			"rerun_failed_verify": "true",
+			"reason":              "<why the failure was infrastructure, not the change>",
+		},
+		Precondition: "the merge-candidate verdict for " + rr.HeadSHA + " failed and the operator judges the failure infrastructure, not the change",
+		Consumes:     consumesNone,
+		Reason:       reason,
+	})
 }
 
 // failureSignatureFor adapts the run's failed stage into failuresig.Evidence
@@ -725,6 +769,15 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// (the usual case — a failed stage fails the run) or still running.
 	if impl != nil && impl.State == "failed" {
 		return implementFailedNextActions(run, plan, stageByType(stages, "review"), impl)
+	}
+
+	// #4356: a non-terminal run with a FAILED acceptance stage is the server's
+	// category-C acceptance park — the run stays running and the stage stays
+	// retry-eligible. Checked BEFORE the cancelled/terminal arms and before the
+	// implement settled path, so an open-concern hint arm cannot mask the retry.
+	// A TERMINAL failed run keeps the bare {State: failed} arm below.
+	if acceptance != nil && acceptance.State == "failed" && !runStateIsTerminal(run.State) {
+		return acceptanceStageFailedNextActions(run, acceptance)
 	}
 
 	// A run cancelled by its PR closing without merge (#4082). Checked AHEAD
@@ -1768,6 +1821,14 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance", acceptance)}
 	}
 
+	// #4356: a FAILED acceptance stage shipped no verdict for its current
+	// episode, so it is checked at the TOP of the terminal section, before any
+	// recorded-verdict arm: an older recorded verdict — even a passed one — must
+	// never route a failed stage to the merge ritual. Mirrors the server gate.
+	if acceptance.State == "failed" {
+		return acceptanceStageFailedNextActions(run, acceptance)
+	}
+
 	// E38.3 / #1877: a succeeded verdict-less acceptance stage that carries the
 	// out-of-scope skip marker was auto-terminated because the approved plan
 	// declared verification.out_of_scope with zero acceptance_criteria — a
@@ -1909,6 +1970,43 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		}
 	default:
 		return acceptanceOutcomeUnknownActions(run, acceptance)
+	}
+}
+
+// acceptanceStageFailedNextActions is the arm for an acceptance stage that
+// FAILED its own execution on a non-terminal run (#4356): the server parks a
+// category-C acceptance failure instead of failing the run, so the recovery is
+// a retry of the acceptance stage, with cancel as the abandon option. The state
+// is byte-equal to drive.RuleAcceptanceOutcomeUnknown and to the server gate
+// state a failed acceptance stage reads, so the surfaces cannot diverge. NOT a
+// product-issue filing state: a parked infra failure is a recovery path.
+func acceptanceStageFailedNextActions(run *Run, acceptance *Stage) *NextActions {
+	category, reason := "", ""
+	if acceptance.FailureCategory != nil {
+		category = *acceptance.FailureCategory
+	}
+	if acceptance.FailureReason != nil {
+		reason = *acceptance.FailureReason
+	}
+	return &NextActions{
+		State: "acceptance_settled_outcome_unknown",
+		Actions: []SuggestedAction{
+			{
+				Action: "fishhawk_retry_stage",
+				Params: map[string]string{"stage_id": acceptance.ID},
+				Precondition: fmt.Sprintf("the acceptance stage FAILED its own execution (failure_category %q, failure_reason %q) while the run stays non-terminal: the server parks a category-C acceptance failure instead of failing the run, up to %d parks per stage (#4356)",
+					category, reason, runpkg.InfraFailureParkRetryBudget),
+				Consumes: consumesRetryBudget,
+				Reason:   "the retry re-opens the acceptance stage failed -> pending; on the local runner follow with fishhawk_dispatch_stage for the acceptance stage. The run keeps its merge-candidate line entry while parked",
+			},
+			{
+				Action:       "fishhawk_cancel_run",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "you choose to abandon the run instead of retrying the acceptance stage",
+				Consumes:     consumesNone,
+				Reason:       "cancel this run (releases its merge-candidate line entry), then start a fresh one with fishhawk_start_run (consumes a new run)",
+			},
+		},
 	}
 }
 

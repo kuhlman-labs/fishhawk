@@ -35,7 +35,9 @@ import (
 //     rebase producer and the decomposed-parent hold read (D2, D4);
 //   - routeMergeCandidateFailure applies D6 to a red result;
 //   - voidFailedMergeCandidateVerdict voids a failed head's verdict for the
-//     operator's verify-only re-run (#4391), making it re-triggerable.
+//     operator's verify-only re-run (#4391), making it re-triggerable; the
+//     in-place conversion of a queued D6 fix-up lives in
+//     merge_candidate_rerun.go.
 
 // CategoryStageMergeCandidateVerifyTriggered is the durable trigger that
 // re-opens the implement stage for a verify-only merge-candidate pass (ADR-090
@@ -52,6 +54,8 @@ const CategoryStageMergeCandidateVerifyTriggered = "stage_merge_candidate_verify
 const CategoryMergeCandidateVerified = "merge_candidate_verified"
 
 // Merge-candidate pass causes: which Fishhawk write produced the head (D2).
+// base_advance also covers an operator-vouched head that brought in base
+// commits (ADR-090 D8 Amendment 1, #4368).
 const (
 	mergeCandidateCauseBaseAdvance        = "base_advance"
 	mergeCandidateCauseConflictResolution = "conflict_resolution"
@@ -130,6 +134,12 @@ type mergeCandidateVerifyTrigger struct {
 	VerifyCommand         string `json:"verify_command"`
 	PriorState            string `json:"prior_state,omitempty"`
 	ReparkedReviewStageID string `json:"reparked_review_stage_id,omitempty"`
+	// SupersedesFixupTriggerSequence is set ONLY by beginSupersededFixupPass
+	// (E86.54 / #4391): the stage_fixup_triggered sequence of the queued D6
+	// fix-up this pass converted in place. It is what confirms a
+	// stage_fixup_superseded marker (confirmedFixupSupersessions); every other
+	// producer's trigger omits it.
+	SupersedesFixupTriggerSequence int64 `json:"supersedes_fixup_trigger_sequence,omitempty"`
 }
 
 // populated reports whether the trigger carries every anchor the runner needs.
@@ -229,12 +239,20 @@ type mergeCandidateVerifyStart struct {
 	Triggered bool
 	Position  int
 	LiveRunID *uuid.UUID
+	// SupersededFixupSequence is set ONLY by begin's SUPERSEDED-FIX-UP arm
+	// (#4391): the queued D6 fix-up trigger this start converted in place.
+	SupersededFixupSequence int64
 }
 
 // mergeCandidateVerifyRefusal is the negative answer: no pass could be
 // started, and why. Reason is always populated.
 type mergeCandidateVerifyRefusal struct {
 	Reason string
+	// Transient marks a refusal the next start may not repeat (#4391, approval
+	// condition C1: begin's SUPERSEDED-FIX-UP arm could not acquire the stage
+	// admission fence within its bound). The queue admission returns such an
+	// entry to held at its place instead of ejecting it.
+	Transient bool
 }
 
 // startMergeCandidateVerifyPass authorizes a verify-only pass for one head
@@ -259,8 +277,7 @@ type mergeCandidateVerifyRefusal struct {
 // below unchanged.
 func (s *Server) startMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
 	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
-	if s.cfg.MergeQueue != nil && s.cfg.GitHub != nil && s.cfg.RunRepo != nil && s.cfg.AuditRepo != nil &&
-		mergeCandidateQueueSerialized(p.Cause) && p.Branch != "" && p.BaseRef != "" && p.HeadSHA != "" && actor.Subject != "" {
+	if s.mergeCandidateQueueRoutes(p, actor) {
 		return s.serializeMergeCandidateVerifyPass(ctx, runID, p, actor)
 	}
 	return s.beginMergeCandidateVerifyPass(ctx, runID, p, actor)
@@ -337,6 +354,20 @@ func (s *Server) beginMergeCandidateVerifyPass(ctx context.Context, runID uuid.U
 		}
 		s.notifyStatusUpdate(ctx, runID, "merge_candidate_verify_start")
 		return &mergeCandidateVerifyStart{State: mergeCandidateStateInFlight, StageID: impl.ID, Triggered: true}, nil
+	}
+
+	// SUPERSEDED-FIX-UP (#4391). No live pass, and the stage is pending or
+	// awaiting_host_dispatch behind a queued D6 fix-up the operator's
+	// rerun_failed_verify superseded (a stage_fixup_superseded marker names
+	// it): convert it in place with a trigger carrying the fix-up's restore
+	// anchors, keeping the stage's place. Every producer reaches here (the
+	// rerun itself, a plain rebase re-invoke, the fan-in hold, the queue
+	// admission), so a marker+void state converts on the next start for this
+	// head. Not handled falls through to the prior-state refusal unchanged.
+	if live == nil && (impl.State == run.StageStatePending || impl.State == run.StageStateAwaitingHostDispatch) {
+		if start, refusal, handled := s.beginSupersededFixupPass(ctx, runID, impl, p, command, actor); handled {
+			return start, refusal
+		}
 	}
 
 	priorState := impl.State
@@ -862,7 +893,10 @@ var mergeCandidateRunnerGatedCategories = []string{"pull_request_opened", "fixup
 //     merge_commit_sha is the head → base_advance;
 //  2. conflict_resolution_pushed at the head → conflict_resolution;
 //  3. a runner-gated head report at the head → not_required;
-//  4. an operator-vouched head → not_required (D8);
+//  4. an operator-vouched head → base_advance when it brings in base commits
+//     the newest verified head lacks (or that cannot be ruled out on a
+//     probeable run), else not_required (D8 as amended, #4368;
+//     classifyVouchedHead in merge_candidate_vouch.go);
 //  5. a decomposed parent (fan-in integration rows on its chain) → fan_in;
 //  6. anything else → not_required.
 //
@@ -883,7 +917,7 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 	if headSHA == "" {
 		return mergeCandidateState{}, errors.New("the live head sha is empty, so the merge-candidate verify state cannot be decided")
 	}
-	cause, err := s.classifyMergeCandidateHead(ctx, runRow.ID, headSHA)
+	cause, err := s.classifyMergeCandidateHead(ctx, runRow, headSHA)
 	if err != nil {
 		return mergeCandidateState{}, err
 	}
@@ -911,7 +945,8 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 
 // classifyMergeCandidateHead returns the cause for a head that needs a
 // merge-candidate verify, or "" when it needs none.
-func (s *Server) classifyMergeCandidateHead(ctx context.Context, runID uuid.UUID, headSHA string) (string, error) {
+func (s *Server) classifyMergeCandidateHead(ctx context.Context, runRow *run.Run, headSHA string) (string, error) {
+	runID := runRow.ID
 	rebased, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryBranchRebased)
 	if err != nil {
 		return "", err
@@ -946,10 +981,13 @@ func (s *Server) classifyMergeCandidateHead(ctx context.Context, runID uuid.UUID
 		}
 	}
 
+	// Rule 4 (ADR-090 D8 Amendment 1, #4368): a vouch exempts the head only
+	// when the probe proves it brings in no base commit the newest verified
+	// head lacks.
 	if hit, err := s.chainReportsHead(ctx, runID, CategoryOperatorCommitVouched, "vouched_sha", headSHA); err != nil {
 		return "", err
 	} else if hit {
-		return "", nil
+		return s.classifyVouchedHead(ctx, runRow, headSHA)
 	}
 
 	for _, category := range []string{auditcomplete.CategoryIntegrationCommitRecorded, auditcomplete.CategorySlicesIntegrated} {
@@ -1136,7 +1174,7 @@ const mergeCandidateRerunReasonPrefix = "operator_rerun: "
 // (#4391). The merge gate's merge_candidate_verify_failed arm carries it so an
 // operator who judges the failure infrastructure rather than the change learns
 // the agent-free route alongside the fix-up route.
-const mergeCandidateRerunHint = "If the failure was infrastructure rather than the change, re-run ONLY the verify with fishhawk_rebase_run_branch rerun_failed_verify:true and a reason: it voids the failed verdict and starts a fresh verify-only pass for the same head, with no agent."
+const mergeCandidateRerunHint = "If the failure was infrastructure rather than the change, re-run ONLY the verify with fishhawk_rebase_run_branch rerun_failed_verify:true and a reason: it voids the failed verdict and starts a fresh verify-only pass for the same head, with no agent. It also supersedes a queued, never-dispatched merge-candidate fix-up in place and refunds its pass."
 
 // errMergeCandidateVoidNotFailed is voidFailedMergeCandidateVerdict's refusal
 // when the head's newest recorded verdict is not a failed one.

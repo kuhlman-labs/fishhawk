@@ -434,6 +434,8 @@ var KnownCategories = map[string]struct{}{
 	"diff_secrets_detected":                   {}, // E80.3 / #3760: the deterministic diff secrets check raised server_check concerns for credential-shaped additions (server/diff_secrets.go) — INTERNAL, locations and pattern classes only
 	"digest_marked_read":                      {},
 	"dispatch_reaper_failed":                  {},
+	"stage_infra_parked":                      {},
+	"stage_infra_park_budget_exhausted":       {},
 	"document_injected":                       {},
 	"document_injection_degraded":             {}, // E55.7 / #3746: run-admission declarations withheld from a served prompt (repodoc.RecordWithheld)
 	"document_truncated":                      {},
@@ -470,6 +472,7 @@ var KnownCategories = map[string]struct{}{
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
+	"merge_settle_members_refused":            {}, // E39.17 / #4132: a merge on a members-declaring review gate was HELD because no forge identity (merger / latest-APPROVED reviewer) is listed (server/merge_members.go) — INTERNAL, not an issue-comment surface
 	"merge_verdict_recorded":                  {},
 	"merge_candidate_queue_admitted":          {}, // E83.85 / #4200 (ADR-092 D1): a held merge-candidate pass was admitted as its base's ONE live pass (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_queue_held":              {}, // E83.85 / #4200 (ADR-092 D1): a merge-candidate pass was held behind its base's live pass, consuming no runner slot (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
@@ -583,7 +586,7 @@ var KnownCategories = map[string]struct{}{
 	"split_filing_refused":                    {},
 	"split_parent_closed":                     {},
 	"spend_alert":                             {},
-	"specialist_job_completed":                {}, // E85.9 / #4300 (ADR-097 D2): a runner-executed specialist job's typed result (or a draft's render), requester from the job row, provenance bearer (specialistjob/store.go) — INTERNAL, not an issue-comment surface
+	"specialist_job_completed":                {}, // E85.9 / #4300 (ADR-097 D2): a runner-executed specialist job's typed result (or a draft's render), requester from the job row; E85.15 / #4363: provenance bearer|runner_attested, blocking_eligible (true only for runner_attested), attested_by (the minting attester's subject, omitted unless runner_attested) (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"specialist_job_requested":                {}, // E85.9 / #4300 (ADR-097 D2): a seat filed a specialist job; inputs recorded verbatim (semantic JSON), requester server-derived (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"specialist_job_taken_over":               {}, // E85.9 / #4300 (ADR-097 D6, approval condition C1): a running job whose heartbeat went stale past JobHeartbeatTTL was re-admitted under a NEW execution nonce (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"stage_budget_exceeded":                   {},
@@ -594,6 +597,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_conflict_resolution_triggered":     {},
 	"stage_merge_candidate_verify_triggered":  {}, // E83.33 / #4018 (ADR-090): the durable trigger that re-opens the implement stage for a verify-only merge-candidate pass; never reads or spends the fix-up budget (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_recovered":                   {},
+	"stage_fixup_superseded":                  {}, // E86.54 / #4391: the operator's in-place supersession of a queued, never-dispatched ADR-090 D6 fix-up by a verify-only re-run; inert unless a conversion trigger names its fix-up trigger (server/merge_candidate_rerun.go) — INTERNAL, not an issue-comment surface
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},
 	"stage_permissions_declared":              {},

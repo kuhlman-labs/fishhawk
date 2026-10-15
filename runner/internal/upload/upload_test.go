@@ -5681,6 +5681,14 @@ func TestSpecialistJobGoldenRoundTrip(t *testing.T) {
 	if !adm.Admitted || adm.ExecutionNonce == "" || adm.Job.JobID != job.JobID {
 		t.Fatalf("golden admission decoded wrong: %+v", adm)
 	}
+	if adm.AttestationKey != "" || adm.AttestationExpiresAt != nil {
+		t.Fatalf("the plain golden admission must carry no attestation key: %+v", adm)
+	}
+	var attested SpecialistJobAdmission
+	roundTripStrict(t, "admission_attested", doc["admission_attested"], &attested)
+	if !attested.Admitted || attested.AttestationKey == "" || attested.AttestationExpiresAt == nil || attested.Job.JobID != job.JobID {
+		t.Fatalf("golden attested admission decoded wrong: %+v", attested)
+	}
 	var completions map[string]json.RawMessage
 	if err := json.Unmarshal(doc["completions"], &completions); err != nil {
 		t.Fatalf("decode completions: %v", err)
@@ -5699,7 +5707,8 @@ func TestSpecialistJobGoldenRoundTrip(t *testing.T) {
 }
 
 type specialistJobRecorded struct {
-	method, path, auth, body string
+	method, path, auth, body, sig string
+	sigCount                      int
 }
 
 // specialistJobServer answers every request with status/body and records it.
@@ -5711,7 +5720,8 @@ func specialistJobServer(t *testing.T, statuses []int, body string) (*httptest.S
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
-		got = append(got, specialistJobRecorded{r.Method, r.URL.Path, r.Header.Get("Authorization"), string(b)})
+		got = append(got, specialistJobRecorded{r.Method, r.URL.Path, r.Header.Get("Authorization"), string(b),
+			r.Header.Get("X-Fishhawk-Signature"), len(r.Header.Values("X-Fishhawk-Signature"))})
 		status := statuses[len(statuses)-1]
 		if i < len(statuses) {
 			status = statuses[i]
@@ -5756,7 +5766,7 @@ func TestSpecialistJobMethods_PathMethodAndBearer(t *testing.T) {
 		}},
 		{"complete", http.MethodPost, "/v0/specialist-jobs/" + jobID + "/result", string(doc["job"]), func(c *Client) error {
 			_, err := c.ShipSpecialistJobCompletion(context.Background(), "tok-1", jobID,
-				SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"})
+				SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"}, nil)
 			return err
 		}},
 	}
@@ -5819,7 +5829,7 @@ func TestSpecialistJobMethods_RetryThenSucceed(t *testing.T) {
 	doc := readSpecialistJobGolden(t)
 	srv, got := specialistJobServer(t, []int{http.StatusServiceUnavailable, http.StatusOK}, string(doc["job"]))
 	j, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", "job-1",
-		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"})
+		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"}, nil)
 	if err != nil {
 		t.Fatalf("ship: %v", err)
 	}
@@ -5843,5 +5853,167 @@ func TestSpecialistJobMethods_RefuseMissingTokenOrJob(t *testing.T) {
 	}
 	if len(*got) != 0 {
 		t.Fatalf("a refused call reached the network: %d requests", len(*got))
+	}
+}
+
+// ---- Specialist-job result attestation (E85.15 / #4363) ----
+
+type specialistJobAttestationVector struct {
+	SeedHex      string `json:"seed_hex"`
+	PublicKeyHex string `json:"public_key_hex"`
+	JobID        string `json:"job_id"`
+	Body         string `json:"body"`
+	MessageHex   string `json:"message_hex"`
+	SignatureHex string `json:"signature_hex"`
+}
+
+func readSpecialistJobAttestationVector(t *testing.T) specialistJobAttestationVector {
+	t.Helper()
+	var v specialistJobAttestationVector
+	dec := json.NewDecoder(bytes.NewReader(readSpecialistJobGolden(t)["result_attestation"]))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		t.Fatalf("decode result_attestation vector: %v", err)
+	}
+	return v
+}
+
+func (v specialistJobAttestationVector) key(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	seed, err := hex.DecodeString(v.SeedHex)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		t.Fatalf("seed_hex %q: %v", v.SeedHex, err)
+	}
+	return ed25519.NewKeyFromSeed(seed)
+}
+
+// TestSpecialistJobResultMessage_MatchesGolden recomputes the shared
+// testdata/wire/specialist_job.json result_attestation vector with the
+// runner's twin; the backend's attestation_golden_test.go recomputes the same
+// vector with specialistjob.ResultMessage, so the two constructions cannot
+// drift apart. The admission_attested key is the vector's seed-derived key.
+func TestSpecialistJobResultMessage_MatchesGolden(t *testing.T) {
+	v := readSpecialistJobAttestationVector(t)
+	priv := v.key(t)
+	if got := hex.EncodeToString(priv.Public().(ed25519.PublicKey)); got != v.PublicKeyHex {
+		t.Fatalf("public key = %s, want the golden %s", got, v.PublicKeyHex)
+	}
+	msg := SpecialistJobResultMessage(v.JobID, []byte(v.Body))
+	if got := hex.EncodeToString(msg); got != v.MessageHex {
+		t.Fatalf("SpecialistJobResultMessage = %s, want the shared golden %s", got, v.MessageHex)
+	}
+	if got := hex.EncodeToString(ed25519.Sign(priv, msg)); got != v.SignatureHex {
+		t.Fatalf("signature = %s, want the shared golden %s", got, v.SignatureHex)
+	}
+	var attested SpecialistJobAdmission
+	if err := json.Unmarshal(readSpecialistJobGolden(t)["admission_attested"], &attested); err != nil {
+		t.Fatal(err)
+	}
+	if want := base64.StdEncoding.EncodeToString(priv); attested.AttestationKey != want {
+		t.Fatalf("admission_attested.attestation_key = %s, want base64 std of the vector key", attested.AttestationKey)
+	}
+}
+
+// TestShipSpecialistJobCompletion_SignsBodyWithJobKey: a key signs the EXACT
+// shipped bytes over SpecialistJobResultMessage, and a retried attempt (503
+// then 200) carries the same single signature header. With the header Set
+// deleted the fake sees no signature and verification fails.
+func TestShipSpecialistJobCompletion_SignsBodyWithJobKey(t *testing.T) {
+	v := readSpecialistJobAttestationVector(t)
+	priv := v.key(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	doc := readSpecialistJobGolden(t)
+	srv, got := specialistJobServer(t, []int{http.StatusServiceUnavailable, http.StatusOK}, string(doc["job"]))
+	completion := SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "golden-execution-nonce",
+		Kind: "inventory", Verdict: "inconclusive", Reason: "timeout", DurationMS: 1234}
+	if _, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", v.JobID, completion, priv); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("requests = %d, want 2 (one retry)", len(*got))
+	}
+	for i, r := range *got {
+		if r.sigCount != 1 {
+			t.Fatalf("attempt %d carried %d X-Fishhawk-Signature headers, want exactly 1", i, r.sigCount)
+		}
+		sig, err := hex.DecodeString(r.sig)
+		if err != nil || !ed25519.Verify(pub, SpecialistJobResultMessage(v.JobID, []byte(r.body)), sig) {
+			t.Fatalf("attempt %d signature %q does not verify over the shipped body (%v)", i, r.sig, err)
+		}
+	}
+	// The shipped body for this completion IS the golden vector body, so the
+	// header is byte-exactly the golden signature.
+	if (*got)[1].body != v.Body || (*got)[1].sig != v.SignatureHex {
+		t.Fatalf("shipped body/sig = %s / %s, want the golden vector", (*got)[1].body, (*got)[1].sig)
+	}
+}
+
+// TestShipSpecialistJobCompletion_UnsignedWithoutKey: a nil key ships with no
+// signature header at all (provenance bearer server-side).
+func TestShipSpecialistJobCompletion_UnsignedWithoutKey(t *testing.T) {
+	doc := readSpecialistJobGolden(t)
+	srv, got := specialistJobServer(t, []int{http.StatusOK}, string(doc["job"]))
+	if _, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", "job-1",
+		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"}, nil); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+	if len(*got) != 1 || (*got)[0].sigCount != 0 {
+		t.Fatalf("requests %d, signature headers %d; want 1 unsigned request", len(*got), (*got)[0].sigCount)
+	}
+}
+
+// TestShipSpecialistJobCompletion_RefusesWrongLengthKey: a key that is not 64
+// bytes is refused before any I/O instead of panicking in ed25519.Sign.
+func TestShipSpecialistJobCompletion_RefusesWrongLengthKey(t *testing.T) {
+	srv, got := specialistJobServer(t, []int{http.StatusOK}, `{}`)
+	_, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", "job-1",
+		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"},
+		ed25519.PrivateKey(make([]byte, 10)))
+	if err == nil || !strings.Contains(err.Error(), "attestation key is 10 bytes") {
+		t.Fatalf("err = %v, want the wrong-length refusal", err)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("a refused shipment reached the network: %d requests", len(*got))
+	}
+}
+
+// TestShipSpecialistJobCompletion_AttestationRefusalIsPermanent: a 401
+// specialist_job_attestation_invalid is ErrSpecialistJobRejected after ONE
+// request — never retried, and the reason reaches the caller.
+func TestShipSpecialistJobCompletion_AttestationRefusalIsPermanent(t *testing.T) {
+	v := readSpecialistJobAttestationVector(t)
+	srv, got := specialistJobServer(t, []int{http.StatusUnauthorized},
+		`{"error":{"code":"specialist_job_attestation_invalid","message":"x","details":{"reason":"attestation_expired"}}}`)
+	_, err := specialistJobClient(srv).ShipSpecialistJobCompletion(context.Background(), "tok", v.JobID,
+		SpecialistJobCompletion{SchemaVersion: "specialist-job-v1", ExecutionNonce: "n", Kind: "inventory", Verdict: "inconclusive", Reason: "timeout"}, v.key(t))
+	if !errors.Is(err, ErrSpecialistJobRejected) || !strings.Contains(err.Error(), "attestation_expired") {
+		t.Fatalf("err = %v, want ErrSpecialistJobRejected naming the reason", err)
+	}
+	if len(*got) != 1 {
+		t.Fatalf("requests = %d, want 1 (a refused attestation is permanent)", len(*got))
+	}
+}
+
+// TestSpecialistJob_DecodesProvenance: the completed read's provenance and
+// blocking_eligible decode (both absent on a job that is not completed).
+func TestSpecialistJob_DecodesProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		body       string
+		provenance string
+		eligible   bool
+	}{
+		{`{"job_id":"j","state":"completed","provenance":"runner_attested","blocking_eligible":true}`, "runner_attested", true},
+		{`{"job_id":"j","state":"completed","provenance":"bearer","blocking_eligible":false}`, "bearer", false},
+		{`{"job_id":"j","state":"running","blocking_eligible":false}`, "", false},
+	} {
+		var j SpecialistJob
+		dec := json.NewDecoder(strings.NewReader(tc.body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&j); err != nil {
+			t.Fatalf("%s: %v", tc.body, err)
+		}
+		if j.Provenance != tc.provenance || j.BlockingEligible != tc.eligible {
+			t.Fatalf("%s decoded provenance=%q blocking_eligible=%v", tc.body, j.Provenance, j.BlockingEligible)
+		}
 	}
 }

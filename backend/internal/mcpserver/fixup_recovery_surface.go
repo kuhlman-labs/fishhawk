@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -18,6 +19,61 @@ import (
 // 512 bytes is enough to name what failed and small enough to be invisible to
 // the budget.
 const fixupRecoveryReasonCap = 512
+
+// fixupRecoveryHeadTailSeparator joins the kept head and tail of an over-cap
+// source_failure_reason. It is space-delimited, so it can never extend a run of
+// the structural runes neutralizeUntrustedFailureText run-splits across the
+// join.
+const fixupRecoveryHeadTailSeparator = " … "
+
+// capJSONStringHeadTail bounds s like capJSONString — its JSON-encoded form
+// fits in max(budget, 2) bytes and the result is valid UTF-8 — but keeps a
+// rune-boundary HEAD and TAIL of s joined by fixupRecoveryHeadTailSeparator
+// instead of a prefix only (#4337). s is returned unchanged when capJSONString
+// would return it unchanged. The tail gets three quarters of the space: the
+// runner's stranded fix-up commit pin clause (#4337, ~366 bytes at SHA-1
+// object ids) is appended as the reason's LAST clause, and the head only has
+// to name what failed. A budget too small to carry the separator falls back to
+// capJSONString's head-only prefix.
+func capJSONStringHeadTail(s string, budget int) string {
+	if capJSONString(s, budget) == s {
+		return s
+	}
+	avail := budget - jsonEncodedLen(fixupRecoveryHeadTailSeparator)
+	if avail < 2 {
+		return capJSONString(s, budget)
+	}
+	headBudget := avail / 4
+	tailBudget := avail - headBudget
+	// Each half's budget carries no quotes of its own; capJSONString and
+	// capJSONStringTail reserve two, so hand them the two back. Head and tail
+	// cannot overlap: s does not fit, so their combined cost (<= avail) is
+	// below s's, and an invalid byte stops both walks short of it.
+	return capJSONString(s, headBudget+2) + fixupRecoveryHeadTailSeparator + capJSONStringTail(s, tailBudget+2)
+}
+
+// capJSONStringTail is capJSONString walking from the END: the longest
+// rune-boundary SUFFIX of s whose JSON-encoded form fits in max(budget, 2)
+// bytes, stopping at an invalid byte so the result is always valid UTF-8.
+func capJSONStringTail(s string, budget int) string {
+	if budget < 2 {
+		budget = 2
+	}
+	n := 2
+	for i := len(s); i > 0; {
+		r, size := utf8.DecodeLastRuneInString(s[:i])
+		if r == utf8.RuneError && size == 1 {
+			return s[i:]
+		}
+		cost := jsonRuneCost(r, size)
+		if n+cost > budget {
+			return s[i:]
+		}
+		n += cost
+		i -= size
+	}
+	return s
+}
 
 // fixupRecoveryCategoryCap bounds the source_failure_category the same way
 // fixupRecoveryReasonCap bounds the reason. The backend writes a single letter
@@ -201,8 +257,11 @@ func latestFixupRecovery(triggerSeqs []int64, recoveries []fixupRecoverySignal) 
 		// the structured JSON fields below and the prose fixupRecoveryMessage
 		// builds from them are fed from here, so neutralizing once covers every
 		// agent-consumed surface the marker reaches. Neutralize BEFORE capping
-		// so the cap bounds the bytes that actually ship.
-		rec.SourceFailureReason = capJSONString(neutralizeUntrustedFailureText(winner.SourceFailureReason), fixupRecoveryReasonCap)
+		// so the cap bounds the bytes that actually ship. The reason keeps its
+		// head AND its tail (#4337): the runner appends its recovery handle —
+		// the stranded fix-up commit's pin ref — as the LAST clause, so a
+		// head-only cap would drop exactly the part an operator acts on.
+		rec.SourceFailureReason = capJSONStringHeadTail(neutralizeUntrustedFailureText(winner.SourceFailureReason), fixupRecoveryReasonCap)
 		rec.SourceFailureCategory = capJSONString(neutralizeUntrustedFailureText(winner.SourceFailureCategory), fixupRecoveryCategoryCap)
 		// restored_state and restored_review_stage_id are backend-authored
 		// enum/UUID values, not agent- or repository-derived free text, so they

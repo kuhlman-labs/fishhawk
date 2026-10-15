@@ -2579,6 +2579,11 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	if got := acceptanceStageNextActions(run, acc("succeeded"), false, false, "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
 		t.Errorf("outcome-unknown state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
 	}
+	// #4356: a FAILED acceptance stage (the category-C park) reads the same
+	// state the server gate returns for it.
+	if got := acceptanceStageNextActions(run, acc("failed"), false, false, "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
+		t.Errorf("failed-stage state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
+	}
 	// skipped-out-of-scope (E38.3 / #1877): a terminal verdict-less acceptance
 	// stage WITH the skip flag classifies acceptance_skipped_out_of_scope — the
 	// MCP state string MUST equal the audit-category marker so the drive gate
@@ -6635,4 +6640,167 @@ func TestReviewCoverageIncompleteLiterals(t *testing.T) {
 	if driveNextActionRerunReview != "rerun_review" {
 		t.Errorf("driveNextActionRerunReview = %q, want rerun_review", driveNextActionRerunReview)
 	}
+}
+
+// TestNextActions_AcceptanceStageFailedParked pins the #4356 arm: a running
+// run whose acceptance stage FAILED (the server's category-C park) leads with
+// fishhawk_retry_stage for that stage, even with an open-concern hint that
+// would otherwise win and an OLDER passed verdict recorded (C3 ordering). The
+// state is not a product-issue filing state. A TERMINAL failed run with the
+// same stages keeps the bare {State: failed} arm.
+func TestNextActions_AcceptanceStageFailedParked(t *testing.T) {
+	acc := naStage("acceptance", "failed")
+	cat, reason := "C", "acceptance_preview_provision_failed"
+	acc.FailureCategory, acc.FailureReason = &cat, &reason
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval"), acc, naStage("review", "pending")}
+	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+
+	run := naRun("running")
+	got := classifyNextActions(run, stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, acceptanceVerdictPassed, "", releaseSignals{})
+	if got.State != string(drive.RuleAcceptanceOutcomeUnknown) {
+		t.Fatalf("state = %q, want %q", got.State, drive.RuleAcceptanceOutcomeUnknown)
+	}
+	if len(got.Actions) < 2 || got.Actions[0].Action != "fishhawk_retry_stage" || got.Actions[0].Params["stage_id"] != acc.ID {
+		t.Fatalf("actions = %+v, want fishhawk_retry_stage{stage_id: %s} first", got.Actions, acc.ID)
+	}
+	if got.Actions[0].Consumes != consumesRetryBudget || !strings.Contains(got.Actions[0].Precondition, reason) {
+		t.Fatalf("retry action = %+v", got.Actions[0])
+	}
+	var cancel bool
+	for _, a := range got.Actions {
+		if a.Action == "fishhawk_report_product_issue" {
+			t.Fatalf("a parked infra failure must not suggest fishhawk_report_product_issue: %+v", got.Actions)
+		}
+		if a.Action == "fishhawk_cancel_run" && a.Params["run_id"] == run.ID {
+			cancel = true
+		}
+	}
+	if !cancel {
+		t.Fatalf("actions = %+v, want a fishhawk_cancel_run", got.Actions)
+	}
+
+	// C3: inside the acceptance arm the failed-stage check precedes the
+	// recorded-verdict switch, so the older passed verdict never routes a
+	// failed stage to the merge ritual.
+	if a := acceptanceStageNextActions(run, &acc, false, false, acceptanceVerdictPassed, ""); a.State != "acceptance_settled_outcome_unknown" || a.Actions[0].Action != "fishhawk_retry_stage" {
+		t.Fatalf("acceptance arm = %+v, want the failed-stage retry arm", a)
+	}
+
+	failed := classifyNextActions(naRun("failed"), stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, acceptanceVerdictPassed, "", releaseSignals{})
+	if failed.State != "failed" {
+		t.Fatalf("terminal failed run state = %q, want failed", failed.State)
+	}
+}
+
+// TestNextActions_MergeCandidateRerunAlternative (A2, E86.54 / #4391): with the
+// run read's advisory merge_candidate_rerun block present on a non-terminal
+// run, every nextActionsFor return path (ci_failed, review_coverage_incomplete
+// and the classify table) APPENDS exactly one fishhawk_rebase_run_branch
+// rerun_failed_verify:true action LAST — never first — with the exact params.
+// Absent without the block and on a terminal run; de-duplicated against an
+// existing rerun action.
+func TestNextActions_MergeCandidateRerunAlternative(t *testing.T) {
+	rerun := &runMergeCandidateRerun{HeadSHA: "bbbb", Cause: "base_advance", FailedSequence: 12,
+		QueuedFixupStageID: "s1", QueuedFixupSequence: 14}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")}
+	paths := []struct {
+		name  string
+		drive *DriveStatus
+	}{
+		{"ci_failed", &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}},
+		{"review_coverage_incomplete", &DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}},
+		{"classify", nil},
+	}
+	rerunActions := func(na *NextActions) []int {
+		var idx []int
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] == "true" {
+				idx = append(idx, i)
+			}
+		}
+		return idx
+	}
+	for _, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			r := naRun("running")
+			r.MergeCandidateRerun = rerun
+			na := nextActionsFor(r, stages, nil, nil, nil, p.drive, false, false, false, "", "", releaseSignals{})
+			idx := rerunActions(na)
+			if len(idx) != 1 {
+				t.Fatalf("rerun actions = %d in %+v, want exactly 1", len(idx), na.Actions)
+			}
+			if idx[0] == 0 {
+				t.Errorf("the rerun alternative is actions[0]; it must never be the default")
+			}
+			if idx[0] != len(na.Actions)-1 {
+				t.Errorf("the rerun alternative is at %d of %d, want appended last", idx[0], len(na.Actions))
+			}
+			a := na.Actions[idx[0]]
+			want := map[string]string{"run_id": r.ID, "confirm": "true", "rerun_failed_verify": "true",
+				"reason": "<why the failure was infrastructure, not the change>"}
+			if len(a.Params) != len(want) {
+				t.Errorf("params = %v, want exactly %v", a.Params, want)
+			}
+			for k, v := range want {
+				if a.Params[k] != v {
+					t.Errorf("params[%s] = %q, want %q", k, a.Params[k], v)
+				}
+			}
+			if a.Consumes != consumesNone {
+				t.Errorf("consumes = %q, want none", a.Consumes)
+			}
+			if !strings.Contains(a.Precondition, "bbbb") || !strings.Contains(a.Precondition, "infrastructure") {
+				t.Errorf("precondition = %q, want the failed head and the operator judgement named", a.Precondition)
+			}
+			if !strings.Contains(a.Reason, "sequence 14") || !strings.Contains(a.Reason, "IN PLACE") || !strings.Contains(a.Reason, "refunds") {
+				t.Errorf("reason = %q, want the queued fix-up it supersedes in place and refunds", a.Reason)
+			}
+		})
+	}
+
+	t.Run("gate reason names no fix-up", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateRerun = &runMergeCandidateRerun{HeadSHA: "bbbb", Cause: "base_advance", FailedSequence: 12}
+		na := nextActionsFor(r, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		idx := rerunActions(na)
+		if len(idx) != 1 {
+			t.Fatalf("rerun actions = %d, want 1", len(idx))
+		}
+		if reason := na.Actions[idx[0]].Reason; strings.Contains(reason, "IN PLACE") {
+			t.Errorf("reason = %q at the gate, want no queued fix-up named", reason)
+		}
+	})
+
+	t.Run("absent without the block", func(t *testing.T) {
+		na := nextActionsFor(naRun("running"), stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if idx := rerunActions(na); len(idx) != 0 {
+			t.Errorf("rerun actions = %d without the block, want 0", len(idx))
+		}
+	})
+
+	t.Run("absent on a terminal run", func(t *testing.T) {
+		for _, state := range []string{"succeeded", "failed", "cancelled"} {
+			r := naRun(state)
+			r.MergeCandidateRerun = rerun
+			na := nextActionsFor(r, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+			if na != nil {
+				if idx := rerunActions(na); len(idx) != 0 {
+					t.Errorf("%s run: rerun actions = %d, want 0", state, len(idx))
+				}
+			}
+		}
+	})
+
+	t.Run("de-duplicated", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateRerun = rerun
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_rebase_run_branch",
+			Params: map[string]string{"run_id": r.ID, "rerun_failed_verify": "true"}}}}
+		foldMergeCandidateRerunAlternative(r, na)
+		if len(na.Actions) != 1 {
+			t.Errorf("actions = %d after folding beside an existing rerun action, want 1", len(na.Actions))
+		}
+		foldMergeCandidateRerunAlternative(nil, na)
+		foldMergeCandidateRerunAlternative(r, nil) // must not panic
+	})
 }

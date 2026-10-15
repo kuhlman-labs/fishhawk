@@ -596,8 +596,19 @@ func (*runResolver) reviewStatusFallback(stage string, reviewed, skipped, failed
 // without the delivered_nothing key never voids — runs recovered before
 // #3395 keep the pre-#3395 behaviour — and a recovery with
 // delivered_nothing:false (the pass pushed before it died) keeps its trigger
-// as the floor because the pushed head's re-review round governs. The rule
-// itself is the pure liveFixupFloor.
+// as the floor because the pushed head's re-review round governs.
+//
+// SUPERSESSION ARM (E86.54 / #4391). A queued, never-dispatched ADR-090 D6
+// fix-up that the operator's verify-only re-run superseded in place never
+// runs, so it opens no review round either: a CONFIRMED stage_fixup_superseded
+// marker (confirmedSupersessionSeqs — a conversion trigger naming its fix-up
+// trigger follows it) voids that trigger exactly as a delivered-nothing
+// recovery does, per trigger window and per stage. An inert marker (followed
+// by a dispatch, push or settle instead) never voids. The marker and
+// conversion reads are BEST-EFFORT like the recovery read: a failure leaves
+// every trigger live (pending), never a false complete and never an error.
+//
+// The rule itself is the pure liveFixupFloor.
 func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: categoryStageFixupTriggered,
@@ -618,14 +629,16 @@ func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UU
 	// pre-#3395 answer — `pending` — never a false `complete`. Failing the
 	// whole status derivation here would turn an advisory read into a hard
 	// dependency for every fishhawk_get_run_status snapshot.
+	supersessions := r.supersessionFloorEntries(ctx, runID)
 	recEntries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: categoryStageFixupRecovered,
 		Limit:    reviewAuditQueryLimit,
 	})
 	if err != nil {
-		return liveFixupFloor(triggers, nil), nil
+		return liveFixupFloor(triggers, supersessions), nil
 	}
-	recoveries := make([]floorEntry, 0, len(recEntries))
+	recoveries := make([]floorEntry, 0, len(recEntries)+len(supersessions))
+	recoveries = append(recoveries, supersessions...)
 	for _, e := range recEntries {
 		fe := floorEntry{Sequence: e.Sequence, StageID: derefString(e.StageID)}
 		// Marshal-then-unmarshal, the fixupRecoveryFor idiom: the client
@@ -644,8 +657,37 @@ func (r *runResolver) latestImplementFixupSeq(ctx context.Context, runID uuid.UU
 	return liveFixupFloor(triggers, recoveries), nil
 }
 
+// supersessionFloorEntries returns one void-capable floorEntry per CONFIRMED
+// stage_fixup_superseded marker on the run (#4391): the marker's sequence and
+// stage with DeliveredNothing true, so liveFixupFloor voids the superseded
+// trigger within its own window and stage. BEST-EFFORT: a marker or
+// conversion-trigger read failure returns nil — every trigger stays live — and
+// the conversion triggers are read only when a marker exists.
+func (r *runResolver) supersessionFloorEntries(ctx context.Context, runID uuid.UUID) []floorEntry {
+	markers, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupSuperseded,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil || len(markers) == 0 {
+		return nil
+	}
+	conversions, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageMergeCandidateVerifyTriggered,
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil
+	}
+	var out []floorEntry
+	for _, cs := range confirmedSupersessionSeqs(markers, conversions) {
+		out = append(out, floorEntry{Sequence: cs.MarkerSequence, StageID: cs.StageID, DeliveredNothing: true})
+	}
+	return out
+}
+
 // floorEntry is one stage_fixup_triggered or stage_fixup_recovered audit
-// entry reduced to what liveFixupFloor needs.
+// entry (or a confirmed stage_fixup_superseded marker, #4391) reduced to what
+// liveFixupFloor needs.
 type floorEntry struct {
 	Sequence         int64
 	StageID          string

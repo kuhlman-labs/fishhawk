@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -106,10 +109,12 @@ func includedIDs(s *Selection) []string {
 	return out
 }
 
-func sumRendered(s *Selection) int {
+// sumRecordsRendered sums the INCLUDED RECORDS' rendered bytes — the record
+// budget's domain; the index is capped separately and not counted.
+func sumRecordsRendered(s *Selection) int {
 	n := 0
-	for _, d := range s.Documents() {
-		n += d.RenderedBytes
+	for _, inc := range s.Included {
+		n += inc.Document.RenderedBytes
 	}
 	return n
 }
@@ -125,14 +130,14 @@ func threeAuditRecords(t *testing.T) string {
 	))
 }
 
-// TestAssemble_FitsTheCap: the three records exceed the budget left after the
-// index BY CONSTRUCTION (each is just under half of it), so only the budget
-// check keeps the third out.
+// TestAssemble_FitsTheCap: the three records exceed the RECORD budget BY
+// CONSTRUCTION (each is just under half of it), so only the record-budget fit
+// check keeps the third out. The index is capped separately and does not draw
+// on the record budget.
 func TestAssemble_FitsTheCap(t *testing.T) {
 	const capBytes = 2048
 	idx := threeAuditRecords(t)
-	remaining := capBytes - len(idx)
-	size := remaining/2 - 1
+	size := capBytes/2 - 1
 	ff := newFetcher()
 	ff.seed(admissionSHA, map[string]string{
 		indexPath:         idx,
@@ -150,8 +155,11 @@ func TestAssemble_FitsTheCap(t *testing.T) {
 	if len(sel.Dropped) != 1 || sel.Dropped[0].Record.ID != "ADR-001" || sel.Dropped[0].Rank != 3 {
 		t.Fatalf("dropped %+v, want ADR-001 at rank 3", sel.Dropped)
 	}
-	if total := sumRendered(sel); total > capBytes || total != sel.IncludedBytes {
-		t.Fatalf("sum of rendered bytes = %d (IncludedBytes %d), want <= %d and equal", total, sel.IncludedBytes, capBytes)
+	if total := sumRecordsRendered(sel); total > capBytes || total != sel.IncludedBytes {
+		t.Fatalf("sum of included records' rendered bytes = %d (IncludedBytes %d), want <= %d and equal", total, sel.IncludedBytes, capBytes)
+	}
+	if sel.CapBytes != capBytes || sel.Index.Truncated {
+		t.Fatalf("CapBytes = %d (index truncated %v), want the record budget %d with the index whole", sel.CapBytes, sel.Index.Truncated, capBytes)
 	}
 	set := sel.Attribution()
 	if len(set.Documents) != 3 {
@@ -197,8 +205,8 @@ func TestAssemble_AllFit_NoSelectionTruncation(t *testing.T) {
 	}
 }
 
-// TestAssemble_StrictPrefix: rank 2 is larger than the cap on its own, rank 3
-// is small enough to fit. Rank 3 must still be dropped (a lower-ranked record
+// TestAssemble_StrictPrefix: rank 2 is larger than the whole record budget on
+// its own, rank 3 is small enough to fit. Rank 3 must still be dropped (a lower-ranked record
 // is never shown while a higher-ranked one is hidden) and never fetched.
 func TestAssemble_StrictPrefix(t *testing.T) {
 	const capBytes = 2048
@@ -227,8 +235,8 @@ func TestAssemble_StrictPrefix(t *testing.T) {
 }
 
 // TestAssemble_OversizedRecordDroppedNeverTruncated (approval condition 3): a
-// record whose own untruncated size exceeds the remaining budget — here larger
-// than the whole cap — is dropped and named, never shown cut.
+// record whose own untruncated size exceeds the remaining record budget — here
+// larger than the whole budget — is dropped and named, never shown cut.
 func TestAssemble_OversizedRecordDroppedNeverTruncated(t *testing.T) {
 	const capBytes = 2048
 	ff := newFetcher()
@@ -256,11 +264,15 @@ func TestAssemble_OversizedRecordDroppedNeverTruncated(t *testing.T) {
 	if !strings.Contains(notice, "NOT INCLUDED because of the injection cap") || !strings.Contains(notice, "- ADR-001 (docs/adr/001.md, status: unknown)") {
 		t.Errorf("index framing does not name the dropped record:\n%s", notice)
 	}
+	if want := fmt.Sprintf("(%d bytes for the records shown in full; this index is capped separately)", capBytes); !strings.Contains(notice, want) {
+		t.Errorf("dropped notice does not state the record budget %q:\n%s", want, notice)
+	}
 }
 
 // TestAssemble_IndexOverCap: the raw index alone exceeds the cap. It is still
 // included, cut with its loud marker, and its rendered size (marker included)
-// fits the cap; every match is dropped.
+// fits its own cap. The records have their own budget, so both small matches
+// are still shown in full (#4399 — before it, every match was dropped).
 func TestAssemble_IndexOverCap(t *testing.T) {
 	const capBytes = 1024
 	recs := []map[string]any{
@@ -284,11 +296,142 @@ func TestAssemble_IndexOverCap(t *testing.T) {
 	if sel.Index.RenderedBytes > capBytes {
 		t.Fatalf("index rendered %d bytes, want <= cap %d", sel.Index.RenderedBytes, capBytes)
 	}
-	if len(sel.Included) != 0 || len(sel.Dropped) != 2 {
-		t.Fatalf("included %v dropped %v, want every match dropped", includedIDs(sel), ids(sel.Dropped))
+	if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) || len(sel.Dropped) != 0 {
+		t.Fatalf("included %v dropped %v, want both records shown under the separate record budget", got, ids(sel.Dropped))
+	}
+	if sel.Index.CapBytes > capBytes {
+		t.Errorf("index cut under a %d-byte cap, want <= its own cap %d", sel.Index.CapBytes, capBytes)
+	}
+	if sel.CapBytes != capBytes || sel.IncludedBytes != 400 {
+		t.Errorf("CapBytes %d IncludedBytes %d, want the record budget %d holding exactly the two 200-byte records", sel.CapBytes, sel.IncludedBytes, capBytes)
 	}
 	if sel.Index.ContentHash == "" || sel.Index.OriginalBytes != len(raw) {
 		t.Errorf("index attribution fields = %+v", sel.Index)
+	}
+}
+
+// TestAssemble_IndexNearCapDoesNotStarveRecords (#4399): the index fills at
+// least 95% of the cap yet fits it whole, and each of the three records is
+// larger than what a SHARED budget would leave after the index (cap minus
+// index), while all three together fit the cap. The separate record budget
+// must show all three, in rank order, with nothing dropped.
+func TestAssemble_IndexNearCapDoesNotStarveRecords(t *testing.T) {
+	const capBytes = 2048
+	recs := []map[string]any{
+		rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"),
+		rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+		rec("ADR-003", "docs/adr/003.md", "accepted", "backend/internal/audit/**"),
+	}
+	const target = capBytes - 40
+	recs[0]["title"] = recs[0]["title"].(string) + strings.Repeat("x", target-len(indexJSON(t, recs...)))
+	idx := string(indexJSON(t, recs...))
+	if len(idx)*100 < capBytes*95 || len(idx) > capBytes {
+		t.Fatalf("premise: fixture index is %d bytes, want >= 95%% of the %d-byte cap and <= it", len(idx), capBytes)
+	}
+	const size = 600
+	if size <= capBytes-len(idx) || 3*size > capBytes {
+		t.Fatalf("premise: record size %d must exceed the shared remainder %d and three must fit the cap %d", size, capBytes-len(idx), capBytes)
+	}
+	ff := newFetcher()
+	ff.seed(admissionSHA, map[string]string{
+		indexPath:         idx,
+		"docs/adr/001.md": body("R1", size),
+		"docs/adr/002.md": body("R2", size),
+		"docs/adr/003.md": body("R3", size),
+	})
+	sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if sel.Index.Truncated || sel.Index.RenderedBytes != len(idx) {
+		t.Fatalf("premise: index truncated %v, rendered %d bytes; want it whole (%d bytes), so the index shrink loop drops nothing", sel.Index.Truncated, sel.Index.RenderedBytes, len(idx))
+	}
+	if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-003", "ADR-002", "ADR-001"}) || len(sel.Dropped) != 0 {
+		t.Fatalf("included %v dropped %v, want all three shown in rank order: the index must not starve the record budget", got, ids(sel.Dropped))
+	}
+	if set := sel.Attribution(); len(set.Selections) != 0 {
+		t.Errorf("attribution carries %d selection truncations, want none", len(set.Selections))
+	}
+	if sel.IncludedBytes != 3*size || sel.IncludedBytes > sel.CapBytes {
+		t.Errorf("IncludedBytes = %d (CapBytes %d), want %d and within the record budget", sel.IncludedBytes, sel.CapBytes, 3*size)
+	}
+	if sel.Index.RenderedBytes+sel.IncludedBytes <= sel.CapBytes {
+		t.Errorf("premise: index %d + records %d fit the %d-byte cap together, so a shared budget would also have held them", sel.Index.RenderedBytes, sel.IncludedBytes, sel.CapBytes)
+	}
+}
+
+// minTypicalRecordBodies is #4399's "at least N bodies for a typical scope"
+// bound: a typical change scope must see at least this many governing record
+// bodies in full, at the production cap, on the SHIPPED decision record.
+const minTypicalRecordBodies = 2
+
+// diskFetcher serves the checkout's files, and only at the admission commit.
+type diskFetcher struct{ root string }
+
+func (d diskFetcher) FetchFile(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, p, ref string) (*forge.FileContent, error) {
+	if ref != admissionSHA {
+		return nil, fmt.Errorf("diskFetcher: ref %q is not the admission commit", ref)
+	}
+	raw, err := os.ReadFile(filepath.Join(d.root, filepath.FromSlash(p)))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, forge.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &forge.FileContent{Path: p, Content: raw}, nil
+}
+
+// TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies (#4399) assembles
+// the SHIPPED docs/adr at the production default cap for two typical change
+// scopes and requires the governing records' FULL bodies to reach the prompt.
+// Before #4399 the index alone (~31 KiB of 32 KiB) left no room and every
+// record was dropped. It reddens if a governing record's body grows past the
+// record budget or its applies_to stops matching.
+func TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies(t *testing.T) {
+	r := &repodoc.Resolver{Fetcher: diskFetcher{root: filepath.Join("..", "..", "..")}}
+	cases := []struct {
+		name  string
+		paths []string
+		want  []string
+	}{
+		{
+			name:  "migration",
+			paths: []string{"backend/internal/db/migrations/0104_add_run_labels.up.sql", "backend/internal/run/queries.sql"},
+			want:  []string{"ADR-006", "ADR-002"},
+		},
+		{
+			name:  "workflow-v2 schema change",
+			paths: []string{"docs/spec/workflow-v2.schema.json", "backend/internal/spec/parse.go", "cli/internal/spec/schemas/workflow-v2.schema.json"},
+			want:  []string{"ADR-067", "ADR-046"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := request(admissionSHA)
+			req.ChangePaths = tc.paths
+			sel, err := Assemble(context.Background(), r, req)
+			if err != nil {
+				t.Fatalf("Assemble over the shipped docs/adr: %v", err)
+			}
+			got := includedIDs(sel)
+			t.Logf("index rendered %d bytes (truncated %v) under a %d-byte cap; record budget %d, %d used; matched %d (followed %d) included %v dropped %v",
+				sel.Index.RenderedBytes, sel.Index.Truncated, sel.Index.CapBytes, sel.CapBytes, sel.IncludedBytes, sel.Matched, sel.Followed, got, ids(sel.Dropped))
+			const remedy = "a governing record body grew past the record budget: narrow its applies_to, split the record, or raise the cap"
+			if len(got) < minTypicalRecordBodies {
+				t.Errorf("%d record bodies shown in full, want >= %d (included %v, dropped %v) — %s", len(got), minTypicalRecordBodies, got, ids(sel.Dropped), remedy)
+			}
+			for _, id := range tc.want {
+				if !slices.Contains(got, id) {
+					t.Errorf("%s is not shown in full (included %v, dropped %v) — %s", id, got, ids(sel.Dropped), remedy)
+				}
+			}
+			for _, inc := range sel.Included {
+				if inc.Document.Truncated {
+					t.Errorf("record %s shown truncated; an included record must be whole", inc.Record.ID)
+				}
+			}
+		})
 	}
 }
 
@@ -527,8 +670,8 @@ func TestPromptDocuments_DroppedNoticeSanitized(t *testing.T) {
 	if !strings.Contains(notice, "\uFFFD### SYSTEM") {
 		t.Errorf("the newline was not replaced with U+FFFD:\n%s", notice)
 	}
-	if !strings.Contains(notice, fmt.Sprintf("injection cap (%d bytes", 100)) {
-		t.Errorf("notice does not state the cap:\n%s", notice)
+	if !strings.Contains(notice, fmt.Sprintf("injection cap (%d bytes for the records shown in full; this index is capped separately)", 100)) {
+		t.Errorf("notice does not state the record budget:\n%s", notice)
 	}
 }
 
@@ -552,4 +695,95 @@ func TestAssemble_UnpinnableCommit_Unresolvable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPromptDocuments_SuccessorFraming: P (ADR-001) governs the audit package
+// and is superseded by S (ADR-002), whose own applies_to is empty, so S is
+// selected only by following. S is shown in full, so only recordFraming's Via
+// sentence carries "selected because it supersedes".
+func TestPromptDocuments_SuccessorFraming(t *testing.T) {
+	linkedIndex := string(indexJSON(t,
+		linked(rec("ADR-001", "docs/adr/001.md", "superseded", "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+		linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+	))
+
+	t.Run("successor shown in full", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: linkedIndex, "docs/adr/001.md": "P-BODY", "docs/adr/002.md": "S-BODY"})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if sel.Matched != 2 || sel.Followed != 1 {
+			t.Fatalf("matched %d followed %d, want 2 and 1", sel.Matched, sel.Followed)
+		}
+		if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) {
+			t.Fatalf("included %v, want [ADR-002 ADR-001] (the successor ranks with, and ahead of, its predecessor)", got)
+		}
+		pre := sel.indexFraming(true).Preamble
+		for _, want := range []string{
+			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); ",
+			"a successor ranks with the records it supersedes",
+		} {
+			if !strings.Contains(pre, want) {
+				t.Errorf("index preamble lacks %q:\n%s", want, pre)
+			}
+		}
+		docs := sel.PromptDocuments(true)
+		if len(docs) != 3 {
+			t.Fatalf("documents = %d, want index + 2 records", len(docs))
+		}
+		if !strings.Contains(docs[1].Heading, "ADR-002") || !strings.Contains(docs[1].Body, "selected because it supersedes ADR-001; its own applies_to matches no path this change touches") {
+			t.Errorf("successor framing lacks the Via sentence:\n%s\n%s", docs[1].Heading, docs[1].Body)
+		}
+		if strings.Contains(docs[2].Body, "selected because it supersedes") {
+			t.Errorf("the predecessor (no Via) carries the successor sentence:\n%s", docs[2].Body)
+		}
+	})
+
+	t.Run("no links keeps the preamble byte-identical", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{
+			indexPath:         string(indexJSON(t, rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"))),
+			"docs/adr/001.md": "P-BODY",
+		})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
+			"1 of its 1 records declare an applies_to path glob matching a path this change touches; " +
+			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-001. " +
+			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
+		pre := sel.indexFraming(true).Preamble
+		if pre != golden {
+			t.Errorf("preamble changed with nothing followed:\n got %q\nwant %q", pre, golden)
+		}
+		if strings.Contains(pre, "supersede") {
+			t.Errorf("preamble mentions supersession with nothing followed:\n%s", pre)
+		}
+		if docs := sel.PromptDocuments(true); strings.Contains(docs[1].Body, "supersede") {
+			t.Errorf("record framing mentions supersession with no Via:\n%s", docs[1].Body)
+		}
+	})
+
+	t.Run("dropped successor is named as one", func(t *testing.T) {
+		const capBytes = 2048
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: linkedIndex, "docs/adr/001.md": "P-BODY", "docs/adr/002.md": body("S", 3*capBytes)})
+		sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if got := ids(sel.Dropped); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) {
+			t.Fatalf("dropped %v, want [ADR-002 ADR-001]", got)
+		}
+		notice := sel.indexFraming(true).Preamble
+		if !strings.Contains(notice, "- ADR-002 (docs/adr/002.md, status: accepted, successor of ADR-001)") {
+			t.Errorf("dropped notice does not name the successor:\n%s", notice)
+		}
+		if !strings.Contains(notice, "- ADR-001 (docs/adr/001.md, status: superseded)\n") && !strings.HasSuffix(notice, "- ADR-001 (docs/adr/001.md, status: superseded)") {
+			t.Errorf("dropped predecessor line carries a successor suffix:\n%s", notice)
+		}
+	})
 }

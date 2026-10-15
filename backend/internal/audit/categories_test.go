@@ -787,3 +787,32 @@ func TestKnownCategories_VerifyFlakeAbsorbed(t *testing.T) {
 		t.Fatal("verify_flake_absorbed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_MergeSettleMembersRefused pins the E39.17 / #4132
+// category resolveReviewStageOnMerge's members seam appends
+// (server/merge_members.go, mergeSettledMembersAdmit's hold record) when a
+// merge on a members-declaring review gate is held because no listed forge
+// identity accepted the change. An unregistered category would redden
+// TestKnownCategoriesCoversEmittedCategories and make a fishhawk_await_audit
+// wait armed on it unsatisfiable.
+//
+// Counterfactual: delete the map entry — this test goes RED.
+func TestKnownCategories_MergeSettleMembersRefused(t *testing.T) {
+	if !IsKnownCategory("merge_settle_members_refused") {
+		t.Fatal("merge_settle_members_refused is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_StageFixupSuperseded pins the E86.54 / #4391 marker
+// rebaseRerunFailedMergeCandidateVerify appends when it supersedes a queued,
+// never-dispatched merge-candidate fix-up in place
+// (server/merge_candidate_rerun.go). An unregistered category would redden
+// TestKnownCategoriesCoversEmittedCategories and make a fishhawk_await_audit
+// wait armed on it unsatisfiable.
+//
+// Counterfactual: delete the map entry — this test goes RED.
+func TestKnownCategories_StageFixupSuperseded(t *testing.T) {
+	if !IsKnownCategory("stage_fixup_superseded") {
+		t.Fatal("stage_fixup_superseded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

@@ -543,8 +543,43 @@ func (s *Server) fetchApprovalsForStage(ctx context.Context, stage *run.Stage) (
 	if err != nil {
 		return nil, fmt.Errorf("get run: %w", err)
 	}
+	return approvalsForRun(runRow, stage.Type)
+}
+
+// errNoCachedWorkflowSpec is approvalsForRun's outcome for a run row with no
+// cached workflow spec (#4132): a legacy or non-dispatcher run, which can
+// carry no approvals block. Typed so a caller (mergeSettledMembersAdmit)
+// distinguishes it from an unreadable spec without string matching.
+var errNoCachedWorkflowSpec = errors.New("run has no cached workflow spec (legacy or non-dispatcher run)")
+
+// stageTypeNotInWorkflowError is approvalsForRun's outcome when the run's
+// workflow declares no stage of the asked type (#4132). Its message is
+// byte-identical to the pre-#4132 fmt.Errorf so existing callers and tests are
+// unaffected; stageTypeMissing detects it.
+type stageTypeNotInWorkflowError struct {
+	stageType  run.StageType
+	workflowID string
+}
+
+func (e *stageTypeNotInWorkflowError) Error() string {
+	return fmt.Sprintf("stage_type %q not in workflow %q", e.stageType, e.workflowID)
+}
+
+// stageTypeMissing reports whether err is (or wraps) a
+// stageTypeNotInWorkflowError.
+func stageTypeMissing(err error) bool {
+	var target *stageTypeNotInWorkflowError
+	return errors.As(err, &target)
+}
+
+// approvalsForRun is fetchApprovalsForStage's pure spec walk over an
+// already-loaded run row (#4132): (nil, errNoCachedWorkflowSpec) for no cached
+// spec, a wrapped parse error, a "workflow not in spec" error, a
+// *stageTypeNotInWorkflowError for a missing stage type, (nil, nil) for a
+// stage with no approvals-block gate, else the gate's Approvals.
+func approvalsForRun(runRow *run.Run, stageType run.StageType) (*spec.Approvals, error) {
 	if len(runRow.WorkflowSpec) == 0 {
-		return nil, errors.New("run has no cached workflow spec (legacy or non-dispatcher run)")
+		return nil, errNoCachedWorkflowSpec
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
@@ -555,7 +590,7 @@ func (s *Server) fetchApprovalsForStage(ctx context.Context, stage *run.Stage) (
 		return nil, fmt.Errorf("workflow %q not in spec", runRow.WorkflowID)
 	}
 	for _, stg := range wf.Stages {
-		if string(stg.Type) != string(stage.Type) {
+		if string(stg.Type) != string(stageType) {
 			continue
 		}
 		for _, gate := range stg.Gates {
@@ -566,7 +601,7 @@ func (s *Server) fetchApprovalsForStage(ctx context.Context, stage *run.Stage) (
 		// Stage exists but carries no approvals-block gate.
 		return nil, nil
 	}
-	return nil, fmt.Errorf("stage_type %q not in workflow %q", stage.Type, runRow.WorkflowID)
+	return nil, &stageTypeNotInWorkflowError{stageType: stageType, workflowID: runRow.WorkflowID}
 }
 
 // predicateOutcome is the discriminated result of resolvePredicates.

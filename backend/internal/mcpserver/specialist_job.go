@@ -37,7 +37,19 @@ const (
 	// its job in the SAME local-verify:unknown group its stages land in.
 	// (concurrency is not imported: it would pull pgx into fishhawk-mcp.)
 	specialistJobUnknownHost = "unknown"
+	// specialistJobAttestTokenEnv names the runner credential holding
+	// attest:specialist-jobs (E85.15 / #4363). The spawned runner inherits it
+	// through os.Environ() and prefers it over FISHHAWK_API_TOKEN; unset, the
+	// result records provenance bearer.
+	specialistJobAttestTokenEnv = "FISHHAWK_RUNNER_ATTEST_TOKEN"
 )
+
+// specialistJobBearerProvenanceWarning is the warning a spawn without
+// FISHHAWK_RUNNER_ATTEST_TOKEN carries: the result will be advisory.
+const specialistJobBearerProvenanceWarning = specialistJobAttestTokenEnv + " is unset: job %s's result will record provenance bearer " +
+	"(advisory, not ADR-089 D4 blocking-grade evidence). To make results runner_attested, issue a runner token with " +
+	"`fishhawkd token issue --subject specialist-runner/<host> --scopes attest:specialist-jobs` and export it as " +
+	specialistJobAttestTokenEnv + " in this process's environment"
 
 // RequestSpecialistJobInput is fishhawk_request_specialist_job's input.
 type RequestSpecialistJobInput struct {
@@ -107,8 +119,11 @@ Inputs:
   - runner_binary, spawn : optional.
 
 Returns the job, spawned, log_path and a next_step naming
-fishhawk_get_specialist_job. Results are bearer-provenance evidence, not a
-gate verdict.
+fishhawk_get_specialist_job. Results are evidence, not a gate verdict: a
+result records provenance runner_attested (blocking_eligible true) only when
+the spawned runner holds FISHHAWK_RUNNER_ATTEST_TOKEN (a token carrying
+attest:specialist-jobs) and signs it; otherwise it records bearer, and a
+spawn without that variable carries a warning saying so.
 
 Tool errors: path_outside_allowed_roots / working_dir refusals and an
 unresolvable runner binary (before any POST); validation_failed (400),
@@ -135,8 +150,9 @@ runner stops holding its local-verify slot within 2 minutes). Writes
 nothing.
 
 Returns the job (result carries verdict pass | fail | inconclusive plus the
-kind's evidence once completed), completed, timed_out, stale and, while the
-job is still live, a next_step to wait again.
+kind's evidence once completed, with provenance runner_attested | bearer and
+blocking_eligible, true only for runner_attested), completed, timed_out,
+stale and, while the job is still live, a next_step to wait again.
 `),
 	}, resolver.getSpecialistJob)
 }
@@ -209,6 +225,9 @@ func (r *runResolver) requestSpecialistJob(ctx context.Context, _ *mcp.CallToolR
 		return nil, out, nil
 	}
 	out.Spawned, out.LogPath = true, logPath
+	if r.getenv(specialistJobAttestTokenEnv) == "" {
+		out.Warnings = append(out.Warnings, fmt.Sprintf(specialistJobBearerProvenanceWarning, job.JobID))
+	}
 	return nil, out, nil
 }
 

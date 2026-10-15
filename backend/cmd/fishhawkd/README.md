@@ -826,8 +826,9 @@ spec edit resets precedent; the `doctrine_version_mismatch` column shows what th
 
 ## `approver-members`: the `approvals.members` dry-run and impact inventory (#4116)
 
-`approvals.members` is enforced as an exact-match approver allow-list at approval-row gates
-(contract: `backend/internal/server/README.md` § "`approvals.members` enforcement (#4116)"). This
+`approvals.members` is enforced as an exact-match approver allow-list at approval-row gates, and at
+merge-settled review gates against forge identities when the PR merges (#4132) (contract:
+`backend/internal/server/README.md` § "`approvals.members` enforcement (#4116)"). This
 command answers "who would that refuse?" BEFORE the enforcement ships or a members list changes,
 and is the impact inventory the AGENTS.md auth-change checklist asks for.
 
@@ -840,10 +841,13 @@ It parses `--spec` with `spec.ParseBytes` (v2 `defaults`/`extends` resolved, lik
 cached-spec read), collects every approval gate with a NON-EMPTY `approvals.members` (an empty or
 absent list restricts nobody — with none, it says so and exits 0 without reading the database), and
 reads one aggregate over `audit_entries` ⋈ `runs`: `approval_submitted` rows with
-`payload.decision = approve` and `ts >=` the lower bound, optionally for one `--repo`. Each row's
+`payload.decision = approve` and `ts >=` the lower bound, optionally for one `--repo`. Each gate is
+marked `enforced_at=merge` when it sits on a review stage declaring a `pull_request` input (it
+settles on PR merge, `stageSettlesOnMerge`), else `enforced_at=approval_row`. Each row's
 **principal** is the recorded `on_behalf_of` for a delegated row (the real operator, or the seated
 captain for an agent-kind delegation), else the actor subject. Every human principal is evaluated
-against EVERY members gate through the same `identity.SubjectListed` the gate runs, with a plain
+against EVERY `enforced_at=approval_row` members gate through the same `identity.SubjectListed` the
+gate runs (an `approval_submitted` principal can never reach a merge-settled gate), with a plain
 (unqualified) member qualified by `--forge` (default `github`) — so the inventory is an upper bound
 when gates carry different lists, since it does not join a row to the gate it was recorded at.
 
@@ -853,10 +857,13 @@ now-relative arithmetic). The two are **mutually exclusive**: passing both expli
 error (exclusivity is read from `flag.FlagSet.Visit`, so the `--window` default alone never
 conflicts with `--since`).
 
-**Output** (stdout): a header naming the effective lower bound and each members gate; three
-`note:` lines — merge-settled review gates (`resolveReviewStageOnMerge`) record no approval row and
-are not members-checked, so they are NOT in the inventory; every principal is evaluated against
-every gate; and the RLS caveat (`audit_entries` is FORCE row-level secured and the command sets no
+**Output** (stdout): a header naming the effective lower bound and each members gate as
+`gate <wf>/<stage> members=[...] enforced_at=<approval_row|merge>`; three `note:` lines —
+`enforced_at=merge` gates (`resolveReviewStageOnMerge`) are members-checked when the PR merges,
+against the forge-read merger and (GitHub) the latest-APPROVED reviewers, which are not
+`approval_submitted` rows, so the principal verdicts do not evaluate those gates and a refused merge
+is a `merge_settle_members_refused` audit row (#4132); every principal is evaluated against every
+approval-row members gate; and the RLS caveat (`audit_entries` is FORCE row-level secured and the command sets no
 `app.account_id`, so a role that is neither superuser nor `BYPASSRLS` sees only account-unscoped
 rows — a short inventory may be incomplete); then one line per principal and a summary:
 

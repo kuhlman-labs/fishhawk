@@ -684,8 +684,9 @@ components:
       type: object
       description: |
         One specialist job (ADR-097 D2, E85.9 / #4300). Never carries the
-        execution nonce.
-      required: [job_id, kind, state, requester, subject, inputs, requested_sequence, requested_at, last_seen_at, stale]
+        execution nonce. A completed job carries its result `provenance`
+        and `blocking_eligible` (E85.15 / #4363).
+      required: [job_id, kind, state, requester, subject, inputs, requested_sequence, requested_at, last_seen_at, blocking_eligible, stale]
       properties:
         job_id: { type: string, format: uuid }
         kind: { type: string, enum: [counterfactual_battery, fanin_build, overlap_scan, plan_crosscheck, inventory, draft] }
@@ -715,6 +716,22 @@ components:
         last_seen_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time }
         completed_at: { type: string, format: date-time }
+        provenance:
+          type: string
+          enum: [bearer, runner_attested]
+          description: |
+            Set only on a completed job (E85.15 / #4363). `runner_attested`:
+            the result carried an `X-Fishhawk-Signature` from the minting
+            attester that verified against the job's attestation key.
+            `bearer`: everything else — an unsigned result, a `draft`, or a
+            completion recorded before migration 0104.
+        blocking_eligible:
+          type: boolean
+          description: |
+            `specialistjob.BlockingEligible(provenance)`: true ONLY for
+            `runner_attested`, i.e. whether the result may count as ADR-089
+            D4 blocking-grade evidence. False on every job that is not a
+            runner-attested completion.
         stale:
           type: boolean
           description: Advisory — queued and unseen past the queue TTL, or running and unseen past JobHeartbeatTTL.
@@ -728,6 +745,26 @@ components:
         contended: { type: boolean, description: 'The group lock was held by another admission, so this call queued without deciding.' }
         taken_over: { type: boolean, description: "This admission replaced a stale running job's nonce." }
         job: { $ref: '#/components/schemas/SpecialistJob' }
+        attestation_key:
+          type: string
+          format: byte
+          description: |
+            E85.15 / #4363. The job-scoped Ed25519 PRIVATE key (64 bytes,
+            base64 std encoding), delivered ONCE: present only on the
+            admission that minted it — an ATTESTER's admission (an explicit
+            API token holding `attest:specialist-jobs`, not a cookie session
+            and not a run-bound `mcp:run:` token) that moved the job to
+            running, fresh or by takeover. Never present on a heartbeat, a
+            queued answer or a non-attester's admission. The server keeps
+            only the public half; the runner holds this in memory and signs
+            the result with it.
+        attestation_expires_at:
+          type: string
+          format: date-time
+          description: |
+            When the minted key expires (database clock; `AttestationTTL`,
+            5 minutes). Only the minting attester's same-nonce heartbeats
+            slide it. Present only together with `attestation_key`.
     Error:
       type: object
       required: [error]
@@ -2593,12 +2630,55 @@ components:
             the queue is unwired, the run has no active entry (never queued,
             or its entry settled), or the store read fails (best-effort — the
             run read never fails on it).
+        merge_candidate_rerun:
+          $ref: '#/components/schemas/RunMergeCandidateRerun'
+          description: |
+            ADVISORY verify-only re-run signal (E86.54 / #4391): the run's
+            newest merge-candidate verdict FAILED and nothing has re-opened or
+            rewritten the head since, so `POST /v0/runs/{run_id}/rebase-branch`
+            with `rerun_failed_verify: true` is legal. Emitted by
+            `GET /v0/runs/{run_id}` ONLY, audit-first with no forge call, and
+            best-effort (a read error omits it). Omitted otherwise.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunMergeCandidateRerun:
+      type: object
+      description: |
+        The advisory verify-only re-run signal (E86.54 / #4391). Present when
+        the run is non-terminal, its newest `merge_candidate_verified` row is
+        `failed`, no `stage_merge_candidate_verify_triggered` row and no
+        head-writing row (`fixup_pushed`, `conflict_resolution_pushed`,
+        `child_pushed`, `operator_commit_vouched`, a performed
+        `branch_rebased`) follows it, and the implement stage is either at its
+        review gate (`succeeded` / `awaiting_approval`) or `pending` /
+        `awaiting_host_dispatch` behind a queued, never-dispatched ADR-090 D6
+        fix-up that the verb's own eligibility predicate admits (including its
+        occupied-base pre-check), so it never offers a call the verb would
+        refuse up front. ADVISORY: the verb re-reads the live PR head and
+        re-checks eligibility under the stage's admission fence.
+      required: [head_sha, cause, failed_sequence, note]
+      properties:
+        head_sha: { type: string, description: The head the failed verdict judged. }
+        cause:
+          type: string
+          description: "The failed pass's cause: `base_advance`, `conflict_resolution` or `fan_in`."
+        failed_sequence:
+          type: integer
+          format: int64
+          description: "The failed `merge_candidate_verified` row's chain sequence; a re-run voids exactly that row."
+        queued_fixup_stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: "The implement stage holding the queued D6 fix-up the re-run would supersede in place and refund; omitted at the review gate."
+        queued_fixup_sequence:
+          type: integer
+          format: int64
+          description: "That fix-up's `stage_fixup_triggered` chain sequence; omitted at the review gate."
+        note: { type: string, description: "What the re-run would do, in one sentence." }
 
     RunMergeCandidateQueue:
       type: object
@@ -3274,6 +3354,37 @@ components:
             `history_incomplete=true` when the store read fails.
         merge_candidate_verdict:
           $ref: '#/components/schemas/GateViewMergeCandidateVerdict'
+        specialist_jobs:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewSpecialistJob' }
+          description: |
+            E85.15 / #4363. The run's COMPLETED specialist jobs (those whose
+            `subject.run_id` is this run, in the run's account) in
+            `completed_sequence` order, at most 100. DISPLAY-ONLY: it feeds no
+            gate, merge or advance decision. Enum and id members only, so no
+            job-authored text reaches a caller, a run-bound `mcp:run:` caller
+            included. Omitted when the specialist-job store is not wired or
+            the run has no completed job; omitted with a `specialist_jobs`
+            `history_gaps` entry and `history_incomplete=true` when the run's
+            account id is unparseable or the read fails — never a failed
+            request.
+
+    GateViewSpecialistJob:
+      type: object
+      required: [job_id, kind, verdict, provenance, blocking_eligible, completed_sequence]
+      description: One completed specialist job in the gate view's `specialist_jobs` block (E85.15 / #4363).
+      properties:
+        job_id: { type: string, format: uuid }
+        kind: { type: string, enum: [counterfactual_battery, fanin_build, overlap_scan, plan_crosscheck, inventory, draft] }
+        verdict: { type: string, enum: [pass, fail, inconclusive] }
+        provenance:
+          type: string
+          enum: [bearer, runner_attested]
+          description: As on `SpecialistJob.provenance`.
+        blocking_eligible:
+          type: boolean
+          description: True ONLY for `runner_attested` (`specialistjob.BlockingEligible`).
+        completed_sequence: { type: integer, format: int64, description: 'Audit sequence of the specialist_job_completed entry.' }
 
     GateViewMergeCandidateVerdict:
       type: object
@@ -3860,7 +3971,7 @@ components:
         One fix-up routing claim reconstructed from the
         `stage_fixup_triggered` entry that named this concern, joined to the
         outcome from the earliest following `fixup_pushed` / `fixup_no_changes`
-        / `stage_fixup_recovered`.
+        / `stage_fixup_recovered`, or a confirmed `stage_fixup_superseded`.
       required: [sequence, outcome]
       properties:
         sequence: { type: integer, format: int64 }
@@ -3869,15 +3980,20 @@ components:
           description: The operator/driver routing reason recorded on the trigger.
         outcome:
           type: string
-          enum: [pushed, no_changes, recovered, pending]
+          enum: [pushed, no_changes, recovered, superseded, pending]
           description: |
             `pushed` — a fix-up commit landed; `no_changes` — the pass
             produced nothing; `recovered` — the pass FAILED and the stage was
             restored to its pre-fix-up gate (#3395; delivered-nothing when the
             `stage_fixup_recovered` audit entry carries
             `delivered_nothing:true` — a pass that pushed and then died still
-            reads `pushed`, the earliest following outcome wins); `pending` —
-            no following outcome entry yet.
+            reads `pushed`, the earliest following outcome wins);
+            `superseded` — the operator's verify-only re-run superseded this
+            queued, never-dispatched fix-up in place (E86.54 / #4391): a
+            `stage_fixup_superseded` marker naming this trigger, confirmed by a
+            following conversion trigger, with no outcome sequenced before the
+            marker (an inert marker never reads `superseded`); `pending` — no
+            following outcome entry yet.
         apply_path:
           type: string
           description: Fix-up apply provenance (`applied`/`agent`/…), present on a `pushed` outcome.
@@ -13518,7 +13634,9 @@ paths:
         stage re-opens. The pass has its OWN per-head idempotency and never
         reads or spends the fix-up budget. The already-up-to-date arm
         re-triggers when the live head is an `unverified` Fishhawk-written head
-        (e.g. after a conflict-resolution push). A pass that cannot start never
+        (e.g. after a conflict-resolution push) or an operator-vouched head
+        that brings in base commits the run's newest verified head lacks
+        (ADR-090 D8 Amendment 1, #4368). A pass that cannot start never
         fails the rebase: the refusal rides on the 200 as
         `merge_candidate_verify_refusal`, and `POST /v0/runs/{run_id}/merge`
         refuses the head `409 merge_candidate_unverified` until a `passed`
@@ -13538,11 +13656,26 @@ paths:
         then starts a fresh pass through the unchanged start path (direct for
         `fan_in`, the ADR-092 queue for `base_advance`/`conflict_resolution`,
         so it may answer `held`). The 200 carries
-        `merge_candidate_verify_rerun: true`. When the stage is NOT at its gate
-        (e.g. a queued D6 fix-up left it `pending`) the call is refused on
-        `merge_candidate_verify_refusal` having written no verdict and no
-        trigger (the `branch_rebased` row still lands), naming
-        `fishhawk_dispatch_stage` for the queued fix-up. On any other head
+        `merge_candidate_verify_rerun: true`. When the stage is instead
+        `pending` or `awaiting_host_dispatch` behind a QUEUED, never-dispatched
+        ADR-090 D6 merge-candidate fix-up (E86.54), the call SUPERSEDES that
+        fix-up IN PLACE: under the stage's admission fence it appends a
+        `stage_fixup_superseded` marker, voids the failed verdict and starts
+        the pass, whose start writes a `stage_merge_candidate_verify_triggered`
+        conversion trigger carrying `supersedes_fixup_trigger_sequence`. There
+        is no stage transition: the stage keeps its place, its next dispatch
+        serves the verify-only pass in the local-verify group, and the
+        superseded fix-up pass is refunded. The 200 then also carries
+        `merge_candidate_fixup_superseded: true`. The conversion is refused on
+        `merge_candidate_verify_refusal` with NOTHING written (the
+        `branch_rebased` row still lands) unless the fix-up is the D6 route
+        (not operator-routed), was routed after the failed verdict, has no
+        dispatch, settle, retry or re-open row after it, has no slot-queue
+        waiter, and would not be held behind another run's active entry on the
+        base. If the pass is held anyway (another run went live after that
+        pre-check), the answer is `held` with the marker and the void landed
+        and the fix-up still dispatchable as a fix-up; the queue's admission
+        converts it. Any other stage state is refused. On any other head
         state, or on a call that PERFORMS a merge (the new head gets its own
         pass), the flag has no effect and `merge_candidate_verify_note` says so.
 
@@ -13671,7 +13804,10 @@ paths:
                       The live head's ADR-090 merge-candidate verify state after
                       this call (E83.33 / #4018). `not_required` when the
                       workflow declares no `executor.verify` command or the head
-                      is not one Fishhawk wrote. `held` (ADR-092 / #4200) when
+                      is not one Fishhawk wrote (an operator-vouched head is
+                      `not_required` only when it brings in no base commit the
+                      newest verified head lacks, ADR-090 D8 Amendment 1 /
+                      #4368). `held` (ADR-092 / #4200) when
                       the pass waits behind its base's live pass: nothing was
                       started, no trigger was appended, and `GET
                       /v0/runs/{run_id}`'s `merge_candidate_queue` names its
@@ -13693,7 +13829,9 @@ paths:
                       resolved new head (the decoded merge commit unless a
                       genuine concurrent push was observed, #4199); the
                       already-up-to-date arm re-triggers only for
-                      an `unverified` Fishhawk-written head — or, with
+                      an `unverified` Fishhawk-written head (or an
+                      operator-vouched head bringing in base commits, #4368) —
+                      or, with
                       `rerun_failed_verify`, a `failed` head whose verdict
                       this call voided (#4391).
                   merge_candidate_verify_stage_id:
@@ -13721,10 +13859,13 @@ paths:
                       `POST /v0/runs/{run_id}/merge` then refuses
                       `409 merge_candidate_unverified`. With
                       `rerun_failed_verify` it also names a refused re-run
-                      (the implement stage not at its gate, or the void append
-                      failing — nothing voided, nothing triggered), or a void
-                      that landed whose pass then could not start (the head is
-                      left `unverified`; re-invoke without the flag).
+                      (the implement stage neither at its gate nor holding an
+                      eligible queued D6 fix-up, or the void append failing —
+                      nothing voided, nothing triggered), a supersession that
+                      landed its marker but not its void (the fix-up stays
+                      dispatchable as a fix-up), or a void that landed whose
+                      pass then could not start (the head is left
+                      `unverified`; re-invoke without the flag).
                   merge_candidate_verify_rerun:
                     type: boolean
                     description: |
@@ -13732,6 +13873,14 @@ paths:
                       verdict for a `rerun_failed_verify` request (#4391); the
                       fields above report the pass that followed (`in_flight`,
                       or `held` behind the base's live pass).
+                  merge_candidate_fixup_superseded:
+                    type: boolean
+                    description: |
+                      True ONLY when THIS call superseded a queued,
+                      never-dispatched ADR-090 D6 fix-up IN PLACE (E86.54 /
+                      #4391): the implement stage kept its place (`pending` or
+                      `awaiting_host_dispatch`), its next dispatch serves the
+                      verify-only pass, and the fix-up pass is refunded.
         '202':
           description: |
             The base merge CONFLICTED and a bounded, agent-driven
@@ -14242,7 +14391,10 @@ paths:
            `merge_candidate_verified` result for that SHA — none or an
            in-flight pass is `409 merge_candidate_unverified`, a `failed` one
            is `409 merge_candidate_verify_failed` (D2). Runner-gated implement
-           and fix-up heads and operator-vouched heads need nothing more.
+           and fix-up heads need nothing more. An operator-vouched head needs
+           nothing more ONLY when it brings in no base commit the run's newest
+           verified head lacks: an operator merge of the base is classified
+           `base_advance` (ADR-090 D8 Amendment 1, #4368).
 
         Fail posture (D7): any read error on a fully wired run fails CLOSED
         with `502 merge_candidate_check_failed` and records nothing. A run the
@@ -14350,9 +14502,10 @@ paths:
             `POST /v0/runs/{run_id}/rebase-branch`, which also authorizes a
             verify-only merge-candidate pass for the new head when a verify
             command is declared, then re-invoke.
-            (6) The live head was written by Fishhawk and has no passing
-            merge-candidate verify for exactly that SHA
-            (`merge_candidate_unverified`, ADR-090 D2). `details` carry
+            (6) The live head was written by Fishhawk, or brings in base
+            commits through an operator-vouched merge (ADR-090 D8 Amendment 1,
+            #4368), and has no passing merge-candidate verify for exactly that
+            SHA (`merge_candidate_unverified`, ADR-090 D2). `details` carry
             `{run_id, pr_url, head_sha, cause, verify_state, next_step}` where
             `cause` is `base_advance` / `conflict_resolution` / `fan_in` and
             `verify_state` is `unverified` (next step
@@ -18635,7 +18788,10 @@ paths:
         **Auth.** `write:stages` from a seat identity. A run-bound
         (`mcp:run:<uuid>`) token is refused
         `specialist_job_requester_not_a_seat` even when it carries
-        `write:stages`.
+        `write:stages`. `attest:specialist-jobs` (the runner credential,
+        E85.15 / #4363) is NOT accepted here: a token holding only that scope
+        is refused `insufficient_scope`, so a runner credential can never
+        request a job.
       tags: [runs]
       requestBody:
         required: true
@@ -18657,7 +18813,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` (no `write:stages`) or `specialist_job_requester_not_a_seat` (a run-bound token).
+            `insufficient_scope` (no `write:stages`; `attest:specialist-jobs` alone does not satisfy it) or `specialist_job_requester_not_a_seat` (a run-bound token).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18692,9 +18848,13 @@ paths:
       summary: Read one specialist job
       description: |
         The job's state, requester, subject, inputs, admission group, verdict
-        and composed `result`, plus a derived advisory `stale` flag. NEVER
-        returns the execution nonce (it is the running runner's capability to
-        ship the result). Auth: `read:runs`; the job's own account only.
+        and composed `result`, the result's `provenance` and
+        `blocking_eligible` once completed (E85.15 / #4363), plus a derived
+        advisory `stale` flag. NEVER returns the execution nonce (it is the
+        running runner's capability to ship the result). Auth: `read:runs`
+        OR `attest:specialist-jobs` (the runner credential); a cookie session
+        bypasses the scope check, as on every write-scoped route; the job's
+        own account only.
       tags: [runs]
       parameters:
         - name: job_id
@@ -18716,7 +18876,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` — no `read:runs`.
+            `insufficient_scope` — a token holding neither `read:runs` nor `attest:specialist-jobs` (`details.accepted_scopes` names both).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18754,7 +18914,25 @@ paths:
         heartbeat; a DIFFERENT nonce is refused while the heartbeat is fresh
         and, once it is stale past `JobHeartbeatTTL`, the job is TAKEN OVER
         under the new nonce (`taken_over: true`, a
-        `specialist_job_taken_over` audit entry). Auth: `write:stages`.
+        `specialist_job_taken_over` audit entry).
+
+        Result attestation (E85.15 / #4363): when the caller is an ATTESTER
+        — an explicit API token holding `attest:specialist-jobs` whose
+        subject is not a run-bound `mcp:run:` token (never a cookie session,
+        never a plain `write:stages` bearer) — an admission that moves the
+        job to running (fresh or by takeover) mints a job-scoped Ed25519 key
+        and returns its private half ONCE as `attestation_key`, with
+        `attestation_expires_at`. The server stores only the public half,
+        bound to the job, the admitting nonce and the minting token's
+        SUBJECT (same-subject tokens are interchangeable attesters). Only
+        that attester's same-nonce heartbeats slide the expiry; a heartbeat
+        never re-delivers the key. A non-attester admission that moves the
+        job to running clears any stored key, so a takeover always
+        invalidates the previous runner's key. Attesters are recorded as
+        `actor_kind: system` under their token subject.
+
+        Auth: `write:stages` OR `attest:specialist-jobs`; a cookie session
+        bypasses the scope check, as on every write-scoped route.
       tags: [runs]
       parameters:
         - name: job_id
@@ -18787,7 +18965,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` — no `write:stages`.
+            `insufficient_scope` — a token holding neither `write:stages` nor `attest:specialist-jobs` (`details.accepted_scopes` names both).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18830,16 +19008,43 @@ paths:
         The runner's `specialist-job-v1` `$defs.completion`, validated by
         `specialistjob.ParseCompletion` against the STORED job kind. Records
         `specialist_job_completed` (verdict, reason, evidence, requester from
-        the job row, `charged_to`, `provenance: bearer` — shipped under the
-        forwarded operator bearer, not runner-signed) and sets the job
-        completed in one transaction. Writes ONLY `specialist_jobs` and the
-        audit chain, never a run or stage row. Auth: `write:stages`.
+        the job row, `charged_to`, `provenance`, `blocking_eligible`, and
+        `attested_by` when runner-attested) and sets the job completed in one
+        transaction. Writes ONLY `specialist_jobs` and the audit chain, never
+        a run or stage row.
+
+        Provenance (E85.15 / #4363): a result carrying `X-Fishhawk-Signature`
+        is verified on the locked job row, after the state and nonce checks,
+        against the key minted at admission. The signature is Ed25519 over
+        `ResultMessage(job_id, body)` = sha256(`fishhawk-specialist-job-result-v1`
+        NUL `job_id` NUL sha256(body)) of the EXACT request body bytes
+        (`docs/spec/specialist-job-v1.md` § "Result provenance and
+        attestation"). Verified → `provenance: runner_attested`,
+        `blocking_eligible: true`, the key is consumed (single use; a replay
+        is `409 specialist_job_not_running`), and the attester is recorded as
+        `actor_kind: system`. A result with NO header is accepted from any
+        caller the route scope admits and records `provenance: bearer`,
+        `blocking_eligible: false` (advisory, not ADR-089 D4 blocking-grade)
+        — exactly as before #4363. A refused signature writes nothing.
+
+        Auth: `write:stages` OR `attest:specialist-jobs`; a cookie session
+        bypasses the scope check, as on every write-scoped route. A signed
+        result additionally requires the caller to be an attester.
       tags: [runs]
       parameters:
         - name: job_id
           in: path
           required: true
           schema: { type: string, format: uuid }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: false
+          schema: { type: string, pattern: '^[0-9a-fA-F]*$' }
+          description: |
+            Optional. Hex-encoded Ed25519 signature (64 bytes) over
+            `ResultMessage(job_id, body)` with the job's attestation key.
+            Sent once; a repeated header is refused `signature_malformed`.
+            Absent → the result records `provenance: bearer`.
       requestBody:
         required: true
         content:
@@ -18857,10 +19062,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '401':
+          description: |
+            `unauthenticated` — authentication missing or invalid (see the shared Unauthorized response).
+            `specialist_job_attestation_invalid` — the result's `X-Fishhawk-Signature` was refused and nothing was written; `details.reason` names the FIRST failing check, in this order.
+            Before any store call: `signature_malformed` (the header is repeated or not hex), then `caller_not_attester` (the caller is not an attester, e.g. a plain `write:stages` bearer).
+            On the locked job row, after the state and nonce checks: `no_attestation_key` (the job holds no key: minted by no attester, cleared by a takeover, or already consumed), `attestation_expired` (past `attestation_expires_at` on the database clock), `subject_mismatch` (the caller is not the minting token's subject), `signature_malformed` (the decoded signature is not 64 bytes, an empty header included), `signature_invalid` (the signature does not verify over this job id and these exact body bytes).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: |
-            `insufficient_scope` — no `write:stages`.
+            `insufficient_scope` — a token holding neither `write:stages` nor `attest:specialist-jobs` (`details.accepted_scopes` names both).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -24996,13 +25209,19 @@ paths:
         `stage_fixup_triggered` windows once and asks ONE question per window
         — does it hold at least one delivered-nothing signal and NO
         `fixup_pushed` entry? A window refunds AT MOST ONCE however many
-        signals of however many kinds land inside it. Four signal shapes are
+        signals of however many kinds land inside it. Five signal shapes are
         unioned: `fixup_no_changes` (the re-dispatch produced no commit — not
         a crash), `dispatch_reaper_failed` with `failure_category` `C` (a
         pre-agent spawn-phase death), `stage_fixup_recovered` with
         `source_failure_category` `C` (a post-agent-work death on the
-        push/report), and `stage_fixup_recovered` with
-        `source_failure_category` `A` (a harness death that pushed nothing).
+        push/report), `stage_fixup_recovered` with
+        `source_failure_category` `A` (a harness death that pushed nothing),
+        and a CONFIRMED `stage_fixup_superseded` marker (E86.54 / #4391: the
+        operator's verify-only re-run superseded the queued, never-dispatched
+        D6 fix-up in place; confirmed only when a later
+        `stage_merge_candidate_verify_triggered` row names its fix-up trigger
+        in `supersedes_fixup_trigger_sequence` — not a crash, so it counts
+        toward `refunded_passes` but never `crashed_without_push`).
         A category-B (policy) failure still CONSUMES a pass — it is a verdict
         on delivered work, not a delivery failure — and the PUSH VETO applies
         UNIFORMLY: a pass that pushed a commit delivered something, so it
@@ -25255,7 +25474,7 @@ paths:
             `crashed_without_push`, the last counting the refunding windows
             whose delivered-nothing signal was a DEATH — a category-A or
             category-C crash that pushed nothing — and reporting 0 for a
-            window refunded only on `fixup_no_changes`, so an operator can see
+            window refunded only on `fixup_no_changes` or a confirmed supersession, so an operator can see
             whether they are overriding a real limit or a crash, #3085; a
             delivered-nothing refund also credits the ceiling up to 3 so the
             absolute cap is 6 triggered passes, and `details` additionally carry

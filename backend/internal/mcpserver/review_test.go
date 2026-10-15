@@ -3251,3 +3251,120 @@ func appendE2EAudit(t *testing.T, repo audit.Repository, runID uuid.UUID, stageI
 		t.Fatalf("AppendChained %s: %v", category, err)
 	}
 }
+
+// --- #4391 supersession arm of the live fix-up floor ---
+
+// seedRunAuditRow appends one run audit entry of category on stageID (empty =
+// no stage) after every previously seeded entry and returns its sequence.
+func seedRunAuditRow(fb *fakeBackend, runID uuid.UUID, category, stageID string, payload map[string]any) int64 {
+	var sid *string
+	if stageID != "" {
+		sid = &stageID
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	seq := int64(len(fb.perRunAuditByRun[runID]) + 1)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID: uuid.New().String(), Sequence: seq, RunID: runID.String(), StageID: sid, Category: category, Payload: payload,
+	})
+	return seq
+}
+
+// TestLatestImplementFixupSeq_Supersession (R6): a CONFIRMED
+// stage_fixup_superseded marker (a conversion trigger naming its fix-up
+// trigger follows it) voids that trigger, so the floor falls to the previous
+// live trigger; an inert marker followed by a dispatch or a push never voids;
+// and a failing marker or conversion read leaves every trigger live with NO
+// error. MECHANISM (CF): dropping confirmation (voiding on every marker)
+// voids the inert rows' trigger, and their floor drops below T; returning the
+// marker read error turns the read-error rows into an error.
+func TestLatestImplementFixupSeq_Supersession(t *testing.T) {
+	const stage = "11111111-1111-1111-1111-111111111111"
+	marker := func(tSeq int64) map[string]any {
+		return map[string]any{"trigger_sequence": tSeq, "superseded_by": "merge_candidate_verify_rerun"}
+	}
+	cases := []struct {
+		name     string
+		seed     func(fb *fakeBackend, runID uuid.UUID, tSeq int64)
+		failRead string
+		wantPrev bool // floor falls to the previous trigger (T voided)
+	}{
+		{"confirmed voids T", func(fb *fakeBackend, runID uuid.UUID, tSeq int64) {
+			seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, marker(tSeq))
+			seedRunAuditRow(fb, runID, categoryStageMergeCandidateVerifyTriggered, stage, map[string]any{"supersedes_fixup_trigger_sequence": tSeq})
+		}, "", true},
+		{"inert then dispatch keeps T", func(fb *fakeBackend, runID uuid.UUID, tSeq int64) {
+			seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, marker(tSeq))
+			seedRunAuditRow(fb, runID, "stage_concurrency_admitted", stage, map[string]any{"group": "local-implement:h1"})
+		}, "", false},
+		{"inert then push keeps T", func(fb *fakeBackend, runID uuid.UUID, tSeq int64) {
+			seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, marker(tSeq))
+			seedRunAuditRow(fb, runID, categoryFixupPushed, stage, map[string]any{"head_sha": "abc"})
+		}, "", false},
+		{"marker read error keeps T", func(fb *fakeBackend, runID uuid.UUID, tSeq int64) {
+			seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, marker(tSeq))
+			seedRunAuditRow(fb, runID, categoryStageMergeCandidateVerifyTriggered, stage, map[string]any{"supersedes_fixup_trigger_sequence": tSeq})
+		}, categoryStageFixupSuperseded, false},
+		{"conversion read error keeps T", func(fb *fakeBackend, runID uuid.UUID, tSeq int64) {
+			seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, marker(tSeq))
+			seedRunAuditRow(fb, runID, categoryStageMergeCandidateVerifyTriggered, stage, map[string]any{"supersedes_fixup_trigger_sequence": tSeq})
+		}, categoryStageMergeCandidateVerifyTriggered, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			prev := seedRunAuditRow(fb, runID, categoryStageFixupTriggered, stage, map[string]any{})
+			tSeq := seedRunAuditRow(fb, runID, categoryStageFixupTriggered, stage, map[string]any{"delegated": "merge_candidate_verify_failed"})
+			tc.seed(fb, runID, tSeq)
+			if tc.failRead != "" {
+				fb.reviewFlip = func(category string) {
+					if category == tc.failRead {
+						fb.perRunAuditStatus = http.StatusInternalServerError
+						return
+					}
+					fb.perRunAuditStatus = http.StatusOK
+				}
+			}
+			r := newResolver(srv, nil)
+
+			got, err := r.latestImplementFixupSeq(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("latestImplementFixupSeq errored: %v (the supersession reads are best-effort)", err)
+			}
+			want := tSeq
+			if tc.wantPrev {
+				want = prev
+			}
+			if got != want {
+				t.Errorf("floor = %d, want %d (previous trigger %d, T %d)", got, want, prev, tSeq)
+			}
+		})
+	}
+}
+
+// TestReviewStatusFor_Implement_CompleteAfterConfirmedSupersession (R6): the
+// round-1 verdicts resurface once a confirmed supersession voids the D6
+// trigger's floor, so the status reads complete with the prior round's
+// verdicts. MECHANISM (CF): deleting the supersessionFloorEntries call leaves
+// T as the floor and the status reads pending.
+func TestReviewStatusFor_Implement_CompleteAfterConfirmedSupersession(t *testing.T) {
+	const stage = "22222222-2222-2222-2222-222222222222"
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	seedImplementReviewAudit(fb, runID, withConcerns(2))
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	tSeq := seedRunAuditRow(fb, runID, categoryStageFixupTriggered, stage, map[string]any{"delegated": "merge_candidate_verify_failed"})
+	seedRunAuditRow(fb, runID, categoryStageFixupSuperseded, stage, map[string]any{"trigger_sequence": tSeq})
+	seedRunAuditRow(fb, runID, categoryStageMergeCandidateVerifyTriggered, stage, map[string]any{"supersedes_fixup_trigger_sequence": tSeq})
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" || len(st.Reviews) != 2 {
+		t.Errorf("status = %q with %d reviews, want complete with the 2 round-1 verdicts", st.Status, len(st.Reviews))
+	}
+}
