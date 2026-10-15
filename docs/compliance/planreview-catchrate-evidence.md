@@ -43,6 +43,20 @@ fifteen**, so their `samples_per_case` drops from 12 to 10
 record is not comparable for those arms: after the live calibration (Step 1c)
 an operator re-pins (Step 2, "The #4361 recording"). #4361 itself leaves
 `evidence.json` and `evidence.trials.json` untouched.
+
+**E55.20 / #4326 records the INSTRUMENT in the evidence**: a
+`catch_rule_version` (the full catch-rule text, on the record and its
+baseline) and a per-arm `input_digest` (each case's name, expectation class,
+exact input bytes and catch rule — not the rendered prompt, fixture, remit or
+documents). A baseline lacking or differing in either is not comparable. The
+committed 2026-10-15 record predates both terms, so `catchrategate` refuses
+it — by mode (4c) while the record is otherwise fresh, otherwise by the
+earlier STALE mode — and in either case the next recording must RE-PIN
+(Step 2), because the committed baseline is not comparable. By the campaign's
+batch rule that re-pin is the ONE combined operator re-recording made after
+every batched catch-rate trigger change (#3930, #4402, #4453, #4326, #4400)
+has merged; until then the refusal is by design. #4326 leaves `evidence.json`
+and `evidence.trials.json` untouched.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -54,7 +68,8 @@ is the operator's recording:
   the recorded evidence speaks to that, and only for the committed
   planted-defect shapes.
 - The gate command (`catchrategate`) passes on a current committed record
-  (not the legacy v1 pair: see the #4313 paragraph above) until the record
+  (not the legacy v1 pair, nor a record made before #4326: see the
+  paragraphs above) until the record
   goes stale (a prompt, corpus, fixture, model or catch-rule change),
   after which `scripts/check-review-prompt-eval` **fails closed on the next
   review-prompt change** until an operator re-measures.
@@ -73,7 +88,7 @@ model credential. The measurement is operator-executed and operator-paid.
 | pinned baseline, catch | any arm's catch rate is MORE than 0.10 below the SAME arm of the PINNED baseline |
 | pinned baseline, false alarm | any arm's false-alarm rate (`(false_alarms + undecodable) / clean trials`) is MORE than 0.10 above the SAME arm of the PINNED baseline |
 | power floor | any arm has fewer than 136 trials in an expectation class it has (catch, clean) — REFUSED, never passed |
-| comparability | the arm set, the generator model, or any arm's case set, expectation classes or samples per case differs from the baseline — refused unless the recording re-pins |
+| comparability | the arm set, the generator model, the catch rule (`catch_rule_version`), or any arm's case set, expectation classes, samples per case or case inputs (`input_digest`: a case's input bytes or catch rule, same case names) differs from the baseline — refused unless the recording re-pins. The treatment (rendered prompt, conventions fixture, remit, documents) is not an instrument term: changing it is what a recording measures |
 
 The baseline is PINNED, not rolling: a recording is never judged only against
 the previous one, so a series of in-tolerance drops cannot erode the
@@ -177,6 +192,82 @@ band:
   (`ErrPortabilityRepoSpecificFinding`; both files untouched, dry run
   included). Read the concern in the report: rework the remit (if it leaked a
   repository assumption) or the case; never delete the marker to pass.
+
+**#4402: the harder security catch cases.** #4402 replaced the six #4314
+catch cases (all at the ceiling, 34/34) with six harder cases under new
+names: `authz-account-check-behind-legacy-flag`,
+`failclosed-gate-lookup-timeout-proceeds`,
+`permission-instruction-path-case-fold-dropped`,
+`secret-signed-url-in-debug-retry-log`,
+`supplychain-installer-from-branch-version-pinned` and
+`trust-linked-issue-summary-one-call-out`. The four clean cases and
+`markers.json` are unchanged. Three steps:
+
+1. **Calibrate at the PR head, before merge.** Run ONE subset dry run over
+   the ten security case ids at 30 trials. Both security arms run (the
+   portability arm runs the four clean ids), and the per-trial miss classes
+   land in `planreview-diag.jsonl` (cost: 10 x 30 + 4 x 30 = 420
+   implement-review persona calls):
+
+   ```sh
+   FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=authz-account-check-behind-legacy-flag,failclosed-gate-lookup-timeout-proceeds,permission-instruction-path-case-fold-dropped,secret-signed-url-in-debug-retry-log,supplychain-installer-from-branch-version-pinned,trust-linked-issue-summary-one-call-out,clean-auth-helper-refactor,clean-ci-pinned-tool-bump,clean-policy-test-only,clean-redaction-helper-move \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
+     scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+   ```
+
+   The band-table alternative is `TestCatchRateCalibrationLive` with
+   `FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security` and then
+   `security_portability`, `FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30` (the
+   commands above). It reports scored counts only, so read the miss classes
+   from the subset dry run.
+2. **Accept a rate on reviewer misses only (the Step 1c rule).** A case is in
+   band (30%–80%) only when its misses are `not_mentioned`. Repair a
+   `no_probe` or `unattributed` miss by widening the case's probes or
+   attribution, never by loosening a probe the loader refuses. Rework an
+   out-of-band case through a routed fix-up. A case still out of band after
+   rework is recorded with its documented reason, which #4402's done-means
+   allows.
+3. **Re-pin in the next combined recording, not on the #4402 branch.** The
+   campaign batches every review-prompt-eval trigger change (#3930, #4402,
+   #4453, #4326, #4400) into ONE combined operator re-recording after all of
+   them merge, so the #4402 merge is not held for a re-pin. The changed case
+   set makes the `security` arm non-comparable for exactly that one pin
+   (`baselineComparable` compares case-name sets): that recording does not
+   check the arm for regression, and later pins compare normally. Until it
+   lands, `catchrategate` and `scripts/check-review-prompt-eval` fail on
+   `main`, naming the stale `security` arm, by design. The combined
+   recording uses this `PIN_REASON` text for the arm, folded into its own:
+   `#4402: six harder security catch cases replace the #4314 ceiling set; the security arm case set changed, so the baseline is not comparable`.
+
+**Calibration at 58f8062e (security arm, 30 trials/case).** The step-1 subset
+dry run at the PR head:
+
+| Case | Caught | Misses |
+|---|---|---|
+| `authz-account-check-behind-legacy-flag` | 29/30 | 1 undecodable |
+| `failclosed-gate-lookup-timeout-proceeds` | 30/30 | none |
+| `permission-instruction-path-case-fold-dropped` | 28/30 | 2 unattributed |
+| `secret-signed-url-in-debug-retry-log` | 30/30 | none |
+| `supplychain-installer-from-branch-version-pinned` | 30/30 | none |
+| `trust-linked-issue-summary-one-call-out` | 24/30 | 4 no_probe, 2 unattributed |
+
+- **Clean cases.** 0/120 false alarms on `security`. 4/120 on
+  `security_portability`, all on `clean-policy-test-only`, all in the
+  `verification` category.
+- **Generic-probe check.** No generic probe matched any trial: every catch
+  matched a defect-specific phrase.
+- **Miss classes.** 171/180 caught. All 8 decodable misses (the 4 `no_probe`
+  and 4 `unattributed` above) were real catches mis-attributed (category or
+  phrase), so the true rate is about 179/180. The
+  `trust-linked-issue-summary-one-call-out` misattributed catches used the
+  phrase `trusted prompt header`, which that case now carries as a probe.
+- **Ruling (Captain, 2026-10-15).** The six cases are accepted as documented
+  OUT-OF-BAND AT THE CEILING; #4402's done-means allows a documented reason.
+  No rework chases the band. Cross-context security cases (a defect visible
+  only against unchanged code, or outside the convention) are the follow-up
+  #4474. The `security` arm is re-pinned in the campaign's combined
+  re-recording (step 3).
 
 ## Step 1c — calibrate new conventions-arm cases (#4361)
 
@@ -331,8 +422,9 @@ Later recordings omit `PIN_REASON`; the pinned baseline is carried forward
 unchanged. Moving it is the separate, explicit action of setting
 `PIN_REASON` again: it still requires a passing measurement (including
 against the current baseline when that baseline is comparable) and records
-the reason and a timestamp in the evidence. After a corpus change the old
-baseline is not comparable, an ordinary recording is refused, and you re-pin.
+the reason and a timestamp in the evidence. After a corpus, catch-rule or
+case-input change (#4326) the old baseline is not comparable, an ordinary
+recording is refused, and you re-pin.
 
 **The #4253 recording is such a re-pin.** The case set changed (six cases to
 twelve), so `samples_per_case` changed too, and the 2026-10-10 baseline is not
@@ -513,8 +605,9 @@ jq -r '.arms | to_entries[] | .key as $arm | [.value.per_case[][] | select(.outc
   probes if they flag the planted defect, then check the widened set with
   `catchrategate --rescore` before re-recording.
 - Either change edits a `review_input.json`, so the record goes stale and
-  must be re-measured. The case set is unchanged, so the baseline stays
-  comparable; re-pinning is an explicit choice there, not forced.
+  must be re-measured. Since #4326 it also changes that arm's `input_digest`
+  (the case's input bytes and catch rule), so the baseline is NOT comparable
+  even though the case set is unchanged: the re-measurement must re-pin.
 
 **Distribution check (done-means of #4253).** A case at an extreme in BOTH
 arms — caught in every trial, or in at most one (with 10 samples per case
@@ -667,8 +760,10 @@ alarm (clean cases).
 The #4314 row's "Other arms" column names `security` catch and false alarm
 (with its security_lens / other_category trial split; the remainder of each
 false-alarm count is undecodable trials) and `security_portability` false
-alarm. All six security catch cases sit at ceiling (34/34 each), accepted by
-Captain ruling 2026-10-14; a harder corpus is #4402.
+alarm. All six #4314 security catch cases sat at ceiling (34/34 each), accepted by
+Captain ruling 2026-10-14. #4402 replaced them with six harder catch cases;
+their calibration and the `security` arm's re-pin follow Step 1b, "#4402: the
+harder security catch cases".
 
 ### Calibration dry runs
 
