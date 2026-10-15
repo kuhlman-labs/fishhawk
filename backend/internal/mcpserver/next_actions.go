@@ -108,6 +108,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -124,6 +125,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
 		return na
@@ -149,9 +151,51 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldLiveValidationAdvisory(run, na)
 	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
+	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
+}
+
+// foldMergeCandidateRerunAlternative APPENDS fishhawk_rebase_run_branch
+// rerun_failed_verify:true as an ALTERNATIVE — never the default, never
+// prepended — when the run read carries the advisory merge_candidate_rerun
+// block (E86.54 / #4391) and the run is non-terminal. The backend builds that
+// block from the verb's own eligibility predicate, so the action is never one
+// the verb would refuse up front; whether the failure was infrastructure is the
+// operator's judgement, which is why it is an alternative and carries a reason
+// placeholder. De-duplicated: an action already carrying rerun_failed_verify
+// is left alone. A no-op (na unchanged) without the block, on a terminal run,
+// or with a nil na.
+func foldMergeCandidateRerunAlternative(run *Run, na *NextActions) {
+	if na == nil || run == nil || run.MergeCandidateRerun == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] == "true" {
+			return
+		}
+	}
+	rr := run.MergeCandidateRerun
+	reason := "the newest merge-candidate verdict for " + rr.HeadSHA + " FAILED (sequence " + strconv.FormatInt(rr.FailedSequence, 10) +
+		"); when that failure was infrastructure, not the change, this voids it and starts a verify-only pass instead of spending a fix-up"
+	if rr.QueuedFixupSequence > 0 {
+		reason = "the newest merge-candidate verdict for " + rr.HeadSHA + " FAILED (sequence " + strconv.FormatInt(rr.FailedSequence, 10) +
+			") and its ADR-090 D6 fix-up (sequence " + strconv.FormatInt(rr.QueuedFixupSequence, 10) + ", stage " + rr.QueuedFixupStageID +
+			") is queued, never dispatched; when that failure was infrastructure, not the change, this supersedes the fix-up IN PLACE with a verify-only pass and refunds its fix-up pass (the stage keeps its place)"
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action: "fishhawk_rebase_run_branch",
+		Params: map[string]string{
+			"run_id":              run.ID,
+			"confirm":             "true",
+			"rerun_failed_verify": "true",
+			"reason":              "<why the failure was infrastructure, not the change>",
+		},
+		Precondition: "the merge-candidate verdict for " + rr.HeadSHA + " failed and the operator judges the failure infrastructure, not the change",
+		Consumes:     consumesNone,
+		Reason:       reason,
+	})
 }
 
 // failureSignatureFor adapts the run's failed stage into failuresig.Evidence

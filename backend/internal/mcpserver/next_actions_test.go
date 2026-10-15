@@ -6691,3 +6691,116 @@ func TestNextActions_AcceptanceStageFailedParked(t *testing.T) {
 		t.Fatalf("terminal failed run state = %q, want failed", failed.State)
 	}
 }
+
+// TestNextActions_MergeCandidateRerunAlternative (A2, E86.54 / #4391): with the
+// run read's advisory merge_candidate_rerun block present on a non-terminal
+// run, every nextActionsFor return path (ci_failed, review_coverage_incomplete
+// and the classify table) APPENDS exactly one fishhawk_rebase_run_branch
+// rerun_failed_verify:true action LAST — never first — with the exact params.
+// Absent without the block and on a terminal run; de-duplicated against an
+// existing rerun action.
+func TestNextActions_MergeCandidateRerunAlternative(t *testing.T) {
+	rerun := &runMergeCandidateRerun{HeadSHA: "bbbb", Cause: "base_advance", FailedSequence: 12,
+		QueuedFixupStageID: "s1", QueuedFixupSequence: 14}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")}
+	paths := []struct {
+		name  string
+		drive *DriveStatus
+	}{
+		{"ci_failed", &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}},
+		{"review_coverage_incomplete", &DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}},
+		{"classify", nil},
+	}
+	rerunActions := func(na *NextActions) []int {
+		var idx []int
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] == "true" {
+				idx = append(idx, i)
+			}
+		}
+		return idx
+	}
+	for _, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			r := naRun("running")
+			r.MergeCandidateRerun = rerun
+			na := nextActionsFor(r, stages, nil, nil, nil, p.drive, false, false, false, "", "", releaseSignals{})
+			idx := rerunActions(na)
+			if len(idx) != 1 {
+				t.Fatalf("rerun actions = %d in %+v, want exactly 1", len(idx), na.Actions)
+			}
+			if idx[0] == 0 {
+				t.Errorf("the rerun alternative is actions[0]; it must never be the default")
+			}
+			if idx[0] != len(na.Actions)-1 {
+				t.Errorf("the rerun alternative is at %d of %d, want appended last", idx[0], len(na.Actions))
+			}
+			a := na.Actions[idx[0]]
+			want := map[string]string{"run_id": r.ID, "confirm": "true", "rerun_failed_verify": "true",
+				"reason": "<why the failure was infrastructure, not the change>"}
+			if len(a.Params) != len(want) {
+				t.Errorf("params = %v, want exactly %v", a.Params, want)
+			}
+			for k, v := range want {
+				if a.Params[k] != v {
+					t.Errorf("params[%s] = %q, want %q", k, a.Params[k], v)
+				}
+			}
+			if a.Consumes != consumesNone {
+				t.Errorf("consumes = %q, want none", a.Consumes)
+			}
+			if !strings.Contains(a.Precondition, "bbbb") || !strings.Contains(a.Precondition, "infrastructure") {
+				t.Errorf("precondition = %q, want the failed head and the operator judgement named", a.Precondition)
+			}
+			if !strings.Contains(a.Reason, "sequence 14") || !strings.Contains(a.Reason, "IN PLACE") || !strings.Contains(a.Reason, "refunds") {
+				t.Errorf("reason = %q, want the queued fix-up it supersedes in place and refunds", a.Reason)
+			}
+		})
+	}
+
+	t.Run("gate reason names no fix-up", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateRerun = &runMergeCandidateRerun{HeadSHA: "bbbb", Cause: "base_advance", FailedSequence: 12}
+		na := nextActionsFor(r, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		idx := rerunActions(na)
+		if len(idx) != 1 {
+			t.Fatalf("rerun actions = %d, want 1", len(idx))
+		}
+		if reason := na.Actions[idx[0]].Reason; strings.Contains(reason, "IN PLACE") {
+			t.Errorf("reason = %q at the gate, want no queued fix-up named", reason)
+		}
+	})
+
+	t.Run("absent without the block", func(t *testing.T) {
+		na := nextActionsFor(naRun("running"), stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if idx := rerunActions(na); len(idx) != 0 {
+			t.Errorf("rerun actions = %d without the block, want 0", len(idx))
+		}
+	})
+
+	t.Run("absent on a terminal run", func(t *testing.T) {
+		for _, state := range []string{"succeeded", "failed", "cancelled"} {
+			r := naRun(state)
+			r.MergeCandidateRerun = rerun
+			na := nextActionsFor(r, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+			if na != nil {
+				if idx := rerunActions(na); len(idx) != 0 {
+					t.Errorf("%s run: rerun actions = %d, want 0", state, len(idx))
+				}
+			}
+		}
+	})
+
+	t.Run("de-duplicated", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateRerun = rerun
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_rebase_run_branch",
+			Params: map[string]string{"run_id": r.ID, "rerun_failed_verify": "true"}}}}
+		foldMergeCandidateRerunAlternative(r, na)
+		if len(na.Actions) != 1 {
+			t.Errorf("actions = %d after folding beside an existing rerun action, want 1", len(na.Actions))
+		}
+		foldMergeCandidateRerunAlternative(nil, na)
+		foldMergeCandidateRerunAlternative(r, nil) // must not panic
+	})
+}

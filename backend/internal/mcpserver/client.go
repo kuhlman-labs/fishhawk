@@ -378,6 +378,14 @@ type Run struct {
 	// the backend's runMergeCandidateQueuePayload or a field silently decodes to
 	// its zero value — the #371-class hand-maintained-wire-mirror trap.
 	MergeCandidateQueue *runMergeCandidateQueue `json:"merge_candidate_queue,omitempty" jsonschema:"the run's active ADR-092 merge-candidate queue entry: state held (waiting behind the base's live pass at position N, using no runner slot; admission is automatic) or live (holding the base's line, with its phase), plus the anchored head. Omitted when the run has no active entry"`
+	// MergeCandidateRerun mirrors the backend runResponse.merge_candidate_rerun
+	// (E86.54 / #4391): the ADVISORY verify-only re-run signal. The backend
+	// emits it on the SINGLE-run read only (handleGetRun); nil when no re-run
+	// is advertisable, on a read error, or against an older backend (the
+	// mixed-version degrade). The json tags MUST byte-match the backend's
+	// runMergeCandidateRerunPayload or a field silently decodes to its zero
+	// value — the #371-class hand-maintained-wire-mirror trap.
+	MergeCandidateRerun *runMergeCandidateRerun `json:"merge_candidate_rerun,omitempty" jsonschema:"advisory: the run's newest merge-candidate verdict FAILED and nothing re-opened or rewrote the head since, so fishhawk_rebase_run_branch rerun_failed_verify:true is legal — at the review gate, or superseding a queued never-dispatched ADR-090 D6 fix-up in place (queued_fixup_* name it). Omitted otherwise"`
 	CreatedAt           time.Time               `json:"created_at"`
 	UpdatedAt           time.Time               `json:"updated_at"`
 }
@@ -401,6 +409,19 @@ type runMergeCandidateQueue struct {
 	LiveRunID       string     `json:"live_run_id,omitempty" jsonschema:"the run holding the base's line (this run when live); omitted when the base has no live entry"`
 	EjectReason     string     `json:"eject_reason,omitempty"`
 	Note            string     `json:"note" jsonschema:"what happens next, in one sentence"`
+}
+
+// runMergeCandidateRerun mirrors the backend's runMergeCandidateRerunPayload
+// (E86.54 / #4391). The json tags MUST byte-match the backend or each field
+// silently decodes to its zero value. UNEXPORTED on the runMergeCandidateQueue
+// precedent (the package's exported surface is pinned).
+type runMergeCandidateRerun struct {
+	HeadSHA             string `json:"head_sha" jsonschema:"the head the failed verdict judged"`
+	Cause               string `json:"cause" jsonschema:"the failed pass's cause: base_advance, conflict_resolution or fan_in"`
+	FailedSequence      int64  `json:"failed_sequence" jsonschema:"the failed merge_candidate_verified row's chain sequence; a re-run voids exactly that row"`
+	QueuedFixupStageID  string `json:"queued_fixup_stage_id,omitempty" jsonschema:"the implement stage holding the queued, never-dispatched ADR-090 D6 fix-up the re-run would supersede in place and refund; omitted at the review gate"`
+	QueuedFixupSequence int64  `json:"queued_fixup_sequence,omitempty" jsonschema:"that fix-up's stage_fixup_triggered sequence; omitted at the review gate"`
+	Note                string `json:"note" jsonschema:"what the re-run would do, in one sentence"`
 }
 
 // runCompletionBlocked mirrors the backend's run-status completion_blocked block
@@ -465,6 +486,12 @@ func init() {
 		// siblings above: stored, retained through T1..T9, itemised out only at
 		// the diagnosis skeleton.
 		pathClassification{Path: "run.capabilities", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The advisory verify-only re-run signal (E86.54 / #4391). One
+		// constant-shape entry (no lists) the backend computes per single-run
+		// read, so it classifies like run.merge_candidate_queue: stored,
+		// retained through T1..T9, itemised out only at the diagnosis skeleton
+		// with GET /v0/runs/{id} as its retrieval pointer.
+		pathClassification{Path: "run.merge_candidate_rerun", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	)
 }
 
@@ -1117,7 +1144,7 @@ type gateViewDispute struct {
 type GateViewFixup struct {
 	Sequence  int64  `json:"sequence"`
 	Reason    string `json:"reason,omitempty"`
-	Outcome   string `json:"outcome"`
+	Outcome   string `json:"outcome" jsonschema:"pushed, no_changes, recovered, superseded (an operator verify-only re-run converted this queued, never-dispatched fix-up in place — E86.54 / #4391) or pending"`
 	ApplyPath string `json:"apply_path,omitempty"`
 	HeadSHA   string `json:"head_sha,omitempty"`
 }
@@ -3399,6 +3426,12 @@ type RebaseBranchResult struct {
 	// merge-candidate verdict for a rerun_failed_verify request (#4391); the
 	// fields above report the pass that follows (in_flight, or held).
 	MergeCandidateVerifyRerun bool `json:"merge_candidate_verify_rerun,omitempty"`
+	// MergeCandidateFixupSuperseded is true ONLY when THIS call superseded a
+	// queued, never-dispatched ADR-090 D6 fix-up IN PLACE (E86.54 / #4391): the
+	// implement stage kept its place (pending or awaiting_host_dispatch), its
+	// next dispatch serves the verify-only pass, and the fix-up pass is
+	// refunded.
+	MergeCandidateFixupSuperseded bool `json:"merge_candidate_fixup_superseded,omitempty"`
 }
 
 // RebaseRunBranch has the RUNNER advance its own lineage branch onto the
