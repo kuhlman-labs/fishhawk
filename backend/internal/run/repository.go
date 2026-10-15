@@ -466,6 +466,38 @@ type StageLiveRunCASTransitioner interface {
 	TransitionStageFromLiveRun(ctx context.Context, id uuid.UUID, from, to StageState) (*Stage, error)
 }
 
+// ConsolidatedPROpenLocker is an OPTIONAL capability on the concrete postgres
+// repo — the cross-process half of the decomposed parent's once-only
+// consolidated-PR open (#4110). The orchestrator's maybeOpenConsolidatedPR runs
+// its read-URL -> create -> record-artifact -> stamp-URL -> audit critical
+// section inside it, so two fishhawkd processes (Helm split mode puts the
+// child-completion sweeper on the worker pod and the event-driven settle on the
+// api pods) cannot both open a PR for the same parent.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner
+// is — widening Repository would break every manually-written full-interface
+// test fake — and probed with a type assertion by its consumer. A repo without
+// it (the in-memory fakes) leaves only the orchestrator's in-process mutex.
+type ConsolidatedPROpenLocker interface {
+	// WithConsolidatedPROpenLock runs fn while holding a cross-process mutual
+	// exclusion keyed on parentRunID. A concurrent call for the SAME run blocks
+	// until the holder's fn returns; calls for distinct runs never block each
+	// other. When the lock cannot be acquired (a database error, or ctx
+	// cancelled while waiting) fn is NOT run and the error is returned; fn's
+	// own error is returned unchanged.
+	//
+	// LOCK ORDER: callers take the orchestrator's in-process per-parent mutex
+	// FIRST and this session advisory lock SECOND, and every caller must keep
+	// that order. Taking the process mutex first means at most one goroutine
+	// per process holds or waits on a pooled connection for a given parent, and
+	// a fixed order across the two layers rules out a lock-order inversion.
+	// Residual: the process mutex is a plain sync.Mutex, so a goroutine waiting
+	// on it cannot observe ctx cancellation — it parks until the holder's forge
+	// calls return (the accepted #1936 stageAdmissionLocks posture). The wait on
+	// THIS lock is ctx-aware.
+	WithConsolidatedPROpenLock(ctx context.Context, parentRunID uuid.UUID, fn func(context.Context) error) error
+}
+
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / E44.5) that
 // returns just a run's account_id ("" for an untenanted NULL row, the account
 // UUID string otherwise) without materializing the whole run.
