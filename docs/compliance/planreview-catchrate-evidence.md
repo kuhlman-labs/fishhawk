@@ -233,6 +233,10 @@ depends on the class:
   polarity-bearing, multi-word phrasing: never a bare generic objection word,
   and never wording the issue or plan shows (mode m) or a non-catching example
   carries (mode j).
+- `truncated` (the generator response stopped at max_tokens) is neither: the
+  trial was never scored. The conventions arms record it as an undecodable
+  miss and keep running instead of aborting. A case whose rate is depressed by
+  `truncated` trials is re-measured, not accepted or reworked.
 
 Widen only for a concern that really flags the planted defect; one about
 another aspect of the criterion stays a miss and becomes a
@@ -524,6 +528,9 @@ Read the miss classes as two kinds of miss:
   and the concern's `raw_concerns` entry, then check a widened set with
   `catchrategate --rescore` before re-recording.
 - `undecodable` means no verdict decoded; read `response_excerpt`.
+- `truncated` means the generator response stopped at max_tokens, so no
+  verdict was scored. It is counted in `undecodable`, and the run continues
+  instead of aborting.
 
 **Probe a few cases before paying for a recording.** A subset dry run
 measures only the named cases (any arm's case directory names) at a reduced

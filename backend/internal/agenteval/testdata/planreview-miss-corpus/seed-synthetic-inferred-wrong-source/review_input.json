@@ -150,7 +150,14 @@
     "cites no place",
     "cites nowhere",
     "does not cite where",
-    "fails the warrant"
+    "fails the warrant",
+    "never states",
+    "link-expiry time",
+    "not a throttle window",
+    "no throttle window",
+    "no send limit",
+    "plan invented",
+    "cites no source"
   ],
   "attribution_phrases": [
     "a fourth post",
@@ -182,6 +189,16 @@
       "severity": "medium",
       "category": "correctness",
       "note": "ac-reset-throttle-fourth is inferred and blocking. It presents 30 minutes as the issue's window, but the only 30 minutes in the issue is how long a reset link stays valid; the issue asks that repeated requests be throttled and gives no count. Both the window and the count of three need a cited source, or the criterion should be non-blocking."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-reset-throttle-fourth introduces specific values the issue never states: in the issue 30 minutes is the link-expiry time, and the rationale cites no source for allowing three sends."
+    },
+    {
+      "severity": "medium",
+      "category": "warrant",
+      "note": "The issue states no throttle window and no send limit; the 30 minutes and the three sends in ac-reset-throttle-fourth are values the plan invented."
     }
   ],
   "non_catching_examples": [

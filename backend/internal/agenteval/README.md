@@ -887,14 +887,15 @@ untestable phrasing without the prompt's literal examples "robust", "clean",
 "handles edge cases"); and the E55.23 / #4361 subtler variants, built for a
 30-80% catch rate. Four of those hide the defect behind correct-looking
 surroundings: `seed-synthetic-contradicts-buried-clause` (the contradiction
-is the last clause of a long, otherwise correct criterion),
+is a narrow edge of the last clause of a long, otherwise correct criterion:
+the detail read's 200 goes "only to a project admin"),
 `seed-synthetic-inferred-wrong-source` (the rationale cites a real issue
 value from the wrong clause), `seed-synthetic-untestable-measurable-phrase`
 (a percentile and a named "latency budget" that nothing defines) and
 `seed-synthetic-restates-approach-observable` (an approach step wrapped in an
 HTTP status). Two reconstruct defect classes this repository hit:
 `seed-synthetic-contradicts-absent-vs-null` (absent vs null merge-patch
-semantics, #2787) and `seed-synthetic-unsatisfiable-stored-verbatim` (an
+semantics, #2787, carried by the criterion's `verify_hint`) and `seed-synthetic-unsatisfiable-stored-verbatim` (an
 unwarranted byte-exact round-trip the plan's own JSONB storage cannot
 satisfy, modeled on the re-encoding note in
 `backend/internal/server/comms_dispositions.go`). Whether each new case
@@ -1685,6 +1686,10 @@ whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
      a scoring miss.
   4. `not_mentioned`: no concern touched either half: a reviewer miss.
   5. `undecodable`: no decodable verdict.
+  6. `truncated`: the generate call stopped at max_tokens
+     (`anthropic.ErrResponseTruncated`); `RunCatchRateArm` records the trial
+     as undecodable (a miss, counted in `undecodable`) and continues, while
+     every other generate error still aborts the arm.
 - **Credential hygiene.** Every line passes, in order, `json.Marshal`,
   known-value redaction of `FISHHAWKD_ANTHROPIC_API_KEY`,
   `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`

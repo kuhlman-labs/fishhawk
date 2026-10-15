@@ -42,3 +42,17 @@ matched against each emitted concern's note and category), the
 no other criterion's), the `defect_phrases` the prompt-leak self-check reads,
 and the hand-written `catching_examples` / `non_catching_examples` the loader
 uses to prove the rule discriminates.
+
+## Calibration rework (Step 1c dry run, fix-up concern 4d935789)
+
+Miss class: `no_probe`. Real catches named `ac-reset-throttle-fourth` but
+matched no probe; they wrote "introduces specific values the issue never
+states", "in the issue 30 minutes is the link-expiry time, not a throttle
+window", "states no throttle window and no send limit", "values the plan
+invented" and "cites no source". Per the run-book's remedy for `no_probe`,
+the probes were widened: `never states`, `link-expiry time`, `not a throttle
+window`, `no throttle window`, `no send limit`, `plan invented`, `cites no
+source`. None occurs in the issue or plan (mode m) or in a
+non_catching_example (mode j). Two catching examples phrased that way were
+added; each scores CAUGHT only through the added probes. The issue, plan and
+attribution phrases are unchanged.

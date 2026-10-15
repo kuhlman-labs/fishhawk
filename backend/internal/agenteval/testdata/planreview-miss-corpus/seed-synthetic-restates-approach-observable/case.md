@@ -18,8 +18,9 @@ through a new component — the handler enqueues a scan job on `ScanQueue` and
 returns 202. The plan's explicit criterion `ac-upload-enqueues-scan` wraps that
 implementation fact in an HTTP observation: "POST /uploads returns HTTP 202
 after the handler enqueues a scan job on ScanQueue". It restates step 2 and is
-not what the issue asks to observe; no criterion checks that an infected file
-is never served. The implementation scanned through a different mechanism,
+not what the issue asks to observe. The issue's central guarantee has its own
+correct criterion, `ac-download-infected-410` (an infected file returns 410
+`file_infected`), so the restatement is the plan's only criterion defect. The implementation scanned through a different mechanism,
 acceptance failed the criterion, and triage classified it class-3.
 
 Mid-difficulty by design: unlike `seed-synthetic-restates-approach` ("the code
@@ -48,3 +49,22 @@ issue-fidelity phrasing beside the restatement phrasing), the
 no other criterion's), the `defect_phrases` the prompt-leak self-check reads,
 and the hand-written `catching_examples` / `non_catching_examples` the loader
 uses to prove the rule discriminates.
+
+## Calibration rework (Step 1c dry run, fix-up concern 4d935789)
+
+Miss class: mostly `not_mentioned` on the planted defect (1/7 caught). The
+original plan had an UNINTENDED, louder defect: no criterion covered the
+issue's central guarantee (an infected file makes `GET /files/{id}` return
+410 `file_infected`). 7/7 reviewers led with that gap and missed the planted
+restatement. The plan now carries the blocking explicit criterion
+`ac-download-infected-410`, and the test strategy names the infected-file
+handler test, so the planted restatement is the only criterion defect. The
+catching example that said "no criterion checks 410" and the non-catching
+example asking for an infected-file test were rewritten to match the new plan.
+
+The probes were also widened from real catches that matched no probe
+(`no_probe`): `approach restatement`, `partly an approach restatement`, `never
+states`, `never specifies`, `plan-chosen design value`. None occurs in the
+issue or plan (mode m) or in a non_catching_example (mode j). One catching
+example phrased that way was added; it scores CAUGHT only through the added
+probes.

@@ -64,7 +64,7 @@ func planReviewCatchLiveGate(t *testing.T) liveCredential {
 func planReviewCatchGeneratorConfig() anthropic.Config {
 	return anthropic.Config{
 		Model:     DefaultCatchRateGeneratorModel,
-		MaxTokens: 4096,
+		MaxTokens: 8192,
 		Timeout:   120 * time.Second,
 	}
 }
@@ -155,8 +155,8 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	if got[0].Model != "claude-sonnet-5-5" {
 		t.Errorf("generator client Model = %q, want %q", got[0].Model, "claude-sonnet-5-5")
 	}
-	if got[0].MaxTokens != 4096 {
-		t.Errorf("generator client MaxTokens = %d, want 4096", got[0].MaxTokens)
+	if got[0].MaxTokens != 8192 {
+		t.Errorf("generator client MaxTokens = %d, want 8192", got[0].MaxTokens)
 	}
 	if got[0].Timeout != 120*time.Second {
 		t.Errorf("generator client Timeout = %v, want 120s", got[0].Timeout)

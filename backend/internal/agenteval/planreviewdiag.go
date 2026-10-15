@@ -98,10 +98,14 @@ const (
 	CatchMissWrongLabel CatchMissClass = "category_mismatch"
 	// CatchMissUndecodable means the response carried no decodable verdict.
 	CatchMissUndecodable CatchMissClass = "undecodable"
+	// CatchMissTruncated means the generate call stopped at max_tokens, so no
+	// response was scored (an undecodable trial marked Truncated).
+	CatchMissTruncated CatchMissClass = "truncated"
 )
 
 // classifyCatchMiss returns a catch-case trial's miss class: "" for a clean
-// rule or a caught trial, CatchMissUndecodable for an undecodable one. A
+// rule or a caught trial, CatchMissTruncated for an undecodable trial marked
+// Truncated, CatchMissUndecodable for any other undecodable one. A
 // missed trial's concerns are read with the classifier's own matcher helpers,
 // in precedence order: a concern matching both halves under the wrong label
 // (CatchMissWrongLabel), else a probe without attribution
@@ -113,6 +117,9 @@ func classifyCatchMiss(tr CatchTrial, rule CatchRule) CatchMissClass {
 	}
 	switch tr.Outcome {
 	case CatchUndecodable:
+		if tr.Truncated {
+			return CatchMissTruncated
+		}
 		return CatchMissUndecodable
 	case CatchMissed:
 	default:

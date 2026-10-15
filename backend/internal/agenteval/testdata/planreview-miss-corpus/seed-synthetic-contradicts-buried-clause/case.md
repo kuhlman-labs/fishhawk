@@ -17,15 +17,19 @@ it stays readable by its members — `GET /projects/{id}` keeps returning 200
 for a member. The plan's explicit criterion `ac-archive-by-admin` is one long
 statement whose first clauses match the issue (200 with the project,
 `archived_at` set, hidden from the list for every caller) and whose last
-clause requires a member's `GET /projects/{id}` to return 404. Approach step 2
-adds `archived_at IS NULL` to the predicate the list and detail reads share,
-so the plan is internally consistent. The implementation followed the issue,
+clause says `GET /projects/{id}` returns 200 with the project "only to a
+project admin", which shuts out every member who is not an admin. Approach
+step 2 adds `archived_at IS NULL` to the list read and applies the admin role
+check to an archived project's detail read, so the plan is internally
+consistent. The implementation followed the issue,
 acceptance failed the criterion on its last clause, and triage classified it
 class-3.
 
-Mid-difficulty by design: the contradiction is one clause among several
-correct ones, so a reviewer who checks the criterion's opening against the
-issue sees it match and moves on.
+Mid-difficulty by design: the contradiction is one narrow edge of one
+clause among several correct ones. The clause even promises the 200 the issue
+asks for, and only the trailing "only to a project admin" narrows who gets
+it, so a reviewer who checks the criterion's status codes against the issue
+sees them match and moves on.
 
 ## The planted defect
 
@@ -44,3 +48,23 @@ matched against each emitted concern's note and category), the
 no other criterion's), the `defect_phrases` the prompt-leak self-check reads,
 and the hand-written `catching_examples` / `non_catching_examples` the loader
 uses to prove the rule discriminates.
+
+## Calibration rework (Step 1c dry run, fix-up concern 4d935789)
+
+Miss class: none. The case scored 30/30, ABOVE the band (too easy): the last
+clause's 404 was a blatant inversion of the issue's 200. The defect was made
+subtler by narrowing it to an edge that only some callers hit. The clause now
+grants the detail read with a 200 "only to a project admin", so only members
+who are not admins are wrong-footed. `miss.json` carries the new statement and
+observation. The attribution phrases follow the statement: `a member's get
+/projects/{id}` is gone and `only to a project admin` is added (mode p: it
+occurs in no sibling statement). The defect phrases gained `only to a project
+admin`. Probes for the narrowed shape were added, such as `not only to a project
+admin`, `members who are not admins`, `excludes members`, `loses read access`
+and `narrows the detail read`. The catching examples were rewritten for the
+new shape, and one is attributed through `only to a project admin` alone. A non_catching_example that names the planted criterion and uses
+admin vocabulary about the archive endpoint proves the added probes
+discriminate. No added probe occurs in the issue or plan (mode m) or in a
+non_catching_example (mode j). The C3 widening fixture
+(`TestCatchCorpusWidening_RepairsScoringMissClasses`) still holds:
+`sets archived_at on the project` remains in the planted statement only.

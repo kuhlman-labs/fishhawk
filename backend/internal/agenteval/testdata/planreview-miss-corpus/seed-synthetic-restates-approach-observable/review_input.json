@@ -61,7 +61,7 @@
       }
     ],
     "verification": {
-      "test_strategy": "Handler tests with a fake scanner: a pending file returns 409, a clean one returns its bytes, and the upload returns 202. A worker test with a fake clamd sets each status.",
+      "test_strategy": "Handler tests with a fake scanner: a pending file returns 409, an infected one returns 410 file_infected, a clean one returns its bytes, and the upload returns 202. A worker test with a fake clamd sets each status.",
       "rollback_plan": "Revert the PR and run the 0052 down migration; uploads are served unscanned again.",
       "acceptance_criteria": [
         {
@@ -73,6 +73,12 @@
         {
           "id": "ac-download-pending-409",
           "statement": "GET /files/{id} while the file's scan is pending returns HTTP 409 with error code scan_pending.",
+          "source": "explicit",
+          "source_ref": "example-org/uploads-service#205"
+        },
+        {
+          "id": "ac-download-infected-410",
+          "statement": "GET /files/{id} for a file the scanner flagged as infected returns HTTP 410 with error code file_infected.",
           "source": "explicit",
           "source_ref": "example-org/uploads-service#205"
         },
@@ -131,7 +137,12 @@
     "marked as explicit",
     "labeled explicit",
     "labelled explicit",
-    "should be inferred"
+    "should be inferred",
+    "approach restatement",
+    "partly an approach restatement",
+    "never states",
+    "never specifies",
+    "plan-chosen design value"
   ],
   "attribution_phrases": [
     "enqueues a scan job",
@@ -161,7 +172,7 @@
     {
       "severity": "medium",
       "category": "correctness",
-      "note": "ac-upload-enqueues-scan reads like an outcome because it names a status code, but its substance is approach step 2: the handler enqueues on ScanQueue. That is an internal mechanism, not what the issue asks to observe. No criterion checks that an infected file returns 410 file_infected, which is the outcome the issue requires. Replace it with that observation."
+      "note": "ac-upload-enqueues-scan reads like an outcome because it names a status code, but its substance is approach step 2: the handler enqueues on ScanQueue. That is an internal mechanism, not what the issue asks to observe. ac-download-infected-410 already observes the outcome the issue requires, so this criterion adds only the mechanism; drop it, or replace it with an observation that the upload returns before the scan finishes."
     },
     {
       "severity": "medium",
@@ -172,6 +183,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "The criterion that POST /uploads returns 202 after the handler enqueues a scan job fails issue fidelity: the issue does not mention ScanQueue or a 202 response."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan is partly an approach restatement: the issue never states a 202 and never specifies a queue, so the enqueue is a plan-chosen design value, not an outcome a user can observe."
     }
   ],
   "non_catching_examples": [
@@ -205,9 +221,9 @@
       "note": "Approach step 2 stores the file before scanning; the storage bucket needs a lifecycle rule for files nobody downloads."
     },
     {
-      "severity": "medium",
+      "severity": "low",
       "category": "coverage",
-      "note": "The test strategy has no test for an infected file; add one asserting GET /files/{id} returns 410 with file_infected."
+      "note": "ac-download-infected-410 should also assert the 410 response body carries none of the uploaded bytes."
     }
   ]
 }

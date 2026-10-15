@@ -6,12 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -1440,6 +1446,22 @@ func TestRunCatchRateArm_FailClosed(t *testing.T) {
 			t.Errorf("a failed arm must return the zero report, got %+v", r)
 		}
 	})
+	t.Run("a generate error that does not wrap ErrResponseTruncated", func(t *testing.T) {
+		// Only the sentinel's IDENTITY makes a generate error a trial: an error
+		// that merely READS like truncation, or a refusal, still aborts the arm.
+		for _, genErr := range []error{
+			errors.New("anthropic: response truncated at max_tokens (8192 tokens); increase max_tokens"),
+			errors.New("anthropic: model refused to respond (stop_reason=refusal, category=general_harms)"),
+		} {
+			r, err := RunCatchRateArm(ctx, &fakeCatchRateSender{err: genErr}, cases, conv, ArmWithoutConventions, 2)
+			if !errors.Is(err, genErr) {
+				t.Fatalf("err = %v, want the generate error %q", err, genErr)
+			}
+			if r.PerCase != nil || r.Arm != "" {
+				t.Errorf("a failed arm must return the zero report, got %+v", r)
+			}
+		}
+	})
 	t.Run("samples < 1", func(t *testing.T) {
 		if _, err := RunCatchRateArm(ctx, ok, cases, conv, ArmWithoutConventions, 0); err == nil || !strings.Contains(err.Error(), "samples must be >= 1") {
 			t.Fatalf("err = %v", err)
@@ -1460,6 +1482,70 @@ func TestRunCatchRateArm_FailClosed(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// TestRunCatchRateArm_TruncatedTrialIsAMissAndContinues pins the one non-fatal
+// generate error: a response the real anthropic client reports as truncated at
+// max_tokens (anthropic.ErrResponseTruncated) is an UNDECODABLE trial marked
+// Truncated, counted in Undecodable with diagnostic miss class `truncated`, and
+// the arm runs every remaining sample.
+func TestRunCatchRateArm_TruncatedTrialIsAMissAndContinues(t *testing.T) {
+	cases, conv := loadCommittedCatch(t)
+	c := cases[0]
+	caught := catchVerdictJSON(t, c.Input.CatchingExamples[0])
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		stop, text := "end_turn", caught
+		if requests == 2 {
+			stop, text = "max_tokens", `{"verdict":"approve_with_concerns","concerns":[{"note":"trunc`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_test", "type": "message", "role": "assistant",
+			"content":     []map[string]string{{"type": "text", "text": text}},
+			"model":       "claude-sonnet-5-5",
+			"stop_reason": stop,
+			"usage":       map[string]int{"input_tokens": 1, "output_tokens": 8192},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	sender := anthropic.NewClient(anthropic.Config{
+		APIKey: "test-key", Model: "claude-sonnet-5-5", MaxTokens: 8192, Timeout: 5 * time.Second,
+	}, option.WithBaseURL(srv.URL))
+
+	r, err := RunCatchRateArm(context.Background(), sender, cases[:1], conv, ArmWithoutConventions, 3)
+	if err != nil {
+		t.Fatalf("RunCatchRateArm: %v (a truncated response must be a trial, not an abort)", err)
+	}
+	if requests != 3 {
+		t.Errorf("server saw %d requests, want 3: the arm must continue past the truncated sample", requests)
+	}
+	if got := r.PerCase[c.Name]; got != (CaseCatchCounts{Trials: 3, Caught: 2, Undecodable: 1}) {
+		t.Errorf("counts = %+v, want 3 trials, 2 caught, 1 undecodable", got)
+	}
+	trials := r.Trials[c.Name]
+	if len(trials) != 3 {
+		t.Fatalf("recorded %d trials, want 3", len(trials))
+	}
+	rule := c.CatchRule()
+	for i, want := range []struct {
+		outcome   CatchOutcome
+		truncated bool
+		class     CatchMissClass
+	}{{CatchCaught, false, ""}, {CatchUndecodable, true, CatchMissTruncated}, {CatchCaught, false, ""}} {
+		tr := trials[i]
+		if tr.Outcome != want.outcome || tr.Truncated != want.truncated {
+			t.Errorf("trial %d = outcome %q truncated %v, want %q / %v", i+1, tr.Outcome, tr.Truncated, want.outcome, want.truncated)
+		}
+		if got := classifyCatchMiss(tr, rule); got != want.class {
+			t.Errorf("trial %d miss class = %q, want %q", i+1, got, want.class)
+		}
+	}
+	// An undecodable trial NOT marked Truncated keeps the undecodable class.
+	if got := classifyCatchMiss(CatchTrial{Outcome: CatchUndecodable, Response: "not json"}, rule); got != CatchMissUndecodable {
+		t.Errorf("unmarked undecodable miss class = %q, want %q", got, CatchMissUndecodable)
+	}
 }
 
 func TestSamplesPerCaseForPower(t *testing.T) {

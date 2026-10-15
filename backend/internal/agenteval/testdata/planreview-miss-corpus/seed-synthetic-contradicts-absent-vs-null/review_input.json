@@ -45,7 +45,7 @@
       },
       {
         "step": 3,
-        "description": "Add UpdateProfile to internal/store/profiles.go, writing all four columns from the ProfilePatch in one UPDATE (a nil pointer writes NULL)."
+        "description": "Add UpdateProfile to internal/store/profiles.go, writing all four columns from the ProfilePatch in one UPDATE."
       },
       {
         "step": 4,
@@ -70,9 +70,10 @@
         },
         {
           "id": "ac-patch-no-bio-key",
-          "statement": "A PATCH /profiles/{id} body with no bio key returns HTTP 200 and leaves the profile with no bio.",
+          "statement": "A PATCH /profiles/{id} body with no bio key returns HTTP 200 and applies the fields the body carries.",
           "source": "explicit",
-          "source_ref": "example-org/profiles-service#202"
+          "source_ref": "example-org/profiles-service#202",
+          "verify_hint": "Set bio to \"hello\", PATCH /profiles/u1 with {\"timezone\": \"UTC\"}, then read the profile back: timezone is \"UTC\" and bio is null."
         },
         {
           "id": "ac-patch-display-name-422",
@@ -146,36 +147,66 @@
     "contradict the issue",
     "conflict with the issue",
     "nothing in the issue permits",
-    "contradict the stated requirement"
+    "contradict the stated requirement",
+    "does not match the issue",
+    "weaker than the issue",
+    "cannot fail against the plan's defect",
+    "not falsifiable",
+    "vacuous",
+    "an existing bio keeps that exact value",
+    "stored bio to be unchanged",
+    "bio is left unchanged",
+    "expects the bio to be null",
+    "expects bio to be null",
+    "expects a null bio",
+    "expects the bio cleared",
+    "expects bio cleared",
+    "hint contradicts"
   ],
   "attribution_phrases": [
     "no bio key",
-    "leaves the profile with no bio"
+    "with no bio"
   ],
   "defect_phrases": [
     "left out of the body",
-    "no bio key"
+    "no bio key",
+    "bio is null"
   ],
   "catching_examples": [
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "ac-patch-no-bio-key contradicts the issue: a field left out of the merge-patch body is left unchanged and only a null clears it, so the criterion should leave bio unchanged."
+      "note": "ac-patch-no-bio-key's verify_hint contradicts the issue: a field left out of the merge-patch body is left unchanged and only a null clears it, so after a body without bio the bio should stay \"hello\", not read back as null."
     },
     {
       "severity": "high",
       "category": "correctness",
-      "note": "ac-patch-no-bio-key conflates absent and null. A body without bio must keep the stored bio, and approach step 1's *string fields cannot distinguish a missing key from a null either."
+      "note": "ac-patch-no-bio-key conflates absent and null in its verify_hint: it expects the bio to be null after a PATCH that sets only timezone, while the issue keeps the stored bio. Approach step 1's *string fields cannot distinguish a missing key from a null either."
     },
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "The criterion where a body with no bio key leaves the profile with no bio treats a missing key as a null, which the issue reserves for clearing; the stored bio should stay."
+      "note": "The statement for a body with no bio key reads fine, but its hint expects the bio cleared; the issue requires the opposite: an existing bio keeps that exact value."
     },
     {
       "severity": "high",
       "category": "correctness",
-      "note": "Criterion ac-patch-no-bio-key cites the issue as explicit yet contradicts it: the issue says a field left out of the body is left unchanged and only `null` clears. Approach step 3 writes NULL for every nil pointer, so the implementation would clear the bio too. Change the criterion to expect the stored bio unchanged, and decode into a structure that tells a missing key from a null."
+      "note": "Criterion ac-patch-no-bio-key is weaker than the issue as stated and wrong in its verify_hint: the issue says a field left out of the body is left unchanged, yet the hint reads bio back as null. Approach step 3 writes all four columns, so the implementation would clear the bio too. Expect the stored bio to be unchanged, and decode into a structure that tells a missing key from a null."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-patch-no-bio-key does not match the issue: as written it is not falsifiable and cannot fail against the plan's defect; it should require the stored bio to be unchanged."
+    },
+    {
+      "severity": "medium",
+      "category": "coverage",
+      "note": "ac-patch-no-bio-key is vacuous against approach step 3: nothing in it checks that the bio is left unchanged."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion on a PATCH body with no bio does not match the issue: its hint expects the bio cleared, but an omitted field keeps its stored value."
     }
   ],
   "non_catching_examples": [
@@ -207,6 +238,11 @@
       "severity": "low",
       "category": "documentation",
       "note": "Document PATCH /profiles/{id} and the display_name_required error in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-patch-no-bio-key: add a sibling test that a {\"bio\": null} body clears the bio."
     }
   ]
 }

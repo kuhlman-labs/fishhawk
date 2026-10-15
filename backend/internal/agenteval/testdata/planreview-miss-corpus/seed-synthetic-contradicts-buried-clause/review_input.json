@@ -45,7 +45,7 @@
       },
       {
         "step": 2,
-        "description": "Add ArchiveProject to internal/store/projects.go (UPDATE projects SET archived_at = now()), and add archived_at IS NULL to the projectVisible predicate that ListProjects and GetProject share."
+        "description": "Add ArchiveProject to internal/store/projects.go (UPDATE projects SET archived_at = now()), add archived_at IS NULL to ListProjects, and have GetProject apply the settings endpoints' admin role check to an archived project."
       },
       {
         "step": 3,
@@ -62,7 +62,7 @@
       "acceptance_criteria": [
         {
           "id": "ac-archive-by-admin",
-          "statement": "POST /projects/{id}/archive by a project admin returns HTTP 200 with the project, sets archived_at on the project, drops the project from GET /projects for every caller, and afterwards a member's GET /projects/{id} returns HTTP 404.",
+          "statement": "POST /projects/{id}/archive by a project admin returns HTTP 200 with the project, sets archived_at on the project, drops the project from GET /projects for every caller, and afterwards GET /projects/{id} returns HTTP 200 with the project only to a project admin.",
           "source": "explicit",
           "source_ref": "example-org/projects-service#201"
         },
@@ -134,37 +134,68 @@
     "contradict the issue",
     "conflict with the issue",
     "nothing in the issue permits",
-    "contradict the stated requirement"
+    "contradict the stated requirement",
+    "not only to a project admin",
+    "not only to admins",
+    "not only admins",
+    "not just admins",
+    "not just to admins",
+    "not just a project admin",
+    "to every member",
+    "by every member",
+    "for every member",
+    "every member, not",
+    "all members, not",
+    "any member's",
+    "excludes members",
+    "excludes non-admin",
+    "shuts out members",
+    "shuts members out",
+    "non-admin member",
+    "members who are not admins",
+    "members who aren't admins",
+    "narrows the detail read",
+    "restricts the detail read",
+    "detail read to admins",
+    "admin-only read",
+    "only admins can read",
+    "loses read access"
   ],
   "attribution_phrases": [
     "for every caller",
-    "a member's get /projects/{id}",
-    "drops the project from"
+    "drops the project from",
+    "only to a project admin"
   ],
   "defect_phrases": [
     "readable by its members",
-    "/projects/{id}/archive"
+    "/projects/{id}/archive",
+    "only to a project admin"
   ],
   "catching_examples": [
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "ac-archive-by-admin contradicts the issue: an archived project stays readable by its members, so a member's GET /projects/{id} must return 200, not 404."
+      "note": "ac-archive-by-admin contradicts the issue in its last clause: an archived project stays readable by its members, so GET /projects/{id} must return 200 to every member, not only to a project admin."
     },
     {
       "severity": "high",
       "category": "correctness",
-      "note": "ac-archive-by-admin bundles correct clauses with a last one that requires the opposite of the issue: after archiving, members lose read access, while the issue keeps GET /projects/{id} returning 200 for them. Approach step 2's shared projectVisible predicate produces the same 404."
+      "note": "ac-archive-by-admin bundles correct clauses with a last one that requires the opposite of the issue for ordinary members: after archiving, a member who is not an admin loses read access, while the issue keeps GET /projects/{id} returning 200 for a member. Approach step 2's admin check on GetProject produces the same refusal."
     },
     {
       "severity": "high",
       "category": "acceptance_criteria",
-      "note": "The criterion that drops the project from GET /projects for every caller also expects a member's GET /projects/{id} to return 404 afterwards; members can still read an archived project per the issue, so it should return 200 rather than 404."
+      "note": "The criterion that drops the project from GET /projects for every caller then grants the detail read only to a project admin; members who are not admins must still be able to read an archived project per the issue."
     },
     {
       "severity": "high",
       "category": "correctness",
-      "note": "Criterion ac-archive-by-admin is mostly right (200, archived_at, hidden from the list), but its final clause directly contradicts the issue it cites: the issue says an archived project stays readable by its members and GET /projects/{id} keeps returning 200 for a member. Approach step 2 adds archived_at IS NULL to the predicate GetProject shares, so the implementation would follow the wrong clause. Split the criterion and expect 200 for a member's detail read."
+      "note": "Criterion ac-archive-by-admin is mostly right (200, archived_at, hidden from the list), but its final clause narrows the detail read to admins, which directly contradicts the issue it cites: an archived project stays readable by its members. Split the criterion and expect 200 for any member's detail read."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "Granting GET /projects/{id} only to a project admin after archiving contradicts the issue: an archived project stays readable by its members."
     }
   ],
   "non_catching_examples": [
@@ -201,6 +232,11 @@
       "severity": "low",
       "category": "scope",
       "note": "An archived project no longer appears in GET /projects; the plan has no way for an admin to list archived projects to restore one."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-archive-by-admin: also assert that only a project admin can archive, with a second test for a caller who is not a member at all."
     }
   ]
 }

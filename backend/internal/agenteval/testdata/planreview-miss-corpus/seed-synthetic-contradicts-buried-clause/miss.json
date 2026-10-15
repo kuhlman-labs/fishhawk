@@ -9,12 +9,12 @@
   "misses": [
     {
       "criterion_id": "ac-archive-by-admin",
-      "statement": "POST /projects/{id}/archive by a project admin returns HTTP 200 with the project, sets archived_at on the project, drops the project from GET /projects for every caller, and afterwards a member's GET /projects/{id} returns HTTP 404.",
+      "statement": "POST /projects/{id}/archive by a project admin returns HTTP 200 with the project, sets archived_at on the project, drops the project from GET /projects for every caller, and afterwards GET /projects/{id} returns HTTP 200 with the project only to a project admin.",
       "source": "explicit",
       "source_ref": "example-org/projects-service#201",
-      "observed": "after an admin archived project p1, a member's GET /projects/p1 returned HTTP 200 with the project, as the issue requires; the criterion failed on its last clause",
-      "expected": "HTTP 404 for a member's GET /projects/{id} after archiving",
-      "steps_taken": "archived project p1 as its admin, then GET /projects/p1 as a member and read the status code",
+      "observed": "after an admin archived project p1, a member who is not a project admin got HTTP 200 with the project from GET /projects/p1, as the issue requires; the criterion failed on its last clause",
+      "expected": "GET /projects/{id} on an archived project returns the project to a project admin only",
+      "steps_taken": "archived project p1 as its admin, then GET /projects/p1 as a member who is not a project admin and read the status code",
       "expectation_basis": "criterion ac-archive-by-admin",
       "repro_handle": "curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer $MEMBER\" $TARGET/projects/p1",
       "result": "failed"
