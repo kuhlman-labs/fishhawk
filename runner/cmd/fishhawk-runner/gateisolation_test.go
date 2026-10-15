@@ -1423,7 +1423,17 @@ func TestGateContainer_EntrypointResetSmoke(t *testing.T) {
 	image := entrypointSmokeImage()
 	pull, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if out, err := exec.CommandContext(pull, rt.Kind.Binary(), "pull", "-q", image).CombinedOutput(); err != nil {
+	// Credential-free and bounded like requireGateImage's pull (#4337).
+	env, cleanup, err := gateTestImageEnv(rt)
+	defer cleanup()
+	if err != nil {
+		t.Skipf("image %s unavailable: %v", image, err)
+	}
+	pullArgv, err := rt.PullArgv(image)
+	if err != nil {
+		t.Skipf("image %s unavailable: %v", image, err)
+	}
+	if out, err := runImageCheckCmd(pull, pullArgv, env); err != nil {
 		t.Skipf("image %s unavailable: %v: %s", image, err, out)
 	}
 	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.DefaultProbes(), io.Discard)
