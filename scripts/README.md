@@ -3804,7 +3804,7 @@ visible sooner. The base ref goes through `env:`, not an inline
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: true
           cache-dependency-path: '**/go.sum'
 

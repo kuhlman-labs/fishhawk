@@ -336,7 +336,7 @@ run_static "$r"
 expect "s9n: \$BUILDPLATFORM and GOARCH=\${TARGETARCH} are not literals" 0 "check-gate-image: ok"
 
 run_static "$REPO_ROOT"
-expect "s10: the SHIPPED repo (deploy/gate-image/Dockerfile vs the real go.work, go.mods, workflows, scripts/test) passes" 0 "check-gate-image: ok" "GO_VERSION 1.25.6"
+expect "s10: the SHIPPED repo (deploy/gate-image/Dockerfile vs the real go.work, go.mods, workflows, scripts/test) passes" 0 "check-gate-image: ok" "GO_VERSION 1.26.9"
 
 r="$(mkfix s11a)"
 edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.7#'

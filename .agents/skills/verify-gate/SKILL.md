@@ -29,9 +29,9 @@ git status --short
 
 - **Live runner.** It may be holding the per-repository verify lock. A shell `verify` that meets a live holder **refuses immediately**. That refusal is final for that invocation: do NOT retry or poll it. Narrow to `scripts/test single -run TestX ./path/to/pkg/...` instead, or wait for the run to finish.
 - **Load average above ~4× the core count.** The host is starved, and unrelated tests will flake. Use the `diagnose-red` skill (orphaned agent processes) before running anything.
-- **Go newer than the 1.25 pin.** This can turn clean main red (e.g. jsonv2 under Go 1.27). Tell the user and propose `go env -w GOTOOLCHAIN=go1.25.6`. It writes their global Go env, so ask first.
-- **golangci-lint.** It must be v2.x, and CI pins **v2.8.0**. A newer local binary can pass while CI's gofmt fails. Pre-check formatting with the pinned version:
-  `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0 fmt --diff`
+- **Go newer than the 1.26 pin.** This can turn clean main red (e.g. jsonv2 under Go 1.27). Tell the user and propose `go env -w GOTOOLCHAIN=go1.26.9`. It writes their global Go env, so ask first.
+- **golangci-lint.** It must be v2.x, and CI pins **v2.12.2**. A newer local binary can pass while CI's gofmt fails. Pre-check formatting with the pinned version:
+  `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 fmt --diff`
 - **Docker down.** Backend tests need it for the shared testcontainers Postgres. Start Docker first.
 - **Dirty tree.** That's allowed: patch coverage diffs merge-base → work tree, so uncommitted edits are gated too.
 

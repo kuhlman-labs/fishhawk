@@ -20,14 +20,14 @@ ps -axo pid=,ppid=,pcpu=,etime=,comm= | sort -k3 -nr | head -15
 
 ## 2. Go toolchain drift
 
-`go env GOVERSION` newer than the `go 1.25.0` pin can turn clean main red. For example, Go 1.27's jsonv2 breaks `TestJSONEncodedLen_MatchesEncoder_Differential`.
+`go env GOVERSION` newer than the `go 1.26.0` pin can turn clean main red. For example, Go 1.27's jsonv2 breaks `TestJSONEncodedLen_MatchesEncoder_Differential`.
 
-- **Signal:** green in CI, and green with `GOTOOLCHAIN=go1.25.6 scripts/test single -run <Test> ./<pkg>/`.
-- **Fix:** propose `go env -w GOTOOLCHAIN=go1.25.6`; it's a global write, so ask first.
+- **Signal:** green in CI, and green with `GOTOOLCHAIN=go1.26.9 scripts/test single -run <Test> ./<pkg>/`.
+- **Fix:** propose `go env -w GOTOOLCHAIN=go1.26.9`; it's a global write, so ask first.
 
 ## 3. golangci-lint
 
-- **Version:** local must be v2.x. CI pins v2.8.0, and a newer local binary formats differently. Check with `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0 fmt --diff`.
+- **Version:** local must be v2.x. CI pins v2.12.2, and a newer local binary formats differently. Check with `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 fmt --diff`.
 - **Cross-worktree cache pollution:** a finding naming a path in a *different* worktree means a stale cache. Fix with `golangci-lint cache clean`, then re-run.
 - **Concurrency:** two concurrent lint/verify runs contend on golangci-lint's global lock. Check for another `scripts/test` process.
 

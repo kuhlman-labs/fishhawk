@@ -60,7 +60,7 @@ The chain closes in two halves:
   `:main`.
 
 Go parity with CI is MAJOR.MINOR only, because CI itself floats the patch
-(`go-version: '1.25'`); the Dockerfile's `GO_VERSION` is the repo's one exact
+(`go-version: '1.26'`); the Dockerfile's `GO_VERSION` is the repo's one exact
 patch pin.
 
 ## Local build
