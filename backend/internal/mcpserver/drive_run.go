@@ -207,6 +207,12 @@ const (
 	// with the same run_id once the operator provisions the target at the named
 	// head SHA.
 	stoppedAcceptanceNeedsTarget = "acceptance_needs_target"
+	// stoppedAcceptanceStageFailed is the stop for a run the server PARKED on a
+	// category-C acceptance failure (#4356): the run stays running with a
+	// failed acceptance stage below a still-open review stage, which the
+	// in-flight walk would otherwise poll to the deadline. Nothing is recorded
+	// or spawned; next_actions lead with fishhawk_retry_stage for the stage.
+	stoppedAcceptanceStageFailed = "acceptance_stage_failed"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -269,7 +275,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -666,6 +672,16 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		} else if pending {
 			out.StoppedReason = "decision_required:scope_amendment_requested"
 			out.NextActions = driveDecisionActions("scope_amendment_requested", runUUID, in.WorkingDir)
+			return nil, out, nil
+		}
+
+		// A failed acceptance stage on a non-terminal run is the server's
+		// category-C acceptance park (#4356): stop with the retry decision
+		// rather than polling the still-open review stage until the deadline.
+		// Nothing is recorded or spawned on this path.
+		if acc := stageByType(stages, "acceptance"); acc != nil && acc.State == "failed" {
+			out.StoppedReason = stoppedAcceptanceStageFailed
+			out.NextActions = acceptanceStageFailedNextActions(runRow, acc)
 			return nil, out, nil
 		}
 

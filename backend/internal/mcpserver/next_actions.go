@@ -727,6 +727,15 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 		return implementFailedNextActions(run, plan, stageByType(stages, "review"), impl)
 	}
 
+	// #4356: a non-terminal run with a FAILED acceptance stage is the server's
+	// category-C acceptance park — the run stays running and the stage stays
+	// retry-eligible. Checked BEFORE the cancelled/terminal arms and before the
+	// implement settled path, so an open-concern hint arm cannot mask the retry.
+	// A TERMINAL failed run keeps the bare {State: failed} arm below.
+	if acceptance != nil && acceptance.State == "failed" && !runStateIsTerminal(run.State) {
+		return acceptanceStageFailedNextActions(run, acceptance)
+	}
+
 	// A run cancelled by its PR closing without merge (#4082). Checked AHEAD
 	// of the generic terminal arm, which would read it as a bare cancelled.
 	if run.State == "cancelled" && review != nil && review.State == "cancelled" &&
@@ -1768,6 +1777,14 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance", acceptance)}
 	}
 
+	// #4356: a FAILED acceptance stage shipped no verdict for its current
+	// episode, so it is checked at the TOP of the terminal section, before any
+	// recorded-verdict arm: an older recorded verdict — even a passed one — must
+	// never route a failed stage to the merge ritual. Mirrors the server gate.
+	if acceptance.State == "failed" {
+		return acceptanceStageFailedNextActions(run, acceptance)
+	}
+
 	// E38.3 / #1877: a succeeded verdict-less acceptance stage that carries the
 	// out-of-scope skip marker was auto-terminated because the approved plan
 	// declared verification.out_of_scope with zero acceptance_criteria — a
@@ -1909,6 +1926,43 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		}
 	default:
 		return acceptanceOutcomeUnknownActions(run, acceptance)
+	}
+}
+
+// acceptanceStageFailedNextActions is the arm for an acceptance stage that
+// FAILED its own execution on a non-terminal run (#4356): the server parks a
+// category-C acceptance failure instead of failing the run, so the recovery is
+// a retry of the acceptance stage, with cancel as the abandon option. The state
+// is byte-equal to drive.RuleAcceptanceOutcomeUnknown and to the server gate
+// state a failed acceptance stage reads, so the surfaces cannot diverge. NOT a
+// product-issue filing state: a parked infra failure is a recovery path.
+func acceptanceStageFailedNextActions(run *Run, acceptance *Stage) *NextActions {
+	category, reason := "", ""
+	if acceptance.FailureCategory != nil {
+		category = *acceptance.FailureCategory
+	}
+	if acceptance.FailureReason != nil {
+		reason = *acceptance.FailureReason
+	}
+	return &NextActions{
+		State: "acceptance_settled_outcome_unknown",
+		Actions: []SuggestedAction{
+			{
+				Action: "fishhawk_retry_stage",
+				Params: map[string]string{"stage_id": acceptance.ID},
+				Precondition: fmt.Sprintf("the acceptance stage FAILED its own execution (failure_category %q, failure_reason %q) while the run stays non-terminal: the server parks a category-C acceptance failure instead of failing the run, up to %d parks per stage (#4356)",
+					category, reason, runpkg.InfraFailureParkRetryBudget),
+				Consumes: consumesRetryBudget,
+				Reason:   "the retry re-opens the acceptance stage failed -> pending; on the local runner follow with fishhawk_dispatch_stage for the acceptance stage. The run keeps its merge-candidate line entry while parked",
+			},
+			{
+				Action:       "fishhawk_cancel_run",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "you choose to abandon the run instead of retrying the acceptance stage",
+				Consumes:     consumesNone,
+				Reason:       "cancel this run (releases its merge-candidate line entry), then start a fresh one with fishhawk_start_run (consumes a new run)",
+			},
+		},
 	}
 }
 

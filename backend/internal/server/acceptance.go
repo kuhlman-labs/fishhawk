@@ -2040,7 +2040,13 @@ func arbitrationOutcomeSequence(payload []byte) (int64, bool) {
 //     cannot admit a merge over an unshipped re-run. NOT merge-eligible;
 //     the recovery is retry_stage (re-open + re-dispatch retires the marker).
 //   - acceptanceGateOutcomeUnknown— no readable verdict, the acceptance stage
-//     is terminal, and NO skip marker (the genuine settled-outcome-unknown hole).
+//     is terminal, and NO skip marker (the genuine settled-outcome-unknown hole);
+//     OR the acceptance stage FAILED its own execution (#4356), whatever
+//     outcome is recorded: a failed stage shipped no verdict for its current
+//     episode, so an older recorded outcome — even a passed one — never admits
+//     a merge. A category-C acceptance failure parks the run non-terminal, so
+//     the run-failed merge refusal no longer covers this shape; this check does.
+//     NOT merge-eligible; the recovery is retry_stage.
 //   - acceptanceGateOmitted       — no verdict, NO acceptance stage row at all,
 //     and the run carries an acceptance_stage_omitted marker (E72.1 / #3325:
 //     the plan declared acceptance_surface: none and the plan gate dropped the
@@ -2080,6 +2086,9 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 		if live && (!outcome.Recorded || outcome.Sequence < markerSeq) {
 			return acceptanceGateVerdictUnshipped, nil
 		}
+	}
+	if acc := acceptanceStageOf(stages); acc != nil && acc.State == run.StageStateFailed {
+		return acceptanceGateOutcomeUnknown, nil
 	}
 	if outcome.Recorded {
 		switch outcome.Verdict {

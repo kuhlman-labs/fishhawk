@@ -233,6 +233,14 @@ Emitters:
 
 Frontend mirrors the descriptions in `frontend/src/api/types.ts` (`FAILURE_DESCRIPTIONS`, `describeFailure`); rendered by `<FailureBanner>` (`frontend/src/components/failure-banner.tsx`) above the stage detail and as a category badge next to failed stages on the run-detail list.
 
+## Acceptance infrastructure park (#4356)
+
+`infrapark.go`'s `ClassifyInfraFailurePark(stages, failed, history)` is the ONE predicate `orchestrator.Advance` and the `stalesweep` settled walk consult before a failed stage completes the run. A FAILED `acceptance` stage with `failure_category` C returns `InfraParkRetryable` (the run parks: it stays running, the stage stays failed and re-openable `failed → pending` through `RetryStage`) or `InfraParkBudgetExhausted`; everything else is `InfraParkNotApplicable` (today's `completeRun`).
+
+- **Acceptance-only by design**: decomposition fan-in resolves a parent only on TERMINAL children, so parking other stage types needs its own design.
+- **Post-merge carve-out** (`NotApplicable`): a `pr_merged` row on the run, or a `review` stage that reads `succeeded` (only `resolveReviewStageOnMerge` resolves it there) — the merge overtook a pre-merge acceptance. A post-deploy acceptance (a `deploy` stage sequenced before it) is never carved out. Every other category-C acceptance failure parks, whether or not another stage is open.
+- **Budget** `InfraFailureParkRetryBudget` = 3 counts ONLY this stage's `stage_infra_parked` audit rows (one per parked failure episode, keyed by `failed_at` + `retry_ordinal`), never `self_retry_count` (which also counts category-A and operator B-override retries). `ReadInfraParkHistory` counts rows for EARLIER episodes since the stage's last `acceptance_outcome_recorded`, so the 4th consecutive category-C failure fails the run, with a `stage_infra_park_budget_exhausted` row. A malformed park row counts (tightens, never loosens).
+
 ## Retry semantics
 
 `retry.go`'s `RetryStage(ctx, repo, stageID, opts)` is the per-category decision tree. `transition.go` keeps a separate `stageRetryTransitions` table (`failed → awaiting_approval` for D-timeout, `failed → pending` for A/C) so the regular state machine invariant "terminal states are terminal under normal transitions" stays true.
