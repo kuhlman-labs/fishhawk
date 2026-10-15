@@ -229,6 +229,9 @@ func (s *Server) startConflictResolutionPass(r *http.Request, runID uuid.UUID,
 			"); the ceiling-of-one budget is now SPENT and no pass will run, so a re-invocation takes the budget-spent refusal"}
 	}
 
+	// The resolution pass moves the head: release the merge-candidate line (#4352).
+	s.releaseMergeCandidateQueueOnReopen(context.WithoutCancel(ctx), runID, mergeCandidateQueueReasonReopenedForConflictResolution, true)
+
 	s.notifyStatusUpdate(ctx, runID, CategoryStageConflictResolutionTriggered)
 	return &conflictResolutionStart{StageID: impl.ID, Pass: pass}, nil
 }

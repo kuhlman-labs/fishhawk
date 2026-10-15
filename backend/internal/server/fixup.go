@@ -1028,6 +1028,11 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 		}
 	}
 
+	// Release the ADR-092 merge-candidate line (#4352): the re-opened run's
+	// head is about to move, so its entry (live or held) stops blocking the
+	// base and the run re-enters at the TAIL on its next pass (ADR-093 Q2).
+	s.releaseMergeCandidateQueueOnReopen(context.WithoutCancel(ctx), dec.Stage.RunID, mergeCandidateQueueReasonReopenedForFixup, true)
+
 	// The fix-up re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
 	// workflow_dispatch. Orchestrator failures are logged but don't fail
