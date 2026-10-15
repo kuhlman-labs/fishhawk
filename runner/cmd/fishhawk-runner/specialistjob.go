@@ -24,12 +24,22 @@ package main
 // Every go test / go list runs through the counterfactual executor's gate exec
 // seam (runBoundedGateArgvDisposed) under the verify lock. A job is admitted
 // into the host's local-verify:<host> concurrency group by POST .../admission
-// (re-POSTed with the same nonce as the heartbeat). Long-form contract:
-// runner/README.md § "Specialist jobs".
+// (re-POSTed with the same nonce as the heartbeat).
+//
+// Result attestation (E85.15 / #4363): with FISHHAWK_RUNNER_ATTEST_TOKEN set
+// (a token holding attest:specialist-jobs) the runner authenticates on it and
+// the admission answer carries a job-scoped Ed25519 key, held in memory only
+// and never logged; the result is signed with it and records provenance
+// runner_attested. Without the token, or with no or an undecodable key, the
+// runner logs specialist_job_attestation_degraded and ships unsigned (bearer).
+// Long-form contract: runner/README.md § "Specialist jobs".
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -147,9 +157,26 @@ type specialistJobRun struct {
 	logSink io.Writer
 }
 
+// Bearer sources, in preference order: the runner attestation token (a
+// credential holding attest:specialist-jobs, so its admission carries an
+// attestation key) and the operator bearer fishhawk-mcp forwards.
+const (
+	envRunnerAttestToken = "FISHHAWK_RUNNER_ATTEST_TOKEN"
+	envOperatorToken     = "FISHHAWK_API_TOKEN"
+)
+
+// Attestation degrade reasons (specialist_job_attestation_degraded): the
+// result ships unsigned and records provenance bearer.
+const (
+	sjAttestNoKey          = "no_attestation_key"
+	sjAttestKeyUndecodable = "attestation_key_undecodable"
+)
+
 // specialistJobFlags is the parsed subcommand command line.
 type specialistJobFlags struct {
 	jobID, backendURL, workingDir, host, token string
+	// tokenSource names the env var token came from (never its value).
+	tokenSource string
 }
 
 func parseSpecialistJobFlags(args []string, logSink io.Writer) (specialistJobFlags, error) {
@@ -163,14 +190,17 @@ func parseSpecialistJobFlags(args []string, logSink io.Writer) (specialistJobFla
 	if err := fs.Parse(args); err != nil {
 		return f, err
 	}
-	f.token = os.Getenv("FISHHAWK_API_TOKEN")
+	f.token, f.tokenSource = os.Getenv(envRunnerAttestToken), envRunnerAttestToken
+	if f.token == "" {
+		f.token, f.tokenSource = os.Getenv(envOperatorToken), envOperatorToken
+	}
 	switch {
 	case f.jobID == "" || f.backendURL == "" || f.workingDir == "" || f.host == "":
 		return f, errors.New("--job-id, --backend-url, --working-dir and --host are required")
 	case !filepath.IsAbs(f.workingDir):
 		return f, fmt.Errorf("--working-dir %q must be absolute", f.workingDir)
 	case f.token == "":
-		return f, errors.New("FISHHAWK_API_TOKEN must carry the operator bearer")
+		return f, errors.New(envRunnerAttestToken + " (runner attestation token) or " + envOperatorToken + " (operator bearer) must carry a bearer")
 	}
 	f.backendURL = strings.TrimRight(f.backendURL, "/")
 	return f, nil
@@ -211,9 +241,11 @@ func executeSpecialistJob(ctx context.Context, f specialistJobFlags, d specialis
 	if err != nil {
 		return err
 	}
-	if err := admitSpecialistJob(ctx, client, f, nonce, d, logSink); err != nil {
+	adm, err := admitSpecialistJob(ctx, client, f, nonce, d, logSink)
+	if err != nil {
 		return err
 	}
+	key := specialistJobAttestationKey(adm, f, logSink)
 	hbCtx, stopHB := context.WithCancel(ctx)
 	var hbWG sync.WaitGroup
 	hbWG.Add(1)
@@ -229,7 +261,7 @@ func executeSpecialistJob(ctx context.Context, f specialistJobFlags, d specialis
 	if err != nil {
 		return err
 	}
-	if _, err := client.ShipSpecialistJobCompletion(ctx, f.token, f.jobID, completion); err != nil {
+	if _, err := client.ShipSpecialistJobCompletion(ctx, f.token, f.jobID, completion, key); err != nil {
 		if !completionLanded(ctx, client, f, err) {
 			return err
 		}
@@ -237,8 +269,50 @@ func executeSpecialistJob(ctx context.Context, f specialistJobFlags, d specialis
 	}
 	logEvent(logSink, "specialist_job_completed", map[string]string{
 		"job_id": f.jobID, "kind": job.Kind, "verdict": outcome.Verdict, "reason": outcome.Reason,
+		"signed": fmt.Sprint(key != nil),
 	})
 	return nil
+}
+
+// specialistJobAttestationKey decodes the admission's job-scoped attestation
+// key: base64 (std) of a 64-byte Ed25519 private key whose public half matches
+// its seed. The key lives only in the returned value — never logged, never
+// written. No key, or one that does not decode, logs
+// specialist_job_attestation_degraded (reason and token source only, no key
+// material) and returns nil, so the result ships unsigned and records
+// provenance bearer.
+func specialistJobAttestationKey(adm *upload.SpecialistJobAdmission, f specialistJobFlags, logSink io.Writer) ed25519.PrivateKey {
+	reason := sjAttestNoKey
+	if adm.AttestationKey != "" {
+		key, err := decodeSpecialistJobAttestationKey(adm.AttestationKey)
+		if err == nil {
+			return key
+		}
+		reason = sjAttestKeyUndecodable
+	}
+	logEvent(logSink, "specialist_job_attestation_degraded", map[string]string{
+		"job_id": f.jobID, "reason": reason, "token_source": f.tokenSource, "provenance": "bearer",
+	})
+	return nil
+}
+
+// decodeSpecialistJobAttestationKey refuses anything but base64 (std) of a
+// 64-byte Ed25519 private key whose stored public half is the one its seed
+// derives (a corrupted key would sign a result the server then refuses).
+// The error never carries key material.
+func decodeSpecialistJobAttestationKey(s string) (ed25519.PrivateKey, error) {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, errors.New("attestation key is not base64")
+	}
+	if len(raw) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("attestation key is %d bytes, want %d", len(raw), ed25519.PrivateKeySize)
+	}
+	key := ed25519.PrivateKey(raw)
+	if !bytes.Equal(ed25519.NewKeyFromSeed(key.Seed()), key) {
+		return nil, errors.New("attestation key public half does not match its seed")
+	}
+	return key, nil
 }
 
 // runSpecialistJobKind sets up the job's scratch parent and runs the
@@ -297,28 +371,30 @@ func completionLanded(ctx context.Context, client *upload.Client, f specialistJo
 
 // admitSpecialistJob POSTs .../admission until admitted, sleeping the poll
 // ±20% between attempts, and gives up after the admission wait leaving the job
-// queued (the read surface marks it stale).
-func admitSpecialistJob(ctx context.Context, client *upload.Client, f specialistJobFlags, nonce string, d specialistJobDeps, logSink io.Writer) error {
+// queued (the read surface marks it stale). It returns the admitting answer,
+// which alone carries the attestation key.
+func admitSpecialistJob(ctx context.Context, client *upload.Client, f specialistJobFlags, nonce string, d specialistJobDeps, logSink io.Writer) (*upload.SpecialistJobAdmission, error) {
 	deadline := time.Now().Add(d.admitWait)
 	for {
 		adm, err := client.AdmitSpecialistJob(ctx, f.token, f.jobID, upload.SpecialistJobAdmissionRequest{Host: f.host, Nonce: nonce})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if adm.Admitted {
 			logEvent(logSink, "specialist_job_admitted", map[string]string{
 				"job_id": f.jobID, "host": f.host, "taken_over": fmt.Sprint(adm.TakenOver),
+				"token_source": f.tokenSource, "attestation_key": fmt.Sprint(adm.AttestationKey != ""),
 			})
-			return nil
+			return adm, nil
 		}
 		logEvent(logSink, "specialist_job_queued", map[string]string{
 			"job_id": f.jobID, "position": fmt.Sprint(adm.Position), "contended": fmt.Sprint(adm.Contended),
 		})
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("%w: %s after %s", errSpecialistJobAdmissionTimeout, f.jobID, d.admitWait)
+			return nil, fmt.Errorf("%w: %s after %s", errSpecialistJobAdmissionTimeout, f.jobID, d.admitWait)
 		}
 		if !sleepCtx(ctx, jitter(d.admitPoll)) {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 }
