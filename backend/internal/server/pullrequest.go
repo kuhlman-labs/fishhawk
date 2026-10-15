@@ -2234,7 +2234,9 @@ const mergeCandidateRunnerSubject = "runner"
 //     after a 5xx appends nothing, settles nothing and routes nothing.
 //  3. settleMergeCandidateVerifyStage returns a `running` implement stage to
 //     the gate it held BEFORE the pass and calls Orchestrator.Advance.
-//  4. On `failed` only, routeMergeCandidateFailure applies D6.
+//  4. On `passed` only, republishAuditCheckOnMergeCandidateVerdict force-
+//     publishes fishhawk_audit_complete AT the verified head (#4397).
+//  5. On `failed` only, routeMergeCandidateFailure applies D6.
 func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
 	ctx := r.Context()
@@ -2297,6 +2299,19 @@ func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *ht
 	if stage.State == run.StageStateRunning {
 		s.settleMergeCandidateVerifyStage(ctx, runID, stage, rec.Trigger)
 	}
+
+	// E86.57 / #4397 (and the #4440 variant): a PASSED pass force-publishes
+	// fishhawk_audit_complete AT the verified head, which findHeadSHA cannot
+	// resolve for a conflict-resolution, base-advance or vouched head. It sits
+	// after the rec.Duplicate return, so an idempotent runner replay publishes
+	// nothing new. ORDERING IS LOAD-BEARING: the recompute must observe the
+	// implement stage already returned to its prior gate. Observed with the
+	// call hoisted above the settle: the recompute sees the implement stage
+	// `running` and posts status in_progress at the head with a
+	// stage_not_terminal item in its output, where in place it posts a
+	// completed check (TestConflictResolutionPushed_VerifyPassedPostsAuditCheckAtMergeHead
+	// goes RED on both its status and its stage_not_terminal assertion).
+	s.republishAuditCheckOnMergeCandidateVerdict(ctx, runID, rec.Trigger.ExpectedHeadSHA, rec.Result)
 
 	if rec.Result == mergeCandidateResultFailed {
 		runRow, gerr := s.cfg.RunRepo.GetRun(ctx, runID)

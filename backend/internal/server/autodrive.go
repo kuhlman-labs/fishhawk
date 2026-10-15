@@ -322,7 +322,9 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 				slog.Bool("check_read_error", gate.Cause != nil))
 			return observeOnly(mergeCandidateObserveNote(gate)), nil
 		} else {
-			outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger)
+			// #4397: the gate's admitted live head rides into the pre-merge
+			// republish so the required check lands where the merge will.
+			outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger, gate.HeadSHA)
 			switch outcome {
 			case mergeDispatchAcceptanceNotReady:
 				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
@@ -429,7 +431,11 @@ const (
 //
 // It is behavior-preserving for the delegated arm and is the SAME path the
 // operator merge endpoint converges on by construction.
-func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger) (mergeDispatchOutcome, string, error) {
+//
+// liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
+// HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it. Empty
+// (an ungated D7 admit, a merged PR) keeps the findHeadSHA resolution.
+func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, liveHead string) (mergeDispatchOutcome, string, error) {
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
 	// The admitted set is the SHARED acceptanceGateAdmitsMerge predicate (E66.37
 	// / #2474), so the delegated merge and the operator merge endpoint cannot
@@ -465,7 +471,11 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	// The returned Result is the operator-merge endpoint's affordance (it names
 	// the blocking stage in its 409 body); this delegated arm has no 409 to
 	// enrich, so it discards it.
-	_, _ = s.republishAuditCheckBeforeMerge(ctx, runRow.ID)
+	//
+	// E86.57 / #4397, #4440: the publish targets liveHead, the head the merge
+	// will land, because findHeadSHA cannot resolve a conflict-resolution,
+	// base-advance or operator-vouched head (mirror of handleMergeRun).
+	_, _ = s.republishAuditCheckBeforeMergeAtHead(ctx, runRow.ID, liveHead)
 	return mergeDispatchMerged, gateState, merger.MergePullRequest(ctx, runRow)
 }
 

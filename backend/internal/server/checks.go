@@ -460,8 +460,9 @@ func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, run
 // its signature would break their compilation with no legal way to fix them.
 // The existing function and every one of its callers stay byte-identical.
 //
-// Force is scoped to the two republish paths that exist to CLEAR a strand. A
-// run stranded on auditcomplete's mid-flight branch recomputes to the SAME
+// Force is scoped to the republish paths that exist to CLEAR a strand (the
+// before-merge and run-terminal republishes, plus the #4397 verify-passed
+// republish through the AtHead variant below). A run stranded on auditcomplete's mid-flight branch recomputes to the SAME
 // pending state the fix-up synchronize already published, so the unforced
 // republish is dedup-suppressed and posts NOTHING — #3190's "#3186 is deployed,
 // ran twice, and moved nothing". The merge reconciler's 60s heal sweep is
@@ -470,6 +471,18 @@ func (s *Server) recomputeAndPublishAuditCompleteAtHead(ctx context.Context, run
 // Best-effort exactly like the unforced sibling: a compute or publish failure
 // logs at WARN and never unwinds the caller.
 func (s *Server) recomputeAndForcePublishAuditComplete(ctx context.Context, runID uuid.UUID) (auditcomplete.Result, bool) {
+	return s.recomputeAndForcePublishAuditCompleteAtHead(ctx, runID, "")
+}
+
+// recomputeAndForcePublishAuditCompleteAtHead is
+// recomputeAndForcePublishAuditComplete with an explicit head override
+// (E86.57 / #4397): it re-derives the audit-complete state and publishes it
+// PAST the dedup AT headSHAOverride. An empty override is the pre-#4397
+// findHeadSHA resolution, which is what the delegation above passes, so every
+// existing caller is byte-identical. Best-effort exactly like the unforced
+// sibling: a compute or publish failure logs at WARN and never unwinds the
+// caller.
+func (s *Server) recomputeAndForcePublishAuditCompleteAtHead(ctx context.Context, runID uuid.UUID, headSHAOverride string) (auditcomplete.Result, bool) {
 	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
 		return auditcomplete.Result{}, false
 	}
@@ -482,7 +495,7 @@ func (s *Server) recomputeAndForcePublishAuditComplete(ctx context.Context, runI
 		return auditcomplete.Result{}, false
 	}
 	_, _ = s.publishAuditCheckWithOptions(ctx, runID, res.State, res.Missing, res.Resolved,
-		auditcheckpublisher.PublishOptions{Force: true})
+		auditcheckpublisher.PublishOptions{HeadSHAOverride: headSHAOverride, Force: true})
 	return res, true
 }
 
@@ -503,7 +516,8 @@ func (s *Server) recomputeAndForcePublishAuditComplete(ctx context.Context, runI
 // case — the merge that would trigger it can never happen. This one runs first.
 //
 // Both call sites — handleMergeRun (the operator merge endpoint) and
-// dispatchAcceptanceGatedMerge (the delegated may_merge arm) — invoke it AFTER
+// dispatchAcceptanceGatedMerge (the delegated may_merge arm) — invoke it
+// (through republishAuditCheckBeforeMergeAtHead since #4397) AFTER
 // the acceptance gate has admitted the merge and BEFORE the dispatch, so a
 // genuinely mid-flight run is already refused by the gate and never reaches a
 // recompute that would report pending.
@@ -524,7 +538,50 @@ func (s *Server) recomputeAndForcePublishAuditComplete(ctx context.Context, runI
 // returned Result lets handleMergeRun name the blocking stage in its 409
 // merge_checks_pending body without recomputing.
 func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.UUID) (auditcomplete.Result, bool) {
-	return s.recomputeAndForcePublishAuditComplete(ctx, runID)
+	return s.republishAuditCheckBeforeMergeAtHead(ctx, runID, "")
+}
+
+// republishAuditCheckBeforeMergeAtHead is republishAuditCheckBeforeMerge AT
+// the head the merge will land (E86.57 / #4397, #4440). liveHead is the head
+// mergeCandidateGate read from the live PR and admitted
+// (mergeCandidateGateResult.HeadSHA). Both merge dispatch sites pass it,
+// because findHeadSHA resolves only the head-report categories: a
+// conflict-resolution merge commit (#3673 keeps conflict_resolution_pushed
+// out of the precedence slice), a base-advance merge and an operator-vouched
+// base merge are in none of them, so the forced republish otherwise lands at
+// a stale recorded head and the live head keeps its missing or IN_PROGRESS
+// required check. An empty liveHead is the pre-#4397 findHeadSHA resolution:
+// the ungated ADR-090 D7 posture and a PR the forge already reports merged.
+func (s *Server) republishAuditCheckBeforeMergeAtHead(ctx context.Context, runID uuid.UUID, liveHead string) (auditcomplete.Result, bool) {
+	return s.recomputeAndForcePublishAuditCompleteAtHead(ctx, runID, liveHead)
+}
+
+// republishAuditCheckOnMergeCandidateVerdict force-publishes the
+// fishhawk_audit_complete Check Run AT the head a merge-candidate verify pass
+// just verified (E86.57 / #4397, the #4440 variant). succeedMergeCandidateVerifiedStage
+// calls it once per settled pass, so it covers every cause uniformly:
+// conflict_resolution, base_advance (an operator-vouched base merge and an
+// ADR-092 queue admission included), fan_in, and the #4391 verify-only re-run.
+//
+// The hole it closes: every unforced publish resolves its head through
+// auditcheckpublisher.findHeadSHA, which reads only the head-report
+// categories. #3673 deliberately keeps conflict_resolution_pushed out of that
+// precedence slice, and a base-advance or vouched head is in no head-report
+// category at all, so after the pass for such a head settled nothing ever
+// published AT it. GitHub then held the PR on a missing or IN_PROGRESS
+// required check and fishhawk_merge_run queued a merge that could only time
+// out, until the operator re-invoked fishhawk_rebase_run_branch.
+//
+// FORCED because it is one publish per settled pass and must clear a stranded
+// IN_PROGRESS at that head even when the dedup cache already records the same
+// state there. PASSED-ONLY because a failed head is refused by the merge gate
+// (and D6 may re-open the stage for a fix-up), and a not_executed result bound
+// no verdict to any head. Best-effort: never unwinds the caller.
+func (s *Server) republishAuditCheckOnMergeCandidateVerdict(ctx context.Context, runID uuid.UUID, headSHA, result string) {
+	if result != mergeCandidateResultPassed {
+		return
+	}
+	_, _ = s.recomputeAndForcePublishAuditCompleteAtHead(ctx, runID, headSHA)
 }
 
 // republishAuditCheckOnRunTerminal recomputes the run's audit-complete state

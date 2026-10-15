@@ -365,7 +365,8 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// the merge_verdict_recorded append, so a merge that cannot land records no
 	// verdict. Unlike the conflict guard it FAILS CLOSED on a read error once
 	// every anchor resolved (D7); see mergeCandidateGate.
-	if gate := s.mergeCandidateGate(r.Context(), runRow); !gate.admits() {
+	gate := s.mergeCandidateGate(r.Context(), runRow)
+	if !gate.admits() {
 		s.writeMergeCandidateRefusal(w, r, runID, prURL, gate)
 		return
 	}
@@ -536,7 +537,14 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// the state is not pending" from "we never got to look" (dev posture or a
 	// compute error), so the generic wording is used for the second case rather
 	// than a misleading claim about a state nothing derived.
-	auditRes, auditRecomputed := s.republishAuditCheckBeforeMerge(r.Context(), runID)
+	//
+	// E86.57 / #4397, #4440: the forced republish targets the head the merge
+	// will land — the live PR head the merge-candidate gate admitted — because
+	// findHeadSHA cannot resolve a conflict-resolution, base-advance or
+	// operator-vouched head and would re-post at a stale recorded head while
+	// the live head kept its missing or IN_PROGRESS required check. An empty
+	// gate.HeadSHA (ungated D7 admit, merged PR) keeps the findHeadSHA head.
+	auditRes, auditRecomputed := s.republishAuditCheckBeforeMergeAtHead(r.Context(), runID, gate.HeadSHA)
 
 	if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
 		// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
@@ -703,6 +711,14 @@ type mergeCandidateGateResult struct {
 	Message string
 	Details map[string]any
 	Cause   error
+	// HeadSHA is the live PR head the gate read and admitted (E86.57 /
+	// #4397). It is set ONLY on the final admit (verify state passed or
+	// not_required after the behind probe) and is empty on every refusal, on
+	// the merged-PR admit and on every ungated D7 admit. Both merge dispatch
+	// sites force-publish fishhawk_audit_complete AT it, because findHeadSHA
+	// cannot resolve a conflict-resolution, base-advance or vouched head; an
+	// empty value keeps the findHeadSHA resolution.
+	HeadSHA string
 }
 
 func (g mergeCandidateGateResult) admits() bool { return g.Code == "" }
@@ -862,7 +878,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 			},
 		}
 	}
-	return mergeCandidateGateResult{}
+	return mergeCandidateGateResult{HeadSHA: headSHA}
 }
 
 // mergeCandidateHeldRefusal is the gate's ADR-092 held arm: nil unless the
