@@ -1,33 +1,32 @@
 {
   "schema": "planreview-catchrate-evidence-v2",
-  "recorded_at": "2026-10-15T00:23:34Z",
+  "recorded_at": "2026-10-15T14:17:21Z",
   "generator_model": "claude-sonnet-5-5",
-  "prompt_fingerprint": "sha256:8ba14cf23827aa29f865b80ebac3ff31a437df9403bbfe48e4c46f06c1fafe60",
+  "prompt_fingerprint": "sha256:23ecdf37cc5ba31cc5419e6a260668901fe80227c44182d9a81af8e93e505756",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
   "arms": {
     "architect": {
       "kind": "persona",
       "samples_per_case": 46,
-      "prompt_fingerprint": "sha256:7869b39db19d7bc91488f4b3f7cceef6680e7c349ab815ecb4383f67d7e5b2cd",
+      "prompt_fingerprint": "sha256:706545dc9ee36ac9277e035d645c9779d6619250a7f5a3c65928043668a0fa73",
       "per_case": {
         "adr006-production-migrate-down": {
           "expect": "catch",
           "trials": 46,
-          "caught": 39,
-          "undecodable": 0
+          "caught": 42,
+          "undecodable": 4
         },
         "adr091-merge-without-review-coverage": {
           "expect": "catch",
           "trials": 46,
-          "caught": 45,
+          "caught": 46,
           "undecodable": 0
         },
         "clean-sqlc-query-cli": {
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 2,
           "undecodable": 0
         },
         "clean-workflow-v2-optional-field": {
@@ -41,13 +40,13 @@
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 24,
+          "false_alarms": 22,
           "undecodable": 0
         },
         "undeclared-cross-component-direction": {
           "expect": "catch",
           "trials": 46,
-          "caught": 21,
+          "caught": 30,
           "undecodable": 0
         }
       }
@@ -67,7 +66,6 @@
           "expect": "clean",
           "trials": 34,
           "caught": 0,
-          "false_alarms": 2,
           "undecodable": 1
         },
         "clean-ci-pinned-tool-bump": {
@@ -122,7 +120,7 @@
       "false_alarm_partition": {
         "clean-auth-helper-refactor": {
           "security_lens": 0,
-          "other_category": 2
+          "other_category": 0
         },
         "clean-ci-pinned-tool-bump": {
           "security_lens": 0,
@@ -153,14 +151,13 @@
           "expect": "clean",
           "trials": 34,
           "caught": 0,
-          "false_alarms": 1,
           "undecodable": 0
         },
         "clean-policy-test-only": {
           "expect": "clean",
           "trials": 34,
           "caught": 0,
-          "false_alarms": 1,
+          "false_alarms": 6,
           "undecodable": 0
         },
         "clean-redaction-helper-move": {
@@ -176,12 +173,12 @@
           "other_category": 0
         },
         "clean-ci-pinned-tool-bump": {
-          "security_lens": 1,
+          "security_lens": 0,
           "other_category": 0
         },
         "clean-policy-test-only": {
           "security_lens": 0,
-          "other_category": 1
+          "other_category": 6
         },
         "clean-redaction-helper-move": {
           "security_lens": 0,
@@ -191,167 +188,176 @@
     },
     "with_conventions": {
       "kind": "conventions",
-      "samples_per_case": 12,
-      "prompt_fingerprint": "sha256:24cf1dab33111c85b561b71921ac1a558d6d1a3e9bc8cf128cf08f6e40f0288a",
+      "samples_per_case": 11,
+      "prompt_fingerprint": "sha256:0b38b7ba323367ee7f332604ec5d2b14c0d75f65803d3a914149ea5807e17d40",
       "per_case": {
         "seed-synthetic-contradicts-issue": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-contradicts-numeric-limit": {
-          "trials": 12,
-          "caught": 10,
-          "undecodable": 0
-        },
-        "seed-synthetic-contradicts-status-code": {
-          "trials": 12,
-          "caught": 9,
-          "undecodable": 0
-        },
-        "seed-synthetic-inferred-criterion": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-inferred-sibling-retention": {
-          "trials": 12,
+          "trials": 11,
           "caught": 11,
           "undecodable": 0
         },
+        "seed-synthetic-contradicts-numeric-limit": {
+          "trials": 11,
+          "caught": 8,
+          "undecodable": 0
+        },
+        "seed-synthetic-contradicts-status-code": {
+          "trials": 11,
+          "caught": 8,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-criterion": {
+          "trials": 11,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-inferred-sibling-retention": {
+          "trials": 11,
+          "caught": 8,
+          "undecodable": 0
+        },
         "seed-synthetic-inferred-sibling-timeout": {
-          "trials": 12,
+          "trials": 11,
           "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-restates-approach": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-restates-approach-observable": {
+          "trials": 11,
+          "caught": 9,
           "undecodable": 0
         },
         "seed-synthetic-untestable-adjective": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-untestable-reasonable-time": {
-          "trials": 12,
-          "caught": 10,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-untestable-user-friendly": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-unwarranted-rate-limit": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 10,
           "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         }
       }
     },
     "without_conventions": {
       "kind": "conventions",
-      "samples_per_case": 12,
-      "prompt_fingerprint": "sha256:917096d14abb7393da8679aa57780dcf39b420fb3d60dbc4b4e051f55fb83d22",
+      "samples_per_case": 11,
+      "prompt_fingerprint": "sha256:412712d62033c4fd4168ab61a40276c1fc05c57f52a92e37a82cebd9dbcdec2d",
       "per_case": {
         "seed-synthetic-contradicts-issue": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-contradicts-numeric-limit": {
-          "trials": 12,
+          "trials": 11,
           "caught": 11,
           "undecodable": 0
         },
+        "seed-synthetic-contradicts-numeric-limit": {
+          "trials": 11,
+          "caught": 10,
+          "undecodable": 0
+        },
         "seed-synthetic-contradicts-status-code": {
-          "trials": 12,
+          "trials": 11,
           "caught": 8,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-inferred-sibling-retention": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 10,
           "undecodable": 0
         },
         "seed-synthetic-inferred-sibling-timeout": {
-          "trials": 12,
+          "trials": 11,
           "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-restates-approach": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-untestable-adjective": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-untestable-reasonable-time": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-untestable-user-friendly": {
-          "trials": 12,
-          "caught": 12,
-          "undecodable": 0
-        },
-        "seed-synthetic-unwarranted-rate-limit": {
-          "trials": 12,
+          "trials": 11,
           "caught": 11,
           "undecodable": 0
         },
+        "seed-synthetic-restates-approach-observable": {
+          "trials": 11,
+          "caught": 3,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-adjective": {
+          "trials": 11,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-reasonable-time": {
+          "trials": 11,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-untestable-user-friendly": {
+          "trials": 11,
+          "caught": 11,
+          "undecodable": 0
+        },
+        "seed-synthetic-unwarranted-rate-limit": {
+          "trials": 11,
+          "caught": 9,
+          "undecodable": 0
+        },
         "seed-synthetic-vacuous-criterion": {
-          "trials": 12,
-          "caught": 12,
+          "trials": 11,
+          "caught": 11,
           "undecodable": 0
         }
       }
     }
   },
   "baseline": {
-    "pinned_at": "2026-10-15T00:23:34Z",
-    "reason": "#4314: security persona arms (security, security_portability) added to the arm-keyed v2 record; the #4313 baseline is not comparable",
+    "pinned_at": "2026-10-15T14:17:21Z",
+    "reason": "combined re-pin after #4337/#4398/#4399/#4361 and ADR-100/101: conventions corpus +restates-approach-observable (13 seed-synthetic cases), MaxTokens 8192 with non-fatal truncation, architect index + #4399 record budget; prior pin not comparable",
     "generator_model": "claude-sonnet-5-5",
-    "prompt_fingerprint": "sha256:8ba14cf23827aa29f865b80ebac3ff31a437df9403bbfe48e4c46f06c1fafe60",
+    "prompt_fingerprint": "sha256:23ecdf37cc5ba31cc5419e6a260668901fe80227c44182d9a81af8e93e505756",
     "arms": {
       "architect": {
         "kind": "persona",
         "samples_per_case": 46,
-        "prompt_fingerprint": "sha256:7869b39db19d7bc91488f4b3f7cceef6680e7c349ab815ecb4383f67d7e5b2cd",
+        "prompt_fingerprint": "sha256:706545dc9ee36ac9277e035d645c9779d6619250a7f5a3c65928043668a0fa73",
         "per_case": {
           "adr006-production-migrate-down": {
             "expect": "catch",
             "trials": 46,
-            "caught": 39,
-            "undecodable": 0
+            "caught": 42,
+            "undecodable": 4
           },
           "adr091-merge-without-review-coverage": {
             "expect": "catch",
             "trials": 46,
-            "caught": 45,
+            "caught": 46,
             "undecodable": 0
           },
           "clean-sqlc-query-cli": {
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 2,
             "undecodable": 0
           },
           "clean-workflow-v2-optional-field": {
@@ -365,13 +371,13 @@
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 24,
+            "false_alarms": 22,
             "undecodable": 0
           },
           "undeclared-cross-component-direction": {
             "expect": "catch",
             "trials": 46,
-            "caught": 21,
+            "caught": 30,
             "undecodable": 0
           }
         }
@@ -391,7 +397,6 @@
             "expect": "clean",
             "trials": 34,
             "caught": 0,
-            "false_alarms": 2,
             "undecodable": 1
           },
           "clean-ci-pinned-tool-bump": {
@@ -446,7 +451,7 @@
         "false_alarm_partition": {
           "clean-auth-helper-refactor": {
             "security_lens": 0,
-            "other_category": 2
+            "other_category": 0
           },
           "clean-ci-pinned-tool-bump": {
             "security_lens": 0,
@@ -477,14 +482,13 @@
             "expect": "clean",
             "trials": 34,
             "caught": 0,
-            "false_alarms": 1,
             "undecodable": 0
           },
           "clean-policy-test-only": {
             "expect": "clean",
             "trials": 34,
             "caught": 0,
-            "false_alarms": 1,
+            "false_alarms": 6,
             "undecodable": 0
           },
           "clean-redaction-helper-move": {
@@ -500,12 +504,12 @@
             "other_category": 0
           },
           "clean-ci-pinned-tool-bump": {
-            "security_lens": 1,
+            "security_lens": 0,
             "other_category": 0
           },
           "clean-policy-test-only": {
             "security_lens": 0,
-            "other_category": 1
+            "other_category": 6
           },
           "clean-redaction-helper-move": {
             "security_lens": 0,
@@ -515,134 +519,144 @@
       },
       "with_conventions": {
         "kind": "conventions",
-        "samples_per_case": 12,
-        "prompt_fingerprint": "sha256:24cf1dab33111c85b561b71921ac1a558d6d1a3e9bc8cf128cf08f6e40f0288a",
+        "samples_per_case": 11,
+        "prompt_fingerprint": "sha256:0b38b7ba323367ee7f332604ec5d2b14c0d75f65803d3a914149ea5807e17d40",
         "per_case": {
           "seed-synthetic-contradicts-issue": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-contradicts-numeric-limit": {
-            "trials": 12,
-            "caught": 10,
-            "undecodable": 0
-          },
-          "seed-synthetic-contradicts-status-code": {
-            "trials": 12,
-            "caught": 9,
-            "undecodable": 0
-          },
-          "seed-synthetic-inferred-criterion": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-inferred-sibling-retention": {
-            "trials": 12,
+            "trials": 11,
             "caught": 11,
             "undecodable": 0
           },
+          "seed-synthetic-contradicts-numeric-limit": {
+            "trials": 11,
+            "caught": 8,
+            "undecodable": 0
+          },
+          "seed-synthetic-contradicts-status-code": {
+            "trials": 11,
+            "caught": 8,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-criterion": {
+            "trials": 11,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-inferred-sibling-retention": {
+            "trials": 11,
+            "caught": 8,
+            "undecodable": 0
+          },
           "seed-synthetic-inferred-sibling-timeout": {
-            "trials": 12,
+            "trials": 11,
             "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-restates-approach": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-restates-approach-observable": {
+            "trials": 11,
+            "caught": 9,
             "undecodable": 0
           },
           "seed-synthetic-untestable-adjective": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-untestable-reasonable-time": {
-            "trials": 12,
-            "caught": 10,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-untestable-user-friendly": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-unwarranted-rate-limit": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 10,
             "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           }
         }
       },
       "without_conventions": {
         "kind": "conventions",
-        "samples_per_case": 12,
-        "prompt_fingerprint": "sha256:917096d14abb7393da8679aa57780dcf39b420fb3d60dbc4b4e051f55fb83d22",
+        "samples_per_case": 11,
+        "prompt_fingerprint": "sha256:412712d62033c4fd4168ab61a40276c1fc05c57f52a92e37a82cebd9dbcdec2d",
         "per_case": {
           "seed-synthetic-contradicts-issue": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-contradicts-numeric-limit": {
-            "trials": 12,
+            "trials": 11,
             "caught": 11,
             "undecodable": 0
           },
+          "seed-synthetic-contradicts-numeric-limit": {
+            "trials": 11,
+            "caught": 10,
+            "undecodable": 0
+          },
           "seed-synthetic-contradicts-status-code": {
-            "trials": 12,
+            "trials": 11,
             "caught": 8,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-inferred-sibling-retention": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 10,
             "undecodable": 0
           },
           "seed-synthetic-inferred-sibling-timeout": {
-            "trials": 12,
+            "trials": 11,
             "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-restates-approach": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-untestable-adjective": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-untestable-reasonable-time": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-untestable-user-friendly": {
-            "trials": 12,
-            "caught": 12,
-            "undecodable": 0
-          },
-          "seed-synthetic-unwarranted-rate-limit": {
-            "trials": 12,
+            "trials": 11,
             "caught": 11,
             "undecodable": 0
           },
+          "seed-synthetic-restates-approach-observable": {
+            "trials": 11,
+            "caught": 3,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-adjective": {
+            "trials": 11,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-reasonable-time": {
+            "trials": 11,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-untestable-user-friendly": {
+            "trials": 11,
+            "caught": 11,
+            "undecodable": 0
+          },
+          "seed-synthetic-unwarranted-rate-limit": {
+            "trials": 11,
+            "caught": 9,
+            "undecodable": 0
+          },
           "seed-synthetic-vacuous-criterion": {
-            "trials": 12,
-            "caught": 12,
+            "trials": 11,
+            "caught": 11,
             "undecodable": 0
           }
         }

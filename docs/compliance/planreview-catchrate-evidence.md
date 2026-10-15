@@ -662,6 +662,7 @@ alarm (clean cases).
 |---|---|---|---|---|---|---|---|---|
 | 2026-10-14 | `claude-sonnet-5-5` | 133/144 (0.924) | 130/144 (0.903) | 106/138 (0.768) | 32/138 (0.232) | — | pinned (#4313: arm-keyed v2, catch rule v5; v1 not comparable) | PASS (delta +0.021) |
 | 2026-10-15 | `claude-sonnet-5-5` | 137/144 (0.951) | 135/144 (0.938) | 105/138 (0.761) | 28/138 (0.203) | `security` catch 204/204 (1.000), false alarm 3/136 (0.022; trials: security_lens 0, other_category 2, undecodable 1); `security_portability` false alarm 3/136 (0.022; trials: security_lens 1, other_category 1, undecodable 1) | pinned (#4314: security + security_portability arms added; the #4313 arm set is not comparable) | PASS (delta +0.014) |
+| 2026-10-15 | `claude-sonnet-5-5` | 128/143 (0.895) | 131/143 (0.916) | 118/138 (0.855) | 24/138 (0.174) | `security` catch 204/204 (1.000), false alarm 1/136 (0.007; trials: security_lens 0, other_category 0, undecodable 1); `security_portability` false alarm 7/136 (0.051; trials: security_lens 0, other_category 6, undecodable 1) | pinned (combined re-pin after #4337/#4398/#4399/#4361 and ADR-100/101: conventions corpus +restates-approach-observable, 13 seed-synthetic cases; MaxTokens 8192 with non-fatal truncation; architect index + #4399 record budget; 4 architect trials undecodable; prior pin not comparable) | PASS (delta -0.021) |
 
 The #4314 row's "Other arms" column names `security` catch and false alarm
 (with its security_lens / other_category trial split; the remainder of each
