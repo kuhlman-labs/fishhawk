@@ -116,7 +116,22 @@
     "passes even when",
     "wrapped in an http",
     "dressed as an",
-    "dressed up as"
+    "dressed up as",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not asked for",
+    "nothing in the issue requires",
+    "nothing in the issue asks",
+    "issue never mentions",
+    "issue does not mention",
+    "issue doesn't mention",
+    "issue fidelity",
+    "marked explicit",
+    "marked as explicit",
+    "labeled explicit",
+    "labelled explicit",
+    "should be inferred"
   ],
   "attribution_phrases": [
     "enqueues a scan job",
@@ -147,6 +162,16 @@
       "severity": "medium",
       "category": "correctness",
       "note": "ac-upload-enqueues-scan reads like an outcome because it names a status code, but its substance is approach step 2: the handler enqueues on ScanQueue. That is an internal mechanism, not what the issue asks to observe. No criterion checks that an infected file returns 410 file_infected, which is the outcome the issue requires. Replace it with that observation."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan is marked explicit, but the issue never asks for a queue or a 202: nothing in the issue requires the upload to enqueue anything, only that an infected file is never served."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion that POST /uploads returns 202 after the handler enqueues a scan job fails issue fidelity: the issue does not mention ScanQueue or a 202 response."
     }
   ],
   "non_catching_examples": [

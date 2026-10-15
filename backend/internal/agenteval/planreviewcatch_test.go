@@ -607,6 +607,33 @@ func TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute(t *testin
 	}
 }
 
+// TestCommittedCatchPhrases_StoredVerbatimSiblingWordingDoesNotAttribute pins
+// that seed-synthetic-unsatisfiable-stored-verbatim declares no attribution
+// phrase a reviewer would use in ordinary English about a SIBLING criterion
+// (#4361 implement-review concern, which dropped "as received"): a concern
+// about ac-delivery-replay replaying the payload "as received", carrying a
+// warrant probe, scores MISSED. The probe half is asserted to match, so the
+// attribution half alone decides the outcome.
+func TestCommittedCatchPhrases_StoredVerbatimSiblingWordingDoesNotAttribute(t *testing.T) {
+	const name = "seed-synthetic-unsatisfiable-stored-verbatim"
+	cases, _ := loadCommittedCatch(t)
+	for _, c := range cases {
+		if c.Name != name {
+			continue
+		}
+		rule := c.CatchRule()
+		concern := CatchExampleConcern{Category: "acceptance_criteria", Note: "ac-delivery-replay replays the payload as received; a second replay of one delivery is not warranted without an idempotency key."}
+		if _, ok := matchCatchProbe(concern.Category, concern.Note, rule.Probes); !ok {
+			t.Fatalf("fixture premise: %q must match a catch probe of %q", concern.Note, name)
+		}
+		if got := ClassifyCatch(catchVerdictJSON(t, concern), rule); got != CatchMissed {
+			t.Errorf("case %q: a concern about sibling criterion ac-delivery-replay classified %q, want missed", name, got)
+		}
+		return
+	}
+	t.Fatalf("committed corpus lacks case %q", name)
+}
+
 // TestCommittedCatchProbes_AbsentFromConventionsFixture: no committed probe
 // occurs in the representative conventions fixture. The with arm alone shows
 // that text, so a with-arm concern echoing it about an unrelated aspect would

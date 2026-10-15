@@ -32,13 +32,18 @@ code, so it reads like an observable outcome.
   `miss.json` and the plan inside `review_input.json` — the loader enforces
   both).
 - Plan-review criterion it violates: 11 (Independence — criteria are not
-  restatements of the approach steps).
+  restatements of the approach steps). Because the criterion is labeled
+  `explicit` against an issue that never mentions a queue or a 202, a
+  reviewer can also correctly flag it under criterion 8a (issue fidelity);
+  the catch probes cover that route too, so such a catch scores CAUGHT, not
+  as a `no_probe` scoring miss.
 
 ## Review input
 
 `review_input.json` carries the issue text the reviewer sees, the complete
 `standard_v1` plan under review, the `catch_probes` (case-folded substrings
-matched against each emitted concern's note and category), the
+matched against each emitted concern's note and category; they include the
+issue-fidelity phrasing beside the restatement phrasing), the
 `attribution_phrases` (substrings of the planted criterion's statement and of
 no other criterion's), the `defect_phrases` the prompt-leak self-check reads,
 and the hand-written `catching_examples` / `non_catching_examples` the loader
