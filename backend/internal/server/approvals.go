@@ -1623,10 +1623,12 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // unlisted principal is refused 403 approver_predicate_unmet
 // (details.predicate:"members") with an approval_predicate_rejected audit
 // row and no approval row. A listed delegated / agent submission is ADMITTED
-// and still never COUNTED (the #1709 agent floor). Members is enforced at
-// APPROVAL-ROW gates only: a merge-settled review gate
-// (resolveReviewStageOnMerge) records no approval row and never reaches this
-// function; approveStageAs is the count-time half.
+// and still never COUNTED (the #1709 agent floor). This function enforces
+// members at APPROVAL-ROW gates: a merge-settled review gate
+// (resolveReviewStageOnMerge) records no approval row and never reaches it,
+// and is members-checked at merge time by mergeSettledMembersAdmit
+// (merge_members.go, #4132) against the forge's merger and latest-APPROVED
+// reviewers instead; approveStageAs is the count-time half.
 //
 // It returns (nil, false) after writing the response
 // on a rejection (403 approver_predicate_unmet), an unresolvable forge (503

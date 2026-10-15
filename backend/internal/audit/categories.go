@@ -470,6 +470,7 @@ var KnownCategories = map[string]struct{}{
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
+	"merge_settle_members_refused":            {}, // E39.17 / #4132: a merge on a members-declaring review gate was HELD because no forge identity (merger / latest-APPROVED reviewer) is listed (server/merge_members.go) — INTERNAL, not an issue-comment surface
 	"merge_verdict_recorded":                  {},
 	"merge_candidate_queue_admitted":          {}, // E83.85 / #4200 (ADR-092 D1): a held merge-candidate pass was admitted as its base's ONE live pass (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_queue_held":              {}, // E83.85 / #4200 (ADR-092 D1): a merge-candidate pass was held behind its base's live pass, consuming no runner slot (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface

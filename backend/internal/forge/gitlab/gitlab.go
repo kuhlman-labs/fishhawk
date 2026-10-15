@@ -1152,6 +1152,18 @@ func mergeRequestToPR(mr *gitlabclient.MergeRequest) *forge.PullRequest {
 	if mr.State == "opened" {
 		state = "open"
 	}
+	// The merger (#4132): merge_user, else the deprecated merged_by. Gated on
+	// the merged state because merge_user names the auto-merge setter on a
+	// still-open MR, which is not a merger.
+	mergedBy := ""
+	if mr.State == "merged" {
+		if mr.MergeUser != nil {
+			mergedBy = mr.MergeUser.Username
+		}
+		if mergedBy == "" && mr.MergedBy != nil {
+			mergedBy = mr.MergedBy.Username
+		}
+	}
 	return &forge.PullRequest{
 		HeadSHA:        mr.SHA,
 		State:          state,
@@ -1163,5 +1175,6 @@ func mergeRequestToPR(mr *gitlabclient.MergeRequest) *forge.PullRequest {
 		Body:           mr.Description,
 		MergedAt:       mr.MergedAt,
 		MergeCommitSHA: mr.MergeCommitSHA,
+		MergedBy:       mergedBy,
 	}
 }

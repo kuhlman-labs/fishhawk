@@ -231,6 +231,14 @@ type PullRequest struct {
 	// results, so a consumer that needs it must refuse on the zero value rather
 	// than record an empty SHA.
 	MergeCommitSHA string
+	// MergedBy is the merging account's forge login (#4132): GitHub's
+	// `merged_by.login`; GitLab's `merge_user.username`, else the deprecated
+	// `merged_by.username`. Empty when the pull request is unmerged or the
+	// adapter does not populate it (CreatePullRequest /
+	// ListOpenPullRequestsByHead on GitHub), so empty means UNKNOWN. The
+	// merge-settled review gate's members check (server/merge_members.go)
+	// reads it as the merger identity.
+	MergedBy string
 }
 
 // PullRequestRef is the thin PR identity ListPullRequestsForCommit

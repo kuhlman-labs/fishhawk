@@ -218,7 +218,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 					t.Errorf("stdout unexpectedly contains %q:\n%s", nw, out.String())
 				}
 			}
-			for _, note := range []string{"gate feature_change/gate members=[", "resolveReviewStageOnMerge", "BYPASSRLS"} {
+			for _, note := range []string{"gate feature_change/gate members=[", "] enforced_at=approval_row\n", "resolveReviewStageOnMerge", "BYPASSRLS"} {
 				if !strings.Contains(out.String(), note) {
 					t.Errorf("stdout header missing %q:\n%s", note, out.String())
 				}
@@ -483,5 +483,67 @@ func TestApproverMembers_PostgresLoader(t *testing.T) {
 func TestApproverMembers_PostgresLoaderConnectFailure(t *testing.T) {
 	if _, err := loadApproverPrincipals(context.Background(), "postgres://x:y@127.0.0.1:1/db?connect_timeout=2", "", time.Now()); err == nil {
 		t.Fatal("want a connect error")
+	}
+}
+
+// TestApproverMembers_MergeSettledGatesCovered pins the #4132 split: a
+// members-declaring review stage carrying a pull_request input is listed
+// enforced_at=merge and is NEVER a principal's refusing gate (an
+// approval_submitted principal cannot reach it), while a members-declaring
+// plan gate stays enforced_at=approval_row and still refuses.
+//
+// Counterfactual (CF5): insert `return false` at the top of
+// stageSettlesOnMerge — the review gate prints enforced_at=approval_row and
+// joins refusing_gates, so this test goes RED.
+func TestApproverMembers_MergeSettledGatesCovered(t *testing.T) {
+	body := `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: ["github:kuhlman-labs"]
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: plan
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: ["github:kuhlman-labs"]
+`
+	specPath := writeApproverMembersSpec(t, body)
+	loader := &recordingPrincipalLoader{rows: []approverPrincipalRow{
+		{ActorSubject: "github:alice", ActorKind: string(audit.ActorUser), Approvals: 2},
+	}}
+	var out, errs strings.Builder
+	got := runApproverMembersWith([]string{"--spec", specPath, "--db", "postgres://unused"}, &out, &errs, loader.load, fixedNow)
+	if got != exitFailure {
+		t.Fatalf("exit = %d, want %d (the plan gate still refuses alice)\nstdout:\n%s\nstderr:\n%s", got, exitFailure, out.String(), errs.String())
+	}
+	for _, w := range []string{
+		"gate feature_change/plan members=[github:kuhlman-labs] enforced_at=approval_row\n",
+		"gate feature_change/review members=[github:kuhlman-labs] enforced_at=merge\n",
+		"note: enforced_at=merge gates (resolveReviewStageOnMerge) are members-checked when the PR merges",
+		"merge_settle_members_refused",
+		"note: each principal is evaluated against EVERY approval-row members gate above",
+		"principal=github:alice approvals=2 verdict=refused refusing_gates=feature_change/plan\n",
+	} {
+		if !strings.Contains(out.String(), w) {
+			t.Errorf("stdout missing %q:\n%s", w, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "not members-checked") {
+		t.Errorf("stdout still carries the pre-#4132 note:\n%s", out.String())
 	}
 }
