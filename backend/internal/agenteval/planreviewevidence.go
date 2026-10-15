@@ -321,11 +321,17 @@ type catchRateArmRow struct {
 	// fingerprint is "sha256:<hex>" over everything this arm's model is
 	// shown and how its trials are scored.
 	fingerprint string
-	// run measures the arm.
-	run func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error)
+	// measure measures the arm over the cases keep selects (nil = every
+	// case).
+	measure func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error)
 	// partition marks an arm that records the false-alarm partition (the
 	// security arms).
 	partition bool
+}
+
+// run measures the arm over every case.
+func (r catchRateArmRow) run(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
+	return r.measure(ctx, sender, samples, nil)
 }
 
 // catchRateComparisonPair is a (reference, treatment) arm pair the
@@ -478,8 +484,8 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 		rows = append(rows, catchRateArmRow{
 			name: arm, kind: CatchRateArmKindConventions, cases: convCases,
 			samples: SamplesPerCaseForPower(len(cases)), fingerprint: fp,
-			run: func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
-				return RunCatchRateArm(ctx, sender, cases, conv, arm, samples)
+			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+				return RunCatchRateArm(ctx, sender, selectCatchCases(cases, keep, func(c PlanReviewCatchCase) string { return c.Name }), conv, arm, samples)
 			},
 		})
 	}
@@ -500,8 +506,8 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 	rows = append(rows, catchRateArmRow{
 		name: ArmArchitect, kind: CatchRateArmKindPersona, cases: pCases,
 		samples: SamplesPerCaseForPersona(nCatch, nClean), fingerprint: fp,
-		run: func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
-			return runPersonaCatchArm(ctx, sender, personaCases, in.RepoRoot, samples, render)
+		measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+			return runPersonaCatchArm(ctx, sender, selectCatchCases(personaCases, keep, func(c PersonaCatchCase) string { return c.Name }), in.RepoRoot, samples, render)
 		},
 	})
 	for _, arm := range []string{ArmSecurity, ArmSecurityPortability} {
@@ -524,8 +530,8 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 		rows = append(rows, catchRateArmRow{
 			name: arm, kind: CatchRateArmKindPersona, cases: sCases, partition: true,
 			samples: SamplesPerCaseForPersona(sCatch, sClean), fingerprint: fp,
-			run: func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
-				return runSecurityCatchArm(ctx, sender, secCases, markers, in.RepoRoot, arm, samples, secRender)
+			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+				return runSecurityCatchArm(ctx, sender, selectCatchCases(secCases, keep, func(c SecurityCatchCase) string { return c.Name }), markers, in.RepoRoot, arm, samples, secRender)
 			},
 		})
 	}
@@ -590,6 +596,11 @@ type RecordCatchRateOptions struct {
 	Reason string
 	// DryRun measures and judges but never writes the evidence file.
 	DryRun bool
+	// Subset measures part of the arm table (FISHHAWK_AGENTEVAL_PLANREVIEW_CASES
+	// / _TRIALS). A subset or reduced-trial run can never record or pin: it is
+	// refused before any model call unless DryRun is set and PinBaseline is
+	// not, and a subset dry run is reported per case, never judged.
+	Subset CatchRateSubset
 }
 
 // RecordCatchRateEvidence runs EVERY arm of the arm table against sender
@@ -600,7 +611,9 @@ type RecordCatchRateOptions struct {
 // gate refusal, so the caller can show the numbers) and an error.
 //
 // It REFUSES, leaving evidencePath and its sidecar byte-identical, on:
-// PinBaseline with a blank Reason; an existing record that is malformed
+// an active Subset without DryRun or with PinBaseline
+// (ErrCatchRateSubsetNotRecordable, the first check, before any model call)
+// or naming an unknown case id; PinBaseline with a blank Reason; an existing record that is malformed
 // (never silently dropped); no pinned baseline yet — including a legacy v1
 // record, which is a non-comparable baseline — without PinBaseline (checked
 // BEFORE any model call); an unavailable input, a transport or render error;
@@ -608,6 +621,9 @@ type RecordCatchRateOptions struct {
 // baseline; and, without PinBaseline, a baseline that is not comparable to
 // this measurement (arm set, case set, model or samples changed — re-pin).
 func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generatorModel string, in CatchRateInputs, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
+	if opts.Subset.active() && (!opts.DryRun || opts.PinBaseline) {
+		return "", fmt.Errorf("agenteval: %w: %s / %s measure part of the arm table, so the run must be a dry run — unset FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 and FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON, or unset the subset knobs for a full recording; see %s", ErrCatchRateSubsetNotRecordable, CatchRateSubsetCasesEnv, CatchRateSubsetTrialsEnv, catchRateRunbook)
+	}
 	if opts.PinBaseline && strings.TrimSpace(opts.Reason) == "" {
 		return "", fmt.Errorf("agenteval: pinning a catch-rate baseline requires a reason (it is recorded in the evidence); see %s", catchRateRunbook)
 	}
@@ -616,6 +632,9 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	}
 	rows, err := catchRateArmTable(in)
 	if err != nil {
+		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
+	}
+	if err := opts.Subset.validate(rows); err != nil {
 		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
 	}
 	existing, legacy, err := readExistingCatchRateEvidence(evidencePath)
@@ -644,16 +663,23 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		Baseline:          ref,
 	}
 	for _, row := range rows {
-		r, err := row.run(ctx, sender, row.samples)
+		samples, keep, ok := opts.Subset.forRow(row)
+		if !ok {
+			continue
+		}
+		r, err := row.measure(ctx, sender, samples, keep)
 		if err != nil {
 			return "", err
 		}
 		reports[row.name] = r
-		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: row.samples, PromptFingerprint: row.fingerprint, PerCase: r.PerCase}
+		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, PerCase: r.PerCase}
 		if row.partition {
 			arm.FalseAlarmPartition = falseAlarmPartitionOf(row, r)
 		}
 		rec.Arms[row.name] = arm
+	}
+	if opts.Subset.active() && opts.DryRun {
+		return renderCatchRateSubsetDryRun(opts.Subset, rows, reports), nil
 	}
 	report := ""
 	if legacy {
