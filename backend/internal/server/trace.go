@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -8576,7 +8577,7 @@ func isBundleDerivedGateEvidence(ev *prompt.GateEvidence) bool {
 		return true
 	}
 	return len(ev.VerifyRuns) > 0 || ev.VerifySummary != nil || ev.ScopeFacts != nil ||
-		len(ev.PolicyViolations) > 0 || ev.ApprovalConditionResponses != nil
+		len(ev.PolicyViolations) > 0 || ev.ApprovalConditionResponses != nil || ev.FixupCommitClaims != nil
 }
 
 // gateEvidenceForReview maps the bundle's gate_evidence wire struct into
@@ -8688,6 +8689,74 @@ func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.Gate
 			Text:      ev.ApprovalConditionResponses.Text,
 			Truncated: ev.ApprovalConditionResponses.Truncated,
 		}
+	}
+	// Fix-up commit-message claims cross-check (#4337). The tokens are
+	// agent-influenced (they come from the commit message), so the runner's
+	// charset limit is RE-VALIDATED here before anything reaches the prompt.
+	out.FixupCommitClaims = fixupCommitClaimsForReview(ev.FixupCommitClaims)
+	return out
+}
+
+// Bounds and charsets the #4337 claims mapper re-validates, mirroring the
+// runner's fixupclaims.go (fixupClaimsMaxClaims, fixupClaimsMaxTokensPerKind,
+// fixupClaimTokenMaxBytes, fixupClaimTokenCharsetRe, fixupClaimMarkerCharsetRe).
+const (
+	fixupClaimsReviewMaxClaims        = 16
+	fixupClaimsReviewMaxTokensPerKind = 8
+	fixupClaimReviewTokenMaxBytes     = 256
+)
+
+var (
+	fixupClaimReviewTokenRe  = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
+	fixupClaimReviewMarkerRe = regexp.MustCompile(`^[A-Za-z]{4,8} #?[A-Za-z0-9][A-Za-z0-9.,-]{0,15}$`)
+)
+
+// fixupCommitClaimsForReview maps the bundle's fixup_commit_claims_unbacked
+// member into the prompt mirror, re-validating every value against the
+// runner's charsets (defense in depth: the bundle content is agent-influenced,
+// and the prompt renders these tokens WITHOUT an untrusted envelope). A claim
+// whose marker fails is dropped whole; a failing token is dropped; a claim left
+// with no token is dropped; claims and tokens past the runner's bounds are
+// dropped, and a claim dropped by the bound sets Truncated. Nil, or nothing
+// surviving, maps to nil so the render stays byte-identical.
+func fixupCommitClaimsForReview(ev *bundle.FixupCommitClaimsEvidence) *prompt.GateFixupCommitClaims {
+	if ev == nil {
+		return nil
+	}
+	out := &prompt.GateFixupCommitClaims{Truncated: ev.Truncated}
+	for _, cl := range ev.Claims {
+		if !fixupClaimReviewMarkerRe.MatchString(cl.Marker) {
+			continue
+		}
+		refs := validFixupClaimTokens(cl.FileRefs)
+		tests := validFixupClaimTokens(cl.TestNames)
+		if len(refs) == 0 && len(tests) == 0 {
+			continue
+		}
+		if len(out.Claims) == fixupClaimsReviewMaxClaims {
+			out.Truncated = true
+			break
+		}
+		out.Claims = append(out.Claims, prompt.GateFixupCommitClaim{Marker: cl.Marker, FileRefs: refs, TestNames: tests})
+	}
+	if len(out.Claims) == 0 {
+		return nil
+	}
+	return out
+}
+
+// validFixupClaimTokens keeps the tokens that pass the charset and length
+// re-validation, at most fixupClaimsReviewMaxTokensPerKind.
+func validFixupClaimTokens(tokens []string) []string {
+	var out []string
+	for _, tok := range tokens {
+		if len(tok) > fixupClaimReviewTokenMaxBytes || !fixupClaimReviewTokenRe.MatchString(tok) {
+			continue
+		}
+		if len(out) == fixupClaimsReviewMaxTokensPerKind {
+			break
+		}
+		out = append(out, tok)
 	}
 	return out
 }
