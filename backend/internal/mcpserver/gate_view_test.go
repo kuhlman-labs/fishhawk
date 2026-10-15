@@ -1104,3 +1104,106 @@ func TestMergeCandidateVerdict_WireShape(t *testing.T) {
 	}
 	check("fishhawk_get_gate_view", out.GateView.MergeCandidateVerdict)
 }
+
+// TestFanInConflict_WireShape (#4343) pins the hand-maintained
+// gateViewFanInConflict mirror against a REAL server response (the
+// TestMergeCandidateVerdict_WireShape pattern): a decomposed parent whose
+// newest slices_integrated row recorded a base-fold conflict is served by the
+// real handler over Postgres. Every key the server emits must be a mirror
+// field and every mirror field must be emitted (both directions), and every
+// member must decode NON-ZERO through the client and through
+// fishhawk_get_gate_view — a tag renamed on either side leaves the block nil
+// or a field zero, and the test fails.
+func TestFanInConflict_WireShape(t *testing.T) {
+	const bearer = "fhk_fan_in_conflict_e2e"
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec: []byte(mcvWireSpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	child := uuid.New()
+	raw, _ := json.Marshal(map[string]any{
+		"child_run_ids": []string{child.String()}, "consolidated_branch": "fishhawk/run-x-consolidated",
+		"slice_count": 1, "integration_commit_shas": []string{"s1"},
+		"base_ref": "main", "base_sha": "basesha2", "base_fold_outcome": "conflict",
+		"base_fold_conflict": map[string]any{
+			"conflicting_slice_index": 1, "conflicting_child_run_id": child.String(),
+			"conflicting_base_paths": []string{"c.go"}, "base_attribution": "paths_overlap", "compare_truncated": true,
+		},
+	})
+	kind := audit.ActorSystem
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: row.ID, Timestamp: time.Now().UTC(), Category: "slices_integrated", ActorKind: &kind, Payload: raw,
+	}); err != nil {
+		t.Fatalf("seed slices_integrated: %v", err)
+	}
+
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo: tokRepo,
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String()+"/gate-view", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET gate-view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET gate-view = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["fan_in_conflict"], &block); err != nil {
+		t.Fatalf("server emitted no fan_in_conflict block:\n%s", body)
+	}
+	fields := jsonFieldNames(reflect.TypeOf(gateViewFanInConflict{}))
+	for k := range block {
+		if !fields[k] {
+			t.Errorf("server fan_in_conflict key %q has no field on the mirror (tag drift)", k)
+		}
+	}
+	for k := range fields {
+		if _, ok := block[k]; !ok {
+			t.Errorf("mirror field %q is not emitted by the server's fan_in_conflict block (tag drift)", k)
+		}
+	}
+
+	check := func(surface string, v *gateViewFanInConflict) {
+		t.Helper()
+		if v == nil {
+			t.Fatalf("%s: fan_in_conflict decoded to nil", surface)
+		}
+		if v.Kind != "base_fold_conflict" || v.Sequence == 0 || v.BaseRef != "main" || v.BaseSHA != "basesha2" ||
+			v.ConflictingSliceIndex == nil || *v.ConflictingSliceIndex != 1 || v.ConflictingChildRunID != child.String() ||
+			v.BaseAttribution != "paths_overlap" || len(v.ConflictingBasePaths) != 1 || v.ConflictingBasePaths[0] != "c.go" ||
+			!v.CompareTruncated || !strings.Contains(v.Remedy, "fishhawk_rebase_run_branch") {
+			t.Errorf("%s: block = %+v, want every member decoded non-zero", surface, v)
+		}
+	}
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	check("client", gv.FanInConflict)
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getGateView(ctx, nil, GetGateViewInput{RunID: row.ID.String()})
+	if err != nil {
+		t.Fatalf("getGateView: %v", err)
+	}
+	check("fishhawk_get_gate_view", out.GateView.FanInConflict)
+}

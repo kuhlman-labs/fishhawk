@@ -567,20 +567,24 @@ func awaitChildrenIntegrationFailedOutput(base AwaitChildrenOutput, parentUUID u
 		slice = fmt.Sprintf("%d", *f.SliceIndex)
 	}
 	var what, remedy string
+	then := "then re-invoke fishhawk_await_children"
 	switch f.Cause {
 	case auditCategorySliceHeadMissing:
 		what = fmt.Sprintf("the slice branch %q of child %s (slice %s) is missing: %s", f.Branch, f.ChildRunID, slice, f.Detail)
 		remedy = "push the missing slice branch, or resume the child's push (fishhawk_get_run_status on the child names how); the server re-integrates once the branch exists"
 	case auditCategorySliceIntegrationConflict:
 		what = fmt.Sprintf("child %s (slice %s) could not merge onto the consolidated branch (merge conflict)", f.ChildRunID, slice)
-		remedy = "re-drive the conflicting child onto the current consolidated branch (fishhawk_get_run_status on the parent names the conflict-resolution move)"
+		// The conflicting child SUCCEEDED, so it cannot be re-driven
+		// (recovery_not_eligible); the working recovery is a restart (#4343).
+		remedy = "restart the work — fishhawk_start_campaign_item_run for a campaign item, otherwise fishhawk_start_run — because the conflicting child SUCCEEDED and fishhawk_resume_run refuses to re-drive it. Read fishhawk_get_gate_view's fan_in_conflict block on this parent first: it names the conflicting slice, child and conflicting_base_paths, and base_attribution says whether the base shares them; keep those paths in one slice at the new plan gate"
+		then = "then drive the new run, whose own parent fishhawk_await_children watches"
 	default:
 		what = fmt.Sprintf("the fan-in gave up: %s", f.Detail)
 		remedy = "read fishhawk_get_run_status on the parent for the category-B decomposed-parent recovery"
 	}
 	out.Message = fmt.Sprintf(
-		"slice integration failed for parent %s (%s, audit sequence %d): %s. Do NOT dispatch acceptance or approve the review — the consolidated branch does not carry every slice. Remedy: %s; then re-invoke fishhawk_await_children.",
-		parentUUID, f.Cause, f.Sequence, what, remedy)
+		"slice integration failed for parent %s (%s, audit sequence %d): %s. Do NOT dispatch acceptance or approve the review — the consolidated branch does not carry every slice. Remedy: %s; %s.",
+		parentUUID, f.Cause, f.Sequence, what, remedy, then)
 	return out
 }
 
