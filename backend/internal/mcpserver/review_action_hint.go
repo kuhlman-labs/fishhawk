@@ -113,11 +113,72 @@ const categoryDispatchReaperFailed = "dispatch_reaper_failed"
 // hint-vs-backend disagreement.
 const categoryStageFixupRecovered = "stage_fixup_recovered"
 
+// categoryStageFixupSuperseded mirrors backend server.CategoryStageFixupSuperseded
+// (backend/internal/server/merge_candidate_rerun.go). KEEP IN SYNC: it is the
+// operator's in-place supersession of a queued, never-dispatched ADR-090 D6
+// fix-up by a verify-only re-run (E86.54 / #4391). A marker counts ONLY when
+// confirmedSupersessionSeqs confirms it; a confirmed one is the fifth
+// delivered-nothing refund signal (server.fixupRefundedPasses) and voids its
+// trigger in the review floor (latestImplementFixupSeq). Drift here silently
+// reintroduces the #968 hint-vs-backend disagreement.
+const categoryStageFixupSuperseded = "stage_fixup_superseded"
+
+// categoryStageMergeCandidateVerifyTriggered mirrors backend
+// server.CategoryStageMergeCandidateVerifyTriggered
+// (backend/internal/server/merge_candidate_verify.go). KEEP IN SYNC: a row of
+// this category carrying supersedes_fixup_trigger_sequence is the conversion
+// trigger that CONFIRMS a stage_fixup_superseded marker (#4391).
+const categoryStageMergeCandidateVerifyTriggered = "stage_merge_candidate_verify_triggered"
+
+// confirmedSupersession is one CONFIRMED stage_fixup_superseded marker.
+type confirmedSupersession struct {
+	StageID         string
+	TriggerSequence int64
+	MarkerSequence  int64
+}
+
+// confirmedSupersessionSeqs is the pure MCP mirror of
+// server.confirmedFixupSupersessions (#4391), the ONE reader rule for a
+// stage_fixup_superseded marker: a marker M confirms iff it decodes a positive
+// trigger_sequence T and a stage_merge_candidate_verify_triggered row V on the
+// SAME (non-empty) stage decodes supersedes_fixup_trigger_sequence == T with
+// V.Sequence > M.Sequence. An inert marker — followed by a dispatch, push or
+// settle instead of a conversion trigger — is never a supersession.
+// Undecodable rows are skipped.
+func confirmedSupersessionSeqs(markers, verifyTriggers []AuditEntry) []confirmedSupersession {
+	var out []confirmedSupersession
+	for _, m := range markers {
+		if m.StageID == nil || *m.StageID == "" {
+			continue
+		}
+		var mp struct {
+			TriggerSequence int64 `json:"trigger_sequence"`
+		}
+		if !decodeAuditPayloadInto(m.Payload, &mp) || mp.TriggerSequence <= 0 {
+			continue
+		}
+		for _, v := range verifyTriggers {
+			if v.StageID == nil || *v.StageID != *m.StageID || v.Sequence <= m.Sequence {
+				continue
+			}
+			var vp struct {
+				SupersedesFixupTriggerSequence int64 `json:"supersedes_fixup_trigger_sequence"`
+			}
+			if !decodeAuditPayloadInto(v.Payload, &vp) || vp.SupersedesFixupTriggerSequence != mp.TriggerSequence {
+				continue
+			}
+			out = append(out, confirmedSupersession{StageID: *m.StageID, TriggerSequence: mp.TriggerSequence, MarkerSequence: m.Sequence})
+			break
+		}
+	}
+	return out
+}
+
 // categoryFixupPushed mirrors backend server.CategoryFixupPushed
 // (backend/internal/server/fixup.go). KEEP IN SYNC: it is the PUSH VETO signal.
 // A trigger window holding one of these DELIVERED a commit to the PR branch, so
 // the backend refunds NOTHING for that window however the pass later died
-// (#3085) — the veto applies uniformly across all four delivered-nothing shapes.
+// (#3085) — the veto applies uniformly across all five delivered-nothing shapes.
 // A mirror that refunded where the backend vetoes would surface a budget the
 // backend refuses to honor, which is worse than no mirror.
 const categoryFixupPushed = "fixup_pushed"
@@ -416,8 +477,9 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 // implement stage from audit data (#777, #860). RemainingFixupBudget mirrors the
 // backend's widened normal budget: it mirrors the backend's ONE unioned
 // per-window refund evaluation — the #967 fixup_no_changes signal, the #1957
-// category-C delivered-nothing signals, and the #3085 category-A harness death,
-// each vetoed by a fixup_pushed in the same window — under the same defensive
+// category-C delivered-nothing signals, the #3085 category-A harness death, and
+// the #4391 confirmed in-place supersession of a queued D6 fix-up, each vetoed
+// by a fixup_pushed in the same window — under the same defensive
 // clamp, and the hard-ceiling check is hoisted
 // ahead of the normal-budget arm to match the backend's error precedence
 // (run.ErrFixupCeilingReached before budget exhaustion). It returns nil (no hint)
@@ -540,13 +602,15 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	// NORMAL-budget arm; the hard ceiling credits refunds up to
 	// maxCeilingRefundCredits (#3335).
 	//
-	// The four unioned signal shapes:
+	// The five unioned signal shapes:
 	//   - #967/#1150: fixup_no_changes — a re-dispatch that produced no commit.
 	//   - #1957: a dispatch_reaper_failed with failure_category C (pre-agent
 	//     spawn-phase death), or a stage_fixup_recovered with
 	//     source_failure_category C (post-agent-work death on the push/report).
 	//   - #3085: a stage_fixup_recovered with source_failure_category A — the
 	//     harness died having pushed nothing.
+	//   - #4391: a CONFIRMED stage_fixup_superseded marker — the operator's
+	//     verify-only re-run superseded a queued, never-dispatched D6 fix-up.
 	refunds, err := r.fixupRefundedPasses(ctx, runID, implementStageID, triggerSeqs)
 	if err != nil {
 		return nil, err
@@ -735,7 +799,7 @@ func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageI
 // and NO fixup_pushed entry? A window refunds AT MOST ONCE however many signals
 // of however many kinds fall inside it.
 //
-// Four signal shapes are unioned, matching the backend exactly:
+// Five signal shapes are unioned, matching the backend exactly:
 //
 //   - fixup_no_changes (#967) — the re-dispatch produced no commit;
 //   - dispatch_reaper_failed with failure_category "C" (#1957) — the #1747
@@ -743,10 +807,14 @@ func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageI
 //   - stage_fixup_recovered with source_failure_category "C" (#1957) — the #788
 //     post-agent-work recovery that still landed nothing;
 //   - stage_fixup_recovered with source_failure_category "A" (#3085) — the
-//     harness death that pushed nothing.
+//     harness death that pushed nothing;
+//   - a CONFIRMED stage_fixup_superseded marker (#4391) — the operator's
+//     verify-only re-run superseded a queued, never-dispatched D6 fix-up in
+//     place (confirmedSupersessionSeqs; an inert marker never counts). The
+//     conversion-trigger read is made only when a marker exists.
 //
 // Category B (policy) still consumes a pass. The PUSH VETO is applied UNIFORMLY
-// across all four: a window holding a fixup_pushed entry contributes nothing,
+// across all five: a window holding a fixup_pushed entry contributes nothing,
 // because that pass DID land a commit and a later death does not undo the push.
 //
 // Window matching is STRICT on both sides (sig > lo && sig < hi), so a signal
@@ -828,6 +896,32 @@ func (r *runResolver) fixupRefundedPasses(ctx context.Context, runID, stageID uu
 		return 0, err
 	}
 	signalSeqs = append(signalSeqs, recovered...)
+
+	// #4391: a confirmed in-place supersession. Both reads are hard errors like
+	// the others; the conversion triggers are read only when a marker exists.
+	readEntries := func(category string) ([]AuditEntry, error) {
+		entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+			Category: category,
+			StageID:  stageID.String(),
+			Limit:    reviewAuditQueryLimit,
+		})
+		return entries, err
+	}
+	markers, err := readEntries(categoryStageFixupSuperseded)
+	if err != nil {
+		return 0, err
+	}
+	if len(markers) > 0 {
+		conversions, err := readEntries(categoryStageMergeCandidateVerifyTriggered)
+		if err != nil {
+			return 0, err
+		}
+		for _, cs := range confirmedSupersessionSeqs(markers, conversions) {
+			if cs.StageID == want {
+				signalSeqs = append(signalSeqs, cs.MarkerSequence)
+			}
+		}
+	}
 
 	// The push veto set. Read UNCONDITIONALLY even when no signal matched, so a
 	// read failure is never masked by an early return.
