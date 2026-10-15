@@ -188,8 +188,13 @@ func TestDelegationTool_CarriesTheCommittedSpecsDelegation(t *testing.T) {
 	if len(fc.MustPageHuman) == 0 {
 		t.Error("must_page_human did not survive the tool boundary")
 	}
-	if len(fc.Escalations) != 1 {
-		t.Fatalf("feature_change has %d escalations, want 1", len(fc.Escalations))
+	// Two escalations: the autonomy clamp (which also attaches the security
+	// persona) and a persona-only entry raising no autonomy ceiling.
+	if len(fc.Escalations) != 2 {
+		t.Fatalf("feature_change has %d escalations, want 2", len(fc.Escalations))
+	}
+	if p := fc.Escalations[1]; p.MaxAutonomy != "" || p.Approvals != nil {
+		t.Errorf("escalations[1] = %+v, want a persona-only entry", p)
 	}
 	e := fc.Escalations[0]
 	if !reflect.DeepEqual(e.Match.Paths, featureChangeEscalationPaths) {
@@ -644,8 +649,8 @@ func TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames(t *test
 	}
 
 	esc := wireArr(t, fc, "escalations", "feature_change")
-	if len(esc) != 1 {
-		t.Fatalf(`"escalations" has %d entries on the wire, want 1`, len(esc))
+	if len(esc) != 2 {
+		t.Fatalf(`"escalations" has %d entries on the wire, want 2`, len(esc))
 	}
 	e := wireObj(t, esc[0], "feature_change.escalations[0]")
 	if got := wireStr(t, e, "max_autonomy", "feature_change.escalations[0]"); got != "medium" {
