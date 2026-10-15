@@ -1,0 +1,14 @@
+id: scenario:issue-4139/unstamped-clone-build-reports-commit
+statement: 'PRECONDITIONS (if any is unmet the criterion is undecidable, not failed): `git` is on PATH, the build directory is a git checkout whose HEAD is the run commit, `go env GOFLAGS` carries no -buildvcs=false, and the Go module cache already holds the CLI''s dependencies. Under those preconditions, a fishhawk CLI built from the checkout with no -ldflags stamp prints `dev (<full 40-hex HEAD commit>)` on `fishhawk version` and exits 0 (the plan''s chosen convention appends `-dirty` when the checkout has uncommitted changes; a clean checkout prints no suffix).'
+verify_hint: 'CLI stdout and exit code: build ./cli/cmd/fishhawk from the checkout with no -ldflags into a temp path, run `<bin> version`, and compare the parenthetical with `git rev-parse HEAD`.'
+steps: 'Preconditions: git is at /usr/bin/git; go env GOFLAGS is empty (no -buildvcs=false); the module cache held the dependencies (offline build succeeded); the preview''s /healthz git_sha is de5c473a. The sanctioned checkout is a git worktree (its .git is a file), and Go records no VCS info there. A control probe showed a plain repo stamps but its `git worktree add` copy does not. So I ran git clone --no-checkout <sanctioned checkout> /tmp/fh4139/clone, then git checkout de5c473a3d83ba52fc2953a83308b52029135a57 (git status clean). In that clone I ran go build -o /tmp/fh4139/fh-clone ./cli/cmd/fishhawk with no -ldflags, then fh-clone version, git rev-parse HEAD and go version -m. To check the dirty convention, I appended a newline to README.md, rebuilt, ran version, then restored README.md.'
+assertions:
+    expected: '`dev (<full 40-hex HEAD commit>)` exit 0, with no suffix on a clean checkout'
+    observed_at_record: stdout 'dev (de5c473a3d83ba52fc2953a83308b52029135a57)', exit 0, equal to git rev-parse HEAD; go version -m shows vcs.revision=de5c473a... and vcs.modified=false. The dirty build printed 'dev (de5c473a3d83ba52fc2953a83308b52029135a57-dirty)'. For contrast, the same unstamped build inside the sanctioned worktree prints 'dev' because Go embedded no vcs.revision.
+    repro_handle: git clone --no-checkout <tree> c && cd c && git checkout de5c473a && go build -o /tmp/fh ./cli/cmd/fishhawk && /tmp/fh version
+origin:
+    issue: 4139
+    pr: 4467
+    run_id: 9a4eac5e-9759-480a-a2c9-24217c6aeeb5
+    head_sha: de5c473a3d83ba52fc2953a83308b52029135a57
+    recorded_at: 2026-10-15T19:57:13Z
