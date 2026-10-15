@@ -101,6 +101,13 @@ const (
 	SeatFirstOfficer Seat = "first_officer"
 )
 
+// RequestScope is the narrow scope a first-officer seat files a request with
+// (E85.6 / #4148). POST /v0/specialist-jobs honors it ONLY from a seat
+// identity (a first_officer/ token subject); every other caller still needs
+// write:stages, so a non-seat token holding only this scope is refused. It is
+// not in the operator default scope set.
+const RequestScope = "request:specialist_jobs"
+
 // Sentinel errors for the rules the schema cannot express.
 var (
 	// ErrDuplicateMember: an object repeats a member name. map decoding

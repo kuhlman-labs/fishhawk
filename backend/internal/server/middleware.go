@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -415,6 +416,17 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 								// bearer request to it. Empty for untenanted /
 								// operator tokens (NULL account_id).
 								AccountID: rec.AccountID,
+							}
+							// A first-officer seat token (ADR-089 D2, E85.6 /
+							// #4148) is clamped to the seat scope profile,
+							// retired when its anchor is terminal, and bound to
+							// its anchor's account. Every arm fails closed.
+							if firstofficer.IsSeatSubject(rec.Subject) {
+								seat, ok := s.resolveFirstOfficerSeat(w, r, id)
+								if !ok {
+									return
+								}
+								id = seat
 							}
 						}
 					}
