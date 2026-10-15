@@ -43,9 +43,9 @@
 // deliberately outside the instrument, so a prompt change stays comparable.
 //
 // LEGACY v1. A planreview-catchrate-evidence-v1 record is recognised by a
-// version-dispatching reader: the gate refuses it naming the shared
-// #4313/#4314 re-pin recording, and the recorder treats it as a
-// non-comparable baseline (only a pin replaces it).
+// version-dispatching reader: the gate refuses it naming the #4313 re-pin
+// recording (#4314 re-pinned separately after it), and the recorder treats it
+// as a non-comparable baseline (only a pin replaces it).
 //
 // THE BASELINE IS PINNED, NOT ROLLING. Every recording is judged against two
 // references: its own same-run without-conventions arm (the within-run rule)
@@ -107,8 +107,10 @@ const CatchRateEvidenceSchema = "planreview-catchrate-evidence-v2"
 // (never accepted) by readCatchRateEvidence.
 const catchRateEvidenceSchemaV1 = "planreview-catchrate-evidence-v1"
 
-// catchRateSharedRecording names the remedy for a legacy v1 record.
-const catchRateSharedRecording = "the shared #4313/#4314 re-pin recording (one recording of every arm, pinning a v2 baseline)"
+// catchRateLegacyRepin names the remedy for a legacy v1 record, in the order
+// the Captain ruled on 2026-10-12: #4313 is recorded first, on its own re-pin,
+// and #4314 is re-pinned separately after it (not one shared recording).
+const catchRateLegacyRepin = "the #4313 re-pin recording (#4313 recorded first, pinning the first v2 baseline over every arm; #4314 re-pinned separately after it)"
 
 // errLegacyCatchRateEvidence marks a v1 record.
 var errLegacyCatchRateEvidence = errors.New("legacy planreview-catchrate-evidence-v1 record")
@@ -709,7 +711,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		ref = existing.Baseline
 	}
 	if legacy && !opts.PinBaseline && !opts.DryRun {
-		return "", fmt.Errorf("agenteval: the existing catch-rate evidence %q is a legacy %s record: its baseline is not comparable to an arm-keyed measurement, so this recording must pin a new one (PinBaseline with a reason) — %s; see %s", evidencePath, catchRateEvidenceSchemaV1, catchRateSharedRecording, catchRateRunbook)
+		return "", fmt.Errorf("agenteval: the existing catch-rate evidence %q is a legacy %s record: its baseline is not comparable to an arm-keyed measurement, so this recording must pin a new one (PinBaseline with a reason) — %s; see %s", evidencePath, catchRateEvidenceSchemaV1, catchRateLegacyRepin, catchRateRunbook)
 	}
 	if ref == nil && !legacy && !opts.PinBaseline && !opts.DryRun {
 		return "", fmt.Errorf("agenteval: no pinned catch-rate baseline exists in %q: the first recording must pin one (PinBaseline with a reason); see %s", evidencePath, catchRateRunbook)
@@ -926,7 +928,7 @@ func decodeCatchRateEvidence(raw []byte) (*CatchRateEvidence, error) {
 		Schema string `json:"schema"`
 	}
 	if err := json.Unmarshal(raw, &head); err == nil && head.Schema == catchRateEvidenceSchemaV1 {
-		return nil, fmt.Errorf("%w: the arm-keyed gate does not read it — re-record every arm in %s", errLegacyCatchRateEvidence, catchRateSharedRecording)
+		return nil, fmt.Errorf("%w: the arm-keyed gate does not read it — re-pin every arm with a fresh v2 recording (PinBaseline); history: %s", errLegacyCatchRateEvidence, catchRateLegacyRepin)
 	}
 	var rec CatchRateEvidence
 	if err := decodeStrictJSON(raw, &rec); err != nil {
@@ -1003,8 +1005,8 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //
 //	(1) an absent evidence file
 //	(2) malformed JSON, an unknown field, or trailing content after the record
-//	(3) a wrong schema; (3b) a legacy v1 record, refused naming the shared
-//	    #4313/#4314 re-pin recording
+//	(3) a wrong schema; (3b) a legacy v1 record, refused naming the #4313
+//	    re-pin recording (#4314 re-pinned separately after it)
 //	(4) a stale prompt fingerprint, or a generator model other than
 //	    generatorModel; (4b) a stale ARM fingerprint, naming every stale arm;
 //	    (4c) a recorded catch_rule_version other than the current catch rule,

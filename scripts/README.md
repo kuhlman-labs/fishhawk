@@ -3699,7 +3699,8 @@ instrument changes: while the record is stale, the check fails on EVERY
 change that touches a trigger path**, including the branch that changed the
 instrument. That is the design, not a defect. Since E78.11 / #4313 the gate
 reads an arm-keyed `planreview-catchrate-evidence-v2` record and REFUSES the
-committed legacy v1 pair, naming the shared #4313/#4314 re-pin recording, so
+committed legacy v1 pair, naming the #4313 re-pin recording (#4314 re-pinned
+separately after it), so
 the check fails on every trigger-path change until that recording lands.
 
 ### Trigger paths and the change set

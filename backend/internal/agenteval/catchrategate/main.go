@@ -16,7 +16,8 @@
 // --security-corpus (the security and security_portability persona arms,
 // E80.17 / #4314, whose remit docs/review/security-remit.md and convention
 // docs/review/security-conventions.md are read from --repo-root). A legacy v1
-// record is refused naming the shared #4313/#4314 re-pin recording.
+// record is refused naming the #4313 re-pin recording (#4314 re-pinned
+// separately after it).
 //
 // --rescore is a DIAGNOSTIC, not a gate verdict (E55.22 / #4355): it
 // re-classifies the sidecar derived from --evidence under the CURRENT arm
@@ -116,8 +117,8 @@ Exit 0: the evidence passes. Exit 1: the gate fails (reason on stderr). Exit 2: 
 The arms: without_conventions and with_conventions (--corpus, --conventions),
 architect (--persona-corpus), and security and security_portability
 (--security-corpus; the security remit and convention), the persona documents
-read under --repo-root. A legacy v1 record is refused: re-record every arm in
-the shared #4313/#4314 re-pin.
+read under --repo-root. A legacy v1 record is refused: re-pin every arm (#4313
+recorded first on its own re-pin; #4314 re-pinned separately after it).
 
 --rescore is a diagnostic, not a gate verdict: it re-classifies the recorded
 trial sidecar under the CURRENT arm table and catch rule with no model call and

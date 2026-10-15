@@ -1787,6 +1787,28 @@ func TestCatchRateArmReport_RateWithNoTrials(t *testing.T) {
 	}
 }
 
+// TestCatchRateArmReport_RatePoolsEveryExpectationClass pins the documented
+// contrast: Rate()/Totals() pool every case regardless of Expect, so a clean
+// case's trials dilute a persona arm's catch rate, while pooledClassCounts
+// keeps the catch and clean classes apart. Rate is a catch rate only for a
+// catch-only (conventions) arm.
+func TestCatchRateArmReport_RatePoolsEveryExpectationClass(t *testing.T) {
+	r := CatchRateArmReport{PerCase: map[string]CaseCatchCounts{
+		"catching": {Trials: 10, Caught: 8},
+		"clean":    {Expect: CatchExpectClean, Trials: 10, FalseAlarms: 2},
+	}}
+	if trials, caught, undecodable := r.Totals(); trials != 20 || caught != 8 || undecodable != 0 {
+		t.Errorf("Totals() = %d/%d/%d, want 20 trials, 8 caught, 0 undecodable (every class pooled)", trials, caught, undecodable)
+	}
+	if got := r.Rate(); got != 0.4 {
+		t.Errorf("Rate() = %v, want 0.4 (8 caught / 20 pooled trials: the clean case dilutes the denominator)", got)
+	}
+	want := classCounts{catchTrials: 10, caught: 8, cleanTrials: 10, alarms: 2}
+	if got := pooledClassCounts(r.PerCase); got != want {
+		t.Errorf("pooledClassCounts = %+v, want %+v (the per-class pools a persona arm is judged on)", got, want)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Catch rule v5 (#4313): category predicate, step anchor, clean kind.
 // ---------------------------------------------------------------------------

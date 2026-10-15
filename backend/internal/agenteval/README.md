@@ -613,7 +613,8 @@ legacy v1 pair until the operator's #4313 re-pin recording: #4313 is recorded
 and merged FIRST on its own re-pin, and #4314 (which registers its security
 arms in the same arm table) records separately after it (Captain ruling
 2026-10-12). Until then `catchrategate` refuses the v1 record (its refusal
-text still names a shared #4313/#4314 recording), and `scripts/check-review-prompt-eval` fails on every trigger-path
+text states that sequence: #4313 recorded first, #4314 re-pinned separately
+after it), and `scripts/check-review-prompt-eval` fails on every trigger-path
 change. That check runs outside `scripts/test verify`, so merge-time verify is
 unaffected; no verify test pins the committed fingerprint or a committed PASS.
 
@@ -1170,7 +1171,8 @@ pinned 0.90 the THIRD recording (0.74, 0.16 below) is refused
   arm-table, catch-rule or case-input change an ordinary recording is refused
   ("not comparable — re-pin"); the re-pin is again explicit and reasoned.
 - A LEGACY v1 record is a non-comparable baseline: `CheckCatchRateEvidence`
-  refuses it naming the shared #4313/#4314 re-pin recording;
+  refuses it naming the #4313 re-pin recording (#4314 re-pinned separately
+  after it);
   `RecordCatchRateEvidence` over it refuses a non-pinning recording (both
   files stay byte-identical), lets a pin replace it, and lets a dry run
   proceed.
@@ -1521,7 +1523,8 @@ regression, (10) a missing, malformed or non-comparable baseline (generator
 model, catch rule, arm set, or per arm case set, expectation class,
 `samples_per_case` or case inputs differ) or a regression against it, (11) an unavailable corpus, (12) an unavailable
 conventions fixture. The arm-keyed modes (E78.11 / #4313): (3b) a legacy v1
-record, refused naming the shared #4313/#4314 re-pin recording; (4b) a stale
+record, refused naming the #4313 re-pin recording (#4314 re-pinned separately
+after it); (4b) a stale
 arm fingerprint, naming the arm; (4c, #4326) a recorded `catch_rule_version`
 other than the current catch rule, or an arm `input_digest` other than the
 current arm table's — a record made before #4326 carries neither, so it is

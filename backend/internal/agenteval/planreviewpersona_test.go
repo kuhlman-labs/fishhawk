@@ -740,9 +740,14 @@ func TestPersonaGeneratorSystemPrompt_NamesQuoteFields(t *testing.T) {
 // tripwire for approval condition C1: the real index is near the
 // DefaultMaxBytes cap and decisionrecord.Assemble truncates an over-cap index,
 // which would silently drop the tail entries the persona cases rest on. The
-// records the in-test superseded case and the planned architect cases depend
-// on (ADR-033, ADR-076, ADR-094) must appear in the RENDERED, post-truncation
-// index text. The committed-corpus test asserts the same per case.
+// in-test superseded case rests on ADR-033 and its successor ADR-076; both
+// must appear in the RENDERED, post-truncation index text. ADR-094 is a later
+// index entry that no committed case rests on, kept here as a further
+// truncation sentinel; it is not free to drop, because its presence is also a
+// premise of TestPersonaCatchCorpus_NotLeakedIntoPersonaPrompt and of the
+// adr006-production-migrate-down case.md. The committed corpus's governing
+// records and their successors (ids and titles) are asserted per case by
+// TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes.
 func TestPersonaArmPrompt_GoverningIndexEntriesSurviveTruncation(t *testing.T) {
 	cases := loadTestPersonaCases(t)
 	r, err := PersonaArmPrompt(cases["superseded"], personaTestRepoRoot)

@@ -1942,10 +1942,9 @@ func copyPersonaRepo(t *testing.T) CatchRateInputs {
 // per_case entry for EVERY committed case of that arm and a pinned baseline,
 // and pass every count invariant and every rule — so the documented shape
 // cannot drift from what CheckCatchRateEvidence accepts (only the
-// fingerprints are placeholders). A LEGACY v1 block (the README before the
-// #4313 docs slice rewrites it) must be recognised by the version-dispatching
-// reader as legacy — never accepted, never mistaken for a malformed v2 record.
-// Adding a corpus case obliges a README update.
+// fingerprints are placeholders). A LEGACY v1 block FAILS the test: the README
+// must document the v2 record the gate accepts. Adding a corpus case obliges a
+// README update.
 func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	readme := string(mustRead(t, "README.md"))
 	const begin, end = "<!-- BEGIN minimal-catchrate-evidence -->", "<!-- END minimal-catchrate-evidence -->"
@@ -1959,8 +1958,7 @@ func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	block = strings.TrimSuffix(block, "```")
 	rec, err := decodeCatchRateEvidence([]byte(block))
 	if errors.Is(err, errLegacyCatchRateEvidence) {
-		t.Logf("README minimal record is the LEGACY %s shape: recognised as legacy; the #4313 docs slice rewrites it as a v2 record", catchRateEvidenceSchemaV1)
-		return
+		t.Fatalf("README minimal record is the LEGACY %s shape; the README block must be a %s record: %v", catchRateEvidenceSchemaV1, CatchRateEvidenceSchema, err)
 	}
 	if err != nil {
 		t.Fatalf("README minimal record: %v", err)
@@ -2036,9 +2034,9 @@ func TestCheckCatchRateEvidence_PerArmModes(t *testing.T) {
 		want      string
 		regressed bool
 	}{
-		{name: "(3b) a legacy v1 record names the shared re-recording", raw: func([]byte) []byte {
+		{name: "(3b) a legacy v1 record names the #4313-then-#4314 re-pin sequence", raw: func([]byte) []byte {
 			return []byte(`{"schema":"planreview-catchrate-evidence-v1","samples_per_case":12,"arms":{}}`)
-		}, want: "#4313/#4314 re-pin recording"},
+		}, want: "#4313 recorded first, pinning the first v2 baseline over every arm; #4314 re-pinned separately after it"},
 		{name: "(6b) false_alarms on a catch case", mutate: func(r *CatchRateEvidence) {
 			setCounts(r.Arms, ArmArchitect, catchCase, func(c *CaseCatchCounts) { c.Caught, c.FalseAlarms = c.Trials-1, 1 })
 		}, want: "on a catch case"},
@@ -2325,7 +2323,7 @@ func TestRecordCatchRateEvidence_V1ExistingRequiresPin(t *testing.T) {
 	if !bytes.Equal(mustRead(t, path), legacy) {
 		t.Fatal("a dry run changed the legacy record")
 	}
-	report, err = record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("shared #4313/#4314 re-pin"))
+	report, err = record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("#4313 re-pin"))
 	if err != nil {
 		t.Fatalf("pin over a legacy record: %v", err)
 	}
