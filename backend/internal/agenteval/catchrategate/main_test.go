@@ -17,13 +17,15 @@ const (
 	testCorpus        = "../testdata/planreview-miss-corpus"
 	testConventions   = "../testdata/planreview-catchrate/representative-conventions.md"
 	testPersonaCorpus = "../testdata/planreview-persona-corpus/architect"
+	testSecurity      = "../testdata/planreview-persona-corpus/security"
 	testRepoRoot      = "../../../.."
 )
 
 // testInputs is the committed arm-table inputs with the given conventions
 // fixture.
 func testInputs(conventions string) agenteval.CatchRateInputs {
-	return agenteval.CatchRateInputs{CorpusDir: testCorpus, ConventionsPath: conventions, PersonaCorpusDir: testPersonaCorpus, RepoRoot: testRepoRoot}
+	return agenteval.CatchRateInputs{CorpusDir: testCorpus, ConventionsPath: conventions, PersonaCorpusDir: testPersonaCorpus,
+		SecurityCorpusDir: testSecurity, RepoRoot: testRepoRoot}
 }
 
 // allCaughtSender answers every call with a verdict whose ONE concern names
@@ -31,7 +33,10 @@ func testInputs(conventions string) agenteval.CatchRateInputs {
 // satisfies both halves of every conventions case's catch rule. The architect
 // arm gets the same answer: an acceptance_criteria concern, so its catch
 // cases are missed (the decision_record category predicate) and its clean
-// cases raise no false alarm — a passing first pin either way.
+// cases raise no false alarm. The security arms get it too: their catch cases
+// miss and, their clean rule having no category predicate, every clean trial
+// is a false alarm (other_category) — still a passing first pin, which has no
+// baseline to regress against.
 type allCaughtSender struct{ response string }
 
 func newAllCaughtSender(t *testing.T) *allCaughtSender {
@@ -472,5 +477,56 @@ func TestRun_PersonaFlags(t *testing.T) {
 			}
 			assertRuleLine(t, stderr)
 		})
+	}
+}
+
+// TestRun_SecurityCorpusFlag (#4314): --security-corpus reaches the arm table
+// — the committed default and an explicit committed path pass, and a
+// nonexistent security corpus fails the gate closed (exit 1) naming the
+// security corpus. A checkout root without the security documents fails the
+// same way.
+func TestRun_SecurityCorpusFlag(t *testing.T) {
+	fresh := freshRecord(t, testConventions)
+	if code, _, stderr := runGate("--evidence", fresh, "--security-corpus", testSecurity); code != 0 {
+		t.Fatalf("premise: an explicit --security-corpus passes; exit %d, stderr:\n%s", code, stderr)
+	}
+	for name, args := range map[string][]string{
+		"nonexistent security corpus": {"--security-corpus", filepath.Join(t.TempDir(), "none")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runGate(append([]string{"--evidence", fresh}, args...)...)
+			if code != 1 || !strings.Contains(stderr, "security corpus unavailable") {
+				t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the security corpus", code, stderr)
+			}
+			if strings.Contains(stdout, "catchrategate: PASS") {
+				t.Fatalf("stdout reports a PASS:\n%s", stdout)
+			}
+			assertRuleLine(t, stderr)
+		})
+	}
+	var stderr bytes.Buffer
+	run([]string{"-h"}, &bytes.Buffer{}, &stderr)
+	for _, want := range []string{"-security-corpus", "planreview-persona-corpus/security", "docs/review/security-remit.md", "docs/review/security-conventions.md", "security_portability"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("usage lacks %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_SecurityCorpusDefault: with no flags the gate resolves the
+// committed security corpus from the backend module root (the default the
+// operator's run uses) — print-fingerprint over the defaults succeeds and
+// equals the fingerprint over the explicit committed inputs.
+func TestRun_SecurityCorpusDefault(t *testing.T) {
+	code, stdout, stderr := runGate("--print-fingerprint")
+	if code != 0 {
+		t.Fatalf("exit %d, stderr:\n%s", code, stderr)
+	}
+	want, err := agenteval.CatchRatePromptFingerprint(testInputs(testConventions), agenteval.DefaultCatchRateGeneratorModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, want) {
+		t.Errorf("default fingerprint output %q does not carry the explicit-inputs fingerprint %s", stdout, want)
 	}
 }

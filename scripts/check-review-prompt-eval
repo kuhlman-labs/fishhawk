@@ -2,7 +2,8 @@
 # check-review-prompt-eval: the STANDING, path-triggered check that a change to
 # the plan-review prompt carries PASSING recorded arm-keyed catch-rate evidence
 # (E55.4 / #2245; arm-keyed since E78.11 / #4313: the two conventions arms plus
-# the architect persona arm).
+# the architect persona arm, and since E80.17 / #4314 the security and
+# security_portability persona arms).
 #
 # When any review-prompt path (TRIGGERS below) changed since the merge base with
 # BASE, it requires the OFFLINE gate command
@@ -77,11 +78,14 @@ TRIGGERS=(
   backend/internal/agenteval/planreviewpersona.go
   backend/internal/agenteval/planreviewcalibrate.go
   backend/internal/agenteval/planreviewrescore.go
+  backend/internal/agenteval/implementreviewsecurity.go
   backend/internal/agenteval/catchrategate/
   backend/internal/agenteval/testdata/planreview-miss-corpus/
   backend/internal/agenteval/testdata/planreview-persona-corpus/
   backend/internal/agenteval/testdata/planreview-catchrate/
   docs/review/architect-remit.md
+  docs/review/security-remit.md
+  docs/review/security-conventions.md
 )
 
 GATE_PKG="./internal/agenteval/catchrategate"
