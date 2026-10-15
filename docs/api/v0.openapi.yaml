@@ -15646,6 +15646,24 @@ paths:
         run — so that boot-marker gate is the control that keeps it from
         terminating a live reviewer.
 
+        **Exception: lost review terminals (E72.64 / #4106).** A reviewer
+        that finished but whose terminal audit write never landed (the audit
+        store failed past the writer's bounded retry) is recorded in the
+        serving process's lost-terminal registry, and a bounded background
+        settle lands a named `*_review_failed` for it once the store accepts
+        writes. When that settle has not landed it yet, this endpoint ACCEPTS
+        the round even though the serving daemon dispatched it: it appends
+        exactly those registered failures — reason prefix
+        `verdict_write_failed`, summarising the lost verdict (its verdict and
+        concern count) or the lost skip/failure (its category and reason) —
+        capped at `configured_agents - landed_before`, never closing a
+        still-running reviewer's share. `synthesized` counts them and
+        `terminated` is `true`. A round with no registered lost terminal is
+        still refused as above. The registry is process-local: a restart
+        empties it, and the boot sweep then handles the round as an orphan.
+        The endpoint stays terminate-only — it only ever writes
+        `*_review_failed`.
+
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403),
         mirroring the sibling recovery verb `reap-failure`.
@@ -15697,8 +15715,12 @@ paths:
                           type: integer
                           description: |
                             Terminal `*_review_failed` entries appended by this
-                            call (`configured_agents - landed_before`); 0 when
-                            nothing needed healing.
+                            call: `configured_agents - landed_before` for an
+                            orphaned round, or the count of registered lost
+                            terminals landed (`verdict_write_failed`, at most
+                            `configured_agents - landed_before`) for a round
+                            the serving daemon dispatched; 0 when nothing
+                            needed healing.
                         skipped:
                           type: boolean
                           description: True when this stage healed nothing.
