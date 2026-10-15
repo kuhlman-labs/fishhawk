@@ -9,7 +9,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 - `cmd/fishhawk/` — the binary entrypoint. Subcommand dispatch in `main.go`, per-command flags in `run.go`, validate logic in `validate.go`.
 - `internal/httpclient/` — typed wrapper around the backend API. Marshals `CreateRunInput`, decodes `Run`, surfaces `*APIError` for non-2xx responses.
 - `internal/spec/` — workflow-spec validator. Embeds `workflow-v0.schema.json` (mirrored from `docs/spec/`; the schema-sync diff in CI fails if the copies drift) and runs JSON Schema validation locally so users iterate on errors before opening a PR.
-- `internal/version/` — build-version package; `Version`/`GitSHA` are stamped via the `-X` pairs `scripts/release-ldflags fishhawk <version> <sha>` prints (unstamped `go install` builds report `dev`).
+- `internal/version/` — build-version package; `Version`/`GitSHA` are stamped via the `-X` pairs `scripts/release-ldflags fishhawk <version> <sha>` prints (an unstamped binary reports the version and `vcs.revision` Go recorded via `debug.ReadBuildInfo`, else `dev`; any stamp wins, #4139).
 
 ## Status
 
@@ -453,7 +453,7 @@ Operator guide: `docs/onboarding.md`.
 
 This works because `cli/go.mod` carries NO `replace` directive — `go install` refuses a module with one ([go.dev/ref/mod#go-install](https://go.dev/ref/mod#go-install)) — and requires the sibling `credstore` module by **pseudo-version** instead (#4117). `cmd/fishhawk/gomod_test.go`'s `TestCLIModuleIsGoInstallable` pins that precondition: no `replace` (single-line or block), a pseudo-version credstore require, and both `go.sum` hashes for exactly that version. A plain `go build` cannot catch a regression there, because workspace mode ignores both.
 
-A `go install`ed CLI is **unstamped**: `fishhawk version` prints `dev` (no git SHA). Stamped builds come from `scripts/release-ldflags` (see `scripts/README.md` § "Release stamping").
+A `go install`ed CLI is **unstamped**, so `fishhawk version` falls back to the module version Go recorded in the binary (a pseudo-version for `@latest` or a commit, the tag for a tagged ref) with no git SHA, because module-cache builds carry no VCS settings (#4139). A plain `go build` from a git clone prints `dev (<commit>)`, with `-dirty` appended when the tree is modified. An ldflags stamp always wins over the fallback. Stamped builds come from `scripts/release-ldflags` (see `scripts/README.md` § "Release stamping").
 
 **Workspace precedence.** Inside the repo, `go.work`'s `use ./credstore` wins over the pin, so local, CI and gate builds always compile the in-tree credstore; the pin only governs `go install` and `GOWORK=off` builds.
 
