@@ -199,3 +199,37 @@ The opt-in `sequences:` allocator that #4018 also proposes is **recorded outside
   - 2: rebase producer plus runner pass;
   - 3: merge gate;
   - 4: decomposed-parent hold.
+
+## Amendment 1 (2026-10-14): an operator base merge is a base advance (#4368)
+
+**Accepted (2026-10-14) at the plan approval of #4368; the wording is surfaced to the Captain before merge.** Amends D8's third bullet ("operator-vouched heads") and the matching Consequences residual. D1–D7 are unchanged.
+
+**Context.** D8 exempted every operator-vouched head from the merge-candidate pass. Rules 1–2 of the head classifier recognise only base advances the PRODUCT wrote (a performed `branch_rebased` merge, a `conflict_resolution_pushed` head). So an operator who merges the base into the run branch by hand and vouches the result takes the exemption, and the combined tree is never product-verified.
+
+Recorded instance: #4293, run e16e6c42. The operator pushed a merge of `main` (head 4ce8fa15) and vouched it. `rebase_run_branch` answered `already_up_to_date` with merge-candidate state `not_required`, and `merge_run` queued the merge with no pass. The tree that landed was never verified.
+
+**Decision.** Rule 4 (an operator-vouched head) no longer exempts unconditionally. The vouch exempts the head H only when a forge probe proves H brings in no base commit that the run's newest VERIFIED head lacks.
+
+- **Reference head V.** The newest head on the run's chain (by chain sequence) whose tree the product gated or verified, never H itself:
+  - a runner-gated head report (`pull_request_opened`, `fixup_pushed`, `child_pushed`);
+  - a `merge_candidate_verified` row with result `passed`;
+  - in ADR-096 `enforce` mode only, the `to_head` of a `merge_candidate_verdict_transferred` row (the same rollback contract as the verdict read).
+- **Probe.** Two GitHub three-dot compares: `V...H` (commits H has and V lacks) and `<PR base ref>...H` (H's branch-only commits). A commit in the first and not in the second is one the base already contains, so H brought it in → `base_advance`. None → `not_required`, which is D8's operator-edit case.
+- **Undecidable on a probeable run fails closed to `base_advance`:** no verified reference head on the chain, an empty PR base ref, or a compare at the un-paginated 250-commit cap (a truncated list cannot prove absence).
+- **A forge or audit read error is returned.** Every reader already fails closed on it (D7): the merge gate answers 502 `merge_candidate_check_failed`.
+- **A deployment that cannot probe** (no GitHub client, no installation, an unparseable repo, no PR number) keeps the pre-amendment exemption with a WARN log, mirroring D7's determinability ladder.
+- **No new surface.** No new cause, state, wire field or audit category. The existing readers do the rest: `merge_run` refuses 409 `merge_candidate_unverified` (cause `base_advance`) until a pass passes on exactly that head, and `rebase_run_branch`'s already-up-to-date arm starts the verify-only pass.
+
+**D8, as amended.** "Operator-vouched heads are not gated ONLY when they bring in no base commit the newest verified head lacks. An operator merge of the base (or an operator conflict-resolution merge) is a base advance and needs a passing merge-candidate verify."
+
+**Consequences.**
+- An operator base merge or conflict-resolution merge now costs one verify-only pass, started by `rebase_run_branch`'s already-up-to-date arm and serialized through the ADR-092 queue.
+- A vouched edit on top of a head whose tree was never verified (a product rebase whose pass never reported, a decomposed parent before its fan-in pass) now reads `base_advance`, or fails closed when nothing on the chain was ever verified. The tree under the vouch was never verified either.
+- Each classification of a vouched head not caught by rules 1–3 costs one pull-request read and up to two compares, on every reader (merge gate, rebase up-to-date arm, fan-in hold, queue admission, gate view, verdict transfer, review re-run hint).
+
+**Residuals, stated.**
+- A base change carried in by a NON-merge commit (a cherry-pick, a hand copy) has a fresh SHA the base does not contain, so it is not detected. Option (b), a scope-bounded tree diff, was not adopted: it would strip D8's canonical case, an operator remediation commit outside the run's scope.
+- A deployment that cannot probe keeps the exemption (D7).
+- The 250-commit compare cap fails closed, so a very long branch pays a pass it might not need.
+
+**Implementation.** #4368.
