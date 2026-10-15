@@ -116,11 +116,42 @@ Contract of record: `docs/api/v0.openapi.yaml`.
 | Route | Scope | Purpose |
 |---|---|---|
 | POST `/v0/specialist-jobs` | `write:stages`, non-run-bound identity | file a request; `draft` answers 201 completed, other kinds 201 queued |
-| GET `/v0/specialist-jobs/{job_id}` | `read:runs`, own account | job state, inputs, verdict, result, derived `stale`; NEVER returns `execution_nonce` |
-| POST `/v0/specialist-jobs/{job_id}/admission` | `write:stages` | admit-or-queue, heartbeat with the same nonce, stale-running takeover under a new nonce |
-| POST `/v0/specialist-jobs/{job_id}/result` | `write:stages` | ship the completion; touches only `specialist_jobs` and the audit chain |
+| GET `/v0/specialist-jobs/{job_id}` | `read:runs` or `attest:specialist-jobs`, own account | job state, inputs, verdict, result, derived `stale`, `provenance` and `blocking_eligible` when completed; NEVER returns `execution_nonce` |
+| POST `/v0/specialist-jobs/{job_id}/admission` | `write:stages` or `attest:specialist-jobs` | admit-or-queue, heartbeat with the same nonce, stale-running takeover under a new nonce; an attester's admission to running also delivers the attestation key once |
+| POST `/v0/specialist-jobs/{job_id}/result` | `write:stages` or `attest:specialist-jobs` | ship the completion, optionally signed (`X-Fishhawk-Signature`); touches only `specialist_jobs` and the audit chain |
+
+A cookie session keeps `requireWriteScope`'s posture on all three routes: scopes are checked only for an explicit API token. `attest:specialist-jobs` never satisfies POST `/v0/specialist-jobs`, so a runner credential cannot file a job.
 
 ## Audit payloads
 
 - `specialist_job_requested`: `{job_id, kind, requester, subject, inputs}` — `inputs` is the request's inputs member, recorded as semantic JSON (JSONB normalizes key order and whitespace). On the run chain when `subject.run_id` is set, else the account's global chain.
-- `specialist_job_completed`: `{job_id, kind, requester (from the job row), subject, verdict, reason, evidence, charged_to, duration_ms, requested_sequence, provenance: "bearer"}`. Result provenance is the forwarded operator bearer, not a runner signature: specialist results are not ADR-089 D4 blocking-grade evidence until #4363.
+- `specialist_job_completed`: `{job_id, kind, requester (from the job row), subject, verdict, reason, evidence, charged_to, duration_ms, requested_sequence, provenance, blocking_eligible, attested_by}` — `provenance` is `bearer` or `runner_attested`, `blocking_eligible` is `BlockingEligible(provenance)`, and `attested_by` (the minting attester's token subject) is present only for `runner_attested`. See § "Result provenance and attestation".
+
+## Result provenance and attestation
+
+E85.15 / #4363. Pure helpers: `backend/internal/specialistjob/attestation.go`; persistence: migration 0104 (`attestation_public_key`, `attestation_subject`, `attestation_expires_at`, `provenance` on `specialist_jobs`, all nullable). `$defs.result` is unchanged: provenance lives on the job row, the audit payload and the API read, never in the result document.
+
+- **Scope.** `attest:specialist-jobs` (`specialistjob.AttestScope`). It is absent from the operator default scope set (so the HTTP token-mint ceiling refuses it and `token migrate --apply` never grants it), absent from the OAuth vocabulary, never carried by a run-bound `mcp:run:` token, and never satisfied by a cookie session. It is issued only by `fishhawkd token issue --subject <s> --scopes attest:specialist-jobs`. An **attester** is a caller authenticated by an explicit API token (non-empty token id) holding that scope whose subject is not `mcp:run:`-prefixed.
+- **Subject binding.** The key binds to the minting token's SUBJECT, not to the token id, so two tokens issued to the same subject are interchangeable attesters. Issue one attester token per host subject (e.g. `specialist-runner/<host>`).
+- **Key lifecycle.**
+  - Mint: an admission that moves a job to running (fresh or stale takeover) by an attester mints a fresh Ed25519 key. The store keeps the 32-byte public half, the attester's subject and `attestation_expires_at = clock_timestamp() + AttestationTTL` (5 min). The 64-byte private key is returned once in that admission answer and never stored. A queued answer and a heartbeat never deliver a key.
+  - Clear: an admission to running by a non-attester sets all three attestation columns NULL, so a takeover always invalidates the previous runner's key.
+  - Slide: a same-nonce heartbeat refreshes the expiry by `AttestationTTL` only when the heartbeating attester is the minting subject and a key is present. Any other heartbeat leaves it unchanged.
+  - Liveness is `attestation_expires_at > clock_timestamp()`, decided on the database clock, never on fishhawkd's.
+  - Consume: every completion sets `attestation_public_key` and `attestation_expires_at` NULL. A key verifies at most one result.
+- **Signed message.** `ResultMessage(job_id, body) = sha256("fishhawk-specialist-job-result-v1" || 0x00 || job_id || 0x00 || sha256(body))`, where `job_id` is the canonical lowercase hyphenated UUID string and `body` is the EXACT result request body bytes. The runner sends the hex Ed25519 signature over that 32-byte digest as `X-Fishhawk-Signature` (the header convention ShipTrace and ShipAcceptance use).
+- **Verification**, in order, each a distinct refusal reason (`specialistjob.AttestationError.Reason`, wrapping `ErrAttestationInvalid`):
+
+  | Reason | Condition |
+  |---|---|
+  | `no_attestation_key` | no stored key of 32 bytes (never minted, cleared by a takeover, or consumed) |
+  | `attestation_expired` | the stored key is not live on the database clock |
+  | `subject_mismatch` | the caller's token subject is not the minting subject |
+  | `signature_malformed` | the decoded signature is not 64 bytes (the handler also uses it for a header that is not hex) |
+  | `signature_invalid` | the signature does not verify over `ResultMessage(job_id, body)` |
+  | `caller_not_attester` | decided by the handler: a signature header from a caller that is not an attester |
+
+  A refusal is 401 `specialist_job_attestation_invalid` with `details.reason`, after the job's state and nonce checks, and writes nothing (the job stays running).
+- **Provenance.** A verified result records `runner_attested`. A result with no signature header records `bearer` (advisory). A pre-0104 completion (provenance NULL) and a `draft` read as `bearer`.
+- **Blocking eligibility.** `specialistjob.BlockingEligible(provenance)` is the ONE predicate deciding ADR-089 D4 blocking eligibility: true only for `runner_attested`; `bearer`, empty and unknown provenance are false.
+- **Residual.** The scope proves possession of a credential a plain `write:stages` bearer cannot mint over the API. It does not isolate the attester token from a same-host, same-OS-user process that can read the runner's environment.

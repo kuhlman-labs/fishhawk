@@ -87,3 +87,18 @@ func TestRunTokenIssue_DefaultsAuthMethodStatic(t *testing.T) {
 		t.Errorf("issued token provider = %q, want NULL for a static token", *provider)
 	}
 }
+
+// TestOperatorDefaultScopes_ExcludeSpecialistJobAttestScope pins #4363: the
+// specialist-job attestation scope must NOT be in the operator default set.
+// That set is the HTTP token-mint ceiling and the `token migrate --apply`
+// target, so a member here would let any operator bearer mint (or be
+// promoted into) a runner attester and record runner_attested results.
+// Attesters are issued only by `fishhawkd token issue --scopes
+// attest:specialist-jobs`. The literal is repeated (not
+// specialistjob.AttestScope) so this guard has no dependency on the
+// constant it guards.
+func TestOperatorDefaultScopes_ExcludeSpecialistJobAttestScope(t *testing.T) {
+	if containsScope(operatorDefaultScopes, "attest:specialist-jobs") {
+		t.Fatalf("operatorDefaultScopes must not contain attest:specialist-jobs; got %v", operatorDefaultScopes)
+	}
+}
