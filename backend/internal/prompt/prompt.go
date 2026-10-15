@@ -1580,6 +1580,33 @@ type GateEvidence struct {
 	// with a reason from one that silently ignored it. False (the
 	// byte-identical default) on every conditions-less or bundle-less round.
 	ApprovalConditionsAttached bool
+	// FixupCommitClaims carries the runner's fix-up commit-message claims
+	// cross-check (#4337), mapped from the bundle's gate_evidence
+	// `fixup_commit_claims_unbacked`: the Item/Finding/Concern paragraphs of
+	// the pass's commit message that name files or tests the pass's own diff
+	// changes NONE of. writeGateEvidence renders it as the UNBACKED
+	// COMMIT-MESSAGE CLAIM block. Nil (the byte-identical default) on an older
+	// bundle, a non-fix-up pass, or when every claim was backed or undecidable.
+	FixupCommitClaims *GateFixupCommitClaims
+}
+
+// GateFixupCommitClaims is the #4337 unbacked commit-message claims member:
+// Claims are the unbacked claim paragraphs, Truncated reports that the runner
+// found more than it carries. Every Marker, FileRef and TestName was
+// charset-limited by the runner and re-validated by the backend mapper
+// (server.gateEvidenceForReview) before it reaches this struct.
+type GateFixupCommitClaims struct {
+	Claims    []GateFixupCommitClaim
+	Truncated bool
+}
+
+// GateFixupCommitClaim is one unbacked claim paragraph (#4337): Marker is its
+// normalized lead (`Item 3`), FileRefs and TestNames the evidence tokens it
+// names that the pass's diff does not change.
+type GateFixupCommitClaim struct {
+	Marker    string
+	FileRefs  []string
+	TestNames []string
 }
 
 // GateApprovalConditionResponses is the peeked commit-body responses section
@@ -8330,6 +8357,8 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 			"for it directly. This whole signal is ADVISORY: it did NOT fail, re-open, or re-budget the pass.\n\n")
 	}
 
+	writeFixupCommitClaims(b, ev.FixupCommitClaims)
+
 	if len(ev.FixupUnattemptedConcerns) > 0 || len(ev.FixupMentionedUntouchedFiles) > 0 {
 		b.WriteString("### Routed concern NOT ATTEMPTED (deterministic, high priority)\n\n")
 		b.WriteString("This is NOT a \"cannot be verified from the diff\" observation — it is a deterministic " +
@@ -8392,6 +8421,52 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		}
 		b.WriteString("\n")
 	}
+}
+
+// fixupCommitClaimsHeading heads the #4337 block; tests pin it.
+const fixupCommitClaimsHeading = "UNBACKED COMMIT-MESSAGE CLAIM (runner cross-check, advisory)"
+
+// writeFixupCommitClaims renders the runner's fix-up commit-message claims
+// cross-check (#4337). NOT enveloped, deliberately: unlike the #3400
+// approval-condition responses (agent free text, rendered inside an untrusted
+// envelope), every value here is a charset-limited token — a marker matching
+// `[A-Za-z]{4,8} #?[A-Za-z0-9][A-Za-z0-9.,-]{0,15}` and file refs / test names
+// matching `[A-Za-z0-9_./-]+` — limited by the runner and RE-VALIDATED by the
+// backend mapper (server.gateEvidenceForReview), so no whitespace run, newline,
+// backtick or envelope delimiter can reach this block and the backtick spans
+// cannot be broken. The block carries no agent prose.
+//
+// nil renders nothing, keeping every render without the member byte-identical.
+func writeFixupCommitClaims(b *strings.Builder, c *GateFixupCommitClaims) {
+	if c == nil {
+		return
+	}
+	b.WriteString("### " + fixupCommitClaimsHeading + "\n\n")
+	b.WriteString("The runner cross-checked this fix-up pass's commit message (peeked from the commit-message " +
+		"sidecar when the trace bundle was packed) against the pass's OWN scope-bounded diff. Each " +
+		"Item/Finding/Concern paragraph below names evidence the diff changes NONE of:\n\n")
+	for _, cl := range c.Claims {
+		tokens := make([]string, 0, len(cl.FileRefs)+len(cl.TestNames))
+		for _, t := range cl.FileRefs {
+			tokens = append(tokens, "`"+t+"`")
+		}
+		for _, t := range cl.TestNames {
+			tokens = append(tokens, "`"+t+"`")
+		}
+		fmt.Fprintf(b, "- `%s`: names %s, none of which this pass's diff changes\n", cl.Marker, strings.Join(tokens, ", "))
+	}
+	if c.Truncated {
+		b.WriteString("- (the runner found more unbacked claim paragraphs than it carries; the list above is " +
+			"truncated)\n")
+	}
+	b.WriteString("\n")
+	b.WriteString("Verify each claim against the diff. A claim the diff does not carry is an `evidence_conflict` " +
+		"concern (the commit message asserts work the commit does not contain), unless the diff shows the item " +
+		"satisfied through a different file — name the marker and the evidence it names. The check is " +
+		"heuristic: a paragraph that names only untouched CONTEXT files is a false positive, so verify before " +
+		"raising, and a paragraph naming only identifiers is never checked, so absence from this list is NOT " +
+		"evidence that a claim is backed. This whole signal is ADVISORY — it did NOT fail, re-open, or " +
+		"re-budget the pass.\n\n")
 }
 
 // writeGateAcceptanceTranscript renders the bounded, machine-derived acceptance
