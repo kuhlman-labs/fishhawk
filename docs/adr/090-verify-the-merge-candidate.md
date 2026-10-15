@@ -202,7 +202,7 @@ The opt-in `sequences:` allocator that #4018 also proposes is **recorded outside
 
 ## Amendment 1 (2026-10-14): an operator base merge is a base advance (#4368)
 
-**Accepted (2026-10-14) at the plan approval of #4368; the wording is surfaced to the Captain before merge.** Amends D8's third bullet ("operator-vouched heads") and the matching Consequences residual. D1–D7 are unchanged.
+**Ratified by the Captain (2026-10-15).** Amends D8's third bullet ("operator-vouched heads") and the matching Consequences residual. D1–D7 are unchanged.
 
 **Context.** D8 exempted every operator-vouched head from the merge-candidate pass. Rules 1–2 of the head classifier recognise only base advances the PRODUCT wrote (a performed `branch_rebased` merge, a `conflict_resolution_pushed` head). So an operator who merges the base into the run branch by hand and vouches the result takes the exemption, and the combined tree is never product-verified.
 
