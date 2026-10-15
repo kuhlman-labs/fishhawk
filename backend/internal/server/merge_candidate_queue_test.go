@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -2108,4 +2109,143 @@ func TestMergeCandidateQueue_AdmissionConcurrentPushNeverTransfers(t *testing.T)
 	if cls.count() != 0 {
 		t.Errorf("classifier calls = %d, want 0", cls.count())
 	}
+}
+
+// infraParkWave seeds the #4356 shape on the real stores: A holds the line
+// (live entry) with a DISPATCHED acceptance stage sequenced before its open
+// review stage, B is held behind it, and a REAL orchestrator is wired so the
+// reap-failure handler's Advance runs the production park path.
+func (f *mcqFixture) infraParkWave() (a, b *mcqRun, acc *run.Stage) {
+	f.t.Helper()
+	a, b = f.wave()
+	// A's admission re-opened implement for the merge-candidate verify pass;
+	// settle it and re-park the review gate so acceptance is A's only moving
+	// stage, then wire the real orchestrator the reap handler advances.
+	f.setStage(a.impl.ID, run.StageStateSucceeded)
+	f.setStage(a.review.ID, run.StageStateAwaitingApproval)
+	f.srv.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.repo, Audit: f.audit}
+	acc, err := f.repo.CreateStage(context.Background(), run.CreateStageParams{
+		RunID: a.id, Sequence: 4, Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		f.t.Fatalf("create acceptance stage: %v", err)
+	}
+	f.setStage(acc.ID, run.StageStateDispatched)
+	// feature_change order: acceptance precedes the review stage.
+	f.exec(`UPDATE stages SET sequence = 5 WHERE id = $1`, a.review.ID)
+	return a, b, acc
+}
+
+// reapAcceptanceInfra posts the category-C acceptance_preview_provision_failed
+// reap for acc through the real handler.
+func (f *mcqFixture) reapAcceptanceInfra(a *mcqRun, acc *run.Stage) {
+	f.t.Helper()
+	rec := postReapFailure(f.t, f.srv, a.id, acc.ID, reapFailureRequest{
+		Category: "C", Reason: "acceptance_preview_provision_failed",
+	}, withReapOperator)
+	if rec.Code != http.StatusOK {
+		f.t.Fatalf("reap-failure = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func (f *mcqFixture) runState(r *mcqRun) run.State {
+	f.t.Helper()
+	row, err := f.repo.GetRun(context.Background(), r.id)
+	if err != nil {
+		f.t.Fatalf("get run: %v", err)
+	}
+	return row.State
+}
+
+func (f *mcqFixture) settledRunTerminal(r *mcqRun) int {
+	f.t.Helper()
+	n := 0
+	for _, e := range f.rows(r, CategoryMergeCandidateQueueSettled) {
+		if strings.Contains(string(e.Payload), mergeCandidateQueueReasonRunTerminal) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestMergeCandidateQueue_AcceptanceInfraFailureKeepsLiveEntry is the #4356
+// cross-layer test: request handler (reap-failure) -> orchestrator.Advance ->
+// Postgres run/stage state -> the merge-candidate pump. A category-C acceptance
+// failure on the line holder parks the run (running, stage failed/C), so the
+// pump's run_terminal drop never fires: A keeps its live entry with the SAME
+// phase and B stays held. Mechanism: without the Advance park branch the reap
+// handler's Advance completes A failed and the pump drops A run_terminal and
+// admits B.
+func TestMergeCandidateQueue_AcceptanceInfraFailureKeepsLiveEntry(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, acc := f.infraParkWave()
+	phaseBefore := f.requireState(a, mergequeue.StateLive, "").Phase
+
+	f.reapAcceptanceInfra(a, acc)
+
+	if got := f.runState(a); got != run.StateRunning {
+		t.Fatalf("run A state = %s, want running (parked)", got)
+	}
+	st, err := f.repo.GetStage(context.Background(), acc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != run.StageStateFailed || st.FailureCategory == nil || *st.FailureCategory != run.FailureC {
+		t.Fatalf("acceptance stage = %s/%v, want failed/C", st.State, st.FailureCategory)
+	}
+	if n := len(f.rows(a, run.CategoryStageInfraParked)); n != 1 {
+		t.Fatalf("stage_infra_parked rows = %d, want 1", n)
+	}
+
+	f.srv.PumpMergeCandidateQueues(context.Background())
+
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != phaseBefore {
+		t.Fatalf("A phase = %s, want unchanged %s", e.Phase, phaseBefore)
+	}
+	f.requireState(b, mergequeue.StateHeld, "")
+	if n := f.settledRunTerminal(a); n != 0 {
+		t.Fatalf("A run_terminal settle rows = %d, want 0", n)
+	}
+
+	// The parked stage stays retry-eligible: failed -> pending.
+	if _, err := run.RetryStage(context.Background(), f.repo, acc.ID, run.RetryOptions{}); err != nil {
+		t.Fatalf("RetryStage on the parked acceptance stage: %v", err)
+	}
+	if got := f.stageState(acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage after retry = %s, want pending", got)
+	}
+}
+
+// TestMergeCandidateQueue_AcceptanceInfraBudgetExhaustedDropsRunTerminal is the
+// budget twin: with three earlier-episode parks already recorded for the stage,
+// the 4th consecutive category-C failure fails the run with one
+// stage_infra_park_budget_exhausted row, and the pump drops A run_terminal and
+// admits B — a genuinely terminal run still settles run_terminal.
+func TestMergeCandidateQueue_AcceptanceInfraBudgetExhaustedDropsRunTerminal(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, acc := f.infraParkWave()
+	sys := audit.ActorSystem
+	for i := 0; i < run.InfraFailureParkRetryBudget; i++ {
+		payload, _ := json.Marshal(map[string]any{"failed_at": fmt.Sprintf("2026-01-0%dT00:00:00Z", i+1), "retry_ordinal": i})
+		stageID := acc.ID
+		if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: a.id, StageID: &stageID, Timestamp: time.Now().UTC(), Category: run.CategoryStageInfraParked, ActorKind: &sys, Payload: payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f.reapAcceptanceInfra(a, acc)
+
+	if got := f.runState(a); got != run.StateFailed {
+		t.Fatalf("run A state = %s, want failed (budget exhausted)", got)
+	}
+	if n := len(f.rows(a, run.CategoryStageInfraParkBudgetExhausted)); n != 1 {
+		t.Fatalf("stage_infra_park_budget_exhausted rows = %d, want 1", n)
+	}
+
+	f.srv.PumpMergeCandidateQueues(context.Background())
+
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal)
+	f.requireState(b, mergequeue.StateLive, "")
 }

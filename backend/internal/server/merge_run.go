@@ -120,9 +120,11 @@ type mergeRunResponse struct {
 //   - the merge-candidate gate (ADR-090 / E83.33 / #4018), AFTER the conflict
 //     guard and BEFORE the verdict append: 409 merge_base_behind when the PR
 //     head does not contain the base tip, 409 merge_candidate_unverified /
-//     merge_candidate_verify_failed when a Fishhawk-written head has no
-//     passing merge-candidate verify, and 502 merge_candidate_check_failed on
-//     a forge or audit read error once every anchor resolved. See
+//     merge_candidate_verify_failed when a Fishhawk-written head (or an
+//     operator-vouched head that brings in base commits, ADR-090 D8
+//     Amendment 1 / #4368) has no passing merge-candidate verify, and 502
+//     merge_candidate_check_failed on a forge or audit read error once every
+//     anchor resolved. See
 //     mergeCandidateGate for the determinability ladder. Inside it, BEFORE the
 //     behind check, 409 merge_candidate_held (ADR-092 / #4200) when the run's
 //     pass is HELD in its base's queue (fail-open on a queue read error).
@@ -835,7 +837,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 	case mergeCandidateStateUnverified:
 		return mergeCandidateGateResult{
 			Code: mergeCodeCandidateUnverified,
-			Message: fmt.Sprintf("head %s was written by Fishhawk (cause %s) and has no passing merge-candidate verify, so the merge is refused (ADR-090 D2). Re-invoke fishhawk_rebase_run_branch: its already-up-to-date arm triggers a verify-only pass for the live head. Dispatch and await that stage, then re-invoke the merge. No merge verdict was recorded.",
+			Message: fmt.Sprintf("head %s (cause %s) was written by Fishhawk or brings in base commits through an operator-vouched merge, and has no passing merge-candidate verify, so the merge is refused (ADR-090 D2, D8 Amendment 1). Re-invoke fishhawk_rebase_run_branch: its already-up-to-date arm triggers a verify-only pass for the live head. Dispatch and await that stage, then re-invoke the merge. No merge verdict was recorded.",
 				headSHA, st.Cause),
 			Details: map[string]any{
 				"head_sha":     headSHA,

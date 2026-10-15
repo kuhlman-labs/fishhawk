@@ -346,6 +346,15 @@ const (
 // stage is agent-driven. If no pending stage remains, the run
 // itself transitions to succeeded.
 //
+// A failed or cancelled stage completes the run (failed / cancelled), with
+// ONE exception (#4356): a category-C (infrastructure) failure of an
+// acceptance stage PARKS the run instead — Advance returns OutcomeNoOp, the
+// run stays running and the stage stays failed and retry-eligible — unless
+// the merge already overtook it (run.ClassifyInfraFailurePark's post-merge
+// carve-out) or the stage has spent run.InfraFailureParkRetryBudget parks, in
+// which case the run fails and a stage_infra_park_budget_exhausted row says
+// why.
+//
 // Errors from the underlying repos surface as wrapped errors;
 // callers usually log + acknowledge rather than retry. The
 // orchestrator is intended to be called from a request handler,
@@ -391,11 +400,35 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// pending one, the run is over — completing as failed (or
 	// cancelled) is correct, and dispatching downstream stages
 	// would be wrong because the upstream output they depended on
-	// never landed.
+	// never landed. The #4356 exception: a category-C acceptance
+	// failure parks the run (see run.ClassifyInfraFailurePark) —
+	// nothing downstream is dispatched, the run just stays running.
 	var next *run.Stage
 	var gated *run.Stage
 	for _, s := range stages {
 		if s.State == run.StageStateFailed || s.State == run.StageStateCancelled {
+			if s.State == run.StageStateFailed {
+				park, history, err := o.classifyInfraFailurePark(ctx, r, stages, s)
+				if err != nil {
+					return OutcomeNoOp, err
+				}
+				if park == run.InfraParkRetryable {
+					o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: acceptance stage failed category C; run parked retry-eligible",
+						slog.String("run_id", r.ID.String()),
+						slog.String("stage_id", s.ID.String()),
+						slog.String("failure_reason", derefString(s.FailureReason)),
+						slog.Int("prior_parks", history.PriorParks),
+						slog.Int("budget", run.InfraFailureParkRetryBudget),
+					)
+					if !history.CurrentEpisodeParked {
+						o.emitInfraParked(ctx, r, s, history)
+					}
+					return OutcomeNoOp, nil
+				}
+				if park == run.InfraParkBudgetExhausted {
+					return o.completeRunInfraParkExhausted(ctx, r, stages, s, history)
+				}
+			}
 			return o.completeRun(ctx, r, stages)
 		}
 		if s.State == run.StageStatePending {
@@ -3042,6 +3075,114 @@ func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, pare
 		Payload:   payload,
 	}); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append plan_decomposed failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// classifyInfraFailurePark reads the failed stage's park history from the
+// run's audit log and classifies it (#4356). The audit read happens only for
+// a category-C acceptance failure, the one shape the predicate can park, so
+// every other failure keeps its zero-I/O path. With no Audit wired the park
+// cannot be bounded, so the failure takes today's completeRun path. A failed
+// audit read surfaces as an error with NO transition: the run stays as it is
+// and the next Advance re-decides.
+func (o *Orchestrator) classifyInfraFailurePark(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage) (run.InfraParkDecision, run.InfraParkHistory, error) {
+	if run.ClassifyInfraFailurePark(stages, failed, run.InfraParkHistory{}) == run.InfraParkNotApplicable {
+		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
+	}
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; category-C acceptance failure not parked",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", failed.ID.String()))
+		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
+	}
+	entries, err := o.Audit.ListForRun(ctx, r.ID)
+	if err != nil {
+		return run.InfraParkNotApplicable, run.InfraParkHistory{}, fmt.Errorf("orchestrator: read infra-park history: %w", err)
+	}
+	history := run.ReadInfraParkHistory(entries, failed)
+	return run.ClassifyInfraFailurePark(stages, failed, history), history, nil
+}
+
+// completeRunInfraParkExhausted fails the run for a category-C acceptance
+// failure past run.InfraFailureParkRetryBudget and, only once completeRun
+// actually terminalized the run, records why.
+func (o *Orchestrator) completeRunInfraParkExhausted(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage, history run.InfraParkHistory) (Outcome, error) {
+	outcome, err := o.completeRun(ctx, r, stages)
+	if err == nil && outcome == OutcomeRunCompleted {
+		o.emitInfraParkBudgetExhausted(ctx, r, failed, history)
+	}
+	return outcome, err
+}
+
+// emitInfraParked writes the stage-scoped stage_infra_parked row for one
+// parked failure episode (#4356) — the record the park budget counts.
+// Best-effort, mirroring emitAcceptanceDispatched: a lost row under-counts
+// the budget by one episode and never unwinds the park.
+func (o *Orchestrator) emitInfraParked(ctx context.Context, r *run.Run, failed *run.Stage, history run.InfraParkHistory) {
+	failedAt, retryOrdinal := run.InfraParkEpisode(failed)
+	o.emitInfraParkRow(ctx, r, failed, run.CategoryStageInfraParked, map[string]any{
+		"run_id":           r.ID.String(),
+		"stage_id":         failed.ID.String(),
+		"stage_type":       string(failed.Type),
+		"failure_category": string(run.FailureC),
+		"failure_reason":   derefString(failed.FailureReason),
+		"failed_at":        failedAt,
+		"retry_ordinal":    retryOrdinal,
+		"park_ordinal":     history.PriorParks + 1,
+		"retry_budget":     run.InfraFailureParkRetryBudget,
+		"run_state":        string(run.StateRunning),
+	})
+}
+
+// emitInfraParkBudgetExhausted writes the stage-scoped
+// stage_infra_park_budget_exhausted row stating that the spent park budget is
+// why the run failed (#4356). Best-effort; never unwinds the transition.
+func (o *Orchestrator) emitInfraParkBudgetExhausted(ctx context.Context, r *run.Run, failed *run.Stage, history run.InfraParkHistory) {
+	o.emitInfraParkRow(ctx, r, failed, run.CategoryStageInfraParkBudgetExhausted, map[string]any{
+		"run_id":           r.ID.String(),
+		"stage_id":         failed.ID.String(),
+		"stage_type":       string(failed.Type),
+		"failure_category": string(run.FailureC),
+		"failure_reason":   derefString(failed.FailureReason),
+		"prior_parks":      history.PriorParks,
+		"retry_budget":     run.InfraFailureParkRetryBudget,
+		"run_state":        string(run.StateFailed),
+	})
+}
+
+// derefString returns *p, or "" for nil.
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func (o *Orchestrator) emitInfraParkRow(ctx context.Context, r *run.Run, failed *run.Stage, category string, fields map[string]any) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping "+category+" entry",
+			slog.String("run_id", r.ID.String()))
+		return
+	}
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal "+category+" payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	stageID := failed.ID
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     r.ID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append "+category+" failed",
+			slog.String("run_id", r.ID.String()),
 			slog.String("error", err.Error()))
 	}
 }

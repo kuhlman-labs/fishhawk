@@ -5529,3 +5529,28 @@ func TestAddedOnlyDowngrade_NoAdds_NoDowngrade(t *testing.T) {
 		t.Error("downgrade fired with an EMPTY added set")
 	}
 }
+
+// TestAcceptanceGateState_FailedStageNeverAdmits pins the #4356 gate check: a
+// FAILED acceptance stage (the category-C park leaves the run non-terminal, so
+// the run-failed merge refusal no longer covers it) reads outcome-unknown even
+// over an older recorded PASSED outcome. No acceptance_reopened entry and no
+// unshipped marker are seeded, so neither the stale-verdict refusal nor the
+// marker branch can mask the check: without it the passed outcome wins.
+func TestAcceptanceGateState_FailedStageNeverAdmits(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictPassed)
+	acc := acceptanceStage(runID, run.StageStateFailed)
+	cat := run.FailureC
+	acc.FailureCategory = &cat
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateOutcomeUnknown {
+		t.Fatalf("state = %q, want %q (a failed acceptance stage never admits a merge)", got, acceptanceGateOutcomeUnknown)
+	}
+	if acceptanceGateAdmitsMerge(got) {
+		t.Fatalf("acceptanceGateAdmitsMerge(%q) = true, want false", got)
+	}
+}
