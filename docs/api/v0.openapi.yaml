@@ -13586,7 +13586,9 @@ paths:
         stage re-opens. The pass has its OWN per-head idempotency and never
         reads or spends the fix-up budget. The already-up-to-date arm
         re-triggers when the live head is an `unverified` Fishhawk-written head
-        (e.g. after a conflict-resolution push). A pass that cannot start never
+        (e.g. after a conflict-resolution push) or an operator-vouched head
+        that brings in base commits the run's newest verified head lacks
+        (ADR-090 D8 Amendment 1, #4368). A pass that cannot start never
         fails the rebase: the refusal rides on the 200 as
         `merge_candidate_verify_refusal`, and `POST /v0/runs/{run_id}/merge`
         refuses the head `409 merge_candidate_unverified` until a `passed`
@@ -13739,7 +13741,10 @@ paths:
                       The live head's ADR-090 merge-candidate verify state after
                       this call (E83.33 / #4018). `not_required` when the
                       workflow declares no `executor.verify` command or the head
-                      is not one Fishhawk wrote. `held` (ADR-092 / #4200) when
+                      is not one Fishhawk wrote (an operator-vouched head is
+                      `not_required` only when it brings in no base commit the
+                      newest verified head lacks, ADR-090 D8 Amendment 1 /
+                      #4368). `held` (ADR-092 / #4200) when
                       the pass waits behind its base's live pass: nothing was
                       started, no trigger was appended, and `GET
                       /v0/runs/{run_id}`'s `merge_candidate_queue` names its
@@ -13761,7 +13766,9 @@ paths:
                       resolved new head (the decoded merge commit unless a
                       genuine concurrent push was observed, #4199); the
                       already-up-to-date arm re-triggers only for
-                      an `unverified` Fishhawk-written head — or, with
+                      an `unverified` Fishhawk-written head (or an
+                      operator-vouched head bringing in base commits, #4368) —
+                      or, with
                       `rerun_failed_verify`, a `failed` head whose verdict
                       this call voided (#4391).
                   merge_candidate_verify_stage_id:
@@ -14310,7 +14317,10 @@ paths:
            `merge_candidate_verified` result for that SHA — none or an
            in-flight pass is `409 merge_candidate_unverified`, a `failed` one
            is `409 merge_candidate_verify_failed` (D2). Runner-gated implement
-           and fix-up heads and operator-vouched heads need nothing more.
+           and fix-up heads need nothing more. An operator-vouched head needs
+           nothing more ONLY when it brings in no base commit the run's newest
+           verified head lacks: an operator merge of the base is classified
+           `base_advance` (ADR-090 D8 Amendment 1, #4368).
 
         Fail posture (D7): any read error on a fully wired run fails CLOSED
         with `502 merge_candidate_check_failed` and records nothing. A run the
@@ -14418,9 +14428,10 @@ paths:
             `POST /v0/runs/{run_id}/rebase-branch`, which also authorizes a
             verify-only merge-candidate pass for the new head when a verify
             command is declared, then re-invoke.
-            (6) The live head was written by Fishhawk and has no passing
-            merge-candidate verify for exactly that SHA
-            (`merge_candidate_unverified`, ADR-090 D2). `details` carry
+            (6) The live head was written by Fishhawk, or brings in base
+            commits through an operator-vouched merge (ADR-090 D8 Amendment 1,
+            #4368), and has no passing merge-candidate verify for exactly that
+            SHA (`merge_candidate_unverified`, ADR-090 D2). `details` carry
             `{run_id, pr_url, head_sha, cause, verify_state, next_step}` where
             `cause` is `base_advance` / `conflict_resolution` / `fan_in` and
             `verify_state` is `unverified` (next step

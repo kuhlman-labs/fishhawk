@@ -2295,6 +2295,16 @@ type mergeCandidateGitHub struct {
 	// reads; nil serves an empty listing.
 	mergeableState string
 	reviews        []map[string]any
+	// compares, keyed "<base>...<head>", serves that commit list for exactly
+	// that pair (the ADR-090 D8 Amendment 1 vouch probe, #4368); a pair absent
+	// from the map falls back to the behind synthesis above, so the merge
+	// gate's behind probe (<live head>...<base ref>) is unaffected.
+	// compareStatusByKey fails one pair with the given status; compareKeys
+	// records every requested pair in order, so the probe DIRECTION is
+	// asserted, not assumed.
+	compares           map[string][]string
+	compareStatusByKey map[string]int
+	compareKeys        []string
 }
 
 func newMergeCandidateGitHubClient(t *testing.T, stub *mergeCandidateGitHub) *githubclient.Client {
@@ -2334,16 +2344,28 @@ func newMergeCandidateGitHubClient(t *testing.T, stub *mergeCandidateGitHub) *gi
 		stub.mu.Lock()
 		defer stub.mu.Unlock()
 		stub.compareCalls++
-		base, head, _ := strings.Cut(r.PathValue("basehead"), "...")
+		key := r.PathValue("basehead")
+		stub.compareKeys = append(stub.compareKeys, key)
+		base, head, _ := strings.Cut(key, "...")
 		stub.compareBase, stub.compareHead = base, head
+		if st := stub.compareStatusByKey[key]; st != 0 && st != http.StatusOK {
+			w.WriteHeader(st)
+			return
+		}
 		if stub.compareStatus != 0 && stub.compareStatus != http.StatusOK {
 			w.WriteHeader(stub.compareStatus)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		commits := make([]string, 0, stub.behind)
-		for i := 0; i < stub.behind; i++ {
-			commits = append(commits, fmt.Sprintf(`{"sha":"base%039d"}`, i))
+		var commits []string
+		if listed, ok := stub.compares[key]; ok {
+			for _, sha := range listed {
+				commits = append(commits, fmt.Sprintf(`{"sha":%q}`, sha))
+			}
+		} else {
+			for i := 0; i < stub.behind; i++ {
+				commits = append(commits, fmt.Sprintf(`{"sha":"base%039d"}`, i))
+			}
 		}
 		fmt.Fprintf(w, `{"commits":[%s]}`, strings.Join(commits, ","))
 	})
@@ -2483,6 +2505,47 @@ func TestMergeRun_MergeCandidate_UnverifiedRefused(t *testing.T) {
 	if !strings.Contains(env.Error.Message, "fishhawk_rebase_run_branch") {
 		t.Errorf("message does not name the re-trigger verb: %q", env.Error.Message)
 	}
+}
+
+// TestMergeRun_OperatorVouchedBaseMergeNeedsPass pins ADR-090 D8 Amendment 1
+// (#4368) through the real merge handler: the chain carries a runner-gated
+// head P and an operator vouch for the live head, and the stub's P...head
+// range carries base commits absent from main...head (an operator merge of
+// the base). Each arm reads COMMITTED state (verdict rows, merger calls).
+// Counterfactual: replacing rule 4's classifyVouchedHead delegation with
+// `return "", nil` admits the base merge (a verdict row and a dispatch) → RED.
+func TestMergeRun_OperatorVouchedBaseMergeNeedsPass(t *testing.T) {
+	t.Run("base merge refused", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		seedVouchedHeadOnGated(g.mcvFixture)
+		g.gh.compares = vouchedBaseMergeCompares()
+
+		env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+		d := env.Error.Details
+		if d["cause"] != mergeCandidateCauseBaseAdvance || d["verify_state"] != mergeCandidateStateUnverified ||
+			d["next_step"] != "fishhawk_rebase_run_branch" || d["head_sha"] != mcvHead {
+			t.Errorf("details = %v, want cause base_advance, verify_state unverified, next_step fishhawk_rebase_run_branch, head %s", d, mcvHead)
+		}
+		// C1: the message reads correctly for an operator-vouched base merge.
+		if !strings.Contains(env.Error.Message, "operator-vouched merge") {
+			t.Errorf("message does not name the operator-vouched merge: %q", env.Error.Message)
+		}
+	})
+	t.Run("passed on exactly that head admits", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		seedVouchedHeadOnGated(g.mcvFixture)
+		g.gh.compares = vouchedBaseMergeCompares()
+		g.seedVerdict(mcvHead, mergeCandidateResultPassed)
+
+		g.assertAdmitted(t, g.post(t))
+	})
+	t.Run("D8 operator edit admitted", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		seedVouchedHeadOnGated(g.mcvFixture)
+		g.gh.compares = vouchedEditCompares()
+
+		g.assertAdmitted(t, g.post(t))
+	})
 }
 
 // TestMergeRun_MergeCandidate_InFlightRefused pins the in-flight arm: a live

@@ -847,7 +847,8 @@ func TestMergeCandidateVerifyState_Classification(t *testing.T) {
 		{"decomposed parent", func(f *mcvFixture) {
 			f.appendRow(nil, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": mcvOtherHead})
 		}, mergeCandidateStateUnverified, mergeCandidateCauseFanIn},
-		{"operator-vouched head", func(f *mcvFixture) {
+		// The probed arms of rule 4 (D8 Amendment 1, #4368) live in TestClassifyVouchedHead.
+		{"operator-vouched head, deployment cannot probe (D7 fallback)", func(f *mcvFixture) {
 			f.appendRow(nil, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": mcvHead})
 			f.appendRow(nil, auditcomplete.CategorySlicesIntegrated, map[string]any{})
 		}, mergeCandidateStateNotRequired, ""},

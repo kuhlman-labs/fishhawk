@@ -36,8 +36,9 @@ The merge verb (`POST /v0/runs/{run_id}/merge`) verifies the merge candidate,
 not the branch (ADR-090). On a GitHub run it refuses a pull request whose head
 does not contain the current base tip (409 `merge_base_behind`) and, when the
 workflow declares a verify command, a head Fishhawk wrote (a base advance, a
-conflict-resolution push, a fan-in integration) that has no passing verify for
-exactly that commit (409 `merge_candidate_unverified` or
+conflict-resolution push, a fan-in integration), or an operator-vouched commit
+that brings in new base commits, that has no passing verify for exactly that
+commit (409 `merge_candidate_unverified` or
 `merge_candidate_verify_failed`). A forge or audit read error there fails
 closed (502 `merge_candidate_check_failed`). Each refusal names the verb that
 clears it; the error-code table in the companion document has the details.
