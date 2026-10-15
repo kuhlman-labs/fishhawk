@@ -54,6 +54,8 @@ const CategoryStageMergeCandidateVerifyTriggered = "stage_merge_candidate_verify
 const CategoryMergeCandidateVerified = "merge_candidate_verified"
 
 // Merge-candidate pass causes: which Fishhawk write produced the head (D2).
+// base_advance also covers an operator-vouched head that brought in base
+// commits (ADR-090 D8 Amendment 1, #4368).
 const (
 	mergeCandidateCauseBaseAdvance        = "base_advance"
 	mergeCandidateCauseConflictResolution = "conflict_resolution"
@@ -891,7 +893,10 @@ var mergeCandidateRunnerGatedCategories = []string{"pull_request_opened", "fixup
 //     merge_commit_sha is the head → base_advance;
 //  2. conflict_resolution_pushed at the head → conflict_resolution;
 //  3. a runner-gated head report at the head → not_required;
-//  4. an operator-vouched head → not_required (D8);
+//  4. an operator-vouched head → base_advance when it brings in base commits
+//     the newest verified head lacks (or that cannot be ruled out on a
+//     probeable run), else not_required (D8 as amended, #4368;
+//     classifyVouchedHead in merge_candidate_vouch.go);
 //  5. a decomposed parent (fan-in integration rows on its chain) → fan_in;
 //  6. anything else → not_required.
 //
@@ -912,7 +917,7 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 	if headSHA == "" {
 		return mergeCandidateState{}, errors.New("the live head sha is empty, so the merge-candidate verify state cannot be decided")
 	}
-	cause, err := s.classifyMergeCandidateHead(ctx, runRow.ID, headSHA)
+	cause, err := s.classifyMergeCandidateHead(ctx, runRow, headSHA)
 	if err != nil {
 		return mergeCandidateState{}, err
 	}
@@ -940,7 +945,8 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 
 // classifyMergeCandidateHead returns the cause for a head that needs a
 // merge-candidate verify, or "" when it needs none.
-func (s *Server) classifyMergeCandidateHead(ctx context.Context, runID uuid.UUID, headSHA string) (string, error) {
+func (s *Server) classifyMergeCandidateHead(ctx context.Context, runRow *run.Run, headSHA string) (string, error) {
+	runID := runRow.ID
 	rebased, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryBranchRebased)
 	if err != nil {
 		return "", err
@@ -975,10 +981,13 @@ func (s *Server) classifyMergeCandidateHead(ctx context.Context, runID uuid.UUID
 		}
 	}
 
+	// Rule 4 (ADR-090 D8 Amendment 1, #4368): a vouch exempts the head only
+	// when the probe proves it brings in no base commit the newest verified
+	// head lacks.
 	if hit, err := s.chainReportsHead(ctx, runID, CategoryOperatorCommitVouched, "vouched_sha", headSHA); err != nil {
 		return "", err
 	} else if hit {
-		return "", nil
+		return s.classifyVouchedHead(ctx, runRow, headSHA)
 	}
 
 	for _, category := range []string{auditcomplete.CategoryIntegrationCommitRecorded, auditcomplete.CategorySlicesIntegrated} {

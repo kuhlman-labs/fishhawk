@@ -52,6 +52,10 @@ const (
 //     be failed independently of the earlier reads (condition 5).
 //   - behindCommits is what the behind-probe compare returns: EMPTY means the
 //     run branch already contains the base.
+//   - compareByPair, keyed "<base>...<head>", serves that commit list for
+//     exactly that pair (the ADR-090 D8 Amendment 1 vouch probe, #4368); a
+//     pair absent from it falls back to behindCommits, so every behind-probe
+//     fixture is unchanged.
 //   - mergeStatus / mergeBody drive the merges endpoint (409 = conflict,
 //     500 = merge_failed, 201 with or without a `sha`).
 //   - onPRCall, when set, is invoked with the 1-based call number of every
@@ -64,6 +68,7 @@ type rebaseGitHub struct {
 	headSHASeq    []string
 	prStatusSeq   []int
 	behindCommits []string
+	compareByPair map[string][]string
 	compareStatus int
 	mergeStatus   int
 	mergeBody     string
@@ -126,10 +131,13 @@ func newRebaseGitHubClient(t *testing.T, stub *rebaseGitHub) *githubclient.Clien
 				head, ref, base)
 		})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}",
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
 			stub.mu.Lock()
 			status := stub.compareStatus
 			commits := append([]string(nil), stub.behindCommits...)
+			if listed, ok := stub.compareByPair[r.PathValue("basehead")]; ok {
+				commits = append([]string(nil), listed...)
+			}
 			stub.mu.Unlock()
 			if status != 0 && status != http.StatusOK {
 				w.WriteHeader(status)
@@ -1982,6 +1990,72 @@ func TestRebaseRunBranch_UpToDateReTriggersUnverifiedHead(t *testing.T) {
 	if !resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyStageID != impl.ID.String() {
 		t.Errorf("response triggered/stage = %v/%q, want true/%s", resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyStageID, impl.ID)
 	}
+}
+
+// TestRebaseRunBranch_UpToDateTriggersPassForVouchedBaseMerge pins ADR-090 D8
+// Amendment 1 (#4368) on the rebase producer: an already-up-to-date invocation
+// whose live head H is an operator-VOUCHED merge of the base (the chain's
+// runner-gated head P lacks base commits H carries) starts a verify-only pass
+// for EXACTLY H with cause base_advance, read back as committed state. The D8
+// operator edit (everything since P is branch-only) starts nothing.
+// Counterfactual: replacing rule 4's classifyVouchedHead delegation with
+// `return "", nil` reads the base merge not_required and appends no trigger →
+// RED.
+func TestRebaseRunBranch_UpToDateTriggersPassForVouchedBaseMerge(t *testing.T) {
+	const gated = "dddd444444444444444444444444444444444444"
+	const baseCommit = "eeee555555555555555555555555555555555555"
+	seed := func(t *testing.T, sinceGated []string) (*rebaseSeed, *run.Stage) {
+		t.Helper()
+		stub := upToDateRebaseStub()
+		stub.compareByPair = map[string][]string{
+			gated + "..." + rebaseNewHeadSHA:         sinceGated,
+			rebaseBaseRef + "..." + rebaseNewHeadSHA: {gated, rebaseNewHeadSHA},
+		}
+		sd := seedMCVRebase(t, stub)
+		impl := crImplementStage(t, sd)
+		seedMCVRow(sd, nil, "pull_request_opened", map[string]any{"head_sha": gated})
+		seedMCVRow(sd, nil, CategoryOperatorCommitVouched, map[string]any{lineageVouchedSHAField: rebaseNewHeadSHA})
+		return sd, impl
+	}
+
+	t.Run("vouched base merge triggers a base_advance pass", func(t *testing.T) {
+		sd, impl := seed(t, []string{baseCommit, rebaseNewHeadSHA})
+		resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+			rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Errorf("state/triggered = %q/%v, want in_flight/true", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+		}
+		triggers := mcvTriggerPayloads(t, sd.au)
+		if len(triggers) != 1 {
+			t.Fatalf("trigger rows = %d, want 1 (the vouched base merge must be verified)", len(triggers))
+		}
+		tr := triggers[0]
+		if tr.ExpectedHeadSHA != rebaseNewHeadSHA || tr.Cause != mergeCandidateCauseBaseAdvance ||
+			tr.Branch != rebaseBranchName || tr.BaseRef != rebaseBaseRef {
+			t.Errorf("trigger = %+v, want head %s cause base_advance branch %s base %s",
+				tr, rebaseNewHeadSHA, rebaseBranchName, rebaseBaseRef)
+		}
+		if impl.State != run.StageStatePending {
+			t.Errorf("implement stage = %q, want pending (re-opened for the pass)", impl.State)
+		}
+	})
+
+	t.Run("D8 operator edit triggers nothing", func(t *testing.T) {
+		sd, impl := seed(t, []string{rebaseNewHeadSHA})
+		resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+			rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+		if resp.MergeCandidateVerifyState != mergeCandidateStateNotRequired || resp.MergeCandidateVerifyTriggered {
+			t.Errorf("state/triggered = %q/%v, want not_required/false", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+		}
+		if n := len(mcvTriggerPayloads(t, sd.au)); n != 0 {
+			t.Errorf("trigger rows = %d, want 0", n)
+		}
+		if impl.State != run.StageStateSucceeded {
+			t.Errorf("implement stage = %q, want succeeded (no re-open)", impl.State)
+		}
+	})
 }
 
 // TestRebaseRunBranch_UpToDateSettledHeadTriggersNothing: a passed verdict, a

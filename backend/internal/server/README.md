@@ -2618,6 +2618,28 @@ never has to push to a branch ADR-035 declares runner-owned.
 - **Not done.** A `next_actions` entry for the re-run and the run-read `merge_candidate_rerun` block (the advertisement slice of #4391).
 - **Tests.** `merge_candidate_rerun_test.go` (handler arms, the void helper, the in-place conversion T1–T8 and the bounded other-stage fence, and the ADR-092 held case on real Postgres), `merge_candidate_rerun_e2e_test.go` (real Postgres: own-entry admission under the held fence, refused on an occupied base, held after the pre-check then converted at admission, both admission-fence arms), `merge_run_test.go` (`rerun_step`).
 
+## Operator-vouched base merges (ADR-090 D8 Amendment 1, #4368)
+
+Rule 4 of `merge_candidate_verify.go::classifyMergeCandidateHead` (an operator-vouched head) no longer exempts unconditionally: it delegates to `merge_candidate_vouch.go::classifyVouchedHead`. The trigger was #4293 (run e16e6c42): an operator pushed a merge of `main`, vouched it, `rebase_run_branch` answered `already_up_to_date` + `not_required`, and the merge queued with no pass, so the combined tree was never product-verified.
+
+- **Reference head** (`newestVerifiedHead`): the newest head on the run's chain, by chain sequence, whose tree the product gated or verified — the `head_sha` of a `pull_request_opened` / `fixup_pushed` / `child_pushed` row, the `head_sha` of a `passed` `merge_candidate_verified` row, and ONLY in ADR-096 `enforce` mode the `to_head` of a `merge_candidate_verdict_transferred` row (the same rollback contract as `newestMergeCandidateVerdict`). The probed head itself is never its own reference: a passed verdict for H must read `passed`, not `not_required` via an empty `H...H`.
+- **Probe**: two three-dot compares, `CompareCommits(V, H)` and `CompareCommits(<PR base ref>, H)` — base first, head second in both. A commit in the first and not in the second (`bringsInBaseCommits`) is one H has, V lacks and the base already contains → `base_advance`. None → `not_required` (D8's non-merge operator edit). An empty `V...H` answers `not_required` without the second compare.
+- **Fail posture:**
+
+  | Situation | Answer |
+  |---|---|
+  | No GitHub client, no installation, unparseable repo, no PR number (cannot probe) | `not_required` + WARN — the pre-amendment exemption, mirroring D7 |
+  | No verified reference head on the chain | `base_advance` (fail closed) |
+  | Empty PR base ref | `base_advance` (fail closed) |
+  | Either compare at the 250-commit cap (`vouchProbeAtCap`; the compare API does not paginate) | `base_advance` (fail closed) |
+  | PR read, compare or audit read error | error returned; every reader fails closed on it (D7) |
+
+- **Readers need no change of their own.** Every `mergeCandidateVerifyState` caller gets the behaviour: the merge gate (`merge_run.go`, 409 `merge_candidate_unverified` cause `base_advance` until a pass passes on exactly that head), the rebase already-up-to-date arm (`rebase_branch.go`, which starts the verify-only pass), the fan-in hold (`fanin_verify.go`), queue admission (`merge_candidate_queue.go`), the gate view (`gateview.go`), the verdict transfer (`merge_candidate_transfer.go`) and the `fanin_verify_held` re-run hint (`review_rerun.go`). No new cause, state, wire field or audit category.
+- **Forge-read cost.** Classifying a vouched head that rules 1–3 did not catch costs one `GET /pulls/{n}` and up to two compares, on EACH of those readers (`merge_run.go`, `rebase_branch.go`, `fanin_verify.go`, `merge_candidate_queue.go`, `gateview.go`, `merge_candidate_transfer.go`, `review_rerun.go`). A read error there takes each reader's existing fail posture (the gate view records a `merge_candidate_verdict` gap; the merge gate answers 502 `merge_candidate_check_failed`; the `review_rerun.go` hint reads `unreadable`).
+- **Intended widening.** A vouched edit on top of a head whose tree was never verified (a product rebase whose pass never reported, a decomposed parent before its fan-in pass) now reads `base_advance`, or fails closed when nothing on the chain was ever verified.
+- **Residuals.** A base change carried in by a NON-merge commit (cherry-pick, hand copy) has a fresh SHA the base lacks, so it is not detected; a scope-bounded tree diff was rejected because it would strip D8's canonical case (an operator remediation commit outside the run's scope). An unprobeable deployment keeps the exemption. The 250-commit cap fails closed, so a very long branch pays a pass it may not need.
+- **Tests.** `merge_candidate_vouch_test.go` (`TestClassifyVouchedHead`: every arm and fail mode through the real `mergeCandidateVerifyState`; `TestBringsInBaseCommits`), `merge_run_test.go` (`TestMergeRun_OperatorVouchedBaseMergeNeedsPass`, committed state), `rebase_branch_test.go` (`TestRebaseRunBranch_UpToDateTriggersPassForVouchedBaseMerge`, the trigger row read back). The two GitHub stubs serve per-pair compares (`compares` / `compareByPair`, keyed `<base>...<head>`) and fall back to their behind synthesis, so no older fixture changed.
+
 ## Merge-candidate held-pass queue (`merge_candidate_queue.go`, ADR-092 / E83.85 #4200)
 
 Serializes ADR-090 merge-candidate verify passes per `(repository, base ref)`:

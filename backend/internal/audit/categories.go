@@ -434,6 +434,8 @@ var KnownCategories = map[string]struct{}{
 	"diff_secrets_detected":                   {}, // E80.3 / #3760: the deterministic diff secrets check raised server_check concerns for credential-shaped additions (server/diff_secrets.go) — INTERNAL, locations and pattern classes only
 	"digest_marked_read":                      {},
 	"dispatch_reaper_failed":                  {},
+	"stage_infra_parked":                      {},
+	"stage_infra_park_budget_exhausted":       {},
 	"document_injected":                       {},
 	"document_injection_degraded":             {}, // E55.7 / #3746: run-admission declarations withheld from a served prompt (repodoc.RecordWithheld)
 	"document_truncated":                      {},

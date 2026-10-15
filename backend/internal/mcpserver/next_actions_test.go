@@ -2579,6 +2579,11 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	if got := acceptanceStageNextActions(run, acc("succeeded"), false, false, "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
 		t.Errorf("outcome-unknown state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
 	}
+	// #4356: a FAILED acceptance stage (the category-C park) reads the same
+	// state the server gate returns for it.
+	if got := acceptanceStageNextActions(run, acc("failed"), false, false, "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
+		t.Errorf("failed-stage state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
+	}
 	// skipped-out-of-scope (E38.3 / #1877): a terminal verdict-less acceptance
 	// stage WITH the skip flag classifies acceptance_skipped_out_of_scope — the
 	// MCP state string MUST equal the audit-category marker so the drive gate
@@ -6634,5 +6639,55 @@ func TestReviewCoverageIncompleteLiterals(t *testing.T) {
 	}
 	if driveNextActionRerunReview != "rerun_review" {
 		t.Errorf("driveNextActionRerunReview = %q, want rerun_review", driveNextActionRerunReview)
+	}
+}
+
+// TestNextActions_AcceptanceStageFailedParked pins the #4356 arm: a running
+// run whose acceptance stage FAILED (the server's category-C park) leads with
+// fishhawk_retry_stage for that stage, even with an open-concern hint that
+// would otherwise win and an OLDER passed verdict recorded (C3 ordering). The
+// state is not a product-issue filing state. A TERMINAL failed run with the
+// same stages keeps the bare {State: failed} arm.
+func TestNextActions_AcceptanceStageFailedParked(t *testing.T) {
+	acc := naStage("acceptance", "failed")
+	cat, reason := "C", "acceptance_preview_provision_failed"
+	acc.FailureCategory, acc.FailureReason = &cat, &reason
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval"), acc, naStage("review", "pending")}
+	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+
+	run := naRun("running")
+	got := classifyNextActions(run, stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, acceptanceVerdictPassed, "", releaseSignals{})
+	if got.State != string(drive.RuleAcceptanceOutcomeUnknown) {
+		t.Fatalf("state = %q, want %q", got.State, drive.RuleAcceptanceOutcomeUnknown)
+	}
+	if len(got.Actions) < 2 || got.Actions[0].Action != "fishhawk_retry_stage" || got.Actions[0].Params["stage_id"] != acc.ID {
+		t.Fatalf("actions = %+v, want fishhawk_retry_stage{stage_id: %s} first", got.Actions, acc.ID)
+	}
+	if got.Actions[0].Consumes != consumesRetryBudget || !strings.Contains(got.Actions[0].Precondition, reason) {
+		t.Fatalf("retry action = %+v", got.Actions[0])
+	}
+	var cancel bool
+	for _, a := range got.Actions {
+		if a.Action == "fishhawk_report_product_issue" {
+			t.Fatalf("a parked infra failure must not suggest fishhawk_report_product_issue: %+v", got.Actions)
+		}
+		if a.Action == "fishhawk_cancel_run" && a.Params["run_id"] == run.ID {
+			cancel = true
+		}
+	}
+	if !cancel {
+		t.Fatalf("actions = %+v, want a fishhawk_cancel_run", got.Actions)
+	}
+
+	// C3: inside the acceptance arm the failed-stage check precedes the
+	// recorded-verdict switch, so the older passed verdict never routes a
+	// failed stage to the merge ritual.
+	if a := acceptanceStageNextActions(run, &acc, false, false, acceptanceVerdictPassed, ""); a.State != "acceptance_settled_outcome_unknown" || a.Actions[0].Action != "fishhawk_retry_stage" {
+		t.Fatalf("acceptance arm = %+v, want the failed-stage retry arm", a)
+	}
+
+	failed := classifyNextActions(naRun("failed"), stages, nil, naReviewStatus("implement", "complete"), hint, false, false, false, acceptanceVerdictPassed, "", releaseSignals{})
+	if failed.State != "failed" {
+		t.Fatalf("terminal failed run state = %q, want failed", failed.State)
 	}
 }
