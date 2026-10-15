@@ -213,17 +213,28 @@ func gitLabMRReadBody(mergeUser, mergedBy string) string {
 }
 
 // membersAuditRepo records appends and serves them back by category, with an
-// injectable list error.
+// injectable list error and an injectable refusal-append error.
 type membersAuditRepo struct {
 	audit.Repository
 	mu       sync.Mutex
 	appended []audit.ChainAppendParams
 	listErr  error
+	// appendErr, when set, fails every merge_settle_members_refused append
+	// (counted in refusalAttempts, not recorded); other categories still
+	// record, so a regression that settled the merge leaves a visible row.
+	appendErr       error
+	refusalAttempts int
 }
 
 func (r *membersAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p.Category == CategoryMergeSettleMembersRefused {
+		r.refusalAttempts++
+		if r.appendErr != nil {
+			return nil, r.appendErr
+		}
+	}
 	r.appended = append(r.appended, p)
 	return &audit.Entry{ID: uuid.New()}, nil
 }
@@ -545,4 +556,56 @@ func TestMergeSettledMembers_AuditDedup(t *testing.T) {
 			t.Fatalf("refusal rows = %d, want 2 (a list error must not suppress the append)", n)
 		}
 	})
+
+	t.Run("audit append error still holds", func(t *testing.T) {
+		ar := &membersAuditRepo{appendErr: errors.New("audit append boom")}
+		s, _, target, st := newFixture(t, ar)
+		if s.mergeSettledMembersAdmit(context.Background(), target, st, meta) {
+			t.Fatal("admit = true after a failed refusal append, want a hold")
+		}
+		if ar.refusalAttempts != 1 {
+			t.Fatalf("refusal append attempts = %d, want 1 (the append-failure branch was not reached)", ar.refusalAttempts)
+		}
+		if n := len(refusalRows(t, ar.appended)); n != 0 {
+			t.Fatalf("refusal rows recorded = %d, want 0 (the append failed)", n)
+		}
+	})
+}
+
+// TestResolveReviewStageOnMerge_MembersAppendFailureStillHolds drives the
+// reconciler poll end to end with the refusal append failing: the merge must
+// still HOLD — review stage parked at awaiting_approval, no transition, no
+// pr_merged row (which the fake WOULD record, since only the refusal category
+// fails). An audit outage on the refusal row never flips the gate to admit.
+func TestResolveReviewStageOnMerge_MembersAppendFailureStillHolds(t *testing.T) {
+	gh := &membersGitHubStub{mmGitHub: mmGitHub{merger: "fishhawk-dev[bot]", reviews: []mmReview{{"alice", "APPROVED"}}}}
+	target := mmGitHubRun(membersSpecYAML(t, `["github:kuhlman-labs"]`))
+	reviewStageID := uuid.New()
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{target},
+		stages: map[uuid.UUID][]*run.Stage{
+			target.ID: {
+				{ID: uuid.New(), RunID: target.ID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: target.ID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &membersAuditRepo{appendErr: errors.New("audit append boom")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newMembersGitHubClient(t, gh)})
+
+	if err := s.ResolveReviewFromPollState(context.Background(), target.ID, true, mmGitHubPRURL); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if ar.refusalAttempts != 1 {
+		t.Fatalf("refusal append attempts = %d, want 1 (the members hold was not reached)", ar.refusalAttempts)
+	}
+	if got := stageStateByID(t, rr, target.ID, reviewStageID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %s, want awaiting_approval (held despite the failed append)", got)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none", rr.transitions)
+	}
+	if findCategory(ar.appended, CategoryPRMerged) != nil {
+		t.Errorf("pr_merged written after a failed refusal append; categories %v", auditCategories(ar.appended))
+	}
 }
