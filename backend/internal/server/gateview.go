@@ -733,8 +733,13 @@ type gateViewFixup struct {
 	// produced nothing), "recovered" (#3395: the pass FAILED and the stage was
 	// restored to its pre-fix-up gate — delivered-nothing when the audit entry
 	// carries delivered_nothing:true; a pushed-then-recovered pass still reads
-	// pushed because the earliest following outcome wins), or "pending" (the
-	// trigger has no following outcome entry yet).
+	// pushed because the earliest following outcome wins), "superseded" (E86.54
+	// / #4391: the operator's verify-only re-run superseded this queued,
+	// never-dispatched fix-up in place — a stage_fixup_superseded marker naming
+	// this trigger, CONFIRMED by a following conversion trigger, with no
+	// outcome sequenced before the marker; an inert marker is never read as
+	// superseded), or "pending" (the trigger has no following outcome entry
+	// yet).
 	Outcome   string `json:"outcome"`
 	ApplyPath string `json:"apply_path,omitempty"`
 	HeadSHA   string `json:"head_sha,omitempty"`
@@ -850,6 +855,8 @@ var gateViewHistoryCategories = []string{
 	concernRelitigationSuppressedCategory,
 	concernResolutionVetoedCategory,
 	CategoryConcernResolvedWithEvidence,
+	CategoryStageFixupSuperseded,
+	CategoryStageMergeCandidateVerifyTriggered,
 }
 
 // scopeGateViewRead is the read scope a non-mcp caller must hold to read the
@@ -1456,6 +1463,10 @@ type gateViewHistory struct {
 	// evidenceResolved is the set of concern ids carrying a
 	// concern_resolved_with_evidence entry (#4086).
 	evidenceResolved map[string]struct{}
+	// supersessions is confirmedFixupSupersessions over the run's markers and
+	// conversion triggers (E86.54 / #4391): stage + fix-up trigger sequence ->
+	// the confirmed marker's sequence.
+	supersessions map[fixupSupersessionKey]int64
 }
 
 type gateViewVeto struct {
@@ -1611,6 +1622,12 @@ func (s *Server) loadGateViewHistory(ctx context.Context, runID uuid.UUID, resp 
 		}
 		h.evidenceResolved[p.ConcernID] = struct{}{}
 	}
+	// E86.54 / #4391: a marker reads as a supersession only when a conversion
+	// trigger confirms it. A read gap on either category leaves the map empty
+	// for that category's rows, so a trigger stays pending (never a false
+	// superseded).
+	h.supersessions = confirmedFixupSupersessions(
+		byCategory[CategoryStageFixupSuperseded], byCategory[CategoryStageMergeCandidateVerifyTriggered])
 	return h
 }
 
@@ -1674,7 +1691,10 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 			Reason:   t.reason,
 			Outcome:  "pending",
 		}
-		if o, ok := earliestOutcomeAfter(h.outcomes, t.stageID, t.sequence); ok {
+		o, ok := earliestOutcomeAfter(h.outcomes, t.stageID, t.sequence)
+		if markerSeq, superseded := supersededFixupMarker(h.supersessions, t); superseded && (!ok || o.sequence > markerSeq) {
+			fx.Outcome = "superseded"
+		} else if ok {
 			fx.Outcome = o.outcome
 			fx.ApplyPath = o.applyPath
 			fx.HeadSHA = o.headSHA
@@ -1767,6 +1787,18 @@ func earliestOutcomeAfter(outcomes []gateViewOutcome, triggerStage *uuid.UUID, t
 		}
 	}
 	return best, found
+}
+
+// supersededFixupMarker returns the confirmed stage_fixup_superseded marker's
+// sequence for trigger t (E86.54 / #4391), keyed to t's exact stage and
+// sequence so an older pending trigger never picks up a later trigger's
+// supersession. A trigger without a stage id is never superseded.
+func supersededFixupMarker(supersessions map[fixupSupersessionKey]int64, t gateViewTrigger) (int64, bool) {
+	if t.stageID == nil {
+		return 0, false
+	}
+	seq, ok := supersessions[fixupSupersessionKey{StageID: *t.stageID, TriggerSequence: t.sequence}]
+	return seq, ok
 }
 
 // sameStage reports whether two optional stage ids match. Two nil ids are

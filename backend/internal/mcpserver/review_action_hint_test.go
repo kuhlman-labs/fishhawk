@@ -1021,6 +1021,149 @@ func TestFixupRefundedPasses_OneRefundPerTriggerWindow(t *testing.T) {
 	}
 }
 
+// TestFixupRefundedPasses_MCPMirror_Supersession (R7, E86.54 / #4391): the
+// MCP refund mirror counts a CONFIRMED stage_fixup_superseded marker as the
+// fifth delivered-nothing signal, so remaining_fixup_budget agrees with the
+// backend's admit decision on the same rows (server
+// TestFixupRefundedPasses_ConfirmedSupersession: refunded 1, so the backend's
+// normal budget is defaultMaxFixupPasses 1 + 1 refund - 1 prior pass = 1). An
+// inert marker, or a confirmed one on ANOTHER stage, refunds nothing; a
+// failing marker or conversion read is a hard error like the mirror's other
+// reads. MECHANISM (CF): dropping the signal (the markers/conversions block)
+// turns the confirmed row's refund to 0 and remaining to 0; counting every
+// marker without confirmation refunds the inert row (its other rows — a
+// dispatch mark and a category-B recovery — are no refund signal); dropping
+// the per-stage filter refunds the other-stage row (the fake does not filter
+// by stage, so that check is the only control in its path).
+func TestFixupRefundedPasses_MCPMirror_Supersession(t *testing.T) {
+	seed := func(fb *fakeBackend, runID uuid.UUID, stageID, category string, payload map[string]any) int64 {
+		fb.mu.Lock()
+		defer fb.mu.Unlock()
+		seq := int64(len(fb.perRunAuditByRun[runID]) + 1)
+		sid := stageID
+		fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+			ID: uuid.New().String(), Sequence: seq, RunID: runID.String(), StageID: &sid, Category: category, Payload: payload,
+		})
+		return seq
+	}
+	marker := func(tSeq int64) map[string]any {
+		return map[string]any{"trigger_sequence": tSeq, "superseded_by": "merge_candidate_verify_rerun"}
+	}
+	conversion := func(tSeq int64) map[string]any {
+		return map[string]any{"expected_head_sha": "h", "supersedes_fixup_trigger_sequence": tSeq}
+	}
+	cases := []struct {
+		name        string
+		seed        func(fb *fakeBackend, runID uuid.UUID, stage string, tSeq int64)
+		wantRefunds int
+	}{
+		{"confirmed", func(fb *fakeBackend, runID uuid.UUID, stage string, tSeq int64) {
+			seed(fb, runID, stage, categoryStageFixupSuperseded, marker(tSeq))
+			seed(fb, runID, stage, categoryStageMergeCandidateVerifyTriggered, conversion(tSeq))
+		}, 1},
+		{"inert", func(fb *fakeBackend, runID uuid.UUID, stage string, tSeq int64) {
+			seed(fb, runID, stage, categoryStageFixupSuperseded, marker(tSeq))
+			seed(fb, runID, stage, "stage_concurrency_admitted", map[string]any{"group": "local-implement:h1"})
+			seed(fb, runID, stage, categoryStageFixupRecovered, map[string]any{"source_failure_category": "B"})
+		}, 0},
+		{"confirmed on another stage", func(fb *fakeBackend, runID uuid.UUID, _ string, tSeq int64) {
+			other := uuid.New().String()
+			seed(fb, runID, other, categoryStageFixupSuperseded, marker(tSeq))
+			seed(fb, runID, other, categoryStageMergeCandidateVerifyTriggered, conversion(tSeq))
+		}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			tSeq := seed(fb, runID, stageID.String(), categoryStageFixupTriggered, map[string]any{"delegated": "merge_candidate_verify_failed"})
+			tc.seed(fb, runID, stageID.String(), tSeq)
+			seedImplementReviewedAudit(fb, runID, stageID, 1)
+			r := newResolver(srv, nil)
+
+			refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{tSeq})
+			if err != nil {
+				t.Fatalf("fixupRefundedPasses: %v", err)
+			}
+			if refunds != tc.wantRefunds {
+				t.Errorf("refunds = %d, want %d", refunds, tc.wantRefunds)
+			}
+			hint, err := r.reviewActionHintFor(context.Background(), runID, stageID, "running", completeStatus(), nil, nil)
+			if err != nil || hint == nil {
+				t.Fatalf("reviewActionHintFor = %v, %v; want a hint", hint, err)
+			}
+			if hint.RemainingFixupBudget != tc.wantRefunds {
+				t.Errorf("RemainingFixupBudget = %d, want %d (the backend's 1 + refunded - 1 prior pass)", hint.RemainingFixupBudget, tc.wantRefunds)
+			}
+		})
+	}
+	for _, failing := range []string{categoryStageFixupSuperseded, categoryStageMergeCandidateVerifyTriggered} {
+		t.Run("read error "+failing, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID, stageID := uuid.New(), uuid.New()
+			tSeq := seed(fb, runID, stageID.String(), categoryStageFixupTriggered, map[string]any{})
+			seed(fb, runID, stageID.String(), categoryStageFixupSuperseded, marker(tSeq))
+			seed(fb, runID, stageID.String(), categoryStageMergeCandidateVerifyTriggered, conversion(tSeq))
+			fb.reviewFlip = func(category string) {
+				if category == failing {
+					fb.perRunAuditStatus = 500
+					return
+				}
+				fb.perRunAuditStatus = 200
+			}
+			r := newResolver(srv, nil)
+			if refunds, err := r.fixupRefundedPasses(context.Background(), runID, stageID, []int64{tSeq}); err == nil {
+				t.Fatalf("refunds = %d, err = nil; want the %s read error returned", refunds, failing)
+			}
+		})
+	}
+}
+
+// TestConfirmedSupersessionSeqs pins the pure MCP mirror of
+// server.confirmedFixupSupersessions row by row. MECHANISM (CF): dropping the
+// V.Sequence > M.Sequence comparison confirms the "V before marker" row;
+// dropping the field match confirms the "V naming another trigger" and
+// "fieldless V" rows; dropping the same-stage match confirms "V on another
+// stage"; dropping the stage guard confirms the stageless/empty-stage rows.
+func TestConfirmedSupersessionSeqs(t *testing.T) {
+	stage, other := "s1", "s2"
+	m := func(seq int64, st string, payload any) AuditEntry {
+		return AuditEntry{Sequence: seq, StageID: &st, Category: categoryStageFixupSuperseded, Payload: payload}
+	}
+	v := func(seq int64, st string, payload any) AuditEntry {
+		return AuditEntry{Sequence: seq, StageID: &st, Category: categoryStageMergeCandidateVerifyTriggered, Payload: payload}
+	}
+	cases := []struct {
+		name    string
+		markers []AuditEntry
+		vs      []AuditEntry
+		want    int
+	}{
+		{"confirmed", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(12, stage, map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 1},
+		{"inert marker", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, nil, 0},
+		{"V naming another trigger", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(12, stage, map[string]any{"supersedes_fixup_trigger_sequence": 9})}, 0},
+		{"fieldless V", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(12, stage, map[string]any{"expected_head_sha": "h"})}, 0},
+		{"V before marker", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(10, stage, map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 0},
+		{"V on another stage", []AuditEntry{m(11, stage, map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(12, other, map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 0},
+		{"undecodable marker", []AuditEntry{m(11, stage, []int{1})}, []AuditEntry{v(12, stage, map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 0},
+		// The stage guards are isolated by pairing with an EMPTY-stage V, so
+		// the same-stage match cannot mask them.
+		{"stageless marker", []AuditEntry{{Sequence: 11, Payload: map[string]any{"trigger_sequence": 10}}}, []AuditEntry{v(12, "", map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 0},
+		{"empty-stage marker", []AuditEntry{m(11, "", map[string]any{"trigger_sequence": 10})}, []AuditEntry{v(12, "", map[string]any{"supersedes_fixup_trigger_sequence": 10})}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := confirmedSupersessionSeqs(tc.markers, tc.vs)
+			if len(got) != tc.want {
+				t.Fatalf("confirmed = %+v, want %d", got, tc.want)
+			}
+			if tc.want == 1 && (got[0].MarkerSequence != 11 || got[0].TriggerSequence != 10 || got[0].StageID != stage) {
+				t.Errorf("confirmed = %+v, want marker 11 / trigger 10 / stage %s", got[0], stage)
+			}
+		})
+	}
+}
+
 // TestImplementReviewMergeHint covers the #947 local-loop parity hint: a
 // display-only merge-readiness warning surfaced ONLY while the implement-stage
 // agent review is pending (dispatched, no verdict). It mirrors the backend's

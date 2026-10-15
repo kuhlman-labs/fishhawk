@@ -527,6 +527,106 @@ func TestGateView_FixupJoin(t *testing.T) {
 	}
 }
 
+// TestGateView_FixupOutcomeSuperseded (R5, E86.54 / #4391): a concern-bearing
+// fix-up trigger a CONFIRMED stage_fixup_superseded marker names reads
+// "superseded"; an inert marker (no conversion trigger names it) followed by
+// a dispatch reads pending, and followed by a push reads pushed; and an older
+// pending trigger does not pick up a later trigger's supersession, because
+// the outcome is keyed to that exact trigger sequence. An outcome sequenced
+// BEFORE the marker still wins. MECHANISM (CF): dropping the confirmation
+// (reading every marker as a supersession) turns the inert-then-dispatch
+// trigger into "superseded"; keying on the stage alone turns the older
+// trigger "superseded"; dropping the before-marker check turns the
+// outcome-before-marker trigger "superseded".
+func TestGateView_FixupOutcomeSuperseded(t *testing.T) {
+	seedMarker := func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, seq, tSeq int64) {
+		seedHeadEntry(au, runID, stageID, CategoryStageFixupSuperseded, seq, map[string]any{
+			"trigger_sequence": tSeq, "superseded_by": fixupSupersededByVerifyRerun, "reason": mergeCandidateRerunReasonPrefix + "infra"})
+	}
+	seedConversion := func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, seq, tSeq int64) {
+		seedHeadEntry(au, runID, stageID, CategoryStageMergeCandidateVerifyTriggered, seq, map[string]any{
+			"expected_head_sha": "h", "supersedes_fixup_trigger_sequence": tSeq})
+	}
+	cases := []struct {
+		name string
+		seed func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string)
+		want []string
+	}{
+		{"confirmed", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedConversion(au, runID, stageID, 22, 20)
+		}, []string{"superseded"}},
+		{"inert then dispatch", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedHeadEntry(au, runID, stageID, CategoryStageConcurrencyAdmitted, 22, map[string]any{"group": "local-implement:h1"})
+		}, []string{"pending"}},
+		{"inert then push", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 21, 20)
+			seedHeadEntry(au, runID, stageID, "fixup_pushed", 22, map[string]any{"head_sha": "deadbeef", "apply_path": "agent"})
+		}, []string{"pushed"}},
+		{"older pending trigger", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "older"})
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 30, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedMarker(au, runID, stageID, 31, 30)
+			seedConversion(au, runID, stageID, 32, 30)
+		}, []string{"pending", "superseded"}},
+		{"outcome before marker wins", func(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, id string) {
+			seedHeadEntry(au, runID, stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "d6"})
+			seedHeadEntry(au, runID, stageID, "fixup_no_changes", 21, map[string]any{})
+			seedMarker(au, runID, stageID, 22, 20)
+			seedConversion(au, runID, stageID, 23, 20)
+		}, []string{"no_changes"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, cr := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stageID := uuid.New()
+			c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
+			tc.seed(au, runID, &stageID, c.ID.String())
+
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if len(resp.Open) != 1 {
+				t.Fatalf("Open = %d, want 1", len(resp.Open))
+			}
+			fx := resp.Open[0].Fixups
+			var got []string
+			for _, f := range fx {
+				got = append(got, f.Outcome)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("fix-up outcomes = %v, want %v", got, tc.want)
+			}
+			if resp.HistoryIncomplete {
+				t.Errorf("history_incomplete with gaps %v, want a complete history", resp.HistoryGaps)
+			}
+		})
+	}
+	// A read gap on either new category leaves a confirmed supersession
+	// pending (never a false superseded) and names the gap.
+	for _, gap := range []string{CategoryStageFixupSuperseded, CategoryStageMergeCandidateVerifyTriggered} {
+		t.Run("read gap "+gap, func(t *testing.T) {
+			s, repo, au, cr := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stageID := uuid.New()
+			c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
+			cases[0].seed(au, runID, &stageID, c.ID.String())
+			au.listByCategoryErrCategory = gap
+
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if len(resp.Open) != 1 || len(resp.Open[0].Fixups) != 1 || resp.Open[0].Fixups[0].Outcome != "pending" {
+				t.Fatalf("open = %+v, want one fix-up reading pending under a %s read gap", resp.Open, gap)
+			}
+			if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gap) {
+				t.Errorf("history_incomplete = %v, gaps = %v; want a %s gap", resp.HistoryIncomplete, resp.HistoryGaps, gap)
+			}
+		})
+	}
+}
+
 // TestGateView_FixupJoin_RecoveredOutcome pins the #3395 third outcome: a
 // trigger followed only by a stage_fixup_recovered entry reads "recovered"
 // (before this it read "pending" forever), while a trigger followed by
