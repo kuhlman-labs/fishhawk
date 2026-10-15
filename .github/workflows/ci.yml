@@ -93,11 +93,10 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          # Some transitive deps (pgx, testcontainers, golang-migrate) declare
-          # `go 1.25` directives, so the toolchain on the runner must be >= 1.25
-          # even though our own code only uses 1.22-era features (method-aware
-          # ServeMux). Bumping conservatively to the major version line.
-          go-version: '1.25'
+          # The workspace declares `go 1.26` (#3787: golang-migrate 4.20 and
+          # x/mod / x/tools need it), so the runner's toolchain floats on the
+          # 1.26 line. The exact patch pin is deploy/gate-image's GO_VERSION.
+          go-version: '1.26'
           cache: true
           # There is no root go.mod (multi-module go.work), and setup-go's
           # default dependency file is ./go.mod — so without this every run
@@ -134,16 +133,18 @@ jobs:
       - name: Install golangci-lint
         if: steps.have-modules.outputs.yes == 'true'
         run: |
-          # v2.8.0 binaries are built with go1.25.x, so they can typecheck
-          # packages whose deps require go 1.25. Older v2 releases (v2.0.x)
-          # were built with go1.24 and reject go 1.25 packages.
+          # golangci-lint must be built with a Go at least as new as the
+          # workspace: v2.8.0 (go1.25) panics on a go 1.26 workspace with
+          # "package requires newer Go version go1.26" (#3787). v2.12.2 is
+          # built with go1.26.2; v2.13+ is built with go1.27, whose gofmt
+          # disagrees with go1.26's.
           #
-          # Pin install.sh to the v2.8.0 tag, NOT master: the master script
+          # Pin install.sh to the v2.12.2 tag, NOT master: the master script
           # is unpinned and an upstream change to it broke CI (exit 1 right
-          # after resolving v2.8.0) with no change on our side. The tagged
+          # after resolving v2.12.2) with no change on our side. The tagged
           # script matches the version it installs and is reproducible.
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.12.2/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
 
       # golangci-lint keeps an incremental analysis cache at
       # ~/.cache/golangci-lint that setup-go's cache does NOT cover. Restoring
@@ -198,7 +199,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           # Cached explicitly below, per leg: each leg compiles a different
           # package set, so one shared setup-go key would save only whichever
           # leg finished first.
@@ -242,7 +243,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
           cache: true
           cache-dependency-path: '**/go.sum'
 

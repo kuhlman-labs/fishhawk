@@ -1,3 +1,3 @@
 module github.com/kuhlman-labs/fishhawk/pricing
 
-go 1.25
+go 1.26

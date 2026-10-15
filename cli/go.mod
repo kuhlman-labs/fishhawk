@@ -1,6 +1,6 @@
 module github.com/kuhlman-labs/fishhawk/cli
 
-go 1.25
+go 1.26
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.2
