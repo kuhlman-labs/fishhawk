@@ -3,7 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // bootMarker is the fixed processStart the reconcile tests inject so the
@@ -803,5 +809,484 @@ func TestReconcileRunReviews_Endpoint_SkipsPendingRedispatch(t *testing.T) {
 	}
 	if reasons := failedReasonsAfter(t, f.au, f.runRow.ID, "plan_review_failed", seq); len(reasons) != 0 {
 		t.Fatalf("plan_review_failed = %v, want none for a pending re-dispatch", reasons)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Lost review terminals on the reconcile path (E72.64 / #4106, slice 1).
+// ---------------------------------------------------------------------------
+
+// newLostTerminalReconcileServer wires a Server over a seeded running run and
+// the flaky audit fake, with the fixed bootMarker as processStart so a round
+// started "now" is one THIS process dispatched. The recorder observes the
+// implement-stage audit-complete republish.
+func newLostTerminalReconcileServer(t *testing.T, f *flakyReviewAudit) (*Server, uuid.UUID, *recomputeRecorder) {
+	t.Helper()
+	repo := newFakeRepo()
+	runID := seedRunningRun(t, repo)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: f, ProcessStart: bootMarker})
+	rec := &recomputeRecorder{}
+	s.reconcileRecomputeAuditComplete = rec.hook(f, t)
+	return s, runID, rec
+}
+
+// registerParkedLost registers a lost terminal for the given original (its
+// Timestamp stamped here) with a settle whose first step cannot elapse during
+// the test, so only the code under test can flush it. The test's own (run,
+// stage) entries are removed at cleanup.
+func registerParkedLost(t *testing.T, s *Server, original audit.ChainAppendParams) {
+	t.Helper()
+	original.Timestamp = nextReviewTerminalTimestamp()
+	named, stage, ok := buildVerdictWriteFailedParams(original, 1, time.Millisecond, errors.New("audit store down"))
+	if !ok {
+		t.Fatalf("buildVerdictWriteFailedParams rejected %s", original.Category)
+	}
+	e := &lostReviewTerminal{stageID: *original.StageID, originalCategory: original.Category, originalTimestamp: original.Timestamp, named: named}
+	s.registerLostReviewTerminal(context.Background(), e, original.RunID, stage, rtCfg(nil, rtSteps(1, timescale.D(30*time.Second)), time.Second))
+	key := lostReviewTerminalKey{runID: original.RunID, stage: stage.label}
+	t.Cleanup(func() {
+		for _, e := range lostReviewTerminalsFor(key) {
+			removeLostReviewTerminal(key, e.id)
+		}
+	})
+}
+
+// recomputeCallsFor is the recorder's call count (every call is for the
+// test's own run: the server serves one run).
+func recomputeCallsFor(rec *recomputeRecorder) int { return len(rec.snapshot()) }
+
+// (24) A round THIS process dispatched (started after the boot marker) whose
+// only reviewer finished but whose terminal write was lost is accepted by the
+// reconcile pass: the registered named failure lands, the stage reports
+// synthesized 1, and the implement stage republishes audit-complete.
+//
+// COUNTERFACTUAL C13: delete the flushLostReviewTerminalsLocked call → the
+// boot-marker gate answers review_dispatched_by_this_process, synthesized 0.
+// COUNTERFACTUAL C21: report the flush as Synthesized 0 → the synthesized
+// assertion (and, on the endpoint, terminated) goes RED.
+func TestReconcileStageOrphanedReviews_LostTerminalSettlesCurrentProcessRound(t *testing.T) {
+	for _, tc := range []struct {
+		label         string
+		original      func(uuid.UUID, uuid.UUID) audit.ChainAppendParams
+		wantRepublish int
+	}{
+		{"plan", planReviewedParams, 0},
+		{"implement", implementReviewedParams, 1},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			f := newFlakyReviewAudit()
+			s, runID, rec := newLostTerminalReconcileServer(t, f)
+			stage, _ := reviewStageKindByLabel(tc.label)
+			stageID := uuid.New()
+			f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), stage.started, 1)
+			registerParkedLost(t, s, tc.original(runID, stageID))
+
+			stages, err := s.reconcileRunOrphanedReviews(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("reconcileRunOrphanedReviews: %v", err)
+			}
+			row := stageRow(t, reconcileRunReviewsResponse{Stages: stages}, tc.label)
+			if row.Synthesized != 1 || row.Skipped || row.LandedBefore != 0 {
+				t.Fatalf("%s row = %+v, want synthesized 1, not skipped, landed_before 0", tc.label, row)
+			}
+			named := f.namedFailures(t, runID, stage.failed)
+			if len(named) != 1 {
+				t.Fatalf("%s verdict_write_failed rows = %d, want 1", stage.failed, len(named))
+			}
+			if !strings.Contains(named[0].Reason, tc.label+"_reviewed append failed") {
+				t.Errorf("named failure reason %q does not name the lost original", named[0].Reason)
+			}
+			if n := registered(runID, tc.label); n != 0 {
+				t.Errorf("registered(%s, %s) = %d, want 0 after the flush landed it", runID, tc.label, n)
+			}
+			if got := recomputeCallsFor(rec); got != tc.wantRepublish {
+				t.Errorf("audit-complete republish calls = %d, want %d", got, tc.wantRepublish)
+			}
+		})
+	}
+}
+
+// (25) Only the LOST slots close: a 2-reviewer round with one lost terminal and
+// one reviewer still running synthesizes exactly 1 and stays pending — the
+// running reviewer's share is never closed.
+//
+// Subtest registered_beyond_room isolates the room cap on the reconcile path:
+// one verdict landed and TWO entries are registered (more than the one slot
+// left), so only the cap stops a second row.
+// COUNTERFACTUAL C8: drop the room cap → registered_beyond_room appends 2 and
+// the round over-settles (landed 3 > configured 2).
+func TestReconcileStageOrphanedReviews_LostTerminalOnlyNotInFlightRemainder(t *testing.T) {
+	t.Run("one_lost_one_running", func(t *testing.T) {
+		f := newFlakyReviewAudit()
+		s, runID, _ := newLostTerminalReconcileServer(t, f)
+		stage, _ := reviewStageKindByLabel("plan")
+		stageID := uuid.New()
+		f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), stage.started, 2)
+		registerParkedLost(t, s, planReviewedParams(runID, stageID))
+
+		res, err := s.reconcileStageOrphanedReviews(context.Background(), runID, stage)
+		if err != nil {
+			t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+		}
+		if res.Synthesized != 1 || res.Skipped {
+			t.Fatalf("row = %+v, want synthesized 1 (the lost slot only)", res)
+		}
+		if n := len(f.rows(t, runID, "plan_review_failed")); n != 1 {
+			t.Fatalf("plan_review_failed rows = %d, want 1 (the running reviewer's share stays open)", n)
+		}
+		landed, err := s.countLandedReviewTerminals(context.Background(), runID, stage, 10)
+		if err != nil || landed != 1 {
+			t.Fatalf("landed = %d (%v), want 1 < configured 2 (round still pending)", landed, err)
+		}
+	})
+	t.Run("registered_beyond_room", func(t *testing.T) {
+		f := newFlakyReviewAudit()
+		s, runID, _ := newLostTerminalReconcileServer(t, f)
+		stage, _ := reviewStageKindByLabel("plan")
+		stageID := uuid.New()
+		f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), stage.started, 2)
+		registerParkedLost(t, s, planReviewedParams(runID, stageID))
+		registerParkedLost(t, s, planReviewedParams(runID, stageID))
+		landedVerdict := planReviewedParams(runID, stageID)
+		landedVerdict.Timestamp = nextReviewTerminalTimestamp()
+		if _, err := f.AppendChained(context.Background(), landedVerdict); err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := s.reconcileStageOrphanedReviews(context.Background(), runID, stage)
+		if err != nil {
+			t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+		}
+		if res.Synthesized != 1 || res.LandedBefore != 1 {
+			t.Fatalf("row = %+v, want synthesized 1, landed_before 1", res)
+		}
+		landed, err := s.countLandedReviewTerminals(context.Background(), runID, stage, 10)
+		if err != nil || landed != 2 {
+			t.Fatalf("landed = %d (%v), want exactly configured 2", landed, err)
+		}
+		if n := registered(runID, "plan"); n != 0 {
+			t.Errorf("registered = %d, want 0 (the over-room entry is dropped)", n)
+		}
+	})
+}
+
+// (26) The control: with NO lost terminal registered for THIS run (one is
+// registered for another run), a round this process dispatched is still
+// refused as review_dispatched_by_this_process and nothing is written.
+// TestReconcileRunReviews_Endpoint_RefusesLiveRound pins the same on the wire.
+func TestReconcileStageOrphanedReviews_NoLostTerminalStillRefusesLiveRound(t *testing.T) {
+	f := newFlakyReviewAudit()
+	s, runID, _ := newLostTerminalReconcileServer(t, f)
+	stage, _ := reviewStageKindByLabel("plan")
+	stageID := uuid.New()
+	f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), stage.started, 1)
+	otherRun, otherStage := uuid.New(), uuid.New()
+	f.seedStarted(otherRun, otherStage, 11, time.Now().UTC().Add(-time.Minute), stage.started, 1)
+	registerParkedLost(t, s, planReviewedParams(otherRun, otherStage))
+
+	res, err := s.reconcileStageOrphanedReviews(context.Background(), runID, stage)
+	if err != nil {
+		t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+	}
+	if !res.Skipped || res.SkipReason != reconcileSkipInFlight || res.Synthesized != 0 {
+		t.Fatalf("row = %+v, want skipped %q with nothing synthesized", res, reconcileSkipInFlight)
+	}
+	if n := len(f.rows(t, runID, "plan_review_failed")); n != 0 {
+		t.Fatalf("plan_review_failed rows = %d, want 0 over a live round", n)
+	}
+	if n := registered(otherRun, "plan"); n != 1 {
+		t.Errorf("another run's entry was touched: registered = %d, want 1", n)
+	}
+}
+
+// Binding condition C2 on the reconcile path: the named failure's append
+// COMMITS but returns an error, so the first pass appends nothing and the
+// entry stays registered. The second pass counts the committed row (the round
+// is now settled), and its flush finds the named failure by probe and removes
+// the entry as confirmed landed — which must republish audit-complete even
+// though nothing was appended.
+//
+// COUNTERFACTUALS: republish only on Synthesized > 0 (drop lostConfirmed from
+// the emittedImplement predicate), or run the flush AFTER the settled check →
+// the second pass never republishes → RED.
+func TestReconcileRunReviews_LostTerminalConfirmedByProbe_RepublishesAuditComplete(t *testing.T) {
+	f := newFlakyReviewAudit()
+	var committed atomic.Bool
+	f.appendAction = func(_ int, p audit.ChainAppendParams) flakyAction {
+		if p.Category == "implement_review_failed" && !committed.Swap(true) {
+			return flakyCommitThenFail
+		}
+		return flakyOK
+	}
+	s, runID, rec := newLostTerminalReconcileServer(t, f)
+	stageID := uuid.New()
+	f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), "implement_review_started", 1)
+	registerParkedLost(t, s, implementReviewedParams(runID, stageID))
+
+	first, err := s.reconcileRunOrphanedReviews(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if row := stageRow(t, reconcileRunReviewsResponse{Stages: first}, "implement"); row.Synthesized != 0 {
+		t.Fatalf("first pass row = %+v, want synthesized 0 (the ack was lost)", row)
+	}
+	if n := registered(runID, "implement"); n != 1 {
+		t.Fatalf("registered after the ambiguous append = %d, want 1", n)
+	}
+	if got := recomputeCallsFor(rec); got != 0 {
+		t.Fatalf("republish calls after the first pass = %d, want 0", got)
+	}
+
+	second, err := s.reconcileRunOrphanedReviews(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	row := stageRow(t, reconcileRunReviewsResponse{Stages: second}, "implement")
+	if row.SkipReason != reconcileSkipAlreadySettled || row.Synthesized != 0 {
+		t.Fatalf("second pass row = %+v, want skipped %q, nothing appended", row, reconcileSkipAlreadySettled)
+	}
+	if n := registered(runID, "implement"); n != 0 {
+		t.Errorf("registered after the confirming probe = %d, want 0", n)
+	}
+	if got := recomputeCallsFor(rec); got != 1 {
+		t.Errorf("republish calls = %d, want 1 (a probe-confirmed removal republishes)", got)
+	}
+	if n := len(f.namedFailures(t, runID, "implement_review_failed")); n != 1 {
+		t.Errorf("implement_review_failed rows = %d, want exactly 1", n)
+	}
+}
+
+// postReconcileRoute drives the SHIPPED route through s.Handler() on an
+// httptest.Server with a real operator bearer, so the request crosses the auth
+// middleware, the account wrapper and the handler.
+func postReconcileRoute(t *testing.T, srv *httptest.Server, runID uuid.UUID, bearer string) (int, reconcileRunReviewsResponse) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL+"/v0/runs/"+runID.String()+"/reviews/reconcile", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	var body reconcileRunReviewsResponse
+	if resp.StatusCode == http.StatusOK {
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode %q: %v", raw, err)
+		}
+	} else {
+		t.Logf("reconcile %d: %s", resp.StatusCode, raw)
+	}
+	return resp.StatusCode, body
+}
+
+// (27) CROSS-BOUNDARY: the real plan review loop runs under a total audit
+// outage to exhaustion, so its verdict never lands and the lost terminal is
+// registered. The detached settle is run out against the same outage (the
+// entry is still registered when it ends), so ONLY reconcile can land the row.
+// The outage clears; POST /v0/runs/{run_id}/reviews/reconcile through the real
+// mux settles the round with the named verdict_write_failed failure(s), and a
+// second POST answers round_already_settled. The two_reviewers case is binding
+// condition C4 on the endpoint: both lost slots close, landed == configured.
+//
+// COUNTERFACTUALS C13 (no flush call) and C21 (flush reported as Synthesized 0)
+// → terminated false / synthesized 0 → RED.
+func TestReconcileRunReviews_Endpoint_SettlesWriteFailedRound(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reviewers int
+	}{
+		{"one_reviewer", 1},
+		{"two_reviewers", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFlakyReviewAudit()
+			f.appendAction = failAll
+			tokenRepo, bearer := mcpTestTokens(t, "write:runs")
+			repo := newFakeRepo()
+			runID := seedRunningRun(t, repo)
+			s := New(Config{
+				Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: f, ConcernRepo: newFakeConcernRepo(),
+				APITokenRepo: tokenRepo, ProcessStart: bootMarker,
+			})
+			stageID := uuid.New()
+			f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), "plan_review_started", tc.reviewers)
+			invocations := make([]reviewerInvocation, tc.reviewers)
+			for i := range invocations {
+				invocations[i] = reviewerInvocation{reviewer: &fakePlanReviewer{verdict: &planreview.ReviewVerdict{
+					Verdict:  planreview.VerdictApproveWithConcerns,
+					Concerns: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+				}, model: "claude-opus-4-8"}}
+			}
+			s.runPlanReviewLoop(context.Background(), runID, stageID, invocations, planreview.AuthorityAdvisory, "prompt", "author", planreview.DefaultReviewBudget, "")
+			s.waitBackgroundReviews()
+			if n := registered(runID, "plan"); n != tc.reviewers {
+				t.Fatalf("registered after the settle ran out = %d, want %d", n, tc.reviewers)
+			}
+			if n := len(f.rows(t, runID, "plan_reviewed")) + len(f.rows(t, runID, "plan_review_failed")); n != 0 {
+				t.Fatalf("terminal rows under the outage = %d, want 0", n)
+			}
+			t.Cleanup(func() {
+				key := lostReviewTerminalKey{runID: runID, stage: "plan"}
+				for _, e := range lostReviewTerminalsFor(key) {
+					removeLostReviewTerminal(key, e.id)
+				}
+			})
+
+			f.recovered.Store(true)
+			srv := httptest.NewServer(s.Handler())
+			t.Cleanup(srv.Close)
+
+			code, body := postReconcileRoute(t, srv, runID, bearer)
+			if code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", code)
+			}
+			row := stageRow(t, body, "plan")
+			if !body.Terminated || row.Synthesized != tc.reviewers {
+				t.Fatalf("terminated = %v plan row = %+v, want terminated true, synthesized %d", body.Terminated, row, tc.reviewers)
+			}
+			named := f.namedFailures(t, runID, "plan_review_failed")
+			if len(named) != tc.reviewers {
+				t.Fatalf("verdict_write_failed rows = %d, want %d", len(named), tc.reviewers)
+			}
+			for _, p := range named {
+				if !strings.Contains(p.Reason, "verdict approve_with_concerns, 1 concerns") {
+					t.Errorf("named failure reason %q does not summarise the lost verdict", p.Reason)
+				}
+			}
+			stage, _ := reviewStageKindByLabel("plan")
+			if landed, err := s.countLandedReviewTerminals(context.Background(), runID, stage, 10); err != nil || landed != tc.reviewers {
+				t.Errorf("landed = %d (%v), want configured %d", landed, err, tc.reviewers)
+			}
+			if n := registered(runID, "plan"); n != 0 {
+				t.Errorf("registered = %d, want 0", n)
+			}
+
+			code, body = postReconcileRoute(t, srv, runID, bearer)
+			if code != http.StatusOK {
+				t.Fatalf("second status = %d, want 200", code)
+			}
+			if row := stageRow(t, body, "plan"); body.Terminated || row.SkipReason != reconcileSkipAlreadySettled {
+				t.Errorf("second POST terminated = %v plan row = %+v, want round_already_settled", body.Terminated, row)
+			}
+		})
+	}
+}
+
+// (28) A flush append that hangs is bounded by the per-operation timeout, so
+// the reconcile request returns and RELEASES the run's stripe lock: the first
+// POST returns within its bound having synthesized nothing (the round reads as
+// in flight), and a second POST — the store no longer hangs — lands the row.
+//
+// COUNTERFACTUAL C16: run flush's append under the bare ctx instead of
+// boundedAppend → the first POST never returns within D(10s) → RED.
+func TestReconcileRunReviews_Endpoint_BlockedFlushReleasesStripeLock(t *testing.T) {
+	f := newFlakyReviewAudit()
+	var blocked atomic.Bool
+	f.appendAction = func(_ int, p audit.ChainAppendParams) flakyAction {
+		if p.Category == "plan_review_failed" && !blocked.Swap(true) {
+			return flakyBlock
+		}
+		return flakyOK
+	}
+	s, runID, _ := newLostTerminalReconcileServer(t, f)
+	stageID := uuid.New()
+	f.seedStarted(runID, stageID, 10, time.Now().UTC().Add(-time.Minute), "plan_review_started", 1)
+	registerParkedLost(t, s, planReviewedParams(runID, stageID))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- postReconcile(t, s, runID.String(), reconcileEndpointIdentity()) }()
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-done:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("a hung flush append held the reconcile request (and its stripe lock) past its bound")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	if body := decodeReconcileBody(t, rec); body.Terminated || stageRow(t, body, "plan").Synthesized != 0 {
+		t.Fatalf("first POST = %+v, want nothing synthesized", body)
+	}
+	if n := registered(runID, "plan"); n != 1 {
+		t.Fatalf("registered after the hung append = %d, want 1", n)
+	}
+	lock := reconcileEmitLockFor(runID)
+	if !lock.TryLock() {
+		t.Fatal("stripe lock still held after the first POST returned")
+	}
+	lock.Unlock()
+
+	rec = postReconcile(t, s, runID.String(), reconcileEndpointIdentity())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeReconcileBody(t, rec)
+	if row := stageRow(t, body, "plan"); !body.Terminated || row.Synthesized != 1 {
+		t.Fatalf("second POST terminated = %v plan row = %+v, want terminated true, synthesized 1", body.Terminated, row)
+	}
+	if n := len(f.namedFailures(t, runID, "plan_review_failed")); n != 1 {
+		t.Errorf("verdict_write_failed rows = %d, want 1", n)
+	}
+}
+
+// The two writers that hold the run's stripe lock — the reconcile synthesis
+// and the boot re-dispatch fallback — write through emitReviewFailedLocked
+// (E72.64 / #4106): under a total audit outage each missing terminal is ONE
+// bounded append (plus one bounded probe) before it is handed to the
+// lost-terminal registry, never a phase-1 retry schedule held under the lock.
+//
+// Only appends of the ORIGINAL synthesized row are counted: the detached
+// settle the registry starts writes only verdict_write_failed stand-ins, so it
+// cannot race the count.
+//
+// COUNTERFACTUAL: route either call site back through emitReviewFailed → the
+// phase-1 retries raise the original-row append count past 1 → RED.
+func TestReconcileInLockSynthesis_TotalOutage_SingleBoundedAttempt(t *testing.T) {
+	stage, _ := reviewStageKindByLabel("plan")
+	for _, tc := range []struct {
+		name string
+		run  func(s *Server, runID uuid.UUID, seq int64, payload planreview.ReviewStartedPayload)
+	}{
+		{"reconcile_synthesis", func(s *Server, runID uuid.UUID, _ int64, _ planreview.ReviewStartedPayload) {
+			if _, err := s.reconcileStageOrphanedReviews(context.Background(), runID, stage); err != nil {
+				t.Fatalf("reconcileStageOrphanedReviews: %v", err)
+			}
+		}},
+		{"redispatch_fallback", func(s *Server, runID uuid.UUID, seq int64, payload planreview.ReviewStartedPayload) {
+			s.closeUnstartedRedispatch(context.Background(), runID, stage, seq, payload, redispatchSlugRedispatchAuditFailed)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFlakyReviewAudit()
+			var originals atomic.Int32
+			f.appendAction = func(_ int, p audit.ChainAppendParams) flakyAction {
+				if !strings.Contains(string(p.Payload), reviewVerdictWriteFailedPrefix) {
+					originals.Add(1)
+				}
+				return flakyFail
+			}
+			s, runID, _ := newLostTerminalReconcileServer(t, f)
+			stageID := uuid.New()
+			f.seedStarted(runID, stageID, 10, beforeBoot, stage.started, 1)
+			t.Cleanup(func() {
+				key := lostReviewTerminalKey{runID: runID, stage: "plan"}
+				for _, e := range lostReviewTerminalsFor(key) {
+					removeLostReviewTerminal(key, e.id)
+				}
+			})
+
+			tc.run(s, runID, 10, planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory})
+			if n := originals.Load(); n != 1 {
+				t.Errorf("original-row append attempts under the stripe lock = %d, want exactly 1 (single bounded attempt)", n)
+			}
+			if n := registered(runID, "plan"); n != 1 {
+				t.Errorf("registered = %d, want 1 (the refused write is handed to the settle)", n)
+			}
+		})
 	}
 }

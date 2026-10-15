@@ -488,6 +488,12 @@ func (s *Server) orphanedRoundStillOpen(ctx context.Context, runID uuid.UUID, st
 // Either read failing (the round anchor or the landed count) WARN-logs and
 // synthesizes nothing: the round is left for the next boot, which closes it
 // failed as already_redispatched (see runOrphanedRoundRedispatch).
+//
+// The synthesis writes through emitReviewFailedLocked (E72.64 / #4106): this
+// function holds the stripe lock it took itself, so each missing terminal is
+// one bounded append plus one bounded probe, and a write the store refuses is
+// handed to the lost-terminal registry's detached settle instead of holding
+// the lock across a retry backoff.
 func (s *Server) closeUnstartedRedispatch(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, orphanedSeq int64, payload planreview.ReviewStartedPayload, slug string) {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
@@ -521,7 +527,7 @@ func (s *Server) closeUnstartedRedispatch(ctx context.Context, runID uuid.UUID, 
 	missing := payload.ConfiguredAgents - landed
 	reason := orphanedReviewRedispatchFallbackReason(slug)
 	for i := 0; i < missing; i++ {
-		s.emitReviewFailed(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", reason, false)
+		s.emitReviewFailedLocked(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", reason, false)
 	}
 	lock.Unlock()
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: re-dispatch started no round — closed the orphaned round failed",
