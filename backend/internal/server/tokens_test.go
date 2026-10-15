@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // fakeTokenRepo is the in-memory apitoken.Repository used by the
@@ -211,6 +212,34 @@ func TestCreateToken_HappyPath(t *testing.T) {
 	}
 	if len(resp.Scopes) != 2 {
 		t.Errorf("Scopes = %v, want 2", resp.Scopes)
+	}
+}
+
+// TestCreateToken_FirstOfficerSeatRefused (E85.6 / #4148): a seat cannot
+// mint itself a token. The assertion reads the token store after the call:
+// the seat still holds exactly the one token it was attached with.
+// Counterfactual run by hand: deleting the tokens.go seat guard turned this
+// test RED (201, and ListForSubject read two tokens).
+func TestCreateToken_FirstOfficerSeatRefused(t *testing.T) {
+	repo := newFakeTokenRepo()
+	runs := newFakeRepo()
+	runID := uuid.New()
+	runs.runs[runID] = &run.Run{ID: runID, State: run.StateRunning}
+	s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo, RunRepo: runs})
+	subject := "first_officer/run/" + runID.String()
+	seat, err := repo.Issue(context.Background(), subject, []string{"read:runs", "read:audit", "write:messages", "request:specialist_jobs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", seat.PlainText,
+		map[string]any{"scopes": []string{"write:approvals", "write:runs"}})
+	requireCrewRefusal(t, w, http.StatusForbidden, "first_officer_cannot_mint_tokens")
+	toks, err := repo.ListForSubject(context.Background(), subject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != 1 || toks[0].ID != seat.ID {
+		t.Fatalf("seat tokens after refused mint = %d, want exactly the attached one", len(toks))
 	}
 }
 

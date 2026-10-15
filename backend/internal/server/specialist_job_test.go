@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
@@ -1195,4 +1196,138 @@ func TestSpecialistJobRoutes_ScopeMatrix(t *testing.T) {
 			requireCrewRefusal(t, rt.call(f, job.JobID, nil), http.StatusUnauthorized, "authentication_required")
 		})
 	}
+}
+
+// --- First-officer seat requests (E85.6 / #4148). Counterfactuals run by
+// hand (control mutated, test run, RED observed, file restored):
+//   - C2 seat profile: adding write:stages to firstofficer.SeatScopes turned
+//     TestSpecialistJobRequest_FirstOfficerSeatCannotAdmitOrResult RED (the
+//     seat's admission answered 200 admitted).
+//   - C5 requester seat: deriving SeatOperator for a seat turned
+//     TestSpecialistJobRequest_FirstOfficerSeatRequester RED.
+//   - C6 scope narrowness: accepting RequestScope from any identity turned
+//     TestSpecialistJobRequest_RequestScopeIsSeatOnly RED (201).
+//   - C7 subject confinement: deleting the specialistJobSubjectInSeat call
+//     turned TestSpecialistJobRequest_FirstOfficerSubjectConfinement RED (the
+//     request naming the unlinked run answered 201).
+
+func sjSeat(subject string, scopes ...string) func(*http.Request) *http.Request {
+	if scopes == nil {
+		scopes = firstofficer.SeatScopes()
+	}
+	return sjIdentity(Identity{Subject: subject, TokenID: "seat-token", Scopes: scopes})
+}
+
+func TestSpecialistJobRequest_FirstOfficerSeatRequester(t *testing.T) {
+	f := newSJPG(t)
+	runID := f.seedRun(nil)
+	subj := runSeat(runID)
+	job := f.request(specialistjob.KindInventory, map[string]any{"run_id": runID.String(), "head_sha": sjSHA1}, sjSeat(subj))
+	want := specialistjob.Requester{Seat: specialistjob.SeatFirstOfficer, ActorKind: "agent", Subject: subj}
+	if job.Requester != want {
+		t.Fatalf("requester = %+v, want %+v", job.Requester, want)
+	}
+	entries := f.runEntries(runID)
+	if len(entries) != 1 || entries[0].actorKind != "agent" || entries[0].actorSubject != subj {
+		t.Fatalf("requested entry = %+v, want actor agent/%s", entries, subj)
+	}
+	// A draft from the seat completes in-process like an operator's.
+	draft := f.request(specialistjob.KindDraft, map[string]any{"run_id": runID.String()}, sjSeat(subj))
+	if draft.State != string(specialistjob.StateCompleted) || draft.Requester.Seat != specialistjob.SeatFirstOfficer {
+		t.Fatalf("seat draft = %+v", draft)
+	}
+}
+
+// The seat profile carries neither write:stages nor the attest scope, so a
+// seat can request but never admit or ship a result.
+func TestSpecialistJobRequest_FirstOfficerSeatCannotAdmitOrResult(t *testing.T) {
+	f := newSJPG(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	seat := sjSeat(runSeat(runID))
+	requireCrewRefusal(t, f.admit(job.JobID, "n", seat), http.StatusForbidden, "insufficient_scope")
+	w := sjCall(t, f.srv.handleSpecialistJobResult, http.MethodPost, "/v0/specialist-jobs/"+job.JobID+"/result", job.JobID, `{}`, seat)
+	requireCrewRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	if got := decodeSJ[specialistJobResponse](t, f.get(job.JobID, sjOperator), http.StatusOK); got.State != string(specialistjob.StateQueued) {
+		t.Fatalf("job state after seat admission attempt = %q, want queued", got.State)
+	}
+}
+
+func TestSpecialistJobRequest_RequestScopeIsSeatOnly(t *testing.T) {
+	f := newSJPG(t)
+	runID := f.seedRun(nil)
+	body := sjRequestBody(t, specialistjob.KindInventory, map[string]any{"run_id": runID.String(), "head_sha": sjSHA1})
+	w := sjCall(t, f.srv.handleRequestSpecialistJob, http.MethodPost, "/v0/specialist-jobs", "", body, operator(specialistjob.RequestScope))
+	requireCrewRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	// A seat WITHOUT the request scope is refused too.
+	w = sjCall(t, f.srv.handleRequestSpecialistJob, http.MethodPost, "/v0/specialist-jobs", "", body, sjSeat(runSeat(runID), "read:runs", "write:stages"))
+	requireCrewRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	if n := f.jobCount(); n != 0 {
+		t.Fatalf("refused requests created %d jobs", n)
+	}
+}
+
+func TestSpecialistJobRequest_FirstOfficerSubjectConfinement(t *testing.T) {
+	f := newSJPG(t)
+	camps := newFOCampaignRepo()
+	f.srv.cfg.CampaignRepo = camps
+	cid, otherCID := uuid.New(), uuid.New()
+	camps.campaigns[cid] = &campaign.Campaign{ID: cid, State: campaign.StateRunning}
+	camps.accounts[cid], camps.accounts[otherCID] = "", ""
+	linked, unlinked := f.seedRun(nil), f.seedRun(nil)
+	camps.byRun[linked] = []*campaign.Item{{ID: uuid.New(), CampaignID: cid, RunID: &linked}}
+	camps.byRun[unlinked] = []*campaign.Item{{ID: uuid.New(), CampaignID: otherCID, RunID: &unlinked}}
+
+	call := func(seat func(*http.Request) *http.Request, subject map[string]any) *httptest.ResponseRecorder {
+		body := sjRequestBody(t, specialistjob.KindInventory, subject)
+		return sjCall(t, f.srv.handleRequestSpecialistJob, http.MethodPost, "/v0/specialist-jobs", "", body, seat)
+	}
+	cseat := sjSeat(campaignSeat(cid))
+	rseat := sjSeat(runSeat(linked))
+
+	refused := []struct {
+		name    string
+		seat    func(*http.Request) *http.Request
+		subject map[string]any
+	}{
+		{"campaign seat, run outside the campaign", cseat, map[string]any{"run_id": unlinked.String(), "head_sha": sjSHA1}},
+		{"campaign seat, another campaign", cseat, map[string]any{"campaign_id": otherCID.String(), "head_sha": sjSHA1}},
+		{"campaign seat, own campaign but foreign run", cseat, map[string]any{"campaign_id": cid.String(), "run_id": unlinked.String(), "head_sha": sjSHA1}},
+		{"campaign seat, run-less and campaign-less subject", cseat, map[string]any{"repo": "kuhlman-labs/fishhawk", "head_sha": sjSHA1}},
+		{"run seat, another run", rseat, map[string]any{"run_id": unlinked.String(), "head_sha": sjSHA1}},
+		{"run seat, a campaign subject", rseat, map[string]any{"campaign_id": cid.String(), "head_sha": sjSHA1}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			requireCrewRefusal(t, call(tc.seat, tc.subject), http.StatusForbidden, "first_officer_subject_out_of_seat")
+		})
+	}
+	if n := f.jobCount(); n != 0 {
+		t.Fatalf("out-of-seat requests created %d jobs", n)
+	}
+
+	for name, tc := range map[string]struct {
+		seat    func(*http.Request) *http.Request
+		subject map[string]any
+	}{
+		"campaign seat, linked run":   {cseat, map[string]any{"run_id": linked.String(), "head_sha": sjSHA1}},
+		"campaign seat, own campaign": {cseat, map[string]any{"campaign_id": cid.String(), "head_sha": sjSHA1}},
+		"run seat, own run":           {rseat, map[string]any{"run_id": linked.String(), "head_sha": sjSHA1}},
+	} {
+		if w := call(tc.seat, tc.subject); w.Code != http.StatusCreated {
+			t.Fatalf("%s: status %d, body %s", name, w.Code, w.Body.String())
+		}
+	}
+
+	// A seat-membership read failure fails closed.
+	before := f.jobCount()
+	camps.listErr = errors.New("db down")
+	if w := call(cseat, map[string]any{"run_id": linked.String(), "head_sha": sjSHA1}); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("membership read error: status %d, want 503", w.Code)
+	}
+	if n := f.jobCount(); n != before {
+		t.Fatal("a membership read error created a job")
+	}
+	// A malformed seat subject (unreachable past the middleware) is refused.
+	w := call(sjSeat("first_officer/run/not-a-uuid"), map[string]any{"run_id": linked.String(), "head_sha": sjSHA1})
+	requireCrewRefusal(t, w, http.StatusUnauthorized, "first_officer_seat_invalid")
 }

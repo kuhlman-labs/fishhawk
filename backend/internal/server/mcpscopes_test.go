@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 // TestMCPToolScopeTable_CoversRegistry is the DONE-MEANS drift test for
@@ -54,6 +55,7 @@ func TestMCPToolScopeTable_VocabularyIsNotParallel(t *testing.T) {
 	allowed[scopeAuditExport] = "named constant (audit_export.go)"
 	allowed[scopeRefinementGate] = "named constant (refinement.go)"
 	allowed[scopeFixupAlternate] = "handler alternate (fixup.go/waive.go/defer_concern.go)"
+	allowed[specialistjob.RequestScope] = "named constant (specialistjob.RequestScope, seat-only alternative in specialist_job.go)"
 
 	for name, rule := range mcpToolScopes {
 		for _, sc := range rule.anyOf {

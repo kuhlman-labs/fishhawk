@@ -1,6 +1,10 @@
 package server
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
+)
 
 // This file carries the ONE reviewable tool-name -> required-scope table the
 // /mcp HTTP-layer authorization gate consults (E66.30 / #2459), plus the
@@ -225,7 +229,9 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// specialist_job.go handleRequestSpecialistJob (E85.9 / #4300). The
 	// handler ALSO refuses a run-bound token that carries write:stages
 	// (specialist_job_requester_not_a_seat), so runBoundSubjectOK stays false.
-	"fishhawk_request_specialist_job": {anyOf: []string{"write:stages"}},
+	// specialistjob.RequestScope is the first-officer seat's alternative (E85.6
+	// / #4148); the handler honors it only from a first_officer/ subject.
+	"fishhawk_request_specialist_job": {anyOf: []string{"write:stages", specialistjob.RequestScope}},
 
 	// --- read:runs. specialist_job.go handleGetSpecialistJob (E85.9 /
 	// #4300) is the one read that enforces read:runs rather than

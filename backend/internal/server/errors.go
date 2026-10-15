@@ -288,6 +288,12 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 		attrs = append(attrs, slog.String("cause", cause))
 	}
 	s.cfg.Logger.LogAttrs(r.Context(), level, "http error response", attrs...)
+
+	// Every 403 served to a first-officer seat also writes an audit row
+	// (ADR-089 D2, E85.6 / #4148). Best-effort; never alters the response.
+	if status == http.StatusForbidden {
+		s.recordFirstOfficerRefusal(r, code, clientDetails)
+	}
 }
 
 // writeJSON renders v as the response body with the given status.
