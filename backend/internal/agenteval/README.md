@@ -1115,6 +1115,12 @@ clean sensitive-path diffs), loaded by `LoadSecurityCatchCorpus` through
   accepted only when its misses are `not_mentioned` reviewer misses, read
   from the subset dry run's `planreview-diag.jsonl`, never from scoring
   misses (`no_probe` / `unattributed`).
+  The 30-trial calibration at 58f8062e caught 171/180 (true rate about
+  179/180; every decodable miss was a mis-attributed real catch), and the
+  Captain's 2026-10-15 ruling accepts the six as documented out-of-band at
+  the ceiling, with cross-context cases left to #4474
+  (`docs/compliance/planreview-catchrate-evidence.md`, "Calibration at
+  58f8062e").
 
 ### The rule, the tolerance and the power floor
 

@@ -98,6 +98,7 @@
     "raw title",
     "raw issue title",
     "raw header",
+    "trusted prompt header",
     "attacker-controlled",
     "attacker controlled",
     "attacker-supplied",

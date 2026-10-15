@@ -225,6 +225,35 @@ names: `authz-account-check-behind-legacy-flag`,
    recording uses this `PIN_REASON` text for the arm, folded into its own:
    `#4402: six harder security catch cases replace the #4314 ceiling set; the security arm case set changed, so the baseline is not comparable`.
 
+**Calibration at 58f8062e (security arm, 30 trials/case).** The step-1 subset
+dry run at the PR head:
+
+| Case | Caught | Misses |
+|---|---|---|
+| `authz-account-check-behind-legacy-flag` | 29/30 | 1 undecodable |
+| `failclosed-gate-lookup-timeout-proceeds` | 30/30 | none |
+| `permission-instruction-path-case-fold-dropped` | 28/30 | 2 unattributed |
+| `secret-signed-url-in-debug-retry-log` | 30/30 | none |
+| `supplychain-installer-from-branch-version-pinned` | 30/30 | none |
+| `trust-linked-issue-summary-one-call-out` | 24/30 | 4 no_probe, 2 unattributed |
+
+- **Clean cases.** 0/120 false alarms on `security`. 4/120 on
+  `security_portability`, all on `clean-policy-test-only`, all in the
+  `verification` category.
+- **Generic-probe check.** No generic probe matched any trial: every catch
+  matched a defect-specific phrase.
+- **Miss classes.** 171/180 caught. All 8 decodable misses (the 4 `no_probe`
+  and 4 `unattributed` above) were real catches mis-attributed (category or
+  phrase), so the true rate is about 179/180. The
+  `trust-linked-issue-summary-one-call-out` misattributed catches used the
+  phrase `trusted prompt header`, which that case now carries as a probe.
+- **Ruling (Captain, 2026-10-15).** The six cases are accepted as documented
+  OUT-OF-BAND AT THE CEILING; #4402's done-means allows a documented reason.
+  No rework chases the band. Cross-context security cases (a defect visible
+  only against unchanged code, or outside the convention) are the follow-up
+  #4474. The `security` arm is re-pinned in the campaign's combined
+  re-recording (step 3).
+
 ## Step 1c — calibrate new conventions-arm cases (#4361)
 
 Before the #4361 re-pin, check that each of its new catch cases is of mid
