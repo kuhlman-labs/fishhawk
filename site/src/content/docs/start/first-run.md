@@ -64,8 +64,11 @@ The CLI installs with `go install`:
 go install github.com/kuhlman-labs/fishhawk/cli/cmd/fishhawk@latest
 ```
 
-A `go install`ed CLI is unstamped, so `fishhawk version` prints `dev`. Only the
-CLI is supported this way: its module pins the sibling `credstore` module by
+A `go install`ed CLI carries no release stamp, so `fishhawk version` falls back
+to the version Go recorded in the binary: a pseudo-version such as
+`v0.0.0-20261015175154-d624cd36df36` for `@latest` or a commit, or the tag for
+a tagged ref. It prints no commit SHA, because module-cache builds carry no VCS
+settings. Only the CLI is supported this way: its module pins the sibling `credstore` module by
 pseudo-version and carries no `replace` directive, which `go install` requires.
 The backend module still carries filesystem `replace` directives, which
 `go install` refuses, so `fishhawkd` builds from a clone, and so does the
@@ -89,16 +92,19 @@ Confirm all three resolve before going on:
 
 ```console
 $ fishhawk version
-dev
+dev (<commit>)
 $ command -v fishhawk-runner
 /path/to/fishhawk/bin/fishhawk-runner
 $ command -v fishhawkd
 /path/to/fishhawk/bin/fishhawkd
 ```
 
-`fishhawk version` printing `dev` is correct — an unstamped build reports the
-`dev` version, which also carries "do not enforce a minimum runner version"
-semantics; `fishhawkd version` prints the same. `fishhawk-runner` has no
+`fishhawk version` printing `dev` plus the checkout commit is correct — a clone
+build has no release stamp and a `(devel)` module version, so the CLI reports
+the `dev` version and the commit Go recorded (`-dirty` appended when the tree
+has uncommitted changes). `dev` also carries "do not enforce a minimum runner
+version" semantics; `fishhawkd version` prints bare `dev`, since the backend has
+no build-info fallback. `fishhawk-runner` has no
 `--version` flag; it has a `version` subcommand (`fishhawk-runner version`)
 that prints JSON with `version`, `git_sha` and `plan_schema_hash`. `command -v`
 is still the check that matters here: it confirms the runner is on `PATH`,
