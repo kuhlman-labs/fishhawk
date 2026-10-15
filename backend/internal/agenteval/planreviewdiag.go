@@ -426,13 +426,19 @@ func (d *CatchRateDiag) writeLineLocked(v any) bool {
 		d.setErrLocked(err)
 		return false
 	}
-	line, _ = d.known.Redact(line)
-	line = catchDiagSkAntRe.ReplaceAll(line, []byte(catchDiagRedacted))
+	line = d.scrub(line)
 	if _, err := d.w.Write(append(line, '\n')); err != nil {
 		d.setErrLocked(err)
 		return false
 	}
 	return true
+}
+
+// scrub is the last pass over every line and the returned summary text:
+// known-value redaction, then the sk-ant scrub.
+func (d *CatchRateDiag) scrub(b []byte) []byte {
+	b, _ = d.known.Redact(b)
+	return catchDiagSkAntRe.ReplaceAll(b, []byte(catchDiagRedacted))
 }
 
 func (d *CatchRateDiag) setErrLocked(err error) {
@@ -575,7 +581,7 @@ func (d *CatchRateDiag) observe(arm, caseName, expect string, index int, respons
 	if d.writeLineLocked(line) {
 		d.trials++
 	}
-	d.armAgg(arm).add(line, rule.Clean)
+	d.armAgg(arm).add(line, rule.Clean, d.scrub)
 	if d.progress != nil {
 		_, _ = fmt.Fprintf(d.progress, "%s/%s/%d %s\n", caseName, arm, index, catchDiagProgressVerdict(line, rule.Clean))
 	}
@@ -619,7 +625,10 @@ func (d *CatchRateDiag) armAgg(arm string) *catchDiagArmAgg {
 	return a
 }
 
-func (a *catchDiagArmAgg) add(line catchDiagTrialLine, clean bool) {
+// add folds one trial line in. scrub runs on each concern category BEFORE
+// it is case-folded into the histogram: a folded credential no longer matches
+// its known value.
+func (a *catchDiagArmAgg) add(line catchDiagTrialLine, clean bool, scrub func([]byte) []byte) {
 	pc, ok := a.perCase[line.Case]
 	if !ok {
 		pc = &catchDiagCaseAgg{misses: map[CatchMissClass]int{}}
@@ -636,7 +645,7 @@ func (a *catchDiagArmAgg) add(line catchDiagTrialLine, clean bool) {
 		a.concernsSum += line.ConcernsTotal
 	}
 	for _, c := range line.RawConcerns {
-		label := strings.ToLower(strings.TrimSpace(c.Category))
+		label := strings.ToLower(strings.TrimSpace(string(scrub([]byte(c.Category)))))
 		if label == "" {
 			label = "(empty)"
 		}
@@ -728,7 +737,7 @@ func (a *catchDiagArmAgg) summary() CatchRateDiagArmSummary {
 }
 
 // Finish writes the summary line for runErr, closes the file and returns the
-// rendered text summary. Its error is the sticky write error or the close
+// rendered text summary, scrubbed like every line. Its error is the sticky write error or the close
 // error, naming the path; the run's own error is the caller's.
 func (d *CatchRateDiag) Finish(runErr error) (string, error) {
 	d.mu.Lock()
@@ -750,7 +759,7 @@ func (d *CatchRateDiag) Finish(runErr error) (string, error) {
 	d.writeLineLocked(line)
 	d.finished = true
 	cerr := d.w.Close()
-	text := renderCatchRateDiagSummary(line)
+	text := string(d.scrub([]byte(renderCatchRateDiagSummary(line))))
 	if d.err != nil {
 		return text, fmt.Errorf("agenteval: catch-rate diagnostics %s: write failed: %w", d.path, d.err)
 	}

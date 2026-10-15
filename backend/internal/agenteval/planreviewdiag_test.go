@@ -149,13 +149,21 @@ func TestRecordCatchRateEvidenceWithDiagnostics_RefusalKeepsEveryTrial(t *testin
 	}
 }
 
-// D2. Fixture-state mechanism: the fake credential matches no
+// D2. Both the file and Finish's returned summary text are checked.
+// Fixture-state mechanism: the fake credential matches no
 // redaction.DefaultPatterns shape, so only the known-value pass removes it
 // (CF4: with that line deleted the file carries the fake value); the
 // sk-ant-oat01 token is short and not an api03 key, so only the sk-ant scrub
-// removes it (CF7: with that line deleted the file carries "sk-ant").
+// removes it (CF7: with that line deleted the file carries "sk-ant"). The
+// undecodable response's verdict carries both, and the verdict histogram is
+// rendered into the returned text without passing the write-time scrub, so
+// with Finish's text scrub deleted the returned text carries the fake value.
+// The credential is MIXED-CASE and also sits in a concern category, which
+// the histogram case-folds: with the scrub-before-fold in add deleted, the
+// folded value no longer matches its known value, so the file's summary line
+// and the returned text carry it lower-cased (the checks are case-folded).
 func TestCatchRateDiag_NoCredentialInFile(t *testing.T) {
-	const fake = "fhdiag-fake-credential-value-0123456789"
+	const fake = "fhdiag-Fake-Credential-Value-0123456789"
 	t.Setenv(liveAPIKeyEnv, fake)
 	t.Setenv(liveAuthTokenEnv, "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
@@ -171,11 +179,11 @@ func TestCatchRateDiag_NoCredentialInFile(t *testing.T) {
 	}
 
 	b, _ := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{map[string]any{
-		"severity": "medium", "category": "leak " + fake, "convention": fake + " " + oat,
+		"severity": "medium", "category": "leak " + fake + " " + oat, "convention": fake + " " + oat,
 		"note": "the key " + fake + " and " + oat + " and " + api03,
 	}}})
 	verdict := string(b)
-	undecodable := "no verdict here: " + fake + " " + oat + " " + api03
+	undecodable := `no verdict here: {"verdict":"` + fake + " " + oat + " " + api03 + `"}`
 	call := 0
 	sender := senderFunc(func(_ context.Context, _, _ string) (string, string, int, int, int, int, error) {
 		call++
@@ -193,8 +201,12 @@ func TestCatchRateDiag_NoCredentialInFile(t *testing.T) {
 	if _, err := RunCatchRateArm(withCatchTrialObserver(context.Background(), d), sender, cases, conv, ArmWithConventions, 1); err != nil {
 		t.Fatalf("RunCatchRateArm: %v", err)
 	}
-	if _, err := d.Finish(errors.New("transport said " + fake + " " + oat)); err != nil {
+	text, err := d.Finish(errors.New("transport said " + fake + " " + oat))
+	if err != nil {
 		t.Fatalf("Finish: %v", err)
+	}
+	if !strings.Contains(text, "verdicts: ") || !strings.Contains(text, "concern categories: leak ") {
+		t.Fatalf("precondition: the returned summary renders no verdict or category histogram; the fixture did not reach it:\n%s", text)
 	}
 	raw := mustRead(t, path)
 	if n := len(catchDiagTrialLines(readCatchDiagLines(t, path))); n != len(cases) {
@@ -203,11 +215,13 @@ func TestCatchRateDiag_NoCredentialInFile(t *testing.T) {
 	if !bytes.Contains(raw, []byte("[REDACTED:")) || !bytes.Contains(raw, []byte("response_excerpt")) {
 		t.Fatal("precondition: the file carries no redaction marker or no undecodable excerpt; the fixture did not reach the writer")
 	}
-	if bytes.Contains(raw, []byte(fake)) {
-		t.Error("the diagnostics file carries the credential value")
-	}
-	if bytes.Contains(raw, []byte("sk-ant")) {
-		t.Error("the diagnostics file carries an sk-ant token")
+	for what, b := range map[string][]byte{"file": raw, "returned summary text": []byte(text)} {
+		if bytes.Contains(bytes.ToLower(b), bytes.ToLower([]byte(fake))) {
+			t.Errorf("the diagnostics %s carries the credential value (in some letter case)", what)
+		}
+		if bytes.Contains(b, []byte("sk-ant")) {
+			t.Errorf("the diagnostics %s carries an sk-ant token", what)
+		}
 	}
 }
 
@@ -365,6 +379,14 @@ func envMap(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
+// The knob refusals are the counterfactual vehicles. Fixture-state
+// mechanism: with the blank-list refusal (`if len(s.Cases) == 0`) deleted,
+// " , " parses to the INACTIVE subset with a nil error, so the blank-list row
+// fails; with the `n < 1` half deleted, "0" and "-1" parse to a non-positive
+// count with a nil error, so those two rows fail; with the `err != nil` half
+// deleted, the out-of-range row fails, because Atoi returns the clamped
+// maximum (positive) with its range error — "abc" cannot isolate that half,
+// since Atoi returns 0 for it and `n < 1` refuses it anyway.
 func TestParseCatchRateSubset(t *testing.T) {
 	s, err := ParseCatchRateSubset(envMap(nil))
 	if err != nil || s.active() {
@@ -382,6 +404,7 @@ func TestParseCatchRateSubset(t *testing.T) {
 		{"zero trials", CatchRateSubsetTrialsEnv, "0"},
 		{"negative trials", CatchRateSubsetTrialsEnv, "-1"},
 		{"non-numeric trials", CatchRateSubsetTrialsEnv, "abc"},
+		{"out-of-range trials", CatchRateSubsetTrialsEnv, "99999999999999999999"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if s, err := ParseCatchRateSubset(envMap(map[string]string{tc.key: tc.val})); err == nil || !strings.Contains(err.Error(), tc.key) {
@@ -775,6 +798,80 @@ func TestRecordCatchRateEvidenceWithDiagnostics_EvidenceUnchanged(t *testing.T) 
 	}
 	if sum := catchDiagSummaryOf(t, readCatchDiagLines(t, diagPath)); sum["outcome"] != "passed" {
 		t.Errorf("summary outcome = %v, want passed", sum["outcome"])
+	}
+}
+
+// C1: raw_concerns is the response's own lenient decode (pre-control) and
+// scored_concerns is tr.Concerns (post-control). The trial comes from the
+// production persona classifier, whose severity cap clamps the emitted high.
+// Fixture-state mechanism: with scored_concerns filled from the raw decode,
+// the scored concern reads the emitted "high" with no severity_clamped_from;
+// with raw_concerns filled from tr.Concerns, the raw concern reads the
+// clamped severity and loses the convention and criterion_id fields.
+func TestCatchRateDiag_RawAndScoredConcernsDiverge(t *testing.T) {
+	response := `{"verdict":"reject","concerns":[{"severity":"high","category":"security","note":"the token reaches the log","convention":"conv-1","criterion_id":"AC-3"}]}`
+	rule := CatchRule{Probes: []string{"untestable"}, CriterionIDs: []string{"AC-9"}}
+	tr := ClassifyPersonaTrial(response, rule, nil, "medium")
+	if tr.Outcome != CatchMissed || len(tr.Concerns) != 1 || tr.Concerns[0].SeverityClampedFrom != "high" || tr.Concerns[0].Severity == "high" {
+		t.Fatalf("precondition: the persona classifier did not clamp the emitted high: %+v", tr)
+	}
+	sink := &nopWriteCloser{}
+	d, err := newCatchRateDiag(sink, "p", CatchRateDiagOptions{}, nil)
+	if err != nil {
+		t.Fatalf("newCatchRateDiag: %v", err)
+	}
+	d.observe(ArmSecurity, "c1", CatchExpectCatch, 1, response, tr)
+	var line catchDiagTrialLine
+	lines := strings.Split(strings.TrimSuffix(sink.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("%d diagnostics lines, want the header and one trial", len(lines))
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &line); err != nil {
+		t.Fatalf("decode the trial line: %v", err)
+	}
+	if len(line.RawConcerns) != 1 || len(line.ScoredConcerns) != 1 {
+		t.Fatalf("raw %d / scored %d concerns, want 1 / 1", len(line.RawConcerns), len(line.ScoredConcerns))
+	}
+	if r := line.RawConcerns[0]; r.Severity != "high" || r.Convention != "conv-1" || r.CriterionID != "AC-3" {
+		t.Errorf("raw concern = %+v, want the emitted severity high with its convention and criterion_id", r)
+	}
+	if sc := line.ScoredConcerns[0]; sc.Severity != tr.Concerns[0].Severity || sc.SeverityClampedFrom != "high" {
+		t.Errorf("scored concern = %+v, want the clamped severity %q from high", sc, tr.Concerns[0].Severity)
+	}
+}
+
+// A table error still leaves a diagnostics file: the header, no trial line
+// and an error summary, while RecordCatchRateEvidence's own table error is
+// what the run returns. Fixture-state mechanism: with the table error
+// returned before the open (`if err != nil { return "", err }`), no file
+// exists, so readCatchDiagLines fails.
+func TestRecordCatchRateEvidenceWithDiagnostics_TableErrorStillSummarized(t *testing.T) {
+	in := committedCatchInputs()
+	in.CorpusDir = filepath.Join(t.TempDir(), "no-such-corpus")
+	_, tableErr := catchRateArmTable(in)
+	if tableErr == nil {
+		t.Fatal("precondition: the arm table built from a missing corpus")
+	}
+	all := committedCatchTrials(t)
+	sender := newScriptedCatchSender(t, all, all)
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	diagPath := filepath.Join(t.TempDir(), CatchRateDiagFileName)
+	_, err := RecordCatchRateEvidenceWithDiagnostics(context.Background(), sender, testCatchModel, in, path, catchT0, pin("x"), diagPath, CatchRateDiagOptions{})
+	if err == nil || !strings.Contains(err.Error(), tableErr.Error()) {
+		t.Errorf("err = %v, want the arm table's error %q", err, tableErr)
+	}
+	if n := sender.total(); n != 0 {
+		t.Errorf("sender called %d times, want 0", n)
+	}
+	lines := readCatchDiagLines(t, diagPath)
+	if lines[0]["kind"] != "header" {
+		t.Errorf("first line = %v, want the header", lines[0])
+	}
+	if n := len(catchDiagTrialLines(lines)); n != 0 {
+		t.Errorf("%d trial lines, want 0", n)
+	}
+	if sum := catchDiagSummaryOf(t, lines); sum["outcome"] != "error" || !strings.Contains(sum["error"].(string), "corpus unavailable") {
+		t.Errorf("summary = outcome %v error %v, want an error outcome naming the table error", sum["outcome"], sum["error"])
 	}
 }
 
