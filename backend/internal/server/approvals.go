@@ -533,6 +533,17 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// First-officer hold (ADR-089 D4, E85.6 / #4148): an APPROVE on a plan
+	// stage (plan-kind) or a review stage (implement-kind) refuses 409
+	// first_officer_finding_open while a first_officer concern is open — a
+	// seat finding backed by a runner-attested failing specialist job. After
+	// approver authorization and PRE-Submit like its sibling gates, so a
+	// refused approve inserts no row; a read error is 500 (fail closed). A
+	// reject is never held.
+	if !s.refuseFirstOfficerApprovalHold(w, r, stage, decision) {
+		return
+	}
+
 	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
 	// submission must hold the may_approve condition against CURRENT run
 	// state, re-evaluated server-side — never trusted from the client's

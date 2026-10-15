@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -33,8 +34,9 @@ import (
 //
 //   - The SENDER ROLE is derived server-side from the caller's identity — a
 //     run-bound token's executing stage (plan -> planner, review -> reviewer;
-//     nothing else) or `captain` for an operator identity — and a body naming
-//     a DIFFERENT role is refused (crewmessage.WithSenderRole).
+//     nothing else), `first_officer` for a first-officer seat token (E85.6 /
+//     #4148), or `captain` for an operator identity — and a body naming a
+//     DIFFERENT role is refused (crewmessage.WithSenderRole).
 //   - A crew message's TEXT leaves this server only in prompt.RenderCrewMessages'
 //     quarantine envelope. No response carries the raw payload, and every read
 //     route applies the SAME run-bound gate as send (write:messages AND the
@@ -106,6 +108,13 @@ type crewMessageResponse struct {
 	// other response is byte-identical to E77.5's.
 	WorkItem            *deferFiledIssue         `json:"work_item,omitempty"`
 	WorkItemFilingError *crewWorkItemFilingError `json:"work_item_filing_error,omitempty"`
+	// BlockingConcernID and BlockingConversionError are set ONLY on the send
+	// response of a BLOCKING first-officer finding (ADR-089 D4, E85.6 /
+	// #4148): the first_officer concern it was converted into, or why the
+	// conversion did not land (the finding then stays OPEN and advisory).
+	// Both omitempty, so every other response is byte-identical.
+	BlockingConcernID       *uuid.UUID `json:"blocking_concern_id,omitempty"`
+	BlockingConversionError string     `json:"blocking_conversion_error,omitempty"`
 }
 
 // crewMessageAnswer is the first reply in a consulted message's thread, in
@@ -376,9 +385,27 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		role      crewmessage.Role
 		actor     crewmessage.Actor
 		execStage *run.Stage
+		seat      firstofficer.Anchor
 	)
+	// The first-officer seat branch (ADR-089 D4, E85.6 / #4148) comes FIRST: a
+	// seat-subject token sends as first_officer, never as the captain. The
+	// bearer middleware already refuses an unparseable seat subject; this
+	// re-check keeps the handler fail-closed when reached without it.
+	isSeat := firstofficer.IsSeatSubject(id.Subject)
 	tokenRunID, runBound := runBoundTokenRunID(id)
-	if runBound {
+	if isSeat {
+		var perr error
+		if seat, perr = firstofficer.ParseSubject(id.Subject); perr != nil {
+			s.writeError(w, r, http.StatusUnauthorized, "first_officer_seat_invalid",
+				"the token subject carries the first-officer prefix but is not first_officer/campaign/<uuid> or first_officer/run/<uuid>", nil)
+			return
+		}
+		if !s.requireCrewMessagesScope(w, r, id) {
+			return
+		}
+		role = crewmessage.RoleFirstOfficer
+		actor = crewmessage.Actor{Kind: audit.ActorAgent, Subject: id.Subject}
+	} else if runBound {
 		if !s.requireCrewMessagesScope(w, r, id) {
 			return
 		}
@@ -431,7 +458,12 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeCrewMessageError(w, r, err)
 		return
 	}
-	if runBound {
+	var seatRun *run.Run
+	if isSeat {
+		if seatRun, ok = s.authorizeFirstOfficerSend(w, r, seat, msg); !ok {
+			return
+		}
+	} else if runBound {
 		anchorRun, perr := uuid.Parse(msg.Anchor.RunID)
 		if msg.Anchor.RunID == "" || perr != nil || anchorRun != tokenRunID {
 			s.writeCrossRunCrewMessage(w, r, tokenRunID, msg.Anchor.RunID)
@@ -512,6 +544,20 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A seat FINDING's evidence is resolved BEFORE Send (ADR-089 D4): a read
+	// error refuses the send with nothing appended, so an outage is never
+	// recorded as an advisory finding.
+	var blocking *firstOfficerBlockingBasis
+	if isSeat && msg.Type == crewmessage.TypeFinding {
+		var berr error
+		if blocking, berr = s.resolveFirstOfficerBlockingEvidence(ctx, seatRun, msg.Evidence); berr != nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "first_officer_evidence_unreadable",
+				"the finding's cited specialist-job evidence could not be read; nothing was recorded, retry shortly",
+				map[string]any{internalCauseKey: berr.Error()})
+			return
+		}
+	}
+
 	row, err := s.cfg.CrewMailbox.Send(ctx, params)
 	var projErr *crewmessage.ProjectionError
 	degraded := errors.As(err, &projErr) && row != nil
@@ -541,6 +587,12 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 	// way, so a filing failure degrades the response rather than failing it.
 	if msg.Type == crewmessage.TypeWorkRequest {
 		resp.WorkItem, resp.WorkItemFilingError = s.fileCrewWorkRequest(ctx, id, msg, row)
+	}
+	// ADR-089 D4: a blocking seat finding becomes a first_officer concern
+	// (insert-then-dispose). The message is on the chain either way, so a
+	// conversion failure degrades the response rather than failing it.
+	if blocking != nil {
+		resp.BlockingConcernID, resp.BlockingConversionError = s.convertBlockingFirstOfficerFinding(ctx, seatRun.ID, msg, row, blocking)
 	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
 }
