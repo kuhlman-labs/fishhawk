@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -721,10 +720,10 @@ func (s *Server) emitPersonaDegraded(ctx context.Context, runID, stageID uuid.UU
 		EscalationAttached: inv.escalationAttached(),
 	})
 	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	// Durable terminal write (E72.64 / #4106).
+	if _, aerr := s.appendReviewTerminal(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   payload,
