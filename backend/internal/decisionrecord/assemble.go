@@ -47,10 +47,14 @@ type Included struct {
 }
 
 // Selection is an assembled decision-record injection: the index, the records
-// shown in full, and the matches left out by the cap.
+// shown in full, and the matches left out by the record budget.
 type Selection struct {
-	// Index is the index document, always included (truncated loudly when it
-	// alone exceeds the cap).
+	// Index is the index document, always included. It is shaped under its
+	// OWN per-document cap, separate from the record budget: the resolver's
+	// effective cap when it fits whole, otherwise the smaller cap it was cut
+	// under (shown with the loud truncation marker). Index.CapBytes records
+	// the cap it was actually cut under, so it equals the resolver's cap only
+	// when the index fit whole.
 	Index repodoc.Document
 	// TotalRecords is how many records the index lists.
 	TotalRecords int
@@ -63,26 +67,31 @@ type Selection struct {
 	// Included are the matches shown in full, in rank order — a strict prefix
 	// of the ranking.
 	Included []Included
-	// Dropped are the matches left out because they did not fit, in rank
-	// order. Never fetched past the first.
+	// Dropped are the matches left out because they did not fit the record
+	// budget, in rank order. Never fetched past the first.
 	Dropped []Match
-	// CapBytes is the budget: the resolver's effective cap. It counts the
-	// index's rendered bytes plus every included record's rendered bytes.
+	// CapBytes is the RECORD budget: the resolver's effective cap, applied to
+	// the included records alone. The index is not counted against it; it is
+	// shaped under its own cap, recorded on Index.CapBytes.
 	CapBytes int
-	// IncludedBytes is that sum; always <= CapBytes.
+	// IncludedBytes is the sum of the included records' rendered bytes (the
+	// index excluded); always <= CapBytes.
 	IncludedBytes int
 }
 
 // Assemble fetches the index at req.Commit, parses it strictly, selects and
-// ranks the matching records, and fits them into r's effective cap:
+// ranks the matching records, and fits them under TWO separate budgets, each
+// r's effective cap, so the index's size can never starve the record bodies:
 //
-//   - the index is ALWAYS included; when its rendered size exceeds the cap it
-//     is reshaped under a smaller cap until it fits (bounded, and never under
-//     a negative cap), shown with repodoc's loud truncation marker;
-//   - each match, in rank order, is fetched at the SAME commit and shaped
-//     under a cap at least its raw size (so its untruncated rendered size is
-//     what is measured), and is included only when that size fits the
-//     remaining budget;
+//   - the index is ALWAYS included, under its own per-document cap; when its
+//     rendered size exceeds the cap it is reshaped under a smaller cap until
+//     it fits (bounded, and never under a negative cap), shown with repodoc's
+//     loud truncation marker;
+//   - the matched records share a separate record budget, which the index
+//     does not draw on. Each match, in rank order, is fetched at the SAME
+//     commit and shaped under a cap at least its raw size (so its untruncated
+//     rendered size is what is measured), and is included only when that
+//     size fits what remains of the record budget;
 //   - the first match that does not fit, and EVERY lower-ranked match, is
 //     dropped — a strict prefix — and the lower-ranked ones are never fetched.
 //
@@ -117,24 +126,25 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		return nil, fmt.Errorf("index %s at commit %s (declared at %s): %w", req.IndexPath, idxF.Commit, req.DeclarationSite, err)
 	}
 
-	budget := r.CapBytes()
-	idxDoc, err := fitIndex(idxF, budget)
+	idxDoc, err := fitIndex(idxF, r.CapBytes())
 	if err != nil {
 		return nil, err
 	}
+	// The records' own budget: the index above was shaped under its own cap
+	// and does not draw on this one.
+	recordBudget := r.CapBytes()
 	sel := &Selection{
-		Index:         idxDoc,
-		TotalRecords:  len(idx.Records),
-		Matched:       len(matches),
-		CapBytes:      budget,
-		IncludedBytes: idxDoc.RenderedBytes,
+		Index:        idxDoc,
+		TotalRecords: len(idx.Records),
+		Matched:      len(matches),
+		CapBytes:     recordBudget,
 	}
 	for _, m := range matches {
 		if m.MatchedPaths == 0 {
 			sel.Followed++
 		}
 	}
-	remaining := budget - idxDoc.RenderedBytes
+	remaining := recordBudget
 	for i, m := range matches {
 		f, err := r.Fetch(ctx, repodoc.Request{
 			Repo:    req.Repo,
@@ -152,7 +162,7 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		// Measure the UNTRUNCATED rendered size: shape under a cap at least
 		// the raw size, never under the remaining budget. A record that does
 		// not fit whole is dropped, never shown cut.
-		doc := f.Document(max(budget, len(f.Content)))
+		doc := f.Document(max(recordBudget, len(f.Content)))
 		if doc.RenderedBytes > remaining {
 			sel.Dropped = append(sel.Dropped, matches[i:]...)
 			break
@@ -200,8 +210,10 @@ func (s *Selection) Documents() []repodoc.Document {
 
 // Attribution returns the injection set for the selection: its documents and,
 // when any match was dropped, the selection-level truncation naming each
-// dropped record with its rank. A caller injecting other documents in the same
-// prompt merges this into ONE repodoc.AttributeSet call.
+// dropped record with its rank. That truncation's CapBytes / IncludedBytes are
+// the record budget and the included records' bytes; the index's own cap and
+// rendered bytes ride on its document entry. A caller injecting other
+// documents in the same prompt merges this into ONE repodoc.AttributeSet call.
 func (s *Selection) Attribution() repodoc.InjectionSet {
 	set := repodoc.InjectionSet{Documents: s.Documents()}
 	if len(s.Dropped) == 0 {
@@ -286,7 +298,7 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 		b.WriteString(", and you cannot read it in this review.")
 	}
 	if len(s.Dropped) > 0 {
-		fmt.Fprintf(&b, "\n\nNOT INCLUDED because of the injection cap (%d bytes, counting this index plus the records shown in full): "+
+		fmt.Fprintf(&b, "\n\nNOT INCLUDED because of the injection cap (%d bytes for the records shown in full; this index is capped separately): "+
 			"these %d matching records were left out, highest rank first. Do not judge the change as if they were absent:\n",
 			s.CapBytes, len(s.Dropped))
 		for _, m := range s.Dropped {

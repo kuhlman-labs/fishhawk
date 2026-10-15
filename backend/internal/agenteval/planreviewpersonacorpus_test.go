@@ -318,6 +318,36 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 	}
 }
 
+// TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona is a
+// deliberate #4399 tripwire, separate from the logged-not-pinned selection in
+// TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes: rendered
+// through PersonaArmPrompt (the production path, the real docs/adr at the
+// production cap), every case shows at least min(2, matched) record bodies in
+// full, and a CATCH case shows every governing record the selection matched.
+// Before #4399 the index alone filled the shared budget and every matched
+// record was dropped, so adr006-production-migrate-down showed no ADR-006
+// body. A governing record the selection does not match (adr091 today) is
+// vacuous here.
+func TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona(t *testing.T) {
+	for _, c := range loadCommittedPersona(t) {
+		r, err := PersonaArmPrompt(c, personaTestRepoRoot)
+		if err != nil {
+			t.Fatalf("case %q: PersonaArmPrompt: %v", c.Name, err)
+		}
+		if want := min(2, len(r.MatchedIDs)); len(r.IncludedIDs) < want {
+			t.Errorf("case %q: %d record bodies shown in full (included %v, dropped %v), want >= %d", c.Name, len(r.IncludedIDs), r.IncludedIDs, r.DroppedIDs, want)
+		}
+		if c.Expect() != CatchExpectCatch {
+			continue
+		}
+		for _, g := range c.Input.GoverningRecords {
+			if slices.Contains(r.MatchedIDs, g.ID) && !slices.Contains(r.IncludedIDs, g.ID) {
+				t.Errorf("case %q: governing record %s matched but its body was dropped (included %v, dropped %v)", c.Name, g.ID, r.IncludedIDs, r.DroppedIDs)
+			}
+		}
+	}
+}
+
 // TestPersonaEnvelopeAssertion_RejectsMissingRemit proves checkPersonaEnvelopes
 // is not vacuous: it errors on a render without the remit, on a document list
 // without the remit, on a remit line placed outside the remit envelope, and on
