@@ -30,11 +30,12 @@ const (
 
 // committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
 // the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
-// #4253 mid-difficulty cases and #4361's three subtler mid-difficulty cases
-// that calibrated in band; the three that sat at the ceiling were cut);
+// #4253 mid-difficulty cases and the one #4361 subtler case that calibrated
+// in band on reviewer misses; five were cut, three at the ceiling and two in
+// band only on scoring misses);
 // the derived list below may grow past it, never shrink below it (so the
 // derivation cannot go vacuous and a deleted case cannot pass silently).
-const committedSyntheticCatchCaseFloor = 15
+const committedSyntheticCatchCaseFloor = 13
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
@@ -614,33 +615,6 @@ func TestCommittedCatchPhrases_ApproachAndVerbReferencesDoNotAttribute(t *testin
 	}
 }
 
-// TestCommittedCatchPhrases_StoredVerbatimSiblingWordingDoesNotAttribute pins
-// that seed-synthetic-unsatisfiable-stored-verbatim declares no attribution
-// phrase a reviewer would use in ordinary English about a SIBLING criterion
-// (#4361 implement-review concern, which dropped "as received"): a concern
-// about ac-delivery-replay replaying the payload "as received", carrying a
-// warrant probe, scores MISSED. The probe half is asserted to match, so the
-// attribution half alone decides the outcome.
-func TestCommittedCatchPhrases_StoredVerbatimSiblingWordingDoesNotAttribute(t *testing.T) {
-	const name = "seed-synthetic-unsatisfiable-stored-verbatim"
-	cases, _ := loadCommittedCatch(t)
-	for _, c := range cases {
-		if c.Name != name {
-			continue
-		}
-		rule := c.CatchRule()
-		concern := CatchExampleConcern{Category: "acceptance_criteria", Note: "ac-delivery-replay replays the payload as received; a second replay of one delivery is not warranted without an idempotency key."}
-		if _, ok := matchCatchProbe(concern.Category, concern.Note, rule.Probes); !ok {
-			t.Fatalf("fixture premise: %q must match a catch probe of %q", concern.Note, name)
-		}
-		if got := ClassifyCatch(catchVerdictJSON(t, concern), rule); got != CatchMissed {
-			t.Errorf("case %q: a concern about sibling criterion ac-delivery-replay classified %q, want missed", name, got)
-		}
-		return
-	}
-	t.Fatalf("committed corpus lacks case %q", name)
-}
-
 // TestCommittedCatchProbes_AbsentFromConventionsFixture: no committed probe
 // occurs in the representative conventions fixture. The with arm alone shows
 // that text, so a with-arm concern echoing it about an unrelated aspect would
@@ -972,18 +946,18 @@ func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
 	}{
 		{
 			class:    CatchMissUnattributed,
-			caseName: "seed-synthetic-unsatisfiable-stored-verbatim",
-			concern:  CatchExampleConcern{Severity: "high", Category: "acceptance_criteria", Note: "The criterion where GET returns the payload as received is unsatisfiable: the plan stores it in a jsonb column."},
+			caseName: "seed-synthetic-restates-approach-observable",
+			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "The criterion where POST /uploads returns HTTP 202 restates the approach instead of an outcome a user could observe."},
 			widen: func(in *PlanReviewCatchInput) {
-				in.AttributionPhrases = append(in.AttributionPhrases, "returns the payload")
+				in.AttributionPhrases = append(in.AttributionPhrases, "returns http 202")
 			},
 		},
 		{
 			class:    CatchMissNoProbe,
-			caseName: "seed-synthetic-untestable-measurable-phrase",
-			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "ac-search-p95-in-budget leaves the budget's figure to whoever runs k6, so nobody can say whether it passed."},
+			caseName: "seed-synthetic-restates-approach-observable",
+			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "ac-upload-enqueues-scan pins a status code that nobody upstream chose, so the check tells the operator nothing."},
 			widen: func(in *PlanReviewCatchInput) {
-				in.CatchProbes = append(in.CatchProbes, "nobody can say whether")
+				in.CatchProbes = append(in.CatchProbes, "nobody upstream chose")
 			},
 		},
 	} {
@@ -1015,16 +989,16 @@ func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
 		})
 	}
 	t.Run("attribution widening past mode p is refused", func(t *testing.T) {
-		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-unsatisfiable-stored-verbatim", func(in *PlanReviewCatchInput) {
-			in.AttributionPhrases = append(in.AttributionPhrases, "get /hooks/deliveries/{id}")
+		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-restates-approach-observable", func(in *PlanReviewCatchInput) {
+			in.AttributionPhrases = append(in.AttributionPhrases, "get /files/{id}")
 		}))
-		if err == nil || !strings.Contains(err.Error(), `attribution phrase "get /hooks/deliveries/{id}" also occurs in criterion`) {
+		if err == nil || !strings.Contains(err.Error(), `attribution phrase "get /files/{id}" also occurs in criterion`) {
 			t.Fatalf("a phrase sibling criteria also state: err = %v, want the mode (p) refusal", err)
 		}
 	})
 	t.Run(string(CatchMissNotMentioned), func(t *testing.T) {
-		rule, _ := rawCommittedCatchRule(t, "seed-synthetic-untestable-measurable-phrase")
-		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "risk", Note: "The k6 script should run against a staging copy of the database."}), rule)
+		rule, _ := rawCommittedCatchRule(t, "seed-synthetic-restates-approach-observable")
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "risk", Note: "Migration 0052 should ship with a matching down migration."}), rule)
 		if got := classifyCatchMiss(trial, rule); trial.Outcome != CatchMissed || got != CatchMissNotMentioned {
 			t.Errorf("a concern touching neither half: outcome %q class %q, want missed / %q (genuine difficulty, no widening repairs it)", trial.Outcome, got, CatchMissNotMentioned)
 		}

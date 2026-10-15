@@ -184,12 +184,12 @@ Before the #4361 re-pin, check that each of its new catch cases is of mid
 difficulty in the conventions arms. The implement agent cannot call the
 model, so this runs on the PR branch as an operator subset dry run (never
 judged, never recordable; see "Probe a few cases before paying for a
-recording" below): both conventions arms, 3 cases x 30 trials each, 180
+recording" below): both conventions arms, 1 case x 30 trials each, 60
 plan-review calls.
 
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
-  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-untestable-measurable-phrase,seed-synthetic-restates-approach-observable,seed-synthetic-unsatisfiable-stored-verbatim \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-restates-approach-observable \
   FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
   scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
@@ -252,20 +252,39 @@ widening, while a widening past mode p is refused. Check any widened set with
 
 **Results (2026-10-15, head `23a9dee4`).** Generator `claude-sonnet-5-5`,
 `MaxTokens` 8192, 30 trials per arm, both conventions arms, 0 truncations,
-0 undecodable. Scored catches per case:
+0 undecodable. Raw scored catches and miss classes, then the honest rate
+(the miss transcripts read by the operator, and the kept case re-scored
+under its widened probes):
 
-| case | with_conventions | without_conventions |
-|---|---|---|
-| restates-approach-observable | 11/30 (37%) | 15/30 (50%) |
-| unsatisfiable-stored-verbatim | 14/30 (47%) | 16/30 (53%) |
-| untestable-measurable-phrase | 20/30 (67%) | 26/30 (87%) |
+| case | arm | scored | misses | honest | outcome |
+|---|---|---|---|---|---|
+| restates-approach-observable | with | 11/30 (37%) | no_probe 15, not_mentioned 4 | 13/30 (43%) | KEPT |
+| restates-approach-observable | without | 15/30 (50%) | no_probe 15 | 16/30 (53%) | KEPT |
+| unsatisfiable-stored-verbatim | with / without | 14/30 / 16/30 | no_probe 16 / 14 | ~30/30 / ~30/30 | CUT |
+| untestable-measurable-phrase | with / without | 20/30 / 26/30 | no_probe 10 / 4 | ~30/30 / ~30/30 | CUT |
+| contradicts-buried-clause | with / without | 30/30 / 30/30 | none | ceiling | CUT |
+| contradicts-absent-vs-null | with / without | 30/30 / 30/30 | none | ceiling | CUT |
+| inferred-wrong-source | with / without | 30/30 / 30/30 | none | ceiling | CUT |
 
-Cut at the ceiling (100%/100%, both arms), by Captain ruling 2026-10-15
-(option c): `contradicts-buried-clause`, `contradicts-absent-vs-null` and
-`inferred-wrong-source`; their case directories were deleted. This is a
-partial delivery of #4361's ">= 6 cases" done-means, by that ruling: #4361
-adds three in-band cases, not six, and the harder cases continue in a
-follow-up issue.
+`unsatisfiable-stored-verbatim` and `untestable-measurable-phrase` were in
+band only on SCORING misses: every `no_probe` transcript is a real catch
+("jsonb normalizes ... the criterion cannot pass"; "cannot be decided
+pass/fail, the budget is never given a number") phrased outside the probes.
+Their honest rate is the ceiling, so by this step's rule they are not
+accepted as measured, and widening would put them at the ceiling. The kept
+case's remaining `no_probe` misses name its criterion id while flagging
+another defect (scan durability, wiring, end-to-end tests), so they are
+reviewer misses. Its three real catches outside the probes (the "marked
+source explicit ... a plan choice presented as an explicit requirement"
+fidelity route) were added as probes, and the re-score under the widened
+rule over the run's diag gives 13/30 and 16/30, matching the hand count.
+
+Cut by Captain ruling 2026-10-15: the three ceiling cases (option c), then
+the two scoring-miss cases after this honest-rate check. This is a PARTIAL
+delivery of #4361's ">= 6 cases" done-means: #4361 adds ONE in-band case.
+The harder cases continue in #4453, which sources them from real
+plan-review misses and requires each case's band to rest on `not_mentioned`
+reviewer misses.
 
 Post the per-case table (both arms, both rates, the miss classes) as a PR
 comment: a fix-up pass cannot edit the PR body. Rework an out-of-band case,
@@ -662,4 +681,4 @@ Captain ruling 2026-10-14; a harder corpus is #4402.
 | 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |
 | 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
 | 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
-| 2026-10-15 | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | contradicts-buried-clause, contradicts-absent-vs-null and inferred-wrong-source at the ceiling (100%/100% both arms), cut by Captain ruling 2026-10-15; restates-approach-observable, unsatisfiable-stored-verbatim and untestable-measurable-phrase in band (Step 1c "Results") | Step 1c "Results" (head `23a9dee4`) |
+| 2026-10-15 | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | three cases at the ceiling (100%/100%) and two in band only on scoring misses (honest rate ~100%) were cut by Captain ruling 2026-10-15; restates-approach-observable is in band on reviewer misses, honest 13/30 with and 16/30 without (Step 1c "Results"); harder cases continue in #4453 | Step 1c "Results" (head `23a9dee4`, re-scored at the operator commit) |

@@ -142,7 +142,9 @@
     "partly an approach restatement",
     "never states",
     "never specifies",
-    "plan-chosen design value"
+    "plan-chosen design value",
+    "marked source explicit",
+    "presented as an explicit requirement"
   ],
   "attribution_phrases": [
     "enqueues a scan job",
@@ -188,6 +190,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "ac-upload-enqueues-scan is partly an approach restatement: the issue never states a 202 and never specifies a queue, so the enqueue is a plan-chosen design value, not an outcome a user can observe."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "Criterion ac-upload-enqueues-scan is marked source explicit, but the issue never says POST /uploads returns 202; the status is a plan choice presented as an explicit requirement."
     }
   ],
   "non_catching_examples": [

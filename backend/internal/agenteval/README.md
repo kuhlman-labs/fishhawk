@@ -884,18 +884,14 @@ rationale); the E55.18 / #4253 mid-difficulty seeds, whose defect is not
 (a plausible number on the wrong side of the issue's limit, a status code the
 plan uses correctly elsewhere, a rationale citing real sibling code, an
 untestable phrasing without the prompt's literal examples "robust", "clean",
-"handles edge cases"); and the E55.23 / #4361 subtler variants, built for a
-30-80% catch rate. Two hide the defect behind correct-looking surroundings:
-`seed-synthetic-untestable-measurable-phrase` (a percentile and a named
-"latency budget" that nothing defines) and
-`seed-synthetic-restates-approach-observable` (an approach step wrapped in an
-HTTP status). One reconstructs a defect class this repository hit:
-`seed-synthetic-unsatisfiable-stored-verbatim` (an unwarranted byte-exact
-round-trip the plan's own JSONB storage cannot satisfy, modeled on the
-re-encoding note in `backend/internal/server/comms_dispositions.go`). Whether
-a case lands in the band is decided only by the operator's live subset dry
-run (run-book Step 1c), not offline: the 2026-10-15 calibration kept these
-three and cut three that sat at the ceiling (the run-book's Step 1c results).
+"handles edge cases"); and the E55.23 / #4361 subtler variant, built for a
+30-80% catch rate: `seed-synthetic-restates-approach-observable` (an approach
+step wrapped in an HTTP status, falsely marked source explicit). Whether a
+case lands in the band is decided only by the operator's live subset dry run
+(run-book Step 1c), not offline, and only on REVIEWER misses: the 2026-10-15
+calibration kept this one case and cut five, three at the scored ceiling and
+two whose in-band scored rate was made of no_probe scoring misses on real
+catches (the run-book's Step 1c results). Harder cases continue in #4453.
 
 ### The arms
 
@@ -1246,46 +1242,42 @@ sidecar (below), which a recording writes beside it.
     },
     "with_conventions": {
       "kind": "conventions",
-      "samples_per_case": 10,
+      "samples_per_case": 11,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
-          "seed-synthetic-contradicts-issue": {"trials": 10, "caught": 6, "undecodable": 1},
-          "seed-synthetic-contradicts-numeric-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-contradicts-status-code": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-criterion": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-sibling-retention": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-sibling-timeout": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-restates-approach": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-restates-approach-observable": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-unsatisfiable-stored-verbatim": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-adjective": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-measurable-phrase": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-reasonable-time": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-user-friendly": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-unwarranted-rate-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-vacuous-criterion": {"trials": 10, "caught": 7, "undecodable": 0}
+          "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
+          "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-criterion": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-retention": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-timeout": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-restates-approach-observable": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-reasonable-time": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-user-friendly": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 11, "caught": 7, "undecodable": 0}
       }
     },
     "without_conventions": {
       "kind": "conventions",
-      "samples_per_case": 10,
+      "samples_per_case": 11,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
-          "seed-synthetic-contradicts-issue": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-contradicts-numeric-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-contradicts-status-code": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-criterion": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-sibling-retention": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-inferred-sibling-timeout": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-restates-approach": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-restates-approach-observable": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-unsatisfiable-stored-verbatim": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-adjective": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-measurable-phrase": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-reasonable-time": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-untestable-user-friendly": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-unwarranted-rate-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-          "seed-synthetic-vacuous-criterion": {"trials": 10, "caught": 7, "undecodable": 0}
+          "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-criterion": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-retention": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-inferred-sibling-timeout": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-restates-approach": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-restates-approach-observable": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-adjective": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-reasonable-time": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-untestable-user-friendly": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-unwarranted-rate-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-vacuous-criterion": {"trials": 11, "caught": 7, "undecodable": 0}
       }
     }
   },
@@ -1350,46 +1342,42 @@ sidecar (below), which a recording writes beside it.
       },
       "with_conventions": {
         "kind": "conventions",
-        "samples_per_case": 10,
+        "samples_per_case": 11,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
-            "seed-synthetic-contradicts-issue": {"trials": 10, "caught": 6, "undecodable": 1},
-            "seed-synthetic-contradicts-numeric-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-contradicts-status-code": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-criterion": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-sibling-retention": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-sibling-timeout": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-restates-approach": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-restates-approach-observable": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-unsatisfiable-stored-verbatim": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-adjective": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-measurable-phrase": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-reasonable-time": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-user-friendly": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-unwarranted-rate-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-vacuous-criterion": {"trials": 10, "caught": 7, "undecodable": 0}
+            "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
+            "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-criterion": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-sibling-retention": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-sibling-timeout": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-restates-approach": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-restates-approach-observable": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-adjective": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-reasonable-time": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-user-friendly": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-unwarranted-rate-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-vacuous-criterion": {"trials": 11, "caught": 7, "undecodable": 0}
         }
       },
       "without_conventions": {
         "kind": "conventions",
-        "samples_per_case": 10,
+        "samples_per_case": 11,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
-            "seed-synthetic-contradicts-issue": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-contradicts-numeric-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-contradicts-status-code": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-criterion": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-sibling-retention": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-inferred-sibling-timeout": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-restates-approach": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-restates-approach-observable": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-unsatisfiable-stored-verbatim": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-adjective": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-measurable-phrase": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-reasonable-time": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-untestable-user-friendly": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-unwarranted-rate-limit": {"trials": 10, "caught": 7, "undecodable": 0},
-            "seed-synthetic-vacuous-criterion": {"trials": 10, "caught": 7, "undecodable": 0}
+            "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-criterion": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-sibling-retention": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-inferred-sibling-timeout": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-restates-approach": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-restates-approach-observable": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-adjective": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-reasonable-time": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-untestable-user-friendly": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-unwarranted-rate-limit": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-vacuous-criterion": {"trials": 11, "caught": 7, "undecodable": 0}
         }
       }
     }
