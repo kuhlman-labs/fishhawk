@@ -974,21 +974,20 @@ against the real index; generic objections and verbatim step echoes scoring
 missed; and no defect phrase in the static persona surfaces. Selection stats
 are logged, not pinned, so a routine ADR landing does not redden verify.
 
-**Finding: the decision record is index-only today.** `docs/adr/index.json`
-(~31 KB) nearly fills the 32 KB `repodoc.DefaultMaxBytes` budget the index and
-included records share (`backend/internal/decisionrecord/README.md` § "Byte
-budget"), so `Assemble` includes ZERO full records: ADR-006 is matched by the
-migration case's scope but dropped (2,569 bytes against the 1,427 the index
-leaves), and ADR-091 and ADR-095 carry empty `applies_to` and are never
-matched. Both ADR-conflict cases plant a conflict stated in a record BODY, so
-the persona has only index titles and supersession metadata to find it from.
-The arm measures what ships. E86.58 / #4398 re-applied the `applies_to` rule to
-the 11 superseding records (only ADR-098 gained a glob,
-`backend/internal/basedelta/**`) and made `Select` follow supersession to a
-selected record's successors; it did NOT move the merge-path case: ADR-091 and
-ADR-095 still name no subject path, so neither is selected, and a selected
-body still does not fit beside the index. The remaining operator follow-up is
-the decision-record budget split (#4399).
+**Finding: matched record bodies now reach the persona (#4399).** The index
+and the records have separate budgets (`backend/internal/decisionrecord/README.md`
+§ "Byte budget"): the ~31 KB `docs/adr/index.json` is shaped under its own
+32 KB cap and the matched records fit a separate 32 KB record budget, so every
+case shows its matched records in full — ADR-006's body now reaches the
+migration case. Before #4399 the index and records shared one budget and
+`Assemble` included ZERO full records. ADR-091 and ADR-095 still carry empty
+`applies_to` and are never matched (E86.58 / #4398 gave only ADR-098 a glob,
+`backend/internal/basedelta/**`, and added successor following, which reaches
+neither), so the merge-path case still sees only index titles and
+supersession metadata. `TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona`
+pins the body floor as a deliberate #4399 tripwire. **The 2026-10-14 architect
+evidence record was measured index-only and is stale** (the rendered persona
+prompt changed) until an operator re-records the arm.
 
 **ADR churn stales the architect arm.** Its fingerprint covers the rendered
 persona prompt, which embeds the real index, so an ADR landing stales THAT arm
