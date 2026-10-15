@@ -1,0 +1,14 @@
+id: scenario:issue-4135/preview-healthz-keeps-dev-floor
+statement: 'A dev build of fishhawkd (the localhost preview, built by scripts/dev with Version=dev) still advertises no runner floor: GET /healthz returns 200 and min_runner_version is exactly "dev".'
+verify_hint: GET /healthz on the localhost preview; read the min_runner_version field of the JSON body (expect "dev"; the version field is also "dev").
+steps: GET http://localhost:8090/healthz on the preview.
+assertions:
+    expected: 200 with min_runner_version exactly "dev".
+    observed_at_record: 200; version dev, git_sha 8caf6f7c, min_runner_version dev.
+    repro_handle: curl -s http://localhost:8090/healthz
+origin:
+    issue: 4135
+    pr: 4463
+    run_id: ef2b2ba6-5e21-472d-80ef-c0c604049a0e
+    head_sha: 8caf6f7cc01b4751bd29e6bec97bbbb210638050
+    recorded_at: 2026-10-15T19:39:46Z
