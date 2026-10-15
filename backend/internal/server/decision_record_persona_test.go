@@ -77,6 +77,15 @@ func drFixtureRecords() []drRecord {
 	}
 }
 
+// drLinkedRecord is one fixture record with supersession links set. The
+// shared drFixtureRecords keep empty links.
+func drLinkedRecord(id, title, path, status string, supersedes, supersededBy []string, applies ...string) drRecord {
+	if applies == nil {
+		applies = []string{}
+	}
+	return drRecord{ID: id, Title: title, Path: path, Status: status, Supersedes: supersedes, SupersededBy: supersededBy, AppliesTo: applies}
+}
+
 // drIndexJSON renders records as an adr-index-v1 document.
 func drIndexJSON(t *testing.T, records []drRecord) string {
 	t.Helper()
@@ -270,6 +279,62 @@ func TestDecisionRecordPersona_PlanReview_SelectsAndAttributes(t *testing.T) {
 		if e.payload["commit"] != personaBaseCommit || e.payload["content_hash"] == "" || e.payload["content_hash"] == nil {
 			t.Errorf("entry %v: want commit %s and a content_hash", e.payload, personaBaseCommit)
 		}
+	}
+}
+
+// (D1b, E86.58 / #4398) SUPERSESSION FOLLOWING, end to end, on its OWN
+// two-record index (the shared drFixtureRecords set is untouched): P governs
+// the audit package and is superseded by S, whose own applies_to is EMPTY. The
+// plan touches only the audit package, so S reaches the persona prompt only
+// because the selection follows P's supersession link — the index data, the
+// Select/Assemble walk, the persona prompt builder and the document_injected
+// attribution are all crossed.
+//
+// Counterfactual (run): replace `out, err := followSuccessors(idx, direct)`
+// with `out, err := direct, error(nil)` in decisionrecord.Select — S's body,
+// heading and path are absent: RED.
+func TestDecisionRecordPersona_PlanReview_FollowsSupersessionToSuccessor(t *testing.T) {
+	const (
+		pPath = "docs/adr/201-audit-registry-v1.md"
+		sPath = "docs/adr/202-audit-registry-v2.md"
+		pBody = "DR-PREDECESSOR SENTINEL: audit categories were registered by hand."
+		sBody = "DR-SUCCESSOR SENTINEL: audit categories are registered in one table."
+	)
+	std, persona := approvingFake(), approvingFake()
+	p := newPersonaPlanRun(t, personaSpec(drSpecOpts("plan")), std, persona)
+	p.fetcher.mu.Lock()
+	p.fetcher.files[drIndexPath] = drIndexJSON(t, []drRecord{
+		drLinkedRecord("ADR-201", "Audit registry v1", pPath, "superseded", []string{}, []string{"ADR-202"}, "backend/internal/audit/**"),
+		drLinkedRecord("ADR-202", "Audit registry v2", sPath, "accepted", []string{"ADR-201"}, []string{}),
+	})
+	p.fetcher.files[pPath] = pBody
+	p.fetcher.files[sPath] = sBody
+	p.fetcher.mu.Unlock()
+	p.planBody = drPlanBody(t, drChangePath)
+	if p.review(t) {
+		t.Fatal("approving reviewers must not gate")
+	}
+
+	perCalls := reviewerCalls(persona)
+	if len(perCalls) != 1 {
+		t.Fatalf("persona calls = %d, want 1", len(perCalls))
+	}
+	pp := perCalls[0]
+	for _, want := range []string{
+		sBody, pBody,
+		"Decision record ADR-202 — status: accepted",
+		"selected because it supersedes ADR-201",
+		"and 1 more were selected because they supersede a selected record",
+	} {
+		if !strings.Contains(pp, want) {
+			t.Errorf("persona prompt missing %q", want)
+		}
+	}
+	if sAt, pAt := strings.Index(pp, sBody), strings.Index(pp, pBody); sAt < 0 || pAt < 0 || sAt > pAt {
+		t.Errorf("render order: successor at %d, predecessor at %d; want the successor first", sAt, pAt)
+	}
+	if got, want := injectedPaths(documentEntries(t, p.au)), []string{pPath, sPath, drIndexPath, personaRemitPath}; !slices.Equal(got, want) {
+		t.Errorf("document_injected paths = %v, want %v (the successor attributed in the ONE set)", got, want)
 	}
 }
 

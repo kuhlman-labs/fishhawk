@@ -199,6 +199,38 @@ one, never in batches:
 - Until its record lands, an ADR is read from the tracker (`gh issue list
   --label adr`).
 
+### `applies_to` review of superseding records (E86.58 / #4398)
+
+Decision-record selection follows supersession from a selected record to its
+successors, so the 11 records that supersede another were re-read against the
+`applies_to` rule above, applied unchanged. Only ADR-098 gained a glob:
+
+- ADR-031: `[]` — names no repository path.
+- ADR-061: `[]` — names no repository path.
+- ADR-076: `[]` — `cli/internal/credstore` and `cli/cmd/fishhawk/run.go`
+  appear only in Context's inventory.
+- ADR-090: `[]` — `merge_run.go` appears only in Context; the Decision names
+  routes, and the Consequences cite `.fishhawk/workflows.yaml` (a timeout) and
+  `backend/internal/audit/categories.go` (a registration).
+- ADR-092: `[]` — names no repository path.
+- ADR-093: `[]` — names only the `categories.go` registration.
+- ADR-094: `[]` — its Consequences name `docs/spec/workflow-v2.md` only as a
+  document to update, the same documentation-update class as ADR-095's
+  README; when in doubt, `[]`. A glob there would also attach this
+  concurrency-admission record to unrelated workflow-spec changes.
+- ADR-095: `[]` — names only the `categories.go` registration and
+  `backend/internal/server/README.md` (documentation).
+- ADR-096: `[]` — its Decision and Consequences name no path; the D3
+  global-surface list is the set's CONTENTS, in the Recommendation.
+- ADR-098: `["backend/internal/basedelta/**"]` — its Consequences
+  "Implementation" bullet places the G/D split and data-read edges there.
+- ADR-099: `[]` — `docs/BRAND_FOUNDATIONS.md` appears only in Context and in
+  Recommendation D4.
+
+A path named only in a Recommendation that a Decision adopts "as written"
+(ADR-096, ADR-099) does not count under the current rule; widening the rule to
+count it is an operator decision.
+
 ## Records
 
 | ID | Title | Status | Issue |
@@ -296,6 +328,7 @@ one, never in batches:
 | [ADR-097](097-operator-as-orchestrator.md) | Operator as orchestrator: the driver delegates evidence work to stateless specialist jobs; the first officer keeps a standing trigger-driven watch the operator cannot silence (amends ADR-089, ADR-040) | `accepted` | [#4299](https://github.com/kuhlman-labs/fishhawk/issues/4299) |
 | [ADR-098](098-split-global-surface-shadow-transfer.md) | Amend ADR-096 D3: split the global surface into verdict-wide and doc-check inputs, add data-read edges, and enable verdict transfer only after a shadow measurement | `accepted` | [#4316](https://github.com/kuhlman-labs/fishhawk/issues/4316) |
 | [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
+| [ADR-100](100-adaptive-bounded-concurrency.md) | Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1) | `accepted` | [#4403](https://github.com/kuhlman-labs/fishhawk/issues/4403) |
 
 ## Status unknown — needs captain confirmation
 
