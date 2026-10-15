@@ -26,6 +26,13 @@ const (
 	// specialistJobKindDraft is the one kind rendered in-process by the
 	// server at request time: it answers already completed and never spawns.
 	specialistJobKindDraft = "draft"
+	// specialistJobKindPlanCrosscheck and specialistJobKindInventory are the
+	// two other kinds next_actions suggests (ADR-097 D1, #4301): a tree-fact
+	// check goes to a plan_crosscheck job, a bounded git listing to an
+	// inventory job. TestSpecialistJobSuggestionKindsAreKnown pins every
+	// suggested kind to specialistjob.AllKinds.
+	specialistJobKindPlanCrosscheck = "plan_crosscheck"
+	specialistJobKindInventory      = "inventory"
 	// specialistJobStateCompleted is the job's terminal state.
 	specialistJobStateCompleted = "completed"
 	// specialistJobMaxWaitSeconds bounds fishhawk_get_specialist_job's wait.
