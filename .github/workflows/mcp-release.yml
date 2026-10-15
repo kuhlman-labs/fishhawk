@@ -6,8 +6,11 @@
 #
 #  1. Re-runs lint + tests at the tag's commit (catches a tag
 #     pushed from a dirty branch).
-#  2. Builds `fishhawk-mcp` for four platforms via a single Go
-#     loop (darwin-arm64, darwin-amd64, linux-amd64, linux-arm64).
+#  2. Builds `fishhawk-mcp` and `fishhawk-mcp-shim` (ADR-060, the
+#     hot-swapping wrapper a local install registers, #4134) for four
+#     platforms via a single Go loop (darwin-arm64, darwin-amd64,
+#     linux-amd64, linux-arm64). The shim versions with its child, so
+#     it rides the `mcp/v*` tag.
 #     CGO disabled so the binary is statically linked and works
 #     across libc variants. Version + GitSHA are stamped through
 #     `scripts/release-ldflags` (#4117), the one stamping source
@@ -100,6 +103,7 @@ jobs:
             exit 1
           fi
           stamp="$(scripts/release-ldflags fishhawk-mcp "${version}" "${GITHUB_SHA}")"
+          shim_stamp="$(scripts/release-ldflags fishhawk-mcp-shim "${version}" "${GITHUB_SHA}")"
           mkdir -p dist
           # Operator-facing targets:
           #   darwin-arm64 / amd64 — most dev machines run macOS.
@@ -118,12 +122,27 @@ jobs:
                 ./cmd/fishhawk-mcp
             )
             echo "built ${out}"
+            shim_out="dist/fishhawk-mcp-shim-${version}-${target}"
+            (
+              cd backend
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
+                -ldflags="-s -w ${shim_stamp}" \
+                -o "../${shim_out}" \
+                ./cmd/fishhawk-mcp-shim
+            )
+            echo "built ${shim_out}"
           done
-          # No sanity-check exec on the linux-amd64 binary: the
-          # server has no --help flag and would block on stdin
-          # waiting for an MCP handshake. The build itself proves
-          # the binary is well-formed; downstream verification is
-          # SHA256SUMS + cosign.
+          # No sanity-check exec on the server binary: it has no
+          # --help flag and would block on stdin waiting for an MCP
+          # handshake. The shim's --version spawns no child and reads
+          # no stdin, so the linux-amd64 shim is checked to carry the
+          # tag and the full commit, not `dev`.
+          shim_version="$("dist/fishhawk-mcp-shim-${version}-linux-amd64" --version)"
+          echo "fishhawk-mcp-shim --version: ${shim_version}"
+          case "${shim_version}" in
+            "${version} (${GITHUB_SHA})") ;;
+            *) echo "::error::fishhawk-mcp-shim reports '${shim_version}', want '${version} (${GITHUB_SHA})'" >&2; exit 1 ;;
+          esac
 
       - name: Generate SBOM (SPDX-JSON)
         uses: anchore/sbom-action@v0
@@ -175,6 +194,10 @@ jobs:
             dist/fishhawk-mcp-${{ steps.build.outputs.version }}-darwin-amd64
             dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-amd64
             dist/fishhawk-mcp-${{ steps.build.outputs.version }}-linux-arm64
+            dist/fishhawk-mcp-shim-${{ steps.build.outputs.version }}-darwin-arm64
+            dist/fishhawk-mcp-shim-${{ steps.build.outputs.version }}-darwin-amd64
+            dist/fishhawk-mcp-shim-${{ steps.build.outputs.version }}-linux-amd64
+            dist/fishhawk-mcp-shim-${{ steps.build.outputs.version }}-linux-arm64
             dist/mcp-${{ steps.build.outputs.version }}.sbom.spdx.json
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
