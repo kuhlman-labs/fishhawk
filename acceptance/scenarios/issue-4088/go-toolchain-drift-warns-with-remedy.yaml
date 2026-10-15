@@ -1,16 +1,14 @@
 id: scenario:issue-4088/go-toolchain-drift-warns-with-remedy
 statement: Running `fishhawk doctor --working-dir <dir>` against a checkout whose root go.work declares `go 1.1` (older than any installed Go) and which has NO deploy/gate-image/Dockerfile prints a `go toolchain pin` rung with status warn stating the local Go is newer than the pin, followed by a `hint:` line naming `go env -w GOTOOLCHAIN=go1.1.0`. If no `go` binary is on PATH in the sandbox, the criterion is undecidable.
 verify_hint: 'CLI stdout of `fishhawk doctor --working-dir <fixture>`: the `go toolchain pin` line ends in `warn` and the following `hint:` line contains `GOTOOLCHAIN=go1.1.0`. Requires a `go` binary on PATH in the sandbox; without one the rung warns `go not on PATH` instead.'
-steps: Created the git repo /tmp/fh4088/fx2 with only go.work containing 'go 1.1', with no deploy/gate-image/Dockerfile, and committed it. go1.26.9 is on PATH. Ran /tmp/fh4088/fishhawk doctor --working-dir /tmp/fh4088/fx2 --backend-url http://localhost:8090 --timeout 10s.
+steps: 'Built the CLI from the sanctioned checkout (HEAD 2e60df86): cd cli && go build -o /tmp/fh4088v/fishhawk ./cmd/fishhawk. Created the git repo /tmp/fh4088v/fx2 holding only go.work containing ''go 1.1'', with no deploy/gate-image/Dockerfile, and committed it. go1.26.9 is on PATH. Ran /tmp/fh4088v/fishhawk doctor --working-dir /tmp/fh4088v/fx2 --backend-url http://localhost:8090 --timeout 10s.'
 assertions:
-    expected: A go toolchain pin warn stating the local Go is newer than the pin, followed by a hint containing GOTOOLCHAIN=go1.1.0
-    observed_at_record: |-
-        go toolchain pin          local go1.26.9 newer than the go.work pin go 1.1 warn
-          hint: a newer Go can red-line `scripts/test verify` on clean main while CI stays green (the jsonv2 encoder case, #3237): pin it with `go env -w GOTOOLCHAIN=go1.1.0`
-    repro_handle: fishhawk doctor --working-dir /tmp/fh4088/fx2 --backend-url http://localhost:8090
+    expected: A warn stating the local Go is newer than the pin, followed by a hint containing GOTOOLCHAIN=go1.1.0
+    observed_at_record: 'go toolchain pin          local go1.26.9 newer than the go.work pin go 1.1 warn; the next line is: hint: ... pin it with `go env -w GOTOOLCHAIN=go1.1.0`'
+    repro_handle: fishhawk doctor --working-dir <fx2>
 origin:
     issue: 4088
     pr: 4472
     run_id: f074973c-062a-4dbb-bd07-b62d15019666
-    head_sha: 2d6307e3e91fdf1e1b0642fde21e9e3aa959c966
-    recorded_at: 2026-10-15T21:47:26Z
+    head_sha: 2e60df860deeba0fb28aeb9d007f3c34de7d6586
+    recorded_at: 2026-10-15T22:56:00Z
