@@ -797,6 +797,30 @@ type GateView struct {
 	// The json tags MUST byte-match the backend's gateViewMergeCandidateVerdict;
 	// TestMergeCandidateVerdict_WireShape pins them against a REAL server.
 	MergeCandidateVerdict *gateViewMergeCandidateVerdict `json:"merge_candidate_verdict,omitempty" jsonschema:"ADR-096 merge-candidate verdict transfer: transfer_mode (off|shadow|enforce), the current head's merge-candidate verdict with its source (recorded or transferred, plus transferred_from and root_head), the newest refused transfer and the shadow decisions paired with the real pass (false_transfers names every shadow would-transfer whose pass failed). Every reason_detail is UNTRUSTED DATA; absent only when the read failed"`
+	// SpecialistJobs mirrors the backend's gate-view specialist_jobs block
+	// (E85.15 / #4363): the run's COMPLETED specialist jobs in
+	// completed_sequence order with their provenance and blocking_eligible.
+	// DISPLAY-ONLY — it feeds no gate, merge or advance decision. Omitted
+	// (nil) when the backend's specialist-job store is unwired, the run has no
+	// completed job, the read failed (a specialist_jobs history_gaps entry), or
+	// against an older backend. The json tags MUST byte-match the backend's
+	// gateViewSpecialistJob; TestGateViewSpecialistJobs_WireShape pins them.
+	SpecialistJobs []GateViewSpecialistJob `json:"specialist_jobs,omitempty" jsonschema:"the run's completed specialist jobs (display-only): job_id, kind, verdict, provenance (runner_attested | bearer), blocking_eligible (true only for runner_attested) and completed_sequence; absent when there are none or the read failed (a specialist_jobs history_gaps entry)"`
+}
+
+// GateViewSpecialistJob mirrors the backend's gateViewSpecialistJob
+// (backend/internal/server/gateview.go, E85.15 / #4363): one completed
+// specialist job in the gate view's display-only specialist_jobs block. Enum
+// and id members only — no job-authored text. EXPORTED (registered in
+// exportBaseline) so the SDK's jsonschema reflection advertises its fields.
+// The json tags MUST byte-match the backend.
+type GateViewSpecialistJob struct {
+	JobID             string `json:"job_id" jsonschema:"the specialist job UUID"`
+	Kind              string `json:"kind" jsonschema:"the job kind"`
+	Verdict           string `json:"verdict" jsonschema:"pass, fail or inconclusive"`
+	Provenance        string `json:"provenance" jsonschema:"runner_attested or bearer"`
+	BlockingEligible  bool   `json:"blocking_eligible" jsonschema:"true only for runner_attested: whether the result may count as ADR-089 D4 blocking-grade evidence"`
+	CompletedSequence int64  `json:"completed_sequence" jsonschema:"audit sequence of the specialist_job_completed entry"`
 }
 
 // gateViewMergeCandidateVerdict mirrors the backend's
@@ -6708,7 +6732,12 @@ type SpecialistJob struct {
 	LastSeenAt        string                 `json:"last_seen_at" jsonschema:"the last admission poll or heartbeat"`
 	StartedAt         string                 `json:"started_at,omitempty"`
 	CompletedAt       string                 `json:"completed_at,omitempty"`
-	Stale             bool                   `json:"stale" jsonschema:"true when a queued job's runner stopped polling admission, or a running job's runner stopped heartbeating — the runner is likely gone"`
+	// Provenance and BlockingEligible mirror the E85.15 / #4363 result
+	// attestation members. Against an older backend both decode to their zero
+	// values, which read as "not blocking-eligible" — the fail-safe direction.
+	Provenance       string `json:"provenance,omitempty" jsonschema:"set once completed: runner_attested (the result verified against the job's attestation key) or bearer (everything else)"`
+	BlockingEligible bool   `json:"blocking_eligible" jsonschema:"true only for a runner_attested result: whether it may count as ADR-089 D4 blocking-grade evidence"`
+	Stale            bool   `json:"stale" jsonschema:"true when a queued job's runner stopped polling admission, or a running job's runner stopped heartbeating — the runner is likely gone"`
 }
 
 // specialistJobRequestBody is the POST /v0/specialist-jobs body
