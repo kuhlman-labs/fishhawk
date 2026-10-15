@@ -186,7 +186,7 @@ func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 // as a catch manufactured by the redaction (#4314 review: the bare "redact"
 // probe did exactly that).
 func TestRescoreCatchRateTrials_RedactionMarkerNeverCatches(t *testing.T) {
-	const name = "secret-credential-in-error-path"
+	const name = "secret-signed-url-in-debug-retry-log"
 	secCases, _ := loadCommittedSecurity(t)
 	var sc SecurityCatchCase
 	for _, c := range secCases {

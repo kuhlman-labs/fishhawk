@@ -1112,6 +1112,26 @@ clean sensitive-path diffs), loaded by `LoadSecurityCatchCorpus` through
   with scripted senders; the live calibration (30 samples per case) and the
   #4314 re-pin recording are operator-run
   (`docs/compliance/planreview-catchrate-evidence.md`).
+- **The #4402 catch cases.** All six #4314 catch cases sat at the ceiling
+  (34/34 in the 2026-10-15 recording), so #4402 replaced them with six harder
+  cases, one per lens, each a defect that is a side effect of a larger
+  legitimate change (seeing it takes connecting two hunks, a default value or
+  one error branch). They carry NEW names on purpose: `baselineComparable`
+  compares each arm's case-name set, so reused names would keep the 1.000
+  `security` baseline comparable and `judgeCatchRate` would refuse the
+  re-pin as a catch-rate regression. The changed case set makes the
+  `security` arm non-comparable for exactly ONE pin; later pins compare
+  normally. The clean cases and `markers.json` are unchanged, so
+  `security_portability` does not stale. A case's calibrated rate is
+  accepted only when its misses are `not_mentioned` reviewer misses, read
+  from the subset dry run's `planreview-diag.jsonl`, never from scoring
+  misses (`no_probe` / `unattributed`).
+  The 30-trial calibration at 58f8062e caught 171/180 (true rate about
+  179/180; every decodable miss was a mis-attributed real catch), and the
+  Captain's 2026-10-15 ruling accepts the six as documented out-of-band at
+  the ceiling, with cross-context cases left to #4474
+  (`docs/compliance/planreview-catchrate-evidence.md`, "Calibration at
+  58f8062e").
 
 ### The rule, the tolerance and the power floor
 
@@ -1234,16 +1254,16 @@ sidecar (below), which a recording writes beside it.
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
-          "authz-run-bound-refusal-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "authz-account-check-behind-legacy-flag": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
           "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
           "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
           "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
           "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
-          "failclosed-policy-check-open-on-error": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-          "permission-workflow-permissions-widened": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-          "secret-credential-in-error-path": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-          "supplychain-unpinned-install-script": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-          "trust-issue-text-outside-envelope": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
+          "failclosed-gate-lookup-timeout-proceeds": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "permission-instruction-path-case-fold-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "secret-signed-url-in-debug-retry-log": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "supplychain-installer-from-branch-version-pinned": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "trust-linked-issue-summary-one-call-out": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
       },
       "false_alarm_partition": {
           "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},
@@ -1340,16 +1360,16 @@ sidecar (below), which a recording writes beside it.
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
-            "authz-run-bound-refusal-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "authz-account-check-behind-legacy-flag": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
             "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
             "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
             "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
             "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
-            "failclosed-policy-check-open-on-error": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-            "permission-workflow-permissions-widened": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-            "secret-credential-in-error-path": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-            "supplychain-unpinned-install-script": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
-            "trust-issue-text-outside-envelope": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
+            "failclosed-gate-lookup-timeout-proceeds": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "permission-instruction-path-case-fold-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "secret-signed-url-in-debug-retry-log": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "supplychain-installer-from-branch-version-pinned": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "trust-linked-issue-summary-one-call-out": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
         },
         "false_alarm_partition": {
             "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},

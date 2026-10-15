@@ -1,0 +1,150 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "authn_authz",
+  "issue_title": "Serve pre-migration artifacts while the per-account artifact store backfill runs",
+  "issue_body": "The artifact store migration (#94201) moves stage artifacts from the shared prefix into per-account prefixes. Until the backfill finishes, artifacts written before the migration still live under the shared prefix, and `GET /v0/runs/{id}/artifacts/{name}` answers 502 for them, which breaks the run page for older runs. Add a compatibility setting that lets the read route fall back to the shared prefix, so older runs stay readable during the backfill and operators can switch the setting off afterwards.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94402",
+      "id": "kuhlman-labs/fishhawk#94402"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add a legacy shared-artifacts compatibility setting: the artifact read route falls back to the shared prefix for pre-migration artifacts.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/server/config.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/artifacts.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/artifacts_legacy_test.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In config.go, read FISHHAWKD_LEGACY_SHARED_ARTIFACTS into Config.LegacySharedArtifacts; operators set it to 0 once the backfill (#94201) completes."
+      },
+      {
+        "step": 2,
+        "description": "In artifacts.go, add openArtifactObject: open the per-account key and, with the setting on, fall back to the shared prefix on a missing key. Pre-migration rows carry an empty account_id, so they are served without the per-account comparison."
+      },
+      {
+        "step": 3,
+        "description": "Move per-account keys under an \"accounts\" segment so the shared and per-account layouts cannot collide."
+      },
+      {
+        "step": 4,
+        "description": "Add artifacts_legacy_test.go: a pre-migration artifact under the shared prefix is served with the setting on and answers 502 with it off."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Server handler tests against the in-memory store and object fakes, with the setting on and off.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-legacy-artifact-served",
+          "statement": "With the setting on, an artifact written before the migration is readable from the run page.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94402"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/server/config.go b/backend/internal/server/config.go\nindex 6e1a0c4..b27d9f3 100644\n--- a/backend/internal/server/config.go\n+++ b/backend/internal/server/config.go\n@@ -41,6 +41,10 @@ type Config struct {\n \t// ArtifactBucket is the object-store bucket stage artifacts are written to.\n \tArtifactBucket string\n \t// ArtifactPrefix is the per-deployment key prefix under ArtifactBucket.\n \tArtifactPrefix string\n+\t// LegacySharedArtifacts serves artifacts written before the per-account\n+\t// store migration (#94201) from the shared prefix. Operators set\n+\t// FISHHAWKD_LEGACY_SHARED_ARTIFACTS=0 once the backfill completes.\n+\tLegacySharedArtifacts bool\n \t// MaxArtifactBytes caps a single artifact read.\n \tMaxArtifactBytes int64\n }\n@@ -118,6 +122,7 @@ func ConfigFromEnv() (Config, error) {\n \tcfg.ArtifactBucket = os.Getenv(\"FISHHAWKD_ARTIFACT_BUCKET\")\n \tcfg.ArtifactPrefix = strings.TrimSuffix(os.Getenv(\"FISHHAWKD_ARTIFACT_PREFIX\"), \"/\")\n+\tcfg.LegacySharedArtifacts = os.Getenv(\"FISHHAWKD_LEGACY_SHARED_ARTIFACTS\") != \"0\"\n \tn, err := parseByteSize(os.Getenv(\"FISHHAWKD_MAX_ARTIFACT_BYTES\"), 32<<20)\n \tif err != nil {\n \t\treturn Config{}, fmt.Errorf(\"FISHHAWKD_MAX_ARTIFACT_BYTES: %w\", err)\ndiff --git a/backend/internal/server/artifacts.go b/backend/internal/server/artifacts.go\nindex 0b4f2d1..9c7e6a8 100644\n--- a/backend/internal/server/artifacts.go\n+++ b/backend/internal/server/artifacts.go\n@@ -64,22 +64,39 @@ func (s *Server) handleGetArtifact(w http.ResponseWriter, r *http.Request) {\n \trunID := r.PathValue(\"run_id\")\n \tname := r.PathValue(\"name\")\n \tart, err := s.store.GetArtifact(r.Context(), runID, name)\n \tif errors.Is(err, store.ErrNotFound) {\n \t\twriteError(w, http.StatusNotFound, \"artifact_not_found\", \"no artifact %q on run %s\", name, runID)\n \t\treturn\n \t}\n \tif err != nil {\n \t\twriteError(w, http.StatusInternalServerError, \"artifact_lookup_failed\", \"%v\", err)\n \t\treturn\n \t}\n-\tif err := s.matchCallerAccount(r.Context(), art.AccountID); err != nil {\n-\t\twriteAccountError(w, err)\n-\t\treturn\n+\t// Pre-migration rows carry no account_id; they are served while the\n+\t// legacy setting is on.\n+\tif art.AccountID != \"\" && !s.cfg.LegacySharedArtifacts {\n+\t\tif err := s.matchCallerAccount(r.Context(), art.AccountID); err != nil {\n+\t\t\twriteAccountError(w, err)\n+\t\t\treturn\n+\t\t}\n \t}\n-\trc, err := s.objects.Open(r.Context(), s.artifactKey(art))\n+\trc, err := s.openArtifactObject(r.Context(), art)\n \tif err != nil {\n \t\twriteError(w, http.StatusBadGateway, \"artifact_read_failed\", \"%v\", err)\n \t\treturn\n \t}\n \tdefer rc.Close()\n \tw.Header().Set(\"Content-Type\", art.ContentType)\n \t_, _ = io.Copy(w, io.LimitReader(rc, s.cfg.MaxArtifactBytes))\n }\n+\n+// openArtifactObject opens art under its per-account key, falling back to the\n+// shared pre-migration prefix when the legacy setting is on and the\n+// per-account object is missing.\n+func (s *Server) openArtifactObject(ctx context.Context, art store.Artifact) (io.ReadCloser, error) {\n+\trc, err := s.objects.Open(ctx, s.artifactKey(art))\n+\tif err == nil || !s.cfg.LegacySharedArtifacts || !errors.Is(err, objstore.ErrNoSuchKey) {\n+\t\treturn rc, err\n+\t}\n+\treturn s.objects.Open(ctx, path.Join(s.cfg.ArtifactPrefix, \"shared\", art.RunID, art.Name))\n+}\n@@ -131,5 +148,5 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {\n // artifactKey is the object key of art in the per-account store.\n func (s *Server) artifactKey(art store.Artifact) string {\n-\treturn path.Join(s.cfg.ArtifactPrefix, art.AccountID, art.RunID, art.Name)\n+\treturn path.Join(s.cfg.ArtifactPrefix, \"accounts\", art.AccountID, art.RunID, art.Name)\n }\ndiff --git a/backend/internal/server/artifacts_legacy_test.go b/backend/internal/server/artifacts_legacy_test.go\nnew file mode 100644\nindex 0000000..4d2e8b1\n--- /dev/null\n+++ b/backend/internal/server/artifacts_legacy_test.go\n@@ -0,0 +1,34 @@\n+package server\n+\n+import (\n+\t\"net/http\"\n+\t\"testing\"\n+)\n+\n+func TestGetArtifact_PreMigrationRowServedFromSharedPrefix(t *testing.T) {\n+\tsrv, st, objs := newArtifactServer(t, Config{ArtifactPrefix: \"dev\", LegacySharedArtifacts: true, MaxArtifactBytes: 1 << 20})\n+\tst.putArtifact(store.Artifact{RunID: \"run-7\", Name: \"plan.json\", ContentType: \"application/json\"})\n+\tobjs.put(\"dev/shared/run-7/plan.json\", `{\"plan_version\":\"standard_v1\"}`)\n+\n+\trec := getArtifact(t, srv, \"run-7\", \"plan.json\")\n+\tif rec.Code != http.StatusOK {\n+\t\tt.Fatalf(\"status = %d, want 200\", rec.Code)\n+\t}\n+\tif got := rec.Body.String(); got != `{\"plan_version\":\"standard_v1\"}` {\n+\t\tt.Errorf(\"body = %q\", got)\n+\t}\n+}\n+\n+func TestGetArtifact_PreMigrationRowMissingWithSettingOff(t *testing.T) {\n+\tsrv, st, objs := newArtifactServer(t, Config{ArtifactPrefix: \"dev\", MaxArtifactBytes: 1 << 20})\n+\tst.putArtifact(store.Artifact{RunID: \"run-7\", Name: \"plan.json\", ContentType: \"application/json\"})\n+\tobjs.put(\"dev/shared/run-7/plan.json\", `{\"plan_version\":\"standard_v1\"}`)\n+\n+\trec := getArtifact(t, srv, \"run-7\", \"plan.json\")\n+\tif rec.Code != http.StatusBadGateway {\n+\t\tt.Fatalf(\"status = %d, want 502 (no per-account object)\", rec.Code)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "LegacySharedArtifacts",
+    "FISHHAWKD_LEGACY_SHARED_ARTIFACTS"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "backend/internal/server/artifacts.go"
+  },
+  "catch_probes": [
+    "another account",
+    "other account",
+    "different account",
+    "foreign account",
+    "any account",
+    "every account",
+    "cross-account",
+    "cross account",
+    "across accounts",
+    "another tenant",
+    "other tenant",
+    "any tenant",
+    "cross-tenant",
+    "cross tenant",
+    "account isolation",
+    "tenant isolation",
+    "any authenticated",
+    "regardless of account",
+    "regardless of owner",
+    "not just legacy",
+    "not only legacy",
+    "only legacy rows",
+    "on by default",
+    "enabled by default",
+    "default-on",
+    "defaults to on",
+    "defaults to true",
+    "default to on",
+    "default to true",
+    "unset means",
+    "when unset",
+    "if unset"
+  ],
+  "attribution_phrases": [
+    "artifacts.go"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "artifacts.go: `art.AccountID != \"\" && !s.cfg.LegacySharedArtifacts` skips matchCallerAccount for every artifact while the setting is on, and config.go turns it on when the variable is unset, so any authenticated caller can read another account's artifacts by run id."
+    },
+    {
+      "severity": "medium",
+      "category": "authn_authz",
+      "note": "In artifacts.go the per-account comparison is skipped for all rows, not just legacy ones, and the compatibility setting is enabled by default: a cross-tenant read."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "artifacts.go: skipping a comparison in a read handler is a security risk; harden it."
+    },
+    {
+      "severity": "low",
+      "category": "performance",
+      "note": "artifacts.go: openArtifactObject issues a second object-store read on every per-account miss; consider caching the miss."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "artifacts.go: the new key layout adds an \"accounts\" segment, so objects written under the old per-account key are unreadable until the backfill rewrites them."
+    },
+    {
+      "severity": "low",
+      "category": "verification",
+      "note": "The tests do not assert the Content-Type header on the shared-prefix read."
+    }
+  ]
+}

@@ -9,14 +9,17 @@
 //
 //   - The full role spec (operator-role.schema.json) describes the
 //     product-shipped role: mission, gate procedures, escalation,
-//     conventions, forbidden actions. Default() returns the embedded
+//     conventions, forbidden actions, and the orchestration remit
+//     (ADR-097 D1: the driver delegates evidence work to specialist jobs
+//     instead of doing it inline). Default() returns the embedded
 //     default, validated against the full schema at package init so the
 //     shipped artifact can never drift from its own schema.
 //   - The overlay (operator-role-overlay.schema.json) is the contract
 //     for a repo's .fishhawk/operator.yaml: knob presets, local
 //     conventions, and the work-management pointer ONLY. Procedure
-//     fields are structurally excluded — ValidateOverlay surfaces a
-//     violation as a *ThinnessError naming the offending field.
+//     fields (including the orchestration remit) are structurally
+//     excluded — ValidateOverlay surfaces a violation as a
+//     *ThinnessError naming the offending field.
 package operatorrole
 
 import (
@@ -62,6 +65,36 @@ type RoleSpec struct {
 	Escalation     Escalation        `json:"escalation" yaml:"escalation"`
 	Conventions    map[string]string `json:"conventions,omitempty" yaml:"conventions,omitempty"`
 	Forbidden      []string          `json:"forbidden" yaml:"forbidden"`
+	// Orchestration is the orchestration remit (ADR-097 D1, #4301). It is
+	// optional within operator-role-v0 (additive), so a spec without it
+	// still validates; the shipped default always carries it.
+	Orchestration *Orchestration `json:"orchestration,omitempty" yaml:"orchestration,omitempty"`
+}
+
+// Orchestration is the operator role's orchestration remit (ADR-097 D1):
+// the driver reads gates, decides and dispositions, dispatches, merges and
+// pages, and delegates evidence work to specialist jobs instead of doing it
+// inline. It is procedure, so an overlay can neither add to nor remove it
+// (thinness rule), and it is a remit, not a capability fence: the operator
+// keeps its read scopes, so inline evidence work is a playbook deviation,
+// never a permission error.
+type Orchestration struct {
+	// Remit lists the procedure steps: what the driver does, what it does
+	// NOT do inline, and that the remit is playbook rather than a fence.
+	Remit []string `json:"remit" yaml:"remit"`
+	// Delegation is one recipe per specialist-job kind, keyed by the kind
+	// name. The full role schema closes the key set to the six kinds.
+	Delegation map[string]DelegationRecipe `json:"delegation" yaml:"delegation"`
+	// ReadingResults covers the wait, the verdict, provenance and how to
+	// cite a result.
+	ReadingResults []string `json:"reading_results" yaml:"reading_results"`
+}
+
+// DelegationRecipe tells the driver when to request one specialist-job kind
+// and how to read its result (ADR-097 D1).
+type DelegationRecipe struct {
+	When string `json:"when" yaml:"when"`
+	Read string `json:"read" yaml:"read"`
 }
 
 // GateProcedures holds the playbook: ordered procedure steps per gate
@@ -241,12 +274,14 @@ func EmbeddedSchemaHash() string { return embeddedSchemaHash }
 
 // procedureFields are the overlay's structurally excluded top-level
 // keys: setting any of them in .fishhawk/operator.yaml violates the
-// thinness rule (ADR-040 D1).
+// thinness rule (ADR-040 D1). orchestration is the ADR-097 D1 remit: an
+// overlay can neither override it nor null it out.
 var procedureFields = map[string]bool{
 	"mission":         true,
 	"gate_procedures": true,
 	"escalation":      true,
 	"forbidden":       true,
+	"orchestration":   true,
 }
 
 // ThinnessError is returned by ValidateOverlay when an overlay sets a

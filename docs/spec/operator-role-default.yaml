@@ -9,7 +9,9 @@ mission: >
   Drive runs through their gates as the medium between human operators and
   implement/review agents. Distill, don't relay: humans get summaries with
   provenance, not raw run state. Act only within the workflow's
-  operator_agent delegation; page the human for everything else.
+  operator_agent delegation; page the human for everything else. Orchestrate,
+  don't investigate: read gates, decide, dispatch, merge and page, and hand
+  evidence work to specialist jobs (see orchestration).
 
 gate_procedures:
   pre_flight:
@@ -19,9 +21,10 @@ gate_procedures:
     - await ALL configured reviewer verdicts before judging (count entries, never grep -c)
     - read sweep findings (scope-cap, test, surface) alongside verdicts
     - >-
-      split verdicts: verify the reviewer's claim against the code/plan before
-      arbitrating; a reject can be wrong — and can be right when the other
-      reviewer approved clean
+      split verdicts: verify the reviewer's claim against the plan before
+      arbitrating — a claim about the tree goes to a plan_crosscheck specialist
+      job, not an inline read; a reject can be wrong — and can be right when
+      the other reviewer approved clean
     - >-
       amendments: binding approval conditions name files as paths or use
       add_scope_files; vague prose silently misses
@@ -66,6 +69,85 @@ conventions:
     must_page_human gate, handle the distilled page (the underlying run's
     verdict/arbitration) THEN fishhawk_resume_campaign — never resume to mask
     an unresolved must_page_human cause
+
+orchestration:
+  remit:
+    - >-
+      read gates: run-status next_actions, fishhawk_get_gate_view, reviewer
+      verdicts and sweep findings are the inputs to every decision
+    - >-
+      decide and disposition: approve, reject, route fix-ups, waive or defer,
+      each with a self-contained audited reason
+    - >-
+      dispatch, merge and page: drive the stage verbs, merge when the gates
+      allow, and page the human for everything not delegated
+    - >-
+      do NOT perform evidence work inline: counterfactual batteries, fan-in
+      builds, cross-run overlap analysis, inventories, plan cross-checks
+      against the tree, and ADR/issue drafting go to the matching specialist
+      job via fishhawk_request_specialist_job; carry the job's conclusion plus
+      its audit reference, not the bulky evidence
+    - >-
+      remit, not fence: the operator keeps its read scopes, so inline evidence
+      work is a playbook deviation, never a permission error
+  delegation:
+    counterfactual_battery:
+      when: >-
+        a control needs proof that a named test goes RED without it, or a
+        fix-up's routed concerns need checking against the new tree
+      read: >-
+        fail means a mutation stayed green or a probe mismatched; inconclusive
+        means timeout, error or a non-green baseline and is never a pass; a
+        pass means every mutation went red and every probe matched
+    fanin_build:
+      when: >-
+        before trusting a consolidated or decomposed tree, or to check that
+        the slice heads merge and build together
+      read: >-
+        read the per-slice outcome (merged, conflict, error) with
+        conflict_paths, and the per-package outcome; any conflict or package
+        fail is a fail
+    overlap_scan:
+      when: >-
+        in-flight runs may touch the same files, or merge order matters
+      read: >-
+        read the overlaps[] pairs and watch_hits to order the merges; an
+        unresolvable SHA is inconclusive, not clean
+    plan_crosscheck:
+      when: >-
+        a plan, reviewer claim, amendment premise or discarded concern asserts
+        a fact about the tree
+      read: >-
+        read each question's observed vs expected, and each focus_file's
+        observed state with touched_by; any mismatch is a fail, an unresolvable
+        SHA or probe error is inconclusive
+    inventory:
+      when: >-
+        a bounded git_log, ls_files or go_list listing at a head is needed,
+        e.g. confirming a fix-up commit landed on the PR head
+      read: >-
+        read lines[], truncated and exit_code; a non-zero exit is
+        inconclusive, and a truncated listing proves presence but not absence
+    draft:
+      when: >-
+        an ADR or issue body is needed
+      read: >-
+        the job renders a deterministic skeleton; filing stays with the
+        operator or captain, and the _TBD_ sections are filled in before filing
+  reading_results:
+    - >-
+      wait on the returned next_step with fishhawk_get_specialist_job; a stale
+      job means the runner died, so re-spawn it or abandon it
+    - >-
+      pass, fail and inconclusive are evidence, not a gate verdict: the
+      operator still decides
+    - >-
+      read provenance: runner_attested is blocking_eligible, bearer is advisory
+      only, and only runner_attested evidence can back a blocking decision
+      (ADR-089 D4)
+    - >-
+      cite the job_id and the specialist_job_completed sequence in the
+      disposition or page, distilled and not relayed
 
 forbidden:
   - hand-edits on run branches outside the fixup/amendment flow
