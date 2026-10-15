@@ -470,6 +470,7 @@ var KnownCategories = map[string]struct{}{
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
+	"merge_settle_members_refused":            {}, // E39.17 / #4132: a merge on a members-declaring review gate was HELD because no forge identity (merger / latest-APPROVED reviewer) is listed (server/merge_members.go) — INTERNAL, not an issue-comment surface
 	"merge_verdict_recorded":                  {},
 	"merge_candidate_queue_admitted":          {}, // E83.85 / #4200 (ADR-092 D1): a held merge-candidate pass was admitted as its base's ONE live pass (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_queue_held":              {}, // E83.85 / #4200 (ADR-092 D1): a merge-candidate pass was held behind its base's live pass, consuming no runner slot (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
@@ -583,7 +584,7 @@ var KnownCategories = map[string]struct{}{
 	"split_filing_refused":                    {},
 	"split_parent_closed":                     {},
 	"spend_alert":                             {},
-	"specialist_job_completed":                {}, // E85.9 / #4300 (ADR-097 D2): a runner-executed specialist job's typed result (or a draft's render), requester from the job row, provenance bearer (specialistjob/store.go) — INTERNAL, not an issue-comment surface
+	"specialist_job_completed":                {}, // E85.9 / #4300 (ADR-097 D2): a runner-executed specialist job's typed result (or a draft's render), requester from the job row; E85.15 / #4363: provenance bearer|runner_attested, blocking_eligible (true only for runner_attested), attested_by (the minting attester's subject, omitted unless runner_attested) (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"specialist_job_requested":                {}, // E85.9 / #4300 (ADR-097 D2): a seat filed a specialist job; inputs recorded verbatim (semantic JSON), requester server-derived (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"specialist_job_taken_over":               {}, // E85.9 / #4300 (ADR-097 D6, approval condition C1): a running job whose heartbeat went stale past JobHeartbeatTTL was re-admitted under a NEW execution nonce (specialistjob/store.go) — INTERNAL, not an issue-comment surface
 	"stage_budget_exceeded":                   {},

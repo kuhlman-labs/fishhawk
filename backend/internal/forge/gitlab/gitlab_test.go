@@ -318,6 +318,47 @@ func TestGetPullRequest_DecodesMergeEvidence(t *testing.T) {
 	})
 }
 
+// TestGetPullRequest_DecodesMergedBy pins the merger decode the merge-settled
+// members check reads (#4132): merge_user wins, the deprecated merged_by is
+// the fallback, both null yields "", and an OPEN MR whose merge_user names
+// the auto-merge setter reports no merger.
+func TestGetPullRequest_DecodesMergedBy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"merged, merge_user wins over merged_by",
+			`{"iid":1,"state":"merged","merge_user":{"username":"alice"},"merged_by":{"username":"bob"},"target_branch":"main"}`,
+			"alice"},
+		{"merged, merge_user null falls back to merged_by",
+			`{"iid":1,"state":"merged","merge_user":null,"merged_by":{"username":"bob"},"target_branch":"main"}`,
+			"bob"},
+		{"merged, both null yields empty",
+			`{"iid":1,"state":"merged","merge_user":null,"merged_by":null,"target_branch":"main"}`,
+			""},
+		{"opened with auto-merge setter reports no merger",
+			`{"iid":1,"state":"opened","merge_user":{"username":"alice"},"merged_by":null,"target_branch":"main"}`,
+			""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v4/projects/5/merge_requests/1", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, http.StatusOK, tc.body)
+			})
+			f, _ := newForge(t, mux)
+			pr, err := f.GetPullRequest(context.Background(), gitlabScope("5"), forge.RepoRef{}, 1)
+			if err != nil {
+				t.Fatalf("GetPullRequest: %v", err)
+			}
+			if pr.MergedBy != tc.want {
+				t.Errorf("MergedBy = %q, want %q", pr.MergedBy, tc.want)
+			}
+		})
+	}
+}
+
 // TestResolveRepoScopeNotInstalled pins the ResolveRepoScope-specific 404
 // mapping: a project the token cannot see is ErrNotInstalled, distinct from
 // ErrNotFound.

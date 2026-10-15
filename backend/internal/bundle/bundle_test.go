@@ -2247,3 +2247,50 @@ func TestExtractGateEvidence_NoFlakeAbsorbedIsNil(t *testing.T) {
 		t.Errorf("FlakeAbsorbed = %+v, want nil", ge.FlakeAbsorbed)
 	}
 }
+
+// TestGateEvidence_DecodesFixupCommitClaimsGolden is the BACKEND half of the
+// #4337 fixup_commit_claims seam: the shared golden
+// testdata/wire/fixup_commit_claims.json — the bytes the runner's
+// composeGateEvidence marshals for the incident's commit message — decodes
+// through ExtractGateEvidence into FixupCommitClaimsEvidence and re-encodes to
+// the SAME bytes (a dropped or renamed field would lose bytes on the trip).
+func TestGateEvidence_DecodesFixupCommitClaimsGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "fixup_commit_claims.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	golden := strings.TrimSuffix(string(raw), "\n")
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, golden))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	fcc := ge.FixupCommitClaims
+	if fcc == nil {
+		t.Fatal("FixupCommitClaims = nil, want the golden member")
+	}
+	want := FixupCommitClaimsEvidence{Claims: []FixupCommitClaimEvidence{{Marker: "Item 3", FileRefs: []string{"injection_test.go"}}}}
+	if fmt.Sprintf("%+v", *fcc) != fmt.Sprintf("%+v", want) {
+		t.Fatalf("FixupCommitClaims = %+v\nwant %+v", *fcc, want)
+	}
+	reencoded, err := json.Marshal(struct {
+		FixupCommitClaims *FixupCommitClaimsEvidence `json:"fixup_commit_claims_unbacked"`
+	}{fcc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reencoded) != golden {
+		t.Fatalf("re-encode drifted from the shared golden:\n got %s\nwant %s", reencoded, golden)
+	}
+}
+
+// TestExtractGateEvidence_NoFixupCommitClaimsIsNil: an older bundle's
+// gate_evidence (no fixup_commit_claims_unbacked key) decodes to a nil member.
+func TestExtractGateEvidence_NoFixupCommitClaimsIsNil(t *testing.T) {
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ge.FixupCommitClaims != nil {
+		t.Errorf("FixupCommitClaims = %+v, want nil", ge.FixupCommitClaims)
+	}
+}

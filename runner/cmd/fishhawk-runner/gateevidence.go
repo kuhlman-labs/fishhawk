@@ -154,6 +154,42 @@ type gateEvidencePayload struct {
 	// bundle.GateEvidence.FlakeAbsorbed, which feeds the verify_flake_absorbed
 	// audit row.
 	FlakeAbsorbed *flakeAbsorbedEvidence `json:"flake_absorbed,omitempty"`
+	// FixupCommitClaims records the fix-up commit-message paragraphs the
+	// runner's cross-check found UNBACKED by the pass's own git_diff (#4337):
+	// an Item/Finding/Concern paragraph naming files or tests the diff touches
+	// none of. Folded from the LAST fixup_commit_claims_unbacked event; every
+	// token is charset-limited at the emit site (emitFixupCommitClaims). Absent
+	// (the byte-identical default) on a non-fix-up pass or when every claim is
+	// backed or undecidable. The json tag MUST stay identical to the backend's
+	// bundle.GateEvidence.FixupCommitClaims.
+	FixupCommitClaims *fixupCommitClaimsEvidence `json:"fixup_commit_claims_unbacked,omitempty"`
+}
+
+// fixupCommitClaimsEvidence is the gate_evidence member of the #4337
+// commit-message claims cross-check: Claims are the unbacked claim paragraphs,
+// at most fixupClaimsMaxClaims; Truncated reports that more were found.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// FixupCommitClaimsEvidence, paired ModeExact in backend/internal/wirecontract
+// and pinned from both modules by testdata/wire/fixup_commit_claims.json.
+type fixupCommitClaimsEvidence struct {
+	Claims    []fixupCommitClaimEvidence `json:"claims"`
+	Truncated bool                       `json:"truncated,omitempty"`
+}
+
+// fixupCommitClaimEvidence is one unbacked claim paragraph (#4337): Marker is
+// its normalized lead (`Item 3`), FileRefs the file references and TestNames
+// the test names it names, none of which the pass's diff changes. TestNames is
+// populated only when the patch was known. No free text: each string matched a
+// fixed charset on the runner.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// FixupCommitClaimEvidence, paired ModeExact in backend/internal/wirecontract
+// and pinned from both modules by testdata/wire/fixup_commit_claims.json.
+type fixupCommitClaimEvidence struct {
+	Marker    string   `json:"marker"`
+	FileRefs  []string `json:"file_refs,omitempty"`
+	TestNames []string `json:"test_names,omitempty"`
 }
 
 // verifyFlakeAbsorbedEvent is the trace event kind the verify-fix loop emits
@@ -626,7 +662,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, records .
 	gateRan := iso != nil || len(observations) > 0
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses", fixupCommitClaimsUnbackedEvent:
 			gateRan = true
 		}
 	}
@@ -778,6 +814,15 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int, records .
 			// (peekApprovalConditionResponses); carried verbatim.
 			acr := w
 			payload.ApprovalConditionResponses = &acr
+		case fixupCommitClaimsUnbackedEvent:
+			// Last-write-wins. Already bounded and charset-limited at the emit
+			// site (emitFixupCommitClaims); carried verbatim.
+			var w fixupCommitClaimsEvidence
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			fcc := w
+			payload.FixupCommitClaims = &fcc
 		case "diff_coverage":
 			var w diffCoverageEvidence
 			if json.Unmarshal(e.Payload, &w) != nil {

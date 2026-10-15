@@ -3706,7 +3706,7 @@ the check fails on every trigger-path change until that recording lands.
 |---|---|
 | `backend/internal/prompt/` | every path under it (the plan-review prompt itself) |
 | `backend/internal/repodoc/` | every path under it (the conventions render path) |
-| `backend/internal/personaprompt/` | every path under it (the production persona prompt builder the architect arm renders through) |
+| `backend/internal/personaprompt/` | every path under it (the production persona prompt builder the persona arms render through) |
 | `backend/internal/agenteval/planreviewcatch.go` | that file only (conventions arms, catch rule v5, tolerance, floor) |
 | `backend/internal/agenteval/planreviewevidence.go` | that file only (arm table, record, fingerprints, check) |
 | `backend/internal/agenteval/planreviewpersona.go` | that file only (the architect arm: declaration, document fetcher, persona-case loader, classifier) |
@@ -3717,6 +3717,9 @@ the check fails on every trigger-path change until that recording lands.
 | `backend/internal/agenteval/testdata/planreview-persona-corpus/` | every path under it (the persona arms' corpus) |
 | `backend/internal/agenteval/testdata/planreview-catchrate/` | every path under it (the conventions fixture, `evidence.json`, its trial sidecar `evidence.trials.json`) |
 | `docs/review/architect-remit.md` | that file only (the architect remit, rendered into every architect-arm prompt) |
+| `backend/internal/agenteval/implementreviewsecurity.go` | that file only (the security arms, E80.17 / #4314: declaration, case and markers loader, render, classifier, runner) |
+| `docs/review/security-remit.md` | that file only (the security remit, rendered into every security-arm prompt) |
+| `docs/review/security-conventions.md` | that file only (the security convention, rendered into every `security`-arm prompt; the source of the portability markers) |
 
 A trigger ending in `/` is a directory at a component boundary
 (`backend/internal/prompts/x.go` does not match `backend/internal/prompt/`);
@@ -3825,10 +3828,10 @@ run-book; c4 untracked trigger file triggers; c5 unresolvable `--base` → 2;
 c6 trigger change with `go` absent → exactly 2; c7 `--always` with no
 trigger runs the gate; c8 not a git repo → 2; c9 a non-trigger agenteval
 sibling (`injection.go`) → 0; c10 each of the thirteen trigger families,
-changed alone, triggers; c11 nine near misses (directory boundaries
-`prompts/` and `personaprompts/`, test files, `.orig` files,
-`catchrategate.go`, a `planreview-persona-corpus.md` sibling, another remit)
-do not; c12 an unstaged edit, c13 a deletion
+changed alone, triggers; c11 eleven near misses (directory boundaries
+`prompts/` and `personaprompts/`, test files, `.orig` files of the
+architect remit, the security remit and the security convention,
+`catchrategate.go`, a `planreview-persona-corpus.md` sibling) do not; c12 an unstaged edit, c13 a deletion
 and c14 a move out of a trigger path trigger; c15 a C-quotable path (an
 embedded tab) under a trigger dir triggers; c16 a base with no shared
 history → 2; c17/c18 a failing `git diff` / `git ls-files` → 2; c19 each of
@@ -3839,7 +3842,11 @@ WIRING (the real `_verify_gate_harnesses`, sourced lib-only against a
 fixture ROOT whose only harness is a failing stub of this one, runs it and
 fails); c28 a new persona-corpus case, committed or untracked, triggers; c29
 an architect-remit edit triggers, and a failing gate then fails the check
-naming the run-book.
+naming the run-book; c30 (#4314) an edit to `implementreviewsecurity.go`,
+the security remit or the security convention triggers (and a failing gate
+fails the check), as does a new security-corpus case, while c11's near misses
+include `implementreviewsecurity_test.go` and `.orig` siblings of both
+security documents.
 
 Counterfactuals (each run by mutating a branch BODY, never deleting a
 referenced declaration): every exit-2 guard replaced with a fall-through to

@@ -69,14 +69,26 @@ var (
 	gateImageResult gateImageCheck
 )
 
+// gateTestDetectTimeout bounds requireGateImage's runtime detection; each
+// probe also carries gateiso's own per-probe bound.
+const gateTestDetectTimeout = time.Minute
+
+// gateTestImageCheckTimeout bounds requireGateImage's and
+// requirePostgresImage's pull and in-image binary check together.
+const gateTestImageCheckTimeout = 5 * time.Minute
+
 // requireGateImage resolves the runtime and image ONCE per process — the
-// real gateiso.DetectRuntime over DefaultProbes (skip naming Runtime.Reason
-// when unsafe or absent), then a `run --rm --network=none --entrypoint ”
-// <image> /bin/sh -c '...'` that executes `sh -c 'echo ok'` (approval
-// condition 1's live half: an ENTRYPOINT of git must not swallow the
-// command) and proves every gateImageBinaries entry resolves in-image (a
-// pull failure skips naming the runtime's error; a missing binary skips
-// naming it). Every docker-gated fixture calls it first.
+// real gateiso.DetectRuntime over DefaultProbes under a bounded context (skip
+// naming Runtime.Reason when unsafe or absent), then a pull and a `run --rm
+// --network=none --entrypoint ” <image> /bin/sh -c '...'` that executes `sh
+// -c 'echo ok'` (approval condition 1's live half: an ENTRYPOINT of git must
+// not swallow the command) and proves every gateImageBinaries entry resolves
+// in-image (a pull failure skips naming the runtime's error; a missing binary
+// skips naming it). The pull and the check run bound to the validated
+// endpoint under a credential-free docker config (gateTestImageEnv), each
+// through runImageCheckCmd, so a locked-screen credential helper can neither
+// be consulted nor hold the exec past its deadline (#4337): a deadline
+// still SKIPS naming the reason. Every docker-gated fixture calls it first.
 func requireGateImage(t *testing.T) (gateiso.Runtime, string) {
 	t.Helper()
 	if testing.Short() {
@@ -87,26 +99,46 @@ func requireGateImage(t *testing.T) (gateiso.Runtime, string) {
 		if res.image == "" {
 			res.image = gateTestImageDefault
 		}
-		res.rt = gateiso.DetectRuntime(context.Background(), gateiso.DefaultProbes())
+		dctx, dcancel := context.WithTimeout(context.Background(), gateTestDetectTimeout)
+		res.rt = gateiso.DetectRuntime(dctx, gateiso.DefaultProbes())
+		dcancel()
 		if !res.rt.Safe {
 			res.skip = "no safe container runtime: " + res.rt.Reason
 			gateImageResult = res
 			return
 		}
-		bin := res.rt.Kind.Binary()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		env, cleanup, err := gateTestImageEnv(res.rt)
+		defer cleanup()
+		if err != nil {
+			res.skip = fmt.Sprintf("credential-free runtime env for image %s: %v", res.image, err)
+			gateImageResult = res
+			return
+		}
+		pull, err := res.rt.PullArgv(res.image)
+		if err != nil {
+			res.skip = fmt.Sprintf("pull argv for image %s: %v", res.image, err)
+			gateImageResult = res
+			return
+		}
+		endpoint, err := res.rt.EndpointArgs()
+		if err != nil {
+			res.skip = fmt.Sprintf("endpoint args for image %s: %v", res.image, err)
+			gateImageResult = res
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), gateTestImageCheckTimeout)
 		defer cancel()
-		if out, err := exec.CommandContext(ctx, bin, "pull", "-q", res.image).CombinedOutput(); err != nil {
-			res.skip = fmt.Sprintf("image %s unavailable: %v: %s", res.image, err, strings.TrimSpace(string(out)))
+		if out, err := runImageCheckCmd(ctx, pull, env); err != nil {
+			res.skip = fmt.Sprintf("image %s unavailable: %v: %s", res.image, err, out)
 			gateImageResult = res
 			return
 		}
 		script := "sh -c 'echo ok' || { echo entrypoint-not-reset; exit 1; }; for b in " +
 			strings.Join(gateImageBinaries, " ") +
 			"; do command -v $b >/dev/null || { echo missing:$b; exit 1; }; done"
-		argv := []string{bin, "run", "--rm", "--network=none", "--entrypoint", "", res.image, "/bin/sh", "-c", script}
-		out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
-		text := strings.TrimSpace(string(out))
+		argv := append(append([]string{res.rt.Kind.Binary()}, endpoint...),
+			"run", "--rm", "--network=none", "--entrypoint", "", res.image, "/bin/sh", "-c", script)
+		text, err := runImageCheckCmd(ctx, argv, env)
 		switch {
 		case err != nil && strings.Contains(text, "missing:"):
 			i := strings.Index(text, "missing:")
@@ -860,22 +892,45 @@ var (
 // process (a pull, falling back to an image already present locally) and
 // proves the in-image binaries fixture (m) relies on — it runs the SAME image
 // as the gate image, for its psql client and busybox. Skips naming the error.
+// Like requireGateImage, every exec runs bound to the validated endpoint under
+// a credential-free docker config through runImageCheckCmd (#4337).
 func requirePostgresImage(t *testing.T, rt gateiso.Runtime) string {
 	t.Helper()
 	image := gateiso.DefaultPostgresImage
 	gatePgImageOnce.Do(func() {
-		bin := rt.Kind.Binary()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		env, cleanup, err := gateTestImageEnv(rt)
+		defer cleanup()
+		if err != nil {
+			gatePgImageSkip = fmt.Sprintf("credential-free runtime env for image %s: %v", image, err)
+			return
+		}
+		pull, err := rt.PullArgv(image)
+		if err != nil {
+			gatePgImageSkip = fmt.Sprintf("pull argv for image %s: %v", image, err)
+			return
+		}
+		inspect, err := rt.InspectArgv(image)
+		if err != nil {
+			gatePgImageSkip = fmt.Sprintf("inspect argv for image %s: %v", image, err)
+			return
+		}
+		endpoint, err := rt.EndpointArgs()
+		if err != nil {
+			gatePgImageSkip = fmt.Sprintf("endpoint args for image %s: %v", image, err)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), gateTestImageCheckTimeout)
 		defer cancel()
-		if out, err := exec.CommandContext(ctx, bin, "pull", "-q", image).CombinedOutput(); err != nil {
-			if exec.CommandContext(ctx, bin, "image", "inspect", image).Run() != nil {
-				gatePgImageSkip = fmt.Sprintf("image %s unavailable: %v: %s", image, err, strings.TrimSpace(string(out)))
+		if out, err := runImageCheckCmd(ctx, pull, env); err != nil {
+			if _, ierr := runImageCheckCmd(ctx, inspect, env); ierr != nil {
+				gatePgImageSkip = fmt.Sprintf("image %s unavailable: %v: %s", image, err, out)
 				return
 			}
 		}
 		script := "for b in psql wget id touch ls env tr find; do command -v $b >/dev/null || { echo missing:$b; exit 1; }; done; echo ok"
-		out, err := exec.CommandContext(ctx, bin, "run", "--rm", "--network=none", "--entrypoint", "", image, "/bin/sh", "-c", script).CombinedOutput()
-		if text := strings.TrimSpace(string(out)); err != nil || !strings.HasPrefix(text, "ok") {
+		argv := append(append([]string{rt.Kind.Binary()}, endpoint...),
+			"run", "--rm", "--network=none", "--entrypoint", "", image, "/bin/sh", "-c", script)
+		if text, err := runImageCheckCmd(ctx, argv, env); err != nil || !strings.HasPrefix(text, "ok") {
 			gatePgImageSkip = fmt.Sprintf("image %s binary check failed: %v: %s", image, err, text)
 		}
 	})

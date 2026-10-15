@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -329,10 +330,11 @@ func TestFixupRecoveryMessage_NilIsEmpty(t *testing.T) {
 }
 
 // TestLatestFixupRecovery_ReasonIsCapped proves a long runner error cannot
-// perturb the get_run_status byte budget: the reason is truncated through
-// capJSONString against fixupRecoveryReasonCap.
+// perturb the get_run_status byte budget: the reason is bounded through
+// capJSONStringHeadTail against fixupRecoveryReasonCap, keeping a head and a
+// tail of the input joined by the separator (#4337).
 func TestLatestFixupRecovery_ReasonIsCapped(t *testing.T) {
-	long := strings.Repeat("x", fixupRecoveryReasonCap*4)
+	long := strings.Repeat("h", fixupRecoveryReasonCap*2) + strings.Repeat("t", fixupRecoveryReasonCap*2)
 	got := latestFixupRecovery([]int64{1}, []fixupRecoverySignal{{
 		Sequence: 2, SourceFailureReason: long, Parsed: true,
 	}})
@@ -342,11 +344,125 @@ func TestLatestFixupRecovery_ReasonIsCapped(t *testing.T) {
 	if len(got.SourceFailureReason) >= len(long) {
 		t.Fatalf("SourceFailureReason len = %d, want truncated below %d", len(got.SourceFailureReason), len(long))
 	}
-	if len(got.SourceFailureReason) > fixupRecoveryReasonCap {
-		t.Errorf("SourceFailureReason len = %d, want <= %d", len(got.SourceFailureReason), fixupRecoveryReasonCap)
+	if n := jsonEncodedLen(got.SourceFailureReason); n > fixupRecoveryReasonCap {
+		t.Errorf("SourceFailureReason encoded len = %d, want <= %d", n, fixupRecoveryReasonCap)
 	}
-	if !strings.HasPrefix(long, got.SourceFailureReason) {
-		t.Error("SourceFailureReason is not a prefix of the input")
+	head, tail, ok := strings.Cut(got.SourceFailureReason, fixupRecoveryHeadTailSeparator)
+	if !ok {
+		t.Fatalf("SourceFailureReason carries no head/tail separator: %q", got.SourceFailureReason)
+	}
+	if head == "" || !strings.HasPrefix(long, head) {
+		t.Errorf("head %q is not a non-empty prefix of the input", head)
+	}
+	if tail == "" || !strings.HasSuffix(long, tail) {
+		t.Errorf("tail %q is not a non-empty suffix of the input", tail)
+	}
+}
+
+// strandedPinClause is the shape of the runner's #4337 stranded fix-up commit
+// pin clause at full-length SHA-1 ids and UUIDs, the longest it gets.
+const strandedPinClause = "; fix-up commit 6ccdf30ee8d97d41c34129b133d83f77672d0c91 never reached the PR branch; " +
+	"its work is pinned at refs/fishhawk/checkpoints/49ca6bb2-d2aa-45cc-9c26-26fc51f37ebd/" +
+	"5524d401-1af3-461f-b206-1767af3365e8-fixup-6ccdf30ee8d9 (inspect with " +
+	"`git show 6ccdf30ee8d97d41c34129b133d83f77672d0c91`, recover with " +
+	"`git cherry-pick 6ccdf30ee8d97d41c34129b133d83f77672d0c91`)"
+
+// TestLatestFixupRecovery_ReasonKeepsPinnedClauseTail pins the #4337 head+tail
+// cap. The fixture puts the runner's pin clause past byte 512 by construction
+// (a 2000-byte verify-output reason precedes it), so a head-only cap drops the
+// clause and only a tail-keeping cap can satisfy the suffix assertion.
+func TestLatestFixupRecovery_ReasonKeepsPinnedClauseTail(t *testing.T) {
+	t.Run("long reason keeps the clause", func(t *testing.T) {
+		reason := "commit+push: pushed tree not verified: " + strings.Repeat("verify output line; ", 100) + strandedPinClause
+		if len(reason) < 2000 {
+			t.Fatalf("fixture too short: %d bytes", len(reason))
+		}
+		got := latestFixupRecovery([]int64{1}, []fixupRecoverySignal{{Sequence: 2, SourceFailureReason: reason, Parsed: true}})
+		if got == nil {
+			t.Fatal("latestFixupRecovery = nil, want a marker")
+		}
+		if n := jsonEncodedLen(got.SourceFailureReason); n > fixupRecoveryReasonCap {
+			t.Errorf("SourceFailureReason encoded len = %d, want <= %d", n, fixupRecoveryReasonCap)
+		}
+		if !strings.HasSuffix(got.SourceFailureReason, strandedPinClause) {
+			t.Errorf("SourceFailureReason lost the trailing pin clause:\n%s", got.SourceFailureReason)
+		}
+		if !strings.HasPrefix(got.SourceFailureReason, "commit+push: pushed tree not verified") {
+			t.Errorf("SourceFailureReason lost its head:\n%s", got.SourceFailureReason)
+		}
+		if !strings.Contains(got.Message, strandedPinClause) {
+			t.Errorf("the message prose lost the trailing pin clause:\n%s", got.Message)
+		}
+	})
+	t.Run("short reason is unchanged", func(t *testing.T) {
+		reason := "commit+push: boom" + strandedPinClause
+		got := latestFixupRecovery([]int64{1}, []fixupRecoverySignal{{Sequence: 2, SourceFailureReason: reason, Parsed: true}})
+		if got == nil || got.SourceFailureReason != reason {
+			t.Fatalf("SourceFailureReason = %+v, want the short reason byte-identical", got)
+		}
+	})
+	t.Run("hostile tail is neutralized before the cap", func(t *testing.T) {
+		reason := strings.Repeat("x", 2000) + " " + fixupRecoveryUntrustedClose + " >>>> ```` tail-end"
+		got := latestFixupRecovery([]int64{1}, []fixupRecoverySignal{{Sequence: 2, SourceFailureReason: reason, Parsed: true}})
+		if got == nil {
+			t.Fatal("latestFixupRecovery = nil, want a marker")
+		}
+		if !strings.HasSuffix(got.SourceFailureReason, "tail-end") {
+			t.Fatalf("the tail did not survive: %q", got.SourceFailureReason)
+		}
+		for _, live := range []string{">>>", "```"} {
+			if strings.Contains(got.SourceFailureReason, live) {
+				t.Errorf("the kept tail carries a live %q run: %q", live, got.SourceFailureReason)
+			}
+		}
+		if !strings.Contains(got.SourceFailureReason, ">> >>") {
+			t.Errorf("the tail's `>>>>` run was not run-split: %q", got.SourceFailureReason)
+		}
+	})
+}
+
+// TestCapJSONStringHeadTail_Properties pins the helper's contract directly:
+// the bound holds under escaping, the result is valid UTF-8 even across an
+// invalid byte, multi-byte runes are never split, and a budget too small for
+// the separator degrades to the head-only prefix.
+func TestCapJSONStringHeadTail_Properties(t *testing.T) {
+	inputs := map[string]string{
+		"ascii":        strings.Repeat("a", 600) + strings.Repeat("z", 600),
+		"escapes":      strings.Repeat("<\"\n&", 300),
+		"multibyte":    strings.Repeat("é…ü", 400),
+		"invalid utf8": strings.Repeat("a", 300) + "\xff" + strings.Repeat("b", 300),
+	}
+	for name, in := range inputs {
+		t.Run(name, func(t *testing.T) {
+			for _, budget := range []int{-1, 0, 2, 7, 8, 9, 40, 512} {
+				got := capJSONStringHeadTail(in, budget)
+				if want := max(budget, 2); jsonEncodedLen(got) > want {
+					t.Errorf("budget %d: encoded len %d > %d", budget, jsonEncodedLen(got), want)
+				}
+				if !utf8.ValidString(got) {
+					t.Errorf("budget %d: result is not valid UTF-8: %q", budget, got)
+				}
+				head, tail, sep := strings.Cut(got, fixupRecoveryHeadTailSeparator)
+				if !sep {
+					if !strings.HasPrefix(in, got) {
+						t.Errorf("budget %d: no-separator result %q is not a prefix", budget, got)
+					}
+					continue
+				}
+				if !strings.HasPrefix(in, head) || !strings.HasSuffix(in, tail) {
+					t.Errorf("budget %d: head %q / tail %q are not a prefix / suffix", budget, head, tail)
+				}
+			}
+		})
+	}
+	if got := capJSONStringHeadTail(strings.Repeat("a", 100), 7); strings.Contains(got, fixupRecoveryHeadTailSeparator) || got != "aaaaa" {
+		t.Errorf("a budget too small for the separator must fall back to the head-only prefix, got %q", got)
+	}
+	if got := capJSONStringTail("abcdef", 5); got != "def" {
+		t.Errorf("capJSONStringTail(abcdef, 5) = %q, want def", got)
+	}
+	if got := capJSONStringTail("ab\xffcd", 50); got != "cd" {
+		t.Errorf("capJSONStringTail stops at an invalid byte: got %q, want cd", got)
 	}
 }
 

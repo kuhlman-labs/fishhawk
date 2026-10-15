@@ -1599,7 +1599,12 @@ func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope
 		// merge_commit_sha names the commit the merge produced.
 		MergedAt       *time.Time `json:"merged_at"`
 		MergeCommitSHA string     `json:"merge_commit_sha"`
-		Head           struct {
+		// MergedBy is a pointer: GitHub returns `merged_by` as JSON null on an
+		// unmerged pull request (#4132).
+		MergedBy *struct {
+			Login string `json:"login"`
+		} `json:"merged_by"`
+		Head struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
@@ -1613,6 +1618,10 @@ func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope
 	if body.NodeID == "" {
 		return nil, fmt.Errorf("githubclient: pr response missing node_id")
 	}
+	mergedBy := ""
+	if body.MergedBy != nil {
+		mergedBy = body.MergedBy.Login
+	}
 	return &PullRequest{
 		NodeID:         body.NodeID,
 		HeadSHA:        body.Head.SHA,
@@ -1625,6 +1634,7 @@ func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope
 		MergeableState: body.MergeableState,
 		MergedAt:       body.MergedAt,
 		MergeCommitSHA: body.MergeCommitSHA,
+		MergedBy:       mergedBy,
 	}, nil
 }
 

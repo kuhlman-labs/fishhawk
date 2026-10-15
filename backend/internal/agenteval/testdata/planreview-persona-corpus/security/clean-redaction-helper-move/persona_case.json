@@ -1,0 +1,82 @@
+{
+  "persona": "security",
+  "kind": "clean_sensitive",
+  "expect": "clean",
+  "issue_title": "Move the trace bearer-scrubbing into a named helper",
+  "issue_body": "The trace writer scrubs bearer values from each captured line with an inline regexp replace. A second writer (the stage log tail) needs the same scrubbing next. Move it into one named helper in its own file with no behaviour change, and give it a direct test.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94110",
+      "id": "kuhlman-labs/fishhawk#94110"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Move the trace writer's inline bearer scrubbing into scrubBearer in a new file, unchanged, with a direct unit test.",
+    "scope": {
+      "files": [
+        {
+          "path": "runner/cmd/fishhawk-runner/tracewriter.go",
+          "operation": "modify"
+        },
+        {
+          "path": "runner/cmd/fishhawk-runner/scrub.go",
+          "operation": "create"
+        },
+        {
+          "path": "runner/cmd/fishhawk-runner/scrub_test.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Create scrub.go holding bearerRe (the same expression, moved) and scrubBearer(line string) string returning bearerRe.ReplaceAllString(line, \"Bearer [scrubbed]\")."
+      },
+      {
+        "step": 2,
+        "description": "In tracewriter.go, delete the package-level expression and the regexp import it alone used, and replace the inline ReplaceAllString with scrubBearer(line)."
+      },
+      {
+        "step": 3,
+        "description": "Add scrub_test.go with table rows for a header line, a lower-case bearer, a line with no bearer value and a line with two, splicing a placeholder value in so no row is a credential-shaped literal."
+      }
+    ],
+    "verification": {
+      "test_strategy": "The new scrub_test.go table plus the existing trace writer tests, which already assert a scrubbed header line.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-helper",
+          "statement": "Bearer scrubbing lives in one named helper the trace writer calls.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94110"
+        },
+        {
+          "id": "ac-unchanged",
+          "statement": "The trace writer's scrubbed output is byte-identical to before.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94110"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/runner/cmd/fishhawk-runner/tracewriter.go b/runner/cmd/fishhawk-runner/tracewriter.go\nindex 3c7a9e2..e1b5d40 100644\n--- a/runner/cmd/fishhawk-runner/tracewriter.go\n+++ b/runner/cmd/fishhawk-runner/tracewriter.go\n@@ -3,13 +3,8 @@ package main\n import (\n \t\"io\"\n-\t\"regexp\"\n \t\"sync\"\n )\n \n-// bearerRe matches an HTTP bearer value so a captured line never carries\n-// one into the trace.\n-var bearerRe = regexp.MustCompile(`(?i)bearer\\s+[A-Za-z0-9._~+/=-]+`)\n-\n type traceWriter struct {\n \tmu  sync.Mutex\n \tout io.Writer\n@@ -41,5 +36,5 @@ func (w *traceWriter) writeLine(line string) error {\n \tw.mu.Lock()\n \tdefer w.mu.Unlock()\n-\t_, err := io.WriteString(w.out, bearerRe.ReplaceAllString(line, \"Bearer [scrubbed]\")+\"\\n\")\n+\t_, err := io.WriteString(w.out, scrubBearer(line)+\"\\n\")\n \treturn err\n }\ndiff --git a/runner/cmd/fishhawk-runner/scrub.go b/runner/cmd/fishhawk-runner/scrub.go\nnew file mode 100644\nindex 0000000..7f3e2a1\n--- /dev/null\n+++ b/runner/cmd/fishhawk-runner/scrub.go\n@@ -0,0 +1,12 @@\n+package main\n+\n+import \"regexp\"\n+\n+// bearerRe matches an HTTP bearer value so a captured line never carries\n+// one into the trace.\n+var bearerRe = regexp.MustCompile(`(?i)bearer\\s+[A-Za-z0-9._~+/=-]+`)\n+\n+// scrubBearer replaces every bearer value in line with a fixed placeholder.\n+func scrubBearer(line string) string {\n+\treturn bearerRe.ReplaceAllString(line, \"Bearer [scrubbed]\")\n+}\ndiff --git a/runner/cmd/fishhawk-runner/scrub_test.go b/runner/cmd/fishhawk-runner/scrub_test.go\nnew file mode 100644\nindex 0000000..0b8d6c4\n--- /dev/null\n+++ b/runner/cmd/fishhawk-runner/scrub_test.go\n@@ -0,0 +1,19 @@\n+package main\n+\n+import \"testing\"\n+\n+func TestScrubBearer(t *testing.T) {\n+\t// fake is spliced in so no row is a credential-shaped literal.\n+\tconst fake = \"PLACEHOLDER\"\n+\ttests := []struct{ in, want string }{\n+\t\t{\"Authorization: Bearer \" + fake, \"Authorization: Bearer [scrubbed]\"},\n+\t\t{\"authorization: bearer \" + fake, \"authorization: Bearer [scrubbed]\"},\n+\t\t{\"no value here\", \"no value here\"},\n+\t\t{\"Bearer a then Bearer b\", \"Bearer [scrubbed] then Bearer [scrubbed]\"},\n+\t}\n+\tfor _, tc := range tests {\n+\t\tif got := scrubBearer(tc.in); got != tc.want {\n+\t\t\tt.Errorf(\"scrubBearer(%q) = %q, want %q\", tc.in, got, tc.want)\n+\t\t}\n+\t}\n+}\n",
+  "defect_phrases": [
+    "scrubBearer"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "scrub.go: moving bearerRe could let a credential reach the trace unscrubbed."
+    }
+  ]
+}

@@ -2,6 +2,8 @@ package run
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1422,6 +1424,74 @@ func rowToStage(s rundb.Stage) *Stage {
 		}
 	}
 	return out
+}
+
+// Compile-time assertion that the concrete postgres repo carries the
+// ConsolidatedPROpenLocker capability (#4110). serve.go wires
+// run.NewPostgresRepository bare and the orchestrator probes the capability by
+// type assertion, so removing or renaming WithConsolidatedPROpenLock must fail
+// the BUILD rather than silently dropping the cross-process half of the
+// once-only consolidated-PR open.
+var _ ConsolidatedPROpenLocker = (*postgresRepo)(nil)
+
+// consolidatedPROpenLockDomain domain-separates the consolidated-PR-open
+// advisory-lock key space from every other advisory key in the backend
+// (refinement filing, captain, audit chain, concurrency).
+const consolidatedPROpenLockDomain = "fishhawk:consolidated-pr-open:"
+
+// consolidatedPROpenLockKey derives the advisory-lock key serializing one
+// decomposed parent's consolidated-PR open: the first 8 bytes, big-endian, of
+// a sha256 over consolidatedPROpenLockDomain and the run UUID bytes (the
+// captainLockKey shape). A residual 1-in-2^64 collision only serializes two
+// unrelated opens.
+func consolidatedPROpenLockKey(runID uuid.UUID) int64 {
+	h := sha256.New()
+	h.Write([]byte(consolidatedPROpenLockDomain))
+	h.Write(runID[:])
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
+}
+
+// WithConsolidatedPROpenLock implements ConsolidatedPROpenLocker (#4110): it
+// takes a SESSION-level advisory lock keyed on consolidatedPROpenLockKey on a
+// dedicated pooled connection, runs fn, then unlocks and releases the
+// connection (the refinement WithFilingLock precedent). Session-level rather
+// than xact-level so fn's own repository writes commit independently on other
+// pool connections while the lock is held.
+//
+// LOCK ORDER: the orchestrator takes its in-process per-parent mutex FIRST and
+// this advisory lock SECOND; every caller must keep that order. Residual: a
+// goroutine waiting on that sync.Mutex cannot observe ctx cancellation (the
+// accepted #1936 posture); the wait here can, because pgx cancels the
+// pg_advisory_lock query when ctx ends.
+//
+// A session lock outlives a failed statement, so the connection is never
+// returned to the pool in doubt: when the lock query errors (ctx cancelled
+// while waiting, or a database error) the underlying connection is CLOSED
+// before Release, so a lock the server granted concurrently with the
+// client-side cancel dies with the session; and when the unlock errors the
+// connection is closed the same way. fn never runs unless the lock was
+// acquired.
+func (r *postgresRepo) WithConsolidatedPROpenLock(ctx context.Context, parentRunID uuid.UUID, fn func(context.Context) error) error {
+	conn, err := r.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection for consolidated PR open lock: %w", err)
+	}
+	defer conn.Release()
+	key := consolidatedPROpenLockKey(parentRunID)
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
+		_ = conn.Conn().Close(context.Background())
+		return fmt.Errorf("acquire consolidated PR open lock: %w", err)
+	}
+	// Unlock on a background context so a cancelled ctx still unlocks. It runs
+	// before conn.Release() (defer LIFO); an unlock failure closes the
+	// connection so a lock-holding session is never returned to the pool.
+	defer func() {
+		if _, uerr := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key); uerr != nil {
+			_ = conn.Conn().Close(context.Background())
+		}
+	}()
+	return fn(ctx)
 }
 
 // Compile-time check that postgresRepo implements Repository.

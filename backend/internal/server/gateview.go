@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 // gateViewResponse is GET /v0/runs/{run_id}/gate-view (#1960): the
@@ -162,7 +163,32 @@ type gateViewResponse struct {
 	// records a merge_candidate_verdict history_gaps entry instead. Computed
 	// only by handleGetRunGateView. See gateViewMergeCandidateVerdictFor.
 	MergeCandidateVerdict *gateViewMergeCandidateVerdict `json:"merge_candidate_verdict,omitempty"`
+	// SpecialistJobs lists the run's COMPLETED specialist jobs (E85.15 /
+	// #4363) in completed_sequence order, each with its provenance and
+	// blocking_eligible (specialistjob.BlockingEligible). DISPLAY-ONLY: it
+	// feeds no gate, merge or advance decision. Enum and id members only, so
+	// no job-authored text reaches a caller — a run-bound mcp:run: caller
+	// included. Computed only by handleGetRunGateView (never buildGateView,
+	// which the attention scan calls per run), from the run row's account.
+	// Omitted (nil) when the specialist-job store is not wired or the run has
+	// no completed job; omitted with a specialist_jobs history_gaps entry when
+	// the run's account id is unparseable or the read fails.
+	SpecialistJobs []gateViewSpecialistJob `json:"specialist_jobs,omitempty"`
 }
+
+// gateViewSpecialistJob is one completed specialist job in the gate view's
+// display-only specialist_jobs block (E85.15 / #4363).
+type gateViewSpecialistJob struct {
+	JobID             string `json:"job_id"`
+	Kind              string `json:"kind"`
+	Verdict           string `json:"verdict"`
+	Provenance        string `json:"provenance"`
+	BlockingEligible  bool   `json:"blocking_eligible"`
+	CompletedSequence int64  `json:"completed_sequence"`
+}
+
+// gateViewGapSpecialistJobs names a failed specialist_jobs read (#4363).
+const gateViewGapSpecialistJobs = "specialist_jobs"
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
 // Blockers carries each determined refusal the merge endpoint would return
@@ -930,7 +956,53 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
 	resp.MergeCandidateQueue = s.gateViewMergeCandidateQueueFor(r.Context(), runID, &resp)
 	resp.MergeCandidateVerdict = s.gateViewMergeCandidateVerdictFor(r.Context(), runRow, &resp)
+	// HERE and not in buildGateView (approval condition C2, #4363): the
+	// attention scan must not pay the extra read.
+	resp.SpecialistJobs = s.gateViewSpecialistJobsFor(r.Context(), runRow, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// gateViewSpecialistJobsFor builds the display-only specialist_jobs block
+// (E85.15 / #4363) from the run row's account:
+//
+//   - store not wired -> nil, no gap, no read;
+//   - the run's account id is not a UUID -> nil plus a specialist_jobs gap,
+//     never a read of the untenanted partition;
+//   - the read fails -> nil plus a specialist_jobs gap, never a failed request.
+func (s *Server) gateViewSpecialistJobsFor(ctx context.Context, ru *run.Run, resp *gateViewResponse) []gateViewSpecialistJob {
+	if ru == nil || s.cfg.SpecialistJobs == nil {
+		return nil
+	}
+	gap := func(msg string, err error) []gateViewSpecialistJob {
+		s.cfg.Logger.Warn(msg, "run_id", ru.ID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapSpecialistJobs)
+		return nil
+	}
+	var acct *uuid.UUID
+	if ru.AccountID != "" {
+		u, err := uuid.Parse(ru.AccountID)
+		if err != nil {
+			return gap("gate-view: run account id is not a UUID; omitting specialist_jobs", err)
+		}
+		acct = &u
+	}
+	jobs, err := s.cfg.SpecialistJobs.ListCompletedForRun(ctx, acct, ru.ID)
+	if err != nil {
+		return gap("gate-view: list completed specialist jobs failed; omitting specialist_jobs", err)
+	}
+	var out []gateViewSpecialistJob
+	for _, j := range jobs {
+		item := gateViewSpecialistJob{
+			JobID: j.ID.String(), Kind: string(j.Kind), Verdict: string(j.Verdict),
+			Provenance: j.Provenance, BlockingEligible: specialistjob.BlockingEligible(j.Provenance),
+		}
+		if j.CompletedSequence != nil {
+			item.CompletedSequence = *j.CompletedSequence
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // gateViewCrewMessagesFor builds the crew block (E77.7 / #3741) with the

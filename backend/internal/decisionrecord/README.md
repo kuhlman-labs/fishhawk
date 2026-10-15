@@ -17,7 +17,7 @@ dependency.
 | Function | Does |
 |---|---|
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
-| `Select(index, changePaths)` | The records whose `applies_to` matches a change path, ranked. |
+| `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede them (transitively), ranked. |
 | `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, and fit the index plus whole records into the cap. Returns a `*Selection`. |
 | `Selection.PromptDocuments(grounded)` | The index, then each included record, as `prompt.InjectedDocument`s. |
 | `Selection.Attribution()` | The `repodoc.InjectionSet` for the selection: its documents plus, when anything was dropped, one selection-level truncation. A caller injecting other documents in the same prompt (the persona remit) merges this into ONE `repodoc.AttributeSet` call. |
@@ -33,7 +33,10 @@ malformed JSON; trailing data after the object; an unknown field at any level
 `status` outside `proposed | accepted | rejected | superseded | unknown`; a
 `supersedes` / `superseded_by` entry not matching the id pattern; an
 `applies_to` glob `spec.Predicate.Validate` refuses; a duplicate id; a duplicate
-path. `TestParseIndex_AcceptsTheShippedIndex` parses `docs/adr/index.json` so the
+path; a `supersedes` / `superseded_by` id that names no record in the index, or
+that names the record itself (`checkLinks`, after the per-record pass — the
+`docs/adr/README.md` "Every id must name an existing record other than itself"
+contract `scripts/check-adr` enforces). `TestParseIndex_AcceptsTheShippedIndex` parses `docs/adr/index.json` so the
 parser cannot drift stricter than the index `scripts/check-adr` generates.
 
 ## Selection and ranking (`Select`)
@@ -44,10 +47,29 @@ other record is matched with `spec.Predicate{Paths: applies_to}` — the shared
 doublestar matcher — against each DISTINCT change path; a `Match` error fails
 the whole selection (`ErrInvalidIndex`), never reads as a non-match.
 
-Ranking is deterministic: **accepted first**; then **more distinct change paths
-matched**; then the **higher record number** (newer) first, compared as a
-digit string so a long number cannot overflow; then **id ascending**. Rank is
-1-based.
+**Successor following (E86.58 / #4398).** Every directly matched record pulls
+in its successors, transitively, so a reviewer shown a superseded record is also
+shown what replaced it. A successor is any id in the record's `superseded_by`,
+or any record whose `supersedes` names it — the union, so a non-reciprocal
+hand-built index is still followed. Each walk is seeded from ONE direct match
+with its own visited set, so a cycle terminates; a record reached twice (a
+diamond) is selected once. Records not reachable from a direct match are never
+selected, and predecessors are never followed. A `superseded_by` id naming no
+record fails the whole selection (`ErrInvalidIndex`) — a hand-built index can
+reach `Select` without `ParseIndex`. Each `Match` carries:
+
+- `MatchedPaths` — distinct change paths the record's OWN `applies_to` matched
+  (0 for a record selected only as a successor);
+- `RankPaths` — the ranking key: the larger of `MatchedPaths` and every selected
+  predecessor's `RankPaths`, so a successor ranks next to the record it
+  replaces (and, being newer, ahead of it);
+- `Via` — the ids of the selected records it supersedes, sorted; empty for a
+  record no selected record links to.
+
+Ranking is deterministic: **accepted first**; then **higher `RankPaths`**; then
+the **higher record number** (newer) first, compared as a digit string so a
+long number cannot overflow; then **id ascending**. Rank is 1-based.
+`RankPaths` equals `MatchedPaths` for a record with no selected predecessor.
 
 The change paths are the caller's: plan scope at plan review; approved plan
 scope union diff at implement review.
@@ -106,24 +128,30 @@ All framing is system-authored. Every interpolated value is a count, an id
 `repodoc.SanitizeMetadata`, so repo-chosen text cannot start a line.
 
 - **Index** — heading `Decision record index`; the preamble states M of N
-  records matched, which ids are shown in full and in what order, that every
+  records matched (and, when any successor was followed, how many more were
+  selected because they supersede a selected record — with nothing followed
+  the preamble is byte-identical to the pre-#4398 text), which ids are shown
+  in full and in what order, that every
   other record is NOT shown — readable from the review tree when the reviewer is
   grounded (with the warning that the tree is the change's HEAD, not the
   admission commit, so a record the change edits reads there as edited), not
-  readable at all when ungrounded — and the dropped list when anything was cut.
+  readable at all when ungrounded — and the dropped list when anything was cut
+  (a dropped successor's line adds `successor of <Via ids>`).
 - **Record** — heading `Decision record <id> — status: <status>`; the preamble
   states the status's meaning: `accepted` = settled; `unknown` = acceptance
   never confirmed, NOT a settled decision; `proposed` = not decided;
   `superseded` = no longer governing (names `superseded_by`); `rejected` =
   decided against. A status outside the closed set renders as `unknown`, never
-  as accepted.
+  as accepted. A record with a non-empty `Via` adds a sentence that it was
+  `selected because it supersedes <Via ids>` (and, when `MatchedPaths` is 0,
+  that its own `applies_to` matches no path the change touches).
 
 ## Errors
 
 | Sentinel | When | Persona degrade detail (server) |
 |---|---|---|
 | `ErrIndexMissing` | the index path is absent at the commit (also wraps `repodoc.ErrMissingDocument`) | `decision_record_index_missing` |
-| `ErrInvalidIndex` | strict parse refusal, or a `Select` match error | `decision_record_invalid` |
+| `ErrInvalidIndex` | strict parse refusal, or a `Select` match error or dangling successor link | `decision_record_invalid` |
 | `ErrUnresolvable` | a listed record absent at the commit, any fetch / pinning error, no resolver, or a cap smaller than the truncation marker | `decision_record_unresolvable` |
 
 Any failure fails the WHOLE assembly: no partial `Selection` is returned.
@@ -135,6 +163,12 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | each strict-parse rung | `ErrInvalidIndex` naming the record | `TestParseIndex_FailsClosed` |
 | empty `applies_to` | never matches; never reaches `Predicate.Match` | `TestSelect_MatchesOnlyGovernedRecords` |
 | `Predicate.Match` error | whole selection fails | `TestSelect_MatchErrorFailsWholeSelection` |
+| dangling `supersedes` / `superseded_by` id | `ErrInvalidIndex` naming the record | `TestParseIndex_FailsClosed` (dangling cases) |
+| self `supersedes` / `superseded_by` id | `ErrInvalidIndex` naming the record | `TestParseIndex_FailsClosed` (self cases) |
+| hand-built index with a dangling `superseded_by` reached by the walk | whole selection fails | `TestSelect_DanglingLinkFailsWholeSelection` |
+| supersession cycle | walk terminates, each record once | `TestSelect_SupersessionCycleTerminates` |
+| diamond (two selected predecessors, one successor) | successor selected once, `Via` holds both | `TestSelect_FollowsSupersessionToSuccessors` |
+| successor of an unselected record | not selected | `TestSelect_FollowsSupersessionToSuccessors` |
 | matches exceed the budget | strict prefix included, rest dropped and named | `TestAssemble_FitsTheCap`, `TestAssemble_StrictPrefix` |
 | record larger than the remaining budget / the cap | dropped whole, never truncated | `TestAssemble_OversizedRecordDroppedNeverTruncated` |
 | raw index over the cap | index shown truncated within the cap; every match dropped | `TestAssemble_IndexOverCap` |
@@ -146,17 +180,23 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 
 ## Residuals
 
-- **Index size.** `docs/adr/index.json` is ~17 KB for 55 records (measured
-  2026-10-02), so roughly half the 32 KiB budget goes to the index before any
-  record. Past ~110 records the index alone exceeds the cap: it is shown
-  truncated (loudly) and no record fits. A compact index rendering is out of
-  scope here.
+- **Index size.** `docs/adr/index.json` is 31,341 bytes for 93 records
+  (measured 2026-10-15), so nearly all of the 32 KiB budget goes to the index
+  before any record. At roughly 97 records the index alone exceeds the cap: it
+  is shown truncated (loudly) and no record fits. A compact index rendering or
+  a separate record budget is #4399's scope, not this package's today.
 - **Grounding reads the head.** Records not injected are reachable only through
   read-only grounding, which reads the REVIEW TREE (the change's head), not the
   admission commit; injection is base-pinned, grounding is not. The index
   preamble says so.
-- **`applies_to` is sparse.** 11 of 55 records declare a glob today, so most changes
-  select few or no records; the index is injected regardless.
+- **`applies_to` is sparse.** 16 of 93 records declare a glob (counted from
+  `docs/adr/index.json`, 2026-10-15), so most changes select few or no records;
+  the index is injected regardless.
+- **Successor following changes no current selection.** No superseded record in
+  the shipped index declares `applies_to`, so no successor is reached from
+  today's index; following takes effect as records gain globs. Even then the
+  ~31 KB index leaves little of the 32 KiB cap for any body, so the budget
+  split in #4399 still decides what is shown.
 - **The shrink step bound is defense-in-depth.** The cap strictly decreases to
   the zero-cap guard, so the step bound is unreachable on any fixture;
   removing it was run and stays green.

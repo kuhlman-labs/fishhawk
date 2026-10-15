@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -668,6 +671,9 @@ func (sjFailingStore) AdmitJob(context.Context, specialistjob.AdmitParams) (*spe
 func (sjFailingStore) Complete(context.Context, specialistjob.CompleteParams) (*specialistjob.Job, error) {
 	return nil, errSJStore
 }
+func (sjFailingStore) ListCompletedForRun(context.Context, *uuid.UUID, uuid.UUID) ([]*specialistjob.Job, error) {
+	return nil, errSJStore
+}
 
 func TestSpecialistJob_StoreErrorIs500(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0", SpecialistJobs: sjFailingStore{}})
@@ -792,5 +798,401 @@ func TestSpecialistJobRequest_DraftRenderTooLarge400(t *testing.T) {
 	}
 	if n := f.jobCount(); n != 0 {
 		t.Fatalf("an over-bound draft created %d jobs", n)
+	}
+}
+
+// --- E85.15 / #4363: runner-attested result provenance ---
+
+// sjAttesterID is a runner credential: an explicit API token holding only the
+// dedicated attest scope.
+var sjAttesterID = Identity{Subject: "specialist-runner/sj-test-host", TokenID: "tok-runner", Scopes: []string{specialistjob.AttestScope}}
+
+// sjBearerID is a plain write:stages bearer (no attest scope).
+var sjBearerID = Identity{Subject: "github:bearer", TokenID: "tok-bearer", Scopes: []string{"write:stages", "read:runs"}}
+
+// sjCookieID is a cookie session: no TokenID and no scope list.
+var sjCookieID = Identity{Subject: "github:cookie-operator", SessionID: "sess-1"}
+
+// sjSigned decorates a request with id and, when sig is non-empty, the
+// result signature header.
+func sjSigned(id Identity, sig string) func(*http.Request) *http.Request {
+	return func(r *http.Request) *http.Request {
+		if sig != "" {
+			r.Header.Set(specialistjob.ResultSignatureHeader, sig)
+		}
+		return sjIdentity(id)(r)
+	}
+}
+
+func (f *sjPG) resultAs(jobID, body string, decorate func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	f.t.Helper()
+	return sjCall(f.t, f.srv.handleSpecialistJobResult, http.MethodPost, "/v0/specialist-jobs/"+jobID+"/result", jobID, body, decorate)
+}
+
+// attestedAdmission admits job as sjAttesterID under nonce and returns the
+// delivered private key, failing unless a 64-byte key was delivered.
+func (f *sjPG) attestedAdmission(jobID, nonce string) ed25519.PrivateKey {
+	f.t.Helper()
+	adm := decodeSJ[specialistJobAdmissionResponse](f.t, f.admit(jobID, nonce, sjIdentity(sjAttesterID)), http.StatusOK)
+	if !adm.Admitted || adm.AttestationKey == "" || adm.AttestationExpiresAt == nil {
+		f.t.Fatalf("attester admission delivered no key: %+v", adm)
+	}
+	raw, err := base64.StdEncoding.DecodeString(adm.AttestationKey)
+	if err != nil || len(raw) != ed25519.PrivateKeySize {
+		f.t.Fatalf("attestation_key = %q (decode err %v, %d bytes), want a base64 64-byte key", adm.AttestationKey, err, len(raw))
+	}
+	return ed25519.PrivateKey(raw)
+}
+
+func sjSign(t *testing.T, key ed25519.PrivateKey, jobID, body string) string {
+	t.Helper()
+	return hex.EncodeToString(ed25519.Sign(key, specialistjob.ResultMessage(uuid.MustParse(jobID), []byte(body))))
+}
+
+// requireAttestationRefusal asserts 401 specialist_job_attestation_invalid
+// with the given details.reason.
+func requireAttestationRefusal(t *testing.T, w *httptest.ResponseRecorder, reason string) {
+	t.Helper()
+	requireCrewRefusal(t, w, http.StatusUnauthorized, "specialist_job_attestation_invalid")
+	var body struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode refusal: %v", err)
+	}
+	if got := body.Error.Details["reason"]; got != reason {
+		t.Fatalf("details.reason = %v, want %q; body = %s", got, reason, w.Body.String())
+	}
+}
+
+// requireStillRunning reads the job back and requires it running with no
+// result and no provenance: a refused result wrote nothing.
+func (f *sjPG) requireStillRunning(jobID string) {
+	f.t.Helper()
+	got := decodeSJ[specialistJobResponse](f.t, f.get(jobID, sjOperator), http.StatusOK)
+	if got.State != "running" || len(got.Result) != 0 || got.Provenance != "" || got.BlockingEligible || got.CompletedSequence != nil {
+		f.t.Fatalf("a refused result changed the job: %+v", got)
+	}
+}
+
+func (f *sjPG) completedPayloads(runID uuid.UUID) []sjEntry {
+	f.t.Helper()
+	var out []sjEntry
+	for _, e := range f.runEntries(runID) {
+		if e.category == specialistjob.CategoryCompleted {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestSpecialistJobResult_RunnerAttestedEndToEnd is the cross-boundary test:
+// HTTP admission under an attester identity -> the delivered key signs
+// ResultMessage over the golden completion bytes -> the signed result under
+// the same identity -> GET and the run chain's specialist_job_completed
+// payload carry runner_attested + blocking_eligible, the key is consumed, and
+// the run and its stages are untouched.
+func TestSpecialistJobResult_RunnerAttestedEndToEnd(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	before := f.runSnapshot(runID)
+	key := f.attestedAdmission(job.JobID, nonce)
+	body := string(completions["inventory"])
+
+	done := decodeSJ[specialistJobResponse](t, f.resultAs(job.JobID, body, sjSigned(sjAttesterID, sjSign(t, key, job.JobID, body))), http.StatusOK)
+	if done.State != "completed" || done.Provenance != specialistjob.ProvenanceRunnerAttested || !done.BlockingEligible {
+		t.Fatalf("result answer = %s/%q/%v, want completed/runner_attested/true", done.State, done.Provenance, done.BlockingEligible)
+	}
+	got := decodeSJ[specialistJobResponse](t, f.get(job.JobID, sjIdentity(sjAttesterID)), http.StatusOK)
+	if got.Provenance != specialistjob.ProvenanceRunnerAttested || !got.BlockingEligible {
+		t.Fatalf("GET provenance/blocking_eligible = %q/%v", got.Provenance, got.BlockingEligible)
+	}
+	entries := f.completedPayloads(runID)
+	if len(entries) != 1 {
+		t.Fatalf("completed entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.payload["provenance"] != specialistjob.ProvenanceRunnerAttested || e.payload["blocking_eligible"] != true ||
+		e.payload["attested_by"] != sjAttesterID.Subject {
+		t.Fatalf("completed payload = %+v", e.payload)
+	}
+	if e.actorKind != string(audit.ActorSystem) || e.actorSubject != sjAttesterID.Subject {
+		t.Fatalf("completed actor = %s/%s, want system/%s", e.actorKind, e.actorSubject, sjAttesterID.Subject)
+	}
+	var keyNull bool
+	if err := f.pool.QueryRow(context.Background(), `SELECT attestation_public_key IS NULL FROM specialist_jobs WHERE id = $1`, job.JobID).Scan(&keyNull); err != nil {
+		t.Fatalf("read key column: %v", err)
+	}
+	if !keyNull {
+		t.Fatal("an attested completion left the attestation key in place, want it consumed")
+	}
+	if after := f.runSnapshot(runID); !reflect.DeepEqual(before, after) {
+		t.Fatalf("run/stage state changed: %v -> %v", before, after)
+	}
+}
+
+// A plain write:stages bearer's result records provenance bearer and is never
+// blocking-eligible, on the result answer, the read and the audit payload.
+func TestSpecialistJobResult_BearerProvenanceNeverBlockingEligible(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	decodeSJ[specialistJobAdmissionResponse](t, f.admit(job.JobID, nonce, sjIdentity(sjBearerID)), http.StatusOK)
+	done := decodeSJ[specialistJobResponse](t, f.resultAs(job.JobID, string(completions["inventory"]), sjIdentity(sjBearerID)), http.StatusOK)
+	got := decodeSJ[specialistJobResponse](t, f.get(job.JobID, sjIdentity(sjBearerID)), http.StatusOK)
+	for name, j := range map[string]specialistJobResponse{"result": done, "get": got} {
+		if j.Provenance != specialistjob.ProvenanceBearer || j.BlockingEligible {
+			t.Fatalf("%s provenance/blocking_eligible = %q/%v, want bearer/false", name, j.Provenance, j.BlockingEligible)
+		}
+	}
+	entries := f.completedPayloads(runID)
+	if len(entries) != 1 || entries[0].payload["provenance"] != specialistjob.ProvenanceBearer ||
+		entries[0].payload["blocking_eligible"] != false {
+		t.Fatalf("completed payload = %+v", entries)
+	}
+	if _, ok := entries[0].payload["attested_by"]; ok {
+		t.Fatalf("a bearer completion carries attested_by: %+v", entries[0].payload)
+	}
+	if entries[0].actorKind != "user" || entries[0].actorSubject != sjBearerID.Subject {
+		t.Fatalf("bearer completion actor = %s/%s, want user/%s", entries[0].actorKind, entries[0].actorSubject, sjBearerID.Subject)
+	}
+}
+
+// A token holding write:stages but NOT the attest scope is admitted with no
+// attestation key delivered and none stored.
+func TestSpecialistJobAdmission_PlainBearerGetsNoAttestationKey(t *testing.T) {
+	f := newSJPG(t)
+	job, _ := f.queuedJob(specialistjob.KindInventory)
+	plain := Identity{Subject: "github:plain", TokenID: "tok-plain", Scopes: []string{"write:stages"}}
+	w := f.admit(job.JobID, "nonce-plain", sjIdentity(plain))
+	adm := decodeSJ[specialistJobAdmissionResponse](t, w, http.StatusOK)
+	if !adm.Admitted {
+		t.Fatalf("plain bearer not admitted: %+v", adm)
+	}
+	if strings.Contains(w.Body.String(), "attestation_key") || strings.Contains(w.Body.String(), "attestation_expires_at") {
+		t.Fatalf("a plain write:stages bearer was delivered an attestation key: %s", w.Body.String())
+	}
+	var keyNull bool
+	if err := f.pool.QueryRow(context.Background(), `SELECT attestation_public_key IS NULL FROM specialist_jobs WHERE id = $1`, job.JobID).Scan(&keyNull); err != nil {
+		t.Fatalf("read key column: %v", err)
+	}
+	if !keyNull {
+		t.Fatal("a plain bearer admission stored an attestation key")
+	}
+}
+
+// Each row isolates one arm of attesterFor's guard.
+func TestAttesterFor_Table(t *testing.T) {
+	runSubject := "mcp:run:" + uuid.NewString()
+	cases := []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"token with the attest scope", Identity{Subject: "specialist-runner/h", TokenID: "t", Scopes: []string{specialistjob.AttestScope}}, "specialist-runner/h"},
+		{"cookie session carrying the attest scope", Identity{Subject: "github:cookie", SessionID: "s", Scopes: []string{specialistjob.AttestScope}}, ""},
+		{"run-bound token carrying the attest scope", Identity{Subject: runSubject, TokenID: "t", Scopes: []string{specialistjob.AttestScope}}, ""},
+		{"token without the attest scope", Identity{Subject: "github:op", TokenID: "t", Scopes: []string{"write:stages"}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := attesterFor(tc.id); got != tc.want {
+				t.Fatalf("attesterFor = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if a := specialistJobActor(cases[0].id); a.Kind != audit.ActorSystem || a.Subject != "specialist-runner/h" {
+		t.Fatalf("attester actor = %+v, want system", a)
+	}
+	if a := specialistJobActor(cases[3].id); a.Kind != audit.ActorUser {
+		t.Fatalf("non-attester actor = %+v, want user", a)
+	}
+}
+
+// A signature header from a caller that is not an attester is refused
+// caller_not_attester and nothing is written. The fixture admits with the
+// SAME plain bearer, so no key exists: without the handler branch the store
+// would refuse no_attestation_key instead, and with the header ignored the
+// result would land bearer.
+func TestSpecialistJobResult_SignatureFromNonAttesterRefused(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	decodeSJ[specialistJobAdmissionResponse](t, f.admit(job.JobID, nonce, sjIdentity(sjBearerID)), http.StatusOK)
+	sig := hex.EncodeToString(make([]byte, ed25519.SignatureSize))
+	requireAttestationRefusal(t, f.resultAs(job.JobID, string(completions["inventory"]), sjSigned(sjBearerID, sig)), specialistjob.ReasonCallerNotAttester)
+	f.requireStillRunning(job.JobID)
+	if n := len(f.completedPayloads(runID)); n != 0 {
+		t.Fatalf("a refused result appended %d completed entries", n)
+	}
+}
+
+// A signature over body A posted with body B is refused signature_invalid.
+func TestSpecialistJobResult_TamperedBodyRefused(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	key := f.attestedAdmission(job.JobID, nonce)
+	signed := string(completions["inventory"])
+	tampered := strings.Replace(signed, "1234", "9999", 1)
+	if tampered == signed {
+		t.Fatal("fixture: the tamper did not change the body")
+	}
+	requireAttestationRefusal(t, f.resultAs(job.JobID, tampered, sjSigned(sjAttesterID, sjSign(t, key, job.JobID, signed))), specialistjob.ReasonSignatureInvalid)
+	f.requireStillRunning(job.JobID)
+	if n := len(f.completedPayloads(runID)); n != 0 {
+		t.Fatalf("a refused result appended %d completed entries", n)
+	}
+}
+
+// The key's expiry is decided on the DB clock: a key seeded expired by SQL
+// refuses attestation_expired (the store's reason reaches details.reason).
+func TestSpecialistJobResult_ExpiredAttestationRefused(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, _ := f.queuedJob(specialistjob.KindInventory)
+	key := f.attestedAdmission(job.JobID, nonce)
+	f.exec(`UPDATE specialist_jobs SET attestation_expires_at = clock_timestamp() - interval '1 minute' WHERE id = $1`, job.JobID)
+	body := string(completions["inventory"])
+	requireAttestationRefusal(t, f.resultAs(job.JobID, body, sjSigned(sjAttesterID, sjSign(t, key, job.JobID, body))), specialistjob.ReasonAttestationExpired)
+	f.requireStillRunning(job.JobID)
+}
+
+// Replaying the identical signed POST after an attested completion is 409
+// specialist_job_not_running and changes nothing.
+func TestSpecialistJobResult_ReplayRefused(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, runID := f.queuedJob(specialistjob.KindInventory)
+	key := f.attestedAdmission(job.JobID, nonce)
+	body := string(completions["inventory"])
+	signed := sjSigned(sjAttesterID, sjSign(t, key, job.JobID, body))
+	first := decodeSJ[specialistJobResponse](t, f.resultAs(job.JobID, body, signed), http.StatusOK)
+	requireCrewRefusal(t, f.resultAs(job.JobID, body, signed), http.StatusConflict, "specialist_job_not_running")
+	got := decodeSJ[specialistJobResponse](t, f.get(job.JobID, sjOperator), http.StatusOK)
+	if got.Provenance != first.Provenance || got.CompletedSequence == nil || first.CompletedSequence == nil ||
+		*got.CompletedSequence != *first.CompletedSequence {
+		t.Fatalf("replay changed the job: first %+v, now %+v", first, got)
+	}
+	if n := len(f.completedPayloads(runID)); n != 1 {
+		t.Fatalf("completed entries = %d, want 1", n)
+	}
+}
+
+// A repeated, empty or non-hex signature header is refused
+// signature_malformed: repeated and non-hex by the handler, empty by the
+// store's length check. The "hex prefix then non-hex" row decodes 64 bytes
+// before the error, so only the handler's decode-error arm refuses it (the
+// store would answer signature_invalid).
+func TestSpecialistJobResult_MalformedSignatureHeader401(t *testing.T) {
+	f := newSJPG(t)
+	completions, nonce := sjGolden(t)
+	job, _ := f.queuedJob(specialistjob.KindInventory)
+	f.attestedAdmission(job.JobID, nonce)
+	good := hex.EncodeToString(make([]byte, ed25519.SignatureSize))
+	for name, headers := range map[string][]string{
+		"not hex":                 {"zz-not-hex"},
+		"hex prefix then non-hex": {good + "zz"},
+		"empty":                   {""},
+		"repeated":                {good, good},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := f.resultAs(job.JobID, string(completions["inventory"]), func(r *http.Request) *http.Request {
+				for _, h := range headers {
+					r.Header.Add(specialistjob.ResultSignatureHeader, h)
+				}
+				return sjIdentity(sjAttesterID)(r)
+			})
+			requireAttestationRefusal(t, w, specialistjob.ReasonSignatureMalformed)
+		})
+	}
+	f.requireStillRunning(job.JobID)
+}
+
+// An attest-only runner credential can never REQUEST a job.
+func TestSpecialistJobRequest_AttestScopeCannotRequest(t *testing.T) {
+	f := newSJPG(t)
+	body := sjRequestBody(t, specialistjob.KindDraft, map[string]any{"repo": "kuhlman-labs/fishhawk"})
+	w := sjCall(t, f.srv.handleRequestSpecialistJob, http.MethodPost, "/v0/specialist-jobs", "", body, sjIdentity(sjAttesterID))
+	requireCrewRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	if n := f.jobCount(); n != 0 {
+		t.Fatalf("an attest-only token created %d jobs", n)
+	}
+}
+
+func TestSpecialistJobGet_AttestScopeMayRead(t *testing.T) {
+	f := newSJPG(t)
+	job, _ := f.queuedJob(specialistjob.KindInventory)
+	got := decodeSJ[specialistJobResponse](t, f.get(job.JobID, sjIdentity(sjAttesterID)), http.StatusOK)
+	if got.JobID != job.JobID || got.Provenance != "" || got.BlockingEligible {
+		t.Fatalf("attest-scope GET = %+v", got)
+	}
+}
+
+// TestSpecialistJobRoutes_ScopeMatrix pins requireSpecialistJobScope on the
+// three runner routes (approval condition C1): the route scope OR the attest
+// scope passes, neither is 403, anonymous is 401, and a cookie session
+// (TokenID "") keeps requireWriteScope's bypass — its pre-change outcome
+// (GET 200, admission 200 with no key, result 200 bearer).
+func TestSpecialistJobRoutes_ScopeMatrix(t *testing.T) {
+	completions, nonce := sjGolden(t)
+	neither := Identity{Subject: "github:none", TokenID: "tok-none", Scopes: []string{"read:audit"}}
+	type route struct {
+		name  string
+		scope string
+		call  func(f *sjPG, jobID string, id func(*http.Request) *http.Request) *httptest.ResponseRecorder
+	}
+	routes := []route{
+		{"get", "read:runs", func(f *sjPG, jobID string, id func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+			return f.get(jobID, id)
+		}},
+		{"admission", "write:stages", func(f *sjPG, jobID string, id func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+			return f.admit(jobID, nonce, id)
+		}},
+		{"result", "write:stages", func(f *sjPG, jobID string, id func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+			decodeSJ[specialistJobAdmissionResponse](f.t, f.admit(jobID, nonce, sjOperator), http.StatusOK)
+			return f.resultAs(jobID, string(completions["inventory"]), id)
+		}},
+	}
+	for _, rt := range routes {
+		t.Run(rt.name+"/cookie session", func(t *testing.T) {
+			f := newSJPG(t)
+			job, _ := f.queuedJob(specialistjob.KindInventory)
+			w := rt.call(f, job.JobID, sjIdentity(sjCookieID))
+			if w.Code != http.StatusOK {
+				t.Fatalf("cookie session: status %d, want 200 (requireWriteScope's bypass); body %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "attestation_key") || strings.Contains(w.Body.String(), specialistjob.ProvenanceRunnerAttested) {
+				t.Fatalf("a cookie session obtained attestation: %s", w.Body.String())
+			}
+		})
+		t.Run(rt.name+"/route scope only", func(t *testing.T) {
+			f := newSJPG(t)
+			job, _ := f.queuedJob(specialistjob.KindInventory)
+			id := Identity{Subject: "github:route", TokenID: "tok-route", Scopes: []string{rt.scope}}
+			if w := rt.call(f, job.JobID, sjIdentity(id)); w.Code != http.StatusOK {
+				t.Fatalf("route scope %s: status %d; body %s", rt.scope, w.Code, w.Body.String())
+			}
+		})
+		t.Run(rt.name+"/attest scope only", func(t *testing.T) {
+			f := newSJPG(t)
+			job, _ := f.queuedJob(specialistjob.KindInventory)
+			if w := rt.call(f, job.JobID, sjIdentity(sjAttesterID)); w.Code != http.StatusOK {
+				t.Fatalf("attest scope: status %d; body %s", w.Code, w.Body.String())
+			}
+		})
+		t.Run(rt.name+"/neither scope", func(t *testing.T) {
+			f := newSJPG(t)
+			job, _ := f.queuedJob(specialistjob.KindInventory)
+			requireCrewRefusal(t, rt.call(f, job.JobID, sjIdentity(neither)), http.StatusForbidden, "insufficient_scope")
+		})
+		t.Run(rt.name+"/anonymous", func(t *testing.T) {
+			f := newSJPG(t)
+			job, _ := f.queuedJob(specialistjob.KindInventory)
+			requireCrewRefusal(t, rt.call(f, job.JobID, nil), http.StatusUnauthorized, "authentication_required")
+		})
 	}
 }

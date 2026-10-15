@@ -1,0 +1,64 @@
+{
+  "persona": "security",
+  "kind": "clean_sensitive",
+  "expect": "clean",
+  "issue_title": "Cover the allowed-paths invalid-pattern violation in the policy tests",
+  "issue_body": "checkAllowed reports `one or more patterns invalid` when a pattern it tries does not parse, but no test pins that row. Add test rows for an invalid pattern alone and an invalid pattern listed before a valid one.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94108",
+      "id": "kuhlman-labs/fishhawk#94108"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Add allowed-paths test rows pinning the invalid-pattern violation.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/policy/policy_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a TestCheckAllowed row whose only pattern is `[` and assert both the invalid-pattern violation and the files-outside violation."
+      },
+      {
+        "step": 2,
+        "description": "Add a row with `[` listed before `docs/**` and assert the invalid-pattern violation plus no files-outside violation for a docs file."
+      }
+    ],
+    "verification": {
+      "test_strategy": "The policy package tests.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-invalid-pinned",
+          "statement": "A test fails if checkAllowed stops reporting an invalid allowed_paths pattern.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94108"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/policy/policy_test.go b/backend/internal/policy/policy_test.go\nindex 5b0c7e4..2e8b1c9 100644\n--- a/backend/internal/policy/policy_test.go\n+++ b/backend/internal/policy/policy_test.go\n@@ -268,6 +268,23 @@ func TestCheckAllowed(t *testing.T) {\n \t\t\tpatterns: []string{\"docs/**\"},\n \t\t\twant:     nil,\n \t\t},\n+\t\t{\n+\t\t\tname:     \"only pattern does not parse\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"files outside allowed patterns\", Files: []string{\"docs/a.md\"}},\n+\t\t\t},\n+\t\t},\n+\t\t{\n+\t\t\tname:     \"unparseable pattern listed before a matching one\",\n+\t\t\tfiles:    []string{\"docs/a.md\"},\n+\t\t\tpatterns: []string{\"[\", \"docs/**\"},\n+\t\t\twant: []Violation{\n+\t\t\t\t{Constraint: \"allowed_paths\", Detail: \"one or more patterns invalid\"},\n+\t\t\t},\n+\t\t},\n \t}\n \tfor _, tc := range tests {\n \t\tt.Run(tc.name, func(t *testing.T) {\n",
+  "defect_phrases": [
+    "only pattern does not parse"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "policy_test.go: the new rows suggest checkAllowed tolerates an invalid pattern."
+    }
+  ]
+}

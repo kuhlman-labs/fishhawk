@@ -393,7 +393,9 @@
       "path": "docs/adr/040-operator-agent-role-contract.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-101"
+      ],
       "applies_to": [
         "docs/spec/operator-role.schema.json",
         ".fishhawk/operator.yaml"
@@ -789,7 +791,8 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [
-        "ADR-094"
+        "ADR-094",
+        "ADR-100"
       ],
       "applies_to": []
     },
@@ -808,7 +811,9 @@
       "path": "docs/adr/089-first-officer-read-only-crew-seat.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-101"
+      ],
       "applies_to": []
     },
     {
@@ -870,7 +875,9 @@
       "supersedes": [
         "ADR-087"
       ],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-100"
+      ],
       "applies_to": []
     },
     {
@@ -903,7 +910,9 @@
       "path": "docs/adr/097-operator-as-orchestrator.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-101"
+      ],
       "applies_to": []
     },
     {
@@ -915,7 +924,9 @@
         "ADR-096"
       ],
       "superseded_by": [],
-      "applies_to": []
+      "applies_to": [
+        "backend/internal/basedelta/**"
+      ]
     },
     {
       "id": "ADR-099",
@@ -924,6 +935,31 @@
       "status": "accepted",
       "supersedes": [
         "ADR-080"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-100",
+      "title": "Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1)",
+      "path": "docs/adr/100-adaptive-bounded-concurrency.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-087",
+        "ADR-094"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-101",
+      "title": "Charter authorization mode: lease-based, bounded autonomous operation by a product-spawned operator under a deterministic engine, intersected with delegation; captain seat stays human (amends ADR-040/085/089/097)",
+      "path": "docs/adr/101-charter-authorization-mode.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-040",
+        "ADR-089",
+        "ADR-097"
       ],
       "superseded_by": [],
       "applies_to": []

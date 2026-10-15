@@ -733,7 +733,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// decode hoisted above the generated-surface gate.
 	if capDecoded && !gatingRejected {
 		if reason := s.overCapSplitRejection(r.Context(), runID, &parsedForCap); reason != "" {
-			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
+			s.emitPreRoundReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
 			cat := run.FailureB
 			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, "plan_review_failed: "+reason); ferr != nil {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -787,7 +787,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 			gatePlan = nil
 		}
 		if reason := s.appliesToPlanGateRejection(r.Context(), runID, gatePlan); reason != "" {
-			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
+			s.emitPreRoundReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
 			cat := run.FailureB
 			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, "plan_review_failed: "+reason); ferr != nil {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -1712,7 +1712,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
+		s.emitPreRoundReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
 		if authority != planreview.AuthorityGating {
 			return false
 		}
@@ -2126,20 +2126,73 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 	return entry.Sequence, true
 }
 
-// emitReviewFailed appends a best-effort terminal *_review_failed audit
-// entry when a wired reviewer invocation errors or times out (#664). Shared
-// by the plan-review (plan.go) and implement-review (trace.go) error
-// branches via the passed category ("plan_review_failed" /
-// "implement_review_failed"). It mirrors emitReviewStarted's contract:
-// ActorKind=system, best-effort, WARN-log on append failure so the review
-// loop is never blocked. Observability-only — it records that a reviewer
+// emitReviewFailed appends a terminal *_review_failed audit entry when a
+// wired reviewer invocation errors or times out (#664). Shared by the
+// plan-review (plan.go) and implement-review (trace.go) error branches via
+// the passed category ("plan_review_failed" / "implement_review_failed").
+// ActorKind=system, WARN-log when the durable write finally fails; the retry
+// can hold the caller for the bounded phase-1 schedule while the audit store
+// is failing, and never fails the review loop. Observability-only — it records that a reviewer
 // failed without altering gating advance/degrade semantics (#574). timeout
 // sets the #747 discriminator: true when the reviewer was killed by the
 // size-aware per-invocation budget deadline, false for other failures.
+//
+// Since E72.64 / #4106 the write is durable (appendReviewTerminal): a transient
+// audit-store failure is retried, and a write that never lands is replaced by a
+// named verdict_write_failed or registered for the detached settle, so the
+// round still reaches configured_agents. A failure recorded BEFORE the round's
+// *_review_started (no round to settle) uses emitPreRoundReviewFailed instead.
 func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
+	if _, aerr := s.appendReviewTerminal(ctx, reviewFailedParams(runID, stageID, category, authority, model, reason, timeout)); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
+// emitReviewFailedLocked is emitReviewFailed for a caller holding the run's
+// reconcileEmitLockFor stripe lock (reconcile synthesis, the boot re-dispatch
+// fallback): a single bounded append and probe, then the lost-terminal
+// registry, so the lock is never held across a backoff (E72.64 / #4106).
+func (s *Server) emitReviewFailedLocked(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	if _, aerr := s.appendReviewTerminalSingleWith(ctx, reviewFailedParams(runID, stageID, category, authority, model, reason, timeout), defaultReviewTerminalWriteConfig); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
+// emitPreRoundReviewFailed records a *_review_failed written BEFORE any
+// *_review_started (the plan-gate split / applies_to rejects and the
+// document-injection failures): no reviewer round exists for it to settle, so
+// it keeps the single best-effort append with a WARN on failure and never
+// takes the retry / lost-terminal registry path (E72.64 / #4106) — a
+// registered entry would otherwise be attributed to an older round.
+func (s *Server) emitPreRoundReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	p := reviewFailedParams(runID, stageID, category, authority, model, reason, timeout)
+	p.Timestamp = time.Now().UTC()
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, p); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
+// reviewFailedParams builds a *_review_failed append; the durable writers stamp
+// the timestamp themselves.
+func reviewFailedParams(runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) audit.ChainAppendParams {
 	payload, _ := json.Marshal(planreview.ReviewFailedPayload{
 		Reason:        reason,
 		ReviewerModel: model,
@@ -2147,18 +2200,12 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 		Timeout:       timeout,
 	})
 	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	return audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   payload,
-	}); aerr != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("error", aerr.Error()),
-		)
 	}
 }
 
@@ -2221,10 +2268,9 @@ func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uui
 		EscalationAttached: escalationAttached,
 	})
 	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	if _, aerr := s.appendReviewTerminal(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   payload,
@@ -2529,10 +2575,11 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 			VerdictClampedFrom: verdictClampedFrom,
 		}
 		payloadBytes, _ := json.Marshal(payload)
-		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		// Durable terminal write (E72.64 / #4106): retried, then a named
+		// verdict_write_failed or the lost-terminal registry.
+		entry, aerr := s.appendReviewTerminal(ctx, audit.ChainAppendParams{
 			RunID:     runID,
 			StageID:   &stageID,
-			Timestamp: time.Now().UTC(),
 			Category:  "plan_reviewed",
 			ActorKind: &systemKind,
 			Payload:   payloadBytes,

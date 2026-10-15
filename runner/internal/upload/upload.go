@@ -4395,12 +4395,21 @@ func (c *Client) RunState(ctx context.Context, runID string) (string, error) {
 // ---- Specialist jobs (ADR-097 D2/D6, E85.9 / #4300) ----
 //
 // The `fishhawk-runner specialist-job` subcommand's three backend calls. They
-// authenticate on the caller-supplied operator bearer (the token fishhawk-mcp
-// forwards as FISHHAWK_API_TOKEN), never a run-bound token or a signing key:
-// a specialist job is not a run stage. Fetch and admission ride the SHORT
+// authenticate on the caller-supplied bearer (the runner attestation token
+// FISHHAWK_RUNNER_ATTEST_TOKEN when set, else the operator bearer fishhawk-mcp
+// forwards as FISHHAWK_API_TOKEN), never a run-bound token or a run signing
+// key: a specialist job is not a run stage. Fetch and admission ride the SHORT
 // (blip) retry budget; the completion is the job's settling upload and rides
 // the TERMINAL-EGRESS budget. The job-side transport allow-list (the runner's
 // specialistJobTransport) is what confines a job to exactly these routes.
+//
+// Result attestation (E85.15 / #4363): an admission answered to an attester
+// carries a job-scoped Ed25519 private key (AttestationKey), delivered once.
+// ShipSpecialistJobCompletion signs SpecialistJobResultMessage over the exact
+// result body with it and sends the hex signature as X-Fishhawk-Signature, so
+// the result records provenance runner_attested; a nil key ships unsigned and
+// the result records bearer. Contract: docs/spec/specialist-job-v1.md
+// § "Result provenance and attestation".
 
 // Specialist-job refusals. Each is returned wrapped; assert with errors.Is.
 var (
@@ -4414,10 +4423,32 @@ var (
 	// transport error) is ambiguous — the first attempt may have landed — so
 	// the caller re-reads the job to tell the two apart.
 	ErrSpecialistJobConflict = errors.New("upload: specialist job conflict")
-	// ErrSpecialistJobRejected: a permanent 4xx (400 validation_failed, 401,
-	// 403, 413 request_too_large) — retrying the same bytes cannot succeed.
+	// ErrSpecialistJobRejected: a permanent 4xx (400 validation_failed, 401 —
+	// including specialist_job_attestation_invalid on a signed result —, 403,
+	// 413 request_too_large) — retrying the same bytes cannot succeed.
 	ErrSpecialistJobRejected = errors.New("upload: specialist job request rejected")
 )
+
+// specialistJobResultPrefix domain-separates a specialist-job result
+// signature; byte-identical to the backend's resultMessagePrefix
+// (backend/internal/specialistjob/attestation.go).
+const specialistJobResultPrefix = "fishhawk-specialist-job-result-v1\x00"
+
+// SpecialistJobResultMessage is the digest a result attestation signs:
+// sha256(prefix || jobID || 0x00 || sha256(body)), body being the EXACT
+// result request body. It is the byte-identical twin of the backend's
+// specialistjob.ResultMessage; both modules recompute the shared vector in
+// testdata/wire/specialist_job.json result_attestation. jobID must be the
+// canonical lowercase form the server renders (uuid.UUID.String()).
+func SpecialistJobResultMessage(jobID string, body []byte) []byte {
+	inner := sha256.Sum256(body)
+	h := sha256.New()
+	h.Write([]byte(specialistJobResultPrefix))
+	h.Write([]byte(jobID))
+	h.Write([]byte{0})
+	h.Write(inner[:])
+	return h.Sum(nil)
+}
 
 // SpecialistJobRequester is the server-derived requesting identity.
 type SpecialistJobRequester struct {
@@ -4458,7 +4489,12 @@ type SpecialistJob struct {
 	LastSeenAt        time.Time              `json:"last_seen_at"`
 	StartedAt         *time.Time             `json:"started_at,omitempty"`
 	CompletedAt       *time.Time             `json:"completed_at,omitempty"`
-	Stale             bool                   `json:"stale"`
+	// Provenance (completed jobs only): runner_attested or bearer.
+	Provenance string `json:"provenance,omitempty"`
+	// BlockingEligible is the server's ADR-089 D4 blocking eligibility
+	// (true only for a runner_attested result).
+	BlockingEligible bool `json:"blocking_eligible,omitempty"`
+	Stale            bool `json:"stale"`
 }
 
 // SpecialistJobAdmissionRequest is the POST .../admission body. Re-POSTing
@@ -4482,6 +4518,12 @@ type SpecialistJobAdmission struct {
 	Contended      bool          `json:"contended"`
 	TakenOver      bool          `json:"taken_over"`
 	Job            SpecialistJob `json:"job"`
+	// AttestationKey is the base64 (std) job-scoped Ed25519 private key, set
+	// only on the admission that minted it (an attester's admission moving
+	// the job to running), never on a heartbeat or a queue answer. Hold it in
+	// memory only; never log or persist it.
+	AttestationKey       string     `json:"attestation_key,omitempty"`
+	AttestationExpiresAt *time.Time `json:"attestation_expires_at,omitempty"`
 }
 
 // SpecialistJobCompletion is the POST .../result body. Evidence stays raw:
@@ -4509,7 +4551,7 @@ func (c *Client) specialistJobEndpoint(jobID, suffix string) string {
 func (c *Client) FetchSpecialistJob(ctx context.Context, token, jobID string) (*SpecialistJob, error) {
 	var out SpecialistJob
 	if err := c.doSpecialistJob(ctx, "fetch specialist job", http.MethodGet,
-		c.specialistJobEndpoint(jobID, ""), token, jobID, nil, false, &out); err != nil {
+		c.specialistJobEndpoint(jobID, ""), token, jobID, nil, "", false, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -4525,22 +4567,33 @@ func (c *Client) AdmitSpecialistJob(ctx context.Context, token, jobID string, in
 	}
 	var out SpecialistJobAdmission
 	if err := c.doSpecialistJob(ctx, "admit specialist job", http.MethodPost,
-		c.specialistJobEndpoint(jobID, "/admission"), token, jobID, raw, false, &out); err != nil {
+		c.specialistJobEndpoint(jobID, "/admission"), token, jobID, raw, "", false, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
 // ShipSpecialistJobCompletion POSTs .../result on the terminal-egress budget
-// and returns the completed job.
-func (c *Client) ShipSpecialistJobCompletion(ctx context.Context, token, jobID string, completion SpecialistJobCompletion) (*SpecialistJob, error) {
+// and returns the completed job. A non-nil key (the admission's job-scoped
+// attestation key) signs SpecialistJobResultMessage over the exact body bytes
+// once, and every attempt carries the hex signature as X-Fishhawk-Signature;
+// a nil key ships unsigned (provenance bearer). A key of the wrong length is
+// refused before any I/O (ed25519.Sign would panic on it).
+func (c *Client) ShipSpecialistJobCompletion(ctx context.Context, token, jobID string, completion SpecialistJobCompletion, key ed25519.PrivateKey) (*SpecialistJob, error) {
+	if key != nil && len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("upload: ship specialist-job completion: attestation key is %d bytes, want %d", len(key), ed25519.PrivateKeySize)
+	}
 	raw, err := json.Marshal(completion)
 	if err != nil {
 		return nil, fmt.Errorf("upload: marshal specialist-job completion: %w", err)
 	}
+	jobSigHex := ""
+	if key != nil {
+		jobSigHex = hex.EncodeToString(ed25519.Sign(key, SpecialistJobResultMessage(jobID, raw)))
+	}
 	var out SpecialistJob
 	if err := c.doSpecialistJob(ctx, "ship specialist-job completion", http.MethodPost,
-		c.specialistJobEndpoint(jobID, "/result"), token, jobID, raw, true, &out); err != nil {
+		c.specialistJobEndpoint(jobID, "/result"), token, jobID, raw, jobSigHex, true, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -4549,8 +4602,9 @@ func (c *Client) ShipSpecialistJobCompletion(ctx context.Context, token, jobID s
 // doSpecialistJob is the shared bearer-authenticated round trip: network
 // errors and 5xx retry (blip budget, or the terminal-egress budget when
 // terminal), 2xx decodes into out, 404/409 map to their sentinels and every
-// other status is permanent.
-func (c *Client) doSpecialistJob(ctx context.Context, op, method, endpoint, token, jobID string, body []byte, terminal bool, out any) error {
+// other status is permanent. A non-empty jobSigHex rides every attempt as
+// X-Fishhawk-Signature.
+func (c *Client) doSpecialistJob(ctx context.Context, op, method, endpoint, token, jobID string, body []byte, jobSigHex string, terminal bool, out any) error {
 	switch {
 	case token == "":
 		return fmt.Errorf("upload: %s: bearer token required", op)
@@ -4587,6 +4641,9 @@ func (c *Client) doSpecialistJob(ctx context.Context, op, method, endpoint, toke
 		req.Header.Set("Accept", "application/json")
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
+		}
+		if jobSigHex != "" {
+			req.Header.Set("X-Fishhawk-Signature", jobSigHex)
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {

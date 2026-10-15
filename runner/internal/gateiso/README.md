@@ -1319,10 +1319,23 @@ narrower file-sharing list the runtime's own error surfaces in the gate output
 Docker-gated fixtures cross gateiso → the runner wiring → a REAL runtime and
 the pinned image `docker.io/alpine/git:v2.47.2` (`FISHHAWK_GATE_TEST_IMAGE`
 overrides; manifest verified 2026-09-15). `requireGateImage` runs ONCE per
-process: `DetectRuntime` over `DefaultProbes` (skip naming `Runtime.Reason`
-when unsafe or absent), a pull (skip naming the runtime error), then an
-in-image check that executes `sh -c 'echo ok'` past the git `ENTRYPOINT` and
-resolves every binary the fixtures need (skip naming the missing one). Each
+process: `DetectRuntime` over `DefaultProbes` under a bounded context (skip
+naming `Runtime.Reason` when unsafe or absent), a pull (skip naming the
+runtime error), then an in-image check that executes `sh -c 'echo ok'` past
+the git `ENTRYPOINT` and resolves every binary the fixtures need (skip naming
+the missing one). The pull and the check (and `requirePostgresImage`'s, and
+`TestGateContainer_EntrypointResetSmoke`'s pull) run like the runner's own
+post-selection calls, credential-free (#4337, `gateimagecheck_test.go`):
+`gateTestImageEnv` mints `NewAnonymousDockerConfig` and binds it with
+`BindEndpointEnv`, and the argv carries `EndpointArgs`, so neither the
+operator's `credsStore` nor an ambient `DOCKER_HOST`/`DOCKER_CONTEXT` is
+consulted. Each exec goes through `runImageCheckCmd`: the child leads its own
+process group, a deadline kills the WHOLE group (`Cmd.Cancel`), and
+`Cmd.WaitDelay` closes the output pipe even when a grandchild still holds it.
+Before this, a locked-screen `docker-credential-desktop` grandchild kept
+`CombinedOutput` blocked past the 5-minute check deadline until the test
+binary's 10-minute timeout. A deadline still SKIPS naming the reason, so the
+sentinel below is unchanged. Each
 docker-gated fixture increments `dockerFixturesRan` at its END; `TestMain`'s
 sentinel (main_test.go) fails the binary when an INDEPENDENT runtime probe — a
 raw `docker version`/`podman version` plus a local-socket `Lstat`, never
