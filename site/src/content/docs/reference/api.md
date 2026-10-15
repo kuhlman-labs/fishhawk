@@ -130,7 +130,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **172 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **175 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -220,6 +220,9 @@ The v0 REST API exposes **172 operations** across the paths below, generated fro
 | `POST` | `/v0/crew-messages/{sequence}/respond` | Answer a crew message (refused over HTTP) |
 | `POST` | `/v0/crew-messages/{sequence}/escalation-decision` | The captain's decision on a crew escalation |
 | `POST` | `/v0/crew-messages/{sequence}/convert-to-concern` | The captain converts a crew finding into a review concern |
+| `POST` | `/v0/first-officer-seats` | Attach a first-officer seat to a campaign or run |
+| `GET` | `/v0/first-officer-seats` | Read an anchor's first-officer seat |
+| `POST` | `/v0/first-officer-seats/retire` | Retire (detach) an anchor's first-officer seat |
 | `POST` | `/v0/specialist-jobs` | Request a specialist job |
 | `GET` | `/v0/specialist-jobs/{job_id}` | Read one specialist job |
 | `POST` | `/v0/specialist-jobs/{job_id}/admission` | Admit, heartbeat or take over a specialist job |

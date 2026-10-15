@@ -199,6 +199,13 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 					Note:             reason,
 				}, nil
 			}
+			// First-officer hold (ADR-089 D4, E85.6 / #4148): the SAME
+			// predicate the approval endpoint refuses on. A hold is a
+			// decision for the captain; a read error is observe-only
+			// (fail-closed). No approval is submitted either way.
+			if out, held := s.firstOfficerAutoDriveHold(ctx, runRow.ID, gated, delegation.ActionApprove); held {
+				return out, nil
+			}
 			result, aerr := s.approveStageAs(ctx, id, approveActionParams{
 				Stage:         gated,
 				Decision:      approval.DecisionApprove,
@@ -311,6 +318,12 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but review coverage is incomplete; observe-only",
 				slog.String("run_id", runRow.ID.String()))
 			return observeOnly(note), nil
+		} else if out, held := s.firstOfficerAutoDriveHold(ctx, runRow.ID, nil, delegation.ActionMerge); held {
+			// ADR-089 D4 (E85.6 / #4148): the SAME first-officer hold the
+			// operator merge endpoint refuses on; the merger is never called.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but a first-officer finding holds the merge",
+				slog.String("run_id", runRow.ID.String()), slog.Bool("decision_required", out.DecisionRequired))
+			return out, nil
 		} else if gate := s.mergeCandidateGate(ctx, runRow); !gate.admits() {
 			// ADR-090 D1/D2/D7 (E83.33 / #4018): the SAME merge-candidate gate the
 			// operator merge endpoint consults, translated to observe-only. A
@@ -378,6 +391,38 @@ func (s *Server) reviewCoverageObserveNote(ctx context.Context, runRow *run.Run)
 	}
 	next, _ := ref.Details["next_step"].(string)
 	return "review coverage incomplete: a decomposed slice is not covered by a successful agent review; the operator's next step is " + next + " — the delegated arm never re-runs a review; observe-only", true
+}
+
+// firstOfficerAutoDriveHold applies the first-officer hold (ADR-089 D4,
+// E85.6 / #4148) to a delegated approve (stage = the gated plan or implement
+// stage, held on concerns of that kind) or merge (stage nil, any kind). An
+// open first_officer concern returns decision_required
+// first_officer_finding_open: only the captain can disposition it. A read
+// error returns observe-only (fail-closed), mirroring
+// reviewCoverageObserveNote. held=false means the arm may proceed.
+func (s *Server) firstOfficerAutoDriveHold(ctx context.Context, runID uuid.UUID, stage *run.Stage, action string) (AutoDriveOutcome, bool) {
+	kind := ""
+	if stage != nil {
+		kind = concern.StageKindImplement
+		if stage.Type == run.StageTypePlan {
+			kind = concern.StageKindPlan
+		}
+	}
+	hold, err := s.firstOfficerHoldRefusal(ctx, runID, kind)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: first-officer concerns unreadable; observe-only",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return observeOnly("first-officer findings could not be read (fail-closed); observe-only"), true
+	}
+	if hold == nil {
+		return AutoDriveOutcome{}, false
+	}
+	return AutoDriveOutcome{
+		DecisionRequired: true,
+		DecisionState:    codeFirstOfficerFindingOpen,
+		Action:           action,
+		Note:             hold.Message + "; " + firstOfficerHoldNextStep,
+	}, true
 }
 
 // mergeCandidateObserveNote renders a refused merge-candidate gate as the
