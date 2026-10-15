@@ -4089,7 +4089,7 @@ type RebaseRunBranchInput struct {
 	RunID             string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch is being advanced onto its declared base"`
 	Reason            string `json:"reason,omitempty" jsonschema:"operator rationale, recorded on the branch_rebased audit entry; REQUIRED (non-blank) with rerun_failed_verify, where it is recorded on the void row as the attestation that the failure was not the change's"`
 	Confirm           bool   `json:"confirm" jsonschema:"MUST be true to proceed — this merges the declared base into the run branch, leaving a merge commit and moving the PR head; a missing/false confirm is refused"`
-	RerunFailedVerify bool   `json:"rerun_failed_verify,omitempty" jsonschema:"#4391: re-run ONLY the verify of a FAILED merge-candidate head, with no agent. On the already-up-to-date arm, with the implement stage parked at its review gate, voids the failed verdict (an operator merge_candidate_verified not_executed row) and starts a fresh verify-only pass (or holds it behind the base's live pass). Refused beside a queued fix-up. Requires a non-blank reason. No effect on any other head state or on a performed merge."`
+	RerunFailedVerify bool   `json:"rerun_failed_verify,omitempty" jsonschema:"#4391: re-run ONLY the verify of a FAILED merge-candidate head, with no agent. On the already-up-to-date arm, with the implement stage parked at its review gate, voids the failed verdict (an operator merge_candidate_verified not_executed row) and starts a fresh verify-only pass (or holds it behind the base's live pass). With the stage pending or awaiting_host_dispatch behind a queued, never-dispatched ADR-090 D6 fix-up, supersedes that fix-up IN PLACE (the stage keeps its place, the fix-up pass is refunded, merge_candidate_fixup_superseded=true); refused with nothing written for an operator-routed, dispatched, slot-queued or held fix-up. Requires a non-blank reason. No effect on any other head state or on a performed merge."`
 }
 
 // RebaseRunBranchOutput surfaces the base-advance summary: the prior and new
@@ -4206,12 +4206,26 @@ merge_candidate_verified{result not_executed, reason "operator_rerun: ..."}
 row that VOIDS the failed verdict, then starts a fresh verify-only pass for
 the same head through the ordinary start path (held behind another run's
 live pass on the same base when the ADR-092 queue is wired). The 200
-carries merge_candidate_verify_rerun=true. It is REFUSED — nothing voided,
-nothing triggered — when the implement stage is not at its gate, e.g. a
-queued fix-up (the ADR-090 D6 auto-route leaves the stage pending): dispatch
-that fix-up with fishhawk_dispatch_stage first, then re-run. On any other
-head state, or on a call that performs a base merge, the flag has no effect
-and merge_candidate_verify_note says so.
+carries merge_candidate_verify_rerun=true. When the implement stage is
+instead pending or awaiting_host_dispatch behind a QUEUED, never-dispatched
+ADR-090 D6 merge-candidate fix-up (the auto-route's park), the call
+SUPERSEDES that fix-up IN PLACE (E86.54): under the stage's admission fence
+it appends a stage_fixup_superseded marker, voids the failed verdict and
+starts the verify-only pass, with no stage transition — the stage keeps its
+place, its next dispatch serves the verify-only pass in the local-verify
+group, and the superseded fix-up pass is refunded. The 200 then also
+carries merge_candidate_fixup_superseded=true. That conversion is refused,
+with NOTHING written, unless the fix-up is the D6 route (an
+operator-routed fix-up is dispatched with fishhawk_dispatch_stage
+instead), was routed after the failed verdict, was never
+dispatched, settled, retried or re-opened, has no slot-queue waiter, and
+would not be held behind another run on the base. A held pass leaves the
+marker and the void with the fix-up still dispatchable; the queue's
+admission converts it. fishhawk_get_run_status advertises a legal re-run as
+run.merge_candidate_rerun and appends this call to next_actions as an
+alternative, never the default. Any other stage state is refused. On any
+other head state, or on a call that performs a base merge, the flag has no
+effect and merge_candidate_verify_note says so.
 
 Idempotent retry: if the CHECK RE-POST fails, re-invoke this verb. The
 branch now contains the base, so the behind-probe short-circuits the merge

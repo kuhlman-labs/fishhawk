@@ -18851,7 +18851,8 @@ func TestRebaseRunBranchTool_RerunFailedVerify(t *testing.T) {
 
 // TestRebaseRunBranchTool_DescribesVerifyRerun pins the #4391 paragraph on
 // the wire-visible description: the flag, its required reason, the void row
-// and the refusal beside a queued fix-up.
+// and the fishhawk_dispatch_stage route for an operator-routed queued fix-up
+// (E86.54 supersedes a D6 one in place).
 func TestRebaseRunBranchTool_DescribesVerifyRerun(t *testing.T) {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "t", Version: "0"}, nil)
 	registerRebaseRunBranch(srv, &runResolver{})
@@ -18879,5 +18880,36 @@ func TestRebaseRunBranchTool_DescribesVerifyRerun(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Errorf("description must name %q:\n%s", want, desc)
 		}
+	}
+}
+
+// TestRebaseRunBranchTool_DescriptionNamesInPlaceConversion (A4, E86.54 /
+// #4391) pins the shipped fishhawk_rebase_run_branch text: the description and
+// the rerun_failed_verify schema both describe the in-place supersession of a
+// queued, never-dispatched D6 fix-up (awaiting_host_dispatch included) and the
+// merge_candidate_fixup_superseded output, and neither still carries the
+// retired "Refused beside a queued fix-up" claim.
+func TestRebaseRunBranchTool_DescriptionNamesInPlaceConversion(t *testing.T) {
+	desc := listToolDescriptions(t)["fishhawk_rebase_run_branch"]
+	if desc == "" {
+		t.Fatal("fishhawk_rebase_run_branch is not registered/visible over ListTools")
+	}
+	norm := normalizeDescription(desc)
+	for _, want := range []string{"supersedes that fix-up in place", "awaiting_host_dispatch", "merge_candidate_fixup_superseded", "refunded", "merge_candidate_rerun"} {
+		if !strings.Contains(norm, want) {
+			t.Errorf("fishhawk_rebase_run_branch description must name %q:\n%s", want, desc)
+		}
+	}
+	if strings.Contains(norm, "dispatch that fix-up with fishhawk_dispatch_stage first") {
+		t.Errorf("fishhawk_rebase_run_branch description still tells the operator to dispatch the queued fix-up first:\n%s", desc)
+	}
+	flag := toolInputPropertyDescription(t, "fishhawk_rebase_run_branch", "rerun_failed_verify")
+	for _, want := range []string{"IN PLACE", "awaiting_host_dispatch", "merge_candidate_fixup_superseded"} {
+		if !strings.Contains(flag, want) {
+			t.Errorf("rerun_failed_verify schema must name %q:\n%s", want, flag)
+		}
+	}
+	if strings.Contains(flag, "Refused beside a queued fix-up") {
+		t.Errorf("rerun_failed_verify schema still carries the retired refusal:\n%s", flag)
 	}
 }
