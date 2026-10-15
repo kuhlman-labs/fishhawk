@@ -1,0 +1,236 @@
+{
+  "issue_title": "Scan uploaded files for malware before anyone downloads them",
+  "issue_body": "Users upload attachments that other users then download, and nothing checks them for malware.\n\nEvery uploaded file must be scanned before anyone can download it. A file the scanner flags as infected must never be served: `GET /files/{id}` returns `410` with error code `file_infected`. While the scan is still running, `GET /files/{id}` returns `409` with error code `scan_pending`. Scanning must not slow down the upload itself.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/uploads-service/issues/205",
+      "id": "example-org/uploads-service#205"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Scan uploads asynchronously through a new ScanQueue and gate downloads on the scan result.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/store/migrations/0052_files_scan_status.sql",
+          "operation": "create"
+        },
+        {
+          "path": "internal/scan/queue.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/scan/worker.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/uploads.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/files.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/files_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0052 adding scan_status (pending, clean, infected) to files, defaulting to pending, with a down migration."
+      },
+      {
+        "step": 2,
+        "description": "In the POST /uploads handler, store the file with scan_status pending, enqueue a scan job on ScanQueue (internal/scan/queue.go), and return 202 with the file id."
+      },
+      {
+        "step": 3,
+        "description": "Add the scan worker in internal/scan/worker.go: it runs clamd on the file and sets scan_status to clean or infected."
+      },
+      {
+        "step": 4,
+        "description": "In GET /files/{id}, return 409 scan_pending while scan_status is pending, 410 file_infected when it is infected, and the bytes when it is clean."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests with a fake scanner: a pending file returns 409, an infected one returns 410 file_infected, a clean one returns its bytes, and the upload returns 202. A worker test with a fake clamd sets each status.",
+      "rollback_plan": "Revert the PR and run the 0052 down migration; uploads are served unscanned again.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-upload-enqueues-scan",
+          "statement": "POST /uploads returns HTTP 202 after the handler enqueues a scan job on ScanQueue.",
+          "source": "explicit",
+          "source_ref": "example-org/uploads-service#205"
+        },
+        {
+          "id": "ac-download-pending-409",
+          "statement": "GET /files/{id} while the file's scan is pending returns HTTP 409 with error code scan_pending.",
+          "source": "explicit",
+          "source_ref": "example-org/uploads-service#205"
+        },
+        {
+          "id": "ac-download-infected-410",
+          "statement": "GET /files/{id} for a file the scanner flagged as infected returns HTTP 410 with error code file_infected.",
+          "source": "explicit",
+          "source_ref": "example-org/uploads-service#205"
+        },
+        {
+          "id": "ac-download-clean-200",
+          "statement": "GET /files/{id} for a file the scanner passed returns HTTP 200 with the uploaded bytes.",
+          "source": "explicit",
+          "source_ref": "example-org/uploads-service#205"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "clamd is already deployed beside the service."
+    ],
+    "predicted_runtime_minutes": 50,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "restates the approach",
+    "restates approach",
+    "restates an approach",
+    "restating the approach",
+    "criterion restates",
+    "restates the implementation",
+    "instead of an observable",
+    "instead of the observable",
+    "restatement of approach",
+    "restatement of the approach",
+    "restates the handler",
+    "restates what the handler",
+    "an implementation detail, not",
+    "internal mechanism",
+    "asserts the mechanism",
+    "checks the mechanism",
+    "observes only the enqueue",
+    "observes the enqueue",
+    "never observes",
+    "does not observe whether",
+    "would pass even if",
+    "passes even if",
+    "passes even when",
+    "wrapped in an http",
+    "dressed as an",
+    "dressed up as",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not asked for",
+    "nothing in the issue requires",
+    "nothing in the issue asks",
+    "issue never mentions",
+    "issue does not mention",
+    "issue doesn't mention",
+    "issue fidelity",
+    "marked explicit",
+    "marked as explicit",
+    "labeled explicit",
+    "labelled explicit",
+    "should be inferred",
+    "approach restatement",
+    "partly an approach restatement",
+    "never states",
+    "never specifies",
+    "plan-chosen design value",
+    "marked source explicit",
+    "presented as an explicit requirement"
+  ],
+  "attribution_phrases": [
+    "enqueues a scan job",
+    "202 after the handler",
+    "on scanqueue"
+  ],
+  "defect_phrases": [
+    "scanqueue",
+    "enqueues a scan job"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan restates approach step 2 instead of an observable outcome; it would pass even if the worker never scans and an infected file is served."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan is a restatement of the approach wrapped in an HTTP status: the issue asks to observe that an infected file is never served, not that a job was queued."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion that POST /uploads returns 202 after the handler enqueues a scan job restates the implementation; it passes even if no scan ever runs."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-upload-enqueues-scan reads like an outcome because it names a status code, but its substance is approach step 2: the handler enqueues on ScanQueue. That is an internal mechanism, not what the issue asks to observe. ac-download-infected-410 already observes the outcome the issue requires, so this criterion adds only the mechanism; drop it, or replace it with an observation that the upload returns before the scan finishes."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan is marked explicit, but the issue never asks for a queue or a 202: nothing in the issue requires the upload to enqueue anything, only that an infected file is never served."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion that POST /uploads returns 202 after the handler enqueues a scan job fails issue fidelity: the issue does not mention ScanQueue or a 202 response."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-upload-enqueues-scan is partly an approach restatement: the issue never states a 202 and never specifies a queue, so the enqueue is a plan-chosen design value, not an outcome a user can observe."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "Criterion ac-upload-enqueues-scan is marked source explicit, but the issue never says POST /uploads returns 202; the status is a plan choice presented as an explicit requirement."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-upload-enqueues-scan should also assert the 202 body carries the new file id."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "ScanQueue on the jobs table needs a retry and a dead-letter path for a clamd timeout, or a file stays pending forever."
+    },
+    {
+      "category": "risk",
+      "note": "ac-upload-enqueues-scan is ambiguous about a failed jobs-table insert: returning 202 then is unjustified."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the scan_pending and file_infected error codes in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-download-pending-409: while the scan is still running, GET /files/{id} returns 409 with scan_pending; add a test for a file whose scan never finishes."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Approach step 2 stores the file before scanning; the storage bucket needs a lifecycle rule for files nobody downloads."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-download-infected-410 should also assert the 410 response body carries none of the uploaded bytes."
+    }
+  ]
+}

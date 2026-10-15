@@ -6,12 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -23,11 +29,13 @@ const (
 )
 
 // committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
-// the corpus has carried since E55.18 / #4253 (six E55.4 seeds plus six
-// mid-difficulty cases); the derived list below may grow past it, never
-// shrink below it (so the derivation cannot go vacuous and a deleted case
-// cannot pass silently).
-const committedSyntheticCatchCaseFloor = 12
+// the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
+// #4253 mid-difficulty cases and the one #4361 subtler case that calibrated
+// in band on reviewer misses; five were cut, three at the ceiling and two in
+// band only on scoring misses);
+// the derived list below may grow past it, never shrink below it (so the
+// derivation cannot go vacuous and a deleted case cannot pass silently).
+const committedSyntheticCatchCaseFloor = 13
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
@@ -890,6 +898,113 @@ func TestCatchRuleV4_NewCatchingExamplesMissUnderV3(t *testing.T) {
 	}
 }
 
+// writeCatchCaseCopy copies committed case name into a fresh temp corpus,
+// applying mutate to its decoded review_input.json, and returns the corpus
+// dir for LoadPlanReviewCatchCorpus.
+func writeCatchCaseCopy(t *testing.T, name string, mutate func(*PlanReviewCatchInput)) string {
+	t.Helper()
+	dir := t.TempDir()
+	caseDir := filepath.Join(dir, name)
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(caseDir, "miss.json"), mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "miss.json")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var in PlanReviewCatchInput
+	if err := json.Unmarshal(mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "review_input.json")), &in); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&in)
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(caseDir, "review_input.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestCatchCorpusWidening_RepairsScoringMissClasses is the offline half of the
+// run-book's Step 1c remedy rule (#4361 approval condition C3): a scoring miss
+// is repaired by widening the half of the rule it failed, and a not_mentioned
+// miss is genuine difficulty. Per scoring class, a confirmed catch of a
+// committed #4361 case phrased the way the class describes scores MISSED with
+// that class and is refused as a catching_example (mode k); after the
+// matching widening (attribution_phrases for unattributed, catch_probes for
+// no_probe) on a temp copy of the case, the loader accepts it (modes (a)-(r),
+// mode p's attribution uniqueness included) and it scores CAUGHT. An
+// attribution widening that a sibling criterion also states is refused (mode
+// p), which is the bound on the unattributed remedy.
+func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
+	for _, tc := range []struct {
+		class    CatchMissClass
+		caseName string
+		concern  CatchExampleConcern
+		widen    func(*PlanReviewCatchInput)
+	}{
+		{
+			class:    CatchMissUnattributed,
+			caseName: "seed-synthetic-restates-approach-observable",
+			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "The criterion where POST /uploads returns HTTP 202 restates the approach instead of an outcome a user could observe."},
+			widen: func(in *PlanReviewCatchInput) {
+				in.AttributionPhrases = append(in.AttributionPhrases, "returns http 202")
+			},
+		},
+		{
+			class:    CatchMissNoProbe,
+			caseName: "seed-synthetic-restates-approach-observable",
+			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "ac-upload-enqueues-scan pins a status code that nobody upstream chose, so the check tells the operator nothing."},
+			widen: func(in *PlanReviewCatchInput) {
+				in.CatchProbes = append(in.CatchProbes, "nobody upstream chose")
+			},
+		},
+	} {
+		t.Run(string(tc.class), func(t *testing.T) {
+			rule, _ := rawCommittedCatchRule(t, tc.caseName)
+			trial := ClassifyCatchTrial(catchVerdictJSON(t, tc.concern), rule)
+			if trial.Outcome != CatchMissed {
+				t.Fatalf("fixture premise: %q scores %q under the committed rule, want missed", tc.concern.Note, trial.Outcome)
+			}
+			if got := classifyCatchMiss(trial, rule); got != tc.class {
+				t.Fatalf("fixture premise: miss class %q, want %q", got, tc.class)
+			}
+			asExample := func(in *PlanReviewCatchInput) {
+				in.CatchingExamples = append(in.CatchingExamples, tc.concern)
+			}
+			if _, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, tc.caseName, asExample)); err == nil || !strings.Contains(err.Error(), "is not a catch under the attribution-AND-probe rule") {
+				t.Fatalf("unwidened case with %q as a catching example: err = %v, want the mode (k) refusal", tc.concern.Note, err)
+			}
+			widened, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, tc.caseName, func(in *PlanReviewCatchInput) {
+				tc.widen(in)
+				asExample(in)
+			}))
+			if err != nil {
+				t.Fatalf("widened case refused by the loader: %v", err)
+			}
+			if got := ClassifyCatch(catchVerdictJSON(t, tc.concern), widened[0].CatchRule()); got != CatchCaught {
+				t.Errorf("after the %s widening %q classified %q, want caught", tc.class, tc.concern.Note, got)
+			}
+		})
+	}
+	t.Run("attribution widening past mode p is refused", func(t *testing.T) {
+		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-restates-approach-observable", func(in *PlanReviewCatchInput) {
+			in.AttributionPhrases = append(in.AttributionPhrases, "get /files/{id}")
+		}))
+		if err == nil || !strings.Contains(err.Error(), `attribution phrase "get /files/{id}" also occurs in criterion`) {
+			t.Fatalf("a phrase sibling criteria also state: err = %v, want the mode (p) refusal", err)
+		}
+	})
+	t.Run(string(CatchMissNotMentioned), func(t *testing.T) {
+		rule, _ := rawCommittedCatchRule(t, "seed-synthetic-restates-approach-observable")
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "risk", Note: "Migration 0052 should ship with a matching down migration."}), rule)
+		if got := classifyCatchMiss(trial, rule); trial.Outcome != CatchMissed || got != CatchMissNotMentioned {
+			t.Errorf("a concern touching neither half: outcome %q class %q, want missed / %q (genuine difficulty, no widening repairs it)", trial.Outcome, got, CatchMissNotMentioned)
+		}
+	})
+}
+
 func mustReadCatch(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -1306,6 +1421,22 @@ func TestRunCatchRateArm_FailClosed(t *testing.T) {
 			t.Errorf("a failed arm must return the zero report, got %+v", r)
 		}
 	})
+	t.Run("a generate error that does not wrap ErrResponseTruncated", func(t *testing.T) {
+		// Only the sentinel's IDENTITY makes a generate error a trial: an error
+		// that merely READS like truncation, or a refusal, still aborts the arm.
+		for _, genErr := range []error{
+			errors.New("anthropic: response truncated at max_tokens (8192 tokens); increase max_tokens"),
+			errors.New("anthropic: model refused to respond (stop_reason=refusal, category=general_harms)"),
+		} {
+			r, err := RunCatchRateArm(ctx, &fakeCatchRateSender{err: genErr}, cases, conv, ArmWithoutConventions, 2)
+			if !errors.Is(err, genErr) {
+				t.Fatalf("err = %v, want the generate error %q", err, genErr)
+			}
+			if r.PerCase != nil || r.Arm != "" {
+				t.Errorf("a failed arm must return the zero report, got %+v", r)
+			}
+		}
+	})
 	t.Run("samples < 1", func(t *testing.T) {
 		if _, err := RunCatchRateArm(ctx, ok, cases, conv, ArmWithoutConventions, 0); err == nil || !strings.Contains(err.Error(), "samples must be >= 1") {
 			t.Fatalf("err = %v", err)
@@ -1326,6 +1457,70 @@ func TestRunCatchRateArm_FailClosed(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+// TestRunCatchRateArm_TruncatedTrialIsAMissAndContinues pins the one non-fatal
+// generate error: a response the real anthropic client reports as truncated at
+// max_tokens (anthropic.ErrResponseTruncated) is an UNDECODABLE trial marked
+// Truncated, counted in Undecodable with diagnostic miss class `truncated`, and
+// the arm runs every remaining sample.
+func TestRunCatchRateArm_TruncatedTrialIsAMissAndContinues(t *testing.T) {
+	cases, conv := loadCommittedCatch(t)
+	c := cases[0]
+	caught := catchVerdictJSON(t, c.Input.CatchingExamples[0])
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		stop, text := "end_turn", caught
+		if requests == 2 {
+			stop, text = "max_tokens", `{"verdict":"approve_with_concerns","concerns":[{"note":"trunc`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_test", "type": "message", "role": "assistant",
+			"content":     []map[string]string{{"type": "text", "text": text}},
+			"model":       "claude-sonnet-5-5",
+			"stop_reason": stop,
+			"usage":       map[string]int{"input_tokens": 1, "output_tokens": 8192},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	sender := anthropic.NewClient(anthropic.Config{
+		APIKey: "test-key", Model: "claude-sonnet-5-5", MaxTokens: 8192, Timeout: 5 * time.Second,
+	}, option.WithBaseURL(srv.URL))
+
+	r, err := RunCatchRateArm(context.Background(), sender, cases[:1], conv, ArmWithoutConventions, 3)
+	if err != nil {
+		t.Fatalf("RunCatchRateArm: %v (a truncated response must be a trial, not an abort)", err)
+	}
+	if requests != 3 {
+		t.Errorf("server saw %d requests, want 3: the arm must continue past the truncated sample", requests)
+	}
+	if got := r.PerCase[c.Name]; got != (CaseCatchCounts{Trials: 3, Caught: 2, Undecodable: 1}) {
+		t.Errorf("counts = %+v, want 3 trials, 2 caught, 1 undecodable", got)
+	}
+	trials := r.Trials[c.Name]
+	if len(trials) != 3 {
+		t.Fatalf("recorded %d trials, want 3", len(trials))
+	}
+	rule := c.CatchRule()
+	for i, want := range []struct {
+		outcome   CatchOutcome
+		truncated bool
+		class     CatchMissClass
+	}{{CatchCaught, false, ""}, {CatchUndecodable, true, CatchMissTruncated}, {CatchCaught, false, ""}} {
+		tr := trials[i]
+		if tr.Outcome != want.outcome || tr.Truncated != want.truncated {
+			t.Errorf("trial %d = outcome %q truncated %v, want %q / %v", i+1, tr.Outcome, tr.Truncated, want.outcome, want.truncated)
+		}
+		if got := classifyCatchMiss(tr, rule); got != want.class {
+			t.Errorf("trial %d miss class = %q, want %q", i+1, got, want.class)
+		}
+	}
+	// An undecodable trial NOT marked Truncated keeps the undecodable class.
+	if got := classifyCatchMiss(CatchTrial{Outcome: CatchUndecodable, Response: "not json"}, rule); got != CatchMissUndecodable {
+		t.Errorf("unmarked undecodable miss class = %q, want %q", got, CatchMissUndecodable)
+	}
 }
 
 func TestSamplesPerCaseForPower(t *testing.T) {
