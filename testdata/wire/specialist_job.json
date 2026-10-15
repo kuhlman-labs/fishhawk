@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared cross-module golden for the specialist-job wire contract (E85.9 / #4300). job is a GET /v0/specialist-jobs/{job_id} body (server specialistJobResponse -> runner upload.SpecialistJob; never execution_nonce). admission is a POST .../admission answer. completions holds one valid POST .../result body per runner-executed kind plus an inconclusive-with-reason one (runner upload.SpecialistJobCompletion -> specialistjob.Completion). Backend tests ParseCompletion every entry; runner tests round-trip every entry through the upload structs with DisallowUnknownFields.",
+  "_comment": "Shared cross-module golden for the specialist-job wire contract (E85.9 / #4300). job is a GET /v0/specialist-jobs/{job_id} body (server specialistJobResponse -> runner upload.SpecialistJob; never execution_nonce). admission is a POST .../admission answer. admission_attested is the same answer as an attester's admission delivers it (E85.15 / #4363): attestation_key is the base64 std encoding of the 64-byte Ed25519 private key derived from result_attestation.seed_hex. result_attestation is the byte-exact result-signature vector: message_hex = sha256(\"fishhawk-specialist-job-result-v1\\u0000\" || job_id || 0x00 || sha256(body)) and signature_hex = Ed25519(seed, message) (deterministic, RFC 8032); the backend specialistjob.ResultMessage and the runner upload.SpecialistJobResultMessage both recompute it. completions holds one valid POST .../result body per runner-executed kind plus an inconclusive-with-reason one (runner upload.SpecialistJobCompletion -> specialistjob.Completion). Backend tests ParseCompletion every entry; runner tests round-trip every entry through the upload structs with DisallowUnknownFields.",
   "job": {
     "job_id": "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f",
     "kind": "overlap_scan",
@@ -82,6 +82,61 @@
       "started_at": "2026-10-12T19:00:05Z",
       "stale": false
     }
+  },
+  "admission_attested": {
+    "admitted": true,
+    "execution_nonce": "golden-execution-nonce",
+    "position": 0,
+    "contended": false,
+    "taken_over": false,
+    "job": {
+      "job_id": "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f",
+      "kind": "overlap_scan",
+      "state": "running",
+      "requester": {
+        "seat": "operator",
+        "actor_kind": "user",
+        "subject": "github:operator"
+      },
+      "subject": {
+        "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+        "head_sha": "1111111111111111111111111111111111111111"
+      },
+      "inputs": {
+        "runs": [
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c01",
+            "head_sha": "1111111111111111111111111111111111111111",
+            "base_sha": "2222222222222222222222222222222222222222"
+          },
+          {
+            "run_id": "0b0e3c1e-5f4a-4d55-9a3c-6f1f2a9d0c02",
+            "head_sha": "2222222222222222222222222222222222222222",
+            "base_sha": "1111111111111111111111111111111111111111"
+          }
+        ],
+        "watch_paths": [
+          "backend/internal/*/store.go"
+        ]
+      },
+      "admission_group": "local-verify:golden-host",
+      "host": "golden-host",
+      "requested_sequence": 7,
+      "requested_at": "2026-10-12T19:00:00Z",
+      "last_seen_at": "2026-10-12T19:00:05Z",
+      "started_at": "2026-10-12T19:00:05Z",
+      "stale": false
+    },
+    "attestation_key": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr9P0JnM1H14k9/p7CRBTssNm1QgIyqtMNkcRlvjPL5lxA==",
+    "attestation_expires_at": "2026-10-12T19:05:05Z"
+  },
+  "result_attestation": {
+    "seed_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "public_key_hex": "4fd099ccd47d7893dfe9ec24414ecb0d9b5420232aad30d91c465be33cbe65c4",
+    "job_id": "7d1f4c2a-1b2c-4d3e-8f90-0a1b2c3d4e5f",
+    "body": "{\"schema_version\":\"specialist-job-v1\",\"execution_nonce\":\"golden-execution-nonce\",\"kind\":\"inventory\",\"verdict\":\"inconclusive\",\"reason\":\"timeout\",\"duration_ms\":1234}",
+    "message_hex": "bcfb05cb640cc8acd47db350a7efc1b991e2970de5a3fbf3dc0f835a15f9aff0",
+    "signature_hex": "690188c6b4ecb6b5310bff169ac76d112f54604f8bc6a85c3d3880d55f7aa6d67ee427d852bd064a28f09266c55e1dffe2d971e4570e2bf8c7a492d576e88007"
   },
   "completions": {
     "counterfactual_battery": {

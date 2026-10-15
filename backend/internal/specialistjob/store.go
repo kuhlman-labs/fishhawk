@@ -2,6 +2,7 @@ package specialistjob
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,18 +25,15 @@ const (
 	CategoryRequested = "specialist_job_requested"
 	// CategoryCompleted: a job's typed result. Payload {job_id, kind,
 	// requester (from the job row), subject, verdict, reason, evidence,
-	// charged_to, duration_ms, requested_sequence, provenance}.
+	// charged_to, duration_ms, requested_sequence, provenance
+	// (bearer|runner_attested), blocking_eligible, attested_by (omitted
+	// unless runner_attested)}.
 	CategoryCompleted = "specialist_job_completed"
 	// CategoryTakenOver: a running job whose heartbeat went stale past
 	// concurrency.JobHeartbeatTTL was re-admitted under a new execution nonce
 	// (approval condition C1).
 	CategoryTakenOver = "specialist_job_taken_over"
 )
-
-// ProvenanceBearer is the completed payload's provenance: the result was
-// shipped under the forwarded operator bearer, NOT signed by the runner, so
-// it is not ADR-089 D4 blocking-grade evidence (#4363).
-const ProvenanceBearer = "bearer"
 
 // State is a specialist_jobs.state value.
 type State string
@@ -90,7 +88,8 @@ func (a Actor) ptrs() (*audit.ActorKind, *string) {
 }
 
 // Job is one specialist_jobs row. ExecutionNonce is a capability: a read
-// surface must never render it (approval condition C1).
+// surface must never render it (approval condition C1). The attestation
+// private key is never stored, so no Job field can carry it.
 type Job struct {
 	ID                uuid.UUID
 	AccountID         *uuid.UUID
@@ -110,6 +109,18 @@ type Job struct {
 	LastSeenAt        time.Time
 	StartedAt         *time.Time
 	CompletedAt       *time.Time
+	// Provenance is set only on a completed job: runner_attested or bearer
+	// (a pre-0104 completion, provenance NULL, reads as bearer).
+	Provenance string
+	// AttestationPublicKey is the job's live-or-expired attestation public
+	// key (nil when none was minted, or once a completion consumed it).
+	AttestationPublicKey ed25519.PublicKey
+	// AttestationSubject is the minting attester's token subject.
+	AttestationSubject   string
+	AttestationExpiresAt *time.Time
+	// AttestationLive is attestation_expires_at > clock_timestamp(), decided
+	// on the DATABASE clock by the reading statement.
+	AttestationLive bool
 }
 
 // Store is the pgx-backed specialist-job store over specialist_jobs (0103).
@@ -128,17 +139,21 @@ func NewStore(pool *pgxpool.Pool) *Store {
 const jobColumns = `id, account_id, kind, state, requester_seat, requester_actor_kind, requester_subject,
   subject_run_id, subject_campaign_id, COALESCE(subject_head_sha, ''), COALESCE(subject_repo, ''),
   inputs, COALESCE(admission_group, ''), host, COALESCE(execution_nonce, ''), COALESCE(verdict, ''), result,
-  requested_sequence, completed_sequence, requested_at, last_seen_at, started_at, completed_at`
+  requested_sequence, completed_sequence, requested_at, last_seen_at, started_at, completed_at,
+  CASE WHEN state = 'completed' THEN COALESCE(provenance, 'bearer') ELSE '' END,
+  attestation_public_key, COALESCE(attestation_subject, ''), attestation_expires_at,
+  COALESCE(attestation_expires_at > clock_timestamp(), false)`
 
 func scanJob(row pgx.Row) (*Job, error) {
 	var j Job
 	var acct, runID, campaignID pgtype.UUID
 	var kind, state, seat, verdict string
-	var inputs, result []byte
+	var inputs, result, pubKey []byte
 	if err := row.Scan(&j.ID, &acct, &kind, &state, &seat, &j.Requester.ActorKind, &j.Requester.Subject,
 		&runID, &campaignID, &j.Subject.HeadSHA, &j.Subject.Repo,
 		&inputs, &j.AdmissionGroup, &j.Host, &j.ExecutionNonce, &verdict, &result,
-		&j.RequestedSequence, &j.CompletedSequence, &j.RequestedAt, &j.LastSeenAt, &j.StartedAt, &j.CompletedAt); err != nil {
+		&j.RequestedSequence, &j.CompletedSequence, &j.RequestedAt, &j.LastSeenAt, &j.StartedAt, &j.CompletedAt,
+		&j.Provenance, &pubKey, &j.AttestationSubject, &j.AttestationExpiresAt, &j.AttestationLive); err != nil {
 		return nil, err
 	}
 	if acct.Valid {
@@ -153,6 +168,9 @@ func scanJob(row pgx.Row) (*Job, error) {
 	}
 	j.Kind, j.State, j.Requester.Seat, j.Verdict = Kind(kind), State(state), Seat(seat), Verdict(verdict)
 	j.Inputs, j.Result = inputs, result
+	if len(pubKey) > 0 {
+		j.AttestationPublicKey = ed25519.PublicKey(pubKey)
+	}
 	return &j, nil
 }
 
@@ -236,6 +254,8 @@ type completedPayload struct {
 	DurationMS        int64           `json:"duration_ms"`
 	RequestedSequence int64           `json:"requested_sequence"`
 	Provenance        string          `json:"provenance"`
+	BlockingEligible  bool            `json:"blocking_eligible"`
+	AttestedBy        string          `json:"attested_by,omitempty"`
 }
 
 type takenOverPayload struct {
@@ -294,7 +314,7 @@ func (s *Store) CreateCompleted(ctx context.Context, p CreateCompletedParams) (*
 			return err
 		}
 		requester := Actor{Kind: audit.ActorKind(p.Requester.ActorKind), Subject: p.Requester.Subject}
-		job, err = s.completeTx(ctx, tx, created, &completion, requester)
+		job, err = s.completeTx(ctx, tx, created, &completion, requester, ProvenanceBearer, "")
 		return err
 	})
 	if err != nil {
@@ -426,6 +446,12 @@ type AdmitParams struct {
 	Nonce string
 	// Actor is the admitting identity (the takeover entry's actor).
 	Actor Actor
+	// Attester is the caller's token subject when it is an attester (an
+	// explicit API token holding AttestScope); empty means not an attester.
+	// An admission that moves the job to running mints a key for a non-empty
+	// Attester and CLEARS any previous key otherwise; a same-nonce heartbeat
+	// refreshes the key's expiry only when Attester is the minting subject.
+	Attester string
 }
 
 // Admission is AdmitJob's verdict.
@@ -443,6 +469,11 @@ type Admission struct {
 	// TakenOver: this admission replaced a stale running job's nonce.
 	TakenOver bool
 	Job       *Job
+	// AttestationKey is the job-scoped private key, delivered ONCE: set only
+	// by the admission that minted it (never on a heartbeat or a queue
+	// answer). The store keeps only the public half.
+	AttestationKey       ed25519.PrivateKey
+	AttestationExpiresAt *time.Time
 }
 
 // AdmitJob admits one runner-executed job through the local-verify:<host>
@@ -461,6 +492,11 @@ type Admission struct {
 //     (a job yields to merge-candidate passes), and no fresh queued job of
 //     the same group and account is older. Otherwise it stays queued with a
 //     refreshed last_seen_at.
+//   - An admission that moves the job to running (fresh or takeover) mints
+//     an attestation key for a non-empty p.Attester, returned once in
+//     Admission.AttestationKey, and clears any previous key otherwise. A
+//     same-nonce heartbeat slides the key's expiry by AttestationTTL only
+//     when p.Attester is the minting subject.
 func (s *Store) AdmitJob(ctx context.Context, p AdmitParams) (*Admission, error) {
 	switch {
 	case p.JobID == uuid.Nil:
@@ -491,8 +527,14 @@ func (s *Store) admitTx(ctx context.Context, tx pgx.Tx, p AdmitParams) (*Admissi
 	takeover := false
 	if job.State == StateRunning {
 		if job.ExecutionNonce == p.Nonce {
-			job, err = scanJob(tx.QueryRow(ctx, `UPDATE specialist_jobs SET last_seen_at = clock_timestamp()
-WHERE id = $1 RETURNING `+jobColumns, job.ID))
+			// A heartbeat slides the key's expiry only for the minting
+			// attester, and never re-delivers the key.
+			job, err = scanJob(tx.QueryRow(ctx, `UPDATE specialist_jobs SET last_seen_at = clock_timestamp(),
+  attestation_expires_at = CASE
+    WHEN $2 <> '' AND attestation_subject = $2 AND attestation_public_key IS NOT NULL
+      THEN clock_timestamp() + make_interval(secs => $3)
+    ELSE attestation_expires_at END
+WHERE id = $1 RETURNING `+jobColumns, job.ID, p.Attester, AttestationTTL.Seconds()))
 			if err != nil {
 				return nil, fmt.Errorf("specialistjob: heartbeat: %w", err)
 			}
@@ -542,11 +584,25 @@ WHERE id = $1 RETURNING `+jobColumns, job.ID, group, p.Host))
 		return out, nil
 	}
 
+	// An attester gets a fresh key; any other admitter clears the columns, so
+	// a takeover always invalidates the previous runner's key.
+	var pub []byte
+	var priv ed25519.PrivateKey
+	if p.Attester != "" {
+		var pk ed25519.PublicKey
+		if pk, priv, err = MintAttestationKey(); err != nil {
+			return nil, err
+		}
+		pub = pk
+	}
 	previous := job
 	job, err = scanJob(tx.QueryRow(ctx, `UPDATE specialist_jobs
 SET state = 'running', admission_group = $2, host = $3, execution_nonce = $4,
-  started_at = clock_timestamp(), last_seen_at = clock_timestamp()
-WHERE id = $1 RETURNING `+jobColumns, job.ID, group, p.Host, p.Nonce))
+  started_at = clock_timestamp(), last_seen_at = clock_timestamp(),
+  attestation_public_key = $5, attestation_subject = $6,
+  attestation_expires_at = CASE WHEN $5::bytea IS NULL THEN NULL
+    ELSE clock_timestamp() + make_interval(secs => $7) END
+WHERE id = $1 RETURNING `+jobColumns, job.ID, group, p.Host, p.Nonce, pub, nullText(p.Attester), AttestationTTL.Seconds()))
 	if err != nil {
 		return nil, fmt.Errorf("specialistjob: admit job: %w", err)
 	}
@@ -562,7 +618,10 @@ WHERE id = $1 RETURNING `+jobColumns, job.ID, group, p.Host, p.Nonce))
 			return nil, err
 		}
 	}
-	return &Admission{Admitted: true, ExecutionNonce: p.Nonce, TakenOver: takeover, Job: job}, nil
+	// Without an attester both are nil: priv was never minted and the UPDATE
+	// set attestation_expires_at NULL.
+	return &Admission{Admitted: true, ExecutionNonce: p.Nonce, TakenOver: takeover, Job: job,
+		AttestationKey: priv, AttestationExpiresAt: job.AttestationExpiresAt}, nil
 }
 
 // CompleteParams ships one running job's completion.
@@ -574,13 +633,31 @@ type CompleteParams struct {
 	// Actor is the completing identity (the completed entry's actor). The
 	// payload's requester always comes from the job row, never from Actor.
 	Actor Actor
+	// Attestation is the result's signature, or nil for an unsigned (bearer)
+	// result.
+	Attestation *ResultAttestation
+}
+
+// ResultAttestation is a signed result as posted.
+type ResultAttestation struct {
+	// Signature is the decoded Ed25519 signature over ResultMessage.
+	Signature []byte
+	// Body is the EXACT request body Completion was parsed from.
+	Body []byte
+	// CallerSubject is the posting identity's token subject; it must be the
+	// key's minting subject.
+	CallerSubject string
 }
 
 // Complete records a running job's typed result: it appends
 // specialist_job_completed and sets the row completed in ONE transaction. A
 // queued or completed job is ErrNotRunning, a different execution nonce is
-// ErrNonceMismatch, and a completion kind that is not the job's is
-// ErrKindMismatch. It touches only specialist_jobs and the audit chain.
+// ErrNonceMismatch, a signed result the job's stored attestation does not
+// verify is ErrAttestationInvalid (an *AttestationError, nothing written),
+// and a completion kind that is not the job's is ErrKindMismatch. A verified
+// result records provenance runner_attested and consumes the key; an
+// unsigned one records bearer. It touches only specialist_jobs and the audit
+// chain.
 func (s *Store) Complete(ctx context.Context, p CompleteParams) (*Job, error) {
 	switch {
 	case p.JobID == uuid.Nil:
@@ -600,7 +677,16 @@ func (s *Store) Complete(ctx context.Context, p CompleteParams) (*Job, error) {
 		if p.Completion.ExecutionNonce != locked.ExecutionNonce {
 			return fmt.Errorf("specialistjob: job %s: %w", locked.ID, ErrNonceMismatch)
 		}
-		job, err = s.completeTx(ctx, tx, locked, p.Completion, p.Actor)
+		provenance := ProvenanceBearer
+		attestedBy := ""
+		if a := p.Attestation; a != nil {
+			stored := StoredAttestation{PublicKey: locked.AttestationPublicKey, Subject: locked.AttestationSubject, Live: locked.AttestationLive}
+			if err := VerifyResultAttestation(stored, a.CallerSubject, locked.ID, a.Body, a.Signature); err != nil {
+				return fmt.Errorf("specialistjob: job %s: %w", locked.ID, err)
+			}
+			provenance, attestedBy = ProvenanceRunnerAttested, a.CallerSubject
+		}
+		job, err = s.completeTx(ctx, tx, locked, p.Completion, p.Actor, provenance, attestedBy)
 		return err
 	})
 	if err != nil {
@@ -612,8 +698,8 @@ func (s *Store) Complete(ctx context.Context, p CompleteParams) (*Job, error) {
 // completeTx composes the result from the job ROW (requester, subject,
 // charge) and the completion (verdict, reason, evidence, duration), validates
 // it against $defs.result, appends specialist_job_completed and sets the row
-// completed.
-func (s *Store) completeTx(ctx context.Context, tx pgx.Tx, job *Job, c *Completion, actor Actor) (*Job, error) {
+// completed with provenance, consuming any attestation key.
+func (s *Store) completeTx(ctx context.Context, tx pgx.Tx, job *Job, c *Completion, actor Actor, provenance, attestedBy string) (*Job, error) {
 	if c.Kind != job.Kind {
 		return nil, fmt.Errorf("specialistjob: job %s is %s, completion is %s: %w", job.ID, job.Kind, c.Kind, ErrKindMismatch)
 	}
@@ -631,7 +717,8 @@ func (s *Store) completeTx(ctx context.Context, tx pgx.Tx, job *Job, c *Completi
 	payload, err := json.Marshal(completedPayload{
 		JobID: job.ID.String(), Kind: job.Kind, Requester: job.Requester, Subject: job.Subject,
 		Verdict: c.Verdict, Reason: c.Reason, Evidence: c.Evidence, ChargedTo: charged,
-		DurationMS: c.DurationMS, RequestedSequence: job.RequestedSequence, Provenance: ProvenanceBearer,
+		DurationMS: c.DurationMS, RequestedSequence: job.RequestedSequence,
+		Provenance: provenance, BlockingEligible: BlockingEligible(provenance), AttestedBy: attestedBy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("specialistjob: marshal completed payload: %w", err)
@@ -641,10 +728,40 @@ func (s *Store) completeTx(ctx context.Context, tx pgx.Tx, job *Job, c *Completi
 		return nil, err
 	}
 	out, err := scanJob(tx.QueryRow(ctx, `UPDATE specialist_jobs
-SET state = 'completed', verdict = $2, result = $3, completed_sequence = $4, completed_at = clock_timestamp()
-WHERE id = $1 RETURNING `+jobColumns, job.ID, string(c.Verdict), result, entry.Sequence))
+SET state = 'completed', verdict = $2, result = $3, completed_sequence = $4, completed_at = clock_timestamp(),
+  provenance = $5, attestation_public_key = NULL, attestation_expires_at = NULL
+WHERE id = $1 RETURNING `+jobColumns, job.ID, string(c.Verdict), result, entry.Sequence, provenance))
 	if err != nil {
 		return nil, fmt.Errorf("specialistjob: complete job: %w", err)
+	}
+	return out, nil
+}
+
+// listCompletedLimit bounds ListCompletedForRun.
+const listCompletedLimit = 100
+
+// ListCompletedForRun returns the completed jobs whose subject is runID in
+// the caller's account, ordered by completed_sequence (the run chain's
+// order), at most 100.
+func (s *Store) ListCompletedForRun(ctx context.Context, acct *uuid.UUID, runID uuid.UUID) ([]*Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobColumns+`
+FROM specialist_jobs
+WHERE subject_run_id = $1 AND account_id IS NOT DISTINCT FROM $2 AND state = 'completed'
+ORDER BY completed_sequence, id LIMIT $3`, runID, acct, listCompletedLimit)
+	if err != nil {
+		return nil, fmt.Errorf("specialistjob: list completed jobs: %w", err)
+	}
+	defer rows.Close()
+	var out []*Job
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("specialistjob: scan completed job: %w", err)
+		}
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("specialistjob: list completed jobs: %w", err)
 	}
 	return out, nil
 }

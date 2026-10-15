@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 // gateViewLongNote is deliberately longer than the MCP compaction levers'
@@ -2662,4 +2663,140 @@ func TestGateView_MergeCandidateVerdictReadFailureRecordsGap(t *testing.T) {
 			t.Errorf("block = %+v, gaps = %v; want no block and a gap", resp.MergeCandidateVerdict, resp.HistoryGaps)
 		}
 	})
+}
+
+// --- E85.15 (#4363): the display-only specialist_jobs block ---
+
+// gvSJStore fakes ListCompletedForRun for the gate view; every other method
+// is the nil embedded interface (the gate view must not call one).
+type gvSJStore struct {
+	SpecialistJobStore
+	jobs  []*specialistjob.Job
+	err   error
+	calls int
+	acct  *uuid.UUID
+	runID uuid.UUID
+}
+
+func (f *gvSJStore) ListCompletedForRun(_ context.Context, acct *uuid.UUID, runID uuid.UUID) ([]*specialistjob.Job, error) {
+	f.calls++
+	f.acct, f.runID = acct, runID
+	return f.jobs, f.err
+}
+
+func gvSJJob(kind specialistjob.Kind, verdict specialistjob.Verdict, provenance string, seq int64) *specialistjob.Job {
+	return &specialistjob.Job{ID: uuid.New(), Kind: kind, State: specialistjob.StateCompleted, Verdict: verdict,
+		Provenance: provenance, CompletedSequence: &seq,
+		Result: json.RawMessage(`{"reason":"untrusted job-authored reason text must never reach the gate view"}`)}
+}
+
+func TestGateView_SpecialistJobsBlock(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	acct := uuid.New()
+	repo.mu.Lock()
+	repo.runs[runID].AccountID = acct.String()
+	repo.mu.Unlock()
+	a := gvSJJob(specialistjob.KindFaninBuild, specialistjob.VerdictPass, specialistjob.ProvenanceRunnerAttested, 7)
+	b := gvSJJob(specialistjob.KindInventory, specialistjob.VerdictFail, specialistjob.ProvenanceBearer, 9)
+	store := &gvSJStore{jobs: []*specialistjob.Job{a, b}}
+	s.cfg.SpecialistJobs = store
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if store.calls != 1 || store.runID != runID || store.acct == nil || *store.acct != acct {
+		t.Fatalf("ListCompletedForRun calls=%d run=%s acct=%v, want once for the run's account %s", store.calls, store.runID, store.acct, acct)
+	}
+	want := []gateViewSpecialistJob{
+		{JobID: a.ID.String(), Kind: "fanin_build", Verdict: "pass", Provenance: "runner_attested", BlockingEligible: true, CompletedSequence: 7},
+		{JobID: b.ID.String(), Kind: "inventory", Verdict: "fail", Provenance: "bearer", BlockingEligible: false, CompletedSequence: 9},
+	}
+	if !slices.Equal(resp.SpecialistJobs, want) {
+		t.Fatalf("specialist_jobs = %+v, want %+v", resp.SpecialistJobs, want)
+	}
+	if resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Fatalf("history gaps = %v, want none", resp.HistoryGaps)
+	}
+	// Member names on the wire (enum and id members only).
+	var raw struct {
+		SpecialistJobs []map[string]any `json:"specialist_jobs"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	var keys []string
+	for k := range raw.SpecialistJobs[0] {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	if wantKeys := []string{"blocking_eligible", "completed_sequence", "job_id", "kind", "provenance", "verdict"}; !slices.Equal(keys, wantKeys) {
+		t.Fatalf("specialist_jobs members = %v, want %v", keys, wantKeys)
+	}
+	if strings.Contains(w.Body.String(), "untrusted job-authored") {
+		t.Fatalf("job-authored text reached the gate view: %s", w.Body.String())
+	}
+}
+
+func TestGateView_SpecialistJobsReadFailureIsHistoryGap(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindPlan, "m", 1, "high", "correctness", "note", "")
+	s.cfg.SpecialistJobs = &gvSJStore{err: errors.New("db down")}
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if resp.SpecialistJobs != nil || strings.Contains(w.Body.String(), `"specialist_jobs":`) {
+		t.Fatalf("a failed read rendered a specialist_jobs block: %s", w.Body.String())
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapSpecialistJobs) {
+		t.Fatalf("history gaps = %v (incomplete=%v), want %q", resp.HistoryGaps, resp.HistoryIncomplete, gateViewGapSpecialistJobs)
+	}
+	if len(resp.Open) != 1 {
+		t.Fatalf("open concerns = %d, want the rest of the view intact", len(resp.Open))
+	}
+}
+
+func TestGateView_SpecialistJobsNonUUIDRunAccountIsGap(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	repo.mu.Lock()
+	repo.runs[runID].AccountID = "not-a-uuid"
+	repo.mu.Unlock()
+	store := &gvSJStore{}
+	s.cfg.SpecialistJobs = store
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if store.calls != 0 || resp.SpecialistJobs != nil {
+		t.Fatalf("unparseable run account: calls=%d block=%v, want no read and no block", store.calls, resp.SpecialistJobs)
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapSpecialistJobs) {
+		t.Fatalf("history gaps = %v, want %q", resp.HistoryGaps, gateViewGapSpecialistJobs)
+	}
+}
+
+func TestGateView_SpecialistJobsOmittedWhenUnwired(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if resp.SpecialistJobs != nil || strings.Contains(w.Body.String(), `"specialist_jobs":`) {
+		t.Fatalf("unwired store rendered a specialist_jobs block: %s", w.Body.String())
+	}
+	if resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Fatalf("unwired store recorded gaps %v", resp.HistoryGaps)
+	}
+}
+
+// Approval condition C2: the block is attached by handleGetRunGateView, never
+// by buildGateView, which the attention scan calls once per run.
+func TestBuildGateView_DoesNotReadSpecialistJobs(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	store := &gvSJStore{jobs: []*specialistjob.Job{gvSJJob(specialistjob.KindInventory, specialistjob.VerdictPass, specialistjob.ProvenanceBearer, 1)}}
+	s.cfg.SpecialistJobs = store
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list concerns: %v", err)
+	}
+	resp := s.buildGateView(context.Background(), runID, "", rows)
+	if store.calls != 0 || resp.SpecialistJobs != nil {
+		t.Fatalf("buildGateView read specialist jobs (calls=%d)", store.calls)
+	}
 }
