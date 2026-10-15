@@ -8,7 +8,7 @@ The typed, addressed message one crew role sends another. Implements [ADR-081](h
 
 ## Not a plan artifact
 
-A crew message is **not** a plan `ArtifactKind`. `backend/internal/plan` is untouched and routes nothing here: `plan-standard-v1` stays frozen, and this contract carries its own schema, its own embedded mirror and its own validator so it can move on its own major. A message is not a concern either — a `finding` never enters the merge gate.
+A crew message is **not** a plan `ArtifactKind`. `backend/internal/plan` is untouched and routes nothing here: `plan-standard-v1` stays frozen, and this contract carries its own schema, its own embedded mirror and its own validator so it can move on its own major. A message is not a concern either — a `finding` never enters the merge gate, with one server-side exception: a blocking `first_officer` finding (see [First-officer findings](#first-officer-findings)).
 
 ## Mirrors
 
@@ -26,7 +26,7 @@ There is deliberately **no runner and no CLI mirror**: the runner neither writes
 |---|---|---|---|
 | `schema_version` | string, const `crew-message-v1` | yes | contract discriminator; a future major is a new file, never a break in place |
 | `type` | enum | yes | `consult`, `finding`, `work_request`, `notice`, `escalation` — selects the payload shape |
-| `sender_role` | crew role | yes | on the wire the server **derives** this from the caller's identity (a run token's executing stage, or `captain` for an operator) and never takes it from a request body: a body may omit it or repeat the derived role, and any other value is refused `sender_role_not_settable` (rule 3) |
+| `sender_role` | crew role | yes | on the wire the server **derives** this from the caller's identity (a run token's executing stage, `first_officer` for a first-officer seat token, or `captain` for an operator) and never takes it from a request body: a body may omit it or repeat the derived role, and any other value is refused `sender_role_not_settable` (rule 3) |
 | `recipient_role` | crew role | yes | the addressee; see [Invariants](#invariants) — the schema alone does **not** enforce invariant #8 |
 | `anchor` | object | yes | exactly one of `run_id` (uuid), `issue_ref`, `decision_record_id` |
 | `payload` | object | yes | narrowed to one closed per-type shape by the `allOf` `if`/`then` arms |
@@ -34,7 +34,7 @@ There is deliberately **no runner and no CLI mirror**: the runner neither writes
 | `response_required` | boolean (default `false`) | no | legal only on `consult` and `escalation`; enforced in Go, not in the schema |
 | `deadline` | RFC 3339 date-time | no | after it, the sender stops waiting; an unanswered consult times out to "no answer" and never blocks the stage |
 
-The crew-role enum is closed: `captain`, `planner`, `architect`, `historian`, `security`, `reviewer`, `implementer`. Adding an eighth role is an additive change within this major (AGENTS.md schema-change checklist step 1) and must be added to `crewmessage.AllRoles` in the same change — `TestSchemaRoleEnumMatchesAllRoles` pins the two sides against each other in both directions.
+The crew-role enum is closed: `captain`, `planner`, `architect`, `historian`, `security`, `reviewer`, `implementer`, `first_officer` (the ADR-089 seat, added additively by E85.6 / #4148). Adding a role is an additive change within this major (AGENTS.md schema-change checklist step 1) and must be added to `crewmessage.AllRoles` in the same change — `TestSchemaRoleEnumMatchesAllRoles` pins the two sides against each other in both directions.
 
 ## Payloads
 
@@ -43,7 +43,7 @@ Every payload object closes with `additionalProperties: false` in its **own** sc
 | Type | Required | Optional | Semantics |
 |---|---|---|---|
 | `consult` | `question` | `what_i_can_infer`, `context` | a question answered synchronously in-process (ADR-081 D1 option 1); first use is planner → historian |
-| `finding` | `summary` | `detail`, `severity` (`low`/`medium`/`high`) | an observation. **Not** a concern: it enters no gate. `severity` is advisory |
+| `finding` | `summary` | `detail`, `severity` (`low`/`medium`/`high`) | an observation. **Not** a concern: it enters no gate. `severity` is advisory. The one exception is a blocking `first_officer` finding, below |
 | `work_request` | `title`, `summary` | `rationale` | files an item through the existing work-item path, run-scoped; **never** dispatches a run |
 | `notice` | `summary` | `detail` | information, delivered asynchronously, no answer expected |
 | `escalation` | `summary`, `recommended_default`, `tradeoffs` | — | a disagreement surfaced to the captain; becomes binding only once the captain answers |
@@ -76,6 +76,24 @@ That split is deliberate, not an oversight:
 - Excluding `implementer` from the enum would enforce the rule twice, but the schema layer would then **mask** the Go rule: deleting the Go check would leave the fixture still rejected by the enum, the test would stay green, and the rule would be untested dead code. Keeping the enum wide leaves `CanReceive` the sole gate in its fixture's path, so `TestValidate_RejectsImplementRecipient` is a genuine counterfactual — and that test asserts the schema accepts the document as an explicit precondition, so if the enum ever narrows, the masking is reported rather than silently tolerated.
 
 A later E77 child that ships this schema to a **non-backend process** must re-evaluate this: without a Go validator in that process, invariant #8 would go unenforced there, and the right answer may then be a second, narrower recipient enum rather than this one.
+
+## First-officer findings
+
+E85.6 / #4148 (ADR-089 D4). A first-officer **seat** is an API token whose subject is `first_officer/campaign/<uuid>` or `first_officer/run/<uuid>` (contract: `backend/internal/firstofficer/README.md`). On `POST /v0/crew-messages` the server derives `sender_role: first_officer` and actor `agent` for it, and refuses — before any append — every send outside the seat's lane:
+
+| Refusal | Code |
+|---|---|
+| type other than `finding` / `notice` (a `work_request` would be a tracker write) | 403 `first_officer_type_not_permitted` |
+| recipient other than `captain` | 403 `first_officer_recipient_not_permitted` |
+| anchor not a `run_id` inside the seat (a run seat: its own run; a campaign seat: a run a campaign item links) | 403 `first_officer_anchor_out_of_seat` |
+| the in-seat check cannot read the campaign store | 503 `first_officer_seat_unverifiable` |
+| the cited evidence cannot be read | 503 `first_officer_evidence_unreadable` |
+
+The captain can address `first_officer`; the seat reads its mailbox through `GET /v0/crew-messages?recipient_role=first_officer` under `read:audit`. Delivery rides the chain by role, never a session name (ADR-089 D7).
+
+**Blocking conversion.** A seat `finding` is BLOCKING iff one of its `audit_entry` evidence refs is the decimal sequence of a `specialist_job_completed` entry on the anchor run's own chain whose job — re-read through the specialist-job store under the run's account — is completed, verdict `fail`, provenance `runner_attested` (`specialistjob.BlockingEligible`, #4363) and about the anchor run. The server then inserts a concern (`provenance: first_officer`, `category: crew_finding`, `check_key: first_officer:job:<job_id>`, severity = the finding's, default `medium`), THEN disposes the finding `accepted`, and appends `crew_finding_converted` with `provenance` and `blocking_basis {specialist_job_id, completed_sequence}` (actor `system`). The 201 send response carries `blocking_concern_id`, or `blocking_conversion_error` when the insert did not land — the finding then stays OPEN and advisory. Every other seat finding (bearer provenance, a pass/inconclusive verdict, another run's sequence, a non-numeric ref, judgement alone) stays advisory.
+
+While a `first_officer` concern is open, plan approve (plan-kind), review approve (implement-kind) and `POST /v0/runs/{id}/merge` refuse 409 `first_officer_finding_open`; a reject is never held. The captain clears it through the existing concern surface (waive with a reason, defer, or a fix-up naming it).
 
 ## Example
 

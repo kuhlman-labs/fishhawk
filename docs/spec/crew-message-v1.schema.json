@@ -24,7 +24,7 @@
     "type": {
       "type": "string",
       "enum": ["consult", "finding", "work_request", "notice", "escalation"],
-      "description": "The closed five-member type set of ADR-081 rule 1. A consult asks a question and is answered synchronously in-process; a finding records an observation and is NOT a concern (it never enters the merge gate); a work_request asks for an item to be filed and never dispatches a run; a notice informs and expects no answer; an escalation surfaces a disagreement to the captain and produces binding text only once the captain answers. The enum selects the payload shape via the allOf if/then arms below."
+      "description": "The closed five-member type set of ADR-081 rule 1. A consult asks a question and is answered synchronously in-process; a finding records an observation and is NOT a concern (it never enters the merge gate, except that a first_officer finding citing a runner-attested failing specialist-job completion on its anchor run is server-converted into a first_officer concern, ADR-089 D4); a work_request asks for an item to be filed and never dispatches a run; a notice informs and expects no answer; an escalation surfaces a disagreement to the captain and produces binding text only once the captain answers. The enum selects the payload shape via the allOf if/then arms below."
     },
     "sender_role": {
       "$ref": "#/$defs/crew-role",
@@ -123,9 +123,10 @@
         "historian",
         "security",
         "reviewer",
-        "implementer"
+        "implementer",
+        "first_officer"
       ],
-      "description": "The closed crew vocabulary (ADR-081 rules 3 and 8, plus E78's plan-fit reviewer persona). An ENUM, never a free string, so a model identifier ('claude-opus-5') or an agent instance name can never be an address. 'implementer' is a member ON PURPOSE: the implementer is a real crew role and a legal sender_role. What invariant #8 forbids is ADDRESSING one, and that refusal lives in crewmessage.CanReceive so it is a live, testable control rather than dead code masked by a narrower enum. Adding an eighth role is an additive change within this major."
+      "description": "The closed crew vocabulary (ADR-081 rules 3 and 8, plus E78's plan-fit reviewer persona). An ENUM, never a free string, so a model identifier ('claude-opus-5') or an agent instance name can never be an address. 'implementer' is a member ON PURPOSE: the implementer is a real crew role and a legal sender_role. What invariant #8 forbids is ADDRESSING one, and that refusal lives in crewmessage.CanReceive so it is a live, testable control rather than dead code masked by a narrower enum. 'first_officer' is the ADR-089 seat (E85.6 / #4148): it is server-derived for a seat-subject token, sends only finding and notice messages to the captain, and is addressable by the captain. Adding a role is an additive change within this major."
     },
 
     "anchor": {
@@ -208,7 +209,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["summary"],
-      "description": "An observation one role wants another to see. A finding is NOT a concern: it never enters the merge gate and nothing is blocked by it. If the captain wants one acted on they route it explicitly (ADR-081 rule 2).",
+      "description": "An observation one role wants another to see. A finding is NOT a concern: it never enters the merge gate and nothing is blocked by it. If the captain wants one acted on they route it explicitly (ADR-081 rule 2). ONE server-side exception (ADR-089 D4, E85.6 / #4148): a first_officer finding whose evidence cites a runner-attested FAILING specialist-job completion on its anchor run is converted by the server into a concern with provenance first_officer, which holds plan approval, review approval and merge until it is dispositioned. Every other finding still feeds no gate.",
       "properties": {
         "summary": {
           "type": "string",
@@ -222,7 +223,7 @@
         "severity": {
           "type": "string",
           "enum": ["low", "medium", "high"],
-          "description": "Optional sender-assessed severity. Advisory: it feeds no gate and changes no outcome."
+          "description": "Optional sender-assessed severity. Advisory: it feeds no gate and changes no outcome, except that it becomes the severity of a server-converted first_officer concern (default medium)."
         }
       }
     },

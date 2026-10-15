@@ -253,9 +253,11 @@ type Concern struct {
 	SeverityClampedFrom string
 	// Provenance records who minted the concern when it was NOT a model
 	// reviewer's verdict (E80.3 / #3760): ProvenanceServerCheck for a concern
-	// the server synthesized from a deterministic check, '' for a row written
-	// by a reviewer verdict, an operator fix-up or a crew conversion — and for
-	// every row minted before migration 0094. Read it through IsServerCheck.
+	// the server synthesized from a deterministic check, ProvenanceFirstOfficer
+	// for a server-converted blocking first-officer finding (E85.6 / #4148),
+	// '' for a row written by a reviewer verdict, an operator fix-up or a
+	// captain's crew conversion — and for every row minted before migration
+	// 0094. Read the server-check case through IsServerCheck.
 	Provenance string
 	// CheckKey is the server check's de-duplication key (E80.3 / #3760), so a
 	// re-run of the same check across review rounds does not mint a duplicate
@@ -271,6 +273,15 @@ type Concern struct {
 // waive, bulk-waive and defer handlers refuse an agent token or a delegated
 // request with 403 concern_requires_human.
 const ProvenanceServerCheck = "server_check"
+
+// ProvenanceFirstOfficer is the provenance of a concern the server converted
+// from a first-officer seat finding that cited a runner-attested FAILING
+// specialist-job completion on its anchor run (ADR-089 D4, E85.6 / #4148).
+// While one is open it holds plan approval, review approval and merge (409
+// first_officer_finding_open); it is dispositioned through the existing
+// accept / waive-with-reason / defer surface. Its CheckKey is
+// first_officer:job:<job_id>.
+const ProvenanceFirstOfficer = "first_officer"
 
 // IsServerCheck reports whether the concern was synthesized by a server check
 // (Provenance == ProvenanceServerCheck) rather than raised by a reviewer. The
@@ -398,8 +409,10 @@ type InsertRaisedParams struct {
 	// and stored as '' (unattributed), never defaulted to standard here.
 	ReviewerRole string
 	// Provenance is stamped on every concern of the entry (E80.3 / #3760):
-	// ProvenanceServerCheck for a server-synthesized entry, '' for a reviewer
-	// verdict, an operator fix-up or a crew conversion. Stored VERBATIM.
+	// ProvenanceServerCheck for a server-synthesized entry,
+	// ProvenanceFirstOfficer for a blocking first-officer finding's automatic
+	// conversion, '' for a reviewer verdict, an operator fix-up or a captain's
+	// crew conversion. Stored VERBATIM.
 	Provenance           string
 	OriginReviewSequence int64
 	Concerns             []RaisedConcern
