@@ -13684,6 +13684,7 @@ func TestSemverLT(t *testing.T) {
 		{"v1.0.0", "v0.9.9", false},
 		{"v0.4.0", "v0.5.0", true},
 		{"v0.5.0", "v0.4.0", false},
+		{"v0.4.9-rc.1", "v0.5.0", true}, // a pre-release runner is below the floor
 		// dev builds never trigger skew
 		{"dev", "v0.5.0", false},
 		{"v0.4.0", "dev", false},
@@ -13760,7 +13761,8 @@ func TestRun_VersionSkewDetected(t *testing.T) {
 		MinRunnerVersion: "v0.5.0",
 	}
 	withFakeUploader(t, fu)
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
 
 	var stderr strings.Builder
 	got := run([]string{
@@ -13778,6 +13780,19 @@ func TestRun_VersionSkewDetected(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"min_required":"v0.5.0"`) {
 		t.Errorf("missing min_required in log:\n%s", stderr.String())
+	}
+	// The named reason the local reaper records as the stage failure (#4135).
+	if !strings.Contains(stderr.String(), `"event":"runner_failed","reason":"version_skew"`) {
+		t.Errorf("missing runner_failed version_skew line:\n%s", stderr.String())
+	}
+	for _, want := range []string{"v0.4.0", "v0.5.0", "upgrade fishhawk-runner to at least v0.5.0"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("runner_failed detail missing %q:\n%s", want, stderr.String())
+		}
+	}
+	// The refusal precedes the agent: it must never be spawned.
+	if inv.callIdx != 0 || inv.gotInv != nil {
+		t.Errorf("agent invoked %d time(s) past the version-skew refusal, want 0", inv.callIdx)
 	}
 }
 

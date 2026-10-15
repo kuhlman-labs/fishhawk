@@ -69,12 +69,12 @@
 # and the runner's container path mounts a runner-generated one on every exec
 # (#2137).
 
-ARG GO_VERSION=1.25.6
+ARG GO_VERSION=1.26.9
 
 FROM golang:${GO_VERSION}-bookworm
 
 ARG TARGETARCH
-ARG GOLANGCI_LINT_VERSION=v2.8.0
+ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG HELM_VERSION=v4.2.4
 ARG CHECK_JSONSCHEMA_VERSION=0.38.0
 

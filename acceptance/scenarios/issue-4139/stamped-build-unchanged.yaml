@@ -1,0 +1,14 @@
+id: scenario:issue-4139/stamped-build-unchanged
+statement: 'A fishhawk CLI built with the -ldflags that `scripts/release-ldflags fishhawk v9.9.9 <sha>` prints reports exactly `v9.9.9 (<sha>)` on `fishhawk version`, exit 0: the ldflags stamp wins over build info.'
+verify_hint: CLI stdout and exit code of `<bin> version` for a binary built with `-ldflags "$(scripts/release-ldflags fishhawk v9.9.9 <HEAD sha>)"`.
+steps: In the clean clone at de5c473a, ran LD=$(scripts/release-ldflags fishhawk v9.9.9 de5c473a3d83ba52fc2953a83308b52029135a57), then go build -ldflags "$LD" -o /tmp/fh4139/fh-stamped ./cli/cmd/fishhawk, then fh-stamped version. Repeated the build inside the sanctioned checkout.
+assertions:
+    expected: exactly `v9.9.9 (<sha>)`, exit 0
+    observed_at_record: Both builds print 'v9.9.9 (de5c473a3d83ba52fc2953a83308b52029135a57)', exit 0. In the clone the binary also carries vcs.revision build info, and the stamp still wins.
+    repro_handle: go build -ldflags "$(scripts/release-ldflags fishhawk v9.9.9 <sha>)" ./cli/cmd/fishhawk && ./fishhawk version
+origin:
+    issue: 4139
+    pr: 4467
+    run_id: 9a4eac5e-9759-480a-a2c9-24217c6aeeb5
+    head_sha: de5c473a3d83ba52fc2953a83308b52029135a57
+    recorded_at: 2026-10-15T19:57:13Z

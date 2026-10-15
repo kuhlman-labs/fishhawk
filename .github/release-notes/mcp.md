@@ -23,6 +23,7 @@ Two audiences share one surface:
 - `fishhawk-mcp-<version>-darwin-amd64` — Intel Mac.
 - `fishhawk-mcp-<version>-linux-amd64` — Linux x86_64.
 - `fishhawk-mcp-<version>-linux-arm64` — Linux ARM64 (incl. the runner container's arm64 build).
+- `fishhawk-mcp-shim-<version>-<os>-<arch>` — the same four targets of [`fishhawk-mcp-shim`](../backend/cmd/fishhawk-mcp-shim/README.md) (ADR-060), the wrapper a local install registers with `claude mcp add`; it hot-swaps a rebuilt `fishhawk-mcp` child. `fishhawk-mcp-shim --version` prints `<version> (<commit>)`.
 - `mcp-<version>.sbom.spdx.json` — SPDX-JSON SBOM produced by [`anchore/sbom-action`](https://github.com/anchore/sbom-action). Covers the backend module's whole dependency tree, since the MCP binary lives under `backend/cmd/fishhawk-mcp/`.
 - `SHA256SUMS` — sha256 of every artifact above.
 - `SHA256SUMS.sig` + `SHA256SUMS.pem` — keyless [cosign](https://docs.sigstore.dev/cosign/overview/) signature + Fulcio certificate chain. Issued by the GitHub Actions OIDC identity for this repo + workflow.

@@ -109,11 +109,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return exitUsage
 	case "version", "--version":
-		if version.GitSHA != "unknown" {
-			_, _ = fmt.Fprintf(stdout, "%s (%s)\n", version.Version, version.GitSHA)
-		} else {
-			_, _ = fmt.Fprintln(stdout, version.Version)
-		}
+		_, _ = fmt.Fprintln(stdout, version.String())
 		return exitOK
 	case "-h", "--help", "help":
 		printUsage(stdout)

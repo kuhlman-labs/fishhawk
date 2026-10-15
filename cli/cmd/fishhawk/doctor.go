@@ -238,6 +238,13 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkBackendSHADrift(*cf.backendURL, *workingDir),
 			checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
 			checkCLIVersion(*cf.backendURL),
+			// Host-environment rungs (doctor_env.go, #4088): warn-only
+			// advisories about the host itself, never a fail.
+			checkICloudCheckout(*workingDir),
+			checkGolangciLintPin(*workingDir),
+			checkGoToolchainPin(*workingDir),
+			checkHostLoad(),
+			checkOrphanedShells(),
 		}
 		// Append the readiness rungs LAST so the printed rung ORDER is
 		// unchanged (they still render after the local rungs).

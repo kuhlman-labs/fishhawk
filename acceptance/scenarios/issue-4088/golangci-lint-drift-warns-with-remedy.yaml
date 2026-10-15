@@ -1,0 +1,14 @@
+id: scenario:issue-4088/golangci-lint-drift-warns-with-remedy
+statement: Running `fishhawk doctor --working-dir <dir>` against a checkout whose deploy/gate-image/Dockerfile declares `ARG GOLANGCI_LINT_VERSION=v0.0.1` (a version no local install reports) prints a `golangci-lint pin` rung with status warn naming the pin v0.0.1, followed by a `hint:` line naming either the pinned install command or `scripts/test lint --in-gate-image`.
+verify_hint: 'CLI stdout of `fishhawk doctor --working-dir <fixture>`: find the line starting `golangci-lint pin`, check it ends in `warn` and contains v0.0.1, and the next line starts with `hint:`. Other rungs (backend, docker) may fail in the sandbox; only this rung''s line matters.'
+steps: 'Built the CLI from the sanctioned checkout (HEAD 2e60df86, equal to the preview /healthz git_sha): cd cli && go build -o /tmp/fh4088v/fishhawk ./cmd/fishhawk. Created the git repo /tmp/fh4088v/fx1 with deploy/gate-image/Dockerfile containing ''ARG GOLANGCI_LINT_VERSION=v0.0.1'' and go.work containing ''go 1.26'', and committed both. Ran /tmp/fh4088v/fishhawk doctor --working-dir /tmp/fh4088v/fx1 --backend-url http://localhost:8090 --timeout 10s.'
+assertions:
+    expected: A warn line naming v0.0.1, followed by a hint naming the install command or scripts/test lint --in-gate-image
+    observed_at_record: 'golangci-lint pin         local v2.12.2, CI pin v0.0.1             warn; the next line is: hint: install the pinned version (curl ... v0.0.1) or run `scripts/test lint --in-gate-image`'
+    repro_handle: fishhawk doctor --working-dir <fx1>
+origin:
+    issue: 4088
+    pr: 4472
+    run_id: f074973c-062a-4dbb-bd07-b62d15019666
+    head_sha: 2e60df860deeba0fb28aeb9d007f3c34de7d6586
+    recorded_at: 2026-10-15T22:56:00Z

@@ -84,7 +84,7 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 | `did not become healthy within 10s` | Read the printed log tail / `tail -50 logs/fishhawkd.log`; usually a migration or config error |
 | `postgres did not become ready` | `docker logs fishhawk-postgres` |
 | `Operation not permitted` on repo read | Grant the app hosting the agent (terminal, Claude Code, Codex) Full Disk Access in System Settings → Privacy & Security, then restart it |
-| Build fails only under a newer local Go | `go env -w GOTOOLCHAIN=go1.25.6` (AGENTS.md Traps, #3237) |
+| Build fails only under a newer local Go | `go env -w GOTOOLCHAIN=go1.26.9` (AGENTS.md Traps, #3237) |
 | k8s: `STALE fishhawkd image` / identity mismatch | See `docs/deploy/kubernetes.md` § "Image identity"; `FISHHAWK_K8S_SKIP_IDENTITY=1` only with the user's OK |
 | k8s: `x509: certificate signed by unknown authority` in `docker build` | TLS-inspecting proxy — `docs/deploy/kubernetes.md` |
 | `.git` pack `Operation timed out` | Repo is in iCloud `~/Documents`; rehydrate the evicted file and retry |

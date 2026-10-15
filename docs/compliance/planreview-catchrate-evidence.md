@@ -43,6 +43,20 @@ fifteen**, so their `samples_per_case` drops from 12 to 10
 record is not comparable for those arms: after the live calibration (Step 1c)
 an operator re-pins (Step 2, "The #4361 recording"). #4361 itself leaves
 `evidence.json` and `evidence.trials.json` untouched.
+
+**E55.20 / #4326 records the INSTRUMENT in the evidence**: a
+`catch_rule_version` (the full catch-rule text, on the record and its
+baseline) and a per-arm `input_digest` (each case's name, expectation class,
+exact input bytes and catch rule — not the rendered prompt, fixture, remit or
+documents). A baseline lacking or differing in either is not comparable. The
+committed 2026-10-15 record predates both terms, so `catchrategate` refuses
+it — by mode (4c) while the record is otherwise fresh, otherwise by the
+earlier STALE mode — and in either case the next recording must RE-PIN
+(Step 2), because the committed baseline is not comparable. By the campaign's
+batch rule that re-pin is the ONE combined operator re-recording made after
+every batched catch-rate trigger change (#3930, #4402, #4453, #4326, #4400)
+has merged; until then the refusal is by design. #4326 leaves `evidence.json`
+and `evidence.trials.json` untouched.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -54,7 +68,8 @@ is the operator's recording:
   the recorded evidence speaks to that, and only for the committed
   planted-defect shapes.
 - The gate command (`catchrategate`) passes on a current committed record
-  (not the legacy v1 pair: see the #4313 paragraph above) until the record
+  (not the legacy v1 pair, nor a record made before #4326: see the
+  paragraphs above) until the record
   goes stale (a prompt, corpus, fixture, model or catch-rule change),
   after which `scripts/check-review-prompt-eval` **fails closed on the next
   review-prompt change** until an operator re-measures.
@@ -73,7 +88,7 @@ model credential. The measurement is operator-executed and operator-paid.
 | pinned baseline, catch | any arm's catch rate is MORE than 0.10 below the SAME arm of the PINNED baseline |
 | pinned baseline, false alarm | any arm's false-alarm rate (`(false_alarms + undecodable) / clean trials`) is MORE than 0.10 above the SAME arm of the PINNED baseline |
 | power floor | any arm has fewer than 136 trials in an expectation class it has (catch, clean) — REFUSED, never passed |
-| comparability | the arm set, the generator model, or any arm's case set, expectation classes or samples per case differs from the baseline — refused unless the recording re-pins |
+| comparability | the arm set, the generator model, the catch rule (`catch_rule_version`), or any arm's case set, expectation classes, samples per case or case inputs (`input_digest`: a case's input bytes or catch rule, same case names) differs from the baseline — refused unless the recording re-pins. The treatment (rendered prompt, conventions fixture, remit, documents) is not an instrument term: changing it is what a recording measures |
 
 The baseline is PINNED, not rolling: a recording is never judged only against
 the previous one, so a series of in-tolerance drops cannot erode the
@@ -407,8 +422,9 @@ Later recordings omit `PIN_REASON`; the pinned baseline is carried forward
 unchanged. Moving it is the separate, explicit action of setting
 `PIN_REASON` again: it still requires a passing measurement (including
 against the current baseline when that baseline is comparable) and records
-the reason and a timestamp in the evidence. After a corpus change the old
-baseline is not comparable, an ordinary recording is refused, and you re-pin.
+the reason and a timestamp in the evidence. After a corpus, catch-rule or
+case-input change (#4326) the old baseline is not comparable, an ordinary
+recording is refused, and you re-pin.
 
 **The #4253 recording is such a re-pin.** The case set changed (six cases to
 twelve), so `samples_per_case` changed too, and the 2026-10-10 baseline is not
@@ -589,8 +605,9 @@ jq -r '.arms | to_entries[] | .key as $arm | [.value.per_case[][] | select(.outc
   probes if they flag the planted defect, then check the widened set with
   `catchrategate --rescore` before re-recording.
 - Either change edits a `review_input.json`, so the record goes stale and
-  must be re-measured. The case set is unchanged, so the baseline stays
-  comparable; re-pinning is an explicit choice there, not forced.
+  must be re-measured. Since #4326 it also changes that arm's `input_digest`
+  (the case's input bytes and catch rule), so the baseline is NOT comparable
+  even though the case set is unchanged: the re-measurement must re-pin.
 
 **Distribution check (done-means of #4253).** A case at an extreme in BOTH
 arms — caught in every trial, or in at most one (with 10 samples per case

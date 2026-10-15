@@ -139,10 +139,14 @@ func TestRun_Version(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) == "" {
 		t.Error("version output empty")
 	}
-	// Unstamped builds (GitSHA "unknown") must print the bare version
-	// with no SHA parenthetical.
+	if gotOut := strings.TrimSpace(stdout.String()); gotOut != version.String() {
+		t.Errorf("version output = %q, want version.String() = %q", gotOut, version.String())
+	}
+	// A test binary carries no VCS settings and a "(devel)" main module
+	// version, so the build-info fallback leaves it as the bare "dev" with
+	// no SHA parenthetical (verified on go1.25.6).
 	if strings.Contains(stdout.String(), "(") {
-		t.Errorf("unstamped build should print bare version, got %q", stdout.String())
+		t.Errorf("unstamped test binary should print bare version, got %q", stdout.String())
 	}
 }
 

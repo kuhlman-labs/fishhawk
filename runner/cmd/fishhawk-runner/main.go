@@ -711,11 +711,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		gateIsolation.declare(promptGateContainer)
 		// Version-skew check: if the backend requires a newer runner, exit
 		// immediately rather than invoking the agent with potentially
-		// incompatible protocol assumptions.
+		// incompatible protocol assumptions. The runner_failed line names the
+		// reason and the remedy: the local detached reaper records the LAST
+		// runner_failed line as the stage failure, so without it the operator
+		// sees only a generic 'runner exited 3' (#4135).
 		if minRunnerVersion != "" && semverLT(runnerVersion(), minRunnerVersion) {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"version_skew_detected","runner_version":%q,"min_required":%q}`+"\n",
 				runnerVersion(), minRunnerVersion)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"version_skew","detail":%q}`+"\n",
+				fmt.Sprintf("fishhawk-runner %s is older than the backend's min_runner_version %s; upgrade fishhawk-runner to at least %s",
+					runnerVersion(), minRunnerVersion, minRunnerVersion))
 			return exitVersionSkew
 		}
 		// Executor agent-version compatibility check (E32.13 / #1743): when the

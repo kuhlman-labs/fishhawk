@@ -626,6 +626,16 @@ ordinary recording is refused: an operator must re-pin with a #4361
 re-measures every arm in the table, the persona arms included. The committed
 evidence pair is left untouched by #4361 itself.
 
+**E55.20 / #4326 adds the instrument terms** `catch_rule_version` (record and
+baseline) and a per-arm `input_digest`, and makes a baseline that lacks or
+differs in either NOT COMPARABLE. The committed 2026-10-15 record predates
+them, so `catchrategate` refuses it — by mode (4c) while the record is
+otherwise fresh, otherwise by the earlier STALE mode — and in either case the
+next recording must RE-PIN. Per the campaign's batch rule, that is the ONE
+combined operator re-recording after every batched catch-rate trigger change
+(#3930, #4402, #4453, #4326, #4400) merges; #4326 leaves the committed
+evidence pair untouched.
+
 The offline tests prove the APPARATUS is correct (the arms differ only by the
 conventions section, the loader refuses non-discriminating probes and
 unattributable examples, every evidence and sidecar mode fails closed); they
@@ -1168,10 +1178,17 @@ pinned 0.90 the THIRD recording (0.74, 0.16 below) is refused
   measurement — including against the CURRENT baseline when that baseline is
   comparable — and records `reason` and `pinned_at` in the evidence. The first
   recording must pin.
-- A baseline is COMPARABLE only with the same generator model, arm set, and
-  per arm the same case set, expectation classes and `samples_per_case`.
-  After a corpus or arm-table change an ordinary recording is refused ("not
-  comparable — re-pin"); the re-pin is again explicit and reasoned.
+- A baseline is COMPARABLE only with the same generator model, catch rule
+  (`catch_rule_version`, the full `catchRuleVersion` text), arm set, and per
+  arm the same case set, expectation classes, `samples_per_case` and case
+  inputs (`input_digest`, #4326). The two #4326 terms are the INSTRUMENT, not
+  the treatment: `input_digest` hashes each case's name, expectation class,
+  exact input bytes (`review_input.json` / `persona_case.json`) and catch rule,
+  and deliberately excludes the rendered prompt, the conventions fixture, the
+  remit and every document, so a prompt change stays comparable while a probe
+  or case-input change under the same case names does not. After a corpus,
+  arm-table, catch-rule or case-input change an ordinary recording is refused
+  ("not comparable — re-pin"); the re-pin is again explicit and reasoned.
 - A LEGACY v1 record is a non-comparable baseline: `CheckCatchRateEvidence`
   refuses it naming the shared #4313/#4314 re-pin recording;
   `RecordCatchRateEvidence` over it refuses a non-pinning recording (both
@@ -1187,12 +1204,15 @@ pinned 0.90 the THIRD recording (0.74, 0.16 below) is refused
 
 A complete minimal valid record: the schema, the current `tolerance` and
 `min_trials_per_arm`, and an `arms` map holding EVERY arm of the arm table,
-each with its `kind`, `samples_per_case`, per-arm `prompt_fingerprint` and a
-`per_case` entry for every committed case of that arm (trials =
+each with its `kind`, `samples_per_case`, per-arm `prompt_fingerprint` and
+`input_digest` and a `per_case` entry for every committed case of that arm (trials =
 `samples_per_case`; a persona case carries `expect`, and a clean case
-`false_alarms`), and a pinned `baseline` carrying the same arm map, a reason
-and an RFC 3339 `pinned_at`. The counts below are
-ILLUSTRATIVE — NOT A MEASUREMENT — and the fingerprint is a placeholder.
+`false_alarms`), a `catch_rule_version`, and a pinned `baseline` carrying the
+same arm map and `catch_rule_version`, a reason and an RFC 3339 `pinned_at`.
+The counts below are ILLUSTRATIVE — NOT A MEASUREMENT — and the fingerprints,
+input digests and catch-rule text are placeholders (the recorder writes the
+full `catchRuleVersion` text and each arm's `armInputDigest`; the gate's mode
+(4c) refuses any other value).
 `TestREADMEMinimalCatchRateEvidenceIsValid` decodes this block and checks it
 against the code and the committed corpus, so adding a corpus case obliges
 updating it. Any test fixture that writes a regression record starts from
@@ -1208,6 +1228,7 @@ sidecar (below), which a recording writes beside it.
   "recorded_at": "2026-10-07T00:00:00Z",
   "generator_model": "claude-sonnet-5-5",
   "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "catch_rule_version": "planreview-catch-v5: placeholder — the full catchRuleVersion text",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
   "arms": {
@@ -1215,6 +1236,7 @@ sidecar (below), which a recording writes beside it.
       "kind": "persona",
       "samples_per_case": 46,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
           "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
           "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
@@ -1228,6 +1250,7 @@ sidecar (below), which a recording writes beside it.
       "kind": "persona",
       "samples_per_case": 34,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
           "authz-account-check-behind-legacy-flag": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
           "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
@@ -1251,6 +1274,7 @@ sidecar (below), which a recording writes beside it.
       "kind": "persona",
       "samples_per_case": 34,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
           "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
           "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
@@ -1268,6 +1292,7 @@ sidecar (below), which a recording writes beside it.
       "kind": "conventions",
       "samples_per_case": 11,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
           "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
           "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1288,6 +1313,7 @@ sidecar (below), which a recording writes beside it.
       "kind": "conventions",
       "samples_per_case": 11,
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
           "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1310,11 +1336,13 @@ sidecar (below), which a recording writes beside it.
     "reason": "first measurement",
     "generator_model": "claude-sonnet-5-5",
     "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "catch_rule_version": "planreview-catch-v5: placeholder — the full catchRuleVersion text",
     "arms": {
       "architect": {
         "kind": "persona",
         "samples_per_case": 46,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
             "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
             "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
@@ -1328,6 +1356,7 @@ sidecar (below), which a recording writes beside it.
         "kind": "persona",
         "samples_per_case": 34,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
             "authz-account-check-behind-legacy-flag": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
             "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
@@ -1351,6 +1380,7 @@ sidecar (below), which a recording writes beside it.
         "kind": "persona",
         "samples_per_case": 34,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
             "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
             "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
@@ -1368,6 +1398,7 @@ sidecar (below), which a recording writes beside it.
         "kind": "conventions",
         "samples_per_case": 11,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
             "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
             "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1388,6 +1419,7 @@ sidecar (below), which a recording writes beside it.
         "kind": "conventions",
         "samples_per_case": 11,
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
             "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1505,11 +1537,15 @@ fingerprint or another generator model, (5) a recorded tolerance /
 negative, `caught + undecodable > trials`, per-case `trials != samples_per_case`,
 or the two arms disagreeing on the case set or per-case trial weights, (7) a
 case set differing from the corpus, (8) an under-powered arm, (9) a within-run
-regression, (10) a missing, malformed or non-comparable baseline or a
-regression against it, (11) an unavailable corpus, (12) an unavailable
+regression, (10) a missing, malformed or non-comparable baseline (generator
+model, catch rule, arm set, or per arm case set, expectation class,
+`samples_per_case` or case inputs differ) or a regression against it, (11) an unavailable corpus, (12) an unavailable
 conventions fixture. The arm-keyed modes (E78.11 / #4313): (3b) a legacy v1
 record, refused naming the shared #4313/#4314 re-pin recording; (4b) a stale
-arm fingerprint, naming the arm; (6b) false alarms on a catch case, a catch
+arm fingerprint, naming the arm; (4c, #4326) a recorded `catch_rule_version`
+other than the current catch rule, or an arm `input_digest` other than the
+current arm table's — a record made before #4326 carries neither, so it is
+refused naming #4326 and the next recording must re-pin; (6b) false alarms on a catch case, a catch
 on a clean case, or an `expect` differing from the corpus; (7b) a missing or
 unknown arm, or an arm kind differing from the table's; (6c, #4314) a
 `false_alarm_partition` that is negative, names a non-clean case or does not
