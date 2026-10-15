@@ -77,7 +77,7 @@ fishhawk validate --emit-resolved .fishhawk/workflows.yaml \
 
 **The static check reads the LOCAL working tree; run admission reads the forge-fetched conventions at the run's ref.** So on a dirty or diverged checkout the two can legitimately disagree, and the direction of any divergence is deliberate: **the CLI can be LESS strict than run admission, never more.** A false-green is a missed early warning (cheap); a false-red would block a spec the product accepts (the worse failure for an advisory check). Concretely, the CLI validates the conventions file against the canonical schema but does **not** reproduce the backend's cross-field *semantic* checks (the mandatory-field trio, provider-connection requirements, ADR numbering) — those live in Go, not the schema, so the CLI is a second *consumer* of the schema, never a second *author* of the rules. A conventions file that violates only a semantic rule is therefore admitted by the CLI though run admission refuses it: a documented, intentional residual (`TestValidateConventionsDocument_SemanticGapAdmitted`).
 
-`doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, rustfs), backend reachability + token acceptance, the committed workflow spec, the charter document, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0).
+`doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, rustfs), backend reachability + token acceptance, the committed workflow spec, the charter document, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift, then five **host-environment** rungs (E83.55 / #4088) — **checkout location** (iCloud Desktop & Documents sync: a synced `~/Documents`/`~/Desktop` checkout, `* N` conflict copies, dataless evicted files), **golangci-lint pin**, **go toolchain pin**, **host load** and **orphaned shells** — which are WARN-ONLY (they never return `fail`) and report `ok` with a `skipped — ` detail where they do not apply (non-macOS, no pin site in the checkout, no readable load average, no `ps`); `--spec-only` runs none of them. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0). Contract: § "Host-environment rungs" below.
 
 Several rungs recognise the transports and credential classes an *external* repo onboarding to a running backend over HTTP-MCP/OAuth actually uses, so they do not fail a legitimately-onboarded repo (#2480): the **token valid** rung resolves the same credential ladder `newClient` uses (`--token` / `$FISHHAWK_TOKEN` > the stored credential from `fishhawk token login`) and probes with whatever it finds — an `fho_` OAuth token passes, an unrecognized prefix is still probed (the prefix labels the class for display, it does not gate admission), and no CLI credential at all is a **warn** (an MCP/OAuth loop needs none) rather than a fail. A successful readiness probe (HTTP 200 **and** a decodable body — a malformed 200 is not an answer) outranks the local token rung, so an OAuth/cookie identity that 403s on `/v0/runs` while being adequate per `/v0/onboarding/readiness` degrades to warn, not fail; the server-side **token scope adequate** rung stays the authority on scope. **MCP registered** parses `claude mcp list` and matches an HTTP-transport registration (`fishhawk-http: https://host/mcp (HTTP)`) by name or by a host:port + `/mcp` backend-URL match, alongside the stdio shim, and degrades to warn when the `claude` CLI is unavailable. **runner binary found** mirrors the MCP dispatch path's resolution order (input > `$FISHHAWK_RUNNER_BIN` > a `fishhawk-runner` sibling of *this CLI binary*, a proxy for the serving binary's sibling > PATH > repo `bin/`) and warns — not fails — when every tier misses, since the CLI process cannot observe the serving binary's directory. **backend SHA drift** skips outright when the working dir is not the backend's own source checkout (a `backend/cmd/fishhawkd` dir + a root `go.work`), because comparing fishhawkd's build SHA to an unrelated repo's HEAD is a category error. The invariant across every relaxation: a repo whose GitHub App is not installed still **fails** with a non-zero exit.
 
@@ -85,7 +85,7 @@ Since E48.58 / #2485 `doctor` also carries a **verify command** rung that, under
 
 **This rung executes a command read from the repository's committed workflow spec, so execution is opt-in and off by default.** Every other rung reads bytes or queries a service; this one runs a string supplied by the checkout under inspection, and `doctor` is what an operator runs *first* — including against a repository they have just cloned and not yet read. Running it by default would make `fishhawk doctor` a code-execution primitive for anyone who controls a repo's `.fishhawk/workflows.yaml`, on the operator's own machine — a strictly higher-value execution context than the runner's, and one where nothing in the CLI bounds the child's network egress. So the rung warns until you pass `--run-verify-command`, and `--skip-verify-command` is the opt-out that wins over it (so an alias or wrapper script that opts in can be overridden on a single invocation). When it does run, that child gets a **stripped environment** — the same default-deny allow-list the runner applies to the identical `sh -c <verifyCmd>` gate child (ADR-029 / #650 item 4) — so it sees `PATH`/`HOME`/locale/temp essentials plus the Go toolchain vars (an explicit Go-name set — `verifyEnvAllowGo` — plus `CGO_*`/`LC_*`, with URL userinfo redacted out of `GOPROXY`-style values) and never the operator's `FISHHAWK_API_TOKEN`, forge token, or agent API keys. The Go rung is an explicit NAME set rather than a bare `GO*` prefix because that prefix also admitted `GOOGLE_API_KEY`/`GOOGLE_APPLICATION_CREDENTIALS` — far more likely to be present on your own machine than on the runner — which a `GOOGLE_` deny prefix now drops belt-and-suspenders (#2504). `GOLANGCI_LINT_CACHE` **is** allow-listed here, so a verify command that runs golangci-lint keeps your inherited cache location (it is a path, not a secret); the runner drops it only because `withIsolatedLintCache` re-supplies its own per-invocation value. The two allow/deny sets are kept byte-identical with the runner copy (`runner/cmd/fishhawk-runner/gateenv.go`) by a cross-checking test.
 
-`--spec-only` runs just the three environment-free rungs — **workflow spec present** (schema validity), **charter document** (the charter resolved from `charter.path`, falling back to `.fishhawk/charter.md`, exists, is non-empty and carries at least one rubric row in the grooming reader's `| **V1** | <line> |` shape; absent is a warn, empty/rubric-less/escaping-path a fail — #3718) and **execution path configured** (every stage declares an executor *on the resolved document*, so a workflow-v2 stage that inherits its executor from a `defaults` block or an `extends` base counts) — and skips every docker/backend/token/MCP/git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose sole Fishhawk artifact is a generated `.fishhawk/workflows.yaml` exits 0 (the charter rung warns) with no local Fishhawk environment, while a missing or schema-invalid spec still fails closed (exit non-zero). Use it right after `fishhawk init` to confirm the scaffolded spec is valid before wiring up the backend, token, and execution path.
+`--spec-only` runs just the three environment-free rungs — **workflow spec present** (schema validity), **charter document** (the charter resolved from `charter.path`, falling back to `.fishhawk/charter.md`, exists, is non-empty and carries at least one rubric row in the grooming reader's `| **V1** | <line> |` shape; absent is a warn, empty/rubric-less/escaping-path a fail — #3718) and **execution path configured** (every stage declares an executor *on the resolved document*, so a workflow-v2 stage that inherits its executor from a `defaults` block or an `extends` base counts) — and skips every docker/backend/token/MCP/git/gh/host-environment/onboarding rung. It is the fresh-repo quick-validate path: a repo whose sole Fishhawk artifact is a generated `.fishhawk/workflows.yaml` exits 0 (the charter rung warns) with no local Fishhawk environment, while a missing or schema-invalid spec still fails closed (exit non-zero). Use it right after `fishhawk init` to confirm the scaffolded spec is valid before wiring up the backend, token, and execution path.
 
 Since E29.5 `doctor` also runs a per-repo **onboarding preflight** — the prerequisites that make a repo *look* onboarded but wedge on the first run. Four rungs are read from the backend readiness endpoint (`GET /v0/onboarding/readiness`): **app installed** (the Fishhawk GitHub App on the target repo), **reviewer available: `<provider>`** per spec-declared reviewer (carrying the adapter's missing-env hint; since #3578 also the model-id verdict — an authoritatively-rejected model fails with the did-you-mean, an unverifiable or unpriced model warns), **token scope adequate** (the run-driving scope subset, with the missing scopes named), and **workflow spec (committed) valid** (the spec on the repo's default branch parses + validates). Since E45.94 / #3646 the backend also serves a **work-item provider registered** rung, and it is the onboarding rung that can FAIL the command: it reports whether the work-item provider this repo's `.fishhawk/work-management.yaml` conventions resolve to is actually registered on the deployment, and a resolved-but-`unregistered` provider is rendered as a **fail** — not as data — because campaigns, `fishhawk_file_issue` and the whole backlog-grooming loop respond `501 provider_unimplemented` on such a deployment. So an operator running `fishhawk doctor` against a deployment that never had a work-item provider wired will now see a **non-zero exit** where the command previously reported all-green; that is the change's intent. `unknown` (the repo's conventions could not be resolved) is read FAIL-CLOSED and renders a **warn** whose remediation states explicitly that it is not evidence the provider is unregistered, and an absent key (an older fishhawkd) draws NO rung at all. A fifth rung, **execution path configured**, is checked client-side against the discovered `.fishhawk/workflows.yaml` *after resolving same-document reuse* (`spec.ResolveReuse`, #2340), so a workflow-v2 stage that inherits its executor from a `defaults` block or an `extends` base counts as configured; it fails when *any* resolved stage declares no executor, naming the unconfigured stage(s). The onboarding rungs target the repo named by `--repo owner/name`; when omitted it is auto-detected from the working dir's git origin, and an unresolved repo degrades to a single warning rather than failing the command. See `docs/onboarding.md` for the full check list and remediations.
 
@@ -338,7 +338,7 @@ documented above. Implementation notes:
 - `--spec-only` (E36.1 / #1639) restricts the run to the three environment-free rungs — `checkSpec` (schema validity) +
   `checkCharter` (E74.3 / #3718: the charter document parses to at least one rubric id under `scaffold.RubricRowPattern`,
   the grooming reader's row shape; absent → warn, empty/rubric-less/escaping `charter.path` → fail) +
-  `checkExecutionPath` (per-stage executor coverage) — and skips every docker/backend/token/MCP/git/gh/onboarding rung.
+  `checkExecutionPath` (per-stage executor coverage) — and skips every docker/backend/token/MCP/git/gh/host-environment/onboarding rung.
   `checkVerifyCommand` is deliberately NOT in that set: it provisions a git worktree and spawns a subprocess, so it is
   neither environment-free nor byte-only.
 
@@ -395,6 +395,68 @@ documented above. Implementation notes:
   non-executing paths are a warn naming the flag that changes the outcome, so the rung stays visible on every run.
 
 Operator guide: `docs/onboarding.md`.
+
+## Host-environment rungs (E83.55 / #4088)
+
+`cmd/fishhawk/doctor_env.go` adds five rungs to the non-`--spec-only` list, after `CLI version` and before the
+onboarding readiness rungs. Each is a cause of a red verify the diff did not introduce. **None returns `fail`** — they
+are dev-host heuristics, not preconditions — and a rung that does not apply returns `ok` with a `skipped — ` detail
+(the `backend SHA drift` convention). No flag was added, so `internal/cmdinfo` and the generated site CLI reference are
+unchanged.
+
+- **Which root each rung uses.** `checkout location`, `golangci-lint pin` and `go toolchain pin` resolve the checkout
+  with `doctorCheckoutRoot`: git's authoritative `git rev-parse --show-toplevel`, falling back to the absolute
+  `--working-dir` when git cannot answer, symlinks resolved. `checkout location` also uses `doctorGitCommonDir`
+  (`git rev-parse --path-format=absolute --git-common-dir`, symlinks resolved; empty when git names no existing
+  absolute directory). They deliberately do NOT use `resolveRepoRoot` (the walk-up to the first `.git` entry that
+  `charter document` and `init` use): only git resolves a linked worktree to both its toplevel and the shared common
+  dir its `.git` FILE points at, and the walk-up silently returns the working dir unchanged outside a repository.
+  `host load` and `orphaned shells` read no root — they inspect the host.
+- **`checkout location`** (macOS only; any other GOOS is skipped before anything is exec'd). Three independent signals,
+  any one warns: (a) **synced path** — the root is inside `~/Documents` or `~/Desktop` AND iCloud Desktop & Documents
+  sync is detected for that folder, i.e. `~/Library/Mobile Documents/com~apple~CloudDocs/<Documents|Desktop>` resolves
+  (EvalSymlinks) to the same real path as the home folder. That marker is observed on the operator host, not
+  documented by Apple; under the folder with no marker is NOT a signal (the `ok` detail says sync was not detected),
+  and the marker is only consulted when the root is already under one of the two folders. (b) **conflict copies** — a
+  name matching `^(.+) [0-9]+(\.[A-Za-z0-9]+)?$` is flagged ONLY when its de-suffixed original (stem + extension) is a
+  sibling in the same directory, so a tracked `Chapter 2.md` is not flagged unless `Chapter.md` exists. Scanned: the
+  checkout top level, the common dir top level, `<common>/objects/pack` (top level), and `<common>/refs/` recursively
+  (never through a symlinked directory), under one shared budget of 20000 entries (`doctorConflictScanLimit`; a
+  truncated scan is noted in the detail). (c) **dataless files** — macOS `find -flags +dataless -type f` over the
+  checkout (pruning `.git` and `node_modules`) and over `<common>/objects/pack` (`-maxdepth 1`), 30s each; output is
+  used even when `find` exits non-zero, and an empty output with an error is reported as "could not check", never as
+  a signal. The remedy: move the checkout out of the synced folder (e.g. `~/Projects/<repo>`) after hydrating it
+  (`find . -flags +dataless -type f -print0 | xargs -0 cat >/dev/null`) and `git worktree repair`, or turn off the sync;
+  diff each `* N` copy against its original before removing it.
+- **`golangci-lint pin`.** The pin is the first non-comment `ARG GOLANGCI_LINT_VERSION=<v>` of
+  `deploy/gate-image/Dockerfile` (quotes stripped — the `scripts/check-gate-image` `arg_default` parse, which holds that
+  ARG equal to every CI pin site). No file or no ARG skips the rung (an external repo has no pin site). `golangci-lint
+  version` runs in the root (10s); not on PATH, unparseable output (`has version v?X.Y.Z`), or a version differing from
+  the pin warns, naming the pinned `install.sh` command and `scripts/test lint --in-gate-image`.
+- **`go toolchain pin`.** The pin is the column-0 `go X.Y[.Z]` directive of `<root>/go.work`, else `<root>/go.mod`
+  (neither: skipped). `go version` runs in the root (30s) so the operator's `GOTOOLCHAIN` and the workspace's toolchain
+  selection apply; MAJOR.MINOR is compared. Newer warns with `go env -w GOTOOLCHAIN=go<toolchain>` (the AGENTS.md #3237
+  trap) plus `scripts/test lint --in-gate-image` when the gate image exists; older warns to upgrade or unset
+  `GOTOOLCHAIN=local`. `<toolchain>` is the Dockerfile's `ARG GO_VERSION` when present, else the directive with `.0`
+  appended when it has no patch (`go 1.25` → `go1.25.0`).
+- **`host load`.** The 1-minute load average from `/proc/loadavg`, else `sysctl -n vm.loadavg`, else `uptime` — the
+  `runner/internal/hostload` ladder, duplicated because the cli module cannot import `runner/internal`. It warns when
+  load exceeds `doctorHostLoadFactor` (4.0) × cores, the runner's #3663 `host_overloaded` factor, naming the top 3 CPU
+  consumers from `ps -axo pid=,pcpu=,comm=` (sorted in Go; best-effort). A core count ≤ 0 decides nothing.
+  `TestDoctorHostLoadFactor_MatchesRunnerHostload` reads `runner/internal/hostload/hostload.go` (anchored on
+  `pkgSrcDir`, never `runtime.Caller`) and fails closed when it is unreadable or no longer declares
+  `DefaultFactor = 4.0`, so the two factors cannot drift silently.
+- **`orphaned shells`.** From `ps -axo pid=,ppid=,pcpu=,etime=,comm=`: a process whose comm basename (leading `-`
+  stripped) is `sh`/`bash`/`zsh`/`dash`/`ksh`, whose parent is pid 1, at ≥ 50% CPU and ≥ 5 minutes elapsed
+  (`[[dd-]hh:]mm:ss`). Such a shell sits outside every run's process tree, so the runner's stage-exit sweep cannot
+  reach it. The remedy names `pgrep -fl 'fishhawk-runner --run-id'` and `kill <pids>`. This is a **macOS dev-host
+  heuristic**, and both the `ok` and the `warn` detail say so: under a subreaper (`systemd --user`, tmux) orphans
+  re-parent there and are missed, and inside a container (pid 1 = the entrypoint) long-running shells it started are
+  reported — so `none` is not proof.
+- **Seams.** `doctorEnvRunOutput(timeout, dir, name, args...)` (stdout AND error, so a non-zero `find` still yields its
+  output; a missing binary satisfies `errors.Is(err, exec.ErrNotFound)`), `doctorReadFile`, `doctorUserHomeDir`,
+  `doctorGOOS`, `doctorNumCPU` — package vars in the `doctorRunOutput` style, so every branch is unit-tested on any
+  host (`doctor_env_test.go`).
 
 ## Init internals (E29.3)
 

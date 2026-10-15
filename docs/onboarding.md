@@ -18,7 +18,9 @@ fishhawk doctor [--repo owner/name] [--working-dir D] [--runner-binary P] [--spe
 
 Beyond the local-loop rungs (Docker stack, backend reachability, token
 acceptance, spec presence, runner binary, MCP registration, git remote/tree,
-`gh` auth, version/schema drift), `doctor` runs the **onboarding preflight**:
+`gh` auth, version/schema drift) and the host-environment rungs (iCloud
+checkout location, golangci-lint and Go toolchain pins, host load, orphaned
+shells), `doctor` runs the **onboarding preflight**:
 the per-repo prerequisites that make a repo *look* onboarded but wedge on the
 first run.
 
@@ -164,6 +166,46 @@ implement pass has been paid for.
   plus network plus the invoking process's credentials is the shape the
   stripping exists to break.
 
+### Host environment rungs
+
+Five rungs check the **host** the local loop runs on rather than the repo or the
+backend. Each names a cause of a red verify that the diff did not introduce. They
+are dev-host advisories: each is **warn-only** (none ever fails the command), each
+prints a `hint:` remedy, and each reports `ok` with a `skipped — ` detail where it
+does not apply. `--spec-only` runs none of them.
+
+- **checkout location** (macOS only) — warns when the checkout sits under
+  `~/Documents` or `~/Desktop` with iCloud Desktop & Documents sync detected, or
+  when iCloud artifacts are present anywhere: `* N` conflict copies beside their
+  originals (checkout top level, the git common dir, its `objects/pack`, its
+  `refs/`) or dataless (evicted) files. Remedy: hydrate the checkout
+  (`find . -flags +dataless -type f -print0 | xargs -0 cat >/dev/null`), move it
+  out of the synced folder (e.g. `~/Projects/<repo>`) and run
+  `git worktree repair`, or turn the sync off; diff each `* N` copy against its
+  original before deleting it.
+- **golangci-lint pin** — warns when the local `golangci-lint version` differs
+  from the CI pin (`deploy/gate-image/Dockerfile`'s `ARG GOLANGCI_LINT_VERSION`) or
+  is not on PATH: in-loop lint can pass while CI's gofmt/lint goes red. Remedy:
+  install the pinned version, or run `scripts/test lint --in-gate-image`. An
+  external repo without that Dockerfile has no pin site, so the rung is skipped.
+- **go toolchain pin** — warns when the Go that `go version` selects in the
+  checkout differs in MAJOR.MINOR from the `go.work` (else `go.mod`) directive. A
+  newer Go can red-line verify on clean main while CI stays green; remedy
+  `go env -w GOTOOLCHAIN=go<version>` (the gate image's `GO_VERSION` when the repo
+  has one). An older Go: upgrade, or unset `GOTOOLCHAIN=local`.
+- **host load** — warns when the 1-minute load average exceeds 4.0 x the core
+  count (the runner's `host_overloaded` threshold), naming the top CPU consumers.
+  A verify run then fails on timeouts in packages the diff never touched: stop the
+  consumers and re-run `doctor` before dispatching.
+- **orphaned shells** — warns on `sh`/`bash`/`zsh`/`dash`/`ksh` processes
+  re-parented to pid 1 that are using at least 50% CPU and have run for at least
+  5 minutes: they sit outside every run's process tree and starve later verifies.
+  Remedy: confirm no live run owns them (`pgrep -fl 'fishhawk-runner --run-id'`),
+  then `kill` them. This is a **macOS dev-host heuristic**: under a subreaper
+  (`systemd --user`, tmux) orphans re-parent there and are missed, and inside a
+  container (pid 1 = the entrypoint) long-running shells it started are reported.
+  A `none` result is not proof that no orphan exists.
+
 ### `--spec-only`
 
 `--spec-only` restricts `doctor` to the three environment-free rungs (the
@@ -171,7 +213,7 @@ implement pass has been paid for.
 subprocess, so it is neither environment-free nor byte-only) —
 **workflow spec present** (schema validity), **charter document** and
 **execution path configured** (every stage declares an executor) — and skips
-every docker/backend/token/MCP/git/gh/onboarding rung. The **charter document**
+every docker/backend/token/MCP/git/gh/host-environment/onboarding rung. The **charter document**
 rung (#3718) resolves `charter.path` from `.fishhawk/work-management.yaml`
 (tolerantly — falling back to `.fishhawk/charter.md`; `fishhawk validate` stays
 the authority on config validity) and is `ok` only when the document exists, is
