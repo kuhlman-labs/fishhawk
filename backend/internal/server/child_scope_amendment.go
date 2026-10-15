@@ -37,7 +37,63 @@ import (
 // the same order the run-concerns listing uses — so the rendered prompt is
 // stable across repeated builds. Paths are deduped first-wins so two slices amending
 // the same path render once.
+//
+// It is a projection of childApprovedAmendmentRecords, the ONE walk it shares
+// with childApprovedAmendmentEntries (the decomposed-parent fix-up scope union,
+// #4338), so the review provenance and the fix-up permission set can never
+// disagree on which child amendments count.
 func (s *Server) childApprovedAmendmentScopePaths(ctx context.Context, parentRunID uuid.UUID) []prompt.ChildAmendedScopePath {
+	records := s.childApprovedAmendmentRecords(ctx, parentRunID)
+	if len(records) == 0 {
+		return nil
+	}
+	out := make([]prompt.ChildAmendedScopePath, 0, len(records))
+	for _, r := range records {
+		out = append(out, prompt.ChildAmendedScopePath{
+			Path:        r.entry.Path,
+			AmendmentID: r.amendmentID,
+			ChildRunID:  r.childRunID,
+			SliceIndex:  r.sliceIndex,
+		})
+	}
+	return out
+}
+
+// childApprovedAmendmentEntries is the operation-preserving projection of the
+// same #2820 walk (#4338): every path a decomposed parent's children were
+// authorized to touch by an APPROVED mid-stage amendment, carrying the declared
+// operation so a child's approved `create` folds into the parent's fix-up scope
+// as create rather than being flattened to modify. Same order, same first-wins
+// dedup, same fail-open degrades as childApprovedAmendmentScopePaths; nil for a
+// run with no children.
+func (s *Server) childApprovedAmendmentEntries(ctx context.Context, parentRunID uuid.UUID) []scopeamendment.PathEntry {
+	records := s.childApprovedAmendmentRecords(ctx, parentRunID)
+	if len(records) == 0 {
+		return nil
+	}
+	out := make([]scopeamendment.PathEntry, 0, len(records))
+	for _, r := range records {
+		out = append(out, r.entry)
+	}
+	return out
+}
+
+// childAmendmentRecord is one path a decomposed child's APPROVED amendment
+// authorized, with its provenance: the full PathEntry (path AND operation), the
+// authorizing amendment id, the child run id, and the child's slice index.
+type childAmendmentRecord struct {
+	entry       scopeamendment.PathEntry
+	amendmentID string
+	childRunID  string
+	sliceIndex  *int
+}
+
+// childApprovedAmendmentRecords is the #2820 walk both projections above read:
+// the decomposed parent's children (listAllDecomposedChildren, in
+// sortDecomposedChildren order), each child's APPROVED amendments, deduped by
+// path first-source-wins. Its degrades are the ones documented on
+// childApprovedAmendmentScopePaths.
+func (s *Server) childApprovedAmendmentRecords(ctx context.Context, parentRunID uuid.UUID) []childAmendmentRecord {
 	if s.cfg.RunRepo == nil || s.cfg.ScopeAmendmentRepo == nil {
 		return nil
 	}
@@ -60,7 +116,7 @@ func (s *Server) childApprovedAmendmentScopePaths(ctx context.Context, parentRun
 
 	sortDecomposedChildren(children)
 
-	var out []prompt.ChildAmendedScopePath
+	var out []childAmendmentRecord
 	seen := make(map[string]struct{})
 	for _, child := range children {
 		items, lerr := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, child.ID)
@@ -90,11 +146,11 @@ func (s *Server) childApprovedAmendmentScopePaths(ctx context.Context, parentRun
 					continue // first-source-wins dedup
 				}
 				seen[p.Path] = struct{}{}
-				out = append(out, prompt.ChildAmendedScopePath{
-					Path:        p.Path,
-					AmendmentID: a.ID.String(),
-					ChildRunID:  childRunID,
-					SliceIndex:  sliceIdx,
+				out = append(out, childAmendmentRecord{
+					entry:       p,
+					amendmentID: a.ID.String(),
+					childRunID:  childRunID,
+					sliceIndex:  sliceIdx,
 				})
 			}
 		}

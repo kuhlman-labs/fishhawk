@@ -23,6 +23,12 @@ func seedAmendment(sar *fakeScopeAmendmentRepo, runID uuid.UUID, status scopeame
 	for _, p := range paths {
 		entries = append(entries, scopeamendment.PathEntry{Path: p, Operation: scopeamendment.OperationModify})
 	}
+	return seedAmendmentEntries(sar, runID, status, entries...)
+}
+
+// seedAmendmentEntries is seedAmendment with explicit PathEntry operations, so a
+// test can seed an approved create- or delete-op row by construction (#4338).
+func seedAmendmentEntries(sar *fakeScopeAmendmentRepo, runID uuid.UUID, status scopeamendment.Status, entries ...scopeamendment.PathEntry) uuid.UUID {
 	a := &scopeamendment.Amendment{
 		ID:          uuid.New(),
 		RunID:       runID,
@@ -184,4 +190,61 @@ func TestChildApprovedAmendmentScopePaths_OrderedBySliceIndex(t *testing.T) {
 	if got[0].Path != "a.go" || got[1].Path != "z.go" {
 		t.Errorf("path order = [%q, %q], want [a.go, z.go]", got[0].Path, got[1].Path)
 	}
+}
+
+// The operation-preserving projection the decomposed-parent fix-up scope folds
+// (#4338): an approved create and an approved delete keep their operations,
+// pending and denied rows confer nothing, and a path two slices both amended
+// resolves once to the sorted-first child's entry.
+//
+// MECHANISM: the pending (pkg/pending/p.go) and denied (pkg/denied/d.go) rows
+// are present in the fake by construction, so with the approved-only filter
+// deleted they are observably returned; with it in place they are absent. The
+// shared path is amended as create on slice 0 and modify on slice 1, so only
+// first-wins dedup in sorted order yields exactly one create entry.
+func TestChildApprovedAmendmentEntries_PreservesOperation(t *testing.T) {
+	// The amendment domain admits only modify/create; a delete op is seeded by
+	// construction to prove the projection carries ANY recorded operation
+	// verbatim rather than re-deriving one.
+	const opDelete = "delete"
+	s, rr, sar := childScopeAmendmentServer()
+	parent := uuid.New()
+	// Seed slice 1 BEFORE slice 0 so seed order differs from slice order.
+	second := rr.seedDecomposedChild(parent, 1, run.StateSucceeded)
+	first := rr.seedDecomposedChild(parent, 0, run.StateSucceeded)
+	seedAmendmentEntries(sar, first.ID, scopeamendment.StatusApproved,
+		scopeamendment.PathEntry{Path: "pkg/c/c.go", Operation: scopeamendment.OperationCreate},
+		scopeamendment.PathEntry{Path: "pkg/shared/s.go", Operation: scopeamendment.OperationCreate})
+	seedAmendmentEntries(sar, second.ID, scopeamendment.StatusApproved,
+		scopeamendment.PathEntry{Path: "pkg/old/o.go", Operation: opDelete},
+		scopeamendment.PathEntry{Path: "pkg/shared/s.go", Operation: scopeamendment.OperationModify})
+	seedAmendment(sar, second.ID, scopeamendment.StatusPending, "pkg/pending/p.go")
+	seedAmendment(sar, first.ID, scopeamendment.StatusDenied, "pkg/denied/d.go")
+
+	got := s.childApprovedAmendmentEntries(context.Background(), parent)
+	want := []scopeamendment.PathEntry{
+		{Path: "pkg/c/c.go", Operation: scopeamendment.OperationCreate},
+		{Path: "pkg/shared/s.go", Operation: scopeamendment.OperationCreate},
+		{Path: "pkg/old/o.go", Operation: opDelete},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %+v, want %+v (all: %+v)", i, got[i], want[i], got)
+		}
+	}
+
+	t.Run("no children", func(t *testing.T) {
+		if got := s.childApprovedAmendmentEntries(context.Background(), uuid.New()); got != nil {
+			t.Errorf("no children: got %v, want nil", got)
+		}
+	})
+	t.Run("nil repos", func(t *testing.T) {
+		bare := New(Config{Addr: "127.0.0.1:0"})
+		if got := bare.childApprovedAmendmentEntries(context.Background(), parent); got != nil {
+			t.Errorf("nil repos: got %v, want nil", got)
+		}
+	})
 }

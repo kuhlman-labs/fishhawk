@@ -21,6 +21,12 @@ import (
 // full timeout. The boot sweep heals exactly this — but only AT BOOT, so an
 // operator whose review was already orphaned had to restart the daemon a
 // second time. This verb runs the same per-run helper on demand.
+//
+// It also closes a review whose reviewer FINISHED but whose terminal audit
+// write never landed (E72.64 / #4106): the serving daemon records such a
+// lost terminal in a process-local registry, and this verb appends the named
+// verdict_write_failed stand-ins for exactly those slots, even on a round the
+// serving daemon dispatched.
 
 // ReconcileReviewsInput is the tool's input schema.
 type ReconcileReviewsInput struct {
@@ -32,7 +38,7 @@ type ReconcileReviewsStage struct {
 	Stage            string `json:"stage" jsonschema:"the review-bearing stage: plan or implement"`
 	ConfiguredAgents int    `json:"configured_agents" jsonschema:"how many agent reviewers the current round was dispatched with"`
 	LandedBefore     int    `json:"landed_before" jsonschema:"how many terminal verdicts had already landed for the round before this call; these are preserved, never re-paid for. Since #3395 it is the REAL count on every skip (the count runs before the boot-marker gate), so a review_dispatched_by_this_process skip reporting 0 means the round genuinely has no landed verdict, not that the count never ran"`
-	Synthesized      int    `json:"synthesized" jsonschema:"how many terminal *_review_failed entries this call appended (configured_agents minus landed_before); 0 when nothing needed healing"`
+	Synthesized      int    `json:"synthesized" jsonschema:"how many terminal *_review_failed entries this call appended: configured_agents minus landed_before for a restart-orphaned round, or the lost-terminal stand-ins (reason verdict_write_failed, at most configured_agents minus landed_before) for a round the serving daemon dispatched; 0 when nothing needed healing"`
 	Skipped          bool   `json:"skipped,omitempty" jsonschema:"true when this stage healed nothing"`
 	SkipReason       string `json:"skip_reason,omitempty" jsonschema:"why nothing was healed: no_review_started_entry, no_configured_agents, started_entry_has_no_stage_id, round_already_settled, or review_dispatched_by_this_process (the live-review refusal)"`
 }
@@ -75,6 +81,19 @@ it against a healthy, genuinely-running review changes nothing. The round's
 landed count is taken BEFORE that gate, so a round that already settled answers
 skip_reason=round_already_settled (it takes precedence) and landed_before is
 the real count on every skip.
+
+The one exception: a LOST verdict write. When a reviewer finished but its
+terminal audit write never landed (the audit store failed past the bounded
+retry), the serving daemon records it and lands a named *_review_failed for it
+in the background once the store accepts writes; the fishhawkd ERROR log
+"review terminal settle exhausted" names this verb when that background settle
+gave up. On such a round this verb appends exactly those stand-ins — reason
+prefix verdict_write_failed, summarising the lost verdict (verdict + concern
+count) or the lost skip/failure — even though the serving daemon dispatched the
+round. It never closes a still-running reviewer's share: synthesized counts
+only the lost slots, so the round can stay pending until that reviewer lands.
+The record is process-local, so after a restart the boot sweep handles the
+round as an ordinary restart orphan instead.
 
 What it CANNOT clear. A pending implement_review_status after a fix-up pass
 that died having pushed nothing is NOT a strand this verb can clear: the
@@ -132,7 +151,7 @@ func reconcileReviewsMessage(out ReconcileReviewsOutput) string {
 	for _, st := range out.Stages {
 		if st.Synthesized > 0 {
 			healed = append(healed, fmt.Sprintf(
-				"%s: synthesized %d terminal entr%s to complete the round (%d of %d reviewers had already landed and are preserved)",
+				"%s: synthesized %d terminal entr%s for the round's missing reviewers (%d of %d reviewers had already landed and are preserved)",
 				st.Stage, st.Synthesized, plural(st.Synthesized, "y", "ies"), st.LandedBefore, st.ConfiguredAgents))
 			continue
 		}
@@ -148,7 +167,7 @@ func reconcileReviewsMessage(out ReconcileReviewsOutput) string {
 			"an already-settled round is an idempotent no-op."
 	}
 	msg := strings.Join(healed, "; ") +
-		". The review gate can now settle: re-read it with fishhawk_get_run_status or fishhawk_get_gate_view."
+		". The review gate settles once every configured reviewer has a terminal entry: re-read it with fishhawk_get_run_status or fishhawk_get_gate_view."
 	if len(skipped) > 0 {
 		msg += " Untouched — " + strings.Join(skipped, "; ") + "."
 	}
