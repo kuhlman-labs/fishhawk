@@ -12,10 +12,23 @@
 //
 // THE ARM TABLE. catchRateArmTable is the one place an arm is declared: its
 // name, kind, cases (name, expectation class, catch rule, raw bytes), its
-// fingerprint and its runner. Today it holds without_conventions and
-// with_conventions over the miss corpus and architect over the persona
-// corpus; #4314 registers its security arms as further rows. The record, the
-// sidecar, the gate and the re-score all iterate it.
+// fingerprint and its runner. It holds without_conventions and
+// with_conventions over the miss corpus, architect over the architect persona
+// corpus, and (E80.17 / #4314) security and security_portability over the
+// security persona corpus. The record, the sidecar, the gate and the re-score
+// all iterate it.
+//
+// THE SECURITY ARMS (#4314). Both record, per clean case, a FALSE-ALARM
+// PARTITION (false_alarm_partition: security_lens / other_category trials) in
+// the evidence and the matching per-trial alarm_partition tag in the sidecar,
+// because their judged false-alarm rate counts EVERY concern on a clean diff —
+// standard-criteria concerns included — and must be read beside it; the gate
+// checks the two agree. Their stored concerns carry the markers.json
+// annotations (repo_specific_marker, absent_control). RecordCatchRateEvidence
+// REFUSES (ErrPortabilityRepoSpecificFinding) a measurement in which any
+// security_portability concern names a repository-specific marker: that
+// reviewer was never shown the convention, so such a concern is about a
+// control it cannot know.
 //
 // THE RULE, PER ARM. catchRateComparisonPairs keeps the within-run rule for
 // (without_conventions, with_conventions). Then every arm, per expectation
@@ -112,14 +125,15 @@ const (
 )
 
 // CatchRateInputs names everything the arm table is built from: the miss
-// corpus and the conventions fixture (the conventions arms), and the persona
-// corpus plus the checkout root its documents are read from (the architect
-// arm).
+// corpus and the conventions fixture (the conventions arms), the architect
+// persona corpus, the security persona corpus (the two security arms, #4314),
+// and the checkout root the persona documents are read from.
 type CatchRateInputs struct {
-	CorpusDir        string
-	ConventionsPath  string
-	PersonaCorpusDir string
-	RepoRoot         string
+	CorpusDir         string
+	ConventionsPath   string
+	PersonaCorpusDir  string
+	SecurityCorpusDir string
+	RepoRoot          string
 }
 
 const (
@@ -142,7 +156,9 @@ func CatchRateTrialsPath(evidencePath string) string {
 
 // CatchRateTrialConcern is one stored reviewer concern of a trial. The
 // persona fields (SeverityClampedFrom, QuoteUnverified, DocumentRef) are set
-// only by a persona arm and omitted otherwise, so a v1 sidecar decodes.
+// only by a persona arm, and the marker annotations (RepoSpecificMarker,
+// AbsentControl) only by a security arm (#4314); all are omitted otherwise,
+// so a v1 sidecar and the #4313 v2 sidecar decode.
 type CatchRateTrialConcern struct {
 	Severity            string `json:"severity"`
 	SeverityClampedFrom string `json:"severity_clamped_from,omitempty"`
@@ -153,6 +169,11 @@ type CatchRateTrialConcern struct {
 	// NearMiss is set on a missed trial's concern only:
 	// NearMissProbeWithoutAttribution or NearMissAttributionWithoutProbe.
 	NearMiss string `json:"near_miss,omitempty"`
+	// RepoSpecificMarker is the first markers.json repository-specific
+	// marker the concern names; AbsentControl reports that it asserts a
+	// control is absent (SecurityMarkers.Annotate).
+	RepoSpecificMarker string `json:"repo_specific_marker,omitempty"`
+	AbsentControl      bool   `json:"absent_control,omitempty"`
 }
 
 // CatchRateTrialRecord is one stored trial.
@@ -170,6 +191,11 @@ type CatchRateTrialRecord struct {
 	ConcernsTotal int                     `json:"concerns_total"`
 	// ResponseExcerpt is set on an undecodable trial only.
 	ResponseExcerpt string `json:"response_excerpt,omitempty"`
+	// AlarmPartition is set on a false_alarm trial of a partitioned arm (the
+	// security arms) only: AlarmPartitionSecurityLens or
+	// AlarmPartitionOther. Its per-case tallies equal the record's
+	// false_alarm_partition.
+	AlarmPartition string `json:"alarm_partition,omitempty"`
 }
 
 // CatchRateTrialsArm is one arm's trials, per case in sample order.
@@ -199,6 +225,34 @@ type CatchRateTrials struct {
 // for the regression reason, not a shape reason.
 var ErrCatchRateRegressed = errors.New("plan-review catch rate regressed")
 
+// ErrPortabilityRepoSpecificFinding marks a refusal whose cause is a
+// security_portability concern naming a repository-specific marker
+// (markers.json): the portability reviewer is shown the generic remit alone,
+// so it must raise ZERO findings about this repository's own controls.
+var ErrPortabilityRepoSpecificFinding = errors.New("security_portability raised a repository-specific finding")
+
+// The false-alarm partition classes of a partitioned arm's false_alarm
+// trial: security_lens when any alarming concern's category names the
+// security lens (SecurityLensCategory), other_category otherwise. The second
+// name deliberately omits "Category": the audit registry's completeness sweep
+// treats a category-named const binding a snake_case literal as an emitted
+// audit category, and this is not one.
+const (
+	AlarmPartitionSecurityLens = "security_lens"
+	AlarmPartitionOther        = "other_category"
+)
+
+// CatchRateFalseAlarmPartition is one clean case's false_alarm trials split by
+// what raised them. A security arm's judged false-alarm rate counts EVERY
+// concern on a clean diff (its clean rule has no category predicate), so the
+// standard-criteria concerns the persona also raises are in it; this split is
+// the committed data a later remit-category decision reads.
+// SecurityLens + OtherCategory == the case's false_alarms.
+type CatchRateFalseAlarmPartition struct {
+	SecurityLens  int `json:"security_lens"`
+	OtherCategory int `json:"other_category"`
+}
+
 // CatchRateEvidenceArm is one arm of a measurement: its kind
 // (CatchRateArmKindConventions or CatchRateArmKindPersona), its per-case
 // sample count, the fingerprint of everything that arm's model was shown, and
@@ -208,6 +262,9 @@ type CatchRateEvidenceArm struct {
 	SamplesPerCase    int                        `json:"samples_per_case"`
 	PromptFingerprint string                     `json:"prompt_fingerprint"`
 	PerCase           map[string]CaseCatchCounts `json:"per_case"`
+	// FalseAlarmPartition is set on a partitioned arm (the security arms)
+	// only: one entry per clean case.
+	FalseAlarmPartition map[string]CatchRateFalseAlarmPartition `json:"false_alarm_partition,omitempty"`
 }
 
 // CatchRateEvidenceArms is every arm of one measurement, keyed by arm name.
@@ -247,6 +304,8 @@ type catchRateArmCase struct {
 	// expect is CatchExpectCatch or CatchExpectClean.
 	expect string
 	rule   CatchRule
+	// lens is a security defect case's remit lens ("" otherwise).
+	lens string
 }
 
 // catchRateArmRow is ONE arm of the arm table: everything the recorder, the
@@ -262,8 +321,17 @@ type catchRateArmRow struct {
 	// fingerprint is "sha256:<hex>" over everything this arm's model is
 	// shown and how its trials are scored.
 	fingerprint string
-	// run measures the arm.
-	run func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error)
+	// measure measures the arm over the cases keep selects (nil = every
+	// case).
+	measure func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error)
+	// partition marks an arm that records the false-alarm partition (the
+	// security arms).
+	partition bool
+}
+
+// run measures the arm over every case.
+func (r catchRateArmRow) run(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
+	return r.measure(ctx, sender, samples, nil)
 }
 
 // catchRateComparisonPair is a (reference, treatment) arm pair the
@@ -341,14 +409,51 @@ func personaArmFingerprint(cases []PersonaCatchCase, repoRoot string, render per
 	return f.sum(), nil
 }
 
-// catchRateArmTable builds THE arm table from inputs, in arm-name order. It
-// fails closed on an unavailable corpus, conventions fixture, persona corpus
-// or document checkout, and on a render error.
-func catchRateArmTable(in CatchRateInputs) ([]catchRateArmRow, error) {
-	return catchRateArmTableWith(in, PersonaArmPrompt)
+// securityArmFingerprint is one security arm's fingerprint (#4314): the arm
+// name, catchRuleVersion, the security generator system prompt, the fixed
+// declaration (remit path and cap, the convention's name, path and cap — or
+// "none" for the portability arm — repository, fixture commit), the exact
+// markers.json bytes, and per case of the arm in name order its name, its
+// exact persona_case.json bytes and its rendered persona prompt — so a remit,
+// convention, markers or corpus edit stales THAT arm, by name.
+func securityArmFingerprint(arm string, cases []SecurityCatchCase, markers SecurityMarkers, repoRoot string, render securityArmRenderer) (string, error) {
+	f := newFingerprintHasher()
+	f.put([]byte(arm))
+	f.put([]byte(catchRuleVersion))
+	f.put([]byte(securityCatchGeneratorSystemPrompt))
+	conv := []string{"none"}
+	if arm == ArmSecurity {
+		conv = []string{personaSecurityConventionName, personaSecurityConventionPath, personaSecurityConventionSeverityCap}
+	}
+	decl := append([]string{personaSecurityRemitPath, personaSecuritySeverityCap}, conv...)
+	decl = append(decl, personaCatchRepoOwner+"/"+personaCatchRepoName, personaFixtureCommit)
+	for _, d := range decl {
+		f.put([]byte(d))
+	}
+	f.put(markers.Raw)
+	sorted := append([]SecurityCatchCase(nil), cases...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	for _, c := range sorted {
+		f.put([]byte(c.Name))
+		f.put(c.Raw)
+		r, err := render(c, repoRoot, arm)
+		if err != nil {
+			return "", err
+		}
+		f.put([]byte(r.Prompt))
+	}
+	return f.sum(), nil
 }
 
-func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer) ([]catchRateArmRow, error) {
+// catchRateArmTable builds THE arm table from inputs, in arm-name order. It
+// fails closed on an unavailable corpus, conventions fixture, persona corpus,
+// security corpus (or its markers) or document checkout, and on a render
+// error.
+func catchRateArmTable(in CatchRateInputs) ([]catchRateArmRow, error) {
+	return catchRateArmTableWith(in, PersonaArmPrompt, SecurityArmPrompt)
+}
+
+func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRender securityArmRenderer) ([]catchRateArmRow, error) {
 	cases, err := LoadPlanReviewCatchCorpus(in.CorpusDir)
 	if err != nil {
 		return nil, fmt.Errorf("corpus unavailable: %w", err)
@@ -360,6 +465,10 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer) ([]cat
 	personaCases, err := LoadPersonaCatchCorpus(in.PersonaCorpusDir, in.RepoRoot, ArmArchitect)
 	if err != nil {
 		return nil, fmt.Errorf("persona corpus unavailable: %w", err)
+	}
+	secCases, markers, err := LoadSecurityCatchCorpus(in.SecurityCorpusDir, in.RepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("security corpus unavailable: %w", err)
 	}
 	var rows []catchRateArmRow
 	convCases := make([]catchRateArmCase, 0, len(cases))
@@ -375,8 +484,8 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer) ([]cat
 		rows = append(rows, catchRateArmRow{
 			name: arm, kind: CatchRateArmKindConventions, cases: convCases,
 			samples: SamplesPerCaseForPower(len(cases)), fingerprint: fp,
-			run: func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
-				return RunCatchRateArm(ctx, sender, cases, conv, arm, samples)
+			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+				return RunCatchRateArm(ctx, sender, selectCatchCases(cases, keep, func(c PlanReviewCatchCase) string { return c.Name }), conv, arm, samples)
 			},
 		})
 	}
@@ -397,10 +506,35 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer) ([]cat
 	rows = append(rows, catchRateArmRow{
 		name: ArmArchitect, kind: CatchRateArmKindPersona, cases: pCases,
 		samples: SamplesPerCaseForPersona(nCatch, nClean), fingerprint: fp,
-		run: func(ctx context.Context, sender MessageSender, samples int) (CatchRateArmReport, error) {
-			return runPersonaCatchArm(ctx, sender, personaCases, in.RepoRoot, samples, render)
+		measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+			return runPersonaCatchArm(ctx, sender, selectCatchCases(personaCases, keep, func(c PersonaCatchCase) string { return c.Name }), in.RepoRoot, samples, render)
 		},
 	})
+	for _, arm := range []string{ArmSecurity, ArmSecurityPortability} {
+		armCases := SecurityArmCases(secCases, arm)
+		sCases := make([]catchRateArmCase, 0, len(armCases))
+		var sCatch, sClean int
+		for _, c := range armCases {
+			sCases = append(sCases, catchRateArmCase{name: c.Name, expect: c.Expect(), rule: c.CatchRule(), lens: c.Lens()})
+			if c.Expect() == CatchExpectClean {
+				sClean++
+			} else {
+				sCatch++
+			}
+		}
+		sort.Slice(sCases, func(i, j int) bool { return sCases[i].name < sCases[j].name })
+		fp, err := securityArmFingerprint(arm, armCases, markers, in.RepoRoot, secRender)
+		if err != nil {
+			return nil, fmt.Errorf("arm %q fingerprint: %w", arm, err)
+		}
+		rows = append(rows, catchRateArmRow{
+			name: arm, kind: CatchRateArmKindPersona, cases: sCases, partition: true,
+			samples: SamplesPerCaseForPersona(sCatch, sClean), fingerprint: fp,
+			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
+				return runSecurityCatchArm(ctx, sender, selectCatchCases(secCases, keep, func(c SecurityCatchCase) string { return c.Name }), markers, in.RepoRoot, arm, samples, secRender)
+			},
+		})
+	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
 	return rows, nil
 }
@@ -462,6 +596,11 @@ type RecordCatchRateOptions struct {
 	Reason string
 	// DryRun measures and judges but never writes the evidence file.
 	DryRun bool
+	// Subset measures part of the arm table (FISHHAWK_AGENTEVAL_PLANREVIEW_CASES
+	// / _TRIALS). A subset or reduced-trial run can never record or pin: it is
+	// refused before any model call unless DryRun is set and PinBaseline is
+	// not, and a subset dry run is reported per case, never judged.
+	Subset CatchRateSubset
 }
 
 // RecordCatchRateEvidence runs EVERY arm of the arm table against sender
@@ -472,7 +611,9 @@ type RecordCatchRateOptions struct {
 // gate refusal, so the caller can show the numbers) and an error.
 //
 // It REFUSES, leaving evidencePath and its sidecar byte-identical, on:
-// PinBaseline with a blank Reason; an existing record that is malformed
+// an active Subset without DryRun or with PinBaseline
+// (ErrCatchRateSubsetNotRecordable, the first check, before any model call)
+// or naming an unknown case id; PinBaseline with a blank Reason; an existing record that is malformed
 // (never silently dropped); no pinned baseline yet — including a legacy v1
 // record, which is a non-comparable baseline — without PinBaseline (checked
 // BEFORE any model call); an unavailable input, a transport or render error;
@@ -480,6 +621,9 @@ type RecordCatchRateOptions struct {
 // baseline; and, without PinBaseline, a baseline that is not comparable to
 // this measurement (arm set, case set, model or samples changed — re-pin).
 func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generatorModel string, in CatchRateInputs, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
+	if opts.Subset.active() && (!opts.DryRun || opts.PinBaseline) {
+		return "", fmt.Errorf("agenteval: %w: %s / %s measure part of the arm table, so the run must be a dry run — unset FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 and FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON, or unset the subset knobs for a full recording; see %s", ErrCatchRateSubsetNotRecordable, CatchRateSubsetCasesEnv, CatchRateSubsetTrialsEnv, catchRateRunbook)
+	}
 	if opts.PinBaseline && strings.TrimSpace(opts.Reason) == "" {
 		return "", fmt.Errorf("agenteval: pinning a catch-rate baseline requires a reason (it is recorded in the evidence); see %s", catchRateRunbook)
 	}
@@ -488,6 +632,9 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	}
 	rows, err := catchRateArmTable(in)
 	if err != nil {
+		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
+	}
+	if err := opts.Subset.validate(rows); err != nil {
 		return "", fmt.Errorf("agenteval: catch-rate recording: %w", err)
 	}
 	existing, legacy, err := readExistingCatchRateEvidence(evidencePath)
@@ -516,12 +663,23 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		Baseline:          ref,
 	}
 	for _, row := range rows {
-		r, err := row.run(ctx, sender, row.samples)
+		samples, keep, ok := opts.Subset.forRow(row)
+		if !ok {
+			continue
+		}
+		r, err := row.measure(ctx, sender, samples, keep)
 		if err != nil {
 			return "", err
 		}
 		reports[row.name] = r
-		rec.Arms[row.name] = CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: row.samples, PromptFingerprint: row.fingerprint, PerCase: r.PerCase}
+		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, PerCase: r.PerCase}
+		if row.partition {
+			arm.FalseAlarmPartition = falseAlarmPartitionOf(row, r)
+		}
+		rec.Arms[row.name] = arm
+	}
+	if opts.Subset.active() && opts.DryRun {
+		return renderCatchRateSubsetDryRun(opts.Subset, rows, reports), nil
 	}
 	report := ""
 	if legacy {
@@ -530,9 +688,14 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 	// The pin is judged against the CURRENT baseline too: a measurement that
 	// regresses against the reference cannot become the reference.
 	judged, err := judgeCatchRate(rec, ref, opts.PinBaseline)
-	report += judged
+	report += judged + personaDiagnostics(rows, reports)
 	if err != nil {
 		return report, fmt.Errorf("agenteval: catch-rate measurement REFUSED, evidence not written: %w", err)
+	}
+	// The Captain's ZERO-findings assertion: a portability concern naming a
+	// repository-specific control refuses the recording (dry run included).
+	if findings := portabilityFindings(reports[ArmSecurityPortability]); len(findings) > 0 {
+		return report, fmt.Errorf("agenteval: catch-rate measurement REFUSED, evidence not written: %w: %s — the remit-only reviewer was never shown that control; read the concern in the report and rework the remit or the case", ErrPortabilityRepoSpecificFinding, renderPortabilityFindings(findings))
 	}
 	if opts.PinBaseline {
 		rec.Baseline = &CatchRateBaseline{
@@ -564,6 +727,13 @@ func cloneEvidenceArms(arms CatchRateEvidenceArms) CatchRateEvidenceArms {
 			pc[k] = v
 		}
 		a.PerCase = pc
+		if a.FalseAlarmPartition != nil {
+			fp := make(map[string]CatchRateFalseAlarmPartition, len(a.FalseAlarmPartition))
+			for k, v := range a.FalseAlarmPartition {
+				fp[k] = v
+			}
+			a.FalseAlarmPartition = fp
+		}
 		out[name] = a
 	}
 	return out
@@ -578,8 +748,13 @@ func buildCatchRateTrials(rec CatchRateEvidence, reports map[string]CatchRateArm
 		out := CatchRateTrialsArm{PerCase: make(map[string][]CatchRateTrialRecord, len(r.Trials))}
 		for name, trials := range r.Trials {
 			recs := make([]CatchRateTrialRecord, 0, len(trials))
+			partitioned := rec.Arms[armName].FalseAlarmPartition != nil
 			for i, tr := range trials {
-				recs = append(recs, catchRateTrialRecord(i+1, tr))
+				r := catchRateTrialRecord(i+1, tr)
+				if partitioned {
+					r.AlarmPartition = alarmPartitionOf(tr)
+				}
+				recs = append(recs, r)
 			}
 			out.PerCase[name] = recs
 		}
@@ -616,6 +791,8 @@ func catchRateTrialRecord(index int, tr CatchTrial) CatchRateTrialRecord {
 			Category:            sanitizeCatchTrialText(c.Category),
 			Note:                sanitizeCatchTrialText(c.Note),
 			NearMiss:            c.NearMiss,
+			RepoSpecificMarker:  c.RepoSpecificMarker,
+			AbsentControl:       c.AbsentControl,
 		})
 	}
 	if tr.Outcome == CatchUndecodable {
@@ -770,7 +947,10 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //	    false_alarms on a catch case, caught on a clean case), samples_per_case
 //	    < 1, per-case trials != the arm's samples_per_case, an unknown arm kind,
 //	    or a comparison pair disagreeing on the case set or the per-case trial
-//	    weights; (6b) a case's expect differing from the corpus
+//	    weights; (6b) a case's expect differing from the corpus; (6c) a
+//	    false_alarm_partition that is negative, names a non-clean case or
+//	    does not sum to the case's false_alarms, is missing a clean case of a
+//	    partitioned arm (the security arms), or is present on any other arm
 //	(7) a case set differing from the current corpus; (7b) a missing or
 //	    unknown arm, or an arm kind differing from the arm table's
 //	(8) an under-powered arm or expectation class
@@ -793,7 +973,10 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //	     recorded trials, whose trial indices are not exactly 1..n, or whose
 //	     outcome tallies differ from the recorded caught / false_alarms /
 //	     undecodable counts (an outcome outside the case's expectation class
-//	     is a tally mismatch)
+//	     is a tally mismatch); on a partitioned arm, a false_alarm trial
+//	     without a known alarm_partition, any other trial carrying one, or
+//	     alarm_partition tallies differing from the record's
+//	     false_alarm_partition; on any other arm, a trial carrying one
 //
 // The success report names the sidecar path.
 func CheckCatchRateEvidence(evidencePath string, in CatchRateInputs, generatorModel string) (string, error) {
@@ -843,6 +1026,9 @@ func CheckCatchRateEvidence(evidencePath string, in CatchRateInputs, generatorMo
 		if err := checkArmCases(rec.Arms[row.name].PerCase, row); err != nil {
 			return fail("%v", err) // (6b), (7)
 		}
+		if err := checkArmPartition(rec.Arms[row.name], row); err != nil {
+			return fail("%v", err) // (6c)
+		}
 	}
 	if rec.Baseline == nil {
 		return fail("no pinned baseline: every record must carry one") // (10)
@@ -871,7 +1057,247 @@ func CatchRateArmRule() string {
 	return fmt.Sprintf("per-arm rule: every arm (%s, %s, %s and any later arm-table row) needs at least %d trials in EACH expectation class "+
 		"(catch, clean) and FAILS when its catch rate is more than %.2f below, or its false-alarm rate ((false_alarms + undecodable) / clean trials) "+
 		"more than %.2f above, the same arm of the pinned baseline",
-		ArmWithoutConventions, ArmWithConventions, ArmArchitect, MinCatchRateTrialsPerArm, DefaultCatchRateRegressionTolerance, DefaultCatchRateRegressionTolerance)
+		ArmWithoutConventions, ArmWithConventions, ArmArchitect+", "+ArmSecurity+", "+ArmSecurityPortability, MinCatchRateTrialsPerArm, DefaultCatchRateRegressionTolerance, DefaultCatchRateRegressionTolerance)
+}
+
+// checkArmPartition is mode (6c)'s arm-table half: a partitioned arm records a
+// false_alarm_partition entry for EVERY clean case; any other arm records
+// none. (validateEvidenceArms checks each entry's own consistency.)
+func checkArmPartition(a CatchRateEvidenceArm, row catchRateArmRow) error {
+	if !row.partition {
+		if a.FalseAlarmPartition != nil {
+			return fmt.Errorf("arm %q records a false_alarm_partition, but only the security arms are partitioned", row.name)
+		}
+		return nil
+	}
+	for _, c := range row.cases {
+		if c.expect != CatchExpectClean {
+			continue
+		}
+		if _, ok := a.FalseAlarmPartition[c.name]; !ok {
+			return fmt.Errorf("arm %q clean case %q has no false_alarm_partition entry: a security arm's false alarms are recorded split into %s and %s — re-measure", row.name, c.name, AlarmPartitionSecurityLens, AlarmPartitionOther)
+		}
+	}
+	return nil
+}
+
+// validateFalseAlarmPartition is mode (6c)'s per-entry half: every entry names
+// a clean case of the arm, is non-negative, and sums to that case's
+// false_alarms.
+func validateFalseAlarmPartition(name string, a CatchRateEvidenceArm) error {
+	keys := make([]string, 0, len(a.FalseAlarmPartition))
+	for k := range a.FalseAlarmPartition {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		p := a.FalseAlarmPartition[k]
+		c, ok := a.PerCase[k]
+		if !ok || !c.IsClean() {
+			return fmt.Errorf("arm %q false_alarm_partition names %q, which is not a clean case of the arm", name, k)
+		}
+		if p.SecurityLens < 0 || p.OtherCategory < 0 {
+			return fmt.Errorf("arm %q case %q false_alarm_partition has a negative count (%s %d, %s %d)", name, k, AlarmPartitionSecurityLens, p.SecurityLens, AlarmPartitionOther, p.OtherCategory)
+		}
+		if p.SecurityLens+p.OtherCategory != c.FalseAlarms {
+			return fmt.Errorf("arm %q case %q false_alarm_partition (%s %d + %s %d) does not sum to its false_alarms %d", name, k, AlarmPartitionSecurityLens, p.SecurityLens, AlarmPartitionOther, p.OtherCategory, c.FalseAlarms)
+		}
+	}
+	return nil
+}
+
+// alarmPartitionOf is a trial's partition class: "" unless it is a
+// false_alarm; AlarmPartitionSecurityLens when any alarming concern's
+// category names the security lens (SecurityLensCategory);
+// AlarmPartitionOther otherwise. It reads the in-memory trial, so
+// every alarming concern counts, not only the stored (capped) ones.
+func alarmPartitionOf(tr CatchTrial) string {
+	if tr.Outcome != CatchFalseAlarm {
+		return ""
+	}
+	for _, c := range tr.Concerns {
+		if SecurityLensCategory(c.Category) {
+			return AlarmPartitionSecurityLens
+		}
+	}
+	return AlarmPartitionOther
+}
+
+// falseAlarmPartitionOf is a partitioned arm's false_alarm_partition: one
+// entry per clean case of the row.
+func falseAlarmPartitionOf(row catchRateArmRow, r CatchRateArmReport) map[string]CatchRateFalseAlarmPartition {
+	out := map[string]CatchRateFalseAlarmPartition{}
+	for _, c := range row.cases {
+		if c.expect != CatchExpectClean {
+			continue
+		}
+		var p CatchRateFalseAlarmPartition
+		for _, tr := range r.Trials[c.name] {
+			switch alarmPartitionOf(tr) {
+			case AlarmPartitionSecurityLens:
+				p.SecurityLens++
+			case AlarmPartitionOther:
+				p.OtherCategory++
+			}
+		}
+		out[c.name] = p
+	}
+	return out
+}
+
+// CatchRatePortabilityFinding is one security_portability concern naming a
+// repository-specific marker: the case, the 1-based trial and the marker.
+type CatchRatePortabilityFinding struct {
+	Case   string
+	Trial  int
+	Marker string
+}
+
+// portabilityFindings is every concern of a security_portability report that
+// names a repository-specific marker, in case-name and trial order.
+func portabilityFindings(r CatchRateArmReport) []CatchRatePortabilityFinding {
+	var out []CatchRatePortabilityFinding
+	names := make([]string, 0, len(r.Trials))
+	for name := range r.Trials {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for i, tr := range r.Trials[name] {
+			for _, c := range tr.Concerns {
+				if c.RepoSpecificMarker != "" {
+					out = append(out, CatchRatePortabilityFinding{Case: name, Trial: i + 1, Marker: c.RepoSpecificMarker})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func renderPortabilityFindings(findings []CatchRatePortabilityFinding) string {
+	parts := make([]string, 0, len(findings))
+	for _, f := range findings {
+		parts = append(parts, fmt.Sprintf("case %q trial %d names %q", f.Case, f.Trial, f.Marker))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// falseAlarmCategoriesOf counts a clean case's false_alarm trials' alarming
+// concerns by normalized category ("(none)" for a blank one).
+func falseAlarmCategoriesOf(trials []CatchTrial) map[string]int {
+	out := map[string]int{}
+	for _, tr := range trials {
+		if tr.Outcome != CatchFalseAlarm {
+			continue
+		}
+		for _, c := range tr.Concerns {
+			cat := normalizeSecurityCategory(c.Category)
+			if cat == "" {
+				cat = "(none)"
+			}
+			out[cat]++
+		}
+	}
+	return out
+}
+
+// renderCategoryCounts renders a category count map in category order.
+func renderCategoryCounts(m map[string]int) string {
+	if len(m) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s %d", k, m[k]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// absentControlCount is the number of stored concerns across trials that
+// assert a control is absent (the markers.json annotation).
+func absentControlCount(trials []CatchTrial) int {
+	n := 0
+	for _, tr := range trials {
+		for _, c := range tr.Concerns {
+			if c.AbsentControl {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// personaDiagnostics is the report's persona section (#4314): for every
+// persona arm, its clean cases' false alarms by normalized concern category
+// (and, on a partitioned arm, the recorded security_lens / other_category
+// split); for every security arm, its per-case absent-control concern
+// counts; for the security arm, its catch rate per remit lens; and the
+// portability arm's repository-specific findings. "" when the table has no
+// persona arm.
+func personaDiagnostics(rows []catchRateArmRow, reports map[string]CatchRateArmReport) string {
+	var b strings.Builder
+	for _, row := range rows {
+		if row.kind != CatchRateArmKindPersona {
+			continue
+		}
+		r := reports[row.name]
+		if b.Len() == 0 {
+			b.WriteString("\nPersona diagnostics (a security arm's false-alarm rate counts EVERY concern on a clean diff, standard-criteria concerns included — read it beside this partition):\n")
+		}
+		fmt.Fprintf(&b, "  %s false alarms by category, per clean case:\n", row.name)
+		for _, c := range row.cases {
+			if c.expect != CatchExpectClean {
+				continue
+			}
+			counts := r.PerCase[c.name]
+			fmt.Fprintf(&b, "    %s: %d of %d trials; concerns: %s", c.name, counts.FalseAlarms, counts.Trials, renderCategoryCounts(falseAlarmCategoriesOf(r.Trials[c.name])))
+			if row.partition {
+				p := falseAlarmPartitionOf(catchRateArmRow{cases: []catchRateArmCase{c}}, r)[c.name]
+				fmt.Fprintf(&b, " (trials: %s %d, %s %d)", AlarmPartitionSecurityLens, p.SecurityLens, AlarmPartitionOther, p.OtherCategory)
+			}
+			b.WriteString("\n")
+		}
+		if !row.partition {
+			continue
+		}
+		fmt.Fprintf(&b, "  %s absent-control concerns, per case:\n", row.name)
+		for _, c := range row.cases {
+			fmt.Fprintf(&b, "    %s: %d\n", c.name, absentControlCount(r.Trials[c.name]))
+		}
+		if row.name == ArmSecurity {
+			type lensTally struct{ caught, trials int }
+			lenses := map[string]*lensTally{}
+			for _, c := range row.cases {
+				if c.lens == "" {
+					continue
+				}
+				if lenses[c.lens] == nil {
+					lenses[c.lens] = &lensTally{}
+				}
+				lenses[c.lens].caught += r.PerCase[c.name].Caught
+				lenses[c.lens].trials += r.PerCase[c.name].Trials
+			}
+			fmt.Fprintf(&b, "  %s catch rate per remit lens:\n", row.name)
+			for _, lens := range SecurityLenses {
+				if t := lenses[lens]; t != nil && t.trials > 0 {
+					fmt.Fprintf(&b, "    %s: %d/%d (%.3f)\n", lens, t.caught, t.trials, float64(t.caught)/float64(t.trials))
+				}
+			}
+		}
+		if row.name == ArmSecurityPortability {
+			if f := portabilityFindings(r); len(f) > 0 {
+				fmt.Fprintf(&b, "  %s repository-specific findings (REFUSED): %s\n", row.name, renderPortabilityFindings(f))
+			} else {
+				fmt.Fprintf(&b, "  %s repository-specific findings: none\n", row.name)
+			}
+		}
+	}
+	return b.String()
 }
 
 // checkArmSet is mode (7b): the record's arms are exactly the arm table's,
@@ -996,7 +1422,41 @@ func checkCatchRateTrials(path string, rec *CatchRateEvidence) error {
 					armName, name, tally[CatchCaught], tally[CatchMissed], tally[CatchFalseAlarm], tally[CatchNoFalseAlarm], tally[CatchUndecodable], len(list),
 					countsExpect(c), c.Caught, c.FalseAlarms, c.Undecodable) // (16) tallies
 			}
+			if err := checkTrialPartition(armName, name, list, rec.Arms[armName].FalseAlarmPartition); err != nil {
+				return err // (16) partition
+			}
 		}
+	}
+	return nil
+}
+
+// checkTrialPartition is mode (16)'s partition half for one case: on a
+// partitioned arm every false_alarm trial carries a known alarm_partition,
+// no other trial carries one, and the tallies equal the record's entry; on
+// any other arm (partition nil) no trial carries one.
+func checkTrialPartition(armName, name string, list []CatchRateTrialRecord, partition map[string]CatchRateFalseAlarmPartition) error {
+	var got CatchRateFalseAlarmPartition
+	for _, tr := range list {
+		switch {
+		case tr.AlarmPartition == "":
+			if partition != nil && tr.Outcome == CatchFalseAlarm {
+				return fmt.Errorf("arm %q case %q trial %d is a false_alarm without an alarm_partition", armName, name, tr.Trial)
+			}
+			continue
+		case partition == nil:
+			return fmt.Errorf("arm %q case %q trial %d carries alarm_partition %q, but the arm is not partitioned", armName, name, tr.Trial, tr.AlarmPartition)
+		case tr.Outcome != CatchFalseAlarm:
+			return fmt.Errorf("arm %q case %q trial %d (%s) carries alarm_partition %q: only a false_alarm trial is partitioned", armName, name, tr.Trial, tr.Outcome, tr.AlarmPartition)
+		case tr.AlarmPartition == AlarmPartitionSecurityLens:
+			got.SecurityLens++
+		case tr.AlarmPartition == AlarmPartitionOther:
+			got.OtherCategory++
+		default:
+			return fmt.Errorf("arm %q case %q trial %d alarm_partition %q is not %q or %q", armName, name, tr.Trial, tr.AlarmPartition, AlarmPartitionSecurityLens, AlarmPartitionOther)
+		}
+	}
+	if want, ok := partition[name]; ok && got != want {
+		return fmt.Errorf("arm %q case %q alarm_partition tallies (%s %d, %s %d) differ from the record's false_alarm_partition (%d, %d)", armName, name, AlarmPartitionSecurityLens, got.SecurityLens, AlarmPartitionOther, got.OtherCategory, want.SecurityLens, want.OtherCategory)
 	}
 	return nil
 }
@@ -1061,6 +1521,9 @@ func validateEvidenceArms(arms CatchRateEvidenceArms) error {
 			if err := a.PerCase[c].validate(); err != nil {
 				return fmt.Errorf("inconsistent counts in arm %q case %q: %w", name, c, err)
 			}
+		}
+		if err := validateFalseAlarmPartition(name, a); err != nil {
+			return err
 		}
 	}
 	for _, pair := range catchRateComparisonPairs {

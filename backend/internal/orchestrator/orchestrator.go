@@ -61,12 +61,15 @@ type GitHubAPI interface {
 	// CreatePullRequest opens the single consolidated PR for a
 	// decomposed parent run (#714 / ADR-032) once all children have
 	// pushed to the shared branch. Returns ErrPullRequestExists when a
-	// PR already exists for head/base (lost double-open race).
+	// PR already exists for head/base — GitHub does not reliably return
+	// it for two creates landing sub-second apart (#4110), so the open is
+	// serialized by the once-only guard rather than relying on it.
 	CreatePullRequest(ctx context.Context, scope forge.CredentialScope,
 		repo forge.RepoRef, head, base, title, body string) (*forge.PullRequest, error)
 	// ListOpenPullRequestsByHead recovers the existing open PR for a
-	// head branch — used to resolve the URL after CreatePullRequest
-	// returns ErrPullRequestExists (#714).
+	// head branch — used by the consolidated-PR open BEFORE creating (adopt
+	// an already-open PR, #4110) and to resolve the URL after
+	// CreatePullRequest returns ErrPullRequestExists (#714).
 	ListOpenPullRequestsByHead(ctx context.Context, scope forge.CredentialScope,
 		repo forge.RepoRef, headBranch, base string) ([]forge.PullRequest, error)
 	// GetBranchSHA resolves a branch ref to its tip SHA, reporting
@@ -232,6 +235,42 @@ type Orchestrator struct {
 	// in-process lock cannot serialize, so the residual is documented rather than
 	// silently claimed closed.
 	stageAdmissionLocks sync.Map
+
+	// consolidatedPROpenLocks is the IN-PROCESS layer of the decomposed
+	// parent's once-only consolidated-PR open (#4110): parent run UUID ->
+	// *sync.Mutex, taken by lockConsolidatedPROpen around maybeOpenConsolidatedPR's
+	// critical section. Zero-value usable and DELIBERATELY NEVER EVICTS, for
+	// the same reason stageAdmissionLocks does not (an eviction racing a
+	// LoadOrStore could hand two callers different mutexes for one parent):
+	// one mutex per decomposed parent per process lifetime. The cross-process
+	// layer is run.ConsolidatedPROpenLocker, always taken SECOND.
+	consolidatedPROpenLocks sync.Map
+}
+
+// lockConsolidatedPROpen acquires the in-process consolidated-PR-open mutex
+// for a parent run and returns its unlock function (#4110). Caller MUST invoke
+// the returned unlock exactly once (defer it). Not reentrant, and not
+// ctx-aware: a waiter parks until the holder's forge calls return.
+func (o *Orchestrator) lockConsolidatedPROpen(runID uuid.UUID) func() {
+	m, _ := o.consolidatedPROpenLocks.LoadOrStore(runID, &sync.Mutex{})
+	// LoadOrStore only ever stores a *sync.Mutex, so the assertion cannot fail.
+	mu, _ := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// withConsolidatedPROpenDBLock runs fn under the run repository's
+// cross-process consolidated-PR-open lock when the repository implements
+// run.ConsolidatedPROpenLocker (production postgres), propagating a lock
+// error WITHOUT running fn — the open is never attempted unguarded. A
+// repository without the capability (the in-memory fakes) runs fn directly;
+// the in-process mutex the caller already holds still serializes it.
+func (o *Orchestrator) withConsolidatedPROpenDBLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	locker, ok := o.Runs.(run.ConsolidatedPROpenLocker)
+	if ok {
+		return locker.WithConsolidatedPROpenLock(ctx, runID, fn)
+	}
+	return fn(ctx)
 }
 
 // LockStageAdmission acquires the per-stage admission mutex for stageID and
@@ -676,11 +715,27 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 // stamps pull_request_url on the run, returning the (reloaded) run so
 // the in-flight Advance dispatches the review with the URL present.
 //
-// Idempotency is load-bearing: the periodic child-completion sweeper and
-// the event-driven maybeAdvanceDecomposedParent can both call Advance on
-// the parent near-simultaneously, and create-PR is not idempotent. The
-// empty-URL re-read (b) shrinks the window; the ErrPullRequestExists
-// recovery (e) makes a lost race benign by resolving the already-open PR.
+// The open is ONCE-ONLY per parent run (#4110). The periodic child-completion
+// sweeper, the event-driven maybeAdvanceDecomposedParent and the acceptance
+// short-circuit re-entry can all call Advance on the parent near-
+// simultaneously, create-PR is not idempotent, and GitHub does not reliably
+// 422 a second create for the same head/base landing ~0.1 s after the first
+// (#4108/#4109, #4272/#4273). So the whole read-URL -> create ->
+// record-artifact -> stamp-URL -> audit critical section
+// (openConsolidatedPRLocked) runs under TWO locks, always in this order:
+//
+//  1. the in-process per-parent mutex (lockConsolidatedPROpen) — covers the
+//     single-process deployment and every fake-backed path;
+//  2. the run repository's cross-process advisory lock
+//     (run.ConsolidatedPROpenLocker, when implemented) — Helm split mode runs
+//     the sweeper on the worker pod and the event-driven settle on the api
+//     pods, i.e. in different processes.
+//
+// The loser re-reads the run INSIDE both locks, finds the winner's URL and
+// returns it without calling the forge. A lock-acquisition error returns
+// without opening anything, so the next Advance retries. Residual: the
+// in-process mutex is not ctx-aware, so a waiter parks until the holder's
+// forge calls return (the accepted #1936 posture).
 //
 // Graceful-skip (returns the run unchanged, nil error) when: the run has
 // no decomposed children (an ordinary PR-less run, never a parent), the
@@ -703,13 +758,38 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 		return r, nil
 	}
 
-	// (b) Re-read immediately before the create to shrink the double-
-	// open window between the two settle paths.
+	// Lock order: the in-process mutex FIRST, then the cross-process advisory
+	// lock (see run.ConsolidatedPROpenLocker).
+	unlockProcess := o.lockConsolidatedPROpen(r.ID)
+	defer unlockProcess()
+
+	var opened *run.Run
+	err = o.withConsolidatedPROpenDBLock(ctx, r.ID, func(ctx context.Context) error {
+		var openErr error
+		opened, openErr = o.openConsolidatedPRLocked(ctx, r, reviewStage)
+		return openErr
+	})
+	if opened == nil {
+		opened = r
+	}
+	return opened, err
+}
+
+// openConsolidatedPRLocked is maybeOpenConsolidatedPR's critical section
+// (#4110). It MUST run under both consolidated-PR-open locks: the (b)
+// re-read is authoritative only because a concurrent winner has already
+// stamped its URL by the time this caller gets the locks.
+func (o *Orchestrator) openConsolidatedPRLocked(ctx context.Context, r *run.Run, reviewStage *run.Stage) (*run.Run, error) {
+	// (b) Re-read under the locks: a URL stamped by a concurrent winner is
+	// authoritative, so the loser returns it without calling the forge.
 	fresh, err := o.Runs.GetRun(ctx, r.ID)
 	if err != nil {
 		return r, fmt.Errorf("reload run: %w", err)
 	}
 	if fresh.PullRequestURL != nil && *fresh.PullRequestURL != "" {
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: consolidated PR already opened by a concurrent advance",
+			slog.String("run_id", fresh.ID.String()),
+			slog.String("pull_request_url", *fresh.PullRequestURL))
 		return fresh, nil
 	}
 	r = fresh
@@ -775,26 +855,49 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 
 	title, body := consolidatedPRTitleBody(r, approvedPlan, implStageID, head, o.ExternalURL, childRunIDs)
 
-	// (e) Open the PR; recover the existing one on a lost race.
+	// Defence in depth (#4110): before creating, adopt an already-open PR for
+	// the consolidated head — a retry after a create-succeeded / stamp-failed
+	// crash, or a duplicate opened before the lock existed. The lock above is
+	// the primary guard; this list can lag GitHub's read-after-write, so it is
+	// never relied on alone. A list error fails CLOSED (no create, no URL
+	// stamp) and the next Advance retries.
+	preexisting, preErr := o.GitHub.ListOpenPullRequestsByHead(ctx, scope, repo, head, base)
+	if preErr != nil {
+		return r, fmt.Errorf("list open prs for consolidated head %q before create: %w", head, preErr)
+	}
+
+	// (e) Adopt the pre-existing PR, or open one and recover the existing PR
+	// on ErrPullRequestExists (the retained last backstop).
 	var prURL string
 	var prNumber int
-	pr, err := o.GitHub.CreatePullRequest(ctx, scope, repo, head, base, title, body)
-	switch {
-	case err == nil:
-		prURL = pr.HTMLURL
-		prNumber = pr.Number
-	case errors.Is(err, forge.ErrPullRequestExists):
-		existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, scope, repo, head, base)
-		if lerr != nil {
-			return r, fmt.Errorf("recover existing pr for head %q: %w", head, lerr)
+	adopted := false
+	if len(preexisting) > 0 {
+		o.warnDuplicateConsolidatedPRs(ctx, r.ID, head, preexisting)
+		existing := oldestPullRequest(preexisting)
+		prURL = existing.HTMLURL
+		prNumber = existing.Number
+		adopted = true
+	} else {
+		pr, err := o.GitHub.CreatePullRequest(ctx, scope, repo, head, base, title, body)
+		switch {
+		case err == nil:
+			prURL = pr.HTMLURL
+			prNumber = pr.Number
+		case errors.Is(err, forge.ErrPullRequestExists):
+			existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, scope, repo, head, base)
+			if lerr != nil {
+				return r, fmt.Errorf("recover existing pr for head %q: %w", head, lerr)
+			}
+			if len(existing) == 0 {
+				return r, fmt.Errorf("pr already exists for head %q but none returned by list", head)
+			}
+			o.warnDuplicateConsolidatedPRs(ctx, r.ID, head, existing)
+			recovered := oldestPullRequest(existing)
+			prURL = recovered.HTMLURL
+			prNumber = recovered.Number
+		default:
+			return r, fmt.Errorf("create consolidated pr: %w", err)
 		}
-		if len(existing) == 0 {
-			return r, fmt.Errorf("pr already exists for head %q but none returned by list", head)
-		}
-		prURL = existing[0].HTMLURL
-		prNumber = existing[0].Number
-	default:
-		return r, fmt.Errorf("create consolidated pr: %w", err)
 	}
 	if prURL == "" {
 		return r, fmt.Errorf("consolidated pr opened but URL is empty")
@@ -809,8 +912,9 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 	// the (b) "URL already set -> return early" short-circuit above can never
 	// observe a URL-stamped-but-artifact-missing state. On an error, return it
 	// (unwind) WITHOUT stamping the URL so the next Advance re-enters this gate
-	// with the URL still empty, re-opens the PR idempotently via the
-	// ErrPullRequestExists recovery, and records the artifact on retry.
+	// with the URL still empty, adopts the PR via the pre-create list (or the
+	// ErrPullRequestExists recovery when the list lags), and records the
+	// artifact on retry.
 	if err := o.recordConsolidatedPRArtifact(ctx, r, prURL, prNumber, head, base); err != nil {
 		return r, fmt.Errorf("record consolidated pull_request artifact: %w", err)
 	}
@@ -822,13 +926,52 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 		return r, fmt.Errorf("set pull_request_url: %w", err)
 	}
 	o.emitConsolidatedPROpened(ctx, r.ID, reviewStage.ID, prURL)
-	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator opened consolidated PR",
+	msg := "orchestrator opened consolidated PR"
+	if adopted {
+		msg = "orchestrator adopted existing open consolidated PR"
+	}
+	o.logger().LogAttrs(ctx, slog.LevelInfo, msg,
 		slog.String("run_id", r.ID.String()),
 		slog.String("head", head),
 		slog.String("base", base),
 		slog.String("pull_request_url", prURL),
 	)
 	return updated, nil
+}
+
+// oldestPullRequest returns the lowest-numbered (earliest-opened) PR in prs,
+// or the zero PullRequest when prs is empty. Both consolidated-PR adopt paths
+// (the pre-create list and the ErrPullRequestExists recovery) pick through it
+// so a pair of duplicates always resolves to the same PR (#4110).
+func oldestPullRequest(prs []forge.PullRequest) forge.PullRequest {
+	if len(prs) == 0 {
+		return forge.PullRequest{}
+	}
+	oldest := prs[0]
+	for _, pr := range prs[1:] {
+		if pr.Number < oldest.Number {
+			oldest = pr
+		}
+	}
+	return oldest
+}
+
+// warnDuplicateConsolidatedPRs WARN-logs every open PR URL when more than one
+// PR is open for a parent's consolidated head (#4110): a duplicate already
+// exists and the operator must close all but the adopted (lowest-numbered) one.
+func (o *Orchestrator) warnDuplicateConsolidatedPRs(ctx context.Context, runID uuid.UUID, head string, prs []forge.PullRequest) {
+	if len(prs) <= 1 {
+		return
+	}
+	urls := make([]string, 0, len(prs))
+	for _, pr := range prs {
+		urls = append(urls, pr.HTMLURL)
+	}
+	o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: multiple open consolidated PRs for one parent; adopting the lowest-numbered, close the others",
+		slog.String("run_id", runID.String()),
+		slog.String("head", head),
+		slog.String("adopted_pull_request_url", oldestPullRequest(prs).HTMLURL),
+		slog.Any("open_pull_request_urls", urls))
 }
 
 // recordConsolidatedPRArtifact records the kind=pull_request artifact on the
@@ -855,8 +998,9 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 // is NO unique (stage_id, kind) DB constraint, so a naive Create on a race or
 // retry would duplicate — the helper ListForStage-guards and skips Create when
 // a kind=pull_request artifact already exists. The ListForStage-then-Create
-// guard is non-atomic; per-run Advance serialization makes that an accepted
-// documented limitation.
+// guard is non-atomic on its own; it is serialized because its only caller,
+// openConsolidatedPRLocked, runs under the once-only consolidated-PR-open
+// locks (in-process mutex + run.ConsolidatedPROpenLocker, #4110).
 func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.Run, prURL string, prNumber int, head, base string) error {
 	// Graceful skip: a harness without the artifact repo can't record the
 	// artifact — same posture as maybeOpenConsolidatedPR's GitHub/installation

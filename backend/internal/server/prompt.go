@@ -1771,8 +1771,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// Subtract the operator's gate-time remove_scope_files (#1726) AFTER
 		// the add fold, the approved-amendment fold, and (for decomposed
 		// children) the per-slice narrowing above — so the removal covers
-		// top-level, decomposed per-slice, and fix-up scopes uniformly. The
-		// runner reads cfg.scopeFiles solely from this ScopeFiles, so a removed
+		// top-level, decomposed per-slice, and fix-up scopes uniformly (a
+		// decomposed parent's fix-up union, folded later, re-applies it — #4338).
+		// The runner reads cfg.scopeFiles solely from this ScopeFiles, so a removed
 		// path is honored by every runner gate with no runner change. Resolved
 		// across the decomposition fan-out boundary so removals reach
 		// implement-only decomposed and recovery children. No-op on an empty
@@ -1786,6 +1787,13 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// effective fix-up scope (#1314) — the inherited plan scope.files, plus
 		// the operator-declared net-new files (#823), the stage's approved
 		// mid-pass scope amendments (#961), and coupled test siblings (#1214).
+		// On a decomposed PARENT it also retains the decomposed-parent union
+		// (#4338, decomposedParentFixupScope): every sub_plan's declared scope,
+		// every slice's add_scope_files_to_slice grant and every child's approved
+		// amendment, folded BEFORE effectiveFixupScope so its coupled-test fold
+		// covers them. The union is gated on isDecomposedParentRun, the predicate
+		// fixupBranchForRun uses for the consolidated branch and the local
+		// fixupPolicyIncrement flag below is assigned from (#4391).
 		// This reverses the #1162 concern-surface narrowing, which silently
 		// collapsed the scope to ~1 file and drift-excluded the agent's in-plan
 		// edits whenever a concern carried only prose and an amendment was
@@ -1820,6 +1828,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			obligations, triggerSeq := s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID, 0)
 			trigger.FixupReportObligations = fixupReportObligationsForPrompt(obligations)
 			s.recordFixupReportObligationsDeclared(r.Context(), runRow.ID, stage.ID, triggerSeq, obligations)
+			scopeFiles = s.decomposedParentFixupScope(r.Context(), runRow, approvedPlan, scopeFiles, removedScopeFiles)
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))
@@ -2625,8 +2634,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// (reusing #558's framing) and RETAIN the FULL approved plan scope
 		// (#1314), identical derivation to the dispatch path so the rendered view
 		// matches byte-for-byte — the inherited plan scope.files, allow_create
-		// (#823), and the stage's approved mid-pass scope amendments (#961). No-op
-		// for a normal (non-fix-up) implement dispatch.
+		// (#823), and the stage's approved mid-pass scope amendments (#961), plus
+		// on a decomposed PARENT the decomposed-parent union (#4338,
+		// decomposedParentFixupScope), gated on isDecomposedParentRun — the
+		// predicate fixupBranchForRun uses and the local fixupPolicyIncrement flag
+		// below is assigned from (#4391). No-op for a normal (non-fix-up)
+		// implement dispatch.
 		// Conflict-resolution pass (#3202). Resolved BEFORE the fix-up block:
 		// a live trigger makes this dispatch a conflict-resolution pass, and
 		// the runner routes on it ahead of every implement/fix-up path. The
@@ -2661,6 +2674,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// only the runner-facing serve pins the entry a review joins against.
 			obligations, _ := s.resolveFixupReportObligations(r.Context(), runRow.ID, stage.ID, 0)
 			trigger.FixupReportObligations = fixupReportObligationsForPrompt(obligations)
+			scopeFiles = s.decomposedParentFixupScope(r.Context(), runRow, approvedPlan, scopeFiles, removedScopeFiles)
 			scopeFiles = s.effectiveFixupScope(r.Context(), scopeFiles,
 				s.resolveFixupAllowCreate(r.Context(), runRow.ID, stage.ID),
 				s.resolveApprovedScopeAmendments(r.Context(), runRow.ID, stage.ID))

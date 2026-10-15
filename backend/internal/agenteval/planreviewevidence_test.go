@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -38,8 +39,14 @@ import (
 // identifies the case, committedPersonaScript): its first caught[architect]
 // catch-case calls get the case's first catching example, every later one a
 // concern-free verdict; its first falseAlarms clean-case calls get the case's
-// first false-alarm example, every later one a concern-free verdict. So every
-// seeded count exists BY CONSTRUCTION.
+// first false-alarm example, every later one a concern-free verdict. The two
+// security arms (#4314) are routed on the security remit heading — the
+// conventions section splits security from security_portability — and are
+// answered PER CASE the same way (committedSecurityScript), with their own
+// counters: the first caught[security] catch-case calls get the case's first
+// catching example, and the first secFalseAlarms[arm] clean-case calls of
+// each arm its first false-alarm example; secOverride, when set, answers a
+// security call first. So every seeded count exists BY CONSTRUCTION.
 type scriptedCatchSender struct {
 	caught      map[string]int
 	falseAlarms int
@@ -48,16 +55,67 @@ type scriptedCatchSender struct {
 	calls       map[string]int
 	cleanCalls  int
 	persona     map[string]personaScriptCase
+	// The security arms.
+	security       map[string]personaScriptCase
+	secFalseAlarms map[string]int
+	secCleanCalls  map[string]int
+	secOverride    func(arm string, sc personaScriptCase, call int) (string, bool)
 }
 
 func newScriptedCatchSender(t *testing.T, withoutCaught, withCaught int) *scriptedCatchSender {
 	t.Helper()
 	return &scriptedCatchSender{
-		caught:  map[string]int{ArmWithoutConventions: withoutCaught, ArmWithConventions: withCaught, ArmArchitect: math.MaxInt},
-		note:    allCaseCatchNote(t),
-		calls:   map[string]int{},
-		persona: committedPersonaScript(t),
+		caught:         map[string]int{ArmWithoutConventions: withoutCaught, ArmWithConventions: withCaught, ArmArchitect: math.MaxInt, ArmSecurity: math.MaxInt},
+		note:           allCaseCatchNote(t),
+		calls:          map[string]int{},
+		persona:        committedPersonaScript(t),
+		security:       committedSecurityScript(t),
+		secFalseAlarms: map[string]int{},
+		secCleanCalls:  map[string]int{},
 	}
+}
+
+var (
+	securityScriptOnce sync.Once
+	securityScript     map[string]personaScriptCase
+	securityScriptErr  error
+)
+
+// committedSecurityScript maps each committed security case's RENDERED
+// persona prompt, for EACH security arm that runs it, to its scripted
+// answers. Computed once per test process.
+func committedSecurityScript(t *testing.T) map[string]personaScriptCase {
+	t.Helper()
+	securityScriptOnce.Do(func() {
+		cases, _, err := LoadSecurityCatchCorpus(committedSecurityCorpus, personaTestRepoRoot)
+		if err != nil {
+			securityScriptErr = err
+			return
+		}
+		securityScript = map[string]personaScriptCase{}
+		for _, arm := range []string{ArmSecurity, ArmSecurityPortability} {
+			for _, c := range SecurityArmCases(cases, arm) {
+				r, err := SecurityArmPrompt(c, personaTestRepoRoot, arm)
+				if err != nil {
+					securityScriptErr = err
+					return
+				}
+				sc := personaScriptCase{name: c.Name, clean: c.Expect() == CatchExpectClean}
+				if sc.clean {
+					ex := c.Input.FalseAlarmExamples[0]
+					sc.falseAlarm = personaVerdictJSON(ex.Category, ex.Note)
+				} else {
+					ex := c.Input.CatchingExamples[0]
+					sc.catching = personaVerdictJSON(ex.Category, ex.Note)
+				}
+				securityScript[r.Prompt] = sc
+			}
+		}
+	})
+	if securityScriptErr != nil {
+		t.Fatalf("committed security script: %v", securityScriptErr)
+	}
+	return securityScript
 }
 
 // personaScriptCase is what the scripted sender answers for one persona case.
@@ -130,11 +188,20 @@ func allCaseCatchNote(t *testing.T) string {
 }
 
 // catchArmOf is the arm a fake sender's user prompt belongs to: the persona
-// remit heading routes to the architect arm, the conventions heading to the
-// with-conventions arm.
+// remit heading routes to the architect arm; the security remit heading —
+// checked BEFORE the conventions heading, because a security prompt carries
+// both — to the security arm when the conventions section is present and the
+// portability arm otherwise; the conventions heading to the with-conventions
+// arm.
 func catchArmOf(userText string) string {
 	if strings.Contains(userText, personaprompt.Framing(ArmArchitect).Heading) {
 		return ArmArchitect
+	}
+	if strings.Contains(userText, personaprompt.Framing(personaSecurityName).Heading) {
+		if strings.Contains(userText, "### "+prompt.ReviewConventionsHeading) {
+			return ArmSecurity
+		}
+		return ArmSecurityPortability
 	}
 	if strings.Contains(userText, "### "+prompt.ReviewConventionsHeading) {
 		return ArmWithConventions
@@ -147,6 +214,31 @@ func (s *scriptedCatchSender) Messages(_ context.Context, _, userText string) (s
 		return "", "", 0, 0, 0, 0, s.err
 	}
 	arm := catchArmOf(userText)
+	if arm == ArmSecurity || arm == ArmSecurityPortability {
+		sc, ok := s.security[userText]
+		if !ok {
+			return "", "", 0, 0, 0, 0, errors.New("scripted sender: a security prompt matching no committed security case")
+		}
+		n := s.calls[arm]
+		s.calls[arm]++
+		if s.secOverride != nil {
+			if ans, ok := s.secOverride(arm, sc, n); ok {
+				return ans, "fake-model", 0, 0, 0, 0, nil
+			}
+		}
+		if sc.clean {
+			cn := s.secCleanCalls[arm]
+			s.secCleanCalls[arm]++
+			if cn < s.secFalseAlarms[arm] {
+				return sc.falseAlarm, "fake-model", 0, 0, 0, 0, nil
+			}
+			return `{"verdict":"approve","concerns":[]}`, "fake-model", 0, 0, 0, 0, nil
+		}
+		if n-s.secCleanCalls[arm] < s.caught[arm] {
+			return sc.catching, "fake-model", 0, 0, 0, 0, nil
+		}
+		return `{"verdict":"approve","concerns":[]}`, "fake-model", 0, 0, 0, 0, nil
+	}
 	if arm == ArmArchitect {
 		sc, ok := s.persona[userText]
 		if !ok {
@@ -179,7 +271,8 @@ func (s *scriptedCatchSender) Messages(_ context.Context, _, userText string) (s
 }
 
 func (s *scriptedCatchSender) total() int {
-	return s.calls[ArmWithoutConventions] + s.calls[ArmWithConventions] + s.calls[ArmArchitect] + s.cleanCalls
+	return s.calls[ArmWithoutConventions] + s.calls[ArmWithConventions] + s.calls[ArmArchitect] + s.cleanCalls +
+		s.calls[ArmSecurity] + s.calls[ArmSecurityPortability]
 }
 
 // catchInputs is the committed arm-table inputs with the conventions arms'
@@ -200,10 +293,11 @@ func setArmSamples(arms CatchRateEvidenceArms, name string, n int) {
 // committedCatchInputs is the committed arm-table inputs.
 func committedCatchInputs() CatchRateInputs {
 	return CatchRateInputs{
-		CorpusDir:        committedCatchCorpus,
-		ConventionsPath:  committedCatchConventions,
-		PersonaCorpusDir: committedPersonaCorpus,
-		RepoRoot:         personaTestRepoRoot,
+		CorpusDir:         committedCatchCorpus,
+		ConventionsPath:   committedCatchConventions,
+		PersonaCorpusDir:  committedPersonaCorpus,
+		SecurityCorpusDir: committedSecurityCorpus,
+		RepoRoot:          personaTestRepoRoot,
 	}
 }
 
@@ -1469,8 +1563,19 @@ func TestCatchRatePromptFingerprint_RenderErrorPropagates(t *testing.T) {
 	if _, err := personaArmFingerprint(cases2, personaTestRepoRoot, broken); err == nil || !strings.Contains(err.Error(), "render down") {
 		t.Fatalf("err = %v, want the persona render error", err)
 	}
-	if _, err := catchRateArmTableWith(committedCatchInputs(), broken); err == nil || !strings.Contains(err.Error(), "render down") {
+	if _, err := catchRateArmTableWith(committedCatchInputs(), broken, SecurityArmPrompt); err == nil || !strings.Contains(err.Error(), "render down") {
 		t.Fatalf("err = %v, want the arm table to propagate the persona render error", err)
+	}
+	secBroken := func(SecurityCatchCase, string, string) (SecurityArmRender, error) {
+		return SecurityArmRender{}, errors.New("security render down")
+	}
+	if _, err := catchRateArmTableWith(committedCatchInputs(), PersonaArmPrompt, secBroken); err == nil || !strings.Contains(err.Error(), "security render down") || !strings.Contains(err.Error(), `arm "security"`) {
+		t.Fatalf("err = %v, want the arm table to propagate the security render error naming the arm", err)
+	}
+	in = committedCatchInputs()
+	in.SecurityCorpusDir = "testdata/no-such-security-corpus"
+	if _, err := CatchRatePromptFingerprint(in, testCatchModel); err == nil || !strings.Contains(err.Error(), "security corpus unavailable") {
+		t.Fatalf("err = %v, want the security corpus refusal", err)
 	}
 }
 
@@ -1556,6 +1661,9 @@ func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 		if err := checkArmCases(rec.Arms[row.name].PerCase, row); err != nil {
 			t.Fatalf("README minimal record: %v", err)
 		}
+		if err := checkArmPartition(rec.Arms[row.name], row); err != nil {
+			t.Fatalf("README minimal record: %v", err)
+		}
 	}
 	if rec.Baseline == nil {
 		t.Fatal("README minimal record carries no pinned baseline")
@@ -1620,7 +1728,9 @@ func TestCheckCatchRateEvidence_PerArmModes(t *testing.T) {
 			setCounts(r.Arms, ArmArchitect, cleanCase, func(c *CaseCatchCounts) { c.Expect = CatchExpectCatch })
 		}, want: `records expect "catch", the corpus "clean"`},
 		{name: "(7b) a missing architect arm", mutate: func(r *CatchRateEvidence) { delete(r.Arms, ArmArchitect) }, want: `arm "architect" is missing`},
-		{name: "(7b) an unknown arm", mutate: func(r *CatchRateEvidence) { r.Arms["security"] = r.Arms[ArmArchitect] }, want: `unknown arm "security"`},
+		{name: "(7b) an unknown arm", mutate: func(r *CatchRateEvidence) { r.Arms["zz_retired_arm"] = r.Arms[ArmArchitect] }, want: `unknown arm "zz_retired_arm"`},
+		{name: "(7b) a missing security arm", mutate: func(r *CatchRateEvidence) { delete(r.Arms, ArmSecurity) }, want: `arm "security" is missing`},
+		{name: "(7b) a missing security_portability arm", mutate: func(r *CatchRateEvidence) { delete(r.Arms, ArmSecurityPortability) }, want: `arm "security_portability" is missing`},
 		{name: "(7b) an arm kind differing from the arm table", mutate: func(r *CatchRateEvidence) {
 			a := r.Arms[ArmArchitect]
 			a.Kind = CatchRateArmKindConventions
@@ -1901,8 +2011,8 @@ func TestRecordCatchRateEvidence_V1ExistingRequiresPin(t *testing.T) {
 	if !strings.Contains(report, "the pin replaces it") {
 		t.Errorf("report does not explain the replaced legacy record:\n%s", report)
 	}
-	if rec := readCatchEvidence(t, path); rec.Schema != CatchRateEvidenceSchema || rec.Baseline == nil || len(rec.Arms) != 3 {
-		t.Fatalf("pinned record = schema %q, baseline %v, %d arms; want a v2 record with three arms and a baseline", rec.Schema, rec.Baseline != nil, len(rec.Arms))
+	if rec := readCatchEvidence(t, path); rec.Schema != CatchRateEvidenceSchema || rec.Baseline == nil || len(rec.Arms) != 5 {
+		t.Fatalf("pinned record = schema %q, baseline %v, %d arms; want a v2 record with five arms and a baseline", rec.Schema, rec.Baseline != nil, len(rec.Arms))
 	}
 	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
 		t.Fatalf("the pinned v2 pair does not pass the gate: %v", err)
@@ -1937,4 +2047,312 @@ func pooledCounts(perCase map[string]CaseCatchCounts) (trials, caught int) {
 		caught += c.Caught
 	}
 	return trials, caught
+}
+
+// ---------------------------------------------------------------------------
+// The security arms (E80.17 / #4314).
+// ---------------------------------------------------------------------------
+
+// securityCaseSets is the committed security corpus's catch and clean case
+// names.
+func securityCaseSets(t *testing.T) (catch, clean []string) {
+	t.Helper()
+	cases, _ := loadCommittedSecurity(t)
+	for _, c := range cases {
+		if c.Expect() == CatchExpectClean {
+			clean = append(clean, c.Name)
+		} else {
+			catch = append(catch, c.Name)
+		}
+	}
+	sort.Strings(catch)
+	sort.Strings(clean)
+	return catch, clean
+}
+
+// TestRecordCatchRateEvidence_RecordsFiveArms (CF8) is the end-to-end
+// security-arm wiring: one recording through the scripted sender writes all
+// five arms — the security arm over every security case, the portability arm
+// over the clean cases only, both persona-kind and partitioned — the record
+// passes the gate, and the report carries the persona diagnostics.
+func TestRecordCatchRateEvidence_RecordsFiveArms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	all := committedCatchTrials(t)
+	report, err := record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("five arms"))
+	if err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	rec := readCatchEvidence(t, path)
+	want := map[string]string{ArmWithoutConventions: CatchRateArmKindConventions, ArmWithConventions: CatchRateArmKindConventions,
+		ArmArchitect: CatchRateArmKindPersona, ArmSecurity: CatchRateArmKindPersona, ArmSecurityPortability: CatchRateArmKindPersona}
+	if len(rec.Arms) != len(want) {
+		t.Fatalf("the record carries %d arms %v, want the five %v", len(rec.Arms), sortedArmNames(rec.Arms), want)
+	}
+	for arm, kind := range want {
+		if a, ok := rec.Arms[arm]; !ok || a.Kind != kind {
+			t.Errorf("arm %q = %+v (present %v), want kind %q", arm, a.Kind, ok, kind)
+		}
+	}
+	catch, clean := securityCaseSets(t)
+	if got := sortedCaseNames(rec.Arms[ArmSecurity].PerCase); len(got) != len(catch)+len(clean) {
+		t.Errorf("security arm cases = %v, want every security case", got)
+	}
+	if got := sortedCaseNames(rec.Arms[ArmSecurityPortability].PerCase); strings.Join(got, ",") != strings.Join(clean, ",") {
+		t.Errorf("security_portability arm cases = %v, want the clean cases %v", got, clean)
+	}
+	sec := pooledClassCounts(rec.Arms[ArmSecurity].PerCase)
+	if sec.catchTrials < MinCatchRateTrialsPerArm || sec.caught != sec.catchTrials || sec.cleanTrials < MinCatchRateTrialsPerArm || sec.alarms != 0 {
+		t.Errorf("security arm counts = %+v, want powered classes, every catch trial caught, no alarm", sec)
+	}
+	for _, arm := range []string{ArmSecurity, ArmSecurityPortability} {
+		if p := rec.Arms[arm].FalseAlarmPartition; len(p) != len(clean) {
+			t.Errorf("arm %q false_alarm_partition = %v, want one entry per clean case %v", arm, p, clean)
+		}
+	}
+	if rec.Arms[ArmArchitect].FalseAlarmPartition != nil {
+		t.Errorf("the architect arm records a false_alarm_partition %v", rec.Arms[ArmArchitect].FalseAlarmPartition)
+	}
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
+		t.Fatalf("CheckCatchRateEvidence on the five-arm record: %v", err)
+	}
+	for _, s := range []string{"Persona diagnostics", "security catch rate per remit lens:", SecurityLensAuthnAuthz + ": ", "security absent-control concerns, per case:",
+		"security_portability repository-specific findings: none", "architect false alarms by category, per clean case:", "standard-criteria concerns included"} {
+		if !strings.Contains(report, s) {
+			t.Errorf("report lacks %q:\n%s", s, report)
+		}
+	}
+}
+
+// TestRecordCatchRateEvidence_PortabilityRepoSpecificFindingRefused (CF7):
+// ONE security_portability clean-case call answered with a concern naming a
+// repository-specific marker refuses the recording — pinning into a fresh
+// path (no baseline to mask it), and on a dry run — with
+// ErrPortabilityRepoSpecificFinding, and NEITHER file exists afterwards. The
+// same answer on the security arm (shown the convention) records.
+func TestRecordCatchRateEvidence_PortabilityRepoSpecificFindingRefused(t *testing.T) {
+	all := committedCatchTrials(t)
+	sender := func(arm string) *scriptedCatchSender {
+		s := newScriptedCatchSender(t, all, all)
+		done := false
+		s.secOverride = func(a string, sc personaScriptCase, _ int) (string, bool) {
+			if a == arm && sc.clean && !done {
+				done = true
+				return portabilityMarkerVerdict, true
+			}
+			return "", false
+		}
+		return s
+	}
+	for _, tc := range []struct {
+		name string
+		opts RecordCatchRateOptions
+	}{{"pin", pin("portability")}, {"dry run", RecordCatchRateOptions{DryRun: true}}} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "evidence.json")
+			report, err := record(t, sender(ArmSecurityPortability), path, catchT0, tc.opts)
+			if err == nil || !errors.Is(err, ErrPortabilityRepoSpecificFinding) || errors.Is(err, ErrCatchRateRegressed) {
+				t.Fatalf("err = %v, want ErrPortabilityRepoSpecificFinding (and not a regression)", err)
+			}
+			if !strings.Contains(err.Error(), `names "gateenv.go"`) || !strings.Contains(report, "repository-specific findings (REFUSED)") {
+				t.Errorf("err %v / report do not name the finding:\n%s", err, report)
+			}
+			for _, p := range []string{path, CatchRateTrialsPath(path)} {
+				if _, statErr := os.Stat(p); !errors.Is(statErr, os.ErrNotExist) {
+					t.Errorf("a refused recording left %s (stat err %v)", p, statErr)
+				}
+			}
+		})
+	}
+	t.Run("the security arm may name a repository control", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "evidence.json")
+		if _, err := record(t, sender(ArmSecurity), path, catchT0, pin("security names a control")); err != nil {
+			t.Fatalf("a security-arm concern naming a repository control was refused: %v", err)
+		}
+	})
+}
+
+// TestRecordCatchRateEvidence_SidecarCarriesAbsenceAnnotations (CF10): a
+// security-arm clean-case concern annotated in memory (repo_specific_marker
+// gateenv.go, absent_control) is stored with both annotations in the WRITTEN
+// sidecar, and the other arms' concerns carry none.
+func TestRecordCatchRateEvidence_SidecarCarriesAbsenceAnnotations(t *testing.T) {
+	all := committedCatchTrials(t)
+	s := newScriptedCatchSender(t, all, all)
+	var hit string
+	s.secOverride = func(a string, sc personaScriptCase, _ int) (string, bool) {
+		if a == ArmSecurity && sc.clean && hit == "" {
+			hit = sc.name
+			return portabilityMarkerVerdict, true
+		}
+		return "", false
+	}
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	if _, err := record(t, s, path, catchT0, pin("annotations")); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	tr := readCatchTrials(t, path)
+	first := tr.Arms[ArmSecurity].PerCase[hit][0]
+	if first.Outcome != CatchFalseAlarm || len(first.Concerns) != 1 {
+		t.Fatalf("case %q trial 1 = %+v, want a false alarm with one concern", hit, first)
+	}
+	if c := first.Concerns[0]; c.RepoSpecificMarker != "gateenv.go" || !c.AbsentControl {
+		t.Errorf("stored concern = %+v, want repo_specific_marker gateenv.go and absent_control true", c)
+	}
+	raw := string(mustRead(t, CatchRateTrialsPath(path)))
+	if !strings.Contains(raw, `"repo_specific_marker": "gateenv.go"`) || !strings.Contains(raw, `"absent_control": true`) {
+		t.Error("the written sidecar JSON lacks the annotation fields")
+	}
+	for _, arm := range []string{ArmWithoutConventions, ArmArchitect} {
+		for _, list := range tr.Arms[arm].PerCase {
+			for _, rec := range list {
+				for _, c := range rec.Concerns {
+					if c.RepoSpecificMarker != "" || c.AbsentControl {
+						t.Fatalf("arm %q stores an annotated concern %+v", arm, c)
+					}
+				}
+			}
+		}
+	}
+}
+
+// partitionSender answers each security arm's FIRST call of every clean case
+// with a concern of the given category: the partition fixture.
+func partitionSender(t *testing.T, cats map[string]string) *scriptedCatchSender {
+	t.Helper()
+	all := committedCatchTrials(t)
+	s := newScriptedCatchSender(t, all, all)
+	seen := map[string]bool{}
+	s.secOverride = func(a string, sc personaScriptCase, _ int) (string, bool) {
+		cat, ok := cats[a+"/"+sc.name]
+		if !ok || seen[a+"/"+sc.name] {
+			return "", false
+		}
+		seen[a+"/"+sc.name] = true
+		return personaVerdictJSON(cat, "a reviewer remark on the clean diff"), true
+	}
+	return s
+}
+
+// TestCatchRateFalseAlarmPartition_RoundTrips is approval condition C1(b):
+// the false-alarm partition (security_lens vs other_category trials, per
+// clean case of each security arm) is RECORDED in the evidence and, per
+// trial, in the sidecar, survives Record → Check, and every inconsistency
+// between the two is refused.
+func TestCatchRateFalseAlarmPartition_RoundTrips(t *testing.T) {
+	_, clean := securityCaseSets(t)
+	if len(clean) < 2 {
+		t.Fatal("fixture premise: at least two clean security cases")
+	}
+	a, b := clean[0], clean[1]
+	cats := map[string]string{
+		ArmSecurity + "/" + a:            "authz",       // security_lens
+		ArmSecurity + "/" + b:            "correctness", // other_category
+		ArmSecurityPortability + "/" + a: "regression",  // other_category
+	}
+	recordPartitioned := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "evidence.json")
+		if _, err := record(t, partitionSender(t, cats), path, catchT0, pin("partition")); err != nil {
+			t.Fatalf("record: %v", err)
+		}
+		return path
+	}
+	path := recordPartitioned(t)
+	rec := readCatchEvidence(t, path)
+	for _, w := range []struct {
+		arm, name string
+		want      CatchRateFalseAlarmPartition
+	}{
+		{ArmSecurity, a, CatchRateFalseAlarmPartition{SecurityLens: 1}},
+		{ArmSecurity, b, CatchRateFalseAlarmPartition{OtherCategory: 1}},
+		{ArmSecurityPortability, a, CatchRateFalseAlarmPartition{OtherCategory: 1}},
+		{ArmSecurityPortability, b, CatchRateFalseAlarmPartition{}},
+	} {
+		if got := rec.Arms[w.arm].FalseAlarmPartition[w.name]; got != w.want {
+			t.Errorf("arm %q case %q false_alarm_partition = %+v, want %+v", w.arm, w.name, got, w.want)
+		}
+		if got := rec.Baseline.Arms[w.arm].FalseAlarmPartition[w.name]; got != w.want {
+			t.Errorf("pinned baseline arm %q case %q false_alarm_partition = %+v, want %+v", w.arm, w.name, got, w.want)
+		}
+	}
+	tr := readCatchTrials(t, path)
+	for _, w := range []struct{ arm, name, want string }{
+		{ArmSecurity, a, AlarmPartitionSecurityLens}, {ArmSecurity, b, AlarmPartitionOther}, {ArmSecurityPortability, a, AlarmPartitionOther},
+	} {
+		if got := tr.Arms[w.arm].PerCase[w.name][0].AlarmPartition; got != w.want {
+			t.Errorf("sidecar arm %q case %q trial 1 alarm_partition = %q, want %q", w.arm, w.name, got, w.want)
+		}
+	}
+	if got := tr.Arms[ArmSecurity].PerCase[a][1].AlarmPartition; got != "" {
+		t.Errorf("a no_false_alarm trial carries alarm_partition %q", got)
+	}
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
+		t.Fatalf("CheckCatchRateEvidence on the partitioned record: %v", err)
+	}
+
+	setPartition := func(r *CatchRateEvidence, arm, name string, p CatchRateFalseAlarmPartition) {
+		x := r.Arms[arm]
+		if x.FalseAlarmPartition == nil {
+			x.FalseAlarmPartition = map[string]CatchRateFalseAlarmPartition{}
+		}
+		x.FalseAlarmPartition[name] = p
+		r.Arms[arm] = x
+	}
+	archCatch, archClean := personaCaseNames(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(r *CatchRateEvidence)
+		trials func(tr *CatchRateTrials)
+		want   string
+	}{
+		{name: "(6c) a partition not summing to false_alarms", mutate: func(r *CatchRateEvidence) {
+			setPartition(r, ArmSecurity, a, CatchRateFalseAlarmPartition{SecurityLens: 2})
+		}, want: "does not sum to its false_alarms 1"},
+		{name: "(6c) a negative partition count", mutate: func(r *CatchRateEvidence) {
+			setPartition(r, ArmSecurity, a, CatchRateFalseAlarmPartition{SecurityLens: 2, OtherCategory: -1})
+		}, want: "negative count"},
+		{name: "(6c) a partition entry on a catch case", mutate: func(r *CatchRateEvidence) {
+			catch, _ := securityCaseSets(t)
+			setPartition(r, ArmSecurity, catch[0], CatchRateFalseAlarmPartition{})
+		}, want: "which is not a clean case of the arm"},
+		{name: "(6c) a clean case missing from a security arm's partition", mutate: func(r *CatchRateEvidence) {
+			delete(r.Arms[ArmSecurityPortability].FalseAlarmPartition, b)
+		}, want: `arm "security_portability" clean case "` + b + `" has no false_alarm_partition entry`},
+		{name: "(6c) a partition on the architect arm", mutate: func(r *CatchRateEvidence) {
+			setPartition(r, ArmArchitect, archClean, CatchRateFalseAlarmPartition{})
+		}, want: `arm "architect" records a false_alarm_partition`},
+		{name: "(16) a partition flipped in the record only", mutate: func(r *CatchRateEvidence) {
+			setPartition(r, ArmSecurity, a, CatchRateFalseAlarmPartition{OtherCategory: 1})
+		}, want: "alarm_partition tallies (security_lens 1, other_category 0) differ"},
+		{name: "(16) a false_alarm trial without a tag", trials: func(tr *CatchRateTrials) {
+			tr.Arms[ArmSecurity].PerCase[a][0].AlarmPartition = ""
+		}, want: "is a false_alarm without an alarm_partition"},
+		{name: "(16) a tag on a no_false_alarm trial", trials: func(tr *CatchRateTrials) {
+			tr.Arms[ArmSecurity].PerCase[b][1].AlarmPartition = AlarmPartitionOther
+		}, want: "only a false_alarm trial is partitioned"},
+		{name: "(16) an unknown tag", trials: func(tr *CatchRateTrials) {
+			tr.Arms[ArmSecurity].PerCase[a][0].AlarmPartition = "security"
+		}, want: `alarm_partition "security" is not`},
+		{name: "(16) a tag on an unpartitioned arm", trials: func(tr *CatchRateTrials) {
+			tr.Arms[ArmArchitect].PerCase[archCatch][0].AlarmPartition = AlarmPartitionSecurityLens
+		}, want: "but the arm is not partitioned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := recordPartitioned(t)
+			if tc.mutate != nil {
+				rec := readCatchEvidence(t, path)
+				tc.mutate(&rec)
+				writeCatchEvidence(t, path, rec)
+			}
+			if tc.trials != nil {
+				tr := readCatchTrials(t, path)
+				tc.trials(&tr)
+				writeCatchTrials(t, path, tr)
+			}
+			_, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a refusal naming %q", err, tc.want)
+			}
+		})
+	}
 }

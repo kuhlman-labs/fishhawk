@@ -5015,7 +5015,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
+		s.emitPreRoundReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
 		if authority == planreview.AuthorityGating {
 			return implementReviewGatingRejectReason
 		}
@@ -5969,10 +5969,11 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 	}
 	payloadBytes, _ := json.Marshal(payload)
 	systemKind := audit.ActorKind("system")
-	entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	// Durable terminal write (E72.64 / #4106): retried, then a named
+	// verdict_write_failed or the lost-terminal registry.
+	entry, aerr := s.appendReviewTerminal(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
 		Category:  "implement_reviewed",
 		ActorKind: &systemKind,
 		Payload:   payloadBytes,

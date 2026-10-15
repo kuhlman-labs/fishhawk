@@ -13,6 +13,14 @@
 // ((false_alarms + undecodable) / trials, the evidence rule's fail-safe
 // direction) with band n/a.
 //
+// A security arm (#4314) also reports each case's remit lens, each clean
+// case's false-alarm concerns by normalized category (its false-alarm rate
+// counts EVERY concern on a clean diff, standard-criteria concerns included),
+// and — the security_portability arm — every concern naming a
+// repository-specific marker, the finding the recorder refuses. The Markdown
+// renders the Lens column and those two blocks only when they are non-empty,
+// so the conventions and architect tables are unchanged.
+//
 // It NEVER writes evidence: it reads the same inputs the recorder reads and
 // returns a value; the markdown table (CatchRateCalibration.Markdown) is for
 // the PR. The live run is operator-executed (planreviewpersonalive_test.go);
@@ -61,6 +69,11 @@ type CatchCalibrationCase struct {
 	// (false_alarms + undecodable) / trials for a clean case.
 	Rate float64
 	Band CalibrationBand
+	// Lens is a security defect case's remit lens ("" otherwise).
+	Lens string
+	// AlarmCategories counts a clean case's false-alarm concerns by
+	// normalized category (nil when it has none).
+	AlarmCategories map[string]int
 }
 
 // CatchRateCalibration is one arm's calibration dry run, cases in name order.
@@ -69,6 +82,9 @@ type CatchRateCalibration struct {
 	Kind           string
 	SamplesPerCase int
 	Cases          []CatchCalibrationCase
+	// PortabilityFindings is every security_portability concern naming a
+	// repository-specific marker (nil on any other arm).
+	PortabilityFindings []CatchRatePortabilityFinding
 }
 
 // calibrationBandFor is the band verdict of caught out of trials (trials >= 1).
@@ -128,15 +144,21 @@ func calibrationFromReport(row catchRateArmRow, report CatchRateArmReport, sampl
 			return CatchRateCalibration{}, fmt.Errorf("agenteval: calibrating arm %q: the measurement has no trials for case %q", row.name, c.name)
 		}
 		cc := CatchCalibrationCase{Case: c.name, Expect: c.expect, Trials: counts.Trials, Caught: counts.Caught,
-			FalseAlarms: counts.FalseAlarms, Undecodable: counts.Undecodable}
+			FalseAlarms: counts.FalseAlarms, Undecodable: counts.Undecodable, Lens: c.lens}
 		if c.expect == CatchExpectClean {
 			cc.Rate = float64(counts.FalseAlarms+counts.Undecodable) / float64(counts.Trials)
 			cc.Band = CalibrationNotApplicable
+			if cats := falseAlarmCategoriesOf(report.Trials[c.name]); len(cats) > 0 {
+				cc.AlarmCategories = cats
+			}
 		} else {
 			cc.Rate = float64(counts.Caught) / float64(counts.Trials)
 			cc.Band = calibrationBandFor(counts.Caught, counts.Trials)
 		}
 		out.Cases = append(out.Cases, cc)
+	}
+	if row.name == ArmSecurityPortability {
+		out.PortabilityFindings = portabilityFindings(report)
 	}
 	return out, nil
 }
@@ -158,19 +180,47 @@ func (c CatchRateCalibration) Markdown() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Calibration dry run: arm `%s` (%s), %d samples per case. Band: a catch case is IN BAND for 30%% <= caught/trials <= 80%%; a clean case reports its false-alarm rate ((false_alarms + undecodable) / trials), band n/a.\n\n",
 		c.Arm, c.Kind, c.SamplesPerCase)
-	b.WriteString("| Case | Expect | Trials | Caught | False alarms | Undecodable | Rate | Band |\n")
-	b.WriteString("|---|---|---|---|---|---|---|---|\n")
+	withLens, withAlarms := false, false
+	for _, cc := range c.Cases {
+		withLens = withLens || cc.Lens != ""
+		withAlarms = withAlarms || len(cc.AlarmCategories) > 0
+	}
+	if withLens {
+		b.WriteString("| Case | Expect | Lens | Trials | Caught | False alarms | Undecodable | Rate | Band |\n")
+		b.WriteString("|---|---|---|---|---|---|---|---|---|\n")
+	} else {
+		b.WriteString("| Case | Expect | Trials | Caught | False alarms | Undecodable | Rate | Band |\n")
+		b.WriteString("|---|---|---|---|---|---|---|---|\n")
+	}
 	for _, cc := range c.Cases {
 		caught, alarms, rate := fmt.Sprint(cc.Caught), "-", fmt.Sprintf("%.1f%% caught", 100*cc.Rate)
 		if cc.Expect == CatchExpectClean {
 			caught, alarms, rate = "-", fmt.Sprint(cc.FalseAlarms), fmt.Sprintf("%.1f%% false alarm", 100*cc.Rate)
 		}
-		fmt.Fprintf(&b, "| %s | %s | %d | %s | %s | %d | %s | %s |\n", cc.Case, cc.Expect, cc.Trials, caught, alarms, cc.Undecodable, rate, cc.Band)
+		lens := ""
+		if withLens {
+			lens = " - |"
+			if cc.Lens != "" {
+				lens = " " + cc.Lens + " |"
+			}
+		}
+		fmt.Fprintf(&b, "| %s | %s |%s %d | %s | %s | %d | %s | %s |\n", cc.Case, cc.Expect, lens, cc.Trials, caught, alarms, cc.Undecodable, rate, cc.Band)
 	}
 	if oob := c.OutOfBand(); len(oob) > 0 {
 		fmt.Fprintf(&b, "\nOut of band: %s.\n", strings.Join(oob, ", "))
 	} else {
 		b.WriteString("\nEvery catch case is in band.\n")
+	}
+	if withAlarms {
+		b.WriteString("\nFalse alarms by category (every concern on a clean diff counts, standard-criteria concerns included):\n\n")
+		for _, cc := range c.Cases {
+			if len(cc.AlarmCategories) > 0 {
+				fmt.Fprintf(&b, "- %s: %s\n", cc.Case, renderCategoryCounts(cc.AlarmCategories))
+			}
+		}
+	}
+	if len(c.PortabilityFindings) > 0 {
+		fmt.Fprintf(&b, "\nPortability findings (a remit-only concern naming a repository-specific control; the recording REFUSES these): %s.\n", renderPortabilityFindings(c.PortabilityFindings))
 	}
 	return b.String()
 }

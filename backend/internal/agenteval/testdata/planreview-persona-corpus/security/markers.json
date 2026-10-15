@@ -1,0 +1,31 @@
+{
+  "repo_specific_markers": [
+    "gateenv.go",
+    "requireStageAccount",
+    "memberWrite",
+    "mcp:run",
+    "categories.go",
+    "AppendChained",
+    "check-gate-image",
+    "agent_instruction_paths",
+    "GIT_CONFIG_GLOBAL",
+    "token migrate"
+  ],
+  "generic_control_phrases": [
+    "audit",
+    "allow-list",
+    "scope check",
+    "authorization check",
+    "redact",
+    "pin",
+    "refusal"
+  ],
+  "absence_phrases": [
+    "is missing",
+    "does not add",
+    "lacks",
+    "no longer",
+    "never registered",
+    "without a"
+  ]
+}

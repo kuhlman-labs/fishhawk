@@ -11,10 +11,12 @@
 // real index), and either a catch rule (anchored at an approach step or an
 // acceptance criterion) or a clean expectation. Scoring is catch rule v5
 // (planreviewcatch.go) through the shared classifyCatchConcerns, AFTER the
-// production persona-ingest controls (quote verification against the injected
-// documents, then the persona's severity cap — personaprompt.ApplyConcernControls)
-// have run on the decoded verdict, so a trial is scored on what the review
-// loop would store.
+// review loop's ingest order has run on the decoded verdict — the convention
+// clamp (nil caps: no convention renders for the architect), the marker scrub,
+// then the production persona-ingest controls (quote verification against the
+// injected documents, then the persona's severity cap —
+// personaprompt.ApplyConcernControls) — so a trial is scored on what the
+// review loop would store (ClassifyPersonaTrialForRound).
 //
 // The documents are read from a checkout (repoRoot) through a filesystem
 // fetcher inside a real repodoc.Resolver at the production DefaultMaxBytes
@@ -689,19 +691,33 @@ func plansEqualExceptDeclaration(a, b json.RawMessage) (bool, error) {
 	return reflect.DeepEqual(ma, mb), nil
 }
 
-// ClassifyPersonaTrial classifies one persona reviewer response the way the
-// review loop would store it: the production planreview.DecodeVerdict (a
-// decode error or an invalid verdict is CatchUndecodable), then
+// ClassifyPersonaTrial is ClassifyPersonaTrialForRound with NIL convention
+// caps: a round that rendered no review convention, so the convention clamp
+// still runs and lowers any convention-category concern to low (#4314).
+func ClassifyPersonaTrial(responseText string, rule CatchRule, quoteDocs []prompt.InjectedDocument, severityCap string) CatchTrial {
+	return ClassifyPersonaTrialForRound(responseText, rule, quoteDocs, severityCap, nil)
+}
+
+// ClassifyPersonaTrialForRound classifies one persona reviewer response the
+// way the review loop would store it, in the loop's own ingest order
+// (server/trace.go clampImplementReviewVerdict, then
+// applyPersonaConcernControls): the production planreview.DecodeVerdict (a
+// decode error or an invalid verdict is CatchUndecodable), then the
+// convention clamp (planreview.ClampConventionSeveritiesForRound against caps,
+// the conventions the round rendered — nil when none did), then
 // planreview.ClearPersonaIngestMarkers, then the production persona-ingest
 // controls (personaprompt.ApplyConcernControls: quote verification against
 // quoteDocs, then the severityCap clamp). Each post-control concern is stored
 // with its severity, severity_clamped_from, quote_unverified, document_ref,
 // category and note, and the concerns go to classifyCatchConcerns.
-func ClassifyPersonaTrial(responseText string, rule CatchRule, quoteDocs []prompt.InjectedDocument, severityCap string) CatchTrial {
+func ClassifyPersonaTrialForRound(responseText string, rule CatchRule, quoteDocs []prompt.InjectedDocument, severityCap string, caps planreview.ConventionCaps) CatchTrial {
 	v, err := planreview.DecodeVerdict([]byte(responseText))
 	if err != nil || !v.Verdict.Valid() {
 		return CatchTrial{Outcome: CatchUndecodable, Response: responseText}
 	}
+	// A persona case never modifies a declared conventions file (the security
+	// loader refuses such a diff), so the round's flag is false.
+	planreview.ClampConventionSeveritiesForRound(&v, caps, false)
 	planreview.ClearPersonaIngestMarkers(&v)
 	personaprompt.ApplyConcernControls(&v, quoteDocs, severityCap)
 	concerns := make([]CatchTrialConcern, 0, len(v.Concerns))
@@ -733,35 +749,68 @@ func RunPersonaCatchArm(ctx context.Context, sender MessageSender, cases []Perso
 }
 
 func runPersonaCatchArm(ctx context.Context, sender MessageSender, cases []PersonaCatchCase, repoRoot string, samples int, render personaArmRenderer) (CatchRateArmReport, error) {
+	return runPersonaTrialLoop(ctx, sender, ArmArchitect, personaCatchGeneratorSystemPrompt, cases, samples, func(c PersonaCatchCase) (personaTrialCase, error) {
+		r, err := render(c, repoRoot)
+		if err != nil {
+			return personaTrialCase{}, err
+		}
+		rule := c.CatchRule()
+		return personaTrialCase{
+			Name:   c.Name,
+			Expect: c.Expect(),
+			Prompt: r.Prompt,
+			Classify: func(responseText string) CatchTrial {
+				return ClassifyPersonaTrial(responseText, rule, r.QuoteDocs, personaArchitectSeverityCap)
+			},
+		}, nil
+	})
+}
+
+// personaTrialCase is one prepared case of a persona arm's trial loop: the
+// rendered prompt sent every sample and the classifier each response goes to.
+type personaTrialCase struct {
+	Name     string
+	Expect   string
+	Prompt   string
+	Classify func(responseText string) CatchTrial
+}
+
+// runPersonaTrialLoop is the per-case render → generate → classify → count
+// loop every persona arm shares (the architect arm and the security arms,
+// #4314). Fail closed: no cases, samples < 1, a nil sender, a prepare (render)
+// error or a transport error returns the ZERO report and an error. Each case
+// is prepared just before its samples are sent, so a render error on a later
+// case comes after the earlier cases' calls. An undecodable response is NOT an
+// error: it is a trial, counted in Undecodable.
+func runPersonaTrialLoop[C any](ctx context.Context, sender MessageSender, arm, systemPrompt string, cases []C, samples int, prepare func(C) (personaTrialCase, error)) (CatchRateArmReport, error) {
 	if len(cases) == 0 {
-		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: no cases", ArmArchitect)
+		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: no cases", arm)
 	}
 	if samples < 1 {
-		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: samples must be >= 1, got %d", ArmArchitect, samples)
+		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: samples must be >= 1, got %d", arm, samples)
 	}
 	if sender == nil {
-		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: sender is required", ArmArchitect)
+		return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q: sender is required", arm)
 	}
 	report := CatchRateArmReport{
-		Arm: ArmArchitect, SamplesPerCase: samples,
+		Arm: arm, SamplesPerCase: samples,
 		PerCase: make(map[string]CaseCatchCounts, len(cases)),
 		Trials:  make(map[string][]CatchTrial, len(cases)),
 	}
-	for _, c := range cases {
-		r, err := render(c, repoRoot)
+	for _, raw := range cases {
+		c, err := prepare(raw)
 		if err != nil {
 			return CatchRateArmReport{}, err
 		}
-		rule := c.CatchRule()
-		counts := CaseCatchCounts{Expect: c.Expect()}
+		counts := CaseCatchCounts{Expect: c.Expect}
 		trials := make([]CatchTrial, 0, samples)
 		for i := 0; i < samples; i++ {
-			responseText, _, _, _, _, _, err := sender.Messages(ctx, personaCatchGeneratorSystemPrompt, r.Prompt)
+			responseText, _, _, _, _, _, err := sender.Messages(ctx, systemPrompt, c.Prompt)
 			if err != nil {
-				return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q case %q sample %d: generate: %w", ArmArchitect, c.Name, i+1, err)
+				return CatchRateArmReport{}, fmt.Errorf("agenteval: persona arm %q case %q sample %d: generate: %w", arm, c.Name, i+1, err)
 			}
 			counts.Trials++
-			trial := ClassifyPersonaTrial(responseText, rule, r.QuoteDocs, personaArchitectSeverityCap)
+			trial := c.Classify(responseText)
 			switch trial.Outcome {
 			case CatchCaught:
 				counts.Caught++
@@ -771,6 +820,7 @@ func runPersonaCatchArm(ctx context.Context, sender MessageSender, cases []Perso
 				counts.Undecodable++
 			}
 			trials = append(trials, trial)
+			observeCatchTrial(ctx, arm, c.Name, c.Expect, i+1, responseText, trial)
 		}
 		report.PerCase[c.Name] = counts
 		report.Trials[c.Name] = trials

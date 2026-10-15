@@ -8,11 +8,13 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // The LIVE plan-review catch-rate measurement (E55.4 / #2245): EVERY arm of
-// the evidence arm table — the two conventions arms and the architect persona
-// arm (E78.11 / #4313) — in ONE recording.
+// the evidence arm table — the two conventions arms, the architect persona
+// arm (E78.11 / #4313) and the security and security_portability persona arms
+// (E80.17 / #4314) — in ONE recording.
 //
 // IT SKIPS IN EVERY IN-LOOP RUN: the runner sanitizes gate-subprocess
 // environments through a default-deny allow-list that names ANTHROPIC_API_KEY
@@ -21,8 +23,9 @@ import (
 // The committed testdata/planreview-catchrate/evidence.json and its per-trial
 // sidecar evidence.trials.json (agenteval.CatchRateTrialsPath) are written
 // together by a recording run; a change to the corpus, the conventions
-// fixture, the persona corpus, the architect remit or decision record, the
-// rendered plan-review or persona prompt, or the catch rule makes the
+// fixture, the persona corpora, the architect remit or decision record, the
+// security remit, convention or markers.json, the rendered plan-review or
+// persona prompt, or the catch rule makes the
 // committed pair STALE, and the standing check fails closed on a review-prompt
 // change until an operator re-records it. The operator walk is
 // docs/compliance/planreview-catchrate-evidence.md.
@@ -30,10 +33,14 @@ import (
 // DOUBLE-GATED on FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE plus
 // one credential — FISHHAWKD_ANTHROPIC_API_KEY or FISHHAWKD_ANTHROPIC_AUTH_TOKEN
 // (exactly one; see livecredential_test.go) — the posture injectionlive_test.go
-// and severitycalibrationlive_test.go take. Two further knobs:
+// and severitycalibrationlive_test.go take. Further knobs:
 //
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1          write the evidence record and its trial sidecar (otherwise a dry run)
 //	FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON=<why>  pin this measurement as the baseline (the explicit operator action)
+//	FISHHAWK_AGENTEVAL_DIAG_DIR=<dir>               root of the per-run diagnostics file (default $TMPDIR/fishhawk-agenteval);
+//	                                                every run writes <root>/<UTC 20060102T150405Z>/planreview-diag.jsonl
+//	FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<id,...>    subset dry run: only these cases (never recordable)
+//	FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=<n>        subset dry run: n samples per case (never recordable)
 //
 // Every function it calls is offline-tested with fake senders. The arms run on
 // DefaultCatchRateGeneratorModel, and this file also carries one OFFLINE wiring
@@ -46,7 +53,7 @@ const planReviewCatchEvidencePath = "testdata/planreview-catchrate/evidence.json
 func planReviewCatchLiveGate(t *testing.T) liveCredential {
 	t.Helper()
 	if os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE") == "" {
-		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's arm-keyed evidence (both conventions arms and the #4313 architect arm) is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
+		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's arm-keyed evidence (both conventions arms, the #4313 architect arm and the #4314 security and security_portability arms) is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
 	}
 	return requireLiveCredential(t, "Skipping the live plan-review catch-rate arms. #2245's arm-keyed evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
 }
@@ -64,11 +71,12 @@ func planReviewCatchGeneratorConfig() anthropic.Config {
 
 // recordPlanReviewCatchLive builds the generator config once and uses that same
 // cfg.Model for the client AND the recorded generator_model, so the model the
-// arms ran on and the model the evidence names cannot disagree.
-func recordPlanReviewCatchLive(ctx context.Context, newGenerator func(anthropic.Config) MessageSender, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
+// arms ran on and the model the evidence names cannot disagree. Every run
+// writes its per-trial diagnostics file at diagPath.
+func recordPlanReviewCatchLive(ctx context.Context, newGenerator func(anthropic.Config) MessageSender, evidencePath string, now time.Time, opts RecordCatchRateOptions, diagPath string, diagOpts CatchRateDiagOptions) (string, error) {
 	cfg := planReviewCatchGeneratorConfig()
-	return RecordCatchRateEvidence(ctx, newGenerator(cfg), cfg.Model,
-		committedCatchInputs(), evidencePath, now, opts)
+	return RecordCatchRateEvidenceWithDiagnostics(ctx, newGenerator(cfg), cfg.Model,
+		committedCatchInputs(), evidencePath, now, opts, diagPath, diagOpts)
 }
 
 // TestPlanReviewCatchRateLive runs every arm against
@@ -81,15 +89,32 @@ func recordPlanReviewCatchLive(ctx context.Context, newGenerator func(anthropic.
 // to write a failing measurement anyway.
 func TestPlanReviewCatchRateLive(t *testing.T) {
 	cred := planReviewCatchLiveGate(t)
+	subset, err := ParseCatchRateSubset(os.Getenv)
+	if err != nil {
+		t.Fatalf("subset knobs: %v", err)
+	}
 	reason := os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON")
 	opts := RecordCatchRateOptions{
 		PinBaseline: reason != "",
 		Reason:      reason,
 		DryRun:      os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD") != "1",
+		Subset:      subset,
 	}
+	now := time.Now().UTC()
+	diagPath, err := ResolveCatchRateDiagPath(os.Getenv, now)
+	if err != nil {
+		t.Fatalf("diagnostics path: %v", err)
+	}
+	creds := CatchRateDiagCredentials(os.Getenv)
+	for name, v := range map[string]string{"resolved_api_key": cred.apiKey, "resolved_auth_token": cred.authToken} {
+		if v != "" {
+			creds = append(creds, redaction.KnownValue{Name: name, Value: v})
+		}
+	}
+	t.Logf("per-trial diagnostics: %s", diagPath)
 	report, err := recordPlanReviewCatchLive(context.Background(),
 		func(c anthropic.Config) MessageSender { return anthropic.NewClient(cred.config(c)) },
-		planReviewCatchEvidencePath, time.Now().UTC(), opts)
+		planReviewCatchEvidencePath, now, opts, diagPath, CatchRateDiagOptions{Progress: os.Stderr, Credentials: creds})
 	if report != "" {
 		t.Logf("\n%s", report)
 	}
@@ -117,8 +142,9 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 		got = append(got, c)
 		return newScriptedCatchSender(t, all, all)
 	}
+	diagPath := filepath.Join(t.TempDir(), "diag", CatchRateDiagFileName)
 	if _, err := recordPlanReviewCatchLive(context.Background(), newGenerator, path, catchT0,
-		RecordCatchRateOptions{PinBaseline: true, Reason: "wiring pin"}); err != nil {
+		RecordCatchRateOptions{PinBaseline: true, Reason: "wiring pin"}, diagPath, CatchRateDiagOptions{}); err != nil {
 		t.Fatalf("recordPlanReviewCatchLive: %v", err)
 	}
 
@@ -156,9 +182,14 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), DefaultCatchRateGeneratorModel); err != nil {
 		t.Errorf("CheckCatchRateEvidence on the recorded evidence: %v", err)
 	}
-	// (iii-b) every arm of the arm table was recorded, the architect arm as a
-	// persona arm whose trials the scripted sender answered per case.
-	for arm, kind := range map[string]string{"without_conventions": "conventions", "with_conventions": "conventions", "architect": "persona"} {
+	// (iii-b) every arm of the arm table was recorded — five arms — the
+	// architect and both security arms as persona arms whose trials the
+	// scripted sender answered per case.
+	if len(rec.Arms) != 5 {
+		t.Errorf("the recording carries %d arms %v, want 5", len(rec.Arms), sortedArmNames(rec.Arms))
+	}
+	for arm, kind := range map[string]string{"without_conventions": "conventions", "with_conventions": "conventions", "architect": "persona",
+		"security": "persona", "security_portability": "persona"} {
 		a, ok := rec.Arms[arm]
 		if !ok {
 			t.Errorf("the recording carries no %q arm", arm)
@@ -171,6 +202,36 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	arch := pooledClassCounts(rec.Arms["architect"].PerCase)
 	if arch.catchTrials == 0 || arch.caught != arch.catchTrials || arch.cleanTrials == 0 || arch.alarms != 0 {
 		t.Errorf("architect arm counts = %+v, want every catch trial caught and no clean-case alarm", arch)
+	}
+	sec := pooledClassCounts(rec.Arms["security"].PerCase)
+	if sec.catchTrials == 0 || sec.caught != sec.catchTrials || sec.cleanTrials == 0 || sec.alarms != 0 {
+		t.Errorf("security arm counts = %+v, want every catch trial caught and no clean-case alarm", sec)
+	}
+	port := pooledClassCounts(rec.Arms["security_portability"].PerCase)
+	if port.catchTrials != 0 || port.cleanTrials == 0 || port.alarms != 0 {
+		t.Errorf("security_portability arm counts = %+v, want clean trials only and no alarm", port)
+	}
+
+	// (iii-c) the seam wrote the per-trial diagnostics: one trial line per
+	// recorded trial in EVERY arm, then a passed summary line.
+	lines := readCatchDiagLines(t, diagPath)
+	perArm := map[string]int{}
+	for _, l := range lines {
+		if l["kind"] == "trial" {
+			perArm[l["arm"].(string)]++
+		}
+	}
+	for arm, a := range rec.Arms {
+		want := 0
+		for _, c := range a.PerCase {
+			want += c.Trials
+		}
+		if perArm[arm] != want {
+			t.Errorf("diagnostics carry %d trial lines for arm %q, want %d (one per recorded trial)", perArm[arm], arm, want)
+		}
+	}
+	if last := lines[len(lines)-1]; last["kind"] != "summary" || last["outcome"] != "passed" {
+		t.Errorf("last diagnostics line = kind %v outcome %v, want a passed summary", last["kind"], last["outcome"])
 	}
 
 	// (iv) the constant, and the defaults it must NOT have moved.

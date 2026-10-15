@@ -560,8 +560,9 @@ false-alarm rate (conforming plans) before the architect is enabled.
 | `planreviewevidence.go` | the arm table (`catchRateArmTable`), the arm-keyed v2 evidence record, per-arm and record fingerprints, the pinned per-arm baseline, the v2 trial sidecar, `RecordCatchRateEvidence`, `CheckCatchRateEvidence`, the legacy v1 reader |
 | `planreviewrescore.go` | the offline re-score of a recorded trial sidecar (v2, or a legacy v1 sidecar's two conventions arms) under the CURRENT corpora and catch rule (`RescoreCatchRateTrials`, `CatchRateRescore.Render`): a diagnostic per-arm lower bound that never writes (E55.22 / #4355) |
 | `planreviewcalibrate.go` | the calibration dry run (`CalibrateCatchRateArm`): one arm's per-case 30–80% band table, never written as evidence (E78.11 / #4313) |
+| `planreviewdiag.go` | the live-run diagnostics file (`planreview-diag.jsonl`: per-trial lines, miss classes, arm summaries, credential redaction), the subset dry-run knobs and `RecordCatchRateEvidenceWithDiagnostics`; diagnostic only and NOT a trigger path (E55.21 / #4350) |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`), and its `--rescore` diagnostic |
-| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
+| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `planreviewpersonalive_test.go` | the double-gated live calibration dry run (`TestCatchRateCalibrationLive`) plus its offline knob and wiring tests |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
 | `testdata/planreview-persona-corpus/architect/` | the six architect cases (`persona_case.json` + a SYNTHETIC-provenance `case.md` each) |
@@ -881,8 +882,9 @@ untestable phrasing without the prompt's literal examples "robust", "clean",
 ONE arm table (`catchRateArmTable(CatchRateInputs)`) lists every arm: its name,
 kind (`conventions` or `persona`), cases (name, expectation class, catch rule),
 per-case samples, fingerprint and runner. The recorder, the gate, the re-score
-and the calibration dry run all iterate it, so a later arm (#4314's security
-rows) is one row. Today: `without_conventions` and `with_conventions` over the
+and the calibration dry run all iterate it, so a later arm is one row (#4314's
+`security` and `security_portability` are two, § "Security persona arms").
+Today: `without_conventions` and `with_conventions` over the
 miss corpus (12 catch cases, 12 samples each), and `architect` over the
 persona corpus (3 catch + 3 clean cases, 46 samples each,
 `SamplesPerCaseForPersona` = the max over the present classes of
@@ -987,6 +989,99 @@ index, and populate `applies_to` on the merge-path records.
 persona prompt, which embeds the real index, so an ADR landing stales THAT arm
 (the stale message names it) even though `docs/adr/` is not a trigger path.
 
+### Security persona arms (E80.17 / #4314)
+
+`implementreviewsecurity.go` adds two persona-kind rows to the arm table over
+one corpus, `testdata/planreview-persona-corpus/security/` (six defect cases,
+one per remit lens the issue names — `trust_boundaries`, `authn_authz`,
+`secret_custody`, `permission_scope`, `fail_closed`, `supply_chain` — and four
+clean sensitive-path diffs), loaded by `LoadSecurityCatchCorpus` through
+`catchRateArmTable` (`CatchRateInputs.SecurityCorpusDir`; `catchrategate
+--security-corpus`):
+
+| Arm | Renders | Cases | Samples per case |
+|---|---|---|---|
+| `security` | the IMPLEMENT-review prompt through `personaprompt.Build` with `docs/review/security-remit.md` AND `docs/review/security-conventions.md` (production review-conventions path, cap `medium`) | all ten | `SamplesPerCaseForPersona(6, 4)` = 34 |
+| `security_portability` | the same, remit alone (a repository with no convention) | the four clean | `SamplesPerCaseForPersona(0, 4)` = 34 |
+
+- **Schema.** `persona_case.json`: `persona` (`security`), `kind`
+  (`defect` → `expect: catch` with a `lens`; `clean_sensitive` → `expect:
+  clean`, no lens), `issue_title`, `issue_body`, a complete standard_v1
+  `plan`, the unified `diff` under review, `defect_phrases`; a catch case
+  adds `anchor` (`{kind: diff_file, path}`), `catch_probes`,
+  `attribution_phrases`, `catching_examples`, `non_catching_examples`; a
+  clean case adds `false_alarm_examples`. `markers.json` at the corpus root
+  carries `repo_specific_markers`, `generic_control_phrases` and
+  `absence_phrases`.
+- **Loader modes (a)-(o)**, each failing closed naming the case: (a) absent
+  dir / no cases; (b) missing, malformed, unknown-field or trailing
+  `persona_case.json`; (c) a persona other than `security`; (d) an unknown or
+  mismatched kind/expect, a defect case without a known lens or a clean case
+  with one; (e) a blank issue or a plan `plan.Parse` rejects; (f) an empty or
+  malformed diff, a changed path outside the plan's scope, or a diff touching
+  the remit or the convention; (g) blank or unshown `defect_phrases`; (h)
+  catch-only fields on a clean case or the reverse; (i) an anchor that is
+  absent, not `diff_file`, or not a changed file; (j) blank probes or
+  attribution phrases; (k) an attribution phrase absent from the anchored
+  file or present in another; (l) an example classifying wrong, or no
+  non-catching example naming the anchor; (m) a probe occurring in the issue,
+  the plan OR the diff (removed lines included); (n) a clean case without
+  false-alarm examples that classify `false_alarm`; (o) an absent or
+  malformed `markers.json`, an empty, blank or duplicate entry, a generic
+  phrase inside another, a repository marker absent from the convention or
+  present in the remit, or one occurring in any clean case's shown text.
+- **Scoring (catch rule v5, no bump).** A catch case is `Probes` +
+  `AttributionPhrases` (the anchored FILE; the lens lives in the probes), no
+  category predicate. A clean case is `CatchRule{Clean: true}` with NO
+  category predicate: the remit reserves no concern category, so **the judged
+  false-alarm rate counts EVERY concern on a clean diff, standard-criteria
+  concerns included, and must be read beside the category partition**.
+  Each trial is classified after the review loop's own ingest order
+  (`ClassifyPersonaTrialForRound`: convention clamp with the round's caps —
+  nil for portability — marker scrub, quote verification against the remit
+  and the rendered convention, the remit's `medium` cap), then every stored
+  concern is annotated from `markers.json`: `repo_specific_marker` (the first
+  repository marker it names, case-folded substring) and `absent_control` (an
+  absence phrase co-occurring, word-bounded, with a generic control phrase or
+  a repository marker).
+- **The category partition, committed (approval C1).** Per clean case of
+  each security arm the evidence records `false_alarm_partition`
+  (`security_lens` / `other_category` false_alarm trials: a trial is
+  `security_lens` when any alarming concern's category names the security
+  lens, `SecurityLensCategory`), and the sidecar tags each false_alarm trial
+  with `alarm_partition`. The gate checks both (modes 6c and 16): the entry
+  sums to `false_alarms`, every clean case has one, no other arm carries one,
+  and the per-trial tags tally to it. So a later decision to reserve a
+  security category in the remit is made from committed data.
+- **The portability refusal.** `RecordCatchRateEvidence` REFUSES
+  (`ErrPortabilityRepoSpecificFinding`, distinct from
+  `ErrCatchRateRegressed`; both files untouched; dry run included) a
+  measurement in which any `security_portability` concern names a repository
+  marker: loader mode (o) guarantees such a concern is about a control the
+  remit-only reviewer was never shown and the clean change did not remove.
+  A generic absent-control concern is SURFACED (sidecar `absent_control`,
+  per-case counts in the report), not refused.
+- **Report.** After the judged rule, a "Persona diagnostics" section: per
+  persona arm, each clean case's false alarms by normalized concern category
+  (and, on a security arm, the security_lens / other_category split); per
+  security arm, per-case absent-control counts; the `security` arm's catch
+  rate per remit lens; the portability findings.
+- **Fingerprint.** `securityArmFingerprint` covers the arm name,
+  `catchRuleVersion`, the security generator system prompt, the declaration
+  literals (remit path and cap, the convention's name, path and cap or `none`
+  for portability, repository, fixture commit), the exact `markers.json`
+  bytes, and per case its name, raw `persona_case.json` and rendered prompt,
+  so a remit, convention, markers or corpus edit stales THAT arm by name.
+- **Offline in verify.** `TestLoadSecurityCatchCorpus_*`,
+  `TestSecurityCatchCorpus_*` (envelope containment by offset, standard
+  render byte-identity, documents within budget, lenses present),
+  `TestRecordCatchRateEvidence_RecordsFiveArms`,
+  `TestRecordCatchRateEvidence_PortabilityRepoSpecificFindingRefused`,
+  `TestCatchRateFalseAlarmPartition_RoundTrips` and the calibration tests run
+  with scripted senders; the live calibration (30 samples per case) and the
+  #4314 re-pin recording are operator-run
+  (`docs/compliance/planreview-catchrate-evidence.md`).
+
 ### The rule, the tolerance and the power floor
 
 - **Within-run rule.** FAIL when the with-conventions catch rate is MORE than
@@ -1089,6 +1184,46 @@ sidecar (below), which a recording writes beside it.
           "undeclared-cross-component-direction": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0}
       }
     },
+    "security": {
+      "kind": "persona",
+      "samples_per_case": 34,
+      "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "per_case": {
+          "authz-run-bound-refusal-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "failclosed-policy-check-open-on-error": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "permission-workflow-permissions-widened": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "secret-credential-in-error-path": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "supplychain-unpinned-install-script": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+          "trust-issue-text-outside-envelope": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
+      },
+      "false_alarm_partition": {
+          "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},
+          "clean-ci-pinned-tool-bump": {"security_lens": 1, "other_category": 2},
+          "clean-policy-test-only": {"security_lens": 1, "other_category": 2},
+          "clean-redaction-helper-move": {"security_lens": 1, "other_category": 2}
+      }
+    },
+    "security_portability": {
+      "kind": "persona",
+      "samples_per_case": 34,
+      "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "per_case": {
+          "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+          "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0}
+      },
+      "false_alarm_partition": {
+          "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},
+          "clean-ci-pinned-tool-bump": {"security_lens": 1, "other_category": 2},
+          "clean-policy-test-only": {"security_lens": 1, "other_category": 2},
+          "clean-redaction-helper-move": {"security_lens": 1, "other_category": 2}
+      }
+    },
     "with_conventions": {
       "kind": "conventions",
       "samples_per_case": 12,
@@ -1145,6 +1280,46 @@ sidecar (below), which a recording writes beside it.
             "clean-workflow-v2-optional-field": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
             "declared-cross-component-direction": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
             "undeclared-cross-component-direction": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0}
+        }
+      },
+      "security": {
+        "kind": "persona",
+        "samples_per_case": 34,
+        "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "per_case": {
+            "authz-run-bound-refusal-dropped": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "failclosed-policy-check-open-on-error": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "permission-workflow-permissions-widened": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "secret-credential-in-error-path": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "supplychain-unpinned-install-script": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0},
+            "trust-issue-text-outside-envelope": {"expect": "catch", "trials": 34, "caught": 20, "undecodable": 0}
+        },
+        "false_alarm_partition": {
+            "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},
+            "clean-ci-pinned-tool-bump": {"security_lens": 1, "other_category": 2},
+            "clean-policy-test-only": {"security_lens": 1, "other_category": 2},
+            "clean-redaction-helper-move": {"security_lens": 1, "other_category": 2}
+        }
+      },
+      "security_portability": {
+        "kind": "persona",
+        "samples_per_case": 34,
+        "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "per_case": {
+            "clean-auth-helper-refactor": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-ci-pinned-tool-bump": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-policy-test-only": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0},
+            "clean-redaction-helper-move": {"expect": "clean", "trials": 34, "caught": 0, "false_alarms": 3, "undecodable": 0}
+        },
+        "false_alarm_partition": {
+            "clean-auth-helper-refactor": {"security_lens": 1, "other_category": 2},
+            "clean-ci-pinned-tool-bump": {"security_lens": 1, "other_category": 2},
+            "clean-policy-test-only": {"security_lens": 1, "other_category": 2},
+            "clean-redaction-helper-move": {"security_lens": 1, "other_category": 2}
         }
       },
       "with_conventions": {
@@ -1246,7 +1421,10 @@ each planted defect; the sidecar says what it wrote when it did not.
   tag when it matched one half only; an undecodable trial stores a
   `response_excerpt`. Every concern records `severity`, `category` and
   `note`; a persona arm's concern also records its post-control
-  `severity_clamped_from`, `quote_unverified` and `document_ref`. A clean
+  `severity_clamped_from`, `quote_unverified` and `document_ref`, and a
+  security arm's (#4314) its `repo_specific_marker` and `absent_control`
+  annotations; a security arm's false_alarm trial carries its
+  `alarm_partition` (`security_lens` or `other_category`). A clean
   case's trial stores its outcome (`false_alarm`, `no_false_alarm` or
   `undecodable`) and its concerns. `concerns_total` is the uncapped count.
 - **Redaction and truncation.** Every stored model-derived string (severity,
@@ -1289,7 +1467,10 @@ conventions fixture. The arm-keyed modes (E78.11 / #4313): (3b) a legacy v1
 record, refused naming the shared #4313/#4314 re-pin recording; (4b) a stale
 arm fingerprint, naming the arm; (6b) false alarms on a catch case, a catch
 on a clean case, or an `expect` differing from the corpus; (7b) a missing or
-unknown arm, or an arm kind differing from the table's; (8b) an under-powered
+unknown arm, or an arm kind differing from the table's; (6c, #4314) a
+`false_alarm_partition` that is negative, names a non-clean case or does not
+sum to the case's `false_alarms`, is missing a clean case of a security arm,
+or is present on any other arm; (8b) an under-powered
 expectation class in any arm; (10b) an arm's catch-rate drop, or (10c) its
 false-alarm-rate rise, above 0.10 against the pinned arm; (10d) an arm set
 differing from the baseline's (not comparable, re-pin); an unavailable persona
@@ -1302,7 +1483,10 @@ a sidecar from another recording, (16) per arm, a sidecar case set differing
 from the record's; per arm and case, a trial list whose length differs from
 the recorded trials, trial indices not exactly 1..n in order, or outcome
 tallies (all five outcomes) differing from the recorded counts, (16b)
-including a clean case's false_alarm / no_false_alarm / undecodable tallies. Each mode, and
+including a clean case's false_alarm / no_false_alarm / undecodable tallies,
+and (#4314) on a security arm a false_alarm trial without a known
+`alarm_partition`, a tag on any other trial, or tag tallies differing from
+the record's `false_alarm_partition`, and on any other arm a tag at all. Each mode, and
 each of the four (16) sub-checks, has its own row in
 `TestCheckCatchRateEvidence_FailClosed`.
 
@@ -1392,6 +1576,113 @@ for a recording, to see what a probe or rule change makes of the last one:
   conventions arms, so #4355's diagnostic survives the format change; an arm
   of the table absent from the sidecar is reported NOT RECORDED.
 
+### Live-run diagnostics (`planreview-diag.jsonl`, E55.21 / #4350)
+
+Every live catch-rate run (`TestPlanReviewCatchRateLive`, through
+`RecordCatchRateEvidenceWithDiagnostics`) leaves a per-trial JSON Lines file,
+whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
+
+- **Location.** `$FISHHAWK_AGENTEVAL_DIAG_DIR/<UTC 20060102T150405Z>/planreview-diag.jsonl`
+  when the knob is set, else `$TMPDIR/fishhawk-agenteval/<UTC 20060102T150405Z>/planreview-diag.jsonl`
+  (`os.TempDir`). The same timestamp layout names the per-run directory in
+  both cases, so repeated runs against one `DIAG_DIR` never collide. The live
+  test logs the path before the first model call (`t.Logf`), and the report
+  ends with `Diagnostics: <path>`.
+- **Never evidence.** `ResolveCatchRateDiagPath` refuses any path with a
+  `testdata` element. `OpenCatchRateDiag` opens with `O_CREATE|O_EXCL`, so it
+  never overwrites an earlier run's file, and it opens BEFORE any model call:
+  an open failure refuses the run. The gate (`catchrategate`,
+  `CheckCatchRateEvidence`) never reads the file.
+- **Lines** (schema `planreview-catchrate-diag-v1`), one JSON object per line:
+  - `header`: `schema`, `started_at`, `generator_model`, `dry_run`,
+    `pin_baseline`, `subset_cases`, `subset_trials_per_case`, `arms`.
+  - `trial`, appended as each trial completes: `arm`, `case`, `expect`,
+    `trial` (1-based), `outcome`, `caught`, `miss_class`, `verdict` (the
+    lenient decode's verdict, `undecodable` when the response has no JSON
+    object), `matched_probe`, `attribution`, `concerns_total`,
+    `raw_concerns`, `scored_concerns` and, on an undecodable trial,
+    `response_excerpt`.
+    - `raw_concerns` is the diagnostics' own lenient re-decode of the
+      response: EVERY concern the reviewer emitted, before any ingest control,
+      each with `severity`, `category`, `note`, the emitted `convention` and
+      `criterion_id` when present (a non-string value is kept as its JSON
+      text), `names_criterion` (the planted criterion id it names), `probe`
+      (the catch probe it matches) and `attributed` (the attribution half).
+    - `scored_concerns` is what the classifier scored (`CatchTrial.Concerns`):
+      the matching concern of a caught trial, every near-miss-tagged concern
+      of a missed one, and, for the persona arms, the concerns AFTER the
+      review loop's ingest controls (`personaprompt.ApplyConcernControls`:
+      severity clamp, quote verification). `miss_class` is computed from this
+      list.
+  - `summary`, written on every outcome: `outcome` (`passed`, `not_judged` for
+    a subset dry run, `refused` for `ErrCatchRateRegressed`,
+    `ErrPortabilityRepoSpecificFinding` or `ErrCatchRateSubsetNotRecordable`,
+    `error` for anything else, including a transport error or an
+    under-powered refusal), `error`, `finished_at`, `trials_written`, and per
+    arm: `trials`, `decoded`, `catch_trials`, `caught`, `clean_trials`,
+    `false_alarms`, `undecodable`, `verdicts`, `concern_categories` (the
+    trimmed, case-folded category histogram over `raw_concerns`),
+    `mean_concerns_per_decoded_trial`, `miss_classes` and `per_case`
+    (`trials`, `caught`, `false_alarms`, `undecodable`, `miss_classes`). The
+    same summary is rendered into the run's report (arms by name, histograms
+    by count descending then name).
+- **Miss classes** (a missed or undecodable CATCH-case trial only; diagnostic,
+  never scored, computed with the classifier's own matcher helpers over
+  `scored_concerns`), in precedence order:
+  1. `category_mismatch`: a concern matched both halves but failed the rule's
+     category predicate (the architect arm's `decision_record`): a scoring miss.
+  2. `unattributed`: a concern matched a probe but named no planted id,
+     anchored step or attribution phrase: a scoring miss.
+  3. `no_probe`: a concern named the planted criterion but matched no probe:
+     a scoring miss.
+  4. `not_mentioned`: no concern touched either half: a reviewer miss.
+  5. `undecodable`: no decodable verdict.
+- **Credential hygiene.** Every line passes, in order, `json.Marshal`,
+  known-value redaction of `FISHHAWKD_ANTHROPIC_API_KEY`,
+  `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+  and the resolved credential (`CatchRateDiagCredentials`,
+  `redaction.NewKnownValues`; a value under `redaction.MinKnownValueBytes` is
+  not redacted by value and is named in a warning), then a scrub of any
+  `sk-ant-…` token whatever its shape (`redaction.DefaultPatterns` matches only
+  40+-character `sk-ant-api03` keys, so an OAuth `sk-ant-oat01` token passes
+  it). Every model-derived string also goes through the sidecar's
+  `sanitizeCatchTrialText` (`RedactDefault` plus the 1000-rune cap). Unlike
+  the sidecar, no concern-count cap applies.
+- **Subset dry runs.** `FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<id,...>` (case
+  directory names, any arm; an unknown id is refused before any model call)
+  and `FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=<n>` (a positive integer replacing
+  every arm's samples per case) measure part of the arm table. An arm none of
+  whose cases is selected does not run. A subset is identified by a knob being
+  SET, whatever its value, and is NEVER recordable:
+  `RecordCatchRateEvidence` refuses it with
+  `ErrCatchRateSubsetNotRecordable` as its first check when `RECORD=1` or
+  `PIN_REASON` is set. A subset dry run is reported per case and is not judged
+  (`Subset dry run: NOT judged against the gate and never recordable`).
+- **Streaming and checkpointing.** Each line is ONE unbuffered `Write` on the
+  `*os.File`, done before the next trial starts, so a killed or timed-out run
+  keeps every finished trial (`tail -f` follows it). There is no `fsync`, so a
+  power loss can lose the tail. Each trial also writes
+  `<case>/<arm>/<trial> caught|miss:<class>|false_alarm|no_false_alarm` to
+  stderr (a clean case's undecodable trial reads `false_alarm`, as the gate
+  counts it); `go test` shows it live only with `-v`. A write error is sticky:
+  later lines are skipped with a warning, `Finish` returns the error, and the
+  run is not aborted.
+- **Instrument invariance.** The observer rides on the context
+  (`withCatchTrialObserver`, the `net/http/httptrace` pattern): one
+  `observeCatchTrial` call in `RunCatchRateArm` and one in
+  `runPersonaTrialLoop`, a no-op without an observer. No prompt, corpus,
+  probe, fingerprint input or `catchRuleVersion` changes, and
+  `TestRecordCatchRateEvidenceWithDiagnostics_EvidenceUnchanged` pins that a
+  diagnosed recording's evidence pair is byte-identical to an undiagnosed one.
+- **Not a trigger path, and the residual.** `planreviewdiag.go` is deliberately
+  NOT a `scripts/check-review-prompt-eval` trigger path, yet
+  `CatchRateSubset.forRow` and `selectCatchCases` run on the recording path in
+  their inactive form (the row's own samples, every case). A future edit there
+  that changed the non-subset samples or cases would not trigger the standing
+  check; it is bounded by the gate's per-arm samples and case-set checks
+  (`checkArmCases`, `checkArmSet`) on any recorded record, and the guard that
+  refuses a recording subset lives in the trigger file `planreviewevidence.go`.
+
 ### Calibration dry run (`CalibrateCatchRateArm`, E78.11 / #4313)
 
 Before a new arm's cases enter a recording, each catch case should be of MID
@@ -1416,13 +1707,22 @@ band. `CatchRateCalibration.Markdown` renders the PR table and
   (`planreviewpersonalive_test.go`) is double-gated on
   `FISHHAWK_AGENTEVAL_CALIBRATE_LIVE` plus one credential
   (`requireLiveCredential`), with `FISHHAWK_AGENTEVAL_CALIBRATE_ARM` (default
-  `architect`) and `FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES` (default 10, a
-  positive integer). It generates on `DefaultCatchRateGeneratorModel` through
-  the recording's generator config, logs the table, and FAILS when any catch
-  case is out of band. The band is a calibration aid, not a gate: nothing in
+  `architect`) and `FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES` (default 30, a
+  positive integer; 10 proved too noisy, #4314). It generates on
+  `DefaultCatchRateGeneratorModel` through the recording's generator config,
+  logs the table, and FAILS when any catch case is out of band, and (#4314)
+  when a `security_portability` concern names a repository-specific marker.
+  The band is a calibration aid, not a gate: nothing in
   `CheckCatchRateEvidence` reads it.
-- **Read the band honestly.** At 10 samples a case's rate has a wide sampling
-  interval; a case at a bound is a candidate for rework, not a verdict.
+- **Security arms (#4314).** A security calibration also reports each case's
+  `Lens` (a Lens column), each clean case's `AlarmCategories` (false-alarm
+  concerns by normalized category; a "False alarms by category" block) and,
+  on `security_portability`, its `PortabilityFindings` (case, trial, marker;
+  a "Portability findings" block). Each column/block renders only when
+  non-empty, so the conventions and architect tables are unchanged.
+- **Read the band honestly.** Even at 30 samples a case's rate has a real
+  sampling interval; a case at a bound is a candidate for rework, not a
+  verdict.
 
 The v3 → v4 re-score of the 2026-10-12 sidecar, per case and arm, is recorded
 in [`docs/compliance/planreview-catchrate-evidence.md`](../../../docs/compliance/planreview-catchrate-evidence.md)
@@ -1472,18 +1772,23 @@ FISHHAWK_AGENTEVAL_CALIBRATION_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -run 'TestSeverityCalibrationLive|TestAdversarialRetentionLive' ./backend/internal/agenteval/
 
 # Offline plan-review catch-rate harness + evidence gate (no model call):
-scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestCatchCorpus|TestCommittedCatch|TestCatchRuleV4|TestCatchRuleV5|TestCatchRule_|TestRescoreCatchRateTrials|TestClassifyCatch|TestRunCatchRateArm|TestCompareCatchRateArms|TestMinCatchRateTrials|TestCheckCatchRateEvidence|TestRecordCatchRateEvidence|TestREADMEMinimalCatchRateEvidence|Persona|TestCalibrat' ./backend/internal/agenteval/
+scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestCatchCorpus|TestCommittedCatch|TestCatchRuleV4|TestCatchRuleV5|TestCatchRule_|TestRescoreCatchRateTrials|TestClassifyCatch|TestRunCatchRateArm|TestCompareCatchRateArms|TestMinCatchRateTrials|TestCheckCatchRateEvidence|TestRecordCatchRateEvidence|TestREADMEMinimalCatchRateEvidence|Persona|Security|TestCalibrat' ./backend/internal/agenteval/
 (cd backend && go run ./internal/agenteval/catchrategate)
 (cd backend && go run ./internal/agenteval/catchrategate --rescore)   # diagnostic lower bound, never a PASS
 
 # Live plan-review catch-rate arms (opt-in; makes real model calls; dry run unless RECORD=1):
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+
+# Live subset dry run (opt-in; a few model calls; never recordable; diagnostics only):
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<case-id> FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=3 \
+  scripts/test single -v -timeout 30m -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 
 # Live calibration dry run of one arm (opt-in; makes real model calls; never writes evidence):
 FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
-  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=architect FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=10 \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
   scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
 ```
 

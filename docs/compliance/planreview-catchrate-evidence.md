@@ -123,7 +123,52 @@ through a routed fix-up before merge rather than cutting it (the corpus
 checks require every kind). Cost: 6 cases x 10 samples = 60 persona-prompt
 calls (each prompt ~60 KB: index, remit and plan-review prompt). At 10 samples
 a case's rate has a wide sampling interval; a case at a bound is a candidate
-for rework, not a verdict.
+for rework, not a verdict. The default is now 30 samples per case (10 proved
+too noisy, #4314).
+
+**The security arms (E80.17 / #4314).** Calibrate every security catch case
+at 30 samples to the 30–80% band BEFORE #4314's recording; any out-of-band
+case is reworked through a routed fix-up first (the merge is held for both).
+Captain ruling 2026-10-14: a catch case at ceiling (30/30) is accepted, since a
+ceiling case still detects a recall drop; a clean case's false alarms are
+reworked (see "Calibration dry runs"):
+
+```sh
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
+  scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security_portability FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
+  scripts/test single -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+```
+
+Cost: 10 cases x 30 = 300 implement-review persona calls for `security`, 4 x
+30 = 120 for `security_portability`. Read three things in the table beyond the
+band:
+
+- **The false-alarm rate counts EVERY concern on a clean diff.** A security
+  clean case has no category predicate (the remit reserves no concern
+  category), so the standard-criteria concerns the persona also raises
+  (correctness, verification, scope) count as false alarms beside the
+  security ones. Read the rate beside the "False alarms by category" block,
+  never alone. The recording commits the same split per clean case as
+  `false_alarm_partition` (`security_lens` / `other_category` trials) in the
+  evidence and a per-trial `alarm_partition` tag in the sidecar, so a later
+  decision to reserve a security category in the remit is made from
+  committed data.
+- **Absent-control concerns.** The sidecar marks each concern asserting a
+  control is absent (`absent_control`, from `markers.json`); the recording
+  report counts them per case. A generic one (no repository marker) is
+  surfaced, not refused.
+- **Portability findings.** A `security_portability` concern naming a
+  repository-specific marker (`markers.json` `repo_specific_markers`: this
+  repository's own controls, every one documented in
+  `docs/review/security-conventions.md` and absent from the remit and from
+  every clean case) is about a control the remit-only reviewer was never
+  shown. The dry run FAILS on one and the recording REFUSES it
+  (`ErrPortabilityRepoSpecificFinding`; both files untouched, dry run
+  included). Read the concern in the report: rework the remit (if it leaked a
+  repository assumption) or the case; never delete the marker to pass.
 
 ## Step 2 — run the arms
 
@@ -132,12 +177,20 @@ Authenticate with exactly one of `FISHHAWKD_ANTHROPIC_API_KEY` or
 any command below). Neither set skips the arm naming both variables; both set
 fails it. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
 
-Dry run (measures and judges against the committed baseline, writes
-nothing):
+Every command below passes `-v` (so the per-trial progress lines stream
+instead of arriving when the package finishes) and an explicit `-timeout`
+(`go test` defaults to 10 minutes; a full recording is about 1,000 model
+calls). Every run, refused or not, writes a per-trial diagnostics file and
+logs its path first (`per-trial diagnostics: <path>`) and last
+(`Diagnostics: <path>`) — see "Diagnosing a refused or surprising
+measurement" below.
+
+Dry run (measures and judges against the committed baseline; writes no
+evidence):
 
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Record a measurement (`RECORD=1`). The FIRST recording must also pin the
@@ -147,7 +200,7 @@ baseline, with a reason:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement after #2245' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Later recordings omit `PIN_REASON`; the pinned baseline is carried forward
@@ -165,7 +218,7 @@ comparable; record with a reason that says so:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4253: catch rule v3 and the twelve-case corpus; the 2026-10-10 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Land that recording commit on the #4253 run branch before merge.
@@ -189,7 +242,7 @@ not comparable:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4355: catch rule v4 (prompt-vocabulary probes) and corpus-disjoint prompt examples; the v3 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 That recording is the ONLY out-of-sample measurement of v4: the re-score
@@ -207,13 +260,29 @@ byte-identical), a pin replaces it, and a dry run proceeds.
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4313: arm-keyed v2 record (catch rule v5, architect persona arm); the v1 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 #4314 records separately, after #4313 has merged. Its security arms change
 the arm table, so an ordinary recording over the #4313 baseline is refused as
 not comparable: #4314's recording is a re-pin of its own, with its own
-`PIN_REASON`.
+`PIN_REASON`, made on the #4314 branch after its calibration (Step 1b) and
+before it merges (the merge is HELD for it; until it lands `catchrategate`
+and `scripts/check-review-prompt-eval` fail on that branch naming the
+missing `security` and `security_portability` arms, by design):
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4314: security and security_portability join the arm table; the #4313 baseline is not comparable' \
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+A recording in which any `security_portability` concern names a
+repository-specific marker is refused (Step 1b, "Portability findings"). The
+security arms' judged false-alarm rate counts every concern on a clean diff,
+standard-criteria concerns included: read it beside the report's "Persona
+diagnostics" partition and the committed `false_alarm_partition`.
 
 Commit the v2 pair (Step 3); `catchrategate` then decodes it, and the stale
 message on any later change names the arm whose fingerprint moved. An ADR
@@ -224,8 +293,10 @@ Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
 calls — 2 x 144 with the twelve committed cases (12 samples per case) — and
 the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
 of its catch and clean classes clears the 136 floor with 138), about 564
-calls for the #4313 recording (#4314's security arms bill to its own
-recording), against
+calls for the #4313 recording; #4314's recording adds the security arm, 10 x
+34 = 340 implement-review persona calls (34 samples per case, so its six catch
+and four clean cases each clear the floor), and the portability arm, 4 x 34 =
+136, against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
@@ -312,6 +383,62 @@ arms — caught in every trial, or in at most one (with 12 samples per case,
 `<= 2/23` thresholds) — no longer discriminates. Explain each such case in
 the recording PR, or file a follow-up for a harder variant.
 
+## Diagnosing a refused or surprising measurement
+
+Every live run writes `planreview-diag.jsonl` (schema, redaction and the
+miss-class rule: `backend/internal/agenteval/README.md` § "Live-run
+diagnostics"), at
+`$FISHHAWK_AGENTEVAL_DIAG_DIR/<UTC 20060102T150405Z>/planreview-diag.jsonl`,
+or under `$TMPDIR/fishhawk-agenteval/<UTC 20060102T150405Z>/` when the knob
+is unset. It is written trial by trial, so a refused, failed or killed run
+still has every trial it finished; it is never evidence and never committed
+(a path under `testdata/` is refused).
+
+Follow a long run as it goes:
+
+```sh
+tail -f "$DIAG"     # DIAG = the path the run logged
+```
+
+Read it with `jq` (`-s` slurps the lines):
+
+```sh
+# Per arm and case: the miss-class breakdown of the missed catch trials.
+jq -rs '.[] | select(.kind == "trial" and .miss_class != "") | "\(.arm) \(.case) \(.miss_class)"' "$DIAG" | sort | uniq -c
+
+# Per arm: the concern-category histogram, verdicts and mean concerns.
+jq -s '.[-1] | select(.kind == "summary") | .arms | map_values({concern_categories, verdicts, mean_concerns_per_decoded_trial})' "$DIAG"
+
+# How the run ended (passed, not_judged, refused, error) and why.
+jq -s '.[-1] | {outcome, error, trials_written}' "$DIAG"
+```
+
+Read the miss classes as two kinds of miss:
+
+- `not_mentioned` is a **reviewer miss**: no concern touched the planted
+  criterion or the defect. The reviewer did not see it, so look at the prompt
+  (or accept that the case is hard).
+- `unattributed`, `no_probe` and `category_mismatch` are **scoring misses**:
+  the reviewer raised the defect, but the catch rule did not credit it (no
+  planted id or phrase, no probe, or the wrong category label on the
+  architect arm). Look at the case's `catch_probes` / `attribution_phrases`
+  and the concern's `raw_concerns` entry, then check a widened set with
+  `catchrategate --rescore` before re-recording.
+- `undecodable` means no verdict decoded; read `response_excerpt`.
+
+**Probe a few cases before paying for a recording.** A subset dry run
+measures only the named cases (any arm's case directory names) at a reduced
+sample count, for a fraction of a recording's cost (a dollar or two at
+most). It is never judged and never recordable: with `RECORD=1` or
+`PIN_REASON` set it is refused before any model call.
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-untestable-adjective,<another-case> \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=3 \
+  scripts/test single -v -timeout 30m -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
 ## Offline re-score: catch rule v3 → v4 (2026-10-12 sidecar, #4355)
 
 Re-score of the committed sidecar
@@ -383,13 +510,20 @@ to use it as a probe.
 
 ### Arm-keyed results (E78.11 / #4313 on)
 
-Pending the #4313 re-pin recording (#4314 records separately after it); one row per recording,
+One row per recording,
 naming every arm. The architect columns are catch (catch cases) and false
 alarm (clean cases).
 
 | Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10-14 | `claude-sonnet-5-5` | 133/144 (0.924) | 130/144 (0.903) | 106/138 (0.768) | 32/138 (0.232) | — | pinned (#4313: arm-keyed v2, catch rule v5; v1 not comparable) | PASS (delta +0.021) |
+| 2026-10-15 | `claude-sonnet-5-5` | 137/144 (0.951) | 135/144 (0.938) | 105/138 (0.761) | 28/138 (0.203) | `security` catch 204/204 (1.000), false alarm 3/136 (0.022; trials: security_lens 0, other_category 2, undecodable 1); `security_portability` false alarm 3/136 (0.022; trials: security_lens 1, other_category 1, undecodable 1) | pinned (#4314: security + security_portability arms added; the #4313 arm set is not comparable) | PASS (delta +0.014) |
+
+The #4314 row's "Other arms" column names `security` catch and false alarm
+(with its security_lens / other_category trial split; the remainder of each
+false-alarm count is undecodable trials) and `security_portability` false
+alarm. All six security catch cases sit at ceiling (34/34 each), accepted by
+Captain ruling 2026-10-14; a harder corpus is #4402.
 
 ### Calibration dry runs
 
@@ -399,3 +533,7 @@ alarm (clean cases).
 | 2026-10-14 | `architect` | 10 | adr033 + adr094 10/10 after rewording; replaced by adr006-production-migrate-down and adr091-merge-without-review-coverage (body-only conflicts), re-calibration pending operator | routed fix-up concern (head `f7549511`) |
 | 2026-10-14 | `architect` | 30 | adr006 76.7% and undeclared 43.3% in band; adr091 13.3% below (successor body never shown: superseding ADRs have empty applies_to); adr091 reworked to a content reference, re-calibration pending operator | routed fix-up concern (head `ea8bd7f1`) |
 | 2026-10-14 | `architect` | 30 | adr006 29/30 and adr091 29/30 ABOVE band; undeclared 10/30 in band. Recorded as-is per Captain ruling (no fix-up budget left). **Variance flag:** adr006 was unchanged since the previous run yet moved 23/30 → 29/30, and clean-sqlc false alarms moved 1/30 → 6/30, so at 30 samples the band is not a stable gate for this arm. The recording (46 per case: adr006 41/46, adr091 45/46, undeclared 20/46; false alarms sqlc 3/46, workflow-v2 1/46, declared pair 28/46) is the measurement of record; #4398 tracks the empty-applies_to gap behind adr091's bimodality | PR #4396 comments (head `77c989e6`) |
+| 2026-10-14 | `security` | 30 | all six catch cases 30/30 (ceiling, accepted by Captain: a ceiling case still detects a recall drop); clean-redaction 30/30 FA, clean-policy-test-only 0-1/30; clean cases reworked, re-calibration pending operator | routed fix-up concern (head `69549c71`) |
+| 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |
+| 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
+| 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |

@@ -732,9 +732,17 @@ type planReviewEmittedVerdict struct {
 // set only on a MISSED trial's concerns (NearMissProbeWithoutAttribution,
 // NearMissAttributionWithoutProbe, or empty when the concern matched neither
 // half). SeverityClampedFrom, QuoteUnverified and DocumentRef are set only by
-// the persona arm (ClassifyPersonaTrial), which stores each concern AFTER the
-// production persona-ingest controls: Severity is then the post-control
+// the persona arms (ClassifyPersonaTrialForRound), which store each concern
+// AFTER the review loop's ingest controls: Severity is then the post-control
 // severity, SeverityClampedFrom the severity a control lowered it from.
+//
+// RepoSpecificMarker and AbsentControl are set only by the security persona
+// arms (ClassifySecurityTrial, #4314) from the corpus markers.json:
+// RepoSpecificMarker is the first repository-specific marker the concern names
+// (a control the generic remit never shows), AbsentControl reports that the
+// concern asserts a control or file is absent. They annotate; no matcher reads
+// them, so catch rule v5 is unchanged, and classifyCatchConcerns copies them
+// through like every other stored field.
 type CatchTrialConcern struct {
 	Severity            string
 	SeverityClampedFrom string
@@ -743,6 +751,8 @@ type CatchTrialConcern struct {
 	Category            string
 	Note                string
 	NearMiss            string
+	RepoSpecificMarker  string
+	AbsentControl       bool
 }
 
 // CatchTrial is the classification of one reviewer response, with what the
@@ -794,9 +804,9 @@ func ClassifyCatchTrial(responseText string, rule CatchRule) CatchTrial {
 
 // classifyCatchConcerns classifies one DECODED verdict's concerns (total is
 // the number the verdict carried) against rule. It is the ONE matcher every
-// arm uses — the conventions arms through ClassifyCatchTrial, the persona arm
-// through ClassifyPersonaTrial, and the rescore over recorded sidecar
-// concerns:
+// arm uses — the conventions arms through ClassifyCatchTrial, the architect
+// persona arm through ClassifyPersonaTrial, the security persona arms through
+// ClassifySecurityTrial, and the rescore over recorded sidecar concerns:
 //
 //   - a CLEAN rule: CatchFalseAlarm when some concern satisfies the category
 //     predicate (matchCatchCategory), with every such concern kept;
@@ -980,6 +990,7 @@ func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanRevi
 				counts.Undecodable++
 			}
 			trials = append(trials, trial)
+			observeCatchTrial(ctx, arm, c.Name, CatchExpectCatch, i+1, responseText, trial)
 		}
 		report.PerCase[c.Name] = counts
 		report.Trials[c.Name] = trials

@@ -1,8 +1,8 @@
 {
   "schema": "planreview-catchrate-evidence-v2",
-  "recorded_at": "2026-10-14T14:15:06Z",
+  "recorded_at": "2026-10-15T00:23:34Z",
   "generator_model": "claude-sonnet-5-5",
-  "prompt_fingerprint": "sha256:ab7ecf8b3a69219a216a4fe4130a78ed9a433d3a57d534c1175be9b254ad6295",
+  "prompt_fingerprint": "sha256:8ba14cf23827aa29f865b80ebac3ff31a437df9403bbfe48e4c46f06c1fafe60",
   "tolerance": 0.1,
   "min_trials_per_arm": 136,
   "arms": {
@@ -14,7 +14,7 @@
         "adr006-production-migrate-down": {
           "expect": "catch",
           "trials": 46,
-          "caught": 41,
+          "caught": 39,
           "undecodable": 0
         },
         "adr091-merge-without-review-coverage": {
@@ -27,28 +27,165 @@
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 3,
+          "false_alarms": 2,
           "undecodable": 0
         },
         "clean-workflow-v2-optional-field": {
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 1,
+          "false_alarms": 2,
           "undecodable": 0
         },
         "declared-cross-component-direction": {
           "expect": "clean",
           "trials": 46,
           "caught": 0,
-          "false_alarms": 28,
+          "false_alarms": 24,
           "undecodable": 0
         },
         "undeclared-cross-component-direction": {
           "expect": "catch",
           "trials": 46,
-          "caught": 20,
+          "caught": 21,
           "undecodable": 0
+        }
+      }
+    },
+    "security": {
+      "kind": "persona",
+      "samples_per_case": 34,
+      "prompt_fingerprint": "sha256:477f97a68468e00a6689d3b7f0db4377f110f7666148b58d776c9d7b5a1309b6",
+      "per_case": {
+        "authz-run-bound-refusal-dropped": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        },
+        "clean-auth-helper-refactor": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "false_alarms": 2,
+          "undecodable": 1
+        },
+        "clean-ci-pinned-tool-bump": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "undecodable": 0
+        },
+        "clean-policy-test-only": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "undecodable": 0
+        },
+        "clean-redaction-helper-move": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "undecodable": 0
+        },
+        "failclosed-policy-check-open-on-error": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        },
+        "permission-workflow-permissions-widened": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        },
+        "secret-credential-in-error-path": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        },
+        "supplychain-unpinned-install-script": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        },
+        "trust-issue-text-outside-envelope": {
+          "expect": "catch",
+          "trials": 34,
+          "caught": 34,
+          "undecodable": 0
+        }
+      },
+      "false_alarm_partition": {
+        "clean-auth-helper-refactor": {
+          "security_lens": 0,
+          "other_category": 2
+        },
+        "clean-ci-pinned-tool-bump": {
+          "security_lens": 0,
+          "other_category": 0
+        },
+        "clean-policy-test-only": {
+          "security_lens": 0,
+          "other_category": 0
+        },
+        "clean-redaction-helper-move": {
+          "security_lens": 0,
+          "other_category": 0
+        }
+      }
+    },
+    "security_portability": {
+      "kind": "persona",
+      "samples_per_case": 34,
+      "prompt_fingerprint": "sha256:d8e410feaf6a45d6fef8719f3ca1eff65fc3e5a693b10687dfca91b3249cbe4e",
+      "per_case": {
+        "clean-auth-helper-refactor": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "undecodable": 1
+        },
+        "clean-ci-pinned-tool-bump": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "false_alarms": 1,
+          "undecodable": 0
+        },
+        "clean-policy-test-only": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "false_alarms": 1,
+          "undecodable": 0
+        },
+        "clean-redaction-helper-move": {
+          "expect": "clean",
+          "trials": 34,
+          "caught": 0,
+          "undecodable": 0
+        }
+      },
+      "false_alarm_partition": {
+        "clean-auth-helper-refactor": {
+          "security_lens": 0,
+          "other_category": 0
+        },
+        "clean-ci-pinned-tool-bump": {
+          "security_lens": 1,
+          "other_category": 0
+        },
+        "clean-policy-test-only": {
+          "security_lens": 0,
+          "other_category": 1
+        },
+        "clean-redaction-helper-move": {
+          "security_lens": 0,
+          "other_category": 0
         }
       }
     },
@@ -64,12 +201,12 @@
         },
         "seed-synthetic-contradicts-numeric-limit": {
           "trials": 12,
-          "caught": 11,
+          "caught": 10,
           "undecodable": 0
         },
         "seed-synthetic-contradicts-status-code": {
           "trials": 12,
-          "caught": 5,
+          "caught": 9,
           "undecodable": 0
         },
         "seed-synthetic-inferred-criterion": {
@@ -84,7 +221,7 @@
         },
         "seed-synthetic-inferred-sibling-timeout": {
           "trials": 12,
-          "caught": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-restates-approach": {
@@ -99,7 +236,7 @@
         },
         "seed-synthetic-untestable-reasonable-time": {
           "trials": 12,
-          "caught": 9,
+          "caught": 10,
           "undecodable": 0
         },
         "seed-synthetic-untestable-user-friendly": {
@@ -109,7 +246,7 @@
         },
         "seed-synthetic-unwarranted-rate-limit": {
           "trials": 12,
-          "caught": 10,
+          "caught": 12,
           "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
@@ -131,7 +268,7 @@
         },
         "seed-synthetic-contradicts-numeric-limit": {
           "trials": 12,
-          "caught": 8,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-contradicts-status-code": {
@@ -146,7 +283,7 @@
         },
         "seed-synthetic-inferred-sibling-retention": {
           "trials": 12,
-          "caught": 10,
+          "caught": 12,
           "undecodable": 0
         },
         "seed-synthetic-inferred-sibling-timeout": {
@@ -176,7 +313,7 @@
         },
         "seed-synthetic-unwarranted-rate-limit": {
           "trials": 12,
-          "caught": 12,
+          "caught": 11,
           "undecodable": 0
         },
         "seed-synthetic-vacuous-criterion": {
@@ -188,10 +325,10 @@
     }
   },
   "baseline": {
-    "pinned_at": "2026-10-14T14:15:06Z",
-    "reason": "#4313: arm-keyed v2 record (catch rule v5, architect persona arm); the v1 baseline is not comparable",
+    "pinned_at": "2026-10-15T00:23:34Z",
+    "reason": "#4314: security persona arms (security, security_portability) added to the arm-keyed v2 record; the #4313 baseline is not comparable",
     "generator_model": "claude-sonnet-5-5",
-    "prompt_fingerprint": "sha256:ab7ecf8b3a69219a216a4fe4130a78ed9a433d3a57d534c1175be9b254ad6295",
+    "prompt_fingerprint": "sha256:8ba14cf23827aa29f865b80ebac3ff31a437df9403bbfe48e4c46f06c1fafe60",
     "arms": {
       "architect": {
         "kind": "persona",
@@ -201,7 +338,7 @@
           "adr006-production-migrate-down": {
             "expect": "catch",
             "trials": 46,
-            "caught": 41,
+            "caught": 39,
             "undecodable": 0
           },
           "adr091-merge-without-review-coverage": {
@@ -214,28 +351,165 @@
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 3,
+            "false_alarms": 2,
             "undecodable": 0
           },
           "clean-workflow-v2-optional-field": {
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 1,
+            "false_alarms": 2,
             "undecodable": 0
           },
           "declared-cross-component-direction": {
             "expect": "clean",
             "trials": 46,
             "caught": 0,
-            "false_alarms": 28,
+            "false_alarms": 24,
             "undecodable": 0
           },
           "undeclared-cross-component-direction": {
             "expect": "catch",
             "trials": 46,
-            "caught": 20,
+            "caught": 21,
             "undecodable": 0
+          }
+        }
+      },
+      "security": {
+        "kind": "persona",
+        "samples_per_case": 34,
+        "prompt_fingerprint": "sha256:477f97a68468e00a6689d3b7f0db4377f110f7666148b58d776c9d7b5a1309b6",
+        "per_case": {
+          "authz-run-bound-refusal-dropped": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          },
+          "clean-auth-helper-refactor": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "false_alarms": 2,
+            "undecodable": 1
+          },
+          "clean-ci-pinned-tool-bump": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "undecodable": 0
+          },
+          "clean-policy-test-only": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "undecodable": 0
+          },
+          "clean-redaction-helper-move": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "undecodable": 0
+          },
+          "failclosed-policy-check-open-on-error": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          },
+          "permission-workflow-permissions-widened": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          },
+          "secret-credential-in-error-path": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          },
+          "supplychain-unpinned-install-script": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          },
+          "trust-issue-text-outside-envelope": {
+            "expect": "catch",
+            "trials": 34,
+            "caught": 34,
+            "undecodable": 0
+          }
+        },
+        "false_alarm_partition": {
+          "clean-auth-helper-refactor": {
+            "security_lens": 0,
+            "other_category": 2
+          },
+          "clean-ci-pinned-tool-bump": {
+            "security_lens": 0,
+            "other_category": 0
+          },
+          "clean-policy-test-only": {
+            "security_lens": 0,
+            "other_category": 0
+          },
+          "clean-redaction-helper-move": {
+            "security_lens": 0,
+            "other_category": 0
+          }
+        }
+      },
+      "security_portability": {
+        "kind": "persona",
+        "samples_per_case": 34,
+        "prompt_fingerprint": "sha256:d8e410feaf6a45d6fef8719f3ca1eff65fc3e5a693b10687dfca91b3249cbe4e",
+        "per_case": {
+          "clean-auth-helper-refactor": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "undecodable": 1
+          },
+          "clean-ci-pinned-tool-bump": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "false_alarms": 1,
+            "undecodable": 0
+          },
+          "clean-policy-test-only": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "false_alarms": 1,
+            "undecodable": 0
+          },
+          "clean-redaction-helper-move": {
+            "expect": "clean",
+            "trials": 34,
+            "caught": 0,
+            "undecodable": 0
+          }
+        },
+        "false_alarm_partition": {
+          "clean-auth-helper-refactor": {
+            "security_lens": 0,
+            "other_category": 0
+          },
+          "clean-ci-pinned-tool-bump": {
+            "security_lens": 1,
+            "other_category": 0
+          },
+          "clean-policy-test-only": {
+            "security_lens": 0,
+            "other_category": 1
+          },
+          "clean-redaction-helper-move": {
+            "security_lens": 0,
+            "other_category": 0
           }
         }
       },
@@ -251,12 +525,12 @@
           },
           "seed-synthetic-contradicts-numeric-limit": {
             "trials": 12,
-            "caught": 11,
+            "caught": 10,
             "undecodable": 0
           },
           "seed-synthetic-contradicts-status-code": {
             "trials": 12,
-            "caught": 5,
+            "caught": 9,
             "undecodable": 0
           },
           "seed-synthetic-inferred-criterion": {
@@ -271,7 +545,7 @@
           },
           "seed-synthetic-inferred-sibling-timeout": {
             "trials": 12,
-            "caught": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-restates-approach": {
@@ -286,7 +560,7 @@
           },
           "seed-synthetic-untestable-reasonable-time": {
             "trials": 12,
-            "caught": 9,
+            "caught": 10,
             "undecodable": 0
           },
           "seed-synthetic-untestable-user-friendly": {
@@ -296,7 +570,7 @@
           },
           "seed-synthetic-unwarranted-rate-limit": {
             "trials": 12,
-            "caught": 10,
+            "caught": 12,
             "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {
@@ -318,7 +592,7 @@
           },
           "seed-synthetic-contradicts-numeric-limit": {
             "trials": 12,
-            "caught": 8,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-contradicts-status-code": {
@@ -333,7 +607,7 @@
           },
           "seed-synthetic-inferred-sibling-retention": {
             "trials": 12,
-            "caught": 10,
+            "caught": 12,
             "undecodable": 0
           },
           "seed-synthetic-inferred-sibling-timeout": {
@@ -363,7 +637,7 @@
           },
           "seed-synthetic-unwarranted-rate-limit": {
             "trials": 12,
-            "caught": 12,
+            "caught": 11,
             "undecodable": 0
           },
           "seed-synthetic-vacuous-criterion": {

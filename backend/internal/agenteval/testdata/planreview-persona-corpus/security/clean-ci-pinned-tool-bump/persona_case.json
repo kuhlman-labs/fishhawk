@@ -1,0 +1,84 @@
+{
+  "persona": "security",
+  "kind": "clean_sensitive",
+  "expect": "clean",
+  "issue_title": "Bump golangci-lint from v2.8.0 to v2.9.0",
+  "issue_body": "golangci-lint v2.9.0 fixes a false positive we suppress by hand in two packages. Move every install site to v2.9.0: the CI workflow, the four release workflows and the gate image, keeping each install on the tagged install script.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94109",
+      "id": "kuhlman-labs/fishhawk#94109"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Move every golangci-lint install site from the v2.8.0 tag to the v2.9.0 tag.",
+    "scope": {
+      "files": [
+        {
+          "path": ".github/workflows/ci.yml",
+          "operation": "modify"
+        },
+        {
+          "path": ".github/workflows/backend-release.yml",
+          "operation": "modify"
+        },
+        {
+          "path": ".github/workflows/cli-release.yml",
+          "operation": "modify"
+        },
+        {
+          "path": ".github/workflows/runner-release.yml",
+          "operation": "modify"
+        },
+        {
+          "path": ".github/workflows/mcp-release.yml",
+          "operation": "modify"
+        },
+        {
+          "path": "deploy/gate-image/Dockerfile",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In ci.yml and the four release workflows, change the install.sh URL tag and the installed version argument from v2.8.0 to v2.9.0."
+      },
+      {
+        "step": 2,
+        "description": "In deploy/gate-image/Dockerfile, change the GOLANGCI_LINT_VERSION ARG default from v2.8.0 to v2.9.0."
+      }
+    ],
+    "verification": {
+      "test_strategy": "CI's lint job installs v2.9.0 from the tagged script; a local gate-image build reports golangci-lint 2.9.0.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-all-sites",
+          "statement": "Every golangci-lint install site names v2.9.0 and the tagged install script.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94109"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\nindex 7e21c0a..4a90d1e 100644\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -145,2 +145,2 @@ jobs:\n-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \\\n-            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.8.0\n+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.9.0/install.sh \\\n+            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.9.0\ndiff --git a/.github/workflows/backend-release.yml b/.github/workflows/backend-release.yml\nindex c31f0b2..9e2d7a4 100644\n--- a/.github/workflows/backend-release.yml\n+++ b/.github/workflows/backend-release.yml\n@@ -176,2 +176,2 @@ jobs:\n-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \\\n-            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.8.0\n+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.9.0/install.sh \\\n+            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.9.0\ndiff --git a/.github/workflows/cli-release.yml b/.github/workflows/cli-release.yml\nindex 18ad3e9..f06b2c1 100644\n--- a/.github/workflows/cli-release.yml\n+++ b/.github/workflows/cli-release.yml\n@@ -73,2 +73,2 @@ jobs:\n-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \\\n-            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.8.0\n+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.9.0/install.sh \\\n+            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.9.0\ndiff --git a/.github/workflows/runner-release.yml b/.github/workflows/runner-release.yml\nindex a4c9e07..2b81f5d 100644\n--- a/.github/workflows/runner-release.yml\n+++ b/.github/workflows/runner-release.yml\n@@ -77,2 +77,2 @@ jobs:\n-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \\\n-            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.8.0\n+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.9.0/install.sh \\\n+            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.9.0\ndiff --git a/.github/workflows/mcp-release.yml b/.github/workflows/mcp-release.yml\nindex d27f4b8..61ce0a3 100644\n--- a/.github/workflows/mcp-release.yml\n+++ b/.github/workflows/mcp-release.yml\n@@ -75,2 +75,2 @@ jobs:\n-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \\\n-            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.8.0\n+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.9.0/install.sh \\\n+            | sh -s -- -b \"$(go env GOPATH)/bin\" v2.9.0\ndiff --git a/deploy/gate-image/Dockerfile b/deploy/gate-image/Dockerfile\nindex 5e6a1f2..8d3c0b7 100644\n--- a/deploy/gate-image/Dockerfile\n+++ b/deploy/gate-image/Dockerfile\n@@ -76,3 +76,3 @@ FROM debian:bookworm-slim\n ARG TARGETARCH\n-ARG GOLANGCI_LINT_VERSION=v2.8.0\n+ARG GOLANGCI_LINT_VERSION=v2.9.0\n ARG HELM_VERSION=v4.2.4\n",
+  "defect_phrases": [
+    "golangci-lint/v2.9.0/install.sh"
+  ],
+  "false_alarm_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "ci.yml: the golangci-lint install runs a downloaded script; consider verifying a checksum."
+    }
+  ]
+}

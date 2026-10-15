@@ -63,6 +63,13 @@ type reconciledStage struct {
 	// terminate-only on-demand verb, and kept off the wire (json:"-") so that
 	// endpoint's response shape is unchanged.
 	Redispatched bool `json:"-"`
+	// lostConfirmed is set when the lost-terminal flush (E72.64 / #4106)
+	// removed an entry because the round's terminal is now confirmed landed —
+	// its own append, or a probe that found the original or the named
+	// failure. It drives the implement-stage audit-complete republish even
+	// when nothing was appended (binding condition C2). Unexported, so off
+	// the wire.
+	lostConfirmed bool
 }
 
 // orphanedReviewStageKind describes one review-bearing stage's audit
@@ -122,7 +129,8 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // StageID). For a review whose latest started entry predates the current
 // process boot marker (s.processStart) with fewer landed terminals than
 // ConfiguredAgents, it emits the missing count of terminal *_review_failed
-// entries via the existing emitReviewFailed helper. That drives landed ==
+// entries via emitReviewFailedLocked (the stripe-lock variant of the shared
+// emitReviewFailed helper, E72.64 / #4106). That drives landed ==
 // ConfiguredAgents, so reviewStatusFor returns a terminal 'failed' status,
 // await_review resolves, and the operator can re-trigger. Mirrors the #1747
 // twin (detached runner dying pre-report → terminal failed) and reuses the
@@ -138,6 +146,15 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // round is synthesized failed with a reason naming the slug that refused it.
 // The on-demand POST /v0/runs/{run_id}/reviews/reconcile stays
 // terminate-only.
+//
+// Lost review terminals (E72.64 / #4106). Before the pending-redispatch and
+// boot-marker gates, each stage first flushes the named verdict_write_failed
+// entries THIS process registered for reviewers whose terminal write never
+// landed (flushLostReviewTerminalsLocked, review_terminal_write.go). It is the
+// one class of missing terminal the pass may close on a round this process
+// dispatched: the reviewer finished, only its audit write failed. The registry
+// is process-local, so at boot it holds only what the sweep's own refused
+// writes register; the on-demand verb is the caller it serves.
 //
 // Attempt correlation (the binding condition): a stage can accumulate several
 // review rounds (a fixup re-triggers the review, appending a fresh
@@ -351,7 +368,7 @@ func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runI
 			return out, emittedImplement, err
 		}
 		out = append(out, res)
-		if res.Synthesized > 0 && stage.isImplement {
+		if (res.Synthesized > 0 || res.lostConfirmed) && stage.isImplement {
 			emittedImplement = true
 		}
 	}
@@ -364,7 +381,9 @@ func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runI
 // per-stage outcome: the round's counts, and — when it healed nothing — the
 // gate that refused it, so the on-demand endpoint can report a reason instead
 // of a silent no-op. Every gate is unchanged from the #1781 boot sweep; only
-// the return type carries more.
+// the return type carries more. The one addition is the lost-terminal flush
+// (E72.64 / #4106) that runs ahead of the settled check and the gates — see
+// below.
 //
 // MUST be called under the run's reconcileEmitLockFor stripe lock: the
 // count-landed -> append-missing sequence below is not atomic on its own (see
@@ -423,10 +442,41 @@ func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uu
 		return out, err
 	}
 	out.LandedBefore = landed
+
+	// Lost review terminals (E72.64 / #4106). When THIS process holds named
+	// verdict_write_failed entries for the stage — a reviewer finished but its
+	// terminal write never landed, and the detached settle has not (yet)
+	// landed the stand-in — flush them now, under the stripe lock already
+	// held. Every store operation in the flush is a single bounded operation
+	// and it stops at the first failure, so the lock is never held across a
+	// retry backoff. It appends at most ConfiguredAgents - landed entries, so
+	// a still-running reviewer's share is never closed.
+	//
+	// It runs BEFORE the settled check (not only on a pending round) so a
+	// registered entry whose terminal already landed — a lost-ack commit, or
+	// a named failure committed under a lost acknowledgement — is confirmed
+	// and dropped, and the implement stage's audit-complete republish fires
+	// on that confirmation (binding condition C2). On a settled round the
+	// room cap means the flush can only drop or confirm, never append.
+	flushed := 0
+	if hasLostReviewTerminals(runID, stage.label) {
+		flushed, out.lostConfirmed = s.flushLostReviewTerminalsLocked(ctx, runID, stage, latest, payload, landed, defaultReviewTerminalWriteConfig)
+	}
+
 	if landed >= payload.ConfiguredAgents {
 		// Already settled for this round — idempotent no-op on a second pass.
 		// Takes precedence over the boot-marker gate below.
 		return skip(reconcileSkipAlreadySettled), nil
+	}
+	if flushed > 0 {
+		// The flushed named failures ARE this call's synthesis: report them
+		// (so the endpoint answers terminated:true and the implement stage
+		// republishes audit-complete) and stop. The pending-redispatch and
+		// boot-marker gates below are deliberately not consulted — a round this
+		// process dispatched may still have live reviewers, and their share
+		// stays theirs; only the lost slots were closed.
+		out.Synthesized = flushed
+		return out, nil
 	}
 
 	// Pending boot re-dispatch (#4077): the orphaned round is mid-handoff to a
@@ -477,9 +527,13 @@ func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uu
 		}
 		reason = orphanedReviewNotRedispatchedReason(slug)
 	}
+	// emitReviewFailedLocked (E72.64 / #4106): the stripe lock is held, so each
+	// synthesized terminal is one bounded append plus one bounded probe; a
+	// write the store refuses goes to the lost-terminal registry and its
+	// detached settle rather than holding the lock across a retry backoff.
 	missing := payload.ConfiguredAgents - landed
 	for i := 0; i < missing; i++ {
-		s.emitReviewFailed(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", reason, false)
+		s.emitReviewFailedLocked(ctx, runID, *latest.StageID, stage.failed, payload.Authority, "", reason, false)
 	}
 	out.Synthesized = missing
 	return out, nil
