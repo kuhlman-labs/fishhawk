@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
 
@@ -540,6 +541,46 @@ func TestClassifyPersonaTrial_RunsIngestControls(t *testing.T) {
 	}
 	if verb.Severity != "medium" || verb.SeverityClampedFrom != "high" || verb.QuoteUnverified {
 		t.Errorf("verbatim-quote concern = %+v, want medium clamped from high, quote verified (the forged marker scrubbed)", verb)
+	}
+}
+
+// TestClassifyPersonaTrialForRound_RunsConventionClamp (CF1): ONE medium
+// repo_convention concern with no quote. With NIL caps (no convention
+// rendered) the convention clamp stores it low, clamped from medium; the
+// persona's medium cap would never lower a medium concern, so only the clamp
+// can. With the convention rendered at medium it keeps medium; at low it is
+// held to low. ClassifyPersonaTrial is the nil-caps round.
+func TestClassifyPersonaTrialForRound_RunsConventionClamp(t *testing.T) {
+	resp := `{"verdict":"approve_with_concerns","concerns":[{"severity":"medium","category":"repo_convention","convention":"security-conventions","note":"breaks a convention"}]}`
+	rule := CatchRule{Clean: true}
+	tests := []struct {
+		name     string
+		caps     planreview.ConventionCaps
+		sev      string
+		clampedF string
+	}{
+		{"nil caps", nil, "low", "medium"},
+		{"convention rendered at medium", planreview.ConventionCaps{"security-conventions": "medium"}, "medium", ""},
+		{"convention rendered at low", planreview.ConventionCaps{"security-conventions": "low"}, "low", "medium"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trial := ClassifyPersonaTrialForRound(resp, rule, nil, "medium", tc.caps)
+			if trial.Outcome != CatchFalseAlarm || len(trial.Concerns) != 1 {
+				t.Fatalf("trial = %+v, want one stored false alarm", trial)
+			}
+			if got := trial.Concerns[0]; got.Severity != tc.sev || got.SeverityClampedFrom != tc.clampedF {
+				t.Errorf("stored concern = %+v, want severity %q clamped from %q", got, tc.sev, tc.clampedF)
+			}
+		})
+	}
+	if got := ClassifyPersonaTrial(resp, rule, nil, "medium").Concerns[0]; got.Severity != "low" || got.SeverityClampedFrom != "medium" {
+		t.Errorf("ClassifyPersonaTrial stored %+v, want the nil-caps clamp to low", got)
+	}
+	// A non-convention category is never touched by the clamp.
+	plain := ClassifyPersonaTrialForRound(`{"verdict":"approve_with_concerns","concerns":[{"severity":"medium","category":"decision_record","note":"x"}]}`, rule, nil, "medium", nil)
+	if got := plain.Concerns[0]; got.Severity != "medium" || got.SeverityClampedFrom != "" {
+		t.Errorf("decision_record concern = %+v, want untouched", got)
 	}
 }
 

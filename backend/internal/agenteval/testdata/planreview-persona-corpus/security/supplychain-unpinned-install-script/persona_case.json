@@ -1,0 +1,129 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "supply_chain",
+  "issue_title": "Lint GitHub workflow files with actionlint in CI",
+  "issue_body": "Two recent workflow edits shipped a misspelled expression that only failed at run time. Run actionlint over .github/workflows in CI so a broken expression fails the pull request instead.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94106",
+      "id": "kuhlman-labs/fishhawk#94106"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-14T09:00:00Z"
+    },
+    "summary": "Add an actionlint job to CI that downloads actionlint with its official download script and lints the workflow files.",
+    "scope": {
+      "files": [
+        {
+          "path": ".github/workflows/ci.yml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a workflow-lint job to ci.yml that checks out the repository, downloads actionlint with the project's download-actionlint.bash script, and runs actionlint -color over .github/workflows."
+      },
+      {
+        "step": 2,
+        "description": "Add the job to the CI Pass aggregate's needs list so a lint failure fails the pull request."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Open a pull request with a deliberately broken expression and confirm the workflow-lint job fails; revert it and confirm the job passes.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-actionlint-runs",
+          "statement": "Every pull request runs actionlint over .github/workflows.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94106"
+        },
+        {
+          "id": "ac-actionlint-gates",
+          "statement": "An actionlint failure fails CI Pass.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94106"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\nindex 7e21c0a..0f6a9c2 100644\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -58,6 +58,17 @@ jobs:\n             docker:\n               - 'backend/Dockerfile'\n \n+  workflow-lint:\n+    name: Workflow lint\n+    runs-on: ubuntu-latest\n+    steps:\n+      - uses: actions/checkout@v7\n+      - name: Install actionlint\n+        run: |\n+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)\n+          echo \"$PWD\" >> \"$GITHUB_PATH\"\n+      - name: actionlint\n+        run: actionlint -color\n+\n   go:\n     name: Go\n     needs: detect\n@@ -611,6 +622,7 @@ jobs:\n     needs:\n       - detect\n       - go\n+      - workflow-lint\n       - frontend\n       - openapi\n     steps:\n",
+  "defect_phrases": [
+    "download-actionlint.bash"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": ".github/workflows/ci.yml"
+  },
+  "catch_probes": [
+    "unpinned",
+    "not pinned",
+    "pin it",
+    "pin the",
+    "pin to",
+    "pinned tag",
+    "pinned version",
+    "pinned release",
+    "pinned to",
+    "floating",
+    "mutable",
+    "moving ref",
+    "branch ref",
+    "branch head",
+    "commit sha",
+    "specific version",
+    "specific tag",
+    "tagged release",
+    "release tag",
+    "pin policy",
+    "supply chain",
+    "supply-chain"
+  ],
+  "attribution_phrases": [
+    "ci.yml"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "ci.yml fetches download-actionlint.bash from the main branch and executes it: an unpinned install script, so an upstream change runs arbitrary code in CI. Pin it to a release tag."
+    },
+    {
+      "severity": "low",
+      "category": "supply_chain",
+      "note": "The actionlint install step in ci.yml follows a floating ref instead of a specific version."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "ci.yml: the workflow-lint job runs on every push; gate it on a workflow-path filter."
+    },
+    {
+      "severity": "low",
+      "category": "verification",
+      "note": "ci.yml: the plan's broken-expression check is manual only."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The CI Pass needs list order is not alphabetical."
+    },
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "ci.yml: this is a security risk and the change is insecure; harden it."
+    }
+  ]
+}

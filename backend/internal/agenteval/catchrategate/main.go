@@ -11,10 +11,12 @@
 // are read there.
 //
 // The arm table (agenteval) reads --corpus and --conventions (the conventions
-// arms) and --persona-corpus plus --repo-root (the architect persona arm,
-// whose remit and decision-record index are read from the checkout at
-// --repo-root). A legacy v1 record is refused naming the shared #4313/#4314
-// re-pin recording.
+// arms), --persona-corpus (the architect persona arm, whose remit and
+// decision-record index are read from the checkout at --repo-root) and
+// --security-corpus (the security and security_portability persona arms,
+// E80.17 / #4314, whose remit docs/review/security-remit.md and convention
+// docs/review/security-conventions.md are read from --repo-root). A legacy v1
+// record is refused naming the shared #4313/#4314 re-pin recording.
 //
 // --rescore is a DIAGNOSTIC, not a gate verdict (E55.22 / #4355): it
 // re-classifies the sidecar derived from --evidence under the CURRENT arm
@@ -70,6 +72,7 @@ const (
 	defaultCorpusRel      = "internal/agenteval/testdata/planreview-miss-corpus"
 	defaultConventionsRel = "internal/agenteval/testdata/planreview-catchrate/representative-conventions.md"
 	defaultPersonaRel     = "internal/agenteval/testdata/planreview-persona-corpus/architect"
+	defaultSecurityRel    = "internal/agenteval/testdata/planreview-persona-corpus/security"
 )
 
 func main() {
@@ -98,7 +101,8 @@ func gate(args []string, stdout, stderr io.Writer) (code int, passed bool) {
 	corpus := fs.String("corpus", "", "plan-review-miss corpus dir (default: the committed "+defaultCorpusRel+")")
 	conventions := fs.String("conventions", "", "representative conventions fixture (default: the committed "+defaultConventionsRel+")")
 	personaCorpus := fs.String("persona-corpus", "", "architect persona corpus dir (default: the committed "+defaultPersonaRel+")")
-	repoRoot := fs.String("repo-root", "", "checkout root the persona arm reads docs/review/architect-remit.md and docs/adr/ from (default: the parent of the backend module root)")
+	securityCorpus := fs.String("security-corpus", "", "security persona corpus dir, markers.json at its root (default: the committed "+defaultSecurityRel+")")
+	repoRoot := fs.String("repo-root", "", "checkout root the persona arms read docs/review/architect-remit.md, docs/adr/, docs/review/security-remit.md and docs/review/security-conventions.md from (default: the parent of the backend module root)")
 	printFingerprint := fs.Bool("print-fingerprint", false, "print the CURRENT prompt fingerprint and exit 0 (compare with the record's prompt_fingerprint to confirm staleness)")
 	rescore := fs.Bool("rescore", false, "re-score the trial sidecar derived from --evidence under the CURRENT --corpus and catch rule and print the report (a diagnostic per-arm LOWER BOUND, never a PASS; never writes evidence); exits 0")
 	fs.Usage = func() {
@@ -109,9 +113,11 @@ and its per-trial sidecar beside it (<evidence stem>.trials.json, e.g.
 evidence.trials.json; derived from --evidence, never a separate flag).
 Exit 0: the evidence passes. Exit 1: the gate fails (reason on stderr). Exit 2: usage.
 
-The arms: without_conventions and with_conventions (--corpus, --conventions)
-and architect (--persona-corpus, documents read under --repo-root). A legacy
-v1 record is refused: re-record every arm in the shared #4313/#4314 re-pin.
+The arms: without_conventions and with_conventions (--corpus, --conventions),
+architect (--persona-corpus), and security and security_portability
+(--security-corpus; the security remit and convention), the persona documents
+read under --repo-root. A legacy v1 record is refused: re-record every arm in
+the shared #4313/#4314 re-pin.
 
 --rescore is a diagnostic, not a gate verdict: it re-classifies the recorded
 trial sidecar under the CURRENT arm table and catch rule with no model call and
@@ -137,7 +143,7 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		fs.Usage()
 		return 2, false
 	}
-	if *evidence == "" || *corpus == "" || *conventions == "" || *personaCorpus == "" || *repoRoot == "" {
+	if *evidence == "" || *corpus == "" || *conventions == "" || *personaCorpus == "" || *securityCorpus == "" || *repoRoot == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "catchrategate: %v\n", err)
@@ -152,9 +158,11 @@ Operator run-book: docs/compliance/planreview-catchrate-evidence.md
 		defaultTo(corpus, filepath.Join(root, defaultCorpusRel))
 		defaultTo(conventions, filepath.Join(root, defaultConventionsRel))
 		defaultTo(personaCorpus, filepath.Join(root, defaultPersonaRel))
+		defaultTo(securityCorpus, filepath.Join(root, defaultSecurityRel))
 		defaultTo(repoRoot, filepath.Dir(root))
 	}
-	inputs := agenteval.CatchRateInputs{CorpusDir: *corpus, ConventionsPath: *conventions, PersonaCorpusDir: *personaCorpus, RepoRoot: *repoRoot}
+	inputs := agenteval.CatchRateInputs{CorpusDir: *corpus, ConventionsPath: *conventions, PersonaCorpusDir: *personaCorpus,
+		SecurityCorpusDir: *securityCorpus, RepoRoot: *repoRoot}
 	model := agenteval.DefaultCatchRateGeneratorModel
 
 	if *printFingerprint {
@@ -210,7 +218,7 @@ func findBackendRoot(dir string) (string, error) {
 			}
 		}
 		if parent := filepath.Dir(d); parent == d {
-			return "", fmt.Errorf("cannot locate the backend module root (a go.mod declaring %s) from %s: run inside the checkout or pass --evidence, --corpus, --conventions, --persona-corpus and --repo-root", backendModulePath, dir)
+			return "", fmt.Errorf("cannot locate the backend module root (a go.mod declaring %s) from %s: run inside the checkout or pass --evidence, --corpus, --conventions, --persona-corpus, --security-corpus and --repo-root", backendModulePath, dir)
 		}
 	}
 }

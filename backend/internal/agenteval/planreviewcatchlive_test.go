@@ -11,8 +11,9 @@ import (
 )
 
 // The LIVE plan-review catch-rate measurement (E55.4 / #2245): EVERY arm of
-// the evidence arm table — the two conventions arms and the architect persona
-// arm (E78.11 / #4313) — in ONE recording.
+// the evidence arm table — the two conventions arms, the architect persona
+// arm (E78.11 / #4313) and the security and security_portability persona arms
+// (E80.17 / #4314) — in ONE recording.
 //
 // IT SKIPS IN EVERY IN-LOOP RUN: the runner sanitizes gate-subprocess
 // environments through a default-deny allow-list that names ANTHROPIC_API_KEY
@@ -21,8 +22,9 @@ import (
 // The committed testdata/planreview-catchrate/evidence.json and its per-trial
 // sidecar evidence.trials.json (agenteval.CatchRateTrialsPath) are written
 // together by a recording run; a change to the corpus, the conventions
-// fixture, the persona corpus, the architect remit or decision record, the
-// rendered plan-review or persona prompt, or the catch rule makes the
+// fixture, the persona corpora, the architect remit or decision record, the
+// security remit, convention or markers.json, the rendered plan-review or
+// persona prompt, or the catch rule makes the
 // committed pair STALE, and the standing check fails closed on a review-prompt
 // change until an operator re-records it. The operator walk is
 // docs/compliance/planreview-catchrate-evidence.md.
@@ -46,7 +48,7 @@ const planReviewCatchEvidencePath = "testdata/planreview-catchrate/evidence.json
 func planReviewCatchLiveGate(t *testing.T) liveCredential {
 	t.Helper()
 	if os.Getenv("FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE") == "" {
-		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's arm-keyed evidence (both conventions arms and the #4313 architect arm) is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
+		t.Skip("set FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 to run the live plan-review catch-rate arms on " + DefaultCatchRateGeneratorModel + ". Until they run and an operator records the baseline, #2245's arm-keyed evidence (both conventions arms, the #4313 architect arm and the #4314 security and security_portability arms) is UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md.")
 	}
 	return requireLiveCredential(t, "Skipping the live plan-review catch-rate arms. #2245's arm-keyed evidence remains UNMEASURED — see docs/compliance/planreview-catchrate-evidence.md. The runner denies ANTHROPIC_API_KEY to gate subprocesses by design (runner gateenv.go), so this arm is operator-executed, never in-loop.")
 }
@@ -156,9 +158,14 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), DefaultCatchRateGeneratorModel); err != nil {
 		t.Errorf("CheckCatchRateEvidence on the recorded evidence: %v", err)
 	}
-	// (iii-b) every arm of the arm table was recorded, the architect arm as a
-	// persona arm whose trials the scripted sender answered per case.
-	for arm, kind := range map[string]string{"without_conventions": "conventions", "with_conventions": "conventions", "architect": "persona"} {
+	// (iii-b) every arm of the arm table was recorded — five arms — the
+	// architect and both security arms as persona arms whose trials the
+	// scripted sender answered per case.
+	if len(rec.Arms) != 5 {
+		t.Errorf("the recording carries %d arms %v, want 5", len(rec.Arms), sortedArmNames(rec.Arms))
+	}
+	for arm, kind := range map[string]string{"without_conventions": "conventions", "with_conventions": "conventions", "architect": "persona",
+		"security": "persona", "security_portability": "persona"} {
 		a, ok := rec.Arms[arm]
 		if !ok {
 			t.Errorf("the recording carries no %q arm", arm)
@@ -171,6 +178,14 @@ func TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	arch := pooledClassCounts(rec.Arms["architect"].PerCase)
 	if arch.catchTrials == 0 || arch.caught != arch.catchTrials || arch.cleanTrials == 0 || arch.alarms != 0 {
 		t.Errorf("architect arm counts = %+v, want every catch trial caught and no clean-case alarm", arch)
+	}
+	sec := pooledClassCounts(rec.Arms["security"].PerCase)
+	if sec.catchTrials == 0 || sec.caught != sec.catchTrials || sec.cleanTrials == 0 || sec.alarms != 0 {
+		t.Errorf("security arm counts = %+v, want every catch trial caught and no clean-case alarm", sec)
+	}
+	port := pooledClassCounts(rec.Arms["security_portability"].PerCase)
+	if port.catchTrials != 0 || port.cleanTrials == 0 || port.alarms != 0 {
+		t.Errorf("security_portability arm counts = %+v, want clean trials only and no alarm", port)
 	}
 
 	// (iv) the constant, and the defaults it must NOT have moved.
