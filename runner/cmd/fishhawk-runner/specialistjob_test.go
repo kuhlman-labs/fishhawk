@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -240,6 +243,13 @@ type fakeSJBackend struct {
 	// and moves the job to stateAfterConflict (an ambiguous retry).
 	resultConflict     bool
 	stateAfterConflict string
+	// attestKey is delivered as attestation_key on the admitting answer only
+	// (never on a heartbeat), as the server does for an attester.
+	attestKey string
+	// resultRefusal, when set, answers every result POST 401 with this body.
+	resultRefusal string
+	auths         []string
+	resultSigs    []string
 }
 
 func newFakeSJBackend(t *testing.T, job upload.SpecialistJob) (*fakeSJBackend, *httptest.Server) {
@@ -253,6 +263,7 @@ func newFakeSJBackend(t *testing.T, job upload.SpecialistJob) (*fakeSJBackend, *
 func (b *fakeSJBackend) serve(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.auths = append(b.auths, r.Header.Get("Authorization"))
 	base := "/v0/specialist-jobs/" + b.job.JobID
 	writeJSON := func(v any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -272,6 +283,8 @@ func (b *fakeSJBackend) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		case b.nonce == "":
 			b.nonce = in.Nonce
+			writeJSON(upload.SpecialistJobAdmission{Admitted: true, ExecutionNonce: in.Nonce, Job: b.job, AttestationKey: b.attestKey})
+			return
 		case in.Nonce == b.nonce:
 			b.heartbeats++
 			if b.heartbeats == 1 {
@@ -286,6 +299,12 @@ func (b *fakeSJBackend) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == base+"/result":
 		raw, _ := io.ReadAll(r.Body)
 		b.results = append(b.results, raw)
+		b.resultSigs = append(b.resultSigs, r.Header.Get("X-Fishhawk-Signature"))
+		if b.resultRefusal != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, b.resultRefusal)
+			return
+		}
 		if b.resultConflict {
 			b.job.State = b.stateAfterConflict
 			w.WriteHeader(http.StatusConflict)
@@ -324,6 +343,7 @@ func useTestSJDeps(t *testing.T, mut func(*specialistJobDeps)) {
 	sjDeps = d
 	t.Cleanup(func() { sjDeps = prev })
 	t.Setenv("FISHHAWK_API_TOKEN", "test-operator-token")
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "")
 }
 
 func runSJSubcommand(srvURL, workingDir string) (int, string) {
@@ -406,6 +426,7 @@ func TestSpecialistJob_AdmissionTimeoutLeavesQueued(t *testing.T) {
 
 func TestSpecialistJob_UsageErrors(t *testing.T) {
 	t.Setenv("FISHHAWK_API_TOKEN", "")
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "")
 	for _, args := range [][]string{
 		{"specialist-job"},
 		{"specialist-job", "--job-id", "j", "--backend-url", "http://x", "--working-dir", "rel", "--host", "h"},
@@ -733,6 +754,211 @@ func TestSpecialistJob_AmbiguousNotRunningReReadsJob(t *testing.T) {
 		b.resultConflict, b.stateAfterConflict = true, tc.state
 		if code, log := runSJSubcommand(srv.URL, t.TempDir()); code != tc.want {
 			t.Fatalf("job re-read as %s: exit %d, want %d; log %s", tc.state, code, tc.want, log)
+		}
+	}
+}
+
+// ---- Result attestation (E85.15 / #4363) ----
+
+// sjTestAttestKey is a fixed job-scoped key as an attester's admission
+// delivers it (base64 std of the 64-byte private key).
+func sjTestAttestKey(t *testing.T) (ed25519.PrivateKey, string) {
+	t.Helper()
+	seed := bytes.Repeat([]byte{0x5a}, ed25519.SeedSize)
+	priv := ed25519.NewKeyFromSeed(seed)
+	return priv, base64.StdEncoding.EncodeToString(priv)
+}
+
+// runSJAttestJob registers a pass executor and drives the subcommand against
+// b; the caller sets the env first.
+func runSJAttestJob(t *testing.T, b *fakeSJBackend, srvURL string) (int, string) {
+	t.Helper()
+	specialistJobExecutors["sj_attest_kind"] = func(ctx context.Context, r *specialistJobRun) specialistJobOutcome {
+		return specialistJobOutcome{Verdict: sjVerdictPass, Evidence: map[string]any{"ok": true}}
+	}
+	t.Cleanup(func() { delete(specialistJobExecutors, "sj_attest_kind") })
+	return runSJSubcommand(srvURL, t.TempDir())
+}
+
+func newAttestSJBackend(t *testing.T) (*fakeSJBackend, string) {
+	t.Helper()
+	b, srv := newFakeSJBackend(t, upload.SpecialistJob{JobID: sjTestJobID, Kind: "sj_attest_kind", State: "queued", Inputs: json.RawMessage(`{}`)})
+	return b, srv.URL
+}
+
+// TestParseSpecialistJobFlags_PrefersAttestToken: the runner attestation
+// token wins when set; either variable alone suffices; neither is a usage
+// error naming both.
+func TestParseSpecialistJobFlags_PrefersAttestToken(t *testing.T) {
+	args := []string{"--job-id", "j", "--backend-url", "http://x/", "--working-dir", "/abs", "--host", "h"}
+	for _, tc := range []struct {
+		attest, operator, wantToken, wantSource string
+	}{
+		{"attest-tok", "op-tok", "attest-tok", "FISHHAWK_RUNNER_ATTEST_TOKEN"},
+		{"attest-tok", "", "attest-tok", "FISHHAWK_RUNNER_ATTEST_TOKEN"},
+		{"", "op-tok", "op-tok", "FISHHAWK_API_TOKEN"},
+	} {
+		t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", tc.attest)
+		t.Setenv("FISHHAWK_API_TOKEN", tc.operator)
+		f, err := parseSpecialistJobFlags(args, io.Discard)
+		if err != nil || f.token != tc.wantToken || f.tokenSource != tc.wantSource || f.backendURL != "http://x" {
+			t.Fatalf("attest=%q operator=%q: token=%q source=%q err=%v; want %q from %s", tc.attest, tc.operator, f.token, f.tokenSource, err, tc.wantToken, tc.wantSource)
+		}
+	}
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "")
+	t.Setenv("FISHHAWK_API_TOKEN", "")
+	if _, err := parseSpecialistJobFlags(args, io.Discard); err == nil ||
+		!strings.Contains(err.Error(), "FISHHAWK_RUNNER_ATTEST_TOKEN") || !strings.Contains(err.Error(), "FISHHAWK_API_TOKEN") {
+		t.Fatalf("no token: err = %v, want a usage error naming both variables", err)
+	}
+}
+
+// TestExecuteSpecialistJob_SignsWithAdmissionKey: the admission delivers a
+// key; every call rides the attestation token; the one shipped result carries
+// a signature that verifies over its exact bytes; the log never names the key.
+func TestExecuteSpecialistJob_SignsWithAdmissionKey(t *testing.T) {
+	useTestSJDeps(t, nil)
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "runner-attest-token")
+	priv, keyB64 := sjTestAttestKey(t)
+	b, url := newAttestSJBackend(t)
+	b.attestKey = keyB64
+	code, log := runSJAttestJob(t, b, url)
+	if code != exitOK {
+		t.Fatalf("exit %d, log %s", code, log)
+	}
+	b.mu.Lock()
+	results, sigs, auths := append([][]byte(nil), b.results...), append([]string(nil), b.resultSigs...), append([]string(nil), b.auths...)
+	b.mu.Unlock()
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	sig, err := hex.DecodeString(sigs[0])
+	if err != nil || !ed25519.Verify(priv.Public().(ed25519.PublicKey), upload.SpecialistJobResultMessage(sjTestJobID, results[0]), sig) {
+		t.Fatalf("result signature %q does not verify over the shipped body (%v)", sigs[0], err)
+	}
+	for i, a := range auths {
+		if a != "Bearer runner-attest-token" {
+			t.Fatalf("request %d authenticated %q, want the runner attestation token", i, a)
+		}
+	}
+	if strings.Contains(log, "specialist_job_attestation_degraded") {
+		t.Fatalf("a delivered key logged a degrade: %s", log)
+	}
+}
+
+// TestExecuteSpecialistJob_UndecodableKeyShipsUnsigned: no key, a non-base64
+// key, a wrong-length key and a key whose public half does not match its seed
+// each log specialist_job_attestation_degraded with its reason and ship ONE
+// unsigned result.
+func TestExecuteSpecialistJob_UndecodableKeyShipsUnsigned(t *testing.T) {
+	priv, _ := sjTestAttestKey(t)
+	mismatched := append(ed25519.PrivateKey(nil), priv...)
+	mismatched[63] ^= 0xff
+	for _, tc := range []struct {
+		name, key, reason string
+	}{
+		{"no key", "", sjAttestNoKey},
+		{"not base64", "!!not-base64!!", sjAttestKeyUndecodable},
+		{"wrong length", base64.StdEncoding.EncodeToString(priv[:32]), sjAttestKeyUndecodable},
+		{"public half mismatch", base64.StdEncoding.EncodeToString(mismatched), sjAttestKeyUndecodable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useTestSJDeps(t, nil)
+			t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "runner-attest-token")
+			b, url := newAttestSJBackend(t)
+			b.attestKey = tc.key
+			code, log := runSJAttestJob(t, b, url)
+			if code != exitOK {
+				t.Fatalf("exit %d, log %s", code, log)
+			}
+			b.mu.Lock()
+			n, sigs := len(b.results), append([]string(nil), b.resultSigs...)
+			b.mu.Unlock()
+			if n != 1 || sigs[0] != "" {
+				t.Fatalf("results %d signatures %q, want one unsigned result", n, sigs)
+			}
+			if !strings.Contains(log, "specialist_job_attestation_degraded") || !strings.Contains(log, tc.reason) {
+				t.Fatalf("log does not name the degrade with reason %s: %s", tc.reason, log)
+			}
+			if tc.key != "" && strings.Contains(log, tc.key) {
+				t.Fatalf("log carries the key material: %s", log)
+			}
+		})
+	}
+}
+
+// TestExecuteSpecialistJob_NeverLogsAttestationKey: neither the base64 key
+// the admission delivered nor its hex form nor its seed reaches the log sink,
+// on the signed path or on a refused shipment.
+func TestExecuteSpecialistJob_NeverLogsAttestationKey(t *testing.T) {
+	priv, keyB64 := sjTestAttestKey(t)
+	for _, refuse := range []bool{false, true} {
+		useTestSJDeps(t, nil)
+		t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "runner-attest-token")
+		b, url := newAttestSJBackend(t)
+		b.attestKey = keyB64
+		if refuse {
+			b.resultRefusal = `{"error":{"code":"specialist_job_attestation_invalid","details":{"reason":"signature_invalid"}}}`
+		}
+		_, log := runSJAttestJob(t, b, url)
+		for _, secret := range []string{keyB64, hex.EncodeToString(priv), hex.EncodeToString(priv.Seed()), base64.StdEncoding.EncodeToString(priv.Seed())} {
+			if strings.Contains(log, secret) {
+				t.Fatalf("refuse=%v: log carries attestation key material: %s", refuse, log)
+			}
+		}
+		if !strings.Contains(log, `"attestation_key":"true"`) {
+			t.Fatalf("refuse=%v: admission log does not record that a key was delivered: %s", refuse, log)
+		}
+	}
+}
+
+// TestExecuteSpecialistJob_AttestationRefusalIsPermanent: a 401
+// specialist_job_attestation_invalid on the signed result exits 1 with the
+// reason and does NOT re-ship unsigned — exactly one (signed) result POST.
+func TestExecuteSpecialistJob_AttestationRefusalIsPermanent(t *testing.T) {
+	useTestSJDeps(t, nil)
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "runner-attest-token")
+	_, keyB64 := sjTestAttestKey(t)
+	b, url := newAttestSJBackend(t)
+	b.attestKey = keyB64
+	b.resultRefusal = `{"error":{"code":"specialist_job_attestation_invalid","details":{"reason":"attestation_expired"}}}`
+	code, log := runSJAttestJob(t, b, url)
+	if code != exitFailure || !strings.Contains(log, "attestation_expired") {
+		t.Fatalf("exit %d, log %s; want exitFailure naming the refusal reason", code, log)
+	}
+	b.mu.Lock()
+	n, sigs := len(b.results), append([]string(nil), b.resultSigs...)
+	b.mu.Unlock()
+	if n != 1 || sigs[0] == "" {
+		t.Fatalf("result POSTs %d signatures %q, want exactly one signed POST and no unsigned re-ship", n, sigs)
+	}
+}
+
+// TestDecodeSpecialistJobAttestationKey: each refusal row isolates ONE guard.
+// "valid key + trailing garbage" decodes all 64 bytes before the base64 error,
+// so only the error check refuses it; the 16-byte key passes base64, so only
+// the length check refuses it (without it key.Seed() panics); the mismatched
+// key is base64 and 64 bytes, so only the seed/public-half check refuses it.
+func TestDecodeSpecialistJobAttestationKey(t *testing.T) {
+	t.Parallel()
+	priv, keyB64 := sjTestAttestKey(t)
+	mismatched := append(ed25519.PrivateKey(nil), priv...)
+	mismatched[40] ^= 0x01
+	got, err := decodeSpecialistJobAttestationKey(keyB64)
+	if err != nil || !bytes.Equal(got, priv) {
+		t.Fatalf("valid key: %v", err)
+	}
+	for _, tc := range []struct{ name, in, want string }{
+		{"valid key + trailing garbage", keyB64 + "!", "not base64"},
+		{"short key", base64.StdEncoding.EncodeToString(priv[:16]), "16 bytes"},
+		{"public half mismatch", base64.StdEncoding.EncodeToString(mismatched), "does not match its seed"},
+	} {
+		k, err := decodeSpecialistJobAttestationKey(tc.in)
+		if err == nil || k != nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%s: key=%v err=%v, want refusal naming %q", tc.name, k != nil, err, tc.want)
+		}
+		if strings.Contains(err.Error(), keyB64) || strings.Contains(err.Error(), hex.EncodeToString(priv)) {
+			t.Fatalf("%s: error carries key material: %v", tc.name, err)
 		}
 	}
 }
