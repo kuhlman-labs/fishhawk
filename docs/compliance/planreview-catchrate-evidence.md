@@ -446,17 +446,20 @@ to use it as a probe.
 
 ### Arm-keyed results (E78.11 / #4313 on)
 
-Pending the #4313 re-pin recording (#4314 records separately after it); one row per recording,
+One row per recording,
 naming every arm. The architect columns are catch (catch cases) and false
 alarm (clean cases).
 
 | Recorded at | Generator model | Without conventions | With conventions | Architect catch | Architect false alarm | Other arms | Pinned baseline | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10-14 | `claude-sonnet-5-5` | 133/144 (0.924) | 130/144 (0.903) | 106/138 (0.768) | 32/138 (0.232) | — | pinned (#4313: arm-keyed v2, catch rule v5; v1 not comparable) | PASS (delta +0.021) |
+| 2026-10-15 | `claude-sonnet-5-5` | 137/144 (0.951) | 135/144 (0.938) | 105/138 (0.761) | 28/138 (0.203) | `security` catch 204/204 (1.000), false alarm 3/136 (0.022; trials: security_lens 0, other_category 2, undecodable 1); `security_portability` false alarm 3/136 (0.022; trials: security_lens 1, other_category 1, undecodable 1) | pinned (#4314: security + security_portability arms added; the #4313 arm set is not comparable) | PASS (delta +0.014) |
 
-The #4314 re-pin recording adds a row whose "Other arms" column names
-`security` catch and false alarm (with its security_lens / other_category
-split) and `security_portability` false alarm; pending the operator.
+The #4314 row's "Other arms" column names `security` catch and false alarm
+(with its security_lens / other_category trial split; the remainder of each
+false-alarm count is undecodable trials) and `security_portability` false
+alarm. All six security catch cases sit at ceiling (34/34 each), accepted by
+Captain ruling 2026-10-14; a harder corpus is #4402.
 
 ### Calibration dry runs
 
@@ -468,3 +471,5 @@ split) and `security_portability` false alarm; pending the operator.
 | 2026-10-14 | `architect` | 30 | adr006 29/30 and adr091 29/30 ABOVE band; undeclared 10/30 in band. Recorded as-is per Captain ruling (no fix-up budget left). **Variance flag:** adr006 was unchanged since the previous run yet moved 23/30 → 29/30, and clean-sqlc false alarms moved 1/30 → 6/30, so at 30 samples the band is not a stable gate for this arm. The recording (46 per case: adr006 41/46, adr091 45/46, undeclared 20/46; false alarms sqlc 3/46, workflow-v2 1/46, declared pair 28/46) is the measurement of record; #4398 tracks the empty-applies_to gap behind adr091's bimodality | PR #4396 comments (head `77c989e6`) |
 | 2026-10-14 | `security` | 30 | all six catch cases 30/30 (ceiling, accepted by Captain: a ceiling case still detects a recall drop); clean-redaction 30/30 FA, clean-policy-test-only 0-1/30; clean cases reworked, re-calibration pending operator | routed fix-up concern (head `69549c71`) |
 | 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |
+| 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
+| 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
