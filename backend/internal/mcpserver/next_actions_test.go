@@ -1287,14 +1287,14 @@ func TestNextActions_CIFailedFoldsDriveNextActionFirst(t *testing.T) {
 	}
 }
 
-// TestNextActions_SliceIntegrationConflict pins the ADR-041 / #1142 arm:
-// a decomposed PARENT whose implement (awaiting_children) stage failed
-// category-B with the stable "slice integration conflict" reason prefix
-// classifies slices_integration_conflict and points fishhawk_resume_run at
-// the CONFLICTING child via a field-path POINTER into the structured
-// slice_integration_conflict audit payload (conflicting_child_run_id) — the
-// resume target is sourced from structured data, NOT parsed from the reason
-// string. (The field-path-pointer idiom mirrors ci_failed's concern_ids.)
+// TestNextActions_SliceIntegrationConflict pins the ADR-041 / #1142 arm as
+// re-routed by #4343: a decomposed PARENT whose implement (awaiting_children)
+// stage failed category-B with the stable "slice integration conflict" reason
+// prefix classifies slices_integration_conflict and names a RESTART
+// (fishhawk_start_run, consuming a new run). It must NOT name
+// fishhawk_resume_run: the conflicting child always SUCCEEDED, and the backend
+// refuses to re-drive a succeeded child (recovery_not_eligible). The reason
+// names the campaign-item restart and the gate view's fan_in_conflict block.
 func TestNextActions_SliceIntegrationConflict(t *testing.T) {
 	run := naRun("failed")
 	stages := []Stage{
@@ -1307,11 +1307,22 @@ func TestNextActions_SliceIntegrationConflict(t *testing.T) {
 	if na.State != "slices_integration_conflict" {
 		t.Fatalf("state = %q, want slices_integration_conflict", na.State)
 	}
-	resume := findAction(t, na, "fishhawk_resume_run")
-	// The resume target is a field-path pointer at the STRUCTURED audit
-	// field, never the reason string.
-	if got := resume.Params["parent_run_id"]; !strings.Contains(got, "slice_integration_conflict") || !strings.Contains(got, "conflicting_child_run_id") {
-		t.Errorf("resume params.parent_run_id = %q, want a field-path pointer into the slice_integration_conflict audit payload's conflicting_child_run_id", got)
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_resume_run" {
+			t.Errorf("actions = %v, want NO fishhawk_resume_run: the backend refuses to re-drive the succeeded conflicting child", actionNames(na))
+		}
+	}
+	restart := findAction(t, na, "fishhawk_start_run")
+	if restart.Consumes != consumesNewRun {
+		t.Errorf("fishhawk_start_run consumes = %q, want %q", restart.Consumes, consumesNewRun)
+	}
+	if restart.Params["repo"] != run.Repo || restart.Params["workflow_id"] != run.WorkflowID {
+		t.Errorf("fishhawk_start_run params = %v, want repo %q + workflow_id %q", restart.Params, run.Repo, run.WorkflowID)
+	}
+	for _, want := range []string{"fishhawk_start_campaign_item_run", "fan_in_conflict", "base_attribution", "approval conditions"} {
+		if !strings.Contains(restart.Reason, want) {
+			t.Errorf("reason = %q, want it to carry %q", restart.Reason, want)
+		}
 	}
 }
 

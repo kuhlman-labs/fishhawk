@@ -2900,3 +2900,309 @@ func TestBuildGateView_DoesNotReadSpecialistJobs(t *testing.T) {
 		t.Fatalf("buildGateView read specialist jobs (calls=%d)", store.calls)
 	}
 }
+
+// --- fan_in_conflict (#4343) ---------------------------------------------
+
+// seedFanInRow seeds one run-level audit row at an explicit sequence. Rows
+// must be seeded in ascending sequence order: the fake returns seeded rows in
+// insertion order, as the real repository returns them sequence-ascending.
+func seedFanInRow(au *auditFake, runID uuid.UUID, category string, seq int64, payload string) {
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		Sequence: seq, RunID: &rid, Category: category, Payload: json.RawMessage(payload),
+	})
+}
+
+// fanInConflictedPayload is a slices_integrated row whose base fold conflicted
+// with slice 1 on c.go, as the orchestrator writes it.
+func fanInConflictedPayload(childID uuid.UUID) string {
+	return `{"child_run_ids":["` + childID.String() + `"],"consolidated_branch":"fishhawk/run-x-consolidated",` +
+		`"base_ref":"main","base_sha":"basesha2","base_fold_outcome":"conflict",` +
+		`"base_fold_conflict":{"conflicting_slice_index":1,"conflicting_child_run_id":"` + childID.String() + `",` +
+		`"conflicting_base_paths":["c.go"],"base_attribution":"paths_overlap","compare_truncated":false}}`
+}
+
+// fanInOutcomePayload is a slices_integrated row with the given fold outcome
+// and no conflict member.
+func fanInOutcomePayload(outcome string) string {
+	return `{"base_ref":"main","base_sha":"basesha3","base_fold_outcome":"` + outcome + `"}`
+}
+
+// fanInSliceConflictPayload is a slice_integration_conflict row naming slice 1.
+func fanInSliceConflictPayload(childID uuid.UUID) string {
+	return `{"parent_stage_id":"` + uuid.NewString() + `","conflicting_slice_index":1,` +
+		`"conflicting_child_run_id":"` + childID.String() + `","base_sha":"basesha2",` +
+		`"conflicting_base_paths":["c.go"],"base_attribution":"paths_overlap","compare_truncated":true}`
+}
+
+// assertBaseFoldBlock asserts a base_fold_conflict block attributed to slice 1
+// / childID / c.go at seq, with the rebase remedy.
+func assertBaseFoldBlock(t *testing.T, fc *gateViewFanInConflict, childID uuid.UUID, seq int64) {
+	t.Helper()
+	if fc == nil {
+		t.Fatal("fan_in_conflict absent, want the unresolved base_fold_conflict")
+	}
+	if fc.Kind != fanInConflictKindBaseFold || fc.Sequence != seq || fc.BaseRef != "main" || fc.BaseSHA != "basesha2" {
+		t.Errorf("block = %+v, want base_fold_conflict at seq %d on main@basesha2", fc, seq)
+	}
+	if fc.ConflictingSliceIndex == nil || *fc.ConflictingSliceIndex != 1 || fc.ConflictingChildRunID != childID.String() {
+		t.Errorf("attribution = (%v, %q), want (1, %s)", fc.ConflictingSliceIndex, fc.ConflictingChildRunID, childID)
+	}
+	if fc.BaseAttribution != "paths_overlap" || !slices.Equal(fc.ConflictingBasePaths, []string{"c.go"}) {
+		t.Errorf("base = (%q, %v), want (paths_overlap, [c.go])", fc.BaseAttribution, fc.ConflictingBasePaths)
+	}
+	if !strings.Contains(fc.Remedy, "fishhawk_rebase_run_branch") || !strings.Contains(fc.Remedy, "conflict-resolution pass") {
+		t.Errorf("remedy = %q, want it to name fishhawk_rebase_run_branch and the conflict-resolution pass", fc.Remedy)
+	}
+}
+
+func TestGateView_FanInConflict_BaseFoldShown(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	child := uuid.New()
+	seedFanInRow(au, runID, "slices_integrated", 10, fanInOutcomePayload("deferred_children_in_flight"))
+	seedFanInRow(au, runID, "slices_integrated", 20, fanInConflictedPayload(child))
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	assertBaseFoldBlock(t, resp.FanInConflict, child, 20)
+	if slices.Contains(resp.HistoryGaps, gateViewGapFanIn) {
+		t.Errorf("gaps = %v, want no fan_in gap", resp.HistoryGaps)
+	}
+}
+
+// TestGateView_FanInConflict_NoOpPassDoesNotSupersede pins approval condition
+// C1: a no-op pass after the conflict (a repeated consolidate or
+// /integrate-wave writes not_attempted; an unsettled one writes
+// deferred_children_in_flight) did not fold, so the head is still behind and
+// the block must stay observable with its attribution and remedy.
+func TestGateView_FanInConflict_NoOpPassDoesNotSupersede(t *testing.T) {
+	for _, outcome := range []string{"not_attempted", "deferred_children_in_flight"} {
+		t.Run(outcome, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			child := uuid.New()
+			seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(child))
+			seedFanInRow(au, runID, "slices_integrated", 20, fanInOutcomePayload(outcome))
+			seedFanInRow(au, runID, "slices_integrated", 30, fanInOutcomePayload(outcome))
+			assertBaseFoldBlock(t, decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict, child, 10)
+		})
+	}
+}
+
+// TestGateView_FanInConflict_SupersededByLandedFold pins C1 (i): a newer
+// slices_integrated whose fold actually landed supersedes the conflict.
+func TestGateView_FanInConflict_SupersededByLandedFold(t *testing.T) {
+	for _, outcome := range []string{"merged", "created_at_tip"} {
+		t.Run(outcome, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+			seedFanInRow(au, runID, "slices_integrated", 20, fanInOutcomePayload("not_attempted"))
+			seedFanInRow(au, runID, "slices_integrated", 30, fanInOutcomePayload(outcome))
+			if fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict; fc != nil {
+				t.Errorf("block = %+v, want nil once a newer fold landed (%s)", fc, outcome)
+			}
+		})
+	}
+}
+
+// TestGateView_FanInConflict_SupersededByNewerBranchRebased pins C1 (ii).
+func TestGateView_FanInConflict_SupersededByNewerBranchRebased(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+	seedFanInRow(au, runID, CategoryBranchRebased, 20, `{"new_head_sha":"h2"}`)
+	if fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict; fc != nil {
+		t.Errorf("block = %+v, want nil after a newer branch_rebased", fc)
+	}
+}
+
+// TestGateView_FanInConflict_SupersededByNewerConflictResolutionPushed pins C1
+// (ii) for the agent pass's success marker.
+func TestGateView_FanInConflict_SupersededByNewerConflictResolutionPushed(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+	seedFanInRow(au, runID, CategoryConflictResolutionPushed, 20, `{"head_sha":"h2"}`)
+	if fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict; fc != nil {
+		t.Errorf("block = %+v, want nil after a newer conflict_resolution_pushed", fc)
+	}
+}
+
+// TestGateView_FanInConflict_OlderRebaseDoesNotSupersede pins the sequence
+// comparison: a rebase or resolution push that PREDATES the conflict did not
+// resolve it.
+func TestGateView_FanInConflict_OlderRebaseDoesNotSupersede(t *testing.T) {
+	for _, category := range []string{CategoryBranchRebased, CategoryConflictResolutionPushed} {
+		t.Run(category, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			child := uuid.New()
+			seedFanInRow(au, runID, category, 5, `{"head_sha":"h1","new_head_sha":"h1"}`)
+			seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(child))
+			assertBaseFoldBlock(t, decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict, child, 10)
+		})
+	}
+}
+
+// TestGateView_FanInConflict_SupersededByPRMerged pins C1 (iii).
+func TestGateView_FanInConflict_SupersededByPRMerged(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+	seedFanInRow(au, runID, CategoryPRMerged, 20, `{}`)
+	if fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict; fc != nil {
+		t.Errorf("block = %+v, want nil once the run's PR merged", fc)
+	}
+}
+
+func TestGateView_FanInConflict_SliceConflictShown(t *testing.T) {
+	cases := []struct {
+		name       string
+		integrated bool
+	}{
+		{"newer than slices_integrated", true},
+		{"no slices_integrated", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			child := uuid.New()
+			if tc.integrated {
+				seedFanInRow(au, runID, "slices_integrated", 10, fanInOutcomePayload("merged"))
+			}
+			seedFanInRow(au, runID, "slice_integration_conflict", 20, fanInSliceConflictPayload(child))
+			fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict
+			if fc == nil {
+				t.Fatal("fan_in_conflict absent, want slice_conflict")
+			}
+			if fc.Kind != fanInConflictKindSlice || fc.Sequence != 20 || fc.BaseSHA != "basesha2" || !fc.CompareTruncated {
+				t.Errorf("block = %+v, want slice_conflict at seq 20 on basesha2, compare_truncated", fc)
+			}
+			if fc.ConflictingSliceIndex == nil || *fc.ConflictingSliceIndex != 1 || fc.ConflictingChildRunID != child.String() ||
+				fc.BaseAttribution != "paths_overlap" || !slices.Equal(fc.ConflictingBasePaths, []string{"c.go"}) {
+				t.Errorf("attribution = %+v, want slice 1 / %s / paths_overlap / [c.go]", fc, child)
+			}
+			for _, want := range []string{"fishhawk_start_run", "fishhawk_start_campaign_item_run", "SUCCEEDED", "base_attribution"} {
+				if !strings.Contains(fc.Remedy, want) {
+					t.Errorf("remedy = %q, want it to contain %q", fc.Remedy, want)
+				}
+			}
+		})
+	}
+}
+
+// TestGateView_FanInConflict_OlderSliceConflictOmitted pins the recency
+// comparison: a slice_integration_conflict OLDER than a clean slices_integrated
+// was resolved by that later clean pass.
+func TestGateView_FanInConflict_OlderSliceConflictOmitted(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedFanInRow(au, runID, "slice_integration_conflict", 10, fanInSliceConflictPayload(uuid.New()))
+	seedFanInRow(au, runID, "slices_integrated", 20, fanInOutcomePayload("merged"))
+	if fc := decodeGateView(t, getGateView(t, s, runID, "")).FanInConflict; fc != nil {
+		t.Errorf("block = %+v, want nil: the slice conflict predates a clean pass", fc)
+	}
+}
+
+func TestGateView_FanInConflict_NoRowsOmitsBlock(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	if strings.Contains(w.Body.String(), `"fan_in_conflict"`) {
+		t.Errorf("a run with no fan-in rows carried the key:\n%s", w.Body.String())
+	}
+	if resp := decodeGateView(t, w); slices.Contains(resp.HistoryGaps, gateViewGapFanIn) {
+		t.Errorf("a quiet run recorded a fan_in gap: %v", resp.HistoryGaps)
+	}
+}
+
+// TestGateView_FanInConflict_NullPathsRenderAsArray pins the always-an-array
+// contract of conflicting_base_paths for a conflict row with no attribution
+// paths (and for one with no attribution member at all).
+func TestGateView_FanInConflict_NullPathsRenderAsArray(t *testing.T) {
+	for name, payload := range map[string]string{
+		"null paths":       `{"base_ref":"main","base_sha":"b","base_fold_outcome":"conflict","base_fold_conflict":{"conflicting_base_paths":null,"base_attribution":"unavailable:compare_failed"}}`,
+		"no member at all": `{"base_ref":"main","base_sha":"b","base_fold_outcome":"conflict"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			seedFanInRow(au, runID, "slices_integrated", 10, payload)
+			w := getGateView(t, s, runID, "")
+			if !strings.Contains(w.Body.String(), `"conflicting_base_paths":[]`) {
+				t.Errorf("conflicting_base_paths did not render as []:\n%s", w.Body.String())
+			}
+		})
+	}
+}
+
+// TestGateView_FanInConflict_StageKindDoesNotFilter pins the block as
+// run-level: a stage_kind filter does not hide it.
+func TestGateView_FanInConflict_StageKindDoesNotFilter(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	child := uuid.New()
+	seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(child))
+	assertBaseFoldBlock(t, decodeGateView(t, getGateView(t, s, runID, "stage_kind=plan")).FanInConflict, child, 10)
+}
+
+func TestGateView_FanInConflict_ListErrorIsGap(t *testing.T) {
+	for _, category := range []string{"slices_integrated", "slice_integration_conflict", CategoryBranchRebased,
+		CategoryConflictResolutionPushed, CategoryPRMerged} {
+		t.Run(category, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+			au.listByCategoryErrCategory = category
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if resp.FanInConflict != nil {
+				t.Errorf("block = %+v, want nil on a %s read failure", resp.FanInConflict, category)
+			}
+			if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapFanIn) {
+				t.Errorf("history_incomplete=%v gaps=%v, want a fan_in gap", resp.HistoryIncomplete, resp.HistoryGaps)
+			}
+		})
+	}
+}
+
+func TestGateView_FanInConflict_UndecodableIsGap(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(au *auditFake, runID uuid.UUID)
+	}{
+		{"slice_integration_conflict", func(au *auditFake, runID uuid.UUID) {
+			seedFanInRow(au, runID, "slice_integration_conflict", 10, `{"conflicting_slice_index":"one"}`)
+		}},
+		{"older slices_integrated", func(au *auditFake, runID uuid.UUID) {
+			seedFanInRow(au, runID, "slices_integrated", 10, `{"base_fold_outcome":7}`)
+			seedFanInRow(au, runID, "slices_integrated", 20, fanInConflictedPayload(uuid.New()))
+		}},
+		{"newer slices_integrated", func(au *auditFake, runID uuid.UUID) {
+			seedFanInRow(au, runID, "slices_integrated", 10, fanInConflictedPayload(uuid.New()))
+			seedFanInRow(au, runID, "slices_integrated", 20, `{"base_fold_outcome":7}`)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			tc.seed(au, runID)
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if resp.FanInConflict != nil {
+				t.Errorf("block = %+v, want nil when a row does not decode", resp.FanInConflict)
+			}
+			if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapFanIn) {
+				t.Errorf("history_incomplete=%v gaps=%v, want a fan_in gap", resp.HistoryIncomplete, resp.HistoryGaps)
+			}
+		})
+	}
+}
+
+func TestGateView_FanInConflict_NilAuditRepoNoGap(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	resp := gateViewResponse{}
+	if fc := s.fanInConflictForRun(context.Background(), uuid.New(), &resp); fc != nil || resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Errorf("nil AuditRepo = (%+v, %v, %v), want (nil, false, none)", fc, resp.HistoryIncomplete, resp.HistoryGaps)
+	}
+}

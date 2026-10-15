@@ -3302,6 +3302,8 @@ components:
             outcome history or its review-coverage history (#4219) could not
             be read. The merge-candidate verdict block adds
             `merge_candidate_verdict` when any of its reads failed (#4293).
+            The fan-in conflict block adds `fan_in` when one of its reads, or
+            the decode of a row it reads, failed (#4343).
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3368,6 +3370,60 @@ components:
             `history_gaps` entry and `history_incomplete=true` when the run's
             account id is unparseable or the read fails — never a failed
             request.
+        fan_in_conflict:
+          $ref: '#/components/schemas/GateViewFanInConflict'
+
+    GateViewFanInConflict:
+      type: object
+      required: [kind, sequence, conflicting_base_paths, compare_truncated, remedy]
+      description: |
+        #4343. A decomposed parent's UNRESOLVED fan-in conflict, its base
+        attribution and the remedy that works. Run-level: `stage_kind` does not
+        filter it. Selected from the run's `slices_integrated` and
+        `slice_integration_conflict` audit rows:
+
+        - `slice_conflict` when a `slice_integration_conflict` is newer than
+          the newest `slices_integrated` (or none exists). A slice failed to
+          merge and failed the parent implement stage category B. The
+          conflicting child SUCCEEDED, so `POST /v0/runs/{run_id}/recover`
+          refuses it (`recovery_not_eligible`); the remedy is a restart.
+        - otherwise `base_fold_conflict` when the newest `slices_integrated`
+          with `base_fold_outcome` `conflict` is not yet superseded. The
+          consolidated head is clean but behind `base_ref`; at merge `POST
+          /v0/runs/{run_id}/rebase-branch` starts the bounded
+          conflict-resolution pass (ceiling 1). Only a NEWER `slices_integrated`
+          whose fold landed (`merged` or `created_at_tip`), a newer
+          `branch_rebased` or `conflict_resolution_pushed`, or the run's PR
+          merging supersedes it; a newer `not_attempted` or
+          `deferred_children_in_flight` row (a no-op fan-in pass) does NOT.
+
+        Omitted when neither applies or no audit repository is wired; omitted
+        with a `fan_in` `history_gaps` entry and `history_incomplete=true` when
+        a read or a row decode fails.
+      properties:
+        kind: { type: string, enum: [base_fold_conflict, slice_conflict] }
+        sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the selected `slices_integrated` (base_fold_conflict) or `slice_integration_conflict` (slice_conflict) row.
+        conflicting_slice_index: { type: integer, description: 'The attributed slice; absent when unattributed.' }
+        conflicting_child_run_id: { type: string, format: uuid, description: "The attributed slice's child run; absent when unattributed." }
+        base_ref: { type: string, description: 'The base branch the fold targeted (base_fold_conflict only).' }
+        base_sha: { type: string, description: 'The base tip the pass integrated against.' }
+        base_attribution:
+          type: string
+          description: |
+            `paths_overlap` (the attributed slice and the base delta share
+            `conflicting_base_paths`), `no_base_overlap` (complete compares
+            share no path: a slice-vs-slice conflict) or
+            `unavailable:<reason>` with reason `compare_unsupported`,
+            `compare_failed` or `compare_truncated`.
+        conflicting_base_paths:
+          type: array
+          items: { type: string }
+          description: Files both the attributed slice and the base delta touched. Always an array.
+        compare_truncated: { type: boolean, description: 'True when a forge compare was truncated, so the attribution may be incomplete.' }
+        remedy: { type: string, description: 'The verb that resolves this kind, and what `base_attribution` means.' }
 
     GateViewSpecialistJob:
       type: object

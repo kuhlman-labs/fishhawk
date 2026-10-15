@@ -70,12 +70,18 @@ The eight shipped signatures, in the reader's terms:
   or rate cap, not a crash (the attempt made no model call). It will fail
   identically until the window resets. Wait for the reset, then retry.
 - **`slice_integration_conflict`** — a decomposed parent's fan-in could not merge
-  one slice branch onto the consolidated branch. The consolidated branch already
-  holds the earlier slices, so the **parent is not the thing to re-drive**.
-  Resume the *conflicting child's* run (read its run id from the newest
-  `slice_integration_conflict` audit entry's structured payload, not the reason
-  string); resuming the parent replans from scratch and discards the succeeded
-  siblings.
+  one slice branch onto the consolidated branch: two slices conflict with each
+  other, or the consolidated branch was created at a newer base tip than an
+  early slice was built on. Read `fishhawk_get_gate_view`'s `fan_in_conflict`
+  block for the conflicting slice, child, paths and `base_attribution`. Do
+  **not** resume the conflicting child: its implement succeeded, so the backend
+  refuses to re-drive it. **Restart** instead, with
+  `fishhawk_start_campaign_item_run` for a campaign item and `fishhawk_start_run`
+  otherwise, and keep the conflicting paths in one slice at the new plan gate.
+  A slice that conflicts with **main** no longer fails here: the base tip is
+  folded in after the slices, so the conflict shows up as a `base_fold_conflict`
+  in that same block, and at merge `fishhawk_rebase_run_branch` hands it to the
+  bounded conflict-resolution pass. You resolve nothing by hand.
 - **`lineage_lock_contention`** — the runner refused to start because another
   runner already holds this run's lineage lock: two runners were pointed at the
   same lineage, or a previous runner's lock outlived it. Confirm no live runner
