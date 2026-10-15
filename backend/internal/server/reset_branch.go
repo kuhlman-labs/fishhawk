@@ -244,6 +244,11 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 		reparkedID = reparked.ID.String()
 	}
 
+	// The rewind moved the head off a LIVE entry's anchor, so release the
+	// merge-candidate line (#4352). A HELD entry keeps its place: admission
+	// re-reads the PR and re-anchors to the rewound head (ADR-092 D2).
+	s.releaseMergeCandidateQueueOnReopen(context.WithoutCancel(r.Context()), runID, mergeCandidateQueueReasonHeadReset, false)
+
 	recoveryNote := "dropped commit " + offendingSHA +
 		" remains recoverable from the remote reflog or the foreign pusher's own branch"
 

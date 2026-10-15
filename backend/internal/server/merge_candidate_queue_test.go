@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -1176,6 +1178,7 @@ func TestMergeCandidateQueue_UnwiredIsNoOp(t *testing.T) {
 	srv.mergeCandidateQueueOnVerdict(ctx, runID, "h", mergeCandidateResultFailed)
 	srv.mergeCandidateQueueOnPRResolved(ctx, runID, true)
 	srv.releaseMergeCandidateQueueForRun(ctx, runID, mergeCandidateQueueReasonRunCancelled)
+	srv.releaseMergeCandidateQueueOnReopen(ctx, runID, mergeCandidateQueueReasonReopenedForFixup, true)
 	if st, err := srv.mergeCandidateQueueForRun(ctx, runID); st != nil || err != nil {
 		t.Fatalf("read seam with no queue = %+v / %v, want nil / nil", st, err)
 	}
@@ -1219,6 +1222,7 @@ func TestMergeCandidateQueue_NoActiveEntryChangesNothing(t *testing.T) {
 	srv.mergeCandidateQueueOnVerdict(ctx, runID, "h", mergeCandidateResultFailed)
 	srv.mergeCandidateQueueOnPRResolved(ctx, runID, false)
 	srv.releaseMergeCandidateQueueForRun(ctx, runID, mergeCandidateQueueReasonRunCancelled)
+	srv.releaseMergeCandidateQueueOnReopen(ctx, runID, mergeCandidateQueueReasonReopenedForFixup, true)
 	if st, err := srv.mergeCandidateQueueForRun(ctx, runID); st != nil || err != nil {
 		t.Fatalf("read seam with no entry = %+v / %v, want nil / nil", st, err)
 	}
@@ -2248,4 +2252,258 @@ func TestMergeCandidateQueue_AcceptanceInfraBudgetExhaustedDropsRunTerminal(t *t
 
 	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal)
 	f.requireState(b, mergequeue.StateLive, "")
+}
+
+// ---- Re-open release (#4352) ----
+
+// gate restores r's stages to the review gate BY CONSTRUCTION: implement
+// succeeded, review awaiting_approval — the state a passed verify pass or a
+// no-op fix-up leaves in production (the fixture's runner never settles them).
+func (f *mcqFixture) gate(r *mcqRun) {
+	f.t.Helper()
+	f.setStage(r.impl.ID, run.StageStateSucceeded)
+	f.setStage(r.review.ID, run.StageStateAwaitingApproval)
+}
+
+// fixup routes one fix-up on r's implement stage through the REAL
+// fixupStageAs (and so the real run.FixupStage).
+func (f *mcqFixture) fixup(r *mcqRun) error {
+	f.t.Helper()
+	_, _, err := f.srv.fixupStageAs(context.Background(),
+		Identity{Subject: "operator-test", Scopes: []string{"write:fixups"}},
+		fixupActionParams{
+			StageID: r.impl.ID,
+			Options: run.FixupOptions{MaxPasses: 2, HardCeiling: 3},
+			Selected: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "security",
+				Note: "tighten the guard"}},
+			Reason: "route the review concern",
+		})
+	return err
+}
+
+// settledRows decodes r's merge_candidate_queue_settled payloads.
+func (f *mcqFixture) settledRows(r *mcqRun) []map[string]any {
+	f.t.Helper()
+	var out []map[string]any
+	for _, e := range f.rows(r, CategoryMergeCandidateQueueSettled) {
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			f.t.Fatalf("decode settled row: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// passedWave is wave with A's pass PASSED at a1 (A live, phase passed; B held)
+// and A's stages back at the review gate.
+func (f *mcqFixture) passedWave() (a, b *mcqRun) {
+	f.t.Helper()
+	a, b = f.wave()
+	f.verdict(a, mergeCandidateResultPassed)
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != mergequeue.PhasePassed || e.AnchoredHeadSHA != "a1" {
+		f.t.Fatalf("fixture: A entry = phase %q head %q, want passed at a1", e.Phase, e.AnchoredHeadSHA)
+	}
+	f.gate(a)
+	return a, b
+}
+
+// TestMergeCandidateQueue_FixupReopenReleasesTheLine (#4352): a fix-up routed
+// on the LIVE, passed line holder drops its entry reopened_for_fixup and the
+// held entry behind it is admitted at once, not after the agent pass.
+func TestMergeCandidateQueue_FixupReopenReleasesTheLine(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.passedWave()
+	if n := len(f.triggers(b)); n != 0 {
+		t.Fatalf("fixture: B triggers = %d before the fix-up, want 0", n)
+	}
+
+	if err := f.fixup(a); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonReopenedForFixup)
+	rows := f.settledRows(a)
+	if len(rows) != 1 {
+		t.Fatalf("A settled rows = %d, want exactly 1", len(rows))
+	}
+	if r := rows[0]; r["reason"] != mergeCandidateQueueReasonReopenedForFixup || r["from_state"] != string(mergequeue.StateLive) ||
+		r["phase"] != string(mergequeue.PhasePassed) || r["anchored_head_sha"] != "a1" {
+		t.Fatalf("A settled row = %+v, want reason %s from_state live phase passed at a1", r, mergeCandidateQueueReasonReopenedForFixup)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b1" {
+		t.Fatalf("B triggers = %+v, want exactly one at b1 (admitted without waiting for A)", tr)
+	}
+
+	t.Run("after verify_failed eject is a no-op", func(t *testing.T) {
+		f := newMCQFixture(t)
+		a, b := f.wave()
+		f.verdict(a, mergeCandidateResultFailed)
+		f.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+		f.requireState(b, mergequeue.StateLive, "")
+		f.gate(a)
+		if err := f.fixup(a); err != nil {
+			t.Fatalf("fixupStageAs: %v", err)
+		}
+		f.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+		if n := len(f.settledRows(a)); n != 1 {
+			t.Fatalf("A settled rows = %d, want exactly 1 (the verify_failed eject)", n)
+		}
+		f.requireState(b, mergequeue.StateLive, "")
+	})
+}
+
+// TestMergeCandidateQueue_RefusedFixupKeepsTheLine: a fix-up run.FixupStage
+// REFUSES (the implement stage is left pending, as the verify re-open left it)
+// releases nothing — the release runs only after the re-open is admitted.
+//
+// Ordering counterfactual (approval condition C1), run by hand: the release
+// was MOVED above run.FixupStage in fixupStageAs, keyed by the run id from a
+// stage read on p.StageID (`if st0, gerr := s.cfg.RunRepo.GetStage(ctx,
+// p.StageID); gerr == nil { s.releaseMergeCandidateQueueOnReopen(...,
+// st0.RunID, ...) }`), and the original call removed. It compiled, and this
+// test went RED: "run <A> entry = dropped/"reopened_for_fixup", want
+// live/""". Restored byte-identically, GREEN.
+func TestMergeCandidateQueue_RefusedFixupKeepsTheLine(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.verdict(a, mergeCandidateResultPassed)
+	if st := f.stageState(a.impl.ID); st != run.StageStatePending {
+		t.Fatalf("fixture: A implement = %s, want pending (the verify re-open's state)", st)
+	}
+
+	err := f.fixup(a)
+	if !errors.Is(err, run.ErrFixupNotApplicable) {
+		t.Fatalf("fixupStageAs = %v, want ErrFixupNotApplicable", err)
+	}
+	if e := f.requireState(a, mergequeue.StateLive, ""); e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("A phase = %q, want passed (untouched)", e.Phase)
+	}
+	if st, _ := f.srv.mergeCandidateQueueForRun(context.Background(), b.id); st == nil || st.Entry.State != mergequeue.StateHeld ||
+		st.Position != 1 {
+		t.Fatalf("B status = %+v, want held at position 1", st)
+	}
+	if n := len(f.settledRows(a)); n != 0 {
+		t.Fatalf("A settled rows = %d, want 0 on a refused fix-up", n)
+	}
+}
+
+// TestMergeCandidateQueue_FixupReopenDropsHeldEntry: a fix-up on a HELD entry
+// drops it (an admission mid-fix-up would auto-advance the branch under the
+// running agent); a held drop frees nothing and pumps nothing.
+func TestMergeCandidateQueue_FixupReopenDropsHeldEntry(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, c := f.waveABC()
+	mergesBefore := f.mergesInto(c)
+
+	if err := f.fixup(c); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+
+	f.requireState(c, mergequeue.StateDropped, mergeCandidateQueueReasonReopenedForFixup)
+	if rows := f.settledRows(c); len(rows) != 1 || rows[0]["from_state"] != string(mergequeue.StateHeld) {
+		t.Fatalf("C settled rows = %+v, want one from_state held", rows)
+	}
+	f.requireState(a, mergequeue.StateLive, "")
+	f.requireState(b, mergequeue.StateHeld, "")
+
+	f.handOff(a, b)
+	f.requireState(b, mergequeue.StateLive, "")
+	if st, err := f.srv.mergeCandidateQueueForRun(context.Background(), c.id); err != nil || st != nil {
+		t.Fatalf("C active entry = %+v / %v, want none", st, err)
+	}
+	if n := f.mergesInto(c); n != mergesBefore {
+		t.Fatalf("merges into C's branch = %d, want unchanged %d (no auto-advance under the agent)", n, mergesBefore)
+	}
+}
+
+// TestMergeCandidateQueue_FixupNoOpKeepsPassedVerdict: the release never
+// touches the verdict. A fix-up that delivered nothing (head still a1, stages
+// back at the gate) still reads passed, and an up-to-date rebase starts no pass.
+func TestMergeCandidateQueue_FixupNoOpKeepsPassedVerdict(t *testing.T) {
+	f := newMCQFixture(t)
+	a, _ := f.passedWave()
+	if err := f.fixup(a); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+	f.gate(a)
+
+	runRow, err := f.repo.GetRun(context.Background(), a.id)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	st, err := f.srv.mergeCandidateVerifyState(context.Background(), runRow, "a1")
+	if err != nil || st.State != mergeCandidateStatePassed {
+		t.Fatalf("A verify state at a1 = %+v / %v, want passed", st, err)
+	}
+	resp := f.rebase(a)
+	if resp.MergeCandidateVerifyState != mergeCandidateStatePassed || resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("A up-to-date rebase = state %q triggered %v, want passed, not triggered",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	if n := len(f.triggers(a)); n != 1 {
+		t.Fatalf("A triggers = %d, want unchanged 1", n)
+	}
+	if st, err := f.srv.mergeCandidateQueueForRun(context.Background(), a.id); err != nil || st != nil {
+		t.Fatalf("A active entry = %+v / %v, want none", st, err)
+	}
+	if rows := f.settledRows(a); len(rows) != 1 || rows[0]["reason"] != mergeCandidateQueueReasonReopenedForFixup {
+		t.Fatalf("A settled rows = %+v, want one naming %s", rows, mergeCandidateQueueReasonReopenedForFixup)
+	}
+}
+
+// TestMergeCandidateQueue_ReleasedHolderReentersAtTail (ADR-093 Q2): after the
+// release, the fix-up's pushed head needs a pass; the run's rebase enqueues it
+// HELD behind the entry that took the line, not back at the head.
+func TestMergeCandidateQueue_ReleasedHolderReentersAtTail(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.passedWave()
+	if err := f.fixup(a); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+	f.gh.set(func() { f.gh.prs[a.pr].head = "a2" })
+	f.gate(a)
+	f.behind(a, "a2", "a3")
+
+	resp := f.rebase(a)
+	if resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("A rebase = state %q triggered %v, want held, not triggered",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	if e := f.requireState(a, mergequeue.StateHeld, ""); e.AnchoredHeadSHA != "a3" {
+		t.Fatalf("A newest entry head = %q, want a3", e.AnchoredHeadSHA)
+	}
+	if st, _ := f.srv.mergeCandidateQueueForRun(context.Background(), a.id); st == nil || st.Position != 1 ||
+		st.LiveRunID == nil || *st.LiveRunID != b.id {
+		t.Fatalf("A status = %+v, want held at position 1 behind B", st)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+}
+
+// TestMergeCandidateQueue_ConflictResolutionReopenReleasesTheLine: a rebase
+// of the live holder that conflicts re-opens it for a conflict-resolution
+// pass, which drops its entry and admits the held entry behind it.
+func TestMergeCandidateQueue_ConflictResolutionReopenReleasesTheLine(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.passedWave()
+	f.gh.set(func() {
+		f.gh.behind["a1"] = []string{"base-x"}
+		f.gh.mergeStatus[a.branch] = http.StatusConflict
+	})
+
+	w := postRebaseBranch(t, f.srv, a.id, rebaseBranchRequest{Confirm: true, Reason: "base moved"}, withRebaseOperator)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("rebase = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var resp rebaseBranchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || !resp.ConflictResolutionTriggered {
+		t.Fatalf("rebase body = %+v / %v, want conflict_resolution_triggered", resp, err)
+	}
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonReopenedForConflictResolution)
+	f.requireState(b, mergequeue.StateLive, "")
+	if n := len(f.triggers(b)); n != 1 {
+		t.Fatalf("B triggers = %d, want 1", n)
+	}
 }

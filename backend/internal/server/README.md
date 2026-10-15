@@ -2692,8 +2692,8 @@ settle carries.
   `admitMergeCandidateEntry`) runs on `mergeCandidateAdmissionContext`:
   detached from the caller's cancellation and bounded by a FRESH
   `mergeCandidateQueueHandOffBudget`, on every trigger path (periodic pump,
-  webhook PR-resolution hook, verdict and cancel hooks, a rebase's
-  serialize). So neither a departed webhook sender nor fishhawkd's shutdown
+  webhook PR-resolution hook, verdict and cancel hooks, the re-open release,
+  a rebase's serialize). So neither a departed webhook sender nor fishhawkd's shutdown
   signal can cut the re-anchor, the pass start or the recovery `Unadmit` and
   strand an entry live in phase `admitted`. The caller ctx gates only the
   TOP-LEVEL `AdmitNext` (and the live-entry check): a cancelled pump claims no
@@ -2708,7 +2708,8 @@ settle carries.
 - **Verdict / merge / close hooks (D4).** `recordMergeCandidateVerified`
   (non-duplicate append) → `mergeCandidateQueueOnVerdict` for the run's LIVE
   entry anchored at that head: failed → ejected `verify_failed` + pump;
-  passed → phase `passed` (holds the line until merge); not_executed →
+  passed → phase `passed` (holds the line until merge, or until a re-open
+  releases it, below); not_executed →
   phase `unverified` (holds the line; the operator's next
   `fishhawk_rebase_run_branch` re-triggers). `resolveReviewStageOnMerge`
   calls `mergeCandidateQueueOnPRResolved` FIRST, before the ADR-036
@@ -2724,6 +2725,45 @@ settle carries.
   error) and the merge gate's `409 merge_candidate_held` (a HELD run's merge
   is refused before the behind check, naming its position, the live run and
   that admission is automatic; next step `fishhawk_get_run_status`).
+  `releaseMergeCandidateQueueOnReopen(ctx, runID, reason, heldToo)` is the
+  re-open release below.
+- **Re-open release (#4352).** A run re-opened for agent work, or whose head
+  was reset, stops holding the line: `releaseMergeCandidateQueueOnReopen`
+  reads the run's active entry and settles it `dropped` through
+  `settleMergeCandidateQueueEntry` (the `merge_candidate_queue_settled` row
+  carries `reason`, `from_state`, `phase`, `anchored_head_sha`; a LIVE entry
+  pumps its base so the next held entry is admitted at once). Call sites, each
+  on `context.WithoutCancel` like the cancel hook: `fixupStageAs` AFTER
+  `run.FixupStage` admits the re-open (`reopened_for_fixup`; covers the HTTP
+  verb, campaign auto-drive, acceptance triage and the ADR-090 D6 route, which
+  finds the entry already ejected `verify_failed` and is a no-op);
+  `startConflictResolutionPass` AFTER its re-open
+  (`reopened_for_conflict_resolution`); `handleResetRunBranch` AFTER the
+  force-update (`head_reset`). The two agent re-opens drop a HELD entry too
+  (admitting it mid-pass would auto-advance the branch under the running agent
+  and eject it `pass_not_startable`); the reset drops a LIVE entry only, since
+  admission re-anchors a held one to the PR's current head (ADR-092 D2). A
+  refused re-open or reset returns before the call and touches no entry; an
+  unreadable entry WARN-logs and changes nothing. The verdict is untouched: a
+  no-op fix-up's head still reads `passed`, only the line POSITION is lost
+  (the release fires at routing time, before the agent can say whether the
+  head moves). The run re-enters at the TAIL on its next serialized pass (a
+  rebase or base advance), per ADR-093 Q2. A rebase of the live holder is NOT
+  a release: it re-verifies the new head as the line's own work (D2).
+  **Latency.** The pump is synchronous: releasing a LIVE entry runs the next
+  admission (auto-advance merge + pass start) before the verb returns, and an
+  admission that ejects its entry admits the next, so the fix-up's
+  orchestrator dispatch (the release sits BEFORE `Orchestrator.Advance` in
+  `fixupStageAs`) and the HTTP fix-up 200 / rebase 202 / reset 200 can each
+  be delayed by up to (number of held entries ejected in the chain + 1) ×
+  `mergeCandidateQueueHandOffBudget` (one budget per admission the chain
+  runs, the final non-ejected admission included), not one budget. Each admission has its
+  own detached budget (#4303); the chain is bounded by the held entries and
+  `mergeCandidateQueueMaxAdmissions`. Tests: `merge_candidate_queue_test.go`
+  (`TestMergeCandidateQueue_FixupReopen*`, `RefusedFixupKeepsTheLine`,
+  `FixupNoOpKeepsPassedVerdict`, `ReleasedHolderReentersAtTail`,
+  `ConflictResolutionReopenReleasesTheLine`) and `reset_branch_test.go`
+  (`TestResetRunBranch_*MergeCandidate*`).
 - **Audit categories** (INTERNAL — not issue-comment activity; registered in
   `audit/categories.go`, pinned by `TestKnownCategories_MergeCandidateQueue`):
   `merge_candidate_queue_held`, `merge_candidate_queue_admitted` (`readmitted`

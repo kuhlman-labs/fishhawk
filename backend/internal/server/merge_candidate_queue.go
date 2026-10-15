@@ -37,13 +37,18 @@ import (
 //     mergeCandidateQueueHandOffBudget (#4303); AdmitNext stays on the caller
 //     ctx, so a cancelled pump claims no new entry.
 //   - mergeCandidateQueueOnVerdict (from recordMergeCandidateVerified): a red
-//     pass EJECTS and hands the line on; passed holds it until merge (D4);
+//     pass EJECTS and hands the line on; passed holds it until merge (D4)
+//     or a re-open releases it (#4352);
 //     not_executed holds it in phase unverified.
 //   - mergeCandidateQueueOnPRResolved (from resolveReviewStageOnMerge): merge
 //     settles the live entry merged (a held one is dropped
 //     pr_merged_externally), close-without-merge drops pr_closed, then pumps.
 //   - releaseMergeCandidateQueueForRun / mergeCandidateQueueForRun are the
 //     cancel-hook and read-surface seams.
+//   - releaseMergeCandidateQueueOnReopen (from fixupStageAs, the
+//     conflict-resolution arm and the branch reset, #4352) drops a re-opened
+//     run's entry so it stops holding the line; the run re-enters at the TAIL
+//     on its next serialized pass (ADR-093 Q2).
 //
 // Every queue move writes one INTERNAL audit row, best-effort and after the
 // store's own transaction committed. The store is the source of truth; a lost
@@ -72,6 +77,11 @@ const (
 	mergeCandidateQueueReasonVerifyFailed       = "verify_failed"
 	mergeCandidateQueueReasonAdvanceConflict    = "advance_conflict"
 	mergeCandidateQueueReasonPassNotStartable   = "pass_not_startable"
+	// Re-open releases (#4352): the run's head is about to move (agent work)
+	// or already moved (a reset), so its entry leaves the line.
+	mergeCandidateQueueReasonReopenedForFixup              = "reopened_for_fixup"
+	mergeCandidateQueueReasonReopenedForConflictResolution = "reopened_for_conflict_resolution"
+	mergeCandidateQueueReasonHeadReset                     = "head_reset"
 )
 
 // mergeCandidateQueueMaxAdmissions bounds one pump's admission loop. Each
@@ -162,7 +172,8 @@ func (s *Server) serializeMergeCandidateVerifyPass(ctx context.Context, runID uu
 
 // applyMergeCandidateStartToEntry records what a pass start for a LIVE entry
 // means for the line: in_flight → verifying; passed / not_required → passed
-// (holds the line until merge, D4); failed → ejected verify_failed and the
+// (holds the line until merge or a re-open release, D4 / #4352); failed →
+// ejected verify_failed and the
 // base is pumped. Reports whether the entry was settled.
 func (s *Server) applyMergeCandidateStartToEntry(ctx context.Context, e mergequeue.Entry, state string) bool {
 	switch state {
@@ -463,7 +474,8 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 
 // mergeCandidateQueueOnVerdict applies a recorded pass result to the run's
 // LIVE entry anchored at that head (D4): failed → ejected verify_failed and
-// the base is pumped; passed → phase passed (holds the line until merge);
+// the base is pumped; passed → phase passed (holds the line until merge, or
+// until releaseMergeCandidateQueueOnReopen drops it on a re-open, #4352);
 // not_executed → phase unverified (still holds the line; the operator's next
 // fishhawk_rebase_run_branch re-triggers it). A verdict for a head other than
 // the anchored one, or for a run with no live entry, changes nothing.
@@ -494,7 +506,7 @@ func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UU
 // mergeCandidateQueueHandOffBudget bounds ONE admission: every entry
 // pumpMergeCandidateQueue admits gets a fresh budget, on every trigger path
 // (the periodic pump, the webhook PR-resolution hook, the verdict and cancel
-// hooks, a rebase's serialize). Separately it bounds the PR-resolution hook's
+// hooks, the re-open release, a rebase's serialize). Separately it bounds the PR-resolution hook's
 // own entry read and settle. An admission runs detached from its caller's
 // cancellation because one admission's auto-advance alone can spend the
 // bounded post-merge re-read and then its own detached
@@ -567,6 +579,44 @@ func (s *Server) releaseMergeCandidateQueueForRun(ctx context.Context, runID uui
 		return
 	}
 	if !found {
+		return
+	}
+	s.settleMergeCandidateQueueEntry(ctx, st.Entry, mergequeue.StateDropped, reason)
+}
+
+// releaseMergeCandidateQueueOnReopen drops the run's active entry with reason
+// when the run is re-opened (#4352), pumping the base when the entry was live
+// so the next held entry is admitted at once. A re-opened run's entry leaves
+// the line because the head will move: a fix-up or conflict-resolution agent
+// pushes new work, a reset already rewound it. The pass the entry anchored, or
+// its passed verdict, is therefore not the one that merges, and holding the
+// line LIVE through a long agent pass head-of-line blocks every ready entry
+// behind it. The run re-enters at the TAIL on its next serialized pass (a
+// rebase or base advance), as ADR-093 Q2 rules.
+//
+// heldToo decides a HELD entry. An agent re-open (heldToo true) drops it too:
+// admitting it mid-pass would auto-advance the branch under the running agent
+// and then eject it pass_not_startable. A head reset (heldToo false) keeps it,
+// because admission re-reads the PR and re-anchors to its current head anyway
+// (ADR-092 D2). No verdict is touched: a head whose fix-up delivered nothing
+// still reads passed. Best-effort: an unreadable entry WARN-logs and changes
+// nothing (an uncertain read never drops an entry); no active entry is a no-op.
+func (s *Server) releaseMergeCandidateQueueOnReopen(ctx context.Context, runID uuid.UUID, reason string, heldToo bool) {
+	if s.cfg.MergeQueue == nil {
+		return
+	}
+	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge-candidate queue: re-open release could not read the run's entry; the entry is left as it is",
+			slog.String("run_id", runID.String()), slog.String("reason", reason),
+			slog.String("error", err.Error()))
+		return
+	}
+	if !found {
+		return
+	}
+	if st.Entry.State != mergequeue.StateLive && !heldToo {
 		return
 	}
 	s.settleMergeCandidateQueueEntry(ctx, st.Entry, mergequeue.StateDropped, reason)

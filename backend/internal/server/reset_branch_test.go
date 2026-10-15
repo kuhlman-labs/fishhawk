@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -482,5 +483,128 @@ func TestResetRunBranch_NoReviewStage(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp.ReparkedReviewStageID != "" {
 		t.Errorf("reparked_review_stage_id = %q, want empty on the no-review shape", resp.ReparkedReviewStageID)
+	}
+}
+
+// resetQueueSettle is one recorded Settle call.
+type resetQueueSettle struct {
+	id     uuid.UUID
+	state  mergequeue.State
+	reason string
+}
+
+// resetQueueStore is a pure-fake mcqFaultStore for the reset release (#4352):
+// ActiveForRun answers entry and err (an entry WITH an error isolates the
+// read-error arm: only that arm keeps the entry from settling), Settle records its state and reason and
+// answers Settled, AdmitNext answers an empty base.
+func resetQueueStore(entry *mergequeue.Entry, err error) (*mcqFaultStore, *[]resetQueueSettle) {
+	var mu sync.Mutex
+	settles := &[]resetQueueSettle{}
+	fs := &mcqFaultStore{
+		activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+			if entry == nil {
+				return mergequeue.Status{}, false, err
+			}
+			return mergequeue.Status{Entry: *entry}, true, err
+		},
+		settle: func(id uuid.UUID, state mergequeue.State, reason string) (mergequeue.SettleResult, error) {
+			mu.Lock()
+			*settles = append(*settles, resetQueueSettle{id: id, state: state, reason: reason})
+			mu.Unlock()
+			e := *entry
+			e.State, e.EjectReason = state, reason
+			return mergequeue.SettleResult{Entry: e, Settled: true}, nil
+		},
+		admitNext: func(mergequeue.Base) (mergequeue.Admission, error) { return mergequeue.Admission{}, nil },
+	}
+	return fs, settles
+}
+
+func resetQueueEntry(runID uuid.UUID, state mergequeue.State) *mergequeue.Entry {
+	e := &mergequeue.Entry{ID: uuid.New(), RunID: runID, Repo: "x/y", BaseRef: "main",
+		State: state, AnchoredHeadSHA: resetForeignSHA}
+	if state == mergequeue.StateLive {
+		e.Phase = mergequeue.PhasePassed
+	}
+	return e
+}
+
+// TestResetRunBranch_ReleasesLiveMergeCandidateLine (#4352): a reset moves the
+// head off a LIVE entry's anchor, so the entry is dropped head_reset and the
+// base is pumped.
+func TestResetRunBranch_ReleasesLiveMergeCandidateLine(t *testing.T) {
+	s, _, _, _, runID := seedResetRun(t, resetForeignSHA,
+		[]string{resetAuthoredSHA, resetForeignSHA}, run.StageStateAwaitingApproval, true)
+	live := resetQueueEntry(runID, mergequeue.StateLive)
+	fs, settles := resetQueueStore(live, nil)
+	s.cfg.MergeQueue = fs
+
+	w := postResetBranch(t, s, runID, resetBranchRequest{Reason: "drop the on-top commit", Confirm: true}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	fs.onlyCall(t, "Settle", live.ID)
+	if len(*settles) != 1 || (*settles)[0].state != mergequeue.StateDropped || (*settles)[0].reason != mergeCandidateQueueReasonHeadReset {
+		t.Fatalf("settles = %+v, want one dropped %s", *settles, mergeCandidateQueueReasonHeadReset)
+	}
+	if n := fs.called("AdmitNext"); n == 0 {
+		t.Fatalf("AdmitNext calls = 0, want the base pumped after a live release (calls %v)", fs.names())
+	}
+}
+
+// TestResetRunBranch_KeepsHeldMergeCandidateEntry: a HELD entry keeps its
+// place across a reset; admission re-anchors it to the rewound head (D2).
+func TestResetRunBranch_KeepsHeldMergeCandidateEntry(t *testing.T) {
+	s, _, _, _, runID := seedResetRun(t, resetForeignSHA,
+		[]string{resetAuthoredSHA, resetForeignSHA}, run.StageStateAwaitingApproval, true)
+	fs, _ := resetQueueStore(resetQueueEntry(runID, mergequeue.StateHeld), nil)
+	s.cfg.MergeQueue = fs
+
+	w := postResetBranch(t, s, runID, resetBranchRequest{Confirm: true}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	fs.onlyCall(t, "ActiveForRun", runID)
+	if n := fs.called("Settle"); n != 0 {
+		t.Fatalf("Settle calls = %d, want 0 for a held entry", n)
+	}
+}
+
+// TestResetRunBranch_RefusedResetLeavesMergeCandidateQueue: a refused reset
+// (nothing to drop) never reaches the queue.
+func TestResetRunBranch_RefusedResetLeavesMergeCandidateQueue(t *testing.T) {
+	s, _, _, _, runID := seedResetRun(t, resetAuthoredSHA,
+		[]string{resetAuthoredSHA}, run.StageStateAwaitingApproval, true)
+	fs, _ := resetQueueStore(resetQueueEntry(runID, mergequeue.StateLive), nil)
+	s.cfg.MergeQueue = fs
+
+	w := postResetBranch(t, s, runID, resetBranchRequest{Confirm: true}, withAuth)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if calls := fs.names(); len(calls) != 0 {
+		t.Fatalf("queue store calls = %v, want none on a refused reset", calls)
+	}
+}
+
+// TestResetRunBranch_MergeCandidateQueueReadErrorIsBestEffort: an unreadable
+// entry never fails the reset and never drops anything. The fake answers a
+// LIVE entry alongside the error, so the read-error arm alone stops the drop.
+func TestResetRunBranch_MergeCandidateQueueReadErrorIsBestEffort(t *testing.T) {
+	s, _, au, _, runID := seedResetRun(t, resetForeignSHA,
+		[]string{resetAuthoredSHA, resetForeignSHA}, run.StageStateAwaitingApproval, true)
+	fs, _ := resetQueueStore(resetQueueEntry(runID, mergequeue.StateLive), errMCQStore)
+	s.cfg.MergeQueue = fs
+
+	w := postResetBranch(t, s, runID, resetBranchRequest{Confirm: true}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if a := branchResetAudit(au); a == nil {
+		t.Fatal("no branch_reset audit entry written")
+	}
+	fs.onlyCall(t, "ActiveForRun", runID)
+	if n := fs.called("Settle"); n != 0 {
+		t.Fatalf("Settle calls = %d, want 0 after an unreadable entry", n)
 	}
 }

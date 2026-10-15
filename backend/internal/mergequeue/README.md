@@ -93,7 +93,8 @@ The store writes exactly one reason itself: `base_changed` (`ReasonBaseChanged`)
 Every other reason is the caller's string. ADR-092's set (owned by the server
 serializer): dropped `run_terminal`, `run_cancelled`, `pr_merged_externally`,
 `pr_closed`, `base_changed`; ejected `verify_failed`, `advance_conflict`,
-`pass_not_startable`.
+`pass_not_startable`. Re-open releases (#4352, server-owned, dropped):
+`reopened_for_fixup`, `reopened_for_conflict_resolution`, `head_reset`.
 
 ## Atomicity and lock order
 
@@ -152,4 +153,6 @@ the BYPASSRLS system context.
   pump"), so for a run that goes terminal without a settle the bound is one
   pump tick. The run's cancel path releases at once.
 - A `passed` live entry holds the line until its PR merges (ADR-092 D4); an
-  operator who never merges stalls the base. ADR-093 merge-on-pass removes it.
+  operator who never merges stalls the base. Exception: a re-open of the run
+  (fix-up, conflict resolution) or a head reset drops it (#4352), and the run
+  re-enters at the tail. ADR-093 merge-on-pass removes the stall.
