@@ -341,8 +341,13 @@ type stubGitHub struct {
 	// (defaults to a canned URL when empty).
 	createPRURL string
 	// listByHeadResult is what ListOpenPullRequestsByHead returns (the
-	// recovery lookup). listByHeadErr forces an error from it.
+	// pre-create adopt lookup and the recovery lookup). listByHeadErr forces
+	// an error from it. listByHeadSeq, when non-empty, programs per-call
+	// results consumed in order (the pre-create list first, then the
+	// ErrPullRequestExists recovery list, #4110); once exhausted, calls fall
+	// back to listByHeadResult.
 	listByHeadResult []forge.PullRequest
+	listByHeadSeq    [][]forge.PullRequest
 	listByHeadErr    error
 	listByHeadCalls  int
 
@@ -454,6 +459,11 @@ func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ forge.Crede
 	g.listByHeadCalls++
 	if g.listByHeadErr != nil {
 		return nil, g.listByHeadErr
+	}
+	if len(g.listByHeadSeq) > 0 {
+		next := g.listByHeadSeq[0]
+		g.listByHeadSeq = g.listByHeadSeq[1:]
+		return next, nil
 	}
 	return g.listByHeadResult, nil
 }
@@ -2075,12 +2085,16 @@ func TestAdvance_DecomposedParent_Idempotent(t *testing.T) {
 func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
 	// A lost double-open race surfaces as ErrPullRequestExists; the
 	// orchestrator recovers the already-open PR's URL via
-	// ListOpenPullRequestsByHead rather than failing the settle.
+	// ListOpenPullRequestsByHead rather than failing the settle. The
+	// pre-create adopt list (#4110) returns empty first — GitHub's list lag —
+	// so the create is still reached and the ErrPullRequestExists backstop
+	// does the recovery on the second list call.
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
 	gh.createPRErr = forge.ErrPullRequestExists
-	gh.listByHeadResult = []forge.PullRequest{
-		{Number: 42, HTMLURL: "https://github.com/kuhlman-labs/fishhawk/pull/42", State: "open"},
+	gh.listByHeadSeq = [][]forge.PullRequest{
+		nil, // pre-create list: lagging, nothing open yet
+		{{Number: 42, HTMLURL: "https://github.com/kuhlman-labs/fishhawk/pull/42", State: "open"}},
 	}
 
 	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
@@ -2088,8 +2102,11 @@ func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
 	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
-	if gh.listByHeadCalls != 1 {
-		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 1", gh.listByHeadCalls)
+	if len(gh.createPRCalls) != 1 {
+		t.Errorf("CreatePullRequest calls = %d, want 1 (the backstop is reached through the create)", len(gh.createPRCalls))
+	}
+	if gh.listByHeadCalls != 2 {
+		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 2 (pre-create + recovery)", gh.listByHeadCalls)
 	}
 	got := rs.runs[parent.ID].PullRequestURL
 	if got == nil || *got != "https://github.com/kuhlman-labs/fishhawk/pull/42" {
@@ -2106,7 +2123,7 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
 	gh.createPRErr = forge.ErrPullRequestExists
-	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty
+	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty (both the pre-create and the recovery list)
 
 	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
 
@@ -2114,8 +2131,8 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 	if err == nil {
 		t.Fatal("Advance: want a retryable error when ErrPullRequestExists but the list returns empty, got nil")
 	}
-	if gh.listByHeadCalls != 1 {
-		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 1", gh.listByHeadCalls)
+	if gh.listByHeadCalls != 2 {
+		t.Errorf("ListOpenPullRequestsByHead calls = %d, want 2 (pre-create + recovery)", gh.listByHeadCalls)
 	}
 	if got := rs.runs[parent.ID].PullRequestURL; got != nil {
 		t.Errorf("pull_request_url = %v, want nil (no URL stamped on the failed recovery)", *got)

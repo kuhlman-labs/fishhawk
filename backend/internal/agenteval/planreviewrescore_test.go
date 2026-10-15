@@ -2,10 +2,13 @@ package agenteval
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/redaction"
 )
 
 // Fixtures: every sidecar below is RECORDED (recordCyclingSidecar /
@@ -88,8 +91,13 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 	path, rec, _ := recordCyclingSidecar(t)
 	stored := readCatchTrials(t, path)
 	r := rescoreOf(t, path)
-	if len(r.Arms) != 3 || r.Arms[0].Arm != ArmWithoutConventions || r.Arms[1].Arm != ArmWithConventions || r.Arms[2].Arm != ArmArchitect {
-		t.Fatalf("arms = %+v, want the arm table order [%s %s %s]", r.Arms, ArmWithoutConventions, ArmWithConventions, ArmArchitect)
+	wantOrder := []string{ArmWithoutConventions, ArmWithConventions, ArmArchitect, ArmSecurity, ArmSecurityPortability}
+	gotOrder := make([]string, 0, len(r.Arms))
+	for _, a := range r.Arms {
+		gotOrder = append(gotOrder, a.Arm)
+	}
+	if strings.Join(gotOrder, ",") != strings.Join(wantOrder, ",") {
+		t.Fatalf("arms = %v, want the arm table order %v", gotOrder, wantOrder)
 	}
 	if r.RecordedAt != rec.RecordedAt || r.PromptFingerprint != rec.PromptFingerprint || !strings.HasPrefix(catchRuleVersion, r.CatchRule+":") {
 		t.Errorf("re-score envelope = %q / %q / %q; want the sidecar's recorded_at and fingerprint and the catch rule label", r.RecordedAt, r.PromptFingerprint, r.CatchRule)
@@ -102,6 +110,8 @@ func TestRescoreCatchRateTrials_IdempotentOnCurrentRule(t *testing.T) {
 		{ArmWithoutConventions, rec.Arms[ArmWithoutConventions].PerCase, stored.Arms[ArmWithoutConventions].PerCase},
 		{ArmWithConventions, rec.Arms[ArmWithConventions].PerCase, stored.Arms[ArmWithConventions].PerCase},
 		{ArmArchitect, rec.Arms[ArmArchitect].PerCase, stored.Arms[ArmArchitect].PerCase},
+		{ArmSecurity, rec.Arms[ArmSecurity].PerCase, stored.Arms[ArmSecurity].PerCase},
+		{ArmSecurityPortability, rec.Arms[ArmSecurityPortability].PerCase, stored.Arms[ArmSecurityPortability].PerCase},
 	} {
 		arm := rescoreArmOf(t, r, a.arm)
 		if len(arm.Unscored) != 0 || len(arm.NotRecorded) != 0 || len(arm.PerCase) != len(a.counts) {
@@ -165,6 +175,70 @@ func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 	}
 	if w := rescoreCaseOf(t, r, ArmWithConventions, name); w.Gained != 0 || w.Lost != 0 {
 		t.Errorf("the untouched with arm changed: +%d/-%d", w.Gained, w.Lost)
+	}
+}
+
+// TestRescoreCatchRateTrials_RedactionMarkerNeverCatches: the sidecar stores
+// every note through sanitizeCatchTrialText, so a credential-shaped string in
+// a concern reaches the re-score as a "[REDACTED:<rule>]" marker the
+// recording never classified. No security catch probe may match that marker:
+// an attributed, otherwise non-catching stored note re-scores as missed, not
+// as a catch manufactured by the redaction (#4314 review: the bare "redact"
+// probe did exactly that).
+func TestRescoreCatchRateTrials_RedactionMarkerNeverCatches(t *testing.T) {
+	const name = "secret-credential-in-error-path"
+	secCases, _ := loadCommittedSecurity(t)
+	var sc SecurityCatchCase
+	for _, c := range secCases {
+		if c.Name == name {
+			sc = c
+		}
+	}
+	if sc.Name == "" {
+		t.Fatalf("no committed security case %q", name)
+	}
+	rule := sc.CatchRule()
+	// The header is assembled at run time so this source carries no
+	// credential-shaped literal of its own.
+	raw := fmt.Sprintf("%s: the test should send %s: Bearer %s", rule.AttributionPhrases[0], "Authorization", "example")
+	note := sanitizeCatchTrialText(raw)
+	if !strings.Contains(note, "[REDACTED:authorization-bearer]") || strings.Contains(note, "Bearer example") {
+		t.Fatalf("premise: the sidecar sanitizer stores %q, want the bearer header redacted", note)
+	}
+	if probe, ok := matchCatchProbe("correctness", raw, rule.Probes); ok {
+		t.Fatalf("premise: the unredacted note matches probe %q; it must be a non-catching note", probe)
+	}
+
+	path, _, _ := recordCyclingSidecar(t)
+	tr := readCatchTrials(t, path)
+	list := tr.Arms[ArmSecurity].PerCase[name]
+	i := firstTrialWith(t, list, CatchMissed)
+	list[i].Concerns = []CatchRateTrialConcern{{Severity: "low", Category: "correctness", Note: note}}
+	list[i].ConcernsTotal = 1
+	writeCatchTrials(t, path, tr)
+
+	c := rescoreCaseOf(t, rescoreOf(t, path), ArmSecurity, name)
+	got := c.TrialRecords[i]
+	if !got.Attributed {
+		t.Fatalf("premise: the stored note %q does not attribute to %v", note, rule.AttributionPhrases)
+	}
+	if got.Rescored.Outcome != CatchMissed || got.Rescored.MatchedProbe != "" || c.Gained != 0 {
+		t.Errorf("redacted note %q re-scored %s (probe %q), case gained %d; want missed, no probe, nothing gained", note, got.Rescored.Outcome, got.Rescored.MatchedProbe, c.Gained)
+	}
+
+	// Every security catch case, every default redaction marker: no probe
+	// matches the marker beside an attributing phrase.
+	for _, sc := range secCases {
+		if sc.Expect() != CatchExpectCatch {
+			continue
+		}
+		r := sc.CatchRule()
+		for _, p := range redaction.DefaultPatterns {
+			stored := r.AttributionPhrases[0] + " carries [REDACTED:" + p.Name + "]"
+			if probe, ok := matchCatchProbe("correctness", stored, r.Probes); ok {
+				t.Errorf("case %q: catch probe %q matches the sidecar's %s redaction marker; a re-score would manufacture a catch", sc.Name, probe, p.Name)
+			}
+		}
 	}
 }
 
@@ -320,8 +394,8 @@ func TestRescoreCatchRateTrials_ReportsUnscoredAndUnrecordedCases(t *testing.T) 
 		writeCatchTrials(t, path, tr)
 		r := rescoreOf(t, path)
 		for _, a := range r.Arms {
-			if a.Arm == ArmArchitect {
-				continue // the architect arm is untouched by this fixture
+			if a.Arm == ArmArchitect || a.Arm == ArmSecurity || a.Arm == ArmSecurityPortability {
+				continue // the persona arms are untouched by this fixture
 			}
 			if len(a.Unscored) != 1 || a.Unscored[0] != unknown || len(a.NotRecorded) != 1 || a.NotRecorded[0] != orig {
 				t.Errorf("arm %q: unscored %v, not recorded %v; want [%s] and [%s]", a.Arm, a.Unscored, a.NotRecorded, unknown, orig)
@@ -346,18 +420,27 @@ func TestRescoreCatchRateTrials_ReportsUnscoredAndUnrecordedCases(t *testing.T) 
 		one := map[string][]CatchRateTrialRecord{unknown: tr.Arms[ArmWithoutConventions].PerCase[orig]}
 		tr.Arms[ArmWithoutConventions] = CatchRateTrialsArm{PerCase: one}
 		tr.Arms[ArmWithConventions] = CatchRateTrialsArm{PerCase: one}
-		delete(tr.Arms, ArmArchitect)
+		for _, arm := range []string{ArmArchitect, ArmSecurity, ArmSecurityPortability} {
+			delete(tr.Arms, arm)
+		}
 		writeCatchTrials(t, path, tr)
 		r := rescoreOf(t, path)
 		cases, _ := loadCommittedCatch(t)
-		if a := rescoreArmOf(t, r, ArmArchitect); a.Recorded || len(a.PerCase) != 0 || len(a.NotRecorded) != len(loadCommittedPersona(t)) {
-			t.Errorf("architect arm absent from the sidecar: recorded %v, %d scored, not recorded %v; want NOT RECORDED", a.Recorded, len(a.PerCase), a.NotRecorded)
-		}
-		if out := r.Render(); !strings.Contains(out, ArmArchitect+": NOT RECORDED (the sidecar carries no such arm)") {
-			t.Errorf("Render does not report the architect arm NOT RECORDED:\n%s", out)
+		secCases, _ := loadCommittedSecurity(t)
+		for arm, n := range map[string]int{
+			ArmArchitect:           len(loadCommittedPersona(t)),
+			ArmSecurity:            len(SecurityArmCases(secCases, ArmSecurity)),
+			ArmSecurityPortability: len(SecurityArmCases(secCases, ArmSecurityPortability)),
+		} {
+			if a := rescoreArmOf(t, r, arm); a.Recorded || len(a.PerCase) != 0 || len(a.NotRecorded) != n {
+				t.Errorf("%s arm absent from the sidecar: recorded %v, %d scored, not recorded %v; want NOT RECORDED", arm, a.Recorded, len(a.PerCase), a.NotRecorded)
+			}
+			if out := r.Render(); !strings.Contains(out, arm+": NOT RECORDED (the sidecar carries no such arm)") {
+				t.Errorf("Render does not report the %s arm NOT RECORDED:\n%s", arm, out)
+			}
 		}
 		for _, a := range r.Arms {
-			if a.Arm == ArmArchitect {
+			if a.Arm == ArmArchitect || a.Arm == ArmSecurity || a.Arm == ArmSecurityPortability {
 				continue
 			}
 			if len(a.PerCase) != 0 || len(a.NotRecorded) != len(cases) || a.Pooled().Trials != 0 {
@@ -497,8 +580,10 @@ func TestRescoreCatchRateTrials_RenderStatesLowerBound(t *testing.T) {
 // (#4361); the margin is inclusive and exact.
 func TestRescoreCatchRateTrials_RenderFlagsTheCeiling(t *testing.T) {
 	out := rescoreOf(t, freshCatchEvidence(t)).Render()
-	if n := strings.Count(out, "AT CEILING"); n != 3 {
-		t.Errorf("an all-caught sidecar is flagged at ceiling %d times, want once per arm:\n%s", n, out)
+	// Once per arm with catch trials: security_portability runs clean cases
+	// only, so it has no catch rate to be at ceiling.
+	if n := strings.Count(out, "AT CEILING"); n != 4 {
+		t.Errorf("an all-caught sidecar is flagged at ceiling %d times, want once per arm with catch cases (4):\n%s", n, out)
 	}
 	for _, tc := range []struct {
 		p    CatchRescoreCounts
@@ -546,6 +631,34 @@ func TestRescoreCatchRateTrials_CommittedSidecar(t *testing.T) {
 		for _, c := range arm.PerCase {
 			if want := a.counts[c.Case]; c.Trials != want.Trials || c.RecordedCaught != want.Caught || c.Undecodable != want.Undecodable {
 				t.Errorf("arm %q case %q: sidecar tallies %+v, record %+v", a.arm, c.Case, c.CatchRescoreCounts, want)
+			}
+		}
+	}
+	// The security arms (#4314) hold BOTH before the operator's #4314 re-pin
+	// recording (the committed sidecar carries no such arm: NOT RECORDED,
+	// every corpus case not recorded) and after it (recorded tallies equal
+	// the record).
+	for _, name := range []string{ArmSecurity, ArmSecurityPortability} {
+		arm := rescoreArmOf(t, r, name)
+		recArm, inRecord := rec.Arms[name]
+		if !arm.Recorded {
+			if inRecord {
+				t.Errorf("arm %q is in the committed record but not its sidecar", name)
+			}
+			if len(arm.PerCase) != 0 || len(arm.NotRecorded) == 0 {
+				t.Errorf("arm %q NOT RECORDED: scored %d cases, not recorded %v; want none scored and every corpus case not recorded", name, len(arm.PerCase), arm.NotRecorded)
+			}
+			if out := r.Render(); !strings.Contains(out, name+": NOT RECORDED") {
+				t.Errorf("Render does not report arm %q NOT RECORDED:\n%s", name, out)
+			}
+			continue
+		}
+		if !inRecord || len(arm.PerCase) == 0 {
+			t.Fatalf("arm %q: in record %v, scored %d cases; want a recorded, scored arm", name, inRecord, len(arm.PerCase))
+		}
+		for _, c := range arm.PerCase {
+			if want := recArm.PerCase[c.Case]; c.Trials != want.Trials || c.RecordedCaught != want.Caught || c.RecordedFalseAlarms != want.FalseAlarms || c.Undecodable != want.Undecodable {
+				t.Errorf("arm %q case %q: sidecar tallies %+v, record %+v", name, c.Case, c.CatchRescoreCounts, want)
 			}
 		}
 	}
