@@ -179,6 +179,12 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 // by the previous overflow each step, is clamped at zero (never negative), and
 // the loop is bounded; an index that cannot fit even at a zero cap — the
 // budget is smaller than the truncation marker — is an error.
+//
+// The returned Document's CapBytes is the cap the index was actually cut under
+// (c), which is below budget whenever the index was reshaped. The in-body
+// marker, the rendered Source line and the per-document document_truncated
+// cap_bytes all report c. The budget itself is reported nowhere on the index;
+// the selection-level row carries the separate record budget (#3930).
 func fitIndex(f *repodoc.Fetched, budget int) (repodoc.Document, error) {
 	c := budget
 	doc := f.Document(c)

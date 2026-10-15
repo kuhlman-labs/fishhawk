@@ -2,6 +2,7 @@ package decisionrecord
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
@@ -269,21 +273,52 @@ func TestAssemble_OversizedRecordDroppedNeverTruncated(t *testing.T) {
 	}
 }
 
-// TestAssemble_IndexOverCap: the raw index alone exceeds the cap. It is still
-// included, cut with its loud marker, and its rendered size (marker included)
-// fits its own cap. The records have their own budget, so both small matches
-// are still shown in full (#4399 — before it, every match was dropped).
-func TestAssemble_IndexOverCap(t *testing.T) {
-	const capBytes = 1024
-	recs := []map[string]any{
-		rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"),
-		rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
-	}
+// overCapIndex builds an index over recs whose first record carries a title long
+// enough that the raw index exceeds capBytes, so Assemble must reshape it.
+func overCapIndex(t *testing.T, capBytes int, recs ...map[string]any) string {
+	t.Helper()
 	recs[0]["title"] = strings.Repeat("long title ", 300)
 	raw := string(indexJSON(t, recs...))
 	if len(raw) <= capBytes {
 		t.Fatalf("fixture index is %d bytes, want > %d", len(raw), capBytes)
 	}
+	return raw
+}
+
+// replayIndexCut computes, independently of fitIndex, the cap an over-cap index
+// is cut under: one shrink step from the budget by the first render's overflow.
+// It reads the index through the same Path and Commit Assemble does, because the
+// truncation marker embeds both and its length depends on them. The fixture
+// must converge in that one step, or the replay is not the production answer.
+func replayIndexCut(t *testing.T, raw string, capBytes int) int {
+	t.Helper()
+	fetched := &repodoc.Fetched{Path: indexPath, Commit: admissionSHA, Content: []byte(raw)}
+	first := fetched.Document(capBytes)
+	wantCut := capBytes - (first.RenderedBytes - capBytes)
+	if wantCut >= capBytes || fetched.Document(wantCut).RenderedBytes > capBytes {
+		t.Fatalf("fixture does not converge in one shrink step: first render %d bytes under cap %d, replayed cut %d renders %d bytes",
+			first.RenderedBytes, capBytes, wantCut, fetched.Document(wantCut).RenderedBytes)
+	}
+	return wantCut
+}
+
+// TestAssemble_IndexOverCap: the raw index alone exceeds the cap. It is still
+// included, cut with its loud marker, and its rendered size (marker included)
+// fits its own cap. The records have their own budget, so both small matches
+// are still shown in full (#4399 — before it, every match was dropped).
+//
+// #3930: the cut cap the index's Document records is pinned EXACTLY, replayed
+// independently of fitIndex, and the in-body marker and the rendered Source
+// line must name that same cap. It is below the resolver cap by design — the
+// resolver cap is never stamped onto the index, or the marker, the Source line
+// and the per-document document_truncated cap_bytes would stop agreeing.
+func TestAssemble_IndexOverCap(t *testing.T) {
+	const capBytes = 1024
+	raw := overCapIndex(t, capBytes,
+		rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"),
+		rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+	)
+	wantCut := replayIndexCut(t, raw, capBytes)
 	ff := newFetcher()
 	ff.seed(admissionSHA, map[string]string{indexPath: raw, "docs/adr/001.md": body("R1", 200), "docs/adr/002.md": body("R2", 200)})
 	sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
@@ -299,14 +334,100 @@ func TestAssemble_IndexOverCap(t *testing.T) {
 	if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) || len(sel.Dropped) != 0 {
 		t.Fatalf("included %v dropped %v, want both records shown under the separate record budget", got, ids(sel.Dropped))
 	}
-	if sel.Index.CapBytes > capBytes {
-		t.Errorf("index cut under a %d-byte cap, want <= its own cap %d", sel.Index.CapBytes, capBytes)
+	if sel.Index.CapBytes != wantCut {
+		t.Errorf("index CapBytes = %d, want the cut cap %d (the resolver cap %d shrunk by the first render's overflow; #3930)", sel.Index.CapBytes, wantCut, capBytes)
+	}
+	if want := fmt.Sprintf("at the %d-byte cap", wantCut); !strings.Contains(sel.Index.Content, want) {
+		t.Errorf("index truncation marker does not name the cut cap %q:\n%s", want, sel.Index.Content)
+	}
+	if want := fmt.Sprintf("TRUNCATED at %d bytes", wantCut); !strings.Contains(sel.PromptDocuments(false)[0].Body, want) {
+		t.Errorf("rendered index Source line does not name the cut cap %q:\n%s", want, sel.PromptDocuments(false)[0].Body)
 	}
 	if sel.CapBytes != capBytes || sel.IncludedBytes != 400 {
 		t.Errorf("CapBytes %d IncludedBytes %d, want the record budget %d holding exactly the two 200-byte records", sel.CapBytes, sel.IncludedBytes, capBytes)
 	}
 	if sel.Index.ContentHash == "" || sel.Index.OriginalBytes != len(raw) {
 		t.Errorf("index attribution fields = %+v", sel.Index)
+	}
+}
+
+// recordingAppender is an audit appender that keeps every append in memory. It
+// satisfies repodoc's unexported appender interface by method set.
+type recordingAppender struct{ appended []audit.ChainAppendParams }
+
+func (a *recordingAppender) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.appended = append(a.appended, p)
+	return &audit.Entry{ID: uuid.New(), Category: p.Category, Payload: p.Payload}, nil
+}
+
+// TestAssemble_IndexOverCap_AttributionCapBytes (#3930): an over-cap index that
+// also drops a record writes TWO document_truncated rows on one injection set,
+// and their cap_bytes measure different things by design — the per-document
+// row carries the index's CUT cap, the selection row the RECORD budget. The
+// assertions read the audit payloads AttributeSet persists, not struct fields.
+func TestAssemble_IndexOverCap_AttributionCapBytes(t *testing.T) {
+	const capBytes = 1024
+	raw := overCapIndex(t, capBytes,
+		rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"),
+		rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+		rec("ADR-003", "docs/adr/003.md", "accepted", "backend/internal/audit/**"),
+	)
+	wantCut := replayIndexCut(t, raw, capBytes)
+	ff := newFetcher()
+	ff.seed(admissionSHA, map[string]string{
+		indexPath:         raw,
+		"docs/adr/003.md": body("R3", 200),
+		"docs/adr/002.md": body("R2", 200),
+		"docs/adr/001.md": body("R1", capBytes+1),
+	})
+	sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if !sel.Index.Truncated {
+		t.Fatalf("fixture precondition: index not truncated, want an over-cap index cut under %d (< %d)", wantCut, capBytes)
+	}
+	if got := ids(sel.Dropped); !reflect.DeepEqual(got, []string{"ADR-001"}) {
+		t.Fatalf("fixture precondition: dropped %v, want exactly [ADR-001] so a selection row is written", got)
+	}
+
+	app := &recordingAppender{}
+	if err := repodoc.AttributeSet(context.Background(), app, uuid.New(), uuid.New(), sel.Attribution()); err != nil {
+		t.Fatalf("AttributeSet: %v", err)
+	}
+	var perDoc, selection []map[string]any
+	for _, p := range app.appended {
+		if p.Category != "document_truncated" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(p.Payload, &payload); err != nil {
+			t.Fatalf("decode document_truncated payload: %v", err)
+		}
+		if _, ok := payload["selection"]; ok {
+			selection = append(selection, payload)
+		} else {
+			perDoc = append(perDoc, payload)
+		}
+	}
+	if len(perDoc) != 1 || len(selection) != 1 {
+		t.Fatalf("document_truncated rows: %d per-document, %d selection, want one of each", len(perDoc), len(selection))
+	}
+	index, sels := perDoc[0], selection[0]
+	if index["path"] != indexPath || sels["selection"] != SelectionName {
+		t.Fatalf("rows mislabeled: per-document path %v, selection %v", index["path"], sels["selection"])
+	}
+	if got := index["cap_bytes"]; got != float64(wantCut) || got != float64(sel.Index.CapBytes) {
+		t.Errorf("per-document cap_bytes = %v, want the index's cut cap %d (Index.CapBytes %d; #3930)", got, wantCut, sel.Index.CapBytes)
+	}
+	if got := sels["cap_bytes"]; got != float64(capBytes) {
+		t.Errorf("selection cap_bytes = %v, want the record budget %d (#3930)", got, capBytes)
+	}
+	if got := sels["included_bytes"]; got != float64(400) || sel.IncludedBytes != 400 {
+		t.Errorf("selection included_bytes = %v (IncludedBytes %d), want the two 200-byte records, 400", got, sel.IncludedBytes)
+	}
+	if index["cap_bytes"] == sels["cap_bytes"] {
+		t.Errorf("both document_truncated rows carry cap_bytes %v; the index cut cap and the record budget measure different things and must differ for an over-cap index (#3930)", index["cap_bytes"])
 	}
 }
 

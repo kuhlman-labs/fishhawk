@@ -85,15 +85,35 @@ persona reviewed from index titles only.
 
 - **Index** — shaped under its own per-document cap, the resolver's cap
   (shrink-to-fit, below). Its own `document_injected` (and, when cut, its
-  per-document `document_truncated`) carry its `cap_bytes` and
-  `rendered_bytes`; that `cap_bytes` is the cap it was actually cut under, so
-  it equals the resolver's cap only when the index fit whole.
+  per-document `document_truncated`) split its numbers: `document_injected`
+  carries `rendered_bytes` and `truncated` but no `cap_bytes`; only the
+  per-document `document_truncated` carries `cap_bytes`. That `cap_bytes` is
+  the cap it was actually cut under, so it is below the resolver's cap
+  whenever the index was reshaped.
 - **Records** — fitted, whole and in rank order, against a separate **record
   budget** = the resolver's cap. `Selection.CapBytes` is that record budget and
   `Selection.IncludedBytes` the sum of the INCLUDED RECORDS' rendered bytes
   (the index excluded), always `<= CapBytes`; the selection-level
   `document_truncated`'s `cap_bytes` / `included_bytes` carry exactly those two
   values.
+
+**Two `cap_bytes` on one injection set (#3930).**
+
+1. When the index is cut, its per-document `document_truncated` `cap_bytes` is
+   the shrunk **cut cap**: below the resolver cap, and equal to the cap named
+   by the body's `at the <c>-byte cap` marker and the `TRUNCATED at <c> bytes`
+   Source line.
+2. When a record is dropped, the selection-level `document_truncated`
+   `cap_bytes` is the **record budget** (`Selection.CapBytes`).
+3. For an over-cap index that also drops a record, the two therefore differ by
+   design and must not be compared as one budget.
+4. Stamping the resolver cap onto the index Document was rejected: it would
+   desync the marker and the Source line (both derive from the cut) from the
+   audit row, and break `repodoc.Document.CapBytes`'s contract (the effective
+   cap the document was resolved under).
+
+Pinned by `TestAssemble_IndexOverCap` (exact cut cap, marker, Source line) and
+`TestAssemble_IndexOverCap_AttributionCapBytes` (both persisted rows).
 
 Bytes are `repodoc.Document.RenderedBytes`, the shown body between the
 delimiters, recorded as `rendered_bytes` on each `document_injected`. **The
@@ -201,7 +221,7 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | successor of an unselected record | not selected | `TestSelect_FollowsSupersessionToSuccessors` |
 | matches exceed the record budget | strict prefix included, rest dropped and named | `TestAssemble_FitsTheCap`, `TestAssemble_StrictPrefix` |
 | record larger than the remaining record budget / the whole budget | dropped whole, never truncated | `TestAssemble_OversizedRecordDroppedNeverTruncated` |
-| raw index over the cap | index shown truncated within its own cap; records still shown under the record budget | `TestAssemble_IndexOverCap` |
+| raw index over the cap | index shown truncated within its own cap; records still shown under the record budget | `TestAssemble_IndexOverCap`, `TestAssemble_IndexOverCap_AttributionCapBytes` |
 | index fills >= 95% of the cap | every record that fits the record budget still shown | `TestAssemble_IndexNearCapDoesNotStarveRecords` |
 | shipped index, typical scope, production cap | at least `minTypicalRecordBodies` governing bodies shown in full | `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` |
 | cap smaller than the marker | `ErrUnresolvable` (zero-cap guard) | `TestAssemble_CapSmallerThanMarker_FailsClosed` |

@@ -402,7 +402,10 @@ NEL included — plus U+2028/U+2029).
 (the zero `BaseSource`, named explicitly so an entry never reads as
 unrecorded). All three are registered in `audit.KnownCategories`, so `fishhawk_await_audit` and
 `GET /v0/runs/{id}/audit` accept them without `allow_unknown`. `cap_bytes` is
-the **configured** cap carried on the Document — it cannot be reconstructed
+the **configured** cap carried on the Document (for a consumer that passed its
+own cap to `Fetched.Document`, the decision-record index's `fitIndex`, it is
+that consumer's cut cap; see `decisionrecord/README.md` § "Two `cap_bytes` on
+one injection set (#3930)") — it cannot be reconstructed
 from `OriginalBytes` and `RenderedBytes` once a rune-safe cut and a marker have
 been applied.
 
