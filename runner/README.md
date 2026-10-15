@@ -520,9 +520,11 @@ pull 10m (`gateUnavailable`), the passwd read 5m and the cache prepare helper
 `FISHHAWK_GATE_IMAGE` pull inside the gate run is bounded only by the gate's
 own `executor.verify.timeout`.
 
-**Pulls OUTSIDE the runner keep the old hazard.** A hand-run pull,
-`scripts/test lint|verify --in-gate-image` and the docker-gated e2e fixtures
-run under YOUR docker config and hang on a locked screen with no bound. Their
+**Pulls OUTSIDE the runner keep the old hazard.** A hand-run pull and
+`scripts/test lint|verify --in-gate-image` run under YOUR docker config and
+hang on a locked screen with no bound (the docker-gated e2e fixtures no
+longer do: since #4337 they pull under a minted credential-free config
+through a bounded, process-group-killing exec). Their
 remedy, for anonymous public pulls only: unlock the screen, or point
 `DOCKER_CONFIG` at a fresh `{"auths":{"fishhawk.invalid":{}}}` config (no
 `credsStore`, no `credHelpers`, no credential in `auths` — the one empty
