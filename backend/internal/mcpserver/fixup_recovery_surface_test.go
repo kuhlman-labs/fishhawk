@@ -140,7 +140,11 @@ func TestFixupRecoveryMessage_NamesTheConsequencesAndTheBudgetRule(t *testing.T)
 		"FAILED",
 		"pushed no commit",
 		"NOT addressed",
-		"git log",
+		// ADR-097 D1 (#4301): the confirmation is an inventory specialist
+		// job, not an inline git read.
+		"fishhawk_request_specialist_job",
+		"inventory",
+		"git_log",
 		"commit/push onto PR branch failed",
 		"Source failure category: C",
 		// The corrected rule: a delivered-nothing category-A death refunds,
@@ -220,7 +224,7 @@ func TestLatestFixupRecovery_RoundClosureFields(t *testing.T) {
 		},
 		{
 			// The pushed outcome must be CONSISTENT end to end: the opening
-			// and the `git log` confirmation may not describe an absent commit
+			// and the inventory-job confirmation may not describe an absent commit
 			// the closure sentence then says was pushed.
 			name:   "pushed before death",
 			sig:    fixupRecoverySignal{Sequence: 11, Parsed: true, DeliveredNothing: &fal},
@@ -284,8 +288,8 @@ func TestFixupRecoveryMessage_PushedOutcomeCompleteAdvisory(t *testing.T) {
 	msg := fixupRecoveryMessage(&FixupRecovery{RestoredState: "succeeded", DetailsAvailable: true, DeliveredNothing: &fal})
 	const want = "the fix-up pass FAILED after pushing a commit; the stage was restored to its prior state (which is why " +
 		"status reads 'succeeded') — the PR head carries that fix-up commit, but the pass died before it finished, so treat " +
-		"your routed concerns as NOT confirmed addressed until the re-review of that head reports. Confirm with `git log` " +
-		"on the PR head: the fix-up commit is present. The pass pushed a commit before it died; the re-review of that head " +
+		"your routed concerns as NOT confirmed addressed until the re-review of that head reports. Confirm on the PR head with an inventory " +
+		"specialist job (fishhawk_request_specialist_job, command git_log): the fix-up commit is present. The pass pushed a commit before it died; the re-review of that head " +
 		"governs. Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded " +
 		"against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or " +
 		"produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed " +

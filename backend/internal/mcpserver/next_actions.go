@@ -563,7 +563,7 @@ func foldRejectWithoutConcernAdvisory(implementReviewStatus *ReviewStatus, na *N
 		Params:       map[string]string{"reviewer_model": who},
 		Precondition: "an implement review returned `reject` while naming no concern — no concerns[] entry and no concern_resolutions note",
 		Consumes:     consumesNone,
-		Reason:       who + " rejected the pass without naming a concern, so there is nothing to route through fishhawk_fixup_stage — read the review's free_form for what it actually asserted and decide yourself whether it is a finding worth routing",
+		Reason:       who + " rejected the pass without naming a concern, so there is nothing to route through fishhawk_fixup_stage — read the review's free_form for what it actually asserted; when it asserts a fact about the tree, check that claim with a " + specialistJobKindPlanCrosscheck + " job via fishhawk_request_specialist_job rather than reading the tree inline (ADR-097 D1), then decide whether it is a finding worth routing",
 	})
 }
 
@@ -1164,9 +1164,10 @@ func supersededImplementCount(run *Run) int {
 }
 
 // supersededSettledActions builds the implement_gate_settled_after_supersede
-// action list (E45.83 / #3618): the two RECOVERY actions first — read the
-// discarded concerns out of the gate view's settled[] ledger, then route them
-// back — followed by whatever the ordinary settled arm would have produced,
+// action list (E45.83 / #3618): the RECOVERY actions first — read the
+// discarded concerns out of the gate view's settled[] ledger, check whether
+// each defect survives with a plan_crosscheck specialist job (ADR-097 D1,
+// #4301), then route them back — followed by whatever the ordinary settled arm would have produced,
 // appended UNCHANGED. Nothing is removed: the acceptance gate is not skipped,
 // and where the ordinary arm offers the merge ritual it is still offered, with a
 // reason that names the discard instead of claiming the review settled.
@@ -1185,24 +1186,52 @@ func supersededSettledActions(run *Run, impl, acceptance *Stage, discarded int,
 			Consumes:     consumesNone,
 			Reason:       fmt.Sprintf("%d implement-review concern(s) from a PRIOR attempt were DISCARDED by a retry (state superseded), so no open concern remains — but nothing ANSWERED them. The settled[] ledger carries each one's id, reviewer_model, severity, category and note; read it before deciding whether the defects survive on this tree", discarded),
 		},
+		supersededCrosscheckAction(run, discarded),
 		{
 			Action:       "fishhawk_fixup_stage",
 			Params:       map[string]string{"stage_id": implStageID, "concern_ids": "<superseded ids from gate_view settled[]>"},
 			Precondition: "the implement stage is parked at its review gate (or succeeded with the PR open); stay on a clean default branch — the runner owns the run branch in its lineage worktree",
 			Consumes:     consumesFixupBudget,
-			Reason:       fmt.Sprintf("route any of the %d discarded concern(s) back against the NEW tree: a SUPERSEDED implement-stage id is accepted by concern_ids and re-opens with its reviewer, round and severity intact, then is tracked to closure like any routed concern. Skip this only once you have read the notes and judged each defect absent from the retried tree", discarded),
+			Reason:       fmt.Sprintf("route any of the %d discarded concern(s) back against the NEW tree: a SUPERSEDED implement-stage id is accepted by concern_ids and re-opens with its reviewer, round and severity intact, then is tracked to closure like any routed concern. Skip this only once the plan_crosscheck job's evidence shows each defect absent from the retried tree", discarded),
 		},
 	}
 	if acceptance != nil {
 		// The acceptance gate is NOT skipped — the ordinary arm's actions ride
-		// along unchanged behind the recovery pair.
+		// along unchanged behind the recovery actions.
 		if acc := acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition); acc != nil {
 			return append(actions, acc.Actions...)
 		}
 		return actions
 	}
 	return append(actions, mergeRitualActions(run,
-		fmt.Sprintf("the implement review has no open concerns, but %d were DISCARDED by a retry rather than addressed — merge only if you have read their notes in the gate view's settled[] ledger and judged each defect absent from this tree", discarded))...)
+		fmt.Sprintf("the implement review has no open concerns, but %d were DISCARDED by a retry rather than addressed — merge only if you have read their notes in the gate view's settled[] ledger and the plan_crosscheck job's evidence shows each defect absent from this tree", discarded))...)
+}
+
+// supersededCrosscheckAction is the delegation step of the
+// implement_gate_settled_after_supersede arm (ADR-097 D1, #4301): between
+// reading the discarded concerns and routing them back, the operator checks
+// whether each defect survives on the retried tree — and that check is
+// evidence work, so it goes to a plan_crosscheck specialist job rather than an
+// inline read of the tree. The job is read-only: it runs in a scratch clone in
+// the local-verify group and writes only its job row and audit entries, so it
+// consumes nothing. subject.head_sha is a field-path pointer (this package's
+// documented convention for a value the Run mirror does not carry), not a
+// resolved SHA: the mirror has no PR-head field and adding a wire field is out
+// of scope.
+func supersededCrosscheckAction(run *Run, discarded int) SuggestedAction {
+	return SuggestedAction{
+		Action: "fishhawk_request_specialist_job",
+		Params: map[string]string{
+			"kind":             specialistJobKindPlanCrosscheck,
+			"subject.run_id":   run.ID,
+			"subject.head_sha": "the PR head commit — gate_view merge_candidate_verdict.head_sha when recorded",
+			"inputs":           "questions[]: one probe (path_exists / file_contains / go_test) per discarded concern from gate_view settled[]",
+			"working_dir":      "<absolute checkout path>",
+		},
+		Precondition: "none — read-only evidence: the job runs in a scratch clone in the local-verify group and writes only its job row and audit entries",
+		Consumes:     consumesNone,
+		Reason:       fmt.Sprintf("check whether each of the %d DISCARDED concern(s) still holds on the retried tree: the job's typed verdict (pass / fail / inconclusive), not an inline read of the tree, decides whether each defect survives (ADR-097 D1). Read the result with fishhawk_get_specialist_job before routing anything back", discarded),
+	}
 }
 
 // deployStageNextActions covers a delegating deploy stage's non-terminal

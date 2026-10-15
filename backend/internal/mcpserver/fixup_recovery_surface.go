@@ -312,8 +312,8 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		return ""
 	}
 	var b strings.Builder
-	// The opening and the `git log` confirmation are keyed to what the backend
-	// actually verified about the PR branch (#3395 fix-up): a pass that
+	// The opening and the inventory-job confirmation are keyed to what the
+	// backend actually verified about the PR branch (#3395 fix-up): a pass that
 	// PUSHED before it died must not be described as having pushed nothing,
 	// nor told to confirm an absent commit that is present.
 	pushed := rec.DeliveredNothing != nil && !*rec.DeliveredNothing
@@ -346,9 +346,9 @@ func fixupRecoveryMessage(rec *FixupRecovery) string {
 		b.WriteString(" " + fixupRecoveryUntrustedClose)
 	}
 	if pushed {
-		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is present.")
+		b.WriteString(" Confirm on the PR head with an inventory specialist job (fishhawk_request_specialist_job, command git_log): the fix-up commit is present.")
 	} else {
-		b.WriteString(" Confirm with `git log` on the PR head: the fix-up commit is absent.")
+		b.WriteString(" Confirm on the PR head with an inventory specialist job (fishhawk_request_specialist_job, command git_log): the fix-up commit is absent.")
 	}
 	b.WriteString(fixupRoundClosureSentence(rec))
 	b.WriteString(" Fix-up budget, as it stands today: a fix-up pass that delivered NOTHING to the PR branch is refunded against the normal budget — whether it died category-A (harness, #3085) or category-C (infrastructure, #1957), or produced no commit at all (#967). A category-B (policy) failure still CONSUMES a pass, as does any pass that pushed a commit before it died. Since #3335 a delivered-nothing pass is credited against the hard ceiling as well as the normal budget, capped at 3 such credits, so the absolute bound is 6 triggered passes.")

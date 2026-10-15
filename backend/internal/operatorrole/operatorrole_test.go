@@ -1,9 +1,16 @@
 package operatorrole
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 type errReader struct{ err error }
@@ -65,6 +72,123 @@ func TestDefaultRoundTrip(t *testing.T) {
 	if len(d.Forbidden) == 0 {
 		t.Error("Forbidden is empty")
 	}
+
+	// The orchestration remit (ADR-097 D1, #4301) is optional in the schema
+	// but always present in the shipped default. Assert it on the EMBEDDED
+	// default so a comment-only or no-op touch of the YAML fails.
+	o := d.Orchestration
+	if o == nil {
+		t.Fatal("Orchestration is nil: the shipped default must carry the remit")
+	}
+	if len(o.Remit) == 0 {
+		t.Error("Orchestration.Remit is empty")
+	}
+	if len(o.ReadingResults) == 0 {
+		t.Error("Orchestration.ReadingResults is empty")
+	}
+	for i, s := range append(append([]string{}, o.Remit...), o.ReadingResults...) {
+		if strings.TrimSpace(s) == "" {
+			t.Errorf("orchestration step %d is blank", i)
+		}
+	}
+	// The delegation key set must EQUAL the specialist-job kind set, so a
+	// kind added to specialistjob.AllKinds without a recipe fails here.
+	var wantKinds, gotKinds []string
+	for _, k := range specialistjob.AllKinds {
+		wantKinds = append(wantKinds, string(k))
+	}
+	for k, r := range o.Delegation {
+		gotKinds = append(gotKinds, k)
+		if strings.TrimSpace(r.When) == "" {
+			t.Errorf("Orchestration.Delegation[%q].When is empty", k)
+		}
+		if strings.TrimSpace(r.Read) == "" {
+			t.Errorf("Orchestration.Delegation[%q].Read is empty", k)
+		}
+	}
+	sort.Strings(wantKinds)
+	sort.Strings(gotKinds)
+	if strings.Join(gotKinds, ",") != strings.Join(wantKinds, ",") {
+		t.Errorf("Orchestration.Delegation keys = %v, want exactly the specialist-job kinds %v", gotKinds, wantKinds)
+	}
+}
+
+// defaultAsRawMap decodes the embedded default into a mutable generic
+// document, the shape the full-schema fixtures below edit.
+func defaultAsRawMap(t *testing.T) map[string]any {
+	t.Helper()
+	data, err := embedded.ReadFile(defaultSpecPath)
+	if err != nil {
+		t.Fatalf("read embedded default: %v", err)
+	}
+	var raw map[string]any
+	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&raw); err != nil {
+		t.Fatalf("decode embedded default: %v", err)
+	}
+	// Round-trip through JSON so every nested value has the generic shape
+	// the schema validator expects (yaml.v3 yields map[string]any already,
+	// but this also normalizes numbers and guards against aliasing).
+	b, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("marshal embedded default: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal embedded default: %v", err)
+	}
+	return out
+}
+
+// TestRoleSchemaClosesDelegationKinds pins the full schema's orchestration
+// shape (ADR-097 D1): the delegation key set is closed to the six
+// specialist-job kinds in BOTH directions, and the section stays optional
+// within operator-role-v0.
+func TestRoleSchemaClosesDelegationKinds(t *testing.T) {
+	// Sanity: the untouched default validates, so each failure below is
+	// attributable to its mutation alone.
+	if err := roleSchema.Validate(defaultAsRawMap(t)); err != nil {
+		t.Fatalf("embedded default does not validate: %v", err)
+	}
+
+	delegationOf := func(doc map[string]any) map[string]any {
+		return doc["orchestration"].(map[string]any)["delegation"].(map[string]any)
+	}
+
+	t.Run("missing kind", func(t *testing.T) {
+		doc := defaultAsRawMap(t)
+		delete(delegationOf(doc), "draft")
+		if err := roleSchema.Validate(doc); err == nil {
+			t.Error("schema accepted a delegation block missing the draft kind")
+		}
+	})
+	t.Run("unknown kind", func(t *testing.T) {
+		doc := defaultAsRawMap(t)
+		delegationOf(doc)["bogus_kind"] = map[string]any{"when": "w", "read": "r"}
+		if err := roleSchema.Validate(doc); err == nil {
+			t.Error("schema accepted a delegation block with an unknown kind key")
+		}
+	})
+	t.Run("recipe missing read", func(t *testing.T) {
+		doc := defaultAsRawMap(t)
+		delegationOf(doc)["inventory"] = map[string]any{"when": "w"}
+		if err := roleSchema.Validate(doc); err == nil {
+			t.Error("schema accepted a delegation recipe without read")
+		}
+	})
+	t.Run("blank recipe when", func(t *testing.T) {
+		doc := defaultAsRawMap(t)
+		delegationOf(doc)["inventory"] = map[string]any{"when": "", "read": "r"}
+		if err := roleSchema.Validate(doc); err == nil {
+			t.Error("schema accepted a delegation recipe with an empty when")
+		}
+	})
+	t.Run("orchestration is optional within v0", func(t *testing.T) {
+		doc := defaultAsRawMap(t)
+		delete(doc, "orchestration")
+		if err := roleSchema.Validate(doc); err != nil {
+			t.Errorf("schema rejected a spec with no orchestration section (additive optional within v0): %v", err)
+		}
+	})
 }
 
 // TestValidateOverlayValid mirrors the documented example overlay
@@ -94,30 +218,51 @@ func TestValidateOverlayMinimal(t *testing.T) {
 // procedure field: each must fail with a *ThinnessError naming the
 // field and the rule.
 func TestValidateOverlayThinness(t *testing.T) {
-	cases := map[string]string{
-		"gate_procedures": `
+	cases := []struct {
+		name    string
+		field   string
+		overlay string
+	}{
+		{"gate_procedures", "gate_procedures", `
 spec_version: operator-role-v0
 gate_procedures:
   extra_gate:
     - a per-repo procedure step
-`,
-		"mission": `
+`},
+		{"mission", "mission", `
 spec_version: operator-role-v0
 mission: a repo-local mission statement
-`,
-		"escalation": `
+`},
+		{"escalation", "escalation", `
 spec_version: operator-role-v0
 escalation:
   page_format: terse
-`,
-		"forbidden": `
+`},
+		{"forbidden", "forbidden", `
 spec_version: operator-role-v0
 forbidden:
   - a repo-local prohibition
-`,
+`},
+		// ADR-097 D1: the orchestration remit is base-spec procedure. An
+		// overlay can neither override it nor remove it.
+		{"orchestration", "orchestration", `
+spec_version: operator-role-v0
+orchestration:
+  remit:
+    - a repo-local remit step
+  delegation:
+    counterfactual_battery:
+      when: a repo-local trigger
+      read: a repo-local reading
+`},
+		{"orchestration_null", "orchestration", `
+spec_version: operator-role-v0
+orchestration: null
+`},
 	}
-	for field, overlay := range cases {
-		t.Run(field, func(t *testing.T) {
+	for _, tc := range cases {
+		field, overlay := tc.field, tc.overlay
+		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateOverlay(strings.NewReader(overlay))
 			if err == nil {
 				t.Fatalf("ValidateOverlay accepted overlay setting %q", field)

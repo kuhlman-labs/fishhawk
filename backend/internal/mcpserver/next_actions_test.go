@@ -31,6 +31,7 @@ import (
 	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
 // --- fixture helpers -------------------------------------------------------
@@ -5263,6 +5264,13 @@ func TestNextActions_RejectWithoutConcernAdvisory(t *testing.T) {
 		if !strings.Contains(act.Reason, "free_form") {
 			t.Errorf("reason = %q, want it to point the operator at free_form", act.Reason)
 		}
+		// ADR-097 D1 (#4301): a tree-fact claim is checked by a specialist
+		// job, not by reading the tree inline.
+		for _, want := range []string{"fishhawk_request_specialist_job", "plan_crosscheck"} {
+			if !strings.Contains(act.Reason, want) {
+				t.Errorf("reason = %q, want it to name %q", act.Reason, want)
+			}
+		}
 		names := actionNames(na)
 		if names[len(names)-1] != "review_reject_without_concern" {
 			t.Errorf("advisory must be appended LAST; actions = %v", names)
@@ -5408,12 +5416,17 @@ func naRunWithSuperseded(state string, openImplement, superseded int) *Run {
 // retry DISCARDED the prior attempt's implement-review concerns, so the open
 // set is empty and the pre-change classifier reported implement_gate_settled
 // with the merge ritual — reporting a discard as a settle. The new arm leads
-// with the RECOVERY (gate view, then fix-up) and keeps the merge ritual LAST,
-// with a reason that no longer claims the review settled with no open concerns.
+// with the RECOVERY (gate view, a plan_crosscheck specialist job that checks
+// whether each discarded defect survives — ADR-097 D1 / #4301 — then fix-up)
+// and keeps the merge ritual LAST, with a reason that no longer claims the
+// review settled with no open concerns.
 //
 // COUNTERFACTUAL (executed): deleting the supersededImplementCount(run) > 0
 // branch from implementStageNextActions makes this fail with
-// `state = "implement_gate_settled"`.
+// `state = "implement_gate_settled"`; deleting the supersededCrosscheckAction
+// call from supersededSettledActions makes the exact-order DeepEqual below
+// fail (the arm drops to [get_gate_view, fixup_stage, approve_pr,
+// merge_run]).
 func TestNextActions_SettledAfterSupersede_NoAcceptance(t *testing.T) {
 	run := naRunWithSuperseded("running", 0, 2)
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
@@ -5421,9 +5434,31 @@ func TestNextActions_SettledAfterSupersede_NoAcceptance(t *testing.T) {
 	if na == nil || na.State != "implement_gate_settled_after_supersede" {
 		t.Fatalf("state = %+v, want implement_gate_settled_after_supersede", na)
 	}
-	want := []string{"fishhawk_get_gate_view", "fishhawk_fixup_stage", "approve_pr", "fishhawk_merge_run"}
+	want := []string{"fishhawk_get_gate_view", "fishhawk_request_specialist_job", "fishhawk_fixup_stage", "approve_pr", "fishhawk_merge_run"}
 	if got := actionNames(na); !reflect.DeepEqual(got, want) {
 		t.Fatalf("actions = %v, want %v (recovery FIRST, merge ritual LAST)", got, want)
+	}
+	// The delegation step: a read-only plan_crosscheck job about THIS run,
+	// naming the discard count (ADR-097 D1, #4301).
+	sj := findAction(t, na, "fishhawk_request_specialist_job")
+	if sj.Params["kind"] != "plan_crosscheck" {
+		t.Errorf("specialist job kind = %q, want plan_crosscheck", sj.Params["kind"])
+	}
+	if sj.Params["subject.run_id"] != run.ID {
+		t.Errorf("specialist job subject.run_id = %q, want %q", sj.Params["subject.run_id"], run.ID)
+	}
+	if sj.Consumes != consumesNone {
+		t.Errorf("specialist job Consumes = %q, want %q (read-only evidence)", sj.Consumes, consumesNone)
+	}
+	if !strings.Contains(sj.Reason, "2 DISCARDED concern") {
+		t.Errorf("specialist job reason must name the discard count: %q", sj.Reason)
+	}
+	// The fix-up and merge reasons cite the job's evidence, not an inline read.
+	if fxr := findAction(t, na, "fishhawk_fixup_stage").Reason; !strings.Contains(fxr, "plan_crosscheck") {
+		t.Errorf("fixup reason must cite the plan_crosscheck evidence: %q", fxr)
+	}
+	if mr := findAction(t, na, "approve_pr").Reason; !strings.Contains(mr, "plan_crosscheck") {
+		t.Errorf("merge reason must cite the plan_crosscheck evidence: %q", mr)
 	}
 	// The gate view action must point at the implement stage's ledger and name
 	// the discard count.
@@ -5464,7 +5499,7 @@ func TestNextActions_SettledAfterSupersede_NoAcceptance(t *testing.T) {
 // TestNextActions_SettledAfterSupersede_WithAcceptance pins that the new arm
 // APPENDS to the ordinary path rather than replacing it: with an acceptance
 // stage present, the acceptance gate's own actions ride along behind the
-// recovery pair and the merge ritual does NOT appear early.
+// recovery actions and the merge ritual does NOT appear early.
 func TestNextActions_SettledAfterSupersede_WithAcceptance(t *testing.T) {
 	run := naRunWithSuperseded("running", 0, 1)
 	stages := naAcceptanceStages("pending")
@@ -5473,11 +5508,11 @@ func TestNextActions_SettledAfterSupersede_WithAcceptance(t *testing.T) {
 		t.Fatalf("state = %+v, want implement_gate_settled_after_supersede", na)
 	}
 	got := actionNames(na)
-	if len(got) < 3 {
-		t.Fatalf("actions = %v, want the recovery pair plus the acceptance arm's actions", got)
+	if len(got) < 4 {
+		t.Fatalf("actions = %v, want the recovery triple plus the acceptance arm's actions", got)
 	}
-	if got[0] != "fishhawk_get_gate_view" || got[1] != "fishhawk_fixup_stage" {
-		t.Fatalf("actions = %v, want the recovery pair first", got)
+	if got[0] != "fishhawk_get_gate_view" || got[1] != "fishhawk_request_specialist_job" || got[2] != "fishhawk_fixup_stage" {
+		t.Fatalf("actions = %v, want the recovery triple (gate view, specialist job, fix-up) first", got)
 	}
 	// The acceptance arm's own actions follow, UNCHANGED — compare against what
 	// the ordinary settled path produces for the same stages.
@@ -5490,10 +5525,10 @@ func TestNextActions_SettledAfterSupersede_WithAcceptance(t *testing.T) {
 	if ordinary == nil {
 		t.Fatal("ordinary acceptance arm returned nil")
 	}
-	if !reflect.DeepEqual(got[2:], actionNames(ordinary)) {
-		t.Errorf("appended actions = %v, want the acceptance arm's %v unchanged (the acceptance gate must not be skipped)", got[2:], actionNames(ordinary))
+	if !reflect.DeepEqual(got[3:], actionNames(ordinary)) {
+		t.Errorf("appended actions = %v, want the acceptance arm's %v unchanged (the acceptance gate must not be skipped)", got[3:], actionNames(ordinary))
 	}
-	if !reflect.DeepEqual(na.Actions[2:], ordinary.Actions) {
+	if !reflect.DeepEqual(na.Actions[3:], ordinary.Actions) {
 		t.Error("the appended acceptance actions are not byte-identical to the ordinary arm's")
 	}
 	for _, name := range got {
@@ -6814,4 +6849,23 @@ func TestNextActions_MergeCandidateRerunAlternative(t *testing.T) {
 		foldMergeCandidateRerunAlternative(nil, na)
 		foldMergeCandidateRerunAlternative(r, nil) // must not panic
 	})
+}
+
+// TestSpecialistJobSuggestionKindsAreKnown pins every specialist-job kind
+// next_actions suggests (ADR-097 D1, #4301) to specialistjob.AllKinds, so a
+// renamed kind can never be suggested to the operator.
+func TestSpecialistJobSuggestionKindsAreKnown(t *testing.T) {
+	known := map[string]bool{}
+	for _, k := range specialistjob.AllKinds {
+		known[string(k)] = true
+	}
+	for name, kind := range map[string]string{
+		"specialistJobKindPlanCrosscheck": specialistJobKindPlanCrosscheck,
+		"specialistJobKindInventory":      specialistJobKindInventory,
+		"specialistJobKindDraft":          specialistJobKindDraft,
+	} {
+		if !known[kind] {
+			t.Errorf("%s = %q is not a specialistjob.AllKinds member", name, kind)
+		}
+	}
 }
