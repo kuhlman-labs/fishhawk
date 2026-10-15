@@ -2379,6 +2379,19 @@ func TestParseDetachedRunnerFailure(t *testing.T) {
 			t.Errorf("(%q,%q), want empty for a missing file", reason, detail)
 		}
 	})
+	// The EXACT line shape fishhawk-runner emits on a version-skew refusal
+	// (#4135), after the earlier version_skew_detected line: the reaper must
+	// surface the named reason and the upgrade remedy, not a generic exit-3.
+	t.Run("runner version_skew refusal", func(t *testing.T) {
+		const wantDetail = "fishhawk-runner v0.4.0 is older than the backend's min_runner_version v0.5.0; upgrade fishhawk-runner to at least v0.5.0"
+		p := writeReapLog(t,
+			`{"event":"version_skew_detected","runner_version":"v0.4.0","min_required":"v0.5.0"}`,
+			`{"event":"runner_failed","reason":"version_skew","detail":"`+wantDetail+`"}`)
+		reason, detail := parseDetachedRunnerFailure(p)
+		if reason != "version_skew" || detail != wantDetail {
+			t.Errorf("(%q,%q), want (version_skew,%q)", reason, detail, wantDetail)
+		}
+	})
 }
 
 // Cross-boundary integration (#1747): a detached runner that writes a

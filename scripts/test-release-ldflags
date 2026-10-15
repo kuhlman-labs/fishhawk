@@ -26,6 +26,11 @@
 #       Prints its wall time.
 #   r8  the stamped fishhawk-mcp's stdio `initialize` handshake advertises
 #       serverInfo.version "<Version>+<GitSHA>" (bounded: killed after ~20s).
+#   r9  cross-boundary (#4135): links backend/internal/version's test binary
+#       with the helper's release stamp and its dev stamp and requires the
+#       init()-resolved MinRunnerVersion to equal the committed
+#       min-runner-version floor (release) / "dev" (dev). SKIP without go.
+#       Prints its wall time.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -257,6 +262,41 @@ else
     fi
   else
     fail "r7/r8 skipped the read-back: a build above failed"
+  fi
+fi
+
+# --- r9 ----------------------------------------------------------------------
+# The helper emits no MinRunnerVersion pair: backend/internal/version embeds the
+# committed floor and init() resolves it when the stamped Version is
+# release-shaped. Output goes to files, never into a quiet grep (pipefail trap).
+if ! command -v go >/dev/null 2>&1; then
+  skip "r9 go is absent from PATH; the MinRunnerVersion resolution leg did not run"
+else
+  FLOOR=$(tr -d '[:space:]' <"$ROOT/backend/internal/version/min-runner-version")
+  if [ -z "$FLOOR" ] || [ "$FLOOR" = dev ]; then
+    fail "r9 backend/internal/version/min-runner-version is [$FLOOR]; the release arm would be vacuous"
+  else
+    r9_start=$(date +%s)
+    # r9_arm <label> <component> <version> <want-line>
+    r9_arm() {
+      label=$1
+      want=$4
+      if ! flags=$(/bin/sh "$HELPER" "$2" "$3" "$FULL_SHA"); then
+        fail "r9 $label: scripts/release-ldflags failed"
+        return
+      fi
+      (cd "$ROOT" && go test -count=1 -v -ldflags "$flags" -run '^TestMinRunnerVersion_MatchesBuildStamp$' ./backend/internal/version/) >"$TMP/r9.$label.out" 2>&1
+      rc=$?
+      if [ "$rc" -eq 0 ] && grep -qF -- "$want" "$TMP/r9.$label.out"; then
+        pass "r9 $label: $want"
+      else
+        fail "r9 $label: rc=$rc, want output containing [$want], got [$(cat "$TMP/r9.$label.out")]"
+      fi
+    }
+    r9_arm release fishhawkd v9.8.7 "resolved min_runner_version=$FLOOR (Version=v9.8.7)"
+    r9_arm dev fishhawkd dev "resolved min_runner_version=dev (Version=dev)"
+    r9_end=$(date +%s)
+    printf 'r9: resolved MinRunnerVersion under two stamps in %ss\n' "$((r9_end - r9_start))"
   fi
 fi
 
