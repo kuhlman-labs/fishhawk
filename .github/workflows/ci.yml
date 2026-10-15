@@ -218,6 +218,16 @@ jobs:
           restore-keys: |
             go-test-${{ runner.os }}-${{ matrix.leg }}-
 
+      # Download EVERY go.work module's dependencies, not just the ones this
+      # leg compiles. basedelta's TestGoListLoader_RealRepository runs `go list`
+      # over the whole workspace under GOPROXY=off, so on a go.sum change the
+      # restore-keys fallback (one leg's older cache) lacks another module's
+      # new versions and the test fails with "module lookup disabled by
+      # GOPROXY=off" (#3787: the runner's x/mod, x/tools, x/sys bumps failed
+      # the backend-rest leg). A no-op on a warm cache.
+      - name: Download workspace modules
+        run: go mod download
+
       - name: Test leg ${{ matrix.leg }}
         run: scripts/ci-test-leg "${{ matrix.leg }}" coverage-profiles
 
