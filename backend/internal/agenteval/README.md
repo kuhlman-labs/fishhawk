@@ -978,12 +978,17 @@ are logged, not pinned, so a routine ADR landing does not redden verify.
 (~31 KB) nearly fills the 32 KB `repodoc.DefaultMaxBytes` budget the index and
 included records share (`backend/internal/decisionrecord/README.md` § "Byte
 budget"), so `Assemble` includes ZERO full records: ADR-006 is matched by the
-migration case's scope but dropped (2,569 bytes against the 1,474 the index
+migration case's scope but dropped (2,569 bytes against the 1,427 the index
 leaves), and ADR-091 and ADR-095 carry empty `applies_to` and are never
 matched. Both ADR-conflict cases plant a conflict stated in a record BODY, so
 the persona has only index titles and supersession metadata to find it from.
-The arm measures what ships. Operator follow-ups: raise the cap or slim the
-index, and populate `applies_to` on the merge-path records.
+The arm measures what ships. E86.58 / #4398 re-applied the `applies_to` rule to
+the 11 superseding records (only ADR-098 gained a glob,
+`backend/internal/basedelta/**`) and made `Select` follow supersession to a
+selected record's successors; it did NOT move the merge-path case: ADR-091 and
+ADR-095 still name no subject path, so neither is selected, and a selected
+body still does not fit beside the index. The remaining operator follow-up is
+the decision-record budget split (#4399).
 
 **ADR churn stales the architect arm.** Its fingerprint covers the rendered
 persona prompt, which embeds the real index, so an ADR landing stales THAT arm

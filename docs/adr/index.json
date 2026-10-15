@@ -915,7 +915,9 @@
         "ADR-096"
       ],
       "superseded_by": [],
-      "applies_to": []
+      "applies_to": [
+        "backend/internal/basedelta/**"
+      ]
     },
     {
       "id": "ADR-099",

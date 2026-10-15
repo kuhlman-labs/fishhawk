@@ -54,8 +54,12 @@ type Selection struct {
 	Index repodoc.Document
 	// TotalRecords is how many records the index lists.
 	TotalRecords int
-	// Matched is how many records' applies_to matched the change.
+	// Matched is how many records were selected: those whose applies_to
+	// matched the change plus the successors followed from them.
 	Matched int
+	// Followed is how many of Matched were selected ONLY as successors of a
+	// selected record (MatchedPaths == 0).
+	Followed int
 	// Included are the matches shown in full, in rank order — a strict prefix
 	// of the ranking.
 	Included []Included
@@ -124,6 +128,11 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		Matched:       len(matches),
 		CapBytes:      budget,
 		IncludedBytes: idxDoc.RenderedBytes,
+	}
+	for _, m := range matches {
+		if m.MatchedPaths == 0 {
+			sel.Followed++
+		}
 	}
 	remaining := budget - idxDoc.RenderedBytes
 	for i, m := range matches {
@@ -236,17 +245,26 @@ func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
 	out := make([]prompt.InjectedDocument, 0, 1+len(s.Included))
 	out = append(out, repodoc.ToPromptDocument(s.Index, s.indexFraming(grounded)))
 	for _, inc := range s.Included {
-		out = append(out, repodoc.ToPromptDocument(inc.Document, recordFraming(inc.Record)))
+		out = append(out, repodoc.ToPromptDocument(inc.Document, recordFraming(inc.Match)))
 	}
 	return out
 }
 
-// indexFraming is the system-authored framing of the index document.
+// indexFraming is the system-authored framing of the index document. With no
+// followed successor (Followed == 0) the preamble is exactly the pre-#4398
+// text.
 func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	var b strings.Builder
-	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. "+
-		"%d of its %d records declare an applies_to path glob matching a path this change touches; ",
-		repodoc.SanitizeMetadata(s.Index.Path), s.Matched, s.TotalRecords)
+	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. ",
+		repodoc.SanitizeMetadata(s.Index.Path))
+	if s.Followed == 0 {
+		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches; ",
+			s.Matched, s.TotalRecords)
+	} else {
+		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches, "+
+			"and %d more were selected because they supersede a selected record (followed through supersedes / superseded_by); ",
+			s.Matched-s.Followed, s.TotalRecords, s.Followed)
+	}
 	if len(s.Included) == 0 {
 		b.WriteString("none of them is shown in full in this prompt. ")
 	} else {
@@ -254,8 +272,12 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 		for _, inc := range s.Included {
 			ids = append(ids, repodoc.SanitizeMetadata(inc.Record.ID))
 		}
-		fmt.Fprintf(&b, "%d of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): %s. ",
-			len(s.Included), strings.Join(ids, ", "))
+		order := "accepted records first, then by how many changed paths each matches, then newest first"
+		if s.Followed > 0 {
+			order += "; a successor ranks with the records it supersedes"
+		}
+		fmt.Fprintf(&b, "%d of them are shown in full below, in rank order (%s): %s. ",
+			len(s.Included), order, strings.Join(ids, ", "))
 	}
 	b.WriteString("Every other record is NOT shown in this prompt")
 	if grounded {
@@ -268,8 +290,12 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 			"these %d matching records were left out, highest rank first. Do not judge the change as if they were absent:\n",
 			s.CapBytes, len(s.Dropped))
 		for _, m := range s.Dropped {
-			fmt.Fprintf(&b, "- %s (%s, status: %s)\n",
-				repodoc.SanitizeMetadata(m.Record.ID), repodoc.SanitizeMetadata(m.Record.Path), statusLabel(m.Record.Status))
+			via := ""
+			if len(m.Via) > 0 {
+				via = ", successor of " + sanitizedIDs(m.Via)
+			}
+			fmt.Fprintf(&b, "- %s (%s, status: %s%s)\n",
+				repodoc.SanitizeMetadata(m.Record.ID), repodoc.SanitizeMetadata(m.Record.Path), statusLabel(m.Record.Status), via)
 		}
 	}
 	return repodoc.Framing{
@@ -280,13 +306,32 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 }
 
 // recordFraming frames one included record with its status and what that
-// status means.
-func recordFraming(r Record) repodoc.Framing {
+// status means and, for a record selected as a successor (non-empty Via), why
+// it was selected.
+func recordFraming(m Match) repodoc.Framing {
+	r := m.Record
+	preamble := statusMeaning(r)
+	if len(m.Via) > 0 {
+		if m.MatchedPaths == 0 {
+			preamble += fmt.Sprintf(" This record was selected because it supersedes %s; its own applies_to matches no path this change touches.", sanitizedIDs(m.Via))
+		} else {
+			preamble += fmt.Sprintf(" This record matches a path this change touches and is also selected because it supersedes %s.", sanitizedIDs(m.Via))
+		}
+	}
 	return repodoc.Framing{
 		Heading:   fmt.Sprintf(recordHeadFmt, repodoc.SanitizeMetadata(r.ID), statusLabel(r.Status)),
-		Preamble:  statusMeaning(r),
+		Preamble:  preamble,
 		TrustNote: indexTrustNote,
 	}
+}
+
+// sanitizedIDs joins ids for framing, each through repodoc.SanitizeMetadata.
+func sanitizedIDs(ids []string) string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, repodoc.SanitizeMetadata(id))
+	}
+	return strings.Join(out, ", ")
 }
 
 // statusLabel renders a status for framing. A status outside the closed set
