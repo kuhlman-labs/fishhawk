@@ -11,7 +11,7 @@
 # and no libc beyond what a static Go binary needs — small
 # attack surface, ~25 MB.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 
 # ---- builder ----
 FROM golang:${GO_VERSION}-bookworm AS builder
