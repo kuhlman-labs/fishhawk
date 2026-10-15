@@ -30,10 +30,11 @@ const (
 
 // committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
 // the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
-// #4253 mid-difficulty cases and #4361's six subtler mid-difficulty cases);
+// #4253 mid-difficulty cases and #4361's three subtler mid-difficulty cases
+// that calibrated in band; the three that sat at the ceiling were cut);
 // the derived list below may grow past it, never shrink below it (so the
 // derivation cannot go vacuous and a deleted case cannot pass silently).
-const committedSyntheticCatchCaseFloor = 18
+const committedSyntheticCatchCaseFloor = 15
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
@@ -971,10 +972,10 @@ func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
 	}{
 		{
 			class:    CatchMissUnattributed,
-			caseName: "seed-synthetic-contradicts-buried-clause",
-			concern:  CatchExampleConcern{Severity: "high", Category: "acceptance_criteria", Note: "The criterion that sets archived_at on the project contradicts the issue in its last clause: members must still be able to read an archived project."},
+			caseName: "seed-synthetic-unsatisfiable-stored-verbatim",
+			concern:  CatchExampleConcern{Severity: "high", Category: "acceptance_criteria", Note: "The criterion where GET returns the payload as received is unsatisfiable: the plan stores it in a jsonb column."},
 			widen: func(in *PlanReviewCatchInput) {
-				in.AttributionPhrases = append(in.AttributionPhrases, "sets archived_at on the project")
+				in.AttributionPhrases = append(in.AttributionPhrases, "returns the payload")
 			},
 		},
 		{
@@ -1014,10 +1015,10 @@ func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
 		})
 	}
 	t.Run("attribution widening past mode p is refused", func(t *testing.T) {
-		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-contradicts-buried-clause", func(in *PlanReviewCatchInput) {
-			in.AttributionPhrases = append(in.AttributionPhrases, "post /projects/{id}/archive")
+		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-unsatisfiable-stored-verbatim", func(in *PlanReviewCatchInput) {
+			in.AttributionPhrases = append(in.AttributionPhrases, "get /hooks/deliveries/{id}")
 		}))
-		if err == nil || !strings.Contains(err.Error(), `attribution phrase "post /projects/{id}/archive" also occurs in criterion`) {
+		if err == nil || !strings.Contains(err.Error(), `attribution phrase "get /hooks/deliveries/{id}" also occurs in criterion`) {
 			t.Fatalf("a phrase sibling criteria also state: err = %v, want the mode (p) refusal", err)
 		}
 	})

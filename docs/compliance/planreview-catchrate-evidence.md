@@ -38,8 +38,8 @@ and `scripts/check-review-prompt-eval` fails on every trigger-path change: by
 design, and outside `scripts/test verify`.
 
 **E55.23 / #4361 grows the conventions arms' corpus from twelve cases to
-eighteen**, so their `samples_per_case` drops from 12 to 8
-(`SamplesPerCaseForPower(18)`, still 144 trials per arm) and the 2026-10-15
+fifteen**, so their `samples_per_case` drops from 12 to 10
+(`SamplesPerCaseForPower(15)`, 150 trials per arm, up from 144) and the 2026-10-15
 record is not comparable for those arms: after the live calibration (Step 1c)
 an operator re-pins (Step 2, "The #4361 recording"). #4361 itself leaves
 `evidence.json` and `evidence.trials.json` untouched.
@@ -97,8 +97,9 @@ scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRateArms' ./backend/i
 Every corpus case needs a hand-curated `review_input.json` (shape, the
 attribution-AND-probe catch rule and the loader's fail-closed modes:
 `backend/internal/agenteval/README.md` § "Corpus authoring"). The corpus
-holds eighteen cases as of #4361 (`seed-synthetic-*`, two or more per weak
-class: #4253's twelve plus #4361's six subtler mid-difficulty cases).
+holds fifteen cases as of #4361 (`seed-synthetic-*`, two or more per weak
+class: #4253's twelve plus #4361's three subtler mid-difficulty cases that
+calibrated in band; Step 1c's results record the three cut at the ceiling).
 
 The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`,
 six SYNTHETIC cases: three catch, three clean) loads against the REAL
@@ -179,16 +180,16 @@ band:
 
 ## Step 1c — calibrate new conventions-arm cases (#4361)
 
-Before the #4361 re-pin, check that each of its six new catch cases is of mid
+Before the #4361 re-pin, check that each of its new catch cases is of mid
 difficulty in the conventions arms. The implement agent cannot call the
 model, so this runs on the PR branch as an operator subset dry run (never
 judged, never recordable; see "Probe a few cases before paying for a
-recording" below): both conventions arms, 6 cases x 30 trials each, 360
+recording" below): both conventions arms, 3 cases x 30 trials each, 180
 plan-review calls.
 
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
-  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-contradicts-buried-clause,seed-synthetic-contradicts-absent-vs-null,seed-synthetic-inferred-wrong-source,seed-synthetic-untestable-measurable-phrase,seed-synthetic-restates-approach-observable,seed-synthetic-unsatisfiable-stored-verbatim \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-untestable-measurable-phrase,seed-synthetic-restates-approach-observable,seed-synthetic-unsatisfiable-stored-verbatim \
   FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
   scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
@@ -248,6 +249,23 @@ of each remedy: a confirmed catch phrased as each scoring class is MISSED and
 refused as a catching example, then loads and scores CAUGHT after its
 widening, while a widening past mode p is refused. Check any widened set with
 `catchrategate --rescore` before re-measuring.
+
+**Results (2026-10-15, head `23a9dee4`).** Generator `claude-sonnet-5-5`,
+`MaxTokens` 8192, 30 trials per arm, both conventions arms, 0 truncations,
+0 undecodable. Scored catches per case:
+
+| case | with_conventions | without_conventions |
+|---|---|---|
+| restates-approach-observable | 11/30 (37%) | 15/30 (50%) |
+| unsatisfiable-stored-verbatim | 14/30 (47%) | 16/30 (53%) |
+| untestable-measurable-phrase | 20/30 (67%) | 26/30 (87%) |
+
+Cut at the ceiling (100%/100%, both arms), by Captain ruling 2026-10-15
+(option c): `contradicts-buried-clause`, `contradicts-absent-vs-null` and
+`inferred-wrong-source`; their case directories were deleted. This is a
+partial delivery of #4361's ">= 6 cases" done-means, by that ruling: #4361
+adds three in-band cases, not six, and the harder cases continue in a
+follow-up issue.
 
 Post the per-case table (both arms, both rates, the miss classes) as a PR
 comment: a fix-up pass cannot edit the PR body. Rework an out-of-band case,
@@ -366,7 +384,7 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
 ```
 
 **The #4361 recording.** The conventions arms' case set grew from twelve to
-eighteen and their `samples_per_case` from 12 to 8, so the 2026-10-15
+fifteen and their `samples_per_case` from 12 to 10, so the 2026-10-15
 baseline is not comparable and the recording is a re-pin, made on the #4361
 branch after its calibration (Step 1c) and before it merges. It measures
 every arm in the table, the persona arms included:
@@ -374,7 +392,7 @@ every arm in the table, the persona arms included:
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
-  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4361: eighteen-case conventions corpus (8 samples per case); the 2026-10-15 baseline is not comparable' \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4361: fifteen-case conventions corpus (10 samples per case); the 2026-10-15 baseline is not comparable' \
   scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
@@ -390,14 +408,15 @@ landing stales the architect arm (its prompt embeds `docs/adr/index.json`)
 even though `docs/adr/` is not a trigger path.
 
 Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
-calls — 2 x 144 with the eighteen committed cases (8 samples per case) — and
+calls — 2 x 150 with the fifteen committed cases (10 samples per case; 2 x
+144 at #4253's twelve) — and
 the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
 of its catch and clean classes clears the 136 floor with 138), about 564
-calls for the #4313 recording; #4314's recording adds the security arm, 10 x
+calls for the #4313 recording (twelve cases); #4314's recording adds the security arm, 10 x
 34 = 340 implement-review persona calls (34 samples per case, so its six catch
 and four clean cases each clear the floor), and the portability arm, 4 x 34 =
-136; the #4361 re-pin re-measures all of them, about 2 x 144 + 276 + 476 =
-1,040 calls, against
+136; the #4361 re-pin re-measures all of them, about 2 x 150 + 276 + 476 =
+1,052 calls, against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
@@ -479,10 +498,10 @@ jq -r '.arms | to_entries[] | .key as $arm | [.value.per_case[][] | select(.outc
   comparable; re-pinning is an explicit choice there, not forced.
 
 **Distribution check (done-means of #4253).** A case at an extreme in BOTH
-arms — caught in every trial, or in at most one (with 8 samples per case
-since #4361, `8/8` or `<= 1/8`; at #4253's 12 samples, `12/12` or `<= 1/12`
+arms — caught in every trial, or in at most one (with 10 samples per case
+since #4361, `10/10` or `<= 1/10`; at #4253's 12 samples, `12/12` or `<= 1/12`
 was the per-case form of the issue's `>= 22/23` and `<= 2/23` thresholds,
-and at 8 samples `<= 1/8` is slightly looser than `2/23`) — no longer
+and at 10 samples `<= 1/10` is slightly looser than `2/23`) — no longer
 discriminates. Explain each such case in
 the recording PR, or file a follow-up for a harder variant.
 
@@ -643,4 +662,4 @@ Captain ruling 2026-10-14; a harder corpus is #4402.
 | 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |
 | 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
 | 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
-| pending | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | #4361 calibration pending operator: the six new cases are not yet measured | PR comment, to be posted |
+| 2026-10-15 | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | contradicts-buried-clause, contradicts-absent-vs-null and inferred-wrong-source at the ceiling (100%/100% both arms), cut by Captain ruling 2026-10-15; restates-approach-observable, unsatisfiable-stored-verbatim and untestable-measurable-phrase in band (Step 1c "Results") | Step 1c "Results" (head `23a9dee4`) |
