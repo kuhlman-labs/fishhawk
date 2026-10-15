@@ -14,6 +14,15 @@ Stage orchestrator: next-stage dispatch after approve. Called from the approval 
 
 `Ref` is unchanged: the run's ADR-035 sole-writer branch from `runBranchRef`, which the `gitlab_ci` backend creates its pipeline against and the `github_actions` backend ignores.
 
+## Acceptance infrastructure park (#4356)
+
+`Advance`'s walk completes the run on a failed or cancelled stage, EXCEPT a failed stage that `run.ClassifyInfraFailurePark` parks (a category-C acceptance failure; contract in `backend/internal/run/README.md`). The park history is read from the run's audit log only for that shape, so every other failure keeps its zero-I/O path.
+
+- **Retryable**: `Advance` returns `OutcomeNoOp` (run stays running, stage stays failed), logs at INFO and writes ONE stage-scoped `stage_infra_parked` row per failure episode (an Advance re-entry on the same episode writes none). Best-effort: a lost row under-counts the budget by one.
+- **Budget exhausted** (3 earlier-episode parks): `completeRun` fails the run and, only when it returned `OutcomeRunCompleted`, `emitInfraParkBudgetExhausted` writes a stage-scoped `stage_infra_park_budget_exhausted` row (`prior_parks`, `retry_budget`, `run_state: failed`). Two concurrent Advance calls that both reach `completeRun` can each append one row — an accepted residual.
+- **No Audit wired** → the park cannot be bounded, so the failure takes `completeRun`. **Audit read error** → `Advance` returns the error with NO transition; the next Advance re-decides.
+- **Merge-candidate line**: a parked run is not terminal, so the merge-candidate pump's `run_terminal` drop (keyed on run state) never fires and the run keeps its live entry, phase unchanged, until the operator retries or cancels (`run_cancelled`); a budget-exhausted run drops `run_terminal` on the next pump.
+
 ## Post-deploy hold (E35.1 / #1598 / ADR-053)
 
 `Advance`'s stage walk records a non-terminal stage as `gated` but keeps walking to the first PENDING stage, so before #1598 a stage sequenced after a `deploy` stage would be dispatched while the deploy was still awaiting approval or in flight — `finishApprovalAdvance` re-enters `Advance` right after the deploy approval parks the deploy at `awaiting_deployment`. `DeployAheadNotSucceeded(stages, target)` (exported, pure) returns the first earlier `deploy` stage whose state is anything but `succeeded`; `Advance` returns `OutcomeNoOp` when it is non-nil for the selected `next` stage, BEFORE the deploy pre-execution park, the acceptance short-circuit, decomposition and dispatch.

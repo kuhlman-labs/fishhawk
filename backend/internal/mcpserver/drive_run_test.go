@@ -4952,3 +4952,49 @@ func TestDriveRun_HandoffPrecedentDegrades(t *testing.T) {
 		t.Errorf("non-hand-off stop %q: precedent = %+v reads = %d, want nil and 0", out.StoppedReason, out.Precedent, f.gateViewCalls)
 	}
 }
+
+// TestDriveRun_AcceptanceStageFailedStops pins the #4356 stop: a running run
+// the server PARKED on a category-C acceptance failure (acceptance failed,
+// review still pending) stops with acceptance_stage_failed and a retry
+// decision, recording no act and spawning nothing. Mechanism: without the
+// branch the pending review reads as in flight behind the failed (terminal)
+// acceptance stage, so the loop polls to its short test deadline and returns
+// timeout.
+func TestDriveRun_AcceptanceStageFailedStops(t *testing.T) {
+	accID := uuid.NewSHA1(uuid.Nil, []byte("acceptance")).String()
+	acc := stg(accID, "acceptance", "failed", 2)
+	cat := "C"
+	acc.FailureCategory = &cat
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		acc,
+		stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "pending", 3),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 300 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedAcceptanceStageFailed {
+		t.Fatalf("stopped_reason = %q, want %q", out.StoppedReason, stoppedAcceptanceStageFailed)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 ||
+		out.NextActions.Actions[0].Action != "fishhawk_retry_stage" || out.NextActions.Actions[0].Params["stage_id"] != accID {
+		t.Fatalf("next_actions = %+v, want fishhawk_retry_stage{stage_id: %s} first", out.NextActions, accID)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on a parked run, want nothing", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Fatalf("recorded %d acts on a parked run, want 0", nActs)
+	}
+}

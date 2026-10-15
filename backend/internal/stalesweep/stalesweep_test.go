@@ -1048,3 +1048,46 @@ func TestOptions_DefaultClock(t *testing.T) {
 		t.Errorf("default clock = %v, want >= %v", got, before)
 	}
 }
+
+// TestFind_AcceptanceInfraFailureParked: the settled walk mirrors Advance's
+// #4356 park. A category-C acceptance failure the predicate parks is NOT
+// settled, so the stale run with a recorded PR URL classifies pr_unobserved
+// (skip); once the stage has spent the park budget it is settled and the run
+// reconciles failed, exactly as Advance would complete it.
+func TestFind_AcceptanceInfraFailureParked(t *testing.T) {
+	seed := func(m *memRuns, a *memAudit, priorParks int) *run.Run {
+		r := m.addRun(run.StateRunning, stale, nil, "https://github.com/x/y/pull/7")
+		m.addStage(r.ID, run.StageTypeImplement, run.StageStateSucceeded, stale)
+		acc := m.addStage(r.ID, run.StageTypeAcceptance, run.StageStateFailed, stale)
+		cat := run.FailureC
+		acc.FailureCategory = &cat
+		m.addStage(r.ID, run.StageTypeReview, run.StageStatePending, stale)
+		for i := 0; i < priorParks; i++ {
+			a.seed(r.ID, run.CategoryStageInfraParked, stale, map[string]any{"failed_at": fmt.Sprintf("2026-01-0%dT00:00:00Z", i+1), "retry_ordinal": i})
+			a.rows[len(a.rows)-1].StageID = &acc.ID
+			a.rows[len(a.rows)-1].Sequence = int64(i + 1)
+		}
+		return r
+	}
+
+	t.Run("parked: not settled", func(t *testing.T) {
+		m, a := newMemRuns(), newMemAudit()
+		r := seed(m, a, 0)
+		cands, res := sweep(t, m, a, noRunners, testOpts())
+		if c := candidateFor(t, cands, r.ID); c.Class != ClassPRUnobserved || c.Action != ActionSkip {
+			t.Fatalf("candidate = %s/%s, want pr_unobserved/skip (a parked run is not settled)", c.Class, c.Action)
+		}
+		if len(res) != 0 {
+			t.Fatalf("results = %+v, want none", res)
+		}
+		assertUntouched(t, m, a, r.ID, run.StateRunning)
+	})
+	t.Run("budget exhausted: settled failed", func(t *testing.T) {
+		m, a := newMemRuns(), newMemAudit()
+		r := seed(m, a, run.InfraFailureParkRetryBudget)
+		cands, _ := sweep(t, m, a, noRunners, testOpts())
+		if c := candidateFor(t, cands, r.ID); c.Class != ClassStagesSettled || c.Action != ActionReconcileFailed || c.Target != run.StateFailed {
+			t.Fatalf("candidate = %s/%s/%s, want stages_settled/reconcile_failed/failed", c.Class, c.Action, c.Target)
+		}
+	})
+}
