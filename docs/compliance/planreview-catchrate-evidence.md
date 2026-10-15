@@ -178,6 +178,53 @@ band:
   included). Read the concern in the report: rework the remit (if it leaked a
   repository assumption) or the case; never delete the marker to pass.
 
+**#4402: the harder security catch cases.** #4402 replaced the six #4314
+catch cases (all at the ceiling, 34/34) with six harder cases under new
+names: `authz-account-check-behind-legacy-flag`,
+`failclosed-gate-lookup-timeout-proceeds`,
+`permission-instruction-path-case-fold-dropped`,
+`secret-signed-url-in-debug-retry-log`,
+`supplychain-installer-from-branch-version-pinned` and
+`trust-linked-issue-summary-one-call-out`. The four clean cases and
+`markers.json` are unchanged. Three steps:
+
+1. **Calibrate at the PR head, before merge.** Run ONE subset dry run over
+   the ten security case ids at 30 trials. Both security arms run (the
+   portability arm runs the four clean ids), and the per-trial miss classes
+   land in `planreview-diag.jsonl` (cost: 10 x 30 + 4 x 30 = 420
+   implement-review persona calls):
+
+   ```sh
+   FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=authz-account-check-behind-legacy-flag,failclosed-gate-lookup-timeout-proceeds,permission-instruction-path-case-fold-dropped,secret-signed-url-in-debug-retry-log,supplychain-installer-from-branch-version-pinned,trust-linked-issue-summary-one-call-out,clean-auth-helper-refactor,clean-ci-pinned-tool-bump,clean-policy-test-only,clean-redaction-helper-move \
+     FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
+     scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+   ```
+
+   The band-table alternative is `TestCatchRateCalibrationLive` with
+   `FISHHAWK_AGENTEVAL_CALIBRATE_ARM=security` and then
+   `security_portability`, `FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30` (the
+   commands above). It reports scored counts only, so read the miss classes
+   from the subset dry run.
+2. **Accept a rate on reviewer misses only (the Step 1c rule).** A case is in
+   band (30%–80%) only when its misses are `not_mentioned`. Repair a
+   `no_probe` or `unattributed` miss by widening the case's probes or
+   attribution, never by loosening a probe the loader refuses. Rework an
+   out-of-band case through a routed fix-up. A case still out of band after
+   rework is recorded with its documented reason, which #4402's done-means
+   allows.
+3. **Re-pin in the next combined recording, not on the #4402 branch.** The
+   campaign batches every review-prompt-eval trigger change (#3930, #4402,
+   #4453, #4326, #4400) into ONE combined operator re-recording after all of
+   them merge, so the #4402 merge is not held for a re-pin. The changed case
+   set makes the `security` arm non-comparable for exactly that one pin
+   (`baselineComparable` compares case-name sets): that recording does not
+   check the arm for regression, and later pins compare normally. Until it
+   lands, `catchrategate` and `scripts/check-review-prompt-eval` fail on
+   `main`, naming the stale `security` arm, by design. The combined
+   recording uses this `PIN_REASON` text for the arm, folded into its own:
+   `#4402: six harder security catch cases replace the #4314 ceiling set; the security arm case set changed, so the baseline is not comparable`.
+
 ## Step 1c — calibrate new conventions-arm cases (#4361)
 
 Before the #4361 re-pin, check that each of its new catch cases is of mid
@@ -667,8 +714,10 @@ alarm (clean cases).
 The #4314 row's "Other arms" column names `security` catch and false alarm
 (with its security_lens / other_category trial split; the remainder of each
 false-alarm count is undecodable trials) and `security_portability` false
-alarm. All six security catch cases sit at ceiling (34/34 each), accepted by
-Captain ruling 2026-10-14; a harder corpus is #4402.
+alarm. All six #4314 security catch cases sat at ceiling (34/34 each), accepted by
+Captain ruling 2026-10-14. #4402 replaced them with six harder catch cases;
+their calibration and the `security` arm's re-pin follow Step 1b, "#4402: the
+harder security catch cases".
 
 ### Calibration dry runs
 
