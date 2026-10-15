@@ -23,11 +23,11 @@ const (
 )
 
 // committedSyntheticCatchCaseFloor is the number of hand-authored seed cases
-// the corpus has carried since E55.18 / #4253 (six E55.4 seeds plus six
-// mid-difficulty cases); the derived list below may grow past it, never
-// shrink below it (so the derivation cannot go vacuous and a deleted case
-// cannot pass silently).
-const committedSyntheticCatchCaseFloor = 12
+// the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
+// #4253 mid-difficulty cases and #4361's six subtler mid-difficulty cases);
+// the derived list below may grow past it, never shrink below it (so the
+// derivation cannot go vacuous and a deleted case cannot pass silently).
+const committedSyntheticCatchCaseFloor = 18
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
@@ -888,6 +888,113 @@ func TestCatchRuleV4_NewCatchingExamplesMissUnderV3(t *testing.T) {
 			}
 		}
 	}
+}
+
+// writeCatchCaseCopy copies committed case name into a fresh temp corpus,
+// applying mutate to its decoded review_input.json, and returns the corpus
+// dir for LoadPlanReviewCatchCorpus.
+func writeCatchCaseCopy(t *testing.T, name string, mutate func(*PlanReviewCatchInput)) string {
+	t.Helper()
+	dir := t.TempDir()
+	caseDir := filepath.Join(dir, name)
+	if err := os.MkdirAll(caseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(caseDir, "miss.json"), mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "miss.json")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var in PlanReviewCatchInput
+	if err := json.Unmarshal(mustReadCatch(t, filepath.Join(committedCatchCorpus, name, "review_input.json")), &in); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&in)
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(caseDir, "review_input.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestCatchCorpusWidening_RepairsScoringMissClasses is the offline half of the
+// run-book's Step 1c remedy rule (#4361 approval condition C3): a scoring miss
+// is repaired by widening the half of the rule it failed, and a not_mentioned
+// miss is genuine difficulty. Per scoring class, a confirmed catch of a
+// committed #4361 case phrased the way the class describes scores MISSED with
+// that class and is refused as a catching_example (mode k); after the
+// matching widening (attribution_phrases for unattributed, catch_probes for
+// no_probe) on a temp copy of the case, the loader accepts it (modes (a)-(r),
+// mode p's attribution uniqueness included) and it scores CAUGHT. An
+// attribution widening that a sibling criterion also states is refused (mode
+// p), which is the bound on the unattributed remedy.
+func TestCatchCorpusWidening_RepairsScoringMissClasses(t *testing.T) {
+	for _, tc := range []struct {
+		class    CatchMissClass
+		caseName string
+		concern  CatchExampleConcern
+		widen    func(*PlanReviewCatchInput)
+	}{
+		{
+			class:    CatchMissUnattributed,
+			caseName: "seed-synthetic-contradicts-buried-clause",
+			concern:  CatchExampleConcern{Severity: "high", Category: "acceptance_criteria", Note: "The criterion that sets archived_at on the project contradicts the issue in its last clause: members must still be able to read an archived project."},
+			widen: func(in *PlanReviewCatchInput) {
+				in.AttributionPhrases = append(in.AttributionPhrases, "sets archived_at on the project")
+			},
+		},
+		{
+			class:    CatchMissNoProbe,
+			caseName: "seed-synthetic-untestable-measurable-phrase",
+			concern:  CatchExampleConcern{Severity: "medium", Category: "acceptance_criteria", Note: "ac-search-p95-in-budget leaves the budget's figure to whoever runs k6, so nobody can say whether it passed."},
+			widen: func(in *PlanReviewCatchInput) {
+				in.CatchProbes = append(in.CatchProbes, "nobody can say whether")
+			},
+		},
+	} {
+		t.Run(string(tc.class), func(t *testing.T) {
+			rule, _ := rawCommittedCatchRule(t, tc.caseName)
+			trial := ClassifyCatchTrial(catchVerdictJSON(t, tc.concern), rule)
+			if trial.Outcome != CatchMissed {
+				t.Fatalf("fixture premise: %q scores %q under the committed rule, want missed", tc.concern.Note, trial.Outcome)
+			}
+			if got := classifyCatchMiss(trial, rule); got != tc.class {
+				t.Fatalf("fixture premise: miss class %q, want %q", got, tc.class)
+			}
+			asExample := func(in *PlanReviewCatchInput) {
+				in.CatchingExamples = append(in.CatchingExamples, tc.concern)
+			}
+			if _, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, tc.caseName, asExample)); err == nil || !strings.Contains(err.Error(), "is not a catch under the attribution-AND-probe rule") {
+				t.Fatalf("unwidened case with %q as a catching example: err = %v, want the mode (k) refusal", tc.concern.Note, err)
+			}
+			widened, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, tc.caseName, func(in *PlanReviewCatchInput) {
+				tc.widen(in)
+				asExample(in)
+			}))
+			if err != nil {
+				t.Fatalf("widened case refused by the loader: %v", err)
+			}
+			if got := ClassifyCatch(catchVerdictJSON(t, tc.concern), widened[0].CatchRule()); got != CatchCaught {
+				t.Errorf("after the %s widening %q classified %q, want caught", tc.class, tc.concern.Note, got)
+			}
+		})
+	}
+	t.Run("attribution widening past mode p is refused", func(t *testing.T) {
+		_, err := LoadPlanReviewCatchCorpus(writeCatchCaseCopy(t, "seed-synthetic-contradicts-buried-clause", func(in *PlanReviewCatchInput) {
+			in.AttributionPhrases = append(in.AttributionPhrases, "post /projects/{id}/archive")
+		}))
+		if err == nil || !strings.Contains(err.Error(), `attribution phrase "post /projects/{id}/archive" also occurs in criterion`) {
+			t.Fatalf("a phrase sibling criteria also state: err = %v, want the mode (p) refusal", err)
+		}
+	})
+	t.Run(string(CatchMissNotMentioned), func(t *testing.T) {
+		rule, _ := rawCommittedCatchRule(t, "seed-synthetic-untestable-measurable-phrase")
+		trial := ClassifyCatchTrial(catchVerdictJSON(t, CatchExampleConcern{Category: "risk", Note: "The k6 script should run against a staging copy of the database."}), rule)
+		if got := classifyCatchMiss(trial, rule); trial.Outcome != CatchMissed || got != CatchMissNotMentioned {
+			t.Errorf("a concern touching neither half: outcome %q class %q, want missed / %q (genuine difficulty, no widening repairs it)", trial.Outcome, got, CatchMissNotMentioned)
+		}
+	})
 }
 
 func mustReadCatch(t *testing.T, path string) []byte {

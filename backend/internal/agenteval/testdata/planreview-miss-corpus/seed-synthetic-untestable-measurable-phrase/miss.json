@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000436104",
+  "artifact_id": "00000000-0000-0000-0001-000000436104",
+  "triage_sequence": 115,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is not concretely verifiable (bad/ambiguous criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-search-p95-in-budget",
+      "statement": "GET /notes/search keeps p95 latency within the service latency budget under production load.",
+      "source": "explicit",
+      "source_ref": "example-org/search-service#204",
+      "observed": "the executor could not decide pass/fail: neither the issue nor the plan defines the latency budget, the production load or a measurement window",
+      "expected": "an observable pass/fail condition",
+      "steps_taken": "read the criterion and the plan; found no budget value, load profile or window to drive or assert",
+      "expectation_basis": "criterion ac-search-p95-in-budget",
+      "repro_handle": "n/a: the criterion names no budget value",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

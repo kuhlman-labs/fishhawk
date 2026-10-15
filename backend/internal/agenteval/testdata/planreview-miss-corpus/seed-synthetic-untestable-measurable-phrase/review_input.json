@@ -1,0 +1,201 @@
+{
+  "issue_title": "Search notes by their text",
+  "issue_body": "Users can only browse notes by date, so finding an old note means scrolling.\n\nAdd `GET /notes/search?q=<terms>` returning the caller's notes whose title or body contains every term, newest first, at most 50 per page with a `next_cursor`. Another user's notes never appear. An empty `q` returns `400` with error code `empty_query`. The web client calls it on every keystroke, so search must respond fast enough for search-as-you-type.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/search-service/issues/204",
+      "id": "example-org/search-service#204"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add full-text note search backed by a GIN index, paginated by cursor.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/store/migrations/0047_notes_fts.sql",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/notes_search.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/search.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/search_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "loadtest/search.js",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0047 creating a GIN index on to_tsvector('simple', title || ' ' || body), with a down migration dropping it."
+      },
+      {
+        "step": 2,
+        "description": "Add SearchNotes in internal/store/notes_search.go: plainto_tsquery so every term must match, filter owner_id to the caller, ORDER BY created_at DESC, and fetch 51 rows to derive next_cursor."
+      },
+      {
+        "step": 3,
+        "description": "Add the GET /notes/search handler: 400 empty_query for an empty q, otherwise the page and next_cursor."
+      },
+      {
+        "step": 4,
+        "description": "Add loadtest/search.js, a k6 script replaying search-as-you-type queries that reports p95 latency."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Store tests on seeded notes for term matching, ownership and ordering; handler tests for pagination and the empty query; the k6 script is run by hand before release.",
+      "rollback_plan": "Revert the PR and run the 0047 down migration to drop the index.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-search-every-term",
+          "statement": "GET /notes/search?q=alpha beta returns only the caller's notes whose title or body contains both alpha and beta.",
+          "source": "explicit",
+          "source_ref": "example-org/search-service#204"
+        },
+        {
+          "id": "ac-search-page",
+          "statement": "GET /notes/search returns at most 50 notes per page, newest first, with next_cursor set when more remain.",
+          "source": "explicit",
+          "source_ref": "example-org/search-service#204"
+        },
+        {
+          "id": "ac-search-owner-only",
+          "statement": "GET /notes/search never returns a note owned by another user.",
+          "source": "explicit",
+          "source_ref": "example-org/search-service#204"
+        },
+        {
+          "id": "ac-search-empty-400",
+          "statement": "GET /notes/search with an empty q returns HTTP 400 with error code empty_query.",
+          "source": "explicit",
+          "source_ref": "example-org/search-service#204"
+        },
+        {
+          "id": "ac-search-p95-in-budget",
+          "statement": "GET /notes/search keeps p95 latency within the service latency budget under production load.",
+          "source": "explicit",
+          "source_ref": "example-org/search-service#204"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Postgres full-text search is fast enough at the current notes volume."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "untestable",
+    "not testable",
+    "unverifiable",
+    "not verifiable",
+    "not concretely verifiable",
+    "cannot be verified",
+    "no pass/fail",
+    "unmeasurable",
+    "not measurable",
+    "vague",
+    "ill-defined",
+    "cannot decide",
+    "can't decide",
+    "undecidable",
+    "no executor can decide",
+    "budget is undefined",
+    "budget is not defined",
+    "budget is never defined",
+    "undefined budget",
+    "unspecified budget",
+    "budget is unspecified",
+    "budget is not specified",
+    "no budget value",
+    "no budget is",
+    "names no budget",
+    "defines no budget",
+    "no defined budget",
+    "which budget",
+    "what budget",
+    "budget value is",
+    "no load profile",
+    "production load is undefined",
+    "production load is not defined",
+    "no measurement window",
+    "no target value",
+    "no numeric target"
+  ],
+  "attribution_phrases": [
+    "latency budget",
+    "under production load",
+    "p95 latency within"
+  ],
+  "defect_phrases": [
+    "latency budget",
+    "production load"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-search-p95-in-budget is not concretely verifiable: no budget value is given anywhere, so no executor can decide pass/fail."
+    },
+    {
+      "severity": "medium",
+      "category": "testability",
+      "note": "ac-search-p95-in-budget sounds measurable but is vague: the latency budget is undefined and production load has no load profile or measurement window."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "The criterion keeping p95 latency within the service latency budget is untestable: which budget, at what load, measured over what window?"
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-search-p95-in-budget names a percentile but no number: neither the issue nor the plan states the budget, the load or the window, so an executor cannot decide whether it passed. State a figure such as p95 under 150 ms at 20 requests per second against a seeded 10,000-note account, or make it non-blocking."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-search-p95-in-budget needs the k6 script wired into CI, not run by hand before release."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "The GIN index migration is built without CONCURRENTLY and locks writes on a large notes table."
+    },
+    {
+      "category": "risk",
+      "note": "ac-search-p95-in-budget is unquantified and ambiguous; a mismatch between staging and production hardware makes any figure unsupported."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-search-page: also test that the last page carries no next_cursor."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The web client calls it on every keystroke; the plan does not debounce or cancel in-flight searches."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document GET /notes/search, next_cursor and the empty_query error in api/openapi.yaml."
+    }
+  ]
+}

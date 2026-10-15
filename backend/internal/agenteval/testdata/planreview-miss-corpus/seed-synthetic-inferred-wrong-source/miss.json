@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000436103",
+  "artifact_id": "00000000-0000-0000-0001-000000436103",
+  "triage_sequence": 114,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is inferred-source with a rationale the issue does not support (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-reset-throttle-fourth",
+      "statement": "A fourth POST /password-resets for the same email within 30 minutes still returns HTTP 202 but sends no reset link.",
+      "source": "inferred",
+      "rationale": "Inferred from the issue's throttling requirement: the window is the issue's 30-minute window, and three requests leave room for a user who mistypes twice.",
+      "observed": "the fourth request within 30 minutes sent a reset link; the implementation throttled at ten requests per hour per the product owner's later answer",
+      "expected": "no reset link sent for the fourth request within 30 minutes",
+      "steps_taken": "sent four POST /password-resets for one email with a fake clock inside 30 minutes and counted the fake mailer's sends",
+      "expectation_basis": "criterion ac-reset-throttle-fourth",
+      "repro_handle": "curl -s -X POST -d '{\"email\":\"a@example.org\"}' $TARGET/password-resets (x4)",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

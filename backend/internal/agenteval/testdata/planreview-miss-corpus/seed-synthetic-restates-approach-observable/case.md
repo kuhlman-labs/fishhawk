@@ -1,0 +1,45 @@
+# Case: seed-synthetic-restates-approach-observable
+
+**Provenance: SYNTHETIC.** This case is a hand-authored plan-review miss
+(E55.23 / #4361), NOT a captured production triage entry. It plants exactly
+one defect the standard plan-review criteria should catch — a criterion that
+restates an approach step while reading like an observable HTTP outcome — so
+the plan-review catch-rate gate (`planreviewcatch.go`) has a committed,
+discriminating fixture. Nothing here is a real run, issue or repository: the
+`example-org/uploads-service` issue, the run ids and the triage sequence are
+fabricated placeholders, and `miss.json` carries `"synthetic": true`.
+
+## What it represents
+
+The issue requires every upload to be scanned for malware before download: an
+infected file is never served (`GET /files/{id}` returns 410 `file_infected`)
+and a pending one returns 409 `scan_pending`. Approach step 2 routes an upload
+through a new component — the handler enqueues a scan job on `ScanQueue` and
+returns 202. The plan's explicit criterion `ac-upload-enqueues-scan` wraps that
+implementation fact in an HTTP observation: "POST /uploads returns HTTP 202
+after the handler enqueues a scan job on ScanQueue". It restates step 2 and is
+not what the issue asks to observe; no criterion checks that an infected file
+is never served. The implementation scanned through a different mechanism,
+acceptance failed the criterion, and triage classified it class-3.
+
+Mid-difficulty by design: unlike `seed-synthetic-restates-approach` ("the code
+in approach step 2 was written"), the criterion names a route and a status
+code, so it reads like an observable outcome.
+
+## The planted defect
+
+- Criterion id: `ac-upload-enqueues-scan` (present, byte-identical, in both
+  `miss.json` and the plan inside `review_input.json` — the loader enforces
+  both).
+- Plan-review criterion it violates: 11 (Independence — criteria are not
+  restatements of the approach steps).
+
+## Review input
+
+`review_input.json` carries the issue text the reviewer sees, the complete
+`standard_v1` plan under review, the `catch_probes` (case-folded substrings
+matched against each emitted concern's note and category), the
+`attribution_phrases` (substrings of the planted criterion's statement and of
+no other criterion's), the `defect_phrases` the prompt-leak self-check reads,
+and the hand-written `catching_examples` / `non_catching_examples` the loader
+uses to prove the rule discriminates.

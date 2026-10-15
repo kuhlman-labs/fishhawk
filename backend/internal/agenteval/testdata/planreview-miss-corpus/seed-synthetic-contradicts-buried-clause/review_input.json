@@ -1,0 +1,206 @@
+{
+  "issue_title": "Archive finished projects instead of deleting them",
+  "issue_body": "Deleting a finished project today removes it outright, and its history goes with it.\n\nAdd `POST /projects/{id}/archive`. A project admin may archive a project: the call returns `200` with the project and sets its `archived_at`. Any other caller gets `403`, and an unknown project id gets `404`. An archived project no longer appears in `GET /projects`, but it stays readable by its members: `GET /projects/{id}` keeps returning `200` with the project for a member.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/projects-service/issues/201",
+      "id": "example-org/projects-service#201"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add an admin-only archive endpoint that stamps archived_at and hides archived projects from the project list.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/store/migrations/0021_projects_archived_at.sql",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/projects.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/projects.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/projects_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0021 adding a nullable archived_at TIMESTAMPTZ column to projects, with a down migration dropping it."
+      },
+      {
+        "step": 2,
+        "description": "Add ArchiveProject to internal/store/projects.go (UPDATE projects SET archived_at = now()), and add archived_at IS NULL to the projectVisible predicate that ListProjects and GetProject share."
+      },
+      {
+        "step": 3,
+        "description": "Add the POST /projects/{id}/archive handler: load the project (404 when unknown), require the project admin role (403 otherwise), call ArchiveProject and return 200 with the project."
+      },
+      {
+        "step": 4,
+        "description": "Document POST /projects/{id}/archive and its 403 and 404 responses in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests: an admin archive returns 200 and stamps archived_at, a non-admin gets 403, an unknown id gets 404, and the list and detail reads are asserted after archiving. A store test covers ArchiveProject.",
+      "rollback_plan": "Revert the PR and run the 0021 down migration; archived_at values are dropped and archived projects reappear in the list.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-archive-by-admin",
+          "statement": "POST /projects/{id}/archive by a project admin returns HTTP 200 with the project, sets archived_at on the project, drops the project from GET /projects for every caller, and afterwards a member's GET /projects/{id} returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/projects-service#201"
+        },
+        {
+          "id": "ac-archive-non-admin-403",
+          "statement": "POST /projects/{id}/archive by a member who is not a project admin returns HTTP 403 and leaves archived_at unset.",
+          "source": "explicit",
+          "source_ref": "example-org/projects-service#201"
+        },
+        {
+          "id": "ac-archive-unknown-404",
+          "statement": "POST /projects/{id}/archive for an unknown project id returns HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/projects-service#201"
+        },
+        {
+          "id": "ac-list-keeps-active",
+          "statement": "GET /projects still lists every project of the caller whose archived_at is unset.",
+          "source": "explicit",
+          "source_ref": "example-org/projects-service#201"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Project admin is the existing role checked by the settings endpoints."
+    ],
+    "predicted_runtime_minutes": 35,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "contradicts the issue",
+    "contradicts issue",
+    "conflicts with the issue",
+    "inconsistent with the issue",
+    "violates the issue",
+    "contrary to the issue",
+    "at odds with the issue",
+    "200, not 404",
+    "200 rather than 404",
+    "200 instead of 404",
+    "should still return 200",
+    "must still return 200",
+    "should keep returning 200",
+    "must keep returning 200",
+    "remain readable",
+    "remains readable",
+    "still be readable",
+    "stay readable",
+    "can still read",
+    "members lose read access",
+    "members lose access",
+    "locks members out",
+    "locks out members",
+    "hides it from its members",
+    "hides the project from its members",
+    "members can no longer read",
+    "no longer readable",
+    "clause contradicts",
+    "requires the opposite",
+    "says the opposite",
+    "yet contradicts",
+    "yet conflicts",
+    "but contradicts",
+    "directly contradicts",
+    "contradicts both the issue",
+    "conflicts directly with",
+    "contradicts the originating issue",
+    "contradicts that issue",
+    "contradict the issue",
+    "conflict with the issue",
+    "nothing in the issue permits",
+    "contradict the stated requirement"
+  ],
+  "attribution_phrases": [
+    "for every caller",
+    "a member's get /projects/{id}",
+    "drops the project from"
+  ],
+  "defect_phrases": [
+    "readable by its members",
+    "/projects/{id}/archive"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-archive-by-admin contradicts the issue: an archived project stays readable by its members, so a member's GET /projects/{id} must return 200, not 404."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-archive-by-admin bundles correct clauses with a last one that requires the opposite of the issue: after archiving, members lose read access, while the issue keeps GET /projects/{id} returning 200 for them. Approach step 2's shared projectVisible predicate produces the same 404."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion that drops the project from GET /projects for every caller also expects a member's GET /projects/{id} to return 404 afterwards; members can still read an archived project per the issue, so it should return 200 rather than 404."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "Criterion ac-archive-by-admin is mostly right (200, archived_at, hidden from the list), but its final clause directly contradicts the issue it cites: the issue says an archived project stays readable by its members and GET /projects/{id} keeps returning 200 for a member. Approach step 2 adds archived_at IS NULL to the predicate GetProject shares, so the implementation would follow the wrong clause. Split the criterion and expect 200 for a member's detail read."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test archives a project that is already archived; decide whether a second archive returns 200 again or 409."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Adding archived_at IS NULL to every project query needs a partial index, or GET /projects slows down as archived projects pile up."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-archive-by-admin should also assert that the archive response body carries the archived_at timestamp."
+    },
+    {
+      "category": "risk",
+      "note": "ac-archive-by-admin is ambiguous about whose clock stamps archived_at; a mismatch between the database clock and the test clock makes the assertion flaky."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document POST /projects/{id}/archive and its 403 and 404 responses in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-archive-non-admin-403: a member who is not a project admin gets 403; also test a caller who is not a member at all."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "An archived project no longer appears in GET /projects; the plan has no way for an admin to list archived projects to restore one."
+    }
+  ]
+}

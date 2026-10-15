@@ -36,6 +36,13 @@ refuses the v1 record (its refusal text, written before the ruling, still
 names a shared #4313/#4314 recording; the #4313 re-pin is what clears it),
 and `scripts/check-review-prompt-eval` fails on every trigger-path change: by
 design, and outside `scripts/test verify`.
+
+**E55.23 / #4361 grows the conventions arms' corpus from twelve cases to
+eighteen**, so their `samples_per_case` drops from 12 to 8
+(`SamplesPerCaseForPower(18)`, still 144 trials per arm) and the 2026-10-15
+record is not comparable for those arms: after the live calibration (Step 1c)
+an operator re-pins (Step 2, "The #4361 recording"). #4361 itself leaves
+`evidence.json` and `evidence.trials.json` untouched.
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -90,8 +97,8 @@ scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRateArms' ./backend/i
 Every corpus case needs a hand-curated `review_input.json` (shape, the
 attribution-AND-probe catch rule and the loader's fail-closed modes:
 `backend/internal/agenteval/README.md` § "Corpus authoring"). The corpus
-holds twelve cases as of #4253 (`seed-synthetic-*`, two or more per weak
-class).
+holds eighteen cases as of #4361 (`seed-synthetic-*`, two or more per weak
+class: #4253's twelve plus #4361's six subtler mid-difficulty cases).
 
 The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`,
 six SYNTHETIC cases: three catch, three clean) loads against the REAL
@@ -169,6 +176,82 @@ band:
   (`ErrPortabilityRepoSpecificFinding`; both files untouched, dry run
   included). Read the concern in the report: rework the remit (if it leaked a
   repository assumption) or the case; never delete the marker to pass.
+
+## Step 1c — calibrate new conventions-arm cases (#4361)
+
+Before the #4361 re-pin, check that each of its six new catch cases is of mid
+difficulty in the conventions arms. The implement agent cannot call the
+model, so this runs on the PR branch as an operator subset dry run (never
+judged, never recordable; see "Probe a few cases before paying for a
+recording" below): both conventions arms, 6 cases x 30 trials each, 360
+plan-review calls.
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-contradicts-buried-clause,seed-synthetic-contradicts-absent-vs-null,seed-synthetic-inferred-wrong-source,seed-synthetic-untestable-measurable-phrase,seed-synthetic-restates-approach-observable,seed-synthetic-unsatisfiable-stored-verbatim \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
+  scripts/test single -v -timeout 2h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+**Band rule.** Each new case is caught in 30%–80% of its trials (both bounds
+inclusive) in at least one conventions arm; the target is 40%–70%. At 30
+samples a case near a bound is a rework candidate, not a verdict (an
+unchanged architect case moved 23/30 → 29/30 between runs, "Calibration dry
+runs" below).
+
+Read the run's diagnostics file (`DIAG` = the path it logged; "Diagnosing a
+refused or surprising measurement" below):
+
+```sh
+# Per arm and case: caught/trials, the rate, and the miss classes.
+jq -rs '.[-1] | select(.kind == "summary") | .arms | to_entries[] | .key as $arm | .value.per_case | to_entries[] | "\($arm) \(.key): \(.value.caught)/\(.value.trials) (\(if .value.trials > 0 then (100 * .value.caught / .value.trials | floor) else 0 end)%), undecodable \(.value.undecodable), misses \(.value.miss_classes // {} | to_entries | map("\(.key) \(.value)") | join(", "))"' "$DIAG"
+
+# Per arm and case: the scored rate beside the attribution-only rate (trials
+# with ANY raw concern naming the planted criterion, probe or not).
+jq -rs '[.[] | select(.kind == "trial" and .expect == "catch")] | group_by([.arm, .case]) | .[] | "\(.[0].arm) \(.[0].case): scored \(map(select(.caught)) | length)/\(length), attribution-only \(map(select(any((.raw_concerns // [])[]; .attributed))) | length)/\(length)"' "$DIAG"
+
+# Per arm, corpus level: the same two rates over every measured case.
+jq -rs '[.[] | select(.kind == "trial" and .expect == "catch")] | group_by(.arm) | .[] | "\(.[0].arm): scored \(map(select(.caught)) | length)/\(length), attribution-only \(map(select(any((.raw_concerns // [])[]; .attributed))) | length)/\(length)"' "$DIAG"
+```
+
+**A case is in band only on REVIEWER misses.** Read each missed trial's
+`miss_class` and its `raw_concerns` before accepting a rate; the remedy
+depends on the class:
+
+- `not_mentioned` is genuine difficulty: no concern named the planted
+  criterion or matched a probe. A case whose in-band rate comes from these is
+  accepted.
+- `unattributed` (a probe matched but no concern named the planted id or a
+  declared attribution phrase) is a scoring miss, repaired by widening the
+  case's ATTRIBUTION wording: add the planted statement's distinguishing
+  wording the concern used to `attribution_phrases` (and to `defect_phrases`
+  when it is new domain content, so the prompt-leak check covers it). Mode p
+  bounds this: a phrase any sibling criterion's statement also carries is
+  refused by the loader.
+- `no_probe` (a concern named the planted criterion but matched no probe) is a
+  scoring miss, repaired by widening `catch_probes` with the concern's
+  polarity-bearing, multi-word phrasing: never a bare generic objection word,
+  and never wording the issue or plan shows (mode m) or a non-catching example
+  carries (mode j).
+
+Widen only for a concern that really flags the planted defect; one about
+another aspect of the criterion stays a miss and becomes a
+`non_catching_example`. A case whose in-band rate comes from scoring misses
+(`unattributed` / `no_probe`) instead of `not_mentioned` is REWORKED (widened
+as above), never accepted as measured. `TestCatchCorpusWidening_RepairsScoringMissClasses`
+(`backend/internal/agenteval/planreviewcatch_test.go`) is the offline example
+of each remedy: a confirmed catch phrased as each scoring class is MISSED and
+refused as a catching example, then loads and scores CAUGHT after its
+widening, while a widening past mode p is refused. Check any widened set with
+`catchrategate --rescore` before re-measuring.
+
+Post the per-case table (both arms, both rates, the miss classes) as a PR
+comment: a fix-up pass cannot edit the PR body. Rework an out-of-band case,
+or one in band on scoring misses, through a routed fix-up and re-run this
+step for it. Then re-pin through Step 2 ("The #4361 recording") and, after
+the recording lands, run `(cd backend && go run ./internal/agenteval/catchrategate --rescore)`
+so the Results row reports the scored rate next to the attribution-only rate
+(#4355 approval condition C3).
 
 ## Step 2 — run the arms
 
@@ -278,6 +361,19 @@ FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
+**The #4361 recording.** The conventions arms' case set grew from twelve to
+eighteen and their `samples_per_case` from 12 to 8, so the 2026-10-15
+baseline is not comparable and the recording is a re-pin, made on the #4361
+branch after its calibration (Step 1c) and before it merges. It measures
+every arm in the table, the persona arms included:
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4361: eighteen-case conventions corpus (8 samples per case); the 2026-10-15 baseline is not comparable' \
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
 A recording in which any `security_portability` concern names a
 repository-specific marker is refused (Step 1b, "Portability findings"). The
 security arms' judged false-alarm rate counts every concern on a clean diff,
@@ -290,13 +386,14 @@ landing stales the architect arm (its prompt embeds `docs/adr/index.json`)
 even though `docs/adr/` is not a trigger path.
 
 Cost: each conventions arm is `ceil(136 / cases) x cases` plan-review
-calls — 2 x 144 with the twelve committed cases (12 samples per case) — and
+calls — 2 x 144 with the eighteen committed cases (8 samples per case) — and
 the architect arm 6 x 46 = 276 persona calls (46 samples per case, so each
 of its catch and clean classes clears the 136 floor with 138), about 564
 calls for the #4313 recording; #4314's recording adds the security arm, 10 x
 34 = 340 implement-review persona calls (34 samples per case, so its six catch
 and four clean cases each clear the floor), and the portability arm, 4 x 34 =
-136, against
+136; the #4361 re-pin re-measures all of them, about 2 x 144 + 276 + 476 =
+1,040 calls, against
 `DefaultCatchRateGeneratorModel` (`claude-sonnet-5-5`, decided 2026-10-10,
 #4235). Per `pricing/pricing.go` it bills $2 input / $10 output per Mtok, against
 $3 / $15 for `claude-sonnet-4-6`; the maintainer's estimate (not re-derived) is
@@ -378,9 +475,11 @@ jq -r '.arms | to_entries[] | .key as $arm | [.value.per_case[][] | select(.outc
   comparable; re-pinning is an explicit choice there, not forced.
 
 **Distribution check (done-means of #4253).** A case at an extreme in BOTH
-arms — caught in every trial, or in at most one (with 12 samples per case,
-`12/12` or `<= 1/12`, the per-case form of the issue's `>= 22/23` and
-`<= 2/23` thresholds) — no longer discriminates. Explain each such case in
+arms — caught in every trial, or in at most one (with 8 samples per case
+since #4361, `8/8` or `<= 1/8`; at #4253's 12 samples, `12/12` or `<= 1/12`
+was the per-case form of the issue's `>= 22/23` and `<= 2/23` thresholds,
+and at 8 samples `<= 1/8` is slightly looser than `2/23`) — no longer
+discriminates. Explain each such case in
 the recording PR, or file a follow-up for a harder variant.
 
 ## Diagnosing a refused or surprising measurement
@@ -537,3 +636,4 @@ Captain ruling 2026-10-14; a harder corpus is #4402.
 | 2026-10-14 | `security_portability` | 30 | clean-redaction 30/30 FA, clean-policy-test-only 21/30; reworked | routed fix-up concern (head `69549c71`) |
 | 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
 | 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
+| pending | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | #4361 calibration pending operator: the six new cases are not yet measured | PR comment, to be posted |

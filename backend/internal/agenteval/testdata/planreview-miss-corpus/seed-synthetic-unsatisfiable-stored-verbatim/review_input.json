@@ -1,0 +1,209 @@
+{
+  "issue_title": "Keep inbound webhook deliveries so support can replay them",
+  "issue_body": "When a partner's webhook handler fails, the delivery is lost and support has nothing to replay.\n\nStore every inbound delivery to `POST /hooks/{partner}` with its headers and payload before it is handled. Add `GET /hooks/deliveries/{id}`, returning the stored delivery as JSON with `partner`, `received_at`, `headers` and `payload` so support can inspect it, and `POST /hooks/deliveries/{id}/replay`, which runs the stored delivery through the partner's handler again. An unknown delivery id returns `404` on both routes.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/hooks-service/issues/206",
+      "id": "example-org/hooks-service#206"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Persist inbound webhook deliveries in hook_deliveries and add inspect and replay routes.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/store/migrations/0041_hook_deliveries.sql",
+          "operation": "create"
+        },
+        {
+          "path": "internal/store/deliveries.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/hooks.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/deliveries.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/api/deliveries_test.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add migration 0041 creating hook_deliveries (id, partner, received_at, headers jsonb, payload jsonb), with a down migration."
+      },
+      {
+        "step": 2,
+        "description": "In the POST /hooks/{partner} handler, insert the delivery via InsertDelivery before dispatching it to the partner's handler."
+      },
+      {
+        "step": 3,
+        "description": "Add GET /hooks/deliveries/{id}, returning partner, received_at, headers and payload from the row, or 404."
+      },
+      {
+        "step": 4,
+        "description": "Add POST /hooks/deliveries/{id}/replay, loading the row and dispatching its headers and payload to the partner's handler, or 404."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests: a delivery is stored even when its handler fails, the GET returns the stored fields, replay dispatches to a fake handler, and unknown ids return 404 on both routes.",
+      "rollback_plan": "Revert the PR and run the 0041 down migration; stored deliveries are dropped.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-delivery-stored",
+          "statement": "Each POST /hooks/{partner} inserts one hook_deliveries row with the partner, received_at, headers and payload, even when the partner's handler fails.",
+          "source": "explicit",
+          "source_ref": "example-org/hooks-service#206"
+        },
+        {
+          "id": "ac-delivery-get",
+          "statement": "GET /hooks/deliveries/{id} returns JSON with partner, received_at, headers and payload for a stored delivery.",
+          "source": "explicit",
+          "source_ref": "example-org/hooks-service#206"
+        },
+        {
+          "id": "ac-delivery-payload-verbatim",
+          "statement": "GET /hooks/deliveries/{id} returns the payload byte-for-byte as received, original whitespace and key order included.",
+          "source": "inferred",
+          "rationale": "A replay should send the partner's exact payload, so the stored copy must match what arrived."
+        },
+        {
+          "id": "ac-delivery-replay",
+          "statement": "POST /hooks/deliveries/{id}/replay dispatches the stored delivery to the partner's handler once.",
+          "source": "explicit",
+          "source_ref": "example-org/hooks-service#206"
+        },
+        {
+          "id": "ac-delivery-unknown-404",
+          "statement": "GET /hooks/deliveries/{id} and POST /hooks/deliveries/{id}/replay for an unknown id return HTTP 404.",
+          "source": "explicit",
+          "source_ref": "example-org/hooks-service#206"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Every partner posts a JSON body."
+    ],
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "jsonb normalizes",
+    "jsonb normalises",
+    "jsonb does not preserve",
+    "jsonb doesn't preserve",
+    "not preserved by jsonb",
+    "jsonb discards",
+    "jsonb reorders",
+    "jsonb re-encodes",
+    "jsonb rewrites",
+    "jsonb loses",
+    "jsonb cannot",
+    "cannot pass under",
+    "can never pass",
+    "never be satisfied",
+    "cannot be satisfied",
+    "can't be satisfied",
+    "unsatisfiable",
+    "not satisfiable",
+    "impossible to satisfy",
+    "infeasible",
+    "unachievable",
+    "not warranted",
+    "unwarranted",
+    "not stated in the issue",
+    "no basis in the issue",
+    "never asks for",
+    "does not ask for",
+    "doesn't ask for",
+    "not requested",
+    "never requested",
+    "not asked for",
+    "issue says nothing",
+    "issue is silent",
+    "precedent, not a",
+    "precedent rather than",
+    "precedent and not",
+    "precedent is not a",
+    "precedent, which is not",
+    "cites no place",
+    "cites nowhere",
+    "does not cite where",
+    "fails the warrant"
+  ],
+  "attribution_phrases": [
+    "byte-for-byte",
+    "as received",
+    "original whitespace",
+    "key order"
+  ],
+  "defect_phrases": [
+    "jsonb",
+    "hook_deliveries",
+    "stored delivery"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-delivery-payload-verbatim cannot pass under the plan's own storage: jsonb normalizes whitespace and key order, so GET can never return the payload byte-for-byte."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-delivery-payload-verbatim is not warranted: the issue never asks for a byte-exact payload, only one support can inspect and replay, and the plan cites no place that requires it."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion requiring the payload as received, original whitespace and key order included, is unsatisfiable: approach step 1 stores the payload in a jsonb column."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-delivery-payload-verbatim is an inferred, blocking criterion the plan's own design cannot meet: approach step 1 declares payload jsonb, and jsonb does not preserve whitespace, key order or duplicate keys. Either store the raw body in a text or bytea column or drop the criterion; the issue asks only that support can inspect and replay a delivery."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-delivery-payload-verbatim needs a test that posts a payload and compares the GET response with it."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "Stored headers may include a partner's Authorization header; redact it before the insert."
+    },
+    {
+      "category": "risk",
+      "note": "ac-delivery-payload-verbatim is ambiguous for a form-encoded delivery; a mismatch with the JSON response shape is unsupported."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "Migration 0041 creates hook_deliveries with payload jsonb; add an index on received_at for support's date-range lookups."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-delivery-replay: replay dispatches the stored delivery once; also test a replay whose handler fails again."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "GET /hooks/deliveries/{id} exposes partner payloads; the plan does not say which callers may read deliveries."
+    }
+  ]
+}

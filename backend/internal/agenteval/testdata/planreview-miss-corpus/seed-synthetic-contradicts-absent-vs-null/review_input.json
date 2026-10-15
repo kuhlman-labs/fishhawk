@@ -1,0 +1,212 @@
+{
+  "issue_title": "Support partial profile updates with PATCH",
+  "issue_body": "Clients must send the whole profile today to change one field.\n\nAdd `PATCH /profiles/{id}` taking a JSON merge-patch body over `display_name`, `bio`, `avatar_url` and `timezone`. A field set to a value replaces the stored value. A field set to `null` clears it. A field left out of the body is left unchanged. `display_name` cannot be cleared: `{\"display_name\": null}` returns `422` with error code `display_name_required`. Only the profile's owner may PATCH it; anyone else gets `403`.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/profiles-service/issues/202",
+      "id": "example-org/profiles-service#202"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add PATCH /profiles/{id} with merge-patch updates of the four profile fields.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/api/profiles.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/api/profiles_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/store/profiles.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Decode the PATCH body into a ProfilePatch struct whose four fields are *string."
+      },
+      {
+        "step": 2,
+        "description": "Reject a null display_name with 422 and error code display_name_required, and a caller other than the owner with 403."
+      },
+      {
+        "step": 3,
+        "description": "Add UpdateProfile to internal/store/profiles.go, writing all four columns from the ProfilePatch in one UPDATE (a nil pointer writes NULL)."
+      },
+      {
+        "step": 4,
+        "description": "Document PATCH /profiles/{id} and the display_name_required error in api/openapi.yaml."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests send each body shape (a value, a null, a body without the field) and read the profile back; the 422 and 403 cases assert the status and the error code.",
+      "rollback_plan": "Revert the PR; the endpoint is additive and no migration runs.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-patch-value-replaces",
+          "statement": "PATCH /profiles/{id} with {\"bio\": \"hello\"} returns HTTP 200 and stores bio \"hello\".",
+          "source": "explicit",
+          "source_ref": "example-org/profiles-service#202"
+        },
+        {
+          "id": "ac-patch-null-clears-timezone",
+          "statement": "PATCH /profiles/{id} with {\"timezone\": null} returns HTTP 200 and clears the stored timezone.",
+          "source": "explicit",
+          "source_ref": "example-org/profiles-service#202"
+        },
+        {
+          "id": "ac-patch-no-bio-key",
+          "statement": "A PATCH /profiles/{id} body with no bio key returns HTTP 200 and leaves the profile with no bio.",
+          "source": "explicit",
+          "source_ref": "example-org/profiles-service#202"
+        },
+        {
+          "id": "ac-patch-display-name-422",
+          "statement": "PATCH /profiles/{id} with {\"display_name\": null} returns HTTP 422 with error code display_name_required.",
+          "source": "explicit",
+          "source_ref": "example-org/profiles-service#202"
+        },
+        {
+          "id": "ac-patch-other-user-403",
+          "statement": "PATCH /profiles/{id} by a caller who does not own the profile returns HTTP 403.",
+          "source": "explicit",
+          "source_ref": "example-org/profiles-service#202"
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Profiles have exactly the four writable fields the issue lists."
+    ],
+    "predicted_runtime_minutes": 30,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "contradicts the issue",
+    "contradicts issue",
+    "conflicts with the issue",
+    "inconsistent with the issue",
+    "violates the issue",
+    "contrary to the issue",
+    "at odds with the issue",
+    "leave bio unchanged",
+    "leave the bio unchanged",
+    "leaves bio unchanged",
+    "leaves the bio unchanged",
+    "keep the stored bio",
+    "keeps the stored bio",
+    "keep the existing bio",
+    "keeps the existing bio",
+    "bio should stay",
+    "bio must stay",
+    "absent and null",
+    "absent vs null",
+    "absent versus null",
+    "missing and null",
+    "conflates absent",
+    "conflates a missing",
+    "conflates an absent",
+    "treats a missing",
+    "treats an absent",
+    "treats absent",
+    "the same as null",
+    "distinct from null",
+    "differs from null",
+    "only an explicit null",
+    "only a null clears",
+    "only null clears",
+    "cannot distinguish",
+    "can't distinguish",
+    "does not distinguish",
+    "cannot tell a missing",
+    "cannot tell an absent",
+    "requires the opposite",
+    "says the opposite",
+    "yet contradicts",
+    "yet conflicts",
+    "but contradicts",
+    "directly contradicts",
+    "contradicts both the issue",
+    "conflicts directly with",
+    "contradicts the originating issue",
+    "contradicts that issue",
+    "contradict the issue",
+    "conflict with the issue",
+    "nothing in the issue permits",
+    "contradict the stated requirement"
+  ],
+  "attribution_phrases": [
+    "no bio key",
+    "leaves the profile with no bio"
+  ],
+  "defect_phrases": [
+    "left out of the body",
+    "no bio key"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-patch-no-bio-key contradicts the issue: a field left out of the merge-patch body is left unchanged and only a null clears it, so the criterion should leave bio unchanged."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "ac-patch-no-bio-key conflates absent and null. A body without bio must keep the stored bio, and approach step 1's *string fields cannot distinguish a missing key from a null either."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion where a body with no bio key leaves the profile with no bio treats a missing key as a null, which the issue reserves for clearing; the stored bio should stay."
+    },
+    {
+      "severity": "high",
+      "category": "correctness",
+      "note": "Criterion ac-patch-no-bio-key cites the issue as explicit yet contradicts it: the issue says a field left out of the body is left unchanged and only `null` clears. Approach step 3 writes NULL for every nil pointer, so the implementation would clear the bio too. Change the criterion to expect the stored bio unchanged, and decode into a structure that tells a missing key from a null."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-patch-no-bio-key needs a test that reads the profile back after the PATCH and asserts the stored bio."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "No test sends a PATCH body that is not valid JSON; it should return 400."
+    },
+    {
+      "category": "risk",
+      "note": "ac-patch-no-bio-key is ambiguous about the Content-Type: application/json versus application/merge-patch+json is a mismatch the handler may refuse as unsupported."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Writing all four columns in one UPDATE races with a concurrent PATCH from another session; add an updated_at precondition."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-patch-null-clears-timezone: a field set to null clears it; add the same test for avatar_url."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document PATCH /profiles/{id} and the display_name_required error in api/openapi.yaml."
+    }
+  ]
+}
