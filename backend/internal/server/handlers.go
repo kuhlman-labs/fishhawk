@@ -166,6 +166,13 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/specialist-jobs/{job_id}", s.handleGetSpecialistJob)
 	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/admission", s.handleAdmitSpecialistJob)
 	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/result", s.handleSpecialistJobResult)
+	// First-officer seat lifecycle (ADR-089 D1/D2, E85.6 / #4148): the
+	// captain attaches (token returned once), reads and retires an anchor's
+	// seat. Not run-scoped (the anchor may be a campaign), so each handler
+	// enforces the anchor's account itself. first_officer_seat.go.
+	mux.HandleFunc("POST /v0/first-officer-seats", s.handleAttachFirstOfficerSeat)
+	mux.HandleFunc("GET /v0/first-officer-seats", s.handleGetFirstOfficerSeat)
+	mux.HandleFunc("POST /v0/first-officer-seats/retire", s.handleRetireFirstOfficerSeat)
 	// Handover brief (E76.4 / #3767): composed on demand from the digest,
 	// captain record, campaign/run reads and the cached-spec delegation view;
 	// never writes.

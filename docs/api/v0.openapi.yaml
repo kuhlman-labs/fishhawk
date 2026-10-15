@@ -3553,9 +3553,10 @@ components:
           items: { $ref: '#/components/schemas/GateViewMergeBlocker' }
           description: |
             Each determined refusal: `acceptance_stale`,
-            `review_coverage_incomplete` (#4219) and/or `approval_dismissed`,
-            with the merge endpoint's message and details verbatim (see that
-            operation's 409 cases 8, 10 and 9).
+            `review_coverage_incomplete` (#4219), `first_officer_finding_open`
+            (ADR-089 D4, E85.6 / #4148) and/or `approval_dismissed`, with the
+            merge endpoint's message and details verbatim (see that
+            operation's 409 cases 8, 10, 11 and 9).
         undetermined:
           type: array
           items: { type: string }
@@ -3564,18 +3565,60 @@ components:
             check's fail-open reasons (`approval dismissal: …` — e.g. no GitHub
             client, a read error, a `mergeable_state` other than `blocked`),
             an acceptance-history read failure (`acceptance staleness: …`) and
-            a review-coverage read failure (`review coverage: …`, #4219); each
+            a review-coverage read failure (`review coverage: …`, #4219), a
+            first-officer concern read failure (`first-officer findings: …`,
+            #4148); each
             history read failure also adds the single `merge_readiness`
             `history_gaps` entry. An empty `blockers` is not "nothing blocks"
             while this is non-empty.
 
+    FirstOfficerSeatAnchorRequest:
+      type: object
+      additionalProperties: false
+      description: Exactly one of `campaign_id` / `run_id`. `reason` is required by retire and refused by attach.
+      properties:
+        campaign_id: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
+        reason: { type: string, maxLength: 1000 }
+    FirstOfficerSeatAnchor:
+      type: object
+      required: [kind, id]
+      properties:
+        kind: { type: string, enum: [campaign, run] }
+        id: { type: string, format: uuid }
+    FirstOfficerSeatAttachResponse:
+      type: object
+      required: [seat_subject, token, token_id, scopes, anchor]
+      properties:
+        seat_subject: { type: string, description: '`first_officer/<campaign|run>/<uuid>`.' }
+        token: { type: string, description: 'The bearer plaintext, returned only here.' }
+        token_id: { type: string, format: uuid }
+        scopes: { type: array, items: { type: string } }
+        anchor: { $ref: '#/components/schemas/FirstOfficerSeatAnchor' }
+    FirstOfficerSeatStatus:
+      type: object
+      required: [seat_subject, attached, token_ids, anchor, anchor_state, anchor_terminal]
+      properties:
+        seat_subject: { type: string }
+        attached: { type: boolean }
+        token_ids: { type: array, items: { type: string, format: uuid } }
+        anchor: { $ref: '#/components/schemas/FirstOfficerSeatAnchor' }
+        anchor_state: { type: string }
+        anchor_terminal: { type: boolean }
+    FirstOfficerSeatRetireResponse:
+      type: object
+      required: [seat_subject, revoked_token_ids, anchor]
+      properties:
+        seat_subject: { type: string }
+        revoked_token_ids: { type: array, items: { type: string, format: uuid } }
+        anchor: { $ref: '#/components/schemas/FirstOfficerSeatAnchor' }
     GateViewMergeBlocker:
       type: object
       required: [code, message]
       properties:
         code:
           type: string
-          enum: [acceptance_stale, review_coverage_incomplete, approval_dismissed]
+          enum: [acceptance_stale, review_coverage_incomplete, first_officer_finding_open, approval_dismissed]
         message:
           type: string
           description: The merge endpoint's refusal message, verbatim.
@@ -10402,6 +10445,19 @@ components:
             sending stage may send (per-stage cap 2).
         work_item:
           $ref: '#/components/schemas/CrewWorkItem'
+        blocking_concern_id:
+          type: string
+          format: uuid
+          description: |
+            Set ONLY on a first-officer seat's finding send (E85.6 / #4148)
+            whose evidence cites a runner-attested FAILING specialist-job
+            completion on its anchor run: the open `first_officer` concern
+            that now holds approve and merge.
+        blocking_conversion_error:
+          type: string
+          description: |
+            Set instead of `blocking_concern_id` when that conversion failed;
+            the finding stays OPEN and advisory.
         work_item_filing_error:
           $ref: '#/components/schemas/CrewWorkItemFilingError'
     CrewWorkItem:
@@ -10516,6 +10572,14 @@ components:
         was unreachable surfaces as `503 service_unavailable` at the
         auth boundary, NOT as 401 — a 401 here means the credential is
         absent or genuinely bad on a healthy database (#764).
+        A first-officer seat token (`first_officer/…`, E85.6 / #4148) is
+        additionally refused `401 first_officer_seat_retired` once its
+        anchor campaign or run is terminal or gone (every token for the seat
+        subject is revoked and `first_officer_seat_retired` is recorded), or
+        `401 first_officer_seat_invalid` when its subject is not
+        `first_officer/campaign/<uuid>` or `first_officer/run/<uuid>`; an
+        anchor that cannot be read or verified is
+        `503 first_officer_seat_unverifiable`, with nothing revoked.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -12018,6 +12082,11 @@ paths:
       description: |
         Returns the freshly-minted token string ONCE in the response body.
         The token is not retrievable later; if lost, revoke and re-issue.
+
+        A first-officer seat identity (`first_officer/…` subject, E85.6 /
+        #4148) is refused `403 first_officer_cannot_mint_tokens` before any
+        token is issued: its captain attaches the seat credential through
+        `POST /v0/first-officer-seats`.
       tags: [auth]
       requestBody:
         required: true
@@ -14647,7 +14716,15 @@ paths:
             refuses it `gating_authority`). Checked after case (8) and BEFORE
             the merge seam, so
             it is reported even where `merge_seam_unconfigured` would follow.
-            Cases (8), (9) and (10) record NO verdict row and dispatch
+            (11) A first-officer finding is open (`first_officer_finding_open`,
+            ADR-089 D4, E85.6 / #4148): an OPEN concern with provenance
+            `first_officer` — a seat finding that cited a runner-attested
+            FAILING specialist-job completion on this run. `details` carry
+            `{run_id, pr_url, concern_ids[], next_step}`; clear it by waiving
+            the concern with a reason, deferring it, or routing a fix-up.
+            Checked after case (10), before the merge seam; a read error is
+            `500 internal_error` (fail-closed).
+            Cases (8), (9), (10) and (11) record NO verdict row and dispatch
             nothing.
           content:
             application/json:
@@ -18429,6 +18506,19 @@ paths:
         `work_item_filing_error` when the filing failed — the message stays
         sent either way. One `crew_work_request_filed` chain entry records a
         landed filing.
+
+        **First-officer seat (ADR-089 D4, E85.6 / #4148).** A seat token
+        (`first_officer/…`, `write:messages`) sends as `first_officer`, only a
+        `finding` or `notice` (`403 first_officer_type_not_permitted`), only
+        to `captain` (`403 first_officer_recipient_not_permitted`), anchored
+        on a run inside its seat (`403 first_officer_anchor_out_of_seat`). A
+        finding citing (`audit_entry` evidence) a runner-attested FAILING
+        specialist-job completion on its anchor run is converted to an open
+        concern with provenance `first_officer`, which holds approve and
+        merge (`409 first_officer_finding_open`); the 201 then carries
+        `blocking_concern_id`, or `blocking_conversion_error` when the insert
+        failed (the finding stays open and advisory). An evidence read error
+        is `503 first_officer_evidence_unreadable` with nothing appended.
       tags: [runs]
       requestBody:
         required: true
@@ -18452,7 +18542,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` (a run-bound token without `write:messages`, or an operator without `write:stages`), `cross_run_crew_message` (another run's anchor or a run-less anchor on a run-bound token), `crew_sender_not_derivable` (the token's run has no executing plan or review stage), or `account_mismatch`.
+            `insufficient_scope` (a run-bound token without `write:messages`, or an operator without `write:stages`), `cross_run_crew_message` (another run's anchor or a run-less anchor on a run-bound token), `crew_sender_not_derivable` (the token's run has no executing plan or review stage), `account_mismatch`, or — for a first-officer seat — `first_officer_type_not_permitted`, `first_officer_recipient_not_permitted` or `first_officer_anchor_out_of_seat`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18482,7 +18572,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
+            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback). `first_officer_evidence_unreadable` — a seat finding's evidence could not be resolved (nothing appended); `first_officer_seat_unverifiable` — whether the anchor run lies inside the seat could not be read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -18815,6 +18905,175 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/first-officer-seats:
+    post:
+      operationId: attachFirstOfficerSeat
+      summary: Attach a first-officer seat to a campaign or run
+      description: |
+        ADR-089 D1/D2 (E85.6 / #4148). The captain attaches the read-only
+        first-officer seat to ONE anchor. The seat IS an api token whose
+        subject is `first_officer/campaign/<uuid>` or
+        `first_officer/run/<uuid>`, holding exactly
+        `[read:runs, read:audit, write:messages, request:specialist_jobs]`;
+        the bearer middleware clamps any seat-subject token to that profile,
+        so a seat can never approve, dispatch, merge, reap or mint a token.
+        The plaintext `token` is returned ONCE. The seat retires on its next
+        request once its anchor is terminal or gone (`401
+        first_officer_seat_retired`), or through
+        `POST /v0/first-officer-seats/retire`.
+
+        **Captain act.** `write:approvals`; an agent identity
+        (operator-agent, run-bound, seat) is refused
+        `first_officer_attach_requires_human`. While the anchor repository
+        has a sitting captain, only that subject may attach
+        (`first_officer_attach_not_captain`); a vacant or unreadable captain
+        seat admits any human `write:approvals` holder, and the basis is
+        recorded. One seat per anchor: an active seat token is
+        `409 first_officer_seat_exists`, and a post-issue convergence keeps
+        the OLDEST active token and revokes the rest (a losing concurrent
+        attach answers 409). Appends `first_officer_seat_attached`
+        `{seat_subject, token_id, anchor, scopes, attached_by, captain_basis}`
+        (never the plaintext) to the run chain (run seat) or the global chain
+        under the campaign's account (campaign seat).
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FirstOfficerSeatAnchorRequest' }
+      responses:
+        '201':
+          description: The seat token, returned once.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FirstOfficerSeatAttachResponse' }
+        '400':
+          description: '`validation_failed` — not exactly one of `campaign_id` / `run_id`, a non-UUID id, an unknown member, or a `reason` (retire only).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` (no `write:approvals`), `first_officer_attach_requires_human` or `first_officer_attach_not_captain`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` / `campaign_not_found` — no such anchor in the caller''s account (a foreign anchor is not disclosed).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`first_officer_anchor_terminal` — the anchor is terminal; `first_officer_seat_exists` — the anchor already has a seat, or a concurrent attach won it.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — a token read/issue failed, uniqueness could not be verified, or the attach row could not be recorded; the issued token is revoked in each case.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`first_officer_seats_unconfigured` — the token, audit, run or campaign repository is not wired; a store read failure is `service_unavailable`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      operationId: getFirstOfficerSeat
+      summary: Read an anchor's first-officer seat
+      description: |
+        E85.6 / #4148. Attach state is derived from the active api tokens
+        for the seat subject. `read:runs`. Exactly one of `campaign_id` /
+        `run_id`; an anchor outside the caller's account is not found.
+      tags: [auth]
+      parameters:
+        - { name: campaign_id, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: run_id, in: query, required: false, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: The seat's state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FirstOfficerSeatStatus' }
+        '400':
+          description: '`validation_failed` — not exactly one anchor, or a non-UUID id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` (no `read:runs`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` / `campaign_not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the token read failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`first_officer_seats_unconfigured`, or `service_unavailable` on an anchor read failure.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/first-officer-seats/retire:
+    post:
+      operationId: retireFirstOfficerSeat
+      summary: Retire (detach) an anchor's first-officer seat
+      description: |
+        E85.6 / #4148. The captain detaches the seat: the same human and
+        captain gate as attach, a non-empty `reason` (1-1000 chars), and a
+        terminal anchor is allowed. Revokes every active seat token and
+        appends `first_officer_seat_retired` `{seat_subject, reason:
+        captain_detached, note, anchor, anchor_state, revoked_token_ids,
+        retired_by}`. Before reverting the seat feature, retire live seats
+        this way: a reverted server no longer clamps their tokens.
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FirstOfficerSeatAnchorRequest' }
+      responses:
+        '200':
+          description: The revoked token ids.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FirstOfficerSeatRetireResponse' }
+        '400':
+          description: '`validation_failed` — empty or over-long `reason`, not exactly one anchor, a non-UUID id or an unknown member.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope`, `first_officer_attach_requires_human` or `first_officer_attach_not_captain`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` / `campaign_not_found`, or `first_officer_seat_not_attached` — the anchor has no active seat token.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — a token read or revoke failed, or the retire row could not be recorded (the revocation stands).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`first_officer_seats_unconfigured`, or `service_unavailable` on an anchor read failure.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/specialist-jobs:
     post:
       operationId: requestSpecialistJob
@@ -18844,7 +19103,14 @@ paths:
         **Auth.** `write:stages` from a seat identity. A run-bound
         (`mcp:run:<uuid>`) token is refused
         `specialist_job_requester_not_a_seat` even when it carries
-        `write:stages`. `attest:specialist-jobs` (the runner credential,
+        `write:stages`. `request:specialist_jobs` is accepted ONLY from a
+        first-officer seat (`first_officer/…`, E85.6 / #4148): a non-seat
+        token holding only it is `insufficient_scope`. A seat's request
+        records `requester.seat: first_officer` (`actor_kind: agent`) and its
+        subject must lie inside the seat (`403
+        first_officer_subject_out_of_seat`: `subject.campaign_id` must be the
+        seat's campaign, `subject.run_id` a run inside it, and one of them
+        must be named). Admission and result stay refused to a seat. `attest:specialist-jobs` (the runner credential,
         E85.15 / #4363) is NOT accepted here: a token holding only that scope
         is refused `insufficient_scope`, so a runner credential can never
         request a job.
@@ -18869,7 +19135,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` (no `write:stages`; `attest:specialist-jobs` alone does not satisfy it) or `specialist_job_requester_not_a_seat` (a run-bound token).
+            `insufficient_scope` (no `write:stages`, and not a seat holding `request:specialist_jobs`; `attest:specialist-jobs` alone does not satisfy it), `specialist_job_requester_not_a_seat` (a run-bound token) or `first_officer_subject_out_of_seat` (a seat naming a subject outside its seat).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -24155,6 +24421,14 @@ paths:
           description: |
             Possible error codes:
 
+            - `first_officer_finding_open` — ADR-089 D4 (E85.6 / #4148): an
+              `approve` on a plan stage while a plan-kind, or on a review
+              stage while an implement-kind, concern with provenance
+              `first_officer` is OPEN. Checked after approver authorization
+              and before the approval is recorded, so no approval row is
+              written; `details` carry `{run_id, stage_id, concern_ids[],
+              next_step}`. A `reject` is never held. A concern read error is
+              `500 internal_error` (fail-closed).
             - `invalid_state_transition` — stage isn't in
               awaiting_approval. (Pre-#253 the handler also returned
               409 with `blocking_checks_not_passed` when any declared
