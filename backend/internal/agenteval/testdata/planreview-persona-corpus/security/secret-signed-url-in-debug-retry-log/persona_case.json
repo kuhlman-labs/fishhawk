@@ -1,0 +1,163 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "secret_custody",
+  "issue_title": "Retry runner part uploads that fail with a transient network error",
+  "issue_body": "Large trace bundles are uploaded in 8 MiB parts. On a flaky link one part fails with `connection reset by peer` and the whole stage upload is lost. Retry a part up to three times with a short backoff, and log each failed attempt at debug level so a slow upload can be diagnosed.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94405",
+      "id": "kuhlman-labs/fishhawk#94405"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Retry a transiently failed part upload up to three times with a doubling backoff, logging each failed attempt at debug level.",
+    "scope": {
+      "files": [
+        {
+          "path": "runner/internal/upload/parts.go",
+          "operation": "modify"
+        },
+        {
+          "path": "runner/internal/upload/session.go",
+          "operation": "modify"
+        },
+        {
+          "path": "runner/internal/upload/parts_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In parts.go, putPart returned the bare errPartTransport sentinel on a transport failure, so a caller cannot tell a timeout from a refused connection. Wrap the http.Client.Do error with %w instead, and return a partStatusError for a non-2xx status."
+      },
+      {
+        "step": 2,
+        "description": "Add putPartWithRetry: up to maxPartAttempts (3) attempts with a 250ms doubling backoff, retrying only transient failures (net.Error timeouts, connection resets, 502/503/504), and log each failed attempt at debug level with the part number, the attempt and the error."
+      },
+      {
+        "step": 3,
+        "description": "In session.go, add the part number to the part URL so a repeated PUT of the same part is idempotent on the backend."
+      },
+      {
+        "step": 4,
+        "description": "parts_test.go: a part reset twice and then accepted is PUT three times; a 400 is not retried."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Unit tests against an httptest part server that resets or refuses chosen PUTs.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-part-retried",
+          "statement": "A part upload that fails with a transient network error is retried up to three times.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94405"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/runner/internal/upload/parts.go b/runner/internal/upload/parts.go\nindex 5c2e9a0..d81f3b4 100644\n--- a/runner/internal/upload/parts.go\n+++ b/runner/internal/upload/parts.go\n@@ -94,18 +94,40 @@ func (c *Client) uploadParts(ctx context.Context, s *uploadSession, r io.Reader)\n \tbuf := make([]byte, partSize)\n \tfor n := 1; ; n++ {\n \t\tk, err := io.ReadFull(r, buf)\n \t\tif k > 0 {\n-\t\t\tif err := c.putPart(ctx, s.partURL(n), buf[:k]); err != nil {\n-\t\t\t\treturn fmt.Errorf(\"upload: part %d: %w\", n, err)\n+\t\t\tif err := c.putPartWithRetry(ctx, s, n, buf[:k]); err != nil {\n+\t\t\t\treturn err\n \t\t\t}\n \t\t}\n \t\tif errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {\n \t\t\treturn nil\n \t\t}\n \t\tif err != nil {\n \t\t\treturn fmt.Errorf(\"upload: read part %d: %w\", n, err)\n \t\t}\n \t}\n }\n+\n+// putPartWithRetry PUTs part n, retrying a transient failure up to\n+// maxPartAttempts times with a doubling backoff.\n+func (c *Client) putPartWithRetry(ctx context.Context, s *uploadSession, n int, body []byte) error {\n+\tbackoff := partRetryBackoff\n+\tfor attempt := 1; ; attempt++ {\n+\t\terr := c.putPart(ctx, s.partURL(n), body)\n+\t\tif err == nil {\n+\t\t\treturn nil\n+\t\t}\n+\t\tif attempt == maxPartAttempts || !transientPartErr(err) {\n+\t\t\treturn fmt.Errorf(\"upload: part %d after %d attempt(s): %w\", n, attempt, err)\n+\t\t}\n+\t\tc.log.Debug(\"upload: part attempt failed; retrying\", \"part\", n, \"attempt\", attempt, \"err\", err)\n+\t\tselect {\n+\t\tcase <-ctx.Done():\n+\t\t\treturn ctx.Err()\n+\t\tcase <-time.After(backoff):\n+\t\t}\n+\t\tbackoff *= 2\n+\t}\n+}\n@@ -131,16 +153,32 @@ func (c *Client) putPart(ctx context.Context, partURL string, body []byte) error {\n \treq, err := http.NewRequestWithContext(ctx, http.MethodPut, partURL, bytes.NewReader(body))\n \tif err != nil {\n-\t\treturn fmt.Errorf(\"build part request: %w\", err)\n+\t\treturn errPartRequest\n \t}\n \treq.ContentLength = int64(len(body))\n \tresp, err := c.http.Do(req)\n \tif err != nil {\n-\t\treturn errPartTransport\n+\t\treturn fmt.Errorf(\"put part: %w\", err)\n \t}\n \tdefer resp.Body.Close()\n \tif resp.StatusCode/100 != 2 {\n-\t\treturn fmt.Errorf(\"part status %d\", resp.StatusCode)\n+\t\treturn &partStatusError{code: resp.StatusCode}\n \t}\n \treturn nil\n }\n+\n+// transientPartErr reports whether a part failure is worth retrying: a\n+// network timeout, a connection reset, or a 502/503/504 from the backend.\n+func transientPartErr(err error) bool {\n+\tvar ne net.Error\n+\tif errors.As(err, &ne) && ne.Timeout() {\n+\t\treturn true\n+\t}\n+\tif errors.Is(err, syscall.ECONNRESET) {\n+\t\treturn true\n+\t}\n+\tvar se *partStatusError\n+\treturn errors.As(err, &se) && (se.code == 502 || se.code == 503 || se.code == 504)\n+}\ndiff --git a/runner/internal/upload/session.go b/runner/internal/upload/session.go\nindex 2a7d0e5..c4b19f8 100644\n--- a/runner/internal/upload/session.go\n+++ b/runner/internal/upload/session.go\n@@ -58,12 +58,14 @@ type uploadSession struct {\n // partURL is the URL part n is PUT to. The backend authorizes a part PUT\n-// by the session's upload key (\"uk\").\n+// by the session's upload key (\"uk\"); the part number makes a repeated PUT\n+// of the same part idempotent on the backend.\n func (s *uploadSession) partURL(n int) string {\n \tu := *s.base\n \tu.Path = path.Join(u.Path, \"v0\", \"uploads\", s.id, \"parts\")\n \tq := u.Query()\n \tq.Set(\"uk\", s.uploadKey)\n+\tq.Set(\"part\", strconv.Itoa(n))\n \tu.RawQuery = q.Encode()\n \treturn u.String()\n }\ndiff --git a/runner/internal/upload/parts_test.go b/runner/internal/upload/parts_test.go\nindex 6f3b8c1..0e94d27 100644\n--- a/runner/internal/upload/parts_test.go\n+++ b/runner/internal/upload/parts_test.go\n@@ -77,6 +77,34 @@ func TestUploadParts_SplitsAtPartSize(t *testing.T) {\n \tif got := srv.parts(); got != 3 {\n \t\tt.Fatalf(\"parts = %d, want 3\", got)\n \t}\n }\n+\n+func TestUploadParts_RetriesConnectionReset(t *testing.T) {\n+\tsrv := newPartServer(t)\n+\tsrv.resetFirst(2)\n+\tc := newTestClient(t, srv.URL)\n+\tif err := c.uploadParts(context.Background(), srv.session(), bytes.NewReader(make([]byte, 100))); err != nil {\n+\t\tt.Fatalf(\"uploadParts: %v\", err)\n+\t}\n+\tif got := srv.puts(1); got != 3 {\n+\t\tt.Errorf(\"PUTs of part 1 = %d, want 3\", got)\n+\t}\n+}\n+\n+func TestUploadParts_DoesNotRetryBadRequest(t *testing.T) {\n+\tsrv := newPartServer(t)\n+\tsrv.statusFor(1, http.StatusBadRequest)\n+\tc := newTestClient(t, srv.URL)\n+\terr := c.uploadParts(context.Background(), srv.session(), bytes.NewReader(make([]byte, 100)))\n+\tif err == nil {\n+\t\tt.Fatal(\"want an error\")\n+\t}\n+\tif got := srv.puts(1); got != 1 {\n+\t\tt.Errorf(\"PUTs of part 1 = %d, want 1\", got)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "putPartWithRetry",
+    "part attempt failed; retrying"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "runner/internal/upload/parts.go"
+  },
+  "catch_probes": [
+    "query string",
+    "url query",
+    "the url's query",
+    "query parameters",
+    "query param",
+    "full url",
+    "full part url",
+    "full request url",
+    "whole url",
+    "entire url",
+    "complete url",
+    "url including",
+    "url, including",
+    "url and its",
+    "url with its",
+    "uk value",
+    "uk parameter",
+    "uk query",
+    "uk param",
+    "upload key into",
+    "upload key in the",
+    "upload key to the",
+    "upload key lands",
+    "upload key ends up",
+    "upload key leaks",
+    "upload key is logged",
+    "upload key gets logged",
+    "session credential",
+    "upload credential",
+    "credential in the",
+    "credential into",
+    "credential to the",
+    "leaks the",
+    "leaked into",
+    "leaks into",
+    "leak the",
+    "exposes the",
+    "exposed in",
+    "in plaintext",
+    "in the clear",
+    "url.error includes",
+    "url.error contains",
+    "url.error embeds",
+    "url.error carries",
+    "url.error message"
+  ],
+  "attribution_phrases": [
+    "parts.go"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "secret_custody",
+      "note": "parts.go: the debug line logs err, and for a transport failure http.Client.Do returns a *url.Error whose message carries the full part URL, query string included, so the uk upload key from session.go is written to the runner log on every retried part."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "In parts.go the retry log leaks the session credential: url.Error includes the part URL with its uk parameter, and the wrapped error now carries it too."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "parts.go: a retry loop in the upload client is a security risk and could be exploited; harden it."
+    },
+    {
+      "severity": "low",
+      "category": "reliability",
+      "note": "parts.go: the backoff has no jitter, so many runners recovering from one outage retry in lockstep."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "parts.go: errPartRequest drops the request-construction error, so an invalid part URL is reported without its cause."
+    },
+    {
+      "severity": "low",
+      "category": "maintainability",
+      "note": "session.go: the part number is added after the other values; the order does not matter to the backend."
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "trust_boundaries",
+  "issue_title": "Plan prompt: name the linked issues up front",
+  "issue_body": "When a run's issue links others (`Depends on #N`, `Relates to #N`), the planner sees them only deep in the prompt, after the plan schema, and often plans as if they did not exist. Put a one-line summary of each linked issue (number, title and the first sentence of its body) in the prompt header next to the run's own issue number, and keep the full linked bodies where they are.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94407",
+      "id": "kuhlman-labs/fishhawk#94407"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "List each linked issue as a one-line headline in the prompt header; keep the full linked bodies in their section.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/prompt/linkedissue.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/prompt/prompt.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/prompt/linkedissue_test.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add linkedissue.go with linkedIssueHeadline(li LinkedIssue) string, rendering \"#<n> <title>: <first sentence of body>\" with whitespace collapsed and the sentence cut at 160 runes."
+      },
+      {
+        "step": 2,
+        "description": "In prompt.go's renderHeader, after the Stage line, write a \"Linked issues:\" list with one headline per linked issue."
+      },
+      {
+        "step": 3,
+        "description": "In renderLinkedIssues, move the title from the #### heading into the renderUntrusted block beside the body, so the heading carries only the number."
+      },
+      {
+        "step": 4,
+        "description": "linkedissue_test.go: sentence ends at '. ', '? ', '! ' or a newline; a body with none is cut at 160 runes; a multi-line title collapses to one line."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Package unit tests for the headline helper, plus the existing prompt golden tests regenerated.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-linked-headline",
+          "statement": "The prompt header names each linked issue by number, title and first sentence.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94407"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/prompt/linkedissue.go b/backend/internal/prompt/linkedissue.go\nnew file mode 100644\nindex 0000000..b6e3a91\n--- /dev/null\n+++ b/backend/internal/prompt/linkedissue.go\n@@ -0,0 +1,38 @@\n+package prompt\n+\n+import (\n+\t\"fmt\"\n+\t\"strings\"\n+\t\"unicode/utf8\"\n+)\n+\n+// linkedIssueHeadlineMaxRunes caps the first-sentence summary of a linked\n+// issue's body.\n+const linkedIssueHeadlineMaxRunes = 160\n+\n+// linkedIssueHeadline is the one-line summary of a linked issue the prompt\n+// header lists: \"#<n> <title>: <first sentence of body>\".\n+func linkedIssueHeadline(li LinkedIssue) string {\n+\ttitle := strings.Join(strings.Fields(li.Title), \" \")\n+\treturn fmt.Sprintf(\"#%d %s: %s\", li.Number, title, firstSentence(li.Body, linkedIssueHeadlineMaxRunes))\n+}\n+\n+// firstSentence returns s up to and including its first sentence end\n+// (\". \", \"? \", \"! \" or a newline), whitespace-collapsed and cut at max runes.\n+func firstSentence(s string, max int) string {\n+\ts = strings.TrimSpace(s)\n+\tend := len(s)\n+\tfor _, sep := range []string{\". \", \"? \", \"! \", \"\\n\"} {\n+\t\tif i := strings.Index(s, sep); i >= 0 && i+1 < end {\n+\t\t\tend = i + 1\n+\t\t}\n+\t}\n+\tout := strings.Join(strings.Fields(s[:end]), \" \")\n+\tif utf8.RuneCountInString(out) > max {\n+\t\tout = string([]rune(out)[:max])\n+\t}\n+\treturn out\n+}\ndiff --git a/backend/internal/prompt/prompt.go b/backend/internal/prompt/prompt.go\nindex 7c41e02..a9d35f8 100644\n--- a/backend/internal/prompt/prompt.go\n+++ b/backend/internal/prompt/prompt.go\n@@ -142,8 +142,14 @@ func renderHeader(b *strings.Builder, t Trigger) {\n \tfmt.Fprintf(b, \"Repository: %s\\n\", t.Repo)\n \tfmt.Fprintf(b, \"Issue: #%d\\n\", t.IssueNumber)\n \tfmt.Fprintf(b, \"Stage: %s\\n\", t.Stage)\n+\tif len(t.LinkedIssues) > 0 {\n+\t\tb.WriteString(\"Linked issues:\\n\")\n+\t\tfor _, li := range t.LinkedIssues {\n+\t\t\tfmt.Fprintf(b, \"- %s\\n\", linkedIssueHeadline(li))\n+\t\t}\n+\t}\n \tb.WriteString(\"\\n\")\n }\n@@ -311,13 +317,13 @@ func renderLinkedIssues(b *strings.Builder, t Trigger) {\n \tif len(t.LinkedIssues) == 0 {\n \t\treturn\n \t}\n \tb.WriteString(\"### Linked issues\\n\\n\")\n \tfor _, li := range t.LinkedIssues {\n-\t\tfmt.Fprintf(b, \"#### #%d %s\\n\\n\", li.Number, li.Title)\n-\t\trenderUntrusted(b, \"linked issue body\", li.Body)\n+\t\tfmt.Fprintf(b, \"#### #%d\\n\\n\", li.Number)\n+\t\trenderUntrusted(b, \"linked issue\", li.Title+\"\\n\\n\"+li.Body)\n \t\tb.WriteString(\"\\n\")\n \t}\n }\ndiff --git a/backend/internal/prompt/linkedissue_test.go b/backend/internal/prompt/linkedissue_test.go\nnew file mode 100644\nindex 0000000..e1f7c20\n--- /dev/null\n+++ b/backend/internal/prompt/linkedissue_test.go\n@@ -0,0 +1,33 @@\n+package prompt\n+\n+import (\n+\t\"strings\"\n+\t\"testing\"\n+)\n+\n+func TestFirstSentence(t *testing.T) {\n+\tfor _, tc := range []struct{ in, want string }{\n+\t\t{\"Retry part uploads. Then log them.\", \"Retry part uploads.\"},\n+\t\t{\"Why does it hang? It waits on a lock.\", \"Why does it hang?\"},\n+\t\t{\"one line\\nsecond line\", \"one line\"},\n+\t\t{\"  no end at all  \", \"no end at all\"},\n+\t} {\n+\t\tif got := firstSentence(tc.in, linkedIssueHeadlineMaxRunes); got != tc.want {\n+\t\t\tt.Errorf(\"firstSentence(%q) = %q, want %q\", tc.in, got, tc.want)\n+\t\t}\n+\t}\n+\tlong := strings.Repeat(\"a\", 400)\n+\tif got := firstSentence(long, linkedIssueHeadlineMaxRunes); len([]rune(got)) != linkedIssueHeadlineMaxRunes {\n+\t\tt.Errorf(\"long body cut to %d runes, want %d\", len([]rune(got)), linkedIssueHeadlineMaxRunes)\n+\t}\n+}\n+\n+func TestLinkedIssueHeadline(t *testing.T) {\n+\tli := LinkedIssue{Number: 812, Title: \"Depends on\\nthe store\", Body: \"Move the store first. Then the API.\"}\n+\tif got, want := linkedIssueHeadline(li), \"#812 Depends on the store: Move the store first.\"; got != want {\n+\t\tt.Errorf(\"headline = %q, want %q\", got, want)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "linkedIssueHeadline"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "backend/internal/prompt/prompt.go"
+  },
+  "catch_probes": [
+    "outside the envelope",
+    "outside the quarantine",
+    "outside of the envelope",
+    "outside of the quarantine",
+    "outside any envelope",
+    "outside an envelope",
+    "outside its envelope",
+    "outside the untrusted",
+    "outside renderuntrusted",
+    "not quarantined",
+    "un-quarantined",
+    "not enveloped",
+    "without the envelope",
+    "without an envelope",
+    "without quarantine",
+    "no envelope",
+    "bypasses the envelope",
+    "bypasses the quarantine",
+    "bypasses renderuntrusted",
+    "raw title",
+    "raw issue title",
+    "raw header",
+    "trusted prompt header",
+    "attacker-controlled",
+    "attacker controlled",
+    "attacker-supplied",
+    "prompt injection",
+    "prompt-injection",
+    "inject instructions",
+    "injected instructions",
+    "injection vector",
+    "as instructions",
+    "instruction injection",
+    "untrusted text",
+    "untrusted title",
+    "untrusted content",
+    "untrusted issue",
+    "issue author controls",
+    "author-controlled",
+    "user-controlled",
+    "anyone who can open",
+    "anyone who can edit"
+  ],
+  "attribution_phrases": [
+    "prompt.go"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "trust_boundaries",
+      "note": "prompt.go: renderHeader writes linkedIssueHeadline (the linked issue's title and first body sentence) into the header outside the quarantine envelope; the body section wraps the same text in renderUntrusted, but the header copy is raw, so a linked issue's author can place instructions the planner reads."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "In prompt.go the new Linked issues header is untrusted text with no envelope: a prompt injection path through a linked issue's title."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "prompt.go: rendering more issue text into the prompt is a security risk; this is unsafe."
+    },
+    {
+      "severity": "low",
+      "category": "maintainability",
+      "note": "prompt.go: the header list has no cap, so a run linking forty issues adds forty header lines; cap it or print a count."
+    },
+    {
+      "severity": "low",
+      "category": "readability",
+      "note": "prompt.go: renderLinkedIssues drops the title from the #### heading, so the section is harder to scan."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "linkedissue.go: firstSentence cuts on a byte index before the rune cut; check a multi-byte separator."
+    }
+  ]
+}

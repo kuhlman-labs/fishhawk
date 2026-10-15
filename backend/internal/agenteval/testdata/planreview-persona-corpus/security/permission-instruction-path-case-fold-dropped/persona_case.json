@@ -1,0 +1,140 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "permission_scope",
+  "issue_title": "Plan scope paths written with backslashes or ./ are not matched by the path constraints",
+  "issue_body": "A plan generated on Windows listed `backend\\internal\\server\\routes.go`, and another listed `./docs/README.md`. The path constraints compare the raw strings, so neither entry matched the constraint tables. Normalize paths (separators, a leading `./`, `.` and `..` segments) in one helper and use it wherever the instruction-path constraint compares a path.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94404",
+      "id": "kuhlman-labs/fishhawk#94404"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Normalize separators, a leading ./ and dot segments in one pathnorm.go helper and use it in both instruction-path checks.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/policy/pathnorm.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/policy/instruction_paths.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/policy/pathnorm_test.go",
+          "operation": "create"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add pathnorm.go with cleanRepoPath (trim, backslashes to slashes, strip a leading ./, path.Clean) and foldRepoPath (cleanRepoPath followed by strings.ToLower)."
+      },
+      {
+        "step": 2,
+        "description": "In instruction_paths.go, replace the inline path handling in CheckScope and CheckChanged with the helpers."
+      },
+      {
+        "step": 3,
+        "description": "Add pathnorm_test.go: table tests for cleanRepoPath, a backslash-separated scope entry in CheckScope and a ./-prefixed committed path in CheckChanged."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Package unit tests for the helper and both checks.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-windows-scope-path",
+          "statement": "A scope entry written with backslashes or a leading ./ is matched against the constraint tables.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94404"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/policy/pathnorm.go b/backend/internal/policy/pathnorm.go\nnew file mode 100644\nindex 0000000..3c1d9e2\n--- /dev/null\n+++ b/backend/internal/policy/pathnorm.go\n@@ -0,0 +1,27 @@\n+package policy\n+\n+import (\n+\t\"path\"\n+\t\"strings\"\n+)\n+\n+// cleanRepoPath puts a repository-relative path in the slash-separated,\n+// cleaned form the constraint tables are written in: surrounding whitespace\n+// is trimmed, backslashes become slashes, a leading \"./\" is dropped and \".\"\n+// and \"..\" segments are resolved.\n+func cleanRepoPath(p string) string {\n+\tp = strings.TrimSpace(p)\n+\tp = strings.ReplaceAll(p, `\\`, \"/\")\n+\tp = strings.TrimPrefix(p, \"./\")\n+\tif p == \"\" {\n+\t\treturn \"\"\n+\t}\n+\treturn path.Clean(p)\n+}\n+\n+// foldRepoPath is cleanRepoPath followed by strings.ToLower.\n+func foldRepoPath(p string) string {\n+\treturn strings.ToLower(cleanRepoPath(p))\n+}\ndiff --git a/backend/internal/policy/instruction_paths.go b/backend/internal/policy/instruction_paths.go\nindex 8d2c4f1..61ae0b7 100644\n--- a/backend/internal/policy/instruction_paths.go\n+++ b/backend/internal/policy/instruction_paths.go\n@@ -61,13 +61,13 @@ var instructionPathPatterns = []string{\n // CheckScope reports every plan scope entry the constraint refuses. It runs\n // in the plan-gate scope precheck.\n func (c InstructionPathConstraint) CheckScope(entries []plan.ScopeFile) []Violation {\n \tvar out []Violation\n \tfor _, e := range entries {\n-\t\tp := strings.ToLower(strings.TrimSpace(e.Path))\n+\t\tp := foldRepoPath(e.Path)\n \t\tif c.refuses(p) {\n \t\t\tout = append(out, Violation{Constraint: c.Name(), Path: e.Path, Phase: PhasePlan})\n \t\t}\n \t}\n \treturn out\n }\n@@ -82,13 +82,13 @@ func (c InstructionPathConstraint) CheckScope(entries []plan.ScopeFile) []Violat\n // CheckChanged reports every committed path the constraint refuses. It runs\n // in the post-implement gate against the stage's diff.\n func (c InstructionPathConstraint) CheckChanged(files []ChangedFile) []Violation {\n \tvar out []Violation\n \tfor _, f := range files {\n-\t\tp := strings.ToLower(strings.TrimSpace(f.Path))\n+\t\tp := cleanRepoPath(f.Path)\n \t\tif c.refuses(p) {\n \t\t\tout = append(out, Violation{Constraint: c.Name(), Path: f.Path, Phase: PhaseImplement})\n \t\t}\n \t}\n \treturn out\n }\n@@ -101,7 +101,8 @@ func (c InstructionPathConstraint) CheckChanged(files []ChangedFile) []Violation\n-// refuses reports whether the lower-cased path p matches an instruction path.\n+// refuses reports whether p, normalized by the caller (pathnorm.go), matches\n+// an instruction path.\n func (c InstructionPathConstraint) refuses(p string) bool {\n \tfor _, pat := range instructionPathPatterns {\n \t\tif ok, _ := doublestar.Match(pat, p); ok {\ndiff --git a/backend/internal/policy/pathnorm_test.go b/backend/internal/policy/pathnorm_test.go\nnew file mode 100644\nindex 0000000..9b70e42\n--- /dev/null\n+++ b/backend/internal/policy/pathnorm_test.go\n@@ -0,0 +1,35 @@\n+package policy\n+\n+import \"testing\"\n+\n+func TestCleanRepoPath(t *testing.T) {\n+\tfor _, tc := range []struct{ in, want string }{\n+\t\t{`backend\\internal\\server\\routes.go`, \"backend/internal/server/routes.go\"},\n+\t\t{\"./docs/README.md\", \"docs/README.md\"},\n+\t\t{\"docs/../README.md\", \"README.md\"},\n+\t\t{\"  scripts/test \", \"scripts/test\"},\n+\t\t{\"\", \"\"},\n+\t} {\n+\t\tif got := cleanRepoPath(tc.in); got != tc.want {\n+\t\t\tt.Errorf(\"cleanRepoPath(%q) = %q, want %q\", tc.in, got, tc.want)\n+\t\t}\n+\t}\n+}\n+\n+func TestCheckScope_WindowsSeparators(t *testing.T) {\n+\tc := InstructionPathConstraint{}\n+\tgot := c.CheckScope([]plan.ScopeFile{{Path: `docs\\CLAUDE.md`}, {Path: `backend\\internal\\server\\routes.go`}})\n+\tif len(got) != 1 || got[0].Path != `docs\\CLAUDE.md` {\n+\t\tt.Fatalf(\"violations = %+v, want exactly docs\\\\CLAUDE.md\", got)\n+\t}\n+}\n+\n+func TestCheckChanged_DotSlashPrefix(t *testing.T) {\n+\tc := InstructionPathConstraint{}\n+\tgot := c.CheckChanged([]ChangedFile{{Path: \"./CLAUDE.md\"}, {Path: \"./docs/README.md\"}})\n+\tif len(got) != 1 || got[0].Path != \"./CLAUDE.md\" {\n+\t\tt.Fatalf(\"violations = %+v, want exactly ./CLAUDE.md\", got)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "cleanRepoPath",
+    "foldRepoPath"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "backend/internal/policy/instruction_paths.go"
+  },
+  "catch_probes": [
+    "letter case",
+    "letter-case",
+    "case-insensitive",
+    "case insensitive",
+    "case-sensitive",
+    "case sensitive",
+    "case-insensitively",
+    "mixed case",
+    "mixed-case",
+    "differently cased",
+    "differently-cased",
+    "upper case",
+    "upper-case",
+    "capital letter",
+    "not folded",
+    "no longer folded",
+    "no longer folds",
+    "not case-folded",
+    "case fold",
+    "case-fold",
+    "not lower-cased",
+    "not lowercased",
+    "never lower-cased",
+    "never lowercased",
+    "without lower-casing",
+    "without lowercasing",
+    "without folding",
+    "drops the tolower",
+    "drops the lower-casing",
+    "lost the tolower",
+    "loses the tolower"
+  ],
+  "attribution_phrases": [
+    "instruction_paths.go"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "permission_scope",
+      "note": "instruction_paths.go: CheckChanged now passes cleanRepoPath, which keeps letter case, while refuses matches lower-cased patterns, so a committed Agents.md or .Claude/settings.json is no longer refused by the post-implement gate."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "In instruction_paths.go only CheckScope uses foldRepoPath; the committed-diff check became case-sensitive, so a mixed-case instruction file slips through."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "instruction_paths.go: changing path handling in the policy package is a security risk and needs a security review."
+    },
+    {
+      "severity": "low",
+      "category": "maintainability",
+      "note": "instruction_paths.go: CheckScope and CheckChanged now duplicate the same loop; extract one helper over a slice of paths."
+    },
+    {
+      "severity": "low",
+      "category": "verification",
+      "note": "pathnorm.go: cleanRepoPath returns \".\" for the input \"./\"; the test table does not cover it."
+    }
+  ]
+}
