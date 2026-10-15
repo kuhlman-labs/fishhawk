@@ -37,6 +37,16 @@ type reconcileRunReviewsResponse struct {
 //     call reports skip_reason=review_dispatched_by_this_process rather than
 //     synthesizing a failure over a live reviewer.
 //
+// One exception to that gate (E72.64 / #4106): when THIS process holds lost
+// review terminals for the round — reviewers that finished but whose terminal
+// audit write never landed, recorded in the lost-terminal registry
+// (review_terminal_write.go) — the call ACCEPTS the round and appends exactly
+// those named *_review_failed entries (reason prefix verdict_write_failed),
+// capped at configured_agents - landed so a still-running reviewer's share is
+// never closed. synthesized reports how many it appended and terminated is
+// true. Without registered lost terminals the gate answers as before. The verb
+// stays terminate-only: it only ever writes *_review_failed.
+//
 // Idempotent: it synthesizes only the MISSING count for the current round, so
 // already-landed verdicts are never re-paid for and a second call against a
 // healed run is a no-op reporting skip_reason=round_already_settled.

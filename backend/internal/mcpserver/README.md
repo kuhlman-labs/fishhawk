@@ -1956,7 +1956,16 @@ timestamp is BEFORE that boot instant. Every other outcome is not-stranded, and 
 verdict still reads back with its concerns at the gate — and a second call is a no-op (`round_already_settled`). It
 **refuses (no-op with a reason) a round this daemon still has in flight**: the server compares the round's dispatch
 timestamp against its own boot marker and answers `skip_reason: review_dispatched_by_this_process`, so invoking it
-against a healthy running review changes nothing. Requires `write:runs`; a 404/403 surfaces verbatim.
+against a healthy running review changes nothing. **One exception — a lost verdict write (E72.64 /
+[#4106](https://github.com/kuhlman-labs/fishhawk/issues/4106)):** a reviewer that finished but whose terminal audit
+write never landed is recorded in the serving daemon's process-local lost-terminal registry, and a bounded background
+settle lands a named `*_review_failed` (reason prefix `verdict_write_failed`) once the store accepts writes. When that
+settle has not landed it — its exhaustion ERROR names this verb — the verb accepts the round even though the serving
+daemon dispatched it and appends exactly those stand-ins, capped at `configured_agents - landed_before`, so a
+still-running reviewer's share stays open (`synthesized` counts only the lost slots, and the round can stay `pending`
+until that reviewer lands). The message therefore says the gate settles once every configured reviewer has a terminal
+entry, not that it has. Contract: `backend/internal/server/README.md` § "Durable review terminal writes". Requires
+`write:runs`; a 404/403 surfaces verbatim.
 
 ## Review-coverage hold and the re-run verb (`fishhawk_rerun_review`, [#4219](https://github.com/kuhlman-labs/fishhawk/issues/4219))
 
