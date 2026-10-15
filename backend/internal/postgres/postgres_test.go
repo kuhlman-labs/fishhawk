@@ -7737,3 +7737,86 @@ VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).S
 		t.Errorf("runs row after rolling back 0103 = %d, want 1 (untouched)", survivors)
 	}
 }
+
+// TestMigrateDown_SpecialistJobAttestationReversal pins 0104 (E85.15 /
+// #4363): after MigrateUp specialist_jobs carries the four nullable
+// attestation columns; a pre-0104-shaped row (all NULL) and a completed row
+// with a known provenance are accepted, while an unknown provenance, a
+// provenance on a non-completed row and a public key that is not 32 bytes are
+// refused; after rolling back 0104 the columns are gone, the schema lands on
+// 0103 and the job rows survive.
+func TestMigrateDown_SpecialistJobAttestationReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	attestationColumns := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'specialist_jobs' AND is_nullable = 'YES'
+  AND column_name IN ('attestation_public_key', 'attestation_subject', 'attestation_expires_at', 'provenance')`).Scan(&n); err != nil {
+			t.Fatalf("read 0104 columns: %v", err)
+		}
+		return n
+	}
+	if n := attestationColumns(); n != 4 {
+		t.Fatalf("nullable attestation columns after MigrateUp = %d, want 4", n)
+	}
+
+	const cols = `(kind, state, requester_seat, requester_actor_kind, requester_subject, inputs, requested_sequence`
+	const completed = `, verdict, result, completed_at`
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+`) VALUES ('inventory', 'queued', 'operator', 'user', 's', '{}', 1)`); err != nil {
+		t.Fatalf("insert pre-0104-shaped row: %v — 0104 must leave it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+completed+`, provenance)
+VALUES ('inventory', 'completed', 'operator', 'user', 's', '{}', 2, 'pass', '{}', now(), 'runner_attested')`); err != nil {
+		t.Fatalf("insert runner_attested completed row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+completed+`)
+VALUES ('inventory', 'completed', 'operator', 'user', 's', '{}', 3, 'pass', '{}', now())`); err != nil {
+		t.Fatalf("insert legacy completed row (provenance NULL): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO specialist_jobs `+cols+`, started_at, execution_nonce, attestation_public_key, attestation_subject, attestation_expires_at)
+VALUES ('inventory', 'running', 'operator', 'user', 's', '{}', 4, now(), 'n', decode(repeat('ab', 32), 'hex'), 'specialist-runner/h', now())`); err != nil {
+		t.Fatalf("insert running row with a 32-byte key: %v", err)
+	}
+	for name, sql := range map[string]string{
+		"unknown provenance":   `INSERT INTO specialist_jobs ` + cols + completed + `, provenance) VALUES ('inventory', 'completed', 'operator', 'user', 's', '{}', 1, 'pass', '{}', now(), 'signed')`,
+		"provenance on queued": `INSERT INTO specialist_jobs ` + cols + `, provenance) VALUES ('inventory', 'queued', 'operator', 'user', 's', '{}', 1, 'bearer')`,
+		"31-byte key":          `INSERT INTO specialist_jobs ` + cols + `, attestation_public_key) VALUES ('inventory', 'queued', 'operator', 'user', 's', '{}', 1, decode(repeat('ab', 31), 'hex'))`,
+		"33-byte key":          `INSERT INTO specialist_jobs ` + cols + `, attestation_public_key) VALUES ('inventory', 'queued', 'operator', 'user', 's', '{}', 1, decode(repeat('ab', 33), 'hex'))`,
+	} {
+		if _, err := pool.Exec(ctx, sql); err == nil {
+			t.Errorf("%s accepted, want a constraint violation", name)
+		}
+	}
+
+	downThrough(t, url, "0104")
+
+	if n := attestationColumns(); n != 0 {
+		t.Errorf("attestation columns after rolling back 0104 = %d, want 0", n)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM specialist_jobs`).Scan(&rows); err != nil {
+		t.Fatalf("read jobs after rollback: %v — the 0103 table must survive", err)
+	}
+	if rows != 4 {
+		t.Errorf("job rows after rolling back 0104 = %d, want 4 (untouched)", rows)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := attestationColumns(); n != 4 {
+		t.Errorf("attestation columns after re-applying 0104 = %d, want 4", n)
+	}
+}
