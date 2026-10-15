@@ -990,6 +990,7 @@ func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanRevi
 				counts.Undecodable++
 			}
 			trials = append(trials, trial)
+			observeCatchTrial(ctx, arm, c.Name, CatchExpectCatch, i+1, responseText, trial)
 		}
 		report.PerCase[c.Name] = counts
 		report.Trials[c.Name] = trials

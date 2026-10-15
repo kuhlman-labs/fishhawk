@@ -560,8 +560,9 @@ false-alarm rate (conforming plans) before the architect is enabled.
 | `planreviewevidence.go` | the arm table (`catchRateArmTable`), the arm-keyed v2 evidence record, per-arm and record fingerprints, the pinned per-arm baseline, the v2 trial sidecar, `RecordCatchRateEvidence`, `CheckCatchRateEvidence`, the legacy v1 reader |
 | `planreviewrescore.go` | the offline re-score of a recorded trial sidecar (v2, or a legacy v1 sidecar's two conventions arms) under the CURRENT corpora and catch rule (`RescoreCatchRateTrials`, `CatchRateRescore.Render`): a diagnostic per-arm lower bound that never writes (E55.22 / #4355) |
 | `planreviewcalibrate.go` | the calibration dry run (`CalibrateCatchRateArm`): one arm's per-case 30–80% band table, never written as evidence (E78.11 / #4313) |
+| `planreviewdiag.go` | the live-run diagnostics file (`planreview-diag.jsonl`: per-trial lines, miss classes, arm summaries, credential redaction), the subset dry-run knobs and `RecordCatchRateEvidenceWithDiagnostics`; diagnostic only and NOT a trigger path (E55.21 / #4350) |
 | `catchrategate/` | the offline gate command (`go run ./internal/agenteval/catchrategate` from `backend/`), and its `--rescore` diagnostic |
-| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
+| `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `planreviewpersonalive_test.go` | the double-gated live calibration dry run (`TestCatchRateCalibrationLive`) plus its offline knob and wiring tests |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
 | `testdata/planreview-persona-corpus/architect/` | the six architect cases (`persona_case.json` + a SYNTHETIC-provenance `case.md` each) |
@@ -1575,6 +1576,113 @@ for a recording, to see what a probe or rule change makes of the last one:
   conventions arms, so #4355's diagnostic survives the format change; an arm
   of the table absent from the sidecar is reported NOT RECORDED.
 
+### Live-run diagnostics (`planreview-diag.jsonl`, E55.21 / #4350)
+
+Every live catch-rate run (`TestPlanReviewCatchRateLive`, through
+`RecordCatchRateEvidenceWithDiagnostics`) leaves a per-trial JSON Lines file,
+whether it passes, is refused or aborts. Code: `planreviewdiag.go`.
+
+- **Location.** `$FISHHAWK_AGENTEVAL_DIAG_DIR/<UTC 20060102T150405Z>/planreview-diag.jsonl`
+  when the knob is set, else `$TMPDIR/fishhawk-agenteval/<UTC 20060102T150405Z>/planreview-diag.jsonl`
+  (`os.TempDir`). The same timestamp layout names the per-run directory in
+  both cases, so repeated runs against one `DIAG_DIR` never collide. The live
+  test logs the path before the first model call (`t.Logf`), and the report
+  ends with `Diagnostics: <path>`.
+- **Never evidence.** `ResolveCatchRateDiagPath` refuses any path with a
+  `testdata` element. `OpenCatchRateDiag` opens with `O_CREATE|O_EXCL`, so it
+  never overwrites an earlier run's file, and it opens BEFORE any model call:
+  an open failure refuses the run. The gate (`catchrategate`,
+  `CheckCatchRateEvidence`) never reads the file.
+- **Lines** (schema `planreview-catchrate-diag-v1`), one JSON object per line:
+  - `header`: `schema`, `started_at`, `generator_model`, `dry_run`,
+    `pin_baseline`, `subset_cases`, `subset_trials_per_case`, `arms`.
+  - `trial`, appended as each trial completes: `arm`, `case`, `expect`,
+    `trial` (1-based), `outcome`, `caught`, `miss_class`, `verdict` (the
+    lenient decode's verdict, `undecodable` when the response has no JSON
+    object), `matched_probe`, `attribution`, `concerns_total`,
+    `raw_concerns`, `scored_concerns` and, on an undecodable trial,
+    `response_excerpt`.
+    - `raw_concerns` is the diagnostics' own lenient re-decode of the
+      response: EVERY concern the reviewer emitted, before any ingest control,
+      each with `severity`, `category`, `note`, the emitted `convention` and
+      `criterion_id` when present (a non-string value is kept as its JSON
+      text), `names_criterion` (the planted criterion id it names), `probe`
+      (the catch probe it matches) and `attributed` (the attribution half).
+    - `scored_concerns` is what the classifier scored (`CatchTrial.Concerns`):
+      the matching concern of a caught trial, every near-miss-tagged concern
+      of a missed one, and, for the persona arms, the concerns AFTER the
+      review loop's ingest controls (`personaprompt.ApplyConcernControls`:
+      severity clamp, quote verification). `miss_class` is computed from this
+      list.
+  - `summary`, written on every outcome: `outcome` (`passed`, `not_judged` for
+    a subset dry run, `refused` for `ErrCatchRateRegressed`,
+    `ErrPortabilityRepoSpecificFinding` or `ErrCatchRateSubsetNotRecordable`,
+    `error` for anything else, including a transport error or an
+    under-powered refusal), `error`, `finished_at`, `trials_written`, and per
+    arm: `trials`, `decoded`, `catch_trials`, `caught`, `clean_trials`,
+    `false_alarms`, `undecodable`, `verdicts`, `concern_categories` (the
+    trimmed, case-folded category histogram over `raw_concerns`),
+    `mean_concerns_per_decoded_trial`, `miss_classes` and `per_case`
+    (`trials`, `caught`, `false_alarms`, `undecodable`, `miss_classes`). The
+    same summary is rendered into the run's report (arms by name, histograms
+    by count descending then name).
+- **Miss classes** (a missed or undecodable CATCH-case trial only; diagnostic,
+  never scored, computed with the classifier's own matcher helpers over
+  `scored_concerns`), in precedence order:
+  1. `category_mismatch`: a concern matched both halves but failed the rule's
+     category predicate (the architect arm's `decision_record`): a scoring miss.
+  2. `unattributed`: a concern matched a probe but named no planted id,
+     anchored step or attribution phrase: a scoring miss.
+  3. `no_probe`: a concern named the planted criterion but matched no probe:
+     a scoring miss.
+  4. `not_mentioned`: no concern touched either half: a reviewer miss.
+  5. `undecodable`: no decodable verdict.
+- **Credential hygiene.** Every line passes, in order, `json.Marshal`,
+  known-value redaction of `FISHHAWKD_ANTHROPIC_API_KEY`,
+  `FISHHAWKD_ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`
+  and the resolved credential (`CatchRateDiagCredentials`,
+  `redaction.NewKnownValues`; a value under `redaction.MinKnownValueBytes` is
+  not redacted by value and is named in a warning), then a scrub of any
+  `sk-ant-…` token whatever its shape (`redaction.DefaultPatterns` matches only
+  40+-character `sk-ant-api03` keys, so an OAuth `sk-ant-oat01` token passes
+  it). Every model-derived string also goes through the sidecar's
+  `sanitizeCatchTrialText` (`RedactDefault` plus the 1000-rune cap). Unlike
+  the sidecar, no concern-count cap applies.
+- **Subset dry runs.** `FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<id,...>` (case
+  directory names, any arm; an unknown id is refused before any model call)
+  and `FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=<n>` (a positive integer replacing
+  every arm's samples per case) measure part of the arm table. An arm none of
+  whose cases is selected does not run. A subset is identified by a knob being
+  SET, whatever its value, and is NEVER recordable:
+  `RecordCatchRateEvidence` refuses it with
+  `ErrCatchRateSubsetNotRecordable` as its first check when `RECORD=1` or
+  `PIN_REASON` is set. A subset dry run is reported per case and is not judged
+  (`Subset dry run: NOT judged against the gate and never recordable`).
+- **Streaming and checkpointing.** Each line is ONE unbuffered `Write` on the
+  `*os.File`, done before the next trial starts, so a killed or timed-out run
+  keeps every finished trial (`tail -f` follows it). There is no `fsync`, so a
+  power loss can lose the tail. Each trial also writes
+  `<case>/<arm>/<trial> caught|miss:<class>|false_alarm|no_false_alarm` to
+  stderr (a clean case's undecodable trial reads `false_alarm`, as the gate
+  counts it); `go test` shows it live only with `-v`. A write error is sticky:
+  later lines are skipped with a warning, `Finish` returns the error, and the
+  run is not aborted.
+- **Instrument invariance.** The observer rides on the context
+  (`withCatchTrialObserver`, the `net/http/httptrace` pattern): one
+  `observeCatchTrial` call in `RunCatchRateArm` and one in
+  `runPersonaTrialLoop`, a no-op without an observer. No prompt, corpus,
+  probe, fingerprint input or `catchRuleVersion` changes, and
+  `TestRecordCatchRateEvidenceWithDiagnostics_EvidenceUnchanged` pins that a
+  diagnosed recording's evidence pair is byte-identical to an undiagnosed one.
+- **Not a trigger path, and the residual.** `planreviewdiag.go` is deliberately
+  NOT a `scripts/check-review-prompt-eval` trigger path, yet
+  `CatchRateSubset.forRow` and `selectCatchCases` run on the recording path in
+  their inactive form (the row's own samples, every case). A future edit there
+  that changed the non-subset samples or cases would not trigger the standing
+  check; it is bounded by the gate's per-arm samples and case-set checks
+  (`checkArmCases`, `checkArmSet`) on any recorded record, and the guard that
+  refuses a recording subset lives in the trigger file `planreviewevidence.go`.
+
 ### Calibration dry run (`CalibrateCatchRateArm`, E78.11 / #4313)
 
 Before a new arm's cases enter a recording, each catch case should be of MID
@@ -1671,7 +1779,12 @@ scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRate|TestCatchCorpus|
 # Live plan-review catch-rate arms (opt-in; makes real model calls; dry run unless RECORD=1):
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+
+# Live subset dry run (opt-in; a few model calls; never recordable; diagnostics only):
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=<case-id> FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=3 \
+  scripts/test single -v -timeout 30m -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 
 # Live calibration dry run of one arm (opt-in; makes real model calls; never writes evidence):
 FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
