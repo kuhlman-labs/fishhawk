@@ -2876,7 +2876,7 @@ func TestDispatchAcceptanceGatedMerge_RepublishesBeforeMerge(t *testing.T) {
 	s, r, stages := newGatedMergeRepublishServer(t, log, nil)
 	merger := &orderedLogMerger{log: log}
 
-	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger)
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger, "")
 	if err != nil {
 		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
 	}
@@ -2901,7 +2901,7 @@ func TestDispatchAcceptanceGatedMerge_AcceptanceNotReady_NoRepublish(t *testing.
 	s, r, stages := newGatedMergeRepublishServer(t, log, specWithAcceptanceStage)
 	merger := &orderedLogMerger{log: log}
 
-	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger)
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, merger, "")
 	if err != nil {
 		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
 	}
@@ -2920,7 +2920,7 @@ func TestDispatchAcceptanceGatedMerge_NilMerger_NoRepublish(t *testing.T) {
 	log := &mergeOrderLog{}
 	s, r, stages := newGatedMergeRepublishServer(t, log, nil)
 
-	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, nil)
+	outcome, gateState, err := s.dispatchAcceptanceGatedMerge(context.Background(), r, stages, nil, "")
 	if err != nil {
 		t.Fatalf("dispatchAcceptanceGatedMerge: %v", err)
 	}
