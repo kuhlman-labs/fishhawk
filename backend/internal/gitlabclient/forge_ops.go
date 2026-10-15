@@ -77,6 +77,18 @@ type MergeRequest struct {
 	MergeCommitSHA string     `json:"merge_commit_sha"`
 	MergedAt       *time.Time `json:"merged_at"`
 	WebURL         string     `json:"web_url"`
+	// MergeUser is the user who merged the MR, the user who set it to
+	// auto-merge (on a still-open MR), or null; MergedBy is GitLab's
+	// deprecated alias (deprecated in 14.7). Both are null on an unmerged MR
+	// (https://docs.gitlab.com/api/merge_requests/#get-single-mr, #4132).
+	MergeUser *MergeRequestUser `json:"merge_user"`
+	MergedBy  *MergeRequestUser `json:"merged_by"`
+}
+
+// MergeRequestUser is the subset of a GitLab user object the adapter reads
+// off a merge request's merge_user / merged_by fields.
+type MergeRequestUser struct {
+	Username string `json:"username"`
 }
 
 // CommitStatus is the subset of a GitLab commit status the adapter reads

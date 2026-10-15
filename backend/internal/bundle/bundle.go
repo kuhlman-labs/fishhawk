@@ -409,6 +409,43 @@ type GateEvidence struct {
 	// the stage-scoped verify_flake_absorbed audit row. The json tag MUST
 	// stay identical to the runner's composer.
 	FlakeAbsorbed *FlakeAbsorbedEvidence `json:"flake_absorbed,omitempty"`
+	// FixupCommitClaims records the fix-up commit-message paragraphs the
+	// runner's cross-check found UNBACKED by the pass's own git_diff (#4337):
+	// an Item/Finding/Concern paragraph naming files or tests the diff touches
+	// none of. Nil (the byte-identical default) on an older bundle, a non-fix-up
+	// pass, or when every claim was backed or undecidable; an older fishhawkd
+	// ignores the member. Agent-influenced: the runner charset-limits every
+	// token, and a consumer rendering it re-validates. The json tag MUST stay
+	// identical to the runner's composer.
+	FixupCommitClaims *FixupCommitClaimsEvidence `json:"fixup_commit_claims_unbacked,omitempty"`
+}
+
+// FixupCommitClaimsEvidence is the #4337 commit-message claims cross-check
+// member: Claims are the unbacked claim paragraphs (at most 16), Truncated
+// reports that the runner found more.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's fixupCommitClaimsEvidence
+// (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
+// backend/internal/wirecontract and pinned from both modules by
+// testdata/wire/fixup_commit_claims.json.
+type FixupCommitClaimsEvidence struct {
+	Claims    []FixupCommitClaimEvidence `json:"claims"`
+	Truncated bool                       `json:"truncated,omitempty"`
+}
+
+// FixupCommitClaimEvidence is one unbacked claim paragraph (#4337): Marker is
+// its normalized lead (`Item 3`), FileRefs and TestNames the evidence tokens it
+// names that the pass's diff does not change (TestNames only when the runner
+// knew the patch).
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's fixupCommitClaimEvidence
+// (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
+// backend/internal/wirecontract and pinned from both modules by
+// testdata/wire/fixup_commit_claims.json.
+type FixupCommitClaimEvidence struct {
+	Marker    string   `json:"marker"`
+	FileRefs  []string `json:"file_refs,omitempty"`
+	TestNames []string `json:"test_names,omitempty"`
 }
 
 // FlakeAbsorbedEvidence is the flat record of one absorbed outside-only verify

@@ -71,9 +71,11 @@ const (
 	reapFailureGo          = "backend/internal/server/reap_failure.go"
 	uploadFile             = "runner/internal/upload/upload.go"
 	scenarioFile           = "runner/internal/scenario/scenario.go"
-	// runnerGateEvidenceGo / bundleGo hold the gate_isolation evidence pair
-	// (#2135) and the counterfactual observation pair (#4143); only those flat
-	// structs carry the marker in either file.
+	// runnerGateEvidenceGo / bundleGo hold the gate_evidence member pairs: the
+	// gate_isolation evidence (#2135), the counterfactual observation (#4143),
+	// the absorbed verify flake (#4229) and the fix-up commit-message claims
+	// wrapper and leaf (#4337). Only those structs carry the marker in either
+	// file.
 	runnerGateEvidenceGo = "runner/cmd/fishhawk-runner/gateevidence.go"
 	bundleGo             = "backend/internal/bundle/bundle.go"
 	// specialistJobGo holds the backend's specialist-job HTTP shapes and
@@ -371,6 +373,23 @@ func SeedManifest() Manifest {
 				Name: "verify_flake_absorbed_evidence", Anchor: "#4229",
 				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "flakeAbsorbedEvidence"},
 				Consumer: Endpoint{File: bundleGo, Type: "FlakeAbsorbedEvidence"},
+				Mode:     ModeExact,
+			},
+			{
+				// The fix-up commit-message claims cross-check (#4337), folded
+				// into gate_evidence and decoded by the backend for the
+				// implement-review render. ModeExact on the wrapper and the leaf;
+				// the bytes are ALSO pinned by the shared golden
+				// testdata/wire/fixup_commit_claims.json.
+				Name: "fixup_commit_claims_evidence", Anchor: "#4337",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "fixupCommitClaimsEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "FixupCommitClaimsEvidence"},
+				Mode:     ModeExact,
+			},
+			{
+				Name: "fixup_commit_claim_evidence", Anchor: "#4337",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "fixupCommitClaimEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "FixupCommitClaimEvidence"},
 				Mode:     ModeExact,
 			},
 		},

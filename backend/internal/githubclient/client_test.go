@@ -2719,6 +2719,38 @@ func TestGetPullRequest_DecodesMergeEvidence(t *testing.T) {
 	})
 }
 
+// TestGetPullRequest_MergedBy pins the merger decode the merge-settled
+// members check reads (#4132): merged_by.login reaches PullRequest.MergedBy,
+// and GitHub's `merged_by: null` on an unmerged PR stays empty.
+func TestGetPullRequest_MergedBy(t *testing.T) {
+	t.Run("merged: merged_by.login decoded", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"closed","merged":true,` +
+			`"merged_by":{"login":"octocat"},"head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.MergedBy != "octocat" {
+			t.Errorf("MergedBy = %q, want octocat", pr.MergedBy)
+		}
+	})
+	t.Run("unmerged: merged_by null stays empty", func(t *testing.T) {
+		fg, srv := newFakeGitHub(t)
+		fg.getPullRequestBody = `{"node_id":"PR_x","state":"open","merged":false,` +
+			`"merged_by":null,"head":{"sha":"abc"},"base":{"ref":"main"}}`
+		c, _ := newTestClient(t, srv, nil)
+		pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
+		if err != nil {
+			t.Fatalf("GetPullRequest: %v", err)
+		}
+		if pr.MergedBy != "" {
+			t.Errorf("MergedBy = %q, want empty on an unmerged PR", pr.MergedBy)
+		}
+	})
+}
+
 func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`

@@ -177,12 +177,20 @@ Authenticate with exactly one of `FISHHAWKD_ANTHROPIC_API_KEY` or
 any command below). Neither set skips the arm naming both variables; both set
 fails it. Which bearer tokens Anthropic's terms permit for direct API use is the operator's responsibility.
 
-Dry run (measures and judges against the committed baseline, writes
-nothing):
+Every command below passes `-v` (so the per-trial progress lines stream
+instead of arriving when the package finishes) and an explicit `-timeout`
+(`go test` defaults to 10 minutes; a full recording is about 1,000 model
+calls). Every run, refused or not, writes a per-trial diagnostics file and
+logs its path first (`per-trial diagnostics: <path>`) and last
+(`Diagnostics: <path>`) — see "Diagnosing a refused or surprising
+measurement" below.
+
+Dry run (measures and judges against the committed baseline; writes no
+evidence):
 
 ```sh
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Record a measurement (`RECORD=1`). The FIRST recording must also pin the
@@ -192,7 +200,7 @@ baseline, with a reason:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='first measurement after #2245' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Later recordings omit `PIN_REASON`; the pinned baseline is carried forward
@@ -210,7 +218,7 @@ comparable; record with a reason that says so:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4253: catch rule v3 and the twelve-case corpus; the 2026-10-10 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 Land that recording commit on the #4253 run branch before merge.
@@ -234,7 +242,7 @@ not comparable:
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4355: catch rule v4 (prompt-vocabulary probes) and corpus-disjoint prompt examples; the v3 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 That recording is the ONLY out-of-sample measurement of v4: the re-score
@@ -252,7 +260,7 @@ byte-identical), a pin replaces it, and a dry run proceeds.
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4313: arm-keyed v2 record (catch rule v5, architect persona arm); the v1 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 #4314 records separately, after #4313 has merged. Its security arms change
@@ -267,7 +275,7 @@ missing `security` and `security_portability` arms, by design):
 FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
   FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 \
   FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON='#4314: security and security_portability join the arm table; the #4313 baseline is not comparable' \
-  scripts/test single -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+  scripts/test single -v -timeout 4h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
 ```
 
 A recording in which any `security_portability` concern names a
@@ -374,6 +382,62 @@ arms — caught in every trial, or in at most one (with 12 samples per case,
 `12/12` or `<= 1/12`, the per-case form of the issue's `>= 22/23` and
 `<= 2/23` thresholds) — no longer discriminates. Explain each such case in
 the recording PR, or file a follow-up for a harder variant.
+
+## Diagnosing a refused or surprising measurement
+
+Every live run writes `planreview-diag.jsonl` (schema, redaction and the
+miss-class rule: `backend/internal/agenteval/README.md` § "Live-run
+diagnostics"), at
+`$FISHHAWK_AGENTEVAL_DIAG_DIR/<UTC 20060102T150405Z>/planreview-diag.jsonl`,
+or under `$TMPDIR/fishhawk-agenteval/<UTC 20060102T150405Z>/` when the knob
+is unset. It is written trial by trial, so a refused, failed or killed run
+still has every trial it finished; it is never evidence and never committed
+(a path under `testdata/` is refused).
+
+Follow a long run as it goes:
+
+```sh
+tail -f "$DIAG"     # DIAG = the path the run logged
+```
+
+Read it with `jq` (`-s` slurps the lines):
+
+```sh
+# Per arm and case: the miss-class breakdown of the missed catch trials.
+jq -rs '.[] | select(.kind == "trial" and .miss_class != "") | "\(.arm) \(.case) \(.miss_class)"' "$DIAG" | sort | uniq -c
+
+# Per arm: the concern-category histogram, verdicts and mean concerns.
+jq -s '.[-1] | select(.kind == "summary") | .arms | map_values({concern_categories, verdicts, mean_concerns_per_decoded_trial})' "$DIAG"
+
+# How the run ended (passed, not_judged, refused, error) and why.
+jq -s '.[-1] | {outcome, error, trials_written}' "$DIAG"
+```
+
+Read the miss classes as two kinds of miss:
+
+- `not_mentioned` is a **reviewer miss**: no concern touched the planted
+  criterion or the defect. The reviewer did not see it, so look at the prompt
+  (or accept that the case is hard).
+- `unattributed`, `no_probe` and `category_mismatch` are **scoring misses**:
+  the reviewer raised the defect, but the catch rule did not credit it (no
+  planted id or phrase, no probe, or the wrong category label on the
+  architect arm). Look at the case's `catch_probes` / `attribution_phrases`
+  and the concern's `raw_concerns` entry, then check a widened set with
+  `catchrategate --rescore` before re-recording.
+- `undecodable` means no verdict decoded; read `response_excerpt`.
+
+**Probe a few cases before paying for a recording.** A subset dry run
+measures only the named cases (any arm's case directory names) at a reduced
+sample count, for a fraction of a recording's cost (a dollar or two at
+most). It is never judged and never recordable: with `RECORD=1` or
+`PIN_REASON` set it is refused before any model call.
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-untestable-adjective,<another-case> \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=3 \
+  scripts/test single -v -timeout 30m -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
 
 ## Offline re-score: catch rule v3 → v4 (2026-10-12 sidecar, #4355)
 

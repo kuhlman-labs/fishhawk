@@ -176,6 +176,11 @@ func (s *Server) handlePullRequestClosed(ctx context.Context, raw []byte) {
 // only prURL and sets actorLogin = mergeReconcilerActor + a system
 // actorKind, leaving the SHAs empty.
 //
+// The members check (mergeSettledMembersAdmit, #4132) reads the merger from
+// the FORGE; actorLogin is consulted there only as a fallback, and only when
+// actorKind is user (a webhook), so the poll's system marker is never treated
+// as an identity.
+//
 // runStateAtClose and reviewStateAtClose are set by resolveReviewStageOnMerge
 // itself on the closed-without-merge arm (never by a caller), so every surface
 // that shares that resolver — webhook, poll, GitLab MR — records them on the
@@ -220,23 +225,45 @@ type reviewMergeMeta struct {
 // refuses to complete the run around it. (The sweep's table also admits
 // a review stage at awaiting_approval, which is not reachable for the
 // stage THIS path resolved — it is already succeeded by then — but is
-// reachable for a review stage findReviewStage did not return: a second
-// review stage on the run, or any stage at all when its list read
-// transiently failed and the sweep's own read then succeeded. Both are
-// the right outcome: the human gate on an already-merged change can no
-// longer alter it.) The sweep
+// reachable for a review stage the lookup did not return: a second
+// review stage on the run. That is the right outcome: the human gate on an
+// already-merged change can no longer alter it. A transient stage-list read
+// failure no longer reaches the sweep on a merge — the merged arm HOLDS on
+// it (#4132 C1) and the next redelivery or poll retries.) The sweep
 // terminalizes exactly the default-deny-table-admissible parked stages
 // as `superseded` so the Advance completes the run on the same pass.
 // Nothing is swept on the closed-without-merge path: a change that was
 // not accepted leaves no stage unreachable-because-merged, and the run
 // resolves to cancelled.
 //
+// MEMBERS (E39.17 / #4132): all three callers — the GitHub
+// pull_request webhook, the merge-status poll (ResolveReviewFromPollState,
+// for GitHub and, through forge.Get, every other family) and the GitLab
+// merge_request webhook — share ONE approvals.members check,
+// mergeSettledMembersAdmit (merge_members.go), placed after the ADR-036 hold
+// and before the pr_merged row. On both forges the merger is read from the
+// forge; meta.actorLogin is consulted only as the user-kind fallback, so the
+// poll's mergeReconcilerActor is never an identity. A members hold leaves the
+// review stage parked with no pr_merged row. A stage-list read failure on a
+// merge also HOLDS (C1) rather than taking the no-review-stage tail.
+//
 // Best-effort throughout: a missing run shape (routine_change-style
 // implement-only workflows) still records the audit row; a
 // state-machine transition reject logs without rolling back the audit;
 // a sweep failure logs and never unwinds the merge resolution.
 func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run, merged bool, meta reviewMergeMeta) {
-	reviewStage := s.findReviewStage(ctx, target.ID)
+	// The STRICT lookup (#4132 approval condition C1): a stage-list read
+	// failure must stay distinguishable from "the run has no review stage",
+	// because the merged arm below would otherwise take the no-review-stage
+	// tail and settle the merge without the members check. The
+	// closed-without-merge arm keeps the best-effort nil-on-error posture.
+	reviewStage, stageLookupErr := s.findReviewStageStrict(ctx, target.ID)
+	if stageLookupErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"list stages failed",
+			slog.String("run_id", target.ID.String()),
+			slog.String("error", stageLookupErr.Error()))
+	}
 	var stageID *uuid.UUID
 	if reviewStage != nil {
 		stageID = &reviewStage.ID
@@ -249,6 +276,19 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 	s.mergeCandidateQueueOnPRResolved(ctx, target.ID, merged)
 
 	if merged {
+		// #4132 approval condition C1: a review-stage LOOKUP FAILURE never
+		// settles a merge without members evaluation. HOLD — no pr_merged row,
+		// no no-review-stage tail, no merge-supersede sweep — and return so
+		// the next webhook redelivery or reconciler poll retries the lookup.
+		if stageLookupErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"pull_request merged: review-stage lookup failed; merge held for retry",
+				slog.String("pr_url", meta.prURL),
+				slog.String("run_id", target.ID.String()),
+				slog.String("error", stageLookupErr.Error()),
+			)
+			return
+		}
 		// ADR-036 (#876) implement-review / merge completion gate. When
 		// the run has a review stage AND a configured agent implement
 		// review (ADR-027) is still in-flight, refuse to resolve the
@@ -274,6 +314,15 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 				slog.String("run_id", target.ID.String()),
 				slog.String("stage_id", reviewStage.ID.String()),
 			)
+			return
+		}
+		// approvals.members at a merge-settled review gate (E39.17 / #4132).
+		// AFTER the ADR-036 hold (a held review re-polls through here anyway)
+		// and BEFORE writePRMergedAudit, for the same reason that gate sits
+		// there: a held merge writes no pr_merged row, so the reconciler's
+		// re-poll cannot duplicate one. mergeSettledMembersAdmit records its
+		// own deduplicated merge_settle_members_refused row on a hold.
+		if reviewStage != nil && !s.mergeSettledMembersAdmit(ctx, target, reviewStage, meta) {
 			return
 		}
 		// Audit row first — if the transition fails (state-machine
@@ -541,7 +590,9 @@ func (s *Server) advanceRunAfterReviewResolve(ctx context.Context, runID uuid.UU
 // The poll lacks the merger/SHA detail the webhook payload carries, so
 // the audit row records the mergeReconcilerActor system marker with
 // empty SHAs; the category is unchanged so audit consumers render
-// identically regardless of source.
+// identically regardless of source. The approvals.members check (#4132)
+// still runs on this path: it reads the merger from the forge, and the
+// system actor is never a fallback identity.
 func (s *Server) ResolveReviewFromPollState(ctx context.Context, runID uuid.UUID, merged bool, prURL string) error {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		return errors.New("server: ResolveReviewFromPollState requires RunRepo and AuditRepo")
@@ -654,7 +705,7 @@ func (s *Server) findRunByPullRequestURL(ctx context.Context, prURL, eventLabel 
 // Best-effort: a list failure logs and yields nil so the caller can
 // keep going with audit-only handling.
 func (s *Server) findReviewStage(ctx context.Context, runID uuid.UUID) *run.Stage {
-	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	st, err := s.findReviewStageStrict(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"list stages failed",
@@ -662,12 +713,24 @@ func (s *Server) findReviewStage(ctx context.Context, runID uuid.UUID) *run.Stag
 			slog.String("error", err.Error()))
 		return nil
 	}
+	return st
+}
+
+// findReviewStageStrict is findReviewStage without the best-effort
+// collapse (#4132 C1): (nil, nil) means the run has no review stage, and a
+// stage-list read failure is returned as (nil, err) so a caller that must
+// not mistake the two — resolveReviewStageOnMerge's merged arm — can hold.
+func (s *Server) findReviewStageStrict(ctx context.Context, runID uuid.UUID) (*run.Stage, error) {
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
 	for _, st := range stages {
 		if st.Type == run.StageTypeReview {
-			return st
+			return st, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // writePRClosedWithoutMergeAudit appends a pr_closed_without_merge

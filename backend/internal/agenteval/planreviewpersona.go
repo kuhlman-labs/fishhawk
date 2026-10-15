@@ -820,6 +820,7 @@ func runPersonaTrialLoop[C any](ctx context.Context, sender MessageSender, arm, 
 				counts.Undecodable++
 			}
 			trials = append(trials, trial)
+			observeCatchTrial(ctx, arm, c.Name, c.Expect, i+1, responseText, trial)
 		}
 		report.PerCase[c.Name] = counts
 		report.Trials[c.Name] = trials

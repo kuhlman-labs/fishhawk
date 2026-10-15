@@ -1714,3 +1714,62 @@ func TestComposeGateEvidence_NoFlakeAbsorbedField(t *testing.T) {
 		t.Fatalf("payload carries flake_absorbed without a decodable event: %s", ev.Payload)
 	}
 }
+
+// TestFixupCommitClaims_MarshalsSharedGolden pins the runner half of the #4337
+// fixup_commit_claims contract on FIXED BYTES: the incident's real commit
+// message, checked against its real changed files by the production
+// cross-check, folds through composeGateEvidence into a gate_evidence member
+// byte-equal to testdata/wire/fixup_commit_claims.json. The backend's
+// bundle_test decodes the same file.
+func TestFixupCommitClaims_MarshalsSharedGolden(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "fixup_commit_claims.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	want := bytes.TrimSuffix(raw, []byte("\n"))
+
+	claims, truncated := checkFixupCommitClaims(incident4337Body(t), incident4337Changed, "", false)
+	ev := fixupCommitClaimsEvidence{Truncated: truncated}
+	for _, c := range claims {
+		ev.Claims = append(ev.Claims, fixupCommitClaimEvidence(c))
+	}
+	composed := composeGateEvidence([]agent.Event{{Kind: fixupCommitClaimsUnbackedEvent, Payload: agent.MakePayload(ev)}}, 1)
+	if composed == nil {
+		t.Fatal("composeGateEvidence returned nil: the claims event must count as a gate having run")
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(composed.Payload, &all); err != nil {
+		t.Fatalf("decode gate_evidence: %v", err)
+	}
+	got, err := json.Marshal(map[string]json.RawMessage{"fixup_commit_claims_unbacked": all["fixup_commit_claims_unbacked"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("fixup_commit_claims_unbacked drifted from the shared golden:\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestComposeGateEvidence_NoFixupCommitClaims_ByteIdentical: without the event
+// the member is absent and gate_evidence is byte-identical to the pre-#4337
+// composition; the last of two events wins.
+func TestComposeGateEvidence_NoFixupCommitClaims_ByteIdentical(t *testing.T) {
+	base := []agent.Event{verifyRunEvent("scripts/test verify", "", "", 0, "ok", "passed")}
+	without := composeGateEvidence(base, 1)
+	if without == nil || strings.Contains(string(without.Payload), "fixup_commit_claims_unbacked") {
+		t.Fatalf("member present without the event: %s", without.Payload)
+	}
+	if want := `{"verify_runs":[{"command":"scripts/test verify","exit_code":0,"outcome":"passed","output_tail":"ok"}],"scope_facts":{"declared_files":1}}`; string(without.Payload) != want {
+		t.Errorf("gate_evidence = %s\nwant byte-identical %s", without.Payload, want)
+	}
+	first := fixupCommitClaimsEvidence{Claims: []fixupCommitClaimEvidence{{Marker: "Item 1", FileRefs: []string{"a.go"}}}}
+	last := fixupCommitClaimsEvidence{Claims: []fixupCommitClaimEvidence{{Marker: "Item 2", TestNames: []string{"TestB"}}}, Truncated: true}
+	with := composeGateEvidence(append(base,
+		agent.Event{Kind: fixupCommitClaimsUnbackedEvent, Payload: agent.MakePayload(first)},
+		agent.Event{Kind: fixupCommitClaimsUnbackedEvent, Payload: json.RawMessage(`{"claims":"undecodable"}`)},
+		agent.Event{Kind: fixupCommitClaimsUnbackedEvent, Payload: agent.MakePayload(last)},
+	), 1)
+	if !strings.Contains(string(with.Payload), `"fixup_commit_claims_unbacked":{"claims":[{"marker":"Item 2","test_names":["TestB"]}],"truncated":true}`) {
+		t.Errorf("last-write-wins member missing: %s", with.Payload)
+	}
+}

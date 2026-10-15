@@ -1,0 +1,14 @@
+id: scenario:issue-4132/approver-members-reports-coverage
+statement: Running `fishhawkd approver-members --spec .fishhawk/workflows.yaml --db <database url>` (or with FISHHAWKD_DATABASE_URL set) prints the feature_change/review and human_led_change/review gate lines with enforced_at=merge and the plan/deploy gate lines with enforced_at=approval_row, and no longer prints the note that merge-settled review gates are not members-checked.
+verify_hint: CLI stdout of `fishhawkd approver-members --spec .fishhawk/workflows.yaml --db <preview database url>` (the gate lines and notes print before the database read; the spec file is read-only CLI input and is not edited); decided by TestApproverMembers_MergeSettledGatesCovered.
+steps: 'Posture B: built fishhawkd from the sanctioned checkout (HEAD c064c623, equal to the preview git_sha). Ran fishhawkd approver-members --spec .fishhawk/workflows.yaml --db postgres://x:y@127.0.0.1:1/z (DB unreachable in the sandbox; the gate lines and notes print before the DB read). Also ran go test -run TestApproverMembers_MergeSettledGatesCovered ./cmd/fishhawkd/.'
+assertions:
+    expected: review gates enforced_at=merge, the others approval_row, and no 'not members-checked' note
+    observed_at_record: 'stdout lines: ''gate feature_change/review members=[github:kuhlman-labs] enforced_at=merge'', ''gate human_led_change/review ... enforced_at=merge'', plan/groom/confirm/deploy gates enforced_at=approval_row. The note now says merge gates ''are members-checked when the PR merges''. grep for ''not members-checked'' found nothing. Exit 1 only from the denied DB read. The unit test passed.'
+    repro_handle: fishhawkd approver-members --spec .fishhawk/workflows.yaml --db <url>
+origin:
+    issue: 4132
+    pr: 4437
+    run_id: 615807fa-2a4b-4933-9ad8-2c42ebc31e5b
+    head_sha: c064c6236554832f2e0f989e38ce48a2f8601ed4
+    recorded_at: 2026-10-15T05:56:31Z

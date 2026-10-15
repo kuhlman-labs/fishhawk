@@ -394,6 +394,27 @@ func (f *mcqFixture) wave() (a, b *mcqRun) {
 	return a, b
 }
 
+// TestMergeCandidateQueue_MergeOnSpecWithoutReviewStageAppendsNoMembersRefusal
+// pins R3 of #4132 on the real Postgres stores: the MCQ fixture's cached spec
+// (mcvUndelegatedSpecYAML) declares no review-type stage while the run carries
+// one, so the merge-settled members check ADMITS (no gate can declare members)
+// rather than holding members_unevaluable. It asserts FIRST that the review
+// stage reached succeeded — the merge passed both the ADR-036 hold and the
+// members seam — so the empty-refusal assertion is not vacuous. A pgtest
+// integration test; the in-process vehicle for CF6 is
+// TestMergeSettledMembers_Verdicts row 04.
+func TestMergeCandidateQueue_MergeOnSpecWithoutReviewStageAppendsNoMembersRefusal(t *testing.T) {
+	f := newMCQFixture(t)
+	r := f.seed("nomembers", "n0", []byte(mcvUndelegatedSpecYAML))
+	f.closePR(r, true)
+	if got := f.stageState(r.review.ID); got != run.StageStateSucceeded {
+		t.Fatalf("review stage = %s, want succeeded (the merge must pass the members seam)", got)
+	}
+	if rows := f.rows(r, CategoryMergeSettleMembersRefused); len(rows) != 0 {
+		t.Errorf("merge_settle_members_refused rows = %d, want 0 on a spec without a review stage", len(rows))
+	}
+}
+
 func TestMergeCandidateQueue_EndToEndWave(t *testing.T) {
 	f := newMCQFixture(t)
 	a, b := f.wave()
