@@ -6,8 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // rec builds one index record as a JSON object. Each parse fixture below
@@ -26,6 +30,19 @@ func rec(id, path, status string, appliesTo ...string) map[string]any {
 		"superseded_by": []string{},
 		"applies_to":    appliesTo,
 	}
+}
+
+// linked sets a record's supersession links.
+func linked(r map[string]any, supersedes, supersededBy []string) map[string]any {
+	if supersedes == nil {
+		supersedes = []string{}
+	}
+	if supersededBy == nil {
+		supersededBy = []string{}
+	}
+	r["supersedes"] = supersedes
+	r["superseded_by"] = supersededBy
+	return r
 }
 
 func indexJSON(t *testing.T, recs ...map[string]any) []byte {
@@ -110,6 +127,12 @@ func TestParseIndex_FailsClosed(t *testing.T) {
 		{"empty applies_to glob", withRecord("applies_to", []string{""}), "records[1]"},
 		{"duplicate id", withRecord("id", "ADR-001"), "duplicate id"},
 		{"duplicate path", withRecord("path", "docs/adr/001-a.md"), "duplicate path"},
+		// The four link-integrity fixtures carry well-formed ids, so only
+		// checkLinks refuses them.
+		{"dangling superseded_by", withRecord("superseded_by", []string{"ADR-099"}), `records[1] (id "ADR-002"): superseded_by[0] "ADR-099" names no record in the index`},
+		{"dangling supersedes", withRecord("supersedes", []string{"ADR-099"}), `records[1] (id "ADR-002"): supersedes[0] "ADR-099" names no record in the index`},
+		{"self superseded_by", withRecord("superseded_by", []string{"ADR-002"}), `records[1] (id "ADR-002"): superseded_by[0] "ADR-002" names the record itself`},
+		{"self supersedes", withRecord("supersedes", []string{"ADR-002"}), `records[1] (id "ADR-002"): supersedes[0] "ADR-002" names the record itself`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -278,5 +301,211 @@ func TestSelect_MatchErrorFailsWholeSelection(t *testing.T) {
 	}
 	if _, err := Select(nil, []string{"a"}); !errors.Is(err, ErrInvalidIndex) {
 		t.Errorf("Select(nil) err = %v, want ErrInvalidIndex", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Supersession following.
+// ---------------------------------------------------------------------------
+
+// wantMatch is one expected selected record, in rank order.
+type wantMatch struct {
+	id        string
+	via       []string
+	matched   int
+	rankPaths int
+}
+
+// TestSelect_FollowsSupersessionToSuccessors: every successor fixture has an
+// EMPTY applies_to (unless the case says otherwise), so only following can
+// select it.
+func TestSelect_FollowsSupersessionToSuccessors(t *testing.T) {
+	cases := []struct {
+		name    string
+		records []map[string]any
+		paths   []string
+		want    []wantMatch
+	}{
+		{
+			name: "one hop via superseded_by",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				rec("ADR-002", "docs/adr/002.md", "accepted"),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantMatch{{"ADR-002", []string{"ADR-001"}, 0, 1}, {"ADR-001", nil, 1, 1}},
+		},
+		{
+			name: "one hop via the successor's supersedes only (non-reciprocal)",
+			records: []map[string]any{
+				rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantMatch{{"ADR-002", []string{"ADR-001"}, 0, 1}, {"ADR-001", nil, 1, 1}},
+		},
+		{
+			name: "transitive two-hop chain",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				linked(rec("ADR-002", "docs/adr/002.md", "superseded"), []string{"ADR-001"}, []string{"ADR-003"}),
+				linked(rec("ADR-003", "docs/adr/003.md", "accepted"), []string{"ADR-002"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want: []wantMatch{
+				{"ADR-003", []string{"ADR-002"}, 0, 1},
+				{"ADR-001", nil, 1, 1},
+				{"ADR-002", []string{"ADR-001"}, 0, 1},
+			},
+		},
+		{
+			name: "a successor that also matches directly appears once",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted", "a/**", "b/**"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go", "b/y.go"},
+			want:  []wantMatch{{"ADR-002", []string{"ADR-001"}, 2, 2}, {"ADR-001", nil, 1, 1}},
+		},
+		{
+			name: "diamond: two selected predecessors share one successor",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-003"}),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted", "a/**"), nil, []string{"ADR-003"}),
+				linked(rec("ADR-003", "docs/adr/003.md", "accepted"), []string{"ADR-001", "ADR-002"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want: []wantMatch{
+				{"ADR-003", []string{"ADR-001", "ADR-002"}, 0, 1},
+				{"ADR-002", nil, 1, 1},
+				{"ADR-001", nil, 1, 1},
+			},
+		},
+		{
+			// ADR-001 matches directly (so the walk runs); ADR-002 does not,
+			// so only seeding the walk from direct matches keeps ADR-003 out.
+			name: "a successor of an unselected record is not selected",
+			records: []map[string]any{
+				rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted", "b/**"), nil, []string{"ADR-003"}),
+				linked(rec("ADR-003", "docs/adr/003.md", "accepted"), []string{"ADR-002"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantMatch{{"ADR-001", nil, 1, 1}},
+		},
+		{
+			// Without inheritance S ranks by 0 below P (2) and Q (1): P, Q, S.
+			name: "a successor inherits its predecessor's rank",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**", "b/**"), nil, []string{"ADR-002"}),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+				rec("ADR-003", "docs/adr/003.md", "accepted", "c/**"),
+			},
+			paths: []string{"a/x.go", "b/y.go", "c/z.go"},
+			want: []wantMatch{
+				{"ADR-002", []string{"ADR-001"}, 0, 2},
+				{"ADR-001", nil, 2, 2},
+				{"ADR-003", nil, 1, 1},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Select(mustIndex(t, tc.records...), tc.paths)
+			if err != nil {
+				t.Fatalf("Select: %v", err)
+			}
+			wantIDs := make([]string, 0, len(tc.want))
+			for _, w := range tc.want {
+				wantIDs = append(wantIDs, w.id)
+			}
+			if !reflect.DeepEqual(ids(got), wantIDs) {
+				t.Fatalf("selected %v, want %v", ids(got), wantIDs)
+			}
+			for i, w := range tc.want {
+				m := got[i]
+				if !slices.Equal(m.Via, w.via) || m.MatchedPaths != w.matched || m.RankPaths != w.rankPaths || m.Rank != i+1 {
+					t.Errorf("%s = {via %v matched %d rankPaths %d rank %d}, want {via %v matched %d rankPaths %d rank %d}",
+						w.id, m.Via, m.MatchedPaths, m.RankPaths, m.Rank, w.via, w.matched, w.rankPaths, i+1)
+				}
+			}
+		})
+	}
+}
+
+// TestSelect_SupersessionCycleTerminates: a hand-built A<->B cycle (ParseIndex
+// accepts it — each link names another existing record) must not loop.
+func TestSelect_SupersessionCycleTerminates(t *testing.T) {
+	idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
+		{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, SupersededBy: []string{"ADR-002"}},
+		{ID: "ADR-002", Path: "docs/adr/002.md", Status: StatusAccepted, SupersededBy: []string{"ADR-001"}},
+	}}
+	type result struct {
+		ms  []Match
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ms, err := Select(idx, []string{"a/x.go"})
+		done <- result{ms, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Select: %v", r.err)
+		}
+		got := ids(r.ms)
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"ADR-001", "ADR-002"}) {
+			t.Fatalf("selected %v, want each of ADR-001, ADR-002 once", ids(r.ms))
+		}
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("Select did not return on a supersession cycle")
+	}
+}
+
+// TestSelect_DanglingLinkFailsWholeSelection builds the index by hand
+// (bypassing ParseIndex, which would refuse it) so Select's own guard is the
+// only refusal in the path.
+func TestSelect_DanglingLinkFailsWholeSelection(t *testing.T) {
+	idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
+		{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, SupersededBy: []string{"ADR-404"}},
+		{ID: "ADR-002", Path: "docs/adr/002.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}},
+	}}
+	got, err := Select(idx, []string{"a/x.go"})
+	if !errors.Is(err, ErrInvalidIndex) || got != nil {
+		t.Fatalf("Select = %v, %v; want nil, ErrInvalidIndex", ids(got), err)
+	}
+	if !strings.Contains(err.Error(), `(id "ADR-001"): superseded_by "ADR-404" names no record`) {
+		t.Errorf("err = %q, want it to name ADR-001 and the absent ADR-404", err)
+	}
+}
+
+// TestSelect_ShippedIndexGovernsSupersedingRecordPaths reads the REAL index:
+// ADR-098 declares backend/internal/basedelta/** (E86.58 / #4398), and no
+// other record's glob matches basedelta, so a change there selects it
+// directly. ADR-096, the record it supersedes, is not followed backwards.
+func TestSelect_ShippedIndexGovernsSupersedingRecordPaths(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "adr", "index.json"))
+	if err != nil {
+		t.Fatalf("read shipped index: %v", err)
+	}
+	idx, err := ParseIndex(raw)
+	if err != nil {
+		t.Fatalf("ParseIndex: %v", err)
+	}
+	got, err := Select(idx, []string{"backend/internal/basedelta/basedelta.go"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	i := slices.IndexFunc(got, func(m Match) bool { return m.Record.ID == "ADR-098" })
+	if i < 0 {
+		t.Fatalf("selected %v, want ADR-098 (docs/adr/098-*.md applies_to backend/internal/basedelta/**)", ids(got))
+	}
+	if got[i].MatchedPaths != 1 {
+		t.Errorf("ADR-098 matched %d paths, want 1 (a direct match)", got[i].MatchedPaths)
+	}
+	if slices.Contains(ids(got), "ADR-096") {
+		t.Errorf("selected %v: ADR-096 is a predecessor, never followed", ids(got))
 	}
 }

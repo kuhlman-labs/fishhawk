@@ -6,7 +6,7 @@ date: 2026-10-11
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4316
 supersedes: ["ADR-096"]
 superseded_by: []
-applies_to: []
+applies_to: ["backend/internal/basedelta/**"]
 ---
 
 # ADR-098: Amend ADR-096 D3: split the global surface into verdict-wide and doc-check inputs, add data-read edges, and enable verdict transfer only after a shadow measurement

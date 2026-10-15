@@ -553,3 +553,94 @@ func TestAssemble_UnpinnableCommit_Unresolvable(t *testing.T) {
 		})
 	}
 }
+
+// TestPromptDocuments_SuccessorFraming: P (ADR-001) governs the audit package
+// and is superseded by S (ADR-002), whose own applies_to is empty, so S is
+// selected only by following. S is shown in full, so only recordFraming's Via
+// sentence carries "selected because it supersedes".
+func TestPromptDocuments_SuccessorFraming(t *testing.T) {
+	linkedIndex := string(indexJSON(t,
+		linked(rec("ADR-001", "docs/adr/001.md", "superseded", "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+		linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+	))
+
+	t.Run("successor shown in full", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: linkedIndex, "docs/adr/001.md": "P-BODY", "docs/adr/002.md": "S-BODY"})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if sel.Matched != 2 || sel.Followed != 1 {
+			t.Fatalf("matched %d followed %d, want 2 and 1", sel.Matched, sel.Followed)
+		}
+		if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) {
+			t.Fatalf("included %v, want [ADR-002 ADR-001] (the successor ranks with, and ahead of, its predecessor)", got)
+		}
+		pre := sel.indexFraming(true).Preamble
+		for _, want := range []string{
+			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); ",
+			"a successor ranks with the records it supersedes",
+		} {
+			if !strings.Contains(pre, want) {
+				t.Errorf("index preamble lacks %q:\n%s", want, pre)
+			}
+		}
+		docs := sel.PromptDocuments(true)
+		if len(docs) != 3 {
+			t.Fatalf("documents = %d, want index + 2 records", len(docs))
+		}
+		if !strings.Contains(docs[1].Heading, "ADR-002") || !strings.Contains(docs[1].Body, "selected because it supersedes ADR-001; its own applies_to matches no path this change touches") {
+			t.Errorf("successor framing lacks the Via sentence:\n%s\n%s", docs[1].Heading, docs[1].Body)
+		}
+		if strings.Contains(docs[2].Body, "selected because it supersedes") {
+			t.Errorf("the predecessor (no Via) carries the successor sentence:\n%s", docs[2].Body)
+		}
+	})
+
+	t.Run("no links keeps the preamble byte-identical", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{
+			indexPath:         string(indexJSON(t, rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"))),
+			"docs/adr/001.md": "P-BODY",
+		})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
+			"1 of its 1 records declare an applies_to path glob matching a path this change touches; " +
+			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-001. " +
+			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
+		pre := sel.indexFraming(true).Preamble
+		if pre != golden {
+			t.Errorf("preamble changed with nothing followed:\n got %q\nwant %q", pre, golden)
+		}
+		if strings.Contains(pre, "supersede") {
+			t.Errorf("preamble mentions supersession with nothing followed:\n%s", pre)
+		}
+		if docs := sel.PromptDocuments(true); strings.Contains(docs[1].Body, "supersede") {
+			t.Errorf("record framing mentions supersession with no Via:\n%s", docs[1].Body)
+		}
+	})
+
+	t.Run("dropped successor is named as one", func(t *testing.T) {
+		const capBytes = 2048
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: linkedIndex, "docs/adr/001.md": "P-BODY", "docs/adr/002.md": body("S", 3*capBytes)})
+		sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if got := ids(sel.Dropped); !reflect.DeepEqual(got, []string{"ADR-002", "ADR-001"}) {
+			t.Fatalf("dropped %v, want [ADR-002 ADR-001]", got)
+		}
+		notice := sel.indexFraming(true).Preamble
+		if !strings.Contains(notice, "- ADR-002 (docs/adr/002.md, status: accepted, successor of ADR-001)") {
+			t.Errorf("dropped notice does not name the successor:\n%s", notice)
+		}
+		if !strings.Contains(notice, "- ADR-001 (docs/adr/001.md, status: superseded)\n") && !strings.HasSuffix(notice, "- ADR-001 (docs/adr/001.md, status: superseded)") {
+			t.Errorf("dropped predecessor line carries a successor suffix:\n%s", notice)
+		}
+	})
+}
