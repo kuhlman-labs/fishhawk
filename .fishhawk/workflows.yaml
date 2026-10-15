@@ -27,6 +27,67 @@
 # stage may only consume an artifact from one declared before it.
 
 version: "2"
+# Repository review conventions (ADR-068). The security convention lists
+# this repository's load-bearing controls, trust boundaries and token model,
+# which the generic security remit defers to. It attaches only to a change
+# touching the sensitive paths below (the same set the security persona's
+# escalations match), so a review elsewhere is byte-identical to one with no
+# convention declared. The standard reviewers of a matching change see it too:
+# a persona sees exactly the conventions its stage's reviewers see.
+review_conventions:
+  security_conventions:
+    path: docs/review/security-conventions.md
+    applies_to:
+      paths:
+        - "backend/internal/spec/**"
+        - "cli/internal/spec/**"
+        - "backend/internal/audit/**"
+        - "backend/internal/policy/**"
+        - "backend/internal/auth/**"
+        - "backend/internal/githubapp/**"
+        - "verifier/**"
+        - "backend/internal/prompt/**"
+        - "backend/internal/agentpaths/**"
+        - "runner/internal/constraint/**"
+        - "runner/internal/agentenv/**"
+        - "runner/cmd/fishhawk-runner/gateenv*.go"
+        - "credstore/**"
+    severity_cap: medium
+
+# Reviewer personas (ADR-084). Each runs as one extra reviewer invocation with
+# its own remit, in addition to the stage's standard reviewers and under their
+# authority. The model and severity caps match the catch-rate evidence the
+# personas were measured under (docs/compliance/planreview-catchrate-evidence.md,
+# baseline d624cd36): claude-sonnet-5-5, medium cap.
+reviewer_personas:
+  # The architect (E78.6 #3757): checks a plan against the in-repo decision
+  # record, cites ADRs verbatim, and flags undeclared new architectural
+  # direction. Attached statically to feature_change's plan review. Measured
+  # at 118/138 catch with 24/138 false alarms — expect roughly one advisory
+  # decision_record false alarm in six plans; its cap keeps it at medium.
+  architect:
+    agent:
+      provider: claudecode
+      model: claude-sonnet-5-5
+      reasoning_effort: high
+    remit:
+      path: docs/review/architect-remit.md
+      severity_cap: medium
+    decision_record:
+      index: docs/adr/index.json
+  # The security persona (E80.5 #3762): a threat-model lens attached by
+  # feature_change's escalations to a change touching a sensitive path, at
+  # plan and implement review. Measured at 204/204 catch with 1/136 false
+  # alarms (7/136 with no repository convention).
+  security:
+    agent:
+      provider: claudecode
+      model: claude-sonnet-5-5
+      reasoning_effort: high
+    remit:
+      path: docs/review/security-remit.md
+      severity_cap: medium
+
 workflows:
   # ---------------------------------------------------------------------------
   # backlog_grooming — decide what to build.
@@ -228,6 +289,21 @@ workflows:
             - "verifier/**"
         require:
           max_autonomy: medium
+          reviewers: [security]
+      # Further security-sensitive surfaces that get the security persona but
+      # keep the workflow's own autonomy: the prompt quarantine envelopes, the
+      # agent-instruction path class, the runner's gate env allow-list and
+      # agent env, and credential storage.
+      - match:
+          paths:
+            - "backend/internal/prompt/**"
+            - "backend/internal/agentpaths/**"
+            - "runner/internal/constraint/**"
+            - "runner/internal/agentenv/**"
+            - "runner/cmd/fishhawk-runner/gateenv*.go"
+            - "credstore/**"
+        require:
+          reviewers: [security]
     policy:
       max_stage_runtime: "30m"
     # Periodic cost ceiling. Advisory: it emits an alert to the audit log
@@ -271,6 +347,11 @@ workflows:
               model: gpt-6-astra
               reasoning_effort: high
           human: 1
+          # Hand the security convention to this stage's reviewers when the
+          # plan's scope touches a sensitive path, and run the architect on
+          # every plan.
+          conventions: [security_conventions]
+          personas: [architect]
         inputs:
           - source: github_issue
             required: true
@@ -374,6 +455,8 @@ workflows:
               model: gpt-6-astra
               reasoning_effort: high
           human: 1
+          # The security convention, on a diff touching a sensitive path.
+          conventions: [security_conventions]
         inputs:
           - artifact: plan
             from_stage: plan

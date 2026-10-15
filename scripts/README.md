@@ -1542,6 +1542,8 @@ the `-X <module>/internal/version.{Version,GitSHA}` pairs for all five binaries
   so it carries the fishhawkd stanza as a literal; `scripts/test-dev` (4f)
   byte-pins that literal to `release-ldflags fishhawkd '${VERSION}' '${GIT_SHA}'`.
 
+- **No `MinRunnerVersion` pair.** The helper deliberately emits only `Version`/`GitSHA`: the runner floor is embedded from `backend/internal/version/min-runner-version` and `init()` resolves it when the stamped `Version` is release-shaped, because the Docker image path cannot exec this helper (#4135; `backend/internal/version/README.md` § "Runner floor").
+
 `scripts/test-release-ldflags` (POSIX sh, wired into `scripts/test verify`'s
 `_verify_gate_harnesses`) pins it: r1 `sh -n`; r2 byte-exact output against
 independent literals for every component × {40-char, short} SHA; r3 dash vs
@@ -1552,7 +1554,7 @@ refusal; r6 the `var Version`/`var GitSHA` declarations; r7 builds all five
 binaries with `go build -trimpath -ldflags "$(scripts/release-ldflags …)"` and
 reads every version surface back (SKIP when go is absent); r8 drives the
 stamped `fishhawk-mcp` through a stdio `initialize` (stdin held open on a FIFO,
-killed after ~20s) and asserts `serverInfo.version` is `<Version>+<GitSHA>`.
+killed after ~20s) and asserts `serverInfo.version` is `<Version>+<GitSHA>`. r9 links `backend/internal/version`'s test binary with the helper's release stamp (`v9.8.7`) and its `dev` stamp and asserts the `init()`-resolved `MinRunnerVersion` equals the committed floor / `dev` (SKIP when go is absent).
 
 **r7 cost.** Five `-trimpath` links run on every verify. `-trimpath` drops the
 worktree path from compile action IDs, so package builds are shared across
