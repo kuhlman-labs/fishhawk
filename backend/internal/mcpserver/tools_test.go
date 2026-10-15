@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18566,6 +18567,12 @@ func TestSpecialistJobTools_EndToEndThroughRealServer(t *testing.T) {
 		draft.Job.Requester.Seat != "operator" || draft.Job.Verdict != "pass" {
 		t.Fatalf("draft = %+v, want completed, unspawned, requested by captain:mcp as operator", draft)
 	}
+	// E85.15 / #4363: the REAL server's provenance members decode through the
+	// mirror and the SDK's output schema — a draft is bearer, never
+	// blocking-eligible.
+	if draft.Job.Provenance != "bearer" || draft.Job.BlockingEligible {
+		t.Errorf("draft provenance=%q blocking_eligible=%v, want bearer / false", draft.Job.Provenance, draft.Job.BlockingEligible)
+	}
 	evidence, _ := draft.Job.Result["evidence"].(map[string]any)
 	if text, _ := evidence["text"].(string); !strings.Contains(text, "# Specialist jobs") || !strings.Contains(text, "Decision") {
 		t.Errorf("draft text = %q, want the title and the ADR sections", text)
@@ -18588,6 +18595,183 @@ func TestSpecialistJobTools_EndToEndThroughRealServer(t *testing.T) {
 	}
 	if runs, _ := got.Job.Inputs["runs"].([]any); len(runs) != 2 {
 		t.Errorf("inputs = %v, want the two recorded runs", got.Job.Inputs)
+	}
+}
+
+// spawnOverlapScan runs fishhawk_request_specialist_job for a spawned
+// overlap_scan against a fake backend, with getenv as the resolver's env.
+func spawnOverlapScan(t *testing.T, getenv func(string) string) (string, *specialistJobSpawnRecorder, RequestSpecialistJobOutput) {
+	t.Helper()
+	jobID := uuid.NewString()
+	_, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, specialistJobBody(jobID, "overlap_scan", "queued", false))
+	r := newResolver(srv, nil)
+	r.getenv = getenv
+	rec := &specialistJobSpawnRecorder{}
+	r.specialistJobSpawn = rec.spawn
+	_, out, err := r.requestSpecialistJob(context.Background(), nil, RequestSpecialistJobInput{
+		Kind: "overlap_scan", Subject: SpecialistJobSubject{HeadSHA: strings.Repeat("a", 40)}, Inputs: overlapInputs(),
+		WorkingDir: t.TempDir(), RunnerBinary: "/opt/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("requestSpecialistJob: %v", err)
+	}
+	if !out.Spawned || rec.calls != 1 {
+		t.Fatalf("spawned=%v spawns=%d, want one spawn", out.Spawned, rec.calls)
+	}
+	return jobID, rec, out
+}
+
+// TestRequestSpecialistJob_WarnsWithoutAttestToken (E85.15 / #4363): a spawn
+// with FISHHAWK_RUNNER_ATTEST_TOKEN unset still succeeds but carries ONE
+// warning naming the job, the advisory bearer provenance and the rollout
+// command, so the operator learns the result will not be blocking-grade.
+func TestRequestSpecialistJob_WarnsWithoutAttestToken(t *testing.T) {
+	jobID, _, out := spawnOverlapScan(t, envFuncFromMap(nil))
+	if len(out.Warnings) != 1 {
+		t.Fatalf("warnings = %q, want exactly the bearer-provenance warning", out.Warnings)
+	}
+	w := out.Warnings[0]
+	for _, want := range []string{
+		"FISHHAWK_RUNNER_ATTEST_TOKEN is unset",
+		"job " + jobID,
+		"provenance bearer",
+		"not ADR-089 D4 blocking-grade",
+		"fishhawkd token issue --subject specialist-runner/<host> --scopes attest:specialist-jobs",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning %q does not contain %q", w, want)
+		}
+	}
+}
+
+// TestRequestSpecialistJob_NoWarningWithAttestToken: with the variable set
+// (through the injectable getenv) the spawn carries no warning at all.
+func TestRequestSpecialistJob_NoWarningWithAttestToken(t *testing.T) {
+	_, _, out := spawnOverlapScan(t, envFuncFromMap(map[string]string{"FISHHAWK_RUNNER_ATTEST_TOKEN": "fhk_runner"}))
+	if len(out.Warnings) != 0 {
+		t.Errorf("warnings = %q, want none when FISHHAWK_RUNNER_ATTEST_TOKEN is set", out.Warnings)
+	}
+}
+
+// TestRequestSpecialistJob_AttestTokenReachesRunnerEnv pins the plan's "no
+// forwarding code is needed" claim with the PRODUCTION env source: a
+// FISHHAWK_RUNNER_ATTEST_TOKEN in this process's environment reaches the
+// spawned runner's env verbatim (through os.Environ()), and the warning reads
+// the same variable through os.Getenv, so it stays silent.
+func TestRequestSpecialistJob_AttestTokenReachesRunnerEnv(t *testing.T) {
+	t.Setenv("FISHHAWK_RUNNER_ATTEST_TOKEN", "fhk_runner_env")
+	_, rec, out := spawnOverlapScan(t, os.Getenv)
+	if !slices.Contains(rec.env, "FISHHAWK_RUNNER_ATTEST_TOKEN=fhk_runner_env") {
+		t.Errorf("spawn env does not carry FISHHAWK_RUNNER_ATTEST_TOKEN=fhk_runner_env")
+	}
+	if !slices.Contains(rec.env, "FISHHAWK_API_TOKEN=tok-test") {
+		t.Errorf("spawn env lost FISHHAWK_API_TOKEN=tok-test (the bearer fallback)")
+	}
+	if len(out.Warnings) != 0 {
+		t.Errorf("warnings = %q, want none when the process env carries the attest token", out.Warnings)
+	}
+}
+
+// TestSpecialistJob_DecodesProvenance (E85.15 / #4363): the job mirror
+// decodes provenance and blocking_eligible from backend-shaped bytes through
+// fishhawk_get_specialist_job, and an older backend that omits both decodes
+// to "" / false — never blocking-eligible.
+func TestSpecialistJob_DecodesProvenance(t *testing.T) {
+	jobID := uuid.NewString()
+	base := specialistJobBody(jobID, "overlap_scan", "completed", false)
+	for _, tc := range []struct {
+		name, extra, wantProv string
+		wantBlocking          bool
+	}{
+		{"runner_attested", `,"provenance":"runner_attested","blocking_eligible":true`, "runner_attested", true},
+		{"bearer", `,"provenance":"bearer","blocking_eligible":false`, "bearer", false},
+		{"older backend", ``, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.TrimSuffix(base, "}") + tc.extra + "}"
+			_, srv := newSpecialistJobFakeBackend(t, http.StatusCreated, "{}", body)
+			_, out, err := newResolver(srv, nil).getSpecialistJob(context.Background(), nil, GetSpecialistJobInput{JobID: jobID})
+			if err != nil {
+				t.Fatalf("getSpecialistJob: %v", err)
+			}
+			if out.Job.Provenance != tc.wantProv || out.Job.BlockingEligible != tc.wantBlocking {
+				t.Errorf("provenance=%q blocking_eligible=%v, want %q / %v", out.Job.Provenance, out.Job.BlockingEligible, tc.wantProv, tc.wantBlocking)
+			}
+		})
+	}
+}
+
+// TestGateViewSpecialistJobs_WireShape (E85.15 / #4363) pins the
+// hand-maintained mirror of the gate view's specialist_jobs block from RAW
+// backend-shaped bytes (the TestGateViewConsults_WireShape pattern; kept in
+// this file per approval condition C3): every field is asserted NON-ZERO, so a
+// mistyped json tag cannot decode to a silently zeroed field. It also pins the
+// mirror's tag SET to the backend's gateViewSpecialistJob members, so a field
+// added on either side without the other fails here.
+func TestGateViewSpecialistJobs_WireShape(t *testing.T) {
+	runID := uuid.New()
+	const block = `[{"job_id":"22222222-2222-2222-2222-222222222222","kind":"counterfactual_battery",` +
+		`"verdict":"fail","provenance":"runner_attested","blocking_eligible":true,"completed_sequence":5150},` +
+		`{"job_id":"33333333-3333-3333-3333-333333333333","kind":"overlap_scan",` +
+		`"verdict":"pass","provenance":"bearer","blocking_eligible":false,"completed_sequence":5160}]`
+	serve := func(t *testing.T, body string) *apiClient {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(ts.Close)
+		return newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	}
+	gvBody := func(extra string) string {
+		return `{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]` + extra + `}`
+	}
+
+	gv, err := serve(t, gvBody(`,"specialist_jobs":`+block)).GetGateView(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	if len(gv.SpecialistJobs) != 2 {
+		t.Fatalf("SpecialistJobs = %+v, want two decoded jobs (a `specialist_jobs` tag typo yields a nil block)", gv.SpecialistJobs)
+	}
+	j := gv.SpecialistJobs[0]
+	switch {
+	case j.JobID != "22222222-2222-2222-2222-222222222222":
+		t.Errorf("job_id = %q", j.JobID)
+	case j.Kind != "counterfactual_battery":
+		t.Errorf("kind = %q", j.Kind)
+	case j.Verdict != "fail":
+		t.Errorf("verdict = %q", j.Verdict)
+	case j.Provenance != "runner_attested":
+		t.Errorf("provenance = %q", j.Provenance)
+	case !j.BlockingEligible:
+		t.Error("blocking_eligible = false")
+	case j.CompletedSequence != 5150:
+		t.Errorf("completed_sequence = %d", j.CompletedSequence)
+	}
+	if b := gv.SpecialistJobs[1]; b.Provenance != "bearer" || b.BlockingEligible || b.CompletedSequence != 5160 {
+		t.Errorf("second job = %+v, want the bearer job, not blocking-eligible, in completed_sequence order", b)
+	}
+
+	wantTags := []string{"blocking_eligible", "completed_sequence", "job_id", "kind", "provenance", "verdict"}
+	var gotTags []string
+	rt := reflect.TypeOf(GateViewSpecialistJob{})
+	for i := range rt.NumField() {
+		gotTags = append(gotTags, strings.Split(rt.Field(i).Tag.Get("json"), ",")[0])
+	}
+	slices.Sort(gotTags)
+	if !slices.Equal(gotTags, wantTags) {
+		t.Errorf("GateViewSpecialistJob json tags = %v, want exactly the backend's gateViewSpecialistJob members %v", gotTags, wantTags)
+	}
+
+	// An older backend (or an unwired store / a run with no completed job)
+	// omits the key: the block decodes nil, never an error.
+	old, err := serve(t, gvBody("")).GetGateView(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("GetGateView (key omitted): %v", err)
+	}
+	if old.SpecialistJobs != nil {
+		t.Errorf("SpecialistJobs = %+v, want nil when the backend omits the key", old.SpecialistJobs)
 	}
 }
 
