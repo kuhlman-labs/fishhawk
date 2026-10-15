@@ -374,7 +374,14 @@ func lastActivity(r *run.Run, stages []*run.Stage, entries []*audit.Entry) time.
 // no non-terminal one either (and at least one stage), every stage is
 // terminal and the run completes. The target is failed if any stage failed,
 // else cancelled if any was cancelled, else succeeded.
-func settledTarget(stages []*run.Stage) (run.State, bool) {
+//
+// It mirrors Advance's #4356 park too: a failed stage that
+// run.ClassifyInfraFailurePark classifies InfraParkRetryable (a category-C
+// acceptance failure, decided from the same audit-derived history Advance
+// reads) is NOT settled — Advance would park the run, not complete it. A
+// budget-exhausted or carved-out stage falls through to the settled/failed
+// classification, matching Advance.
+func settledTarget(stages []*run.Stage, entries []*audit.Entry) (run.State, bool) {
 	if len(stages) == 0 {
 		return "", false
 	}
@@ -383,6 +390,9 @@ func settledTarget(stages []*run.Stage) (run.State, bool) {
 	settled := false
 	allTerminal := true
 	for _, s := range ordered {
+		if s.State == run.StageStateFailed && run.ClassifyInfraFailurePark(ordered, s, run.ReadInfraParkHistory(entries, s)) == run.InfraParkRetryable {
+			return "", false
+		}
 		if s.State == run.StageStateFailed || s.State == run.StageStateCancelled {
 			settled = true
 			break
@@ -466,7 +476,7 @@ func classify(e evidence, live map[uuid.UUID]bool, now time.Time, opts Options) 
 	// observed: stamping it succeeded would claim a change shipped that did
 	// not (closed) or may not have (unobserved), so it falls through to the
 	// PR-evidence class instead.
-	if target, ok := settledTarget(stages); ok &&
+	if target, ok := settledTarget(stages, e.entries); ok &&
 		(target != run.StateSucceeded || (c.PREvidence != PREvidenceClosed && c.PREvidence != PREvidenceOpened)) {
 		c.Class = ClassStagesSettled
 		c.Target = target

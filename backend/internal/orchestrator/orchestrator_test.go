@@ -5688,3 +5688,256 @@ func TestTryShortCircuitAcceptance_EffectiveVerification(t *testing.T) {
 		})
 	}
 }
+
+// parkAudit is a recordingAudit whose ListForRun returns the seeded entries
+// plus every appended row (sequence-ordered), so the #4356 park history reads
+// what earlier Advance calls wrote.
+type parkAudit struct {
+	*recordingAudit
+	seeded  []*audit.Entry
+	listErr error
+}
+
+func (p *parkAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	if p.listErr != nil {
+		return nil, p.listErr
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := append([]*audit.Entry(nil), p.seeded...)
+	seq := int64(len(out))
+	for _, a := range p.appended {
+		seq++
+		rid := a.RunID
+		out = append(out, &audit.Entry{Sequence: 1000 + seq, RunID: &rid, StageID: a.StageID, Category: a.Category, Payload: a.Payload})
+	}
+	return out, nil
+}
+
+func (p *parkAudit) rows(category string) []audit.ChainAppendParams {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, a := range p.appended {
+		if a.Category == category {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// seedAcceptanceInfraFailure seeds plan+implement succeeded, acceptance
+// failed with category cat, review in reviewState (the feature_change shape).
+func seedAcceptanceInfraFailure(t *testing.T, rs *stubRuns, cat run.FailureCategory, reviewState run.StageState) (*run.Run, *run.Stage) {
+	t.Helper()
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, State: run.StageStateFailed},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: reviewState},
+	})
+	acc := stages[2]
+	reason := "acceptance_preview_provision_failed"
+	ended := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	acc.FailureCategory = &cat
+	acc.FailureReason = &reason
+	acc.EndedAt = &ended
+	return r, acc
+}
+
+func newParkOrchestrator(t *testing.T) (*Orchestrator, *stubRuns, *parkAudit) {
+	t.Helper()
+	o, rs, _ := newOrchestrator(t)
+	au := &parkAudit{recordingAudit: &recordingAudit{}}
+	o.Audit = au
+	return o, rs, au
+}
+
+// TestAdvance_AcceptanceInfraFailure_ParksRun: a category-C acceptance failure
+// with the review stage still open parks the run (#4356) — Advance is a no-op,
+// the run stays running, the stage stays failed, and exactly one stage-scoped
+// stage_infra_parked row is written even across a re-entry.
+func TestAdvance_AcceptanceInfraFailure_ParksRun(t *testing.T) {
+	o, rs, au := newParkOrchestrator(t)
+	r, acc := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStatePending)
+
+	for i := 0; i < 2; i++ { // the second call is an Advance re-entry on the same episode
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != OutcomeNoOp {
+			t.Fatalf("call %d: Outcome = %q, want noop", i, out)
+		}
+	}
+	if got := rs.runs[r.ID].State; got != run.StateRunning {
+		t.Fatalf("run state = %q, want running (parked)", got)
+	}
+	if acc.State != run.StageStateFailed {
+		t.Fatalf("acceptance state = %q, want failed", acc.State)
+	}
+	parks := au.rows(run.CategoryStageInfraParked)
+	if len(parks) != 1 {
+		t.Fatalf("stage_infra_parked rows = %d, want 1 (re-entry must not double-count)", len(parks))
+	}
+	if parks[0].StageID == nil || *parks[0].StageID != acc.ID {
+		t.Fatalf("park row not stage-scoped to the acceptance stage: %+v", parks[0].StageID)
+	}
+	if n := len(au.rows(run.CategoryStageInfraParkBudgetExhausted)); n != 0 {
+		t.Fatalf("budget-exhausted rows = %d, want 0", n)
+	}
+}
+
+// TestAdvance_AcceptanceInfraFailure_CategoryARetriesDoNotSpendBudget pins
+// approval condition C1: three prior category-A retries (SelfRetryCount 3)
+// with no prior park rows still PARK on the first category-C failure.
+func TestAdvance_AcceptanceInfraFailure_CategoryARetriesDoNotSpendBudget(t *testing.T) {
+	o, rs, au := newParkOrchestrator(t)
+	r, acc := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStatePending)
+	acc.SelfRetryCount = 3
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp || rs.runs[r.ID].State != run.StateRunning {
+		t.Fatalf("Outcome = %q, run state = %q; want noop + running (self_retry_count must not count)", out, rs.runs[r.ID].State)
+	}
+	if n := len(au.rows(run.CategoryStageInfraParked)); n != 1 {
+		t.Fatalf("stage_infra_parked rows = %d, want 1", n)
+	}
+}
+
+// TestAdvance_AcceptanceInfraFailure_BudgetExhaustedFailsRunWithAudit: after
+// three parks for earlier episodes, the 4th consecutive category-C failure
+// fails the run and writes one stage_infra_park_budget_exhausted row.
+func TestAdvance_AcceptanceInfraFailure_BudgetExhaustedFailsRunWithAudit(t *testing.T) {
+	o, rs, au := newParkOrchestrator(t)
+	r, acc := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStatePending)
+	acc.SelfRetryCount = 3
+	stageID := acc.ID
+	for i := 0; i < run.InfraFailureParkRetryBudget; i++ {
+		payload, _ := json.Marshal(map[string]any{"failed_at": fmt.Sprintf("2026-10-15T0%d:00:00Z", i), "retry_ordinal": i})
+		au.seeded = append(au.seeded, &audit.Entry{Sequence: int64(i + 1), StageID: &stageID, Category: run.CategoryStageInfraParked, Payload: payload})
+	}
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeRunCompleted {
+		t.Fatalf("Outcome = %q, want run_completed", out)
+	}
+	if got := rs.runs[r.ID].State; got != run.StateFailed {
+		t.Fatalf("run state = %q, want failed", got)
+	}
+	rows := au.rows(run.CategoryStageInfraParkBudgetExhausted)
+	if len(rows) != 1 {
+		t.Fatalf("budget-exhausted rows = %d, want 1", len(rows))
+	}
+	if rows[0].StageID == nil || *rows[0].StageID != acc.ID {
+		t.Fatalf("budget row not stage-scoped: %+v", rows[0].StageID)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["prior_parks"] != float64(3) || p["retry_budget"] != float64(3) || p["run_state"] != "failed" || p["failure_category"] != "C" {
+		t.Fatalf("budget payload = %v", p)
+	}
+	if n := len(au.rows(run.CategoryStageInfraParked)); n != 0 {
+		t.Fatalf("stage_infra_parked rows = %d, want 0 on the exhausted path", n)
+	}
+}
+
+// TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun: every shape the
+// predicate does not park keeps today's completeRun -> failed, with no park or
+// budget row: an implement C failure, an acceptance A or B failure, and the C2
+// post-merge shape (review resolved succeeded by the merge, or pr_merged).
+func TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun(t *testing.T) {
+	cases := []struct {
+		name        string
+		cat         run.FailureCategory
+		reviewState run.StageState
+		implement   bool
+		prMerged    bool
+	}{
+		{name: "implement C", cat: run.FailureC, reviewState: run.StageStatePending, implement: true},
+		{name: "acceptance A", cat: run.FailureA, reviewState: run.StageStatePending},
+		{name: "acceptance B", cat: run.FailureB, reviewState: run.StageStatePending},
+		{name: "acceptance C, review resolved by merge", cat: run.FailureC, reviewState: run.StageStateSucceeded},
+		{name: "acceptance C, pr_merged observed", cat: run.FailureC, reviewState: run.StageStateAwaitingApproval, prMerged: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, au := newParkOrchestrator(t)
+			r, acc := seedAcceptanceInfraFailure(t, rs, tc.cat, tc.reviewState)
+			if tc.implement {
+				acc.Type = run.StageTypeImplement
+			}
+			if tc.prMerged {
+				au.seeded = append(au.seeded, &audit.Entry{Sequence: 1, Category: "pr_merged"})
+			}
+			out, err := o.Advance(context.Background(), r.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out != OutcomeRunCompleted || rs.runs[r.ID].State != run.StateFailed {
+				t.Fatalf("Outcome = %q, run state = %q; want run_completed + failed", out, rs.runs[r.ID].State)
+			}
+			if n := len(au.appended); n != 0 {
+				t.Fatalf("audit rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestAdvance_AcceptanceInfraFailure_FinalAcceptanceNoOtherOpenStageParks pins
+// C2: with every other stage terminal but no merge (review cancelled is not a
+// merge resolution), the category-C acceptance failure still parks.
+func TestAdvance_AcceptanceInfraFailure_FinalAcceptanceNoOtherOpenStageParks(t *testing.T) {
+	o, rs, au := newParkOrchestrator(t)
+	r, _ := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStateSucceeded)
+	// Drop the review stage: acceptance is the final stage, nothing else open.
+	rs.stages[r.ID] = rs.stages[r.ID][:3]
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeNoOp || rs.runs[r.ID].State != run.StateRunning {
+		t.Fatalf("Outcome = %q, run state = %q; want noop + running", out, rs.runs[r.ID].State)
+	}
+	if n := len(au.rows(run.CategoryStageInfraParked)); n != 1 {
+		t.Fatalf("stage_infra_parked rows = %d, want 1", n)
+	}
+}
+
+// TestAdvance_AcceptanceInfraFailure_AuditFailurePaths: an unreadable park
+// history surfaces as an error with NO transition; with no Audit wired the
+// park cannot be bounded, so the failure takes today's path.
+func TestAdvance_AcceptanceInfraFailure_AuditFailurePaths(t *testing.T) {
+	t.Run("history read error", func(t *testing.T) {
+		o, rs, au := newParkOrchestrator(t)
+		au.listErr = errors.New("audit down")
+		r, _ := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStatePending)
+		out, err := o.Advance(context.Background(), r.ID)
+		if err == nil || !strings.Contains(err.Error(), "infra-park history") {
+			t.Fatalf("err = %v, want infra-park history error", err)
+		}
+		if out != OutcomeNoOp || rs.runs[r.ID].State != run.StateRunning {
+			t.Fatalf("Outcome = %q, run state = %q; want noop + running", out, rs.runs[r.ID].State)
+		}
+	})
+	t.Run("nil Audit", func(t *testing.T) {
+		o, rs, _ := newOrchestrator(t)
+		r, _ := seedAcceptanceInfraFailure(t, rs, run.FailureC, run.StageStatePending)
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != OutcomeRunCompleted || rs.runs[r.ID].State != run.StateFailed {
+			t.Fatalf("Outcome = %q, run state = %q; want run_completed + failed", out, rs.runs[r.ID].State)
+		}
+	})
+}
