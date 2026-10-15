@@ -6100,9 +6100,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		//                     outcome, verify_gate_refused;
 		//   gateUnavailable → the container path failed BEFORE exec on the
 		//                     HOST (visible-cache / lint-cache creation, the
-		//                     mount guard, the host GOMODCACHE probe or
-		//                     `go mod download` on an offline host, endpoint
-		//                     binding): verify_gate_unavailable.
+		//                     mount guard, the git work-tree preflight of the
+		//                     runner-made clone (#4392), the host GOMODCACHE
+		//                     probe or `go mod download` on an offline host,
+		//                     endpoint binding): verify_gate_unavailable.
 		//
 		// Neither is a red tree and neither is a flake: both break the loop
 		// BEFORE the infra absorb (the selection is fixed for the process and
@@ -7416,7 +7417,10 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	// withDecidingGate marks this as a VERIFY gate: its outcome decides the
 	// push or the failure, so a declared gate_container's evidence records
 	// the image of the last one (E51.3 / #2136 approval condition 4).
-	output, exitCode, disp := runBoundedGateCommandDisposed(withDecidingGate(ctx), verifyCmd, wt,
+	// withGitWorkTreeRequired: wt is a runner-materialized clone, a full git
+	// work tree, so the container path preflights that git sees it at /work
+	// and maps a failure to gateUnavailable, never a red verdict (#4392).
+	output, exitCode, disp := runBoundedGateCommandDisposed(withGitWorkTreeRequired(withDecidingGate(ctx)), verifyCmd, wt,
 		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
 	if disp == gateTimedOut {
 		elapsed := time.Since(start)

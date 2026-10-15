@@ -1134,10 +1134,13 @@ func TestRunVerifyFixLoop_RefusedIsCategoryC(t *testing.T) {
 
 // unavailableContainerState installs a container-path state whose host-side
 // seed fails for a HOST reason (an offline proxy lookup) — the
-// gateUnavailable shape — and fails the test if the runtime CLI is reached.
+// gateUnavailable shape — and fails the test if the gate run is reached. The
+// auxiliary seam is scripted healthy, so the verify gate's work-tree preflight
+// (#4392) passes and the seed is what fails.
 func unavailableContainerState(t *testing.T) {
 	t.Helper()
 	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	scriptAuxExec(t, nil)
 	captureHostExec(t, true, 0)
 	stubSeed(t, func(string) error {
 		return errors.New("go mod download all: dial tcp: lookup proxy.golang.org: no such host")
@@ -1229,6 +1232,7 @@ func TestRunVerifyGateCommitted_ContainerUnavailableIsCategoryC(t *testing.T) {
 // red (category C, agent never invoked).
 func TestRunVerifyFixLoop_SeedCheckoutRefusedReachesFixAgent(t *testing.T) {
 	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	scriptAuxExec(t, nil) // the work-tree preflight (#4392) passes
 	captureHostExec(t, true, 0)
 	stubSeed(t, func(string) error {
 		return fmt.Errorf("%w: go.sum is not a regular file", gateiso.ErrSeedCheckout)
@@ -1701,6 +1705,8 @@ func classifyGateArgv(argv []string) string {
 		return "cache_check"
 	case strings.HasSuffix(joined, "cat /etc/passwd"):
 		return "passwd"
+	case len(sub) > 1 && sub[0] == "run" && sub[1] == "--rm" && strings.HasSuffix(joined, " git rev-parse --is-inside-work-tree"):
+		return "worktree_preflight"
 	case len(sub) > 1 && sub[0] == "volume" && sub[1] == "create":
 		return "volume_create"
 	case len(sub) > 1 && sub[0] == "volume" && sub[1] == "rm":
@@ -1730,14 +1736,18 @@ func classifyGateArgv(argv []string) string {
 }
 
 // gateExecScript records every runtime call on BOTH seams in one order and
-// answers each through respond (label, 1-based per-label call count).
+// answers each through respond (label, 1-based per-label call count). The
+// verify gate's work-tree preflight (#4392) is answered by preflight instead
+// (nil = a healthy work tree: `true`, exit 0), so no existing responder needs
+// to know the label.
 type gateExecScript struct {
-	order   []string
-	argv    map[string][]string // last argv per label
-	env     map[string][]string // last env per label
-	passwd  []byte              // content of the passwd file at gate_run time
-	respond func(label string, n int) (string, int, bool)
-	counts  map[string]int
+	order     []string
+	argv      map[string][]string // last argv per label
+	env       map[string][]string // last env per label
+	passwd    []byte              // content of the passwd file at gate_run time
+	respond   func(label string, n int) (string, int, bool)
+	preflight func(n int) (string, int, bool)
+	counts    map[string]int
 }
 
 func (g *gateExecScript) record(argv, env []string) (string, int, bool) {
@@ -1752,6 +1762,12 @@ func (g *gateExecScript) record(argv, env []string) (string, int, bool) {
 				g.passwd, _ = os.ReadFile(src)
 			}
 		}
+	}
+	if label == "worktree_preflight" {
+		if g.preflight == nil {
+			return "true\n", 0, false
+		}
+		return g.preflight(g.counts[label])
 	}
 	return g.respond(label, g.counts[label])
 }
@@ -4534,4 +4550,235 @@ func TestRunGateInContainer_HostGoEnvNeverReachesContainer(t *testing.T) {
 	if v, ok := envOf(seedEnv, "GOROOT"); !ok || v != hostRoot {
 		t.Errorf("seed env GOROOT = (%q, %v), want the process GOROOT %q: the host seed needs the host toolchain", v, ok, hostRoot)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Work-tree preflight (#4392): a verify gate's container exec first proves git
+// sees a work tree at /work, through the auxiliary seam, from the gate's own
+// spec; a failure is gateUnavailable and the gate never runs.
+// ---------------------------------------------------------------------------
+
+// mountSourceFor returns the `-v` value in argv whose target suffix is suffix.
+func mountSourceFor(argv []string, suffix string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-v" && strings.HasSuffix(argv[i+1], suffix) {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+// TestRunGateInContainer_WorkTreePreflightFailureIsUnavailable: a marked gate
+// whose preflight exits 128 (the #4390 dubious-ownership shape) is
+// gateUnavailable with -1 and a `work tree preflight` lead, BEFORE the seed
+// and the gate run — even though the scripted gate_run would exit 0. Replacing
+// `if requiresGitWorkTree(ctx) {` with `if false {` turns this red (the gate
+// runs and returns executed/0).
+func TestRunGateInContainer_WorkTreePreflightFailureIsUnavailable(t *testing.T) {
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	g := scriptGateExec(t, serviceHappyPath)
+	g.preflight = func(int) (string, int, bool) {
+		return "fatal: detected dubious ownership in repository at '/work'\n", 128, false
+	}
+	seeded := 0
+	stubSeed(t, func(string) error { seeded++; return nil })
+	out, code, disp := runBoundedGateArgvDisposed(withGitWorkTreeRequired(context.Background()), []string{"sh", "-c", "true"},
+		t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+	if disp != gateUnavailable || code != -1 {
+		t.Fatalf("(code, disp) = (%d, %s), want (-1, unavailable); out %q", code, disp, out)
+	}
+	for _, w := range []string{"gate container: work tree preflight", "(exit 128)", "detected dubious ownership"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("output %q lacks %q", out, w)
+		}
+	}
+	if g.counts["gate_run"] != 0 {
+		t.Errorf("the gate ran despite the failed preflight: %q", g.order)
+	}
+	if seeded != 0 {
+		t.Errorf("the seed ran %d time(s) despite the failed preflight", seeded)
+	}
+	if got := strings.Join(g.order, ","); got != "passwd,worktree_preflight" {
+		t.Errorf("call order = %s, want passwd,worktree_preflight", got)
+	}
+}
+
+// TestRunGateInContainer_WorkTreePreflightArms: one row per preflight result.
+// Only exit 0 with a final `true` line proceeds; 126/127 (the image cannot run
+// git) skip the preflight and keep the gate's own verdict; everything else —
+// exit 0 printing `false`, 125, 128, and a timeout — is gateUnavailable
+// (never timed_out: the gate never ran), and a -1 preflight removes ITS
+// container through the auxiliary seam.
+func TestRunGateInContainer_WorkTreePreflightArms(t *testing.T) {
+	rows := []struct {
+		name     string
+		out      string
+		code     int
+		timedOut bool
+		wantDisp gateDisposition
+		result   string
+	}{
+		{name: "exit 0 true", out: "true\n", wantDisp: gateExecuted, result: "ok"},
+		{name: "cold pull chatter then true", out: "Unable to find image 'img:1' locally\n1: Pulling from library/img\nStatus: Downloaded newer image for img:1\ntrue\n",
+			wantDisp: gateExecuted, result: "ok"},
+		{name: "exit 0 printing false", out: "false\n", wantDisp: gateUnavailable, result: "unavailable"},
+		{name: "runtime error 125", out: "docker: Error response from daemon: conflict.\n", code: 125, wantDisp: gateUnavailable, result: "unavailable"},
+		{name: "cannot invoke git 126", out: "exec: \"git\": permission denied\n", code: 126, wantDisp: gateExecuted, result: "skipped_no_git"},
+		{name: "git not found 127", out: "exec: \"git\": executable file not found in $PATH\n", code: 127, wantDisp: gateExecuted, result: "skipped_no_git"},
+		{name: "not a git repository 128", out: "fatal: not a git repository (or any of the parent directories): .git\n", code: 128,
+			wantDisp: gateUnavailable, result: "unavailable"},
+		{name: "timed out", code: -1, timedOut: true, wantDisp: gateUnavailable, result: "unavailable"},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", &log))
+			g := scriptGateExec(t, serviceHappyPath)
+			g.preflight = func(int) (string, int, bool) { return r.out, r.code, r.timedOut }
+			out, code, disp := runBoundedGateArgvDisposed(withGitWorkTreeRequired(context.Background()), []string{"sh", "-c", "true"},
+				t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+			if disp != r.wantDisp {
+				t.Fatalf("disposition = %s, want %s; out %q order %q", disp, r.wantDisp, out, g.order)
+			}
+			if r.wantDisp == gateExecuted {
+				if code != 0 || out != "gate ok" || g.counts["gate_run"] != 1 {
+					t.Errorf("(out, code, gate runs) = (%q, %d, %d), want the gate's own verdict", out, code, g.counts["gate_run"])
+				}
+			} else {
+				if code != -1 || g.counts["gate_run"] != 0 || !strings.Contains(out, fmt.Sprintf("work tree preflight: git cannot see a usable work tree at /work (exit %d)", r.code)) {
+					t.Errorf("(out, code, gate runs) = (%q, %d, %d), want an unavailable preflight that never ran the gate", out, code, g.counts["gate_run"])
+				}
+			}
+			want := fmt.Sprintf(`{"event":"gate_worktree_preflight","result":%q,"exit_code":%d,`, r.result, r.code)
+			if !strings.Contains(log.String(), want) {
+				t.Errorf("log lacks %s:\n%s", want, log.String())
+			}
+			if r.code == -1 {
+				name := flagValueOf(g.argv["worktree_preflight"], "--name")
+				kill := g.argv["gate_kill"]
+				if g.counts["gate_kill"] != 1 || name == "" || strings.Join(kill, " ") != "docker --host unix:///nonexistent/daemon.sock rm -f "+name {
+					t.Errorf("kill argv = %q (calls %d), want docker --host unix:///nonexistent/daemon.sock rm -f %s", kill, g.counts["gate_kill"], name)
+				}
+			} else if g.counts["gate_kill"] != 0 {
+				t.Errorf("an exited preflight issued %d rm -f call(s): %q", g.counts["gate_kill"], g.order)
+			}
+		})
+	}
+}
+
+// TestRunGateInContainer_WorkTreePreflightMirrorsGateSpec: the preflight runs
+// the gate's OWN spec — the same bound CLI env, --user, /work mount, passwd
+// mount, safe.directory pin and in-container env (the SENTINEL extra proves
+// the env is inherited, since BuildArgv re-adds the safe.directory pin even to
+// a nil Env) — under a FRESH name, without the service mount, and before the
+// service volume exists. Building the preflight with a nil Env turns the
+// sentinel assertion red; keeping the gate's ServiceMounts turns the
+// service-mount assertion red.
+func TestRunGateInContainer_WorkTreePreflightMirrorsGateSpec(t *testing.T) {
+	serviceContainerState(t, "/nonexistent/daemon.sock", io.Discard, nil)
+	g := scriptGateExec(t, nil)
+	const sentinel = "FISHHAWK_PREFLIGHT_SENTINEL"
+	_, code, disp := runBoundedGateArgvDisposed(withGitWorkTreeRequired(context.Background()), []string{"sh", "-c", "true"},
+		t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute, sentinel+"=4392")
+	if code != 0 || disp != gateExecuted {
+		t.Fatalf("(code, disp) = (%d, %s), want the gate's own verdict", code, disp)
+	}
+	want := "passwd,worktree_preflight,volume_create,service_run,logs,ready,bootstrap,gate_run,service_rm,volume_rm"
+	if got := strings.Join(g.order, ","); got != want {
+		t.Fatalf("call order:\n got %s\nwant %s", got, want)
+	}
+	pre, gate := g.argv["worktree_preflight"], g.argv["gate_run"]
+	if !slices.Equal(g.env["worktree_preflight"], g.env["gate_run"]) {
+		t.Errorf("the preflight ran under a different CLI env than the gate")
+	}
+	if u := flagValueOf(gate, "--user"); u == "" || flagValueOf(pre, "--user") != u {
+		t.Errorf("preflight --user %q, gate --user %q", flagValueOf(pre, "--user"), u)
+	}
+	for _, suffix := range []string{":" + gateiso.MountWork, ":" + gateiso.MountPasswd + ":ro"} {
+		if src := mountSourceFor(gate, suffix); src == "" || !argvHasPair(pre, "-v", src) {
+			t.Errorf("preflight lacks the gate's %s mount %q: %q", suffix, src, pre)
+		}
+	}
+	if v, _ := lastEnvValue(pre, sentinel); v != "4392" {
+		t.Errorf("preflight %s = %q, want the gate env's 4392 (the preflight must inherit the gate's Env): %q", sentinel, v, pre)
+	}
+	n, err := strconv.Atoi(func() string { v, _ := lastEnvValue(pre, "GIT_CONFIG_COUNT"); return v }())
+	if err != nil || n < 1 {
+		t.Fatalf("preflight GIT_CONFIG_COUNT unparseable: %v", err)
+	}
+	k, _ := lastEnvValue(pre, "GIT_CONFIG_KEY_"+strconv.Itoa(n-1))
+	v, _ := lastEnvValue(pre, "GIT_CONFIG_VALUE_"+strconv.Itoa(n-1))
+	if k != "safe.directory" || v != gateiso.MountWork {
+		t.Errorf("preflight safe.directory pin = %q=%q, want safe.directory=%s", k, v, gateiso.MountWork)
+	}
+	pn, gn := flagValueOf(pre, "--name"), flagValueOf(gate, "--name")
+	if !strings.HasPrefix(pn, "fishhawk-gate-") || pn == gn {
+		t.Errorf("preflight name %q must be a fresh gate container name (gate %q)", pn, gn)
+	}
+	if strings.Contains(strings.Join(pre, " "), "fishhawk-gate-svc-") {
+		t.Errorf("the preflight mounts the service volume: %q", pre)
+	}
+	if !strings.Contains(strings.Join(gate, " "), "fishhawk-gate-svc-") {
+		t.Fatalf("fixture: the gate argv carries no service mount, so the absence check above is vacuous: %q", gate)
+	}
+	if gateRunImage(pre) != gateRunImage(gate) || !strings.HasSuffix(strings.Join(pre, " "), " git rev-parse --is-inside-work-tree") {
+		t.Errorf("preflight image/argv = %q, want the gate image %q running git rev-parse", pre, gateRunImage(gate))
+	}
+}
+
+// TestRunGateInContainer_UnmarkedGateRunsNoPreflight: an exec WITHOUT the
+// work-tree marker — the auto-format absorb against the lineage worktree,
+// whose `.git` is a gitdir FILE outside the /work mount — runs no preflight,
+// deciding or not. Replacing `if requiresGitWorkTree(ctx) {` with `if true {`
+// turns this red.
+func TestRunGateInContainer_UnmarkedGateRunsNoPreflight(t *testing.T) {
+	for name, ctx := range map[string]context.Context{"plain": context.Background(), "deciding only": withDecidingGate(context.Background())} {
+		t.Run(name, func(t *testing.T) {
+			installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+			g := scriptGateExec(t, serviceHappyPath)
+			g.preflight = func(int) (string, int, bool) { return "fatal: not a git repository\n", 128, false }
+			out, code, disp := runBoundedGateCommandDisposed(ctx, "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+			if code != 0 || disp != gateExecuted || out != "gate ok" {
+				t.Errorf("(out, code, disp) = (%q, %d, %s), want the gate's own verdict", out, code, disp)
+			}
+			if got := strings.Join(g.order, ","); got != "passwd,gate_run" {
+				t.Errorf("call order = %s, want passwd,gate_run (no worktree_preflight)", got)
+			}
+		})
+	}
+}
+
+// TestRunVerifyCommittedTree_ContainerWorkTreePreflight: the REAL committed-
+// tree verify marks its gate, so on the container path the preflight runs
+// against the clone's /work mount before the gate run; a failing preflight is
+// outcome failed with disposition gateUnavailable and no gate run.
+func TestRunVerifyCommittedTree_ContainerWorkTreePreflight(t *testing.T) {
+	repo, head := gateRepoWithCommit(t)
+	t.Run("ok", func(t *testing.T) {
+		installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+		g := scriptGateExec(t, serviceHappyPath)
+		_, out, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil)
+		if outcome != "passed" || disp != gateExecuted {
+			t.Fatalf("verify = %s / %s: %s", outcome, disp, out)
+		}
+		if got := strings.Join(g.order, ","); got != "passwd,worktree_preflight,gate_run" {
+			t.Errorf("call order = %s, want passwd,worktree_preflight,gate_run", got)
+		}
+		work := mountSourceFor(g.argv["gate_run"], ":"+gateiso.MountWork)
+		if work == "" || !argvHasPair(g.argv["worktree_preflight"], "-v", work) || strings.HasPrefix(work, repo+":") {
+			t.Errorf("preflight /work mount must be the gate's clone %q (not the primary %q): %q", work, repo, g.argv["worktree_preflight"])
+		}
+	})
+	t.Run("failing preflight", func(t *testing.T) {
+		installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+		g := scriptGateExec(t, serviceHappyPath)
+		g.preflight = func(int) (string, int, bool) { return "fatal: not a git repository\n", 128, false }
+		_, out, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil)
+		if outcome != "failed" || disp != gateUnavailable || !strings.Contains(out, "work tree preflight") {
+			t.Errorf("verify = %s / %s: %s, want failed / unavailable naming the preflight", outcome, disp, out)
+		}
+		if g.counts["gate_run"] != 0 {
+			t.Errorf("the gate ran despite the failed preflight: %q", g.order)
+		}
+	})
 }

@@ -107,10 +107,12 @@ const (
 	gateRefused
 	// gateUnavailable: container path — a pre-exec failure whose cause is the
 	// HOST, not the tree: visible-cache creation, the lint-cache dir, the
-	// mount-guard refusal, the host GOMODCACHE probe / `go mod download` (an
-	// offline host), or endpoint binding. The gate never executed, so its
-	// verdict says nothing about the tree: category C exactly like a refusal
-	// (verify_gate_unavailable / errGateContainerUnavailable).
+	// mount-guard refusal, the git work-tree preflight of a verify gate's
+	// runner-made clone (#4392), the host GOMODCACHE probe / `go mod
+	// download` (an offline host), or endpoint binding. The gate never
+	// executed, so its verdict says nothing about the tree: category C
+	// exactly like a refusal (verify_gate_unavailable /
+	// errGateContainerUnavailable).
 	gateUnavailable
 	// gateTimedOut: the gate DID execute but the RUNNER's own per-exec
 	// deadline (executor.verify.timeout) expired before it returned, so the
@@ -346,8 +348,9 @@ var seedModCacheFn = gateiso.SeedModCache
 var bindEndpointEnvFn = gateiso.Runtime.BindEndpointEnv
 
 // execGateAuxArgvFn is the host-exec seam for the runtime CLI calls AROUND a
-// container gate exec — the gate image's /etc/passwd read and the gate-service
-// lifecycle (#2137) — kept apart from execBoundedHostArgvFn so that seam still
+// container gate exec — the gate image's /etc/passwd read, the gate-service
+// lifecycle (#2137) and a verify gate's work-tree preflight with its `rm -f`
+// (#4392) — kept apart from execBoundedHostArgvFn so that seam still
 // carries exactly the gate's own `run` and its `rm -f` kill. A package var
 // SOLELY so a test can script and record those calls; production leaves it
 // execBoundedHostArgv.
@@ -654,6 +657,85 @@ func isDecidingGate(ctx context.Context) bool {
 	return v
 }
 
+// gitWorkTreeRequiredKey marks a gate exec's context as one whose checkout is
+// a runner-materialized independent clone, so git MUST see a work tree at
+// /work (#4392). Only runVerifyCommittedTreeEnv sets it. Every unmarked exec —
+// the auto-format absorb (which runs against the lineage worktree, whose
+// `.git` is a gitdir FILE pointing outside the /work mount), the diff-coverage
+// measurement, the counterfactuals and every direct runBoundedGateCommand
+// caller — runs no work-tree preflight and is byte-unchanged.
+type gitWorkTreeRequiredKey struct{}
+
+// withGitWorkTreeRequired marks ctx as a gate whose /work must be a git work
+// tree: the container path preflights it (gitWorkTreePreflight).
+func withGitWorkTreeRequired(ctx context.Context) context.Context {
+	return context.WithValue(ctx, gitWorkTreeRequiredKey{}, true)
+}
+
+// requiresGitWorkTree reports whether ctx was marked by withGitWorkTreeRequired.
+func requiresGitWorkTree(ctx context.Context) bool {
+	v, _ := ctx.Value(gitWorkTreeRequiredKey{}).(bool)
+	return v
+}
+
+// gitWorkTreePreflightArgv is the in-container work-tree preflight (#4392):
+// it prints `true` and exits 0 only inside a git work tree.
+var gitWorkTreePreflightArgv = []string{"git", "rev-parse", "--is-inside-work-tree"}
+
+// gateWorkTreePreflightTimeout bounds the work-tree preflight. Like
+// gatePasswdReadTimeout it runs BEFORE the gate exec and outside the gate's
+// own timeout, and covers a cold pull of the gate image when the passwd read
+// degraded; exceeding it is gateUnavailable, never a verdict.
+const gateWorkTreePreflightTimeout = 5 * time.Minute
+
+// gitWorkTreePreflight runs `git rev-parse --is-inside-work-tree` in a
+// container built from the gate's OWN spec — same user, /work mount, caches,
+// passwd file and env (including the #4390 safe.directory pin) — with only a
+// fresh name, the preflight argv and NO service mounts (the service volume
+// does not exist yet, and a `-v name:…` on a missing named volume would make
+// the daemon auto-create it). It runs through execGateAuxArgvFn, the seam for
+// the runtime calls AROUND the gate, so execBoundedHostArgvFn still carries
+// exactly the gate's run and its kill. It returns "" to proceed, or a failure
+// message the caller maps to gateUnavailable: the gate never ran, and git not
+// seeing the runner-materialized clone is the host's fault, not the tree's.
+// Exit 126/127 (the image cannot invoke or find git) SKIPS the preflight so
+// the gate's own verdict stands exactly as before #4392. Logs one
+// gate_worktree_preflight line. Nil-safe.
+func (s *gateIsolationState) gitWorkTreePreflight(ctx context.Context, spec gateiso.ContainerSpec, policy gateiso.MountPolicy, root string, cliEnv []string) string {
+	pre := spec
+	pre.Name = gateiso.NewContainerName()
+	pre.Argv = gitWorkTreePreflightArgv
+	pre.ServiceMounts = nil
+	argv, err := pre.BuildArgv(policy)
+	if err != nil {
+		return "work tree preflight: " + err.Error()
+	}
+	start := time.Now()
+	out, code, _ := execGateAuxArgvFn(ctx, argv, root, cliEnv, gateWorkTreePreflightTimeout)
+	elapsed := time.Since(start)
+	if code == -1 {
+		// Killing the CLI does not stop the container: remove it.
+		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
+		_, _, _ = execGateAuxArgvFn(killCtx, pre.KillArgv(), root, cliEnv, diffCoverageCleanupTimeout)
+		cancel()
+	}
+	result, msg := "ok", ""
+	if ok := code == 0 && strings.TrimSpace(lastNonEmptyLine(out)) == "true"; !ok {
+		switch code {
+		case 126, 127:
+			// The image cannot invoke or find git: no preflight verdict.
+			result = "skipped_no_git"
+		default:
+			// 128 (not a git repository / dubious ownership), 125 (runtime
+			// error), exit 0 printing `false`, -1 (timeout or cancellation).
+			result = "unavailable"
+			msg = fmt.Sprintf("work tree preflight: git cannot see a usable work tree at %s (exit %d): %s", gateiso.MountWork, code, gateOutputTail(out))
+		}
+	}
+	s.logEvent(`{"event":"gate_worktree_preflight","result":%q,"exit_code":%d,"preflight_ms":%d}`, result, code, elapsed.Milliseconds())
+	return msg
+}
+
 // noteDeclaredGate records that a declared-image gate started resolution: a
 // deciding gate clears the deciding image, so a deciding gate whose
 // resolution fails never inherits an earlier gate's image.
@@ -918,7 +1000,12 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // DEGRADE to the per-exec GOCACHE / lint-cache binds on any failure, #3967)
 // with its env applied before the service env; the argv build
 // under the resolved-path mount guard (BEFORE the seed — a checkout the guard
-// refuses is never handed to the host-side seed); the host-side module-cache
+// refuses is never handed to the host-side seed); for a gate marked
+// withGitWorkTreeRequired (the committed-tree verify, #4392) the work-tree
+// preflight (gitWorkTreePreflight: `git rev-parse --is-inside-work-tree` from
+// the gate's own spec through execGateAuxArgvFn — anything but exit 0 with a
+// final `true` line is gateUnavailable, while exit 126/127, an image that
+// cannot run git, skips it so the gate's own verdict stands); the host-side module-cache
 // seed under the SANITIZED gate env (no runner credential reaches the
 // `go mod download`, and the checkout's module metadata is refused before any
 // go process runs when it would reach outside the checkout); the gate service
@@ -931,7 +1018,7 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // the container). Every failure before the exec returns -1 WITHOUT executing
 // the gate, and the third value names WHY out of band (#3448): a HOST-caused
 // pre-exec failure — visible-cache creation, the lint-cache dir, the docker
-// config, endpoint binding, a blocked credential helper, the gate-service argv, the mount-guard refusal, a seed failure NOT
+// config, endpoint binding, a blocked credential helper, the gate-service argv, the mount-guard refusal, a failed work-tree preflight, a seed failure NOT
 // wrapping gateiso.ErrSeedCheckout (the host GOMODCACHE probe or `go mod
 // download` on an offline host), or ANY gate-service provisioning step — is
 // gateUnavailable (category C at the gates, like a refusal; never the fix
@@ -1052,12 +1139,22 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if svc != nil {
 		spec.ServiceMounts = []gateiso.ServiceMount{svc.GateMount()}
 	}
-	runArgv, err := spec.BuildArgv(gateiso.MountPolicy{
+	policy := gateiso.MountPolicy{
 		Permitted:    []string{dir, vc.Root, lintCacheDir},
 		DaemonSocket: sel.Runtime.SocketPath,
-	})
+	}
+	runArgv, err := spec.BuildArgv(policy)
 	if err != nil {
 		return "gate container: " + err.Error(), -1, gateUnavailable
+	}
+	// A verify gate's checkout is a runner-materialized clone, so git must
+	// see a work tree at /work (#4392): preflight it from the gate's own spec
+	// BEFORE the seed, the service and the run. A failure is gateUnavailable
+	// (the gate never ran), never a verdict on the tree.
+	if requiresGitWorkTree(ctx) {
+		if msg := st.gitWorkTreePreflight(ctx, spec, policy, vc.Root, cliEnv); msg != "" {
+			return "gate container: " + msg, -1, gateUnavailable
+		}
 	}
 	// Seed only AFTER the mount guard accepted every source: the seed is the
 	// one host-side process the container path runs against the checkout.

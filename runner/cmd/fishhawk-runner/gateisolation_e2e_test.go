@@ -31,7 +31,7 @@ import (
 //
 // These cross gateiso → the runner wiring (runBoundedGateArgv,
 // runVerifyCommittedTree, runVerifyFixLoop) → a REAL container runtime and
-// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o), (p), (q) skips with
+// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o)–(r) skips with
 // the detected reason when no safe runtime or the image is unavailable, and
 // increments dockerFixturesRan at its END so main_test.go's TestMain
 // sentinel (approval condition 3) turns an all-skipped run on a docker host
@@ -1769,6 +1769,51 @@ func TestGateContainer_SafeDirectoryOverRootOwnedMountPoint(t *testing.T) {
 	}
 	if outputField(got, "inside") != "true" || outputField(got, "status") != "ok" {
 		t.Errorf("pinned arm: inside=%q status=%q, want inside=true status=ok:\n%s", outputField(got, "inside"), outputField(got, "status"), got)
+	}
+	dockerFixturesRan++
+}
+
+// (r) TestGateContainer_WorkTreePreflight (#4392): the verify gate's work-tree
+// preflight against REAL git in the pinned image. (i) The committed-tree
+// verify's runner-made clone passes it (git sees the clone at /work under the
+// #4390 safe.directory pin) and the gate runs. (ii) A marked exec on an EMPTY
+// checkout fails it with git's own `not a git repository` and is
+// gateUnavailable, and the gate command — which would create a marker file in
+// the checkout — never runs; the unmarked control proves the same command
+// does create the marker, so its absence is the preflight's doing.
+func TestGateContainer_WorkTreePreflight(t *testing.T) {
+	rt, image := requireGateImage(t)
+	st := liveContainerState(t, rt, image)
+	var log strings.Builder
+	st.logSink = &log
+	repo, head := gateRepoWithCommit(t)
+	_, out, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, head, 3*time.Minute, nil)
+	if outcome != "passed" || disp != gateExecuted {
+		t.Fatalf("clone verify = %s / %s:\n%s", outcome, disp, out)
+	}
+	if !strings.Contains(log.String(), `"event":"gate_worktree_preflight","result":"ok","exit_code":0`) {
+		t.Errorf("the clone verify logged no passing preflight:\n%s", log.String())
+	}
+
+	empty := t.TempDir()
+	marker := filepath.Join(empty, "gate-ran")
+	cmd := "touch " + gateiso.MountWork + "/gate-ran"
+	out, code, disp := runBoundedGateCommandDisposed(withGitWorkTreeRequired(context.Background()), cmd, empty,
+		filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if disp != gateUnavailable || code != -1 {
+		t.Fatalf("(code, disp) = (%d, %s), want (-1, unavailable):\n%s", code, disp, out)
+	}
+	if !strings.Contains(out, "work tree preflight") || !strings.Contains(out, "not a git repository") {
+		t.Errorf("output lacks the preflight lead or git's own error:\n%s", out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Errorf("the gate command ran despite the failed preflight (marker stat err %v)", err)
+	}
+	if out, code := runBoundedGateCommand(context.Background(), cmd, empty, filepath.Join(t.TempDir(), "lc"), 2*time.Minute); code != 0 {
+		t.Fatalf("unmarked control exit %d:\n%s", code, out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("unmarked control did not create the marker, so its absence above is vacuous: %v", err)
 	}
 	dockerFixturesRan++
 }
