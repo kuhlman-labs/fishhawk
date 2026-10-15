@@ -309,13 +309,23 @@ func SeedManifest() Manifest {
 			{
 				// The specialist-job read (E85.9 / #4300): fishhawkd emits it on
 				// GET/POST /v0/specialist-jobs, the runner's specialist-job
-				// subcommand decodes it. ModeSubset with every name decoded today;
-				// the nested requester/subject members and the bytes are pinned
-				// by testdata/wire/specialist_job.json, which both modules decode.
+				// subcommand decodes it. ModeSubset; the nested requester/subject
+				// members and the bytes are pinned by
+				// testdata/wire/specialist_job.json, which both modules decode.
 				Name: "specialist_job", Anchor: "#4300",
 				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobResponse"},
 				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJob"},
 				Mode:     ModeSubset,
+				AllowedEmitterOnly: []Allowance{
+					{
+						JSONName: "provenance",
+						Reason:   "result provenance (E85.15 / #4363 slice 1) emitted on the read; the runner's upload.SpecialistJob decodes it in #4363 slice 3",
+					},
+					{
+						JSONName: "blocking_eligible",
+						Reason:   "ADR-089 D4 blocking eligibility (E85.15 / #4363 slice 1) emitted on the read; the runner's upload.SpecialistJob decodes it in #4363 slice 3",
+					},
+				},
 			},
 			{
 				// The admission body the runner POSTs (and re-POSTs as its
@@ -332,6 +342,16 @@ func SeedManifest() Manifest {
 				Emitter:  Endpoint{File: specialistJobGo, Type: "specialistJobAdmissionResponse"},
 				Consumer: Endpoint{File: uploadFile, Type: "SpecialistJobAdmission"},
 				Mode:     ModeSubset,
+				AllowedEmitterOnly: []Allowance{
+					{
+						JSONName: "attestation_key",
+						Reason:   "job-scoped attestation key delivered once at an attester's admission (E85.15 / #4363 slice 1); the runner's upload.SpecialistJobAdmission decodes it in #4363 slice 3",
+					},
+					{
+						JSONName: "attestation_expires_at",
+						Reason:   "attestation key expiry delivered with the key (E85.15 / #4363 slice 1); the runner's upload.SpecialistJobAdmission decodes it in #4363 slice 3",
+					},
+				},
 			},
 			{
 				// The runner's completion envelope, decoded by

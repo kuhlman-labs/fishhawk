@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
@@ -22,7 +25,10 @@ import (
 // campaign or only a head SHA — so each handler does its own account scoping
 // through the store (account_id IS NOT DISTINCT FROM the caller's account).
 // The result handler writes ONLY specialist_jobs and the audit chain, never a
-// run or stage row. Long-form contract: backend/internal/specialistjob/README.md.
+// run or stage row. Result attestation (E85.15 / #4363): an admission by an
+// attester (attesterFor) mints a job-scoped key, and a result signed with it
+// records provenance runner_attested; every other result records bearer.
+// Long-form contract: backend/internal/specialistjob/README.md.
 
 // SpecialistJobStore is the store surface the handlers use;
 // *specialistjob.Store satisfies it. An interface so a handler test can inject
@@ -33,6 +39,9 @@ type SpecialistJobStore interface {
 	Get(ctx context.Context, accountID *uuid.UUID, jobID uuid.UUID) (*specialistjob.Job, error)
 	AdmitJob(ctx context.Context, p specialistjob.AdmitParams) (*specialistjob.Admission, error)
 	Complete(ctx context.Context, p specialistjob.CompleteParams) (*specialistjob.Job, error)
+	// ListCompletedForRun feeds the gate view's display-only specialist_jobs
+	// block (E85.15 / #4363).
+	ListCompletedForRun(ctx context.Context, accountID *uuid.UUID, runID uuid.UUID) ([]*specialistjob.Job, error)
 }
 
 const (
@@ -73,6 +82,14 @@ type specialistJobResponse struct {
 	LastSeenAt        time.Time               `json:"last_seen_at"`
 	StartedAt         *time.Time              `json:"started_at,omitempty"`
 	CompletedAt       *time.Time              `json:"completed_at,omitempty"`
+	// Provenance is set only on a completed job: runner_attested (the result
+	// verified against the job's attestation key) or bearer (everything else,
+	// including a pre-0104 completion).
+	Provenance string `json:"provenance,omitempty"`
+	// BlockingEligible is specialistjob.BlockingEligible(Provenance): whether
+	// the result may count as ADR-089 D4 blocking-grade evidence. False for
+	// every job that is not a runner-attested completion.
+	BlockingEligible bool `json:"blocking_eligible"`
 	// Stale is derived: a queued job unseen past concurrency.QueueTTL (its
 	// runner stopped polling admission) or a running job unseen past
 	// concurrency.JobHeartbeatTTL (its runner stopped heartbeating). Judged
@@ -92,6 +109,11 @@ type specialistJobAdmissionRequest struct {
 
 // specialistJobAdmissionResponse is the POST .../admission answer.
 // execution_nonce is the caller's own nonce, echoed only when admitted.
+// attestation_key (the base64 std encoding of the job-scoped Ed25519 private
+// key) and attestation_expires_at are set ONLY by the admission that minted
+// the key — an attester's admission that moved the job to running — and never
+// on a heartbeat, a queue answer or a non-attester's admission. The server
+// keeps only the public half.
 //
 // CROSS-MODULE WIRE CONTRACT: the runner decodes it as
 // upload.SpecialistJobAdmission (runner/internal/upload/upload.go).
@@ -102,6 +124,9 @@ type specialistJobAdmissionResponse struct {
 	Contended      bool                  `json:"contended"`
 	TakenOver      bool                  `json:"taken_over"`
 	Job            specialistJobResponse `json:"job"`
+	// AttestationKey is delivered once; see the type comment.
+	AttestationKey       string     `json:"attestation_key,omitempty"`
+	AttestationExpiresAt *time.Time `json:"attestation_expires_at,omitempty"`
 }
 
 func toSpecialistJobResponse(j *specialistjob.Job, now time.Time) specialistJobResponse {
@@ -111,6 +136,7 @@ func toSpecialistJobResponse(j *specialistjob.Job, now time.Time) specialistJobR
 		AdmissionGroup: j.AdmissionGroup, Host: j.Host, Verdict: string(j.Verdict),
 		RequestedSequence: j.RequestedSequence, CompletedSequence: j.CompletedSequence,
 		RequestedAt: j.RequestedAt, LastSeenAt: j.LastSeenAt, StartedAt: j.StartedAt, CompletedAt: j.CompletedAt,
+		Provenance: j.Provenance, BlockingEligible: specialistjob.BlockingEligible(j.Provenance),
 	}
 	if len(j.Result) > 0 {
 		out.Result = j.Result
@@ -178,9 +204,78 @@ func specialistJobParseDetails(err error) map[string]any {
 
 // specialistJobActor is the authenticated identity as an audit actor: the
 // kind comes from the token subject (an operator-agent token is agent,
-// approval condition C4), never from the request.
+// approval condition C4), never from the request. An attester (a runner
+// credential, attesterFor) acts as system under its token subject.
 func specialistJobActor(id Identity) specialistjob.Actor {
+	if attesterFor(id) != "" {
+		return specialistjob.Actor{Kind: audit.ActorSystem, Subject: id.Subject}
+	}
 	return specialistjob.Actor{Kind: actorKindForSubject(id.Subject), Subject: id.Subject}
+}
+
+// attesterFor returns the caller's token subject when it is a specialist-job
+// ATTESTER, "" otherwise. An attester is an explicit API token (TokenID set:
+// a cookie session carries no scope list and bypasses scope checks, so it can
+// never be one) holding specialistjob.AttestScope whose subject is not a
+// run-bound mcp:run: token. Only an attester's admission mints an
+// attestation key, and only an attester may post a signed result.
+func attesterFor(id Identity) string {
+	if id.TokenID == "" || !hasScope(id, specialistjob.AttestScope) || strings.HasPrefix(id.Subject, "mcp:run:") {
+		return ""
+	}
+	return id.Subject
+}
+
+// requireSpecialistJobScope is requireWriteScope for the three routes a
+// runner credential uses (GET, admission, result): it accepts routeScope OR
+// specialistjob.AttestScope. It preserves requireWriteScope's posture exactly
+// otherwise — anonymous is 401, a cookie session (TokenID "") bypasses the
+// scope check, and a token holding neither scope is 403 insufficient_scope.
+func (s *Server) requireSpecialistJobScope(w http.ResponseWriter, r *http.Request, routeScope string) bool {
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() {
+		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+			"an authenticated token is required", nil)
+		return false
+	}
+	if id.TokenID != "" && !hasScope(id, routeScope) && !hasScope(id, specialistjob.AttestScope) {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: "+routeScope+" (or "+specialistjob.AttestScope+")",
+			map[string]any{"required_scope": routeScope, "accepted_scopes": []string{routeScope, specialistjob.AttestScope}})
+		return false
+	}
+	return true
+}
+
+// writeSpecialistJobAttestationRefusal answers 401
+// specialist_job_attestation_invalid with details.reason.
+func (s *Server) writeSpecialistJobAttestationRefusal(w http.ResponseWriter, r *http.Request, reason string) {
+	s.writeError(w, r, http.StatusUnauthorized, "specialist_job_attestation_invalid",
+		"the result's attestation was refused: "+reason, map[string]any{"reason": reason})
+}
+
+// specialistJobResultAttestation reads the result's signature header. Absent
+// is (nil, true): an unsigned result, recorded as bearer. A header that is
+// repeated or not hex is refused signature_malformed, and a signature from a
+// caller that is not an attester is refused caller_not_attester — both 401
+// before any store call. A present-but-empty (or wrong-length) signature
+// reaches the store, which refuses it signature_malformed.
+func (s *Server) specialistJobResultAttestation(w http.ResponseWriter, r *http.Request, body []byte) (*specialistjob.ResultAttestation, bool) {
+	vals := r.Header.Values(specialistjob.ResultSignatureHeader)
+	if len(vals) == 0 {
+		return nil, true
+	}
+	sig, err := hex.DecodeString(vals[0])
+	if len(vals) != 1 || err != nil {
+		s.writeSpecialistJobAttestationRefusal(w, r, specialistjob.ReasonSignatureMalformed)
+		return nil, false
+	}
+	attester := attesterFor(IdentityFrom(r.Context()))
+	if attester == "" {
+		s.writeSpecialistJobAttestationRefusal(w, r, specialistjob.ReasonCallerNotAttester)
+		return nil, false
+	}
+	return &specialistjob.ResultAttestation{Signature: sig, Body: body, CallerSubject: attester}, true
 }
 
 // writeSpecialistJobStoreError maps a store refusal onto the HTTP surface.
@@ -202,6 +297,13 @@ func (s *Server) writeSpecialistJobStoreError(w http.ResponseWriter, r *http.Req
 	case errors.Is(err, specialistjob.ErrNonceMismatch):
 		s.writeError(w, r, http.StatusConflict, "specialist_job_nonce_mismatch",
 			"the execution nonce is not the running job's", nil)
+	case errors.Is(err, specialistjob.ErrAttestationInvalid):
+		reason := ""
+		var ae *specialistjob.AttestationError
+		if errors.As(err, &ae) {
+			reason = ae.Reason
+		}
+		s.writeSpecialistJobAttestationRefusal(w, r, reason)
 	case errors.Is(err, specialistjob.ErrKindMismatch), errors.Is(err, specialistjob.ErrInvalidParams):
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed", err.Error(), specialistJobParseDetails(err))
 	default:
@@ -302,13 +404,14 @@ func (s *Server) specialistJobCampaignVisible(w http.ResponseWriter, r *http.Req
 	return true
 }
 
-// handleGetSpecialistJob implements GET /v0/specialist-jobs/{job_id}: read:runs,
-// the job's own account only (a foreign job is specialist_job_not_found).
+// handleGetSpecialistJob implements GET /v0/specialist-jobs/{job_id}: read:runs
+// (or attest:specialist-jobs), the job's own account only (a foreign job is
+// specialist_job_not_found).
 func (s *Server) handleGetSpecialistJob(w http.ResponseWriter, r *http.Request) {
 	if !s.specialistJobsConfigured(w, r) {
 		return
 	}
-	if !s.requireWriteScope(w, r, "read:runs") {
+	if !s.requireSpecialistJobScope(w, r, "read:runs") {
 		return
 	}
 	jobID, ok := s.specialistJobID(w, r)
@@ -329,12 +432,14 @@ func (s *Server) handleGetSpecialistJob(w http.ResponseWriter, r *http.Request) 
 
 // handleAdmitSpecialistJob implements POST /v0/specialist-jobs/{job_id}/admission:
 // admit (or heartbeat, or take over a stale running job) through the
-// local-verify:<host> concurrency group. write:stages.
+// local-verify:<host> concurrency group. write:stages (or
+// attest:specialist-jobs). An attester's admission that moves the job to
+// running carries the job-scoped attestation key, once.
 func (s *Server) handleAdmitSpecialistJob(w http.ResponseWriter, r *http.Request) {
 	if !s.specialistJobsConfigured(w, r) {
 		return
 	}
-	if !s.requireWriteScope(w, r, "write:stages") {
+	if !s.requireSpecialistJobScope(w, r, "write:stages") {
 		return
 	}
 	jobID, ok := s.specialistJobID(w, r)
@@ -362,9 +467,10 @@ func (s *Server) handleAdmitSpecialistJob(w http.ResponseWriter, r *http.Request
 			"host must be 1..253 bytes and nonce 1..128 bytes", nil)
 		return
 	}
+	id := IdentityFrom(r.Context())
 	adm, err := s.cfg.SpecialistJobs.AdmitJob(r.Context(), specialistjob.AdmitParams{
 		AccountID: acct, JobID: jobID, Host: in.Host, Nonce: in.Nonce,
-		Actor: specialistJobActor(IdentityFrom(r.Context())),
+		Actor: specialistJobActor(id), Attester: attesterFor(id),
 	})
 	if err != nil {
 		s.writeSpecialistJobStoreError(w, r, err)
@@ -376,19 +482,27 @@ func (s *Server) handleAdmitSpecialistJob(w http.ResponseWriter, r *http.Request
 	}
 	if adm.Admitted {
 		out.ExecutionNonce = adm.ExecutionNonce
+		if len(adm.AttestationKey) > 0 {
+			out.AttestationKey = base64.StdEncoding.EncodeToString(adm.AttestationKey)
+			out.AttestationExpiresAt = adm.AttestationExpiresAt
+		}
 	}
 	s.writeJSON(w, r, http.StatusOK, out)
 }
 
 // handleSpecialistJobResult implements POST /v0/specialist-jobs/{job_id}/result:
 // the runner's completion, validated against the STORED job kind, recorded as
-// specialist_job_completed (provenance bearer) with the requester taken from
-// the job row. Touches only specialist_jobs and the audit chain. write:stages.
+// specialist_job_completed with the requester taken from the job row. A
+// result carrying X-Fishhawk-Signature from the minting attester that
+// verifies over the exact body records provenance runner_attested; an
+// unsigned one records bearer; a refused signature is 401
+// specialist_job_attestation_invalid with nothing written. Touches only
+// specialist_jobs and the audit chain. write:stages (or attest:specialist-jobs).
 func (s *Server) handleSpecialistJobResult(w http.ResponseWriter, r *http.Request) {
 	if !s.specialistJobsConfigured(w, r) {
 		return
 	}
-	if !s.requireWriteScope(w, r, "write:stages") {
+	if !s.requireSpecialistJobScope(w, r, "write:stages") {
 		return
 	}
 	jobID, ok := s.specialistJobID(w, r)
@@ -400,6 +514,10 @@ func (s *Server) handleSpecialistJobResult(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	body, ok := s.readSpecialistJobBody(w, r, specialistJobResultMaxBytes)
+	if !ok {
+		return
+	}
+	attestation, ok := s.specialistJobResultAttestation(w, r, body)
 	if !ok {
 		return
 	}
@@ -416,7 +534,7 @@ func (s *Server) handleSpecialistJobResult(w http.ResponseWriter, r *http.Reques
 	}
 	done, err := s.cfg.SpecialistJobs.Complete(r.Context(), specialistjob.CompleteParams{
 		AccountID: acct, JobID: jobID, Completion: completion,
-		Actor: specialistJobActor(IdentityFrom(r.Context())),
+		Actor: specialistJobActor(IdentityFrom(r.Context())), Attestation: attestation,
 	})
 	if err != nil {
 		s.writeSpecialistJobStoreError(w, r, err)
