@@ -395,6 +395,16 @@ type runResponse struct {
 	// the queue is unwired, the run has no active entry (never queued, or its
 	// entry settled), or the read fails (warn-logged, never a failed read).
 	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
+	// MergeCandidateRerun is the ADVISORY verify-only re-run signal (E86.54 /
+	// #4391): the run's newest merge-candidate verdict FAILED and nothing has
+	// re-opened or rewritten the head since, so fishhawk_rebase_run_branch
+	// rerun_failed_verify:true is a legal call — at the review gate, or
+	// superseding a queued, never-dispatched ADR-090 D6 fix-up in place (then
+	// queued_fixup_* name it). Built by mergeCandidateRerunSignalFor from the
+	// verb's own eligibility predicate, so it never offers a call the verb would
+	// refuse up front. Populated by handleGetRun ONLY, audit-first with no forge
+	// call, best-effort (a read error warn-logs and omits the block).
+	MergeCandidateRerun *runMergeCandidateRerunPayload `json:"merge_candidate_rerun,omitempty"`
 }
 
 // runMergeCandidateQueuePayload is the ADR-092 queue entry projection shared by
@@ -2388,6 +2398,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			"run_id", runID.String(), "error", qerr.Error())
 	} else {
 		resp.MergeCandidateQueue = mcq
+	}
+	// Verify-only re-run signal (E86.54 / #4391): single-run read ONLY,
+	// best-effort with the same posture as merge_candidate_queue.
+	if rerun, rerr := s.mergeCandidateRerunSignalFor(r.Context(), got); rerr != nil {
+		s.cfg.Logger.Warn("read merge-candidate re-run signal failed; omitting merge_candidate_rerun",
+			"run_id", runID.String(), "error", rerr.Error())
+	} else {
+		resp.MergeCandidateRerun = rerun
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
