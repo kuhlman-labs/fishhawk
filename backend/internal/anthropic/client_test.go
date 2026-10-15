@@ -164,6 +164,9 @@ func TestClient_Messages_RefusalReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "stop_reason=refusal") {
 		t.Errorf("error = %q, want it to contain 'stop_reason=refusal'", err)
 	}
+	if errors.Is(err, ErrResponseTruncated) {
+		t.Errorf("errors.Is(err, ErrResponseTruncated) = true for a refusal %q: only max_tokens truncation carries the sentinel", err)
+	}
 	if text != "" {
 		t.Errorf("responseText = %q, want empty string on refusal error", text)
 	}
@@ -199,11 +202,11 @@ func TestClient_Messages_MaxTokensReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Messages: got nil error for stop_reason=max_tokens, want non-nil")
 	}
-	if !strings.Contains(err.Error(), "truncated at max_tokens") {
-		t.Errorf("error = %q, want it to contain 'truncated at max_tokens'", err)
+	if want := "anthropic: response truncated at max_tokens (1024 tokens); increase max_tokens"; err.Error() != want {
+		t.Errorf("error = %q, want %q (message text unchanged by the sentinel wrap)", err, want)
 	}
-	if !strings.Contains(err.Error(), "increase max_tokens") {
-		t.Errorf("error = %q, want it to contain 'increase max_tokens'", err)
+	if !errors.Is(err, ErrResponseTruncated) {
+		t.Errorf("errors.Is(err, ErrResponseTruncated) = false for %q, want true", err)
 	}
 	if text != "" {
 		t.Errorf("responseText = %q, want empty string (partial fragment must not be returned as success)", text)
@@ -302,6 +305,9 @@ func TestClient_Messages_ContextWindowExceededWithPartialTextReturnsError(t *tes
 	}
 	if !strings.Contains(err.Error(), "reduce prompt size") {
 		t.Errorf("error = %q, want it to contain 'reduce prompt size'", err)
+	}
+	if errors.Is(err, ErrResponseTruncated) {
+		t.Errorf("errors.Is(err, ErrResponseTruncated) = true for a context-window error %q: only max_tokens truncation carries the sentinel", err)
 	}
 	if !strings.Contains(err.Error(), "100") {
 		t.Errorf("error = %q, want it to name the input-token count 100", err)

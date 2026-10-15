@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000436105",
+  "artifact_id": "00000000-0000-0000-0001-000000436105",
+  "triage_sequence": 116,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion restates an approach step instead of an observable outcome (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-upload-enqueues-scan",
+      "statement": "POST /uploads returns HTTP 202 after the handler enqueues a scan job on ScanQueue.",
+      "source": "explicit",
+      "source_ref": "example-org/uploads-service#205",
+      "observed": "POST /uploads returned 202 with no scan job enqueued: the implementation scans through a clamd sidecar on write, and an infected file was never served, as the issue requires; the criterion failed",
+      "expected": "an observable outcome: an infected file is never served",
+      "steps_taken": "uploaded a file, read the 202, inspected ScanQueue for a job",
+      "expectation_basis": "criterion ac-upload-enqueues-scan",
+      "repro_handle": "curl -s -o /dev/null -w '%{http_code}' -F file=@eicar.txt $TARGET/uploads",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

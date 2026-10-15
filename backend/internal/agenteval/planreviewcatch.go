@@ -67,6 +67,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -772,6 +773,9 @@ type CatchTrial struct {
 	ConcernsTotal int
 	// Response is the raw response text of an UNDECODABLE trial only.
 	Response string
+	// Truncated marks an UNDECODABLE trial whose generate call stopped at
+	// max_tokens (anthropic.ErrResponseTruncated), so no response text exists.
+	Truncated bool
 }
 
 // ClassifyCatch classifies one reviewer response against a case's catch rule;
@@ -951,8 +955,11 @@ func SamplesPerCaseForPower(nCases int) int {
 // closed: no cases, samples < 1, a nil sender, an unknown arm, a render error
 // or a transport error returns the ZERO report and an error — a partial arm
 // would be a silently-biased comparison. An undecodable response is NOT an
-// error: it is a trial, scored as a miss and counted in Undecodable. Every
-// trial's classification is kept in Trials, in sample order.
+// error: it is a trial, scored as a miss and counted in Undecodable. A
+// generate error wrapping anthropic.ErrResponseTruncated (the response hit
+// max_tokens) is the one generate error that is a trial too: an UNDECODABLE
+// trial marked Truncated, and the arm continues. Every trial's classification
+// is kept in Trials, in sample order.
 func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanReviewCatchCase, conv prompt.ReviewConvention, arm string, samples int) (CatchRateArmReport, error) {
 	if len(cases) == 0 {
 		return CatchRateArmReport{}, fmt.Errorf("agenteval: catch arm %q: no cases", arm)
@@ -978,11 +985,16 @@ func RunCatchRateArm(ctx context.Context, sender MessageSender, cases []PlanRevi
 		trials := make([]CatchTrial, 0, samples)
 		for i := 0; i < samples; i++ {
 			responseText, _, _, _, _, _, err := sender.Messages(ctx, planReviewCatchGeneratorSystemPrompt, promptText)
-			if err != nil {
+			var trial CatchTrial
+			switch {
+			case errors.Is(err, anthropic.ErrResponseTruncated):
+				trial = CatchTrial{Outcome: CatchUndecodable, Truncated: true}
+			case err != nil:
 				return CatchRateArmReport{}, fmt.Errorf("agenteval: catch arm %q case %q sample %d: generate: %w", arm, c.Name, i+1, err)
+			default:
+				trial = ClassifyCatchTrial(responseText, rule)
 			}
 			counts.Trials++
-			trial := ClassifyCatchTrial(responseText, rule)
 			switch trial.Outcome {
 			case CatchCaught:
 				counts.Caught++

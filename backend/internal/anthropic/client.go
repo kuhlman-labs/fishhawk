@@ -23,6 +23,12 @@ import (
 // could not tell which one authenticated the call.
 var ErrConflictingCredentials = errors.New("anthropic: Config.APIKey and Config.AuthToken are both set; configure exactly one credential")
 
+// ErrResponseTruncated is wrapped (%w) in the error Messages returns when the
+// response stopped at max_tokens (stop_reason=max_tokens), so a caller can
+// tell a truncated response from every other failure with errors.Is. The
+// returned error's text is the sentinel's followed by the output token count.
+var ErrResponseTruncated = errors.New("anthropic: response truncated at max_tokens")
+
 // Config holds the settings needed to create an Anthropic API client.
 type Config struct {
 	APIKey string
@@ -234,7 +240,7 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 	}
 	if msg.StopReason == anthropicsdk.StopReasonMaxTokens {
 		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
-			fmt.Errorf("anthropic: response truncated at max_tokens (%d tokens); increase max_tokens", outTok)
+			fmt.Errorf("%w (%d tokens); increase max_tokens", ErrResponseTruncated, outTok)
 	}
 	if msg.StopReason == anthropicsdk.StopReasonModelContextWindowExceeded {
 		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
