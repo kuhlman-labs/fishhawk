@@ -446,6 +446,12 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 	start, refusal := s.beginMergeCandidateVerifyPass(ctx, e.RunID, mergeCandidateVerifyParams{
 		Branch: branch, BaseRef: e.BaseRef, HeadSHA: head, Cause: st.Cause,
 	}, mergeCandidateSystemActor())
+	if refusal != nil && refusal.Transient {
+		// #4391 (approval condition C1): begin's superseded-fix-up arm could not
+		// take the stage's admission fence within its bound; the next pump
+		// re-admits the entry.
+		return unadmit(refusal.Reason)
+	}
 	if refusal != nil {
 		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonPassNotStartable, refusal.Reason)
 	}

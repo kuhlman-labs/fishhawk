@@ -4,13 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // --- #4391: the operator's verify-only re-run of a FAILED merge-candidate
@@ -226,19 +234,18 @@ func TestRebaseRerunFailedVerify_NotFailedHasNoEffect(t *testing.T) {
 	})
 }
 
-// TestRebaseRerunFailedVerify_RefusedBesideQueuedFixup (V3, approval
-// condition C1, through the HTTP handler): a failed head whose implement stage
-// is pending behind a queued fix-up (the D6 auto-route) is refused. The
-// COMPLETE audit-chain delta of the call is exactly one branch_rebased row
-// (already_up_to_date:true) — zero merge_candidate_verified and zero
-// stage_merge_candidate_verify_triggered rows — and the refusal names
-// fishhawk_dispatch_stage and the re-run. MECHANISM: deleting the pre-check
-// lets the void land before beginMergeCandidateVerifyPass refuses on state
-// pending, so the delta gains a merge_candidate_verified row.
-func TestRebaseRerunFailedVerify_RefusedBesideQueuedFixup(t *testing.T) {
+// TestRebaseRerunFailedVerify_RefusedBesideOperatorRoutedFixup (V3, rewritten
+// for E86.54): a failed head whose implement stage is pending behind an
+// OPERATOR-routed (non-D6) queued fix-up is refused. The COMPLETE audit-chain
+// delta of the call is exactly one branch_rebased row
+// (already_up_to_date:true). MECHANISM: the fix-up trigger carries no
+// `delegated` key, so queuedMergeCandidateFixupFor's D6 check is the only
+// refusal in the path; making it always true lands the marker (RED).
+func TestRebaseRerunFailedVerify_RefusedBesideOperatorRoutedFixup(t *testing.T) {
 	sd := seedMCVRebase(t, upToDateRebaseStub())
 	impl, _, _ := seedFailedRebaseHead(t, sd)
-	seedMCVRow(sd, &impl.ID, CategoryStageFixupTriggered, map[string]any{"delegated_rule": mergeCandidateDelegatedRule})
+	seedMCVRow(sd, &impl.ID, CategoryStageFixupTriggered, map[string]any{
+		"prior_state": "succeeded", "reparked_review_stage_id": sd.review.ID.String()})
 	impl.State = run.StageStatePending
 	before := chainLen(sd.au)
 
@@ -247,27 +254,17 @@ func TestRebaseRerunFailedVerify_RefusedBesideQueuedFixup(t *testing.T) {
 
 	delta := chainDelta(sd.au, before)
 	if len(delta) != 1 || delta[0].Category != CategoryBranchRebased {
-		cats := []string{}
-		for _, r := range delta {
-			cats = append(cats, r.Category)
-		}
-		t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", cats)
+		t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", deltaCategories(delta))
 	}
-	var br map[string]any
-	if err := json.Unmarshal(delta[0].Payload, &br); err != nil || br["already_up_to_date"] != true {
-		t.Errorf("branch_rebased payload = %v (err %v), want already_up_to_date:true", br, err)
-	}
-	for _, want := range []string{"fishhawk_dispatch_stage", "rerun_failed_verify", string(run.StageStatePending), impl.ID.String(), "NOT voided"} {
+	for _, want := range []string{"fishhawk_dispatch_stage", "rerun_failed_verify", "operator-routed", string(run.StageStatePending), impl.ID.String(), "NOT voided", "NOTHING was written"} {
 		if !strings.Contains(resp.MergeCandidateVerifyRefusal, want) {
 			t.Errorf("refusal must name %q: %q", want, resp.MergeCandidateVerifyRefusal)
 		}
 	}
-	if resp.MergeCandidateVerifyRerun || resp.MergeCandidateVerifyTriggered || resp.MergeCandidateVerifyState != mergeCandidateStateFailed {
-		t.Errorf("response = rerun %v triggered %v state %q, want false/false/failed",
-			resp.MergeCandidateVerifyRerun, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyState)
-	}
-	if strings.Contains(resp.MergeCandidateVerifyNote, "had no effect") {
-		t.Errorf("note = %q: a decided refusal must not also claim the flag had no effect", resp.MergeCandidateVerifyNote)
+	if resp.MergeCandidateVerifyRerun || resp.MergeCandidateVerifyTriggered || resp.MergeCandidateFixupSuperseded ||
+		resp.MergeCandidateVerifyState != mergeCandidateStateFailed {
+		t.Errorf("response = rerun %v triggered %v superseded %v state %q, want false/false/false/failed",
+			resp.MergeCandidateVerifyRerun, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateFixupSuperseded, resp.MergeCandidateVerifyState)
 	}
 	if impl.State != run.StageStatePending {
 		t.Errorf("implement stage = %q, want pending (the queued fix-up untouched)", impl.State)
@@ -593,5 +590,633 @@ func TestRebaseRerunFailedVerify_HeldBehindLivePass(t *testing.T) {
 	}
 	if st := f.stageState(b.impl.ID); st != run.StageStatePending {
 		t.Fatalf("B implement after admission = %s, want pending (re-opened)", st)
+	}
+}
+
+// --- E86.54 / #4391: in-place conversion of a queued D6 fix-up ---
+
+func deltaCategories(rows []audit.ChainAppendParams) []string {
+	out := []string{}
+	for _, r := range rows {
+		out = append(out, r.Category)
+	}
+	return out
+}
+
+// seedQueuedD6Fixup is the queued-D6 shape: a real failed pass for the live
+// head, then the D6 route's stage_fixup_triggered (the production `delegated`
+// key, prior_state succeeded, the review stage re-parked) sequenced after it,
+// with the implement stage at state. It returns the stage and the trigger and
+// failed-verdict sequences.
+func seedQueuedD6Fixup(t *testing.T, sd *rebaseSeed, state run.StageState) (*run.Stage, int64, int64) {
+	t.Helper()
+	impl, _, failedSeq := seedFailedRebaseHead(t, sd)
+	seedMCVRow(sd, &impl.ID, CategoryStageFixupTriggered, map[string]any{
+		"delegated": mergeCandidateDelegatedRule, "prior_state": string(run.StageStateSucceeded),
+		"reparked_review_stage_id": sd.review.ID.String(), "concern_ids": []string{}})
+	impl.State = state
+	return impl, int64(chainLen(sd.au)), failedSeq
+}
+
+// rerunStatusStore is a test-local concurrency.Store answering StatusForStages
+// from a fixed map (or an error); Admit and Promote are never reached.
+type rerunStatusStore struct {
+	concurrency.Store
+	status map[uuid.UUID]concurrency.Status
+	err    error
+}
+
+func (r *rerunStatusStore) StatusForStages(context.Context, []uuid.UUID) (map[uuid.UUID]concurrency.Status, error) {
+	return r.status, r.err
+}
+
+// rerunHookAudit wraps the auditFake with a hook fired after a list of one
+// category.
+type rerunHookAudit struct {
+	*auditFake
+	hookCategory string
+	afterList    func(ctx context.Context)
+}
+
+// rerunCallerKey tags each concurrent caller's context.
+type rerunCallerKey struct{}
+
+func (h *rerunHookAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	entries, err := h.auditFake.ListForRunByCategory(ctx, runID, category)
+	if err == nil && category == h.hookCategory && h.afterList != nil {
+		h.afterList(ctx)
+	}
+	return entries, err
+}
+
+func postFixupRerun(t *testing.T, sd *rebaseSeed) rebaseBranchResponse {
+	t.Helper()
+	return decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Confirm: true, Reason: rerunReason, RerunFailedVerify: true}, withRebaseOperator))
+}
+
+// TestRerunQueuedFixup_ConvertsInPlace (T1): on a stage pending or
+// awaiting_host_dispatch behind a queued D6 fix-up, the re-run appends
+// EXACTLY [branch_rebased, stage_fixup_superseded, merge_candidate_verified
+// (void), stage_merge_candidate_verify_triggered], leaves the stage state
+// UNCHANGED, and moves its dispatch group from local-implement to
+// local-verify. MECHANISM (CF): routing the pending/awaiting_host_dispatch
+// branch of rebaseRerunFailedMergeCandidateVerify back to the not-at-gate
+// refusal leaves the delta [branch_rebased] only.
+func TestRerunQueuedFixup_ConvertsInPlace(t *testing.T) {
+	for _, state := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
+		t.Run(string(state), func(t *testing.T) {
+			sd := seedMCVRebase(t, upToDateRebaseStub())
+			impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, state)
+			ctx := context.Background()
+			runRow := sd.rr.getRuns[sd.runID]
+			if g, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); g != "local-implement:h1" {
+				t.Fatalf("fixture: group before = %q, want local-implement:h1", g)
+			}
+			before := chainLen(sd.au)
+
+			resp := postFixupRerun(t, sd)
+
+			delta := chainDelta(sd.au, before)
+			want := []string{CategoryBranchRebased, CategoryStageFixupSuperseded, CategoryMergeCandidateVerified, CategoryStageMergeCandidateVerifyTriggered}
+			if got := deltaCategories(delta); strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("audit-chain delta = %v, want %v (refusal %q)", got, want, resp.MergeCandidateVerifyRefusal)
+			}
+			var marker stageFixupSupersededPayload
+			if err := json.Unmarshal(delta[1].Payload, &marker); err != nil {
+				t.Fatalf("decode marker: %v", err)
+			}
+			if marker.TriggerSequence != tSeq || marker.SupersededBy != fixupSupersededByVerifyRerun ||
+				marker.FailedVerdictSequence != fSeq || marker.Reason != mergeCandidateRerunReasonPrefix+rerunReason {
+				t.Errorf("marker = %+v, want trigger %d, superseded_by %s, failed %d, the operator_rerun reason", marker, tSeq, fixupSupersededByVerifyRerun, fSeq)
+			}
+			if delta[1].StageID == nil || *delta[1].StageID != impl.ID {
+				t.Errorf("marker stage = %v, want %s", delta[1].StageID, impl.ID)
+			}
+			var tr mergeCandidateVerifyTrigger
+			if err := json.Unmarshal(delta[3].Payload, &tr); err != nil {
+				t.Fatalf("decode trigger: %v", err)
+			}
+			if tr.SupersedesFixupTriggerSequence != tSeq || tr.PriorState != string(run.StageStateSucceeded) ||
+				tr.ReparkedReviewStageID != sd.review.ID.String() || tr.ExpectedHeadSHA != rebaseNewHeadSHA {
+				t.Errorf("conversion trigger = %+v, want supersedes %d with T's anchors for %s", tr, tSeq, rebaseNewHeadSHA)
+			}
+			if impl.State != state {
+				t.Errorf("implement stage = %q, want %q (no transition)", impl.State, state)
+			}
+			if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered ||
+				!resp.MergeCandidateVerifyRerun || !resp.MergeCandidateFixupSuperseded || resp.MergeCandidateVerifyRefusal != "" {
+				t.Errorf("response = state %q triggered %v rerun %v superseded %v refusal %q, want in_flight/true/true/true/none",
+					resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRerun,
+					resp.MergeCandidateFixupSuperseded, resp.MergeCandidateVerifyRefusal)
+			}
+			if !strings.Contains(resp.MergeCandidateVerifyNote, "keeps its place") || !strings.Contains(resp.MergeCandidateVerifyNote, "refunded") {
+				t.Errorf("note = %q, want the in-place conversion named", resp.MergeCandidateVerifyNote)
+			}
+			if g, _, _ := sd.s.resolveStageConcurrency(ctx, runRow, impl, "h1"); g != "local-verify:h1" {
+				t.Errorf("group after = %q, want local-verify:h1", g)
+			}
+		})
+	}
+}
+
+// TestRerunQueuedFixup_RefusesIneligible (T2): each subtest seeds ONLY its own
+// disqualifier on the T1 fixture; the delta is [branch_rebased], the head is
+// still failed, the stage unchanged, and the refusal names the reason.
+// MECHANISM (CF per arm): delete the named check in queuedMergeCandidateFixupFor
+// and only that subtest's marker lands.
+func TestRerunQueuedFixup_RefusesIneligible(t *testing.T) {
+	type tc struct {
+		name  string
+		setup func(sd *rebaseSeed, impl *run.Stage)
+		state run.StageState
+		want  string
+	}
+	cases := []tc{
+		{name: "dispatched", state: run.StageStateDispatched, want: `state "dispatched"`},
+		{name: "running", state: run.StageStateRunning, want: `state "running"`},
+		{name: "failed", state: run.StageStateFailed, want: `state "failed"`},
+		{name: "fixup_older_than_verdict", want: "older than the failed verdict", setup: func(sd *rebaseSeed, impl *run.Stage) {
+			// Re-seed a fresh failed verdict AFTER the D6 trigger.
+			seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+				HeadSHA: rebaseNewHeadSHA, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand,
+				Result: mergeCandidateResultFailed, OutputUntrusted: true})
+		}},
+		{name: "unrestorable_prior_state", want: "not a review-gate state", setup: func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, CategoryStageFixupTriggered, map[string]any{
+				"delegated": mergeCandidateDelegatedRule, "prior_state": "running"})
+		}},
+		{name: "unparseable_reparked_review", want: "is unparseable", setup: func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, CategoryStageFixupTriggered, map[string]any{
+				"delegated": mergeCandidateDelegatedRule, "prior_state": "succeeded", "reparked_review_stage_id": "not-a-uuid"})
+		}},
+		{name: "fixup_trigger_read_error", want: "eligibility could not be read", setup: func(sd *rebaseSeed, _ *run.Stage) {
+			sd.au.listByCategoryErrCategory = CategoryStageFixupTriggered
+		}},
+		{name: "disqualifying_read_error", want: "eligibility could not be read", setup: func(sd *rebaseSeed, _ *run.Stage) {
+			sd.au.listByCategoryErrCategory = CategoryStageConcurrencyAdmitted
+		}},
+	}
+	// A LITERAL list, never the production set: a subtest derived from the set
+	// would vanish with the category it guards.
+	for _, c := range []string{
+		"fixup_pushed", "fixup_no_changes", "stage_fixup_recovered", "stage_fixup_superseded", "dispatch_reaper_failed",
+		"stage_retried", "stage_override_retried", "stage_concurrency_admitted", "installation_token_issued",
+		"stage_concurrency_queued", "stage_merge_candidate_verify_triggered", "stage_conflict_resolution_triggered",
+	} {
+		cat := c
+		cases = append(cases, tc{name: "after_" + cat, want: "a " + cat + " row", setup: func(sd *rebaseSeed, impl *run.Stage) {
+			seedMCVRow(sd, &impl.ID, cat, map[string]any{"seeded": true})
+		}})
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sd := seedMCVRebase(t, upToDateRebaseStub())
+			state := run.StageStatePending
+			if c.state != "" {
+				state = c.state
+			}
+			impl, _, _ := seedQueuedD6Fixup(t, sd, state)
+			if c.setup != nil {
+				c.setup(sd, impl)
+			}
+			before := chainLen(sd.au)
+			resp := postFixupRerun(t, sd)
+			if delta := chainDelta(sd.au, before); len(delta) != 1 || delta[0].Category != CategoryBranchRebased {
+				t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", deltaCategories(delta))
+			}
+			if !strings.Contains(resp.MergeCandidateVerifyRefusal, c.want) || !strings.Contains(resp.MergeCandidateVerifyRefusal, "NOT voided") {
+				t.Errorf("refusal = %q, want it to name %q and NOT voided", resp.MergeCandidateVerifyRefusal, c.want)
+			}
+			if resp.MergeCandidateFixupSuperseded || resp.MergeCandidateVerifyRerun {
+				t.Errorf("superseded/rerun = %v/%v, want false/false", resp.MergeCandidateFixupSuperseded, resp.MergeCandidateVerifyRerun)
+			}
+			if impl.State != state {
+				t.Errorf("implement stage = %q, want %q", impl.State, state)
+			}
+			sd.au.listByCategoryErrCategory = ""
+			if got := sd.verifyState(t, rebaseNewHeadSHA); got != mergeCandidateStateFailed {
+				t.Errorf("head state = %q, want still failed", got)
+			}
+		})
+	}
+}
+
+// TestRerunQueuedFixup_RefusesSlotStoreWaiterWithoutAuditRow (T3): the slot
+// store holds a queued (or held) row for the stage while the chain carries NO
+// stage_concurrency_queued row, or the store read errors. MECHANISM (CF):
+// replacing the StatusForStages call with an empty map (or treating the error
+// as empty) lands the marker.
+func TestRerunQueuedFixup_RefusesSlotStoreWaiterWithoutAuditRow(t *testing.T) {
+	cases := []struct {
+		name  string
+		store func(stageID uuid.UUID) *rerunStatusStore
+		want  []string
+	}{
+		{name: "queued", want: []string{"local-implement:h1", "position 2"}, store: func(id uuid.UUID) *rerunStatusStore {
+			return &rerunStatusStore{status: map[uuid.UUID]concurrency.Status{id: {
+				State: concurrency.SlotQueued, GroupKey: "local-implement:h1", Position: 2, WaiterLive: true}}}
+		}},
+		{name: "held", want: []string{"holds a concurrency slot", "local-implement:h1"}, store: func(id uuid.UUID) *rerunStatusStore {
+			return &rerunStatusStore{status: map[uuid.UUID]concurrency.Status{id: {
+				State: concurrency.SlotHeld, GroupKey: "local-implement:h1"}}}
+		}},
+		{name: "read_error", want: []string{"slot store could not be read"}, store: func(uuid.UUID) *rerunStatusStore {
+			return &rerunStatusStore{err: errors.New("pool closed")}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sd := seedMCVRebase(t, upToDateRebaseStub())
+			impl, _, _ := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+			sd.s.cfg.Concurrency = c.store(impl.ID)
+			before := chainLen(sd.au)
+			resp := postFixupRerun(t, sd)
+			if delta := chainDelta(sd.au, before); len(delta) != 1 {
+				t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", deltaCategories(delta))
+			}
+			for _, w := range c.want {
+				if !strings.Contains(resp.MergeCandidateVerifyRefusal, w) {
+					t.Errorf("refusal = %q, want it to name %q", resp.MergeCandidateVerifyRefusal, w)
+				}
+			}
+		})
+	}
+}
+
+// TestRerunQueuedFixup_ConcurrentSecondRerunRefused (T4): two reruns race on
+// one stage with a real Orchestrator (LockStageAdmission). A two-party barrier
+// fires after each caller's stage_fixup_superseded eligibility read. Under the
+// fence the second caller cannot arrive while the first waits, the barrier
+// times out, and the second reads the first's rows: ONE marker, ONE void, ONE
+// conversion trigger. MECHANISM (CF): a no-op holdStageAdmission lets both
+// pass the barrier having read no marker → `markers = 2, want 1`.
+func TestRerunQueuedFixup_ConcurrentSecondRerunRefused(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl, _, _ := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+	sd.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: sd.rr}
+	barrier := newTwoPartyBarrier(timescale.D(300 * time.Millisecond))
+	var once sync.Map
+	sd.s.cfg.AuditRepo = &rerunHookAudit{auditFake: sd.au, hookCategory: CategoryStageFixupSuperseded, afterList: func(ctx context.Context) {
+		// Only each caller's FIRST marker read (the eligibility scan) arrives.
+		if _, loaded := once.LoadOrStore(ctx.Value(rerunCallerKey{}), true); !loaded {
+			barrier.arrive()
+		}
+	}}
+	runRow := sd.rr.getRuns[sd.runID]
+	before := chainLen(sd.au)
+	var wg sync.WaitGroup
+	results := make([]rebaseMergeCandidateFields, 2)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx := context.WithValue(context.Background(), rerunCallerKey{}, i)
+			results[i] = sd.s.rerunQueuedMergeCandidateFixup(ctx, runRow, impl,
+				rebaseBranchName, rebaseBaseRef, rebaseNewHeadSHA, mergeCandidateCauseBaseAdvance, rerunReason)
+		}(i)
+	}
+	wg.Wait()
+	counts := map[string]int{}
+	for _, r := range chainDelta(sd.au, before) {
+		counts[r.Category]++
+	}
+	if counts[CategoryStageFixupSuperseded] != 1 || counts[CategoryMergeCandidateVerified] != 1 || counts[CategoryStageMergeCandidateVerifyTriggered] != 1 {
+		t.Fatalf("markers = %d, voids = %d, triggers = %d, want 1/1/1", counts[CategoryStageFixupSuperseded],
+			counts[CategoryMergeCandidateVerified], counts[CategoryStageMergeCandidateVerifyTriggered])
+	}
+	converted, refused := 0, 0
+	for _, r := range results {
+		if r.FixupSuperseded && r.State == mergeCandidateStateInFlight {
+			converted++
+		} else if strings.Contains(r.Refusal, "NOTHING was written") {
+			refused++
+		}
+	}
+	if converted != 1 || refused != 1 {
+		t.Errorf("results = %+v, want one conversion and one refusal", results)
+	}
+}
+
+// TestRerunQueuedFixup_MarkerAppendFails (T6a): the marker append failing
+// refuses with nothing written. MECHANISM (CF): ignoring the append error
+// lets the void land and the delta assertion fails.
+func TestRerunQueuedFixup_MarkerAppendFails(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl, _, _ := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+	sd.au.appendErrCategory = CategoryStageFixupSuperseded
+	before := chainLen(sd.au)
+	resp := postFixupRerun(t, sd)
+	if delta := chainDelta(sd.au, before); len(delta) != 1 || delta[0].Category != CategoryBranchRebased {
+		t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", deltaCategories(delta))
+	}
+	if !strings.Contains(resp.MergeCandidateVerifyRefusal, "NOTHING was written") ||
+		!strings.Contains(resp.MergeCandidateVerifyRefusal, "still queued and dispatchable") {
+		t.Errorf("refusal = %q, want nothing-written and the fix-up still dispatchable", resp.MergeCandidateVerifyRefusal)
+	}
+	if impl.State != run.StageStatePending {
+		t.Errorf("stage = %q, want pending", impl.State)
+	}
+}
+
+// TestRerunQueuedFixup_VoidFailsAfterMarker (T6b): the marker landed but the
+// void failed; the refusal names the marker's sequence, NOT voided and the
+// fix-up still dispatchable as a fix-up, and a second re-run is refused
+// because the marker follows T. MECHANISM (CF): ignoring the void error
+// continues to begin (which answers failed); the refusal no longer names the
+// marker.
+func TestRerunQueuedFixup_VoidFailsAfterMarker(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	seedQueuedD6Fixup(t, sd, run.StageStatePending)
+	sd.au.appendErrCategory = CategoryMergeCandidateVerified
+	before := chainLen(sd.au)
+	resp := postFixupRerun(t, sd)
+	delta := chainDelta(sd.au, before)
+	if got := deltaCategories(delta); strings.Join(got, ",") != CategoryBranchRebased+","+CategoryStageFixupSuperseded {
+		t.Fatalf("audit-chain delta = %v, want [branch_rebased, stage_fixup_superseded]", got)
+	}
+	markerSeq := fmt.Sprintf("sequence %d", before+2)
+	for _, w := range []string{markerSeq, "NOT voided", "dispatchable as a fix-up"} {
+		if !strings.Contains(resp.MergeCandidateVerifyRefusal, w) {
+			t.Errorf("refusal = %q, want it to name %q", resp.MergeCandidateVerifyRefusal, w)
+		}
+	}
+	sd.au.appendErrCategory = ""
+	again := postFixupRerun(t, sd)
+	if !strings.Contains(again.MergeCandidateVerifyRefusal, "a "+CategoryStageFixupSuperseded+" row") {
+		t.Errorf("second re-run refusal = %q, want the spent marker named", again.MergeCandidateVerifyRefusal)
+	}
+}
+
+// TestRerunQueuedFixup_StartRefusedThenResumedByRebase (T6c): the conversion
+// trigger append fails, so marker + void land with no trigger and the refusal
+// says re-invoke. A plain rebase WITHOUT the flag then reaches begin's arm and
+// converts. MECHANISM (CF): deleting the beginSupersededFixupPass call makes
+// begin fall to the prior-state refusal on the pending stage; no trigger.
+func TestRerunQueuedFixup_StartRefusedThenResumedByRebase(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl, tSeq, _ := seedQueuedD6Fixup(t, sd, run.StageStateAwaitingHostDispatch)
+	sd.au.appendErrCategory = CategoryStageMergeCandidateVerifyTriggered
+	before := chainLen(sd.au)
+	resp := postFixupRerun(t, sd)
+	if got := deltaCategories(chainDelta(sd.au, before)); strings.Join(got, ",") !=
+		strings.Join([]string{CategoryBranchRebased, CategoryStageFixupSuperseded, CategoryMergeCandidateVerified}, ",") {
+		t.Fatalf("audit-chain delta = %v, want [branch_rebased, marker, void]", got)
+	}
+	if resp.MergeCandidateVerifyState != mergeCandidateStateUnverified || !resp.MergeCandidateVerifyRerun ||
+		resp.MergeCandidateFixupSuperseded || !strings.Contains(resp.MergeCandidateVerifyRefusal, "re-invoke fishhawk_rebase_run_branch (no flag needed)") {
+		t.Fatalf("response = state %q rerun %v superseded %v refusal %q, want unverified/true/false naming the re-invoke",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyRerun, resp.MergeCandidateFixupSuperseded, resp.MergeCandidateVerifyRefusal)
+	}
+	sd.au.appendErrCategory = ""
+	before = chainLen(sd.au)
+	plain := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true, Reason: "resume"}, withRebaseOperator))
+	mc := mcRows(chainDelta(sd.au, before))
+	if len(mc) != 1 || mc[0].Category != CategoryStageMergeCandidateVerifyTriggered {
+		t.Fatalf("plain rebase rows = %v, want the conversion trigger (refusal %q)", deltaCategories(mc), plain.MergeCandidateVerifyRefusal)
+	}
+	var tr mergeCandidateVerifyTrigger
+	_ = json.Unmarshal(mc[0].Payload, &tr)
+	if tr.SupersedesFixupTriggerSequence != tSeq || tr.ReparkedReviewStageID != sd.review.ID.String() {
+		t.Errorf("trigger = %+v, want supersedes %d with T's anchors", tr, tSeq)
+	}
+	if impl.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage = %q, want awaiting_host_dispatch (kept its place)", impl.State)
+	}
+}
+
+// startRerunHead calls startMergeCandidateVerifyPass for the seeded head.
+func startRerunHead(ctx context.Context, sd *rebaseSeed) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+	return sd.s.startMergeCandidateVerifyPass(ctx, sd.runID, mergeCandidateVerifyParams{
+		Branch: rebaseBranchName, BaseRef: rebaseBaseRef, HeadSHA: rebaseNewHeadSHA, Cause: mergeCandidateCauseBaseAdvance,
+	}, mergeCandidateSystemActor())
+}
+
+// seedMarkerAndVoid adds the stage_fixup_superseded marker for tSeq and voids
+// the failed verdict, as the verb does before its start.
+func seedMarkerAndVoid(t *testing.T, sd *rebaseSeed, impl *run.Stage, tSeq, fSeq int64) {
+	t.Helper()
+	seedMCVRow(sd, &impl.ID, CategoryStageFixupSuperseded, stageFixupSupersededPayload{
+		TriggerSequence: tSeq, SupersededBy: fixupSupersededByVerifyRerun, FailedVerdictSequence: fSeq, Reason: "operator_rerun: x"})
+	if err := sd.s.voidFailedMergeCandidateVerdict(context.Background(), sd.runID, rebaseNewHeadSHA, mergeCandidateSystemActor(), "x"); err != nil {
+		t.Fatalf("void: %v", err)
+	}
+}
+
+// TestBeginSupersededFixupArm (T7): the arm's refusals and fall-through.
+// MECHANISM (CF per row): drop the post-marker disqualifying scan (inert row's
+// trigger lands), skip the slot read (slot row's trigger lands), delete the
+// beginSupersededFixupPass call (converts row gets the prior-state refusal).
+func TestBeginSupersededFixupArm(t *testing.T) {
+	t.Run("converts", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+		start, refusal := startRerunHead(context.Background(), sd)
+		if refusal != nil || start.SupersededFixupSequence != tSeq || !start.Triggered {
+			t.Fatalf("start = %+v refusal %+v, want a conversion naming %d", start, refusal, tSeq)
+		}
+	})
+	t.Run("refuses_inert_marker", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+		seedMCVRow(sd, &impl.ID, CategoryStageConcurrencyAdmitted, map[string]any{"group": "local-implement:h1"})
+		before := chainLen(sd.au)
+		_, refusal := startRerunHead(context.Background(), sd)
+		if refusal == nil || !strings.Contains(refusal.Reason, CategoryStageConcurrencyAdmitted) || !strings.Contains(refusal.Reason, "INERT") || refusal.Transient {
+			t.Fatalf("refusal = %+v, want the inert marker named (not transient)", refusal)
+		}
+		if n := len(chainDelta(sd.au, before)); n != 0 {
+			t.Errorf("rows appended = %d, want 0", n)
+		}
+	})
+	t.Run("refuses_slot_waiter", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+		sd.s.cfg.Concurrency = &rerunStatusStore{status: map[uuid.UUID]concurrency.Status{impl.ID: {
+			State: concurrency.SlotQueued, GroupKey: "local-implement:h1", Position: 1}}}
+		before := chainLen(sd.au)
+		_, refusal := startRerunHead(context.Background(), sd)
+		if refusal == nil || !strings.Contains(refusal.Reason, "waiting for a slot") {
+			t.Fatalf("refusal = %+v, want the slot waiter named", refusal)
+		}
+		if n := len(chainDelta(sd.au, before)); n != 0 {
+			t.Errorf("rows appended = %d, want 0", n)
+		}
+	})
+	t.Run("not_handled_falls_through", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		if err := sd.s.voidFailedMergeCandidateVerdict(context.Background(), sd.runID, rebaseNewHeadSHA, mergeCandidateSystemActor(), "x"); err != nil {
+			t.Fatalf("void: %v", err)
+		}
+		_, refusal := startRerunHead(context.Background(), sd)
+		want := `the implement stage is in state "pending"; only a stage parked at its review gate (succeeded or awaiting_approval) can be re-opened for a merge-candidate verify pass`
+		if refusal == nil || refusal.Reason != want {
+			t.Fatalf("refusal = %+v, want today's prior-state refusal byte-unchanged", refusal)
+		}
+	})
+}
+
+// TestBeginSupersededFixupArm_OtherStageFenceIsBounded (approval condition C1,
+// unit half): with stage T's admission mutex HELD by the test, begin's arm for
+// T reached from inside stage S's critical section (a context marked for S)
+// answers a TRANSIENT refusal within the bound, writing nothing. MECHANISM
+// (CF): an unbounded LockStageAdmission in the arm deadlocks; the bounded
+// wait below fails it.
+func TestBeginSupersededFixupArm_OtherStageFenceIsBounded(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+	seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+	orch := &orchestrator.Orchestrator{Runs: sd.rr}
+	sd.s.cfg.Orchestrator = orch
+	release := orch.LockStageAdmission(impl.ID)
+	defer release()
+	sctx, unlockS := sd.s.holdStageAdmission(context.Background(), uuid.New())
+	defer unlockS()
+	before := chainLen(sd.au)
+
+	type answer struct {
+		refusal *mergeCandidateVerifyRefusal
+	}
+	done := make(chan answer, 1)
+	go func() {
+		_, refusal := startRerunHead(sctx, sd)
+		done <- answer{refusal}
+	}()
+	select {
+	case a := <-done:
+		if a.refusal == nil || !a.refusal.Transient || !strings.Contains(a.refusal.Reason, "admission fence is held") {
+			t.Fatalf("refusal = %+v, want a transient fence refusal", a.refusal)
+		}
+	case <-time.After(timescale.D(stageAdmissionTryWait + 10*time.Second)):
+		t.Fatal("begin's arm did not return within its bound while another stage's fence was held (deadlock)")
+	}
+	if n := len(chainDelta(sd.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+}
+
+// TestConfirmedFixupSupersessions (T8): the pure reader rule. MECHANISM (CF):
+// dropping V.Sequence > M.Sequence confirms the "v_before_marker" row;
+// dropping the field match confirms the "v_names_other_trigger" row.
+func TestConfirmedFixupSupersessions(t *testing.T) {
+	stage, other := uuid.New(), uuid.New()
+	entry := func(seq int64, sid uuid.UUID, payload any) *audit.Entry {
+		raw, _ := json.Marshal(payload)
+		return &audit.Entry{Sequence: seq, StageID: &sid, Payload: raw}
+	}
+	marker := func(seq, trigger int64) *audit.Entry {
+		return entry(seq, stage, stageFixupSupersededPayload{TriggerSequence: trigger, SupersededBy: fixupSupersededByVerifyRerun})
+	}
+	v := func(seq int64, sid uuid.UUID, supersedes int64) *audit.Entry {
+		return entry(seq, sid, mergeCandidateVerifyTrigger{Branch: "b", SupersedesFixupTriggerSequence: supersedes})
+	}
+	cases := []struct {
+		name     string
+		markers  []*audit.Entry
+		triggers []*audit.Entry
+		want     bool
+	}{
+		{"confirmed", []*audit.Entry{marker(10, 5)}, []*audit.Entry{v(12, stage, 5)}, true},
+		{"inert_marker", []*audit.Entry{marker(10, 5)}, nil, false},
+		{"v_names_other_trigger", []*audit.Entry{marker(10, 5)}, []*audit.Entry{v(12, stage, 6)}, false},
+		{"v_without_field", []*audit.Entry{marker(10, 5)}, []*audit.Entry{v(12, stage, 0)}, false},
+		{"v_before_marker", []*audit.Entry{marker(10, 5)}, []*audit.Entry{v(9, stage, 5)}, false},
+		{"v_other_stage", []*audit.Entry{marker(10, 5)}, []*audit.Entry{v(12, other, 5)}, false},
+		{"undecodable_marker", []*audit.Entry{{Sequence: 10, StageID: &stage, Payload: []byte("{")}}, []*audit.Entry{v(12, stage, 5)}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := confirmedFixupSupersessions(c.markers, c.triggers)
+			seq, ok := got[fixupSupersessionKey{StageID: stage, TriggerSequence: 5}]
+			if ok != c.want || (ok && seq != 10) {
+				t.Fatalf("confirmed = %v (seq %d), want %v", ok, seq, c.want)
+			}
+		})
+	}
+}
+
+// rerunReReadRepo answers GetStage for one stage with a copy at a different
+// state, so the re-read under the fence diverges from the caller's view (the
+// TOCTOU the fence exists for) while ListStages keeps the original.
+type rerunReReadRepo struct {
+	*promptRunRepo
+	stageID uuid.UUID
+	state   run.StageState
+}
+
+func (r *rerunReReadRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	st, err := r.promptRunRepo.GetStage(ctx, id)
+	if err != nil || id != r.stageID {
+		return st, err
+	}
+	cp := *st
+	cp.State = r.state
+	return &cp, nil
+}
+
+// TestRerunQueuedFixup_ReReadUnderFence: the verb's caller saw the stage
+// pending, but the re-read under the fence finds it running (a dispatch
+// landed first). Both the verb's predicate (a) and begin's arm refuse with
+// nothing written. MECHANISM (CF): dropping the state check in
+// queuedMergeCandidateFixupFor (verb) or the arm's re-read state check lands
+// a row. The verb's own switch read the stale pending, so the predicate's
+// check is the only refusal in the path.
+func TestRerunQueuedFixup_ReReadUnderFence(t *testing.T) {
+	t.Run("verb", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl, _, _ := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		sd.s.cfg.RunRepo = &rerunReReadRepo{promptRunRepo: sd.rr, stageID: impl.ID, state: run.StageStateRunning}
+		before := chainLen(sd.au)
+		resp := postFixupRerun(t, sd)
+		if delta := chainDelta(sd.au, before); len(delta) != 1 {
+			t.Fatalf("audit-chain delta = %v, want exactly [branch_rebased]", deltaCategories(delta))
+		}
+		if !strings.Contains(resp.MergeCandidateVerifyRefusal, `state "running"`) {
+			t.Errorf("refusal = %q, want the re-read state named", resp.MergeCandidateVerifyRefusal)
+		}
+	})
+	t.Run("begin_arm", func(t *testing.T) {
+		sd := seedMCVRebase(t, upToDateRebaseStub())
+		impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+		seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+		sd.s.cfg.RunRepo = &rerunReReadRepo{promptRunRepo: sd.rr, stageID: impl.ID, state: run.StageStateRunning}
+		before := chainLen(sd.au)
+		_, refusal := startRerunHead(context.Background(), sd)
+		if refusal == nil || !strings.Contains(refusal.Reason, "left its queued state") {
+			t.Fatalf("refusal = %+v, want the arm's re-read refusal", refusal)
+		}
+		if n := len(chainDelta(sd.au, before)); n != 0 {
+			t.Errorf("rows appended = %d, want 0", n)
+		}
+	})
+}
+
+// TestBeginSupersededFixupArm_RefusesAlreadyConverted: a conversion trigger
+// already follows the marker (its pass was consumed by a not_executed verdict
+// without restoring the gate), so the arm refuses naming the conversion.
+// MECHANISM (CF): dropping the already-converted check falls to the
+// disqualifying scan, whose INERT wording replaces it (RED on the text).
+func TestBeginSupersededFixupArm_RefusesAlreadyConverted(t *testing.T) {
+	sd := seedMCVRebase(t, upToDateRebaseStub())
+	impl, tSeq, fSeq := seedQueuedD6Fixup(t, sd, run.StageStatePending)
+	seedMarkerAndVoid(t, sd, impl, tSeq, fSeq)
+	seedMCVRow(sd, &impl.ID, CategoryStageMergeCandidateVerifyTriggered, mergeCandidateVerifyTrigger{
+		Branch: rebaseBranchName, BaseRef: rebaseBaseRef, ExpectedHeadSHA: rebaseNewHeadSHA, Cause: mergeCandidateCauseBaseAdvance,
+		VerifyCommand: mcvCommand, PriorState: string(run.StageStateSucceeded), SupersedesFixupTriggerSequence: tSeq})
+	vSeq := int64(chainLen(sd.au))
+	seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: rebaseNewHeadSHA, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand,
+		Result: mergeCandidateResultNotExecuted, TriggerSequence: vSeq, OutputUntrusted: true})
+	before := chainLen(sd.au)
+	_, refusal := startRerunHead(context.Background(), sd)
+	if refusal == nil || !strings.Contains(refusal.Reason, "already converted") {
+		t.Fatalf("refusal = %+v, want the existing conversion named", refusal)
+	}
+	if n := len(chainDelta(sd.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
 	}
 }
