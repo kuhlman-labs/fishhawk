@@ -187,12 +187,14 @@ does not apply. `--spec-only` runs none of them.
   from the CI pin (`deploy/gate-image/Dockerfile`'s `ARG GOLANGCI_LINT_VERSION`) or
   is not on PATH: in-loop lint can pass while CI's gofmt/lint goes red. Remedy:
   install the pinned version, or run `scripts/test lint --in-gate-image`. An
-  external repo without that Dockerfile has no pin site, so the rung is skipped.
+  external repo without that Dockerfile has no pin site, so the rung is skipped;
+  so is a pin that is not `vX.Y[.Z]`, which is never echoed into the remedy
+  command (a freshly cloned checkout is untrusted input).
 - **go toolchain pin** — warns when the Go that `go version` selects in the
   checkout differs in MAJOR.MINOR from the `go.work` (else `go.mod`) directive. A
   newer Go can red-line verify on clean main while CI stays green; remedy
   `go env -w GOTOOLCHAIN=go<version>` (the gate image's `GO_VERSION` when the repo
-  has one). An older Go: upgrade, or unset `GOTOOLCHAIN=local`.
+  has a version-shaped one, else the directive). An older Go: upgrade, or unset `GOTOOLCHAIN=local`.
 - **host load** — warns when the 1-minute load average exceeds 4.0 x the core
   count (the runner's `host_overloaded` threshold), naming the top CPU consumers.
   A verify run then fails on timeouts in packages the diff never touched: stop the

