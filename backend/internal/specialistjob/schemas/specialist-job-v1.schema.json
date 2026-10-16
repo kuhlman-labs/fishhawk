@@ -473,9 +473,13 @@
           "enum": [
             "git_log",
             "ls_files",
-            "go_list"
+            "go_list",
+            "host.memory",
+            "host.top_memory",
+            "host.load",
+            "host.containers"
           ],
-          "description": "A closed command id; the runner maps it to a fixed argv. No free-form shell."
+          "description": "A closed command id; the runner maps it to a fixed argv. No free-form shell. The host.* ids are read-only, argument-free host diagnostics (ADR-089 D9: observation only, never remediation); they read no repository tree, so the runner never clones for them."
         },
         "args": {
           "type": "object",
@@ -586,6 +590,33 @@
                     }
                   }
                 }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "enum": [
+                  "host.memory",
+                  "host.top_memory",
+                  "host.load",
+                  "host.containers"
+                ]
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "args": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+                "description": "A host.* command takes NO arguments: no repository- or host-specific value can reach its argv."
               }
             }
           }
@@ -1237,7 +1268,11 @@
           "enum": [
             "git_log",
             "ls_files",
-            "go_list"
+            "go_list",
+            "host.memory",
+            "host.top_memory",
+            "host.load",
+            "host.containers"
           ]
         },
         "lines": {
@@ -1308,7 +1343,8 @@
             "execution_error",
             "timeout",
             "probe_error",
-            "inputs_invalid"
+            "inputs_invalid",
+            "not_applicable"
           ],
           "description": "Closed reason vocabulary. Required when evidence is absent."
         },
@@ -1526,7 +1562,8 @@
             "execution_error",
             "timeout",
             "probe_error",
-            "inputs_invalid"
+            "inputs_invalid",
+            "not_applicable"
           ]
         },
         "evidence": {

@@ -260,12 +260,29 @@ type FaninInputs struct {
 	Packages []string     `json:"packages"`
 }
 
-// Inventory command ids.
+// Inventory command ids. The host.* ids (#4330) are read-only, argument-free
+// host diagnostics: the schema closes their args to the empty object, and the
+// runner executes them from a per-OS table without cloning the subject.
 const (
 	InventoryGitLog  = "git_log"
 	InventoryLsFiles = "ls_files"
 	InventoryGoList  = "go_list"
+
+	InventoryHostMemory     = "host.memory"
+	InventoryHostTopMemory  = "host.top_memory"
+	InventoryHostLoad       = "host.load"
+	InventoryHostContainers = "host.containers"
 )
+
+// InventoryCommands is the closed inventory command set, in schema order. The
+// schema's inputs-inventory and evidence-inventory command enums must equal it
+// (TestInventoryCommands_MatchSchemaEnums), so the schema layer refuses every
+// other id and a host.* id carrying any args member; the path and package
+// rules in checkRequestSemantics have nothing to check for a host.* id.
+var InventoryCommands = []string{
+	InventoryGitLog, InventoryLsFiles, InventoryGoList,
+	InventoryHostMemory, InventoryHostTopMemory, InventoryHostLoad, InventoryHostContainers,
+}
 
 // InventoryArgs is the union of the per-command args objects; the schema's
 // if/then arms admit only the members of the selected command.

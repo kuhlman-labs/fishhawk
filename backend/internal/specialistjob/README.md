@@ -1,8 +1,8 @@
 # specialistjob
 
 ADR-097 D2/D6 specialist jobs (E85.9 / #4300): bounded, typed evidence work a
-seat requests and a runner executes in a fresh scratch clone, recorded on the
-audit chain. Contract: `docs/spec/specialist-job-v1.md` (canonical schema
+seat requests and a runner executes in a fresh scratch clone (the `host.*`
+inventory ids, which read no tree, excepted), recorded on the audit chain. Contract: `docs/spec/specialist-job-v1.md` (canonical schema
 `docs/spec/specialist-job-v1.schema.json`, mirrored into `schemas/` by
 `scripts/sync-schemas`).
 
@@ -10,7 +10,7 @@ audit chain. Contract: `docs/spec/specialist-job-v1.md` (canonical schema
 
 | File | Owns |
 |---|---|
-| `specialistjob.go` | Kinds, verdicts, seats; `ParseRequest` / `ParseCompletion` (duplicate-member walk → schema → strict decode → Go semantic rules); `ValidateResult`; `DecodeEvidence`; the deterministic `RenderDraft`. |
+| `specialistjob.go` | Kinds, verdicts, seats; the closed `InventoryCommands` set; `ParseRequest` / `ParseCompletion` (duplicate-member walk → schema → strict decode → Go semantic rules); `ValidateResult`; `DecodeEvidence`; the deterministic `RenderDraft`. |
 | `store.go` | The pgx store over `specialist_jobs` (migrations 0103, 0104): `Create`, `CreateCompleted`, `Get`, `AdmitJob` (mints / refreshes / clears the attestation key), `Complete` (verifies a signed result, records provenance, consumes the key), `ListCompletedForRun`. |
 | `attestation.go` | Result attestation (E85.15 / #4363): `AttestScope`, the provenance values, `AttestationTTL`, `ResultMessage`, `BlockingEligible`, `VerifyResultAttestation` and its refusal reasons. |
 | `backend/internal/server/specialist_job.go` | The four `/v0/specialist-jobs` handlers, `attesterFor`, `requireSpecialistJobScope`. |
@@ -152,7 +152,34 @@ the job's key verifies when posted under either, and either's same-nonce
 heartbeat slides the key's expiry. Issue ONE token per host subject
 (`specialist-runner/<host>`), and revoke a host's token before re-issuing it.
 
+## Host inventory commands (#4330)
+
+`inventory` accepts four read-only, argument-free host ids beside `git_log` /
+`ls_files` / `go_list`: `host.memory`, `host.top_memory`, `host.load`,
+`host.containers` (`InventoryHost*`). They are the diagnostics the first
+officer's host-health duty requests; they observe and never remediate
+(ADR-089 D9). The schema closes their `args` to the empty object, so a host id
+carrying any member, and every id outside `InventoryCommands` (`host.shell`,
+`sh`, `git`, a lookalike), is a `400` schema error at request time. The
+completion and result `reason` enums gain `not_applicable` (the executing
+runner's OS has no host table). `TestInventoryCommands_MatchSchemaEnums` pins
+both command enums to `InventoryCommands` and both reason enums to each other;
+`TestParseCompletion_HostInventoryAndNotApplicable` pins that a `host.memory`
+evidence completion and a `not_applicable` one parse. The per-OS read set,
+the no-clone routing and the bounding live runner-side (`runner/README.md` §
+"Specialist jobs"; table: `docs/spec/specialist-job-v1.md` § "Host inventory
+commands").
+
 ## Residuals
+
+- **Host inventory evidence names host processes.** A `host.top_memory` or
+  `host.containers` completion carries process / container names and pids of
+  the executing host onto the job's `specialist_job_completed` row. The runner
+  strips control and format characters, cuts each parsed name to 64 bytes and
+  bounds every line (2000 lines of ≤1000 chars, redacted); the names are
+  evidence data, not instructions. On a podman-only host `host.containers` is
+  `inconclusive` (`execution_error`): only a safe local docker endpoint is
+  read.
 
 - **Host trust.** Attestation proves possession of a credential a plain
   `write:stages` bearer cannot mint over the API. It does NOT isolate the
