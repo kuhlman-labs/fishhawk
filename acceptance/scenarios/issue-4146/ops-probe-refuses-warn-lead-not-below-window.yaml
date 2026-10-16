@@ -1,0 +1,14 @@
+id: scenario:issue-4146/ops-probe-refuses-warn-lead-not-below-window
+statement: '`fishhawkd ops-probe --ops-monitor-amendment-window 15m --ops-monitor-amendment-warn-lead 15m` exits 2 and its stderr names `--ops-monitor-amendment-warn-lead`, because the warning lead must be at least 0 and below the decision window.'
+verify_hint: 'CLI: run the command, read the exit code (2) and stderr containing `--ops-monitor-amendment-warn-lead`. Hermetic harness: TestResolveOpsMonitorConfig in backend/cmd/fishhawkd/ops_monitor_test.go.'
+steps: 'Posture B: built fishhawkd from the sanctioned checkout. Ran fishhawkd ops-probe --ops-monitor-amendment-window 15m --ops-monitor-amendment-warn-lead 15m; also lead 20m and lead 0 under --deployment remote. Ran TestResolveOpsMonitorConfig (pass).'
+assertions:
+    expected: exit 2, stderr names --ops-monitor-amendment-warn-lead
+    observed_at_record: exit 2; stderr '--ops-monitor-amendment-warn-lead must be >= 0 and below the amendment window (15m0s), got 15m0s'. Lead 20m exits 2; lead 0 is accepted (exit 0).
+    repro_handle: fishhawkd ops-probe --ops-monitor-amendment-window 15m --ops-monitor-amendment-warn-lead 15m
+origin:
+    issue: 4146
+    pr: 4490
+    run_id: 8f9207d1-3e6b-4034-9dc8-6b3872513127
+    head_sha: 9e447d2c750b4358eba4a6d321c195d4beb25a26
+    recorded_at: 2026-10-16T12:11:35Z

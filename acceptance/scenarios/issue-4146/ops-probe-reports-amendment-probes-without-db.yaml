@@ -1,0 +1,14 @@
+id: scenario:issue-4146/ops-probe-reports-amendment-probes-without-db
+statement: Running `fishhawkd ops-probe --json` with no database URL prints an `amendment_window` and an `amendment_terminal` result, each status `unknown` with reason `no database configured`, under every deployment (local, kubernetes, remote). They are never `not_applicable`, because the probes are not host-local. Under deployment kubernetes or remote, where every host probe is not_applicable, the command exits 0.
+verify_hint: 'CLI: run `fishhawkd ops-probe --deployment remote --json` with FISHHAWKD_DATABASE_URL unset; read stdout JSON for probe amendment_window and amendment_terminal (status unknown, reason `no database configured`) and the exit code 0. Hermetic harness: TestOpsProbe_NonLocalAllHostProbesNotApplicable in backend/cmd/fishhawkd/ops_monitor_test.go.'
+steps: 'Posture B: built fishhawkd from the sanctioned checkout (HEAD 9e447d2c = preview git_sha) with cd backend && go build -o /tmp/fh4146/fishhawkd ./cmd/fishhawkd. With FISHHAWKD_DATABASE_URL unset, ran fishhawkd ops-probe --deployment {local,kubernetes,remote} --json and recorded the exit codes. Ran the hermetic tests TestOpsProbe_NonLocalAllHostProbesNotApplicable and TestOpsProbe_DiskFailingExitsOne (pass).'
+assertions:
+    expected: both amendment probes unknown/'no database configured' under every deployment; exit 0 under kubernetes/remote
+    observed_at_record: Every deployment shows amendment_window and amendment_terminal as unknown with reason 'no database configured' (never not_applicable). kubernetes and remote exit 0. local exits 1 only because this host's own gocache and docker probes fail.
+    repro_handle: env -u FISHHAWKD_DATABASE_URL fishhawkd ops-probe --deployment remote --json; echo $?
+origin:
+    issue: 4146
+    pr: 4490
+    run_id: 8f9207d1-3e6b-4034-9dc8-6b3872513127
+    head_sha: 9e447d2c750b4358eba4a6d321c195d4beb25a26
+    recorded_at: 2026-10-16T12:11:35Z
