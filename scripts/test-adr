@@ -125,6 +125,21 @@
 #   'Decisions', 'decision '} — 299,593 strings — found 0 match differences
 #   between the E78.2 form, the issue's \s+ form and the committed form, so the
 #   rewrite changes cost, not the set of Decision headings.
+#   E78.13 / #4471 amendment relation (same restore discipline):
+#   CF38 C-ref limited back to the supersession keys → h37 and h38 RED.
+#   CF39 C-amend-recip-fwd given the supersession shape (skip a partner that
+#        lacks the key) → h39 RED: its partner has NO amended_by line, so the
+#        absent-reads-[] rule is the only thing that reports it.
+#   CF40 the same mutation on C-amend-recip-rev only → h40 RED.
+#   CF41 C-amend-exclusive made a no-op → h41 RED (both reciprocal pairs are
+#        consistent, so nothing else fires and the case exits 0).
+#   CF42 `amends` dropped from LIST_KEYS → h42 RED (the scalar is then
+#        accepted and C-ref walks its characters), plus h37/h39/h41/h43/h45/
+#        h46, whose list-valued amends turn into C-grammar violations.
+#   CF43 the stale loop skips the optional fields → h43 RED (exit 0).
+#   CF44 the writer always writes the optional keys → h46 RED (ADR-001 then
+#        carries empty amends / amended_by).
+#   CF45 the index key-set check accepts any extra key → h44 RED (exit 0).
 #   Not counterfactual-run: the unterminated-front-matter branch (deleting it
 #   crashes on close=None rather than greening — h16a still RED via no tag),
 #   the index not-JSON and entry-shape branches (h30a/h30c assert them), and
@@ -658,6 +673,125 @@ subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' \
 $h36b_heading"
 run_check_bounded "$d"
 expect_ok "h36b: 100,000-space heading is checked inside the 5s watchdog" "2 record(s) consistent"
+
+# --- h37-h46: the amends / amended_by relation (E78.13 / #4471) ------------------
+# The keys are OPTIONAL: absent reads []. amend_fixture builds the base fixture
+# plus gamma (ADR-003) declaring `amends: ["ADR-002"]` and beta declaring
+# `amended_by: ["ADR-003"]`, with the hand-written index carrying the keys ONLY
+# on those two entries (alpha's entry has neither, so the omit-empty shape is
+# what h45 accepts).
+amend_fixture() {
+  local d
+  d="$(fixture "$1")"
+  add_gamma "$d" "ADR-003"
+  subst "$d/003-gamma.md" $'superseded_by: []\napplies_to: []' $'superseded_by: []\namends: ["ADR-002"]\napplies_to: []'
+  subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\namended_by: ["ADR-003"]\n'
+  subst "$d/index.json" '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}' \
+    '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "amends": ["ADR-002"], "applies_to": []}'
+  subst "$d/index.json" '"superseded_by": [], "applies_to": ["infra/terraform/**"]}' \
+    '"superseded_by": [], "amended_by": ["ADR-003"], "applies_to": ["infra/terraform/**"]}'
+  printf '%s' "$d"
+}
+
+# h37: a dangling amends id (C-ref). Reciprocity skips an unresolvable target,
+# and the index entry carries the same id, so only C-ref can fire.
+d="$(fixture h37)"; add_gamma "$d" "ADR-003"
+subst "$d/003-gamma.md" $'superseded_by: []\napplies_to: []' $'superseded_by: []\namends: ["ADR-099"]\napplies_to: []'
+subst "$d/index.json" '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}' \
+  '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "amends": ["ADR-099"], "applies_to": []}'
+run_check "$d"; expect_only "h37: dangling amends reference" C-ref "003-gamma.md" "'amends' names 'ADR-099'"
+
+# h38: a self amended_by id (C-ref self half). Reciprocity skips a self target.
+d="$(fixture h38)"; add_gamma "$d" "ADR-003"
+subst "$d/003-gamma.md" $'superseded_by: []\napplies_to: []' $'superseded_by: []\namended_by: ["ADR-003"]\napplies_to: []'
+subst "$d/index.json" '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}' \
+  '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "amended_by": ["ADR-003"], "applies_to": []}'
+run_check "$d"; expect_only "h38: self-referencing amended_by" C-ref "003-gamma.md" "'amended_by' names the record itself"
+
+# h39: one-way amends, forward (C-amend-recip-fwd). The PARTNER (beta) has NO
+# amended_by line at all, so this case isolates the absent-key-reads-[] rule:
+# a check that skipped a partner missing the key (the supersession shape)
+# would exit 0 here.
+d="$(fixture h39)"; add_gamma "$d" "ADR-003"
+subst "$d/003-gamma.md" $'superseded_by: []\napplies_to: []' $'superseded_by: []\namends: ["ADR-002"]\napplies_to: []'
+subst "$d/index.json" '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}' \
+  '"path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "amends": ["ADR-002"], "applies_to": []}'
+run_check "$d"; expect_only "h39: one-way amends, partner has no amended_by key" C-amend-recip-fwd "003-gamma.md" "'amends' names 'ADR-002'" "amended_by"
+
+# h40: one-way amended_by, reverse (C-amend-recip-rev). The partner (gamma)
+# has NO amends line at all.
+d="$(fixture h40)"; add_gamma "$d" "ADR-003"
+subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\namended_by: ["ADR-003"]\n'
+subst "$d/index.json" '"superseded_by": [], "applies_to": ["infra/terraform/**"]}' \
+  '"superseded_by": [], "amended_by": ["ADR-003"], "applies_to": ["infra/terraform/**"]}'
+run_check "$d"; expect_only "h40: one-way amended_by, partner has no amends key" C-amend-recip-rev "002-beta.md" "'amended_by' names 'ADR-003'"
+
+# h41: the same id in a supersession AND an amendment key (C-amend-exclusive).
+# Beta already supersedes ADR-001; it now ALSO amends it, and alpha lists beta
+# in both superseded_by and amended_by. Both reciprocal pairs are consistent
+# and every id resolves, so only exclusivity can fire — once per pair.
+d="$(fixture h41)"
+subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\namends: ["ADR-001"]\n'
+subst "$d/001-alpha.md" $'superseded_by: ["ADR-002"]\n' $'superseded_by: ["ADR-002"]\namended_by: ["ADR-002"]\n'
+subst "$d/index.json" '"superseded_by": [], "applies_to": ["infra/terraform/**"]}' \
+  '"superseded_by": [], "amends": ["ADR-001"], "applies_to": ["infra/terraform/**"]}'
+subst "$d/index.json" '"superseded_by": ["ADR-002"], "applies_to": []}' \
+  '"superseded_by": ["ADR-002"], "amended_by": ["ADR-002"], "applies_to": []}'
+run_check "$d"; expect_only "h41: supersedes and amends the same ADR" C-amend-exclusive \
+  "002-beta.md: [C-amend-exclusive] 'ADR-001' is named in both 'supersedes' and 'amends'" \
+  "001-alpha.md: [C-amend-exclusive] 'ADR-002' is named in both 'superseded_by' and 'amended_by'"
+
+# h42: a scalar amends (C-grammar list-key half covers the optional keys).
+d="$(fixture h42)"; add_gamma "$d" "ADR-003"
+subst "$d/003-gamma.md" $'superseded_by: []\napplies_to: []' $'superseded_by: []\namends: "ADR-002"\napplies_to: []'
+run_check "$d"; expect_only "h42: amends given a scalar" C-grammar "003-gamma.md" "'amends': expected a list"
+
+# h43: the record carries amends, the hand-written index entry omits it
+# (C-index-stale on an OPTIONAL field: absent reads [] on the index side too).
+d="$(amend_fixture h43)"
+subst "$d/index.json" '"superseded_by": [], "amends": ["ADR-002"], "applies_to": []}' '"superseded_by": [], "applies_to": []}'
+run_check "$d"; expect_only "h43: index entry omits a record's amends" C-index-stale "003-gamma.md" "'amends'"
+
+# h44: an index entry carrying an unknown key beside the optional ones
+# (C-index key-set check). A malformed entry is unkeyed, so its record ALSO
+# reports C-index-missing (the h30c shape).
+d="$(amend_fixture h44)"
+subst "$d/index.json" '"amends": ["ADR-002"], "applies_to": []}' '"amends": ["ADR-002"], "owner": "someone", "applies_to": []}'
+run_check "$d"; expect_has "h44: index entry with an unknown key beside amends" C-index "plus optionally amends, amended_by"
+
+# h45: a valid reciprocal amendment, index keys only on the two linked entries.
+d="$(amend_fixture h45)"; run_check "$d"
+expect_ok "h45: valid reciprocal amendment with omit-empty index passes" "3 record(s) consistent"
+
+# h46: --write-index writes amends / amended_by on the linked entries ONLY.
+d="$(amend_fixture h46)"
+subst "$d/index.json" '"path": "docs/adr/002-beta.md", "status": "accepted"' '"path": "docs/adr/002-beta.md", "status": "proposed"'
+run_check --write-index "$d"
+if [ "$status" -ne 0 ]; then
+  fail "h46: --write-index exited $status (expected 0); output: $out"
+else
+  h46out="$(python3 -I - "$d/index.json" <<'PY'
+import json, sys
+recs = {r["id"]: r for r in json.load(open(sys.argv[1], encoding="utf-8"))["records"]}
+problems = []
+if recs["ADR-003"].get("amends") != ["ADR-002"]:
+    problems.append("ADR-003 amends = %r" % recs["ADR-003"].get("amends"))
+if recs["ADR-002"].get("amended_by") != ["ADR-003"]:
+    problems.append("ADR-002 amended_by = %r" % recs["ADR-002"].get("amended_by"))
+for rid, key in (("ADR-001", "amends"), ("ADR-001", "amended_by"),
+                 ("ADR-002", "amends"), ("ADR-003", "amended_by")):
+    if key in recs[rid]:
+        problems.append("%s carries an empty-or-unlinked '%s' key" % (rid, key))
+print("; ".join(problems) if problems else "OK")
+PY
+)"
+  if [ "$h46out" != "OK" ]; then
+    fail "h46: written index shape wrong: $h46out"
+  else
+    run_check "$d"
+    expect_ok "h46: --write-index writes the optional keys only where non-empty" "3 record(s) consistent"
+  fi
+fi
 
 echo
 echo "scripts/test-adr: $PASS passed, $FAIL failed"

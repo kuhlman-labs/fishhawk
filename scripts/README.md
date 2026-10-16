@@ -3404,18 +3404,30 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
   a real `YYYY-MM-DD` date.
 - **C-required / C-status-present** — `id`, `title`, `status`, `issue`,
   `supersedes`, `superseded_by`, `applies_to` are present (lists even when
-  empty). A missing `status` reports as C-status-present.
+  empty). A missing `status` reports as C-status-present. `amends` and
+  `amended_by` (E78.13 / #4471) are OPTIONAL list keys: absent means `[]`, so
+  only a record that states an amendment carries them; C-grammar still
+  requires a list when present.
 - **C-file** — every non-README `*.md` is named `NNN-slug.md`; anything else
   is a stray file.
 - **C-id** — `id` is `ADR-NNN` and equals `ADR-` + the filename prefix.
 - **C-status-set** — a PRESENT `status` is in
   `{proposed, accepted, rejected, superseded, unknown}`.
 - **C-unique** — ids are unique across records.
-- **C-ref** — every `supersedes` / `superseded_by` id names an existing record
-  other than the record itself.
+- **C-ref** — every `supersedes` / `superseded_by` / `amends` /
+  `amended_by` id names an existing record other than the record itself.
 - **C-recip-fwd / C-recip-rev** — `A.supersedes ∋ B ⇔ B.superseded_by ∋ A`,
   one branch per direction; both skip targets C-ref rejects, so C-ref is
   isolated.
+- **C-amend-recip-fwd / C-amend-recip-rev** — `A.amends ∋ B ⇔ B.amended_by ∋
+  A`, one branch per direction, skipping targets C-ref rejects. Unlike the
+  supersession pair (which skips a partner missing its REQUIRED key, already a
+  C-required violation), a partner WITHOUT the optional key reads as `[]` and
+  is reported.
+- **C-amend-exclusive** — one record names the same id in `supersedes` AND
+  `amends`, or in `superseded_by` AND `amended_by`. A record cannot both
+  supersede and amend the same ADR; a stated supersession, even partial,
+  takes precedence (`docs/adr/README.md` § "Field semantics").
 - **C-superseded** — `status: superseded` requires a non-empty `superseded_by`.
 - **C-accepted** — `status: accepted` requires SOME section whose heading
   matches `^#{1,6}\s(?:[^/\n]*/)*\s*Decision\b` (case-insensitive: `Decision`
@@ -3455,11 +3467,14 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
   tree match.
 - **C-index / C-index-missing / C-index-extra / C-index-stale** — `index.json`
   parses as `{"schema_version": "adr-index-v1", "records": [...]}` with
-  well-formed, path-unique entries; then, keyed by PATH (never id): a record
-  with no entry, an entry naming no record file, an entry field disagreeing
-  with the record's front matter (named). A missing `index.json` while records
-  exist is C-index-missing. Comparison is semantic, list order significant;
-  a field the record fails to declare is left to C-required / C-grammar.
+  well-formed, path-unique entries (exactly the required fields plus any
+  subset of the optional `amends` / `amended_by`; any other key is refused);
+  then, keyed by PATH (never id): a record with no entry, an entry naming no
+  record file, an entry field disagreeing with the record's front matter
+  (named). A missing `index.json` while records exist is C-index-missing.
+  Comparison is semantic, list order significant; a required field the record
+  fails to declare is left to C-required / C-grammar, and an optional field
+  reads absent = `[]` on BOTH sides.
 
 ### Exit codes, fail-opens, `--write-index`
 
@@ -3473,6 +3488,11 @@ from 1, so the gate never reports a clean tree it did not read.
 violation it refuses with exit 1 and writes NOTHING; otherwise it writes
 `json.dumps(obj, indent=2, ensure_ascii=False)` + newline, records sorted by id,
 through a temp file + rename (a failed write exits 2 and removes the temp).
+The optional `amends` / `amended_by` fields are written only when non-empty,
+between `superseded_by` and `applies_to` (omit-empty): always-present keys
+would add ~4 KB and push the index past its 32,768-byte injection cap, which
+`backend/internal/decisionrecord`'s `TestShippedIndex_WithinInjectionCap`
+asserts.
 
 ### Testing
 
@@ -3510,7 +3530,17 @@ pattern changed, not necessarily `DECISION_RE`. The header records every
 counterfactual run against the gate (CF28–CF35 cover the E78.2 hardening: each
 bounded-stem condition, the placeholder regex and each of its alternatives, and
 the Decision-heading widening in both directions; CF36/CF37 the two regex
-ambiguities h36/h36b isolate).
+ambiguities h36/h36b isolate; CF38–CF45 the E78.13 amendment relation).
+The amendment cases (E78.13 / #4471): h37 dangling `amends` and h38 self
+`amended_by` (C-ref); h39/h40 one-way `amends` / `amended_by` where the
+PARTNER has no such line at all (C-amend-recip-fwd/rev, isolating
+absent-reads-`[]`); h41 the same id in `supersedes` + `amends` and in
+`superseded_by` + `amended_by`, reciprocals consistent (C-amend-exclusive);
+h42 a scalar `amends` (C-grammar); h43 the index entry omits a record's
+`amends` (C-index-stale); h44 an unknown index key beside the optional ones
+(C-index); h45 a valid reciprocal amendment with the keys only on the two
+linked entries → 0; h46 `--write-index` writes the keys on the linked entries
+and on no other.
 
 `scripts/test verify` runs BOTH: `test-adr` in `_verify_gate_harnesses`, and
 `check-adr` itself via `_verify_adr_records` (immediately after

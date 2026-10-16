@@ -4,8 +4,9 @@ title: "Review-coverage hold for decomposed parents, plus an operator re-run ver
 status: accepted
 date: 2026-10-10
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4287
-supersedes: ["ADR-091"]
+supersedes: []
 superseded_by: []
+amends: ["ADR-091"]
 applies_to: []
 ---
 
