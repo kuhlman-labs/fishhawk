@@ -933,3 +933,35 @@ Classifies every `pending`/`running` run with NO decomposition parent whose last
 - **Exit codes:** `0` success (including the dry run; delegated and skipped runs never fail it), `1` a connect or scan failure, an `--apply` refusal (probe failure / unattributed runner), or any run that failed to transition or transitioned with a cascade/append error, `2` a usage error (including `--days` < 1).
 
 Core: `backend/internal/stalesweep` (`Find` + `Apply`). Tests: `sweep_stale_runs_test.go` (`TestSweepStaleRuns_DryRunThenApply` end to end over pgtest).
+
+## Ops monitor: `serve --enable-ops-monitor` and `ops-probe` (E85.1 / #4142)
+
+Host and process health probes: data-volume free space, sampled GOCACHE size, 1-minute load vs cores, Docker reachability, Postgres reachability (both with an EIO indicator), and `fishhawk-runner` processes whose stage or run is terminal. Probe semantics, the fail-safe sweep, the quiet-window dedup and its residuals, and the comment surface: `backend/internal/opsmonitor/README.md`. Wiring: `ops_monitor.go`.
+
+**Serve flags.** `--enable-ops-monitor` (`FISHHAWKD_ENABLE_OPS_MONITOR`, default off) starts the ticker on its own goroutine after the server is constructed; a panic in it is recovered into a WARN, and nothing it does logs at ERROR, so it can never block or crash startup. The shared flags below are validated only when the monitor is enabled, before anything dials a database; an invalid value then fails startup with `invalid ops monitor configuration` (exit 1). Each has a `FISHHAWKD_OPS_MONITOR_*` env fallback (an unparseable env value falls back to the default, like every other `envOr*` knob).
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--ops-monitor-interval` | `FISHHAWKD_OPS_MONITOR_INTERVAL` | `5m` | sweep interval; > 0 |
+| `--ops-monitor-deployment` | `FISHHAWKD_OPS_MONITOR_DEPLOYMENT` | `auto` | `auto\|local\|kubernetes\|remote`; `auto` = `kubernetes` when `KUBERNETES_SERVICE_HOST` is set, else `local`. Under `kubernetes`/`remote` the host-local probes (disk, gocache, load, docker, runners) report `not_applicable` without running; postgres runs everywhere. Pass `remote` on a non-k8s host that does not share the runners' host |
+| `--ops-monitor-quiet-window` | `FISHHAWKD_OPS_MONITOR_QUIET_WINDOW` | `1h` | one audit row + one comment per failing condition+subject per window; > 0 |
+| `--ops-monitor-disk-path` | `FISHHAWKD_OPS_MONITOR_DISK_PATH` | home directory | a path on the data volume; empty reads `unknown` |
+| `--ops-monitor-disk-min-free-gb` | `FISHHAWKD_OPS_MONITOR_DISK_MIN_FREE_GB` | `20` | free-space floor (GiB); > 0 |
+| `--ops-monitor-gocache-dir` | `FISHHAWKD_OPS_MONITOR_GOCACHE_DIR` | empty | cache root; empty resolves `go env GOCACHE` lazily at each probe, never at startup (empty/`off`/error → `unknown`) |
+| `--ops-monitor-gocache-max-gb` | `FISHHAWKD_OPS_MONITOR_GOCACHE_MAX_GB` | `50` | sampled-estimate ceiling (GiB), matching `FISHHAWK_GOCACHE_MAX_GB`; > 0 |
+| `--ops-monitor-load-factor` | `FISHHAWKD_OPS_MONITOR_LOAD_FACTOR` | `4.0` | fails above factor × cores, matching the runner's `hostload` default; > 0 |
+| `--ops-monitor-notify-issue` | `FISHHAWKD_OPS_MONITOR_NOTIFY_ISSUE` | empty | `owner/name#N`; empty = audit-only. Posted through the GitHub App client; with no App configured it WARNs and runs audit-only |
+
+- **The notify issue must be access-controlled.** The comment carries pids, run ids and host metrics (never `Detail`: no host paths or process argv). Point it at a private operator repository's issue.
+- **Postgres and runners use fishhawkd's own pool.** Without `--db` the postgres probe and the runners probe read `unknown` (`no database configured`). The runners probe reads `runs`/`stages`, which are FORCE row-level secured (migration 0057) with no `app.account_id` set here: under a role without `BYPASSRLS`, a tenanted run reads as not-found, so a runner for it is skipped as foreign rather than checked.
+- **Startup line.** `ops monitor started` with `deployment`, `interval`, `quiet_window` and `notify_issue` (whether a notifier is wired).
+
+### `fishhawkd ops-probe`
+
+```sh
+fishhawkd ops-probe [--deployment auto|local|kubernetes|remote] [--db <url>] [--json] [--ops-monitor-* threshold flags]
+```
+
+One dry-run sweep with the same probes and flags as the serve ticker; it writes NOTHING (no audit row, no notification). `--deployment` is an alias of `--ops-monitor-deployment`. `--db` falls back to `FISHHAWKD_DATABASE_URL`; without it postgres and runners read `unknown`. A single sweep cannot confirm an orphaned runner (confirmation needs 2 consecutive sweeps), so `ops-probe` never reports `orphaned_runner`; a runner seen terminal once is counted in the runners result's `detail.pending_confirmation` (`--json`), and the serve ticker is what confirms and reports it. Output: one line per result, `<status> <probe> [condition="…"] [subject="…"] [observed="…"] [threshold="…"] [remedy="…"] [reason="…"]` (empty fields omitted, values quoted), or a JSON array of results with `--json`. Exit codes: `0` nothing failing, `1` any result failing or a `--db` connect failure, `2` a usage error (including an invalid flag value).
+
+Tests: `ops_monitor_test.go` (config table, ticker wiring with every seam failing, the serve wiring through the `newServer`/`serveContext` seams, `ops-probe` end to end through `run`, including a real-Postgres `--db` case).

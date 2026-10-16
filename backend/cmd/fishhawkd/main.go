@@ -13,6 +13,7 @@
 //	fishhawkd precedent-tuning --repo R      replay the divergence threshold over recorded decisions (#3733)
 //	fishhawkd approver-members --spec F      dry-run approvals.members against recorded approvers (#4116)
 //	fishhawkd sweep-stale-runs [--apply]     dry-run / reconcile stale non-terminal top-level runs (#4185)
+//	fishhawkd ops-probe [--json]             dry-run one ops-monitor sweep of host/process health (#4142)
 //	fishhawkd version | --version    print "<Version> (<GitSHA>)" and exit (#4117)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
@@ -72,6 +73,8 @@ func run(args []string, logSink io.Writer) int {
 		return runReconcileOrphanChildren(rest, logSink)
 	case "sweep-stale-runs":
 		return runSweepStaleRuns(rest, logSink)
+	case "ops-probe":
+		return runOpsProbe(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
 	case "account":
@@ -107,7 +110,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members|reconcile-orphan-children|sweep-stale-runs|version] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index|precedent-tuning|approver-members|reconcile-orphan-children|sweep-stale-runs|ops-probe|version] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -131,6 +134,7 @@ func printUsage(w io.Writer) {
 		"  approver-members         Dry-run approvals.members: evaluate recorded approvers against a spec's members gates; exits 1 if any human would be refused (#4116).",
 		"  reconcile-orphan-children  Dry-run (default) or --apply: cancel non-terminal decomposition children of cancelled/succeeded parents (#4186).",
 		"  sweep-stale-runs           Dry-run (default) or --apply: reconcile stale (--days, default 14) non-terminal top-level runs (#4185).",
+		"  ops-probe                  Dry-run one ops-monitor sweep (disk, gocache, load, docker, postgres, runners); writes nothing; exits 1 if any probe is failing (#4142).",
 		"  version | --version      Print the build version and git SHA, \"<Version> (<GitSHA>)\", and exit.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
