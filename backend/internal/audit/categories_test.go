@@ -2,6 +2,7 @@ package audit
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -71,8 +72,11 @@ func TestIsKnownCategory(t *testing.T) {
 // "pending"→"requested" (= 8). Both are correct scope_amendment_* siblings
 // and both land in the top suggestions, which is the property that matters:
 // the fail-loud message names the right family. We assert membership among
-// the two nearest rather than distorting the specified metric or dropping a
-// genuine category to force a first-place tie.
+// the three nearest rather than distorting the specified metric or dropping a
+// genuine category to force a first-place tie. Since #4127 registered
+// scope_amendment_lapsed ("pending"→"lapsed" is also nearer than
+// "requested"), the measured top three are [decided lapsed requested]: all
+// three suggestions are scope_amendment_* siblings and requested is among them.
 func TestSuggestCategories_RanksNearest(t *testing.T) {
 	got := SuggestCategories("scope_amendment_pending", 3)
 	if len(got) == 0 {
@@ -81,20 +85,20 @@ func TestSuggestCategories_RanksNearest(t *testing.T) {
 	if len(got) > 3 {
 		t.Errorf("returned %d suggestions, want <= 3", len(got))
 	}
-	// scope_amendment_requested is one of the two nearest scope_amendment_*
-	// siblings — the operator sees it and fixes the wrong-surface string.
-	nearestTwo := got
-	if len(nearestTwo) > 2 {
-		nearestTwo = nearestTwo[:2]
-	}
+	// Every suggestion is a scope_amendment_* sibling, and
+	// scope_amendment_requested is among them — the operator sees it and
+	// fixes the wrong-surface string.
 	found := false
-	for _, c := range nearestTwo {
+	for _, c := range got {
+		if !strings.HasPrefix(c, "scope_amendment_") {
+			t.Errorf("suggestion %q is not a scope_amendment_* sibling; got=%v", c, got)
+		}
 		if c == "scope_amendment_requested" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("scope_amendment_requested not among the two nearest suggestions; got=%v", got)
+		t.Errorf("scope_amendment_requested not among the three nearest suggestions; got=%v", got)
 	}
 }
 
@@ -814,5 +818,14 @@ func TestKnownCategories_MergeSettleMembersRefused(t *testing.T) {
 func TestKnownCategories_StageFixupSuperseded(t *testing.T) {
 	if !IsKnownCategory("stage_fixup_superseded") {
 		t.Fatal("stage_fixup_superseded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_ScopeAmendmentLapsed pins the E83.64 / #4127
+// registration: scopeamendment's lapse writes scope_amendment_lapsed, and a
+// fishhawk_await_audit wait armed on it must not be refused as unknown.
+func TestKnownCategories_ScopeAmendmentLapsed(t *testing.T) {
+	if !IsKnownCategory("scope_amendment_lapsed") {
+		t.Fatal("scope_amendment_lapsed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }

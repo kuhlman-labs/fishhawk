@@ -762,7 +762,7 @@ export interface ApprovalRequest {
  */
 
 export type ScopeAmendmentDecision = 'approve' | 'deny';
-export type ScopeAmendmentStatus = 'pending' | 'approved' | 'denied';
+export type ScopeAmendmentStatus = 'pending' | 'approved' | 'denied' | 'lapsed';
 
 /** One requested path in a mid-stage scope amendment (#961). */
 export interface ScopeAmendmentPath {

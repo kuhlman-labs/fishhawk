@@ -466,6 +466,43 @@ type StageLiveRunCASTransitioner interface {
 	TransitionStageFromLiveRun(ctx context.Context, id uuid.UUID, from, to StageState) (*Stage, error)
 }
 
+// StageTerminalObserver is called with the committed stage after a stage
+// transition lands in a terminal state (succeeded, failed, cancelled,
+// superseded; E83.64 / #4127). It runs POST-COMMIT and synchronously on the
+// caller's goroutine, and it is best-effort: it returns nothing, so it can
+// never fail or roll back the transition, and it owns its own error handling.
+// It may fire again for a same-state re-application, so an observer must be
+// idempotent. fishhawkd wires it to scopeamendment.LapseOnStageTerminal.
+type StageTerminalObserver func(ctx context.Context, s *Stage)
+
+// TerminalRunObserver is the run-level sibling of StageTerminalObserver: called
+// with the committed run after TransitionRun lands in a terminal state
+// (succeeded, failed, cancelled). Same post-commit, synchronous, best-effort,
+// idempotent contract. fishhawkd wires it to scopeamendment.LapseOnRunTerminal.
+type TerminalRunObserver func(ctx context.Context, r *Run)
+
+// StageTerminalObservable is an OPTIONAL capability on the concrete postgres
+// repo (#4127): install (or, with nil, clear) the stage-terminal observer.
+// transitionStage (TransitionStage, TransitionStageFrom,
+// TransitionStageFromAttempt) and SupersedeStrandedStageOnMerge fire it. The
+// transaction-scoped package functions TransitionStageFromTx and
+// TransitionStageFromLiveRunTx do NOT: they commit in the caller's
+// transaction, and their only caller (concurrency.Admit) moves a stage to
+// dispatched. A terminal write outside these paths is repaired by
+// scopeamendment's startup backfill, not instantly.
+//
+// Kept OFF the Repository interface so in-memory fakes keep compiling.
+type StageTerminalObservable interface {
+	SetStageTerminalObserver(StageTerminalObserver)
+}
+
+// TerminalRunObservable is the run-level sibling of StageTerminalObservable:
+// TransitionRun fires the installed TerminalRunObserver. RetryRun and
+// ReviveRunOnReopen do not (they move a run OUT of a terminal state).
+type TerminalRunObservable interface {
+	SetRunTerminalObserver(TerminalRunObserver)
+}
+
 // ConsolidatedPROpenLocker is an OPTIONAL capability on the concrete postgres
 // repo — the cross-process half of the decomposed parent's once-only
 // consolidated-PR open (#4110). The orchestrator's maybeOpenConsolidatedPR runs

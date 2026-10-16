@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,6 +69,59 @@ type pgxQueries interface {
 // from observing the same prior state.
 type postgresRepo struct {
 	pool *pgxpool.Pool
+
+	// stageTerminalObserver / runTerminalObserver are the post-commit
+	// terminal hooks (#4127); nil when none is installed.
+	stageTerminalObserver atomic.Pointer[StageTerminalObserver]
+	runTerminalObserver   atomic.Pointer[TerminalRunObserver]
+}
+
+// Compile-time assertions that the concrete postgres repo carries the
+// terminal-observer capabilities (#4127), so fishhawkd's wiring cannot
+// silently degrade to "no amendment ever lapses".
+var (
+	_ StageTerminalObservable = (*postgresRepo)(nil)
+	_ TerminalRunObservable   = (*postgresRepo)(nil)
+)
+
+// SetStageTerminalObserver installs the StageTerminalObserver; nil clears it.
+func (r *postgresRepo) SetStageTerminalObserver(obs StageTerminalObserver) {
+	if obs == nil {
+		r.stageTerminalObserver.Store(nil)
+		return
+	}
+	r.stageTerminalObserver.Store(&obs)
+}
+
+// SetRunTerminalObserver installs the TerminalRunObserver; nil clears it.
+func (r *postgresRepo) SetRunTerminalObserver(obs TerminalRunObserver) {
+	if obs == nil {
+		r.runTerminalObserver.Store(nil)
+		return
+	}
+	r.runTerminalObserver.Store(&obs)
+}
+
+// notifyStageTerminal fires the installed StageTerminalObserver for a
+// committed stage in a terminal state. Call it only AFTER the transaction
+// committed.
+func (r *postgresRepo) notifyStageTerminal(ctx context.Context, s *Stage) {
+	if s == nil || !s.State.IsTerminal() {
+		return
+	}
+	if obs := r.stageTerminalObserver.Load(); obs != nil {
+		(*obs)(ctx, s)
+	}
+}
+
+// notifyRunTerminal is the run-level sibling of notifyStageTerminal.
+func (r *postgresRepo) notifyRunTerminal(ctx context.Context, run *Run) {
+	if run == nil || !run.State.IsTerminal() {
+		return
+	}
+	if obs := r.runTerminalObserver.Load(); obs != nil {
+		(*obs)(ctx, run)
+	}
 }
 
 // NewPostgresRepository wraps a pgxpool.Pool to satisfy Repository.
@@ -267,6 +321,7 @@ func (r *postgresRepo) TransitionRun(ctx context.Context, id uuid.UUID, to State
 	if err != nil {
 		return nil, err
 	}
+	r.notifyRunTerminal(ctx, result)
 	return result, nil
 }
 
@@ -707,6 +762,7 @@ func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to Sta
 	if err != nil {
 		return nil, err
 	}
+	r.notifyStageTerminal(ctx, result)
 	return result, nil
 }
 
@@ -916,6 +972,7 @@ func (r *postgresRepo) SupersedeStrandedStageOnMerge(ctx context.Context, stageI
 	if err != nil {
 		return nil, err
 	}
+	r.notifyStageTerminal(ctx, result)
 	return result, nil
 }
 
