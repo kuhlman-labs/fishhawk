@@ -386,8 +386,19 @@ type Run struct {
 	// runMergeCandidateRerunPayload or a field silently decodes to its zero
 	// value — the #371-class hand-maintained-wire-mirror trap.
 	MergeCandidateRerun *runMergeCandidateRerun `json:"merge_candidate_rerun,omitempty" jsonschema:"advisory: the run's newest merge-candidate verdict FAILED and nothing re-opened or rewrote the head since, so fishhawk_rebase_run_branch rerun_failed_verify:true is legal — at the review gate, or superseding a queued never-dispatched ADR-090 D6 fix-up in place (queued_fixup_* name it). Omitted otherwise"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
+	// MergeCandidateStaleness mirrors the backend
+	// runResponse.merge_candidate_staleness (E85.4 / #4147): whether an open
+	// decomposed parent's consolidated PR head still contains its base tip,
+	// observed at read time. The backend emits it on the SINGLE-run read only
+	// (handleGetRun); nil when the run is not an eligible merge candidate, on a
+	// read error, or against an older backend (the mixed-version degrade). The
+	// json tags MUST byte-match the backend's mergeCandidateStalenessPayload or
+	// a field silently decodes to its zero value — the #371-class
+	// hand-maintained-wire-mirror trap; TestMergeCandidateStaleness_WireShape
+	// pins them against a REAL server.
+	MergeCandidateStaleness *runMergeCandidateStaleness `json:"merge_candidate_staleness,omitempty" jsonschema:"read-time observation for an open decomposed parent's consolidated PR: state fresh (the head contains the base tip), stale (the base advanced past it: fishhawk_merge_run would refuse merge_base_behind, so next_step names fishhawk_rebase_run_branch) or undetermined (a forge read failed; reason says which, never reported fresh). Cached per run and recorded head for up to 60s (checked_at). Omitted when the run is not an open decomposed parent with a PR"`
+	CreatedAt               time.Time                   `json:"created_at"`
+	UpdatedAt               time.Time                   `json:"updated_at"`
 }
 
 // runMergeCandidateQueue mirrors the backend's runMergeCandidateQueuePayload
@@ -422,6 +433,28 @@ type runMergeCandidateRerun struct {
 	QueuedFixupStageID  string `json:"queued_fixup_stage_id,omitempty" jsonschema:"the implement stage holding the queued, never-dispatched ADR-090 D6 fix-up the re-run would supersede in place and refund; omitted at the review gate"`
 	QueuedFixupSequence int64  `json:"queued_fixup_sequence,omitempty" jsonschema:"that fix-up's stage_fixup_triggered sequence; omitted at the review gate"`
 	Note                string `json:"note" jsonschema:"what the re-run would do, in one sentence"`
+}
+
+// runMergeCandidateStaleness mirrors the backend's
+// mergeCandidateStalenessPayload (backend/internal/server/
+// merge_candidate_staleness.go, E85.4 / #4147), carried on BOTH the run read
+// and the gate view. The json tags MUST byte-match the backend or each field
+// silently decodes to its zero value. UNEXPORTED on the runMergeCandidateQueue
+// precedent (the package's exported surface is pinned).
+//
+// BehindBy is a pointer on purpose: 0 on fresh is a positive fact, distinct
+// from the key's ABSENCE on undetermined (the count is unknown).
+type runMergeCandidateStaleness struct {
+	State              string    `json:"state" jsonschema:"fresh, stale or undetermined. A failed or timed-out forge read is undetermined, never fresh"`
+	HeadSHA            string    `json:"head_sha,omitempty" jsonschema:"the LIVE pull request head the forge reported"`
+	BaseRef            string    `json:"base_ref,omitempty" jsonschema:"the pull request's base branch"`
+	BaseSHA            string    `json:"base_sha,omitempty" jsonschema:"the base tip head_sha was compared against (one snapshot with behind_by)"`
+	BehindBy           *int      `json:"behind_by,omitempty" jsonschema:"base commits the head lacks: 0 on fresh, positive on stale, omitted on undetermined"`
+	BehindByLowerBound bool      `json:"behind_by_lower_bound" jsonschema:"true when the compare hit GitHub's un-paginated 250-commit cap, so behind_by is a lower bound"`
+	Reason             string    `json:"reason,omitempty" jsonschema:"undetermined only: forge_not_probeable, pr_read_failed, base_tip_unresolved, compare_failed or read_timeout"`
+	NextStep           string    `json:"next_step,omitempty" jsonschema:"stale only: fishhawk_rebase_run_branch (the operator's move; Fishhawk does not advance the branch itself)"`
+	CheckedAt          time.Time `json:"checked_at" jsonschema:"when the observation was computed; a cache hit returns the stored value"`
+	Note               string    `json:"note" jsonschema:"what the state means, in one constant-shape sentence"`
 }
 
 // runCompletionBlocked mirrors the backend's run-status completion_blocked block
@@ -492,6 +525,15 @@ func init() {
 		// retained through T1..T9, itemised out only at the diagnosis skeleton
 		// with GET /v0/runs/{id} as its retrieval pointer.
 		pathClassification{Path: "run.merge_candidate_rerun", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The read-time merge-candidate staleness observation (E85.4 /
+		// #4147). One constant-shape entry (no lists) the backend computes
+		// per single-run read AND per gate-view read, so it classifies like
+		// run.merge_candidate_queue: stored, retained through T1..T9,
+		// itemised out only at the diagnosis skeleton with GET /v0/runs/{id}
+		// and the gate view as its retrieval pointers.
+		pathClassification{Path: "run.merge_candidate_staleness", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+			return append(restRun(runID), gateView(runID)...)
+		}},
 	)
 }
 
@@ -841,6 +883,14 @@ type GateView struct {
 	// gateViewFanInConflict; TestFanInConflict_WireShape pins them against a
 	// REAL server.
 	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty" jsonschema:"a decomposed parent's unresolved fan-in conflict: kind base_fold_conflict (the consolidated head is clean but behind base_ref; at merge fishhawk_rebase_run_branch starts the bounded conflict-resolution pass, no manual resolution) or slice_conflict (a slice failed to merge and failed implement category B; restart with fishhawk_start_run or fishhawk_start_campaign_item_run, never fishhawk_resume_run on the succeeded child), with the attributed slice, child and conflicting_base_paths and the remedy; absent when there is none or the read failed (a fan_in history_gaps entry)"`
+	// MergeCandidateStaleness mirrors the backend's gate-view
+	// merge_candidate_staleness block (E85.4 / #4147) — the same projection
+	// Run.MergeCandidateStaleness carries. Omitted (nil) when the run is not
+	// an open decomposed parent with a PR, when the read failed (a
+	// merge_candidate_staleness history_gaps entry), or against an older
+	// backend. The json tags MUST byte-match the backend;
+	// TestMergeCandidateStaleness_WireShape pins them against a REAL server.
+	MergeCandidateStaleness *runMergeCandidateStaleness `json:"merge_candidate_staleness,omitempty" jsonschema:"read-time observation for an open decomposed parent's consolidated PR: fresh, stale (the base advanced past the head; next_step fishhawk_rebase_run_branch) or undetermined (reason names the failed forge read; never reported fresh). Absent when the run is not an open decomposed parent with a PR, or with a merge_candidate_staleness history_gaps entry when the read failed"`
 }
 
 // gateViewFanInConflict mirrors the backend's gateViewFanInConflict

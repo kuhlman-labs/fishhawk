@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1206,4 +1208,209 @@ func TestFanInConflict_WireShape(t *testing.T) {
 		t.Fatalf("getGateView: %v", err)
 	}
 	check("fishhawk_get_gate_view", out.GateView.FanInConflict)
+}
+
+// TestMergeCandidateStaleness_WireShape pins the hand-maintained
+// runMergeCandidateStaleness mirror against the REAL backend (E85.4 / #4147;
+// the #371 trap). A real server.New over Postgres, with GitHub a githubclient
+// over an httptest fake, carries two open decomposed parents (installation,
+// PR URL, one child each): one whose PR head the fake reports 250 commits
+// behind the base tip (stale, lower-bounded) and one whose PR read fails
+// (undetermined). (a) The UNION of the keys the server emits across the two
+// gate-view blocks equals the mirror's json tags in BOTH directions; (b) every
+// member decodes non-zero through GetGateView, GetRun, the
+// fishhawk_get_gate_view handler and fishhawk_get_run_status; (c)
+// nextActionsFor over the decoded Run, and the run-status tool's own
+// next_actions, name fishhawk_rebase_run_branch. Counterfactual: renaming a
+// mirror tag (e.g. base_sha) fails (a) and (b).
+func TestMergeCandidateStaleness_WireShape(t *testing.T) {
+	const (
+		bearer   = "fhk_merge_candidate_staleness_e2e"
+		prHead   = "1111111111111111111111111111111111111111"
+		baseTip  = "2222222222222222222222222222222222222222"
+		stalePR  = 7
+		brokenPR = 8
+	)
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	newParent := func(pr int) uuid.UUID {
+		t.Helper()
+		inst := int64(55)
+		row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+			InstallationID: &inst,
+		})
+		if err != nil {
+			t.Fatalf("create parent: %v", err)
+		}
+		if _, err := runRepo.SetRunPullRequestURL(ctx, row.ID, fmt.Sprintf("https://github.com/x/y/pull/%d", pr)); err != nil {
+			t.Fatalf("SetRunPullRequestURL: %v", err)
+		}
+		if _, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+			DecomposedFrom: &row.ID,
+		}); err != nil {
+			t.Fatalf("create child: %v", err)
+		}
+		return row.ID
+	}
+	staleID, brokenID := newParent(stalePR), newParent(brokenPR)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/x/y/pulls/{number}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("number") != fmt.Sprint(stalePR) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"boom"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"node_id":"PR_x","state":"open","merged":false,"head":{"sha":%q,"ref":"fishhawk/run-x-consolidated"},"base":{"ref":"main"}}`, prHead)
+	})
+	mux.HandleFunc("GET /repos/x/y/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"object":{"sha":%q}}`, baseTip)
+	})
+	mux.HandleFunc("GET /repos/x/y/compare/{basehead...}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("basehead") != prHead+"..."+baseTip {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		commits := make([]map[string]string, 250)
+		for i := range commits {
+			commits[i] = map[string]string{"sha": fmt.Sprintf("c%039d", i)}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"commits": commits})
+	})
+	ghSrv := httptest.NewServer(mux)
+	t.Cleanup(ghSrv.Close)
+
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo: tokRepo,
+		GitHub: &githubclient.Client{
+			BaseURL: ghSrv.URL,
+			Tokens:  rebaseE2ETokens{},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+			AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+		},
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+
+	rawBlock := func(id uuid.UUID) map[string]json.RawMessage {
+		t.Helper()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+id.String()+"/gate-view", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET gate-view: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET gate-view = %d: %s", resp.StatusCode, body)
+		}
+		var block map[string]json.RawMessage
+		if err := json.Unmarshal(top["merge_candidate_staleness"], &block); err != nil {
+			t.Fatalf("server emitted no merge_candidate_staleness block:\n%s", body)
+		}
+		return block
+	}
+	union := map[string]bool{}
+	for _, id := range []uuid.UUID{staleID, brokenID} {
+		for k := range rawBlock(id) {
+			union[k] = true
+		}
+	}
+	fields := jsonFieldNames(reflect.TypeOf(runMergeCandidateStaleness{}))
+	for k := range union {
+		if !fields[k] {
+			t.Errorf("server merge_candidate_staleness key %q has no field on the mirror (tag drift)", k)
+		}
+	}
+	for k := range fields {
+		if !union[k] {
+			t.Errorf("mirror field %q is not emitted by the server's merge_candidate_staleness block (tag drift)", k)
+		}
+	}
+
+	checkStale := func(surface string, v *runMergeCandidateStaleness) {
+		t.Helper()
+		if v == nil {
+			t.Fatalf("%s: merge_candidate_staleness decoded to nil", surface)
+		}
+		if v.State != "stale" || v.HeadSHA != prHead || v.BaseRef != "main" || v.BaseSHA != baseTip ||
+			v.BehindBy == nil || *v.BehindBy != 250 || !v.BehindByLowerBound || v.NextStep != "fishhawk_rebase_run_branch" ||
+			v.CheckedAt.IsZero() || v.Note == "" || v.Reason != "" {
+			t.Errorf("%s: block = %+v, want stale 250+ behind %s with every stale member decoded non-zero", surface, v, baseTip)
+		}
+	}
+	checkUndetermined := func(surface string, v *runMergeCandidateStaleness) {
+		t.Helper()
+		if v == nil {
+			t.Fatalf("%s: merge_candidate_staleness decoded to nil", surface)
+		}
+		if v.State != "undetermined" || v.Reason != "pr_read_failed" || v.CheckedAt.IsZero() || v.Note == "" ||
+			v.BehindBy != nil || v.NextStep != "" {
+			t.Errorf("%s: block = %+v, want undetermined pr_read_failed with no behind_by or next_step", surface, v)
+		}
+	}
+
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	for _, tc := range []struct {
+		id    uuid.UUID
+		check func(string, *runMergeCandidateStaleness)
+	}{{staleID, checkStale}, {brokenID, checkUndetermined}} {
+		gv, err := client.GetGateView(ctx, tc.id, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		tc.check("gate view", gv.MergeCandidateStaleness)
+		_, out, err := resolver.getGateView(ctx, nil, GetGateViewInput{RunID: tc.id.String()})
+		if err != nil {
+			t.Fatalf("getGateView: %v", err)
+		}
+		tc.check("fishhawk_get_gate_view", out.GateView.MergeCandidateStaleness)
+		r, err := client.GetRun(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		tc.check("run", r.MergeCandidateStaleness)
+	}
+
+	r, err := client.GetRun(ctx, staleID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	hasRebase := func(na *NextActions) bool {
+		if na == nil {
+			return false
+		}
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_rebase_run_branch" && a.Params["run_id"] == staleID.String() && a.Params["confirm"] == "true" {
+				return true
+			}
+		}
+		return false
+	}
+	if na := nextActionsFor(r, nil, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{}); !hasRebase(na) {
+		t.Errorf("nextActionsFor over the decoded Run = %v, want fishhawk_rebase_run_branch", actionNames(na))
+	}
+	_, out, err := resolver.getRunStatus(ctx, nil, GetRunStatusInput{RunID: staleID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	checkStale("get_run_status", out.Run.MergeCandidateStaleness)
+	if !hasRebase(out.NextActions) {
+		t.Errorf("get_run_status next_actions = %v, want fishhawk_rebase_run_branch", actionNames(out.NextActions))
+	}
 }

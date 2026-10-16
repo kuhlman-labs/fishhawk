@@ -52,6 +52,18 @@ line; admission is automatic, so the next step is a status read.
 `GET /v0/runs/{run_id}` and the gate view carry the run's queue entry as
 `merge_candidate_queue` (state, position, the live run and the anchored head).
 
+A decomposed parent's consolidated pull request can also fall behind while it
+waits for review: once its base branch moves past the head, the merge verb
+would refuse `merge_base_behind`. `GET /v0/runs/{run_id}` and the gate view
+report this ahead of time as `merge_candidate_staleness`: `fresh`, `stale`
+(with `behind_by`, the `base_sha` it was compared against, and `next_step`
+naming `fishhawk_rebase_run_branch`), or `undetermined` with a `reason` when a
+forge read failed or the forge cannot be probed. A failed read is never
+reported `fresh`. The check reads the pull request, the base tip and one
+compare, cached per run and recorded head for 60 seconds (`checked_at` is the
+observation time). It writes nothing, and Fishhawk does not advance the branch
+itself: the rebase stays the operator's call.
+
 At a clean base advance Fishhawk performed, a prior head's passed verdict can
 transfer to the new merge commit instead of running a pass, when the advance
 cannot affect what the pull request changed (ADR-096). The daemon's transfer
