@@ -134,7 +134,7 @@ func printUsage(w io.Writer) {
 		"  approver-members         Dry-run approvals.members: evaluate recorded approvers against a spec's members gates; exits 1 if any human would be refused (#4116).",
 		"  reconcile-orphan-children  Dry-run (default) or --apply: cancel non-terminal decomposition children of cancelled/succeeded parents (#4186).",
 		"  sweep-stale-runs           Dry-run (default) or --apply: reconcile stale (--days, default 14) non-terminal top-level runs (#4185).",
-		"  ops-probe                  Dry-run one ops-monitor sweep (disk, gocache, load, docker, postgres, runners); writes nothing; exits 1 if any probe is failing (#4142).",
+		"  ops-probe                  Dry-run one ops-monitor sweep (disk, gocache, load, docker, postgres, runners, amendment_window, amendment_terminal, memory, workload_containers); writes nothing; exits 1 if any probe is failing (#4142, #4330).",
 		"  version | --version      Print the build version and git SHA, \"<Version> (<GitSHA>)\", and exit.",
 	} {
 		_, _ = fmt.Fprintln(w, line)

@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/opsmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -30,6 +31,8 @@ import (
 // and the dry-run `ops-probe` subcommand share, their validation, and the
 // probe/ticker construction. The probes, the fail-safe Sweep and the
 // emit/dedup contract live in backend/internal/opsmonitor (README.md there).
+// E85.11 / #4330 adds the host-health thresholds, the memory and
+// workload_containers probes, load attribution and the interim dispatch hold.
 
 const (
 	// defaultOpsMonitorDiskMinFreeGB is the data-volume free-space floor.
@@ -61,6 +64,20 @@ type opsMonitorFlags struct {
 	AmendmentWindow   time.Duration
 	AmendmentWarnLead time.Duration
 	AmendmentLookback time.Duration
+
+	// Host-health thresholds (E85.11 / #4330), in PERCENT; 0 (the default)
+	// keeps hosthealth.DefaultThresholds, resolved against the host's RAM
+	// and cores at Check time.
+	SwapEnterPct       float64
+	SwapExitPct        float64
+	MemAvailableMinPct float64
+	CriticalSwapPct    float64
+	HolderMinPct       float64
+	ContainersMax      int
+	ContainersMemPct   float64
+	// DispatchHold is the serve-only --ops-monitor-dispatch-hold (the
+	// interim admission hold); ops-probe never registers it.
+	DispatchHold bool
 }
 
 // defaultOpsMonitorDiskPath is the operator's home directory: the volume the
@@ -84,7 +101,8 @@ func registerOpsMonitorFlags(fs *flag.FlagSet) *opsMonitorFlags {
 		envOr("FISHHAWKD_OPS_MONITOR_DEPLOYMENT", "auto"),
 		"where fishhawkd runs relative to its runners: auto|local|kubernetes|remote. auto resolves kubernetes when "+
 			"KUBERNETES_SERVICE_HOST is set, else local; pass remote on a non-k8s host that does not share the runners' "+
-			"host. Under kubernetes or remote the host-local probes (disk, gocache, load, docker, runners) report "+
+			"host. Under kubernetes or remote the host-local probes (disk, gocache, load, docker, runners, memory, "+
+			"workload_containers) report "+
 			"not_applicable without running")
 	fs.DurationVar(&f.QuietWindow, "ops-monitor-quiet-window",
 		envOrDuration("FISHHAWKD_OPS_MONITOR_QUIET_WINDOW", opsmonitor.DefaultQuietWindow),
@@ -119,9 +137,49 @@ func registerOpsMonitorFlags(fs *flag.FlagSet) *opsMonitorFlags {
 			"no lead (it fires only once the window has elapsed). Must be >= 0 and below the window")
 	fs.DurationVar(&f.AmendmentLookback, "ops-monitor-amendment-lookback",
 		envOrDuration("FISHHAWKD_OPS_MONITOR_AMENDMENT_LOOKBACK", opsmonitor.DefaultAmendmentLookback),
-		"only pending scope amendments requested within this long are scanned, which bounds the backlog of stale "+
-			"pre-#4127 pending rows; must exceed the window")
+		"only pending scope amendments requested within this long are scanned, which bounds the pending rows the "+
+			"#4127 lapse step leaves pending (failed-stage rows and any it missed); must exceed the window")
+	fs.Float64Var(&f.SwapEnterPct, "ops-monitor-swap-enter-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_SWAP_ENTER_PCT", 0),
+		"memory probe (E85.11 / #4330): used swap, as a percent of swap total, at which host_memory_pressure trips; "+
+			"0 keeps the default 90. Must lie in (0,100) and above --ops-monitor-swap-exit-pct")
+	fs.Float64Var(&f.SwapExitPct, "ops-monitor-swap-exit-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_SWAP_EXIT_PCT", 0),
+		"memory probe: used swap percent below which a tripped swap signal clears (hysteresis); 0 keeps the default 70. "+
+			"Must lie in (0,100) and below the enter percent")
+	fs.Float64Var(&f.MemAvailableMinPct, "ops-monitor-mem-available-min-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_MEM_AVAILABLE_MIN_PCT", 0),
+		"memory probe: available memory, as a percent of RAM, at or below which host_memory_pressure trips; 0 keeps the "+
+			"default 5. The band scales with it: it clears above 2x and is critical at 0.4x. Must lie in (0,50)")
+	fs.Float64Var(&f.CriticalSwapPct, "ops-monitor-critical-swap-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_CRITICAL_SWAP_PCT", 0),
+		"memory probe: used swap percent at which memory pressure is CRITICAL (drives --ops-monitor-dispatch-hold); "+
+			"0 keeps the default 97. Must lie in (0,100) and above the swap enter percent")
+	fs.Float64Var(&f.HolderMinPct, "ops-monitor-holder-min-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_HOLDER_MIN_PCT", 0),
+		"memory probe: a process whose footprint is at least this percent of RAM is named as a contributor "+
+			"(attribution only, never a trigger); 0 keeps the default max(1 GiB, 25%). Must lie in (0,100)")
+	fs.IntVar(&f.ContainersMax, "ops-monitor-containers-max",
+		envOrInt("FISHHAWKD_OPS_MONITOR_CONTAINERS_MAX", 0),
+		"workload_containers probe: more running fishhawk-gate- containers than this trips workload_containers_high; "+
+			"0 keeps the default max(4, cores/2). Must be >= 0")
+	fs.Float64Var(&f.ContainersMemPct, "ops-monitor-containers-mem-pct",
+		envOrFloat("FISHHAWKD_OPS_MONITOR_CONTAINERS_MEM_PCT", 0),
+		"workload_containers probe: total gate-container memory, as a percent of RAM, at which "+
+			"workload_containers_high trips; 0 keeps the default 50. It clears below 0.8x. Must lie in (0,100)")
 	return f
+}
+
+// registerOpsMonitorDispatchHoldFlag registers the serve-only
+// --ops-monitor-dispatch-hold onto f (ops-probe writes and holds nothing,
+// so it never registers it).
+func registerOpsMonitorDispatchHoldFlag(fs *flag.FlagSet, f *opsMonitorFlags) {
+	fs.BoolVar(&f.DispatchHold, "ops-monitor-dispatch-hold",
+		envOrBool("FISHHAWKD_OPS_MONITOR_DISPATCH_HOLD", false),
+		"INTERIM dispatch hold (E85.11 / #4330; ADR-100's adaptive concurrency controller absorbs it): while the "+
+			"memory probe reads CRITICAL pressure, refuse NEW host-dispatch admissions with 409 host_memory_pressure. "+
+			"In-flight and already-dispatched stages are never touched. Needs --enable-ops-monitor and a local "+
+			"deployment; ignored (with a WARN) otherwise. Off by default")
 }
 
 // opsMonitorConfig is the validated ops-monitor configuration.
@@ -142,14 +200,119 @@ type opsMonitorConfig struct {
 	// NotifyIssue is 0 when no notify issue is configured (audit-only).
 	NotifyRepo  forge.RepoRef
 	NotifyIssue int
+	// HostThresholds are the validated host-health overrides (E85.11).
+	HostThresholds hostThresholdOverrides
+	// DispatchHold requests the interim admission hold (opsAdmissionHold
+	// decides whether it is built).
+	DispatchHold bool
+}
+
+// hostThresholdOverrides are the operator's host-health threshold
+// overrides as FRACTIONS; a zero field keeps the hosthealth default. It is
+// applied at Check time against the host's RAM and cores (thresholds), so
+// nothing reads the host at flag registration.
+type hostThresholdOverrides struct {
+	SwapEnter         float64
+	SwapExit          float64
+	AvailableEnter    float64
+	CriticalSwap      float64
+	HolderMinFraction float64
+	ContainerMemEnter float64
+	ContainerCountMax int
+}
+
+// thresholds is the probes' opsmonitor.ThresholdsFunc: the defaults for
+// totalRAM/cores with every set override applied. A single-flag band
+// (available memory, container memory) scales its exit (and, for available
+// memory, its critical entry) by the same ratio as its enter, so the band
+// keeps the default shape: available clears above 2x the floor and is
+// critical at 0.4x; container memory clears below 0.8x.
+func (o hostThresholdOverrides) thresholds(totalRAM uint64, cores int) hosthealth.Thresholds {
+	th := hosthealth.DefaultThresholds(totalRAM, cores)
+	if o.SwapEnter > 0 {
+		th.SwapEnter = o.SwapEnter
+	}
+	if o.SwapExit > 0 {
+		th.SwapExit = o.SwapExit
+	}
+	if o.CriticalSwap > 0 {
+		th.CriticalSwap = o.CriticalSwap
+	}
+	if o.AvailableEnter > 0 {
+		scale := o.AvailableEnter / th.AvailableEnter
+		th.AvailableEnter = o.AvailableEnter
+		th.AvailableExit *= scale
+		th.CriticalAvailable *= scale
+	}
+	if o.HolderMinFraction > 0 {
+		if b := uint64(o.HolderMinFraction * float64(totalRAM)); b > 0 {
+			th.HolderMinBytes = b
+		}
+	}
+	if o.ContainerMemEnter > 0 {
+		scale := o.ContainerMemEnter / th.ContainerMemEnter
+		th.ContainerMemEnter = o.ContainerMemEnter
+		th.ContainerMemExit *= scale
+	}
+	if o.ContainerCountMax > 0 {
+		th.ContainerCountMax = o.ContainerCountMax
+	}
+	return th
+}
+
+// validationRAM and validationCores are the representative host the
+// startup check resolves the overrides against: every override is a
+// fraction or a count, so the verdict does not depend on the real RAM.
+const (
+	validationRAM   = 16 << 30
+	validationCores = 8
+)
+
+// resolveHostThresholds validates the host-health flags: each percent flag
+// is 0 (default) or in (0,100) (available memory in (0,50), so its scaled
+// exit stays a fraction), the container count is >= 0, and the composed
+// bands pass hosthealth.Thresholds.Validate (high-water exit below enter,
+// low-water exit above enter, critical beyond the failing entry).
+func resolveHostThresholds(f *opsMonitorFlags) (hostThresholdOverrides, error) {
+	var o hostThresholdOverrides
+	for _, p := range []struct {
+		name string
+		pct  float64
+		max  float64
+		dst  *float64
+	}{
+		{"--ops-monitor-swap-enter-pct", f.SwapEnterPct, 100, &o.SwapEnter},
+		{"--ops-monitor-swap-exit-pct", f.SwapExitPct, 100, &o.SwapExit},
+		{"--ops-monitor-mem-available-min-pct", f.MemAvailableMinPct, 50, &o.AvailableEnter},
+		{"--ops-monitor-critical-swap-pct", f.CriticalSwapPct, 100, &o.CriticalSwap},
+		{"--ops-monitor-holder-min-pct", f.HolderMinPct, 100, &o.HolderMinFraction},
+		{"--ops-monitor-containers-mem-pct", f.ContainersMemPct, 100, &o.ContainerMemEnter},
+	} {
+		if p.pct == 0 {
+			continue
+		}
+		if math.IsNaN(p.pct) || p.pct <= 0 || p.pct >= p.max {
+			return hostThresholdOverrides{}, fmt.Errorf("%s must be 0 (default) or a percent in (0,%.0f), got %v", p.name, p.max, p.pct)
+		}
+		*p.dst = p.pct / 100
+	}
+	if f.ContainersMax < 0 {
+		return hostThresholdOverrides{}, fmt.Errorf("--ops-monitor-containers-max must be 0 (default) or >= 1, got %d", f.ContainersMax)
+	}
+	o.ContainerCountMax = f.ContainersMax
+	if err := o.thresholds(validationRAM, validationCores).Validate(); err != nil {
+		return hostThresholdOverrides{}, fmt.Errorf("--ops-monitor-*-pct host-health thresholds are inconsistent: %w", err)
+	}
+	return o, nil
 }
 
 // resolveOpsMonitorConfig validates f. Disabled → (nil, nil) without
 // validating anything, so a typo in a flag the operator never turned on
 // cannot fail startup. Enabled → an unknown deployment, a malformed notify
 // issue, a non-positive interval or quiet window, a non-positive,
-// non-finite or overflowing threshold, or a degenerate amendment window,
-// warn lead or lookback is an error naming the flag.
+// non-finite or overflowing threshold, a degenerate amendment window,
+// warn lead or lookback, or an out-of-range or inconsistent host-health
+// threshold is an error naming the flag.
 func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(string) string) (*opsMonitorConfig, error) {
 	if !enabled {
 		return nil, nil
@@ -189,6 +352,10 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 		return nil, fmt.Errorf("--ops-monitor-amendment-lookback must exceed the amendment window (%s), got %s",
 			f.AmendmentWindow, f.AmendmentLookback)
 	}
+	hostThresholds, err := resolveHostThresholds(f)
+	if err != nil {
+		return nil, err
+	}
 	conf := &opsMonitorConfig{
 		Deployment:       deployment,
 		Interval:         f.Interval,
@@ -202,6 +369,9 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 		AmendmentWindow:   f.AmendmentWindow,
 		AmendmentWarnLead: f.AmendmentWarnLead,
 		AmendmentLookback: f.AmendmentLookback,
+
+		HostThresholds: hostThresholds,
+		DispatchHold:   f.DispatchHold,
 	}
 	if f.NotifyIssue != "" {
 		repo, issue, err := opsmonitor.ParseIssueRef(f.NotifyIssue)
@@ -236,6 +406,10 @@ type opsMonitorSeams struct {
 	ListRunners func(ctx context.Context) ([]stalesweep.RunnerProcess, error)
 	// Ping, when set, replaces the deps' pool ping.
 	Ping func(ctx context.Context) error
+	// Host is the host-health reader the memory, workload_containers and
+	// load-attribution reads go through (E85.11); the zero Reader reads the
+	// running host.
+	Host hosthealth.Reader
 }
 
 // opsMonitorDeps are the ops monitor's runtime dependencies. Every field is
@@ -249,18 +423,24 @@ type opsMonitorDeps struct {
 	GitHub     *githubclient.Client
 	Logger     *slog.Logger
 	Seams      opsMonitorSeams
+	// Hold, when set, is the interim admission hold the ticker updates every
+	// tick; serve shares the SAME pointer with server.Config.HostAdmissionHold.
+	Hold *opsmonitor.AdmissionHold
 }
 
-// newOpsProbes builds the eight probes from conf + deps.
+// newOpsProbes builds the ten probes from conf + deps. The two host-health
+// probes come last, so the E85.1/E85.2 probe order is unchanged.
 func newOpsProbes(conf opsMonitorConfig, deps opsMonitorDeps) []opsmonitor.Probe {
 	ping := deps.Ping
 	if deps.Seams.Ping != nil {
 		ping = deps.Seams.Ping
 	}
+	host := deps.Seams.Host
+	thresholds := conf.HostThresholds.thresholds
 	return []opsmonitor.Probe{
 		opsmonitor.DiskProbe{Path: conf.DiskPath, MinFreeBytes: conf.DiskMinFreeBytes, Statfs: deps.Seams.Statfs},
 		opsmonitor.GoCacheProbe{Dir: conf.GoCacheDir, MaxBytes: conf.GoCacheMaxBytes, ResolveDir: deps.Seams.ResolveDir},
-		opsmonitor.LoadProbe{Factor: conf.LoadFactor, ReadLoad: deps.Seams.ReadLoad, Cores: deps.Seams.Cores},
+		opsmonitor.LoadProbe{Factor: conf.LoadFactor, ReadLoad: deps.Seams.ReadLoad, Cores: deps.Seams.Cores, Attribution: host.Load},
 		opsmonitor.DockerProbe{Exec: deps.Seams.DockerExec},
 		opsmonitor.PostgresProbe{Ping: ping},
 		&opsmonitor.RunnerProbe{List: deps.Seams.ListRunners, Runs: deps.Runs},
@@ -271,7 +451,28 @@ func newOpsProbes(conf opsMonitorConfig, deps opsMonitorDeps) []opsmonitor.Probe
 			Lookback:   conf.AmendmentLookback,
 		},
 		opsmonitor.AmendmentTerminalProbe{Amendments: deps.Amendments, Lookback: conf.AmendmentLookback},
+		&opsmonitor.MemoryProbe{Reader: host, Thresholds: thresholds, Cores: deps.Seams.Cores},
+		&opsmonitor.WorkloadContainersProbe{Reader: host, Thresholds: thresholds, Cores: deps.Seams.Cores},
 	}
+}
+
+// opsAdmissionHold builds the interim dispatch hold (E85.11 / #4330) when
+// the monitor is enabled, --ops-monitor-dispatch-hold is set AND the
+// resolved deployment is local: only there does the memory probe observe
+// the host the runners spawn on. Otherwise it returns nil (a requested hold
+// under a non-local deployment WARNs). serve builds it BEFORE newServer and
+// hands the same pointer to the ticker. INTERIM: ADR-100's adaptive
+// concurrency controller absorbs it.
+func opsAdmissionHold(conf *opsMonitorConfig, logger *slog.Logger) *opsmonitor.AdmissionHold {
+	if conf == nil || !conf.DispatchHold {
+		return nil
+	}
+	if conf.Deployment != opsmonitor.DeploymentLocal {
+		logger.Warn("--ops-monitor-dispatch-hold ignored: the memory probe observes the runners' host only under a local deployment",
+			slog.String("deployment", string(conf.Deployment)))
+		return nil
+	}
+	return &opsmonitor.AdmissionHold{}
 }
 
 // opsAmendmentReader adapts a pool to the amendment probes' reader. A nil
@@ -299,6 +500,7 @@ func newOpsMonitorTicker(conf opsMonitorConfig, deps opsMonitorDeps) *opsmonitor
 		Logger:      logger,
 		Interval:    conf.Interval,
 		QuietWindow: conf.QuietWindow,
+		Hold:        deps.Hold,
 	}
 	if conf.NotifyIssue > 0 {
 		if deps.GitHub == nil {
@@ -356,7 +558,8 @@ func poolPing(pool *pgxpool.Pool) func(ctx context.Context) error {
 	}
 }
 
-const opsProbeUsage = "Usage: fishhawkd ops-probe [--deployment auto|local|kubernetes|remote] [--db <url>] [--json] [--ops-monitor-* threshold flags]"
+const opsProbeUsage = "Usage: fishhawkd ops-probe [--deployment auto|local|kubernetes|remote] [--db <url>] [--json] [--ops-monitor-* threshold flags]\n" +
+	"Probes: disk, gocache, load, docker, postgres, runners, amendment_window, amendment_terminal, memory, workload_containers"
 
 // opsProbeOut is where `ops-probe` prints its results; opsProbeSeams are its
 // probe seams. Package-level so tests can drive run([]string{"ops-probe", …}).
@@ -437,8 +640,9 @@ func runOpsProbeWith(args []string, out, logSink io.Writer, seams opsMonitorSeam
 }
 
 // formatOpsProbeLine renders one result as
-// `<status> <probe> condition=… subject=… observed=… threshold=… remedy=…|reason=…`,
-// omitting empty fields and quoting values.
+// `<status> <probe> condition=… subject=… observed=… threshold=… contributors=… remedy=…|reason=…`,
+// omitting empty fields and quoting values. contributors (E85.11) is
+// `name[pid] 41.0 GiB, …`; the names are already bounded and sanitized.
 func formatOpsProbeLine(r opsmonitor.Result) string {
 	parts := []string{string(r.Status), r.Probe}
 	for _, kv := range []struct{ k, v string }{
@@ -446,6 +650,7 @@ func formatOpsProbeLine(r opsmonitor.Result) string {
 		{"subject", r.Subject},
 		{"observed", r.Observed},
 		{"threshold", r.Threshold},
+		{"contributors", formatOpsContributors(r.Contributors)},
 		{"remedy", r.Remedy},
 		{"reason", r.Reason},
 	} {
@@ -454,4 +659,18 @@ func formatOpsProbeLine(r opsmonitor.Result) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// formatOpsContributors renders contributors for the ops-probe line; "" when
+// there are none.
+func formatOpsContributors(cs []opsmonitor.Contributor) string {
+	descs := make([]string, 0, len(cs))
+	for _, c := range cs {
+		d := c.Name
+		if c.PID > 0 {
+			d += fmt.Sprintf("[%d]", c.PID)
+		}
+		descs = append(descs, fmt.Sprintf("%s %.1f GiB", d, float64(c.ResidentBytes)/bytesPerGiB))
+	}
+	return strings.Join(descs, ", ")
 }

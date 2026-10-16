@@ -168,3 +168,51 @@ func TestOpsMonitor_PostgresAmendmentProbesEndToEnd(t *testing.T) {
 		t.Errorf("terminal fields.stage_id = %v, want %s", tf["stage_id"], terminalStage)
 	}
 }
+
+// TestOpsMonitor_PostgresAlertRestartDedup crosses hosthealth parsers ->
+// MemoryProbe -> latch -> Ticker -> the real audit repository: the done-means
+// macOS host writes ONE global-chain ops_monitor_alert row, and a FRESH
+// Ticker with a FRESH probe (empty memory and an unlatched latch, so it
+// re-crosses) inside the quiet window writes none — only the audit lookup
+// can suppress it (counterfactual 6).
+func TestOpsMonitor_PostgresAlertRestartDedup(t *testing.T) {
+	ctx := context.Background()
+	repo := audit.NewPostgresRepository(pgtest.NewPool(t))
+	host := darwinDoneMeans()
+	newTk := func() (*Ticker, *MemoryProbe) {
+		p := &MemoryProbe{Reader: host.reader("darwin")}
+		return &Ticker{Probes: []Probe{p}, Deployment: DeploymentLocal, Audit: repo, QuietWindow: time.Hour}, p
+	}
+	first, _ := newTk()
+	first.Tick(ctx)
+	first.Tick(ctx)
+
+	category := CategoryOpsMonitorAlert
+	rows, err := repo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ops_monitor_alert rows = %d, want 1", len(rows))
+	}
+	if rows[0].RunID != nil || rows[0].AccountID != nil || rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorSystem {
+		t.Errorf("row = %+v, want a run-less, untenanted, system-actor entry", rows[0])
+	}
+	var p alertBody
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if len(p.Contributors) == 0 || p.Contributors[0].Name != "fseventsd" || !p.Critical || p.Crossings[0].Condition != ConditionHostMemoryPressure {
+		t.Errorf("payload = %+v", p)
+	}
+
+	restarted, _ := newTk()
+	rs := restarted.Tick(ctx)
+	if r := resultFor(t, rs, "memory"); !r.Crossing {
+		t.Fatalf("restarted probe result = %+v, want a re-crossing (fresh latch)", r)
+	}
+	rows, err = repo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil || len(rows) != 1 {
+		t.Errorf("ops_monitor_alert rows after restart = %d (%v), want still 1 (dedup via the audit log)", len(rows), err)
+	}
+}

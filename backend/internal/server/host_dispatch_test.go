@@ -19,6 +19,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -2184,5 +2185,197 @@ func TestHostDispatch_DecomposedParentAcceptance_NoIntegrationAuthority_Admits(t
 	}
 	if got := f.stageState(t); got != run.StageStateDispatched {
 		t.Errorf("stage state = %q, want dispatched", got)
+	}
+}
+
+// --- interim host memory hold (E85.11 / #4330) -------------------------------
+
+// fakeAdmissionHold is a HostAdmissionHold that answers a fixed verdict and
+// counts how often the marker consulted it.
+type fakeAdmissionHold struct {
+	mu     sync.Mutex
+	held   bool
+	reason string
+	calls  int
+}
+
+func (h *fakeAdmissionHold) Held(time.Time) (bool, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	return h.held, h.reason
+}
+
+func (h *fakeAdmissionHold) consulted() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
+}
+
+// hostDispatchHoldServer is hostDispatchServer with a HostAdmissionHold wired.
+func hostDispatchHoldServer(t *testing.T, stageState run.StageState, hold HostAdmissionHold) (*Server, *orchestratorRepo, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, stageState)
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: rr, HostAdmissionHold: hold}), rr, runRow.ID, stage.ID
+}
+
+// TestHostDispatch_HostMemoryHold_RefusesBothAdmissibleArms (approval
+// condition 4): a held hold refuses a NEW admission from BOTH admissible arms
+// — pending AND awaiting_host_dispatch — with 409 host_memory_pressure
+// carrying reason + retry, and COMMITS NOTHING: the re-read stage is still in
+// its observed state (with the check deleted the CAS moves it to dispatched,
+// so the committed state, not the error identity, is the evidence).
+func TestHostDispatch_HostMemoryHold_RefusesBothAdmissibleArms(t *testing.T) {
+	for _, st := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
+		t.Run(string(st), func(t *testing.T) {
+			hold := &fakeAdmissionHold{held: true, reason: "host memory pressure is critical: swap 98.0%"}
+			s, rr, runID, stageID := hostDispatchHoldServer(t, st, hold)
+
+			w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+			if w.Code != http.StatusConflict {
+				t.Errorf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+			}
+			var body struct {
+				Error struct {
+					Code    string         `json:"code"`
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v (%s)", err, w.Body.String())
+			}
+			if body.Error.Code != "host_memory_pressure" {
+				t.Errorf("error code = %q, want host_memory_pressure:\n%s", body.Error.Code, w.Body.String())
+			}
+			if d := body.Error.Details; d["reason"] != hold.reason || d["retry"] != hostDispatchHoldRetry || d["state"] != string(st) {
+				t.Errorf("details = %v, want reason %q, retry %q, state %s", d, hold.reason, hostDispatchHoldRetry, st)
+			}
+			cur, err := rr.GetStage(context.Background(), stageID)
+			if err != nil {
+				t.Fatalf("re-read stage: %v", err)
+			}
+			if cur.State != st {
+				t.Errorf("committed state = %q, want %q: a held admission must commit no transition", cur.State, st)
+			}
+			if hold.consulted() != 1 {
+				t.Errorf("hold consulted %d times, want 1", hold.consulted())
+			}
+		})
+	}
+}
+
+// TestHostDispatch_HostMemoryHold_NotHeldAdmits: a wired hold that is not
+// held admits exactly as before (the control half of the refusal case).
+func TestHostDispatch_HostMemoryHold_NotHeldAdmits(t *testing.T) {
+	hold := &fakeAdmissionHold{}
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateAwaitingHostDispatch, hold)
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateDispatched {
+		t.Errorf("committed state = %q, want dispatched", cur.State)
+	}
+	if hold.consulted() != 1 {
+		t.Errorf("hold consulted %d times, want 1", hold.consulted())
+	}
+}
+
+// TestHostDispatch_HostMemoryHold_NilIsDefault: no hold wired (the default)
+// admits; the Config field's zero value changes nothing.
+func TestHostDispatch_HostMemoryHold_NilIsDefault(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStatePending, nil)
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateDispatched {
+		t.Errorf("committed state = %q, want dispatched", cur.State)
+	}
+}
+
+// TestHostDispatch_HostMemoryHold_AlreadyDispatchedUntouched: a held hold
+// never refuses the idempotent already-dispatched arm (a spawn attempt
+// exists; in-flight work is never refused) and is not even consulted there.
+func TestHostDispatch_HostMemoryHold_AlreadyDispatchedUntouched(t *testing.T) {
+	hold := &fakeAdmissionHold{held: true, reason: "critical"}
+	s, rr, runID, stageID := hostDispatchHoldServer(t, run.StageStateDispatched, hold)
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the idempotent 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:false dispatched", resp)
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateDispatched {
+		t.Errorf("committed state = %q, want dispatched", cur.State)
+	}
+	if hold.consulted() != 0 {
+		t.Errorf("hold consulted %d times on the idempotent arm, want 0", hold.consulted())
+	}
+}
+
+// countingAdmitStore is a concurrency.Store that counts Admit calls and
+// fails each one (so an admission that is reached answers 500).
+type countingAdmitStore struct {
+	errStore
+	mu     sync.Mutex
+	admits int
+}
+
+func (c *countingAdmitStore) Admit(ctx context.Context, req concurrency.Request) (concurrency.Admission, error) {
+	c.mu.Lock()
+	c.admits++
+	c.mu.Unlock()
+	return c.errStore.Admit(ctx, req)
+}
+
+func (c *countingAdmitStore) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.admits
+}
+
+// TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission: for a GROUPED stage
+// (an implement stage with a slot store wired) a held hold refuses BEFORE the
+// slot admission, so no queue row or slot can be committed — Admit is never
+// called. The not-held control proves the fixture reaches Admit.
+func TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		held       bool
+		wantCode   int
+		wantAdmits int
+	}{
+		{"held", true, http.StatusConflict, 0},
+		{"not held", false, http.StatusInternalServerError, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			runRow := rr.seedRun()
+			stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+			stage.Type = run.StageTypeImplement
+			store := &countingAdmitStore{}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, Concurrency: store,
+				HostAdmissionHold: &fakeAdmissionHold{held: tc.held, reason: "critical"}})
+
+			w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if got := store.count(); got != tc.wantAdmits {
+				t.Errorf("slot Admit calls = %d, want %d", got, tc.wantAdmits)
+			}
+			if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingHostDispatch {
+				t.Errorf("committed state = %q, want awaiting_host_dispatch", cur.State)
+			}
+		})
 	}
 }

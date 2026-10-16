@@ -52,7 +52,7 @@ There is NO `requester` member: fishhawkd derives the requester from the authent
 | `plan_crosscheck` | `questions[]`, `focus_files[] {path, expect: present\|absent}`, `compare_runs[]` of `run-ref`; at least one of questions/focus_files non-empty | 16 / 64 / 8 |
 | `overlap_scan` | `runs[]` of `run-ref` (required), `watch_paths[]` (`path.Match` globs) | 2..16 / ≤32 |
 | `fanin_build` | `slices[] {name, head_sha}`, `packages[]` (both required) | 1..16 each |
-| `inventory` | `command` (`git_log` \| `ls_files` \| `go_list`), `args` selected by command: `git_log {paths[], max_count}`, `ls_files {pathspec[], max_entries}`, `go_list {packages[]}` | paths ≤16, max_count 1..200, max_entries 1..2000, packages 1..16 |
+| `inventory` | `command` (`git_log` \| `ls_files` \| `go_list` \| `host.memory` \| `host.top_memory` \| `host.load` \| `host.containers`), `args` selected by command: `git_log {paths[], max_count}`, `ls_files {pathspec[], max_entries}`, `go_list {packages[]}`, every `host.*` id exactly `{}` (closed: no member is accepted) | paths ≤16, max_count 1..200, max_entries 1..2000, packages 1..16 |
 | `draft` | `document_kind` (`adr` \| `issue`), `title`, `brief`, `outline[] {heading, body}` | title ≤200, brief ≤8192, outline ≤16 of heading ≤120 / body ≤8192 |
 
 `battery-mutation` is exactly the field set of `plan-standard-v1` `$defs.counterfactual` (`control_path`, `mutation {find, replace | patch}`, `tests {run, package}`, `expect: red`) with bounds added; `TestBatteryMutationShapeMatchesPlanCounterfactual` pins the property keys, required sets and `expect` enum of all three defs.
@@ -65,7 +65,7 @@ There is NO `requester` member: fishhawkd derives the requester from the authent
 | `execution_nonce` | string ≤128 | the nonce the admission issued; required |
 | `kind` | kind | must equal the job's kind (`ErrKindMismatch`) |
 | `verdict` | `pass` \| `fail` \| `inconclusive` | required |
-| `reason` | `kind_not_executable` \| `not_runnable` \| `admission_timeout` \| `materialize_failed` \| `unresolvable_sha` \| `execution_error` \| `timeout` \| `probe_error` \| `inputs_invalid` | required when `evidence` is absent |
+| `reason` | `kind_not_executable` \| `not_runnable` \| `admission_timeout` \| `materialize_failed` \| `unresolvable_sha` \| `execution_error` \| `timeout` \| `probe_error` \| `inputs_invalid` \| `not_applicable` | required when `evidence` is absent; `not_applicable` = the job cannot apply on the executing host (a `host.*` id on an OS outside the runner's table) |
 | `evidence` | object | selected by `kind`; may be absent ONLY with `verdict: inconclusive` and a `reason` |
 | `duration_ms` | integer ≥0 | required |
 
@@ -90,7 +90,7 @@ There is NO `requester` member: fishhawkd derives the requester from the authent
 | `fanin_build` | any slice `conflict` or package `fail` | any `timeout`/`error` | otherwise |
 | `overlap_scan` | any pairwise overlap or watch hit | any unresolvable SHA | otherwise |
 | `plan_crosscheck` | any question/focus mismatch, or a focus file touched by a compare run | unresolvable SHA or probe `error` | otherwise |
-| `inventory` | — | non-zero exit | exit 0 |
+| `inventory` | — | non-zero exit or unreadable source (`execution_error`), `timeout`; a `host.*` id on an OS outside the table: `not_applicable`, no evidence | exit 0 / every read succeeded |
 | `draft` | — | — | rendered |
 | unregistered kind | — | `reason: kind_not_executable`, no evidence | — |
 
@@ -104,7 +104,7 @@ Server-composed, never accepted from a client: `{job_id, kind, requester {seat: 
 
 ## Execution boundary
 
-- Every non-draft kind runs under `fishhawk-runner specialist-job` in a freshly materialized scratch clone, never the lineage worktree or the source checkout; every untrusted execution gets its own clone and no git call runs in a clone after code executed in it.
+- Every non-draft kind runs under `fishhawk-runner specialist-job` in a freshly materialized scratch clone, never the lineage worktree or the source checkout; every untrusted execution gets its own clone and no git call runs in a clone after code executed in it. The one exception is the `inventory` `host.*` ids, which read no repository tree and so never clone (below).
 - Every `go test` / `go list` goes through the runner's gate exec seam under the verify lock.
 - The runner's job HTTP client admits only GET `/v0/specialist-jobs/{id}` and POST `/v0/specialist-jobs/{id}/{admission,result}`; its git guard refuses `push` and remote edits.
 - Runner jobs are admitted through the `local-verify:<host>` concurrency group (never an implement slot) and yield to verify-stage holders and waiters; a running job heartbeats by re-POSTing admission.
@@ -155,3 +155,16 @@ E85.15 / #4363. Pure helpers: `backend/internal/specialistjob/attestation.go`; p
 - **Provenance.** A verified result records `runner_attested`. A result with no signature header records `bearer` (advisory). A pre-0104 completion (provenance NULL) and a `draft` read as `bearer`.
 - **Blocking eligibility.** `specialistjob.BlockingEligible(provenance)` is the ONE predicate deciding ADR-089 D4 blocking eligibility: true only for `runner_attested`; `bearer`, empty and unknown provenance are false.
 - **Residual.** The scope proves possession of a credential a plain `write:stages` bearer cannot mint over the API. It does not isolate the attester token from a same-host, same-OS-user process that can read the runner's environment.
+
+## Host inventory commands (#4330)
+
+The four `host.*` `inventory` ids are read-only, argument-free host diagnostics the first officer's host-health duty requests. They observe and never remediate (ADR-089 D9): no id kills, restarts, cleans or reconfigures anything. Each maps, per OS, onto a fixed runner-side read set, so no repository- or host-specific value reaches a command line; they read no tree, so the runner routes them before any clone (`subject.head_sha` is still required by the envelope and unused).
+
+| Id | darwin | linux |
+|---|---|---|
+| `host.memory` | `vm_stat`; `sysctl -n vm.swapusage` | `/proc/meminfo`; `/proc/pressure/memory` (absent = the line `unavailable`, not a failure) |
+| `host.top_memory` | `top -l 1 -o mem -n 50 -stats pid,command,mem,cmprs` | `/proc/<pid>/status` `Name`/`VmRSS`/`VmSwap`, top 50 by resident + swapped |
+| `host.load` | `uptime`; runnable (`R`) / uninterruptible (`U`) counts from `ps -axo stat=` | `/proc/loadavg`; `procs_running` / `procs_blocked` from `/proc/stat` |
+| `host.containers` | `docker ps` / `docker stats --no-stream` for `fishhawk-gate-` containers only, under a runner-minted credential-free `DOCKER_CONFIG` | same |
+
+Every line is evidence data: control and format characters are stripped, a parsed process or container name is cut to 64 bytes, and the lines go through the same 2000-line / 1000-char redacted bound as every inventory output. An OS outside the table answers `inconclusive` / `not_applicable` without running anything. `host.containers` needs a safe local docker endpoint: with none (no docker, a podman-only host, a remote endpoint) it is `inconclusive` / `execution_error`. Runner contract: `runner/README.md` § "Specialist jobs".

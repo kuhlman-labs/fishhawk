@@ -331,6 +331,96 @@ func TestParseRequest_InventoryCommandEnum(t *testing.T) {
 	wantSchemaError(t, err, "/inputs/command")
 }
 
+// TestParseRequest_HostInventoryCommands (#4330): each host.* id parses with
+// the empty args object; a host id carrying any args member, and every id
+// outside the closed set (a shell, git, a host.* lookalike), is refused.
+func TestParseRequest_HostInventoryCommands(t *testing.T) {
+	for _, cmd := range []string{InventoryHostMemory, InventoryHostTopMemory, InventoryHostLoad, InventoryHostContainers} {
+		req, err := ParseRequest(mustJSON(t, requestDoc(KindInventory, map[string]any{"command": cmd, "args": map[string]any{}})))
+		if err != nil {
+			t.Fatalf("%s with {}: %v", cmd, err)
+		}
+		if req.Inventory == nil || req.Inventory.Command != cmd || !reflect.DeepEqual(req.Inventory.Args, InventoryArgs{}) {
+			t.Fatalf("%s typed inputs = %+v", cmd, req.Inventory)
+		}
+		for _, args := range []map[string]any{
+			{"max_count": 1},
+			{"paths": []any{"docs"}},
+			{"pid": 1},
+		} {
+			_, err := ParseRequest(mustJSON(t, requestDoc(KindInventory, map[string]any{"command": cmd, "args": args})))
+			wantSchemaError(t, err, "")
+		}
+	}
+	for _, cmd := range []string{"host.shell", "sh", "git", "host.memory ", "HOST.MEMORY", "host.*"} {
+		_, err := ParseRequest(mustJSON(t, requestDoc(KindInventory, map[string]any{"command": cmd, "args": map[string]any{}})))
+		wantSchemaError(t, err, "/inputs/command")
+	}
+}
+
+// TestParseCompletion_HostInventoryAndNotApplicable (#4330 condition 3): a
+// serialized host.memory completion with typed evidence, and an inconclusive
+// not_applicable completion without evidence, both pass ParseCompletion; the
+// evidence command enum refuses an id outside the closed set.
+func TestParseCompletion_HostInventoryAndNotApplicable(t *testing.T) {
+	ev := map[string]any{"command": InventoryHostMemory, "lines": []any{"# vm_stat", "Pages free: 1000."}, "truncated": false, "exit_code": 0}
+	c, err := ParseCompletion(mustJSON(t, completionDoc(KindInventory, "pass", ev)), KindInventory)
+	if err != nil {
+		t.Fatalf("host.memory completion: %v", err)
+	}
+	typed, err := DecodeEvidence(KindInventory, c.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := typed.(*InventoryEvidence); got.Command != InventoryHostMemory || len(got.Lines) != 2 {
+		t.Fatalf("typed evidence = %+v", got)
+	}
+	na := completionDoc(KindInventory, "inconclusive", nil)
+	na["reason"] = "not_applicable"
+	c, err = ParseCompletion(mustJSON(t, na), KindInventory)
+	if err != nil {
+		t.Fatalf("not_applicable completion: %v", err)
+	}
+	if c.Reason != "not_applicable" || len(c.Evidence) != 0 {
+		t.Fatalf("not_applicable completion = %+v", c)
+	}
+	ev["command"] = "host.shell"
+	_, err = ParseCompletion(mustJSON(t, completionDoc(KindInventory, "pass", ev)), KindInventory)
+	wantSchemaError(t, err, "/evidence/command")
+}
+
+// TestInventoryCommands_MatchSchemaEnums pins both schema command enums
+// (inputs-inventory and evidence-inventory) to InventoryCommands, and both
+// reason enums (completion and result) to the same set carrying not_applicable.
+func TestInventoryCommands_MatchSchemaEnums(t *testing.T) {
+	var doc struct {
+		Defs map[string]struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(EmbeddedSchema(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, def := range []string{"inputs-inventory", "evidence-inventory"} {
+		if got := doc.Defs[def].Properties["command"].Enum; !reflect.DeepEqual(got, InventoryCommands) {
+			t.Errorf("$defs.%s.command enum = %v, want InventoryCommands %v", def, got, InventoryCommands)
+		}
+	}
+	completion := doc.Defs["completion"].Properties["reason"].Enum
+	if result := doc.Defs["result"].Properties["reason"].Enum; !reflect.DeepEqual(completion, result) {
+		t.Errorf("completion reason enum %v != result reason enum %v", completion, result)
+	}
+	found := false
+	for _, r := range completion {
+		found = found || r == "not_applicable"
+	}
+	if !found {
+		t.Errorf("completion reason enum %v lacks not_applicable", completion)
+	}
+}
+
 func TestParseRequest_InventoryArgsSelectedByCommand(t *testing.T) {
 	in := validInputs(KindInventory)
 	in["command"] = "go_list" // args still carry git_log's members

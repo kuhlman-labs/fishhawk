@@ -132,6 +132,17 @@ keeps its state. It is the same
 rule the server applies when it advances a run on its own: a post-deploy
 acceptance stage runs only once every earlier deploy stage succeeded.
 
+The same marker can also hold new dispatches while the host is short of
+memory, which the table does not spell out either. The hold is off by
+default and interim (the planned adaptive concurrency controller replaces
+it): `fishhawkd serve --enable-ops-monitor --ops-monitor-dispatch-hold` on a
+local deployment turns it on. While the ops monitor reads critical memory
+pressure, a `pending` or `awaiting_host_dispatch` stage is refused with 409
+`host_memory_pressure`, `details.reason` and `details.retry`, and the stage
+keeps its state. A stage that is already `dispatched` keeps its idempotent
+200, and nothing in flight is stopped. Re-dispatch once the condition
+clears.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->

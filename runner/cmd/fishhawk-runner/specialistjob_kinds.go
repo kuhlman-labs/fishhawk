@@ -2,9 +2,10 @@ package main
 
 // Specialist-job kinds executed by this file (E85.9 / #4300):
 // counterfactual_battery (the E85.3 counterfactual executor plus structured
-// probes), inventory (a closed command-id → argv table), and the shared probe
-// evaluator plan_crosscheck reuses. Contract: runner/README.md § "Specialist
-// jobs".
+// probes), inventory (a closed command-id → argv table; the argument-free
+// host.* ids run from specialistjob_host.go's per-OS table, #4330), and the
+// shared probe evaluator plan_crosscheck reuses. Contract: runner/README.md §
+// "Specialist jobs".
 
 import (
 	"bytes"
@@ -415,22 +416,30 @@ func (r *specialistJobRun) probeGoTest(ctx context.Context, head string, t sjTes
 	}
 }
 
-// executeInventoryJob maps the closed command id onto a fixed argv, runs it
-// in a fresh scratch clone of head (git through jobGit, go list through
-// execInClone), and returns the bounded, redacted output lines. pass on exit
-// 0, otherwise inconclusive.
+// executeInventoryJob validates the closed command id and its args, routes a
+// host.* id to the per-OS host table BEFORE any clone (it reads no tree),
+// and otherwise maps the id onto a fixed argv run in a fresh scratch clone of
+// head (git through jobGit, go list through execInClone). It returns the
+// bounded, redacted output lines: pass on exit 0, otherwise inconclusive.
 func executeInventoryJob(ctx context.Context, r *specialistJobRun) specialistJobOutcome {
 	var in sjInventoryInputs
 	if err := decodeJobInputs(r.job.Inputs, &in); err != nil {
 		return inconclusive(sjReasonInputsInvalid)
 	}
-	head, ok := r.headSHA()
-	if !ok {
-		return inconclusive(sjReasonUnresolvableSHA)
-	}
 	limit, err := inventoryLimit(in)
 	if err != nil {
 		return inconclusive(sjReasonInputsInvalid)
+	}
+	if isHostInventoryCommand(in.Command) {
+		s := defaultHostInventorySeams()
+		if r.host != nil {
+			s = *r.host
+		}
+		return executeHostInventory(ctx, s, in.Command)
+	}
+	head, ok := r.headSHA()
+	if !ok {
+		return inconclusive(sjReasonUnresolvableSHA)
 	}
 	clone, err := r.freshClone(ctx, head)
 	if err != nil {
@@ -484,6 +493,11 @@ func inventoryLimit(in sjInventoryInputs) (int, error) {
 			if strings.HasPrefix(strings.TrimPrefix(strings.TrimSpace(p), "./"), "-") {
 				return 0, fmt.Errorf("package %q", p)
 			}
+		}
+		return inventoryMaxLines, nil
+	case sjHostMemory, sjHostTopMemory, sjHostLoad, sjHostContainers:
+		if err := hostArgsEmpty(in.Args); err != nil {
+			return 0, err
 		}
 		return inventoryMaxLines, nil
 	}

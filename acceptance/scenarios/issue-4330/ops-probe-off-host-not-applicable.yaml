@@ -1,0 +1,14 @@
+id: scenario:issue-4330/ops-probe-off-host-not-applicable
+statement: Running `fishhawkd ops-probe --deployment kubernetes --json` lists the memory and workload_containers results with status not_applicable (never ok), because host probes do not run where the host is not Fishhawk's to observe.
+verify_hint: 'CLI stdout: parse the JSON array from `fishhawkd ops-probe --deployment kubernetes --json` and check the status of the entries whose probe is memory and workload_containers; exit code 0 unless another probe fails.'
+steps: 'Built fishhawkd from the sanctioned checkout (HEAD 17be7f14 = preview git_sha): cd backend && go build -o /tmp/fh4330/fishhawkd ./cmd/fishhawkd. With no database URL, ran /tmp/fh4330/fishhawkd ops-probe --deployment kubernetes --json, parsed the JSON array and checked the memory and workload_containers entries. Also ran --deployment remote and the text-mode spelling --ops-monitor-deployment kubernetes.'
+assertions:
+    expected: memory and workload_containers status not_applicable (never ok); exit 0
+    observed_at_record: 'exit 0. memory: not_applicable, reason ''host-local probe skipped: deployment is kubernetes''. workload_containers: not_applicable with the same reason. No entry is ok. remote gives the same result.'
+    repro_handle: fishhawkd ops-probe --deployment kubernetes --json
+origin:
+    issue: 4330
+    pr: 0
+    run_id: f43b9730-36a9-444a-828c-7e9d02795880
+    head_sha: 17be7f1403eca1028a538d83e55e105cb53da383
+    recorded_at: 2026-10-16T16:50:48Z

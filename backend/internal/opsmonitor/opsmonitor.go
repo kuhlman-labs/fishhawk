@@ -4,9 +4,12 @@
 // reachability with an EIO indicator, Postgres reachability,
 // fishhawk-runner processes whose stage or run is terminal, and (E85.2 /
 // #4146) pending scope amendments whose decision window is closing or whose
-// stage is already terminal — and turns each
-// FAILING (condition, subject) into ONE run-less ops_probe_failed audit row
-// plus ONE operator issue comment per quiet window.
+// stage is already terminal, and (E85.11 / #4330) host memory pressure and
+// Fishhawk gate-container load — and turns each FAILING (condition, subject)
+// into ONE run-less ops_probe_failed audit row plus ONE operator issue
+// comment per quiet window. A host-health hysteresis CROSSING additionally
+// writes ONE ops_monitor_alert trigger row per tick, and an optional
+// AdmissionHold tracks critical memory pressure (hosthealth.go).
 //
 // Fail-safety is enforced centrally by Sweep: a probe that panics, times out,
 // returns no result or an unrecognized status reads unknown, never ok. Every
@@ -26,6 +29,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
 )
 
 // CategoryOpsProbeFailed is the global-chain audit category written once per
@@ -100,6 +104,15 @@ const (
 	// ConditionAmendmentPendingOnTerminalStage: a scope amendment is still
 	// pending although its stage is terminal.
 	ConditionAmendmentPendingOnTerminalStage = "amendment_pending_on_terminal_stage"
+	// ConditionHostMemoryPressure: a host memory signal (available memory,
+	// swap, the OS pressure signal) is latched past its band (E85.11).
+	ConditionHostMemoryPressure = "host_memory_pressure"
+	// ConditionWorkloadContainersHigh: running Fishhawk gate containers are
+	// too many or hold too much of host RAM (E85.11).
+	ConditionWorkloadContainersHigh = "workload_containers_high"
+	// ConditionHostLoadIOWait: the load is over the limit and driven by tasks
+	// waiting (I/O, swap-in), not by CPU demand (E85.11).
+	ConditionHostLoadIOWait = "host_load_io_wait"
 )
 
 // Conditions lists every condition constant (the remedies-table coverage
@@ -114,6 +127,9 @@ var Conditions = []string{
 	ConditionOrphanedRunner,
 	ConditionAmendmentWindowClosing,
 	ConditionAmendmentPendingOnTerminalStage,
+	ConditionHostMemoryPressure,
+	ConditionWorkloadContainersHigh,
+	ConditionHostLoadIOWait,
 }
 
 // remedies is the one human remedy per condition.
@@ -127,6 +143,12 @@ var remedies = map[string]string{
 	ConditionOrphanedRunner:                  "Confirm the pid is a fishhawk-runner whose stage is terminal (`ps -o pid,args -p <pid>`) and kill it; it holds host resources and can block reload/post-merge.",
 	ConditionAmendmentWindowClosing:          "Decide the amendment now with fishhawk_decide_scope_amendment (fishhawk_list_scope_amendments names it). Once the window closes the implement agent stops waiting, and a later approval lands only through fishhawk_retry_stage.",
 	ConditionAmendmentPendingOnTerminalStage: "The stage is terminal, so no agent will read a decision: deny the amendment with fishhawk_decide_scope_amendment to close it, or approve it and run fishhawk_retry_stage to land the paths.",
+	// The three host-health remedies are host- and codebase-agnostic. The
+	// memory and container probes compose their own remedy naming the
+	// contributors, which wins over these table entries.
+	ConditionHostMemoryPressure:     hosthealth.GenericAction + " " + hosthealth.HoldGuidance,
+	ConditionWorkloadContainersHigh: "Too many workload containers are running, or they hold too much host memory: let in-flight stages finish, stop idle containers, and run fewer stages concurrently until the count and memory recover.",
+	ConditionHostLoadIOWait:         "The load is driven by tasks waiting on I/O or swap-in, not by CPU demand: free memory (the memory probe names the largest holders) and run fewer I/O-heavy workloads at once; stopping CPU-bound processes will not help.",
 }
 
 // genericRemedy fills a failing result whose condition has no table entry.
@@ -157,6 +179,23 @@ type Result struct {
 	// durations: never host paths, argv, amendment paths or agent-written
 	// reason text.
 	Fields map[string]any `json:"fields,omitempty"`
+	// Contributors names the processes or containers a host-health failing
+	// result attributes the condition to (E85.11). The alert row carries
+	// them bounded and sanitized (boundContributors).
+	Contributors []Contributor `json:"contributors,omitempty"`
+	// OS is the operating system a host-health probe read (E85.11).
+	OS string `json:"os,omitempty"`
+	// Crossing is set from the tick a host-health latch crosses from clear to
+	// latched until the Ticker records a result carrying it, so a discarded
+	// (timed-out) result cannot lose it; only a crossing writes an
+	// ops_monitor_alert row. Critical is set while the memory probe's
+	// critical latch holds; it drives the AdmissionHold. Neither is
+	// serialized.
+	Crossing bool `json:"-"`
+	Critical bool `json:"-"`
+	// ackCrossing, set with Crossing, tells the probe the Ticker recorded
+	// the crossing (crossingEdge.ack).
+	ackCrossing func()
 }
 
 // Probe is one health check. HostLocal probes observe the fishhawkd host and
@@ -324,10 +363,15 @@ type Ticker struct {
 	NotifyTimeout time.Duration // default DefaultNotifyTimeout
 	// Now is the clock for the dedup window and the row timestamp.
 	Now func() time.Time
+	// Hold, when set, is updated on every tick: held while a memory result
+	// is critical, cleared otherwise. INTERIM (see AdmissionHold). Its
+	// update never depends on an audit write.
+	Hold *AdmissionHold
 
 	mu          sync.Mutex
 	lastEmitted map[string]time.Time
 	lastWarned  map[string]time.Time
+	lastAlerted map[string]time.Time
 }
 
 // Run drives the ticker until ctx is cancelled. It errors only on an empty
@@ -336,14 +380,10 @@ func (t *Ticker) Run(ctx context.Context) error {
 	if len(t.Probes) == 0 {
 		return fmt.Errorf("opsmonitor: ticker requires at least one probe")
 	}
-	interval := t.Interval
-	if interval <= 0 {
-		interval = DefaultInterval
-	}
 	t.logNotApplicable(ctx)
 
 	t.Tick(ctx)
-	tick := time.NewTicker(interval)
+	tick := time.NewTicker(t.interval())
 	defer tick.Stop()
 	for {
 		select {
@@ -376,11 +416,15 @@ func (t *Ticker) logNotApplicable(ctx context.Context) {
 		slog.String("probes", strings.Join(skipped, ",")))
 }
 
-// Tick runs one sweep and emits its failing results. A panicking audit store
-// or notifier is recovered per result into a WARN, so one emit can never
-// stop another or crash the process. Exposed for deterministic tests.
+// Tick runs one sweep, updates the Hold, emits its failing results, then
+// writes at most ONE ops_monitor_alert row for the tick's host-health
+// crossings. A panicking audit store or notifier is recovered per result
+// (and once for the alert) into a WARN, so one emit can never stop another
+// or crash the process. Exposed for deterministic tests.
 func (t *Ticker) Tick(ctx context.Context) []Result {
 	results := Sweep(ctx, t.Probes, t.Deployment, t.ProbeTimeout)
+	// Before any audit write, so the hold never depends on one succeeding.
+	t.updateHold(results)
 	for _, r := range results {
 		switch r.Status {
 		case StatusFailing:
@@ -389,6 +433,7 @@ func (t *Ticker) Tick(ctx context.Context) []Result {
 			t.warnUnknown(ctx, r)
 		}
 	}
+	t.alertRecovered(ctx, results)
 	return results
 }
 
@@ -506,7 +551,7 @@ func (t *Ticker) auditSuppressed(ctx context.Context, r Result, now time.Time, q
 	if t.Audit == nil {
 		return time.Time{}, false
 	}
-	entries, err := t.listOpsRows(ctx)
+	entries, err := t.listOpsRows(ctx, CategoryOpsProbeFailed)
 	if err != nil {
 		t.logger().LogAttrs(ctx, slog.LevelWarn, "opsmonitor: audit dedup lookup failed; using in-memory dedup only",
 			slog.String("error", err.Error()))
@@ -530,16 +575,16 @@ func (t *Ticker) auditSuppressed(ctx context.Context, r Result, now time.Time, q
 	return time.Time{}, false
 }
 
-// listOpsRows runs the dedup lookup under its own recover, so a panicking
-// store degrades to the in-memory path like a read error instead of
-// unwinding emit before the notifier is reached.
-func (t *Ticker) listOpsRows(ctx context.Context) (entries []*audit.Entry, err error) {
+// listOpsRows runs a dedup lookup (the newest auditLookupLimit rows of one
+// category) under its own recover, so a panicking store degrades to the
+// in-memory path like a read error instead of unwinding emit before the
+// notifier is reached.
+func (t *Ticker) listOpsRows(ctx context.Context, category string) (entries []*audit.Entry, err error) {
 	defer func() {
 		if recover() != nil {
 			entries, err = nil, errors.New("audit lookup panicked")
 		}
 	}()
-	category := CategoryOpsProbeFailed
 	return t.Audit.ListAll(ctx, audit.ListAllParams{Category: &category, Limit: auditLookupLimit})
 }
 
@@ -574,6 +619,15 @@ func (t *Ticker) markEmitted(key string, ts time.Time) {
 // in either direction, so a clock step backwards cannot suppress forever.
 func within(d, quiet time.Duration) bool {
 	return d < quiet && d > -quiet
+}
+
+// interval is the effective sweep interval: Run and the AdmissionHold
+// staleness bound share this one zero -> DefaultInterval resolution.
+func (t *Ticker) interval() time.Duration {
+	if t.Interval <= 0 {
+		return DefaultInterval
+	}
+	return t.Interval
 }
 
 func (t *Ticker) quietWindow() time.Duration {
