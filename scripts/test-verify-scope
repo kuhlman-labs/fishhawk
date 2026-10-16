@@ -72,6 +72,8 @@ assert_ne() { # <desc> <not-expected> <actual>
 #
 # <dir>/scripts/test          a copy of the REPO's real scripts/test
 # <dir>/scripts/*             no-op recording stubs for every sub-gate verify runs
+#                             (check-gate-image included: the lint leg's --host
+#                             precondition and the static pin leg, #4245)
 # <dir>/bin/{go,golangci-lint,sleep,docker}  recording stubs; prepend to PATH
 # <dir>/go.work + modules.json  two modules: ./backend and ./cli
 # <dir>/logs/go.log           one `<reldir>\t<argv>` line per `go test`
@@ -177,6 +179,18 @@ exit 0
 EOF
     chmod +x "$dir/scripts/$g"
   done
+
+  # --- check-gate-image stub ---------------------------------------------
+  # Records its argv: the lint leg's host-toolchain precondition (#4245) calls
+  # it with --host, and verify's static pin leg calls it without. The REAL one
+  # would probe the operator's host tools and fail the fixture on a mismatched
+  # gofmt, which this harness does not test.
+  cat > "$dir/scripts/check-gate-image" <<EOF
+#!/usr/bin/env bash
+printf 'check-gate-image %s\n' "\$*" >> "$dir/logs/gate.log"
+exit 0
+EOF
+  chmod +x "$dir/scripts/check-gate-image"
 
   # --- check-coverage.py stub --------------------------------------------
   cat > "$dir/scripts/check-coverage.py" <<EOF
@@ -411,6 +425,7 @@ assert_contains "a10 scoped: site IA gate ran" "$FX/logs/gate.log" "check-site-i
 assert_contains "a10 scoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
 assert_contains "a10 scoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
 assert_contains "a10 scoped: run-agent guard harness ran" "$FX/logs/gate.log" "test-is-run-agent"
+assert_contains "a10 scoped: the lint leg ran the host-toolchain check (#4245)" "$FX/logs/gate.log" "--host"
 run_verify "$FX"
 assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run --allow-serial-runners ./..."
 assert_contains "a10 unscoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
@@ -420,6 +435,7 @@ assert_contains "a10 unscoped: site IA gate ran" "$FX/logs/gate.log" "check-site
 assert_contains "a10 unscoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
 assert_contains "a10 unscoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
 assert_contains "a10 unscoped: run-agent guard harness ran" "$FX/logs/gate.log" "test-is-run-agent"
+assert_contains "a10 unscoped: the lint leg ran the host-toolchain check (#4245)" "$FX/logs/gate.log" "--host"
 
 # a11 — the doc-line budget still FAILS verify in both modes (the non-test legs
 # are not merely invoked in scoped mode, they still gate).

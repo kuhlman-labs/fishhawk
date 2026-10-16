@@ -15,7 +15,9 @@
 #   scripts/test              run `go test -race ./...` in every module (a failing
 #                             module does not stop the rest; see above)
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
-#   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module
+#   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module;
+#                             refuses (host_toolchain_mismatch) on a host golangci-lint/gofmt
+#                             that differs from the gate-image pins (#4245)
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
 #   scripts/test verify --packages backend/internal/run,cli/internal/spec
 #                             the SCOPED verify form (#3315): every non-test leg
@@ -1015,6 +1017,36 @@ EOF
   fi
 }
 
+# _require_lint_host_toolchain (#4245): refuse to lint when the HOST's
+# golangci-lint or standalone gofmt differs from this checkout's gate-image pins
+# (deploy/gate-image/Dockerfile, read at run time by `scripts/check-gate-image
+# --host`). golangci-lint's gofmt/goimports formatters are the go/printer of the
+# Go that BUILT it, so a host binary built with another Go minor reports
+# correctly formatted main as misformatted, and an implement agent then reads an
+# environment artifact as a format defect in the tree. lint never runs a
+# standalone gofmt, but the gofmt half refuses anyway: the agent's OWN `gofmt -l`
+# on a Homebrew go1.27 gofmt is what misled run 580c33c6 into a scope amendment
+# whose "fix" would red CI, and a lint leg passing beside that gofmt reads as
+# corroboration. Unlike _verify_gate_image_pins (a pin REPORT that skips when the
+# script is absent) this is a CONTROL, so a missing checker refuses (fail closed).
+_require_lint_host_toolchain() {
+  if [ ! -x "$ROOT/scripts/check-gate-image" ]; then
+    echo "scripts/test: scripts/check-gate-image missing or not executable — cannot check the host golangci-lint/gofmt against the gate-image pins, refusing to lint (fail closed)" >&2
+    exit 1
+  fi
+  if ! "$ROOT/scripts/check-gate-image" --root "$ROOT" --host >&2; then
+    cat >&2 <<'EOF'
+scripts/test: host_toolchain_mismatch: lint REFUSED — the host golangci-lint/gofmt above differ from this checkout's gate-image pins (deploy/gate-image/Dockerfile).
+Any format or lint finding from them would describe the HOST toolchain, not the code: this is an ENVIRONMENT problem, NOT a defect in the tree.
+Do not edit files or request a scope amendment to "fix" it. Remedies:
+  - CI parity in the pinned image: `scripts/test lint --in-gate-image` / `scripts/test verify --in-gate-image`
+  - or put the pinned tools first on PATH: `export PATH="$(go env GOROOT)/bin:$PATH"` when `go version`
+    reports the pinned Go, and install the pinned golangci-lint release named above.
+EOF
+    exit 1
+  fi
+}
+
 # cmd_lint passes --allow-serial-runners (#3962): golangci-lint holds a global
 # lock, and WITHOUT the flag a second concurrent instance exits immediately with
 # "parallel golangci-lint is running". Two local runs' verify gates (or an
@@ -1023,9 +1055,12 @@ EOF
 # instance WAITS for the lock and runs serially. --allow-parallel-runners is
 # deliberately not used: two concurrent analyses against one shared cache are
 # what the lock exists to prevent. CI runs one lint per job and never contends,
-# so its ci.yml invocation stays flagless; that is the only difference.
+# so its ci.yml invocation stays flagless; that is the only difference. Before
+# any module is linted, _require_lint_host_toolchain refuses on a host toolchain
+# that differs from the gate-image pins (#4245).
 cmd_lint() {
   _require_golangci_lint
+  _require_lint_host_toolchain
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && golangci-lint run --allow-serial-runners ./...)
