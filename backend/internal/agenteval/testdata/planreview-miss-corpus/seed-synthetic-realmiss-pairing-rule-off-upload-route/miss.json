@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000445302",
+  "artifact_id": "00000000-0000-0000-0001-000000445302",
+  "triage_sequence": 121,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion observes a surface the planned change reaches for only one of its cases (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-post-deferral-note-400",
+      "statement": "POST /schedules returns HTTP 400 naming deferral_note for each of four bodies: delivery deferred with deferral_note absent, delivery deferred with deferral_note empty, delivery deferred with deferral_note whitespace-only, and deferral_note set while delivery is now.",
+      "source": "inferred",
+      "rationale": "The issue requires these schedules to be refused; schedules enter the service through POST /schedules, so each refusal is observable there.",
+      "observed": "POST /schedules returned 400 naming deferral_note for the absent-note body and 201 for the empty, whitespace-only and delivery-now bodies: the handler checked the JSON Schema only, and schedule.Validate ran only when the dispatcher loaded each stored schedule",
+      "expected": "HTTP 400 naming deferral_note for all four bodies",
+      "steps_taken": "POST each of the four bodies to /schedules and read the status and the error",
+      "expectation_basis": "criterion ac-post-deferral-note-400",
+      "repro_handle": "curl -s -o /dev/null -w '%{http_code}' -d '{\"cron\":\"0 6 * * 1\",\"delivery\":\"deferred\",\"deferral_note\":\"  \"}' $TARGET/schedules",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

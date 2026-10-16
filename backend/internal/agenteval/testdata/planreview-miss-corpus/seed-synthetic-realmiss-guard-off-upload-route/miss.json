@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000445301",
+  "artifact_id": "00000000-0000-0000-0001-000000445301",
+  "triage_sequence": 120,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion observes a surface the planned change never reaches (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-put-none-with-rules-400",
+      "statement": "PUT /flags/{key} with a body that declares rollout none and carries a targeting rule returns HTTP 400 whose error names that rule's id.",
+      "source": "inferred",
+      "rationale": "The issue requires such a definition to be rejected with the rule's id; definitions reach the service through PUT /flags/{key}, so an operator sees the rejection there.",
+      "observed": "PUT /flags/demo with rollout none and rule r-1 returned HTTP 201 and stored the definition: the handler checked the body against the JSON Schema only, and flagdef.Check rejected the definition only when the evaluator later loaded it",
+      "expected": "HTTP 400 whose error names r-1",
+      "steps_taken": "PUT a rollout-none definition carrying targeting rule r-1 to /flags/demo, read the status and body, then GET /flags/demo",
+      "expectation_basis": "criterion ac-put-none-with-rules-400",
+      "repro_handle": "curl -s -o /dev/null -w '%{http_code}' -X PUT -d '{\"rollout\":\"none\",\"rules\":[{\"id\":\"r-1\",\"segment\":\"beta\"}]}' $TARGET/flags/demo",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}
