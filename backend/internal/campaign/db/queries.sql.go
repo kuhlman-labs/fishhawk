@@ -590,6 +590,42 @@ func (q *Queries) SetCampaignItemAutonomy(ctx context.Context, arg SetCampaignIt
 	return i, err
 }
 
+const setCampaignItemDependsOn = `-- name: SetCampaignItemDependsOn :one
+UPDATE campaign_items
+   SET depends_on = $2
+ WHERE id = $1
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
+`
+
+type SetCampaignItemDependsOnParams struct {
+	ID        uuid.UUID `json:"id"`
+	DependsOn []byte    `json:"depends_on"`
+}
+
+// Overwrites an item's depends_on with the MONOTONE union the append path
+// computed (E86.47 / #4358). The caller holds the campaign row lock, then this
+// item's LockCampaignItemForUpdate lock, applies it only to a pending/blocked
+// item with no run, and passes a superset of the persisted edges.
+func (q *Queries) SetCampaignItemDependsOn(ctx context.Context, arg SetCampaignItemDependsOnParams) (CampaignItem, error) {
+	row := q.db.QueryRow(ctx, setCampaignItemDependsOn, arg.ID, arg.DependsOn)
+	var i CampaignItem
+	err := row.Scan(
+		&i.ID,
+		&i.CampaignID,
+		&i.IssueRef,
+		&i.DependsOn,
+		&i.RunID,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PauseReason,
+		&i.Autonomy,
+		&i.QueuePosition,
+		&i.ResolvedBy,
+	)
+	return i, err
+}
+
 const settleCampaignItemForClosedIssue = `-- name: SettleCampaignItemForClosedIssue :one
 UPDATE campaign_items
    SET state = $2, resolved_by = $3
