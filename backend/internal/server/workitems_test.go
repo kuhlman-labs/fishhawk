@@ -1878,6 +1878,160 @@ func TestFileWorkItem_Anonymous_Unauthorized(t *testing.T) {
 	}
 }
 
+// fileWorkItemAs POSTs body to the handler under the exact Identity given.
+// Unlike fileWorkItem it can set TokenID and Scopes, which the #4481 scope
+// tests need: an identity with no TokenID is cookie-shaped and passes
+// requireWriteScope unconditionally, so it would mask the check.
+func fileWorkItemAs(t *testing.T, s *Server, body workItemRequest, id Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v0/work-items", bytes.NewReader(raw))
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	rec := httptest.NewRecorder()
+	s.handleFileWorkItem(rec, req)
+	return rec
+}
+
+// countingConventionsLoader swaps conventionsLoader for one returning the
+// default conventions and counting its calls, so a test can assert a refusal
+// landed BEFORE the conventions load (#4481: a refused caller costs no
+// conventions load and no forge round-trip).
+func countingConventionsLoader(t *testing.T) *int {
+	t.Helper()
+	calls := 0
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		calls++
+		return workmgmt.Default(), nil
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+	return &calls
+}
+
+// TestFileWorkItem_ReadOnlyToken_InsufficientScope pins the #4481 control: a
+// non-run-bound bearer WITHOUT write:runs is refused 403 insufficient_scope
+// naming write:runs, and nothing is filed. The identity is built so the scope
+// check is the only thing in the path: TokenID is set (so the cookie bypass
+// cannot admit it), the subject is github: (so neither the first-officer
+// wrapper nor the run-bound arms intervene), no run_id is supplied (so the
+// run_not_entitled arm is not reached) and the provider is registered (so,
+// with the check deleted, the run-absent filing would reach File and 201).
+func TestFileWorkItem_ReadOnlyToken_InsufficientScope(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scopes []string
+	}{
+		{"read_runs_only", []string{"read:runs"}},
+		{"read_audit_only", []string{"read:audit"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeWorkProvider{}
+			registerFakeProvider(t, fp)
+			loads := countingConventionsLoader(t)
+			au := newAuditFake()
+			s := New(Config{AuditRepo: au})
+
+			rec := fileWorkItemAs(t, s, workItemRequest{
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "chore",
+				Summary:   "A read-only token tries to file",
+				TitleVars: map[string]string{"epic": "22", "n": "7"},
+			}, Identity{Subject: "github:reader", TokenID: "tok", Scopes: tc.scopes})
+
+			// Errorf, not Fatalf: with the check deleted every assertion below
+			// must report, the committed-state reads (provider, loader, audit)
+			// included.
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+			}
+			var env struct {
+				Error struct {
+					Code    string         `json:"code"`
+					Details map[string]any `json:"details"`
+				} `json:"error"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &env)
+			code, details := env.Error.Code, env.Error.Details
+			if code != "insufficient_scope" {
+				t.Errorf("code = %q, want insufficient_scope", code)
+			}
+			if got, _ := details["required_scope"].(string); got != "write:runs" {
+				t.Errorf("details.required_scope = %q, want write:runs", got)
+			}
+			if fp.called {
+				t.Error("provider File was called; a read-only token must file nothing")
+			}
+			if *loads != 0 {
+				t.Errorf("conventions loaded %d times; want 0 (refused before the body read)", *loads)
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			if len(au.appended) != 0 {
+				t.Errorf("appended %d audit entries, want 0", len(au.appended))
+			}
+		})
+	}
+}
+
+// TestFileWorkItem_WriteRunsToken_Files is the admit half of the #4481
+// control: the same bearer fixture holding write:runs files (201, provider
+// called), so the refusal above is the scope and not the fixture.
+func TestFileWorkItem_WriteRunsToken_Files(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	s := New(Config{AuditRepo: newAuditFake()})
+
+	rec := fileWorkItemAs(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "A write:runs token files",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+	}, Identity{Subject: "github:operator", TokenID: "tok", Scopes: []string{"write:runs"}})
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("provider was not called")
+	}
+}
+
+// TestFileWorkItem_RunBoundToken_FilesWithoutWriteRuns pins the run-bound
+// exemption that keeps the in-run agent loop working (#4481): a run-bound
+// token carrying only mcp:read, with TokenID SET, files on its own run. The
+// TokenID is set on purpose: the existing run-bound tests carry none, so the
+// cookie bypass in requireWriteScope would admit them even without the
+// exemption. Here the exemption is the only thing admitting the caller.
+func TestFileWorkItem_RunBoundToken_FilesWithoutWriteRuns(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	inst := int64(4242)
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: run.StateRunning, InstallationID: &inst}
+	s := New(Config{RunRepo: rr, AuditRepo: au})
+
+	rec := fileWorkItemAs(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "The in-run agent files on its own run",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		RunID:     runID.String(),
+	}, Identity{Subject: "mcp:run:" + runID.String(), TokenID: "tok", Scopes: []string{scopeRunBoundRead}})
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("provider was not called")
+	}
+}
+
 // fakeGithubAPI implements github.API so the depends_on end-to-end test can
 // drive the REAL workmgmt/github.Provider — exercising its actual
 // renderDependsOnMarker write at File time and parseDependsOnMarker read at
