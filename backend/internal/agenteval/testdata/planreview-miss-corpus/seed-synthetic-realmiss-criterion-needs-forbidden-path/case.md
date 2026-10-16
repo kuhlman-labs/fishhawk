@@ -56,8 +56,10 @@ operator-side edit (`verification.out_of_scope`) instead of a criterion.
 The `catch_probes` are polarity-bearing and defect-specific, one family per
 honest phrasing route: unsatisfiable from inside the run (`unsatisfiable
 from`, `cannot be satisfied by this`), the run cannot edit the pipeline
-(`cannot edit verify.yml`, `this change cannot touch`, `not writable`,
-`off-limits`), the criterion contradicts the plan's own risk entry
+(`cannot edit verify.yml`, `this change cannot touch`, `not writable`),
+the plan never writes the pipeline (`not in scope.files`,
+`absent from scope.files`, `no approach step edits`), the criterion
+contradicts the plan's own risk entry
 (`contradicts the plan's own risk`, `falls under deploy/pipelines`,
 `fails the path check`), and the remedy (`platform-team change`,
 `operator-side edit`, `move it to out_of_scope`, `separate pull request`).
@@ -71,6 +73,18 @@ probes, the `attribution_phrases` (substrings of the planted statement and of
 no other criterion), the `defect_phrases` the prompt-leak self-check reads,
 and the catching and non-catching examples the loader checks.
 
-Whether this case lands in the 30-80% band on `not_mentioned` reviewer misses
-is decided only by the operator's live calibration dry run (run-book Step
-1d), not offline.
+## Calibration
+
+**Result (Step 1d, head `18a3ad31`, 30 trials).** Scored 15/30 with
+conventions and 14/30 without. All 31 misses were `no_probe`, and every one is
+a real attributed catch phrased outside the probes (Captain ruling
+2026-10-16). The fix-up after calibration widened the probes with `not in
+scope.files`, `absent from scope.files` and `no approach step edits`, and
+pinned them with a catching example only those probes match. It also dropped
+`is forbidden` and `off-limits`: neither matched in the 30-trial calibration,
+both are short enough for an unrelated anchored note to reach, and no catching
+example depends on either (the one that contains `off-limits` also matches
+`not writable`). Kept as a documented CEILING by Captain ruling 2026-10-16
+(honest rate about 30/30); the combined batch re-recording rescores it. Step
+1d "Results" in `docs/compliance/planreview-catchrate-evidence.md` is the
+record.

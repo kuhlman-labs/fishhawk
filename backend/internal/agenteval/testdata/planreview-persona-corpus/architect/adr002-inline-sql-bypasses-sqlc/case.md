@@ -81,3 +81,9 @@ score. Attribution by `step 2`, `ListRunsFiltered`, `pgxpool directly` or
 loader classifies to prove the rule discriminates. Difficulty is not
 decidable offline: it waits on the operator's Step 1d calibration
 (`docs/compliance/planreview-catchrate-evidence.md`).
+
+**Result (Step 1d, head `18a3ad31`, 30 trials).** Scored 30/30 on the
+architect arm. Kept as a documented CEILING by Captain ruling 2026-10-16
+(honest rate about 30/30); the combined batch re-recording rescores it. Step
+1d "Results" in `docs/compliance/planreview-catchrate-evidence.md` is the
+record.

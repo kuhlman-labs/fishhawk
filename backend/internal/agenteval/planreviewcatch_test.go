@@ -34,11 +34,13 @@ const (
 // in band on reviewer misses; five were cut, three at the ceiling and two in
 // band only on scoring misses), plus E55.26 / #4453's three slice-0
 // real-miss reconstructions (seed-synthetic-realmiss-guard-off-upload-route,
-// -pairing-rule-off-upload-route and -deferred-surface-conjunct), which are
-// candidates until the operator's live calibration: the post-calibration
-// fix-up sets this floor to the kept count;
+// -pairing-rule-off-upload-route and -deferred-surface-conjunct). The
+// operator's live calibration (run-book Step 1d, 2026-10-16) cut none of
+// #4453's five cases, and its fix-up left this floor at 16, so the two
+// lesson-derived seeds sit in its slack;
 // the derived list below may grow past it, never shrink below it (so the
-// derivation cannot go vacuous and a deleted case cannot pass silently).
+// derivation cannot go vacuous and a deletion past the slack cannot pass
+// silently).
 const committedSyntheticCatchCaseFloor = 16
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every

@@ -174,7 +174,11 @@
     "no step sends the email",
     "no step sends an email",
     "plan itself defers the email",
-    "plan itself excludes the email"
+    "plan itself excludes the email",
+    "out of scope section excludes",
+    "excludes exactly that",
+    "excludes that email",
+    "contradicts the plan's own scope"
   ],
   "attribution_phrases": [
     "email names the dropped row numbers",
@@ -211,6 +215,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "ac-drops-audited-and-emailed: the email clause is not warranted (the issue asks for a record support can read) and the plan itself excludes the email; drop the second clause."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-drops-audited-and-emailed: the plan's out of scope section excludes exactly that, so the criterion contradicts the plan's own scope."
     }
   ],
   "non_catching_examples": [

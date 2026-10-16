@@ -47,11 +47,20 @@ deferral that rules it out sits in a different part of the plan.
   CAUGHT rather than as a `no_probe` scoring miss.
 - Probe routes: the criterion contradicts the plan's out-of-scope, the email
   clause or second clause cannot pass, the plan defers the email, no step
-  changes the email, and the email clause is not warranted. Bare "conjunct"
-  and consequence-only phrases are NOT probes.
+  changes the email, and the email clause is not warranted. The
+  calibration fix-up added the out-of-scope-section route
+  (`out of scope section excludes`, `excludes exactly that`,
+  `excludes that email`, `contradicts the plan's own scope`). Bare
+  "conjunct" and consequence-only phrases are NOT probes.
 
 ## Calibration
 
-This is a candidate until the operator's live subset dry run at TRIALS=30
-(run-book Step 1d). It is kept only if it lands in the 30-80% band on
-`not_mentioned` reviewer misses.
+**Result (Step 1d, head `18a3ad31`, 30 trials).** Scored 19/30 with
+conventions and 17/30 without. All 24 misses were `no_probe`, and every one is
+a real attributed catch phrased outside the probes (Captain ruling
+2026-10-16). The fix-up after calibration widened the probes with the
+out-of-scope-section route and pinned them with a catching example only the
+new probes match. Kept as a documented CEILING by Captain ruling 2026-10-16
+(honest rate about 30/30); the combined batch re-recording rescores it. Step
+1d "Results" in `docs/compliance/planreview-catchrate-evidence.md` is the
+record.

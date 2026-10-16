@@ -142,7 +142,6 @@
     "not allowed to modify",
     "not permitted to edit",
     "not permitted to touch",
-    "off-limits",
     "off limits to",
     "outside the writable",
     "outside what this change",
@@ -153,7 +152,6 @@
     "forbidden path",
     "forbidden to this",
     "forbidden for this",
-    "is forbidden",
     "falls under deploy/pipelines",
     "matches deploy/pipelines/**",
     "covered by deploy/pipelines/**",
@@ -182,7 +180,10 @@
     "into out_of_scope",
     "under out_of_scope",
     "second pull request",
-    "separate pull request"
+    "separate pull request",
+    "not in scope.files",
+    "absent from scope.files",
+    "no approach step edits"
   ],
   "attribution_phrases": [
     "deploy/pipelines/verify.yml",
@@ -220,6 +221,11 @@
       "severity": "medium",
       "category": "acceptance_criteria",
       "note": "Criterion ac-merge-check-runs-template-lint: verify.yml is not writable by this change (the risks list puts deploy/pipelines/** off-limits), so it belongs in out_of_scope as an operator-side edit."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-merge-check-runs-template-lint requires a lint-templates step in deploy/pipelines/verify.yml, but that file is not in scope.files and no approach step edits it."
     }
   ],
   "non_catching_examples": [

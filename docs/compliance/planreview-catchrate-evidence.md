@@ -70,7 +70,9 @@ candidates at the PR head (Step 1d), routes any rework or cut through a
 fix-up, and re-pins later in the ONE combined re-recording after #3930,
 #4402, #4453, #4326 and #4400 have all merged. Until then `catchrategate`
 reads stale on main, by design. #4453 leaves `evidence.json` and
-`evidence.trials.json` untouched.
+`evidence.trials.json` untouched. Step 1d ran on 2026-10-16 at head
+`18a3ad31`: no candidate was cut, and all eight are kept as a documented
+CEILING, a partial delivery (Step 1d "Results").
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -129,11 +131,12 @@ attribution-AND-probe catch rule and the loader's fail-closed modes:
 holds eighteen cases as of #4453, all `seed-synthetic-*`, two or more per
 weak class. Thirteen are kept cases: #4253's twelve plus the one #4361 case
 that calibrated in band (Step 1c's results record the five cut). Five are
-#4453 CANDIDATES (`seed-synthetic-realmiss-*`) pending Step 1d.
+#4453 cases (`seed-synthetic-realmiss-*`), kept at the ceiling after Step 1d
+(a partial delivery; Step 1d "Results").
 
 The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`)
 holds nine SYNTHETIC cases: six catch and three clean. Three of the catch
-cases are #4453 candidates pending Step 1d. The corpus loads against the REAL
+cases are #4453 cases, kept at the ceiling after Step 1d. The corpus loads against the REAL
 `docs/review/architect-remit.md` and `docs/adr/index.json` of the checkout;
 its schema and fail-closed loader modes are in the agenteval README §
 "The arms":
@@ -471,7 +474,9 @@ fewer survive, the Captain rules on a partial delivery, as for #4361.
   lower bound, so until this fix-up the per-case hygiene tests are the only
   guard on the two lesson-derived cases: deleting one leaves the floor
   satisfied. With 18 seeds against 16 the slack is two, so the floor does not
-  catch the deletion of any single case until this fix-up.
+  catch the deletion of any single case until this fix-up. The 2026-10-16
+  fix-up cut nothing and, under the Captain's instruction not to touch the
+  floor beyond what the tests need, left it at 16 (see "Results").
 - Update the case counts in the agenteval README (§ "The arms", its file
   table) and in Step 1 above. Every cut conventions case changes
   `SamplesPerCaseForPower(n)`.
@@ -480,20 +485,50 @@ fewer survive, the Captain rules on a partial delivery, as for #4361.
 - Add a "Calibration dry runs" row (§ "Results").
 - The re-pin is NOT part of this fix-up: it waits for the combined recording.
 
-**Results (pending operator calibration).** One row per candidate and arm:
-the raw scored rate, the miss classes, the honest rate (the miss transcripts
-read, and any widened rule re-scored) and the outcome.
+**Results (2026-10-16, head `18a3ad31`).** 30 trials per case and arm, both
+conventions arms and the architect arm. Raw scored catches and miss classes,
+then the honest rate (every miss transcript read) and the outcome:
 
 | case | arm | scored | misses | honest | outcome |
 |---|---|---|---|---|---|
-| seed-synthetic-realmiss-guard-off-upload-route | with / without | pending | pending | pending | pending operator calibration |
-| seed-synthetic-realmiss-pairing-rule-off-upload-route | with / without | pending | pending | pending | pending operator calibration |
-| seed-synthetic-realmiss-deferred-surface-conjunct | with / without | pending | pending | pending | pending operator calibration |
-| seed-synthetic-realmiss-criterion-needs-forbidden-path | with / without | pending | pending | pending | pending operator calibration |
-| seed-synthetic-realmiss-criterion-needs-unwritable-pr-body | with / without | pending | pending | pending | pending operator calibration |
-| adr040-superseded-operator-role-reliance | architect | pending | pending | pending | pending operator calibration |
-| adr002-inline-sql-bypasses-sqlc | architect | pending | pending | pending | pending operator calibration |
-| adr046-required-field-in-frozen-major | architect | pending | pending | pending | pending operator calibration |
+| seed-synthetic-realmiss-guard-off-upload-route | with / without | 30/30 / 30/30 | none | ceiling | KEPT (ceiling) |
+| seed-synthetic-realmiss-pairing-rule-off-upload-route | with / without | 30/30 / 30/30 | none | ceiling | KEPT (ceiling) |
+| seed-synthetic-realmiss-deferred-surface-conjunct | with / without | 19/30 / 17/30 | no_probe 11 / 13 | ~30/30 / ~30/30 | KEPT (ceiling), probes widened |
+| seed-synthetic-realmiss-criterion-needs-forbidden-path | with / without | 15/30 / 14/30 | no_probe 15 / 16 | ~30/30 / ~30/30 | KEPT (ceiling), probes widened |
+| seed-synthetic-realmiss-criterion-needs-unwritable-pr-body | with / without | 28/30 / 30/30 | no_probe 2 / none | ~30/30 / ceiling | KEPT (ceiling) |
+| adr040-superseded-operator-role-reliance | architect | 29/30 | undecodable 1 | ~30/30 | KEPT (ceiling) |
+| adr002-inline-sql-bypasses-sqlc | architect | 30/30 | none | ceiling | KEPT (ceiling) |
+| adr046-required-field-in-frozen-major | architect | 29/30 | undecodable 1 | ~30/30 | KEPT (ceiling) |
+
+- All 57 conventions-arm misses were `no_probe`, and every one is a real
+  attributed catch. The two architect misses were undecodable responses.
+- 0 of the 5 conventions cases is in band on `not_mentioned` misses, against
+  the issue's bar of 5 or more. This is a PARTIAL DELIVERY: the cases are
+  kept as a documented CEILING (honest rate about 30/30), per Captain ruling
+  2026-10-16.
+- The probes were widened on the two cases with `no_probe` misses
+  (`deferred-surface-conjunct`, `criterion-needs-forbidden-path`) so the
+  scored rate matches the honest one. Each widening is pinned by a catching
+  example that only the new probes match (loader mode k). `forbidden-path`
+  also dropped `is forbidden` and `off-limits`, which never matched and are
+  reachable by unrelated notes. Each `case.md` records its widening.
+- `unwritable-pr-body`: reviewers led with the planted description-surface
+  defect ("cannot edit the pr description", 25-26/30). The "later-job files"
+  adjacency an implement-review low raised did not displace it, so the case
+  is kept unchanged.
+- The combined batch re-recording rescores everything (batch rule: no re-pin
+  on this branch). Until it lands, `catchrategate` reads stale on main, by
+  design.
+- The cause: the reconstructed plans are obviously flawed overall. 300/300
+  conventions trials returned `reject`, with about 4.3 concerns each, so the
+  planted defect is never subtle.
+- A follow-up plants cases into real approved plans (follow-up filed by
+  operator).
+- No case was cut, so the case counts above are unchanged. The fix-up left
+  `committedSyntheticCatchCaseFloor` at 16 under the Captain's instruction not
+  to touch it beyond what the tests need. The slack of two therefore stands,
+  and the per-case hygiene tests remain the only guard against deleting a
+  single seed case.
 
 ## Step 2 — run the arms
 
@@ -888,4 +923,4 @@ harder security catch cases".
 | 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
 | 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
 | 2026-10-15 | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | three cases at the ceiling (100%/100%) and two in band only on scoring misses (honest rate ~100%) were cut by Captain ruling 2026-10-15; restates-approach-observable is in band on reviewer misses, honest 13/30 with and 16/30 without (Step 1c "Results"); harder cases continue in #4453 | Step 1c "Results" (head `23a9dee4`, re-scored at the operator commit) |
-| pending | `without_conventions` + `with_conventions` + `architect` (#4453, Step 1d) | 30 | pending operator calibration: eight candidates (five conventions, three architect); at least 5 must be kept, in band on `not_mentioned` reviewer misses | Step 1d "Results" (pending) |
+| 2026-10-16 | `without_conventions` + `with_conventions` + `architect` (#4453, Step 1d) | 30 | 0 of 5 conventions cases in band on `not_mentioned` misses (bar: 5): all 57 misses `no_probe`, each a real catch (honest ~30/30); architect adr002 30/30, adr040 and adr046 29/30 (1 undecodable each). All eight kept as a documented CEILING by Captain ruling 2026-10-16 (partial delivery); probes widened on deferred-surface-conjunct and criterion-needs-forbidden-path; the combined batch re-recording rescores them | Step 1d "Results" (head `18a3ad31`) |

@@ -565,7 +565,7 @@ false-alarm rate (conforming plans) before the architect is enabled.
 | `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `planreviewpersonalive_test.go` | the double-gated live calibration dry run (`TestCatchRateCalibrationLive`) plus its offline knob and wiring tests |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
-| `testdata/planreview-persona-corpus/architect/` | the nine architect cases, six catch and three clean (`persona_case.json` + a SYNTHETIC-provenance `case.md` each); a CANDIDATE count until the E55.26 / #4453 calibration cuts (run-book Step 1d) |
+| `testdata/planreview-persona-corpus/architect/` | the nine architect cases, six catch and three clean (`persona_case.json` + a SYNTHETIC-provenance `case.md` each); the E55.26 / #4453 calibration cut none (run-book Step 1d "Results") |
 
 ### Generator model
 
@@ -617,7 +617,10 @@ The operator calibrates the candidates at the PR head (run-book Step 1d),
 routes any out-of-band rework through a fix-up, and re-pins later in the ONE
 combined re-recording after every batched trigger change (#3930, #4402,
 #4453, #4326, #4400) merges. Until then `catchrategate` reads stale on main,
-by design.
+by design. Step 1d ran on 2026-10-16 (head `18a3ad31`): no case was cut, and
+all eight are kept as a documented CEILING (honest rate about 30/30), a
+partial delivery by Captain ruling; the run-book's Step 1d "Results" is the
+record.
 
 **E78.11 / #4313 makes the record arm-keyed (`planreview-catchrate-evidence-v2`)
 and bumps the rule to `planreview-catch-v5`.** The committed pair stays a
@@ -995,7 +998,10 @@ the only guard on those two cases: deleting one leaves the floor satisfied.
 With 18 seeds against a floor of 16 the slack is two, so until that fix-up the
 floor does not catch the deletion of any single case, slice 0's included.
 That same fix-up updates the case counts above and fills the run-book's
-Step 1d results table.
+Step 1d results table. The 2026-10-16 fix-up cut nothing, so the counts
+stand, and it left the floor at 16 under the Captain's instruction not to
+touch it beyond what the tests need: the slack of two, and the per-case
+hygiene tests as the only guard on a single deleted case, remain.
 
 ### The arms
 
@@ -1008,10 +1014,11 @@ Today: `without_conventions` and `with_conventions` over the
 miss corpus (18 catch cases, 8 samples each: `SamplesPerCaseForPower(18)`),
 and `architect` over the persona corpus (6 catch + 3 clean cases, 46 samples
 each, `SamplesPerCaseForPersona(6, 3)` = the max over the present classes of
-`ceil(136 / n)`, so each class clears the floor). Both counts are CANDIDATE
-counts: E55.26 / #4453 added five conventions cases and three architect catch
-cases that the operator's Step 1d calibration keeps or cuts, and a cut changes
-the conventions arms' `samples_per_case` again. `CatchRateInputs` names the
+`ceil(136 / n)`, so each class clears the floor). E55.26 / #4453 added five
+conventions cases and three architect catch cases; the operator's Step 1d
+calibration (2026-10-16) cut none and kept all eight at the ceiling, so both
+counts stand. A later cut changes the conventions arms' `samples_per_case`
+again. `CatchRateInputs` names the
 miss corpus, the conventions fixture, the persona corpus and the checkout root
 the persona arm reads its documents from.
 

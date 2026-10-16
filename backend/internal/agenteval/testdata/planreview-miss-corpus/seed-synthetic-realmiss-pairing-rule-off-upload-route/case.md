@@ -57,6 +57,8 @@ missed this class twice in separate runs, and this is the second instance.
 
 ## Calibration
 
-This is a candidate until the operator's live subset dry run at TRIALS=30
-(run-book Step 1d). It is kept only if it lands in the 30-80% band on
-`not_mentioned` reviewer misses.
+**Result (Step 1d, head `18a3ad31`, 30 trials).** Scored 30/30 with
+conventions and 30/30 without: no misses. Kept as a documented CEILING by
+Captain ruling 2026-10-16 (honest rate about 30/30); the combined batch
+re-recording rescores it. Step 1d "Results" in
+`docs/compliance/planreview-catchrate-evidence.md` is the record.

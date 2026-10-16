@@ -75,6 +75,16 @@ probes, the `attribution_phrases` (substrings of the planted statement and of
 no other criterion), the `defect_phrases` the prompt-leak self-check reads,
 and the catching and non-catching examples the loader checks.
 
-Whether this case lands in the 30-80% band on `not_mentioned` reviewer misses
-is decided only by the operator's live calibration dry run (run-book Step
-1d), not offline.
+## Calibration
+
+**Result (Step 1d, head `18a3ad31`, 30 trials).** Scored 28/30 with
+conventions and 30/30 without; both misses were `no_probe` and both are real
+catches. Reviewers led with the planted description-surface defect ("cannot
+edit the pr description", 25-26/30). The implement review's low-tier concern
+that `scope.files` creates `bench/results/presets.md` and
+`internal/thumbs/presets_gen.go` while approach step 4 has the media-runner
+job produce them after the pull request opens (the "later-job files"
+adjacency) did not displace it, so the case is kept unchanged. Kept as a
+documented CEILING by Captain ruling 2026-10-16 (honest rate about 30/30); the
+combined batch re-recording rescores it. Step 1d "Results" in
+`docs/compliance/planreview-catchrate-evidence.md` is the record.

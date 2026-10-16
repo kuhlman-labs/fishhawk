@@ -119,7 +119,7 @@ func TestCalibrationLiveKnobs(t *testing.T) {
 // live seam builds ONE generator on the catch-rate model and calibrates the
 // committed architect arm end to end (a scripted sender catching every catch
 // case is ABOVE band, so the live test would fail on it). The want is every
-// committed catch case, counted from the loaded corpus.
+// committed catch case, counted from the loaded corpus, with a floor of 3.
 func TestCatchRateCalibrationLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	var got []anthropic.Config
 	cal, model, err := calibrateLive(context.Background(), func(c anthropic.Config) MessageSender {
@@ -137,6 +137,12 @@ func TestCatchRateCalibrationLive_WiresCatchRateGeneratorModel(t *testing.T) {
 		if c.Expect() == CatchExpectCatch {
 			nCatch++
 		}
+	}
+	// The want is derived from the corpus the code under test reads, so it
+	// guards itself: below the persona corpus's catch-case floor the equality
+	// would hold vacuously (#4453 fix-up).
+	if nCatch < 3 {
+		t.Fatalf("committed persona corpus holds %d catch cases, want >= 3: the OutOfBand count below would hold vacuously", nCatch)
 	}
 	if oob := cal.OutOfBand(); len(oob) != nCatch {
 		t.Errorf("OutOfBand() = %v, want the %d always-caught architect catch cases", oob, nCatch)
