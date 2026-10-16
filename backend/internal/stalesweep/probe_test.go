@@ -115,3 +115,91 @@ func TestPSProbe_DefaultExecMissingBinary(t *testing.T) {
 		t.Fatal("execOutput on a missing binary returned nil error")
 	}
 }
+
+// TestParseRunnerProcessList_StageID pins the stage-id half of the shared
+// identity rule the ops monitor's orphaned-runner probe reads (E85.1 / #4142):
+// exact-token `--stage-id`, first occurrence wins, and a present-but-unreadable
+// claim (valueless, non-UUID, or the single-token `--stage-id=` form) is
+// distinguishable from no claim at all.
+func TestParseRunnerProcessList_StageID(t *testing.T) {
+	run, stage := uuid.New(), uuid.New()
+	for name, tc := range map[string]struct {
+		line      string
+		wantStage *uuid.UUID
+		malformed bool
+	}{
+		"present":               {fmt.Sprintf("1 fishhawk-runner --run-id %s --stage-id %s", run, stage), &stage, false},
+		"missing":               {fmt.Sprintf("2 fishhawk-runner --run-id %s", run), nil, false},
+		"non-UUID":              {fmt.Sprintf("3 fishhawk-runner --run-id %s --stage-id nope", run), nil, true},
+		"valueless":             {fmt.Sprintf("4 fishhawk-runner --run-id %s --stage-id", run), nil, true},
+		"single-token = form":   {fmt.Sprintf("5 fishhawk-runner --run-id %s --stage-id=%s", run, stage), nil, true},
+		"first --stage-id wins": {fmt.Sprintf("6 fishhawk-runner --run-id %s --stage-id bad --stage-id %s", run, stage), nil, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			procs := ParseRunnerProcessList(tc.line + "\n")
+			if len(procs) != 1 {
+				t.Fatalf("procs = %+v, want one", procs)
+			}
+			p := procs[0]
+			if p.RunID == nil || *p.RunID != run {
+				t.Errorf("RunID = %v, want %s", p.RunID, run)
+			}
+			switch {
+			case tc.wantStage == nil && p.StageID != nil:
+				t.Errorf("StageID = %s, want nil", *p.StageID)
+			case tc.wantStage != nil && (p.StageID == nil || *p.StageID != *tc.wantStage):
+				t.Errorf("StageID = %v, want %s", p.StageID, *tc.wantStage)
+			}
+			if p.StageIDMalformed != tc.malformed {
+				t.Errorf("StageIDMalformed = %v, want %v", p.StageIDMalformed, tc.malformed)
+			}
+		})
+	}
+}
+
+// TestParseRunnerProcessList_DedupAndUnattributed: a repeated pid is listed
+// once and a run-id-less runner is still listed (RunID nil) so the ops monitor
+// can count it as unattributed.
+func TestParseRunnerProcessList_DedupAndUnattributed(t *testing.T) {
+	a := uuid.New()
+	raw := fmt.Sprintf("7 fishhawk-runner --run-id %s\n7 fishhawk-runner --run-id %s\n8 fishhawk-runner\n9 grep fishhawk-runner\n", a, uuid.New())
+	procs := ParseRunnerProcessList(raw)
+	if len(procs) != 2 {
+		t.Fatalf("procs = %+v, want pids 7 and 8", procs)
+	}
+	if procs[0].PID != "7" || procs[0].RunID == nil || *procs[0].RunID != a {
+		t.Errorf("procs[0] = %+v, want pid 7 run %s (first occurrence)", procs[0], a)
+	}
+	if procs[1].PID != "8" || procs[1].RunID != nil {
+		t.Errorf("procs[1] = %+v, want pid 8 with nil RunID", procs[1])
+	}
+}
+
+func TestPSProbe_ProcessesExecError(t *testing.T) {
+	p := PSProbe{Exec: func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf("1 fishhawk-runner --run-id %s\n", uuid.New())), errors.New("exit status 1")
+	}}
+	procs, err := p.Processes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("err = %v, want the exec error", err)
+	}
+	if procs != nil {
+		t.Errorf("procs = %+v, want nil alongside the error", procs)
+	}
+}
+
+func TestPSProbe_ProcessesParses(t *testing.T) {
+	run, stage := uuid.New(), uuid.New()
+	var gotArgs []string
+	p := PSProbe{Exec: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(fmt.Sprintf("42 fishhawk-runner --run-id %s --stage-id %s\n", run, stage)), nil
+	}}
+	procs, err := p.Processes(context.Background())
+	if err != nil || len(procs) != 1 || procs[0].StageID == nil || *procs[0].StageID != stage {
+		t.Fatalf("procs = %+v, err %v", procs, err)
+	}
+	if strings.Join(gotArgs, " ") != "-axww -o pid=,args=" {
+		t.Errorf("args = %v, want the scripts/dev ps invocation", gotArgs)
+	}
+}

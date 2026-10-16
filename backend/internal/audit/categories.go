@@ -485,6 +485,7 @@ var KnownCategories = map[string]struct{}{
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},
+	"ops_probe_failed":                        {}, // E85.1 / #4142: the opt-in ops monitor saw a failing host/process condition; one global-chain row per (condition, subject) per quiet window, also its restart-surviving dedup record (opsmonitor) — INTERNAL, not in issuecomment activityCategories
 	"parent_awaiting_child_scope_decision":    {},
 	"parent_awaiting_redrive":                 {},
 	"permission_drift_detected":               {}, // E80.4 / #3761: the deterministic permission-drift check raised server_check concerns for widened permission surfaces (server/permission_drift.go) — INTERNAL, surfaces/paths/keys/values only

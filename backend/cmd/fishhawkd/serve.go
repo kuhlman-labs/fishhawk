@@ -1079,6 +1079,17 @@ func registeredCIRequirementReader(id string) forge.CIRequirementReader {
 // (backend/internal/repodoc), not to this wiring.
 var documentInjectionForgeIDs = []string{"github", "gitlab"}
 
+// serveContext is runServe's shutdown context: cancelled on SIGINT/SIGTERM.
+// A seam so a test can drive runServe to a live listener and stop it without
+// signalling the test process.
+var serveContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+}
+
+// serveOpsMonitorSeams are the ops monitor's probe seams under runServe; the
+// zero value is production.
+var serveOpsMonitorSeams opsMonitorSeams
+
 // newServer indirects server.New so serve_test can observe the FULLY
 // CONSTRUCTED server.Config runServe builds — the seam the cross-layer
 // single-tenant-profile-reaches-the-denial-log test (#2468) captures through.
@@ -2049,6 +2060,14 @@ func runServe(args []string, logSink io.Writer) int {
 	invariantMonitorInterval := fs.Duration("invariant-monitor-interval",
 		60*time.Second,
 		"invariant monitor scan interval")
+	enableOpsMonitor := fs.Bool("enable-ops-monitor",
+		envOrBool("FISHHAWKD_ENABLE_OPS_MONITOR", false),
+		"start the host and process health monitor (E85.1 / #4142): disk free space, sampled GOCACHE size, load vs "+
+			"cores, Docker and Postgres reachability (EIO indicator), and fishhawk-runner processes whose stage is "+
+			"terminal. Each failing condition writes one ops_probe_failed audit row and, with "+
+			"--ops-monitor-notify-issue, one issue comment per quiet window. Off by default; an invalid "+
+			"--ops-monitor-* value fails startup only when this is on")
+	opsMonitorFlagSet := registerOpsMonitorFlags(fs)
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -2296,6 +2315,15 @@ func runServe(args []string, logSink io.Writer) int {
 	schedRepos, err := parseSchedulerRepos(*schedulerRepos)
 	if err != nil {
 		logger.Error("invalid --scheduler-repos", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	// Ops monitor flags (E85.1 / #4142), validated only when the monitor is
+	// enabled and before anything dials a database: a misconfigured monitor
+	// the operator turned on fails startup loudly rather than silently
+	// watching the wrong volume or posting nowhere.
+	opsMonitorConf, err := resolveOpsMonitorConfig(*enableOpsMonitor, opsMonitorFlagSet, os.Getenv)
+	if err != nil {
+		logger.Error("invalid ops monitor configuration", slog.String("error", err.Error()))
 		return exitFailure
 	}
 
@@ -3617,7 +3645,7 @@ func runServe(args []string, logSink io.Writer) int {
 	logger.Info("review-gate resolution provider selected",
 		slog.String("provider", reviewResolver.Name()))
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := serveContext()
 	defer stop()
 
 	// Start the live ModelOracle refresh goroutine (#1341). Fires an initial
@@ -3909,6 +3937,28 @@ func runServe(args []string, logSink io.Writer) int {
 				slog.Duration("interval", *invariantMonitorInterval),
 				slog.Bool("lineage_sweep", cfg.GitHub != nil))
 		}
+	}
+
+	// Ops monitor (E85.1 / #4142): host and process health probes. Started on
+	// its own goroutine AFTER the server is constructed, so a slow or
+	// panicking probe can never block or crash startup (startOpsMonitor
+	// recovers; opsmonitor.Sweep bounds each probe). Without a database the
+	// postgres and runners probes read unknown; it never logs at ERROR.
+	if opsMonitorConf != nil {
+		deps := opsMonitorDeps{
+			Audit:  cfg.AuditRepo,
+			Runs:   cfg.RunRepo, // a nil run.Repository converts to a nil RunReader
+			Ping:   poolPing(pool),
+			GitHub: cfg.GitHub,
+			Logger: logger,
+			Seams:  serveOpsMonitorSeams,
+		}
+		startOpsMonitor(ctx, newOpsMonitorTicker(*opsMonitorConf, deps), logger)
+		logger.Info("ops monitor started",
+			slog.String("deployment", string(opsMonitorConf.Deployment)),
+			slog.Duration("interval", opsMonitorConf.Interval),
+			slog.Duration("quiet_window", opsMonitorConf.QuietWindow),
+			slog.Bool("notify_issue", opsMonitorConf.NotifyIssue > 0 && cfg.GitHub != nil))
 	}
 
 	// Child-completion sweeper (#455 / ADR-025 D4). Resolves parent
