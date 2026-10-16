@@ -116,6 +116,9 @@ func (f *fakeScopeAmendmentRepo) Decide(_ context.Context, p scopeamendment.Deci
 	if !ok {
 		return nil, scopeamendment.ErrNotFound
 	}
+	if a.Status == scopeamendment.StatusLapsed {
+		return nil, scopeamendment.ErrLapsed
+	}
 	if a.Status != scopeamendment.StatusPending {
 		return nil, scopeamendment.ErrAlreadyDecided
 	}
@@ -128,6 +131,23 @@ func (f *fakeScopeAmendmentRepo) Decide(_ context.Context, p scopeamendment.Deci
 	a.DecidedAt = &now
 	cp := *a
 	return &cp, nil
+}
+
+// lapse mirrors the #4127 lapse: a pending row moves to lapsed with
+// decided_at set, decided_by nil and decision_reason naming the trigger.
+func (f *fakeScopeAmendmentRepo) lapse(t *testing.T, id uuid.UUID, trigger string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.rows[id]
+	if !ok || a.Status != scopeamendment.StatusPending {
+		t.Fatalf("lapse(%s): row missing or not pending", id)
+	}
+	now := time.Now().UTC()
+	reason := "lapsed undecided: " + trigger + " before an operator decision"
+	a.Status = scopeamendment.StatusLapsed
+	a.DecisionReason = &reason
+	a.DecidedAt = &now
 }
 
 var _ scopeamendment.Repository = (*fakeScopeAmendmentRepo)(nil)
@@ -1535,5 +1555,90 @@ func TestScopeAmendment_HeadroomFields_ListPendingOnly(t *testing.T) {
 		default:
 			t.Errorf("unexpected status %q", item.Status)
 		}
+	}
+}
+
+// TestDecideScopeAmendment_Lapsed409 (#4127): approve and deny on a lapsed
+// row both answer 409 amendment_lapsed with the lapse's status, reason and
+// stage, write NO scope_amendment_decided entry, and leave the row unchanged.
+func TestDecideScopeAmendment_Lapsed409(t *testing.T) {
+	s, _, sa, au, runRow, _ := scopeAmendmentServer(t)
+	amendmentID := seedPendingAmendment(t, s, runRow.ID)
+	sa.lapse(t, amendmentID, "stage succeeded")
+	before, _ := sa.GetByID(context.Background(), amendmentID)
+	auditBefore := len(au.appended)
+	operator := func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") }
+
+	for _, decision := range []string{"approve", "deny"} {
+		w := postDecision(t, s, runRow.ID, amendmentID, `{"decision":"`+decision+`","reason":"late"}`, operator)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("%s on a lapsed row: status = %d, want 409; body = %s", decision, w.Code, w.Body.String())
+		}
+		var body struct {
+			Error struct {
+				Code    string         `json:"code"`
+				Message string         `json:"message"`
+				Details map[string]any `json:"details"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v; body = %s", err, w.Body.String())
+		}
+		if body.Error.Code != "amendment_lapsed" {
+			t.Errorf("%s: error.code = %q, want amendment_lapsed", decision, body.Error.Code)
+		}
+		if body.Error.Details["status"] != "lapsed" ||
+			body.Error.Details["decision_reason"] != *before.DecisionReason ||
+			body.Error.Details["stage_id"] != before.StageID.String() {
+			t.Errorf("%s: details = %v, want status lapsed + the lapse reason + stage id", decision, body.Error.Details)
+		}
+		for _, want := range []string{"fishhawk_resume_run", "add_scope_files", "fishhawk_retry_stage"} {
+			if !strings.Contains(body.Error.Message, want) {
+				t.Errorf("%s: message %q missing recovery verb %q", decision, body.Error.Message, want)
+			}
+		}
+	}
+	if len(au.appended) != auditBefore {
+		t.Errorf("audit entries after refused decides = %d, want %d (no scope_amendment_decided)", len(au.appended), auditBefore)
+	}
+	after, _ := sa.GetByID(context.Background(), amendmentID)
+	if after.Status != scopeamendment.StatusLapsed || after.DecidedBy != nil || *after.DecisionReason != *before.DecisionReason {
+		t.Errorf("row after refused decides = %+v, want unchanged", after)
+	}
+}
+
+// TestListScopeAmendments_LapsedNotPresentedAsPending (#4127): a lapsed row
+// lists as lapsed with no headroom fields, and a ?wait request whose only row
+// is lapsed returns immediately (the pending snapshot excludes it).
+func TestListScopeAmendments_LapsedNotPresentedAsPending(t *testing.T) {
+	s, sa, _, runRow, _ := scopeAmendmentHeadroomServer(t)
+	agent := func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	}
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, agent)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("request: %d; %s", w.Code, w.Body.String())
+	}
+	var created scopeAmendmentResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	sa.lapse(t, created.ID, "run cancelled")
+
+	start := time.Now()
+	w = getAmendmentsWait(t, s, runRow.ID, 30, agent)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("wait with only a lapsed row took %s — must return immediately", elapsed)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d; %s", w.Code, w.Body.String())
+	}
+	var list scopeAmendmentListResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(list.Items) != 1 || list.Items[0].Status != "lapsed" {
+		t.Fatalf("items = %+v, want one lapsed item", list.Items)
+	}
+	if item := list.Items[0]; item.EffectiveScopeFilesAfterApproval != nil || item.MaxFilesChanged != nil || item.DecidedBy != nil {
+		t.Errorf("lapsed item = %+v, want no headroom fields and no decided_by", item)
 	}
 }

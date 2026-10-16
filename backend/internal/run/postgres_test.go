@@ -4573,3 +4573,150 @@ func TestPostgres_TransitionStageFrom_StillRefusesRunningToSuperseded(t *testing
 	}
 	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, token)
 }
+
+// terminalRecorder records every StageTerminalObserver / TerminalRunObserver
+// call (#4127). Its slices are appended ONLY by the observers, so with the
+// notify call sites removed from postgres.go they stay empty.
+type terminalRecorder struct {
+	mu     sync.Mutex
+	stages []run.StageState
+	runs   []run.State
+}
+
+func (rec *terminalRecorder) stage(_ context.Context, s *run.Stage) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	rec.stages = append(rec.stages, s.State)
+}
+
+func (rec *terminalRecorder) run(_ context.Context, r *run.Run) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	rec.runs = append(rec.runs, r.State)
+}
+
+func (rec *terminalRecorder) snapshot() ([]run.StageState, []run.State) {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]run.StageState(nil), rec.stages...), append([]run.State(nil), rec.runs...)
+}
+
+func installRecorder(t *testing.T, repo run.Repository) *terminalRecorder {
+	t.Helper()
+	so, ok := repo.(run.StageTerminalObservable)
+	if !ok {
+		t.Fatalf("postgres repo %T does not implement run.StageTerminalObservable", repo)
+	}
+	ro, ok := repo.(run.TerminalRunObservable)
+	if !ok {
+		t.Fatalf("postgres repo %T does not implement run.TerminalRunObservable", repo)
+	}
+	rec := &terminalRecorder{}
+	so.SetStageTerminalObserver(rec.stage)
+	ro.SetRunTerminalObserver(rec.run)
+	return rec
+}
+
+// TestPostgres_StageTerminalObserver_FiresOnTerminalOnly pins the #4127 hook:
+// non-terminal stage moves fire nothing, the running → failed commit fires
+// exactly once with the committed state, a nil observer stops the calls, and
+// a stranded merge-supersede fires once with superseded.
+func TestPostgres_StageTerminalObserver_FiresOnTerminalOnly(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	rec := installRecorder(t, repo)
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+	}
+	if stages, _ := rec.snapshot(); len(stages) != 0 {
+		t.Fatalf("observer calls after non-terminal moves = %v, want none", stages)
+	}
+	cat, reason := run.FailureA, "boom"
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateFailed, &run.StageCompletion{FailureCategory: &cat, FailureReason: &reason}); err != nil {
+		t.Fatalf("→failed: %v", err)
+	}
+	if stages, _ := rec.snapshot(); len(stages) != 1 || stages[0] != run.StageStateFailed {
+		t.Fatalf("observer calls after running → failed = %v, want exactly [failed]", stages)
+	}
+
+	// A refused transition (CAS mismatch) commits nothing and fires nothing.
+	if _, err := repo.(run.StageCASTransitioner).TransitionStageFrom(ctx, s.ID, run.StageStateRunning, run.StageStateSucceeded, nil); err == nil {
+		t.Fatal("TransitionStageFrom(running → succeeded) on a failed stage succeeded, want a state-changed refusal")
+	}
+	if stages, _ := rec.snapshot(); len(stages) != 1 {
+		t.Fatalf("observer calls after a refused CAS = %v, want still exactly one", stages)
+	}
+
+	// Stranded merge-supersede fires once with superseded.
+	st, token, updatedAt := seedRunningTypedStage(t, repo, run.StageTypeImplement)
+	if _, err := strandedSuperseder(t, repo).SupersedeStrandedStageOnMerge(ctx, st.ID, run.StageStateRunning, token, updatedAt); err != nil {
+		t.Fatalf("SupersedeStrandedStageOnMerge: %v", err)
+	}
+	if stages, _ := rec.snapshot(); len(stages) != 2 || stages[1] != run.StageStateSuperseded {
+		t.Fatalf("observer calls after a stranded supersede = %v, want [failed superseded]", stages)
+	}
+
+	// Clearing the observer stops the calls.
+	repo.(run.StageTerminalObservable).SetStageTerminalObserver(nil)
+	s2 := makeStage(t, repo, r.ID, 1)
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateSucceeded} {
+		if _, err := repo.TransitionStage(ctx, s2.ID, to, nil); err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+	}
+	if stages, _ := rec.snapshot(); len(stages) != 2 {
+		t.Fatalf("observer calls after SetStageTerminalObserver(nil) = %v, want no new call", stages)
+	}
+}
+
+// TestPostgres_TerminalRunObserver_FiresOnTerminalOnly pins the run-level
+// sibling (#4127): pending → running fires nothing, running → cancelled fires
+// exactly once with cancelled, RetryRun (failed → running) fires nothing, and
+// a nil observer stops the calls.
+func TestPostgres_TerminalRunObserver_FiresOnTerminalOnly(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	rec := installRecorder(t, repo)
+
+	r := makeRun(t, repo)
+	if _, err := repo.TransitionRun(ctx, r.ID, run.StateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	if _, runs := rec.snapshot(); len(runs) != 0 {
+		t.Fatalf("observer calls after pending → running = %v, want none", runs)
+	}
+	if _, err := repo.TransitionRun(ctx, r.ID, run.StateCancelled); err != nil {
+		t.Fatalf("→cancelled: %v", err)
+	}
+	if _, runs := rec.snapshot(); len(runs) != 1 || runs[0] != run.StateCancelled {
+		t.Fatalf("observer calls after running → cancelled = %v, want exactly [cancelled]", runs)
+	}
+
+	r2 := makeRun(t, repo)
+	for _, to := range []run.State{run.StateRunning, run.StateFailed} {
+		if _, err := repo.TransitionRun(ctx, r2.ID, to); err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+	}
+	if _, err := repo.RetryRun(ctx, r2.ID, run.StateRunning); err != nil {
+		t.Fatalf("RetryRun: %v", err)
+	}
+	if _, runs := rec.snapshot(); len(runs) != 2 || runs[1] != run.StateFailed {
+		t.Fatalf("observer calls after running → failed → (retry) running = %v, want [cancelled failed]", runs)
+	}
+
+	repo.(run.TerminalRunObservable).SetRunTerminalObserver(nil)
+	if _, err := repo.TransitionRun(ctx, r2.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("→succeeded: %v", err)
+	}
+	if _, runs := rec.snapshot(); len(runs) != 2 {
+		t.Fatalf("observer calls after SetRunTerminalObserver(nil) = %v, want no new call", runs)
+	}
+}

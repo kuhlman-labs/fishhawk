@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	amendmentdb "github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment/db"
 )
 
@@ -113,18 +115,162 @@ func (r *postgresRepo) Decide(ctx context.Context, p DecideParams) (*Amendment, 
 		DecidedAt:      pgtype.Timestamptz{Time: r.now(), Valid: true},
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		// The pending-only WHERE matched nothing: either the row is
-		// already decided, or it never existed. Disambiguate with a
-		// plain read so handlers can map 409 vs 404.
-		if _, gerr := r.GetByID(ctx, p.ID); gerr == nil {
-			return nil, ErrAlreadyDecided
+		// The pending-only WHERE matched nothing: the row lapsed
+		// undecided (#4127), is already decided, or never existed.
+		// Disambiguate with a plain read so handlers can map 409
+		// amendment_lapsed vs 409 already-decided vs 404.
+		existing, gerr := r.GetByID(ctx, p.ID)
+		if gerr != nil {
+			return nil, ErrNotFound
 		}
-		return nil, ErrNotFound
+		if existing.Status == StatusLapsed {
+			return nil, ErrLapsed
+		}
+		return nil, ErrAlreadyDecided
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scopeamendment: decide: %w", err)
 	}
 	return rowToAmendment(row)
+}
+
+// lapseDecisionReason is the decision_reason a lapsed row carries; it names
+// the triggering transition (e.g. "stage succeeded", "run cancelled").
+func lapseDecisionReason(trigger string) string {
+	return "lapsed undecided: " + trigger + " before an operator decision"
+}
+
+// LapseForStage implements Lapser for one stage's pending rows.
+func (r *postgresRepo) LapseForStage(ctx context.Context, p LapseParams) ([]*Amendment, error) {
+	if p.StageID == uuid.Nil {
+		return nil, errors.New("scopeamendment: lapse: stage_id required")
+	}
+	return r.lapse(ctx, p, func(q *amendmentdb.Queries, reason *string, at pgtype.Timestamptz) ([]amendmentdb.ScopeAmendment, error) {
+		return q.LapsePendingScopeAmendmentsForStage(ctx, amendmentdb.LapsePendingScopeAmendmentsForStageParams{
+			StageID: p.StageID, DecisionReason: reason, DecidedAt: at,
+		})
+	})
+}
+
+// LapseForRun implements Lapser for every pending row on the run.
+func (r *postgresRepo) LapseForRun(ctx context.Context, p LapseParams) ([]*Amendment, error) {
+	if p.RunID == uuid.Nil {
+		return nil, errors.New("scopeamendment: lapse: run_id required")
+	}
+	return r.lapse(ctx, p, func(q *amendmentdb.Queries, reason *string, at pgtype.Timestamptz) ([]amendmentdb.ScopeAmendment, error) {
+		return q.LapsePendingScopeAmendmentsForRun(ctx, amendmentdb.LapsePendingScopeAmendmentsForRunParams{
+			RunID: p.RunID, DecisionReason: reason, DecidedAt: at,
+		})
+	})
+}
+
+// lapse runs one lapse UPDATE and appends one chained scope_amendment_lapsed
+// entry per returned row, all in ONE transaction: any error rolls back both
+// the flips and the entries. Zero rows takes no audit lock.
+func (r *postgresRepo) lapse(ctx context.Context, p LapseParams,
+	update func(q *amendmentdb.Queries, reason *string, at pgtype.Timestamptz) ([]amendmentdb.ScopeAmendment, error),
+) ([]*Amendment, error) {
+	if strings.TrimSpace(p.Trigger) == "" {
+		return nil, errors.New("scopeamendment: lapse: trigger required")
+	}
+	if p.Source == "" {
+		return nil, errors.New("scopeamendment: lapse: source required")
+	}
+	now := r.now()
+	reason := lapseDecisionReason(p.Trigger)
+	var out []*Amendment
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		out = out[:0]
+		rows, err := update(amendmentdb.New(tx), &reason, pgtype.Timestamptz{Time: now, Valid: true})
+		if err != nil {
+			return fmt.Errorf("lapse update: %w", err)
+		}
+		for _, row := range rows {
+			a, err := rowToAmendment(row)
+			if err != nil {
+				return err
+			}
+			if err := appendLapsedEntry(ctx, tx, a, p, now); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scopeamendment: lapse: %w", err)
+	}
+	if out == nil {
+		out = []*Amendment{}
+	}
+	return out, nil
+}
+
+// lapsedPayload is the scope_amendment_lapsed audit payload.
+type lapsedPayload struct {
+	AmendmentID    string      `json:"amendment_id"`
+	StageID        string      `json:"stage_id"`
+	Trigger        string      `json:"trigger"`
+	Paths          []PathEntry `json:"paths"`
+	RequestedAt    time.Time   `json:"requested_at"`
+	DecisionReason string      `json:"decision_reason"`
+	Source         string      `json:"source"`
+}
+
+func appendLapsedEntry(ctx context.Context, tx pgx.Tx, a *Amendment, p LapseParams, now time.Time) error {
+	payload, err := json.Marshal(lapsedPayload{
+		AmendmentID:    a.ID.String(),
+		StageID:        a.StageID.String(),
+		Trigger:        p.Trigger,
+		Paths:          a.Paths,
+		RequestedAt:    a.RequestedAt,
+		DecisionReason: lapseDecisionReason(p.Trigger),
+		Source:         p.Source,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal lapsed payload: %w", err)
+	}
+	kind := audit.ActorSystem
+	subject := "fishhawkd"
+	stageID := a.StageID
+	if _, err := audit.AppendChainedTx(ctx, tx, audit.ChainAppendParams{
+		RunID:        a.RunID,
+		StageID:      &stageID,
+		Timestamp:    now,
+		Category:     CategoryLapsed,
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		return fmt.Errorf("append %s for amendment %s: %w", CategoryLapsed, a.ID, err)
+	}
+	return nil
+}
+
+// LapseStranded implements Lapser: it lapses each stranded stage's pending
+// rows in its OWN transaction (one bad stage cannot block the rest), naming
+// the stage transition when the stage state lapses and the run transition
+// otherwise, and joins the per-stage failures.
+func (r *postgresRepo) LapseStranded(ctx context.Context) (int, error) {
+	stages, err := amendmentdb.New(r.pool).ListStrandedPendingScopeAmendmentStages(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("scopeamendment: list stranded: %w", err)
+	}
+	total := 0
+	var errs []error
+	for _, st := range stages {
+		trigger := "run " + st.RunState
+		if StageStateLapses(st.StageState) {
+			trigger = "stage " + st.StageState
+		}
+		lapsed, err := r.LapseForStage(ctx, LapseParams{StageID: st.StageID, Trigger: trigger, Source: LapseSourceStartupBackfill})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stage %s: %w", st.StageID, err))
+			continue
+		}
+		total += len(lapsed)
+	}
+	return total, errors.Join(errs...)
 }
 
 func rowToAmendment(r amendmentdb.ScopeAmendment) (*Amendment, error) {
@@ -152,5 +298,8 @@ func rowToAmendment(r amendmentdb.ScopeAmendment) (*Amendment, error) {
 	return out, nil
 }
 
-// Compile-time check.
-var _ Repository = (*postgresRepo)(nil)
+// Compile-time checks.
+var (
+	_ Repository = (*postgresRepo)(nil)
+	_ Lapser     = (*postgresRepo)(nil)
+)
