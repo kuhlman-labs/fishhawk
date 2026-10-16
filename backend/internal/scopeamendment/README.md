@@ -4,7 +4,7 @@ Mid-stage scope amendments (#961, E22.X): the operator-gated escape hatch for a 
 
 ## Storage
 
-This package: domain `Amendment`/`PathEntry`/`Status` + `Repository` {Create, GetByID, ListByRun, CountByStage, Decide} + the separate `Lapser` capability {LapseForStage, LapseForRun, LapseStranded} (#4127, kept off `Repository` so handler fakes need no stub); sqlc `db/`; migrations `0029_scope_amendments` + `0105_scope_amendments_lapsed` — paths jsonb of `{path, operation: modify|create}`, status `pending|approved|denied|lapsed`, pending-only atomic decide and lapse.
+This package: domain `Amendment`/`PathEntry`/`Status` + `Repository` {Create, GetByID, ListByRun, CountByStage, Decide} + the separate `Lapser` capability {LapseForStage, LapseForRun, LapseStranded} (#4127, kept off `Repository` so handler fakes need no stub); sqlc `db/`; migrations `0029_scope_amendments` + `0105_scope_amendments_lapsed` — paths jsonb of `{path, operation: modify|create}`, status `pending|approved|denied|lapsed`, pending-only atomic decide and lapse. A third, read-only capability, `PendingLister` {ListPendingWithStage} (`NewPendingLister`, E85.2 / #4146), is the ops monitor's amendment scan: pending rows within a lookback, LEFT JOINed to the stage state (NULL when the stage is hidden by RLS), with the database's `now()` as `ObservedAt`, newest first, bounded. It is NOT on `Repository` (handler fakes need no stub); consumer: `backend/internal/opsmonitor/README.md` § "Scope amendments".
 
 ## HTTP surface
 

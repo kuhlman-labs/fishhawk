@@ -234,6 +234,69 @@ func (q *Queries) LapsePendingScopeAmendmentsForStage(ctx context.Context, arg L
 	return items, nil
 }
 
+const listPendingScopeAmendmentsWithStage = `-- name: ListPendingScopeAmendmentsWithStage :many
+SELECT sa.id, sa.run_id, sa.stage_id, sa.status, sa.requested_at,
+       s.state AS stage_state,
+       now()::timestamptz AS observed_at
+  FROM scope_amendments sa
+  LEFT JOIN stages s ON s.id = sa.stage_id
+ WHERE sa.status = 'pending'
+   AND sa.requested_at > now() - make_interval(secs => $1::float8)
+ ORDER BY sa.requested_at DESC, sa.id DESC
+ LIMIT $2
+`
+
+type ListPendingScopeAmendmentsWithStageParams struct {
+	LookbackSeconds float64 `json:"lookback_seconds"`
+	RowLimit        int32   `json:"row_limit"`
+}
+
+type ListPendingScopeAmendmentsWithStageRow struct {
+	ID          uuid.UUID          `json:"id"`
+	RunID       uuid.UUID          `json:"run_id"`
+	StageID     uuid.UUID          `json:"stage_id"`
+	Status      string             `json:"status"`
+	RequestedAt pgtype.Timestamptz `json:"requested_at"`
+	StageState  *string            `json:"stage_state"`
+	ObservedAt  pgtype.Timestamptz `json:"observed_at"`
+}
+
+// E85.2 / #4146: the ops monitor's amendment scan (read-only). Undecided rows
+// only, so a #4127 lapsed row (and an approved/denied one) is never returned.
+// LEFT JOIN because stages is FORCE row-level secured through its parent run
+// (migration 0057): a stage hidden from this session reads a NULL state
+// instead of silently dropping the amendment. now() is returned as
+// observed_at so the caller measures age in ONE clock domain, the database's
+// (#3048). Newest first, so a bounded scan always holds the freshest rows:
+// they are the only ones whose decision window can still be met.
+func (q *Queries) ListPendingScopeAmendmentsWithStage(ctx context.Context, arg ListPendingScopeAmendmentsWithStageParams) ([]ListPendingScopeAmendmentsWithStageRow, error) {
+	rows, err := q.db.Query(ctx, listPendingScopeAmendmentsWithStage, arg.LookbackSeconds, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPendingScopeAmendmentsWithStageRow
+	for rows.Next() {
+		var i ListPendingScopeAmendmentsWithStageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.StageID,
+			&i.Status,
+			&i.RequestedAt,
+			&i.StageState,
+			&i.ObservedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listScopeAmendmentsByRun = `-- name: ListScopeAmendmentsByRun :many
 SELECT id, run_id, stage_id, paths, reason, status, decision_reason, decided_by, requested_at, decided_at FROM scope_amendments
  WHERE run_id = $1
