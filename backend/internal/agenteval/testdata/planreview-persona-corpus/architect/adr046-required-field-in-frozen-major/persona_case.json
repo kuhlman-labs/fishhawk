@@ -1,0 +1,172 @@
+{
+  "persona": "architect",
+  "kind": "accepted_conflict",
+  "expect": "catch",
+  "issue_title": "Let a deploy stage name the environment it targets",
+  "issue_body": "A workflow-v1 deploy stage cannot say which environment it targets, so every deploy goes to the runner's default cluster. Let a deploy stage name its environment, carry it on the deployment artifact, and refuse a deploy to an environment the repository has not registered.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94455",
+      "id": "kuhlman-labs/fishhawk#94455"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add an environment field to workflow-v1 deploy stages, carry it on the deployment artifact, and refuse a deploy to an unregistered environment.",
+    "scope": {
+      "files": [
+        {
+          "path": "docs/spec/workflow-v1.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/schemas/workflow-v1.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "cli/internal/spec/schemas/workflow-v1.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/parse.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/spec/parse_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/deployreconciler/reconciler.go",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/spec/workflow-v1.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In docs/spec/workflow-v1.schema.json, add environment (a non-empty string) to the deploy stage's properties and to its required list, editing the v1 file in place so a v1 spec whose deploy stage omits it is refused at parse, then mirror it with scripts/sync-schemas."
+      },
+      {
+        "step": 2,
+        "description": "Carry the parsed environment on the deploy stage in backend/internal/spec/parse.go and stamp it on the deployment artifact."
+      },
+      {
+        "step": 3,
+        "description": "In backend/internal/deployreconciler/reconciler.go, refuse a deploy whose environment is not in the repository's registered environment list, naming the environment, before the runner starts."
+      },
+      {
+        "step": 4,
+        "description": "Document the field in docs/spec/workflow-v1.md and add parse tests for a present and an empty environment plus a reconciler test for an unregistered one."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Parse tests over v1 fixtures for the environment field, a reconciler test for an unregistered environment, and the schema-sync check in verify.",
+      "rollback_plan": "Revert the PR and re-run scripts/sync-schemas.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-environment-on-artifact",
+          "statement": "A deploy stage that names an environment records that environment on its deployment artifact.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94455"
+        },
+        {
+          "id": "ac-unregistered-environment-refused",
+          "statement": "A deploy to an environment the repository has not registered is refused, naming the environment, before the runner starts.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94455"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 55,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-046",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "and to its required list, editing the v1 file in place",
+    "a v1 spec whose deploy stage omits it is refused at parse"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 1
+  },
+  "catch_probes": [
+    "adr-046",
+    "non-additive",
+    "not additive",
+    "additively within",
+    "within a major line",
+    "within each major line",
+    "x-intended-required",
+    "is a breaking change",
+    "breaks existing",
+    "breaks every existing",
+    "stop validating",
+    "stops validating",
+    "no longer validate",
+    "needs a new major",
+    "requires a new major",
+    "bump the major"
+  ],
+  "attribution_phrases": [
+    "required list",
+    "v1 file in place"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 1 adds environment to the deploy stage's required list in workflow-v1 in place. ADR-046 D6 says new optional fields continue additively within each major line; a required field makes every existing v1 spec with a deploy stage stop validating. Add it as optional (x-intended-required) or carry the requirement in a new major."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Putting environment on the required list is a non-additive change to a coexisting major: under ADR-046 each major is frozen and only optional fields are added within it."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Editing the v1 file in place this way breaks existing v1 specs that ADR-046 keeps validating indefinitely."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 1: the environment field is unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 1 changes the deploy stage; ADR-038 defines the deploy stage's release governance, so confirm the environment is recorded where its deployment artifact expects it."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 1 edits docs/spec/workflow-v1.schema.json; cite the record that governs that file in the plan."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-unregistered-environment-refused does not say where the registered environment list lives."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The required list change in step 1 has no test for an environment of only whitespace."
+    }
+  ]
+}

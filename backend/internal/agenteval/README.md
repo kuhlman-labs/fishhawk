@@ -565,7 +565,7 @@ false-alarm rate (conforming plans) before the architect is enabled.
 | `planreviewcatchlive_test.go` | the double-gated live measurement of EVERY arm (`TestPlanReviewCatchRateLive`, which writes the diagnostics file on every run) plus the offline wiring test (`TestPlanReviewCatchRateLive_WiresCatchRateGeneratorModel`) that runs in every verify |
 | `planreviewpersonalive_test.go` | the double-gated live calibration dry run (`TestCatchRateCalibrationLive`) plus its offline knob and wiring tests |
 | `testdata/planreview-catchrate/` | the representative conventions fixture, the operator-recorded `evidence.json` (first baseline pinned 2026-10-10) and, from E55.18 / #4253 on, its trial sidecar `evidence.trials.json` |
-| `testdata/planreview-persona-corpus/architect/` | the six architect cases (`persona_case.json` + a SYNTHETIC-provenance `case.md` each) |
+| `testdata/planreview-persona-corpus/architect/` | the nine architect cases, six catch and three clean (`persona_case.json` + a SYNTHETIC-provenance `case.md` each); a CANDIDATE count until the E55.26 / #4453 calibration cuts (run-book Step 1d) |
 
 ### Generator model
 
@@ -606,6 +606,18 @@ offline re-score below previews what v4 makes of the 2026-10-12 sidecar). The
 CURRENT pinned baseline is
 whatever `evidence.json` carries — read its `baseline.pinned_at` and
 `baseline.reason`; the run-book's results table lists every recording.
+
+**E55.26 / #4453 changes the conventions case set** (13 to 18 candidate
+cases, so `samples_per_case` drops from `SamplesPerCaseForPower(13)` = 11 to
+`SamplesPerCaseForPower(18)` = 8) **and the architect corpus** (6 to 9 cases,
+still 46 samples per case). The 2026-10-15 combined pin is therefore NOT
+COMPARABLE for the conventions and architect arms. Per the campaign's batch
+rule there is NO re-pin on #4453's branch, and its merge is not held for one.
+The operator calibrates the candidates at the PR head (run-book Step 1d),
+routes any out-of-band rework through a fix-up, and re-pins later in the ONE
+combined re-recording after every batched trigger change (#3930, #4402,
+#4453, #4326, #4400) merges. Until then `catchrategate` reads stale on main,
+by design.
 
 **E78.11 / #4313 makes the record arm-keyed (`planreview-catchrate-evidence-v2`)
 and bumps the rule to `planreview-catch-v5`.** The committed pair stays a
@@ -904,6 +916,87 @@ calibration kept this one case and cut five, three at the scored ceiling and
 two whose in-band scored rate was made of no_probe scoring misses on real
 catches (the run-book's Step 1c results). Harder cases continue in #4453.
 
+**E55.26 / #4453: cases sourced from real misses.** #4453 adds eight
+CANDIDATE cases, sourced in the issue's order of preference. Five are
+conventions-arm cases under `testdata/planreview-miss-corpus/`:
+
+- Three are reconstructions of REAL class-3 plan-review misses, which both
+  plan reviewers approved and acceptance triage later paged.
+  - The upload-route class, twice:
+    `seed-synthetic-realmiss-guard-off-upload-route` (run b00d3249 / #3325)
+    and its subtler, partly-satisfiable variant
+    `seed-synthetic-realmiss-pairing-rule-off-upload-route` (run 0697f4cb /
+    #4085). In both, a criterion observes an upload route, while the approach
+    puts the guard only in a parse-time pass that the route never calls.
+  - The deferred-surface conjunct,
+    `seed-synthetic-realmiss-deferred-surface-conjunct` (run 91006d10 /
+    #3328): a conjunctive criterion's second clause demands a surface that
+    the plan's own out-of-scope line defers.
+- Two are derived from recorded repository lessons, not from a triage entry.
+  Each plants a criterion that is unsatisfiable from inside the run:
+  - `seed-synthetic-realmiss-criterion-needs-forbidden-path` demands an edit
+    to a path the implement stage forbids. The lesson is the
+    Unenforceable-criteria rule in the plan prompt
+    (`backend/internal/prompt/prompt.go`) and `docs/METHODOLOGY.md`.
+  - `seed-synthetic-realmiss-criterion-needs-unwritable-pr-body` demands a
+    PR-description edit from a commit-only follow-up pass. The lesson is the
+    run-book's "a fix-up pass cannot edit the PR body".
+
+Three authoring rules hold for every one of these cases:
+
+- **Anonymization is load-bearing.** Each case is reconstructed in a neutral
+  domain, and its `case.md` cites the real run, issue and criterion as
+  provenance. That is why `miss.json` carries `synthetic: true` with
+  placeholder ids, unique `triage_sequence` values 120-124 (the committed set
+  before #4453 was 42, 101-111 and 116), and ids of the form
+  `00000000-0000-0000-0000-0000004453NN`. The review input never uses this
+  product's own plan-review vocabulary, which the plan-review prompt teaches.
+  Reusing it would trip `TestCatchCorpus_NotLeakedIntoPlanReviewPrompt` or
+  mode m, and it would hand the reviewer the answer. No case quotes the
+  plan-prompt rule it is derived from.
+- **Design for `not_mentioned` difficulty.** Each case plants exactly one
+  criterion defect, with no louder unintended defect beside it. The issue's
+  central guarantee keeps its own correct criterion, because #4361's rework
+  found 7/7 reviewers leading with such a gap. The defect is discoverable
+  only by connecting two parts of what the reviewer is shown (a criterion and
+  a separate approach step, risk or out-of-scope line), never by reading the
+  criterion alone.
+- **Probes are polarity-bearing and defect-specific.** Each probe is a
+  multi-word phrasing of the planted defect. No probe is a generic consequence
+  phrase that could score an unrelated anchored note as a catch (a #4402
+  review finding).
+
+The other three #4453 candidates are architect persona cases under
+`testdata/planreview-persona-corpus/architect/`. Each anchors on a BODY-level
+rule, because the 2026-10-14 calibration put title-level conflicts at the
+ceiling:
+
+- `adr040-superseded-operator-role-reliance` (`superseded_reliance`):
+  unattended operation justified by ADR-040's harness-neutral model, which
+  ADR-101 supersedes with a lease-based, product-spawned operator.
+- `adr002-inline-sql-bypasses-sqlc` (`accepted_conflict`): a store query
+  assembled in Go outside `queries.sql`, against ADR-002's Decision.
+- `adr046-required-field-in-frozen-major` (`accepted_conflict`): a required
+  property added inside workflow-v1, against ADR-046 Decision 6.
+
+Each architect case was checked against both #4399 tripwires
+(`TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona` and
+`TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes`) before
+the next one was written. None needed a substitute record, and each
+`case.md` records the selection it was authored against.
+
+**The seed floor after calibration.** `committedSyntheticCatchCaseFloor`
+went from 13 to 16 for #4453's three real-miss cases. It is a lower bound, so
+the two lesson-derived cases (18 seeds in all) raised nothing. Until the
+post-calibration fix-up sets the floor to the KEPT count, the per-case
+hygiene tests (the derived-seed-list `TestCommittedCatchProbes_*` checks and
+`TestCatchCorpus_NotLeakedIntoPlanReviewPrompt`, plus the loader's modes) are
+the only guard on those two cases: deleting one leaves the floor satisfied.
+With 18 seeds against a floor of 16 the slack is two, so until that fix-up the
+floor does not catch the deletion of any single case, slice 0's included.
+That same fix-up updates the case counts above and fills the run-book's
+Step 1d results table.
+
 ### The arms
 
 ONE arm table (`catchRateArmTable(CatchRateInputs)`) lists every arm: its name,
@@ -912,10 +1005,13 @@ per-case samples, fingerprint and runner. The recorder, the gate, the re-score
 and the calibration dry run all iterate it, so a later arm is one row (#4314's
 `security` and `security_portability` are two, § "Security persona arms").
 Today: `without_conventions` and `with_conventions` over the
-miss corpus (15 catch cases, 10 samples each), and `architect` over the
-persona corpus (3 catch + 3 clean cases, 46 samples each,
-`SamplesPerCaseForPersona` = the max over the present classes of
-`ceil(136 / n)`, so each class clears the floor). `CatchRateInputs` names the
+miss corpus (18 catch cases, 8 samples each: `SamplesPerCaseForPower(18)`),
+and `architect` over the persona corpus (6 catch + 3 clean cases, 46 samples
+each, `SamplesPerCaseForPersona(6, 3)` = the max over the present classes of
+`ceil(136 / n)`, so each class clears the floor). Both counts are CANDIDATE
+counts: E55.26 / #4453 added five conventions cases and three architect catch
+cases that the operator's Step 1d calibration keeps or cuts, and a cut changes
+the conventions arms' `samples_per_case` again. `CatchRateInputs` names the
 miss corpus, the conventions fixture, the persona corpus and the checkout root
 the persona arm reads its documents from.
 
@@ -1003,10 +1099,12 @@ are logged, not pinned, so a routine ADR landing does not redden verify.
 
 **Finding: matched record bodies now reach the persona (#4399).** The index
 and the records have separate budgets (`backend/internal/decisionrecord/README.md`
-§ "Byte budget"): the ~31 KB `docs/adr/index.json` is shaped under its own
-32 KB cap and the matched records fit a separate 32 KB record budget, so every
-case shows its matched records in full — ADR-006's body now reaches the
-migration case. Before #4399 the index and records shared one budget and
+§ "Byte budget"): the ~32 KB `docs/adr/index.json` is shaped under its own
+32 KB cap and the matched records share a separate 32 KB record budget, so
+every case shows its matched GOVERNING records in full — ADR-006's body now
+reaches the migration case. A non-governing match can still be dropped when
+the budget runs out: `adr040-superseded-operator-role-reliance` shows ADR-101
+(23 KB) and ADR-040 in full and drops ADR-013 (#4453). Before #4399 the index and records shared one budget and
 `Assemble` included ZERO full records. ADR-091 and ADR-095 still carry empty
 `applies_to` and are never matched (E86.58 / #4398 gave only ADR-098 a glob,
 `backend/internal/basedelta/**`, and added successor following, which reaches
@@ -1240,7 +1338,10 @@ sidecar (below), which a recording writes beside it.
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
+          "adr002-inline-sql-bypasses-sqlc": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
           "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+          "adr040-superseded-operator-role-reliance": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+          "adr046-required-field-in-frozen-major": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
           "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
           "clean-sqlc-query-cli": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
           "clean-workflow-v2-optional-field": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
@@ -1356,7 +1457,10 @@ sidecar (below), which a recording writes beside it.
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
+            "adr002-inline-sql-bypasses-sqlc": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
             "adr006-production-migrate-down": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+            "adr040-superseded-operator-role-reliance": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
+            "adr046-required-field-in-frozen-major": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
             "adr091-merge-without-review-coverage": {"expect": "catch", "trials": 46, "caught": 25, "undecodable": 0},
             "clean-sqlc-query-cli": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
             "clean-workflow-v2-optional-field": {"expect": "clean", "trials": 46, "caught": 0, "false_alarms": 2, "undecodable": 0},
