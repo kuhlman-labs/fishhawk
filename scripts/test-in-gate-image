@@ -41,6 +41,7 @@
 #   unknown lint option accepted (`shift` instead of exit)   -> i2c
 #   docker-absent guard made a no-op                         -> i3 i3b
 #   `_acquire_verify_lock` CALL deleted from cmd_in_gate_image -> i4 i5
+#   refusal `exit "$?"` replaced by `exit 1` in cmd_in_gate_image -> i4 (73, #4022)
 #   `-e FISHHAWK_VERIFY_LOCK_PATH=...` argument deleted      -> i6
 #   common-dir mount call deleted                            -> i7
 #   `exit "$rc"` replaced by `exit 0`                        -> i8
@@ -306,11 +307,13 @@ assert_eq "i3b: docker absent: lint --in-gate-image exits 1 (never a skip)" 1 "$
 assert_contains "i3b: the message names docker" "$out" "docker not found on PATH"
 
 # --- i4: a live host holder refuses and docker never runs --------------------
+# The refusal exits VERIFY_EXIT_LOCK_REFUSED (73), never 1: the runner reads an
+# exit 1 as a red tree, and a refusal judged nothing (#4022).
 sleep 300 &
 HOLDER=$!
 ln -s "$HOLDER:shell" "$LOCK"
 KEEP_LOCK=1 st i4 "$FX" docker verify --in-gate-image
-assert_eq "i4: a live holder: verify --in-gate-image exits 1" 1 "$rc"
+assert_eq "i4: a live holder: verify --in-gate-image exits 73 (lock refused)" 73 "$rc"
 assert_contains "i4: the shell-kind refusal is printed" "$out" "another verify already holds the lock"
 assert_eq "i4: docker was NEVER invoked" "" "$(cat "$st/log")"
 assert_eq "i4: the holder's lock is untouched" "$HOLDER:shell" "$(readlink "$LOCK" 2>/dev/null)"
