@@ -213,11 +213,11 @@ func mergeCandidateVerify(ctx context.Context, cfg config, req mergeCandidateVer
 // temporary failure itself: a not_executed result leaves the head
 // re-triggerable on the backend.
 //
-// Lock contention is read from the exit-code disposition (gateLockRefused,
-// exit 73) first; the #3948 text classifier stays as a fallback until the
-// disposition is produced at every gate site, so a real refusal never reads
-// as a red tree in between.
-func classifyMergeCandidateVerify(outcome string, disp gateDisposition, out string) (string, string) {
+// Lock contention is read ONLY from the exit-code disposition
+// (gateLockRefused, exit 73, #4022): the #3948 text classifier is deleted, so
+// refusal TEXT on any other exit is an ordinary verify_failed. The output
+// parameter is unused and kept for the call sites' shape.
+func classifyMergeCandidateVerify(outcome string, disp gateDisposition, _ string) (string, string) {
 	switch {
 	case disp == gateRefused:
 		return mergeCandidateNotExecuted, mcReasonGateRefused
@@ -233,8 +233,6 @@ func classifyMergeCandidateVerify(outcome string, disp gateDisposition, out stri
 		return mergeCandidateNotExecuted, mcReasonGateSkipped
 	case outcome == "passed":
 		return mergeCandidatePassed, ""
-	case isVerifyLockContended(out):
-		return mergeCandidateNotExecuted, mcReasonLockContended
 	default:
 		return mergeCandidateFailed, "verify_failed"
 	}

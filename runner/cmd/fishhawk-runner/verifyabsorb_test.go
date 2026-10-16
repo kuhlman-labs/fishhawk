@@ -356,7 +356,9 @@ func TestDecideFlakeAbsorb_SortsAndDeduplicatesDirs(t *testing.T) {
 }
 
 func TestAbsorbRerunRefusal(t *testing.T) {
-	lock := verifyLockRefusalLinePrefix + verifyLockRefusalSignatures[0] + "\n"
+	// scripts/test's refusal TEXT on an executed gate that did not exit 73:
+	// the #3948 text classifier is deleted (#4022), so it is rerun_failed.
+	lock := "scripts/test: another RUNNER verify still holds the lock at /l after 600s\n"
 	for _, tc := range []struct {
 		outcome string
 		disp    gateDisposition
@@ -365,7 +367,7 @@ func TestAbsorbRerunRefusal(t *testing.T) {
 	}{
 		{"failed", gateExecuted, absorbOutsideFail, absorbRefusedRerunFailed},
 		{"failed", gateExecuted, golangciLintLockSignature + "\n", absorbRefusedRerunFailed},
-		{"failed", gateExecuted, lock, absorbRefusedRerunNotExecuted},
+		{"failed", gateExecuted, lock, absorbRefusedRerunFailed},
 		{"skipped", gateExecuted, "", absorbRefusedRerunNotExecuted},
 		{"failed", gateTimedOut, "", absorbRefusedRerunNotExecuted},
 		{"failed", gateRefused, "", absorbRefusedRerunNotExecuted},
@@ -695,15 +697,19 @@ func TestRunVerifyFixLoop_AbsorbRefusedWhenRerunFails(t *testing.T) {
 func TestRunVerifyFixLoop_AbsorbRerunInfraOrLockIsNotReabsorbed(t *testing.T) {
 	for _, tc := range []struct {
 		name, out, reason string
+		rc                int
 	}{
-		{"infra signature", golangciLintLockSignature + "\n", absorbRefusedRerunFailed},
-		{"lock refusal", verifyLockRefusalLinePrefix + verifyLockRefusalSignatures[0] + "\n", absorbRefusedRerunNotExecuted},
+		{"infra signature", golangciLintLockSignature + "\n", absorbRefusedRerunFailed, 1},
+		// Refusal TEXT without exit 73 is an ordinary failure since the #3948
+		// text classifier was deleted (#4022); exit 73 alone is the refusal.
+		{"lock refusal text without exit 73", "scripts/test: another RUNNER verify still holds the lock at /l after 600s\n", absorbRefusedRerunFailed, 1},
+		{"lock refusal exit 73", "", absorbRefusedRerunNotExecuted, verifyExitLockRefused},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAbsorbFixture(t, 0,
 				absorbStep{pkgs: "moda/a", out: absorbPassOut},
 				absorbOutsideStep(goodAbsorbAttest()),
-				absorbStep{pkgs: "modb/b", out: tc.out, rc: 1},
+				absorbStep{pkgs: "modb/b", out: tc.out, rc: tc.rc},
 				absorbStep{pkgs: "modb/b", out: "ok\n"}, // a second re-run would pass
 			)
 			f.wantCalls = 3

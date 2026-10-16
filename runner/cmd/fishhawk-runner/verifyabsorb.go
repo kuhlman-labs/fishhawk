@@ -456,12 +456,12 @@ func sortedKeysOf(m map[string]bool) []string {
 // rerun_failed when it executed and exited non-zero on a judged tree,
 // rerun_not_executed otherwise (skipped clone, refusal, unavailable, timeout,
 // an exit-75 temporary failure (gateTempFail), or a verify-lock refusal —
-// exit 73 (gateLockRefused), with the #3948 text classifier kept as the
-// fallback until every gate site produces the disposition). The
+// exit 73 (gateLockRefused); the #3948 text classifier is deleted, #4022). The
 // `disp == gateExecuted` conjunct is what keeps both exit-code dispositions
-// out of rerun_failed: neither judged the tree.
-func absorbRerunRefusal(outcome string, disp gateDisposition, out string) string {
-	if outcome == "failed" && disp == gateExecuted && !isVerifyLockContended(out) {
+// out of rerun_failed: neither judged the tree. The output parameter is unused
+// and kept for the call sites' shape.
+func absorbRerunRefusal(outcome string, disp gateDisposition, _ string) string {
+	if outcome == "failed" && disp == gateExecuted {
 		return absorbRefusedRerunFailed
 	}
 	return absorbRefusedRerunNotExecuted

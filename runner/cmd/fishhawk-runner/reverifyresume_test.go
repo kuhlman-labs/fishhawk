@@ -234,6 +234,9 @@ func withScriptedReverify(t *testing.T, script []scriptedVerify) (pkgSets *[][]s
 // one-shot infra re-run.
 func TestReverifyHeldCommit(t *testing.T) {
 	const infra = "lint: " + golangciLintLockSignature + "\n"
+	// scripts/test's refusal TEXT on an executed gate that did not exit 73: the
+	// #3948 text classifier is deleted (#4022), so it is an ordinary
+	// (undecidable → in-change) failure, never not_executed.
 	const lockRefusal = "scripts/test: verify lock held: another RUNNER verify still holds the lock\n"
 	inScope := "FAIL\tgithub.com/kuhlman-labs/fishhawk/runner/cmd/widget\t0.1s\n"
 	outside := "--- FAIL: TestFlaky (0.01s)\nFAIL\tgithub.com/kuhlman-labs/fishhawk/backend/internal/other\t0.2s\n"
@@ -260,7 +263,7 @@ func TestReverifyHeldCommit(t *testing.T) {
 		// only an EXECUTED failure is re-run (a re-run costs another timeout).
 		{name: "timed_out_infra_output_no_rerun", script: []scriptedVerify{{out: infra, outcome: "failed", disp: gateTimedOut}}, wantCalls: 1, wantToken: reverifyGateNotExecuted},
 		{name: "skipped", script: []scriptedVerify{{out: "clone: boom", outcome: "skipped", disp: gateExecuted}}, wantCalls: 1, wantToken: reverifyGateNotExecuted},
-		{name: "lock_contended", script: []scriptedVerify{failed(lockRefusal)}, wantCalls: 1, wantToken: reverifyGateNotExecuted},
+		{name: "lock_refusal_text_without_exit_73", script: []scriptedVerify{failed(lockRefusal)}, wantCalls: 1, wantToken: reverifyFailedInChange, wantPermanent: true},
 		// The exit-code dispositions (#4022) carry SIGNATURE-FREE output, so the
 		// text classifiers cannot mask a missing disposition arm: without the
 		// re-run disjunct temp_fail_then_pass stops at one run, and without the

@@ -12,11 +12,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
-// The #3948 vocabulary for a committed-tree verify that `scripts/test` REFUSED
-// because another live RUNNER verify held the per-repository verify lock past
-// its wait budget, held in ONE place so the three committed-tree gate sites
-// (runVerifyFixLoop, runVerifyGateCommitted and the #960 strict re-verify)
-// recognise, bound, log and render it identically.
+// The #3948 vocabulary for a committed-tree verify that could not acquire the
+// per-repository verify lock, held in ONE place so the three committed-tree
+// gate sites (runVerifyFixLoop, runVerifyGateCommitted and the #960 strict
+// re-verify) bound, log and render it identically.
 //
 // Before #3948 every site read that refusal as an ordinary red verify: the
 // strict re-verify turned it into ErrPushedTreeNotVerified (category B, which
@@ -26,96 +25,18 @@ import (
 // one lock), never of the diff, so it is re-run in place a bounded number of
 // times and then classified category C (retryable in place).
 //
+// RECOGNITION is by exit code since #4022: the verify command exits 73
+// (EX_CANTCREAT) on a lock refusal and runVerifyCommittedTree maps that to
+// gateLockRefused (verifyExitDisposition, verifyexit.go). The #3948 text
+// classifier that scraped scripts/test's refusal literals out of the output is
+// deleted; refusal TEXT on any other exit is an ordinary failure.
+//
 // The runner adds NO sleep or backoff between re-runs, deliberately. A
 // RUNNER-kind `scripts/test verify` already polls the lock every 2s for up to
 // 600s before it refuses (_acquire_verify_lock_at, VERIFY_LOCK_WAIT_SECONDS /
 // VERIFY_LOCK_POLL_SECONDS), so each re-run IS a bounded wait. An idle runner
 // sleep would only miss the brief release gap between a holder's back-to-back
 // scoped, full and strict verifies — the very window a re-run exists to catch.
-
-// verifyLockRefusalSignatures are the refusal literals a RUNNER-kind
-// `scripts/test verify` prints when it cannot take the verify lock. Each is a
-// substring of scripts/test's own text, pinned against the real file by
-// TestVerifyLockRefusalSignaturesMatchScriptsTest and against its real
-// executable behaviour by TestRealScriptsTestRunnerRefusalIsVerifyLockContended:
-//
-//   - "another RUNNER verify still holds the lock": the live-runner arm of
-//     _acquire_verify_lock_at once the wait budget is spent — a runner never
-//     displaces a peer runner, it refuses;
-//   - "was retaken after a displacement": the lock was re-taken by another
-//     invocation after this one displaced a wedged SHELL holder once, and the
-//     script refuses rather than displace twice;
-//   - "the verify lock never settled": VERIFY_LOCK_UNSETTLED_MSG, the restart
-//     budget spent on a lock that kept changing hands.
-//
-// The SHELL-kind immediate refusal ("another verify already holds the lock")
-// is deliberately NOT a member: the runner's committed-tree gate always runs
-// scripts/test as RUNNER kind (verifyLockOwnerEnv is injected unconditionally
-// in runVerifyCommittedTree), so that text can only reach a runner gate from
-// output the change itself printed. Neither is golangci-lint's own lock
-// ("parallel golangci-lint is running", golangciLintLockSignature): lint
-// contention is serialized by --allow-serial-runners (#3962) and, where it
-// still surfaces, stays the #2645 infra absorb's (isVerifyInfraFailure).
-var verifyLockRefusalSignatures = []string{
-	"another RUNNER verify still holds the lock",
-	"was retaken after a displacement",
-	"the verify lock never settled",
-}
-
-// verifyLockRefusalLinePrefix is the prefix every line scripts/test prints
-// about its verify lock carries — the refusal itself and everything that can
-// precede it (the "waiting up to …" announcement, a displacement warning).
-const verifyLockRefusalLinePrefix = "scripts/test: "
-
-// isVerifyLockContended reports whether a failed verify's output is a
-// scripts/test verify-lock refusal.
-//
-// It is POSITION-ANCHORED, not a bare substring match: cmd_verify takes the
-// lock BEFORE it runs any leg (lint, schema-sync, harnesses, tests), so a real
-// refusal is printed before any lint or test output. The matcher therefore
-// walks the output's non-empty lines in order and requires every line up to
-// and including the one carrying a signature to begin with
-// verifyLockRefusalLinePrefix. The first line that does not ends the search
-// with false. A signature printed by a failing test — which can only appear
-// after the lock was taken and lint has already run — is not recognised.
-//
-// The anchor assumes the verify command's own output begins with scripts/test's
-// lock lines, which holds for this repository's `scripts/test verify`. A
-// wrapper that prints its own preamble first (a `make` echo, a shell `set -x`)
-// makes the matcher miss a genuine refusal. That degrades to the pre-#3948
-// classification, the safe direction.
-//
-// RESIDUAL — the input is UNTRUSTED, exactly as isVerifyInfraFailure's
-// residual states, and the anchor narrows it without closing it. A diff that
-// makes the verify command's FIRST output a scripts/test-prefixed line carrying
-// a signature (for example by editing scripts/test itself to print it before
-// failing) steers its own red verify to category C. The real cost, named rather
-// than left abstract: at the verify-fix loop that red tree NEVER reaches the fix
-// agent — the loop spends verifyLockContentionMaxReruns fast-failing re-runs and
-// ends category C `verify_lock_contended` instead of re-invoking the agent with
-// the failure and, on exhaustion, category A. At the single-shot gate and the
-// strict re-verify it trades a category-B park for a retryable C. It is NEVER a
-// verified-tree bypass: every push still requires an explicit "passed" verify
-// outcome, which this classifier never produces, and a retry re-runs the same
-// command and re-fails. A stage that keeps ending verify_lock_contended with no
-// other run's verify live on the host should be inspected, not retried.
-func isVerifyLockContended(output string) bool {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, verifyLockRefusalLinePrefix) {
-			return false
-		}
-		for _, sig := range verifyLockRefusalSignatures {
-			if strings.Contains(line, sig) {
-				return true
-			}
-		}
-	}
-	return false
-}
 
 // verifyLockContentionMaxReruns bounds the in-place re-runs ONE gate site
 // spends on a contended verify, so a contended verify executes at most
@@ -134,7 +55,7 @@ const verifyLockContentionMaxReruns = 2
 // The runner's gate env is a default-deny allow-list, so
 // FISHHAWK_VERIFY_LOCK_WAIT_SECONDS never reaches the gate subprocess and
 // scripts/test always uses this default there. Pinned against the script text
-// by TestVerifyLockRefusalSignaturesMatchScriptsTest.
+// by TestVerifyExitCodesMatchScriptsTest.
 const verifyLockWaitBudget = 600 * time.Second
 
 // errVerifyLockContended is the sentinel a committed-tree gate wraps
@@ -150,7 +71,9 @@ var errVerifyLockContended = errors.New("verify lock contended")
 const verifyLockContendedLead = "verify_lock_contended"
 
 // verifyLockContendedReason renders the FailureReason / error LEAD for a
-// contended gate.
+// contended gate (the command exited 73 on every attempt). The wording is
+// copied byte-for-byte by backend/internal/run/retry_test.go, so it is kept
+// stable.
 func verifyLockContendedReason(verifyCmd string, attempts int) string {
 	return fmt.Sprintf("%s: %q could not acquire the per-repository verify lock after %d attempt(s): scripts/test refused because another verify held it past its wait budget; the change was NOT judged. Retry the stage in place once the other run's verify has finished.",
 		verifyLockContendedLead, verifyCmd, attempts)
