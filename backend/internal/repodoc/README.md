@@ -627,10 +627,13 @@ learn about conventions or charters.
 ## Budgeted selections (`backend/internal/decisionrecord`, E78.5 / #3756)
 
 The decision-record consumer injects an index under its own per-document cap
-plus a ranked selection of whole records under a SEPARATE record budget (each
-the resolver's `CapBytes()`, #4399). The index is shown as its compact
-rendering through `Fetched.Derive` (#4478), so the index cap is spent on the
-rendering while the index's hash stays the file's. It is the first
+plus a ranked selection of whole records, then Decision-section excerpts, under
+a SEPARATE record budget (each the resolver's `CapBytes()`, #4399). The index
+is shown as its compact rendering through `Fetched.Derive` (#4478), so the
+index cap is spent on the rendering while the index's hash stays the file's;
+a record that does not fit whole is shown as its Decision section(s) through
+`Fetched.Derive` too (`adr-decision-section-v1`, #4489), its hash likewise the
+file's. It is the first
 consumer of `Fetch`/`Document`/`Derive`, `AttributeSet` and the selection shape of
 `document_truncated`; repodoc still carries no consumer vocabulary — the
 selection's name, ids and statuses are opaque strings to it. Contract:

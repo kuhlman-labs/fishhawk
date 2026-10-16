@@ -295,8 +295,8 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 			t.Errorf("case %q: %v", c.Name, err)
 			continue
 		}
-		if want := 2 + len(r.IncludedIDs); len(r.QuoteDocs) != want {
-			t.Errorf("case %q: %d rendered documents, want the remit, the index and %d included records", c.Name, len(r.QuoteDocs), len(r.IncludedIDs))
+		if want := 2 + len(r.IncludedIDs) + len(r.Selection.Excerpted); len(r.QuoteDocs) != want {
+			t.Errorf("case %q: %d rendered documents, want the remit, the index, %d included records and %d excerpts", c.Name, len(r.QuoteDocs), len(r.IncludedIDs), len(r.Selection.Excerpted))
 		}
 		idxSpan := spans[personaArchitectIndexPath]
 		indexText := r.Prompt[idxSpan.start:idxSpan.end]
@@ -319,8 +319,8 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 				t.Errorf("case %q: the rendered index lacks %s's title %q", c.Name, id, title)
 			}
 		}
-		t.Logf("case %q: matched %v included %v dropped %v; index rendered %d bytes (truncated %v, cap %d)",
-			c.Name, r.MatchedIDs, r.IncludedIDs, r.DroppedIDs, r.Selection.Index.RenderedBytes, r.Selection.Index.Truncated, r.Selection.CapBytes)
+		t.Logf("case %q: matched %v included %v excerpted %d dropped %v; index rendered %d bytes (truncated %v, cap %d)",
+			c.Name, r.MatchedIDs, r.IncludedIDs, len(r.Selection.Excerpted), r.DroppedIDs, r.Selection.Index.RenderedBytes, r.Selection.Index.Truncated, r.Selection.CapBytes)
 	}
 }
 
@@ -329,26 +329,40 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 // TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes: rendered
 // through PersonaArmPrompt (the production path, the real docs/adr at the
 // production cap), every case shows at least min(2, matched) record bodies in
-// full, and a CATCH case shows every governing record the selection matched.
-// Before #4399 the index alone filled the shared budget and every matched
-// record was dropped, so adr006-production-migrate-down showed no ADR-006
-// body. A governing record the selection does not match (adr091 today) is
-// vacuous here.
+// full, and a CATCH case shows every governing record the selection matched
+// in FULL — a governing record shown only as its Decision-section excerpt
+// (#4489) fails it too. Before #4399 the index alone filled the shared budget
+// and every matched record was dropped, so adr006-production-migrate-down
+// showed no ADR-006 body. A governing record the selection does not match
+// (adr091 today) is vacuous here. The matched set is read from the Selection
+// (included, excerpted and dropped), since PersonaArmRender.MatchedIDs does
+// not carry excerpts.
 func TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona(t *testing.T) {
 	for _, c := range loadCommittedPersona(t) {
 		r, err := PersonaArmPrompt(c, personaTestRepoRoot)
 		if err != nil {
 			t.Fatalf("case %q: PersonaArmPrompt: %v", c.Name, err)
 		}
-		if want := min(2, len(r.MatchedIDs)); len(r.IncludedIDs) < want {
-			t.Errorf("case %q: %d record bodies shown in full (included %v, dropped %v), want >= %d", c.Name, len(r.IncludedIDs), r.IncludedIDs, r.DroppedIDs, want)
+		var matched, excerpted []string
+		for _, inc := range r.Selection.Included {
+			matched = append(matched, inc.Record.ID)
+		}
+		for _, ex := range r.Selection.Excerpted {
+			matched = append(matched, ex.Record.ID)
+			excerpted = append(excerpted, ex.Record.ID)
+		}
+		for _, d := range r.Selection.Dropped {
+			matched = append(matched, d.Record.ID)
+		}
+		if want := min(2, len(matched)); len(r.IncludedIDs) < want {
+			t.Errorf("case %q: %d record bodies shown in full (included %v, excerpted %v, dropped %v), want >= %d", c.Name, len(r.IncludedIDs), r.IncludedIDs, excerpted, r.DroppedIDs, want)
 		}
 		if c.Expect() != CatchExpectCatch {
 			continue
 		}
 		for _, g := range c.Input.GoverningRecords {
-			if slices.Contains(r.MatchedIDs, g.ID) && !slices.Contains(r.IncludedIDs, g.ID) {
-				t.Errorf("case %q: governing record %s matched but its body was dropped (included %v, dropped %v)", c.Name, g.ID, r.IncludedIDs, r.DroppedIDs)
+			if slices.Contains(matched, g.ID) && !slices.Contains(r.IncludedIDs, g.ID) {
+				t.Errorf("case %q: governing record %s matched but its full body was not shown (included %v, excerpted %v, dropped %v)", c.Name, g.ID, r.IncludedIDs, excerpted, r.DroppedIDs)
 			}
 		}
 	}
@@ -482,9 +496,11 @@ func commonSuffixLen(a, b string) int {
 // listing supersedes back. An amended_by amendment must be an accepted record
 // in the real index listing amends back, whether or not the case also lists it
 // as governing (E78.13 / #4471): a case may rest on an amended record whose
-// amendment's body the record budget drops (adr040, whose ADR-101 is ~23 KB),
-// and the persona then sees the amendment only through the index metadata. A
-// non-governing amendment is CHECKED against the real index, never skipped.
+// amendment's full body the record budget cannot fit (adr040, whose ADR-101 is
+// ~23 KB), and the persona then sees the amendment only through the index
+// metadata and, when it has one that fits, its Decision-section excerpt
+// (#4489). A non-governing amendment is CHECKED against the real index, never
+// skipped.
 func supersededReliancePremiseErrors(records []PersonaGoverningRecord, real map[string]realIndexEntry) []string {
 	governing := map[string]bool{}
 	for _, g := range records {
@@ -819,7 +835,10 @@ var adr040AmendmentEdges = map[string]struct{ amends, amendedBy []string }{
 // asserting on the RENDERED prompt, not only on Match metadata: ADR-097 and
 // ADR-101 are selected through amended_by (AmendsVia, never Via), ADR-040's
 // body ranks ahead of both and is shown whenever either is, and the amendment
-// count and framing sentences reach the prompt text.
+// count and framing sentences reach the prompt text. ADR-101, too large to fit
+// whole, reaches the prompt as its Decision-section excerpt (#4489): its
+// Decision-only Q4 answer is in the rendered prompt and its
+// Recommendation-only Q4 question is not.
 //
 // The index is the shipped one with adr040AmendmentEdges applied. Once the
 // records carry that encoding the overlay must change nothing, so from then on
@@ -889,13 +908,18 @@ func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
 	}
 
 	ranked := map[string]decisionrecord.Match{}
-	included := map[string]bool{}
+	included, excerpted, dropped := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, inc := range r.Selection.Included {
 		ranked[inc.Record.ID] = inc.Match
 		included[inc.Record.ID] = true
 	}
+	for _, ex := range r.Selection.Excerpted {
+		ranked[ex.Record.ID] = ex.Match
+		excerpted[ex.Record.ID] = true
+	}
 	for _, d := range r.Selection.Dropped {
 		ranked[d.Record.ID] = d
+		dropped[d.Record.ID] = true
 	}
 	p040, ok40 := ranked["ADR-040"]
 	if !ok40 || p040.MatchedPaths == 0 {
@@ -916,8 +940,8 @@ func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
 		if m.Rank <= p040.Rank {
 			t.Errorf("%s ranks %d, ahead of the record it amends (ADR-040 ranks %d)", w.id, m.Rank, p040.Rank)
 		}
-		if included[w.id] && !included["ADR-040"] {
-			t.Errorf("%s's body is shown but ADR-040's is not (included %v)", w.id, r.IncludedIDs)
+		if (included[w.id] || excerpted[w.id]) && !included["ADR-040"] && !excerpted["ADR-040"] {
+			t.Errorf("%s is shown but ADR-040 is not (included %v)", w.id, r.IncludedIDs)
 		}
 	}
 	if r.Selection.Amendments < 2 {
@@ -935,9 +959,13 @@ func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
 		{"ADR-097", "docs/adr/097-operator-as-orchestrator.md", "ADR-040"},
 		{"ADR-101", "docs/adr/101-charter-authorization-mode.md", "ADR-040, ADR-097"},
 	} {
-		if included[w.id] {
+		switch {
+		case included[w.id] || excerpted[w.id]:
 			wants = append(wants, "This record was selected because it amends "+w.amends+"; the amended record still governs except where this record decides otherwise.")
-		} else {
+			if excerpted[w.id] {
+				wants = append(wants, "Decision record "+w.id+" — status: accepted (Decision section only)")
+			}
+		case dropped[w.id]:
 			wants = append(wants, "- "+w.id+" ("+w.path+", status: accepted, amendment of "+w.amends+")")
 		}
 	}
@@ -946,6 +974,33 @@ func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
 			t.Errorf("the rendered persona prompt lacks %q", want)
 		}
 	}
-	t.Logf("operator.yaml scope: matched %v included %v dropped %v; amendments %d; record budget %d, %d used",
-		r.MatchedIDs, r.IncludedIDs, r.DroppedIDs, r.Selection.Amendments, r.Selection.CapBytes, r.Selection.IncludedBytes)
+	// ADR-101's Decision text reaches the rendered prompt (#4489). The two Q4
+	// anchors each occur once in ADR-101's file — the answer under Decision,
+	// the question under Recommendation — and in no other shipped document
+	// the prompt can show, so the answer proves the Decision section was shown
+	// and the question's absence proves nothing outside it was.
+	const (
+		adr101Path          = "docs/adr/101-charter-authorization-mode.md"
+		decisionAnchor      = "**Q4: yes.** Agent classification before issuance"
+		recommendationProbe = "Should the charter subject be classified"
+	)
+	file := string(mustReadCatch(t, filepath.Join(personaTestRepoRoot, filepath.FromSlash(adr101Path))))
+	for _, anchor := range []string{decisionAnchor, recommendationProbe} {
+		if n := strings.Count(file, anchor); n != 1 {
+			t.Fatalf("premise: %q occurs %d times in %s, want exactly once", anchor, n, adr101Path)
+		}
+	}
+	if dropped["ADR-101"] {
+		t.Errorf("ADR-101 was dropped (included %v, dropped %v): its Decision section must be shown", r.IncludedIDs, r.DroppedIDs)
+	}
+	for _, want := range []string{decisionAnchor, "holding only the lease credential"} {
+		if !strings.Contains(r.Prompt, want) {
+			t.Errorf("the rendered persona prompt lacks ADR-101's Decision text %q", want)
+		}
+	}
+	if strings.Contains(r.Prompt, recommendationProbe) {
+		t.Errorf("the rendered persona prompt carries ADR-101's Recommendation-only %q: the excerpt leaked text outside the Decision section", recommendationProbe)
+	}
+	t.Logf("operator.yaml scope: matched %v included %v excerpted %d dropped %v; amendments %d; record budget %d, %d used",
+		r.MatchedIDs, r.IncludedIDs, len(r.Selection.Excerpted), r.DroppedIDs, r.Selection.Amendments, r.Selection.CapBytes, r.Selection.IncludedBytes)
 }

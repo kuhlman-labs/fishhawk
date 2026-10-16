@@ -38,16 +38,20 @@ type Request struct {
 	ChangePaths []string
 }
 
-// Included is one selected record shown in full.
+// Included is one selected record shown in full, or, in
+// Selection.Excerpted, as its Decision-section excerpt.
 type Included struct {
 	Match
 	// Document is the record, shaped under a cap at least its raw size, so it
-	// is never truncated.
+	// is never truncated. An excerpt's Document is its untruncated
+	// Decision-section rendering (DecisionExcerptRendering, derived through
+	// repodoc.Fetched.Derive), so its hash and OriginalBytes stay the file's.
 	Document repodoc.Document
 }
 
 // Selection is an assembled decision-record injection: the index, the records
-// shown in full, and the matches left out by the record budget.
+// shown in full, the records shown as Decision-section excerpts, and the
+// matches left out by the record budget.
 type Selection struct {
 	// Index is the index document, always included. It is shaped under its
 	// OWN per-document cap, separate from the record budget: the resolver's
@@ -72,15 +76,20 @@ type Selection struct {
 	// Included are the matches shown in full, in rank order — a strict prefix
 	// of the ranking.
 	Included []Included
+	// Excerpted are the matches shown as Decision-section excerpts (#4489), in
+	// rank order, all ranked below every Included record: Included then
+	// Excerpted is itself a strict prefix of the ranking.
+	Excerpted []Included
 	// Dropped are the matches left out because they did not fit the record
-	// budget, in rank order. Never fetched past the first.
+	// budget, whole or as an excerpt, in rank order. Never fetched past the
+	// first.
 	Dropped []Match
 	// CapBytes is the RECORD budget: the resolver's effective cap, applied to
 	// the included records alone. The index is not counted against it; it is
 	// shaped under its own cap, recorded on Index.CapBytes.
 	CapBytes int
-	// IncludedBytes is the sum of the included records' rendered bytes (the
-	// index excluded); always <= CapBytes.
+	// IncludedBytes is the sum of the rendered bytes of every record document
+	// shown, whole or excerpt (the index excluded); always <= CapBytes.
 	IncludedBytes int
 }
 
@@ -97,10 +106,22 @@ type Selection struct {
 //   - the matched records share a separate record budget, which the index
 //     does not draw on. Each match, in rank order, is fetched at the SAME
 //     commit and shaped under a cap at least its raw size (so its untruncated
-//     rendered size is what is measured), and is included only when that
-//     size fits what remains of the record budget;
-//   - the first match that does not fit, and EVERY lower-ranked match, is
-//     dropped — a strict prefix — and the lower-ranked ones are never fetched.
+//     rendered size is what is measured), and is included WHOLE only when
+//     that size fits what remains of the record budget;
+//   - the first match that does not fit whole, and EVERY lower-ranked match,
+//     is offered only as its Decision-section excerpt (DecisionExcerpt,
+//     derived under DecisionExcerptRendering and likewise measured
+//     untruncated), included when it fits what remains (#4489). Fidelity
+//     never increases down the ranking: once one record is excerpted, a
+//     lower-ranked record is never shown whole, even one that would fit;
+//   - the first match with no Decision section, or whose excerpt does not
+//     fit, and EVERY lower-ranked match, is dropped, and the lower-ranked ones
+//     are never fetched.
+//
+// So the records shown (whole or excerpt) are a strict prefix of the ranking,
+// and the records shown whole are a strict prefix of those shown: a
+// lower-ranked record is never shown more fully than a higher-ranked one, and
+// no record is ever shown cut.
 //
 // A record the index lists that is missing at the commit, or any other fetch
 // error, fails the WHOLE assembly: there is no partial selection.
@@ -162,6 +183,7 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		}
 	}
 	remaining := recordBudget
+	excerpting := false
 	for i, m := range matches {
 		f, err := r.Fetch(ctx, repodoc.Request{
 			Repo:    req.Repo,
@@ -178,17 +200,45 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		}
 		// Measure the UNTRUNCATED rendered size: shape under a cap at least
 		// the raw size, never under the remaining budget. A record that does
-		// not fit whole is dropped, never shown cut.
-		doc := f.Document(max(recordBudget, len(f.Content)))
-		if doc.RenderedBytes > remaining {
+		// not fit whole is offered as its excerpt, never shown cut.
+		if !excerpting {
+			whole := f.Document(max(recordBudget, len(f.Content)))
+			if whole.RenderedBytes <= remaining {
+				sel.Included = append(sel.Included, Included{Match: m, Document: whole})
+				sel.IncludedBytes += whole.RenderedBytes
+				remaining -= whole.RenderedBytes
+				continue
+			}
+			excerpting = true
+		}
+		excerpt, ok, err := excerptDocument(f, recordBudget)
+		if err != nil {
+			return nil, fmt.Errorf("%w: record %s listed in %s: %w", ErrUnresolvable, m.Record.ID, req.IndexPath, err)
+		}
+		if !ok || excerpt.RenderedBytes > remaining {
 			sel.Dropped = append(sel.Dropped, matches[i:]...)
 			break
 		}
-		sel.Included = append(sel.Included, Included{Match: m, Document: doc})
-		sel.IncludedBytes += doc.RenderedBytes
-		remaining -= doc.RenderedBytes
+		sel.Excerpted = append(sel.Excerpted, Included{Match: m, Document: excerpt})
+		sel.IncludedBytes += excerpt.RenderedBytes
+		remaining -= excerpt.RenderedBytes
 	}
 	return sel, nil
+}
+
+// excerptDocument shapes f's Decision-section excerpt under a cap at least its
+// own size, so its untruncated rendered size is what is measured. ok is false
+// when the record has no Decision section.
+func excerptDocument(f *repodoc.Fetched, recordBudget int) (repodoc.Document, bool, error) {
+	body, ok := DecisionExcerpt(f.Content)
+	if !ok {
+		return repodoc.Document{}, false, nil
+	}
+	doc, err := f.Derive(DecisionExcerptRendering, body, max(recordBudget, len(body)))
+	if err != nil {
+		return repodoc.Document{}, false, err
+	}
+	return doc, true, nil
 }
 
 // fitIndex shapes the index's compact rendering (body, derived from f under
@@ -227,12 +277,15 @@ func fitIndex(f *repodoc.Fetched, body []byte, budget int) (repodoc.Document, er
 }
 
 // Documents returns the documents the selection injects, in render order: the
-// index, then each included record.
+// index, then each record shown in full, then each excerpt — rank order.
 func (s *Selection) Documents() []repodoc.Document {
-	out := make([]repodoc.Document, 0, 1+len(s.Included))
+	out := make([]repodoc.Document, 0, 1+len(s.Included)+len(s.Excerpted))
 	out = append(out, s.Index)
 	for _, inc := range s.Included {
 		out = append(out, inc.Document)
+	}
+	for _, ex := range s.Excerpted {
+		out = append(out, ex.Document)
 	}
 	return out
 }
@@ -240,8 +293,11 @@ func (s *Selection) Documents() []repodoc.Document {
 // Attribution returns the injection set for the selection: its documents and,
 // when any match was dropped, the selection-level truncation naming each
 // dropped record with its rank. That truncation's CapBytes / IncludedBytes are
-// the record budget and the included records' bytes; the index's own cap and
-// rendered bytes ride on its document entry. A caller injecting other
+// the record budget and the shown records' bytes (whole and excerpts); the
+// index's own cap and rendered bytes ride on its document entry, and an
+// excerpt's rendering rides on its own document entry (repodoc's derived
+// rendering / rendering_bytes), so an excerpt-only selection writes no
+// selection-level row. A caller injecting other
 // documents in the same prompt merges this into ONE repodoc.AttributeSet call.
 func (s *Selection) Attribution() repodoc.InjectionSet {
 	set := repodoc.InjectionSet{Documents: s.Documents()}
@@ -279,14 +335,17 @@ const (
 
 // PromptDocuments returns the selection as prompt documents, in render order:
 // the index (framed with what was and was not selected), then each included
-// record framed with its status. grounded reports whether the reviewer can
-// read the review tree; it changes only what the index framing says about the
-// records that are NOT shown.
+// record framed with its status, then each excerpt framed as one. grounded
+// reports whether the reviewer can read the review tree; it changes only what
+// the index framing says about the records that are NOT shown.
 func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
-	out := make([]prompt.InjectedDocument, 0, 1+len(s.Included))
+	out := make([]prompt.InjectedDocument, 0, 1+len(s.Included)+len(s.Excerpted))
 	out = append(out, repodoc.ToPromptDocument(s.Index, s.indexFraming(grounded)))
 	for _, inc := range s.Included {
 		out = append(out, repodoc.ToPromptDocument(inc.Document, recordFraming(inc.Match)))
+	}
+	for _, ex := range s.Excerpted {
+		out = append(out, repodoc.ToPromptDocument(ex.Document, excerptFraming(ex.Match, grounded)))
 	}
 	return out
 }
@@ -298,7 +357,8 @@ const indexRenderingNote = "It is shown below as a compact rendering of that fil
 // indexFraming is the system-authored framing of the index document. Apart
 // from the indexRenderingNote sentence (#4478): with no followed successor
 // (Followed == 0) the preamble is exactly the pre-#4398 text; with successors
-// but no amendment (Amendments == 0) it is exactly the pre-#4471 text.
+// but no amendment (Amendments == 0) it is exactly the pre-#4471 text; with no
+// excerpt (len(Excerpted) == 0) it is exactly the pre-#4489 text.
 func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	var b strings.Builder
 	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. ",
@@ -335,16 +395,30 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 		fmt.Fprintf(&b, "%d of them are shown in full below, in rank order (%s): %s. ",
 			len(s.Included), order, strings.Join(ids, ", "))
 	}
-	b.WriteString("Every other record is NOT shown in this prompt")
+	if len(s.Excerpted) > 0 {
+		ids := make([]string, 0, len(s.Excerpted))
+		for _, ex := range s.Excerpted {
+			ids = append(ids, repodoc.SanitizeMetadata(ex.Record.ID))
+		}
+		fmt.Fprintf(&b, "%d of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: %s. ",
+			len(s.Excerpted), strings.Join(ids, ", "))
+		b.WriteString("Every other record, and every section of an excerpted record outside its Decision section, is NOT shown in this prompt")
+	} else {
+		b.WriteString("Every other record is NOT shown in this prompt")
+	}
 	if grounded {
 		b.WriteString(": you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED.")
 	} else {
 		b.WriteString(", and you cannot read it in this review.")
 	}
 	if len(s.Dropped) > 0 {
-		fmt.Fprintf(&b, "\n\nNOT INCLUDED because of the injection cap (%d bytes for the records shown in full; this index is capped separately): "+
+		shown := "the records shown in full"
+		if len(s.Excerpted) > 0 {
+			shown = "the records shown in full or as excerpts"
+		}
+		fmt.Fprintf(&b, "\n\nNOT INCLUDED because of the injection cap (%d bytes for %s; this index is capped separately): "+
 			"these %d matching records were left out, highest rank first. Do not judge the change as if they were absent:\n",
-			s.CapBytes, len(s.Dropped))
+			s.CapBytes, shown, len(s.Dropped))
 		for _, m := range s.Dropped {
 			via := ""
 			if len(m.Via) > 0 {
@@ -411,6 +485,41 @@ func amendedByMeaning(r Record) string {
 		return fmt.Sprintf(" Amended by %s: it still governs, except where an amendment decides otherwise.", sanitizedIDs(r.AmendedBy))
 	}
 	return fmt.Sprintf(" Amended by %s.", sanitizedIDs(r.AmendedBy))
+}
+
+// excerptNoteFmt is what every excerpt's framing appends to its record
+// framing's preamble (#4489): that only the Decision section is shown, and
+// that the record's full text, named by its path, was omitted for budget.
+// excerptGroundedTail or excerptUngroundedTail completes it, so the framing
+// itself says whether this review can read that path (the remit reads a
+// record not shown in full from the tree ONLY when the framing says so).
+const (
+	excerptNoteFmt = " EXCERPT: this record did not fit the record budget whole, so only its Decision section is shown below, verbatim (every section whose heading begins with Decision); " +
+		"its other sections are NOT shown in this prompt. Its full text (%s), including any Recommendation or Options section the Decision adopts by reference (such as \"D1–D10 as written\"), was omitted for budget"
+	excerptGroundedTail = ": where the Decision refers to text outside it, read that text from the review tree at that path rather than infer it; " +
+		"the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
+	excerptUngroundedTail = ", and you cannot read it in this review: where the Decision refers to text outside it, that text is not available here, so do not infer it."
+)
+
+// excerptNote is the note excerptFraming appends for a record at path; grounded
+// reports whether the reviewer can read the review tree.
+func excerptNote(path string, grounded bool) string {
+	note := fmt.Sprintf(excerptNoteFmt, repodoc.SanitizeMetadata(path))
+	if grounded {
+		return note + excerptGroundedTail
+	}
+	return note + excerptUngroundedTail
+}
+
+// excerptFraming frames one record shown as its Decision-section excerpt: its
+// recordFraming (status, amended_by, Via and AmendsVia sentences unchanged)
+// with " (Decision section only)" on the heading and excerptNote on the
+// preamble.
+func excerptFraming(m Match, grounded bool) repodoc.Framing {
+	f := recordFraming(m)
+	f.Heading += " (Decision section only)"
+	f.Preamble += excerptNote(m.Record.Path, grounded)
+	return f
 }
 
 // sanitizedIDs joins ids for framing, each through repodoc.SanitizeMetadata.

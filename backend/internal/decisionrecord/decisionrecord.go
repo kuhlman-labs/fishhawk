@@ -12,7 +12,8 @@
 // paths are selected and ranked (Select). Assemble then shows the index as its
 // compact rendering (RenderIndex, one JSON object per record per line) under
 // its own per-document cap and fits the FULL text of as many ranked matches as
-// a separate record budget allows, so the index cannot starve the records.
+// a separate record budget allows, then the Decision section(s) of the next
+// ones (DecisionExcerpt, #4489), so the index cannot starve the records.
 //
 // The package reads through repodoc and renders through repodoc's framing, so
 // base-ref pinning, content hashing, delimiter neutralization and attribution
@@ -295,7 +296,8 @@ type Match struct {
 // (newer) first; then id ascending. On top of that order, an amendment never
 // ranks ahead of a selected record it amends (placeAmendmentsAfterAmended):
 // the amended record still governs, so under the strict-prefix record budget
-// its body is never dropped while an amendment of it is shown.
+// it is never shown less fully than an amendment of it (whole before excerpt,
+// excerpt before dropped).
 func Select(idx *Index, changePaths []string) ([]Match, error) {
 	if idx == nil {
 		return nil, fmt.Errorf("%w: no index", ErrInvalidIndex)

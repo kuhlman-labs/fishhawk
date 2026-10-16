@@ -520,6 +520,105 @@ func TestDecisionRecordPersona_OverCap_DropsAndRecordsSelection(t *testing.T) {
 	}
 }
 
+// (D4c, #4489) OVER CAP, SHOWN AS AN EXCERPT: the same record budget as D4,
+// but R-unknown's body carries a Decision section, so instead of dropping it
+// the selection shows that section alone. Through the real server path
+// (buildPersonaPrompt → resolvePersonaDecisionRecord → decisionrecord.Assemble
+// → personaprompt.Build → repodoc.AttributeSet → the audit fake → quote
+// verification): the persona prompt carries R-audit whole and R-unknown's
+// Decision text framed as an excerpt, never its Consequences text; nothing is
+// dropped, so no document_truncated is written; R-unknown's document_injected
+// carries the excerpt rendering with the FULL file's content_hash and
+// original_bytes; and a persona concern quoting the Decision text verifies
+// against that hash.
+//
+// Counterfactual (run): make decisionrecord.Assemble drop every excerpt
+// (`if !ok || excerpt.RenderedBytes > remaining {` → `>= 0`) — R-unknown is
+// dropped, its Decision text is absent and its document_injected is missing:
+// RED.
+func TestDecisionRecordPersona_OverCap_ShowsDecisionExcerpt(t *testing.T) {
+	const (
+		decisionText  = "DR-EXCERPT DECISION SENTINEL: audit rows are never rewritten in place."
+		decisionQuote = "audit rows are never rewritten in place"
+		conseqText    = "DR-EXCERPT CONSEQUENCES SENTINEL: rewrites need a migration."
+		note          = "quotes R-unknown's Decision"
+	)
+	persona := verdictFake(planreview.VerdictApproveWithConcerns, personaAgentModel, quotedConcern(note, decisionQuote, drUnknownPath))
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", human: 1, decisionRecordIndex: drIndexPath}), approvingFake(), persona)
+	seedDecisionRecord(t, p.fetcher)
+	p.planBody = drPlanBody(t, drChangePath)
+	cr := newFakeConcernRepo()
+	p.s.cfg.ConcernRepo = cr
+	capBytes := len(p.fetcher.files[drIndexPath]) + len(drAuditBody) + 200
+	excerpt := "## Decision\n\n" + decisionText + "\n\n"
+	bigUnknown := "# ADR-104\n\n## Context\n\n" + strings.Repeat("x", capBytes) + "\n\n" + excerpt + "## Consequences\n\n" + conseqText + "\n"
+	p.fetcher.files[drUnknownPath] = bigUnknown
+	p.s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: p.fetcher, MaxBytes: capBytes}
+	if got, ok := decisionrecord.DecisionExcerpt([]byte(bigUnknown)); !ok || string(got) != excerpt {
+		t.Fatalf("premise: the fixture's Decision excerpt = %q, %v; want %q", got, ok, excerpt)
+	}
+	p.review(t)
+
+	perCalls := reviewerCalls(persona)
+	if len(perCalls) != 1 {
+		t.Fatalf("persona calls = %d, want 1", len(perCalls))
+	}
+	pp := perCalls[0]
+	for _, want := range []string{
+		drAuditBody,
+		decisionText,
+		drUnknownHead + " (Decision section only)",
+		"shown as its " + decisionrecord.DecisionExcerptRendering + " rendering, not verbatim",
+		"shown below as excerpts, their Decision section only, in rank order: ADR-104. ",
+	} {
+		if !strings.Contains(pp, want) {
+			t.Errorf("persona prompt lacks %q", want)
+		}
+	}
+	for _, absent := range []string{conseqText, "NOT INCLUDED because of the injection cap", strings.Repeat("x", 64)} {
+		if strings.Contains(pp, absent) {
+			t.Errorf("persona prompt carries %q: text outside R-unknown's Decision section, or a drop notice", absent)
+		}
+	}
+
+	entries := documentEntries(t, p.au)
+	sumBig := sha256.Sum256([]byte(bigUnknown))
+	wantHash := "sha256:" + hex.EncodeToString(sumBig[:])
+	records, sawExcerpt := 0, false
+	for _, e := range entries {
+		if e.category != "document_injected" {
+			t.Errorf("unexpected %s entry %v — nothing was dropped", e.category, e.payload)
+			continue
+		}
+		if e.payload["path"] == personaRemitPath || e.payload["path"] == drIndexPath {
+			continue
+		}
+		records += int(e.payload["rendered_bytes"].(float64))
+		if e.payload["path"] != drUnknownPath {
+			continue
+		}
+		sawExcerpt = true
+		if e.payload["rendering"] != decisionrecord.DecisionExcerptRendering || e.payload["rendering_bytes"] != float64(len(excerpt)) {
+			t.Errorf("R-unknown rendering = %v / %v, want %q / %d", e.payload["rendering"], e.payload["rendering_bytes"], decisionrecord.DecisionExcerptRendering, len(excerpt))
+		}
+		if e.payload["content_hash"] != wantHash || e.payload["original_bytes"] != float64(len(bigUnknown)) {
+			t.Errorf("R-unknown content_hash / original_bytes = %v / %v, want the FULL file's %s / %d", e.payload["content_hash"], e.payload["original_bytes"], wantHash, len(bigUnknown))
+		}
+	}
+	if !sawExcerpt {
+		t.Fatalf("R-unknown has no document_injected entry: its excerpt was not attributed (paths %v)", injectedPaths(entries))
+	}
+	if records > capBytes {
+		t.Errorf("records' rendered_bytes = %d, exceeds the record budget %d", records, capBytes)
+	}
+
+	pv := personaPlanVerdict(t, p.au)
+	c := payloadConcernByNote(t, pv.Concerns, note)
+	if c.Severity != planreview.SeverityHigh || c.QuoteUnverified || c.QuoteVerifiedContentHash != wantHash {
+		t.Errorf("R-unknown quote concern = %+v, want high and verified with %s", c, wantHash)
+	}
+}
+
 // (D4b, #4399) INDEX NEAR CAP: the resolver cap is the size of the index's
 // compact rendering (what the persona is shown, #4478) plus 32 bytes, so the
 // index fits whole but a budget SHARED with it would leave only
