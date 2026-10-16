@@ -30,7 +30,7 @@ type DispatchStageInput struct {
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
-	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
+	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	AutoPreview   bool   `json:"auto_preview,omitempty" jsonschema:"ACCEPTANCE STAGE ONLY (inert on every other stage): stand the acceptance preview target up as part of this dispatch instead of provisioning it by hand first. It sets FISHHAWK_ACCEPTANCE_PREVIEW_CMD=\"scripts/dev preview\" AND FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD=\"scripts/dev preview-down\" on the SPAWNED RUNNER, so the runner performs the bring-up through its existing provision -> readiness -> identity -> teardown pipeline (docs/acceptance-preview.md) and tears the preview down on every exit path, and this verb still returns the durable handle immediately. An operator-set value of EITHER variable in this process ALWAYS wins and is passed through unchanged; the teardown default is injected only when the provision default is (an operator provision hook keeps ownership of its own teardown). Defaults to false, which resolves the preview command from the environment exactly as before"`
 }
 
@@ -222,6 +222,12 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
 		return nil, DispatchStageOutput{}, cerr
 	}
+	// runner_binary is refused over HTTP (E66.64 / #4476), here — ahead of
+	// every backend read and the host-dispatch marker — so the refusal commits
+	// nothing; resolveRunnerBinary refuses it again as the chokepoint.
+	if rerr := r.refuseHTTPRunnerBinary(in.RunnerBinary); rerr != nil {
+		return nil, DispatchStageOutput{}, rerr
+	}
 	pushAndOpenPR := in.PushAndOpenPR == nil || *in.PushAndOpenPR
 	if in.StageID != "" {
 		if _, perr := uuid.Parse(in.StageID); perr != nil {
@@ -312,8 +318,8 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// moment rather than of queue time.
 	prepareSpawn := func() (dispatchSpawnPlan, error) {
 		var plan dispatchSpawnPlan
-		// (3) Resolve the runner binary (input > env > sibling > PATH > error).
-		binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+		// (3) Resolve the runner binary (input (stdio only) > env > sibling > PATH > error).
+		binary, err := r.resolveRunnerBinary(in.RunnerBinary)
 		if err != nil {
 			return plan, err
 		}

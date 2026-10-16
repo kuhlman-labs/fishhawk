@@ -58,7 +58,7 @@ type RunChildrenInput struct {
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the parent run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"fallback base branch for a child's implement stage; defaults to main. The SERVER is the authority for a dependent fan-out child — the host-dispatch marker returns the consolidated base_branch and this value is used only when it returns none"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
-	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH"`
+	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	Verbose      bool   `json:"verbose,omitempty" jsonschema:"accepted for back-compat and ignored: a detached child returns no event stream to this call, so there is nothing to make verbose"`
 }
 
@@ -242,6 +242,12 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
 		return nil, RunChildrenOutput{}, cerr
 	}
+	// runner_binary is refused over HTTP (E66.64 / #4476), here — ahead of
+	// every backend read and any per-child worktree — so the refusal commits
+	// nothing; resolveRunnerBinary refuses it again as the chokepoint.
+	if rerr := r.refuseHTTPRunnerBinary(in.RunnerBinary); rerr != nil {
+		return nil, RunChildrenOutput{}, rerr
+	}
 
 	// (a) Discover the children + the effective cap from the parent's
 	// plan_decomposed audit entry. Absence means the run is not decomposed —
@@ -273,7 +279,7 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 
 	// Resolve the runner binary once (shared by every child spawn).
-	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+	binary, err := r.resolveRunnerBinary(in.RunnerBinary)
 	if err != nil {
 		return nil, RunChildrenOutput{}, err
 	}

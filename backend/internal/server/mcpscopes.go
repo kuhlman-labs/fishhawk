@@ -249,9 +249,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// handler ALSO refuses a run-bound token that carries write:stages
 	// (specialist_job_requester_not_a_seat), so runBoundSubjectOK stays false.
 	// The first-officer seat's specialistjob.RequestScope (E85.6 / #4148) is
-	// deliberately NOT an alternative here: this tool resolves a caller-chosen
-	// runner_binary and spawns it on the daemon host with the daemon's
-	// environment, so a seat reaching it could run any host executable. A
+	// deliberately NOT an alternative here: this tool spawns the daemon-resolved
+	// runner on the daemon host with the daemon's environment in a caller-chosen
+	// working_dir (a caller-chosen runner_binary is refused over HTTP since
+	// #4476), so a seat reaching it could run repository code on the host. A
 	// seat files its request over REST (POST /v0/specialist-jobs), which only
 	// queues the job. Pinned by
 	// TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools.

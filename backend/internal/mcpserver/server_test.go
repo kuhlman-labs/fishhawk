@@ -198,7 +198,8 @@ func TestNewServer_HTTPTransportEchoesResolvedWorkingDir(t *testing.T) {
 			"working_dir":      dir,
 			"github_repo":      "x/y",
 			"push_and_open_pr": false,
-			"runner_binary":    "/fake/fishhawk-runner",
+			// runner_binary omitted: it is refused over HTTP (E66.64 / #4476);
+			// withFakeRunner's LookPath stub resolves the daemon-side rung.
 		})
 	if res.IsError {
 		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
@@ -216,6 +217,51 @@ func TestNewServer_HTTPTransportEchoesResolvedWorkingDir(t *testing.T) {
 	}
 	if out.ResolvedWorkingDir != dir {
 		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+}
+
+// TestNewServer_HTTPTransportRefusesRunnerBinary is the cross-boundary proof
+// for E66.64 / #4476: a REAL NewServer(Config{HTTPTransport:true}) refuses a
+// supplied runner_binary at the tool-result layer with no host-dispatch
+// marker, and the SAME arguments through NewServer(Config{HTTPTransport:false})
+// are not refused — so the refusal is keyed on the transport flag NewServer
+// threads onto the resolver, which a unit test on the helper cannot show.
+func TestNewServer_HTTPTransportRefusesRunnerBinary(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withFakeRunner(t, "exit 0")
+	runID, stageID := uuid.New(), uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	dir := t.TempDir()
+	args := map[string]any{
+		"run_id":           runID.String(),
+		"workflow":         "feature_change",
+		"stage":            "implement",
+		"working_dir":      dir,
+		"github_repo":      "x/y",
+		"push_and_open_pr": false,
+		"runner_binary":    "/opt/attacker/payload",
+	}
+	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true, AllowedRoots: []string{dir}}, args)
+	if !res.IsError {
+		t.Fatalf("a runner_binary over HTTP must be refused through NewServer; content: %+v", res.Content)
+	}
+	if !strings.Contains(toolResultText(t, res), runnerBinaryNotAllowedCode) {
+		t.Errorf("the refusal should carry %q; content: %+v", runnerBinaryNotAllowedCode, res.Content)
+	}
+	fb.mu.Lock()
+	marks := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marks != 0 {
+		t.Errorf("host-dispatch marker called %d times, want 0 (refused before any state)", marks)
+	}
+
+	res = callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: false}, args)
+	if strings.Contains(toolResultText(t, res), runnerBinaryNotAllowedCode) {
+		t.Errorf("the stdio transport must not refuse runner_binary; content: %+v", res.Content)
+	}
+	if res.IsError {
+		t.Errorf("the stdio dispatch with runner_binary failed; content: %+v", res.Content)
 	}
 }
 

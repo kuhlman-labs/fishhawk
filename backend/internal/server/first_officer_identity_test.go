@@ -645,9 +645,10 @@ func TestFirstOfficerSeat_TenantedAnchor(t *testing.T) {
 }
 
 // TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools pins that a seat cannot
-// execute a caller-selected host program over /mcp. Each tool below resolves
-// a caller-chosen runner_binary and spawns it on the daemon host with the
-// daemon's environment, so a real seat bearer (through the seat identity hook)
+// execute a host program over /mcp. Each tool below spawns the daemon-resolved
+// runner on the daemon host with the daemon's environment in a caller-chosen
+// working_dir (a caller-chosen runner_binary is refused over HTTP since
+// #4476), so a real seat bearer (through the seat identity hook)
 // is refused 403 insufficient_scope at the gate, before any tool registry is
 // built. The seat files specialist jobs over REST instead, which only queues.
 // The read tool at the end is the positive control: the same bearer passes

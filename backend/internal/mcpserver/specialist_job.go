@@ -64,7 +64,7 @@ type RequestSpecialistJobInput struct {
 	Subject      SpecialistJobSubject `json:"subject" jsonschema:"what the job is about (run_id, campaign_id, head_sha, repo); at least one member, and head_sha is required for every kind except draft"`
 	Inputs       map[string]any       `json:"inputs" jsonschema:"the per-kind inputs object, exactly as docs/spec/specialist-job-v1.md defines it (closed members, bounded lists; no free-form shell)"`
 	WorkingDir   string               `json:"working_dir,omitempty" jsonschema:"ABSOLUTE path of the checkout the runner clones from (the clone SOURCE; the job never executes in it). Required over the HTTP MCP transport; ignored for draft"`
-	RunnerBinary string               `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; defaults to FISHHAWK_RUNNER_BIN, the fishhawk-mcp sibling, then PATH"`
+	RunnerBinary string               `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN, the fishhawk-mcp sibling, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http (even with spawn=false or kind draft) and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	Spawn        *bool                `json:"spawn,omitempty" jsonschema:"spawn the runner for a runner-executed kind (default true). false creates the job queued and spawns nothing — you run fishhawk-runner specialist-job yourself"`
 }
 
@@ -123,7 +123,9 @@ Inputs:
   - kind, subject, inputs : the specialist-job-v1 request (see
     docs/spec/specialist-job-v1.md for each kind's inputs).
   - working_dir : ABSOLUTE checkout path (required over HTTP; not for draft).
-  - runner_binary, spawn : optional.
+  - runner_binary, spawn : optional. runner_binary is stdio-only: over
+    HTTP a supplied value is refused runner_binary_not_allowed_over_http
+    (even with spawn=false) and the daemon resolves its own runner.
 
 Returns the job, spawned, log_path and a next_step naming
 fishhawk_get_specialist_job. Results are evidence, not a gate verdict: a
@@ -132,8 +134,9 @@ the spawned runner holds FISHHAWK_RUNNER_ATTEST_TOKEN (a token carrying
 attest:specialist-jobs) and signs it; otherwise it records bearer, and a
 spawn without that variable carries a warning saying so.
 
-Tool errors: path_outside_allowed_roots / working_dir refusals and an
-unresolvable runner binary (before any POST); validation_failed (400),
+Tool errors: path_outside_allowed_roots / working_dir refusals,
+runner_binary_not_allowed_over_http (a runner_binary supplied over HTTP) and
+an unresolvable runner binary (before any POST); validation_failed (400),
 insufficient_scope / specialist_job_requester_not_a_seat (403),
 run_not_found / campaign_not_found (404), request_too_large (413),
 specialist_jobs_unconfigured (503).
@@ -167,7 +170,8 @@ stale and, while the job is still live, a next_step to wait again.
 // requestSpecialistJob is fishhawk_request_specialist_job's handler.
 //
 // ORDERING (approval condition C6): every pre-spawn refusal — working_dir
-// confinement, working_dir resolution, runner-binary resolution — runs BEFORE
+// confinement, the HTTP runner_binary refusal (#4476), working_dir resolution,
+// runner-binary resolution — runs BEFORE
 // the POST, so a refusal leaves no orphan queued job row behind it.
 func (r *runResolver) requestSpecialistJob(ctx context.Context, _ *mcp.CallToolRequest, in RequestSpecialistJobInput) (*mcp.CallToolResult, RequestSpecialistJobOutput, error) {
 	kind := strings.TrimSpace(in.Kind)
@@ -177,6 +181,13 @@ func (r *runResolver) requestSpecialistJob(ctx context.Context, _ *mcp.CallToolR
 	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
 		return nil, RequestSpecialistJobOutput{}, cerr
 	}
+	// runner_binary is refused over HTTP (E66.64 / #4476) UNCONDITIONALLY —
+	// even for spawn=false or a draft, where the value would go unused — so
+	// every spawning tool shares one rule, and before the POST so a refusal
+	// leaves no orphan job row.
+	if rerr := r.refuseHTTPRunnerBinary(in.RunnerBinary); rerr != nil {
+		return nil, RequestSpecialistJobOutput{}, rerr
+	}
 	spawn := kind != specialistJobKindDraft && (in.Spawn == nil || *in.Spawn)
 	var workingDir, binary string
 	if spawn {
@@ -184,7 +195,7 @@ func (r *runResolver) requestSpecialistJob(ctx context.Context, _ *mcp.CallToolR
 		if workingDir, err = r.resolveWorkingDir(in.WorkingDir); err != nil {
 			return nil, RequestSpecialistJobOutput{}, err
 		}
-		if binary, err = resolveRunnerBinary(in.RunnerBinary, r.getenv); err != nil {
+		if binary, err = r.resolveRunnerBinary(in.RunnerBinary); err != nil {
 			return nil, RequestSpecialistJobOutput{}, err
 		}
 	}
