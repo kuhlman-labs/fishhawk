@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -273,6 +274,56 @@ func (r *postgresRepo) LapseStranded(ctx context.Context) (int, error) {
 	return total, errors.Join(errs...)
 }
 
+// NewPendingLister wraps a pgxpool.Pool to satisfy PendingLister (the ops
+// monitor's read-only amendment scan, E85.2 / #4146). Caller retains
+// ownership of pool.
+func NewPendingLister(pool *pgxpool.Pool) PendingLister {
+	return &postgresRepo{
+		pool: pool,
+		now:  func() time.Time { return time.Now().UTC() },
+	}
+}
+
+// ListPendingWithStage implements PendingLister. The SQL is the only status
+// filter at this layer (no Go-side re-filter), so the query's pending-only
+// clause stays directly observable to its tests.
+func (r *postgresRepo) ListPendingWithStage(ctx context.Context, lookback time.Duration, limit int) ([]PendingWithStage, error) {
+	if lookback <= 0 {
+		return nil, fmt.Errorf("scopeamendment: list pending: lookback must be positive, got %s", lookback)
+	}
+	if limit <= 0 {
+		return nil, fmt.Errorf("scopeamendment: list pending: limit must be positive, got %d", limit)
+	}
+	if limit > math.MaxInt32 {
+		limit = math.MaxInt32
+	}
+	rows, err := amendmentdb.New(r.pool).ListPendingScopeAmendmentsWithStage(ctx, amendmentdb.ListPendingScopeAmendmentsWithStageParams{
+		LookbackSeconds: lookback.Seconds(),
+		RowLimit:        int32(limit), //nolint:gosec // clamped to math.MaxInt32 above
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scopeamendment: list pending: %w", err)
+	}
+	out := make([]PendingWithStage, 0, len(rows))
+	for _, row := range rows {
+		p := PendingWithStage{
+			ID:         row.ID,
+			RunID:      row.RunID,
+			StageID:    row.StageID,
+			Status:     Status(row.Status),
+			StageState: row.StageState,
+		}
+		if row.RequestedAt.Valid {
+			p.RequestedAt = row.RequestedAt.Time
+		}
+		if row.ObservedAt.Valid {
+			p.ObservedAt = row.ObservedAt.Time
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 func rowToAmendment(r amendmentdb.ScopeAmendment) (*Amendment, error) {
 	var paths []PathEntry
 	if err := json.Unmarshal(r.Paths, &paths); err != nil {
@@ -300,6 +351,7 @@ func rowToAmendment(r amendmentdb.ScopeAmendment) (*Amendment, error) {
 
 // Compile-time checks.
 var (
-	_ Repository = (*postgresRepo)(nil)
-	_ Lapser     = (*postgresRepo)(nil)
+	_ Repository    = (*postgresRepo)(nil)
+	_ Lapser        = (*postgresRepo)(nil)
+	_ PendingLister = (*postgresRepo)(nil)
 )

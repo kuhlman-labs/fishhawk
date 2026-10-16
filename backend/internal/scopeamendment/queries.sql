@@ -73,3 +73,22 @@ SELECT DISTINCT sa.stage_id, s.state AS stage_state, r.state AS run_state
    AND (s.state IN ('succeeded', 'cancelled', 'superseded')
         OR r.state IN ('succeeded', 'cancelled'))
  ORDER BY sa.stage_id;
+
+-- name: ListPendingScopeAmendmentsWithStage :many
+-- E85.2 / #4146: the ops monitor's amendment scan (read-only). Undecided rows
+-- only, so a #4127 lapsed row (and an approved/denied one) is never returned.
+-- LEFT JOIN because stages is FORCE row-level secured through its parent run
+-- (migration 0057): a stage hidden from this session reads a NULL state
+-- instead of silently dropping the amendment. now() is returned as
+-- observed_at so the caller measures age in ONE clock domain, the database's
+-- (#3048). Newest first, so a bounded scan always holds the freshest rows:
+-- they are the only ones whose decision window can still be met.
+SELECT sa.id, sa.run_id, sa.stage_id, sa.status, sa.requested_at,
+       s.state AS stage_state,
+       now()::timestamptz AS observed_at
+  FROM scope_amendments sa
+  LEFT JOIN stages s ON s.id = sa.stage_id
+ WHERE sa.status = 'pending'
+   AND sa.requested_at > now() - make_interval(secs => sqlc.arg(lookback_seconds)::float8)
+ ORDER BY sa.requested_at DESC, sa.id DESC
+ LIMIT sqlc.arg(row_limit);

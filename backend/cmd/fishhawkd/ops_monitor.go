@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/opsmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stalesweep"
 )
 
@@ -56,6 +57,10 @@ type opsMonitorFlags struct {
 	GoCacheMaxGB  float64
 	LoadFactor    float64
 	NotifyIssue   string
+
+	AmendmentWindow   time.Duration
+	AmendmentWarnLead time.Duration
+	AmendmentLookback time.Duration
 }
 
 // defaultOpsMonitorDiskPath is the operator's home directory: the volume the
@@ -104,6 +109,18 @@ func registerOpsMonitorFlags(fs *flag.FlagSet) *opsMonitorFlags {
 		envOr("FISHHAWKD_OPS_MONITOR_NOTIFY_ISSUE", ""),
 		"owner/name#N issue each failing condition is commented on through the GitHub App; empty is audit-only. "+
 			"It MUST be an access-controlled issue: the comment carries pids, run ids and host metrics")
+	fs.DurationVar(&f.AmendmentWindow, "ops-monitor-amendment-window",
+		envOrDuration("FISHHAWKD_OPS_MONITOR_AMENDMENT_WINDOW", opsmonitor.DefaultAmendmentWindow),
+		"scope-amendment decision window the amendment_window probe measures against (E85.2 / #4146); mirrors the "+
+			"implement agent's ~15-minute decision wait-poll. Must be positive")
+	fs.DurationVar(&f.AmendmentWarnLead, "ops-monitor-amendment-warn-lead",
+		envOrDuration("FISHHAWKD_OPS_MONITOR_AMENDMENT_WARN_LEAD", opsmonitor.DefaultAmendmentWarnLead),
+		"the amendment_window probe fires once a pending amendment's age exceeds the window minus this lead; 0 means "+
+			"no lead (it fires only once the window has elapsed). Must be >= 0 and below the window")
+	fs.DurationVar(&f.AmendmentLookback, "ops-monitor-amendment-lookback",
+		envOrDuration("FISHHAWKD_OPS_MONITOR_AMENDMENT_LOOKBACK", opsmonitor.DefaultAmendmentLookback),
+		"only pending scope amendments requested within this long are scanned, which bounds the backlog of stale "+
+			"pre-#4127 pending rows; must exceed the window")
 	return f
 }
 
@@ -117,6 +134,11 @@ type opsMonitorConfig struct {
 	GoCacheDir       string
 	GoCacheMaxBytes  uint64
 	LoadFactor       float64
+	// The amendment probes' durations (E85.2 / #4146), passed to the probes
+	// verbatim: a zero warn lead means no lead.
+	AmendmentWindow   time.Duration
+	AmendmentWarnLead time.Duration
+	AmendmentLookback time.Duration
 	// NotifyIssue is 0 when no notify issue is configured (audit-only).
 	NotifyRepo  forge.RepoRef
 	NotifyIssue int
@@ -125,8 +147,9 @@ type opsMonitorConfig struct {
 // resolveOpsMonitorConfig validates f. Disabled → (nil, nil) without
 // validating anything, so a typo in a flag the operator never turned on
 // cannot fail startup. Enabled → an unknown deployment, a malformed notify
-// issue, a non-positive interval or quiet window, or a non-positive,
-// non-finite or overflowing threshold is an error naming the flag.
+// issue, a non-positive interval or quiet window, a non-positive,
+// non-finite or overflowing threshold, or a degenerate amendment window,
+// warn lead or lookback is an error naming the flag.
 func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(string) string) (*opsMonitorConfig, error) {
 	if !enabled {
 		return nil, nil
@@ -155,6 +178,17 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 	if math.IsNaN(f.LoadFactor) || math.IsInf(f.LoadFactor, 0) || f.LoadFactor <= 0 {
 		return nil, fmt.Errorf("--ops-monitor-load-factor must be a positive finite number, got %v", f.LoadFactor)
 	}
+	if f.AmendmentWindow <= 0 {
+		return nil, fmt.Errorf("--ops-monitor-amendment-window must be positive, got %s", f.AmendmentWindow)
+	}
+	if f.AmendmentWarnLead < 0 || f.AmendmentWarnLead >= f.AmendmentWindow {
+		return nil, fmt.Errorf("--ops-monitor-amendment-warn-lead must be >= 0 and below the amendment window (%s), got %s",
+			f.AmendmentWindow, f.AmendmentWarnLead)
+	}
+	if f.AmendmentLookback <= f.AmendmentWindow {
+		return nil, fmt.Errorf("--ops-monitor-amendment-lookback must exceed the amendment window (%s), got %s",
+			f.AmendmentWindow, f.AmendmentLookback)
+	}
 	conf := &opsMonitorConfig{
 		Deployment:       deployment,
 		Interval:         f.Interval,
@@ -164,6 +198,10 @@ func resolveOpsMonitorConfig(enabled bool, f *opsMonitorFlags, getenv func(strin
 		GoCacheDir:       f.GoCacheDir,
 		GoCacheMaxBytes:  cacheMax,
 		LoadFactor:       f.LoadFactor,
+
+		AmendmentWindow:   f.AmendmentWindow,
+		AmendmentWarnLead: f.AmendmentWarnLead,
+		AmendmentLookback: f.AmendmentLookback,
 	}
 	if f.NotifyIssue != "" {
 		repo, issue, err := opsmonitor.ParseIssueRef(f.NotifyIssue)
@@ -201,18 +239,19 @@ type opsMonitorSeams struct {
 }
 
 // opsMonitorDeps are the ops monitor's runtime dependencies. Every field is
-// optional: a nil Ping or Runs reads unknown, a nil Audit is in-memory dedup
-// with no row, a nil GitHub is audit-only.
+// optional: a nil Ping, Runs or Amendments reads unknown, a nil Audit is
+// in-memory dedup with no row, a nil GitHub is audit-only.
 type opsMonitorDeps struct {
-	Audit  audit.Repository
-	Runs   opsmonitor.RunReader
-	Ping   func(ctx context.Context) error
-	GitHub *githubclient.Client
-	Logger *slog.Logger
-	Seams  opsMonitorSeams
+	Audit      audit.Repository
+	Runs       opsmonitor.RunReader
+	Amendments opsmonitor.AmendmentReader
+	Ping       func(ctx context.Context) error
+	GitHub     *githubclient.Client
+	Logger     *slog.Logger
+	Seams      opsMonitorSeams
 }
 
-// newOpsProbes builds the six probes from conf + deps.
+// newOpsProbes builds the eight probes from conf + deps.
 func newOpsProbes(conf opsMonitorConfig, deps opsMonitorDeps) []opsmonitor.Probe {
 	ping := deps.Ping
 	if deps.Seams.Ping != nil {
@@ -225,7 +264,24 @@ func newOpsProbes(conf opsMonitorConfig, deps opsMonitorDeps) []opsmonitor.Probe
 		opsmonitor.DockerProbe{Exec: deps.Seams.DockerExec},
 		opsmonitor.PostgresProbe{Ping: ping},
 		&opsmonitor.RunnerProbe{List: deps.Seams.ListRunners, Runs: deps.Runs},
+		opsmonitor.AmendmentWindowProbe{
+			Amendments: deps.Amendments,
+			Window:     conf.AmendmentWindow,
+			WarnLead:   conf.AmendmentWarnLead,
+			Lookback:   conf.AmendmentLookback,
+		},
+		opsmonitor.AmendmentTerminalProbe{Amendments: deps.Amendments, Lookback: conf.AmendmentLookback},
 	}
+}
+
+// opsAmendmentReader adapts a pool to the amendment probes' reader. A nil
+// pool returns a nil INTERFACE (never a typed nil), so the probes read
+// unknown (no database configured) instead of panicking.
+func opsAmendmentReader(pool *pgxpool.Pool) opsmonitor.AmendmentReader {
+	if pool == nil {
+		return nil
+	}
+	return scopeamendment.NewPendingLister(pool)
 }
 
 // newOpsMonitorTicker builds the serve-side ticker. A notify issue with no
@@ -315,7 +371,8 @@ var (
 //
 // It runs ONE opsmonitor.Sweep with the same probes and thresholds `serve
 // --enable-ops-monitor` uses, and writes NOTHING: no audit row, no
-// notification. Without --db the postgres and runners probes read unknown.
+// notification. Without --db the postgres, runners and amendment probes read
+// unknown.
 // Exit 0 when nothing is failing, 1 when any result is failing or --db fails
 // to connect, 2 on a usage error (including an invalid flag value).
 func runOpsProbe(args []string, logSink io.Writer) int {
@@ -328,7 +385,7 @@ func runOpsProbeWith(args []string, out, logSink io.Writer, seams opsMonitorSeam
 	f := registerOpsMonitorFlags(fs)
 	fs.StringVar(&f.Deployment, "deployment", f.Deployment, "alias of --ops-monitor-deployment")
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
-		"postgres URL; without it the postgres and runners probes read unknown")
+		"postgres URL; without it the postgres, runners and amendment probes read unknown")
 	asJSON := fs.Bool("json", false, "print the results as a JSON array instead of one line per result")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -354,6 +411,7 @@ func runOpsProbeWith(args []string, out, logSink io.Writer, seams opsMonitorSeam
 		}
 		defer pool.Close()
 		deps.Runs = runpkg.NewPostgresRepository(pool)
+		deps.Amendments = opsAmendmentReader(pool)
 		deps.Ping = poolPing(pool)
 	}
 

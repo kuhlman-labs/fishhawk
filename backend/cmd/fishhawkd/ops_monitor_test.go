@@ -48,6 +48,9 @@ var opsMonitorEnvVars = []string{
 	"FISHHAWKD_OPS_MONITOR_GOCACHE_MAX_GB",
 	"FISHHAWKD_OPS_MONITOR_LOAD_FACTOR",
 	"FISHHAWKD_OPS_MONITOR_NOTIFY_ISSUE",
+	"FISHHAWKD_OPS_MONITOR_AMENDMENT_WINDOW",
+	"FISHHAWKD_OPS_MONITOR_AMENDMENT_WARN_LEAD",
+	"FISHHAWKD_OPS_MONITOR_AMENDMENT_LOOKBACK",
 	"FISHHAWKD_DATABASE_URL",
 }
 
@@ -116,6 +119,13 @@ func TestResolveOpsMonitorConfig(t *testing.T) {
 		{"negative load factor", []string{"-ops-monitor-load-factor", "-4"}, "--ops-monitor-load-factor"},
 		{"NaN load factor", []string{"-ops-monitor-load-factor", "NaN"}, "--ops-monitor-load-factor"},
 		{"Inf load factor", []string{"-ops-monitor-load-factor", "+Inf"}, "--ops-monitor-load-factor"},
+		{"zero amendment window", []string{"-ops-monitor-amendment-window", "0s"}, "--ops-monitor-amendment-window"},
+		{"negative amendment window", []string{"-ops-monitor-amendment-window", "-1m"}, "--ops-monitor-amendment-window"},
+		{"negative warn lead", []string{"-ops-monitor-amendment-warn-lead", "-1s"}, "--ops-monitor-amendment-warn-lead"},
+		{"warn lead equal to window", []string{"-ops-monitor-amendment-warn-lead", "15m"}, "--ops-monitor-amendment-warn-lead"},
+		{"warn lead above window", []string{"-ops-monitor-amendment-warn-lead", "20m"}, "--ops-monitor-amendment-warn-lead"},
+		{"lookback equal to window", []string{"-ops-monitor-amendment-lookback", "15m"}, "--ops-monitor-amendment-lookback"},
+		{"lookback below window", []string{"-ops-monitor-amendment-lookback", "1m"}, "--ops-monitor-amendment-lookback"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conf, err := resolveOpsMonitorConfig(true, parseOpsMonitorFlags(t, tc.args...), noEnv)
@@ -142,9 +152,23 @@ func TestResolveOpsMonitorConfig(t *testing.T) {
 			GoCacheDir:       "",
 			GoCacheMaxBytes:  50 << 30,
 			LoadFactor:       opsmonitor.DefaultLoadFactor,
+
+			AmendmentWindow:   opsmonitor.DefaultAmendmentWindow,
+			AmendmentWarnLead: opsmonitor.DefaultAmendmentWarnLead,
+			AmendmentLookback: opsmonitor.DefaultAmendmentLookback,
 		}
 		if *conf != want {
 			t.Errorf("resolved defaults = %+v, want %+v", *conf, want)
+		}
+	})
+
+	t.Run("zero amendment warn lead is accepted verbatim", func(t *testing.T) {
+		conf, err := resolveOpsMonitorConfig(true, parseOpsMonitorFlags(t, "-ops-monitor-amendment-warn-lead", "0"), noEnv)
+		if err != nil {
+			t.Fatalf("resolve warn lead 0: %v", err)
+		}
+		if conf.AmendmentWarnLead != 0 {
+			t.Errorf("AmendmentWarnLead = %s, want 0 (no lead, never the default)", conf.AmendmentWarnLead)
 		}
 	})
 
@@ -168,7 +192,8 @@ func TestResolveOpsMonitorConfig(t *testing.T) {
 		f := parseOpsMonitorFlags(t, "-ops-monitor-deployment", "remote", "-ops-monitor-interval", "90s",
 			"-ops-monitor-quiet-window", "2h", "-ops-monitor-disk-path", "/data", "-ops-monitor-disk-min-free-gb", "1.5",
 			"-ops-monitor-gocache-dir", "/cache", "-ops-monitor-gocache-max-gb", "10", "-ops-monitor-load-factor", "2.5",
-			"-ops-monitor-notify-issue", "acme/ops#42")
+			"-ops-monitor-notify-issue", "acme/ops#42", "-ops-monitor-amendment-window", "20m",
+			"-ops-monitor-amendment-warn-lead", "5m", "-ops-monitor-amendment-lookback", "48h")
 		conf, err := resolveOpsMonitorConfig(true, f, noEnv)
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
@@ -184,6 +209,10 @@ func TestResolveOpsMonitorConfig(t *testing.T) {
 			LoadFactor:       2.5,
 			NotifyRepo:       forge.RepoRef{Owner: "acme", Name: "ops"},
 			NotifyIssue:      42,
+
+			AmendmentWindow:   20 * time.Minute,
+			AmendmentWarnLead: 5 * time.Minute,
+			AmendmentLookback: 48 * time.Hour,
 		}
 		if *conf != want {
 			t.Errorf("resolved = %+v, want %+v", *conf, want)
@@ -209,7 +238,9 @@ func TestRegisterOpsMonitorFlags_DefaultsAndEnv(t *testing.T) {
 		t.Errorf("--ops-monitor-notify-issue help does not state the access-controlled requirement: %q", usage)
 	}
 	if f.Deployment != "auto" || f.Interval != opsmonitor.DefaultInterval || f.QuietWindow != opsmonitor.DefaultQuietWindow ||
-		f.DiskMinFreeGB != 20 || f.GoCacheMaxGB != 50 || f.LoadFactor != opsmonitor.DefaultLoadFactor || f.NotifyIssue != "" {
+		f.DiskMinFreeGB != 20 || f.GoCacheMaxGB != 50 || f.LoadFactor != opsmonitor.DefaultLoadFactor || f.NotifyIssue != "" ||
+		f.AmendmentWindow != opsmonitor.DefaultAmendmentWindow || f.AmendmentWarnLead != opsmonitor.DefaultAmendmentWarnLead ||
+		f.AmendmentLookback != opsmonitor.DefaultAmendmentLookback {
 		t.Errorf("defaults = %+v", *f)
 	}
 
@@ -222,10 +253,14 @@ func TestRegisterOpsMonitorFlags_DefaultsAndEnv(t *testing.T) {
 	t.Setenv("FISHHAWKD_OPS_MONITOR_GOCACHE_MAX_GB", "12")
 	t.Setenv("FISHHAWKD_OPS_MONITOR_LOAD_FACTOR", "3")
 	t.Setenv("FISHHAWKD_OPS_MONITOR_NOTIFY_ISSUE", "acme/ops#7")
+	t.Setenv("FISHHAWKD_OPS_MONITOR_AMENDMENT_WINDOW", "30m")
+	t.Setenv("FISHHAWKD_OPS_MONITOR_AMENDMENT_WARN_LEAD", "0s")
+	t.Setenv("FISHHAWKD_OPS_MONITOR_AMENDMENT_LOOKBACK", "24h")
 	g := registerOpsMonitorFlags(flag.NewFlagSet("env", flag.ContinueOnError))
 	want := opsMonitorFlags{
 		Interval: 7 * time.Minute, Deployment: "remote", QuietWindow: 3 * time.Hour, DiskPath: "/env/data",
 		DiskMinFreeGB: 11, GoCacheDir: "/env/cache", GoCacheMaxGB: 12, LoadFactor: 3, NotifyIssue: "acme/ops#7",
+		AmendmentWindow: 30 * time.Minute, AmendmentWarnLead: 0, AmendmentLookback: 24 * time.Hour,
 	}
 	if *g != want {
 		t.Errorf("env fallbacks = %+v, want %+v", *g, want)
@@ -301,8 +336,20 @@ func TestNewOpsMonitorTicker_Wiring(t *testing.T) {
 		for _, p := range tk.Probes {
 			names = append(names, p.Name())
 		}
-		if got, want := strings.Join(names, ","), "disk,gocache,load,docker,postgres,runners"; got != want {
+		if got, want := strings.Join(names, ","), "disk,gocache,load,docker,postgres,runners,amendment_window,amendment_terminal"; got != want {
 			t.Errorf("probes = %s, want %s", got, want)
+		}
+		// The amendment durations are passed verbatim: a zero warn lead stays
+		// zero (no lead), never the default.
+		c := conf
+		c.AmendmentWindow, c.AmendmentWarnLead, c.AmendmentLookback = 20*time.Minute, 0, 48*time.Hour
+		probes := newOpsProbes(c, opsMonitorDeps{})
+		wp, ok := probes[6].(opsmonitor.AmendmentWindowProbe)
+		if !ok || wp.Window != 20*time.Minute || wp.WarnLead != 0 || wp.Lookback != 48*time.Hour {
+			t.Errorf("amendment_window probe = %#v, want window 20m, warn lead 0, lookback 48h", probes[6])
+		}
+		if tp, ok := probes[7].(opsmonitor.AmendmentTerminalProbe); !ok || tp.Lookback != 48*time.Hour {
+			t.Errorf("amendment_terminal probe = %#v, want lookback 48h", probes[7])
 		}
 		if tk.Deployment != opsmonitor.DeploymentRemote || tk.Interval != 3*time.Minute || tk.QuietWindow != 2*time.Hour {
 			t.Errorf("ticker = {deployment %s interval %s quiet %s}", tk.Deployment, tk.Interval, tk.QuietWindow)
@@ -736,8 +783,10 @@ func TestOpsProbe_NonLocalAllHostProbesNotApplicable(t *testing.T) {
 						t.Errorf("%s = %+v, want not_applicable naming %s", name, r, dep)
 					}
 				}
-				if pg := byProbe["postgres"]; pg.Status != opsmonitor.StatusUnknown || pg.Reason != "no database configured" {
-					t.Errorf("postgres = %+v, want unknown (no database configured)", pg)
+				for _, name := range []string{"postgres", "amendment_window", "amendment_terminal"} {
+					if r := byProbe[name]; r.Status != opsmonitor.StatusUnknown || r.Reason != "no database configured" {
+						t.Errorf("%s = %+v, want unknown (no database configured), never not_applicable", name, r)
+					}
 				}
 				if n := calls.Load(); n != 0 {
 					t.Errorf("host probe seams called %d times under %s, want 0", n, dep)
@@ -790,7 +839,8 @@ func TestOpsProbe_DiskFailingExitsOne(t *testing.T) {
 			t.Errorf("disk line missing %s: %s", want, diskLine)
 		}
 	}
-	for _, want := range []string{"ok gocache ", "ok load ", "ok docker ", `unknown postgres reason="no database configured"`, "unknown runners "} {
+	for _, want := range []string{"ok gocache ", "ok load ", "ok docker ", `unknown postgres reason="no database configured"`, "unknown runners ",
+		`unknown amendment_window reason="no database configured"`, `unknown amendment_terminal reason="no database configured"`} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout missing %q:\n%s", want, stdout)
 		}
@@ -828,6 +878,39 @@ func TestOpsProbe_WithDB(t *testing.T) {
 	}
 	if rn := byProbe["runners"]; rn.Status != opsmonitor.StatusUnknown || !strings.Contains(rn.Reason, "1 fishhawk-runner process(es) not found in this tracker") {
 		t.Errorf("runners = %+v, want unknown naming 1 runner not found", rn)
+	}
+	// The amendment probes cross CLI -> lister -> SQL: an empty table reads ok.
+	for _, name := range []string{"amendment_window", "amendment_terminal"} {
+		if r := byProbe[name]; r.Status != opsmonitor.StatusOK || !strings.Contains(r.Observed, "0 pending amendment(s) scanned") {
+			t.Errorf("%s = %+v, want ok over the real scan", name, r)
+		}
+	}
+}
+
+// TestOpsMonitorAmendmentWindowDefaultMatchesPollWindow pins the amendment
+// window default to the implement agent's decision wait-poll.
+func TestOpsMonitorAmendmentWindowDefaultMatchesPollWindow(t *testing.T) {
+	if want := time.Duration(server.AmendmentPollWindowSeconds) * time.Second; opsmonitor.DefaultAmendmentWindow != want {
+		t.Errorf("opsmonitor.DefaultAmendmentWindow = %s, server.AmendmentPollWindowSeconds = %s: update "+
+			"DefaultAmendmentWindow, backend/internal/opsmonitor/README.md, backend/cmd/fishhawkd/README.md, "+
+			".env.example and the --ops-monitor-amendment-window help together with the poll window",
+			opsmonitor.DefaultAmendmentWindow, want)
+	}
+}
+
+// TestOpsAmendmentReader_NilPoolIsNilInterface: a nil pool is a nil
+// INTERFACE (the probes then read unknown), never a typed nil.
+func TestOpsAmendmentReader_NilPoolIsNilInterface(t *testing.T) {
+	if r := opsAmendmentReader(nil); r != nil {
+		t.Errorf("opsAmendmentReader(nil) = %#v, want a nil interface", r)
+	}
+	pool, err := pgxpool.New(context.Background(), "postgres://fishhawk@127.0.0.1:1/none?connect_timeout=1")
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	if opsAmendmentReader(pool) == nil {
+		t.Error("opsAmendmentReader(pool) = nil, want the postgres lister")
 	}
 }
 
