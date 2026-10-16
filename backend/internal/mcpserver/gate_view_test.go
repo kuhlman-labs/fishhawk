@@ -1414,3 +1414,56 @@ func TestMergeCandidateStaleness_WireShape(t *testing.T) {
 		t.Errorf("get_run_status next_actions = %v, want fishhawk_rebase_run_branch", actionNames(out.NextActions))
 	}
 }
+
+// TestGetGateView_ScopeOverlapPassThrough (E83.60 / #4118): the backend's
+// scope_overlap block survives the MCP seam intact through the client mirror,
+// and a body without it (a run-bound caller, a failed compute, an older
+// backend) leaves the mirror nil.
+func TestGetGateView_ScopeOverlapPassThrough(t *testing.T) {
+	runID := uuid.New()
+	other := uuid.NewString()
+	parent := uuid.NewString()
+	raw := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[],` +
+		`"suppressed_relitigations":[],"history_incomplete":false,"scope_overlap":{"run_id":"` + runID.String() +
+		`","self_scope_resolved":true,"overlaps":[{"run_id":"` + other + `","issue_ref":"x/y#7","decomposed_from":"` + parent +
+		`","stage":"implement","stage_state":"running","paths":["a.go","b.go"]}],"scanned_runs":4,"unscoped_runs":2,"truncated":true}}`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	ov := decoded.GateView.ScopeOverlap
+	if ov == nil {
+		t.Fatal("scope_overlap did not decode through the seam (json tag mismatch?)")
+	}
+	if ov.RunID != runID.String() || !ov.SelfScopeResolved || ov.ScannedRuns != 4 || ov.UnscopedRuns != 2 || !ov.Truncated {
+		t.Errorf("scope_overlap scalars = %+v, want every scalar intact", ov)
+	}
+	if len(ov.Overlaps) != 1 {
+		t.Fatalf("overlaps = %+v, want one", ov.Overlaps)
+	}
+	o := ov.Overlaps[0]
+	if o.RunID != other || o.IssueRef != "x/y#7" || o.DecomposedFrom != parent || o.Stage != "implement" ||
+		o.StageState != "running" || len(o.Paths) != 2 || o.Paths[0] != "a.go" || o.Paths[1] != "b.go" {
+		t.Errorf("overlap = %+v, want every member intact", o)
+	}
+
+	bare := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[],` +
+		`"suppressed_relitigations":[],"history_incomplete":false}`)
+	srv2, _ := newGateViewBackend(t, http.StatusOK, bare)
+	res2 := callGateView(t, srv2, map[string]any{"run_id": runID.String()})
+	out2, _ := json.Marshal(res2.StructuredContent)
+	var decoded2 GetGateViewOutput
+	if uerr := json.Unmarshal(out2, &decoded2); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	if decoded2.GateView.ScopeOverlap != nil {
+		t.Errorf("scope_overlap = %+v, want nil when the backend omits it", decoded2.GateView.ScopeOverlap)
+	}
+}

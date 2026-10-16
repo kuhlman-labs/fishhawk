@@ -823,6 +823,12 @@ type GetPlanOutput struct {
 	// children, the #2062 close-parent-watcher deferral, and the drafted
 	// cap-exception when the contract phase is a governed exception.
 	SplitFiling *PlanSplitFiling `json:"split_filing,omitempty" jsonschema:"on-approval split-child filing outcome (#2057, E50.5; refusal #2412): present once the approval hook has filed every phased child of an approved split_proposal (split_children_filed completion marker) OR refused to file any (split_filing_refused marker). contract_classification is delete-only (the transitional name is kept permanently; the contract phase deletes only) or governed-exception (the contract phase's reachability-derived file count exceeds the implement max_files_changed cap, so an atomic rename cannot fit one in-cap PR). children[] lists each filed phased child (phase_index, title, number, url, is_contract) with depends_on edges resolved to sibling #N; contract_child_number is the acceptance-carrier child; deferral_issue is the #2062 close-parent-watcher follow-up (this slice ships no live parent-close — a child issue body carries no functionless Closes line). cap_exception, present only for governed-exception, carries the in-memory-only operator-authored + admin-merged draft (spec_diff raising the cap + pr_body from the atomicity evidence) that rides the audit payload and is NEVER written to .fishhawk/**. refused (#2412), present only when the hook DECLINED to file any children because a split_proposal phase's own declared file count exceeds the resolved implement cap, names each offending phase — no children were filed. Absent when the plan carries no split_proposal, the hook has not yet completed filing or refusing, or on older runs predating the pass"`
+	// ScopeOverlap is the LIVE cross-run scope overlap of the REQUESTED run
+	// (E83.60 / #4118), read from GET /v0/runs/{run_id}/scope-overlap on every
+	// call. Fail-open: nil when the read failed (including the backend's 403
+	// for a run-bound token or a token without read:audit) or against an older
+	// backend; the plan is returned regardless.
+	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"live cross-run scope overlap (#4118) of THIS run's effective scope (plan scope, approval add/remove, approved amendments) with every other non-terminal run in the same repo and tenant, outside this run's decomposition/recovery lineage: overlaps[] names each run_id, issue_ref, decomposed_from, current stage/stage_state and the shared paths; scanned_runs/unscoped_runs/truncated say how complete the scan was. Advisory, never blocks approval — weigh merge order. Absent when the read failed (a run-bound token, a token without read:audit) or against an older backend"`
 }
 
 // PlanSplitFilingChild is one filed phased child decoded from a
@@ -1073,6 +1079,11 @@ Response status:
   - "no_plan_yet"   — The run (and its parents) have no terminal plan
                       artifact yet. Message names the chain depth
                       searched.
+
+On "available" the response also carries scope_overlap: the LIVE cross-run
+overlap of the requested run's effective scope with every other non-terminal
+run in the repository (advisory, never blocks approval; absent when the read
+failed, including for a token without read:audit).
 `),
 	}, resolver.getPlan)
 }
@@ -1129,6 +1140,12 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load split filing: %w", err)
 			}
+			// Live cross-run scope overlap of the REQUESTED run (#4118):
+			// fail-open, so a failed read never fails the plan read.
+			overlap, oerr := r.api.GetScopeOverlap(ctx, runID)
+			if oerr != nil {
+				overlap = nil
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -1141,6 +1158,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				PlanWarnings:     planWarnings,
 				Reachability:     reach,
 				SplitFiling:      splitFiling,
+				ScopeOverlap:     overlap,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)

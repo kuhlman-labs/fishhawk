@@ -648,6 +648,15 @@ type fakeBackend struct {
 	// refusal tests can assert an explicit never-dialed seam rather than
 	// inferring it from a zero-value response.
 	startCampaignItemRunCalls int
+
+	// E83.60 / #4118: GET /v0/runs/{run_id}/scope-overlap. scopeOverlapByRun
+	// seeds the per-run body; an unkeyed run answers 404 (the older-backend /
+	// unrouted shape). scopeOverlapStatus (default 200) forces that status with
+	// an error body on EVERY read; scopeOverlapCalls records each read's run id
+	// so a test can assert WHICH run was read.
+	scopeOverlapByRun  map[uuid.UUID]scopeOverlap
+	scopeOverlapStatus int
+	scopeOverlapCalls  []uuid.UUID
 }
 
 // recordedReapExpectedState reads the expected_state precondition the fake
@@ -782,8 +791,35 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		campaignStatusStatus:          http.StatusOK,
 		resumeCampaignStatus:          http.StatusOK,
 		cancelCampaignStatus:          http.StatusOK,
+		scopeOverlapByRun:             map[uuid.UUID]scopeOverlap{},
+		scopeOverlapStatus:            http.StatusOK,
 	}
 	mux := http.NewServeMux()
+	// GET /v0/runs/{run_id}/scope-overlap (E83.60 / #4118).
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.scopeOverlapCalls = append(fb.scopeOverlapCalls, id)
+		status := fb.scopeOverlapStatus
+		body, ok := fb.scopeOverlapByRun[id]
+		fb.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"code":"internal_error","message":"scope overlap failed"}`))
+			return
+		}
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"no route"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	})
 	// GET /healthz — the #2712 restart-boundary probe. Unauthenticated by
 	// contract; the handler records any Authorization header it DID receive so
 	// a test can prove the client sends none.
@@ -18923,5 +18959,145 @@ func TestRebaseRunBranchTool_DescriptionNamesInPlaceConversion(t *testing.T) {
 	}
 	if strings.Contains(flag, "Refused beside a queued fix-up") {
 		t.Errorf("rerun_failed_verify schema still carries the retired refusal:\n%s", flag)
+	}
+}
+
+// --- scope_overlap on fishhawk_get_plan (E83.60 / #4118) ---
+
+// seedAvailablePlanRun seeds a run whose own plan stage carries a plan, so
+// getPlan resolves status=available via self.
+func seedAvailablePlanRun(fb *fakeBackend) uuid.UUID {
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"}}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+	return runID
+}
+
+// TestGetPlan_ScopeOverlap_Populated: a seeded backend overlap reaches
+// GetPlanOutput.scope_overlap with its run_id, issue_ref, stage and paths.
+// Counterfactual H: getPlan skipping the GetScopeOverlap read leaves it nil.
+func TestGetPlan_ScopeOverlap_Populated(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := seedAvailablePlanRun(fb)
+	other := uuid.NewString()
+	fb.scopeOverlapByRun[runID] = scopeOverlap{
+		RunID: runID.String(), SelfScopeResolved: true, ScannedRuns: 3, UnscopedRuns: 1,
+		Overlaps: []scopeOverlapRun{{
+			RunID: other, IssueRef: "x/y#42", Stage: "implement", StageState: "running",
+			Paths: []string{"backend/shared.go"},
+		}},
+	}
+
+	_, out, err := newResolver(srv, nil).getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "available" {
+		t.Fatalf("status = %q, want available", out.Status)
+	}
+	ov := out.ScopeOverlap
+	if ov == nil {
+		t.Fatal("scope_overlap = nil, want the seeded overlap passed through")
+	}
+	if !ov.SelfScopeResolved || ov.ScannedRuns != 3 || ov.UnscopedRuns != 1 || len(ov.Overlaps) != 1 {
+		t.Fatalf("scope_overlap = %+v, want resolved, scanned 3, unscoped 1, one overlap", ov)
+	}
+	got := ov.Overlaps[0]
+	if got.RunID != other || got.IssueRef != "x/y#42" || got.Stage != "implement" || got.StageState != "running" ||
+		len(got.Paths) != 1 || got.Paths[0] != "backend/shared.go" {
+		t.Errorf("overlap = %+v, want run %s on x/y#42 implement/running sharing backend/shared.go", got, other)
+	}
+}
+
+// TestGetPlan_ScopeOverlap_BackendErrorOmitted: a 500, an unrouted 404 (an
+// older backend) and a 403 (the backend's refusal of a run-bound token, or a
+// token without read:audit) each leave scope_overlap nil while the plan read
+// still answers status=available — fail-open, and a refused caller learns no
+// other run's id, issue or paths.
+func TestGetPlan_ScopeOverlap_BackendErrorOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		seed   bool
+	}{
+		{"500", http.StatusInternalServerError, true},
+		{"unrouted 404", http.StatusOK, false},
+		{"403 run-bound or missing read:audit", http.StatusForbidden, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := seedAvailablePlanRun(fb)
+			fb.scopeOverlapStatus = tc.status
+			if tc.seed {
+				fb.scopeOverlapByRun[runID] = scopeOverlap{RunID: runID.String(), SelfScopeResolved: true,
+					Overlaps: []scopeOverlapRun{{RunID: uuid.NewString(), IssueRef: "x/y#9", Paths: []string{"a.go"}}}}
+			}
+			_, out, err := newResolver(srv, nil).getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getPlan: %v (a scope-overlap read failure must not fail the plan read)", err)
+			}
+			if out.Status != "available" || out.Plan == nil {
+				t.Fatalf("status = %q plan = %v, want available with the plan", out.Status, out.Plan)
+			}
+			if out.ScopeOverlap != nil {
+				t.Errorf("scope_overlap = %+v, want nil on a failed read", out.ScopeOverlap)
+			}
+			if len(fb.scopeOverlapCalls) != 1 {
+				t.Errorf("scope-overlap reads = %d, want exactly 1 (the read was attempted)", len(fb.scopeOverlapCalls))
+			}
+		})
+	}
+}
+
+// TestGetPlan_ScopeOverlap_ReadsRequestedRun: on a CI-retry chain the plan
+// resolves via the parent, but scope_overlap is read for the REQUESTED run —
+// its own effective scope and lineage are what the operator is judging.
+func TestGetPlan_ScopeOverlap_ReadsRequestedRun(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	parentID := uuid.New()
+	childID := uuid.New()
+	parentPlanStage := uuid.New()
+	parentIDStr := parentID.String()
+	fb.getRunByID[childID] = Run{ID: childID.String(), ParentRunID: &parentIDStr, State: "running", Repo: "x/y"}
+	fb.getRunByID[parentID] = Run{ID: parentID.String(), State: "running", Repo: "x/y"}
+	fb.stagesByRun[childID] = []Stage{{ID: uuid.New().String(), RunID: childID.String(), Type: "implement", State: "running"}}
+	fb.stagesByRun[parentID] = []Stage{{ID: parentPlanStage.String(), RunID: parentID.String(), Type: "plan", State: "succeeded"}}
+	seedPlanArtifact(fb, parentPlanStage, samplePlanContent(), time.Hour)
+	fb.scopeOverlapByRun[childID] = scopeOverlap{RunID: childID.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{}}
+	fb.scopeOverlapByRun[parentID] = scopeOverlap{RunID: parentID.String(), SelfScopeResolved: true,
+		Overlaps: []scopeOverlapRun{{RunID: uuid.NewString(), Paths: []string{"wrong.go"}}}}
+
+	_, out, err := newResolver(srv, nil).getPlan(context.Background(), nil, GetPlanInput{RunID: childID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ResolvedVia != "parent:"+parentID.String() {
+		t.Fatalf("resolved_via = %q, want the parent walk", out.ResolvedVia)
+	}
+	if out.ScopeOverlap == nil || out.ScopeOverlap.RunID != childID.String() || len(out.ScopeOverlap.Overlaps) != 0 {
+		t.Errorf("scope_overlap = %+v, want the REQUESTED child run's overlap", out.ScopeOverlap)
+	}
+	if len(fb.scopeOverlapCalls) != 1 || fb.scopeOverlapCalls[0] != childID {
+		t.Errorf("scope-overlap reads = %v, want exactly one for the child %s", fb.scopeOverlapCalls, childID)
+	}
+}
+
+// TestGetPlan_ScopeOverlap_NotReadWithoutPlan: a no_plan_yet answer makes no
+// scope-overlap read (there is nothing to weigh yet).
+func TestGetPlan_ScopeOverlap_NotReadWithoutPlan(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+	fb.stagesByRun[runID] = []Stage{{ID: uuid.New().String(), RunID: runID.String(), Type: "implement", State: "running"}}
+	_, out, err := newResolver(srv, nil).getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Status != "no_plan_yet" || out.ScopeOverlap != nil {
+		t.Errorf("status = %q scope_overlap = %+v, want no_plan_yet with no block", out.Status, out.ScopeOverlap)
+	}
+	if len(fb.scopeOverlapCalls) != 0 {
+		t.Errorf("scope-overlap reads = %d, want 0 on no_plan_yet", len(fb.scopeOverlapCalls))
 	}
 }

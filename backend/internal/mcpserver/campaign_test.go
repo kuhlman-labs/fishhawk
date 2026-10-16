@@ -3479,3 +3479,185 @@ func TestPreviewCampaignToolDescription_NamesAcceptedEpicRefForms(t *testing.T) 
 		t.Errorf("epic_ref description does not name the refused cross-repo form owner/name#25: %s", desc)
 	}
 }
+
+// --- scope_overlap on fishhawk_get_campaign_status (E83.60 / #4118) ---
+
+// overlapCampaign seeds a running campaign over items and returns its id.
+func overlapCampaign(fb *fakeBackend, items []CampaignItem) uuid.UUID {
+	id := uuid.New()
+	fb.campaignStatusByID[id] = CampaignStatus{
+		Campaign:   Campaign{ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+		Items:      items,
+		Rollup:     CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+		NextAction: CampaignNextAction{Action: "wait", Detail: "items are running"},
+	}
+	return id
+}
+
+// TestGetCampaignStatus_ScopeOverlap_FiltersToOtherInFlightItems: each
+// in-flight item (running or paused with a run) keeps ONLY the overlap entries
+// naming another in-flight item's run (run_id arm) or a decomposition slice of
+// one (decomposed_from arm); a non-campaign run and a terminal item's run are
+// dropped, and terminal, pending and runless items are never read.
+// Counterfactual I: dropping the decomposed_from arm empties #1's overlaps.
+func TestGetCampaignStatus_ScopeOverlap_FiltersToOtherInFlightItems(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runA, runB, runC := uuid.New(), uuid.New(), uuid.New()
+	sliceOfB := uuid.NewString()
+	external := uuid.NewString()
+	items := []CampaignItem{
+		{ID: uuid.NewString(), IssueRef: "#1", State: "running", RunID: runA.String()},
+		{ID: uuid.NewString(), IssueRef: "#2", State: "paused", RunID: runB.String()},
+		{ID: uuid.NewString(), IssueRef: "#3", State: "succeeded", RunID: runC.String()},
+		{ID: uuid.NewString(), IssueRef: "#4", State: "running"},
+		{ID: uuid.NewString(), IssueRef: "#5", State: "pending"},
+	}
+	fb.scopeOverlapByRun[runA] = scopeOverlap{RunID: runA.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{
+		{RunID: sliceOfB, IssueRef: "#2", DecomposedFrom: runB.String(), Paths: []string{"slice.go"}},
+		{RunID: external, IssueRef: "#99", Paths: []string{"shared.go"}},
+		{RunID: runC.String(), IssueRef: "#3", Paths: []string{"done.go"}},
+		// Defensive: an entry naming the item's OWN run, or a slice of it, is
+		// never "another" item (the server's lineage exclusion already drops
+		// these; the filter must not re-admit them).
+		{RunID: runA.String(), IssueRef: "#1", Paths: []string{"self.go"}},
+		{RunID: uuid.NewString(), IssueRef: "#1", DecomposedFrom: runA.String(), Paths: []string{"own-slice.go"}},
+	}}
+	fb.scopeOverlapByRun[runB] = scopeOverlap{RunID: runB.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{
+		{RunID: runA.String(), IssueRef: "#1", Paths: []string{"slice.go"}},
+		{RunID: external, IssueRef: "#99", Paths: []string{"shared.go"}},
+	}}
+	fb.scopeOverlapByRun[runC] = scopeOverlap{RunID: runC.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{}}
+	id := overlapCampaign(fb, items)
+
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	so := out.ScopeOverlap
+	if so == nil {
+		t.Fatal("scope_overlap = nil, want the block when items are in flight")
+	}
+	if so.Truncated || len(so.ReadFailures) != 0 {
+		t.Errorf("truncated = %v read_failures = %v, want neither", so.Truncated, so.ReadFailures)
+	}
+	if len(so.Items) != 2 {
+		t.Fatalf("items = %+v, want the two in-flight items only", so.Items)
+	}
+	byRef := map[string]campaignItemScopeOverlap{}
+	for _, it := range so.Items {
+		byRef[it.IssueRef] = it
+	}
+	one := byRef["#1"]
+	if one.RunID != runA.String() || !one.SelfScopeResolved || len(one.Overlaps) != 1 ||
+		one.Overlaps[0].RunID != sliceOfB || one.Overlaps[0].DecomposedFrom != runB.String() {
+		t.Errorf("#1 = %+v, want only the slice of #2's run (decomposed_from arm)", one)
+	}
+	two := byRef["#2"]
+	if two.RunID != runB.String() || len(two.Overlaps) != 1 || two.Overlaps[0].RunID != runA.String() {
+		t.Errorf("#2 = %+v, want only #1's run (run_id arm)", two)
+	}
+	read := map[uuid.UUID]bool{}
+	for _, c := range fb.scopeOverlapCalls {
+		read[c] = true
+	}
+	if len(fb.scopeOverlapCalls) != 2 || !read[runA] || !read[runB] {
+		t.Errorf("scope-overlap reads = %v, want exactly runA and runB (terminal/pending/runless items never read)", fb.scopeOverlapCalls)
+	}
+}
+
+// TestGetCampaignStatus_ScopeOverlap_ReadFailureListed: a per-item read failure
+// lists the item in read_failures and never fails the snapshot; the other
+// item's entry still lands.
+func TestGetCampaignStatus_ScopeOverlap_ReadFailureListed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runA, runB := uuid.New(), uuid.New()
+	fb.scopeOverlapByRun[runA] = scopeOverlap{RunID: runA.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{}}
+	// runB is unkeyed: its read answers 404, a read failure.
+	id := overlapCampaign(fb, []CampaignItem{
+		{ID: uuid.NewString(), IssueRef: "#1", State: "running", RunID: runA.String()},
+		{ID: uuid.NewString(), IssueRef: "#2", State: "running", RunID: runB.String()},
+	})
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v (a failed overlap read must not fail the status)", err)
+	}
+	so := out.ScopeOverlap
+	if so == nil {
+		t.Fatal("scope_overlap = nil, want a partial block")
+	}
+	if len(so.ReadFailures) != 1 || so.ReadFailures[0] != "#2" {
+		t.Errorf("read_failures = %v, want [#2]", so.ReadFailures)
+	}
+	if len(so.Items) != 1 || so.Items[0].IssueRef != "#1" || so.Items[0].Overlaps == nil {
+		t.Errorf("items = %+v, want #1 with a non-nil empty overlaps", so.Items)
+	}
+
+	// Every read failing (a token without read:audit): every item listed, no items.
+	fb.scopeOverlapStatus = http.StatusForbidden
+	_, out2, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out2.ScopeOverlap == nil || len(out2.ScopeOverlap.ReadFailures) != 2 || len(out2.ScopeOverlap.Items) != 0 {
+		t.Errorf("scope_overlap = %+v, want both items as read failures and no item entries", out2.ScopeOverlap)
+	}
+}
+
+// TestGetCampaignStatus_ScopeOverlap_AbsentWhenNothingInFlight: no running or
+// paused item with a run -> no block and no read.
+func TestGetCampaignStatus_ScopeOverlap_AbsentWhenNothingInFlight(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := overlapCampaign(fb, []CampaignItem{
+		{ID: uuid.NewString(), IssueRef: "#1", State: "succeeded", RunID: uuid.NewString()},
+		{ID: uuid.NewString(), IssueRef: "#2", State: "pending"},
+		{ID: uuid.NewString(), IssueRef: "#3", State: "running", RunID: "not-a-uuid"},
+	})
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.ScopeOverlap != nil {
+		t.Errorf("scope_overlap = %+v, want nil when nothing is in flight", out.ScopeOverlap)
+	}
+	if len(fb.scopeOverlapCalls) != 0 {
+		t.Errorf("scope-overlap reads = %d, want 0", len(fb.scopeOverlapCalls))
+	}
+}
+
+// TestGetCampaignStatus_ScopeOverlap_TruncatedPastCap: more in-flight items than
+// campaignScopeOverlapMaxItemReads -> exactly the cap is read and truncated is
+// set; an item beyond the cap still counts as "another in-flight item" for the
+// filter, since its run id needs no read.
+func TestGetCampaignStatus_ScopeOverlap_TruncatedPastCap(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	n := campaignScopeOverlapMaxItemReads + 2
+	items := make([]CampaignItem, 0, n)
+	runs := make([]uuid.UUID, 0, n)
+	for i := 0; i < n; i++ {
+		rid := uuid.New()
+		runs = append(runs, rid)
+		items = append(items, CampaignItem{ID: uuid.NewString(), IssueRef: fmt.Sprintf("#%d", i+1), State: "running", RunID: rid.String()})
+	}
+	last := runs[n-1]
+	for _, rid := range runs {
+		fb.scopeOverlapByRun[rid] = scopeOverlap{RunID: rid.String(), SelfScopeResolved: true, Overlaps: []scopeOverlapRun{}}
+	}
+	fb.scopeOverlapByRun[runs[0]] = scopeOverlap{RunID: runs[0].String(), SelfScopeResolved: true,
+		Overlaps: []scopeOverlapRun{{RunID: last.String(), Paths: []string{"x.go"}}}}
+	id := overlapCampaign(fb, items)
+
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	so := out.ScopeOverlap
+	if so == nil || !so.Truncated {
+		t.Fatalf("scope_overlap = %+v, want truncated", so)
+	}
+	if len(so.Items) != campaignScopeOverlapMaxItemReads || len(fb.scopeOverlapCalls) != campaignScopeOverlapMaxItemReads {
+		t.Errorf("items = %d reads = %d, want exactly the cap %d", len(so.Items), len(fb.scopeOverlapCalls), campaignScopeOverlapMaxItemReads)
+	}
+	if len(so.Items[0].Overlaps) != 1 || so.Items[0].Overlaps[0].RunID != last.String() {
+		t.Errorf("#1 overlaps = %+v, want the beyond-cap item's run kept", so.Items[0].Overlaps)
+	}
+}
