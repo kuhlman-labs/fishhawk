@@ -1,0 +1,14 @@
+id: scenario:issue-4330/ops-probe-local-memory-result
+statement: Running `fishhawkd ops-probe --deployment local --json` on a darwin or linux host includes a memory result whose status is one of ok, failing or unknown (never empty) and whose observed or reason text describes available memory and swap.
+verify_hint: CLI stdout of `fishhawkd ops-probe --deployment local --json`; the exit code may be 1 if the preview host itself is under pressure, so judge the memory entry's fields, not the exit code.
+steps: Ran /tmp/fh4330/fishhawkd (built from the sanctioned checkout) ops-probe --deployment local --json on this darwin host and inspected the memory entry.
+assertions:
+    expected: memory status one of ok/failing/unknown, with observed text describing available memory and swap
+    observed_at_record: 'memory: status ok, os darwin. observed: ''available 30.5% of 36.0 GiB; swap 63.0% of 2.0 GiB; pressure level normal''. threshold: ''available > 5.0% (clears above 10.0%); swap < 90.0% (clears below 70.0%); pressure level below critical (clears at normal); critical at available <= 2.0% or swap >= 97.0%''. workload_containers is unknown (''host container reading unavailable on darwin''), never ok. The process exits 1 only because of the unrelated gocache/docker failures.'
+    repro_handle: fishhawkd ops-probe --deployment local --json
+origin:
+    issue: 4330
+    pr: 0
+    run_id: f43b9730-36a9-444a-828c-7e9d02795880
+    head_sha: 17be7f1403eca1028a538d83e55e105cb53da383
+    recorded_at: 2026-10-16T16:50:48Z
