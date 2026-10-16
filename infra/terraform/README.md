@@ -5,9 +5,9 @@ Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform
 - **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + 2-AZ subnets + IGW + single NAT, security groups (ALB → app → RDS chain), IAM (ECS task / execution roles + GitHub Actions OIDC role), Secrets Manager skeletons, CloudWatch log group.
 - **ECS service + ALB** (E13.7.2 / [#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate cluster + task definition pointing at `ghcr.io/kuhlman-labs/fishhawkd:<image_tag>`, ECS service across both private subnets with rolling-deploy + circuit-breaker rollback, ALB + target group with `/healthz` health checks, HTTP listener (forward-only when no domain set, redirect-to-HTTPS otherwise), optional ACM cert + Route 53 alias + HTTPS listener gated on `var.domain_name`.
 - **RDS Postgres + migration task** (E13.7.3 / [#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with `rds.force_ssl=1` and the master password RDS-managed; Terraform reads it via `aws_db_instance.master_user_secret` and assembles the libpq URL into the existing `database_url` Secrets Manager entry. Dedicated `<project>-<env>-migrate` task definition for `fishhawkd migrate up`.
-- **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — `.github/workflows/backend-deploy.yml` runs after `backend-release.yml` on `backend/v*` tags, or via `workflow_dispatch` for rollback. Registers a new task-definition revision, runs the migration task to completion, then swaps the service via `aws-actions/amazon-ecs-deploy-task-definition`. Operator wires up the GitHub repo variable `AWS_DEPLOY_ROLE_ARN` once.
+- **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — **removed** under [ADR-073](https://github.com/kuhlman-labs/fishhawk/issues/2298). `.github/workflows/backend-deploy.yml` never ran (its `workflow_run` trigger named `backend-build`/`backend-release`, not the real `Backend Build`/`Backend Release` workflow names) and was deleted rather than fixed: fixing the names would have deployed a release candidate to prod. Kubernetes + Helm (`deploy/helm/fishhawk/`) is the single deployment substrate; the ECS-specific resources below await retirement under the same ADR.
 
-The full deploy chain is in. Day-21 self-execution can run end-to-end against this stack.
+There is no CI deploy path into this stack any more; an ECS deploy is a manual `terraform apply` with an explicit `image_tag`.
 
 ## Prerequisites
 
@@ -188,15 +188,7 @@ aws logs tail /aws/ecs/fishhawk-prod --follow
 
 ## Releasing
 
-Once the stack is up, the deploy workflow handles the loop:
-
-1. Cut a tag: `git tag backend/v0.1.0 && git push --tags`. `backend-release.yml` builds + signs + publishes the image; `backend-deploy.yml` fires on its completion.
-2. The deploy workflow assumes the `<project>-<env>-gha-deploy` OIDC role (foundation slice's `iam.tf`), registers a new task-definition revision in both the serve and migrate families, runs the migration task, then `aws-actions/amazon-ecs-deploy-task-definition` waits for the ECS service to converge.
-3. The service's circuit breaker (slice 2) auto-rolls-back on health-check failures. The workflow surfaces the rollback as a workflow failure so the operator notices.
-
-**One-time per environment**: set the GitHub repo variable `AWS_DEPLOY_ROLE_ARN` from `terraform output -raw github_actions_deploy_role_arn`. ARN, not secret — repo variables are correct here.
-
-**Rollback**: trigger the deploy workflow manually with `workflow_dispatch` and an explicit older `image_tag` (e.g. `v0.0.9`).
+A `backend/v*` tag runs `backend-release.yml`, which builds, signs and publishes `ghcr.io/kuhlman-labs/fishhawkd:vX.Y.Z` (plus `:latest` for a final release only). Nothing deploys it here: the ECS deploy workflow was removed under ADR-073. To move this stack to a new image, set `image_tag` in the environment's tfvars and apply (see "Local apply" / "CI apply" above); the ECS service's circuit breaker still rolls back on health-check failures.
 
 ## Running migrations manually
 
