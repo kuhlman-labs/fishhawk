@@ -5,8 +5,10 @@ package main
 // A specialist job is NOT a run stage: it is evidence work an operator seat
 // requests about a run, campaign or head SHA. fishhawkd records the request
 // (and renders `draft` in-process); this subcommand executes every other kind
-// against a FRESH scratch clone of the subject's head SHA and ships one typed
-// completion. Four controls bound what a job can do, each with a named error:
+// against a FRESH scratch clone of the subject's head SHA (except the
+// argument-free host.* inventory ids, which read no tree and never clone,
+// #4330) and ships one typed completion. Four controls bound what a job can
+// do, each with a named error:
 //
 //   - the job HTTP client's specialistJobTransport admits ONLY this job's
 //     GET /v0/specialist-jobs/{id} and POST .../{admission,result}; every other
@@ -87,6 +89,9 @@ const (
 	sjReasonTimeout           = "timeout"
 	sjReasonProbeError        = "probe_error"
 	sjReasonInputsInvalid     = "inputs_invalid"
+	// sjReasonNotApplicable: the job cannot apply on this host (a host.*
+	// inventory id on an OS outside the per-OS table, #4330).
+	sjReasonNotApplicable = "not_applicable"
 )
 
 // Named refusals. Each is returned wrapped; assert with errors.Is.
@@ -155,6 +160,9 @@ type specialistJobRun struct {
 	x       *counterfactualExecutor
 	git     *jobGit
 	logSink io.Writer
+	// host overrides the host.* inventory seams (nil = the real host,
+	// defaultHostInventorySeams); tests set it per run.
+	host *hostInventorySeams
 }
 
 // Bearer sources, in preference order: the runner attestation token (a
