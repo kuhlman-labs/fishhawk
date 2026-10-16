@@ -2648,6 +2648,16 @@ components:
             with `rerun_failed_verify: true` is legal. Emitted by
             `GET /v0/runs/{run_id}` ONLY, audit-first with no forge call, and
             best-effort (a read error omits it). Omitted otherwise.
+        merge_candidate_staleness:
+          $ref: '#/components/schemas/MergeCandidateStaleness'
+          description: |
+            Read-time staleness of an open decomposed parent's consolidated
+            PR head against its base tip (E85.4 / #4147). Emitted by
+            `GET /v0/runs/{run_id}` ONLY (the list endpoint never computes
+            it). Unlike `merge_candidate_rerun` it reads the forge; the cost
+            bound is per cache entry once stored (see the schema). Best-effort:
+            a children-list or chain-head read error omits it, never failing
+            the read.
         created_at:
           type: string
           format: date-time
@@ -2688,6 +2698,72 @@ components:
           format: int64
           description: "That fix-up's `stage_fixup_triggered` chain sequence; omitted at the review gate."
         note: { type: string, description: "What the re-run would do, in one sentence." }
+
+    MergeCandidateStaleness:
+      type: object
+      description: |
+        Read-time staleness of a decomposed parent's consolidated pull
+        request head against the CURRENT tip of its base branch (E85.4 /
+        #4147, detect-and-surface). Shared by `GET /v0/runs/{run_id}` and
+        the gate view. Present only for a non-terminal run with a pull
+        request URL and at least one decomposition child whose PR the forge
+        reports open and unmerged; a merged or closed PR omits it.
+
+        Detection is three forge GETs: the pull request (live head and base
+        ref), the base branch tip, and a three-dot compare of the head
+        against that resolved tip, so `behind_by` and `base_sha` are one
+        snapshot. The result is cached in process per (run, chain-recorded
+        head) for 60s: a head change Fishhawk records (`branch_rebased`,
+        `fixup_pushed`, `child_pushed`, `conflict_resolution_pushed`,
+        `operator_commit_vouched`, `pull_request_opened`) re-reads at once;
+        a base advance, or a push Fishhawk never recorded, shows within one
+        TTL, and `checked_at` says how old the observation is. The bound
+        (at most one read set per entry per 60s, each under a 5s deadline)
+        holds per cache entry once stored; it is not a hard rate limit —
+        concurrent first misses for the same run may each issue the reads
+        (no singleflight).
+
+        Fail-closed: any forge failure, deadline or unprobeable forge
+        reports `undetermined` with a closed-set `reason`, never `fresh`.
+        Read-only: no forge write, no audit append, no stage change, and
+        Fishhawk runs no verify command. Advancing the branch is the
+        operator's move (`next_step`).
+      required: [state, behind_by_lower_bound, checked_at, note]
+      properties:
+        state:
+          type: string
+          enum: [fresh, stale, undetermined]
+        head_sha: { type: string, description: The live pull request head the forge reported; absent when the PR read failed or was not attempted. }
+        base_ref: { type: string, description: "The pull request's base branch; absent when the PR read failed or was not attempted." }
+        base_sha: { type: string, description: The base tip the head was compared against; absent until the tip resolved. }
+        behind_by:
+          type: integer
+          minimum: 0
+          description: Base commits the head lacks — 0 on `fresh`, positive on `stale`, absent on `undetermined`.
+        behind_by_lower_bound:
+          type: boolean
+          description: True when the compare hit GitHub's un-paginated 250-commit cap, so `behind_by` is a lower bound.
+        reason:
+          type: string
+          enum: [forge_not_probeable, pr_read_failed, base_tip_unresolved, compare_failed, read_timeout]
+          description: |
+            `undetermined` only. `forge_not_probeable`: no GitHub client, no
+            installation (every GitLab-family run), an unparseable repo or no
+            PR number. `pr_read_failed`: the pull request read failed or
+            returned an empty head or base. `base_tip_unresolved`: the base
+            ref read failed or the ref does not exist. `compare_failed`: the
+            compare failed. `read_timeout`: a read hit the 5s deadline. No
+            error text is carried.
+        next_step:
+          type: string
+          enum: [fishhawk_rebase_run_branch]
+          description: |
+            `stale` only. The merge would refuse `merge_base_behind`;
+            `POST /v0/runs/{run_id}/rebase-branch` merges the base into the
+            run branch and authorizes the ADR-090 verify-only merge-candidate
+            pass. Fishhawk does not advance the branch itself.
+        checked_at: { type: string, format: date-time, description: When the observation was computed; a cache hit returns the stored value. }
+        note: { type: string, description: A constant-shape sentence per state. }
 
     RunMergeCandidateQueue:
       type: object
@@ -3312,7 +3388,10 @@ components:
             be read. The merge-candidate verdict block adds
             `merge_candidate_verdict` when any of its reads failed (#4293).
             The fan-in conflict block adds `fan_in` when one of its reads, or
-            the decode of a row it reads, failed (#4343).
+            the decode of a row it reads, failed (#4343). The merge-candidate
+            staleness block adds `merge_candidate_staleness` when the
+            decomposition-children list or the chain-head read failed
+            (E85.4 / #4147).
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -3381,6 +3460,15 @@ components:
             request.
         fan_in_conflict:
           $ref: '#/components/schemas/GateViewFanInConflict'
+        merge_candidate_staleness:
+          $ref: '#/components/schemas/MergeCandidateStaleness'
+          description: |
+            E85.4 / #4147. The same block `GET /v0/runs/{run_id}` carries,
+            computed by this handler only (the attention scan never pays the
+            forge reads). Omitted with a `merge_candidate_staleness`
+            `history_gaps` entry and `history_incomplete=true` when the
+            decomposition-children list or the chain-head read fails, so an
+            unreadable state is never shown as fresh.
 
     GateViewFanInConflict:
       type: object

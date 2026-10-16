@@ -108,6 +108,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateStaleness(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -125,6 +126,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateStaleness(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -151,10 +153,68 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldLiveValidationAdvisory(run, na)
 	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
+	foldMergeCandidateStaleness(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
 	return na
+}
+
+// foldMergeCandidateStaleness names fishhawk_rebase_run_branch when the run
+// read carries a STALE merge_candidate_staleness block (E85.4 / #4147, the
+// Captain's 2026-10-15 ruling, option b: detect and surface): the base branch
+// advanced past the open decomposed parent's consolidated PR head, so
+// fishhawk_merge_run would refuse merge_base_behind (ADR-090 D1). The rebase
+// verb merges the base into the branch and authorizes the ADR-090 verify-only
+// pass; Fishhawk never advances the branch itself, so this is the operator's
+// move.
+//
+// Placement: when the block offers the merge (naOffersMerge), the action is
+// INSERTED immediately before the first fishhawk_merge_run, because the merge
+// would refuse until the rebase lands; otherwise it is APPENDED. A no-op (na
+// unchanged) with a nil na or run, on a terminal run, without the block, with
+// any state other than stale (fresh and undetermined add nothing — an
+// undetermined read is no evidence the base moved), or when the actions
+// already carry a plain fishhawk_rebase_run_branch (one without
+// rerun_failed_verify, which is a different move).
+func foldMergeCandidateStaleness(run *Run, na *NextActions) {
+	if na == nil || run == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	st := run.MergeCandidateStaleness
+	if st == nil || st.State != "stale" {
+		return
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] != "true" {
+			return
+		}
+	}
+	behind := "an unknown number of"
+	if st.BehindBy != nil {
+		behind = strconv.Itoa(*st.BehindBy)
+		if st.BehindByLowerBound {
+			behind += "+"
+		}
+	}
+	action := SuggestedAction{
+		Action:       "fishhawk_rebase_run_branch",
+		Params:       map[string]string{"run_id": run.ID, "confirm": "true"},
+		Precondition: "the pull request head " + st.HeadSHA + " is behind " + st.BaseRef + " at " + st.BaseSHA + " by " + behind + " commit(s), as observed at read time",
+		Consumes:     consumesNone,
+		Reason: "the base branch advanced past the consolidated head, so fishhawk_merge_run would refuse merge_base_behind (ADR-090 D1); " +
+			"this merges " + st.BaseRef + " into the run branch and authorizes the ADR-090 verify-only merge-candidate pass for the new head. " +
+			"Fishhawk does not advance the branch itself",
+	}
+	if naOffersMerge(na) {
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_merge_run" {
+				na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
+				return
+			}
+		}
+	}
+	na.Actions = append(na.Actions, action)
 }
 
 // foldMergeCandidateRerunAlternative APPENDS fishhawk_rebase_run_branch

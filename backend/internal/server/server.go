@@ -1282,6 +1282,21 @@ type Server struct {
 	// default installs it.
 	postMergeHeadReadBackoff []time.Duration
 
+	// mergeCandidateStaleness{Mu,Cache} memoize the read-time
+	// merge_candidate_staleness block (E85.4 / #4147) per run, keyed on the
+	// chain-recorded head and aged against mergeCandidateStalenessTTL by
+	// nowFunc. The mutex guards map access only, never a forge read; the map
+	// is lazily initialized on first store and pruned of expired entries on
+	// every store. Per-process and in-memory: a restart simply re-reads.
+	mergeCandidateStalenessMu    sync.Mutex
+	mergeCandidateStalenessCache map[uuid.UUID]mergeCandidateStalenessEntry
+
+	// mergeCandidateStalenessReadTimeout bounds one staleness computation's
+	// forge reads. Zero in production, which selects the 5s
+	// defaultMergeCandidateStalenessReadTimeout; tests inject a
+	// timescale-scaled value. No New() default installs it.
+	mergeCandidateStalenessReadTimeout time.Duration
+
 	// stageBudgetProbe is nil in production. When a test sets it, it is
 	// invoked at the TOP of checkStageBudget — before any read or guard — so
 	// the test can observe how many times the stage-budget check is EVALUATED

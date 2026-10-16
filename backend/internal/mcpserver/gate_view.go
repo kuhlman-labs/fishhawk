@@ -197,6 +197,27 @@ Response (gate_view):
     unavailable:<reason>), conflicting_base_paths[] (always an array),
     compare_truncated and remedy. Run-level: stage_kind does not filter it. Omitted when there is
     none; omitted with a fan_in history_gaps entry when a read failed.
+  - merge_candidate_staleness — whether an open decomposed parent's
+    consolidated PR head still contains the tip of its base branch, observed
+    at READ time (the same block fishhawk_get_run_status carries). state is
+    fresh (behind_by 0), stale (the base advanced past the head:
+    fishhawk_merge_run would refuse merge_base_behind; next_step names
+    fishhawk_rebase_run_branch, which merges the base and authorizes the
+    ADR-090 verify-only pass — the rebase is YOUR move, Fishhawk does not
+    advance the branch itself) or undetermined (a forge read failed or timed
+    out; reason is forge_not_probeable | pr_read_failed |
+    base_tip_unresolved | compare_failed | read_timeout, and behind_by and
+    next_step are absent). A failed read is NEVER reported fresh. Also carries
+    head_sha (the live PR head), base_ref, base_sha (the base tip compared
+    against), behind_by_lower_bound (true at GitHub's 250-commit compare cap),
+    checked_at and a one-line note. Cost bound: the observation is cached per
+    run and recorded head for up to 60s once stored (checked_at says how old
+    it is), and a Fishhawk-recorded head change re-reads immediately;
+    concurrent first reads may each reach the forge, so it is not a hard rate
+    limit. Run-level: stage_kind does not filter it. Omitted when the run is
+    not an open (non-terminal, PR open and unmerged) decomposed parent;
+    omitted with a merge_candidate_staleness history_gaps entry when the
+    run's children or audit chain could not be read.
 `),
 	}, resolver.getGateView)
 }
