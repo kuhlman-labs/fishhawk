@@ -2063,8 +2063,10 @@ func runServe(args []string, logSink io.Writer) int {
 	enableOpsMonitor := fs.Bool("enable-ops-monitor",
 		envOrBool("FISHHAWKD_ENABLE_OPS_MONITOR", false),
 		"start the host and process health monitor (E85.1 / #4142): disk free space, sampled GOCACHE size, load vs "+
-			"cores, Docker and Postgres reachability (EIO indicator), and fishhawk-runner processes whose stage is "+
-			"terminal. Each failing condition writes one ops_probe_failed audit row and, with "+
+			"cores, Docker and Postgres reachability (EIO indicator), fishhawk-runner processes whose stage is "+
+			"terminal, and (E85.2 / #4146) the amendment_window and amendment_terminal probes: pending scope "+
+			"amendments whose decision window is closing or whose stage is terminal. Each failing condition writes "+
+			"one ops_probe_failed audit row and, with "+
 			"--ops-monitor-notify-issue, one issue comment per quiet window. Off by default; an invalid "+
 			"--ops-monitor-* value fails startup only when this is on")
 	opsMonitorFlagSet := registerOpsMonitorFlags(fs)
@@ -3957,15 +3959,17 @@ func runServe(args []string, logSink io.Writer) int {
 	// its own goroutine AFTER the server is constructed, so a slow or
 	// panicking probe can never block or crash startup (startOpsMonitor
 	// recovers; opsmonitor.Sweep bounds each probe). Without a database the
-	// postgres and runners probes read unknown; it never logs at ERROR.
+	// postgres, runners and amendment probes read unknown; it never logs at
+	// ERROR.
 	if opsMonitorConf != nil {
 		deps := opsMonitorDeps{
-			Audit:  cfg.AuditRepo,
-			Runs:   cfg.RunRepo, // a nil run.Repository converts to a nil RunReader
-			Ping:   poolPing(pool),
-			GitHub: cfg.GitHub,
-			Logger: logger,
-			Seams:  serveOpsMonitorSeams,
+			Audit:      cfg.AuditRepo,
+			Runs:       cfg.RunRepo, // a nil run.Repository converts to a nil RunReader
+			Amendments: opsAmendmentReader(pool),
+			Ping:       poolPing(pool),
+			GitHub:     cfg.GitHub,
+			Logger:     logger,
+			Seams:      serveOpsMonitorSeams,
 		}
 		startOpsMonitor(ctx, newOpsMonitorTicker(*opsMonitorConf, deps), logger)
 		logger.Info("ops monitor started",

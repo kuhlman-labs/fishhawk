@@ -1,8 +1,10 @@
 // Package opsmonitor is fishhawkd's opt-in host and process health monitor
 // (E85.1 / #4142). A Ticker sweeps a fixed set of probes — data-volume free
 // space, sampled GOCACHE size, 1-minute load vs core count, Docker
-// reachability with an EIO indicator, Postgres reachability, and
-// fishhawk-runner processes whose stage or run is terminal — and turns each
+// reachability with an EIO indicator, Postgres reachability,
+// fishhawk-runner processes whose stage or run is terminal, and (E85.2 /
+// #4146) pending scope amendments whose decision window is closing or whose
+// stage is already terminal — and turns each
 // FAILING (condition, subject) into ONE run-less ops_probe_failed audit row
 // plus ONE operator issue comment per quiet window.
 //
@@ -92,6 +94,12 @@ const (
 	ConditionStorageEIO           = "storage_eio"
 	ConditionPostgresUnreachable  = "postgres_unreachable"
 	ConditionOrphanedRunner       = "orphaned_runner"
+	// ConditionAmendmentWindowClosing: a pending scope amendment on a live
+	// stage is near (or past) the implement agent's decision wait.
+	ConditionAmendmentWindowClosing = "amendment_window_closing"
+	// ConditionAmendmentPendingOnTerminalStage: a scope amendment is still
+	// pending although its stage is terminal.
+	ConditionAmendmentPendingOnTerminalStage = "amendment_pending_on_terminal_stage"
 )
 
 // Conditions lists every condition constant (the remedies-table coverage
@@ -104,17 +112,21 @@ var Conditions = []string{
 	ConditionStorageEIO,
 	ConditionPostgresUnreachable,
 	ConditionOrphanedRunner,
+	ConditionAmendmentWindowClosing,
+	ConditionAmendmentPendingOnTerminalStage,
 }
 
 // remedies is the one human remedy per condition.
 var remedies = map[string]string{
-	ConditionDiskFreeLow:          "Free space on the data volume: run `scripts/dev sweep` and `scripts/dev gocache --trim`, prune unused Docker images and volumes, and remove stale run worktrees.",
-	ConditionGoCacheOverThreshold: "Run `scripts/dev gocache --trim` (it refuses while a run is live). Never run `go clean -cache` under a live run: it deletes entries a running build is reading.",
-	ConditionHostLoadHigh:         "Look for orphaned sh/zsh children of pid 1 that no run owns (`ps -axo pid=,ppid=,pcpu=,comm=`) and kill them; verifies started now may fail on host load, not on the change.",
-	ConditionDockerUnreachable:    "Start or restart Docker Desktop (`open -a Docker`), confirm `docker info` answers, then reap any stage stranded by the outage (fishhawk_reap_stage).",
-	ConditionStorageEIO:           "Storage is returning I/O errors: free host disk, restart Docker Desktop, confirm Postgres is healthy, then reap stranded stages (fishhawk_reap_stage).",
-	ConditionPostgresUnreachable:  "Check the Postgres container (`docker ps`, `docker logs`), free host disk if it crashed on EIO, restart it, then reap stages stranded by the outage.",
-	ConditionOrphanedRunner:       "Confirm the pid is a fishhawk-runner whose stage is terminal (`ps -o pid,args -p <pid>`) and kill it; it holds host resources and can block reload/post-merge.",
+	ConditionDiskFreeLow:                     "Free space on the data volume: run `scripts/dev sweep` and `scripts/dev gocache --trim`, prune unused Docker images and volumes, and remove stale run worktrees.",
+	ConditionGoCacheOverThreshold:            "Run `scripts/dev gocache --trim` (it refuses while a run is live). Never run `go clean -cache` under a live run: it deletes entries a running build is reading.",
+	ConditionHostLoadHigh:                    "Look for orphaned sh/zsh children of pid 1 that no run owns (`ps -axo pid=,ppid=,pcpu=,comm=`) and kill them; verifies started now may fail on host load, not on the change.",
+	ConditionDockerUnreachable:               "Start or restart Docker Desktop (`open -a Docker`), confirm `docker info` answers, then reap any stage stranded by the outage (fishhawk_reap_stage).",
+	ConditionStorageEIO:                      "Storage is returning I/O errors: free host disk, restart Docker Desktop, confirm Postgres is healthy, then reap stranded stages (fishhawk_reap_stage).",
+	ConditionPostgresUnreachable:             "Check the Postgres container (`docker ps`, `docker logs`), free host disk if it crashed on EIO, restart it, then reap stages stranded by the outage.",
+	ConditionOrphanedRunner:                  "Confirm the pid is a fishhawk-runner whose stage is terminal (`ps -o pid,args -p <pid>`) and kill it; it holds host resources and can block reload/post-merge.",
+	ConditionAmendmentWindowClosing:          "Decide the amendment now with fishhawk_decide_scope_amendment (fishhawk_list_scope_amendments names it). Once the window closes the implement agent stops waiting, and a later approval lands only through fishhawk_retry_stage.",
+	ConditionAmendmentPendingOnTerminalStage: "The stage is terminal, so no agent will read a decision: deny the amendment with fishhawk_decide_scope_amendment to close it, or approve it and run fishhawk_retry_stage to land the paths.",
 }
 
 // genericRemedy fills a failing result whose condition has no table entry.
@@ -139,6 +151,12 @@ type Result struct {
 	Remedy    string         `json:"remedy,omitempty"`
 	Reason    string         `json:"reason,omitempty"`
 	Detail    map[string]any `json:"detail,omitempty"`
+	// Fields are structured values emit copies VERBATIM onto the untenanted
+	// ops_probe_failed row (payload key `fields`), which every tenant member
+	// can read. Unlike Detail they must carry only ids, counts and
+	// durations: never host paths, argv, amendment paths or agent-written
+	// reason text.
+	Fields map[string]any `json:"fields,omitempty"`
 }
 
 // Probe is one health check. HostLocal probes observe the fishhawkd host and
@@ -425,8 +443,9 @@ func (t *Ticker) emit(ctx context.Context, r Result) {
 	}
 	// No Detail: the row is untenanted (nil account), so GET /v0/audit shows
 	// it to every tenant member, and Detail carries host paths (the disk
-	// path, the GOCACHE dir). The row carries the comment's field set.
-	payload, err := json.Marshal(map[string]any{
+	// path, the GOCACHE dir). The row carries the comment's field set, plus
+	// the result's Fields (ids/counts/durations only, see Result.Fields).
+	body := map[string]any{
 		"condition":            r.Condition,
 		"probe":                r.Probe,
 		"subject":              r.Subject,
@@ -438,7 +457,11 @@ func (t *Ticker) emit(ctx context.Context, r Result) {
 		"deployment":           t.Deployment,
 		"quiet_window_seconds": int64(quiet / time.Second),
 		"notification":         notification,
-	})
+	}
+	if len(r.Fields) > 0 {
+		body["fields"] = r.Fields
+	}
+	payload, err := json.Marshal(body)
 	if err != nil {
 		t.logger().LogAttrs(ctx, slog.LevelWarn, "opsmonitor: marshal audit payload failed",
 			slog.String("condition", r.Condition), slog.String("error", err.Error()))

@@ -712,6 +712,40 @@ func TestTick_AuditPayloadOmitsDetail(t *testing.T) {
 	}
 }
 
+// TestTick_EmitCarriesResultFields: a failing result's Fields land on the
+// row payload as `fields`, verbatim; a result without Fields writes no
+// `fields` key.
+func TestTick_EmitCarriesResultFields(t *testing.T) {
+	withFields := failingResult("amendment_window", ConditionAmendmentWindowClosing, "a1")
+	withFields.Fields = map[string]any{"run_id": "r1", "time_remaining_seconds": int64(540), "window_elapsed": false}
+	without := failingResult("disk", ConditionDiskFreeLow, "")
+	au, h, clk := &fakeAudit{}, &captureHandler{}, newClock()
+	tk := newTicker([]Probe{
+		stubProbe{name: "amendment_window", check: fixed(withFields)},
+		stubProbe{name: "disk", check: fixed(without)},
+	}, au, nil, clk, h)
+	tk.Tick(context.Background())
+	if au.appendCount() != 2 {
+		t.Fatalf("appends = %d, want 2", au.appendCount())
+	}
+	got, ok := au.payload(t, 0)["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload 0 has no fields object: %v", au.payload(t, 0))
+	}
+	want := map[string]any{"run_id": "r1", "time_remaining_seconds": float64(540), "window_elapsed": false}
+	if len(got) != len(want) {
+		t.Errorf("fields = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("fields[%s] = %#v, want %#v", k, got[k], v)
+		}
+	}
+	if _, ok := au.payload(t, 1)["fields"]; ok {
+		t.Errorf("a result without Fields wrote a fields key: %v", au.payload(t, 1))
+	}
+}
+
 func TestTick_UnknownWarnRateLimited(t *testing.T) {
 	h, clk := &captureHandler{}, newClock()
 	tk := newTicker([]Probe{stubProbe{name: "p", check: fixed(Result{Status: StatusUnknown, Reason: "r"})}}, &fakeAudit{}, &countingNotifier{}, clk, h)

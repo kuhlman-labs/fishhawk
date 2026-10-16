@@ -175,6 +175,32 @@ type Lapser interface {
 	LapseStranded(ctx context.Context) (int, error)
 }
 
+// PendingWithStage is one pending amendment joined to its stage's state, as
+// the ops monitor's amendment scan reads it (E85.2 / #4146).
+type PendingWithStage struct {
+	ID          uuid.UUID
+	RunID       uuid.UUID
+	StageID     uuid.UUID
+	Status      Status
+	RequestedAt time.Time
+	// StageState is nil when the stage is not visible to this session
+	// (stages is row-level secured through its run, migration 0057).
+	StageState *string
+	// ObservedAt is the database's now() at read time, so
+	// ObservedAt.Sub(RequestedAt) is an age measured in ONE clock domain
+	// (#3048).
+	ObservedAt time.Time
+}
+
+// PendingLister is the read-only pending-amendment scan of the postgres
+// repository (E85.2 / #4146). It is deliberately NOT on Repository, so the
+// handler test fakes need no stub. ListPendingWithStage returns the pending
+// rows requested within lookback, newest first, at most limit of them; a
+// non-positive lookback or limit is an error.
+type PendingLister interface {
+	ListPendingWithStage(ctx context.Context, lookback time.Duration, limit int) ([]PendingWithStage, error)
+}
+
 // StageStateLapses reports whether a stage reaching state lapses its pending
 // amendments: succeeded, cancelled and superseded do. failed deliberately
 // does NOT: a failed stage can be re-run with fishhawk_retry_stage (which

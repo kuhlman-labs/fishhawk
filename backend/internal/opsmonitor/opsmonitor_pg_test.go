@@ -6,8 +6,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
 
 // TestOpsMonitor_PostgresDedupAcrossTicksAndRestart crosses probe -> sweep ->
@@ -60,5 +64,107 @@ func TestOpsMonitor_PostgresDedupAcrossTicksAndRestart(t *testing.T) {
 	rows, err = repo.ListAll(ctx, audit.ListAllParams{Category: &category})
 	if err != nil || len(rows) != 1 {
 		t.Errorf("rows after restart = %d (%v), want still 1", len(rows), err)
+	}
+}
+
+// TestOpsMonitor_PostgresAmendmentProbesEndToEnd crosses scope-amendment SQL
+// -> lister -> both amendment probes -> Ticker -> real audit repository. Ages
+// are backdated DB-side (now() - interval), so both sides of every age are the
+// database clock (#3048). A live-stage row 6m old fires the window probe, a
+// terminal-stage row fires the terminal probe, a lapsed row (#4127) on a
+// terminal stage fires nothing, and a second Tick adds no row.
+func TestOpsMonitor_PostgresAmendmentProbesEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage := func(seq int) uuid.UUID {
+		st, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+			RunID: r.ID, Sequence: seq, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+		})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		return st.ID
+	}
+	liveStage, terminalStage, lapsedStage := stage(1), stage(2), stage(3)
+	amendRepo := scopeamendment.NewPostgresRepository(pool)
+	amend := func(stageID uuid.UUID) uuid.UUID {
+		a, err := amendRepo.Create(ctx, scopeamendment.CreateParams{
+			RunID: r.ID, StageID: stageID, Reason: "needed",
+			Paths: []scopeamendment.PathEntry{{Path: "backend/x.go", Operation: scopeamendment.OperationModify}},
+		})
+		if err != nil {
+			t.Fatalf("create amendment: %v", err)
+		}
+		return a.ID
+	}
+	liveID, terminalID, lapsedID := amend(liveStage), amend(terminalStage), amend(lapsedStage)
+	for _, stmt := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE scope_amendments SET requested_at = now() - interval '6 minutes' WHERE id = ANY($1)`, []any{[]uuid.UUID{liveID, terminalID, lapsedID}}},
+		{`UPDATE stages SET state = 'succeeded' WHERE id = ANY($1)`, []any{[]uuid.UUID{terminalStage, lapsedStage}}},
+		{`UPDATE scope_amendments SET status = 'lapsed' WHERE id = $1`, []any{lapsedID}},
+	} {
+		if _, err := pool.Exec(ctx, stmt.sql, stmt.args...); err != nil {
+			t.Fatalf("%s: %v", stmt.sql, err)
+		}
+	}
+
+	lister := scopeamendment.NewPendingLister(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	notifier := &countingNotifier{}
+	tk := &Ticker{
+		Probes: []Probe{
+			AmendmentWindowProbe{Amendments: lister, Window: 15 * time.Minute, WarnLead: 10 * time.Minute, Lookback: 7 * 24 * time.Hour},
+			AmendmentTerminalProbe{Amendments: lister, Lookback: 7 * 24 * time.Hour},
+		},
+		Deployment: DeploymentLocal, Audit: auditRepo, Notifier: notifier, QuietWindow: time.Hour,
+	}
+	tk.Tick(ctx)
+	tk.Tick(ctx)
+
+	category := CategoryOpsProbeFailed
+	rows, err := auditRepo.ListAll(ctx, audit.ListAllParams{Category: &category})
+	if err != nil {
+		t.Fatalf("ListAll: %v", err)
+	}
+	if len(rows) != 2 || notifier.count() != 2 {
+		t.Fatalf("rows %d, notifies %d; want exactly 2/2 (one window, one terminal)", len(rows), notifier.count())
+	}
+	bySubject := map[string]map[string]any{}
+	for _, row := range rows {
+		var p map[string]any
+		if err := json.Unmarshal(row.Payload, &p); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		bySubject[p["subject"].(string)] = p
+	}
+	if _, ok := bySubject[lapsedID.String()]; ok {
+		t.Errorf("the lapsed amendment %s was reported", lapsedID)
+	}
+	w, ok := bySubject[liveID.String()]
+	if !ok || w["condition"] != ConditionAmendmentWindowClosing {
+		t.Fatalf("no window row for the live amendment %s: %v", liveID, bySubject)
+	}
+	fields, _ := w["fields"].(map[string]any)
+	if fields["run_id"] != r.ID.String() {
+		t.Errorf("window fields.run_id = %v, want %s", fields["run_id"], r.ID)
+	}
+	if rem, _ := fields["time_remaining_seconds"].(float64); rem < 480 || rem > 540 {
+		t.Errorf("window fields.time_remaining_seconds = %v, want in [480,540] (DB-clock age ~6m)", fields["time_remaining_seconds"])
+	}
+	term, ok := bySubject[terminalID.String()]
+	if !ok || term["condition"] != ConditionAmendmentPendingOnTerminalStage {
+		t.Errorf("no terminal row for amendment %s: %v", terminalID, bySubject)
+	} else if tf, _ := term["fields"].(map[string]any); tf["stage_id"] != terminalStage.String() {
+		t.Errorf("terminal fields.stage_id = %v, want %s", tf["stage_id"], terminalStage)
 	}
 }

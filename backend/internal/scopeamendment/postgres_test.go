@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -932,5 +934,165 @@ func TestBackfillStranded_Logging(t *testing.T) {
 	scopeamendment.BackfillStranded(ctx, &fakeLapser{stranded: 53}, logger)
 	if out := buf.String(); !strings.Contains(out, "level=INFO") || !strings.Contains(out, "lapsed=53") {
 		t.Errorf("log after lapsing 53 rows = %q, want an INFO with lapsed=53", out)
+	}
+}
+
+// --- ListPendingWithStage (E85.2 / #4146) -------------------------------------
+
+func (h harness) listPending(t *testing.T, lookback time.Duration, limit int) []scopeamendment.PendingWithStage {
+	t.Helper()
+	rows, err := scopeamendment.NewPendingLister(h.pool).ListPendingWithStage(context.Background(), lookback, limit)
+	if err != nil {
+		t.Fatalf("ListPendingWithStage(%s, %d): %v", lookback, limit, err)
+	}
+	return rows
+}
+
+func (h harness) exec(t *testing.T, sql string, args ...any) {
+	t.Helper()
+	if _, err := h.pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+}
+
+func pendingIDs(rows []scopeamendment.PendingWithStage) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.ID)
+	}
+	return out
+}
+
+func TestPostgres_ListPendingWithStage_ReturnsStageStateAndDBNow(t *testing.T) {
+	h := newHarness(t)
+	a := h.create(t)
+	st, err := h.runRepo.GetStage(context.Background(), h.stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	rows := h.listPending(t, time.Hour, 10)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want the one pending amendment", rows)
+	}
+	r := rows[0]
+	if r.ID != a.ID || r.RunID != h.runID || r.StageID != h.stageID || r.Status != scopeamendment.StatusPending {
+		t.Errorf("row = %+v", r)
+	}
+	if r.StageState == nil || *r.StageState != string(st.State) {
+		t.Errorf("StageState = %v, want %q", r.StageState, st.State)
+	}
+	if !r.RequestedAt.Equal(a.RequestedAt) {
+		t.Errorf("RequestedAt = %s, want %s", r.RequestedAt, a.RequestedAt)
+	}
+	// Both are database timestamps: the read's now() is at or after the
+	// insert's (one clock domain, #3048).
+	if r.ObservedAt.IsZero() || r.ObservedAt.Before(r.RequestedAt) {
+		t.Errorf("ObservedAt = %s, want the database now() at or after RequestedAt %s", r.ObservedAt, r.RequestedAt)
+	}
+}
+
+func TestPostgres_ListPendingWithStage_ExcludesNonPendingRows(t *testing.T) {
+	h := newHarness(t)
+	pending, lapsed, denied, approved := h.create(t), h.create(t), h.create(t), h.create(t)
+	h.exec(t, `UPDATE scope_amendments SET status = 'lapsed' WHERE id = $1`, lapsed.ID)
+	for id, status := range map[uuid.UUID]scopeamendment.Status{denied.ID: scopeamendment.StatusDenied, approved.ID: scopeamendment.StatusApproved} {
+		if _, err := h.repo.Decide(context.Background(), scopeamendment.DecideParams{ID: id, Status: status, Reason: "r", DecidedBy: "op"}); err != nil {
+			t.Fatalf("Decide(%s): %v", status, err)
+		}
+	}
+	rows := h.listPending(t, time.Hour, 10)
+	if got := pendingIDs(rows); len(got) != 1 || got[0] != pending.ID {
+		t.Errorf("ids = %v, want only the pending row %s (lapsed %s, denied %s, approved %s excluded)",
+			got, pending.ID, lapsed.ID, denied.ID, approved.ID)
+	}
+}
+
+func TestPostgres_ListPendingWithStage_LookbackExcludesOldRows(t *testing.T) {
+	h := newHarness(t)
+	fresh, old := h.create(t), h.create(t)
+	h.exec(t, `UPDATE scope_amendments SET requested_at = now() - interval '8 days' WHERE id = $1`, old.ID)
+	if got := pendingIDs(h.listPending(t, 7*24*time.Hour, 10)); len(got) != 1 || got[0] != fresh.ID {
+		t.Errorf("7-day lookback ids = %v, want only the fresh row %s (the 8-day-old %s excluded)", got, fresh.ID, old.ID)
+	}
+	if got := pendingIDs(h.listPending(t, 9*24*time.Hour, 10)); len(got) != 2 {
+		t.Errorf("9-day lookback ids = %v, want both rows", got)
+	}
+}
+
+// TestPostgres_ListPendingWithStage_NewestFirst (condition 2): the scan is
+// newest first, so a bounded page always holds the freshest rows.
+func TestPostgres_ListPendingWithStage_NewestFirst(t *testing.T) {
+	h := newHarness(t)
+	oldest, middle, newest := h.create(t), h.create(t), h.create(t)
+	h.exec(t, `UPDATE scope_amendments SET requested_at = now() - interval '3 minutes' WHERE id = $1`, oldest.ID)
+	h.exec(t, `UPDATE scope_amendments SET requested_at = now() - interval '2 minutes' WHERE id = $1`, middle.ID)
+	h.exec(t, `UPDATE scope_amendments SET requested_at = now() - interval '1 minute' WHERE id = $1`, newest.ID)
+	if got := pendingIDs(h.listPending(t, time.Hour, 1)); len(got) != 1 || got[0] != newest.ID {
+		t.Errorf("limit 1 ids = %v, want the newest row %s", got, newest.ID)
+	}
+	got := pendingIDs(h.listPending(t, time.Hour, 10))
+	if want := []uuid.UUID{newest.ID, middle.ID, oldest.ID}; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("ids = %v, want newest first %v", got, want)
+	}
+}
+
+func TestPostgres_ListPendingWithStage_RejectsBadArgs(t *testing.T) {
+	h := newHarness(t)
+	lister := scopeamendment.NewPendingLister(h.pool)
+	for _, tc := range []struct {
+		name     string
+		lookback time.Duration
+		limit    int
+		wantErr  string
+	}{
+		{"zero lookback", 0, 10, "lookback must be positive"},
+		{"negative lookback", -time.Second, 10, "lookback must be positive"},
+		{"zero limit", time.Hour, 0, "limit must be positive"},
+		{"negative limit", time.Hour, -1, "limit must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := lister.ListPendingWithStage(context.Background(), tc.lookback, tc.limit)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("ListPendingWithStage(%s, %d) = (%v, %v), want an error naming %q", tc.lookback, tc.limit, rows, err, tc.wantErr)
+			}
+		})
+	}
+	t.Run("limit above int32 is clamped", func(t *testing.T) {
+		h.create(t)
+		rows, err := lister.ListPendingWithStage(context.Background(), time.Hour, math.MaxInt32+1)
+		if err != nil || len(rows) != 1 {
+			t.Errorf("ListPendingWithStage(1h, MaxInt32+1) = (%d rows, %v), want the one row", len(rows), err)
+		}
+	})
+}
+
+// TestPostgres_ScopeAmendmentsHasNoDeadlineColumn pins the premise of the ops
+// monitor's window probe: scope_amendments stores no deadline, so the probe
+// derives it from requested_at + the configured window. requested_at must be
+// present, so a wrong table name cannot pass vacuously.
+func TestPostgres_ScopeAmendmentsHasNoDeadlineColumn(t *testing.T) {
+	h := newHarness(t)
+	rows, err := h.pool.Query(context.Background(),
+		`SELECT column_name FROM information_schema.columns WHERE table_name = 'scope_amendments'`)
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		cols[c] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if !cols["requested_at"] {
+		t.Fatalf("scope_amendments columns %v lack requested_at", cols)
+	}
+	if cols["deadline"] {
+		t.Errorf("scope_amendments has a deadline column: the ops monitor's derived deadline (requested_at + window, backend/internal/opsmonitor/README.md) must read it instead")
 	}
 }
