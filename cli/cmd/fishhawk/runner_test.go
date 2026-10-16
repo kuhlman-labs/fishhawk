@@ -507,13 +507,18 @@ func TestParseGitHubRemote_Variants(t *testing.T) {
 	}
 }
 
+// fakeRunnerClientToken is the bearer withFakeHTTPClient's client carries, so
+// a test can assert the client's resolved token reached the sticky-comment
+// seam (#4483).
+const fakeRunnerClientToken = "fhk_runner_test_token"
+
 // withFakeHTTPClient swaps runnerNewClient so all HTTP calls inside
 // runRunnerStart go to srv instead of the real backend.
 func withFakeHTTPClient(t *testing.T, srv *httptest.Server) {
 	t.Helper()
 	orig := runnerNewClient
 	runnerNewClient = func(_ commonFlags) *httpclient.Client {
-		return httpclient.New(srv.URL, "")
+		return httpclient.New(srv.URL, fakeRunnerClientToken)
 	}
 	t.Cleanup(func() { runnerNewClient = orig })
 }
@@ -522,6 +527,7 @@ func withFakeHTTPClient(t *testing.T, srv *httptest.Server) {
 // without shelling to gh or reaching the backend status-comment endpoints.
 type postOrEditCall struct {
 	backendURL  string
+	token       string
 	runID       string
 	repo        string
 	issueNumber int
@@ -531,8 +537,8 @@ func withCapturedPostOrEdit(t *testing.T) *[]postOrEditCall {
 	t.Helper()
 	calls := new([]postOrEditCall)
 	orig := postOrEditStatusComment
-	postOrEditStatusComment = func(backendURL, runID, repo string, issueNumber int) error {
-		*calls = append(*calls, postOrEditCall{backendURL, runID, repo, issueNumber})
+	postOrEditStatusComment = func(backendURL, token, runID, repo string, issueNumber int) error {
+		*calls = append(*calls, postOrEditCall{backendURL, token, runID, repo, issueNumber})
 		return nil
 	}
 	t.Cleanup(func() { postOrEditStatusComment = orig })
@@ -598,6 +604,12 @@ func TestRunnerStart_StageCompleteComment(t *testing.T) {
 	}
 	if c.issueNumber != 1 {
 		t.Errorf("issueNumber = %d, want 1", c.issueNumber)
+	}
+	// The record-id POST requires write:runs (#4483), so the bearer the
+	// client resolved must reach the seam rather than the call going out
+	// anonymously.
+	if c.token != fakeRunnerClientToken {
+		t.Errorf("token = %q, want the client's resolved bearer %q", c.token, fakeRunnerClientToken)
 	}
 }
 

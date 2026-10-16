@@ -34,9 +34,13 @@ ships a result), `write:fixups` / dispositions (the captain disposes findings),
 `attest:specialist-jobs` (only a runner credential attests). A seat cannot mint
 itself a token: POST `/v0/tokens` refuses a seat subject 403
 `first_officer_cannot_mint_tokens`. A seat cannot write tracker state: POST
-`/v0/work-items` (and so `fishhawk_file_issue` over `/mcp`, which dials it under
-the caller's bearer) checks no scope, so the route refuses a seat subject 403
-`first_officer_tracker_write_not_permitted` before the handler runs.
+`/v0/work-items` requires `write:runs` of every non-run-bound caller (#4481),
+which the seat scopes above withhold, and the route's named seat wrapper
+refuses a seat subject 403 `first_officer_tracker_write_not_permitted` ahead of
+that scope check, so the refusal is recorded. `fishhawk_file_issue` over `/mcp`
+is refused earlier, at the `/mcp` gate, with 403 `insufficient_scope` (its row
+requires `write:runs`); that gate refusal records no
+`first_officer_action_refused` row.
 
 ## Enforcement (server)
 
