@@ -18969,7 +18969,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
-          description: '`internal_error` — a token read/issue failed, uniqueness could not be verified, or the attach row could not be recorded; the issued token is revoked in each case.'
+          description: '`internal_error` — a token read/issue failed, uniqueness could not be verified (including a losing token whose revocation failed, named in the message), or the attach row could not be recorded. An issued token is withdrawn, and the message states whether that revocation persisted.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

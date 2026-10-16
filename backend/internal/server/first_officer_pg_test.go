@@ -233,6 +233,35 @@ func TestFirstOfficerSeat_EndToEndPostgres(t *testing.T) {
 		t.Fatalf("concern provenance = %q, want first_officer", provenance)
 	}
 
+	// (e2) by-role delivery (ADR-089 D7): the captain addresses
+	// recipient_role first_officer, and the seat lists it under read:audit.
+	// Counterfactual: dropping read:audit from firstofficer.SeatScopes turned
+	// this step RED (seat list by role = 403).
+	notice := `{"schema_version":"crew-message-v1","type":"notice","recipient_role":"first_officer","anchor":{"run_id":"` +
+		runID.String() + `"},"payload":{"summary":"re-scan after the rebase"}}`
+	w = f.do(http.MethodPost, "/v0/crew-messages", human, notice)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("captain notice = %d:\n%s", w.Code, w.Body.String())
+	}
+	var toFO crewMessageResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &toFO)
+	w = f.do(http.MethodGet, "/v0/crew-messages?recipient_role=first_officer", seat, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("seat list by role = %d:\n%s", w.Code, w.Body.String())
+	}
+	var listed crewMessageListResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &listed)
+	found := false
+	for _, m := range listed.Items {
+		if m.RecipientRole != string(crewmessage.RoleFirstOfficer) {
+			t.Fatalf("by-role list carries recipient_role %q:\n%s", m.RecipientRole, w.Body.String())
+		}
+		found = found || (m.SentSequence == toFO.SentSequence && m.SenderRole == string(crewmessage.RoleCaptain))
+	}
+	if toFO.SentSequence == 0 || !found {
+		t.Fatalf("seat's by-role list lacks the captain's notice %d:\n%s", toFO.SentSequence, w.Body.String())
+	}
+
 	// (f) merge refuses; the gate view lists the concern and the blocker.
 	requireCode(t, f.do(http.MethodPost, "/v0/runs/"+runID.String()+"/merge", human, `{"verdict":"lgtm"}`), http.StatusConflict, codeFirstOfficerFindingOpen)
 	gv := f.do(http.MethodGet, "/v0/runs/"+runID.String()+"/gate-view", human, "")

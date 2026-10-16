@@ -48,6 +48,10 @@ import (
 //   - Condition 1 account stamp: deleting `id.AccountID = st.accountID` turned
 //     TestFirstOfficerSeat_TenantedAnchor RED (same-account read 403
 //     account_forbidden).
+//   - /mcp spawn boundary (fix-up concern 5415a6e3): re-adding
+//     request:specialist_jobs to fishhawk_request_specialist_job's mcpscopes
+//     row turned TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools RED (200,
+//     the tool registry built for the seat's call).
 
 // foCampaignRepo is a campaign fake for the seat tests: campaigns by id, their
 // accounts, and items keyed by run.
@@ -587,6 +591,42 @@ func TestFirstOfficerSeat_TenantedAnchor(t *testing.T) {
 		t.Fatalf("untenanted anchor seat account = %q, want empty", uid.AccountID)
 	}
 	requireCrewRefusal(t, f.do(http.MethodGet, "/v0/runs/"+runA.String(), f.mint(runSeat(runU), "read:runs"), ""), http.StatusForbidden, "account_forbidden")
+}
+
+// TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools pins that a seat cannot
+// execute a caller-selected host program over /mcp. Each tool below resolves
+// a caller-chosen runner_binary and spawns it on the daemon host with the
+// daemon's environment, so a real seat bearer (through the seat identity hook)
+// is refused 403 insufficient_scope at the gate, before any tool registry is
+// built. The seat files specialist jobs over REST instead, which only queues.
+// The read tool at the end is the positive control: the same bearer passes
+// the gate, so the refusals come from the scope table, not a dead credential.
+func TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools(t *testing.T) {
+	f := newSeatFixture(t)
+	cf := &countingMCPFactory{}
+	f.s = New(Config{
+		Addr: "127.0.0.1:8080", APITokenRepo: f.tokens, RunRepo: f.runs, CampaignRepo: f.camps,
+		AuditRepo: f.aud, MCPServerFactory: cf.factory,
+	})
+	runID := f.seedRun(run.StateRunning, "")
+	bearer := f.mint(runSeat(runID), firstofficer.SeatScopes()...)
+	for _, tool := range []string{
+		"fishhawk_request_specialist_job", "fishhawk_run_stage", "fishhawk_dispatch_stage",
+		"fishhawk_run_children", "fishhawk_drive_run",
+	} {
+		status, body := mcpGateResult(t, f.s, newMCPToolCall(tool, bearer))
+		if status != http.StatusForbidden || !strings.Contains(body, "insufficient_scope") {
+			t.Errorf("%s: status %d, want 403 insufficient_scope:\n%s", tool, status, body)
+		}
+	}
+	if n := cf.calls.Load(); n != 0 {
+		t.Fatalf("the MCP tool registry was built %d time(s) for a seat's runner-spawning call", n)
+	}
+	status, body := mcpGateResult(t, f.s, newMCPToolCall("fishhawk_get_specialist_job", bearer))
+	if status == http.StatusForbidden || status == http.StatusUnauthorized || cf.calls.Load() == 0 {
+		t.Fatalf("seat read tool: status %d, registry builds %d; the seat bearer must pass the gate:\n%s",
+			status, cf.calls.Load(), body)
+	}
 }
 
 // foSpecialistJobStore records the last Create call.

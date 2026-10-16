@@ -80,7 +80,11 @@ Specialist jobs: a seat files POST `/v0/specialist-jobs` with
 `actor_kind: agent`, and its subject must lie inside the seat
 (`firstOfficerRunInSeat`: a run seat matches only its run; a campaign seat
 matches a run any of its campaign items is linked to) or 403
-`first_officer_subject_out_of_seat`.
+`first_officer_subject_out_of_seat`. REST only: over `/mcp`,
+`fishhawk_request_specialist_job` stays `write:stages`, because that tool
+resolves a caller-chosen `runner_binary` and spawns it on the daemon host with
+the daemon's environment. A seat reaches no `/mcp` tool that spawns a host
+program (403 `insufficient_scope` at the gate); the REST request only queues.
 
 ## Residuals
 
@@ -90,6 +94,12 @@ matches a run any of its campaign items is linked to) or 403
   sweep is remaining scope on #4148.
 - A refusal that bypasses `writeError` (the `/mcp` JSON-RPC tool-scope
   precheck) is a permission error with no `first_officer_action_refused` row.
+- No per-seat bound: every 403 to a seat appends one
+  `first_officer_action_refused` row (no coalescing), and a seat's
+  `POST /v0/specialist-jobs` is unbounded (non-draft kinds consume runner
+  capacity), so a looping or compromised seat agent amplifies requests into
+  chain writes and queued jobs. The ADR-089 D6 spend cap / a per-seat rate
+  bound is remaining scope on #4148.
 - Seat tokens are untenanted rows (`apitoken.Repository.Issue` binds no
   account); the account comes from the anchor at request time. Per-account
   token binding is remaining scope.

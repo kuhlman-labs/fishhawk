@@ -279,15 +279,25 @@ func (s *Server) handleAttachFirstOfficerSeat(w http.ResponseWriter, r *http.Req
 			map[string]any{"error": err.Error()})
 		return
 	}
-	won, err := s.convergeSeatTokens(ctx, subject, tok.ID)
+	won, unrevoked, err := s.convergeSeatTokens(ctx, subject, tok.ID)
 	if err != nil {
 		// Cannot prove ONE seat: withdraw ours (fail closed).
-		s.revokeSeatToken(ctx, subject, tok.ID)
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not verify the seat is unique; the issued token was revoked", map[string]any{"error": err.Error()})
+		s.withdrawSeatAttach(w, r, subject, tok.ID, "could not verify the seat is unique", err)
+		return
+	}
+	if len(unrevoked) > 0 {
+		// A losing token's revocation did not persist, so more than one seat
+		// token may be active: never answer 201 or 409 over that. Token ids
+		// are not secrets, and 5xx details are redacted, so the message names
+		// them.
+		s.withdrawSeatAttach(w, r, subject, tok.ID,
+			"could not revoke losing seat token(s) "+strings.Join(unrevoked, ", ")+", so more than one may be active",
+			errors.New("seat convergence revoke failed"))
 		return
 	}
 	if !won {
+		// No unrevoked loser means every losing token, ours included, was
+		// revoked, so the message below is persisted fact.
 		s.writeError(w, r, http.StatusConflict, "first_officer_seat_exists",
 			"a concurrent attach won this anchor's seat; this request's token was revoked",
 			map[string]any{"seat_subject": subject})
@@ -304,9 +314,7 @@ func (s *Server) handleAttachFirstOfficerSeat(w http.ResponseWriter, r *http.Req
 	})
 	if err := s.appendSeatLifecycleRow(ctx, rec, auditFirstOfficerSeatAttached, audit.ActorUser, caller, payload); err != nil {
 		// An unrecorded seat must not exist: withdraw the token.
-		s.revokeSeatToken(ctx, subject, tok.ID)
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"record the seat attach failed; the issued token was revoked", map[string]any{"error": err.Error()})
+		s.withdrawSeatAttach(w, r, subject, tok.ID, "record the seat attach failed", err)
 		return
 	}
 	s.writeJSON(w, r, http.StatusCreated, firstOfficerSeatAttachResponse{
@@ -324,16 +332,36 @@ func (s *Server) writeSeatExists(w http.ResponseWriter, r *http.Request, subject
 		map[string]any{"seat_subject": subject, "token_ids": ids})
 }
 
+// withdrawSeatAttach is an attach's fail-closed exit after Issue: it revokes
+// this request's token and answers 500. The message states what was
+// PERSISTED: when the revocation itself fails the token may still be active,
+// so the envelope says so and names the token instead of claiming it was
+// revoked.
+func (s *Server) withdrawSeatAttach(w http.ResponseWriter, r *http.Request, subject string, id uuid.UUID, what string, cause error) {
+	details := map[string]any{"error": cause.Error(), "seat_subject": subject, "token_id": id.String()}
+	msg := what + "; the issued token was revoked"
+	if rerr := s.revokeSeatToken(r.Context(), subject, id); rerr != nil {
+		msg = what + "; revoking the issued token " + id.String() + " also failed, so it may still be active: " +
+			"retire the seat (POST /v0/first-officer-seats/retire) to withdraw it"
+		details["revoke_error"] = rerr.Error()
+	}
+	s.writeError(w, r, http.StatusInternalServerError, "internal_error", msg, details)
+}
+
 // convergeSeatTokens is the post-issue convergence: with more than one active
 // token for the subject, the OLDEST (created_at, then id) is kept and every
-// other one is revoked. It reports whether mine is the survivor.
-func (s *Server) convergeSeatTokens(ctx context.Context, subject string, mine uuid.UUID) (bool, error) {
+// other one is revoked. It reports whether mine is the survivor and the ids
+// of losing tokens whose Revoke FAILED (still possibly active). The outcome
+// reflects persisted revocation: a non-empty unrevoked list means no winner,
+// so the handler fails closed instead of answering 201 beside a live
+// competitor or 409 claiming a revocation that did not happen.
+func (s *Server) convergeSeatTokens(ctx context.Context, subject string, mine uuid.UUID) (won bool, unrevoked []string, err error) {
 	toks, err := s.cfg.APITokenRepo.ListForSubject(ctx, subject)
 	if err != nil {
-		return false, fmt.Errorf("list seat tokens: %w", err)
+		return false, nil, fmt.Errorf("list seat tokens: %w", err)
 	}
 	if len(toks) == 0 {
-		return false, errors.New("the issued seat token is not active")
+		return false, nil, errors.New("the issued seat token is not active")
 	}
 	sort.SliceStable(toks, func(i, j int) bool {
 		if !toks[i].CreatedAt.Equal(toks[j].CreatedAt) {
@@ -342,16 +370,24 @@ func (s *Server) convergeSeatTokens(ctx context.Context, subject string, mine uu
 		return toks[i].ID.String() < toks[j].ID.String()
 	})
 	for _, t := range toks[1:] {
-		s.revokeSeatToken(ctx, subject, t.ID)
+		if rerr := s.revokeSeatToken(ctx, subject, t.ID); rerr != nil {
+			unrevoked = append(unrevoked, t.ID.String())
+		}
 	}
-	return toks[0].ID == mine, nil
+	if len(unrevoked) > 0 {
+		return false, unrevoked, nil
+	}
+	return toks[0].ID == mine, nil, nil
 }
 
-func (s *Server) revokeSeatToken(ctx context.Context, subject string, id uuid.UUID) {
+// revokeSeatToken revokes one seat token, logging and returning any failure.
+func (s *Server) revokeSeatToken(ctx context.Context, subject string, id uuid.UUID) error {
 	if _, err := s.cfg.APITokenRepo.Revoke(ctx, id, subject); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "first-officer seat: revoke failed",
 			slog.String("seat_subject", subject), slog.String("token_id", id.String()), slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }
 
 // appendSeatLifecycleRow writes an attach/retire row: a run seat on the run's

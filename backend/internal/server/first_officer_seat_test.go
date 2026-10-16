@@ -43,6 +43,12 @@ import (
 //     merge_readiness without first_officer_finding_open — RED.
 //   - C23 attach captain: pinned over a real captain store in
 //     first_officer_pg_test.go.
+//   - Convergence reflects persisted revocation (fix-up concern ee8a14fb):
+//     discarding a losing token's Revoke error in convergeSeatTokens turned
+//     both revoke-failure subtests RED (201 beside a live competitor; 409
+//     while our token stayed active); making withdrawSeatAttach ignore its
+//     own revoke failure turned the own-revoke subtest RED (the 500 claimed
+//     "the issued token was revoked").
 
 const seatHuman = "github:alice"
 
@@ -204,6 +210,17 @@ type racingTokenRepo struct {
 	competitor    uuid.UUID
 	failList      int // fail the Nth ListForSubject call (1-based); 0 = never
 	listCalls     int
+	// failRevokeCompetitor / failRevokeOurs make Revoke fail for that token,
+	// leaving it ACTIVE in the store.
+	failRevokeCompetitor, failRevokeOurs bool
+}
+
+func (r *racingTokenRepo) Revoke(ctx context.Context, id uuid.UUID, subject string) (*apitoken.Token, error) {
+	isCompetitor := id == r.competitor
+	if (isCompetitor && r.failRevokeCompetitor) || (!isCompetitor && r.failRevokeOurs) {
+		return nil, errors.New("revoke down")
+	}
+	return r.fakeTokenRepo.Revoke(ctx, id, subject)
 }
 
 func (r *racingTokenRepo) Issue(ctx context.Context, subject string, scopes []string) (*apitoken.Token, error) {
@@ -281,6 +298,51 @@ func TestFirstOfficerSeatAttach_PostIssueConvergence(t *testing.T) {
 		}
 		if n := f.activeTokens(runSeat(runID)); n != 0 {
 			t.Errorf("active seat tokens = %d, want 0", n)
+		}
+	})
+	// Revocation failure injection: the outcome must reflect the PERSISTED
+	// token set, read back from the store after the call.
+	t.Run("loser revoke fails: 500 naming it, never 201 beside it", func(t *testing.T) {
+		r := &racingTokenRepo{competitorAge: time.Second, failRevokeCompetitor: true}
+		f := newRacingSeatFixture(t, r)
+		human := f.human()
+		runID := f.seedRun(run.StateRunning, "")
+		w := f.do(http.MethodPost, "/v0/first-officer-seats", human, attachBody(firstofficer.AnchorRun, runID))
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 (a competitor is still active):\n%s", w.Code, w.Body.String())
+		}
+		toks, _ := f.tokens.ListForSubject(context.Background(), runSeat(runID))
+		if len(toks) != 1 || toks[0].ID != r.competitor {
+			t.Fatalf("active tokens = %+v, want only the unrevoked competitor %s", toks, r.competitor)
+		}
+		if body := w.Body.String(); !strings.Contains(body, r.competitor.String()) || !strings.Contains(body, "the issued token was revoked") {
+			t.Errorf("body = %s, want the unrevoked competitor named and ours reported revoked", body)
+		}
+		if n := len(f.aud.chainedOf(auditFirstOfficerSeatAttached)); n != 0 {
+			t.Errorf("attached rows = %d, want 0", n)
+		}
+	})
+	t.Run("own revoke fails: 500 saying it may be active, never a 409 claiming revoked", func(t *testing.T) {
+		r := &racingTokenRepo{competitorAge: -time.Second, failRevokeOurs: true}
+		f := newRacingSeatFixture(t, r)
+		human := f.human()
+		runID := f.seedRun(run.StateRunning, "")
+		w := f.do(http.MethodPost, "/v0/first-officer-seats", human, attachBody(firstofficer.AnchorRun, runID))
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 (our token could not be revoked):\n%s", w.Code, w.Body.String())
+		}
+		toks, _ := f.tokens.ListForSubject(context.Background(), runSeat(runID))
+		if len(toks) != 2 {
+			t.Fatalf("active seat tokens = %d, want 2 (ours unrevoked + competitor)", len(toks))
+		}
+		ours := toks[0].ID
+		if ours == r.competitor {
+			ours = toks[1].ID
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "may still be active") || !strings.Contains(body, ours.String()) ||
+			strings.Contains(body, "the issued token was revoked") {
+			t.Errorf("body = %s, want our unrevoked token %s reported as possibly active", body, ours)
 		}
 	})
 }
