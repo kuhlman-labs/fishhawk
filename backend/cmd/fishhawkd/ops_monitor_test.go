@@ -808,7 +808,8 @@ func TestOpsProbe_DiskFailingExitsOne(t *testing.T) {
 
 // TestOpsProbe_WithDB drives --db against a real Postgres: postgres pings ok
 // and the runners probe reads the real run repository (an attributed runner
-// whose stage this tracker has never seen is skipped as foreign → ok).
+// whose stage this tracker has never seen — another backend, or a tenanted
+// run hidden by row-level security — is unobserved → unknown, never ok).
 func TestOpsProbe_WithDB(t *testing.T) {
 	clearOpsMonitorEnv(t)
 	seams := okOpsSeams(t)
@@ -825,8 +826,8 @@ func TestOpsProbe_WithDB(t *testing.T) {
 	if pg := byProbe["postgres"]; pg.Status != opsmonitor.StatusOK {
 		t.Errorf("postgres = %+v, want ok", pg)
 	}
-	if rn := byProbe["runners"]; rn.Status != opsmonitor.StatusOK || rn.Detail["foreign"] != float64(1) {
-		t.Errorf("runners = %+v, want ok with foreign=1", rn)
+	if rn := byProbe["runners"]; rn.Status != opsmonitor.StatusUnknown || !strings.Contains(rn.Reason, "1 fishhawk-runner process(es) not found in this tracker") {
+		t.Errorf("runners = %+v, want unknown naming 1 runner not found", rn)
 	}
 }
 

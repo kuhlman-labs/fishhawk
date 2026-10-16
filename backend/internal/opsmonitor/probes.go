@@ -489,7 +489,7 @@ func (p *RunnerProbe) Check(ctx context.Context) []Result {
 		confirm = DefaultConfirmSweeps
 	}
 
-	var unattributed, unobservable, foreign, attributed int
+	var unattributed, unobservable, notFound, attributed int
 	var terminal []orphan
 	for _, proc := range procs {
 		if proc.RunID == nil || proc.StageIDMalformed {
@@ -499,7 +499,10 @@ func (p *RunnerProbe) Check(ctx context.Context) []Result {
 		state, isTerminal, lerr := p.lookup(ctx, proc)
 		switch {
 		case errors.Is(lerr, run.ErrNotFound):
-			foreign++ // a runner pointed at another backend (e.g. the acceptance preview)
+			// Another backend's runner (e.g. the acceptance preview), OR a
+			// tenanted run hidden by row-level security: indistinguishable
+			// here, so it is unobserved and never counts toward ok.
+			notFound++
 			continue
 		case lerr != nil:
 			unobservable++
@@ -554,6 +557,9 @@ func (p *RunnerProbe) Check(ctx context.Context) []Result {
 	if unattributed > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d fishhawk-runner process(es) carry no readable --run-id/--stage-id", unattributed))
 	}
+	if notFound > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d fishhawk-runner process(es) not found in this tracker (another backend, or hidden by row-level security)", notFound))
+	}
 	if len(reasons) > 0 {
 		return []Result{unknown(p.Name(), strings.Join(reasons, "; "))}
 	}
@@ -562,7 +568,7 @@ func (p *RunnerProbe) Check(ctx context.Context) []Result {
 		Status:    StatusOK,
 		Observed:  fmt.Sprintf("%d fishhawk-runner process(es) attributed to this tracker, none confirmed orphaned", attributed),
 		Threshold: fmt.Sprintf("no fishhawk-runner outlives its terminal stage (confirmed over %d sweeps)", confirm),
-		Detail:    map[string]any{"attributed": attributed, "foreign": foreign, "pending_confirmation": pending},
+		Detail:    map[string]any{"attributed": attributed, "pending_confirmation": pending},
 	}}
 }
 

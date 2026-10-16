@@ -452,6 +452,9 @@ func TestRunnerProbe_NoStageIDUsesRun(t *testing.T) {
 	}
 }
 
+// TestRunnerProbe_StatusBranches: the not-found rows pin that a runner this
+// tracker cannot see (another backend, or a tenanted run hidden by row-level
+// security) is unobserved, never ok, whether it is every runner or only some.
 func TestRunnerProbe_StatusBranches(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	live := stalesweep.RunnerProcess{PID: "1", RunID: ptr(runID), StageID: ptr(stageID)}
@@ -465,9 +468,10 @@ func TestRunnerProbe_StatusBranches(t *testing.T) {
 		"list error":         {&RunnerProbe{Runs: running, List: func(context.Context) ([]stalesweep.RunnerProcess, error) { return nil, errors.New("ps missing") }}, StatusUnknown, "process scan failed"},
 		"non-terminal":       {&RunnerProbe{Runs: running, List: procList(live)}, StatusOK, ""},
 		"no runners":         {&RunnerProbe{Runs: running, List: procList()}, StatusOK, ""},
-		"stage not found":    {&RunnerProbe{Runs: &fakeRuns{}, List: procList(live)}, StatusOK, ""},
-		"nil stage result":   {&RunnerProbe{Runs: &fakeRuns{nilResult: true}, List: procList(live)}, StatusOK, ""},
-		"nil run result":     {&RunnerProbe{Runs: &fakeRuns{nilResult: true}, List: procList(stalesweep.RunnerProcess{PID: "2", RunID: ptr(runID)})}, StatusOK, ""},
+		"all not found":      {&RunnerProbe{Runs: &fakeRuns{}, List: procList(live)}, StatusUnknown, "1 fishhawk-runner process(es) not found in this tracker"},
+		"some not found":     {&RunnerProbe{Runs: running, List: procList(live, stalesweep.RunnerProcess{PID: "6", RunID: ptr(runID), StageID: ptr(uuid.New())})}, StatusUnknown, "1 fishhawk-runner process(es) not found in this tracker"},
+		"nil stage result":   {&RunnerProbe{Runs: &fakeRuns{nilResult: true}, List: procList(live)}, StatusUnknown, "not found in this tracker"},
+		"nil run result":     {&RunnerProbe{Runs: &fakeRuns{nilResult: true}, List: procList(stalesweep.RunnerProcess{PID: "2", RunID: ptr(runID)})}, StatusUnknown, "not found in this tracker"},
 		"lookup error":       {&RunnerProbe{Runs: &fakeRuns{err: errors.New("db down")}, List: procList(live)}, StatusUnknown, "1 runner lookup(s) failed"},
 		"run lookup error":   {&RunnerProbe{Runs: &fakeRuns{err: errors.New("db down")}, List: procList(stalesweep.RunnerProcess{PID: "2", RunID: ptr(runID)})}, StatusUnknown, "lookup(s) failed"},
 		"only unattributed":  {&RunnerProbe{Runs: running, List: procList(stalesweep.RunnerProcess{PID: "3"}, stalesweep.RunnerProcess{PID: "4"})}, StatusUnknown, "2 fishhawk-runner process(es) carry no readable --run-id/--stage-id"},

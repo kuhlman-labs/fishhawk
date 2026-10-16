@@ -624,10 +624,14 @@ func TestTick_EmitPathFailuresAreContained(t *testing.T) {
 				t.Errorf("an ERROR record was logged")
 			}
 			if name == "lookup panics" {
-				if h.count(slog.LevelWarn, "emit panicked") != 2 {
-					t.Errorf("want one 'emit panicked' WARN per failing result")
+				// The lookup degrades to in-memory dedup like a read error:
+				// the notifier is still reached and the row still lands.
+				if got := h.count(slog.LevelWarn, "audit dedup lookup failed"); got != 2 {
+					t.Errorf("lookup-failed WARNs = %d, want one per failing result", got)
 				}
-				return
+				if got := tc.au.appendCount(); got != 2 {
+					t.Errorf("appends = %d, want 2", got)
+				}
 			}
 			if tc.n.count() != 2 {
 				t.Errorf("notify attempts = %d, want 2 (the second failing result is still emitted)", tc.n.count())
@@ -648,19 +652,63 @@ func TestTick_AllProbesErrorOrPanicIsFailSafe(t *testing.T) {
 		stubProbe{name: "bogus", check: fixed(Result{Status: "weird"})},
 		DiskProbe{Path: "/x", Statfs: func(string) (uint64, uint64, error) { return 0, 0, errors.New("eio") }},
 		PostgresProbe{},
+		// The one failing result drives the panicking lookup, notifier and
+		// appender, so the panic flags above are exercised.
+		stubProbe{name: "fails", check: fixed(failingResult("fails", ConditionDiskFreeLow, ""))},
 	}, au, n, clk, h)
 	tk.ProbeTimeout = timescale.D(50 * time.Millisecond)
-	res := tk.Tick(context.Background())
-	if len(res) != 6 {
+	var res []Result
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Tick panicked: %v", r)
+			}
+		}()
+		res = tk.Tick(context.Background())
+	}()
+	if len(res) != 7 {
 		t.Fatalf("results = %+v", res)
 	}
-	for _, r := range res {
+	for _, r := range res[:6] {
 		if r.Status != StatusUnknown {
 			t.Errorf("%s = %s, want unknown", r.Probe, r.Status)
 		}
 	}
+	if res[6].Status != StatusFailing {
+		t.Errorf("fails = %s, want failing", res[6].Status)
+	}
+	if n.count() != 1 {
+		t.Errorf("notify attempts = %d, want 1 (the lookup panic degrades, the notifier is reached)", n.count())
+	}
+	if got := h.count(slog.LevelWarn, "emit panicked"); got != 1 {
+		t.Errorf("emit-panicked WARNs = %d, want 1 (the appender's panic)", got)
+	}
 	if h.atOrAbove(slog.LevelError) != 0 {
 		t.Errorf("an ERROR record was logged")
+	}
+}
+
+// TestTick_AuditPayloadOmitsDetail: the ops_probe_failed row is untenanted
+// (visible to every tenant member via GET /v0/audit), so Detail's host paths
+// never reach it.
+func TestTick_AuditPayloadOmitsDetail(t *testing.T) {
+	const hostPath = "/Users/operator/secret-volume"
+	r := failingResult("disk", ConditionDiskFreeLow, "")
+	r.Detail = map[string]any{"path": hostPath, "dir": hostPath + "/go-build"}
+	au, h, clk := &fakeAudit{}, &captureHandler{}, newClock()
+	tk := newTicker([]Probe{stubProbe{name: "disk", check: fixed(r)}}, au, nil, clk, h)
+	tk.Tick(context.Background())
+	if au.appendCount() != 1 {
+		t.Fatalf("appends = %d, want 1", au.appendCount())
+	}
+	au.mu.Lock()
+	raw := string(au.appends[0].Payload)
+	au.mu.Unlock()
+	if strings.Contains(raw, hostPath) {
+		t.Errorf("audit payload carries a Detail host path: %s", raw)
+	}
+	if _, ok := au.payload(t, 0)["detail"]; ok {
+		t.Errorf("audit payload has a detail key: %s", raw)
 	}
 }
 

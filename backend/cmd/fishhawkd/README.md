@@ -953,7 +953,7 @@ Host and process health probes: data-volume free space, sampled GOCACHE size, 1-
 | `--ops-monitor-notify-issue` | `FISHHAWKD_OPS_MONITOR_NOTIFY_ISSUE` | empty | `owner/name#N`; empty = audit-only. Posted through the GitHub App client; with no App configured it WARNs and runs audit-only |
 
 - **The notify issue must be access-controlled.** The comment carries pids, run ids and host metrics (never `Detail`: no host paths or process argv). Point it at a private operator repository's issue.
-- **Postgres and runners use fishhawkd's own pool.** Without `--db` the postgres probe and the runners probe read `unknown` (`no database configured`). The runners probe reads `runs`/`stages`, which are FORCE row-level secured (migration 0057) with no `app.account_id` set here: under a role without `BYPASSRLS`, a tenanted run reads as not-found, so a runner for it is skipped as foreign rather than checked.
+- **Postgres and runners use fishhawkd's own pool.** Without `--db` the postgres probe and the runners probe read `unknown` (`no database configured`). The runners probe reads `runs`/`stages`, which are FORCE row-level secured (migration 0057) with no `app.account_id` set here: under a role without `BYPASSRLS`, a tenanted run reads as not-found. A not-found runner (that, or one pointed at another backend) is unobserved, so the runners probe reads `unknown` naming the not-found count, never `ok`.
 - **Startup line.** `ops monitor started` with `deployment`, `interval`, `quiet_window` and `notify_issue` (whether a notifier is wired).
 
 ### `fishhawkd ops-probe`

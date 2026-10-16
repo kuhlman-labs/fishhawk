@@ -16,6 +16,7 @@ package opsmonitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -216,6 +217,9 @@ func runProbe(ctx context.Context, p Probe, deployment Deployment, timeout time.
 
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// Buffered so a late result never blocks the sender. A Check that ignores
+	// its context and never returns is abandoned here: one leaked goroutine
+	// per tick for as long as it stays wedged (README "Fail-safety").
 	ch := make(chan checkOutcome, 1)
 	go func() {
 		defer func() {
@@ -419,6 +423,9 @@ func (t *Ticker) emit(ctx context.Context, r Result) {
 	if t.Audit == nil {
 		return
 	}
+	// No Detail: the row is untenanted (nil account), so GET /v0/audit shows
+	// it to every tenant member, and Detail carries host paths (the disk
+	// path, the GOCACHE dir). The row carries the comment's field set.
 	payload, err := json.Marshal(map[string]any{
 		"condition":            r.Condition,
 		"probe":                r.Probe,
@@ -429,7 +436,6 @@ func (t *Ticker) emit(ctx context.Context, r Result) {
 		"remedy":               r.Remedy,
 		"reason":               r.Reason,
 		"deployment":           t.Deployment,
-		"detail":               r.Detail,
 		"quiet_window_seconds": int64(quiet / time.Second),
 		"notification":         notification,
 	})
@@ -471,14 +477,13 @@ func (t *Ticker) notify(ctx context.Context, r Result) (err error) {
 
 // auditSuppressed reports whether the audit log already holds an
 // ops_probe_failed row for r's (condition, subject) inside the quiet window,
-// returning its timestamp. A read error WARN-logs and returns false: fail open
-// toward one notification, never toward silence.
+// returning its timestamp. A read error or a panicking lookup WARN-logs and
+// returns false: fail open toward one notification, never toward silence.
 func (t *Ticker) auditSuppressed(ctx context.Context, r Result, now time.Time, quiet time.Duration) (time.Time, bool) {
 	if t.Audit == nil {
 		return time.Time{}, false
 	}
-	category := CategoryOpsProbeFailed
-	entries, err := t.Audit.ListAll(ctx, audit.ListAllParams{Category: &category, Limit: auditLookupLimit})
+	entries, err := t.listOpsRows(ctx)
 	if err != nil {
 		t.logger().LogAttrs(ctx, slog.LevelWarn, "opsmonitor: audit dedup lookup failed; using in-memory dedup only",
 			slog.String("error", err.Error()))
@@ -500,6 +505,19 @@ func (t *Ticker) auditSuppressed(ctx context.Context, r Result, now time.Time, q
 		}
 	}
 	return time.Time{}, false
+}
+
+// listOpsRows runs the dedup lookup under its own recover, so a panicking
+// store degrades to the in-memory path like a read error instead of
+// unwinding emit before the notifier is reached.
+func (t *Ticker) listOpsRows(ctx context.Context) (entries []*audit.Entry, err error) {
+	defer func() {
+		if recover() != nil {
+			entries, err = nil, errors.New("audit lookup panicked")
+		}
+	}()
+	category := CategoryOpsProbeFailed
+	return t.Audit.ListAll(ctx, audit.ListAllParams{Category: &category, Limit: auditLookupLimit})
 }
 
 // warnUnknown logs one WARN per probe per quiet window for unknown results.
