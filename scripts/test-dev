@@ -1029,6 +1029,22 @@ else
   fail "cmd_up serve should pass --enable-child-completion-sweeper so local decompositions fan in"
 fi
 
+# 9a2. cmd_up serve launch enables the ops monitor AUDIT-ONLY with the interim
+# dispatch hold (E85.1 / #4142, E85.11 / #4330). The repository is public, so
+# the local stack must never pass --ops-monitor-notify-issue: a notification
+# comment names pids and run ids.
+if print -r -- "$up_body" | grep_q -- '--enable-ops-monitor' \
+  && print -r -- "$up_body" | grep_q -- '--ops-monitor-dispatch-hold'; then
+  pass "cmd_up serve enables the ops monitor with the interim dispatch hold"
+else
+  fail "cmd_up serve should pass --enable-ops-monitor and --ops-monitor-dispatch-hold"
+fi
+if print -r -- "$up_body" | grep_q -- '--ops-monitor-notify-issue'; then
+  fail "cmd_up serve must not pass --ops-monitor-notify-issue (public repository: comments name pids and run ids)"
+else
+  pass "cmd_up serve leaves the ops monitor audit-only (no notify issue)"
+fi
+
 # 9b. cmd_k8s_up readiness gate: like cmd_up, the body must poll _await_healthz,
 # tail the pod logs, and exit 1 on failure so a future edit can't silently drop
 # the fail-loud guarantee of the Docker-Desktop bring-up.
