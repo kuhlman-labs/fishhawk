@@ -1,0 +1,275 @@
+{
+  "issue_title": "Let a report schedule be deferred, with a note saying why",
+  "issue_body": "Teams pause report schedules by deleting them, and nobody remembers why a report stopped arriving. Add two optional fields to the schedule definition: `delivery` (`now` or `deferred`; absent means `now`) and `deferral_note` (free text).\n\nA deferred schedule must say why: a schedule with `delivery: deferred` needs a `deferral_note` that is neither empty nor only whitespace. A `deferral_note` on a schedule that is not deferred is meaningless and must be refused, so a stale note never outlives its deferral. The dispatcher must not run deferred schedules.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/report-scheduler/issues/88",
+      "id": "example-org/report-scheduler#88"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add the delivery and deferral_note schedule fields, require the note for deferred schedules in the JSON Schema and schedule.Validate, and skip deferred schedules in the dispatcher.",
+    "scope": {
+      "files": [
+        {
+          "path": "schemas/schedule.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/schedule/schedule.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/schedule/validate.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/schedule/validate_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/dispatch/dispatcher.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/dispatch/dispatcher_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add optional delivery (enum now, deferred) and deferral_note (string) properties to schemas/schedule.schema.json, with a root if/then: when delivery is deferred, deferral_note is required. Add the matching fields to schedule.Schedule in internal/schedule/schedule.go."
+      },
+      {
+        "step": 2,
+        "description": "In schedule.Validate (internal/schedule/validate.go), beside the existing cron-expression check, reject a deferral_note that is empty or whitespace-only, and a deferral_note on a schedule whose delivery is not deferred, each with an error naming deferral_note."
+      },
+      {
+        "step": 3,
+        "description": "In internal/dispatch/dispatcher.go, skip a schedule whose delivery is deferred and log its deferral_note."
+      },
+      {
+        "step": 4,
+        "description": "Document delivery and deferral_note in api/openapi.yaml's Schedule schema."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Schema fixture tests: a deferred schedule without deferral_note fails the schema. Table tests for schedule.Validate covering an empty note, a whitespace-only note, a note on a delivery-now schedule and a valid deferred schedule. A dispatcher test with one deferred and one active schedule.",
+      "rollback_plan": "Revert the PR. Stored schedules keep their delivery and deferral_note keys, which the previous binary ignores, so deferred schedules run again.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-dispatcher-skips-deferred",
+          "statement": "The dispatcher runs no report for a schedule whose delivery is deferred.",
+          "source": "explicit",
+          "source_ref": "example-org/report-scheduler#88"
+        },
+        {
+          "id": "ac-schema-requires-note",
+          "statement": "schemas/schedule.schema.json rejects a schedule whose delivery is deferred and which has no deferral_note.",
+          "source": "explicit",
+          "source_ref": "example-org/report-scheduler#88"
+        },
+        {
+          "id": "ac-validate-note-rules",
+          "statement": "schedule.Validate returns an error naming deferral_note for a deferred schedule whose deferral_note is empty or whitespace-only, and for a delivery-now schedule that carries a deferral_note.",
+          "source": "explicit",
+          "source_ref": "example-org/report-scheduler#88"
+        },
+        {
+          "id": "ac-post-deferral-note-400",
+          "statement": "POST /schedules returns HTTP 400 naming deferral_note for each of four bodies: delivery deferred with deferral_note absent, delivery deferred with deferral_note empty, delivery deferred with deferral_note whitespace-only, and deferral_note set while delivery is now.",
+          "source": "inferred",
+          "rationale": "The issue requires these schedules to be refused; schedules enter the service through POST /schedules, so each refusal is observable there.",
+          "verify_hint": "POST each of the four bodies to /schedules and read the status and the error."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Existing schedules have no delivery key and read as now, so they keep running.",
+      "POST /schedules (internal/api/schedules.go) checks each body against schemas/schedule.schema.json, returns 400 naming the failing property on a violation and otherwise stores the schedule with 201; schedule.Validate runs when the dispatcher loads a schedule."
+    ],
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "never calls schedule.validate",
+    "does not call schedule.validate",
+    "doesn't call schedule.validate",
+    "never runs schedule.validate",
+    "does not run schedule.validate",
+    "doesn't run schedule.validate",
+    "never invokes schedule.validate",
+    "does not invoke schedule.validate",
+    "schedule.validate is not called",
+    "schedule.validate is never called",
+    "schedule.validate never runs on",
+    "schedule.validate does not run on",
+    "check is not wired",
+    "check isn't wired",
+    "not wired into the post",
+    "not wired into post",
+    "not wired into the handler",
+    "never wired into",
+    "no step wires",
+    "no approach step wires",
+    "nothing wires",
+    "no step changes the post",
+    "no step modifies the post",
+    "no step touches the post",
+    "schedules.go is not in scope",
+    "schedules.go isn't in scope",
+    "schedules.go is missing from scope",
+    "schedules.go is not in the scope",
+    "handler is not in scope",
+    "handler isn't in scope",
+    "handler is missing from scope",
+    "only checks the schema",
+    "only validates the schema",
+    "only validates against the schema",
+    "only checks against the schema",
+    "schema validation only",
+    "schema-only",
+    "schema only",
+    "only enforces presence",
+    "enforces only presence",
+    "only presence",
+    "presence only",
+    "only the absent",
+    "only absence",
+    "schema cannot reject",
+    "schema can't reject",
+    "schema does not reject",
+    "schema doesn't reject",
+    "schema won't reject",
+    "if/then only",
+    "if/then covers only",
+    "if/then cannot",
+    "if/then can't",
+    "would return 201",
+    "would still return 201",
+    "still returns 201",
+    "return 201 for",
+    "returns 201 for",
+    "201 instead of 400",
+    "201 rather than 400",
+    "cannot pass as planned",
+    "can't pass as planned",
+    "will fail as planned",
+    "would fail as planned",
+    "fails as planned",
+    "partly satisfiable",
+    "partially satisfiable",
+    "only at dispatch",
+    "only when the dispatcher loads",
+    "at load time, not",
+    "at dispatch time, not",
+    "not at post",
+    "not on post",
+    "not at write time",
+    "not at upload",
+    "post handler never",
+    "post handler does not",
+    "post handler doesn't",
+    "handler never calls",
+    "handler does not call",
+    "handler doesn't call",
+    "handler never runs",
+    "handler does not run",
+    "unreachable from the post",
+    "unreachable from post",
+    "upload route never",
+    "upload path never",
+    "three of the four would",
+    "three of the four return",
+    "three of the four are stored",
+    "three of the four are accepted",
+    "three of the four still",
+    "only a missing note",
+    "only an absent note",
+    "only the missing-note"
+  ],
+  "attribution_phrases": [
+    "four bodies",
+    "post /schedules returns http 400",
+    "deferral_note set while"
+  ],
+  "defect_phrases": [
+    "schedule.validate",
+    "deferral_note",
+    "post /schedules"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-post-deferral-note-400 is only partly satisfiable: the schema's if/then enforces only presence, and POST /schedules never runs schedule.Validate, so the empty, whitespace and unpaired bodies return 201."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-post-deferral-note-400 cannot pass as planned: the POST handler only validates against the schema, and schedule.Validate runs only when the dispatcher loads a schedule, so three of the four are stored."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion where POST /schedules returns HTTP 400 for each of four bodies would fail as planned: schedules.go is not in scope and nothing wires the blank-note check into the handler."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-post-deferral-note-400: only the absent-note body is refused at POST; the blank, whitespace and delivery-now cases return 201 because the handler does not call schedule.Validate."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-post-deferral-note-400 expects 400 for all four bodies, but the schema can't reject a blank note and the semantic check is not wired into the POST path."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-post-deferral-note-400 should also assert the error body points at deferral_note with a JSON pointer."
+    },
+    {
+      "category": "risk",
+      "note": "ac-post-deferral-note-400 is ambiguous: four bodies in one criterion is unjustified; split it so a failure names the body."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document a length limit for deferral_note in api/openapi.yaml."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-dispatcher-skips-deferred: add a test that a deferred schedule's next run time is still computed."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Approach step 3 logs the deferral_note; redact it if it can carry customer names."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-validate-note-rules: include a tab-only note among the whitespace cases."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "ac-post-deferral-note-400: the 400 error code should be a stable string, not free text."
+    }
+  ]
+}

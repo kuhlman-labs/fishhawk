@@ -32,10 +32,14 @@ const (
 // the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
 // #4253 mid-difficulty cases and the one #4361 subtler case that calibrated
 // in band on reviewer misses; five were cut, three at the ceiling and two in
-// band only on scoring misses);
+// band only on scoring misses), plus E55.26 / #4453's three slice-0
+// real-miss reconstructions (seed-synthetic-realmiss-guard-off-upload-route,
+// -pairing-rule-off-upload-route and -deferred-surface-conjunct), which are
+// candidates until the operator's live calibration: the post-calibration
+// fix-up sets this floor to the kept count;
 // the derived list below may grow past it, never shrink below it (so the
 // derivation cannot go vacuous and a deleted case cannot pass silently).
-const committedSyntheticCatchCaseFloor = 13
+const committedSyntheticCatchCaseFloor = 16
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE
