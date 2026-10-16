@@ -1,0 +1,14 @@
+id: scenario:issue-4476/http-mcp-tool-schemas-state-refusal
+statement: Over fishhawkd's HTTP /mcp route, tools/list returns input schemas in which the runner_binary property description of each of fishhawk_run_stage, fishhawk_dispatch_stage, fishhawk_run_children, fishhawk_drive_run and fishhawk_request_specialist_job names runner_binary_not_allowed_over_http.
+verify_hint: POST /mcp tools/list with a valid bearer; inspect inputSchema.properties.runner_binary.description of the five tools in the MCP tool result.
+steps: 'Seeded plan-gate-parked and minted an fhm_ run token: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over ''{}'', then POST /v0/runs/{run}/mcp-token. POST http://localhost:8090/mcp tools/list with Authorization Bearer, the Mcp-Protocol-Version 2026-07-28 and Mcp-Method tools/list headers, and params._meta protocolVersion/clientInfo/clientCapabilities. Read inputSchema.properties.runner_binary.description of the five spawning tools.'
+assertions:
+    expected: each of the five runner_binary descriptions names runner_binary_not_allowed_over_http
+    observed_at_record: 79 tools listed. runner_binary descriptions of fishhawk_run_stage, fishhawk_dispatch_stage, fishhawk_run_children, fishhawk_drive_run and fishhawk_request_specialist_job each contain 'Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH'. request_specialist_job adds '(even with spawn=false or kind draft)'.
+    repro_handle: POST http://localhost:8090/mcp {jsonrpc:2.0,id:2,method:tools/list,params:{_meta:{...protocolVersion:2026-07-28}}}
+origin:
+    issue: 4476
+    pr: 4508
+    run_id: 1e242758-7de8-4d5a-959e-d3ba01fba09b
+    head_sha: 691985e9b15daaf8e37d23c6232f16be7298a9e2
+    recorded_at: 2026-10-16T19:36:43Z
