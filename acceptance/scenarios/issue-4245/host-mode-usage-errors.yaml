@@ -1,0 +1,14 @@
+id: scenario:issue-4245/host-mode-usage-errors
+statement: '`scripts/check-gate-image --host --image <ref>` and `scripts/check-gate-image --host --platform <p>` exit 2 with a usage message naming the conflicting flags, and static mode (no flags) still exits 0 on this checkout.'
+verify_hint: CLI exit codes and stderr of `scripts/check-gate-image` with those argument combinations, and with no arguments.
+steps: 'In the sanctioned checkout ran: scripts/check-gate-image --host --image foo:bar; scripts/check-gate-image --host --platform linux/amd64; scripts/check-gate-image --image foo:bar --host; scripts/check-gate-image with no arguments.'
+assertions:
+    expected: Exit 2 with a usage message naming the conflicting flags; static mode exits 0.
+    observed_at_record: 'Each of the three combinations exits 2 with ''check-gate-image: --host probes THIS host''s PATH and cannot be combined with --image or --platform (which probe an image)'' plus the usage line. With no arguments it exits 0: ''check-gate-image: ok — GO_VERSION 1.26.9 agrees with 9 go directive(s) ...; GOLANGCI_LINT_VERSION v2.12.2 agrees with 12 pin site(s) ...''.'
+    repro_handle: scripts/check-gate-image --host --image foo:bar; echo $?; scripts/check-gate-image; echo $?
+origin:
+    issue: 4245
+    pr: 4535
+    run_id: ab48e168-c713-417a-b5fc-6674b1b22752
+    head_sha: 60964391153dea43c175372687fedebf232bc68c
+    recorded_at: 2026-10-16T22:08:01Z

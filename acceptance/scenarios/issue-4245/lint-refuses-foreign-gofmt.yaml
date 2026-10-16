@@ -1,0 +1,14 @@
+id: scenario:issue-4245/lint-refuses-foreign-gofmt
+statement: With golangci-lint matching the pins but a gofmt first on PATH whose Go version (as `go version <gofmt>` reports it) has a MAJOR.MINOR other than GO_VERSION's, `scripts/test lint` exits non-zero and its stderr names `host_toolchain_mismatch`, the gofmt path and both Go versions, with a remedy that does not ask for any file in the tree to be changed.
+verify_hint: CLI exit code and stderr of `scripts/test lint` with stub golangci-lint (pinned version and build Go), stub gofmt and a stub `go` answering `version <stub gofmt>` with a foreign Go minor, prepended to PATH.
+steps: 'In the sanctioned checkout, created a stub dir holding: a golangci-lint whose version is 2.12.2 built with go1.26.2 (matching the pins); a stub gofmt; and a stub go that answers ''version <stub gofmt>'' with ''<path>: go1.27.1'' and execs the real go otherwise. Ran PATH=<stubdir>:$PATH scripts/test lint.'
+assertions:
+    expected: Non-zero exit; stderr names host_toolchain_mismatch, the gofmt path and both Go versions; the remedy does not ask for any file to change.
+    observed_at_record: 'Exit 1. Stderr: ''ok host golangci-lint 2.12.2 (built with go1.26)'', then ''check-gate-image: host gofmt /tmp/fhv4245/stubs/badgofmt/gofmt is built with go1.27 but deploy/gate-image/Dockerfile:72 GO_VERSION 1.26.9 is 1.26 — ... put "$(go env GOROOT)/bin" first on PATH ...'', then ''scripts/test: host_toolchain_mismatch: lint REFUSED'' with remedies (--in-gate-image or a PATH change) and the line ''Do not edit files or request a scope amendment''. Stub run was never invoked. TestLintLegRefusesForeignGofmt PASS.'
+    repro_handle: PATH=/tmp/fhv4245/stubs/badgofmt:$PATH scripts/test lint
+origin:
+    issue: 4245
+    pr: 4535
+    run_id: ab48e168-c713-417a-b5fc-6674b1b22752
+    head_sha: 60964391153dea43c175372687fedebf232bc68c
+    recorded_at: 2026-10-16T22:08:01Z

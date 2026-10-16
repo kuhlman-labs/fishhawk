@@ -6,6 +6,7 @@
 # Usage:
 #   scripts/check-gate-image [--root DIR]                              # static
 #   scripts/check-gate-image [--root DIR] --image REF [--platform P]   # dynamic
+#   scripts/check-gate-image [--root DIR] --host                       # host
 #   --root defaults to this checkout; scripts/test-check-gate-image points it
 #   at temp fixture roots.
 #
@@ -49,6 +50,29 @@
 # and an `ok image <REF> id=<ID> digests=<...>` line naming what was checked;
 # pass an ID or digest as REF to pin exactly that image.
 #
+# HOST mode (--host, #4245) probes the tools on THIS host's PATH against the
+# Dockerfile ARGs, never docker and never the network. It is the precondition of
+# scripts/test's lint leg (_require_lint_host_toolchain), so `scripts/test lint`
+# and verify's lint leg refuse on a host toolchain that would report format
+# findings the pinned toolchain (CI, the gate image) does not:
+#   (a) GO_VERSION must have a parseable MAJOR.MINOR (fail closed);
+#   (b) `golangci-lint version` (FIRST line) must report EXACTLY
+#       GOLANGCI_LINT_VERSION and be `built with` a Go whose MAJOR.MINOR equals
+#       GO_VERSION's: its gofmt/goimports formatters are the go/printer of the
+#       Go that BUILT the binary, not of the `go` on PATH. golangci-lint absent
+#       from PATH, or a line without a version or a `built with goX.Y`, fails
+#       closed;
+#   (c) the standalone gofmt on PATH, when present, must be built with a Go of
+#       GO_VERSION's MAJOR.MINOR, read with `go version <gofmt path>`. gofmt
+#       absent passes (the lint leg never runs it); gofmt present with `go`
+#       absent fails closed. `go version <file>` exits 0 even on a non-Go file
+#       (`could not read Go build info`), so its OUTPUT is parsed, never its
+#       status. Patch releases are compared at MAJOR.MINOR only (Go minor
+#       revisions fix critical issues, not formatting).
+# Every mismatch is reported (not just the first); on success it prints one
+# `ok host golangci-lint <v> (built with go<mm>)` and one `ok host gofmt ...`
+# line. --host with --image or --platform is a usage error.
+#
 # EXIT: 0 ok, 1 violation (each line names file:line and both values),
 # 2 usage error or an unreadable Dockerfile.
 set -euo pipefail
@@ -57,9 +81,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE=""
 PLATFORM=""
 platform_set=0
+HOST=0
 
 usage() {
-  echo "usage: scripts/check-gate-image [--root DIR] [--image REF [--platform P]]" >&2
+  echo "usage: scripts/check-gate-image [--root DIR] [--image REF [--platform P] | --host]" >&2
   exit 2
 }
 
@@ -74,6 +99,8 @@ while [ $# -gt 0 ]; do
     --platform)
       [ $# -ge 2 ] && [ -n "$2" ] || usage
       PLATFORM="$2"; platform_set=1; shift 2 ;;
+    --host)
+      HOST=1; shift ;;
     -h|--help)
       usage ;;
     *)
@@ -81,6 +108,10 @@ while [ $# -gt 0 ]; do
       usage ;;
   esac
 done
+if [ "$HOST" = 1 ] && { [ -n "$IMAGE" ] || [ "$platform_set" = 1 ]; }; then
+  echo "check-gate-image: --host probes THIS host's PATH and cannot be combined with --image or --platform (which probe an image)" >&2
+  usage
+fi
 if [ "$platform_set" = 1 ] && [ -z "$IMAGE" ]; then
   echo "check-gate-image: --platform requires --image" >&2
   usage
@@ -134,6 +165,68 @@ done
 if [ "$missing_arg" = 1 ]; then
   echo "check-gate-image: $violations violation(s)" >&2
   exit 1
+fi
+
+GO_MM="$(printf '%s\n' "$GO_VERSION" | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
+
+# ---------------------------------------------------------------------------
+# HOST mode (#4245)
+# ---------------------------------------------------------------------------
+if [ "$HOST" = 1 ]; then
+  if [ -z "$GO_MM" ]; then
+    violate "$DOCKERFILE_REL:$GO_VERSION_LINE: GO_VERSION '$GO_VERSION' has no parseable MAJOR.MINOR (fail closed: the host Go cannot be compared)"
+  fi
+
+  if ! command -v golangci-lint >/dev/null 2>&1; then
+    violate "host golangci-lint not found on PATH (fail closed: it cannot be compared with $DOCKERFILE_REL:$GOLANGCI_LINT_VERSION_LINE GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION)"
+  else
+    host_gl_out="$(golangci-lint version 2>&1)" || true
+    host_gl_line="${host_gl_out%%$'\n'*}"
+    host_gl_version="$(sed -nE 's/.*has version v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<< "$host_gl_line")"
+    host_gl_go_mm="$(sed -nE 's/.*built with go([0-9]+\.[0-9]+).*/\1/p' <<< "$host_gl_line")"
+    if [ -z "$host_gl_version" ]; then
+      violate "cannot parse a version from host \`golangci-lint version\` output '$host_gl_line' (fail closed)"
+    elif [ "$host_gl_version" != "${GOLANGCI_LINT_VERSION#v}" ]; then
+      violate "host golangci-lint $host_gl_version differs from $DOCKERFILE_REL:$GOLANGCI_LINT_VERSION_LINE GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION — install golangci-lint $GOLANGCI_LINT_VERSION first on PATH"
+    fi
+    if [ -z "$host_gl_go_mm" ]; then
+      violate "cannot parse the Go that built host golangci-lint (no \`built with goX.Y\`) from '$host_gl_line' (fail closed)"
+    elif [ -n "$GO_MM" ]; then
+      if [ "$host_gl_go_mm" != "$GO_MM" ]; then
+        violate "host golangci-lint is built with go$host_gl_go_mm but $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION is $GO_MM — its gofmt/goimports formatters follow the Go that built it"
+      fi
+    fi
+    if [ -n "$host_gl_version" ] && [ "$host_gl_version" = "${GOLANGCI_LINT_VERSION#v}" ] \
+      && [ -n "$GO_MM" ] && [ "$host_gl_go_mm" = "$GO_MM" ]; then
+      echo "ok host golangci-lint $host_gl_version (built with go$host_gl_go_mm)"
+    fi
+  fi
+
+  gofmt_path="$(command -v gofmt 2>/dev/null || true)"
+  if [ -z "$gofmt_path" ]; then
+    echo "ok host gofmt absent from PATH (the lint leg never runs it)"
+  elif ! command -v go >/dev/null 2>&1; then
+    violate "host gofmt $gofmt_path is on PATH but \`go\` is not, so its Go version cannot be read with \`go version <path>\` (fail closed)"
+  else
+    host_gofmt_out="$(go version "$gofmt_path" 2>&1)" || true
+    host_gofmt_line="${host_gofmt_out%%$'\n'*}"
+    host_gofmt_go_mm="$(sed -nE 's/.*: go([0-9]+\.[0-9]+).*/\1/p' <<< "$host_gofmt_line")"
+    if [ -z "$host_gofmt_go_mm" ]; then
+      violate "cannot read the Go version of host gofmt $gofmt_path from \`go version $gofmt_path\` output '$host_gofmt_line' (fail closed: \`go version\` exits 0 even on a non-Go file, so only its output counts)"
+    elif [ -n "$GO_MM" ]; then
+      if [ "$host_gofmt_go_mm" != "$GO_MM" ]; then
+        violate "host gofmt $gofmt_path is built with go$host_gofmt_go_mm but $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION is $GO_MM — \`go env -w GOTOOLCHAIN\` switches \`go\`, never a standalone gofmt (AGENTS.md #3237), so put \"\$(go env GOROOT)/bin\" first on PATH when \`go version\` reports go$GO_VERSION"
+      else
+        echo "ok host gofmt $gofmt_path go$host_gofmt_go_mm"
+      fi
+    fi
+  fi
+
+  if [ "$violations" -gt 0 ]; then
+    echo "check-gate-image: $violations host toolchain violation(s)" >&2
+    exit 1
+  fi
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -243,7 +336,6 @@ fi
 if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<< "$GO_VERSION"; then
   violate "$DOCKERFILE_REL:$GO_VERSION_LINE: GO_VERSION '$GO_VERSION' is not an exact MAJOR.MINOR.PATCH"
 fi
-GO_MM="$(printf '%s\n' "$GO_VERSION" | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
 
 # (h) HELM_VERSION exact, MAJOR >= 4 (cluster-free `helm install --dry-run`).
 HELM_MAJOR="$(printf '%s\n' "$HELM_VERSION" | sed -nE 's/^v([0-9]+)\.[0-9]+\.[0-9]+$/\1/p')"
