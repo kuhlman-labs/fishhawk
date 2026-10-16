@@ -921,7 +921,12 @@ type CatchRateArmReport struct {
 	Trials map[string][]CatchTrial
 }
 
-// Totals sums the per-case counts.
+// Totals sums the per-case counts over EVERY case regardless of Expect, so a
+// clean case's trials (which never record caught) are pooled into trials with
+// the catch cases. That is correct only for a catch-only arm, i.e. the
+// conventions arms, which CompareCatchRateArms is the sole production caller
+// for; a persona arm's rates are the per-expectation-class pools
+// pooledClassCounts computes, which judgeCatchRate decides on.
 func (r CatchRateArmReport) Totals() (trials, caught, undecodable int) {
 	for _, c := range r.PerCase {
 		trials += c.Trials
@@ -932,7 +937,12 @@ func (r CatchRateArmReport) Totals() (trials, caught, undecodable int) {
 }
 
 // Rate is caught / trials over the pooled trials (undecodable included in the
-// denominator as misses); 0 when there are no trials.
+// denominator as misses); 0 when there are no trials. It pools EVERY case
+// regardless of Expect, so clean-case trials dilute the denominator: Rate is a
+// catch rate only for a catch-only arm (the conventions arms, read through
+// CompareCatchRateArms). A persona arm must not be read through Rate: its
+// catch and false-alarm rates are the per-expectation-class pools
+// pooledClassCounts computes.
 func (r CatchRateArmReport) Rate() float64 {
 	trials, caught, _ := r.Totals()
 	if trials == 0 {

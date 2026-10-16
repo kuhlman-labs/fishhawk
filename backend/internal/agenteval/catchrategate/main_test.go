@@ -441,21 +441,35 @@ func TestRun_RescoreWithPrintFingerprintIsUsage(t *testing.T) {
 }
 
 // TestRun_FailsOnLegacyV1Record: a legacy planreview-catchrate-evidence-v1
-// record (the committed pair until the shared re-pin) exits 1 naming the
-// shared #4313/#4314 re-recording, with the rule line on stderr.
+// record (the committed pair until the #4313 re-pin recording) exits 1 naming
+// the Captain's sequence (#4313 recorded first, #4314 re-pinned separately
+// after it), never a shared recording, with the rule line on stderr. The -h
+// usage states the same sequence.
 func TestRun_FailsOnLegacyV1Record(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "evidence.json")
 	if err := os.WriteFile(path, []byte(`{"schema":"planreview-catchrate-evidence-v1","arms":{}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, stderr := runGate("--evidence", path)
-	if code != 1 || !strings.Contains(stderr, "legacy planreview-catchrate-evidence-v1") || !strings.Contains(stderr, "#4313/#4314 re-pin recording") {
-		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the legacy record and the shared re-recording", code, stderr)
+	if code != 1 || !strings.Contains(stderr, "legacy planreview-catchrate-evidence-v1") || !strings.Contains(stderr, "#4314 re-pinned separately after it") {
+		t.Fatalf("exit %d, stderr:\n%s\nwant exit 1 naming the legacy record and the #4313-then-#4314 re-pin sequence", code, stderr)
+	}
+	if strings.Contains(stderr, "#4313/#4314") {
+		t.Errorf("stderr names a shared #4313/#4314 recording:\n%s", stderr)
 	}
 	if strings.Contains(stdout, "catchrategate: PASS") {
 		t.Fatalf("stdout reports a PASS:\n%s", stdout)
 	}
 	assertRuleLine(t, stderr)
+
+	var usage bytes.Buffer
+	run([]string{"-h"}, &bytes.Buffer{}, &usage)
+	if !strings.Contains(usage.String(), "#4314 re-pinned separately after it") {
+		t.Errorf("usage lacks the #4313-then-#4314 re-pin sequence:\n%s", usage.String())
+	}
+	if strings.Contains(usage.String(), "#4313/#4314") {
+		t.Errorf("usage names a shared #4313/#4314 recording:\n%s", usage.String())
+	}
 }
 
 // TestRun_PersonaFlags: --persona-corpus and --repo-root reach the arm table —

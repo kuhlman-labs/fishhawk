@@ -32,8 +32,9 @@ Recording sequence (Captain ruling 2026-10-12): #4313 is recorded and merged
 FIRST, on its own re-pin; #4314 (which registers its security arms in the
 same arm table) records separately after it (Step 2, "The #4313 re-pin
 recording, then #4314's"). Until the #4313 recording lands `catchrategate`
-refuses the v1 record (its refusal text, written before the ruling, still
-names a shared #4313/#4314 recording; the #4313 re-pin is what clears it),
+refuses the v1 record (its refusal text names the ruling's sequence, #4313
+recorded first and #4314 re-pinned separately after it; the #4313 re-pin is
+what clears it),
 and `scripts/check-review-prompt-eval` fails on every trigger-path change: by
 design, and outside `scripts/test verify`.
 
