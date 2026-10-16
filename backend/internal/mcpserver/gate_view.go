@@ -218,6 +218,16 @@ Response (gate_view):
     not an open (non-terminal, PR open and unmerged) decomposed parent;
     omitted with a merge_candidate_staleness history_gaps entry when the
     run's children or audit chain could not be read.
+  - scope_overlap — the LIVE cross-run scope overlap (#4118): every OTHER
+    non-terminal run in the same repository and tenant whose effective scope
+    (plan scope, approval add/remove, approved amendments) shares exact paths
+    with this run, outside its own decomposition/recovery lineage. Carries
+    run_id, self_scope_resolved, overlaps[] (run_id, issue_ref,
+    decomposed_from, stage, stage_state, paths[]), scanned_runs,
+    unscoped_runs and truncated. Advisory: it never blocks, but merging one of
+    two overlapping runs while the other is mid-implement can strand it.
+    Run-level: stage_kind does not filter it. Omitted for a run-bound token,
+    when the backend's compute failed, or against an older backend.
 `),
 	}, resolver.getGateView)
 }
