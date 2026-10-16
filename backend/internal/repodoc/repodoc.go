@@ -41,7 +41,10 @@
 // constrained the agent", and that question must have the same answer
 // whether or not the document happened to exceed the cap. What was actually
 // SHOWN is described by the sibling fields RenderedBytes, OriginalBytes,
-// CapBytes and Truncated, not by the hash.
+// CapBytes and Truncated, not by the hash. A consumer-DERIVED document
+// (Fetched.Derive, #4478) keeps the same hash domain: its hash and
+// OriginalBytes are the fetched file's, and Rendering names what was shown
+// instead of the file's bytes.
 package repodoc
 
 import (
@@ -51,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -220,6 +224,15 @@ type Document struct {
 	// BaseSource is echoed from Declaration.Base, so attribution can record
 	// which ref source the pinned commit came from.
 	BaseSource BaseSource
+	// Rendering names the consumer derivation Content was shaped from
+	// (Fetched.Derive); empty means the document is shown VERBATIM. For a
+	// derived document ContentHash and OriginalBytes still describe the
+	// fetched file, while Content, RenderedBytes, DroppedBytes and the
+	// truncation marker describe the rendering.
+	Rendering string
+	// RenderingBytes is the untruncated length of the derived body; 0 when
+	// the document is shown verbatim.
+	RenderingBytes int
 }
 
 // fileFetcher is the narrow consumer-side view of forge.FileFetcher.
@@ -365,11 +378,46 @@ func (r *Resolver) Fetch(ctx context.Context, req Request) (*Fetched, error) {
 // capBytes below zero is treated as zero (only the truncation marker is
 // shown for a non-empty document), never as "no cap".
 func (f *Fetched) Document(capBytes int) Document {
+	return f.shape(f.Content, capBytes)
+}
+
+// renderingNamePattern is the grammar of a Derive rendering name: a lowercase
+// machine identifier, so the name reads the same in an audit payload and on
+// the prompt's Source line.
+var renderingNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
+// Derive shapes a CONSUMER-DERIVED body for display under capBytes (#4478):
+// body is shown in place of the fetched bytes, while the document's identity
+// stays the FETCHED file's. ContentHash is over f.Content and OriginalBytes is
+// len(f.Content), exactly as Document reports them, so attribution still
+// answers "which revision of this file constrained the agent". body is capped
+// and neutralized like any document, so the truncation marker's "N of M bytes"
+// counts RENDERING bytes; RenderingBytes is len(body), the untruncated
+// rendering size, and Rendering names the derivation on the audit trail and
+// the prompt's Source line.
+//
+// rendering must match ^[a-z0-9][a-z0-9._-]*$; anything else, the empty name
+// included, is refused, because an UNNAMED derivation would read as a
+// verbatim injection in the audit trail.
+func (f *Fetched) Derive(rendering string, body []byte, capBytes int) (Document, error) {
+	if !renderingNamePattern.MatchString(rendering) {
+		return Document{}, fmt.Errorf("repodoc: derive %q: rendering name %q is not a lowercase identifier matching %s", f.Path, rendering, renderingNamePattern)
+	}
+	doc := f.shape(body, capBytes)
+	doc.Rendering = rendering
+	doc.RenderingBytes = len(body)
+	return doc, nil
+}
+
+// shape is Document and Derive's shared body: the content hash and
+// OriginalBytes describe the FETCHED bytes (f.Content) whatever is shown, and
+// shown is cut and neutralized under capBytes.
+func (f *Fetched) shape(shown []byte, capBytes int) Document {
 	if capBytes < 0 {
 		capBytes = 0
 	}
 	sum := sha256.Sum256(f.Content)
-	content, dropped, truncated := capContent(string(f.Content), capBytes, f.Path, f.Commit)
+	content, dropped, truncated := capContent(string(shown), capBytes, f.Path, f.Commit)
 	// Neutralize forged delimiter lines HERE, not only at render time, so
 	// Content IS the body that will be shown and RenderedBytes counts those
 	// exact bytes. Render neutralizes again (the operation is idempotent —

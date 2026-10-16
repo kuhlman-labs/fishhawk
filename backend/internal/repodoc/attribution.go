@@ -222,13 +222,15 @@ func AttributeSet(ctx context.Context, a appender, runID, stageID uuid.UUID, set
 		if !doc.Truncated {
 			continue
 		}
-		if err := appendEntry(categoryDocumentTruncated, doc.Path, doc.DeclarationSite, map[string]any{
+		p := map[string]any{
 			"path":          doc.Path,
 			"commit":        doc.Commit,
 			"content_hash":  doc.ContentHash,
 			"cap_bytes":     doc.CapBytes,
 			"dropped_bytes": doc.DroppedBytes,
-		}); err != nil {
+		}
+		addRendering(p, doc)
+		if err := appendEntry(categoryDocumentTruncated, doc.Path, doc.DeclarationSite, p); err != nil {
 			return err
 		}
 	}
@@ -257,7 +259,7 @@ func AttributeSet(ctx context.Context, a appender, runID, stageID uuid.UUID, set
 
 	// Phase 2 — the injection claims, each the commit point for its document.
 	for i, doc := range docs {
-		if err := appendEntry(categoryDocumentInjected, doc.Path, doc.DeclarationSite, map[string]any{
+		p := map[string]any{
 			"declaration_site": doc.DeclarationSite,
 			"path":             doc.Path,
 			"commit":           doc.Commit,
@@ -268,11 +270,27 @@ func AttributeSet(ctx context.Context, a appender, runID, stageID uuid.UUID, set
 			"base_source":      doc.BaseSource.AuditValue(),
 			"document_index":   i,
 			"document_count":   len(docs),
-		}); err != nil {
+		}
+		addRendering(p, doc)
+		if err := appendEntry(categoryDocumentInjected, doc.Path, doc.DeclarationSite, p); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// addRendering stamps a DERIVED document's rendering name and untruncated
+// rendering size onto its document_injected / per-document document_truncated
+// payload (#4478), so a reader can tell the shown bytes were a rendering of
+// the hashed file and can reconcile dropped_bytes against rendering_bytes. A
+// verbatim document (empty Rendering) gets neither key, so its payload is
+// exactly the pre-#4478 shape.
+func addRendering(p map[string]any, doc Document) {
+	if doc.Rendering == "" {
+		return
+	}
+	p["rendering"] = doc.Rendering
+	p["rendering_bytes"] = doc.RenderingBytes
 }
 
 // firstPath names the set's first subject for an error message.

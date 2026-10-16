@@ -2,6 +2,8 @@ package decisionrecord
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -273,37 +275,62 @@ func TestAssemble_OversizedRecordDroppedNeverTruncated(t *testing.T) {
 	}
 }
 
+// indexRenderingOf parses raw and returns its RenderIndex rendering — the bytes
+// Assemble shows and caps (#4478).
+func indexRenderingOf(t *testing.T, raw string) []byte {
+	t.Helper()
+	idx, err := ParseIndex([]byte(raw))
+	if err != nil {
+		t.Fatalf("fixture index does not parse: %v", err)
+	}
+	rendered, err := RenderIndex(idx)
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	return rendered
+}
+
 // overCapIndex builds an index over recs whose first record carries a title long
-// enough that the raw index exceeds capBytes, so Assemble must reshape it.
+// enough that the index's RENDERING exceeds capBytes, so Assemble must reshape
+// it.
 func overCapIndex(t *testing.T, capBytes int, recs ...map[string]any) string {
 	t.Helper()
 	recs[0]["title"] = strings.Repeat("long title ", 300)
 	raw := string(indexJSON(t, recs...))
-	if len(raw) <= capBytes {
-		t.Fatalf("fixture index is %d bytes, want > %d", len(raw), capBytes)
+	if n := len(indexRenderingOf(t, raw)); n <= capBytes {
+		t.Fatalf("fixture index rendering is %d bytes, want > %d", n, capBytes)
 	}
 	return raw
 }
 
 // replayIndexCut computes, independently of fitIndex, the cap an over-cap index
 // is cut under: one shrink step from the budget by the first render's overflow.
-// It reads the index through the same Path and Commit Assemble does, because the
-// truncation marker embeds both and its length depends on them. The fixture
-// must converge in that one step, or the replay is not the production answer.
+// It derives the index's rendering through the same Path and Commit Assemble
+// does, because the truncation marker embeds both and its length depends on
+// them. The fixture must converge in that one step, or the replay is not the
+// production answer.
 func replayIndexCut(t *testing.T, raw string, capBytes int) int {
 	t.Helper()
 	fetched := &repodoc.Fetched{Path: indexPath, Commit: admissionSHA, Content: []byte(raw)}
-	first := fetched.Document(capBytes)
+	rendering := indexRenderingOf(t, raw)
+	derive := func(c int) repodoc.Document {
+		doc, err := fetched.Derive(IndexRendering, rendering, c)
+		if err != nil {
+			t.Fatalf("Derive: %v", err)
+		}
+		return doc
+	}
+	first := derive(capBytes)
 	wantCut := capBytes - (first.RenderedBytes - capBytes)
-	if wantCut >= capBytes || fetched.Document(wantCut).RenderedBytes > capBytes {
+	if wantCut >= capBytes || derive(wantCut).RenderedBytes > capBytes {
 		t.Fatalf("fixture does not converge in one shrink step: first render %d bytes under cap %d, replayed cut %d renders %d bytes",
-			first.RenderedBytes, capBytes, wantCut, fetched.Document(wantCut).RenderedBytes)
+			first.RenderedBytes, capBytes, wantCut, derive(wantCut).RenderedBytes)
 	}
 	return wantCut
 }
 
-// TestAssemble_IndexOverCap: the raw index alone exceeds the cap. It is still
-// included, cut with its loud marker, and its rendered size (marker included)
+// TestAssemble_IndexOverCap: the index's rendering alone exceeds the cap. It is
+// still included, cut with its loud marker, and its rendered size (marker included)
 // fits its own cap. The records have their own budget, so both small matches
 // are still shown in full (#4399 — before it, every match was dropped).
 //
@@ -348,6 +375,9 @@ func TestAssemble_IndexOverCap(t *testing.T) {
 	}
 	if sel.Index.ContentHash == "" || sel.Index.OriginalBytes != len(raw) {
 		t.Errorf("index attribution fields = %+v", sel.Index)
+	}
+	if n := len(indexRenderingOf(t, raw)); sel.Index.Rendering != IndexRendering || sel.Index.RenderingBytes != n {
+		t.Errorf("index rendering = %q (%d bytes), want %q (%d bytes)", sel.Index.Rendering, sel.Index.RenderingBytes, IndexRendering, n)
 	}
 }
 
@@ -417,6 +447,10 @@ func TestAssemble_IndexOverCap_AttributionCapBytes(t *testing.T) {
 	if index["path"] != indexPath || sels["selection"] != SelectionName {
 		t.Fatalf("rows mislabeled: per-document path %v, selection %v", index["path"], sels["selection"])
 	}
+	if index["rendering"] != IndexRendering || index["rendering_bytes"] != float64(len(indexRenderingOf(t, raw))) {
+		t.Errorf("per-document document_truncated rendering = %v / %v, want %q / %d: dropped_bytes must be reconcilable against the rendering",
+			index["rendering"], index["rendering_bytes"], IndexRendering, len(indexRenderingOf(t, raw)))
+	}
 	if got := index["cap_bytes"]; got != float64(wantCut) || got != float64(sel.Index.CapBytes) {
 		t.Errorf("per-document cap_bytes = %v, want the index's cut cap %d (Index.CapBytes %d; #3930)", got, wantCut, sel.Index.CapBytes)
 	}
@@ -431,8 +465,8 @@ func TestAssemble_IndexOverCap_AttributionCapBytes(t *testing.T) {
 	}
 }
 
-// TestAssemble_IndexNearCapDoesNotStarveRecords (#4399): the index fills at
-// least 95% of the cap yet fits it whole, and each of the three records is
+// TestAssemble_IndexNearCapDoesNotStarveRecords (#4399): the index's rendering
+// fills at least 95% of the cap yet fits it whole, and each of the three records is
 // larger than what a SHARED budget would leave after the index (cap minus
 // index), while all three together fit the cap. The separate record budget
 // must show all three, in rank order, with nothing dropped.
@@ -444,14 +478,15 @@ func TestAssemble_IndexNearCapDoesNotStarveRecords(t *testing.T) {
 		rec("ADR-003", "docs/adr/003.md", "accepted", "backend/internal/audit/**"),
 	}
 	const target = capBytes - 40
-	recs[0]["title"] = recs[0]["title"].(string) + strings.Repeat("x", target-len(indexJSON(t, recs...)))
+	recs[0]["title"] = recs[0]["title"].(string) + strings.Repeat("x", target-len(indexRenderingOf(t, string(indexJSON(t, recs...)))))
 	idx := string(indexJSON(t, recs...))
-	if len(idx)*100 < capBytes*95 || len(idx) > capBytes {
-		t.Fatalf("premise: fixture index is %d bytes, want >= 95%% of the %d-byte cap and <= it", len(idx), capBytes)
+	shown := len(indexRenderingOf(t, idx))
+	if shown*100 < capBytes*95 || shown > capBytes {
+		t.Fatalf("premise: fixture index rendering is %d bytes, want >= 95%% of the %d-byte cap and <= it", shown, capBytes)
 	}
 	const size = 600
-	if size <= capBytes-len(idx) || 3*size > capBytes {
-		t.Fatalf("premise: record size %d must exceed the shared remainder %d and three must fit the cap %d", size, capBytes-len(idx), capBytes)
+	if size <= capBytes-shown || 3*size > capBytes {
+		t.Fatalf("premise: record size %d must exceed the shared remainder %d and three must fit the cap %d", size, capBytes-shown, capBytes)
 	}
 	ff := newFetcher()
 	ff.seed(admissionSHA, map[string]string{
@@ -464,8 +499,8 @@ func TestAssemble_IndexNearCapDoesNotStarveRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
-	if sel.Index.Truncated || sel.Index.RenderedBytes != len(idx) {
-		t.Fatalf("premise: index truncated %v, rendered %d bytes; want it whole (%d bytes), so the index shrink loop drops nothing", sel.Index.Truncated, sel.Index.RenderedBytes, len(idx))
+	if sel.Index.Truncated || sel.Index.RenderedBytes != shown {
+		t.Fatalf("premise: index truncated %v, rendered %d bytes; want its rendering whole (%d bytes), so the index shrink loop drops nothing", sel.Index.Truncated, sel.Index.RenderedBytes, shown)
 	}
 	if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-003", "ADR-002", "ADR-001"}) || len(sel.Dropped) != 0 {
 		t.Fatalf("included %v dropped %v, want all three shown in rank order: the index must not starve the record budget", got, ids(sel.Dropped))
@@ -553,6 +588,151 @@ func TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAssemble_IndexShownAsCompactRendering (#4478): the fixture index is
+// written PRETTY (json.MarshalIndent), so its raw bytes exceed the cap while
+// its compact rendering fits. Assemble must show the rendering whole, and the
+// document's hash and OriginalBytes must still describe the fetched file.
+func TestAssemble_IndexShownAsCompactRendering(t *testing.T) {
+	const capBytes = 2048
+	recs := make([]map[string]any, 0, 12)
+	for i := 1; i <= 12; i++ {
+		recs = append(recs, rec(fmt.Sprintf("ADR-%03d", i), fmt.Sprintf("docs/adr/%03d.md", i), "accepted", "docs/unrelated/**"))
+	}
+	pretty, err := json.MarshalIndent(map[string]any{"schema_version": IndexSchemaVersion, "records": recs}, "", "    ")
+	if err != nil {
+		t.Fatalf("marshal pretty index: %v", err)
+	}
+	raw := string(pretty)
+	rendering := indexRenderingOf(t, raw)
+	if len(raw) <= capBytes || len(rendering) > capBytes {
+		t.Fatalf("premise: raw index %d bytes must exceed the %d-byte cap while its rendering (%d bytes) fits it", len(raw), capBytes, len(rendering))
+	}
+	ff := newFetcher()
+	ff.seed(admissionSHA, map[string]string{indexPath: raw})
+	sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if sel.Index.Truncated || sel.Index.Content != string(rendering) {
+		t.Fatalf("index truncated %v, content %d bytes; want the compact rendering whole (%d bytes):\n%s", sel.Index.Truncated, len(sel.Index.Content), len(rendering), sel.Index.Content)
+	}
+	sum := sha256.Sum256(pretty)
+	if want := "sha256:" + hex.EncodeToString(sum[:]); sel.Index.ContentHash != want {
+		t.Errorf("ContentHash = %s, want the fetched file's %s", sel.Index.ContentHash, want)
+	}
+	if sel.Index.OriginalBytes != len(raw) || sel.Index.RenderedBytes != len(rendering) ||
+		sel.Index.RenderingBytes != len(rendering) || sel.Index.Rendering != IndexRendering {
+		t.Errorf("index bytes: original %d (want %d) rendered %d rendering %d (want %d) name %q (want %q)",
+			sel.Index.OriginalBytes, len(raw), sel.Index.RenderedBytes, sel.Index.RenderingBytes, len(rendering), sel.Index.Rendering, IndexRendering)
+	}
+	if err := indexFitError(sel); err != nil {
+		t.Errorf("indexFitError on a fitting rendering: %v", err)
+	}
+	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its "+IndexRendering+" rendering, not verbatim") || !strings.Contains(body, indexRenderingNote) {
+		t.Errorf("index prompt document does not disclose the rendering:\n%s", body)
+	}
+}
+
+// indexFitError is the done-means check of #4478: nil when the index's
+// rendering reached the prompt whole, otherwise an error naming the rendered
+// bytes, the cut cap, the resolver cap and the overflow.
+func indexFitError(sel *Selection) error {
+	if !sel.Index.Truncated {
+		return nil
+	}
+	return fmt.Errorf("the %s rendering of %s is %d bytes, %d over the %d-byte resolver cap, so it was injected CUT under a %d-byte cap and the persona loses the newest records; shrinking the rendering or raising the cap is an operator decision",
+		IndexRendering, sel.Index.Path, sel.Index.RenderingBytes, sel.Index.RenderingBytes-sel.CapBytes, sel.CapBytes, sel.Index.CapBytes)
+}
+
+// The shipped rendering's measured headroom (#4478, 2026-10-16): at
+// measuredShippedRecords records the largest rendered line was
+// measuredLargestIndexLine bytes, and the rendering left room for at least
+// minHeadroomRecords more such lines under repodoc.DefaultMaxBytes (approval
+// condition 4). The floor is anchored to the record count AT MEASUREMENT, so
+// it holds the rendering format to that capacity without failing the ADRs that
+// spend the headroom; the fit check itself is indexFitError.
+const (
+	measuredShippedRecords   = 95
+	measuredLargestIndexLine = 428
+	minHeadroomRecords       = 25
+)
+
+// TestAssemble_ShippedIndex_RenderingFitsCap (#4478) assembles the SHIPPED
+// docs/adr at the production cap and requires the index's rendering to reach
+// the prompt whole, plus the measured headroom floor. It fails the change
+// whose record makes the rendering overflow the cap.
+func TestAssemble_ShippedIndex_RenderingFitsCap(t *testing.T) {
+	r := &repodoc.Resolver{Fetcher: diskFetcher{root: filepath.Join("..", "..", "..")}}
+	req := request(admissionSHA)
+	req.ChangePaths = nil
+	sel, err := Assemble(context.Background(), r, req)
+	if err != nil {
+		t.Fatalf("Assemble over the shipped docs/adr: %v", err)
+	}
+	if err := indexFitError(sel); err != nil {
+		t.Fatal(err)
+	}
+	largest := 0
+	for _, line := range strings.SplitAfter(sel.Index.Content, "\n") {
+		largest = max(largest, len(line))
+	}
+	headroom := repodoc.DefaultMaxBytes - sel.Index.RenderingBytes
+	t.Logf("shipped %s: %d raw bytes, %d records, rendering %d bytes, headroom %d bytes = %d more records at the largest line (%d bytes; measured %d) = %d at the measured largest",
+		indexPath, sel.Index.OriginalBytes, sel.TotalRecords, sel.Index.RenderingBytes, headroom, headroom/max(largest, 1), largest, measuredLargestIndexLine, headroom/measuredLargestIndexLine)
+	if capacity, floor := sel.TotalRecords+headroom/measuredLargestIndexLine, measuredShippedRecords+minHeadroomRecords; capacity < floor {
+		t.Errorf("the rendering now holds %d records at %d bytes each (%d shipped + %d more), below the documented floor of %d (%d at measurement + %d): the rendering format lost capacity",
+			capacity, measuredLargestIndexLine, sel.TotalRecords, headroom/measuredLargestIndexLine, floor, measuredShippedRecords, minHeadroomRecords)
+	}
+}
+
+// TestAssemble_IndexRenderingOverflow_IsCaught is the permanent proof that
+// TestAssemble_ShippedIndex_RenderingFitsCap's check can go RED: synthetic
+// records with realistic titles are appended to the SHIPPED index until its
+// rendering exceeds repodoc.DefaultMaxBytes, and indexFitError must refuse the
+// assembly.
+func TestAssemble_IndexRenderingOverflow_IsCaught(t *testing.T) {
+	_, raw := shippedIndex(t)
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode shipped index: %v", err)
+	}
+	recs, _ := doc["records"].([]any)
+	title := strings.TrimSpace(strings.Repeat("Synthetic overflow record proving the shipped-index fit check reddens ", 4))[:230]
+	var grown string
+	for n := 9001; ; n++ {
+		r := rec(fmt.Sprintf("ADR-%d", n), fmt.Sprintf("docs/adr/%d-synthetic-overflow-record.md", n), "accepted")
+		r["title"] = title
+		recs = append(recs, r)
+		doc["records"] = recs
+		b, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal grown index: %v", err)
+		}
+		grown = string(b)
+		if len(indexRenderingOf(t, grown)) > repodoc.DefaultMaxBytes {
+			break
+		}
+		if n > 9500 {
+			t.Fatalf("the rendering never exceeded the cap")
+		}
+	}
+	ff := newFetcher()
+	ff.seed(admissionSHA, map[string]string{indexPath: grown})
+	req := request(admissionSHA)
+	req.ChangePaths = nil
+	sel, err := Assemble(context.Background(), resolver(ff, 0), req)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	err = indexFitError(sel)
+	if err == nil {
+		t.Fatalf("indexFitError = nil for a %d-byte rendering over the %d-byte cap", sel.Index.RenderingBytes, repodoc.DefaultMaxBytes)
+	}
+	if want := fmt.Sprintf("%d over the %d-byte resolver cap", sel.Index.RenderingBytes-repodoc.DefaultMaxBytes, repodoc.DefaultMaxBytes); !strings.Contains(err.Error(), want) {
+		t.Errorf("indexFitError = %v, want it to name the overflow %q", err, want)
 	}
 }
 
@@ -873,12 +1053,13 @@ func TestPromptDocuments_SuccessorFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. " +
 			"1 of its 1 records declare an applies_to path glob matching a path this change touches; " +
 			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
 		pre := sel.indexFraming(true).Preamble
 		if pre != golden {
-			t.Errorf("preamble changed with nothing followed:\n got %q\nwant %q", pre, golden)
+			t.Errorf("preamble changed (beyond the #4478 rendering sentence) with nothing followed:\n got %q\nwant %q", pre, golden)
 		}
 		if strings.Contains(pre, "supersede") {
 			t.Errorf("preamble mentions supersession with nothing followed:\n%s", pre)
@@ -1069,6 +1250,7 @@ func TestPromptDocuments_AmendmentFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. " +
 			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); " +
 			"2 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first; a successor ranks with the records it supersedes): ADR-002, ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
