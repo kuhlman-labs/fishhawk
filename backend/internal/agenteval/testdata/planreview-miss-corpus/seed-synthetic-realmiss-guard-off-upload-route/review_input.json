@@ -1,0 +1,259 @@
+{
+  "issue_title": "Flags with rollout none must not carry targeting rules",
+  "issue_body": "Flag definitions have no way to say a flag is off for everyone, so people delete the targeting rules instead and then lose them. Add a `rollout` field to the flag definition with the values `none`, `percentage` and `all`.\n\nA flag whose definition declares `rollout: none` is off for everyone: evaluating it returns the flag's default variant for every subject. A definition that declares `rollout: none` and still carries targeting rules is a mistake waiting to happen (someone flips the rollout and stale rules go live), so such a definition must be rejected, and the rejection must name the offending rule's id.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/flags-service/issues/412",
+      "id": "example-org/flags-service#412"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add the rollout field to flag definitions, serve the default variant for rollout none, and reject targeting rules under rollout none in flagdef.Check.",
+    "scope": {
+      "files": [
+        {
+          "path": "schemas/flag-definition.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/flagdef/definition.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/flagdef/check.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/flagdef/check_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/eval/evaluate.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/eval/evaluate_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "api/openapi.yaml",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add an optional rollout property (enum none, percentage, all; default percentage) to schemas/flag-definition.schema.json and a Rollout field to flagdef.Definition in internal/flagdef/definition.go."
+      },
+      {
+        "step": 2,
+        "description": "In flagdef.Check (internal/flagdef/check.go), the semantic pass that already rejects duplicate rule ids, add a rule: a definition with rollout none and one or more targeting rules returns ErrRulesUnderNone carrying the first rule's id."
+      },
+      {
+        "step": 3,
+        "description": "In internal/eval/evaluate.go, return the flag's default variant without walking the targeting rules when the definition's rollout is none."
+      },
+      {
+        "step": 4,
+        "description": "Document the rollout field and its three values in api/openapi.yaml's FlagDefinition schema."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Table tests for flagdef.Check: rollout none with rules returns ErrRulesUnderNone naming the first rule id; rollout none without rules, percentage and all pass. Evaluator tests: a rollout-none flag returns the default variant for several subjects.",
+      "rollback_plan": "Revert the PR. Stored definitions keep their rollout key, which the previous binary ignores.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-none-serves-default",
+          "statement": "Evaluating a flag whose definition declares rollout none returns the flag's default variant for every subject.",
+          "source": "explicit",
+          "source_ref": "example-org/flags-service#412"
+        },
+        {
+          "id": "ac-check-rejects-rules-under-none",
+          "statement": "flagdef.Check on a definition that declares rollout none and carries one or more targeting rules returns an error naming the first such rule's id.",
+          "source": "explicit",
+          "source_ref": "example-org/flags-service#412"
+        },
+        {
+          "id": "ac-put-none-with-rules-400",
+          "statement": "PUT /flags/{key} with a body that declares rollout none and carries a targeting rule returns HTTP 400 whose error names that rule's id.",
+          "source": "inferred",
+          "rationale": "The issue requires such a definition to be rejected with the rule's id; definitions reach the service through PUT /flags/{key}, so an operator sees the rejection there.",
+          "verify_hint": "PUT a rollout-none definition carrying rule r-1 to /flags/demo and read the status and the error body."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "Existing definitions have no rollout key and default to percentage, so their evaluation does not change.",
+      "The PUT /flags/{key} handler (internal/api/flags.go) checks each body against schemas/flag-definition.schema.json, returns 400 on a schema violation and otherwise stores the definition with 201; flagdef.Check runs when the evaluator loads a stored definition."
+    ],
+    "predicted_runtime_minutes": 40,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "never calls flagdef.check",
+    "does not call flagdef.check",
+    "doesn't call flagdef.check",
+    "never runs flagdef.check",
+    "does not run flagdef.check",
+    "doesn't run flagdef.check",
+    "never invokes flagdef.check",
+    "does not invoke flagdef.check",
+    "flagdef.check is not called",
+    "flagdef.check is never called",
+    "flagdef.check never runs on",
+    "flagdef.check does not run on",
+    "check is not wired",
+    "check isn't wired",
+    "not wired into the put",
+    "not wired into the handler",
+    "not wired into put",
+    "never wired into",
+    "no step wires",
+    "no approach step wires",
+    "nothing wires",
+    "no step changes the put",
+    "no step modifies the put",
+    "no step touches the put",
+    "no step changes internal/api/flags.go",
+    "flags.go is not in scope",
+    "flags.go isn't in scope",
+    "flags.go is missing from scope",
+    "flags.go is absent from scope",
+    "flags.go is not in the scope",
+    "handler is not in scope",
+    "handler isn't in scope",
+    "handler is missing from scope",
+    "only checks the schema",
+    "only validates the schema",
+    "only validates against the schema",
+    "only checks against the schema",
+    "only the json schema",
+    "only schema-validates",
+    "schema validation only",
+    "schema-only",
+    "schema only",
+    "only at evaluation",
+    "only at evaluate time",
+    "only on evaluation",
+    "only when the evaluator loads",
+    "only when a definition is evaluated",
+    "at evaluation time, not",
+    "at load time, not",
+    "not at put time",
+    "not at put",
+    "not on put",
+    "not at write time",
+    "not at upload",
+    "would return 201",
+    "would still return 201",
+    "still returns 201",
+    "returns 201 instead",
+    "201 instead of 400",
+    "201 rather than 400",
+    "cannot pass as planned",
+    "can't pass as planned",
+    "cannot pass under this plan",
+    "will fail as planned",
+    "would fail as planned",
+    "fails as planned",
+    "unsatisfiable as planned",
+    "not satisfiable as planned",
+    "unreachable from the put",
+    "unreachable from put",
+    "check is unreachable",
+    "never reaches the put",
+    "put path never",
+    "put handler never",
+    "put handler does not",
+    "put handler doesn't",
+    "handler never calls",
+    "handler does not call",
+    "handler doesn't call",
+    "handler never runs",
+    "handler does not run",
+    "upload path never",
+    "upload handler never",
+    "upload route never",
+    "at evaluation, not"
+  ],
+  "attribution_phrases": [
+    "returns http 400",
+    "put /flags/{key} with a body",
+    "that rule's id"
+  ],
+  "defect_phrases": [
+    "flagdef.check",
+    "rollout none",
+    "targeting rule"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-put-none-with-rules-400 cannot pass as planned: the PUT /flags/{key} handler only validates against the schema and stores the body, and no step wires flagdef.Check into it, so the request returns 201."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-put-none-with-rules-400: flagdef.Check runs only when the evaluator loads a definition, not at PUT time; internal/api/flags.go is not in scope, so the PUT would return 201 instead of 400."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion that PUT /flags/{key} returns HTTP 400 for a rollout-none body with rules is unreachable from the PUT handler: it never calls flagdef.Check."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-put-none-with-rules-400 depends on a check that is not wired into the handler; the rejection happens only at evaluation, so the definition would still be stored."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-put-none-with-rules-400 expects a 400 from PUT, but the risks say the PUT handler does schema validation only; flagdef.Check is never called on that path."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-put-none-with-rules-400 should also assert the error body names only the first offending rule, not every rule."
+    },
+    {
+      "category": "risk",
+      "note": "ac-put-none-with-rules-400 is ambiguous about which rule id to name when two rules are present: naming the first is unjustified."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document ErrRulesUnderNone in the flagdef package README."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-none-serves-default: add an evaluator test with a percentage rollout for contrast."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Existing definitions without a rollout key default to percentage; confirm the evaluator reads an absent key that way."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Approach step 2 adds ErrRulesUnderNone beside the duplicate-rule-id check; give both errors a shared prefix."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-put-none-with-rules-400: use two rules in the test body and assert the error names r-1."
+    }
+  ]
+}

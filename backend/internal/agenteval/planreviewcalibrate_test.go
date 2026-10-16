@@ -74,13 +74,16 @@ func TestCalibrationBandFor_InclusiveBounds(t *testing.T) {
 
 // TestCalibrate_BandVerdicts drives the REAL architect arm (committed persona
 // corpus, real docs, production persona builder) with a per-case scripted
-// sender: below 30%, exactly 30%, exactly 80% and above 80% on the three catch
+// sender: below 30%, exactly 30%, exactly 80% and above 80% on the six catch
 // cases across two runs, and a clean case's false-alarm rate with band n/a.
 func TestCalibrate_BandVerdicts(t *testing.T) {
 	const (
 		admission  = "adr006-production-migrate-down"
 		superseded = "adr091-merge-without-review-coverage"
 		undeclared = "undeclared-cross-component-direction"
+		roleLease  = "adr040-superseded-operator-role-reliance"
+		inlineSQL  = "adr002-inline-sql-bypasses-sqlc"
+		frozenMaj  = "adr046-required-field-in-frozen-major"
 		cleanSQLC  = "clean-sqlc-query-cli"
 	)
 	for _, run := range []struct {
@@ -90,13 +93,13 @@ func TestCalibrate_BandVerdicts(t *testing.T) {
 	}{
 		{
 			name: "below, lower bound, above",
-			hits: map[string]int{admission: 2, superseded: 3, undeclared: 9, cleanSQLC: 1},
-			want: map[string]CalibrationBand{admission: CalibrationBelow, superseded: CalibrationInBand, undeclared: CalibrationAbove},
+			hits: map[string]int{admission: 2, superseded: 3, undeclared: 9, roleLease: 3, inlineSQL: 10, frozenMaj: 0, cleanSQLC: 1},
+			want: map[string]CalibrationBand{admission: CalibrationBelow, superseded: CalibrationInBand, undeclared: CalibrationAbove, roleLease: CalibrationInBand, inlineSQL: CalibrationAbove, frozenMaj: CalibrationBelow},
 		},
 		{
 			name: "upper bound and mid band",
-			hits: map[string]int{admission: 8, superseded: 5, undeclared: 3, cleanSQLC: 1},
-			want: map[string]CalibrationBand{admission: CalibrationInBand, superseded: CalibrationInBand, undeclared: CalibrationInBand},
+			hits: map[string]int{admission: 8, superseded: 5, undeclared: 3, roleLease: 8, inlineSQL: 4, frozenMaj: 6, cleanSQLC: 1},
+			want: map[string]CalibrationBand{admission: CalibrationInBand, superseded: CalibrationInBand, undeclared: CalibrationInBand, roleLease: CalibrationInBand, inlineSQL: CalibrationInBand, frozenMaj: CalibrationInBand},
 		},
 	} {
 		t.Run(run.name, func(t *testing.T) {
@@ -107,8 +110,8 @@ func TestCalibrate_BandVerdicts(t *testing.T) {
 			if cal.Arm != ArmArchitect || cal.Kind != CatchRateArmKindPersona || cal.SamplesPerCase != 10 {
 				t.Errorf("calibration header = %q/%q/%d, want architect/persona/10", cal.Arm, cal.Kind, cal.SamplesPerCase)
 			}
-			if len(cal.Cases) != 6 {
-				t.Fatalf("calibrated %d cases, want the 6 committed architect cases", len(cal.Cases))
+			if want := len(loadCommittedPersona(t)); len(cal.Cases) != want {
+				t.Fatalf("calibrated %d cases, want the %d committed architect cases", len(cal.Cases), want)
 			}
 			var wantOOB []string
 			for _, cc := range cal.Cases {

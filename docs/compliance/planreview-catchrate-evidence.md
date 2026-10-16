@@ -58,6 +58,21 @@ batch rule that re-pin is the ONE combined operator re-recording made after
 every batched catch-rate trigger change (#3930, #4402, #4453, #4326, #4400)
 has merged; until then the refusal is by design. #4326 leaves `evidence.json`
 and `evidence.trials.json` untouched.
+
+**E55.26 / #4453 grows both corpora with CANDIDATE cases.** The conventions
+arms go from 13 cases to 18, so `samples_per_case` drops from 11 to 8
+(`SamplesPerCaseForPower(18)`, 144 trials per arm). The architect corpus goes
+from 6 cases to 9 (six catch, three clean), still at 46 samples per case. The
+2026-10-15 combined pin is therefore not comparable for the conventions and
+architect arms. Under the campaign's batch rule there is NO re-pin on #4453's
+branch, and the merge is not held for one. The operator calibrates the
+candidates at the PR head (Step 1d), routes any rework or cut through a
+fix-up, and re-pins later in the ONE combined re-recording after #3930,
+#4402, #4453, #4326 and #4400 have all merged. Until then `catchrategate`
+reads stale on main, by design. #4453 leaves `evidence.json` and
+`evidence.trials.json` untouched. Step 1d ran on 2026-10-16 at head
+`18a3ad31`: no candidate was cut, and all eight are kept as a documented
+CEILING, a partial delivery (Step 1d "Results").
 #2245 shipped the measurement APPARATUS and the offline gate; the measurement
 is the operator's recording:
 
@@ -113,12 +128,15 @@ scripts/test single -run 'TestLoadPlanReviewCatch|TestCatchRateArms' ./backend/i
 Every corpus case needs a hand-curated `review_input.json` (shape, the
 attribution-AND-probe catch rule and the loader's fail-closed modes:
 `backend/internal/agenteval/README.md` § "Corpus authoring"). The corpus
-holds fifteen cases as of #4361 (`seed-synthetic-*`, two or more per weak
-class: #4253's twelve plus #4361's three subtler mid-difficulty cases that
-calibrated in band; Step 1c's results record the three cut at the ceiling).
+holds eighteen cases as of #4453, all `seed-synthetic-*`, two or more per
+weak class. Thirteen are kept cases: #4253's twelve plus the one #4361 case
+that calibrated in band (Step 1c's results record the five cut). Five are
+#4453 cases (`seed-synthetic-realmiss-*`), kept at the ceiling after Step 1d
+(a partial delivery; Step 1d "Results").
 
-The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`,
-six SYNTHETIC cases: three catch, three clean) loads against the REAL
+The architect arm's corpus (`testdata/planreview-persona-corpus/architect/`)
+holds nine SYNTHETIC cases: six catch and three clean. Three of the catch
+cases are #4453 cases, kept at the ceiling after Step 1d. The corpus loads against the REAL
 `docs/review/architect-remit.md` and `docs/adr/index.json` of the checkout;
 its schema and fail-closed loader modes are in the agenteval README §
 "The arms":
@@ -144,8 +162,8 @@ Run it on the PR branch (the implement agent cannot call the model) and post
 the logged markdown table as a PR comment (a fix-up pass cannot edit the PR
 body). The test FAILS when any catch case is out of band: rework that case
 through a routed fix-up before merge rather than cutting it (the corpus
-checks require every kind). Cost: 6 cases x 10 samples = 60 persona-prompt
-calls (each prompt ~60 KB: index, remit and plan-review prompt). At 10 samples
+checks require every kind). Cost: 9 cases x 10 samples = 90 persona-prompt
+calls since #4453 (each prompt ~60 KB: index, remit and plan-review prompt). At 10 samples
 a case's rate has a wide sampling interval; a case at a bound is a candidate
 for rework, not a verdict. The default is now 30 samples per case (10 proved
 too noisy, #4314).
@@ -385,6 +403,132 @@ step for it. Then re-pin through Step 2 ("The #4361 recording") and, after
 the recording lands, run `(cd backend && go run ./internal/agenteval/catchrategate --rescore)`
 so the Results row reports the scored rate next to the attribution-only rate
 (#4355 approval condition C3).
+
+## Step 1d — calibrate the #4453 candidates
+
+E55.26 / #4453 adds eight CANDIDATE cases. Five are conventions-arm cases:
+three reconstructed from real class-3 plan-review misses, and two derived
+from recorded repository lessons. Three are architect persona cases. The
+README's § "Corpus authoring" names each one and its source.
+
+**Batch rule (approval condition 1).** There is no re-pin on #4453's branch,
+and the merge is not held for one. Run this step at THIS PR's head, as a
+subset dry run (TRIALS=30). Route any out-of-band rework or cut through a
+fix-up. The re-pin comes later, in the ONE combined operator re-recording
+after every batched catch-rate trigger change (#3930, #4402, #4453, #4326,
+#4400) has merged; Step 2 runs it, with a `PIN_REASON` naming #4453 among the
+others. Until it lands, `catchrategate` reads stale on main, by design.
+
+**The subset command (390 calls).** It names all eight candidate
+directories. The subset knob takes any arm's case directory names, and an arm
+none of whose cases is named does not run (`CatchRateSubset.forRow` in
+`backend/internal/agenteval/planreviewdiag.go`). The count is 5 conventions
+cases x 2 arms x 30 trials = 300 plan-review calls, plus 3 architect cases x
+30 trials = 90 persona calls. That is 390 calls, about 2.2 h at roughly 20 s
+per call, so the timeout is 3 h:
+
+```sh
+FISHHAWK_AGENTEVAL_PLANREVIEW_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_CASES=seed-synthetic-realmiss-guard-off-upload-route,seed-synthetic-realmiss-pairing-rule-off-upload-route,seed-synthetic-realmiss-deferred-surface-conjunct,seed-synthetic-realmiss-criterion-needs-forbidden-path,seed-synthetic-realmiss-criterion-needs-unwritable-pr-body,adr040-superseded-operator-role-reliance,adr002-inline-sql-bypasses-sqlc,adr046-required-field-in-frozen-major \
+  FISHHAWK_AGENTEVAL_PLANREVIEW_TRIALS=30 \
+  scripts/test single -v -timeout 3h -run TestPlanReviewCatchRateLive ./backend/internal/agenteval/
+```
+
+**The architect fallback (270 calls).** Use it if the subset run does not
+reach the persona cases. It is the Step 1b calibration dry run over the
+WHOLE architect corpus: 9 cases x 30 samples = 270 persona calls, about
+1.5 h at roughly 20 s per call, so the timeout is 2 h. It also re-measures
+the six existing cases, and it FAILS when any catch case is out of band,
+existing ones included. Read its table, not its exit status. In that case,
+drop the three `adr*` names from the subset command above, which leaves 300
+calls.
+
+```sh
+FISHHAWK_AGENTEVAL_CALIBRATE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  FISHHAWK_AGENTEVAL_CALIBRATE_ARM=architect FISHHAWK_AGENTEVAL_CALIBRATE_SAMPLES=30 \
+  scripts/test single -v -timeout 2h -run 'TestCatchRateCalibrationLive$' ./backend/internal/agenteval/
+```
+
+**Band rule.** A candidate is in band when it is caught in 30%–80% of its
+trials (both bounds inclusive) in at least one arm. For a conventions case
+that means either conventions arm; for an architect case, the architect arm.
+The target is 40%–70%.
+
+**In band ONLY on `not_mentioned` reviewer misses** (the issue comment's
+2026-10-15 re-ruling). Read each missed trial's `miss_class` and its
+`raw_concerns` with Step 1c's three `jq` reads, then apply Step 1c's
+miss-class rules. A case whose in-band rate is made of `unattributed`,
+`no_probe` or `category_mismatch` scoring misses is not accepted as measured.
+On the architect arm, `category_mismatch` (both halves matched under a label
+other than `decision_record`) is a scoring miss like the other two. Rework
+such a case by widening its probes or phrases, then read its honest rate as
+Step 1c does. A case at 0% or 100%, or one whose honest rate leaves the
+band, is reworked or cut. The issue requires at least 5 KEPT candidates. If
+fewer survive, the Captain rules on a partial delivery, as for #4361.
+
+**What a cut or rework obliges, in the same routed fix-up:**
+
+- Set `committedSyntheticCatchCaseFloor` in
+  `backend/internal/agenteval/planreviewcatch_test.go` to the KEPT seed count.
+  #4453 raised it from 13 to 16 for the three real-miss cases. The floor is a
+  lower bound, so until this fix-up the per-case hygiene tests are the only
+  guard on the two lesson-derived cases: deleting one leaves the floor
+  satisfied. With 18 seeds against 16 the slack is two, so the floor does not
+  catch the deletion of any single case until this fix-up. The 2026-10-16
+  fix-up cut nothing and, under the Captain's instruction not to touch the
+  floor beyond what the tests need, left it at 16 (see "Results").
+- Update the case counts in the agenteval README (§ "The arms", its file
+  table) and in Step 1 above. Every cut conventions case changes
+  `SamplesPerCaseForPower(n)`.
+- Fill the results table below. Do that through the fix-up or an operator
+  commit, NOT the PR body: a fix-up pass cannot edit the PR body.
+- Add a "Calibration dry runs" row (§ "Results").
+- The re-pin is NOT part of this fix-up: it waits for the combined recording.
+
+**Results (2026-10-16, head `18a3ad31`).** 30 trials per case and arm, both
+conventions arms and the architect arm. Raw scored catches and miss classes,
+then the honest rate (every miss transcript read) and the outcome:
+
+| case | arm | scored | misses | honest | outcome |
+|---|---|---|---|---|---|
+| seed-synthetic-realmiss-guard-off-upload-route | with / without | 30/30 / 30/30 | none | ceiling | KEPT (ceiling) |
+| seed-synthetic-realmiss-pairing-rule-off-upload-route | with / without | 30/30 / 30/30 | none | ceiling | KEPT (ceiling) |
+| seed-synthetic-realmiss-deferred-surface-conjunct | with / without | 19/30 / 17/30 | no_probe 11 / 13 | ~30/30 / ~30/30 | KEPT (ceiling), probes widened |
+| seed-synthetic-realmiss-criterion-needs-forbidden-path | with / without | 15/30 / 14/30 | no_probe 15 / 16 | ~30/30 / ~30/30 | KEPT (ceiling), probes widened |
+| seed-synthetic-realmiss-criterion-needs-unwritable-pr-body | with / without | 28/30 / 30/30 | no_probe 2 / none | ~30/30 / ceiling | KEPT (ceiling) |
+| adr040-superseded-operator-role-reliance | architect | 29/30 | undecodable 1 | ~30/30 | KEPT (ceiling) |
+| adr002-inline-sql-bypasses-sqlc | architect | 30/30 | none | ceiling | KEPT (ceiling) |
+| adr046-required-field-in-frozen-major | architect | 29/30 | undecodable 1 | ~30/30 | KEPT (ceiling) |
+
+- All 57 conventions-arm misses were `no_probe`, and every one is a real
+  attributed catch. The two architect misses were undecodable responses.
+- 0 of the 5 conventions cases is in band on `not_mentioned` misses, against
+  the issue's bar of 5 or more. This is a PARTIAL DELIVERY: the cases are
+  kept as a documented CEILING (honest rate about 30/30), per Captain ruling
+  2026-10-16.
+- The probes were widened on the two cases with `no_probe` misses
+  (`deferred-surface-conjunct`, `criterion-needs-forbidden-path`) so the
+  scored rate matches the honest one. Each widening is pinned by a catching
+  example that only the new probes match (loader mode k). `forbidden-path`
+  also dropped `is forbidden` and `off-limits`, which never matched and are
+  reachable by unrelated notes. Each `case.md` records its widening.
+- `unwritable-pr-body`: reviewers led with the planted description-surface
+  defect ("cannot edit the pr description", 25-26/30). The "later-job files"
+  adjacency an implement-review low raised did not displace it, so the case
+  is kept unchanged.
+- The combined batch re-recording rescores everything (batch rule: no re-pin
+  on this branch). Until it lands, `catchrategate` reads stale on main, by
+  design.
+- The cause: the reconstructed plans are obviously flawed overall. 300/300
+  conventions trials returned `reject`, with about 4.3 concerns each, so the
+  planted defect is never subtle.
+- A follow-up plants cases into real approved plans (follow-up filed by
+  operator).
+- No case was cut, so the case counts above are unchanged. The fix-up left
+  `committedSyntheticCatchCaseFloor` at 16 under the Captain's instruction not
+  to touch it beyond what the tests need. The slack of two therefore stands,
+  and the per-case hygiene tests remain the only guard against deleting a
+  single seed case.
 
 ## Step 2 — run the arms
 
@@ -779,3 +923,4 @@ harder security catch cases".
 | 2026-10-14 | `security` | 30 | re-calibration after the clean-case rework: all four clean cases 0/30 FA; six catch cases 30/30 (ceiling, accepted) | operator dry run (head `f691917a`) |
 | 2026-10-14 | `security_portability` | 30 | re-calibration after the clean-case rework: clean-auth 1/30 (undecodable), clean-policy-test-only 2/30, clean-ci and clean-redaction 0/30 | operator dry run (head `f691917a`) |
 | 2026-10-15 | `without_conventions` + `with_conventions` (#4361, Step 1c) | 30 | three cases at the ceiling (100%/100%) and two in band only on scoring misses (honest rate ~100%) were cut by Captain ruling 2026-10-15; restates-approach-observable is in band on reviewer misses, honest 13/30 with and 16/30 without (Step 1c "Results"); harder cases continue in #4453 | Step 1c "Results" (head `23a9dee4`, re-scored at the operator commit) |
+| 2026-10-16 | `without_conventions` + `with_conventions` + `architect` (#4453, Step 1d) | 30 | 0 of 5 conventions cases in band on `not_mentioned` misses (bar: 5): all 57 misses `no_probe`, each a real catch (honest ~30/30); architect adr002 30/30, adr040 and adr046 29/30 (1 undecodable each). All eight kept as a documented CEILING by Captain ruling 2026-10-16 (partial delivery); probes widened on deferred-surface-conjunct and criterion-needs-forbidden-path; the combined batch re-recording rescores them | Step 1d "Results" (head `18a3ad31`) |

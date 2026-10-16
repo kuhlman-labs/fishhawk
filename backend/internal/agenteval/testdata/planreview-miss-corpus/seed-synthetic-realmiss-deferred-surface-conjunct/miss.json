@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000445303",
+  "artifact_id": "00000000-0000-0000-0001-000000445303",
+  "triage_sequence": 122,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed conjunctive criterion demands a surface the plan itself defers (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-drops-audited-and-emailed",
+      "statement": "An import that drops rows appends one import_rows_dropped audit entry listing each dropped row number with its drop reason, and the import owner's import-complete email names the dropped row numbers.",
+      "source": "inferred",
+      "rationale": "The issue requires every dropped row to be recorded so the owner can learn what did not make it in; owners already read the import-complete email, so the dropped rows should reach them there as well.",
+      "observed": "the import of a fixture file with rows 7 and 12 malformed appended one import_rows_dropped entry listing both rows with their reasons, but the owner's import-complete email carried only the stored row count: the change recorded drops in the audit log only, as the plan's own deferral said",
+      "expected": "the audit entry AND an import-complete email naming rows 7 and 12",
+      "steps_taken": "imported the fixture file, read the audit log, then read the captured import-complete email",
+      "expectation_basis": "criterion ac-drops-audited-and-emailed",
+      "repro_handle": "curl -s -F file=@rows-7-12-malformed.csv $TARGET/imports && curl -s $TARGET/audit?category=import_rows_dropped",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

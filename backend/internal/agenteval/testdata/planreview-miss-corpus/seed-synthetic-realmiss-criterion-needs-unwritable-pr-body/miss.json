@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000445305",
+  "artifact_id": "00000000-0000-0000-0001-000000445305",
+  "triage_sequence": 124,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion demands a surface the plan's own delivery mechanism cannot write (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-results-table-in-description",
+      "statement": "The pull request description carries the measured size and SSIM table for every preset, old and new values side by side, before the change is approved.",
+      "source": "inferred",
+      "rationale": "The issue says reviewers must see the measured numbers for every preset before they approve, and reviewers read the pull request description first.",
+      "observed": "the pull request description carries only the plan summary written when the pull request opened; the media runner job pushed bench/results/presets.md with the full table to the branch, but its contents-only token could not edit the description; the criterion failed",
+      "expected": "a criterion observing a surface the delivery mechanism can write, such as the committed bench/results/presets.md",
+      "steps_taken": "read the pull request description at the head commit, then read bench/results/presets.md on the branch",
+      "expectation_basis": "criterion ac-results-table-in-description",
+      "repro_handle": "gh pr view --json body --jq .body | grep -c SSIM",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}
