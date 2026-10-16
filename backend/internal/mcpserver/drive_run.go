@@ -256,7 +256,7 @@ type DriveRunInput struct {
 	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path) Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
-	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH"`
+	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	MaxMinutes   int    `json:"max_minutes,omitempty" jsonschema:"wall-clock budget in minutes for this drive; clamped to [1,240], default 60. Every return is resumable by re-invoking with the same run_id"`
 }
 
@@ -429,6 +429,13 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
 		return nil, DriveRunOutput{}, cerr
 	}
+	// runner_binary is refused over HTTP (E66.64 / #4476), here — ahead of
+	// every backend read and the loop's first act — so the refusal commits
+	// nothing. It also covers an injected driveSpawn seam, which skips the
+	// resolveRunnerBinary chokepoint below.
+	if rerr := r.refuseHTTPRunnerBinary(in.RunnerBinary); rerr != nil {
+		return nil, DriveRunOutput{}, rerr
+	}
 
 	baseBranch := in.BaseBranch
 	if baseBranch == "" {
@@ -459,7 +466,7 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 	binary := in.RunnerBinary
 	if spawn == nil {
 		spawn = spawnRunnerStageDetached
-		binary, err = resolveRunnerBinary(in.RunnerBinary, r.getenv)
+		binary, err = r.resolveRunnerBinary(in.RunnerBinary)
 		if err != nil {
 			return nil, DriveRunOutput{}, err
 		}
