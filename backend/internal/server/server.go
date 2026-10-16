@@ -915,6 +915,18 @@ type Config struct {
 	// backend/internal/concurrency/README.md.
 	Concurrency concurrency.Store
 
+	// HostAdmissionHold is the optional, default-off INTERIM dispatch hold
+	// (E85.11 / #4330): while it reads held, the host-dispatch marker
+	// refuses every NEW admission — a stage at pending OR
+	// awaiting_host_dispatch — with 409 host_memory_pressure and commits no
+	// transition; the already-dispatched idempotent arm and every in-flight
+	// stage are untouched. Wired from serve.go only under
+	// --enable-ops-monitor --ops-monitor-dispatch-hold on a local deployment
+	// (the same *opsmonitor.AdmissionHold the ops monitor ticker updates);
+	// nil keeps the marker byte-identical. ADR-100's adaptive concurrency
+	// controller absorbs it. See host_dispatch.go.
+	HostAdmissionHold HostAdmissionHold
+
 	// SpecialistJobs is the ADR-097 D2/D6 specialist-job store (E85.9 /
 	// #4300) behind the /v0/specialist-jobs routes. Wired from serve.go next
 	// to Concurrency (specialistjob.NewStore); nil answers every route 503

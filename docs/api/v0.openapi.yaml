@@ -16744,6 +16744,18 @@ paths:
         stages and a daemon with no slot store are unchanged. Audit:
         `stage_concurrency_queued` (once per queue episode) and
         `stage_concurrency_admitted` (every grouped admission).
+
+        **Interim host memory hold (E85.11 / #4330).** Optional and default
+        off; INTERIM, absorbed later by ADR-100's adaptive concurrency
+        controller. With `fishhawkd serve --enable-ops-monitor
+        --ops-monitor-dispatch-hold` on a local deployment, while the ops
+        monitor's memory probe reads CRITICAL pressure, every NEW admission —
+        a `pending` or `awaiting_host_dispatch` stage — answers 409
+        `host_memory_pressure`. It is checked after every guard above and
+        BEFORE the CAS and the slot admission, so it commits no transition
+        and no queue row. The idempotent already-`dispatched` arm is never
+        refused and nothing in flight is touched. A hold the ops monitor has
+        not refreshed for 3 x its interval reads not held.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -16822,7 +16834,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            One of four refusals, or the concurrency queue answer:
+            One of five refusals, or the concurrency queue answer:
 
             - `concurrency_slot_queued` (#3964 / ADR-087) — NOT a refusal: the
               grouped stage is queued FIFO for a concurrency slot and its state
@@ -16905,6 +16917,16 @@ paths:
               stage keeps its state. Do not retry blindly: wait for the fan-in
               to cover every child (`fishhawk_await_children` names a stuck
               child and its recovery), then re-dispatch.
+            - `host_memory_pressure` — the interim host memory hold (E85.11 /
+              #4330, default off): the ops monitor reads CRITICAL host memory
+              pressure, so a `pending` or `awaiting_host_dispatch` stage is
+              not admitted. `details` carries `stage_id`, `state`, `reason`
+              (the probe's observed numbers) and `retry` (`re-dispatch once
+              the ops monitor clears the condition`). Fires BEFORE the CAS and
+              the slot admission, so the stage keeps its state and no queue
+              row is written; unlike `concurrency_slot_queued` it carries no
+              `Retry-After`, so a slot waiter stops and the operator
+              re-dispatches once the condition clears.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
