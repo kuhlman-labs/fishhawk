@@ -405,6 +405,19 @@ type runResponse struct {
 	// refuse up front. Populated by handleGetRun ONLY, audit-first with no forge
 	// call, best-effort (a read error warn-logs and omits the block).
 	MergeCandidateRerun *runMergeCandidateRerunPayload `json:"merge_candidate_rerun,omitempty"`
+	// MergeCandidateStaleness is the read-time staleness of an open
+	// decomposed parent's consolidated PR head against its base tip (E85.4 /
+	// #4147): fresh | stale | undetermined (a failed forge read is
+	// undetermined, never fresh), with next_step fishhawk_rebase_run_branch on
+	// stale. Populated by handleGetRun ONLY — the list endpoint never computes
+	// it. Unlike merge_candidate_rerun it reads the forge: up to three GETs
+	// per (run, chain-recorded head) per 60s cache entry once stored, each
+	// computation under a 5s deadline, and only for a non-terminal decomposed
+	// parent with a pull request; concurrent first misses may each read (no
+	// singleflight). Best-effort: a children-list or chain-head read error
+	// warn-logs and omits the block, never failing the read. See
+	// mergeCandidateStalenessFor.
+	MergeCandidateStaleness *mergeCandidateStalenessPayload `json:"merge_candidate_staleness,omitempty"`
 }
 
 // runMergeCandidateQueuePayload is the ADR-092 queue entry projection shared by
@@ -2406,6 +2419,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			"run_id", runID.String(), "error", rerr.Error())
 	} else {
 		resp.MergeCandidateRerun = rerun
+	}
+	// Merge-candidate staleness (E85.4 / #4147): single-run read ONLY,
+	// best-effort with the same posture as merge_candidate_rerun.
+	if stale, serr := s.mergeCandidateStalenessFor(r.Context(), got); serr != nil {
+		s.cfg.Logger.Warn("read merge-candidate staleness failed; omitting merge_candidate_staleness",
+			"run_id", runID.String(), "error", serr.Error())
+	} else {
+		resp.MergeCandidateStaleness = stale
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
