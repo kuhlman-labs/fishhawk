@@ -455,7 +455,11 @@ func sortedKeysOf(m map[string]bool) []string {
 // absorbRerunRefusal names why a scoped absorb re-run did not absorb:
 // rerun_failed when it executed and exited non-zero on a judged tree,
 // rerun_not_executed otherwise (skipped clone, refusal, unavailable, timeout,
-// a verify-lock refusal).
+// an exit-75 temporary failure (gateTempFail), or a verify-lock refusal —
+// exit 73 (gateLockRefused), with the #3948 text classifier kept as the
+// fallback until every gate site produces the disposition). The
+// `disp == gateExecuted` conjunct is what keeps both exit-code dispositions
+// out of rerun_failed: neither judged the tree.
 func absorbRerunRefusal(outcome string, disp gateDisposition, out string) string {
 	if outcome == "failed" && disp == gateExecuted && !isVerifyLockContended(out) {
 		return absorbRefusedRerunFailed
