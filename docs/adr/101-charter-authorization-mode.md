@@ -4,8 +4,9 @@ title: "Charter authorization mode: lease-based, bounded autonomous operation by
 status: accepted
 date: 2026-10-14
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4412
-supersedes: ["ADR-040", "ADR-089", "ADR-097"]
+supersedes: []
 superseded_by: []
+amends: ["ADR-040", "ADR-089", "ADR-097"]
 applies_to: []
 ---
 

@@ -40,10 +40,14 @@ editorial act.
   a valid YAML double-quoted scalar); a bare token matching
   `^[A-Za-z0-9][A-Za-z0-9._:/#-]*$`; or, for list keys, a JSON array of strings.
 - Known keys: `id`, `title`, `status`, `date`, `issue`, `supersedes`,
-  `superseded_by`, `applies_to`. Unknown and duplicate keys are violations.
-- Required: every key except `date`. List keys (`supersedes`, `superseded_by`,
-  `applies_to`) are present even when empty (`[]`), and must be lists; the
-  other keys must be scalars.
+  `superseded_by`, `amends`, `amended_by`, `applies_to`. Unknown and duplicate
+  keys are violations.
+- Required: every key except `date`, `amends` and `amended_by`. The required
+  list keys (`supersedes`, `superseded_by`, `applies_to`) are present even
+  when empty (`[]`). `amends` and `amended_by` are OPTIONAL list keys: absent
+  means `[]`, so only a record that states an amendment carries them, written
+  after `superseded_by`. Every list key must be a list; the other keys must be
+  scalars.
 - `date` is optional and, when present, a real `YYYY-MM-DD` date.
 
 ## Field semantics
@@ -56,6 +60,7 @@ editorial act.
 | `date` | The date the Decision section or its heading states (`Recorded 2026-04-30`, `Accepted (2026-07-26)`, `Decided 2026-06-09`, `## Decision (2026-05-19)`, `Resolved on 2026-05-26`). Omitted when none is stated. A separate Resolution section's or an implementation-landed date is NOT a decision date. |
 | `issue` | The tracker issue URL the body is transcribed from. |
 | `supersedes` / `superseded_by` | ADR ids, only when a source STATES the supersession. Reciprocal: `A.supersedes ∋ B ⇔ B.superseded_by ∋ A`. Every id must name an existing record other than itself, so a link to a not-yet-backfilled ADR is impossible by construction — the batch that backfills the superseding record adds both sides. |
+| `amends` / `amended_by` | ADR ids, only when a source STATES an amendment of that record and states no supersession of it (E78.13 / #4471). Reciprocal: `A.amends ∋ B ⇔ B.amended_by ∋ A`, and a record without the key reads `[]`. Every id must name an existing record other than itself. An amended record still governs, except where an amendment decides otherwise; it is not superseded and keeps its status. **Precedence:** a source that states BOTH an amendment and a supersession (even partial) of the same ADR is encoded as `supersedes` only, and one id never appears in both relations of one record (`supersedes` + `amends`, `superseded_by` + `amended_by`). This rule is the operator's decision, ratified in the #4471 plan approval (condition 5), not something the issue implies. |
 | `applies_to` | Repository path globs the decision governs (see below). |
 
 ### Status inference rule (fail-closed)
@@ -130,8 +135,13 @@ record:
 }
 ```
 
-`path` is repo-relative. The gate compares the index to the records
-semantically, keyed by path: a record with no entry, an entry naming no record
+`path` is repo-relative. `amends` / `amended_by` are optional entry fields,
+written by `--write-index` ONLY when non-empty, between `superseded_by` and
+`applies_to`, so the records without an amendment cost the index no bytes
+against its 32,768-byte injection cap (always-present keys would add ~4 KB
+and truncate it). An absent optional field means `[]` to the gate and to
+`backend/internal/decisionrecord`'s strict parser alike. The gate compares the
+index to the records semantically, keyed by path: a record with no entry, an entry naming no record
 file, or an entry field disagreeing with the front matter each fail verify.
 Never hand-edit it — regenerate with:
 
@@ -192,8 +202,9 @@ one, never in batches:
   that records the ratification, or in the change immediately after.
 - The adding change regenerates `index.json` (`scripts/check-adr
   --write-index`), adds the row under "Records" below and, when the new ADR
-  states a supersession, edits the superseded record's `superseded_by` (front
-  matter only) in the same change.
+  states a supersession, edits the superseded record's `superseded_by` — or,
+  when it states an amendment and no supersession, the amended record's
+  `amended_by` — (front matter only) in the same change.
 - A record whose status the inference rule leaves `unknown` adds a bullet to
   "Status unknown" below, quoting its source verbatim.
 - Until its record lands, an ADR is read from the tracker (`gh issue list
@@ -230,6 +241,87 @@ successors, so the 11 records that supersede another were re-read against the
 A path named only in a Recommendation that a Decision adopts "as written"
 (ADR-096, ADR-099) does not count under the current rule; widening the rule to
 count it is an operator decision.
+
+Since E78.13 / #4471, ADR-095 is encoded as an AMENDMENT of ADR-091, not a
+supersession, and selection follows amendments (`amended_by`) as it follows
+successors, so the same `applies_to` reasoning covers the amending records
+below.
+
+### Amendment relation (E78.13 / #4471)
+
+The record had no amends relation, so ADR-095, ADR-100 and ADR-101 encoded a
+stated amendment as `supersedes`, against the "only when a source STATES the
+supersession" rule. They now carry `amends` (front matter only; no body
+touched):
+
+- ADR-095: `amends: [ADR-091]` ("This amends ADR-091 D6 and leaves D6 itself
+  unchanged"); ADR-091 `superseded_by: []`, `amended_by: [ADR-095]`.
+- ADR-100: `amends: [ADR-087, ADR-094]` ("explicit amendments to
+  ADR-087/094"; "ADR-087: amends its ... rule", "ADR-094: amends D4 ... and
+  Q1"); ADR-087 keeps `superseded_by: [ADR-094]` and gains `amended_by:
+  [ADR-100]`; ADR-094 `superseded_by: []`, `amended_by: [ADR-100]`.
+- ADR-101: `amends: [ADR-040, ADR-089, ADR-097]` ("ADR-040: amended",
+  "ADR-089: amended for charter only", "ADR-097: amended for charter only");
+  ADR-040, ADR-089 and ADR-097 drop ADR-101 from `superseded_by` and list it
+  in `amended_by`.
+- Added by the audit: ADR-097 `amends: [ADR-040, ADR-089]`. Its Relations
+  section states "Amends ADR-089 (#4149) D1 and ADR-040 (#997)", its Q4 asks
+  whether it amends both "without superseding either", and it states no
+  supersession. ADR-040 and ADR-089 therefore carry `amended_by: [ADR-097,
+  ADR-101]`.
+- NOT encodable: ADR-101's "ADR-085: amended". No ADR-085 record exists, and a
+  link must name an existing record; the change that backfills ADR-085 adds
+  both sides.
+
+Decision-record selection (`backend/internal/decisionrecord`) follows
+`amended_by` from a selected record to its amendments and ranks a
+still-governing amended record AHEAD of its amendments, so when the record
+budget cannot fit them all it drops amendments first and never keeps an
+amendment's body without the body of the record it amends (pinned on these
+records by `TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments`).
+
+Kept as supersession, because each source states a supersession (partial
+ones included) of that record, which takes precedence under the rule above:
+
+- ADR-031 → ADR-018: "Amends/supersedes the review-gate-resolution
+  *mechanism* of ADR-018".
+- ADR-061 → ADR-058: "Supersedes ADR-058's tenant definition."
+- ADR-076 → ADR-033: "This **supersedes ADR-033's gate**".
+- ADR-090 → ADR-043: "**This ADR partially supersedes ADR-043**".
+- ADR-092 → ADR-090: "**This ADR partially supersedes ADR-090:**".
+- ADR-093 → ADR-090, ADR-092: "**This ADR partially supersedes ADR-092** ...
+  **and ADR-090**".
+- ADR-094 → ADR-087: "This partially supersedes ADR-087".
+- ADR-096 → ADR-090: "This partially supersedes ADR-090 D2 (independent
+  deltas only) and D5 (fan-in base)".
+- ADR-098 → ADR-096: "**Supersession.** This amends ADR-096: D3 is replaced
+  by D1–D2 here". The borderline case: the source labels the relation
+  "Supersession" and states a replacement.
+- ADR-099 → ADR-080: "This partially supersedes ADR-080's vocabulary table".
+
+The audit scanned every record body for `amend*` and `supersed*`. Every
+record whose `amend*` wording sits in a sentence naming another ADR id, and
+its disposition:
+
+- ADR-031, ADR-076, ADR-092, ADR-094, ADR-096, ADR-098, ADR-099: amendment
+  wording beside a stated supersession of the same ADR → `supersedes` kept.
+  ADR-076's "provider discriminator per the ADR-057 amendment" names an
+  amendment WITHIN ADR-057's own history, not one ADR-076 makes → no edge.
+- ADR-032: "Amends the decomposition fan-out design (the per-child PR
+  behaviour that emerged from ADR-031 Phase 1)" → NO edge. It amends emergent
+  behaviour, not a decision ADR-031 states: ADR-031's body decides the
+  `github_merge` review-gate resolution and never mentions decomposition,
+  fan-out or per-child PRs.
+- ADR-095, ADR-097, ADR-100, ADR-101: stated amendment, no supersession of
+  that record → `amends` (above).
+- ADR-099's "Neither amended ADR-080's glossary" and ADR-100's "Precedent:
+  ADR-098 (... a new ADR amending an accepted one)" are context and citation
+  → no edge beyond ADR-099's kept supersession.
+
+The other records using `amend*` name no other ADR as the amended thing (a
+self-amendment section, an issue, a charter, `MVP_SPEC`, a scope amendment):
+ADR-039, ADR-040, ADR-042, ADR-053, ADR-061, ADR-062, ADR-063, ADR-066,
+ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 
 ## Records
 

@@ -302,6 +302,11 @@ func TestLoadPersonaCatchCorpus_FailClosed(t *testing.T) {
 		{"governing record superseded_by differs", catchRow(func(c map[string]any) {
 			c["governing_records"] = []any{map[string]any{"id": "ADR-033", "status": "accepted", "superseded_by": []any{"ADR-999"}}}
 		}), "governing record ADR-033: the case declares superseded_by [ADR-999]"},
+		// Status and superseded_by agree with the real index; only amended_by
+		// differs, so only the amended_by comparison can refuse it.
+		{"governing record amended_by differs", catchRow(func(c map[string]any) {
+			c["governing_records"] = []any{map[string]any{"id": "ADR-033", "status": "accepted", "superseded_by": []any{"ADR-076"}, "amended_by": []any{"ADR-999"}}}
+		}), "governing record ADR-033: the case declares amended_by [ADR-999], the real index says []"},
 		{"clean-only field on a catch case", catchRow(func(c map[string]any) { c["min_matched_records"] = 1 }), "a catch case must not carry clean-case fields"},
 		{"catch-only field on a clean case", cleanRow(func(c map[string]any) { c["catch_probes"] = []any{"x"} }), "a clean case must not carry catch-case fields"},
 		{"absent anchor", catchRow(func(c map[string]any) { delete(c, "anchor") }), "a catch case needs an anchor"},

@@ -20,17 +20,28 @@
 #   C-grammar        every front-matter line is `key: value`; known key; no
 #                    duplicate; scalar vs list type; date is YYYY-MM-DD
 #   C-required       id, title, status, issue, supersedes, superseded_by and
-#                    applies_to are present (status absence is C-status-present)
+#                    applies_to are present (status absence is C-status-present);
+#                    amends and amended_by are OPTIONAL list keys, absent = []
 #   C-file           every non-README *.md is named NNN-slug.md (else stray)
 #   C-id             id is ADR-NNN and equals 'ADR-' + the filename prefix
 #   C-status-set     a PRESENT status is in the closed set
 #   C-unique         ids are unique across records
-#   C-ref            every supersedes/superseded_by id names an existing
-#                    record other than the record itself
+#   C-ref            every supersedes/superseded_by/amends/amended_by id
+#                    names an existing record other than the record itself
 #   C-recip-fwd      A.supersedes ∋ B  =>  B.superseded_by ∋ A
 #   C-recip-rev      B.superseded_by ∋ A  =>  A.supersedes ∋ B
 #                    (both reciprocity checks skip targets C-ref rejects, so
 #                    C-ref is isolated)
+#   C-amend-recip-fwd  A.amends ∋ B  =>  B.amended_by ∋ A
+#   C-amend-recip-rev  B.amended_by ∋ A  =>  A.amends ∋ B
+#                    (E78.13 / #4471: both skip targets C-ref rejects, and both
+#                    read a partner WITHOUT the optional key as [] — unlike the
+#                    supersession pair, which skips a partner missing its
+#                    REQUIRED key because C-required already reports that)
+#   C-amend-exclusive  one record names the same id in supersedes AND amends,
+#                    or in superseded_by AND amended_by: a record cannot both
+#                    supersede and amend the same ADR (a stated supersession,
+#                    even partial, takes precedence — docs/adr/README.md)
 #   C-superseded     status superseded => non-empty superseded_by
 #   C-accepted       status accepted => SOME Decision section (a heading where
 #                    'Decision' starts the heading or a slash-separated part of
@@ -44,14 +55,20 @@
 #                    not the tail of a longer path (leading char not
 #                    [A-Za-z0-9_./-], except a '/' that itself starts a
 #                    root-anchored path, '`/cli/**`')
-#   C-index          index.json parses and has the adr-index-v1 shape; plus three
-#                    separate branches keyed by PATH: missing (record with no
-#                    entry), extra (entry naming no record file), stale (entry
-#                    field disagrees with the record's front matter)
+#   C-index          index.json parses and has the adr-index-v1 shape (every
+#                    entry carries exactly the required fields plus any subset
+#                    of the optional amends / amended_by); plus three separate
+#                    branches keyed by PATH: missing (record with no entry),
+#                    extra (entry naming no record file), stale (entry field
+#                    disagrees with the record's front matter; an optional
+#                    field reads absent = [] on BOTH sides)
 #
 # --write-index runs every record check (all but C-index); on any violation it
 # refuses with exit 1 and writes NOTHING. Otherwise it writes index.json
-# (records sorted by id) via a temp file + rename.
+# (records sorted by id) via a temp file + rename. The optional amends /
+# amended_by fields are written only when non-empty, between superseded_by and
+# applies_to, so the 86-odd records without an amendment cost the index no
+# bytes against its 32 KiB injection cap.
 #
 # EXIT CODES (mirroring scripts/check-site-ia): 0 = consistent, or a documented
 # fail-open with a printed reason (ADR_DIR does not exist; ADR_DIR holds no *.md
@@ -67,13 +84,20 @@ import re
 import sys
 
 KNOWN_KEYS = ("id", "title", "status", "date", "issue",
-              "supersedes", "superseded_by", "applies_to")
-LIST_KEYS = ("supersedes", "superseded_by", "applies_to")
+              "supersedes", "superseded_by", "amends", "amended_by",
+              "applies_to")
+LIST_KEYS = ("supersedes", "superseded_by", "amends", "amended_by",
+             "applies_to")
 REQUIRED_KEYS = ("id", "title", "status", "issue",
                  "supersedes", "superseded_by", "applies_to")
 STATUSES = ("proposed", "accepted", "rejected", "superseded", "unknown")
 INDEX_FIELDS = ("id", "title", "path", "status",
                 "supersedes", "superseded_by", "applies_to")
+# Optional adr-index-v1 fields (E78.13 / #4471): written only when non-empty,
+# and read absent = [] by the stale compare and by backend/internal/
+# decisionrecord's strict parser alike.
+OPTIONAL_INDEX_FIELDS = ("amends", "amended_by")
+LINK_KEYS = ("supersedes", "superseded_by", "amends", "amended_by")
 INDEX_SCHEMA = "adr-index-v1"
 
 FILENAME_RE = re.compile(r"^\d{3}-[a-z0-9]+(-[a-z0-9]+)*\.md$")
@@ -318,7 +342,7 @@ def check_records(records):
         return target in by_id and target != rec["fm"].get("id")
 
     for rec in parsed:
-        for key in ("supersedes", "superseded_by"):
+        for key in LINK_KEYS:
             for target in rec["fm"].get(key, []):
                 if target == rec["fm"].get("id"):
                     out.append((rec["file"], "C-ref",
@@ -359,6 +383,36 @@ def check_records(records):
                             "supersedes does not name '%s'"
                             % (target, other["name"], rid)))
 
+    # C-amend-recip-fwd / C-amend-recip-rev. The keys are OPTIONAL, so a partner
+    # WITHOUT the key reads as [] and is reported, never skipped.
+    for (key, partner_key, cls) in (("amends", "amended_by", "C-amend-recip-fwd"),
+                                    ("amended_by", "amends", "C-amend-recip-rev")):
+        for rec in parsed:
+            rid = rec["fm"].get("id")
+            for target in rec["fm"].get(key, []):
+                if not resolvable(rec, target):
+                    continue
+                other = by_id[target][0]
+                if rid not in other["fm"].get(partner_key, []):
+                    out.append((rec["file"], cls,
+                                "key '%s' names '%s', but %s's %s does not "
+                                "name '%s'"
+                                % (key, target, other["name"], partner_key,
+                                   rid)))
+
+    # C-amend-exclusive
+    for rec in parsed:
+        for (sup_key, amend_key) in (("supersedes", "amends"),
+                                     ("superseded_by", "amended_by")):
+            both = [x for x in rec["fm"].get(amend_key, [])
+                    if x in rec["fm"].get(sup_key, [])]
+            for target in sorted(set(both)):
+                out.append((rec["file"], "C-amend-exclusive",
+                            "'%s' is named in both '%s' and '%s': a record "
+                            "cannot both supersede and amend the same ADR (a "
+                            "stated supersession takes precedence)"
+                            % (target, sup_key, amend_key)))
+
     # C-superseded
     for rec in parsed:
         if rec["fm"].get("status") == "superseded" \
@@ -394,11 +448,24 @@ def check_records(records):
 
 def index_entry(rec):
     fm = rec["fm"]
-    return {"id": fm["id"], "title": fm["title"],
-            "path": "docs/adr/" + rec["name"], "status": fm["status"],
-            "supersedes": fm["supersedes"],
-            "superseded_by": fm["superseded_by"],
-            "applies_to": fm["applies_to"]}
+    entry = {"id": fm["id"], "title": fm["title"],
+             "path": "docs/adr/" + rec["name"], "status": fm["status"],
+             "supersedes": fm["supersedes"],
+             "superseded_by": fm["superseded_by"]}
+    # Omit-empty: an optional field is written only when non-empty.
+    for field in OPTIONAL_INDEX_FIELDS:
+        if fm.get(field):
+            entry[field] = fm[field]
+    entry["applies_to"] = fm["applies_to"]
+    return entry
+
+
+def entry_keys_ok(entry):
+    """The required fields, plus any subset of the optional ones, and no other
+    key."""
+    keys = set(entry)
+    required = set(INDEX_FIELDS)
+    return required <= keys and keys - required <= set(OPTIONAL_INDEX_FIELDS)
 
 
 def check_index(index_path, records):
@@ -426,11 +493,13 @@ def check_index(index_path, records):
                  "list" % INDEX_SCHEMA)]
     entries = {}
     for n, entry in enumerate(doc["records"]):
-        if not isinstance(entry, dict) or sorted(entry) != sorted(INDEX_FIELDS) \
+        if not isinstance(entry, dict) or not entry_keys_ok(entry) \
                 or not isinstance(entry.get("path"), str):
             out.append((index_path, "C-index",
-                        "records[%d] must be an object with exactly the keys %s"
-                        % (n, ", ".join(INDEX_FIELDS))))
+                        "records[%d] must be an object with exactly the keys "
+                        "%s, plus optionally %s"
+                        % (n, ", ".join(INDEX_FIELDS),
+                           ", ".join(OPTIONAL_INDEX_FIELDS))))
             continue
         if entry["path"] in entries:
             out.append((index_path, "C-index",
@@ -455,17 +524,21 @@ def check_index(index_path, records):
         rec = rec_by_path.get(path)
         if rec is None or rec["fm"] is None:
             continue
-        for field in INDEX_FIELDS:
-            if field == "path" or field not in rec["fm"]:
+        for field in INDEX_FIELDS + OPTIONAL_INDEX_FIELDS:
+            if field in OPTIONAL_INDEX_FIELDS:
+                # Absent reads [] on BOTH sides.
+                have = entries[path].get(field, [])
+                want = rec["fm"].get(field, [])
+            elif field == "path" or field not in rec["fm"]:
                 continue
-            if entries[path][field] != rec["fm"][field]:
+            else:
+                have, want = entries[path][field], rec["fm"][field]
+            if have != want:
                 out.append((index_path, "C-index-stale",
                             "entry '%s' field '%s' is %s but the record says %s"
                             % (path, field,
-                               json.dumps(entries[path][field],
-                                          ensure_ascii=False),
-                               json.dumps(rec["fm"][field],
-                                          ensure_ascii=False))))
+                               json.dumps(have, ensure_ascii=False),
+                               json.dumps(want, ensure_ascii=False))))
     return out
 
 

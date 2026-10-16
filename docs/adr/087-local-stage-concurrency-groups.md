@@ -5,7 +5,8 @@ status: accepted
 date: 2026-10-04
 issue: https://github.com/kuhlman-labs/fishhawk/issues/3968
 supersedes: []
-superseded_by: ["ADR-094", "ADR-100"]
+superseded_by: ["ADR-094"]
+amended_by: ["ADR-100"]
 applies_to: []
 ---
 

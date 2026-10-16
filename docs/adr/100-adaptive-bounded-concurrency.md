@@ -4,8 +4,9 @@ title: "Adaptive, bounded concurrency for host-dispatched stages: a product-owne
 status: accepted
 date: 2026-10-14
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4403
-supersedes: ["ADR-087", "ADR-094"]
+supersedes: []
 superseded_by: []
+amends: ["ADR-087", "ADR-094"]
 applies_to: []
 ---
 

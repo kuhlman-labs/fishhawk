@@ -72,7 +72,8 @@
     {
       "id": "ADR-091",
       "status": "accepted",
-      "superseded_by": [
+      "superseded_by": [],
+      "amended_by": [
         "ADR-095"
       ]
     },
@@ -105,12 +106,12 @@
     {
       "severity": "high",
       "category": "decision_record",
-      "note": "Step 2 makes a decomposed parent merge-eligible whatever the round's outcome. That is the behaviour before ADR-095, which supersedes ADR-091 with a review-coverage hold: a parent merges only when every slice is covered by a successful review, and a failed round covers nothing. ADR-095's text is not shown here; recover through a re-run instead."
+      "note": "Step 2 makes a decomposed parent merge-eligible whatever the round's outcome. That is the behaviour before ADR-095, which amends ADR-091 with a review-coverage hold: a parent merges only when every slice is covered by a successful review, and a failed round covers nothing. ADR-095's text is not shown here; recover through a re-run instead."
     },
     {
       "severity": "medium",
       "category": "decision_record",
-      "note": "The restart-recovery rule that advisory review rounds never hold up a merge is ADR-091, which the index marks superseded by ADR-095 (review coverage for decomposed parents)."
+      "note": "The restart-recovery rule that advisory review rounds never hold up a merge is ADR-091, which the index marks amended by ADR-095 (review coverage for decomposed parents)."
     }
   ],
   "non_catching_examples": [

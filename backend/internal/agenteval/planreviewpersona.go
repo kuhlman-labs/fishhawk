@@ -104,11 +104,13 @@ const (
 )
 
 // PersonaGoverningRecord is one record a persona case's premise rests on, as
-// the case expects the REAL index to list it.
+// the case expects the REAL index to list it. AmendedBy is optional (E78.13 /
+// #4471): absent is empty, as in the index.
 type PersonaGoverningRecord struct {
 	ID           string   `json:"id"`
 	Status       string   `json:"status"`
 	SupersededBy []string `json:"superseded_by"`
+	AmendedBy    []string `json:"amended_by,omitempty"`
 }
 
 // PersonaCaseAnchor names WHERE in the plan a catch case's defect sits.
@@ -315,7 +317,8 @@ func personaScopePaths(p *plan.Plan) []string {
 //	(f) empty, blank or absent defect_phrases, or a defect phrase absent from
 //	    the issue and plan (v4 mode r)
 //	(g) empty governing_records, or a governing record absent from the real
-//	    index or listed there with a different status or superseded_by
+//	    index or listed there with a different status, superseded_by or
+//	    amended_by
 //	(h) catch-only fields on a clean case, or clean-only fields on a catch case
 //	(i) catch: an absent or unknown anchor, or an anchored step or criterion
 //	    absent from the plan
@@ -439,7 +442,8 @@ func loadPersonaCatchCase(dir, name, persona string, idx *decisionrecord.Index) 
 }
 
 // checkPersonaPremises is loader mode (g): every governing record is listed in
-// the real index with the declared status and superseded_by.
+// the real index with the declared status, superseded_by and amended_by (each
+// list compared as a set, an absent amended_by equal to an empty one).
 func checkPersonaPremises(recs []PersonaGoverningRecord, idx *decisionrecord.Index) error {
 	if len(recs) == 0 {
 		return errors.New("governing_records must be non-empty — the case's premise rests on no recorded decision")
@@ -458,6 +462,9 @@ func checkPersonaPremises(recs []PersonaGoverningRecord, idx *decisionrecord.Ind
 		}
 		if !sameStringSet(r.SupersededBy, g.SupersededBy) {
 			return fmt.Errorf("governing record %s: the case declares superseded_by %v, the real index says %v: the case's premise does not hold", g.ID, g.SupersededBy, r.SupersededBy)
+		}
+		if !sameStringSet(r.AmendedBy, g.AmendedBy) {
+			return fmt.Errorf("governing record %s: the case declares amended_by %v, the real index says %v: the case's premise does not hold", g.ID, g.AmendedBy, r.AmendedBy)
 		}
 	}
 	return nil
