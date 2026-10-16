@@ -913,6 +913,22 @@ Notes:
   Read back by the MCP surface (`fishhawk_get_plan` `plan_warnings`, newest
   entry wins). Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The plan-gate cross-run scope-overlap audit kind — `plan_scope_overlap`
+  (E83.60 / #4118), written by the plan upload handler
+  (`server/scope_overlap.go::recordPlanScopeOverlap`) immediately after
+  `plan_warnings` and before plan review — is an **internal, advisory audit
+  kind, not an issue-comment surface**. Nothing in `issuecomment` posts it to
+  the issue thread and it is not in `activityCategories`. It records which
+  OTHER non-terminal runs in the repo and tenant share files with the settling
+  plan's effective scope, with payload `{run_id, self_scope_resolved,
+  overlaps:[{run_id, issue_ref, decomposed_from, stage, stage_state, paths}],
+  scanned_runs, unscoped_runs, truncated, stage_id}`. Like `plan_warnings` it
+  is advisory + fail-open and written ONLY when an overlap exists — a clean
+  check writes no entry, so the live `GET /v0/runs/{run_id}/scope-overlap`
+  (not the audit log) answers "checked and clean". The row is the snapshot the
+  plan saw when it settled; the live surfaces recompute on every read. Listed
+  here only so a future reader grepping the audit categories doesn't mistake
+  it for a comment surface.
 - The on-approval split-child-filing completion audit kind —
   `split_children_filed` (#2057, E50.5), written by the approval hook
   (`server/split_filing.go::fileSplitProposalChildren` via

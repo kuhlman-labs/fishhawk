@@ -153,7 +153,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **175 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **176 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -215,6 +215,7 @@ The v0 REST API exposes **175 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/stages/{stage_id}/progress` | Record a stage's mid-execution progress heartbeat |
 | `GET` | `/v0/runs/{run_id}/audit` | List audit entries for a run |
 | `GET` | `/v0/runs/{run_id}/gate-view` | Gate-scoped decision view for a run |
+| `GET` | `/v0/runs/{run_id}/scope-overlap` | Live cross-run scope overlap for a run |
 | `GET` | `/v0/runs/{run_id}/budget` | Current periodic-budget status for a run's workflow |
 | `GET` | `/v0/runs/{run_id}/cache-efficiency` | Per-run prompt-cache efficiency metric |
 | `GET` | `/v0/runs/{run_id}/cost` | Per-run estimated cost with per-stage and per-merged-PR rollup |
