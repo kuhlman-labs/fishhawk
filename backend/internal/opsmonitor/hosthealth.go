@@ -37,6 +37,40 @@ const fallbackHolders = 3
 // many effective intervals reads not held.
 const holdStaleFactor = 3
 
+// crossingEdge is a stateful probe's clear -> failing edge. A crossing stays
+// PENDING until the Ticker records a result carrying it (ack), so a result
+// Sweep discards (a probe timeout, a late result) cannot lose the episode's
+// only ops_monitor_alert trigger: every failing result while the crossing is
+// pending carries it again. Recovering clears it; the next failing tick is a
+// new edge anyway. The caller holds the probe's mutex.
+type crossingEdge struct {
+	failing bool
+	gen     uint64 // generation of the latest crossing
+	pending uint64 // generation of the unreported crossing; 0 is none
+}
+
+// observe records this tick's verdict and returns whether the result carries
+// a crossing, with the generation its ack clears.
+func (e *crossingEdge) observe(failing bool) (crossing bool, gen uint64) {
+	switch {
+	case failing && !e.failing:
+		e.gen++
+		e.pending = e.gen
+	case !failing:
+		e.pending = 0
+	}
+	e.failing = failing
+	return e.pending != 0, e.pending
+}
+
+// ack clears the pending crossing gen. A newer crossing (the host recovered
+// and crossed again since gen was reported) stays pending.
+func (e *crossingEdge) ack(gen uint64) {
+	if e.pending == gen {
+		e.pending = 0
+	}
+}
+
 // ThresholdsFunc resolves the host-health bands from the host's total RAM
 // (read at Check time, so nothing runs at flag registration) and its core
 // count. nil selects hosthealth.DefaultThresholds.
@@ -126,8 +160,9 @@ func boundContributors(cs []Contributor) []Contributor {
 // or swap >= CriticalSwap, clearing at the ordinary exits). It emits ONE
 // result: failing host_memory_pressure while any signal latch is latched,
 // naming the largest holders as contributors and a composed remedy.
-// Crossing is set only on the clear -> failing edge. Stateful: use it by
-// pointer and share one instance across sweeps.
+// Crossing is set from the clear -> failing edge until the Ticker records a
+// result carrying it (crossingEdge). Stateful: use it by pointer and share
+// one instance across sweeps.
 type MemoryProbe struct {
 	// Reader reads the host; the zero Reader reads the running host.
 	Reader hosthealth.Reader
@@ -138,7 +173,7 @@ type MemoryProbe struct {
 
 	mu                                  sync.Mutex
 	available, swap, pressure, critical hosthealth.Latch
-	failing                             bool
+	edge                                crossingEdge
 }
 
 // Name implements Probe.
@@ -159,7 +194,7 @@ func (p *MemoryProbe) Check(ctx context.Context) []Result {
 	if err != nil {
 		return []Result{unknown(p.Name(), "memory thresholds invalid: "+err.Error())}
 	}
-	failing, crossed, critical := p.advance(goos, m, th)
+	failing, crossed, gen, critical := p.advance(goos, m, th)
 	r := Result{
 		Probe:     p.Name(),
 		Status:    StatusOK,
@@ -174,6 +209,9 @@ func (p *MemoryProbe) Check(ctx context.Context) []Result {
 	r.Condition = ConditionHostMemoryPressure
 	r.Subject = subjectHost
 	r.Crossing = crossed
+	if crossed {
+		r.ackCrossing = func() { p.ack(gen) }
+	}
 	r.Critical = critical
 	var holders []hosthealth.Process
 	if procs, perr := p.Reader.Processes(ctx, hosthealth.DefaultTopProcesses); perr == nil {
@@ -187,9 +225,9 @@ func (p *MemoryProbe) Check(ctx context.Context) []Result {
 }
 
 // advance feeds one reading to every latch. failing is any signal latch
-// latched; crossed is the clear -> failing edge; critical is the critical
-// latch while failing.
-func (p *MemoryProbe) advance(goos string, m hosthealth.Memory, th hosthealth.Thresholds) (failing, crossed, critical bool) {
+// latched; crossed is a pending (unreported) clear -> failing edge, gen its
+// ack generation; critical is the critical latch while failing.
+func (p *MemoryProbe) advance(goos string, m hosthealth.Memory, th hosthealth.Thresholds) (failing, crossed bool, gen uint64, critical bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	avail := m.AvailableFraction()
@@ -207,9 +245,14 @@ func (p *MemoryProbe) advance(goos string, m hosthealth.Memory, th hosthealth.Th
 	criticalLatched, _ := p.critical.Update(criticalEnter, criticalExit)
 
 	failing = availLatched || swapLatched || pressureLatched
-	crossed = failing && !p.failing
-	p.failing = failing
-	return failing, crossed, failing && criticalLatched
+	crossed, gen = p.edge.observe(failing)
+	return failing, crossed, gen, failing && criticalLatched
+}
+
+func (p *MemoryProbe) ack(gen uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.edge.ack(gen)
 }
 
 // pressureBand maps the OS pressure signal onto the latch's enter/exit. An
@@ -274,7 +317,8 @@ func memoryThreshold(goos string, m hosthealth.Memory, th hosthealth.Thresholds)
 // workload_containers_high while their total memory (high-water, a fraction
 // of host RAM) or their count is latched. The count trips above
 // ContainerCountMax and clears below it. Contributors are the containers,
-// largest first. Stateful: use it by pointer.
+// largest first. Crossing follows the same pending rule as MemoryProbe
+// (crossingEdge). Stateful: use it by pointer.
 type WorkloadContainersProbe struct {
 	// Reader reads the host; the zero Reader reads the running host.
 	Reader hosthealth.Reader
@@ -285,7 +329,7 @@ type WorkloadContainersProbe struct {
 
 	mu            sync.Mutex
 	memory, count hosthealth.Latch
-	failing       bool
+	edge          crossingEdge
 }
 
 // Name implements Probe.
@@ -320,8 +364,7 @@ func (p *WorkloadContainersProbe) Check(ctx context.Context) []Result {
 	memLatched, _ := p.memory.UpdateHighWater(frac, th.ContainerMemEnter, th.ContainerMemExit)
 	countLatched, _ := p.count.Update(n > th.ContainerCountMax, n < th.ContainerCountMax)
 	failing := memLatched || countLatched
-	crossed := failing && !p.failing
-	p.failing = failing
+	crossed, gen := p.edge.observe(failing)
 	p.mu.Unlock()
 
 	r := Result{
@@ -339,6 +382,13 @@ func (p *WorkloadContainersProbe) Check(ctx context.Context) []Result {
 	r.Condition = ConditionWorkloadContainersHigh
 	r.Subject = subjectGateContainers
 	r.Crossing = crossed
+	if crossed {
+		r.ackCrossing = func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.edge.ack(gen)
+		}
+	}
 	r.Contributors = contributorsFromContainers(cs)
 	r.Remedy = containersRemedy(r.Contributors)
 	return []Result{r}
@@ -426,7 +476,10 @@ func (t *Ticker) alertRecovered(ctx context.Context, results []Result) {
 // alert writes ONE ops_monitor_alert row for the tick's failing crossings,
 // skipping each crossing whose condition|subject was alerted inside the
 // quiet window (in memory, then through the audit log, fail-open). Nothing
-// is written when no crossing occurred or every one is suppressed.
+// is written when no crossing occurred or every one is suppressed. Once the
+// crossings are recorded (written, suppressed, or the append failed) each is
+// acked to its probe; a panic skips the ack, so the crossing is retried on
+// the next failing tick.
 func (t *Ticker) alert(ctx context.Context, results []Result) {
 	var crossings []Result
 	for _, r := range results {
@@ -437,6 +490,15 @@ func (t *Ticker) alert(ctx context.Context, results []Result) {
 	if len(crossings) == 0 {
 		return
 	}
+	t.recordCrossings(ctx, crossings)
+	for _, r := range crossings {
+		if r.ackCrossing != nil {
+			r.ackCrossing()
+		}
+	}
+}
+
+func (t *Ticker) recordCrossings(ctx context.Context, crossings []Result) {
 	now, quiet := t.now(), t.quietWindow()
 	var recorded map[string]time.Time
 	looked := false

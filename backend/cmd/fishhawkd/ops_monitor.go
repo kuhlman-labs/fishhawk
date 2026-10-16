@@ -137,8 +137,8 @@ func registerOpsMonitorFlags(fs *flag.FlagSet) *opsMonitorFlags {
 			"no lead (it fires only once the window has elapsed). Must be >= 0 and below the window")
 	fs.DurationVar(&f.AmendmentLookback, "ops-monitor-amendment-lookback",
 		envOrDuration("FISHHAWKD_OPS_MONITOR_AMENDMENT_LOOKBACK", opsmonitor.DefaultAmendmentLookback),
-		"only pending scope amendments requested within this long are scanned, which bounds the backlog of stale "+
-			"pre-#4127 pending rows; must exceed the window")
+		"only pending scope amendments requested within this long are scanned, which bounds the pending rows the "+
+			"#4127 lapse step leaves pending (failed-stage rows and any it missed); must exceed the window")
 	fs.Float64Var(&f.SwapEnterPct, "ops-monitor-swap-enter-pct",
 		envOrFloat("FISHHAWKD_OPS_MONITOR_SWAP_ENTER_PCT", 0),
 		"memory probe (E85.11 / #4330): used swap, as a percent of swap total, at which host_memory_pressure trips; "+

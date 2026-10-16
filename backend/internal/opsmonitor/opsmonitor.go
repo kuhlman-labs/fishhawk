@@ -185,12 +185,17 @@ type Result struct {
 	Contributors []Contributor `json:"contributors,omitempty"`
 	// OS is the operating system a host-health probe read (E85.11).
 	OS string `json:"os,omitempty"`
-	// Crossing is set on the tick a host-health latch crosses from clear to
-	// latched; only a crossing writes an ops_monitor_alert row. Critical is
-	// set while the memory probe's critical latch holds; it drives the
-	// AdmissionHold. Neither is serialized.
+	// Crossing is set from the tick a host-health latch crosses from clear to
+	// latched until the Ticker records a result carrying it, so a discarded
+	// (timed-out) result cannot lose it; only a crossing writes an
+	// ops_monitor_alert row. Critical is set while the memory probe's
+	// critical latch holds; it drives the AdmissionHold. Neither is
+	// serialized.
 	Crossing bool `json:"-"`
 	Critical bool `json:"-"`
+	// ackCrossing, set with Crossing, tells the probe the Ticker recorded
+	// the crossing (crossingEdge.ack).
+	ackCrossing func()
 }
 
 // Probe is one health check. HostLocal probes observe the fishhawkd host and

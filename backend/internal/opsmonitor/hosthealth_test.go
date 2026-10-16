@@ -11,11 +11,13 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // --- host fixtures ------------------------------------------------------------
@@ -719,6 +721,168 @@ func TestHostHealth_AlertAppendFailureWarnsAndHoldStillUpdates(t *testing.T) {
 			warns := h.count(slog.LevelWarn, "opsmonitor: alert append failed") + h.count(slog.LevelWarn, "opsmonitor: alert panicked")
 			if warns != 1 || h.atOrAbove(slog.LevelError) != 0 {
 				t.Errorf("alert WARNs = %d, ERRORs = %d; want 1/0", warns, h.atOrAbove(slog.LevelError))
+			}
+
+			// The chosen semantics (#4330 review): the key is marked before
+			// the append, so after a failed append a SECOND crossing of the
+			// same condition|subject inside the quiet window attempts no row;
+			// one past the window attempts again. A failed append is recorded
+			// by the fake; a panicking one by its WARN.
+			attempts := func() int {
+				return au.categoryCount(CategoryOpsMonitorAlert) + h.count(slog.LevelWarn, "opsmonitor: alert panicked")
+			}
+			recrossAfter := func(gap time.Duration) Result {
+				clk.Advance(gap)
+				host.set("sysctl -n vm.swapusage", darwinSwap(0.40))
+				host.set("sysctl -n kern.memorystatus_vm_pressure_level", "1")
+				if r := resultFor(t, tk.Tick(context.Background()), "memory"); r.Status != StatusOK {
+					t.Fatalf("recovered host = %+v, want ok", r)
+				}
+				clk.Advance(time.Minute)
+				host.set("sysctl -n vm.swapusage", darwinSwap(0.98))
+				host.set("sysctl -n kern.memorystatus_vm_pressure_level", "4")
+				return resultFor(t, tk.Tick(context.Background()), "memory")
+			}
+			if r := recrossAfter(time.Minute); !r.Crossing {
+				t.Fatalf("re-pressured host inside the window = %+v, want a second crossing", r)
+			}
+			if n := attempts(); n != 1 {
+				t.Errorf("alert attempts after a second crossing inside the window = %d, want 1 (suppressed after the failed append)", n)
+			}
+			if r := recrossAfter(2 * time.Hour); !r.Crossing {
+				t.Fatalf("re-pressured host past the window = %+v, want a third crossing", r)
+			}
+			if n := attempts(); n != 2 {
+				t.Errorf("alert attempts after a crossing past the window = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// TestHostHealth_TimedOutCrossingSurvivesToTheNextTick (#4330 review, HIGH):
+// a crossing whose result Sweep discards must not be lost. Tick 1 crosses
+// but the process scan blocks past the probe deadline, so the result reads
+// unknown and no alert row lands; tick 2 is still pressured and the scan
+// succeeds, so it carries the crossing and writes EXACTLY ONE row naming the
+// holder. Tick 3, past the quiet window so dedup cannot mask it, writes no
+// second row: the Ticker acked the crossing it recorded.
+func TestHostHealth_TimedOutCrossingSurvivesToTheNextTick(t *testing.T) {
+	ctx := context.Background()
+	host := darwinDoneMeans()
+	var blockNext atomic.Bool
+	blockNext.Store(true)
+	rd := host.reader("darwin")
+	rd.Exec = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if strings.Join(append([]string{name}, args...), " ") == hhTopCommand && blockNext.CompareAndSwap(true, false) {
+			<-ctx.Done() // past the probe deadline
+			return nil, ctx.Err()
+		}
+		return host.exec(ctx, name, args...)
+	}
+	au, clk, h := &fakeAudit{}, newClock(), &captureHandler{}
+	tk := hhTicker(au, clk, h, &MemoryProbe{Reader: rd, Cores: cores(10)})
+
+	// Tick 1: the expected verdict IS the timeout, so a cheap budget.
+	tk.ProbeTimeout = timescale.D(50 * time.Millisecond)
+	if r := resultFor(t, tk.Tick(ctx), "memory"); r.Status != StatusUnknown || !strings.Contains(r.Reason, "timed out") {
+		t.Fatalf("tick 1 memory = %+v, want unknown on the probe timeout", r)
+	}
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 0 {
+		t.Fatalf("ops_monitor_alert rows after the timed-out tick = %d, want 0", n)
+	}
+
+	// Tick 2 must complete: an order-of-magnitude budget (#3587).
+	tk.ProbeTimeout = DefaultProbeTimeout
+	clk.Advance(time.Minute)
+	r := resultFor(t, tk.Tick(ctx), "memory")
+	if r.Status != StatusFailing {
+		t.Fatalf("tick 2 memory = %+v, want failing (precondition: the scan completed inside the budget)", r)
+	}
+	if !r.Crossing {
+		t.Errorf("tick 2 Crossing = false: the crossing from the timed-out tick was lost")
+	}
+	alerts := au.alerts(t)
+	if len(alerts) != 1 {
+		t.Fatalf("ops_monitor_alert rows = %d, want exactly 1 for the episode", len(alerts))
+	}
+	if len(alerts[0].Contributors) == 0 || alerts[0].Contributors[0].Name != "fseventsd" {
+		t.Errorf("contributors = %+v, want fseventsd from the successful scan", alerts[0].Contributors)
+	}
+
+	clk.Advance(2 * time.Hour)
+	if r := resultFor(t, tk.Tick(ctx), "memory"); r.Status != StatusFailing || r.Crossing {
+		t.Errorf("tick 3 memory = %+v, want failing without a crossing (acked)", r)
+	}
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 1 {
+		t.Errorf("ops_monitor_alert rows after tick 3 = %d, want still 1", n)
+	}
+}
+
+// TestCrossingEdge_PendingUntilAcked pins the pending-crossing rule on both
+// stateful probes: a failing result nobody recorded keeps carrying the
+// crossing; its ack clears it; a STALE ack (from a crossing reported before
+// the host recovered and crossed again) leaves the newer crossing pending.
+func TestCrossingEdge_PendingUntilAcked(t *testing.T) {
+	ctx := context.Background()
+	memHost := darwinHost(0.30, 0.98, "1", darwinTopDoneMeans)
+	memProbe := &MemoryProbe{Reader: memHost.reader("darwin")}
+	setMem := func(failing bool) {
+		swap := 0.40
+		if failing {
+			swap = 0.98
+		}
+		memHost.set("sysctl -n vm.swapusage", darwinSwap(swap))
+	}
+
+	ctHost := darwinHealthy()
+	ctNames := []string{"fishhawk-gate-a1", "fishhawk-gate-b2", "fishhawk-gate-c3", "fishhawk-gate-d4", "fishhawk-gate-e5"}
+	ctProbe := &WorkloadContainersProbe{Reader: ctHost.reader("darwin"), Cores: cores(8)} // count max 4
+	setCt := func(failing bool) {
+		names := ctNames[:1]
+		if failing {
+			names = ctNames
+		}
+		var stats []string
+		for _, n := range names {
+			stats = append(stats, n+"\t1.0GiB / 48GiB")
+		}
+		ctHost.set(dockerPS, strings.Join(names, "\n"))
+		ctHost.set(dockerStatsKey(names...), strings.Join(stats, "\n"))
+	}
+
+	for name, tc := range map[string]struct {
+		probe Probe
+		set   func(failing bool)
+	}{
+		"memory":              {memProbe, setMem},
+		"workload_containers": {ctProbe, setCt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			check := func(failing bool) Result {
+				t.Helper()
+				tc.set(failing)
+				r := one(t, tc.probe.Check(ctx))
+				if (r.Status == StatusFailing) != failing {
+					t.Fatalf("result = %+v, want failing=%v", r, failing)
+				}
+				return r
+			}
+			first := check(true)
+			if !first.Crossing || first.ackCrossing == nil {
+				t.Fatalf("first failing result = %+v, want a crossing with an ack", first)
+			}
+			if r := check(true); !r.Crossing {
+				t.Error("unrecorded crossing lost: a still-failing result no Ticker recorded must carry it again")
+			}
+			check(false)
+			second := check(true)
+			first.ackCrossing() // stale: reported before the recovery
+			if r := check(true); !r.Crossing {
+				t.Error("a stale ack cleared the newer crossing")
+			}
+			second.ackCrossing()
+			if r := check(true); r.Crossing {
+				t.Error("an acked crossing is still carried")
 			}
 		})
 	}
