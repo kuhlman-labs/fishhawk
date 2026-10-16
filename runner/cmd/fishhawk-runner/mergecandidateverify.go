@@ -76,6 +76,9 @@ const (
 	mcReasonGateUnavailable   = "verify_gate_unavailable"
 	mcReasonGateTimedOut      = "verify_gate_timed_out"
 	mcReasonLockContended     = "verify_lock_contended"
+	// mcReasonTempFail: the verify command exited 75 (EX_TEMPFAIL, the #4022
+	// exit-code contract) — an infrastructure failure, not a verdict.
+	mcReasonTempFail = "verify_infra_tempfail"
 )
 
 // mergeCandidateDefaultVerifyTimeout is the fallback when neither the operator
@@ -203,10 +206,17 @@ func mergeCandidateVerify(ctx context.Context, cfg config, req mergeCandidateVer
 
 // classifyMergeCandidateVerify maps the gate's (outcome, disposition) to the
 // pass's result. A gate that never reached a verdict about the TREE — infra
-// skip, isolation refusal, an unavailable host, the runner's own deadline, or
-// verify-lock contention — is not_executed, NEVER failed: a failed result is
-// head-bound and routes a fix-up, which would hand the fix agent a tree that
-// was never judged.
+// skip, isolation refusal, an unavailable host, the runner's own deadline, an
+// exit-75 temporary failure, or verify-lock contention — is not_executed,
+// NEVER failed: a failed result is head-bound and routes a fix-up, which would
+// hand the fix agent a tree that was never judged. The pass does not re-run a
+// temporary failure itself: a not_executed result leaves the head
+// re-triggerable on the backend.
+//
+// Lock contention is read from the exit-code disposition (gateLockRefused,
+// exit 73) first; the #3948 text classifier stays as a fallback until the
+// disposition is produced at every gate site, so a real refusal never reads
+// as a red tree in between.
 func classifyMergeCandidateVerify(outcome string, disp gateDisposition, out string) (string, string) {
 	switch {
 	case disp == gateRefused:
@@ -215,6 +225,10 @@ func classifyMergeCandidateVerify(outcome string, disp gateDisposition, out stri
 		return mergeCandidateNotExecuted, mcReasonGateUnavailable
 	case disp == gateTimedOut:
 		return mergeCandidateNotExecuted, mcReasonGateTimedOut
+	case disp == gateTempFail:
+		return mergeCandidateNotExecuted, mcReasonTempFail
+	case disp == gateLockRefused:
+		return mergeCandidateNotExecuted, mcReasonLockContended
 	case outcome == "skipped":
 		return mergeCandidateNotExecuted, mcReasonGateSkipped
 	case outcome == "passed":

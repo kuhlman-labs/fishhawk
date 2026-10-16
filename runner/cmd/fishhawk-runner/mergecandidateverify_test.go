@@ -337,6 +337,11 @@ func TestMergeCandidateVerify_NotExecutedArms(t *testing.T) {
 		{"timed_out", "failed", gateTimedOut, "killed", mcReasonGateTimedOut},
 		{"skipped", "skipped", gateExecuted, "", mcReasonGateSkipped},
 		{"lock_contended", "failed", gateExecuted, verifyLockRefusalLinePrefix + "another RUNNER verify still holds the lock\n", mcReasonLockContended},
+		// The exit-code dispositions (#4022) classify with SIGNATURE-FREE output,
+		// so only the disposition arm can make them not_executed: without it
+		// both fall to the default verify_failed.
+		{"temp_fail_exit_75", "failed", gateTempFail, "", mcReasonTempFail},
+		{"lock_refused_exit_73", "failed", gateLockRefused, "", mcReasonLockContended},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := mergeCandidateVerifyFn

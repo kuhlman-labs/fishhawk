@@ -370,6 +370,10 @@ func TestAbsorbRerunRefusal(t *testing.T) {
 		{"failed", gateTimedOut, "", absorbRefusedRerunNotExecuted},
 		{"failed", gateRefused, "", absorbRefusedRerunNotExecuted},
 		{"passed", gateCheckoutRefused, "", absorbRefusedRerunNotExecuted},
+		// The exit-code dispositions (#4022), with SIGNATURE-FREE output: only
+		// the disposition keeps them out of rerun_failed.
+		{"failed", gateTempFail, absorbOutsideFail, absorbRefusedRerunNotExecuted},
+		{"failed", gateLockRefused, absorbOutsideFail, absorbRefusedRerunNotExecuted},
 	} {
 		if got := absorbRerunRefusal(tc.outcome, tc.disp, tc.out); got != tc.want {
 			t.Errorf("absorbRerunRefusal(%q, %v, %q) = %q, want %q", tc.outcome, tc.disp, tc.out, got, tc.want)

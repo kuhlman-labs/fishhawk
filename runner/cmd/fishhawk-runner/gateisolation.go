@@ -122,6 +122,20 @@ const (
 	// hand it). neverExecutedInfra() stays FALSE — the gate ran; it simply
 	// did not finish — so every site tests this value explicitly.
 	gateTimedOut
+	// gateTempFail: the verify command ran and EXITED 75 (sysexits(3)
+	// EX_TEMPFAIL) — by the documented verify exit-code contract (#4022) an
+	// infrastructure / temporary failure the tree did not cause. Derived from
+	// the exit CODE, never the output text. A no-verdict outcome: re-run in
+	// place (bounded), never handed to the fix agent, then category C.
+	// neverExecutedInfra() stays FALSE — the command ran — so every site tests
+	// this value explicitly.
+	gateTempFail
+	// gateLockRefused: the verify command ran and EXITED 73 (sysexits(3)
+	// EX_CANTCREAT) — by the same contract, the shared verify lock could not be
+	// acquired, so the tree was never judged. Category C verify_lock_contended
+	// after the bounded contention re-run, never the fix agent.
+	// neverExecutedInfra() stays FALSE for the same reason as gateTempFail.
+	gateLockRefused
 )
 
 // neverExecutedInfra reports whether the disposition is one the gates
@@ -144,6 +158,10 @@ func (d gateDisposition) String() string {
 		return "unavailable"
 	case gateTimedOut:
 		return "timed_out"
+	case gateTempFail:
+		return "temp_fail"
+	case gateLockRefused:
+		return "lock_refused"
 	}
 	return fmt.Sprintf("gateDisposition(%d)", int(d))
 }
