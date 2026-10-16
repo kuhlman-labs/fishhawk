@@ -59,11 +59,16 @@ type Selection struct {
 	// TotalRecords is how many records the index lists.
 	TotalRecords int
 	// Matched is how many records were selected: those whose applies_to
-	// matched the change plus the successors followed from them.
+	// matched the change plus the successors and amendments followed from
+	// them.
 	Matched int
-	// Followed is how many of Matched were selected ONLY as successors of a
-	// selected record (MatchedPaths == 0).
+	// Followed is how many of Matched were selected ONLY as successors or
+	// amendments of a selected record (MatchedPaths == 0).
 	Followed int
+	// Amendments is how many of Matched amend a selected record (non-empty
+	// AmendsVia), whether or not their own applies_to also matched. It is what
+	// tells the index framing that an amendment was followed.
+	Amendments int
 	// Included are the matches shown in full, in rank order — a strict prefix
 	// of the ranking.
 	Included []Included
@@ -142,6 +147,9 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 	for _, m := range matches {
 		if m.MatchedPaths == 0 {
 			sel.Followed++
+		}
+		if len(m.AmendsVia) > 0 {
+			sel.Amendments++
 		}
 	}
 	remaining := recordBudget
@@ -270,15 +278,22 @@ func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
 
 // indexFraming is the system-authored framing of the index document. With no
 // followed successor (Followed == 0) the preamble is exactly the pre-#4398
-// text.
+// text; with successors but no amendment (Amendments == 0) it is exactly the
+// pre-#4471 text.
 func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	var b strings.Builder
 	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. ",
 		repodoc.SanitizeMetadata(s.Index.Path))
-	if s.Followed == 0 {
+	switch {
+	case s.Amendments > 0:
+		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches, "+
+			"and %d more were selected because they supersede or amend a selected record (followed through supersedes / superseded_by and amends / amended_by); "+
+			"%d of the selected records amend a selected record, and an amended record still governs, except where an amendment decides otherwise; ",
+			s.Matched-s.Followed, s.TotalRecords, s.Followed, s.Amendments)
+	case s.Followed == 0:
 		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches; ",
 			s.Matched, s.TotalRecords)
-	} else {
+	default:
 		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches, "+
 			"and %d more were selected because they supersede a selected record (followed through supersedes / superseded_by); ",
 			s.Matched-s.Followed, s.TotalRecords, s.Followed)
@@ -291,7 +306,10 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 			ids = append(ids, repodoc.SanitizeMetadata(inc.Record.ID))
 		}
 		order := "accepted records first, then by how many changed paths each matches, then newest first"
-		if s.Followed > 0 {
+		switch {
+		case s.Amendments > 0:
+			order += "; a successor ranks with the records it supersedes; an amendment ranks with the records it amends, after them"
+		case s.Followed > 0:
 			order += "; a successor ranks with the records it supersedes"
 		}
 		fmt.Fprintf(&b, "%d of them are shown in full below, in rank order (%s): %s. ",
@@ -312,6 +330,9 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 			if len(m.Via) > 0 {
 				via = ", successor of " + sanitizedIDs(m.Via)
 			}
+			if len(m.AmendsVia) > 0 {
+				via += ", amendment of " + sanitizedIDs(m.AmendsVia)
+			}
 			fmt.Fprintf(&b, "- %s (%s, status: %s%s)\n",
 				repodoc.SanitizeMetadata(m.Record.ID), repodoc.SanitizeMetadata(m.Record.Path), statusLabel(m.Record.Status), via)
 		}
@@ -323,12 +344,16 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	}
 }
 
+// amendedRecordGoverns is the clause every amendment's record framing carries.
+const amendedRecordGoverns = "the amended record still governs except where this record decides otherwise."
+
 // recordFraming frames one included record with its status and what that
-// status means and, for a record selected as a successor (non-empty Via), why
-// it was selected.
+// status means, then, for a record with amendments (non-empty AmendedBy), that
+// it is amended, and, for a record selected as a successor (non-empty Via) or
+// as an amendment (non-empty AmendsVia), why it was selected.
 func recordFraming(m Match) repodoc.Framing {
 	r := m.Record
-	preamble := statusMeaning(r)
+	preamble := statusMeaning(r) + amendedByMeaning(r)
 	if len(m.Via) > 0 {
 		if m.MatchedPaths == 0 {
 			preamble += fmt.Sprintf(" This record was selected because it supersedes %s; its own applies_to matches no path this change touches.", sanitizedIDs(m.Via))
@@ -336,11 +361,36 @@ func recordFraming(m Match) repodoc.Framing {
 			preamble += fmt.Sprintf(" This record matches a path this change touches and is also selected because it supersedes %s.", sanitizedIDs(m.Via))
 		}
 	}
+	if len(m.AmendsVia) > 0 {
+		amends := sanitizedIDs(m.AmendsVia)
+		switch {
+		case len(m.Via) > 0:
+			preamble += fmt.Sprintf(" It is also selected because it amends %s; %s", amends, amendedRecordGoverns)
+		case m.MatchedPaths == 0:
+			preamble += fmt.Sprintf(" This record was selected because it amends %s; %s Its own applies_to matches no path this change touches.", amends, amendedRecordGoverns)
+		default:
+			preamble += fmt.Sprintf(" This record matches a path this change touches and is also selected because it amends %s; %s", amends, amendedRecordGoverns)
+		}
+	}
 	return repodoc.Framing{
 		Heading:   fmt.Sprintf(recordHeadFmt, repodoc.SanitizeMetadata(r.ID), statusLabel(r.Status)),
 		Preamble:  preamble,
 		TrustNote: indexTrustNote,
 	}
+}
+
+// amendedByMeaning is the sentence a record with amendments (non-empty
+// AmendedBy) adds after its status meaning; empty for a record without any.
+// Only an accepted record is said to still govern: a record of any other
+// status governs nothing, so its amendments are only named.
+func amendedByMeaning(r Record) string {
+	if len(r.AmendedBy) == 0 {
+		return ""
+	}
+	if r.Status == StatusAccepted {
+		return fmt.Sprintf(" Amended by %s: it still governs, except where an amendment decides otherwise.", sanitizedIDs(r.AmendedBy))
+	}
+	return fmt.Sprintf(" Amended by %s.", sanitizedIDs(r.AmendedBy))
 }
 
 // sanitizedIDs joins ids for framing, each through repodoc.SanitizeMetadata.

@@ -549,6 +549,7 @@ cannot answer. Since E78.11 / #4313 the record is ARM-KEYED: beside the two
 conventions arms it carries the `architect` persona arm, which renders each
 case through the production persona builder (`backend/internal/personaprompt`)
 over the REAL `docs/review/architect-remit.md` and the ADR-084 D4(b)
+(ADR-084 has no `docs/adr` record yet; it is read from the tracker)
 decision-record selection from the REAL `docs/adr/index.json`, and measures
 both a catch rate (plans conflicting with a recorded decision) and a
 false-alarm rate (conforming plans) before the architect is enabled.
@@ -1069,8 +1070,12 @@ committed v4-scored sidecar re-scores with zero gained and zero lost catches.
 decoded strictly): `persona`, `kind` (`accepted_conflict`, `superseded_reliance`,
 `undeclared_direction` → `catch`; `declared_direction`, `clean_area` →
 `clean`), `expect`, `issue_title`, `issue_body`, a COMPLETE `plan`
-(`plan.Parse`), `governing_records` (`id`, `status`, `superseded_by`) and
-`defect_phrases`. Catch cases add `anchor` (`approach_step` + `step`, or
+(`plan.Parse`), `governing_records` (`id`, `status`, `superseded_by`, and an
+optional `amended_by`, absent equal to empty, E78.13 / #4471) and
+`defect_phrases`. `superseded_reliance` covers reliance on a decision that a
+later record replaced, through a successor OR an amendment (remit item 2): the
+kind name predates the amendment relation and is kept so the kind set, and
+every case's calibration, stays unchanged. Catch cases add `anchor` (`approach_step` + `step`, or
 `criterion` + `criterion_id`), `catch_probes`, `attribution_phrases`,
 `catching_examples` and `non_catching_examples`; clean cases add
 `false_alarm_examples`, `benign_examples`, optional `pair_of` and optional
@@ -1083,8 +1088,8 @@ from the anchored text or present in another step or any criterion; a probe in
 the issue or plan text (v4 mode m); a probe matching a non-catching example
 (mode j); a catching example not caught or a non-catching example caught; no
 attributed non-catching example (mode n); absent defect phrases (mode r); a
-governing record absent from the REAL index or with a different status or
-`superseded_by`; a false-alarm example not classified `false_alarm` or a
+governing record absent from the REAL index or with a different status,
+`superseded_by` or `amended_by` (each compared as a set); a false-alarm example not classified `false_alarm` or a
 benign example classified so; a `pair_of` whose plan differs in anything but
 `new_architectural_decision`, or that is not undeclared (catch) vs declared
 (clean); a `clean_area` case whose scope matches fewer than
@@ -1096,8 +1101,8 @@ the checkout root): every kind present (≥ 3 catch, ≥ 3 clean, ≥ 2
 `clean_area`); every persona render carries the remit and every assembled
 document strictly inside its own `BEGIN/END REPO-AUTHORED DOCUMENT` envelope,
 with a remit line read independently from the file inside the remit span; each
-catch case's governing records' index entries PRESENT in the rendered,
-post-truncation index text (an ADR landing that truncates them reddens
+catch case's governing records' index entries (and their successors' and
+amendments') PRESENT in the rendered, post-truncation index text (an ADR landing that truncates them reddens
 verify); the standard `plan_review` render byte-identical before and after the
 persona build and to a direct `prompt.Build`; the governing premises holding
 against the real index; generic objections and verbatim step echoes scoring
@@ -1111,11 +1116,16 @@ and the records have separate budgets (`backend/internal/decisionrecord/README.m
 every case shows its matched GOVERNING records in full — ADR-006's body now
 reaches the migration case. A non-governing match can still be dropped when
 the budget runs out: `adr040-superseded-operator-role-reliance` shows ADR-101
-(23 KB) and ADR-040 in full and drops ADR-013 (#4453). Before #4399 the index and records shared one budget and
+(23 KB) and ADR-040 in full and drops ADR-013 (#4453) while the index encodes
+ADR-101 as ADR-040's successor. Once ADR-101 is encoded as an amendment
+(E78.13 / #4471), ADR-040 ranks ahead of its amendments and ADR-097 joins the
+selection, so at the production cap ADR-040 and ADR-097 fit and ADR-101 is
+dropped (`TestPersonaPrompt_AmendmentFramingCrossesTheBoundary` on the
+`.fishhawk/operator.yaml` scope). Before #4399 the index and records shared one budget and
 `Assemble` included ZERO full records. ADR-091 and ADR-095 still carry empty
 `applies_to` and are never matched (E86.58 / #4398 gave only ADR-098 a glob,
 `backend/internal/basedelta/**`, and added successor following, which reaches
-neither), so the merge-path case still sees only index titles and
+neither; E78.13 / #4471's amendment following reaches neither either), so the merge-path case still sees only index titles and
 supersession metadata. `TestPersonaCatchCorpus_MatchedGoverningRecordBodiesReachThePersona`
 pins the body floor as a deliberate #4399 tripwire. **The 2026-10-14 architect
 evidence record was measured index-only and is stale** (the rendered persona

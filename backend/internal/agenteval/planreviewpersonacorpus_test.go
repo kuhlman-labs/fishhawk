@@ -243,6 +243,8 @@ type realIndexEntry struct {
 	Status       string   `json:"status"`
 	Supersedes   []string `json:"supersedes"`
 	SupersededBy []string `json:"superseded_by"`
+	Amends       []string `json:"amends"`
+	AmendedBy    []string `json:"amended_by"`
 	AppliesTo    []string `json:"applies_to"`
 }
 
@@ -274,7 +276,8 @@ func readRealIndex(t *testing.T) map[string]realIndexEntry {
 // It also carries approval condition C1: the real index is near the
 // DefaultMaxBytes cap and decisionrecord.Assemble reshapes an over-cap index
 // behind a truncation marker, so every governing record's index entry (its id
-// AND its title, plus each successor's entry) must be PRESENT in the RENDERED,
+// AND its title, plus each successor's and each amendment's entry) must be
+// PRESENT in the RENDERED,
 // post-truncation index envelope. A future ADR landing that truncates them
 // away reddens verify here. The selection (included / dropped ids, rendered
 // index bytes) is logged, not pinned.
@@ -302,6 +305,9 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 			need[g.ID] = true
 			for _, s := range g.SupersededBy {
 				need[s] = true
+			}
+			for _, a := range g.AmendedBy {
+				need[a] = true
 			}
 		}
 		for id := range need {
@@ -472,10 +478,14 @@ func commonSuffixLen(a, b string) int {
 
 // TestPersonaCatchCorpus_GoverningPremisesHold re-checks each case's planted
 // premise against the REAL index, decoded independently of the loader: every
-// governing record is listed with the declared status and superseded_by; a
-// superseded_reliance case's superseded record names an accepted successor that
-// is itself governing and lists the supersession back; an accepted_conflict
-// case's records are accepted, unsuperseded and never named in its issue or
+// governing record is listed with the declared status, superseded_by and
+// amended_by; a superseded_reliance case rests on a governing record a later
+// decision replaced — through superseded_by (each successor an accepted
+// governing record listing the supersession back) or amended_by (at least one
+// amendment an accepted governing record listing amends back; E78.13 / #4471:
+// remit item 2 covers reliance on a decision an amendment changed); an
+// accepted_conflict case's records are accepted, unsuperseded, unamended and
+// never named in its issue or
 // plan (the persona must find the conflict from the index); and every governing
 // record of a clean_area case is one the plan scope actually selects.
 func TestPersonaCatchCorpus_GoverningPremisesHold(t *testing.T) {
@@ -494,8 +504,9 @@ func TestPersonaCatchCorpus_GoverningPremisesHold(t *testing.T) {
 				t.Errorf("case %q: governing record %s is absent from the real index", c.Name, g.ID)
 				continue
 			}
-			if r.Status != g.Status || !sameStringSet(r.SupersededBy, g.SupersededBy) {
-				t.Errorf("case %q: %s declared %s/%v, the real index says %s/%v", c.Name, g.ID, g.Status, g.SupersededBy, r.Status, r.SupersededBy)
+			if r.Status != g.Status || !sameStringSet(r.SupersededBy, g.SupersededBy) || !sameStringSet(r.AmendedBy, g.AmendedBy) {
+				t.Errorf("case %q: %s declared %s/superseded_by %v/amended_by %v, the real index says %s/%v/%v",
+					c.Name, g.ID, g.Status, g.SupersededBy, g.AmendedBy, r.Status, r.SupersededBy, r.AmendedBy)
 			}
 		}
 		shown, err := catchShownText(PlanReviewCatchInput{IssueTitle: c.Input.IssueTitle, IssueBody: c.Input.IssueBody, Plan: c.Input.Plan})
@@ -504,23 +515,34 @@ func TestPersonaCatchCorpus_GoverningPremisesHold(t *testing.T) {
 		}
 		switch c.Input.Kind {
 		case PersonaKindSupersededReliance:
-			superseded := 0
+			replaced := 0
 			for _, g := range c.Input.GoverningRecords {
 				for _, s := range g.SupersededBy {
-					superseded++
+					replaced++
 					succ, ok := real[s]
 					if _, gov := governing[s]; !ok || !gov || succ.Status != "accepted" || !slices.Contains(succ.Supersedes, g.ID) {
 						t.Errorf("case %q: %s's successor %s must be an accepted governing record listing supersedes %s", c.Name, g.ID, s, g.ID)
 					}
 				}
+				// An amended record may carry amendments the case does not rest
+				// on; only the governing ones count, and each must hold.
+				for _, a := range g.AmendedBy {
+					if _, gov := governing[a]; !gov {
+						continue
+					}
+					replaced++
+					if am, ok := real[a]; !ok || am.Status != "accepted" || !slices.Contains(am.Amends, g.ID) {
+						t.Errorf("case %q: %s's amendment %s must be an accepted governing record listing amends %s", c.Name, g.ID, a, g.ID)
+					}
+				}
 			}
-			if superseded == 0 {
-				t.Errorf("case %q: a superseded_reliance case needs a governing record with superseded_by", c.Name)
+			if replaced == 0 {
+				t.Errorf("case %q: a superseded_reliance case needs a governing record with superseded_by, or with amended_by naming a governing amendment", c.Name)
 			}
 		case PersonaKindAcceptedConflict:
 			for _, g := range c.Input.GoverningRecords {
-				if g.Status != "accepted" || len(g.SupersededBy) != 0 {
-					t.Errorf("case %q: %s must be accepted and unsuperseded", c.Name, g.ID)
+				if g.Status != "accepted" || len(g.SupersededBy) != 0 || len(g.AmendedBy) != 0 {
+					t.Errorf("case %q: %s must be accepted, unsuperseded and unamended", c.Name, g.ID)
 				}
 				if strings.Contains(shown, strings.ToLower(g.ID)) {
 					t.Errorf("case %q: the issue or plan names %s: the persona would be told the governing record", c.Name, g.ID)
@@ -707,4 +729,153 @@ func TestPersonaCatchCorpus_NotLeakedIntoPersonaPrompt(t *testing.T) {
 	if needles == 0 {
 		t.Fatal("no needles: the leak check is vacuous")
 	}
+}
+
+// adr040AmendmentEdges is the E78.13 / #4471 encoding of ADR-040 and the
+// records amending it (docs/adr/README.md § "Amendment relation"): ADR-097
+// and ADR-101 amend ADR-040 and ADR-089, ADR-101 also amends ADR-097, and none
+// of the four supersedes another. A record not listed keeps its shipped links.
+var adr040AmendmentEdges = map[string]struct{ amends, amendedBy []string }{
+	"ADR-040": {nil, []string{"ADR-097", "ADR-101"}},
+	"ADR-089": {nil, []string{"ADR-097", "ADR-101"}},
+	"ADR-097": {[]string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
+	"ADR-101": {[]string{"ADR-040", "ADR-089", "ADR-097"}, nil},
+}
+
+// TestPersonaPrompt_AmendmentFramingCrossesTheBoundary is approval
+// conditions 1-3: the SHIPPED docs/adr (index, record bodies, remit) driven
+// through decisionrecord.ParseIndex -> Select -> Assemble -> the production
+// persona builder (PersonaArmPrompt) on ADR-040's REAL applies_to path,
+// asserting on the RENDERED prompt, not only on Match metadata: ADR-097 and
+// ADR-101 are selected through amended_by (AmendsVia, never Via), ADR-040's
+// body ranks ahead of both and is shown whenever either is, and the amendment
+// count and framing sentences reach the prompt text.
+//
+// The index is the shipped one with adr040AmendmentEdges applied. Once the
+// records carry that encoding the overlay must change nothing, so from then on
+// the test exercises the shipped index byte-for-byte in substance; before it,
+// the overlay supplies the edges the reader side must follow.
+func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
+	const operatorScope = ".fishhawk/operator.yaml"
+	raw := mustReadCatch(t, filepath.Join(personaTestRepoRoot, filepath.FromSlash(personaArchitectIndexPath)))
+	idx, err := decisionrecord.ParseIndex(raw)
+	if err != nil {
+		t.Fatalf("ParseIndex(shipped index): %v", err)
+	}
+	shippedEncoded, changed := false, false
+	for i := range idx.Records {
+		r := &idx.Records[i]
+		e, ok := adr040AmendmentEdges[r.ID]
+		if !ok {
+			continue
+		}
+		if r.ID == "ADR-040" {
+			if !slices.Contains(r.AppliesTo, operatorScope) {
+				t.Fatalf("ADR-040's shipped applies_to %v no longer names %s: re-anchor this test on ADR-040's real scope", r.AppliesTo, operatorScope)
+			}
+			shippedEncoded = len(r.AmendedBy) > 0
+		}
+		if len(r.Supersedes) != 0 || len(r.SupersededBy) != 0 || !sameStringSet(r.Amends, e.amends) || !sameStringSet(r.AmendedBy, e.amendedBy) {
+			changed = true
+		}
+		r.Supersedes, r.SupersededBy, r.Amends, r.AmendedBy = nil, nil, e.amends, e.amendedBy
+	}
+	if shippedEncoded && changed {
+		t.Fatal("the shipped index encodes ADR-040's amendments but differs from adr040AmendmentEdges: update the edges (or the records) so they agree")
+	}
+	t.Logf("shipped index already encodes the amendments: %v", shippedEncoded)
+	overlaid, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decisionrecord.ParseIndex(overlaid); err != nil {
+		t.Fatalf("the overlaid index does not parse: %v", err)
+	}
+
+	root := t.TempDir()
+	writeFile := func(rel string, content []byte) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(personaArchitectRemitPath, mustReadCatch(t, filepath.Join(personaTestRepoRoot, filepath.FromSlash(personaArchitectRemitPath))))
+	writeFile(personaArchitectIndexPath, overlaid)
+	for _, r := range idx.Records {
+		writeFile(r.Path, mustReadCatch(t, filepath.Join(personaTestRepoRoot, filepath.FromSlash(r.Path))))
+	}
+
+	c := loadCommittedPersona(t)[0]
+	p := *c.Plan
+	p.Scope.Files = []plan.ScopeFile{{Path: operatorScope, Operation: plan.FileOpModify}}
+	c.Plan = &p
+	r, err := PersonaArmPrompt(c, root)
+	if err != nil {
+		t.Fatalf("PersonaArmPrompt: %v", err)
+	}
+
+	ranked := map[string]decisionrecord.Match{}
+	included := map[string]bool{}
+	for _, inc := range r.Selection.Included {
+		ranked[inc.Record.ID] = inc.Match
+		included[inc.Record.ID] = true
+	}
+	for _, d := range r.Selection.Dropped {
+		ranked[d.Record.ID] = d
+	}
+	p040, ok40 := ranked["ADR-040"]
+	if !ok40 || p040.MatchedPaths == 0 {
+		t.Fatalf("ADR-040 not selected directly by %s (matched %v)", operatorScope, r.MatchedIDs)
+	}
+	for _, w := range []struct {
+		id        string
+		amendsVia []string
+	}{{"ADR-097", []string{"ADR-040"}}, {"ADR-101", []string{"ADR-040", "ADR-097"}}} {
+		m, ok := ranked[w.id]
+		if !ok {
+			t.Errorf("%s not selected (matched %v): ADR-040's amended_by was not followed", w.id, r.MatchedIDs)
+			continue
+		}
+		if !slices.Equal(m.AmendsVia, w.amendsVia) || len(m.Via) != 0 || m.MatchedPaths != 0 {
+			t.Errorf("%s = {amendsVia %v via %v matched %d}, want {amendsVia %v via [] matched 0}: an amendment, never a successor", w.id, m.AmendsVia, m.Via, m.MatchedPaths, w.amendsVia)
+		}
+		if m.Rank <= p040.Rank {
+			t.Errorf("%s ranks %d, ahead of the record it amends (ADR-040 ranks %d)", w.id, m.Rank, p040.Rank)
+		}
+		if included[w.id] && !included["ADR-040"] {
+			t.Errorf("%s's body is shown but ADR-040's is not (included %v)", w.id, r.IncludedIDs)
+		}
+	}
+	if r.Selection.Amendments < 2 {
+		t.Fatalf("selection counts %d amendments, want >= 2 (ADR-097, ADR-101)", r.Selection.Amendments)
+	}
+
+	wants := []string{
+		fmt.Sprintf("%d of the selected records amend a selected record, and an amended record still governs, except where an amendment decides otherwise; ", r.Selection.Amendments),
+		"an amendment ranks with the records it amends, after them",
+	}
+	if included["ADR-040"] {
+		wants = append(wants, "Amended by ADR-097, ADR-101: it still governs, except where an amendment decides otherwise.")
+	}
+	for _, w := range []struct{ id, path, amends string }{
+		{"ADR-097", "docs/adr/097-operator-as-orchestrator.md", "ADR-040"},
+		{"ADR-101", "docs/adr/101-charter-authorization-mode.md", "ADR-040, ADR-097"},
+	} {
+		if included[w.id] {
+			wants = append(wants, "This record was selected because it amends "+w.amends+"; the amended record still governs except where this record decides otherwise.")
+		} else {
+			wants = append(wants, "- "+w.id+" ("+w.path+", status: accepted, amendment of "+w.amends+")")
+		}
+	}
+	for _, want := range wants {
+		if !strings.Contains(r.Prompt, want) {
+			t.Errorf("the rendered persona prompt lacks %q", want)
+		}
+	}
+	t.Logf("operator.yaml scope: matched %v included %v dropped %v; amendments %d; record budget %d, %d used",
+		r.MatchedIDs, r.IncludedIDs, r.DroppedIDs, r.Selection.Amendments, r.Selection.CapBytes, r.Selection.IncludedBytes)
 }

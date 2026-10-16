@@ -908,3 +908,234 @@ func TestPromptDocuments_SuccessorFraming(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Amendment framing and ranking under the record budget (E78.13 / #4471).
+// ---------------------------------------------------------------------------
+
+// amendedIndex is P (ADR-001), governing the audit package, amended by A
+// (ADR-002), whose own applies_to is empty, so A is selected only by following.
+func amendedIndex(t *testing.T, pStatus string) string {
+	t.Helper()
+	return string(indexJSON(t,
+		amending(rec("ADR-001", "docs/adr/001.md", pStatus, "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+		amending(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+	))
+}
+
+// TestPromptDocuments_AmendmentFraming pins every amendment sentence verbatim:
+// the index preamble (count and order clause), the amended record's AmendedBy
+// sentence, the amendment's AmendsVia sentence in each of its three shapes, and
+// the dropped list's amendment suffix. It also pins the successor-only index
+// preamble byte-identical to the pre-#4471 text.
+func TestPromptDocuments_AmendmentFraming(t *testing.T) {
+	t.Run("amendment shown in full after the record it amends", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: amendedIndex(t, "accepted"), "docs/adr/001.md": "P-BODY", "docs/adr/002.md": "A-BODY"})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if sel.Matched != 2 || sel.Followed != 1 || sel.Amendments != 1 {
+			t.Fatalf("matched %d followed %d amendments %d, want 2, 1 and 1", sel.Matched, sel.Followed, sel.Amendments)
+		}
+		if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-001", "ADR-002"}) {
+			t.Fatalf("included %v, want [ADR-001 ADR-002] (the amended record ranks ahead of its amendment)", got)
+		}
+		pre := sel.indexFraming(true).Preamble
+		for _, want := range []string{
+			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede or amend a selected record (followed through supersedes / superseded_by and amends / amended_by); " +
+				"1 of the selected records amend a selected record, and an amended record still governs, except where an amendment decides otherwise; ",
+			"; a successor ranks with the records it supersedes; an amendment ranks with the records it amends, after them): ADR-001, ADR-002. ",
+		} {
+			if !strings.Contains(pre, want) {
+				t.Errorf("index preamble lacks %q:\n%s", want, pre)
+			}
+		}
+		docs := sel.PromptDocuments(true)
+		if len(docs) != 3 {
+			t.Fatalf("documents = %d, want index + 2 records", len(docs))
+		}
+		const amendedBy = "Status: accepted. This record is a SETTLED decision: a change that contradicts it should either conform to it or say why the decision should be revisited. " +
+			"Amended by ADR-002: it still governs, except where an amendment decides otherwise."
+		if !strings.Contains(docs[1].Heading, "ADR-001") || !strings.Contains(docs[1].Body, amendedBy) {
+			t.Errorf("amended record framing lacks the AmendedBy sentence:\n%s\n%s", docs[1].Heading, docs[1].Body)
+		}
+		const amendsVia = " This record was selected because it amends ADR-001; the amended record still governs except where this record decides otherwise. Its own applies_to matches no path this change touches."
+		if !strings.Contains(docs[2].Heading, "ADR-002") || !strings.Contains(docs[2].Body, amendsVia) {
+			t.Errorf("amendment framing lacks the AmendsVia sentence:\n%s\n%s", docs[2].Heading, docs[2].Body)
+		}
+		if strings.Contains(docs[2].Body, "supersedes") || strings.Contains(docs[2].Body, "Amended by") {
+			t.Errorf("the amendment (no Via, no AmendedBy) carries a successor or AmendedBy sentence:\n%s", docs[2].Body)
+		}
+	})
+
+	t.Run("a directly matched amendment says so", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{
+			indexPath: string(indexJSON(t,
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted", "backend/**"), []string{"ADR-001"}, nil),
+			)),
+			"docs/adr/001.md": "P-BODY", "docs/adr/002.md": "A-BODY",
+		})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if sel.Followed != 0 || sel.Amendments != 1 {
+			t.Fatalf("followed %d amendments %d, want 0 and 1", sel.Followed, sel.Amendments)
+		}
+		if pre := sel.indexFraming(true).Preamble; !strings.Contains(pre, "1 of the selected records amend a selected record") {
+			t.Errorf("index preamble does not count the directly matched amendment:\n%s", pre)
+		}
+		const want = " This record matches a path this change touches and is also selected because it amends ADR-001; the amended record still governs except where this record decides otherwise."
+		if docs := sel.PromptDocuments(true); !strings.Contains(docs[2].Heading, "ADR-002") || !strings.Contains(docs[2].Body, want) {
+			t.Errorf("directly matched amendment framing lacks %q:\n%s", want, docs[2].Body)
+		}
+	})
+
+	t.Run("a successor that also amends carries both sentences", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{
+			indexPath: string(indexJSON(t,
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"), nil, []string{"ADR-003"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted", "backend/**"), nil, []string{"ADR-003"}),
+				amending(linked(rec("ADR-003", "docs/adr/003.md", "accepted"), []string{"ADR-001"}, nil), []string{"ADR-002"}, nil),
+			)),
+			"docs/adr/001.md": "P-BODY", "docs/adr/002.md": "Q-BODY", "docs/adr/003.md": "S-BODY",
+		})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		i := slices.IndexFunc(sel.Included, func(inc Included) bool { return inc.Record.ID == "ADR-003" })
+		if i < 0 {
+			t.Fatalf("included %v, want ADR-003", includedIDs(sel))
+		}
+		const want = " This record was selected because it supersedes ADR-001; its own applies_to matches no path this change touches." +
+			" It is also selected because it amends ADR-002; the amended record still governs except where this record decides otherwise."
+		if body := sel.PromptDocuments(true)[1+i].Body; !strings.Contains(body, want) {
+			t.Errorf("successor-and-amendment framing lacks %q:\n%s", want, body)
+		}
+	})
+
+	t.Run("a non-accepted amended record is only named as amended", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: amendedIndex(t, "unknown"), "docs/adr/001.md": "P-BODY", "docs/adr/002.md": "A-BODY"})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		body := sel.PromptDocuments(true)[1].Body
+		if !strings.Contains(body, "Status: unknown.") || !strings.Contains(body, " Amended by ADR-002.") {
+			t.Errorf("unknown amended record framing lacks the plain AmendedBy sentence:\n%s", body)
+		}
+		if strings.Contains(body, "it still governs") {
+			t.Errorf("a record that is not accepted is said to still govern:\n%s", body)
+		}
+	})
+
+	t.Run("dropped amendment is named as one; the amended record is kept", func(t *testing.T) {
+		const capBytes = 2048
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: amendedIndex(t, "accepted"), "docs/adr/001.md": "P-BODY", "docs/adr/002.md": body("A", 3*capBytes)})
+		sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		if got := includedIDs(sel); !reflect.DeepEqual(got, []string{"ADR-001"}) {
+			t.Fatalf("included %v, want [ADR-001]", got)
+		}
+		if got := ids(sel.Dropped); !reflect.DeepEqual(got, []string{"ADR-002"}) {
+			t.Fatalf("dropped %v, want [ADR-002]", got)
+		}
+		if notice := sel.indexFraming(true).Preamble; !strings.Contains(notice, "- ADR-002 (docs/adr/002.md, status: accepted, amendment of ADR-001)") {
+			t.Errorf("dropped notice does not name the amendment:\n%s", notice)
+		}
+	})
+
+	t.Run("successor-only preamble is byte-identical to the pre-#4471 text", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{
+			indexPath: string(indexJSON(t,
+				linked(rec("ADR-001", "docs/adr/001.md", "superseded", "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+				linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+			)),
+			"docs/adr/001.md": "P-BODY", "docs/adr/002.md": "S-BODY",
+		})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
+			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); " +
+			"2 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first; a successor ranks with the records it supersedes): ADR-002, ADR-001. " +
+			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
+		if pre := sel.indexFraming(true).Preamble; pre != golden {
+			t.Errorf("successor-only preamble changed:\n got %q\nwant %q", pre, golden)
+		}
+		for _, d := range sel.PromptDocuments(true) {
+			if strings.Contains(d.Body, "amend") {
+				t.Errorf("a selection with no amendment link mentions amendment:\n%s", d.Body)
+			}
+		}
+	})
+}
+
+// TestAssemble_AmendedRecordBodyKeptAheadOfAmendments is approval condition
+// 2: on the ADR-040 shape (.fishhawk/operator.yaml selects ADR-040, which
+// ADR-097 and ADR-101 amend), at EVERY record budget the included records are
+// a prefix of [ADR-040, ADR-097, ADR-101], so ADR-040's body is included
+// whenever any amendment of it is, and the budget drops amendments first. The
+// bodies are sized like the shipped records (~7.5, ~10.5 and ~23 KiB), and
+// the comparator alone (newest first) would rank ADR-101 first, so at the
+// production cap it would show ADR-101 and drop ADR-040.
+func TestAssemble_AmendedRecordBodyKeptAheadOfAmendments(t *testing.T) {
+	idx := string(indexJSON(t,
+		amending(rec("ADR-040", "docs/adr/040.md", "accepted", ".fishhawk/operator.yaml"), nil, []string{"ADR-097", "ADR-101"}),
+		amending(rec("ADR-089", "docs/adr/089.md", "accepted"), nil, []string{"ADR-097", "ADR-101"}),
+		amending(rec("ADR-097", "docs/adr/097.md", "accepted"), []string{"ADR-040", "ADR-089"}, []string{"ADR-101"}),
+		amending(rec("ADR-101", "docs/adr/101.md", "accepted"), []string{"ADR-040", "ADR-089", "ADR-097"}, nil),
+	))
+	files := map[string]string{
+		indexPath:         idx,
+		"docs/adr/040.md": body("ADR-040-BODY", 7500),
+		"docs/adr/089.md": body("ADR-089-BODY", 9000),
+		"docs/adr/097.md": body("ADR-097-BODY", 10500),
+		"docs/adr/101.md": body("ADR-101-BODY", 23000),
+	}
+	order := []string{"ADR-040", "ADR-097", "ADR-101"}
+	sawPartial := false
+	for _, capBytes := range []int{4096, 8192, 16384, 20000, repodoc.DefaultMaxBytes, 45000, 65536} {
+		t.Run(fmt.Sprintf("cap %d", capBytes), func(t *testing.T) {
+			ff := newFetcher()
+			ff.seed(admissionSHA, files)
+			req := request(admissionSHA)
+			req.ChangePaths = []string{".fishhawk/operator.yaml"}
+			sel, err := Assemble(context.Background(), resolver(ff, capBytes), req)
+			if err != nil {
+				t.Fatalf("Assemble: %v", err)
+			}
+			got := includedIDs(sel)
+			if !slices.Equal(got, order[:len(got)]) {
+				t.Fatalf("included %v, want a prefix of %v (ADR-040's body whenever an amendment's is)", got, order)
+			}
+			if !slices.Equal(append(slices.Clone(got), ids(sel.Dropped)...), order) {
+				t.Errorf("included %v + dropped %v, want %v", got, ids(sel.Dropped), order)
+			}
+			if sel.Amendments != 2 {
+				t.Errorf("amendments = %d, want 2 (ADR-097, ADR-101)", sel.Amendments)
+			}
+			if capBytes == repodoc.DefaultMaxBytes && !slices.Equal(got, []string{"ADR-040", "ADR-097"}) {
+				t.Errorf("at the production cap included %v, want [ADR-040 ADR-097] (ADR-101 dropped, not ADR-040)", got)
+			}
+			if len(got) > 0 && len(got) < len(order) {
+				sawPartial = true
+			}
+		})
+	}
+	if !sawPartial {
+		t.Fatal("no budget dropped only some records: the sweep never exercised the drop order")
+	}
+}

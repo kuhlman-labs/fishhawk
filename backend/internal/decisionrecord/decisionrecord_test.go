@@ -45,6 +45,18 @@ func linked(r map[string]any, supersedes, supersededBy []string) map[string]any 
 	return r
 }
 
+// amending sets a record's OPTIONAL amendment links; a nil list leaves the key
+// absent, which is how scripts/check-adr writes an unlinked record.
+func amending(r map[string]any, amends, amendedBy []string) map[string]any {
+	if amends != nil {
+		r["amends"] = amends
+	}
+	if amendedBy != nil {
+		r["amended_by"] = amendedBy
+	}
+	return r
+}
+
 func indexJSON(t *testing.T, recs ...map[string]any) []byte {
 	t.Helper()
 	if recs == nil {
@@ -89,6 +101,29 @@ func TestParseIndex_Valid(t *testing.T) {
 	if !reflect.DeepEqual(idx.Records[0].AppliesTo, []string{"backend/internal/audit/**"}) {
 		t.Errorf("applies_to = %v", idx.Records[0].AppliesTo)
 	}
+	if idx.Records[0].Amends != nil || idx.Records[0].AmendedBy != nil {
+		t.Errorf("absent amends / amended_by decoded as %v / %v, want empty", idx.Records[0].Amends, idx.Records[0].AmendedBy)
+	}
+}
+
+// TestParseIndex_Valid_AmendmentKeys: the optional amends / amended_by keys
+// are accepted when present (on the two linked records only) and when present
+// but empty.
+func TestParseIndex_Valid_AmendmentKeys(t *testing.T) {
+	idx, err := ParseIndex(indexJSON(t,
+		amending(rec("ADR-001", "docs/adr/001-a.md", "accepted", "backend/internal/audit/**"), nil, []string{"ADR-002"}),
+		amending(rec("ADR-002", "docs/adr/002-b.md", "accepted"), []string{"ADR-001"}, nil),
+		amending(rec("ADR-003", "docs/adr/003-c.md", "accepted"), []string{}, []string{}),
+	))
+	if err != nil {
+		t.Fatalf("ParseIndex: %v", err)
+	}
+	if !slices.Equal(idx.Records[0].AmendedBy, []string{"ADR-002"}) || len(idx.Records[0].Amends) != 0 {
+		t.Errorf("ADR-001 amends %v amended_by %v, want [] / [ADR-002]", idx.Records[0].Amends, idx.Records[0].AmendedBy)
+	}
+	if !slices.Equal(idx.Records[1].Amends, []string{"ADR-001"}) || len(idx.Records[1].AmendedBy) != 0 {
+		t.Errorf("ADR-002 amends %v amended_by %v, want [ADR-001] / []", idx.Records[1].Amends, idx.Records[1].AmendedBy)
+	}
 }
 
 // TestParseIndex_FailsClosed is one case per refusal rung. Each case asserts
@@ -99,6 +134,13 @@ func TestParseIndex_FailsClosed(t *testing.T) {
 		return func(t *testing.T) []byte {
 			recs := baseRecords()
 			recs[1][field] = value
+			return indexJSON(t, recs...)
+		}
+	}
+	withRecords := func(mutate func(recs []map[string]any)) func(t *testing.T) []byte {
+		return func(t *testing.T) []byte {
+			recs := baseRecords()
+			mutate(recs)
 			return indexJSON(t, recs...)
 		}
 	}
@@ -133,6 +175,24 @@ func TestParseIndex_FailsClosed(t *testing.T) {
 		{"dangling supersedes", withRecord("supersedes", []string{"ADR-099"}), `records[1] (id "ADR-002"): supersedes[0] "ADR-099" names no record in the index`},
 		{"self superseded_by", withRecord("superseded_by", []string{"ADR-002"}), `records[1] (id "ADR-002"): superseded_by[0] "ADR-002" names the record itself`},
 		{"self supersedes", withRecord("supersedes", []string{"ADR-002"}), `records[1] (id "ADR-002"): supersedes[0] "ADR-002" names the record itself`},
+		// The optional amendment keys (E78.13 / #4471) take the same rungs.
+		{"amends not a list", withRecord("amends", "ADR-001"), "amends"},
+		{"bad amends id", withRecord("amends", []string{"ADR-x"}), `records[1] (id "ADR-002"): amends[0] "ADR-x" does not match`},
+		{"bad amended_by id", withRecord("amended_by", []string{"001"}), `records[1] (id "ADR-002"): amended_by[0] "001" does not match`},
+		{"dangling amends", withRecord("amends", []string{"ADR-099"}), `records[1] (id "ADR-002"): amends[0] "ADR-099" names no record in the index`},
+		{"dangling amended_by", withRecord("amended_by", []string{"ADR-099"}), `records[1] (id "ADR-002"): amended_by[0] "ADR-099" names no record in the index`},
+		{"self amends", withRecord("amends", []string{"ADR-002"}), `records[1] (id "ADR-002"): amends[0] "ADR-002" names the record itself`},
+		{"self amended_by", withRecord("amended_by", []string{"ADR-002"}), `records[1] (id "ADR-002"): amended_by[0] "ADR-002" names the record itself`},
+		// Exclusivity: the target exists and is not the record itself, so
+		// only the both-relations check refuses these.
+		{"same id in supersedes and amends", withRecords(func(recs []map[string]any) {
+			recs[1]["supersedes"] = []string{"ADR-001"}
+			recs[1]["amends"] = []string{"ADR-001"}
+		}), `records[1] (id "ADR-002"): "ADR-001" is listed in both supersedes and amends`},
+		{"same id in superseded_by and amended_by", withRecords(func(recs []map[string]any) {
+			recs[1]["superseded_by"] = []string{"ADR-001"}
+			recs[1]["amended_by"] = []string{"ADR-001"}
+		}), `records[1] (id "ADR-002"): "ADR-001" is listed in both superseded_by and amended_by`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -468,16 +528,225 @@ func TestSelect_SupersessionCycleTerminates(t *testing.T) {
 // (bypassing ParseIndex, which would refuse it) so Select's own guard is the
 // only refusal in the path.
 func TestSelect_DanglingLinkFailsWholeSelection(t *testing.T) {
-	idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
-		{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, SupersededBy: []string{"ADR-404"}},
-		{ID: "ADR-002", Path: "docs/adr/002.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}},
-	}}
-	got, err := Select(idx, []string{"a/x.go"})
-	if !errors.Is(err, ErrInvalidIndex) || got != nil {
-		t.Fatalf("Select = %v, %v; want nil, ErrInvalidIndex", ids(got), err)
+	cases := []struct {
+		name  string
+		first Record
+		want  string
+	}{
+		{
+			name:  "superseded_by",
+			first: Record{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, SupersededBy: []string{"ADR-404"}},
+			want:  `(id "ADR-001"): superseded_by "ADR-404" names no record`,
+		},
+		{
+			name:  "amended_by",
+			first: Record{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, AmendedBy: []string{"ADR-404"}},
+			want:  `(id "ADR-001"): amended_by "ADR-404" names no record`,
+		},
 	}
-	if !strings.Contains(err.Error(), `(id "ADR-001"): superseded_by "ADR-404" names no record`) {
-		t.Errorf("err = %q, want it to name ADR-001 and the absent ADR-404", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
+				tc.first,
+				{ID: "ADR-002", Path: "docs/adr/002.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}},
+			}}
+			got, err := Select(idx, []string{"a/x.go"})
+			if !errors.Is(err, ErrInvalidIndex) || got != nil {
+				t.Fatalf("Select = %v, %v; want nil, ErrInvalidIndex", ids(got), err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %q, want it to carry %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Amendment following (E78.13 / #4471).
+// ---------------------------------------------------------------------------
+
+// wantAmend is one expected selected record, in rank order, with both link
+// provenance lists.
+type wantAmend struct {
+	id        string
+	via       []string
+	amendsVia []string
+	matched   int
+	rankPaths int
+}
+
+// TestSelect_FollowsAmendments: every amendment fixture has an EMPTY
+// applies_to (unless the case says otherwise), so only following can select
+// it, and every amendment is NEWER than the record it amends, so the
+// comparator alone would rank it first: only placeAmendmentsAfterAmended puts
+// the amended record ahead.
+func TestSelect_FollowsAmendments(t *testing.T) {
+	cases := []struct {
+		name    string
+		records []map[string]any
+		paths   []string
+		want    []wantAmend
+	}{
+		{
+			name: "one hop via amended_by and the amendment's amends (reciprocal)",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantAmend{{"ADR-001", nil, nil, 1, 1}, {"ADR-002", nil, []string{"ADR-001"}, 0, 1}},
+		},
+		{
+			name: "one hop via the amendment's amends only (reverse-only, non-reciprocal)",
+			records: []map[string]any{
+				rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantAmend{{"ADR-001", nil, nil, 1, 1}, {"ADR-002", nil, []string{"ADR-001"}, 0, 1}},
+		},
+		{
+			name: "one hop via amended_by only (forward-only, non-reciprocal)",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				rec("ADR-002", "docs/adr/002.md", "accepted"),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantAmend{{"ADR-001", nil, nil, 1, 1}, {"ADR-002", nil, []string{"ADR-001"}, 0, 1}},
+		},
+		{
+			// Without inheritance ADR-002 ranks by 0 below ADR-003 (1).
+			name: "an amendment inherits the amended record's rank",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**", "b/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+				rec("ADR-003", "docs/adr/003.md", "accepted", "c/**"),
+			},
+			paths: []string{"a/x.go", "b/y.go", "c/z.go"},
+			want: []wantAmend{
+				{"ADR-001", nil, nil, 2, 2},
+				{"ADR-002", nil, []string{"ADR-001"}, 0, 2},
+				{"ADR-003", nil, nil, 1, 1},
+			},
+		},
+		{
+			// The amendment matches MORE paths directly, so the comparator
+			// ranks it first; the amended record still precedes it.
+			name: "an amended record ranks ahead of an amendment matching more paths",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted", "a/**", "b/**"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go", "b/y.go"},
+			want:  []wantAmend{{"ADR-001", nil, nil, 1, 1}, {"ADR-002", nil, []string{"ADR-001"}, 2, 2}},
+		},
+		{
+			// The comparator puts the accepted amendment ahead of the unknown
+			// record; the placement rule keeps the amended record first.
+			name: "an amendment ranks after a non-accepted record it amends",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "unknown", "a/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantAmend{{"ADR-001", nil, nil, 1, 1}, {"ADR-002", nil, []string{"ADR-001"}, 0, 1}},
+		},
+		{
+			name: "an amendment of a successor is followed (mixed chain)",
+			records: []map[string]any{
+				linked(rec("ADR-001", "docs/adr/001.md", "accepted", "a/**"), nil, []string{"ADR-002"}),
+				amending(linked(rec("ADR-002", "docs/adr/002.md", "accepted"), []string{"ADR-001"}, nil), nil, []string{"ADR-003"}),
+				amending(rec("ADR-003", "docs/adr/003.md", "accepted"), []string{"ADR-002"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want: []wantAmend{
+				{"ADR-002", []string{"ADR-001"}, nil, 0, 1},
+				{"ADR-003", nil, []string{"ADR-002"}, 0, 1},
+				{"ADR-001", nil, nil, 1, 1},
+			},
+		},
+		{
+			// ADR-002 matches directly; the record it amends (ADR-001) does
+			// not, and amended records are never followed.
+			name: "the amended record of a directly matched amendment is not followed",
+			records: []map[string]any{
+				amending(rec("ADR-001", "docs/adr/001.md", "accepted", "b/**"), nil, []string{"ADR-002"}),
+				amending(rec("ADR-002", "docs/adr/002.md", "accepted", "a/**"), []string{"ADR-001"}, nil),
+			},
+			paths: []string{"a/x.go"},
+			want:  []wantAmend{{"ADR-002", nil, nil, 1, 1}},
+		},
+		{
+			// The ADR-040 shape: two amendments of one record, the later one
+			// also amending the earlier one and a record that is not selected.
+			name: "an amendment of an amendment ranks after both",
+			records: []map[string]any{
+				amending(rec("ADR-040", "docs/adr/040.md", "accepted", ".fishhawk/operator.yaml"), nil, []string{"ADR-097", "ADR-101"}),
+				amending(rec("ADR-089", "docs/adr/089.md", "accepted"), nil, []string{"ADR-097", "ADR-101"}),
+				amending(rec("ADR-097", "docs/adr/097.md", "accepted"), []string{"ADR-040", "ADR-089"}, []string{"ADR-101"}),
+				amending(rec("ADR-101", "docs/adr/101.md", "accepted"), []string{"ADR-040", "ADR-089", "ADR-097"}, nil),
+			},
+			paths: []string{".fishhawk/operator.yaml"},
+			want: []wantAmend{
+				{"ADR-040", nil, nil, 1, 1},
+				{"ADR-097", nil, []string{"ADR-040"}, 0, 1},
+				{"ADR-101", nil, []string{"ADR-040", "ADR-097"}, 0, 1},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Select(mustIndex(t, tc.records...), tc.paths)
+			if err != nil {
+				t.Fatalf("Select: %v", err)
+			}
+			wantIDs := make([]string, 0, len(tc.want))
+			for _, w := range tc.want {
+				wantIDs = append(wantIDs, w.id)
+			}
+			if !reflect.DeepEqual(ids(got), wantIDs) {
+				t.Fatalf("selected %v, want %v", ids(got), wantIDs)
+			}
+			for i, w := range tc.want {
+				m := got[i]
+				if !slices.Equal(m.Via, w.via) || !slices.Equal(m.AmendsVia, w.amendsVia) || m.MatchedPaths != w.matched || m.RankPaths != w.rankPaths || m.Rank != i+1 {
+					t.Errorf("%s = {via %v amendsVia %v matched %d rankPaths %d rank %d}, want {via %v amendsVia %v matched %d rankPaths %d rank %d}",
+						w.id, m.Via, m.AmendsVia, m.MatchedPaths, m.RankPaths, m.Rank, w.via, w.amendsVia, w.matched, w.rankPaths, i+1)
+				}
+			}
+		})
+	}
+}
+
+// TestSelect_AmendmentCycleTerminates: a hand-built A<->B amendment cycle
+// must not loop, in the walk or in the placement pass (where neither record
+// is ever eligible, so the fallback takes the highest-ranked one).
+func TestSelect_AmendmentCycleTerminates(t *testing.T) {
+	idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
+		{ID: "ADR-001", Path: "docs/adr/001.md", Status: StatusAccepted, AppliesTo: []string{"a/**"}, AmendedBy: []string{"ADR-002"}},
+		{ID: "ADR-002", Path: "docs/adr/002.md", Status: StatusAccepted, AmendedBy: []string{"ADR-001"}},
+	}}
+	type result struct {
+		ms  []Match
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ms, err := Select(idx, []string{"a/x.go"})
+		done <- result{ms, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Select: %v", r.err)
+		}
+		// Comparator order is ADR-002, ADR-001 (newer first); each amends the
+		// other, so the fallback keeps that order.
+		if got := ids(r.ms); !slices.Equal(got, []string{"ADR-002", "ADR-001"}) {
+			t.Fatalf("selected %v, want [ADR-002 ADR-001]", got)
+		}
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("Select did not return on an amendment cycle")
 	}
 }
 
