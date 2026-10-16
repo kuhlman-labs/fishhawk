@@ -6869,3 +6869,187 @@ func TestSpecialistJobSuggestionKindsAreKnown(t *testing.T) {
 		}
 	}
 }
+
+// TestNextActions_MergeCandidateStaleness (E85.4 / #4147): a STALE
+// merge_candidate_staleness block on a non-terminal run makes every
+// nextActionsFor return path (ci_failed, review_coverage_incomplete and the
+// classify table) name fishhawk_rebase_run_branch {run_id, confirm} with
+// consumes none — INSERTED immediately before fishhawk_merge_run when the
+// merge is offered, APPENDED otherwise. Fresh, undetermined and an absent
+// block, and a terminal run, leave the actions deep-equal to the no-block
+// baseline; an existing plain rebase action is not duplicated.
+func TestNextActions_MergeCandidateStaleness(t *testing.T) {
+	two, capN := 2, 250
+	stale := &runMergeCandidateStaleness{State: "stale", HeadSHA: "hhhh", BaseRef: "main", BaseSHA: "bbbb",
+		BehindBy: &two, NextStep: "fishhawk_rebase_run_branch", Note: "n"}
+	zero := 0
+	fresh := &runMergeCandidateStaleness{State: "fresh", HeadSHA: "hhhh", BaseRef: "main", BaseSHA: "bbbb", BehindBy: &zero, Note: "n"}
+	undetermined := &runMergeCandidateStaleness{State: "undetermined", Reason: "compare_failed", Note: "n"}
+
+	pendingStages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")}
+	mergeStages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	type fixture struct {
+		name   string
+		state  string
+		stages []Stage
+		implRS *ReviewStatus
+		drive  *DriveStatus
+		merge  bool // the baseline offers fishhawk_merge_run
+	}
+	fixtures := []fixture{
+		{name: "ci_failed", state: "running", stages: pendingStages, drive: &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}},
+		{name: "review_coverage_incomplete", state: "running", stages: pendingStages, drive: &DriveStatus{Drive: true, DerivedStatus: stateReviewCoverageIncomplete}},
+		{name: "classify_no_merge", state: "running", stages: pendingStages},
+		{name: "classify_merge_offered", state: "running", stages: mergeStages, implRS: naReviewStatus("implement", "complete"), merge: true},
+	}
+	compute := func(f fixture, r *Run) *NextActions {
+		return nextActionsFor(r, f.stages, nil, f.implRS, nil, f.drive, false, false, false, "", "", releaseSignals{})
+	}
+	plainRebase := func(na *NextActions) []int {
+		var idx []int
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_rebase_run_branch" && a.Params["rerun_failed_verify"] != "true" {
+				idx = append(idx, i)
+			}
+		}
+		return idx
+	}
+
+	for _, f := range fixtures {
+		t.Run("stale/"+f.name, func(t *testing.T) {
+			r := naRun(f.state)
+			baseline := compute(f, r)
+			if got := naOffersMerge(baseline); got != f.merge {
+				t.Fatalf("fixture precondition: baseline offers merge = %v, want %v (%v)", got, f.merge, actionNames(baseline))
+			}
+			if len(plainRebase(baseline)) != 0 {
+				t.Fatalf("fixture precondition: baseline already carries a plain rebase: %v", actionNames(baseline))
+			}
+			r.MergeCandidateStaleness = stale
+			na := compute(f, r)
+			idx := plainRebase(na)
+			if len(idx) != 1 {
+				t.Fatalf("plain rebase actions = %d in %v, want exactly 1", len(idx), actionNames(na))
+			}
+			// The exact placement: the baseline with ONE action spliced in.
+			want := actionNames(baseline)
+			pos := len(want)
+			if f.merge {
+				for i, n := range want {
+					if n == "fishhawk_merge_run" {
+						pos = i
+						break
+					}
+				}
+			}
+			want = append(want[:pos], append([]string{"fishhawk_rebase_run_branch"}, want[pos:]...)...)
+			if got := actionNames(na); !reflect.DeepEqual(got, want) {
+				t.Errorf("actions = %v, want %v (rebase at %d)", got, want, pos)
+			}
+			if f.merge && (idx[0]+1 >= len(na.Actions) || na.Actions[idx[0]+1].Action != "fishhawk_merge_run") {
+				t.Errorf("rebase at %d is not immediately before fishhawk_merge_run: %v", idx[0], actionNames(na))
+			}
+			a := na.Actions[idx[0]]
+			wantParams := map[string]string{"run_id": r.ID, "confirm": "true"}
+			if !reflect.DeepEqual(a.Params, wantParams) {
+				t.Errorf("params = %v, want exactly %v", a.Params, wantParams)
+			}
+			if a.Consumes != consumesNone {
+				t.Errorf("consumes = %q, want none", a.Consumes)
+			}
+			for _, s := range []string{"hhhh", "main", "bbbb", "by 2 commit"} {
+				if !strings.Contains(a.Precondition, s) {
+					t.Errorf("precondition = %q, want it to name %q", a.Precondition, s)
+				}
+			}
+			for _, s := range []string{"merge_base_behind", "verify-only", "does not advance the branch itself"} {
+				if !strings.Contains(a.Reason, s) {
+					t.Errorf("reason = %q, want it to name %q", a.Reason, s)
+				}
+			}
+		})
+	}
+
+	t.Run("lower bound marked", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateStaleness = &runMergeCandidateStaleness{State: "stale", HeadSHA: "hhhh", BaseRef: "main",
+			BaseSHA: "bbbb", BehindBy: &capN, BehindByLowerBound: true}
+		na := compute(fixtures[2], r)
+		idx := plainRebase(na)
+		if len(idx) != 1 || !strings.Contains(na.Actions[idx[0]].Precondition, "by 250+ commit") {
+			t.Errorf("actions = %+v, want one rebase whose precondition names 250+", na.Actions)
+		}
+	})
+
+	t.Run("a stale block without behind_by names no count", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateStaleness = &runMergeCandidateStaleness{State: "stale", HeadSHA: "hhhh", BaseRef: "main", BaseSHA: "bbbb"}
+		na := compute(fixtures[2], r)
+		idx := plainRebase(na)
+		if len(idx) != 1 || !strings.Contains(na.Actions[idx[0]].Precondition, "by an unknown number of commit") {
+			t.Errorf("actions = %+v, want one rebase whose precondition names an unknown count", na.Actions)
+		}
+	})
+
+	for _, f := range fixtures {
+		for name, block := range map[string]*runMergeCandidateStaleness{"fresh": fresh, "undetermined": undetermined, "absent": nil} {
+			t.Run("unchanged/"+name+"/"+f.name, func(t *testing.T) {
+				r := naRun(f.state)
+				baseline := compute(f, r)
+				r.MergeCandidateStaleness = block
+				if got := compute(f, r); !reflect.DeepEqual(got, baseline) {
+					t.Errorf("actions with a %s block = %v, want the baseline %v", name, actionNames(got), actionNames(baseline))
+				}
+			})
+		}
+	}
+
+	t.Run("unchanged on a terminal run", func(t *testing.T) {
+		for _, state := range []string{"succeeded", "failed", "cancelled"} {
+			r := naRun(state)
+			prURL := "https://github.com/x/y/pull/1"
+			r.PullRequestURL = &prURL
+			f := fixture{stages: mergeStages, implRS: naReviewStatus("implement", "complete")}
+			baseline := compute(f, r)
+			if state == "succeeded" && !naOffersMerge(baseline) {
+				t.Fatalf("fixture precondition: the succeeded run's baseline must offer the merge (the fold would act on it): %v", actionNames(baseline))
+			}
+			r.MergeCandidateStaleness = stale
+			if got := compute(f, r); !reflect.DeepEqual(got, baseline) {
+				t.Errorf("%s run: actions = %v, want the baseline %v", state, actionNames(got), actionNames(baseline))
+			}
+		}
+	})
+
+	t.Run("not duplicated beside a plain rebase", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateStaleness = stale
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_rebase_run_branch",
+			Params: map[string]string{"run_id": r.ID, "confirm": "true"}}}}
+		foldMergeCandidateStaleness(r, na)
+		if len(na.Actions) != 1 {
+			t.Errorf("actions = %d after folding beside a plain rebase, want 1", len(na.Actions))
+		}
+		foldMergeCandidateStaleness(nil, na)
+		foldMergeCandidateStaleness(r, nil) // must not panic
+	})
+
+	t.Run("a rerun action is a different move", func(t *testing.T) {
+		r := naRun("running")
+		r.MergeCandidateStaleness = stale
+		r.MergeCandidateRerun = &runMergeCandidateRerun{HeadSHA: "hhhh", Cause: "base_advance", FailedSequence: 12}
+		na := compute(fixtures[2], r)
+		if idx := plainRebase(na); len(idx) != 1 {
+			t.Errorf("plain rebase actions = %d beside the rerun alternative, want 1: %v", len(idx), actionNames(na))
+		}
+		// nextActionsFor runs this fold BEFORE the rerun fold, so the de-dup's
+		// rerun_failed_verify carve-out is only observable on an na that
+		// already carries the rerun action: fold onto one directly.
+		pre := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_rebase_run_branch",
+			Params: map[string]string{"run_id": r.ID, "confirm": "true", "rerun_failed_verify": "true"}}}}
+		foldMergeCandidateStaleness(r, pre)
+		if idx := plainRebase(pre); len(idx) != 1 || len(pre.Actions) != 2 {
+			t.Errorf("actions = %v after folding beside a rerun action, want the plain rebase added", actionNames(pre))
+		}
+	})
+}
