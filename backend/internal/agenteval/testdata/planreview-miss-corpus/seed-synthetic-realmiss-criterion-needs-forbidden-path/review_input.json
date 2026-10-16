@@ -1,0 +1,256 @@
+{
+  "issue_title": "Catch broken report templates before they merge",
+  "issue_body": "Report templates live under `templates/reports/` as YAML files. A template that names a column the warehouse does not have, or carries a filter expression that does not parse, is only discovered when the nightly report run fails, after it has already merged and shipped.\n\nAdd a `make lint-templates` command that loads every template, checks each column against the warehouse catalog and parses each filter. It must exit non-zero and list every broken template with its file path and line, and exit 0 when every template is clean. We want broken templates caught before they merge, not by the nightly run.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/reports-service/issues/318",
+      "id": "example-org/reports-service#318"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add a report-template linter command and a make target that checks every template's columns and filters.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/templates/lint.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/templates/lint_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "cmd/templatelint/main.go",
+          "operation": "create"
+        },
+        {
+          "path": "Makefile",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/templates.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add internal/templates/lint.go: Lint(dir) loads every YAML template under dir, resolves each column against the warehouse catalog snapshot in internal/catalog, parses each filter with the existing filter parser, and returns one finding per problem carrying the file path, line and message."
+      },
+      {
+        "step": 2,
+        "description": "Add cmd/templatelint/main.go: run Lint over templates/reports/, print each finding as path:line: message, and exit 1 when any finding exists and 0 otherwise."
+      },
+      {
+        "step": 3,
+        "description": "Add a lint-templates target to the Makefile that builds and runs cmd/templatelint, beside the existing lint-sql target."
+      },
+      {
+        "step": 4,
+        "description": "Document the command and its path:line: message output format in docs/templates.md."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Table tests for Lint over fixture template directories: an unknown column, a filter that does not parse, two broken templates in one set, and a clean set. A command test runs the built binary against a broken fixture directory and asserts exit 1 and the path:line output.",
+      "rollback_plan": "Revert the PR; templates are again checked only by the nightly report run.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-lint-names-broken-template",
+          "statement": "Running make lint-templates against a template set containing one template with an unknown column exits non-zero and prints that template's file path and line.",
+          "source": "explicit",
+          "source_ref": "example-org/reports-service#318"
+        },
+        {
+          "id": "ac-lint-lists-every-broken",
+          "statement": "When two templates in the set are broken, make lint-templates prints a finding for both of them, not only the first.",
+          "source": "explicit",
+          "source_ref": "example-org/reports-service#318"
+        },
+        {
+          "id": "ac-lint-clean-exits-zero",
+          "statement": "Running make lint-templates against a template set with no broken templates exits 0.",
+          "source": "explicit",
+          "source_ref": "example-org/reports-service#318"
+        },
+        {
+          "id": "ac-merge-check-runs-template-lint",
+          "statement": "deploy/pipelines/verify.yml runs make lint-templates as a required step on every push, so a pull request with a broken template cannot merge.",
+          "source": "inferred",
+          "rationale": "The issue wants broken templates caught before they merge, and this repository's merge checks are the steps in deploy/pipelines/verify.yml, where lint-sql already runs as a required step."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The warehouse catalog snapshot in internal/catalog is regenerated weekly, so a column added in the last week can be reported as unknown until the next snapshot.",
+      "Repository paths under deploy/pipelines/** are platform-owned: the change workflow that implements this plan writes application code only, and a diff touching that tree fails the workflow's path check."
+    ],
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "unsatisfiable from",
+    "unsatisfiable within",
+    "unsatisfiable by this",
+    "unsatisfiable in this",
+    "unsatisfiable as planned",
+    "unsatisfiable because",
+    "unsatisfiable without",
+    "cannot be satisfied by this",
+    "cannot be satisfied from",
+    "cannot be satisfied within",
+    "cannot be satisfied without",
+    "can't be satisfied by this",
+    "can't be satisfied without",
+    "cannot be met by this",
+    "cannot be met without",
+    "cannot be delivered by this",
+    "cannot be delivered in this",
+    "cannot be delivered from",
+    "this change cannot edit",
+    "this change cannot touch",
+    "this change cannot modify",
+    "this change cannot write",
+    "this run cannot edit",
+    "this run cannot touch",
+    "this run cannot make",
+    "this run cannot change",
+    "this run cannot write",
+    "implementer cannot edit",
+    "implementer cannot touch",
+    "agent cannot edit the pipeline",
+    "agent cannot touch the pipeline",
+    "cannot edit verify.yml",
+    "cannot modify verify.yml",
+    "cannot touch verify.yml",
+    "cannot change verify.yml",
+    "can't edit verify.yml",
+    "can't touch verify.yml",
+    "cannot edit the pipeline",
+    "cannot modify the pipeline",
+    "cannot touch the pipeline",
+    "cannot change the pipeline",
+    "can't edit the pipeline",
+    "can't touch the pipeline",
+    "not allowed to edit",
+    "not allowed to touch",
+    "not allowed to modify",
+    "not permitted to edit",
+    "not permitted to touch",
+    "off-limits",
+    "off limits to",
+    "outside the writable",
+    "outside what this change",
+    "outside what the change",
+    "not writable",
+    "unwritable",
+    "write-protected",
+    "forbidden path",
+    "forbidden to this",
+    "forbidden for this",
+    "is forbidden",
+    "falls under deploy/pipelines",
+    "matches deploy/pipelines/**",
+    "covered by deploy/pipelines/**",
+    "excluded by deploy/pipelines",
+    "contradicts the plan's own risk",
+    "contradicts its own risk",
+    "contradicts the risk",
+    "conflicts with the risk",
+    "at odds with the risk",
+    "fail the path check",
+    "fails the path check",
+    "trip the path check",
+    "trips the path check",
+    "fail its own path check",
+    "needs a platform-team",
+    "requires a platform-team",
+    "platform-team change",
+    "platform-team edit",
+    "platform team must",
+    "platform team has to",
+    "operator-side edit",
+    "operator-side change",
+    "move it to out_of_scope",
+    "belongs in out_of_scope",
+    "record it in out_of_scope",
+    "into out_of_scope",
+    "under out_of_scope",
+    "second pull request",
+    "separate pull request"
+  ],
+  "attribution_phrases": [
+    "deploy/pipelines/verify.yml",
+    "verify.yml",
+    "required step on every push",
+    "on every push"
+  ],
+  "defect_phrases": [
+    "deploy/pipelines/verify.yml",
+    "lint-templates as a required step",
+    "deploy/pipelines/**"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-merge-check-runs-template-lint is unsatisfiable from inside this change: it requires editing deploy/pipelines/verify.yml, and the plan's own risks say deploy/pipelines/** is platform-owned and a diff touching it fails the workflow's path check. Move the pipeline step out of the criteria and record it as a platform-team change."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-merge-check-runs-template-lint contradicts the plan's own risk entry: verify.yml falls under deploy/pipelines/**, which the change workflow will not let this change write, so the criterion can only fail."
+    },
+    {
+      "severity": "medium",
+      "category": "feasibility",
+      "note": "The criterion that deploy/pipelines/verify.yml runs make lint-templates as a required step cannot be satisfied by this change; the implementing agent cannot edit the pipeline."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-merge-check-runs-template-lint needs a platform-team edit to deploy/pipelines/verify.yml; this run cannot make it. Scope the criteria to the make target and move it to out_of_scope."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "Criterion ac-merge-check-runs-template-lint: verify.yml is not writable by this change (the risks list puts deploy/pipelines/** off-limits), so it belongs in out_of_scope as an operator-side edit."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-merge-check-runs-template-lint should also assert the step fails the build when lint-templates exits 1."
+    },
+    {
+      "category": "risk",
+      "note": "ac-merge-check-runs-template-lint is ambiguous about which branches count; a push to a fork is unsupported."
+    },
+    {
+      "severity": "medium",
+      "category": "scope",
+      "note": "ac-merge-check-runs-template-lint names deploy/pipelines/verify.yml, but scope.files does not list it; add that file to the scope."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document the lint-templates output format in docs/templates.md with one example finding."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-lint-lists-every-broken: add a fixture where one template has both an unknown column and a filter that does not parse."
+    },
+    {
+      "severity": "low",
+      "category": "risk",
+      "note": "The weekly catalog snapshot can lag a new column; lint-templates would then flag a valid template and block it."
+    }
+  ]
+}

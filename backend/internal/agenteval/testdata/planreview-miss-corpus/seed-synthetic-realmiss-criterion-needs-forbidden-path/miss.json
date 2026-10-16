@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000445304",
+  "artifact_id": "00000000-0000-0000-0001-000000445304",
+  "triage_sequence": 123,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion demands a change to a path the implementing workflow may not write, so it is unsatisfiable from inside the run (bad criterion)",
+  "decided_at": "2026-10-15T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-merge-check-runs-template-lint",
+      "statement": "deploy/pipelines/verify.yml runs make lint-templates as a required step on every push, so a pull request with a broken template cannot merge.",
+      "source": "inferred",
+      "rationale": "The issue wants broken templates caught before they merge, and this repository's merge checks are the steps in deploy/pipelines/verify.yml, where lint-sql already runs as a required step.",
+      "observed": "deploy/pipelines/verify.yml has no lint-templates step: the implementation left the pipeline untouched because the change workflow rejects a diff under deploy/pipelines/**; make lint-templates itself works as the issue asks; the criterion failed",
+      "expected": "the criteria scoped to what the run can deliver, with the pipeline step recorded as an operator-side edit",
+      "steps_taken": "read deploy/pipelines/verify.yml at the pull request head and searched it for lint-templates",
+      "expectation_basis": "criterion ac-merge-check-runs-template-lint",
+      "repro_handle": "grep -n lint-templates deploy/pipelines/verify.yml",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}

@@ -1,0 +1,242 @@
+{
+  "issue_title": "Retune the thumbnail JPEG quality presets from measured numbers",
+  "issue_body": "Our three thumbnail presets (small, medium, large) still use JPEG quality values someone picked by hand years ago. Retune each preset to the lowest quality whose output keeps a minimum SSIM of 0.95 against the source across the sample image set, so thumbnails get smaller without visibly degrading.\n\nReviewers need to see the measured numbers for every preset, old and new (mean file size and minimum SSIM), before they approve the change.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/thumbnail-service/issues/142",
+      "id": "example-org/thumbnail-service#142"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Sweep JPEG quality per preset over the sample image set, pick the lowest value holding SSIM 0.95, and generate the presets and a results table from the sweep.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/bench/presets.go",
+          "operation": "create"
+        },
+        {
+          "path": "cmd/genpresets/main.go",
+          "operation": "create"
+        },
+        {
+          "path": "cmd/genpresets/main_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/thumbs/presets_gen.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/thumbs/presets.go",
+          "operation": "modify"
+        },
+        {
+          "path": "bench/results/presets.md",
+          "operation": "create"
+        },
+        {
+          "path": "Makefile",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add internal/bench/presets.go: for each preset, sweep JPEG quality from 40 to 95 over the images in the sample set, recording the mean output size and the minimum SSIM against the source for each value."
+      },
+      {
+        "step": 2,
+        "description": "Add cmd/genpresets/main.go: read the sweep output, choose for each preset the lowest quality whose minimum SSIM is at least 0.95, write internal/thumbs/presets_gen.go, and write bench/results/presets.md with one row per preset giving the old and new quality, mean size and minimum SSIM. internal/thumbs/presets.go reads its values from presets_gen.go."
+      },
+      {
+        "step": 3,
+        "description": "Add a bench-presets Makefile target that runs the sweep and then cmd/genpresets."
+      },
+      {
+        "step": 4,
+        "description": "The full sample set (4 GB) lives only on the shared media runner, which this change's own automation cannot reach. After the pull request opens, the media runner's benchmark job runs make bench-presets and pushes the regenerated presets_gen.go and bench/results/presets.md to the pull request branch in one commit. The job's token is scoped to repository contents only."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Unit tests for the quality choice in cmd/genpresets over a recorded sweep fixture: a preset whose threshold falls between two swept values, and a preset that already passes at the lowest value swept. A golden test pins the presets.md table layout. The full sweep runs only on the media runner.",
+      "rollback_plan": "Revert the PR; the presets return to their hand-picked quality values.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-presets-meet-ssim-floor",
+          "statement": "For every preset, the output at the new quality value has a minimum SSIM of at least 0.95 against the source across the sample image set.",
+          "source": "explicit",
+          "source_ref": "example-org/thumbnail-service#142"
+        },
+        {
+          "id": "ac-presets-lowest-passing-quality",
+          "statement": "For every preset, the swept quality one step below the new value has a minimum SSIM below 0.95 across the sample image set.",
+          "source": "explicit",
+          "source_ref": "example-org/thumbnail-service#142"
+        },
+        {
+          "id": "ac-results-table-in-description",
+          "statement": "The pull request description carries the measured size and SSIM table for every preset, old and new values side by side, before the change is approved.",
+          "source": "inferred",
+          "rationale": "The issue says reviewers must see the measured numbers for every preset before they approve, and reviewers read the pull request description first."
+        }
+      ]
+    },
+    "risks_and_assumptions": [
+      "The change workflow fills in the pull request's body from this plan's summary at the moment it opens the pull request.",
+      "SSIM is computed on the luma channel only; a chroma-only regression would not show in the minimum SSIM."
+    ],
+    "predicted_runtime_minutes": 55,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "cannot edit the description",
+    "can't edit the description",
+    "cannot edit the pull request description",
+    "can't edit the pull request description",
+    "cannot edit the pr description",
+    "cannot update the description",
+    "can't update the description",
+    "cannot update the pull request description",
+    "cannot update the pr description",
+    "cannot rewrite the description",
+    "cannot write the description",
+    "cannot write to the description",
+    "cannot change the description",
+    "cannot touch the description",
+    "cannot modify the description",
+    "no step updates the description",
+    "no step writes the description",
+    "no step edits the description",
+    "nothing updates the description",
+    "nothing edits the description",
+    "never updates the description",
+    "never edits the description",
+    "description is never updated",
+    "description is not updated",
+    "description is written before",
+    "description is fixed at",
+    "written before the numbers",
+    "before the numbers exist",
+    "before the results exist",
+    "before any numbers exist",
+    "description is not writable",
+    "not writable by",
+    "unwritable",
+    "contents-only token",
+    "contents-scoped token",
+    "contents-only scope",
+    "contents:write",
+    "pull-requests: write",
+    "pull_requests: write",
+    "pull-requests write",
+    "pull request write permission",
+    "pull-request write",
+    "no pull request permission",
+    "lacks pull request",
+    "lacks permission to edit",
+    "only pushes commits",
+    "can only push",
+    "only push commits",
+    "commit-only",
+    "unsatisfiable from",
+    "unsatisfiable as planned",
+    "unsatisfiable with",
+    "unsatisfiable because",
+    "unsatisfiable by",
+    "cannot be satisfied by the benchmark",
+    "cannot be satisfied by the media",
+    "cannot be satisfied by this",
+    "cannot be satisfied as planned",
+    "no mechanism updates the description",
+    "no mechanism to update the description",
+    "nothing in the plan writes",
+    "nothing in the plan updates",
+    "in a committed file",
+    "the committed file",
+    "a committed results",
+    "committed presets.md",
+    "committed bench/results",
+    "presets.md instead",
+    "results file instead",
+    "assert on bench/results",
+    "observe bench/results",
+    "check bench/results",
+    "contradicts approach step 4",
+    "contradicts step 4",
+    "conflicts with step 4"
+  ],
+  "attribution_phrases": [
+    "pull request description",
+    "size and ssim table",
+    "side by side"
+  ],
+  "defect_phrases": [
+    "size and ssim table",
+    "scoped to repository contents only"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-results-table-in-description cannot be satisfied by the benchmark job: the description is written when the pull request opens, before the numbers exist, and the media runner job's token is scoped to repository contents only, so it can push a commit but cannot edit the pull request description. Assert on bench/results/presets.md instead."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-results-table-in-description is unsatisfiable as planned: no step updates the description after the numbers arrive, and the only mechanism that has them (approach step 4) only pushes commits."
+    },
+    {
+      "severity": "medium",
+      "category": "feasibility",
+      "note": "The criterion that the pull request description carries the measured size and SSIM table needs pull-requests: write, which the media runner's contents-only token lacks; record the table in a committed file the reviewers read instead."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-results-table-in-description contradicts approach step 4: the only job holding the numbers has a contents-only token, and nothing in the plan updates the description once the pull request is open."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "Criterion ac-results-table-in-description: the description is never updated after the pull request opens, so the table cannot appear there; check the committed bench/results/presets.md file instead."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-results-table-in-description should also list the number of sample images measured for each preset."
+    },
+    {
+      "category": "risk",
+      "note": "ac-results-table-in-description is ambiguous about how many decimal places the SSIM column shows."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "ac-results-table-in-description: link the generated bench/results/presets.md from the pull request description rather than pasting the full table."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "The media runner benchmark job needs a timeout; a hung sweep holds the shared runner for every other team."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-presets-lowest-passing-quality: add a recorded-sweep fixture where two adjacent quality values tie on minimum SSIM."
+    },
+    {
+      "severity": "low",
+      "category": "documentation",
+      "note": "Document make bench-presets and the media runner job in docs/thumbnails.md."
+    }
+  ]
+}
