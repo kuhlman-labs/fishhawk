@@ -1754,6 +1754,46 @@ credential the agent held (the preview's fixed Postgres role can mint a
   with no refusal row. Counterfactual: deleting the `devModeActive()` branch
   answers 200 with the stage `dispatched`.
 
+## Interim host memory hold (`host_dispatch.go`, E85.11 / [#4330](https://github.com/kuhlman-labs/fishhawk/issues/4330))
+
+An optional, default-off dispatch hold on the host-dispatch marker. It is
+**INTERIM**: ADR-100's adaptive concurrency controller absorbs it, and #4330
+stays open (this is a partial delivery; the first-officer seat half is
+remaining scope).
+
+- **Seam.** `Config.HostAdmissionHold` is the package-local interface
+  `HostAdmissionHold { Held(now) (bool, reason string) }`; nil (the default)
+  leaves the marker byte-identical. fishhawkd wires it only under
+  `--enable-ops-monitor --ops-monitor-dispatch-hold` on a `local` deployment,
+  with the SAME `*opsmonitor.AdmissionHold` the ops monitor ticker updates
+  (`backend/cmd/fishhawkd/README.md` § "Interim dispatch hold"). That hold is
+  held while the memory probe reads CRITICAL pressure and reads not-held once
+  the ticker has not updated it for 3 × its effective interval, so a dead
+  ticker cannot pin admissions shut (`backend/internal/opsmonitor/README.md`).
+- **Where it fires.** After every eligibility and dependency guard (dev mode,
+  auth, runner_kind/executor, terminal run, wave order, post-deploy hold,
+  decomposed-parent acceptance) and the state switch, and BEFORE the bare CAS
+  or the concurrency slot admission. Only the two admissible arms reach it —
+  `pending` (a first plan-stage spawn) and `awaiting_host_dispatch` — so it
+  refuses EVERY new admission, and it commits nothing: no transition, no
+  queue row, no slot.
+- **Refusal.** `409 host_memory_pressure`, details `{stage_id, state, reason,
+  retry: "re-dispatch once the ops monitor clears the condition"}`. A plain
+  409, not the queued `concurrency_slot_queued`: an MCP slot waiter stops on
+  it and the operator re-dispatches once the condition clears; the stage stays
+  where it was.
+- **What it never touches.** The idempotent already-`dispatched` arm returns
+  before the hold is consulted (a spawn attempt exists; a dead-runner
+  re-dispatch proceeds), and nothing in flight is refused or killed.
+- **Tests** (`host_dispatch_test.go`):
+  `TestHostDispatch_HostMemoryHold_RefusesBothAdmissibleArms` (a held hold on a
+  `pending` and on an `awaiting_host_dispatch` stage: 409 with reason + retry,
+  and the re-read stage is unchanged — committed state, since with the check
+  deleted the CAS moves it to `dispatched`), `…_NotHeldAdmits`,
+  `…_NilIsDefault`, `…_AlreadyDispatchedUntouched` (the hold is not even
+  consulted) and `…_PrecedesSlotAdmission` (a grouped implement stage: a held
+  hold never calls `concurrency.Store.Admit`; the not-held control does).
+
 ## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
 
 `acceptance_admission.go::handleAcceptanceAdmission` —

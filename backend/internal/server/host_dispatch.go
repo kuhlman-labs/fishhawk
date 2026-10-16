@@ -28,6 +28,21 @@ const hostDispatchAnchorSource = "host_dispatch"
 // sits behind an earlier deploy stage that has not succeeded.
 const hostDispatchReasonDeployNotSucceeded = "deploy_not_succeeded"
 
+// HostAdmissionHold is the interim host-dispatch admission hold (E85.11 /
+// #4330; Config.HostAdmissionHold). Held reports whether NEW admissions are
+// held at now and a human-readable reason. Production is
+// *opsmonitor.AdmissionHold, whose Held also reads false once the ops
+// monitor has not updated it for 3 x its effective interval, so a dead
+// ticker cannot pin it. INTERIM: ADR-100's adaptive concurrency controller
+// absorbs it.
+type HostAdmissionHold interface {
+	Held(now time.Time) (held bool, reason string)
+}
+
+// hostDispatchHoldRetry is the `retry` detail on the 409
+// host_memory_pressure refusal.
+const hostDispatchHoldRetry = "re-dispatch once the ops monitor clears the condition"
+
 // hostDispatchResponse is the 200 body of the host-dispatch marker endpoint
 // (#1912). Transitioned is true when this call drove the stage
 // pending|awaiting_host_dispatch → dispatched (the spawn marker), false on the
@@ -96,6 +111,16 @@ type hostDispatchResponse struct {
 // predicate Orchestrator.Advance enforces. The idempotent `dispatched` arm is
 // deliberately NOT checked (a dead-runner re-spawn of an already-marked stage).
 // A stage-list read error there answers 500 dependency_check_failed.
+//
+// Host memory hold (E85.11 / #4330, INTERIM until ADR-100's adaptive
+// concurrency controller): with Config.HostAdmissionHold wired and held, a
+// stage in either admissible arm — `pending` or `awaiting_host_dispatch` —
+// returns 409 host_memory_pressure (details reason + retry) AFTER every
+// eligibility and dependency guard and BEFORE the CAS / slot admission, so
+// it commits no transition and no queue row. The idempotent `dispatched`
+// arm is deliberately NOT checked (a spawn attempt already exists), and
+// nothing in flight is refused or killed. A plain 409, not the queued one:
+// an MCP slot waiter stops on it and the operator re-dispatches.
 //
 // Decomposed-parent acceptance (#4080): an ACCEPTANCE stage of a run that has
 // decomposed children returns 409 acceptance_integration_incomplete — on every
@@ -411,6 +436,20 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 			"stage is not in a host-dispatchable state",
 			map[string]any{"stage_id": stageID.String(), "state": string(stage.State)})
 		return
+	}
+
+	// Host memory hold (E85.11 / #4330, INTERIM): only the two admissible
+	// arms reach here (the idempotent dispatched arm returned above), so the
+	// hold refuses every NEW admission and nothing already spawned. Before
+	// the CAS / slot admission, so a refusal commits no state.
+	if s.cfg.HostAdmissionHold != nil {
+		if held, reason := s.cfg.HostAdmissionHold.Held(time.Now()); held {
+			s.writeError(w, r, http.StatusConflict, "host_memory_pressure",
+				"new host-dispatch admissions are held while host memory pressure is critical",
+				map[string]any{"stage_id": stageID.String(), "state": string(stage.State),
+					"reason": reason, "retry": hostDispatchHoldRetry})
+			return
+		}
 	}
 
 	// CAS the observed state → dispatched under the row lock (production

@@ -2067,9 +2067,11 @@ func runServe(args []string, logSink io.Writer) int {
 			"terminal, and (E85.2 / #4146) the amendment_window and amendment_terminal probes: pending scope "+
 			"amendments whose decision window is closing or whose stage is terminal. Each failing condition writes "+
 			"one ops_probe_failed audit row and, with "+
-			"--ops-monitor-notify-issue, one issue comment per quiet window. Off by default; an invalid "+
-			"--ops-monitor-* value fails startup only when this is on")
+			"--ops-monitor-notify-issue, one issue comment per quiet window. E85.11 / #4330 adds the memory and "+
+			"workload_containers host-health probes and load attribution; each hysteresis crossing also writes one "+
+			"ops_monitor_alert row. Off by default; an invalid --ops-monitor-* value fails startup only when this is on")
 	opsMonitorFlagSet := registerOpsMonitorFlags(fs)
+	registerOpsMonitorDispatchHoldFlag(fs, opsMonitorFlagSet)
 	oidcAudience := fs.String("oidc-audience",
 		envOr("FISHHAWKD_OIDC_AUDIENCE", ""),
 		"GitHub Actions OIDC audience the signing-key endpoint requires; when set, callers must present a valid id_token whose aud matches this value")
@@ -3587,6 +3589,17 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn(skipReason)
 	}
 
+	// Interim dispatch hold (E85.11 / #4330): built BEFORE newServer copies
+	// cfg, and the SAME pointer goes to the ops monitor ticker below, which
+	// updates it every tick. nil (monitor off, --ops-monitor-dispatch-hold
+	// off, or a non-local deployment) leaves cfg.HostAdmissionHold nil and
+	// the host-dispatch marker unchanged. INTERIM: ADR-100's adaptive
+	// concurrency controller absorbs it.
+	opsHold := opsAdmissionHold(opsMonitorConf, logger)
+	if opsHold != nil {
+		cfg.HostAdmissionHold = opsHold
+	}
+
 	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
@@ -3970,13 +3983,15 @@ func runServe(args []string, logSink io.Writer) int {
 			GitHub:     cfg.GitHub,
 			Logger:     logger,
 			Seams:      serveOpsMonitorSeams,
+			Hold:       opsHold,
 		}
 		startOpsMonitor(ctx, newOpsMonitorTicker(*opsMonitorConf, deps), logger)
 		logger.Info("ops monitor started",
 			slog.String("deployment", string(opsMonitorConf.Deployment)),
 			slog.Duration("interval", opsMonitorConf.Interval),
 			slog.Duration("quiet_window", opsMonitorConf.QuietWindow),
-			slog.Bool("notify_issue", opsMonitorConf.NotifyIssue > 0 && cfg.GitHub != nil))
+			slog.Bool("notify_issue", opsMonitorConf.NotifyIssue > 0 && cfg.GitHub != nil),
+			slog.Bool("dispatch_hold", opsHold != nil))
 	}
 
 	// Child-completion sweeper (#455 / ADR-025 D4). Resolves parent
