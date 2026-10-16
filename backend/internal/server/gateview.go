@@ -181,6 +181,19 @@ type gateViewResponse struct {
 	// conflict or no AuditRepo; omitted with a fan_in history_gaps entry when
 	// a read or a payload decode fails. See fanInConflictForRun.
 	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty"`
+	// MergeCandidateStaleness is the read-time staleness of an open
+	// decomposed parent's consolidated PR head against its base tip (E85.4 /
+	// #4147): fresh | stale | undetermined, with next_step
+	// fishhawk_rebase_run_branch on stale. The same block GET /v0/runs/{id}
+	// carries. Computed only by handleGetRunGateView — never by
+	// buildGateView, which the attention scan calls per run — because it
+	// costs up to three forge GETs per (run, recorded head) per 60s cache
+	// entry. Omitted (nil) for a run that is not an open, non-terminal
+	// decomposed parent with a pull request; omitted with a
+	// merge_candidate_staleness history_gaps entry when the children list or
+	// the chain-head read fails, so an unreadable state is never shown as
+	// fresh. See mergeCandidateStalenessFor.
+	MergeCandidateStaleness *mergeCandidateStalenessPayload `json:"merge_candidate_staleness,omitempty"`
 }
 
 // gateViewFanInConflict is the gate view's fan_in_conflict block (#4343).
@@ -405,6 +418,25 @@ const gateViewGapMergeCandidateQueue = "merge_candidate_queue"
 // gateViewGapMergeCandidateVerdict names a failed merge_candidate_verdict
 // read (E87.2 / #4293).
 const gateViewGapMergeCandidateVerdict = "merge_candidate_verdict"
+
+// gateViewGapMergeCandidateStaleness names a failed merge_candidate_staleness
+// read (the children list or the chain head; E85.4 / #4147).
+const gateViewGapMergeCandidateStaleness = "merge_candidate_staleness"
+
+// gateViewMergeCandidateStalenessFor builds the gate view's
+// merge_candidate_staleness block, or nil plus a history_gaps entry when a
+// read fails, so an unreadable state is named rather than read as fresh.
+func (s *Server) gateViewMergeCandidateStalenessFor(ctx context.Context, runRow *run.Run, resp *gateViewResponse) *mergeCandidateStalenessPayload {
+	block, err := s.mergeCandidateStalenessFor(ctx, runRow)
+	if err != nil {
+		s.cfg.Logger.Warn("gate view: merge-candidate staleness read failed; omitting merge_candidate_staleness",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeCandidateStaleness)
+		return nil
+	}
+	return block
+}
 
 // gateViewMergeCandidateVerdict is the gate view's merge_candidate_verdict
 // block (E87.2 / #4293, ADR-096 D1/D2/D5 under ADR-098 D3).
@@ -1156,6 +1188,9 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
 	resp.MergeCandidateQueue = s.gateViewMergeCandidateQueueFor(r.Context(), runID, &resp)
 	resp.MergeCandidateVerdict = s.gateViewMergeCandidateVerdictFor(r.Context(), runRow, &resp)
+	// HERE and not in buildGateView (E85.4 / #4147): up to three forge GETs
+	// per cache entry, which the attention scan must not pay per run.
+	resp.MergeCandidateStaleness = s.gateViewMergeCandidateStalenessFor(r.Context(), runRow, &resp)
 	// HERE and not in buildGateView (approval condition C2, #4363): the
 	// attention scan must not pay the extra read.
 	resp.SpecialistJobs = s.gateViewSpecialistJobsFor(r.Context(), runRow, &resp)
