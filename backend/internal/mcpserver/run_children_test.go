@@ -475,7 +475,10 @@ func warningContaining(warnings []string, needle string) string {
 
 func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 	fb, srv := newFakeBackend(t)
-	r := newResolver(srv, nil)
+	// The binary comes from the daemon's FISHHAWK_RUNNER_BIN rung: runner_binary
+	// is refused over HTTP (E66.64 / #4476), and a resolvable binary keeps a
+	// deleted working_dir control reaching a spawn.
+	r := newResolver(srv, map[string]string{"FISHHAWK_RUNNER_BIN": "/fake/fishhawk-runner"})
 	r.httpTransport = true
 
 	parent := uuid.New()
@@ -486,7 +489,7 @@ func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 	spawn := withFakeDetachedSpawn(t)
 
 	_, _, err := r.runChildren(context.Background(), nil, RunChildrenInput{
-		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y",
 		// working_dir intentionally omitted.
 	})
 	if err == nil {
@@ -648,19 +651,21 @@ func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree(t *testing
 	// spawnRunnerStage). getwd is injected to the real repo so a DELETED
 	// http+empty refusal would fall through to it and spawn a real runner — the
 	// counterfactual RED. With the control present getwd is never consulted.
+	// The real runner resolves through the daemon's FISHHAWK_RUNNER_BIN rung,
+	// not runner_binary, which is refused over HTTP (E66.64 / #4476) — so the
+	// deleted-control counterfactual still reaches a real spawn.
 	r := &runResolver{
 		api:           newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
-		getenv:        func(string) string { return "" },
+		getenv:        envFuncFromMap(map[string]string{"FISHHAWK_RUNNER_BIN": runnerBin}),
 		httpTransport: true,
 		getwd:         func() (string, error) { return repo, nil },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	_, _, err = r.runChildren(ctx, nil, RunChildrenInput{
-		RunID:        parent.String(),
-		Workflow:     "wf",
-		GitHubRepo:   "x/y",
-		RunnerBinary: runnerBin,
+		RunID:      parent.String(),
+		Workflow:   "wf",
+		GitHubRepo: "x/y",
 		// working_dir intentionally omitted → refused over HTTP before any spawn.
 	})
 	// Non-fatal on the error precheck so the worktree-state assertion below ALWAYS
@@ -735,7 +740,8 @@ func TestRunChildren_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
 // argv still carries `--working-dir <that path>` (#2479).
 func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	fb, srv := newFakeBackend(t)
-	r := newResolver(srv, nil)
+	// Daemon-side binary rung: runner_binary is refused over HTTP (E66.64 / #4476).
+	r := newResolver(srv, map[string]string{"FISHHAWK_RUNNER_BIN": "/fake/fishhawk-runner"})
 	r.httpTransport = true
 
 	dir := t.TempDir()
@@ -751,7 +757,7 @@ func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	spawn := withFakeDetachedSpawn(t)
 
 	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
-		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y",
 		WorkingDir: dir,
 	})
 	if err != nil {
@@ -776,7 +782,8 @@ func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 // argv carries --working-dir <bound> and resolved_working_dir echoes it.
 func TestRunChildren_InheritsBoundWorkingDir(t *testing.T) {
 	fb, srv := newFakeBackend(t)
-	r := newResolver(srv, nil)
+	// Daemon-side binary rung: runner_binary is refused over HTTP (E66.64 / #4476).
+	r := newResolver(srv, map[string]string{"FISHHAWK_RUNNER_BIN": "/fake/fishhawk-runner"})
 	r.httpTransport = true
 
 	bound := t.TempDir()
@@ -793,7 +800,7 @@ func TestRunChildren_InheritsBoundWorkingDir(t *testing.T) {
 	spawn := withFakeDetachedSpawn(t)
 
 	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
-		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y",
 		// working_dir OMITTED — inherits the parent's binding.
 	})
 	if err != nil {

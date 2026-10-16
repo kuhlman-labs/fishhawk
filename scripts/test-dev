@@ -1045,6 +1045,33 @@ else
   pass "cmd_up serve leaves the ops monitor audit-only (no notify issue)"
 fi
 
+# 9a3. cmd_up serve launch enables the workflow scheduler (E79.1 / #3725) for
+# the weekly upkeep_scan (E80.2 / #3750): --enable-scheduler, a
+# --scheduler-repos list (without it fishhawkd logs and starts no ticker), and
+# --scheduler-runner-kind local (fishhawkd's default is github_actions, which
+# the local stack has no runner for). The flag array must reach the serve
+# argv, not only be assigned.
+if print -r -- "$up_body" | grep_q -- '--enable-scheduler' \
+  && print -r -- "$up_body" | grep_q -- '--scheduler-repos' \
+  && print -r -- "$up_body" | grep_q -- '--scheduler-runner-kind local' \
+  && print -r -- "$up_body" | grep_q -- 'serve --enable-child-completion-sweeper .*scheduler_flags\[@\]'; then
+  pass "cmd_up serve enables the scheduler for this repository on the local runner kind"
+else
+  fail "cmd_up serve should pass --enable-scheduler --scheduler-repos <repo> --scheduler-runner-kind local"
+fi
+
+# 9a4. cmd_up serve launch enables the merge-outcome CI observer (E82.2 /
+# #3779, ADR-085): it reads the forge and writes only internal
+# run_merge_ci_observed audit rows. The flag array must reach the serve argv,
+# and the env opt-out must exist.
+if print -r -- "$up_body" | grep_q -- '--enable-merge-outcome-observer' \
+  && print -r -- "$up_body" | grep_q -- 'FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER' \
+  && print -r -- "$up_body" | grep_q -- 'serve --enable-child-completion-sweeper .*merge_outcome_flags\[@\]'; then
+  pass "cmd_up serve enables the merge-outcome CI observer (opt-out FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER=0)"
+else
+  fail "cmd_up serve should pass --enable-merge-outcome-observer via merge_outcome_flags, opt-out FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER=0"
+fi
+
 # 9b. cmd_k8s_up readiness gate: like cmd_up, the body must poll _await_healthz,
 # tail the pod logs, and exit 1 on failure so a future edit can't silently drop
 # the fail-loud guarantee of the Docker-Desktop bring-up.

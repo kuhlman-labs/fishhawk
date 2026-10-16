@@ -18214,7 +18214,7 @@ func TestRequestSpecialistJob_RefusalLeavesNoOrphanJob(t *testing.T) {
 				r.httpTransport, r.allowedRoots = true, []string{root}
 				return r
 			},
-			in:      RequestSpecialistJobInput{WorkingDir: outside, RunnerBinary: "/opt/fishhawk-runner"},
+			in:      RequestSpecialistJobInput{WorkingDir: outside},
 			wantErr: pathOutsideAllowedRootsCode,
 		},
 		{
@@ -18234,8 +18234,20 @@ func TestRequestSpecialistJob_RefusalLeavesNoOrphanJob(t *testing.T) {
 				r.httpTransport, r.allowedRoots = true, []string{root}
 				return r
 			},
-			in:      RequestSpecialistJobInput{RunnerBinary: "/opt/fishhawk-runner"},
+			in:      RequestSpecialistJobInput{},
 			wantErr: "working_dir is required",
+		},
+		{
+			// E66.64 / #4476: a runner_binary over HTTP is refused before the
+			// POST, so it too leaves no orphan job row.
+			name: "runner_binary supplied over HTTP",
+			r: func(srv *httptest.Server) *runResolver {
+				r := newResolver(srv, nil)
+				r.httpTransport, r.allowedRoots = true, []string{root}
+				return r
+			},
+			in:      RequestSpecialistJobInput{WorkingDir: root, RunnerBinary: "/opt/fishhawk-runner"},
+			wantErr: runnerBinaryNotAllowedCode,
 		},
 		{
 			name:    "runner binary unresolvable",

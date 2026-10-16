@@ -2923,7 +2923,39 @@ cmd_up() {
   if [[ "${FISHHAWK_DEV_OPS_MONITOR:-1}" != "0" ]]; then
     ops_monitor_flags=(--enable-ops-monitor --ops-monitor-dispatch-hold)
   fi
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" >> "$LOG_FILE" 2>&1 &
+  #
+  # --enable-scheduler (E79.1 / #3725): starts each workflow that declares a
+  # `schedule` once per due cron window — today upkeep_scan, the weekly
+  # dependency-advisory and upkeep scan (E80.2 / #3750), and backlog_grooming
+  # on the grooming anchor #3112. The scheduler reads
+  # .fishhawk/workflows.yaml at the DEFAULT branch through the GitHub App, so
+  # a schedule fires only once it is merged. --scheduler-repos names the
+  # repositories it scans (FISHHAWKD_SCHEDULER_REPOS overrides the default,
+  # this repository). --scheduler-runner-kind local: fishhawkd's default is
+  # github_actions; local makes a started run park at awaiting_host_dispatch
+  # until a host dispatches it, so a firing spends nothing on its own.
+  # FISHHAWK_DEV_SCHEDULER=0 drops all three flags. scripts/test-dev pins them.
+  local -a scheduler_flags
+  scheduler_flags=()
+  if [[ "${FISHHAWK_DEV_SCHEDULER:-1}" != "0" ]]; then
+    scheduler_flags=(--enable-scheduler
+      --scheduler-repos "${FISHHAWKD_SCHEDULER_REPOS:-kuhlman-labs/fishhawk}"
+      --scheduler-runner-kind local)
+  fi
+  #
+  # --enable-merge-outcome-observer (E82.2 / #3779, ADR-085): records each
+  # merged run's merge-commit CI conclusion, fixed at merged_at + 6h, as one
+  # run_merge_ci_observed audit row. Per 10m tick it makes at most 20 forge
+  # evaluations (GetPullRequest plus 1-5 check-run pages, all READS through
+  # the GitHub App) and writes nothing to the forge: the row is an internal
+  # fact record, not an issue-comment surface. FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER=0
+  # drops the flag. scripts/test-dev pins it.
+  local -a merge_outcome_flags
+  merge_outcome_flags=()
+  if [[ "${FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER:-1}" != "0" ]]; then
+    merge_outcome_flags=(--enable-merge-outcome-observer)
+  fi
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" "${merge_outcome_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"

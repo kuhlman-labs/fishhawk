@@ -34,9 +34,13 @@ ships a result), `write:fixups` / dispositions (the captain disposes findings),
 `attest:specialist-jobs` (only a runner credential attests). A seat cannot mint
 itself a token: POST `/v0/tokens` refuses a seat subject 403
 `first_officer_cannot_mint_tokens`. A seat cannot write tracker state: POST
-`/v0/work-items` (and so `fishhawk_file_issue` over `/mcp`, which dials it under
-the caller's bearer) checks no scope, so the route refuses a seat subject 403
-`first_officer_tracker_write_not_permitted` before the handler runs.
+`/v0/work-items` requires `write:runs` of every non-run-bound caller (#4481),
+which the seat scopes above withhold, and the route's named seat wrapper
+refuses a seat subject 403 `first_officer_tracker_write_not_permitted` ahead of
+that scope check, so the refusal is recorded. `fishhawk_file_issue` over `/mcp`
+is refused earlier, at the `/mcp` gate, with 403 `insufficient_scope` (its row
+requires `write:runs`); that gate refusal records no
+`first_officer_action_refused` row.
 
 ## Enforcement (server)
 
@@ -85,8 +89,9 @@ Specialist jobs: a seat files POST `/v0/specialist-jobs` with
 matches a run any of its campaign items is linked to) or 403
 `first_officer_subject_out_of_seat`. REST only: over `/mcp`,
 `fishhawk_request_specialist_job` stays `write:stages`, because that tool
-resolves a caller-chosen `runner_binary` and spawns it on the daemon host with
-the daemon's environment. A seat reaches no `/mcp` tool that spawns a host
+spawns the daemon-resolved runner on the daemon host with the daemon's
+environment, executing repository code from a caller-chosen `working_dir` (a
+caller-chosen `runner_binary` is refused over HTTP since #4476). A seat reaches no `/mcp` tool that spawns a host
 program (403 `insufficient_scope` at the gate); the REST request only queues.
 
 ## Residuals

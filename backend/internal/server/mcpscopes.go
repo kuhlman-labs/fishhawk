@@ -177,20 +177,40 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_record_merge_observation": {anyOf: []string{"write:runs"}},
 	"fishhawk_reconcile_merge":          {anyOf: []string{"write:runs"}},
 
-	// fishhawk_file_issue POSTs /v0/work-items, which enforces no scope:
-	// workitems.go gates on run ENTITLEMENT (runBoundTokenRunID) and
-	// repo consistency, not on a scope predicate. A first-officer seat passes
-	// this gate and is refused at that route by subject (403
-	// first_officer_tracker_write_not_permitted, refuseFirstOfficerTrackerWrite,
-	// E85.6 / #4148), since the tool dials it under the caller's own bearer.
-	"fishhawk_file_issue": mcpScopeAuthenticatedOnly,
+	// fishhawk_file_issue POSTs /v0/work-items (workitems.go
+	// resolveWorkItemRequest), which since #4481 calls
+	// requireWriteScope(w, r, "write:runs") for every NON-run-bound caller
+	// before the body is read, and admits a run-bound subject WITHOUT
+	// write:runs, gating it instead on its own-run entitlement
+	// (runBoundTokenRunID: 403 run_not_entitled on a foreign run_id, 403
+	// run_scoped_filing_required on the run-absent arm). That is the
+	// mutually-exclusive switch product_report.go handleFileProductReport uses
+	// for the same filing-with-deployment-credentials action, so the row is the
+	// same shape as fishhawk_report_product_issue's below.
+	//
+	// runBoundSubjectOK is a DELIBERATE widening relative to the prior
+	// mcpScopeAuthenticatedOnly row's derivation, and a permission-drift check
+	// will flag it: the run-bound in-run agent already reached this handler
+	// (the empty anyOf admitted it), and the handler already admits it by
+	// own-run entitlement, so the flag only keeps that path open now that
+	// anyOf names write:runs, which a run-bound token never carries. Waive the
+	// drift concern with this reason.
+	//
+	// A first-officer seat's clamped scopes (firstofficer.SeatScopes) lack
+	// write:runs, so over /mcp a seat is now refused HERE with
+	// insufficient_scope and records no first_officer_action_refused row (the
+	// documented gate residual). Over REST the subject wrapper
+	// (refuseFirstOfficerTrackerWrite, E85.6 / #4148) still refuses the seat
+	// first, by subject, and records the row.
+	"fishhawk_file_issue": {anyOf: []string{"write:runs"}, runBoundSubjectOK: true},
 
 	// fishhawk_preview_issue POSTs /v0/work-items/preview
 	// (workitem_preview.go handlePreviewWorkItem), which enforces no scope
-	// predicate either: the handler itself refuses a run-bound token 403
-	// preview_operator_only (ADR-064: no agent-reachable tracker read) and
-	// applies the point-read repo-visibility DENY — the same "gate admits, the
-	// handler refuses" posture as fishhawk_file_issue's row (#3774).
+	// predicate: the preview WRITES NOTHING (no provider.File, no audit), so
+	// the #4481 write:runs check on the filing deliberately skips it. The
+	// handler itself refuses a run-bound token 403 preview_operator_only
+	// (ADR-064: no agent-reachable tracker read) and applies the point-read
+	// repo-visibility DENY — a "gate admits, the handler refuses" row (#3774).
 	"fishhawk_preview_issue": mcpScopeAuthenticatedOnly,
 
 	// gateview.go handleGetRunGateView: a run-bound subject is authorized by
@@ -229,9 +249,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// handler ALSO refuses a run-bound token that carries write:stages
 	// (specialist_job_requester_not_a_seat), so runBoundSubjectOK stays false.
 	// The first-officer seat's specialistjob.RequestScope (E85.6 / #4148) is
-	// deliberately NOT an alternative here: this tool resolves a caller-chosen
-	// runner_binary and spawns it on the daemon host with the daemon's
-	// environment, so a seat reaching it could run any host executable. A
+	// deliberately NOT an alternative here: this tool spawns the daemon-resolved
+	// runner on the daemon host with the daemon's environment in a caller-chosen
+	// working_dir (a caller-chosen runner_binary is refused over HTTP since
+	// #4476), so a seat reaching it could run repository code on the host. A
 	// seat files its request over REST (POST /v0/specialist-jobs), which only
 	// queues the job. Pinned by
 	// TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools.

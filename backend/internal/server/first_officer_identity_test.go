@@ -346,12 +346,15 @@ func TestFirstOfficerSeat_ProhibitedVerbsRefused(t *testing.T) {
 	}
 }
 
-// A seat cannot file a work item (ADR-089 D2): POST /v0/work-items checks no
-// scope, so the seat's clamp cannot stop it and the route refuses the seat by
-// subject — 403 plus a refusal row, provider never called. The human bearer on
-// the SAME fixture files 201, so the seat's 403 comes from the subject guard,
-// not from a fixture that could not file. fishhawk_file_issue over /mcp dials
-// this route under the caller's bearer, so it meets the same refusal.
+// A seat cannot file a work item (ADR-089 D2): the route refuses the seat by
+// subject, ahead of its own write:runs check (#4481) — 403 plus a refusal row,
+// provider never called. The seat is minted WITH write:runs so the subject
+// guard, not the scope check, is what refuses it. A read:runs-only non-seat
+// bearer draws the scope check's 403 insufficient_scope with NO refusal row,
+// and the write:runs human bearer on the SAME fixture files 201, so the seat's
+// 403 comes from the subject guard, not from a fixture that could not file.
+// Over /mcp, fishhawk_file_issue's gate row now requires write:runs, so a seat
+// (clamped scopes lack it) is refused at the gate before this route.
 func TestFirstOfficerSeat_CannotFileWorkItem(t *testing.T) {
 	fp := &fakeWorkProvider{}
 	registerFakeProvider(t, fp)
@@ -376,7 +379,19 @@ func TestFirstOfficerSeat_CannotFileWorkItem(t *testing.T) {
 			t.Fatalf("%s: refusal payload = %v", seat, p)
 		}
 	}
-	human := f.mint("github:octocat", "read:runs")
+	// A read:runs-only NON-seat bearer is refused by the route's own write:runs
+	// check (#4481), not the seat wrapper: 403 insufficient_scope, nothing
+	// filed and no first_officer_action_refused row (it is not a seat).
+	reader := f.mint("github:reader", "read:runs")
+	before := len(f.aud.globalOf(auditFirstOfficerActionRefused))
+	requireCrewRefusal(t, f.do(http.MethodPost, "/v0/work-items", reader, body), http.StatusForbidden, "insufficient_scope")
+	if fp.called {
+		t.Fatal("read-only filing: the work-item provider was called")
+	}
+	if after := len(f.aud.globalOf(auditFirstOfficerActionRefused)); after != before {
+		t.Fatalf("read-only filing: refusal rows %d -> %d, want unchanged for a non-seat bearer", before, after)
+	}
+	human := f.mint("github:octocat", "write:runs")
 	if w := f.do(http.MethodPost, "/v0/work-items", human, body); w.Code != http.StatusCreated || !fp.called {
 		t.Fatalf("human filing: status %d, provider called %v, want 201 + called; body %s", w.Code, fp.called, w.Body.String())
 	}
@@ -630,9 +645,10 @@ func TestFirstOfficerSeat_TenantedAnchor(t *testing.T) {
 }
 
 // TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools pins that a seat cannot
-// execute a caller-selected host program over /mcp. Each tool below resolves
-// a caller-chosen runner_binary and spawns it on the daemon host with the
-// daemon's environment, so a real seat bearer (through the seat identity hook)
+// execute a host program over /mcp. Each tool below spawns the daemon-resolved
+// runner on the daemon host with the daemon's environment in a caller-chosen
+// working_dir (a caller-chosen runner_binary is refused over HTTP since
+// #4476), so a real seat bearer (through the seat identity hook)
 // is refused 403 insufficient_scope at the gate, before any tool registry is
 // built. The seat files specialist jobs over REST instead, which only queues.
 // The read tool at the end is the positive control: the same bearer passes

@@ -3512,7 +3512,19 @@ type postStatusCommentRequest struct {
 // entry using the same payload shape as the GHA sticky-comment path, so that
 // findStatusCommentID in the Notifier picks up local-path entries naturally
 // on subsequent GHA-side transitions (#428).
+//
+// Auth (#4483): write:runs, as rung 0 ahead of the configuration checks (the
+// merge_observation.go precedent). An anonymous caller is 401 and a bearer
+// without write:runs (a read-only token, a first-officer seat) is 403
+// insufficient_scope; neither appends a status_comment_posted row. A run-bound
+// mcp:run token gets no exemption: no in-run caller exists, and the only
+// production caller is the operator CLI's sticky-comment helper, which sends
+// its resolved bearer. Cookie sessions pass requireWriteScope as on every other
+// write route.
 func (s *Server) handlePostStatusComment(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
 			"status-comment endpoint requires a configured run repository", nil)

@@ -765,7 +765,8 @@ func TestNewServer_AllowedRootsReachesTheResolver(t *testing.T) {
 		return map[string]any{
 			"run_id": runID.String(), "workflow": "feature_change", "stage": "implement",
 			"working_dir": wd, "github_repo": "x/y", "push_and_open_pr": false,
-			"runner_binary": "/fake/fishhawk-runner",
+			// runner_binary omitted: it is refused over HTTP (E66.64 / #4476);
+			// withFakeRunner's LookPath stub resolves the daemon-side rung.
 		}
 	}
 	cfg := Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true, AllowedRoots: []string{root}}

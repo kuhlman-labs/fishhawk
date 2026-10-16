@@ -21,8 +21,9 @@ const progressLastEventMaxLen = 128
 // before the clamp runs. The report is three small fields — a 128-rune
 // last_event plus two ints — so a few KiB is ample; an oversized body trips the
 // decode-error branch and returns 400. The route sits behind
-// requireRunAccount(memberWrite), so only a run-bound bearer holder can reach
-// this, but the cap is cheap defense in depth.
+// requireRunAccount(memberWrite) and authorizeStageProgress, so only the run's
+// own run-bound bearer or a write:runs caller reaches the decode, but the cap
+// is cheap defense in depth.
 const progressMaxBodyBytes = 16 << 10
 
 // stageProgressStore is the CONSUMER-SIDE narrow capability the progress ingest
@@ -57,9 +58,11 @@ type stageProgressReport struct {
 // It projects the runner's mid-execution stage_progress heartbeat onto the
 // stage row, last-writer-wins, so an operator poll returns last_event / turns /
 // tokens instead of a single 'running' bit. Registered at the SAME memberWrite
-// tier and identical path shape as the sibling host-dispatch route, so the
-// run-bound fhm_ bearer the runner already holds admits it and the auth-change
-// impact inventory is empty.
+// tier and identical path shape as the sibling host-dispatch route. The
+// memberWrite tier bounds the tenant account only; the caller is then held by
+// authorizeStageProgress (#4483): the run-bound fhm_ bearer the runner already
+// holds is admitted on its OWN run (403 run_not_entitled on any other), and
+// every other caller needs write:runs (401 anonymous, 403 insufficient_scope).
 //
 // The terminal refusal is the UPDATE's own WHERE-state predicate: a heartbeat
 // that arrives after the stage settled matches zero rows (applied=false) and is
@@ -85,6 +88,9 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"run_id must be a valid UUID",
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+	if !s.authorizeStageProgress(w, r, runID) {
 		return
 	}
 	stageID, err := uuid.Parse(r.PathValue("stage_id"))
@@ -161,6 +167,29 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// authorizeStageProgress holds the caller of the progress ingest to the run it
+// reports on (#4483). A run-bound mcp:run:<uuid> token — the runner's
+// heartbeat bearer, which carries mcp:read and never write:runs — is admitted
+// only when its run equals the path run_id; a token for any other run is 403
+// run_not_entitled. Every other caller needs write:runs through
+// requireWriteScope, which also answers an anonymous caller 401 and admits a
+// cookie session, so the helper carries no separate anonymous arm. It runs
+// before stage_id parsing and the body decode, so a refused caller costs no
+// body read and no stage lookup. Returns true when the caller may proceed.
+func (s *Server) authorizeStageProgress(w http.ResponseWriter, r *http.Request, runID uuid.UUID) bool {
+	id := IdentityFrom(r.Context())
+	if tokenRunID, runBound := runBoundTokenRunID(id); runBound {
+		if tokenRunID != runID {
+			s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
+				"a run-bound token may only report progress for its own run",
+				map[string]any{"run_id": runID.String()})
+			return false
+		}
+		return true
+	}
+	return s.requireWriteScope(w, r, "write:runs")
 }
 
 // clampRunes truncates s to at most max runes, preserving UTF-8 boundaries.
