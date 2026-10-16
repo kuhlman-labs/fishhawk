@@ -493,6 +493,7 @@ var KnownCategories = map[string]struct{}{
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},
+	"ops_monitor_alert":                       {}, // E85.11 / #4330: a host-health hysteresis crossing (memory pressure, workload containers); ONE global-chain row per tick with an undeduplicated crossing, the ADR-097 D3 trigger record the first officer's standing watch consumes, also its own restart-surviving dedup record (opsmonitor) — INTERNAL, not an issue-comment surface
 	"ops_probe_failed":                        {}, // E85.1 / #4142: the opt-in ops monitor saw a failing host/process condition; one global-chain row per (condition, subject) per quiet window, also its restart-surviving dedup record (opsmonitor) — INTERNAL, not in issuecomment activityCategories
 	"parent_awaiting_child_scope_decision":    {},
 	"parent_awaiting_redrive":                 {},

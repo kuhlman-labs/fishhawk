@@ -383,6 +383,150 @@ func TestRemediesCoverEveryCondition(t *testing.T) {
 		!strings.Contains(remedies[ConditionGoCacheOverThreshold], "go clean -cache") {
 		t.Errorf("gocache remedy must name the trim and warn off go clean -cache")
 	}
+	// The E85.11 host-health remedies are host- and codebase-agnostic, like
+	// hosthealth's own remedy text.
+	for _, c := range []string{ConditionHostMemoryPressure, ConditionWorkloadContainersHigh, ConditionHostLoadIOWait} {
+		for _, tok := range []string{"scripts/", "backend/", "runner/", "cli/", "docs/", ".fishhawk", "go-build", "GOCACHE", "gocache", "node_modules", "/Users/", "/home/", "~/", "fishhawk_"} {
+			if strings.Contains(remedies[c], tok) {
+				t.Errorf("%s remedy names %q: host-health remedies carry no repo or host specifics", c, tok)
+			}
+		}
+	}
+}
+
+// --- ops_monitor_alert dedup ---------------------------------------------------
+
+func crossing(condition, subject string) Result {
+	r := failingResult("memory", condition, subject)
+	r.Crossing = true
+	return r
+}
+
+func alertRow(ts time.Time, keys ...[2]string) *audit.Entry {
+	var cs []map[string]string
+	for _, k := range keys {
+		cs = append(cs, map[string]string{"condition": k[0], "subject": k[1]})
+	}
+	b, _ := json.Marshal(map[string]any{"crossings": cs})
+	return &audit.Entry{Category: CategoryOpsMonitorAlert, Timestamp: ts, Payload: b}
+}
+
+// TestAlert_OnlyCrossingsWrite: a failing result that is not a crossing, an
+// ok result and an unknown one write no alert; a tick with two crossings
+// writes ONE row carrying both.
+func TestAlert_OnlyCrossingsWrite(t *testing.T) {
+	au, clk, h := &fakeAudit{}, newClock(), &captureHandler{}
+	notCrossing := failingResult("memory", ConditionHostMemoryPressure, "host")
+	tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(notCrossing, Result{Status: StatusOK}, Result{Status: StatusUnknown, Reason: "r"})}}, au, nil, clk, h)
+	tk.Tick(context.Background())
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 0 {
+		t.Errorf("alerts = %d for a tick with no crossing, want 0", n)
+	}
+	tk = newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"), crossing(ConditionWorkloadContainersHigh, "gate_containers"))}}, au, nil, clk, h)
+	tk.Tick(context.Background())
+	alerts := au.alerts(t)
+	if len(alerts) != 1 || len(alerts[0].Crossings) != 2 {
+		t.Fatalf("alerts = %+v, want one row with two crossings", alerts)
+	}
+	// With no composed remedy each crossing carries its table remedy, once.
+	want := remedies[ConditionHostMemoryPressure] + " " + remedies[ConditionWorkloadContainersHigh]
+	if alerts[0].Remedy != want || alerts[0].HoldGuidance == "" || alerts[0].OS == "" || alerts[0].Contributors == nil {
+		t.Errorf("alert = %+v", alerts[0])
+	}
+}
+
+// TestAlert_InMemoryDedup: a re-crossing inside the quiet window writes no
+// second row; one past the window does.
+func TestAlert_InMemoryDedup(t *testing.T) {
+	au, clk, h := &fakeAudit{}, newClock(), &captureHandler{}
+	tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"))}}, au, nil, clk, h)
+	tk.Tick(context.Background())
+	clk.Advance(30 * time.Minute)
+	tk.Tick(context.Background())
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 1 {
+		t.Errorf("alerts inside the window = %d, want 1", n)
+	}
+	clk.Advance(31 * time.Minute)
+	tk.Tick(context.Background())
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 2 {
+		t.Errorf("alerts past the window = %d, want 2", n)
+	}
+}
+
+// TestAlert_AuditLookupDedup: a fresh Ticker (a restart) is suppressed by an
+// ops_monitor_alert row inside the window whose crossings name the same
+// condition|subject; a partially suppressed tick writes only the rest; a
+// row outside the window, a different subject, an undecodable payload or
+// another category never suppresses.
+func TestAlert_AuditLookupDedup(t *testing.T) {
+	clk := newClock()
+	now := clk.Now()
+	au := &fakeAudit{listed: []*audit.Entry{
+		alertRow(now.Add(-10*time.Minute), [2]string{ConditionHostMemoryPressure, "host"}),
+		alertRow(now.Add(-3*time.Hour), [2]string{ConditionWorkloadContainersHigh, "gate_containers"}),
+		alertRow(now.Add(-5*time.Minute), [2]string{ConditionWorkloadContainersHigh, "other"}),
+		{Category: CategoryOpsMonitorAlert, Timestamp: now, Payload: []byte("{not json")},
+		auditRow(ConditionWorkloadContainersHigh, "gate_containers", now),
+		nil,
+	}}
+	tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"), crossing(ConditionWorkloadContainersHigh, "gate_containers"))}}, au, nil, clk, &captureHandler{})
+	tk.Tick(context.Background())
+	alerts := au.alerts(t)
+	if len(alerts) != 1 || len(alerts[0].Crossings) != 1 || alerts[0].Crossings[0].Condition != ConditionWorkloadContainersHigh {
+		t.Fatalf("alerts = %+v, want one row carrying only the unsuppressed containers crossing", alerts)
+	}
+	if got := au.listParams[len(au.listParams)-1]; got.Category == nil || *got.Category != CategoryOpsMonitorAlert || got.Limit != auditLookupLimit {
+		t.Errorf("lookup params = %+v", got)
+	}
+	// The audit hit is cached: the next tick inside the window does no new
+	// lookup for the suppressed key and still writes nothing for it.
+	calls := au.listCalls
+	clk.Advance(time.Minute)
+	tk.Tick(context.Background())
+	if au.listCalls != calls || au.categoryCount(CategoryOpsMonitorAlert) != 1 {
+		t.Errorf("list calls %d -> %d, alerts %d; want the cached suppression", calls, au.listCalls, au.categoryCount(CategoryOpsMonitorAlert))
+	}
+}
+
+// TestAlert_EveryCrossingSuppressedWritesNothing.
+func TestAlert_EveryCrossingSuppressedWritesNothing(t *testing.T) {
+	clk := newClock()
+	au := &fakeAudit{listed: []*audit.Entry{alertRow(clk.Now().Add(-time.Minute), [2]string{ConditionHostMemoryPressure, "host"})}}
+	tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"))}}, au, nil, clk, &captureHandler{})
+	tk.Tick(context.Background())
+	if n := au.categoryCount(CategoryOpsMonitorAlert); n != 0 {
+		t.Errorf("alerts = %d, want 0 when every crossing is suppressed", n)
+	}
+}
+
+// TestAlert_LookupFailureFailsOpen: a read error or a panicking lookup
+// WARN-logs and writes the single row; a nil Audit writes nothing and
+// still dedups in memory.
+func TestAlert_LookupFailureFailsOpen(t *testing.T) {
+	for name, au := range map[string]*fakeAudit{
+		"read error": {listErr: errors.New("db down")},
+		"panic":      {listPanic: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := &captureHandler{}
+			tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"))}}, au, nil, newClock(), h)
+			tk.Tick(context.Background())
+			if n := au.categoryCount(CategoryOpsMonitorAlert); n != 1 {
+				t.Errorf("alerts = %d, want 1 (fail open)", n)
+			}
+			if h.count(slog.LevelWarn, "alert dedup lookup failed") != 1 {
+				t.Error("no WARN for the failed alert lookup")
+			}
+		})
+	}
+	h := &captureHandler{}
+	clk := newClock()
+	tk := newTicker([]Probe{stubProbe{name: "m", check: fixed(crossing(ConditionHostMemoryPressure, "host"))}}, nil, nil, clk, h)
+	tk.Tick(context.Background())
+	tk.Tick(context.Background())
+	if h.count(slog.LevelWarn, "opsmonitor: host health crossing") != 1 {
+		t.Errorf("crossing WARNs = %d with no audit store, want 1 (in-memory dedup)", h.count(slog.LevelWarn, "opsmonitor: host health crossing"))
+	}
 }
 
 func TestResolveDeployment(t *testing.T) {

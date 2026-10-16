@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stalesweep"
 )
@@ -204,6 +205,13 @@ type LoadProbe struct {
 	// (/proc/loadavg, `sysctl -n vm.loadavg`, `uptime`) and runtime.NumCPU.
 	ReadLoad func(ctx context.Context) (float64, error)
 	Cores    func() int
+	// Attribution, when set, is read only once the load is over the limit
+	// (E85.11): a wait-dominated load (runnable vs uninterruptible tasks,
+	// or PSI io vs cpu when present) reads host_load_io_wait instead of
+	// host_load_high, so swap thrash is not mistaken for CPU contention. A
+	// read error falls back to host_load_high with the reading omitted. nil
+	// is exactly the E85.1 behavior.
+	Attribution func(ctx context.Context) (hosthealth.LoadAttribution, error)
 }
 
 // Name implements Probe.
@@ -247,8 +255,30 @@ func (p LoadProbe) Check(ctx context.Context) []Result {
 	if load > limit {
 		r.Status = StatusFailing
 		r.Condition = ConditionHostLoadHigh
+		if p.Attribution != nil {
+			attribute(ctx, p.Attribution, &r)
+		}
 	}
 	return []Result{r}
+}
+
+// attribute names what an over-limit load is made of and re-classifies a
+// wait-dominated one as host_load_io_wait. A read error leaves r as
+// host_load_high with nothing appended.
+func attribute(ctx context.Context, read func(context.Context) (hosthealth.LoadAttribution, error), r *Result) {
+	a, err := read(ctx)
+	if err != nil {
+		return
+	}
+	r.Observed += fmt.Sprintf("; %d runnable vs %d uninterruptible", a.Runnable, a.Uninterruptible)
+	if a.HasPSI {
+		r.Observed += fmt.Sprintf("; PSI io some avg10 %.2f vs cpu some avg10 %.2f", a.IOSomeAvg10, a.CPUSomeAvg10)
+	}
+	r.Detail["runnable"] = a.Runnable
+	r.Detail["uninterruptible"] = a.Uninterruptible
+	if a.WaitDominated() {
+		r.Condition = ConditionHostLoadIOWait
+	}
 }
 
 // uptimeLoadRe matches both `load average:` (procps) and `load averages:`

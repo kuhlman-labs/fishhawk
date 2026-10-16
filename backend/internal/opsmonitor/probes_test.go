@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/hosthealth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stalesweep"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -209,6 +210,60 @@ func TestLoadProbe(t *testing.T) {
 				t.Errorf("failing result = %+v", r)
 			}
 		})
+	}
+}
+
+// TestLoadProbe_Attribution (E85.11): an over-limit load is classified by
+// what it is made of. Load 160 on 14 cores (limit 56) with 150
+// uninterruptible vs 3 runnable is swap/I-O thrash -> host_load_io_wait.
+func TestLoadProbe_Attribution(t *testing.T) {
+	read := func(v float64) func(context.Context) (float64, error) {
+		return func(context.Context) (float64, error) { return v, nil }
+	}
+	attr := func(a hosthealth.LoadAttribution, err error) func(context.Context) (hosthealth.LoadAttribution, error) {
+		return func(context.Context) (hosthealth.LoadAttribution, error) { return a, err }
+	}
+	for name, tc := range map[string]struct {
+		load          float64
+		attribution   func(context.Context) (hosthealth.LoadAttribution, error)
+		wantStatus    Status
+		wantCondition string
+		wantObserved  string
+	}{
+		"wait dominated": {160, attr(hosthealth.LoadAttribution{Load1: 160, Runnable: 3, Uninterruptible: 150}, nil),
+			StatusFailing, ConditionHostLoadIOWait, "1-minute load 160.00 on 14 cores; 3 runnable vs 150 uninterruptible"},
+		"psi io dominated": {160, attr(hosthealth.LoadAttribution{Runnable: 90, Uninterruptible: 2, HasPSI: true, IOSomeAvg10: 70, CPUSomeAvg10: 10}, nil),
+			StatusFailing, ConditionHostLoadIOWait, "1-minute load 160.00 on 14 cores; 90 runnable vs 2 uninterruptible; PSI io some avg10 70.00 vs cpu some avg10 10.00"},
+		"runnable dominated": {160, attr(hosthealth.LoadAttribution{Runnable: 150, Uninterruptible: 3}, nil),
+			StatusFailing, ConditionHostLoadHigh, "1-minute load 160.00 on 14 cores; 150 runnable vs 3 uninterruptible"},
+		"attribution error": {160, attr(hosthealth.LoadAttribution{Runnable: 3, Uninterruptible: 150}, errors.New("ps failed")),
+			StatusFailing, ConditionHostLoadHigh, "1-minute load 160.00 on 14 cores"},
+		"under limit never attributes": {20, func(context.Context) (hosthealth.LoadAttribution, error) {
+			panic("attribution read under the limit")
+		}, StatusOK, "", "1-minute load 20.00 on 14 cores"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := LoadProbe{Factor: 4, ReadLoad: read(tc.load), Cores: func() int { return 14 }, Attribution: tc.attribution}
+			r := one(t, p.Check(context.Background()))
+			if r.Status != tc.wantStatus || r.Condition != tc.wantCondition || r.Observed != tc.wantObserved {
+				t.Errorf("result = %+v\nwant status %s condition %q observed %q", r, tc.wantStatus, tc.wantCondition, tc.wantObserved)
+			}
+		})
+	}
+}
+
+// TestLoadProbe_NilAttributionIsUnchanged: with no Attribution the result is
+// byte-identical to the E85.1 probe's.
+func TestLoadProbe_NilAttributionIsUnchanged(t *testing.T) {
+	p := LoadProbe{Factor: 4, ReadLoad: func(context.Context) (float64, error) { return 41, nil }, Cores: func() int { return 10 }}
+	got := fmt.Sprintf("%+v", one(t, p.Check(context.Background())))
+	want := fmt.Sprintf("%+v", Result{
+		Probe: "load", Condition: ConditionHostLoadHigh, Status: StatusFailing,
+		Observed: "1-minute load 41.00 on 10 cores", Threshold: "<= 40.0 (4.0 x 10 cores)",
+		Detail: map[string]any{"load1": 41.0, "cores": 10, "factor": 4.0},
+	})
+	if got != want {
+		t.Errorf("nil Attribution result\n got %s\nwant %s", got, want)
 	}
 }
 
