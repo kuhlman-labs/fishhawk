@@ -7,7 +7,11 @@
 #     pushed from a dirty branch).
 #  2. Builds the multi-stage Dockerfile with -ldflags=-X stamping
 #     the tag version into internal/version.Version.
-#  3. Pushes ghcr.io/kuhlman-labs/fishhawkd:vX.Y.Z + :latest.
+#  3. Pushes ghcr.io/kuhlman-labs/fishhawkd:vX.Y.Z, plus :latest for a
+#     final release only. A prerelease tag (one containing `-`, e.g.
+#     backend/v0.1.0-rc.1) pushes :vX.Y.Z-rc.N and leaves :latest on
+#     the last final release, matching the GitHub Release's
+#     prerelease / make_latest guard below.
 #  4. Signs the resulting image digest with cosign keyless.
 #  5. Generates an SPDX-JSON SBOM as a downloadable artifact.
 #  6. Publishes a GitHub Release with the SBOM + image-digest
@@ -210,9 +214,14 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/kuhlman-labs/fishhawkd
+          # latest=false turns off metadata-action's implicit `latest`, so
+          # the raw entry below is the ONLY thing that can emit it, and it
+          # is disabled for a prerelease tag (one containing `-`).
+          flavor: |
+            latest=false
           tags: |
             type=match,pattern=backend/(v.+),group=1
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
           labels: |
             org.opencontainers.image.title=fishhawkd
             org.opencontainers.image.description=Fishhawk backend control plane.

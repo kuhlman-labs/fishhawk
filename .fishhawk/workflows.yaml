@@ -20,7 +20,7 @@
 #   feature_change    build it — plan, implement, verify, approve
 #   routine_change     the low-risk variant the agent carries alone
 #   human_led_change   the variant a human writes and the log records
-#   release            ship it
+#   release            record the release and gate its environment deploy
 #
 # Key order in a YAML mapping carries no meaning to the parser, so this
 # ordering is for the reader. Stage order within a workflow is a
@@ -846,10 +846,22 @@ workflows:
               not: [author, agent]
 
   # ---------------------------------------------------------------------------
-  # release — ship it. The last step of the cycle, and a separate run.
+  # release — the last step of the cycle, and a separate run.
   #
-  # Fishhawk holds no deploy logic and no deploy credentials. This stage
-  # triggers an external pipeline, passing the run and stage identifiers the
+  # The run does two things. It anchors the release record (E33): the
+  # operator drives `fishhawk release prepare/preview/cut/publish` against
+  # it, producing evidence-linked release notes and the `release_cut` /
+  # `release_published` audit entries. And it gates environment deploys
+  # through the delegated `deploy.yml`, which is still a validation stub
+  # until #1418 points it at a real target.
+  #
+  # It does NOT cut or build binary tags. A `<component>/vX.Y.Z` tag push
+  # runs the tag-driven `.github/workflows/*-release.yml` workflows, which
+  # build, sign and publish the binaries and the fishhawkd image on their
+  # own; this run never triggers them.
+  #
+  # Fishhawk holds no deploy logic and no deploy credentials. The deploy
+  # stage triggers `deploy.yml`, passing the run and stage identifiers the
   # pipeline echoes back for correlation, then monitors it to a terminal
   # state and records a deployment artifact and audit trail.
   #
@@ -870,9 +882,9 @@ workflows:
     # declaration cannot yet distinguish an operator-triggered release from
     # anything else — it would match nothing and refuse every real run.
     description: >-
-      Delegating deploy workflow: triggers an external release pipeline and monitors it to a terminal state. Fishhawk holds no deploy logic or credentials. Operator-triggered after the corresponding feature_change runs merge.
+      Release record and deploy gate: anchors the E33 release record (fishhawk release prepare/preview/cut/publish, evidence-linked notes, release_cut/release_published audit) and gates environment deploys through the delegated deploy.yml (a stub until #1418). It does not cut or build binary tags; the tag-driven *-release.yml workflows do that. Fishhawk holds no deploy logic or credentials. Operator-triggered after the corresponding feature_change runs merge.
     auto_advance: true
-    # No `autonomy` and therefore no delegation: a production deploy always
+    # No `autonomy` and therefore no delegation: an environment deploy always
     # pages a human at the gate below, whatever the rest of the file allows.
     policy:
       max_stage_runtime: "30m"
@@ -887,10 +899,12 @@ workflows:
             workflow_ref: deploy.yml
             git_ref: main
         # Pre-flight constraints, evaluated at the gate before anything is
-        # dispatched. `change_freeze: false` declares the surface without
-        # blocking; set it to true to hold releases.
+        # dispatched. Staging only: `deploy.yml` is a stub until #1418, and
+        # no production target exists to deploy to. `change_freeze: false`
+        # declares the surface without blocking; set it to true to hold
+        # releases.
         constraints:
-          allowed_environments: [staging, production]
+          allowed_environments: [staging]
           change_freeze: false
         produces:
           - artifact: deployment
