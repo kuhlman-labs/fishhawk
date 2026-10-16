@@ -1193,8 +1193,8 @@ catch arm. This package keeps the forge reads, the build-then-attribute order, e
   index + records + the selection-level `document_truncated` (when a match was dropped by the cap) are written as
   ONE `repodoc.AttributeSet` (one `injection_set_id`; every `document_truncated` before any `document_injected`);
   a failure is `remit_unattributed` and the prompt is discarded. The selection's `cap_bytes` is the record budget
-  (the resolver's cap, counting the included records' rendered bytes only — the index is shaped under its own cap,
-  #4399); the remit and the fixed framing are outside it (contract:
+  (the resolver's cap, counting only the shown records' rendered bytes, whole bodies and Decision-section excerpts
+  (#4489) — the index is shaped under its own cap, #4399); the remit and the fixed framing are outside it (contract:
   `backend/internal/decisionrecord/README.md`). The records join `quoteDocs`, so E55.10 quote verification covers
   them. Tests: `decision_record_persona_test.go` (the index-near-cap case,
   `TestDecisionRecordPersona_IndexNearCap_RecordsStillShown`, pins that the index cannot starve the records).

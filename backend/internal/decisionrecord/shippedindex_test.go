@@ -225,9 +225,10 @@ func shippedFetcher(t *testing.T, idx *Index, raw []byte) *fakeFetcher {
 
 // TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments is approval
 // conditions 2 and 3 on the SHIPPED records: through Assemble with ADR-040's
-// operator.yaml scope, ADR-040's body ranks ahead of its amendments and is
-// included whenever any amendment is (at EVERY record budget swept, the
-// included set is a prefix of [ADR-040, ADR-097, ADR-101]); and at the
+// operator.yaml scope, ADR-040 ranks ahead of its amendments and is shown
+// whenever any amendment is (at EVERY record budget swept, the SHOWN set —
+// whole then excerpts — is a prefix of [ADR-040, ADR-097, ADR-101], and no
+// record is shown whole after an earlier one is excerpted, #4489); and at the
 // production cap the RENDERED prompt documents carry the amendment count, the
 // order clause and the per-record amendment sentences. The rendered persona
 // prompt itself (personaprompt.Build) is driven by agenteval's
@@ -245,15 +246,27 @@ func TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments(t *testing.T) 
 			t.Fatalf("budget %d: Assemble: %v", budget, err)
 		}
 		var got []string
+		whole := map[string]bool{}
 		for _, id := range includedIDs(sel) {
+			if slices.Contains(order, id) {
+				got = append(got, id)
+				whole[id] = true
+			}
+		}
+		for _, id := range excerptedIDs(sel) {
 			if slices.Contains(order, id) {
 				got = append(got, id)
 			}
 		}
 		if !slices.Equal(got, order[:len(got)]) {
-			t.Errorf("budget %d: included %v (of %v), want a prefix of %v: an amendment's body shown without the body of the record it amends", budget, got, includedIDs(sel), order)
+			t.Errorf("budget %d: shown %v (included %v, excerpted %v), want a prefix of %v: an amendment shown without the record it amends", budget, got, includedIDs(sel), excerptedIDs(sel), order)
 		}
-		t.Logf("budget %d: included %v, dropped %d", budget, includedIDs(sel), len(sel.Dropped))
+		for i := 1; i < len(got); i++ {
+			if whole[got[i]] && !whole[got[i-1]] {
+				t.Errorf("budget %d: %s shown whole after %s was excerpted: a lower-ranked record shown more fully than a higher-ranked one", budget, got[i], got[i-1])
+			}
+		}
+		t.Logf("budget %d: included %v, excerpted %v, dropped %d", budget, includedIDs(sel), excerptedIDs(sel), len(sel.Dropped))
 	}
 
 	sel, err := Assemble(context.Background(), resolver(ff, 0), req)
@@ -281,14 +294,108 @@ func TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments(t *testing.T) 
 		"Amended by ADR-097, ADR-101: it still governs, except where an amendment decides otherwise.",
 		"This record was selected because it amends ADR-040; the amended record still governs except where this record decides otherwise.",
 	}
-	if slices.Contains(inc, "ADR-101") {
-		wants = append(wants, "This record was selected because it amends ADR-040, ADR-097; the amended record still governs except where this record decides otherwise.")
-	} else {
-		wants = append(wants, "- ADR-101 (docs/adr/101-charter-authorization-mode.md, status: accepted, amendment of ADR-040, ADR-097)")
-	}
+	// ADR-101, whole or as its excerpt, carries its amendment sentence (#4489).
+	wants = append(wants, "This record was selected because it amends ADR-040, ADR-097; the amended record still governs except where this record decides otherwise.")
 	for _, w := range wants {
 		if !strings.Contains(rendered.String(), w) {
 			t.Errorf("the rendered decision-record documents lack %q", w)
 		}
+	}
+}
+
+// TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt is #4489's done-means
+// on the SHIPPED records: at the production cap, a change on ADR-040's scope
+// sees ADR-040 and ADR-097 whole and ADR-101 — the newest amendment, too large
+// to fit whole — as its Decision section, framed as one, instead of dropping
+// it. ADR-101's Decision-only Q4 answer reaches the rendered documents, and
+// its Recommendation-only Q4 question does not.
+func TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt(t *testing.T) {
+	idx, raw := shippedIndex(t)
+	ff := shippedFetcher(t, idx, raw)
+	req := request(admissionSHA)
+	req.ChangePaths = []string{operatorScope}
+	sel, err := Assemble(context.Background(), resolver(ff, 0), req)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	t.Logf("record budget %d, %d used; included %v excerpted %v dropped %v", sel.CapBytes, sel.IncludedBytes, includedIDs(sel), excerptedIDs(sel), ids(sel.Dropped))
+	if got := includedIDs(sel); !slices.Equal(got, []string{"ADR-040", "ADR-097"}) {
+		t.Fatalf("included %v, want [ADR-040 ADR-097]", got)
+	}
+	if got := excerptedIDs(sel); !slices.Equal(got, []string{"ADR-101"}) {
+		t.Fatalf("excerpted %v, want [ADR-101] (dropped %v)", got, ids(sel.Dropped))
+	}
+	if !slices.Equal(sel.Excerpted[0].AmendsVia, []string{"ADR-040", "ADR-097"}) {
+		t.Errorf("ADR-101 AmendsVia = %v, want [ADR-040 ADR-097]", sel.Excerpted[0].AmendsVia)
+	}
+	if slices.Contains(ids(sel.Dropped), "ADR-101") {
+		t.Errorf("ADR-101 is both excerpted and dropped")
+	}
+	if sel.IncludedBytes > sel.CapBytes {
+		t.Errorf("IncludedBytes %d over the %d-byte record budget", sel.IncludedBytes, sel.CapBytes)
+	}
+
+	docs := sel.PromptDocuments(false)
+	var adr101, others strings.Builder
+	var rendered strings.Builder
+	for _, d := range docs {
+		rendered.WriteString(d.Body)
+		rendered.WriteString("\n")
+		if strings.HasPrefix(d.Heading, "Decision record ADR-101") {
+			adr101.WriteString(d.Heading + "\n" + d.Body)
+		} else {
+			others.WriteString(d.Body)
+		}
+	}
+	// Premises: the anchors occur once in ADR-101's file, in the section the
+	// assertion below relies on, and nowhere in the other shown documents.
+	file := string(readShipped(t, adr101Path))
+	for _, anchor := range []string{decisionOnlyAnchor, recommendationOnlyProbe} {
+		if n := strings.Count(file, anchor); n != 1 {
+			t.Fatalf("premise: %q occurs %d times in %s, want exactly once", anchor, n, adr101Path)
+		}
+		if strings.Contains(others.String(), anchor) {
+			t.Fatalf("premise: %q appears outside ADR-101's document (ADR-040, ADR-097 or the index)", anchor)
+		}
+	}
+	if strings.Contains(others.String(), "holding only the lease credential") {
+		t.Fatalf("premise: the Q4 phrase appears outside ADR-101's document")
+	}
+	shown := adr101.String()
+	if shown == "" {
+		t.Fatalf("no ADR-101 document rendered")
+	}
+	for _, want := range []string{
+		"Decision record ADR-101 — status: accepted (Decision section only)",
+		decisionOnlyAnchor,
+		"holding only the lease credential",
+		"This record was selected because it amends ADR-040, ADR-097; the amended record still governs except where this record decides otherwise.",
+		"shown as its adr-decision-section-v1 rendering, not verbatim",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("ADR-101's rendered document lacks %q", want)
+		}
+	}
+	// The excerpt's PREAMBLE (before the Source line) names ADR-101's full
+	// path and says its full text was omitted for budget (#4489 amendment
+	// condition), so a reviewer can find the D1–D10 text the Decision adopts.
+	preamble, _, _ := strings.Cut(shown, "Source: ")
+	for _, want := range []string{
+		"Its full text (" + adr101Path + "), including any Recommendation or Options section the Decision adopts by reference (such as \"D1–D10 as written\"), was omitted for budget",
+		", and you cannot read it in this review: ",
+	} {
+		if !strings.Contains(preamble, want) {
+			t.Errorf("ADR-101's excerpt preamble lacks %q:\n%s", want, preamble)
+		}
+	}
+	if strings.Contains(shown, recommendationOnlyProbe) {
+		t.Errorf("ADR-101's rendered document carries the Recommendation-only %q: the excerpt leaked Recommendation text", recommendationOnlyProbe)
+	}
+	all := rendered.String()
+	if want := "1 of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: ADR-101. "; !strings.Contains(all, want) {
+		t.Errorf("the index framing lacks %q", want)
+	}
+	if strings.Contains(all, "- ADR-101 (docs/adr/101-charter-authorization-mode.md") {
+		t.Errorf("ADR-101 is still named as NOT INCLUDED")
 	}
 }

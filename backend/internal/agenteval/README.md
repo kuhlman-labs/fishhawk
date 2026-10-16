@@ -1119,9 +1119,14 @@ the budget runs out: `adr040-superseded-operator-role-reliance` shows ADR-101
 (23 KB) and ADR-040 in full and drops ADR-013 (#4453) while the index encodes
 ADR-101 as ADR-040's successor. Once ADR-101 is encoded as an amendment
 (E78.13 / #4471), ADR-040 ranks ahead of its amendments and ADR-097 joins the
-selection, so at the production cap ADR-040 and ADR-097 fit and ADR-101 is
-dropped (`TestPersonaPrompt_AmendmentFramingCrossesTheBoundary` on the
-`.fishhawk/operator.yaml` scope). Before #4399 the index and records shared one budget and
+selection, so at the production cap ADR-040 and ADR-097 fit whole. Since
+#4489 a record that does not fit whole is shown as its Decision-section
+excerpt instead of being dropped, so ADR-101 now reaches the persona as its
+Decision section (`TestPersonaPrompt_AmendmentFramingCrossesTheBoundary` on the
+`.fishhawk/operator.yaml` scope), and the `adr040-superseded-operator-role-reliance`
+case shows ADR-040 and ADR-097 whole and ADR-101 and ADR-013 as excerpts. That
+changed the rendered architect prompt for the case, so the architect arm's
+evidence record needs the operator's re-record. Before #4399 the index and records shared one budget and
 `Assemble` included ZERO full records. ADR-091 and ADR-095 still carry empty
 `applies_to` and are never matched (E86.58 / #4398 gave only ADR-098 a glob,
 `backend/internal/basedelta/**`, and added successor following, which reaches

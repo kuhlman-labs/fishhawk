@@ -20,8 +20,9 @@ dependency.
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
 | `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede or amend them (transitively), ranked. |
 | `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v1`, below) the persona is shown. |
-| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records into a separate record budget. Returns a `*Selection`. |
-| `Selection.PromptDocuments(grounded)` | The index, then each included record, as `prompt.InjectedDocument`s. |
+| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records, then Decision-section excerpts, into a separate record budget. Returns a `*Selection`. |
+| `DecisionExcerpt(content)` | A record's Decision section(s), verbatim, and whether it has any (the excerpt `Assemble` falls back to, #4489, below). |
+| `Selection.PromptDocuments(grounded)` | The index, then each included record, then each excerpt, as `prompt.InjectedDocument`s. |
 | `Selection.Attribution()` | The `repodoc.InjectionSet` for the selection: its documents plus, when anything was dropped, one selection-level truncation. A caller injecting other documents in the same prompt (the persona remit) merges this into ONE `repodoc.AttributeSet` call. |
 
 ## Strict parse (`ParseIndex`)
@@ -104,9 +105,10 @@ amended record.
 position, the highest-ranked remaining record whose `AmendsVia` records are
 all already placed, so no amendment ranks ahead of a selected record it amends
 — whatever its status, `RankPaths` or number. The amended record still
-governs, and the record budget is a strict prefix, so its body is never
-dropped while an amendment of it is shown: when the budget cannot fit them all,
-amendments are dropped first. An amendment cycle (only a hand-built index can
+governs, and the record budget is a strict prefix at two fidelities (whole,
+then Decision-section excerpt, #4489), so it is never shown less fully than an
+amendment of it: when the budget cannot fit them all, amendments are excerpted,
+then dropped, first. An amendment cycle (only a hand-built index can
 carry one) leaves no eligible record; the highest-ranked remaining record is
 then taken, so the pass terminates.
 
@@ -158,9 +160,10 @@ persona reviewed from index titles only.
   per-document `document_truncated` carries `cap_bytes`. That `cap_bytes` is
   the cap it was actually cut under, so it is below the resolver's cap
   whenever the index was reshaped.
-- **Records** — fitted, whole and in rank order, against a separate **record
-  budget** = the resolver's cap. `Selection.CapBytes` is that record budget and
-  `Selection.IncludedBytes` the sum of the INCLUDED RECORDS' rendered bytes
+- **Records** — fitted, in rank order, whole and then as Decision-section
+  excerpts (#4489), against a separate **record budget** = the resolver's cap.
+  `Selection.CapBytes` is that record budget and `Selection.IncludedBytes` the
+  sum of the rendered bytes of every record document SHOWN, whole or excerpt
   (the index excluded), always `<= CapBytes`; the selection-level
   `document_truncated`'s `cap_bytes` / `included_bytes` carry exactly those two
   values.
@@ -201,16 +204,24 @@ records <= cap), in the persona prompt only.
 2. **Each match, in rank order,** is fetched at the SAME commit and shaped
    under a cap **at least its raw size** — so what is measured is its
    UNTRUNCATED rendered size, never a size under the shrunk budget — and is
-   included only if that fits what remains of the record budget. The index
-   draws nothing from it (`TestAssemble_IndexNearCapDoesNotStarveRecords`).
-3. **Strict prefix.** The first match that does not fit, and EVERY lower-ranked
-   match, is dropped, even if a smaller lower-ranked record would fit: a
-   lower-ranked record is never shown while a higher-ranked one is hidden.
-   Records below the first drop are never fetched.
-4. **A record is never shown truncated.** One whose own untruncated size
-   exceeds the remaining record budget — including one larger than the whole
-   budget — is dropped and named
-   (`TestAssemble_OversizedRecordDroppedNeverTruncated`).
+   included WHOLE only if that fits what remains of the record budget. The
+   index draws nothing from it (`TestAssemble_IndexNearCapDoesNotStarveRecords`).
+   The first match that does not fit whole, and every lower-ranked match, is
+   offered only as its Decision-section excerpt, likewise measured untruncated
+   and shown when it fits what remains (below).
+3. **Strict prefix, at two fidelities.** The records SHOWN (whole or excerpt)
+   are a strict prefix of the ranking: the first match with no Decision
+   section, or whose excerpt does not fit, and EVERY lower-ranked match, is
+   dropped, even if a smaller lower-ranked record would fit, and records below
+   the first drop are never fetched. The records shown WHOLE are a strict
+   prefix of those shown: once a record is excerpted, no lower-ranked record is
+   shown whole, even one that would fit. So a lower-ranked record is never
+   shown more fully than a higher-ranked one.
+4. **A record is never shown truncated.** It is shown whole, or as its
+   complete Decision section(s), or not at all; one whose untruncated size
+   exceeds the remaining record budget and that has no fitting excerpt —
+   including one larger than the whole budget with no Decision section — is
+   dropped and named (`TestAssemble_OversizedRecordDroppedNeverTruncated`).
 
 **Typical scopes reach record bodies.** `minTypicalRecordBodies` (2) is the
 floor `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` holds on the
@@ -225,9 +236,47 @@ because of the injection cap` list of id, path, status, stating the record
 budget and that the index is capped separately) and in one
 `document_truncated` entry of the selection shape (`selection:
 "decision_record"`, `path` = index path, `commit`, `cap_bytes`,
-`included_bytes` — the record budget and the included records' bytes —
-`dropped: [{id, path, status, rank}]`, `dropped_count`),
+`included_bytes` — the record budget and the shown records' bytes, whole and
+excerpts — `dropped: [{id, path, status, rank}]`, `dropped_count`),
 written before any `document_injected` of the set (repodoc `AttributeSet`).
+
+## Decision-section excerpt (`DecisionExcerpt`, #4489)
+
+A record that does not fit the record budget whole is offered as its Decision
+section(s) instead of being dropped, so a large record — ADR-101 (~23 KB) on
+ADR-040's scope — still reaches the reviewer as its decision.
+
+- **Sections.** A section boundary is a level-1 or level-2 ATX heading at
+  column 0 (`^#{1,2}(?:[ \t]|\r?\n?$)`, an empty heading included). A section
+  runs from its heading to the next boundary or EOF; a level-3+ heading never
+  starts or ends one. A section is a Decision section when its heading matches
+  `(?i)^##[ \t]+decisions?\b`: `## Decision`, `## Decisions`,
+  `## Decision (2026-05-21)` and `## Decision addendum …` match;
+  `## Decisionmaking`, `### Decision` and `## Recommendation / Decision` do not.
+  EVERY Decision section is kept, verbatim and concatenated in file order;
+  line terminators (CRLF included) are kept as written.
+- **Fences.** A heading-shaped line inside a fenced code block (CommonMark
+  0.31.2 §4.5) is code: it neither ends nor starts a section. An opening fence
+  is 0-3 spaces then a run of at least three backticks or tildes (a backtick
+  fence's info string may not contain a backtick); a closing fence is 0-3
+  spaces, a run of the same character at least as long, then only spaces or
+  tabs; an unclosed fence runs to EOF.
+- **Rendering and hash domain.** `Assemble` shows the excerpt through
+  `repodoc.Fetched.Derive(DecisionExcerptRendering, …)`
+  (`adr-decision-section-v1`): `content_hash` and `original_bytes` stay the
+  committed FILE's, while `Content` and `rendered_bytes` are the excerpt's, and
+  its `document_injected` carries `rendering` / `rendering_bytes` (repodoc
+  README § "Derived renderings"). The excerpt is shaped under a cap at least
+  its own size, so it is never cut; a quoted passage verifies against the
+  excerpt the reviewer saw, recording the file's hash.
+- **Two-fidelity strict prefix.** Byte budget items 2-4 above:
+  `Selection.Included` (whole) then `Selection.Excerpted` (excerpts) is a
+  strict prefix of the ranking, and whole bodies are a strict prefix of the
+  shown set. With the amended-first placement (#4471), an amendment is never
+  shown more fully than the record it amends.
+- **Fallthrough.** A record with no Decision section, or whose excerpt does not
+  fit what remains, is dropped with everything below it, as before, and named
+  in the `NOT INCLUDED` list and the selection-level `document_truncated`.
 
 ## Pinning
 
@@ -266,7 +315,16 @@ All framing is system-authored. Every interpolated value is a count, an id
   record still governs except where an amendment decides otherwise, and its
   order clause adds that an amendment ranks with the records it amends, after
   them; with successors but no amendment it is byte-identical to the
-  pre-#4471 text.
+  pre-#4471 text. When any record is shown as an excerpt
+  (`len(Selection.Excerpted) > 0`), the preamble adds, after the shown-in-full
+  sentence (or `none of them is shown in full in this prompt.`), `<n> of them
+  did not fit the record budget whole and are shown below as excerpts, their
+  Decision section only, in rank order: <ids>.`; the not-shown clause becomes
+  `Every other record, and every section of an excerpted record outside its
+  Decision section, is NOT shown in this prompt` (grounded / ungrounded tails
+  unchanged); and the dropped list's header says the record budget is for
+  `the records shown in full or as excerpts`. With no excerpt every one of
+  these strings is byte-identical to the pre-#4489 text.
 - **Record** — heading `Decision record <id> — status: <status>`; the preamble
   states the status's meaning: `accepted` = settled; `unknown` = acceptance
   never confirmed, NOT a settled decision; `proposed` = not decided;
@@ -283,6 +341,19 @@ All framing is system-authored. Every interpolated value is a count, an id
   governs except where this record decides otherwise.` (with the same
   `applies_to` clause when `MatchedPaths` is 0, and as `It is also selected
   because it amends …` after a `Via` sentence).
+- **Excerpt** (#4489) — the record framing above, unchanged (status, amended
+  by, `Via`, `AmendsVia`), with ` (Decision section only)` appended to the
+  heading and a note appended to the preamble: only the Decision section
+  (every section whose heading begins with Decision) is shown, verbatim; its
+  other sections are NOT shown; and its full text, NAMED BY ITS PATH in the
+  preamble itself, including any Recommendation or Options section the
+  Decision adopts by reference (such as "D1–D10 as written"), was omitted for
+  budget. Grounded, the note says to read text the Decision refers to from the
+  review tree at that path rather than infer it (with the same HEAD-not-
+  admission-commit warning as the index); ungrounded, that it cannot be read in
+  this review and must not be inferred — the framing the architect remit's
+  "Records not shown in full" rule keys on. The Source line says
+  `shown as its adr-decision-section-v1 rendering, not verbatim`.
 
 ## Errors
 
@@ -328,6 +399,14 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | non-accepted or unrecognized status | framed as NOT settled, never `status: accepted` | `TestPromptDocuments_StatusFraming`, `TestPromptDocuments_UnknownRecordFromIndex` |
 | non-accepted amended record | named as amended, never said to still govern | `TestPromptDocuments_AmendmentFraming` |
 | control character in a dropped path | sanitized, cannot start a line | `TestPromptDocuments_DroppedNoticeSanitized` |
+| heading / fence rules of the excerpt parser (no Decision heading, EOF, H1 and empty-heading boundaries, level-3 kept, `### Decision` / indented / `## Decisionmaking` / `## Recommendation / Decision` not a start, dated / plural / lower-case match, multiple sections, fenced headings, fence close rules, two-character runs, CRLF) | exact excerpt bytes, `nil, false` when none | `TestDecisionExcerpt` |
+| shipped ADR-040 / ADR-097 / ADR-101 Decision heading form unrecognized, or the cut leaks Recommendation / Context / Consequences text | verify fails | `TestDecisionExcerpt_ShippedRecords` |
+| record over the budget whole, excerpt fits | shown as its excerpt (`adr-decision-section-v1`, the file's hash and size, never truncated) | `TestAssemble_DecisionExcerptFallback` (excerpt fits) |
+| record over the budget whole with no Decision section | dropped with every lower-ranked record, which is never fetched | `TestAssemble_DecisionExcerptFallback` (no Decision section) |
+| excerpt over the remaining record budget | dropped with every lower-ranked record; `IncludedBytes` stays `<= CapBytes` | `TestAssemble_DecisionExcerptFallback` (excerpt over the remaining budget) |
+| lower-ranked record that would fit whole after an excerpt | shown only as its excerpt (fidelity never increases) | `TestAssemble_DecisionExcerptFallback` (fidelity), `TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments` |
+| excerpt framing (index sentence, widened not-shown clause, dropped header, heading, note naming the record path with its grounded / ungrounded tail, Source line, a forged delimiter in the Decision section) | framed as an excerpt; delimiter neutralized | `TestPromptDocuments_ExcerptFraming`; on the shipped ADR-101 excerpt, `TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt` |
+| shipped ADR-040 scope at the production cap | ADR-040 and ADR-097 whole, ADR-101 as its Decision excerpt | `TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt`, `TestPersonaPrompt_AmendmentFramingCrossesTheBoundary` (agenteval), `TestDecisionRecordPersona_OverCap_ShowsDecisionExcerpt` (server) |
 
 ## Residuals
 
@@ -360,8 +439,23 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
   reached only as records gain globs. A followed record competes for the
   record budget like any other match, and the amended-first rule decides who
   is cut: on the `.fishhawk/operator.yaml` scope at the production cap,
-  ADR-040 and ADR-097 fit and ADR-101 (~23 KB) is dropped
-  (`TestPersonaPrompt_AmendmentFramingCrossesTheBoundary`).
+  ADR-040 and ADR-097 fit whole and ADR-101 (~23 KB) is shown as its ~1.5 KB
+  Decision-section excerpt (#4489;
+  `TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt`,
+  `TestPersonaPrompt_AmendmentFramingCrossesTheBoundary`). That excerpt is a
+  summary ("Adopt Option C with D1–D10 as written" plus the Q1–Q8 answers):
+  the D1–D10 text lives under ADR-101's Recommendation and is still not shown.
+- **Records with no Decision-prefixed heading have no excerpt.** ADR-026,
+  ADR-030 and ADR-071 carry no `## Decision…` heading today, so one that does
+  not fit whole is dropped as before. Setext headings and indented ATX headings
+  are not recognized (a deliberate narrowing of CommonMark §4.2).
+- **An excerpt-only selection writes no selection-level row.** The
+  selection-level `document_truncated` is written only when something is
+  dropped; an excerpted record is marked by its own `document_injected`'s
+  `rendering` / `rendering_bytes`.
+- **`PersonaArmRender.MatchedIDs` under-reports excerpts.** agenteval's
+  persona-arm render lists included and dropped ids only; its tests read
+  `Selection.Excerpted` directly. Follow-up filed by the operator (#4489).
 - **The shrink step bound is defense-in-depth.** The cap strictly decreases to
   the zero-cap guard, so the step bound is unreachable on any fixture;
   removing it was run and stays green.
