@@ -977,7 +977,7 @@ ceiling:
 
 - `adr040-superseded-operator-role-reliance` (`superseded_reliance`):
   unattended operation justified by ADR-040's harness-neutral model, which
-  ADR-101 supersedes with a lease-based, product-spawned operator.
+  ADR-101 amends with a lease-based, product-spawned operator.
 - `adr002-inline-sql-bypasses-sqlc` (`accepted_conflict`): a store query
   assembled in Go outside `queries.sql`, against ADR-002's Decision.
 - `adr046-required-field-in-frozen-major` (`accepted_conflict`): a required

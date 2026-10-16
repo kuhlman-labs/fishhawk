@@ -23,7 +23,7 @@ import (
 // and docs/adr/** read from the checkout (personaTestRepoRoot). Their
 // assertions are invariants — envelopes, byte identity, premises, a
 // min_matched_records floor — so a routine ADR landing does not redden verify,
-// while a genuine premise break (ADR-091 losing superseded_by, ADR-006's index
+// while a genuine premise break (ADR-091 losing amended_by, ADR-006's index
 // entry truncated away) does. Selection stats are logged, never pinned.
 const committedPersonaCorpus = "testdata/planreview-persona-corpus/architect"
 
@@ -476,6 +476,99 @@ func commonSuffixLen(a, b string) int {
 	return n
 }
 
+// supersededReliancePremiseErrors is the superseded_reliance premise: some
+// governing record has a REPLACING link, and every replacing link holds in the
+// real index. A superseded_by successor must be an accepted GOVERNING record
+// listing supersedes back. An amended_by amendment must be an accepted record
+// in the real index listing amends back, whether or not the case also lists it
+// as governing (E78.13 / #4471): a case may rest on an amended record whose
+// amendment's body the record budget drops (adr040, whose ADR-101 is ~23 KB),
+// and the persona then sees the amendment only through the index metadata. A
+// non-governing amendment is CHECKED against the real index, never skipped.
+func supersededReliancePremiseErrors(records []PersonaGoverningRecord, real map[string]realIndexEntry) []string {
+	governing := map[string]bool{}
+	for _, g := range records {
+		governing[g.ID] = true
+	}
+	var errs []string
+	replaced := 0
+	for _, g := range records {
+		for _, s := range g.SupersededBy {
+			replaced++
+			succ, ok := real[s]
+			if !ok || !governing[s] || succ.Status != "accepted" || !slices.Contains(succ.Supersedes, g.ID) {
+				errs = append(errs, fmt.Sprintf("%s's successor %s must be an accepted governing record listing supersedes %s", g.ID, s, g.ID))
+			}
+		}
+		for _, a := range g.AmendedBy {
+			replaced++
+			am, ok := real[a]
+			switch {
+			case !ok:
+				errs = append(errs, fmt.Sprintf("%s's amendment %s is absent from the real index", g.ID, a))
+			case am.Status != "accepted" || !slices.Contains(am.Amends, g.ID):
+				errs = append(errs, fmt.Sprintf("%s's amendment %s must be an accepted record listing amends %s (governing: %t)", g.ID, a, g.ID, governing[a]))
+			}
+		}
+	}
+	if replaced == 0 {
+		errs = append(errs, "a superseded_reliance case needs a governing record with superseded_by or amended_by")
+	}
+	return errs
+}
+
+// TestSupersededReliancePremise_Rows pins supersededReliancePremiseErrors on
+// hand-built real indexes: each refusal row differs from the accepted adr040
+// shape (ADR-040 governing, amended_by [ADR-097, ADR-101], neither governing)
+// in ONE fact about one non-governing amendment.
+func TestSupersededReliancePremise_Rows(t *testing.T) {
+	adr040 := []PersonaGoverningRecord{{ID: "ADR-040", Status: "accepted", SupersededBy: []string{}, AmendedBy: []string{"ADR-097", "ADR-101"}}}
+	realWith := func(edit func(map[string]realIndexEntry)) map[string]realIndexEntry {
+		r := map[string]realIndexEntry{
+			"ADR-040": {ID: "ADR-040", Status: "accepted", AmendedBy: []string{"ADR-097", "ADR-101"}},
+			"ADR-097": {ID: "ADR-097", Status: "accepted", Amends: []string{"ADR-040", "ADR-089"}, AmendedBy: []string{"ADR-101"}},
+			"ADR-101": {ID: "ADR-101", Status: "accepted", Amends: []string{"ADR-040", "ADR-089", "ADR-097"}},
+		}
+		if edit != nil {
+			edit(r)
+		}
+		return r
+	}
+	for _, tc := range []struct {
+		name    string
+		real    map[string]realIndexEntry
+		records []PersonaGoverningRecord
+		want    string // "" = accepted
+	}{
+		{"adr040 shape accepted", realWith(nil), adr040, ""},
+		{"non-governing amendment missing from the index", realWith(func(r map[string]realIndexEntry) { delete(r, "ADR-101") }), adr040, "ADR-040's amendment ADR-101 is absent from the real index"},
+		{"non-governing amendment not listing amends back", realWith(func(r map[string]realIndexEntry) {
+			e := r["ADR-101"]
+			e.Amends = []string{"ADR-089", "ADR-097"}
+			r["ADR-101"] = e
+		}), adr040, "ADR-040's amendment ADR-101 must be an accepted record listing amends ADR-040 (governing: false)"},
+		{"non-governing amendment not accepted", realWith(func(r map[string]realIndexEntry) {
+			e := r["ADR-097"]
+			e.Status = "proposed"
+			r["ADR-097"] = e
+		}), adr040, "ADR-040's amendment ADR-097 must be an accepted record listing amends ADR-040 (governing: false)"},
+		{"no replacing link", realWith(nil), []PersonaGoverningRecord{{ID: "ADR-040", Status: "accepted", SupersededBy: []string{}}}, "needs a governing record with superseded_by or amended_by"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := supersededReliancePremiseErrors(tc.records, tc.real)
+			if tc.want == "" {
+				if len(errs) != 0 {
+					t.Fatalf("refused the accepted shape: %v", errs)
+				}
+				return
+			}
+			if len(errs) != 1 || !strings.Contains(errs[0], tc.want) {
+				t.Fatalf("errors = %v, want exactly one naming %q", errs, tc.want)
+			}
+		})
+	}
+}
+
 // TestPersonaCatchCorpus_GoverningPremisesHold re-checks each case's planted
 // premise against the REAL index, decoded independently of the loader: every
 // governing record is listed with the declared status, superseded_by and
@@ -496,9 +589,7 @@ func TestPersonaCatchCorpus_GoverningPremisesHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range loadCommittedPersona(t) {
-		governing := map[string]PersonaGoverningRecord{}
 		for _, g := range c.Input.GoverningRecords {
-			governing[g.ID] = g
 			r, ok := real[g.ID]
 			if !ok {
 				t.Errorf("case %q: governing record %s is absent from the real index", c.Name, g.ID)
@@ -515,29 +606,8 @@ func TestPersonaCatchCorpus_GoverningPremisesHold(t *testing.T) {
 		}
 		switch c.Input.Kind {
 		case PersonaKindSupersededReliance:
-			replaced := 0
-			for _, g := range c.Input.GoverningRecords {
-				for _, s := range g.SupersededBy {
-					replaced++
-					succ, ok := real[s]
-					if _, gov := governing[s]; !ok || !gov || succ.Status != "accepted" || !slices.Contains(succ.Supersedes, g.ID) {
-						t.Errorf("case %q: %s's successor %s must be an accepted governing record listing supersedes %s", c.Name, g.ID, s, g.ID)
-					}
-				}
-				// An amended record may carry amendments the case does not rest
-				// on; only the governing ones count, and each must hold.
-				for _, a := range g.AmendedBy {
-					if _, gov := governing[a]; !gov {
-						continue
-					}
-					replaced++
-					if am, ok := real[a]; !ok || am.Status != "accepted" || !slices.Contains(am.Amends, g.ID) {
-						t.Errorf("case %q: %s's amendment %s must be an accepted governing record listing amends %s", c.Name, g.ID, a, g.ID)
-					}
-				}
-			}
-			if replaced == 0 {
-				t.Errorf("case %q: a superseded_reliance case needs a governing record with superseded_by, or with amended_by naming a governing amendment", c.Name)
+			for _, msg := range supersededReliancePremiseErrors(c.Input.GoverningRecords, real) {
+				t.Errorf("case %q: %s", c.Name, msg)
 			}
 		case PersonaKindAcceptedConflict:
 			for _, g := range c.Input.GoverningRecords {
