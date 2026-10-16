@@ -16,7 +16,8 @@
 # them, so the file reads top to bottom as one turn of the loop:
 #
 #   backlog_grooming   decide what to build
-#   feature_change     build it — plan, implement, verify, approve
+#   upkeep_scan        find upkeep work: flakes, pin drift, advisories
+#   feature_change    build it — plan, implement, verify, approve
 #   routine_change     the low-risk variant the agent carries alone
 #   human_led_change   the variant a human writes and the log records
 #   release            ship it
@@ -215,6 +216,75 @@ workflows:
               # login` (GitHub device-flow) credential, not the static MCP token.
               members: ["github:kuhlman-labs"]
               not: [agent]
+
+  # ---------------------------------------------------------------------------
+  # upkeep_scan — find what needs fixing before anyone asks.
+  #
+  # A propose-only scan for repository upkeep: recorded-run flakes,
+  # toolchain-pin drift, deprecations and dependency vulnerability
+  # advisories (govulncheck reachability per Go module, pnpm audit per
+  # lockfile; E80.2 / #3750). The scan stage emits an upkeep_report and
+  # stops at a human approval. Nothing is filed until that gate is
+  # approved: approving it settles the per-finding dispositions and files
+  # each captain-approved finding that no open issue or open Dependabot
+  # pull request already covers. Rejecting it files nothing. The run
+  # never creates another run and produces no code diff.
+  #
+  # Modelled on docs/spec/examples/workflow-v2-upkeep-scan.yaml, minus
+  # that example's `file` implement stage: since #3924 the filing runs on
+  # the scan gate's decision, server-side, with no agent stage between
+  # the decision and the tracker write, so an apply stage would spawn an
+  # agent with nothing left to do (the same reasoning as
+  # backlog_grooming above). The one-stage shape matches the newer
+  # user-report scan example.
+  #
+  # The advisory source has no switch: the scan prompt always asks for it.
+  # It needs network egress to the advisory databases; without egress the
+  # report names `advisory` in `source_degrades` rather than reporting an
+  # empty clean scan. No charter is required (that keys on
+  # grooming_report only).
+  #
+  # SCHEDULE. Weekly, Monday 09:00 UTC (05:00 US Eastern), outside
+  # campaign hours. The schedule starts runs only when fishhawkd runs
+  # with --enable-scheduler and this repository in --scheduler-repos
+  # (scripts/dev passes both, with --scheduler-runner-kind local). A local
+  # scheduled run parks at awaiting_host_dispatch until a host dispatches
+  # its scan stage, so it holds no host-dispatch slot and spends nothing
+  # until then. The first tick after the scheduler is enabled starts one
+  # run for the most recent Monday window; there is never a backfill.
+  # ---------------------------------------------------------------------------
+  upkeep_scan:
+    description: >-
+      Scan for repository upkeep work — recorded-run flakes, toolchain-pin drift, deprecations and dependency vulnerability advisories (govulncheck reachability, pnpm audit) — propose it as an upkeep report, gate the report on a human approval, and file the approved findings as issues on that approval. Produces no code diff at any stage.
+    auto_advance: true
+
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    schedule:
+      cron: "0 9 * * 1"
+
+    # Nothing delegated: the gate below always stops for a human.
+    autonomy: low
+
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              # Forge-verified approver identity (provider-qualified subject),
+              # as on every other gate in this file.
+              members: ["github:kuhlman-labs"]
+              not: [author, agent]
 
   # ---------------------------------------------------------------------------
   # feature_change — build it. The default workflow for product work.
