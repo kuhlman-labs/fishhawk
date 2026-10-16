@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 )
 
@@ -333,6 +334,16 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	if id.IsAnonymous() {
 		s.writeError(w, r, http.StatusUnauthorized, "auth_required",
 			"creating a token requires an authenticated session or an existing bearer token", nil)
+		return
+	}
+	// A first-officer seat never mints itself a token (E85.6 / #4148): this
+	// route issues for the caller's OWN subject with no scope ceiling, so a
+	// seat-minted token would carry whatever scopes it asked for. The
+	// middleware clamp would still bound it, but the refusal keeps the seat's
+	// token set exactly what its captain attached.
+	if firstofficer.IsSeatSubject(id.Subject) {
+		s.writeError(w, r, http.StatusForbidden, "first_officer_cannot_mint_tokens",
+			"a first-officer seat cannot mint API tokens; its captain attaches the seat credential", nil)
 		return
 	}
 

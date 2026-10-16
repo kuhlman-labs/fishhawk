@@ -442,6 +442,9 @@ var KnownCategories = map[string]struct{}{
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
 	"escalation_persona_attached":             {}, // E55.9 / #3754: fired escalations attached reviewer personas to a review round (server/escalation_persona.go)
+	"first_officer_action_refused":            {}, // E85.6 / #4148 (ADR-089 D2): a 403 served to a first-officer seat identity, written from writeError on the global chain (server/first_officer_identity.go) — INTERNAL, not an issue-comment surface
+	"first_officer_seat_attached":             {}, // E85.6 / #4148 (ADR-089 D1): the captain attached a first-officer seat (token id, scopes; never the plaintext) — INTERNAL, not an issue-comment surface
+	"first_officer_seat_retired":              {}, // E85.6 / #4148 (ADR-089 D2): a seat's tokens were revoked because its anchor is terminal/gone (server/first_officer_identity.go) or the captain detached it — INTERNAL, not an issue-comment surface
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"gate_isolation_recorded":                 {}, // E51.2 / #2135: which ADR-063 gate isolation path a stage's gates ran under, recorded at raw trace upload (server/gate_isolation.go) — INTERNAL, read by the gate view

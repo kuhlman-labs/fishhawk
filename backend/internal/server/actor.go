@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
 
@@ -15,9 +16,11 @@ import (
 // fallback) stays actor_kind=user. One shared definition of the "role
 // instance vs human" distinction; mcp:run:<uuid> subjects never reach
 // these writers with the prefix, so they classify as user here and are
-// guarded by their own subject-binding checks upstream.
+// guarded by their own subject-binding checks upstream. A first-officer seat
+// subject (first_officer/..., E85.6 / #4148) is an agent too: seat-driven
+// rows record actor_kind agent.
 func actorKindForSubject(subject string) audit.ActorKind {
-	if operatorrole.IsTokenSubject(subject) {
+	if operatorrole.IsTokenSubject(subject) || firstofficer.IsSeatSubject(subject) {
 		return audit.ActorAgent
 	}
 	return audit.ActorUser
@@ -25,8 +28,10 @@ func actorKindForSubject(subject string) audit.ActorKind {
 
 // isAgentSubject reports whether subject is an AGENT identity (E80.3 /
 // #3760): the operator-agent token family (operatorrole.IsTokenSubject, the
-// same prefix actorKindForSubject keys on) or a run-bound mcp:run:<uuid>
-// subject, minted for the agent executing inside a run. Every other subject —
+// same prefix actorKindForSubject keys on), a run-bound mcp:run:<uuid>
+// subject, minted for the agent executing inside a run, or a first-officer
+// seat subject (firstofficer.IsSeatSubject, E85.6 / #4148 — a prefix match,
+// so a malformed seat subject is an agent too). Every other subject —
 // a human token, a GitHub login, a cookie session — is a human.
 //
 // It is the ONE classification shared by the captain verbs
@@ -36,5 +41,6 @@ func actorKindForSubject(subject string) audit.ActorKind {
 // model's: an agent session presenting a human operator's token is
 // indistinguishable from that human and is treated as one.
 func isAgentSubject(subject string) bool {
-	return operatorrole.IsTokenSubject(subject) || strings.HasPrefix(subject, "mcp:run:")
+	return operatorrole.IsTokenSubject(subject) || strings.HasPrefix(subject, "mcp:run:") ||
+		firstofficer.IsSeatSubject(subject)
 }

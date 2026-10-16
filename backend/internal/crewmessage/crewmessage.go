@@ -134,6 +134,11 @@ const (
 	RoleSecurity    Role = "security"
 	RoleReviewer    Role = "reviewer"
 	RoleImplementer Role = "implementer"
+	// RoleFirstOfficer is the ADR-089 first-officer seat (E85.6 / #4148). The
+	// server derives it for a seat-subject token; a seat sends only finding
+	// and notice messages to the captain. It is not implement-executed, so it
+	// is addressable (the captain consults or notifies the seat by role).
+	RoleFirstOfficer Role = "first_officer"
 )
 
 // AllRoles is the full crew vocabulary, in schema order. It INCLUDES
@@ -147,6 +152,7 @@ var AllRoles = []Role{
 	RoleSecurity,
 	RoleReviewer,
 	RoleImplementer,
+	RoleFirstOfficer,
 }
 
 // implementStageRoles is the set of roles an implement stage executes. It is
@@ -189,7 +195,10 @@ const (
 	// TypeConsult asks a question, answered synchronously in-process.
 	TypeConsult MessageType = "consult"
 	// TypeFinding records an observation. A finding is NOT a concern: it
-	// never enters the merge gate.
+	// never enters the merge gate — with ONE server-side exception (ADR-089
+	// D4, E85.6 / #4148): a first_officer finding citing a runner-attested
+	// FAILING specialist-job completion on its anchor run is converted by the
+	// server into a concern with provenance first_officer.
 	TypeFinding MessageType = "finding"
 	// TypeWorkRequest asks for an item to be filed. It never dispatches a run.
 	TypeWorkRequest MessageType = "work_request"

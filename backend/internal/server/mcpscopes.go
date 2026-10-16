@@ -179,7 +179,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 
 	// fishhawk_file_issue POSTs /v0/work-items, which enforces no scope:
 	// workitems.go gates on run ENTITLEMENT (runBoundTokenRunID) and
-	// repo consistency, not on a scope predicate.
+	// repo consistency, not on a scope predicate. A first-officer seat passes
+	// this gate and is refused at that route by subject (403
+	// first_officer_tracker_write_not_permitted, refuseFirstOfficerTrackerWrite,
+	// E85.6 / #4148), since the tool dials it under the caller's own bearer.
 	"fishhawk_file_issue": mcpScopeAuthenticatedOnly,
 
 	// fishhawk_preview_issue POSTs /v0/work-items/preview
@@ -225,6 +228,13 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// specialist_job.go handleRequestSpecialistJob (E85.9 / #4300). The
 	// handler ALSO refuses a run-bound token that carries write:stages
 	// (specialist_job_requester_not_a_seat), so runBoundSubjectOK stays false.
+	// The first-officer seat's specialistjob.RequestScope (E85.6 / #4148) is
+	// deliberately NOT an alternative here: this tool resolves a caller-chosen
+	// runner_binary and spawns it on the daemon host with the daemon's
+	// environment, so a seat reaching it could run any host executable. A
+	// seat files its request over REST (POST /v0/specialist-jobs), which only
+	// queues the job. Pinned by
+	// TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools.
 	"fishhawk_request_specialist_job": {anyOf: []string{"write:stages"}},
 
 	// --- read:runs. specialist_job.go handleGetSpecialistJob (E85.9 /

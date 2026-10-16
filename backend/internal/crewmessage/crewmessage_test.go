@@ -165,6 +165,9 @@ func TestCanReceive_ExcludesImplementStageRoles(t *testing.T) {
 		RoleHistorian: true,
 		RoleSecurity:  true,
 		RoleReviewer:  true,
+		// RoleFirstOfficer is not implement-executed (E85.6 / #4148): the
+		// captain addresses the seat by role.
+		RoleFirstOfficer: true,
 		// RoleImplementer is deliberately absent.
 	}
 	for _, r := range AllRoles {
@@ -205,6 +208,29 @@ func TestValidFixturesExistForEveryType(t *testing.T) {
 		path := filepath.Join("testdata", "valid", string(mt)+".json")
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("missing valid fixture for type %q: %v", mt, err)
+		}
+	}
+}
+
+// TestFirstOfficerRole pins the E85.6 (#4148) seat role: it is a member of the
+// shipped crew-role enum, a legal sender_role, and addressable — a document
+// naming it on either side validates.
+func TestFirstOfficerRole(t *testing.T) {
+	if !CanReceive(RoleFirstOfficer) {
+		t.Fatal("CanReceive(first_officer) = false, want true: the seat is not implement-executed")
+	}
+	if RoleFirstOfficer != "first_officer" {
+		t.Fatalf("RoleFirstOfficer = %q, want first_officer (the schema enum member)", RoleFirstOfficer)
+	}
+	for _, doc := range []string{
+		`{"schema_version":"crew-message-v1","type":"finding","sender_role":"first_officer","recipient_role":"captain",` +
+			`"anchor":{"run_id":"6f1c2f43-8d7e-4b0a-9c3e-2a4b5c6d7e8f"},"payload":{"summary":"verify failed","severity":"high"},` +
+			`"evidence":[{"kind":"audit_entry","ref":"42"}]}`,
+		`{"schema_version":"crew-message-v1","type":"notice","sender_role":"captain","recipient_role":"first_officer",` +
+			`"anchor":{"run_id":"6f1c2f43-8d7e-4b0a-9c3e-2a4b5c6d7e8f"},"payload":{"summary":"watch the fan-in"}}`,
+	} {
+		if _, err := Parse([]byte(doc)); err != nil {
+			t.Fatalf("Parse(%s) = %v, want nil", doc, err)
 		}
 	}
 }

@@ -166,6 +166,13 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/specialist-jobs/{job_id}", s.handleGetSpecialistJob)
 	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/admission", s.handleAdmitSpecialistJob)
 	mux.HandleFunc("POST /v0/specialist-jobs/{job_id}/result", s.handleSpecialistJobResult)
+	// First-officer seat lifecycle (ADR-089 D1/D2, E85.6 / #4148): the
+	// captain attaches (token returned once), reads and retires an anchor's
+	// seat. Not run-scoped (the anchor may be a campaign), so each handler
+	// enforces the anchor's account itself. first_officer_seat.go.
+	mux.HandleFunc("POST /v0/first-officer-seats", s.handleAttachFirstOfficerSeat)
+	mux.HandleFunc("GET /v0/first-officer-seats", s.handleGetFirstOfficerSeat)
+	mux.HandleFunc("POST /v0/first-officer-seats/retire", s.handleRetireFirstOfficerSeat)
 	// Handover brief (E76.4 / #3767): composed on demand from the digest,
 	// captain record, campaign/run reads and the cached-spec delegation view;
 	// never writes.
@@ -201,7 +208,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("PATCH /v0/refinement/sessions/{session_id}/draft", s.handlePatchRefinementDraft)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/decision", s.handleDecideRefinementSession)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
-	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
+	// A first-officer seat is refused by subject before the handler (E85.6 /
+	// #4148): the route checks no scope, so the seat clamp cannot stop it.
+	mux.HandleFunc("POST /v0/work-items", s.refuseFirstOfficerTrackerWrite(s.handleFileWorkItem))
 	// The non-mutating intake preview of the filing above (#3774): the same
 	// prelude and conventions/intake core, never provider.File, no audit. A
 	// literal path segment, so it does not collide with POST /v0/work-items.

@@ -107,6 +107,11 @@ type mergeRunResponse struct {
 //     is in flight). A read error is a 500 with nothing recorded
 //     (fail-closed). It runs right after acceptance_stale, before the
 //     GateMerger guard;
+//   - 409 first_officer_finding_open (ADR-089 D4, E85.6 / #4148) while a
+//     first_officer concern is open on the run (firstOfficerHoldRefusal). It
+//     names the concern ids and how to disposition them; a read error is a 500
+//     with nothing recorded (fail-closed). It runs right after
+//     review_coverage_incomplete, before the GateMerger guard;
 //   - 503 when the merge seam (GateMerger) is unconfigured;
 //   - 409 merge_conflicting when the PR has a merge conflict against its base
 //     (E64.14 / #3109). This guard is BEST-EFFORT and FAIL-OPEN — it refuses
@@ -325,6 +330,22 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if coverage != nil {
 		s.writeMergeReadinessRefusal(w, r, runID, prURL, coverage)
+		return
+	}
+
+	// First-officer hold (ADR-089 D4, E85.6 / #4148): an open first_officer
+	// concern — a seat finding backed by a runner-attested failing specialist
+	// job — refuses the merge 409 first_officer_finding_open until the captain
+	// dispositions it. Same placement and posture as the review-coverage hold:
+	// nothing recorded, FAIL-CLOSED on a read error (500).
+	foHold, ferr := s.firstOfficerHoldRefusal(r.Context(), runID, "")
+	if ferr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"read open first-officer concerns failed", map[string]any{"error": ferr.Error()})
+		return
+	}
+	if foHold != nil {
+		s.writeMergeReadinessRefusal(w, r, runID, prURL, foHold)
 		return
 	}
 

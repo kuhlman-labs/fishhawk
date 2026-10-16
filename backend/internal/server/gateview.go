@@ -374,10 +374,11 @@ const gateViewGapSpecialistJobs = "specialist_jobs"
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
 // Blockers carries each determined refusal the merge endpoint would return
-// (acceptance_stale, review_coverage_incomplete, approval_dismissed) with the
-// endpoint's own message and details. Undetermined names every check that
-// could not reach a verdict — the approval check's fail-open reasons, or an
-// acceptance-history or review-coverage read failure — so an empty Blockers list is never read as "nothing blocks" when a check did
+// (acceptance_stale, review_coverage_incomplete, first_officer_finding_open,
+// approval_dismissed) with the endpoint's own message and details.
+// Undetermined names every check that could not reach a verdict — the approval
+// check's fail-open reasons, or an acceptance-history, review-coverage or
+// first-officer concern read failure — so an empty Blockers list is never read as "nothing blocks" when a check did
 // not run. Both arrays are always present (possibly empty) when the block is.
 type gateViewMergeReadiness struct {
 	Blockers     []gateViewMergeBlocker `json:"blockers"`
@@ -689,6 +690,16 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 		block.Undetermined = append(block.Undetermined, "review coverage: the review history could not be read: "+cerr.Error())
 	} else if coverage != nil {
 		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(coverage))
+	}
+
+	// First-officer hold (ADR-089 D4, E85.6 / #4148): the merge endpoint's
+	// firstOfficerHoldRefusal. A read failure records the history gap and
+	// names the check in Undetermined, never a silent "no blocker".
+	if fo, ferr := s.firstOfficerHoldRefusal(ctx, runRow.ID, ""); ferr != nil {
+		recordGap()
+		block.Undetermined = append(block.Undetermined, "first-officer findings: the open concerns could not be read: "+ferr.Error())
+	} else if fo != nil {
+		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(fo))
 	}
 
 	approval := s.approvalDismissedCheck(ctx, runRow)
