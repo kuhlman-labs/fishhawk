@@ -2923,7 +2923,25 @@ cmd_up() {
   if [[ "${FISHHAWK_DEV_OPS_MONITOR:-1}" != "0" ]]; then
     ops_monitor_flags=(--enable-ops-monitor --ops-monitor-dispatch-hold)
   fi
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" >> "$LOG_FILE" 2>&1 &
+  #
+  # --enable-scheduler (E79.1 / #3725): starts each workflow that declares a
+  # `schedule` once per due cron window — today only upkeep_scan, the weekly
+  # dependency-advisory and upkeep scan (E80.2 / #3750). The scheduler reads
+  # .fishhawk/workflows.yaml at the DEFAULT branch through the GitHub App, so
+  # a schedule fires only once it is merged. --scheduler-repos names the
+  # repositories it scans (FISHHAWKD_SCHEDULER_REPOS overrides the default,
+  # this repository). --scheduler-runner-kind local: fishhawkd's default is
+  # github_actions; local makes a started run park at awaiting_host_dispatch
+  # until a host dispatches it, so a firing spends nothing on its own.
+  # FISHHAWK_DEV_SCHEDULER=0 drops all three flags. scripts/test-dev pins them.
+  local -a scheduler_flags
+  scheduler_flags=()
+  if [[ "${FISHHAWK_DEV_SCHEDULER:-1}" != "0" ]]; then
+    scheduler_flags=(--enable-scheduler
+      --scheduler-repos "${FISHHAWKD_SCHEDULER_REPOS:-kuhlman-labs/fishhawk}"
+      --scheduler-runner-kind local)
+  fi
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" "${scheduler_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"

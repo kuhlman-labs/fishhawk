@@ -1447,6 +1447,30 @@ under critical memory pressure (E85.11 / #4330).
 - **Pins.** `scripts/test-dev` pins both flags, and pins the absence of a
   notify issue.
 
+They also pass `--enable-scheduler --scheduler-repos kuhlman-labs/fishhawk
+--scheduler-runner-kind local`, which turn on the workflow scheduler
+(E79.1 / #3725). It starts one run per due cron window for each workflow that
+declares a `schedule` in `.fishhawk/workflows.yaml`. Today that is only
+`upkeep_scan`, the weekly upkeep and dependency-advisory scan (E80.2 / #3750),
+on Mondays at 09:00 UTC.
+
+- **Default branch only.** The scheduler reads the spec at the default branch
+  through the GitHub App, so a schedule on a feature branch never fires.
+- **Parks, never dispatches.** With runner kind `local`, a scheduled run parks
+  at `awaiting_host_dispatch` until a host dispatches it. A firing therefore
+  holds no host-dispatch slot and spends nothing until someone dispatches it.
+  An `upkeep_scan` run then stops at its approval gate, and nothing is filed
+  until a human approves it.
+- **First tick.** The first tick after the scheduler is enabled starts one run
+  for the most recent window. Missed windows are never backfilled.
+- **Repositories.** `FISHHAWKD_SCHEDULER_REPOS` in `.env` replaces the default
+  repository list.
+- **Opting out.** `FISHHAWK_DEV_SCHEDULER=0` drops all three scheduler flags.
+- **Inspect.** `GET /v0/schedules?repo=kuhlman-labs/fishhawk` reports each
+  schedule's window, next due time and last outcome.
+- **Pins.** `scripts/test-dev` pins the three flags and pins that they reach
+  the `serve` argv.
+
 ### `post-merge` and `reload`
 
 `scripts/dev post-merge [<issue>] [--start-deps]` is the one-step full per-PR
