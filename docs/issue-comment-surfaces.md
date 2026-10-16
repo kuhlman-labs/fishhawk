@@ -2995,7 +2995,8 @@ path under "Routing" above regardless of runner kind — the credential comes
 from the ref, not from a GitHub installation.)
 
 **Edit-in-place sticky comment (#428).** Every CLI verb that changes run or
-stage state calls `ghcomment.PostOrEditStatusComment`, which:
+stage state calls `ghcomment.PostOrEditStatusComment` with the bearer the
+verb's client already resolved (flag, env or credstore), which:
 
 1. `GET /v0/runs/{run_id}/status-comment` — fetches the rendered body (server
    calls `issuecomment.RenderStatusBody`) and the stored `github_comment_id`.
@@ -3004,7 +3005,12 @@ stage state calls `ghcomment.PostOrEditStatusComment`, which:
    create a new one. Falls back to create on HTTP 404 (deleted comment).
 3. `POST /v0/runs/{run_id}/status-comment` — records the returned comment ID
    in the run's audit log (`status_comment_posted` category) so the next call
-   can edit in place.
+   can edit in place. The route requires `write:runs` (#4483): the CLI sends
+   its resolved bearer on both backend calls; an anonymous POST is 401 and a
+   bearer without `write:runs` is 403 `insufficient_scope`, and neither
+   appends the row. The CLI treats that failure as best-effort and warns, so a
+   token-less or pre-#4483 CLI still posts the GitHub comment but records no
+   id, and the next transition creates a new comment instead of editing.
 
 | CLI verb | Sticky comment updated when |
 |---|---|

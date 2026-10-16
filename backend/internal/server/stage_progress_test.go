@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -53,14 +54,51 @@ func progressBody(t *testing.T, v any) *strings.Reader {
 	return strings.NewReader(string(raw))
 }
 
+// newProgressServer wires repo with a fake MCP token repository (so a
+// run-bound fhm_ bearer authenticates through the real bearerAuth middleware,
+// subject mcp:run:<uuid>, the production runner shape) and the shared
+// write:runs / read:runs api-token stub (#4483).
+func newProgressServer(repo run.Repository) *Server {
+	return New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		MCPTokenRepo: newFakeMCPTokenRepo(),
+		APITokenRepo: writeScopeTokenRepo{},
+	})
+}
+
+// runBoundBearer mints a run-bound fhm_ token for runID on s's MCP token repo,
+// carrying only mcp:read as the runner's heartbeat bearer does (it never holds
+// write:runs), and returns its plaintext.
+func runBoundBearer(t *testing.T, s *Server, runID uuid.UUID) string {
+	t.Helper()
+	tok, err := s.cfg.MCPTokenRepo.Issue(context.Background(), mcptoken.IssueParams{
+		RunID: runID, Scopes: []string{"mcp:read"},
+	})
+	if err != nil {
+		t.Fatalf("issue run-bound token: %v", err)
+	}
+	return tok.PlainText
+}
+
 // postProgressMux drives the request through the registered mux (auth
-// middleware included) — an anonymous request against a run with no account is
-// admitted at the memberWrite tier, so this is the wiring proof for the new
-// route (approval condition 3).
+// middleware included) carrying the run-bound bearer of runID itself — the
+// runner's own heartbeat shape, admitted by authorizeStageProgress's own-run
+// entitlement. This is the wiring proof for the route.
 func postProgressMux(t *testing.T, s *Server, runID, stageID uuid.UUID, body *strings.Reader) *httptest.ResponseRecorder {
+	t.Helper()
+	return postProgressAs(t, s, runID, stageID, body, runBoundBearer(t, s, runID))
+}
+
+// postProgressAs drives the request through the registered mux with an
+// explicit bearer; an empty bearer sends no Authorization header (anonymous).
+func postProgressAs(t *testing.T, s *Server, runID, stageID uuid.UUID, body *strings.Reader, bearer string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost,
 		"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/progress", body)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w
@@ -68,26 +106,32 @@ func postProgressMux(t *testing.T, s *Server, runID, stageID uuid.UUID, body *st
 
 // postProgressDirect calls the handler with explicit path values, bypassing the
 // mux/auth — used where the assertion is about the handler's own validation, not
-// the route wiring.
+// the route wiring. It injects the production runner identity for the PATH run
+// (subject mcp:run:<runID>, a non-empty TokenID, mcp:read only), so the
+// handler's own-run entitlement admits it exactly as it admits the runner.
 func postProgressDirect(t *testing.T, s *Server, runID, stageID string, body *strings.Reader) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost,
 		"/v0/runs/"+runID+"/stages/"+stageID+"/progress", body)
 	req.SetPathValue("run_id", runID)
 	req.SetPathValue("stage_id", stageID)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "mcp:run:" + runID, TokenID: "tok", Scopes: []string{"mcp:read"},
+	}))
 	w := httptest.NewRecorder()
 	s.handleReportStageProgress(w, req)
 	return w
 }
 
 // TestReportStageProgress_EndToEndReachesStageRead (E1) drives a real
-// pgtest-backed postgres repo through the REGISTERED MUX: POST the heartbeat,
-// then GET /v0/stages/{id} and GET /v0/runs/{id}/stages and assert BOTH read
+// pgtest-backed postgres repo through the REGISTERED MUX: POST the heartbeat
+// carrying the run's OWN run-bound fhm_ bearer (the production runner shape,
+// through the real bearerAuth middleware, #4483), then GET /v0/stages/{id} and GET /v0/runs/{id}/stages and assert BOTH read
 // surfaces return the identical last_event / turns_this_attempt /
 // tokens_this_attempt.
 func TestReportStageProgress_EndToEndReachesStageRead(t *testing.T) {
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 
 	w := postProgressMux(t, s, runID, stageID, progressBody(t, stageProgressReport{
@@ -173,6 +217,133 @@ func TestReportStageProgress_CrossAccountForbidden(t *testing.T) {
 	}
 }
 
+// assertProgressUnrecorded READS the stage's committed progress back and fails
+// when a heartbeat landed: the refusal controls below are about committed
+// state, so a status code alone would not prove the write never happened.
+func assertProgressUnrecorded(t *testing.T, repo run.Repository, stageID uuid.UUID) {
+	t.Helper()
+	got, err := repo.(run.StageProgressStore).StageProgressByID(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("StageProgressByID: %v", err)
+	}
+	if got != nil {
+		t.Errorf("stage progress = %+v, want nil (the refused heartbeat must not be recorded)", *got)
+	}
+}
+
+// progressErrorCode decodes the error envelope, checks its code and returns
+// its details.
+func progressErrorCode(t *testing.T, w *httptest.ResponseRecorder, want string) map[string]any {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (%s)", err, w.Body.String())
+	}
+	if env.Error.Code != want {
+		t.Errorf("error code = %q, want %q (body %s)", env.Error.Code, want, w.Body.String())
+	}
+	return env.Error.Details
+}
+
+// TestReportStageProgress_ForeignRunBoundToken_Refused pins the own-run
+// entitlement (#4483): a run-bound token minted for a DIFFERENT run (a second
+// seeded run, non-matching by construction) posting a heartbeat to a running
+// stage of this run is 403 run_not_entitled, and the stage carries no
+// progress afterwards. With the own-run comparison deleted, the token is
+// admitted, RecordStageProgress applies, and the test reads progress back.
+func TestReportStageProgress_ForeignRunBoundToken_Refused(t *testing.T) {
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+	otherRun, _ := seedRunningStage(t, repo)
+
+	w := postProgressAs(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: "assistant", TurnsThisAttempt: 3,
+	}), runBoundBearer(t, s, otherRun))
+	// Committed state first, so a missing control reports BOTH the recorded
+	// heartbeat and the wrong status.
+	assertProgressUnrecorded(t, repo, stageID)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	details := progressErrorCode(t, w, "run_not_entitled")
+	if details["run_id"] != runID.String() {
+		t.Errorf("details.run_id = %v, want %s", details["run_id"], runID)
+	}
+}
+
+// TestReportStageProgress_ReadOnlyToken_Refused pins the write:runs fallback
+// for a non-run-bound bearer (#4483): a read:runs-only api token (TokenID set
+// by bearerAuth, github: subject) is 403 insufficient_scope naming write:runs,
+// and the stage carries no progress.
+func TestReportStageProgress_ReadOnlyToken_Refused(t *testing.T) {
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	w := postProgressAs(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: "assistant", TurnsThisAttempt: 1,
+	}), readRunsBearer)
+	// Committed state first, so a missing control reports BOTH the recorded
+	// heartbeat and the wrong status.
+	assertProgressUnrecorded(t, repo, stageID)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if details := progressErrorCode(t, w, "insufficient_scope"); details["required_scope"] != "write:runs" {
+		t.Errorf("details.required_scope = %v, want write:runs", details["required_scope"])
+	}
+}
+
+// TestReportStageProgress_Anonymous_Unauthorized pins the anonymous refusal,
+// which requireWriteScope itself answers (no separate anonymous arm exists to
+// be masked): no Authorization header → 401, no progress recorded.
+func TestReportStageProgress_Anonymous_Unauthorized(t *testing.T) {
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	w := postProgressAs(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: "assistant", TurnsThisAttempt: 1,
+	}), "")
+	// Committed state first, so a missing control reports BOTH the recorded
+	// heartbeat and the wrong status.
+	assertProgressUnrecorded(t, repo, stageID)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+	}
+	progressErrorCode(t, w, "authentication_required")
+}
+
+// TestReportStageProgress_WriteRunsOperator_Admitted pins the preservation
+// arm: a non-run-bound operator bearer holding write:runs is admitted (204) and
+// its heartbeat is recorded.
+func TestReportStageProgress_WriteRunsOperator_Admitted(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	w := postProgressAs(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: "tool_use", TurnsThisAttempt: 5,
+	}), writeRunsBearer)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204:\n%s", w.Code, w.Body.String())
+	}
+	got, err := repo.(run.StageProgressStore).StageProgressByID(ctx, stageID)
+	if err != nil {
+		t.Fatalf("StageProgressByID: %v", err)
+	}
+	if got == nil || got.LastEvent != "tool_use" || got.TurnsThisAttempt != 5 {
+		t.Errorf("stage progress = %+v, want the operator's heartbeat recorded", got)
+	}
+}
+
 // TestReportStageProgress_OversizedBodyRejected pins the http.MaxBytesReader
 // body cap: a VALID-JSON but oversized payload (past progressMaxBodyBytes) is
 // refused 400 at decode rather than being read wholesale into memory. Paired
@@ -180,7 +351,7 @@ func TestReportStageProgress_CrossAccountForbidden(t *testing.T) {
 // the discriminating counterfactual for the size guard.
 func TestReportStageProgress_OversizedBodyRejected(t *testing.T) {
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 
 	// A single valid last_event string larger than the cap: the body is
@@ -206,7 +377,7 @@ func TestReportStageProgress_OversizedBodyRejected(t *testing.T) {
 func TestReportStageProgress_TerminalStageRefused(t *testing.T) {
 	ctx := context.Background()
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 	if _, err := repo.TransitionStage(ctx, stageID, run.StageStateSucceeded, nil); err != nil {
 		t.Fatalf("transition succeeded: %v", err)
@@ -238,7 +409,7 @@ func TestReportStageProgress_TerminalStageRefused(t *testing.T) {
 func TestReportStageProgress_LastEventClamped(t *testing.T) {
 	ctx := context.Background()
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 
 	oversized := strings.Repeat("x", progressLastEventMaxLen+50)
@@ -267,7 +438,7 @@ func TestReportStageProgress_LastEventClamped(t *testing.T) {
 func TestReportStageProgress_NegativeCountersRejected(t *testing.T) {
 	ctx := context.Background()
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 
 	w := postProgressMux(t, s, runID, stageID, progressBody(t, stageProgressReport{
@@ -309,7 +480,7 @@ func TestReportStageProgress_StoreUnsupportedReturns503(t *testing.T) {
 // check: a stage that exists but belongs to a DIFFERENT run is 404 at this path.
 func TestReportStageProgress_StageRunMismatch404(t *testing.T) {
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	_, stageID := seedRunningStage(t, repo)
 	otherRun, _ := seedRunningStage(t, repo)
 
@@ -328,7 +499,7 @@ func TestReportStageProgress_StageRunMismatch404(t *testing.T) {
 // loud rather than silently dropping it.
 func TestReportStageProgress_UnknownFieldRejected(t *testing.T) {
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	runID, stageID := seedRunningStage(t, repo)
 
 	w := postProgressMux(t, s, runID, stageID,
@@ -344,7 +515,7 @@ func TestReportStageProgress_UnknownFieldRejected(t *testing.T) {
 // TestReportStageProgress_BadUUIDs pins the id validation branches.
 func TestReportStageProgress_BadUUIDs(t *testing.T) {
 	repo := run.NewPostgresRepository(pgtest.NewPool(t))
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	s := newProgressServer(repo)
 	w := postProgressDirect(t, s, "not-a-uuid", uuid.New().String(),
 		progressBody(t, stageProgressReport{LastEvent: "assistant"}))
 	if w.Code != http.StatusBadRequest {

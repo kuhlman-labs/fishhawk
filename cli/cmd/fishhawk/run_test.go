@@ -30,6 +30,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -599,5 +600,72 @@ func TestRunStart_OmittedForgeNoIssue_SendsNoForge(t *testing.T) {
 	}
 	if got, ok := fake.body["forge"]; ok {
 		t.Errorf("forge key present (%v) with no issue and no --forge; the backend must derive: %+v", got, fake.body)
+	}
+}
+
+// localIssueRunBackend answers every request with a local-runner run that
+// carries an issue_context, so the #428 sticky-comment branch runs.
+func localIssueRunBackend(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"x/y","workflow_id":"trivial","state":"pending","runner_kind":"local","issue_context":{"title":"t","body":"b","url":"u","number":42}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestRunStartAndCancel_StatusCommentCarriesClientToken pins that the
+// bearer the verb's client resolved reaches the sticky-comment seam on a
+// local issue-triggered run (#4483): the record-id POST requires write:runs.
+// The seam fails, so the best-effort contract is pinned too: the verb still
+// exits OK and warns naming the issue.
+func TestRunStartAndCancel_StatusCommentCarriesClientToken(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(backendURL string, stdout, stderr *bytes.Buffer) int
+	}{
+		{name: "start", run: func(backendURL string, stdout, stderr *bytes.Buffer) int {
+			return runStart([]string{
+				"--repo", "x/y", "--workflow", "trivial",
+				"--working-dir", specDir(t),
+				"--backend-url", backendURL, "--token", "tok-test",
+			}, stdout, stderr)
+		}},
+		{name: "cancel", run: func(backendURL string, stdout, stderr *bytes.Buffer) int {
+			return runCancel([]string{
+				"--backend-url", backendURL, "--token", "tok-test", uuid.NewString(),
+			}, stdout, stderr)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := http.StatusOK
+			if tc.name == "start" {
+				status = http.StatusCreated
+			}
+			srv := localIssueRunBackend(t, status)
+			var calls []postOrEditCall
+			orig := postOrEditStatusComment
+			postOrEditStatusComment = func(backendURL, token, runID, repo string, issueNumber int) error {
+				calls = append(calls, postOrEditCall{backendURL, token, runID, repo, issueNumber})
+				return errors.New("record comment id: HTTP 401")
+			}
+			t.Cleanup(func() { postOrEditStatusComment = orig })
+			var stdout, stderr bytes.Buffer
+			if code := tc.run(srv.URL, &stdout, &stderr); code != exitOK {
+				t.Fatalf("exit = %d, want exitOK\nstderr: %s", code, stderr.String())
+			}
+			if len(calls) != 1 {
+				t.Fatalf("postOrEditStatusComment called %d times, want 1", len(calls))
+			}
+			c := calls[0]
+			if c.token != "tok-test" || c.issueNumber != 42 || c.repo != "x/y" {
+				t.Errorf("call = %+v, want token tok-test, issue 42, repo x/y", c)
+			}
+			if !strings.Contains(stderr.String(), "comment on issue #42 failed: record comment id: HTTP 401") {
+				t.Errorf("stderr should warn about the failed comment: %s", stderr.String())
+			}
+		})
 	}
 }
