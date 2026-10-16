@@ -1429,6 +1429,24 @@ stay in `AGENTS.md`. All of this is pinned by `scripts/test-dev`, which
 in-loop when zsh is absent from PATH), so a `scripts/dev` regression fails
 in-loop rather than only when a human runs the harness.
 
+### The local `serve` flags
+
+`up` and `reload` start fishhawkd with `serve --enable-child-completion-sweeper`
+(#1238: the fan-in backstop is off by default in fishhawkd). They also pass
+`--enable-ops-monitor --ops-monitor-dispatch-hold`, which turn on the
+host- and process-health ticker (E85.1 / #4142) and its interim dispatch hold
+under critical memory pressure (E85.11 / #4330).
+
+- **Audit-only.** The ops monitor runs with no notify issue, because this
+  repository is public and a notification comment names pids and run ids.
+  A failing probe is an `ops_probe_failed` row on `GET /v0/audit`; see
+  `docs/OPERATING_MODEL.md` § 3 for the condition-to-action table.
+- **Opting out.** `FISHHAWK_DEV_OPS_MONITOR=0` drops both ops-monitor flags.
+- **Dry check.** `bin/fishhawkd ops-probe` is the same sweep, run once, and it
+  writes nothing.
+- **Pins.** `scripts/test-dev` pins both flags, and pins the absence of a
+  notify issue.
+
 ### `post-merge` and `reload`
 
 `scripts/dev post-merge [<issue>] [--start-deps]` is the one-step full per-PR

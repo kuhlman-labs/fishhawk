@@ -2907,7 +2907,23 @@ cmd_up() {
   # awaiting_children with no consolidated branch/PR. Re-enable it here so the
   # local runner completes decompositions automatically; scripts/test-dev
   # body-greps for this flag so a future edit can't silently drop it.
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper >> "$LOG_FILE" 2>&1 &
+  #
+  # --enable-ops-monitor (E85.1 / #4142): the host- and process-health
+  # ticker (disk, gocache, load, docker, postgres, orphaned runners, memory,
+  # gate containers, scope-amendment windows). AUDIT-ONLY on purpose: no
+  # notify-issue flag, because this repository is public and a
+  # notification comment names pids and run ids; failures land as
+  # ops_probe_failed rows on GET /v0/audit. --ops-monitor-dispatch-hold
+  # (E85.11 / #4330) refuses NEW host dispatches under CRITICAL memory
+  # pressure, the 2026-10-11 swap-exhaustion class; nothing in flight is
+  # touched, and a dead ticker releases it after three intervals.
+  # FISHHAWK_DEV_OPS_MONITOR=0 drops both flags. scripts/test-dev pins both.
+  local -a ops_monitor_flags
+  ops_monitor_flags=()
+  if [[ "${FISHHAWK_DEV_OPS_MONITOR:-1}" != "0" ]]; then
+    ops_monitor_flags=(--enable-ops-monitor --ops-monitor-dispatch-hold)
+  fi
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper "${ops_monitor_flags[@]}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"
