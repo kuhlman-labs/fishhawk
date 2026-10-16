@@ -19,7 +19,8 @@ dependency.
 |---|---|
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
 | `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede or amend them (transitively), ranked. |
-| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index under its own cap, and fit whole records into a separate record budget. Returns a `*Selection`. |
+| `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v1`, below) the persona is shown. |
+| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records into a separate record budget. Returns a `*Selection`. |
 | `Selection.PromptDocuments(grounded)` | The index, then each included record, as `prompt.InjectedDocument`s. |
 | `Selection.Attribution()` | The `repodoc.InjectionSet` for the selection: its documents plus, when anything was dropped, one selection-level truncation. A caller injecting other documents in the same prompt (the persona remit) merges this into ONE `repodoc.AttributeSet` call. |
 
@@ -112,6 +113,35 @@ then taken, so the pass terminates.
 The change paths are the caller's: plan scope at plan review; approved plan
 scope union diff at implement review.
 
+## Index rendering (`RenderIndex`, #4478)
+
+The persona is shown a COMPACT rendering of the index, not the committed file:
+`RenderIndex` writes one compact JSON object per record, `\n`-terminated, in
+the index's order, with no `schema_version` wrapper. `Record`'s slice tags all
+carry `omitempty`, so every empty list (`supersedes`, `superseded_by`,
+`amends`, `amended_by`, `applies_to`) is left out of its line; `omitempty`
+changes encoding only, so `ParseIndex`'s strict decode still requires the
+three non-optional lists. Because `Record` is marshalled directly, a field
+added to it renders with no further code; `TestRenderIndex_RendersEveryRecordField`
+reflects over `Record`'s json tags and fails when a field is missing from the
+rendering or a slice tag lacks `omitempty`. `TestRenderIndex_EmptyListsOmitted`
+pins the exact lines, an amended record's `amends` / `amended_by` included.
+
+The encoder runs with `SetEscapeHTML(false)` (a `<` stays raw).
+`encoding/json` escapes every byte below 0x20, U+2028 and U+2029, but NOT
+U+0085 NEL, which repodoc honours as a line break; `RenderIndex` rewrites every
+raw NEL (only ever inside a JSON string) as `\u0085`, so the rendering holds
+exactly one repodoc line break per record and each line decodes back to its
+record (`TestRenderIndex_OneLinePerRecordRoundTrips`).
+
+`Assemble` shows it through `repodoc.Fetched.Derive(IndexRendering, …)`: the
+index document's `content_hash` and `original_bytes` stay the committed file's,
+while `Content`, `rendered_bytes`, the cut and the marker are the rendering's,
+and its audit entries carry `rendering` / `rendering_bytes` (repodoc README §
+"Derived renderings"). The framing says the index is a compact rendering and
+how to read it, and the Source line says `shown as its adr-index-lines-v1
+rendering, not verbatim`.
+
 ## Byte budget (`Assemble`)
 
 **Two budgets (#4399).** The index and the records are budgeted SEPARATELY,
@@ -121,8 +151,8 @@ starve the record bodies. Before #4399 one budget counted both, and the
 shipped index alone (~31 KiB) left no room for any record: the architect
 persona reviewed from index titles only.
 
-- **Index** — shaped under its own per-document cap, the resolver's cap
-  (shrink-to-fit, below). Its own `document_injected` (and, when cut, its
+- **Index** — its compact rendering, shaped under its own per-document cap, the
+  resolver's cap (shrink-to-fit, below). Its own `document_injected` (and, when cut, its
   per-document `document_truncated`) split its numbers: `document_injected`
   carries `rendered_bytes` and `truncated` but no `cap_bytes`; only the
   per-document `document_truncated` carries `cap_bytes`. That `cap_bytes` is
@@ -161,10 +191,10 @@ budgets**: the remit is its own repodoc document under its own cap. The
 decision-record injection is therefore at most twice the cap (index <= cap,
 records <= cap), in the persona prompt only.
 
-1. **The index is always included.** Shaped under its own cap; when its
-   rendered size (including repodoc's truncation marker, which is appended
-   AFTER the cut) exceeds the cap, it is reshaped under a cap reduced by the
-   overflow.
+1. **The index is always included.** Its compact rendering is shaped under
+   its own cap; when its rendered size (including repodoc's truncation marker,
+   which is appended AFTER the cut) exceeds the cap, it is reshaped under a cap
+   reduced by the overflow.
    The loop is bounded (`maxIndexShrinkSteps`), the cap is clamped at zero and
    never negative, and an index that does not fit even at a zero-byte cut (a
    budget smaller than the marker) fails the assembly (`ErrUnresolvable`).
@@ -215,7 +245,11 @@ All framing is system-authored. Every interpolated value is a count, an id
 `ParseIndex` validated, or a repo-authored path/status passed through
 `repodoc.SanitizeMetadata`, so repo-chosen text cannot start a line.
 
-- **Index** — heading `Decision record index`; the preamble states M of N
+- **Index** — heading `Decision record index`; after its opening sentence the
+  preamble says the index is shown as a compact rendering, one JSON object per
+  record per line in the file's order, with an empty list field left out
+  (#4478; the byte-identical claims below hold apart from that sentence); it
+  then states M of N
   records matched (and, when any successor was followed, how many more were
   selected because they supersede a selected record — with nothing followed
   the preamble is byte-identical to the pre-#4398 text), which ids are shown
@@ -282,8 +316,11 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | successor of an unselected record | not selected | `TestSelect_FollowsSupersessionToSuccessors` |
 | matches exceed the record budget | strict prefix included, rest dropped and named | `TestAssemble_FitsTheCap`, `TestAssemble_StrictPrefix` |
 | record larger than the remaining record budget / the whole budget | dropped whole, never truncated | `TestAssemble_OversizedRecordDroppedNeverTruncated` |
-| raw index over the cap | index shown truncated within its own cap; records still shown under the record budget | `TestAssemble_IndexOverCap`, `TestAssemble_IndexOverCap_AttributionCapBytes` |
-| index fills >= 95% of the cap | every record that fits the record budget still shown | `TestAssemble_IndexNearCapDoesNotStarveRecords` |
+| index rendering over the cap | index shown truncated within its own cap (the cut, marker and per-document `document_truncated` count rendering bytes and carry `rendering` / `rendering_bytes`); records still shown under the record budget | `TestAssemble_IndexOverCap`, `TestAssemble_IndexOverCap_AttributionCapBytes` |
+| raw index over the cap, rendering under it | the rendering shown whole; hash and `original_bytes` the raw file's | `TestAssemble_IndexShownAsCompactRendering` |
+| index rendering fills >= 95% of the cap | every record that fits the record budget still shown | `TestAssemble_IndexNearCapDoesNotStarveRecords` |
+| shipped index rendering past the production cap, or below the measured headroom floor | verify fails naming the overflow | `TestAssemble_ShippedIndex_RenderingFitsCap`, `TestShippedIndex_WithinInjectionCap`; the check's RED is pinned by `TestAssemble_IndexRenderingOverflow_IsCaught` |
+| record field missing from the rendering, a slice tag without `omitempty`, a raw NEL, an HTML-escaped `<` | rendering refused by test | `TestRenderIndex_RendersEveryRecordField`, `TestRenderIndex_OneLinePerRecordRoundTrips` |
 | shipped index, typical scope, production cap | at least `minTypicalRecordBodies` governing bodies shown in full | `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` |
 | cap smaller than the marker | `ErrUnresolvable` (zero-cap guard) | `TestAssemble_CapSmallerThanMarker_FailsClosed` |
 | branch ref handed as the commit | `repodoc.ErrUnpinnedBaseRef`, zero fetches | `TestAssemble_BasePinning` |
@@ -294,14 +331,18 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 
 ## Residuals
 
-- **Index size.** `docs/adr/index.json` is 32,432 bytes for 95 records
-  (measured 2026-10-16), 336 bytes under its own 32 KiB cap. The next record
-  or two and the index itself is shown truncated (loudly), cutting its
-  newest entries; the records are no longer affected, since #4399 gave them a
-  separate budget. The optional amendment keys cost bytes only on the records
-  that carry them; how the writer emits them is `docs/adr/README.md`'s. A compact index rendering stays out of scope: it would need
-  a repodoc derived-document attribution contract (the rendered bytes would no
-  longer be the fetched file's).
+- **Index size.** The persona is shown the index's compact rendering
+  (`RenderIndex`, #4478), not the committed file. Measured 2026-10-16 on 95
+  records: `docs/adr/index.json` is 32,744 raw bytes and its rendering 21,142
+  bytes, leaving 11,626 bytes under the 32 KiB cap — 27 more records at the
+  largest current line (428 bytes), about 35 at the last ten records' average
+  (330 bytes). `TestAssemble_ShippedIndex_RenderingFitsCap` fails the change
+  whose record makes the rendering overflow the cap (and holds the format to
+  at least 25 more records at 428 bytes beyond the 95 measured), as does
+  `TestShippedIndex_WithinInjectionCap`. Concurrent ADR merges can still
+  overflow on main between their verifies, as with any shared-file budget. The
+  raw file's size no longer reaches the prompt; how the writer emits the
+  optional amendment keys is `docs/adr/README.md`'s.
 - **Grounding reads the head.** Records not injected are reachable only through
   read-only grounding, which reads the REVIEW TREE (the change's head), not the
   admission commit; injection is base-pinned, grounding is not. The index

@@ -137,10 +137,20 @@ record:
 
 `path` is repo-relative. `amends` / `amended_by` are optional entry fields,
 written by `--write-index` ONLY when non-empty, between `superseded_by` and
-`applies_to`, so the records without an amendment cost the index no bytes
-against its 32,768-byte injection cap (always-present keys would add ~4 KB
-and truncate it). An absent optional field means `[]` to the gate and to
-`backend/internal/decisionrecord`'s strict parser alike. The gate compares the
+`applies_to`, so the records without an amendment cost the committed file no
+bytes (always-present keys would add ~4 KB). An absent optional field means
+`[]` to the gate and to `backend/internal/decisionrecord`'s strict parser
+alike.
+
+The architect persona is shown a COMPACT rendering of this file, not the file
+itself (`decisionrecord.RenderIndex`, #4478): one JSON object per record, one
+record per line, with every empty list left out. It is that rendering, not the
+committed file, that must fit the 32,768-byte (32 KiB) decision-record index
+cap; `TestAssemble_ShippedIndex_RenderingFitsCap` (and
+`TestShippedIndex_WithinInjectionCap`) in `backend/internal/decisionrecord`
+fail the change whose record makes it overflow. Measured 2026-10-16: 95
+records render to 21,142 bytes, room for about 27 more at the largest current
+entry. The gate compares the
 index to the records semantically, keyed by path: a record with no entry, an entry naming no record
 file, or an entry field disagreeing with the front matter each fail verify.
 Never hand-edit it — regenerate with:

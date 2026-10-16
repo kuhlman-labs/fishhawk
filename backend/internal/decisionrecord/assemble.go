@@ -88,10 +88,12 @@ type Selection struct {
 // ranks the matching records, and fits them under TWO separate budgets, each
 // r's effective cap, so the index's size can never starve the record bodies:
 //
-//   - the index is ALWAYS included, under its own per-document cap; when its
-//     rendered size exceeds the cap it is reshaped under a smaller cap until
-//     it fits (bounded, and never under a negative cap), shown with repodoc's
-//     loud truncation marker;
+//   - the index is ALWAYS included, shown as its compact rendering
+//     (RenderIndex, derived under IndexRendering, so its hash stays the
+//     fetched file's), under its own per-document cap; when the rendering's
+//     size exceeds the cap it is reshaped under a smaller cap until it fits
+//     (bounded, and never under a negative cap), shown with repodoc's loud
+//     truncation marker;
 //   - the matched records share a separate record budget, which the index
 //     does not draw on. Each match, in rank order, is fetched at the SAME
 //     commit and shaped under a cap at least its raw size (so its untruncated
@@ -131,7 +133,14 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 		return nil, fmt.Errorf("index %s at commit %s (declared at %s): %w", req.IndexPath, idxF.Commit, req.DeclarationSite, err)
 	}
 
-	idxDoc, err := fitIndex(idxF, r.CapBytes())
+	// The persona is shown the index's compact rendering, not the fetched
+	// file: the document's hash and OriginalBytes stay the file's (repodoc
+	// Derive), while the cap is spent on the rendering (#4478).
+	rendered, err := RenderIndex(idx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: index %s at commit %s: %w", ErrUnresolvable, req.IndexPath, idxF.Commit, err)
+	}
+	idxDoc, err := fitIndex(idxF, rendered, r.CapBytes())
 	if err != nil {
 		return nil, err
 	}
@@ -182,8 +191,9 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 	return sel, nil
 }
 
-// fitIndex shapes the index under budget, reshaping it under a smaller cap
-// until its rendered size (truncation marker included) fits. The cap shrinks
+// fitIndex shapes the index's compact rendering (body, derived from f under
+// IndexRendering) under budget, reshaping it under a smaller cap until its
+// rendered size (truncation marker included) fits. The cap shrinks
 // by the previous overflow each step, is clamped at zero (never negative), and
 // the loop is bounded; an index that cannot fit even at a zero cap — the
 // budget is smaller than the truncation marker — is an error.
@@ -193,9 +203,12 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 // marker, the rendered Source line and the per-document document_truncated
 // cap_bytes all report c. The budget itself is reported nowhere on the index;
 // the selection-level row carries the separate record budget (#3930).
-func fitIndex(f *repodoc.Fetched, budget int) (repodoc.Document, error) {
+func fitIndex(f *repodoc.Fetched, body []byte, budget int) (repodoc.Document, error) {
 	c := budget
-	doc := f.Document(c)
+	doc, err := f.Derive(IndexRendering, body, c)
+	if err != nil {
+		return repodoc.Document{}, fmt.Errorf("%w: %w", ErrUnresolvable, err)
+	}
 	for step := 0; doc.RenderedBytes > budget; step++ {
 		if c <= 0 {
 			return repodoc.Document{}, fmt.Errorf("%w: index %s does not fit the %d-byte cap even at a zero-byte cut (%d bytes rendered: the cap is smaller than the truncation marker)",
@@ -206,7 +219,9 @@ func fitIndex(f *repodoc.Fetched, budget int) (repodoc.Document, error) {
 				ErrUnresolvable, f.Path, budget, maxIndexShrinkSteps)
 		}
 		c = max(c-(doc.RenderedBytes-budget), 0)
-		doc = f.Document(c)
+		if doc, err = f.Derive(IndexRendering, body, c); err != nil {
+			return repodoc.Document{}, fmt.Errorf("%w: %w", ErrUnresolvable, err)
+		}
 	}
 	return doc, nil
 }
@@ -276,14 +291,19 @@ func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
 	return out
 }
 
-// indexFraming is the system-authored framing of the index document. With no
-// followed successor (Followed == 0) the preamble is exactly the pre-#4398
-// text; with successors but no amendment (Amendments == 0) it is exactly the
-// pre-#4471 text.
+// indexRenderingNote is the sentence the index framing adds after its opening
+// sentence, describing the RenderIndex format the persona is shown (#4478).
+const indexRenderingNote = "It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. "
+
+// indexFraming is the system-authored framing of the index document. Apart
+// from the indexRenderingNote sentence (#4478): with no followed successor
+// (Followed == 0) the preamble is exactly the pre-#4398 text; with successors
+// but no amendment (Amendments == 0) it is exactly the pre-#4471 text.
 func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	var b strings.Builder
 	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. ",
 		repodoc.SanitizeMetadata(s.Index.Path))
+	b.WriteString(indexRenderingNote)
 	switch {
 	case s.Amendments > 0:
 		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches, "+

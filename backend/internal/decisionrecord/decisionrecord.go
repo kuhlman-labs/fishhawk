@@ -9,7 +9,8 @@
 // repodoc can fetch a named file but cannot list a directory, so the index is
 // the entry point: it is fetched at the run's admission commit, parsed
 // STRICTLY (ParseIndex), and the records whose applies_to matches the change's
-// paths are selected and ranked (Select). Assemble then shapes the index under
+// paths are selected and ranked (Select). Assemble then shows the index as its
+// compact rendering (RenderIndex, one JSON object per record per line) under
 // its own per-document cap and fits the FULL text of as many ranked matches as
 // a separate record budget allows, so the index cannot starve the records.
 //
@@ -78,16 +79,21 @@ var idPattern = regexp.MustCompile(`^ADR-[0-9]{3,}$`)
 
 // Record is one index entry. Amends / AmendedBy are OPTIONAL keys (E78.13 /
 // #4471): an absent key decodes as empty, exactly like an empty list.
+//
+// Every slice tag carries omitempty, which affects ENCODING only: RenderIndex
+// marshals Record directly, so an empty list costs the rendering no bytes,
+// while ParseIndex's strict decode still requires supersedes, superseded_by
+// and applies_to (TestRenderIndex_RendersEveryRecordField pins the tags).
 type Record struct {
 	ID           string   `json:"id"`
 	Title        string   `json:"title"`
 	Path         string   `json:"path"`
 	Status       Status   `json:"status"`
-	Supersedes   []string `json:"supersedes"`
-	SupersededBy []string `json:"superseded_by"`
+	Supersedes   []string `json:"supersedes,omitempty"`
+	SupersededBy []string `json:"superseded_by,omitempty"`
 	Amends       []string `json:"amends,omitempty"`
 	AmendedBy    []string `json:"amended_by,omitempty"`
-	AppliesTo    []string `json:"applies_to"`
+	AppliesTo    []string `json:"applies_to,omitempty"`
 }
 
 // linkField is one of a record's link lists, by its front-matter key.
@@ -106,6 +112,35 @@ func (r Record) linkFields() []linkField {
 type Index struct {
 	SchemaVersion string   `json:"schema_version"`
 	Records       []Record `json:"records"`
+}
+
+// IndexRendering names the compact index rendering RenderIndex produces; it is
+// the repodoc rendering name Assemble derives the index document under.
+const IndexRendering = "adr-index-lines-v1"
+
+// RenderIndex renders idx compactly for a reviewer prompt (#4478): one compact
+// JSON object per record, one record per line ("\n"-terminated), in index
+// order, with every empty list field left out (Record's omitempty tags). The
+// schema_version wrapper is not rendered. Because Record is marshalled
+// directly, every field it declares — the amends / amended_by relations
+// included — renders with no further code.
+//
+// Each line decodes back to its record. encoding/json escapes every byte below
+// 0x20, U+2028 and U+2029 (SetEscapeHTML(false) only stops it escaping '<',
+// '>' and '&'), but NOT U+0085 NEL, which repodoc honours as a line break; so
+// every raw NEL in the output — which can only sit inside a JSON string — is
+// rewritten as the escape \u0085, and the output holds exactly one repodoc
+// line break per record.
+func RenderIndex(idx *Index) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	for _, r := range idx.Records {
+		if err := enc.Encode(r); err != nil {
+			return nil, fmt.Errorf("decisionrecord: render index record %q: %w", r.ID, err)
+		}
+	}
+	return bytes.ReplaceAll(b.Bytes(), []byte("\u0085"), []byte(`\u0085`)), nil
 }
 
 // ParseIndex decodes raw as a STRICT adr-index-v1 index. It refuses: malformed

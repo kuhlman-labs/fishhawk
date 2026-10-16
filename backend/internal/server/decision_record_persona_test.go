@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -8,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionrecord"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -94,6 +97,22 @@ func drIndexJSON(t *testing.T, records []drRecord) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// drIndexRendering is the decisionrecord.RenderIndex rendering of the raw
+// fixture index — the bytes the persona is shown and the cap is spent on
+// (#4478).
+func drIndexRendering(t *testing.T, raw string) []byte {
+	t.Helper()
+	idx, err := decisionrecord.ParseIndex([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseIndex(fixture): %v", err)
+	}
+	rendered, err := decisionrecord.RenderIndex(idx)
+	if err != nil {
+		t.Fatalf("RenderIndex(fixture): %v", err)
+	}
+	return rendered
 }
 
 // seedDecisionRecord serves the fixture index and every record body at the
@@ -216,6 +235,11 @@ func injectedPaths(entries []decodedEntry) []string {
 // set: document_injected for the remit, the index and both records, all at the
 // admission commit with content hashes, sharing one injection_set_id.
 //
+// The index is shown as its compact rendering (#4478): its document_injected
+// carries the RAW fixture file's content_hash plus rendering and
+// rendering_bytes, the remit and record entries carry neither key, and the
+// persona prompt's index Source line says the index is a rendering.
+//
 // Counterfactuals (run): (a) delete the `record.PromptDocuments(...)` append
 // in buildPersonaPrompt — the persona prompt lacks the index and records: RED;
 // (b) replace the AttributeSet call with Attribute(*doc) — only the remit is
@@ -279,6 +303,31 @@ func TestDecisionRecordPersona_PlanReview_SelectsAndAttributes(t *testing.T) {
 		if e.payload["commit"] != personaBaseCommit || e.payload["content_hash"] == "" || e.payload["content_hash"] == nil {
 			t.Errorf("entry %v: want commit %s and a content_hash", e.payload, personaBaseCommit)
 		}
+		_, hasRendering := e.payload["rendering"]
+		_, hasRenderingBytes := e.payload["rendering_bytes"]
+		if e.payload["path"] != drIndexPath {
+			if hasRendering || hasRenderingBytes {
+				t.Errorf("verbatim entry %v carries a rendering key", e.payload)
+			}
+			continue
+		}
+		raw := p.fetcher.files[drIndexPath]
+		sum := sha256.Sum256([]byte(raw))
+		if want := "sha256:" + hex.EncodeToString(sum[:]); e.payload["content_hash"] != want {
+			t.Errorf("index content_hash = %v, want the RAW fixture index's %s", e.payload["content_hash"], want)
+		}
+		if e.payload["rendering"] != decisionrecord.IndexRendering || e.payload["rendering_bytes"] != float64(len(drIndexRendering(t, raw))) {
+			t.Errorf("index rendering = %v / %v, want %q / %d", e.payload["rendering"], e.payload["rendering_bytes"], decisionrecord.IndexRendering, len(drIndexRendering(t, raw)))
+		}
+		if e.payload["original_bytes"] != float64(len(raw)) {
+			t.Errorf("index original_bytes = %v, want the raw fixture size %d", e.payload["original_bytes"], len(raw))
+		}
+	}
+	if want := "shown as its " + decisionrecord.IndexRendering + " rendering, not verbatim"; !strings.Contains(pp, want) {
+		t.Errorf("persona prompt lacks the index rendering disclosure %q", want)
+	}
+	if !strings.Contains(pp, string(drIndexRendering(t, p.fetcher.files[drIndexPath]))) {
+		t.Error("persona prompt does not carry the index's compact rendering")
 	}
 }
 
@@ -471,8 +520,9 @@ func TestDecisionRecordPersona_OverCap_DropsAndRecordsSelection(t *testing.T) {
 	}
 }
 
-// (D4b, #4399) INDEX NEAR CAP: the resolver cap is the index's size plus 32
-// bytes, so the index fits whole but a budget SHARED with it would leave only
+// (D4b, #4399) INDEX NEAR CAP: the resolver cap is the size of the index's
+// compact rendering (what the persona is shown, #4478) plus 32 bytes, so the
+// index fits whole but a budget SHARED with it would leave only
 // 32 bytes — less than either R-audit or R-unknown. The records have their own
 // budget (the same cap), which holds both, so through the real server path
 // (buildPersonaPrompt → resolvePersonaDecisionRecord → decisionrecord.Assemble
@@ -483,7 +533,7 @@ func TestDecisionRecordPersona_IndexNearCap_RecordsStillShown(t *testing.T) {
 	std, persona := approvingFake(), approvingFake()
 	p := newDRPlanRun(t, std, persona)
 	const sharedRemainder = 32
-	capBytes := len(p.fetcher.files[drIndexPath]) + sharedRemainder
+	capBytes := len(drIndexRendering(t, p.fetcher.files[drIndexPath])) + sharedRemainder
 	if len(drAuditBody) <= sharedRemainder || len(drUnknownBody) <= sharedRemainder || len(drAuditBody)+len(drUnknownBody) > capBytes {
 		t.Fatalf("premise: each record must exceed the %d-byte shared remainder and both must fit the %d-byte cap", sharedRemainder, capBytes)
 	}
