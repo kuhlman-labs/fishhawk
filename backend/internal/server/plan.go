@@ -604,6 +604,12 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// plan_warnings field.
 	_ = s.runPlanWarnings(r.Context(), runID, stageID, body)
 
+	// Plan-gate cross-run scope overlap (E83.60 / #4118): record a
+	// plan_scope_overlap row ONLY when this plan's effective scope shares
+	// files with another non-terminal run in the repo. Advisory + fail-open;
+	// runs before runPlanReviews so the row precedes plan_reviewed.
+	_ = s.recordPlanScopeOverlap(r.Context(), runID, stageID)
+
 	// Plan-gate reachability sweep (#2056, E50.4): decode the advisory
 	// symbol-reachability sweep result the runner shipped in the
 	// reachabilityHeader header (the runner holds the checked-out Go source; the
