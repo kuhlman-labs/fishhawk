@@ -10,7 +10,10 @@ import (
 // mid-stage scope-amendment poll window — the length of time the implement
 // agent keeps polling a filed amendment before it gives up, at which point the
 // request EXPIRES UNDECIDED (it stays pending server-side; an expiry is NOT a
-// denial, and a late decision is still honored on a fishhawk_retry_stage).
+// denial, and a late decision is still honored on a fishhawk_retry_stage while
+// the stage is failed and the run is live — a stage that succeeds, is cancelled
+// or superseded, or a run that ends, LAPSES it, #4127, and a later decide is
+// refused 409 amendment_lapsed).
 //
 // It is deliberately a var, not a const, for exactly one reason: two
 // discrimination tests reassign it to a different value and assert the rendered
